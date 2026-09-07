@@ -1162,3 +1162,51 @@ TEST_CASE("Handle-less plan deserialize", "[serialize][graph]") {
     }
 #endif  // CUDNN_VERSION >= 90800
 }
+
+// serialize() must return a clear error (not an OOB read or silent UB) when
+// no execution plan has been selected.  get_name_at_index OOB must error, not
+// crash.
+TEST_CASE("Graph::serialize rejects unbuilt candidate; get_name_at_index rejects OOB",
+          "[serialize][serialize_validate]") {
+    if (cudnnGetVersion() < 90400) {
+        SKIP("requires cuDNN >= 9.4");
+    }
+
+    namespace fe = cudnn_frontend;
+    ConvGraph cg;
+
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+    REQUIRE(cg.graph->build_operation_graph(handle).is_good());
+    REQUIRE(cg.graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
+    REQUIRE(cg.graph->check_support().is_good());
+
+    // candidate == -1 (build_plans not yet called): serialize must fail with a
+    // diagnostic mentioning the candidate value, not silently write a partial blob.
+    {
+        std::vector<uint8_t> data;
+        auto err = cg.graph->serialize(data);
+        REQUIRE(err.is_bad());
+        REQUIRE(err.get_message().find("candidate") != std::string::npos);
+        REQUIRE(data.empty());
+    }
+
+    REQUIRE(cg.graph->build_plans().is_good());
+
+    // After a successful build, serialize must succeed.
+    {
+        std::vector<uint8_t> data;
+        REQUIRE(cg.graph->serialize(data).is_good());
+        REQUIRE(!data.empty());
+    }
+
+    // get_name_at_index with out-of-range index must return an error, not crash.
+    {
+        std::string name;
+        auto const count = cg.graph->get_execution_plan_count();
+        REQUIRE(cg.graph->get_plan_name_at_index(-1, name).is_bad());
+        REQUIRE(cg.graph->get_plan_name_at_index(count, name).is_bad());
+    }
+
+    cudnnDestroy(handle);
+}

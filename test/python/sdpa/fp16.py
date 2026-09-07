@@ -169,6 +169,18 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
             allocs[TensorUid.dK] = alloc_tensor((max_t_kv, cfg.h_k, cfg.d_qk), cfg.data_type, strides=k_strides)
             allocs[TensorUid.dV] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type, strides=v_strides)
             allocs[TensorUid.dO] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type, strides=o_strides, rng=rng_data_gen, mean=0.0, std=0.1, sparse_int=si)
+        # NaN-poison the capacity tail (tokens past the last ragged offset).
+        # No engine may ever read those rows; finite random data there hides
+        # capacity-vs-live-token binding bugs because the padding mask turns
+        # them into exact zeros (0 x finite = 0), while real recycled device
+        # memory holds NaN bit patterns (0 x NaN = NaN) — GitHub issue #624.
+        # This makes f16/bf16 consistent with the fp8 harness, whose
+        # convert_uniform_to_packed always NaN-fills the tail.
+        total_t_q, total_t_kv = sum(cfg.seq_len_q), sum(cfg.seq_len_kv)
+        for uid, total in ((TensorUid.q, total_t_q), (TensorUid.k, total_t_kv), (TensorUid.v, total_t_kv)):
+            allocs[uid][0][total:] = float("nan")
+        if cfg.is_train:
+            allocs[TensorUid.dO][0][total_t_q:] = float("nan")
     else:
         allocs[TensorUid.q] = alloc_tensor(cfg.shape_q, cfg.data_type, strides=cfg.stride_q, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.k] = alloc_tensor(cfg.shape_k, cfg.data_type, strides=cfg.stride_k, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
@@ -733,8 +745,8 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     if cfg.is_ragged and cfg.is_train:
         dO_ref = convert_packed_to_uniform(dO_ref, seq_len_q_ref, cfg.s_q)
 
-    max_t_q = max(64, ((seq_len_q_ref.sum().item() + 63) // 64) * 64) if cfg.is_ragged else None
-    max_t_kv = max(64, ((seq_len_kv_ref.sum().item() + 63) // 64) * 64) if cfg.is_ragged else None
+    max_t_q = packed_token_capacity(seq_len_q_ref.tolist()) if cfg.is_ragged else None
+    max_t_kv = packed_token_capacity(seq_len_kv_ref.tolist()) if cfg.is_ragged else None
 
     attn_scale = 0.125
 

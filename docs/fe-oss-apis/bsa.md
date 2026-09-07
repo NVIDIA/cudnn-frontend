@@ -27,17 +27,16 @@ BSA is implemented with Python CuTe DSL/JIT kernels.
 
 ## Installation
 
-Install the CuTe DSL optional dependencies:
+The CuTe DSL runtime is a required dependency, so the base install is enough:
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
-The package-wide `nvidia-cutlass-dsl[cu13]>=4.5.0` dependency floor applies to
-BSA. The FP16/BF16 APIs continue to work with supported CuTe DSL 4.5 releases.
-The Sage FP8 API below performs an additional runtime check and requires
-`nvidia-cutlass-dsl>=4.6.1`; this narrower requirement does not change the
-package dependency floor or make importing `cudnn` require CuTe DSL 4.6.1.
+The package-wide `nvidia-cutlass-dsl[cu13]>=4.6.2` dependency floor applies to
+BSA. The Sage FP8 API below performs an additional runtime check and requires
+`nvidia-cutlass-dsl>=4.6.1`, which the package floor already satisfies; the
+check stays in place for environments that force an older DSL.
 
 ## Forward
 

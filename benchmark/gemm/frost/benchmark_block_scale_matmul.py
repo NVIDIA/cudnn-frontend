@@ -40,7 +40,7 @@ from benchmark_utils import (
 
 
 def _build_spec_map():
-    """Legacy label -> (geometry cfg, cta_group) for block-scale
+    """Canonical label -> (geometry cfg, cta_group) for block-scale
     strategies (geometry must satisfy the SF 128x4 swizzle; K-tile bytes are
     arch-keyed: 128 on sm100, 384 on sm103)."""
     m = {}
@@ -48,10 +48,7 @@ def _build_spec_map():
         kb_want = 384 if cfg.pipeline == "sm103" else 128
         if cfg.mma_tile_m % 128 or cfg.mma_tile_n % 128 or cfg.cta_tile_k_bytes != kb_want:
             continue
-        for cg in (1, 2):
-            if cg == 2 and (cfg.cga_size_m % 2 or cfg.cta_tile_m == 64):
-                continue
-            m[f"{cfg.name}_{cg}ctamma"] = (cfg, cg)
+        m[cfg.name] = (cfg, cfg.cta_group)
     return m
 
 
@@ -64,9 +61,8 @@ def _vp_bs(handles, a, b, c, sfa, sfb):
     return {A: a, B: b, SFA: sfa, SFB: sfb, C: c}
 
 
-def _build_plan(g, cfg, name):
+def _build_plan(g, cfg, _name):
     """JIT-compile the recorded graph with a forced tile config."""
-    _, cta_group = spec_for(name, _SPEC_MAP)
     return jit_from_cudnn_graph(g, config=cfg)
 
 

@@ -148,7 +148,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.28.0"
+__version__ = "1.29.0"
 
 
 def _tensor(
@@ -385,6 +385,11 @@ _LAZY_OPTIONAL_IMPORTS = {
     "MoeTensor": (".moe_ep", "MoeTensor"),
     "pack_backward_weights": (".moe_ep", "pack_backward_weights"),
     "pack_forward_weights": (".moe_ep", "pack_forward_weights"),
+    "FlexAttentionBwd": (".flex_attention", "FlexAttentionBwd"),
+    "FlexAttentionFwd": (".flex_attention", "FlexAttentionFwd"),
+    "create_mask_plan": (".flex_attention", "create_mask_plan"),
+    "flex_attn_func": (".flex_attention", "flex_attn_func"),
+    "sdpa_torch": (".sdpa.fwd.torch_op", "sdpa"),
     "BSA": (".block_sparse_attention", "BSA"),
     "block_sparse_attention_forward": (
         ".block_sparse_attention",
@@ -568,17 +573,29 @@ def _load_optional_symbol(name: str) -> Any:
         module = importlib.import_module(module_name, package=__name__)
         value = module if attr_name is None else getattr(module, attr_name)
     except Exception as e:
-        install_hint = (
-            _MOE_EP_INSTALL_HINT
-            if name in _MOE_EP_OPTIONAL_IMPORTS
-            else _CUTEDSL_INSTALL_HINT
-        )
-        raise ImportError(
-            f"{name} requires optional dependencies. {install_hint}: {e}"
-        ) from e
+        raise ImportError(_optional_dependency_message(name, e)) from e
 
     globals()[name] = value
     return value
+
+
+def _optional_dependency_message(name: str, error: Exception) -> str:
+    # A DSL that is installed but below the floor must not be reported as a
+    # missing dependency: "pip install [cutedsl]" would change nothing.
+    try:
+        from .frost.buffers import cutedsl_requirement_error
+
+        too_old = cutedsl_requirement_error(name)
+    except Exception:
+        too_old = None
+    if too_old is not None:
+        return f"{too_old}: {error}"
+    install_hint = (
+        _MOE_EP_INSTALL_HINT
+        if name in _MOE_EP_OPTIONAL_IMPORTS
+        else _CUTEDSL_INSTALL_HINT
+    )
+    return f"{name} requires optional dependencies. {install_hint}: {error}"
 
 
 def __getattr__(name: str) -> Any:
@@ -613,6 +630,17 @@ def __getattr__(name: str) -> Any:
         _jax = importlib.import_module(".jax", __name__)
         globals()["jax"] = _jax
         return _jax
+
+    if name == "torch":
+        # `import cudnn; cudnn.torch.install()` works like `import cudnn.torch`,
+        # mirroring the `jax` branch above. Deferred so `import cudnn` never
+        # eagerly imports torch; the submodule raises its own descriptive error
+        # when torch (or the 2.13+ flash-impl registry) is unavailable — which
+        # is why this is NOT a _LAZY_OPTIONAL_IMPORTS entry: that path would
+        # blame the `[cutedsl]` extra for a missing framework.
+        _torch_mod = importlib.import_module(".torch", __name__)
+        globals()["torch"] = _torch_mod
+        return _torch_mod
 
     if name == "fla":
         # `import cudnn; cudnn.fla.accelerate_fla()` works like `import cudnn.fla`.

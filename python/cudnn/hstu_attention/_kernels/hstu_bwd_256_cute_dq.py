@@ -493,7 +493,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         # llvm.inline_asm(
         #     None,
         #     [],
-        #     '.pragma "global knob CommonIntoMultiBlockLoop=1";',
+        #     'pragma "global knob CommonIntoMultiBlockLoop=1";',
         #     "",
         #     has_side_effects=True,
         #     is_align_stack=False,

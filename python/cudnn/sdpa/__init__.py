@@ -13,7 +13,7 @@ live one level down and are imported from there directly:
 
     from cudnn.sdpa.fwd import SdpaFwdDslSm100, SdpaFwdDslSm120, SdpaFwdDslSm80
     from cudnn.sdpa.fwd import sdpa_fwd_wrapper_dsl_sm100, sdpa_fwd_wrapper_dsl_sm120, sdpa_fwd_wrapper_sm80
-    from cudnn.sdpa.bwd import SdpaBwdDslSm120, SdpabwdSm80
+    from cudnn.sdpa.bwd import SdpaBwdDslSm120, SdpaBwdDslSm80
     from cudnn.sdpa.bwd import sdpa_bwd_wrapper_dsl_sm120, sdpa_bwd_wrapper_sm80
 
 Submodule imports stay lazy there (PEP 562): eager imports used to drag the

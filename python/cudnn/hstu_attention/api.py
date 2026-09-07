@@ -457,7 +457,7 @@ class HSTUFwdSm100(_HSTUBase):
     def check_support(self) -> bool:
         if self._is_supported:
             return True
-        self._check_common((64, 128, 256))
+        self._check_common((32, 64, 128, 256))
         q = self._sample_q
         o = self._sample_o
         _require_same_cuda_device(
@@ -707,7 +707,7 @@ class HSTUBwdSm100(_HSTUBase):
     def check_support(self) -> bool:
         if self._is_supported:
             return True
-        self._check_common((64, 128, 256))
+        self._check_common((32, 64, 128, 256))
         q = self._sample_q
         k = self._sample_k
         v = self._sample_v

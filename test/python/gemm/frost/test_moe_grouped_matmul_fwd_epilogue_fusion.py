@@ -20,6 +20,7 @@ import inspect
 from cudnn.gemm.frost import compiler
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.epilogue_codegen import generate
+from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
 
@@ -415,14 +416,18 @@ def test_single_moe_col_quant_grouped_segmented(bs):
     assert mismatch < 1e-4, mismatch
 
 
-def test_single_moe_col_quant_group_offset_rejections():
-    # Row quant with group_offset: rejected (row SF is already per-group contiguous).
+def test_single_moe_quant_group_offset_rejections():
+    # Row quant is analyzable with an explicit segmented capacity, but the
+    # plain-BF16 MoE scheduler has no per-group row-atom prefix and declines it.
     g, c, fto = _graph()
     sw = g.swish(input=c, name="sw")
     q, qs = g.block_scale_quantize(input=sw, block_size=32, axis=-1, group_offset=fto, name="q")
     q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
-    qs.set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
-    with pytest.raises(ValueError, match="supports only the M axis"):
+    capacity_rows = segmented_row_scale_capacity_rows(_S, _G)
+    scale_cols = (_N // 32 + 3) // 4 * 4
+    qs.set_dim([1, capacity_rows, scale_cols]).set_stride([capacity_rows * scale_cols, scale_cols, 1])
+    qs.set_data_type(cudnn.data_type.FP8_E8M0).set_output(True).set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    with pytest.raises(NotImplementedError, match="requires a block-scaled MoE"):
         jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
 
     # group_offset that is not the MoE fto: rejected.

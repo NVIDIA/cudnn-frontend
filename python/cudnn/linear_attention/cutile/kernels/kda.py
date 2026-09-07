@@ -252,6 +252,7 @@ def kda_gate_chunk_cumsum_vector_kernel(
     BS: ConstInt,
     REVERSE: ConstInt,
     HAS_BIAS: ConstInt,
+    HAS_A: ConstInt,
     HAS_SCALE: ConstInt,
     USE_LOWER_BOUND: ConstInt,
 ):
@@ -282,11 +283,18 @@ def kda_gate_chunk_cumsum_vector_kernel(
         b_bias = ct.astype(ct.gather(dt_bias, bias_off, mask=m_s, check_bounds=False, padding_value=0.0), ct.float32)
         b_s = b_s + b_bias[None, :]
 
-    b_A = ct.astype(ct.load(A_log, (i_h,), shape=()).item(), ct.float32)
     if USE_LOWER_BOUND:
-        b_gate = lower_bound * (1.0 / (1.0 + ct.exp(-(exp(b_A) * b_s))))
+        if HAS_A:
+            b_A = ct.astype(ct.load(A_log, (i_h,), shape=()).item(), ct.float32)
+            b_gate = lower_bound * (1.0 / (1.0 + ct.exp(-(exp(b_A) * b_s))))
+        else:
+            b_gate = lower_bound * (1.0 / (1.0 + ct.exp(-b_s)))
     else:
-        b_gate = -exp(b_A) * softplus(b_s)
+        if HAS_A:
+            b_A = ct.astype(ct.load(A_log, (i_h,), shape=()).item(), ct.float32)
+            b_gate = -exp(b_A) * softplus(b_s)
+        else:
+            b_gate = -softplus(b_s)
 
     b_o = ct.cumsum(b_gate, axis=0)
     if REVERSE:
@@ -313,13 +321,18 @@ def kda_gate_bwd_kernel(
     BT: ConstInt,
     BD: ConstInt,
     HAS_BIAS: ConstInt,
+    HAS_A: ConstInt,
     USE_LOWER_BOUND: ConstInt,
 ):
     # G/dYg/dG layout [T, H, D] -> view (T, D) stride (H*D, 1) at base i_h*D.
     i_t = ct.bid(0)
     i_h = ct.bid(1)
 
-    b_A = ct.astype(ct.load(A_log, (i_h,), shape=()).item(), ct.float32)
+    if HAS_A:
+        b_A = ct.astype(ct.load(A_log, (i_h,), shape=()).item(), ct.float32)
+        b_eA = exp(b_A)
+    else:
+        b_eA = 1.0
 
     o_t = ct.arange(BT, dtype=ct.int32)
     o_d = ct.arange(BD, dtype=ct.int32)
@@ -338,22 +351,24 @@ def kda_gate_bwd_kernel(
         b_g = b_g + b_bias[None, :]
 
     if USE_LOWER_BOUND:
-        b_eA = exp(b_A)
         b_inner = b_eA * b_g
         b_sig = 1.0 / (1.0 + ct.exp(-b_inner))
         b_dsig = b_sig * (1.0 - b_sig)
         b_d_inner_term = b_dyg * (lower_bound * b_dsig)
         b_dg = b_d_inner_term * b_eA
-        b_dA = ct.sum(ct.sum(b_dg * b_g, axis=1), axis=0)
+        if HAS_A:
+            b_dA = ct.sum(ct.sum(b_dg * b_g, axis=1), axis=0)
     else:
-        b_negeA = -exp(b_A)
-        b_yg = b_negeA * softplus(b_g)
+        b_negeA = -b_eA
         b_sig = 1.0 / (1.0 + ct.exp(-b_g))
         b_dg = b_negeA * (b_dyg * b_sig)
-        b_dA = ct.sum(ct.sum(b_dyg * b_yg, axis=1), axis=0)
+        if HAS_A:
+            b_yg = b_negeA * softplus(b_g)
+            b_dA = ct.sum(ct.sum(b_dyg * b_yg, axis=1), axis=0)
 
     ct.scatter(dg, off, ct.astype(b_dg, dg.dtype), mask=m, check_bounds=False)
-    ct.scatter(dA, i_t * H + i_h, b_dA)
+    if HAS_A:
+        ct.scatter(dA, i_t * H + i_h, b_dA)
     if HAS_BIAS:
         # b_dg is zero on masked lanes (b_dyg gathers with padding_value=0)
         b_db = ct.sum(b_dg, axis=0)
@@ -2234,7 +2249,8 @@ def kda_gate_chunk_cumsum(
     assert chunk_size == 2 ** (chunk_size.bit_length() - 1), "chunk_size must be a power of 2"
     BS = min(BS_LIST_DEFAULT, next_power_of_2(S))
     g_out = out.reshape((T, H, S))
-    dt_arg = opt(dt_bias, bufs, dtname(A_log)).reshape((-1,))
+    a_arg = opt(A_log, bufs).reshape((-1,))
+    dt_arg = opt(dt_bias, bufs).reshape((-1,))
     scale_val = float(scale) if scale is not None else 0.0
     lb_val = float(lower_bound) if lower_bound is not None else 0.0
     cu_arg = cu_seqlens.reshape(-1)
@@ -2246,7 +2262,7 @@ def kda_gate_chunk_cumsum(
         kda_gate_chunk_cumsum_vector_kernel,
         (
             g.reshape((-1,)),
-            A_log.reshape((-1,)),
+            a_arg,
             dt_arg,
             g_out.reshape(-1),
             scale_val,
@@ -2259,6 +2275,7 @@ def kda_gate_chunk_cumsum(
             BS,
             0,
             int(dt_bias is not None),
+            int(A_log is not None),
             int(scale is not None),
             int(lower_bound is not None),
         ),
@@ -2267,8 +2284,8 @@ def kda_gate_chunk_cumsum(
 
 
 def kda_gate_bwd(g, A_log, dt_bias=None, dyg=None, lower_bound=None, dg_out=None, dA_out=None, dbias_out=None, bufs=None, stream=None):
-    """Vector-gate backward. ``dg_out`` (g-shaped), ``dA_out`` (A_log-shaped) and —
-    with ``dt_bias`` — ``dbias_out`` (H*K) are written in place; ``bufs['dA_gate']``
+    """Vector-gate backward. ``dg_out`` (g-shaped) and, per present parameter,
+    ``dA_out`` (A_log-shaped) / ``dbias_out`` (H*K) are written in place; ``bufs['dA_gate']``
     / ``bufs['db_gate']`` hold the (NT, H) / (NT, H*K) fp32 chunk partials."""
     stream = 0 if stream is None else stream
     H, K = g.shape[-2:]
@@ -2277,9 +2294,11 @@ def kda_gate_bwd(g, A_log, dt_bias=None, dyg=None, lower_bound=None, dg_out=None
     NT = cdiv(T, BT)
     BD = next_power_of_2(K)
     dg = dg_out.reshape(tuple(g.shape))
-    dA_nt = bufs["dA_gate"].reshape((NT, H))
+    dA_nt = bufs["dA_gate"].reshape((NT, H)) if A_log is not None else None
     db_nt = bufs["db_gate"].reshape((NT, H * K)) if dt_bias is not None else None
-    dt_arg = opt(dt_bias, bufs, dtname(A_log)).reshape((-1,))
+    a_arg = opt(A_log, bufs).reshape((-1,))
+    dt_arg = opt(dt_bias, bufs).reshape((-1,))
+    dA_arg = opt(dA_nt, bufs).reshape(-1)
     db_arg = opt(db_nt, bufs).reshape(-1)
     lb_val = float(lower_bound) if lower_bound is not None else 0.0
     grid = (NT, H)
@@ -2289,11 +2308,11 @@ def kda_gate_bwd(g, A_log, dt_bias=None, dyg=None, lower_bound=None, dg_out=None
         kda_gate_bwd_kernel,
         (
             g.reshape((-1,)),
-            A_log.reshape((-1,)),
+            a_arg,
             dt_arg,
             dyg.reshape((-1,)),
             dg.reshape(-1),
-            dA_nt.reshape(-1),
+            dA_arg,
             db_arg,
             lb_val,
             T,
@@ -2302,13 +2321,15 @@ def kda_gate_bwd(g, A_log, dt_bias=None, dyg=None, lower_bound=None, dg_out=None
             BT,
             BD,
             int(dt_bias is not None),
+            int(A_log is not None),
             int(lower_bound is not None),
         ),
     )
-    sum_leading(dA_out.reshape((H,)), dA_nt, NT, H, stream=stream)
+    if A_log is not None:
+        sum_leading(dA_out.reshape((H,)), dA_nt, NT, H, stream=stream)
     if dt_bias is not None:
         sum_leading(dbias_out.reshape((H * K,)), db_nt, NT, H * K, stream=stream)
-    return dg, dA_out, (dbias_out if dt_bias is not None else None)
+    return dg, (dA_out if A_log is not None else None), (dbias_out if dt_bias is not None else None)
 
 
 # --- Launchers: WY representation -----------------------------------------------------------------
@@ -3262,7 +3283,7 @@ def chunk_kda_bwd(
             dyg=dg,
             lower_bound=lower_bound,
             dg_out=bufs["dg_gate"],
-            dA_out=bufs["dA_log"],
+            dA_out=bufs["dA_log"] if A_log is not None else None,
             dbias_out=bufs["ddt_bias"] if dt_bias is not None else None,
             bufs=bufs,
             stream=stream,
@@ -3432,7 +3453,7 @@ def chunk_kda(
 
     A_log, dt_bias = None, None
     if use_gate_in_kernel:
-        A_log, dt_bias = kwargs["A_log"], kwargs.get("dt_bias")
+        A_log, dt_bias = kwargs.get("A_log"), kwargs.get("dt_bias")
 
     chunk_size = kwargs.pop("chunk_size", 64)
 

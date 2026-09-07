@@ -257,6 +257,23 @@ QUANT_DATA_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp4_e2m1")
 M_MAJOR_OUT_DTYPES = ("bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2", "fp8_e8m0", "fp8_e5m3", "int8", "uint8", "int32")
 
 
+def segmented_row_scale_capacity_rows(total_rows: int, num_groups: int) -> int:
+    """Static rows needed by independently 128-row-padded group segments.
+
+    Runtime group sizes are device data. For ``total_rows=M`` split across at
+    most ``num_groups=G`` non-empty groups, the exact maximum number of 128-row
+    atoms is ``A + (M - A) // 128``, where ``A=min(M,G)``. This graph-time
+    envelope admits every valid partition without synchronizing the offsets.
+    """
+    if total_rows < 0:
+        raise ValueError(f"segmented row scale total_rows must be non-negative; got {total_rows}")
+    if num_groups < 1:
+        raise ValueError(f"segmented row scale num_groups must be positive; got {num_groups}")
+    active = min(total_rows, num_groups)
+    max_atoms = active + (total_rows - active) // 128
+    return 128 * max_atoms
+
+
 @dataclass(frozen=True)
 class BlockQuantizeSpec:
     """One block-scale quantize node (cuDNN ``block_scale_quantize``): each
@@ -269,10 +286,16 @@ class BlockQuantizeSpec:
     Col quant: compact `(B, M/block_size, N)`, F8_128x4 = the transposed atom
     `(B, rup(N,128), rup(M/bs,4))`.
 
-    ``grouped_by_moe`` (col + F8_128x4 only; declared via ``group_offset=fto``
-    on the quant node) = per-group segmented col-SF: each routed group is its
-    own compact table at its atom-quad base, same total footprint. Runtime
-    CONTRACT: every fto value must be a multiple of ``4 * block_size``."""
+    ``grouped_by_moe`` (F8_128x4 only; declared via ``group_offset=fto`` on the
+    quant node) makes each routed group its own scale segment. For col quant the
+    segment is the group's compact transposed table at its atom-quad base; the
+    runtime CONTRACT remains that every fto value is a multiple of
+    ``4 * block_size``. For row quant the segment starts at the prefix sum of
+    the preceding groups' 128-row atom counts. For fixed ``M`` and declared
+    group count ``G``, ``scale_dim[1]`` must cover the graph-time worst case
+    ``128 * (A + (M-A)//128)``, ``A=min(M,G)``. This admits every valid runtime
+    partition without reading device offsets on the host. Padding scale bytes
+    are not written by the quantizer and must be initialized to a valid value."""
 
     source_ref: int
     block_size: int
@@ -297,8 +320,8 @@ class BlockQuantizeSpec:
             raise ValueError(f"block quantize scale reordering {self.scale_reorder!r} is not supported; " "expected None or F8_128x4")
         if self.compute_dtype != "fp32":
             raise ValueError(f"block quantize compute_dtype {self.compute_dtype!r} is not supported; " "expected fp32")
-        if self.grouped_by_moe and (self.axis != 1 or self.scale_reorder != "F8_128x4"):
-            raise ValueError("grouped block quantize requires the M axis (col) and F8_128x4 scale reordering")
+        if self.grouped_by_moe and self.scale_reorder != "F8_128x4":
+            raise ValueError("grouped block quantize requires F8_128x4 scale reordering")
 
 
 @dataclass(frozen=True)
@@ -579,6 +602,7 @@ class MoeSpec:
     # time; the scheduler casts reads to Int32 so the math is dtype-agnostic.
     offset_dtype: Dtype = "int32"
     num_groups: int = 0
+    offset_multiple: int = 1
 
     def __post_init__(self) -> None:
         if self.num_experts < 1:
@@ -589,6 +613,8 @@ class MoeSpec:
             raise ValueError(f"MoE grouped matmul mode {self.mode!r} is out of POC scope; " "only 'none' is supported (gather / scatter rejected)")
         if self.offset_dtype not in ("int32", "int64"):
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
+        if self.offset_multiple < 1:
+            raise ValueError(f"first_token_offset alignment_value must be >= 1; " f"got {self.offset_multiple}")
 
 
 def _walk_dtype_fields(obj: object, found: "set[Dtype]", *, in_dtype_field: bool = False) -> None:

@@ -235,6 +235,18 @@ class FlashAttentionDSABackwardSm100H16:
 
         return sum_OdO, scaled_lse, dKV_acc
 
+    @cute.kernel
+    def clear_dKV_workspace(self, mdKV_acc: cute.Tensor, num_rows: Int32):
+        """Clear caller-owned FP32 dKV scratch before atomic accumulation."""
+        tidx, tidy, _ = cute.arch.thread_idx()
+        row_block, _, _ = cute.arch.block_idx()
+        rows_per_cta = 64
+        for row_in_block in cutlass.range(tidy, rows_per_cta, 8, unroll_full=True):
+            row_idx = row_block * rows_per_cta + row_in_block
+            if row_idx < num_rows:
+                for dim_idx in cutlass.range(tidx, self.head_dim, 32):
+                    mdKV_acc[dim_idx, row_idx, (0, 0)] = Float32(0.0)
+
     @staticmethod
     def _compute_sum_OdO_grid(
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
@@ -465,6 +477,12 @@ class FlashAttentionDSABackwardSm100H16:
             self.acc_dtype,
         )
         mdKV_acc = cute.make_tensor(mdKV_acc.iterator, mdKV.layout)
+        rows_per_cta = 64
+        self.clear_dKV_workspace(mdKV_acc, mKV.shape[0]).launch(
+            grid=[cute.ceil_div(mKV.shape[0], rows_per_cta), 1, 1],
+            block=[32, 8, 1],
+            stream=stream,
+        )
 
         # ============ Sum OdO ============
         sum_OdO_scale = Float32(-1.0)
@@ -1101,6 +1119,7 @@ class FlashAttentionDSABackwardSm100H16:
         sSum_OdO: cute.Tensor,
         pipelines,
     ):
+        """Load the CTA's Q/dO tiles and per-head LSE/O·dO scalars into SMEM."""
         tidx, _, _ = cute.arch.thread_idx()
         token_idx, head_block_idx, batch_idx = cute.arch.block_idx()
         local_tidx = tidx % self.threads_per_warp
@@ -1141,13 +1160,13 @@ class FlashAttentionDSABackwardSm100H16:
         load_mma_QdO_producer_state.advance()
 
         async_copy_atom = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS), self.acc_dtype, num_bits_per_copy=64)
-        lse_copy_threads = 8
+        lse_copy_threads = self.h_tile // 2
         thr_layout = cute.make_layout((lse_copy_threads), stride=(1))
         val_layout = cute.make_layout((2), stride=(1))
         async_tiled_copy = cute.make_tiled_copy_tv(async_copy_atom, thr_layout, val_layout)
         thr_async_copy = async_tiled_copy.get_slice(local_tidx % lse_copy_threads)
 
-        softmax_rows = 16
+        softmax_rows = self.h_tile
         gLSE = cute.flat_divide(mLSE, (softmax_rows,))
         gSum_OdO = cute.flat_divide(mSum_OdO, (softmax_rows,))
 

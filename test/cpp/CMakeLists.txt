@@ -29,6 +29,7 @@ add_executable(
     version.cpp
     tensor.cpp
     get_engine_and_knobs.cpp
+    kernel_cache.cpp
 )
 
 if (MSVC)

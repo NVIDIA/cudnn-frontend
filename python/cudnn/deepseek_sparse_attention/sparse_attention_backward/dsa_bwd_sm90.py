@@ -335,12 +335,12 @@ class _FlashAttentionDSABackwardPreprocessSm90:
                         LOG2_E = math.log2(math.e)
                         lse_log2 = lse_row * LOG2_E
                         sink_log2 = mAttnSink[head_idx] * LOG2_E
-                        lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
-                        sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
-                        lse_with_sink_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
-                        p_sink = cute.math.exp2(sink_log2 - lse_with_sink_log2)
-                        if lse_row == Float32.inf:
-                            p_sink = Float32(0.0)
+                        # KV LSE +inf keeps the develop convention p_sink = 0.
+                        p_sink = Float32(0.0)
+                        if lse_row != Float32.inf:
+                            p_sink = Float32(1.0) / (Float32(1.0) + cute.math.exp2(lse_log2 - sink_log2))
+                            if lse_log2 == sink_log2:
+                                p_sink = Float32(0.5)
                         if row_valid:
                             atomic_add_fp32(
                                 -p_sink * dP_sum[m],
@@ -387,10 +387,12 @@ class _FlashAttentionDSABackwardPreprocessSm90:
                     if cutlass.const_expr(mAttnSink is not None):
                         sink_log2 = mAttnSink[head_idx] * LOG2_E
                         lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
-                        sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
-                        lse_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
-                        if lse == Float32.inf:
-                            lse_log2 = Float32.inf
+                        # Infinite max is already the logaddexp; shifting it is inf-inf.
+                        if lse_max_log2 == Float32.inf or lse_max_log2 == -Float32.inf:
+                            lse_log2 = lse_max_log2
+                        else:
+                            sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
+                            lse_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
                     gLSElog2[tidx] = lse_log2
 
 
@@ -1034,6 +1036,12 @@ class FlashAttentionDSABackwardSm90:
         wg_mma_SdP = tiled_mma_SdP.get_slice(wg_tidx)
         thr_mma_SdP = tiled_mma_SdP.get_slice(wg_tidx)
 
+        # KV-column coordinate of each S accumulator element, used to mask the
+        # top-k tail. Loop invariant, so build it once per CTA.
+        S_tile_shape = (self.tile_m, self.tile_n)
+        cS = cute.make_identity_tensor(S_tile_shape if const_expr(not self.SdP_swapAB) else S_tile_shape[::-1])
+        tScS_mn = make_acc_tensor_mn_view(thr_mma_SdP.partition_C(cS), transpose=self.SdP_swapAB)
+
         # GEMM1: S = Q @ KV^T (SS), K dim = tile_hdim (512 or 576)
         tSrQ, tSrKV = mma_partition_fragment_AB(wg_mma_SdP, sQ, sKV, self.SdP_swapAB)
         # GEMM2: dP = dO @ V^T (SS), K dim = tile_hdimv (512)
@@ -1144,9 +1152,6 @@ class FlashAttentionDSABackwardSm90:
                 topK = mTopkLength[batch_idx, seq_idx]
             else:
                 topK = self.max_topk
-            n_block_max = (topK + self.tile_n - 1) // self.tile_n
-            topk_tail_rows = topK - (n_block_max - 1) * self.tile_n
-            n_block = n_block_max - 1
 
             mKV_cur = mKV[None, None, head_idx_kv, batch_idx]
             mTopkIdxs_cur = mTopkIdxs[batch_idx, seq_idx, None]
@@ -1159,82 +1164,62 @@ class FlashAttentionDSABackwardSm90:
             load_Q, _, _ = tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True)
             load_dO, _, _ = tma_get_copy_fn(tma_atom_dO, 0, cute.make_layout(1), gdO, sdO, single_stage=True)
 
-            if warp_idx_in_wg == 0:
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(mbar_QdO_ptr, self.tma_copy_bytes["Q"] + self.tma_copy_bytes["dO"])
-                load_Q(tma_bar_ptr=mbar_QdO_ptr)
-                load_dO(tma_bar_ptr=mbar_QdO_ptr)
+            # Skip the WG0 prologue together with WG1 for empty rows.
+            # This avoids asymmetric 256-thread barriers and prevents the Q TMA
+            # from racing with WG1's dQ epilogue in sQ.
+            if topK > 0:
+                n_block_max = (topK + self.tile_n - 1) // self.tile_n
+                topk_tail_rows = topK - (n_block_max - 1) * self.tile_n
+                if warp_idx_in_wg == 0:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(mbar_QdO_ptr, self.tma_copy_bytes["Q"] + self.tma_copy_bytes["dO"])
+                    load_Q(tma_bar_ptr=mbar_QdO_ptr)
+                    load_dO(tma_bar_ptr=mbar_QdO_ptr)
 
-            # All 128 threads load the query's head values. Rows beyond qhpkv
-            # are neutralized for the 64-row MMA tile.
-            mLSE_cur = mLSE[None, head_idx_kv, seq_idx, batch_idx]
-            mdPsum_cur = mdPsum[None, head_idx_kv, seq_idx, batch_idx]
-            _load_f32_head_to_smem(
-                mLSE_cur,
-                sLSE,
-                self.tile_m,
-                wg_tidx,
-                self.num_threads_per_warp_group,
-                self.qhead_per_kvhead,
-                head_tile,
-                Float32.inf,
-            )
-            _load_f32_head_to_smem(
-                mdPsum_cur,
-                sdPsum,
-                self.tile_m,
-                wg_tidx,
-                self.num_threads_per_warp_group,
-                self.qhead_per_kvhead,
-                head_tile,
-                Float32(0.0),
-            )
+                # All 128 threads load the query's head values. Rows beyond qhpkv
+                # are neutralized for the 64-row MMA tile.
+                mLSE_cur = mLSE[None, head_idx_kv, seq_idx, batch_idx]
+                mdPsum_cur = mdPsum[None, head_idx_kv, seq_idx, batch_idx]
+                _load_f32_head_to_smem(
+                    mLSE_cur,
+                    sLSE,
+                    self.tile_m,
+                    wg_tidx,
+                    self.num_threads_per_warp_group,
+                    self.qhead_per_kvhead,
+                    head_tile,
+                    Float32.inf,
+                )
+                _load_f32_head_to_smem(
+                    mdPsum_cur,
+                    sdPsum,
+                    self.tile_m,
+                    wg_tidx,
+                    self.num_threads_per_warp_group,
+                    self.qhead_per_kvhead,
+                    head_tile,
+                    Float32(0.0),
+                )
 
-            # Fence SMEM writes (LSE/dPsum stores) + barrier to ensure visibility
-            cute.arch.fence_view_async_shared()
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierBwd.WG0_producer_sync),
-                number_of_threads=self.num_threads_per_warp_group,
-            )
+                # Fence SMEM writes (LSE/dPsum stores) + barrier to ensure visibility
+                cute.arch.fence_view_async_shared()
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierBwd.WG0_producer_sync),
+                    number_of_threads=self.num_threads_per_warp_group,
+                )
 
-            # Wait for Q/dO TMA complete
-            cute.arch.mbarrier_wait(mbar_QdO_ptr, mbar_QdO_phase)
-            mbar_QdO_phase = mbar_QdO_phase ^ 1
+                # Wait for Q/dO TMA complete
+                cute.arch.mbarrier_wait(mbar_QdO_ptr, mbar_QdO_phase)
+                mbar_QdO_phase = mbar_QdO_phase ^ 1
 
-            # S2R: LSE and dPsum (SMEM to registers, once per m_block)
-            tLSErLSE = load_s2r(tLSEsLSE)
-            tLSErdPsum = load_s2r(tLSEsdPsum)
+                # S2R: LSE and dPsum (SMEM to registers, once per m_block)
+                tLSErLSE = load_s2r(tLSEsLSE)
+                tLSErdPsum = load_s2r(tLSEsdPsum)
 
-            # first n_block
-            self._wg0_one_n_block(
-                n_block,
-                wg_tidx,
-                mKV_cur,
-                mTopkIdxs_cur,
-                sKV,
-                async_copy_atom,
-                async_thr_copy,
-                idx_in_group,
-                group_idx,
-                mma_qkv_fn,
-                mma_dov_fn,
-                mma_dsk_fn_0,
-                mma_dsk_fn_1,
-                tLSErLSE,
-                tLSErdPsum,
-                tPsP,
-                tdSsdS,
-                smem_thr_copy_PdS,
-                softmax_scale_log2,
-                softmax_scale,
-                dQ_accumulate=False,
-                is_first=True,
-                num_valid_rows=topk_tail_rows,
-            )
-            n_block -= 1
+                n_block = n_block_max - 1
 
-            # remaining n_blocks
-            while n_block >= 0:
+                # Peel the tail block so its validity mask does not enter the
+                # steady-state loop.
                 self._wg0_one_n_block(
                     n_block,
                     wg_tidx,
@@ -1253,21 +1238,53 @@ class FlashAttentionDSABackwardSm90:
                     tLSErdPsum,
                     tPsP,
                     tdSsdS,
+                    tScS_mn,
                     smem_thr_copy_PdS,
                     softmax_scale_log2,
                     softmax_scale,
-                    dQ_accumulate=True,
-                    is_first=False,
-                    num_valid_rows=self.tile_n,
+                    dQ_accumulate=False,
+                    num_valid_rows=topk_tail_rows,
                 )
                 n_block -= 1
 
-            # Wait for WG1 to finish reading sQ (GEMM5 dS^T @ Q uses sQ),
-            # before epilogue_dQ overwrites sQ with dQ output.
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierBwd.sdS_consumed),
-                number_of_threads=self.num_mma_threads,
-            )
+                while n_block >= 0:
+                    self._wg0_one_n_block(
+                        n_block,
+                        wg_tidx,
+                        mKV_cur,
+                        mTopkIdxs_cur,
+                        sKV,
+                        async_copy_atom,
+                        async_thr_copy,
+                        idx_in_group,
+                        group_idx,
+                        mma_qkv_fn,
+                        mma_dov_fn,
+                        mma_dsk_fn_0,
+                        mma_dsk_fn_1,
+                        tLSErLSE,
+                        tLSErdPsum,
+                        tPsP,
+                        tdSsdS,
+                        tScS_mn,
+                        smem_thr_copy_PdS,
+                        softmax_scale_log2,
+                        softmax_scale,
+                        dQ_accumulate=True,
+                        num_valid_rows=self.tile_n,
+                    )
+                    n_block -= 1
+
+                # Wait for WG1 to finish reading sQ (GEMM5 dS^T @ Q uses sQ),
+                # before epilogue_dQ overwrites sQ with dQ output.
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierBwd.sdS_consumed),
+                    number_of_threads=self.num_mma_threads,
+                )
+            else:
+                # No GEMM4 ran; zero the dQ accumulators before the epilogue.
+                acc_dQ_0.fill(0.0)
+                acc_dQ_1.fill(0.0)
 
             # WG0 always writes dQ[0:256] — same as V3.1 for both d=512 and d=576
             self.epilogue_dQ(
@@ -1411,15 +1428,15 @@ class FlashAttentionDSABackwardSm90:
         tLSErdPsum: cute.Tensor,
         tPsP: cute.Tensor,
         tdSsdS: cute.Tensor,
+        tScS_mn: cute.Tensor,
         smem_thr_copy_PdS: cute.TiledCopy,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
         dQ_accumulate: Boolean = False,
-        is_first: Boolean = True,
         num_valid_rows: Int32 = 64,
     ):
         """WG0 one n_block: load KV(cp.async) + GEMM1/2 + softmax/dsoftmax + R2S + GEMM4_WG0(x2)"""
-        if not is_first:
+        if dQ_accumulate:
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierBwd.KV_empty),
                 number_of_threads=self.num_mma_threads,  # 256 = WG0(128) + WG1(128)
@@ -1431,7 +1448,7 @@ class FlashAttentionDSABackwardSm90:
         for r in cutlass.range_constexpr(ROWS_PER_GROUP):
             row = r * NUM_GROUPS + group_idx
             global_topk_row = n_block * self.tile_n + row
-            if row < num_valid_rows or not is_first:
+            if row < num_valid_rows or dQ_accumulate:
                 if const_expr(self.have_topk_length):
                     self._copy_row(
                         mKV_cur,
@@ -1459,7 +1476,7 @@ class FlashAttentionDSABackwardSm90:
                     else:
                         self._zero_row(sKV, row, idx_in_group)
             else:
-                # clear for OOB rows (only in first n_block)
+                # Tail padding of the peeled n_block.
                 self._zero_row(sKV, row, idx_in_group)
 
         cute.arch.cp_async_commit_group()
@@ -1479,10 +1496,28 @@ class FlashAttentionDSABackwardSm90:
         acc_dP = mma_dov_fn(B_idx=None, wg_wait=1)
 
         # (3) Softmax: P = exp2(S * scale_log2 - LSE)
+        #
+        # Padded columns are zero-filled in sKV, so their score is 0 rather
+        # than -inf. Force those lanes to probability zero.
+        # Compact: past num_valid_rows on the peeled tail n_block.
+        # Non-compact: a negative top-k index. Positive OOB indices and
+        # compact entries in [0, topK) are trusted as valid KV rows.
         acc_S_mn = make_acc_tensor_mn_view(acc_S, transpose=self.SdP_swapAB)
+        COL = const_expr(1 if not self.SdP_swapAB else 0)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
             for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
-                acc_S_mn[r, c] = cute.math.exp2(acc_S_mn[r, c] * softmax_scale_log2 - tLSErLSE[r], fastmath=True)
+                p = cute.math.exp2(acc_S_mn[r, c] * softmax_scale_log2 - tLSErLSE[r], fastmath=True)
+                col = tScS_mn[r, c][COL]
+                if not dQ_accumulate:
+                    p = Float32(0.0) if col >= num_valid_rows else p
+                if const_expr(not self.have_topk_length):
+                    # Peeled tile still spans tile_n columns; clamp so a
+                    # partial non-compact row is not read past its end.
+                    idx = n_block * self.tile_n + col
+                    idx = idx if idx < self.max_topk else Int32(self.max_topk - 1)
+                    if mTopkIdxs_cur[idx] < 0:
+                        p = Float32(0.0)
+                acc_S_mn[r, c] = p
 
         # Convert P f32 -> bf16
         tdKVrP = cvt_f16(make_acc_tensor_frgA_view(acc_S), self.dtype)
@@ -1965,6 +2000,11 @@ class FlashAttentionDSABackwardSm90:
 
                 n_block -= 1
                 first_iter = False
+
+            # Empty top-k skipped the G4_half zero_init=first_iter pass.
+            if topK <= 0:
+                acc_dQ_2.fill(0.0)
+                acc_dQ_3.fill(0.0)
 
             # epilogue: write dQ[256:tile_hdim] to gmem
             # WG1 writes dQ[256:tile_hdim]: 128+128 for d=512, 128+192 for d=576

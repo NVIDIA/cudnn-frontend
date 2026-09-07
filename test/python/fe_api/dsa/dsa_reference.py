@@ -85,6 +85,8 @@ def ref_sparse_attention_forward(
     sink = attn_sink.view(1, h)
     lse_with_sink = torch.logaddexp(lse, sink)
     weights = torch.exp(scores - lse_with_sink.unsqueeze(-1))
+    # Masked scores are -inf; with a +inf sink that is -inf - +inf = NaN.
+    weights = weights.masked_fill(~mask, 0.0)
     out = torch.einsum("thk,kd->thd", weights, v_f)
 
     return out.to(q.dtype), lse

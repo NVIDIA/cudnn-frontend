@@ -13,6 +13,8 @@ import cutlass
 import cutlass.pipeline
 import cutlass.cute as cute
 from cutlass import const_expr
+from cutlass.cutlass_dsl import T
+from cutlass._mlir.dialects import llvm
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.typing import Int32, Float32, Boolean
 from cutlass.cute.nvgpu import cpasync
@@ -42,8 +44,109 @@ from .block_sparsity import (
 )
 
 
-class HSTUAttentionForwardSm100:
+def _atomic_add_bf16x2(ptr, val_lo: Float32, val_hi: Float32, *, loc=None, ip=None):
+    """Packed BF16x2 atomic add used by the split-KV epilogue."""
+    llvm.inline_asm(
+        None,
+        [ptr, val_hi.ir_value(loc=loc, ip=ip), val_lo.ir_value(loc=loc, ip=ip)],
+        "{ .reg .b32 packed; cvt.rn.bf16x2.f32 packed, $1, $2; red.global.add.noftz.bf16x2 [$0], packed; }",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
+
+@cute.jit
+def _tmem_load_32dp32b32x(tmem_addr: Int32):
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 32),
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()],
+        "tcgen05.ld.sync.aligned.32x32b.x32.b32 "
+        "{$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, "
+        "$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31}, [$32];",
+        ",".join(["=r"] * 32 + ["r"]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(32))
+
+
+@cute.jit
+def _tmem_load_16dp64b16x(tmem_addr: Int32):
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 16),
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()],
+        "tcgen05.ld.sync.aligned.16x64b.x16.b32 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15}, [$16];",
+        ",".join(["=r"] * 16 + ["r"]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(16))
+
+
+@cute.jit
+def _cvt_f32x2_to_bf16x2(a: Float32, b: Float32) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(b).ir_value(), Float32(a).ir_value()],
+            "cvt.rn.satfinite.bf16x2.f32 $0, $1, $2;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _tmem_store_bf16x16(tmem_addr: Int32, vals: cute.Tensor):
+    assert cute.size(vals) == 16
+    llvm.inline_asm(
+        None,
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()] + [Int32(vals[i]).ir_value() for i in range(16)],
+        "tcgen05.st.sync.aligned.32x32b.x16.b32 [$0], {$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16};",
+        ",".join(["r"] * 17),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def _tmem_store_bf16x8_16dp64b(tmem_addr: Int32, vals: cute.Tensor):
+    assert cute.size(vals) == 8
+    llvm.inline_asm(
+        None,
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()] + [Int32(vals[i]).ir_value() for i in range(8)],
+        "tcgen05.st.sync.aligned.16x64b.x8.b32 [$0], {$1, $2, $3, $4, $5, $6, $7, $8};",
+        ",".join(["r"] * 9),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def _silu_f32_inplace(scores: cute.Tensor, score_scale_half: Float32):
+    for i in cutlass.range_constexpr(0, cute.size(scores), 2):
+        v0, v1 = utils.mul_packed_f32x2(
+            (scores[i], scores[i + 1]),
+            (score_scale_half, score_scale_half),
+        )
+        tanh_v0 = utils.tanhf(v0)
+        tanh_v1 = utils.tanhf(v1)
+        scores[i], scores[i + 1] = utils.fma_packed_f32x2(
+            (v0, v1),
+            (tanh_v0, tanh_v1),
+            (v0, v1),
+        )
+
+
+class HSTUAttentionForwardSm100:
     arch = 100
 
     def __init__(
@@ -66,6 +169,14 @@ class HSTUAttentionForwardSm100:
         use_tma_O: bool = True,
         use_causal_mask_r2p: bool = True,
         use_2cta_instrs: bool = False,
+        is_q_len_one: bool = False,
+        q1_split_kv: int = 1,
+        q1_single_warp_epilogue: bool = False,
+        q1_m64_silu_warps: int = 0,
+        q1_m64_inplace_silu: bool = False,
+        q1_m64_16dp_silu: bool = False,
+        q1_m64_tail_branch: bool = False,
+        q1_m64_kv_stage: int = 0,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -76,8 +187,26 @@ class HSTUAttentionForwardSm100:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.kBlockM = kBlockM
         self.kBlockN = kBlockN
+        self.q1_split_kv = q1_split_kv
+        self.q1_single_warp_epilogue = q1_single_warp_epilogue
+        self.q1_m64_silu_warps = q1_m64_silu_warps
+        self.q1_m64_inplace_silu = q1_m64_inplace_silu
+        self.q1_m64_16dp_silu = q1_m64_16dp_silu
+        self.q1_m64_tail_branch = q1_m64_tail_branch
+        self.q1_m64_kv_stage = q1_m64_kv_stage
+        assert q1_split_kv in (1, 2, 4)
+        assert q1_split_kv == 1 or is_q_len_one
+        assert not q1_single_warp_epilogue or is_q_len_one
+        assert q1_m64_silu_warps in (0, 1, 2, 3)
+        assert q1_m64_silu_warps == 0 or (is_q_len_one and kBlockM == 64 and kBlockN == 128)
+        assert not (q1_m64_inplace_silu or q1_m64_16dp_silu) or (is_q_len_one and kBlockM == 64 and kBlockN == 128)
+        assert not q1_m64_16dp_silu or q1_m64_inplace_silu
+        assert not q1_m64_tail_branch or q1_m64_16dp_silu
+        assert q1_m64_kv_stage in (0, 5)
+        assert q1_m64_kv_stage == 0 or (is_q_len_one and kBlockM == 64 and kBlockN == 128)
         self.use_2cta_instrs = (
             use_2cta_instrs
+            and q1_split_kv == 1
             and head_dim == 128
             and head_dim_v == 128
             and is_causal
@@ -92,8 +221,10 @@ class HSTUAttentionForwardSm100:
             and kBlockN == 128
         )
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
-        # Use one Q stage for 2-CTA MMA and when D >= 256.
-        self.q_stage = 1 if self.use_2cta_instrs or self.head_dim_padded >= 256 else 2
+        # A qlen=1 tile has no second Q block to overlap. Keeping one Q stage
+        # avoids issuing a fully masked QK/PV tile and cuts its Q/O storage in
+        # half. D256 and 2-CTA MMA have the same one-stage requirement.
+        self.q_stage = 1 if is_q_len_one or self.use_2cta_instrs or self.head_dim_padded >= 256 else 2
         self.s_stage = 2  # score stage for intra-warp overlap
         assert self.q_stage in [1, 2]
         assert self.s_stage in [2]
@@ -149,7 +280,7 @@ class HSTUAttentionForwardSm100:
         self.descriptor_stages = 2
         self.use_clc_descriptor = use_clc_descriptor and self.use_clc_scheduler and not self.use_2cta_instrs
         self.use_precomputed_qk_descriptors = self.q_stage == 2 and not self.use_2cta_instrs
-        self.use_tma_O = use_tma_O and self.use_clc_scheduler
+        self.use_tma_O = use_tma_O and self.use_clc_scheduler and q1_split_kv == 1
         self.use_causal_mask_r2p = use_causal_mask_r2p and self.is_causal and not self.is_local
         self.clc_scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
 
@@ -226,6 +357,8 @@ class HSTUAttentionForwardSm100:
             self.kv_stage = 7
         elif self.q_dtype.width == 8:
             self.kv_stage = 4
+        elif self.q1_m64_kv_stage:
+            self.kv_stage = self.q1_m64_kv_stage
         else:
             self.kv_stage = min((224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage, 3)
         assert self.kv_stage >= 2
@@ -499,7 +632,7 @@ class HSTUAttentionForwardSm100:
         seqlen_k = max_seqlen_k if const_expr(self.use_clc_scheduler) else cute.size(mK.shape[0])
         tile_sched_args = TileSchedulerArguments(
             num_block,
-            cute.size(mQ.shape[2]),
+            cute.size(mQ.shape[2]) * self.q1_split_kv,
             cute.size(cu_seqlens_q.shape[0] - 1),
             seqlen_k,
             mQ.shape[1],
@@ -1178,6 +1311,8 @@ class HSTUAttentionForwardSm100:
                 self.silu_loop,
                 score_scale=score_scale,
                 scaling_seqlen=scaling_seqlen,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
                 thr_mma_qk=thr_mma_qk,
                 mbar_ptr=mbar_ptr,
                 block_info=block_info,
@@ -1218,6 +1353,21 @@ class HSTUAttentionForwardSm100:
         if const_expr(self.use_clc_descriptor):
             return work_tile
         return SeqlenInfoCls(batch_idx)
+
+    @cute.jit
+    def decode_q1_split_head(self, head_idx: Int32):
+        if const_expr(self.q1_split_kv == 1):
+            return head_idx, Int32(0)
+        return head_idx // self.q1_split_kv, head_idx % self.q1_split_kv
+
+    @cute.jit
+    def get_q1_split_n_block_info(self, n_block_max: Int32, n_block_min: Int32, split_idx: Int32):
+        if const_expr(self.q1_split_kv == 1):
+            return n_block_max, n_block_min
+        blocks_per_split = cute.ceil_div(n_block_max - n_block_min, self.q1_split_kv)
+        split_max = max(n_block_min, n_block_max - split_idx * blocks_per_split)
+        split_min = max(n_block_min, split_max - blocks_per_split)
+        return split_max, split_min
 
     @cute.jit
     def clc_scheduler_warp(self, TileSchedulerCls: Callable):
@@ -1462,6 +1612,7 @@ class HSTUAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
+            head_idx, split_idx = self.decode_q1_split_head(head_idx)
             seqlen = self.get_seqlen_info(work_tile, batch_idx, SeqlenInfoCls)
             offset = seqlen.offset_q
             offset_dynamic = (self.logical_cta_tiler[0] - (seqlen.seqlen_q & (self.logical_cta_tiler[0] - 1))) & (self.logical_cta_tiler[0] - 1)
@@ -1548,6 +1699,7 @@ class HSTUAttentionForwardSm100:
                     m_block,
                 )
                 n_block_min = Int32(0)
+            n_block_max, n_block_min = self.get_q1_split_n_block_info(n_block_max, n_block_min, split_idx)
             has_work = n_block_max > n_block_min
             if has_work:
                 if const_expr(self.q_stage == 2):
@@ -2465,6 +2617,7 @@ class HSTUAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
+            _, split_idx = self.decode_q1_split_head(head_idx)
             seqlen = self.get_seqlen_info(work_tile, batch_idx, SeqlenInfoCls)
             offset_dynamic = (self.logical_cta_tiler[0] - (seqlen.seqlen_q & (self.logical_cta_tiler[0] - 1))) & (self.logical_cta_tiler[0] - 1)
             offset_dynamic = 0 if (offset_dynamic <= self.kBlockM or not self.enable_offset_dynamic) else offset_dynamic
@@ -2476,6 +2629,7 @@ class HSTUAttentionForwardSm100:
                     m_block,
                 )
                 n_block_min = Int32(0)
+            n_block_max, n_block_min = self.get_q1_split_n_block_info(n_block_max, n_block_min, split_idx)
             n_block_nums = n_block_max - n_block_min
 
             if n_block_nums > 0:
@@ -2643,6 +2797,8 @@ class HSTUAttentionForwardSm100:
         stage: int | Int32,
         score_scale: Float32,
         scaling_seqlen: Float32,
+        window_size_left: Int32,
+        window_size_right: Int32,
         thr_mma_qk: cute.core.ThrMma,
         tStSi: cute.Tensor,
         mbar_ptr: cute.Pointer,
@@ -2664,17 +2820,17 @@ class HSTUAttentionForwardSm100:
         tStP_layout = cute.composition(tStSi.layout, cute.make_layout((self.kBlockM, tilePlikeFP32)))
         tStP = cute.make_tensor(tStSi.iterator + self.tmem_s_to_p_offset, tStP_layout)
 
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
-            Float32,
+        tmem_load_op = (
+            tcgen05.copy.Ld16x64bOp(tcgen05.copy.Repetition(16)) if const_expr(self.kBlockM == 64) else tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
         )
+        tmem_load_atom = cute.make_copy_atom(tmem_load_op, Float32)
         thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStSi).get_slice(tidx)
         tStS_t2r = thr_tmem_load.partition_S(tStSi)
 
-        tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)),
-            Float32,
+        tmem_store_op = (
+            tcgen05.copy.St16x64bOp(tcgen05.copy.Repetition(8)) if const_expr(self.kBlockM == 64) else tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16))
         )
+        tmem_store_atom = cute.make_copy_atom(tmem_store_op, Float32)
         tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP)
         thr_tmem_store = tiled_tmem_store.get_slice(tidx)
         tStP_r2t = thr_tmem_store.partition_D(tStP)
@@ -2695,6 +2851,7 @@ class HSTUAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
+            head_idx, split_idx = self.decode_q1_split_head(head_idx)
             q_work_block = m_block
             seqlen = self.get_seqlen_info(work_tile, batch_idx, SeqlenInfoCls)
             offset_dynamic = (self.logical_cta_tiler[0] - (seqlen.seqlen_q & (self.logical_cta_tiler[0] - 1))) & (self.logical_cta_tiler[0] - 1)
@@ -2717,6 +2874,9 @@ class HSTUAttentionForwardSm100:
                     q_work_block,
                 )
                 n_block_min = Int32(0)
+            n_block_max, n_block_min = self.get_q1_split_n_block_info(n_block_max, n_block_min, split_idx)
+            if const_expr(self.q1_split_kv > 1):
+                n_masking_steps = min(n_masking_steps, n_block_max - n_block_min) if split_idx == 0 else Int32(0)
             has_work = n_block_max > n_block_min
             # func: (head_func, n_func, L_func) -> (n_func, L_func)
             func_tensor = func[0, None, None] if func is not None else None
@@ -2750,6 +2910,9 @@ class HSTUAttentionForwardSm100:
             silu_step = partial(
                 self.silu_step,
                 fastsilu=fastsilu,
+                seqlen_k=seqlen.seqlen_k,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
                 mbar_ptr=mbar_ptr,
                 mbar_s0_s1_sequence_offset=mbar_s0_s1_sequence_offset,
                 thr_mma_qk=thr_mma_qk,
@@ -2895,12 +3058,167 @@ class HSTUAttentionForwardSm100:
             )
 
     @cute.jit
+    def _silu_step_q1_m64(
+        self,
+        mma_si_consumer_phase: Int32,
+        s0_s1_sequence_phase: Int32,
+        n_block: Int32,
+        score_scale: Float32,
+        score_scale_half: Float32,
+        seqlen_k: Int32,
+        window_size_left: Int32,
+        window_size_right: Int32,
+        mbar_ptr: cute.Pointer,
+        stage: int | Int32,
+    ):
+        """Convert one M64 score row-group to BF16 P with the native 32-DP TMEM mapping."""
+        assert self.kBlockM == 64 and self.kBlockN in (64, 128)
+        assert not self.use_2cta_instrs
+
+        cute.arch.mbarrier_wait(
+            mbar_ptr + self.mbar_S_full_offset + stage,
+            mma_si_consumer_phase,
+        )
+        valid_col_begin = Int32(0)
+        valid_col_end = seqlen_k
+        if const_expr(self.is_local):
+            # Packed HSTU aligns its single Q row with K row seqlen_k - 1.
+            # Local attention is consequently a contiguous suffix of K.
+            aligned_q_row = seqlen_k - Int32(1)
+            valid_col_begin = max(Int32(0), aligned_q_row - window_size_left)
+            valid_col_end = min(seqlen_k, aligned_q_row + Int32(1) + window_size_right)
+        block_col_begin = n_block * self.kBlockN
+        block_valid_begin = min(max(valid_col_begin - block_col_begin, Int32(0)), self.kBlockN)
+        block_valid_end = min(max(valid_col_end - block_col_begin, Int32(0)), self.kBlockN)
+        if const_expr(self.q1_m64_16dp_silu):
+            scores_16dp = cute.make_rmem_tensor((self.kBlockN // 2,), Float32)
+            packed_16dp = cute.make_rmem_tensor((8,), Int32)
+            lane_parity = (cute.arch.thread_idx()[0] >> 1) & 1
+            for chunk in cutlass.range_constexpr(self.kBlockN // 32):
+                values_16dp = _tmem_load_16dp64b16x(Int32(self.tmem_s_offset[stage] + chunk * 32))
+                for i in cutlass.range_constexpr(16):
+                    score_idx = chunk * 16 + i
+                    col = chunk * 32 + i * 2 + lane_parity
+                    scores_16dp[score_idx] = (
+                        values_16dp[i] if const_expr(self.q1_m64_tail_branch) or (col >= block_valid_begin and col < block_valid_end) else Float32(0.0)
+                    )
+            cute.arch.fence_view_async_tmem_load()
+            if const_expr(self.q1_m64_tail_branch):
+                if block_valid_begin > 0 or block_valid_end < self.kBlockN:
+                    for chunk in cutlass.range_constexpr(self.kBlockN // 32):
+                        for i in cutlass.range_constexpr(16):
+                            col = chunk * 32 + i * 2 + lane_parity
+                            scores_16dp[chunk * 16 + i] = scores_16dp[chunk * 16 + i] if col >= block_valid_begin and col < block_valid_end else Float32(0.0)
+            _silu_f32_inplace(scores_16dp, score_scale_half)
+
+            split_chunk_16dp = self.split_P_arrive // 32
+            for chunk in cutlass.range_constexpr(split_chunk_16dp):
+                for i in cutlass.range_constexpr(8):
+                    even = scores_16dp[chunk * 16 + i * 2]
+                    odd = scores_16dp[chunk * 16 + i * 2 + 1]
+                    partner_even = cute.arch.shuffle_sync_bfly(even, offset=2)
+                    partner_odd = cute.arch.shuffle_sync_bfly(odd, offset=2)
+                    lo = even if lane_parity == 0 else partner_odd
+                    hi = partner_even if lane_parity == 0 else odd
+                    packed_16dp[i] = _cvt_f32x2_to_bf16x2(lo, hi)
+                _tmem_store_bf16x8_16dp64b(Int32(self.tmem_p_offset[stage] + chunk * 16), packed_16dp)
+            cute.arch.fence_view_async_tmem_store()
+
+            if const_expr(self.s0_s1_barrier):
+                cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_s0_s1_sequence_offset + (1 - stage))
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+
+            for chunk in cutlass.range_constexpr(split_chunk_16dp, self.kBlockN // 32):
+                for i in cutlass.range_constexpr(8):
+                    even = scores_16dp[chunk * 16 + i * 2]
+                    odd = scores_16dp[chunk * 16 + i * 2 + 1]
+                    partner_even = cute.arch.shuffle_sync_bfly(even, offset=2)
+                    partner_odd = cute.arch.shuffle_sync_bfly(odd, offset=2)
+                    lo = even if lane_parity == 0 else partner_odd
+                    hi = partner_even if lane_parity == 0 else odd
+                    packed_16dp[i] = _cvt_f32x2_to_bf16x2(lo, hi)
+                _tmem_store_bf16x8_16dp64b(Int32(self.tmem_p_offset[stage] + chunk * 16), packed_16dp)
+            cute.arch.fence_view_async_tmem_store()
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+            return mma_si_consumer_phase ^ 1, s0_s1_sequence_phase ^ 1
+
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % len(self.silu0_warp_ids)
+        split_chunk = self.split_P_arrive // 32
+        if const_expr(self.q1_m64_silu_warps == 0):
+            scores = cute.make_rmem_tensor((self.kBlockN,), Float32)
+            packed = cute.make_rmem_tensor((16,), Int32)
+            for chunk in cutlass.range_constexpr(self.kBlockN // 32):
+                values = _tmem_load_32dp32b32x(Int32(self.tmem_s_offset[stage] + chunk * 32))
+                for i in cutlass.range_constexpr(32):
+                    scores[chunk * 32 + i] = values[i]
+            cute.arch.fence_view_async_tmem_load()
+
+            for i in cutlass.range_constexpr(self.kBlockN):
+                scores[i] = scores[i] if i >= block_valid_begin and i < block_valid_end else Float32(0.0)
+            if const_expr(self.q1_m64_inplace_silu):
+                _silu_f32_inplace(scores, score_scale_half)
+            else:
+                converted = cute.make_rmem_tensor((self.kBlockN,), self.q_dtype)
+                FastSilU(score_scale, score_scale_half).silu_x2(scores, converted, None)
+
+            for chunk in cutlass.range_constexpr(split_chunk):
+                for i in cutlass.range_constexpr(16):
+                    packed[i] = _cvt_f32x2_to_bf16x2(scores[chunk * 32 + i * 2], scores[chunk * 32 + i * 2 + 1])
+                _tmem_store_bf16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), packed)
+            cute.arch.fence_view_async_tmem_store()
+        else:
+            active_scores = cute.make_rmem_tensor((self.kBlockN,), Float32)
+            active_packed = cute.make_rmem_tensor((16,), Int32)
+            active_converted = cute.make_rmem_tensor((self.kBlockN,), self.q_dtype)
+            values = (Float32(0.0),) * 32
+            if warp_idx < self.q1_m64_silu_warps:
+                for chunk in cutlass.range_constexpr(self.kBlockN // 32):
+                    values = _tmem_load_32dp32b32x(Int32(self.tmem_s_offset[stage] + chunk * 32))
+                    for i in cutlass.range_constexpr(32):
+                        active_scores[chunk * 32 + i] = values[i]
+                cute.arch.fence_view_async_tmem_load()
+
+                for i in cutlass.range_constexpr(self.kBlockN):
+                    active_scores[i] = active_scores[i] if i >= block_valid_begin and i < block_valid_end else Float32(0.0)
+                FastSilU(score_scale, score_scale_half).silu_x2(active_scores, active_converted, None)
+
+                for chunk in cutlass.range_constexpr(split_chunk):
+                    for i in cutlass.range_constexpr(16):
+                        active_packed[i] = _cvt_f32x2_to_bf16x2(active_scores[chunk * 32 + i * 2], active_scores[chunk * 32 + i * 2 + 1])
+                    _tmem_store_bf16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), active_packed)
+                cute.arch.fence_view_async_tmem_store()
+
+        if const_expr(self.s0_s1_barrier):
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_s0_s1_sequence_offset + (1 - stage))
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+
+        if const_expr(self.q1_m64_silu_warps == 0):
+            for chunk in cutlass.range_constexpr(split_chunk, self.kBlockN // 32):
+                for i in cutlass.range_constexpr(16):
+                    packed[i] = _cvt_f32x2_to_bf16x2(scores[chunk * 32 + i * 2], scores[chunk * 32 + i * 2 + 1])
+                _tmem_store_bf16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), packed)
+            cute.arch.fence_view_async_tmem_store()
+        else:
+            if warp_idx < self.q1_m64_silu_warps:
+                for chunk in cutlass.range_constexpr(split_chunk, self.kBlockN // 32):
+                    for i in cutlass.range_constexpr(16):
+                        active_packed[i] = _cvt_f32x2_to_bf16x2(active_scores[chunk * 32 + i * 2], active_scores[chunk * 32 + i * 2 + 1])
+                    _tmem_store_bf16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), active_packed)
+                cute.arch.fence_view_async_tmem_store()
+
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+        return mma_si_consumer_phase ^ 1, s0_s1_sequence_phase ^ 1
+
+    @cute.jit
     def silu_step(
         self,
         mma_si_consumer_phase: Int32,
         s0_s1_sequence_phase: Int32,
         n_block: Int32,
         fastsilu: FastSilU,
+        seqlen_k: Int32,
+        window_size_left: Int32,
+        window_size_right: Int32,
         mbar_ptr: cute.Pointer,
         mbar_s0_s1_sequence_offset: Int32,
         thr_mma_qk: cute.core.ThrMma,
@@ -2924,6 +3242,20 @@ class HSTUAttentionForwardSm100:
         4. Coordinating pipeline synchronization between different processing stages
         """
         assert mask_fn is None or r2p_mask_fn is None, "scalar and R2P masks are mutually exclusive"
+
+        if const_expr(self.kBlockM == 64):
+            return self._silu_step_q1_m64(
+                mma_si_consumer_phase,
+                s0_s1_sequence_phase,
+                n_block,
+                fastsilu.score_scale,
+                fastsilu.score_scale_half,
+                seqlen_k,
+                window_size_left,
+                window_size_right,
+                mbar_ptr,
+                stage,
+            )
 
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor((self.mma_tiler_qk[0], self.mma_tiler_qk[1])))
@@ -3070,7 +3402,11 @@ class HSTUAttentionForwardSm100:
         )
         tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_i[(None, None), 0])
         thr_tmem_load = tiled_tmem_load.get_slice(tidx)
-        smem_copy_atom = sm100_utils_basic.get_smem_store_op(self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load)
+        smem_copy_atom = (
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.o_dtype)
+            if const_expr(self.kBlockM == 64)
+            else sm100_utils_basic.get_smem_store_op(self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load)
+        )
         tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_r2s = utils.partition_D_position_independent(
@@ -3093,28 +3429,30 @@ class HSTUAttentionForwardSm100:
                     mbar_ptr + self.mbar_O_full_offset + stage,
                     epi_consumer_phase,
                 )
-        for i in cutlass.range_constexpr(self.head_dim_v_padded // async_copy_elems):
-            tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
-            tOsO_r2s_i = tOsO_r2s[None, 0, 0, i]
-            tOrO_frg_cvt = cute.make_rmem_tensor(
-                tOsO_r2s[None, 0, 0, i].shape,
-                self.o_dtype,
-            )
-            if has_work:
-                tOrO_frg = cute.make_rmem_tensor(
+        participates = tidx < cute.arch.WARP_SIZE if const_expr(self.kBlockM == 64 or self.q1_single_warp_epilogue) else True
+        if participates:
+            for i in cutlass.range_constexpr(self.head_dim_v_padded // async_copy_elems):
+                tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
+                tOsO_r2s_i = tOsO_r2s[None, 0, 0, i]
+                tOrO_frg_cvt = cute.make_rmem_tensor(
                     tOsO_r2s[None, 0, 0, i].shape,
-                    self.pv_acc_dtype,
+                    self.o_dtype,
                 )
-                cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
-                for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
-                    tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
-                        (tOrO_frg[j], tOrO_frg[j + 1]),
-                        (scale, scale),
+                if has_work:
+                    tOrO_frg = cute.make_rmem_tensor(
+                        tOsO_r2s[None, 0, 0, i].shape,
+                        self.pv_acc_dtype,
                     )
-                tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
-            else:
-                tOrO_frg_cvt.fill(0)
-            cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
+                    cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
+                    for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
+                        tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
+                            (tOrO_frg[j], tOrO_frg[j + 1]),
+                            (scale, scale),
+                        )
+                    tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
+                else:
+                    tOrO_frg_cvt.fill(0)
+                cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
 
         if const_expr(self.use_2cta_instrs):
             if has_work:
@@ -3125,6 +3463,10 @@ class HSTUAttentionForwardSm100:
             # Publish regular SMEM writes before the async proxy reads sO for the TMA store.
             cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.barrier(barrier_id=EPILOGUE_BARRIER_BASE + stage, number_of_threads=cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
+
+        if const_expr(self.q1_split_kv > 1):
+            self._atomic_add_q1_split_O(head_idx, stage, seqlen, mO, sO)
+            return
 
         logical_stage_start = m_block * self.kBlockM - offset_dynamic
         valid_rows = min(
@@ -3192,6 +3534,23 @@ class HSTUAttentionForwardSm100:
                 mO,
                 sO,
             )
+
+    @cute.jit
+    def _atomic_add_q1_split_O(
+        self,
+        head_idx: Int32,
+        stage: int,
+        seqlen: Callable,
+        mO: cute.Tensor,
+        sO: cute.Tensor,
+    ):
+        tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
+        if tidx < self.head_dim_v_padded // 2 and seqlen.seqlen_q > 0:
+            dim_idx = tidx * 2
+            val_lo = sO[0, dim_idx, stage].to(Float32)
+            val_hi = sO[0, dim_idx + 1, stage].to(Float32)
+            mO_row = mO[seqlen.offset_q, None, head_idx]
+            _atomic_add_bf16x2((mO_row.iterator + dim_idx).llvm_ptr, val_lo, val_hi)
 
     @cute.jit
     def _store_O_to_gmem(

@@ -63,8 +63,12 @@ def flash_attn_bwd_sm90(
         dq: pre-allocated (total_S_q, nheads, headdim), optional
         dkv: pre-allocated (total_S_kv, headdim), optional
         d_sink: pre-allocated (nheads,), optional
-        topk_idxs: (total_S_q, topk_max) int32, global indices
-        topk_length: (total_S_q,) int32, per-query valid count, optional
+        topk_idxs: (total_S_q, topk_max) int32, global KV indices.
+            Compact (`topk_length` given): prefix `[0, topk_length)` is valid.
+            Non-compact (`topk_length` is None): a negative entry is padding.
+            Positive indices must be in `[0, S_kv)`; oversized `topk_length`
+            is out of contract.
+        topk_length: (total_S_q,) int32, per-query valid prefix length, optional
         need_d_sink: return and compute d_sink when True
 
     Returns:

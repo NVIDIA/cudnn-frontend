@@ -73,7 +73,7 @@ becomes one consumer rather than the anchor.
 
 ## `Handle`
 
-```
+```text
 class Handle:
     backend_handle: int | None  # the wrapped cudnnHandle_t; None = pure-python (future)
     _ordinal: int | None        # CUDA device ordinal this handle is bound to

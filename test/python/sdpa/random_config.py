@@ -42,8 +42,13 @@ def get_strides_from_indices(shape, indices=[0, 1, 2, 3], gaps=[0, 0, 0, 0], rng
 
 
 def packed_token_capacity(seq_lens):
-    """Token capacity of a packed (ragged) buffer, rounded up to a multiple of 64."""
-    return max(64, ((sum(seq_lens) + 63) // 64) * 64)
+    """Token capacity of a packed (ragged) buffer: total tokens rounded up to the
+    next multiple of 64, always strictly greater than the total. The surplus
+    guarantees every ragged buffer has a capacity tail past the last ragged
+    offset — the harnesses NaN-poison that tail so an engine that reads it
+    (e.g. binding K/V views to capacity instead of live token counts,
+    GitHub #624) fails deterministically instead of only on recycled memory."""
+    return (sum(seq_lens) // 64 + 1) * 64
 
 
 def get_strides_from_layout(shape, layout, gaps=[0, 0, 0, 0], rng_geom=None):
@@ -370,8 +375,9 @@ class RandomizationContext:
             randoms_.left_bound = None if randoms_.diag_align == cudnn.diagonal_alignment.BOTTOM_RIGHT else 1
             randoms_.right_bound = rng.randint(0, randoms_.s_kv // 2)
         elif randoms["with_sliding_mask"] == "band_around_diag":
-            randoms_.left_bound = rng.randint(1, randoms_.s_kv // 2)
-            randoms_.right_bound = rng.randint(1, randoms_.s_kv // 2)
+            # s_kv == 1 leaves an empty randint range; a 1-wide band is the only option.
+            randoms_.left_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
+            randoms_.right_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
         elif randoms["with_sliding_mask"] == "causal":
             randoms_.right_bound = 0
 
