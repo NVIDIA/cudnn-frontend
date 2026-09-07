@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import cudnn
+import math
 import pytest
 import torch
 from enum import IntEnum
@@ -395,6 +396,7 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         score_sum_exp=score_sum_exp,
         sink_token=sink_token,
         unfuse_fma=cfg.with_unfuse_fma,
+        stats_use_log2=cfg.with_stats_log2,
     )
 
     o.set_uid(int(TensorUid.o)).set_output(True).set_dim(cfg.shape_o).set_stride(cfg.stride_o)
@@ -779,6 +781,8 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
                 if cudnn_version < "9.14.0":
                     stats_ref[i, :, m:, :] = 0
                     stats_gpu[i, :, m:, :] = 0
+                    if cfg.with_stats_log2:
+                        allocs["stats_log2"][0][i, :, m:, :] = 0
                 else:
                     stats_ref[i, :, m:, :] = -float("inf")
             # zero out padded regions for score_max and score_sum_exp
@@ -884,6 +888,9 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     if cfg.is_train:
         dkv_atol = 2e-2 if cfg.data_type == torch.float16 else 7e-2
         err_count += approx_equal(allocs[TensorUid.stats], stats_ref, atol=2e-2, rtol=2e-2, tag="stats", disp_elems=diffs)
+        if cfg.with_stats_log2:
+            # The forward's own output, snapshotted before the natural-log restore that fed the backward.
+            err_count += approx_equal(allocs["stats_log2"], stats_ref * math.log2(math.e), atol=2e-2, rtol=2e-2, tag="stats_log2", disp_elems=diffs)
         err_count += approx_equal(allocs[TensorUid.dQ], dQ_ref, atol=2e-2, rtol=2e-2, tag="dQ", disp_elems=diffs)
         err_count += approx_equal(allocs[TensorUid.dK], dK_ref, atol=dkv_atol, rtol=2e-2, tag="dK", disp_elems=diffs)
         err_count += approx_equal(allocs[TensorUid.dV], dV_ref, atol=dkv_atol, rtol=2e-2, tag="dV", disp_elems=diffs)
@@ -923,6 +930,13 @@ def exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=None, tensor_checke
     bwd_graph, bwd_pack = create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv) if cfg.is_train else (None, None)
 
     execute_graph(fwd_graph, fwd_pack, allocs, tensors, cudnn_handle, request, label="Forward")
+
+    if cfg.is_train and cfg.with_stats_log2:
+        # The forward wrote base-2 stats. Keep them for the comparison and hand the backward the
+        # natural-log form it consumes, as a training caller would (-inf rows are unaffected).
+        stats_gpu = tensors.get(TensorUid.stats)
+        allocs["stats_log2"] = (stats_gpu.clone(), None, None)
+        stats_gpu.mul_(math.log(2.0))
 
     if cfg.is_train:
         execute_graph(bwd_graph, bwd_pack, allocs, tensors, cudnn_handle, request, label="Backward")

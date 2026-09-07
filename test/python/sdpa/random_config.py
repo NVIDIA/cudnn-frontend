@@ -125,6 +125,9 @@ class ExecConfig:
     with_score_sum_exp: bool = False
     with_sink_token: bool = False
     with_unfuse_fma: bool = False
+    # Forward writes base-2 stats (sdpa(stats_use_log2=True)); the harness restores the
+    # natural-log form before the backward, which consumes natural-log stats only.
+    with_stats_log2: bool = False
     with_rope: bool = False
     with_ragged_offset_multiplier: bool = False
     # Each ragged tensor (Q/K/V/O and gradients) independently draws a token
