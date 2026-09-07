@@ -921,13 +921,17 @@ def gdn_setup_context(ctx, inputs, output):
 
 
 def gdn_backward(ctx, dO, dFinal, dstate_checkpoints):
+    # Non-reentrant activation checkpointing permits each saved-tensor unpack
+    # hook to run only once.  Keep the returned tuple and slice that tuple;
+    # reading ``ctx.saved_tensors`` again would trigger a second unpack.
+    saved_tensors = ctx.saved_tensors
     if ctx.checkpoint_reuse:
-        q, k, v, g, beta, cu_seqlens, state_checkpoints = ctx.saved_tensors[:7]
-        gate_params = list(ctx.saved_tensors[7:])
+        q, k, v, g, beta, cu_seqlens, state_checkpoints = saved_tensors[:7]
+        gate_params = list(saved_tensors[7:])
     else:
-        q, k, v, g, beta, cu_seqlens = ctx.saved_tensors[:6]
+        q, k, v, g, beta, cu_seqlens = saved_tensors[:6]
         state_checkpoints = None
-        gate_params = list(ctx.saved_tensors[6:])
+        gate_params = list(saved_tensors[6:])
     a_log = gate_params.pop(0) if ctx.has_a_log else None
     dt_bias = gate_params.pop(0) if ctx.has_dt_bias else None
     initial_state = ctx.initial_state

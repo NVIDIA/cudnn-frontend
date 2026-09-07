@@ -30,6 +30,7 @@ cudnn = pytest.importorskip("cudnn")
 la_ops = pytest.importorskip("cudnn.linear_attention.ops")
 
 import torch.nn.functional as F  # noqa: E402
+import torch.utils.checkpoint  # noqa: E402
 
 from .conftest import gen_qkv  # noqa: E402
 from .reference_gdn import gdn_reference, gdp_reference, rms_ratio  # noqa: E402
@@ -697,6 +698,28 @@ def test_bwd_gqa_qk_l2norm(backend, H, HK, HV, V):
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_varlen(backend, variant, seq_lens):
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, seq_lens=seq_lens))
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_under_nonreentrant_activation_checkpoint(backend, variant):
+    """Saved-tensor hooks may be unpacked only once during checkpoint replay."""
+    case = make_case(variant, torch.bfloat16, T=128, H=1)
+    leaves = [value.detach().clone().requires_grad_(True) for value in op_args(case)[:-1]]
+
+    def forward(*values):
+        output, _ = pinned_op(backend, variant)(*values, case.cu)
+        return output
+
+    with waive_unsupported(backend, variant):
+        output = torch.utils.checkpoint.checkpoint(
+            forward,
+            *leaves,
+            use_reentrant=False,
+        )
+        output.float().square().mean().backward()
+
+    assert all(value.grad is not None for value in leaves)
 
 
 @pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
@@ -2569,6 +2592,23 @@ def run_gdp(pinned, *args, **kw):
         return pinned(*args, **kw)
     except cudnn.cudnnGraphNotSupportedError as exc:
         pytest.skip(f"gdp_frost declined: {exc}")
+
+
+def test_gdp_bwd_under_nonreentrant_activation_checkpoint(gdp_frost):
+    base, expanded = make_gdp_case(torch.bfloat16, 2, T=128, H=1)
+    values = [value.detach().clone().requires_grad_(True) for value in gdp_args(base, expanded, 2)[:5]]
+
+    def forward(*leaves):
+        output, _ = gdp_frost(*leaves, base.cu, 2)
+        return output
+
+    output = torch.utils.checkpoint.checkpoint(
+        forward,
+        *values,
+        use_reentrant=False,
+    )
+    output.float().square().mean().backward()
+    assert all(value.grad is not None for value in values)
 
 
 def make_gdp_case(dtype, n, *, B=1, T=None, seq_lens=None, H=2, HK=None, HV=None, K=128, V=128, lo=None, seed=SEED):
