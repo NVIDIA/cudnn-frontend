@@ -393,7 +393,12 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
     b, h, d, dev = case.b, case.h, case.d, "cuda"
     hkv = h if hkv is None else hkv
     io = cudnn.data_type.HALF if case.dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    s_max_q, s_max_kv = max(max(case.lens_q), 1), max(max(case.lens_kv), 1)
+    # Keep a legal non-degenerate graph envelope even when this step's packed
+    # totals are both zero.  The envelope is a declared capacity, not cu[-1];
+    # cuDNN rejects the unrelated dense S_q=S_kv=1 special case before engine
+    # selection, while a normal model still declares max_seqlen > 1 on an
+    # all-empty microbatch.
+    s_max_q, s_max_kv = max(max(case.lens_q), 2), max(max(case.lens_kv), 2)
     st_q = [s_max_q * h * d, d, h * d, 1]
     st_kv = [s_max_kv * hkv * d, d, hkv * d, 1]
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -464,7 +469,20 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
     return g, vp, (dq_t, dk_t, dv_t)
 
 
-def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, stats_layout="head_major", poison=False, pad_cap=0, **kw):
+def _run_graph(
+    lens_q,
+    lens_kv,
+    *,
+    h=2,
+    hkv=None,
+    d=_D,
+    dtype=torch.bfloat16,
+    stats_layout="head_major",
+    poison=False,
+    poison_outputs=False,
+    pad_cap=0,
+    **kw,
+):
     """Build the ragged graph, PIN the engine, execute, compare per sequence.
 
     ``use_causal_mask`` / ``use_causal_mask_bottom_right`` thread through ``kw``
@@ -499,8 +517,9 @@ def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, st
     # dK / dV carry H_kv heads under GQA, so they are shaped from the graph's
     # KV head count, not from the Q tensors.
     _kvh = h if hkv is None else hkv
-    dq = torch.zeros_like(case.q)
-    dk, dv = (torch.zeros(1, case.cap_kv, _kvh, d, device="cuda", dtype=dtype) for _ in range(2))
+    fill = float("nan") if poison_outputs else 0.0
+    dq = torch.full_like(case.q, fill)
+    dk, dv = (torch.full((1, case.cap_kv, _kvh, d), fill, device="cuda", dtype=dtype) for _ in range(2))
     vp.update({dq_t: dq, dk_t: dk, dv_t: dv})
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute(vp, ws)
@@ -533,6 +552,81 @@ def test_graph_thd_stats_packings(layout):
     total -- the forward rounds its token capacity up to 64.
     """
     _run_graph((300, 128), (300, 128), stats_layout=layout)
+
+
+def test_public_torch_op_thd_gqa_autograd_preserves_packed_stats():
+    """The public differentiable op reaches the THD+GQA d512 engine.
+
+    The direct graph tests above deliberately pin ``sdpa_bwd_sm100`` and feed
+    packed Stats, but that does not prove the public autograd bridge preserves
+    the forward's packed ``(T, H, 1)`` LSE.  Re-padding it makes the only d512
+    THD backward engine decline the graph, leaving a feature that is tested
+    internally but unreachable by a user.
+    """
+    from cudnn.torch import served_plan_names
+
+    frost_before = sum(_ENGINE in name for name in served_plan_names())
+    # Both totals are in the same 128-row private delta bucket.  Buffer capacities are
+    # exact graph attributes, so the second call must not reuse the first
+    # call's plan merely because their private workspaces round alike.
+    for lens in ((128, 97), (128, 101)):
+        case = _thd_case(lens, lens, h=4, hkv=2, d=_D, dtype=torch.bfloat16, causal=True)
+        q = case.q[0, : case.t_q].detach().requires_grad_(True)
+        k = case.k[0, : case.t_kv].detach().requires_grad_(True)
+        v = case.v[0, : case.t_kv].detach().requires_grad_(True)
+        cu = torch.tensor(case.cu_q, dtype=torch.int32, device="cuda")
+
+        o, lse = cudnn.sdpa_torch(
+            q,
+            k,
+            v,
+            scale=case.scale,
+            is_causal=True,
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            max_seqlen_q=max(case.lens_q),
+            max_seqlen_kv=max(case.lens_kv),
+            return_lse=True,
+        )
+        assert lse.shape == (case.t_q, case.h, 1)
+        torch.testing.assert_close(o, case.o[0, : case.t_q], rtol=2e-2, atol=2e-2)
+
+        o.backward(case.do[0, : case.t_q])
+        for name, grad in (("dQ", q.grad), ("dK", k.grad), ("dV", v.grad)):
+            assert grad is not None and torch.isfinite(grad).all(), f"{name} is missing or non-finite"
+        _check(case, q.grad.unsqueeze(0), k.grad.unsqueeze(0), v.grad.unsqueeze(0), hkv=case.hkv)
+    assert sum(_ENGINE in name for name in served_plan_names()) == frost_before + 2
+
+
+def test_torch_varlen_provider_thd_gqa_autograd_preserves_packed_stats():
+    """PyTorch's registered CUDNN varlen provider also reaches this engine."""
+    from torch.nn.attention import activate_flash_attention_impl, restore_flash_attention_impl
+    from torch.nn.attention.varlen import varlen_attn
+
+    import cudnn.torch as provider
+
+    # Use a different exact total from the public-op test above so this call
+    # adds its own cached backward graph and route attribution is observable.
+    case = _thd_case((128, 99), (128, 99), h=4, hkv=2, d=_D, dtype=torch.bfloat16, causal=True)
+    q = case.q[0, : case.t_q].detach().requires_grad_(True)
+    k = case.k[0, : case.t_kv].detach().requires_grad_(True)
+    v = case.v[0, : case.t_kv].detach().requires_grad_(True)
+    cu = torch.tensor(case.cu_q, dtype=torch.int32, device="cuda")
+    fwd_before, bwd_before = provider.calls["fwd"], provider.calls["bwd"]
+    frost_before = sum(_ENGINE in name for name in provider.served_plan_names())
+
+    activate_flash_attention_impl("CUDNN")
+    try:
+        o = varlen_attn(q, k, v, cu, cu, max(case.lens_q), max(case.lens_kv), window_size=(-1, 0), enable_gqa=True)
+        torch.testing.assert_close(o, case.o[0, : case.t_q], rtol=2e-2, atol=2e-2)
+        o.backward(case.do[0, : case.t_q])
+    finally:
+        restore_flash_attention_impl()
+
+    assert provider.calls["fwd"] == fwd_before + 1
+    assert provider.calls["bwd"] == bwd_before + 1
+    assert sum(_ENGINE in name for name in provider.served_plan_names()) == frost_before + 1
+    _check(case, q.grad.unsqueeze(0), k.grad.unsqueeze(0), v.grad.unsqueeze(0), hkv=case.hkv)
 
 
 def test_graph_thd_zero_length_sequence():
@@ -579,6 +673,29 @@ def test_graph_thd_one_sided_empty_sequence(lens_q, lens_kv):
     sl_k = slice(case.cu_k[i], case.cu_k[i] + case.lens_kv[i])
     for name, got in (("dQ", dq[0, sl_q]), ("dK", dk[0, sl_k]), ("dV", dv[0, sl_k])):
         assert got.numel() == 0 or not got.any(), f"{name} of a one-sided-empty sequence must be exactly zero, got max |{got.abs().max().item()}|"
+
+
+@pytest.mark.parametrize(
+    "lens_q,lens_kv",
+    (
+        ((0, 0), (64, 33)),
+        ((64, 33), (0, 0)),
+        ((0, 0), (0, 0)),
+    ),
+    ids=("empty_q_pack", "empty_kv_pack", "both_packs_empty"),
+)
+def test_graph_thd_zero_total_side(lens_q, lens_kv):
+    """A whole packed side may have zero storage, not merely one sequence.
+
+    CUDA tensor maps cannot encode a zero global extent.  The adapter therefore
+    binds a one-token workspace dummy while device metadata suppresses every
+    access.  Poisoning the nonempty output proves the zero-reduction epilogue
+    actually overwrites it; a pre-zeroed output would let a skipped launch pass.
+    """
+    case, dq, dk, dv = _run_graph(lens_q, lens_kv, h=4, hkv=2, poison_outputs=True)
+    for name, got in (("dQ", dq), ("dK", dk), ("dV", dv)):
+        live = got[0, : case.t_q] if name == "dQ" else got[0, : case.t_kv]
+        assert live.numel() == 0 or not live.any(), f"{name} for an empty reduction must be exactly zero"
 
 
 def test_graph_thd_nan_capacity_tail():

@@ -252,16 +252,13 @@ def _varlen_bwd(grad_out, query, key, value, out, lse, cu_seq_q, cu_seq_k, max_q
 
     calls["bwd"] += 1
     attn_scale = scale if scale is not None else query.shape[-1] ** -0.5
-    # (H, T) packed -> (B, H, max_q, 1) padded: the backend rejects ragged LSE
-    # for bprop THD on SM8X/SM12X, so the bwd op takes the padded layout.
-    # (H, T) -> (T, H) for the shared device-side repad. The naive
-    # `for i in range(B): int(cu_seq_q[i])` loop that used to live here was
-    # 2*B blocking D2H copies per backward call, before the kernel even
-    # launched — an async-launch API turned synchronous, and un-capturable
-    # (python/cudnn/AGENTS.md Rule 3).
-    lse_padded = _cudnn_ops.thd_lse_to_padded(lse.transpose(0, 1), cu_seq_q, max_q)
+    # PyTorch carries packed Stats as (H, T); hand the (T, H) view to the
+    # semantic backward op unchanged.  It preserves that packing for FROST's
+    # SM100 large-head THD engine and performs the legacy backend's device-side
+    # repad itself, so this provider does not duplicate engine layout policy.
+    lse_packed = lse.transpose(0, 1)
     dq, dk, dv = torch.ops.cudnn.sdpa_bwd(
-        grad_out, query, key, value, out, lse_padded, attn_scale,
+        grad_out, query, key, value, out, lse_packed, attn_scale,
         is_causal=is_causal, window_left=_fa_window_left_to_cudnn(ws[0]), window_right=window_right,
         cu_seqlens_q=cu_seq_q, cu_seqlens_kv=cu_seq_k,
         max_seqlen_q=max_q, max_seqlen_kv=max_k,

@@ -24,12 +24,12 @@ engines) per config.
 
 Backward contract: ``sdpa_bwd`` serves the THD/varlen path and the unpadded
 dense BHSD path (sink backward, and dense backward with per-batch lengths,
-are follow-ups and raise ``NotImplementedError``). On THD it consumes a
-PADDED ``(B, H, max_seqlen_q, 1)`` fp32 LSE — a backend restriction (bprop THD
-rejects ragged LSE on SM8X/SM12X). ``sdpa_fwd`` is differentiable on the
+are follow-ups and raise ``NotImplementedError``). On THD it accepts either
+the forward's packed ``(T, H, 1)`` fp32 LSE or the legacy backend's padded
+``(B, H, max_seqlen_q, 1)`` form. ``sdpa_fwd`` is differentiable on the
 varlen path via ``torch.library.register_autograd`` when called with
-``return_lse=True``; the autograd glue converts the packed TH1 stats to the
-padded layout the backward needs.
+``return_lse=True``; autograd preserves the packed result and ``sdpa_bwd``
+repads internally only when the serving path needs the legacy layout.
 
 Public entry point: ``cudnn.sdpa_torch`` (lazy export — accessing it imports
 this module, which registers the ops; ``torch`` is not imported before then).
@@ -187,10 +187,6 @@ def _int64_col(t: torch.Tensor) -> torch.Tensor:
     """(N, 1, 1, 1) INT64 column: ragged offsets are int64 so element offsets
     (token prefix sums x token stride) cannot overflow."""
     return t.to(torch.int64).reshape(-1, 1, 1, 1)
-
-
-def _round64(n: int) -> int:
-    return ((n + 63) // 64) * 64
 
 
 def _check_same_device(q: torch.Tensor, **tensors) -> None:
@@ -565,6 +561,7 @@ def _build_bwd_graph(
     v_stride,
     o_stride,
     stats_stride,
+    stats_is_packed: bool,
     is_deterministic: bool,
     is_thd: bool,
     dq_stride=None,
@@ -592,8 +589,6 @@ def _build_bwd_graph(
     v_t = g.tensor(name="v", dim=[B, H_v, S_kv, D_v], stride=list(v_stride), data_type=io_dtype, uid=_UIDs.V)
     o_t = g.tensor(name="o", dim=[B, H_q, S_q, D_v], stride=list(o_stride), data_type=io_dtype, uid=_UIDs.O)
     do_t = g.tensor(name="dO", dim=[B, H_q, S_q, D_v], stride=list(o_stride), data_type=io_dtype, uid=_UIDs.DO)
-    # Stats stay PADDED dense even in THD: the backend rejects ragged LSE for
-    # bprop THD on SM8X/SM12X ("Packed/ragged LSE is not supported").
     stats_t = g.tensor(name="stats", dim=[B, H_q, S_q, 1], stride=list(stats_stride), data_type=cudnn.data_type.FLOAT, uid=_UIDs.STATS)
 
     seq_q_t = seq_kv_t = None
@@ -613,6 +608,12 @@ def _build_bwd_graph(
         v_t.set_ragged_offset(rv)
         o_t.set_ragged_offset(ro)
         do_t.set_ragged_offset(ro)
+        if stats_is_packed:
+            # FROST's THD path consumes the forward's token-major packed LSE
+            # directly.  The descriptor keeps the ragged BHS1 envelope while
+            # this offset maps each batch to its first packed token.
+            rs = g.tensor(name="ragged_stats", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_STATS)
+            stats_t.set_ragged_offset(rs)
 
     rb = window_right if window_right >= 0 else (0 if is_causal else None)
     lb = window_left if window_left >= 0 else None
@@ -633,7 +634,11 @@ def _build_bwd_graph(
         use_padding_mask=is_thd,
         seq_len_q=seq_q_t,
         seq_len_kv=seq_kv_t,
-        **({"max_total_seq_len_q": _round64(total_q), "max_total_seq_len_kv": _round64(total_kv)} if is_thd else {}),
+        # These are buffer capacities, not workspace tile sizes.  The engine
+        # rounds its private workspace internally; overstating either capacity
+        # makes it form an out-of-bounds packed view over an exact-size caller
+        # tensor.
+        **({"max_total_seq_len_q": total_q, "max_total_seq_len_kv": total_kv} if is_thd else {}),
         diagonal_alignment=alignment,
         diagonal_band_left_bound=lb,
         diagonal_band_right_bound=rb,
@@ -786,6 +791,7 @@ def _sdpa_bwd_dense(
             v_stride=v.stride(),
             o_stride=o.stride(),
             stats_stride=stats_stride,
+            stats_is_packed=False,
             is_deterministic=is_deterministic,
             is_thd=False,
             dq_stride=dq_stride,
@@ -887,16 +893,36 @@ def _sdpa_bwd_impl(
     S_q, S_kv = max_seqlen_q, max_seqlen_kv
     _check_same_device(q, k=k, v=v, o=o, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv, lse=lse, grad_out=grad_out)
 
-    # lse arrives PADDED (B, H, max_seqlen_q) or (B, H, max_seqlen_q, 1) fp32
-    # — a backend restriction (bprop THD rejects ragged LSE on SM8X/SM12X).
-    # Rows past each sequence's length are ignored. Normalize BEFORE reshape
-    # (reshape of a non-contiguous tensor silently copies or raises), and also
-    # on base-pointer misalignment.
+    # Accept both public layouts.  FROST SM100 consumes token-major packed LSE
+    # in place; classic backend THD consumes a padded per-batch rectangle.
+    # Normalize before reshape (a non-contiguous reshape may silently copy),
+    # and also repair a base-pointer alignment violation.
     if lse.dtype != torch.float32:
         raise ValueError(f"lse must be float32, got {lse.dtype}")
+    packed_shapes = {(T_q, H_q), (T_q, H_q, 1)}
+    padded_shapes = {(B, H_q, S_q), (B, H_q, S_q, 1)}
+    stats_is_packed = tuple(lse.shape) in packed_shapes
+    if not stats_is_packed and tuple(lse.shape) not in padded_shapes:
+        raise ValueError(
+            "THD lse must be packed (T_q, H_q[, 1]) or padded "
+            f"(B, H_q, max_seqlen_q[, 1]); got {tuple(lse.shape)}, "
+            f"expected one of {sorted(packed_shapes | padded_shapes)}"
+        )
     if not lse.is_contiguous() or lse.data_ptr() % 16:
         lse = lse.clone(memory_format=torch.contiguous_format)
-    lse = lse.reshape(B, H_q, S_q, 1)
+    if stats_is_packed and not _thd_bwd_prefers_packed_stats(q, k, v, o, S_q, is_deterministic):
+        # Public forward always returns packed TH1.  Keep direct bwd callers
+        # equivalent to autograd: adapt inside this semantic op when the
+        # serving path is the classic backend rather than making every caller
+        # know an engine's private Stats layout.
+        lse = thd_lse_to_padded(lse.reshape(T_q, H_q, 1)[:, :, 0], cu_seqlens_q, S_q)
+        stats_is_packed = False
+    if stats_is_packed:
+        lse = lse.reshape(T_q, H_q, 1)
+        stats_stride = (S_q * H_q, 1, H_q, 1)  # TH1 token-major
+    else:
+        lse = lse.reshape(B, H_q, S_q, 1)
+        stats_stride = (H_q * S_q, S_q, 1, 1)  # padded dense BHS1
     # Normalize dO to O's layout; ALSO on base-pointer misalignment — equal
     # strides with an odd storage offset would fault the kernels.
     if grad_out.stride() != o.stride() or grad_out.data_ptr() % 16:
@@ -906,7 +932,6 @@ def _sdpa_bwd_impl(
     k_stride = _thd_desc_stride(k, S_kv)
     v_stride = _thd_desc_stride(v, S_kv)
     o_stride = _thd_desc_stride(o, S_q)
-    stats_stride = (H_q * S_q, S_q, 1, 1)  # padded dense BHS1
 
     key = (
         "sdpa_bwd",
@@ -915,13 +940,12 @@ def _sdpa_bwd_impl(
         H_q,
         H_k,
         H_v,
-        # The packed token totals are BAKED into the graph (they size the dq
-        # accumulator via max_total_seq_len_*): a plan built for smaller
-        # totals must not serve a call with larger ones. Rounded to the same
-        # 64-token granularity the graph uses, so the cache still hits across
-        # calls that share an accumulator size.
-        _round64(T_q),
-        _round64(T_kv),
+        # The exact packed token capacities are baked into the graph.  They
+        # describe caller storage as well as sizing workspace, so even two
+        # exact totals cannot share a plan, even when their private workspaces
+        # happen to use the same rounded buckets.
+        T_q,
+        T_kv,
         S_q,
         S_kv,
         D_qk,
@@ -935,6 +959,7 @@ def _sdpa_bwd_impl(
         causal_bottom_right,
         window_left,
         window_right,
+        stats_is_packed,
         is_deterministic,
         q.device,
     )
@@ -965,6 +990,7 @@ def _sdpa_bwd_impl(
             v_stride=v_stride,
             o_stride=o_stride,
             stats_stride=stats_stride,
+            stats_is_packed=stats_is_packed,
             is_deterministic=is_deterministic,
             is_thd=True,
         ),
@@ -997,6 +1023,8 @@ def _sdpa_bwd_impl(
         int(_UIDs.SEQ_LEN_Q): _int32_col(cu_seqlens_q[1:] - cu_seqlens_q[:-1]),
         int(_UIDs.SEQ_LEN_KV): _int32_col(cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]),
     }
+    if stats_is_packed:
+        variant[int(_UIDs.RAGGED_STATS)] = _int64_col(cu_seqlens_q.to(torch.int64) * H_q)
 
     g.execute(variant, workspace, handle=handle)
     return dq, dk, dv
@@ -1043,9 +1071,9 @@ def _sdpa_bwd_fake(
 
 # ---------------------------------------------------------------------------
 # Autograd: sdpa_fwd is differentiable on the varlen path (dense/sink
-# backward raise until their engine contracts land). The glue converts the
-# forward's packed TH1 stats to the padded (B, H, max_seqlen_q, 1) layout the
-# backward requires.
+# backward raise until their engine contracts land). Autograd hands the
+# forward's packed TH1 Stats straight to the semantic backward op; that op
+# owns any serving-engine layout adaptation.
 # ---------------------------------------------------------------------------
 
 
@@ -1092,9 +1120,10 @@ def _sdpa_setup_context(ctx, inputs, output):
 def thd_lse_to_padded(lse_th: torch.Tensor, cu_seqlens_q: torch.Tensor, max_seqlen_q: int) -> torch.Tensor:
     """Packed ``(T, H)`` log-sum-exp -> padded ``(B, H, max_seqlen_q, 1)``.
 
-    ``cudnn::sdpa_bwd`` takes the padded layout on the THD path (the backend
-    rejects ragged LSE for bprop THD on SM8X/SM12X). Rows past each sequence's
-    length stay zero and are ignored.
+    This is the compatibility bridge for legacy backend THD engines, which
+    reject ragged LSE on SM8X/SM12X.  The semantic ``cudnn::sdpa_bwd`` op also
+    accepts packed Stats directly and preserves them for native FROST engines.
+    Rows past each sequence's length stay zero and are ignored here.
 
     Entirely DEVICE-side, and deliberately so: the obvious
     ``for i in range(B): int(cu[i])`` loop is ``2*B`` blocking D2H copies
@@ -1107,12 +1136,59 @@ def thd_lse_to_padded(lse_th: torch.Tensor, cu_seqlens_q: torch.Tensor, max_seql
     B = cu_seqlens_q.numel() - 1
     T, H = lse_th.shape
     cu = cu_seqlens_q.long()
-    token = torch.arange(T, device=lse_th.device)
-    seq_of_token = torch.searchsorted(cu[1:], token, right=True)  # t in [cu[i], cu[i+1]) -> i
-    pos_in_seq = token - cu[seq_of_token]
-    padded = torch.zeros(B, H, max_seqlen_q, 1, dtype=torch.float32, device=lse_th.device)
-    padded[seq_of_token, :, pos_in_seq, 0] = lse_th
-    return padded
+    pos = torch.arange(max_seqlen_q, device=lse_th.device)
+    lengths = cu[1:] - cu[:-1]
+    token = cu[:-1, None] + pos[None, :]
+    live = pos[None, :] < lengths[:, None]
+    # Gather output cells from the packed input rather than scattering every
+    # capacity row.  Thus rows at/after cu[-1] are never indexed at all, and
+    # there are no duplicate/atomic writes under deterministic mode.
+    safe_token = token.clamp(min=0, max=max(T - 1, 0))
+    gathered = lse_th[safe_token] if T else torch.zeros(B, max_seqlen_q, H, dtype=lse_th.dtype, device=lse_th.device)
+    return torch.where(live[:, :, None], gathered, 0.0).permute(0, 2, 1).unsqueeze(-1).contiguous()
+
+
+def _thd_bwd_prefers_packed_stats(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    max_seqlen_q: int,
+    is_deterministic: bool,
+) -> bool:
+    """Whether the currently offered THD backward consumes packed Stats.
+
+    This is layout routing, not model matching: the SM100 large-head engine is
+    the one backward capability cell whose contract is ragged Stats.  Classic
+    backend THD paths require padded Stats instead.  Keep the predicate beside
+    the bridge so the public forward's native packed result is not destroyed
+    before the engine that owns it sees the graph.  This runs inside the CUDA
+    custom op, so AOT autograd never captures an environment/device decision.
+    """
+    from cudnn.engines.manifest import opt_in_engines_enabled
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    if not opt_in_engines_enabled() or is_deterministic or max_seqlen_q <= 1:
+        return False
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        return False
+    major, minor = torch.cuda.get_device_capability(q.device)
+    sm = major * 10 + minor
+    d_qk, d_v = q.shape[-1], v.shape[-1]
+
+    def _is_compact_thd(t: torch.Tensor) -> bool:
+        _, h, d = t.shape
+        return tuple(t.stride()) == (h * d, d, 1)
+
+    # The graph analyzer's layout filter is intentionally coarse; this adapter
+    # has no THD staging leg and accepts only exact compact BSHD physical
+    # storage.  Mirror that final capability here so a kv-interleaved public
+    # input is repadded for the legacy engine instead of building a ragged-Stats
+    # graph for a FROST plan that will decline it.
+    return (
+        100 <= sm <= 103 and d_qk == d_v and k.shape[1] == v.shape[1] and 256 < d_qk <= 512 and d_qk % 8 == 0 and all(_is_compact_thd(t) for t in (q, k, v, o))
+    )
 
 
 def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
@@ -1144,11 +1220,7 @@ def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
         )
         return (dq, dk, dv) + (None,) * 13
 
-    # Packed TH1 (T, H, 1) -> padded (B, H, max_seqlen_q, 1): the backend
-    # rejects ragged LSE for bprop THD on SM8X/SM12X. Entirely device-side
-    # (no host reads of cu values): traceable under dynamic-shape AOT
-    # dispatch, and no D2H sync on the backward hot path.
-    lse_padded = thd_lse_to_padded(stats[:, :, 0], cu_q, ctx.max_seqlen_q)
+    deterministic = torch.are_deterministic_algorithms_enabled()
 
     dq, dk, dv = torch.ops.cudnn.sdpa_bwd(
         grad_o,
@@ -1156,7 +1228,7 @@ def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
         k,
         v,
         o,
-        lse_padded,
+        stats,
         ctx.attn_scale,
         is_causal=ctx.is_causal,
         causal_bottom_right=ctx.causal_bottom_right,
@@ -1166,7 +1238,7 @@ def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
         cu_seqlens_kv=cu_kv,
         max_seqlen_q=ctx.max_seqlen_q,
         max_seqlen_kv=ctx.max_seqlen_kv,
-        is_deterministic=torch.are_deterministic_algorithms_enabled(),
+        is_deterministic=deterministic,
     )
     # One grad slot per op input: (q, k, v, attn_scale, is_causal,
     # causal_bottom_right, window_left, window_right, sinks, seq_len_q,
