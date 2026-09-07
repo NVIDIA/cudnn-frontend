@@ -1084,11 +1084,16 @@ def test_intermediate_requires_full_mma_n_tile():
 
 
 @pytest.mark.L0
-def test_activation_scale_rows_are_padded_to_16_bytes():
+def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
+    import cudnn.moe_ep._megamoe_backend.mxfp8._adapter as adapter_module
     from cudnn import MoeEp
     from cudnn.moe_ep._megamoe_backend._workspace import (
         WorkspaceRequirements,
         padded_mxfp8_scale_columns,
+    )
+    from cudnn.moe_ep._megamoe_backend.mxfp8._adapter import (
+        Mxfp8InputAdapter,
+        Mxfp8Weights,
     )
 
     assert padded_mxfp8_scale_columns(128) == 16
@@ -1101,8 +1106,71 @@ def test_activation_scale_rows_are_padded_to_16_bytes():
             kernel_local_workspace_bytes=128,
             kernel_shared_workspace_bytes=128,
         )
-    activation_scale = next(region for region in requirements.symmetric_regions if region.name == "activation_scale")
-    assert activation_scale.nbytes == 5 * 16
+    activation_scale = next(
+        region
+        for region in requirements.symmetric_regions
+        if region.name == "activation_scale"
+    )
+    assert activation_scale.nbytes == 128 * 16
+
+    capacity = 5
+    hidden = 128
+    top_k = 2
+    symmetric = {
+        "activation_data": torch.empty(capacity * hidden, dtype=torch.uint8),
+        "activation_scale": torch.empty(activation_scale.nbytes, dtype=torch.uint8),
+        "topk_weights": torch.empty(capacity * top_k * 4, dtype=torch.uint8),
+        "output_data": torch.empty(capacity * hidden * 2, dtype=torch.uint8),
+        "kernel_shared_workspace": torch.empty(128, dtype=torch.uint8),
+    }
+    local = {
+        "topk_idx": torch.empty(capacity * top_k * 4, dtype=torch.uint8),
+        "overflow_flag": torch.empty(4, dtype=torch.uint8),
+        "kernel_local_workspace": torch.empty(128, dtype=torch.uint8),
+    }
+    request = SimpleNamespace(
+        token_count=1,
+        activation=object(),
+        topk_idx=torch.zeros((1, top_k), dtype=torch.int32),
+        topk_weights=torch.ones((1, top_k), dtype=torch.float32),
+    )
+    staged_activation = SimpleNamespace(
+        data=torch.zeros((1, hidden), dtype=torch.float8_e4m3fn),
+        scale=torch.zeros((1, hidden // 32), dtype=torch.float8_e8m0fnu),
+    )
+    config = SimpleNamespace(
+        max_tokens_per_rank=capacity,
+        hidden=hidden,
+        top_k=top_k,
+        generate_c=False,
+        enable_col_quant=False,
+        fc2_in_kernel_topk_reduce=True,
+        combine_format="bf16",
+    )
+    resources = SimpleNamespace(
+        workspace=SimpleNamespace(symmetric=symmetric, local=local),
+    )
+    weights = Mxfp8Weights(*(torch.empty(0) for _ in range(4)))
+    adapter = Mxfp8InputAdapter()
+    monkeypatch.setattr(adapter_module, "_as_mxfp8", lambda _: staged_activation)
+    monkeypatch.setattr(adapter, "_prepare_weights", lambda *_: weights)
+
+    launch = adapter.stage(
+        request,
+        resources,
+        config,
+        local_workspace_zero_bytes=0,
+        shared_workspace_zero_bytes=0,
+        pre_reduced_activation_offset=None,
+        pre_reduced_activation_bytes_per_token=0,
+        pre_reduced_activation_sf_offset=None,
+        pre_reduced_activation_sf_bytes_per_token=0,
+        col_quant_data_rows=0,
+        col_quant_sf_elements=0,
+    )
+
+    assert launch.activation_sf.shape == (capacity, 16)
+    assert launch.activation_sf.data_ptr() == symmetric["activation_scale"].data_ptr()
 
 
 @pytest.mark.L0
