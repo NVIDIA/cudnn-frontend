@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.utils.checkpoint
 from fe_api.causal_conv1d_bulk.reference import causal_conv1d_bulk_reference
 
 pytestmark = [
@@ -222,3 +223,37 @@ def test_public_inference_separates_bf16_and_fp32_weight_plans() -> None:
 
     torch.testing.assert_close(actual_bf16.float(), expected_bf16.transpose(1, 2).float(), atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(actual_fp32.float(), expected_fp32.transpose(1, 2).float(), atol=3e-2, rtol=3e-2)
+
+
+def test_public_packed_bias_backward_under_nonreentrant_checkpoint() -> None:
+    """Optional saved inputs must share checkpoint's one unpack operation."""
+
+    _require_native_route()
+    from cudnn.ops.causal_conv1d import causal_conv1d
+
+    generator = torch.Generator(device="cuda").manual_seed(20260907)
+    x = torch.randn((1, 8, 16), device="cuda", dtype=torch.bfloat16, generator=generator).requires_grad_()
+    weight = torch.randn((16, 4), device="cuda", dtype=torch.bfloat16, generator=generator).requires_grad_()
+    bias = torch.randn((16,), device="cuda", dtype=torch.bfloat16, generator=generator).requires_grad_()
+    cu_seqlens = torch.tensor([0, 3, 8], device="cuda", dtype=torch.int32)
+
+    def forward(x_value, weight_value, bias_value):
+        return causal_conv1d(
+            x_value.transpose(1, 2),
+            weight_value,
+            bias_value,
+            "silu",
+            cu_seqlens=cu_seqlens,
+        )
+
+    output = torch.utils.checkpoint.checkpoint(
+        forward,
+        x,
+        weight,
+        bias,
+        use_reentrant=False,
+    )
+    output.float().square().mean().backward()
+    assert x.grad is not None
+    assert weight.grad is not None
+    assert bias.grad is not None
