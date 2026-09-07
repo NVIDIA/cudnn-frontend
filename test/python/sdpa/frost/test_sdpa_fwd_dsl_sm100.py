@@ -290,6 +290,25 @@ def test_dsl_sm100_d192_d128(dtype, is_causal):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@pytest.mark.L1
+@torch_fork_set_rng(seed=17)
+def test_dsl_sm100_d192_d128_short_bf16_lpt():
+    """The short BF16 LPT specialization preserves both output and LSE."""
+    _require_dsl()
+    b, h, s = 2, 8, 2048
+    d_qk, d_v = 192, 128
+    dtype = torch.bfloat16
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h, s, d_qk, dtype)
+    k = _bhsd(b, h, s, d_qk, dtype)
+    v = _bhsd(b, h, s, d_v, dtype)
+
+    o, stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), return_stats=True)
+    o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
