@@ -296,6 +296,7 @@ def compile_or_get(
         _COMPILE_CACHE[key] = compiled
         return compiled
 
+
 __all__ = [
     "CompiledMxfp8Kernel",
     "PreparedMxfp8Kernel",

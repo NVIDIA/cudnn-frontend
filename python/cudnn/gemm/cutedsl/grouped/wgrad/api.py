@@ -333,13 +333,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
     )
     if framework == "jax" and backend is GroupedGemmBackend.BLOCK_SCALED:
         raise ValueError(_BLOCK_SCALED_JAX_ERROR)
-    if descriptor_workspace is not None and (
-        backend is not GroupedGemmBackend.BLOCK_SCALED
-        or framework != "torch"
-    ):
-        raise ValueError(
-            "descriptor_workspace is supported only for torch block-scaled WGrad"
-        )
+    if descriptor_workspace is not None and (backend is not GroupedGemmBackend.BLOCK_SCALED or framework != "torch"):
+        raise ValueError("descriptor_workspace is supported only for torch block-scaled WGrad")
     explicit_dense_output_identity = None
     if (
         backend is GroupedGemmBackend.BLOCK_SCALED

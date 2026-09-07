@@ -136,9 +136,7 @@ def test_autotune_core_contracts(monkeypatch):
         patch.setattr(
             autotune_module.dist,
             "all_reduce",
-            lambda values, **kwargs: values.copy_(
-                torch.tensor([5.0, 8.0, 4.0], dtype=values.dtype)
-            ),
+            lambda values, **kwargs: values.copy_(torch.tensor([5.0, 8.0, 4.0], dtype=values.dtype)),
         )
         latency, samples = autotune_module.benchmark_candidate(
             lambda: None,
@@ -438,8 +436,7 @@ def _print_candidate_timings(label, result) -> None:
     for index, measurement in enumerate(result.candidates):
         samples = ", ".join(f"{sample:.4f}" for sample in measurement.samples_ms)
         print(
-            f"  [{index}] median={measurement.latency_ms:.4f} ms "
-            f"samples=[{samples}] tuning={measurement.tuning}",
+            f"  [{index}] median={measurement.latency_ms:.4f} ms " f"samples=[{samples}] tuning={measurement.tuning}",
             flush=True,
         )
 
@@ -515,9 +512,7 @@ def test_autotune_sm107_inference_training_and_graph():
         combine_format="bf16",
         weight_interleave_size=32,
     ) as op:
-        forward_staging, backward_staging = _allocate_training_weight_staging(
-            source_weights
-        )
+        forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         native_forward = op.pack_forward_weights(
             source_weights[0],
             out=forward_staging,

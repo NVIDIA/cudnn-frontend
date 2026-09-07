@@ -108,9 +108,7 @@ def set_stream(handle, stream):
     per stream regardless.)
     """
     if not isinstance(handle, Handle):
-        raise TypeError(
-            f"cudnn.set_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}"
-        )
+        raise TypeError(f"cudnn.set_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
     if handle.stream == stream:
         return
     if handle.backend_handle is not None:
@@ -122,9 +120,7 @@ def get_stream(handle):
     """The CUDA stream a :class:`cudnn.Handle` runs on -- the cached ``Handle.stream``, no
     backend round-trip."""
     if not isinstance(handle, Handle):
-        raise TypeError(
-            f"cudnn.get_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}"
-        )
+        raise TypeError(f"cudnn.get_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
     return handle.stream
 
 
@@ -133,9 +129,7 @@ def destroy_handle(handle):
     after destruction so a reused Handle object cannot pass a released ``cudnnHandle_t`` back to
     C++ (a double-destroy or a later set_stream)."""
     if not isinstance(handle, Handle):
-        raise TypeError(
-            f"cudnn.destroy_handle expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}"
-        )
+        raise TypeError(f"cudnn.destroy_handle expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
     backend = handle.backend_handle
     if backend is None:
         handle.stream = None
@@ -208,14 +202,10 @@ _pybind_module.backend_graph.tensor = _tensor
 
 def load_cudnn():
     # First look at python site packages
-    lib_path = glob.glob(
-        os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/bin/cudnn64_9.dll")
-    )
+    lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/bin/cudnn64_9.dll"))
 
     if lib_path:
-        assert (
-            len(lib_path) == 1
-        ), f"Found {len(lib_path)} libcudnn.dll.x in nvidia-cudnn-cuXX."
+        assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.dll.x in nvidia-cudnn-cuXX."
         lib = ctypes.windll.LoadLibrary(lib_path[0])
     else:  # Fallback
         lib = ctypes.windll.LoadLibrary("cudnn64_9.dll")
@@ -240,23 +230,13 @@ def _dlopen_cudnn():
             return
 
     # Then look at python site packages
-    lib_path = glob.glob(
-        os.path.join(
-            sysconfig.get_path("purelib"), "nvidia/cudnn/lib/libcudnn.so.*[0-9]"
-        )
-    )
+    lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/lib/libcudnn.so.*[0-9]"))
 
     if not lib_path:
-        lib_path = glob.glob(
-            os.path.join(
-                sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"
-            )
-        )
+        lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"))
 
     if lib_path:
-        assert (
-            len(lib_path) == 1
-        ), f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
+        assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
         lib = ctypes.CDLL(lib_path[0])
     else:  # Fallback
         try:
@@ -326,10 +306,7 @@ _EAGER_PUBLIC_NAMES = (
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _CUTEDSL_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
-_MOE_EP_INSTALL_HINT = (
-    "Install with 'pip install "
-    '"nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext\''
-)
+_MOE_EP_INSTALL_HINT = "Install with 'pip install " '"nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext\''
 _MOE_EP_OPTIONAL_IMPORTS = {
     "moe_ep",
     "BlockScaledTensor",
@@ -590,11 +567,7 @@ def _optional_dependency_message(name: str, error: Exception) -> str:
         too_old = None
     if too_old is not None:
         return f"{too_old}: {error}"
-    install_hint = (
-        _MOE_EP_INSTALL_HINT
-        if name in _MOE_EP_OPTIONAL_IMPORTS
-        else _CUTEDSL_INSTALL_HINT
-    )
+    install_hint = _MOE_EP_INSTALL_HINT if name in _MOE_EP_OPTIONAL_IMPORTS else _CUTEDSL_INSTALL_HINT
     return f"{name} requires optional dependencies. {install_hint}: {error}"
 
 
