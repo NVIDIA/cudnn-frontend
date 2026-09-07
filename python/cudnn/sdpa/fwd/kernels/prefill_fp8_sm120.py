@@ -73,7 +73,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     lpt_l2_tile_coords,
 )
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
-from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_kernel as _build_thd_meta_kernel, sanitize_v_tail as _sanitize_v_tail, THD_SETUP_THREADS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_kernel, sanitize_v_tail, THD_SETUP_THREADS
 from cudnn.sdpa.fwd.kernels._common_sm120 import (
     SCHED_L2_BUDGET_BYTES,
     ceil_div,
@@ -843,7 +843,7 @@ class SM120FusedMultiHeadAttentionForward:
         )
 
         if cutlass.const_expr(self.thd_varlen and in_mask_steps and is_first_kv_tile):
-            _sanitize_v_tail(
+            sanitize_v_tail(
                 mma_params.sV,
                 basic_params.lane,
                 basic_params.seqlen_k,
@@ -1682,7 +1682,7 @@ class SM120FusedMultiHeadAttentionForward:
             # Build the [kv|cu_q|cu_k|remap|live|ctr] metadata buffer DEVICE-side
             # from the caller's length tensors (no host cumsum, no H2D — issue
             # #552); the main kernel launched after it on this stream reads it.
-            _build_thd_meta_kernel(
+            build_thd_meta_kernel(
                 seq_kv_lens,
                 thd_q_lens,
                 thd_kv_lens,

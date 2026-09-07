@@ -1,12 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""PTX helpers shared by the SM120 SDPA-forward kernel flavors.
+"""PTX helpers shared by the SM120 SDPA-forward kernels.
 
-The per-flavor templates (``prefill_d<flavor>_{f16,fp8}_sm120.py``) are
-self-contained kernels that differ in head-tile geometry and MMA shape; the
-lane-level primitives below are the same in every one of them and live here
-so a fix lands once.
+``prefill_f16_sm120.py``, ``prefill_fp8_sm120.py``, and the D=256
+specialization ``prefill_d256_f16_sm120.py`` are self-contained kernels that
+differ in head-tile geometry, MMA shape, and warp roles; the lane-level
+primitives below are the same in every one of them and live here so a fix
+lands once.
 """
 
 from typing import Type

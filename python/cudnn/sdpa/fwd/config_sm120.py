@@ -21,22 +21,9 @@ FP8_HEAD_TILE_GRANULE = 32
 SUPPORTED_HEAD_TILES_FP8 = tuple(range(FP8_HEAD_TILE_GRANULE, SUPPORTED_HEAD_TILE_MAX + 1, FP8_HEAD_TILE_GRANULE))
 
 
-@dataclass(frozen=True)
-class Cfg:
-    D_QK: int
-    D_V: int
-    TILE_M: int
-    TILE_N: int
-
-
-D256_F16_CFG = Cfg(D_QK=256, D_V=256, TILE_M=64, TILE_N=64)
-D256_FP8_CFG = Cfg(D_QK=256, D_V=256, TILE_M=128, TILE_N=128)
-D256_FLAVOR = (D256_F16_CFG.D_QK, D256_F16_CFG.D_V)
-FLAVOR_CFGS = {D256_FLAVOR: (D256_F16_CFG, D256_FP8_CFG)}
-
-
-def flavor_cfg(flavor: tuple[int, int], fp8: bool) -> Cfg:
-    return FLAVOR_CFGS[flavor][fp8]
+D256_FLAVOR = (256, 256)
+F16_FLAVORS: frozenset[tuple[int, int]] = frozenset({D256_FLAVOR})
+FP8_FLAVORS: frozenset[tuple[int, int]] = frozenset()
 
 
 def pick_flavor(d_qk: int, d_v: int, fp8: bool) -> Optional[tuple[int, int]]:
@@ -45,7 +32,7 @@ def pick_flavor(d_qk: int, d_v: int, fp8: bool) -> Optional[tuple[int, int]]:
     granule), or ``None`` for the general template."""
     granule = FP8_HEAD_TILE_GRANULE if fp8 else HEAD_TILE_GRANULE
     tiles = (-(-d_qk // granule) * granule, -(-d_v // granule) * granule)
-    return tiles if tiles in FLAVOR_CFGS else None
+    return tiles if tiles in (FP8_FLAVORS if fp8 else F16_FLAVORS) else None
 
 
 # SMEM the SM120 parts expose to a kernel. The adapter asks cutlass for the
@@ -71,13 +58,17 @@ def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2
     One K tile (D_QK wide) plus one V tile (D_V wide), aliased with the
     q_tile x D_V output staging tile. The two terms size INDEPENDENTLY:
     ``itemsize`` is the QKV element, ``out_itemsize`` the staged output's, and
-    FP8 differs on exactly that (1-byte KV, half-precision O).
+    FP8 differs on exactly that (1-byte KV, half-precision O). The f16 D=256
+    kernel also keeps half of its Q tile resident in shared memory.
 
     Lives here rather than in the adapter because the ranking must not propose
     a tile the kernel cannot fit, and two answers to that question is how a plan
     list fills with entries that decline at build.
     """
-    return max(kv_tile * (d_qk + d_v) * itemsize, q_tile * d_v * (itemsize if out_itemsize is None else out_itemsize)) + 16
+    kv_or_o = max(kv_tile * (d_qk + d_v) * itemsize, q_tile * d_v * (itemsize if out_itemsize is None else out_itemsize))
+    flavor = pick_flavor(d_qk, d_v, fp8=itemsize == 1)
+    q_resident = q_tile * (flavor[0] // 2) * itemsize if flavor == D256_FLAVOR else 0
+    return kv_or_o + q_resident + 16
 
 
 @dataclass(frozen=True)

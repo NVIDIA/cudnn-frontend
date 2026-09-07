@@ -12,11 +12,9 @@ declare one are declined and route to the native backend).
 SM120 envelope (see engines._sm120_fp8_spec): E4M3/E5M2 in, FP16/BF16/FP8
 out (fp8 O via a direct quantizing store, Scale_O applied pre-cast), head
 TILES any multiple of 32 up to 256 with the QK^T and P@V sides independent,
-actual head dims any multiple of 16 up to the tile via TMA zero-padding; head
-dims that tile at 256 on both sides run the d256 template (what graphs can
-reach is further gated by the C++ sdpa_fp8
-node: d_qk <= 128 x d_v <= 128 plus the (192, 128) MLA pair, so the d256
-flavor is exercised through the template directly), causal /
+actual head dims any multiple of 16 up to the tile via TMA zero-padding
+(what graphs can reach is further gated by the C++ sdpa_fp8 node:
+d_qk <= 128 x d_v <= 128 plus the (192, 128) MLA pair), causal /
 bottom-right / SWA / right-band / KV-padding masks, per-batch seq_len_q trim,
 ragged S_kv without a padding mask (skv_tile=0), dense_flex layouts, THD
 (ragged) with token- or head-major Stats, and attention sinks
@@ -808,11 +806,10 @@ def _run_template_tail(D, D_v, *, mask, S=256):
     """Compile and launch the fp8 kernel template directly (production loader
     and adapter ABI) for head dims the graph front door cannot reach.
 
-    The engine row declares the kernels' full domain — multiples of 32 up to
+    The engine row declares the kernel's full domain — multiples of 32 up to
     256, QK^T/P@V sides independent — but the C++ sdpa_fp8 node admits only
     d_qk <= 128 x d_v <= 128 plus (192, 128) today, so the >128 tail is
-    protected here at the template level, through the same flavor pick the
-    adapter makes (the (256, 256) cases load the d256 template).
+    protected here at the template level.
 
     scale_s is 1.0 (P is cast to e4m3 unscaled and the reference does not
     model that cast), so the error floor is the bare P-quantization step
@@ -841,13 +838,7 @@ def _run_template_tail(D, D_v, *, mask, S=256):
     if mask == "padded":
         kw["seq_kv_lens_present"] = True
         seq_kv_lens = [S, S - 73]  # batch 1 ends inside a KV tile at an odd offset
-    from cudnn.sdpa.fwd.config_sm120 import flavor_cfg, pick_flavor
-
-    flavor = pick_flavor(D, D_v, fp8=True)
-    if flavor is not None:
-        cfg = flavor_cfg(flavor, fp8=True)
-        kw.update(q_tile=cfg.TILE_M, kv_tile=cfg.TILE_N)  # the flavor Cfg's default CTA tiles
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", api_dsl._SM120_FP8_KERNEL_FILES[flavor])
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "prefill_fp8_sm120.py")
     module = load_template(path, TemplateParams(**kw), tag=f"fp8_tail_d{D}_d{D_v}_{mask}")
     fn = module.compile(compute_capability=torch.cuda.get_device_capability(), b=B, qh=H, kh=H, sq=S, skv=S, d_qk=D, d_v=D_v, has_lse=False)
 
@@ -883,6 +874,7 @@ def _run_template_tail(D, D_v, *, mask, S=256):
         None,  # thd_q_lens (dense: folded out of the ABI)
         None,  # thd_kv_lens
         None,  # thd_lens_form
+        cutlass.Int32(0),  # thd_n_ctas (dense: no persistent grid)
         cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
     )
     torch.cuda.synchronize()
@@ -911,7 +903,7 @@ def _run_template_tail(D, D_v, *, mask, S=256):
         (256, 128, "causal"),
         (128, 256, "causal"),
         (224, 160, "causal"),
-        (240, 240, "causal"),  # d256 template, zero-padded 240 -> 256 on both sides
+        (240, 240, "causal"),  # zero-padded 240 -> 256 on both sides
         (240, 240, "none"),
     ],
 )

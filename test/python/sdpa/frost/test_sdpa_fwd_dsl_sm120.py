@@ -934,17 +934,19 @@ def test_dsl_sm120_thd():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128)], ids=["d64", "d128", "d192x128"])
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (248, 248)], ids=["d64", "d128", "d192x128", "d248"])
 @torch_fork_set_rng(seed=23)
 def test_dsl_sm120_thd_nan_capacity_tail(d_qk, d_v):
-    """THD with a NaN-poisoned capacity tail: O must be finite and correct."""
+    """THD with a NaN-poisoned capacity tail: O must be finite and correct.
+    (248, 248) runs the d256 kernel with zero-filled pad columns in the tail."""
 
     _run_thd_case(seq_q_lens=[200, 150, 47], seq_kv_lens=[200, 150, 47], head_dim=d_qk, head_dim_v=d_v, is_causal=True, nan_capacity_tail=True)
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [128, 256], ids=["d128", "d256"])
 @torch_fork_set_rng(seed=27)
-def test_dsl_sm120_thd_multi_unit_per_cta():
+def test_dsl_sm120_thd_multi_unit_per_cta(head_dim: int):
     """THD with more live units than the machine has CTAs.
 
     The other THD cases are small enough that every CTA is handed at most one
@@ -960,7 +962,7 @@ def test_dsl_sm120_thd_multi_unit_per_cta():
         seq_kv_lens=[1024, 768, 512, 256],
         h_q=8,
         h_kv=2,
-        head_dim=128,
+        head_dim=head_dim,
         is_causal=True,
         check_stats=True,
     )
@@ -1013,14 +1015,15 @@ def test_dsl_sm120_thd_gqa_sink(stats_layout: str):
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize("head_dim", [64, 256], ids=["d64", "d256"])
 @torch_fork_set_rng(seed=26)
-def test_dsl_sm120_thd_zero_length_sequence():
+def test_dsl_sm120_thd_zero_length_sequence(head_dim: int):
     """A zero-length sequence contributes no tokens and must not perturb its
     packed neighbors (O and ragged Stats). The last sequence has Q tokens but
     ZERO keys inside a live launch: its rows must come back O := 0 with
     LSE := -inf through the kernel's row_sum <= 0 guard, not stale memory."""
 
-    _run_thd_case(seq_q_lens=[128, 0, 64], seq_kv_lens=[100, 0, 0], is_causal=True, check_stats=True)
+    _run_thd_case(seq_q_lens=[128, 0, 64], seq_kv_lens=[100, 0, 0], head_dim=head_dim, is_causal=True, check_stats=True)
 
 
 @pytest.mark.L1
@@ -1312,7 +1315,7 @@ def test_dsl_sm120_flavor_routing():
     """The adapter resolves the kernel flavor from the head dims: dims the
     general template would tile at 256 on both sides (f16: above 240) run the
     d256 template, everything else the general one.
-    Unset tile knobs take the d256 flavor's default; explicit knobs are honored
+    Unset tile knobs resolve exactly as on the general template; explicit knobs are honored
     on both templates (a geometry that does not fit SMEM declines, as on the
     general template)."""
 
@@ -1330,9 +1333,11 @@ def test_dsl_sm120_flavor_routing():
     for d_qk, d_v in ((64, 64), (128, 128), (192, 128), (256, 128), (240, 240), (256, 240)):
         api = _api(d_qk, d_v)
         assert api.check_support() and api.flavor is None, (d_qk, d_v)  # general template
+    ref = _api(240, 240)  # general template at the same grid: the flavor must not change the tiles
+    assert ref.check_support() and ref.flavor is None
     for d_qk, d_v in ((256, 256), (248, 248), (256, 248)):
         api = _api(d_qk, d_v)
-        assert api.check_support() and api.flavor == (256, 256) and (api.q_tile, api.kv_tile) == (64, 64), (d_qk, d_v)
+        assert api.check_support() and api.flavor == (256, 256) and (api.q_tile, api.kv_tile) == (ref.q_tile, ref.kv_tile), (d_qk, d_v)
     api = _api(256, 256, tile_m=128)
     assert api.check_support() and (api.q_tile, api.kv_tile) == (128, 64)  # explicit knob honored, default for the rest
     with pytest.raises(NotImplementedError, match="shared memory"):
@@ -1351,15 +1356,11 @@ def test_dsl_sm120_d256_template_rejects_dims_outside_its_envelope():
     route to it — a routing bug, not a user error, so it raises."""
 
     _require_dsl()
-    import os
-
-    from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm120 import D256_FLAVOR, TemplateParams
 
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", api_dsl._SM120_KERNEL_FILES[D256_FLAVOR])
-    module = load_template(path, TemplateParams(q_tile=64, kv_tile=64), tag="d256_envelope_guard")
-    with pytest.raises(ValueError, match="d256 flavor"):
+    module = api_dsl._load_sm120_kernel_module(D256_FLAVOR, TemplateParams(q_tile=64, kv_tile=64))
+    with pytest.raises(ValueError, match="do not tile to"):
         module.compile(compute_capability=torch.cuda.get_device_capability(), b=1, qh=1, kh=1, sq=128, skv=128, d_qk=240, d_v=240, has_lse=False)
 
 
@@ -1638,6 +1639,7 @@ def test_dsl_sm120_head_dim_envelope_features():
     # tile: both zero-fill mechanisms at once, with the LSE checked.
     _run_case(batch=2, h_q=4, h_kv=4, s_q=192, s_kv=300, head_dim=104, head_dim_v=72, check_stats=True)
     _run_case(head_dim=248, head_dim_v=248, s_q=128, s_kv=128)  # d256 flavor: (64, 64)
+    _run_case(head_dim=256, head_dim_v=248, s_q=128, s_kv=128)  # d256 flavor, padded on the V side only
     _run_thd_case(
         seq_q_lens=[130, 70],
         seq_kv_lens=[130, 70],

@@ -43,7 +43,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     SUPPORTED_HEAD_TILE_MAX as _SM120_HEAD_TILE_MAX,
     FP8_HEAD_TILE_GRANULE as _SM120_FP8_HEAD_TILE_GRANULE,
     TemplateParams as Sm120TemplateParams,
-    flavor_cfg as _sm120_flavor_cfg,
+    D256_FLAVOR as _SM120_D256_FLAVOR,
     pick_flavor as _sm120_pick_flavor,
     smem_bytes as _sm120_smem_bytes,
 )
@@ -126,9 +126,10 @@ def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:
 # the padded/causal mask paths are active (see check_support).
 _SM100_TILE_N = 128
 
-# Keyed by kernel flavor (config_sm120.FLAVOR_CFGS envelope); None = the general template.
-_SM120_KERNEL_FILES = {(256, 256): "prefill_d256_f16_sm120.py", None: "prefill_f16_sm120.py"}
-_SM120_FP8_KERNEL_FILES = {(256, 256): "prefill_d256_fp8_sm120.py", None: "prefill_fp8_sm120.py"}
+# Keyed by kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template. The fp8
+# family has no flavor: every head dim runs its general template.
+_SM120_KERNEL_FILES = {_SM120_D256_FLAVOR: "prefill_d256_f16_sm120.py", None: "prefill_f16_sm120.py"}
+_SM120_FP8_KERNEL_FILES = {None: "prefill_fp8_sm120.py"}
 
 
 _SM120_DTYPE_QKV_CODE = {
@@ -2599,9 +2600,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
     ``scale_softmax`` is a runtime parameter. Dtype, shape, tile sizes, masks,
     and length-tensor / sink / THD presence are compile-time specializations.
-    ``tile_m`` / ``tile_n`` are honored on both templates; left unset, the d256
-    template runs its flavor Cfg (``config_sm120.flavor_cfg``) and the general
-    template the largest KV tile that fits.
+    ``tile_m`` / ``tile_n`` are honored on both templates; left unset, both run
+    the largest KV tile that fits (the flavor selects the file, not the tiles).
     """
 
     def _initialize_implementation(self) -> None:
@@ -2718,12 +2718,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
-        # Kernel flavor (config_sm120.FLAVOR_CFGS); None = the general template.
+        # Kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template.
         self.flavor = _sm120_pick_flavor(int(d_q), int(d_v), self._fp8)
-        if self.flavor is not None:
-            cfg = _sm120_flavor_cfg(self.flavor, self._fp8)
-            self.q_tile = cfg.TILE_M if self.tile_m is None else self.tile_m
-            self.kv_tile = cfg.TILE_N if self.tile_n is None else self.tile_n
         if self.pack_gqa:
             self._not_implemented_error_if(
                 self.thd,
@@ -2815,7 +2811,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # FP8 stages a byte per KV element but still writes O in half.
             return _sm120_smem_bytes(d_qp, d_vp, self.q_tile, kv_tile, self.dtype.itemsize, 2 if self._fp8 else self.dtype.itemsize)
 
-        if self.tile_n is None and self.flavor is None:
+        if self.tile_n is None:
             # Pick the largest KV tile that fits this device.
             self.kv_tile = next((t for t in _SM120_KV_TILES if _smem_bytes(t) <= smem_capacity_bytes), self.kv_tile)
         self._not_implemented_error_if(
