@@ -378,7 +378,16 @@ def emit_clamped_desc(
     src_words = Pointer(base_desc.get_ptr(), dtype=cutlass.Int64)
     for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
         (dptr + i).store((src_words + i).load())
-    nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, dptr, new_value=extent, ord=seq_ord)
+    # A zero-extent tensor map is invalid even when no consumer dereferences
+    # it.  Zero-packed callers bind a one-token dummy view and their device
+    # metadata suppresses every access, so keep the descriptor structurally
+    # legal in the same way `emit_seq_descs` does for an empty sequence.
+    nvvm.tensormap_replace(
+        nvvm.TensormapField.GLOBAL_DIM,
+        dptr,
+        new_value=cute.math.max(extent, cutlass.Int32(1)),
+        ord=seq_ord,
+    )
 
 
 __all__ = [

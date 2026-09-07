@@ -1600,6 +1600,7 @@ def compile(  # noqa: A001
         bwd.chunk_elems,
         bwd.use_pdl,
         bwd.deterministic,
+        False,
         fake_stream,
         options=options,
     )
@@ -1676,6 +1677,7 @@ def compile(  # noqa: A001
             qh // kvh,
             STORAGE_DTYPE,
             bwd.use_pdl,
+            False,
             fake_stream,
             options=options,
         )

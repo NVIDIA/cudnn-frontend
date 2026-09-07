@@ -20,6 +20,17 @@ from frost_test_utils import select_engine as _select_engine  # noqa: F401
 pytestmark = requires_pre_rubin_blackwell
 
 
+@pytest.mark.L0
+def test_workspace_carver_rejects_noncontiguous_workspace():
+    """Execute must never make a hidden contiguous copy of caller scratch."""
+    from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver
+
+    workspace = torch.empty(2, 256, dtype=torch.uint8, device="cuda").transpose(0, 1)
+    assert not workspace.is_contiguous()
+    with pytest.raises(ValueError, match="workspace must be contiguous"):
+        WorkspaceCarver(workspace, required=1, owner="test")
+
+
 def _ref_sdpa(q, k, v, *, is_causal, scale):
     """Reference SDPA in fp32 (dense, top-left causal or none)."""
     q_ref, k_ref, v_ref = q.to(torch.float32), k.to(torch.float32), v.to(torch.float32)

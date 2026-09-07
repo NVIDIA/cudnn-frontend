@@ -1027,12 +1027,25 @@ def _compute_warp_group(
         # tensor's STATIC RANK -- token-major (T, H) or head-major (1, QH, T).
         # do_dot is ours and stays head-major.
         if cutlass.const_expr(_THD):
-            _row_pk = q_tok + q_row_safe
-            if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                lse_q_log2e = lse_tensor[_row_pk, head_g] * cutlass.Float32(LOG2E)
-            else:
-                lse_q_log2e = lse_tensor[cutlass.Int32(0), head_g, _row_pk] * cutlass.Float32(LOG2E)
-            scaled_do_dot_q = do_dot_tensor[cutlass.Int32(0), head_g, _row_pk] * attn_scale_in
+            # Define both carried values before the dynamic live/dead branch;
+            # the DSL requires staged-control-flow outputs to have an incoming
+            # value even though the live arm overwrites them before use.
+            lse_q_log2e = cutlass.Float32(0.0)
+            scaled_do_dot_q = cutlass.Float32(0.0)
+            # An occupancy-sized persistent grid can start beyond the device
+            # live-unit count.  Its sentinel decode has batch == n_batch and
+            # q_tok == packed_total.  row_scale is already zero, but scalar
+            # loads execute before that factor is applied.  Guard the LOADS,
+            # not merely their results: selecting row 0 is still out of bounds
+            # for an all-empty pack.  batch_idx is CTA-uniform, so this does
+            # not split the warp group around its barrier protocol.
+            if batch_idx < n_batch:
+                _row_pk = q_tok + q_row_safe
+                if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                    lse_q_log2e = lse_tensor[_row_pk, head_g] * cutlass.Float32(LOG2E)
+                else:
+                    lse_q_log2e = lse_tensor[cutlass.Int32(0), head_g, _row_pk] * cutlass.Float32(LOG2E)
+                scaled_do_dot_q = do_dot_tensor[cutlass.Int32(0), head_g, _row_pk] * attn_scale_in
         else:
             lse_q_log2e = lse_tensor[batch_g, head_g, q_row_safe] * cutlass.Float32(LOG2E)
             scaled_do_dot_q = do_dot_tensor[batch_g, head_g, q_row_safe] * attn_scale_in
@@ -1568,6 +1581,8 @@ def compile(  # noqa: A001
         # host sizes it from the declared S_kv_max.
         if lse_token_major:
             pass  # rank-2 (T, H) Stats; the kernel branches on the static rank
+        if sq_real <= 0 or sq_real % 128 != 0:
+            raise ValueError(f"bwd d512 THD: sq_real is delta's positive 128-row compile capacity; got {sq_real}")
     else:
         if sq % (CFG.TILE_M * CFG.CTA_MMA) != 0:
             raise ValueError(f"bwd d512: S_q must be a multiple of TILE_M*CTA_MMA ({CFG.TILE_M * CFG.CTA_MMA}); got {sq}")
@@ -1599,10 +1614,11 @@ def compile(  # noqa: A001
     # Q/K/V/dO carry the REAL sequence length: a tile reading past it is TMA
     # zero-filled, which is exactly what the tail mask expects to see.
     if CFG.THD_VARLEN:
-        # One symbol per ragged group: Q/dO (and the Stats/delta rows) share the
-        # packed q total, K/V share the kv total, and the workspace's blocked
-        # row total is its own -- so a new packing re-binds the SAME compiled
-        # artifact instead of minting one per step.
+        # One symbol per ragged group: Q/dO/Stats share the packed q total, K/V
+        # share the kv total, and the workspace's blocked row total is its own.
+        # Delta is private padded storage and has a static 128-row bucket below.
+        # Thus a new packing re-binds the SAME compiled artifact instead of
+        # minting one per exact total.
         _t_q = cute.sym_int(divisibility=1)
         _t_kv = cute.sym_int(divisibility=1)
         _ws_rows = cute.sym_int(divisibility=CFG.WS_BLOCK_ROWS)
@@ -1651,14 +1667,11 @@ def compile(  # noqa: A001
     # which is why a non-multiple was the only shape that exposed it.
     sq_dot = -(-sq_real // 128) * 128
     if CFG.THD_VARLEN:
-        # delta is OURS, so it stays head-major packed [1, QH, T_q]: stage 1
-        # produces it from the packed O/dO with a batch extent of 1.
-        # delta's extent is STATIC even under THD: the adapter binds the packed
-        # tensors at the capacity bound it passes as `sq_real`, so the producer's
-        # ceil(rows / 128) * 128 rounding is a compile-time number.  Both the
-        # symbolic alternatives fail -- a second shape symbol gets unified with
-        # Q's (and then rejects any packing that is not a multiple of 128), and
-        # a symbolic STRIDE crashes the DSL outright.
+        # Delta is OURS, so it stays head-major [1, QH, delta_rows].  Its extent
+        # is STATIC even under THD, but `sq_real` is now that private 128-row
+        # bucket rather than the caller's exact packed capacity.  Both symbolic
+        # alternatives fail: a second shape symbol gets unified with Q's (then
+        # rejects non-multiples of 128), and a symbolic stride crashes the DSL.
         fake_do_dot = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1, qh, sq_dot), stride_order=(2, 1, 0), assumed_align=16)
         # The metadata buffer (THD_BWD_META_WORDS(B)) and the descriptor array
         # (THD_BWD_DESC_SLOTS(B) tensor maps), both written by the setup launch.
@@ -1686,7 +1699,17 @@ def compile(  # noqa: A001
         # N_THD_UNITS: the persistent grid's cluster count, a RUNTIME value --
         # the host sizes it for occupancy, and the device bound in the metadata
         # is what actually stops the claim loop.
-        (b, qh, sq, skv, qh_chunk, qh_kv, sq_real, skv_real, cute.sym_int(divisibility=1) if CFG.THD_VARLEN else 0),
+        (
+            b,
+            qh,
+            sq,
+            skv,
+            qh_chunk,
+            qh_kv,
+            0 if CFG.THD_VARLEN else sq_real,
+            0 if CFG.THD_VARLEN else skv_real,
+            cute.sym_int(divisibility=1) if CFG.THD_VARLEN else 0,
+        ),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),

@@ -310,6 +310,7 @@ def dot_do_o_kernel(
     chunk_elems: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     deterministic: cutlass.Constexpr[bool],
+    assume_compact_io: cutlass.Constexpr[bool],
 ):
     if cutlass.const_expr(use_pdl):
         cute.arch.griddepcontrol_launch_dependents()
@@ -328,8 +329,16 @@ def dot_do_o_kernel(
 
     o_batch_stride, o_seq_stride, o_head_stride, _ = o.stride
     do_batch_stride, do_seq_stride, do_head_stride, _ = do.stride
-    compact = (S_Q * H * D_V, H * D_V, D_V)
-    io_strided = o.shape[3] != D_V or (o_batch_stride, o_seq_stride, o_head_stride) != compact or (do_batch_stride, do_seq_stride, do_head_stride) != compact
+    if cutlass.const_expr(assume_compact_io):
+        # THD's adapter contract admits only compact BSHD physical storage.
+        # Saying that explicitly also lets S_Q remain a runtime symbol, rather
+        # than asking const_expr to compare a symbolic batch stride.
+        io_strided = False
+    else:
+        compact = (S_Q * H * D_V, H * D_V, D_V)
+        io_strided = (
+            o.shape[3] != D_V or (o_batch_stride, o_seq_stride, o_head_stride) != compact or (do_batch_stride, do_seq_stride, do_head_stride) != compact
+        )
     if cutlass.const_expr(io_strided):
         o_base = batch * o_batch_stride + (q_block * Q_TILE) * o_seq_stride + head * o_head_stride
         do_base = batch * do_batch_stride + (q_block * Q_TILE) * do_seq_stride + head * do_head_stride
@@ -432,10 +441,11 @@ def dot_do_o_host(
     chunk_elems: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     deterministic: cutlass.Constexpr[bool],
+    assume_compact_io: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ):
     q_blocks = ceil_div(o.shape[1], q_tile)
-    dot_do_o_kernel(o, do, delta, dq_accum, dq_sem, q_tile, D_QK, D_V, chunk_elems, use_pdl, deterministic).launch(
+    dot_do_o_kernel(o, do, delta, dq_accum, dq_sem, q_tile, D_QK, D_V, chunk_elems, use_pdl, deterministic, assume_compact_io).launch(
         grid=(q_blocks, o.shape[2], o.shape[0]),
         block=(256, 1, 1),
         stream=stream,
@@ -715,6 +725,7 @@ def dkv_reduce_kernel(
     group: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
     use_pdl: cutlass.Constexpr[bool],
+    assume_compact_out: cutlass.Constexpr[bool],
 ):
     # One thread per 16 B output vector; serial fp32 accumulation over the
     # group's q-head slices (fixed order -> deterministic).
@@ -734,8 +745,12 @@ def dkv_reduce_kernel(
     dv_ptr = dv.iterator.raw_ptr()
     dk_batch_stride, dk_seq_stride, dk_head_stride, _ = dk.stride
     dv_batch_stride, dv_seq_stride, dv_head_stride, _ = dv.stride
-    dk_strided = (dk_batch_stride, dk_seq_stride, dk_head_stride) != (S_KV * H_KV * D_QK, H_KV * D_QK, D_QK)
-    dv_strided = (dv_batch_stride, dv_seq_stride, dv_head_stride) != (S_KV * H_KV * D_V, H_KV * D_V, D_V)
+    if cutlass.const_expr(assume_compact_out):
+        dk_strided = False
+        dv_strided = False
+    else:
+        dk_strided = (dk_batch_stride, dk_seq_stride, dk_head_stride) != (S_KV * H_KV * D_QK, H_KV * D_QK, D_QK)
+        dv_strided = (dv_batch_stride, dv_seq_stride, dv_head_stride) != (S_KV * H_KV * D_V, H_KV * D_V, D_V)
     gidx = bidx * 256 + tidx  # host launch 256 threads
     if cutlass.const_expr(D_QK == D_V):
         OUT_VECS = B * S_KV * H_KV * D_QK // VEC
@@ -828,6 +843,7 @@ def dkv_reduce_host(
     group: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
     use_pdl: cutlass.Constexpr[bool],
+    assume_compact_out: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ):
     if cutlass.const_expr(D_QK == D_V):
@@ -835,7 +851,7 @@ def dkv_reduce_host(
     else:
         # Split index space: one thread per dK vector plus one per dV vector.
         out_vecs = ceil_div(dk.shape[0] * dk.shape[1] * dk.shape[2] * (D_QK + D_V), 8)
-    dkv_reduce_kernel(dk_ws, dv_ws, dk, dv, D_QK, D_V, group, io_dtype, use_pdl).launch(
+    dkv_reduce_kernel(dk_ws, dv_ws, dk, dv, D_QK, D_V, group, io_dtype, use_pdl, assume_compact_out).launch(
         grid=(ceil_div(out_vecs, 256), 1, 1),
         block=(256, 1, 1),
         stream=stream,

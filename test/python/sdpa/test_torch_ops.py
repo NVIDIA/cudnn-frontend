@@ -517,8 +517,8 @@ class TestSdpaVarlen:
     @pytest.mark.L0
     def test_thd_autograd(self):
         """sdpa_fwd is differentiable end to end on the varlen path: the
-        registered autograd glue converts the packed TH1 stats to the padded
-        LSE layout and routes grads through cudnn::sdpa_bwd."""
+        registered autograd glue preserves packed TH1 Stats and routes grads
+        through cudnn::sdpa_bwd, which adapts only for a legacy backend."""
         torch.manual_seed(0)
         lens, H, D = [200, 312, 96], 8, 128
         q, k, v, cu, _, mx = self._make(lens, H, H, D)
@@ -538,6 +538,40 @@ class TestSdpaVarlen:
         assert (q.grad.float() - rdq).abs().max().item() < TOL
         assert (k.grad.float() - rdk).abs().max().item() < TOL
         assert (v.grad.float() - rdv).abs().max().item() < TOL
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("deterministic", [False, True])
+    def test_thd_autograd_ignores_trailing_capacity(self, deterministic):
+        """A reusable packed buffer may be larger than the live ``cu[-1]``.
+
+        Public forward/backward must ignore that tail without a host read.  In
+        particular, the packed-to-padded LSE bridge must not interpret capacity
+        rows as a sentinel batch index and scatter out of bounds.
+        """
+        torch.manual_seed(0)
+        lens, capacity, H, D = [64, 33], 112, 4, 128
+        live = sum(lens)
+        cu = torch.tensor([0, lens[0], live], dtype=torch.int32, device="cuda")
+        q, k, v = (torch.randn(capacity, H, D, dtype=torch.bfloat16, device="cuda").requires_grad_(True) for _ in range(3))
+        scale = D**-0.5
+        was_deterministic = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(deterministic)
+        try:
+            o, _ = torch.ops.cudnn.sdpa_fwd(
+                q, k, v, scale, is_causal=True,
+                cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=max(lens), max_seqlen_kv=max(lens), return_lse=True,
+            )  # fmt: skip
+            grad = torch.zeros_like(o)
+            grad[:live] = torch.randn_like(grad[:live])
+            o.backward(grad)
+        finally:
+            torch.use_deterministic_algorithms(was_deterministic)
+
+        ref, _, rdq, rdk, rdv = self._ref(q, k, v, cu, is_causal=True, grad=grad[:live])
+        assert (o[:live].float() - ref).abs().max().item() < TOL
+        assert (q.grad[:live].float() - rdq[:live]).abs().max().item() < TOL
+        assert (k.grad[:live].float() - rdk[:live]).abs().max().item() < TOL
+        assert (v.grad[:live].float() - rdv[:live]).abs().max().item() < TOL
 
     @pytest.mark.L0
     def test_thd_kv_packed_views(self):
