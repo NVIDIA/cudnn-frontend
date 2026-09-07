@@ -46,13 +46,16 @@ def _workspace_shapes_sm100(
         1,
         acc_dtype,
     )
-    dkv_kernel_cls = FlashAttentionDSABackwardSm100Deterministic if deterministic else FlashAttentionDSABackwardSm100
-    workspace_dkv_shape = dkv_kernel_cls._get_workspace_size_dKV(
-        total_s_kv,
-        head_dim,
-        1,
-        acc_dtype,
-    )
+    if deterministic:
+        workspace_dkv_shape = FlashAttentionDSABackwardSm100Deterministic._get_workspace_size_dKV(total_s_kv, head_dim, 1, acc_dtype)
+    else:
+        workspace_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
+            total_s_kv,
+            head_dim,
+            1,
+            acc_dtype,
+            pad_dkv_workspace=num_heads == 64 and head_dim == 576,
+        )
     return workspace_lse_odo_shape, workspace_dkv_shape
 
 
@@ -363,13 +366,16 @@ def flash_attn_bwd_sm100(
         workspace_LSE_OdO_tensor = to_cute_tensor(workspace_LSE_OdO, fully_dynamic=True)
         workspace_dKV_tensor = to_cute_tensor(workspace_dKV, fully_dynamic=True)
 
-        kernel_obj = kernel_cls(
+        kernel_kwargs = dict(
             element_dtype=dtype,
             head_dim=head_dim,
             head_dim_v=head_dim_v,
             block_tile=block_tile,
             max_topk=max_topk,
         )
+        if backend == "generic_m64":
+            kernel_kwargs["pad_dkv_workspace"] = not deterministic and num_head == 64 and head_dim == 576
+        kernel_obj = kernel_cls(**kernel_kwargs)
 
         with torch.cuda.nvtx.range("flash_attn_bwd_sm100_compile"):
             flash_attn_bwd_sm100.compile_cache[compile_key] = cute.compile(

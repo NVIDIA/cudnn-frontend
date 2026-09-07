@@ -95,6 +95,27 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("num_heads", [16, 32, 64, 96, 128])
+def test_DSA_sparse_attention_backward_sm100_d576_workspace_padding_is_h64_only(num_heads):
+    """The L2-friendly dKV row padding must not inflate other backends."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    s_q, s_kv, head_dim = 7, 1025, 576
+    padded_s_q = math.ceil(s_q / 8) * 8
+    padded_s_kv = math.ceil(s_kv / 8) * 8
+    lse_odo_bytes = num_heads * padded_s_q * 2 * torch.float32.itemsize
+    dkv_row_dim = 640 if num_heads == 64 else head_dim
+    expected = lse_odo_bytes + padded_s_kv * dkv_row_dim * torch.float32.itemsize
+    assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads) == expected
+
+    deterministic_dkv_bytes = 128 * padded_s_kv * head_dim * torch.float32.itemsize
+    assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == lse_odo_bytes + deterministic_dkv_bytes
+
+
 def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False):
     """Run one deterministic case against bitwise and numerical contracts."""
     from cudnn import DSA
@@ -529,6 +550,8 @@ def _run_DSA_sparse_attention_backward_wrapper(
     topk,
     has_topk_length,
     request,
+    allow_unsupported=True,
+    s_q_default=1024,
 ):
     try:
         from cudnn import DSA
@@ -546,7 +569,7 @@ def _run_DSA_sparse_attention_backward_wrapper(
         topk=topk,
         has_topk_length=has_topk_length,
         min_compute_capability=90,
-        s_q_default=1024,
+        s_q_default=s_q_default,
         s_kv_default=4096,
     )
     cfg["h_q"] = num_heads
@@ -580,6 +603,8 @@ def _run_DSA_sparse_attention_backward_wrapper(
             stream=stream,
         )
     except (ValueError, NotImplementedError, RuntimeError) as e:
+        if not allow_unsupported:
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
 
     dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
@@ -627,6 +652,65 @@ def test_DSA_sparse_attention_backward_wrapper(
         topk=topk,
         has_topk_length=has_topk_length,
         request=request,
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
+@torch_fork_set_rng(seed=422)
+def test_DSA_sparse_attention_backward_wrapper_h64_d576_topk2048(has_topk_length, request):
+    """Cover the primary H64/D576 training shape beyond one sparse tile."""
+    _require_sm100()
+    _run_DSA_sparse_attention_backward_wrapper(
+        dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        head_dim=576,
+        head_dim_v=512,
+        num_heads=64,
+        topk=2048,
+        has_topk_length=has_topk_length,
+        request=request,
+        allow_unsupported=False,
+        s_q_default=8,
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("num_heads", [96, 128])
+@torch_fork_set_rng(seed=423)
+def test_DSA_sparse_attention_backward_wrapper_generic_d576_head_blocks(num_heads, request):
+    """Guard the other head counts that share the generic D576 pipeline."""
+    _require_sm100()
+    _run_DSA_sparse_attention_backward_wrapper(
+        dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        head_dim=576,
+        head_dim_v=512,
+        num_heads=num_heads,
+        topk=128,
+        has_topk_length=True,
+        request=request,
+        allow_unsupported=False,
+        s_q_default=3,
+    )
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=424)
+def test_DSA_sparse_attention_backward_wrapper_generic_d512_reducer_generations(request):
+    """Exercise three sparse tiles through the generic D512 reducer."""
+    _require_sm100()
+    _run_DSA_sparse_attention_backward_wrapper(
+        dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        head_dim=512,
+        head_dim_v=512,
+        num_heads=64,
+        topk=129,
+        has_topk_length=False,
+        request=request,
+        allow_unsupported=False,
+        s_q_default=3,
     )
 
 
@@ -732,6 +816,13 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
         pytest.param(576, 32, (0, 1, 64, 65, 128, 0), id="d576-mixed"),
         pytest.param(576, 16, (0, 1, 127, 128, 129, 511, 512, 513), id="d576-h16-m128-boundaries"),
         pytest.param(576, 32, (0, 1, 63, 64, 65, 127, 128), id="d576-h32-m64-boundaries"),
+        pytest.param(576, 64, (0, 1, 63, 64, 65, 127, 128), id="d576-h64-m64-boundaries"),
+        pytest.param(
+            576,
+            64,
+            (0, 1, 63, 64, 65, 127, 128, 129, 511, 512, 513, 1023, 1024, 1025, 2047, 2048),
+            id="d576-h64-topk2048-boundaries",
+        ),
     ],
 )
 def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, topk_length_values):
@@ -751,8 +842,13 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
 
     device = torch.device("cuda")
     s_q = len(topk_length_values) if topk_length_values is not None else 2
-    is_h16 = head_dim == 576 and num_heads == 16
-    s_kv, topk = (640, 513) if is_h16 else (256, 128)
+    max_topk_length = max(topk_length_values)
+    if head_dim == 576 and num_heads == 16:
+        s_kv, topk = 640, 513
+    elif head_dim == 576 and num_heads == 64 and max_topk_length > 128:
+        s_kv, topk = 2112, 2048
+    else:
+        s_kv, topk = 256, 128
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
@@ -762,9 +858,9 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
 
     # D512 covers defensive negative handling around the 64-row tile boundary.
     # D576/H16 covers both sides of the dedicated kernel's 128-row boundary and
-    # its final feature/top-k tails. D576/H32 covers the corresponding M64
-    # boundary (a partial 64-row CTA on SM100), and every case also exercises
-    # the all-empty fast path, where the expected gradients are exactly zero.
+    # its final feature/top-k tails. D576/H32 and H64 cover the corresponding
+    # M64 boundaries; the extended H64 case crosses every power-of-two boundary
+    # through topk=2048. Every case also exercises the all-empty fast path.
     topk_length_cases = [torch.zeros(s_q, dtype=torch.int32, device=device)]
     if topk_length_values is not None:
         topk_length_cases.insert(0, torch.tensor(topk_length_values, dtype=torch.int32, device=device))
