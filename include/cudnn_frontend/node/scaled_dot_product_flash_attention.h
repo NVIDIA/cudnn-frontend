@@ -953,13 +953,6 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
         if (attributes.inputs.find(input_names::SINK_TOKEN) != attributes.inputs.end()) {
             softmax_attributes.set_sink(attributes.inputs[input_names::SINK_TOKEN]);
         }
-        // The base-2 stats convention is a property of the fused SDPA_FWD backend op; the composite
-        // softmax has no such attribute and an appended pointwise on Stats has no servable engine.
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            attributes.stats_use_log2 && attributes.outputs[output_names::Stats] != nullptr,
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "stats_use_log2 requires the UNIFIED SDPA implementation (cuDNN 9.28.0+) or a FROST engine");
-
         // Special non-functional-style call. Needed because output already created and provided to user.
         softmax(last_output,
                 softmax_attributes,
