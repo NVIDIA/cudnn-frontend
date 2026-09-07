@@ -794,9 +794,7 @@ def test_grouped_gemm_wgrad_wrapper_explicit_dense_output_cache(
     workspaces = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
     try:
         for output, workspace in zip(outputs, workspaces):
-            workspace_kwargs = (
-                {"descriptor_workspace": workspace} if caller_owned_workspace else {}
-            )
+            workspace_kwargs = {"descriptor_workspace": workspace} if caller_owned_workspace else {}
             cudnn.grouped_gemm_wgrad_wrapper_sm100(
                 **inputs,
                 **workspace_kwargs,
@@ -865,9 +863,7 @@ def test_grouped_gemm_wgrad_wrapper_discrete_accepts_caller_workspace(monkeypatc
                 sf_vec_size=16,
             )
     finally:
-        cache_entries = len(
-            grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects
-        )
+        cache_entries = len(grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects)
         grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
 
     assert compile_count["value"] == 1

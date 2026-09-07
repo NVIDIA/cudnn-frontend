@@ -550,6 +550,9 @@ def _bprop_kernel(
         Pointer((dK_view.data_ptr() + base_b + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dK[off + 2], acc_dK[off + 3], dtype=io_dtype), alignment=4)
 
 
+_bprop_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.kernel
 def _unpermute_dq_kernel(
     dQ_acc: cute.Tensor,  # [B, H, SQ, d] fp32 PERMUTED-flat scratch (atomic target)
@@ -591,6 +594,9 @@ def _unpermute_dq_kernel(
         dcol = dq_wc * cutlass.Int32(32) + cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
         Pointer((out_view.data_ptr() + out_t + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(v0, v1, dtype=io_dtype), alignment=4)
         Pointer((out_view.data_ptr() + out_b + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(v2, v3, dtype=io_dtype), alignment=4)
+
+
+_unpermute_dq_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit

@@ -30,29 +30,12 @@ def normalize_candidates(
 ) -> tuple[MoeEpTuningConfig, ...]:
     """Validate, de-duplicate, and prepend the current configuration."""
 
-    if (
-        isinstance(warmup_iters, bool)
-        or not isinstance(warmup_iters, int)
-        or warmup_iters < 0
-    ):
-        raise ValueError(
-            f"warmup_iters must be a non-negative integer, got {warmup_iters!r}"
-        )
-    if (
-        isinstance(timed_iters, bool)
-        or not isinstance(timed_iters, int)
-        or timed_iters <= 0
-    ):
+    if isinstance(warmup_iters, bool) or not isinstance(warmup_iters, int) or warmup_iters < 0:
+        raise ValueError(f"warmup_iters must be a non-negative integer, got {warmup_iters!r}")
+    if isinstance(timed_iters, bool) or not isinstance(timed_iters, int) or timed_iters <= 0:
         raise ValueError(f"timed_iters must be a positive integer, got {timed_iters!r}")
-    if (
-        isinstance(max_candidates, bool)
-        or not isinstance(max_candidates, int)
-        or not 1 <= max_candidates <= _MAX_AUTOTUNE_CANDIDATES
-    ):
-        raise ValueError(
-            f"max_candidates must be an integer in [1, {_MAX_AUTOTUNE_CANDIDATES}], "
-            f"got {max_candidates!r}"
-        )
+    if isinstance(max_candidates, bool) or not isinstance(max_candidates, int) or not 1 <= max_candidates <= _MAX_AUTOTUNE_CANDIDATES:
+        raise ValueError(f"max_candidates must be an integer in [1, {_MAX_AUTOTUNE_CANDIDATES}], " f"got {max_candidates!r}")
     if not isinstance(candidates, Sequence) or isinstance(candidates, (str, bytes)):
         raise TypeError("candidates must be a sequence of MoeEpTuningConfig values")
     if not candidates:
@@ -62,10 +45,7 @@ def normalize_candidates(
     seen = {baseline}
     for index, candidate in enumerate(candidates):
         if not isinstance(candidate, MoeEpTuningConfig):
-            raise TypeError(
-                "candidates must contain only MoeEpTuningConfig values; "
-                f"candidates[{index}] is {type(candidate).__name__}"
-            )
+            raise TypeError("candidates must contain only MoeEpTuningConfig values; " f"candidates[{index}] is {type(candidate).__name__}")
         if candidate.reduce_topk_in_kernel != baseline.reduce_topk_in_kernel:
             raise ValueError(
                 "autotune does not sweep reduce_topk_in_kernel; "
@@ -77,10 +57,7 @@ def normalize_candidates(
             seen.add(candidate)
 
     if len(ordered) > max_candidates:
-        raise ValueError(
-            f"autotune has {len(ordered)} unique candidates including the baseline, "
-            f"exceeding max_candidates={max_candidates}"
-        )
+        raise ValueError(f"autotune has {len(ordered)} unique candidates including the baseline, " f"exceeding max_candidates={max_candidates}")
     return tuple(ordered)
 
 
@@ -95,10 +72,7 @@ def verify_candidates_across_ranks(
     gathered: list[object] = [None] * dist.get_world_size(group)
     dist.all_gather_object(gathered, candidates, group=group)
     if any(value != candidates for value in gathered):
-        raise RuntimeError(
-            f"MoeEp autotune candidates must match on every EP rank; "
-            f"rank candidate lists: {gathered}"
-        )
+        raise RuntimeError(f"MoeEp autotune candidates must match on every EP rank; " f"rank candidate lists: {gathered}")
 
 
 def verify_state_across_ranks(
@@ -112,10 +86,7 @@ def verify_state_across_ranks(
     gathered: list[object] = [None] * dist.get_world_size(group)
     dist.all_gather_object(gathered, state, group=group)
     if any(value != state for value in gathered):
-        raise RuntimeError(
-            f"MoeEp autotune requires matching lifecycle state on every EP rank; "
-            f"rank states: {gathered}"
-        )
+        raise RuntimeError(f"MoeEp autotune requires matching lifecycle state on every EP rank; " f"rank states: {gathered}")
 
 
 def raise_preflight_errors(
@@ -133,13 +104,9 @@ def raise_preflight_errors(
     local = None if error is None else (type(error).__name__, str(error))
     gathered: list[object] = [None] * dist.get_world_size(group)
     dist.all_gather_object(gathered, local, group=group)
-    failures = [
-        (rank, value) for rank, value in enumerate(gathered) if value is not None
-    ]
+    failures = [(rank, value) for rank, value in enumerate(gathered) if value is not None]
     if failures:
-        raise RuntimeError(
-            f"MoeEp autotune {phase} failed before runtime entry; rank errors: {failures}"
-        ) from error
+        raise RuntimeError(f"MoeEp autotune {phase} failed before runtime entry; rank errors: {failures}") from error
 
 
 def synchronize_candidate(
@@ -179,9 +146,7 @@ def benchmark_candidate(
     samples = tuple(float(value) for value in slow_rank_samples.cpu().tolist())
     latency_ms = float(statistics.median(samples))
     if not math.isfinite(latency_ms):
-        raise RuntimeError(
-            f"MoeEp autotune produced a non-finite latency: {latency_ms}"
-        )
+        raise RuntimeError(f"MoeEp autotune produced a non-finite latency: {latency_ms}")
     return latency_ms, samples
 
 
@@ -206,9 +171,7 @@ def allocate_training_outputs(
         shape, stride, dtype, alignment = requirements[name]
         tensor = torch.empty_strided(shape, stride, dtype=dtype, device=device)
         if tensor.data_ptr() % alignment:
-            raise RuntimeError(
-                f"autotune output {name} is not {alignment}-byte aligned"
-            )
+            raise RuntimeError(f"autotune output {name} is not {alignment}-byte aligned")
         return tensor
 
     forward = MoeEpTrainingForwardOutputs(

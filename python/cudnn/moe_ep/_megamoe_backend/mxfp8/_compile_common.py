@@ -24,29 +24,19 @@ def _prepare_rubin_environment(
     torch.cuda.set_device(device)
     architecture = torch.cuda.get_device_capability(device)
     if architecture != (10, 7):
-        raise RuntimeError(
-            f"Rubin MXFP8 {context} preparation requires compute capability "
-            f"(10, 7), got {architecture}"
-        )
+        raise RuntimeError(f"Rubin MXFP8 {context} preparation requires compute capability " f"(10, 7), got {architecture}")
 
     configured_architecture = os.environ.get("CUTE_DSL_ARCH")
     if configured_architecture is None:
         os.environ["CUTE_DSL_ARCH"] = "sm_107a"
     elif configured_architecture not in ("sm_107", "sm_107a"):
-        raise RuntimeError(
-            "CUTE_DSL_ARCH must target SM107 for Rubin MXFP8 "
-            f"{context}, got {configured_architecture!r}"
-        )
+        raise RuntimeError("CUTE_DSL_ARCH must target SM107 for Rubin MXFP8 " f"{context}, got {configured_architecture!r}")
 
     import cutlass.utils as utils
 
-    launch_cluster_count = int(
-        utils.HardwareInfo().get_max_active_clusters(config.cluster_size)
-    )
+    launch_cluster_count = int(utils.HardwareInfo().get_max_active_clusters(config.cluster_size))
     if launch_cluster_count <= 0:
-        raise RuntimeError(
-            "hardware occupancy query returned no launchable Rubin clusters"
-        )
+        raise RuntimeError("hardware occupancy query returned no launchable Rubin clusters")
     return architecture, launch_cluster_count
 
 

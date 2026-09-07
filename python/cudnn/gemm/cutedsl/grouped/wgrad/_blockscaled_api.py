@@ -620,8 +620,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 )
                 self._value_error_if(
                     descriptor_workspace.numel() < self._workspace_bytes,
-                    f"descriptor_workspace requires at least {self._workspace_bytes} bytes, "
-                    f"got {descriptor_workspace.numel()}",
+                    f"descriptor_workspace requires at least {self._workspace_bytes} bytes, " f"got {descriptor_workspace.numel()}",
                 )
                 workspace_arg = from_dlpack(
                     descriptor_workspace,
@@ -670,8 +669,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             )
             self._value_error_if(
                 descriptor_workspace.numel() < self._workspace_bytes,
-                f"descriptor_workspace requires at least {self._workspace_bytes} bytes, "
-                f"got {descriptor_workspace.numel()}",
+                f"descriptor_workspace requires at least {self._workspace_bytes} bytes, " f"got {descriptor_workspace.numel()}",
             )
             workspace_arg = from_dlpack(
                 descriptor_workspace,

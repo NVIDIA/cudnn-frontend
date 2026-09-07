@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """The epilogue drain is ONE logic across all 20 kernel templates.
 
 Source-level only -- no GPU, no render, no JIT. See CLAUDE.md

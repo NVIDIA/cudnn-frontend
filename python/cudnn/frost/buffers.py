@@ -156,6 +156,14 @@ class DeviceView:
     def view_as(self, other):
         return self.reshape(tuple(other.shape))
 
+    def stride(self):
+        st = []
+        acc = 1
+        for s in reversed(self.shape):
+            st.append(acc)
+            acc *= s
+        return tuple(reversed(st))
+
     def contiguous(self):
         return self  # row-major contiguous by construction
 
@@ -503,6 +511,20 @@ def cutedsl_too_old(version):
     except ValueError:
         return False
     return len(parts) == 3 and parts < CUTEDSL_MIN_VERSION
+
+
+def cutedsl_requirement_error(what):
+    """Message naming the installed DSL version when it is below the floor, else None.
+
+    Route checks and the lazy-import wrappers use it so a too-old DSL reads as a
+    version problem, not as a missing dependency: pyproject's floor is the
+    downstream floor (4.6.2), below this one (see AGENTS.md Rule 7).
+    """
+    installed, version = cutedsl_state()
+    if not installed or not cutedsl_too_old(version):
+        return None
+    floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
+    return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
 
 
 def current_device_id():

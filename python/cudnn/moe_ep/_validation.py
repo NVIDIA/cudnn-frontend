@@ -474,16 +474,8 @@ def validate_training_input(
 
 def _tensor_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
     byte_start = tensor.data_ptr()
-    max_element_offset = sum(
-        (int(extent) - 1) * int(step)
-        for extent, step in zip(tensor.shape, tensor.stride())
-        if int(extent) > 0
-    )
-    byte_end = byte_start + (
-        0
-        if tensor.numel() == 0
-        else (max_element_offset + 1) * tensor.element_size()
-    )
+    max_element_offset = sum((int(extent) - 1) * int(step) for extent, step in zip(tensor.shape, tensor.stride()) if int(extent) > 0)
+    byte_end = byte_start + (0 if tensor.numel() == 0 else (max_element_offset + 1) * tensor.element_size())
     return byte_start, byte_end
 
 

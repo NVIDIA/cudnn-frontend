@@ -65,24 +65,18 @@ def _resolve_ep_topology(
     if ep_group is None:
         return 1, 0, ()
     if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError(
-            "ep_group requires an initialized torch.distributed process group"
-        )
+        raise RuntimeError("ep_group requires an initialized torch.distributed process group")
 
     ep_size = dist.get_world_size(ep_group)
     ep_rank = dist.get_rank(ep_group)
     if ep_size <= 0 or ep_rank < 0 or ep_rank >= ep_size:
         raise ValueError("the current process must be a member of ep_group")
 
-    ep_global_ranks = tuple(
-        dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size)
-    )
+    ep_global_ranks = tuple(dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size))
     if len(set(ep_global_ranks)) != ep_size:
         raise RuntimeError("ep_group returned duplicate global ranks")
     if ep_global_ranks[ep_rank] != dist.get_rank():
-        raise RuntimeError(
-            "ep_group rank mapping is inconsistent with the current global rank"
-        )
+        raise RuntimeError("ep_group rank mapping is inconsistent with the current global rank")
     return ep_size, ep_rank, ep_global_ranks
 
 
@@ -92,18 +86,12 @@ def _validate_training_assert_capability(config: ForwardConfig) -> None:
     if config.drop_on_overflow:
         return
     if not callable(getattr(torch, "_assert_async", None)):
-        raise RuntimeError(
-            "drop_on_overflow=False training requires callable "
-            "torch._assert_async before CUDA Graph capture"
-        )
+        raise RuntimeError("drop_on_overflow=False training requires callable " "torch._assert_async before CUDA Graph capture")
     if config.ep_size <= 1:
         return
     backend = dist.get_backend(config.ep_group)
     if backend != dist.Backend.NCCL and str(backend).lower() != "nccl":
-        raise NotImplementedError(
-            "drop_on_overflow=False EP2+ training requires an NCCL "
-            "process group for the captured scalar global overflow OR"
-        )
+        raise NotImplementedError("drop_on_overflow=False EP2+ training requires an NCCL " "process group for the captured scalar global overflow OR")
 
 
 def _resolve_training_device(
@@ -123,11 +111,7 @@ def _resolve_training_device(
             resolved = torch.device("cuda", torch.cuda.current_device())
     if resolved.type != "cuda":
         raise ValueError(f"training device must be CUDA, got {resolved}")
-    if (
-        resolved.index is None
-        or resolved.index < 0
-        or resolved.index >= torch.cuda.device_count()
-    ):
+    if resolved.index is None or resolved.index < 0 or resolved.index >= torch.cuda.device_count():
         raise ValueError(f"CUDA device {resolved} is not available")
     return resolved
 
@@ -236,25 +220,13 @@ class MoeEp:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
         if top_k > num_experts:
-            raise ValueError(
-                f"top_k ({top_k}) cannot exceed num_experts ({num_experts})"
-            )
-        if max_tokens_per_rank is not None and (
-            isinstance(max_tokens_per_rank, bool)
-            or not isinstance(max_tokens_per_rank, int)
-            or max_tokens_per_rank < 0
-        ):
-            raise ValueError(
-                "max_tokens_per_rank must be a non-negative integer or None"
-            )
+            raise ValueError(f"top_k ({top_k}) cannot exceed num_experts ({num_experts})")
+        if max_tokens_per_rank is not None and (isinstance(max_tokens_per_rank, bool) or not isinstance(max_tokens_per_rank, int) or max_tokens_per_rank < 0):
+            raise ValueError("max_tokens_per_rank must be a non-negative integer or None")
         if max_recv_size_per_rank is not None and (
-            isinstance(max_recv_size_per_rank, bool)
-            or not isinstance(max_recv_size_per_rank, int)
-            or max_recv_size_per_rank <= 0
+            isinstance(max_recv_size_per_rank, bool) or not isinstance(max_recv_size_per_rank, int) or max_recv_size_per_rank <= 0
         ):
-            raise ValueError(
-                "max_recv_size_per_rank must be a positive integer or None"
-            )
+            raise ValueError("max_recv_size_per_rank must be a positive integer or None")
         if not isinstance(drop_on_overflow, bool):
             raise ValueError("drop_on_overflow must be a bool")
         if not isinstance(apply_topk_in_fc1, bool):
@@ -291,15 +263,10 @@ class MoeEp:
                 raise ValueError("gate_up_clamp must be a finite real number or None")
 
         if ep_group is not None and not isinstance(ep_group, dist.ProcessGroup):
-            raise ValueError(
-                f"ep_group must be a torch.distributed.ProcessGroup or None, "
-                f"got {type(ep_group).__name__}"
-            )
+            raise ValueError(f"ep_group must be a torch.distributed.ProcessGroup or None, " f"got {type(ep_group).__name__}")
         ep_size, ep_rank, ep_global_ranks = _resolve_ep_topology(ep_group)
         if num_experts % ep_size != 0:
-            raise ValueError(
-                f"num_experts ({num_experts}) must be divisible by EP size ({ep_size})"
-            )
+            raise ValueError(f"num_experts ({num_experts}) must be divisible by EP size ({ep_size})")
 
         self.num_experts = num_experts
         self.hidden_size = hidden_size
@@ -351,14 +318,9 @@ class MoeEp:
             ("output_format", self.output_format),
             ("combine_format", self.combine_format),
         ):
-            required_multiple = (
-                32 if fmt is MoeFormat.MXFP8 else 16 if fmt is MoeFormat.NVFP4 else 1
-            )
+            required_multiple = 32 if fmt is MoeFormat.MXFP8 else 16 if fmt is MoeFormat.NVFP4 else 1
             if hidden_size % required_multiple != 0:
-                raise ValueError(
-                    f"hidden_size ({hidden_size}) must be divisible by "
-                    f"{required_multiple} for {name}={fmt.value}"
-                )
+                raise ValueError(f"hidden_size ({hidden_size}) must be divisible by " f"{required_multiple} for {name}={fmt.value}")
 
         self._forward_config = ForwardConfig(
             num_experts=self.num_experts,
@@ -418,19 +380,11 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
-                raise RuntimeError(
-                    "MoeEp is unusable after an autotune runtime failure"
-                )
+                raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             from . import _backend
 
-            if (
-                self._forward_backend is not None
-                and request.device != self._forward_backend_device
-            ):
-                raise ValueError(
-                    f"MoeEp backend is bound to {self._forward_backend_device}; "
-                    f"create a separate MoeEp instance for {request.device}"
-                )
+            if self._forward_backend is not None and request.device != self._forward_backend_device:
+                raise ValueError(f"MoeEp backend is bound to {self._forward_backend_device}; " f"create a separate MoeEp instance for {request.device}")
 
             _backend.validate_config(self._forward_config)
             _backend.validate_request(request)
@@ -465,15 +419,9 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
-                raise RuntimeError(
-                    "MoeEp is unusable after an autotune runtime failure"
-                )
+                raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             topk_version = self._tensor_version(topk_idx)
-            validate_expert_ids = not (
-                self._validated_topk_idx is topk_idx
-                and topk_version is not None
-                and topk_version == self._validated_topk_version
-            )
+            validate_expert_ids = not (self._validated_topk_idx is topk_idx and topk_version is not None and topk_version == self._validated_topk_version)
             request = validate_forward(
                 self._forward_config,
                 activation,
@@ -527,9 +475,7 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
-                raise RuntimeError(
-                    "MoeEp is unusable after an autotune runtime failure"
-                )
+                raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             if self._training_state is not None:
                 raise RuntimeError("autotune must be called before prepare_training()")
 
@@ -545,11 +491,7 @@ class MoeEp:
                 (
                     self._forward_backend is not None,
                     self._training_state is not None,
-                    (
-                        None
-                        if self._forward_backend_device is None
-                        else str(self._forward_backend_device)
-                    ),
+                    (None if self._forward_backend_device is None else str(self._forward_backend_device)),
                 ),
                 self._forward_config.ep_group,
             )
@@ -569,22 +511,15 @@ class MoeEp:
                             topk_weights,
                         )
                         if request.device.type != "cuda":
-                            raise ValueError(
-                                f"autotune requires CUDA inputs, got {request.device}"
-                            )
+                            raise ValueError(f"autotune requires CUDA inputs, got {request.device}")
                         with torch.cuda.device(request.device):
                             if torch.cuda.is_current_stream_capturing():
-                                raise RuntimeError(
-                                    "autotune cannot run during CUDA Graph capture"
-                                )
+                                raise RuntimeError("autotune cannot run during CUDA Graph capture")
                         _backend.validate_config(config)
                         _backend.validate_request(request)
                         candidate_requests.append(request)
                     except BaseException as exc:
-                        raise RuntimeError(
-                            f"MoeEp autotune candidate {index} {tuning!r} "
-                            f"failed during preflight: {exc}"
-                        ) from exc
+                        raise RuntimeError(f"MoeEp autotune candidate {index} {tuning!r} " f"failed during preflight: {exc}") from exc
             except BaseException as exc:
                 preflight_error = exc
             raise_preflight_errors(
@@ -605,14 +540,10 @@ class MoeEp:
                         dist.barrier(group=self._forward_config.ep_group)
                 except BaseException as exc:
                     self._poisoned = True
-                    raise RuntimeError(
-                        f"MoeEp autotune failed during active backend teardown: {exc}"
-                    ) from exc
+                    raise RuntimeError(f"MoeEp autotune failed during active backend teardown: {exc}") from exc
 
             results: list[MoeEpAutotuneCandidateResult] = []
-            for index, (tuning, request) in enumerate(
-                zip(normalized, candidate_requests)
-            ):
+            for index, (tuning, request) in enumerate(zip(normalized, candidate_requests)):
                 backend = None
                 runtime_entered = False
                 phase = "backend creation"
@@ -656,9 +587,7 @@ class MoeEp:
                             backend.close()
                     if runtime_entered:
                         self._poisoned = True
-                    raise RuntimeError(
-                        f"MoeEp autotune candidate {index} {tuning!r} failed during {phase}: {exc}"
-                    ) from exc
+                    raise RuntimeError(f"MoeEp autotune candidate {index} {tuning!r} failed during {phase}: {exc}") from exc
 
             winner = select_winner(results)
             winner_request = candidate_requests[normalized.index(winner.tuning)]
@@ -677,9 +606,7 @@ class MoeEp:
                     with contextlib.suppress(Exception):
                         winner_backend.close()
                 self._poisoned = True
-                raise RuntimeError(
-                    f"MoeEp autotune winner {winner.tuning!r} failed final validation: {exc}"
-                ) from exc
+                raise RuntimeError(f"MoeEp autotune winner {winner.tuning!r} failed final validation: {exc}") from exc
 
             self.forward_tuning = winner.tuning
             self.tuning = self.forward_tuning
@@ -735,13 +662,9 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
-                raise RuntimeError(
-                    "MoeEp is unusable after an autotune runtime failure"
-                )
+                raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             if self._training_state is not None:
-                raise RuntimeError(
-                    "autotune_training must be called before prepare_training()"
-                )
+                raise RuntimeError("autotune_training must be called before prepare_training()")
 
             normalized = normalize_candidates(
                 self.tuning,
@@ -755,11 +678,7 @@ class MoeEp:
                 (
                     self._forward_backend is not None,
                     self._training_state is not None,
-                    (
-                        None
-                        if self._forward_backend_device is None
-                        else str(self._forward_backend_device)
-                    ),
+                    (None if self._forward_backend_device is None else str(self._forward_backend_device)),
                 ),
                 self._forward_config.ep_group,
             )
@@ -771,14 +690,10 @@ class MoeEp:
             try:
                 device = torch.device(activation.device)
                 if device.type != "cuda":
-                    raise ValueError(
-                        f"autotune_training requires CUDA inputs, got {device}"
-                    )
+                    raise ValueError(f"autotune_training requires CUDA inputs, got {device}")
                 with torch.cuda.device(device):
                     if torch.cuda.is_current_stream_capturing():
-                        raise RuntimeError(
-                            "autotune_training cannot run during CUDA Graph capture"
-                        )
+                        raise RuntimeError("autotune_training cannot run during CUDA Graph capture")
                 for index, tuning in enumerate(normalized):
                     try:
                         config = replace(self._forward_config, tuning=tuning)
@@ -801,23 +716,13 @@ class MoeEp:
                             device=device,
                         )
                         if activation_tokens != grad_tokens:
-                            raise ValueError(
-                                "activation and grad_output must have the same token "
-                                f"count, got {activation_tokens} and {grad_tokens}"
-                            )
-                        validate_native_forward_weights(
-                            config, forward_weights, device=device
-                        )
-                        validate_native_backward_weights(
-                            config, backward_weights, device=device
-                        )
+                            raise ValueError("activation and grad_output must have the same token " f"count, got {activation_tokens} and {grad_tokens}")
+                        validate_native_forward_weights(config, forward_weights, device=device)
+                        validate_native_backward_weights(config, backward_weights, device=device)
                         token_count = activation_tokens
                         candidate_configs.append(config)
                     except BaseException as exc:
-                        raise RuntimeError(
-                            f"MoeEp autotune_training candidate {index} {tuning!r} "
-                            f"failed during preflight: {exc}"
-                        ) from exc
+                        raise RuntimeError(f"MoeEp autotune_training candidate {index} {tuning!r} " f"failed during preflight: {exc}") from exc
             except BaseException as exc:
                 preflight_error = exc
             raise_preflight_errors(
@@ -837,15 +742,10 @@ class MoeEp:
                         dist.barrier(group=self._forward_config.ep_group)
                 except BaseException as exc:
                     self._poisoned = True
-                    raise RuntimeError(
-                        "MoeEp autotune_training failed during active backend "
-                        f"teardown: {exc}"
-                    ) from exc
+                    raise RuntimeError("MoeEp autotune_training failed during active backend " f"teardown: {exc}") from exc
 
             results: list[MoeEpAutotuneCandidateResult] = []
-            for index, (tuning, config) in enumerate(
-                zip(normalized, candidate_configs)
-            ):
+            for index, (tuning, config) in enumerate(zip(normalized, candidate_configs)):
                 backend = None
                 runtime_entered = False
                 phase = "backend creation"
@@ -969,10 +869,7 @@ class MoeEp:
                             backend.close()
                     if runtime_entered:
                         self._poisoned = True
-                    raise RuntimeError(
-                        f"MoeEp autotune_training candidate {index} {tuning!r} "
-                        f"failed during {phase}: {exc}"
-                    ) from exc
+                    raise RuntimeError(f"MoeEp autotune_training candidate {index} {tuning!r} " f"failed during {phase}: {exc}") from exc
 
             winner = select_winner(results)
             winner_config = candidate_configs[normalized.index(winner.tuning)]
@@ -1013,9 +910,7 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
-                raise RuntimeError(
-                    "MoeEp is unusable after an autotune runtime failure"
-                )
+                raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             output = self(
                 activation,
                 fc1_weight,
@@ -1065,17 +960,9 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
-                raise RuntimeError(
-                    "MoeEp is unusable after an autotune runtime failure"
-                )
-            if (
-                isinstance(lane_count, bool)
-                or not isinstance(lane_count, int)
-                or lane_count <= 0
-            ):
-                raise ValueError(
-                    f"lane_count must be a positive integer, got {lane_count!r}"
-                )
+                raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
+            if isinstance(lane_count, bool) or not isinstance(lane_count, int) or lane_count <= 0:
+                raise ValueError(f"lane_count must be a positive integer, got {lane_count!r}")
             if self._training_state is not None:
                 raise RuntimeError("MoeEp training is already prepared")
             if self._fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
@@ -1085,14 +972,8 @@ class MoeEp:
             from . import _backend
 
             _backend.validate_config(self._forward_config)
-            if (
-                self._forward_backend is not None
-                and resolved_device != self._forward_backend_device
-            ):
-                raise ValueError(
-                    f"MoeEp backend is bound to {self._forward_backend_device}; "
-                    f"got {resolved_device}"
-                )
+            if self._forward_backend is not None and resolved_device != self._forward_backend_device:
+                raise ValueError(f"MoeEp backend is bound to {self._forward_backend_device}; " f"got {resolved_device}")
             if self._forward_backend is None:
                 self._forward_backend = _backend.create_backend(
                     self._forward_config,
@@ -1104,10 +985,7 @@ class MoeEp:
                     lane_count=lane_count,
                 )
             self._training_state = state
-            self._training_lanes = tuple(
-                MoeEpExecutionLane(index, self._operator_token)
-                for index in range(lane_count)
-            )
+            self._training_lanes = tuple(MoeEpExecutionLane(index, self._operator_token) for index in range(lane_count))
             self._training_requirements = state.public_requirements()
             return self._training_requirements
 
@@ -1121,11 +999,7 @@ class MoeEp:
             raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
         if self._training_state is None or self._training_requirements is None:
             raise RuntimeError("prepare_training() must be called first")
-        if (
-            not isinstance(lane, MoeEpExecutionLane)
-            or lane._operator_token is not self._operator_token
-            or lane not in self._training_lanes
-        ):
+        if not isinstance(lane, MoeEpExecutionLane) or lane._operator_token is not self._operator_token or lane not in self._training_lanes:
             raise ValueError("execution lane does not belong to this MoeEp")
 
     def _training_requirement_subset(
@@ -1397,9 +1271,7 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
-                raise RuntimeError(
-                    "MoeEp is unusable after an autotune runtime failure"
-                )
+                raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:

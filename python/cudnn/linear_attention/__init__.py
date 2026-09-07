@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""cudnn.linear_attention: the linear-attention operation family (GDN, KDA, GDN-2)."""
+"""cudnn.linear_attention: the linear-attention operation family (GDN, KDA, GDN-2, GDP)."""
 
 from typing import Any
 
@@ -9,6 +9,7 @@ _LAZY_EXPORTS = {
     "gated_delta_net": ("cudnn.linear_attention.ops", "gated_delta_net"),
     "kimi_delta_attention": ("cudnn.linear_attention.ops", "kimi_delta_attention"),
     "gated_delta_net_v2": ("cudnn.linear_attention.ops", "gated_delta_net_v2"),
+    "gated_delta_product": ("cudnn.linear_attention.ops", "gated_delta_product"),
 }
 
 
@@ -78,3 +79,8 @@ def KdaEngines(ids):
 def Gdn2Engines(ids):
     """The GDN-2 family."""
     return _collect(ids, ("gdn2_frost", "cudnn.linear_attention.frost.gdn2_engine", "Gdn2FrostEngine"))
+
+
+def GdpEngines(ids):
+    """The GDP family: the FROST GDN kernels behind an engine-side sub-token expansion."""
+    return _collect(ids, ("gdp_frost", "cudnn.linear_attention.frost.gdp_engine", "GdpFrostEngine"))

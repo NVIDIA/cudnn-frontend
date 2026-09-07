@@ -391,7 +391,7 @@ def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=No
     assert len(flat_coord_i64) == len(flat_stride), "Coordinate and stride must have the same length"
     offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
     assert isinstance(tensor.iterator, cute.Pointer)
-    # HACK: we assume that applying the offset does not change the pointer alignment
+    # NOTE: we assume that applying the offset does not change the pointer alignment
     new_ptr = cute.make_ptr(
         tensor.element_type,
         tensor.iterator.toint() + offset * tensor.element_type.width // 8,

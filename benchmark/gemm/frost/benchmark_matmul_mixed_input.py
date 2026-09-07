@@ -96,9 +96,8 @@ def _vp(handles, a, b, c):
     return {A: a, B: b, C: c}
 
 
-def _build_plan(g, cfg, name):
+def _build_plan(g, cfg, _name):
     """JIT-compile the graph with a forced tile config -> callable kernel."""
-    _, cta_group = spec_for(name, _SPEC_MAP)
     return jit_from_cudnn_graph(g, config=cfg)
 
 

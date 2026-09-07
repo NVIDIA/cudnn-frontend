@@ -698,6 +698,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                 )
                 sched_counter[0] = cutlass.Int32(0)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,
@@ -3568,6 +3570,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             # Wait C buffer tail complete
             #
             c_pipeline.producer_tail(c_pipeline_producer_state)
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     def epilog_tmem_copy_and_partition(
         self,

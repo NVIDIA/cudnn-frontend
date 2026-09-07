@@ -1,8 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
+import math
+
 import pytest
 import torch
+import torch.nn.functional as F
 
 import inspect
 import threading
@@ -124,9 +128,9 @@ def test_DSA_indexer_backward_wrapper(
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
-    # The kernel mutates attn_score + index_score in-place during its
-    # score-grad stage. Keep pre-call copies so the reference can consume the
-    # same inputs the kernel was given.
+    # The score-grad stage overwrites attn_score but treats index_score as
+    # read-only. Keep pre-call copies for both reference input and the
+    # preservation check.
     attn_score_ref = attn_score.clone()
     index_score_ref = index_score.clone()
     torch_stream.wait_stream(torch.cuda.current_stream())
@@ -147,6 +151,8 @@ def test_DSA_indexer_backward_wrapper(
     except (ValueError, NotImplementedError, RuntimeError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
     torch_stream.synchronize()
+
+    assert torch.equal(index_score, index_score_ref)
 
     d_index_q = result["d_index_q"]
     d_weights = result["d_weights"]
@@ -178,7 +184,7 @@ def test_DSA_indexer_backward_wrapper(
 # ===========================================================================
 # Regression coverage for the output/plan-signature validation on the default
 # indexer backward (SM100/SM90):
-#   * illegal output dtypes raise BEFORE kernel 1 mutates the score buffers;
+#   * illegal output dtypes raise BEFORE kernel 1 overwrites attn_score;
 #   * wrong-rank / wrong-shape / non-contiguous plans are rejected up front;
 #   * a direct plan or a cached wrapper plan reused with a mismatched
 #     shape/stride signature raises (no fail-dirty);
@@ -227,7 +233,7 @@ def _idxbwd_inputs():
 @torch_fork_set_rng(seed=0)
 def test_DSA_indexer_backward_illegal_output_dtype_raises_before_mutation():
     """Each illegal output dtype raises ValueError, and the raise happens
-    before kernel 1 mutates attn_score / index_score in place (no fail-dirty)."""
+    before kernel 1 overwrites attn_score (index_score is always read-only)."""
     _require_sm100()
     DSA, _ = _import_dsa()
 
@@ -308,7 +314,7 @@ def _noncontiguous_like(sample):
 def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     """A directly-built plan rejects a runtime tensor whose shape or
     stride/layout differs from the descriptor it was compiled for, raising a
-    clean ValueError BEFORE kernel 1 mutates the score buffers (no fail-dirty)."""
+    clean ValueError BEFORE kernel 1 overwrites attn_score (no fail-dirty)."""
     _require_sm100()
     DSA, _ = _import_dsa()
 
@@ -404,7 +410,7 @@ def test_DSA_indexer_backward_wrapper_cache_hit_stride_mismatch_raises():
 def test_DSA_indexer_backward_wrong_shape_plan_rejected_before_kernel1():
     """A first-call / directly-built plan whose output/score shape is
     inconsistent with ``index_q`` is rejected by the semantic shape validation
-    in ``check_support`` BEFORE kernel 1 mutates the score buffers — not
+    in ``check_support`` BEFORE kernel 1 overwrites attn_score — not
     silently run on a mismatched signature that only faults in the GEMM. Covers
     both the wrapper (cache miss) and a directly-built plan. Fail-hard."""
     _require_sm100()
@@ -483,7 +489,7 @@ def test_DSA_indexer_backward_noncontiguous_index_k_plan_rejected():
         plan.check_support()
 
     # (b) Wrapper first call (cache miss) with a non-contiguous index_k is
-    #     rejected before kernel 1 mutates the score buffers.
+    #     rejected before kernel 1 overwrites attn_score.
     aq = attn.clone()
     isc = idx.clone()
     aq_pre = aq.clone()
@@ -546,12 +552,11 @@ def _v2_call(
     d_index_k=None,
     stream=None,
 ):
-    """Run the wrapper with backend="sm100_v2" on CLONED score buffers.
+    """Run the wrapper with backend="sm100_v2" on cloned score inputs.
 
-    Returns (result, grad_signal, predict) -- the two in-place score buffers
-    after the call: grad_signal is the attn_score scratch (kernel 1's output)
-    and predict is the consumed index_score buffer. Both are shared
-    bit-for-bit with the default backend.
+    Returns (result, grad_signal, predict): grad_signal is the overwritten
+    attn_score scratch (kernel 1's output), while predict is the preserved,
+    read-only index_score input. Both match the default backend bit-for-bit.
     """
     from cudnn import DSA
     from cuda.bindings import driver as cuda
@@ -974,7 +979,7 @@ def test_DSA_indexer_backward_wrapper_v2_envelope_rejection(
     request,
 ):
     """check_support must reject out-of-envelope requests with ValueError
-    BEFORE kernel 1 mutates the score buffers: topk bounds (2176 above the
+    BEFORE kernel 1 overwrites attn_score: topk bounds (2176 above the
     smem cap, non-multiple-of-128), non-positive sm_scale, unsupported output
     dtypes, non-contiguous metadata, and an index_k whose dim 0 / dim 2
     disagree with index_q. (topk 128/256 are now inside the envelope and are
@@ -1176,11 +1181,10 @@ def test_DSA_indexer_backward_wrapper_v2_sm_scale(
     folds the scale into the grad signal -- an autograd-reference check
     alone historically could not catch a mis-applied scale here (its noise
     floor has since dropped to rms_rel <= 0.005, but the fp64 recompute stays
-    the authoritative scale check); (b) both in-place score
-    buffers are left bitwise identical to the default backend's, i.e. the
-    scratch holds exactly kernel 1's grad_signal and ``index_score`` is
-    consumed the same way (the scale folds inside kernel 2, no host-side
-    buffer mutation)."""
+    the authoritative scale check); (b) score handling is bitwise identical
+    to the default backend, i.e. the attn_score scratch holds exactly kernel
+    1's grad_signal and ``index_score`` remains unchanged (the scale folds
+    inside kernel 2, with no host-side buffer mutation)."""
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
@@ -1384,7 +1388,7 @@ def test_DSA_indexer_backward_wrapper_v2_multi_stream(
 
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     cu_streams = [cuda.CUstream(s.cuda_stream) for s in streams]
-    # pre-clone the in-place score buffers for every iteration up front so
+    # pre-clone the score inputs for every iteration up front so
     # the interleaved phase enqueues only wrapper work
     clones = [[(inp[3].clone(), inp[4].clone()) for _ in range(n_iters)] for inp in inputs]
     results = [[None] * n_iters for _ in range(2)]
@@ -1696,7 +1700,7 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
     Run the identical input bits on each device, then interleave the devices,
     checking dq/dw bitwise against each device's serial result and dk in the
     fp32-atomic class; finally, executing a plan with tensors on the wrong
-    device must raise ValueError before kernel 1 mutates the score buffers."""
+    device must raise ValueError before kernel 1 overwrites attn_score."""
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda  # noqa: F401
@@ -1773,7 +1777,7 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
             assert _rms_rel(r["d_index_k"], refs[dev]["d_index_k"].double()) < _DK_ATOMIC_BAND, f"device {dev} iter {it}: d_index_k diverged"
 
     # direct-object contract: a plan built on device 0 must reject device-1
-    # tensors BEFORE kernel 1 mutates the score buffers
+    # tensors BEFORE kernel 1 overwrites attn_score
     iq0, w0, ik0, attn0, index0, tki0 = inputs[0]
     with torch.cuda.device(0):
         plan = DSA.IndexerBackward(
@@ -2220,3 +2224,290 @@ def test_DSA_indexer_backward_wrapper_legacy_positional_call(
     assert torch.isfinite(d_index_q.float()).all()
     assert torch.isfinite(d_weights.float()).all()
     assert torch.isfinite(d_index_k.float()).all()
+
+
+@pytest.mark.L1
+def test_DSA_indexer_backward_sm100_persistent_short_topk_dispatch_threshold():
+    """Use persistence only once a CTA can amortize setup across rows."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ required")
+
+    try:
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import IndexerBackwardSm100, _HAS_TMA_GATHER4
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    for topk in (128, 256, 384):
+        short = IndexerBackwardSm100(
+            128,
+            heads=64,
+            block_I=128,
+            topk=topk,
+            total_seqlen_k=512,
+            total_rows=sm_count,
+            persistent_grid_size=sm_count,
+            topk_indices_global=True,
+        )
+        long = IndexerBackwardSm100(
+            128,
+            heads=64,
+            block_I=128,
+            topk=topk,
+            total_seqlen_k=512,
+            total_rows=sm_count + 1,
+            persistent_grid_size=sm_count,
+            topk_indices_global=True,
+        )
+        assert not short.use_persistent
+        assert long.use_persistent
+        assert short.use_tma_gather is _HAS_TMA_GATHER4
+        assert long.use_tma_gather is _HAS_TMA_GATHER4
+        assert long.use_cross_row_persistent is _HAS_TMA_GATHER4
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("topk", [128, 256, 384, 512])
+def test_DSA_indexer_backward_sm100_score_grad_packed_rows_and_fused_dk_zero(topk):
+    """Packed tail rows preserve score math and clear the FP32 dK scratch."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ required")
+
+    try:
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import indexer_backward_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(20260826 + topk)
+    batch, seqlen_q, seqlen_k, heads, head_dim = 2, 151, max(512, topk), 64, 128
+    target = torch.softmax(
+        torch.randn((batch, seqlen_q, topk), device=device, dtype=torch.float32, generator=generator),
+        dim=-1,
+    )
+    predict = torch.softmax(
+        torch.randn((batch, seqlen_q, topk), device=device, dtype=torch.float32, generator=generator),
+        dim=-1,
+    )
+    target[:, ::23, ::31] = 0.0
+    predict[:, ::29, ::37] = 0.0
+    grad_loss = torch.tensor([0.7], device=device, dtype=torch.float32)
+    grad_scale = 0.13
+    actual = target.clone()
+    d_index_k_f32 = torch.full(
+        (batch, seqlen_k, head_dim),
+        7.0,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    kernel = indexer_backward_sm100(
+        batch,
+        seqlen_q,
+        seqlen_k,
+        heads,
+        head_dim,
+        topk,
+        sm_scale=head_dim**-0.5,
+        block_I=128,
+        topk_indices_global=True,
+    )
+    kernel.score_grad_zero(
+        actual,
+        predict,
+        grad_loss,
+        grad_scale,
+        dIndexK_f32=d_index_k_f32,
+    )
+    torch.cuda.synchronize()
+
+    clip_probability_min = math.exp(-100.0)
+    grad = -target.clamp_min(clip_probability_min) * (predict >= clip_probability_min) * (grad_scale * grad_loss.item())
+    expected = grad - predict * grad.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-7)
+    torch.testing.assert_close(d_index_k_f32, torch.zeros_like(d_index_k_f32), rtol=0.0, atol=0.0)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("topk", [128, 256, 384])
+def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(topk):
+    """PDL prologue overlap remains ordered across back-to-back calls."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ required")
+
+    try:
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import indexer_backward_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(20260827 + topk)
+    batch, seqlen_q, seqlen_k, heads, head_dim = 1, 149, 512, 64, 128
+    index_q = torch.randn((batch, seqlen_q, heads, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
+    index_k = torch.randn((batch, seqlen_k, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
+    weights = torch.randn((batch, seqlen_q, heads), device=device, dtype=torch.bfloat16, generator=generator).abs().mul_(0.1)
+    topk_indices = torch.randint(0, seqlen_k, (batch, seqlen_q, topk), device=device, dtype=torch.int32, generator=generator)
+    target = torch.softmax(torch.randn((batch, seqlen_q, topk), device=device, dtype=torch.float32, generator=generator), dim=-1)
+    predict = torch.softmax(torch.randn((batch, seqlen_q, topk), device=device, dtype=torch.float32, generator=generator), dim=-1)
+    grad_loss = torch.tensor([0.7], device=device, dtype=torch.float32)
+    grad_scale = 0.13
+    clip_probability_min = math.exp(-100.0)
+    grad = -target.clamp_min(clip_probability_min) * (predict >= clip_probability_min) * (grad_scale * grad_loss.item())
+    grad_signal = (grad - predict * grad.sum(dim=-1, keepdim=True)).contiguous()
+
+    kernel = indexer_backward_sm100(
+        batch,
+        seqlen_q,
+        seqlen_k,
+        heads,
+        head_dim,
+        topk,
+        sm_scale=head_dim**-0.5,
+        block_I=128,
+        topk_indices_global=True,
+    )
+    d_index_q_ref = torch.empty_like(index_q)
+    d_weights_ref = torch.empty_like(weights)
+    d_index_k_ref_f32 = torch.zeros_like(index_k, dtype=torch.float32)
+    kernel.gemm_only(
+        index_q,
+        weights,
+        index_k,
+        d_index_q_ref,
+        d_weights_ref,
+        d_index_k_ref_f32,
+        grad_signal,
+        topk_indices,
+    )
+    d_index_k_ref = d_index_k_ref_f32.to(torch.bfloat16)
+
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights)
+    d_index_k = torch.empty_like(index_k)
+    for _ in range(2):
+        kernel(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            target.clone(),
+            predict,
+            topk_indices,
+            grad_loss,
+            grad_scale,
+        )
+    torch.cuda.synchronize()
+
+    for name, actual, expected in (
+        ("dQ", d_index_q, d_index_q_ref),
+        ("dW", d_weights, d_weights_ref),
+        ("dK", d_index_k, d_index_k_ref),
+    ):
+        assert torch.isfinite(actual.float()).all(), f"{name} contains NaN/Inf"
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2, msg=lambda msg, name=name: f"{name}: {msg}")
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "topk,topk_indices_global,force_manual_k_load",
+    [
+        pytest.param(topk, topk_indices_global, False, id=f"{'global' if topk_indices_global else 'local'}-{topk}")
+        for topk_indices_global in (True, False)
+        for topk in (128, 256, 384)
+    ]
+    + [pytest.param(512, True, True, id="global-512-manual-k-load")],
+)
+def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
+    topk,
+    topk_indices_global,
+    force_manual_k_load,
+    monkeypatch,
+    request,
+):
+    """Check persistent phases and the manual K-load fallback against the reference."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ required")
+
+    try:
+        indexer_backward_sm100_module = importlib.import_module("cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100")
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    if force_manual_k_load:
+        monkeypatch.setattr(indexer_backward_sm100_module, "_HAS_TMA_GATHER4", False)
+        indexer_backward_sm100_module._compile_cache.clear()
+        request.addfinalizer(indexer_backward_sm100_module._compile_cache.clear)
+    indexer_backward_sm100 = indexer_backward_sm100_module.indexer_backward_sm100
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(20260825 + topk + int(topk_indices_global))
+    batch, seqlen_q, seqlen_k, heads, head_dim = 2, 151, 512, 64, 128
+    sm_scale = head_dim**-0.5
+    index_q = torch.randn((batch, seqlen_q, heads, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
+    index_k = torch.randn((batch, seqlen_k, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
+    weights = torch.randn((batch, seqlen_q, heads), device=device, dtype=torch.bfloat16, generator=generator).abs().mul_(0.1)
+    local_ids = torch.randint(0, seqlen_k, (batch, seqlen_q, topk), device=device, dtype=torch.int32, generator=generator)
+    local_ids[:, ::17, ::19] = -1
+    valid = local_ids >= 0
+    batch_offsets = torch.arange(batch, device=device, dtype=torch.int32)[:, None, None] * seqlen_k
+    global_ids = torch.where(valid, local_ids + batch_offsets, local_ids)
+    if topk_indices_global:
+        kernel_ids = global_ids.clone()
+        kernel_ids[0, 1, 3] = batch * seqlen_k
+    else:
+        kernel_ids = local_ids.clone()
+        kernel_ids[0, 1, 3] = seqlen_k
+    local_ids[0, 1, 3] = -1
+    global_ids[0, 1, 3] = -1
+    valid[0, 1, 3] = False
+    grad_signal = torch.randn((batch, seqlen_q, topk), device=device, dtype=torch.float32, generator=generator)
+
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights)
+    d_index_k = torch.zeros_like(index_k, dtype=torch.float32)
+    kernel = indexer_backward_sm100(
+        batch,
+        seqlen_q,
+        seqlen_k,
+        heads,
+        head_dim,
+        topk,
+        sm_scale=sm_scale,
+        block_I=128,
+        topk_indices_global=topk_indices_global,
+    )
+    kernel.gemm_only(index_q, weights, index_k, d_index_q, d_weights, d_index_k, grad_signal, kernel_ids)
+    torch.cuda.synchronize()
+
+    safe_ids = local_ids.clamp(min=0).long()
+    selected_k = torch.gather(
+        index_k[:, None].expand(-1, seqlen_q, -1, -1),
+        2,
+        safe_ids[..., None].expand(-1, -1, -1, head_dim),
+    ).float()
+    scores = torch.einsum("bqhd,bqtd->bqht", index_q.float(), selected_k) * sm_scale
+    d_scores = grad_signal[:, :, None, :] * weights.float()[:, :, :, None] * ((scores > 0) & valid[:, :, None, :])
+    d_index_q_ref = torch.einsum("bqht,bqtd->bqhd", d_scores, selected_k) * sm_scale
+    d_weights_ref = (grad_signal[:, :, None, :] * torch.relu(scores) * valid[:, :, None, :]).sum(dim=-1)
+    d_index_k_ref = torch.zeros_like(index_k, dtype=torch.float32)
+    d_index_k_contrib = torch.einsum("bqht,bqhd->bqtd", d_scores, index_q.float()) * sm_scale
+    d_index_k_ref.view(-1, head_dim).index_add_(
+        0,
+        global_ids.clamp(min=0).reshape(-1).long(),
+        d_index_k_contrib.reshape(-1, head_dim),
+    )
+
+    for name, actual, expected in (
+        ("dQ", d_index_q.float(), d_index_q_ref),
+        ("dW", d_weights.float(), d_weights_ref),
+        ("dK", d_index_k, d_index_k_ref),
+    ):
+        actual_flat = actual.flatten()
+        expected_flat = expected.flatten()
+        cosine = F.cosine_similarity(actual_flat, expected_flat, dim=0).item()
+        rms_relative = ((actual_flat - expected_flat).square().mean().sqrt() / expected_flat.square().mean().sqrt().clamp_min(1e-12)).item()
+        assert torch.isfinite(actual_flat).all(), f"{name} contains NaN/Inf"
+        assert cosine >= 0.99, f"{name} cosine={cosine:.6f}"
+        assert rms_relative <= 0.02, f"{name} RMS-relative error={rms_relative:.6f}"

@@ -26,6 +26,17 @@ SUPPORTED_HEAD_TILES_FP8 = tuple(range(FP8_HEAD_TILE_GRANULE, SUPPORTED_HEAD_TIL
 SMEM_CAPACITY_BYTES = 101376
 
 
+def register_budgets(q_tile: int) -> tuple[int, int]:
+    max_regs_per_sm = 2048
+    max_regs_per_thread = 256
+    load_regs_per_thread = 24
+    num_compute_warps = 8 if q_tile == 128 else 4
+    num_load_warps = 4
+    free_slots = max_regs_per_sm - num_load_warps * load_regs_per_thread
+    compute_regs_per_thread = min(max_regs_per_thread, free_slots // num_compute_warps // 8 * 8)
+    return load_regs_per_thread, compute_regs_per_thread
+
+
 def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2, out_itemsize: Optional[int] = None) -> int:
     """SMEM the SM120 prefill kernel needs for one specialization.
 

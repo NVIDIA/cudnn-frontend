@@ -30,7 +30,8 @@ BACKEND_CONFIG = {
     "flash_qla": {"name": "FlashQLA (TileLang)", "color": "#6495ED", "order": 1},
     "flash_kda": {"name": "FlashKDA", "color": "#9370DB", "order": 2},
     "cudnn": {"name": "cuDNN (default)", "color": "#76b900", "order": 3},
-    "cudnn_state_on": {"name": "cuDNN (state on)", "color": "#2f6e00", "order": 4},
+    "cudnn_batch_invariant": {"name": "cuDNN (batch invariant)", "color": "#4f9200", "order": 4},
+    "cudnn_state_on": {"name": "cuDNN (state on)", "color": "#2f6e00", "order": 5},
 }
 
 # Backends dropped from every chart (rows may still exist in older CSVs).
@@ -68,6 +69,30 @@ METRIC_CONFIG = (
 )
 
 
+def _clear_legend(ax, legend, margin=0.04):
+    """Raise the y-limit until no bar reaches under the legend box.
+
+    The legend sits upper-left and its height is set by the backend count in
+    FIGURE units, while bar heights are data units, so a fixed fractional
+    headroom does not track it: one dominant series in the leftmost group still
+    clips.  Measure the rendered box instead and solve for the limit.
+    """
+    bars = [(patch.get_x() + patch.get_width() / 2, patch.get_height()) for c in ax.containers for patch in c]
+    if not bars:
+        return
+    for _ in range(3):
+        ax.figure.canvas.draw()
+        box = legend.get_window_extent().transformed(ax.transData.inverted())
+        under = [h for x, h in bars if box.x0 <= x <= box.x1 and h >= box.y0]
+        if not under:
+            return
+        top = ax.get_ylim()[1]
+        frac = (box.y0 / top) - margin
+        if frac <= 0:
+            return
+        ax.set_ylim(0, max(under) / frac)
+
+
 def get_backend_display_name(backend: str, cudnn_version: Optional[str] = None) -> str:
     return BACKEND_CONFIG.get(backend, {}).get("name", backend)
 
@@ -80,6 +105,7 @@ def generate_charts(
     variant: str = "gdn",
     batch_sizes: Optional[List[int]] = None,
     x_axis: str = "seqlen",
+    dims_label: Optional[str] = None,
 ) -> list:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -128,8 +154,9 @@ def generate_charts(
             head_dim = sub["head_dim"].iloc[0]
             gpu_info = f" ({gpu_name})" if gpu_name else ""
             group_label = f"Batch = {group_val}" if x_axis == "seqlen" else f"Sequence Length = {group_val}"
+            dims = dims_label if dims_label else f"d = {head_dim}"
             fig.suptitle(
-                f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, d = {head_dim}{gpu_info}",
+                f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, {dims}, " f"use_qk_l2norm = True{gpu_info}",
                 fontsize=TITLE_FONT_SIZE,
             )
 
@@ -155,7 +182,8 @@ def generate_charts(
                 ax.set_xlabel(x_label, fontsize=LABEL_FONT_SIZE)
                 ax.set_ylabel(y_label, fontsize=LABEL_FONT_SIZE)
                 ax.set_title(pass_name, fontsize=TITLE_FONT_SIZE)
-                ax.legend(title="Backend", fontsize=LEGEND_FONT_SIZE, loc="upper left")
+                legend = ax.legend(title="Backend", fontsize=LEGEND_FONT_SIZE, loc="upper left", framealpha=0.9)
+                _clear_legend(ax, legend)
                 ax.tick_params(axis="x", rotation=45)
                 for container in ax.containers:
                     ax.bar_label(container, fmt=bar_fmt, fontsize=BAR_LABEL_FONT_SIZE)
@@ -184,6 +212,7 @@ def main():
     parser.add_argument("--gpu-name", default="", help="GPU name for the chart title")
     parser.add_argument("--cudnn-version", default=None, help="cuDNN backend version for the legend (e.g. 9.24.0)")
     parser.add_argument("--variant", default="gdn", help="Linear attention variant to plot")
+    parser.add_argument("--dims-label", default=None, help="Head-dim label for the chart title (default: 'd = <head_dim>')")
     parser.add_argument("--batch-sizes", default=None, help="Comma-separated batch sizes to plot (default: all in the CSV)")
     parser.add_argument(
         "--x-axis", default="seqlen", choices=("seqlen", "batch"), help="Bar-group axis: seqlen (one chart per batch) or batch (one chart per seqlen)"
@@ -198,7 +227,16 @@ def main():
         raise ValueError(f"CSV is missing expected columns: {missing}")
 
     output_dir = args.output_dir if args.output_dir is not None else args.csv.parent
-    generate_charts(df, output_dir, gpu_name=args.gpu_name, cudnn_version=args.cudnn_version, variant=args.variant, batch_sizes=batch_sizes, x_axis=args.x_axis)
+    generate_charts(
+        df,
+        output_dir,
+        gpu_name=args.gpu_name,
+        cudnn_version=args.cudnn_version,
+        variant=args.variant,
+        batch_sizes=batch_sizes,
+        x_axis=args.x_axis,
+        dims_label=args.dims_label,
+    )
 
 
 if __name__ == "__main__":

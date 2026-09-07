@@ -31,6 +31,7 @@ def emit_seq_descs(
     n_batch: cutlass.Int32,
     row_stride: cutlass.Int32,
     seq_ord: cutlass.Constexpr[int],
+    expand_num: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Per-BATCH TMA-descriptor array for a VARLEN (THD) tensor whose base
     descriptor carries the head axis as a real dimension (``(d, head,
@@ -38,10 +39,11 @@ def emit_seq_descs(
     base and length are patched per slot.  GLOBAL_ADDRESS folds
     ``cu_seqlens[b] * row_stride`` (Int64); GLOBAL_DIM[``seq_ord``] is
     capped to the per-sequence token count so tail loads zero-fill and tail
-    stores clip in hardware.  GQA/GVA head grouping happens at the issue
-    site (``head_idx // group`` with a static group), not here.  Runs on
-    one electing thread; the calling warp elects and release-fences
-    (GENERIC->TENSORMAP)."""
+    stores clip in hardware.  ``expand_num`` scales every loaded ``cu``
+    value onto GDP's sub-token timeline (1 = off).  GQA/GVA head grouping
+    happens at the issue site (``head_idx // group`` with a static group),
+    not here.  Runs on one electing thread; the calling warp elects and
+    release-fences (GENERIC->TENSORMAP)."""
     desc_base = desc_words.iterator.raw_ptr()
     src_words = Pointer(base_desc.get_ptr(), dtype=cutlass.Int64)
     cu = cutlass.make_array_view(cu_seqlens)
@@ -49,6 +51,9 @@ def emit_seq_descs(
     for b in cutlass.range(0, n_batch, 1, unroll=1):
         cu_b = cutlass.Int32(cu[b])
         s_b = cutlass.Int32(cu[b + cutlass.Int32(1)]) - cu_b
+        if cutlass.const_expr(expand_num > 1):
+            cu_b = cu_b * cutlass.Int32(expand_num)
+            s_b = s_b * cutlass.Int32(expand_num)
         dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
         for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
             (dptr + i).store((src_words + i).load())
@@ -76,15 +81,17 @@ def emit_checkpoint_seq_descs(
     row_stride: cutlass.Int32,
     every_n: cutlass.Int32,
     seq_ord: cutlass.Constexpr[int],
+    expand_num: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Per-BATCH descriptor array for the per-chunk checkpoint tensor with the head
     axis as a descriptor dimension (``(dv, dk, chunk, head)``).  Derives the
     per-sequence checkpoint offsets from the TOKEN ``cu_seqlens`` on the fly
     (``count_b = (batch_seqlen - 1) // every_n + 1``, running-prefix-summed) — an
     address fold no coordinate transform can express — and caps
-    GLOBAL_DIM[``seq_ord``] to ``count_b``.  The head index is a load
-    coordinate.  Runs on one electing thread; the calling warp elects and
-    fences."""
+    GLOBAL_DIM[``seq_ord``] to ``count_b``.  ``expand_num`` scales the
+    loaded per-sequence token counts onto GDP's sub-token timeline (1 =
+    off).  The head index is a load coordinate.  Runs on one electing
+    thread; the calling warp elects and fences."""
     desc_base = desc_words.iterator.raw_ptr()
     src_words = Pointer(base_desc.get_ptr(), dtype=cutlass.Int64)
     cu = cutlass.make_array_view(cu_seqlens)
@@ -92,6 +99,8 @@ def emit_checkpoint_seq_descs(
     run = cutlass.Int32(0)
     for b in cutlass.range(0, n_batch, 1, unroll=1):
         s_tok = cutlass.Int32(cu[b + cutlass.Int32(1)]) - cutlass.Int32(cu[b])
+        if cutlass.const_expr(expand_num > 1):
+            s_tok = s_tok * cutlass.Int32(expand_num)
         cnt = (s_tok - cutlass.Int32(1)) // every_n + cutlass.Int32(1)
         cnt = cnt if s_tok > 0 else cutlass.Int32(0)
         checkpoint_base = run

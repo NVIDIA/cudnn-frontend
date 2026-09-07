@@ -129,13 +129,18 @@ EngineFamily(
     slots={"sdpa_fwd_prefill_sm100_d128": EngineSlot(0, opt_in=True), ...},
     analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
     heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
+    validator=("cudnn._sdpa_validate", "validate_graph"),
 ),
 ```
 
 - A family is **pure data**: strings and ints, zero imports of engine code.
   `import cudnn` must never pay the CuTe-DSL import (~1.2 s) merely to know an
-  engine exists. `analyzer` and `heuristics` are `(module, callable)` pairs for
-  the same reason, resolved only when something needs to rank.
+  engine exists. `analyzer`, `heuristics` and `validator` are `(module, callable)`
+  pairs for the same reason, resolved only when something needs them. The
+  `validator` is what lets `pygraph.validate()` skip the eager C++ lowering for
+  a graph a python engine may serve (it runs the family's semantic rules; the
+  backend's verdict is deferred to planning) — see
+  `docs/python_graph_and_execution_backends.md`, *The manifest*.
 - **A family is a KIND OF GRAPH**, not a group of engines that ship together.
   `_ANCHOR_NODE_TO_FAMILY` maps a node type to the one family that serves that
   kind of graph, so a graph belongs to exactly one family or to none, and
@@ -314,7 +319,7 @@ python/cudnn/
         prefill_d512_f16_sm100.py
         prefill_f16_sm120.py
         _common_sm100.py
-        thd_sm100.py
+        thd_helpers.py
     bwd/                        future: same shape, its own api_dsl.py
 
   gemm/frost/                   engine.py + graph_analyzer.py + compiler.py
@@ -813,3 +818,12 @@ Asserts:
     `pre-commit run --all-files` (black, 160 cols) before pushing.
 13. **Keep this document true.** If code and this contract disagree and you
     change the code, change this file in the same commit.
+14. **Coverage changes update the support matrix.** A change to any SDPA
+    `Capabilities` field that affects graph eligibility, or adding/retiring
+    an `EngineSpec`, updates
+    `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.
+    That tracker is the only arch x pass x head-dim x dtype view of what
+    FROST serves, it is maintained by hand from these rows, and it silently
+    rots otherwise. Knob-domain-only changes are exempt (it does not track
+    knobs). `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the
+    exact scope and is the number to cite in review.

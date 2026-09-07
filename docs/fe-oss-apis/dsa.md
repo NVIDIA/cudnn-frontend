@@ -63,7 +63,7 @@ Training-score loss path:
 ## Installation
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 ---
@@ -124,20 +124,53 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward outputs
   - `topk_idxs`: `(total_S_q, topk_max)` INT32 (global)
   - `topk_length` (optional): `(total_S_q,)` INT32 — per-query valid count
 
-On SM100, the public backward entry point automatically selects the tuned
-kernel from `q.shape[1:3]`: H16 with `head_dim=576` uses the dedicated M128
-sparse-row pipeline, while `head_dim=512`, H32/H64, and other supported shapes
-use the generic M64 pipeline. No backend or tile-size argument is required.
-SM90 continues to use its Hopper-specific implementation.
+On Blackwell SM100/SM103, the public backward entry point automatically selects
+the tuned kernel from the device, dtype, and tensor shape. On SM100 (10, 0) and
+SM103 (10, 3) devices, BF16 H128 with `head_dim = head_dim_v = 512` and
+`topk_max ∈ {128, 512, 1024, 1152, 2048}` uses the two-CTA specialization. H16 with
+`head_dim=576` uses the dedicated M128 sparse-row pipeline. FP16, other head
+counts and dimensions, and every other `topk_max` retain the existing
+generic/H16 selection. Other compute capabilities, including SM107, do not
+select the two-CTA path. No backend or tile-size argument is required. SM90
+continues to use its Hopper-specific implementation.
+
+The H128 specialization keeps the five tensor-core products in one
+two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to the
+caller-provided scratch workspace, converts the FP32 dKV workspace to the public BF16
+output, and completes dSink with a separate FP32 reduction kernel. The helper
+launches do not change the two-CTA topology of the core computation.
+
+On SM100 with H16/H32/H64/H96/H128, `deterministic=True` selects a bounded-wave
+M64 implementation. Queries run in same-stream waves of 128 CTAs; CTA lane
+`i` is the sole writer of FP32 dKV shard `i` in each wave. H16/H32 use a masked
+M64 head tile. H96/H128 split each query wave into ordered M64 head-block
+launches, preserving single-writer ownership without multiplying the number
+of shards. Kernel launch ordering serializes both head blocks and shard reuse
+across waves, so the protocol needs neither semaphores nor cooperative launch.
+A fixed-order two-stage reduction combines the 128 shards, and one CTA per
+head reduces `d_sink`. The additional dKV workspace is
+`128 * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)` bytes. Use
+`scratch_workspace_bytes()` as the authoritative full scratch size.
+`deterministic=True` takes precedence over the two-CTA selection: the BF16
+H128/D512 envelope also runs the bounded-wave M64 kernel when determinism is
+requested, because the two-CTA path accumulates dKV with FP32 atomics.
+
+`SparseAttentionBackward.scratch_workspace_bytes()` reports the full SM100
+scratch requirement. Pass a contiguous CUDA `uint8` tensor of at least this
+size to `execute(..., workspace=workspace)` and reuse it across calls; the
+compiled kernel initializes the dKV accumulator on every execution. The
+high-level wrapper accepts the same optional `workspace=` argument and only
+allocates convenience scratch when it is omitted.
 
 - **Outputs** — tuple `(dq, dkv, d_sink)`
-- **Constraints** — SM90 or SM100; SM90 supports the FlashMLA DSA shape with `head_dim ∈ {512, 576}`
+- **Constraints** — SM90 or Blackwell SM100/SM103; SM90 supports the FlashMLA DSA shape with `head_dim ∈ {512, 576}`
 
 ```python
 result = DSA.sparse_attention_backward_wrapper(
     q, kv, out, dout, lse, attn_sink, topk_idxs,
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
+    deterministic=True,  # optional; SM100 H16/H32/H64/H96/H128
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
 ```
@@ -305,8 +338,9 @@ and normalization semantics differ from the indexer path.
 Three-stage sparse top-K pipeline that produces the training gradients for the
 indexer tower:
 
-1. `ScoreGradSm90` / `ScoreGradSm100` (kernel 1) — in-place score-grad precompute from
-   `attn_score` (target) and `index_score` (predict).
+1. `ScoreGradSm90` / `ScoreGradSm100` (kernel 1) — in-place score-grad precompute
+   that overwrites `attn_score` (target) and reads `index_score` (predict)
+   without modifying it.
 2. `IndexerBackwardSm90` / `IndexerBackwardSm100` (kernel 2) — three
    warp-specialised GEMMs produce `d_index_q`, `d_weights`, and a
    `dIndexK_f32` accumulator.
@@ -331,11 +365,11 @@ d_index_q, d_weights, d_index_k = (
 
 When compressed forward returns its fused `softmax`, backward can skip both
 indexer Q@K score recompute and the separate logits softmax. Pass `softmax`
-directly as `index_score`; backward consumes and overwrites this buffer, so
-pass `softmax.clone()` if it must be preserved. `attn_score` must use the same
-valid-slot mask. Because compressed forward returns global indices by default,
-also pass `topk_indices_global=True` unless forward used
-`topk_indices_global=False`. The public sparse `indexer_backward_wrapper` has a
+directly as `index_score`; backward treats this buffer as read-only.
+`attn_score` must use the same valid-slot mask. Because compressed forward
+returns global indices by default, also pass `topk_indices_global=True` unless
+forward used `topk_indices_global=False`. The public sparse
+`indexer_backward_wrapper` has a
 BSHD-shaped interface; BF16 THD tensors can use zero-copy `B=1` views (squeeze
 the singleton K head and add a batch dimension) together with global Top-K
 indices. FP8 and MXFP8 indexer backward are not currently supported because
@@ -388,10 +422,10 @@ the default backend.
   full dQ/dK contribution (`g' * w`, not scaled by `S`) is what differs. The
   default backend's multiply preserves subnormals, so reaching it takes an
   exact `sm_scale * S` below `2^-150` (~7.0e-46).
-- **Scratch / workspace behavior** — `attn_score`/`index_score` are consumed
-  in place exactly like the default backend (`attn_score` is left holding
-  kernel 1's `grad_signal`; `sm_scale` folds inside kernel 2 without touching
-  the buffer). The backend owns one piece of per-plan workspace — the
+- **Scratch / workspace behavior** — `attn_score` is consumed in place and left
+  holding kernel 1's `grad_signal`, while `index_score` is read-only and
+  preserved. `sm_scale` folds inside kernel 2 without touching either buffer.
+  The backend owns one piece of per-plan workspace — the
   dynamic-ticket counter — allocated on first execute and reused by every
   later one. A BF16 `d_index_k` additionally needs a `B * S_k * D` fp32
   accumulator (2 MiB = 2,097,152 bytes at B=1, S_k=4096, D=128, growing with
@@ -403,7 +437,7 @@ the default backend.
 - **Concurrency** — executions sharing one plan must not overlap on the
   device (the ticket counter is per-plan workspace). One plan serves one
   device: the workspace is device-resident, and execution rejects tensors on
-  any other device before touching the score buffers. The wrapper keys its
+  any other device before overwriting `attn_score`. The wrapper keys its
   plan cache on the CUDA device and on the **resolved** stream (`stream` when
   given, otherwise `torch.cuda.current_stream()` at call time), so calls that
   differ in device or stream get a private plan and private workspace; calls

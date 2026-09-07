@@ -18,7 +18,8 @@
 """Cutlass-primitives kernel helpers local to the FROST GDN implementation.
 
 ``thd.py`` (the THD per-(batch, head) TMA descriptor builders),
-``head_reduce.py`` (the GVA/GQA head-group gradient reduction), and
+``head_reduce.py`` (the GVA/GQA head-group gradient reduction),
+``expand.py`` (the GDP sub-token row expansion/gather), and
 ``split_k.py`` (the split-K work-item partitioning: forgetting-horizon
 cuts + the tile decode shared by the main kernels; scalar and per-channel
 gate scans through one pipeline).  The tile primitive

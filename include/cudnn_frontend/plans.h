@@ -506,6 +506,9 @@ class Execution_plan_list {
 
     error_t
     get_name_at_index(int64_t index, std::string& name) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(index < 0 || index >= static_cast<int64_t>(engine_configs.size()),
+                                       error_code_t::GRAPH_EXECUTION_FAILED,
+                                       "Plan index " + std::to_string(index) + " is invalid.");
         name = detail::get_engine_tag(engine_configs[index]);
         return {error_code_t::OK, ""};
     }

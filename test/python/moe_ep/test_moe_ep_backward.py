@@ -1012,9 +1012,7 @@ def test_native_io_mxfp8_cuda_graph_replay():
         # fallback packer is used once here as a test oracle to create known-good
         # native contents, then copied into independent caller-owned tensors.
         source_weights = _fixed_training_weights(args)
-        forward_staging, backward_staging = _allocate_training_weight_staging(
-            source_weights
-        )
+        forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         packed_forward = op.pack_forward_weights(
             source_weights[0],
             out=forward_staging,

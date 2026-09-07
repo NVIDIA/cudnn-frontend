@@ -58,8 +58,9 @@ FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
 # plan-time-envelope design (write_thd_meta, issue #552 / PRs #606, #608) used
 # by the f16 kernels: packed [1,T,H,D] Q/K/V/O with DYNAMIC token extents, the
 # setup kernel builds the [kv|cu_q|cu_k] metadata + per-batch O TMA descriptors
-# device-side, and the launch grid is the plan-time envelope (dead units decode
-# the batch == n_batch sentinel and drain).  MXFP8-only addition: the SF
+# device-side, and the launch grid is machine-sized under a device-read live
+# unit bound (issue #618; dead units decode the batch == n_batch sentinel and
+# drain).  MXFP8-only addition: the SF
 # tensors travel PACKED per-sequence-TILE-padded (the shared MXFP8 quantizer
 # writes SF tiles at cu_sf[b] + local_tile; this kernel reads them with the
 # matching tile base from _thd_sf_tile_bases) as [1, H, Σ_b ceil(S_b/TILE),
@@ -87,6 +88,7 @@ from cudnn.frost.tile_dsl.barrier import (
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
     scheduler_warp_loop,
+    scheduler_warp_loop_persistent,
     read_tile_id_arrive,
     SCHED_NATURAL,
     SCHED_LPT,
@@ -212,6 +214,7 @@ from cudnn.sdpa.fwd.kernels._common_sm100 import (
     lpt_tile_coords,
     make_sdpa_helpers,
     assert_tile_n_supported,
+    sanitize_mxfp8_thd_v_sf_padding,
 )
 
 assert_tile_n_supported(CFG)
@@ -230,6 +233,10 @@ kTmaTransactionBytes = kBufferElems * CFG.BPE * CFG.CTA_MMA
 vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+# THD uses a persistent grid + device-bounded claim counter (not the CLC
+# envelope). The adapter caps the launch at min(envelope, SMs / CGA_SIZE)
+# and the setup kernel publishes the live unit total it stops at.
+THD_PERSISTENT = True
 
 
 # SM100 is always cga2 → LPT reverse-row count in CGA-tile units.
@@ -242,7 +249,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 
 # THD / varlen — flat-grid decode + tma-offset closures (CFG-bound) from the
 # factory; the setup kernel + TENSOR_MAP_QWORDS from the shared
-# kernels thd_sm100.py.  Gated by CFG.THD_VARLEN (folds out: _thd_tma_offsets
+# kernels thd_helpers.py.  Gated by CFG.THD_VARLEN (folds out: _thd_tma_offsets
 # is (0, 0, batch_idx) and _thd_sf_tile_bases (0, 0) dense — TMA coords
 # byte-identical).  Supported at cga1 and cga2 (TILES_Q=2 → two Q slabs /
 # O stores per tile).  seq_kv_lens overloaded as the THD metadata buffer
@@ -253,7 +260,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # trailing two words are read only by the persistent schedulers.
 # MXFP8-only: _thd_sf_tile_bases returns the per-sequence SF-tile prefix bases
 # (cu_sf_q_base / cu_sf_k_base) for the packed scale-factor layout.
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
@@ -783,7 +790,27 @@ def _kernel(
     else:  # warp_idx == CFG.SCHED_WARP_ID
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
-        scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+        if cutlass.const_expr(CFG.THD_VARLEN):
+            # THD: persistent grid + device-bounded claim counter, so no unit
+            # past the live total is ever handed out (the CLC path would need
+            # the grid to BE the work list, i.e. the plan-time envelope).
+            # n_batch is a kernel argument -- do NOT re-derive it from the
+            # metadata tensor's layout.
+            scheduler_warp_loop_persistent(
+                sched,
+                CFG.SCHEDULER_STAGES,
+                is_cga_first_cta,
+                seq_kv_lens_tensor,
+                cutlass.Int32(4) * n_batch + cutlass.Int32(3),
+                cutlass.Int32(4) * n_batch + cutlass.Int32(2),
+                CGA_SIZE,
+                CFG.CGA_M,
+            )
+        else:
+            scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+
+
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 # === Warp-group functions ===
@@ -1474,6 +1501,8 @@ def _mma_warp_group(
                 kv_state = advance(kv_state, CFG.STAGES_KV)
 
                 bars.mb_v_full[old_state.idx].wait(old_state.phase)
+                if cutlass.const_expr(CFG.THD_VARLEN):
+                    sanitize_mxfp8_thd_v_sf_padding(sV_SF[old_state.idx], kv_loop - cutlass.Int32(1), eff_seqlen_kv)
                 desc_V = sV[old_state.idx].desc()
                 desc_V_SF = sV_SF[old_state.idx].desc()
                 is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
@@ -1579,6 +1608,8 @@ def _mma_warp_group(
                     bars.mb_q_empty[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
             bars.mb_v_full[kv_state.idx].wait(kv_state.phase)
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                sanitize_mxfp8_thd_v_sf_padding(sV_SF[kv_state.idx], kv_right - cutlass.Int32(1), eff_seqlen_kv)
             desc_V = sV[kv_state.idx].desc()
             desc_V_SF = sV_SF[kv_state.idx].desc()
             is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))
@@ -2555,10 +2586,14 @@ def _host(
         # DEVICE-side from the caller's length tensors (no host cumsum, no
         # H2D — issue #552), then the per-batch O descriptor array (reuse
         # tma_o_desc over the packed [1,T,QH,D_v] O as base). Main grid: the
-        # PLAN-TIME ENVELOPE (n_thd_units = B * ceil(S_q_decl/CGA_TILE_M) * QH,
-        # from the DECLARED S_q — no runtime length reaches the host); units
-        # past a sequence's live tiles decode the batch == n_batch sentinel
-        # and drain without loads or stores. grid_x = n_thd_units * CGA_M.
+        # PERSISTENT cluster count — the adapter hands down n_thd_units
+        # already capped to what the device holds resident, min(plan-time
+        # envelope, SMs / CGA_SIZE), NOT the envelope itself (issue #618). It
+        # doubles as the claim counter's seed: cluster c runs unit c off its
+        # blockIdx, then pulls from the counter, so the grid and the seed must
+        # be the same number. Dispatching past the live total stays safe — such
+        # a unit decodes the batch == n_batch sentinel and drains without loads
+        # or stores. grid_x = n_thd_units * CGA_M.
         # Per-token element stride of packed O (o_tensor.stride[1] = QH * d_v)
         # — NOT CFG.TILE_O, which is only coincidentally right at QH == 1.
         # The FP8-family setup variant also clamps runtime K/V descriptors to
@@ -2578,6 +2613,8 @@ def _host(
             cutlass.Int32(QH),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int32(CGA_TILE_M),
+            n_thd_units,
         ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:

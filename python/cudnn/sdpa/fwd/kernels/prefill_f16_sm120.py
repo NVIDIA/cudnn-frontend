@@ -59,8 +59,9 @@ from cudnn.frost.tile_dsl.scheduler import (
 )
 from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
-from cudnn.sdpa.fwd.kernels.thd_sm100 import (
+from cudnn.sdpa.fwd.kernels.thd_helpers import (
     build_thd_meta_kernel as _build_thd_meta_kernel,
+    sanitize_v_tail as _sanitize_v_tail,
     thd_claim_next,
     thd_decode_unit,
     THD_SETUP_THREADS,
@@ -71,6 +72,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_Q_TILES as _SEQ_Q_TILES,
     SUPPORTED_HEAD_TILES as _SUPPORTED_HEAD_TILES,
     TemplateParams,
+    register_budgets,
     validate_params,
 )
 
@@ -330,6 +332,7 @@ class SM120FusedMultiHeadAttentionForward:
             self.num_warps = 8
         self.num_compute_warps = len(self.compute_warp_ids)
         self.num_load_warps = 1
+        self.load_regs, self.compute_regs = register_budgets(self.q_tile)
 
         self.bar_compute_sync = 1
         self.bar_k_consumed = 2
@@ -832,6 +835,17 @@ class SM120FusedMultiHeadAttentionForward:
             is_first_kv_tile,
         )
 
+        if cutlass.const_expr(self.thd_varlen and in_mask_steps and is_first_kv_tile):
+            _sanitize_v_tail(
+                mma_params.sV,
+                basic_params.lane,
+                basic_params.seqlen_k,
+                kv_tile_idx * self.kv_tile,
+                self.in_dtype,
+                self.head_tile_v,
+                self.kv_tile,
+                self.v_swizzle_chunk_elems,
+            )
         self.mma_pv(basic_params, mma_params, p_regs)
         prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
 
@@ -974,7 +988,7 @@ class SM120FusedMultiHeadAttentionForward:
         #  LOAD K/V
         # /////////////////////////////////////////////////////////////////////////////
         if warp == self.load_warp_id:
-            prims.setmaxregister(40, prims.SetMaxRegisterAction.DECREASE)
+            prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
 
             # THD collapses the packed view's batch coordinate to 0; the
             # per-sequence token base rides the seq coordinate instead. Every
@@ -1057,7 +1071,7 @@ class SM120FusedMultiHeadAttentionForward:
         #  COMPUTE
         # /////////////////////////////////////////////////////////////////////////////
         elif warp < self.load_warp_id:
-            prims.setmaxregister(232, prims.SetMaxRegisterAction.INCREASE)
+            prims.setmaxregister(self.compute_regs, prims.SetMaxRegisterAction.INCREASE)
 
             compute_warp_idx = warp
             q_warp_row0 = compute_warp_idx * self.MMA_TILER[0]
@@ -1340,7 +1354,7 @@ class SM120FusedMultiHeadAttentionForward:
         #  EMPTY
         # /////////////////////////////////////////////////////////////////////////////
         else:
-            prims.setmaxregister(40, prims.SetMaxRegisterAction.DECREASE)
+            prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
 
         return tiles_loaded
 
@@ -1535,6 +1549,8 @@ class SM120FusedMultiHeadAttentionForward:
                 batch_idx,
                 head_idx,
             )
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def __call__(

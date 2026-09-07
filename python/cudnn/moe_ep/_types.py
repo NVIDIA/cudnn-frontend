@@ -57,11 +57,7 @@ def _block_scaled_representation(
         raise ValueError("BlockScaledTensor only represents mxfp8 or nvfp4")
     logical_extent = logical_shape[axis]
     block_size = 32 if fmt is MoeFormat.MXFP8 else 16
-    payload_extent = (
-        logical_extent
-        if fmt is MoeFormat.MXFP8
-        else ceil_div(logical_extent, 2)
-    )
+    payload_extent = logical_extent if fmt is MoeFormat.MXFP8 else ceil_div(logical_extent, 2)
     data_shape = list(logical_shape)
     data_shape[axis] = payload_extent
     scale_shape = list(logical_shape)
@@ -73,9 +69,7 @@ def _block_scaled_representation(
     if fmt is MoeFormat.MXFP8:
         scale_dtype = getattr(torch, "float8_e8m0fnu", None)
         if scale_dtype is None:
-            raise RuntimeError(
-                "this PyTorch build does not provide torch.float8_e8m0fnu"
-            )
+            raise RuntimeError("this PyTorch build does not provide torch.float8_e8m0fnu")
         data_dtype = e4m3_dtype
     else:
         data_dtype = torch.uint8

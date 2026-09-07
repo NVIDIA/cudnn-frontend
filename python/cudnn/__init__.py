@@ -108,9 +108,7 @@ def set_stream(handle, stream):
     per stream regardless.)
     """
     if not isinstance(handle, Handle):
-        raise TypeError(
-            f"cudnn.set_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}"
-        )
+        raise TypeError(f"cudnn.set_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
     if handle.stream == stream:
         return
     if handle.backend_handle is not None:
@@ -122,9 +120,7 @@ def get_stream(handle):
     """The CUDA stream a :class:`cudnn.Handle` runs on -- the cached ``Handle.stream``, no
     backend round-trip."""
     if not isinstance(handle, Handle):
-        raise TypeError(
-            f"cudnn.get_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}"
-        )
+        raise TypeError(f"cudnn.get_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
     return handle.stream
 
 
@@ -133,9 +129,7 @@ def destroy_handle(handle):
     after destruction so a reused Handle object cannot pass a released ``cudnnHandle_t`` back to
     C++ (a double-destroy or a later set_stream)."""
     if not isinstance(handle, Handle):
-        raise TypeError(
-            f"cudnn.destroy_handle expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}"
-        )
+        raise TypeError(f"cudnn.destroy_handle expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
     backend = handle.backend_handle
     if backend is None:
         handle.stream = None
@@ -148,7 +142,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.28.0"
+__version__ = "1.29.0"
 
 
 def _tensor(
@@ -208,14 +202,10 @@ _pybind_module.backend_graph.tensor = _tensor
 
 def load_cudnn():
     # First look at python site packages
-    lib_path = glob.glob(
-        os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/bin/cudnn64_9.dll")
-    )
+    lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/bin/cudnn64_9.dll"))
 
     if lib_path:
-        assert (
-            len(lib_path) == 1
-        ), f"Found {len(lib_path)} libcudnn.dll.x in nvidia-cudnn-cuXX."
+        assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.dll.x in nvidia-cudnn-cuXX."
         lib = ctypes.windll.LoadLibrary(lib_path[0])
     else:  # Fallback
         lib = ctypes.windll.LoadLibrary("cudnn64_9.dll")
@@ -240,23 +230,13 @@ def _dlopen_cudnn():
             return
 
     # Then look at python site packages
-    lib_path = glob.glob(
-        os.path.join(
-            sysconfig.get_path("purelib"), "nvidia/cudnn/lib/libcudnn.so.*[0-9]"
-        )
-    )
+    lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/lib/libcudnn.so.*[0-9]"))
 
     if not lib_path:
-        lib_path = glob.glob(
-            os.path.join(
-                sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"
-            )
-        )
+        lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"))
 
     if lib_path:
-        assert (
-            len(lib_path) == 1
-        ), f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
+        assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
         lib = ctypes.CDLL(lib_path[0])
     else:  # Fallback
         try:
@@ -326,10 +306,7 @@ _EAGER_PUBLIC_NAMES = (
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _CUTEDSL_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
-_MOE_EP_INSTALL_HINT = (
-    "Install with 'pip install "
-    '"nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext\''
-)
+_MOE_EP_INSTALL_HINT = "Install with 'pip install " '"nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext\''
 _MOE_EP_OPTIONAL_IMPORTS = {
     "moe_ep",
     "BlockScaledTensor",
@@ -385,6 +362,11 @@ _LAZY_OPTIONAL_IMPORTS = {
     "MoeTensor": (".moe_ep", "MoeTensor"),
     "pack_backward_weights": (".moe_ep", "pack_backward_weights"),
     "pack_forward_weights": (".moe_ep", "pack_forward_weights"),
+    "FlexAttentionBwd": (".flex_attention", "FlexAttentionBwd"),
+    "FlexAttentionFwd": (".flex_attention", "FlexAttentionFwd"),
+    "create_mask_plan": (".flex_attention", "create_mask_plan"),
+    "flex_attn_func": (".flex_attention", "flex_attn_func"),
+    "sdpa_torch": (".sdpa.fwd.torch_op", "sdpa"),
     "BSA": (".block_sparse_attention", "BSA"),
     "block_sparse_attention_forward": (
         ".block_sparse_attention",
@@ -568,17 +550,25 @@ def _load_optional_symbol(name: str) -> Any:
         module = importlib.import_module(module_name, package=__name__)
         value = module if attr_name is None else getattr(module, attr_name)
     except Exception as e:
-        install_hint = (
-            _MOE_EP_INSTALL_HINT
-            if name in _MOE_EP_OPTIONAL_IMPORTS
-            else _CUTEDSL_INSTALL_HINT
-        )
-        raise ImportError(
-            f"{name} requires optional dependencies. {install_hint}: {e}"
-        ) from e
+        raise ImportError(_optional_dependency_message(name, e)) from e
 
     globals()[name] = value
     return value
+
+
+def _optional_dependency_message(name: str, error: Exception) -> str:
+    # A DSL that is installed but below the floor must not be reported as a
+    # missing dependency: "pip install [cutedsl]" would change nothing.
+    try:
+        from .frost.buffers import cutedsl_requirement_error
+
+        too_old = cutedsl_requirement_error(name)
+    except Exception:
+        too_old = None
+    if too_old is not None:
+        return f"{too_old}: {error}"
+    install_hint = _MOE_EP_INSTALL_HINT if name in _MOE_EP_OPTIONAL_IMPORTS else _CUTEDSL_INSTALL_HINT
+    return f"{name} requires optional dependencies. {install_hint}: {error}"
 
 
 def __getattr__(name: str) -> Any:
@@ -613,6 +603,17 @@ def __getattr__(name: str) -> Any:
         _jax = importlib.import_module(".jax", __name__)
         globals()["jax"] = _jax
         return _jax
+
+    if name == "torch":
+        # `import cudnn; cudnn.torch.install()` works like `import cudnn.torch`,
+        # mirroring the `jax` branch above. Deferred so `import cudnn` never
+        # eagerly imports torch; the submodule raises its own descriptive error
+        # when torch (or the 2.13+ flash-impl registry) is unavailable — which
+        # is why this is NOT a _LAZY_OPTIONAL_IMPORTS entry: that path would
+        # blame the `[cutedsl]` extra for a missing framework.
+        _torch_mod = importlib.import_module(".torch", __name__)
+        globals()["torch"] = _torch_mod
+        return _torch_mod
 
     if name == "fla":
         # `import cudnn; cudnn.fla.accelerate_fla()` works like `import cudnn.fla`.
