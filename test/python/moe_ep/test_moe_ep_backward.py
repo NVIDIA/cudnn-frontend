@@ -247,6 +247,48 @@ def test_training_input_rejects_noncontiguous_plain_tensor():
 
 
 @pytest.mark.L0
+def test_training_input_accepts_logical_view_of_padded_lane_scale():
+    config = _training_config(
+        weight_interleave_size=32,
+        max_tokens_per_rank=5,
+    )
+    token_count = 5
+    logical_scale_columns = config.hidden_size // 32
+    lane_scale = torch.empty(
+        (128, 16),
+        dtype=torch.float8_e8m0fnu,
+    )
+    scale = lane_scale[:token_count, :logical_scale_columns]
+    activation = BlockScaledTensor(
+        data=torch.empty(
+            (token_count, config.hidden_size),
+            dtype=torch.float8_e4m3fn,
+        ),
+        scale=scale,
+        format="mxfp8",
+        logical_shape=(token_count, config.hidden_size),
+        axis=1,
+    )
+    topk_idx = torch.zeros((token_count, config.top_k), dtype=torch.int32)
+    topk_weights = torch.ones((token_count, config.top_k), dtype=torch.float32)
+
+    assert scale.shape == (5, 4)
+    assert scale.stride() == (16, 1)
+    assert not scale.is_contiguous()
+    assert (
+        validate_training_input(
+            config,
+            "activation",
+            activation,
+            topk_idx,
+            topk_weights,
+            device=torch.device("cpu"),
+        )
+        == token_count
+    )
+
+
+@pytest.mark.L0
 def test_training_bundle_fields_match_public_contracts():
     dummy = object()
     assert [field.name for field in fields(MoeEpForwardWeights)] == ["fc1", "fc2"]

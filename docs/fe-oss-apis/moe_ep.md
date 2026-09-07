@@ -213,8 +213,12 @@ y = op.training_forward(
 `activation` may be contiguous BF16/FP32 or an axis-1 MXFP8
 `BlockScaledTensor`. To avoid input staging, quantize directly into the
 `forward_input` and `forward_input_scale` views returned by
-`training_symmetric_buffers(lane)` and pass those views as the MXFP8 input.
-Routing metadata is still staged privately.
+`training_symmetric_buffers(lane)`. Construct the MXFP8 input from
+`forward_input[:T]` and
+`forward_input_scale[:T, :ceil_div(hidden_size, 32)]`. The logical scale view
+has unit column stride and may retain the lane buffer's padded row stride;
+training accepts this layout without copying. Routing metadata is still staged
+privately.
 
 `fc1_preact` is required because the training forward kernel always runs with
 `generate_c=True`; TE must provide its destination and retain it through the
@@ -257,7 +261,8 @@ dx, dprob, operands = op.training_backward(
 
 `grad_output` has the same BF16/FP32/MXFP8 input choices as forward. To avoid
 staging, quantize it directly into the lane's `backward_input` and
-`backward_input_scale` buffers.
+`backward_input_scale` buffers and construct the same logical prefix views
+described for `forward_input`.
 `fc1_preact` and the four forward WGrad values are required and passed
 explicitly because cuDNN does not retain the forward output bundle.
 
