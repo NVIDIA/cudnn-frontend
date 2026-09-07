@@ -368,6 +368,7 @@ class SdpaFwdDsl(APIBase):
         cu_seq_q_lens: bool = False,
         cu_seq_kv_lens: bool = False,
         has_sink: bool = False,
+        stats_log2: bool = False,
         thd: bool = False,
         max_total_seq_len_q: Optional[int] = None,
         max_total_seq_len_kv: Optional[int] = None,
@@ -430,6 +431,11 @@ class SdpaFwdDsl(APIBase):
         self.cu_seq_q_lens = bool(cu_seq_q_lens)
         self.cu_seq_kv_lens = bool(cu_seq_kv_lens)
         self.has_sink = bool(has_sink)
+        # Base-2 Stats (sdpa(stats_use_log2=True)): a compile-time epilogue
+        # specialization. Under split_kv > 1 the per-split partials stay
+        # natural (the combine merges them that way) and only the combine's
+        # final LSE converts.
+        self.stats_log2 = bool(stats_log2)
         self.thd = bool(thd)
         # Caller-declared packed token totals. These only ever TIGHTEN the
         # execute-time token extents (they are min'd against the capacity the
@@ -1280,6 +1286,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             window_right=self.window_right,
             bottom_right=self.causal_bottom_right,
             has_sink=self.has_sink,
+            stats_log2=self.stats_log2 and self.split_kv == 1,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
             sched_policy=sched_policy,
@@ -1413,6 +1420,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 has_lse=self.lse_desc is not None,
                 has_amax=self._fp8,
                 lse_stride=self._lse_stride,
+                stats_log2=self.stats_log2,
             )
         self._logger.debug("compile completed")
 
@@ -2888,6 +2896,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
             has_sink=self.has_sink,
+            stats_log2=self.stats_log2 and self.split_kv == 1,
             thd_varlen=self.thd,
             q_tile=self.q_tile,
             kv_tile=self.kv_tile,
@@ -4073,6 +4082,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             has_seq_kv_lens=self.seq_kv_lens_present,
             has_seq_q_lens=self.seq_q_lens_present,
             has_sink=self.has_sink,
+            stats_log2=self.stats_log2,
             has_bias=self._bias_present,
             bias_is_fp32=self._bias_fp32,
             has_rope=self._rope_max_s > 0,

@@ -144,13 +144,13 @@ def test_fwd_engine_end_to_end():
     assert torch.isfinite(stats_buf).all()
 
 
-def _check_fwd_engine_strided_stats(d):
+def _check_fwd_engine_strided_stats(d, stats_use_log2=False):
     sentinel = -12345.0
     stats_storage = torch.full((S + 7, H + 2, B), sentinel, dtype=torch.float32, device="cuda")
     strided_stats_buf = stats_storage.permute(2, 1, 0)[:, :H, :S].unsqueeze(-1)
     compact_stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
-    compact_graph = _build_fwd_graph(d=d, stats_stride=compact_stats_buf.stride())
-    strided_graph = _build_fwd_graph(d=d, stats_stride=strided_stats_buf.stride())
+    compact_graph = _build_fwd_graph(d=d, stats_stride=compact_stats_buf.stride(), stats_use_log2=stats_use_log2)
+    strided_graph = _build_fwd_graph(d=d, stats_stride=strided_stats_buf.stride(), stats_use_log2=stats_use_log2)
     _native_then_pin(compact_graph[0], _FWD)
     _native_then_pin(strided_graph[0], _FWD)
 
@@ -165,6 +165,8 @@ def _check_fwd_engine_strided_stats(d):
     scores = torch.matmul(q_buf.float(), k_buf.float().transpose(-1, -2)) * scale
     causal_mask = torch.ones(S, S, dtype=torch.bool, device="cuda").triu(diagonal=1)
     stats_ref = torch.logsumexp(scores.masked_fill(causal_mask, float("-inf")), dim=-1)
+    if stats_use_log2:
+        stats_ref = stats_ref * math.log2(math.e)
     torch.testing.assert_close(strided_stats_buf, compact_stats_buf, rtol=0, atol=0)
     torch.testing.assert_close(strided_stats_buf.squeeze(-1), stats_ref, rtol=3e-2, atol=5e-2)
 
@@ -175,9 +177,10 @@ def _check_fwd_engine_strided_stats(d):
 
 @_SM80
 @pytest.mark.L0
-def test_fwd_engine_strided_stats():
-    """The SM80 L0 half flavor writes LSE into a permuted, gapped layout."""
-    _check_fwd_engine_strided_stats(128)
+@pytest.mark.parametrize("stats_use_log2", [False, True], ids=["ln", "log2"])
+def test_fwd_engine_strided_stats(stats_use_log2):
+    """The SM80 L0 half flavor writes LSE into a permuted, gapped layout, in either base."""
+    _check_fwd_engine_strided_stats(128, stats_use_log2=stats_use_log2)
 
 
 @_SM80

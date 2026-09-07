@@ -2000,6 +2000,9 @@ def _correction_warp_group(
                 neg_inf_trim = cutlass.Float32(float("-inf"))
                 lse_val = cutlass.Float32(arith.select(row_trim.ir_value(), neg_inf_trim.ir_value(), lse_val.ir_value()))
                 inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
+            # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
+            if cutlass.const_expr(CFG.STATS_LOG2):
+                lse_val = lse_val * cutlass.Float32(1.4426950408889634)
             if cutlass.const_expr(lse_tensor is None):
                 pass  # has_lse=False: the Stats store is compiled out
             elif cutlass.const_expr(CFG.THD_VARLEN):

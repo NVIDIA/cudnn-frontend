@@ -1309,6 +1309,10 @@ def _compute_warp_group(
                 beta = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
                 lse = cutlass.Float32(arith.select(row_trim.ir_value(), neg_inf_trim.ir_value(), lse.ir_value()))
 
+            # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
+            if cutlass.const_expr(CFG.STATS_LOG2):
+                lse = lse * cutlass.Float32(1.4426950408889634)
+
             # amax_o = max over VALID rows of |o_scaled| (the fp32 pre-cast
             # output).  The adapter divides by scale_o on device afterwards to
             # give the pre-quant output amax (cuDNN's FP8 reference semantics).

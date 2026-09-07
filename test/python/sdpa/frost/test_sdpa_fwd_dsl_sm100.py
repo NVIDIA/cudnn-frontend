@@ -237,7 +237,7 @@ def _run_dsl_graph(
     return o_gpu
 
 
-def _check_dsl_sm100_strided_stats(d_qk, d_v):
+def _check_dsl_sm100_strided_stats(d_qk, d_v, stats_use_log2=False):
     _require_dsl()
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("SM107 serves only the per-tensor FP8 d128 forward path")
@@ -248,19 +248,23 @@ def _check_dsl_sm100_strided_stats(d_qk, d_v):
     k = _bhsd(b, h, s, d_qk, dtype)
     v = _bhsd(b, h, s, d_v, dtype)
 
-    _, contiguous_stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), return_stats=True)
-    o, strided_stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), return_stats=True, stats_layout="strided")
+    sdpa_kwargs = dict(use_causal_mask=True, stats_use_log2=stats_use_log2)
+    _, contiguous_stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=sdpa_kwargs, return_stats=True)
+    o, strided_stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=sdpa_kwargs, return_stats=True, stats_layout="strided")
     o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, return_stats=True)
+    if stats_use_log2:
+        stats_ref = stats_ref * math.log2(math.e)
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(strided_stats, contiguous_stats, atol=0, rtol=0)
     torch.testing.assert_close(strided_stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("stats_use_log2", [False, True], ids=["ln", "log2"])
 @torch_fork_set_rng(seed=59)
-def test_dsl_sm100_strided_stats():
-    """The SM100 half L0 flavor writes permuted, gapped LSE directly."""
-    _check_dsl_sm100_strided_stats(128, 128)
+def test_dsl_sm100_strided_stats(stats_use_log2):
+    """The SM100 half L0 flavor writes permuted, gapped LSE directly, in either base."""
+    _check_dsl_sm100_strided_stats(128, 128, stats_use_log2=stats_use_log2)
 
 
 @pytest.mark.L1

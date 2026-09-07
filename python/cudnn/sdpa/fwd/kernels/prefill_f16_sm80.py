@@ -1414,6 +1414,10 @@ def _sdpa_kernel(
                 trim_bot = q_row_base_i32 + block_row_bot
                 lse_top = cutlass.Float32(arith.select((trim_top < eff_sq).ir_value(), lse_top.ir_value(), _ninf.ir_value()))
                 lse_bot = cutlass.Float32(arith.select((trim_bot < eff_sq).ir_value(), lse_bot.ir_value(), _ninf.ir_value()))
+            # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
+            if cutlass.const_expr(PARAMS.stats_log2):
+                lse_top = lse_top * cutlass.Float32(1.4426950408889634)
+                lse_bot = lse_bot * cutlass.Float32(1.4426950408889634)
             lse_top_ptr = lse_gmem + cutlass.Int64(block_row_top) * LSE_S_STRIDE_E
             lse_bot_ptr = lse_gmem + cutlass.Int64(block_row_bot) * LSE_S_STRIDE_E
 

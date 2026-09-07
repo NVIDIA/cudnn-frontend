@@ -168,6 +168,9 @@ class Capabilities:
     score_sum_exp: bool = False  # per-row/tile sum-of-exp side output
     dynamic_scale: bool = False
     unfuse_fma: bool = False
+    # Stats written as max + log2(sum_exp) (sdpa(stats_use_log2=True)): the
+    # kernel epilogue (or the split-KV combine) scales the LSE by log2(e).
+    stats_log2: bool = False
     seq_q_trim: bool = False
     right_band_widening: bool = False
 
@@ -467,6 +470,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         (facts.has_score_sum_exp, capabilities.score_sum_exp, "score_sum_exp output"),
         (facts.dynamic_scale, capabilities.dynamic_scale, "tensor attn_scale"),
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
+        (facts.has_stats_log2, capabilities.stats_log2, "stats_use_log2 (base-2 stats)"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
         (facts.right_band_widening, capabilities.right_band_widening, "causal right-band widening"),
         (facts.causal, capabilities.causal, "causal mask"),
@@ -582,6 +586,7 @@ def _sm100_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             lse_optional=True,
             thd=True,
             cu_seq_len=True,
@@ -647,6 +652,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             lse_optional=True,
             thd=True,
             cu_seq_len=True,
@@ -750,6 +756,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             lse_optional=True,
             thd=True,
             cu_seq_len=True,
@@ -813,6 +820,7 @@ def _sm80_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             padded_stats=True,
             decode=False,
             # The kernels implement the dense padded-Q trim natively
@@ -851,6 +859,7 @@ def _sm120_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             lse_optional=True,
             padded_stats=True,
             dense_seq_q_trim=True,
@@ -961,6 +970,7 @@ def lower_dsl_prefill(
         cu_seq_q_lens=facts.cu_seq_q_t is not None,
         cu_seq_kv_lens=facts.cu_seq_kv_t is not None,
         has_sink=facts.has_sink,
+        stats_log2=facts.has_stats_log2,
         thd=facts.thd,
         # Caller-declared packed token totals (issue #624): when present the
         # adapter binds EXACT token extents instead of the buffer-derived
@@ -1054,7 +1064,7 @@ def lower_dsl_prefill(
             return buf
         return buf.as_strided(dim, stride)
 
-    def _execute(variant_pack, workspace=None, stream=None):
+    def _execute_on_stream(variant_pack, workspace=None, stream=None):
         resolved = ga.resolve_variant_pack(variant_pack, binding)
         q_buf = resolved[id(binding.q)]
         k_buf = resolved[id(binding.k)]
@@ -1143,6 +1153,18 @@ def lower_dsl_prefill(
         api.execute(**execute_kwargs)
         return None
 
+    def _execute(variant_pack, workspace=None, stream=None):
+        # The kernels launch on the handle's stream; the adapters' torch-side
+        # glue (O staging copy-back, dummy / carved-scratch fills) must ride the
+        # same stream or the copy-back can read O_scratch before the kernel
+        # wrote it (garbage O under a non-default handle stream).
+        if stream is None:
+            return _execute_on_stream(variant_pack, workspace, stream)
+        import torch
+
+        with torch.cuda.stream(torch.cuda.ExternalStream(int(stream))):
+            return _execute_on_stream(variant_pack, workspace, stream)
+
     # Executor contract (engine._FrostSdpaFwdPlan): a non-zero workspace_bytes
     # means the plan calls _execute(variant_pack, workspace) with the caller's
     # buffer; 0 means _execute(variant_pack) and the buffer is never touched.
@@ -1223,6 +1245,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             lse_optional=True,
             thd=True,
             padded_stats=True,

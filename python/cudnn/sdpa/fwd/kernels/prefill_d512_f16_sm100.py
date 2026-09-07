@@ -1188,6 +1188,10 @@ def _compute_warp_group(
                 beta = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
                 lse = cutlass.Float32(arith.select(row_trim.ir_value(), neg_inf_trim.ir_value(), lse.ir_value()))
 
+            # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
+            if cutlass.const_expr(CFG.STATS_LOG2):
+                lse = lse * cutlass.Float32(1.4426950408889634)
+
             sO_base = sO[0].base
 
             for b in cutlass.range_constexpr(CFG.TILE_O // O_EPI_BLOCK_SIZE):

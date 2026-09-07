@@ -54,16 +54,17 @@ def _ref_sdpa(q, k, v, scale, is_causal, kh):
     return torch.matmul(p, vb).permute(0, 2, 1, 3)
 
 
-def _kernel_module(splits, dtype_qkv, causal, cta_mma=2, pack_gqa=False, qh_per_kh=1):
+def _kernel_module(splits, dtype_qkv, causal, cta_mma=2, pack_gqa=False, qh_per_kh=1, stats_log2=False):
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
     path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "prefill_d128_f16_sm100.py")
-    kw = {"dtype_qkv": dtype_qkv, "split_kv": splits, "cta_mma": cta_mma, "pack_gqa": pack_gqa, "qh_per_kh": qh_per_kh}
+    kw = {"dtype_qkv": dtype_qkv, "split_kv": splits, "cta_mma": cta_mma, "pack_gqa": pack_gqa, "qh_per_kh": qh_per_kh, "stats_log2": stats_log2}
     if causal:
         kw["window_right"] = 0
-    return load_template(path, TemplateParams(**kw), tag=f"splitkv{splits}_d{dtype_qkv}_{'caus' if causal else 'dense'}_cga{cta_mma}_pg{int(pack_gqa)}")
+    tag = f"splitkv{splits}_d{dtype_qkv}_{'caus' if causal else 'dense'}_cga{cta_mma}_pg{int(pack_gqa)}" + ("_log2" if stats_log2 else "")
+    return load_template(path, TemplateParams(**kw), tag=tag)
 
 
 def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
@@ -692,12 +693,15 @@ def test_split_kv_mxfp8(splits, cta_mma):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("stats_log2", [False, True], ids=["ln", "log2"])
 @pytest.mark.parametrize("splits", [1, 4], ids=lambda s: f"split{s}")
-def test_combine_lse_matches_reference(splits):
+def test_combine_lse_matches_reference(splits, stats_log2):
     """The RECOMBINED LSE is an output too, and nothing else here checks it.
 
     split_combine_sm100 computes lse = M + log(sum_s exp(lse_s - M)); every other
-    test only compares O, so a wrong LSE would pass all of them.
+    test only compares O, so a wrong LSE would pass all of them.  Base-2 Stats
+    (``stats_log2``) live in the prefill epilogue at split 1 and in the combine's
+    final store otherwise -- the partials it merges stay natural.
     """
     import cutlass
     import cuda.bindings.driver as cuda_driver
@@ -712,7 +716,7 @@ def test_combine_lse_matches_reference(splits):
     k = torch.randn(B, SKV, H, D, device=dev, dtype=torch.float16)
     v = torch.randn(B, SKV, H, D, device=dev, dtype=torch.float16)
 
-    mod = _kernel_module(splits, 3, causal=False)
+    mod = _kernel_module(splits, 3, causal=False, stats_log2=stats_log2 and splits == 1)
     fn = mod.compile(b=B, qh=H, kh=H, sq=SQ, skv=SKV, d_qk=D, d_v=D, has_lse=True)
     o_p = torch.zeros(splits * B, SQ, H, D, device=dev, dtype=torch.float16)
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
@@ -736,6 +740,8 @@ def test_combine_lse_matches_reference(splits):
     # Reference LSE = logsumexp of the scaled scores, in natural log.
     qb, kb = (t.float().permute(0, 2, 1, 3) for t in (q, k))
     ref_lse = torch.logsumexp(torch.matmul(qb, kb.transpose(-1, -2)) * scale, dim=-1)  # [B,H,SQ]
+    if stats_log2:
+        ref_lse = ref_lse * math.log2(math.e)
 
     if splits == 1:
         torch.cuda.synchronize()
@@ -743,7 +749,7 @@ def test_combine_lse_matches_reference(splits):
     else:
         o_out = torch.zeros(B, SQ, H, D, device=dev, dtype=torch.float16)
         lse_out = torch.zeros(B, H, SQ, device=dev, dtype=torch.float32)
-        cfn = comb.compile(b=B, h=H, sq=SQ, d_v=D, splits=splits, dtype_o="f16", has_lse=True)
+        cfn = comb.compile(b=B, h=H, sq=SQ, d_v=D, splits=splits, dtype_o="f16", has_lse=True, stats_log2=stats_log2)
         cfn(o_p, lse_p, o_out, lse_out, None, (B, H, SQ, D), cutlass.Int32(splits), stream=stream)
         torch.cuda.synchronize()
         got_lse = lse_out

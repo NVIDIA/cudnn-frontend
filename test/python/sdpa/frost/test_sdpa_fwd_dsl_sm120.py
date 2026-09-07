@@ -168,6 +168,7 @@ def _run_case(
     scale: float | None = None,
     with_sink: bool = False,
     check_stats: bool = False,
+    stats_use_log2: bool = False,
     pack_gqa: bool | None = None,
     stats_layout: str = "contiguous",
 ) -> None:
@@ -194,12 +195,15 @@ def _run_case(
         pack_gqa=pack_gqa,
         scale=scale,
         return_stats=check_stats,
+        stats_use_log2=stats_use_log2,
         stats_layout=stats_layout,
         **mask_kwargs,
     )
     if check_stats:
         output, stats = result
         expected, expected_lse = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True, **mask_kwargs)
+        if stats_use_log2:
+            expected_lse = expected_lse * math.log2(math.e)
         torch.testing.assert_close(stats.squeeze(-1), expected_lse, atol=2e-2, rtol=2e-2)
     else:
         output = result
@@ -246,6 +250,7 @@ def _run_dsl_graph(
     kv_tile: int | None = None,
     pack_gqa: bool | None = None,
     return_stats: bool = False,
+    stats_use_log2: bool = False,
     stats_layout: str = "contiguous",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Build, select, and execute the SM120 FROST graph engine.
@@ -283,6 +288,8 @@ def _run_dsl_graph(
         "generate_stats": return_stats,
         "attn_scale": scale,
     }
+    if stats_use_log2:
+        sdpa_kwargs["stats_use_log2"] = True
     variant_pack = {q: q_gpu, k: k_gpu, v: v_gpu}
 
     _apply_mask_kwargs(
@@ -700,11 +707,12 @@ def test_dsl_sm120_fully_masked_rows():
     ],
     ids=["dense", "causal", "causal_br", "causal_swa"],
 )
+@pytest.mark.parametrize("stats_use_log2", [False, True], ids=["ln", "log2"])
 @torch_fork_set_rng(seed=13)
-def test_dsl_sm120_stats(mask_kwargs):
-    """generate_stats=True: the Stats output matches the natural-log LSE."""
+def test_dsl_sm120_stats(mask_kwargs, stats_use_log2):
+    """generate_stats=True: the Stats output matches the LSE in the requested base."""
 
-    _run_case(batch=2, h_q=4, h_kv=2, s_q=256, s_kv=256, head_dim=128, check_stats=True, **mask_kwargs)
+    _run_case(batch=2, h_q=4, h_kv=2, s_q=256, s_kv=256, head_dim=128, check_stats=True, stats_use_log2=stats_use_log2, **mask_kwargs)
 
 
 @pytest.mark.L0

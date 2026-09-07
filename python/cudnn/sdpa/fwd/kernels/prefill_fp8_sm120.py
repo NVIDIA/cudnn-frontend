@@ -240,6 +240,7 @@ class SM120FusedMultiHeadAttentionForward:
         seq_q_lens_present: bool = False,
         seq_kv_lens_present: bool = False,
         has_sink: bool = False,
+        stats_log2: bool = False,
         thd_varlen: bool = False,
         split_kv: int = 1,
         thd_lse_head_major: bool = False,
@@ -325,6 +326,7 @@ class SM120FusedMultiHeadAttentionForward:
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
         self.has_sink = has_sink
+        self.stats_log2 = stats_log2
         self.thd_varlen = thd_varlen
         # KV split: SPLIT_KV CTAs per (q_tile, batch, head), each covering a
         # contiguous slice of that tile's KV-tile range.  1 = off (folds away).
@@ -1431,6 +1433,9 @@ class SM120FusedMultiHeadAttentionForward:
                         lse_q_idx = q_seq_idx + (_lse_row_in_cta if cutlass.const_expr(not self.pack_gqa) else _lse_row_in_cta // self.qh_per_kh)
                         _lse_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + _lse_row_in_cta % self.qh_per_kh
                         lse_out = cutlass.Float32(row_lse[row_half])
+                        # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
+                        if cutlass.const_expr(self.stats_log2):
+                            lse_out = lse_out * cutlass.Float32(1.4426950408889634)
                         if cutlass.const_expr(self.thd_varlen):
                             # Packed ragged-Stats LSE, written directly in the
                             # caller's declared layout: token-major (T, H) or
@@ -1854,6 +1859,7 @@ def compile(  # noqa: A001
         seq_q_lens_present=PARAMS.seq_q_lens_present,
         seq_kv_lens_present=PARAMS.seq_kv_lens_present,
         has_sink=PARAMS.has_sink,
+        stats_log2=PARAMS.stats_log2,
         thd_varlen=PARAMS.thd_varlen,
         thd_lse_head_major=lse_head_major,
         thd_batch=b,
