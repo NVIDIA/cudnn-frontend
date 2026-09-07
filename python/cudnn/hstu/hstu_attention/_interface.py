@@ -591,10 +591,12 @@ def hstu_varlen_fwd_100(
         use_2cta_instrs,
         use_clc_descriptor,
         q1_split_kv,
-        # Head count is plan-time metadata. Packed token and batch extents are
-        # deliberately absent: the qlen=1 compile descriptors below represent
-        # them with SymInt so one artifact re-binds every runtime batch.
+        # Head count and query-length class are plan-time metadata. Packed token
+        # and batch extents are deliberately absent: the qlen=1 compile
+        # descriptors below represent them with SymInt so one artifact re-binds
+        # every runtime batch.
         q.shape[1],
+        is_q_len_one,
         q1_single_warp_epilogue,
         q1_m64_silu_warps,
         q1_m64_inplace_silu,

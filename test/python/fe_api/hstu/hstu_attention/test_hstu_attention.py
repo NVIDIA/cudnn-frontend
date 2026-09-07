@@ -1989,6 +1989,40 @@ def test_single_query_forward_cache_reuses_runtime_shapes(head_dim):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
+def test_forward_compile_cache_separates_query_length_classes():
+    """Qlen=1 and multi-query kernels must not share a compiled artifact."""
+    _interface.hstu_varlen_fwd_100.compile_cache.clear()
+    batch_size, heads, head_dim, kv_len = 2, 1, 32, 128
+    k = torch.full((batch_size * kv_len, heads, head_dim), 0.125, dtype=torch.bfloat16, device="cuda")
+    v = torch.full_like(k, 0.125)
+    cu_k = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda") * kv_len
+
+    for q_len in (1, 2):
+        q = torch.full((batch_size * q_len, heads, head_dim), 0.125, dtype=torch.bfloat16, device="cuda")
+        cu_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda") * q_len
+        _interface.hstu_varlen_fwd_100(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            q_len,
+            kv_len,
+            -1,
+            0,
+            0.7,
+            None,
+            scaling_seqlen=128.0,
+            out=torch.empty_like(q),
+            _compile_only=True,
+        )
+
+    assert len(_interface.hstu_varlen_fwd_100.compile_cache) == 2
+    assert {key[15] for key in _interface.hstu_varlen_fwd_100.compile_cache} == {False, True}
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
 @pytest.mark.parametrize("head_dim", (64, 128, 256))
 def test_single_query_backward_cache_reuses_runtime_shapes(head_dim):
     """Packed Q/K totals and batch size must re-bind one backward artifact."""

@@ -4355,7 +4355,7 @@ class HSTUAttentionBackwardSm100:
             (
                 blk_coord,
                 _,
-                problem_shape_cur_batch,
+                _,
                 _,
                 process_tile,
             ) = self.get_work_context(
