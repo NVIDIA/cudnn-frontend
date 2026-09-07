@@ -68,7 +68,7 @@ def compute_default_BHSD_strides(shape):
     return tuple(strides)
 
 
-def compute_packed_strides(shape, token_gap=0):
+def compute_packed_strides(shape, token_gap=0, head_gap=0):
     """Compute packed (ragged) BSHD strides for BHSD shape: (s*h*d, d, h*d, 1).
 
     ``token_gap`` widens the token stride to ``h*d + token_gap`` elements —
@@ -76,12 +76,14 @@ def compute_packed_strides(shape, token_gap=0):
     ``token_gap == h*d`` this is exactly a K or V view of a kv-interleaved
     ``[T, 2, H, D]`` buffer (token stride ``2*h*d``), the layout
     ``torch.nn.attention.varlen`` users produce by slicing a fused KV
-    projection."""
+    projection. ``head_gap`` widens the head stride to ``d + head_gap``; the
+    token record then spans ``h * (d + head_gap) + token_gap``."""
     if shape is None:
         return None
     _, h, s, d = shape
-    token_stride = h * d + token_gap
-    return (s * token_stride, d, token_stride, 1)
+    head_stride = d + head_gap
+    token_stride = h * head_stride + token_gap
+    return (s * token_stride, head_stride, token_stride, 1)
 
 
 @dataclass
@@ -142,6 +144,12 @@ class ExecConfig:
     # fp8/mxfp8 harnesses (#537). Configs with explicit strides are
     # unaffected (the gap only fills strides left None).
     with_ragged_token_gap: bool = True
+    # Sibling of the above for the HEAD axis (stride[1] != d, e.g. head-interleaved
+    # buffers): each ragged tensor independently widens its head stride by 0-3
+    # units of 16 bytes, only where d itself is 16-byte granular so every head base
+    # keeps the packed layout's alignment class. Drawn after the token gaps from the
+    # same RNG, so existing seeds keep their token layouts.
+    with_ragged_head_gap: bool = True
     # Packed (THD) token capacities, first-class: buffer allocation sizes the
     # packed Q/O and K/V buffers from these (not a locally recomputed
     # sum-of-seq-lens), knobs may fuzz slack capacity beyond the packed
@@ -244,29 +252,33 @@ class ExecConfig:
         #    packed strides (#537).
         _gap_applicable = (
             self.is_ragged
-            and self.with_ragged_token_gap
+            and (self.with_ragged_token_gap or self.with_ragged_head_gap)
             and not self.is_cu_seq_len
             and not self.with_ragged_offset_multiplier
             and not (self.data_type is not None and self.data_type.itemsize == 1)
         )
         if _gap_applicable:
             _gap_rng = random.Random((self.rng_geom_seed or 0) ^ 0xA80517)
-            # Draw ALL FOUR gaps up front, in fixed Q/K/V/O order: an
+            # Draw ALL gaps up front, in fixed Q/K/V/O order: an
             # explicitly provided stride must not shift the gaps the
             # remaining tensors get (same rng_geom_seed -> same per-tensor
             # layouts regardless of which strides were overridden).
-            _gaps = {name: _gap_rng.randint(0, 3) for name in ("q", "k", "v", "o")}
+            _token_gaps = {name: _gap_rng.randint(0, 3) for name in ("q", "k", "v", "o")}
+            _head_gaps = {name: _gap_rng.randint(0, 3) for name in ("q", "k", "v", "o")}
+            _head_gap_quantum = 16 // (self.data_type.itemsize if self.data_type is not None else 2)
 
-            def _make_gap_fn(gap_tokens):
+            def _make_gap_fn(token_gap_units, head_gap_units):
                 def _gapped(shape):
                     if shape is None:
                         return None
                     h, d = shape[1], shape[3]
-                    return compute_packed_strides(shape, gap_tokens * h * d)
+                    token_gap = token_gap_units * h * d if self.with_ragged_token_gap else 0
+                    head_gap = head_gap_units * _head_gap_quantum if self.with_ragged_head_gap and d % _head_gap_quantum == 0 else 0
+                    return compute_packed_strides(shape, token_gap, head_gap)
 
                 return _gapped
 
-            gap_q, gap_k, gap_v, gap_o = (_make_gap_fn(_gaps[n]) for n in ("q", "k", "v", "o"))
+            gap_q, gap_k, gap_v, gap_o = (_make_gap_fn(_token_gaps[n], _head_gaps[n]) for n in ("q", "k", "v", "o"))
         elif self.is_ragged:
             gap_q = gap_k = gap_v = gap_o = compute_packed_strides
         else:
