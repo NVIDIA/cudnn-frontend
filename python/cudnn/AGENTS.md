@@ -265,7 +265,7 @@ DSL satisfies your kernel.**
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
-  (`ci/stages/oss_tests/jobs.yml` on the GitLab side); a lane below your floor
+  (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
   must show skips, not errors.
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
