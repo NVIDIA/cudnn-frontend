@@ -34,7 +34,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Block Sparse Attention (BSA)](bsa.md)
 - [DeepSeek Sparse Attention (DSA)](dsa.md)
 - [Flex Attention](attention/flex_attention.md)
-- [HSTU Attention (Blackwell SM100/SM103)](attention/hstu.md)
+- [HSTU Attention (Blackwell SM100/SM103)](hstu/hstu_attention.md)
 - [Native Sparse Attention (NSA)](nsa.md)
 - [CSA Fused Compressor](csa.md)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)

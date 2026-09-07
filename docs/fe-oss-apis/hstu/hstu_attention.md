@@ -49,7 +49,7 @@ Install cuDNN Frontend; its CuTe DSL dependencies are required and come with it:
 pip install nvidia-cudnn-frontend
 ```
 
-The implementation is available from `cudnn.hstu_attention` and through the
+The implementation is available from `cudnn.hstu.hstu_attention` and through the
 following lazy top-level exports:
 
 ```python
