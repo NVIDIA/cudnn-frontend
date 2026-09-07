@@ -258,6 +258,7 @@ def _run_dsl_graph(
     _require_dsl()
     import cudnn
 
+    from cudnn.sdpa.fwd.api_dsl import ws_align
     from cudnn.sdpa.fwd.engines import engine_name
 
     dtype = q_gpu.dtype
@@ -325,13 +326,21 @@ def _run_dsl_graph(
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name(arch="sm120"), tiles=tiles, pack_gqa=pack_gqa)
+    plan = _select_engine(graph, engine_name(arch="sm120"), tiles=tiles, pack_gqa=pack_gqa)
     graph.check_support()
     graph.build_plans()
     # Honest workspace: the SM120 kernel None-specializes the LSE store, so a
-    # stats-less graph needs no dummy-LSE chunk — dense workspace is always 0.
+    # stats-less dense graph needs no dummy-LSE chunk and no scratch at all.
+    # Only a KV split (the heuristics choose one for short-S_q, long-S_kv
+    # shapes) carves scratch: the half-precision partial O slab and the fp32
+    # partial LSE slab the combine pass reduces, each carve-aligned.
+    split_kv = plan.knobs.split_kv or 1
     expected_workspace = 0
-    assert graph.get_workspace_size() == expected_workspace
+    if split_kv > 1:
+        b, h, s_q, _ = q_gpu.shape
+        d_v = v_gpu.shape[-1]
+        expected_workspace = ws_align(split_kv * b * s_q * h * d_v * q_gpu.element_size()) + ws_align(split_kv * b * h * s_q * 4)
+    assert graph.get_workspace_size() == expected_workspace, (split_kv, graph.get_workspace_size(), expected_workspace)
 
     variant_pack[o] = o_gpu
     graph.execute(
