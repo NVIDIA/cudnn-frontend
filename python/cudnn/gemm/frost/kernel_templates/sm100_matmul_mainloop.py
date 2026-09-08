@@ -1060,9 +1060,8 @@ def _kernel(
                     nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
                 tile_iter += 1
 
-            # Dense only: with split-K the dependent is the reducer, and an
-            # early launch would place its many CTAs on the few SMs idle at
-            # this point (see USE_PDL); it is left to the trigger at grid exit.
+            # Dense only: an early-launched reducer would pile its many small CTAs
+            # onto the few idle SMs, so split-K leaves the trigger to grid exit.
             if cutlass.const_expr(USE_PDL and split_k_slices == 1):
                 nvvm.griddepcontrol("launch_dependents")
 

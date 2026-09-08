@@ -2722,6 +2722,7 @@ class CompiledFusedGemm:
         split_k_slices = self.config.split_k_slices
         if needs_workspace:
             cta_k_elems = self.config.cta_smem_tile_mnk(DTYPE_BYTES[_mma_a_dtype(self.chain)])[2]
+            reduce_elems = _splitk_reduce_elems(self.chain)
         # Named so a test can assert which rule refused a call, and that a legal
         # call trips none. Incremented only on the path that is already raising.
         gave_up = self.deferrals
@@ -2857,6 +2858,12 @@ class CompiledFusedGemm:
                     )
                 if batch * split_k_slices > 65535:
                     raise ValueError(f"cudnn.frost gemm: batch={batch} * split_k_slices={split_k_slices} " f"exceeds the CUDA grid.z limit of 65535")
+                # The reducer's row chunk was sized for the plan's N.
+                if n % reduce_elems:
+                    raise ValueError(
+                        f"cudnn.frost gemm: N={n} is not a multiple of the reducer chunk ({reduce_elems} elements) "
+                        f"this plan was built with — rebuild for this shape"
+                    )
                 extra = (workspace.view(0, "float32", (split_k_slices * batch * m * n,)),)
             return launchable(
                 tuple(problem),
