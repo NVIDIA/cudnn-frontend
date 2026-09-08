@@ -171,11 +171,11 @@ class Capabilities:
     # could not do.
     #
     # `thd_causal` and `thd_gqa` were both removed on exactly that rule, once
-    # sdpa_bwd_sm100 -- the only row that sets `thd` -- served the causal family
-    # and then GQA. NOTHING is left here: the packed path's remaining limits
-    # (`thd_declared_totals`, the BSHD requirement) are not feature
-    # conjunctions, they are properties of the path itself. Think twice before
-    # adding another.
+    # sdpa_bwd_sm100 -- then the only row that set `thd` -- served the causal
+    # family and then GQA. NOTHING is left here: the packed path's remaining
+    # limits (`thd_declared_totals`, compact BSHD, no bias) are not feature
+    # conjunctions, they are properties of the path itself and mismatch()
+    # applies them to every THD row. Think twice before adding another.
     # True when THD REQUIRES sdpa(max_total_seq_len_q=..., max_total_seq_len_kv=...):
     # the row's workspace is sized from the packed token totals at BUILD time,
     # before any buffer exists.
@@ -308,15 +308,38 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             return f"graph uses {label}, which this engine does not support"
 
     if facts.thd and capabilities.thd:
-        if capabilities.thd_declared_totals and (facts.max_total_seq_len_q is None or facts.max_total_seq_len_kv is None):
+        if capabilities.thd_declared_totals and any(t is None or int(t) <= 0 for t in (facts.max_total_seq_len_q, facts.max_total_seq_len_kv)):
             return (
-                "THD requires sdpa_backward(max_total_seq_len_q=..., max_total_seq_len_kv=...): "
+                "THD requires positive sdpa_backward(max_total_seq_len_q=..., max_total_seq_len_kv=...): "
                 "the packed workspace is sized from the declared token totals at build time"
             )
         # The packed path binds the caller's buffers straight to kernels whose
         # operands are compact BSHD; it has no staging copy to fix a layout up.
         if not facts.bshd_layout:
             return "Q/K/V/O/dO/dQ/dK/dV must be BSHD-physical under THD (the packed path has no staging copy)"
+        # COMPACT, not just BSHD-ordered: the kernels address packed rows from H
+        # and D alone (head stride D, token stride H*D, element stride 1), so a
+        # port declared as a view into a wider per-token record (a K or V slice
+        # of an interleaved [T, 2, H, D] buffer, token stride 2*H*D) would be
+        # read at the wrong rows. The batch stride is not consulted (a ragged
+        # port's sequences start at its ragged offsets). The TOKEN stride is
+        # always checked: the packed view walks every token of every sequence
+        # with it, so it is load-bearing even when the envelope S_max is 1.
+        # The head and element strides wildcard on a size-1 extent, as in
+        # bshd_layout_ok. The adapters re-check this at build; declining here
+        # keeps the ranked plan list honest.
+        for name, dim, stride in facts.port_layouts:
+            _, h, _, d = (int(x) for x in dim)
+            head_ok = int(dim[1]) == 1 or int(stride[1]) == d
+            token_ok = int(stride[2]) == h * d
+            elem_ok = d == 1 or int(stride[3]) == 1
+            if not (head_ok and token_ok and elem_ok):
+                return f"{name} must be compact BSHD under THD (head stride D, token stride H*D); got stride {tuple(stride)}"
+        # A packed graph has no [B, H, S_q, S_kv] bias: the per-sequence score
+        # rectangles are different sizes, and the kernels' bias read is the
+        # dense one. Dense-only on every THD row.
+        if facts.has_bias or facts.has_dbias:
+            return "bias / dBias is dense-only under THD (a packed graph has no [B, H, S_q, S_kv] bias)"
 
     if facts.has_dsink and not facts.has_sink:
         return "dSink_token output requires a sink_token input"
@@ -716,10 +739,21 @@ def _sm80_spec() -> EngineSpec:
     (head-dim envelopes up to (256, 256), incl. rectangular 192/128),
     host-side head-dim zero-padding, BHSD<->BSHD normalization, per-shape
     kernel caching, and the dedicated plain-dense d=64 fast path.  The
-    CuTe-DSL JIT happens on the first execute (the kernel modules self-cache
-    per shape).  Knob domains are empty (no tunables wired).  sm80 exactly:
-    the kernels assume the A100's 164 KiB opt-in SMEM, which the sm86/sm89
-    parts do not have."""
+    CuTe-DSL JIT happens at compile(), except for that d=64 fast path, whose
+    module still self-caches on the first execute.  Knob domains are empty
+    (no tunables wired).  sm80 exactly: the kernels assume the A100's 164 KiB
+    opt-in SMEM, which the sm86/sm89 parts do not have.
+
+    THD / ragged: served on the packed ``[1, T, H, D]`` path (compact BSHD
+    ports, per-batch ``seq_len_q/kv`` turned into device ``cu_seqlens`` by a
+    setup launch, Stats read in either packed packing, declared totals sizing
+    the carved scratch -- hence ``thd_declared_totals``).  Deterministic dQ,
+    sinks, GQA, the causal family and head-dim envelope padding all ride it;
+    bias / dBias is dense-only (a path property, see mismatch()).  As on every
+    FROST THD row the packed addressing is ``prefix(lengths) x token stride``
+    and the bound ragged-offset values are not read: sequences must be
+    adjacent (padded THD with inter-sequence gaps is issue #737).
+    """
     return EngineSpec(
         name="sdpa_bwd_sm80",
         capabilities=Capabilities(
@@ -741,6 +775,12 @@ def _sm80_spec() -> EngineSpec:
             swa=True,
             padded=True,
             sink=True,
+            thd=True,
+            # The packed scratch (fp32 dQ accumulator, per-query-head dK/dV
+            # partials, do_dot) is sized from the declared token totals at
+            # build time; B * S_max would be the fallback and is far larger
+            # than any packed buffer.
+            thd_declared_totals=True,
             decode=False,  # prefill kernels only
             layouts=frozenset({"bshd", "dense_flex"}),
             # The kernels READ the declared stats strides natively (the
