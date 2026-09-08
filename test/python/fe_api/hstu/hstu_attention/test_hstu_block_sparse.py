@@ -13,17 +13,17 @@ try:
 except (ImportError, OSError) as exc:
     pytest.skip(f"CuTe DSL is unavailable: {exc}", allow_module_level=True)
 
-from cudnn.hstu_attention import (
+from cudnn.hstu.hstu_attention import (
     HSTUBwdSm100,
     HSTUFwdSm100,
     hstu_attention_backward,
     hstu_attention_forward,
 )
-from cudnn.hstu_attention import _interface
-from cudnn.hstu_attention._kernels import (
+from cudnn.hstu.hstu_attention import _interface
+from cudnn.hstu.hstu_attention._kernels import (
     hstu_bwd_256_cute as hstu_bwd_256_cute_module,
 )
-from cudnn.hstu_attention._kernels.block_sparse_builder import (
+from cudnn.hstu.hstu_attention._kernels.block_sparse_builder import (
     build_hstu_d256_bwd_block_sparse,
     build_hstu_k2q_block_sparse,
     build_hstu_q2k_block_sparse,

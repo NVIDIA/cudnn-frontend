@@ -49,16 +49,12 @@ Install cuDNN Frontend; its CuTe DSL dependencies are required and come with it:
 pip install nvidia-cudnn-frontend
 ```
 
-The implementation is available from `cudnn.hstu_attention` and through the
-following lazy top-level exports:
+The allocating functions are available as lazy top-level exports, while the
+architecture-specific class APIs live under `cudnn.hstu.hstu_attention`:
 
 ```python
-from cudnn import (
-    HSTUFwdSm100,
-    HSTUBwdSm100,
-    hstu_attention_forward,
-    hstu_attention_backward,
-)
+from cudnn import hstu_attention_backward, hstu_attention_forward
+from cudnn.hstu.hstu_attention import HSTUBwdSm100, HSTUFwdSm100
 ```
 
 ## Tensor layout

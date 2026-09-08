@@ -16,7 +16,7 @@ try:
 except Exception as exc:
     pytest.skip(f"CuTe DSL is unavailable: {exc}", allow_module_level=True)
 
-from cudnn.hstu_attention._kernels import utils
+from cudnn.hstu.hstu_attention._kernels import utils
 
 pytestmark = [
     pytest.mark.gpu_exclusive,
