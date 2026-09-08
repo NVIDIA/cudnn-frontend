@@ -275,8 +275,10 @@ def test_q2k_builder_rebuilds_mutated_func_on_current_stream():
         "block_size": (256, 128),
     }
     stream = torch.cuda.Stream()
+    producer_stream = torch.cuda.current_stream()
 
     with torch.cuda.stream(stream):
+        stream.wait_stream(producer_stream)
         full_metadata = build_hstu_q2k_block_sparse(
             func,
             cu_q,
@@ -407,8 +409,10 @@ def test_k2q_builder_rebuilds_mutated_func_on_current_stream():
         "block_size": (128, 128),
     }
     stream = torch.cuda.Stream()
+    producer_stream = torch.cuda.current_stream()
 
     with torch.cuda.stream(stream):
+        stream.wait_stream(producer_stream)
         full_metadata = build_hstu_k2q_block_sparse(
             func,
             cu_q,
