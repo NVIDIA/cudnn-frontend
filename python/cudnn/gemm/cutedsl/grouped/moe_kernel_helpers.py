@@ -613,19 +613,24 @@ def is_valid_mma_tiler_and_cluster_shape(
     cluster_shape_mn: Tuple[int, int],
     m_aligned: int,
     fix_pad_size: int = FIX_PAD_SIZE,
+    allowed_mma_tiler_n: Tuple[int, ...] = (256,),
 ) -> bool:
     """
     Check if the MMA tiler and cluster shape are valid.
 
     :param fix_pad_size: The fixed pad size used by the kernel (default: FIX_PAD_SIZE).
+    :param allowed_mma_tiler_n: Accepted MMA tile N extents. The default (256,)
+        matches the fused GLU kernels (even iterations with Epi Tile N 64 for
+        swiGeLU fusion); kernels without that constraint (e.g. the unfused
+        subchannel-scaled GEMM, whose default tile is (256, 128)) opt in to
+        additional extents explicitly.
     :return: True if valid, False otherwise
     """
     is_valid = True
 
     if not ((not use_2cta_instrs and mma_tiler_mn[0] in [128]) or (use_2cta_instrs and mma_tiler_mn[0] in [256])):
         is_valid = False
-    # Needs to have even iterations with Epi Tile N 64 for swiGeLU fusion
-    if mma_tiler_mn[1] not in [256]:
+    if mma_tiler_mn[1] not in allowed_mma_tiler_n:
         is_valid = False
     if cluster_shape_mn[0] % (2 if use_2cta_instrs else 1) != 0:
         is_valid = False
@@ -701,11 +706,15 @@ def can_implement(
     cd_major: str,
     m_aligned: int,
     fix_pad_size: int = FIX_PAD_SIZE,
+    allowed_mma_tiler_n: Tuple[int, ...] = (256,),
 ) -> bool:
     """
     Check if the grouped GEMM can be implemented with the given parameters.
 
     :param fix_pad_size: The fixed pad size used by the kernel (default: FIX_PAD_SIZE).
+    :param allowed_mma_tiler_n: Accepted MMA tile N extents (see
+        ``is_valid_mma_tiler_and_cluster_shape``); the default preserves the
+        historical (256,)-only behavior for existing callers.
     :return: True if implementable, False otherwise
     """
     result = True
@@ -719,7 +728,7 @@ def can_implement(
     if not is_valid_layouts(ab_dtype, d_dtype, a_major, b_major, cd_major):
         result = False
 
-    if not is_valid_mma_tiler_and_cluster_shape(use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m_aligned, fix_pad_size):
+    if not is_valid_mma_tiler_and_cluster_shape(use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m_aligned, fix_pad_size, allowed_mma_tiler_n):
         result = False
 
     if not is_valid_tensor_alignment(m, n, k, l, ab_dtype, d_dtype, a_major, b_major, cd_major):

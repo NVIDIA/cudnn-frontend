@@ -346,6 +346,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "grouped_gemm": (".gemm.cutedsl.grouped", None),
     "GroupedGemmSm100": (".gemm.cutedsl.grouped", "GroupedGemmSm100"),
     "grouped_gemm_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wrapper_sm100"),
+    "GroupedGemmUnfusedSubchannelScaledSm100": (".gemm.cutedsl.grouped", "GroupedGemmUnfusedSubchannelScaledSm100"),
+    "grouped_gemm_unfused_subchannel_scaled_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_unfused_subchannel_scaled_wrapper_sm100"),
     "grouped_gemm_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_jax_sm100"),
     "grouped_gemm_glu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_jax_sm100"),
     "grouped_gemm_dglu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dglu_jax_sm100"),
