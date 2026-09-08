@@ -350,9 +350,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
                 # inference below from mis-reading that layout.
                 return "THD stats must be ragged (packed); a dense per-batch stats tensor is not read by the packed path"
             stride_h, stride_s = s_stride[1], s_stride[2]
-            token_major = (stride_h, stride_s) == (1, facts.h_q)
-            head_major = not token_major and stride_s == 1 and stride_h >= 1
-            if not token_major and not head_major:
+            packing = ga.thd_stats_packing(stride_h, stride_s, facts.h_q)
+            head_major = packing == "head_major"
+            if packing is None:
                 return (
                     f"THD stats must be packed token-major (stride_h == 1, stride_s == {facts.h_q}) "
                     f"or head-major (stride_s == 1, stride_h == head stride); got stride {s_stride}"
@@ -521,7 +521,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     # which is what the FROST forward emits natively. mismatch() has already
     # rejected anything that is neither.
     stats_stride_h, stats_stride_s = (int(stats_geom[1][1]), int(stats_geom[1][2])) if thd else (0, 0)
-    stats_token_major = thd and (stats_stride_h, stats_stride_s) == (1, facts.h_q)
+    stats_token_major = thd and ga.thd_stats_packing(stats_stride_h, stats_stride_s, facts.h_q) == "token_major"
     stats_head_stride = stats_stride_h if (thd and not stats_token_major) else 0
     # Sink ports: geometry straight from the IR tensors (fp32 (1, H_q, 1, 1)).
     sink_geom = (tuple(facts.sink_t.get_dim()), tuple(facts.sink_t.get_stride())) if facts.has_sink else None

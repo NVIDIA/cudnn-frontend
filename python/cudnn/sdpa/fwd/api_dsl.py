@@ -1075,7 +1075,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # over the caller's strides.
         # THD (ragged) keeps the strict BSHD stride order: the varlen path
         # rebuilds packed [1,T,H,D] views and only that packing is defined.
-        from cudnn.sdpa.graph_analyzer import dense_layout_ok
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok, thd_stats_packing
 
         _REQ = (3, 1, 2, 0)
         for desc_name in ["q_desc", "k_desc", "v_desc", "o_desc"]:
@@ -1172,10 +1172,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._check_tensor_shape(self.lse_desc, (b, h_qo, s_qo), name="LSE")
             if self.thd:
                 stride_h, stride_s = tuple(self.lse_desc.stride[1:])
-                token_major = (stride_h, stride_s) == (1, h_qo)
-                head_major = not token_major and stride_s == 1 and stride_h >= 1
+                packing = thd_stats_packing(stride_h, stride_s, h_qo)
+                head_major = packing == "head_major"
                 self._value_error_if(
-                    not token_major and not head_major,
+                    packing is None,
                     f"THD LSE must be packed token-major (stride_h == 1, stride_s == H) "
                     f"or head-major (stride_s == 1, stride_h == head_stride); got stride {self.lse_desc.stride}",
                 )
@@ -2884,7 +2884,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # normalization needs is required: head dim innermost-contiguous
         # (stride 1), non-broadcast, non-overlapping strides, any B/H/S
         # order, padded strides allowed.
-        from cudnn.sdpa.graph_analyzer import bshd_layout_ok, dense_layout_ok
+        from cudnn.sdpa.graph_analyzer import bshd_layout_ok, dense_layout_ok, thd_stats_packing
 
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
             self._value_error_if(
@@ -2920,10 +2920,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self._check_tensor_shape(self.lse_desc, (b, h_q, s_q), name="LSE")
             if self.thd:
                 stride_h, stride_s = tuple(self.lse_desc.stride[1:])
-                token_major = (stride_h, stride_s) == (1, h_q)
-                head_major = not token_major and stride_s == 1 and stride_h >= 1
+                packing = thd_stats_packing(stride_h, stride_s, h_q)
+                head_major = packing == "head_major"
                 self._value_error_if(
-                    not token_major and not head_major,
+                    packing is None,
                     f"THD LSE must be packed token-major (stride_h == 1, stride_s == H) "
                     f"or head-major (stride_s == 1, stride_h == head_stride); got stride {self.lse_desc.stride}",
                 )
