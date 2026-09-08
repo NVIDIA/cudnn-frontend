@@ -80,7 +80,7 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # d512 carries an envelope FLOOR: it serves (256, 512] on both head dims,
     # so a smaller graph is declined rather than routed onto the d512 kernel at
     # a multiple-x zero-padding cost.  Rubin has no d512 flavor, hence no floor.
-    assert sm100.d_envelope_floors == (((512, 512), 256),)
+    assert sm100.d_envelope_floors == (((192, 128), 128), ((256, 256), 255), ((512, 512), 256))
     assert sm107.d_envelope_floors == ()
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
@@ -372,10 +372,16 @@ def test_fp8_envelope_mismatch_rules():
     sm100 = caps[engines.engine_name(fp8=True)]
     assert engines.mismatch(sm100, _fp8_facts()) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
-    # The d192xd128 flavor serves its envelope too (kernel takes d_qk/d_v).
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=96)) is None
-    # D256xD256 extends that envelope in both dimensions.
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=160)) is None
+    # The d192xd128 and D256 flavors serve ONLY their exact shapes (floors 128 / 255):
+    # d_qk zero-padded into d192 is numerically wrong and the D256 padded envelope is
+    # nondeterministic in test_mhas_v2, so the row declines the whole (128, 256) inexact
+    # region and the classic backend verdict applies there.
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128)) is None
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256)) is None
+    for dq, dv in ((160, 96), (176, 128), (192, 96), (160, 160), (224, 208)):
+        assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=dq, d_v=dv)), (dq, dv)
+    assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=192, d_v=128)) == (192, 128)
+    assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=256, d_v=256)) == (256, 256)
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=256))
     assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))

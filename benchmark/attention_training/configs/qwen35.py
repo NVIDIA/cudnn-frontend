@@ -6,7 +6,9 @@ Qwen 3.5 SDPA Benchmark Configuration
 
 Benchmarks Qwen 3.5-style GQA attention with causal (top_left) mask only.
 32 Q heads and 2 KV heads (16:1 GQA) with head_dim 256.
-Forward-only pass with bfloat16 (backward blocked at head_dim=256 on Blackwell).
+bfloat16 and mxfp8; the mxfp8 backward at head_dim=256 is served only by the
+FROST engine (``cudnn_oss`` backend, sdpa_bwd_sm100_mxfp8), the native cuDNN
+backend has no plan for it.
 
 Usage:
     python -m benchmark.attention_training.runner --config qwen35
@@ -33,11 +35,11 @@ CONFIG = BenchmarkConfig(
         (2048, 2048),
     ],
     backends=["cudnn", "cudnn_oss", "flash_attention_4"] + fa2_on_ampere(),
-    # Blackwell limits at head_dim=256: cuDNN bwd rejects head_dim>128 at
-    # graph_bwd.validate(), and fa4's sm100 forward kernel asserts on tmem
-    # exhaustion for head_dim=256 regardless of batch. Restrict to cuDNN fwd.
-    # fa4 rows are kept (they fail) to document the sm100 kernel limitation.
-    data_types=["bfloat16"],
+    # Blackwell at head_dim=256: fa4's sm100 forward kernel asserts on tmem
+    # exhaustion regardless of batch (rows kept, they fail, to document the
+    # limitation). mxfp8 backward has no native cuDNN plan at this head dim;
+    # the cudnn_oss backend pins the FROST engine (sdpa_bwd_sm100_mxfp8).
+    data_types=["bfloat16", "mxfp8"],
     attn_masks=["top_left"],  # Causal only
     profile_pass="both",
     deterministic_bwd=[False, True],

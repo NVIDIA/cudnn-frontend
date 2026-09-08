@@ -40,11 +40,11 @@ For ``swiglu_mlp`` only, by default,
 kernel that never materialises ``dh`` to HBM (set
 ``CUDNN_GEMM_SWIGLU_FROST_BWD=0`` for the separate nvjet GEMM + one-kernel
 pointwise, which it falls back to anyway if FROST cannot serve a
-shape/arch/thread). The dense large-M path uses the B200-tuned 2-CTA
-M128/N256/K128, cluster2x1, CLC strategy; its bare GEMM is at nvjet parity and
-the fused epilogue turns the avoided ``dh`` round-trip into a net win. A balanced
-B200 run at M=8192, H=5120, I=17408 measured 1.077x backward and 1.109x full
-fwd+bwd versus eager torch (the exact ratio is workload/runtime dependent).
+shape/arch/thread). On the first call for a shape, the dense path autotunes the
+M128/N128 and M128/N256 variants (cluster2x1, 2-CTA for M > 128) on the actual
+inputs and caches the winner; set ``CUDNN_GEMM_SWIGLU_FROST_AUTOTUNE=0`` to use
+the static N256-for-I>=256 policy instead. The fused epilogue avoids the ``dh``
+HBM round-trip in either case.
 Numerically matches torch to bf16 noise on the output and all four gradients.
 
 At the public call boundary the op snapshots GradMode and each input's
@@ -377,6 +377,9 @@ _FROST_DSWIGLU_CACHE = {}
 # the pointwise path if FROST explicitly declines a shape, architecture, layout,
 # or optional dependency.
 _FROST_BWD = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_BWD", "1") != "0"
+_FROST_BWD_AUTOTUNE = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_AUTOTUNE", "1") != "0"
+_FROST_AUTOTUNE_ITERS = 10
+_FROST_AUTOTUNE_REPEATS = 3
 _FROST_DECLINE_ERRORS = (NotImplementedError, cudnn.cudnnGraphNotSupportedError, ImportError)
 
 
@@ -400,10 +403,11 @@ def _frost_dswiglu(
     FROST takes the natural down weight directly (an N-major / I-contiguous B -- no
     transpose copy; the downstream ``dg.t()`` wgrad operand is likewise a free strided
     view) and keeps ``dh`` on-chip (no HBM round-trip). This is the DEFAULT backward
-    stage. The large-M path deliberately pins the B200-tuned
-    M128/N256/Kbytes128, cluster2x1, 2CTAMMA, CLC strategy. The previous geometry-
-    only sweep fixed 1CTAMMA/cluster1x1 and therefore did not cover this execution-
-    strategy win. Small M retains the 1CTAMMA/cluster1x1 strategy. Not a transpose
+    stage. The first call for each shape autotunes M128/N128 and M128/N256 using
+    CUDA events around the actual inputs, then caches the winner. Both candidates
+    use cluster2x1, 2CTAMMA for M > 128; small M retains 1CTAMMA/cluster1x1.
+    Autotuning can be disabled with ``CUDNN_GEMM_SWIGLU_FROST_AUTOTUNE=0``, which
+    retains the static N256-for-I>=256 policy. Not a transpose
     problem (dense bf16 needs none; ``dg.t()`` is a free view) and not a host-
     overhead one (host is ~1% of these compute-bound GEMMs, and #612 already cut
     it). SiTU is deliberately unsupported here: this FROST graph contains
@@ -463,19 +467,31 @@ def _frost_dswiglu(
         from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
         from cudnn.gemm.frost.tile_config import CATALOG
 
-        stream = torch.cuda.current_stream(device).cuda_stream
-        key = (M, H, interm, dout2.dtype, device.index)
+        torch_stream = torch.cuda.current_stream(device)
+        stream = torch_stream.cuda_stream
+        capability = torch.cuda.get_device_capability(device)
+        key = (M, H, interm, dout2.dtype, device.index, capability)
+        dgate = torch.empty(1, M, interm, device=device, dtype=dout2.dtype)
+        dup = torch.empty(1, M, interm, device=device, dtype=dout2.dtype)
+
+        def launch(entry):
+            compiled, bd, out_by, aux_by = entry
+            compiled(
+                {
+                    bd.a_operands[0]: dout2.unsqueeze(0),
+                    bd.b_operands[0]: Wd.unsqueeze(0),  # natural [1,H,I], N-major — no transpose
+                    out_by["dup"]: dup,
+                    out_by["dgate"]: dgate,
+                    aux_by["gate_pre"]: gate.unsqueeze(0),
+                    aux_by["up_pre"]: up.unsqueeze(0),
+                },
+                stream=stream,
+            )
+
         e = _FROST_DSWIGLU_CACHE.get(key)
         if e is None:
-            tn = 256 if interm >= 256 else 128
             cta_group = 2 if M > 128 else 1
             cluster_m = 2 if cta_group == 2 else 1
-            cfg = next(
-                c
-                for c in CATALOG
-                if (c.pipeline, c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cga_size_m, c.cga_size_n, c.cta_group)
-                == ("sm100", 128, tn, 128, cluster_m, 1, cta_group)
-            )
             g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
             DY = g.tensor(name="dy", dim=[1, M, H], stride=[M * H, H, 1])
             # Natural down weight [H,I] as an N-major (I-contiguous) B -- FROST takes
@@ -486,26 +502,49 @@ def _frost_dswiglu(
             dh = g.matmul(A=DY, B=WD, name="dgrad")
             g.mul(a=dh, b=g.swish(input=G), name="dup").set_output(True).set_data_type(_BF16)
             g.mul(a=g.swish_backward(loss=dh, input=G), b=U, name="dgate").set_output(True).set_data_type(_BF16)
-            compiled = jit_from_cudnn_graph(g, config=cfg)
-            bd = compiled.binding
-            out_by = {o.get_name().split("::")[0]: o for o in bd.outputs}
-            aux_by = {a.get_name(): a for a in bd.aux}
-            e = (compiled, bd, out_by, aux_by)
+
+            if _FROST_BWD_AUTOTUNE and interm >= 256:
+                tile_ns = (128, 256)
+            else:
+                tile_ns = (256 if interm >= 256 else 128,)
+            entries = []
+            for tn in tile_ns:
+                cfg = next(
+                    c
+                    for c in CATALOG
+                    if (c.pipeline, c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cga_size_m, c.cga_size_n, c.cta_group)
+                    == ("sm100", 128, tn, 128, cluster_m, 1, cta_group)
+                )
+                compiled = jit_from_cudnn_graph(g, config=cfg)
+                bd = compiled.binding
+                out_by = {o.get_name().split("::")[0]: o for o in bd.outputs}
+                aux_by = {a.get_name(): a for a in bd.aux}
+                entries.append((compiled, bd, out_by, aux_by))
+
+            if len(entries) == 1:
+                e = entries[0]
+            else:
+                # Warm both candidates before timing. Events and launches share
+                # torch_stream, so the measured interval excludes JIT and host work.
+                for entry in entries:
+                    launch(entry)
+                torch_stream.synchronize()
+                samples = [[] for _ in entries]
+                start = torch.cuda.Event(enable_timing=True)
+                stop = torch.cuda.Event(enable_timing=True)
+                for repeat in range(_FROST_AUTOTUNE_REPEATS):
+                    order = range(len(entries)) if repeat % 2 == 0 else reversed(range(len(entries)))
+                    for index in order:
+                        start.record(torch_stream)
+                        for _ in range(_FROST_AUTOTUNE_ITERS):
+                            launch(entries[index])
+                        stop.record(torch_stream)
+                        stop.synchronize()
+                        samples[index].append(start.elapsed_time(stop) / _FROST_AUTOTUNE_ITERS)
+                medians = [sorted(values)[len(values) // 2] for values in samples]
+                e = entries[min(range(len(entries)), key=medians.__getitem__)]
             _FROST_DSWIGLU_CACHE[key] = e
-        compiled, bd, out_by, aux_by = e
-        dgate = torch.empty(1, M, interm, device=device, dtype=dout2.dtype)
-        dup = torch.empty(1, M, interm, device=device, dtype=dout2.dtype)
-        compiled(
-            {
-                bd.a_operands[0]: dout2.unsqueeze(0),
-                bd.b_operands[0]: Wd.unsqueeze(0),  # natural [1,H,I], N-major — no transpose
-                out_by["dup"]: dup,
-                out_by["dgate"]: dgate,
-                aux_by["gate_pre"]: gate.unsqueeze(0),
-                aux_by["up_pre"]: up.unsqueeze(0),
-            },
-            stream=stream,
-        )
+        launch(e)
     return dgate.squeeze(0), dup.squeeze(0)
 
 

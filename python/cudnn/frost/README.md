@@ -129,13 +129,18 @@ EngineFamily(
     slots={"sdpa_fwd_prefill_sm100_d128": EngineSlot(0, opt_in=True), ...},
     analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
     heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
+    validator=("cudnn._sdpa_validate", "validate_graph"),
 ),
 ```
 
 - A family is **pure data**: strings and ints, zero imports of engine code.
   `import cudnn` must never pay the CuTe-DSL import (~1.2 s) merely to know an
-  engine exists. `analyzer` and `heuristics` are `(module, callable)` pairs for
-  the same reason, resolved only when something needs to rank.
+  engine exists. `analyzer`, `heuristics` and `validator` are `(module, callable)`
+  pairs for the same reason, resolved only when something needs them. The
+  `validator` is what lets `pygraph.validate()` skip the eager C++ lowering for
+  a graph a python engine may serve (it runs the family's semantic rules; the
+  backend's verdict is deferred to planning) — see
+  `docs/python_graph_and_execution_backends.md`, *The manifest*.
 - **A family is a KIND OF GRAPH**, not a group of engines that ship together.
   `_ANCHOR_NODE_TO_FAMILY` maps a node type to the one family that serves that
   kind of graph, so a graph belongs to exactly one family or to none, and
@@ -312,8 +317,10 @@ python/cudnn/
       kernels/
         prefill_d256_f16_sm100.py     naming: <phase>_d<dim>_<dtype-family>_sm<arch>.py
         prefill_d512_f16_sm100.py
-        prefill_f16_sm120.py
+        prefill_f16_sm120.py          general SM120 template (any head dim)
+        prefill_d256_f16_sm120.py     d256 flavor
         _common_sm100.py
+        _common_sm120.py
         thd_helpers.py
     bwd/                        future: same shape, its own api_dsl.py
 

@@ -728,15 +728,21 @@ else:
             amax_dV_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
 
         if args.data_type == "mxfp8":
-            # MXFP8 backward outputs use the same dtype as forward output
-            dQuery = torch.empty(batch_size, num_q_heads, q_seqlen, head_dim_qk, dtype=output_dtype, device=device)
-            dKey = torch.empty(batch_size, num_kv_heads, kv_seqlen, head_dim_qk, dtype=output_dtype, device=device)
-            dValue = torch.empty(batch_size, num_kv_heads, kv_seqlen, head_dim_vo, dtype=output_dtype, device=device)
+            # MXFP8 backward outputs use the same dtype as forward output, in the
+            # same BSHD-physical layout as Q/K/V (a training framework hands the
+            # gradients over in the activations' layout; the FROST MXFP8 backward
+            # engine serves BSHD-physical only).
+            dQuery = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_qk, dtype=output_dtype, device=device).transpose(1, 2)
+            dKey = torch.empty(batch_size, kv_seqlen, num_kv_heads, head_dim_qk, dtype=output_dtype, device=device).transpose(1, 2)
+            dValue = torch.empty(batch_size, kv_seqlen, num_kv_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
         else:
             dQuery = torch.empty_like(query)
             dKey = torch.empty_like(key)
             dValue = torch.empty_like(value)
-        dOutput = torch.randn(output.shape, dtype=randn_dtype, device=device).to(target_dtype)
+        # dO in O's memory format (BSHD-physical): torch.randn(output.shape) would
+        # allocate BHSD-contiguous and hand every backward a gradient laid out
+        # differently from the activations.
+        dOutput = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
         stats = torch.empty(batch_size, num_q_heads, q_seqlen, 1, dtype=torch.float32, device=device)
         if is_dropout:
             dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
@@ -1138,9 +1144,16 @@ else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride()).set_data_type(cudnn.data_type.BFLOAT16)
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride()).set_data_type(cudnn.data_type.BFLOAT16)
                 dV_bwd.set_output(True).set_dim(dValue.size()).set_stride(dValue.stride()).set_data_type(cudnn.data_type.BFLOAT16)
-                amax_dQ_bwd.set_output(True).set_dim(amax_dQ_gpu.size()).set_stride(amax_dQ_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
-                amax_dK_bwd.set_output(True).set_dim(amax_dK_gpu.size()).set_stride(amax_dK_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
-                amax_dV_bwd.set_output(True).set_dim(amax_dV_gpu.size()).set_stride(amax_dV_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+                # The gradients are half precision, so the amax_dQ/dK/dV outputs
+                # carry no information a consumer needs; the FROST MXFP8 backward
+                # engine does not produce them and declines a graph that asks.
+                # Leave them virtual under cudnn_oss (dims are still required by
+                # validate()); the native backend path keeps requesting them.
+                mxfp8_amax_requested = args.sdpa_backend != "cudnn_oss"
+                for _amax_t, _amax_gpu in ((amax_dQ_bwd, amax_dQ_gpu), (amax_dK_bwd, amax_dK_gpu), (amax_dV_bwd, amax_dV_gpu)):
+                    _amax_t.set_dim(_amax_gpu.size()).set_stride(_amax_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+                    if mxfp8_amax_requested:
+                        _amax_t.set_output(True)
             else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride())
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride())
@@ -1255,10 +1268,11 @@ else:
                     dQ_bwd: dQuery,
                     dK_bwd: dKey,
                     dV_bwd: dValue,
-                    amax_dQ_bwd: amax_dQ_gpu,
-                    amax_dK_bwd: amax_dK_gpu,
-                    amax_dV_bwd: amax_dV_gpu,
                 }
+                if mxfp8_amax_requested:
+                    variant_pack_bwd[amax_dQ_bwd] = amax_dQ_gpu
+                    variant_pack_bwd[amax_dK_bwd] = amax_dK_gpu
+                    variant_pack_bwd[amax_dV_bwd] = amax_dV_gpu
                 workspace = torch.empty(
                     max(graph_fwd.get_workspace_size(), graph_bwd.get_workspace_size()),
                     device="cuda",

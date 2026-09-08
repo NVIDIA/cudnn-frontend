@@ -54,7 +54,7 @@ from functools import lru_cache
 from typing import Callable, Optional, Tuple
 
 
-from cutlass.base_dsl.typing import Pointer  # was the legacy DSL Pointer pre-DKG-bump
+from cutlass.base_dsl.typing import Pointer  # was the legacy DSL Pointer pre-DSL-bump
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.primitives import vote_sync, VoteSync
 from cutlass.experimental.cuda import tensor_map as tmap

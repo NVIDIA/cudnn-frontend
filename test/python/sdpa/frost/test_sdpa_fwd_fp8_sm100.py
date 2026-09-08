@@ -523,60 +523,49 @@ def test_fp8_head_dim_envelope(dims, mask):
 
 @pytest.mark.L0
 @_skip_on_rubin
-@pytest.mark.parametrize(("d_qk", "d_v"), [(160, 96), (224, 208)], ids=["d192_envelope", "d256_envelope"])
-@torch_fork_set_rng(seed=0)
-def test_fp8_head_dim_envelope_large_flavors(d_qk, d_v):
-    """The D192/D128 and D256 flavors serve their dense envelopes through
-    TMA zero-padding on both head dimensions.
+def test_fp8_large_flavors_serve_exact_shapes_only():
+    """The d192xd128 and D256 per-tensor FP8 flavors serve ONLY their exact shapes.
+    With d_qk zero-padded into d192 (144/160/176) the output is wrong (test_mhas_v2
+    fp8 fwd: 4-19% of elements off by O(1)); the D256 padded envelope shows
+    run-to-run nondeterminism on long causal e5m2/GQA/sink graphs (a case passes
+    alone and fails in the battery). The engine row floors both (128 / 255), the
+    adapter mirrors the floors, and both flavor selections honour them, so the
+    inexact (128, 256) region is declined everywhere -- the classic backend verdict
+    applies -- while the d128 flavor's envelope and the d512 band are unchanged."""
+    from cudnn.sdpa.fwd import engines as eng
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, _SM100_FP8_ENVELOPE_FLOORS, _fp8_envelope_covers
 
-    Direct adapter API: the pygraph ``sdpa_fp8`` node validator still bounds
-    the GRAPH route at d_qk <= 128 (%16) / exact (192, 128) — a pre-FE-OSS
-    shape whitelist in the C++ frontend — so this region of the envelope is
-    reachable through the standalone API only until that validation is
-    relaxed to describe rather than judge."""
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+    assert _SM100_FP8_ENVELOPE_FLOORS[(192, 128)] == 128 and _SM100_FP8_ENVELOPE_FLOORS[(256, 256)] == 255
+    spec = next(sp for sp in eng.ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm100_fp8")
+    assert dict(spec.capabilities.d_envelope_floors) == {(192, 128): 128, (256, 256): 255, (512, 512): 256}
+    shapes = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    for d_qk, d_v in ((160, 96), (176, 128), (192, 96), (160, 160), (224, 208)):
+        assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
+    for d_qk, d_v in ((96, 96), (128, 64), (320, 320)):
+        assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
 
-    B, H, S = 2, 4, 384
-    dev = "cuda"
-    Q8 = (torch.randn(B, H, S, d_qk, device=dev) * 0.5).to(torch.float8_e4m3fn)
-    K8 = (torch.randn(B, H, S, d_qk, device=dev) * 0.5).to(torch.float8_e4m3fn)
-    V8 = (torch.randn(B, H, S, d_v, device=dev) * 0.5).to(torch.float8_e4m3fn)
-    out = torch.empty(B, H, S, d_v, device=dev, dtype=torch.bfloat16)
-    lse = torch.empty(B, H, S, device=dev, dtype=torch.float32)
-    scale = 1.0 / math.sqrt(d_qk)
+    B, H, S, dev = 2, 4, 384, "cuda"
 
-    api = SdpaFwdDslSm100(sample_q=Q8, sample_k=K8, sample_v=V8, sample_o=out, sample_lse=lse, scale_softmax=scale, pertensor_fp8=True)
-    assert api.check_support()
-    api.compile()
-    api.execute(q_tensor=Q8, k_tensor=K8, v_tensor=V8, o_tensor=out, lse_tensor=lse)
-    torch.cuda.synchronize()
+    def _api(d_qk, d_v):
+        Q8 = (torch.randn(B, H, S, d_qk, device=dev) * 0.5).to(torch.float8_e4m3fn)
+        K8 = (torch.randn(B, H, S, d_qk, device=dev) * 0.5).to(torch.float8_e4m3fn)
+        V8 = (torch.randn(B, H, S, d_v, device=dev) * 0.5).to(torch.float8_e4m3fn)
+        out = torch.empty(B, H, S, d_v, device=dev, dtype=torch.bfloat16)
+        lse = torch.empty(B, H, S, device=dev, dtype=torch.float32)
+        return SdpaFwdDslSm100(sample_q=Q8, sample_k=K8, sample_v=V8, sample_o=out, sample_lse=lse, scale_softmax=1.0 / math.sqrt(d_qk), pertensor_fp8=True)
 
-    o_ref = torch.softmax(Q8.float() @ K8.float().transpose(-1, -2) * scale, dim=-1) @ V8.float()
-    err = (out.float() - o_ref).abs().max().item()
-    assert err <= 5e-2 + 0.05 * o_ref.abs().max().item(), f"({d_qk},{d_v}) envelope mismatch: max err {err}"
-    assert not torch.isnan(out.float()).any()
-
-
-@pytest.mark.L0
-@torch_fork_set_rng(seed=0)
-def test_fp8_head_dim_envelope_padded():
-    """The envelope composed with the KV padding mask — the ViT production
-    shape (non-causal, seqlen padded up to a tile multiple, d=80)."""
-    out, o_ref, a_o, a_o_ref = _run(
-        2,
-        4,
-        4,
-        384,
-        384,
-        "e4m3",
-        torch.bfloat16,
-        scale=1.0 / math.sqrt(72),
-        sdpa_kwargs={},
-        seq_lens_kv=[384, 250],
-        d_qk=80,
-        d_v=80,
-    )
-    _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_o_ref)
+    for d_qk, d_v, want in ((192, 128, (192, 128)), (256, 256, (256, 256)), (96, 96, (128, 128))):
+        api = _api(d_qk, d_v)
+        assert api.check_support(), (d_qk, d_v)
+        assert tuple(api.flavor) == want, (d_qk, d_v, api.flavor)
+    for d_qk, d_v in ((160, 96), (224, 208)):
+        api = _api(d_qk, d_v)
+        try:
+            supported = api.check_support()
+        except ValueError as exc:  # the adapter may surface the envelope gate as a raise
+            supported = False
+            assert "floors" in str(exc), str(exc)
+        assert not supported, (d_qk, d_v)
 
 
 @pytest.mark.L0

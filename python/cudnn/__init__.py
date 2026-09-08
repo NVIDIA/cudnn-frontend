@@ -391,10 +391,24 @@ def _load_optional_symbol(name: str) -> Any:
         module = importlib.import_module(module_name, package=__name__)
         value = module if attr_name is None else getattr(module, attr_name)
     except Exception as e:
-        raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
+        raise ImportError(_optional_dependency_message(name, e)) from e
 
     globals()[name] = value
     return value
+
+
+def _optional_dependency_message(name: str, error: Exception) -> str:
+    # A DSL that is installed but below the floor must not be reported as a
+    # missing dependency: "pip install [cutedsl]" would change nothing.
+    try:
+        from .frost.buffers import cutedsl_requirement_error
+
+        too_old = cutedsl_requirement_error(name)
+    except Exception:
+        too_old = None
+    if too_old is not None:
+        return f"{too_old}: {error}"
+    return f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {error}"
 
 
 def __getattr__(name: str) -> Any:

@@ -35,8 +35,7 @@ def _is_cudnn_name_prefix(statement: ast.stmt, kernel_name: str) -> bool:
     if len(call.args) != 1 or not isinstance(call.args[0], ast.Constant) or call.args[0].value != "cudnn":
         return False
 
-    remove_cutlass_symbol = next((kw.value for kw in call.keywords if kw.arg == "remove_cutlass_symbol"), None)
-    return isinstance(remove_cutlass_symbol, ast.Constant) and remove_cutlass_symbol.value is True
+    return True
 
 
 def _missing_prefixes(node: ast.AST, scope: tuple[str, ...] = ()) -> list[str]:

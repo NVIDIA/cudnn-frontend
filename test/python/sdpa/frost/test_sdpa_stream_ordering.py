@@ -101,7 +101,7 @@ def test_sdpa_fwd_dsl_side_stream_ordering(d):
         out = sdpa_fwd_wrapper_dsl(q, k, v, scale_softmax=scale)["o_tensor"]
     torch.cuda.synchronize()
 
-    assert not torch.isnan(out).any(), "SDPA kernel read the poisoned Q: launch was not ordered after the " "side-stream copy (env-stream routing broken)"
+    assert not torch.isnan(out).any(), "SDPA kernel read the poisoned Q: launch was not ordered after the " "side-stream copy (env-stream routing failed)"
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 

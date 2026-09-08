@@ -14,7 +14,7 @@ mask patterns.
 From a source checkout:
 
 ```bash
-pip install -e ".[cutedsl]"
+pip install -e .
 pip install --group torch
 ```
 

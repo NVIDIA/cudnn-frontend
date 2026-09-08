@@ -217,7 +217,7 @@ class Capabilities:
     decode: bool = True
 
     # Escape hatch for kernels whose persistent multi-wave rescheduling is
-    # numerically broken: eligible only when the whole grid fits in one wave
+    # numerically invalid: eligible only when the whole grid fits in one wave
     # (B*H_q*ceil(S_q/512) <= SM_count / CTA_MMA). NO CURRENT ROW SETS THIS.
     # Historical user: the fp8 d128 row, whose multi-wave wrong-O bug (14-19%
     # mismatched elements, some tiles left unwritten NaN) was root-caused to
@@ -294,9 +294,17 @@ def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
 
 
 def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> Optional[tuple[int, int]]:
-    """Smallest native flavor whose envelope covers this graph."""
+    """Smallest native flavor whose envelope covers this graph -- honouring the
+    per-shape envelope floors, so the knob domains (cga, split) describe the
+    flavor the lowering will actually pick (api_dsl._pick_flavor walks the same
+    floors). An exact native shape is always its own selection."""
 
-    covering = [shape for shape in capabilities.d_shapes if facts.d_qk <= shape[0] and facts.d_v <= shape[1]]
+    floors = dict(capabilities.d_envelope_floors)
+    covering = [
+        shape
+        for shape in capabilities.d_shapes
+        if facts.d_qk <= shape[0] and facts.d_v <= shape[1] and ((facts.d_qk, facts.d_v) == shape or min(facts.d_qk, facts.d_v) > floors.get(shape, 0))
+    ]
     return min(covering, key=lambda shape: (shape[0], shape[1])) if covering else None
 
 
@@ -534,7 +542,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if clusters > resident:
             return (
                 f"launch needs {clusters} Q-tile clusters but only {resident} fit in one wave; "
-                "the fp8 kernel's persistent multi-wave rescheduling is numerically broken (gated)"
+                "the fp8 kernel's persistent multi-wave rescheduling is numerically invalid (gated)"
             )
 
     if capabilities.skv_tile and facts.s_kv % capabilities.skv_tile != 0 and not capabilities.skv_tail_via_padding:
@@ -718,8 +726,19 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
             # Below that floor it declines rather than swallowing e.g. a d256
             # graph onto a kernel whose cga4x1 role-split geometry is tuned for
-            # d = 512. Mirrored by api_dsl._SM100_FP8_ENVELOPE_FLOORS.
-            d_envelope_floors=() if rubin_row else (((512, 512), 256),),
+            # d = 512.  The d192x128 flavor serves ONLY its exact shape: with
+            # d_qk zero-padded into it (144/160/176) the kernel's output is wrong
+            # (4-19% of elements off by O(1) against the fp32 reference on
+            # SM100; d_v padding and the d128/d512 flavors' padding are exact),
+            # so a floor of 128 (min(d_qk, d_v) > 128 is unreachable at d_v <=
+            # 128) keeps every inexact graph off it until the kernel's Q/K
+            # padding is fixed.  Mirrored by api_dsl._SM100_FP8_ENVELOPE_FLOORS.
+            # The D256 flavor (#860) likewise serves only its exact shape for now: the
+            # classic battery routed onto its padded envelope (d_qk in (128, 256))
+            # shows run-to-run nondeterminism on long causal e5m2/GQA/sink graphs;
+            # min(d_qk, d_v) > 255 admits nothing inexact. Lift both floors once the
+            # kernels' padded paths are validated through test_mhas_v2.
+            d_envelope_floors=() if rubin_row else (((192, 128), 128), ((256, 256), 255), ((512, 512), 256)),
             thd_d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
