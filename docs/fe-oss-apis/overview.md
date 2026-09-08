@@ -39,6 +39,9 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
+- [MoE + Expert Parallel API](moe_ep.md) — Rubin SM107 fused SwiGLU with
+  stateless caller-owned training buffers and CUDA Graph support; see the
+  [MoeEP operation reference](../operations/moe_ep.md) for support details
 
 ## Installation and setup
 
@@ -55,6 +58,16 @@ pip install --group jax     # jax >= 0.5 (XLA entry points via cutlass.jax, ship
 ```
 (For the published wheel, `pip install torch torch-c-dlpack-ext` or `pip install "jax>=0.5"` directly.)
 
+MoE + Expert Parallel composes the reusable CuTeDSL and communication extras:
+```bash
+pip install "nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext
+```
+
+MoeEP is currently CUDA/PyTorch-only and targets Rubin SM107. EP2+ execution
+also requires NCCL, NVSHMEM, and a direct-P2P MNNVL peer-access domain. See the
+[MoeEP support matrix and tensor contracts](../operations/moe_ep.md)
+before integrating it.
+
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 
 ## API Usage
@@ -67,6 +80,13 @@ class conventions below apply to prepared frontend-only kernel APIs.
 Most compiler-style operations expose the following two APIs. Functional
 autograd integrations such as BSA and Flex Attention instead document their
 own wrapper and reusable-plan lifecycle on their operation pages.
+
+MoeEP is an exception to the generic wrapper/kernel pattern below. It exposes
+an object API: `MoeEp.__call__` for inference and
+`prepare_training` plus stateless `training_forward`/`training_backward` calls
+for training. See
+[MoE + Expert Parallel API](moe_ep.md) for its lifecycle and CUDA Graph
+contract.
 
 ### 1. High-level wrapper
 

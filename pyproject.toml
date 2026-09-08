@@ -1,7 +1,7 @@
 [project]
 name = "nvidia-cudnn-frontend"
 dynamic = ["version"]
-description = "NVIDIA cuDNN Frontend — Python and C++ Graph API with SOTA attention (SDPA / Flash Attention), MoE grouped GEMM fusions, and FP8/MXFP8 kernels for Hopper and Blackwell GPUs."
+description = "NVIDIA cuDNN Frontend — Python and C++ Graph API with SOTA attention (SDPA / Flash Attention), MoE grouped GEMM fusions, and FP8/MXFP8 kernels for Hopper, Blackwell, and Rubin GPUs."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0 AND MIT"}
@@ -21,6 +21,7 @@ keywords = [
     "fp8",
     "mxfp8",
     "blackwell",
+    "rubin",
     "hopper",
     "pytorch",
     "kernel",
@@ -71,6 +72,11 @@ cutedsl = [
     # `pip install nvidia-cudnn-frontend[cutedsl]` resolving for everyone who
     # still writes it that way.
     "cuda-python",
+]
+comm = [
+    # Communication runtimes are grouped by backend so future distributed
+    # operation graphs can reuse the same installation extra.
+    "nvshmem4py-cu13>=0.3.1",
 ]
 cutile = [
     # The cuTile linear-attention engines. Base cuda-tile only -- its [tileiras]
@@ -123,3 +129,7 @@ version = {attr = "cudnn.__version__"}
 
 [tool.setuptools.package-data]
 include = ["**/*"]
+"cudnn.moe_ep._megamoe_backend.cutedsl_src" = [
+    "LICENSE.Apache-2.0",
+    "VENDOR.md",
+]

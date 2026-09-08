@@ -305,19 +305,81 @@ _EAGER_PUBLIC_NAMES = (
 )
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
-_OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
+_CUTEDSL_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
+_MOE_EP_INSTALL_HINT = "Install with 'pip install " '"nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext\''
+_MOE_EP_OPTIONAL_IMPORTS = {
+    "moe_ep",
+    "BlockScaledTensor",
+    "MoeEp",
+    "MoeEpAutotuneCandidateResult",
+    "MoeEpAutotuneResult",
+    "MoeEpBackwardWeightStaging",
+    "MoeEpBackwardWeights",
+    "MoeEpExecutionLane",
+    "MoeEpForwardWeightStaging",
+    "MoeEpForwardWeights",
+    "MoeEpNativeBackwardWeights",
+    "MoeEpNativeForwardWeights",
+    "MoeEpNativeWeight",
+    "MoeEpNativeWeightLayout",
+    "MoeEpTrainingBackwardOutputs",
+    "MoeEpTrainingForwardOutputs",
+    "MoeEpTrainingWgradOperands",
+    "MoeEpTuningConfig",
+    "MoeFormat",
+    "MoeTensor",
+    "pack_backward_weights",
+    "pack_forward_weights",
+}
 
 _LAZY_OPTIONAL_IMPORTS = {
     "gnn": (".gnn", None),
+    "moe_ep": (".moe_ep", None),
+    "BlockScaledTensor": (".moe_ep", "BlockScaledTensor"),
+    "MoeEp": (".moe_ep", "MoeEp"),
+    "MoeEpAutotuneCandidateResult": (
+        ".moe_ep",
+        "MoeEpAutotuneCandidateResult",
+    ),
+    "MoeEpAutotuneResult": (".moe_ep", "MoeEpAutotuneResult"),
+    "MoeEpBackwardWeightStaging": (".moe_ep", "MoeEpBackwardWeightStaging"),
+    "MoeEpBackwardWeights": (".moe_ep", "MoeEpBackwardWeights"),
+    "MoeEpExecutionLane": (".moe_ep", "MoeEpExecutionLane"),
+    "MoeEpForwardWeightStaging": (".moe_ep", "MoeEpForwardWeightStaging"),
+    "MoeEpForwardWeights": (".moe_ep", "MoeEpForwardWeights"),
+    "MoeEpNativeBackwardWeights": (".moe_ep", "MoeEpNativeBackwardWeights"),
+    "MoeEpNativeForwardWeights": (".moe_ep", "MoeEpNativeForwardWeights"),
+    "MoeEpNativeWeight": (".moe_ep", "MoeEpNativeWeight"),
+    "MoeEpNativeWeightLayout": (".moe_ep", "MoeEpNativeWeightLayout"),
+    "MoeEpTrainingBackwardOutputs": (".moe_ep", "MoeEpTrainingBackwardOutputs"),
+    "MoeEpTrainingForwardOutputs": (".moe_ep", "MoeEpTrainingForwardOutputs"),
+    "MoeEpTrainingWgradOperands": (
+        ".moe_ep",
+        "MoeEpTrainingWgradOperands",
+    ),
+    "MoeEpTuningConfig": (".moe_ep", "MoeEpTuningConfig"),
+    "MoeFormat": (".moe_ep", "MoeFormat"),
+    "MoeTensor": (".moe_ep", "MoeTensor"),
+    "pack_backward_weights": (".moe_ep", "pack_backward_weights"),
+    "pack_forward_weights": (".moe_ep", "pack_forward_weights"),
     "FlexAttentionBwd": (".flex_attention", "FlexAttentionBwd"),
     "FlexAttentionFwd": (".flex_attention", "FlexAttentionFwd"),
     "create_mask_plan": (".flex_attention", "create_mask_plan"),
     "flex_attn_func": (".flex_attention", "flex_attn_func"),
     "sdpa_torch": (".sdpa.fwd.torch_op", "sdpa"),
     "BSA": (".block_sparse_attention", "BSA"),
-    "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
-    "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
-    "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
+    "block_sparse_attention_forward": (
+        ".block_sparse_attention",
+        "block_sparse_attention_forward",
+    ),
+    "block_sparse_attention_fp8_forward": (
+        ".block_sparse_attention",
+        "block_sparse_attention_fp8_forward",
+    ),
+    "block_sparse_attention_backward": (
+        ".block_sparse_attention",
+        "block_sparse_attention_backward",
+    ),
     "DSA": (".deepseek_sparse_attention", "DSA"),
     "CSA": (".csa", "CSA"),
     "CSACompressorForward": (".csa", "CSACompressorForward"),
@@ -326,62 +388,159 @@ _LAZY_OPTIONAL_IMPORTS = {
     "csa_compressor_backward_wrapper": (".csa", "csa_compressor_backward_wrapper"),
     "NSA": (".native_sparse_attention", "NSA"),
     "GemmSwigluSm100": (".gemm.cutedsl.dense.swiglu", "GemmSwigluSm100"),
-    "gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_wrapper_sm100"),
+    "gemm_swiglu_wrapper_sm100": (
+        ".gemm.cutedsl.dense.swiglu",
+        "gemm_swiglu_wrapper_sm100",
+    ),
     "gemm_swiglu_jax_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_jax_sm100"),
     "gemm_srelu_jax_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_jax_sm100"),
     "gemm_dsrelu_jax_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_jax_sm100"),
     "GemmSreluSm100": (".gemm.cutedsl.dense.srelu", "GemmSreluSm100"),
-    "gemm_srelu_wrapper_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_wrapper_sm100"),
+    "gemm_srelu_wrapper_sm100": (
+        ".gemm.cutedsl.dense.srelu",
+        "gemm_srelu_wrapper_sm100",
+    ),
     "GemmDsreluSm100": (".gemm.cutedsl.dense.dsrelu", "GemmDsreluSm100"),
-    "gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_wrapper_sm100"),
+    "gemm_dsrelu_wrapper_sm100": (
+        ".gemm.cutedsl.dense.dsrelu",
+        "gemm_dsrelu_wrapper_sm100",
+    ),
     "GemmAmaxSm100": (".gemm.cutedsl.dense.amax", "GemmAmaxSm100"),
     "gemm_amax_wrapper_sm100": (".gemm.cutedsl.dense.amax", "gemm_amax_wrapper_sm100"),
     "gemm_amax_jax_sm100": (".gemm.cutedsl.dense.amax", "gemm_amax_jax_sm100"),
-    "GemmProjRopeMxfp8Bf16InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Bf16InSm100"),
-    "GemmProjRopeMxfp8Mxfp8InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Mxfp8InSm100"),
-    "gemm_proj_rope_mxfp8_wrapper_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_wrapper_sm100"),
-    "gemm_proj_rope_mxfp8_jax_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_jax_sm100"),
+    "GemmProjRopeMxfp8Bf16InSm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "GemmProjRopeMxfp8Bf16InSm100",
+    ),
+    "GemmProjRopeMxfp8Mxfp8InSm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "GemmProjRopeMxfp8Mxfp8InSm100",
+    ),
+    "gemm_proj_rope_mxfp8_wrapper_sm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "gemm_proj_rope_mxfp8_wrapper_sm100",
+    ),
+    "gemm_proj_rope_mxfp8_jax_sm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "gemm_proj_rope_mxfp8_jax_sm100",
+    ),
     "RmsNormRhtAmaxSm100": (".rmsnorm_rht_amax", "RmsNormRhtAmaxSm100"),
-    "rmsnorm_rht_amax_wrapper_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_wrapper_sm100"),
+    "rmsnorm_rht_amax_wrapper_sm100": (
+        ".rmsnorm_rht_amax",
+        "rmsnorm_rht_amax_wrapper_sm100",
+    ),
     "grouped_gemm": (".gemm.cutedsl.grouped", None),
     "GroupedGemmSm100": (".gemm.cutedsl.grouped", "GroupedGemmSm100"),
-    "grouped_gemm_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wrapper_sm100"),
+    "grouped_gemm_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_wrapper_sm100",
+    ),
     "grouped_gemm_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_jax_sm100"),
-    "grouped_gemm_glu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_jax_sm100"),
-    "grouped_gemm_dglu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dglu_jax_sm100"),
-    "grouped_gemm_dsrelu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_jax_sm100"),
-    "grouped_gemm_wgrad_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wgrad_jax_sm100"),
-    "discrete_grouped_gemm_swiglu_jax_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_swiglu_jax_sm100"),
-    "discrete_grouped_gemm_dswiglu_jax_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_dswiglu_jax_sm100"),
+    "grouped_gemm_glu_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_jax_sm100",
+    ),
+    "grouped_gemm_dglu_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dglu_jax_sm100",
+    ),
+    "grouped_gemm_dsrelu_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dsrelu_jax_sm100",
+    ),
+    "grouped_gemm_wgrad_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_wgrad_jax_sm100",
+    ),
+    "discrete_grouped_gemm_swiglu_jax_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_swiglu_jax_sm100",
+    ),
+    "discrete_grouped_gemm_dswiglu_jax_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_dswiglu_jax_sm100",
+    ),
     "GroupedGemmSwigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmSwigluSm100"),
-    "grouped_gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_swiglu_wrapper_sm100"),
+    "grouped_gemm_swiglu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_swiglu_wrapper_sm100",
+    ),
     "GroupedGemmDswigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDswigluSm100"),
-    "grouped_gemm_dswiglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dswiglu_wrapper_sm100"),
+    "grouped_gemm_dswiglu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dswiglu_wrapper_sm100",
+    ),
     "GroupedGemmSreluSm100": (".gemm.cutedsl.grouped", "GroupedGemmSreluSm100"),
-    "grouped_gemm_srelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_srelu_wrapper_sm100"),
+    "grouped_gemm_srelu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_srelu_wrapper_sm100",
+    ),
     "GroupedGemmDsreluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDsreluSm100"),
-    "grouped_gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_wrapper_sm100"),
+    "grouped_gemm_dsrelu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dsrelu_wrapper_sm100",
+    ),
     "HSTUFwdSm100": (".hstu_attention", "HSTUFwdSm100"),
     "HSTUBwdSm100": (".hstu_attention", "HSTUBwdSm100"),
     "hstu_attention_forward": (".hstu_attention", "hstu_attention_forward"),
     "hstu_attention_backward": (".hstu_attention", "hstu_attention_backward"),
     "GroupedGemmQuantSm100": (".gemm.cutedsl.grouped", "GroupedGemmQuantSm100"),
-    "grouped_gemm_quant_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_quant_wrapper_sm100"),
+    "grouped_gemm_quant_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_quant_wrapper_sm100",
+    ),
     "GroupedGemmGluSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluSm100"),
-    "grouped_gemm_glu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_wrapper_sm100"),
-    "GroupedGemmGluHadamardSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluHadamardSm100"),
-    "grouped_gemm_glu_hadamard_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_hadamard_wrapper_sm100"),
-    "GroupedGemmGluHadamardQuantSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluHadamardQuantSm100"),
-    "grouped_gemm_glu_hadamard_quant_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_hadamard_quant_wrapper_sm100"),
+    "grouped_gemm_glu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_wrapper_sm100",
+    ),
+    "GroupedGemmGluHadamardSm100": (
+        ".gemm.cutedsl.grouped",
+        "GroupedGemmGluHadamardSm100",
+    ),
+    "grouped_gemm_glu_hadamard_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_hadamard_wrapper_sm100",
+    ),
+    "GroupedGemmGluHadamardQuantSm100": (
+        ".gemm.cutedsl.grouped",
+        "GroupedGemmGluHadamardQuantSm100",
+    ),
+    "grouped_gemm_glu_hadamard_quant_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_hadamard_quant_wrapper_sm100",
+    ),
     "GroupedGemmDgluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDgluSm100"),
-    "grouped_gemm_dglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dglu_wrapper_sm100"),
+    "grouped_gemm_dglu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dglu_wrapper_sm100",
+    ),
     "GroupedGemmWgradSm100": (".gemm.cutedsl.grouped", "GroupedGemmWgradSm100"),
-    "grouped_gemm_wgrad_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wgrad_wrapper_sm100"),
+    "get_grouped_gemm_wgrad_workspace_size_sm100": (
+        ".gemm.cutedsl.grouped",
+        "get_grouped_gemm_wgrad_workspace_size_sm100",
+    ),
+    "grouped_gemm_wgrad_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_wgrad_wrapper_sm100",
+    ),
     "discrete_grouped_gemm": (".gemm.cutedsl.discrete_grouped", None),
-    "DiscreteGroupedGemmSwigluSm100": (".gemm.cutedsl.discrete_grouped", "DiscreteGroupedGemmSwigluSm100"),
-    "discrete_grouped_gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_swiglu_wrapper_sm100"),
-    "DiscreteGroupedGemmDswigluSm100": (".gemm.cutedsl.discrete_grouped", "DiscreteGroupedGemmDswigluSm100"),
-    "discrete_grouped_gemm_dswiglu_wrapper_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_dswiglu_wrapper_sm100"),
+    "DiscreteGroupedGemmSwigluSm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "DiscreteGroupedGemmSwigluSm100",
+    ),
+    "discrete_grouped_gemm_swiglu_wrapper_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_swiglu_wrapper_sm100",
+    ),
+    "DiscreteGroupedGemmDswigluSm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "DiscreteGroupedGemmDswigluSm100",
+    ),
+    "discrete_grouped_gemm_dswiglu_wrapper_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_dswiglu_wrapper_sm100",
+    ),
 }
 
 
@@ -408,7 +567,8 @@ def _optional_dependency_message(name: str, error: Exception) -> str:
         too_old = None
     if too_old is not None:
         return f"{too_old}: {error}"
-    return f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {error}"
+    install_hint = _MOE_EP_INSTALL_HINT if name in _MOE_EP_OPTIONAL_IMPORTS else _CUTEDSL_INSTALL_HINT
+    return f"{name} requires optional dependencies. {install_hint}: {error}"
 
 
 def __getattr__(name: str) -> Any:
