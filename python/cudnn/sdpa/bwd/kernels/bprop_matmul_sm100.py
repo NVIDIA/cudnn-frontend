@@ -1882,12 +1882,21 @@ def _host(
         )
 
 
+_CODEGEN_TARGET_SMS = frozenset({100, 103, 107, 110})
+
+
 @lru_cache(maxsize=None)
 def compile(device) -> Callable:
     major, minor = compute_capability(resolve_device(device))
     sm = major * 10 + minor
-    if not 100 <= sm <= 103:
-        raise ValueError(f"SM100 SDPA bwd stage 3 requires SM100 through SM103; got SM{sm}")
+    # This is the source-level CODEGEN domain, not the engine's advertised
+    # support contract.  The complete three-stage engine remains qualified only
+    # on SM100/SM103; SM107/SM110 targets are kept available for isolated
+    # lowering and future board qualification.  In particular SM107 needs a
+    # CuTe DSL build that recognizes sm_107a (the public 4.7 wheel does not).
+    if sm not in _CODEGEN_TARGET_SMS:
+        expected = ", ".join(f"SM{x}" for x in sorted(_CODEGEN_TARGET_SMS))
+        raise ValueError(f"SM100 SDPA bwd stage 3 has codegen targets for {expected}; got SM{sm}")
     # The architecture-specific target is required for tcgen05/TMA. Resolve it
     # from this function's device cache key so B200 and B300 cannot share an
     # incompatible TVM-FFI artifact in a multi-GPU process.
