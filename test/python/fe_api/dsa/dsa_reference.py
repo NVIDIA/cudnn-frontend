@@ -106,8 +106,9 @@ def ref_sparse_attention_forward(
     if logical_topk == 0:
         weights = q_f.new_empty((t, h, 0))
     else:
-        safe_scores = scores.masked_fill(~slot_valid.unsqueeze(1), 0.0)
-        weights = torch.exp(safe_scores - safe_normalizer.unsqueeze(-1))
+        # Keep invalid logits at -inf before exp.  Replacing them with zero can
+        # overflow for a very negative normalizer and poison autograd via 0 * inf.
+        weights = torch.exp(scores - safe_normalizer.unsqueeze(-1))
         weights = weights.masked_fill(~slot_valid.unsqueeze(1), 0.0)
     gathered_v = gathered_kv[..., :head_dim_v]
     out = torch.einsum("thk,tkd->thd", weights, gathered_v)
