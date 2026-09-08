@@ -1776,13 +1776,18 @@ def test_fp8_d512_head_dim_envelope(d_qk, d_v, mask):
 @pytest.mark.L0
 @_skip_d512_on_rubin
 def test_fp8_d512_envelope_floor_declines_straddling_shapes():
-    """D256 serves its own envelope; shapes straddling the D512 floor decline."""
+    """The D512 flavor serves the (256, 512] band on both head dims; shapes
+    straddling its floor decline.  Below it the D256 flavor is exact-shape only
+    (its padded envelope is non-deterministic, see
+    test_fp8_large_flavors_serve_exact_shapes_only), so a shape such as
+    (160, 160) -- too wide for D192/128, not the D256 shape -- is declined too.
+    """
     from cudnn.sdpa.fwd.api_dsl import _fp8_envelope_covers, _sm100_fp8_shapes
 
     shapes = _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
-    for d_qk, d_v in [(160, 160), (256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
+    for d_qk, d_v in [(256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
         assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
-    for d_qk, d_v in [(272, 256), (384, 128), (512, 256)]:
+    for d_qk, d_v in [(160, 160), (272, 256), (384, 128), (512, 256)]:
         assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
 
 
