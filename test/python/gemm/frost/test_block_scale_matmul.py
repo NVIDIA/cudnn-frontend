@@ -2446,15 +2446,23 @@ def test_sm120_block_scale_tile_constants_render(combo, kind, vec, fmt, ptx):
         assert int(assigned["ab_stages"]) >= 1
         for banned in ("acc_stages", "tmem", "utccp", "num_sf_atoms", "sfa_col_bases", "smem_desc", "multicast", "cta_group", "idesc"):
             assert banned not in src, banned
-    # A 256-tall stage is 48 KB of data + the two SF boxes; whether one survives
-    # the 16.5 KB epilogue staging is the active device's SMEM budget, and the
-    # renderer (not the funnel) is where that is decided.
+    # The ring depth funds the 16.5 KB epilogue staging in BYTES: a 128x128
+    # nvfp4 stage is 36 KB, so two of them plus the staging fit a ~99 KB part
+    # (one stage would, wrongly, be all that surviving whole-stage rounding).
+    # Whether a tile fits at all is the active device's budget, decided by the
+    # renderer (not the funnel).
     from cudnn.gemm.frost.tile_config import smem_ab_stages
 
+    staging = 4 * 528 * 8
+    cfg128 = by_name(_SM120_BS_128)
+    per_stage_128 = (128 + 128) * 128 + (128 + 128) * sf_k + 16
+    src128 = C._render_block_scale_tile_constants(cfg128, chain, select_template(chain, cfg128))
+    want = smem_ab_stages(per_stage_128, smem_fixed_reserve=2048, extra_smem_bytes=staging)
+    assert int(dict(re.findall(r"^(\w+) = (.*)$", src128, re.M))["ab_stages"]) == want
     tall = by_name(_SM120_BS_256x128)
     per_stage = (256 + 128) * 128 + (256 + 128) * sf_k + 16
-    if smem_ab_stages(per_stage, smem_fixed_reserve=2048) - -(-(4 * 528 * 8) // per_stage) < 1:
-        with pytest.raises(NotImplementedError, match="leaves none"):
+    if smem_ab_stages(per_stage, smem_fixed_reserve=2048, extra_smem_bytes=staging) < 1:
+        with pytest.raises(NotImplementedError, match="does not fit"):
             C._render_block_scale_tile_constants(tall, chain, select_template(chain, tall))
     else:
         C._render_block_scale_tile_constants(tall, chain, select_template(chain, tall))

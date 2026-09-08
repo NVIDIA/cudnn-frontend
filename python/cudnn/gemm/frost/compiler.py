@@ -1585,20 +1585,20 @@ def _render_block_scale_tile_constants_sm120(
 
     # --- AB SMEM pipeline depth -------------------------------------------------
     # One stage = a whole K-tile of packed A + B plus both SF boxes (+16 B, the
-    # slack the template counts); the template then funds its transposed-STG
-    # epilogue staging (4 B x 528 per compute warp) out of the ring, so what is
-    # checked here is the depth that SURVIVES that. The catalog's SMEM sweep
-    # counts data only, so a cataloged tile (e.g. the 128x256 the auto path
-    # picks for a wide N) can still fail here on a ~99 KB consumer part; the
-    # engine then declines the graph.
+    # slack the template counts). The transposed-STG epilogue staging (4 B x 528
+    # per compute warp) is taken off the budget in BYTES before the ring is
+    # sized -- not as a whole stage, which on a ~99 KB consumer part would cost
+    # a 128x128 tile its second stage (2 x 36 KB + 16.5 KB fits; 3 x 36 KB does
+    # not). The catalog's SMEM sweep counts data only, so a cataloged tile can
+    # still leave no stage here; the engine then declines the graph.
     per_stage = sA_packed_elems + sB_packed_elems + sfa_smem_bytes + sfb_smem_bytes + 16
-    ab_stages = smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve)
     compute_warps = (cta_m // cfg.warp_tile_m) * (cta_n // cfg.warp_tile_n)
     staging_bytes = 4 * _SM120_STG_STAGE_ELEMS * compute_warps
-    if ab_stages - -(-staging_bytes // per_stage) < 1:
+    ab_stages = smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=staging_bytes)
+    if ab_stages < 1:
         raise NotImplementedError(
-            f"block-scale {cfg.name!r}: {ab_stages} stage(s) of {per_stage} B (packed A/B + SF) fit the SMEM budget, "
-            f"but the {staging_bytes}-B epilogue staging leaves none -- pick a smaller CTA tile"
+            f"block-scale {cfg.name!r}: one stage of {per_stage} B (packed A/B + SF) plus the "
+            f"{staging_bytes}-B epilogue staging does not fit the SMEM budget -- pick a smaller CTA tile"
         )
 
     out_dt = chain.output_dtype
@@ -1618,6 +1618,8 @@ def _render_block_scale_tile_constants_sm120(
         f"matmul_b_batch = {chain.matmul.b_batch}",
         f"a_is_m_major = {a_major == 'm'}",
         f"b_is_n_major = {b_major == 'n'}",
+        # The AB ring depth with the epilogue staging already funded (the
+        # template takes it as is).
         f"ab_stages = {ab_stages}",
         f"a_tma_group_elems = {a_tma_group_elems}",
         f"b_tma_group_elems = {b_tma_group_elems}",

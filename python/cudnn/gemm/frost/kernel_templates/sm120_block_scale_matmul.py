@@ -152,12 +152,10 @@ _STG_EPI_WARP_ELEMS = _STG_EPI_GROUP_FRAGS * _STG_EPI_BATCH_STRIDE  # 528
 _STG_EPI_NGRP = (_N_FRAGS + _STG_EPI_GROUP_FRAGS - 1) // _STG_EPI_GROUP_FRAGS
 _STG_V = (vec_bytes_epi * 8) // cd_dtype.width
 
-# One AB stage = packed A + packed B + both SF boxes; the STG staging is funded
-# out of the ring (the renderer has already checked that >= 1 stage survives).
-_STG_EPI_BYTES = 4 * _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS
-_AB_STAGE_BYTES = (sA_packed_elems + sB_packed_elems) * (ab_dtype.width // 8) + sfa_smem_bytes + sfb_smem_bytes + 16
-ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
-assert ab_stages >= 1, f"{__name__}: no AB stage left after the epilogue staging"
+# One AB stage = packed A + packed B + both SF boxes. Unlike the dense template,
+# the injected ab_stages already has the STG staging (4 B x 528 per compute warp)
+# taken off the budget in bytes, so it is used as is.
+assert ab_stages >= 1, f"{__name__}: the renderer emitted an empty AB ring"
 
 # ---------------------------------------------------------------------------
 # Scale-factor geometry. The F8_128x4 blob is 512-byte atoms: 128 rows x 4
