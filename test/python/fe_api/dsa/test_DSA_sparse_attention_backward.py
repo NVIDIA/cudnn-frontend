@@ -900,8 +900,9 @@ def test_DSA_sparse_attention_backward_sm100_masks_invalid_topk_rows(invalid_val
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=677)
+@pytest.mark.parametrize("deterministic", [False, True], ids=["ordinary", "deterministic"])
 @pytest.mark.parametrize("sink_value,empty_row", [(-math.inf, True), (math.inf, False)], ids=["empty-no-mass", "positive-infinite-sink"])
-def test_DSA_sparse_attention_backward_sm100_handles_infinite_sink_limits(sink_value, empty_row):
+def test_DSA_sparse_attention_backward_sm100_handles_infinite_sink_limits(sink_value, empty_row, deterministic):
     """Sink/LSE infinities must use their limiting probabilities without inf-inf."""
     _require_sm100()
     try:
@@ -934,6 +935,7 @@ def test_DSA_sparse_attention_backward_sm100_handles_infinite_sink_limits(sink_v
         topk_idxs,
         softmax_scale=192**-0.5,
         topk_length=topk_length,
+        deterministic=deterministic,
     )
 
     assert torch.equal(result["dq"], torch.zeros_like(result["dq"]))
