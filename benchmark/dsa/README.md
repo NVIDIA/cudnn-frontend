@@ -1,4 +1,43 @@
-# DSA Sparse Attention Backward Benchmark
+# DSA Sparse Attention Benchmarks
+
+## Sparse Attention Forward
+
+`benchmark_dsa_sparse_attention_forward.py` benchmarks the public SM100
+`cudnn.DSA.sparse_attention_forward_wrapper` API for H64/D512 or D576 and the
+H128/D512 small-top-k Prefill kernel. The default shape is the H64 production
+anchor `S_q=4096, S_kv=5120, K=640, indexer_topk=512`.
+
+Two cuDNN Frontend timings are reported:
+
+- **DSA execute path (preallocated)** — the concrete CuTe kernel is
+  compiled before timing, all enabled output buffers are reused, and each
+  iteration calls the same `SparseAttentionForward.execute()` object.
+- **DSA public wrapper** — each iteration calls
+  `sparse_attention_forward_wrapper`, including any GPU work caused by output
+  allocation and logical-K padding/layout normalization.
+
+Both timings use CUDA events on the current stream after independent warmup.
+The execute measurement is not raw kernel-only time: it still includes the
+lightweight public execution adapter, and for a non-multiple-of-64 logical K
+it also includes internal index padding. CUDA events measure GPU elapsed time;
+Python/host-side wrapper and allocation overhead is not separately captured.
+The script prints both logical and padded K so that distinction is visible.
+
+Run the default H64/D512 case or select another frozen specialization:
+
+```bash
+python benchmark_dsa_sparse_attention_forward.py
+python benchmark_dsa_sparse_attention_forward.py --heads 64 --head-dim 576 --topk 640 --indexer-topk 512
+python benchmark_dsa_sparse_attention_forward.py --heads 128 --head-dim 512 --topk 1152 --indexer-topk 1024
+```
+
+Common options are `--seqlen-q`, `--seqlen-kv`, `--heads`, `--head-dim`,
+`--topk`, `--indexer-topk`, `--warmup`, `--repeat`, `--seed`,
+`--no-attn-sink`, and `--use-topk-length`. Forward
+requires an SM100-family GPU, BF16 inputs, PyTorch with CUDA support, and the
+cuDNN Frontend `[cutedsl]` dependencies.
+
+## Sparse Attention Backward
 
 Microbenchmark for the DeepSeek Sparse Attention (DSA) backward kernel in the
 cuDNN Frontend CuTe DSL package, driven through the public
@@ -6,14 +45,14 @@ cuDNN Frontend CuTe DSL package, driven through the public
 the Hopper (SM90) or Blackwell (SM100) implementation based on the active
 CUDA device.
 
-## What is measured
+### What is measured
 
-Inputs are flat FlashMLA-shaped tensors: `q (S_q, H, d_qk)`, a shared
+Inputs are flat MQA tensors: `q (S_q, H, d_qk)`, a shared
 `kv (S_kv, d_qk)` buffer (K = V), and per-query global top-k indices
 `topk_idxs (S_q, topk)` with unique random indices per query row. The forward
 `out`/`lse` consumed by the backward kernel come from a chunked PyTorch
-reference, since the production forward (FlashMLA) is out of scope for this
-repository.
+reference so that this benchmark isolates backward and does not include a
+forward launch.
 
 Each timed iteration is one full wrapper call — gradient-buffer zeroing,
 workspace allocation, and the preprocess/backward/convert kernels — i.e. the
@@ -27,7 +66,7 @@ dP, dQ, dK):
 FLOPs = 2 * S_q * H * topk * (3 * d_qk + 2 * d_v)
 ```
 
-## Requirements
+### Requirements
 
 - Hopper (SM90) or Blackwell (SM100) GPU
 - PyTorch with CUDA support
@@ -35,7 +74,7 @@ FLOPs = 2 * S_q * H * topk * (3 * d_qk + 2 * d_v)
   this repository's `python/` package) -- the CuTe DSL dependencies are
   required dependencies and come with either
 
-## How to run
+### How to run
 
 Default sweep (`seqlens 4096,8192 x topks 128,512,1024,2048`, bf16,
 `d_qk = d_v = 512`, 64 heads):
@@ -70,9 +109,9 @@ Options:
   first warmup iteration also triggers kernel compilation).
 - `--csv` — write results to a CSV file.
 
-## Results
+### Results
 
-### B200
+#### B200
 
 Generated on an NVIDIA B200 with the default
 sweep settings (`nheads=64`, `d_qk = d_v = 512`, bf16, attention sink and
@@ -91,7 +130,7 @@ repository.
 |     8192 |      8192 | 1024 |  4.538 |     605.76 |
 |     8192 |      8192 | 2048 |  8.562 |     642.06 |
 
-## Profiling
+### Profiling
 
 `profile` mode runs a single warmed-up backward call (using the first value
 of `--seqlens` and the last value of `--topks`) wrapped in
