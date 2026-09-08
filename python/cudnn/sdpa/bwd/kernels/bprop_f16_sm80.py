@@ -116,7 +116,7 @@ from cudnn.frost.tile_dsl.mma import load_b_smem_x4, mma_step  # noqa: E402
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16  # noqa: E402
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b  # noqa: E402
 from cudnn.frost.tile_dsl.tma import load_tile_2d, cp_async_commit, cp_async_wait  # noqa: E402
-from cudnn.frost.tile_dsl.mask import MASK_NONE, MASK_PADDED, MASK_CAUSAL, MASK_SWA  # noqa: E402
+from cudnn.frost.tile_dsl.mask import MASK_NONE, MASK_PADDED, MASK_CAUSAL, MASK_SWA, compute_q_loop_bounds, swa_kv_lo_tile  # noqa: E402
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
 from cudnn.frost.tile_dsl.scheduler import lpt_l2_tile_coords  # noqa: E402
 
@@ -427,42 +427,30 @@ def _bprop_kernel(
     VV_RS = cutlass.Int32(Hkv) * cutlass.Int32(d_v)  # V read row stride (H_kv heads)
     kv_base = kv_tile * cutlass.Int32(tile_kv)
 
-    # ---- Causal compute-skip: a kv-tile [kv_base, kv_base+tile_kv) is attended
-    #      only by q >= kv_base (top-left causal) or q >= kv_base - causal_diag
-    #      (bottom-right).  Start the q-loop at the first such q-tile and run a
-    #      j-counter (q_iter = q_lo_tile + j) so the double-buffer stage parity is
-    #      relative to the loop start, not the absolute q-tile.  ~2x on causal
-    #      bprop.  Non-causal → q_lo_tile=0, n_iters=n_q_tiles (byte-identical).
-    #      SKV>SQ edge: kv-tiles past SQ get q_lo_tile >= n_q_tiles → 0 iters →
-    #      dV/dK epilogue writes 0 (those kv attend no q under causal).  The
-    #      prologue's valid_rows row-gate makes the OOB prefetch a zero-size copy.
-    if cutlass.const_expr(mask_flags & MASK_CAUSAL):
-        # A kv-tile [kv_base, kv_base+tile_kv) is attended by q whenever
-        # kv <= q + causal_diag + right_bound (band widening), i.e. the first
-        # attending q is (kv_base - causal_diag) - right_bound (BR) / kv_base -
-        # right_bound (TL).  Subtract right_bound so band-right widening doesn't
-        # drop the right_bound queries that straddle the previous kv-tile (else
-        # their dQ + this tile's dK/dV lose those contributions).  right_bound==0
-        # → byte-identical to the plain-causal skip.
-        _q_lo_abs = ((kv_base - causal_diag) if cutlass.const_expr(causal_bottom_right) else kv_base) - right_bound
-        _q_lo_t = _q_lo_abs // cutlass.Int32(tile_q)
-        q_lo_tile = cutlass.Int32(arith.maxsi(_q_lo_t.ir_value(), cutlass.Int32(0).ir_value()))
-    else:
-        q_lo_tile = cutlass.Int32(0)
-    n_iters = cutlass.Int32(arith.maxsi((n_q_tiles_eff - q_lo_tile).ir_value(), cutlass.Int32(0).ir_value()))
-    # ---- SWA compute-skip (upper bound): the window keeps kv >= anchor(q) - W
-    #      (anchor = q, or q + causal_diag under bottom-right; see _mask_p), so
-    #      no q >= kv_base + tile_kv + W - diag attends this kv-tile.  Cap the
-    #      q-loop there (the forward trims kv_left the same way).  Fully-masked
-    #      tiles run 0 iters and the epilogue stores dK = dV = 0.
-    if cutlass.const_expr(mask_flags & MASK_SWA):
-        _q_hi_abs = kv_base + cutlass.Int32(tile_kv + swa_window)
-        if cutlass.const_expr(causal_bottom_right):
-            _q_hi_abs = _q_hi_abs - causal_diag
-        _q_hi_abs = cutlass.Int32(arith.maxsi(_q_hi_abs.ir_value(), cutlass.Int32(0).ir_value()))
-        _q_hi_t = (_q_hi_abs + cutlass.Int32(tile_q - 1)) // cutlass.Int32(tile_q)
-        _q_hi_t = cutlass.Int32(arith.minsi(_q_hi_t.ir_value(), n_q_tiles_eff.ir_value()))
-        n_iters = cutlass.Int32(arith.maxsi((_q_hi_t - q_lo_tile).ir_value(), cutlass.Int32(0).ir_value()))
+    # ---- Q-loop bounds (shared tile_dsl arithmetic, the KV-major dual of the
+    #      forward's compute_kv_loop_bounds): causal trims the q-loop from below
+    #      (q above the diagonal never attends this kv-tile; ~2x on causal
+    #      bprop), the sliding window trims it from above (the forward trims
+    #      kv_left the same way).  The j-counter runs from 0 (q_iter = q_lo_tile
+    #      + j) so the double-buffer stage parity is relative to the loop start.
+    #      Non-causal, no window -> [0, n_q_tiles_eff) (byte-identical).  A
+    #      kv-tile past every attending q (SKV > SQ causal edge, or a window that
+    #      ends before it) runs 0 iters and the epilogue stores dK = dV = 0.
+    #      Under THD the per-sequence lengths feed the diagonal and tile count.
+    _qb = compute_q_loop_bounds(
+        kv_base,
+        seqlen_q=s_q_b if cutlass.const_expr(THD_VARLEN) else q_bound,
+        seq_kv_len=s_kv_b if cutlass.const_expr(THD_VARLEN) else eff_skv,
+        n_q_tiles=n_q_tiles_eff,
+        window_left=swa_window,
+        mask_flags=mask_flags,
+        tile_q=tile_q,
+        tile_kv=tile_kv,
+        bottom_right=bool(causal_bottom_right),
+        window_right=right_bound,
+    )
+    q_lo_tile = _qb.lo
+    n_iters = cutlass.Int32(arith.maxsi((_qb.hi - _qb.lo).ir_value(), cutlass.Int32(0).ir_value()))
     # THD over-provisioned grid: this CTA's kv-tile may start past the packed
     # sequence's KV length (n_kv_tiles = ceil(max_skv/tile_kv) covers the longest
     # sequence).  Force 0 q-iters for such tiles → no compute, and the dV/dK
@@ -986,10 +974,11 @@ def _bprop_kernel(
         # A kv-tile's turn is its rank among the q-tile's visitors.  The visitor
         # set is contiguous in kv_tile: the causal q_lo skip removes only higher
         # kv-tiles, the window q_hi cap removes only lower ones, so it starts at
-        # kv_first = max((q_row0 + diag - W) // tile_kv, 0) (the inverse of the
-        # q_hi cap; 0 without a window) and turn = kv_tile - kv_first.  Every
-        # visitor computes the same kv_first, so acquire (== turn) and release
-        # (turn + 1) agree.  Folds out when deterministic=False.
+        # the window's first kv-tile for the q-tile's first row (the forward's
+        # KV-loop lower bound, swa_kv_lo_tile; 0 without a window) and turn =
+        # kv_tile - kv_first.  Every visitor computes the same kv_first, so
+        # acquire (== turn) and release (turn + 1) agree.  Folds out when
+        # deterministic=False.
         if cutlass.const_expr(deterministic):
             sem_idx = (batch * cutlass.Int32(H) + head) * sem_q_stride + q_iter
             sem_ptr = Pointer(cutlass.make_array_view(DQ_SEM).data_ptr() + sem_idx, dtype=cutlass.Int32)
@@ -997,9 +986,7 @@ def _bprop_kernel(
                 _q_row0 = q_iter * cutlass.Int32(tile_q)
                 if cutlass.const_expr(causal_bottom_right):
                     _q_row0 = _q_row0 + causal_diag
-                _kv_first = (_q_row0 - cutlass.Int32(swa_window)) // cutlass.Int32(tile_kv)
-                _kv_first = cutlass.Int32(arith.maxsi(_kv_first.ir_value(), cutlass.Int32(0).ir_value()))
-                relay_turn = kv_tile - _kv_first
+                relay_turn = kv_tile - swa_kv_lo_tile(_q_row0, swa_window, tile_kv)
             else:
                 relay_turn = kv_tile
             if tidx == cutlass.Int32(0):
