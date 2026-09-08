@@ -1,21 +1,22 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
 """
-A fused multi-head attention (FMHA) FP16/BF16 kernel for the NVIDIA Blackwell
-SM120 family (SM120 and SM121) using TMA K/V loads.
+A fused multi-head attention (FMHA) FP16/BF16 kernel for D=256 heads on the
+NVIDIA Blackwell SM120 family (SM120 and SM121) using TMA K/V loads.
 
-This example demonstrates an implementation of fused multi-head attention using
-SM80-era ``mma.sync.aligned.m16n8k16`` tensor cores and TMA loads for K/V tiles.
-The implementation fuses the Q*K^T matrix multiplication, softmax normalization,
-and softmax(Q*K^T)*V into a single kernel, avoiding intermediate data movement
-through global memory.
+This is the D=256 variant of ``prefill_f16_sm120.py``: the same fused Q*K^T,
+softmax, and softmax(Q*K^T)*V pipeline on SM80-era ``mma.sync.aligned.m16n8k16``
+tensor cores, with (256, 256) head tiles. To fit the larger Q, S, and O working
+set in registers, it keeps half of the Q tile in shared memory and gives every
+warp the full register budget.
 
 The kernel implements key optimizations including:
-- A dedicated load warp that streams K/V tiles into shared memory using TMA and
-  mbarrier completion
-- Q fragments loaded directly from global memory into registers to reduce shared
-  memory footprint
+- All warps compute; an elected lane of warp 0 also issues the K/V TMA loads
+- Half of each warp's Q tile lives in registers, the other half in shared memory
+  and is reloaded once per KV tile
+- Lazy O rescale: the running row max only moves when a tile raises it by more
+  than ``RESCALE_THRESHOLD``, so most KV tiles skip the O correction
 - Online softmax fused into the main loop, with per-lane registers and intra-warp
   threadquad shuffles for max/sum reductions across the 4 lanes that share a Q-row
 - Shared-memory epilogue staging that aliases the K/V buffer after compute warps
@@ -30,12 +31,12 @@ The kernel implements key optimizations including:
 
 Constraints:
 - Supported input dtypes: Float16 and BFloat16, output dtype must match input dtype
-- Runtime head dimensions must be multiples of 8 up to 256 (TMA 16-byte
-  global-stride rule); the kernel compiles at head TILES rounded up to 16 and
-  TMA zero-fills the pad columns (the head-dim ENVELOPE)
+- Head tiles are (256, 256): runtime head dimensions 241..256 in multiples of 8
+  (TMA 16-byte global-stride rule); TMA zero-fills the pad columns
 - Q heads must be divisible by the number of K/V heads
 - Q/K/V/O use compact BSHD storage
-- Supported CTA Q/KV tiles are 128 or 64
+- Supported CTA (Q, KV) tiles are (128, 64) and (64, 64): a 128-wide KV tile does
+  not fit in SMEM at these head tiles
 - K/V pipeline and output staging storage must fit within the target SM120 SMEM
   capacity
 """
@@ -73,13 +74,14 @@ from cudnn.sdpa.fwd.kernels._common_sm120 import (
     nvvm_threadquad_reduction_sum,
     pack_to_i32,
 )
+from cudnn.sdpa.fwd.config_sm100 import rescale_threshold
 from cudnn.sdpa.fwd.config_sm120 import (
+    D256_FLAVOR,
     HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SEQ_KV_TILES,
     SEQ_Q_TILES as _SEQ_Q_TILES,
-    SUPPORTED_HEAD_TILES as _SUPPORTED_HEAD_TILES,
     TemplateParams,
-    register_budgets,
+    pick_flavor,
     validate_params,
 )
 
@@ -119,8 +121,11 @@ class SM120FusedMultiHeadAttentionForward:
 
     SEQ_Q_TILES = _SEQ_Q_TILES
     SEQ_KV_TILES = _SEQ_KV_TILES
-    SUPPORTED_HEAD_TILES = _SUPPORTED_HEAD_TILES
+    SUPPORTED_HEAD_TILES = (256,)
     MMA_TILER = (16, 8, 16)  # mma.sync.aligned.m16n8k16
+    # Lazy rescale: a tile max at most this far (log2 units of the scaled scores)
+    # above the running row max is not adopted, so the O correction stays 1.0.
+    RESCALE_THRESHOLD = rescale_threshold(PARAMS.dtype_qkv)
 
     @staticmethod
     def is_layout_supported(
@@ -200,11 +205,11 @@ class SM120FusedMultiHeadAttentionForward:
             ``(H, head_stride)`` (FlashAttention's ``softmax_lse`` layout; tokens
             contiguous within a head, ``head_stride >= T``) instead of the default
             token-major ``(T, H)``.
-        :param head_tile_qk: Q/K head TILE (the QK^T contraction width). Must
-            be a multiple of 16 between 16 and 256, inclusive. Runtime head
-            dims may be any multiple of 8 that rounds up to this tile — the
-            TMA descriptors keep the actual extents and zero-fill the pad
-            columns (the head-dim ENVELOPE).
+        :param head_tile_qk: Q/K head TILE (the QK^T contraction width): 256,
+            the one tile this kernel is built for. Runtime head dims may be any
+            multiple of 8 that rounds up to it (248 or 256) — the TMA
+            descriptors keep the actual extents and zero-fill the pad columns
+            (the head-dim ENVELOPE).
         :param head_tile_v: V/O head TILE (the P@V output width). Same
             constraint as ``head_tile_qk``.
         :param q_tile: Query sequence tile size.
@@ -260,26 +265,19 @@ class SM120FusedMultiHeadAttentionForward:
         # Warp roles
         if self.q_tile == 128:
             self.compute_warp_ids = (0, 1, 2, 3, 4, 5, 6, 7)
-            self.load_warp_id = 8
-            self.empty_warp_ids = (9, 10, 11)
-            self.num_warps = 12
+            self.num_warps = 8
         else:
             self.compute_warp_ids = (0, 1, 2, 3)
-            self.load_warp_id = 4
-            self.empty_warp_ids = (5, 6, 7)
-            self.num_warps = 8
+            self.num_warps = 4
         self.num_compute_warps = len(self.compute_warp_ids)
-        self.num_load_warps = 1
-        self.load_regs, self.compute_regs = register_budgets(self.q_tile)
 
         self.bar_compute_sync = 1
         self.bar_k_consumed = 2
         self.bar_v_consumed = 3
 
         self.threads_per_cta = cute.arch.WARP_SIZE * self.num_warps
-        self.threads_load = cute.arch.WARP_SIZE * self.num_load_warps
         self.threads_compute = cute.arch.WARP_SIZE * self.num_compute_warps
-        self.threads_kv_pipeline = self.threads_compute + self.threads_load
+        self.threads_kv_pipeline = self.threads_compute
 
         self._setup_attributes()
 
@@ -296,6 +294,9 @@ class SM120FusedMultiHeadAttentionForward:
         self.qk_d_frags = self.head_tile_qk // self.MMA_TILER[2]
         self.pv_v_frags = self.kv_tile // self.MMA_TILER[2]
         self.pv_d_frags = self.head_tile_v // self.MMA_TILER[1]
+        # Half of the Q tile stays in shared memory to reduce register pressure
+        self.q_smem_frags = self.qk_d_frags // 2
+        self.q_reg_frags = self.qk_d_frags - self.q_smem_frags
 
         # TMA
         def get_swizzle(head_tile: int):
@@ -389,9 +390,11 @@ class SM120FusedMultiHeadAttentionForward:
             offsets.
         :return: Packed Q fragments arranged for ``mma.sync`` A operands.
         """
+        # One spare fragment slot at the end: mma_qk reloads the upper
+        # d-fragments from shared memory into it.
         q_regs = cutlass.Array(
             cutlass.Int32,
-            self.qk_d_frags * 4,
+            (self.q_reg_frags + 1) * 4,
             alignment=16,
         )
 
@@ -401,8 +404,9 @@ class SM120FusedMultiHeadAttentionForward:
 
         row0_in_cta = basic_params.q_warp_row0 + row0
         col0_in_cta = col0
+        q_smem_base = (basic_params.compute_warp_idx * self.q_smem_frags * 32 + basic_params.lane) * 4
         q_regs_offset = 0
-        for _ in cutlass.range_constexpr(self.qk_d_frags):
+        for d_frag in cutlass.range_constexpr(self.qk_d_frags):
             mma_offsets_in_cta = (
                 (row0_in_cta, col0_in_cta),
                 (row0_in_cta + 8, col0_in_cta),
@@ -419,10 +423,15 @@ class SM120FusedMultiHeadAttentionForward:
                 if cur_q_seq_idx < basic_params.seqlen_q and col_in_cta < basic_params.head_dim_qk:
                     q_pair = (basic_params.q_ptr + basic_params.q_head_off + q_row_off + col_in_cta).load(count=2, alignment=4)
                     q_packed = q_pair.bitcast(cutlass.Int32)[0]
-                q_regs[q_regs_offset + i] = q_packed
+                if cutlass.const_expr(d_frag >= self.q_reg_frags):
+                    # Upper-half d-fragments go to shared memory; mma_qk reloads them once per KV tile
+                    basic_params.sQ[q_smem_base + (d_frag - self.q_reg_frags) * 32 * 4 + i] = q_packed
+                else:
+                    q_regs[q_regs_offset + i] = q_packed
 
             col0_in_cta += self.MMA_TILER[2]
-            q_regs_offset += 4
+            if cutlass.const_expr(d_frag < self.q_reg_frags):
+                q_regs_offset += 4
 
         return q_regs
 
@@ -472,10 +481,15 @@ class SM120FusedMultiHeadAttentionForward:
             )
             return prims.ldmatrix(k_smem_ptr, 4, prims.MMALayout.ROW)
 
-        for k_frag_pair in cutlass.range_constexpr(self.qk_k_frags // 2):
-            for d_frag in cutlass.range_constexpr(self.qk_d_frags):
+        q_smem_base = (basic_params.compute_warp_idx * self.q_smem_frags * 32 + basic_params.lane) * 4
+        for d_frag in cutlass.range_constexpr(self.qk_d_frags):
+            q_off = d_frag * 4
+            if cutlass.const_expr(d_frag >= self.q_reg_frags):
+                # Upper d-fragment: reload it from shared memory into the spare slot.
+                q_off = self.q_reg_frags * 4
+                q_regs[q_off:4] = (basic_params.sQ.data_ptr() + q_smem_base + (d_frag - self.q_reg_frags) * 32 * 4).load(count=4, alignment=16)
+            for k_frag_pair in cutlass.range_constexpr(self.qk_k_frags // 2):
                 k_vec = load_k_frag_pair(k_frag_pair, d_frag)
-                q_off = d_frag * 4
                 s_off = (k_frag_pair * 2) * 4
                 s_regs[s_off:4] = mma_m16n8k16_f32(
                     q_regs[q_off + 0],
@@ -594,7 +608,14 @@ class SM120FusedMultiHeadAttentionForward:
                 new_max = cur_max
             else:
                 row_max_prev = row_max[row_half]
-                new_max = cute.arch.fmax(row_max_prev, cur_max)
+                # Only adopt a new row max when it exceeds the old one by more
+                # than RESCALE_THRESHOLD; otherwise old_scale stays exactly 1.0.
+                update = (cur_max - row_max_prev) * softmax_scale_log2 > self.RESCALE_THRESHOLD
+                if row_max_prev == -cutlass.Float32.inf:
+                    update = cur_max > -cutlass.Float32.inf
+                new_max = row_max_prev
+                if update:
+                    new_max = cur_max
                 need_correct = True
                 if cutlass.const_expr(in_mask_steps):
                     need_correct = new_max > -cutlass.Float32.inf
@@ -640,12 +661,15 @@ class SM120FusedMultiHeadAttentionForward:
             else:
                 row_sum[row_half] = row_sum[row_half] * old_scale + tile_sum
 
-                for d_frag in cutlass.range_constexpr(self.pv_d_frags):
-                    o_off = d_frag * 4 + row_half * 2
-                    o_regs[o_off + 0], o_regs[o_off + 1] = fmul2(
-                        (o_regs[o_off + 0], o_regs[o_off + 1]),
-                        (old_scale, old_scale),
-                    )
+                # Skip the O rescale when every lane's correction is 1.0.
+                rescale = ~prims.vote_sync(0xFFFFFFFF, old_scale == cutlass.Float32(1.0), prims.VoteSync.ALL)
+                if rescale:
+                    for d_frag in cutlass.range_constexpr(self.pv_d_frags):
+                        o_off = d_frag * 4 + row_half * 2
+                        o_regs[o_off + 0], o_regs[o_off + 1] = fmul2(
+                            (o_regs[o_off + 0], o_regs[o_off + 1]),
+                            (old_scale, old_scale),
+                        )
 
         return s_regs
 
@@ -758,7 +782,23 @@ class SM120FusedMultiHeadAttentionForward:
             pass
 
         s_regs = self.mma_qk(basic_params, mma_params, q_regs)
-        prims.barrier_cta_arrive(self.bar_k_consumed, self.threads_kv_pipeline)
+        # Warp 0 waits until every warp has read sK, then issues the next K tile's
+        # TMA load while the other warps run softmax.
+        if basic_params.q_warp_row0 == 0:
+            prims.barrier_cta_sync(self.bar_k_consumed, thread_count=self.threads_kv_pipeline)
+            if kv_tile_idx - 1 >= basic_params.min_kv_tile:
+                self.load_one_kv_tile(
+                    mma_params.sK,
+                    basic_params.tma_k_desc,
+                    basic_params.k_tma_mbar,
+                    basic_params.tma_batch_idx,
+                    basic_params.kv_head_idx,
+                    basic_params.kv_row_base + (kv_tile_idx - 1) * self.kv_tile,
+                    is_v=False,
+                    envelope=basic_params.k_envelope,
+                )
+        else:
+            prims.barrier_cta_arrive(self.bar_k_consumed, self.threads_kv_pipeline)
 
         while not prims.mbarrier_try_wait_parity(basic_params.v_tma_mbar, tma_phase):
             pass
@@ -785,7 +825,21 @@ class SM120FusedMultiHeadAttentionForward:
                 self.v_swizzle_chunk_elems,
             )
         self.mma_pv(basic_params, mma_params, p_regs)
-        prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
+        if basic_params.q_warp_row0 == 0:
+            prims.barrier_cta_sync(self.bar_v_consumed, thread_count=self.threads_kv_pipeline)
+            if kv_tile_idx - 1 >= basic_params.min_kv_tile:
+                self.load_one_kv_tile(
+                    mma_params.sV,
+                    basic_params.tma_v_desc,
+                    basic_params.v_tma_mbar,
+                    basic_params.tma_batch_idx,
+                    basic_params.kv_head_idx,
+                    basic_params.kv_row_base + (kv_tile_idx - 1) * self.kv_tile,
+                    is_v=True,
+                    envelope=basic_params.v_envelope,
+                )
+        else:
+            prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
 
     @cute.jit
     def _run_unit(
@@ -804,6 +858,7 @@ class SM120FusedMultiHeadAttentionForward:
         sKV,
         sK,
         sV,
+        sQ,
         k_tma_mbar,
         v_tma_mbar,
         lane,
@@ -819,9 +874,8 @@ class SM120FusedMultiHeadAttentionForward:
         last three arguments.
 
         Split out of ``kernel`` so the persistent THD path can call it once per
-        claimed unit. SMEM and the per-warp register budget belong to the CTA,
-        not to the unit, so they stay in the caller and arrive here as
-        arguments — the same convention ``load_one_kv_tile`` already uses.
+        claimed unit. SMEM belongs to the CTA, not to the unit, so it stays in
+        the caller and arrives here as arguments.
         """
         q_seq_idx = q_tile_idx * (self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile)
 
@@ -917,177 +971,144 @@ class SM120FusedMultiHeadAttentionForward:
             min_kv_tile = _lo
             num_kv_tiles = _lo + _per + _extra
         has_kv_work = num_kv_tiles > 0 and (num_kv_tiles - 1) >= min_kv_tile
-        # Tiles the load warp will push through the K/V mbarriers for this unit.
+        # Tiles warp 0 will push through the K/V mbarriers for this unit.
         # Branchless on purpose: when has_kv_work is false the difference is
         # already <= 0, so this is exactly zero.
         tiles_loaded = cute.math.max(cutlass.Int32(0), num_kv_tiles - min_kv_tile)
 
+        # THD collapses the packed view's batch coordinate to 0; the
+        # per-sequence token base rides the seq coordinate instead. Every
+        # K/V load (including the first) must apply both, or batch >= 1
+        # reads the wrong packed rows.
+        tma_batch_idx = batch_idx
+        if cutlass.const_expr(self.thd_varlen):
+            tma_batch_idx = cutlass.Int32(0)
         # /////////////////////////////////////////////////////////////////////////////
-        #  LOAD K/V
+        #  COMPUTE (every warp)
         # /////////////////////////////////////////////////////////////////////////////
-        if warp == self.load_warp_id:
-            prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
+        compute_warp_idx = warp
+        q_warp_row0 = compute_warp_idx * self.MMA_TILER[0]
 
-            # THD collapses the packed view's batch coordinate to 0; the
-            # per-sequence token base rides the seq coordinate instead. Every
-            # K/V load (including the first) must apply both, or batch >= 1
-            # reads the wrong packed rows.
-            tma_batch_idx = batch_idx
-            if cutlass.const_expr(self.thd_varlen):
-                tma_batch_idx = cutlass.Int32(0)
+        lane_div8 = lane // 8
+        lane_mod8 = lane % 8
+        lane_div16 = lane // 16
 
-            # The attention loop walks K/V tiles right-to-left so causal and
-            # tail-masked tiles are processed before fully unmasked tiles.
+        # Per-lane row_max and row_sum for online softmax. Each lane owns
+        # two Q rows: lane//4 and lane//4 + 8 within this compute warp.
+        row_max = cutlass.Array(cutlass.Float32, 2, alignment=16)
+        row_sum = cutlass.Array(cutlass.Float32, 2, alignment=16)
+        for i in cutlass.range_constexpr(2):
+            row_max[i] = -cutlass.Float32.inf
+            row_sum[i] = 0.0
+
+        # Per-lane fp32 accumulator for O = P @ V.
+        o_regs = cutlass.Array(
+            cutlass.Float32,
+            self.pv_d_frags * 4,
+            alignment=16,
+        )
+        for i in cutlass.range_constexpr(self.pv_d_frags * 4):
+            o_regs[i] = 0.0
+
+        basic_params = SimpleNamespace(
+            phase_base=phase_base,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            head_dim_qk=head_dim_qk,
+            q_ptr=q_ptr,
+            batch_idx=batch_idx,
+            head_idx=head_idx,
+            q_seq_idx=q_seq_idx,
+            q_head_off=q_head_off,
+            q_seq_stride=q_seq_stride,
+            q_head_stride=q_head_stride,
+            q_warp_row0=q_warp_row0,
+            lane=lane,
+            lane_div8=lane_div8,
+            lane_mod8=lane_mod8,
+            lane_div16=lane_div16,
+            tma_k_desc=tma_k_desc,
+            tma_v_desc=tma_v_desc,
+            k_tma_mbar=k_tma_mbar,
+            v_tma_mbar=v_tma_mbar,
+            sQ=sQ,
+            compute_warp_idx=compute_warp_idx,
+            tma_batch_idx=tma_batch_idx,
+            kv_head_idx=kv_head_idx,
+            kv_row_base=kv_row_base,
+            min_kv_tile=min_kv_tile,
+            k_envelope=k_envelope,
+            v_envelope=v_envelope,
+        )
+        mma_params = SimpleNamespace(
+            sK=sK,
+            sV=sV,
+            o_regs=o_regs,
+        )
+        softmax_params = SimpleNamespace(
+            row_max=row_max,
+            row_sum=row_sum,
+            softmax_scale_log2=softmax_scale_log2,
+        )
+
+        # Warp 0 issues the first K/V tile's TMA loads; compute_one_kv_tile
+        # issues the rest.
+        if warp == 0 and has_kv_work:
             kv_seq_idx = (num_kv_tiles - 1) * self.kv_tile
-            if has_kv_work:
-                self.load_one_kv_tile(
-                    sK,
-                    tma_k_desc,
-                    k_tma_mbar,
-                    tma_batch_idx,
-                    kv_head_idx,
-                    kv_row_base + kv_seq_idx,
-                    is_v=False,
-                    envelope=k_envelope,
+            self.load_one_kv_tile(sK, tma_k_desc, k_tma_mbar, tma_batch_idx, kv_head_idx, kv_row_base + kv_seq_idx, is_v=False, envelope=k_envelope)
+            self.load_one_kv_tile(sV, tma_v_desc, v_tma_mbar, tma_batch_idx, kv_head_idx, kv_row_base + kv_seq_idx, is_v=True, envelope=v_envelope)
+
+        # Load Q into registers.
+        q_regs = self.load_q_tile(basic_params)
+
+        # Main attention loop.
+        mask_steps = 1
+        if cutlass.const_expr(self.is_causal):
+            mask_steps = ceil_div(self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile, self.kv_tile)
+            if cutlass.const_expr(self.diag_shifted):
+                # A translated diagonal (bottom-right anchoring or a right
+                # band) can straddle one additional KV tile; the frontier
+                # width itself is R-independent — the band only translates
+                # the diagonal.
+                mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
+        left_mask_steps = 1
+        if cutlass.const_expr(self.window_size_left is not None):
+            left_mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
+
+        kv_tile_idx = num_kv_tiles - 1
+        # Phase 1: potentially masked iterations.
+        for step in cutlass.range_constexpr(mask_steps):
+            if kv_tile_idx >= min_kv_tile:
+                self.compute_one_kv_tile(
+                    basic_params,
+                    mma_params,
+                    softmax_params,
+                    q_regs,
+                    num_kv_tiles,
+                    kv_tile_idx,
+                    in_mask_steps=True,
+                    is_first_kv_tile=(step == 0),
                 )
-                self.load_one_kv_tile(
-                    sV,
-                    tma_v_desc,
-                    v_tma_mbar,
-                    tma_batch_idx,
-                    kv_head_idx,
-                    kv_row_base + kv_seq_idx,
-                    is_v=True,
-                    envelope=v_envelope,
-                )
+            kv_tile_idx -= 1
 
-                kv_seq_idx -= self.kv_tile
-                while kv_seq_idx >= min_kv_tile * self.kv_tile:
-                    prims.barrier_cta_sync(
-                        self.bar_k_consumed,
-                        thread_count=self.threads_kv_pipeline,
-                    )
-                    self.load_one_kv_tile(
-                        sK,
-                        tma_k_desc,
-                        k_tma_mbar,
-                        tma_batch_idx,
-                        kv_head_idx,
-                        kv_row_base + kv_seq_idx,
-                        is_v=False,
-                        envelope=k_envelope,
-                    )
-
-                    prims.barrier_cta_sync(
-                        self.bar_v_consumed,
-                        thread_count=self.threads_kv_pipeline,
-                    )
-                    self.load_one_kv_tile(
-                        sV,
-                        tma_v_desc,
-                        v_tma_mbar,
-                        tma_batch_idx,
-                        kv_head_idx,
-                        kv_row_base + kv_seq_idx,
-                        is_v=True,
-                        envelope=v_envelope,
-                    )
-                    kv_seq_idx -= self.kv_tile
-                # Consume the LAST tile's consumer arrivals. compute_one_kv_tile
-                # arrives at both barriers for every tile it processes (N), but
-                # the loop above only syncs between tiles (N-1), so without this
-                # each pass leaves one unmatched arrival pending on each barrier.
-                # That is invisible while a CTA runs a single tile range -- the
-                # leftover dies with the CTA -- but a CTA that starts a SECOND
-                # range finds the barrier already part-signalled, satisfies its
-                # first sync immediately, and issues the next
-                # mbarrier.arrive.expect_tx while the previous transaction is
-                # still outstanding.
-                prims.barrier_cta_sync(self.bar_k_consumed, thread_count=self.threads_kv_pipeline)
-                prims.barrier_cta_sync(self.bar_v_consumed, thread_count=self.threads_kv_pipeline)
-        # /////////////////////////////////////////////////////////////////////////////
-        #  COMPUTE
-        # /////////////////////////////////////////////////////////////////////////////
-        elif warp < self.load_warp_id:
-            prims.setmaxregister(self.compute_regs, prims.SetMaxRegisterAction.INCREASE)
-
-            compute_warp_idx = warp
-            q_warp_row0 = compute_warp_idx * self.MMA_TILER[0]
-
-            lane_div8 = lane // 8
-            lane_mod8 = lane % 8
-            lane_div16 = lane // 16
-
-            # Per-lane row_max and row_sum for online softmax. Each lane owns
-            # two Q rows: lane//4 and lane//4 + 8 within this compute warp.
-            row_max = cutlass.Array(cutlass.Float32, 2, alignment=16)
-            row_sum = cutlass.Array(cutlass.Float32, 2, alignment=16)
-            for i in cutlass.range_constexpr(2):
-                row_max[i] = -cutlass.Float32.inf
-                row_sum[i] = 0.0
-
-            # Per-lane fp32 accumulator for O = P @ V.
-            o_regs = cutlass.Array(
-                cutlass.Float32,
-                self.pv_d_frags * 4,
-                alignment=16,
+        # Phase 2: remaining fully unmasked iterations.
+        while kv_tile_idx > min_kv_tile + (left_mask_steps - 1):
+            self.compute_one_kv_tile(
+                basic_params,
+                mma_params,
+                softmax_params,
+                q_regs,
+                num_kv_tiles,
+                kv_tile_idx,
+                in_mask_steps=False,
+                is_first_kv_tile=False,
             )
-            for i in cutlass.range_constexpr(self.pv_d_frags * 4):
-                o_regs[i] = 0.0
+            kv_tile_idx -= 1
 
-            basic_params = SimpleNamespace(
-                phase_base=phase_base,
-                seqlen_q=seqlen_q,
-                seqlen_k=seqlen_k,
-                head_dim_qk=head_dim_qk,
-                q_ptr=q_ptr,
-                batch_idx=batch_idx,
-                head_idx=head_idx,
-                q_seq_idx=q_seq_idx,
-                q_head_off=q_head_off,
-                q_seq_stride=q_seq_stride,
-                q_head_stride=q_head_stride,
-                q_warp_row0=q_warp_row0,
-                lane=lane,
-                lane_div8=lane_div8,
-                lane_mod8=lane_mod8,
-                lane_div16=lane_div16,
-                tma_k_desc=tma_k_desc,
-                tma_v_desc=tma_v_desc,
-                k_tma_mbar=k_tma_mbar,
-                v_tma_mbar=v_tma_mbar,
-            )
-            mma_params = SimpleNamespace(
-                sK=sK,
-                sV=sV,
-                o_regs=o_regs,
-            )
-            softmax_params = SimpleNamespace(
-                row_max=row_max,
-                row_sum=row_sum,
-                softmax_scale_log2=softmax_scale_log2,
-            )
-
-            # Load Q into registers.
-            q_regs = self.load_q_tile(basic_params)
-
-            # Main attention loop.
-            mask_steps = 1
-            if cutlass.const_expr(self.is_causal):
-                mask_steps = ceil_div(self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile, self.kv_tile)
-                if cutlass.const_expr(self.diag_shifted):
-                    # A translated diagonal (bottom-right anchoring or a right
-                    # band) can straddle one additional KV tile; the frontier
-                    # width itself is R-independent — the band only translates
-                    # the diagonal.
-                    mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
-            left_mask_steps = 1
-            if cutlass.const_expr(self.window_size_left is not None):
-                left_mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
-
-            kv_tile_idx = num_kv_tiles - 1
-            # Phase 1: potentially masked iterations.
-            for step in cutlass.range_constexpr(mask_steps):
+        # The sliding-window left edge sweeps across the Q tile and can
+        # therefore cut through more than one K/V tile.
+        if cutlass.const_expr(self.window_size_left is not None):
+            for _ in cutlass.range_constexpr(left_mask_steps):
                 if kv_tile_idx >= min_kv_tile:
                     self.compute_one_kv_tile(
                         basic_params,
@@ -1097,12 +1118,15 @@ class SM120FusedMultiHeadAttentionForward:
                         num_kv_tiles,
                         kv_tile_idx,
                         in_mask_steps=True,
-                        is_first_kv_tile=(step == 0),
+                        is_first_kv_tile=False,
                     )
                 kv_tile_idx -= 1
-
-            # Phase 2: remaining fully unmasked iterations.
-            while kv_tile_idx > min_kv_tile + (left_mask_steps - 1):
+        else:
+            # Guard against the split's START, not 0. Without KV split
+            # min_kv_tile is 0 on this branch so the two agree, but a split
+            # begins partway into the KV range -- and warp 0 bounds the K/V
+            # refills it issues by min_kv_tile.
+            if kv_tile_idx >= min_kv_tile:
                 self.compute_one_kv_tile(
                     basic_params,
                     mma_params,
@@ -1113,186 +1137,142 @@ class SM120FusedMultiHeadAttentionForward:
                     in_mask_steps=False,
                     is_first_kv_tile=False,
                 )
-                kv_tile_idx -= 1
 
-            # The sliding-window left edge sweeps across the Q tile and can
-            # therefore cut through more than one K/V tile.
-            if cutlass.const_expr(self.window_size_left is not None):
-                for _ in cutlass.range_constexpr(left_mask_steps):
-                    if kv_tile_idx >= min_kv_tile:
-                        self.compute_one_kv_tile(
-                            basic_params,
-                            mma_params,
-                            softmax_params,
-                            q_regs,
-                            num_kv_tiles,
-                            kv_tile_idx,
-                            in_mask_steps=True,
-                            is_first_kv_tile=False,
-                        )
-                    kv_tile_idx -= 1
+        # Per-row O normalization factor and natural-log LSE.
+        # The thread-quad reductions left row_max / row_sum replicated across
+        # the four lanes that share a Q row, so every lane finalizes the two
+        # rows it owns without further exchange. row_max holds the raw (unscaled)
+        # score max; the scale is applied in log2 domain and converted with ln(2).
+        # With has_sink, the per-head sink logit joins the softmax denominator
+        # as a virtual column with no V row: it rescales O, enters the LSE,
+        # and gives a row with no visible key a finite LSE (the sink alone).
+        LN2 = cutlass.Float32(0.6931471805599453)
+        row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
+        row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
+        for row_half in cutlass.range_constexpr(2):
+            row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
+            if cutlass.const_expr(self.has_sink):
+                sinks_arr = cutlass.make_array_view(sinks)
+                _sink_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + (q_warp_row0 + (lane // 4) + row_half * 8) % self.qh_per_kh
+                sink_logit = cutlass.Float32(sinks_arr[_sink_head])
+                new_max = cute.arch.fmax(row_max_nat, sink_logit)
+                # alpha re-normalizes the loop's accumulator and sum from
+                # row_max_nat to the sink-extended max; it is 0 for a row
+                # with no visible key, so O := 0 falls out.
+                alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
+                new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
+                row_sum_inv[row_half] = alpha / new_sum
+                row_lse[row_half] = new_max + cute.math.log(new_sum, fastmath=True)
             else:
-                # Guard against the split's START, not 0. Without KV split
-                # min_kv_tile is 0 on this branch so the two agree, but a split
-                # begins partway into the KV range -- and the load warp bounds
-                # its loop by min_kv_tile, so testing >= 0 here makes the compute
-                # warps run one tile the loader never fetches and the CTA
-                # deadlocks on the TMA barrier.
-                if kv_tile_idx >= min_kv_tile:
-                    self.compute_one_kv_tile(
-                        basic_params,
-                        mma_params,
-                        softmax_params,
-                        q_regs,
-                        num_kv_tiles,
-                        kv_tile_idx,
-                        in_mask_steps=False,
-                        is_first_kv_tile=False,
-                    )
-
-            # Per-row O normalization factor and natural-log LSE.
-            # The thread-quad reductions left row_max / row_sum replicated across
-            # the four lanes that share a Q row, so every lane finalizes the two
-            # rows it owns without further exchange. row_max holds the raw (unscaled)
-            # score max; the scale is applied in log2 domain and converted with ln(2).
-            # With has_sink, the per-head sink logit joins the softmax denominator
-            # as a virtual column with no V row: it rescales O, enters the LSE,
-            # and gives a row with no visible key a finite LSE (the sink alone).
-            LN2 = cutlass.Float32(0.6931471805599453)
-            row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
-            row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
-            for row_half in cutlass.range_constexpr(2):
-                row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
-                if cutlass.const_expr(self.has_sink):
-                    sinks_arr = cutlass.make_array_view(sinks)
-                    _sink_head = (
-                        q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + (q_warp_row0 + (lane // 4) + row_half * 8) % self.qh_per_kh
-                    )
-                    sink_logit = cutlass.Float32(sinks_arr[_sink_head])
-                    new_max = cute.arch.fmax(row_max_nat, sink_logit)
-                    # alpha re-normalizes the loop's accumulator and sum from
-                    # row_max_nat to the sink-extended max; it is 0 for a row
-                    # with no visible key, so O := 0 falls out.
-                    alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
-                    new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
-                    row_sum_inv[row_half] = alpha / new_sum
-                    row_lse[row_half] = new_max + cute.math.log(new_sum, fastmath=True)
-                else:
-                    inv = cutlass.Float32(0.0)
-                    if row_sum[row_half] > 0.0:
-                        inv = cute.math.rcp(row_sum[row_half], approx=True, ftz=True)
-                    row_sum_inv[row_half] = inv
-                    lse_val = row_max_nat + cute.math.log(
-                        cute.math.max(row_sum[row_half], cutlass.Float32(1e-30)),
-                        fastmath=True,
-                    )
-                    # Rows with no visible key write -inf / O := 0.
-                    if row_sum[row_half] <= 0.0:
-                        lse_val = -cutlass.Float32.inf
-                    row_lse[row_half] = lse_val
-
-            if cutlass.const_expr(lse is not None):
-                if lane % 4 == 0:
-                    lse_arr = cutlass.make_array_view(lse)
-                    for row_half in cutlass.range_constexpr(2):
-                        _lse_row_in_cta = q_warp_row0 + (lane // 4) + row_half * 8
-                        lse_q_idx = q_seq_idx + (_lse_row_in_cta if cutlass.const_expr(not self.pack_gqa) else _lse_row_in_cta // self.qh_per_kh)
-                        _lse_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + _lse_row_in_cta % self.qh_per_kh
-                        lse_out = cutlass.Float32(row_lse[row_half])
-                        if cutlass.const_expr(self.thd_varlen):
-                            # Packed ragged-Stats LSE, written directly in the
-                            # caller's declared layout: token-major (T, H) or
-                            # head-major (H, head_stride).
-                            # Rows past this sequence's Q length belong to the
-                            # NEXT sequence — never written, and there is no
-                            # padded region to trim.
-                            if lse_q_idx < seqlen_q:
-                                if cutlass.const_expr(self.thd_lse_head_major):
-                                    lse_row = lse_arr[_lse_head, :]
-                                    lse_row[q_row_base + lse_q_idx] = lse_out
-                                else:
-                                    lse_row = lse_arr[q_row_base + lse_q_idx, :]
-                                    lse_row[_lse_head] = lse_out
-                        else:
-                            # Rows at/past this batch's Q length trim to -inf.
-                            if lse_q_idx >= seqlen_q:
-                                lse_out = -cutlass.Float32.inf
-                            if lse_q_idx < q.shape[1]:
-                                lse_arr[o_batch_idx, _lse_head, lse_q_idx] = lse_out
-
-            prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
-
-            # Epilogue: normalize O, stage it through an stmatrix-friendly SMEM
-            # layout, then store one contiguous 8-element vector per lane to GMEM.
-            sO = sKV
-            row_sum_inv_vec = cutlass.Vector.from_elements(
-                (
-                    row_sum_inv[0],
-                    row_sum_inv[0],
-                    row_sum_inv[1],
-                    row_sum_inv[1],
-                    row_sum_inv[0],
-                    row_sum_inv[0],
-                    row_sum_inv[1],
-                    row_sum_inv[1],
-                ),
-                cutlass.Float32,
-            )
-            for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
-                o_off = (d_frag_pair * 2) * 4
-                o_scaled = fmul2(o_regs[o_off:8], row_sum_inv_vec)
-                o_packed = o_scaled.to(o.dtype).bitcast(cutlass.Int32)
-                sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * (16 * 16) + lane * 8
-                prims.stmatrix(
-                    sO_ptr,
-                    o_packed,
-                    prims.MMALayout.ROW,
+                inv = cutlass.Float32(0.0)
+                if row_sum[row_half] > 0.0:
+                    inv = cute.math.rcp(row_sum[row_half], approx=True, ftz=True)
+                row_sum_inv[row_half] = inv
+                lse_val = row_max_nat + cute.math.log(
+                    cute.math.max(row_sum[row_half], cutlass.Float32(1e-30)),
+                    fastmath=True,
                 )
+                # Rows with no visible key write -inf / O := 0.
+                if row_sum[row_half] <= 0.0:
+                    lse_val = -cutlass.Float32.inf
+                row_lse[row_half] = lse_val
 
-            store_row = lane_mod8 + ((lane_div8) % 2) * 8
-            store_col = lane_div16 * 8
-            _store_row_in_cta = q_warp_row0 + store_row
-            store_q_seq_idx = q_seq_idx + (_store_row_in_cta if cutlass.const_expr(not self.pack_gqa) else _store_row_in_cta // self.qh_per_kh)
-            store_head_off = o_head_off
-            if cutlass.const_expr(self.pack_gqa and self.qh_per_kh != 1):
-                store_head_off = store_head_off + (_store_row_in_cta % self.qh_per_kh) * o_head_stride
-            for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
-                store_col_in_cta = d_frag_pair * 16 + store_col
-                if cutlass.const_expr(self.thd_varlen):
-                    # Packed storage: rows past this sequence's Q length are
-                    # the NEXT sequence's tokens — no store, and never the
-                    # dense path's zero-fill.
-                    if store_q_seq_idx < seqlen_q and store_col_in_cta < head_dim_v:
-                        gO_ptr = o_ptr + store_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
+        if cutlass.const_expr(lse is not None):
+            if lane % 4 == 0:
+                lse_arr = cutlass.make_array_view(lse)
+                for row_half in cutlass.range_constexpr(2):
+                    _lse_row_in_cta = q_warp_row0 + (lane // 4) + row_half * 8
+                    lse_q_idx = q_seq_idx + (_lse_row_in_cta if cutlass.const_expr(not self.pack_gqa) else _lse_row_in_cta // self.qh_per_kh)
+                    _lse_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + _lse_row_in_cta % self.qh_per_kh
+                    lse_out = cutlass.Float32(row_lse[row_half])
+                    if cutlass.const_expr(self.thd_varlen):
+                        # Packed ragged-Stats LSE, written directly in the
+                        # caller's declared layout: token-major (T, H) or
+                        # head-major (H, head_stride).
+                        # Rows past this sequence's Q length belong to the
+                        # NEXT sequence — never written, and there is no
+                        # padded region to trim.
+                        if lse_q_idx < seqlen_q:
+                            if cutlass.const_expr(self.thd_lse_head_major):
+                                lse_row = lse_arr[_lse_head, :]
+                                lse_row[q_row_base + lse_q_idx] = lse_out
+                            else:
+                                lse_row = lse_arr[q_row_base + lse_q_idx, :]
+                                lse_row[_lse_head] = lse_out
+                    else:
+                        # Rows at/past this batch's Q length trim to -inf.
+                        if lse_q_idx >= seqlen_q:
+                            lse_out = -cutlass.Float32.inf
+                        if lse_q_idx < q.shape[1]:
+                            lse_arr[o_batch_idx, _lse_head, lse_q_idx] = lse_out
+
+        prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
+
+        # Epilogue: normalize O, stage it through an stmatrix-friendly SMEM
+        # layout, then store one contiguous 8-element vector per lane to GMEM.
+        sO = sKV
+        row_sum_inv_vec = cutlass.Vector.from_elements(
+            (
+                row_sum_inv[0],
+                row_sum_inv[0],
+                row_sum_inv[1],
+                row_sum_inv[1],
+                row_sum_inv[0],
+                row_sum_inv[0],
+                row_sum_inv[1],
+                row_sum_inv[1],
+            ),
+            cutlass.Float32,
+        )
+        for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
+            o_off = (d_frag_pair * 2) * 4
+            o_scaled = fmul2(o_regs[o_off:8], row_sum_inv_vec)
+            o_packed = o_scaled.to(o.dtype).bitcast(cutlass.Int32)
+            sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * (16 * 16) + lane * 8
+            prims.stmatrix(
+                sO_ptr,
+                o_packed,
+                prims.MMALayout.ROW,
+            )
+
+        store_row = lane_mod8 + ((lane_div8) % 2) * 8
+        store_col = lane_div16 * 8
+        _store_row_in_cta = q_warp_row0 + store_row
+        store_q_seq_idx = q_seq_idx + (_store_row_in_cta if cutlass.const_expr(not self.pack_gqa) else _store_row_in_cta // self.qh_per_kh)
+        store_head_off = o_head_off
+        if cutlass.const_expr(self.pack_gqa and self.qh_per_kh != 1):
+            store_head_off = store_head_off + (_store_row_in_cta % self.qh_per_kh) * o_head_stride
+        for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
+            store_col_in_cta = d_frag_pair * 16 + store_col
+            if cutlass.const_expr(self.thd_varlen):
+                # Packed storage: rows past this sequence's Q length are
+                # the NEXT sequence's tokens — no store, and never the
+                # dense path's zero-fill.
+                if store_q_seq_idx < seqlen_q and store_col_in_cta < head_dim_v:
+                    gO_ptr = o_ptr + store_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
+                    sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * (16 * 16) + lane * 8
+                    gO_ptr.store(sO_ptr.load(count=8, alignment=16), alignment=16)
+            else:
+                if store_q_seq_idx < q.shape[1] and store_col_in_cta < head_dim_v:
+                    gO_ptr = o_ptr + store_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
+                    if store_q_seq_idx < seqlen_q:
                         sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * (16 * 16) + lane * 8
                         gO_ptr.store(sO_ptr.load(count=8, alignment=16), alignment=16)
-                else:
-                    if store_q_seq_idx < q.shape[1] and store_col_in_cta < head_dim_v:
-                        gO_ptr = o_ptr + store_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
-                        if store_q_seq_idx < seqlen_q:
-                            sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * (16 * 16) + lane * 8
-                            gO_ptr.store(sO_ptr.load(count=8, alignment=16), alignment=16)
-                        else:
-                            zero_vec = cutlass.Vector.from_elements(
-                                (
-                                    o.dtype(0.0),
-                                    o.dtype(0.0),
-                                    o.dtype(0.0),
-                                    o.dtype(0.0),
-                                    o.dtype(0.0),
-                                    o.dtype(0.0),
-                                    o.dtype(0.0),
-                                    o.dtype(0.0),
-                                ),
-                                o.dtype,
-                            )
-                            gO_ptr.store(zero_vec, alignment=16)
-
-        # /////////////////////////////////////////////////////////////////////////////
-        #  EMPTY
-        # /////////////////////////////////////////////////////////////////////////////
-        else:
-            prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
+                    else:
+                        zero_vec = cutlass.Vector.from_elements(
+                            (
+                                o.dtype(0.0),
+                                o.dtype(0.0),
+                                o.dtype(0.0),
+                                o.dtype(0.0),
+                                o.dtype(0.0),
+                                o.dtype(0.0),
+                                o.dtype(0.0),
+                                o.dtype(0.0),
+                            ),
+                            o.dtype,
+                        )
+                        gO_ptr.store(zero_vec, alignment=16)
 
         return tiles_loaded
 
@@ -1348,13 +1328,19 @@ class SM120FusedMultiHeadAttentionForward:
         )
         sK = sKV
         sV = sKV.subview(self.k_tile_elems)
+        sQ = cutlass.Array(
+            cutlass.Int32,
+            self.num_compute_warps * self.q_smem_frags * 32 * 4,
+            space=cutlass.AddressSpace.smem,
+            alignment=16,
+        )
         tma_mbar = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
         k_tma_mbar = tma_mbar
         v_tma_mbar = tma_mbar.subview(1)
 
         # Initialize the TMA completion barriers before any load or compute warp
         # can touch the K/V pipeline.
-        if warp == self.load_warp_id:
+        if warp == 0:
             if prims.elect_sync():
                 prims.prefetch_tensormap(tma_k_desc.get_ptr())
                 prims.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -1405,6 +1391,7 @@ class SM120FusedMultiHeadAttentionForward:
                     sKV,
                     sK,
                     sV,
+                    sQ,
                     k_tma_mbar,
                     v_tma_mbar,
                     lane,
@@ -1476,6 +1463,7 @@ class SM120FusedMultiHeadAttentionForward:
                 sKV,
                 sK,
                 sV,
+                sQ,
                 k_tma_mbar,
                 v_tma_mbar,
                 lane,
@@ -1731,7 +1719,7 @@ def compile(  # noqa: A001
     """Compile and cache one architecture-specific compact BSHD shape.
 
     ``d_qk`` is the Q/K head dim (QK^T contraction width) and ``d_v`` the V/O
-    head dim (P@V output width); they are independent, e.g. (192, 128).
+    head dim (P@V output width).
 
     THD specializations pack the batch: ``b`` is the real sequence count and
     ``sq``/``skv`` are IGNORED — the packed token totals are runtime values
@@ -1753,6 +1741,9 @@ def compile(  # noqa: A001
     caller-declared head-row stride (``>= T``, a shape — part of the cache key).
     """
 
+    # Head dims that do not tile to (256, 256) belong to prefill_f16_sm120.py.
+    if pick_flavor(d_qk, d_v, fp8=False) != D256_FLAVOR:
+        raise ValueError(f"SM120 SDPA d256 kernel: head dims ({d_qk}, {d_v}) do not tile to {D256_FLAVOR}")
     kernel = SM120FusedMultiHeadAttentionForward(
         in_dtype=STORAGE_DTYPE,
         out_dtype=STORAGE_DTYPE,
@@ -1767,8 +1758,8 @@ def compile(  # noqa: A001
         thd_varlen=PARAMS.thd_varlen,
         thd_batch=b,
         thd_lse_head_major=lse_head_major,
-        head_tile_qk=round_up_head_tile(d_qk),
-        head_tile_v=round_up_head_tile(d_v),
+        head_tile_qk=D256_FLAVOR[0],
+        head_tile_v=D256_FLAVOR[1],
         q_tile=PARAMS.q_tile,
         kv_tile=PARAMS.kv_tile,
         split_kv=PARAMS.split_kv,

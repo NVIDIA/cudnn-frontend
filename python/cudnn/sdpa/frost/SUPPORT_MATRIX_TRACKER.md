@@ -244,7 +244,8 @@ relying on it; do not read ❔ as either a guarantee or a rejection.
 
 Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
 `sdpa_bwd_sm120`. Head dims are a **continuum**, not per-model flavors: the
-kernel picks Q/K and V head tiles independently.
+kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
+tile at 256 on both sides run a dedicated template, `prefill_d256_f16_sm120.py` with the same support; fp8 has no such flavor).
 
 | Feature | FPROP<br>d ≤ 256, any ×8 | FPROP FP8<br>d ≤ 256, any ×16 | BPROP<br>d ≤ 256, any ×8 |
 |---|:--:|:--:|:--:|
