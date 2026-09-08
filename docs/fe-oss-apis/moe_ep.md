@@ -43,6 +43,9 @@ op = MoeEp(
 )
 ```
 
+`max_recv_size_per_rank` is the physical receive-pool size in token rows,
+including all per-expert padding. Padding is contained within this capacity.
+
 Native training requires `weight_interleave_size=32`. FC1 payloads then use
 alternating 32-element gate/up strips.
 

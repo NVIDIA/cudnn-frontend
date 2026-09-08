@@ -550,7 +550,7 @@ def test_autotune_sm107_inference_training_and_graph():
         intermediate_size=256,
         top_k=2,
         max_tokens_per_rank=training_args[0].shape[0],
-        max_recv_size_per_rank=(training_args[0].shape[0] * training_args[3].shape[1]),
+        max_recv_size_per_rank=2 * 128,
         drop_on_overflow=True,
         combine_format="bf16",
         weight_interleave_size=32,

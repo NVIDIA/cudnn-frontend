@@ -228,8 +228,8 @@ EP2+ execution requires:
 - consistent rank ordering, buffer schemas, tuning, lane selection, and launch
   ordering across the group.
 
-`max_recv_size_per_rank` bounds receive capacity. When omitted, it defaults to
-the worst-case route count:
+`max_recv_size_per_rank` is the physical receive-pool capacity in token rows,
+including per-expert padding.
 
 ```text
 ep_size * max_tokens_per_rank * top_k

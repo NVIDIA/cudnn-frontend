@@ -72,8 +72,22 @@ class Mxfp8KernelConfig:
             raise ValueError(f"ep_rank {config.ep_rank} is outside EP size {config.ep_size}")
         if config.max_tokens_per_rank is None:
             raise ValueError("MXFP8 execution requires max_tokens_per_rank")
-        worst_case_recv_size = config.ep_size * config.max_tokens_per_rank * config.top_k
-        max_recv_size_per_rank = worst_case_recv_size if config.max_recv_size_per_rank is None else min(config.max_recv_size_per_rank, worst_case_recv_size)
+        token_padding_block = (
+            config.token_padding_size
+            if config.backward_wgrad_mode == "operands"
+            else 128 if config.generate_c else config.token_padding_size
+        )
+        raw_route_count = config.ep_size * config.max_tokens_per_rank * config.top_k
+        active_expert_count = min(config.experts_per_rank, raw_route_count)
+        worst_case_padded_recv_size = (
+            active_expert_count
+            + (raw_route_count - active_expert_count) // token_padding_block
+        ) * token_padding_block
+        max_recv_size_per_rank = (
+            worst_case_padded_recv_size
+            if config.max_recv_size_per_rank is None
+            else config.max_recv_size_per_rank
+        )
         if max_recv_size_per_rank <= 0:
             raise ValueError("max_recv_size_per_rank must be positive")
         if tuning is None:
@@ -94,9 +108,7 @@ class Mxfp8KernelConfig:
             drop_on_overflow=config.drop_on_overflow,
             combine_format=combine_wire_format(config.combine_format),
             enable_col_quant=(config.backward_wgrad_mode == "operands"),
-            token_padding_block=(
-                config.token_padding_size if config.backward_wgrad_mode == "operands" else 128 if config.generate_c else config.token_padding_size
-            ),
+            token_padding_block=token_padding_block,
             sf_padding_block=config.sf_padding_size,
             group_hint=tuning.group_hint,
             token_back_mode=tuning.token_back_mode,

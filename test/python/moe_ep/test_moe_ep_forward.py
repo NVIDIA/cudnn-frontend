@@ -181,7 +181,16 @@ def test_internal_column_requant_config_is_disabled_by_default_and_cache_distinc
         )
 
     assert default_config.enable_col_quant is False
-    assert default_config.max_recv_size_per_rank == (default_forward.ep_size * default_forward.max_tokens_per_rank * default_forward.top_k)
+    raw_route_count = (
+        default_forward.ep_size
+        * default_forward.max_tokens_per_rank
+        * default_forward.top_k
+    )
+    active_expert_count = min(default_forward.experts_per_rank, raw_route_count)
+    expected_padded_capacity = (
+        active_expert_count + (raw_route_count - active_expert_count) // 128
+    ) * 128
+    assert default_config.max_recv_size_per_rank == expected_padded_capacity
     assert enabled_config.enable_col_quant is True
     assert enabled_config.col_quant_num_ctas == 512
     with pytest.raises(ValueError, match="max_recv_size_per_rank"):
@@ -213,6 +222,23 @@ def test_bounded_receive_capacity_propagates_to_kernel_config():
         MoeEp(**_forward_config(), max_recv_size_per_rank=0)
     with pytest.raises(ValueError, match="drop_on_overflow"):
         MoeEp(**_forward_config(), drop_on_overflow=1)
+
+
+@pytest.mark.L0
+def test_receive_capacity_is_the_physical_pool_size():
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.nvlink_domain.token_comm_deterministic import (
+        _compute_receive_capacity,
+    )
+
+    capacity = _compute_receive_capacity(
+        world_size=4,
+        max_tokens_per_rank=64,
+        topk=2,
+        max_recv_size_per_rank=256,
+    )
+
+    assert capacity.raw_route_count == 512
+    assert capacity.padded_route_count == 256
 
 
 @pytest.mark.L0
