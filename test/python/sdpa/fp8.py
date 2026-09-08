@@ -308,7 +308,9 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5):
     actual = actual.detach().float()
     expected = expected.detach().float()
     diff = (actual - expected).abs()
-    bad = (diff > atol + rtol * expected.abs()) | ~torch.isfinite(actual)
+    # NaN compares false against the tolerance, so non-finite values on either side are flagged explicitly.
+    nonfinite = ~torch.isfinite(actual) | ~torch.isfinite(expected)
+    bad = (diff > atol + rtol * expected.abs()) | nonfinite
     n_bad = int(bad.sum().item())
     if n_bad == 0:
         return
@@ -318,8 +320,8 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5):
         f"%%%% '{tag}': {n_bad:,} of {actual.numel():,} elements outside atol={atol} rtol={rtol} (budget {allowed}); "
         f"first at {idx}: actual={actual[idx].item():+.5f} expected={expected[idx].item():+.5f}; max |diff|={diff.max().item():.4f}"
     )
-    if n_bad > allowed or not bool(torch.isfinite(actual).all()):
-        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    if n_bad > allowed or bool(nonfinite.any()):
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, equal_nan=False)
 
 
 def create_paged_container_and_block_table(tensor, block_size):
@@ -345,6 +347,7 @@ def create_paged_container_and_block_table(tensor, block_size):
     return (container, block_table)
 
 def exec_sdpa_fp8(cfg, request, cudnn_handle):
+    """Build, run and validate one fp8 SDPA forward (and backward when cfg.is_train) against fp8_ref."""
     if request.config.option.dryrun:
         pytest.skip("dryrun")
     perf = request.config.getoption("--perf")
