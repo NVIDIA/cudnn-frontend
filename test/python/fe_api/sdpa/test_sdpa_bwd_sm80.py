@@ -156,6 +156,58 @@ def test_sdpa_bwd_sm80_wrapper(dtype, d_qk, d_v, mask, gqa):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "is_causal,deterministic,expected", [(True, False, "lpt_l2"), (True, True, "natural"), (False, False, "natural")], ids=["causal", "causal-det", "dense"]
+)
+def test_sm80_bwd_sched_policy_resolution(is_causal, deterministic, expected):
+    """Causal takes the L2-grouped kv-major order; the deterministic relay and
+    non-causal work keep the plain 3-D grid (host-only: no compile)."""
+    try:
+        from cudnn.sdpa.bwd import api_dsl as api_sm80
+        from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2, SCHED_NATURAL
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+    want = {"lpt_l2": SCHED_LPT_L2, "natural": SCHED_NATURAL}[expected]
+    assert api_sm80._sm80_bwd_sched_policy(is_causal=is_causal, deterministic=deterministic) == want
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_lpt_l2_short_last_group():
+    """LPT_L2 grid decode with a SHORT last head-group block.
+
+    per_group = S_q * (Q + dO + fp32 dQ) = 8192 * 1024 B = 8 MiB against the
+    16 MiB budget -> 2 heads per block; H=3 MHA leaves the last block with one
+    head, exercising the clamped decode.  Every (kv_tile, head) must be visited
+    exactly once for dK/dV to be right and dQ to be complete.
+    """
+    try:
+        from cudnn.sdpa.bwd import sdpa_bwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+        from cudnn.sdpa.bwd import api_dsl as api_sm80
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+    b, h, s, d = 1, 3, 8192, 128
+    dtype = torch.bfloat16
+    q, k, v, do = (_bshd_randn(b, h, s, d, dtype=dtype, device="cuda") for _ in range(4))
+    scale = 1.0 / math.sqrt(d)
+    fwd = sdpa_fwd_wrapper_sm80(q_tensor=q, k_tensor=k, v_tensor=v, is_causal=True, scale_softmax=scale)
+    out = sdpa_bwd_wrapper_sm80(
+        q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=fwd["o_tensor"], do_tensor=do, lse_tensor=fwd["lse_tensor"], is_causal=True, scale_softmax=scale
+    )
+    # The wrapper's cached adapter for THIS shape must be on the grouped order
+    # (the cache is module-global, so filter by the shape, not any entry).
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+
+    mine = [e for e in api_sm80._sm80_bwd_cache.values() if getattr(e, "s_q_max", None) == s and getattr(e, "h_q", None) == h]
+    assert mine and all(e._params.sched_policy == SCHED_LPT_L2 for e in mine)
+    _, dq_ref, dk_ref, dv_ref = _ref_grads(q, k, v, do, is_causal=True, window_left=-1, scale=scale)
+    torch.testing.assert_close(out["dq_tensor"].to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(out["dk_tensor"].to(torch.float32), dk_ref, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(out["dv_tensor"].to(torch.float32), dv_ref, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_sdpa_bwd_sm80_deterministic_repeatable():
     """deterministic=True must produce bitwise-identical dQ across runs."""
