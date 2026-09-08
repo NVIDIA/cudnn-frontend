@@ -77,10 +77,13 @@ Named-"barrier" table (all ``nvvm.barrier_cta_sync()`` — full 256-thread CTA):
 ALL barriers are at top level (never inside a divergent ``if sg0`` arm) so the
 per-thread barrier count is identical across both sub-groups.
 
-v1 envelope: f16/bf16, dense (no mask), MHA, SQ % TILE_Q == 0, SKV % TILE_KV == 0,
-d_qk == d_v, (d_qk//2) % 16 == 0 (llama d=128, gptoss d=64).  do_dot + LSE fed in
-(computed by the reference / forward kernel for now; on-device do_dot is a
-follow-up).
+Envelope: f16/bf16; dense (partial tiles gated by runtime bounds) or packed THD
+(``THD_VARLEN``: ``[1,T,H,D]`` operands, ``CU_Q``/``CU_K`` prefix sums, per-sequence
+bounds and diagonal, LSE in either packed packing -- see ``LSE_TOKEN_MAJOR``);
+causal / bottom-right / band / sliding-window masks; GQA via per-query-head
+dK/dV write buffers reduced by the host; d_qk >= d_v with (d_qk//2) % 16 == 0
+(the flavor envelopes: gptoss 64, llama 128, dsv3 192/128, qwen 256).  do_dot
+is computed on device by ``_do_dot_kernel``; LSE is the forward's Stats.
 
 The kernel is fully parameterized on d_qk/d_v/tile_kv/tile_q/warps_per_sg — d=64
 (gptoss) and d=128 (llama) run the SAME code; d=64 uses strictly less SMEM /
@@ -247,6 +250,7 @@ def _bprop_kernel(
     has_rope: cutlass.Constexpr[bool],  # rotate Q/K in SMEM; un-rotate dQ/dK
     has_seq_len_q: cutlass.Constexpr[bool],  # read SEQ_LEN_Q[batch] → per-batch q-pad (dense PADDED)
     THD_VARLEN: cutlass.Constexpr[bool],  # packed [1,T,H,D] + CU_Q/CU_K; per-batch S_q/S_kv
+    LSE_TOKEN_MAJOR: cutlass.Constexpr[bool],  # THD Stats packing: (T, H) token-major (True) or (1, H, head_stride) head-major (False)
     deterministic: cutlass.Constexpr[bool],  # gate the dQ semaphore relay (folds out → byte-identical fast path)
     sched_policy: cutlass.Constexpr[int],  # SCHED_DEFAULT / SCHED_LPT / SCHED_LPT_L2 grid decode
     sched_l2_bytes: cutlass.Constexpr[int],  # L2 budget sizing the SCHED_LPT_L2 head groups
@@ -469,12 +473,21 @@ def _bprop_kernel(
     # LSE: STRIDE-AWARE on the dense path (a graph Stats input may carry any
     # dense-compatible [B,H,SQ] layout; the compile-time strides come from the
     # fake — a compact fake folds them to the packed constants, so the packed
-    # case is byte-identical).  THD keeps the packed [1,H,T_q] math (the grid
-    # `batch` is the LOGICAL sequence index, not the tensor's batch-1 dim).
-    # do_dot is an internal packed buffer → packed math always.
+    # case is byte-identical).  THD reads the PACKED Stats in either packing
+    # Rule S1 admits, both plan-time (the fake's shape and strides):
+    #   head-major  (1, H, head_stride): row = head*head_stride + cu_q[b] + q,
+    #               head_stride == the packed extent when compact (the
+    #               wrapper's [1,H,T_q]) or the caller's wider capacity;
+    #   token-major (T, H): row = (cu_q[b] + q)*H + head (cuDNN's ragged recipe).
+    # The grid `batch` is the LOGICAL sequence index, not the tensor's batch-1
+    # dim.  do_dot is an internal packed buffer → packed math always.
     if cutlass.const_expr(THD_VARLEN):
-        lse_head_base = cutlass.Int64(head * cutlass.Int32(SQ) + cu_q_b)
-        LSE_Q_STRIDE = cutlass.Int64(1)
+        if cutlass.const_expr(LSE_TOKEN_MAJOR):
+            lse_head_base = cutlass.Int64(cu_q_b * cutlass.Int32(LSE.stride[0]) + head)
+            LSE_Q_STRIDE = cutlass.Int64(LSE.stride[0])
+        else:
+            lse_head_base = cutlass.Int64(head * cutlass.Int32(LSE.stride[1]) + cu_q_b)
+            LSE_Q_STRIDE = cutlass.Int64(1)
         dot_head_base = head * cutlass.Int32(SQ) + cu_q_b
     else:
         lse_head_base = cutlass.Int64(batch) * cutlass.Int64(LSE.stride[0]) + cutlass.Int64(head) * cutlass.Int64(LSE.stride[1])
@@ -1323,6 +1336,7 @@ def _dsink_kernel(
     DSINK: cute.Tensor,  # [H] fp32 (atomicAdd target; zero-init)
     CU_Q: cute.Tensor,  # THD: [n_seq + 1] int32 cumulative q seqlens; dense: 1-elem dummy
     thd: cutlass.Constexpr[bool],
+    lse_token_major: cutlass.Constexpr[bool],  # THD Stats packing (see _bprop_kernel's LSE_TOKEN_MAJOR)
     n_rows: cutlass.Int32,  # (B or n_seq) * H
 ):
     """dSink[h] = -sum_rows exp(sink[h] - LSE) * (dO . O), one warp per (batch|sequence, head)
@@ -1349,11 +1363,18 @@ def _dsink_kernel(
             q_lo = Pointer(cu_p + b, dtype=cutlass.Int32).load()
             n_q = Pointer(cu_p + b + cutlass.Int32(1), dtype=cutlass.Int32).load() - q_lo
             base = cutlass.Int64(h) * cutlass.Int64(SQ) + cutlass.Int64(q_lo)
-            lse_base = cutlass.Int64(h) * cutlass.Int64(LSE.stride[1]) + cutlass.Int64(q_lo) * cutlass.Int64(LSE.stride[2])
+            if cutlass.const_expr(lse_token_major):
+                # (T, H) packing: token stride is the fake's leading stride.
+                lse_base = cutlass.Int64(q_lo) * cutlass.Int64(LSE.stride[0]) + cutlass.Int64(h) * cutlass.Int64(LSE.stride[1])
+                lse_step = cutlass.Int64(LSE.stride[0])
+            else:
+                lse_base = cutlass.Int64(h) * cutlass.Int64(LSE.stride[1]) + cutlass.Int64(q_lo) * cutlass.Int64(LSE.stride[2])
+                lse_step = cutlass.Int64(LSE.stride[2])
         else:
             n_q = SQ
             base = cutlass.Int64(row) * cutlass.Int64(SQ)
             lse_base = cutlass.Int64(b) * cutlass.Int64(LSE.stride[0]) + cutlass.Int64(h) * cutlass.Int64(LSE.stride[1])
+            lse_step = cutlass.Int64(LSE.stride[2])
         lse_p = cutlass.make_array_view(LSE).data_ptr()
         dot_p = cutlass.make_array_view(DO_DOT).data_ptr()
         acc = cutlass.Float32(0.0)
@@ -1361,7 +1382,7 @@ def _dsink_kernel(
         for kk in cutlass.range(n_chunks, unroll=1):
             q = lane + kk * cutlass.Int32(32)
             if q < n_q:
-                lse_q = Pointer(lse_p + lse_base + cutlass.Int64(q) * cutlass.Int64(LSE.stride[2]), dtype=cutlass.Float32).load()
+                lse_q = Pointer(lse_p + lse_base + cutlass.Int64(q) * lse_step, dtype=cutlass.Float32).load()
                 dd_q = Pointer(dot_p + base + cutlass.Int64(q), dtype=cutlass.Float32).load()
                 # Padded / fully-masked q-rows have LSE = -inf (forward writes -inf
                 # for an empty softmax denom).  exp2((sink - (-inf))·log2e) = +inf →
@@ -1401,6 +1422,43 @@ def _cast_kernel(
 _cast_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
+# THD variant: the dQ cast writes the CALLER's packed dQ directly -- only the
+# rows below the packed total cu_q[n_seq] (a device value; the rows past it are
+# the caller's capacity tail and must stay as the caller left them), at the
+# caller's head dim d_out (<= the flavor envelope fd the accumulator carries).
+# One thread per (row, head, column pair).
+@cute.kernel
+def _cast_thd_kernel(
+    dQ_acc: cute.Tensor,  # [1, T_cap, H, fd] fp32
+    dQ_out: cute.Tensor,  # [1, T_cap, H, d_out] io_dtype (the caller's packed dQ)
+    CU_Q: cute.Tensor,  # [n_seq + 1] int32
+    io_dtype: cutlass.Constexpr,
+    H: cutlass.Constexpr[int],
+    fd: cutlass.Constexpr[int],
+    d_out: cutlass.Constexpr[int],
+    n_seq: cutlass.Int32,
+    n_pairs: cutlass.Int32,  # T_cap * H * d_out / 2
+):
+    bx, _, _ = cute.arch.block_idx()
+    tidx, _, _ = cute.arch.thread_idx()
+    gid = bx * cutlass.Int32(256) + tidx
+    if gid < n_pairs:
+        per_row = cutlass.Int32(H * (d_out // 2))
+        row = gid // per_row
+        r = gid % per_row
+        h = r // cutlass.Int32(d_out // 2)
+        c = (r % cutlass.Int32(d_out // 2)) * cutlass.Int32(2)
+        t_live = Pointer(cutlass.make_array_view(CU_Q).data_ptr() + n_seq, dtype=cutlass.Int32).load()
+        if row < t_live:
+            src = cutlass.make_array_view(dQ_acc).data_ptr() + (row * cutlass.Int32(H) + h) * cutlass.Int32(fd) + c
+            dst = cutlass.make_array_view(dQ_out).data_ptr() + (row * cutlass.Int32(H) + h) * cutlass.Int32(d_out) + c
+            v = Pointer(src, dtype=cutlass.Float32).load(count=2)
+            Pointer(dst, dtype=cutlass.Int32).store(fp32_to_fp16(v[0], v[1], dtype=io_dtype), alignment=4)
+
+
+_cast_thd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # ===========================================================================
 # GQA dK/dV head reduction: sum the per-query-head workspace over each
 # query-head group → [B, SKV, Hk, d].  IN[B,SKV,H,d] (io_dtype) → OUT[B,SKV,Hk,d].
@@ -1435,6 +1493,45 @@ def _dkv_reduce_kernel(
 
 
 _dkv_reduce_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+# THD variant: folds the per-query-head partials IN[1, T_cap, H, d_in] onto the
+# CALLER's packed dK / dV OUT[1, T_cap, Hk, d_out] -- ratio H // Hk (1 = a plain
+# copy, the padded-head-dim MHA case), rows below the packed total cu_k[n_seq]
+# only, at the caller's head dim d_out (<= d_in, the flavor envelope).
+@cute.kernel
+def _dkv_reduce_thd_kernel(
+    IN: cute.Tensor,  # [1, T_cap, H, d_in] io_dtype (per-query-head dK/dV)
+    OUT: cute.Tensor,  # [1, T_cap, Hk, d_out] io_dtype (the caller's packed dK/dV)
+    CU_K: cute.Tensor,  # [n_seq + 1] int32
+    d_in: cutlass.Constexpr[int],
+    d_out: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    Hk: cutlass.Constexpr[int],
+    io_dtype: cutlass.Constexpr,
+    n_seq: cutlass.Int32,
+    n_out: cutlass.Int32,  # T_cap * Hk * d_out
+):
+    ratio = H // Hk
+    bx, _, _ = cute.arch.block_idx()
+    tidx, _, _ = cute.arch.thread_idx()
+    e = bx * cutlass.Int32(256) + tidx
+    if e < n_out:
+        di = e % cutlass.Int32(d_out)
+        rest = e // cutlass.Int32(d_out)
+        hk = rest % cutlass.Int32(Hk)
+        row = rest // cutlass.Int32(Hk)
+        t_live = Pointer(cutlass.make_array_view(CU_K).data_ptr() + n_seq, dtype=cutlass.Int32).load()
+        if row < t_live:
+            in_base = (row * cutlass.Int32(H) + hk * cutlass.Int32(ratio)) * cutlass.Int32(d_in) + di
+            src = cutlass.make_array_view(IN).data_ptr()
+            acc = cutlass.Float32(0.0)
+            for g in cutlass.range_constexpr(ratio):
+                acc = acc + Pointer(src + in_base + cutlass.Int32(g * d_in), dtype=io_dtype).load().to(cutlass.Float32)
+            Pointer(cutlass.make_array_view(OUT).data_ptr() + e, dtype=io_dtype).store(acc.to(io_dtype))
+
+
+_dkv_reduce_thd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 # ===========================================================================
@@ -1476,6 +1573,7 @@ def _bprop_host(
     has_rope: cutlass.Constexpr[bool],
     has_seq_len_q: cutlass.Constexpr[bool],
     thd_varlen: cutlass.Constexpr[bool],
+    lse_token_major: cutlass.Constexpr[bool],
     deterministic: cutlass.Constexpr[bool],
     sched_policy: cutlass.Constexpr[int],
     sched_l2_bytes: cutlass.Constexpr[int],
@@ -1540,6 +1638,7 @@ def _bprop_host(
         has_rope,
         has_seq_len_q,
         thd_varlen,
+        lse_token_major,
         deterministic,
         sched_policy,
         sched_l2_bytes,
@@ -1580,6 +1679,41 @@ def _cast_host(
 
 
 @cute.jit
+def _cast_thd_host(
+    dQ_acc: cute.Tensor,
+    dQ_out: cute.Tensor,
+    CU_Q: cute.Tensor,
+    io_dtype: cutlass.Constexpr,
+    H: cutlass.Constexpr[int],
+    fd: cutlass.Constexpr[int],
+    d_out: cutlass.Constexpr[int],
+    n_seq: cutlass.Int32,
+    n_pairs: cutlass.Int32,
+    stream: cuda.CUstream,
+):
+    n_blocks = (n_pairs + 255) // 256
+    _cast_thd_kernel(dQ_acc, dQ_out, CU_Q, io_dtype, H, fd, d_out, n_seq, n_pairs).launch(grid=(n_blocks, 1, 1), block=(256, 1, 1), stream=stream)
+
+
+@cute.jit
+def _dkv_reduce_thd_host(
+    IN: cute.Tensor,
+    OUT: cute.Tensor,
+    CU_K: cute.Tensor,
+    d_in: cutlass.Constexpr[int],
+    d_out: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    Hk: cutlass.Constexpr[int],
+    io_dtype: cutlass.Constexpr,
+    n_seq: cutlass.Int32,
+    n_out: cutlass.Int32,
+    stream: cuda.CUstream,
+):
+    n_blocks = (n_out + 255) // 256
+    _dkv_reduce_thd_kernel(IN, OUT, CU_K, d_in, d_out, H, Hk, io_dtype, n_seq, n_out).launch(grid=(n_blocks, 1, 1), block=(256, 1, 1), stream=stream)
+
+
+@cute.jit
 def _dkv_reduce_host(
     IN: cute.Tensor,
     OUT: cute.Tensor,
@@ -1602,12 +1736,13 @@ def _dsink_host(
     DSINK: cute.Tensor,
     CU_Q: cute.Tensor,
     thd: cutlass.Constexpr[bool],
+    lse_token_major: cutlass.Constexpr[bool],
     n_rows: cutlass.Int32,
     stream: cuda.CUstream,
 ):
     """Host launcher for :func:`_dsink_kernel`: ``n_rows`` = (batch|n_seq) * H warps."""
     n_blocks = (n_rows + _DODOT_WARPS - 1) // _DODOT_WARPS
-    _dsink_kernel(LSE, DO_DOT, SINKS, DSINK, CU_Q, thd, n_rows).launch(grid=(n_blocks, 1, 1), block=(_DODOT_WARPS * 32, 1, 1), stream=stream)
+    _dsink_kernel(LSE, DO_DOT, SINKS, DSINK, CU_Q, thd, lse_token_major, n_rows).launch(grid=(n_blocks, 1, 1), block=(_DODOT_WARPS * 32, 1, 1), stream=stream)
 
 
 # ===========================================================================
@@ -1701,6 +1836,10 @@ def compile(  # noqa: A001 — the template contract's entry point
     rope_max_s: int = 0,
     n_batch_logical: int = 0,
     lse_stride: "Optional[tuple[int, int, int]]" = None,
+    lse_token_major: bool = False,
+    lse_head_stride: int = 0,
+    out_d_qk: int = 0,
+    out_d_v: int = 0,
 ):
     """Compile (or fetch) this template specialization for one shape.
 
@@ -1716,8 +1855,34 @@ def compile(  # noqa: A001 — the template contract's entry point
     non-contiguous Stats input — the kernels then READ the LSE natively at
     that layout (the #712 analogue for the backward's loads; ``None`` keeps
     the packed compact fake, byte-identical codegen).
+
+    ``lse_token_major`` / ``lse_head_stride`` (THD only, plan-time): the packed
+    Stats packing (Rule S1).  Default = head-major with the compact head
+    stride (the ``[1, H, T_q]`` the SM80 forward wrapper emits; byte-identical
+    codegen).  ``lse_head_stride > 0`` binds head-major Stats at the caller's
+    wider head stride (the FROST forwards' 64-token-rounded capacity);
+    ``lse_token_major`` binds cuDNN's ``(T, H)`` ragged recipe.
+
+    ``out_d_qk`` / ``out_d_v`` (THD only, plan-time; 0 = the envelope): the
+    CALLER's head dims.  Under THD the dQ cast and the dK/dV fold write the
+    caller's packed gradients directly, rows below the packed total only and
+    at these widths, so nothing past ``cu_*[B]`` and no padded column is ever
+    written into the caller's buffers.  ``CompiledBwd.cast`` then takes
+    ``(dQ_acc, dQ_out, CU_Q, n_seq, n_pairs, stream)`` and ``reduce_k`` /
+    ``reduce_v`` ``(IN, OUT, CU_K, n_seq, n_out, stream)`` (always compiled
+    under THD; ratio 1 is the padded-head-dim copy).
     """
     p = PARAMS
+    if (lse_token_major or lse_head_stride) and not p.thd_varlen:
+        raise ValueError("sm80 bwd: lse_token_major / lse_head_stride describe PACKED (THD) Stats; dense Stats pass lse_stride")
+    if lse_token_major and lse_head_stride:
+        raise ValueError("sm80 bwd: lse_head_stride is head-major-only (token-major (T, H) Stats is compact)")
+    if (out_d_qk or out_d_v) and not p.thd_varlen:
+        raise ValueError("sm80 bwd: out_d_qk / out_d_v are THD-only (the dense path slices the padded gradient on the host)")
+    d_out_qk = int(out_d_qk) if out_d_qk else p.d_qk
+    d_out_v = int(out_d_v) if out_d_v else p.d_v
+    if d_out_qk % 2 or d_out_v % 2 or d_out_qk > p.d_qk or d_out_v > p.d_v or d_out_qk <= 0 or d_out_v <= 0:
+        raise ValueError(f"sm80 bwd: out head dims must be even and within the envelope ({p.d_qk}, {p.d_v}); got ({out_d_qk}, {out_d_v})")
     io_dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
     mask_flags = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0) | (MASK_PADDED if p.has_seq_kv_lens else 0)
     # SMEM budget derivations (see the assertions in the device code): drop
@@ -1757,11 +1922,17 @@ def compile(  # noqa: A001 — the template contract's entry point
     # dK/dV WRITE buffers carry H_q heads (per-query-head; GQA reduces after).
     fdk_ws = _fake(io_dtype, (_b, _skv, h, p.d_qk), r4)
     fdv_ws = _fake(io_dtype, (_b, _skv, h, p.d_v), r4)
-    fl = (
-        cute.runtime.make_fake_tensor(cutlass.Float32, (_b, h, _sq), lse_stride, assumed_align=4)
-        if lse_stride is not None and not p.thd_varlen
-        else _fake(cutlass.Float32, (_b, h, _sq), (2, 1, 0))
-    )
+    if p.thd_varlen and lse_token_major:
+        # (T, H) token-major: a compact rank-2 fake over the sym token extent.
+        fl = _fake(cutlass.Float32, (_sq, h), (1, 0), align=4)
+    elif p.thd_varlen and lse_head_stride:
+        # (1, H, head_stride) head-major at the caller's plan-time head stride
+        # (the third EXTENT of a compact fake, never a stride).
+        fl = _fake(cutlass.Float32, (1, h, int(lse_head_stride)), (2, 1, 0), align=4)
+    elif lse_stride is not None and not p.thd_varlen:
+        fl = cute.runtime.make_fake_tensor(cutlass.Float32, (_b, h, _sq), lse_stride, assumed_align=4)
+    else:
+        fl = _fake(cutlass.Float32, (_b, h, _sq), (2, 1, 0))
     fdt = _fake(cutlass.Float32, (_b, h, _sq), (2, 1, 0))
     fsk = _fake(cutlass.Int32, (b if p.has_seq_kv_lens else 1,), (0,), align=4)
     bias_dtype = cutlass.Float32 if p.bias_is_fp32 else io_dtype
@@ -1812,6 +1983,7 @@ def compile(  # noqa: A001 — the template contract's entry point
         bool(p.has_rope),
         bool(p.has_seq_q_lens),
         bool(p.thd_varlen),
+        bool(lse_token_major),
         bool(p.deterministic),
         int(p.sched_policy),
         int(p.sched_l2_mib) * 1024 * 1024,
@@ -1830,16 +2002,57 @@ def compile(  # noqa: A001 — the template contract's entry point
     fo = _fake(io_dtype, (_b, _sq, h, p.d_v), r4)
     do_dot = cute.compile(_do_dot_host, fo, fdo, fdt, p.d_v, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
     fdq_out = _fake(io_dtype, (_b, _sq, h, p.d_qk), r4)
-    cast = cute.compile(_cast_host, fdq_acc, fdq_out, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
-    reduce_k = reduce_v = None
-    if gqa:
-        fdk_out = _fake(io_dtype, (_b, _skv, h_kv, p.d_qk), r4)
-        fdv_out = _fake(io_dtype, (_b, _skv, h_kv, p.d_v), r4)
-        reduce_k = cute.compile(_dkv_reduce_host, fdk_ws, fdk_out, p.d_qk, h, h_kv, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
-        reduce_v = cute.compile(_dkv_reduce_host, fdv_ws, fdv_out, p.d_v, h, h_kv, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+    if p.thd_varlen:
+        # Row-bounded, caller-width outputs (see out_d_qk / out_d_v above).
+        fdq_out = _fake(io_dtype, (1, _sq, h, d_out_qk), r4)
+        cast = cute.compile(
+            _cast_thd_host, fdq_acc, fdq_out, fcuq, io_dtype, h, p.d_qk, d_out_qk, cutlass.Int32(0), cutlass.Int32(0), fstream, options="--enable-tvm-ffi"
+        )
+        fdk_out = _fake(io_dtype, (1, _skv, h_kv, d_out_qk), r4)
+        fdv_out = _fake(io_dtype, (1, _skv, h_kv, d_out_v), r4)
+        reduce_k = cute.compile(
+            _dkv_reduce_thd_host,
+            fdk_ws,
+            fdk_out,
+            fcuk,
+            p.d_qk,
+            d_out_qk,
+            h,
+            h_kv,
+            io_dtype,
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            fstream,
+            options="--enable-tvm-ffi",
+        )
+        reduce_v = cute.compile(
+            _dkv_reduce_thd_host,
+            fdv_ws,
+            fdv_out,
+            fcuk,
+            p.d_v,
+            d_out_v,
+            h,
+            h_kv,
+            io_dtype,
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            fstream,
+            options="--enable-tvm-ffi",
+        )
+    else:
+        cast = cute.compile(_cast_host, fdq_acc, fdq_out, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+        reduce_k = reduce_v = None
+        if gqa:
+            fdk_out = _fake(io_dtype, (b, skv, h_kv, p.d_qk), r4)
+            fdv_out = _fake(io_dtype, (b, skv, h_kv, p.d_v), r4)
+            reduce_k = cute.compile(_dkv_reduce_host, fdk_ws, fdk_out, p.d_qk, h, h_kv, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+            reduce_v = cute.compile(_dkv_reduce_host, fdv_ws, fdv_out, p.d_v, h, h_kv, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
     dsink = None
     if p.has_sink:
         fsinks = _fake(cutlass.Float32, (h,), (0,), align=4)
         fdsink = _fake(cutlass.Float32, (h,), (0,), align=4)
-        dsink = cute.compile(_dsink_host, fl, fdt, fsinks, fdsink, fcuq, bool(p.thd_varlen), cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+        dsink = cute.compile(
+            _dsink_host, fl, fdt, fsinks, fdsink, fcuq, bool(p.thd_varlen), bool(lse_token_major), cutlass.Int32(0), fstream, options="--enable-tvm-ffi"
+        )
     return CompiledBwd(main=main, do_dot=do_dot, cast=cast, reduce_k=reduce_k, reduce_v=reduce_v, dsink=dsink, sem_q_stride=sem_q_stride)
