@@ -118,6 +118,7 @@ from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b  # noqa: E402
 from cudnn.frost.tile_dsl.tma import load_tile_2d, cp_async_commit, cp_async_wait  # noqa: E402
 from cudnn.frost.tile_dsl.mask import MASK_NONE, MASK_PADDED, MASK_CAUSAL, MASK_SWA  # noqa: E402
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
+from cudnn.frost.tile_dsl.scheduler import lpt_l2_tile_coords  # noqa: E402
 
 # Pull the default geometry from the flavor config (single source of truth).
 from cudnn.sdpa.bwd.config_sm80 import LLAMA_CFG as _LLAMA_CFG  # noqa: E402
@@ -129,14 +130,24 @@ _COPY_ELEMS = 8  # 16-byte cp.async chunk (8 fp16)
 # Scheduler policy (compile-time).  The bprop parallel axis is the KV-tile; under
 # causal the lowest kv-tile is the heaviest (most q-iters after the causal
 # skip), so an LPT schedule is KV-MAJOR (all kv=0 tiles first → the light high-kv
-# tiles land in the last wave, minimizing the makespan tail).
-SCHED_DEFAULT = 0  # 3-D grid (kv_tile, head, batch); no reorder (byte-identical)
-SCHED_LPT = 1  # 1-D kv-major grid for causal load-balance
+# tiles land in the last wave, minimizing the makespan tail).  Plain kv-major
+# over EVERY (head, batch) puts the resident CTAs on ~108 different heads, so
+# a head's Q / dO / dQ tiles leave L2 between its kv-tiles' visits and the dQ
+# atomics become DRAM read-modify-writes (1.4x slower than the 3-D grid at
+# B2 H64/8 S4K).  SCHED_LPT_L2 keeps kv-major order WITHIN an L2-sized group
+# of (batch, kv_head) — the 3-D grid's locality with LPT's tail — and is the
+# causal default; SCHED_LPT stays for small grids by explicit request.
+# The policy ids are the SHARED tile_dsl vocabulary (config_sm80 / api_dsl
+# pass those ids in), so the kernel compares against the same symbols:
+#   SCHED_DEFAULT (== SCHED_NATURAL): 3-D grid (kv_tile, head, batch); no reorder
+#   SCHED_LPT:    1-D kv-major grid over all heads (causal load-balance, no locality)
+#   SCHED_LPT_L2: 1-D kv-major grid within L2-sized head groups (causal default)
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL  # noqa: E402
+
+SCHED_DEFAULT = SCHED_NATURAL
 
 # TemplateParams injection seam (frost.template_loader): one uniquely named
 # module per parameter set, specialized below via cutlass.const_expr folding.
-# The shared tile_dsl scheduler vocabulary maps IDENTITY onto the internal
-# grid decode (SCHED_NATURAL == SCHED_DEFAULT == 0, SCHED_LPT == 1).
 from cudnn.sdpa.bwd.config_sm80 import TemplateParams  # noqa: E402
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
@@ -237,7 +248,8 @@ def _bprop_kernel(
     has_seq_len_q: cutlass.Constexpr[bool],  # read SEQ_LEN_Q[batch] → per-batch q-pad (dense PADDED)
     THD_VARLEN: cutlass.Constexpr[bool],  # packed [1,T,H,D] + CU_Q/CU_K; per-batch S_q/S_kv
     deterministic: cutlass.Constexpr[bool],  # gate the dQ semaphore relay (folds out → byte-identical fast path)
-    sched_policy: cutlass.Constexpr[int],  # SCHED_DEFAULT / SCHED_LPT grid decode
+    sched_policy: cutlass.Constexpr[int],  # SCHED_DEFAULT / SCHED_LPT / SCHED_LPT_L2 grid decode
+    sched_l2_bytes: cutlass.Constexpr[int],  # L2 budget sizing the SCHED_LPT_L2 head groups
     n_q_tiles: cutlass.Int32,  # runtime — ceil(SQ / tile_q) (dense); THD recomputes per-batch
     softmax_scale_log2: cutlass.Float32,  # = attn_scale * log2(e)  (for P)
     attn_scale: cutlass.Float32,  # linear scale (for dS)
@@ -289,14 +301,35 @@ def _bprop_kernel(
     PARTIAL_KV = False if cutlass.const_expr(THD_VARLEN) else ((SKV % tile_kv) != 0)
 
     # Grid decode.  SCHED_DEFAULT: plain 3-D (kv_tile, head, batch).  SCHED_LPT:
-    # 1-D kv-major flat grid — bx = kv_tile*(H*B) + head*B... no: kv-major means
-    # kv_tile = bx // (H*B), so all (head,batch) of kv=0 come first (heaviest).
+    # 1-D kv-major flat grid, kv_tile = bx // (H*B), so all (head, batch) of
+    # kv=0 come first (heaviest).  SCHED_LPT_L2: the same order within L2-sized
+    # (batch, kv_head) groups, one group block after another.
     if cutlass.const_expr(sched_policy == SCHED_LPT):
         _hb = cutlass.Int32(H) * cutlass.Int32(B)
         kv_tile = bx // _hb
         _r = bx % _hb
         head = _r % cutlass.Int32(H)
         batch = _r // cutlass.Int32(H)
+    elif cutlass.const_expr(sched_policy == SCHED_LPT_L2):
+        # Block-cyclic over L2-sized (batch, kv_head) groups, kv-major within a
+        # block: the shared fwd helper decodes (row_rank, head, batch) with the
+        # row REVERSED for the forward's heavy-high-q order; the backward's heavy
+        # tiles are LOW kv (kv-tile 0 attends every q), so undo the reversal.
+        # per_group = this group's Q + dO + fp32 dQ stream over its heads_per_kv
+        # query heads -- the bytes the group's CTAs re-touch every Q-iter.
+        _nkv = cutlass.Int32((SKV + tile_kv - 1) // tile_kv)
+        _hpk = H // Hkv
+        _row, head, batch = lpt_l2_tile_coords(
+            bx,
+            cutlass.Int32(H),
+            cutlass.Int32(B),
+            _nkv,
+            _hpk,
+            cutlass.Int32(SQ),
+            _hpk * (2 * d_qk + 2 * d_v + 4 * d_qk),
+            sched_l2_bytes,
+        )
+        kv_tile = (_nkv - cutlass.Int32(1)) - _row
     else:
         kv_tile = bx
         head = by
@@ -1458,6 +1491,7 @@ def _bprop_host(
     thd_varlen: cutlass.Constexpr[bool],
     deterministic: cutlass.Constexpr[bool],
     sched_policy: cutlass.Constexpr[int],
+    sched_l2_bytes: cutlass.Constexpr[int],
     n_q_tiles: cutlass.Int32,
     softmax_scale_log2: cutlass.Float32,
     attn_scale: cutlass.Float32,
@@ -1478,7 +1512,7 @@ def _bprop_host(
     # 3-D grid only (SCHED_DEFAULT); LPT+THD is a future scheduler tweak.
     if cutlass.const_expr(thd_varlen):
         grid = (grid_kv_tiles, H, grid_batch)
-    elif cutlass.const_expr(sched_policy == SCHED_LPT):
+    elif cutlass.const_expr(sched_policy == SCHED_LPT or sched_policy == SCHED_LPT_L2):
         n_kv_tiles = (SKV + tile_kv - 1) // tile_kv
         grid = (n_kv_tiles * H * B, 1, 1)
     else:
@@ -1521,6 +1555,7 @@ def _bprop_host(
         thd_varlen,
         deterministic,
         sched_policy,
+        sched_l2_bytes,
         n_q_tiles,
         softmax_scale_log2,
         attn_scale,
@@ -1792,6 +1827,7 @@ def compile(  # noqa: A001 — the template contract's entry point
         bool(p.thd_varlen),
         bool(p.deterministic),
         int(p.sched_policy),
+        int(p.sched_l2_mib) * 1024 * 1024,
         cutlass.Int32(0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
