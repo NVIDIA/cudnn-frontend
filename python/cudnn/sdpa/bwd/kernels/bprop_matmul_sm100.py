@@ -46,6 +46,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Callable
 
+import torch
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.kernel_templates._tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
@@ -210,7 +211,6 @@ num_tmem_alloc_cols = 512
 tmem_alloc_exclusive = False
 acc_stages = 1  # 512 acc cols/stage
 vec_bytes_epi = int(PARAMS.vec_bytes_epi)
-frost_compile_options = "--enable-tvm-ffi --gpu-arch sm_100a"
 n_tma_outputs = 1
 moe_aligned_offsets = False
 epi_slot_widen = 1
@@ -1883,7 +1883,15 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile() -> Callable:
+def compile(device: torch.device) -> Callable:
+    major, minor = torch.cuda.get_device_capability(device)
+    sm = major * 10 + minor
+    if not 100 <= sm <= 103:
+        raise ValueError(f"SM100 SDPA bwd stage 3 requires SM100 through SM103; got SM{sm}")
+    # The architecture-specific target is required for tcgen05/TMA. Resolve it
+    # from this function's device cache key so B200 and B300 cannot share an
+    # incompatible TVM-FFI artifact in a multi-GPU process.
+    gpu_arch = f"sm_{major}{minor}a"
     out_vec_elems = vec_bytes_epi // (cd_dtype.width // 8)
     ab_stride_elems = 16 // (ab_dtype.width // 8)
     sym_m = cute.sym_int64()
@@ -1987,7 +1995,7 @@ def compile() -> Callable:
         fake_meta,
         fake_desc,
         stream=_fake_stream,
-        options=frost_compile_options,
+        options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
     )
 
 
@@ -2007,7 +2015,18 @@ def _permuted(t, mn_dim: int, k_dim: int, h_dim: int, b_dim: int):
     return t.permute(mn_dim, k_dim, h_dim, b_dim)
 
 
-def matmul_bh(a, b, out, *, n_head: int, n_batch: int, stream=None, meta=None, desc_words=None, grid_m: int = None):
+def matmul_bh(
+    a,
+    b,
+    out,
+    *,
+    n_head: int,
+    n_batch: int,
+    stream=None,
+    meta=None,
+    desc_words=None,
+    grid_m: int = None,
+):
     """Run one ``(batch, head)``-batched GEMM.
 
     ``a`` / ``b`` / ``out`` are already permuted to ``(M|N, K, H, B)`` /
@@ -2024,7 +2043,10 @@ def matmul_bh(a, b, out, *, n_head: int, n_batch: int, stream=None, meta=None, d
         # Required on both paths: dense never reads them, but the compiled ABI
         # has the slots and a None would fail at the call boundary.
         raise ValueError("matmul_bh needs `meta` and `desc_words` (dense may pass any 1-D dummies)")
-    fn = compile()
+    # Key the compiled artifact by the tensor's actual device.  A process may
+    # execute plans on both B200 and B300, and the TVM-FFI function is not
+    # portable between their architecture-specific targets.
+    fn = compile(a.device)
     # `m` sizes the GRID.  Dense: the operands' shared M.  THD: the caller
     # passes the longest sequence, because the per-sequence extents are device
     # values and A's own M is the workspace's column count, not an output row

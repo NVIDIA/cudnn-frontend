@@ -38,6 +38,37 @@ _DTYPES = (torch.bfloat16, torch.float16)
 _DTYPE_IDS = ("bf16", "fp16")
 
 
+def test_stage3_compile_cache_is_arch_specific(monkeypatch):
+    import cudnn.sdpa.bwd.kernels.bprop_matmul_sm100 as stage3
+
+    options = []
+    b200_device = torch.device("cuda:0")
+    b300_device = torch.device("cuda:1")
+    capabilities = {
+        b200_device: (10, 0),
+        b300_device: (10, 3),
+    }
+
+    def fake_compile(*args, **kwargs):
+        options.append(kwargs["options"])
+        return object()
+
+    monkeypatch.setattr(stage3.torch.cuda, "get_device_capability", capabilities.__getitem__)
+    monkeypatch.setattr(stage3.cute, "compile", fake_compile)
+    stage3.compile.cache_clear()
+    try:
+        b200 = stage3.compile(b200_device)
+        assert stage3.compile(b200_device) is b200
+        b300 = stage3.compile(b300_device)
+        assert b300 is not b200
+        assert options == [
+            "--enable-tvm-ffi --gpu-arch sm_100a",
+            "--enable-tvm-ffi --gpu-arch sm_103a",
+        ]
+    finally:
+        stage3.compile.cache_clear()
+
+
 def _io_dtype(dt):
     return cudnn.data_type.HALF if dt == torch.float16 else cudnn.data_type.BFLOAT16
 
