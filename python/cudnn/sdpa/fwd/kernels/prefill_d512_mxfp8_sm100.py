@@ -317,12 +317,11 @@ _E5_STYLE_KV_PIPELINE = CFG.DTYPE_QKV == 1 or (CFG.DTYPE_QKV == 0 and (CFG.MASK_
 _PADDED_TOP_LEFT_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.BOTTOM_RIGHT == 0 and CFG.WINDOW_RIGHT == 0
 _SWA_REUSE_P = (
     CFG.CTA_MMA == 1
-    and CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_SWA)
+    and (CFG.MASK_FLAGS & ~MASK_PADDED) == (MASK_CAUSAL | MASK_SWA)
     and CFG.WINDOW_LEFT == CFG.TILE_N - 1
     and CFG.WINDOW_RIGHT == 0
     and CFG.BOTTOM_RIGHT == 0
-    and CFG.SEQ_KV_LENS_PRESENT == 0
-    and CFG.THD_VARLEN == 0
+    and (CFG.SEQ_KV_LENS_PRESENT == 0 or CFG.THD_VARLEN == 1)
     and SPLIT_KV == 1
 )
 
@@ -2623,14 +2622,15 @@ def _softmax_warp_group(
             # Correction opens the replay only after the first output slice has
             # left TMEM.  P is already materialized, so these arrivals replace
             # the softmax half of the normal BMM2-ready handshake.
-            wait(mb_qk_sf_reuse.subview(0), reuse_gate_phase)
-            reuse_gate_phase = reuse_gate_phase ^ cutlass.Int32(1)
-            for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
-                parity_rt = kv_loop & cutlass.Int32(1)
-                for chunk_id in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
-                    bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(chunk_id)].arrive(
-                        leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA
-                    )
+            if bounds.right > bounds.left:
+                wait(mb_qk_sf_reuse.subview(0), reuse_gate_phase)
+                reuse_gate_phase = reuse_gate_phase ^ cutlass.Int32(1)
+                for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
+                    parity_rt = kv_loop & cutlass.Int32(1)
+                    for chunk_id in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
+                        bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(chunk_id)].arrive(
+                            leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA
+                        )
 
         wait(mb_decoded.subview(sched_state.idx), sched_state.phase)
         payload_base = sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)
@@ -3244,15 +3244,16 @@ def _correction_warp_group(
         if cutlass.const_expr(_SWA_REUSE_P):
             # Start the second Dv256 pass only after correction has consumed the
             # first output.  The first KV tile needs no accumulator rescale.
-            lo_parity_rt = bounds.left & cutlass.Int32(1)
-            if nvvm.elect_sync():
-                nvvm.mbarrier_arrive(mb_sf_reuse.subview(lo_parity_rt))
-            bars.mb_bmm2_ready[lo_parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(
-                leader_cta_id=leader_cta_id,
-                cta_group=CFG.CTA_MMA,
-            )
-            if nvvm.elect_sync():
-                nvvm.mbarrier_arrive(mb_qk_sf_reuse.subview(0))
+            if bounds.right > bounds.left:
+                lo_parity_rt = bounds.left & cutlass.Int32(1)
+                if nvvm.elect_sync():
+                    nvvm.mbarrier_arrive(mb_sf_reuse.subview(lo_parity_rt))
+                bars.mb_bmm2_ready[lo_parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(
+                    leader_cta_id=leader_cta_id,
+                    cta_group=CFG.CTA_MMA,
+                )
+                if nvvm.elect_sync():
+                    nvvm.mbarrier_arrive(mb_qk_sf_reuse.subview(0))
 
             # For each later KV tile, replay the same online-softmax alpha before
             # admitting its retained P tile to BMM2.
@@ -3305,10 +3306,11 @@ def _correction_warp_group(
                     cta_group=CFG.CTA_MMA,
                 )
 
-            parity_last_rt = (bounds.right - cutlass.Int32(1)) & cutlass.Int32(1)
-            bmm2_done_phase_last = (bmm2_done_phase_pair >> parity_last_rt) & cutlass.Int32(1)
-            bars.mb_bmm2_done[parity_last_rt].wait(bmm2_done_phase_last)
-            bmm2_done_phase_pair = bmm2_done_phase_pair ^ (cutlass.Int32(1) << parity_last_rt)
+            if bounds.right > bounds.left:
+                parity_last_rt = (bounds.right - cutlass.Int32(1)) & cutlass.Int32(1)
+                bmm2_done_phase_last = (bmm2_done_phase_pair >> parity_last_rt) & cutlass.Int32(1)
+                bars.mb_bmm2_done[parity_last_rt].wait(bmm2_done_phase_last)
+                bmm2_done_phase_pair = bmm2_done_phase_pair ^ (cutlass.Int32(1) << parity_last_rt)
 
             _emit_output_slice(
                 tmem_base_epi,
