@@ -77,6 +77,11 @@ class Mxfp8KernelConfig:
             if config.backward_wgrad_mode == "operands"
             else 128 if config.generate_c else config.token_padding_size
         )
+        # When no physical receive capacity is provided, preserve the previous
+        # default by accounting for worst-case per-expert padding. This is not
+        # equivalent to rounding the total route count once: every active
+        # expert owns a separately padded segment. An explicit value is already
+        # the physical pool size and is therefore used verbatim below.
         raw_route_count = config.ep_size * config.max_tokens_per_rank * config.top_k
         active_expert_count = min(config.experts_per_rank, raw_route_count)
         worst_case_padded_recv_size = (
