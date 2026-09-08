@@ -72,7 +72,7 @@ FLOPs = 2 * S_q * H * topk * (3 * d_qk + 2 * d_v)
 - PyTorch with CUDA support
 - `pip install nvidia-cudnn-frontend` (or a development install of
   this repository's `python/` package) -- the CuTe DSL dependencies are
-  required dependencies and come with either
+  required dependencies and come with either installation method
 
 ### How to run
 
@@ -117,7 +117,9 @@ Generated on an NVIDIA B200 with the default
 sweep settings (`nheads=64`, `d_qk = d_v = 512`, bf16, attention sink and
 `topk_length` enabled, `warmup=10`, `repeat=50`), using `torch 2.12.1`,
 `nvidia-cutlass-dsl 4.5.2`, and `nvidia-cudnn-frontend` built from this
-repository.
+repository. That DSL release predates the package's current `>=4.6.2` floor;
+the numbers are a historical measurement and have not been re-run on a
+supported DSL.
 
 | seqlen_q | seqlen_kv | topk | BWD ms | BWD TFLOPS |
 |---------:|----------:|-----:|-------:|-----------:|
