@@ -51,6 +51,23 @@ def with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_grou
     return result
 
 
+def skip_unless_pipeline_active(cfg) -> None:
+    """Skip when ``cfg``'s template family does not run on the active GPU.
+
+    For a test that pins a config of one family to probe a REJECTION: the family
+    gate (kernel_registry.KernelTemplate.arch_active_reject) fires before the rule
+    under test, so on another part the test would meet the arch message instead
+    of the one it asserts. (A test that merely fails with that message is turned
+    into a skip by the frost conftest; one that catches it inside pytest.raises
+    needs this gate.)"""
+    from cudnn.gemm.frost.compiler import _current_arch
+    from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES
+
+    arch = _current_arch()
+    if arch is not None and not any(lo <= arch < hi for lo, hi in PIPELINE_ARCH_RANGES[cfg.pipeline]):
+        pytest.skip(f"the {cfg.pipeline} pipeline does not run on sm_{arch}")
+
+
 # The sm120 (consumer Blackwell, warp-scoped MMA) family's own e2e tests: its
 # templates JIT only on 12.0 <= SM < 13.0 GPUs.
 requires_sm120 = pytest.mark.skipif(

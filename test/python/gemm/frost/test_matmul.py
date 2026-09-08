@@ -24,6 +24,7 @@ import torch
 from gemm_test_utils import (
     requires_int8_mma,
     requires_matmul_gpu,
+    skip_unless_pipeline_active as _skip_unless_active,
     requires_sm100,
     Plan as _plan,
     vp as _vp,
@@ -1543,6 +1544,7 @@ def test_dense_col_quant_rejections() -> None:
         return g
 
     cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    _skip_unless_active(cfg)  # the rules below sit behind the family's arch gate
     with pytest.raises(ValueError, match="divisible by block_size"):
         _plan(_col_graph(160 + 8, 128, 128, 32), config=cfg)
     with pytest.raises(NotImplementedError, match="block_size 32"):
@@ -2760,7 +2762,7 @@ def test_no_template_hardcodes_the_staging_alignment() -> None:
 
     tmpl_dir = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
     files = sorted(p for p in tmpl_dir.glob("sm*.py"))
-    assert len(files) == 7, [p.name for p in files]
+    assert len(files) == 8, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
     for path in files:
         src = path.read_text()
         assert "alignment=64" not in src, path.name
