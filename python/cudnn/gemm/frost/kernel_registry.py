@@ -51,7 +51,7 @@ PIPELINE_ARCH_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
 # SM ranges whose block-scale MMA issues a 64-byte K per instruction (half the
 # instruction count of sm100's 32). SILICON, not a pipeline -- an sm100-pipeline
 # kernel on a 10.7 part gets it, exactly like the B collector and the 576-column
-# TMEM. Read by preferred_mma_tile_k_bytes and validate_block_scale_config.
+# TMEM. Read by preferred_mma_tile_k_bytes and validate_block_scale_config_sm100.
 MMA_INST_K64_ARCH_RANGES: tuple[tuple[int, int], ...] = ((107, 110),)
 
 # Pointwise ops a mainloop-fusion template can transform in SMEM.
@@ -203,6 +203,16 @@ MMA_TYPE_SUPPORT: dict[str, dict[GraphType, frozenset]] = {
     },
     "sm120": {
         GraphType.MATMUL: _MATMUL_CASES,
+        GraphType.BLOCK_SCALE_MATMUL: frozenset(
+            {
+                _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 16),
+                _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
+                _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
+                _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+                _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
+                _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+            }
+        ),
     },
 }
 
@@ -421,7 +431,8 @@ class Sm120KernelTemplate(KernelTemplate):
     8-bit ones — sub-byte dtypes have no transposed load and must be K-major),
     and an N-major output stores whole (n, n+1) accumulator pairs (an M-major
     output scatters per element, so its chunk may narrow freely). Non-fp4
-    output only."""
+    output only. Fronts both sm120 templates (dense and block-scale): a packed
+    fp4 operand is 4-bit, so the MN-major gate keeps it K-major."""
 
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         from .dtypes import DTYPE_BITS, DTYPE_BYTES
@@ -517,6 +528,12 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
     ),
     _mm(
         "sm120_matmul.py",
+        supports_multi_gemm=False,
+        template_cls=Sm120KernelTemplate,
+    ),
+    _mm(
+        "sm120_block_scale_matmul.py",
+        graph_type=GraphType.BLOCK_SCALE_MATMUL,
         supports_multi_gemm=False,
         template_cls=Sm120KernelTemplate,
     ),

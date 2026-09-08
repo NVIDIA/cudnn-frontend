@@ -3162,7 +3162,7 @@ def test_sm120_registry_wiring() -> None:
     # SM 12.x is in the family's active range (whatever else the range covers).
     assert any(lo <= 120 < hi for lo, hi in PIPELINE_ARCH_RANGES["sm120"])
 
-    (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120"]
+    (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120" and t.graph_type is GraphType.MATMUL]
     assert tmpl.file == "sm120_matmul.py"
     assert isinstance(tmpl, Sm120KernelTemplate)
     # Warp-scoped MMA: 1-CTA only, no multi-GEMM (no per-GEMM operand indexing).
@@ -3357,8 +3357,6 @@ def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
     CTA tile) computes the same matmul on a tail-heavy shape. The Am cases pin
     the combinations the old per-MMA swizzle-slice rule wrongly rejected (an
     M-major A on the 2x4 / 1x8 grids has no per-MMA descriptor on sm120)."""
-    if _current_arch() != 120:
-        pytest.skip(f"sm120-host-only matrix (running on sm_{_current_arch()})")
     cfg = _resolve(config_name)
     M, N, K = 192, 192, 160
     ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", a_major=a_major)

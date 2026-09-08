@@ -51,6 +51,13 @@ def with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_grou
     return result
 
 
+# The sm120 (consumer Blackwell, warp-scoped MMA) family's own e2e tests: its
+# templates JIT only on 12.0 <= SM < 13.0 GPUs.
+requires_sm120 = pytest.mark.skipif(
+    _SM is None or not (120 <= _SM < 130),
+    reason="needs a consumer-Blackwell GPU (120 <= SM < 130), have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
+
 # test_matmul.py sweeps every matmul family (sm100 tcgen05 + sm120 warp-MMA), so
 # its module gate is the union of their arch ranges; a config whose own family
 # does not cover the active part is skipped per-case by `_compatible`.
