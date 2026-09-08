@@ -229,6 +229,12 @@ MMA_GPU_ARCH_SPECIAL_CASES: dict[tuple[str, tuple], tuple[tuple[int, int], ...]]
     ("sm103", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 16)): ((107, 110),),
     ("sm103", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 32)): ((107, 110),),
     ("sm103", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32)): ((107, 110),),
+    ("sm120", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 16)): ((120, 130),),
+    ("sm120", _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32)): ((120, 130),),
 }
 
 

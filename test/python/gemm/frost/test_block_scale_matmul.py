@@ -2323,6 +2323,14 @@ _SM120_BS_64x128 = "CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps2x4"
 _SM120_BS_256x128 = "CONFIG_sm120_256x128x128_16x16x32_cluster1x1_warps8x1"
 
 
+def _build_dense_bf16_graph(M, N, K):
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    g.matmul(A=A, B=B, name="mm").set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    return g
+
+
 def _sm120_bs_template():
     (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120" and t.graph_type is GraphType.BLOCK_SCALE_MATMUL]
     return tmpl
@@ -2354,6 +2362,23 @@ def test_sm120_block_scale_registry_wiring():
     assert not any(k[1] == "fp8_e5m3" for k in cases)
     # The renderer's instruction table mirrors the support table exactly.
     assert set(C._SM120_BLOCK_SCALE_MMA) == {(k[0] == "fp4_e2m1", k[2][1], k[1]) for k in cases}
+    # The family's range starts at SM 10.0 for its dense template, but the
+    # block-scaled warp MMA is SM 12.x silicon: every block-scale combo is pinned
+    # to [120, 130) the way int8 is pinned on sm100.
+    from cudnn.gemm.frost.kernel_registry import MMA_GPU_ARCH_SPECIAL_CASES
+
+    assert all(MMA_GPU_ARCH_SPECIAL_CASES[("sm120", k)] == ((120, 130),) for k in cases)
+    dense_chain = analyze(_build_dense_bf16_graph(256, 256, 512))
+    bs_chain = analyze(_build_nvfp4_graph(256, 256, 512))
+    for arch, bs_ok in ((100, False), (103, False), (120, True), (121, True)):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(C, "_current_arch", lambda *a, _v=arch, **k: _v)
+            reason = mma_arch_reject(bs_chain, GraphType.BLOCK_SCALE_MATMUL, "sm120")
+            assert (reason is None) == bs_ok, (arch, reason)
+            if not bs_ok:
+                assert "exists only on 120 <= SM < 130" in reason
+            # the dense sm120 template keeps running on the whole family range
+            assert mma_arch_reject(dense_chain, GraphType.MATMUL, "sm120") is None
 
     chain = analyze(_build_nvfp4_graph(256, 256, 512))
     cfg = by_name(_SM120_BS_128)
