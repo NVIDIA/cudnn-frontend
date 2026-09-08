@@ -42,7 +42,6 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 *   **[HSTU Attention](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/hstu_attention/):** Packed variable-length HSTU attention forward and backward CuTe DSL kernels for Blackwell SM100/SM103 GPUs, using SiLU scores without softmax.
 *   **[NSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/native_sparse_attention/):** Native Sparse attention as described in the Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention.
 *   **[SDPA Backward: SM100, D=256](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/sdpa):** SDPA Backward pass for D=256 on SM100.
-*   **[cudnn SDPA Fprop](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/sdpa):** Open sourcing the Hopper and Blackwell fprop kernels with stats.
 *   **[Fused RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/rms_norm_silu):** Implementation of a fused kernel of RMS normalization followed by SiLU (Swish) activation.
 *   **[DSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/deepseek_sparse_attention):** DSA/CSA kernels for DSv4 and DSv3.2 for fprop and bprop.
 
