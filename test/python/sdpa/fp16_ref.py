@@ -93,17 +93,42 @@ def _grouped(x, h_kv):
     return x.view(b, h_kv, h_q // h_kv, s, d)
 
 
+# The three contractions below are written with torch.matmul on the grouped 5-D views rather
+# than torch.einsum. Same fp32 math, but einsum lowers "bhgqd,bhkd->bhgqk" to one bmm with the
+# GQA group folded into M (M = g*s_q up to ~10^5, N = the 128-wide KV block); on aarch64 VR200
+# (SM107) that cublasSgemmStridedBatched shape crashes or hangs under multi-process GPU
+# sharing (xdist -n 8), while the matmul form keeps the group as a batch dimension and does
+# not. See /home/scratch.vagarwalla_gpu/sm107_cublas_concurrency_repro.
+
+
+def _mm(a, b):
+    # matmul, except that a contraction of length 1 (a 1-column KV block in P @ V, or s_q = 1 in
+    # dS^T @ Q / P^T @ dO) is a plain broadcast product. torch nightlies (2.14.0.dev, torch._native)
+    # reroute aten::bmm with K = 1 to a Triton outer-product kernel, and Triton's ptxas has no
+    # sm_107a target (PTXASError / process abort on Rubin). The product is exact either way.
+    if a.shape[-1] == 1:
+        return a * b
+    return torch.matmul(a, b)
+
+
 def _qk(q, k_block, h_k):
     # q: (b, h_q, s_q, d), k_block: (b, h_k, n, d) -> (b, h_q, s_q, n) without expanding K.
     b, h_q, s_q, _ = q.shape
-    s = torch.einsum("bhgqd,bhkd->bhgqk", _grouped(q, h_k), k_block)
+    s = _mm(_grouped(q, h_k), k_block.transpose(-1, -2).unsqueeze(2))  # (b, h_k, g, s_q, n)
     return s.reshape(b, h_q, s_q, -1)
 
 
 def _pv(p, v_block, h_v):
+    # p: (b, h_q, s_q, n), v_block: (b, h_v, n, d) -> (b, h_q, s_q, d) without expanding V.
     b, h_q, s_q, _ = p.shape
-    o = torch.einsum("bhgqk,bhkd->bhgqd", _grouped(p, h_v), v_block)
+    o = _mm(_grouped(p, h_v), v_block.unsqueeze(2))  # (b, h_v, g, s_q, d)
     return o.reshape(b, h_q, s_q, -1)
+
+
+def _kv_reduce(x, y, h_kv):
+    # x: (b, h_q, s_q, n), y: (b, h_q, s_q, d) -> (b, h_kv, n, d): x^T @ y per head, summed over
+    # the GQA group ("bhgqk,bhgqd->bhkd"). Used for dK (x = dS, y = Q) and dV (x = P, y = dO).
+    return _mm(_grouped(x, h_kv).transpose(-1, -2), _grouped(y, h_kv)).sum(2)
 
 
 def _score_blocks(q, k, attn_scale, mask):
@@ -261,15 +286,13 @@ def compute_ref_backward(
     dV = torch.zeros((b, h_v, s_kv, d_v), dtype=torch.float32, device=device)
     dBias = torch.zeros((1, h_q, s_q, s_kv), dtype=torch.float32, device=device) if bias is not None else None
 
-    q_g_k = _grouped(q, h_k)
-    dO_g_v = _grouped(dO, h_v)
 
     # Pass 2: P = exp(S - lse) per block; all-masked rows give exp(-inf - -inf) -> nan -> 0.
     for start, end, s_block in _score_blocks(q, k, attn_scale, mask):
         p = torch.exp(s_block - lse).nan_to_num()
 
         # dP = dO @ V^T, then apply dropout mask
-        dP = torch.einsum("bhgqd,bhkd->bhgqk", dO_g_v, v[:, :, start:end, :]).reshape(b, h_q, s_q, end - start)
+        dP = _qk(dO, v[:, :, start:end, :], h_v)
         if dropout_prob != 0.0:
             drop = dropout_mask[:, :, :, start:end]
             dP = (dP * drop) / (1 - dropout_prob)
@@ -289,8 +312,8 @@ def compute_ref_backward(
         # dQ += dS @ K_block
         dQ = dQ + _pv(dS, k[:, :, start:end, :], h_k)
         # dK_block = dS^T @ Q, dV_block = P_dropped^T @ dO (both reduce over the GQA group directly)
-        dK[:, :, start:end, :] = torch.einsum("bhgqk,bhgqd->bhkd", _grouped(dS, h_k), q_g_k)
-        dV[:, :, start:end, :] = torch.einsum("bhgqk,bhgqd->bhkd", _grouped(p_dropped, h_v), dO_g_v)
+        dK[:, :, start:end, :] = _kv_reduce(dS, q, h_k)
+        dV[:, :, start:end, :] = _kv_reduce(p_dropped, dO, h_v)
 
     # dSink_token: gradient for sink token
     dSink_token = None
