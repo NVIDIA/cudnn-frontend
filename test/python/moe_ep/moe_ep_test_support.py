@@ -40,6 +40,7 @@ __all__ = [
     "_naive_reference",
     "_output_as_float",
     "_pad_wgrad_operands_for_grouped_kernel",
+    "_poison_pre_reduced_for_test",
     "_poison_training_outputs_for_test",
     "_reference_backward",
     "_reference_forward",
@@ -92,7 +93,7 @@ def make_forward_inputs(device: torch.device):
         axis=1,
     )
     topk_idx = torch.tensor(
-        [[0, 1], [1, 0], [0, -1], [1, 0], [0, 1]],
+        [[0, 1], [1, 0], [0, 1], [1, 0], [0, 1]],
         dtype=torch.int32,
         device=device,
     )
@@ -100,7 +101,7 @@ def make_forward_inputs(device: torch.device):
         [
             [0.75, 0.25],
             [0.625, 0.375],
-            [1.0, 0.0],
+            [0.8, 0.2],
             [0.5, 0.5],
             [0.875, 0.125],
         ],
@@ -390,8 +391,8 @@ def _naive_reference(
     for token in range(token_count):
         for slot in range(top_k):
             expert = int(topk_idx[token, slot])
-            if expert == -1:
-                continue
+            if expert < 0 or expert >= fc1_weight.shape[0]:
+                raise ValueError(f"topk_idx contains invalid expert id {expert}")
             gate_up = activation[token].float() @ fc1_weight[expert].float()
             gate, up = gate_up.split(intermediate_size)
             if clamp is not None:
@@ -548,15 +549,12 @@ def _stress_backend_reuse(
         args[3].copy_(original_topk_idx)
         args[4].copy_(original_topk_weights * float((iteration % 7) + 1) / 7.0)
         if iteration % 10 == 0:
-            args[3].fill_(-1)
+            args[3].copy_(original_topk_idx.flip(1))
         stream = torch.cuda.current_stream(device) if iteration % 2 == 0 else alternate_stream
         with torch.cuda.stream(stream):
             stressed = op(*args)
         stream.synchronize()
-        if iteration % 10 == 0:
-            assert _output_as_float(stressed).eq(0).all()
-        else:
-            assert torch.isfinite(_output_as_float(stressed)).all()
+        assert torch.isfinite(_output_as_float(stressed)).all()
         assert backend._compiled is compiled
         assert backend._plan._workspace is plan_workspace
         if weight_refresh_count is not None:
@@ -570,6 +568,9 @@ def _replay_cuda_graph(
     expected,
     device,
     *,
+    alternate_topk_idx,
+    alternate_expected,
+    poison_before_replay=None,
     synchronize_ranks=None,
 ):
     synchronize_ranks = synchronize_ranks or (lambda: None)
@@ -582,14 +583,16 @@ def _replay_cuda_graph(
 
     for replay in range(20):
         if replay % 2:
-            args[3].fill_(-1)
+            args[3].copy_(alternate_topk_idx)
         else:
             args[3].copy_(original_topk_idx)
+        if poison_before_replay is not None:
+            poison_before_replay()
         synchronize_ranks()
         graph.replay()
         torch.cuda.synchronize(device)
         if replay % 2:
-            assert _output_as_float(graph_output).eq(0).all()
+            _assert_matches_reference(graph_output, alternate_expected)
         else:
             _assert_matches_reference(graph_output, expected)
 
@@ -801,6 +804,31 @@ def _poison_training_outputs_for_test(forward_out, backward_out) -> None:
         tensor = getattr(backward_out, name)
         if tensor is not None:
             tensor.view(torch.uint8).fill_(0xFF)
+
+
+def _poison_pre_reduced_for_test(prepared, shared_workspace) -> None:
+    """Poison every persistent standalone-reduce data and scale byte."""
+
+    capacity = prepared.config.max_tokens_per_rank
+    poisoned = False
+    for offset, bytes_per_token in (
+        (
+            prepared.pre_reduced_activation_offset,
+            prepared.pre_reduced_activation_bytes_per_token,
+        ),
+        (
+            prepared.pre_reduced_activation_sf_offset,
+            prepared.pre_reduced_activation_sf_bytes_per_token,
+        ),
+    ):
+        if offset is not None and bytes_per_token:
+            shared_workspace.narrow(
+                0,
+                offset,
+                capacity * bytes_per_token,
+            ).fill_(0xFF)
+            poisoned = True
+    assert poisoned, "test requires a standalone top-k reduction workspace"
 
 
 def _dequantize_wgrad_operand(
@@ -1267,11 +1295,6 @@ def _assert_backward_matches(actual, expected, topk_idx) -> None:
             msg=lambda default, name=name: (f"{name} does not match the backward reference\n{default}"),
             **close_kwargs,
         )
-
-    dropped = topk_idx == -1
-    assert actual[1][dropped].eq(0).all()
-
-
 def _interleave_fc1_wgrad(
     tensor: torch.Tensor,
     interleave_size: int = 32,

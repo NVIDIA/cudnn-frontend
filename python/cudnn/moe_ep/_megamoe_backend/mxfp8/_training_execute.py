@@ -40,18 +40,6 @@ from ._training_weights import (
 from ._training_wgrad import assemble_training_wgrad_operands
 
 
-def _zero_accepted_route_validity(inputs, prepared) -> None:
-    offset = prepared.accepted_route_validity_offset
-    elements = prepared.accepted_route_validity_elements
-    if offset is None:
-        if elements != 0:
-            raise ValueError("missing validity-table offset for nonzero element count")
-        return
-    if elements <= 0:
-        raise ValueError("validity-table element count must be positive")
-    inputs.local_workspace.narrow(0, offset, elements * 4).zero_()
-
-
 def _activation_views(
     execution: Mxfp8TrainingExecutionViews,
     *,
@@ -197,7 +185,6 @@ def launch_training_forward(
         shared_workspace=workspace.symmetric["kernel_shared_workspace"],
         token_count=token_count,
     )
-    _zero_accepted_route_validity(inputs, prepared)
     _runtime_debug("training-forward.compile.begin", lane=scratch.index)
     compiled = compile_or_get(
         prepared,
@@ -323,7 +310,6 @@ def launch_training_backward(
         shared_workspace=workspace.symmetric["kernel_shared_workspace"],
         token_count=token_count,
     )
-    _zero_accepted_route_validity(inputs, prepared)
     _runtime_debug("training-backward.compile.begin", lane=scratch.index)
     compiled = compile_backward_or_get(
         prepared,

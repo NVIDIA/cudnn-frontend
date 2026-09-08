@@ -142,8 +142,6 @@ class Mxfp8Backend:
                         self.kernel_config,
                         local_workspace_zero_bytes=(prepared.local_workspace_zero_bytes),
                         shared_workspace_zero_bytes=(prepared.shared_workspace_zero_bytes),
-                        accepted_route_validity_offset=(prepared.accepted_route_validity_offset),
-                        accepted_route_validity_elements=(prepared.accepted_route_validity_elements),
                         pre_reduced_activation_offset=(prepared.pre_reduced_activation_offset),
                         pre_reduced_activation_bytes_per_token=(prepared.pre_reduced_activation_bytes_per_token),
                         pre_reduced_activation_sf_offset=(prepared.pre_reduced_activation_sf_offset),
@@ -218,14 +216,9 @@ class Mxfp8Backend:
                 graph_kernel_config,
                 self.device,
             )
-            backward_kernel_config = replace(
-                graph_kernel_config,
-                token_back_mode="epi_warps",
-                fc2_in_kernel_topk_reduce=False,
-            )
             backward = prepare_backward_kernel(
                 training_config,
-                backward_kernel_config,
+                graph_kernel_config,
                 self.device,
             )
             from ._training_resources import Mxfp8TrainingState

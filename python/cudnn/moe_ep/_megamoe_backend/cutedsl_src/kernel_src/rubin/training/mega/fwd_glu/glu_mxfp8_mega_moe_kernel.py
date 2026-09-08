@@ -98,8 +98,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             f"drop{int(self.drop_on_overflow)}_lc{self.launch_cluster_count}_"
             f"genc{int(self.generate_c)}_topkfc11_"
             f"fc2bulk{int(self.fc2_use_bulk)}x{self.fc2_tma_stages}_"
-            f"redtopk{int(self.reduce_topk_in_kernel)}_"
-            f"routevalid{int(not self.reduce_topk_in_kernel)}"
+            f"redtopk{int(self.reduce_topk_in_kernel)}"
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -793,7 +792,6 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         else:
             pre_reduced = self.token_comm.pre_reduced_activation_tensor(dw)
             pre_reduced_sf = self.token_comm.pre_reduced_activation_sf_tensor(dw)
-            accepted_routes = self.token_comm.accepted_route_validity_tensor(dw)
 
         if cutlass.const_expr(self.token_comm.token_back_push_data):
             # token_back-by-dispatch (standalone_warps / reuse_dispatch_warps)
@@ -838,7 +836,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         # Top-k weights were already applied before FC1 quantization, so the
         # post-kernel reduction is a plain dequantized sum.
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
-            self._topk_reduce(pre_reduced, pre_reduced_sf, accepted_routes, output_activation, None, stream)
+            self._topk_reduce(pre_reduced, pre_reduced_sf, output_activation, None, stream)
 
         # Post-kernel token-axis MXFP8 requantization of the preserved dispatch-local
         # FC1 activation pool, stored by the tail snapshot of per-expert token counts.

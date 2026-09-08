@@ -40,11 +40,27 @@ op = MoeEp(
     combine_format="bf16",
     apply_topk_in_fc1=True,
     weight_interleave_size=32,
+    validation_mode="strict",
 )
 ```
 
 Native training requires `weight_interleave_size=32`. FC1 payloads then use
 alternating 32-element gate/up strips.
+
+## Routing contract
+
+Inference and training require dense routing: `topk_idx` has shape `(T, K)`
+and every active value must be a global expert ID in `[0, num_experts)`.
+Negative IDs, including the conventional `-1` dropped-route sentinel, are not
+supported. Private fixed-capacity staging may use `-1` after row `T`; callers
+never pass or consume that tail.
+
+`validation_mode="strict"` checks expert-ID values during eager execution and
+warmup. `"trusted"` skips this device-value check and relies on the caller.
+Structural shape, dtype, device, capacity, aliasing, and output checks remain
+enabled in both modes. CUDA Graph capture and replay do not perform semantic
+routing validation, so routing contents updated at captured addresses must
+continue to satisfy the same dense contract.
 
 ## Explicit sweep autotuning
 
@@ -303,7 +319,16 @@ contract.
 Overflow is private per-launch state. Each forward and backward applies the
 configured policy before returning; there is no public overflow tensor or
 `finalize_overflow` method. EP2+ retains the scalar MAX reduction required to
-make the policy rank-consistent.
+make the policy rank-consistent. Numerically usable results are guaranteed
+only when no overflow occurs. A launch that overflows may raise or drop work
+according to `drop_on_overflow`, but its returned values are outside the
+supported correctness contract.
+
+Private pre-reduction data and scale planes persist across launches and are not
+cleared. Under dense, non-overflow routing, every active `(token, top-k slot)`
+is completely overwritten before reduction. Rows in
+`[T, max_tokens_per_rank)` remain unspecified and must not be returned or
+consumed.
 
 ## CUDA Graph capture
 
@@ -320,8 +345,10 @@ make the policy rank-consistent.
 The local token count `T` is fixed by the input shapes used during capture.
 Every replay of that graph must use the same `T`, shapes, and addresses.
 Tensor contents, routing, `valid_route_counts`, and `expert_offsets` may change
-at those fixed addresses on each replay. Eager invocations may use a different
-`T` and replace addresses between calls, subject to the configured capacity.
+at those fixed addresses on each replay, but all routing IDs must remain valid
+and dense because replay performs no value check. Eager invocations may use a
+different `T` and replace addresses between calls, subject to the configured
+capacity.
 
 ## Breaking migration
 

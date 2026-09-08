@@ -2,11 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Device combine reduce: collapse per-(token, topk) fc2 cells into one row.
 
-The combine step writes one fc2 output per accepted ``(token, topk)`` cell;
-this reduces only cells selected by the source-domain uint32 validity table
-into the token-centric ``(token, hidden)`` output. Unaccepted cells may contain
-stale data from a prior launch and must not be read. The wire format is
-described by ``CombineFormat``:
+The combine step writes one fc2 output per ``(token, topk)`` cell; this reduces
+over the topk axis into the token-centric ``(token, hidden)`` output. The wire
+format is described by ``CombineFormat``:
 
     bf16          -- no staging: bf16 terms reduced directly.
     32e4m3xe8m0   -- MXFP8: fp8 e4m3 data + per-32 e8m0 (power-of-2) scale.
@@ -17,7 +15,8 @@ Task partition: each worker owns one ``(token, hidden_tile)`` and loops topk; th
 flat worker index decodes into ``(token_idx, hidden_tile_idx)`` via a constant
 divide by ``hidden_tiles``. The per-block scale is broadcast to a logical
 per-hidden view (stride 0) so it tiles by the same worker index as the data. The
-activation load stays in the topk loop.
+activation load stays in the topk loop (too large to hoist); the small scale and
+score loads are hoisted ahead of the loop when topk is small.
 """
 
 import os
@@ -161,6 +160,9 @@ class TopkReduce:
     # bf16 8*2B=16B, e4m3 16*1B=16B, e2m1 16*0.5B=8B). For quantized formats this
     # stays <= the scale block, so each worker reads exactly one scale entry.
     _hidden_per_thread: ClassVar[Dict[str, int]] = {"bf16": 8, "32e4m3xe8m0": 16, "16e2m1xbf16": 16}
+    # topk count at/below which the scale + score loads are hoisted ahead of the
+    # topk loop (small enough to not bloat registers; a CTA-broadcast read).
+    _prefetch_limit: ClassVar[int] = 16
 
     def __init__(self, hidden: int, num_topk: int, combine_format: CombineFormat) -> None:
         self.hidden = int(hidden)
@@ -175,9 +177,10 @@ class TopkReduce:
                 f"hidden_per_thread) = {align} for combine_format {combine_format}."
             )
         self.hidden_tiles = self.hidden // self.hidden_per_thread
-        # Tail guard is only needed when the worker count per token is not a
-        # whole number of CTAs.
+        # tail guard only needed when the worker count per token is not a whole
+        # number of CTAs; prefetch only when topk is small enough to hoist.
         self.require_predicate = self.hidden_tiles % self._threads != 0
+        self.prefetch = self.num_topk <= self._prefetch_limit
 
     # -- launcher -------------------------------------------------------------
 
@@ -186,7 +189,6 @@ class TopkReduce:
         self,
         combine_quant: cute.Tensor,  # (token, topk, hidden)
         combine_sf: Optional[cute.Tensor],  # (token, topk, hidden)
-        accepted_routes: cute.Tensor,  # (token, topk) uint32
         reduced_output: cute.Tensor,  # (token, hidden)
         topk_score: Optional[cute.Tensor],  # (token, topk)
         stream: cuda.CUstream,
@@ -200,10 +202,6 @@ class TopkReduce:
             combine_quant.iterator,
             cute.make_layout((combine_quant.shape[0], self.num_topk, self.hidden), stride=combine_quant.stride),
         )
-        accepted_routes = cute.make_tensor(
-            accepted_routes.iterator,
-            cute.make_layout((accepted_routes.shape[0], self.num_topk), stride=accepted_routes.stride),
-        )
         reduced_output = cute.make_tensor(
             reduced_output.iterator,
             cute.make_layout((reduced_output.shape[0], self.hidden), stride=reduced_output.stride),
@@ -214,7 +212,7 @@ class TopkReduce:
             )
 
         if cutlass.const_expr(not self.combine_format.is_quantized):
-            self._reduce_bf16(combine_quant, accepted_routes, topk_score, reduced_output).launch(grid=grid, block=block, stream=stream)
+            self._reduce_bf16(combine_quant, topk_score, reduced_output).launch(grid=grid, block=block, stream=stream)
             return
 
         # The mega kernel hands sf in already as the depth-2 broadcast layout; a
@@ -238,53 +236,32 @@ class TopkReduce:
             )
 
         if cutlass.const_expr(self.combine_format.act_dtype is cutlass.Float8E4M3FN):
-            self._reduce_mxfp8(combine_quant, sf, accepted_routes, topk_score, reduced_output).launch(
+            self._reduce_mxfp8(combine_quant, sf, topk_score, reduced_output).launch(
                 grid=grid, block=block, stream=stream
             )
         else:
-            self._reduce_fp4(combine_quant, sf, accepted_routes, topk_score, reduced_output).launch(
+            self._reduce_fp4(combine_quant, sf, topk_score, reduced_output).launch(
                 grid=grid, block=block, stream=stream
             )
 
     # -- kernels --------------------------------------------------------------
 
-    @cute.jit
-    def _load_accepted_routes(
-        self,
-        accepted_routes: cute.Tensor,
-        token_idx: Int32,
-        worker_idx: Int32,
-    ) -> cute.Tensor:
-        """Load one validity row once per token segment in each warp."""
-        lane_idx = cute.arch.thread_idx()[0] % Int32(32)
-        warp_worker_begin = worker_idx - lane_idx
-        token_worker_begin = token_idx * Int32(self.hidden_tiles)
-        leader_lane = cutlass.max(token_worker_begin - warp_worker_begin, Int32(0))
-        accepted = cute.make_rmem_tensor((self.num_topk,), cutlass.Int32)
-        for k in cutlass.range_constexpr(self.num_topk):
-            value = Int32(0)
-            if lane_idx == leader_lane:
-                value = Int32(accepted_routes[token_idx, Int32(k)])
-            accepted[k] = Int32(cute.arch.shuffle_sync(value, leader_lane))
-        return accepted
-
     @cute.kernel
-    def _reduce_bf16(self, combine_output: cute.Tensor, accepted_routes: cute.Tensor, topk_score: Optional[cute.Tensor], reduced_output: cute.Tensor):
+    def _reduce_bf16(self, combine_output: cute.Tensor, topk_score: Optional[cute.Tensor], reduced_output: cute.Tensor):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
         num_topk: cutlass.Constexpr[int] = self.num_topk
         needs_guard = self.require_predicate
+        prefetch = self.prefetch
         out_dtype = reduced_output.element_type
 
         worker_idx = cute.arch.block_idx()[0] * Int32(threads) + cute.arch.thread_idx()[0]
         token_idx = worker_idx // hidden_tiles
         hidden_tile_idx = worker_idx % hidden_tiles
-        safe_token_idx = token_idx
-        if cutlass.const_expr(needs_guard):
-            if token_idx >= reduced_output.shape[0]:
-                safe_token_idx = Int32(0)
-        accepted = self._load_accepted_routes(accepted_routes, safe_token_idx, worker_idx)
+
+        score_dtype = topk_score.dtype if cutlass.const_expr(topk_score is not None) else cutlass.Float32
+        score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
 
         if (not needs_guard) or token_idx < reduced_output.shape[0]:
             # (token, topk, hidden) -> (topk, hidden_per_thread)
@@ -294,24 +271,35 @@ class TopkReduce:
             # (token, hidden) -> (hidden_per_thread)
             dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
 
+            if cutlass.const_expr(topk_score is not None):
+                if cutlass.const_expr(prefetch):
+                    cute.autovec_copy(topk_score[token_idx, None], score_reg)
+            else:
+                for k in cutlass.range_constexpr(num_topk):
+                    score_reg[k] = score_dtype(1)
+
             load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
             acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
-            acc.fill(0.0)
 
             for k in cutlass.range_constexpr(0, num_topk, 1):
-                if accepted[k] != Int32(0):
-                    term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
-                    cute.copy(
-                        load_atom, mark_alignment(terms[k, None], hidden_per_thread * cutlass.BFloat16.width // 8), term
-                    )
-                    score = Float32(1)
-                    if cutlass.const_expr(topk_score is not None):
-                        score = Float32(topk_score[token_idx, Int32(k)])
-                    score_pair = (score, score)
+                term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+                cute.copy(
+                    load_atom, mark_alignment(terms[k, None], hidden_per_thread * cutlass.BFloat16.width // 8), term
+                )
+                if cutlass.const_expr(topk_score is not None and not prefetch):
+                    score_reg[k] = topk_score[token_idx, Int32(k)]
+                score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
 
-                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
-                        value_pair = (Float32(term[i]), Float32(term[i + 1]))
+                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                    value_pair = (Float32(term[i]), Float32(term[i + 1]))
+                    if cutlass.const_expr(k != 0):
                         acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(value_pair, score_pair, (acc[i], acc[i + 1]))
+                    else:
+                        if cutlass.const_expr(topk_score is not None):
+                            acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(value_pair, score_pair)
+                        else:
+                            acc[i] = value_pair[0]
+                            acc[i + 1] = value_pair[1]
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
@@ -326,7 +314,6 @@ class TopkReduce:
         self,
         combine_quant: cute.Tensor,
         combine_sf: cute.Tensor,  # depth-2 broadcast view: logical (token, topk, hidden) e8m0
-        accepted_routes: cute.Tensor,
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
     ):
@@ -335,16 +322,16 @@ class TopkReduce:
         hidden_tiles = self.hidden_tiles
         num_topk: cutlass.Constexpr[int] = self.num_topk
         needs_guard = self.require_predicate
+        prefetch = self.prefetch
         out_dtype = reduced_output.element_type
 
         worker_idx = cute.arch.block_idx()[0] * Int32(threads) + cute.arch.thread_idx()[0]
         token_idx = worker_idx // hidden_tiles
         hidden_tile_idx = worker_idx % hidden_tiles
-        safe_token_idx = token_idx
-        if cutlass.const_expr(needs_guard):
-            if token_idx >= reduced_output.shape[0]:
-                safe_token_idx = Int32(0)
-        accepted = self._load_accepted_routes(accepted_routes, safe_token_idx, worker_idx)
+
+        score_dtype = topk_score.dtype if cutlass.const_expr(topk_score is not None) else cutlass.Float32
+        score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
+        scale_reg = cute.make_rmem_tensor((num_topk,), cutlass.Float8E8M0FNU)
 
         if (not needs_guard) or token_idx < reduced_output.shape[0]:
             # (token, topk, hidden) -> (topk, hidden_per_thread)
@@ -358,28 +345,44 @@ class TopkReduce:
             # (token, hidden) -> (hidden_per_thread)
             dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
 
+            if cutlass.const_expr(topk_score is not None):
+                if cutlass.const_expr(prefetch):
+                    cute.autovec_copy(topk_score[token_idx, None], score_reg)
+            else:
+                for k in cutlass.range_constexpr(num_topk):
+                    score_reg[k] = score_dtype(1)
+            if cutlass.const_expr(prefetch):
+                cute.autovec_copy(sf[None, 0], scale_reg)  # one scale per topk slot (stride-0 broadcast)
+
             fp8_dtype = self.combine_format.act_dtype
             load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), fp8_dtype, num_bits_per_copy=128)
             acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
-            acc.fill(0.0)
 
             for k in cutlass.range_constexpr(0, num_topk, 1):
-                if accepted[k] != Int32(0):
-                    term = cute.make_rmem_tensor((hidden_per_thread,), fp8_dtype)
-                    cute.copy(load_atom, mark_alignment(codes[k, None], hidden_per_thread * fp8_dtype.width // 8), term)
-                    value = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
-                    value.store(term.load().to(cutlass.Float32))
+                term = cute.make_rmem_tensor((hidden_per_thread,), fp8_dtype)
+                cute.copy(load_atom, mark_alignment(codes[k, None], hidden_per_thread * fp8_dtype.width // 8), term)
+                value = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+                value.store(term.load().to(cutlass.Float32))
 
-                    scale = Float32(sf[k, 0])  # e8m0 -> f32
-                    score = Float32(1)
+                if cutlass.const_expr(not prefetch):
+                    scale_reg[k] = sf[k, 0]
                     if cutlass.const_expr(topk_score is not None):
-                        score = Float32(topk_score[token_idx, Int32(k)])
-                    scale_pair = (scale, scale)
-                    score_pair = (score, score)
+                        score_reg[k] = topk_score[token_idx, Int32(k)]
 
-                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
-                        dequant_pair = cute.arch.mul_packed_f32x2((value[i], value[i + 1]), scale_pair)
+                scale = Float32(scale_reg[k])  # e8m0 -> f32
+                scale_pair = (scale, scale)
+                score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+
+                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                    dequant_pair = cute.arch.mul_packed_f32x2((value[i], value[i + 1]), scale_pair)
+                    if cutlass.const_expr(k != 0):
                         acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(dequant_pair, score_pair, (acc[i], acc[i + 1]))
+                    else:
+                        if cutlass.const_expr(topk_score is not None):
+                            acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(dequant_pair, score_pair)
+                        else:
+                            acc[i] = dequant_pair[0]
+                            acc[i + 1] = dequant_pair[1]
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
@@ -394,7 +397,6 @@ class TopkReduce:
         self,
         combine_quant: cute.Tensor,  # (token, topk, hidden) e2m1 (logical)
         combine_sf: cute.Tensor,  # depth-2 broadcast view: logical (token, topk, hidden) bf16 amax
-        accepted_routes: cute.Tensor,
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
     ):
@@ -403,16 +405,16 @@ class TopkReduce:
         hidden_tiles = self.hidden_tiles
         num_topk: cutlass.Constexpr[int] = self.num_topk
         needs_guard = self.require_predicate
+        prefetch = self.prefetch
         out_dtype = reduced_output.element_type
 
         worker_idx = cute.arch.block_idx()[0] * Int32(threads) + cute.arch.thread_idx()[0]
         token_idx = worker_idx // hidden_tiles
         hidden_tile_idx = worker_idx % hidden_tiles
-        safe_token_idx = token_idx
-        if cutlass.const_expr(needs_guard):
-            if token_idx >= reduced_output.shape[0]:
-                safe_token_idx = Int32(0)
-        accepted = self._load_accepted_routes(accepted_routes, safe_token_idx, worker_idx)
+
+        score_dtype = topk_score.dtype if cutlass.const_expr(topk_score is not None) else cutlass.Float32
+        score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
+        scale_reg = cute.make_rmem_tensor((num_topk,), cutlass.BFloat16)
 
         if (not needs_guard) or token_idx < reduced_output.shape[0]:
             # (token, topk, hidden) -> (topk, hidden_per_thread)
@@ -426,37 +428,52 @@ class TopkReduce:
             # (token, hidden) -> (hidden_per_thread)
             dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
 
+            if cutlass.const_expr(topk_score is not None):
+                if cutlass.const_expr(prefetch):
+                    cute.autovec_copy(topk_score[token_idx, None], score_reg)
+            else:
+                for k in cutlass.range_constexpr(num_topk):
+                    score_reg[k] = score_dtype(1)
+            if cutlass.const_expr(prefetch):
+                cute.autovec_copy(sf[None, 0], scale_reg)
+
             load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float4E2M1FN, num_bits_per_copy=64)
             acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
-            acc.fill(0.0)
 
             for k in cutlass.range_constexpr(0, num_topk, 1):
-                if accepted[k] != Int32(0):
-                    term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float4E2M1FN)
-                    cute.copy(
-                        load_atom, mark_alignment(codes[k, None], hidden_per_thread * cutlass.Float4E2M1FN.width // 8), term
-                    )
-                    value = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
-                    # Dev-only knob (MEGA_F4CVT_USE_MANUAL): manual LUT/PRMT decode vs
-                    # the HW cvt path, so both SASS forms can be compared on device;
-                    # one is kept once chosen. Read inline on purpose -- never a
-                    # customer-facing option. Both decoders are bit-exact.
-                    if cutlass.const_expr(os.environ.get("MEGA_F4CVT_USE_MANUAL", "0") == "1"):
-                        cvt_e2m1_to_fp32_optimal_ptx(term, value)
-                    else:
-                        cvt_e2m1_to_fp32_cvt_ptx(term, value)
+                term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float4E2M1FN)
+                cute.copy(
+                    load_atom, mark_alignment(codes[k, None], hidden_per_thread * cutlass.Float4E2M1FN.width // 8), term
+                )
+                value = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+                # Dev-only knob (MEGA_F4CVT_USE_MANUAL): manual LUT/PRMT decode vs
+                # the HW cvt path, so both SASS forms can be compared on device;
+                # one is kept once chosen. Read inline on purpose -- never a
+                # customer-facing option. Both decoders are bit-exact.
+                if cutlass.const_expr(os.environ.get("MEGA_F4CVT_USE_MANUAL", "0") == "1"):
+                    cvt_e2m1_to_fp32_optimal_ptx(term, value)
+                else:
+                    cvt_e2m1_to_fp32_cvt_ptx(term, value)
 
-                    # amax (bf16) -> per-element scale; (1/6) folds the fp4 grid max.
-                    scale = Float32(sf[k, 0]) * Float32(Nvfp4E2M1RcpLimit)
-                    score = Float32(1)
+                if cutlass.const_expr(not prefetch):
+                    scale_reg[k] = sf[k, 0]
                     if cutlass.const_expr(topk_score is not None):
-                        score = Float32(topk_score[token_idx, Int32(k)])
-                    scale_pair = (scale, scale)
-                    score_pair = (score, score)
+                        score_reg[k] = topk_score[token_idx, Int32(k)]
 
-                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
-                        dequant_pair = cute.arch.mul_packed_f32x2((value[i], value[i + 1]), scale_pair)
+                # amax (bf16) -> per-element scale; (1/6) folds the fp4 grid max.
+                scale = Float32(scale_reg[k]) * Float32(Nvfp4E2M1RcpLimit)
+                scale_pair = (scale, scale)
+                score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+
+                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                    dequant_pair = cute.arch.mul_packed_f32x2((value[i], value[i + 1]), scale_pair)
+                    if cutlass.const_expr(k != 0):
                         acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(dequant_pair, score_pair, (acc[i], acc[i + 1]))
+                    elif cutlass.const_expr(topk_score is not None):
+                        acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(dequant_pair, score_pair)
+                    else:
+                        acc[i] = dequant_pair[0]
+                        acc[i + 1] = dequant_pair[1]
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))

@@ -105,8 +105,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             f"deterministic_mtpr{self.max_tokens_per_rank}_mrpr{self.max_recv_size_per_rank}_"
             f"drop{int(self.drop_on_overflow)}_lc{self.launch_cluster_count}_"
             f"recompute{int(self.dfc2_recompute)}x{int(self.dfc2_col_output)}_"
-            f"redtopk{int(self.reduce_topk_in_kernel)}_"
-            f"routevalid{int(not self.reduce_topk_in_kernel)}_preactarg1"
+            f"redtopk{int(self.reduce_topk_in_kernel)}_preactarg1"
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -861,7 +860,6 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         else:
             pre_reduced = self.token_comm.pre_reduced_activation_tensor(dw)
             pre_reduced_sf = self.token_comm.pre_reduced_activation_sf_tensor(dw)
-            accepted_routes = self.token_comm.accepted_route_validity_tensor(dw)
 
         if cutlass.const_expr(self.token_comm.token_back_push_data):
             # token_back-by-dispatch: the epilogue writes grad_x to the LOCAL fc2_activation
@@ -923,7 +921,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
 
         # Post-kernel top-k reduction: dequant + K-sum into the final output.
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
-            self._topk_reduce(pre_reduced, pre_reduced_sf, accepted_routes, output_activation, None, stream)
+            self._topk_reduce(pre_reduced, pre_reduced_sf, output_activation, None, stream)
 
         # Export the routed dfc2 input in token-axis MXFP8 form. The source
         # grad_out pool and its row-wise SF remain resident after reset_tail.

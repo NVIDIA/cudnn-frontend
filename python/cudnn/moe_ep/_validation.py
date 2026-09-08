@@ -109,10 +109,13 @@ def _validate_expert_ids(
     config: ForwardConfig,
     topk_idx: torch.Tensor,
 ) -> None:
-    valid_experts = topk_idx.reshape(-1)
-    valid_experts = valid_experts[valid_experts != -1]
-    if valid_experts.numel() > 0 and bool(((valid_experts < 0) | (valid_experts >= config.num_experts)).any().item()):
-        raise ValueError("topk_idx contains out-of-range expert ids")
+    expert_ids = topk_idx.reshape(-1)
+    if expert_ids.numel() > 0 and bool(((expert_ids < 0) | (expert_ids >= config.num_experts)).any().item()):
+        raise ValueError(
+            "topk_idx must contain a valid global expert id in "
+            f"[0, {config.num_experts}) for every route; negative and "
+            "dropped-route sentinel values are not supported"
+        )
 
 
 def _validate_routes(

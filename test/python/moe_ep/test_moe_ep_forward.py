@@ -27,6 +27,7 @@ from moe_ep.moe_ep_test_support import (
     _make_forward_case,
     _naive_reference,
     _output_as_float,
+    _poison_pre_reduced_for_test,
     _reference_forward,
     _replay_cuda_graph,
     _require_distributed_sm107,
@@ -319,72 +320,6 @@ def test_in_kernel_topk_reduce_omits_standalone_combine_workspace():
 
 
 @pytest.mark.L0
-def test_standalone_topk_reduce_tracks_uint32_accepted_routes():
-    import cutlass
-
-    from cudnn.moe_ep._megamoe_backend.mxfp8._compile import (
-        _accepted_route_validity_workspace_metadata,
-    )
-
-    class NoValidityWorkspace:
-        def region(self, _name):
-            raise AssertionError("in-kernel reduction must not query validity")
-
-    config = SimpleNamespace(
-        fc2_in_kernel_topk_reduce=True,
-        max_tokens_per_rank=5,
-        top_k=3,
-    )
-    assert _accepted_route_validity_workspace_metadata(
-        NoValidityWorkspace(),
-        config,
-        local_bytes=0,
-    ) == (None, 0)
-
-    elements = config.max_tokens_per_rank * config.top_k
-
-    class StandaloneWorkspace:
-        def region(self, _name):
-            return SimpleNamespace(
-                buffer_space="local",
-                dtype=cutlass.Uint32,
-            )
-
-        def offset(self, _name):
-            return 64
-
-        def nbytes(self, _name):
-            return elements * 4
-
-    config.fc2_in_kernel_topk_reduce = False
-    assert _accepted_route_validity_workspace_metadata(
-        StandaloneWorkspace(),
-        config,
-        local_bytes=64 + elements * 4,
-    ) == (64, elements)
-
-
-@pytest.mark.L0
-def test_training_reset_clears_only_accepted_route_validity():
-    from cudnn.moe_ep._megamoe_backend.mxfp8._training_execute import (
-        _zero_accepted_route_validity,
-    )
-
-    workspace = torch.full((96,), 0xA5, dtype=torch.uint8)
-    inputs = SimpleNamespace(local_workspace=workspace)
-    prepared = SimpleNamespace(
-        accepted_route_validity_offset=16,
-        accepted_route_validity_elements=8,
-    )
-
-    _zero_accepted_route_validity(inputs, prepared)
-
-    assert workspace[:16].eq(0xA5).all()
-    assert workspace[16:48].eq(0).all()
-    assert workspace[48:].eq(0xA5).all()
-
-
-@pytest.mark.L0
 @pytest.mark.parametrize(
     ("combine_format", "bits_per_element"),
     [
@@ -509,6 +444,23 @@ def test_moe_ep_accepts_validation_modes(validation_mode):
         validation_mode=validation_mode,
     ) as op:
         assert op.validation_mode == validation_mode
+
+
+@pytest.mark.L0
+def test_strict_expert_id_validation_requires_dense_routes():
+    from cudnn import MoeEp
+    from cudnn.moe_ep._validation import _validate_expert_ids
+
+    with MoeEp(**_forward_config()) as op:
+        config = op._forward_config
+        _validate_expert_ids(config, torch.tensor([[0, 1]], dtype=torch.int32))
+        with pytest.raises(ValueError, match="dropped-route sentinel"):
+            _validate_expert_ids(config, torch.tensor([[0, -1]], dtype=torch.int32))
+        with pytest.raises(ValueError, match="valid global expert id"):
+            _validate_expert_ids(
+                config,
+                torch.tensor([[0, config.num_experts]], dtype=torch.int32),
+            )
 
 
 @pytest.mark.L0
@@ -706,8 +658,6 @@ def test_bf16_forward_matches_reference_and_returns_fresh_outputs():
         first = op(*args)
         snapshot = first.clone()
         second = op(*args)
-        args[3].fill_(-1)
-        dropped = op(*args)
         torch.cuda.synchronize(device)
 
     assert isinstance(first, torch.Tensor)
@@ -720,7 +670,6 @@ def test_bf16_forward_matches_reference_and_returns_fresh_outputs():
     torch.testing.assert_close(first, snapshot, rtol=0, atol=0)
     torch.testing.assert_close(first, second, rtol=0, atol=0)
     _assert_matches_reference(first, expected)
-    assert dropped.eq(0).all()
 
 
 @pytest.mark.L1
@@ -964,15 +913,22 @@ def test_supported_topk_shape_and_routing_format_matrix(
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("combine_format", ["bf16", "mxfp8"])
-def test_single_gpu_stress_and_cuda_graph_replay(combine_format):
+@pytest.mark.parametrize("capacity", [5, 129])
+def test_single_gpu_stress_and_cuda_graph_replay(combine_format, capacity):
     from cudnn import MoeEp
 
     device = _sm107_device()
     args = make_forward_inputs(device)
     original_topk_idx = args[3].clone()
     original_topk_weights = args[4].clone()
-    config = _forward_config(combine_format=combine_format)
+    config = _forward_config(
+        combine_format=combine_format,
+        max_tokens_per_rank=capacity,
+    )
     expected = _reference_forward(args, **config)
+    alternate_topk_idx = original_topk_idx.flip(1).contiguous()
+    alternate_args = (*args[:3], alternate_topk_idx, args[4])
+    alternate_expected = _reference_forward(alternate_args, **config)
 
     with MoeEp(**config) as op:
         op.warmup(*args)
@@ -987,10 +943,33 @@ def test_single_gpu_stress_and_cuda_graph_replay(combine_format):
 
         args[3].copy_(original_topk_idx)
         args[4].copy_(original_topk_weights)
+        backend = op._forward_backend
+        assert backend is not None
+        assert backend._prepared_kernel is not None
+        assert backend._plan is not None
+        assert backend._plan._workspace is not None
+
+        def poison_pre_reduced():
+            workspace = backend._plan._workspace.views(args[0].logical_shape[0])
+            _poison_pre_reduced_for_test(
+                backend._prepared_kernel,
+                workspace.symmetric["kernel_shared_workspace"],
+            )
+
+        poison_pre_reduced()
         eager = op(*args)
         torch.cuda.synchronize(device)
         _assert_matches_reference(eager, expected)
-        _replay_cuda_graph(op, args, original_topk_idx, expected, device)
+        _replay_cuda_graph(
+            op,
+            args,
+            original_topk_idx,
+            expected,
+            device,
+            alternate_topk_idx=alternate_topk_idx,
+            alternate_expected=alternate_expected,
+            poison_before_replay=poison_pre_reduced,
+        )
 
 
 @pytest.mark.L0

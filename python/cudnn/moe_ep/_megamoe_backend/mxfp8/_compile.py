@@ -40,8 +40,6 @@ class PreparedMxfp8Kernel:
     pre_reduced_activation_bytes_per_token: int
     pre_reduced_activation_sf_offset: int | None
     pre_reduced_activation_sf_bytes_per_token: int
-    accepted_route_validity_offset: int | None
-    accepted_route_validity_elements: int
     local_workspace_zero_bytes: int
     shared_workspace_zero_bytes: int
 
@@ -59,38 +57,6 @@ _TOKEN_SRC_METADATA_REGION = "nvlink.token_comm.token_src_metadata"
 _COL_QUANT_SIZES_REGION = "rubin.glu_mxfp8.mega.col_quant_expert_token_sizes"
 _PRE_REDUCED_ACTIVATION_REGION = "nvlink.token_comm.pre_reduced_activation"
 _PRE_REDUCED_ACTIVATION_SF_REGION = "nvlink.token_comm.pre_reduced_activation_sf"
-_ACCEPTED_ROUTE_VALIDITY_REGION = "nvlink.token_comm.accepted_route_validity"
-
-
-def _accepted_route_validity_workspace_metadata(
-    device_workspace: Any,
-    config: Mxfp8KernelConfig,
-    local_bytes: int,
-) -> tuple[int | None, int]:
-    """Describe the source-domain uint32 validity table, if required."""
-    if config.fc2_in_kernel_topk_reduce:
-        return None, 0
-
-    import cutlass
-
-    region = device_workspace.region(_ACCEPTED_ROUTE_VALIDITY_REGION)
-    if region.buffer_space != "local":
-        raise RuntimeError("Rubin accepted_route_validity must reside in local workspace")
-    if region.dtype is not cutlass.Uint32:
-        raise RuntimeError("Rubin accepted_route_validity must use Uint32 elements")
-    offset = int(device_workspace.offset(_ACCEPTED_ROUTE_VALIDITY_REGION))
-    nbytes = int(device_workspace.nbytes(_ACCEPTED_ROUTE_VALIDITY_REGION))
-    elements = config.max_tokens_per_rank * config.top_k
-    expected_bytes = elements * 4
-    if nbytes != expected_bytes:
-        raise RuntimeError(
-            "Rubin accepted_route_validity size does not match "
-            f"max_tokens_per_rank={config.max_tokens_per_rank}, top_k={config.top_k}: "
-            f"{nbytes} bytes, expected {expected_bytes}"
-        )
-    if offset + nbytes > local_bytes:
-        raise RuntimeError("Rubin accepted_route_validity region exceeds local workspace")
-    return offset, elements
 
 
 def _pre_reduced_workspace_metadata(
@@ -271,14 +237,6 @@ def prepare_kernel(
         config,
         shared_bytes,
     )
-    (
-        accepted_route_validity_offset,
-        accepted_route_validity_elements,
-    ) = _accepted_route_validity_workspace_metadata(
-        device_workspace,
-        config,
-        local_bytes,
-    )
     return PreparedMxfp8Kernel(
         config=config,
         device=torch.device(device),
@@ -297,8 +255,6 @@ def prepare_kernel(
         pre_reduced_activation_bytes_per_token=(pre_reduced_activation_bytes_per_token),
         pre_reduced_activation_sf_offset=pre_reduced_activation_sf_offset,
         pre_reduced_activation_sf_bytes_per_token=(pre_reduced_activation_sf_bytes_per_token),
-        accepted_route_validity_offset=accepted_route_validity_offset,
-        accepted_route_validity_elements=accepted_route_validity_elements,
         local_workspace_zero_bytes=int(local_zero_bytes),
         shared_workspace_zero_bytes=int(shared_zero_bytes),
     )
@@ -340,10 +296,10 @@ def compile_or_get(
         _COMPILE_CACHE[key] = compiled
         return compiled
 
+
 __all__ = [
     "CompiledMxfp8Kernel",
     "PreparedMxfp8Kernel",
-    "_accepted_route_validity_workspace_metadata",
     "compile_or_get",
     "prepare_kernel",
 ]

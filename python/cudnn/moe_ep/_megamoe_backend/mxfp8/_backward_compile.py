@@ -16,7 +16,6 @@ from ..._contracts import ForwardConfig
 from .._plan import PreparedResources
 from .._workspace import WorkspaceRequirements
 from ._compile import (
-    _accepted_route_validity_workspace_metadata,
     _pre_reduced_sf_workspace_metadata,
     _pre_reduced_workspace_metadata,
 )
@@ -39,8 +38,6 @@ class PreparedMxfp8BackwardKernel:
     pre_reduced_activation_bytes_per_token: int
     pre_reduced_activation_sf_offset: int | None
     pre_reduced_activation_sf_bytes_per_token: int
-    accepted_route_validity_offset: int
-    accepted_route_validity_elements: int
     local_workspace_zero_bytes: int
     shared_workspace_zero_bytes: int
     dfc2_recompute: bool
@@ -195,13 +192,6 @@ def prepare_backward_kernel(
         config,
         shared_bytes,
     )
-    accepted_route_validity_offset, accepted_route_validity_elements = _accepted_route_validity_workspace_metadata(
-        device_workspace,
-        config,
-        local_bytes,
-    )
-    if accepted_route_validity_offset is None or accepted_route_validity_elements <= 0:
-        raise RuntimeError("Rubin MXFP8 backward requires an accepted-route validity table")
     return PreparedMxfp8BackwardKernel(
         config=config,
         device=torch.device(device),
@@ -214,8 +204,6 @@ def prepare_backward_kernel(
         pre_reduced_activation_bytes_per_token=pre_reduced_bytes_per_token,
         pre_reduced_activation_sf_offset=pre_reduced_sf_offset,
         pre_reduced_activation_sf_bytes_per_token=(pre_reduced_sf_bytes_per_token),
-        accepted_route_validity_offset=accepted_route_validity_offset,
-        accepted_route_validity_elements=accepted_route_validity_elements,
         local_workspace_zero_bytes=int(local_zero),
         shared_workspace_zero_bytes=int(shared_zero),
         dfc2_recompute=dfc2_recompute,

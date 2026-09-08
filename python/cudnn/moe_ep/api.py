@@ -205,9 +205,11 @@ class MoeEp:
 
     ``validation_mode="strict"`` validates expert IDs before eager execution.
     ``validation_mode="trusted"`` skips only that value-range check; callers
-    must guarantee that every routing ID is ``-1`` or belongs to
-    ``[0, num_experts)``. Structural tensor, workspace, aliasing, and overflow
-    checks remain enabled in both modes.
+    must guarantee that every routing ID belongs to ``[0, num_experts)``.
+    Negative IDs and dropped-route sentinels are not supported. CUDA Graph
+    replay does not repeat this value check, so replayed routing contents must
+    preserve the same dense-routing invariant. Structural tensor, workspace,
+    aliasing, and overflow checks remain enabled in both modes.
     """
 
     def __init__(

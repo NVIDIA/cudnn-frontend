@@ -15,7 +15,8 @@ The private backend provides Rubin SM107 MXFP8 execution for `cudnn.moe_ep`.
 Inference accepts BF16/FP16/FP32 or MXFP8 operands. Training accepts
 BF16/FP32 or MXFP8 activation and grad-output, contiguous Int32 routing
 indices, contiguous FP32 routing weights, and independent native forward and
-backward weight packs.
+backward weight packs. Every active routing index is a valid global expert ID;
+the `-1` sentinel is reserved for private capacity-tail staging.
 
 ## Execution state
 
@@ -59,6 +60,11 @@ Caller outputs are borrowed for one launch:
   to caller buffers because remote ranks address the symmetric plane;
 - primary forward/backward outputs are required caller-owned destinations.
 
+Standalone top-k reduction uses persistent pre-reduction data and scale
+planes without clearing them between launches. Dense, non-overflow routing
+must completely overwrite every active `(token, top-k slot)` before reduction.
+Capacity-tail rows are unspecified and never copied to caller outputs.
+
 The producing kernels already expose the final grouped-WGrad scale carriers
 when token and scale-factor padding are both 128. Caller E8M0 matrices are
 viewed through the producer's flat or matrix signature, so no scale expansion
@@ -81,4 +87,6 @@ Preparation and first-time compilation happen before capture. Training calls
 require every destination advertised by `prepare_training()` to be
 caller-owned. Every input, output, saved-state, native weight, and staging
 address referenced by a graph remains stable until that graph executable is
-destroyed. Eager calls may change addresses between invocations.
+destroyed. Routing values remain dense and valid on every replay; replay adds
+no value-validation work. Eager calls may change addresses between
+invocations.

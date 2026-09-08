@@ -145,18 +145,6 @@ def _zero_workspace_prefix(
     workspace[:nbytes].zero_()
 
 
-def _zero_workspace_range(
-    workspace: torch.Tensor,
-    offset: int,
-    nbytes: int,
-    *,
-    name: str,
-) -> None:
-    if offset < 0 or nbytes < 0 or offset + nbytes > workspace.numel():
-        raise ValueError(f"{name} byte range [{offset}, {offset + nbytes}) exceeds " f"{workspace.numel()} bytes")
-    workspace.narrow(0, offset, nbytes).zero_()
-
-
 def _interleave_gate_up_rows(
     tensor: torch.Tensor,
     intermediate: int,
@@ -399,8 +387,6 @@ class Mxfp8InputAdapter:
         *,
         local_workspace_zero_bytes: int,
         shared_workspace_zero_bytes: int,
-        accepted_route_validity_offset: int | None,
-        accepted_route_validity_elements: int,
         pre_reduced_activation_offset: int | None,
         pre_reduced_activation_bytes_per_token: int,
         pre_reduced_activation_sf_offset: int | None,
@@ -517,28 +503,17 @@ class Mxfp8InputAdapter:
             self._initialized_workspace_key = workspace_key
         if config.fc2_in_kernel_topk_reduce:
             if (
-                accepted_route_validity_offset is not None
-                or accepted_route_validity_elements != 0
-                or pre_reduced_activation_offset is not None
+                pre_reduced_activation_offset is not None
                 or pre_reduced_activation_bytes_per_token != 0
                 or pre_reduced_activation_sf_offset is not None
                 or pre_reduced_activation_sf_bytes_per_token != 0
             ):
-                raise ValueError("in-kernel top-k reduction must not receive standalone " "combine validity or pre-reduced workspaces")
+                raise ValueError("in-kernel top-k reduction must not receive a " "standalone pre-reduced activation workspace")
         else:
-            if accepted_route_validity_offset is None or accepted_route_validity_elements <= 0:
-                raise ValueError("standalone top-k reduction requires an accepted-route validity table")
-            _zero_workspace_range(
-                local_workspace,
-                accepted_route_validity_offset,
-                accepted_route_validity_elements * 4,
-                name="accepted-route validity table",
-            )
             if pre_reduced_activation_offset is None or pre_reduced_activation_bytes_per_token <= 0:
                 raise ValueError("standalone top-k reduction requires a pre-reduced " "activation workspace")
-            # The persistent data/scale planes are intentionally not cleared.
-            # Router acceptance marks exactly which source slots TopkReduce may
-            # consume during this launch.
+            # Dense routing guarantees that every active (token, top-k) row is
+            # completely overwritten before the standalone reduction.
             quantized_combine = config.combine_format != "bf16"
             if quantized_combine:
                 if pre_reduced_activation_sf_offset is None or pre_reduced_activation_sf_bytes_per_token <= 0:

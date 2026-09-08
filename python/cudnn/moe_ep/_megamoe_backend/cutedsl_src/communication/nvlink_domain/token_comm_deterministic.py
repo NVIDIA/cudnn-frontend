@@ -149,7 +149,6 @@ class _MetadataPushRouter(KernelComponent):
     router_histogram_done_region = "nvlink.token_comm.router_histogram_done"
     router_cta_histograms_region = "nvlink.token_comm.router_cta_histograms"
     source_base_ready_region = "nvlink.token_comm.source_base_ready"
-    accepted_route_validity_region = "nvlink.token_comm.accepted_route_validity"
 
     router_data_histogram_region = "nvlink.token_comm.router_smem.data_histogram"
     router_data_totals_region = "nvlink.token_comm.router_smem.data_totals"
@@ -176,7 +175,7 @@ class _MetadataPushRouter(KernelComponent):
 
     @classmethod
     def impl_desc_require(cls) -> dict[str, type]:
-        return {"token_padding_block": int, "promised_launchable_sm_count": int, "drop_on_overflow": bool, "reduce_topk_in_kernel": bool}
+        return {"token_padding_block": int, "promised_launchable_sm_count": int, "drop_on_overflow": bool}
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
@@ -193,8 +192,6 @@ class _MetadataPushRouter(KernelComponent):
         self.token_padding_block = impl_desc["token_padding_block"]
         self.promised_launchable_sm_count = impl_desc["promised_launchable_sm_count"]
         self.drop_on_overflow = impl_desc["drop_on_overflow"]
-        self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
-        self.track_accepted_routes = not self.reduce_topk_in_kernel
 
         self._validate_router_configuration()
         token_capacity = self.receive_capacity(self.token_padding_block)
@@ -378,19 +375,6 @@ class _MetadataPushRouter(KernelComponent):
             self.sorted_metadata_ready_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
         )
         workspace.register(self.push_table_ready_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset")
-        if self.track_accepted_routes:
-            # Source-domain validity metadata for the standalone TopkReduce.
-            # This is deliberately a persistent data region rather than a
-            # tail-reset counter: it must survive the MegaMoE kernel tail and
-            # is explicitly cleared by the host before every launch.
-            workspace.register(
-                self.accepted_route_validity_region,
-                cutlass.Uint32,
-                (self.max_tokens_per_rank, self.topk),
-                buffer_space="local",
-                stride=(self.topk, 1),
-                byte_alignment=16,
-            )
         if self.router_data_cta_count > 1:
             workspace.register(
                 self.router_cta_histograms_region,
@@ -760,8 +744,6 @@ class _MetadataPushRouter(KernelComponent):
                 destination_scores_address = (
                     self._device_workspace.ptr(self.fc1_topk_scores_region).toint() + peer_offset
                 )
-            if cutlass.const_expr(self.track_accepted_routes):
-                accepted_routes = self._device_workspace.tensor(self.accepted_route_validity_region)
             route_round_count = (route_count + Int32(31)) // Int32(32)
             for route_round in cutlass.range(route_round_count, unroll=1):
                 route = Int32(route_round) * Int32(32) + self._router_lane_idx
@@ -775,12 +757,6 @@ class _MetadataPushRouter(KernelComponent):
                         metadata,
                         physical_store,
                     )
-                    if cutlass.const_expr(self.track_accepted_routes):
-                        if physical_store:
-                            metadata_high = metadata >> Int64(32)
-                            src_token = Int32(metadata & Int64(0xFFFFFFFF))
-                            src_topk = Int32(metadata_high & Int64(0xFFFF))
-                            accepted_routes[src_token, src_topk] = cutlass.Uint32(1)
                     if cutlass.const_expr(self.apply_topk_at_fc1):
                         score = cute.arch.load(source_scores + source_position, cutlass.Float32)
                         stg_f32(
@@ -1282,7 +1258,6 @@ class TokenCommDeterministic(KernelComponent):
     fc2_activation_sf_region = "nvlink.token_comm.fc2_activation_sf"
     pre_reduced_activation_region = "nvlink.token_comm.pre_reduced_activation"
     pre_reduced_activation_sf_region = "nvlink.token_comm.pre_reduced_activation_sf"
-    accepted_route_validity_region = _MetadataPushRouter.accepted_route_validity_region
     token_back_schedule_region = "nvlink.token_comm.token_back_schedule"
 
     token_in_mbarrier_region = "nvlink.token_comm.main_smem.token_in_mbarriers"
@@ -1778,13 +1753,6 @@ class TokenCommDeterministic(KernelComponent):
         if cutlass.const_expr(self.reduce_topk_in_kernel or not self.combine_format.is_quantized):
             return None
         return device_workspace.tensor(self.pre_reduced_activation_sf_region)
-
-    @cute.jit
-    def accepted_route_validity_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
-        """Return the source ``(token, topk)`` accepted-route table."""
-        if cutlass.const_expr(self.reduce_topk_in_kernel):
-            return None
-        return device_workspace.tensor(self.accepted_route_validity_region)
 
     @cute.jit
     def token_in(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> None:

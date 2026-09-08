@@ -72,6 +72,7 @@ from moe_ep.moe_ep_test_support import (
     _grad_output,
     _interleave_fc1_wgrad,
     _pad_wgrad_operands_for_grouped_kernel,
+    _poison_pre_reduced_for_test,
     _poison_training_outputs_for_test,
     _sm107_device,
     _training_abi_prepared,
@@ -251,25 +252,46 @@ def test_training_input_rejects_noncontiguous_plain_tensor():
 
 
 @pytest.mark.L0
-def test_training_input_trusted_mode_skips_only_expert_id_range_check():
+def test_training_input_strict_requires_dense_routes_and_trusted_skips_value_checks():
     config = _training_config(weight_interleave_size=32)
     activation = torch.empty((2, config.hidden_size), dtype=torch.bfloat16)
-    topk_idx = torch.tensor(
-        [[0, config.num_experts], [-1, 0]],
-        dtype=torch.int32,
-    )
     topk_weights = torch.ones((2, config.top_k), dtype=torch.float32)
 
-    with pytest.raises(ValueError, match="out-of-range expert ids"):
-        validate_training_input(
-            config,
-            "activation",
-            activation,
-            topk_idx,
-            topk_weights,
-            device=torch.device("cpu"),
-            validate_expert_ids=True,
+    for topk_idx in (
+        torch.tensor([[0, 1], [-1, 0]], dtype=torch.int32),
+        torch.tensor([[0, config.num_experts], [1, 0]], dtype=torch.int32),
+    ):
+        with pytest.raises(ValueError, match="valid global expert id"):
+            validate_training_input(
+                config,
+                "activation",
+                activation,
+                topk_idx,
+                topk_weights,
+                device=torch.device("cpu"),
+                validate_expert_ids=True,
+            )
+
+        assert (
+            validate_training_input(
+                config,
+                "activation",
+                activation,
+                topk_idx,
+                topk_weights,
+                device=torch.device("cpu"),
+                validate_expert_ids=False,
+            )
+            == 2
         )
+
+
+@pytest.mark.L0
+def test_training_input_strict_accepts_dense_routes():
+    config = _training_config(weight_interleave_size=32)
+    activation = torch.empty((2, config.hidden_size), dtype=torch.bfloat16)
+    topk_idx = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+    topk_weights = torch.ones((2, config.top_k), dtype=torch.float32)
 
     assert (
         validate_training_input(
@@ -279,7 +301,7 @@ def test_training_input_trusted_mode_skips_only_expert_id_range_check():
             topk_idx,
             topk_weights,
             device=torch.device("cpu"),
-            validate_expert_ids=False,
+            validate_expert_ids=True,
         )
         == 2
     )
@@ -459,8 +481,8 @@ def test_mxfp8_training_input_bypasses_quantization_stager():
         logical_shape=(token_count, hidden),
         axis=1,
     )
-    topk_idx = torch.tensor([[0, 1], [1, -1]], dtype=torch.int32)
-    topk_weights = torch.tensor([[0.75, 0.25], [1.0, 0.0]], dtype=torch.float32)
+    topk_idx = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.75, 0.25], [0.625, 0.375]], dtype=torch.float32)
     activation_data = torch.empty((4, hidden), dtype=torch.float8_e4m3fn)
     activation_sf = torch.empty((4, hidden // 32), dtype=torch.float8_e8m0fnu)
     routing_idx = torch.empty((4, top_k), dtype=torch.int32)
@@ -896,14 +918,20 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize(
-    "input_dtype",
+    ("input_dtype", "combine_format", "capacity"),
     (
-        pytest.param(torch.bfloat16, id="bf16"),
-        pytest.param(torch.float32, id="fp32"),
+        pytest.param(torch.bfloat16, "bf16", 5, id="bf16-combine-full"),
+        pytest.param(torch.float32, "bf16", 129, id="bf16-combine-tail"),
+        pytest.param(torch.bfloat16, "mxfp8", 5, id="mxfp8-combine-full"),
+        pytest.param(torch.float32, "mxfp8", 129, id="mxfp8-combine-tail"),
     ),
 )
-def test_stateless_training_ep1_poisoned_capacity_matches_reference(input_dtype):
-    """Poisoned invalid WGrad rows must not affect valid eager/graph results."""
+def test_stateless_training_ep1_poisoned_capacity_matches_reference(
+    input_dtype,
+    combine_format,
+    capacity,
+):
+    """Poisoned outputs and pre-reduce planes must be completely overwritten."""
 
     device = _sm107_device()
     base_args = make_forward_inputs(device)
@@ -915,23 +943,22 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(input_dtype)
         base_args[4].float().contiguous(),
     )
     original_topk_idx = args[3].clone()
-    capacity = 129
-    assert args[0].shape[0] < capacity
+    assert args[0].shape[0] <= capacity
     grad_output = _grad_output(device, args[0].shape[0], seed=20260902)
     expected = _fixed_training_reference(
         args,
         grad_output,
-        combine_format="bf16",
+        combine_format=combine_format,
         gate_up_clamp=None,
         max_tokens_per_rank=capacity,
         max_recv_size_per_rank=capacity * args[3].shape[1],
     )
-    invalid_topk_idx = torch.full_like(args[3], -1)
-    invalid_args = (*args[:3], invalid_topk_idx, args[4])
-    invalid_expected = _fixed_training_reference(
-        invalid_args,
+    alternate_topk_idx = original_topk_idx.flip(1).contiguous()
+    alternate_args = (*args[:3], alternate_topk_idx, args[4])
+    alternate_expected = _fixed_training_reference(
+        alternate_args,
         grad_output,
-        combine_format="bf16",
+        combine_format=combine_format,
         gate_up_clamp=None,
         max_tokens_per_rank=capacity,
         max_recv_size_per_rank=capacity * args[3].shape[1],
@@ -946,7 +973,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(input_dtype)
         max_tokens_per_rank=capacity,
         max_recv_size_per_rank=capacity * args[3].shape[1],
         drop_on_overflow=True,
-        combine_format="bf16",
+        combine_format=combine_format,
         weight_interleave_size=32,
     ) as op:
         requirements = op.prepare_training(lane_count=1, device=device)
@@ -964,9 +991,23 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(input_dtype)
             device,
         )
         lane = op.training_lanes[0]
+        state = op._training_state
+        assert state is not None
+        execution = state.views(
+            lane=lane.index,
+            token_count=args[0].shape[0],
+        )
 
         def run():
             _poison_training_outputs_for_test(forward_out, backward_out)
+            _poison_pre_reduced_for_test(
+                state.forward_prepared,
+                execution.forward.workspace.symmetric["kernel_shared_workspace"],
+            )
+            _poison_pre_reduced_for_test(
+                state.backward_prepared,
+                execution.backward.workspace.symmetric["kernel_shared_workspace"],
+            )
             y = op.training_forward(
                 lane,
                 args[0],
@@ -1039,8 +1080,8 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(input_dtype)
         pointers = tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
         for replay in range(4):
             if replay % 2:
-                args[3].fill_(-1)
-                replay_expected = invalid_expected
+                args[3].copy_(alternate_topk_idx)
+                replay_expected = alternate_expected
             else:
                 args[3].copy_(original_topk_idx)
                 replay_expected = expected

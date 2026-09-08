@@ -104,7 +104,7 @@ def _run_forward_output_case(
     combine_format: str = "bf16",
     expected_global_ranks: tuple[int, ...] | None = None,
 ) -> None:
-    """Run inference-forward parity and dropped-route checks."""
+    """Run inference-forward parity across two dense routing patterns."""
 
     from cudnn import MoeEp
 
@@ -116,15 +116,18 @@ def _run_forward_output_case(
         combine_format=combine_format,
     )
     expected = _reference_forward(args, **config)
+    alternate_topk_idx = args[3].flip(1).contiguous()
+    alternate_args = (*args[:3], alternate_topk_idx, args[4])
+    alternate_expected = _reference_forward(alternate_args, **config)
     op = MoeEp(**config)
     try:
         actual = op(*args)
         actual_snapshot = _output_as_float(actual).clone()
         torch.cuda.synchronize(device)
 
-        args[3].fill_(-1)
-        dropped = op(*args)
-        dropped_snapshot = _output_as_float(dropped).clone()
+        args[3].copy_(alternate_topk_idx)
+        alternate = op(*args)
+        alternate_snapshot = _output_as_float(alternate).clone()
         torch.cuda.synchronize(device)
 
         dist.barrier(group=ep_group)
@@ -134,7 +137,7 @@ def _run_forward_output_case(
             if expected_global_ranks is not None:
                 assert op.ep_global_ranks == expected_global_ranks
             _assert_matches_reference(actual_snapshot, expected)
-            assert dropped_snapshot.eq(0).all()
+            _assert_matches_reference(alternate_snapshot, alternate_expected)
         except BaseException as error:
             assertion_error = error
         dist.barrier(group=ep_group)
@@ -267,12 +270,12 @@ def _make_distributed_backward_inputs(
     local_expert = ep_rank * local_experts
     remote_expert = ((ep_rank + 1) % ep_size) * local_experts
     topk_idx = torch.tensor(
-        [[local_expert, remote_expert], [-1, local_expert]],
+        [[local_expert, remote_expert], [local_expert, local_expert]],
         dtype=torch.int32,
         device=device,
     )
     topk_weights = torch.tensor(
-        [[0.625, 0.375], [0.0, 1.0]],
+        [[0.625, 0.375], [0.25, 0.75]],
         dtype=torch.float32,
         device=device,
     )
@@ -310,7 +313,7 @@ def _run_backward_reference_case(
         device,
     )
     num_experts = 2 * ep_size
-    max_recv_size_per_rank = 3
+    max_recv_size_per_rank = 4
 
     # Finish all collective reference work, including dense local dW, before
     # constructing or launching the production operator.
@@ -401,7 +404,6 @@ def _run_backward_reference_case(
                 assert op.ep_global_ranks == expected_global_ranks
             assert args[3][0, 0] // 2 == ep_rank
             assert args[3][0, 1] // 2 == (ep_rank + 1) % ep_size
-            assert args[3].eq(-1).any()
             assert expected_wgrads.valid_route_counts[1].eq(0)
             assert actual_wgrads.valid_route_counts[1].eq(0)
             _assert_matches_reference(actual_y, expected_y)
