@@ -42,24 +42,19 @@ def test_stage3_compile_cache_is_arch_specific(monkeypatch):
     import cudnn.sdpa.bwd.kernels.bprop_matmul_sm100 as stage3
 
     options = []
-    b200_device = torch.device("cuda:0")
-    b300_device = torch.device("cuda:1")
-    capabilities = {
-        b200_device: (10, 0),
-        b300_device: (10, 3),
-    }
+    capabilities = {0: (10, 0), 1: (10, 3)}
 
     def fake_compile(*args, **kwargs):
         options.append(kwargs["options"])
         return object()
 
-    monkeypatch.setattr(stage3.torch.cuda, "get_device_capability", capabilities.__getitem__)
+    monkeypatch.setattr(stage3, "compute_capability", capabilities.__getitem__)
     monkeypatch.setattr(stage3.cute, "compile", fake_compile)
     stage3.compile.cache_clear()
     try:
-        b200 = stage3.compile(b200_device)
-        assert stage3.compile(b200_device) is b200
-        b300 = stage3.compile(b300_device)
+        b200 = stage3.compile(0)
+        assert stage3.compile(0) is b200
+        b300 = stage3.compile(1)
         assert b300 is not b200
         assert options == [
             "--enable-tvm-ffi --gpu-arch sm_100a",

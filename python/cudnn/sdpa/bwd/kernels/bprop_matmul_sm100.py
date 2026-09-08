@@ -46,7 +46,6 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Callable
 
-import torch
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.kernel_templates._tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
@@ -64,6 +63,7 @@ from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as _cuda
 from cutlass.cute.arch import clc as cute_clc
 
+from cudnn.frost.device import compute_capability, resolve_device
 from cudnn.frost.tile_dsl.constants import DTYPE_FP16
 from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, emit_clamped_desc, emit_seq_descs
 from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, MatmulTemplateParams, validate_matmul_params
@@ -1883,8 +1883,8 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile(device: torch.device) -> Callable:
-    major, minor = torch.cuda.get_device_capability(device)
+def compile(device) -> Callable:
+    major, minor = compute_capability(resolve_device(device))
     sm = major * 10 + minor
     if not 100 <= sm <= 103:
         raise ValueError(f"SM100 SDPA bwd stage 3 requires SM100 through SM103; got SM{sm}")
@@ -2043,9 +2043,9 @@ def matmul_bh(
         # Required on both paths: dense never reads them, but the compiled ABI
         # has the slots and a None would fail at the call boundary.
         raise ValueError("matmul_bh needs `meta` and `desc_words` (dense may pass any 1-D dummies)")
-    # Key the compiled artifact by the tensor's actual device.  A process may
-    # execute plans on both B200 and B300, and the TVM-FFI function is not
-    # portable between their architecture-specific targets.
+    # Use FROST's framework-neutral device facts. This is the same per-ordinal
+    # DeviceInfo cache exposed by cudnn.Handle.device, without making the kernel
+    # template depend on torch.
     fn = compile(a.device)
     # `m` sizes the GRID.  Dense: the operands' shared M.  THD: the caller
     # passes the longest sequence, because the per-sequence extents are device
