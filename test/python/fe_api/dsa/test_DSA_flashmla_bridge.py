@@ -414,7 +414,7 @@ def _require_b200_flashmla():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("topk", [1, 4, 128, 129, 1152])
+@pytest.mark.parametrize("topk", [1, 4, 128, 129, 257, 1152])
 def test_sparse_attention_score_recompute_deepseek_v4_topk_contract(monkeypatch, topk):
     """Preserve semantic outputs across the DeepSeek-V4 Top-K envelope."""
 
@@ -433,6 +433,37 @@ def test_sparse_attention_score_recompute_deepseek_v4_topk_contract(monkeypatch,
 
     assert torch.equal(result["indices"], indices)
     assert result["target"].shape == indices.shape
+    torch.testing.assert_close(
+        result["target"],
+        torch.full_like(result["target"], 1.0 / topk),
+        atol=1e-6,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.L0
+def test_sparse_attention_score_recompute_resets_partial_tmem_ring():
+    """A partial first TMEM-ring traversal must not reuse prior-launch scores."""
+
+    _require_exact_b200()
+    torch.manual_seed(20260907)
+    device = torch.device("cuda")
+    s_q, s_kv, heads, head_dim, topk = 1, 1152, 128, 512, 1152
+    q = torch.randn((s_q, heads, head_dim), dtype=torch.bfloat16, device=device)
+    kv = torch.randn((s_kv, head_dim), dtype=torch.bfloat16, device=device)
+    lse = torch.zeros((s_q, heads), dtype=torch.float32, device=device)
+    indices = torch.arange(topk, dtype=torch.int32, device=device).unsqueeze(0)
+
+    # Leave non-uniform values in the same four-slot TMEM ring, then reuse the
+    # compiled kernel with inputs whose exact semantic result is uniform.
+    DSA.sparse_attention_score_recompute(q, kv, lse, indices)
+    torch.cuda.synchronize()
+    q.zero_()
+    kv.zero_()
+
+    result = DSA.sparse_attention_score_recompute(q, kv, lse, indices)
+    torch.cuda.synchronize()
+
     torch.testing.assert_close(
         result["target"],
         torch.full_like(result["target"], 1.0 / topk),
