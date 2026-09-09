@@ -30,12 +30,11 @@ BACKEND_CONFIG = {
     "flash_qla": {"name": "FlashQLA (TileLang)", "color": "#6495ED", "order": 1},
     "flash_kda": {"name": "FlashKDA", "color": "#9370DB", "order": 2},
     "cudnn": {"name": "cuDNN (default)", "color": "#76b900", "order": 3},
-    "cudnn_batch_invariant": {"name": "cuDNN (batch invariant)", "color": "#4f9200", "order": 4},
-    "cudnn_state_on": {"name": "cuDNN (state on)", "color": "#2f6e00", "order": 5},
+    "cudnn_state_on": {"name": "cuDNN (state on)", "color": "#2f6e00", "order": 4},
 }
 
 # Backends dropped from every chart (rows may still exist in older CSVs).
-UNAVAILABLE_BACKENDS = ()
+UNAVAILABLE_BACKENDS = ("cudnn_batch_invariant",)
 
 LABEL_FONT_SIZE = 10
 LEGEND_FONT_SIZE = 8
@@ -106,6 +105,7 @@ def generate_charts(
     batch_sizes: Optional[List[int]] = None,
     x_axis: str = "seqlen",
     dims_label: Optional[str] = None,
+    stem: Optional[str] = None,
 ) -> list:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -190,13 +190,16 @@ def generate_charts(
 
             plt.tight_layout()
             gv = int(group_val)
-            if df[group_col].nunique() == 1:
+            pinned = df[group_col].nunique() == 1
+            if stem is not None:
+                file_stem = stem if pinned else f"{stem}_{gv}"
+            elif pinned:
                 # the sweep pinned the group dimension: fixed-batch (seqlen
                 # sweep) / fixed-seq (batch sweep) result-tree naming
-                stem = f"{variant}_fixed_batch" if x_axis == "seqlen" else f"{variant}_fixed_seq"
+                file_stem = f"{variant}_fixed_batch" if x_axis == "seqlen" else f"{variant}_fixed_seq"
             else:
-                stem = f"{variant}_b{gv}" if x_axis == "seqlen" else f"{variant}_t{gv}_bsweep"
-            output_path = output_dir / f"{stem}{file_suffix}.png"
+                file_stem = f"{variant}_b{gv}" if x_axis == "seqlen" else f"{variant}_t{gv}_bsweep"
+            output_path = output_dir / f"{file_stem}{file_suffix}.png"
             plt.savefig(output_path, dpi=150, bbox_inches="tight")
             plt.close()
             saved_paths.append(output_path)
@@ -217,6 +220,11 @@ def main():
     parser.add_argument(
         "--x-axis", default="seqlen", choices=("seqlen", "batch"), help="Bar-group axis: seqlen (one chart per batch) or batch (one chart per seqlen)"
     )
+    parser.add_argument(
+        "--stem",
+        default=None,
+        help="Output file stem before the metric suffix (default: <variant>_fixed_batch / <variant>_fixed_seq when the CSV pins the group axis, else per-group stems); required when a CSV pins batch AND heads, e.g. <variant>_b1_h16",
+    )
     args = parser.parse_args()
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")] if args.batch_sizes else None
 
@@ -236,6 +244,7 @@ def main():
         batch_sizes=batch_sizes,
         x_axis=args.x_axis,
         dims_label=args.dims_label,
+        stem=args.stem,
     )
 
 

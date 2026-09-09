@@ -62,6 +62,14 @@ class NodeType(Enum):
     BLOCK_SCALE_DEQUANTIZE = auto()
     GDP = auto()
     GDP_BWD = auto()
+    GDN_SUMMARY = auto()
+    KDA_SUMMARY = auto()
+    GDN2_SUMMARY = auto()
+    GDP_SUMMARY = auto()
+    GDN_SUMMARY_BWD = auto()
+    KDA_SUMMARY_BWD = auto()
+    GDN2_SUMMARY_BWD = auto()
+    GDP_SUMMARY_BWD = auto()
 
 
 @dataclass(eq=False)  # identity-based hash/eq: uid/name are mutable
@@ -85,7 +93,7 @@ class Tensor:
         alignment_value: caller's promise that every VALUE this tensor holds is a
             multiple of it (1 = no promise). Unlike every other attribute here it
             constrains the CONTENTS, not the layout, and it is not validated --
-            violating it is undefined behaviour. Today only the MoE
+            violating it is undefined behaviour. Only the MoE
             first_token_offset tensor reads it.
     """
 
@@ -256,9 +264,9 @@ def describing_tensor(uid: int, dim, stride, data_type) -> Tensor:
     """A Tensor describing a caller's buffer, built without the dataclass
     ``__init__``.
 
-    ``execute()`` builds one of these per operand per call, and the generated
-    ``__init__`` sets seventeen attributes and runs two default factories to do
-    it: 0.71 us against 0.29 for assigning the four that are known. Every field
+    ``execute()`` builds one of these per operand per call; the generated
+    ``__init__`` would set seventeen attributes and run two default factories
+    where only four fields are known. Every field
     left unset resolves to the class attribute the dataclass already installed
     for its default, so the result is indistinguishable from ``Tensor(...)`` --
     ``test_describing_tensor_matches_the_dataclass`` compares them field by

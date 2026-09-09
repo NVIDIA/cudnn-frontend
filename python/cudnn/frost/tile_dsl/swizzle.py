@@ -12,6 +12,11 @@ def swizzle_xor_128b(row, col_elem, *, elem_bytes: cutlass.Constexpr[int] = 2):
 
 
 @cute.jit
+def swizzle_xor_128b_seg(row, seg, col_elem, *, elem_bytes: cutlass.Constexpr[int] = 2):
+    return col_elem ^ (((row & 7) ^ (seg & 7)) * cutlass.const_expr(16 // elem_bytes))
+
+
+@cute.jit
 def swizzle_xor_64b(row, col_elem, *, elem_bytes: cutlass.Constexpr[int] = 2):
     chunk_elems = 16 // elem_bytes
     chunk_idx = col_elem // chunk_elems

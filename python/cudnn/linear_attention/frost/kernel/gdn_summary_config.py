@@ -15,10 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gated DeltaNet (GDN) Cutlass-primitives prefill kernel config (fixed compile-time
-constants; the per-compile attributes live on ``GdnCfg`` in the kernel file).
-
-Target arch: Blackwell SM100 / SM103.
+"""Fixed compile-time constants of the GDN fused state-summary (H + M) kernel (SM100 / SM103); the per-compile attributes
+live on ``GdnSummaryCfg`` in the kernel file.
 """
 
 from dataclasses import dataclass
@@ -29,22 +27,19 @@ from typing import Tuple
 class Cfg:
     # --- tile shape ---
     B_T: int = 64  # chunk size / token tile (the mma N or K of every GEMM)
-    D_K: int = 128  # query/key head dim (contraction of the KK/QK/K*state/Q*state GEMMs, output dim of the KV update)
-    D_V: int = 128  # value head dim (output dim of the K*state/Q*state/U/QKV GEMMs and of the KV update)
-
-    # --- TMA descriptor pool ---
+    D_K: int = 128  # default key head dim (contraction of the K*state GEMM, output dim of the KV update); per-compile 64 or 128
+    D_V: int = 128  # default value head dim (rows of chain H); per-compile 64 or 128
 
     # --- warp assignments (12 warps total) ---
-    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # T-pairwise / qk_epi
-    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # kv_decay_v / v-k*state / epi ops
+    CHAIN_M_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # transition chain epilogues (identity seed, V = 0)
+    CHAIN_H_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # state chain epilogues (zero / initial_state seed, consumes V)
     LOAD_GATE_WARP_ID: int = 8  # gate chunk loads
-    TMA_QKV_WARP_ID: int = 9
-    TCGEN05_MMA_WARP_ID: int = 10  # sole tcgen05 issuer: fused KK/QK pairs + KS/QS/U/QKV/KV per chunk
-    EPILOGUE_WARP_ID: int = 11
+    TMA_WARP_ID: int = 9  # K / V TMA loads + chunk-factor bulk loads
+    TCGEN05_MMA_WARP_ID: int = 10  # sole tcgen05 issuer: both chains' KS / U / KV per chunk; TMEM lifecycle
+    REGISTER_POOL_WARP_ID: int = 11  # setmaxnreg.dec only: the CTA launches at 168 regs/thread and this warp's share feeds the chain groups
 
-    # --- register split ---
-    NUM_REGS_COMPUTE_GROUP_0: int = 224
-    NUM_REGS_COMPUTE_GROUP_1: int = 256
+    # --- register split (12 warps launched at 168 regs/thread: 4 x 24 + 8 x 240 = 2016 = 12 x 168) ---
+    NUM_REGS_CHAIN: int = 240
     NUM_REGS_OTHER: int = 24
 
     THREADS_PER_WARP: int = 32
@@ -53,19 +48,14 @@ class Cfg:
 
     # --- SMEM stage counts ---
     SMEM_SCHEDULER_STAGES: int = 2
-    SMEM_KQ_STAGES: int = 4
-    SMEM_V_STAGES: int = 2
+    SMEM_K_STAGES: int = 3
+    SMEM_V_STAGES: int = 3
     SMEM_T_INV_STAGES: int = 3
-    SMEM_A_STAGES: int = 3
-    SMEM_O_STAGES: int = 1
     SMEM_GATE_STAGES: int = 3
 
     # --- TMEM stage counts ---
-    TMEM_KV_ACC_STAGES: int = 1
-    TMEM_Q_STATE_ACC_STAGES: int = 1
-    TMEM_STATE_INP_STAGES: int = 1
-    TMEM_CG0_ACC_STAGES: int = 2
-    TMEM_CG1_ACC_STAGES: int = 1
+    TMEM_STATE_ACC_STAGES: int = 1
+    TMEM_STATE_INPUT_STAGES: int = 1
 
     BUFFER_ALIGN_BYTES: int = 1024
 

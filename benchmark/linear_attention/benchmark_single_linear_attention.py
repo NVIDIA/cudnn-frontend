@@ -249,7 +249,7 @@ def parse_args():
         "--seed",
         default=0,
         type=int,
-        help="RNG seed for the input draws. The gate values decide the split-K partition, so an unseeded run is not a reproducible measurement",
+        help="RNG seed for the input draws (q/k/v and the write strengths; the decay gates are all ones, so the schedule does not depend on the draw)",
     )
     return parser.parse_args()
 
@@ -1020,26 +1020,28 @@ else:
         )
         return b / time / 1e9 if not math.isnan(time) else 0.0  # Assume time is in msec
 
-    ## Gate generators per variant. Decays are LOG-space (alpha = exp(g)),
-    ## drawn from ranges the kernels' io-dtype arithmetic is conditioned for.
-    ## The draws stay fp32 for the log/logit/sigmoid math and narrow on the way out.
+    ## Gate generators per variant. Decays are LOG-space (alpha = exp(g)) and
+    ## all ones (alpha = 1, g = 0): the decay gate steers the split-K planner, so a
+    ## constant gate keeps the measurement independent of the input draw.
+    ## Write strengths stay random draws; everything is fp32 for the log/logit/
+    ## sigmoid math and narrows on the way out.
     def generate_gates():
         if args.variant == "gdn":
             # scalar decay [B, T, HO] + scalar write strength
-            gate = torch.empty(batch_size, seqlen, num_o_heads, device=device).uniform_(0.1, 1.0).log()
+            gate = torch.ones(batch_size, seqlen, num_o_heads, device=device).log()
             beta = torch.rand(batch_size, seqlen, num_o_heads, device=device)
             write_gate = None
         elif args.variant == "gdp":
             # scalar decay [B, T, HO] fp32 per real token + per-Householder
             # write strength on the expanded timeline
-            gate = torch.empty(batch_size, seqlen, num_o_heads, device=device).uniform_(0.1, 1.0).log()
+            gate = torch.ones(batch_size, seqlen, num_o_heads, device=device).log()
             beta = torch.rand(batch_size, kv_seqlen, num_o_heads, device=device)
             write_gate = None
         elif args.variant == "kda":
             # per-key-channel decay [B, T, HO, K] + post-sigmoid scalar
             # beta; forward-only runs feed raw logits with the same effective
             # distributions (the in-kernel activations invert them)
-            gate = torch.empty(batch_size, seqlen, num_o_heads, head_dim_qk, device=device).uniform_(0.5, 1.0).log()
+            gate = torch.ones(batch_size, seqlen, num_o_heads, head_dim_qk, device=device).log()
             beta = torch.rand(batch_size, seqlen, num_o_heads, device=device)
             if raw_gates:
                 gate = torch.special.logit((gate / _KDA_GATE_LOWER_BOUND).clamp(1e-7, 1 - 1e-7))
@@ -1049,7 +1051,7 @@ else:
         else:  # gdn2
             # per-key decay/erase [B, T, HO, K] + per-value write gate [B, T, HO, V];
             # raw_gates feeds decay and erase logits, as kda does
-            gate = torch.empty(batch_size, seqlen, num_o_heads, head_dim_qk, device=device).uniform_(0.5, 1.0).log()
+            gate = torch.ones(batch_size, seqlen, num_o_heads, head_dim_qk, device=device).log()
             beta = torch.rand(batch_size, seqlen, num_o_heads, head_dim_qk, device=device)
             if raw_gates:
                 gate = torch.special.logit((gate / _KDA_GATE_LOWER_BOUND).clamp(1e-7, 1 - 1e-7))

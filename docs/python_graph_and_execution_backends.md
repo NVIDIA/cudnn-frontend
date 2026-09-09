@@ -279,7 +279,10 @@ are close.
   `d_a_log`/`d_dt_bias` for the given parameters produced by a deterministic
   reduction helper) and
   `use_beta_sigmoid`; the cuTile engine remains the fallback for non-128
-  head dims.
+  head dims. The `gate_domain` attribute (`"log"`, the default, or
+  `"linear"`) selects whether `g` is `ln(alpha)` or `alpha` itself; the
+  FROST GDN / GDP / GDN-2 engines serve `"linear"` (forward and backward,
+  `dG` with respect to `alpha`); the cuTile engine and KDA are log-only.
 - `KdaFrostEngine` / `KdaCuTileEngine` do the same for the single-node
   `kda` / `kda_bwd` ops (Kimi Delta Attention). KDA is GDN with a
   per-key-channel decay: its `g` is the log-space vector gate
@@ -336,6 +339,60 @@ are close.
   `cu_seqlens`, so execution stays sync-free. Buffers only need
   `__cuda_array_interface__` or `__dlpack__`; the torch custom ops do the
   dtype normalization on their side.
+- Sequence splitting. The main kernels run one persistent CTA per (sequence,
+  head), so a long sequence on few tiles leaves SMs idle. `choose_mode`
+  (`frost/common/piece_chain.py`) fixes the scheme at build from the declared
+  shapes and the device's SM count, identically for the forward and the
+  backward, and it is not a node attribute. `chain` cuts every sequence into
+  `P = num_sm // (B * HO)` unit-aligned pieces (at least 3 for a forward plan
+  and 2 for a backward plan, at most 16, each at least 4 chunk units of
+  `lcm(expand_num, checkpoint cadence)` chunks) wherever that has room,
+  `warmup` (the decay-warmup split-K of `frost/common/split_k.py`) serves the
+  band where it has not, and `uncut` runs one item per (sequence, head). Under
+  `batch_invariant` the geometry comes from the length rule alone, `P =
+  clamp(ceil(total / 8192), 1, 16)` slots per sequence, of which each fills
+  `clamp(ceil(len / 8192), 1, P)` on device, `uncut` when `total <= 8192`, so a
+  sequence's outputs are bitwise the same alone and in any batch. The chain is
+  exact. The chain prologue writes the piece-wise `cu_pieces` (real tokens)
+  and the work-item tables (every filled slot per head, plus an empty
+  sequence's slot 0 as a passthrough; the summary table only for sequences
+  with two or more filled slots); a summary launch produces every multi-piece
+  sequence's per-piece state from a zero seed (H) and transition (M) in fp32
+  (GDN's summaries read the T pass, the beta-folded chunk factor of
+  `kernel/gdn_tinv_f16.py`; a GDN prefill or bprop builds the factor itself
+  when it is the tiles' only consumer and, for the prefill, the plan fills at
+  least half of the SMs, and reads the tiles otherwise); an fp32 FMA
+  chain composes `X_{j+1} = X_j M_j + H_j` from `initial_state` (a one-piece
+  sequence's `X` is its seed, copied); the seeded main kernel runs over the
+  piece work items as independent sequences and the last filled piece of each
+  sequence writes `final_state` in the state dtype. The backward mirrors it
+  with M (with H and X when no series is passed back), a G summary from the
+  bprop-summary kernel, the reverse chain seeded by `d_final_state`, the bprop
+  over the pieces seeded by row 0 of each piece's series, and piece 0 writes
+  `d_initial_state`. A one-piece chain is bitwise the uncut run. Workspace
+  grows in chain mode by the piece table (`piece_table_layout`), fp32 H, M and
+  X slots `[B * P, HO, V or K, K]`, and the T pass tiles (`tinv_rows * HO *
+  8 KB`) plus their tensor-map slot. The summary ops (`*_summary`,
+  `*_summary_bwd`) use the same rule; their chain summarizes every
+  filled piece over the main work-item table (an empty sequence's passthrough
+  item yields `H = 0`, `M = I`) and one emitting state chain composes them,
+  its tail being `final_state` (in reverse, `d_initial_state`) and its running
+  product `transition`.
+- Context parallelism across devices. The state ops are the per-span
+  summaries of a two-tier scheme: every rank summarizes its span at once, the
+  ranks exchange the summaries, and every rank runs its span's main op seeded
+  by the composition. In the stored domain (state buffers V-major, the buffer
+  holds `S^T`) the forward summary `*_summary` returns `H` (the span's
+  final state from a zero seed) and `M_buf` (the transition, holding `M^T`),
+  composed forward from the incoming state as `X_{j+1} = X_j @ M_buf_j + H_j`;
+  the span forward then runs with `initial_state = X_j`. The backward summary
+  `*_summary_bwd` returns `G` (the incoming state gradient from a zero
+  outgoing gradient) and, with `output_transition=True`, the transition in the
+  backward's orientation (`M_buf^T`), composed in reverse from the outgoing
+  state gradient as `dX_j = dX_{j+1} @ transition_j + G_j`; the span backward
+  then runs with `initial_state = X_j` and `dX_{j+1}` as the gradient on its
+  `final_state`. Seeds, summaries and compositions are fp32, and every summary
+  is itself the intra-device chain above.
 
 ### The manifest: classify, then let the engine decide
 
