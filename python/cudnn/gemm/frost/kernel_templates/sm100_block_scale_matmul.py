@@ -136,6 +136,27 @@ def _b_collector_op(mi):
     return nvvm.Tcgen05MMACollectorOp.USE
 
 
+# @@SPLITK_ONLY:BEGIN@@
+from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import (
+    SPLITK_REDUCE_THREADS,
+    SPLITK_REDUCE_TILE_M,
+    _splitk_reduce_kernel,
+    splitk_reduce_tile_n,
+)
+
+
+@cute.jit
+def _splitk_epilogue(vec_f32, row, col_j, tile_l, M, N, vsize, taps, strides, aux):
+    """epilogue function for split-K reduction"""
+    # @@INJECT_SPLITK_EPILOGUE_BINDINGS@@
+    # @@INJECT_REDUCE_AUX_VIEWS@@
+
+    # @@INJECT_REDUCE_EPILOGUE@@
+
+
+# @@SPLITK_ONLY:END@@
+
+
 @cute.kernel
 def _kernel(
     m: cutlass.Int64,
@@ -143,6 +164,9 @@ def _kernel(
     k: cutlass.Int64,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
+    # @@SPLITK_ONLY:BEGIN@@
+    mSplitK_partials: cute.Tensor,
+    # @@SPLITK_ONLY:END@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
     # @@TMA_STORE_ONLY:BEGIN@@
@@ -360,7 +384,7 @@ def _kernel(
     # count -- which is epi_tile_mn[0] only when the MMA M block is 128.
     epi_subtile_elems = epi_stage_rows * epi_row_elems * epi_slot_widen
     smem_d_ptr = cutlass.Array(
-        cd_dtype,
+        epi_store_dtype,
         epi_subtile_elems * EPI_SMEM_STAGES,
         space=cutlass.AddressSpace.smem,
         alignment=1024,
@@ -458,6 +482,9 @@ def _kernel(
         nvvm.barrier_cta_sync(0)
 
     # @@INJECT_TAP_PTRS@@
+    # @@SPLITK_ONLY:BEGIN@@
+    gSplitK_partials_ptr = mSplitK_partials.iterator.raw_ptr()
+    # @@SPLITK_ONLY:END@@
 
     vsize = epi_chunk_elems
 
@@ -547,16 +574,28 @@ def _kernel(
                 coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
             else:
                 coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
+            # Split-K: grid z carries batch*S
+            if cutlass.const_expr(split_k_slices > 1):
+                batch_tile_l = tile_l // split_k_slices
+                split_idx = cutlass.Int64(tile_l % split_k_slices)
+                k_tiles_per_split = num_k_tiles // split_k_slices
+                k_tiles_remainder = num_k_tiles % split_k_slices
+                k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
+                k_end = (split_idx + 1) * k_tiles_per_split + cutlass.min(split_idx + 1, k_tiles_remainder)
+            else:
+                batch_tile_l = tile_l
+                k_begin = cutlass.Int64(0)
+                k_end = num_k_tiles
             if cutlass.const_expr(matmul_a_batch == 1):
                 tile_l_a = cutlass.Int32(0)
             else:
-                tile_l_a = tile_l
+                tile_l_a = batch_tile_l
             if cutlass.const_expr(matmul_b_batch == 1):
                 tile_l_b = cutlass.Int32(0)
             else:
-                tile_l_b = tile_l
+                tile_l_b = batch_tile_l
 
-            for k_tile_idx in range(num_k_tiles):
+            for k_tile_idx in range(k_begin, k_end):
                 stage = ab_iter % ab_stages
                 if stage == 0 and ab_iter != 0:
                     ab_empty_phase_bit = ab_empty_phase_bit ^ 1
@@ -920,6 +959,8 @@ def _kernel(
             is_valid = cutlass.Int32(1)
             clc_full_phase_mma = cutlass.Int32(0)
             acc_stage = cutlass.Int32(0)
+            if cutlass.const_expr(split_k_slices > 1):
+                tile_l = bidz
 
             # fp4 packs its K-mode into the OMMA descriptor's 2-bit split field;
             # fp8 keeps the MX descriptor's 1-bit one. Both are built once,
@@ -1050,8 +1091,17 @@ def _kernel(
                     for g in range(num_gemms)
                 ]
 
+                if cutlass.const_expr(split_k_slices > 1):
+                    split_idx = cutlass.Int64(tile_l % split_k_slices)
+                    k_tiles_per_split = num_k_tiles // split_k_slices
+                    k_tiles_remainder = num_k_tiles % split_k_slices
+                    k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
+                    k_end = (split_idx + 1) * k_tiles_per_split + cutlass.min(split_idx + 1, k_tiles_remainder)
+                else:
+                    k_begin = cutlass.Int64(0)
+                    k_end = num_k_tiles
                 scale_d = cutlass.Boolean(False)
-                for k_tile_idx in range(num_k_tiles):
+                for k_tile_idx in range(k_begin, k_end):
                     stage = ab_iter % ab_stages
                     if stage == 0 and ab_iter != 0:
                         ab_full_phase_bit = ab_full_phase_bit ^ 1
@@ -1158,13 +1208,17 @@ def _kernel(
                 _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
                 cute.arch.fence_proxy("async.shared", space="cta")
                 is_valid = vld
+                if cutlass.const_expr(split_k_slices > 1):
+                    tile_l = _l_idx
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
                     empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
                     nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
                 tile_iter += 1
 
-            if cutlass.const_expr(USE_PDL):
+            # Dense only: an early-launched reducer would pile its many small CTAs
+            # onto the few idle SMs, so split-K leaves the trigger to grid exit.
+            if cutlass.const_expr(USE_PDL and split_k_slices == 1):
                 nvvm.griddepcontrol("launch_dependents")
 
             tail_stage = acc_stage
@@ -1222,7 +1276,8 @@ def _kernel(
                         empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
                         nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
                     tile_iter += 1
-                if cutlass.const_expr(USE_PDL):
+                # Dense only, same reason as above.
+                if cutlass.const_expr(USE_PDL and split_k_slices == 1):
                     nvvm.griddepcontrol("launch_dependents")
                 nvvm.tcgen05_relinquish_alloc_permit(group=_CTA_GROUP)
                 peer_mbar = nvvm.mapa(tmem_dealloc_mbar_ptr, peer_cta_rank)
@@ -1430,6 +1485,9 @@ def _host(
     problem_size: tuple,
     # @@INJECT_HOST_AB_PARAMS@@
     # @@INJECT_HOST_TAP_PARAMS@@
+    # @@SPLITK_ONLY:BEGIN@@
+    splitk_partials: cute.Tensor,
+    # @@SPLITK_ONLY:END@@
     # @@INJECT_HOST_AUX_PARAMS@@
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_HOST_TMA_C_PARAMS@@
@@ -1585,13 +1643,16 @@ def _host(
     num_tile_n_host = (n + cgrp_tile_n - 1) // cgrp_tile_n
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
-    grid_shape = (grid_x, grid_y, batch)
+    grid_shape = (grid_x, grid_y, batch * split_k_slices)
     launch = _kernel(
         problem_size[0],
         problem_size[1],
         problem_size[2],
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
+        # @@SPLITK_ONLY:BEGIN@@
+        splitk_partials,
+        # @@SPLITK_ONLY:END@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@
         # @@TMA_STORE_ONLY:BEGIN@@
@@ -1619,6 +1680,37 @@ def _host(
             use_pdl=USE_PDL,
             stream=stream,
         )
+
+    # @@SPLITK_ONLY:BEGIN@@
+    _splitk_reduce_kernel(
+        m,
+        n,
+        batch,
+        splitk_partials,
+        (
+            # @@INJECT_HOST_TAP_PASS@@
+        ),
+        (
+            # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
+        ),
+        (
+            # @@INJECT_HOST_AUX_PASS@@
+        ),
+        _splitk_epilogue,
+        split_k_slices,
+        splitk_reduce_elems,
+        USE_PDL,
+    ).launch(
+        grid=(
+            (m + SPLITK_REDUCE_TILE_M - 1) // SPLITK_REDUCE_TILE_M,
+            (n + splitk_reduce_tile_n(split_k_slices, splitk_reduce_elems) - 1) // splitk_reduce_tile_n(split_k_slices, splitk_reduce_elems),
+            batch,
+        ),
+        block=(SPLITK_REDUCE_THREADS, 1, 1),
+        use_pdl=USE_PDL,
+        stream=stream,
+    )
+    # @@SPLITK_ONLY:END@@
 
 
 @lru_cache(maxsize=None)
@@ -1718,6 +1810,10 @@ def compile() -> Callable:
     )
 
     # @@INJECT_COMPILE_AUX_FAKES@@
+    # @@SPLITK_ONLY:BEGIN@@
+    sym_partials_elems = cute.sym_int64()
+    fake_splitk_partials = cute.runtime.make_fake_tensor(cutlass.Float32, (sym_partials_elems,), stride=(1,), assumed_align=16)
+    # @@SPLITK_ONLY:END@@
 
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
     return cute.compile(
@@ -1729,6 +1825,9 @@ def compile() -> Callable:
         # @@TMA_STORE_ONLY:BEGIN@@
         # @@INJECT_COMPILE_TMA_C_PASS@@
         # @@TMA_STORE_ONLY:END@@
+        # @@SPLITK_ONLY:BEGIN@@
+        fake_splitk_partials,
+        # @@SPLITK_ONLY:END@@
         stream=_fake_stream,
         options=frost_compile_options,
     )

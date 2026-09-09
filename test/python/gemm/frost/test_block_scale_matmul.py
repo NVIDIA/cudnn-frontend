@@ -403,7 +403,17 @@ def _make_block_scale_inputs(combo, M, N, K, dev="cuda"):
     return a_rt, b_rt, sfa_log, sfb_log, ref, bs, sf_dt, a_dt
 
 
-def _run_bs_numeric(combo, config_name, M, N, K, out_major="n"):
+def _splitk_workspace(compiled):
+    """(Workspace, buffer); the caller keeps both alive across the launch."""
+    from cudnn.frost.workspace import Workspace
+
+    if not compiled.workspace_bytes:
+        return None, None
+    buf = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    return Workspace(buf, compiled.workspace_bytes, "test_block_scale_splitk"), buf
+
+
+def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force_stg=False):
     """Block-scale matmul vs a torch dequant-matmul reference."""
     dev = "cuda"
     torch.manual_seed(0)
@@ -435,8 +445,9 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n"):
         sfb_log = _rand_e8m0((N, sf_k), dev)
 
     g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt, out_major=out_major)
-    compiled = _plan(g, **_kw(config_name))
+    compiled = _plan(g, config=dataclasses.replace(by_name(config_name), split_k_slices=split_k), force_stg_epi=force_stg)
     assert compiled.block_scale
+    ws, _ws_buf = _splitk_workspace(compiled)
     assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == (_DTYPE_FROM_CUDNN[sf_dt], bs)
 
     if out_major == "m":
@@ -451,7 +462,8 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n"):
             c,
             _to_blocked(sfa_log).view(1, M, sf_k),
             _to_blocked(sfb_log).view(1, N, sf_k),
-        )
+        ),
+        workspace=ws,
     )
     torch.cuda.synchronize()
 
@@ -460,6 +472,36 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n"):
     ref = (a_s @ b_s.t()).to(torch.float16)
     # nvfp4 is bit-exact; mx paths carry fp16 rounding.
     torch.testing.assert_close(c[0], ref, atol=2e-1, rtol=2e-2)
+
+
+_SPLITK_BS_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "combo,config_name,S,out_major,force_stg",
+    [
+        ("nvfp4", _SPLITK_BS_CFG, 5, "n", False),
+        ("mxfp8", "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma", 4, "n", False),
+        ("nvfp4", _SPLITK_BS_CFG, 2, "m", True),
+    ],
+    ids=("nvfp4-S5", "mxfp8-2ctamma-S4", "nvfp4-mmajor-stg-S2"),
+)
+def test_block_scale_matmul_splitk_numerics(combo, config_name, S, out_major, force_stg):
+    _run_bs_numeric(combo, config_name, 256, 256, 4096, out_major=out_major, split_k=S, force_stg=force_stg)
+
+
+def test_block_scale_splitk_auto_select_and_quant_reject():
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+
+    cfg = by_name(_SPLITK_BS_CFG)
+    # fp4 packs two K elements per byte: 4096 K = 2 KiB per row, 16 CTA-K tiles.
+    chain, _ = analyze_with_binding(_bs_chain("nvfp4", 256, 256, 4096))
+    assert C._auto_split_k(chain, cfg, sm_count=148).split_k_slices == 8
+    chain, _ = analyze_with_binding(_bs_chain("nvfp4", 256, 256, 2048))
+    assert C._auto_split_k(chain, cfg, sm_count=148).split_k_slices == 1
+    chain, _ = analyze_with_binding(_build_block_scale_quant_graph(256, 256, 4096))
+    assert "block-scale quantize" in C._splitk_reject_reason(chain, dataclasses.replace(cfg, split_k_slices=2))
 
 
 def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
@@ -873,7 +915,7 @@ def test_block_scale_matmul_nonpacked_tensors(combo, config_name, mode):
     _run_bs_nonpacked_numeric(combo, config_name, 256, 256, 512, mode)
 
 
-def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_stride, ref_dims):
+def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_stride, ref_dims, split_k=1):
     dev = "cuda"
     torch.manual_seed(0)
     a_rt, b_rt, sfa_log, sfb_log, ref, bs, sf_dt, a_dt = _make_block_scale_inputs(combo, M, N, K, dev)
@@ -888,8 +930,9 @@ def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_s
         a_dt=a_dt,
         red_stride=red_stride,
     )
-    compiled = _plan(g, **_kw(config_name))
+    compiled = _plan(g, config=dataclasses.replace(by_name(config_name), split_k_slices=split_k))
     assert compiled.block_scale and compiled.chain.reductions
+    ws, _ws_buf = _splitk_workspace(compiled)
 
     c_term = torch.empty(1, M, N, dtype=torch.float32, device=dev)
     if red_stride is None:
@@ -905,7 +948,8 @@ def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_s
             [c_term, c_red],
             _to_blocked(sfa_log).view(1, M, K // bs),
             _to_blocked(sfb_log).view(1, N, K // bs),
-        )
+        ),
+        workspace=ws,
     )
     torch.cuda.synchronize()
 
@@ -962,6 +1006,14 @@ def test_block_scale_matmul_reduction_scalar(mode, combo, config_name, M, N, K):
         red_dims=[1, 1, 1],
         red_stride=None,
         ref_dims=(0, 1, 2),
+    )
+
+
+@_GPU
+def test_block_scale_matmul_splitk_reduction():
+    """The reduction atomics run in the reducer, once per output element."""
+    _run_bs_reduction_numeric(
+        "nvfp4", _SPLITK_BS_CFG, 256, 256, 4096, cudnn.reduction_mode.AMAX, red_dims=[1, 1, 1], red_stride=None, ref_dims=(0, 1, 2), split_k=4
     )
 
 

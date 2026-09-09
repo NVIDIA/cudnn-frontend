@@ -99,9 +99,10 @@ class Plan:
         self.block_scale = self.chain.has_block_scale
         self.aux_names = [t.name for t in self.chain.aux_tensors]
         self.generated_path = self._compiled.generated_path
+        self.workspace_bytes = getattr(self._compiled, "workspace_bytes", 0)
 
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
+    def __call__(self, variant_pack, workspace=None):
+        return self._compiled(variant_pack, workspace=workspace)
 
 
 def resolve(name):

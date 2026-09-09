@@ -1667,6 +1667,7 @@ def _render_block_scale_tile_constants(
         ab_stages = max(1, smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=ab_reserved))
 
     out_dt = chain.output_dtype
+    epi_store_dt = _epi_store_dtype(chain, cfg)
     vec_bytes_epi = _epi_vec_bytes(chain, cfg)
 
     # Instruction-descriptor operand dtype. On sm100 the fp4 MMA rides
@@ -1768,17 +1769,20 @@ def _render_block_scale_tile_constants(
         "",
         f"# output",
         f"cd_dtype = {'cutlass.Int8' if out_dt == 'fp4_e2m1' else DTYPE_TO_CUTLASS[out_dt]}",
+        f"epi_store_dtype = {DTYPE_TO_CUTLASS[epi_store_dt]}",
         f"vec_bytes_epi = {vec_bytes_epi}",
+        f"split_k_slices = {cfg.split_k_slices}",
+        *([f"splitk_reduce_elems = {_splitk_reduce_elems(chain)}"] if cfg.split_k_slices > 1 else []),
         f"frost_compile_options = {_frost_compile_options()!r}",
         # The COUNT, not the flag: a block-scale graph can put more than one
         # output on the TMA-C surface, and on MoE this number also sizes the
         # tensormap scratch and the per-CTA workspace stride.
-        f"n_tma_outputs = {len(_tma_slots_for(chain, cfg))}",
+        f"n_tma_outputs = {1 if (cfg.split_k_slices > 1 and use_tma_store_epi) else len(_tma_slots_for(chain, cfg))}",
         f"moe_aligned_offsets = {_moe_aligned_offsets(chain, cfg)}",
         f"epi_slot_widen = {_epi_slot_widen(chain, cfg)}",
         f"epi_stage_rows = {_epi_stage_rows(cfg)}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store_epi)}",
-        *_epi_swizzle_lines(cfg, out_dt, chain),
+        *_epi_swizzle_lines(cfg, epi_store_dt, chain),
         "",
         f"# block-scale MMA",
         f"mma_block_scale_kind = nvvm.MMABlockScaleKind.{bs.mma_block_scale_kind}",
@@ -2125,36 +2129,41 @@ def _render_block_scale_template(
     template_path = _TEMPLATE_DIR / tmpl.file
     src = template_path.read_text()
     store_modes = _store_modes(chain, config)
-    tma_slots = frozenset(i for i, m in enumerate(store_modes) if m == "tma")
-    use_tma = bool(tma_slots)
+    use_tma = _use_tma_store_epi(chain, config)
+    splitk = config.split_k_slices > 1
+    tma_slots = frozenset({0}) if (splitk and use_tma) else frozenset(i for i, m in enumerate(store_modes) if m == "tma")
     src = _resolve_path_blocks(src, use_tma_store_epi=use_tma)
+    if "@@SPLITK_ONLY:BEGIN@@" in src:
+        src = _resolve_blocks(src, "SPLITK_ONLY", splitk)
+    elif splitk:
+        raise NotImplementedError(f"split_k_slices={config.split_k_slices}: template {tmpl.file} has no split-K support")
+    # Under split-K `snippets` is kernel 1's partials store; kernel 2 renders the graph's epilogue.
+    plumb = _splitk_reduce_snippets(chain, config) if splitk else snippets
 
     aux_tensors = chain.aux_tensors
     kernel_aux_params = _aux_signature_block(aux_tensors)
     host_aux_params = _aux_signature_block(aux_tensors)
     host_aux_pass = _aux_call_block(aux_tensors)
-    compile_aux_fakes = _aux_fake_block(
-        aux_tensors, dynamic_strides=True, align_reqs=_aux_align_reqs(chain, vec_bytes=_epi_chunk_bytes(chain, config, use_tma))
-    )
+    compile_aux_fakes = _aux_fake_block(aux_tensors, dynamic_strides=True, align_reqs=_aux_align_reqs(chain, vec_bytes=_out_vec_bytes(chain, config, use_tma)))
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
     tile_constants = _render_block_scale_tile_constants(config, chain, tmpl)
-    if snippets.tap_constants:
-        tile_constants += "\n" + "\n".join(snippets.tap_constants)
+    if plumb.tap_constants:
+        tile_constants += "\n" + "\n".join(plumb.tap_constants)
 
-    kernel_tap_params = ",\n".join(snippets.tap_kernel_params)
+    kernel_tap_params = ",\n".join(plumb.tap_kernel_params)
     if kernel_tap_params:
         kernel_tap_params += ","
-    host_tap_params = ",\n".join(snippets.tap_host_params)
+    host_tap_params = ",\n".join(plumb.tap_host_params)
     if host_tap_params:
         host_tap_params += ","
-    host_tap_pass = ",\n".join(snippets.tap_host_pass)
+    host_tap_pass = ",\n".join(plumb.tap_host_pass)
     if host_tap_pass:
         host_tap_pass += ","
-    compile_tap_fakes = "\n".join(snippets.tap_compile_fakes)
-    compile_tap_pass = ",\n".join(snippets.tap_compile_pass)
+    compile_tap_fakes = "\n".join(plumb.tap_compile_fakes)
+    compile_tap_pass = ",\n".join(plumb.tap_compile_pass)
     if compile_tap_pass:
         compile_tap_pass += ","
-    tap_ptr_binds = "\n".join(snippets.tap_ptr_binds) if snippets.tap_ptr_binds else "pass"
+    tap_ptr_binds = "\n".join(plumb.tap_ptr_binds) if (plumb.tap_ptr_binds and not splitk) else "pass"
     red_kernel_stride_params = _reduction_stride_kernel_params(chain)
     red_host_stride_unpack = _reduction_stride_host_unpack(chain) if chain.has_moe else _reduction_stride_host_unpack_from(chain, 10)
     red_host_stride_pass = _reduction_stride_host_pass(chain)
@@ -2252,9 +2261,13 @@ def _render_block_scale_template(
         "INJECT_COMPILE_TAP_FAKES": compile_tap_fakes,
         "INJECT_COMPILE_TAP_PASS": compile_tap_pass,
         "INJECT_TAP_PTRS": tap_ptr_binds,
-        "INJECT_AUX_VIEWS": snippets.aux_views,
+        "INJECT_AUX_VIEWS": "pass" if splitk else snippets.aux_views,
         "INJECT_EPILOGUE": snippets.epilogue,
     }
+    if splitk:
+        replacements["INJECT_SPLITK_EPILOGUE_BINDINGS"] = _splitk_epilogue_bindings(chain, len(plumb.tap_kernel_params))
+        replacements["INJECT_REDUCE_AUX_VIEWS"] = plumb.aux_views
+        replacements["INJECT_REDUCE_EPILOGUE"] = plumb.epilogue
     for marker, replacement in (
         ("INJECT_KERNEL_REDUCTION_STRIDE_PARAMS", red_kernel_stride_params),
         ("INJECT_HOST_REDUCTION_STRIDES", red_host_stride_unpack),
@@ -2283,7 +2296,7 @@ def _render_block_scale_template(
     if "@@INJECT_STG_VEC_BINDINGS@@" in src:
         replacements["INJECT_STG_VEC_BINDINGS"] = stg_vec_bindings
     if "@@INJECT_KERNEL_TMA_C_PARAMS@@" in src:
-        replacements.update(_tma_c_plumbing(chain, tma_slots))
+        replacements.update(_tma_c_plumbing(chain, tma_slots, splitk=splitk))
     if "@@INJECT_TMA_STORE_SEQUENCE@@" in src:
         _epi = _epi_n_for_chain(config, chain)
         replacements["INJECT_EPILOGUE"], replacements["INJECT_TMA_STORE_SEQUENCE"] = _place_tma_stores(snippets.epilogue, chain, config, tma_slots, _epi)
@@ -2721,7 +2734,7 @@ class CompiledFusedGemm:
         needs_workspace = bool(r.workspace_bytes)
         split_k_slices = self.config.split_k_slices
         if needs_workspace:
-            cta_k_elems = self.config.cta_smem_tile_mnk(DTYPE_BYTES[_mma_a_dtype(self.chain)])[2]
+            cta_k_elems = _cta_k_elems(self.chain, self.config)
             reduce_elems = _splitk_reduce_elems(self.chain)
         # Named so a test can assert which rule refused a call, and that a legal
         # call trips none. Incremented only on the path that is already raising.
@@ -3588,6 +3601,18 @@ def _check_executable(chain: FusionChain) -> None:
 _SPLITK_PIPELINES = ("sm100", "sm120")
 
 
+def _cta_k_elems(chain: FusionChain, config: TileConfig) -> int:
+    """Elements of K per CTA tile; fp4 packs two per byte."""
+    return config.cta_tile_k_bytes * 8 // DTYPE_BITS[_mma_a_dtype(chain)]
+
+
+def _splitk_workspace_bytes(chain: FusionChain, config: TileConfig) -> int:
+    """fp32 partials: split_k_slices * B * M * N * 4B."""
+    if config.split_k_slices == 1:
+        return 0
+    return align_up(config.split_k_slices * chain.matmul.batch * chain.matmul.M * chain.matmul.N * 4)
+
+
 def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None" = None) -> TileConfig:
     """Layer split-K onto the selected config when the output grid underfills
     the GPU and K is deep.
@@ -3607,14 +3632,13 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
     if _splitk_reject_reason(chain, replace(config, split_k_slices=2)) is not None:
         return config
     mm = chain.matmul
-    elem_bytes = DTYPE_BYTES[_mma_a_dtype(chain)]
-    if mm.K * elem_bytes < 2048:
+    if mm.K * DTYPE_BITS[_mma_a_dtype(chain)] < 2048 * 8:
         return config
     sm = sm_count if sm_count is not None else _sm_count()
     output_tiles = mm.batch * -(-mm.M // config.cta_tile_m) * -(-mm.N // config.cta_tile_n)
     if output_tiles >= sm:
         return config
-    cta_k_elems = config.cta_smem_tile_mnk(elem_bytes)[2]
+    cta_k_elems = _cta_k_elems(chain, config)
     num_k_tiles = -(-mm.K // cta_k_elems)
     min_k_tiles_per_slice = max(-(-64 // cta_k_elems), 2)
     slices = min(
@@ -3847,8 +3871,6 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
         reasons.append(f"the {config.pipeline!r} pipeline ({' / '.join(_SPLITK_PIPELINES)} only)")
     if chain.has_moe:
         reasons.append("MoE grouped matmul")
-    if chain.has_block_scale:
-        reasons.append("block-scale matmul")
     if chain.is_multi_gemm:
         reasons.append("multi-GEMM")
     if chain.quants:
@@ -3937,10 +3959,6 @@ def jit_from_cudnn_graph(
     src = _render_template(chain, snippets, config)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
-    splitk_ws = 0
-    if splitk:
-        # fp32 partials buffer: split_k_slices * B * M * N * 4B
-        splitk_ws = align_up(config.split_k_slices * chain.matmul.batch * chain.matmul.M * chain.matmul.N * 4)
     return CompiledFusedGemm(
         chain=chain,
         config=config,
@@ -3952,7 +3970,7 @@ def jit_from_cudnn_graph(
         store_modes=store_modes,
         use_tma_store=use_tma,
         vec_bytes_epi=_out_vec_bytes(chain, config, use_tma),
-        workspace_bytes=splitk_ws,
+        workspace_bytes=_splitk_workspace_bytes(chain, config),
     )
 
 
@@ -4414,13 +4432,15 @@ def _jit_block_scale(
 
     _precheck_block_scale(chain, config)
     store_modes = _store_modes(chain, config)
-    use_tma = "tma" in store_modes
+    use_tma = _use_tma_store_epi(chain, config)
+    splitk = config.split_k_slices > 1
     snippets = generate(
         chain,
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
-        tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
+        tma_slots=frozenset({0}) if (splitk and use_tma) else frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
+        split_k_slices=config.split_k_slices,
     )
     src = _render_block_scale_template(chain, snippets, config)
     mod = _import_kernel(src)
@@ -4436,7 +4456,8 @@ def _jit_block_scale(
         use_tma_store=use_tma,
         block_scale=True,
         binding=binding,
-        vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
+        vec_bytes_epi=_out_vec_bytes(chain, config, use_tma),
+        workspace_bytes=_splitk_workspace_bytes(chain, config),
     )
 
 
