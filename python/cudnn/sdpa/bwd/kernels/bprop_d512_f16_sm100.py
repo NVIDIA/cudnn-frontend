@@ -262,6 +262,11 @@ SMEM_LAYOUT_V = _SWZ_ENUM[CFG.V_SWZ_BYTES]
 SMEM_LAYOUT_S = _SWZ_ENUM[CFG.S_SWZ_BYTES]
 S_SMEM_SWIZZLE = cutlass.Swizzle(_SWZ_B[CFG.S_SWZ_BYTES], 4, 3)
 
+# fp32 ship staging is one 256 B row per lane, so a linear map is a 32-way
+# bank conflict, and no descriptor reads it, so nothing but this XOR spreads
+# its banks.  mbase + sshift == log2(row bytes); the (b, 4, 3) presets are 128 B.
+S_XFER_SWIZZLE = cutlass.Swizzle(3, 4, 4)
+
 _CORE_MATRIX_ROWS = 8
 LEADING_BYTE_OFFSET_QK = 0
 STRIDE_BYTE_OFFSET_QK = _CORE_MATRIX_ROWS * CFG.Q_SWZ_BYTES
@@ -877,13 +882,10 @@ def _compute_kv_iter(
             if cutlass.const_expr(_PADDED):
                 s_post = s_post * row_scale
 
-            # The fp32 ship, sg0 -> sg1.  This buffer is UNSWIZZLED and
-            # linear on purpose: unlike the forward's P it is never an
-            # MMA operand and never TMA'd, so a swizzled read path would
-            # buy nothing and cost a matching load.
+            # The fp32 ship, sg0 -> sg1.  sg1 reads it back through the same swizzle
+            # at the same offset; the bulk ship below copies bytes and does not care.
             bars.mb_s_xfer_empty[chunk].wait(xfer_empty_state.phase)
-            for _i in cutlass.range_constexpr(S_D_BLOCK):
-                sXfer_raw.subview(xfer_off + cutlass.Int32(_i)).store(s_post[_i])
+            sXfer_raw.subview(xfer_off).data_ptr().store_swizzled(s_post, alignment=128, swizzle=S_XFER_SWIZZLE)
 
             # The workspace store staging.  Deferred wait: the exp2 above
             # overlaps the previous TMA-STG drain.
@@ -910,9 +912,9 @@ def _compute_kv_iter(
             # dS = (attn_scale_for_dS * dS_acc - do_dot*attn_scale) * S.
             # S is read at fp32 -- rounding it to the io dtype here is
             # exactly the accuracy the Rubin reference does not lose.
-            ds_elems = tuple(
-                (reg_acc[_i] * attn_scale_for_dS - scaled_do_dot_q) * sXfer_raw.subview(xfer_off + cutlass.Int32(_i)).load() for _i in range(S_D_BLOCK)
-            )
+            # One 256 B swizzled read, the mirror of sg0's store.
+            s_ship = sXfer_raw.subview(xfer_off).data_ptr().load_swizzled(S_XFER_SWIZZLE, alignment=128, count=S_D_BLOCK)
+            ds_elems = tuple((reg_acc[_i] * attn_scale_for_dS - scaled_do_dot_q) * s_ship[_i] for _i in range(S_D_BLOCK))
             ds_post = cutlass.Vector.from_elements(ds_elems, cutlass.Float32)
 
             bars.mb_smem_empty[chunk].wait(smem_state.phase)

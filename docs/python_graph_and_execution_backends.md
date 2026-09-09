@@ -32,7 +32,9 @@ configs or place it against the backend.
 ```text
 create_execution_plans([heur_mode.A, ...])                    _pygraph.py
 │
-├─ validate()                    lowers + freezes any graph the backend CAN lower
+├─ validate()                    family declares a validator AND a python engine is
+│                                a candidate → native semantic validation (no lowering);
+│                                otherwise lowers + freezes any graph the backend CAN lower
 ├─ _finalize_backend_layout()    backend layout inference lands, or records a decline
 ├─ _freeze()                     whole public surface sealed
 ├─ _attach_facts()               family_for → resolve_analyzer → ONE parse, hung on the graph
@@ -369,6 +371,18 @@ without being imported. Everything else is the engine's own `check_support()`.
   `("module", "callable")` pair kept as strings so the coarse key stays
   import-free. It is handed the facts, the family's offered ids and the
   backend's entries, and what it returns IS the plan list.
+- **A family may name a `validator` hook** — the same import-free pair,
+  `validate_graph(graph) -> bool`. When the manifest offers a python engine for
+  the graph, `validate()` runs it instead of the eager C++ lowering: it applies
+  the family's version- and arch-agnostic semantic rules with the classic error
+  types, and returns False (classic lowering) for a graph holding a node it does
+  not cover. It exists because the eager lowering coupled a graph a python
+  engine fully serves to the installed backend's version and per-arch gates
+  (issue #704); the backend's own verdict is not lost, only deferred to planning
+  (`_finalize_backend_layout` records the decline, `plan()` raises it if no
+  python engine proposes a plan either). A family without one validates
+  classically. `cudnn/_sdpa_validate.py` and `cudnn/_gemm_validate.py` are the
+  two today; both import only the IR.
 - **There is no registration call.** The manifest is the only way a python
   engine exists, and `_candidate_engines()` is the graph's family and nothing
   else. An engine handed over at runtime could never be ranked anyway: it
@@ -430,7 +444,8 @@ only to decline is why `closed_under` existed.
   `import cudnn.sdpa.graph_analyzer` costs 9 ms and 2 modules rather than
   1059 ms and 381.
 - The graph API pulls no framework at all: describing and validating a graph
-  imports neither torch nor cutlass.
+  imports neither torch nor cutlass — the family validators included (they see
+  only the IR).
 - A missing or too-old DSL is a DECLINE at `check_support()`, probed without
   executing the module (`importlib.util.find_spec`, `importlib.metadata`).
   `CUTEDSL_MIN_VERSION` in `frost/buffers.py` is the floor these engines want;
@@ -528,17 +543,22 @@ only to decline is why `closed_under` existed.
   `Tensor`/`Node`/`GraphContext`, dict writes on node ports/params
   (MappingProxy), in-place dim/stride edits (sealed to tuples). Inspection
   stays fully readable. `validate()` lowers and freezes any graph the backend
-  CAN lower (classic error timing), so the mutable-after-validate window is
-  exactly the ops with no backend node (GDN/KDA/…); a mutation in it
-  invalidates the validation. Planning freezes BEFORE it analyses, so facts
-  never describe a graph that can still change.
+  CAN lower (classic error timing) unless the graph's family validated it
+  natively (see *The manifest*), so the mutable-after-validate window is the ops
+  with no backend node (GDN/KDA/…) plus natively validated graphs; a mutation in
+  it invalidates the validation and drops the cached candidate list. Planning
+  freezes BEFORE it analyses, so facts never describe a graph that can still
+  change.
 - **Output layout contract**: only USER-assigned output dim/stride are pushed
   to the lowered graph; IR-inferred strides are provisional (row-major) and
   the backend keeps its classic per-op layout inference (e.g. channels-last
   conv). A unified layout resolver across python/cuDNN candidates belongs to
   the heuristics follow-up.
 - **Classic parity**: the public `cudnn.pygraph` surface behaves as before —
-  `cudnnGraphNotSupportedError` at `validate()`, conditional outputs return
+  `cudnnGraphNotSupportedError` at `validate()` for a semantically invalid
+  graph (natively or via the backend; with a python engine candidate, a
+  rejection the *backend* alone would raise — version or arch gate — surfaces
+  at `plan()` instead, and only if no python engine proposes a plan), conditional outputs return
   `None`, torch dtypes/`torch.Size` accepted, ragged (THD) offsets and
   multipliers on outputs, serialize/deserialize passthrough, plan queries
   delegate to the lowered graph.

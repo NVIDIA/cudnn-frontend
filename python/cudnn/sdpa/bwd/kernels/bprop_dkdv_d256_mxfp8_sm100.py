@@ -2868,7 +2868,7 @@ class BlackwellFmhaBackwardDKDV256:
             compute_mma_dS_pipeline,
             mma_compute_dK_pipeline,
         ) = pipeline_args
-        # FIXME: TMEM pointers are fixed after cluster sync
+        # TODO: TMEM pointers are fixed after cluster sync
         # therefore, this wait shall be trivial.
         tmem.wait_for_alloc()
 
@@ -3499,7 +3499,7 @@ class BlackwellFmhaBackwardDKDV256:
         Q, K, _, _ = problem_shape
         _, blk_coord_k, _, _ = blk_coord
 
-        # FIXME: perhaps make it uniform register
+        # TODO: perhaps make it uniform register
         wg_idx_valid = (tidx % (self.num_compute_warps * self.threads_per_warp)) // 128
         iter_start_global = iter_start
         num_warp_groups = self.num_compute_warps // self.num_compute_0_warps

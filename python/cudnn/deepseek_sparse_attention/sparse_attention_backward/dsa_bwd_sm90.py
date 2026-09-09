@@ -12,6 +12,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
+from cutlass._mlir.dialects import arith
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import LayoutEnum
 
@@ -630,6 +631,7 @@ class FlashAttentionDSABackwardSm90:
 
         sLSE_struct = cute.struct.Align[cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64)], 128]
         sdPsum_struct = cute.struct.Align[cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64)], 128]
+        sValid_struct = cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, 16], 16]
 
         @cute.struct
         class SharedStorage:
@@ -637,6 +639,7 @@ class FlashAttentionDSABackwardSm90:
             mbar_QdO: cute.struct.MemRange[cutlass.Int64, 2]
             sLSE: sLSE_struct
             sdPsum: sdPsum_struct
+            sValid: sValid_struct
             sQ: sQ_struct
             sKV: sKV_struct
             sdO: sdO_struct
@@ -888,6 +891,7 @@ class FlashAttentionDSABackwardSm90:
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sKV = storage.sKV.get_tensor(sKV_layout.outer, swizzle=sKV_layout.inner)
+        sValid = storage.sValid.get_tensor(cute.make_layout((4, 4)))
         sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
         sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
@@ -941,6 +945,7 @@ class FlashAttentionDSABackwardSm90:
                 mdQ,
                 sQ,
                 sKV,
+                sValid,
                 sV,
                 sdO,
                 sP,
@@ -990,6 +995,7 @@ class FlashAttentionDSABackwardSm90:
                 tma_atom_dQ_64,
                 mTopkLength,
                 mTopkIdxs,  # per-q length + scatter indices
+                mKV.shape[0],
                 tidx,
                 TileSchedulerCls,
             )
@@ -1009,6 +1015,7 @@ class FlashAttentionDSABackwardSm90:
         mdQ: cute.Tensor,
         sQ: cute.Tensor,
         sKV: cute.Tensor,
+        sValid: cute.Tensor,
         sV: cute.Tensor,
         sdO: cute.Tensor,
         sP: cute.Tensor,
@@ -1153,6 +1160,14 @@ class FlashAttentionDSABackwardSm90:
             else:
                 topK = self.max_topk
 
+            # Both warpgroups must derive the same bounded tile count. Apart
+            # from preventing top-k reads past the physical row, this keeps
+            # every cross-warpgroup named barrier symmetric.
+            if topK > Int32(self.max_topk):
+                topK = Int32(self.max_topk)
+            if topK < Int32(0):
+                topK = Int32(0)
+
             mKV_cur = mKV[None, None, head_idx_kv, batch_idx]
             mTopkIdxs_cur = mTopkIdxs[batch_idx, seq_idx, None]
 
@@ -1226,6 +1241,7 @@ class FlashAttentionDSABackwardSm90:
                     mKV_cur,
                     mTopkIdxs_cur,
                     sKV,
+                    sValid,
                     async_copy_atom,
                     async_thr_copy,
                     idx_in_group,
@@ -1254,6 +1270,7 @@ class FlashAttentionDSABackwardSm90:
                         mKV_cur,
                         mTopkIdxs_cur,
                         sKV,
+                        sValid,
                         async_copy_atom,
                         async_thr_copy,
                         idx_in_group,
@@ -1306,41 +1323,50 @@ class FlashAttentionDSABackwardSm90:
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
-    # cp.async one gmem row → swizzled smem
+    # cp.async one valid gmem row → swizzled smem, or zero an invalid row
     @cute.jit
     def _copy_row(
         self,
         mKV_cur: cute.Tensor,  # (s_kv, headdim) gmem
-        mTopkIdxs_cur: cute.Tensor,  # (topk,) gmem
+        token_idx: Int32,
+        row_is_valid: Boolean,
         sKV: cute.Tensor,  # (tile_n, headdim) swizzled smem
         row: Int32,  # smem row index
         idx_in_group: Int32,  # 0..7 dim dir
         copy_atom: cute.CopyAtom,
         thr_copy: cute.TiledCopy,
-        global_topk_row: Int32,  # index into topk_idxs
     ):
-        token_idx = mTopkIdxs_cur[global_topk_row]
         gKV_row = mKV_cur[token_idx, None]
         gKV_chunks = cute.flat_divide(gKV_row, (8,))
+        sKV_row = sKV[row, None]
+        sKV_row_chunks = cute.flat_divide(sKV_row, (8,))
+        pred_sKV = sKV_row_chunks[None, idx_in_group]
+        pred_tSsKV = thr_copy.partition_D(pred_sKV)
+        load_pred = cute.make_fragment_like(pred_tSsKV[(0, None), None], Boolean)
+        load_pred.fill(row_is_valid)
         for tile in cutlass.range_constexpr(self.tile_hdim // 64):
             chunk_idx = tile * 8 + idx_in_group
             g_chunk = gKV_chunks[None, chunk_idx]
-            sKV_row = sKV[row, None]
-            sKV_row_chunks = cute.flat_divide(sKV_row, (8,))
             s_chunk = sKV_row_chunks[None, chunk_idx]
             tSg = thr_copy.partition_S(g_chunk)
             tSs = thr_copy.partition_D(s_chunk)
-            cute.copy(copy_atom, tSg, tSs)
+            cute.copy(copy_atom, tSg, tSs, pred=load_pred)
 
-    # clear for OOB rows
     @cute.jit
-    def _zero_row(self, sKV: cute.Tensor, row: Int32, idx_in_group: Int32):
-        """Zero-fill one K row in smem, cooperative across 8 threads in a group."""
-        sK_row = sKV[row, None]
-        sK_chunks = cute.flat_divide(sK_row, (8,))
-        for tile in cutlass.range_constexpr(self.tile_hdim // 64):
-            chunk_idx = tile * 8 + idx_in_group
-            sK_chunks[None, chunk_idx].fill(0)
+    def _topk_row_is_valid(self, sValid: cute.Tensor, col: Int32) -> Boolean:
+        """Read one row predicate from four packed loader-warp ballots."""
+        sValid_words = cute.make_tensor(
+            cute.recast_ptr(sValid.iterator, dtype=cutlass.Uint32),
+            cute.make_layout((4,)),
+        )
+        group_idx = col % 16
+        bit = (group_idx // 4) * 8 + group_idx % 4
+        return (sValid_words[col // 16] & (cutlass.Uint32(1) << bit)) != 0
+
+    @cute.jit
+    def _select_valid_probability(self, probability: Float32, is_valid: Boolean) -> Float32:
+        zero = Float32(0.0)
+        return Float32(arith.select(is_valid.ir_value(), probability.ir_value(), zero.ir_value()))
 
     # Scatter AtomicAdd — write dKV accumulator fragment to
     # per-row interleaved fake-col layout in gmem indexed by topK_idx,
@@ -1362,6 +1388,7 @@ class FlashAttentionDSABackwardSm90:
         mdKVaccum_cur: cute.Tensor,  # (seqlen_k_rounded * hdim_rounded,) f32 gmem
         n_block: Int32,  # current n_block (KV tile index in topk)
         topK: Int32,  # per-q valid KV count (runtime)
+        max_seqlen_kv: Int32,  # logical KV row count
         thr_mma: cute.TiledMma,  # thread's MMA slice
         tidx: Int32,
     ):
@@ -1388,10 +1415,8 @@ class FlashAttentionDSABackwardSm90:
             global_topk_row = n_block * self.tile_n + local_row
             if global_topk_row < topK:
                 global_kv_row = mTopkIdxs_cur[global_topk_row]
-                should_accumulate_dkv = const_expr(True)
-                if const_expr(not self.have_topk_length):
-                    should_accumulate_dkv = global_kv_row >= 0
-                if should_accumulate_dkv:
+                row_is_valid = global_kv_row >= 0 and global_kv_row < max_seqlen_kv
+                if row_is_valid:
                     row_base = global_kv_row * self.tile_hdim + chunk_idx * self.hdim_chunk
 
                     # Each group of 4 MN-view cols maps to one N-tile.
@@ -1416,6 +1441,7 @@ class FlashAttentionDSABackwardSm90:
         mKV_cur: cute.Tensor,  # (s_kv, headdim) gmem
         mTopkIdxs_cur: cute.Tensor,  # (topk,) gmem
         sKV: cute.Tensor,  # (tile_n, headdim) swizzled smem
+        sValid: cute.Tensor,  # four packed row-validity words
         async_copy_atom: cute.CopyAtom,
         async_thr_copy: cute.TiledCopy,
         idx_in_group: Int32,
@@ -1448,36 +1474,28 @@ class FlashAttentionDSABackwardSm90:
         for r in cutlass.range_constexpr(ROWS_PER_GROUP):
             row = r * NUM_GROUPS + group_idx
             global_topk_row = n_block * self.tile_n + row
-            if row < num_valid_rows or dQ_accumulate:
-                if const_expr(self.have_topk_length):
-                    self._copy_row(
-                        mKV_cur,
-                        mTopkIdxs_cur,
-                        sKV,
-                        row,
-                        idx_in_group,
-                        async_copy_atom,
-                        async_thr_copy,
-                        global_topk_row,
-                    )
-                else:
-                    token_idx = mTopkIdxs_cur[global_topk_row]
-                    if token_idx >= 0:
-                        self._copy_row(
-                            mKV_cur,
-                            mTopkIdxs_cur,
-                            sKV,
-                            row,
-                            idx_in_group,
-                            async_copy_atom,
-                            async_thr_copy,
-                            global_topk_row,
-                        )
-                    else:
-                        self._zero_row(sKV, row, idx_in_group)
-            else:
-                # Tail padding of the peeled n_block.
-                self._zero_row(sKV, row, idx_in_group)
+            row_is_active = row < num_valid_rows or dQ_accumulate
+            token_idx = Int32(-1)
+            if row_is_active:
+                token_idx = mTopkIdxs_cur[global_topk_row]
+            row_is_valid = row_is_active and token_idx >= 0 and token_idx < mKV_cur.shape[0]
+            valid_bits = cutlass.Uint32(cute.arch.vote_ballot_sync(row_is_valid))
+            self._copy_row(
+                mKV_cur,
+                token_idx,
+                row_is_valid,
+                sKV,
+                row,
+                idx_in_group,
+                async_copy_atom,
+                async_thr_copy,
+            )
+
+            if wg_tidx % 32 == 0:
+                valid_nibble = (valid_bits & cutlass.Uint32(1)) | ((valid_bits >> 7) & cutlass.Uint32(2))
+                valid_nibble = valid_nibble | ((valid_bits >> 14) & cutlass.Uint32(4))
+                valid_nibble = valid_nibble | ((valid_bits >> 21) & cutlass.Uint32(8))
+                sValid[wg_tidx // 32, r] = cutlass.Uint8(valid_nibble)
 
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
@@ -1499,25 +1517,16 @@ class FlashAttentionDSABackwardSm90:
         #
         # Padded columns are zero-filled in sKV, so their score is 0 rather
         # than -inf. Force those lanes to probability zero.
-        # Compact: past num_valid_rows on the peeled tail n_block.
-        # Non-compact: a negative top-k index. Positive OOB indices and
-        # compact entries in [0, topK) are trusted as valid KV rows.
+        # Tail columns and every index outside the logical KV extent are
+        # invalid in both compact and non-compact modes.
         acc_S_mn = make_acc_tensor_mn_view(acc_S, transpose=self.SdP_swapAB)
         COL = const_expr(1 if not self.SdP_swapAB else 0)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
             for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
-                p = cute.math.exp2(acc_S_mn[r, c] * softmax_scale_log2 - tLSErLSE[r], fastmath=True)
                 col = tScS_mn[r, c][COL]
-                if not dQ_accumulate:
-                    p = Float32(0.0) if col >= num_valid_rows else p
-                if const_expr(not self.have_topk_length):
-                    # Peeled tile still spans tile_n columns; clamp so a
-                    # partial non-compact row is not read past its end.
-                    idx = n_block * self.tile_n + col
-                    idx = idx if idx < self.max_topk else Int32(self.max_topk - 1)
-                    if mTopkIdxs_cur[idx] < 0:
-                        p = Float32(0.0)
-                acc_S_mn[r, c] = p
+                row_is_valid = self._topk_row_is_valid(sValid, col)
+                p = cute.math.exp2(acc_S_mn[r, c] * softmax_scale_log2 - tLSErLSE[r], fastmath=True)
+                acc_S_mn[r, c] = self._select_valid_probability(p, row_is_valid)
 
         # Convert P f32 -> bf16
         tdKVrP = cvt_f16(make_acc_tensor_frgA_view(acc_S), self.dtype)
@@ -1617,6 +1626,7 @@ class FlashAttentionDSABackwardSm90:
         tma_atom_dQ_64: cute.CopyAtom,
         mTopkLength: cute.Tensor,  # (batch, seqlen_q) int32, per-q valid KV count
         mTopkIdxs: cute.Tensor,  # (batch, seqlen_q, topk_max) int32 for scatter
+        max_seqlen_kv: Int32,
         tidx: Int32,
         TileSchedulerCls: Callable,
     ):
@@ -1694,6 +1704,10 @@ class FlashAttentionDSABackwardSm90:
                 topK = mTopkLength[batch_idx, seq_idx]
             else:
                 topK = self.max_topk
+            if topK > Int32(self.max_topk):
+                topK = Int32(self.max_topk)
+            if topK < Int32(0):
+                topK = Int32(0)
             n_block_max = (topK + self.tile_n - 1) // self.tile_n
 
             # scatter AtomicAdd — flat gmem dKVaccum for per-row addressing
@@ -1764,6 +1778,7 @@ class FlashAttentionDSABackwardSm90:
                     mdKVaccum_cur,
                     n_block,
                     topK,
+                    max_seqlen_kv,
                     thr_mma_dKV,
                     tidx,
                 )
@@ -1796,6 +1811,7 @@ class FlashAttentionDSABackwardSm90:
                     mdKVaccum_cur,
                     n_block,
                     topK,
+                    max_seqlen_kv,
                     thr_mma_dKV,
                     tidx,
                 )
@@ -1828,6 +1844,7 @@ class FlashAttentionDSABackwardSm90:
                     mdKVaccum_cur,
                     n_block,
                     topK,
+                    max_seqlen_kv,
                     thr_mma_dKV,
                     tidx,
                 )
@@ -1858,6 +1875,7 @@ class FlashAttentionDSABackwardSm90:
                     mdKVaccum_cur,
                     n_block,
                     topK,
+                    max_seqlen_kv,
                     thr_mma_dKV,
                     tidx,
                 )
@@ -1882,6 +1900,7 @@ class FlashAttentionDSABackwardSm90:
                     mdKVaccum_cur,
                     n_block,
                     topK,
+                    max_seqlen_kv,
                     thr_mma_dKV,
                     tidx,
                 )
@@ -1906,6 +1925,7 @@ class FlashAttentionDSABackwardSm90:
                     mdKVaccum_cur,
                     n_block,
                     topK,
+                    max_seqlen_kv,
                     thr_mma_dKV,
                     tidx,
                 )
@@ -1930,6 +1950,7 @@ class FlashAttentionDSABackwardSm90:
                     mdKVaccum_cur,
                     n_block,
                     topK,
+                    max_seqlen_kv,
                     thr_mma_dKV,
                     tidx,
                 )
@@ -1959,6 +1980,7 @@ class FlashAttentionDSABackwardSm90:
                         mdKVaccum_cur,
                         n_block,
                         topK,
+                        max_seqlen_kv,
                         thr_mma_dKV,
                         tidx,
                     )
@@ -1969,6 +1991,7 @@ class FlashAttentionDSABackwardSm90:
                         mdKVaccum_cur,
                         n_block,
                         topK,
+                        max_seqlen_kv,
                         thr_mma_dKV,
                         tidx,
                     )
@@ -1994,6 +2017,7 @@ class FlashAttentionDSABackwardSm90:
                         mdKVaccum_cur,
                         n_block,
                         topK,
+                        max_seqlen_kv,
                         thr_mma_dKV,
                         tidx,
                     )

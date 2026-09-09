@@ -23,22 +23,19 @@ def _is_sm80() -> bool:
     return (major, minor) == (8, 0)
 
 
-def _dsl_available() -> bool:
-    # The kernels need the CuTe DSL *with* cutlass.experimental (cutlass-dsl
-    # >= 4.7). The package imports lazily (PEP 562), so a missing/old DSL
-    # only surfaces at kernel-load time — probe it here so the suite SKIPS
-    # instead of erroring mid-test.
-    try:
-        import cutlass.experimental  # noqa: F401
-    except ImportError:
-        return False
-    return True
+def _has_supported_cutedsl() -> bool:
+    """Rule 7 (python/cudnn/AGENTS.md): skip below CUTEDSL_MIN_VERSION instead of
+    failing inside the DSL when the kernel module loads."""
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    return bool(installed) and not cutedsl_too_old(version)
 
 
-pytestmark = pytest.mark.skipif(
-    not (_is_sm80() and _dsl_available()),
-    reason="SM80 SDPA API requires an SM80 (A100) device and nvidia-cutlass-dsl >= 4.7.",
-)
+pytestmark = [
+    pytest.mark.skipif(not _is_sm80(), reason="SM80 SDPA API requires an SM80 (A100) device"),
+    pytest.mark.skipif(not _has_supported_cutedsl(), reason="requires nvidia-cutlass-dsl at or above cudnn.frost.buffers.CUTEDSL_MIN_VERSION"),
+]
 
 
 def _bshd_randn(b, h, s, d, **kw):
@@ -150,6 +147,58 @@ def test_sdpa_bwd_sm80_wrapper(dtype, d_qk, d_v, mask, gqa):
     _, dq_ref, dk_ref, dv_ref = _ref_grads(q, k, v, do, is_causal=is_causal, window_left=window[0], scale=scale)
 
     # fp16 backward accumulates over S; scale tolerance accordingly.
+    torch.testing.assert_close(out["dq_tensor"].to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(out["dk_tensor"].to(torch.float32), dk_ref, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(out["dv_tensor"].to(torch.float32), dv_ref, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "is_causal,deterministic,expected", [(True, False, "lpt_l2"), (True, True, "natural"), (False, False, "natural")], ids=["causal", "causal-det", "dense"]
+)
+def test_sm80_bwd_sched_policy_resolution(is_causal, deterministic, expected):
+    """Causal takes the L2-grouped kv-major order; the deterministic relay and
+    non-causal work keep the plain 3-D grid (host-only: no compile)."""
+    try:
+        from cudnn.sdpa.bwd import api_dsl as api_sm80
+        from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2, SCHED_NATURAL
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+    want = {"lpt_l2": SCHED_LPT_L2, "natural": SCHED_NATURAL}[expected]
+    assert api_sm80._sm80_bwd_sched_policy(is_causal=is_causal, deterministic=deterministic) == want
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_lpt_l2_short_last_group():
+    """LPT_L2 grid decode with a SHORT last head-group block.
+
+    per_group = S_q * (Q + dO + fp32 dQ) = 8192 * 1024 B = 8 MiB against the
+    16 MiB budget -> 2 heads per block; H=3 MHA leaves the last block with one
+    head, exercising the clamped decode.  Every (kv_tile, head) must be visited
+    exactly once for dK/dV to be right and dQ to be complete.
+    """
+    try:
+        from cudnn.sdpa.bwd import sdpa_bwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+        from cudnn.sdpa.bwd import api_dsl as api_sm80
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+    b, h, s, d = 1, 3, 8192, 128
+    dtype = torch.bfloat16
+    q, k, v, do = (_bshd_randn(b, h, s, d, dtype=dtype, device="cuda") for _ in range(4))
+    scale = 1.0 / math.sqrt(d)
+    fwd = sdpa_fwd_wrapper_sm80(q_tensor=q, k_tensor=k, v_tensor=v, is_causal=True, scale_softmax=scale)
+    out = sdpa_bwd_wrapper_sm80(
+        q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=fwd["o_tensor"], do_tensor=do, lse_tensor=fwd["lse_tensor"], is_causal=True, scale_softmax=scale
+    )
+    # The wrapper's cached adapter for THIS shape must be on the grouped order
+    # (the cache is module-global, so filter by the shape, not any entry).
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+
+    mine = [e for e in api_sm80._sm80_bwd_cache.values() if getattr(e, "s_q_max", None) == s and getattr(e, "h_q", None) == h]
+    assert mine and all(e._params.sched_policy == SCHED_LPT_L2 for e in mine)
+    _, dq_ref, dk_ref, dv_ref = _ref_grads(q, k, v, do, is_causal=True, window_left=-1, scale=scale)
     torch.testing.assert_close(out["dq_tensor"].to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(out["dk_tensor"].to(torch.float32), dk_ref, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(out["dv_tensor"].to(torch.float32), dv_ref, rtol=3e-2, atol=3e-2)
@@ -375,8 +424,8 @@ def test_sm80_bwd_thd_compile_key_plan_time_only():
         # Count ONLY the bprop template's per-shape lru (the fwd wrapper runs
         # too, and its counters are covered by the forward's twin test); the
         # counters are session-global, so assert on DELTAS across our calls.
-        mods = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
-        infos = [m.compile.cache_info() for m in mods if hasattr(m.compile, "cache_info")]
+        modules = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
+        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
         return sum(i.misses for i in infos), sum(i.hits for i in infos)
 
     varlen([96, 160])  # first call: one compile
@@ -801,8 +850,8 @@ def test_sm80_bwd_thd_sinks_deterministic_compile_key():
 
     def cache_totals():
         """(misses, hits) summed over the loaded bprop template modules' compile caches."""
-        mods = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
-        infos = [m.compile.cache_info() for m in mods if hasattr(m.compile, "cache_info")]
+        modules = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
+        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
         return sum(i.misses for i in infos), sum(i.hits for i in infos)
 
     sinks = torch.randn(4, dtype=torch.float32, device="cuda")

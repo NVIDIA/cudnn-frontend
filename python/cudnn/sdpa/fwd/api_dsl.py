@@ -43,6 +43,8 @@ from cudnn.sdpa.fwd.config_sm120 import (
     SUPPORTED_HEAD_TILE_MAX as _SM120_HEAD_TILE_MAX,
     FP8_HEAD_TILE_GRANULE as _SM120_FP8_HEAD_TILE_GRANULE,
     TemplateParams as Sm120TemplateParams,
+    D256_FLAVOR as _SM120_D256_FLAVOR,
+    pick_flavor as _sm120_pick_flavor,
     smem_bytes as _sm120_smem_bytes,
 )
 
@@ -111,7 +113,7 @@ def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[
 # smaller FP8 flavor reaches, at most 2x zero-padding. A smaller graph is
 # declined rather than routed onto a kernel whose cga4x1 role-split geometry is
 # tuned for d = 512.
-_SM100_FP8_ENVELOPE_FLOORS = {(512, 512): 256}
+_SM100_FP8_ENVELOPE_FLOORS = {(192, 128): 128, (256, 256): 255, (512, 512): 256}  # (192,128)/(256,256): exact shape only, see engines._sm100_fp8_spec
 
 
 def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:
@@ -124,10 +126,12 @@ def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:
 # the padded/causal mask paths are active (see check_support).
 _SM100_TILE_N = 128
 
-_SM120_KERNEL_FILE = "prefill_f16_sm120.py"
-# Per-tensor FP8 kernel (E4M3/E5M2 in, FP16/BF16/FP8 out, mma.sync
-# m16n8k32); selected by the graph op (sdpa_fp8) via check_support's dtype.
-_SM120_FP8_KERNEL_FILE = "prefill_fp8_sm120.py"
+# Keyed by kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template. The fp8
+# family has no flavor: every head dim runs its general template.
+_SM120_KERNEL_FILES = {_SM120_D256_FLAVOR: "prefill_d256_f16_sm120.py", None: "prefill_f16_sm120.py"}
+_SM120_FP8_KERNEL_FILES = {None: "prefill_fp8_sm120.py"}
+
+
 _SM120_DTYPE_QKV_CODE = {
     torch.float8_e4m3fn: DTYPE_E4M3,
     torch.float8_e5m2: DTYPE_E5M2,
@@ -342,10 +346,11 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     return _load_kernel_template(filename, params, tag)
 
 
-def _load_sm120_kernel_module(params: Sm120TemplateParams, fp8: bool = False):
-    if fp8:
-        return _load_kernel_template(_SM120_FP8_KERNEL_FILE, params, tag="sdpa_fwd_sm120_fp8")
-    return _load_kernel_template(_SM120_KERNEL_FILE, params, tag="sdpa_fwd_sm120")
+def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120TemplateParams, fp8: bool = False):
+    tag = "sdpa_fwd_sm120_fp8" if fp8 else "sdpa_fwd_sm120"
+    if flavor is not None:
+        tag = f"{tag}_{_flavor_tag(flavor)}"
+    return _load_kernel_template((_SM120_FP8_KERNEL_FILES if fp8 else _SM120_KERNEL_FILES)[flavor], params, tag=tag)
 
 
 class SdpaFwdDsl(APIBase):
@@ -1088,7 +1093,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         # An FP8 graph must only land on a flavor that HAS an fp8 kernel: the
         # per-tensor and block-scale families have different native maps.
-        self.flavor = _pick_flavor(d_qk, d_v, tuple(f for f in _SM100_FLAVORS if f in fp8_shapes) if self._fp8 else None)
+        # The FP8 walk must agree with check_support: a flavor whose envelope
+        # floor excludes (d_qk, d_v) is skipped, so the graph lands on the next
+        # covering flavor instead of the one the floor exists to keep it off.
+        self.flavor = _pick_flavor(
+            d_qk,
+            d_v,
+            (
+                tuple(
+                    f
+                    for f in _SM100_FLAVORS
+                    if f in fp8_shapes and (f == (int(d_qk), int(d_v)) or min(int(d_qk), int(d_v)) > _SM100_FP8_ENVELOPE_FLOORS.get(f, 0))
+                )
+                if self._fp8
+                else None
+            ),
+        )
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
             f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
@@ -2567,10 +2587,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     with the head dim innermost (``dense_flex``, same envelope as SM100):
     ``execute()`` normalizes to the kernel's compact-BSHD storage via
     ``_to_bshd`` / ``_to_bshd_writable`` — zero-copy when the tensor already
-    is BSHD-compact, one gather / scatter copy otherwise. The kernel supports
+    is BSHD-compact, one gather / scatter copy otherwise. The kernels support
     FP16/BF16 MHA, GQA, and MQA; head dimensions in multiples of 8 through
-    256 (ENVELOPE: the kernel compiles at tiles rounded up to 16 and TMA
-    zero-fills the pad columns); top-left or bottom-right causal masks; left sliding
+    256 (ENVELOPE: the general template compiles at tiles rounded up to 16 and
+    TMA zero-fills the pad columns; head dims inside the d256 flavor's envelope
+    run the d256 template instead, ``config_sm120.pick_flavor``); top-left or
+    bottom-right causal masks; left sliding
     windows; optional per-batch query and key/value lengths; optional
     per-Q-head attention-sink logits; and THD (ragged / fully packed
     variable-length) batches, whose per-shape compile is deferred to
@@ -2578,11 +2600,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
     ``scale_softmax`` is a runtime parameter. Dtype, shape, tile sizes, masks,
     and length-tensor / sink / THD presence are compile-time specializations.
+    ``tile_m`` / ``tile_n`` are honored on both templates; left unset, both run
+    the largest KV tile that fits (the flavor selects the file, not the tiles).
     """
 
     def _initialize_implementation(self) -> None:
         self.q_tile = _SM120_Q_TILES[0] if self.tile_m is None else self.tile_m
         self.kv_tile = _SM120_KV_TILES[0] if self.tile_n is None else self.tile_n
+        self.flavor: Optional[tuple[int, int]] = None
         self.compute_capability: Optional[tuple[int, int]] = None
         self.head_dim_qk: Optional[int] = None
         self.head_dim_v: Optional[int] = None
@@ -2693,6 +2718,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
+        # Kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template.
+        self.flavor = _sm120_pick_flavor(int(d_q), int(d_v), self._fp8)
         if self.pack_gqa:
             self._not_implemented_error_if(
                 self.thd,
@@ -2879,7 +2906,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack_gqa=self.pack_gqa,
             split_kv=self.split_kv,
         )
-        self._k_mod = _load_sm120_kernel_module(params, fp8=self._fp8)
+        self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8)
         if self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
             # compile as dynamic extents and max_sq is a runtime launch
@@ -4469,6 +4496,14 @@ def sdpa_fwd_wrapper_sm80(
     token extents.  ALiBi, block_mask and the score-stat side outputs are not
     supported (use the graph API, which routes them to the cuDNN backend).
     """
+    # Rule 7 (python/cudnn/AGENTS.md): this entry reaches the kernel module on its
+    # own, so decline by DSL version here instead of surfacing the DSL's own
+    # TypeError/ModuleNotFoundError from the template load.
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    _too_old = cutedsl_requirement_error("sdpa_fwd_wrapper_sm80")
+    if _too_old is not None:
+        raise NotImplementedError(_too_old)
     if q_tensor.ndim != 4 or v_tensor.ndim != 4:
         raise ValueError(f"Q and V must be rank-4 BHSD; got Q={q_tensor.ndim}D V={v_tensor.ndim}D")
     if scale_output not in (None, 1.0):

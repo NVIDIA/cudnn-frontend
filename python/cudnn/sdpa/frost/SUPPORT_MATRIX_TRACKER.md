@@ -66,7 +66,7 @@ MMA as d=512.
 | FP8 E4M3 / E5M2 (per-tensor descale) | ⚠️⁷ | ✅ | ✅ | ❌ | ✅ | ❌ |
 | MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ❌⁸ | ✅ | ✅ | ❌ | ❌ | ✅ᵍ (E4M3 only, d=256) |
 | O dtype ≠ QKV dtype — **quantized graphs only**¹ | ✅ | ✅ | ✅ | — | ✅ | ✅ᵍ (fp16/bf16 gradients) |
-| Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 | f16 ×8 · fp8 ×16, floor 256² | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |
+| Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · **fp8 exact (192, 128) only**¹⁰ · mxfp8 exact | f16 ×8 · **fp8 exact 256 only**¹⁰ | f16 ×8 · fp8 ×16, floor 256² | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |
 | **Layout** | | | | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |
 | Arbitrary dense B/H/S stride order (`dense_flex`) | f16 only | f16 only | f16 only | ✅ | f16 only | ✅ᵇ ᶜ · ❌ᵍ |
@@ -82,7 +82,7 @@ MMA as d=512.
 | Padding mask + stats (per-batch LSE trim) | ✅ | f16/fp8 only⁴ | f16/fp8 only⁴ | ✅ | f16/fp8 only⁴ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | f16 only⁵ | f16 only⁵ | f16 only⁵ | ✅ | f16 only⁵ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ · dense only under THDʰ |
+| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ ʰ |
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
@@ -162,12 +162,17 @@ A sequence that is empty on ONE side only (`S_q[b] == 0` with `S_kv[b] > 0`, or
 the reverse) is served and returns exactly zero for that sequence: its GEMM's
 reduction axis is empty, so no MMA initialises the accumulator, and the epilogue
 stores zeros rather than TMEM residue.
-Its remaining conjunctions are declined, each with a reject test: **GQA** (the dK/dV
-partials would have to be packed per Q head), a non-BSHD-physical layout (the packed
-path has no staging copy), and a graph that does not declare
-**`max_total_seq_len_q`/`_kv`** — those are REQUIRED here, because
-`scratch_workspace_bytes()` is a build-time function and the blocked row count
-comes from the packed totals before any buffer exists.
+**GQA / MQA is served** as well: the stage-3 dK/dV GEMMs write one partial per Q
+head over the PACKED kv axis and the shared reduce folds the group onto the KV
+heads, so the packed path now matches the dense one feature for feature. With
+that, BOTH THD conjunction flags (`thd_causal`, `thd_gqa`) are **deleted** rather
+than set True — a conjunction flag is transitional by design and earns its place
+only while some row genuinely cannot serve the pair.
+What remains is a property of the path, not a feature it declines: a
+non-BSHD-physical layout (the packed path has no staging copy), and a graph that
+does not declare **`max_total_seq_len_q`/`_kv`** — those are REQUIRED here,
+because `scratch_workspace_bytes()` is a build-time function and the blocked row
+count comes from the packed totals before any buffer exists.
 ʲ Not a gap in this engine: `cu_seq_len_q/kv` is a **forward-only** graph
 attribute. `SDPA_backward_attributes` has no such input port and
 `pygraph.sdpa_backward()` no such keyword, so no backward row can claim it and
@@ -176,6 +181,16 @@ none could be tested. Ragged backward lengths arrive as per-batch `seq_len_q/kv`
 quantized rows list `{(128,128), (512,512)}` (per-tensor) / `{(128,128)}`
 (MXFP8), so d=64 **THD on FP8/MXFP8 is declined**. f16/bf16 THD rides the
 envelope (`thd_d_shapes=None`) and works.
+¹⁰ The per-tensor FP8 d192×d128 and d256 flavors are **floored to their exact
+shapes** (`d_envelope_floors` `((192,128),128), ((256,256),255)`, mirrored in
+`fwd/api_dsl._SM100_FP8_ENVELOPE_FLOORS`): with d_qk zero-padded into d192×d128
+the kernel's output is wrong (4–19 % of elements off by O(1) in `test_mhas_v2`),
+and the d256 padded envelope is run-to-run nondeterministic on long causal
+e5m2/GQA/sink graphs. So an FP8 graph with head dims in (128, 256) that is not
+exactly (192, 128) or (256, 256) is declined by the engine and takes the classic
+backend verdict — the same envelope the C++ `validate()` always enforced. The
+d128 flavor's ×16 envelope and the d512 band² are unaffected. Lift the floors
+once the kernels' padded paths pass the battery.
 ᵍ **`sdpa_bwd_sm100_mxfp8` only — `sdpa_mxfp8_backward()` with E4M3 payloads,
 d_qk = d_v = 256 exactly, fp16/bf16 `o_f16`/`dO_f16`/dQ/dK/dV.** Serves MHA /
 GQA / MQA, any fixed S_q / S_kv (the kernels mask tile tails; S_q = 1 works),
@@ -229,7 +244,8 @@ relying on it; do not read ❔ as either a guarantee or a rejection.
 
 Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
 `sdpa_bwd_sm120`. Head dims are a **continuum**, not per-model flavors: the
-kernel picks Q/K and V head tiles independently.
+kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
+tile at 256 on both sides run a dedicated template, `prefill_d256_f16_sm120.py` with the same support; fp8 has no such flavor).
 
 | Feature | FPROP<br>d ≤ 256, any ×8 | FPROP FP8<br>d ≤ 256, any ×16 | BPROP<br>d ≤ 256, any ×8 |
 |---|:--:|:--:|:--:|
@@ -312,7 +328,6 @@ feature-free d=64 graph.
 | Backward pass entirely | SM107 |
 | Backward outside d ∈ (256, 512] (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the two backward engines there serve exactly those bands |
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
-| Backward THD + GQA | SM100, SM103 |
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |

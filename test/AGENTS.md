@@ -33,7 +33,7 @@ pytest fe_api/gemm/          # OSS kernel tests
 
 ### Layout
 
-- `test/python/test_*.py` — core graph-API tests (conv, matmul, norms, SDPA `test_mhas*.py`, rope, kernel cache, OSS engines `test_sm{90,100}_prefill_oss_engine.py`, ...). Shared SDPA references in `test/python/sdpa/`.
+- `test/python/test_*.py` — core graph-API tests (conv, matmul, norms, SDPA `test_mhas*.py`, rope, kernel cache, OSS engine `test_sm100_rms_norm_silu_graph_api.py`, ...). Shared SDPA references in `test/python/sdpa/`.
 - **`test/python/sdpa/` is a mixed directory and the `test_` prefix is load-bearing.** `fp16.py`, `helpers.py`, `random_config.py` are harness modules the tests import; `sdpa/test_*.py` (and `sdpa/frost/test_*.py`) are collected tests. `pytest.ini` sets no `python_files` override, so a test file dropped there **without** the prefix is silently treated as a helper — it is never collected, and the suite stays green while asserting nothing. After moving or adding a test, confirm it is picked up by the *default* sweep, not just when named directly:
 
   ```bash

@@ -92,6 +92,13 @@ class EngineFamily:
     # can rank -- an engine cannot see its siblings. None falls back to one
     # default plan per accepting engine, ahead of the backend's.
     heuristics: Optional[Tuple[str, str]] = None
+    # ("module", "callable") validating a graph of this family natively in
+    # python -- ``validate_graph(graph) -> bool`` runs the family's version- and
+    # arch-agnostic semantic rules with the classic error types and returns False
+    # (having raised nothing) when the graph holds a node it does not cover, so
+    # pygraph.validate() takes the classic eager C++ lowering instead. None means
+    # the family has no native validator and always validates classically.
+    validator: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -178,6 +185,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.gemm.frost.engine",
         "FrostGemmEngines",
         slots={"frost_gemm": EngineSlot(0, opt_in=True)},
+        validator=("cudnn._gemm_validate", "validate_graph"),
     ),
     EngineFamily(
         FROST_SDPA_FWD_ID_BASE,
@@ -201,6 +209,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
+        validator=("cudnn._sdpa_validate", "validate_graph"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -214,6 +223,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm100_mxfp8": EngineSlot(3, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
+        validator=("cudnn._sdpa_validate", "validate_graph"),
     ),
 )
 
@@ -283,6 +293,12 @@ def resolve_analyzer(family: EngineFamily):
     family's heuristics and engines then read that same record back.
     """
     return _resolve(family, family.analyzer, "analyzer")
+
+
+def resolve_validator(family: EngineFamily):
+    """The family's python-native graph validator, or None (see EngineFamily.validator)."""
+
+    return _resolve(family, family.validator, "validator")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):

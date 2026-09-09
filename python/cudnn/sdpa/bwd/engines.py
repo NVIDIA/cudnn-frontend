@@ -162,19 +162,20 @@ class Capabilities:
     cu_seq_len: bool = False
     # THD is a SEPARATE code path (packed views + a blocked S/dS workspace), so
     # a feature the dense path serves is not automatically served under THD.
-    # These are the conjunction verdicts; mismatch() knows the shape of each.
     #
-    # BOTH ARE TRANSITIONAL AND MEANT TO BE DELETED, not accumulated. A
-    # conjunction flag earns its place only while some row genuinely cannot
-    # serve the pair; once the last one can, the flag is vacuous (it can never
-    # fire) and the field, its branch in mismatch(), and its tests all go --
-    # rather than being left set to True forever as a widening record of
-    # everything the packed path once could not do.
-    #   thd_causal: True on sdpa_bwd_sm100, the only row that sets thd -- so it
-    #     is ALREADY vacuous and is scheduled for removal.
-    #   thd_gqa:    still False; removal lands with the GQA-under-THD work.
-    thd_causal: bool = False  # any causal-family bound (causal / SWA / band / bottom-right) under THD
-    thd_gqa: bool = False  # h_q != h_kv under THD
+    # A conjunction flag here is TRANSITIONAL AND MEANT TO BE DELETED, not
+    # accumulated: it earns its place only while some row genuinely cannot serve
+    # the pair, and once the last one can it is vacuous -- it can never fire --
+    # so the field, its branch in mismatch() and its tests all go, rather than
+    # sitting at True forever as a widening record of what the packed path once
+    # could not do.
+    #
+    # `thd_causal` and `thd_gqa` were both removed on exactly that rule, once
+    # sdpa_bwd_sm100 -- the only row that sets `thd` -- served the causal family
+    # and then GQA. NOTHING is left here: the packed path's remaining limits
+    # (`thd_declared_totals`, the BSHD requirement) are not feature
+    # conjunctions, they are properties of the path itself. Think twice before
+    # adding another.
     # True when THD REQUIRES sdpa(max_total_seq_len_q=..., max_total_seq_len_kv=...):
     # the row's workspace is sized from the packed token totals at BUILD time,
     # before any buffer exists.
@@ -307,18 +308,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             return f"graph uses {label}, which this engine does not support"
 
     if facts.thd and capabilities.thd:
-        # These are the generic MATCHER, NOT a statement about any engine: a
-        # branch fires only for a row that has not set the flag. Reading the
-        # string below as "THD cannot do causal" is the wrong conclusion --
-        # sdpa_bwd_sm100 sets thd_causal=True and serves the whole causal
-        # family (stage 2 masks per sequence, stage 3 renders untrimmed; see
-        # SdpaBwdDslSm100.compile). thd_gqa is the one still declined.
-        #
-        # Both flags are TRANSITIONAL -- see Capabilities for the removal plan.
-        if (facts.causal or facts.right_band_widening or facts.window_left is not None) and not capabilities.thd_causal:
-            return "this engine does not serve causal-family masks under THD (its row leaves thd_causal unset)"
-        if facts.h_q != facts.h_kv and not capabilities.thd_gqa:
-            return f"this engine does not serve GQA / MQA under THD (its row leaves thd_gqa unset; H_q={facts.h_q}, H_kv={facts.h_kv})"
         if capabilities.thd_declared_totals and (facts.max_total_seq_len_q is None or facts.max_total_seq_len_kv is None):
             return (
                 "THD requires sdpa_backward(max_total_seq_len_q=..., max_total_seq_len_kv=...): "
@@ -792,11 +781,14 @@ def _sm100_spec() -> EngineSpec:
     family is served: stage 2 masks from the per-sequence metadata lengths (the
     bottom-right diagonal included, as ``S_kv[b] - S_q[b]``), and stage 3 is
     rendered UNTRIMMED because its K-trim is in absolute workspace rows -- the
-    adapter zero-fills the blocked workspace instead. Its remaining conjunctions
-    are declined and each is asserted by a reject test: GQA (the dK/dV partials
-    would have to be packed per Q head), and a graph that does not declare
+    adapter zero-fills the blocked workspace instead. GQA / MQA is served too,
+    by per-Q-head dK/dV partials over the PACKED kv axis plus the shared group
+    fold -- so the packed path now matches the dense one feature for feature,
+    and both THD conjunction flags are gone. What remains is a property of the
+    path, not a feature it declines: it requires
     ``max_total_seq_len_q/kv`` (``scratch_workspace_bytes()`` is a build-time
-    function and the blocked row count comes from the packed totals).
+    function and the blocked row count comes from the packed totals) and
+    BSHD-physical io (there is no staging leg).
 
     Everything else is declined for now and each rejection is asserted by a
     test: DENSE padding masks (the kernel compiles a scalar length; THD threads
@@ -819,7 +811,6 @@ def _sm100_spec() -> EngineSpec:
             right_band_widening=True,
             gqa=True,  # per-Q-head dK/dV partials + the shared dkv_reduce group fold
             thd=True,
-            thd_causal=True,  # stage 2 masks per sequence; stage 3 drops its trim and leans on the zero-fill
             thd_declared_totals=True,  # the blocked workspace is sized at build time
             # Any dense layout: the adapter uses a BSHD-physical tensor in place
             # (a permuted view, zero copy) and stages a non-conforming one
