@@ -222,6 +222,10 @@ class SdpaGraphFacts:
     has_paged_kv: bool = False
     has_alibi: bool = False
     has_unfuse_fma: bool = False
+    # sdpa(stats_use_log2=True): Stats requested as max + log2(sum_exp) instead of
+    # the natural-log form. A convention on the Stats output, not a math change;
+    # an engine that writes natural-log stats must decline, not ignore it.
+    has_stats_log2: bool = False
     has_block_mask: bool = False
     has_rng_dump: bool = False
     is_backward: bool = False  # sdpa_backward() / sdpa_mxfp8_backward() node (NodeType.SDPA_BWD / SDPA_MXFP8_BWD)
@@ -661,6 +665,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         has_paged_kv=(rec.get("paged_attention_k_table") is not None or rec.get("paged_attention_v_table") is not None),
         has_alibi=bool(rec.get("use_alibi_mask")),
         has_unfuse_fma=bool(rec.get("unfuse_fma")),
+        has_stats_log2=bool(rec.get("stats_use_log2")) and wants_stats,
         has_block_mask=rec.get("block_mask") is not None,
         has_rng_dump=rec.get("rng_dump") is not None,
         has_score_max=rec.get("score_max") is not None,

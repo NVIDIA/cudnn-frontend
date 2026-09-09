@@ -56,7 +56,8 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> scale_s,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> scale_o,
                        cudnn_frontend::AttentionImplementation_t const& implementation,
-                       bool const unfuse_fma) {
+                       bool const unfuse_fma,
+                       bool const stats_use_log2) {
     auto attributes = cudnn_frontend::graph::SDPA_attributes()
                           .set_bias(bias)
                           .set_alibi_mask(use_alibi_mask)
@@ -72,7 +73,8 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                           .set_implementation(implementation)
                           .set_logit_max(score_max)
                           .set_score_sum_exp(score_sum_exp)
-                          .set_unfuse_fma(unfuse_fma);
+                          .set_unfuse_fma(unfuse_fma)
+                          .set_stats_use_log2(stats_use_log2);
 
     if (block_mask) {
         attributes.set_block_mask(block_mask);
@@ -271,7 +273,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
               bool const unfuse_fma,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
-              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv) {
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
+              bool const stats_use_log2) {
     cudnn_frontend::DataType_t mma_core_mode                            = cudnn_frontend::DataType_t::HALF;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q = nullptr;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k = nullptr;
@@ -366,7 +369,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          scale_s,
                                          scale_o,
                                          implementation,
-                                         unfuse_fma);
+                                         unfuse_fma,
+                                         stats_use_log2);
 
     // Return {O, Stats} for backward compatibility
     return {internal_result.O, internal_result.Stats};
@@ -1171,6 +1175,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("unfuse_fma", false),
           py::arg_v("cu_seq_len_q", nullptr),
           py::arg_v("cu_seq_len_kv", nullptr),
+          py::arg_v("stats_use_log2", false),
           R"pbdoc(
                 Perform scaled dot product attention.
 
@@ -1203,6 +1208,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     unfuse_fma (Optional[bool]): For SM100: use unfused __fmul_rn + __fadd_rn instead of ffma2 in softmax. Default is False.
                     cu_seq_len_q (Optional[cudnn_tensor]): Cumulative sequence length of the query, shape (b+1, 1, 1, 1) or 1-D (b+1,) (promoted automatically), int32 or int64. Mutually exclusive with seq_len_q; pair with a KV-side tensor (seq_len_kv or cu_seq_len_kv) and set use_padding_mask=True. Requires cuDNN 9.24+ and UNIFIED (9.25+ if the two sides use different forms).
                     cu_seq_len_kv (Optional[cudnn_tensor]): Cumulative sequence length of the key, shape (b+1, 1, 1, 1) or 1-D (b+1,) (promoted automatically), int32 or int64. Mutually exclusive with seq_len_kv; pair with a Q-side tensor (seq_len_q or cu_seq_len_q) and set use_padding_mask=True. Requires cuDNN 9.24+ and UNIFIED (9.25+ if the two sides use different forms).
+                    stats_use_log2 (Optional[bool]): If true, the returned stats are in base 2 (max + log2(sum_exp)) instead of cuDNN's default natural-log convention (max + ln(sum_exp)). Matches flash-attention-style kernels that fold log2(e) into the softmax scale. Only affects stats; score_max and score_sum_exp are unchanged. Requires a FROST engine or the UNIFIED implementation on cuDNN 9.28.0+; COMPOSITE declines. Default is False.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
                     diagonal_band_left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.

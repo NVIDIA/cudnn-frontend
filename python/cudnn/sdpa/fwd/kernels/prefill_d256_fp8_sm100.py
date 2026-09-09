@@ -2423,6 +2423,10 @@ def _correction_warp_group(
             inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
             beta = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
 
+        # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
+        if cutlass.const_expr(CFG.STATS_LOG2):
+            lse_val = lse_val * cutlass.Float32(1.4426950408889634)
+
         if cutlass.const_expr(CFG.THD_VARLEN):
             cu = cutlass.make_array_view(seq_kv_lens_tensor)
             cu_q_b = cutlass.Int32(cu[n_batch + batch_idx])

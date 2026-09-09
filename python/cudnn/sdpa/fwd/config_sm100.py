@@ -78,6 +78,9 @@ class TemplateParams:
     window_right: Optional[int] = None
     bottom_right: bool = False
     has_sink: bool = False
+    # Stats written as max + log2(sum_exp) (sdpa(stats_use_log2=True)): the
+    # epilogue scales the natural-log LSE by log2(e) right before the store.
+    stats_log2: bool = False
     seq_kv_lens_present: bool = False
     # Dense padded-Q trim: per-batch seq_len_q is a SEPARATE (B,)-int32
     # kernel parameter (seq_q_lens_tensor — mirrors cuDNN's distinct SEQLEN_Q
@@ -362,6 +365,7 @@ class CfgD256:
     WINDOW_LEFT: int = 0  # band left offset W (valid when MASK_SWA is set)
     WINDOW_RIGHT: int = 0  # band right offset R (valid when MASK_CAUSAL is set; 0 = plain causal)
     HAS_SINK: int = 0
+    STATS_LOG2: int = 0  # LSE stored in base 2 (stats_use_log2)
     BOTTOM_RIGHT: int = 0  # band diagonal anchored bottom-right
 
     L2_SIZE_MIB: int = 60
@@ -582,6 +586,7 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
         BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
         L2_SIZE_MIB=params.lpt_l2_size_mib or 60,
@@ -659,6 +664,7 @@ class CfgD512:
     WINDOW_LEFT: int = 0  # band left offset W (valid when MASK_SWA is set)
     WINDOW_RIGHT: int = 0  # band right offset R (valid when MASK_CAUSAL is set; 0 = plain causal)
     HAS_SINK: int = 0
+    STATS_LOG2: int = 0  # LSE stored in base 2 (stats_use_log2)
     BOTTOM_RIGHT: int = 0  # band diagonal anchored bottom-right
 
     L2_SIZE_MIB: int = 60
@@ -780,6 +786,7 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
         BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
@@ -850,6 +857,7 @@ class CfgD128:
     WINDOW_LEFT: int = 0  # band left offset W (valid when MASK_SWA is set)
     WINDOW_RIGHT: int = 0  # band right offset R (valid when MASK_CAUSAL is set; 0 = plain causal)
     HAS_SINK: int = 0
+    STATS_LOG2: int = 0  # LSE stored in base 2 (stats_use_log2)
     BOTTOM_RIGHT: int = 0  # band diagonal anchored bottom-right
 
     L2_SIZE_MIB: int = 60
@@ -1003,6 +1011,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
         BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
@@ -1218,6 +1227,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
         BOTTOM_RIGHT=int(params.bottom_right),
         L2_SIZE_MIB=params.lpt_l2_size_mib or 60,
         SCHEDULER_POLICY=params.sched_policy,

@@ -1996,8 +1996,9 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         std::function<Tensor_t(std::shared_ptr<Graph>, std::shared_ptr<Tensor_attributes>)>;
 
     std::optional<bool> generate_stats;
-    bool alibi_mask   = false;
-    bool padding_mask = false;
+    bool stats_use_log2 = false;
+    bool alibi_mask     = false;
+    bool padding_mask   = false;
     std::optional<int64_t> left_bound;
     std::optional<int64_t> right_bound;
     DiagonalAlignment_t diagonal_alignment = DiagonalAlignment_t::TOP_LEFT;
@@ -2088,6 +2089,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
                                    inputs,
                                    outputs,
                                    generate_stats,
+                                   stats_use_log2,
                                    alibi_mask,
                                    padding_mask,
                                    dropout_probability,
@@ -2104,6 +2106,16 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_generate_stats(bool const value) {
         generate_stats = value;
+        return *this;
+    }
+
+    /// Convert the "Stats" (LSE) output from cuDNN's natural-log convention to base-2
+    /// (max + log2(sum_exp)), matching flash-attention-style kernels (fa2/fa3/trtllm-gen)
+    /// that fold log2(e) into their softmax scale. Only affects Stats; Max and Sum_exp (if
+    /// requested instead) remain in their natural units.
+    SDPA_attributes&
+    set_stats_use_log2(bool const value) {
+        stats_use_log2 = value;
         return *this;
     }
 

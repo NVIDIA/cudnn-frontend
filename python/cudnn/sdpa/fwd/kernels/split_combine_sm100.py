@@ -47,6 +47,7 @@ def _combine_kernel(
     n_batch: cutlass.Int32,
     n_splits: cutlass.Int32,
     d_v: cutlass.Int32,
+    stats_log2: cutlass.Constexpr[bool],  # write the FINAL LSE in base 2 (stats_use_log2)
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     q_row = cute.arch.block_idx()[0]
@@ -125,6 +126,10 @@ def _combine_kernel(
             lo = cutlass.make_array_view(lse_out)
             lse_val = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
             lse_val = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(NEG_INF).ir_value(), lse_val.ir_value()))
+            # Base-2 Stats (stats_use_log2): the partials stay natural (the merge
+            # above needs them); only the final value converts. -inf stays -inf.
+            if cutlass.const_expr(stats_log2):
+                lse_val = lse_val * cutlass.Float32(1.4426950408889634)
             lo[batch, head, q_row] = lse_val
 
 
@@ -140,6 +145,7 @@ def _host(
     amax_o: Optional[cute.Tensor],
     problem_size: Tuple[int, int, int, int],
     n_splits: cutlass.Int32,
+    stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, H, SQ, D = problem_size
@@ -152,6 +158,7 @@ def _host(
         cutlass.Int32(B),
         n_splits,
         cutlass.Int32(D),
+        stats_log2,
     ).launch(
         grid=(SQ, H, B),
         block=[THREADS, 1, 1],
@@ -170,6 +177,7 @@ def compile(  # noqa: A001
     has_lse: bool = False,
     lse_stride: Optional[tuple[int, int, int]] = None,
     has_amax: bool = False,
+    stats_log2: bool = False,
 ) -> Callable:
     """Compile the combine pass for one concrete (B, H, S_q, d_v, splits) shape.
 
@@ -180,7 +188,8 @@ def compile(  # noqa: A001
     store is None-specialized out of the traced code.  ``has_amax`` does the
     same for the FP8-family amax of the recombined O.  ``lse_stride`` describes
     the caller-visible LSE output; the per-split LSE input workspace remains
-    compact regardless of that final layout.
+    compact regardless of that final layout.  ``stats_log2`` writes the FINAL
+    LSE in base 2 (``stats_use_log2``); the per-split partials stay natural.
     """
     elem = {"f16": cutlass.Float16, "bf16": cutlass.BFloat16}[dtype_o]
 
@@ -207,6 +216,7 @@ def compile(  # noqa: A001
         fake_amax_o,
         (b, h, sq, d_v),
         cutlass.Int32(0),
+        bool(stats_log2),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )

@@ -89,6 +89,8 @@ class TemplateParams:
     has_seq_kv_lens: bool = False
     has_seq_q_lens: bool = False
     has_sink: bool = False
+    # Stats written as max + log2(sum_exp) (sdpa(stats_use_log2=True)).
+    stats_log2: bool = False
     has_bias: bool = False
     bias_is_fp32: bool = False
     has_rope: bool = False

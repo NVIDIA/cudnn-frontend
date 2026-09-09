@@ -2819,6 +2819,24 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
 #endif
         }
 
+        // Base-2 stats (max + log2(sum_exp)) are an epilogue property of the fused kernel.
+        auto stats_log2_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
+        if (attributes.stats_use_log2 && stats_log2_it != attributes.outputs.end() && stats_log2_it->second) {
+            auto stats_log2_cudnn_ver_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "stats_use_log2 in unified SDPA node requires cuDNN 9.28.0"};
+#if CUDNN_VERSION >= 92800
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92800, stats_log2_cudnn_ver_error);
+            bool stats_log2_value = true;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_STATS_LOG2,
+                                                           CUDNN_TYPE_BOOLEAN,
+                                                           1,
+                                                           &stats_log2_value));
+#else
+            return stats_log2_cudnn_ver_error;
+#endif
+        }
+
         // Dropout attributes
         if (attributes.dropout_probability.has_value() && attributes.dropout_probability.value() != 0.0f) {
             auto dropout_cudnn_ver_error =
