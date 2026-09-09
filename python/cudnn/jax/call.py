@@ -3,6 +3,10 @@
 
 """cudnn.jax.call: cutlass.jax.cutlass_call with cuDNN conveniences."""
 
+from functools import lru_cache
+
+import cutlass.cute as cute
+
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import jax
@@ -13,7 +17,8 @@ from cutlass.jax import TensorSpec, cutlass_call
 
 if not cutlass.jax.is_available():  # pragma: no cover - guarded import surface
     raise ImportError(
-        "cudnn.jax requires the CuTeDSL JAX extensions (cutlass.jax), which need jax >= 0.5; " "install/upgrade jax (`pip install --group jax` from a checkout)"
+        "cudnn.jax requires the CuTeDSL JAX extensions (cutlass.jax), which need jax >= 0.5; "
+        "install/upgrade jax (`pip install --group jax` from a checkout)"
     )
 
 
@@ -74,6 +79,24 @@ def sf_atom_spec() -> TensorSpec:
     return TensorSpec(mode=(3, 4, 1, 5, 2, 0))
 
 
+@lru_cache(maxsize=128)
+def initialized_output_adapter(fn, num_inputs, num_outputs, initialized_indices, aliased_indices):
+    remaining = tuple(i for i in range(num_outputs) if i not in initialized_indices and i not in aliased_indices)
+    positions = tuple(
+        num_inputs + initialized_indices.index(i) if i in initialized_indices else num_inputs + len(initialized_indices) + remaining.index(i)
+        for i in range(num_outputs)
+        if i not in aliased_indices
+    )
+
+    @cute.jit
+    def adapter(stream, *args, **kwargs):
+        inputs = args[:num_inputs]
+        outputs = tuple(args[i] for i in positions)
+        fn(stream, *inputs, *outputs, **kwargs)
+
+    return adapter
+
+
 def call(
     fn: Callable[..., None],
     *,
@@ -95,8 +118,9 @@ def call(
         *accumulates into* rather than fully writes (atomic max/add). For each entry,
         ``init_fn(ShapeDtypeStruct) -> jax.Array`` produces the pre-initialized buffer
         (e.g. :func:`zeros_init`), which is appended as a trailing input and donated to
-        that output via ``input_output_aliases`` — the bridge drops aliased inputs from
-        the kernel's argument list, so ``fn``'s signature stays exactly the kernel's.
+        that output via ``input_output_aliases``. An adapter restores output order
+        because the bridge retains aliased inputs and omits aliased outputs.
+        Initializers require flat positional inputs and a flat output sequence.
     """
     output_leaves = jax.tree.leaves(
         output_shape_dtype,
@@ -105,7 +129,17 @@ def call(
     initialized_outputs = dict(initialized_outputs or {})
     input_output_aliases = dict(input_output_aliases or {})
 
+    if initialized_outputs:
+        if not isinstance(output_shape_dtype, (tuple, list)) or len(output_shape_dtype) != len(output_leaves):
+            raise ValueError("initialized_outputs requires a flat output sequence")
+        if any(i < 0 or i >= len(output_leaves) for i in initialized_outputs):
+            raise ValueError("initialized output index out of range")
+        if set(initialized_outputs).intersection(input_output_aliases.values()):
+            raise ValueError("an initialized output cannot also alias an explicit input")
+
     def wrapper(*arrays: Any) -> Any:
+        if initialized_outputs and any(not hasattr(a, "shape") for a in arrays):
+            raise ValueError("initialized_outputs requires flat array inputs")
         inits = []
         aliases = dict(input_output_aliases)
         extra_specs = []
@@ -115,19 +149,37 @@ def call(
             extra_specs.append(output_spec[out_index] if output_spec is not None else None)
 
         full_input_spec = input_spec
-        if inits and input_spec is not None:
-            full_input_spec = tuple(input_spec) + tuple(extra_specs)
+        if inits:
+            full_input_spec = (tuple(input_spec) if input_spec is not None else (None,) * len(arrays)) + tuple(extra_specs)
 
-        return cutlass_call(
-            fn,
-            output_shape_dtype=output_shape_dtype,
+        adapter = fn
+        if inits:
+            adapter = initialized_output_adapter(
+                fn, len(arrays), len(output_leaves), tuple(sorted(initialized_outputs)), tuple(sorted(input_output_aliases.values()))
+            )
+        shapes, specs = output_shape_dtype, output_spec
+        order = tuple(range(len(output_leaves)))
+        if inits:
+            # The runtime ABI appends result buffers; aliased results must trail
+            # the non-aliased results consumed by the compiled adapter.
+            order = tuple(i for i in order if i not in aliases.values()) + tuple(sorted(aliases.values()))
+            shapes = tuple(output_leaves[i] for i in order)
+            specs = tuple(output_spec[i] for i in order) if output_spec is not None else None
+            aliases = {i: order.index(o) for i, o in aliases.items()}
+        result = cutlass_call(
+            adapter,
+            output_shape_dtype=shapes,
             input_spec=full_input_spec,
-            output_spec=output_spec,
+            output_spec=specs,
             input_output_aliases=aliases,
             allow_cuda_graph=allow_cuda_graph,
             compile_options=compile_options,
             use_static_tensors=use_static_tensors,
             **kwargs,
         )(*arrays, *inits)
+        if inits:
+            restored = [result[order.index(i)] for i in range(len(output_leaves))]
+            return tuple(restored) if isinstance(output_shape_dtype, tuple) else restored
+        return result
 
     return wrapper

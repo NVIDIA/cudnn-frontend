@@ -11,12 +11,9 @@ from dataclasses import dataclass, fields
 from functools import partial
 from typing import Tuple, get_origin
 
-import torch
-
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import nvvm
-from cutlass.base_dsl.tvm_ffi_builder import spec
 from cutlass.cutlass_dsl import NumericMeta
 from cutlass.cute.runtime import from_dlpack
 
@@ -34,6 +31,7 @@ def _install_constexpr_tvm_ffi_converter() -> None:
     its concrete field annotations when a broader tuple type is used at the
     call site.
     """
+    from cutlass.base_dsl.tvm_ffi_builder import spec
     import cutlass.cute._tvm_ffi_args_spec_converter as converter
 
     original = converter._convert_single_arg
@@ -65,17 +63,6 @@ def _install_constexpr_tvm_ffi_converter() -> None:
 
     convert_single_arg._cudnn_bsa_constexpr_compat = True
     converter._convert_single_arg = convert_single_arg
-
-
-_install_constexpr_tvm_ffi_converter()
-
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    torch.float8_e5m2: cutlass.Float8E5M2,
-}
 
 
 def _partition_param_fields(obj):
@@ -157,6 +144,10 @@ def assume_tensor_aligned(t):
 
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
+    import torch
+
+    _install_constexpr_tvm_ffi_converter()
+
     # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
     # currently export raw bytes as uint8 and tell cutlass correct type
     # can directly export as fp8 when torch supports it
@@ -176,7 +167,7 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
 
-def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
+def get_broadcast_dims(tensor: "torch.Tensor") -> Tuple[bool, ...]:
     """Return tuple of bools indicating which dims have stride=0 (broadcast).
 
     This is useful for compile keys since CuTe's mark_layout_dynamic() keeps
