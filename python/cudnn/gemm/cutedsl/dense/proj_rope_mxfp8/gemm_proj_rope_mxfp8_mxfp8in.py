@@ -530,8 +530,8 @@ def gemm_proj_rope_mxfp8_kernel(
                             s0 = ts[0].to(cutlass.Float32)
                             c1 = tc[1].to(cutlass.Float32)
                             s1 = ts[1].to(cutlass.Float32)
-                            qc0, qc1 = cute.arch.mul_packed_f32x2((q0, q1), (c0, c1))
-                            v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (s0, s1), (qc0, qc1))
+                            ps0, ps1 = cute.arch.mul_packed_f32x2((p0, p1), (s0, s1))
+                            v0, v1 = cute.arch.fma_packed_f32x2((q0, q1), (c0, c1), (ps0, ps1))
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
@@ -562,8 +562,9 @@ def gemm_proj_rope_mxfp8_kernel(
                             s0 = ts[0].to(cutlass.Float32)
                             c1 = tc[1].to(cutlass.Float32)
                             s1 = ts[1].to(cutlass.Float32)
+                            pc0, pc1 = cute.arch.mul_packed_f32x2((p0, p1), (c0, c1))
                             qs0, qs1 = cute.arch.mul_packed_f32x2((q0, q1), (s0, s1))
-                            v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (c0, c1), (-qs0, -qs1))
+                            v0, v1 = cute.arch.fma_packed_f32x2((qs0, qs1), (cutlass.Float32(-1.0), cutlass.Float32(-1.0)), (pc0, pc1))
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
