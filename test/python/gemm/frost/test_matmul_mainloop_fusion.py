@@ -875,3 +875,74 @@ def test_e2e_mixed_input_int8_fp8_2ctamma() -> None:
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# Two-kernel split-K on the mainloop template
+# ---------------------------------------------------------------------------
+
+
+def _splitk_plan(g, S):
+    from dataclasses import replace
+
+    return jit_from_cudnn_graph(g, replace(_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")["config"], split_k_slices=S))
+
+
+def _run_splitk(compiled, variant_pack):
+    from cudnn.frost.workspace import Workspace
+
+    buf = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    compiled(variant_pack, workspace=Workspace(buf, compiled.workspace_bytes, "test_splitk_mainloop"))
+    torch.cuda.synchronize()
+
+
+@requires_sm100
+def test_splitk_cos_both_koob() -> None:
+    """cos(A) @ cos(B) split over K with a partial last K tile: the mainloop
+    warps transform only their slice's K tiles, and the OOB zeroing lands in
+    the slice that owns the tail."""
+    M, N, K, S = 240, 272, 4200, 8
+    compiled = _splitk_plan(_mainloop_graph_ab("cos", "cos", M, N, K), S)
+    assert compiled.chain.has_mainloop_fusion and compiled.config.split_k_slices == S
+    torch.manual_seed(0)
+    a = (torch.rand(1, M, K, device="cuda") * 6 - 3).to(torch.bfloat16)
+    b = (torch.rand(1, N, K, device="cuda") * 6 - 3).to(torch.bfloat16)
+    c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    _run_splitk(compiled, _vp(compiled, a, b, c))
+    ref = torch.einsum("bmk,bnk->bmn", torch.cos(a.float()), torch.cos(b.float())).to(torch.bfloat16)
+    torch.testing.assert_close(c, ref, atol=6e-1, rtol=2e-2)
+
+
+@requires_sm100
+def test_splitk_mixed_input_int8_bf16() -> None:
+    """The mixed-input LOAD buffer is per stage, so it follows the slice's K range."""
+    M, N, K = 512, 512, 4096
+    g, A, B, C = _mixed_input_graph(True, True, M, N, K)
+    compiled = _splitk_plan(g, 4)
+    assert compiled.chain.mainloop_a_cast and compiled.chain.mainloop_b_cast
+    torch.manual_seed(0)
+    a = torch.empty(1, M, K, dtype=torch.int32).random_(-4, 4).to(torch.int8).cuda()
+    b = torch.empty(1, N, K, dtype=torch.int32).random_(-4, 4).to(torch.int8).cuda()
+    c = torch.empty(1, M, N, dtype=torch.bfloat16).cuda()
+    _run_splitk(compiled, {A: a, B: b, C: c})
+    ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
+    assert torch.equal(c, ref)
+
+
+@requires_sm100
+def test_splitk_scalar_aux_mainloop() -> None:
+    """A scalar mainloop aux is applied by kernel 1; the reducer never sees it."""
+    M, N, K, av, bv = 256, 256, 4096, 2.0, 0.5
+    compiled = _splitk_plan(_scaled_graph(True, True, M, N, K), 4)
+    assert compiled.chain.aux_tensors
+    torch.manual_seed(0)
+    a = torch.empty(1, M, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch.bfloat16, device="cuda")
+    b = torch.empty(1, N, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch.bfloat16, device="cuda")
+    c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    auxmap = {
+        "alpha": torch.full((1, 1, 1), av, dtype=torch.bfloat16, device="cuda"),
+        "beta": torch.full((1, 1, 1), bv, dtype=torch.bfloat16, device="cuda"),
+    }
+    _run_splitk(compiled, _vp(compiled, a, b, c, *[auxmap[t.name] for t in compiled.chain.aux_tensors]))
+    ref = torch.einsum("bmk,bnk->bmn", a.float() * av, b.float() * bv).to(torch.bfloat16)
+    assert torch.equal(c, ref)

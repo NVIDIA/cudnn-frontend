@@ -122,8 +122,20 @@ def _auto_swizzle_w(m, n, k, nt_n):
 # @@SPLITK_ONLY:BEGIN@@
 from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import (
     SPLITK_REDUCE_THREADS,
+    SPLITK_REDUCE_TILE_M,
     _splitk_reduce_kernel,
+    splitk_reduce_tile_n,
 )
+
+
+@cute.jit
+def _splitk_epilogue(vec_f32, row, col_j, tile_l, M, N, vsize, taps, strides, aux):
+    """epilogue function for split-K reduction"""
+    # @@INJECT_SPLITK_EPILOGUE_BINDINGS@@
+    # @@INJECT_REDUCE_AUX_VIEWS@@
+
+    # @@INJECT_REDUCE_EPILOGUE@@
+
 
 # @@SPLITK_ONLY:END@@
 
@@ -461,6 +473,8 @@ def _kernel(
 
     if warp_idx == scheduler_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(USE_PDL):
+            nvvm.griddepcontrol("wait")
         sched_iter = cutlass.Int32(0)
         clc_empty_phase = cutlass.Int32(1)
         clc_full_phase = cutlass.Int32(0)
@@ -499,11 +513,6 @@ def _kernel(
                 nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
 
             sched_iter += 1
-
-        if cutlass.const_expr(USE_PDL and split_k_slices > 1):
-            # Fire launch_dependents when the CLC scheduler runs dry, one tile
-            # earlier than the MMA-warp signal
-            nvvm.griddepcontrol("launch_dependents")
 
         if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
             if is_cluster_leader_cta:
@@ -973,7 +982,9 @@ def _kernel(
                     nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
                 tile_iter += 1
 
-            if cutlass.const_expr(USE_PDL):
+            # Dense only: an early-launched reducer would pile its many small CTAs
+            # onto the few idle SMs, so split-K leaves the trigger to grid exit.
+            if cutlass.const_expr(USE_PDL and split_k_slices == 1):
                 nvvm.griddepcontrol("launch_dependents")
 
             tail_stage = acc_stage
@@ -1025,7 +1036,8 @@ def _kernel(
                         empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
                         nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
                     tile_iter += 1
-                if cutlass.const_expr(USE_PDL):
+                # Dense only, same reason as above.
+                if cutlass.const_expr(USE_PDL and split_k_slices == 1):
                     nvvm.griddepcontrol("launch_dependents")
                 nvvm.tcgen05_relinquish_alloc_permit(group=_CTA_GROUP)
                 peer_mbar = nvvm.mapa(tmem_dealloc_mbar_ptr, peer_cta_rank)
@@ -1385,19 +1397,24 @@ def _host(
         m,
         n,
         batch,
-        out_stride_m_0,
-        out_stride_n_0,
-        out_stride_l_0,
-        # @@INJECT_SPLITK_OUTPUT@@
         splitk_partials,
+        (
+            # @@INJECT_HOST_TAP_PASS@@
+        ),
+        (
+            # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
+        ),
+        (
+            # @@INJECT_HOST_AUX_PASS@@
+        ),
+        _splitk_epilogue,
         split_k_slices,
         splitk_reduce_elems,
-        cd_dtype,
         USE_PDL,
     ).launch(
         grid=(
-            m,
-            (n + SPLITK_REDUCE_THREADS * splitk_reduce_elems - 1) // (SPLITK_REDUCE_THREADS * splitk_reduce_elems),
+            (m + SPLITK_REDUCE_TILE_M - 1) // SPLITK_REDUCE_TILE_M,
+            (n + splitk_reduce_tile_n(split_k_slices, splitk_reduce_elems) - 1) // splitk_reduce_tile_n(split_k_slices, splitk_reduce_elems),
             batch,
         ),
         block=(SPLITK_REDUCE_THREADS, 1, 1),
