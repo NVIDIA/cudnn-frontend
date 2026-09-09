@@ -27,7 +27,10 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _E4M3, _BF16_OUT = 0, 2
-_FLAVORS = [(128, 128), (256, 256), (512, 512)]
+# (192, 128) is in the sweep for all three dtype families as of 2026-09-09 --
+# it is the flavor whose wider K moves SMEM offsets, so it is exactly the one
+# a DESC_VERSION check must cover, not skip.
+_FLAVORS = [(128, 128), (192, 128), (256, 256), (512, 512)]
 
 
 def _load(flavor, rubin, *, fp8=False, pertensor=False, **params):
@@ -129,9 +132,13 @@ def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
     PARTIALLY INVERTED 2026-09-04: d192xd128 now HAS a Rubin sibling
     (``sm107/prefill_d192_d128_f16.py`` -- the same body as d128 with
     ``make_cfg_d192``), so a d=192 f16 graph lowers onto the NATIVE kernel
-    instead of riding the d256 envelope.  The pool-narrowing invariant is
-    unchanged and is what this test really pins; the FP8/MXFP8 lines still have
-    no d192 sibling, which is why the narrowing cannot be deleted.
+    instead of riding the d256 envelope.
+
+    FULLY INVERTED 2026-09-09: the quantized lines gained their d192 siblings
+    too, so every Rubin pool now covers all four flavors.  The pool-NARROWING
+    invariant is what this test really pins and it is unchanged -- it is what
+    keeps a graph off a flavor with no Rubin module, and it must survive every
+    future arch line that ships a partial flavor set.
     """
     from cudnn.sdpa.fwd.api_dsl import (
         _SM100_FLAVORS,
@@ -144,11 +151,17 @@ def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
     assert _pick_flavor(192, 128, rubin_pool) == (192, 128)
     # Blackwell keeps its native d192xd128 kernel.
     assert _pick_flavor(192, 128, None) == (192, 128)
-    # The quantized Rubin lines have NO d192 sibling -- a d=192 FP8 graph must
-    # still ride the next covering envelope rather than KeyError.
+    # INVERTED: the quantized Rubin lines gained their d192 siblings, so a
+    # d=192 FP8 graph lands on the NATIVE kernel instead of an envelope.
     rubin_fp8_pool = tuple(f for f in _SM100_FLAVORS if f in _SM107_FP8_KERNEL_FILES)
-    assert (192, 128) not in rubin_fp8_pool
-    assert _pick_flavor(192, 128, rubin_fp8_pool) == (256, 256)
+    assert (192, 128) in rubin_fp8_pool
+    assert _pick_flavor(192, 128, rubin_fp8_pool) == (192, 128)
+    # The narrowing itself still has teeth: every Rubin pool is a SUBSET of the
+    # Blackwell flavor list, and _pick_flavor is only ever handed the pool whose
+    # kernel files exist.  A pool built from a map that lacks a flavor must not
+    # offer it -- this is the guard that survives the next partial arch line.
+    assert set(rubin_pool) <= set(_SM100_FLAVORS) and set(rubin_fp8_pool) <= set(_SM100_FLAVORS)
+    assert _pick_flavor(192, 128, tuple(f for f in rubin_fp8_pool if f != (192, 128))) != (192, 128)
     # Every flavor Rubin can pick has a module ON DISK -- the map is the only
     # thing standing between _pick_flavor and a KeyError/ImportError deep in
     # module loading, so check the file, not the map key it came from.
@@ -358,18 +371,103 @@ def test_sm107_rows_claim_optional_stats():
 def test_rubin_mxfp8_forward_row_exists():
     """INVERTED 2026-09-04: the Rubin MXFP8 row landed (slot 16).  It is WIDER
     than its Blackwell counterpart at the top end -- Rubin has a d512 MXFP8
-    kernel and SM100 does not -- and narrower at d192xd128, which has no Rubin
-    MXFP8 sibling.  SM100's row stays capped at cc 10.6."""
+    kernel and SM100 does not.  INVERTED again 2026-09-09: d192xd128 gained a
+    Rubin MXFP8 sibling, at cga2 ONLY -- at cga1 that flavor's scale-factor
+    tiles start past the 256 KiB version-0 tcgen05 descriptor window.  SM100's
+    row stays capped at cc 10.6."""
     from cudnn.sdpa.fwd import engines
 
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
     assert caps.is_mxfp8 is True
-    assert caps.d_shapes == frozenset({(128, 128), (256, 256), (512, 512)})
+    assert caps.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert (512, 512) not in _caps("sdpa_fwd_prefill_sm100_mxfp8").d_shapes
-    assert (192, 128) not in caps.d_shapes
+    assert (192, 128) in caps.d_shapes
+    # (192, 128) takes NO cgas_by_d_shape entry, so it inherits the row default
+    # cgas={2}.  That is a DESCRIPTOR constraint, not a tuning choice: at cga1
+    # the four SF tiles land at 256-278 KiB, past the version-0 tcgen05
+    # descriptor window, and the UTCCP would read Q data as scale factors
+    # (LSE=+inf, O=NaN on every cell).  SM100 serves the same shape at {1, 2}.
+    assert caps.cgas == frozenset({2})
+    assert all(shape != (192, 128) for shape, _ in caps.cgas_by_d_shape)
+    assert _caps("sdpa_fwd_prefill_sm100_mxfp8").cgas_by_d_shape != caps.cgas_by_d_shape
     # Exact-native only: the SF tensors are not zero-padded.
     assert caps.d_pad_multiple == 0
     # The machinery the ported kernels lack stays declined.
     assert caps.thd is False and caps.split_kv_supported is False
     assert caps.pack_gqas == frozenset({False})
     assert _caps("sdpa_fwd_prefill_sm100_mxfp8").sm_hi == 106
+
+
+def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
+    """ACCEPT side of the 2026-09-09 d192 addition, one case PER DTYPE MEMBER of
+    each row's frozenset -- a row listing two dtypes is making two claims, and a
+    suite that exercises only E4M3 leaves the other as an untested assertion
+    (contract rule 12).
+
+    The shape must land on the NATIVE (192, 128) kernel, not an envelope: the
+    d256 flavor's floor (255) would otherwise swallow it onto a padded path
+    nobody validated."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+
+    for row, is_mx in (("sdpa_fwd_prefill_sm107_fp8", False), ("sdpa_fwd_prefill_sm107_mxfp8", True)):
+        caps = _caps(row)
+        assert (192, 128) in caps.d_shapes, row
+        for dt in sorted(caps.dtypes, key=lambda d: int(d)):
+            facts = _quant_facts(d_qk=192, d_v=128, dtype=dt, is_mx=is_mx)
+            assert engines.mismatch(caps, facts) is None, (row, dt)
+            assert engines._selected_d_shape(caps, facts) == (192, 128), (row, dt)
+
+
+def test_sm107_d192_mxfp8_is_cga2_only_because_of_the_descriptor_window():
+    """REJECT side, and the reason is a DESCRIPTOR constraint rather than taste.
+
+    At cga1 the K/V rings are not halved, so this flavor's four scale-factor
+    tiles start at 256-278 KiB -- past the 256 KiB version-0 tcgen05 descriptor
+    window, where ``start_address`` wraps to 0 and the UTCCP copies Q DATA bytes
+    into the SF TMEM columns (LSE=+inf, O=NaN on 100% of cells, at every shape).
+
+    Two independent guards, and this test pins BOTH: the row keeps (192, 128) on
+    the default ``cgas={2}`` so a graph cannot request cga1, and the kernel body
+    raises at import if it is ever handed one anyway.  INVERTS-WHEN DESC_VERSION
+    is derived from the layout and the version-1 SF path is validated on Rubin
+    -- which is not free: desc_version=1 on the d128/d256 MXFP8 tiles turned 21
+    green tests red (2026-09-08)."""
+    import pytest as _pytest
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
+    facts = _quant_facts(d_qk=192, d_v=128, is_mx=True)
+    # Guard 1 -- knob domain. cga2 is honored, cga1 makes the plan ineligible.
+    assert engines.mismatch(caps, facts, SdpaFwdKnobs(cga=2)) is None
+    assert engines.mismatch(caps, facts, SdpaFwdKnobs(cga=1)) is not None
+    # SM100 serves the same shape at BOTH widths -- so this is Rubin-specific,
+    # which is what makes it worth pinning rather than assuming.
+    assert 1 in engines.effective_cgas(_caps("sdpa_fwd_prefill_sm100_mxfp8"), facts, 1)
+
+    # Guard 2 -- the kernel body itself, so the constraint survives a row edit.
+    with _pytest.raises(ValueError, match="CTA_MMA must be 2"):
+        _load((192, 128), rubin=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
+
+
+def _quant_facts(**kw):
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+
+    is_mx = kw.pop("is_mx", False)
+    base = dict(
+        b=2,
+        h_q=4,
+        h_kv=4,
+        s_q=384,
+        s_kv=384,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        device_cc=(10, 7),
+    )
+    base.update(kw)
+    base["is_mxfp8" if is_mx else "is_fp8"] = True
+    return ga.SdpaGraphFacts(**base)

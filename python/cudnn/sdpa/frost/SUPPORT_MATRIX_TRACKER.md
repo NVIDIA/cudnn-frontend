@@ -222,43 +222,54 @@ flavor's P transfer ring at exactly 256 KiB, where a version-0 descriptor wraps
 to offset 0 and the MMA multiplies the untouched O staging slab (O comes out
 exactly zero, no crash).
 
-The f16/bf16 line carries all four SM100 flavors, d192×d128 included
-(`sm107/prefill_d192_d128_f16.py` — the d128 body with `make_cfg_d192`), so a
-d=192 f16 graph lands on its NATIVE kernel. The **quantized** lines are the
-strict subset: neither has a d192×d128 sibling, and (as on SM100) the
-`(256, 256)` envelope floor keeps an inexact graph off the d256 flavor's
-unvalidated padded path, so a d=192 FP8/MXFP8 graph is **declined** rather than
-zero-padded.
+All three lines now carry d192×d128 (`sm107/prefill_d192_d128_{f16,fp8,mxfp8}.py`
+— the d128 body with `make_cfg_d192` / `make_cfg_d192_mxfp8`), so a d=192 graph
+lands on its NATIVE kernel in every dtype family. The FP8 row carries that
+flavor's envelope **floor** (128) with it: the floors are arch-independent
+(`fwd/api_dsl._SM100_FP8_ENVELOPE_FLOORS`), so d_qk zero-padded into d192 stays
+declined here exactly as on SM100 — that is a kernel property, not an arch one.
 
-| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | BPROP<br>no engine |
-|---|:--:|:--:|:--:|:--:|:--:|
-| **Data types** | | | | | |
-| FP16 / BF16 | ⚠️ⁱ | ✅ | ✅ | ✅ | ❌ |
-| FP8 E4M3 / E5M2 (per-tensor) | ⚠️ⁱ | ✅ | ✅ | ✅ | ❌ |
-| MXFP8 | ❌ | ✅ | ✅ | ⚠️ⁱᵛ | ❌ |
-| O dtype ≠ QKV — **quantized graphs only** (fp16/bf16/fp8 out) | ✅ | ✅ | ✅ | ✅ | — |
-| Head-dim envelope | none — runs the d128 kernelⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 ×16 (floor 255) | f16 ×8 · fp8 ×16 (floor 256) | — |
-| **Layout** | | | | | |
-| BSHD | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ |
-| THD / ragged (packed varlen) | ❌ⁱⁱ | fp8 onlyᵛ | ❌ᵛ | ❌ᵛ | ❌ |
-| `cu_seq_len_q/kv` prefix sums (THD only) | ❌ⁱⁱ | fp8 only | ❌ | ❌ | ❌ |
-| **Masks / features** | | | | | |
-| Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Padding mask + stats (per-batch LSE trim) | ✅ | fp8 onlyᵛⁱ | ❌ᵛⁱ | ❌ᵛⁱ | ❌ |
-| Dense padded-Q trim (O:=0, LSE:=−inf) | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Attention sink | ✅ | ✅ | ✅ | ✅ | ❌ |
-| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ❌ |
-| PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ |
-| Split-KV | fp8 only | fp8 only | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ |
-| Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Bias | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ❌ |
-| FP16 softmax accumulate (`softmax_precision=HALF`) | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | ❌ | ❌ | — |
+The MXFP8 d192 flavor is **cga2 only** where SM100 serves it at both widths, and
+that is a descriptor constraint rather than a tuning choice. At cga1 the K/V
+rings are not halved, so its four scale-factor tiles start at 256–278 KiB —
+past the 256 KiB version-0 tcgen05 descriptor window, where `start_address`
+wraps to 0 and the UTCCP copies Q *data* bytes into the SF TMEM columns
+(`LSE = +inf`, `O = NaN` on 100 % of cells, at every shape). The row expresses
+this by leaving `(192, 128)` on its default `cgas={2}`, and the kernel body
+raises at import if handed cga1 anyway. Lifting it needs `DESC_VERSION` derived
+from the layout **and** the version-1 SF path validated on Rubin — not free:
+putting the d128/d256 MXFP8 tiles on descriptor version 1 turned 21 green tests
+red (2026-09-08).
+
+| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | BPROP<br>no engine |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|
+| **Data types** | | |  | | | |
+| FP16 / BF16 | ⚠️ⁱ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| FP8 E4M3 / E5M2 (per-tensor) | ⚠️ⁱ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| MXFP8 | ❌ | ✅ | ✅ˣ | ✅ | ⚠️ⁱᵛ | ❌ |
+| O dtype ≠ QKV — **quantized graphs only** (fp16/bf16/fp8 out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| Head-dim envelope | none — runs the d128 kernelⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 exact only (floor 128) | f16 ×8 · fp8 ×16 (floor 255) | f16 ×8 · fp8 ×16 (floor 256) | — |
+| **Layout** | | |  | | | |
+| BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| THD / ragged (packed varlen) | ❌ⁱⁱ | fp8 onlyᵛ | ❌ᵛ | ❌ᵛ | ❌ᵛ | ❌ |
+| `cu_seq_len_q/kv` prefix sums (THD only) | ❌ⁱⁱ | fp8 only | ❌ | ❌ | ❌ | ❌ |
+| **Masks / features** | | |  | | | |
+| Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Padding mask + stats (per-batch LSE trim) | ✅ | fp8 onlyᵛⁱ | fp8 onlyᵛⁱ | ❌ᵛⁱ | ❌ᵛⁱ | ❌ |
+| Dense padded-Q trim (O:=0, LSE:=−inf) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ | ❌ |
+| Split-KV | fp8 only | fp8 only | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ |
+| Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ❌ |
+| FP16 softmax accumulate (`softmax_precision=HALF`) | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |
 
 ⁱ No native d=64 Rubin kernel, so a d=64 graph rides the d128 envelope (64 is a
 multiple of 8 at f16 and of 16 at fp8) at ~2× the MMA cost.
@@ -278,6 +289,14 @@ a 7-arg contract against a 14-arg helper, and the metadata layout differs
 ᵛⁱ Needs the per-batch `seq_len_q` LSE trim, which the f16 Rubin kernels do not
 carry (`padded_stats=False`). KV-side padding itself is served.
 ᵛⁱⁱ The f16 Rubin kernels wire no SplitHelpers.
+
+ˣ d192×d128 MXFP8 runs at **cga2 only** (SM100 serves the shape at cga1 and
+cga2). See the paragraph above: at cga1 this flavor's scale-factor tiles cross
+the 256 KiB version-0 tcgen05 descriptor window. Every other cell in that
+column was measured on `w2u1g-lc-0030` (cc 10.7) by
+`test_sdpa_fwd_{fp8,mxfp8}_sm100.py`, whose dense d192 cases stopped skipping on
+Rubin in the same commit — 31 passed, and the 18 that still skip are the
+PackGQA and THD families this line declines per-feature, not per-shape.
 ⁱˣ Served through the padded path with synthesized full-length KV lengths
 (`skv_tail_via_padding`). REQUIRED, not an optimization: with no mask the
 kernel's KV loop bound is a floor division, so an un-synthesized ragged `S_kv`
@@ -394,7 +413,7 @@ feature-free d=64 graph.
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
 | f16/bf16 forward THD, split-KV, PackGQA, dense padded-Q trim | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d192×d128/d256/d512; these four are the machinery its kernels lack (optional stats IS served — `lse_optional=True`) |
-| d192×d128 **quantized** forward | SM107 — no FP8 or MXFP8 sibling at that shape, and the d256 envelope floor declines the inexact ride |
+| d192×d128 quantized THD / PackGQA / split-KV | SM107 — the shape itself is served in FP8 and MXFP8 as of 2026-09-09; these three stay wired in the d128 flavor only (`thd_d_shapes` / `pack_gqa_d_shapes` / `split_d_shapes`) |
 | MXFP8 forward | SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
 | Per-tensor FP8 backward | every arch |
 | MXFP8 backward outside SM100/SM103 d = 256 | every arch |

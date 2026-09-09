@@ -38,10 +38,15 @@ pytestmark = [requires_blackwell, requires_dsl]
 # 100-106, sm107 = the Rubin line): pin the engine that serves the device
 # under test. The d192xd128 kernel flavor exists on the sm100 engine only.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
-_skip_on_rubin = pytest.mark.skipif(_SM == 107, reason="the d192xd128 per-tensor FP8 flavor has no Rubin kernel (sm107 serves d128 only)")
-# Rubin serves per-tensor FP8 at d128/d256/d512 as of the SM107 port, so no
-# flavor gate is needed for the dense cases.  Only d192xd128 lacks a Rubin
-# sibling; that one is gated by _skip_on_rubin above.  (These used to be
+# INVERTED 2026-09-09: the Rubin line gained sm107/prefill_d192_d128_fp8.py, so
+# every DENSE d192xd128 case below now RUNS on Rubin instead of skipping.  What
+# remains declined is per-FEATURE, not per-shape -- the Rubin row wires PackGQA
+# and THD in its d128 flavor only (pack_gqa_d_shapes / thd_d_shapes), so those
+# two families keep a skip that names the capability it is waiting on.
+_skip_on_rubin_d192_packgqa = pytest.mark.skipif(_SM == 107, reason="Rubin wires PackGQA in the d128 FP8 flavor only (pack_gqa_d_shapes={(128,128)})")
+_skip_on_rubin_d192_thd = pytest.mark.skipif(_SM == 107, reason="Rubin wires THD in the d128 FP8 flavor only (thd_d_shapes={(128,128)})")
+# Rubin serves per-tensor FP8 at EVERY native flavor -- d128/d192x128/d256/d512
+# -- so no flavor gate is needed for the dense cases at all any more.  (These used to be
 # skipif(False) no-op markers -- a marker that reads like a live gate and never
 # skips, whose `reason` states why the case IS served.  If a flavor ever loses
 # its Rubin kernel, add a real `_SM == 107` marker back.)
@@ -359,8 +364,6 @@ _MASKS = {
 def _check_fp8_strided_stats(d_qk, d_v, in_key):
     # Rubin now ships d128/d256/d512 per-tensor FP8; d192xd128 still has no
     # sibling there, so that one flavor stays skipped.
-    if torch.cuda.get_device_capability() == (10, 7) and (d_qk, d_v) == (192, 128):
-        pytest.skip("SM107 per-tensor FP8 has no d192xd128 kernel")
     kwargs = dict(
         B=2,
         H_q=4,
@@ -423,7 +426,6 @@ def test_fp8_output_dtypes(in_key, out_key):
     _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
 
 
-@_skip_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
 @pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
@@ -447,7 +449,6 @@ def test_fp8_d192_d128_output_dtypes(in_key, out_key):
     _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
 
 
-@_skip_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("mask", ["none", "causal_br", "swa"])
 @torch_fork_set_rng(seed=0)
@@ -470,7 +471,6 @@ def test_fp8_d192_d128_masks(mask):
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
-@_skip_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_d192_d128_wide_swa_boundary_dense():
@@ -492,7 +492,6 @@ def test_fp8_d192_d128_wide_swa_boundary_dense():
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
-@_skip_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     ("in_key", "out_key", "with_sink"),
@@ -558,7 +557,6 @@ def test_fp8_head_dim_envelope(dims, mask):
 
 
 @pytest.mark.L0
-@_skip_on_rubin
 def test_fp8_large_flavors_serve_exact_shapes_only():
     """The d192xd128 and D256 per-tensor FP8 flavors serve ONLY their exact shapes.
     With d_qk zero-padded into d192 (144/160/176) the output is wrong (test_mhas_v2
@@ -957,7 +955,7 @@ def test_fp8_pack_gqa_e5m2(d):
     _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref)
 
 
-@_skip_on_rubin
+@_skip_on_rubin_d192_packgqa
 @pytest.mark.L0
 @pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (16, 2)], ids=["g2", "g4", "g8"])
 @torch_fork_set_rng(seed=0)
@@ -983,7 +981,7 @@ def test_fp8_pack_gqa_d192_d128_ratios(h_q, h_kv):
     torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_on_rubin
+@_skip_on_rubin_d192_packgqa
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_d192_d128_grouped_lpt():
@@ -1011,7 +1009,7 @@ def test_fp8_pack_gqa_d192_d128_grouped_lpt():
     torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_on_rubin
+@_skip_on_rubin_d192_packgqa
 @pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_d192_d128_e5m2_sink():
@@ -1335,7 +1333,7 @@ def test_fp8_thd(in_key, causal):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-@_skip_on_rubin
+@_skip_on_rubin_d192_thd
 @pytest.mark.L0
 @pytest.mark.parametrize(
     ("in_key", "causal", "bottom_right"),
@@ -1360,7 +1358,7 @@ def test_fp8_d192_d128_thd(in_key, causal, bottom_right):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-@_skip_on_rubin
+@_skip_on_rubin_d192_thd
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_d192_d128_wide_swa_boundary_thd():
@@ -1381,7 +1379,7 @@ def test_fp8_d192_d128_wide_swa_boundary_thd():
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
-@_skip_on_rubin
+@_skip_on_rubin_d192_thd
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_d192_d128_thd_features():

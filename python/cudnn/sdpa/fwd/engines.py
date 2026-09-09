@@ -811,7 +811,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             sm_lo=107 if rubin_row else _BLACKWELL[0],
             sm_hi=_BLACKWELL[1] if rubin_row else 106,
             phase="prefill",
-            d_shapes=frozenset({(128, 128), (256, 256), (512, 512)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            # Both lines now carry all four native flavors: Rubin gained its
+            # d192x128 FP8 sibling (sm107/prefill_d192_d128_fp8.py).
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             d_pad_multiple=16,
             # The d512 flavor serves the (256, 512] band on BOTH head dims —
             # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
@@ -829,8 +831,11 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # shows run-to-run nondeterminism on long causal e5m2/GQA/sink graphs;
             # min(d_qk, d_v) > 255 admits nothing inexact. Lift both floors once the
             # kernels' padded paths are validated through test_mhas_v2.
-            # The Rubin row carries the SAME floors, minus the (192, 128) entry
-            # it has no flavor for.  It previously declared () -- which made
+            # The Rubin row carries the SAME floors, (192, 128) included since it
+            # gained that flavor -- the table is arch-INDEPENDENT
+            # (api_dsl._SM100_FP8_ENVELOPE_FLOORS), and a row that omits an entry
+            # the adapter still enforces ADMITS a graph the lowering then kills
+            # with a bare ValueError (contract rule 8b').  It previously declared () -- which made
             # mismatch() ADMIT e.g. (512, 256) and (192, 128) that
             # api_dsl._SM100_FP8_ENVELOPE_FLOORS then rejected with a bare
             # ValueError inside check_support: a plan that enters the ranked
@@ -838,7 +843,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # rationale transfers unchanged -- the Rubin d512 kernel is the same
             # cga4x1 role-split geometry, and the d256 padded envelope is no
             # more validated here than on Blackwell.
-            d_envelope_floors=(((256, 256), 255), ((512, 512), 256)) if rubin_row else (((192, 128), 128), ((256, 256), 255), ((512, 512), 256)),
+            d_envelope_floors=(((192, 128), 128), ((256, 256), 255), ((512, 512), 256)),
             thd_d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
@@ -920,8 +925,10 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     f16 and FP8 rows split at the arch line: these are the SM107 sibling
     kernels (dense K=64 MMA, version-1 SMEM descriptors).  Rubin also carries a
     d512 MXFP8 flavor, which SM100 does NOT -- so this row is WIDER than its
-    Blackwell counterpart at the top end and narrower at d192xd128, which has
-    no Rubin MXFP8 sibling.
+    Blackwell counterpart at the top end.  d192xd128 now has a Rubin MXFP8
+    sibling too, but at cga2 ONLY (SM100 serves it at both widths): the wider K
+    pushes this flavor's scale-factor tiles past the 256 KiB version-0
+    descriptor window at cga1.
 
     Declined deliberately, because the ported kernels lack the machinery (not
     because it went untested): THD, split-KV, PackGQA, and the dense padded-Q
@@ -936,7 +943,11 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             sm_hi=_BLACKWELL[1],
             phase="prefill",
             # Exact native shapes only -- the SF tensors are not zero-padded.
-            d_shapes=frozenset({(128, 128), (256, 256), (512, 512)}),
+            # (192, 128) deliberately takes NO cgas_by_d_shape entry below, so it
+            # stays on the row default cgas={2}: at cga1 its four SF tiles start
+            # past the 256 KiB version-0 tcgen05 descriptor window and the UTCCP
+            # would read Q data as scale factors.  See make_cfg_d192_mxfp8.
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             d_pad_multiple=0,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),

@@ -2,7 +2,21 @@
 # SPDX-License-Identifier: MIT
 
 """
-DSL prefill SDPA kernel — classic pipeline, per-tensor FP8 (E4M3 / E5M2), d=128, SM107 (Rubin).
+DSL prefill SDPA kernel — classic pipeline, per-tensor FP8 (E4M3 / E5M2),
+d_qk=192 / d_v=128, SM107 (Rubin).
+
+Geometry is ``make_cfg_d192`` (d_qk=192, d_v=128); the BODY is the same as
+``sm107/prefill_d128_fp8.py``.  The pre-upstream base kernel was flavor-generic
+(one file served d128 and d192xd128 by swapping the config), and ``CfgD192``
+only widens ``TILE_K`` over ``CfgD128``, so the config factory is the ONLY
+difference — exactly the relationship ``sm107/prefill_d192_d128_f16.py`` has to
+its own d128 sibling.
+
+SMEM at cga2: Q 96 KiB + K ring 48 + V ring 32 + O 64 = 192 KiB, every slab well
+below the 256 KiB version-0 tcgen05 descriptor window, so ``DESC_VERSION`` stays
+0 (rules/mma-tma-matrix.md S6).  Unlike the MXFP8 sibling this flavor also clears
+the line at cga1 (highest slab 208 KiB), but the engine row serves cga2 only,
+matching the f16 d192 Rubin sibling.
 
 Verbatim sibling of ``sm100/prefill_d128_fp8.py`` (at 923fcb1a9) with the
 Rubin-specific deltas baked in — the ``_rubin`` sibling-module pattern from
@@ -67,12 +81,12 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 
 from dataclasses import dataclass
 
-from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d128
+from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d192
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
-CFG, _TMA = make_cfg_d128(PARAMS)
+CFG, _TMA = make_cfg_d192(PARAMS)
 
 # tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
 # decision point, wired into every construction below rather than repeated as a
@@ -114,7 +128,7 @@ _SMEM_BYTES = (
     + 2048  # barriers + scheduler + tmem-ptr slack (upper bound)
 )
 if _SMEM_BYTES > _GR100_SMEM_BUDGET:
-    raise ValueError(f"prefill_d128_fp8_sm107: SMEM {_SMEM_BYTES} B exceeds the GR100 budget ({_GR100_SMEM_BUDGET} B) — shrink STAGES_KV")
+    raise ValueError(f"prefill_d192_d128_fp8_sm107: SMEM {_SMEM_BYTES} B exceeds the GR100 budget ({_GR100_SMEM_BUDGET} B) — shrink STAGES_KV")
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
 TMA_QK_GRANU_ELEMS = _TMA.QK_GRANU_ELEMS
@@ -376,7 +390,7 @@ _ONES_I32 = 0x38383838 if CFG.DTYPE_QKV == 0 else 0x3C3C3C3C
 _ONES_ROWS = 16 // CFG.CTA_MMA
 _ONES_ROW_BYTES = CFG.TILE_N * CFG.BPE
 if _ONES_ROW_BYTES not in (128, 64, 32):
-    raise ValueError(f"prefill_d128_fp8_sm107: ones-tile row ({_ONES_ROW_BYTES} B) is not a legal tcgen05 swizzle atom (128/64/32)")
+    raise ValueError(f"prefill_d192_d128_fp8_sm107: ones-tile row ({_ONES_ROW_BYTES} B) is not a legal tcgen05 swizzle atom (128/64/32)")
 
 
 # === Kernel ===

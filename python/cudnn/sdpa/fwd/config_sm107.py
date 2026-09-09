@@ -75,6 +75,7 @@ __all__ = [
     "make_cfg_d128",
     "make_cfg_d128_mxfp8",
     "make_cfg_d192",
+    "make_cfg_d192_mxfp8",
     "make_cfg_d256",
     "make_cfg_d256_mxfp8",
     "make_cfg_d512",
@@ -642,7 +643,35 @@ def make_cfg_d128_mxfp8(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
 
 
 def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
+    """d_qk=192 / d_v=128, f16 and per-tensor FP8.
+
+    Same family as ``make_cfg_d128`` with a wider K: the pre-upstream base kernel
+    was flavor-generic (one body served d128 and d192xd128 by swapping the config),
+    and ``CfgD192`` only widens ``TILE_K``.
+    """
     return _make_cfg_d128_family(params, flavor="sm107 d192xd128", tile_k=192, tile_o=128, mxfp8=False)
+
+
+def make_cfg_d192_mxfp8(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
+    """d_qk=192 / d_v=128, block-scale MXFP8.
+
+    CGA2 ONLY, and that is a DESCRIPTOR constraint rather than a tuning choice.
+    At ``cta_mma=1`` the K/V rings are not halved, so the four scale-factor tiles
+    -- allocated last -- start at 256/258/276/278 KiB, i.e. past the **256 KiB
+    version-0 tcgen05 descriptor window**.  A version-0 SF descriptor there wraps
+    to offset 0 and the UTCCP copies Q DATA bytes into the SF TMEM columns:
+    ``LSE = +inf`` and ``O = NaN`` on 100 % of cells, at every shape (the exact
+    d512 MXFP8 failure in rules/mma-tma-matrix.md S6).  At ``cta_mma=2`` the
+    highest slab sits at 200 KiB and version 0 is provably safe.
+
+    So the Rubin MXFP8 engine row deliberately declares NO ``cgas_by_d_shape``
+    entry for (192, 128), leaving it on the row default ``cgas={2}``.  Lifting
+    that needs ``DESC_VERSION`` derived from the layout AND the version-1 SF path
+    validated on Rubin -- which is NOT a free widening: setting
+    ``desc_version=1`` on the d128/d256 MXFP8 tiles turned 21 green tests red
+    (2026-09-08), so the bit is not a transparent superset.
+    """
+    return _make_cfg_d128_family(params, flavor="sm107 d192xd128 mxfp8", tile_k=192, tile_o=128, mxfp8=True)
 
 
 # ---------------------------------------------------------------------------
