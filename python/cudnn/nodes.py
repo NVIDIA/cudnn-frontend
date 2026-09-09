@@ -53,6 +53,8 @@ class Node:
 
         if self.node_type == NodeType.MATMUL:
             self._validate_matmul()
+        elif self.node_type == NodeType.CONV_FPROP:
+            self._validate_conv_fprop()
 
     def infer_properties(self, context: "GraphContext") -> None:
         """Infer unset tensor properties from context and inputs."""
@@ -91,6 +93,20 @@ class Node:
             return
         if a.dim[-1] != b.dim[-2]:
             raise ValueError(f"Node '{self.name}': Inner dimensions must match for matmul: " f"A{a.dim} @ B{b.dim}")
+
+    def _validate_conv_fprop(self) -> None:
+        """Validate the restricted NDHWC 3D convolution path."""
+        x = self.inputs.get("image")
+        k = self.inputs.get("weight")
+        if not (x and k and x.dim and k.dim):
+            return
+
+        if any(extent <= 0 for extent in x.dim):
+            raise ValueError(f"Node '{self.name}': X dimensions must be positive, got X{x.dim}")
+        if any(extent <= 0 for extent in k.dim):
+            raise ValueError(f"Node '{self.name}': K dimensions must be positive, got K{k.dim}")
+        if x.dim[1] != k.dim[1]:
+            raise ValueError(f"Node '{self.name}': Input channels must match for convolution: X{x.dim} vs K{k.dim}")
 
     def _infer_matmul(self) -> None:
         """Infer output dims for matmul: C = A @ B."""
