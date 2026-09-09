@@ -102,7 +102,7 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
     with GLU and quantization fusion.
 
     Handles domain conversion for: a, b, c, d, d_col, prob, dprob,
-    row_scale, sfa, sfa2, sfd, sfd_col, sfb, sfb2.
+    row_scale, sfa, sfa2, sfd, sfd2, sfd_col, sfb, sfb2.
 
     B and SFB are discrete (per-expert pointer arrays) → use expert-wise
     TMA descriptors from workspace. SFB2 is a per-expert pointer array
@@ -229,6 +229,15 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
             sgm = shape[0][0]
             real_sfa2 = rewrite_tensor_shape(real, ((sgm, tokens_i), shape[1], c1))
             return (real_sfa2, None)
+
+        elif cutlass.const_expr(tensor_name == "sfd2"):
+            # SFD2: ((sgm, total_padded_M), (2*sgn, N), 1) subchannel scale
+            # (sgn deinterleaved f-cols = 2*sgn interleaved D-cols per block),
+            # grouped along M → offset scale_m by token_offset, global desc.
+            real = cute.domain_offset(((0, token_offset), 0, 0), gmem_tensor_in_moe_view)
+            sgm = shape[0][0]
+            real_sfd2 = rewrite_tensor_shape(real, ((sgm, tokens_i), shape[1], c1))
+            return (real_sfd2, None)
 
         elif cutlass.const_expr(tensor_name == "sfb2"):
             # SFB2: discrete — load per-expert pointer from pointer array
@@ -396,6 +405,15 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             sgm = shape[0][0]
             real_sfa2 = rewrite_tensor_shape(real, ((sgm, tokens_i), shape[1], c1))
             return (real_sfa2, None)
+
+        elif cutlass.const_expr(tensor_name == "sfd2"):
+            # SFD2: ((sgm, total_padded_M), (2*sgn, N), 1) subchannel scale
+            # (sgn deinterleaved f-cols = 2*sgn interleaved D-cols per block),
+            # grouped along M → offset scale_m by token_offset, global desc.
+            real = cute.domain_offset(((0, token_offset), 0, 0), gmem_tensor_in_moe_view)
+            sgm = shape[0][0]
+            real_sfd2 = rewrite_tensor_shape(real, ((sgm, tokens_i), shape[1], c1))
+            return (real_sfd2, None)
 
         elif cutlass.const_expr(tensor_name == "sfb2"):
             # SFB2: ((sgn, N), (sgk, K), L) subchannel scale, grouped along L →

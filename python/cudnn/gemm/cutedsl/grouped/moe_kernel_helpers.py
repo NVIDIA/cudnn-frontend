@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Type, Tuple, Union
 
+import inspect as _inspect
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.testing as testing
@@ -285,6 +287,173 @@ def atomic_add_float32(
     )
 
     return Float32(llvm.bitcast(T.f32(), old_value, loc=loc, ip=ip))
+
+
+def red_smem_cluster_max_f32(
+    ptr,
+    value: Float32,
+    cta_rank_in_cluster,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Relaxed cluster-scope FP32 max-reduction into a cluster CTA's SMEM.
+
+    Bit-pattern u32 max on the DSMEM address obtained via mapa — valid for
+    non-negative floats only (the same IEEE-ordering trick as
+    atomic_max_float32 above). `ptr` is the LOCAL smem address of the slot;
+    `cta_rank_in_cluster` selects the target CTA (pass the caller's own rank
+    to reduce into its own buffer through the same path). The reduction is
+    RELAXED: producers must publish with a cluster-scope release fence +
+    mbarrier arrive, and readers must acquire (fence.acq_rel.cluster after
+    the mbarrier wait) before trusting the slot.
+    """
+    value_int = llvm.bitcast(T.i32(), value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    smem_addr = llvm.ptrtoint(T.i32(), ptr.llvm_ptr, loc=loc, ip=ip)
+    llvm.inline_asm(
+        res=None,
+        operands_=[
+            smem_addr,
+            value_int,
+            Int32(cta_rank_in_cluster).ir_value(loc=loc, ip=ip),
+        ],
+        asm_string="""{{
+            .reg .u32 remote_addr;
+            mapa.shared::cluster.u32 remote_addr, $0, $2;
+            red.relaxed.cluster.shared::cluster.max.u32 [remote_addr], $1;
+        }}""",
+        constraints="r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+# Remote mbarrier arrival with cluster-scoped ordering (DSMEM handoffs).
+# Some DSL wheels expose an explicit ``scope=`` on ``mbarrier_arrive``
+# (default CTA — DSMEM data handoffs must request CLUSTER for the cross-CTA
+# memory-model ordering); others lower via ``mbarrier_txn`` and derive the
+# cluster space solely from ``peer_cta_rank_in_cluster`` being set. Detect by
+# feature (does ``scope`` survive in the signature), not by version.
+if "scope" in _inspect.signature(cute.arch.mbarrier_arrive).parameters:
+
+    def mbarrier_arrive_cluster(mbar_ptr, peer_cta_rank_in_cluster, *, loc=None, ip=None):
+        """Remote mbarrier arrival with cluster-scoped ordering (DSMEM handoff)."""
+        cute.arch.mbarrier_arrive(
+            mbar_ptr,
+            peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
+            scope=nvvm.MemScopeKind.CLUSTER,
+            loc=loc,
+            ip=ip,
+        )
+
+else:
+
+    def mbarrier_arrive_cluster(mbar_ptr, peer_cta_rank_in_cluster, *, loc=None, ip=None):
+        """Remote mbarrier arrival with cluster-scoped ordering (DSMEM handoff)."""
+        cute.arch.mbarrier_arrive(
+            mbar_ptr,
+            peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
+            loc=loc,
+            ip=ip,
+        )
+
+
+def atomic_add_i32_gmem(
+    ptr,
+    value: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Atomic i32 addition in global memory; returns the pre-add value."""
+    old_value = nvvm.atomicrmw(
+        op=AtomicOpKind.ADD,
+        ptr=ptr,
+        a=value.ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(old_value)
+
+
+def load_float32_volatile(
+    ptr,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """Volatile FP32 load from global memory.
+
+    Reads back a value produced by gmem atomic reductions (e.g. the sfd2
+    atomic-max): red/atom results are reduced in L2, and a volatile load
+    guarantees the read reaches L2 instead of being served from a stale L1
+    line or being hoisted/cached by the compiler."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [ptr],
+            "ld.volatile.global.f32 $0, [$1];",
+            "=f,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def load_acquire_i32_gpu(
+    ptr,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """GPU-scope acquire load of an i32 from global memory.
+
+    Pairs with a release-ordered atomic (fence.acq_rel.gpu + atom.add) on the
+    writer side: once this load observes the writer's counter update, every
+    gmem write the writer made before its release fence is visible to loads
+    that follow this one."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [ptr],
+            "ld.acquire.gpu.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def nanosleep(*, sleep_time: int = 1000, loc=None, ip=None) -> None:
+    """nanosleep.u32 backoff (the current DSL builds do not expose
+    cute.arch.nanosleep). Used by the sfd2 cross-tile arrival spin-loop of the
+    subchannel-scaled dSwiGLU kernel."""
+    llvm.inline_asm(
+        None,
+        [Int32(sleep_time).ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $0;",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def get_dtype_max(dtype: Type[cutlass.Numeric]) -> float:
+    """Largest finite magnitude of a narrow quantized element type (the
+    reciprocal of get_dtype_rcp_limits). Used to build the SFD2 second-level
+    divisor = max(data dtype) * max(scale-factor dtype)."""
+    if dtype == cutlass.Float4E2M1FN:
+        return 6.0
+    if dtype == cutlass.Float8E4M3FN:
+        return 448.0
+    raise ValueError(f"unsupported quantized dtype {dtype}")
 
 
 def cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8_type, loc=None, ip=None):
@@ -614,11 +783,16 @@ def is_valid_mma_tiler_and_cluster_shape(
     m_aligned: int,
     fix_pad_size: int = FIX_PAD_SIZE,
     allowed_mma_tiler_n: Tuple[int, ...] = (256,),
+    allowed_cluster_tiler_m: Tuple[int, ...] = (128, 256),
 ) -> bool:
     """
     Check if the MMA tiler and cluster shape are valid.
 
     :param fix_pad_size: The fixed pad size used by the kernel (default: FIX_PAD_SIZE).
+    :param allowed_cluster_tiler_m: Accepted cluster M tile extents (the
+        cluster's row span sharing one multicast B load). Callers opting into
+        wider tiles (e.g. 512 with cluster (4, 1)) must themselves gate
+        per-expert M alignment so a cluster never straddles an expert boundary.
     :param allowed_mma_tiler_n: Accepted MMA tile N extents. The default (256,)
         matches the fused GLU kernels (even iterations with Epi Tile N 64 for
         swiGeLU fusion); kernels without that constraint (e.g. the unfused
@@ -647,7 +821,7 @@ def is_valid_mma_tiler_and_cluster_shape(
         is_valid = False
     cluster_tiler_m = (cluster_shape_mn[0] // (2 if use_2cta_instrs else 1)) * mma_tiler_mn[0]
 
-    if cluster_tiler_m not in [128, 256]:
+    if cluster_tiler_m not in allowed_cluster_tiler_m:
         is_valid = False
 
     if m_aligned % mma_tiler_mn[0] != 0:

@@ -2041,7 +2041,7 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
                             kblock_coord = (None, None, kblock_idx, ab_consumer_state.index)
                             sf_kblock_coord = (None, None, kblock_idx)
                             tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
-                            tiled_mma.set(tcgen05.Field.SFB, tCtSFB_mma[sf_kblock_coord].iterator)
+                            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
                             cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
@@ -2494,6 +2494,16 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
 
     @cute.jit
     def _make_extension(self, workspace_ptr):
+        # Discrete mode resolves per-expert B/SFB via prebuilt TMA descriptors;
+        # dense mode uses the contiguous grouped-GEMM scheduler extension
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE):
+            desc_workspace = TensormapWorkspace(workspace_ptr, ["b", "sfb"])
+            return DiscreteWeightScaledGemmSchedExtension(
+                tensormap_ctor=desc_workspace,
+                sf_vec_size=self.sf_vec_size,
+            )
+        else:
+            return ContiguousAndConsistentGroupedGemmSchedExtension(
         # Discrete mode resolves per-expert B/SFB via prebuilt TMA descriptors;
         # dense mode uses the contiguous grouped-GEMM scheduler extension
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE):
