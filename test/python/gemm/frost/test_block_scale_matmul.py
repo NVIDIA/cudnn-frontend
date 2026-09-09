@@ -2384,7 +2384,9 @@ def test_sm120_block_scale_registry_wiring():
     cfg = by_name(_SM120_BS_128)
     assert select_template(chain, cfg) is tmpl
     reason = tmpl.accepts(chain, cfg)
-    assert reason is None or "runs only on" in reason  # only the active-GPU gate may refuse
+    # Only the active-GPU gates may refuse -- the family range (sm < 100) or the
+    # block-scale MMA special case (100 <= sm < 120) -- never the wiring itself.
+    assert reason is None or "runs only on" in reason or "exists only on 120 <= SM < 130" in reason, reason
     # fp4 + e8m0 at block 16 is refused by the MMA-type table ...
     chain16 = analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=cudnn.data_type.FP8_E8M0))
     assert "does not support" in mma_arch_reject(chain16, GraphType.BLOCK_SCALE_MATMUL, "sm120")
