@@ -207,6 +207,8 @@ class MoeEp:
         token_padding_size: int = 128,
         sf_padding_size: int = 128,
         tuning: Optional[MoeEpTuningConfig] = None,
+        forward_tuning: Optional[MoeEpTuningConfig] = None,
+        backward_tuning: Optional[MoeEpTuningConfig] = None,
     ) -> None:
         self._lifecycle_lock = threading.RLock()
         for name, value in (
@@ -237,9 +239,22 @@ class MoeEp:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
         if sf_padding_size % 128:
-            raise ValueError("sf_padding_size must be a positive multiple of 128, " f"got {sf_padding_size}")
-        if tuning is not None and not isinstance(tuning, MoeEpTuningConfig):
-            raise TypeError("tuning must be a MoeEpTuningConfig or None, " f"got {type(tuning).__name__}")
+            raise ValueError(
+                "sf_padding_size must be a positive multiple of 128, "
+                f"got {sf_padding_size}"
+            )
+        for name, value in (
+            ("tuning", tuning),
+            ("forward_tuning", forward_tuning),
+            ("backward_tuning", backward_tuning),
+        ):
+            if value is not None and not isinstance(value, MoeEpTuningConfig):
+                raise TypeError(
+                    f"{name} must be a MoeEpTuningConfig or None, "
+                    f"got {type(value).__name__}"
+                )
+        if tuning is not None and forward_tuning is not None:
+            raise ValueError("tuning and forward_tuning are aliases; pass only one")
         if gate_up_clamp is not None:
             if isinstance(gate_up_clamp, bool) or not isinstance(gate_up_clamp, Real):
                 raise ValueError("gate_up_clamp must be a finite real number or None")
@@ -273,11 +288,31 @@ class MoeEp:
         self.gate_up_clamp = None if gate_up_clamp is None else abs(gate_up_clamp)
         self.token_padding_size = token_padding_size
         self.sf_padding_size = sf_padding_size
-        self.tuning = MoeEpTuningConfig() if tuning is None else tuning
-        if self.tuning.reduce_topk_in_kernel and (
-            self.combine_format is not MoeFormat.BF16 or self.output_format is not MoeFormat.BF16 or not self.apply_topk_in_fc1
+        self.forward_tuning = (
+            forward_tuning
+            if forward_tuning is not None
+            else MoeEpTuningConfig() if tuning is None else tuning
+        )
+        self.backward_tuning = (
+            backward_tuning
+            if backward_tuning is not None
+            else MoeEpTuningConfig()
+        )
+        # Backward-compatible alias for inference and forward-only autotuning.
+        self.tuning = self.forward_tuning
+        if self.forward_tuning.reduce_topk_in_kernel and (
+            self.combine_format is not MoeFormat.BF16
+            or self.output_format is not MoeFormat.BF16
+            or not self.apply_topk_in_fc1
         ):
-            raise ValueError("reduce_topk_in_kernel requires BF16 combine/output and " "apply_topk_in_fc1=True")
+            raise ValueError(
+                "reduce_topk_in_kernel requires BF16 combine/output and "
+                "apply_topk_in_fc1=True"
+            )
+        if self.backward_tuning.token_back_mode != "epi_warps":
+            raise ValueError("backward_tuning requires token_back_mode='epi_warps'")
+        if self.backward_tuning.reduce_topk_in_kernel:
+            raise ValueError("backward_tuning does not support reduce_topk_in_kernel=True")
 
         for name, fmt in (
             ("output_format", self.output_format),
@@ -308,7 +343,8 @@ class MoeEp:
             generate_c=False,
             token_padding_size=self.token_padding_size,
             sf_padding_size=self.sf_padding_size,
-            tuning=self.tuning,
+            tuning=self.forward_tuning,
+            backward_tuning=self.backward_tuning,
             backward_wgrad_mode="none",
         )
         self._forward_backend = None
@@ -572,7 +608,8 @@ class MoeEp:
                 self._poisoned = True
                 raise RuntimeError(f"MoeEp autotune winner {winner.tuning!r} failed final validation: {exc}") from exc
 
-            self.tuning = winner.tuning
+            self.forward_tuning = winner.tuning
+            self.tuning = self.forward_tuning
             self._forward_config = winner_request.config
             self._forward_backend = winner_backend
             self._forward_backend_device = device
@@ -719,9 +756,11 @@ class MoeEp:
                     with torch.cuda.device(device):
                         state = backend.prepare_training(lane_count=1)
                         requirements = state.public_requirements()
+                        symmetric_buffers = state.public_symmetric_buffers(0)
                         forward_out, backward_out = allocate_training_outputs(
                             requirements,
                             device,
+                            symmetric_buffers,
                         )
                         forward_names = (
                             "output",
@@ -834,7 +873,8 @@ class MoeEp:
 
             winner = select_winner(results)
             winner_config = candidate_configs[normalized.index(winner.tuning)]
-            self.tuning = winner.tuning
+            self.forward_tuning = winner.tuning
+            self.tuning = self.forward_tuning
             self._forward_config = winner_config
             self._forward_backend = None
             self._forward_backend_device = None
@@ -889,6 +929,17 @@ class MoeEp:
 
         return self._training_lanes
 
+    def training_symmetric_buffers(
+        self,
+        lane: MoeEpExecutionLane,
+    ) -> Mapping[str, torch.Tensor]:
+        """Return one lane's symmetric MXFP8 input and final-output buffers."""
+
+        with self._lifecycle_lock:
+            self._require_training_lane(lane)
+            assert self._training_state is not None
+            return self._training_state.public_symmetric_buffers(lane.index)
+
     def prepare_training(
         self,
         *,
@@ -900,8 +951,9 @@ class MoeEp:
     ]:
         """Collectively prepare private training runtime and return contracts.
 
-        ``device`` defaults to the current CUDA device. No weights or caller
-        output buffers are retained by the operator.
+        ``device`` defaults to the current CUDA device. No weights are retained.
+        Per-lane symmetric input and final-output buffers are available through
+        :meth:`training_symmetric_buffers`.
         """
 
         with self._lifecycle_lock:

@@ -114,7 +114,14 @@ def _prepare_case(
         source_weights[1],
         out=backward_staging,
     )
-    output_pairs = tuple(_allocate_stateless_training_outputs(requirements, device) for _ in range(lane_count))
+    output_pairs = tuple(
+        _allocate_stateless_training_outputs(
+            requirements,
+            device,
+            op.training_symmetric_buffers(lane),
+        )
+        for lane in op.training_lanes
+    )
     return (
         op,
         args,

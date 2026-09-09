@@ -43,6 +43,9 @@ op = MoeEp(
 )
 ```
 
+`max_recv_size_per_rank` is the physical receive-pool size in token rows,
+including all per-expert padding. Padding is contained within this capacity.
+
 Native training requires `weight_interleave_size=32`. FC1 payloads then use
 alternating 32-element gate/up strips.
 
@@ -108,6 +111,7 @@ requirements = op.prepare_training(
     device=None,  # current CUDA device; pass an explicit device for multi-GPU hosts
 )
 lane = op.training_lanes[0]
+symmetric = op.training_symmetric_buffers(lane)
 ```
 
 `prepare_training` does not accept or bind weights. It returns a plain mapping
@@ -117,10 +121,15 @@ whose values are:
 (shape, stride, dtype, alignment_bytes)
 ```
 
-The mapping contains `output`, `fc1_preact`, `fc1_a`, `fc1_sfa`,
+The requirements mapping contains `output`, `fc1_preact`, `fc1_a`, `fc1_sfa`,
 `valid_route_counts`, `expert_offsets`, `grad_activation`, `dprob`, `fc1_b`,
-`fc1_sfb`, `fc2_a`, `fc2_sfa`, `fc2_b`, and `fc2_sfb`. TE allocates these
-buffers and passes them to each invocation. cuDNN validates exact shape,
+`fc1_sfb`, `fc2_a`, `fc2_sfa`, `fc2_b`, and `fc2_sfb`.
+`training_symmetric_buffers(lane)` returns the cuDNN-allocated
+`forward_input`, `forward_input_scale`, `backward_input`,
+`backward_input_scale`, `output`, BF16 `grad_activation`, and FP32 `dprob`
+buffers for that lane. TE quantizes directly into the input pairs and binds the
+returned output buffers in the public output bundles. TE allocates the
+remaining buffers from the requirements mapping. cuDNN validates exact shape,
 stride, dtype, alignment, device, and non-aliasing before launch.
 
 `device=None` binds the current CUDA device. An explicit CUDA device takes
@@ -205,9 +214,14 @@ y = op.training_forward(
 ```
 
 `activation` may be contiguous BF16/FP32 or an axis-1 MXFP8
-`BlockScaledTensor`. MXFP8 input bypasses the BF16-to-MXFP8 quantization
-stager. Routing still copies data into private symmetric memory because remote
-ranks address that memory directly.
+`BlockScaledTensor`. To avoid input staging, quantize directly into the
+`forward_input` and `forward_input_scale` views returned by
+`training_symmetric_buffers(lane)`. Construct the MXFP8 input from
+`forward_input[:T]` and
+`forward_input_scale[:T, :ceil_div(hidden_size, 32)]`. The logical scale view
+has unit column stride and may retain the lane buffer's padded row stride;
+training accepts this layout without copying. Routing metadata is still staged
+privately.
 
 `fc1_preact` is required because the training forward kernel always runs with
 `generate_c=True`; TE must provide its destination and retain it through the
@@ -215,8 +229,9 @@ matching backward. `fc1_a`, `fc1_sfa`, `valid_route_counts`, and
 `expert_offsets` are also required caller-owned destinations after
 `prepare_training()`.
 
-`output` is required. The return is a logical `(T, H)` view of that
-caller-owned capacity buffer.
+`output` is required and must be the lane's cuDNN-allocated symmetric
+`output` buffer. The return is a logical `(T, H)` view of that buffer and the
+forward kernel writes it directly.
 
 ## Backward and WGrad
 
@@ -247,11 +262,17 @@ dx, dprob, operands = op.training_backward(
 )
 ```
 
-`grad_output` has the same BF16/FP32/MXFP8 input choices as forward.
+`grad_output` has the same BF16/FP32/MXFP8 input choices as forward. To avoid
+staging, quantize it directly into the lane's `backward_input` and
+`backward_input_scale` buffers and construct the same logical prefix views
+described for `forward_input`.
 `fc1_preact` and the four forward WGrad values are required and passed
 explicitly because cuDNN does not retain the forward output bundle.
 
-`grad_activation` and `dprob` are required caller-owned destinations.
+`grad_activation` and `dprob` are required destinations. Both must be the
+corresponding symmetric buffers returned by `training_symmetric_buffers(lane)`
+and are written directly by the backward kernel. `grad_activation` is BF16 and
+`dprob` is FP32.
 
 All six backward WGrad fields are required. `operands` is always a
 `MoeEpTrainingWgradOperands` containing non-owning views of the exact caller
@@ -273,13 +294,15 @@ not the model's top-k value:
 
 - TE owns all native weights, output bundles, saved forward state, WGrad
   operands, and optional pack staging.
-- cuDNN borrows these tensors for one call and does not cache their Python
-  objects or pointers.
+- cuDNN borrows caller-allocated tensors for one call and does not cache their
+  Python objects or pointers. The per-lane symmetric buffers returned by
+  `training_symmetric_buffers` remain cuDNN-owned for the lane lifetime.
 - TE must provide `fc1_preact` to forward and keep it live through the matching
   backward; cuDNN has no private preactivation fallback or workspace alias.
 - Forward WGrad outputs, segment metadata, and backward WGrad outputs remain
   live until the independent grouped WGrad consumer completes.
-- cuDNN owns private per-lane local and NVSHMEM symmetric scratch.
+- cuDNN owns per-lane local and NVSHMEM symmetric storage; only the documented
+  input and final-output views are exposed to the caller.
 - One lane may be active on only one stream at a time.
 - All EP ranks must submit distributed forward/backward calls in identical
   order.
@@ -321,5 +344,6 @@ Removed:
 - `finalize_overflow`
 
 The old resource-owned forward/backward state is replaced by explicit
-per-invocation native weight packs and caller-owned output buffers. No
-compatibility shim is retained.
+per-invocation native weight packs, caller-owned saved/WGrad buffers, and
+cuDNN-owned symmetric input/final-output views. No compatibility shim is
+retained.

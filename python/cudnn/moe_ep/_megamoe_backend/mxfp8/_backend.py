@@ -13,6 +13,7 @@ import torch.distributed as dist
 
 from ..._backend import BackendUnavailableError
 from ..._contracts import ForwardConfig, ValidatedForwardRequest
+from ..._tuning import MoeEpTuningConfig
 from .._plan import ExecutionPlanOwner
 from ._adapter import Mxfp8InputAdapter
 from ._backward_compile import prepare_backward_kernel
@@ -32,7 +33,7 @@ class Mxfp8Backend:
     def __init__(self, config: ForwardConfig, device: torch.device) -> None:
         self.config = config
         self.device = torch.device(device)
-        self.kernel_config = Mxfp8KernelConfig.from_forward_config(config)
+        self.kernel_config = Mxfp8KernelConfig.from_operator_config(config)
         self._adapter = Mxfp8InputAdapter()
         self._prepared_kernel: PreparedMxfp8Kernel | None = None
         self._compiled: CompiledMxfp8Kernel | None = None
@@ -198,11 +199,31 @@ class Mxfp8Backend:
                 token_padding_size=128,
                 sf_padding_size=128,
             )
-            training_kernel_config = Mxfp8KernelConfig.from_forward_config(training_config)
+            forward_kernel_config = Mxfp8KernelConfig.from_operator_config(
+                training_config,
+                tuning=training_config.tuning,
+            )
+            backward_tuning = training_config.backward_tuning
+            if backward_tuning is None:
+                backward_tuning = MoeEpTuningConfig()
+            backward_kernel_config = Mxfp8KernelConfig.from_operator_config(
+                training_config,
+                tuning=backward_tuning,
+            )
             # Graph transport must complete its cross-rank protocol before the
             # frontend applies the public trap/drop policy at graph tail.
-            graph_kernel_config = replace(
-                training_kernel_config,
+            forward_graph_kernel_config = replace(
+                forward_kernel_config,
+                drop_on_overflow=True,
+                # Upstream 5b89819's forward col-requant accepts token
+                # padding 128/256 but fixes SF atoms at 128; its dGLU
+                # auxiliaries require token and SF padding to match. The
+                # graph-only fixed-capacity intersection is therefore 128.
+                token_padding_block=128,
+                sf_padding_block=128,
+            )
+            backward_graph_kernel_config = replace(
+                backward_kernel_config,
                 drop_on_overflow=True,
                 # Upstream 5b89819's forward col-requant accepts token
                 # padding 128/256 but fixes SF atoms at 128; its dGLU
@@ -213,12 +234,12 @@ class Mxfp8Backend:
             )
             forward = prepare_kernel(
                 training_config,
-                graph_kernel_config,
+                forward_graph_kernel_config,
                 self.device,
             )
             backward = prepare_backward_kernel(
                 training_config,
-                graph_kernel_config,
+                backward_graph_kernel_config,
                 self.device,
             )
             from ._training_resources import Mxfp8TrainingState

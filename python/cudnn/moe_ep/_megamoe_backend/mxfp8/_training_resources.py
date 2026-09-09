@@ -34,6 +34,7 @@ from .._workspace import (
     WorkspaceOwner,
     WorkspaceRequirements,
     WorkspaceViews,
+    padded_mxfp8_scale_columns,
 )
 from ._adapter import _typed_view
 from ._backward_compile import PreparedMxfp8BackwardKernel
@@ -742,6 +743,44 @@ class Mxfp8TrainingState:
             ),
         )
 
+    def public_symmetric_buffers(
+        self,
+        lane: int,
+    ) -> Mapping[str, torch.Tensor]:
+        """Return caller-visible views over one lane's symmetric I/O buffers."""
+
+        capacity = int(self.config.max_tokens_per_rank)
+        hidden = int(self.config.hidden_size)
+        execution = self.views(lane=lane, token_count=capacity)
+
+        def activation_views(workspace: WorkspaceViews) -> tuple[torch.Tensor, torch.Tensor]:
+            return (
+                _typed_view(
+                    workspace.symmetric["activation_data"],
+                    _DATA_DTYPE,
+                    (capacity, hidden),
+                ),
+                _typed_view(
+                    workspace.symmetric["activation_scale"],
+                    _SCALE_DTYPE,
+                    (round_up(capacity, 128), padded_mxfp8_scale_columns(hidden)),
+                ),
+            )
+
+        forward_data, forward_scale = activation_views(execution.forward.workspace)
+        backward_data, backward_scale = activation_views(execution.backward.workspace)
+        return MappingProxyType(
+            {
+                "forward_input": forward_data,
+                "forward_input_scale": forward_scale,
+                "backward_input": backward_data,
+                "backward_input_scale": backward_scale,
+                "output": execution.scratch.forward_output,
+                "grad_activation": execution.scratch.backward_output,
+                "dprob": execution.scratch.dprob,
+            }
+        )
+
     def public_requirements(
         self,
     ) -> Mapping[
@@ -803,7 +842,7 @@ class Mxfp8TrainingState:
             "grad_activation": (
                 (capacity, config.hidden_size),
                 (config.hidden_size, 1),
-                torch.float32,
+                torch.bfloat16,
                 16,
             ),
             "dprob": (

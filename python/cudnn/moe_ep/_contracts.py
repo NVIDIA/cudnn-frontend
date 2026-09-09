@@ -54,6 +54,7 @@ class ForwardConfig:
     token_padding_size: int
     sf_padding_size: int
     tuning: MoeEpTuningConfig
+    backward_tuning: MoeEpTuningConfig | None = None
     backward_wgrad_mode: Literal["none", "operands"] = "none"
     max_recv_size_per_rank: Optional[int] = None
     drop_on_overflow: bool = False

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 import statistics
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TypeVar
 
 import torch
@@ -163,8 +163,9 @@ def select_winner(
 def allocate_training_outputs(
     requirements,
     device: torch.device,
+    symmetric_buffers: Mapping[str, torch.Tensor],
 ) -> tuple[MoeEpTrainingForwardOutputs, MoeEpTrainingBackwardOutputs]:
-    """Allocate private one-lane outputs from the production ABI contract."""
+    """Bind symmetric outputs and allocate the remaining one-lane contracts."""
 
     def allocate(name: str) -> torch.Tensor:
         shape, stride, dtype, alignment = requirements[name]
@@ -175,15 +176,15 @@ def allocate_training_outputs(
 
     forward = MoeEpTrainingForwardOutputs(
         fc1_preact=allocate("fc1_preact"),
-        output=allocate("output"),
+        output=symmetric_buffers["output"],
         fc1_a=allocate("fc1_a"),
         fc1_sfa=allocate("fc1_sfa"),
         valid_route_counts=allocate("valid_route_counts"),
         expert_offsets=allocate("expert_offsets"),
     )
     backward = MoeEpTrainingBackwardOutputs(
-        grad_activation=allocate("grad_activation"),
-        dprob=allocate("dprob"),
+        grad_activation=symmetric_buffers["grad_activation"],
+        dprob=symmetric_buffers["dprob"],
         fc1_b=allocate("fc1_b"),
         fc1_sfb=allocate("fc1_sfb"),
         fc2_a=allocate("fc2_a"),

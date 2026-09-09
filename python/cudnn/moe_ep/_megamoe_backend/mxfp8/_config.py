@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import torch
 
 from ..._contracts import Fc1WeightLayout, ForwardConfig
+from ..._tuning import MoeEpTuningConfig
 from ._formats import combine_wire_format
 
 
@@ -59,17 +60,43 @@ class Mxfp8KernelConfig:
             raise ValueError("col_quant_num_ctas must be positive")
 
     @classmethod
-    def from_forward_config(cls, config: ForwardConfig) -> "Mxfp8KernelConfig":
+    def from_operator_config(
+        cls,
+        config: ForwardConfig,
+        *,
+        tuning: MoeEpTuningConfig | None = None,
+    ) -> "Mxfp8KernelConfig":
         if config.ep_size < 1:
             raise ValueError("MXFP8 execution requires a positive EP size")
         if config.ep_rank < 0 or config.ep_rank >= config.ep_size:
             raise ValueError(f"ep_rank {config.ep_rank} is outside EP size {config.ep_size}")
         if config.max_tokens_per_rank is None:
             raise ValueError("MXFP8 execution requires max_tokens_per_rank")
-        worst_case_recv_size = config.ep_size * config.max_tokens_per_rank * config.top_k
-        max_recv_size_per_rank = worst_case_recv_size if config.max_recv_size_per_rank is None else min(config.max_recv_size_per_rank, worst_case_recv_size)
+        token_padding_block = (
+            config.token_padding_size
+            if config.backward_wgrad_mode == "operands"
+            else 128 if config.generate_c else config.token_padding_size
+        )
+        # When no physical receive capacity is provided, preserve the previous
+        # default by accounting for worst-case per-expert padding. This is not
+        # equivalent to rounding the total route count once: every active
+        # expert owns a separately padded segment. An explicit value is already
+        # the physical pool size and is therefore used verbatim below.
+        raw_route_count = config.ep_size * config.max_tokens_per_rank * config.top_k
+        active_expert_count = min(config.experts_per_rank, raw_route_count)
+        worst_case_padded_recv_size = (
+            active_expert_count
+            + (raw_route_count - active_expert_count) // token_padding_block
+        ) * token_padding_block
+        max_recv_size_per_rank = (
+            worst_case_padded_recv_size
+            if config.max_recv_size_per_rank is None
+            else config.max_recv_size_per_rank
+        )
         if max_recv_size_per_rank <= 0:
             raise ValueError("max_recv_size_per_rank must be positive")
+        if tuning is None:
+            tuning = config.tuning
         return cls(
             num_experts=config.experts_per_rank,
             world_size=config.ep_size,
@@ -86,15 +113,13 @@ class Mxfp8KernelConfig:
             drop_on_overflow=config.drop_on_overflow,
             combine_format=combine_wire_format(config.combine_format),
             enable_col_quant=(config.backward_wgrad_mode == "operands"),
-            token_padding_block=(
-                config.token_padding_size if config.backward_wgrad_mode == "operands" else 128 if config.generate_c else config.token_padding_size
-            ),
+            token_padding_block=token_padding_block,
             sf_padding_block=config.sf_padding_size,
-            group_hint=config.tuning.group_hint,
-            token_back_mode=config.tuning.token_back_mode,
-            epi_flag_batch=config.tuning.epi_flag_batch,
-            flag_batch=config.tuning.token_in_flag_batch,
-            fc2_in_kernel_topk_reduce=(config.tuning.reduce_topk_in_kernel),
+            group_hint=tuning.group_hint,
+            token_back_mode=tuning.token_back_mode,
+            epi_flag_batch=tuning.epi_flag_batch,
+            flag_batch=tuning.token_in_flag_batch,
+            fc2_in_kernel_topk_reduce=tuning.reduce_topk_in_kernel,
         )
 
     @property

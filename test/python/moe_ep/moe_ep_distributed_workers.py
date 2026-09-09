@@ -357,6 +357,7 @@ def _run_backward_reference_case(
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
+            op.training_symmetric_buffers(lane),
         )
         actual_y = op.training_forward(
             lane,

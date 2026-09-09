@@ -942,8 +942,8 @@ def _allocate_training_weight_staging(weights):
     return forward_out, backward_out
 
 
-def _allocate_stateless_training_outputs(requirements, device):
-    """Allocate every advertised caller-owned output contract."""
+def _allocate_stateless_training_outputs(requirements, device, symmetric_buffers):
+    """Bind symmetric final outputs and allocate the remaining contracts."""
 
     from cudnn.moe_ep import (
         MoeEpTrainingBackwardOutputs,
@@ -960,7 +960,7 @@ def _allocate_stateless_training_outputs(requirements, device):
         )
 
     forward = MoeEpTrainingForwardOutputs(
-        output=allocate("output"),
+        output=symmetric_buffers["output"],
         fc1_preact=allocate("fc1_preact"),
         fc1_a=allocate("fc1_a"),
         fc1_sfa=allocate("fc1_sfa"),
@@ -968,8 +968,8 @@ def _allocate_stateless_training_outputs(requirements, device):
         expert_offsets=allocate("expert_offsets"),
     )
     backward = MoeEpTrainingBackwardOutputs(
-        grad_activation=allocate("grad_activation"),
-        dprob=allocate("dprob"),
+        grad_activation=symmetric_buffers["grad_activation"],
+        dprob=symmetric_buffers["dprob"],
         fc1_b=allocate("fc1_b"),
         fc1_sfb=allocate("fc1_sfb"),
         fc2_a=allocate("fc2_a"),

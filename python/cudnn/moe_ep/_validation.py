@@ -65,6 +65,18 @@ def _validate_strided(name: str, tensor: torch.Tensor) -> None:
         raise ValueError(f"{name} must use torch.strided layout, got {tensor.layout}")
 
 
+def _is_training_mxfp8_scale_layout(tensor: torch.Tensor) -> bool:
+    """Accept compact scales or logical views into padded lane-scale storage."""
+
+    if tensor.is_contiguous():
+        return True
+    return (
+        tensor.ndim == 2
+        and tensor.stride(1) == 1
+        and tensor.stride(0) >= tensor.shape[1]
+    )
+
+
 def _validate_tensor_representation(
     name: str,
     tensor: MoeTensor,
@@ -437,8 +449,13 @@ def validate_training_input(
     if isinstance(value, BlockScaledTensor):
         if value.format is not MoeFormat.MXFP8:
             raise NotImplementedError(f"{name} only supports MXFP8 block scaling")
-        if not value.data.is_contiguous() or not value.scale.is_contiguous():
-            raise ValueError(f"{name} MXFP8 data and scale must be contiguous")
+        if not value.data.is_contiguous():
+            raise ValueError(f"{name} MXFP8 data must be contiguous")
+        if not _is_training_mxfp8_scale_layout(value.scale):
+            raise ValueError(
+                f"{name} MXFP8 scale must be contiguous or a row-major view "
+                "with padded row stride"
+            )
     elif value.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError(f"{name} must be BF16, FP32, or an MXFP8 BlockScaledTensor")
     elif not value.is_contiguous():

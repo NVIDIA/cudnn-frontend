@@ -247,6 +247,48 @@ def test_training_input_rejects_noncontiguous_plain_tensor():
 
 
 @pytest.mark.L0
+def test_training_input_accepts_logical_view_of_padded_lane_scale():
+    config = _training_config(
+        weight_interleave_size=32,
+        max_tokens_per_rank=5,
+    )
+    token_count = 5
+    logical_scale_columns = config.hidden_size // 32
+    lane_scale = torch.empty(
+        (128, 16),
+        dtype=torch.float8_e8m0fnu,
+    )
+    scale = lane_scale[:token_count, :logical_scale_columns]
+    activation = BlockScaledTensor(
+        data=torch.empty(
+            (token_count, config.hidden_size),
+            dtype=torch.float8_e4m3fn,
+        ),
+        scale=scale,
+        format="mxfp8",
+        logical_shape=(token_count, config.hidden_size),
+        axis=1,
+    )
+    topk_idx = torch.zeros((token_count, config.top_k), dtype=torch.int32)
+    topk_weights = torch.ones((token_count, config.top_k), dtype=torch.float32)
+
+    assert scale.shape == (5, 4)
+    assert scale.stride() == (16, 1)
+    assert not scale.is_contiguous()
+    assert (
+        validate_training_input(
+            config,
+            "activation",
+            activation,
+            topk_idx,
+            topk_weights,
+            device=torch.device("cpu"),
+        )
+        == token_count
+    )
+
+
+@pytest.mark.L0
 def test_training_bundle_fields_match_public_contracts():
     dummy = object()
     assert [field.name for field in fields(MoeEpForwardWeights)] == ["fc1", "fc2"]
@@ -369,6 +411,45 @@ def test_mxfp8_training_input_bypasses_quantization_stager():
     assert activation_sf[token_count:].view(torch.uint8).eq(0).all()
     assert routing_idx[token_count:].eq(-1).all()
     assert routing_weights[token_count:].eq(0).all()
+
+
+@pytest.mark.L0
+def test_mxfp8_training_input_already_in_symmetric_staging_is_not_copied():
+    token_count = 2
+    capacity = 4
+    hidden = 32
+    top_k = 2
+    activation_data = torch.ones((capacity, hidden), dtype=torch.float8_e4m3fn)
+    activation_sf = torch.ones((capacity, hidden // 32), dtype=torch.float8_e8m0fnu)
+    value = BlockScaledTensor(
+        data=activation_data[:token_count],
+        scale=activation_sf[:token_count],
+        format="mxfp8",
+        logical_shape=(token_count, hidden),
+        axis=1,
+    )
+    topk_idx = torch.tensor([[0, 1], [1, -1]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.75, 0.25], [1.0, 0.0]], dtype=torch.float32)
+    routing_idx = torch.empty((capacity, top_k), dtype=torch.int32)
+    routing_weights = torch.empty((capacity, top_k), dtype=torch.float32)
+    tail_data = activation_data[token_count:].clone()
+    tail_scale = activation_sf[token_count:].clone()
+
+    _stage_input(
+        object(),
+        value,
+        topk_idx,
+        topk_weights,
+        activation_data,
+        activation_sf,
+        routing_idx,
+        routing_weights,
+    )
+
+    torch.testing.assert_close(activation_data[token_count:], tail_data)
+    torch.testing.assert_close(activation_sf[token_count:], tail_scale)
+    torch.testing.assert_close(routing_idx[:token_count], topk_idx)
+    torch.testing.assert_close(routing_weights[:token_count], topk_weights)
 
 
 @pytest.mark.L0
@@ -565,6 +646,7 @@ def test_private_training_state_has_no_bound_weights_or_wgrad_exporter():
     assert requirements["fc1_b"][1] == (2 * config.intermediate_size, 1)
     assert requirements["fc2_a"][1] == (1, config.intermediate_size)
     assert requirements["fc2_b"][1] == (1, forward.pool_token_capacity)
+    assert requirements["grad_activation"][2] is torch.bfloat16
 
 
 @pytest.mark.L0
@@ -780,7 +862,7 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-def test_stateless_training_ep1_eager_and_cuda_graph_match_reference():
+def test_stateless_training_padded_capacity_eager_and_cuda_graph_match_reference():
     device = _sm107_device()
     base_args = make_forward_inputs(device)
     args = (
@@ -798,14 +880,16 @@ def test_stateless_training_ep1_eager_and_cuda_graph_match_reference():
         gate_up_clamp=None,
     )
     source_weights = _fixed_training_weights(args)
+    capacity = args[0].shape[0] + 1
+    assert capacity % 128 != 0
 
     with MoeEp(
         num_experts=2,
         hidden_size=128,
         intermediate_size=256,
         top_k=2,
-        max_tokens_per_rank=args[0].shape[0],
-        max_recv_size_per_rank=args[0].shape[0] * args[3].shape[1],
+        max_tokens_per_rank=capacity,
+        max_recv_size_per_rank=2 * 128,
         drop_on_overflow=True,
         combine_format="bf16",
         weight_interleave_size=32,
@@ -820,11 +904,15 @@ def test_stateless_training_ep1_eager_and_cuda_graph_match_reference():
             source_weights[1],
             out=backward_staging,
         )
+        lane = op.training_lanes[0]
+        symmetric = op.training_symmetric_buffers(lane)
+        assert symmetric["forward_input_scale"].shape[0] == 128
+        assert symmetric["backward_input_scale"].shape[0] == 128
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
+            symmetric,
         )
-        lane = op.training_lanes[0]
 
         def run():
             y = op.training_forward(
@@ -926,7 +1014,7 @@ def test_native_io_mxfp8_cuda_graph_replay():
         intermediate_size=256,
         top_k=2,
         max_tokens_per_rank=activation.shape[0],
-        max_recv_size_per_rank=activation.shape[0] * topk_idx.shape[1],
+        max_recv_size_per_rank=2 * 128,
         drop_on_overflow=True,
         output_format="bf16",
         combine_format="bf16",
@@ -934,11 +1022,33 @@ def test_native_io_mxfp8_cuda_graph_replay():
     )
     try:
         requirements = op.prepare_training(lane_count=1, device=device)
+        lane = op.training_lanes[0]
+        symmetric = op.training_symmetric_buffers(lane)
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
+            symmetric,
         )
-        lane = op.training_lanes[0]
+
+        def stage_symmetric(source, prefix):
+            token_count = source.logical_shape[0]
+            data = symmetric[prefix][:token_count]
+            scale = symmetric[f"{prefix}_scale"][
+                :token_count,
+                : source.scale.shape[1],
+            ]
+            data.copy_(source.data)
+            scale.copy_(source.scale)
+            return BlockScaledTensor(
+                data=data,
+                scale=scale,
+                format="mxfp8",
+                logical_shape=source.logical_shape,
+                axis=1,
+            )
+
+        activation = stage_symmetric(activation, "forward_input")
+        grad_output = stage_symmetric(grad_output, "backward_input")
 
         # The production call below receives only native packs. The existing
         # fallback packer is used once here as a test oracle to create known-good

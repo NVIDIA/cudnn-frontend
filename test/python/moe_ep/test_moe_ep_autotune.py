@@ -105,6 +105,36 @@ def test_autotune_core_contracts(monkeypatch):
     result = MoeEpAutotuneResult("inference", first.tuning, (first, second))
     assert result.evaluated_candidates == 2
 
+    requirements = {
+        name: ((2, 3), (3, 1), torch.float32, 1)
+        for name in (
+            "fc1_preact",
+            "fc1_a",
+            "fc1_sfa",
+            "valid_route_counts",
+            "expert_offsets",
+            "fc1_b",
+            "fc1_sfb",
+            "fc2_a",
+            "fc2_sfa",
+            "fc2_b",
+            "fc2_sfb",
+        )
+    }
+    symmetric_buffers = {
+        "output": torch.empty(2, 3),
+        "grad_activation": torch.empty(2, 3),
+        "dprob": torch.empty(2, 3),
+    }
+    forward_out, backward_out = autotune_module.allocate_training_outputs(
+        requirements,
+        torch.device("cpu"),
+        symmetric_buffers,
+    )
+    assert forward_out.output is symmetric_buffers["output"]
+    assert backward_out.grad_activation is symmetric_buffers["grad_activation"]
+    assert backward_out.dprob is symmetric_buffers["dprob"]
+
     with monkeypatch.context() as patch:
         remote = (candidate,)
         patch.setattr(autotune_module.dist, "get_world_size", lambda group: 2)
@@ -311,10 +341,19 @@ def test_autotune_api_transactions(monkeypatch):
             "fc2_b",
             "fc2_sfb",
         )
+        symmetric_buffers = {
+            "output": object(),
+            "grad_activation": object(),
+            "dprob": object(),
+        }
 
         class TrainingState:
             def public_requirements(self):
                 return {name: None for name in requirement_names}
+
+            def public_symmetric_buffers(self, lane):
+                assert lane == 0
+                return symmetric_buffers
 
             def views(self, *, lane, token_count):
                 return lane, token_count
@@ -373,7 +412,11 @@ def test_autotune_api_transactions(monkeypatch):
         patch.setattr(
             autotune_module,
             "allocate_training_outputs",
-            lambda requirements, device: (forward_outputs, backward_outputs),
+            lambda requirements, device, symmetric: (
+                (forward_outputs, backward_outputs)
+                if symmetric is symmetric_buffers
+                else pytest.fail("autotune used the wrong symmetric buffers")
+            ),
         )
         patch.setattr(
             autotune_module,
@@ -507,7 +550,7 @@ def test_autotune_sm107_inference_training_and_graph():
         intermediate_size=256,
         top_k=2,
         max_tokens_per_rank=training_args[0].shape[0],
-        max_recv_size_per_rank=(training_args[0].shape[0] * training_args[3].shape[1]),
+        max_recv_size_per_rank=2 * 128,
         drop_on_overflow=True,
         combine_format="bf16",
         weight_interleave_size=32,
@@ -534,11 +577,12 @@ def test_autotune_sm107_inference_training_and_graph():
         )
         _print_candidate_timings("training", result)
         requirements = op.prepare_training(lane_count=1, device=device)
+        lane = op.training_lanes[0]
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
+            op.training_symmetric_buffers(lane),
         )
-        lane = op.training_lanes[0]
         actual_y = op.training_forward(
             lane,
             training_args[0],

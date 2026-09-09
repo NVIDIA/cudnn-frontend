@@ -161,7 +161,7 @@ class WorkspaceRequirements:
         backward_symmetric_regions = (BufferRegion("backward_dprob", backward_dprob_bytes),) if backward_dprob_bytes else ()
         symmetric_regions = (
             BufferRegion("activation_data", tokens * hidden),
-            BufferRegion("activation_scale", tokens * kernel_sf_columns),
+            BufferRegion("activation_scale", round_up(tokens, 128) * kernel_sf_columns),
             BufferRegion("topk_weights", tokens * top_k * 4),
             BufferRegion("output_data", tokens * hidden * 2),
             *backward_symmetric_regions,

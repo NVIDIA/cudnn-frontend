@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 
+from ..._math import round_up
 from ..._types import (
     BlockScaledTensor,
     MoeEpNativeBackwardWeights,
@@ -77,7 +78,7 @@ def _activation_views(
         _typed_view(
             workspace.symmetric["activation_scale"],
             torch.float8_e8m0fnu,
-            (capacity, padded_mxfp8_scale_columns(hidden)),
+            (round_up(capacity, 128), padded_mxfp8_scale_columns(hidden)),
         ),
     )
 
@@ -108,14 +109,23 @@ def _stage_input(
 
     token_count = int(value.logical_shape[0])
     scale_columns = int(value.scale.shape[1])
-    activation_data.zero_()
-    activation_sf.zero_()
+    data_in_place = value.data.data_ptr() == activation_data.data_ptr()
+    scale_in_place = value.scale.data_ptr() == activation_sf.data_ptr()
+    if data_in_place != scale_in_place:
+        raise ValueError(
+            "MXFP8 training input data and scale must either both use the "
+            "lane's symmetric buffers or neither use them"
+        )
+    if not data_in_place:
+        activation_data.zero_()
+        activation_sf.zero_()
     routing_topk_idx.fill_(-1)
     routing_topk_weights.zero_()
     if token_count == 0:
         return
-    activation_data[:token_count].copy_(value.data)
-    activation_sf[:token_count, :scale_columns].copy_(value.scale)
+    if not data_in_place:
+        activation_data[:token_count].copy_(value.data)
+        activation_sf[:token_count, :scale_columns].copy_(value.scale)
     routing_topk_idx[:token_count].copy_(topk_idx)
     routing_topk_weights[:token_count].copy_(topk_weights)
 
@@ -188,8 +198,13 @@ def launch_training_forward(
         raise ValueError("out.fc1_sfa storage does not match the forward producer ABI: " f"{col_quant_sf.numel()} != {expected_elements}")
     valid_route_counts = out.valid_route_counts
     expert_offsets = out.expert_offsets
+    if out.output.data_ptr() != scratch.forward_output.data_ptr():
+        raise ValueError(
+            "out.output must be the lane's symmetric output buffer from "
+            "training_symmetric_buffers()"
+        )
 
-    scratch.forward_output.zero_()
+    out.output.zero_()
     scratch.forward_overflow.zero_()
     col_quant_data.zero_()
     # E8M0 byte 127 encodes scale 1.0. The producer only overwrites active
@@ -205,7 +220,7 @@ def launch_training_forward(
         topk_scores=scratch.routing_topk_weights,
         weights=forward_native_to_kernel(weights),
         fc1_c=fc1_preact,
-        output_data=scratch.forward_output,
+        output_data=out.output,
         col_quant_data=col_quant_data,
         col_quant_sf=col_quant_sf,
         overflow_flag=scratch.forward_overflow,
@@ -235,7 +250,6 @@ def launch_training_forward(
     state.apply_overflow(lane=scratch.index, phase="forward")
 
     output = out.output[:token_count]
-    output.copy_(scratch.forward_output[:token_count])
     _runtime_debug("training-forward.end", lane=scratch.index)
     return output
 
@@ -308,10 +322,20 @@ def launch_training_backward(
     fc1_col_output_sf = out.fc1_sfb
     grad_y2 = out.fc2_b
     grad_y2_sf = out.fc2_sfb.view(torch.uint8).reshape(-1)
+    if out.grad_activation.data_ptr() != scratch.backward_output.data_ptr():
+        raise ValueError(
+            "out.grad_activation must be the lane's symmetric grad_activation "
+            "buffer from training_symmetric_buffers()"
+        )
+    if out.dprob.data_ptr() != scratch.dprob.data_ptr():
+        raise ValueError(
+            "out.dprob must be the lane's symmetric dprob buffer from "
+            "training_symmetric_buffers()"
+        )
 
-    scratch.backward_output.zero_()
+    out.grad_activation.zero_()
     scratch.backward_overflow.zero_()
-    scratch.dprob.zero_()
+    out.dprob.zero_()
     fc1_recompute.zero_()
     fc1_recompute_sf.view(torch.uint8).fill_(127)
     fc1_col_output.zero_()
@@ -333,9 +357,9 @@ def launch_training_backward(
         fc2_weight_sf=kernel_weights.fc2_weight_sf,
         beta=state.beta,
         fc1_preact=fc1_preact,
-        output_activation=scratch.backward_output,
+        output_activation=out.grad_activation,
         overflow_flag=scratch.backward_overflow,
-        dprob=scratch.dprob,
+        dprob=out.dprob,
         fc1_recompute=fc1_recompute,
         fc1_recompute_sf=fc1_recompute_sf,
         fc1_col_output=fc1_col_output,
@@ -360,10 +384,8 @@ def launch_training_backward(
     state.apply_overflow(lane=scratch.index, phase="backward")
 
     grad_activation = out.grad_activation[:token_count]
-    grad_activation.copy_(scratch.backward_output[:token_count])
 
     dprob = out.dprob[:token_count]
-    dprob.copy_(scratch.dprob[:token_count])
 
     operands = assemble_training_wgrad_operands(
         fc1_a=fc1_a,

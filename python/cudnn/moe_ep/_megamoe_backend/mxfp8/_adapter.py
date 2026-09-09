@@ -429,8 +429,11 @@ class Mxfp8InputAdapter:
             _MXFP8_DATA_DTYPE,
             (capacity, config.hidden),
         )
+        activation_scale_bytes = (
+            capacity * padded_sf_columns * _MXFP8_SCALE_DTYPE.itemsize
+        )
         activation_sf = _typed_view(
-            symmetric["activation_scale"],
+            symmetric["activation_scale"][:activation_scale_bytes],
             _MXFP8_SCALE_DTYPE,
             (capacity, padded_sf_columns),
         )

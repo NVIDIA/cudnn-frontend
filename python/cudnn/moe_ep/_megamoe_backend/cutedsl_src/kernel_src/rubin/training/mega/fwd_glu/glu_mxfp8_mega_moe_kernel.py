@@ -304,9 +304,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         local_rank = problem_desc["local_rank"]
         num_topk = problem_desc["topk"]
         max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
-        max_recv_size_per_rank = min(
-            problem_desc["max_recv_size_per_rank"], world_size * max_tokens_per_rank * num_topk
-        )
+        max_recv_size_per_rank = problem_desc["max_recv_size_per_rank"]
         hidden = problem_desc["hidden_size"]
         gate_up_clamp = problem_desc["gate_up_clamp"]
         combine_format = problem_desc["combine_format"]

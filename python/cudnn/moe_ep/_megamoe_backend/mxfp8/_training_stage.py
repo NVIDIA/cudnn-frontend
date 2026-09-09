@@ -9,6 +9,7 @@ import threading
 
 import torch
 
+from ..._math import round_up
 from ._launch import _to_cute
 
 
@@ -54,7 +55,7 @@ class Mxfp8TrainingStager:
         if (
             output_sf.dtype is not torch.float8_e8m0fnu
             or output_sf.ndim != 2
-            or output_sf.shape[0] != output.shape[0]
+            or output_sf.shape[0] != round_up(output.shape[0], 128)
             or output_sf.shape[1] < logical_sf_columns
             or not output_sf.is_contiguous()
         ):
