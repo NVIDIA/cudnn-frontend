@@ -358,8 +358,10 @@ kernel. It does not rewrite DLPack capsules or insert a Python transpose. XLA ma
 still insert layout conversions when surrounding operations use incompatible
 physical layouts; this is not a universal zero-copy guarantee.
 
-Cached plans retain static configuration and kernel objects, never input arrays
-or pointers. `bucket_size_blocks` optionally controls backward query buckets;
+Two cached call builders retain static configuration and kernel objects, never
+input arrays or pointers. XLA handles compilation and execution; there is no
+separate plan lifecycle. One `custom_vjp` registration connects forward and
+backward. `bucket_size_blocks` optionally controls backward query buckets;
 the default reuses the torch path's heuristic. Multi-device placement and cache
 portability across architectures require further qualification.
 
