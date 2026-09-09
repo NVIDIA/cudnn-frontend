@@ -133,6 +133,19 @@ def scan_rows_per_warp(need_rows: int, grid_y: int, num_sms: int) -> int:
             return rows
 
 
+def scan_geometry(total_tokens: int, batch_size: int, b_t: int, n_heads_out: int, gate_channels: int, num_sms: int):
+    """Shared scan launch geometry for Python execution and exported host programs."""
+    need_rows = chunk_scratch_rows(total_tokens, batch_size, b_t)
+    grid_y = n_heads_out if gate_channels > 0 else -(-n_heads_out // WARP_SIZE)
+    scan_rows = scan_rows_per_warp(need_rows, grid_y, num_sms)
+    n_scan_blocks = -(-need_rows // (SCAN_WARPS * scan_rows))
+    n_scan_ctas = min(
+        n_scan_blocks,
+        max(max(1, SCAN_CTA_CAP * num_sms // grid_y), -(-n_scan_blocks // SCAN_BLOCK_LOOP_MAX)),
+    )
+    return scan_rows, n_scan_blocks, n_scan_ctas
+
+
 def chunk_scratch_rows(total_tokens: int, batch_size: int, b_t: int) -> int:
     """Rows of the ``(rows, HO)`` fp32 chunk-value scratch: per-batch chunk
     ranges are based at ``cu[b] // b_t + b``, so one extra row per sequence
@@ -1457,14 +1470,7 @@ def build_split_table(
     batch_size = cu_seqlens.shape[0] - 1
     gate_elem_bytes = get_dtype(gate.dtype).width // 8
     n_walk_ctas = batch_size * n_heads_out
-    need_rows = chunk_scratch_rows(gate.shape[0] * int(expand_num), batch_size, b_t)
-    grid_y = n_heads_out if gate_channels > 0 else -(-n_heads_out // WARP_SIZE)
-    scan_rows = scan_rows_per_warp(need_rows, grid_y, num_sms)
-    n_scan_blocks = -(-need_rows // (SCAN_WARPS * scan_rows))
-    n_scan_ctas = min(
-        n_scan_blocks,
-        max(max(1, SCAN_CTA_CAP * num_sms // grid_y), -(-n_scan_blocks // SCAN_BLOCK_LOOP_MAX)),
-    )
+    scan_rows, n_scan_blocks, n_scan_ctas = scan_geometry(gate.shape[0] * int(expand_num), batch_size, b_t, n_heads_out, gate_channels, num_sms)
     overhead_chunks = max(1, OVERHEAD_TOKENS // b_t)
     warmup_cap = warmup_cap_chunks(gate_channels, int(expand_num))
     full_scan = gate_channels == 0

@@ -3,7 +3,7 @@
 
 """First-order JAX KDA using Frost's existing forward and backward kernels."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import lru_cache, partial
 import math
 from typing import NamedTuple
@@ -14,7 +14,9 @@ import numpy as np
 
 import cudnn
 from cudnn.jax.call import call, zeros_init
-from ..kda_graph import build_fprop_graph, build_bprop_graph
+
+PRIMAL_NAMES = ("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias")
+GRADIENT_NAMES = ("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias")
 
 
 @dataclass(frozen=True)
@@ -51,10 +53,6 @@ class KdaGradients(NamedTuple):
     d_initial_state: jax.Array | None
     d_a_log: jax.Array | None
     d_dt_bias: jax.Array | None
-
-
-def tensor_metadata(tensor):
-    return None if tensor is None else (tuple(tensor.shape), np.dtype(tensor.dtype).name)
 
 
 def validate_inputs(primals, config):
@@ -115,100 +113,45 @@ def target_device():
 
 
 @lru_cache(maxsize=128)
-def build_call(
-    metadata,
-    config,
-    device,
-    backward=False,
-    dfs_meta=None,
-    checkpoints_meta=None,
-):
+def build_call(metadata, config, device):
     from cudnn.frost.device import build_device
-    from ..frost.kda_engine import KdaFrostEngine, build_kda
+    from .frost.kda_engine import KdaFrostEngine, build_kda
+    from cutlass.jax import TensorSpec
 
-    q, k, v, g, beta, cu, state, a, dt = metadata
-    total, hq, dk = q[0]
-    hv, dv = v[0][1:]
-    dtype_map = dict(
-        float16=cudnn.data_type.HALF,
-        bfloat16=cudnn.data_type.BFLOAT16,
-        float32=cudnn.data_type.FLOAT,
-        int32=cudnn.data_type.INT32,
-    )
-
-    def dtype(meta):
-        if meta is None:
-            return None
-        if meta[1] not in dtype_map:
-            raise ValueError(f"unsupported KDA dtype: {meta[1]}")
-        return dtype_map[meta[1]]
-
-    kwargs = dict(
-        total=total,
-        N=cu[0][0] - 1,
-        H=hq,
-        HK=k[0][1],
-        HV=hv,
-        K=dk,
-        V=dv,
-        io_dtype=dtype(q),
-        g_dtype=dtype(g),
-        beta_dtype=dtype(beta),
-        state_dtype=dtype(state),
-        cu_dtype=dtype(cu),
-        scale=config.scale,
-        use_qk_l2norm=config.use_qk_l2norm_in_kernel,
-        batch_invariant=config.batch_invariant,
-        use_beta_sigmoid=config.use_beta_sigmoid_in_kernel,
-        allow_neg_eigval=config.allow_neg_eigval,
-        safe_gate=config.safe_gate,
-        gate_lower_bound=config.gate_lower_bound,
-        a_log_dtype=dtype(a),
-        dt_bias_dtype=dtype(dt),
-    )
-    if backward:
-        graph, _ = build_bprop_graph(
-            **kwargs,
-            dstate_in_dtype=dtype(dfs_meta),
-            checkpoint_rows=checkpoints_meta[0][0] if checkpoints_meta else None,
-            checkpoint_every_n_tokens=config.checkpoint_every_n_tokens,
-        )
+    data_types = dict(float16=cudnn.data_type.HALF, bfloat16=cudnn.data_type.BFLOAT16, float32=cudnn.data_type.FLOAT, int32=cudnn.data_type.INT32)
+    graph = cudnn.pygraph()
+    tensors = {}
+    for name, shape, dtype in metadata:
+        if dtype not in data_types:
+            raise ValueError(f"unsupported KDA dtype: {dtype}")
+        tensors[name] = graph.tensor(shape, data_type=data_types[dtype], name=name)
+    attributes = asdict(config)
+    attributes["use_qk_l2norm"] = attributes.pop("use_qk_l2norm_in_kernel")
+    attributes["use_beta_sigmoid"] = attributes.pop("use_beta_sigmoid_in_kernel")
+    if "dO" in tensors:
+        attributes.pop("output_final_state")
+        attributes["checkpoint_every_n_tokens"] = config.checkpoint_every_n_tokens or None
+        graph.kda_bwd(**tensors, **attributes)
+        output_sources = dict(zip(GRADIENT_NAMES, PRIMAL_NAMES[:5] + PRIMAL_NAMES[6:]))
     else:
-        graph, _ = build_fprop_graph(
-            **kwargs,
-            output_final_state=config.output_final_state,
-            checkpoint=config.checkpoint_every_n_tokens,
-        )
+        graph.kda(**tensors, **attributes)
+        output_sources = dict(O="q", final_state="initial_state", state_checkpoints="q")
     node = graph.nodes[0]
-    output_dtypes = dict(
-        O=dtype(q),
-        final_state=dtype(state) or cudnn.data_type.FLOAT,
-        state_checkpoints=dtype(q),
-        dQ=dtype(q),
-        dK=dtype(k),
-        dV=dtype(v),
-        dG=dtype(g),
-        dBeta=dtype(beta),
-        d_initial_state=dtype(state),
-        d_a_log=dtype(a),
-        d_dt_bias=dtype(dt),
-    )
     for name, tensor in node.outputs.items():
-        tensor.set_output(True).set_data_type(output_dtypes[name])
+        source = tensors.get(output_sources[name])
+        dtype = source.get_data_type() if source is not None else cudnn.data_type.FLOAT
+        tensor.set_output(True).set_data_type(dtype)
     with build_device(device):
         graph.validate()
         KdaFrostEngine().check_support(graph)
         plan = build_kda(graph)
-    from ..frost.kda_launch import make_launcher
+    from .frost.kda_launch import make_launcher
 
     input_names, output_names = tuple(node.inputs), tuple(node.outputs)
-    reverse_dtype = {v: k for k, v in dtype_map.items()}
+    reverse_dtype = {v: k for k, v in data_types.items()}
     shapes = tuple(jax.ShapeDtypeStruct(tuple(t.dim), reverse_dtype[t.get_data_type()]) for t in node.outputs.values())
     workspace = jax.ShapeDtypeStruct((plan.workspace_bytes(),), jnp.uint8)
     initialized = {i: zeros_init for i, name in enumerate(output_names) if name == "state_checkpoints"}
-    from cutlass.jax import TensorSpec
-
-    in_shapes = [tuple(t.dim) for t in node.inputs.values()]
 
     def specs(shapes):
         return tuple(TensorSpec(layout=tuple(reversed(range(len(s))))) for s in shapes)
@@ -216,7 +159,7 @@ def build_call(
     invoke = call(
         make_launcher(plan, input_names, output_names),
         output_shape_dtype=shapes + (workspace,),
-        input_spec=specs(in_shapes),
+        input_spec=specs([t.dim for t in node.inputs.values()]),
         output_spec=specs([s.shape for s in shapes + (workspace,)]),
         initialized_outputs=initialized,
         use_static_tensors=True,
@@ -224,28 +167,18 @@ def build_call(
     return invoke, input_names, output_names
 
 
+def execute(primals, config, **backward_inputs):
+    values = dict(zip(PRIMAL_NAMES, primals))
+    values.update(backward_inputs)
+    metadata = tuple((name, tuple(value.shape), np.dtype(value.dtype).name) for name, value in values.items() if value is not None)
+    invoke, inputs, outputs = build_call(metadata, config, target_device())
+    return dict(zip(outputs, invoke(*(values[name] for name in inputs))[:-1]))
+
+
 def forward(primals, config):
     validate_inputs(primals, config)
-    invoke, inputs, outputs = build_call(tuple(map(tensor_metadata, primals)), config, target_device())
-    values = dict(
-        zip(
-            (
-                "q",
-                "k",
-                "v",
-                "g",
-                "beta",
-                "cu_seqlens",
-                "initial_state",
-                "a_log",
-                "dt_bias",
-            ),
-            primals,
-        )
-    )
-    results = dict(zip(outputs, invoke(*(values[n] for n in inputs))[:-1]))
-    residual = KdaResidual(primals, results.get("state_checkpoints"), config)
-    return results["O"], results.get("final_state"), residual
+    results = execute(primals, config)
+    return results["O"], results.get("final_state"), KdaResidual(primals, results.get("state_checkpoints"), config)
 
 
 def kimi_delta_attention_fwd(
@@ -297,62 +230,23 @@ def kimi_delta_attention_bwd(residual, doutput, *, d_final_state=None):
         shape = (cu.shape[0] - 1, g.shape[1], v.shape[2], q.shape[2])
         if d_final_state.shape != shape or d_final_state.dtype != (state.dtype if state is not None else jnp.float32):
             raise ValueError("d_final_state must match the forward final state shape and dtype")
-    invoke, inputs, outputs = build_call(
-        tuple(map(tensor_metadata, primals)),
-        config,
-        target_device(),
-        backward=True,
-        dfs_meta=tensor_metadata(d_final_state),
-        checkpoints_meta=tensor_metadata(residual.checkpoints),
-    )
-    values = dict(
-        zip(
-            (
-                "q",
-                "k",
-                "v",
-                "g",
-                "beta",
-                "cu_seqlens",
-                "initial_state",
-                "a_log",
-                "dt_bias",
-            ),
-            primals,
-        )
-    )
-    values.update(dO=doutput, d_final_state=d_final_state, state_checkpoints=residual.checkpoints)
-    results = dict(zip(outputs, invoke(*(values[n] for n in inputs))[:-1]))
-    return KdaGradients(
-        *(
-            results.get(n)
-            for n in (
-                "dQ",
-                "dK",
-                "dV",
-                "dG",
-                "dBeta",
-                "d_initial_state",
-                "d_a_log",
-                "d_dt_bias",
-            )
-        )
-    )
+    results = execute(primals, config, dO=doutput, d_final_state=d_final_state, state_checkpoints=residual.checkpoints)
+    return KdaGradients(*(results.get(name) for name in GRADIENT_NAMES))
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(9,))
-def differentiable(q, k, v, g, beta, cu, state, a, dt, config):
-    return forward((q, k, v, g, beta, cu, state, a, dt), config)[:2]
+@partial(jax.custom_vjp, nondiff_argnums=(1,))
+def differentiable(primals, config):
+    return forward(primals, config)[:2]
 
 
-def vjp_forward(q, k, v, g, beta, cu, state, a, dt, config):
-    o, fs, residual = forward((q, k, v, g, beta, cu, state, a, dt), config)
+def vjp_forward(primals, config):
+    o, fs, residual = forward(primals, config)
     return (o, fs), residual
 
 
 def vjp_backward(config, residual, cotangents):
     grads = kimi_delta_attention_bwd(residual, cotangents[0], d_final_state=cotangents[1])
-    return (*grads[:5], None, *grads[5:])
+    return ((*grads[:5], None, *grads[5:]),)
 
 
 differentiable.defvjp(vjp_forward, vjp_backward)
@@ -397,4 +291,4 @@ def kimi_delta_attention(
         batch_invariant,
         checkpoint_every_n_tokens,
     )
-    return differentiable(q, k, v, g, beta, cu_seqlens, initial_state, a_log, dt_bias, config)
+    return differentiable((q, k, v, g, beta, cu_seqlens, initial_state, a_log, dt_bias), config)

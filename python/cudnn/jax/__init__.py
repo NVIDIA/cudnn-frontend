@@ -41,7 +41,7 @@ def __getattr__(name):
         "KdaResidual",
         "KdaGradients",
     ):
-        from cudnn.linear_attention.jax import kda
+        from cudnn.linear_attention import jax_api as kda
 
         value = getattr(kda, name)
         globals()[name] = value
