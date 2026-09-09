@@ -7,6 +7,12 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
 - `import cudnn` must work **without** torch/cutlass/cuda-python installed. Everything that needs them is exported lazily via `_LAZY_OPTIONAL_IMPORTS` in `__init__.py` — a module-level `__getattr__` imports the submodule on first attribute access and re-raises failures as `ImportError` that names the missing framework module (torch, jax, cuda-python) alongside the base `pip install nvidia-cudnn-frontend` hint — or, for a CuTe DSL below `CUTEDSL_MIN_VERSION`, points at the DSL upgrade (Rule 7).
 - Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
 - Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
+- A lazy public function and a same-named subpackage can collide: importing the
+  subpackage writes a module onto the parent, bypassing its `__getattr__` on the
+  next access. When both APIs coexist, preserve the public function and test
+  both public access orders in fresh subprocesses, checking identity as well
+  as callability. See `test_native_and_semantic_forward_exports_survive_import_order`
+  for the native/semantic DSA forward collision.
 
 ## Hard rules
 
