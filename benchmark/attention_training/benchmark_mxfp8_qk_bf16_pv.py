@@ -156,7 +156,9 @@ def _frost_kernel_time_us(prof) -> float:
     kernels = [
         item
         for item in prof.key_averages()
-        if item.key.startswith(("cudnn_frost_", "kernel_cutlass"))
+        if item.key.startswith(
+            ("cudnn_frost_", "kernel_cutlass", "cudnn_kernel__")
+        )
     ]
     if kernels:
         return sum(item.device_time_total for item in kernels)
