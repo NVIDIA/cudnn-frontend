@@ -21,6 +21,12 @@ def test_context_fp8_thd(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("test_no", suite_seeds("context.fp8.chunked"), ids=lambda p: f"test{p[0]}")
-def test_context_fp8_chunked(env_info, test_no, request, cudnn_handle):
-    run_suite("context.fp8.chunked", env_info, test_no, request, cudnn_handle)
+@pytest.mark.parametrize("test_no", suite_seeds("context.fp8.dense_chunked"), ids=lambda p: f"test{p[0]}")
+def test_context_fp8_dense_chunked(env_info, test_no, request, cudnn_handle):
+    run_suite("context.fp8.dense_chunked", env_info, test_no, request, cudnn_handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("test_no", suite_seeds("context.fp8.thd_chunked"), ids=lambda p: f"test{p[0]}")
+def test_context_fp8_thd_chunked(env_info, test_no, request, cudnn_handle):
+    run_suite("context.fp8.thd_chunked", env_info, test_no, request, cudnn_handle)
