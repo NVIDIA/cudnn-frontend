@@ -67,22 +67,23 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 
 from dataclasses import dataclass
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128
+from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d128
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d128(PARAMS)
-# Rubin geometry, baked post-validation (this module is only ever loaded for
-# cc10.7 by the adapter): dense-FP8 K=64 steps and the 9-stage KV ring. The
-# TMA iteration constants depend only on TILE_K/TILE_O/BPE/swizzle, so _TMA
-# is unaffected.
-import dataclasses as _dc
-
-CFG = _dc.replace(CFG, TILE_K_HW_BMM1=64, TILE_K_HW_BMM2=64, STAGES_KV=9)
+# Rubin's dense-FP8 MMA runs K=64 per instruction, and every
+# ``Tcgen05InstrDesc.build`` site in this body hardcodes the matching idesc
+# ``k_dim=1``.  ``config_sm107.tile_k_hw()`` derives the 64; this guard is the
+# tripwire for the pairing, which is arch-OPPOSITE (Blackwell wants k_dim=0 with
+# TILE_K_HW=32) and fails SILENTLY -- a mismatch scrambles rows of the
+# accumulator rather than raising (rules/mma-tma-matrix.md S1).
+if CFG.TILE_K_HW_BMM1 != 64 or CFG.TILE_K_HW_BMM2 != 64:
+    raise ValueError(f"{__name__}: this body's idesc k_dim=1 requires TILE_K_HW=64 on Rubin; " f"got BMM1={CFG.TILE_K_HW_BMM1} BMM2={CFG.TILE_K_HW_BMM2}")
 Cfg = type(CFG)
 
-# Static SMEM accounting for the post-override geometry.  The 9-stage ring
+# Static SMEM accounting for the Rubin geometry.  The 9-stage ring
 # with BF16/FP16 O (~241 KiB) exceeds the STANDARD sm_10x 227 KiB per-CTA
 # opt-in, and is legal on GR100 only through the sm107 oversized-SMEM
 # launch mode (function attribute 16), which the required internal
@@ -172,7 +173,7 @@ else:
 # P -> fp8 cast bias (BAKED constant — NOT cuDNN's Scale_S; that pair is
 # accepted and ignored). P is quantized as P * 2**P_CAST_LOG2_SCALE: the
 # lazy-rescale skip bounds P by 2**RESCALE_THRESHOLD (4.0 for fp8, see
-# config_sm100.rescale_threshold), so the cast peaks at 2^(4+4) = 256 < 448
+# config_sm107.rescale_threshold), so the cast peaks at 2^(4+4) = 256 < 448
 # (e4m3 max) — no saturation — while flat-row entries (P ~ 1/S) sit four
 # binades above e4m3's subnormal cliff (quantization stays normal out to
 # S ~ 2^13). The bias rides the exp2 argument, so total_sum accumulates in

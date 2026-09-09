@@ -39,8 +39,43 @@ pytestmark = [requires_blackwell, requires_dsl]
 # under test. The d192xd128 kernel flavor exists on the sm100 engine only.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
 _skip_on_rubin = pytest.mark.skipif(_SM == 107, reason="the d192xd128 per-tensor FP8 flavor has no Rubin kernel (sm107 serves d128 only)")
-_skip_d256_on_rubin = pytest.mark.skipif(_SM == 107, reason="the d256xd256 per-tensor FP8 flavor has no Rubin kernel (sm107 serves d128 only)")
+# d256 is SERVED on Rubin as of the SM107 port -- kept as a no-op marker so
+# the many _D128_D256 call sites need no churn.
+_skip_d256_on_rubin = pytest.mark.skipif(False, reason="d256 per-tensor FP8 is served on Rubin")
 _D128_D256 = [pytest.param(128, id="d128"), pytest.param(256, id="d256", marks=_skip_d256_on_rubin)]
+# Same gate, accurate for ANY flavor wider than d128 (the d192xd128 THD case
+# below needs it too, and the d256-specific wording would read wrong there).
+# Only d192xd128 lacks a Rubin per-tensor FP8 kernel now.
+_skip_wide_fp8_on_rubin = pytest.mark.skipif(False, reason="d256/d512 per-tensor FP8 are served on Rubin")
+
+# Rubin serves per-tensor FP8 at d128/d256/d512, but its THD and PackGQA legs
+# are d128-ONLY -- the row says so per shape (`thd_d_shapes` /
+# `pack_gqa_d_shapes` are both frozenset({(128, 128)})), so a d256/d512 THD or
+# PackGQA graph is DECLINED and the test cannot run.  Honest capability gaps,
+# not kernel bugs; flip the condition when the ported kernels grow the legs.
+_skip_wide_thd_on_rubin = pytest.mark.skipif(
+    _SM == 107,
+    reason="THD/varlen is d128-only on the Rubin FP8 line (row: thd_d_shapes={(128,128)})",
+)
+_skip_wide_pack_gqa_on_rubin = pytest.mark.skipif(
+    _SM == 107,
+    reason="PackGQA is d128-only on the Rubin FP8 line (row: pack_gqa_d_shapes={(128,128)})",
+)
+_D128_D256_THD = [pytest.param(128, id="d128"), pytest.param(256, id="d256", marks=_skip_wide_thd_on_rubin)]
+_D128_D256_PACK_GQA = [pytest.param(128, id="d128"), pytest.param(256, id="d256", marks=_skip_wide_pack_gqa_on_rubin)]
+
+# The PORTED d256/d512 Rubin FP8 kernels carry neither a strided-Stats store
+# (compile() raises "strided Stats not ported (contiguous [B, H, S] only)") nor
+# the per-batch seq_len_q O/LSE trim (row: padded_stats / dense_seq_q_trim are
+# both off for the Rubin line).  Honest declines; flip when either lands.
+_skip_wide_strided_stats_on_rubin = pytest.mark.skipif(
+    _SM == 107,
+    reason="strided Stats not ported to the wide Rubin FP8 kernels (contiguous [B,H,S] only)",
+)
+_skip_dense_q_trim_on_rubin = pytest.mark.skipif(
+    _SM == 107,
+    reason="dense padded-Q O/LSE trim not carried by the Rubin kernels (row: dense_seq_q_trim=False)",
+)
 
 _FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 _FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
@@ -323,8 +358,10 @@ _MASKS = {
 
 
 def _check_fp8_strided_stats(d_qk, d_v, in_key):
-    if torch.cuda.get_device_capability() == (10, 7) and d_qk != 128:
-        pytest.skip("SM107 per-tensor FP8 supports only d128")
+    # Rubin now ships d128/d256/d512 per-tensor FP8; d192xd128 still has no
+    # sibling there, so that one flavor stays skipped.
+    if torch.cuda.get_device_capability() == (10, 7) and (d_qk, d_v) == (192, 128):
+        pytest.skip("SM107 per-tensor FP8 has no d192xd128 kernel")
     kwargs = dict(
         B=2,
         H_q=4,
@@ -614,6 +651,7 @@ def test_fp8_d256_masks(in_key, mask):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
+@_skip_wide_strided_stats_on_rubin
 @pytest.mark.L1
 @_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
@@ -702,6 +740,7 @@ def test_fp8_d256_padding(in_key, causal):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
+@_skip_dense_q_trim_on_rubin
 @pytest.mark.L1
 @_skip_d256_on_rubin
 @torch_fork_set_rng(seed=0)
@@ -822,7 +861,7 @@ def test_fp8_gqa(in_key):
     [(8, 4), (8, 2), (8, 1), (16, 1)],
     ids=["g2", "g4", "g8_mqa", "g16_mqa"],
 )
-@pytest.mark.parametrize("d", _D128_D256)
+@pytest.mark.parametrize("d", _D128_D256_PACK_GQA)
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_ratios(d, h_q, h_kv):
     """Packed plans across GQA ratios, causal, tile-unaligned s_q, LSE checked."""
@@ -865,7 +904,7 @@ def test_fp8_pack_gqa_tiles(s_q):
     "mask",
     ["none_padded", "causal", "causal_br", "swa", "sink_causal"],
 )
-@pytest.mark.parametrize("d", _D128_D256)
+@pytest.mark.parametrize("d", _D128_D256_PACK_GQA)
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_features(d, mask, out_dt):
     """Packed plans x the fp8 mask/sink envelope x both output dtypes."""
@@ -906,7 +945,7 @@ def test_fp8_pack_gqa_features(d, mask, out_dt):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("d", _D128_D256)
+@pytest.mark.parametrize("d", _D128_D256_PACK_GQA)
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_e5m2(d):
     """Packed e5m2 input path."""
@@ -1380,7 +1419,18 @@ def test_fp8_d192_d128_thd_features():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_d128", "d256"])
+# Rubin serves d128 only on this row, so the two wider flavors have no kernel
+# there -- same gate _D128_D256 applies, spelled out because this list is
+# inline.  Without it the test pins sdpa_fwd_prefill_sm107_fp8 for a shape
+# the row correctly declines and fails with "no plan for engine".
+@pytest.mark.parametrize(
+    "d_qk,d_v",
+    [
+        pytest.param(128, 128, id="d128"),
+        pytest.param(192, 128, id="d192_d128", marks=_skip_wide_thd_on_rubin),
+        pytest.param(256, 256, id="d256", marks=_skip_wide_thd_on_rubin),
+    ],
+)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_multi_unit_per_cta(monkeypatch, d_qk, d_v):
     """THD where a cluster claims more than one unit (issue #618).
@@ -1396,6 +1446,7 @@ def test_fp8_thd_multi_unit_per_cta(monkeypatch, d_qk, d_v):
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
+@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
@@ -1418,7 +1469,7 @@ def test_fp8_d256_thd(in_key, causal):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", _D128_D256)
+@pytest.mark.parametrize("d", _D128_D256_THD)
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("bottom_right", [False, True])
 @torch_fork_set_rng(seed=0)
@@ -1445,7 +1496,7 @@ def test_fp8_thd_sliding_window(d, in_key, bottom_right):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", _D128_D256)
+@pytest.mark.parametrize("d", _D128_D256_THD)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_cross_gqa(d):
     """THD cross-attention (unequal packed Q and K/V totals) with GQA heads."""
@@ -1455,7 +1506,7 @@ def test_fp8_thd_cross_gqa(d):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", _D128_D256)
+@pytest.mark.parametrize("d", _D128_D256_THD)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_sink(d):
     """THD causal + attention sink."""
@@ -1466,7 +1517,7 @@ def test_fp8_thd_sink(d):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", _D128_D256)
+@pytest.mark.parametrize("d", _D128_D256_THD)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_stats(d):
     """THD + generate_stats: the ragged token-major TH1 LSE is written next to O."""
@@ -1477,7 +1528,7 @@ def test_fp8_thd_stats(d):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", _D128_D256)
+@pytest.mark.parametrize("d", _D128_D256_THD)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_zero_len_kv(d):
     """Zero-length Q and KV sequences (test_mhas_v2 ragged parity, e.g.
@@ -1493,7 +1544,7 @@ def test_fp8_thd_zero_len_kv(d):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", _D128_D256)
+@pytest.mark.parametrize("d", _D128_D256_THD)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_cu_seq_len(d):
     """THD via the (B+1,) cu_seq_len prefix-sum length form."""
@@ -1596,7 +1647,7 @@ def test_fp8_sm100_device_scales_execute_reads_no_device_memory():
 # kernel, so this whole section is sm100-only.
 # ===========================================================================
 
-_skip_d512_on_rubin = pytest.mark.skipif(_SM == 107, reason="the d512 per-tensor FP8 flavor has no Rubin kernel (sm107 serves d128 only)")
+_skip_d512_on_rubin = pytest.mark.skipif(False, reason="d512 per-tensor FP8 is served on Rubin")
 _D512 = 512
 _D512_SCALE = 1.0 / math.sqrt(_D512)
 
@@ -1685,6 +1736,7 @@ def test_fp8_d512_multi_tile():
 # --- d512 THD / varlen -----------------------------------------------------
 
 
+@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @_skip_d512_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
@@ -1697,6 +1749,7 @@ def test_fp8_d512_thd(in_key, causal):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
+@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
@@ -1707,6 +1760,7 @@ def test_fp8_d512_thd_cross_gqa():
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
+@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
@@ -1719,6 +1773,7 @@ def test_fp8_d512_thd_sink_stats():
     assert diff <= 5e-2, f"max|LSE-ref| = {diff:.4f}"
 
 
+@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
@@ -1741,6 +1796,7 @@ def test_fp8_d512_thd_zero_len_kv():
     _check(out, o_ref, torch.float16, "e5m2", a_o, a_o_ref)
 
 
+@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
@@ -1812,4 +1868,5 @@ def test_fp8_d512_mxfp8_declines():
 
     assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
     assert (512, 512) not in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
-    assert (512, 512) not in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
+    # INVERTED 2026-09-04: Rubin gained the d512 per-tensor FP8 kernel.
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))

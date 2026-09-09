@@ -127,6 +127,24 @@ class SmemTile:
     tma_granu_elems: int = 0
     tma_subtile_stride_elems: int = 0
     stages: int = 1
+    # tcgen05 SMEM-descriptor version for :meth:`desc`.
+    #
+    # 0 = the public ``Tcgen05SmemDesc.build`` path (SM100 format).  Its
+    # ``start_address`` field is bits [0:15) with bit [14] *reserved on SM100*,
+    # i.e. only 14 usable bits = a 256 KiB addressable window.
+    #
+    # 1 = the extended format, which is what the C++ ``SmemTile::make_desc``
+    # always emitted.  REQUIRED on Rubin (SM107) for any MMA operand whose SMEM
+    # buffer sits at or above 256 KiB — the arch raises the per-CTA SMEM cap to
+    # 327 KiB, but a version-0 descriptor still truncates the address to 14 bits
+    # and silently wraps it to the bottom of SMEM.
+    #
+    # Symptom of getting this wrong: the MMA runs, both operands are provably
+    # correct in SMEM, the accumulator TMEM is the one the epilogue reads — and
+    # the accumulator is EXACTLY zero, because the wrapped address landed on an
+    # untouched buffer.  No crash, no launch error.  (Found 2026-09-04 on the
+    # d512 f16 SM107 port: sP_xfer_raw began at exactly 262144.)
+    desc_version: int = 0
 
     def __getitem__(self, stage):
         off = stage * self.elems_per_stage
@@ -140,11 +158,34 @@ class SmemTile:
     def desc(self):
         from cutlass.experimental import primitives as prims
 
-        return prims.Tcgen05SmemDesc.build(
-            self.base,
-            leading_byte_offset=self.leading_byte_offset,
-            stride_byte_offset=self.stride_byte_offset,
-            layout=self.layout,
+        if self.desc_version == 0:
+            return prims.Tcgen05SmemDesc.build(
+                self.base,
+                leading_byte_offset=self.leading_byte_offset,
+                stride_byte_offset=self.stride_byte_offset,
+                layout=self.layout,
+            )
+
+        # Hand-rolled because the public ``Tcgen05SmemDesc.build`` takes no
+        # ``version`` argument — it calls the non-versioned intrinsic.  The
+        # versioned one exists in the same wheel, just module-private, and the
+        # argument list below mirrors ``build``'s defaults exactly.
+        import cutlass
+        from cutlass._mlir.dialects import llvm
+        from cutlass.experimental.primitives import nvvm_wrapper as _nvvm_wrap
+
+        addr = cutlass.Int32(llvm.ptrtoint(cutlass.Int32.mlir_type, self.base.ir_value()))
+        return prims.Tcgen05SmemDesc(
+            _nvvm_wrap._tcgen05_mma_smem_desc_v2(
+                addr >> cutlass.Int32(4),
+                self.leading_byte_offset >> 4,
+                self.stride_byte_offset >> 4,
+                self.desc_version,
+                0,  # base_offset
+                0,  # leading_dim_mode
+                0,  # k_segment_offset
+                self.layout,
+            )
         )
 
 

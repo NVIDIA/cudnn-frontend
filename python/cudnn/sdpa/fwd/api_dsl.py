@@ -90,7 +90,26 @@ _SM100_MXFP8_KERNEL_FILES = {
     (192, 128): "prefill_d192_d128_mxfp8_sm100.py",
     (256, 256): "prefill_d256_mxfp8_sm100.py",
 }
-_SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
+# Rubin (SM107) siblings.  Separate maps rather than entries in the SM100
+# ones: the lowerings genuinely diverge (dense K=64 FP8 MMA, 576-column TMEM,
+# version-1 tcgen05 SMEM descriptors for operands above 256 KiB), which is the
+# same reason engines.py keeps one row per ARCH LINE.
+_SM107_KERNEL_FILES = {
+    (512, 512): "prefill_d512_f16_sm107.py",
+    (256, 256): "prefill_d256_f16_sm107.py",
+    (192, 128): "prefill_d192_d128_f16_sm107.py",
+    (128, 128): "prefill_d128_f16_sm107.py",
+}
+_SM107_FP8_KERNEL_FILES = {
+    (512, 512): "prefill_d512_fp8_sm107.py",
+    (256, 256): "prefill_d256_fp8_sm107.py",
+    (128, 128): "prefill_d128_fp8_sm107.py",
+}
+_SM107_MXFP8_KERNEL_FILES = {
+    (512, 512): "prefill_d512_mxfp8_sm107.py",
+    (256, 256): "prefill_d256_mxfp8_sm107.py",
+    (128, 128): "prefill_d128_mxfp8_sm107.py",
+}
 _SM100_FP8_KERNEL_FILES = {
     (128, 128): "prefill_d128_fp8_sm100.py",
     (192, 128): "prefill_d192_d128_fp8_sm100.py",
@@ -102,7 +121,7 @@ _SM100_FP8_KERNEL_FILES = {
 def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[tuple[int, int]]:
     """NATIVE (exact) FP8 kernel-flavor shapes for the device line."""
     if device_cc == (10, 7):
-        return frozenset({(128, 128)})
+        return frozenset(_SM107_FP8_KERNEL_FILES if pertensor else _SM107_MXFP8_KERNEL_FILES)
     kernel_files = _SM100_FP8_KERNEL_FILES if pertensor else _SM100_MXFP8_KERNEL_FILES
     return frozenset(kernel_files)
 
@@ -330,13 +349,19 @@ def _load_kernel_template(filename: str, params: Hashable, tag: str):
 
 def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False, rubin: bool = False):
     """Load one SM100-family module for the selected flavor and quantization
-    path.  ``rubin`` routes per-tensor FP8 to the SM107 sibling kernel (the
-    dense K=64 FP8 path baked in — see prefill_d128_fp8_sm107.py)."""
+    path.  ``rubin`` routes EVERY dtype family to its SM107 sibling kernel
+    (dense K=64 FP8 MMA and the version-1 SMEM descriptors baked in — see
+    prefill_d128_fp8_sm107.py and the d256/d512 siblings)."""
 
     tag = _flavor_tag(flavor)
-    if fp8 and pertensor and rubin and flavor == (128, 128):
-        filename = _SM107_FP8_KERNEL_FILE
-        tag = f"sdpa_fwd_sm107_fp8_{tag}"
+    if rubin:
+        # Tag spelling is load-bearing: it keys the template-module cache, and
+        # "sdpa_fwd_sm107_fp8_<flavor>" is what the shipped d128 FP8 row has
+        # always produced -- keep it byte-identical.
+        kind = ("fp8" if pertensor else "mxfp8") if fp8 else "f16"
+        files = (_SM107_FP8_KERNEL_FILES if pertensor else _SM107_MXFP8_KERNEL_FILES) if fp8 else _SM107_KERNEL_FILES
+        filename = files[flavor]
+        tag = f"sdpa_fwd_sm107_{kind}_{tag}"
     elif fp8:
         filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
@@ -1041,15 +1066,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # cc10.0 (SM100) and cc10.3 (Blackwell-class) both run these kernels; cc10.3
         # additionally has the fused LDTM.STAT row-max, auto-enabled for MXFP8 in compile().
         self._device_cc = (major, minor)
-        # cc10.7 (Rubin) is served by the per-tensor FP8 path only, through the
-        # SM107 sibling kernel (dense K=64 FP8; the f16 and MXFP8 kernels'
-        # K=32-QMMA / f16-QMMA geometry has not been ported).
-        if self._fp8 and self._pertensor:
-            _allowed_cc = ((10, 0), (10, 3), (10, 7))
-            _allowed_msg = "cc=10.0/10.3 (Blackwell) or 10.7 (Rubin, per-tensor FP8)"
-        else:
-            _allowed_cc = ((10, 0), (10, 3))
-            _allowed_msg = "cc=10.0 or 10.3 (Blackwell; Rubin cc10.7 serves only the per-tensor FP8 d128 path)"
+        # cc10.7 (Rubin) now runs every dtype family through its own SM107
+        # sibling kernels (f16/bf16, per-tensor FP8 and MXFP8 -- the SM107 port).
+        # The per-arch-line split lives in the kernel FILES and the engine rows;
+        # this adapter serves both lines, so the gate is simply "a cc10.x line
+        # we have kernels for".
+        _allowed_cc = ((10, 0), (10, 3), (10, 7))
+        _allowed_msg = "cc=10.0/10.3 (Blackwell) or 10.7 (Rubin)"
         self._value_error_if(
             self._device_cc not in _allowed_cc,
             f"SdpaFwdDslSm100 requires {_allowed_msg}; found SM{major}{minor} on {device}",
@@ -1057,8 +1080,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         # FP8 flavor shapes: SM100 per-tensor FP8 serves d128/d128,
         # d192/d128, and d256/d256; MXFP8 serves the shapes in its independent
-        # native map. Rubin
-        # currently serves only per-tensor FP8 d128. Per-tensor FP8 serves
+        # native map. Rubin serves d128/d256/d512 in both quantized families
+        # through its SM107 siblings. Per-tensor FP8 serves
         # the dense ENVELOPE of every flavor it has (TMA zero-padding, like
         # the f16 flavors — exact in FP8, and the descales are scalars, so
         # the envelope is arch-independent): head dims componentwise <= a
@@ -1091,24 +1114,28 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"(TMA 16-byte global-stride constraint at 2 bytes/elem); got "
             f"(D_QK={d_qk}, D_V={d_v})",
         )
-        # An FP8 graph must only land on a flavor that HAS an fp8 kernel: the
-        # per-tensor and block-scale families have different native maps.
-        # The FP8 walk must agree with check_support: a flavor whose envelope
-        # floor excludes (d_qk, d_v) is skipped, so the graph lands on the next
-        # covering flavor instead of the one the floor exists to keep it off.
-        self.flavor = _pick_flavor(
-            d_qk,
-            d_v,
-            (
-                tuple(
-                    f
-                    for f in _SM100_FLAVORS
-                    if f in fp8_shapes and (f == (int(d_qk), int(d_v)) or min(int(d_qk), int(d_v)) > _SM100_FP8_ENVELOPE_FLOORS.get(f, 0))
-                )
-                if self._fp8
-                else None
-            ),
-        )
+        # A graph must only land on a flavor that HAS a kernel for its
+        # quantization AND its arch line: the per-tensor and block-scale
+        # families have different native maps, and Rubin ships a strict subset
+        # of the SM100 f16 flavors (no d192xd128 sibling).  Without the Rubin
+        # narrowing a d=192 graph would pick (192, 128) and then KeyError in
+        # _load_sm100_kernel_module; with it, the graph falls to the next
+        # covering envelope exactly as it does for a missing FP8 flavor.
+        # The FP8 walk must also agree with check_support: a flavor whose
+        # envelope floor excludes (d_qk, d_v) is skipped, so the graph lands on
+        # the next covering flavor instead of the one the floor exists to keep
+        # it off.  (`fp8_shapes` is already arch-aware -- _sm100_fp8_shapes
+        # returns the SM107 maps at cc 10.7 -- so the FP8 arm needs no separate
+        # Rubin narrowing.)
+        if self._fp8:
+            _flavor_pool = tuple(
+                f for f in _SM100_FLAVORS if f in fp8_shapes and (f == (int(d_qk), int(d_v)) or min(int(d_qk), int(d_v)) > _SM100_FP8_ENVELOPE_FLOORS.get(f, 0))
+            )
+        elif self._device_cc == (10, 7):
+            _flavor_pool = tuple(f for f in _SM100_FLAVORS if f in _SM107_KERNEL_FILES)
+        else:
+            _flavor_pool = None
+        self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
             f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
@@ -1198,6 +1225,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.thd and self._fp8 and (int(d_qk), int(d_v)) not in _thd_fp8_shapes,
             f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; " f"got (D_QK={d_qk}, D_V={d_v})",
         )
+        # THD on the Rubin line: only the SHIPPED d128 per-tensor FP8 kernel
+        # carries it.  Every PORTED SM107 kernel raises at compile() -- the
+        # setup-kernel call site still speaks the pre-upstream 7-arg contract
+        # against a 14-arg helper, and the metadata layout differs (3B+2 vs
+        # 4B+4).  The three SM107 engine rows already say so (`thd=False` on
+        # f16/MXFP8, `thd_d_shapes={(128,128)}` on FP8); this is the
+        # STANDALONE-wrapper twin of that decline, which the rows cannot cover
+        # because the wrapper never consults them.  Without it check_support()
+        # returns True and compile() dies with a bare TypeError on the
+        # lse_head_major kwarg -- an untyped escape, not a decline.
+        self._not_implemented_error_if(
+            self.thd and self._device_cc == (10, 7) and not (self._fp8 and self._pertensor and (int(d_qk), int(d_v)) == (128, 128)),
+            f"THD/varlen on the Rubin (SM107) line is per-tensor FP8 d128 only; "
+            f"got (D_QK={d_qk}, D_V={d_v}) on the "
+            f"{'MXFP8' if (self._fp8 and not self._pertensor) else 'FP8' if self._fp8 else 'f16/bf16'} path",
+        )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
         self._value_error_if(
@@ -1265,7 +1308,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # THD is excluded: the LPT decodes assume a dense rectangular
             # tile space, while a ragged batch carries its own scheduler,
             # which walks the live units through batch_remap.
-            if self.window_right is not None and not self.thd:
+            #
+            # Rubin is excluded for a different reason: the PORTED SM107
+            # kernels do not honor either LPT decode.  LPT_L2 raises outright
+            # ("SCHED_LPT_L2 decode requires qh_per_kh and seqlen_kv at every
+            # call site" -- the ported decode sites never thread them), and
+            # plain LPT is silently WRONG (measured 2026-09-08: causal d512 FP8
+            # -> NaN, masked d128 MXFP8 -> max|O-ref| ~ 1.9).  The three SM107
+            # engine rows already declare sched_policies={SCHED_NATURAL}; this
+            # is the STANDALONE-wrapper twin of that decline, which the row
+            # cannot cover because the wrapper never consults it.
+            # NOTE: the SHIPPED d128 FP8 SM107 kernel does honor both, and
+            # loses them here too -- recovering that needs a per-flavor domain
+            # (see the sched_policies_by_d_shape follow-up).
+            _rubin = self._device_cc == (10, 7)
+            if self.window_right is not None and not self.thd and not _rubin:
                 # Causal: balance the triangular load; pick the LPT variant by working set.
                 _, _, s_kv_sched, _ = self.k_desc.shape
                 _, _, _, d_qk_sched = self.q_desc.shape
