@@ -32,7 +32,9 @@ configs or place it against the backend.
 ```text
 create_execution_plans([heur_mode.A, ...])                    _pygraph.py
 │
-├─ validate()                    lowers + freezes any graph the backend CAN lower
+├─ validate()                    family declares a validator AND a python engine is
+│                                a candidate → native semantic validation (no lowering);
+│                                otherwise lowers + freezes any graph the backend CAN lower
 ├─ _finalize_backend_layout()    backend layout inference lands, or records a decline
 ├─ _freeze()                     whole public surface sealed
 ├─ _attach_facts()               family_for → resolve_analyzer → ONE parse, hung on the graph
@@ -254,9 +256,12 @@ are close.
   `cu_seqlens` (a dense batch is `[0, T, 2T, ...]`). `gdn_bwd` takes the
   forward inputs plus `dO` (and optionally `d_final_state`) and produces
   `dQ/dK/dV/dG/dBeta` (+ `d_initial_state` iff `initial_state` is given,
-  + `d_a_log`/`d_dt_bias` iff the node carries `safe_gate` — the gate
-  transform's parameter gradients, with `dG`/`dBeta` then in raw-logit
-  space under `safe_gate`/`use_beta_sigmoid`);
+  + `d_a_log` iff the node carries `safe_gate` and an `a_log` input, and
+  `d_dt_bias` iff it carries `safe_gate` and a `dt_bias` input). Both gate
+  parameters are optional under `safe_gate`: an absent `a_log` is unit
+  amplitude (`exp(a_log) = 1`), an absent `dt_bias` is zero bias, and no
+  zero tensor is materialized for either. `dG`/`dBeta` are in raw-logit
+  space under `safe_gate`/`use_beta_sigmoid`;
   the cumulative gate and intra-chunk WY matrix are recomputed inside the
   engine, so the graph contract carries no forward intermediates. Both are
   python-engine-only ops: they have no cuDNN backend lowering, so routing
@@ -271,7 +276,8 @@ are close.
   helper kernel (normalized q/k copies + saved inverse norms, with the
   backward Jacobian projection applied in place after the head-group fold),
   and likewise serves `safe_gate` (in-kernel raw-logit gate transform, with
-  `d_a_log`/`d_dt_bias` produced by a deterministic reduction helper) and
+  `d_a_log`/`d_dt_bias` for the given parameters produced by a deterministic
+  reduction helper) and
   `use_beta_sigmoid`; the cuTile engine remains the fallback for non-128
   head dims.
 - `KdaFrostEngine` / `KdaCuTileEngine` do the same for the single-node
@@ -296,6 +302,27 @@ are close.
   `KdaFrostEngine`), and serves `gdn2_bwd` the same way (checkpoint
   recompute when the series is absent); the op is
   `cudnn.linear_attention.ops.gated_delta_net_v2`.
+- Gated DeltaProduct (`gdp` / `gdp_bwd`) applies `num_householder` beta-gated
+  Householder updates per token with one scalar decay per token: the GDN
+  recurrence on an expanded sub-token timeline (gate on sub-token 0, readout
+  on sub-token `n - 1`). The node carries q/g/O/dO/dQ/dG at real-token rows
+  and k/v/beta/dK/dV/dBeta at `total_T * num_householder` rows;
+  `num_householder == 1` is exactly `gdn`. `GdpFrostEngine`
+  (`cudnn.linear_attention.frost.gdp_engine`, SM100/SM103) is its only
+  engine and runs the shared GDN kernels, except the `d_v == 64` backward
+  fork `kernel/gdp_bprop_v64_f16.py`, which reads q/dO and writes dQ in the
+  token domain. The forward reads q compact: the prefill re-reads each
+  64-token q block into every chunk of the block and runs its q-side work
+  (readout, rescale, O drain) once per block, so no expanded q copy exists.
+  In the `d_v == 128` backward, q and dO are zero-scattered into an expanded
+  workspace copy and dQ is gathered back (`frost/common/expand.py`);
+  the gate is read compact with the sub-token rows derived in registers,
+  O and dG are stored compact in-kernel, and `cu_seqlens` is scaled by `n`
+  at every read site. `checkpoint_every_n_tokens` counts expanded sub-tokens (64 = the
+  bwd-reusable chunk cadence; a multiple of `lcm(64, n)` puts every
+  checkpoint on a real-token boundary). `safe_gate`, `use_beta_sigmoid` and
+  `allow_neg_eigval` (beta as `2 * sigmoid(x)`) all pass through. The op is
+  `cudnn.linear_attention.ops.gated_delta_product`.
 - The FROST engines are pure pass-through: `check_support` requires the
   kernel-native dtypes (fp32/bf16/fp16 gates — io-dtype `beta`/`w` for GDN-2
   — int32 or int64 `cu_seqlens`, fp32-or-bf16 state ports with matching
@@ -344,6 +371,18 @@ without being imported. Everything else is the engine's own `check_support()`.
   `("module", "callable")` pair kept as strings so the coarse key stays
   import-free. It is handed the facts, the family's offered ids and the
   backend's entries, and what it returns IS the plan list.
+- **A family may name a `validator` hook** — the same import-free pair,
+  `validate_graph(graph) -> bool`. When the manifest offers a python engine for
+  the graph, `validate()` runs it instead of the eager C++ lowering: it applies
+  the family's version- and arch-agnostic semantic rules with the classic error
+  types, and returns False (classic lowering) for a graph holding a node it does
+  not cover. It exists because the eager lowering coupled a graph a python
+  engine fully serves to the installed backend's version and per-arch gates
+  (issue #704); the backend's own verdict is not lost, only deferred to planning
+  (`_finalize_backend_layout` records the decline, `plan()` raises it if no
+  python engine proposes a plan either). A family without one validates
+  classically. `cudnn/_sdpa_validate.py` and `cudnn/_gemm_validate.py` are the
+  two today; both import only the IR.
 - **There is no registration call.** The manifest is the only way a python
   engine exists, and `_candidate_engines()` is the graph's family and nothing
   else. An engine handed over at runtime could never be ranked anyway: it
@@ -405,12 +444,14 @@ only to decline is why `closed_under` existed.
   `import cudnn.sdpa.graph_analyzer` costs 9 ms and 2 modules rather than
   1059 ms and 381.
 - The graph API pulls no framework at all: describing and validating a graph
-  imports neither torch nor cutlass.
+  imports neither torch nor cutlass — the family validators included (they see
+  only the IR).
 - A missing or too-old DSL is a DECLINE at `check_support()`, probed without
   executing the module (`importlib.util.find_spec`, `importlib.metadata`).
-  `CUTEDSL_MIN_VERSION` in `frost/buffers.py` is the floor; `pyproject`'s extra
-  deliberately does NOT pin it, since that would make cudnn-frontend
-  incompatible with anything holding the DSL back.
+  `CUTEDSL_MIN_VERSION` in `frost/buffers.py` is the floor these engines want;
+  `pyproject`'s required dependency deliberately sits below it (`>=4.6.2`),
+  since pinning that high would make cudnn-frontend incompatible with anything
+  holding the DSL back.
 - `test/python/test_import_boundaries.py` holds all of this, in a fresh
   interpreter, measuring the delta against an empty one.
 
@@ -502,17 +543,22 @@ only to decline is why `closed_under` existed.
   `Tensor`/`Node`/`GraphContext`, dict writes on node ports/params
   (MappingProxy), in-place dim/stride edits (sealed to tuples). Inspection
   stays fully readable. `validate()` lowers and freezes any graph the backend
-  CAN lower (classic error timing), so the mutable-after-validate window is
-  exactly the ops with no backend node (GDN/KDA/…); a mutation in it
-  invalidates the validation. Planning freezes BEFORE it analyses, so facts
-  never describe a graph that can still change.
+  CAN lower (classic error timing) unless the graph's family validated it
+  natively (see *The manifest*), so the mutable-after-validate window is the ops
+  with no backend node (GDN/KDA/…) plus natively validated graphs; a mutation in
+  it invalidates the validation and drops the cached candidate list. Planning
+  freezes BEFORE it analyses, so facts never describe a graph that can still
+  change.
 - **Output layout contract**: only USER-assigned output dim/stride are pushed
   to the lowered graph; IR-inferred strides are provisional (row-major) and
   the backend keeps its classic per-op layout inference (e.g. channels-last
   conv). A unified layout resolver across python/cuDNN candidates belongs to
   the heuristics follow-up.
 - **Classic parity**: the public `cudnn.pygraph` surface behaves as before —
-  `cudnnGraphNotSupportedError` at `validate()`, conditional outputs return
+  `cudnnGraphNotSupportedError` at `validate()` for a semantically invalid
+  graph (natively or via the backend; with a python engine candidate, a
+  rejection the *backend* alone would raise — version or arch gate — surfaces
+  at `plan()` instead, and only if no python engine proposes a plan), conditional outputs return
   `None`, torch dtypes/`torch.Size` accepted, ragged (THD) offsets and
   multipliers on outputs, serialize/deserialize passthrough, plan queries
   delegate to the lowered graph.

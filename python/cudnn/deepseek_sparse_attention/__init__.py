@@ -8,6 +8,8 @@ _SYMBOLS = {
     "sparse_attention_forward": (".flashmla_bridge", "sparse_attention_forward"),
     "sparse_attention": (".flashmla_bridge", "sparse_attention"),
     "sparse_attention_score_recompute": (".flashmla_bridge", "sparse_attention_score_recompute"),
+    "SparseAttentionForward": (".sparse_attention_forward", "SparseAttentionForward"),
+    "sparse_attention_forward_wrapper": (".sparse_attention_forward", "sparse_attention_forward_wrapper"),
     "SparseAttentionBackward": (".sparse_attention_backward", "SparseAttentionBackward"),
     "sparse_attention_backward_wrapper": (".sparse_attention_backward", "sparse_attention_backward_wrapper"),
     "IndexerForward": (".indexer_forward", "IndexerForward"),

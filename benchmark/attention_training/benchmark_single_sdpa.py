@@ -693,7 +693,6 @@ else:
             scale_dK_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dV_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dP_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
-            amax_s_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dQ_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dK_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
@@ -729,15 +728,21 @@ else:
             amax_dV_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
 
         if args.data_type == "mxfp8":
-            # MXFP8 backward outputs use the same dtype as forward output
-            dQuery = torch.empty(batch_size, num_q_heads, q_seqlen, head_dim_qk, dtype=output_dtype, device=device)
-            dKey = torch.empty(batch_size, num_kv_heads, kv_seqlen, head_dim_qk, dtype=output_dtype, device=device)
-            dValue = torch.empty(batch_size, num_kv_heads, kv_seqlen, head_dim_vo, dtype=output_dtype, device=device)
+            # MXFP8 backward outputs use the same dtype as forward output, in the
+            # same BSHD-physical layout as Q/K/V (a training framework hands the
+            # gradients over in the activations' layout; the FROST MXFP8 backward
+            # engine serves BSHD-physical only).
+            dQuery = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_qk, dtype=output_dtype, device=device).transpose(1, 2)
+            dKey = torch.empty(batch_size, kv_seqlen, num_kv_heads, head_dim_qk, dtype=output_dtype, device=device).transpose(1, 2)
+            dValue = torch.empty(batch_size, kv_seqlen, num_kv_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
         else:
             dQuery = torch.empty_like(query)
             dKey = torch.empty_like(key)
             dValue = torch.empty_like(value)
-        dOutput = torch.randn(output.shape, dtype=randn_dtype, device=device).to(target_dtype)
+        # dO in O's memory format (BSHD-physical): torch.randn(output.shape) would
+        # allocate BHSD-contiguous and hand every backward a gradient laid out
+        # differently from the activations.
+        dOutput = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
         stats = torch.empty(batch_size, num_q_heads, q_seqlen, 1, dtype=torch.float32, device=device)
         if is_dropout:
             dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
@@ -772,7 +777,11 @@ else:
             scale_s_fwd = graph_fwd.tensor_like(scale_s_gpu)
             scale_o_fwd = graph_fwd.tensor_like(scale_o_gpu)
 
-            o_fwd, stats_fwd, amax_s_fwd, amax_o_fwd = graph_fwd.sdpa_fp8(
+            # Amax_S is returned unconditionally but never requested: it only becomes a
+            # real graph output if set_output(True) is called on it, and nothing here
+            # consumes it. Leaving it virtual also keeps the graph servable by engines
+            # that do not produce Amax_S.
+            o_fwd, stats_fwd, _amax_s_unused, amax_o_fwd = graph_fwd.sdpa_fp8(
                 q=q_fwd,
                 k=k_fwd,
                 v=v_fwd,
@@ -871,7 +880,6 @@ else:
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
 
         if args.data_type == "fp8":
-            amax_s_fwd.set_output(True).set_dim(amax_s_gpu.size()).set_stride(amax_s_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
             amax_o_fwd.set_output(True).set_dim(amax_o_gpu.size()).set_stride(amax_o_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
         elif args.data_type == "mxfp8":
             amax_o_fwd.set_output(True).set_dim(amax_o_gpu.size()).set_stride(amax_o_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
@@ -1136,9 +1144,16 @@ else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride()).set_data_type(cudnn.data_type.BFLOAT16)
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride()).set_data_type(cudnn.data_type.BFLOAT16)
                 dV_bwd.set_output(True).set_dim(dValue.size()).set_stride(dValue.stride()).set_data_type(cudnn.data_type.BFLOAT16)
-                amax_dQ_bwd.set_output(True).set_dim(amax_dQ_gpu.size()).set_stride(amax_dQ_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
-                amax_dK_bwd.set_output(True).set_dim(amax_dK_gpu.size()).set_stride(amax_dK_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
-                amax_dV_bwd.set_output(True).set_dim(amax_dV_gpu.size()).set_stride(amax_dV_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+                # The gradients are half precision, so the amax_dQ/dK/dV outputs
+                # carry no information a consumer needs; the FROST MXFP8 backward
+                # engine does not produce them and declines a graph that asks.
+                # Leave them virtual under cudnn_oss (dims are still required by
+                # validate()); the native backend path keeps requesting them.
+                mxfp8_amax_requested = args.sdpa_backend != "cudnn_oss"
+                for _amax_t, _amax_gpu in ((amax_dQ_bwd, amax_dQ_gpu), (amax_dK_bwd, amax_dK_gpu), (amax_dV_bwd, amax_dV_gpu)):
+                    _amax_t.set_dim(_amax_gpu.size()).set_stride(_amax_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+                    if mxfp8_amax_requested:
+                        _amax_t.set_output(True)
             else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride())
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride())
@@ -1175,7 +1190,6 @@ else:
                     descale_s_fwd: descale_s_gpu,
                     scale_s_fwd: scale_s_gpu,
                     scale_o_fwd: scale_o_gpu,
-                    amax_s_fwd: amax_s_gpu,
                     amax_o_fwd: amax_o_gpu,
                 }
 
@@ -1254,10 +1268,11 @@ else:
                     dQ_bwd: dQuery,
                     dK_bwd: dKey,
                     dV_bwd: dValue,
-                    amax_dQ_bwd: amax_dQ_gpu,
-                    amax_dK_bwd: amax_dK_gpu,
-                    amax_dV_bwd: amax_dV_gpu,
                 }
+                if mxfp8_amax_requested:
+                    variant_pack_bwd[amax_dQ_bwd] = amax_dQ_gpu
+                    variant_pack_bwd[amax_dK_bwd] = amax_dK_gpu
+                    variant_pack_bwd[amax_dV_bwd] = amax_dV_gpu
                 workspace = torch.empty(
                     max(graph_fwd.get_workspace_size(), graph_bwd.get_workspace_size()),
                     device="cuda",
@@ -1301,7 +1316,6 @@ else:
                     descale_s_fwd: descale_s_gpu,
                     scale_s_fwd: scale_s_gpu,
                     scale_o_fwd: scale_o_gpu,
-                    amax_s_fwd: amax_s_gpu,
                     amax_o_fwd: amax_o_gpu,
                 }
                 workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
@@ -1356,7 +1370,9 @@ else:
 
         # Flash Attention Native
         def flash_attention_sdpa(query, key, value):
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
+            # flash-attn 2.7+ requires ints here: (-1, -1) is its no-window
+            # sentinel; passing None fails the SymInt cast in the op schema.
+            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (-1, -1)
             return flash_attn_func(
                 query,
                 key,
@@ -1583,7 +1599,6 @@ else:
             scale_dK_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dV_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dP_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
-            amax_s_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dQ_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dK_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
@@ -1625,7 +1640,6 @@ else:
                         descale_s_fwd: descale_s_gpu,
                         scale_s_fwd: scale_s_gpu,
                         scale_o_fwd: scale_o_gpu,
-                        amax_s_fwd: amax_s_gpu,
                         amax_o_fwd: amax_o_gpu,
                     }
                     variant_pack_bwd = {
@@ -1737,7 +1751,6 @@ else:
                         descale_s_fwd: descale_s_gpu,
                         scale_s_fwd: scale_s_gpu,
                         scale_o_fwd: scale_o_gpu,
-                        amax_s_fwd: amax_s_gpu,
                         amax_o_fwd: amax_o_gpu,
                     }
                 elif args.data_type == "mxfp8":
@@ -1972,17 +1985,47 @@ else:
     # Compute MMA SOL% using the per-arch FLOPs/clk/SM table and the actual
     # sampled boost clock observed during the benchmark window.
     _peak_mma_tflops = None
+    # Why the peak is unavailable, when it is -- the two causes need different
+    # advice and conflating them sends the user after the wrong one.
+    _peak_unavailable = "unavailable"
     try:
         _flops_per_clk_per_sm = _peak_flops_per_clock_per_sm(args.data_type)
         _num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         _sampled_mhz = _clock_sampler.peak_mhz()
-        if _flops_per_clk_per_sm is not None and _sampled_mhz is not None:
+        if _flops_per_clk_per_sm is None:
+            # No dense-MMA peak modelled for this dtype / arch (e.g. --data_type float).
+            _peak_unavailable = f"no MMA peak modelled for {args.data_type} on this arch"
+        elif _sampled_mhz is None:
+            _peak_unavailable = "no clock sample -- pip install pynvml"
+        else:
             _peak_mma_tflops = _flops_per_clk_per_sm * _num_sms * _sampled_mhz / 1e6
-    except Exception:
-        pass
+    except Exception as _e:
+        _peak_unavailable = f"peak lookup failed ({type(_e).__name__})"
 
-    fwd_sol_str = f", {fwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and fwd_tflops > 0 else ""
-    bwd_sol_str = f", {bwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and bwd_tflops > 0 else ""
+    def _sol(tflops):
+        """SOL% against the dense-MMA peak, or an explicit note when we cannot
+        compute it.
+
+        The peak needs both a modelled dense-MMA rate for the dtype and a
+        sampled boost clock (which needs ``pynvml``). When either is missing the
+        SOL suffix used to vanish entirely and an impossible TFLOPS number
+        printed unremarked -- the only cross-check this harness has on its own
+        arithmetic, silently disabled. Say so instead, naming WHICH of the two
+        is missing, and shout when a number exceeds the hardware: >100% SOL
+        means the FLOP model or the timing is wrong, never that the kernel is
+        fast.
+        """
+        if tflops <= 0:
+            return ""
+        if not _peak_mma_tflops:
+            return f", SOL n/a ({_peak_unavailable})"
+        pct = tflops / _peak_mma_tflops * 100
+        if pct > 100.0:
+            return f", {pct:.1f}% SOL -- ABOVE HARDWARE PEAK, MEASUREMENT IS WRONG"
+        return f", {pct:.1f}% SOL"
+
+    fwd_sol_str = _sol(fwd_tflops)
+    bwd_sol_str = _sol(bwd_tflops)
 
     if args.format_output:
         print(

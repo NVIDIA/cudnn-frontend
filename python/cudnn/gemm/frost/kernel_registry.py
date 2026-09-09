@@ -412,28 +412,50 @@ class MainloopKernelTemplate(KernelTemplate):
 
 
 class Sm120KernelTemplate(KernelTemplate):
-    """The sm120 warp-MMA template. Its v1 scope is enforced by render-time
+    """The sm120 warp-MMA template. Its scope is enforced by render-time
     asserts in the template source; encoding it here lets the funnel (and the
     jit paths, via ``active_reject``) reject cleanly instead of faulting
-    mid-render: TN GEMM (K-major A and B), N-major non-fp4 output, and an
-    epilogue that stores whole (n, n+1) accumulator pairs."""
+    mid-render. All eight A/B/output major combinations are served, with two
+    carve-outs: an MN-major operand rides a transposing ldmatrix (the b16 form
+    for 16-bit dtypes, the SM 12x byte-granule ``m16n16.trans.b8`` form for
+    8-bit ones — sub-byte dtypes have no transposed load and must be K-major),
+    and an N-major output stores whole (n, n+1) accumulator pairs (an M-major
+    output scatters per element, so its chunk may narrow freely). Non-fp4
+    output only."""
 
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
+        from .dtypes import DTYPE_BITS, DTYPE_BYTES
+
         mm = chain.matmul
-        if mm.a_major != "k" or mm.b_major != "k":
-            return f"{self.file} supports only K-major A and B (TN GEMM); " f"got A {mm.a_major}-major, B {mm.b_major}-major"
-        if chain.out_major != "n":
-            return f"{self.file} supports only an N-major output"
+        if mm.a_major == "m" and DTYPE_BITS[mm.a_dtype] not in (16, 8):
+            return f"{self.file} loads MN-major operands with ldmatrix.trans (b16) / " f"ldmatrix.m16n16.trans.b8; {mm.a_dtype} A must be K-major"
+        if mm.b_major == "n" and DTYPE_BITS[mm.b_dtype] not in (16, 8):
+            return f"{self.file} loads MN-major operands with ldmatrix.trans (b16) / " f"ldmatrix.m16n16.trans.b8; {mm.b_dtype} B must be K-major"
+        # (The template also asserts _N_FRAGS is even for an 8-bit N-major B —
+        # one m16n16.b8 tile spans two n-frags. No funnel mirror is needed:
+        # every constructible ConfigSm120 satisfies it, because construction
+        # enforces warp_tile_n % mma_tile_n(=16) == 0.)
+        if mm.a_major == "m" or mm.b_major == "n":
+            # Mirror of _render_tile_constants' rule. The sm120 ldmatrix path
+            # has no per-MMA SMEM descriptors (that is a tcgen05 fact), so only
+            # the WHOLE extent must cut into whole swizzle groups -- that is
+            # what the template's TMA group walk needs.
+            elem_bytes = DTYPE_BYTES[mm.a_dtype]
+            group = config.cta_tile_k_bytes // elem_bytes
+            cta_smem_m, cta_smem_n, _ = config.cta_smem_tile_mnk(elem_bytes)
+            if mm.a_major == "m" and (cta_smem_m < group or cta_smem_m % group):
+                return f"{self.file}: M-major A SMEM extent {cta_smem_m} is not a " f"whole number of {group}-element swizzle groups"
+            if mm.b_major == "n" and (cta_smem_n < group or cta_smem_n % group):
+                return f"{self.file}: N-major B SMEM extent {cta_smem_n} is not a " f"whole number of {group}-element swizzle groups"
         if chain.output_dtype == "fp4_e2m1":
             return f"{self.file} does not support fp4 output"
         from . import compiler as C
-        from .dtypes import DTYPE_BYTES
 
         try:
             vec = C._epi_vec_bytes(chain, config)
         except ValueError as e:
             return str(e)
-        if vec < 2 * DTYPE_BYTES[chain.output_dtype]:
+        if chain.out_major == "n" and vec < 2 * DTYPE_BYTES[chain.output_dtype]:
             return f"{self.file} stores whole (n, n+1) accumulator pairs; the output " f"layout admits only {vec}-byte epilogue chunks"
         return None
 
@@ -537,8 +559,9 @@ def preferred_mma_tile_k_bytes(chain: FusionChain) -> int:
 def preferred_strategy(chain: FusionChain, config: TileConfig) -> TileConfig:
     """Re-target an auto pick at the family :func:`preferred_pipeline` chooses and
     the MMA-inst K width :func:`preferred_mma_tile_k_bytes` wants. ``cta_group``
-    rides the geometry, and a family that fixes it re-pins it in its own
-    ``__post_init__`` (sm120's warp MMA is 1-CTA), so nothing is clamped here."""
+    rides the geometry, and family-fixed axes (sm120's warp-MMA pair, cluster and
+    default warp grid) are snapped by :func:`as_pipeline`, so nothing is clamped
+    here."""
     pipeline = preferred_pipeline(chain)
     config = as_mma_tile_k(config, preferred_mma_tile_k_bytes(chain))
     if pipeline != config.pipeline:

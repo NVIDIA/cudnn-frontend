@@ -179,6 +179,7 @@ def gdn_gate_chunk_cumsum_scalar_kernel(
     BT: ConstInt,
     REVERSE: ConstInt,
     HAS_BIAS: ConstInt,
+    HAS_A: ConstInt,
     HAS_SCALE: ConstInt,
 ):
     i_t = ct.bid(0)
@@ -196,12 +197,15 @@ def gdn_gate_chunk_cumsum_scalar_kernel(
     t_idx = bos + row
 
     b_g = ct.astype(ct.gather(g, (t_idx, i_h), mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
-    b_A = ct.astype(ct.load(A_log, (i_h,), shape=()).item(), ct.float32)
     if HAS_BIAS:
         b_bias = ct.astype(ct.load(dt_bias, (i_h,), shape=()).item(), ct.float32)
         b_g = b_g + b_bias
 
-    b_gate = -exp(b_A) * softplus(b_g)
+    if HAS_A:
+        b_A = ct.astype(ct.load(A_log, (i_h,), shape=()).item(), ct.float32)
+        b_gate = -exp(b_A) * softplus(b_g)
+    else:
+        b_gate = -softplus(b_g)
     b_o = ct.cumsum(b_gate, axis=0)
     if REVERSE:
         b_z = ct.sum(b_gate, axis=0)
@@ -212,11 +216,10 @@ def gdn_gate_chunk_cumsum_scalar_kernel(
 
 
 @ct.kernel
-def gdn_gate_bwd_kernel(g, A_log, dt_bias, dyg, dg, dA, db, T, H: ConstInt, BT: ConstInt, HAS_BIAS: ConstInt):
+def gdn_gate_bwd_kernel(g, A_log, dt_bias, dyg, dg, dA, db, T, H: ConstInt, BT: ConstInt, HAS_BIAS: ConstInt, HAS_A: ConstInt):
     i_t = ct.bid(0)
     i_h = ct.bid(1)
 
-    b_A = ct.astype(ct.load(A_log, (i_h,), shape=()).item(), ct.float32)
     offs = ct.arange(BT, dtype=ct.int32)
     row = i_t * BT + offs
     mask = row < T
@@ -228,14 +231,19 @@ def gdn_gate_bwd_kernel(g, A_log, dt_bias, dyg, dg, dA, db, T, H: ConstInt, BT: 
         b_bias = ct.astype(ct.load(dt_bias, (i_h,), shape=()).item(), ct.float32)
         b_g = b_g + b_bias
 
-    b_neg_expA = -exp(b_A)
-    b_yg = b_neg_expA * softplus(b_g)
+    if HAS_A:
+        b_A = ct.astype(ct.load(A_log, (i_h,), shape=()).item(), ct.float32)
+        b_neg_expA = -exp(b_A)
+    else:
+        b_neg_expA = -1.0
     b_sig = 1.0 / (1.0 + ct.exp(-b_g))
     b_dg = b_neg_expA * (b_dyg * b_sig)
-    b_dA = ct.sum(b_dyg * b_yg, axis=0)
 
     ct.scatter(dg, idx, ct.astype(b_dg, dg.dtype), mask=mask, check_bounds=False)
-    ct.scatter(dA, i_t * H + i_h, b_dA)
+    if HAS_A:
+        b_yg = b_neg_expA * softplus(b_g)
+        b_dA = ct.sum(b_dyg * b_yg, axis=0)
+        ct.scatter(dA, i_t * H + i_h, b_dA)
     if HAS_BIAS:
         # b_dg is zero on masked lanes (b_dyg gathers with padding_value=0)
         b_db = ct.sum(b_dg, axis=0)
@@ -2229,7 +2237,8 @@ def gdn_gate_chunk_cumsum(
     BT = chunk_size
     NT = len(chunk_indices)
     o = out.reshape((T, H))
-    dt_arg = opt(dt_bias, bufs, dtname(A_log)).reshape((-1,))
+    a_arg = opt(A_log, bufs).reshape((-1,))
+    dt_arg = opt(dt_bias, bufs).reshape((-1,))
     scale_val = float(scale) if scale is not None else 0.0
     cu_arg = cu_seqlens
     ci_arg = chunk_indices
@@ -2239,7 +2248,7 @@ def gdn_gate_chunk_cumsum(
         gdn_gate_chunk_cumsum_scalar_kernel,
         (
             g,
-            A_log.reshape((-1,)),
+            a_arg,
             dt_arg,
             o,
             scale_val,
@@ -2249,6 +2258,7 @@ def gdn_gate_chunk_cumsum(
             BT,
             0,
             int(dt_bias is not None),
+            int(A_log is not None),
             int(scale is not None),
         ),
     )
@@ -2256,8 +2266,8 @@ def gdn_gate_chunk_cumsum(
 
 
 def gdn_gate_bwd(g, A_log, dt_bias, dyg, dg_out=None, dA_out=None, dbias_out=None, bufs=None, stream=None):
-    """Gate backward. ``dg_out`` (g-shaped, any dtype), ``dA_out`` (A_log-shaped)
-    and — with ``dt_bias`` — ``dbias_out`` (H) are written in place;
+    """Gate backward. ``dg_out`` (g-shaped, any dtype) and, per present parameter,
+    ``dA_out`` (A_log-shaped) / ``dbias_out`` (H) are written in place;
     ``bufs['dA_gate']``/``bufs['db_gate']`` hold the (NT, H) fp32 chunk partials."""
     stream = 0 if stream is None else stream
     H = g.shape[-1]
@@ -2265,9 +2275,11 @@ def gdn_gate_bwd(g, A_log, dt_bias, dyg, dg_out=None, dA_out=None, dbias_out=Non
     BT = 32
     NT = cdiv(T, BT)
     dg = dg_out.reshape(tuple(g.shape))
-    dA_nt = bufs["dA_gate"].reshape((NT, H))
+    dA_nt = bufs["dA_gate"].reshape((NT, H)) if A_log is not None else None
     db_nt = bufs["db_gate"].reshape((NT, H)) if dt_bias is not None else None
-    dt_arg = opt(dt_bias, bufs, dtname(A_log)).reshape((-1,))
+    a_arg = opt(A_log, bufs).reshape((-1,))
+    dt_arg = opt(dt_bias, bufs).reshape((-1,))
+    dA_arg = opt(dA_nt, bufs).reshape(-1)
     db_arg = opt(db_nt, bufs).reshape(-1)
     ct.launch(
         stream,
@@ -2275,22 +2287,24 @@ def gdn_gate_bwd(g, A_log, dt_bias, dyg, dg_out=None, dA_out=None, dbias_out=Non
         gdn_gate_bwd_kernel,
         (
             g.reshape((-1,)),
-            A_log.reshape((-1,)),
+            a_arg,
             dt_arg,
             dyg.reshape((-1,)),
             dg.reshape(-1),
-            dA_nt.reshape(-1),
+            dA_arg,
             db_arg,
             T,
             H,
             BT,
             int(dt_bias is not None),
+            int(A_log is not None),
         ),
     )
-    sum_leading(dA_out.reshape((H,)), dA_nt, NT, H, stream=stream)
+    if A_log is not None:
+        sum_leading(dA_out.reshape((H,)), dA_nt, NT, H, stream=stream)
     if dt_bias is not None:
         sum_leading(dbias_out.reshape((H,)), db_nt, NT, H, stream=stream)
-    return dg, dA_out, (dbias_out if dt_bias is not None else None)
+    return dg, (dA_out if A_log is not None else None), (dbias_out if dt_bias is not None else None)
 
 
 # --- Launchers: WY representation -----------------------------------------------------------------
@@ -2923,6 +2937,7 @@ def chunk_gated_delta_rule_fwd(
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             out=bufs["g_cum"],
+            bufs=bufs,
             stream=stream,
         )
     else:
@@ -3035,7 +3050,7 @@ def chunk_gated_delta_rule_bwd(
             dt_bias=dt_bias,
             dyg=dg,
             dg_out=bufs["dg_gate"],
-            dA_out=bufs["dA_log"],
+            dA_out=bufs["dA_log"] if A_log is not None else None,
             dbias_out=bufs["ddt_bias"] if dt_bias is not None else None,
             bufs=bufs,
             stream=stream,
@@ -3156,8 +3171,6 @@ def chunk_gated_delta_rule(
     use_gate_in_kernel = kwargs.get("use_gate_in_kernel", False)
     A_log = kwargs.get("A_log")
     dt_bias = kwargs.get("dt_bias")
-    if use_gate_in_kernel:
-        assert A_log is not None, "A_log must be provided when use_gate_in_kernel=True."
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
         raise ValueError("`allow_neg_eigval=True` requires `use_beta_sigmoid_in_kernel=True`.")
 

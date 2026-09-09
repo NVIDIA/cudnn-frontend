@@ -1,10 +1,10 @@
 # Grouped GEMM (SM100 BF16)
 
 **This is an experimental API and subject to change.** It requires an NVIDIA
-SM100-or-newer GPU and the optional CuTe DSL dependencies:
+SM100-or-newer GPU. The CuTe DSL dependencies ship with the package:
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 `GroupedGemmSm100` and `grouped_gemm_wrapper_sm100` implement the neutral,

@@ -59,11 +59,19 @@ from cudnn.frost.tile_dsl.scheduler import (
 )
 from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
-from cudnn.sdpa.fwd.kernels.thd_sm100 import (
-    build_thd_meta_kernel as _build_thd_meta_kernel,
+from cudnn.sdpa.fwd.kernels.thd_helpers import (
+    build_thd_meta_kernel,
+    sanitize_v_tail,
     thd_claim_next,
     thd_decode_unit,
     THD_SETUP_THREADS,
+)
+from cudnn.sdpa.fwd.kernels._common_sm120 import (
+    SCHED_L2_BUDGET_BYTES,
+    ceil_div,
+    nvvm_threadquad_reduction_max,
+    nvvm_threadquad_reduction_sum,
+    pack_to_i32,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE,
@@ -82,70 +90,6 @@ validate_params(PARAMS)
 
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
 
-# ---------------------------------------------------------------------------
-# PTX and layout helpers.
-# ---------------------------------------------------------------------------
-
-
-@cute.jit
-def nvvm_threadquad_reduction_max(val: cutlass.Float32) -> cutlass.Float32:
-    """Butterfly thread-quad (4 lanes) reduction max via shfl.sync.bfly."""
-    val = cute.arch.fmax(
-        val,
-        prims.shfl_sync(
-            thread_mask=0xFFFFFFFF,
-            val=val,
-            offset=2,
-            mask_and_clamp=0x1F,
-            kind=prims.Shfl.BFLY,
-        ),
-    )
-    val = cute.arch.fmax(
-        val,
-        prims.shfl_sync(
-            thread_mask=0xFFFFFFFF,
-            val=val,
-            offset=1,
-            mask_and_clamp=0x1F,
-            kind=prims.Shfl.BFLY,
-        ),
-    )
-    return val
-
-
-@cute.jit
-def nvvm_threadquad_reduction_sum(val: cutlass.Float32) -> cutlass.Float32:
-    """Butterfly thread-quad (4 lanes) reduction sum via shfl.sync.bfly."""
-    val = val + prims.shfl_sync(
-        thread_mask=0xFFFFFFFF,
-        val=val,
-        offset=2,
-        mask_and_clamp=0x1F,
-        kind=prims.Shfl.BFLY,
-    )
-    val = val + prims.shfl_sync(
-        thread_mask=0xFFFFFFFF,
-        val=val,
-        offset=1,
-        mask_and_clamp=0x1F,
-        kind=prims.Shfl.BFLY,
-    )
-    return val
-
-
-@cute.jit
-def pack_to_i32(
-    src: tuple,
-    dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-) -> cutlass.Int32:
-    """Pack four 8-bit or two 16-bit values into one 32-bit register."""
-    vals = cutlass.Vector.from_elements(src, dtype)
-    return vals.bitcast(cutlass.Int32)[0]
-
-
-# L2 working-set budget used by the LPT_L2 group sizing.
-_SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
-
 # THD only: pull units from a device-side counter over a machine-sized grid
 # instead of launching the plan-time envelope as a padded rectangle. The
 # envelope scales with the DECLARED S_q, so on ragged batches most of that
@@ -154,11 +98,6 @@ _SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
 # This is what made the K/V consumer barriers have to balance per unit (see the
 # drain in _run_unit): a CTA here runs the tile range of several units in turn.
 THD_PERSISTENT = True
-
-
-def ceil_div(a: int, b: int) -> int:
-    """Return the ceiling division of a by b."""
-    return (a + b - 1) // b
 
 
 def round_up_head_tile(d: int) -> int:
@@ -834,6 +773,17 @@ class SM120FusedMultiHeadAttentionForward:
             is_first_kv_tile,
         )
 
+        if cutlass.const_expr(self.thd_varlen and in_mask_steps and is_first_kv_tile):
+            sanitize_v_tail(
+                mma_params.sV,
+                basic_params.lane,
+                basic_params.seqlen_k,
+                kv_tile_idx * self.kv_tile,
+                self.in_dtype,
+                self.head_tile_v,
+                self.kv_tile,
+                self.v_swizzle_chunk_elems,
+            )
         self.mma_pv(basic_params, mma_params, p_regs)
         prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
 
@@ -1491,7 +1441,7 @@ class SM120FusedMultiHeadAttentionForward:
                         _n_qh // cutlass.Int32(k.shape[2]),
                         cutlass.Int32(k.shape[1]),
                         (self.head_tile_qk + self.head_tile_v) * self.in_dtype.width // 8,
-                        _SCHED_L2_BUDGET_BYTES,
+                        SCHED_L2_BUDGET_BYTES,
                     )
                 else:
                     q_tile_idx, head_idx, batch_idx = lpt_tile_coords(q_tile_idx, _n_qh, _n_batch, n_q_tiles)
@@ -1537,6 +1487,8 @@ class SM120FusedMultiHeadAttentionForward:
                 batch_idx,
                 head_idx,
             )
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def __call__(
@@ -1699,7 +1651,7 @@ class SM120FusedMultiHeadAttentionForward:
             # Build the [kv|cu_q|cu_k|remap|live|ctr] metadata buffer DEVICE-side
             # from the caller's length tensors (no host cumsum, no H2D — issue
             # #552); the main kernel launched after it on this stream reads it.
-            _build_thd_meta_kernel(
+            build_thd_meta_kernel(
                 seq_kv_lens,
                 thd_q_lens,
                 thd_kv_lens,

@@ -118,7 +118,7 @@ def test_sdpa_dense_parity(B, Hq, Hkv, Sq, Skv, D, dtype, is_causal, scale, enab
         assert ours <= max(3 * flash, floor), f"{name}: cudnn err {ours:.4f} vs flash {flash:.4f}"
 
 
-def ref_varlen(q, k, v, cu_q, cu_kv, is_causal, window_left=-1):
+def ref_varlen(q, k, v, cu_q, cu_kv, is_causal, window_left=-1, window_right=-1):
     """Per-sequence fp32 dense reference; returns (out, q_ref, k_ref, v_ref)."""
     qr, kr, vr = (t.detach().float().requires_grad_(True) for t in (q, k, v))
     Hq, Hkv = q.shape[1], k.shape[1]
@@ -141,6 +141,8 @@ def ref_varlen(q, k, v, cu_q, cu_kv, is_causal, window_left=-1):
             mask |= jj > ii
         if window_left >= 0:
             mask |= jj < (ii - window_left)  # FA2: window (w, 0) attends [i-w, i]
+        if window_right >= 0:
+            mask |= jj > (ii + window_right)  # FA2: window (_, r) attends up to i+r
         s = s.masked_fill(mask, float("-inf"))
         outs.append(torch.einsum("bhqk,bhkd->bhqd", torch.softmax(s, dim=-1), vi)[0].transpose(0, 1))
     out = torch.cat(outs)
@@ -154,6 +156,11 @@ VARLEN_CASES = [
     pytest.param(16, 4, 128, [200, 312, 96], (-1, 0), True, False, id="gqa"),
     pytest.param(8, 8, 128, [400, 288], (128, 0), False, False, id="window-128"),
     pytest.param(8, 8, 128, [400, 288], (4, 0), False, False, id="window-4-tight"),
+    # Bands that admit FUTURE columns. Before window_right these fell through
+    # _varlen_supported to the flash kernels, so the `calls["fwd"]` assertion
+    # below is what pins them onto the cuDNN python path.
+    pytest.param(8, 8, 128, [400, 288], (-1, 64), False, False, id="window-right-only"),
+    pytest.param(8, 8, 128, [333, 128, 512, 47], (128, 32), False, False, id="window-asymmetric"),
     pytest.param(8, 8, 64, [512, 512], (-1, 0), False, False, id="d64"),
     pytest.param(
         8,
@@ -190,7 +197,7 @@ def test_varlen_attn(Hq, Hkv, D, lens, window, enable_gqa, kv_packed):
     assert provider.calls["fwd"] == fwd0 + 1 and provider.calls["bwd"] == bwd0 + 1, "provider did not intercept"
 
     is_causal = window[1] == 0
-    ref, qr, kr, vr = ref_varlen(q, k, v, cu, cu, is_causal, window[0])
+    ref, qr, kr, vr = ref_varlen(q, k, v, cu, cu, is_causal, window[0], window[1])
     ref.backward(grad.float())
     if kv_packed:
         kv_grad = torch.stack([kr.grad, vr.grad], dim=1)
@@ -250,15 +257,35 @@ def test_d256_direct_aten_op():
     """d=256: torch's C++ fused_sdp_choice still gates cuDNN to head_dim<=128,
     so F.sdpa cannot reach it — but the python path serves it through the aten
     op directly (what a fixed selection gate would dispatch to)."""
+    # Plan-time gates first, before any allocation (same floors as
+    # test_torch_ops.py's module gate): older stacks skip cleanly here rather
+    # than via a broad exception net below.
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("cuDNN SDPA requires sm80+")
+    if cudnn.backend_version() < 90600:
+        pytest.skip("requires cuDNN >= 9.6")
     torch.manual_seed(0)
     q = torch.randn(2, 4, 384, 256, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     k, v = torch.randn_like(q, requires_grad=True), torch.randn_like(q, requires_grad=True)
+    # Both directions must be servable: the forward may build while the
+    # BACKWARD graph is rejected at validate() (e.g. Ampere's native support
+    # surface caps the backward at d<=128 and runs before FROST routing, so
+    # the graph never reaches an OSS engine that could serve d=256 — #864).
+    # The frontend signals that with cudnnGraphNotSupportedError (a plain
+    # Exception, not a RuntimeError). A RuntimeError is a skip ONLY when it
+    # is the engine-selection rejection itself; anything else (allocation
+    # failures, autograd regressions) must surface as a failure.
     try:
         out = torch.ops.aten._scaled_dot_product_cudnn_attention(q, k, v, None, True, 0.0, False)
+        o = out[0]
+        o.backward(torch.ones_like(o))
+    except cudnn.cudnnGraphNotSupportedError as e:
+        pytest.skip(f"no engine serves d=256 fwd+bwd on this arch: {str(e).splitlines()[0][:80]}")
     except RuntimeError as e:
-        pytest.skip(f"no engine serves d=256 on this arch: {str(e).splitlines()[0][:80]}")
-    o = out[0]
-    o.backward(torch.ones_like(o))
+        msg = str(e).splitlines()[0]
+        if any(t in msg.lower() for t in ("not supported", "unsupported", "no valid engine", "no engine")):
+            pytest.skip(f"no engine serves d=256 fwd+bwd on this arch: {msg[:80]}")
+        raise
     o_ref, q_ref, _, _ = math_ref(q, k, v, False, None)
     o_ref.backward(torch.ones_like(o_ref))
     assert (o.float() - o_ref).abs().max().item() < 0.05

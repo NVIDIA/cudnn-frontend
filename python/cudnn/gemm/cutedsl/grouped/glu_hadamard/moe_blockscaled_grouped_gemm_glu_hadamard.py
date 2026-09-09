@@ -529,6 +529,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                 )
                 sched_counter[0] = cutlass.Int32(0)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,
@@ -2571,6 +2573,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                 self.epilog_sync_barrier_group1.arrive_and_wait()
                 tmem.free(tmem_ptr)
         # END OF KERNEL
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 class BlockScaledMoEGroupedGemmGluHadamardCompatKernel(BlockScaledMoEGroupedGemmGluHadamardKernel):

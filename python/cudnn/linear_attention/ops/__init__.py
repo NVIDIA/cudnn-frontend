@@ -5,6 +5,7 @@
 
 from .gdn import gated_delta_net
 from .gdn2 import gated_delta_net_v2
+from .gdp import gated_delta_product
 from .kda import kimi_delta_attention
 
-__all__ = ["gated_delta_net", "kimi_delta_attention", "gated_delta_net_v2"]
+__all__ = ["gated_delta_net", "kimi_delta_attention", "gated_delta_net_v2", "gated_delta_product"]

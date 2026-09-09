@@ -180,10 +180,10 @@ The compiled-kernel lifecycle (`check_support`/`compile`/`execute`) lives in the
 
 ## Installation
 
-Requires the optional CuTeDSL dependencies:
+Requires the CuTeDSL dependencies, which ship with the package:
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 ## Usage examples

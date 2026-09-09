@@ -561,6 +561,7 @@ def test_moe_grouped_matmul_fwd_auto_config_n_major_small_n() -> None:
     torch.testing.assert_close(output[0], _ref_f32(token, weight_k, offsets, S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
 
 
+@pytest.mark.L0
 def test_moe_tma_store_uses_rank2_output_descriptor() -> None:
     """MoE's output is one flat (S, N) surface, so its TMA store must not carry
     the fixed-one batch dimension paid by ordinary batched GEMM. Besides being
@@ -571,7 +572,7 @@ def test_moe_tma_store_uses_rank2_output_descriptor() -> None:
     chain = analyze(_build_graph(E=4, S=512, N=256, K=128))
     cfg = by_name(_CFG)
     epi_n = _epi_n(cfg, chain.output_dtype)
-    host = _host_tma_c_descs(chain, frozenset({0}), epi_n)
+    host = _host_tma_c_descs(chain, cfg, frozenset({0}), epi_n)
     sequence = _tma_store_sequence(chain, cfg, frozenset({0}), epi_n)
 
     assert "global_dims=[n, m]" in host

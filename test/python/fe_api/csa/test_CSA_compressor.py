@@ -57,7 +57,7 @@ import torch
 
 def _import_compressor():
     """Import ``cudnn.csa.compressor``, skipping only on a missing cutedsl stack."""
-    # Skip only when the optional cutedsl dependency stack is missing; a broken
+    # Skip only when the optional cutedsl dependency stack is missing; an invalid
     # cudnn.csa package itself must fail the tests, not skip them.
     pytest.importorskip("cutlass", reason="Environment not supported: cudnn[cutedsl] not installed")
     pytest.importorskip("cuda.bindings", reason="Environment not supported: cuda-python not installed")
