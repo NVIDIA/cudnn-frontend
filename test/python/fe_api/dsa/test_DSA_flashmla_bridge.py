@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import math
+import subprocess
+import sys
 import types
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -50,6 +52,21 @@ def test_sparse_attention_public_namespace_is_provider_neutral():
     ):
         with pytest.raises(AttributeError):
             getattr(DSA, provider_branded_name)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("native_first", [False, True])
+def test_native_and_semantic_forward_exports_survive_import_order(native_first):
+    accesses = ["package.sparse_attention_forward", "package.SparseAttentionForward"]
+    if native_first:
+        accesses.reverse()
+    code = "import cudnn.deepseek_sparse_attention as package\n"
+    code += "\n".join(accesses)
+    code += "\nfrom cudnn.deepseek_sparse_attention.flashmla_bridge import sparse_attention_forward\n"
+    code += "assert package.sparse_attention_forward is sparse_attention_forward\n"
+    code += "assert callable(package.SparseAttentionForward)\n"
+    code += "assert package.DSA.sparse_attention_forward is sparse_attention_forward\n"
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 @pytest.mark.L0

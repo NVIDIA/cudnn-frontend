@@ -41,6 +41,10 @@ def _load_symbol(name):
     module = import_module(module_name, package=__name__)
     symbol = getattr(module, symbol_name)
     globals()[name] = symbol
+    if module_name == ".sparse_attention_forward":
+        # Importing the native subpackage sets the parent's same-named attribute
+        # to a module. Keep the public semantic function stable in either order.
+        _load_symbol("sparse_attention_forward")
     return symbol
 
 
