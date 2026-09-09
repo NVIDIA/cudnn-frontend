@@ -210,9 +210,9 @@ backward) and its workspace (about one payload-equivalent of bytes).
 
 ## SM107 (Rubin, cc 10.7–11.9)
 
-Engines: `sdpa_fwd_prefill_sm107` (f16/bf16) and `sdpa_fwd_prefill_sm107_fp8`.
-**No MXFP8 forward and no backward** on the Rubin line — those graphs fall
-through to the backend.
+Engines: `sdpa_fwd_prefill_sm107` (f16/bf16), `sdpa_fwd_prefill_sm107_fp8`
+(per-tensor FP8) and `sdpa_fwd_prefill_sm107_mxfp8` (block-scale). **No
+backward** on the Rubin line — those graphs fall through to the backend.
 
 The f16/bf16 row is a separate engine from `sdpa_fwd_prefill_sm100` (which stops
 at cc 10.6) because the lowerings diverge: the Rubin kernels build **version-1
@@ -222,8 +222,13 @@ flavor's P transfer ring at exactly 256 KiB, where a version-0 descriptor wraps
 to offset 0 and the MMA multiplies the untouched O staging slab (O comes out
 exactly zero, no crash).
 
-Rubin ships a **strict subset** of the SM100 flavors: there is no d192×d128
-sibling, so a d=192 f16 graph rides the d256 envelope at that flavor's MMA cost.
+The f16/bf16 line carries all four SM100 flavors, d192×d128 included
+(`prefill_d192_d128_f16_sm107.py` — the d128 body with `make_cfg_d192`), so a
+d=192 f16 graph lands on its NATIVE kernel. The **quantized** lines are the
+strict subset: neither has a d192×d128 sibling, and (as on SM100) the
+`(256, 256)` envelope floor keeps an inexact graph off the d256 flavor's
+unvalidated padded path, so a d=192 FP8/MXFP8 graph is **declined** rather than
+zero-padded.
 
 | Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | BPROP<br>no engine |
 |---|:--:|:--:|:--:|:--:|:--:|
@@ -232,7 +237,7 @@ sibling, so a d=192 f16 graph rides the d256 envelope at that flavor's MMA cost.
 | FP8 E4M3 / E5M2 (per-tensor) | ⚠️ⁱ | ✅ | ✅ | ✅ | ❌ |
 | MXFP8 | ❌ | ✅ | ✅ | ⚠️ⁱᵛ | ❌ |
 | O dtype ≠ QKV — **quantized graphs only** (fp16/bf16/fp8 out) | ✅ | ✅ | ✅ | ✅ | — |
-| Head-dim envelope | none — runs the d128 kernelⁱ | f16 ×8 · fp8 ×16 | f16 ×8 (serves d192 too) | f16 ×8 | — |
+| Head-dim envelope | none — runs the d128 kernelⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 ×16 (floor 255) | f16 ×8 · fp8 ×16 (floor 256) | — |
 | **Layout** | | | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -388,9 +393,9 @@ feature-free d=64 graph.
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
-| f16/bf16 forward THD, split-KV, PackGQA, optional-stats, dense padded-Q trim | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d256/d512; these five are the machinery its kernels lack |
-| Per-tensor FP8 forward above d=128 | SM107 — the d256/d512 kernels exist but have never produced a number |
-| MXFP8 forward | SM107 (kernels ported, never validated), SM120, SM80 |
+| f16/bf16 forward THD, split-KV, PackGQA, dense padded-Q trim | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d192×d128/d256/d512; these four are the machinery its kernels lack (optional stats IS served — `lse_optional=True`) |
+| d192×d128 **quantized** forward | SM107 — no FP8 or MXFP8 sibling at that shape, and the d256 envelope floor declines the inexact ride |
+| MXFP8 forward | SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
 | Per-tensor FP8 backward | every arch |
 | MXFP8 backward outside SM100/SM103 d = 256 | every arch |
 | THD / ragged backward | SM80, SM120, and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ) |

@@ -265,10 +265,6 @@ class Capabilities:
     # a row that accepts split_kv > 1 without the plumbing leaves untouched
     # partial slots at lse_partial = 0, which corrupt the combine's
     # log-sum-exp rather than raising.
-    # PackGQA, like split-KV, can be wired per FLAVOR rather than per row: the
-    # SM107 line ships it only in the d128 per-tensor FP8 kernel, while the
-    # ported d256/d512 siblings skip it.  None = every shape the row serves.
-    pack_gqa_d_shapes: Optional[frozenset] = None
     split_kv_supported: bool = False
     # Shapes whose kernel flavors wire SplitHelpers. None = every flavor in
     # d_shapes does (f16/SM120). A set = split_kv > 1 is honored only when
@@ -281,6 +277,12 @@ class Capabilities:
     # each row declares exactly what its own lowering carries — not by a
     # knob x arch notch here.
     softmax_precisions: frozenset[int] = frozenset()
+    # PackGQA, like split-KV, can be wired per FLAVOR rather than per row: the
+    # SM107 line ships it only in the d128 per-tensor FP8 kernel, while the
+    # ported d256/d512 siblings skip it.  None = every shape the row serves.
+    # APPENDED at the end deliberately: Capabilities evolves append-only, so a
+    # positional construction of an older field never silently rebinds.
+    pack_gqa_d_shapes: Optional[frozenset] = None
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -394,7 +396,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel " f"flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
                 )
         if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:
-            if (facts.d_qk, facts.d_v) not in capabilities.pack_gqa_d_shapes:
+            # _selected_d_shape, not the raw dims: the FP8 rows carry
+            # d_pad_multiple=16, so an inexact graph (D=112) lowers onto the
+            # smallest covering NATIVE flavor (d128) -- which is the kernel
+            # whose PackGQA wiring the set is describing.
+            if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
                 return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel " f"flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa:
             if facts.thd:
@@ -628,9 +634,10 @@ def _sm107_spec() -> EngineSpec:
     The lowerings diverge enough to need their own row rather than a widened
     SM100 one: the Rubin kernels build **version-1 tcgen05 SMEM descriptors**
     (a version-0 descriptor addresses only 256 KiB, and Rubin's 327 KiB budget
-    puts the d512 flavor's P ring at exactly that boundary), and Rubin ships a
-    strict SUBSET of the SM100 flavors — there is no d192xd128 sibling, so a
-    d=192 graph rides the d256 envelope here.
+    puts the d512 flavor's P ring at exactly that boundary).  The f16 line
+    carries all four SM100 flavors, d192xd128 included
+    (``prefill_d192_d128_f16_sm107.py`` — the d128 body with ``make_cfg_d192``);
+    the QUANTIZED Rubin rows are the ones that ship a strict subset.
 
     Every capability below was MEASURED on Rubin (`w2u1g-lc-0030`) against an
     explicit fp32 reference, not inherited from the SM100 row:
@@ -662,8 +669,10 @@ def _sm107_spec() -> EngineSpec:
             sm_lo=107,
             sm_hi=_BLACKWELL[1],
             phase="prefill",
-            # No (192, 128): Rubin has no native d192xd128 kernel.
-            d_shapes=frozenset({(128, 128), (256, 256), (512, 512)}),
+            # All four f16 flavors have a Rubin module -- api_dsl._SM107_KERNEL_FILES
+            # is the other half of this claim, and _pick_flavor lands a d=192
+            # graph on the NATIVE kernel rather than the d256 envelope.
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
@@ -682,14 +691,6 @@ def _sm107_spec() -> EngineSpec:
             # MASK_FLAGS == 0 the kernel's kv_right is a floor division, so an
             # un-synthesized ragged S_kv would silently drop the tail tile.
             skv_tail_via_padding=True,
-            # NATURAL and LPT only -- NOT LPT_L2.  The SM107 kernels import the
-            # SCHED_LPT_L2 constant but never pass qh_per_kh / seqlen_kv to their
-            # decode call sites, so _common_sm100._decode_initial raises
-            # "SCHED_LPT_L2 decode requires qh_per_kh and seqlen_kv at every call
-            # site" the moment heuristics proposes it.  A knob is honored or the
-            # engine is ineligible -- so the row must not claim it.  This was
-            # latent on the f16/FP8 rows too (their suites never hit a shape the
-            # heuristic sends down the L2 path); MXFP8 surfaced it.
             # NATURAL ONLY -- same finding as the FP8 and MXFP8 Rubin rows:
             # every kernel this row serves is a PORT, and the ported decode
             # sites do not honor SCHED_LPT (measured on the d512 FP8 and d128
@@ -828,7 +829,16 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # shows run-to-run nondeterminism on long causal e5m2/GQA/sink graphs;
             # min(d_qk, d_v) > 255 admits nothing inexact. Lift both floors once the
             # kernels' padded paths are validated through test_mhas_v2.
-            d_envelope_floors=() if rubin_row else (((192, 128), 128), ((256, 256), 255), ((512, 512), 256)),
+            # The Rubin row carries the SAME floors, minus the (192, 128) entry
+            # it has no flavor for.  It previously declared () -- which made
+            # mismatch() ADMIT e.g. (512, 256) and (192, 128) that
+            # api_dsl._SM100_FP8_ENVELOPE_FLOORS then rejected with a bare
+            # ValueError inside check_support: a plan that enters the ranked
+            # list only to die in the lowering (contract rule 1).  The floors'
+            # rationale transfers unchanged -- the Rubin d512 kernel is the same
+            # cga4x1 role-split geometry, and the d256 padded envelope is no
+            # more validated here than on Blackwell.
+            d_envelope_floors=(((256, 256), 255), ((512, 512), 256)) if rubin_row else (((192, 128), 128), ((256, 256), 255), ((512, 512), 256)),
             thd_d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
@@ -914,8 +924,10 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     no Rubin MXFP8 sibling.
 
     Declined deliberately, because the ported kernels lack the machinery (not
-    because it went untested): THD, split-KV, PackGQA, optional stats, and the
-    dense padded-Q trim.  See _sm107_spec for the same list on f16.
+    because it went untested): THD, split-KV, PackGQA, and the dense padded-Q
+    trim.  Optional stats IS served (``lse_optional=True`` below -- has_lse=False
+    is a real specialization on every Rubin kernel, not an accepted-and-ignored
+    flag).  See _sm107_spec for the same list on f16.
     """
     return EngineSpec(
         name="sdpa_fwd_prefill_sm107_mxfp8",
@@ -940,14 +952,6 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             # every Rubin kernel, not an accepted-and-ignored flag.
             lse_optional=True,
             skv_tail_via_padding=True,
-            # NATURAL and LPT only -- NOT LPT_L2.  The SM107 kernels import the
-            # SCHED_LPT_L2 constant but never pass qh_per_kh / seqlen_kv to their
-            # decode call sites, so _common_sm100._decode_initial raises
-            # "SCHED_LPT_L2 decode requires qh_per_kh and seqlen_kv at every call
-            # site" the moment heuristics proposes it.  A knob is honored or the
-            # engine is ineligible -- so the row must not claim it.  This was
-            # latent on the f16/FP8 rows too (their suites never hit a shape the
-            # heuristic sends down the L2 path); MXFP8 surfaced it.
             # NATURAL ONLY.  Session 6 dropped SCHED_LPT_L2 from this row
             # (the ported decode sites never thread qh_per_kh / seqlen_kv);
             # SCHED_LPT is ALSO not honored, and that stayed hidden because

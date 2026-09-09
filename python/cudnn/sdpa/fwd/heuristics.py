@@ -370,7 +370,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     # already balanced — so don't spend autotune slots on them.
     if not causal_ish and facts.window_left is None:
         runners = []
-    return [chosen] + runners
+    return [chosen, *runners]
 
 
 def select_d192_auto_knobs(

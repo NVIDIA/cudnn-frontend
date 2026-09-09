@@ -158,6 +158,9 @@ class SmemTile:
     def desc(self):
         from cutlass.experimental import primitives as prims
 
+        if self.desc_version not in (0, 1):
+            raise ValueError(f"SmemTile.desc_version must be 0 or 1 (got {self.desc_version}); there is no other tcgen05 SMEM-descriptor format")
+
         if self.desc_version == 0:
             return prims.Tcgen05SmemDesc.build(
                 self.base,
@@ -173,6 +176,15 @@ class SmemTile:
         import cutlass
         from cutlass._mlir.dialects import llvm
         from cutlass.experimental.primitives import nvvm_wrapper as _nvvm_wrap
+
+        if not hasattr(_nvvm_wrap, "_tcgen05_mma_smem_desc_v2"):
+            raise RuntimeError(
+                "desc_version=1 needs the versioned tcgen05 SMEM-descriptor intrinsic "
+                "(cutlass.experimental.primitives.nvvm_wrapper._tcgen05_mma_smem_desc_v2), "
+                "which this cutlass-dsl build does not expose.  It is required on Rubin "
+                "(SM107) for any MMA operand at or above 256 KiB; there is no kernel-side "
+                "workaround -- upgrade the DSL."
+            )
 
         addr = cutlass.Int32(llvm.ptrtoint(cutlass.Int32.mlir_type, self.base.ir_value()))
         return prims.Tcgen05SmemDesc(

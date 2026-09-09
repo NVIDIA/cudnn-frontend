@@ -85,10 +85,15 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     assert sm107.d_shapes == frozenset({(128, 128), (256, 256), (512, 512)})
     assert (192, 128) not in sm107.d_shapes
     # Envelope FLOORS keep an inexact graph off a flavor whose padded path is
-    # not validated.  They are SM100-row data: the Rubin row carries none, so
-    # its d512 kernel serves the whole (0, 512] band its d_shapes admit.
+    # not validated.  BOTH rows carry them, and the Rubin one differs only by
+    # the (192, 128) entry it has no flavor for -- the floors' rationale is the
+    # kernel geometry (a cga4x1 d512 role-split; an unvalidated d256 padded
+    # path), which the Rubin ports inherit unchanged.  They must also match
+    # api_dsl._SM100_FP8_ENVELOPE_FLOORS, which the adapter enforces on BOTH
+    # arch lines -- a row that admits what the adapter rejects is a plan that
+    # enters the ranked list only to die in check_support.
     assert sm100.d_envelope_floors == (((192, 128), 128), ((256, 256), 255), ((512, 512), 256))
-    assert sm107.d_envelope_floors == ()
+    assert sm107.d_envelope_floors == (((256, 256), 255), ((512, 512), 256))
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
     assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
@@ -112,11 +117,15 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     assert sm100.thd and sm107.thd and sm100.cu_seq_len and sm107.cu_seq_len
 
 
-def test_sm107_row_ranks_the_lpt_remap_for_causal():
-    """The LPT/LPT_L2 remap (issue #653) is live on the Rubin row: a causal
-    per-tensor FP8 graph at cc10.7 ranks LPT_L2 first, exactly as its SM100
-    twin does, and both remap specializations template-load. Pure — facts pin
-    the device, and nothing here compiles."""
+def test_sm107_row_ranks_natural_only_for_causal():
+    """The LPT/LPT_L2 remap (issue #653) is an SM100-row property.  A causal
+    per-tensor FP8 graph ranks [LPT_L2, LPT, NATURAL] there, but the Rubin row
+    declares a SINGLE-element domain -- its ported kernels raise on the L2
+    decode and do not honor LPT -- so ranking must offer exactly [NATURAL] and
+    never bolt a fallback on beside it.  The LPT specialization still
+    template-LOADS; it is the decode that is unvalidated, which is why the ROW
+    declines rather than the template raising.  Pure — facts pin the device,
+    and nothing here compiles."""
     import cudnn as _c
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa import graph_analyzer as ga
@@ -426,17 +435,19 @@ def test_fp8_envelope_mismatch_rules():
     # but has no d192 flavor at all.
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
-    # d192xd128 has no Rubin FP8 FLAVOR, but the SHAPE is still served: it rides
-    # the (256, 256) envelope with zero padding, exactly as any other
-    # non-native d in the band does.  "No flavor" is not "declined".
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
+    # d192xd128 has no Rubin FP8 FLAVOR *and* is not served: the (256, 256)
+    # floor (255) keeps every inexact graph off that flavor's unvalidated
+    # padded path, exactly as on the SM100 row.  Asserting the DECLINE rather
+    # than skipping it -- INVERTS-WHEN a Rubin d192 FP8 sibling lands, or the
+    # d256 padded envelope is validated through test_mhas_v2.
+    assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128))
     assert "dense-only" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))
     # INVERTED: the Rubin line gained a d512 per-tensor FP8 kernel, so the
     # native d512 shape is now SERVED rather than declined.  d192xd128 is the
     # one flavor it still lacks (asserted above), and the (256, 512] floor
     # applies here exactly as on the SM100 row.
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512)) is None
-    # ...and, carrying NO envelope floors (unlike the SM100 row), its d512
-    # flavor also serves the padded band below the native shape.
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=256)) is None
+    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=384, d_v=448)) is None
+    # ...and straddling the floor declines on BOTH rows, identically.
+    assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=256))
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=256))

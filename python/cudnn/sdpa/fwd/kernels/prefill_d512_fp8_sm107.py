@@ -93,6 +93,23 @@ from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d512
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d512(PARAMS)
+
+# tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
+# decision point, wired into every construction below rather than repeated as a
+# per-tile literal.  A version-0 descriptor's ``start_address`` is 14 bits = a
+# 256 KiB window; Rubin raises the per-CTA SMEM cap to 327 KiB, and THIS flavor
+# crosses the line (the d512 slabs put the P transfer ring at exactly 262144),
+# so a version-0 descriptor would wrap to offset 0 and the MMA would multiply
+# whatever sits at the bottom of SMEM -- the accumulator comes out EXACTLY
+# zero, or the SF columns come back as data bytes (LSE = +inf, O = NaN).  No
+# crash either way.  Matches what C++ SmemTile::make_desc always emitted.
+#
+# Do NOT re-literal this at a call site: this kernel's MXFP8 sibling shipped
+# NaN on 100% of cells because its scale-factor tiles were declared UNDER a
+# comment claiming "every operand tile here carries desc_version=1" -- without
+# the kwarg.  A single constant makes that class of drift impossible, and
+# test_sm107_descriptor_version_matches_the_smem_budget asserts it.
+DESC_VERSION: int = 1
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -586,12 +603,12 @@ def _kernel(
     # LSE staging on sg1 (sub-tile write-back from corr; cf. C++ line 198).
     sLSE_raw = cutlass.Array(cutlass.Float32, CFG.TILE_M, alignment=128, space=cutlass.AddressSpace.smem)
 
-    # Typed SmemTile handles.
-    # Rubin SM107 raises the per-CTA SMEM cap to 327 KiB, so an MMA-operand
-    # buffer can land at or above 256 KiB — past what a version-0 tcgen05 SMEM
-    # descriptor can address (14-bit start_address).  Every operand tile here
-    # therefore carries desc_version=1, matching what C++ SmemTile::make_desc
-    # always emitted.  See tile_dsl/handles.py SmemTile.desc_version.
+    # Typed SmemTile handles.  EVERY tile takes the module-level DESC_VERSION
+    # (= 1 here) -- see its declaration for why that is one constant and not a
+    # per-tile literal.  The short version: Rubin raises the per-CTA SMEM cap
+    # to 327 KiB, so a buffer can land past the 256 KiB a version-0 tcgen05
+    # descriptor can address (14-bit start_address), and the tiles that cross
+    # the line are not the ones you would guess.
     sQ = SmemTile(
         base=sQ_raw,
         elems_per_stage=qBufferElems,
@@ -602,7 +619,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_QK_GRANU_ELEMS,
-        desc_version=1,
+        desc_version=DESC_VERSION,
     )
     sK = SmemTile(
         base=sK_raw,
@@ -614,7 +631,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=(CFG.TILE_N // CFG.CTA_MMA) * TMA_QK_GRANU_ELEMS,
-        desc_version=1,
+        desc_version=DESC_VERSION,
     )
     sV = SmemTile(
         base=sV_raw,
@@ -626,7 +643,7 @@ def _kernel(
         tma_loads_per_tile=TMA_VO_ITERS // CFG.CTA_MMA,
         tma_granu_elems=TMA_VO_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_N * TMA_VO_GRANU_ELEMS,
-        desc_version=1,
+        desc_version=DESC_VERSION,
     )
     sO = SmemTile(
         base=sO_raw,
@@ -638,6 +655,7 @@ def _kernel(
         tma_loads_per_tile=TMA_O_ITERS_HOST,
         tma_granu_elems=TMA_O_GRANU_ELEMS_HOST,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_O_GRANU_ELEMS_HOST,
+        desc_version=DESC_VERSION,
     )
 
     # ------------------------------------------------------------------
@@ -1820,7 +1838,7 @@ def _mma_warp_group(
         leading_byte_offset=LEADING_BYTE_OFFSET_QK,
         stride_byte_offset=STRIDE_BYTE_OFFSET_QK,
         layout=SMEM_LAYOUT_P,
-        desc_version=1,
+        desc_version=DESC_VERSION,
     )
 
     # BMM1 leader: desc_Q is tile-static (Q stays resident under d=512 / no Q∪K alias).

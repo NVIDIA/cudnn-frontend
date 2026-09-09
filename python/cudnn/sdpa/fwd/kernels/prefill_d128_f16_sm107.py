@@ -31,12 +31,14 @@ Same kernel shape as the C++ source: pipeline, TMEM/SMEM layout,
 barrier inventory + init counts, scheduler, warp dispatch, register
 split match.  Canonical reference port; reaches ~0.99x C++ TFLOPS.
 
-THD / varlen (``CFG.THD_VARLEN=1``, the pre-upstream packed-varlen entry point)
-is supported (f16/bf16) for all three d=128 flavors (llama / dsv3 / gptoss) at
-cga1 and cga2: packed ``[1,T,H,D]`` + ``cu_seqlens`` coord offset (applied to
-both Q slabs under TILES_Q=2), per-batch O TMA-descriptor array (shared
-``kernels/ctm/common/sdpa/thd.py``), packed ``[1,QH,T]`` LSE.  The dense
-``[B,S,H,D]`` path is byte-identical.
+THD / varlen is **NOT** ported.  The pre-upstream body carried a packed-varlen
+entry point (``CFG.THD_VARLEN=1``: packed ``[1,T,H,D]`` + ``cu_seqlens`` coord
+offset, per-batch O TMA-descriptor array, packed ``[1,QH,T]`` LSE), but its
+setup-kernel call site still speaks the pre-upstream 7-arg contract against a
+14-arg helper and the metadata layout differs (3B+2 vs 4B+4).  ``compile()``
+raises on ``CFG.THD_VARLEN`` rather than half-serving it, ``config_sm107``
+rejects THD for f16/bf16, and no engine row advertises it.  Only the dense
+``[B,S,H,D]`` path is served.
 """
 
 import os
@@ -77,6 +79,20 @@ from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d128
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d128(PARAMS)
+
+# tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
+# decision point, wired into every construction below rather than repeated as a
+# per-tile literal.  A version-0 descriptor's ``start_address`` is 14 bits = a
+# 256 KiB window; Rubin raises the per-CTA SMEM cap to 327 KiB, so an operand
+# buffer at or above 256 KiB wraps to offset 0 and the MMA multiplies whatever
+# sits at the bottom of SMEM.  This flavor's buffers all stay below the line.
+#
+# Do NOT re-literal this at a call site: the d512 MXFP8 sibling shipped NaN on
+# 100% of cells because its scale-factor tiles were declared UNDER a comment
+# claiming "every operand tile here carries desc_version=1" -- without the
+# kwarg.  A single constant makes that class of drift impossible, and
+# test_sm107_descriptor_version_matches_the_smem_budget asserts it.
+DESC_VERSION: int = 0
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -308,6 +324,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sK = SmemTile(
         base=sK_raw,
@@ -319,6 +336,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=(CFG.TILE_N // CFG.CTA_MMA) * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sV = SmemTile(
         base=sV_raw,
@@ -331,6 +349,7 @@ def _kernel(
         tma_loads_per_tile=TMA_VO_ITERS // CFG.CTA_MMA,
         tma_granu_elems=TMA_VO_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_N * TMA_VO_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sO = SmemTile(
         base=sO_raw,
@@ -342,6 +361,7 @@ def _kernel(
         tma_loads_per_tile=TMA_O_ITERS_HOST,
         tma_granu_elems=TMA_O_GRANU_ELEMS_HOST,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_O_GRANU_ELEMS_HOST,
+        desc_version=DESC_VERSION,
     )
 
     bars = make_classic_bars(CFG)
@@ -1726,6 +1746,24 @@ def _correction_warp_group(
                 lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
                 # Safe inverse: avoid div by 0 on fully-masked rows.
                 inv_sum = cutlass.Float32(1.0) / cute.math.max(total_sum, cutlass.Float32(1e-30))
+            # --- empty KV range (fully-masked / zero-length KV for this tile) ---
+            # Same guard as prefill_d256_{f16,fp8,mxfp8}_sm107.py.  With
+            # bounds.right <= bounds.left the kv loop ran ZERO iterations, so
+            # BMM2 never overwrote the O accumulator (mma_ss overwrites only on
+            # its first k-step) and TMEM still holds the PREVIOUS persistent
+            # tile's O -- residue, possibly a NaN bit pattern.
+            #
+            # The softmax warp still publishes (total_max = -inf, total_sum = 0)
+            # for an empty range, so LSE is already right on both arms: no-sink
+            # gives -inf + log(0) = -inf (this kernel puts NO 1e-30 floor on the
+            # log -- if one is ever added, the select below must cover lse_val
+            # too, or it leaks log(1e-30) = -69.08), and the sink arm folds to
+            # exactly sink_logit.  inv_sum, however, is 1/max(0, 1e-30) = 1e30
+            # (no sink) or 0 (sink), so O = residue * 1e30 -> +-inf/NaN, or
+            # residue * 0 -> NaN.  Zero O with a SELECT, never a multiply.
+            _kv_empty = bounds.right <= bounds.left
+            if cutlass.const_expr(not CFG.HAS_SINK):
+                lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
 
             # OOB-row guard: under cga2 the cluster's Q rows can exceed seqlen_q;
             # without the guard the write aliases the next head's LSE slot.
@@ -1759,6 +1797,14 @@ def _correction_warp_group(
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 o_scaled = o_chunk * inv_sum
+                # SELECT the zero for an empty KV range -- see _kv_empty above.
+                # NB: a plain `for` statement, not a comprehension -- the DSL
+                # preprocessor only rewrites statement-level range_constexpr
+                # loops ("range_constexpr should be preprocessed by preprocessor").
+                _o_elems = []
+                for _i in cutlass.range_constexpr(O_CHUNK):
+                    _o_elems.append(cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_i].ir_value())))
+                o_scaled = cutlass.Vector.from_elements(tuple(_o_elems), cutlass.Float32)
                 o_fp16 = o_scaled.to(STORAGE_DTYPE)
 
                 col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE

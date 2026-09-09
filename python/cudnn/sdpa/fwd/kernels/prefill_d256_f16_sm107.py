@@ -44,6 +44,20 @@ from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d256
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d256(PARAMS)
+
+# tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
+# decision point, wired into every construction below rather than repeated as a
+# per-tile literal.  A version-0 descriptor's ``start_address`` is 14 bits = a
+# 256 KiB window; Rubin raises the per-CTA SMEM cap to 327 KiB, so an operand
+# buffer at or above 256 KiB wraps to offset 0 and the MMA multiplies whatever
+# sits at the bottom of SMEM.  This flavor's buffers all stay below the line.
+#
+# Do NOT re-literal this at a call site: the d512 MXFP8 sibling shipped NaN on
+# 100% of cells because its scale-factor tiles were declared UNDER a comment
+# claiming "every operand tile here carries desc_version=1" -- without the
+# kwarg.  A single constant makes that class of drift impossible, and
+# test_sm107_descriptor_version_matches_the_smem_budget asserts it.
+DESC_VERSION: int = 0
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -259,6 +273,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sK = SmemTile(
         base=sK_raw,
@@ -270,6 +285,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=(CFG.TILE_N // CFG.CTA_MMA) * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sV = SmemTile(
         base=sV_raw,
@@ -281,6 +297,7 @@ def _kernel(
         tma_loads_per_tile=TMA_VO_ITERS // CFG.CTA_MMA,
         tma_granu_elems=TMA_VO_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_N * TMA_VO_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     # sO shares backing with sQ (Q∪O alias).
     sO = SmemTile(
@@ -293,6 +310,7 @@ def _kernel(
         tma_loads_per_tile=TMA_O_ITERS_HOST,
         tma_granu_elems=TMA_O_GRANU_ELEMS_HOST,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_O_GRANU_ELEMS_HOST,
+        desc_version=DESC_VERSION,
     )
 
     bars = make_d256_bars(CFG, N_O_CHUNKS=N_O_CHUNKS)

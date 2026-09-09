@@ -37,6 +37,20 @@ from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d128_mxfp8
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d128_mxfp8(PARAMS)
+
+# tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
+# decision point, wired into every construction below rather than repeated as a
+# per-tile literal.  A version-0 descriptor's ``start_address`` is 14 bits = a
+# 256 KiB window; Rubin raises the per-CTA SMEM cap to 327 KiB, so an operand
+# buffer at or above 256 KiB wraps to offset 0 and the MMA multiplies whatever
+# sits at the bottom of SMEM.  This flavor's buffers all stay below the line.
+#
+# Do NOT re-literal this at a call site: the d512 MXFP8 sibling shipped NaN on
+# 100% of cells because its scale-factor tiles were declared UNDER a comment
+# claiming "every operand tile here carries desc_version=1" -- without the
+# kwarg.  A single constant makes that class of drift impossible, and
+# test_sm107_descriptor_version_matches_the_smem_budget asserts it.
+DESC_VERSION: int = 0
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -330,6 +344,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sK = SmemTile(
         base=sK_raw,
@@ -341,6 +356,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=(CFG.TILE_N // CFG.CTA_MMA) * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sV = SmemTile(
         base=sV_raw,
@@ -352,6 +368,7 @@ def _kernel(
         tma_loads_per_tile=TMA_VO_ITERS // CFG.CTA_MMA,
         tma_granu_elems=TMA_VO_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_N * TMA_VO_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sO = SmemTile(
         base=sO_raw,
@@ -363,6 +380,7 @@ def _kernel(
         tma_loads_per_tile=TMA_O_ITERS_HOST,
         tma_granu_elems=TMA_O_GRANU_ELEMS_HOST,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_O_GRANU_ELEMS_HOST,
+        desc_version=DESC_VERSION,
     )
 
     # SF SmemTiles: no-swizzle, leading=16, stride=128. TMA-LDG warp issues one 5-D bulk.tensor per slab.
@@ -375,6 +393,7 @@ def _kernel(
         leading_byte_offset=SF_LEADING_BYTE_OFFSET,
         stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
         layout=SMEM_LAYOUT_SF,
+        desc_version=DESC_VERSION,
     )
     sK_SF = SmemTile(
         base=sK_SF_raw,
@@ -383,6 +402,7 @@ def _kernel(
         leading_byte_offset=SF_LEADING_BYTE_OFFSET,
         stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
         layout=SMEM_LAYOUT_SF,
+        desc_version=DESC_VERSION,
     )
     sP_SF = SmemTile(
         base=sP_SF_raw,
@@ -391,6 +411,7 @@ def _kernel(
         leading_byte_offset=SF_LEADING_BYTE_OFFSET,
         stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
         layout=SMEM_LAYOUT_SF,
+        desc_version=DESC_VERSION,
     )
     sV_SF = SmemTile(
         base=sV_SF_raw,
@@ -399,6 +420,7 @@ def _kernel(
         leading_byte_offset=SF_LEADING_BYTE_OFFSET,
         stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
         layout=SMEM_LAYOUT_SF,
+        desc_version=DESC_VERSION,
     )
 
     bars = make_classic_bars(CFG)
@@ -1964,23 +1986,51 @@ def _correction_warp_group(
                 lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
                 # Safe inverse: avoid div by 0 (rows fully masked).
                 inv_sum = cutlass.Float32(1.0) / cute.math.max(total_sum, cutlass.Float32(1e-30))
+            # --- empty KV range (fully-masked / zero-length KV for this tile) ---
+            # Same guard as prefill_d256_mxfp8_sm107.py.  With bounds.right <=
+            # bounds.left the kv loop ran ZERO iterations, so BMM2 never
+            # overwrote the O accumulator (mma_ss overwrites only on its first
+            # k-step) and TMEM still holds the PREVIOUS persistent tile's O --
+            # residue, possibly a NaN bit pattern.
+            #
+            # The softmax warp still publishes (total_max = -inf, total_sum = 0)
+            # for an empty range, so LSE is already right on both arms: no-sink
+            # gives -inf + log(0) = -inf (this kernel puts NO 1e-30 floor on the
+            # log -- if one is ever added, the select below must cover lse_val
+            # too, or it leaks log(1e-30) = -69.08), and the sink arm folds to
+            # exactly sink_logit.  inv_sum, however, is 1/max(0, 1e-30) = 1e30
+            # (no sink) or 0 (sink), so O = residue * 1e30 -> +-inf/NaN, or
+            # residue * 0 -> NaN.  Zero O with a SELECT, never a multiply -- and
+            # BEFORE the amax fold below, or one dead row's NaN permanently
+            # inflates the graph's Amax_O for every live row (atomicMax only grows).
+            _kv_empty = bounds.right <= bounds.left
+            if cutlass.const_expr(not CFG.HAS_SINK):
+                lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
 
             # OOB-row guard: under cga2 cluster Q rows can exceed seqlen_q (else write aliases next head's LSE slot).
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
+            # ONE row bound for BOTH the LSE write and the amax atomic below.
+            # They must stay tied: amax is an atomicMax, which only GROWS, so a
+            # single padded row folded in permanently inflates the graph's
+            # Amax_O for the whole tensor and no per-row check ever shows it.
+            # Dense-only today (compile() rejects THD on this kernel), but the
+            # THD arm is written out so a future port cannot diverge the two.
+            q_row_limit = seqlen_q
             if cutlass.const_expr(CFG.THD_VARLEN):
                 # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
                 # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
                 _cu = cutlass.make_array_view(seq_kv_lens_tensor)
                 _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
                 _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+                q_row_limit = _s_q_b
                 if cutlass.const_expr(lse_tensor is not None):
-                    if q_row_global < _s_q_b:
+                    if q_row_global < q_row_limit:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
                         lse_row[_cu_q_b + q_row_global] = lse_val
             else:
                 if cutlass.const_expr(lse_tensor is not None):
-                    if q_row_global < seqlen_q:
+                    if q_row_global < q_row_limit:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_row = lse_arr[batch_idx, head_idx, :]
                         lse_row[q_row_global] = lse_val
@@ -2002,6 +2052,14 @@ def _correction_warp_group(
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 o_scaled = o_chunk * inv_sum
+                # SELECT the zero for an empty KV range -- see _kv_empty above.
+                # NB: a plain `for` statement, not a comprehension -- the DSL
+                # preprocessor only rewrites statement-level range_constexpr
+                # loops ("range_constexpr should be preprocessed by preprocessor").
+                _o_elems = []
+                for _i in cutlass.range_constexpr(O_CHUNK):
+                    _o_elems.append(cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_i].ir_value())))
+                o_scaled = cutlass.Vector.from_elements(tuple(_o_elems), cutlass.Float32)
                 for _i in cutlass.range_constexpr(O_CHUNK):
                     _e = o_scaled[_i]
                     _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
@@ -2018,7 +2076,7 @@ def _correction_warp_group(
                     bars.mb_o_empty[qs].wait(o_empty_phase)
                 smem_ptr.store_swizzled(o_out, alignment=64, swizzle=_O_SMEM_SWIZZLE)
 
-            if q_row_global < seqlen_q:
+            if q_row_global < q_row_limit:
                 nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 
             # fence_proxy needed before TMA reads SMEM written by tcgen05_st.

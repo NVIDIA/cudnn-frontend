@@ -59,6 +59,20 @@ from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d256_mxfp8
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d256_mxfp8(PARAMS)
+
+# tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
+# decision point, wired into every construction below rather than repeated as a
+# per-tile literal.  A version-0 descriptor's ``start_address`` is 14 bits = a
+# 256 KiB window; Rubin raises the per-CTA SMEM cap to 327 KiB, so an operand
+# buffer at or above 256 KiB wraps to offset 0 and the MMA multiplies whatever
+# sits at the bottom of SMEM.  This flavor's buffers all stay below the line.
+#
+# Do NOT re-literal this at a call site: the d512 MXFP8 sibling shipped NaN on
+# 100% of cells because its scale-factor tiles were declared UNDER a comment
+# claiming "every operand tile here carries desc_version=1" -- without the
+# kwarg.  A single constant makes that class of drift impossible, and
+# test_sm107_descriptor_version_matches_the_smem_budget asserts it.
+DESC_VERSION: int = 0
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -390,6 +404,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sK = SmemTile(
         base=sK_raw,
@@ -401,6 +416,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=(CFG.TILE_N // CFG.CTA_MMA) * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sV = SmemTile(
         base=sV_raw,
@@ -412,6 +428,7 @@ def _kernel(
         tma_loads_per_tile=TMA_VO_ITERS // CFG.CTA_MMA,
         tma_granu_elems=TMA_VO_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_N * TMA_VO_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     # sO shares backing with sQ (Q∪O alias) — OUT_STORAGE_DTYPE view for BPE_O offsets.
     sO = SmemTile(
@@ -424,6 +441,7 @@ def _kernel(
         tma_loads_per_tile=TMA_O_ITERS_HOST,
         tma_granu_elems=TMA_O_GRANU_ELEMS_HOST,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_O_GRANU_ELEMS_HOST,
+        desc_version=DESC_VERSION,
     )
 
     sQ_SF = SmemTile(
@@ -433,6 +451,7 @@ def _kernel(
         leading_byte_offset=SF_LEADING_BYTE_OFFSET,
         stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
         layout=SMEM_LAYOUT_SF,
+        desc_version=DESC_VERSION,
     )
     sK_SF = SmemTile(
         base=sK_SF_raw,
@@ -441,6 +460,7 @@ def _kernel(
         leading_byte_offset=SF_LEADING_BYTE_OFFSET,
         stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
         layout=SMEM_LAYOUT_SF,
+        desc_version=DESC_VERSION,
     )
     sP_SF = SmemTile(
         base=sP_SF_raw,
@@ -449,6 +469,7 @@ def _kernel(
         leading_byte_offset=SF_LEADING_BYTE_OFFSET,
         stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
         layout=SMEM_LAYOUT_SF,
+        desc_version=DESC_VERSION,
     )
     sV_SF = SmemTile(
         base=sV_SF_raw,
@@ -457,6 +478,7 @@ def _kernel(
         leading_byte_offset=SF_LEADING_BYTE_OFFSET,
         stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
         layout=SMEM_LAYOUT_SF,
+        desc_version=DESC_VERSION,
     )
 
     bars = make_d256_bars(CFG, N_O_CHUNKS=N_O_CHUNKS)
@@ -1898,19 +1920,25 @@ def _correction_warp_group(
             lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
 
         q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + tid_in_wg
+        # ONE row bound for BOTH the LSE write and the amax atomic below.
+        # They must stay tied: amax is an atomicMax, which only GROWS, so a
+        # single padded row folded in permanently inflates the graph's Amax_O
+        # for the whole tensor and no per-row check ever shows it.
+        q_row_limit = seqlen_q
         if cutlass.const_expr(CFG.THD_VARLEN):
             # THD: sequence-local row; LSE packed [1,QH,T] → [0, head, cu_q[b]+local].
             _cu = cutlass.make_array_view(seq_kv_lens_tensor)
             _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
             _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+            q_row_limit = _s_q_b
             if cutlass.const_expr(lse_tensor is not None):
-                if q_row_global < _s_q_b:
+                if q_row_global < q_row_limit:
                     lse_arr = cutlass.make_array_view(lse_tensor)
                     lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
                     lse_row[_cu_q_b + q_row_global] = lse_val
         else:
             if cutlass.const_expr(lse_tensor is not None):
-                if q_row_global < seqlen_q:
+                if q_row_global < q_row_limit:
                     lse_arr = cutlass.make_array_view(lse_tensor)
                     lse_row = lse_arr[batch_idx, head_idx, :]
                     lse_row[q_row_global] = lse_val
@@ -1981,7 +2009,7 @@ def _correction_warp_group(
                 nvvm.fence_proxy("async.shared", space="cta")
                 bars.mb_o_full[block_idx // _BLOCKS_PER_OCHUNK].arrive()
 
-        if q_row_global < seqlen_q:
+        if q_row_global < q_row_limit:
             nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 
         epilogue_state = epilogue_state ^ cutlass.Int32(1)

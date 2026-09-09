@@ -249,8 +249,13 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.split_kv and k.split_kv > 1:
         raise ValueError(f"{flavor}: split_kv > 1 is not wired in the SM107 kernels (no SplitHelpers)")
-    if k.thd_varlen and k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16):
-        raise ValueError(f"{flavor}: THD/varlen supports f16/bf16/fp8 only (got dtype_qkv={k.dtype_qkv})")
+    # FP8/MXFP8 only.  The f16/bf16 Rubin kernels carry no varlen plumbing --
+    # their setup-kernel call site still speaks the pre-upstream 7-arg contract
+    # against a 14-arg helper, and the metadata layout differs (3B+2 vs 4B+4).
+    # (This guard used to repeat the same dtype set the check above already
+    # enforces, so it declined nothing.)
+    if k.thd_varlen and k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2):
+        raise ValueError(f"{flavor}: THD/varlen is FP8/MXFP8 only on SM107 (got dtype_qkv={k.dtype_qkv}); the f16/bf16 kernels carry no varlen plumbing")
 
 
 def _band_fields(params: TemplateParams) -> Tuple[int, int, int, int, int]:

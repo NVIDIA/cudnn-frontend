@@ -39,14 +39,13 @@ pytestmark = [requires_blackwell, requires_dsl]
 # under test. The d192xd128 kernel flavor exists on the sm100 engine only.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
 _skip_on_rubin = pytest.mark.skipif(_SM == 107, reason="the d192xd128 per-tensor FP8 flavor has no Rubin kernel (sm107 serves d128 only)")
-# d256 is SERVED on Rubin as of the SM107 port -- kept as a no-op marker so
-# the many _D128_D256 call sites need no churn.
-_skip_d256_on_rubin = pytest.mark.skipif(False, reason="d256 per-tensor FP8 is served on Rubin")
-_D128_D256 = [pytest.param(128, id="d128"), pytest.param(256, id="d256", marks=_skip_d256_on_rubin)]
-# Same gate, accurate for ANY flavor wider than d128 (the d192xd128 THD case
-# below needs it too, and the d256-specific wording would read wrong there).
-# Only d192xd128 lacks a Rubin per-tensor FP8 kernel now.
-_skip_wide_fp8_on_rubin = pytest.mark.skipif(False, reason="d256/d512 per-tensor FP8 are served on Rubin")
+# Rubin serves per-tensor FP8 at d128/d256/d512 as of the SM107 port, so no
+# flavor gate is needed for the dense cases.  Only d192xd128 lacks a Rubin
+# sibling; that one is gated by _skip_on_rubin above.  (These used to be
+# skipif(False) no-op markers -- a marker that reads like a live gate and never
+# skips, whose `reason` states why the case IS served.  If a flavor ever loses
+# its Rubin kernel, add a real `_SM == 107` marker back.)
+_D128_D256 = [pytest.param(128, id="d128"), pytest.param(256, id="d256")]
 
 # Rubin serves per-tensor FP8 at d128/d256/d512, but its THD and PackGQA legs
 # are d128-ONLY -- the row says so per shape (`thd_d_shapes` /
@@ -606,7 +605,6 @@ def test_fp8_large_flavors_serve_exact_shapes_only():
 
 
 @pytest.mark.L0
-@_skip_d256_on_rubin
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
@@ -629,7 +627,6 @@ def test_fp8_d256_output_dtypes(in_key, out_key):
 
 
 @pytest.mark.L0
-@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("mask", ["none", "causal_br", "swa"])
 @torch_fork_set_rng(seed=0)
@@ -653,7 +650,6 @@ def test_fp8_d256_masks(in_key, mask):
 
 @_skip_wide_strided_stats_on_rubin
 @pytest.mark.L1
-@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=59)
 def test_fp8_d256_strided_stats(in_key):
@@ -662,7 +658,6 @@ def test_fp8_d256_strided_stats(in_key):
 
 
 @pytest.mark.L1
-@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
 def test_fp8_d256_bottom_right_rectangular(in_key):
@@ -685,7 +680,6 @@ def test_fp8_d256_bottom_right_rectangular(in_key):
 
 
 @pytest.mark.L1
-@_skip_d256_on_rubin
 @pytest.mark.parametrize("case", ["right", "bottom_right", "right_swa"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_d256_right_band_combinations(case):
@@ -715,7 +709,6 @@ def test_fp8_d256_right_band_combinations(case):
 
 
 @pytest.mark.L1
-@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
@@ -742,7 +735,6 @@ def test_fp8_d256_padding(in_key, causal):
 
 @_skip_dense_q_trim_on_rubin
 @pytest.mark.L1
-@_skip_d256_on_rubin
 @torch_fork_set_rng(seed=0)
 def test_fp8_d256_dense_q_trim_stats_sink():
     """Short dense Q rows trim O/LSE even when a sink makes softmax finite."""
@@ -772,7 +764,6 @@ def test_fp8_d256_dense_q_trim_stats_sink():
 
 
 @pytest.mark.L1
-@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
 def test_fp8_d256_gqa_sink(in_key):
@@ -798,7 +789,6 @@ def test_fp8_d256_gqa_sink(in_key):
 
 
 @pytest.mark.L0
-@_skip_d256_on_rubin
 @pytest.mark.parametrize(
     ("in_key", "out_key", "with_sink"),
     [
@@ -1419,10 +1409,11 @@ def test_fp8_d192_d128_thd_features():
 
 
 @pytest.mark.L0
-# Rubin serves d128 only on this row, so the two wider flavors have no kernel
-# there -- same gate _D128_D256 applies, spelled out because this list is
-# inline.  Without it the test pins sdpa_fwd_prefill_sm107_fp8 for a shape
-# the row correctly declines and fails with "no plan for engine".
+# Rubin serves per-tensor FP8 at d128/d256/d512, but its THD leg is d128-ONLY
+# (row: thd_d_shapes={(128, 128)}), so the two wider THD flavors are DECLINED
+# there -- a capability gap, not a missing kernel.  Without the gate the test
+# pins sdpa_fwd_prefill_sm107_fp8 for a shape the row correctly declines and
+# fails with "no plan for engine".
 @pytest.mark.parametrize(
     "d_qk,d_v",
     [
@@ -1448,7 +1439,6 @@ def test_fp8_thd_multi_unit_per_cta(monkeypatch, d_qk, d_v):
 
 @_skip_wide_thd_on_rubin
 @pytest.mark.L0
-@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
@@ -1643,17 +1633,15 @@ def test_fp8_sm100_device_scales_execute_reads_no_device_memory():
 #
 # Same cga4x1 role-split kernel family as the d512 f16 sibling; the FP8 fork
 # runs STAGES_KV = XFER_STAGES = 3 with a 128-column TMEM-resident Q and the
-# Blackwell K=32 QMMA step.  There is no d512 MXFP8 kernel and no Rubin d512
-# kernel, so this whole section is sm100-only.
+# Blackwell K=32 QMMA step.  There is no d512 MXFP8 kernel on EITHER line; the
+# Rubin per-tensor d512 kernel exists and runs this section too.
 # ===========================================================================
 
-_skip_d512_on_rubin = pytest.mark.skipif(False, reason="d512 per-tensor FP8 is served on Rubin")
 _D512 = 512
 _D512_SCALE = 1.0 / math.sqrt(_D512)
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("mask", list(_MASKS))
 @torch_fork_set_rng(seed=0)
@@ -1664,7 +1652,6 @@ def test_fp8_d512_masks(in_key, mask):
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
@@ -1679,7 +1666,6 @@ def test_fp8_d512_output_dtypes(in_key, out_key):
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_sink():
     """Attention sink on d512: one extra softmax column with V = 0."""
@@ -1689,7 +1675,6 @@ def test_fp8_d512_sink():
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @pytest.mark.parametrize("h_q,h_kv", [(8, 2), (8, 1)], ids=["g4", "mqa"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_gqa(h_q, h_kv):
@@ -1699,7 +1684,6 @@ def test_fp8_d512_gqa(h_q, h_kv):
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_padded_kv():
     """Per-batch KV padding (seq_len_kv) on d512: KV columns past the batch's
@@ -1710,7 +1694,6 @@ def test_fp8_d512_padded_kv():
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_stats():
     """generate_stats on d512: the dense LSE matches the natural-log reference."""
@@ -1721,7 +1704,6 @@ def test_fp8_d512_stats():
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_multi_tile():
     """A shape that spans several Q tiles and several persistent waves, so the
@@ -1738,7 +1720,6 @@ def test_fp8_d512_multi_tile():
 
 @_skip_wide_thd_on_rubin
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
@@ -1751,7 +1732,6 @@ def test_fp8_d512_thd(in_key, causal):
 
 @_skip_wide_thd_on_rubin
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_thd_cross_gqa():
     """THD cross-attention on d512: unequal per-sequence Q and KV lengths with
@@ -1762,7 +1742,6 @@ def test_fp8_d512_thd_cross_gqa():
 
 @_skip_wide_thd_on_rubin
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_thd_sink_stats():
     """THD + sink + ragged Stats on d512 (packed token-major TH1 layout)."""
@@ -1775,7 +1754,6 @@ def test_fp8_d512_thd_sink_stats():
 
 @_skip_wide_thd_on_rubin
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_thd_zero_len_kv():
     """Zero-length KV and Q sequences on d512 (the d128 sibling's shapes).
@@ -1798,7 +1776,6 @@ def test_fp8_d512_thd_zero_len_kv():
 
 @_skip_wide_thd_on_rubin
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_thd_cu_seq_len():
     """THD on d512 via the cu_seq_len prefix-sum length form."""
@@ -1807,7 +1784,6 @@ def test_fp8_d512_thd_cu_seq_len():
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
 @pytest.mark.parametrize(
     ("d_qk", "d_v"),
     [(384, 448), (464, 368), (272, 272), (512, 496)],
@@ -1830,7 +1806,6 @@ def test_fp8_d512_head_dim_envelope(d_qk, d_v, mask):
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
 def test_fp8_d512_envelope_floor_declines_straddling_shapes():
     """The D512 flavor serves the (256, 512] band on both head dims; shapes
     straddling its floor decline.  Below it the D256 flavor is exact-shape only
@@ -1855,15 +1830,22 @@ def test_fp8_envelope_floor_matches_engine_row():
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.api_dsl import _SM100_FP8_ENVELOPE_FLOORS
 
-    row = {s.name: s.capabilities for s in engines.ENGINE_SPECS}[engines.engine_name(fp8=True)]
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    row = caps[engines.engine_name(fp8=True)]
     assert dict(row.d_envelope_floors) == _SM100_FP8_ENVELOPE_FLOORS
+    # The RUBIN row too: the adapter consults one arch-independent table, so a
+    # Rubin row with different floors admits shapes check_support then rejects
+    # with a bare ValueError.  Rubin has no (192, 128) flavor, so its floors
+    # are the SM100 ones restricted to the shapes it serves.
+    rubin = caps[engines.engine_name(arch="sm107", fp8=True)]
+    assert dict(rubin.d_envelope_floors) == {f: v for f, v in _SM100_FP8_ENVELOPE_FLOORS.items() if f in rubin.d_shapes}
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
 def test_fp8_d512_mxfp8_declines():
-    """There is no d512 block-scale kernel: an MXFP8 d512 graph must be
-    rejected up front, not fail late in the lowering."""
+    """There is no d512 BLOCK-SCALE kernel on either arch line: an MXFP8 d512
+    graph must be rejected up front, not fail late in the lowering.  The
+    per-tensor d512 flavor is a different claim and exists on both."""
     from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
 
     assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
