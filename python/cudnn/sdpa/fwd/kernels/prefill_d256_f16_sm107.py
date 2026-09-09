@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""CTM-DSL qwen prefill SDPA kernel — d_qk = d_v = 256, FP16/BF16.
+"""pre-upstream DSL qwen prefill SDPA kernel — d_qk = d_v = 256, FP16/BF16.
 
 TILES_Q=1, SOFTMAX_WARPGROUPS=1, 12 warps total.  Q∪O SMEM alias with
 extra barriers ``mb_q_o_alias`` and ``mb_tmastg_go``.  Q·K(i+1) → S·V(i)
@@ -130,7 +130,7 @@ else:
     raise ValueError(f"prefill_sdpa_d256_f16: DTYPE_QKV={CFG.DTYPE_QKV} not supported " f"(expected 2=BF16, 3=FP16, or 4=TF32)")
 
 if CFG.DTYPE_O != CFG.DTYPE_QKV:
-    raise NotImplementedError(f"prefill_sdpa_d256_f16 CTM: DTYPE_O={CFG.DTYPE_O} != DTYPE_QKV=" f"{CFG.DTYPE_QKV} not yet supported.")
+    raise NotImplementedError(f"prefill_sdpa_d256_f16: DTYPE_O={CFG.DTYPE_O} != DTYPE_QKV=" f"{CFG.DTYPE_QKV} not yet supported.")
 OUT_STORAGE_DTYPE = STORAGE_DTYPE
 
 
@@ -169,7 +169,7 @@ _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 
 # THD / varlen — flat-grid decode + tma-offset closures (CFG-bound) from the
 # factory; O-descriptor builder + TENSOR_MAP_QWORDS from the shared
-# kernels/ctm/common/sdpa/thd.py.  Gated by CFG.THD_VARLEN (folds out otherwise).
+# the shared pre-upstream THD helper.  Gated by CFG.THD_VARLEN (folds out otherwise).
 # seq_kv_lens overloaded as the THD metadata buffer (int32 len 3B+2):
 #   [0..B-1]=seq_kv_lens  [B..2B]=cu_q(B+1)  [2B+1..3B+1]=cu_k(B+1)
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS
@@ -195,7 +195,7 @@ class KernelTmemLayout:
 
     O_OFF: int = 256
 
-    # Stats parked at 544 (outside S_acc/O range — CTM-only vs C++ col 512).
+    # Stats parked at 544 (outside S_acc/O range — DSL-only vs C++ col 512).
     STATS_OFF: int = 544
 
 
@@ -1075,7 +1075,7 @@ def _softmax_warp_group(
         N_CHUNKS = CFG.N_BMM2_CHUNKS
         RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
 
-        # 3-segment dispatch — body inlined so the CTM tracer can dispatch
+        # 3-segment dispatch — body inlined so the DSL tracer can dispatch
         # through cutlass.range without tripping the closure check.
         if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
             for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
@@ -1515,7 +1515,7 @@ def _correction_warp_group(
 
         tmem_base_epi = tmem_ptr_i32.load()
 
-        # CTM if-staging requires names used after the conditional to be bound on every path
+        # DSL if-staging requires names used after the conditional to be bound on every path
         total_max_scaled = cutlass.Float32(0.0)
         total_sum = cutlass.Float32(0.0)
         if bounds.right > bounds.left:

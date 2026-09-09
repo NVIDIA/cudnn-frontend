@@ -3,7 +3,7 @@
 
 """Rubin SM107 DSv4 SDPA prefill — d_qk = d_v = 512, MXFP8 (block-scale FP8).
 
-CTM-DSL Python port of the C++ Rubin baseline
+Python port (from the pre-upstream DSL) of the C++ Rubin baseline
 ``kernels/c++/sm107/sdpa/prefill/prefill_sdpa_d512_mxfp8.cu`` — same kernel,
 different language.  Pipeline shape, TMEM/SMEM layout, barrier inventory,
 scheduler, warp dispatch, and register split mirror the C++ source 1:1.
@@ -59,7 +59,7 @@ P12 / P13 patterns (cf. mbarrier-patterns.md, also project memory):
     tcgen05.commit.cta_group::2.multicast with sg0_mcast_mask (= 0x3) so
     BOTH sg0 CTAs see one arrive — pre-armed via PipelineState(0, 1).
 
-CTM-only adjustments applied (per cpp-to-ctm.md):
+DSL-only adjustments applied (per the C++-to-DSL porting notes):
   - is_exclusive=True on tmem_alloc (SM107 >512-col TMEM).
   - tile_id_smem stride 8 Int32/stage.
   - cga_arrive/wait wrapped with relaxed=True (per project memory:
@@ -76,9 +76,9 @@ SF-tile prefix base (cu_sf_q/k from _thd_sf_tile_bases) added to the SF tile
 coord (batch coord -> 0).  The cga4x1 within-tile peer SF byte offsets + the
 SF_NUM_BLOCKS_V=4 / BMM2_LOOP_N_BLOCKS=2 V-SF N-block split are orthogonal to the
 sequence-tile axis and unchanged.  Per-batch O TMA descriptor array + packed
-[1,QH,T] LSE (shared kernels/ctm/common/sdpa/thd.py).  Dense path (THD_VARLEN=0)
+[1,QH,T] LSE (the shared pre-upstream THD helper).  Dense path (THD_VARLEN=0)
 folds to identity (cu_sf=0, tma_batch=batch_idx) — byte-identical.  Public-API
-MXFP8 THD glue is a follow-up (THD-aware quantizer); drive via --backend ctm.
+MXFP8 THD glue is a follow-up (THD-aware quantizer); drive via the kernel module directly.
 """
 
 import os
@@ -198,7 +198,7 @@ from cudnn.frost.tile_dsl.mask import (
 
 # Reuse sm107 SDPA pipeline-shared helpers (KvLoopBounds + closures factory).
 # Note: dsv4 forks Bars in this file (NOT imported from _sdpa_common) per the
-# per-pipeline fork pattern in cpp-to-ctm.md.
+# per-pipeline fork pattern in the C++-to-DSL porting notes.
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
     KvLoopBounds,
     compute_kv_loop_bounds,
@@ -334,7 +334,7 @@ CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 
 # ----------------------------------------------------------------------------
 # Softmax-body constants — module-level so the top-level @cute.jit helper
-# `_sg0_softmax_kv_iter` can read them without a closure capture (CTM-DSL
+# `_sg0_softmax_kv_iter` can read them without a closure capture (pre-upstream DSL
 # forbids closures inside @cute.jit traced under dynamic control flow).
 # ----------------------------------------------------------------------------
 # P SMEM layout helpers (TILE_M=128 rows × TILE_N=128 cols, Swz128B).
@@ -607,7 +607,7 @@ _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 
 # THD / varlen — flat-grid decode + tma-offset closures (CFG-bound) from the
 # factory; O-descriptor builder + TENSOR_MAP_QWORDS from the shared
-# kernels/ctm/common/sdpa/thd.py.  Gated by CFG.THD_VARLEN (folds out otherwise).
+# the shared pre-upstream THD helper.  Gated by CFG.THD_VARLEN (folds out otherwise).
 # Supported at cga4x1 (the per-batch O descriptor's seq extent OOB-clips the
 # 256-row store box).  seq_kv_lens overloaded as the THD metadata buffer (int32
 # len 3B+2): [0..B-1]=seq_kv_lens [B..2B]=cu_q(B+1) [2B+1..3B+1]=cu_k(B+1).
@@ -837,7 +837,7 @@ def _kernel(
     mcast_mask = (cutlass.Int32(3) << leader_cta_id) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int32(0)
     # sg0_mcast_mask = 0x3 — both sg0 CTAs (used by sg1 leader's P13 multicast on mb_p_xfer_empty).
     sg0_mcast_mask = cutlass.Int32(0x3)
-    # TMA-load self-bit mask: per cga2-mma.md / DKG `fp16_gemm_3.py`, each
+    # TMA-load self-bit mask: per cga2-mma.md and a reference fp16 GEMM sample, each
     # peer's `cta_group::2` TMA targets ITS OWN cluster bit (= cta_id_x);
     # cga2 routing strips bit-24 so bytes land on the cga2 pair leader's
     # mbar.  Use cluster-rank (cta_id_x), NOT pair-rank (cta_in_pair) — for
@@ -1097,7 +1097,7 @@ def _kernel(
 # (HW max can't observe -inf written by the mask after the load).
 #
 # Top-level @cute.jit so the dynamic call-graph contains no closure-capture
-# violations (CTM-DSL forbids closures under dynamic control flow).  All
+# violations (the pre-upstream DSL forbids closures under dynamic control flow).  All
 # kernel-local vars are passed as explicit args; constants come from
 # module-level (NEG_INF_F32, RESCALE_THRESHOLD_F32, P_*, SOFTMAX_*, etc.).
 # ============================================================================
@@ -1234,11 +1234,11 @@ def _sg0_softmax_kv_iter(
 
     # DSMEM bulk_copy alpha + P → cross-sg sg1 peer's SMEM, firing peer's
     # mb_alpha_xfer_full + mb_p_xfer_full.  PREDICATED form: emit `@p
-    # cp.async.bulk` (matches C++'s uniform `@UP0 UBLKCP`) instead of an
+    # cp.async.bulk` (matches the C++ reference's uniform predicated form) instead of an
     # `if is_lead_warp: if elect_sync():` branch — that branch lowers to a
     # warp-divergent BSSY/BSYNC + reconverge in the hot softmax iter.  All 128
     # lanes compute the (cheap) mapa addresses up-front; only the lead warp's
-    # elected lane issues the two UBLKCPs under ship_pred.  nvvm.elect_sync()
+    # elected lane issues the two bulk copies under ship_pred.  nvvm.elect_sync()
     # is warp-convergent — every compute warp's lanes call it (each warp elects
     # its own lowest lane); `is_lead_warp &` masks the predicate to (lead warp,
     # elected lane) == the single C++ issuing thread.
@@ -1883,7 +1883,7 @@ def _mma_warp_group(
     nvvm.barrier_cta_arrive(1, 32 * (CFG.SOFTMAX_WG_WARPS + 1))
 
     # Do column arithmetic on raw Int8 ptr; retype at use site.  (Per
-    # cpp-to-ctm.md: make_tmem_ptr(addr, Float16) + N strides FP16 elems
+    # C++-to-DSL porting notes: make_tmem_ptr(addr, Float16) + N strides FP16 elems
     # not columns — silent-wrong-result bug.)
     tmem_raw = nvvm.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
 
@@ -2240,7 +2240,7 @@ def _mma_warp_non_leader(
 
     # sg0 non-leader is quiet (just wait dealloc); sg1 non-leader runs the
     # persistent P12 forwarder loop.  `return` is forbidden inside @cute.jit
-    # (CTM gotcha), so we gate the forwarder on `is_sg1` and let both arms
+    # (DSL gotcha), so we gate the forwarder on `is_sg1` and let both arms
     # fall through to the shared dealloc wait + free at the bottom.
     if is_sg1:
         q_super_idx, head_idx, batch_idx = _dispatch_decode_initial(
@@ -2497,7 +2497,7 @@ def _tmaldg_warp_group(
                     kv_state = advance(kv_state, CFG.STAGES_KV)
             else:
                 # ---- sg1: V_ring only -----------------------------------
-                # V split along d_v: per-CTA inner = TILE_O / CTA_MMA.  CTM
+                # V split along d_v: per-CTA inner = TILE_O / CTA_MMA.  the pre-upstream DSL
                 # TMA descriptors are element-typed so the per-peer offset
                 # is in elements (NOT bytes — C++ uses bytes because its
                 # TMA descriptors are UINT8-typed).

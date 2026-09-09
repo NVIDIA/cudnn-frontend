@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""CTM-DSL qwen prefill SDPA MXFP8 kernel (d_qk = d_v = 256).
+"""pre-upstream DSL qwen prefill SDPA MXFP8 kernel (d_qk = d_v = 256).
 
 Qwen pipeline: TILES_Q=1, single softmax wg, Q∪O SMEM alias, Q*K(i+1)→S*V(i)
 lookahead, parity-keyed S_acc/P, bootstrap-only-lo-parity bmm2_ready in
@@ -164,7 +164,7 @@ elif CFG.DTYPE_O == 2:
 elif CFG.DTYPE_O == 3:
     OUT_STORAGE_DTYPE = cutlass.Float16
 else:
-    raise ValueError(f"prefill_sdpa_d256_mxfp8 CTM: DTYPE_O={CFG.DTYPE_O} not supported " f"(expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
+    raise ValueError(f"prefill_sdpa_d256_mxfp8: DTYPE_O={CFG.DTYPE_O} not supported " f"(expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
 
 
 # === MXFP8 SF constants (trace-time folded) ===
@@ -266,7 +266,7 @@ _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 
 # THD / varlen — flat-grid decode + tma-offset closures (CFG-bound) from the
 # factory; O-descriptor builder + TENSOR_MAP_QWORDS from the shared
-# kernels/ctm/common/sdpa/thd.py.  Gated by CFG.THD_VARLEN (folds out otherwise).
+# the shared pre-upstream THD helper.  Gated by CFG.THD_VARLEN (folds out otherwise).
 # Supported at cga1 and cga2 (the per-batch O descriptor's seq extent OOB-clips
 # the 256-row cga2 store box).  seq_kv_lens overloaded as the THD metadata buffer
 # (int32 len 3B+2): [0..B-1]=seq_kv_lens [B..2B]=cu_q(B+1) [2B+1..3B+1]=cu_k(B+1).
@@ -1438,7 +1438,7 @@ def _softmax_warp_group(
         stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
-        # Body inlined (no nested @cute.jit helper) so the CTM tracer can
+        # Body inlined (no nested @cute.jit helper) so the DSL tracer can
         # dispatch through cutlass.range without hitting the closure check.
         CHUNK = 64
         P_COLS_PER_CHUNK = CHUNK // 4  # fp8 packed 4:1 into FP32 cells
@@ -1874,7 +1874,7 @@ def _correction_warp_group(
 
         tmem_base_epi = tmem_ptr_i32.load()
 
-        # Pre-declare for CTM if-staging — names used after the conditional
+        # Pre-declare for DSL if-staging — names used after the conditional
         # must be bound on every path.
         total_max_scaled = cutlass.Float32(0.0)
         total_sum = cutlass.Float32(0.0)

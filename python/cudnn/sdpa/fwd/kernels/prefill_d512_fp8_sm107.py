@@ -6,11 +6,11 @@
 THD / varlen (``CFG.THD_VARLEN=1``) is supported — FP8 is element-addressed (no
 block-scale SF), so it rides the same THD path as f16: packed ``[1,T,H,D]`` +
 ``cu_seqlens`` coord offset, per-batch O TMA-descriptor array (shared
-``kernels/ctm/common/sdpa/thd.py``), packed ``[1,QH,T]`` LSE.  Dense path
+the shared pre-upstream THD helper), packed ``[1,QH,T]`` LSE.  Dense path
 byte-identical.  Public-API fp8 THD glue is a follow-up (THD-aware quantizer);
-drive via the kernel module / --backend ctm.
+drive via the kernel module directly.
 
-CTM-DSL Python port of the C++ Rubin baseline
+Python port (from the pre-upstream DSL) of the C++ Rubin baseline
 ``kernels/c++/sm107/sdpa/prefill/prefill_sdpa_d512_fp8.cu`` — same kernel,
 different language.  Pipeline shape, TMEM/SMEM layout, barrier inventory,
 scheduler, warp dispatch, and register split mirror the C++ source 1:1.
@@ -51,7 +51,7 @@ P12 / P13 patterns (cf. mbarrier-patterns.md, also project memory):
     tcgen05.commit.cta_group::2.multicast with sg0_mcast_mask (= 0x3) so
     BOTH sg0 CTAs see one arrive — pre-armed via PipelineState(0, 1).
 
-CTM-only adjustments applied (per cpp-to-ctm.md):
+DSL-only adjustments applied (per the C++-to-DSL porting notes):
   - is_exclusive=True on tmem_alloc (SM107 >512-col TMEM).
   - tile_id_smem stride 8 Int32/stage.
   - cga_arrive/wait wrapped with relaxed=True (per project memory:
@@ -176,7 +176,7 @@ from cudnn.frost.tile_dsl.mask import (
 
 # Reuse sm107 SDPA pipeline-shared helpers (KvLoopBounds + closures factory).
 # Note: dsv4 forks Bars in this file (NOT imported from _sdpa_common) per the
-# per-pipeline fork pattern in cpp-to-ctm.md.
+# per-pipeline fork pattern in the C++-to-DSL porting notes.
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
     KvLoopBounds,
     compute_kv_loop_bounds,
@@ -252,7 +252,7 @@ CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 
 # ----------------------------------------------------------------------------
 # Softmax-body constants — module-level so the top-level @cute.jit helper
-# `_sg0_softmax_kv_iter` can read them without a closure capture (CTM-DSL
+# `_sg0_softmax_kv_iter` can read them without a closure capture (pre-upstream DSL
 # forbids closures inside @cute.jit traced under dynamic control flow).
 # ----------------------------------------------------------------------------
 # P SMEM layout helpers (TILE_M=128 rows × TILE_N=128 cols, Swz128B).
@@ -509,7 +509,7 @@ _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 
 # THD / varlen — flat-grid decode + tma-offset closures (CFG-bound) from the
 # factory; O-descriptor builder + TENSOR_MAP_QWORDS from the shared
-# kernels/ctm/common/sdpa/thd.py.  Gated by CFG.THD_VARLEN (folds out otherwise).
+# the shared pre-upstream THD helper.  Gated by CFG.THD_VARLEN (folds out otherwise).
 # FP8 is element-addressed (per-tensor dequant scalars, no block-scale SF), so
 # THD rides the same path as f16.  seq_kv_lens overloaded as the THD metadata
 # buffer (int32 len 3B+2): [0..B-1]=seq_kv_lens [B..2B]=cu_q [2B+1..3B+1]=cu_k.
@@ -688,7 +688,7 @@ def _kernel(
     mcast_mask = (cutlass.Int32(3) << leader_cta_id) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int32(0)
     # sg0_mcast_mask = 0x3 — both sg0 CTAs (used by sg1 leader's P13 multicast on mb_p_xfer_empty).
     sg0_mcast_mask = cutlass.Int32(0x3)
-    # TMA-load self-bit mask: per cga2-mma.md / DKG `fp16_gemm_3.py`, each
+    # TMA-load self-bit mask: per cga2-mma.md and a reference fp16 GEMM sample, each
     # peer's `cta_group::2` TMA targets ITS OWN cluster bit (= cta_id_x);
     # cga2 routing strips bit-24 so bytes land on the cga2 pair leader's
     # mbar.  Use cluster-rank (cta_id_x), NOT pair-rank (cta_in_pair) — for
@@ -921,7 +921,7 @@ def _kernel(
 # (HW max can't observe -inf written by the mask after the load).
 #
 # Top-level @cute.jit so the dynamic call-graph contains no closure-capture
-# violations (CTM-DSL forbids closures under dynamic control flow).  All
+# violations (the pre-upstream DSL forbids closures under dynamic control flow).  All
 # kernel-local vars are passed as explicit args; constants come from
 # module-level (NEG_INF_F32, RESCALE_THRESHOLD_F32, P_*, SOFTMAX_*, etc.).
 # ============================================================================
@@ -1058,13 +1058,13 @@ def _sg0_softmax_kv_iter(
 
     # DSMEM bulk_copy alpha + P → cross-sg sg1 peer's SMEM, firing peer's
     # mb_alpha_xfer_full + mb_p_xfer_full.  PREDICATED form: emit `@p
-    # cp.async.bulk` (matches C++'s uniform `@UP0 UBLKCP`) instead of an
+    # cp.async.bulk` (matches the C++ reference's uniform predicated form) instead of an
     # `if is_lead_warp: if elect_sync():` branch — that branch lowers to a
     # warp-divergent BSSY/BSYNC + reconverge that also poisons ptxas's uniform
     # analysis of nearby mbar waits (measured: removing the ship branches flips
     # ~5 SYNCS.PHASECHK → USYNCS and is worth ~+12% on dsv4 d512).  All 128
     # lanes compute the cheap mapa addresses up-front; only the lead warp's
-    # elected lane issues the UBLKCPs under ship_pred.
+    # elected lane issues the bulk copies under ship_pred.
     ship_pred = is_lead_warp & nvvm.elect_sync()
     local_alpha_src = sAlpha_xfer_raw.subview(cur_parity_S * cutlass.Int32(CFG.TILE_M))
     peer_alpha_dst = nvvm.mapa(local_alpha_src, cross_sg_peer, addrspace=7)
@@ -1391,7 +1391,7 @@ def _compute_warp_group(
             nvvm.barrier_cta_sync(barrier_id=8, thread_count=128)
 
             # Predicated stats ship — same rationale as the per-iter alpha/P
-            # ship above (`@p UBLKCP`, no warp-divergent branch).
+            # ship above (predicated, no warp-divergent branch).
             ship_pred = is_lead_warp & nvvm.elect_sync()
             peer_stats_dst = nvvm.mapa(sStats_xfer_raw, cross_sg_peer, addrspace=7)
             peer_stats_full_mbar = nvvm.mapa(bars.mb_stats_xfer_full.smem_ptr, cross_sg_peer, addrspace=7)
@@ -1736,7 +1736,7 @@ def _mma_warp_group(
     nvvm.barrier_cta_arrive(1, 32 * (CFG.SOFTMAX_WG_WARPS + 1))
 
     # Do column arithmetic on raw Int8 ptr; retype at use site.  (Per
-    # cpp-to-ctm.md: make_tmem_ptr(addr, Float16) + N strides FP16 elems
+    # C++-to-DSL porting notes: make_tmem_ptr(addr, Float16) + N strides FP16 elems
     # not columns — silent-wrong-result bug.)
     tmem_raw = nvvm.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
 
@@ -2003,7 +2003,7 @@ def _mma_warp_non_leader(
 
     # sg0 non-leader is quiet (just wait dealloc); sg1 non-leader runs the
     # persistent P12 forwarder loop.  `return` is forbidden inside @cute.jit
-    # (CTM gotcha), so we gate the forwarder on `is_sg1` and let both arms
+    # (DSL gotcha), so we gate the forwarder on `is_sg1` and let both arms
     # fall through to the shared dealloc wait + free at the bottom.
     if is_sg1:
         q_super_idx, head_idx, batch_idx = _dispatch_decode_initial(
@@ -2123,9 +2123,9 @@ def _tmaldg_warp_group(
           wait(v_empty[stage]); leader arrive_expect_tx(v_full[stage], vBytes);
           tma_load_tile(sV[stage], v_gmem(v_col_off + cta_in_pair * (TILE_O/CTA_MMA) * BPE,
                                         kv * TILE_N), v_full, multicast).
-        Note: C++ uses BYTE coord for V because UINT8 TMA descriptors; CTM's
+        Note: C++ uses BYTE coord for V because UINT8 TMA descriptors; the DSL's
         typed descriptor uses ELEMENT coord — so multiply only when descriptor
-        is UINT8.  Current CTM descriptors are element-typed, so plain cta_in_pair *
+        is UINT8.  Current DSL descriptors are element-typed, so plain cta_in_pair *
         (TILE_O/CTA_MMA) suffices.
 
     Both sgs drain trailing K/V/Q empty arrives at end-of-kernel under cga2.
@@ -2202,7 +2202,7 @@ def _tmaldg_warp_group(
                     kv_state = advance(kv_state, CFG.STAGES_KV)
             else:
                 # ---- sg1: V_ring only -----------------------------------
-                # V split along d_v: per-CTA inner = TILE_O / CTA_MMA.  CTM
+                # V split along d_v: per-CTA inner = TILE_O / CTA_MMA.  the pre-upstream DSL
                 # TMA descriptors are element-typed so the per-peer offset
                 # is in elements (NOT bytes — C++ uses bytes because its
                 # TMA descriptors are UINT8-typed).

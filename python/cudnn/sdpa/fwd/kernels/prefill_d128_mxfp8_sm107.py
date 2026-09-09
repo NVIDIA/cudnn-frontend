@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""CTM-DSL port of the pre-upstream prefill SDPA MXFP8 kernel
+"""Port (from the pre-upstream DSL) of the pre-upstream prefill SDPA MXFP8 kernel
 (dsv3 / llama / gptoss: block-scale MXFP8 inputs, TILES_Q = 2,
 2 softmax warpgroups, 4 correction warps, persistent try_cancel
-scheduler).  Same pipeline structure as the FP8 CTM twin.
+scheduler).  Same pipeline structure as the FP8 twin.
 """
 
 import os
@@ -142,7 +142,7 @@ elif CFG.DTYPE_O == 2:
 elif CFG.DTYPE_O == 3:
     OUT_STORAGE_DTYPE = cutlass.Float16
 else:
-    raise ValueError(f"prefill_sdpa_mxfp8 CTM: DTYPE_O={CFG.DTYPE_O} not supported " f"(expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
+    raise ValueError(f"prefill_sdpa_mxfp8: DTYPE_O={CFG.DTYPE_O} not supported " f"(expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
 
 
 # MXFP8 SF constants — E8M0 scale factor, 32 elems share one SF.
@@ -219,7 +219,7 @@ _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 
 # THD / varlen — flat-grid decode + tma-offset closures (CFG-bound) from the
 # factory; O-descriptor builder + TENSOR_MAP_QWORDS from the shared
-# kernels/ctm/common/sdpa/thd.py.  Gated by CFG.THD_VARLEN (folds out otherwise).
+# the shared pre-upstream THD helper.  Gated by CFG.THD_VARLEN (folds out otherwise).
 # Supported at cga1 and cga2 (TILES_Q=2 → two Q slabs / O stores per tile).
 # seq_kv_lens overloaded as the THD metadata buffer (int32 len 3B+2):
 #   [0..B-1]=seq_kv_lens  [B..2B]=cu_q(B+1)  [2B+1..3B+1]=cu_k(B+1)
@@ -276,7 +276,7 @@ _O_SWZ_B = {128: 3, 64: 2, 32: 1}[CFG.O_SWZ_BYTES]
 _O_SMEM_SWIZZLE = cutlass.Swizzle(_O_SWZ_B, 4, 3)
 LEADING_BYTE_OFFSET_QK = 0
 
-_CTM_MMA_K_FP8 = _MXFP8_TILE_K_HW
+_MMA_K_FP8 = _MXFP8_TILE_K_HW
 STRIDE_BYTE_OFFSET_QK = 8 * CFG.Q_SWZ_BYTES
 
 # leading_byte_offset = 0 when (TILE_O/CTA_MMA)/8 <= 8 else TILE_N*V_SWZ_BYTES
@@ -285,7 +285,7 @@ _V_PC_COLS = CFG.TILE_O // CFG.CTA_MMA
 LEADING_BYTE_OFFSET_PV = 0 if (_V_PC_COLS // _CORE_MATRIX_ROWS) <= 8 else CFG.TILE_N * CFG.V_SWZ_BYTES
 STRIDE_BYTE_OFFSET_PV = 8 * CFG.V_SWZ_BYTES
 
-NUM_KPHASES_PV = CFG.TILE_N // _CTM_MMA_K_FP8
+NUM_KPHASES_PV = CFG.TILE_N // _MMA_K_FP8
 NUM_KPHASES_PV_PER_CHUNK = NUM_KPHASES_PV // CFG.N_BMM2_CHUNKS
 
 
@@ -1929,7 +1929,7 @@ def _correction_warp_group(
 
                 bars.mb_bmm2_done[qs].wait(bmm2_done_phase)
 
-                # vec_scale_pair emits mul_packed_f32x2; without it CTM lowers to scalar FMUL inside this runtime-if.
+                # vec_scale_pair emits mul_packed_f32x2; without it the DSL lowers to scalar FMUL inside this runtime-if.
                 # cfence after each chunk keeps ptxas from sinking next tcgen05_ld ahead of prior tcgen05_st (TMEM anti-dep).
                 if ~all_alpha_one:
                     for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""CTM-DSL qwen prefill SDPA kernel (d_qk=d_v=256, FP8 E4M3/E5M2).
+"""pre-upstream DSL qwen prefill SDPA kernel (d_qk=d_v=256, FP8 E4M3/E5M2).
 
 Qwen pipeline: TILES_Q=1, single softmax wg, Q∪O SMEM alias with two
 extra barriers (mb_q_o_alias TMASTG→TMA bootstrap-armed; mb_tmastg_go
@@ -136,7 +136,7 @@ elif CFG.DTYPE_O == 2:
 elif CFG.DTYPE_O == 3:
     OUT_STORAGE_DTYPE = cutlass.Float16
 else:
-    raise ValueError(f"prefill_sdpa_d256_fp8 CTM: DTYPE_O={CFG.DTYPE_O} not supported " f"(expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
+    raise ValueError(f"prefill_sdpa_d256_fp8: DTYPE_O={CFG.DTYPE_O} not supported " f"(expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
 
 
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
@@ -187,7 +187,7 @@ class KernelTmemLayout:
     """Column offsets for the qwen 2-parity-slot SDPA pipeline (FP8 d=256).
 
     P aliases the TAIL of each parity's S_acc slot.  Stats parked at col
-    544 (CTM-only — outside S_acc/O range) vs C++ col 512.
+    544 (DSL-only — outside S_acc/O range) vs C++ col 512.
     """
 
     TOTAL_COLS: int = 576
@@ -228,8 +228,8 @@ STRIDE_BYTE_OFFSET_PV = 8 * CFG.V_SWZ_BYTES
 # Derived, never a literal: NUM_KPHASES_PV must track the SAME k-step size
 # the MmaDesc below is built with, or the BMM2 k-loop and the descriptor's
 # num_k_steps disagree and half of V's K is silently dropped.
-_CTM_MMA_K_FP8 = CFG.TILE_K_HW_BMM2
-NUM_KPHASES_PV = CFG.TILE_N // _CTM_MMA_K_FP8
+_MMA_K_FP8 = CFG.TILE_K_HW_BMM2
+NUM_KPHASES_PV = CFG.TILE_N // _MMA_K_FP8
 NUM_KPHASES_PV_PER_CHUNK = NUM_KPHASES_PV // CFG.N_BMM2_CHUNKS
 
 
@@ -1103,7 +1103,7 @@ def _softmax_warp_group(
         stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
-        # Body inlined per-segment so the CTM tracer can dispatch through
+        # Body inlined per-segment so the DSL tracer can dispatch through
         # cutlass.range without hitting the closure check.
         CHUNK = 64
         P_COLS_PER_CHUNK = CHUNK // 4  # fp8 packed 4:1 into FP32 cells
@@ -1552,7 +1552,7 @@ def _correction_warp_group(
         # Epilogue: always run (stores garbage on empty-mainloop — TMASTG ignores)
         tmem_base_epi = tmem_ptr_i32.load()
 
-        # Pre-declare for CTM if-staging — names used after conditional must
+        # Pre-declare for DSL if-staging — names used after conditional must
         # be bound on every path
         total_max_scaled = cutlass.Float32(0.0)
         total_sum = cutlass.Float32(0.0)

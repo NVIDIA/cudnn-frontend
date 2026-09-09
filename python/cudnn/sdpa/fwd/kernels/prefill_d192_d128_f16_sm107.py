@@ -4,10 +4,10 @@
 """
 DSL prefill SDPA kernel — classic pipeline, f16/bf16, d_qk=192 / d_v=128, SM107 (Rubin).
 
-Ported from the pre-upstream CTM kernel ``prefill_sdpa_f16.py``
-(CTM DSL) by frost_dev/port_ctm_kernel.py. The kernel BODY is the pre-upstream one,
-unchanged — only the DSL surface moved (ctm.* -> public cutlass/nvvm/cute, and
-tile_ctm -> cudnn.frost.tile_dsl). Two things are NOT mechanical and were done
+Ported from the pre-upstream kernel ``prefill_sdpa_f16.py``
+by the port script. The kernel BODY is the pre-upstream one,
+unchanged — only the DSL surface moved (the pre-upstream ops -> public cutlass/nvvm/cute, and
+the pre-upstream tile library -> cudnn.frost.tile_dsl). Two things are NOT mechanical and were done
 by hand:
 
   1. **Config.** The pre-upstream kernels picked a flavor with an env var;
@@ -27,7 +27,7 @@ not taken here.
 
 Original pre-upstream header follows.
 
-CTM-DSL port of the pre-upstream prefill SDPA kernel
+Port (from the pre-upstream DSL) of the pre-upstream prefill SDPA kernel
 (FP16, d_qk = 192 / d_v = 128 via ``make_cfg_d192``, TILES_Q = 2, two softmax
 warpgroups, four correction warps, persistent try_cancel scheduler).
 
@@ -218,7 +218,7 @@ _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 
 # THD / varlen — flat-grid decode + tma-offset closures (CFG-bound) from the
 # factory; O-descriptor builder + TENSOR_MAP_QWORDS from the shared
-# kernels/ctm/common/sdpa/thd.py.  Gated by CFG.THD_VARLEN (folds out otherwise).
+# the shared pre-upstream THD helper.  Gated by CFG.THD_VARLEN (folds out otherwise).
 # Supported at cga1 and cga2 (TILES_Q=2 → two Q slabs / O stores per tile).
 # seq_kv_lens overloaded as the THD metadata buffer (int32 len 3B+2):
 #   [0..B-1]=seq_kv_lens  [B..2B]=cu_q(B+1)  [2B+1..3B+1]=cu_k(B+1)
@@ -302,7 +302,7 @@ def _kernel(
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
 
-    # SMEM allocations in natural Q/K/V/O order — CTM Tcgen05SmemDesc.build truncates
+    # SMEM allocations in natural Q/K/V/O order — Tcgen05SmemDesc.build truncates
     # start_address past ~256 KiB so this order keeps the data buffers in low SMEM.
     # QO_ALIAS: one Q∪O slab (TILES_Q × max(Q,O) elems); sO points into it and
     # strides by QO_SLAB_ELEMS so sO[qs] coincides with sQ[qs].  Else: separate
@@ -425,7 +425,7 @@ def _kernel(
         cga_arrive()
         cga_wait()
 
-    # CTM @cute.kernel stages if/else — use Python ternaries so the chosen
+    # @cute.kernel stages if/else — use Python ternaries so the chosen
     # expression flows into the trace (variables in branches aren't visible outside).
     cta_id_x = cute.arch.block_idx_in_cluster() if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int32(0)
     cta_in_pair = (cta_id_x & cutlass.Int32(1)) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int32(0)
@@ -656,7 +656,7 @@ def _tmaldg_warp_group(
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
 
-    # CTM TMA descriptor is element-typed; contiguous coord is in ELEMENTS not bytes.
+    # the DSL's TMA descriptors is element-typed; contiguous coord is in ELEMENTS not bytes.
     K_ROW_OFFSET_PEER = cta_in_pair * cutlass.Int32(CFG.TILE_N // CFG.CTA_MMA)
     V_COL_OFFSET_PEER = cta_in_pair * cutlass.Int32(CFG.TILE_O // CFG.CTA_MMA)
 
@@ -1259,7 +1259,7 @@ def _softmax_kv_body(
     p_addr_base = tmem_base + cutlass.Int32(tmem_P_off)
     stats_addr = tmem_base + cutlass.Int32(stats_off)
 
-    # apply_mask is a Python bool — wrap in cutlass.const_expr so CTM folds
+    # apply_mask is a Python bool — wrap in cutlass.const_expr so the DSL folds
     # at trace time instead of staging cf.if (the two arms produce Vectors
     # built via different MLIR op sequences and the tracer would error).
     if cutlass.const_expr(apply_mask):
@@ -1342,7 +1342,7 @@ def _softmax_kv_body(
     # Rescale full reg_S in one vector op — emits same FFMA2 sequence as explicit half-tile rescales.
     reg_S = reg_S * scale_log2 - new_total_max
 
-    # Chunk 0 manual unroll — CTM's @cute.jit tracer makes the loop iter an
+    # Chunk 0 manual unroll — the DSL's @cute.jit tracer makes the loop iter an
     # MLIR value, breaking Python slice.indices() math inside RegTile[].
     chunk_S_0 = reg_S[0:CHUNK].vec
     chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
@@ -1616,7 +1616,7 @@ def _correction_warp_group(
     tid_in_wg = tid_raw - cutlass.Int32(CFG.CORR_WARP_BASE * 32)
 
     # O_CHUNK=16 (halved from 32) shortens the alpha-rescale live range —
-    # at 32, CTM regalloc spilled correction-warp regs to the stack.
+    # at 32, the DSL's register allocator spilled correction-warp regs to the stack.
     O_CHUNK = 16
     N_CHUNKS_O = CFG.TILE_O // O_CHUNK
     # Use O_SWZ_B (NOT V_SWZ_B): under cga2 V is split along d_v and may drop
@@ -1733,7 +1733,7 @@ def _correction_warp_group(
             # Fire stat_empty so softmax's NEXT-tile iter 0 wait can pass.
             bars.mb_stat_empty[qs].arrive()
 
-            inv_sum = cutlass.Float32(0.0)  # pre-declare for CTM if-staging
+            inv_sum = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
             lse_val = cutlass.Float32(0.0)
             # With sinks: fold the lift-the-max rescale into threshold_beta so O is scaled by scale/new_sum in one FMUL.
             LN2 = cutlass.Float32(0.6931471805599453)
@@ -1960,7 +1960,7 @@ def _host(
         ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
-        # Grid Python-folds on Cfg constant (avoids CTM if staging).
+        # Grid Python-folds on Cfg constant (avoids DSL if-staging).
         grid_shape = (grid_q_supers, QH, B) if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL) else (grid_q_supers * QH * B, 1, 1)
     _kernel(
         tma_q_desc,
