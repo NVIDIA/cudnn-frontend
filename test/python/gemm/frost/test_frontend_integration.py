@@ -135,7 +135,10 @@ def test_select_frost_engine_runs_frost():
     torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
 
 
-_OVERRIDE_SHAPES = [(256, 256, 128), (1024, 512, 512), (200, 768, 256), (333, 512, 264)]
+_OVERRIDE_CASES = {
+    "dense": ((256, 256, 128), ((1024, 512, 512), (200, 768, 256), (333, 512, 264))),
+    "splitk": ((128, 128, 16384), ((256, 256, 16384), (128, 256, 16384), (64, 128, 16384))),
+}
 
 
 def _build_matmul_uids(m, n, k):
@@ -160,30 +163,36 @@ def _mm_operands(m, n, k):
 
 
 @_GPU
-def test_override_shape_frost():
+@pytest.mark.parametrize("case", _OVERRIDE_CASES, ids=tuple(_OVERRIDE_CASES))
+def test_override_shape_frost(case):
     """A FROST plan built for one problem size runs OTHER sizes through the native
     override-shape API — ``get_workspace_size_plan_at_index`` /
     ``execute_plan_at_index`` with ``override_uids/shapes/strides`` — and through
     plain ``execute`` with new-shape buffers. The compiled kernel is shape-agnostic
     (M/N/K symbolic), so no rebuild; results are bit-exact (small-int inputs)."""
     h = cudnn.create_handle()
-    m0, n0, k0 = 256, 256, 128
+    (m0, n0, k0), override_shapes = _OVERRIDE_CASES[case]
     g, _A, _B, _C = _build_matmul_uids(m0, n0, k0)
     _plan(g)
     frost = _index_of(g, _FROST)
     g.select_plan(frost)
     g.check_support()
     _build_plans_or_skip(g)  # one JIT compile, at the anchor shape
+    ws0 = g.get_workspace_size()
+    if case == "splitk" and ws0 == 0:
+        pytest.skip("auto selector did not split at this anchor")
 
-    for m, n, k in _OVERRIDE_SHAPES:
+    ou = [1, 2, 3]
+    for m, n, k in override_shapes:
         a, b, ref = _mm_operands(m, n, k)
-        ou = [1, 2, 3]
         osh = [[1, m, k], [1, k, n], [1, m, n]]
         ost = [[m * k, k, 1], [k * n, 1, k], [m * n, n, 1]]
 
         # (a) native override-shape API: workspace query + indexed execute.
         wsz = g.get_workspace_size_plan_at_index(frost, h, ou, osh, ost)
-        assert wsz == 0  # FROST owns its workspace at any shape
+        # dense gemm is 0
+        # splitK: ws0 = S * B * m0 * n0 * 4, wsz = S * B * m * n * 4
+        assert wsz == ws0 * (m * n) // (m0 * n0)
         ws = torch.empty(max(wsz, 1), device="cuda", dtype=torch.uint8)
         c = torch.empty(1, m, n, dtype=torch.bfloat16, device="cuda")
         g.execute_plan_at_index(

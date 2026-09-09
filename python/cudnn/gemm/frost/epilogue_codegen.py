@@ -917,6 +917,12 @@ def _scale_store_dtype(scale_dtype: Dtype) -> str:
     return "cutlass.Int8" if scale_dtype == "fp8_e5m3" else DTYPE_TO_CUTLASS[scale_dtype]
 
 
+def _f8_128x4_row_scale_index_expr(row: str, scale_col: str, n_col_quads: str, *, atom_base: str | None = None) -> str:
+    """Physical byte index for one logical row scale in an F8_128x4 blob."""
+    prefix = f"{atom_base} + " if atom_base is not None else ""
+    return f"{prefix}(({row} // 128) * {n_col_quads} + ({scale_col} // 4)) * 512 + " f"({row} % 32) * 16 + (({row} % 128) // 32) * 4 + ({scale_col} % 4)"
+
+
 def _emit_scale_quantize(p: str, sfx: str, src: str, scale_var: str, back_var: str, quant: BlockQuantizeSpec) -> list[str]:
     """Quantize one fp32 scale to ``quant.scale_dtype`` and read the STORED
     value back as fp32 — the data is divided by what was actually written, not
@@ -1194,19 +1200,34 @@ def _emit_block_quant(
             ),
         ]
     )
+    if quant.grouped_by_moe:
+        # Slot 6 is the block-scaled MoE scheduler's prefix sum of preceding
+        # groups' ceil(group_rows/128) scale atoms. Restart the row address at
+        # the group-local row and that atom base.
+        lines.extend(
+            [
+                f"{p}_local_row = row - group_begin",
+                f"{p}_ncb = ((N // {bs}) + 3) // 4",
+                f"{p}_base = start_sf_block_m * {p}_ncb * 512",
+            ]
+        )
     for k in range(n_sub):
         lines.append(f"{p}_scol{k} = col_j // {bs} + {k}")
         if quant.scale_reorder == "F8_128x4":
-            lines.extend(
-                [
-                    f"{p}_ncb{k} = ((N // {bs}) + 3) // 4",
-                    (
-                        f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
-                        f"((row // 128) * {p}_ncb{k} + ({p}_scol{k} // 4)) * 512 + "
-                        f"(row % 32) * 16 + ((row % 128) // 32) * 4 + ({p}_scol{k} % 4)"
-                    ),
-                ]
-            )
+            if quant.grouped_by_moe:
+                sidx = _f8_128x4_row_scale_index_expr(f"{p}_local_row", f"{p}_scol{k}", f"{p}_ncb", atom_base=f"{p}_base")
+                lines.append(f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + {sidx}")
+            else:
+                lines.extend(
+                    [
+                        f"{p}_ncb{k} = ((N // {bs}) + 3) // 4",
+                        (
+                            f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
+                            f"((row // 128) * {p}_ncb{k} + ({p}_scol{k} // 4)) * 512 + "
+                            f"(row % 32) * 16 + ((row % 128) // 32) * 4 + ({p}_scol{k} % 4)"
+                        ),
+                    ]
+                )
         else:
             lines.append(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
@@ -1316,6 +1337,16 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     return "\n".join(lines)
 
 
+def _emit_splitk_partial_store(vsize: int) -> list[str]:
+    """Split-K kernel-1 STG fallback: store the raw fp32 accumulator chunk to
+    partials[tile_l][M][N]; tile_l = grid z = batch*split."""
+    chunk = min(vsize, 4)  # 4 fp32 = one 16-byte STG
+    lines = [f"_split_k_off = (tile_l * M + row) * N + col_j"]
+    for s in range(0, vsize, chunk):
+        lines.append(f"(gSplitK_partials_ptr + _split_k_off + {s}).store(vec_f32[{s} : {s + chunk}], alignment={chunk * 4})")
+    return lines
+
+
 def generate(
     chain: FusionChain,
     *,
@@ -1323,6 +1354,7 @@ def generate(
     output_elem_bytes: int = 2,
     tma_slots: "frozenset[int]" = frozenset(),
     packed_lanes: bool = False,
+    split_k_slices: int = 1,
 ) -> EpilogueSnippets:
     """Produce the two hook-site snippets, the extra kernel param list, and
     all per-tap plumbing. ``vec_bytes_epi`` / ``output_elem_bytes`` (from the
@@ -1437,13 +1469,21 @@ def generate(
     if on_tma_arm and len(tma_slots) > 1:
         # The compiler stores each output at its ready marker.  Retire outputs
         # backed by an exclusive source first, while register-heavy quantizers
-        # stay last.  Python's stable sort preserves slot order among ties.
+        # stay last.  Among quantizers retire M-axis/column reduction state
+        # before the cheaper row path; on a shared 64-column drain this avoids
+        # carrying the heavier path across the row output's TMA store.
         source_uses: dict[int, int] = {}
         for output_spec in specs:
             source_uses[output_spec.source_ref] = source_uses.get(output_spec.source_ref, 0) + 1
         for reduction in chain.reductions:
             source_uses[reduction.source_ref] = source_uses.get(reduction.source_ref, 0) + 1
-        output_order.sort(key=lambda oi: (specs[oi].quant_idx is not None, source_uses[specs[oi].source_ref]))
+        output_order.sort(
+            key=lambda oi: (
+                specs[oi].quant_idx is not None,
+                0 if specs[oi].quant_idx is not None and chain.quants[specs[oi].quant_idx].axis == 1 else 1,
+                source_uses[specs[oi].source_ref],
+            )
+        )
     for si in output_order:
         spec = specs[si]
         src = _parent_value(spec.source_ref)
@@ -1508,6 +1548,13 @@ def generate(
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)
         body_lines.extend(_emit_reduction_atomic(_tap_of[len(specs) + red_idx], red_idx, red, red_source, chain.matmul, vsize, store_row_pred))
+
+    # Split-K partial store handling
+    if split_k_slices > 1:
+        if tma_slots:
+            body_lines = ["vec_out = vec_f32", tma_out_ready_marker(0)]
+        else:
+            body_lines = _emit_splitk_partial_store(vsize)
 
     epilogue = "\n".join(body_lines)
 

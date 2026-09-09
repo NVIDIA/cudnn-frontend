@@ -459,6 +459,7 @@ def run_grouped_gemm_srelu_ref(
     d_dtype: torch.dtype = torch.float32,
     sf_vec_size: int = 16,
     sf_dtype: torch.dtype = torch.float8_e8m0fnu,
+    tanh_clamp_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Run reference implementation for grouped GEMM SReLU.
 
@@ -480,6 +481,9 @@ def run_grouped_gemm_srelu_ref(
     :param d_dtype: Output D tensor dtype
     :param sf_vec_size: Scale factor vector size
     :param sf_dtype: Scale factor dtype
+    :param tanh_clamp_scale: Optional soft-clamp scale ``s``. When set, computes
+        ``(s * tanh(relu(ref) / s)) ** 2`` in fp32 instead of plain ``relu(ref) ** 2``.
+        ``None`` (default) is the plain unclamped reference.
     :return: Reference output tensor (valid_m, n_out, 1)
     """
     n, k, l = b_ref.shape
@@ -513,8 +517,12 @@ def run_grouped_gemm_srelu_ref(
 
     ref_tensors["c_ref"] = ref.clone()
 
-    # Step 3: Apply squared-ReLU and probability gating elementwise
-    ref_after_srelu = torch.relu(ref) ** 2
+    # Step 3: Apply (optionally soft-clamped) squared-ReLU and probability gating elementwise
+    if tanh_clamp_scale is not None:
+        t_ref = torch.tanh(torch.relu(ref) / tanh_clamp_scale)
+        ref_after_srelu = (tanh_clamp_scale * t_ref) ** 2
+    else:
+        ref_after_srelu = torch.relu(ref) ** 2
     ref_after_srelu = ref_after_srelu * prob_tensor.expand(-1, n_out, -1)
     ref_tensors["d_ref"] = ref_after_srelu.clone()
 
@@ -683,6 +691,7 @@ def check_ref_grouped_gemm_srelu(
         d_dtype=cfg["d_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
         sf_dtype=cfg["sf_dtype"],
+        tanh_clamp_scale=cfg.get("tanh_clamp_scale"),
     )
 
     torch.testing.assert_close(outputs["c_tensor"].float(), ref_tensors["c_ref"].float(), atol=atol, rtol=rtol)

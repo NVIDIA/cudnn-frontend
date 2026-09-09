@@ -16,6 +16,7 @@ _LAZY_EXPORTS = {
     "causal_conv1d": (".causal_conv1d", "causal_conv1d"),
     "causal_conv1d_nwh": (".causal_conv1d", "causal_conv1d_nwh"),
     "b2b_causal_conv1d": (".causal_conv1d", "b2b_causal_conv1d"),
+    "causal_conv1d_update": ("._causal_conv1d_update", "causal_conv1d_update"),
     "fft_causal_conv1d": (".fft_causal_conv1d", "fft_causal_conv1d"),
     "Nvfp4BlockScaleQuantizer": (".nvfp4", "Nvfp4BlockScaleQuantizer"),
     "Nvfp4BlockScaleDequantizer": (".nvfp4", "Nvfp4BlockScaleDequantizer"),
@@ -35,7 +36,9 @@ def __getattr__(name: str) -> Any:
     try:
         value = getattr(importlib.import_module(module_name, __name__), attr_name)
     except ImportError as error:
-        raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {error}") from error
+        from cudnn import _optional_dependency_message
+
+        raise ImportError(_optional_dependency_message(name, error)) from error
 
     globals()[name] = value
     return value

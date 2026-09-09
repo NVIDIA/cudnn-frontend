@@ -127,6 +127,8 @@ class _Nvfp4BlockScaleQuantizeKernel:
                 scale_idx = _scale_storage_index(row, group_i64, self.groups_per_row)
                 (scale_ptr + scale_idx).store(scale_e4m3)
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,
@@ -216,6 +218,8 @@ class _Nvfp4BlockScaleDequantizeKernel:
                 )
                 destination = cute.make_tensor(destination_ptr, cute.make_layout((BLOCK_SIZE,)))
                 cute.autovec_copy(output_values, destination)
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def __call__(

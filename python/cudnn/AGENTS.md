@@ -4,9 +4,9 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
 
 ## Import-time rules (the most common way to break this package)
 
-- `import cudnn` must work **without** torch/cutlass/cuda-python installed. Everything that needs them is exported lazily via `_LAZY_OPTIONAL_IMPORTS` in `__init__.py` — a module-level `__getattr__` imports the submodule on first attribute access and re-raises failures as `ImportError` pointing at `pip install nvidia-cudnn-frontend[cutedsl]`.
+- `import cudnn` must work **without** torch/cutlass/cuda-python installed. Everything that needs them is exported lazily via `_LAZY_OPTIONAL_IMPORTS` in `__init__.py` — a module-level `__getattr__` imports the submodule on first attribute access and re-raises failures as `ImportError` that names the missing framework module (torch, jax, cuda-python) alongside the base `pip install nvidia-cudnn-frontend` hint — or, for a CuTe DSL below `CUTEDSL_MIN_VERSION`, points at the DSL upgrade (Rule 7).
 - Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
-- Reuse the existing `[cutedsl]` extra (`pyproject.toml` optional-dependencies) unless a kernel truly needs a new package.
+- Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
 
 ## Hard rules
 
@@ -38,6 +38,12 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   launches, and a second copy of the semantics that can drift). If a packed
   extent would be zero, bind a never-dereferenced dummy view over storage
   the contract already guarantees.
+- **Overlapping optional declarations are validated as a set, not one by
+  one.** When two mechanisms can declare the same thing (ragged offsets vs
+  `cu_seqlen` vs plain `seq_len` tensors), each combination is either
+  defined or explicitly rejected — an unhandled overlap is an untested code
+  path with unspecified semantics, and "both supplied" is exactly the case
+  no per-argument check catches (raised in review on PR #266).
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**
@@ -168,6 +174,15 @@ not become a compile key.
   (#493) still keys `SQ`/`SKV` under `THD_VARLEN` — migrate it to dynamic
   token extents like the SM100/SM120 THD compiles rather than copying its
   pattern.
+- **Key on exactly the contract-relevant set — no more, no less.** Both
+  failure modes shipped on PR #553 and were caught in review: *under-keying*
+  (the cache keyed only `x.shape`/`w.shape` while `check_support()`
+  validated weight, RoPE, and scale descriptors — a hit can return an
+  artifact compiled for a different contract, i.e. wrong results) and
+  *over-keying* (`alpha` passed at launch, `m`/`n`/`k` on a shape-generic
+  kernel — every miss is a spurious multi-second recompile). Enumerate what
+  `check_support()` validates and what the kernel specializes on; the key
+  is that set.
 
 **Rule 5 — every torch operation on the execute path is ordered on the
 LAUNCH stream, never implicitly on torch's current stream.**
@@ -192,6 +207,73 @@ the kernel that reads it).
   context is a no-op — the race only bites direct graph-API users with an
   explicit handle stream, which is exactly why tests miss it. Order the work
   by construction rather than relying on the common case.
+- **The device is implicit state exactly like the stream.** A `torch.empty`
+  (or any allocator call) without a device context silently allocates on the
+  *current* GPU, not the input tensor's — wrap execute-path allocations in
+  the right device context as well as the stream context. And a raw pointer
+  argument is a contract: validate device-residency and dtype (a CUDA int64
+  tensor, not a host tensor) before handing its address to a kernel — both
+  flagged in review on PR #517.
+
+SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
+[sdpa/AGENTS.md](sdpa/AGENTS.md) — read it before touching anything under
+`python/cudnn/sdpa/`.
+
+**Rule 6 — every Frost-generated kernel has a cuDNN-attributable symbol.**
+
+- Immediately after every ``@cute.kernel`` definition, including auxiliary and
+  generated-template kernels, call the public naming API:
+
+  ```python
+  kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+  ```
+
+- Use the decorated function's actual name, keep the default
+  ``keep_mangled_name=True``, and do not use compiler flags or symbol rewriting
+  instead.
+- Verify with ``(cd test/python && pytest -q test_frost_kernel_name_prefix.py)``.
+- This call runs at module import, and DSL APIs used this way can be newer than
+  the `pyproject.toml` floor admits. It is legal only because Rule 7's gate runs
+  before the kernel module is imported — do not add an import path that skips
+  it.
+
+**Rule 7 — gate the CuTe DSL version at runtime; never assume the installed
+DSL satisfies your kernel.**
+
+- The `pyproject.toml` floor on `nvidia-cutlass-dsl` (`>=4.6.2`) is the
+  **downstream** floor, not ours: vLLM and SGLang inherit quack-kernels'
+  `==4.6.2`, and a higher floor would make this package uninstallable next to
+  them. The FROST-derived kernels need more (`CUTEDSL_MIN_VERSION`, 4.7.0). So
+  an installed DSL that satisfies pip can still be below what a kernel needs,
+  and every backend/kernel must cope with that at runtime.
+- Before a path imports a DSL-version-specific API, check the installed version
+  with `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old()` (floor:
+  `CUTEDSL_MIN_VERSION`) and **decline, or raise an error that names the
+  version** — `cutedsl_requirement_error(what)` builds it. Never let the failure
+  surface as an `AttributeError` / `TypeError` / `ModuleNotFoundError` from
+  inside the DSL, and never let it read as a missing-dependency install hint:
+  the package is installed, and that `pip install` changes nothing.
+- The gate lives at the entry the caller hits, before the kernel module is
+  imported: the semantic op's route check (`_can_route_causal_conv1d_bulk` in
+  `ops/causal_conv1d.py`, `_validated_native_update` in
+  `ops/_causal_conv1d_update.py`), an engine's `check_support`, or the family
+  `__init__`'s lazy import. Module-scope code in kernel files may assume the
+  floor only because that gate ran first.
+- Known floors — extend this list when you take a dependency on a newer API,
+  and say so in the PR body if it raises the floor of a user-facing op:
+  `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
+  `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
+- Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
+  they do not fail. CI runs the `oss:` lanes across the supported DSL versions
+  (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
+  must show skips, not errors.
+- Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
+  with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
+  ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk
+  route next to it had the check and declined cleanly. Earlier, PR #854's
+  module-scope `set_name_prefix(..., remove_cutlass_symbol=True)` failed the
+  same way on a since-dropped 4.5.x lane, reported as "install optional
+  dependencies".
 
 
 ## Frontend-only kernel package layout
@@ -218,6 +300,30 @@ python/cudnn/gemm/
 
 Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`) stay internal to the family package — never exported through `cudnn`.
 
+## CuTeDSL kernel bodies
+
+**Do not factor code out of a `@cute.kernel` body into a plain Python helper.**
+The DSL AST-transforms only the decorated function's own source: `for` becomes
+an `ir_loop`, `if` becomes an `scf` region. A helper called from the kernel is
+not transformed, so the ops it emits can land outside the enclosing region.
+
+Hoisting an 11-line block that ran correctly inline into a
+`write_clamped_kv_descs(...)` helper — called from inside
+`if nvvm.elect_sync() and tidx < 32:` — turned 212 passing forward tests into
+31 failures (`Error building ...`, traceback through `ir_loop` →
+`scf_execute_dynamic`). Unrolling the helper's own loop did not help; the
+helper *call* was the problem. Duplicating the block across flavors is the
+correct trade here. Factor only host-side code, or code you can mark
+`@cute.jit`.
+
+Related: inside a kernel body, `for x in (a, b)` over a Python tuple is
+rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
+(e.g. `GridConstant[TensorMap]`). Unroll it, or use `cutlass.range_constexpr`.
+
+**Detector.** These break at `compile()`, not at import — `python -c "import ..."`
+and `pytest --collect-only` both stay green. After any refactor of a kernel
+body, run that flavor's own tests.
+
 ## The APIBase contract (`api_base.py`)
 
 Every OSS kernel API extends `APIBase` and implements:
@@ -235,6 +341,7 @@ Every OSS kernel API extends `APIBase` and implements:
 3. Exports: family `__init__.py` `__all__` **and** `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`; register any new package dir in `pyproject.toml` packages list.
 4. Docs: page under `docs/fe-oss-apis/` (family subdir) + link it from `docs/fe-oss-apis/overview.md`.
 5. Tests: `test/python/fe_api/<family>/test_<op>.py` (+ `_utils.py`/reference), covering check_support pass/fail and numerical reference comparison.
+6. DSL version gate (Rule 7): the route/`check_support` declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
 
 The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) documents this workflow in detail, including how to classify a kernel into a family — follow it for any kernel integration.
 

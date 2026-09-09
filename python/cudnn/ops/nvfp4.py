@@ -20,7 +20,13 @@ from cuda.bindings import driver as cuda
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.tensor_adapter import detect_framework, get_device, get_shape
 
-from ._nvfp4_block_scale_kernels import (
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+_dsl_error = cutedsl_requirement_error("NVFP4 block-scale conversion")
+if _dsl_error:
+    raise ImportError(_dsl_error)
+
+from ._nvfp4_block_scale_kernels import (  # noqa: E402
     BLOCK_SIZE,
     MAX_GROUPS_PER_ROW,
     compile_nvfp4_block_scale_dequantize,

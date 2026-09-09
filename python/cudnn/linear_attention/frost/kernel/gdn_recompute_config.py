@@ -29,8 +29,8 @@ from typing import Tuple
 class Cfg:
     # --- tile shape ---
     B_T: int = 64  # chunk size / token tile (the mma N or K of every GEMM)
-    D_K: int = 128  # key head dim (contraction of GEMMs 1/3, M of GEMM 7)
-    D_V: int = 128  # value head dim (M of GEMMs 3/5, N of GEMM 7)
+    D_K: int = 128  # key head dim (contraction of the KK/K*state GEMMs, output dim of the KV update)
+    D_V: int = 128  # value head dim (output dim of the K*state/U GEMMs and of the KV update)
 
     # --- TMA descriptor pool ---
 

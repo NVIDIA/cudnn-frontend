@@ -703,6 +703,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 )
                 sched_counter[0] = cutlass.Int32(0)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,
@@ -3138,3 +3140,5 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             if cutlass.const_expr(self.d_quant):
                 dq_pipeline.producer_tail()
         # END OF KERNEL
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

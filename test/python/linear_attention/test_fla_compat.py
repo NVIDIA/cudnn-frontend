@@ -69,7 +69,6 @@ def _run(fn, master, dtype, **kw):
 
 def _run_truth(master):
     lv = _leaves(master, torch.float32)
-    # naive signature: (q, k, v, beta, g, ...)
     o, _ = naive_recurrent(lv["q"], lv["k"], lv["v"], lv["beta"], lv["g"], output_final_state=False)
     return o, lv
 
@@ -114,25 +113,27 @@ def test_parity_native(cfg):
         check("d" + n, lv_fla[n].grad, lv_cud[n].grad, ref)
 
 
-def _fused_leaves(B, T, H, HV, K, V, dtype, seed):
+def _fused_leaves(B, T, H, HV, K, V, dtype, seed, with_dt_bias=True):
     dev = torch.device("cuda")
     gen = torch.Generator(device=dev).manual_seed(seed)
 
     def leaf(shape, dt, req=True):
         return torch.randn(*shape, generator=gen, device=dev, dtype=dt).detach().requires_grad_(req)
 
-    return {
+    lv = {
         "q": leaf((B, T, H, K), dtype),
         "k": leaf((B, T, H, K), dtype),
         "v": leaf((B, T, HV, V), dtype),
         "graw": torch.rand(B, T, HV, generator=gen, device=dev, dtype=torch.float32).requires_grad_(True),
         "braw": leaf((B, T, HV), torch.float32),
         "A_log": torch.log(torch.empty(HV, device=dev).uniform_(0.1, 16)).requires_grad_(True),
-        "dt_bias": torch.randn(HV, generator=gen, device=dev).requires_grad_(True),
     }
+    if with_dt_bias:
+        lv["dt_bias"] = torch.randn(HV, generator=gen, device=dev).requires_grad_(True)
+    return lv
 
 
-def _run_fused(fn, lv):
+def _run_fused(fn, lv, allow_neg_eigval=False):
     o, _ = fn(
         lv["q"],
         lv["k"],
@@ -140,19 +141,23 @@ def _run_fused(fn, lv):
         lv["graw"],
         lv["braw"],
         A_log=lv["A_log"],
-        dt_bias=lv["dt_bias"],
+        dt_bias=lv.get("dt_bias"),
         use_gate_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
+        allow_neg_eigval=allow_neg_eigval,
         use_qk_l2norm_in_kernel=True,
         output_final_state=False,
     )
     return o
 
 
+@pytest.mark.parametrize("with_dt_bias", [True, False], ids=["bias", "no_bias"])
+@pytest.mark.parametrize("allow_neg_eigval", [False, True], ids=["sigmoid", "neg_eigval"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-def test_parity_fused_layer_path(dtype):
+def test_parity_fused_layer_path(dtype, allow_neg_eigval, with_dt_bias):
     """The FLA GatedDeltaNet layer's actual call (raw g/beta + A_log/dt_bias +
-    in-kernel L2-norm/gate/beta fusion): the shim forwards the fusions to the native
+    in-kernel L2-norm/gate/beta fusion, with and without the ``2 * sigmoid`` beta,
+    with and without ``dt_bias``): the shim forwards the fusions to the native
     kernel and must still match FLA within its own noise (truth = FLA fused in fp32)."""
     shape = dict(B=2, T=256, H=4, HV=4, K=128, V=128)
     do = torch.randn(shape["B"], shape["T"], shape["HV"], shape["V"], device="cuda")
@@ -164,15 +169,15 @@ def test_parity_fused_layer_path(dtype):
             lv[name] = t.detach().clone().to(torch.float32 if keep_fp32 else dt).requires_grad_(True)
         return lv
 
-    master = _fused_leaves(**shape, dtype=dtype, seed=3)
+    master = _fused_leaves(**shape, dtype=dtype, seed=3, with_dt_bias=with_dt_bias)
     lv_fla = clone_to(master, dtype)
     lv_cud = clone_to(master, dtype)
-    lv_ref = clone_to(master, torch.float32)  # fp32 truth via FLA's own fused path
+    lv_ref = clone_to(master, torch.float32)
 
-    o_fla = _run_fused(chunk_gated_delta_rule, lv_fla)
-    o_cud = _run_fused(shim, lv_cud)
+    o_fla = _run_fused(chunk_gated_delta_rule, lv_fla, allow_neg_eigval)
+    o_cud = _run_fused(shim, lv_cud, allow_neg_eigval)
     assert last_path() == "native", f"expected cuDNN native path, got {last_path()}"
-    o_ref = _run_fused(chunk_gated_delta_rule, lv_ref)
+    o_ref = _run_fused(chunk_gated_delta_rule, lv_ref, allow_neg_eigval)
 
     o_fla.backward(do.to(o_fla.dtype))
     o_cud.backward(do.to(o_cud.dtype))
@@ -184,7 +189,7 @@ def test_parity_fused_layer_path(dtype):
         assert e_cud <= C_SLACK * max(e_fla, FLOOR), f"{name}: e_cud={e_cud:.2e} vs e_fla={e_fla:.2e}"
 
     check("o", o_fla, o_cud, o_ref)
-    for n in ("q", "k", "v", "graw", "braw", "A_log", "dt_bias"):
+    for n in master:
         check("d" + n, lv_fla[n].grad, lv_cud[n].grad, lv_ref[n].grad)
 
 
@@ -240,82 +245,113 @@ from cudnn.fla.kda import make_chunk_kda, last_path as kda_last_path
 kda_shim = make_chunk_kda(chunk_kda)
 
 
-def _kda_leaves(B, T, H, K, V, dtype, seed):
+def _kda_leaves(B, T, H, HV, K, V, dtype, seed, with_a_log=True, with_dt_bias=True, mild_decay=False):
     dev = torch.device("cuda")
     gen = torch.Generator(device=dev).manual_seed(seed)
 
-    def io(*s):
-        return torch.randn(*s, generator=gen, device=dev, dtype=dtype).detach().requires_grad_(True)
+    def io(*s, scale=1.0):
+        return (torch.randn(*s, generator=gen, device=dev, dtype=dtype) * scale).detach().requires_grad_(True)
 
-    # realistic KDA gate init: mild g via dt_bias = softplus^{-1}(dt), dt in [1e-3, 0.1]
-    dt = torch.exp(torch.rand(H * K, generator=gen, device=dev) * (math.log(0.1) - math.log(1e-3)) + math.log(1e-3)).clamp(min=1e-4)
-    return {
+    dt = torch.exp(torch.rand(HV * K, generator=gen, device=dev) * (math.log(0.1) - math.log(1e-3)) + math.log(1e-3)).clamp(min=1e-4)
+    amplitude = (0.1, 0.3) if mild_decay else (1, 16)
+    lv = {
         "q": io(B, T, H, K),
         "k": io(B, T, H, K),
-        "v": io(B, T, H, V),
-        "g": io(B, T, H, K),  # raw f_proj output (channel-wise), io dtype
-        "beta": io(B, T, H),
-        "A_log": torch.log(torch.empty(H, device=dev).uniform_(1, 16)).requires_grad_(True),
-        "dt_bias": (dt + torch.log(-torch.expm1(-dt))).detach().requires_grad_(True),
+        "v": io(B, T, HV, V),
+        "g": io(B, T, HV, K, scale=0.1 if mild_decay else 1.0),
+        "beta": torch.randn(B, T, HV, generator=gen, device=dev).requires_grad_(True),
     }
+    if with_dt_bias:
+        lv["dt_bias"] = (dt + torch.log(-torch.expm1(-dt))).detach().requires_grad_(True)
+    if with_a_log:
+        lv["A_log"] = torch.log(torch.empty(HV, device=dev).uniform_(*amplitude)).requires_grad_(True)
+    return lv
 
 
-def _run_kda(fn, lv):
+KDA_GATES = {
+    "softplus": dict(safe_gate=False, lower_bound=None),
+    "lower_bound": dict(safe_gate=True, lower_bound=-5.0),
+    "lower_bound_no_a_log": dict(safe_gate=False, lower_bound=-5.0),
+    "lower_bound_no_dt_bias": dict(safe_gate=True, lower_bound=-5.0),
+    "lower_bound_no_params": dict(safe_gate=False, lower_bound=-5.0),
+}
+
+
+def _run_kda(fn, lv, gate, allow_neg_eigval=False):
     o, _ = fn(
         q=lv["q"],
         k=lv["k"],
         v=lv["v"],
         g=lv["g"],
         beta=lv["beta"],
-        A_log=lv["A_log"],
-        dt_bias=lv["dt_bias"],
+        A_log=lv.get("A_log"),
+        dt_bias=lv.get("dt_bias"),
         use_qk_l2norm_in_kernel=True,
         use_gate_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
-        safe_gate=False,
+        allow_neg_eigval=allow_neg_eigval,
         output_final_state=False,
+        **KDA_GATES[gate],
     )
     return o
 
 
-def test_kda_parity_fused():
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        pytest.param(dict(gate="softplus", allow_neg_eigval=False, H=4, HV=4), id="softplus"),
+        pytest.param(dict(gate="softplus", allow_neg_eigval=True, H=4, HV=4), id="softplus-neg_eigval"),
+        pytest.param(dict(gate="lower_bound", allow_neg_eigval=False, H=4, HV=4), id="lower_bound"),
+        pytest.param(dict(gate="lower_bound", allow_neg_eigval=True, H=4, HV=4), id="lower_bound-neg_eigval"),
+        pytest.param(dict(gate="lower_bound_no_a_log", allow_neg_eigval=False, H=4, HV=4), id="lower_bound_no_a_log"),
+        pytest.param(dict(gate="lower_bound_no_dt_bias", allow_neg_eigval=False, H=4, HV=4), id="lower_bound_no_dt_bias"),
+        pytest.param(dict(gate="lower_bound_no_params", allow_neg_eigval=False, H=4, HV=4), id="lower_bound_no_params"),
+        pytest.param(dict(gate="lower_bound", allow_neg_eigval=False, H=2, HV=4), id="lower_bound-gva"),
+        pytest.param(dict(gate="softplus", allow_neg_eigval=False, H=4, HV=4, dtype=torch.float16, mild_decay=True), id="softplus-fp16"),
+    ],
+)
+def test_kda_parity_fused(cfg):
     """cuDNN KDA (through the shim) matches FLA's chunk_kda on the layer's fused
     call, calibrated to a fp32 FLA reference: cuDNN's error from truth must be
-    within 3x FLA's own bf16 error, on the output and every gradient. bf16 only —
-    cuDNN's KDA kernel is unstable in fp16 (the shim declines fp16 -> FLA). T=128
-    avoids a FLA/triton autotune crash unrelated to cuDNN at some larger tiles."""
-    shape = dict(B=2, T=128, H=4, K=128, V=128)
-    master = _kda_leaves(**shape, dtype=torch.bfloat16, seed=5)
-    do = torch.randn(shape["B"], shape["T"], shape["H"], shape["V"], device="cuda")
+    within a fixed factor of FLA's own 16-bit error, on the output and every
+    gradient. Covers both FLA gate transforms (softplus and the lower-bounded
+    sigmoid, with and without ``A_log`` / ``dt_bias``), the ``2 * sigmoid`` beta, grouped
+    value heads, and fp16 io at a per-token decay the fp16 range represents over
+    a chunk. T=128 avoids a FLA/triton autotune crash unrelated to cuDNN at some
+    larger tiles."""
+    shape = dict(B=2, T=128, H=cfg["H"], HV=cfg["HV"], K=128, V=128)
+    dtype = cfg.get("dtype", torch.bfloat16)
+    master = _kda_leaves(
+        **shape,
+        dtype=dtype,
+        seed=5,
+        with_a_log=cfg["gate"] not in ("lower_bound_no_a_log", "lower_bound_no_params"),
+        with_dt_bias=cfg["gate"] not in ("lower_bound_no_dt_bias", "lower_bound_no_params"),
+        mild_decay=cfg.get("mild_decay", False),
+    )
+    do = torch.randn(shape["B"], shape["T"], shape["HV"], shape["V"], device="cuda")
 
     def clone(src, dt):
         lv = {}
         for name, t in src.items():
-            fp32 = name in ("A_log", "dt_bias")
+            fp32 = name in ("beta", "A_log", "dt_bias")
             lv[name] = t.detach().clone().to(torch.float32 if fp32 else dt).requires_grad_(True)
         return lv
 
-    lv_fla = clone(master, torch.bfloat16)
-    lv_cud = clone(master, torch.bfloat16)
-    lv_ref = clone(master, torch.float32)  # fp32 truth via FLA's own fused path
+    lv_fla = clone(master, dtype)
+    lv_cud = clone(master, dtype)
+    lv_ref = clone(master, torch.float32)
 
-    o_fla = _run_kda(chunk_kda, lv_fla)
-    o_cud = _run_kda(kda_shim, lv_cud)
+    o_fla = _run_kda(chunk_kda, lv_fla, cfg["gate"], cfg["allow_neg_eigval"])
+    o_cud = _run_kda(kda_shim, lv_cud, cfg["gate"], cfg["allow_neg_eigval"])
     assert kda_last_path() == "native", f"expected cuDNN native path, got {kda_last_path()}"
-    o_ref = _run_kda(chunk_kda, lv_ref)
+    o_ref = _run_kda(chunk_kda, lv_ref, cfg["gate"], cfg["allow_neg_eigval"])
 
     o_fla.backward(do.to(o_fla.dtype))
     o_cud.backward(do.to(o_cud.dtype))
     o_ref.backward(do.to(o_ref.dtype))
 
-    # cuDNN KDA's channel-gate backward is a bit noisier than FLA's in bf16, so the
-    # gate-parameter gradients (dg / dA_log, amplified through exp(A_log)) sit at ~3x
-    # FLA's own error from truth rather than <=3x. Output and the main data gradients
-    # match to bf16 noise; the wider slack applies only to the gate-parameter path.
-    KDA_SLACK = 5.0  # output + data gradients
-    # The gate-parameter gradients (dg, dA_log, dt_bias) go through cuDNN's non-deterministic
-    # backward (cross-CTA fp atomicAdd), so they are noisier and vary run-to-run; give them a
-    # wider bound. This is still a real bound (a gross error would blow well past it).
+    KDA_SLACK = 5.0
     KDA_GATE_SLACK = 8.0
     GATE_PARAMS = ("g", "A_log", "dt_bias")
 
@@ -325,56 +361,108 @@ def test_kda_parity_fused():
         assert e_cud <= slack * max(e_fla, FLOOR), f"{name}: e_cud={e_cud:.2e} vs e_fla={e_fla:.2e} (slack {slack})"
 
     check("o", o_fla, o_cud, o_ref, KDA_SLACK)
-    for n in ("q", "k", "v", "g", "beta", "A_log", "dt_bias"):
+    for n in master:
         check("d" + n, lv_fla[n].grad, lv_cud[n].grad, lv_ref[n].grad, KDA_GATE_SLACK if n in GATE_PARAMS else KDA_SLACK)
+    assert lv_cud["beta"].grad.dtype == torch.float32
 
 
 def test_fallback_is_transparent():
-    """A variant the native op does not model falls back and returns FLA's exact result.
+    """A config the native engine does not serve falls back and returns FLA's exact result.
 
-    Keyed on ``allow_neg_eigval``, which the shim declines by construction, so this stays
-    a fallback no matter which shapes the engines grow support for.
+    Keyed on K = 256: the FROST GDN engine takes head dims 64 and 128 only and the
+    shim pins its plans to FROST, so this stays a fallback whatever the other engines
+    grow support for.
     """
-    m = _master(2, 256, 4, 4, 128, 128, seed=1)
-    kw = dict(allow_neg_eigval=True, use_beta_sigmoid_in_kernel=True)  # FLA requires the pair
-    o_fla, _ = _run(chunk_gated_delta_rule, m, torch.bfloat16, **kw)
-    o_cud, _ = _run(shim, m, torch.bfloat16, **kw)
+    m = _master(2, 256, 4, 4, 256, 128, seed=1)
+    o_fla, _ = _run(chunk_gated_delta_rule, m, torch.bfloat16)
+    o_cud, _ = _run(shim, m, torch.bfloat16)
     assert last_path().startswith("fallback"), f"expected fallback, got {last_path()}"
     torch.testing.assert_close(o_cud, o_fla, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("state_v_first,expect_native", [(True, True), (False, False)])
-def test_state_v_first_routing(state_v_first, expect_native):
-    """cuDNN carries the recurrent state V-major, so it serves ``state_v_first=True``
-    natively and declines the K-major request; a stateless call is layout-agnostic
-    and runs native either way."""
-    m = _master(2, 256, 4, 4, 128, 128, seed=2)
-    lv = _leaves(m, torch.bfloat16)
-    o_cud, fs_cud = shim(
-        lv["q"],
-        lv["k"],
-        lv["v"],
-        lv["g"],
-        lv["beta"],
-        output_final_state=True,
-        state_v_first=state_v_first,
-    )
-    got = last_path()
-    if expect_native:
-        assert got == "native", f"state_v_first={state_v_first}: expected native, got {got}"
-        assert fs_cud.shape == (m["q"].shape[0], m["v"].shape[2], m["v"].shape[3], m["q"].shape[3])
+@pytest.mark.parametrize("state_v_first", [True, False], ids=["v_major", "k_major"])
+@pytest.mark.parametrize("with_initial_state", [False, True], ids=["zero_state", "initial_state"])
+def test_state_layouts(state_v_first, with_initial_state):
+    """The recurrent state is exchanged in FLA's layout for both ``state_v_first``
+    settings, with and without an incoming state, on the native path; the output,
+    the final state and the state gradient match FLA within its own noise."""
+    B, T, H, HV, K, V = 2, 256, 4, 4, 128, 128
+    m = _master(B, T, H, HV, K, V, seed=2)
+    state_shape = (B, HV, V, K) if state_v_first else (B, HV, K, V)
+    h0_master = torch.randn(*state_shape, device="cuda") if with_initial_state else None
+    do = torch.randn(B, T, HV, V, device="cuda")
+    dfs = torch.randn(*state_shape, device="cuda")
+
+    def run(fn):
+        lv = _leaves(m, torch.bfloat16)
+        h0 = None if h0_master is None else h0_master.detach().clone().requires_grad_(True)
+        o, fs = fn(lv["q"], lv["k"], lv["v"], lv["g"], lv["beta"], initial_state=h0, output_final_state=True, state_v_first=state_v_first)
+        (o.float() * do.to(o.dtype)).sum().add((fs * dfs).sum()).backward()
+        return o, fs, lv, h0
+
+    o_fla, fs_fla, lv_fla, h0_fla = run(chunk_gated_delta_rule)
+    o_cud, fs_cud, lv_cud, h0_cud = run(shim)
+    assert last_path() == "native", f"expected native, got {last_path()}"
+    assert fs_cud.shape == fs_fla.shape == state_shape
+    assert fs_cud.dtype == fs_fla.dtype == torch.float32
+    assert _relL2(o_cud, o_fla) <= C_SLACK * FLOOR
+    assert _relL2(fs_cud, fs_fla) <= C_SLACK * FLOOR
+    for n in ("q", "k", "v", "g", "beta"):
+        assert _relL2(lv_cud[n].grad, lv_fla[n].grad) <= C_SLACK * FLOOR, n
+    if with_initial_state:
+        assert _relL2(h0_cud.grad, h0_fla.grad) <= C_SLACK * FLOOR
+
+
+@pytest.mark.parametrize("state_v_first", [True, False], ids=["v_major", "k_major"])
+@pytest.mark.parametrize("layout", ["dense", "varlen"])
+def test_kda_intermediate_states(layout, state_v_first):
+    """``return_intermediate_states`` (FLA's inference path) is served from cuDNN's
+    per-chunk state series: same chunking (64 tokens, state before each chunk,
+    ``ceil(len / 64)`` entries per sequence packed in order), same layout as
+    FLA's ``h`` for both state layouts, same dtype; the output and the final
+    state match FLA within its own noise."""
+    H, K, V = 4, 128, 128
+    if layout == "dense":
+        B, T, cu, n_chunks = 2, 200, None, 4
     else:
-        assert got.startswith("fallback"), f"state_v_first={state_v_first}: expected fallback, got {got}"
-        o_fla, _ = chunk_gated_delta_rule(
-            lv["q"],
-            lv["k"],
-            lv["v"],
-            lv["g"],
-            lv["beta"],
-            output_final_state=True,
-            state_v_first=state_v_first,
-        )
-        torch.testing.assert_close(o_cud, o_fla, rtol=0, atol=0)
+        seq_lens = [96, 32, 160]
+        B, T, cu, n_chunks = 1, sum(seq_lens), torch.tensor([0, 96, 128, 288], dtype=torch.long, device="cuda"), 2 + 1 + 3
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    io = lambda *shape: torch.randn(*shape, generator=gen, device="cuda", dtype=torch.bfloat16)
+    q, k, v = io(B, T, H, K), io(B, T, H, K), io(B, T, H, V)
+    g = -torch.rand(B, T, H, K, generator=gen, device="cuda").mul(0.2)
+    beta = torch.rand(B, T, H, generator=gen, device="cuda")
+    n_seq = B if cu is None else len(cu) - 1
+    h0 = torch.randn(n_seq, H, *((V, K) if state_v_first else (K, V)), generator=gen, device="cuda")
+
+    def run(fn):
+        with torch.inference_mode():
+            return fn(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state=h0,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                return_intermediate_states=True,
+                state_v_first=state_v_first,
+                cu_seqlens=cu,
+            )
+
+    o_fla, fs_fla, h_fla = run(chunk_kda)
+    o_cud, fs_cud, h_cud = run(kda_shim)
+    assert kda_last_path() == "native", f"expected native, got {kda_last_path()}"
+    assert h_fla.shape == (B, n_chunks, H) + ((V, K) if state_v_first else (K, V))
+    assert h_cud.shape == h_fla.shape and h_cud.dtype == h_fla.dtype
+    assert fs_cud.shape == fs_fla.shape
+    assert _relL2(o_cud, o_fla) <= C_SLACK * FLOOR
+    assert _relL2(fs_cud, fs_fla) <= C_SLACK * FLOOR
+    assert _relL2(h_cud, h_fla) <= C_SLACK * FLOOR
+    expect0 = (h0 if cu is None else h0[:1]).to(h_cud.dtype)
+    torch.testing.assert_close(h_cud[:, 0], expect0, rtol=0, atol=0)
+    torch.testing.assert_close(h_fla[:, 0], expect0, rtol=0, atol=0)
 
 
 def test_accelerate_fla_patches_and_restores():

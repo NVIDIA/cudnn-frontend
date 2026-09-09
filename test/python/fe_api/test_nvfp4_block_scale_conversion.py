@@ -7,6 +7,12 @@ import cudnn
 import pytest
 import torch
 
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+_dsl_error = cutedsl_requirement_error("NVFP4 block-scale conversion tests")
+if _dsl_error:
+    pytest.skip(_dsl_error, allow_module_level=True)
+
 
 def _active_sm() -> int | None:
     if not torch.cuda.is_available():

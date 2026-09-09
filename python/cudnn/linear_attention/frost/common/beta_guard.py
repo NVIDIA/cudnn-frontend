@@ -41,7 +41,8 @@ def beta_guard(
     decay_row: cutlass.Int32,
     lane_in_row_group: cutlass.Int32,
 ) -> None:
-    """Rewrite the 16 per-lane beta registers to beta_eff in place."""
+    """Rewrite the dk_halves * 8 per-lane beta registers to beta_eff in place."""
+    dk_halves = cfg.d_k // 64
     zero = cutlass.Float32(0.0)
     one = cutlass.Float32(1.0)
 
@@ -50,8 +51,8 @@ def beta_guard(
     if decay_row == 0:
         prev_row = cutlass.Int32(0)
     max_ratio = zero
-    for dim_half in cutlass.range_constexpr(2):
-        dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
+    for dim_half in cutlass.range_constexpr(dk_halves):
+        dim_base = dim_half * 64 + lane_in_row_group * 8
         for f32_group in cutlass.range_constexpr(2):
             f32_dim_base = dim_base + f32_group * 4
             f32_segment = f32_dim_base // 32
@@ -74,7 +75,7 @@ def beta_guard(
     n_val = zero
     a_val = zero
     nu_val = zero
-    for reg_idx in cutlass.range_constexpr(2 * 8):
+    for reg_idx in cutlass.range_constexpr(dk_halves * 8):
         k_norm = raw_k_regs[reg_idx] * k_inv_norm
         weight = k_norm * k_norm
         beta_val = raw_beta_regs[reg_idx]
@@ -110,7 +111,7 @@ def beta_guard(
     # ---- quantize + re-test ----------------------------------------------------
     a_q = zero
     nu_q = zero
-    for reg_idx in cutlass.range_constexpr(2 * 8):
+    for reg_idx in cutlass.range_constexpr(dk_halves * 8):
         candidate = raw_beta_regs[reg_idx]
         if unsafe:
             candidate = mu + eta * (candidate - mu)
@@ -135,7 +136,7 @@ def beta_guard(
         if r2_q > r2_crit_q + quant_tol:
             fallback = cutlass.Boolean(True)
     mu_q = (a_q * inv_n).to(cfg.io_dtype).to(cutlass.Float32)
-    for reg_idx in cutlass.range_constexpr(2 * 8):
+    for reg_idx in cutlass.range_constexpr(dk_halves * 8):
         final_val = raw_beta_regs[reg_idx]
         if fallback:
             final_val = mu_q
