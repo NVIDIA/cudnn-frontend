@@ -171,7 +171,6 @@ def _run_cycle(args: argparse.Namespace, *, device: torch.device, rank: int, wor
                 out=backward_out,
             )
         torch.cuda.synchronize(device)
-        dist.barrier(group=dist.group.WORLD, device_ids=[device.index])
 
         graphs = tuple(
             _capture_training_graph(
@@ -189,15 +188,26 @@ def _run_cycle(args: argparse.Namespace, *, device: torch.device, rank: int, wor
                 output_pairs,
             )
         )
-        dist.barrier(group=dist.group.WORLD, device_ids=[device.index])
 
-        replay_count = args.diagnostic_replays + args.burst_replays
-        if lane_count > 1:
-            replay_count += args.multistream_replays
         caught = None
         try:
+            replay_count = args.diagnostic_replays + args.burst_replays
             for replay in range(replay_count):
-                graphs[replay % len(graphs)].replay()
+                graph_index = replay % len(graphs)
+                graphs[graph_index].replay()
+            if lane_count > 1:
+                current_stream = torch.cuda.current_stream(device)
+                streams = tuple(
+                    torch.cuda.Stream(device=device) for _ in range(lane_count)
+                )
+                for stream in streams:
+                    stream.wait_stream(current_stream)
+                for _ in range(args.multistream_replays):
+                    for stream, graph in zip(streams, graphs):
+                        with torch.cuda.stream(stream):
+                            graph.replay()
+                for stream in streams:
+                    stream.synchronize()
             torch.cuda.synchronize(device)
         except Exception as error:
             caught = error
@@ -207,7 +217,6 @@ def _run_cycle(args: argparse.Namespace, *, device: torch.device, rank: int, wor
                 raise AssertionError("expected the captured overflow assertion")
         elif caught is not None:
             raise caught
-        dist.barrier(group=dist.group.WORLD, device_ids=[device.index])
     finally:
         op.close()
 
@@ -235,7 +244,8 @@ def main() -> None:
         device_id=device,
     )
     try:
-        if torch.cuda.get_device_capability(device) != (10, 7):
+        capability = torch.cuda.get_device_capability(device)
+        if capability != (10, 7):
             raise RuntimeError("stateless training graph probe requires SM107")
         for _ in range(args.cycles):
             _run_cycle(args, device=device, rank=rank, world_size=world_size)

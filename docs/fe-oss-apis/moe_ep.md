@@ -40,6 +40,7 @@ op = MoeEp(
     combine_format="bf16",
     apply_topk_in_fc1=True,
     weight_interleave_size=32,
+    validation_mode="strict",
 )
 ```
 
@@ -48,6 +49,21 @@ including all per-expert padding. Padding is contained within this capacity.
 
 Native training requires `weight_interleave_size=32`. FC1 payloads then use
 alternating 32-element gate/up strips.
+
+## Routing contract
+
+Inference and training require dense routing: `topk_idx` has shape `(T, K)`
+and every active value must be a global expert ID in `[0, num_experts)`.
+Negative IDs, including the conventional `-1` dropped-route sentinel, are not
+supported. Private fixed-capacity staging may use `-1` after row `T`; callers
+never pass or consume that tail.
+
+`validation_mode="strict"` checks expert-ID values during eager execution and
+warmup. `"trusted"` skips this device-value check and relies on the caller.
+Structural shape, dtype, device, capacity, aliasing, and output checks remain
+enabled in both modes. CUDA Graph capture and replay do not perform semantic
+routing validation, so routing contents updated at captured addresses must
+continue to satisfy the same dense contract.
 
 ## Explicit sweep autotuning
 
@@ -276,11 +292,8 @@ and are written directly by the backward kernel. `grad_activation` is BF16 and
 
 All six backward WGrad fields are required. `operands` is always a
 `MoeEpTrainingWgradOperands` containing non-owning views of the exact caller
-buffers.
-
-The producer-native ABI is directly consumable by the separately invoked
-grouped WGrad kernel. Here `K_pool` is the fixed routed-token pool capacity,
-not the model's top-k value:
+buffers. Here `K_pool` is the fixed routed-token pool capacity, not the
+model's top-k value:
 
 - `fc1_b` remains gate/up-interleaved with shape `(K_pool, 2I)` and stride
   `(2I, 1)`;
@@ -289,6 +302,20 @@ not the model's top-k value:
   interleaved layout;
 - no public compact scale, deinterleave copy, physical transpose, slot export,
   or scale-expansion kernel is used.
+
+The fixed tensor extent is storage capacity, not a promise that every row is
+defined. For local expert `e`, let `begin` be zero when `e == 0` and
+`expert_offsets[e - 1]` otherwise. Only
+`[begin, begin + valid_route_counts[e])` is valid. The remainder of that
+expert's padded segment and the capacity tail after `expert_offsets[-1]` have
+unspecified data and scale values. Consumers must use both metadata tensors:
+`expert_offsets` locates each physical segment and `valid_route_counts`
+limits the rows read from it.
+
+The existing grouped WGrad API derives its GEMM K extent from adjacent
+`expert_offsets` and therefore reads complete padded segments. MoeEP operands
+are not guaranteed to be directly consumable by that API under this validity
+contract.
 
 ## Ownership and lifetime
 
@@ -315,7 +342,16 @@ not the model's top-k value:
 Overflow is private per-launch state. Each forward and backward applies the
 configured policy before returning; there is no public overflow tensor or
 `finalize_overflow` method. EP2+ retains the scalar MAX reduction required to
-make the policy rank-consistent.
+make the policy rank-consistent. Numerically usable results are guaranteed
+only when no overflow occurs. A launch that overflows may raise or drop work
+according to `drop_on_overflow`, but its returned values are outside the
+supported correctness contract.
+
+Private pre-reduction data and scale planes persist across launches and are not
+cleared. Under dense, non-overflow routing, every active `(token, top-k slot)`
+is completely overwritten before reduction. Rows in
+`[T, max_tokens_per_rank)` remain unspecified and must not be returned or
+consumed.
 
 ## CUDA Graph capture
 
@@ -329,8 +365,13 @@ make the policy rank-consistent.
 6. Keep all captured input, output, saved-state, staging, and native-pack
    addresses stable until every referencing graph executable is destroyed.
 
-Dynamic contents may change at fixed addresses. Eager invocations may replace
-addresses between calls.
+The local token count `T` is fixed by the input shapes used during capture.
+Every replay of that graph must use the same `T`, shapes, and addresses.
+Tensor contents, routing, `valid_route_counts`, and `expert_offsets` may change
+at those fixed addresses on each replay, but all routing IDs must remain valid
+and dense because replay performs no value check. Eager invocations may use a
+different `T` and replace addresses between calls, subject to the configured
+capacity.
 
 ## Breaking migration
 

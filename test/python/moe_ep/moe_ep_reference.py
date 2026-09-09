@@ -616,16 +616,14 @@ class MoeEpReference:
         token_count = topk_idx.shape[0]
         flat_expert = topk_idx.reshape(-1).to(torch.int64)
         flat_weight = topk_weights.reshape(-1).float()
-        valid = flat_expert != -1
-        invalid_negative = flat_expert < -1
-        invalid_high = flat_expert >= self.num_experts
-        if bool((invalid_negative | invalid_high).any().item()):
-            bad = flat_expert[invalid_negative | invalid_high][0].item()
+        invalid = (flat_expert < 0) | (flat_expert >= self.num_experts)
+        if bool(invalid.any().item()):
+            bad = flat_expert[invalid][0].item()
             raise ValueError(f"topk_idx contains out-of-range expert id {bad}")
 
         flat_token = torch.arange(token_count, device=device).repeat_interleave(self.top_k)
         flat_slot = torch.arange(self.top_k, device=device).repeat(token_count)
-        expert = flat_expert[valid]
+        expert = flat_expert
         destination = torch.div(expert, self.experts_per_rank, rounding_mode="floor")
         order = torch.argsort(destination, stable=True)
 
@@ -633,9 +631,9 @@ class MoeEpReference:
         recv_counts_tensor = self._exchange_counts(send_counts_tensor)
         return _DispatchPlan(
             send_expert=expert.index_select(0, order).remainder(self.experts_per_rank),
-            send_weight=flat_weight[valid].index_select(0, order),
-            send_token_idx=flat_token[valid].index_select(0, order),
-            send_slot_idx=flat_slot[valid].index_select(0, order),
+            send_weight=flat_weight.index_select(0, order),
+            send_token_idx=flat_token.index_select(0, order),
+            send_slot_idx=flat_slot.index_select(0, order),
             send_counts=tuple(int(v) for v in send_counts_tensor.cpu().tolist()),
             recv_counts=tuple(int(v) for v in recv_counts_tensor.cpu().tolist()),
         )

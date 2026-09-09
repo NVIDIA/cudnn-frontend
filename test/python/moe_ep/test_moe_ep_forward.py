@@ -27,6 +27,7 @@ from moe_ep.moe_ep_test_support import (
     _make_forward_case,
     _naive_reference,
     _output_as_float,
+    _poison_pre_reduced_for_test,
     _reference_forward,
     _replay_cuda_graph,
     _require_distributed_sm107,
@@ -485,6 +486,47 @@ def test_moe_ep_rejects_invalid_padding(kwargs):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("validation_mode", ["strict", "trusted"])
+def test_moe_ep_accepts_validation_modes(validation_mode):
+    from cudnn import MoeEp
+
+    with MoeEp(
+        **_forward_config(),
+        validation_mode=validation_mode,
+    ) as op:
+        assert op.validation_mode == validation_mode
+
+
+@pytest.mark.L0
+def test_strict_expert_id_validation_requires_dense_routes():
+    from cudnn import MoeEp
+    from cudnn.moe_ep._validation import _validate_expert_ids
+
+    with MoeEp(**_forward_config()) as op:
+        config = op._forward_config
+        _validate_expert_ids(config, torch.tensor([[0, 1]], dtype=torch.int32))
+        with pytest.raises(ValueError, match="dropped-route sentinel"):
+            _validate_expert_ids(config, torch.tensor([[0, -1]], dtype=torch.int32))
+        with pytest.raises(ValueError, match="valid global expert id"):
+            _validate_expert_ids(
+                config,
+                torch.tensor([[0, config.num_experts]], dtype=torch.int32),
+            )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("validation_mode", [None, True, "fast"])
+def test_moe_ep_rejects_invalid_validation_mode(validation_mode):
+    from cudnn import MoeEp
+
+    with pytest.raises(ValueError, match="validation_mode"):
+        MoeEp(
+            **_forward_config(),
+            validation_mode=validation_mode,
+        )
+
+
+@pytest.mark.L0
 def test_moe_ep_rejects_unsupported_weight_interleave_size():
     from cudnn import MoeEp
 
@@ -691,8 +733,6 @@ def test_bf16_forward_matches_reference_and_returns_fresh_outputs():
         first = op(*args)
         snapshot = first.clone()
         second = op(*args)
-        args[3].fill_(-1)
-        dropped = op(*args)
         torch.cuda.synchronize(device)
 
     assert isinstance(first, torch.Tensor)
@@ -705,7 +745,6 @@ def test_bf16_forward_matches_reference_and_returns_fresh_outputs():
     torch.testing.assert_close(first, snapshot, rtol=0, atol=0)
     torch.testing.assert_close(first, second, rtol=0, atol=0)
     _assert_matches_reference(first, expected)
-    assert dropped.eq(0).all()
 
 
 @pytest.mark.L1
@@ -946,15 +985,23 @@ def test_supported_topk_shape_and_routing_format_matrix(
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-def test_single_gpu_stress_and_cuda_graph_replay():
+@pytest.mark.parametrize("combine_format", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("capacity", [5, 129])
+def test_single_gpu_stress_and_cuda_graph_replay(combine_format, capacity):
     from cudnn import MoeEp
 
     device = _sm107_device()
     args = make_forward_inputs(device)
     original_topk_idx = args[3].clone()
     original_topk_weights = args[4].clone()
-    config = _forward_config()
+    config = _forward_config(
+        combine_format=combine_format,
+        max_tokens_per_rank=capacity,
+    )
     expected = _reference_forward(args, **config)
+    alternate_topk_idx = original_topk_idx.flip(1).contiguous()
+    alternate_args = (*args[:3], alternate_topk_idx, args[4])
+    alternate_expected = _reference_forward(alternate_args, **config)
 
     with MoeEp(**config) as op:
         op.warmup(*args)
@@ -969,10 +1016,33 @@ def test_single_gpu_stress_and_cuda_graph_replay():
 
         args[3].copy_(original_topk_idx)
         args[4].copy_(original_topk_weights)
+        backend = op._forward_backend
+        assert backend is not None
+        assert backend._prepared_kernel is not None
+        assert backend._plan is not None
+        assert backend._plan._workspace is not None
+
+        def poison_pre_reduced():
+            workspace = backend._plan._workspace.views(args[0].logical_shape[0])
+            _poison_pre_reduced_for_test(
+                backend._prepared_kernel,
+                workspace.symmetric["kernel_shared_workspace"],
+            )
+
+        poison_pre_reduced()
         eager = op(*args)
         torch.cuda.synchronize(device)
         _assert_matches_reference(eager, expected)
-        _replay_cuda_graph(op, args, original_topk_idx, expected, device)
+        _replay_cuda_graph(
+            op,
+            args,
+            original_topk_idx,
+            expected,
+            device,
+            alternate_topk_idx=alternate_topk_idx,
+            alternate_expected=alternate_expected,
+            poison_before_replay=poison_pre_reduced,
+        )
 
 
 @pytest.mark.L0

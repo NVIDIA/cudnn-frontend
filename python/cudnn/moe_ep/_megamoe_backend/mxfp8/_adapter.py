@@ -145,18 +145,6 @@ def _zero_workspace_prefix(
     workspace[:nbytes].zero_()
 
 
-def _zero_workspace_range(
-    workspace: torch.Tensor,
-    offset: int,
-    nbytes: int,
-    *,
-    name: str,
-) -> None:
-    if offset < 0 or nbytes < 0 or offset + nbytes > workspace.numel():
-        raise ValueError(f"{name} byte range [{offset}, {offset + nbytes}) exceeds " f"{workspace.numel()} bytes")
-    workspace.narrow(0, offset, nbytes).zero_()
-
-
 def _interleave_gate_up_rows(
     tensor: torch.Tensor,
     intermediate: int,
@@ -479,20 +467,12 @@ class Mxfp8InputAdapter:
         shared_workspace = symmetric["kernel_shared_workspace"]
 
         staged_activation = _as_mxfp8(request.activation)
-        _as_bytes(activation).zero_()
         _as_bytes(activation[:token_count]).copy_(_as_bytes(staged_activation.data))
-        _as_bytes(activation_sf).zero_()
         _as_bytes(activation_sf[:token_count, :hidden_sf_columns]).copy_(_as_bytes(staged_activation.scale))
         _validate_int32_downcast(request.topk_idx)
         topk_indices.fill_(-1)
         topk_indices[:token_count].copy_(request.topk_idx)
-        topk_weights.zero_()
         topk_weights[:token_count].copy_(request.topk_weights)
-        _as_bytes(output_data).zero_()
-        if col_quant_data is not None:
-            local["col_quant_data"].zero_()
-        if col_quant_sf is not None:
-            col_quant_sf.zero_()
         overflow_flag.zero_()
         workspace_key = (
             local_workspace.data_ptr(),
@@ -522,30 +502,15 @@ class Mxfp8InputAdapter:
                 or pre_reduced_activation_sf_bytes_per_token != 0
             ):
                 raise ValueError("in-kernel top-k reduction must not receive a " "standalone pre-reduced activation workspace")
-            # output_data is the in-kernel REDG accumulation base and was
-            # cleared above.
         else:
             if pre_reduced_activation_offset is None or pre_reduced_activation_bytes_per_token <= 0:
                 raise ValueError("standalone top-k reduction requires a pre-reduced " "activation workspace")
-            # The kernel writes only valid routes into this persistent combine
-            # plane. Clear the active token rows so dropped routes cannot reuse
-            # contributions from a previous launch.
-            _zero_workspace_range(
-                shared_workspace,
-                pre_reduced_activation_offset,
-                token_count * pre_reduced_activation_bytes_per_token,
-                name="pre-reduced activation workspace",
-            )
+            # Dense routing guarantees that every active (token, top-k) row is
+            # completely overwritten before the standalone reduction.
             quantized_combine = config.combine_format != "bf16"
             if quantized_combine:
                 if pre_reduced_activation_sf_offset is None or pre_reduced_activation_sf_bytes_per_token <= 0:
                     raise ValueError("quantized standalone top-k reduction requires a " "pre-reduced scale workspace")
-                _zero_workspace_range(
-                    shared_workspace,
-                    pre_reduced_activation_sf_offset,
-                    token_count * pre_reduced_activation_sf_bytes_per_token,
-                    name="pre-reduced activation scale workspace",
-                )
             elif pre_reduced_activation_sf_offset is not None or pre_reduced_activation_sf_bytes_per_token != 0:
                 raise ValueError("BF16 standalone top-k reduction must not receive a " "pre-reduced scale workspace")
 

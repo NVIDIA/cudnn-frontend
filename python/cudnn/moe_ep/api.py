@@ -16,7 +16,7 @@ import threading
 import warnings
 from dataclasses import replace
 from numbers import Real
-from typing import Mapping, Optional, Sequence, Union
+from typing import Literal, Mapping, Optional, Sequence, Union
 
 import torch
 import torch.distributed as dist
@@ -186,6 +186,14 @@ class MoeEp:
     instead of returning uninitialized storage. Once created, a backend and its
     workspaces are bound to that call's device; use a separate ``MoeEp``
     instance for another device.
+
+    ``validation_mode="strict"`` validates expert IDs before eager execution.
+    ``validation_mode="trusted"`` skips only that value-range check; callers
+    must guarantee that every routing ID belongs to ``[0, num_experts)``.
+    Negative IDs and dropped-route sentinels are not supported. CUDA Graph
+    replay does not repeat this value check, so replayed routing contents must
+    preserve the same dense-routing invariant. Structural tensor, workspace,
+    aliasing, and overflow checks remain enabled in both modes.
     """
 
     def __init__(
@@ -209,6 +217,7 @@ class MoeEp:
         tuning: Optional[MoeEpTuningConfig] = None,
         forward_tuning: Optional[MoeEpTuningConfig] = None,
         backward_tuning: Optional[MoeEpTuningConfig] = None,
+        validation_mode: Literal["strict", "trusted"] = "strict",
     ) -> None:
         self._lifecycle_lock = threading.RLock()
         for name, value in (
@@ -255,6 +264,11 @@ class MoeEp:
                 )
         if tuning is not None and forward_tuning is not None:
             raise ValueError("tuning and forward_tuning are aliases; pass only one")
+        if validation_mode not in ("strict", "trusted"):
+            raise ValueError(
+                "validation_mode must be 'strict' or 'trusted', "
+                f"got {validation_mode!r}"
+            )
         if gate_up_clamp is not None:
             if isinstance(gate_up_clamp, bool) or not isinstance(gate_up_clamp, Real):
                 raise ValueError("gate_up_clamp must be a finite real number or None")
@@ -300,6 +314,7 @@ class MoeEp:
         )
         # Backward-compatible alias for inference and forward-only autotuning.
         self.tuning = self.forward_tuning
+        self._validation_mode = validation_mode
         if self.forward_tuning.reduce_topk_in_kernel and (
             self.combine_format is not MoeFormat.BF16
             or self.output_format is not MoeFormat.BF16
@@ -364,6 +379,12 @@ class MoeEp:
         self._poisoned = False
         self._closed = False
 
+    @property
+    def validation_mode(self) -> Literal["strict", "trusted"]:
+        """Return the immutable expert-ID validation policy."""
+
+        return self._validation_mode
+
     @staticmethod
     def _tensor_version(tensor: torch.Tensor) -> int | None:
         if not isinstance(tensor, torch.Tensor):
@@ -419,9 +440,16 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
-                raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
-            topk_version = self._tensor_version(topk_idx)
-            validate_expert_ids = not (self._validated_topk_idx is topk_idx and topk_version is not None and topk_version == self._validated_topk_version)
+                raise RuntimeError(
+                    "MoeEp is unusable after an autotune runtime failure"
+                )
+            strict_validation = self.validation_mode == "strict"
+            topk_version = self._tensor_version(topk_idx) if strict_validation else None
+            validate_expert_ids = strict_validation and not (
+                self._validated_topk_idx is topk_idx
+                and topk_version is not None
+                and topk_version == self._validated_topk_version
+            )
             request = validate_forward(
                 self._forward_config,
                 activation,
@@ -432,7 +460,7 @@ class MoeEp:
                 validate_expert_ids=validate_expert_ids,
             )
             version_after_validation = self._tensor_version(topk_idx)
-            if topk_version is not None and topk_version == version_after_validation:
+            if strict_validation and topk_version is not None and topk_version == version_after_validation:
                 self._validated_topk_idx = topk_idx
                 self._validated_topk_version = topk_version
             else:
@@ -509,6 +537,7 @@ class MoeEp:
                             fc2_weight,
                             topk_idx,
                             topk_weights,
+                            validate_expert_ids=self.validation_mode == "strict",
                         )
                         if request.device.type != "cuda":
                             raise ValueError(f"autotune requires CUDA inputs, got {request.device}")
@@ -706,6 +735,7 @@ class MoeEp:
                             topk_idx,
                             topk_weights,
                             device=device,
+                            validate_expert_ids=self.validation_mode == "strict",
                         )
                         grad_tokens = validate_training_input(
                             config,
@@ -714,6 +744,7 @@ class MoeEp:
                             topk_idx,
                             topk_weights,
                             device=device,
+                            validate_expert_ids=self.validation_mode == "strict",
                         )
                         if activation_tokens != grad_tokens:
                             raise ValueError("activation and grad_output must have the same token " f"count, got {activation_tokens} and {grad_tokens}")
@@ -1067,6 +1098,7 @@ class MoeEp:
                 topk_idx,
                 topk_weights,
                 device=self._forward_backend_device,
+                validate_expert_ids=self.validation_mode == "strict",
             )
             validate_native_forward_weights(
                 self._forward_config,
@@ -1157,6 +1189,7 @@ class MoeEp:
                 topk_idx,
                 topk_weights,
                 device=self._forward_backend_device,
+                validate_expert_ids=self.validation_mode == "strict",
             )
             validate_native_backward_weights(
                 self._forward_config,

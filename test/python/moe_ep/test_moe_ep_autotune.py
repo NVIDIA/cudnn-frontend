@@ -501,6 +501,10 @@ def test_autotune_sm107_inference_training_and_graph():
     inference_args = make_forward_inputs(device)
     inference_expected = _reference_forward(inference_args)
     original_topk_idx = inference_args[3].clone()
+    alternate_topk_idx = original_topk_idx.flip(1).contiguous()
+    alternate_expected = _reference_forward(
+        (*inference_args[:3], alternate_topk_idx, inference_args[4]),
+    )
     with MoeEp(**_forward_config()) as op:
         result = op.autotune(
             *inference_args,
@@ -522,6 +526,8 @@ def test_autotune_sm107_inference_training_and_graph():
             original_topk_idx,
             inference_expected,
             device,
+            alternate_topk_idx=alternate_topk_idx,
+            alternate_expected=alternate_expected,
         )
 
     base_args = make_forward_inputs(device)

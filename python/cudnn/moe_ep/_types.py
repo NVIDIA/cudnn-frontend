@@ -290,7 +290,7 @@ class MoeEpTrainingForwardOutputs:
 
 @dataclass(frozen=True)
 class MoeEpTrainingBackwardOutputs:
-    """Backward destinations, including the lane's symmetric input gradient."""
+    """Backward and WGrad destinations, including the lane's symmetric input gradient."""
 
     grad_activation: torch.Tensor | None = None
     dprob: torch.Tensor | None = None
@@ -304,7 +304,14 @@ class MoeEpTrainingBackwardOutputs:
 
 @dataclass(frozen=True)
 class MoeEpTrainingWgradOperands:
-    """Non-owning views over caller-owned grouped-WGrad operand buffers."""
+    """Non-owning views over caller-owned fixed-capacity WGrad operands.
+
+    For expert ``e``, the physical segment starts at zero or
+    ``expert_offsets[e - 1]``.  Only the next ``valid_route_counts[e]`` rows
+    are defined; per-expert padding and the final capacity tail are
+    unspecified.  Consumers must use both metadata tensors when reading the
+    operands.
+    """
 
     fc1_a: torch.Tensor
     fc1_sfa: torch.Tensor

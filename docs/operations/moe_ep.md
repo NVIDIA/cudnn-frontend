@@ -24,17 +24,18 @@ $$
 The final token output is the sum over its selected experts:
 
 $$
-y_t = \sum_{\substack{0 \le k < K \\ e_{t,k} \ne -1}} z_{t,k}.
+y_t = \sum_{0 \le k < K} z_{t,k}.
 $$
 
 When `gate_up_clamp=C`, the operation uses
 $\min(g_{t,k}, C)$ for the gate and
-$\mathrm{clip}(u_{t,k}, -C, C)$ for the up projection. A route whose
-expert ID is `-1` contributes zero. Because the executable backend requires
-`apply_topk_in_fc1=True`, it applies $p_{t,k}$ to the SwiGLU result before
-FC2. The backend also stages plain inputs to MXFP8 and requantizes the routed
-intermediate before FC2, so the equations describe the mathematical operation
-rather than its finite-precision rounding.
+$\mathrm{clip}(u_{t,k}, -C, C)$ for the up projection. Every route must name a
+global expert in `[0, E)`; negative IDs and dropped-route sentinels are not
+supported. Because the executable backend requires `apply_topk_in_fc1=True`,
+it applies $p_{t,k}$ to the SwiGLU result before FC2. The backend also stages
+plain inputs to MXFP8 and requantizes the routed intermediate before FC2, so
+the equations describe the mathematical operation rather than its
+finite-precision rounding.
 
 With $E$ global experts and an expert-parallel group of size $P$, each rank
 stores $E_{\mathrm{local}}=E/P$ consecutive experts. Global expert $e$ is
@@ -67,11 +68,13 @@ op = MoeEp(
     apply_topk_in_fc1=True,
     weight_interleave_size=None,       # Or 32 for pre-interleaved MXFP8 W1
     gate_up_clamp=None,
+    validation_mode="strict",          # Or "trusted"
 )
 ```
 
-`topk_idx` contains global expert IDs. Each rank passes its local tokens and
-its contiguous shard of both expert-weight tensors:
+`topk_idx` contains one valid global expert ID for every `(token, top-k slot)`.
+Each rank passes its local tokens and its contiguous shard of both expert-weight
+tensors:
 
 `weight_interleave_size=32` declares that MXFP8 FC1 values already use
 alternating 32-element gate/up strips. The default `None` uses conventional
@@ -83,13 +86,16 @@ output = op(
     activation,       # (T, H)
     fc1_weight,       # (E_local, H, 2I)
     fc2_weight,       # (E_local, I, H)
-    topk_idx,         # (T, K), global expert IDs or -1
+    topk_idx,         # (T, K), global expert IDs in [0, E)
     topk_weights,     # (T, K)
 )                     # (T, H), BF16
 ```
 
 For inference CUDA Graph capture, call `op.warmup(...)` with the exact
-bindings before capture. `MoeEp` supports `close()` and context-manager use.
+bindings before capture. Strict mode validates routing values during eager
+execution and warmup. Trusted mode skips that device-value check. Capture and
+replay do not repeat it, so every replay must preserve the dense valid-ID
+contract. `MoeEp` supports `close()` and context-manager use.
 
 Explicit sweep autotuning is available before capture:
 
@@ -133,8 +139,10 @@ grad_activation, dprob, wgrad_operands = op.training_backward(
 )
 ```
 
-The WGrad result is a fixed-capacity grouped-GEMM operand bundle, not dense
-optimizer-ready weight gradients. See the detailed
+The WGrad result is a fixed-capacity operand bundle, not dense optimizer-ready
+weight gradients. Only the expert rows identified jointly by
+`expert_offsets` and `valid_route_counts` are defined; padded rows and the
+remaining capacity tail are unspecified. See the detailed
 [MoE + Expert Parallel API](../fe-oss-apis/moe_ep.md) reference for
 installation, all constructor arguments, native layouts, buffer ownership,
 overflow handling, and CUDA Graph requirements. MoeEP is
@@ -189,8 +197,7 @@ Let:
 Inference uses:
 
 - `activation`: `(T, H)`;
-- `topk_idx`: `(T, K)`, Int32 or Int64, containing `-1` or a valid global
-  expert ID;
+- `topk_idx`: `(T, K)`, Int32 or Int64, with every value in `[0, E)`;
 - `topk_weights`: `(T, K)`, floating point;
 - FC1 weights: `(E_local, H, 2I)`;
 - FC2 weights: `(E_local, I, H)`;
@@ -218,6 +225,13 @@ Stateless training uses:
 All dynamic training tensors must reside on one device and satisfy
 `T <= max_tokens_per_rank`.
 
+The backend may use `-1` internally to mask private capacity rows after `T`;
+that sentinel is not part of the public input. Persistent pre-reduction data
+and scale planes are not cleared between launches. Correctness relies on every
+non-overflow active `(token, k)` route completely overwriting its plane before
+top-k reduction. Physical rows in `[T, max_tokens_per_rank)` are unspecified
+and must not be returned or consumed.
+
 ## Expert-parallel communication
 
 EP2+ execution requires:
@@ -234,6 +248,10 @@ including per-expert padding.
 ```text
 ep_size * max_tokens_per_rank * top_k
 ```
+
+The supported correctness contract requires routing not to overflow this
+capacity. If overflow occurs, the launch may raise or drop work according to
+the configured policy, but its numerical outputs are not guaranteed usable.
 
 Private lane resources cannot grow during CUDA Graph replay. Capacity changes
 require a new operator preparation; caller-address changes require recapture.

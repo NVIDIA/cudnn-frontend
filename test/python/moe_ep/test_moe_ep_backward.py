@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from types import SimpleNamespace
 
 import cudnn
 import pytest
@@ -65,10 +66,14 @@ from moe_ep.moe_ep_test_support import (
     _assert_matches_reference,
     _assert_wgrads_match_reference,
     _dense_wgrads_from_grouped_kernel,
+    _dense_wgrads_from_operands,
     _fixed_training_reference,
     _fixed_training_weights,
     _grad_output,
     _interleave_fc1_wgrad,
+    _pad_wgrad_operands_for_grouped_kernel,
+    _poison_pre_reduced_for_test,
+    _poison_training_outputs_for_test,
     _sm107_device,
     _training_abi_prepared,
     _training_config,
@@ -275,6 +280,7 @@ def test_training_input_accepts_logical_view_of_padded_lane_scale():
     assert scale.shape == (5, 4)
     assert scale.stride() == (16, 1)
     assert not scale.is_contiguous()
+
     assert (
         validate_training_input(
             config,
@@ -286,6 +292,97 @@ def test_training_input_accepts_logical_view_of_padded_lane_scale():
         )
         == token_count
     )
+
+
+@pytest.mark.L0
+def test_training_input_strict_requires_dense_routes_and_trusted_skips_value_checks():
+    config = _training_config(weight_interleave_size=32)
+    activation = torch.empty((2, config.hidden_size), dtype=torch.bfloat16)
+    topk_weights = torch.ones((2, config.top_k), dtype=torch.float32)
+
+    for topk_idx in (
+        torch.tensor([[0, 1], [-1, 0]], dtype=torch.int32),
+        torch.tensor([[0, config.num_experts], [1, 0]], dtype=torch.int32),
+    ):
+        with pytest.raises(ValueError, match="valid global expert id"):
+            validate_training_input(
+                config,
+                "activation",
+                activation,
+                topk_idx,
+                topk_weights,
+                device=torch.device("cpu"),
+                validate_expert_ids=True,
+            )
+
+        assert (
+            validate_training_input(
+                config,
+                "activation",
+                activation,
+                topk_idx,
+                topk_weights,
+                device=torch.device("cpu"),
+                validate_expert_ids=False,
+            )
+            == 2
+        )
+
+
+@pytest.mark.L0
+def test_training_input_strict_accepts_dense_routes():
+    config = _training_config(weight_interleave_size=32)
+    activation = torch.empty((2, config.hidden_size), dtype=torch.bfloat16)
+    topk_idx = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+    topk_weights = torch.ones((2, config.top_k), dtype=torch.float32)
+
+    assert (
+        validate_training_input(
+            config,
+            "activation",
+            activation,
+            topk_idx,
+            topk_weights,
+            device=torch.device("cpu"),
+            validate_expert_ids=True,
+        )
+        == 2
+    )
+
+
+@pytest.mark.L0
+def test_training_forward_propagates_trusted_validation_mode(monkeypatch):
+    import cudnn.moe_ep.api as api_module
+
+    class ValidationObserved(Exception):
+        pass
+
+    def observe_validation(*args, **kwargs):
+        assert kwargs["validate_expert_ids"] is False
+        raise ValidationObserved
+
+    op = MoeEp(
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size=256,
+        top_k=2,
+        validation_mode="trusted",
+    )
+    op._training_state = object()
+    op._training_requirements = {}
+    op._forward_backend_device = torch.device("cpu")
+    monkeypatch.setattr(op, "_require_training_lane", lambda lane: None)
+    monkeypatch.setattr(api_module, "validate_training_input", observe_validation)
+
+    with pytest.raises(ValidationObserved):
+        op.training_forward(
+            None,
+            None,
+            None,
+            None,
+            weights=None,
+            out=None,
+        )
 
 
 @pytest.mark.L0
@@ -370,6 +467,48 @@ def test_weight_packing_rejects_source_staging_alias():
 
 
 @pytest.mark.L0
+def test_training_weight_staging_uses_singleton_expert_abi_strides():
+    dtype = torch.float8_e4m3fn
+    fc1_data = torch.empty_strided(
+        (1, 128, 512),
+        (128 * 512, 1, 128),
+        dtype=dtype,
+    )
+    fc2_data = torch.empty_strided(
+        (1, 256, 128),
+        (256 * 128, 1, 256),
+        dtype=dtype,
+    )
+    # Model the collapsed leading strides observed in the container.
+    w2t_data = torch.empty_strided(
+        (1, 128, 256),
+        (256, 256, 1),
+        dtype=dtype,
+    )
+    w1t_data = torch.empty_strided(
+        (1, 512, 128),
+        (128, 128, 1),
+        dtype=dtype,
+    )
+
+    def weight(data):
+        return SimpleNamespace(data=data, device=data.device)
+
+    _, backward = _allocate_training_weight_staging(
+        (
+            SimpleNamespace(fc1=weight(fc1_data), fc2=weight(fc2_data)),
+            SimpleNamespace(
+                w2_transpose=weight(w2t_data),
+                w1_transpose=weight(w1t_data),
+            ),
+        )
+    )
+
+    assert backward.w2_transpose_payload.stride() == (32768, 256, 1)
+    assert backward.w1_transpose_payload.stride() == (65536, 128, 1)
+
+
+@pytest.mark.L0
 def test_mxfp8_training_input_bypasses_quantization_stager():
     class RejectingStager:
         def stage(self, *args, **kwargs):
@@ -385,8 +524,8 @@ def test_mxfp8_training_input_bypasses_quantization_stager():
         logical_shape=(token_count, hidden),
         axis=1,
     )
-    topk_idx = torch.tensor([[0, 1], [1, -1]], dtype=torch.int32)
-    topk_weights = torch.tensor([[0.75, 0.25], [1.0, 0.0]], dtype=torch.float32)
+    topk_idx = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.75, 0.25], [0.625, 0.375]], dtype=torch.float32)
     activation_data = torch.empty((4, hidden), dtype=torch.float8_e4m3fn)
     activation_sf = torch.empty((4, hidden // 32), dtype=torch.float8_e8m0fnu)
     routing_idx = torch.empty((4, top_k), dtype=torch.int32)
@@ -407,10 +546,9 @@ def test_mxfp8_training_input_bypasses_quantization_stager():
     torch.testing.assert_close(activation_sf[:token_count], value.scale)
     torch.testing.assert_close(routing_idx[:token_count], topk_idx)
     torch.testing.assert_close(routing_weights[:token_count], topk_weights)
-    assert activation_data[token_count:].eq(0).all()
-    assert activation_sf[token_count:].view(torch.uint8).eq(0).all()
+    # Data, scales, and routing weights outside the runtime token range are
+    # unspecified after removing the production-side poison fills.
     assert routing_idx[token_count:].eq(-1).all()
-    assert routing_weights[token_count:].eq(0).all()
 
 
 @pytest.mark.L0
@@ -862,25 +1000,53 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-def test_stateless_training_padded_capacity_eager_and_cuda_graph_match_reference():
+@pytest.mark.parametrize(
+    ("input_dtype", "combine_format", "capacity"),
+    (
+        pytest.param(torch.bfloat16, "bf16", 5, id="bf16-combine-full"),
+        pytest.param(torch.float32, "bf16", 129, id="bf16-combine-tail"),
+        pytest.param(torch.bfloat16, "mxfp8", 5, id="mxfp8-combine-full"),
+        pytest.param(torch.float32, "mxfp8", 129, id="mxfp8-combine-tail"),
+    ),
+)
+def test_stateless_training_ep1_poisoned_capacity_matches_reference(
+    input_dtype,
+    combine_format,
+    capacity,
+):
+    """Poisoned outputs and pre-reduce planes must be completely overwritten."""
+
     device = _sm107_device()
     base_args = make_forward_inputs(device)
     args = (
-        base_args[0].dequantize(torch.bfloat16),
+        base_args[0].dequantize(input_dtype),
         base_args[1],
         base_args[2],
         base_args[3],
         base_args[4].float().contiguous(),
     )
+    original_topk_idx = args[3].clone()
+    assert args[0].shape[0] <= capacity
     grad_output = _grad_output(device, args[0].shape[0], seed=20260902)
     expected = _fixed_training_reference(
         args,
         grad_output,
-        combine_format="bf16",
+        combine_format=combine_format,
         gate_up_clamp=None,
+        max_tokens_per_rank=capacity,
+        max_recv_size_per_rank=capacity * args[3].shape[1],
+    )
+    alternate_topk_idx = original_topk_idx.flip(1).contiguous()
+    alternate_args = (*args[:3], alternate_topk_idx, args[4])
+    alternate_expected = _fixed_training_reference(
+        alternate_args,
+        grad_output,
+        combine_format=combine_format,
+        gate_up_clamp=None,
+        max_tokens_per_rank=capacity,
+        max_recv_size_per_rank=capacity * args[3].shape[1],
     )
     source_weights = _fixed_training_weights(args)
-    capacity = args[0].shape[0] + 1
     assert capacity % 128 != 0
 
     with MoeEp(
@@ -889,9 +1055,9 @@ def test_stateless_training_padded_capacity_eager_and_cuda_graph_match_reference
         intermediate_size=256,
         top_k=2,
         max_tokens_per_rank=capacity,
-        max_recv_size_per_rank=2 * 128,
+        max_recv_size_per_rank=capacity * args[3].shape[1],
         drop_on_overflow=True,
-        combine_format="bf16",
+        combine_format=combine_format,
         weight_interleave_size=32,
     ) as op:
         requirements = op.prepare_training(lane_count=1, device=device)
@@ -913,8 +1079,23 @@ def test_stateless_training_padded_capacity_eager_and_cuda_graph_match_reference
             device,
             symmetric,
         )
+        state = op._training_state
+        assert state is not None
+        execution = state.views(
+            lane=lane.index,
+            token_count=args[0].shape[0],
+        )
 
         def run():
+            _poison_training_outputs_for_test(forward_out, backward_out)
+            _poison_pre_reduced_for_test(
+                state.forward_prepared,
+                execution.forward.workspace.symmetric["kernel_shared_workspace"],
+            )
+            _poison_pre_reduced_for_test(
+                state.backward_prepared,
+                execution.backward.workspace.symmetric["kernel_shared_workspace"],
+            )
             y = op.training_forward(
                 lane,
                 args[0],
@@ -939,49 +1120,201 @@ def test_stateless_training_padded_capacity_eager_and_cuda_graph_match_reference
             assert operands is not None
             return y, dx, dprob, operands
 
-        def assert_matches(actual):
+        def assert_matches(actual, reference=expected):
             y, dx, dprob, operands = actual
-            _assert_matches_reference(y, expected[0])
+            _assert_matches_reference(y, reference[0])
             _assert_backward_matches(
                 (dx, dprob),
-                (expected[1], expected[2]),
+                (reference[1], reference[2]),
                 args[3],
             )
             _assert_wgrads_match_reference(
                 operands,
-                expected[3],
+                reference[3],
                 weight_interleave_size=32,
             )
 
+        expected_fc1_wgrad, expected_fc2_wgrad = expected[3].dense_wgrads()
+        grouped_expected = (
+            _interleave_fc1_wgrad(expected_fc1_wgrad),
+            expected_fc2_wgrad,
+        )
+        grouped_outputs = tuple(
+            torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected
+        )
+
+        def assert_grouped_matches(operands):
+            padded_operands = _pad_wgrad_operands_for_grouped_kernel(operands)
+            grouped_wgrads = _dense_wgrads_from_grouped_kernel(
+                padded_operands,
+                wgrad_tensors=grouped_outputs,
+            )
+            torch.cuda.synchronize(device)
+            _assert_grouped_wgrads_match_reference(
+                grouped_wgrads,
+                grouped_expected,
+                reference_name="the independent PyTorch MXFP8 reference",
+            )
+
         eager = run()
-        grouped_wgrads = _dense_wgrads_from_grouped_kernel(eager[3])
         torch.cuda.synchronize(device)
         assert_matches(eager)
-        expected_fc1_wgrad, expected_fc2_wgrad = expected[3].dense_wgrads()
-        _assert_grouped_wgrads_match_reference(
-            grouped_wgrads,
-            (
-                _interleave_fc1_wgrad(expected_fc1_wgrad),
-                expected_fc2_wgrad,
-            ),
-            reference_name="the independent PyTorch MXFP8 reference",
-        )
+        assert_grouped_matches(eager[3])
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = run()
+        captured_token_count = int(args[0].shape[0])
         pointers = tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
-        for _ in range(2):
+        for replay in range(4):
+            if replay % 2:
+                args[3].copy_(alternate_topk_idx)
+                replay_expected = alternate_expected
+            else:
+                args[3].copy_(original_topk_idx)
+                replay_expected = expected
             graph.replay()
             torch.cuda.synchronize(device)
-            assert pointers == tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
-            assert_matches(captured)
+            assert int(args[0].shape[0]) == captured_token_count
+            assert pointers == tuple(
+                tensor.data_ptr()
+                for bundle in (forward_out, backward_out)
+                for tensor in vars(bundle).values()
+                if tensor is not None
+            )
+            assert_matches(captured, replay_expected)
+
+        args[3].copy_(original_topk_idx)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert_matches(captured)
+        assert_grouped_matches(captured[3])
 
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-def test_native_io_mxfp8_cuda_graph_replay():
-    """Exercise native MXFP8 I/O and weight contracts with graph replay."""
+@pytest.mark.parametrize("token_count", (1, 127, 128, 129))
+def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
+    """Decode only offsets/counts-defined rows across padding boundaries."""
+
+    device = _sm107_device()
+    generator = torch.Generator(device=device).manual_seed(20260904 + token_count)
+    hidden = 128
+    intermediate = 256
+    activation = torch.randn(
+        (token_count, hidden),
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    fc1_weight = (
+        torch.randn(
+            (1, hidden, 2 * intermediate),
+            generator=generator,
+            dtype=torch.float32,
+            device=device,
+        )
+        / 8
+    )
+    fc2_weight = (
+        torch.randn(
+            (1, intermediate, hidden),
+            generator=generator,
+            dtype=torch.float32,
+            device=device,
+        )
+        / 8
+    )
+    topk_idx = torch.zeros((token_count, 1), dtype=torch.int32, device=device)
+    topk_weights = torch.ones(
+        (token_count, 1),
+        dtype=torch.float32,
+        device=device,
+    )
+    grad_output = _grad_output(device, token_count, seed=20261000 + token_count)
+    source_weights = _fixed_training_weights(
+        (
+            activation,
+            fc1_weight,
+            fc2_weight,
+            topk_idx,
+            topk_weights,
+        )
+    )
+
+    with MoeEp(
+        num_experts=1,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        top_k=1,
+        max_tokens_per_rank=129,
+        max_recv_size_per_rank=129,
+        drop_on_overflow=True,
+        combine_format="bf16",
+        weight_interleave_size=32,
+    ) as op:
+        requirements = op.prepare_training(lane_count=1, device=device)
+        forward_staging, backward_staging = _allocate_training_weight_staging(
+            source_weights
+        )
+        native_forward = op.pack_forward_weights(
+            source_weights[0],
+            out=forward_staging,
+        )
+        native_backward = op.pack_backward_weights(
+            source_weights[1],
+            out=backward_staging,
+        )
+        lane = op.training_lanes[0]
+        symmetric = op.training_symmetric_buffers(lane)
+        forward_out, backward_out = _allocate_stateless_training_outputs(
+            requirements,
+            device,
+            symmetric,
+        )
+
+        _poison_training_outputs_for_test(forward_out, backward_out)
+        op.training_forward(
+            lane,
+            activation,
+            topk_idx,
+            topk_weights,
+            weights=native_forward,
+            out=forward_out,
+        )
+        _, _, operands = op.training_backward(
+            lane,
+            grad_output,
+            topk_idx,
+            topk_weights,
+            weights=native_backward,
+            fc1_preact=forward_out.fc1_preact,
+            fc1_a=forward_out.fc1_a,
+            fc1_sfa=forward_out.fc1_sfa,
+            valid_route_counts=forward_out.valid_route_counts,
+            expert_offsets=forward_out.expert_offsets,
+            out=backward_out,
+        )
+        torch.cuda.synchronize(device)
+        assert operands.valid_route_counts.tolist() == [token_count]
+        assert operands.expert_offsets.tolist() == [_round_up(token_count, 128)]
+        dense_wgrads = _dense_wgrads_from_operands(operands)
+        assert dense_wgrads[0].shape == (1, hidden, 2 * intermediate)
+        assert dense_wgrads[1].shape == (1, intermediate, hidden)
+        padded_operands = _pad_wgrad_operands_for_grouped_kernel(operands)
+        grouped_wgrads = _dense_wgrads_from_grouped_kernel(padded_operands)
+        torch.cuda.synchronize(device)
+        _assert_grouped_wgrads_match_reference(
+            grouped_wgrads,
+            dense_wgrads,
+            reference_name="the valid-range decoded MoeEP operands",
+        )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
+    """Validate poisoned fixed-capacity operands at fixed-T graph replay."""
 
     device = _sm107_device()
     base_args = make_forward_inputs(device)
@@ -995,6 +1328,8 @@ def test_native_io_mxfp8_cuda_graph_replay():
         topk_idx,
         topk_weights,
     )
+    capacity = 129
+    assert activation.logical_shape[0] < capacity
     grad_output_plain = _grad_output(
         device,
         activation.shape[0],
@@ -1006,6 +1341,8 @@ def test_native_io_mxfp8_cuda_graph_replay():
         grad_output.dequantize(torch.float32),
         combine_format="bf16",
         gate_up_clamp=None,
+        max_tokens_per_rank=capacity,
+        max_recv_size_per_rank=capacity * topk_idx.shape[1],
     )
 
     op = MoeEp(
@@ -1013,8 +1350,8 @@ def test_native_io_mxfp8_cuda_graph_replay():
         hidden_size=128,
         intermediate_size=256,
         top_k=2,
-        max_tokens_per_rank=activation.shape[0],
-        max_recv_size_per_rank=2 * 128,
+        max_tokens_per_rank=capacity,
+        max_recv_size_per_rank=capacity * topk_idx.shape[1],
         drop_on_overflow=True,
         output_format="bf16",
         combine_format="bf16",
@@ -1100,6 +1437,7 @@ def test_native_io_mxfp8_cuda_graph_replay():
         assert native_backward.w1_transpose.scale.data_ptr() != packed_backward.w1_transpose.scale.data_ptr()
 
         def run():
+            _poison_training_outputs_for_test(forward_out, backward_out)
             output = op.training_forward(
                 lane,
                 activation,
@@ -1140,27 +1478,42 @@ def test_native_io_mxfp8_cuda_graph_replay():
                 weight_interleave_size=32,
             )
 
+        expected_fc1_wgrad, expected_fc2_wgrad = expected[3].dense_wgrads()
+        grouped_expected = (
+            _interleave_fc1_wgrad(expected_fc1_wgrad),
+            expected_fc2_wgrad,
+        )
+        grouped_outputs = tuple(
+            torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected
+        )
+
+        def assert_grouped_matches(operands):
+            padded_operands = _pad_wgrad_operands_for_grouped_kernel(operands)
+            grouped_wgrads = _dense_wgrads_from_grouped_kernel(
+                padded_operands,
+                wgrad_tensors=grouped_outputs,
+            )
+            torch.cuda.synchronize(device)
+            _assert_grouped_wgrads_match_reference(
+                grouped_wgrads,
+                grouped_expected,
+                reference_name="the independent PyTorch MXFP8 reference",
+            )
+
         eager = run()
-        grouped_wgrads = _dense_wgrads_from_grouped_kernel(eager[3])
         torch.cuda.synchronize(device)
         assert_matches(eager)
-        expected_fc1_wgrad, expected_fc2_wgrad = expected[3].dense_wgrads()
-        _assert_grouped_wgrads_match_reference(
-            grouped_wgrads,
-            (
-                _interleave_fc1_wgrad(expected_fc1_wgrad),
-                expected_fc2_wgrad,
-            ),
-            reference_name="the independent PyTorch MXFP8 reference",
-        )
+        assert_grouped_matches(eager[3])
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = run()
-        output_pointers = (
-            forward_out.output.data_ptr(),
-            backward_out.grad_activation.data_ptr(),
-            backward_out.dprob.data_ptr(),
+        captured_token_count = int(activation.logical_shape[0])
+        output_pointers = tuple(
+            tensor.data_ptr()
+            for bundle in (forward_out, backward_out)
+            for tensor in vars(bundle).values()
+            if tensor is not None
         )
         native_weight_pointers = (
             native_forward.fc1.payload.data_ptr(),
@@ -1175,10 +1528,12 @@ def test_native_io_mxfp8_cuda_graph_replay():
         for _ in range(2):
             graph.replay()
             torch.cuda.synchronize(device)
-            assert output_pointers == (
-                forward_out.output.data_ptr(),
-                backward_out.grad_activation.data_ptr(),
-                backward_out.dprob.data_ptr(),
+            assert int(activation.logical_shape[0]) == captured_token_count
+            assert output_pointers == tuple(
+                tensor.data_ptr()
+                for bundle in (forward_out, backward_out)
+                for tensor in vars(bundle).values()
+                if tensor is not None
             )
             assert native_weight_pointers == (
                 native_forward.fc1.payload.data_ptr(),
@@ -1191,5 +1546,6 @@ def test_native_io_mxfp8_cuda_graph_replay():
                 native_backward.w1_transpose.scale.data_ptr(),
             )
             assert_matches(captured)
+        assert_grouped_matches(captured[3])
     finally:
         op.close()

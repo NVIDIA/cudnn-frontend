@@ -89,7 +89,7 @@ class Mxfp8TrainingStager:
         output_topk_idx: torch.Tensor,
         output_topk_weights: torch.Tensor,
     ) -> None:
-        """Enqueue tail reset plus one fused quant-and-routing launch."""
+        """Enqueue the routing sentinel and fused quant-and-routing launch."""
 
         token_count = self._validate(
             source,
@@ -100,14 +100,12 @@ class Mxfp8TrainingStager:
             output_topk_idx,
             output_topk_weights,
         )
-        output_sf.zero_()
         routing_in_place = topk_idx.data_ptr() == output_topk_idx.data_ptr() and topk_weights.data_ptr() == output_topk_weights.data_ptr()
         routing_partially_aliased = (topk_idx.data_ptr() == output_topk_idx.data_ptr()) != (topk_weights.data_ptr() == output_topk_weights.data_ptr())
         if routing_partially_aliased:
             raise ValueError("training staging routing inputs must either both alias " "their outputs or neither alias")
         if not routing_in_place:
             output_topk_idx.fill_(-1)
-            output_topk_weights.zero_()
         if token_count == 0:
             return
 
