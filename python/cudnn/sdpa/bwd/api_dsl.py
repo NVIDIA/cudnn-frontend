@@ -2122,13 +2122,15 @@ def _sm100_head_chunk(b: int, h_q: int, s_q: int, s_kv: int, bpe: int, budget: i
     head needs and the size is still honest.
     """
     per_head = 2 * b * s_q * s_kv * bpe
-    # Under GQA the chunk must also be a MULTIPLE OF THE GROUP, so a chunk's Q
-    # heads map onto whole KV heads and the dQ group-slice below stays exact.
-    cands = [c for c in range(1, h_q + 1) if h_q % c == 0 and c % group == 0]
+    # A GQA group may span several chunks. Stage 2 maps each global Q head to
+    # its KV head, dK/dV retain one partial per Q head, and stage 3 handles the
+    # non-group-aligned dQ case explicitly. Requiring a whole group here would
+    # violate the budget for long-context models such as Gemma 4.
+    cands = [c for c in range(1, h_q + 1) if h_q % c == 0]
     for c in sorted(cands, reverse=True):
         if per_head * c <= budget:
             return c
-    return group
+    return 1
 
 
 class SdpaBwdDslSm100(SdpaBwdDsl):
@@ -2690,10 +2692,26 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                     meta=seq_kv,
                     desc_words=desc_words,
                 )
-                # dQ = dS.K. Under GQA the K head is shared by `group` Q heads,
-                # so the GEMM runs once per group MEMBER: taking every `group`-th
-                # Q head lines A and the output up with the KV heads exactly, and
-                # every operand stays a strided view (no expand, no copy).
+                # dQ = dS.K. A group-aligned chunk keeps the vectorised path:
+                # one GEMM per group member, covering all KV heads in the
+                # chunk. A tighter workspace budget may split a GQA group; map
+                # those Q heads one by one to their shared global KV head.
+                if gqa and chunk % self._gqa_group != 0:
+                    for lh in range(chunk):
+                        qh = hb + lh
+                        kvh = qh // self._gqa_group
+                        mm_hi.matmul_bh(
+                            ds_ws[:, lh : lh + 1].permute(2, 3, 1, 0),
+                            k[:, :, kvh : kvh + 1, :].permute(3, 1, 2, 0),
+                            dq[:, :, qh : qh + 1, :].permute(1, 3, 2, 0),
+                            n_head=1,
+                            n_batch=b,
+                            stream=stream,
+                            meta=seq_kv,
+                            desc_words=desc_words,
+                        )
+                    continue
+
                 kv_lo, kv_n = hb // self._gqa_group, chunk // self._gqa_group
                 kvs = slice(kv_lo, kv_lo + kv_n)
                 for gi in range(self._gqa_group):
