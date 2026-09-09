@@ -220,6 +220,38 @@ def test_gqa_mqa(hq, hkv):
     _run(hq=hq, hkv=hkv, sq=256, skv=256)
 
 
+def test_gqa_chunk_smaller_than_group(monkeypatch):
+    """The workspace budget may split one GQA group across head chunks.
+
+    Gemma 4 has Hq=16/Hkv=2.  At long sequence lengths a whole eight-head
+    group cannot fit the stated 4 GiB S+dS budget, so the dense adapter must be
+    able to process a four-head (and eventually one-head) chunk without losing
+    the Q-head -> KV-head mapping in dQ.
+    """
+    import cudnn.sdpa.bwd.api_dsl as bwd_dsl
+
+    choose = bwd_dsl._sm100_head_chunk
+    seen = []
+
+    def force_four(b, h_q, s_q, s_kv, bpe, budget=bwd_dsl._SM100_WS_BUDGET_BYTES, group=1):
+        per_head = 2 * b * s_q * s_kv * bpe
+        chunk = choose(b, h_q, s_q, s_kv, bpe, budget=4 * per_head, group=group)
+        assert chunk == 4
+        seen.append((chunk, group))
+        return chunk
+
+    monkeypatch.setattr(bwd_dsl, "_sm100_head_chunk", force_four)
+    _run(b=1, hq=16, hkv=2, sq=256, skv=256)
+    assert seen == [(4, 8)]
+
+
+@pytest.mark.parametrize("s,want", [(8192, 16), (16384, 4), (32768, 1)])
+def test_gemma4_head_chunk_respects_workspace_budget(s, want):
+    from cudnn.sdpa.bwd.api_dsl import _sm100_head_chunk
+
+    assert _sm100_head_chunk(1, 16, s, s, 2, group=8) == want
+
+
 def test_causal_top_left():
     _run(keep=_causal_keep(512, 512), use_causal_mask=True)
 
