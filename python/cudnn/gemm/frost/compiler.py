@@ -3597,10 +3597,6 @@ def _check_executable(chain: FusionChain) -> None:
         raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
 
 
-# Templates that render the @@SPLITK_ONLY@@ blocks.
-_SPLITK_PIPELINES = ("sm100", "sm103", "sm120")
-
-
 def _cta_k_elems(chain: FusionChain, config: TileConfig) -> int:
     """Elements of K per CTA tile; fp4 packs two per byte."""
     return config.cta_tile_k_bytes * 8 // DTYPE_BITS[_mma_a_dtype(chain)]
@@ -3627,7 +3623,7 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
     - every slice keeps at least max(64 elements, 2 CTA-K tiles) of K;
     - 32, the reducer's trace-time unroll bound;
     - the CUDA grid.z limit (kernel 1's z = batch * S)."""
-    if config.split_k_slices != 1 or config.pipeline not in _SPLITK_PIPELINES:
+    if config.split_k_slices != 1:
         return config
     if _splitk_reject_reason(chain, replace(config, split_k_slices=2)) is not None:
         return config
@@ -3867,8 +3863,6 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
     if config.split_k_slices == 1:
         return None
     reasons = []
-    if config.pipeline not in _SPLITK_PIPELINES:
-        reasons.append(f"the {config.pipeline!r} pipeline ({' / '.join(_SPLITK_PIPELINES)} only)")
     if chain.has_moe:
         reasons.append("MoE grouped matmul")
     if chain.is_multi_gemm:
