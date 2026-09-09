@@ -145,9 +145,15 @@ may require materialization.
 
 ## Execution and review notes
 
-The shared graph builders and Frost workspace layouts are reused. The JAX
-launcher composes existing CuTe host functions into one native XLA FFI call per
-forward/backward. That call receives XLA's stream and launches the complete
+`linear_attention/jax_api.py` owns metadata, argument binding and autodiff.
+`linear_attention/frost/kda_launch.py` composes the native launch sequence.
+The existing engine owns workspace layout; the split scheduler owns launch
+geometry, shared by torch and JAX.
+
+Graph tensors come directly from JAX shape/dtype metadata; the existing
+`graph.kda` / `graph.kda_bwd` methods infer output shapes and validate the graph.
+Frost workspace layouts are reused. The JAX launcher composes existing CuTe host
+functions into one native XLA FFI call per forward/backward. That call receives XLA's stream and launches the complete
 sequence, including runtime TMA descriptors and PDL dependencies. No Python
 callback, torch tensor, DLPack handoff, or KDA math implementation is introduced.
 
