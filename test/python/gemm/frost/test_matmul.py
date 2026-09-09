@@ -24,6 +24,7 @@ import torch
 from gemm_test_utils import (
     requires_int8_mma,
     requires_matmul_gpu,
+    skip_unless_pipeline_active as _skip_unless_active,
     requires_sm100,
     Plan as _plan,
     vp as _vp,
@@ -1543,6 +1544,7 @@ def test_dense_col_quant_rejections() -> None:
         return g
 
     cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    _skip_unless_active(cfg)  # the rules below sit behind the family's arch gate
     with pytest.raises(ValueError, match="divisible by block_size"):
         _plan(_col_graph(160 + 8, 128, 128, 32), config=cfg)
     with pytest.raises(NotImplementedError, match="block_size 32"):
@@ -2760,7 +2762,7 @@ def test_no_template_hardcodes_the_staging_alignment() -> None:
 
     tmpl_dir = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
     files = sorted(p for p in tmpl_dir.glob("sm*.py"))
-    assert len(files) == 7, [p.name for p in files]
+    assert len(files) == 8, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
     for path in files:
         src = path.read_text()
         assert "alignment=64" not in src, path.name
@@ -3162,7 +3164,7 @@ def test_sm120_registry_wiring() -> None:
     # SM 12.x is in the family's active range (whatever else the range covers).
     assert any(lo <= 120 < hi for lo, hi in PIPELINE_ARCH_RANGES["sm120"])
 
-    (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120"]
+    (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120" and t.graph_type is GraphType.MATMUL]
     assert tmpl.file == "sm120_matmul.py"
     assert isinstance(tmpl, Sm120KernelTemplate)
     # Warp-scoped MMA: 1-CTA only, no multi-GEMM (no per-GEMM operand indexing).
@@ -3357,8 +3359,6 @@ def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
     CTA tile) computes the same matmul on a tail-heavy shape. The Am cases pin
     the combinations the old per-MMA swizzle-slice rule wrongly rejected (an
     M-major A on the 2x4 / 1x8 grids has no per-MMA descriptor on sm120)."""
-    if _current_arch() != 120:
-        pytest.skip(f"sm120-host-only matrix (running on sm_{_current_arch()})")
     cfg = _resolve(config_name)
     M, N, K = 192, 192, 160
     ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", a_major=a_major)

@@ -17,8 +17,9 @@ import cudnn  # noqa: F401
 import cudnn.gemm.frost  # noqa: F401
 import torch
 
-from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
-from cudnn.gemm.frost.tile_config import CATALOG as _CATALOG
+from cudnn.gemm.frost.compiler import _render_block_scale_tile_constants, jit_from_cudnn_graph
+from cudnn.gemm.frost.graph_analyzer import analyze
+from cudnn.gemm.frost.kernel_registry import candidates as _candidates
 
 from benchmark_utils import (
     add_sweep_args,
@@ -37,22 +38,6 @@ from benchmark_utils import (
     time_ms_events,
     to_blocked,
 )
-
-
-def _build_spec_map():
-    """Canonical label -> (geometry cfg, cta_group) for block-scale
-    strategies (geometry must satisfy the SF 128x4 swizzle; K-tile bytes are
-    arch-keyed: 128 on sm100, 384 on sm103)."""
-    m = {}
-    for cfg in _CATALOG:
-        kb_want = 384 if cfg.pipeline == "sm103" else 128
-        if cfg.mma_tile_m % 128 or cfg.mma_tile_n % 128 or cfg.cta_tile_k_bytes != kb_want:
-            continue
-        m[cfg.name] = (cfg, cfg.cta_group)
-    return m
-
-
-_SPEC_MAP = _build_spec_map()
 
 
 def _vp_bs(handles, a, b, c, sfa, sfb):
@@ -106,6 +91,30 @@ def _graph_block_scale(batch: int, M: int, N: int, K: int, combo: str):
     C = g.matmul(A=Ad, B=Bd, name="mm")
     C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
     return g, (A, Bt, C, SFA, SFB)
+
+
+def _build_spec_map():
+    """Canonical label -> (geometry cfg, cta_group) for every block-scale
+    strategy the registry funnel accepts on the ACTIVE GPU -- arch gate, the
+    family's MMA-type table and its validate_block_scale_config -- minus the
+    geometries whose tile constants do not render (no SMEM / TMEM room for a
+    stage). The sweep therefore follows the machine: sm100 / sm103 configs on a
+    tcgen05 part, the sm120 warp-MMA configs on a consumer part. The funnel is
+    asked with the default nvfp4 chain; the block-scale geometry rules are the
+    same for every combo the script offers."""
+    chain = analyze(_graph_block_scale(1, 4096, 4096, 4096, "nvfp4")[0])
+    m = {}
+    for tmpl, cfg in _candidates(chain):
+        try:
+            _render_block_scale_tile_constants(cfg, chain, tmpl)
+        except (NotImplementedError, ValueError):
+            continue
+        # A family without the CTA-pair axis (sm120) has no cta_group at all.
+        m[cfg.name] = (cfg, getattr(cfg, "cta_group", 1))
+    return m
+
+
+_SPEC_MAP = _build_spec_map()
 
 
 def _mkdata(batch: int, M: int, N: int, K: int, combo: str):
