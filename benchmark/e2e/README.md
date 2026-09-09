@@ -258,6 +258,12 @@ Planned: Kimi Linear (KDA), DeepSeek-V3.
 
 ## Run
 
+`--mode` selects the workload and sampling protocol, not a GPU product or SM
+count. The runners retain their kernel architecture/backend requirements and
+record the selected device and SM count in each artifact. Performance results
+apply to that recorded hardware; selecting `formal` does not certify a B200 run.
+Use `CUDA_VISIBLE_DEVICES` to select the GPU for a controlled measurement.
+
 ```bash
 # The factorial math/reporting tests are CPU-only and do not import Torch.
 python -m unittest discover -s benchmark/e2e/tests -v
@@ -268,7 +274,7 @@ python -m unittest discover -s benchmark/e2e/tests -v
 python benchmark/e2e/Qwen3.8/run_matrix.py \
   --mode smoke --output-dir qwen3.8-factorial-results/smoke
 
-# Formal 8-arm Williams run: full 148-SM B200, bs=4, seq=2048,
+# Formal 8-arm Williams run: bs=4, seq=2048,
 # 40 balanced batches, 3 repeats. Produces timestamped .json and .md artifacts.
 python benchmark/e2e/Qwen3.8/run_matrix.py \
   --mode formal --output-dir qwen3.8-factorial-results/formal
@@ -305,7 +311,7 @@ python benchmark/e2e/Qwen-Image/run_bf16.py \
   --mode smoke --output-dir qwen-image-bf16-results/smoke
 
 # Formal four-arm BF16 transformer proxy: B=1, 4096 image + 512 text tokens,
-# four real-shape blocks, 40 Williams-balanced batches x 3 repeats on a full B200.
+# four real-shape blocks, 40 Williams-balanced batches x 3 repeats.
 python benchmark/e2e/Qwen-Image/run_bf16.py \
   --mode formal --output-dir qwen-image-bf16-results/formal
 
@@ -326,8 +332,7 @@ cuDNN >= 9.23 backend d256 SDPA path on an SM100 (Blackwell) device;
 and admits its validated plain, local, bias-free BF16 `swish` module;
 unsupported runtime configurations fall back to FLA. The default
 `short_conv=true` GDN axis uses the packed-QKV support landed in #685. After
-#682, the FE public d256 SDPA operator is backend-graph-only. Formal mode
-additionally rejects anything other than a full 148-SM NVIDIA B200. Both modes verify exact
+#682, the FE public d256 SDPA operator is backend-graph-only. Both modes verify exact
 GDN/MLP/full-attention routes and explicit finite correctness before reporting.
 Formal shape/timing overrides are allowed but are listed prominently and
 included in the comparability fingerprint. The default

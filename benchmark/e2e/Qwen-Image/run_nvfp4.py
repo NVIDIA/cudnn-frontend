@@ -146,12 +146,9 @@ def _pick_device(torch, mode):
     for index in range(torch.cuda.device_count()):
         properties = torch.cuda.get_device_properties(index)
         candidates.append(f"cuda:{index}={properties.name}/{properties.multi_processor_count}SM")
-        if (properties.major, properties.minor) == (10, 0) and (
-            mode != "formal" or (properties.name == "NVIDIA B200" and properties.multi_processor_count == 148)
-        ):
+        if (properties.major, properties.minor) == (10, 0):
             return torch.device(f"cuda:{index}"), properties
-    requirement = "a full 148-SM NVIDIA B200" if mode == "formal" else "an SM100 GPU"
-    raise RuntimeError(f"{mode} mode requires {requirement}; visible: {', '.join(candidates)}")
+    raise RuntimeError(f"{mode} mode requires an SM100 GPU; visible: {', '.join(candidates)}")
 
 
 def _rel_l2(actual, expected):
