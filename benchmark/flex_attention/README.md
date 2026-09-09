@@ -9,7 +9,7 @@ mask patterns.
 
 - NVIDIA Hopper SM90, Blackwell SM100, or Blackwell SM103 GPU
 - CUDA-enabled PyTorch
-- the cuDNN Frontend `cutedsl` optional dependencies
+- cuDNN Frontend (its CuTeDSL dependencies are required and install with it)
 
 From a source checkout:
 

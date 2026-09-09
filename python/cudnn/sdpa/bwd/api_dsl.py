@@ -1180,8 +1180,23 @@ _cache_of_objects: dict = {}
 _SM80_BWD_KERNEL_FILE = "bprop_f16_sm80.py"
 # The shared tile_dsl scheduler vocabulary maps identity onto the bwd grid
 # decode (NATURAL == plain 3-D == 0, LPT == kv-major == 1).
-from cudnn.frost.tile_dsl.constants import SCHED_LPT as _BWD_SCHED_LPT  # noqa: E402
+from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2 as _BWD_SCHED_LPT_L2  # noqa: E402
 from cudnn.frost.tile_dsl.constants import SCHED_NATURAL as _BWD_SCHED_NATURAL  # noqa: E402
+
+
+def _sm80_bwd_sched_policy(*, is_causal: bool, deterministic: bool) -> int:
+    """Grid order for the SM80 backward (a ``tile_dsl.constants.SCHED_*``).
+
+    Causal takes the kv-major LPT order WITHIN L2-sized head groups.  The plain
+    kv-major LPT over every head at once spreads a head's kv-tiles across the
+    whole grid, so its Q / dO / dQ tiles fall out of L2 between visits and the
+    dQ atomics turn into DRAM read-modify-writes (1.4x slower than the plain
+    3-D grid at 64x8 heads, S=4K); the plain grid in turn leaves a one-CTA-long
+    tail that costs 10-17% on small grids.  Grouping keeps both.  Non-causal
+    work is uniform per kv-tile, so the plain 3-D grid stays; the deterministic
+    relay REQUIRES the plain decode (kv_tile == blockIdx.x).
+    """
+    return _BWD_SCHED_LPT_L2 if (is_causal and not deterministic) else _BWD_SCHED_NATURAL
 
 
 def _load_sm80_bwd_module(params):
@@ -1483,10 +1498,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._ensure_support_checked()
         from cudnn.sdpa.bwd.config_sm80 import bwd_params_for_flavor
 
-        # Scheduler resolution (the old backward()'s "auto"): kv-major LPT for
-        # causal load-balance, the plain 3-D grid otherwise; the deterministic
-        # relay REQUIRES the plain decode (kv_tile == blockIdx.x).
-        sched = _BWD_SCHED_LPT if (self.is_causal and not self.deterministic) else _BWD_SCHED_NATURAL
+        sched = _sm80_bwd_sched_policy(is_causal=self.is_causal, deterministic=self.deterministic)
         # NOTE: the generic pipeline always ran the llama-swept tile point
         # regardless of flavor (the old backward() defaults); the gptoss
         # wide-Q-tile row stays unwired pending an adapter-level perf gate.
@@ -1896,6 +1908,14 @@ def sdpa_bwd_wrapper_sm80(
     drops KV tiles, an undersized ``max_s_q`` indexes the relay counter out
     of bounds.
     """
+    # Rule 7 (python/cudnn/AGENTS.md): this entry reaches the kernel module on its
+    # own, so decline by DSL version here instead of surfacing the DSL's own
+    # TypeError/ModuleNotFoundError from the template load.
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    _too_old = cutedsl_requirement_error("sdpa_bwd_wrapper_sm80")
+    if _too_old is not None:
+        raise NotImplementedError(_too_old)
     # THD / varlen: q/k/v/o/dO are PACKED [1, T, H, D] (BSHD) + cu_seqlens;
     # lse is packed [1, H, T_q].  Dedicated path that skips the dense BHSD
     # transpose + dense grad alloc (mirrors the forward THD branch).

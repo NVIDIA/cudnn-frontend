@@ -3521,7 +3521,8 @@ def test_splitk_n_not_multiple_of_4(N):
 def test_splitk_cta_group1():
     g, A, Bt, C = _splitk_graph(1, 256, 256, 4096)
     compiled = _jit_splitk(g, 4, base_cfg=by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
-    assert compiled.store_modes == ("tma",)
+    # The reduce kernel uses STG, so the `store_modes` is always STG.
+    assert compiled.store_modes == ("stg",)
     assert compiled.use_tma_store
     a, b, c, ref = _splitk_data(1, 256, 256, 4096)
     _run_splitk(compiled, {A: a, Bt: b, C: c})
@@ -3588,19 +3589,71 @@ def test_splitk_rejects_grid_z_overflow():
         _jit_splitk(g, 2)
 
 
+_SPLITK_EPI_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+
+
+def _run_splitk_vs_dense(g, S, M, N, K, outs_fn, aux_fn=lambda p: []):
+    """Same graph built dense (S=1) and split (S): every output must match bit
+    for bit, since small-integer data keeps the partial sums exact."""
+    dense = _jit_splitk(g, 1, base_cfg=by_name(_SPLITK_EPI_CFG))
+    split = _jit_splitk(g, S, base_cfg=by_name(_SPLITK_EPI_CFG))
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    outs_d, outs_s = outs_fn(dense), outs_fn(split)
+    _run_splitk(dense, _vp(dense, a, b, outs_d, *aux_fn(dense)))
+    _run_splitk(split, _vp(split, a, b, outs_s, *aux_fn(split)))
+    assert not any(torch.isnan(o.float()).any() for o in outs_s), "split-K left cells unwritten"
+    assert all(torch.equal(x.float(), y.float()) for x, y in zip(outs_d, outs_s)), "split-K != dense"
+
+
 @requires_sm100
-def test_splitk_rejects_epilogue_fusion():
-    with pytest.raises(NotImplementedError, match=r"split_k_slices.*plain matmul"):
-        _jit_splitk(_splitk_fused_graph(K=512), 2)
-    # probe and build must agree: the same explicit config fails probe_supported
-    # (split-K is a config attribute, gated with the rest of the config).
-    from dataclasses import replace
+@pytest.mark.parametrize(
+    ("kind", "N", "S"),
+    (
+        ("row_aux", 256, 8),  # per-row aux prefetched before the ops
+        ("per_col_aux", 256, 8),  # aux vector loaded per chunk; partials via TMA store
+        ("two_taps", 250, 6),  # two dense outputs; N % 4 != 0 -> STG partials, 2-elem chunks
+    ),
+    ids=("row_aux", "per_col_aux", "two_taps_stg"),
+)
+def test_splitk_epilogue_fusion(kind, N, S):
+    """The graph's epilogue runs in kernel 2 on the reduced sum."""
+    M, K = 256, 4096
+    _run_splitk_vs_dense(_straddle_graph(kind, M, N, K), S, M, N, K, lambda p: _straddle_outs(p, M, N), lambda p: _straddle_aux(p, M, N))
 
-    from cudnn.gemm.frost.compiler import probe_supported
-    from cudnn.gemm.frost.tile_config import DEFAULT_CONFIG
 
-    with pytest.raises(NotImplementedError, match=r"split_k_slices.*plain matmul"):
-        probe_supported(_splitk_fused_graph(K=512), replace(DEFAULT_CONFIG, split_k_slices=2))
+@requires_sm100
+def test_splitk_epilogue_m_major_output():
+    M, N, K = 256, 256, 4096
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    Y = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    Y.set_stride([M * N, 1, M])
+    Y.set_output(True)
+    _run_splitk_vs_dense(g, 8, M, N, K, lambda p: [torch.full((1, N, M), float("nan"), dtype=torch.bfloat16, device="cuda").transpose(1, 2)])
+
+
+@requires_sm100
+def test_splitk_epilogue_reduction():
+    """relu + AMAX beside the dense output: the atomic runs in kernel 2."""
+    M, N, K = 256, 256, 4096
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    R.set_output(True)
+    amax = g.reduction(input=R, mode=cudnn.reduction_mode.AMAX, name="amax")
+    amax.set_dim([1, 1, 1]).set_stride([1, 1, 1])
+    amax.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    compiled = _jit_splitk(g, 8, base_cfg=by_name(_SPLITK_EPI_CFG))
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    out = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    out_am = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
+    _run_splitk(compiled, _vp(compiled, a, b, [out, out_am]))
+    # The matmul output is bf16, so the chain (and the AMAX) sees the rounded value.
+    ref = torch.relu(torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16).float())
+    assert torch.equal(out, ref.to(torch.bfloat16))
+    assert out_am.flatten()[0] == ref.abs().amax()
 
 
 def test_splitk_auto_select():
@@ -3625,8 +3678,8 @@ def test_splitk_auto_select():
     assert slices(_splitk_graph(1, 256, 256, 512)[0]) == 1
     # grid.z cap: batch * S <= 65535.
     assert 60000 * slices(_splitk_graph(60000, 128, 128, 65536)[0]) <= 65535
-    # Fused graph never auto-splits (gate reused).
-    assert slices(_splitk_fused_graph(K=8192)) == 1
+    # A fused graph splits
+    assert slices(_splitk_fused_graph(K=8192)) == 32
     # A dynamic-shape graph never auto-splits: S is baked at compile, and a
     # runtime K below S CTA-K tiles cannot be served without a rebuild.
     from cudnn.gemm.frost.compiler import _graph_dynamic_shapes, plan_config

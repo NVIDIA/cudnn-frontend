@@ -317,8 +317,10 @@ python/cudnn/
       kernels/
         prefill_d256_f16_sm100.py     naming: <phase>_d<dim>_<dtype-family>_sm<arch>.py
         prefill_d512_f16_sm100.py
-        prefill_f16_sm120.py
+        prefill_f16_sm120.py          general SM120 template (any head dim)
+        prefill_d256_f16_sm120.py     d256 flavor
         _common_sm100.py
+        _common_sm120.py
         thd_helpers.py
     bwd/                        future: same shape, its own api_dsl.py
 

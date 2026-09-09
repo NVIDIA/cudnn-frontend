@@ -131,6 +131,12 @@ def validate_config(cfg):
         print("@@@@ Overall result: WAIVED, mixed-form sequence lengths require cuDNN 9.25.0 or higher.")
         pytest.skip("mixed-form sequence lengths (cumulative on one side only) require cuDNN 9.25.0 or higher")
 
+    # Same gate as test_sdpa_edge_cases.py: the random sweeps draw zero-length
+    # sequences (~10% per batch), which older engines answer with NaN rows.
+    if cudnn_version < "9.25.0" and (0 in cfg.seq_len_q or 0 in cfg.seq_len_kv):
+        print("@@@@ Overall result: WAIVED, zero sequence length SDPA requires cuDNN 9.25.0 or higher.")
+        pytest.skip("zero sequence length SDPA requires cuDNN 9.25.0 or higher")
+
 
 def allocate_tensors(cfg, rng_data_gen, perf=False):
     allocs = {}

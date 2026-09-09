@@ -6,10 +6,10 @@
 
 Times the public ``cudnn.DSA.sparse_attention_backward_wrapper`` API, which
 dispatches to the Hopper (SM90) or Blackwell (SM100) CuTe DSL kernel based on
-the active CUDA device. Inputs are flat FlashMLA-shaped tensors (shared K=V
+the active CUDA device. Inputs are flat MQA tensors (shared K=V
 buffer, global per-query top-k indices). The forward ``out``/``lse`` consumed
 by the backward kernel are produced by a chunked PyTorch reference; the
-production forward (FlashMLA) is out of scope here.
+forward launch is intentionally excluded so the benchmark isolates backward.
 
 Usage:
     python benchmark_dsa_sparse_attention_backward.py

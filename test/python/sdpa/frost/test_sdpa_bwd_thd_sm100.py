@@ -757,7 +757,7 @@ def _thd_mismatch(lens_q=(256, 128), lens_kv=(256, 128), *, h=2, hkv=None, stats
 
 def test_graph_thd_accepts_the_plain_case():
     """The counterweight to the rejects below: the same builder, no extras, IS
-    served -- so a reject test that passes for the wrong reason (a broken
+    served -- so a reject test that passes for the wrong reason (an invalid
     graph, a builder typo) fails here first."""
     assert _thd_mismatch() is None
 

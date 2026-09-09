@@ -4,7 +4,7 @@
 import math
 import torch
 
-from .fp16_ref import _ScoreMask, _score_blocks, _pv, _grouped, _init_softmax_state
+from .fp16_ref import _ScoreMask, _score_blocks, _qk, _pv, _kv_reduce, _init_softmax_state
 
 # fmt: off
 
@@ -141,9 +141,6 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
     dQ = torch.zeros((b, h_q, s_q, d_qk), dtype=torch.float32, device=device)
     dK = torch.zeros((b, h_k, s_kv, d_qk), dtype=torch.float32, device=device)
     dV = torch.zeros((b, h_v, s_kv, d_vo), dtype=torch.float32, device=device)
-    dO_g_v = _grouped(dO_dq, h_v)
-    dO_t_g_v = _grouped(dO_t_dq, h_v)
-    q_t_g_k = _grouped(q_t_dq, h_k)
 
     for start, end, s_raw in _score_blocks(q_dq, k_dq, None, mask):
         n = end - start
@@ -168,7 +165,7 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
         p_fp8 = (p * 256.0).to(torch_itype).float() * (1.0 / 256.0)
 
         # dO @ V -> dP
-        dP = torch.einsum("bhgqd,bhkd->bhgqk", dO_g_v, v_dq[:, :, start:end, :]).reshape(b, h_q, s_q, n)
+        dP = _qk(dO_dq, v_dq[:, :, start:end, :], h_v)
 
         # dS = P * (dP - D) * attn_scale
         dS = p * (dP - D) * attn_scale
@@ -182,10 +179,10 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
         dS_fp32 = _dequant(dS_fp8, sf_dS_ref)
         dS_fp32_t = _dequant(dS_fp8_t, sf_dS_t_ref)
 
-        # P @ dO -> dV; dS @ K -> dQ; dS^T @ Q -> dK (GQA reduction folded into the einsum)
-        dV[:, :, start:end, :] = torch.einsum("bhgqk,bhgqd->bhkd", _grouped(p_fp8, h_v), dO_t_g_v)
+        # P @ dO -> dV; dS @ K -> dQ; dS^T @ Q -> dK (GQA reduction inside _kv_reduce)
+        dV[:, :, start:end, :] = _kv_reduce(p_fp8, dO_t_dq, h_v)
         dQ = dQ + _pv(dS_fp32, k_t_dq[:, :, start:end, :], h_k)
-        dK[:, :, start:end, :] = torch.einsum("bhgqk,bhgqd->bhkd", _grouped(dS_fp32_t, h_k), q_t_g_k)
+        dK[:, :, start:end, :] = _kv_reduce(dS_fp32_t, q_t_dq, h_k)
 
     # Compute dSink_token if sink_token was provided
     # Formula: dSink = -exp(sink - logsumexp) * D summed over batch and sequence
