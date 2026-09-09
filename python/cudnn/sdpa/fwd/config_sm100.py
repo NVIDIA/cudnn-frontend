@@ -462,6 +462,21 @@ def canonicalize_d256_lowering(params: TemplateParams, *, s_q: int, s_kv: int) -
     return replace(params, bottom_right=False) if d256_square_br_as_tl(params, s_q=s_q, s_kv=s_kv) else params
 
 
+def canonicalize_d512_mxfp8_lowering(params: TemplateParams, *, s_q: int, s_kv: int) -> TemplateParams:
+    """Canonicalize an exactly square D512 MXFP8 causal diagonal."""
+
+    square_bottom_right = (
+        not params.thd_varlen
+        and not params.seq_q_lens_present
+        and not params.seq_kv_lens_present
+        and params.window_left is None
+        and params.window_right == 0
+        and params.bottom_right
+        and s_q == s_kv
+    )
+    return replace(params, bottom_right=False) if square_bottom_right else params
+
+
 def derive_d256_internal_params(
     params: TemplateParams,
     *,

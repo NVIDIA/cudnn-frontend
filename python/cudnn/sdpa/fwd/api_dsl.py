@@ -34,6 +34,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
     canonicalize_d192_lowering,
     canonicalize_d256_lowering,
+    canonicalize_d512_mxfp8_lowering,
     derive_d192_internal_params,
     derive_d256_internal_params,
     pack_gqa_supported,
@@ -1468,6 +1469,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
                 cta_mma=auto_cga if self.cga is None else params.cta_mma,
             )
+            params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
