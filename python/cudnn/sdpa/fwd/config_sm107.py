@@ -129,7 +129,7 @@ _DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16 = 0, 1, 2, 3
 # d256 / d512 do NOT: those ported bodies still call the setup kernel with the
 # pre-upstream 7-arg contract against a 14-arg helper, and their metadata layout
 # is 3B+2 where the helper builds 4B+4, so they raise at compile().
-SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128)})
+SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 
 # f16/bf16 flavor names whose kernel body HAS been ported to the FROST
 # setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4

@@ -56,15 +56,13 @@ _D128_D256 = [pytest.param(128, id="d128"), pytest.param(256, id="d256")]
 # `pack_gqa_d_shapes` are both frozenset({(128, 128)})), so a d256/d512 THD or
 # PackGQA graph is DECLINED and the test cannot run.  Honest capability gaps,
 # not kernel bugs; flip the condition when the ported kernels grow the legs.
-_skip_wide_thd_on_rubin = pytest.mark.skipif(
-    _SM == 107,
-    reason="THD/varlen is d128-only on the Rubin FP8 line (row: thd_d_shapes={(128,128)})",
-)
 _skip_wide_pack_gqa_on_rubin = pytest.mark.skipif(
     _SM == 107,
     reason="PackGQA is d128-only on the Rubin FP8 line (row: pack_gqa_d_shapes={(128,128)})",
 )
-_D128_D256_THD = [pytest.param(128, id="d128"), pytest.param(256, id="d256", marks=_skip_wide_thd_on_rubin)]
+# INVERTED 2026-09-09: THD is served on every Rubin FP8 flavor, so d256 no
+# longer carries a THD skip.  PackGQA below is still d128-only.
+_D128_D256_THD = [pytest.param(128, id="d128"), pytest.param(256, id="d256")]
 _D128_D256_PACK_GQA = [pytest.param(128, id="d128"), pytest.param(256, id="d256", marks=_skip_wide_pack_gqa_on_rubin)]
 
 # The PORTED d256/d512 Rubin FP8 kernels carry neither a strided-Stats store
@@ -1435,8 +1433,8 @@ def test_fp8_d192_d128_thd_features():
     "d_qk,d_v",
     [
         pytest.param(128, 128, id="d128"),
-        pytest.param(192, 128, id="d192_d128", marks=_skip_wide_thd_on_rubin),
-        pytest.param(256, 256, id="d256", marks=_skip_wide_thd_on_rubin),
+        pytest.param(192, 128, id="d192_d128"),
+        pytest.param(256, 256, id="d256"),
     ],
 )
 @torch_fork_set_rng(seed=0)
@@ -1454,7 +1452,6 @@ def test_fp8_thd_multi_unit_per_cta(monkeypatch, d_qk, d_v):
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
-@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
@@ -1735,7 +1732,6 @@ def test_fp8_d512_multi_tile():
 # --- d512 THD / varlen -----------------------------------------------------
 
 
-@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
@@ -1747,7 +1743,6 @@ def test_fp8_d512_thd(in_key, causal):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_thd_cross_gqa():
@@ -1757,7 +1752,6 @@ def test_fp8_d512_thd_cross_gqa():
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
-@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_thd_sink_stats():
@@ -1769,7 +1763,6 @@ def test_fp8_d512_thd_sink_stats():
     assert diff <= 5e-2, f"max|LSE-ref| = {diff:.4f}"
 
 
-@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_thd_zero_len_kv():
@@ -1791,7 +1784,6 @@ def test_fp8_d512_thd_zero_len_kv():
     _check(out, o_ref, torch.float16, "e5m2", a_o, a_o_ref)
 
 
-@_skip_wide_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_thd_cu_seq_len():

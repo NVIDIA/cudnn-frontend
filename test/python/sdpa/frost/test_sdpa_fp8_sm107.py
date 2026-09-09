@@ -369,13 +369,12 @@ def test_fp8_rows_serve_dense_envelope():
     for arch in ("sm100", "sm107"):
         row = caps[engines.engine_name(arch=arch, fp8=True)]
         assert row.d_pad_multiple == 16, arch
-    # PARTIALLY INVERTED 2026-09-09: the Rubin THD leg now covers d192xd128 too.
-    # It came free with the DSv3 port -- that kernel IS the d128 body (only the
-    # config factory differs), so its THD wiring is the shipped one; validated on
-    # w2u1g-lc-0030.  d256/d512 still raise at compile() (7-arg call site vs the
-    # 14-arg helper, 3B+2 vs 4B+4 metadata), so sm100 keeps the wider set.
+    # FULLY INVERTED 2026-09-09: the Rubin per-tensor FP8 THD leg now covers every
+    # native flavor -- d192xd128 came free with the DSv3 port (same body as d128),
+    # and d256/d512 were moved onto the FROST THD contract.  Both lines now serve
+    # THD at every shape they serve dense.
     rubin_fp8 = caps[engines.engine_name(arch="sm107", fp8=True)]
-    assert rubin_fp8.thd_d_shapes == frozenset({(128, 128), (192, 128)})
+    assert rubin_fp8.thd_d_shapes == rubin_fp8.d_shapes
     assert caps[engines.engine_name(fp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 
     # The row and the STANDALONE wrapper enforce the same fact at two places
