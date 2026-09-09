@@ -3598,7 +3598,7 @@ def _check_executable(chain: FusionChain) -> None:
 
 
 # Templates that render the @@SPLITK_ONLY@@ blocks.
-_SPLITK_PIPELINES = ("sm100", "sm120")
+_SPLITK_PIPELINES = ("sm100", "sm103", "sm120")
 
 
 def _cta_k_elems(chain: FusionChain, config: TileConfig) -> int:

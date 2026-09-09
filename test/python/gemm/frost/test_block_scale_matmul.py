@@ -1521,7 +1521,7 @@ def test_sm103_rejects_misaligned_runtime_k(_pretend_sm103):
 # End-to-end numerics (sm103 GPU only)
 
 
-def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1):
+def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1, split_k=1):
     dev = "cuda"
     torch.manual_seed(0)
     bs = 16 if combo == "nvfp4" else 32
@@ -1545,9 +1545,10 @@ def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1):
         sfb_log = _rand_e8m0((N, sf_k), dev)
 
     g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt)
-    compiled = _plan(g, **_sm103_kw(config_name, cta_group))
+    compiled = _plan(g, config=dataclasses.replace(by_name(config_name), cta_group=cta_group, split_k_slices=split_k))
     assert compiled.block_scale
     assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == (_DTYPE_FROM_CUDNN[sf_dt], bs)
+    ws, _ws_buf = _splitk_workspace(compiled)
 
     # The F8_128x4 reorder pads to 128-row × 4-SF blocks; view with the
     # padded dims (matters for M/N not multiples of 128).
@@ -1563,7 +1564,8 @@ def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1):
             c,
             _to_blocked(sfa_log).view(1, mp, kp),
             _to_blocked(sfb_log).view(1, np_, kp),
-        )
+        ),
+        workspace=ws,
     )
     torch.cuda.synchronize()
 
@@ -1605,6 +1607,19 @@ def test_sm103_block_scale_matmul_numerics(combo, config_name, shape):
 )
 def test_sm103_block_scale_matmul_numerics_2ctamma(combo, config_name, shape):
     _run_sm103_numeric(combo, config_name, *shape, cta_group=2)
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "config_name,cta_group,shape,S",
+    [
+        (_CFG_128, 1, (256, 256, 4096), 3),  # partial K-tile lands in the last slice
+        ("CONFIG_sm103_128x256x384_128x256x48_cluster2x1", 2, (512, 512, 6144), 7),
+    ],
+    ids=("S3-partialK", "2ctamma-S7"),
+)
+def test_sm103_block_scale_matmul_splitk_numerics(config_name, cta_group, shape, S):
+    _run_sm103_numeric("nvfp4", config_name, *shape, cta_group=cta_group, split_k=S)
 
 
 @requires_sm103
