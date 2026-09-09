@@ -82,6 +82,7 @@ __all__ = [
     "make_cfg_d512_mxfp8",
     "SMEM_CAP_BYTES",
     "SM107_FP8_THD_SHAPES",
+    "SM107_F16_THD_SHAPES",
 ]
 
 
@@ -129,6 +130,18 @@ _DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16 = 0, 1, 2, 3
 # pre-upstream 7-arg contract against a 14-arg helper, and their metadata layout
 # is 3B+2 where the helper builds 4B+4, so they raise at compile().
 SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128)})
+
+# f16/bf16 flavor names whose kernel body HAS been ported to the FROST
+# setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4
+# metadata the shared decode reads).  Keyed by the `flavor` string
+# `_validate_params` already receives, so adding a ported flavor is one entry.
+_F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128"})
+
+# Head-dim shapes whose Rubin f16/bf16 kernel carries the THD/varlen leg -- the
+# same one-definition-two-consumers arrangement as SM107_FP8_THD_SHAPES above
+# (engine row + standalone adapter gate; contract rule 8b').  Must stay in step
+# with _F16_THD_FLAVORS, which is the same fact keyed by config-flavor name.
+SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128)})
 
 
 # ---------------------------------------------------------------------------
@@ -270,13 +283,19 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.split_kv and k.split_kv > 1:
         raise ValueError(f"{flavor}: split_kv > 1 is not wired in the SM107 kernels (no SplitHelpers)")
-    # FP8/MXFP8 only.  The f16/bf16 Rubin kernels carry no varlen plumbing --
-    # their setup-kernel call site still speaks the pre-upstream 7-arg contract
-    # against a 14-arg helper, and the metadata layout differs (3B+2 vs 4B+4).
-    # (This guard used to repeat the same dtype set the check above already
-    # enforces, so it declined nothing.)
-    if k.thd_varlen and k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2):
-        raise ValueError(f"{flavor}: THD/varlen is FP8/MXFP8 only on SM107 (got dtype_qkv={k.dtype_qkv}); the f16/bf16 kernels carry no varlen plumbing")
+    # THD/varlen is per-FLAVOR on the Rubin line, not per-dtype.  Every
+    # QUANTIZED flavor carries it; on the f16/bf16 side only the flavors whose
+    # BODY has been ported to the FROST setup-kernel contract do -- the rest
+    # still call it with the pre-upstream 7-arg signature against a 14-arg
+    # helper, and allocate the 3B+2 metadata buffer where the SHARED decode
+    # (_common_blackwell._thd_decode) reads 4B+4 with a batch_remap.  That
+    # mismatch is a HANG or a wrong batch, not an arity error, so it is declined
+    # here rather than left to fail deep in a trace.
+    if k.thd_varlen and k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2) and flavor not in _F16_THD_FLAVORS:
+        raise ValueError(
+            f"{flavor}: THD/varlen on the SM107 f16/bf16 line is served by {sorted(_F16_THD_FLAVORS)} only "
+            f"(got dtype_qkv={k.dtype_qkv}); the other flavors' setup-kernel call sites are not ported"
+        )
 
 
 def _band_fields(params: TemplateParams) -> Tuple[int, int, int, int, int]:

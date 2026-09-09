@@ -114,14 +114,23 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(flavor, kind, load_
     assert not re.search(r"desc_version=[01]\b", code), f"{mod.__name__}: a re-literalled desc_version bypasses DESC_VERSION"
 
 
-def test_sm107_f16_kernels_do_not_claim_thd():
-    """THD is NOT ported: the setup-kernel call site still speaks the
-    pre-upstream 7-arg contract against a 14-arg helper, and the metadata
-    layout differs (3B+2 vs 4B+4).  compile() must refuse loudly rather than
-    fail as an arity error deep in a trace -- and no engine row may advertise
-    it."""
-    mod = _load((128, 128), rubin=True, seq_kv_lens_present=True)
-    assert mod.CFG.THD_VARLEN == 0
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_sm107_f16_thd_specialization_matches_the_ported_flavors(flavor):
+    """A THD config must TRACE for a ported f16 flavor and be REFUSED for the
+    rest -- the config guard is what stops an unported body pairing its 3B+2
+    metadata with the shared 4B+4 decode (a wrong-sequence read, not a raise).
+
+    Also pins that the dense specialization stays THD-free everywhere, which is
+    what keeps `get_workspace_size() == 0` for a dense stats-less graph."""
+    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES
+
+    assert _load(flavor, rubin=True, seq_kv_lens_present=True).CFG.THD_VARLEN == 0
+
+    if flavor in SM107_F16_THD_SHAPES:
+        assert _load(flavor, rubin=True, seq_kv_lens_present=True, thd_varlen=1).CFG.THD_VARLEN == 1
+    else:
+        with pytest.raises(ValueError, match="THD/varlen"):
+            _load(flavor, rubin=True, seq_kv_lens_present=True, thd_varlen=1)
 
 
 def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
@@ -275,16 +284,27 @@ def test_sm107_f16_serves_d192_on_its_native_kernel():
     assert engines.mismatch(caps, _f16_facts(d_qk=192, d_v=128)) is None
 
 
-def test_sm107_f16_declines_thd():
-    """INVERTS-WHEN the THD setup-kernel contract is ported: the call site
-    still passes 7 args to a 14-arg helper and the metadata layout differs
-    (3B+2 vs 4B+4).  Asserted on a real facts object, not just the dataclass
-    field, so it exercises the path mismatch() actually walks."""
+def test_sm107_f16_thd_is_served_at_d128_and_declined_above_it():
+    """INVERTED 2026-09-09: the d128 f16 setup-kernel call site was ported to
+    the 14-arg helper and its metadata to the 4B+4 layout, so THD is SERVED
+    there.  It is still declined at every wider f16 flavor, whose call sites
+    remain on the pre-upstream 7-arg contract.
+
+    The decline half matters more than the accept half: those bodies allocate
+    3B+2 while the SHARED decode (_common_blackwell._thd_decode) reads a
+    batch_remap at 3*n_batch+2, so serving them would not raise -- it would
+    read the remap out of the metadata's tail and hand tiles the WRONG
+    sequence.  Asserted on real facts objects, not the dataclass field, so it
+    walks the path mismatch() actually takes."""
     from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES
 
     caps = _caps("sdpa_fwd_prefill_sm107")
-    assert caps.thd is False
-    assert engines.mismatch(caps, _f16_facts(thd=True, padded=True)) is not None
+    assert caps.thd is True
+    assert caps.thd_d_shapes is SM107_F16_THD_SHAPES
+    assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=128, d_v=128)) is None
+    for d_qk, d_v in sorted(caps.d_shapes - SM107_F16_THD_SHAPES):
+        assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is not None, (d_qk, d_v)
 
 
 def test_sm107_f16_declines_split_kv_and_pack_gqa():

@@ -37,7 +37,7 @@ from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURA
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
-from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -654,9 +654,11 @@ def _sm107_spec() -> EngineSpec:
     Deliberately NOT claimed, each because the kernels lack the machinery
     rather than because it went untested:
 
-    - ``thd``: the setup-kernel call site still speaks the pre-upstream 7-arg
-      contract against a 14-arg helper, and the metadata layout differs
-      (3B+2 vs 4B+4). ``compile()`` raises rather than half-serving it.
+    - ``thd``: SERVED at d128 as of 2026-09-09 -- that kernel's setup-kernel
+      call site was ported to the 14-arg helper and its metadata to the 4B+4
+      layout the SHARED decode already read (the two had disagreed, which is
+      why ``compile()`` used to raise).  The wider f16 flavors still speak the
+      pre-upstream 7-arg contract, so ``thd_d_shapes`` keeps them out.
     - ``split_kv_supported``: these kernels wire no SplitHelpers.
     - ``pack_gqas``: no PackGQA path.
     - ``padded_stats`` / ``dense_seq_q_trim``: both need the per-batch
@@ -692,6 +694,12 @@ def _sm107_spec() -> EngineSpec:
             # MASK_FLAGS == 0 the kernel's kv_right is a floor division, so an
             # un-synthesized ragged S_kv would silently drop the tail tile.
             skv_tail_via_padding=True,
+            # THD at d128 only: SM107_F16_THD_SHAPES is the single definition,
+            # shared with the standalone adapter's gate so the two cannot drift
+            # (contract rule 8b').
+            thd=True,
+            thd_d_shapes=SM107_F16_THD_SHAPES,
+            cu_seq_len=True,
             # NATURAL ONLY -- same finding as the FP8 and MXFP8 Rubin rows:
             # every kernel this row serves is a PORT, and the ported decode
             # sites do not honor SCHED_LPT (measured on the d512 FP8 and d128

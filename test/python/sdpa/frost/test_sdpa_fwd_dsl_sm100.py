@@ -32,7 +32,15 @@ _ARCH = "sm107" if _SM == 107 else "sm100"
 # cannot run.  Flip each condition when the gap closes.
 _skip_split_kv_on_rubin = pytest.mark.skipif(_SM == 107, reason="the ported Rubin f16 kernels wire no SplitHelpers (row: split_kv_supported=False)")
 _skip_pack_gqa_on_rubin = pytest.mark.skipif(_SM == 107, reason="no PackGQA path in the ported Rubin f16 kernels (row: pack_gqas={False})")
-_skip_thd_on_rubin = pytest.mark.skipif(_SM == 107, reason="THD/varlen not ported to the Rubin f16 kernels (row: thd=False)")
+# PARTIALLY INVERTED 2026-09-09: the Rubin f16 THD leg is ported at d128
+# (config_sm107.SM107_F16_THD_SHAPES).  The cases below still skip on Rubin
+# because they SWEEP _FLAVORS -- d256/d512 remain on the pre-upstream 7-arg
+# setup contract -- and a per-parameter mark across 24 sites would be more
+# error-prone than the coverage it buys.  What d128 newly serves is covered
+# directly by test_thd_d128_runs_on_every_arch_line below, which is unskipped.
+_skip_thd_on_rubin = pytest.mark.skipif(
+    _SM == 107, reason="this case sweeps flavors wider than d128; the Rubin f16 THD leg is ported at d128 only (SM107_F16_THD_SHAPES)"
+)
 _skip_stats_trim_on_rubin = pytest.mark.skipif(
     _SM == 107,
     reason="per-batch seq_len_q O/LSE trim not carried by the Rubin f16 kernels " "(row: padded_stats=False / dense_seq_q_trim=False)",
@@ -1478,6 +1486,33 @@ def _run_thd_stats_case(
         else:
             got_lse = packed_stats[cu_q[i] : cu_q[i + 1]].t().unsqueeze(0)  # (T_i, H) -> (1, H, T_i)
         torch.testing.assert_close(got_lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@pytest.mark.parametrize("mask", ["none", "causal", "causal_br", "swa"])
+@torch_fork_set_rng(seed=30)
+def test_thd_d128_runs_on_every_arch_line(mask, stats_layout):
+    """f16 THD at d128, UNSKIPPED on Rubin as of 2026-09-09.
+
+    This is the coverage for the SM107 f16 THD port, and it deliberately
+    exercises the three things that port touched rather than a happy path:
+
+    - **both Stats layouts.** The kernel picks its store arm from the STATIC
+      rank compile() baked in.  Before the port the body implemented only the
+      head-major (rank-3) arm, while `_thd_compile_kwargs` defaults to
+      TOKEN-major -- so the common path would have transposed every LSE.
+    - **ragged, non-tile-aligned sequences** ([200, 150] against TILE_M=128),
+      so a tail tile is partly masked and the per-sequence Q length actually
+      gates the LSE store.
+    - **the mask arms**, because every one of them is `const_expr`-folded: a
+      dense THD pass proves nothing about the causal THD specialization.
+
+    On Rubin this also pins the metadata contract: the body now allocates 4B+4
+    with a batch_remap, which is what the SHARED decode reads.  When the two
+    disagreed the failure was not an error -- it was tiles reading the remap
+    out of the metadata's tail and attributing rows to the wrong sequence."""
+    _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[200, 150], d=128, mask=mask, stats_layout=stats_layout)
 
 
 @_skip_thd_on_rubin

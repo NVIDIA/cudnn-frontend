@@ -28,6 +28,7 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
+from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
@@ -1273,8 +1274,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # admits a graph that then dies untyped (row wider), or declines a graph
         # the row advertises (wrapper wider).  Contract rule 8b'.
         self._not_implemented_error_if(
-            self.thd and self._device_cc == (10, 7) and not (self._fp8 and self._pertensor and (int(d_qk), int(d_v)) in _SM107_FP8_THD_SHAPES),
-            f"THD/varlen on the Rubin (SM107) line is per-tensor FP8 d128 / d192xd128 only; "
+            self.thd
+            and self._device_cc == (10, 7)
+            and not (
+                (self._fp8 and self._pertensor and (int(d_qk), int(d_v)) in _SM107_FP8_THD_SHAPES)
+                or (not self._fp8 and (int(d_qk), int(d_v)) in _SM107_F16_THD_SHAPES)
+            ),
+            f"THD/varlen on the Rubin (SM107) line is per-tensor FP8 {sorted(_SM107_FP8_THD_SHAPES)} "
+            f"or f16/bf16 {sorted(_SM107_F16_THD_SHAPES)} only; "
             f"got (D_QK={d_qk}, D_V={d_v}) on the "
             f"{'MXFP8' if (self._fp8 and not self._pertensor) else 'FP8' if self._fp8 else 'f16/bf16'} path",
         )
