@@ -363,6 +363,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "grouped_gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_wrapper_sm100"),
     "hstu_attention_forward": (".hstu.hstu_attention", "hstu_attention_forward"),
     "hstu_attention_backward": (".hstu.hstu_attention", "hstu_attention_backward"),
+    "hstu_lmsd_forward": (".hstu.hstu_lmsd", "hstu_lmsd_forward"),
+    "hstu_lmsd_backward": (".hstu.hstu_lmsd", "hstu_lmsd_backward"),
     "GroupedGemmQuantSm100": (".gemm.cutedsl.grouped", "GroupedGemmQuantSm100"),
     "grouped_gemm_quant_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_quant_wrapper_sm100"),
     "GroupedGemmGluSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluSm100"),
