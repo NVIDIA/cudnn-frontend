@@ -64,6 +64,8 @@ def domain_offset_i64(
     ip=None,
 ) -> cute.Tensor:
     """Rebase a tensor with a 64-bit byte offset, preserving its layout."""
+    # Materializing the row base pointer separately gives ptxas better uniform-register
+    # allocation than cute.domain_offset for LMSD row views and produces faster code.
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(tensor.stride)
     assert len(flat_coord_i64) == len(flat_stride)
