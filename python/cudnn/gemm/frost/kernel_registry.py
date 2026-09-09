@@ -150,6 +150,10 @@ _BLOCK_SCALE_CASES = frozenset(
         _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
         _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
         _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+        _bs_key("fp4_e2m1", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
+        _bs_key("fp4_e2m1", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+        _bs_key("fp8_e4m3", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
+        _bs_key("fp8_e5m2", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
     }
 )
 
@@ -348,7 +352,7 @@ class KernelTemplate:
 
                 bs = chain.block_scale
                 assert bs is not None
-                data_elem_bits = 4 if bs.is_fp4 else 8
+                data_elem_bits = max(C.DTYPE_BITS[bs.a_dtype], C.DTYPE_BITS[bs.b_dtype])
                 cta_k_elems = config.cta_tile_k_bytes * 8 // data_elem_bits
                 validate_block_scale_config(config, bs.block_size, cta_k_elems)
             else:

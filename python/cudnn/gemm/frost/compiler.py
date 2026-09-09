@@ -1753,22 +1753,27 @@ def _render_block_scale_tile_constants_sm100(
 
     bs = chain.block_scale
     assert bs is not None
-    is_fp4 = bs.is_fp4
+    both_fp4 = bs.both_fp4
+    mixed_width = bs.mixed_width
     is_sm103 = cfg.pipeline == "sm103"
     # The 64-byte block-scale MMA. A pipeline no longer implies it: sm100
     # configs carry both widths and the ACTIVE arch decides (validate_block_scale_config_sm100).
     mma_k64 = cfg.mma_tile_k_bytes == 64
-    if is_sm103 and not is_fp4:
+    if is_sm103 and not both_fp4:
         raise NotImplementedError("the sm103 block-scale pipeline is fp4-only; " f"{bs.a_dtype} data with {bs.sf_dtype} scales runs the sm100 templates")
+    # Baseline SM100 mixed UTCQMMA uses K32 and the padded E2M1 SMEM format
+    # (16 FP4 lanes in 8 payload bytes + 8 padding bytes). Rubin's K64 form
+    # consumes native packed FP4 instead.
+    padded_fp4 = mixed_width and not mma_k64
 
-    # data_elem_bits / sA-sB bytes / B's TMA stride encoding all take one packed
-    # width, read off A alone — a mixed-width combo would mis-size B, not fail.
-    if DTYPE_BITS[bs.a_dtype] != DTYPE_BITS[bs.b_dtype]:
-        raise NotImplementedError(
-            f"block-scale A and B must share an element width; got {bs.a_dtype} " f"({DTYPE_BITS[bs.a_dtype]}b) x {bs.b_dtype} ({DTYPE_BITS[bs.b_dtype]}b)"
-        )
-
-    data_elem_bits = 4 if is_fp4 else 8
+    a_data_elem_bits = DTYPE_BITS[bs.a_dtype]
+    b_data_elem_bits = DTYPE_BITS[bs.b_dtype]
+    a_smem_elem_bits = 8 if padded_fp4 and a_data_elem_bits == 4 else a_data_elem_bits
+    b_smem_elem_bits = 8 if padded_fp4 and b_data_elem_bits == 4 else b_data_elem_bits
+    # K_BYTES names the byte width of the widest operand.  In a mixed UTCQMMA
+    # both sides span the same logical K, while the native packed FP4 SMEM row
+    # occupies half the bytes of its FP8 peer.
+    data_elem_bits = max(a_data_elem_bits, b_data_elem_bits)
     cta_k_elems = cfg.cta_tile_k_bytes * 8 // data_elem_bits
     validate_block_scale_config_sm100(cfg, bs.block_size, cta_k_elems)
 
@@ -1779,6 +1784,10 @@ def _render_block_scale_tile_constants_sm100(
     mma_inst_k_bytes = cfg.mma_tile_k_bytes
     mma_inst_k_elems = mma_inst_k_bytes * 8 // data_elem_bits
     num_kblocks = cta_k_elems // mma_inst_k_elems
+    a_cta_k_bytes = cta_k_elems * a_smem_elem_bits // 8
+    b_cta_k_bytes = cta_k_elems * b_smem_elem_bits // 8
+    a_mma_inst_k_bytes = mma_inst_k_elems * a_smem_elem_bits // 8
+    b_mma_inst_k_bytes = mma_inst_k_elems * b_smem_elem_bits // 8
 
     # --- Operand major (K- / M- / N-major) -----------------------------------
     # FP4 (nvfp4/mxfp4) is K-major only — sub-byte (Float4E2M1FNx2) packing
@@ -1786,17 +1795,19 @@ def _render_block_scale_tile_constants_sm100(
     # (A) / N-major (B). SF layout is unchanged regardless of data major.
     a_major = chain.matmul.a_major
     b_major = chain.matmul.b_major
-    if is_fp4 and (a_major != "k" or b_major != "k"):
-        raise ValueError(f"FP4 block-scaled inputs must be K-major (got A={a_major}-major, " f"B={b_major}-major); only mxfp8 supports M/N-major operands.")
+    if (a_data_elem_bits == 4 and a_major != "k") or (b_data_elem_bits == 4 and b_major != "k"):
+        raise ValueError(
+            f"FP4 block-scaled inputs must be K-major (got A={a_major}-major, " f"B={b_major}-major); only an MXFP8 side supports M/N-major layout."
+        )
     # Major-dependent SMEM descriptor params, mirroring _smem_desc_params.
-    ab_elem_bytes = 1  # FP8; FP4 rejected above for non-K
-    mn_group_elems = cfg.cta_tile_k_bytes // ab_elem_bytes
     cta_smem_m = cta_m
     cta_smem_n = cta_n // cta_group
 
-    def _bs_smem_desc_params(is_mn_major, mn_extent, name):
+    def _bs_smem_desc_params(is_mn_major, mn_extent, name, cta_k_bytes, inst_k_bytes, elem_bits):
         if not is_mn_major:
-            return 16, 8 * min(cfg.cta_tile_k_bytes, 128), mma_inst_k_bytes, 1
+            return 16, 8 * min(cta_k_bytes, 128), inst_k_bytes, 1
+        elem_bytes = elem_bits // 8
+        mn_group_elems = cta_k_bytes // elem_bytes
         if mn_extent < mn_group_elems or mn_extent % mn_group_elems != 0:
             raise ValueError(
                 f"block-scale config {cfg.name!r} cannot use {name}-major input: "
@@ -1805,20 +1816,22 @@ def _render_block_scale_tile_constants_sm100(
             )
         g = mn_group_elems
         return (
-            cfg.cta_tile_k_bytes * g,
-            8 * g * ab_elem_bytes,
-            mma_inst_k_bytes * g,
+            cta_k_bytes * g,
+            8 * g * elem_bytes,
+            inst_k_bytes * g,
             g,
         )
 
-    a_lbo, a_sbo, a_k_step, a_tma_group_elems = _bs_smem_desc_params(a_major == "m", cta_smem_m, "M")
-    b_lbo, b_sbo, b_k_step, b_tma_group_elems = _bs_smem_desc_params(b_major == "n", cta_smem_n, "N")
+    a_lbo, a_sbo, a_k_step, a_tma_group_elems = _bs_smem_desc_params(a_major == "m", cta_smem_m, "M", a_cta_k_bytes, a_mma_inst_k_bytes, a_data_elem_bits)
+    b_lbo, b_sbo, b_k_step, b_tma_group_elems = _bs_smem_desc_params(b_major == "n", cta_smem_n, "N", b_cta_k_bytes, b_mma_inst_k_bytes, b_data_elem_bits)
 
     # Packed (Float4E2M1FNx2 / Float8) element count per row for SMEM.
-    pack = 2 if is_fp4 else 1
-    ab_packed_per_row = cta_k_elems // pack  # ab_dtype elems per K-row
-    sA_packed_elems = cta_m * ab_packed_per_row
-    sB_packed_elems = (cta_n // cta_group) * ab_packed_per_row
+    a_pack = 8 // a_smem_elem_bits
+    b_pack = 8 // b_smem_elem_bits
+    a_packed_per_row = cta_k_elems // a_pack
+    b_packed_per_row = cta_k_elems // b_pack
+    sA_packed_elems = cta_m * a_packed_per_row
+    sB_packed_elems = (cta_n // cta_group) * b_packed_per_row
 
     # --- Scale factors --------------------------------------------------------
     sf_k = cta_k_elems // bs.block_size  # SF values along K per tile
@@ -1999,7 +2012,7 @@ def _render_block_scale_tile_constants_sm100(
             )
     else:
         # One stage covers a whole K-tile: packed data + SF per DISTINCT operand.
-        per_stage = na * (sA_packed_elems + sfa_smem_bytes) + nb * (sB_packed_elems + sfb_smem_bytes)
+        per_stage = na * (cta_m * a_cta_k_bytes + sfa_smem_bytes) + nb * ((cta_n // cta_group) * b_cta_k_bytes + sfb_smem_bytes)
         ab_stages = max(1, smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=ab_reserved))
 
     out_dt = chain.output_dtype
@@ -2009,16 +2022,37 @@ def _render_block_scale_tile_constants_sm100(
     # Instruction-descriptor operand dtype. On sm100 the fp4 MMA rides
     # Tcgen05MxInstrDesc with the E5M2 piggy-back; the K=64B fp4 MMA is an
     # OMMA and takes the real fp4 dtype. fp8 always uses its real dtype.
-    if is_fp4 and not mma_k64:
+    if both_fp4 and not mma_k64:
         idesc_a = idesc_b = "cutlass.Float8E5M2"
-    elif is_fp4:
+    elif both_fp4:
         idesc_a = idesc_b = "cutlass.Float4E2M1FN"
     else:
         idesc_a = DTYPE_TO_CUTLASS[bs.a_dtype]
         idesc_b = DTYPE_TO_CUTLASS[bs.b_dtype]
 
-    # FP4 needs explicit B4X16 (4-bit packed) TMA format; FP8 auto-derives.
-    ab_tma_format = "_tma.TensorMapDataFormat.B4X16" if is_fp4 else "None"
+    def _tma_side(dtype):
+        is_fp4 = dtype == "fp4_e2m1"
+        if is_fp4 and padded_fp4:
+            return DTYPE_TO_CUTLASS[dtype], "_tma.TensorMapDataFormat.B4X16_P64"
+        return (
+            "cutlass.Float4E2M1FN" if is_fp4 else DTYPE_TO_CUTLASS[dtype],
+            "_tma.TensorMapDataFormat.B4X16" if is_fp4 else "None",
+        )
+
+    a_tma_desc_dtype, a_tma_format = _tma_side(bs.a_dtype)
+    b_tma_desc_dtype, b_tma_format = _tma_side(bs.b_dtype)
+
+    def _swizzle_side(row_bytes):
+        if row_bytes % 128 == 0:
+            return "s128b", "SWIZZLE_128B"
+        if row_bytes % 64 == 0:
+            return "s64b", "SWIZZLE_64B"
+        if row_bytes % 32 == 0:
+            return "s32b", "SWIZZLE_32B"
+        return "none", "NONE"
+
+    a_tma_swizzle, a_smem_swizzle = _swizzle_side(a_cta_k_bytes)
+    b_tma_swizzle, b_smem_swizzle = _swizzle_side(b_cta_k_bytes)
 
     lines = [
         f"# Block-scale config: {cfg.name} data={bs.a_dtype}x{bs.b_dtype} sf={bs.sf_dtype} block={bs.block_size}",
@@ -2070,22 +2104,35 @@ def _render_block_scale_tile_constants_sm100(
         f"ab_empty_full_mask = {bs_ab_empty_full_mask}",
         "",
         f"# packed data SMEM",
-        # ab_dtype is the width BOTH operands are sized by (sA/sB bytes, B's TMA
-        # stride encoding, ab_stride_elems); it is only spelled as A's dtype.
-        f"ab_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",
+        f"a_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",
+        f"b_dtype = {DTYPE_TO_CUTLASS[bs.b_dtype]}",
+        f"a_smem_dtype = {'cutlass.Float4E2M1FN_unpack' if padded_fp4 and a_data_elem_bits == 4 else DTYPE_TO_CUTLASS[bs.a_dtype]}",
+        f"b_smem_dtype = {'cutlass.Float4E2M1FN_unpack' if padded_fp4 and b_data_elem_bits == 4 else DTYPE_TO_CUTLASS[bs.b_dtype]}",
+        f"ab_max_data_bits = {data_elem_bits}",
         # Fake-tensor dtypes: A and B may differ (mxfp8 e4m3xe5m2); NOT idesc_a/b (fp4 forces E5M2).
         f"a_fake_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",
         f"b_fake_dtype = {DTYPE_TO_CUTLASS[bs.b_dtype]}",
-        f"ab_packed_per_row = {ab_packed_per_row}",
+        f"a_packed_per_row = {a_packed_per_row}",
+        f"b_packed_per_row = {b_packed_per_row}",
         f"sA_packed_elems = {sA_packed_elems}",
         f"sB_packed_elems = {sB_packed_elems}",
-        # TMA-descriptor element dtype. FP4 uses the NATIVE 4-bit Float4E2M1FN
-        # (not the packed-pair Float4E2M1FNx2) so cute scales the descriptor by
-        # width=4 itself (no manual stride halving). FP8 same as ab_tma_dtype.
-        f"ab_tma_desc_dtype = {'cutlass.Float4E2M1FN' if is_fp4 else DTYPE_TO_CUTLASS[bs.a_dtype]}",
-        f"ab_tma_format = {ab_tma_format}",
-        "ab_tma_swizzle = _tma.TensorMapSwizzle.s128b",
-        "ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.SWIZZLE_128B",
+        # TMA completion counts GMEM payload bytes, not the padded SMEM
+        # footprint.  They differ for B4X16_P64: 128 logical FP4 values read
+        # 64 bytes from GMEM but occupy 128 bytes in SMEM.
+        f"sA_tma_bytes = {cta_m * cta_k_elems * a_data_elem_bits // 8}",
+        f"sB_tma_bytes = {(cta_n // cta_group) * cta_k_elems * b_data_elem_bits // 8}",
+        # Native FP4 TMA uses logical-width Float4E2M1FN + B4X16.  Padded FP4
+        # uses packed-pair Float4E2M1FNx2 + B4X16_P64, whose builder derives
+        # logical FP4 strides while expanding the SMEM destination. FP8 uses
+        # its ordinary data dtype/format.
+        f"a_tma_desc_dtype = {a_tma_desc_dtype}",
+        f"b_tma_desc_dtype = {b_tma_desc_dtype}",
+        f"a_tma_format = {a_tma_format}",
+        f"b_tma_format = {b_tma_format}",
+        f"a_tma_swizzle = _tma.TensorMapSwizzle.{a_tma_swizzle}",
+        f"b_tma_swizzle = _tma.TensorMapSwizzle.{b_tma_swizzle}",
+        f"a_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{a_smem_swizzle}",
+        f"b_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{b_smem_swizzle}",
         f"a_smem_desc_leading_byte_offset = {a_lbo}",
         f"a_smem_desc_stride_byte_offset = {a_sbo}",
         f"a_smem_k_step_bytes = {a_k_step}",
@@ -2147,7 +2194,7 @@ def _render_block_scale_tile_constants_sm100(
         # Byte step from one MMA M sub-block to the next inside the SMEM tile.
         # sm103 stages ONE 128-B K chunk per AB stage, not the whole K-tile, so
         # its per-M-row width is the chunk's, not cta_tile_k_bytes.
-        f"a_smem_m_step_bytes = {(cta_m // mma_size_m) * (128 if is_sm103 else cfg.cta_tile_k_bytes)}",
+        f"a_smem_m_step_bytes = {(cta_m // mma_size_m) * (128 if is_sm103 else a_cta_k_bytes)}",
         f"registers_per_atom = {_REGISTERS_PER_ATOM}",
         f"sf_atom_desc_stride = {sf_atom_desc_stride}",
         f"sf_block_desc_stride = {sf_block_desc_stride}",
@@ -2165,6 +2212,18 @@ def _render_block_scale_tile_constants_sm100(
         spi = scales_per_inst
         sf_groups = 4 if bs.block_size == 16 else 2  # 12 SFs/row per group either way
         lines += [
+            "",
+            # The sm103 template is homogeneous FP4-only and still uses the
+            # shared AB names.  Keep those aliases local to that pipeline; the
+            # sm100 templates intentionally consume the side-specific names so
+            # a mixed-width operand cannot accidentally inherit its peer's
+            # packing, descriptor dtype, or swizzle.
+            "ab_dtype = a_dtype",
+            "ab_packed_per_row = a_packed_per_row",
+            "ab_tma_desc_dtype = a_tma_desc_dtype",
+            "ab_tma_format = a_tma_format",
+            "ab_tma_swizzle = a_tma_swizzle",
+            "ab_smem_swizzle = a_smem_swizzle",
             "",
             f"# sm103 K=48B UTCOMMA pipeline: {num_kblocks} MMAs per K-tile; an AB " f"stage is one 128-B chunk (3 per K-tile); SF rides its own ring",
             f"chunks_per_ktile = {cfg.cta_tile_k_bytes // 128}",
@@ -2193,8 +2252,8 @@ def _render_block_scale_tile_constants_sm100(
     lines += [
         "",
         f"# block-scale MMA: {num_kblocks} MMAs per K-tile at mma_inst_k_bytes={cfg.mma_tile_k_bytes}",
-        f"idesc_is_omma = {is_fp4 and mma_k64}",
-        f"mma_k_dim_mode = {(2 if is_fp4 else 1) if mma_k64 else 0}",
+        f"idesc_is_omma = {both_fp4 and mma_k64}",
+        f"mma_k_dim_mode = {(2 if both_fp4 else 1) if mma_k64 else 0}",
     ]
     # MoE grouped block-scale: grouped persistent scheduler launches a FIXED
     # cluster count (≈ NUM_SMS / cluster_size); host grid and stride share it.
