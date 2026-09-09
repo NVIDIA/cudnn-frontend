@@ -711,7 +711,7 @@ separate from the cuDNN Graph API described above.
 
 ### HSTU Attention FE OSS API (SM100/SM103)
 
-The experimental [HSTU Attention API](../fe-oss-apis/attention/hstu.md)
+The experimental [HSTU Attention API](../fe-oss-apis/hstu/hstu_attention.md)
 provides packed-variable-length forward and backward CuTe DSL kernels for
 Blackwell SM100/SM103 GPUs. HSTU applies SiLU to scaled QK scores without
 softmax, supports its specialized mask modes, and exposes the sequence
@@ -793,7 +793,7 @@ o, lse = cudnn.sdpa_torch(q, k, v, is_causal=True, cu_seqlens_q=cu, cu_seqlens_k
 
 #### Requirements
 
-- `nvidia-cudnn-frontend[cutedsl]`, cuDNN backend ≥ 9.6 (THD token-major
+- `nvidia-cudnn-frontend`, cuDNN backend ≥ 9.6 (THD token-major
   stats), sm80+.
 
 Tests: [test/python/sdpa/test_torch_ops.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/test_torch_ops.py).

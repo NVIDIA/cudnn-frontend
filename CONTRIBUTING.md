@@ -16,7 +16,7 @@ cd cudnn-frontend
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j $(nproc)
 
-# Python package (editable). Add ".[cutedsl]" to work on the OSS CuTeDSL kernels.
+# Python package (editable). The OSS CuTeDSL kernel dependencies come with it.
 pip install -e .
 ```
 
@@ -29,7 +29,7 @@ See [AGENTS.md](AGENTS.md) for the full repo map, all build options, and per-dir
 cd test/python && pytest          # Python; defaults to the L0 smoke level
 ```
 
-Python tests need `pip install -e ".[cutedsl]"` plus `pytest pytest-xdist looseversion`, and a GPU. Details and conventions: [test/AGENTS.md](test/AGENTS.md).
+Python tests need `pip install -e .` plus `pytest pytest-xdist looseversion`, and a GPU. Details and conventions: [test/AGENTS.md](test/AGENTS.md).
 
 ## Code formatting
 

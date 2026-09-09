@@ -169,7 +169,13 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         sink_log2 = attn_sink[head_idx, (0, batch_idx)] * log2_e
         acc = Float32(0.0)
         while q_idx < problem_shape[0]:
-            p_sink = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx, batch_idx)])
+            p_sink = Float32(0.0)
+            if sink_log2 == Float32(float("inf")):
+                p_sink = Float32(1.0)
+            elif sink_log2 == Float32(float("-inf")):
+                p_sink = Float32(0.0)
+            else:
+                p_sink = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx, batch_idx)])
             acc += p_sink * sum_OdO[head_idx, (q_idx, batch_idx)]
             q_idx += self.dSink_num_threads
         acc = cute.arch.warp_reduction_sum(acc, threads_in_group=self.dSink_num_threads)

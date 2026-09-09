@@ -106,10 +106,10 @@ def _cutlass_dsl_version() -> tuple[int, int, int]:
 
 
 def _require_sage_fp8_cutedsl() -> None:
-    """Gate the new Sage FP8 kernels while preserving the package's 4.5 floor."""
+    """Gate the Sage FP8 kernels for environments that force a DSL below the package floor."""
     if _cutlass_dsl_version() < (4, 6, 1):
         raise RuntimeError(
-            "Sage FP8 block-sparse attention requires nvidia-cutlass-dsl>=4.6.1; " "the BF16/FP16 BSA paths remain available with the package minimum of 4.5.0"
+            "Sage FP8 block-sparse attention requires nvidia-cutlass-dsl>=4.6.1; " "the BF16/FP16 BSA paths remain available on older DSL builds"
         )
 
 
@@ -1354,8 +1354,6 @@ def bsa_attn_fwd_blk64_cutedsl(
     assert k_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim)
     assert v_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim_v)
     if is_sage_fp8:
-        assert batch_size == 1, "SM100 FP8 requires batch size 1"
-        assert num_head in (4, 8), "SM100 FP8 supports H=4 or H=8"
         assert seqlen_q % 64 == 0 and seqlen_k % 64 == 0, "SM100 FP8 requires Sq and Sk to be multiples of 64"
         q_scale = maybe_contiguous(q_scale)
         k_scale = maybe_contiguous(k_scale)

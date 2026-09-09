@@ -62,6 +62,7 @@ GPTOSS_CFG = Cfg(D_QK=64, D_V=64, TILE_KV=64, TILE_Q=128, WARPS_PER_SG=4)
 # DYNAMIC (``cute.sym_int``) there and are never part of any key (issue #604).
 # ---------------------------------------------------------------------------
 from cudnn.frost.tile_dsl.constants import SCHED_LPT as _SCHED_LPT  # noqa: E402
+from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2 as _SCHED_LPT_L2  # noqa: E402
 from cudnn.frost.tile_dsl.constants import SCHED_NATURAL as _SCHED_NATURAL  # noqa: E402
 
 
@@ -102,10 +103,13 @@ class TemplateParams:
     # Packed varlen (wrapper-only today; the engine row declares thd=False).
     thd_varlen: bool = False
     # Tile-scheduler policy in the SHARED frost vocabulary
-    # (tile_dsl.constants.SCHED_*): the bwd grid interprets NATURAL as its
-    # plain kv-major grid and LPT as the kv-major LPT remap (LPT_L2 is a
-    # forward-only policy today).
+    # (tile_dsl.constants.SCHED_*): NATURAL is the plain 3-D grid, LPT the
+    # kv-major remap over every (head, batch) at once, LPT_L2 the kv-major
+    # remap within L2-sized (batch, kv_head) groups so the resident CTAs keep
+    # re-touching the same Q / dO / dQ tiles (the causal default).
     sched_policy: int = _SCHED_NATURAL
+    # L2 budget (MiB) that sizes the LPT_L2 head groups (mirrors fwd).
+    sched_l2_mib: int = 16
 
 
 def validate_bwd_params(p: TemplateParams) -> None:
@@ -125,8 +129,10 @@ def validate_bwd_params(p: TemplateParams) -> None:
         raise ValueError(f"sm80 bwd: d_v ({p.d_v}) must be a multiple of 32 (do_dot warp reduce)")
     if p.has_rope and p.d_qk > 128:
         raise ValueError("sm80 bwd: RoPE requires d_qk <= 128 (the sDQ SMEM staging exceeds the A100 budget beyond that)")
-    if p.sched_policy not in (_SCHED_NATURAL, _SCHED_LPT):
-        raise ValueError(f"sm80 bwd: sched_policy must be SCHED_NATURAL or SCHED_LPT; got {p.sched_policy}")
+    if p.sched_policy not in (_SCHED_NATURAL, _SCHED_LPT, _SCHED_LPT_L2):
+        raise ValueError(f"sm80 bwd: sched_policy must be SCHED_NATURAL, SCHED_LPT or SCHED_LPT_L2; got {p.sched_policy}")
+    if p.sched_l2_mib <= 0:
+        raise ValueError(f"sm80 bwd: sched_l2_mib must be > 0; got {p.sched_l2_mib}")
     if p.deterministic and p.sched_policy != _SCHED_NATURAL:
         raise ValueError("sm80 bwd: deterministic dQ requires SCHED_NATURAL (the kv-ordered semaphore relay)")
     if p.causal_bottom_right and not (p.is_causal or p.has_swa):

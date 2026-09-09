@@ -86,6 +86,22 @@ kernel_cache_from_json_helper(std::shared_ptr<cudnn_frontend::KernelCache> kerne
     throw_if(err.is_bad(), err.code, err.get_message());
 }
 
+int64_t
+kernel_cache_revision_helper(std::shared_ptr<cudnn_frontend::KernelCache> const& kernel_cache) {
+    int64_t value = 0;
+    auto err      = kernel_cache->revision(value);
+    throw_if(err.is_bad(), err.code, err.get_message());
+    return value;
+}
+
+int64_t
+kernel_cache_size_helper(std::shared_ptr<cudnn_frontend::KernelCache> const& kernel_cache) {
+    int64_t value = 0;
+    auto err      = kernel_cache->size(value);
+    throw_if(err.is_bad(), err.code, err.get_message());
+    return value;
+}
+
 std::shared_ptr<cudnn_frontend::DeviceProperties>
 create_device_properties_helper(int32_t device_id) {
     auto device_properties = std::make_shared<cudnn_frontend::DeviceProperties>();
@@ -272,7 +288,34 @@ init_properties(py::module_& m) {
 
     py::class_<cudnn_frontend::KernelCache, std::shared_ptr<cudnn_frontend::KernelCache>>(m, "kernel_cache")
         .def("serialize", &kernel_cache_to_json_helper)
-        .def("deserialize", &kernel_cache_from_json_helper);
+        .def("deserialize", &kernel_cache_from_json_helper)
+        .def("revision",
+             &kernel_cache_revision_helper,
+             R"pbdoc(
+                Get a counter that shows if the contents of the kernel cache changed.
+
+                An insertion, a replacement, a removal, or an eviction each add one to the counter.
+                A lookup does not change the counter. Use this function, and not size(), to find if
+                the cache changed. cuDNN can replace data that is already in the cache, so size()
+                is not a reliable measure.
+
+                The counter is local to the process. serialize() does not put the counter in its
+                data, and deserialize() starts a new count.
+
+                Returns:
+                    int: The revision counter.
+             )pbdoc")
+        .def("size",
+             &kernel_cache_size_helper,
+             R"pbdoc(
+                Get the number of entries in the kernel cache.
+
+                Two different shapes can use the same entry, so this count does not track the
+                number of shapes that were built.
+
+                Returns:
+                    int: The number of entries.
+             )pbdoc");
     m.def("create_kernel_cache", &create_kernel_cache_helper);
 
     py::class_<cudnn_frontend::DeviceProperties, std::shared_ptr<cudnn_frontend::DeviceProperties>>(m,
