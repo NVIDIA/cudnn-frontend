@@ -4,20 +4,23 @@
 """Experimental, single-device SM100 blk128 JAX block sparse attention."""
 
 from dataclasses import dataclass
-from functools import lru_cache
-from importlib.metadata import version
-import re
+from functools import lru_cache, partial
 import math
 
 import jax
 import jax.numpy as jnp
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("JAX BSA")
+if requirement_error:
+    raise ImportError(requirement_error)
+if jax.version.__version_info__ < (0, 9, 1):
+    raise ImportError("JAX BSA requires jax >= 0.9.1")
+
+from cudnn.api_base import TupleDict
 from cudnn.jax import TensorSpec, call, zeros_init
 from .jax_kernels import Forward, Backward
-
-if tuple(map(int, re.findall(r"\d+", version("nvidia-cutlass-dsl"))[:2])) < (4, 7) or jax.version.__version_info__ < (0, 9, 1):
-    raise ImportError("JAX BSA requires nvidia-cutlass-dsl >= 4.7 and jax >= 0.9.1")
 
 
 @jax.tree_util.register_pytree_node_class
@@ -122,74 +125,47 @@ def configuration(q_tensor, k_tensor, v_tensor, indices, nums, count, block_size
     )
 
 
-class BlockSparseAttentionJax(APIBase):
-    """Internal cached call plan; XLA owns compilation, streams, and allocations."""
-
-    def __init__(self, config, backward=False):
-        super().__init__()
-        self.config = config
-        self.backward = backward
-
-    def check_support(self):
-        c = self.config
-        _, _, sq, d = c.bhsd
-        sk = c.kshape[2 if c.layout == "bhsd" else 1]
-        if c.layout not in ("bhsd", "bshd") or d not in (64, 128) or sq % 128 or sk % 128:
-            raise ValueError("Unsupported SM100 blk128 JAX plan")
-        self._is_supported = True
-        return True
-
-    def compile(self):
-        self.check_support()
-        c = self.config
-        b, h, sq, d = c.bhsd
-        sk = c.kshape[2 if c.layout == "bhsd" else 1]
-        groups = (sq // 128 + c.bucket_size - 1) // c.bucket_size
-        permute = (c.layout == "bhsd") if self.backward else (c.layout == "bshd")
-        tensor_spec = TensorSpec(mode=(0, 2, 1, 3) if permute else None)
-        desc = jax.ShapeDtypeStruct
-        qout, kout = desc(c.qshape, jnp.bfloat16), desc(c.kshape, jnp.bfloat16)
-        stats = desc((b, h, sq), jnp.float32)
-        if not self.backward:
-            kernel = Forward(d, c.count, c.variable, c.allow_empty, c.scale)
-            self._compiled_kernel = call(
-                kernel,
-                output_shape_dtype=(qout, stats),
-                input_spec=(tensor_spec,) * 3 + (None, None),
-                output_spec=(tensor_spec, None),
-                compile_options="--gpu-arch=sm_100a",
-            )
-        else:
-            kernel = Backward(d, c.count, c.variable, c.ishape[-1], c.bucket_size, groups, c.scale)
-            counts = desc((b, h, groups, sk // 128), jnp.int32)
-            offsets = desc((b, h, groups, sk // 128 + 1), jnp.int32)
-            edges = desc((b, h, sq // 128 * (c.ishape[-1] if c.variable else c.count)), jnp.int32)
-            dqacc = desc((b, h, sq * d), jnp.float32)
-            dkacc = desc((b, h, sk * d) if groups > 1 else (1,), jnp.float32)
-            outputs = (qout, kout, kout, counts, offsets, desc((b, h, groups), jnp.int32), offsets, counts, edges, stats, stats, dqacc, dkacc, dkacc)
-            init = {3: zeros_init}
-            if groups > 1:
-                init.update({12: zeros_init, 13: zeros_init})
-            self._compiled_kernel = call(
-                kernel,
-                output_shape_dtype=outputs,
-                input_spec=(tensor_spec,) * 5 + (None,) * 3,
-                output_spec=(tensor_spec,) * 3 + (None,) * 11,
-                initialized_outputs=init,
-                compile_options="--gpu-arch=sm_100a",
-            )
-
-    def execute(self, *arrays):
-        if self._compiled_kernel is None:
-            self.compile()
-        return self._compiled_kernel(*arrays)
+@lru_cache(maxsize=128)
+def forward_call(c):
+    b, h, sq, d = c.bhsd
+    spec = TensorSpec(mode=(0, 2, 1, 3) if c.layout == "bshd" else None)
+    return call(
+        Forward(d, c.count, c.variable, c.allow_empty, c.scale),
+        output_shape_dtype=(jax.ShapeDtypeStruct(c.qshape, jnp.bfloat16), jax.ShapeDtypeStruct((b, h, sq), jnp.float32)),
+        input_spec=(spec,) * 3 + (None, None),
+        output_spec=(spec, None),
+        compile_options="--gpu-arch=sm_100a",
+    )
 
 
 @lru_cache(maxsize=128)
-def call_plan(config, backward=False):
-    plan = BlockSparseAttentionJax(config, backward)
-    plan.compile()
-    return plan
+def backward_call(c):
+    b, h, sq, d = c.bhsd
+    sk = c.kshape[2 if c.layout == "bhsd" else 1]
+    groups = (sq // 128 + c.bucket_size - 1) // c.bucket_size
+    spec = TensorSpec(mode=(0, 2, 1, 3) if c.layout == "bhsd" else None)
+    desc = jax.ShapeDtypeStruct
+    qout, kout = desc(c.qshape, jnp.bfloat16), desc(c.kshape, jnp.bfloat16)
+    stats = desc((b, h, sq), jnp.float32)
+    counts = desc((b, h, groups, sk // 128), jnp.int32)
+    offsets = desc((b, h, groups, sk // 128 + 1), jnp.int32)
+    totals = desc((b, h, groups), jnp.int32)
+    edges = desc((b, h, sq // 128 * (c.ishape[-1] if c.variable else c.count)), jnp.int32)
+    dqacc = desc((b, h, sq * d), jnp.float32)
+    dkacc = desc((b, h, sk * d) if groups > 1 else (1,), jnp.float32)
+    # Output order matches Backward.__call__; counts and multi-bucket dK/dV accumulate.
+    outputs = (qout, kout, kout, counts, offsets, totals, offsets, counts, edges, stats, stats, dqacc, dkacc, dkacc)
+    initialized = {3: zeros_init}
+    if groups > 1:
+        initialized.update({12: zeros_init, 13: zeros_init})
+    return call(
+        Backward(d, c.count, c.variable, c.ishape[-1], c.bucket_size, groups, c.scale),
+        output_shape_dtype=outputs,
+        input_spec=(spec,) * 5 + (None,) * 3,
+        output_spec=(spec,) * 3 + (None,) * 11,
+        initialized_outputs=initialized,
+        compile_options="--gpu-arch=sm_100a",
+    )
 
 
 def block_sparse_attention_forward_jax(
@@ -221,7 +197,7 @@ def block_sparse_attention_forward_jax(
         allow_empty_block_nums,
         None,
     )
-    o_tensor, lse_tensor = call_plan(c).execute(
+    o_tensor, lse_tensor = forward_call(c)(
         q_tensor, k_tensor, v_tensor, q2k_block_index, q2k_block_index if q2k_block_nums is None else q2k_block_nums
     )
     return BSAResult(o_tensor=o_tensor, lse_tensor=lse_tensor)
@@ -263,33 +239,29 @@ def block_sparse_attention_backward_jax(
     require_array(do_tensor, "do_tensor", q_tensor.shape, jnp.bfloat16)
     require_array(o_tensor, "o_tensor", q_tensor.shape, jnp.bfloat16)
     require_array(lse_tensor, "lse_tensor", c.bhsd[:3], jnp.float32)
-    dq_tensor, dk_tensor, dv_tensor, *workspace = call_plan(c, True).execute(
+    dq_tensor, dk_tensor, dv_tensor, *workspace = backward_call(c)(
         q_tensor, k_tensor, v_tensor, do_tensor, o_tensor, lse_tensor, q2k_block_index, q2k_block_index if q2k_block_nums is None else q2k_block_nums
     )
     return BSAResult(dq_tensor=dq_tensor, dk_tensor=dk_tensor, dv_tensor=dv_tensor)
 
 
-@lru_cache(maxsize=128)
-def differentiable_attention(config):
-    c = config
+@partial(jax.custom_vjp, nondiff_argnums=(0,))
+def attention(c, q, k, v, indices, nums):
+    return forward_call(c)(q, k, v, indices, nums)[0]
 
-    @jax.custom_vjp
-    def attention(q_tensor, k_tensor, v_tensor, indices, nums):
-        return call_plan(c).execute(q_tensor, k_tensor, v_tensor, indices, nums)[0]
 
-    def forward(q_tensor, k_tensor, v_tensor, indices, nums):
-        o_tensor, lse_tensor = call_plan(c).execute(q_tensor, k_tensor, v_tensor, indices, nums)
-        return o_tensor, (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, indices, nums)
+def attention_forward(c, q, k, v, indices, nums):
+    o, lse = forward_call(c)(q, k, v, indices, nums)
+    return o, (q, k, v, o, lse, indices, nums)
 
-    def backward(residual, do_tensor):
-        q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, indices, nums = residual
-        dq_tensor, dk_tensor, dv_tensor, *workspace = call_plan(c, True).execute(
-            q_tensor, k_tensor, v_tensor, do_tensor, o_tensor, lse_tensor, indices, nums
-        )
-        return dq_tensor, dk_tensor, dv_tensor, None, None
 
-    attention.defvjp(forward, backward)
-    return attention
+def attention_backward(c, residual, do):
+    q, k, v, o, lse, indices, nums = residual
+    dq, dk, dv, *workspace = backward_call(c)(q, k, v, do, o, lse, indices, nums)
+    return dq, dk, dv, None, None
+
+
+attention.defvjp(attention_forward, attention_backward)
 
 
 def block_sparse_attention_jax(
@@ -322,4 +294,4 @@ def block_sparse_attention_jax(
         allow_empty_block_nums,
         bucket_size_blocks,
     )
-    return differentiable_attention(c)(q_tensor, k_tensor, v_tensor, q2k_block_index, q2k_block_index if q2k_block_nums is None else q2k_block_nums)
+    return attention(c, q_tensor, k_tensor, v_tensor, q2k_block_index, q2k_block_index if q2k_block_nums is None else q2k_block_nums)
