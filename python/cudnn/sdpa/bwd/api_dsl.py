@@ -2595,8 +2595,8 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         # both artifacts while the plan is being prepared, on the graph's
         # declared device, so replay remains allocation/JIT-free (Rule 4).
         with torch.cuda.device(self.q_desc.device):
-            mm_lo.compile()
-            mm_hi.compile()
+            mm_lo.compile(device=self.q_desc.device)
+            mm_hi.compile(device=self.q_desc.device)
         stage2 = stage2_mod.compile(
             b=self.batch_size,
             qh=self.h_q,
