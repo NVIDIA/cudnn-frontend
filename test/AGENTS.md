@@ -52,6 +52,15 @@ pytest fe_api/gemm/          # OSS kernel tests
 - **Seed before you allocate.** `torch.manual_seed()` after constructing the inputs seeds nothing that matters. Two runs meant to be compared then differ by data, and the assertion fails (or worse, passes) for a reason unrelated to what is under test — if two runs must be comparable, build the inputs once and reuse them.
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
 
+### Gate correctness on capability, not benchmark policy
+
+GPU correctness tests must check the kernel's actual architecture, resource,
+and provider requirements, not a product-name string or a preferred benchmark
+SM count. A requirement to collect performance numbers on a particular GPU is
+an agent/reporting instruction, not a test skip condition. When changing a gate,
+cover both a supported architecture with a different product name and genuinely
+unsupported architectures.
+
 ### Confirm you are testing the code you edited
 
 `pip install -e .` does **not** put the package on `sys.path`. It installs a

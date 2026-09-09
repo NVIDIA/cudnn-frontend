@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Contract and B200 integration tests for the optional FlashMLA bridge."""
+"""Contract and SM100 integration tests for the optional FlashMLA bridge."""
 
 from __future__ import annotations
 
@@ -415,15 +415,15 @@ def test_flashmla_training_trusted_compact_metadata_requires_bool():
         )
 
 
-def _require_exact_b200():
+def _require_sm100():
     if not torch.cuda.is_available():
-        pytest.skip("exact NVIDIA B200 required")
-    if torch.cuda.get_device_capability() != (10, 0) or torch.cuda.get_device_name() != "NVIDIA B200":
-        pytest.skip("exact NVIDIA B200 required")
+        pytest.skip("CUDA GPU required")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 (compute capability 10.0) required")
 
 
-def _require_b200_flashmla():
-    _require_exact_b200()
+def _require_sm100_flashmla():
+    _require_sm100()
     try:
         return bridge._resolve_flashmla_sparse_fwd()
     except bridge.SparseAttentionBackendUnavailableError as exc:
@@ -431,11 +431,35 @@ def _require_b200_flashmla():
 
 
 @pytest.mark.L0
+def test_correctness_gate_does_not_require_a_gpu_product_name(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: pytest.fail("correctness must not depend on a GPU product name"))
+    _require_sm100()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (10, 3), (12, 0)])
+def test_correctness_gate_still_requires_supported_architecture(monkeypatch, capability):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    with pytest.raises(pytest.skip.Exception, match="SM100"):
+        _require_sm100()
+
+
+@pytest.mark.L0
+def test_correctness_gate_requires_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(pytest.skip.Exception, match="CUDA GPU required"):
+        _require_sm100()
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("topk", [1, 4, 128, 129, 257, 1152])
 def test_sparse_attention_score_recompute_deepseek_v4_topk_contract(monkeypatch, topk):
     """Preserve semantic outputs across the DeepSeek-V4 Top-K envelope."""
 
-    _require_exact_b200()
+    _require_sm100()
     monkeypatch.setattr(bridge, "import_module", lambda _name: pytest.fail("score recompute must not resolve or launch a forward provider"))
 
     device = torch.device("cuda")
@@ -462,7 +486,7 @@ def test_sparse_attention_score_recompute_deepseek_v4_topk_contract(monkeypatch,
 def test_sparse_attention_score_recompute_resets_partial_tmem_ring():
     """A partial first TMEM-ring traversal must not reuse prior-launch scores."""
 
-    _require_exact_b200()
+    _require_sm100()
     torch.manual_seed(20260907)
     device = torch.device("cuda")
     s_q, s_kv, heads, head_dim, topk = 1, 1152, 128, 512, 1152
@@ -500,7 +524,7 @@ def test_sparse_attention_score_recompute_resets_partial_tmem_ring():
     ],
 )
 def test_flashmla_bridge_forward_matches_reference(heads, head_dim, topk, s_kv):
-    _require_b200_flashmla()
+    _require_sm100_flashmla()
     torch.manual_seed(410)
     device = torch.device("cuda")
     s_q = 4
@@ -533,7 +557,7 @@ def test_flashmla_bridge_forward_matches_reference(heads, head_dim, topk, s_kv):
 def test_flashmla_bridge_masks_inactive_valid_index_before_provider():
     """An ignored valid index must not pull a NaN KV row into the output."""
 
-    _require_b200_flashmla()
+    _require_sm100_flashmla()
     torch.manual_seed(413)
     device = torch.device("cuda")
     s_q, s_kv, heads, head_dim, topk = 1, 65, 64, 512, 64
@@ -556,7 +580,7 @@ def test_flashmla_bridge_masks_inactive_valid_index_before_provider():
 
 @pytest.mark.L1
 def test_flashmla_cudnn_training_and_score_recompute_match_references():
-    _require_b200_flashmla()
+    _require_sm100_flashmla()
     torch.manual_seed(411)
     device = torch.device("cuda")
     s_q, s_kv, heads, head_dim, topk = 4, 96, 32, 576, 65
@@ -630,9 +654,9 @@ def test_flashmla_cudnn_training_and_score_recompute_match_references():
 
 @pytest.mark.L2
 def test_flashmla_cudnn_deepseek_v32_h128_d576_k2048_contract():
-    """Exercise the production DeepSeek V3.2 H/D/Top-K contract on B200."""
+    """Exercise the production DeepSeek V3.2 H/D/Top-K contract on SM100."""
 
-    _require_b200_flashmla()
+    _require_sm100_flashmla()
     torch.manual_seed(412)
     device = torch.device("cuda")
     s_q, s_kv, heads, head_dim, topk = 1, 2304, 128, 576, 2048
