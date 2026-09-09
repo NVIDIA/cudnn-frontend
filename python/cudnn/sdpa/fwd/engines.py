@@ -654,11 +654,12 @@ def _sm107_spec() -> EngineSpec:
     Deliberately NOT claimed, each because the kernels lack the machinery
     rather than because it went untested:
 
-    - ``thd``: SERVED at d128 as of 2026-09-09 -- that kernel's setup-kernel
-      call site was ported to the 14-arg helper and its metadata to the 4B+4
-      layout the SHARED decode already read (the two had disagreed, which is
-      why ``compile()`` used to raise).  The wider f16 flavors still speak the
-      pre-upstream 7-arg contract, so ``thd_d_shapes`` keeps them out.
+    - ``thd``: SERVED on EVERY f16 flavor as of 2026-09-09.  All four bodies were
+      moved onto the FROST THD contract -- the 14-arg setup helper, the 4B+4
+      metadata the SHARED decode already read (the two had disagreed, which is
+      why ``compile()`` used to raise), the persistent claim-counter scheduler,
+      the dead-unit O-store guard, and the packed-total-clamped runtime K/V
+      descriptors that keep a NaN capacity tail out of BMM2.
     - ``split_kv_supported``: these kernels wire no SplitHelpers.
     - ``pack_gqas``: no PackGQA path.
     - ``padded_stats`` / ``dense_seq_q_trim``: both need the per-batch
@@ -694,9 +695,10 @@ def _sm107_spec() -> EngineSpec:
             # MASK_FLAGS == 0 the kernel's kv_right is a floor division, so an
             # un-synthesized ragged S_kv would silently drop the tail tile.
             skv_tail_via_padding=True,
-            # THD at d128 only: SM107_F16_THD_SHAPES is the single definition,
-            # shared with the standalone adapter's gate so the two cannot drift
-            # (contract rule 8b').
+            # SM107_F16_THD_SHAPES is the single definition, shared with the
+            # standalone adapter's gate so the two cannot drift (rule 8b').  It
+            # now covers every f16 flavor; keeping it a named constant rather
+            # than `True` is what makes a future partial arch line expressible.
             thd=True,
             thd_d_shapes=SM107_F16_THD_SHAPES,
             cu_seq_len=True,

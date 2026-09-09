@@ -284,27 +284,26 @@ def test_sm107_f16_serves_d192_on_its_native_kernel():
     assert engines.mismatch(caps, _f16_facts(d_qk=192, d_v=128)) is None
 
 
-def test_sm107_f16_thd_is_served_at_d128_and_declined_above_it():
-    """INVERTED 2026-09-09: the d128 f16 setup-kernel call site was ported to
-    the 14-arg helper and its metadata to the 4B+4 layout, so THD is SERVED
-    there.  It is still declined at every wider f16 flavor, whose call sites
-    remain on the pre-upstream 7-arg contract.
+def test_sm107_f16_thd_is_served_on_every_flavor():
+    """FULLY INVERTED 2026-09-09: every f16 flavor now serves THD.
 
-    The decline half matters more than the accept half: those bodies allocate
-    3B+2 while the SHARED decode (_common_blackwell._thd_decode) reads a
-    batch_remap at 3*n_batch+2, so serving them would not raise -- it would
-    read the remap out of the metadata's tail and hand tiles the WRONG
-    sequence.  Asserted on real facts objects, not the dataclass field, so it
-    walks the path mismatch() actually takes."""
+    The row must cover exactly `d_shapes` -- no more (a shape with no kernel
+    would KeyError inside module loading) and no less (a served shape left out
+    is a capability the engine silently declines).  Asserted on real facts
+    objects, not the dataclass field, so it walks the path mismatch() takes.
+
+    This keeps `thd_d_shapes` as a named SET rather than collapsing to `True`,
+    because that is what makes the next partial arch line expressible without
+    reintroducing a boolean that cannot describe it."""
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES
 
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert caps.thd is True
     assert caps.thd_d_shapes is SM107_F16_THD_SHAPES
-    assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=128, d_v=128)) is None
-    for d_qk, d_v in sorted(caps.d_shapes - SM107_F16_THD_SHAPES):
-        assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is not None, (d_qk, d_v)
+    assert SM107_F16_THD_SHAPES == caps.d_shapes, "every served f16 shape must serve THD, and no unserved one may"
+    for d_qk, d_v in sorted(caps.d_shapes):
+        assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
 
 
 def test_sm107_f16_declines_split_kv_and_pack_gqa():

@@ -135,13 +135,13 @@ SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128)})
 # setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4
 # metadata the shared decode reads).  Keyed by the `flavor` string
 # `_validate_params` already receives, so adding a ported flavor is one entry.
-_F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128"})
+_F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512"})
 
 # Head-dim shapes whose Rubin f16/bf16 kernel carries the THD/varlen leg -- the
 # same one-definition-two-consumers arrangement as SM107_FP8_THD_SHAPES above
 # (engine row + standalone adapter gate; contract rule 8b').  Must stay in step
 # with _F16_THD_FLAVORS, which is the same fact keyed by config-flavor name.
-SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128)})
+SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 
 
 # ---------------------------------------------------------------------------

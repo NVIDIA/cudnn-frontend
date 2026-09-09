@@ -252,8 +252,8 @@ red (2026-09-08).
 | **Layout** | | |  | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| THD / ragged (packed varlen) | ❌ⁱⁱ | fp8 onlyᵛ | fp8 onlyʸ | ❌ᵛ | ❌ᵛ | ❌ |
-| `cu_seq_len_q/kv` prefix sums (THD only) | ❌ⁱⁱ | fp8 only | fp8 only | ❌ | ❌ | ❌ |
+| THD / ragged (packed varlen) | ✅ᶻ | ✅ᶻ | ✅ᶻ | f16 onlyᶻ | f16 onlyᶻ | ❌ |
+| `cu_seq_len_q/kv` prefix sums (THD only) | ✅ᶻ | ✅ᶻ | ✅ᶻ | f16 onlyᶻ | f16 onlyᶻ | ❌ |
 | **Masks / features** | | |  | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -289,6 +289,19 @@ a 7-arg contract against a 14-arg helper, and the metadata layout differs
 ᵛⁱ Needs the per-batch `seq_len_q` LSE trim, which the f16 Rubin kernels do not
 carry (`padded_stats=False`). KV-side padding itself is served.
 ᵛⁱⁱ The f16 Rubin kernels wire no SplitHelpers.
+
+ᶻ **f16/bf16 THD is served on EVERY flavor** as of 2026-09-09 (d128, d192×d128,
+d256, d512), and per-tensor FP8 THD at d128 and d192×d128. The f16 bodies were
+moved onto the FROST THD contract: the 14-arg setup helper, the 4B+4 metadata
+the shared decode already read, the persistent claim-counter scheduler, the
+dead-unit O-store guard, the packed-total-clamped runtime K/V descriptors (a NaN
+capacity tail otherwise wipes a tile through BMM2), the token-major Stats arm,
+and per-sequence Q lengths for the bottom-right diagonal. Validated on
+`w2u1g-lc-0030`: the whole SM100 f16 THD suite — **215 passed** where it
+previously skipped entirely — plus a per-flavor attribution sweep (B=1/2/3 ×
+none/causal/bottom-right, 9/9 per flavor). **Still declined: MXFP8 THD
+line-wide, and FP8 THD at d256/d512** — those bodies keep the pre-upstream
+7-arg setup call, and the rows decline them rather than half-serving.
 
 ʸ Per-tensor FP8 **THD** at d192×d128 came free with the DSv3 port and is
 served as of 2026-09-09: that kernel *is* the shipped d128 FP8 body (only the
