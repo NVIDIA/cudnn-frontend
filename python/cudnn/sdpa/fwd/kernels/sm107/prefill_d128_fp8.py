@@ -377,6 +377,59 @@ _ONES_ROWS = 16 // CFG.CTA_MMA
 _ONES_ROW_BYTES = CFG.TILE_N * CFG.BPE
 if _ONES_ROW_BYTES not in (128, 64, 32):
     raise ValueError(f"prefill_d128_fp8_sm107: ones-tile row ({_ONES_ROW_BYTES} B) is not a legal tcgen05 swizzle atom (128/64/32)")
+# ...and the FILL must cover the whole tile.  The loop below stores 512 B per
+# iteration (32 lanes x 16 B) and trip-counts as a floor division, so a tile
+# smaller than 512 B would be left UNWRITTEN -- an all-ones operand that is not
+# all ones, i.e. silently wrong row sums.  Always true today (TILE_N=128, BPE=1
+# -> 1024 B at cga2), but the atom check above alone would wave through a 32 B
+# row that the loop cannot fill.
+if (_ONES_ROWS * _ONES_ROW_BYTES) % 512 != 0:
+    raise ValueError(
+        f"prefill_d128_fp8_sm107: ones tile is {_ONES_ROWS} x {_ONES_ROW_BYTES} B = "
+        f"{_ONES_ROWS * _ONES_ROW_BYTES} B, not a multiple of the 512 B the fill loop stores per iteration"
+    )
+
+
+# --- Descriptor-window guard for the ones tile (DERIVED, not asserted) ------
+# sOnes is allocated LAST and is read as an MMA operand through
+# `SmemTile.desc()`, so its byte OFFSET -- not just its size -- has to stay
+# inside the window this module's DESC_VERSION can address.  A version-0
+# tcgen05 descriptor carries a 14-bit `start_address` (a 256 KiB window) while
+# Rubin's per-CTA budget is 327 KiB, so a tile at or past 256 KiB wraps to
+# offset 0 and the Sigma row-sum MMA multiplies whatever sits at the bottom of
+# SMEM -- here that is sQ, so `total_sum` silently becomes a function of Q.
+# No crash, no NaN: just wrong LSE and wrong O on every row
+# (rules/mma-tma-matrix.md S6).
+#
+# Compute the offset the way the allocator does (declaration order, each slab
+# 1024-B aligned) rather than restating a number in prose.  A prose figure is
+# exactly what failed here: the first version of this file's docstring argued
+# cga1 was safe at "208 KiB", which was Q+K+V with sO and sOnes left out -- at
+# cga1 with a HALF-PRECISION O the ring halves do not apply and sOnes really
+# starts at 272 KiB.  Derived, this guard covers every future config too.
+def _smem_offset_of_ones() -> int:
+    off = 0
+    for nbytes in (
+        CFG.TILES_Q * CFG.TILE_M * CFG.TILE_K * CFG.BPE,  # sQ
+        CFG.STAGES_KV * (CFG.TILE_N * CFG.TILE_K // CFG.CTA_MMA) * CFG.BPE,  # sK
+        CFG.STAGES_KV * (CFG.TILE_O * CFG.TILE_N // CFG.CTA_MMA) * CFG.BPE,  # sV
+        CFG.TILES_Q * CFG.TILE_M * CFG.TILE_O * CFG.BPE_O,  # sO
+    ):
+        off = ((off + 1023) // 1024) * 1024 + nbytes
+    return ((off + 1023) // 1024) * 1024
+
+
+_ONES_SMEM_OFFSET = _smem_offset_of_ones()
+_DESC_V0_WINDOW = 256 * 1024
+if DESC_VERSION == 0 and _ONES_SMEM_OFFSET >= _DESC_V0_WINDOW:
+    raise ValueError(
+        f"prefill_d128_fp8_sm107: the ones tile starts at {_ONES_SMEM_OFFSET} B, at or past the "
+        f"{_DESC_V0_WINDOW} B version-0 tcgen05 descriptor window (CTA_MMA={CFG.CTA_MMA}, "
+        f"BPE_O={CFG.BPE_O}); its descriptor would wrap to offset 0 and the row-sum MMA "
+        f"would read Q as its all-ones operand (silently wrong LSE and O). "
+        f"Serve this config at CTA_MMA=2, or move the kernel to DESC_VERSION=1 and "
+        f"re-validate -- version 1 is NOT a transparent widening (rules/mma-tma-matrix.md S6)."
+    )
 
 
 # === Kernel ===
@@ -537,6 +590,13 @@ def _kernel(
             _ones_ptr = Pointer(sOnes_raw.subview(tidx * cutlass.Int32(16) + cutlass.Int32(_i * 512)).data_ptr(), dtype=cutlass.Int32)
             _ones_ptr.store(_ones_vec, alignment=16)
 
+    # The ones tile is written by plain SMEM stores above and then read as a
+    # tcgen05 MMA operand (desc_ones) -- a generic-proxy -> async-proxy
+    # boundary, which needs a REAL fence.  fence_mbarrier_init orders mbarrier
+    # init and barrier_cta_sync is a CTA barrier; neither publishes the stores
+    # to the async proxy (frost-tile-dsl.md S1).  Without it the first launch
+    # can feed the row-sum MMA a partially-visible tile and pass on the second.
+    nvvm.fence_proxy("async.shared", space="cta")
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
 

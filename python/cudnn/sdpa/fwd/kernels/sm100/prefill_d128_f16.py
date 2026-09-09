@@ -50,7 +50,7 @@ FP8 (E4M3 / E5M2, incl. output-dtype override) lives in the sibling
 KV split (``CFG.SPLIT_KV > 1``): each chunk runs the UNCHANGED mainloop and
 epilogue, writing its partial O and LSE into a split-major workspace at batch
 coord ``b + s*B`` -- so the O TMA descriptor is untouched, only the batch coord
-shifts.  ``split_combine_sm100.py`` reduces over the split axis.
+shifts.  ``sm100/split_combine.py`` reduces over the split axis.
 
 KV split composes with the cluster width, and the pair is what closes the gap
 to cuDNN's own SM100 prefill split-K.  cga1 halves both the wasted MMA work at

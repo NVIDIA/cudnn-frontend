@@ -471,3 +471,51 @@ def _quant_facts(**kw):
     base.update(kw)
     base["is_mxfp8" if is_mx else "is_fp8"] = True
     return ga.SdpaGraphFacts(**base)
+
+
+def test_sm107_ones_tile_stays_inside_the_v0_descriptor_window():
+    """The row-sum "ones" tile is allocated LAST and read as an MMA operand, so
+    its OFFSET -- not its size -- has to stay under 256 KiB while DESC_VERSION
+    is 0.  At cga1 the K/V rings are not halved, and with a HALF-PRECISION O
+    the d192 tile lands at 272 KiB: its version-0 descriptor wraps to offset 0
+    and the Sigma MMA multiplies sQ instead of all-ones, so `total_sum` becomes
+    a function of Q -- wrong LSE and wrong O on every row, no crash.
+
+    Caught in review, not by a test, because the kernel docstring ARGUED cga1
+    was safe from a hand-summed figure that omitted two buffers.  The guard is
+    therefore derived from the allocator's own constants; this pins that it
+    fires exactly on the unsafe config and on nothing else, so the safe ones
+    cannot be walled off by a future over-broad tightening."""
+    import pytest as _pytest
+
+    _E4M3_OUT, _BF16 = 0, 2
+    safe = [
+        ("d128", (128, 128), 1, _E4M3_OUT),
+        ("d128", (128, 128), 1, _BF16),
+        ("d128", (128, 128), 2, _BF16),
+        ("d192", (192, 128), 1, _E4M3_OUT),
+        ("d192", (192, 128), 2, _BF16),
+    ]
+    for _id, flavor, cta, dto in safe:
+        mod = _load(flavor, rubin=True, fp8=True, pertensor=True, dtype_qkv=_E4M3, dtype_o=dto, cta_mma=cta)
+        assert mod._ONES_SMEM_OFFSET < 256 * 1024, (_id, cta, dto, mod._ONES_SMEM_OFFSET)
+
+    # The one unsafe combination: d192 x cga1 x half-precision O.
+    with _pytest.raises(ValueError, match="version-0 tcgen05 descriptor window"):
+        _load((192, 128), rubin=True, fp8=True, pertensor=True, dtype_qkv=_E4M3, dtype_o=_BF16, cta_mma=1)
+
+    # ...and the STANDALONE wrapper must decline it too, rather than letting a
+    # bare ValueError escape from compile() (contract rule 8b' -- the kernel
+    # raise and the wrapper gate are two enforcement points for one fact).
+    # Assert the wrapper's OWN decision function, so this holds from any host:
+    # the Rubin arm is unreachable on a non-cc-10.7 box, which is exactly the
+    # kind of branch that rots untested.
+    from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
+
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7)) == (2,)
+    # ...and only there: Blackwell keeps both widths, and the f16 Rubin path is
+    # not narrowed (it has no quantized SF or ones tile to push over the line).
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 0)) == (1, 2)
+    assert supported_cgas_for((192, 128), fp8=False, device_cc=(10, 7)) == (1, 2)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7)) == (2,)
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7)) == (1,)

@@ -44,7 +44,6 @@ _D128_ARCH = "sm107" if _SM == 107 else "sm100"
 # and THD in its d128 flavor only (pack_gqa_d_shapes / thd_d_shapes), so those
 # two families keep a skip that names the capability it is waiting on.
 _skip_on_rubin_d192_packgqa = pytest.mark.skipif(_SM == 107, reason="Rubin wires PackGQA in the d128 FP8 flavor only (pack_gqa_d_shapes={(128,128)})")
-_skip_on_rubin_d192_thd = pytest.mark.skipif(_SM == 107, reason="Rubin wires THD in the d128 FP8 flavor only (thd_d_shapes={(128,128)})")
 # Rubin serves per-tensor FP8 at EVERY native flavor -- d128/d192x128/d256/d512
 # -- so no flavor gate is needed for the dense cases at all any more.  (These used to be
 # skipif(False) no-op markers -- a marker that reads like a live gate and never
@@ -840,6 +839,29 @@ def test_fp8_gqa(in_key):
     scale = 1.0 / math.sqrt(128)
     out, o_ref, a_o, a_o_ref = _run(2, 8, 2, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_d128", "d256", "d512"])
+@pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (8, 1)], ids=["g2", "g4", "mqa"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_dense_gqa_ratios(d_qk, d_v, h_q, h_kv):
+    """DENSE GQA/MQA across every ratio and every native shape.
+
+    The rows claim GQA/MQA unconditionally, but the dense coverage was one
+    ratio (8:2) at one shape, and h_kv=1 -- MQA, where EVERY query head shares
+    a single KV head -- appeared only inside PackGQA tests, which the Rubin
+    line declines at d192/d256/d512.  So the widest head-sharing case went
+    untested on exactly the shapes this arch serves.
+
+    Dense GQA is NATIVE here: `qh_per_kh` is threaded to the kernel, which maps
+    a Q head to its KV head.  Nothing expands K/V (graph_analyzer's
+    expand_gqa_heads is dead code), so a wrong mapping is a silent wrong
+    answer, not a slow one -- MQA is the case where an off-by-one in that
+    mapping still lands on a VALID head and therefore cannot fault."""
+    scale = 1.0 / math.sqrt(d_qk)
+    out, o_ref, a_o, a_o_ref = _run(2, h_q, h_kv, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), d_qk=d_qk, d_v=d_v)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
 # --- PackGQA: TILE_M/G tokens x G query heads per tile -------

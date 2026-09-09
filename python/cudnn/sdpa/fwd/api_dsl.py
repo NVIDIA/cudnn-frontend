@@ -343,6 +343,38 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
     raise ValueError(f"Frost SM100 DSL SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); available envelopes: {sorted(pool)}.")
 
 
+def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int]) -> tuple[int, ...]:
+    """CGA widths the STANDALONE adapter serves for a kernel flavor.
+
+    A module-level function, not an inline expression in ``check_support``, so a
+    test can assert it without a live device of the right arch -- the Rubin arm
+    below is unreachable from any host that is not cc 10.7, which is exactly the
+    kind of branch that rots untested.
+
+    d192x128 accepts both widths on Blackwell.  On the RUBIN QUANTIZED line it
+    is cga2 ONLY, and that is a descriptor constraint rather than a tuning
+    choice: at cga1 the K/V rings are not halved, which pushes the MXFP8
+    scale-factor tiles (and, with a half-precision O, the FP8 kernel's row-sum
+    "ones" tile) at or past the 256 KiB version-0 tcgen05 descriptor window.  A
+    wrapped descriptor reads Q data as its operand: silently wrong LSE/O, no
+    crash (rules/mma-tma-matrix.md S6).
+
+    Both kernels also raise at import if handed cga1, but a kernel-side raise
+    alone is not enough -- ``check_support()`` would still return True and the
+    failure would escape as a bare ValueError from ``compile()``, i.e. a plan
+    that clears eligibility and dies in the lowering (contract rule 8b').  This
+    is the wrapper twin of the engine rows leaving (192, 128) on their default
+    ``cgas={2}``.  Keep the three in lockstep.
+    """
+    if device_cc == (10, 7) and fp8 and flavor == (192, 128):
+        return (2,)
+    if flavor == (192, 128):
+        return (1, 2)
+    if fp8 and flavor == (256, 256):
+        return (1,)
+    return (2,)
+
+
 def _load_kernel_template(filename: str, params: Hashable, tag: str):
     """Load one uniquely named kernel module per template parameter set."""
 
@@ -1151,11 +1183,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
             )
-        supported_cgas = (1, 2) if self.flavor == (192, 128) else (1,) if self._fp8 and self.flavor == (256, 256) else (2,)
-        self._value_error_if(
-            self.cga is not None and self.cga not in supported_cgas,
-            f"SM100 DSL SDPA only supports cga in {supported_cgas}",
-        )
+        supported_cgas = supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc)
         self._value_error_if(
             self.flavor == (192, 128) and self.split_kv > 1 and self.cga == 1,
             "D192 split_kv > 1 is validated only with cga=2",
@@ -3929,9 +3957,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     are deliberately NOT served: the capability row declines such graphs and
     the backend takes them.
 
-    Known deviations, pre-existing and tracked rather than introduced here:
-    dense GQA expands K/V heads adapter-side until the kernels' native dense
-    GQA path is qualified (see ``graph_analyzer.expand_gqa_heads``); an
+    Known deviations, pre-existing and tracked rather than introduced here: an
     off-flavor head dim pads V (and O, via a scratch) host-side; sink logits
     are rescaled to log2 units with one (H,)-element multiply per execute.
     """

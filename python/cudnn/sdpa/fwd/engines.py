@@ -911,8 +911,12 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             split_kv_supported=True,
             split_d_shapes=(frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256)})),
             pack_gqas=frozenset({False, True}),
-            # SM107: only the shipped d128 sibling wires PackGQA; the ported
-            # d256/d512 kernels skip it, as they skip split-KV.
+            # SM107: PackGQA is wired in the d128 FP8 BODY, which d192xd128
+            # shares -- but the row keeps it to d128 until the d192 PackGQA
+            # path is actually validated on Rubin (a shared body is evidence
+            # the code exists, not that it is correct at a wider K).  The
+            # ported d256/d512 kernels do not wire it at all, as they do not
+            # wire split-KV.
             pack_gqa_d_shapes=(frozenset({(128, 128)}) if rubin_row else None),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),

@@ -800,6 +800,24 @@ def test_mxfp8_gqa(in_key):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_d128", "d256"])
+@pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (8, 1)], ids=["g2", "g4", "mqa"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_dense_gqa_ratios(d_qk, d_v, h_q, h_kv):
+    """DENSE GQA/MQA across every ratio and shape -- see the FP8 twin.
+
+    Block-scale adds a reason to care: K and V carry PER-HEAD scale-factor
+    planes, so head sharing has to index the SF tensors by the KV head while
+    indexing Q's SF by the query head.  MQA (h_kv=1) collapses every KV-side SF
+    lookup onto plane 0, which is precisely where a stride that is really
+    `h_q`-based instead of `h_kv`-based still reads in-bounds and returns the
+    wrong exponents."""
+    scale = 1.0 / math.sqrt(d_qk)
+    O, O_ref, _ = _run(2, h_q, h_kv, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), d_qk=d_qk, d_v=d_v)
+    _check(O, O_ref, torch.float16, "e4m3")
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "d_qk,d_v",
     [(128, 128), (192, 128)],
