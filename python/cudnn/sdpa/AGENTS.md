@@ -57,3 +57,32 @@ head-major, never dense-padded.**
 - Reviewing: if the diff touches `fwd/engines.py`, `bwd/engines.py` or
   `cudnn/engines/manifest.py` and `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` is
   untouched, ask why before approving.
+
+**Rule S3 — Opening the graph-level support surface for a FROST-only shape
+admits exactly the graph forms that engine serves; never assume the backend
+will decline the rest.**
+
+- `include/cudnn_frontend/node/sdpa_support_surface.h` runs for EVERY graph,
+  including ones the plain backend serves with FROST disabled. A FROST-only
+  shape let through there does not "fail cleanly at plan creation": the
+  backend's runtime-compiled SDPA engine has no head-dim upper bound for
+  SM100/SM107 prefill (only `d % 16`), so it claims the graph at
+  check-support and dies in NVRTC —
+  `CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED`, which every consumer
+  reads as a library bug, not a support gate. This is how #845's
+  `(256, 512]` fp8 band produced 16 red deepseek_v4 cases per Blackwell part
+  on the attention_training nightly: `sdpa_fp8` and `sdpa_mxfp8` share
+  `mma_core_mode = FP8_E4M3`, so the band admitted MXFP8 d512 too, which no
+  kernel anywhere serves.
+- Scope the C++ gate by the same discriminators the engine row uses
+  (per-tensor vs block-scaled = `Descale_Q` dtype `FP8_E8M0`, pass, dtype
+  family, arch), and pair it with a validate()-level test in both forms —
+  `test_fp8_d512_graph_surface_admits_per_tensor_only` is the template.
+- Detector before merging such a widening: build the newly admitted graph
+  with FROST OFF (`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=0`, plain
+  `create_execution_plans([A, FALLBACK])`), print
+  `get_plan_name_at_index(i)` for every plan, and `build_plan_at_index(i)`
+  each. Any plan that builds means the backend serves the shape (say so in
+  the PR — and check it is correct); any plan that fails to build is a
+  backend NOT_SUPPORTED bug to report, and the C++ gate must stay closed
+  until it lands.
