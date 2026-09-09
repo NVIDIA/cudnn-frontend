@@ -18,6 +18,7 @@ Can be used as CLI or imported as a module:
 """
 
 import argparse
+import sys
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 import os
@@ -29,6 +30,49 @@ import time
 from typing import Optional, Dict, Any
 
 from torch.profiler import profile, record_function, ProfilerActivity
+
+if __package__:
+    from .flops import count_causal_nonmasked_elems
+else:
+    from flops import count_causal_nonmasked_elems
+
+# torch.profiler measures through CUPTI. If CUPTI cannot attach -- for any
+# reason: a device it does not recognise, a driver mismatch, missing profiling
+# permissions, or simply not being present -- it records no events at all, and
+# refusing to measure would leave the harness unusable on that machine. Fall
+# back to CUDA-event timing of the same region instead.
+#
+# These are NOT the same measurement. CUPTI reports the summed DEVICE time of
+# the matched kernels; events report WALL time of the region (kernel + launch
+# overhead + any gap). They agree closely when one kernel dominates, but do not
+# mix the two in a single comparison table -- every fallback run is tagged
+# [cuda-events] on the result line.
+_EVENT_TIMING = False
+
+
+def _time_region_ms(fn):
+    """Wall-clock milliseconds for one call of fn(), via CUDA events."""
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start.record()
+    fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end)
+
+
+def _run_forward_once():
+    """One forward execution, used by both the profiled and the event-timed path.
+
+    Assigns the module-level ``output`` so the non-cuDNN backends do not have to
+    be run a second time just to retrieve it for the backward pass.
+    """
+    global output
+    if is_cudnn_fe:
+        graph_fwd.execute(variant_pack_fwd, workspace)
+    else:
+        output = sdpa_function(query, key, value)
+
 
 # Exit code the benchmark subprocess uses to signal "this backend cannot serve
 # this configuration" (vs. a real failure). The `cudnn_oss` backend emits it for
@@ -52,6 +96,10 @@ _FLOPS_PER_CLOCK_PER_SM = {
     # Hopper (sm90): H100 SXM lists 989.5 dense BF16 TFLOPS (FP32 accumulate;
     # 1979 is the sparsity figure) = 132 SMs x 1.83 GHz x 4096 FLOPs/clk/SM;
     # FP8 dense is 2x. (No mxfp8 entry: Hopper has no MXFP8 datapath.)
+    # Ampere (sm80): A100 lists 312 dense BF16/FP16 TFLOPS (FP32 accumulate;
+    # 624 is the sparsity figure) = 108 SMs x 1.41 GHz x 2048 FLOPs/clk/SM.
+    # (No fp8/mxfp8 entries: Ampere has neither datapath.)
+    8: {"bfloat16": 2048, "float16": 2048},
     9: {"bfloat16": 4096, "float16": 4096, "fp8": 8192},
     10: {"bfloat16": 8192, "float16": 8192, "fp8": 16384, "mxfp8": 16384},
     12: {"bfloat16": 1024, "float16": 1024, "fp8": 2048, "mxfp8": 2048},
@@ -65,6 +113,30 @@ def _peak_flops_per_clock_per_sm(dtype_str):
         return None
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     return _FLOPS_PER_CLOCK_PER_SM.get(props.major, {}).get(dtype_str)
+
+
+def _nvml_handle_for_torch_device(pynvml, cuda_index):
+    """NVML handle for the PHYSICAL device backing torch device ``cuda_index``.
+
+    NVML enumerates physical GPUs and ignores CUDA_VISIBLE_DEVICES, while torch
+    indexes only the visible subset: under ``CUDA_VISIBLE_DEVICES=3`` the
+    benchmark runs on physical GPU 3 but ``torch.cuda.current_device()`` is 0,
+    so indexing NVML with the torch index samples GPU 0's clock. When several
+    single-GPU shards run side by side on a multi-GPU node (each pinned via
+    CUDA_VISIBLE_DEVICES), a shard whose neighbor GPU 0 has gone idle then
+    records the IDLE clock as its "peak", collapsing the SOL ceiling by the
+    idle-vs-boost ratio (>10x on aggressively-downclocking parts).
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd:
+        entries = [e.strip() for e in cvd.split(",") if e.strip()]
+        if cuda_index < len(entries):
+            entry = entries[cuda_index]
+            if entry.isdigit():
+                return pynvml.nvmlDeviceGetHandleByIndex(int(entry))
+            # UUID ("GPU-...") or MIG ("MIG-...") form.
+            return pynvml.nvmlDeviceGetHandleByUUID(entry.encode())
+    return pynvml.nvmlDeviceGetHandleByIndex(cuda_index)
 
 
 class _SmClockSampler:
@@ -89,7 +161,7 @@ class _SmClockSampler:
 
             pynvml.nvmlInit()
             self._pynvml = pynvml
-            self._handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+            self._handle = _nvml_handle_for_torch_device(pynvml, torch.cuda.current_device())
         except Exception:
             self._pynvml = None
             return
@@ -621,7 +693,6 @@ else:
             scale_dK_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dV_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dP_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
-            amax_s_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dQ_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dK_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
@@ -657,15 +728,21 @@ else:
             amax_dV_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
 
         if args.data_type == "mxfp8":
-            # MXFP8 backward outputs use the same dtype as forward output
-            dQuery = torch.empty(batch_size, num_q_heads, q_seqlen, head_dim_qk, dtype=output_dtype, device=device)
-            dKey = torch.empty(batch_size, num_kv_heads, kv_seqlen, head_dim_qk, dtype=output_dtype, device=device)
-            dValue = torch.empty(batch_size, num_kv_heads, kv_seqlen, head_dim_vo, dtype=output_dtype, device=device)
+            # MXFP8 backward outputs use the same dtype as forward output, in the
+            # same BSHD-physical layout as Q/K/V (a training framework hands the
+            # gradients over in the activations' layout; the FROST MXFP8 backward
+            # engine serves BSHD-physical only).
+            dQuery = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_qk, dtype=output_dtype, device=device).transpose(1, 2)
+            dKey = torch.empty(batch_size, kv_seqlen, num_kv_heads, head_dim_qk, dtype=output_dtype, device=device).transpose(1, 2)
+            dValue = torch.empty(batch_size, kv_seqlen, num_kv_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
         else:
             dQuery = torch.empty_like(query)
             dKey = torch.empty_like(key)
             dValue = torch.empty_like(value)
-        dOutput = torch.randn(output.shape, dtype=randn_dtype, device=device).to(target_dtype)
+        # dO in O's memory format (BSHD-physical): torch.randn(output.shape) would
+        # allocate BHSD-contiguous and hand every backward a gradient laid out
+        # differently from the activations.
+        dOutput = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
         stats = torch.empty(batch_size, num_q_heads, q_seqlen, 1, dtype=torch.float32, device=device)
         if is_dropout:
             dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
@@ -700,7 +777,11 @@ else:
             scale_s_fwd = graph_fwd.tensor_like(scale_s_gpu)
             scale_o_fwd = graph_fwd.tensor_like(scale_o_gpu)
 
-            o_fwd, stats_fwd, amax_s_fwd, amax_o_fwd = graph_fwd.sdpa_fp8(
+            # Amax_S is returned unconditionally but never requested: it only becomes a
+            # real graph output if set_output(True) is called on it, and nothing here
+            # consumes it. Leaving it virtual also keeps the graph servable by engines
+            # that do not produce Amax_S.
+            o_fwd, stats_fwd, _amax_s_unused, amax_o_fwd = graph_fwd.sdpa_fp8(
                 q=q_fwd,
                 k=k_fwd,
                 v=v_fwd,
@@ -799,7 +880,6 @@ else:
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
 
         if args.data_type == "fp8":
-            amax_s_fwd.set_output(True).set_dim(amax_s_gpu.size()).set_stride(amax_s_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
             amax_o_fwd.set_output(True).set_dim(amax_o_gpu.size()).set_stride(amax_o_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
         elif args.data_type == "mxfp8":
             amax_o_fwd.set_output(True).set_dim(amax_o_gpu.size()).set_stride(amax_o_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
@@ -1064,9 +1144,16 @@ else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride()).set_data_type(cudnn.data_type.BFLOAT16)
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride()).set_data_type(cudnn.data_type.BFLOAT16)
                 dV_bwd.set_output(True).set_dim(dValue.size()).set_stride(dValue.stride()).set_data_type(cudnn.data_type.BFLOAT16)
-                amax_dQ_bwd.set_output(True).set_dim(amax_dQ_gpu.size()).set_stride(amax_dQ_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
-                amax_dK_bwd.set_output(True).set_dim(amax_dK_gpu.size()).set_stride(amax_dK_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
-                amax_dV_bwd.set_output(True).set_dim(amax_dV_gpu.size()).set_stride(amax_dV_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+                # The gradients are half precision, so the amax_dQ/dK/dV outputs
+                # carry no information a consumer needs; the FROST MXFP8 backward
+                # engine does not produce them and declines a graph that asks.
+                # Leave them virtual under cudnn_oss (dims are still required by
+                # validate()); the native backend path keeps requesting them.
+                mxfp8_amax_requested = args.sdpa_backend != "cudnn_oss"
+                for _amax_t, _amax_gpu in ((amax_dQ_bwd, amax_dQ_gpu), (amax_dK_bwd, amax_dK_gpu), (amax_dV_bwd, amax_dV_gpu)):
+                    _amax_t.set_dim(_amax_gpu.size()).set_stride(_amax_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+                    if mxfp8_amax_requested:
+                        _amax_t.set_output(True)
             else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride())
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride())
@@ -1103,7 +1190,6 @@ else:
                     descale_s_fwd: descale_s_gpu,
                     scale_s_fwd: scale_s_gpu,
                     scale_o_fwd: scale_o_gpu,
-                    amax_s_fwd: amax_s_gpu,
                     amax_o_fwd: amax_o_gpu,
                 }
 
@@ -1182,10 +1268,11 @@ else:
                     dQ_bwd: dQuery,
                     dK_bwd: dKey,
                     dV_bwd: dValue,
-                    amax_dQ_bwd: amax_dQ_gpu,
-                    amax_dK_bwd: amax_dK_gpu,
-                    amax_dV_bwd: amax_dV_gpu,
                 }
+                if mxfp8_amax_requested:
+                    variant_pack_bwd[amax_dQ_bwd] = amax_dQ_gpu
+                    variant_pack_bwd[amax_dK_bwd] = amax_dK_gpu
+                    variant_pack_bwd[amax_dV_bwd] = amax_dV_gpu
                 workspace = torch.empty(
                     max(graph_fwd.get_workspace_size(), graph_bwd.get_workspace_size()),
                     device="cuda",
@@ -1229,7 +1316,6 @@ else:
                     descale_s_fwd: descale_s_gpu,
                     scale_s_fwd: scale_s_gpu,
                     scale_o_fwd: scale_o_gpu,
-                    amax_s_fwd: amax_s_gpu,
                     amax_o_fwd: amax_o_gpu,
                 }
                 workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
@@ -1284,7 +1370,9 @@ else:
 
         # Flash Attention Native
         def flash_attention_sdpa(query, key, value):
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
+            # flash-attn 2.7+ requires ints here: (-1, -1) is its no-window
+            # sentinel; passing None fails the SymInt cast in the op schema.
+            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (-1, -1)
             return flash_attn_func(
                 query,
                 key,
@@ -1410,21 +1498,7 @@ else:
         if attn_mask == "no_mask":
             num_nonmasked_elems = q_seqlen * kv_seqlen
         elif attn_mask in ("top_left", "bottom_right"):
-            if sliding_window_size is not None:
-                # With sliding window: each query attends to at most W keys
-                # (left_bound is exclusive, right_bound is inclusive)
-                # For positions 0 to W-1: 1, 2, ..., W keys (partial window)
-                # For positions W to S-1: W keys each (full window)
-                W = sliding_window_size
-                S = min(q_seqlen, kv_seqlen)
-                if S <= W:
-                    # Sequence shorter than window, use full causal
-                    num_nonmasked_elems = S * (S + 1) // 2
-                else:
-                    # Partial window (first W positions) + full window (remaining positions)
-                    num_nonmasked_elems = W * (W + 1) // 2 + (S - W) * W
-            else:
-                num_nonmasked_elems = torch.tril(torch.ones((q_seqlen, kv_seqlen), dtype=torch.bool)).sum()
+            num_nonmasked_elems = count_causal_nonmasked_elems(q_seqlen, kv_seqlen, attn_mask, sliding_window_size)
         else:
             raise ValueError(f"Unknown attn_mask: {attn_mask}")
         # BMM FLOPs: 2 * M * N * K.
@@ -1525,7 +1599,6 @@ else:
             scale_dK_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dV_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dP_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
-            amax_s_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dQ_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dK_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
@@ -1567,7 +1640,6 @@ else:
                         descale_s_fwd: descale_s_gpu,
                         scale_s_fwd: scale_s_gpu,
                         scale_o_fwd: scale_o_gpu,
-                        amax_s_fwd: amax_s_gpu,
                         amax_o_fwd: amax_o_gpu,
                     }
                     variant_pack_bwd = {
@@ -1679,7 +1751,6 @@ else:
                         descale_s_fwd: descale_s_gpu,
                         scale_s_fwd: scale_s_gpu,
                         scale_o_fwd: scale_o_gpu,
-                        amax_s_fwd: amax_s_gpu,
                         amax_o_fwd: amax_o_gpu,
                     }
                 elif args.data_type == "mxfp8":
@@ -1715,7 +1786,12 @@ else:
         l2_flush_buffer.zero_()
 
         # Run kernel with profiler for forward if requested, else run unprofiled to prep for backward
-        if run_fwd:
+        if run_fwd and _EVENT_TIMING:
+            # CUPTI already known unavailable -> ONE execution, timed with events.
+            fwd_time = _time_region_ms(_run_forward_once)
+            if i >= dry_run_iters:
+                forward_times.append(fwd_time)
+        elif run_fwd:
             with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
                 with record_function("sdpa.forward"):  # Custom marker
                     if is_cudnn_fe:
@@ -1737,15 +1813,34 @@ else:
                 or "(anonymous namespace)::" in item.key
                 or item.key.startswith("fmha_")
             ]
+            # "No events at all" is the wrong test for a dead CUPTI: even a
+            # healthy profiler reports runtime-API entries (cudaMalloc,
+            # cudaLaunchKernel, ...) that carry device_time == 0 alongside the
+            # real kernel activity. Distinguish on DEVICE time, so that a run
+            # which recorded kernels but matched no name filter still raises
+            # below instead of being silently re-timed as a wider region.
+            device_events = [item for item in prof.key_averages() if item.device_time > 0]
             if len(matched_kernels) >= 1:
-                fwd_time = sum(item.device_time for item in matched_kernels) / 1000
+                # device_time_total, NOT device_time: key_averages() aggregates by
+                # kernel name and device_time is the per-occurrence MEAN, so a
+                # kernel launched n times per pass was being counted once.
+                fwd_time = sum(item.device_time_total for item in matched_kernels) / 1000
                 if i >= dry_run_iters:
                     forward_times.append(fwd_time)
-            elif not prof.key_averages():
-                # A silently-empty profiler (typically CUPTI failing to init
-                # against this driver) would make every case read 0.000 ms and
-                # ship as valid data — fail loudly instead.
-                raise RuntimeError("torch.profiler recorded no CUDA events for the forward pass (CUPTI init failure?); refusing to emit unusable timings")
+            elif not device_events:
+                # No device time was recorded at all -> CUPTI could not attach.
+                # Switch the whole run to CUDA-event timing and say so loudly;
+                # a silently-empty profiler must never ship as a 0.000 ms row.
+                _EVENT_TIMING = True
+                print(
+                    "WARNING: CUPTI unavailable on this device - falling back to CUDA-event timing. "
+                    "These are WALL times for the region, not summed kernel device times; "
+                    "do not compare them against CUPTI-timed rows.",
+                    file=sys.stderr,
+                )
+                fwd_time = _time_region_ms(_run_forward_once)
+                if i >= dry_run_iters:
+                    forward_times.append(fwd_time)
             else:
                 raise RuntimeError(
                     "torch.profiler recorded CUDA events for the forward pass but none matched the known kernel-name filters; "
@@ -1795,7 +1890,10 @@ else:
                 or item.key.startswith("fmha_")
             ]
             if len(matched_kernels) >= 1:
-                bwd_time = sum(item.device_time for item in matched_kernels) / 1000
+                # device_time_total, NOT device_time: key_averages() aggregates by
+                # kernel name and device_time is the per-occurrence MEAN, so a
+                # kernel launched n times per pass was being counted once.
+                bwd_time = sum(item.device_time_total for item in matched_kernels) / 1000
                 if i >= dry_run_iters:
                     backward_times.append(bwd_time)
             elif not prof.key_averages():
@@ -1887,28 +1985,59 @@ else:
     # Compute MMA SOL% using the per-arch FLOPs/clk/SM table and the actual
     # sampled boost clock observed during the benchmark window.
     _peak_mma_tflops = None
+    # Why the peak is unavailable, when it is -- the two causes need different
+    # advice and conflating them sends the user after the wrong one.
+    _peak_unavailable = "unavailable"
     try:
         _flops_per_clk_per_sm = _peak_flops_per_clock_per_sm(args.data_type)
         _num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         _sampled_mhz = _clock_sampler.peak_mhz()
-        if _flops_per_clk_per_sm is not None and _sampled_mhz is not None:
+        if _flops_per_clk_per_sm is None:
+            # No dense-MMA peak modelled for this dtype / arch (e.g. --data_type float).
+            _peak_unavailable = f"no MMA peak modelled for {args.data_type} on this arch"
+        elif _sampled_mhz is None:
+            _peak_unavailable = "no clock sample -- pip install pynvml"
+        else:
             _peak_mma_tflops = _flops_per_clk_per_sm * _num_sms * _sampled_mhz / 1e6
-    except Exception:
-        pass
+    except Exception as _e:
+        _peak_unavailable = f"peak lookup failed ({type(_e).__name__})"
 
-    fwd_sol_str = f", {fwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and fwd_tflops > 0 else ""
-    bwd_sol_str = f", {bwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and bwd_tflops > 0 else ""
+    def _sol(tflops):
+        """SOL% against the dense-MMA peak, or an explicit note when we cannot
+        compute it.
+
+        The peak needs both a modelled dense-MMA rate for the dtype and a
+        sampled boost clock (which needs ``pynvml``). When either is missing the
+        SOL suffix used to vanish entirely and an impossible TFLOPS number
+        printed unremarked -- the only cross-check this harness has on its own
+        arithmetic, silently disabled. Say so instead, naming WHICH of the two
+        is missing, and shout when a number exceeds the hardware: >100% SOL
+        means the FLOP model or the timing is wrong, never that the kernel is
+        fast.
+        """
+        if tflops <= 0:
+            return ""
+        if not _peak_mma_tflops:
+            return f", SOL n/a ({_peak_unavailable})"
+        pct = tflops / _peak_mma_tflops * 100
+        if pct > 100.0:
+            return f", {pct:.1f}% SOL -- ABOVE HARDWARE PEAK, MEASUREMENT IS WRONG"
+        return f", {pct:.1f}% SOL"
+
+    fwd_sol_str = _sol(fwd_tflops)
+    bwd_sol_str = _sol(bwd_tflops)
 
     if args.format_output:
         print(
             f"{args.case_tag},{args.sdpa_backend},{args.batch_size},{args.q_seqlen},{args.kv_seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{f'{_peak_mma_tflops:.0f}' if _peak_mma_tflops else ''}"
         )
     else:
+        _tt = " [cuda-events]" if _EVENT_TIMING else ""
         if run_fwd and run_bwd:
             print(
-                f"{args.sdpa_backend}:: Median (fwd, bwd) Execution Times: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}), {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})"
+                f"{args.sdpa_backend}{_tt}:: Median (fwd, bwd) Execution Times: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}), {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})"
             )
         elif run_fwd:
-            print(f"{args.sdpa_backend}:: Median (fwd) Execution Time: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str})")
+            print(f"{args.sdpa_backend}{_tt}:: Median (fwd) Execution Time: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str})")
         elif run_bwd:
-            print(f"{args.sdpa_backend}:: Median (bwd) Execution Time: {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})")
+            print(f"{args.sdpa_backend}{_tt}:: Median (bwd) Execution Time: {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})")

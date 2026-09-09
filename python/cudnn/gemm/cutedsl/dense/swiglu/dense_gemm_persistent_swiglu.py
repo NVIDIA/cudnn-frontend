@@ -1153,6 +1153,8 @@ class PersistentDenseGemmKernel:
             #
             c_pipeline.producer_tail()
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     def epilog_tmem_copy_and_partition(
         self,
         tidx: cutlass.Int32,

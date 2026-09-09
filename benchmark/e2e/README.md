@@ -218,6 +218,27 @@ E2M1/F8_128x4 dequantized reference. The four-block C output differs from A by
 proxy uses random weights and synthetic calibration.
 
 Raw artifact SHA-256: `7af126f91ea958a8912e611168136afc2241fbc79e9d74d4a26ace907648f7e6`.
+
+### Private quantizer and the proposed public conversion API
+
+This benchmark's `_nvfp4_quantize` is a private recipe implementation, not a
+second public quantization API. It accepts BF16 `[M,K]` with arbitrary positive
+M and K divisible by 16, fuses BF16 per-channel `pre_quant_scale`, and lazily
+builds a CUDA/C++ extension. Its installed wheel therefore must retain the
+`csrc/` sources and their third-party notices; running this leaf requires a
+compatible CUDA toolkit and host compiler.
+
+The public conversion API proposed in [PR #814](https://github.com/NVIDIA/cudnn-frontend/pull/814)
+also emits E2M1 with F8_128x4 block scales, but adds dequantization and prepared
+operations via CuTe DSL. Its current contract is `[1,M,K]`, M divisible by 128,
+K divisible by 64, K <= 16384, without fused per-channel smoothing. The two
+normalization formulas also use different floating-point operation orders;
+matching layouts alone does not establish byte-identical quantization.
+
+The intended consolidation point is the public conversion API, after the
+fused-smoothing, tail-shape, and numerical contracts are reconciled. This leaf
+does not depend on that unmerged PR, and the historical timings above do not
+compare the two quantizers.
 The benchmark-private BF16-to-NVFP4 kernel is derived from FlashInfer commit
 `f212ec8230486e3615502b8af75fe7022c60b2f3`, retaining its Apache-2.0 notice
 and its TensorRT-LLM provenance; FROST folds dequantization into the MMA.

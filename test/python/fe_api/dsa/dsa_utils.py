@@ -25,6 +25,12 @@ def _require_sm100():
         pytest.skip("SM100 GPU required")
 
 
+def _require_exact_sm100():
+    """Skip unless the device is exactly SM100 (capability ``(10, 0)``)."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 (10, 0) GPU required")
+
+
 # Parameterization marks shared by every DSA test
 DSA_PARAM_MARKS = [
     pytest.mark.parametrize("dtype", [torch.bfloat16]),
@@ -35,7 +41,9 @@ DSA_SPARSE_ATTENTION_BACKWARD_PARAM_MARKS = [
     pytest.mark.parametrize(
         "head_dim,head_dim_v,num_heads",
         [
+            (512, 512, 16),
             (512, 512, 64),
+            (576, 512, 16),
             # Regression for a packed-M tile crossing query boundaries. This
             # is the MLA shape that exposed catastrophic dQ/dKV corruption.
             (576, 512, 32),

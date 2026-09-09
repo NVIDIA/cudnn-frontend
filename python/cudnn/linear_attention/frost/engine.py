@@ -21,8 +21,8 @@ def frost_la_gate(engine: str, facts, op: str) -> None:
     if facts.invalid:
         raise NotImplementedError(f"{engine}: {facts.invalid}")
     sm = buffers.current_sm()
-    if sm is None or not (100 <= sm <= 103):
-        raise NotImplementedError(f"{engine} requires SM100-SM103 (found {sm})")
+    if sm is None or not (100 <= sm <= 103 or sm == 107):
+        raise NotImplementedError(f"{engine} requires SM100-SM103 or SM107 (found {sm})")
     installed, version = buffers.cutedsl_state()
     if not installed:
         raise NotImplementedError(f"{engine} requires the cutedsl extra (nvidia-cutlass-dsl), which is not installed")
@@ -35,14 +35,12 @@ def frost_la_gate(engine: str, facts, op: str) -> None:
         raise NotImplementedError(f"{engine}: q/k/v must be fp16/bf16, got {facts.io_dtype}")
     if not facts.thd_layout:
         raise NotImplementedError(f"{engine}: q/k/v must be THD [total_T, heads, dim]")
-    if facts.d_qk != 128 or facts.d_v != 128:
-        raise NotImplementedError(f"{engine}: head dims must be 128 (the recurrent state is 128x128), got K={facts.d_qk} V={facts.d_v}")
     if facts.h_k not in (facts.h_q, facts.h_v):
         raise NotImplementedError(f"{engine}: k heads ({facts.h_k}) must match q's ({facts.h_q}) or v's ({facts.h_v}; canonical GQA shares grouped k/v heads)")
     if facts.h_v != facts.h_q and max(facts.h_q, facts.h_v) % min(facts.h_q, facts.h_v) != 0:
         raise NotImplementedError(f"{engine}: q heads ({facts.h_q}) and v heads ({facts.h_v}) must be equal or one a multiple of the other")
-    if facts.g_dtype not in (cudnn.data_type.FLOAT, None):
-        raise NotImplementedError(f"{engine}: 'g' must be fp32, got {facts.g_dtype}")
+    if facts.g_dtype not in (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF, None):
+        raise NotImplementedError(f"{engine}: 'g' must be fp32/fp16/bf16, got {facts.g_dtype}")
     if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
         raise NotImplementedError(f"{engine}: 'cu_seqlens' must be int32/int64, got {facts.cu_dtype}")
 
@@ -75,6 +73,11 @@ class FrostLaPlan(CompiledPlan):
         return self.compiled.workspace_bytes()
 
     def execute(self, graph, variant_pack, ctx) -> None:
+        launch_device = variant_pack.device
+        if launch_device != self.compiled.device:
+            raise ValueError(
+                f"{self.compiled.plan_name}: plan was built for cuda:{self.compiled.device}, " f"but cuda:{launch_device} is current; build one plan per device"
+            )
         ports = self.ports
         if ports is None:
             ports = self.ports = bind_ports(graph, variant_pack)
@@ -86,5 +89,5 @@ class FrostLaPlan(CompiledPlan):
         if not ok:
             raise ValueError(dense_layout_message(self.compiled.plan_name, ports, offender))
         views = variant_pack.operands(self.indices)
-        workspace = Workspace.over(variant_pack, self.compiled.ws_bytes, type(self.compiled).__name__)
+        workspace = Workspace.over(variant_pack, self.compiled.workspace_size, type(self.compiled).__name__)
         self.compiled.run(views, workspace, ctx.stream)

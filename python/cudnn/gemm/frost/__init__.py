@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""cudnn.gemm.frost: JIT fused sm100 GEMM kernels from cuDNN graphs via the CuTe DSL.
+"""cudnn.gemm.frost: JIT fused GEMM kernels from cuDNN graphs via the CuTe DSL.
 
 User code uses the plain cuDNN frontend API. The analyzer reads the python IR
 (``graph.nodes``) directly; :class:`cudnn.gemm.frost.engine.FrostGemmEngine`

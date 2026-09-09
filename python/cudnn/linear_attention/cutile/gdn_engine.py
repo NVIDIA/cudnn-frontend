@@ -94,7 +94,7 @@ class GdnCuTilePlan(CompiledPlan):
                 ("wy_dg", layout.add(total * HV * 4), f32, (total, HV)),
             ]
 
-        self.ws_bytes = layout.size
+        self.workspace_size = layout.size
         self.carve_names = [name for name, _off, _dtype, _shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dtype, shape) for _name, off, dtype, shape in regions])
         self.expect = expect_table(node)
@@ -120,7 +120,7 @@ class GdnCuTilePlan(CompiledPlan):
         self.indices = None
 
     def get_workspace_size(self) -> int:
-        return self.ws_bytes
+        return self.workspace_size
 
     def execute(self, graph, variant_pack, ctx) -> None:
         if self.ports is None:
@@ -132,8 +132,8 @@ class GdnCuTilePlan(CompiledPlan):
         check_layouts_compact(self.plan_name, self.expect, self.names, views)
         nb = dict(zip(self.names, views))
         stream = ctx.stream if ctx.stream is not None else 0
-        ws = Workspace.over(variant_pack, self.ws_bytes, self.plan_name)
-        region = dict(zip(self.carve_names, ws.carve(self.carve)))
+        workspace = Workspace.over(variant_pack, self.workspace_size, self.plan_name)
+        region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         self.common.build_chunk_table(
             region["chunk_table"],
             region["chunk_count"],
@@ -152,7 +152,7 @@ class GdnCuTilePlan(CompiledPlan):
             self.execute_fwd(nb, region, stream)
 
     def execute_fwd(self, nb, region, stream) -> None:
-        gate = dict(use_gate_in_kernel=True, A_log=nb["a_log"], dt_bias=nb["dt_bias"]) if self.safe_gate else {}
+        gate = dict(use_gate_in_kernel=True, A_log=nb.get("a_log"), dt_bias=nb.get("dt_bias")) if self.safe_gate else {}
         self.kernels.chunk_gated_delta_rule(
             nb["q"],
             nb["k"],

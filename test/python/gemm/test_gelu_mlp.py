@@ -37,13 +37,13 @@ def _rel_l2(actual, expected):
 
 def _inputs(*, requires=(False, False, False, False, False)):
     torch.manual_seed(0)
-    M, H, intermediate, O = 128, 256, 512, 192
+    M, H, intermediate, out_features = 128, 256, 512, 192
     base = (
         torch.randn(2, M, H, device="cuda", dtype=torch.bfloat16),
         torch.randn(intermediate, H, device="cuda", dtype=torch.bfloat16) * 0.02,
         torch.randn(intermediate, device="cuda", dtype=torch.bfloat16) * 0.02,
-        torch.randn(O, intermediate, device="cuda", dtype=torch.bfloat16) * 0.02,
-        torch.randn(O, device="cuda", dtype=torch.bfloat16) * 0.02,
+        torch.randn(out_features, intermediate, device="cuda", dtype=torch.bfloat16) * 0.02,
+        torch.randn(out_features, device="cuda", dtype=torch.bfloat16) * 0.02,
     )
     return tuple(t.detach().requires_grad_(need) for t, need in zip(base, requires))
 

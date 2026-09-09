@@ -4,7 +4,7 @@
 """cudnn.linear_attention.frost: the FROST linear-attention engines —
 Gated DeltaNet, Kimi Delta Attention, and Gated DeltaNet v2 on the SM100
 chunked kernels built on Cutlass primitives. All three serve forward and
-backward on SM100/SM103 and rank ahead of the cuTile fallbacks, except
+backward on SM100/SM103/SM107 and rank ahead of the cuTile fallbacks, except
 GDN-2, which does not have a cuTile fallback."""
 
 # Lazy: importing one family's engine must not drag its neighbours in.
@@ -15,6 +15,7 @@ _LAZY_EXPORTS = {
     "GdnFrostEngine": (".gdn_engine", "GdnFrostEngine"),
     "Gdn2FrostEngine": (".gdn2_engine", "Gdn2FrostEngine"),
     "KdaFrostEngine": (".kda_engine", "KdaFrostEngine"),
+    "GdpFrostEngine": (".gdp_engine", "GdpFrostEngine"),
 }
 
 
@@ -32,4 +33,4 @@ def __dir__():
     return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 
-__all__ = ["GdnFrostEngine", "KdaFrostEngine", "Gdn2FrostEngine"]
+__all__ = ["GdnFrostEngine", "KdaFrostEngine", "Gdn2FrostEngine", "GdpFrostEngine"]

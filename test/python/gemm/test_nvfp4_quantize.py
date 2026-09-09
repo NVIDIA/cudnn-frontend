@@ -153,3 +153,15 @@ def test_nvfp4_quantize_rejects_before_lazy_build(monkeypatch):
             torch.empty((1, 256), dtype=torch.bfloat16),
             torch.ones(1, dtype=torch.float32),
         )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _is_sm100(), reason="NVFP4 quantization requires SM100")
+@pytest.mark.parametrize("m,k,sm_count", [(1, 1, 1), (1, 8, 1), (1, 24, 1), (-1, 16, 1), (1, 16, 0)])
+def test_nvfp4_direct_binding_rejects_invalid_launch_geometry(m, k, sm_count):
+    from cudnn.gemm.ops._nvfp4_quantize import _load_extension
+
+    # Zero addresses are safe here only because validation must precede any
+    # launch. This bypasses the Python tensor wrapper that already checks K.
+    with pytest.raises(ValueError, match="positive width divisible by 16"):
+        _load_extension().launch(0, 0, 0, 0, 0, m, k, sm_count, 0, False)

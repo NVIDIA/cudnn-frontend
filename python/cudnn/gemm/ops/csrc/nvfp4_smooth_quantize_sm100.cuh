@@ -46,6 +46,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <type_traits>
 
 namespace flashinfer {
@@ -562,6 +563,9 @@ inline void nvfp4_smooth_quantize(void* out, void* sf_out, void const* in, void 
   using namespace smooth_quantize_detail;
 
   if (m == 0 || n == 0) return;
+  if (m < 0 || n < SF_VEC_SIZE || n % SF_VEC_SIZE != 0 || multiProcessorCount <= 0) {
+    throw std::invalid_argument("NVFP4 quantize requires nonnegative rows, a positive width divisible by 16, and a positive SM count");
+  }
 
   bool const enablePDL = enable_pdl;
   bool const useFastPath = (n == 3072 || n == 12288);

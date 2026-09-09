@@ -53,7 +53,7 @@ class Cfg:
 
     # --- SMEM / TMEM ring stage counts ---
     SMEM_RAW_STAGES: int = 8
-    SMEM_SCHED_STAGES: int = 8
+    SMEM_SCHEDULER_STAGES: int = 8
     SMEM_O_STAGES: int = 2
     SMEM_DECAY_STAGES: int = 2
     SMEM_INTERMEDIATE_STAGES: int = 2

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from cuda.bindings import driver as cuda
 
@@ -116,6 +116,10 @@ class GroupedGemmSm100(APIBase):
 
 _cache_of_GroupedGemmSm100Objects: dict[tuple, GroupedGemmSm100] = {}
 
+# Operand-metadata key -> the wrapper's derived result. Holds one entry per distinct
+# (operand metadata, config) the process sees, the same growth as the op cache above.
+_wrapper_memo: dict = {}
+
 
 def _stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
     strides = get_strides(tensor)
@@ -127,6 +131,36 @@ def _stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
             key=lambda item: (item[1], shape[item[0]]),
         )
     )
+
+
+def _operand_meta(tensor: Optional[torch.Tensor]) -> Optional[tuple]:
+    """Everything the wrapper's derivation reads off an operand, and nothing else.
+
+    Deliberately not the object's identity: a tensor's address is recycled by CPython
+    as soon as it is freed, so an id-keyed memo answers for tensors it never saw.
+    Reading these five values costs ~0.3 us and cannot alias a differently-shaped
+    operand. Data pointers are excluded because they vary per call and nothing derived
+    here depends on them -- their alignment is re-checked inside execute().
+    """
+    if tensor is None:
+        return None
+    device = get_device(tensor)
+    return (get_shape(tensor), get_strides(tensor), tensor.dtype, device.type, device.index)
+
+
+def _allocate_output(framework: str, shape: tuple, stride: tuple, dtype, device) -> Any:
+    from cudnn.tensor_adapter import framework_dtype
+
+    if framework == "torch":
+        import torch
+
+        return torch.empty_strided(shape, stride, dtype=framework_dtype(dtype, "torch"), device=device)
+    import jax
+    import jax.numpy as jnp
+
+    # n-major C-contiguous; the extent-1 batch dim's stride is unobservable.
+    # The kernel writes into this buffer on the launch stream; materialize it first.
+    return jax.block_until_ready(jnp.empty(shape, dtype=framework_dtype(dtype, "jax"), device=device))
 
 
 def _tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_m: bool = False) -> tuple:
@@ -273,6 +307,58 @@ def grouped_gemm_wrapper_sm100(
     use_dynamic_sched: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    # Hot-loop memo. Everything between here and op.execute() is derivation -- resolving
+    # dtypes, deriving (m, n, experts), and rebuilding the op cache key -- and it is a
+    # pure function of the operands' metadata plus the scalar config, both of which are
+    # in the key below. So a hit skips the derivation and reuses its result. It does not
+    # skip any check: op.execute() still validates every operand, including the data
+    # pointers the key deliberately omits. Only the allocate-the-outputs case is memoized;
+    # caller-supplied c/d need _validate_output and fall through.
+    _memo_key = None
+    if c_tensor is None and d_tensor is None:
+        _memo_key = (
+            type(a_tensor),
+            _operand_meta(a_tensor),
+            _operand_meta(padded_offsets),
+            _operand_meta(alpha_tensor),
+            _operand_meta(prob_tensor),
+            _operand_meta(b_tensor),
+            _operand_meta(b_ptrs),
+            _operand_meta(bias_tensor),
+            n,
+            b_dtype,
+            b_major,
+            acc_dtype,
+            c_dtype,
+            d_dtype,
+            cd_major,
+            tuple(mma_tiler_mn),
+            None if cluster_shape_mn is None else tuple(cluster_shape_mn),
+            vector_f32,
+            m_aligned,
+            generate_c,
+            use_dynamic_sched,
+            os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+        )
+        memo = _wrapper_memo.get(_memo_key)
+        if memo is not None:
+            op, framework, expected_shape, expected_stride, memo_c_dtype, memo_d_dtype, is_dense = memo
+            internal_c = _allocate_output(framework, expected_shape, expected_stride, memo_c_dtype, a_tensor.device)
+            d_out = _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
+            op.execute(
+                a_tensor=a_tensor,
+                c_tensor=internal_c,
+                d_tensor=d_out,
+                padded_offsets=padded_offsets,
+                alpha_tensor=alpha_tensor,
+                b_tensor=b_tensor if is_dense else None,
+                b_ptrs=None if is_dense else b_ptrs,
+                bias_tensor=bias_tensor,
+                prob_tensor=prob_tensor,
+                current_stream=current_stream,
+            )
+            return TupleDict(d_tensor=d_out, c_tensor=internal_c if generate_c else None)
+
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_wrapper_sm100; pass torch tensors or JAX arrays")
@@ -301,27 +387,11 @@ def grouped_gemm_wrapper_sm100(
     expected_shape = (tensor_m, n_out, 1)
     expected_stride = (n_out, 1, tensor_m * n_out)
 
-    def _allocate_output(dtype):
-        from cudnn.tensor_adapter import framework_dtype
-
-        if framework == "torch":
-            import torch
-
-            return torch.empty_strided(
-                expected_shape,
-                expected_stride,
-                dtype=framework_dtype(dtype, "torch"),
-                device=a_tensor.device,
-            )
-        import jax
-        import jax.numpy as jnp
-
-        # n-major C-contiguous; the extent-1 batch dim's stride is unobservable.
-        # The kernel writes into this buffer on the launch stream; materialize it first.
-        return jax.block_until_ready(jnp.empty(expected_shape, dtype=framework_dtype(dtype, "jax"), device=a_tensor.device))
+    def _allocate(dtype):
+        return _allocate_output(framework, expected_shape, expected_stride, dtype, a_tensor.device)
 
     if c_tensor is None:
-        internal_c = _allocate_output(c_dtype)
+        internal_c = _allocate(c_dtype)
     else:
         _validate_output(
             c_tensor,
@@ -333,7 +403,7 @@ def grouped_gemm_wrapper_sm100(
         )
         internal_c = c_tensor
     if d_tensor is None:
-        d_tensor = _allocate_output(d_dtype)
+        d_tensor = _allocate(d_dtype)
     else:
         _validate_output(
             d_tensor,
@@ -407,6 +477,9 @@ def grouped_gemm_wrapper_sm100(
         assert op.check_support(), "Unsupported configuration"
         op.compile()
         _cache_of_GroupedGemmSm100Objects[cache_key] = op
+
+    if _memo_key is not None:
+        _wrapper_memo[_memo_key] = (op, framework, expected_shape, expected_stride, c_dtype, d_dtype, is_dense)
 
     op.execute(
         a_tensor=a_tensor,

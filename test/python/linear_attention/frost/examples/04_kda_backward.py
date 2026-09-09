@@ -23,7 +23,7 @@ def _build_plans(g) -> None:
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    g.select_plan(names.index("kda_frost"))  # pin the FROST entry
+    g.select_plan(names.index("kda_frost"))
     g.check_support()
     g.build_plans()
 

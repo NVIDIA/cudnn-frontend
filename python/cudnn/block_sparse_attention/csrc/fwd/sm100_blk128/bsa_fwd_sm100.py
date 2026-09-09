@@ -1174,12 +1174,6 @@ class BlockSparseAttnForwardSm100Blk128:
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
                         mma_kv_consumer_state.advance()
-                        # Wait K
-                        pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                        Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                        sK_cur = sK[None, None, None, Ki_index]
-                        if const_expr(self.uneven_kv_smem):
-                            sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         pipeline_s_p_o.producer_acquire_w_index_phase(stage, phase_cur)
                         gemm_Pi[stage](
                             tCrB=tOrVi,
@@ -1188,6 +1182,12 @@ class BlockSparseAttnForwardSm100Blk128:
                             mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
                             mbar_phase=phase_cur,
                         )
+                        # Overlap the independent K wait with the issued PV MMA.
+                        pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                        Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                        sK_cur = sK[None, None, None, Ki_index]
+                        if const_expr(self.uneven_kv_smem):
+                            sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         gemm_Si[stage](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
                         pipeline_s_p_o.producer_commit_w_index(stage)
                         if const_expr(stage == 0):

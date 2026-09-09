@@ -3,8 +3,8 @@
 
 """Helpers shared by the gemm/frost benchmark scripts.
 
-Each script builds its own `spec_map` (label -> (geometry cfg, cta_group,
-scheduler)) from the registry funnel and its own graph / data, but the way they
+Each script builds its own `spec_map` (label -> (geometry cfg, cta_group))
+from the registry funnel and its own graph / data, but the way they
 select configs, rotate buffers, time launches and read an nsys report is the
 same everywhere. That part lives here.
 """
@@ -15,6 +15,7 @@ import argparse
 import csv
 import fnmatch
 import io
+import math
 import os
 import re
 import shutil
@@ -29,31 +30,28 @@ from cudnn.gemm.frost.tile_config import by_name as _by_name
 
 # Config selection
 
-LABEL_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
-
 
 def spec_for(label, spec_map):
-    """(geometry cfg, cta_group, scheduler) for a --configs label, or None.
+    """(config, cta_group) for a --configs label, or None.
 
     The sweep map comes from the registry funnel over CATALOG; a label naming a
-    geometry outside it (e.g. a num_mma_m > 1 tile, which `by_name` synthesizes) is
-    still runnable, so parse it rather than calling it unsweepable."""
+    geometry outside it (e.g. a mma_size_m > 1 tile, which `by_name` synthesizes) is
+    still runnable, so parse the complete canonical name rather than calling it
+    unsweepable.  ``cta_group`` is part of TileConfig geometry; do not strip its
+    suffix and carry a second, potentially inconsistent value beside the config."""
     spec = spec_map.get(label)
     if spec is not None:
         return spec
-    m = LABEL_RE.match(label)
-    if m is None:
-        return None
     try:
-        cfg = _by_name(m.group(1))
+        cfg = _by_name(label)
     except (KeyError, NotImplementedError):
         return None
-    return cfg, int(m.group(2)), "static" if m.group(3) else "clc"
+    return cfg, getattr(cfg, "cta_group", 1)
 
 
 def select_configs(arg, spec_map):
     """--configs value -> concrete label list. A token carrying a glob
-    (`CONFIG_sm107_*`) is expanded against the sweep map; anything else is kept
+    (`CONFIG_sm100_*`) is expanded against the sweep map; anything else is kept
     verbatim so `spec_for` can still synthesize an off-catalog geometry."""
     if not arg:
         return list(spec_map)
@@ -73,7 +71,7 @@ def select_configs(arg, spec_map):
 
 # Argument surface
 
-CONFIGS_HELP = "comma-separated config names or globs, e.g. 'CONFIG_sm107_*' (default: sweep all)"
+CONFIGS_HELP = "comma-separated config names or globs, e.g. 'CONFIG_sm100_*' (default: sweep all)"
 
 ROTATE_HELP = (
     "allocate N independent copies of every tensor and rotate the timed launches "
@@ -214,14 +212,14 @@ def time_ms(timed_fn: Callable, warmup_fn: Callable | None = None, *, warmup: in
 # nsys mode
 
 
-def kernel_match_token(cfg, cta_group: int, scheduler: str = "clc") -> str:
+def kernel_match_token(cfg, cta_group: int) -> str:
     """The substring the demangled symbol carries. `compiler` names the kernel
-    `<template_file_stem>_<geometry_name>`, so a static config reads
-    `..._1ctamma_static_128x256x128_...` — the scheduler sits BETWEEN the
-    cta_group token and the geometry and has to be part of the match.
-    The --configs LABEL is not usable here at all: it spells the pipeline before
-    the geometry and the cta_group after it, so it is never a substring."""
-    return f"{cta_group}ctamma{'_static' if scheduler == 'static' else ''}_{cfg.geometry_name}"
+    `<template_stem>_<geometry_name>`, and geometry_name now ends in the MMA
+    mode, so it reads
+    `..._128x256x128_128x256x32_cluster2x1_1ctamma`. The --configs LABEL is not
+    usable here at all: it spells the pipeline before the geometry, so it is
+    never a substring."""
+    return cfg.geometry_name
 
 
 def parse_nsys_stats(text: str) -> dict[str, float]:
@@ -337,6 +335,48 @@ def rand_e8m0(shape, dev):
     """Random E8M0 scale bytes centred on 2^0 (biased exponent 127). The graph
     declares the SF as FP8_E8M0, so the blob must carry that dtype."""
     return torch.randint(125, 129, shape, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
+
+
+FTO_ALIGNMENT_HELP = (
+    "value for the `alignment_value` attribute on the first_token_offset tensor: a "
+    "promise that every routed-group start is a multiple of it. It lets FROST address "
+    "A / SFA / D through the ORIGINAL TMA descriptors instead of rewriting them per "
+    "group, for every config whose cluster tile M (and, block-scale, 128) divides it. "
+    "'auto' reads the promise off the offsets this bench lays out; 1 (default) makes "
+    "none, i.e. every config keeps the per-group descriptor patch."
+)
+
+
+def add_fto_alignment_arg(parser) -> None:
+    """The `--fto-alignment` knob, shared by every MoE bench."""
+    parser.add_argument("--fto-alignment", default="1", help=FTO_ALIGNMENT_HELP)
+
+
+def fto_alignment(spec, offsets) -> int:
+    """Resolve `--fto-alignment` against the offsets the bench actually lays out.
+
+    `auto` is their GCD. An explicit value is CHECKED here because the KERNEL does
+    not check it -- the offsets live on the device, so a false promise is undefined
+    behaviour that silently reads another group's scale factors."""
+    vals = [int(v) for v in (offsets.tolist() if hasattr(offsets, "tolist") else offsets)]
+    if str(spec).strip().lower() == "auto":
+        auto = 0
+        for v in vals:
+            auto = math.gcd(auto, v)
+        # All-zero (a single routed group) constrains nothing; claim no promise
+        # rather than an arbitrarily large one.
+        return auto or 1
+    n = int(spec)
+    if n < 1:
+        raise SystemExit(f"--fto-alignment must be >= 1 or 'auto', got {spec!r}")
+    bad = [v for v in vals if v % n]
+    if bad:
+        raise SystemExit(
+            f"--fto-alignment {n} is not true of this bench's routed-group offsets "
+            f"({bad[:4]}{'...' if len(bad) > 4 else ''}): the promise is unchecked at "
+            "runtime and would miscompute."
+        )
+    return n
 
 
 def group_offsets(S: int, E: int) -> torch.Tensor:

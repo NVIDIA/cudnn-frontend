@@ -36,7 +36,7 @@ class Cfg:
 
     # --- warp assignments (16 warps = 512 threads) ---
     COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # forward gate cumsum + decay-operand materialize
-    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # value-side TMEM staging / restages / dH capture
+    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # value-side TMEM staging / restages / dstate capture
     COMPUTE_GROUP_2_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)  # dq/dk-bank drain, dG assembly + reverse cumsum
     SUPER_MMA_WARP_ID: int = 12  # register-MMA KK/A/dA/dM + Neumann T_inv
     TCGEN05_MMA_WARP_ID: int = 13  # tcgen05 GEMM schedule
@@ -44,16 +44,10 @@ class Cfg:
     EPILOGUE_WARP_ID: int = 15  # dq/dk/dv TMA stores only
 
     # --- register split ---
-    # WG1's drain runs at the register ceiling (spilled at 152) while WG0
-    # sits near ~100 live regs, so WG0 funds WG1.  Constraints: compute
-    # groups can't go below the 128-reg launch base (setmaxregister is
-    # INCREASE-only there), and warps 12-15 are one warpgroup so they must
-    # share a single setmaxregister value (56; super/epilogue peak ~R49).
-    # dht configs keep ~15 in-loop WG2 spills at 136 (152 doesn't fit).
     NUM_REGS_COMPUTE_GROUP_0: int = 128
     NUM_REGS_COMPUTE_GROUP_1: int = 184
-    NUM_REGS_COMPUTE_GROUP_2: int = 136
-    NUM_REGS_OTHER: int = 64  # warpgroup-uniform; +8 donated by CG1
+    NUM_REGS_COMPUTE_GROUP_2: int = 144
+    NUM_REGS_OTHER: int = 56
 
     THREADS_PER_WARP: int = 32
 
@@ -64,6 +58,7 @@ class Cfg:
     SMEM_STATE_STAGES: int = 1
     SMEM_DECAY_STAGES: int = 2
     SMEM_INTERMEDIATE_STAGES: int = 2
+    SMEM_DA_DIAG_STAGES: int = 4
     SMEM_STATE_SCALE_DIAG_STAGES: int = 2
     SMEM_DQ_STAGES: int = 1
     SMEM_DK_STAGES: int = 1

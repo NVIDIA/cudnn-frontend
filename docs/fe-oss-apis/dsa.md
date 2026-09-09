@@ -6,35 +6,38 @@
 
 The DeepSeek Sparse Attention (DSA) module integrates a set of CuTe-DSL
 kernels that support the sparse-attention path used by DeepSeek-style models.
-Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs. Dense Indexer
-Forward and standalone Indexer Top-K support both architectures; the combined
-compressed-logits + Top-K path is SM100-only. The kernels are delivered as
-Python classes / wrappers that follow the same `APIBase` pattern as other
-cuDNN Frontend operations.
+Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs. Sparse-attention
+forward and the combined compressed-logits + Top-K path are SM100-only;
+sparse-attention forward is limited to the mapped SM100-family capabilities
+10.0, 10.3, and 10.7. Dense Indexer Forward and standalone Indexer Top-K
+support both architectures. The kernels are delivered as Python classes /
+wrappers that follow the same `APIBase` pattern as other cuDNN Frontend
+operations.
 
-**Scope:** this module ships CuTe-DSL kernels for DSA backward, indexer
-scores/top-K, sparse/dense score recompute, and sparse/dense indexer
-backward. The production
-sparse-attention forward kernel (FlashMLA) is C++ and is **not** integrated
-here; when evaluating the backward, use the pure-PyTorch reference in
-`test/python/fe_api/dsa/dsa_reference.py::ref_sparse_attention_forward`.
+**Scope:** this module ships CuTe-DSL kernels for sparse-attention forward and
+backward, indexer scores/top-K, sparse/dense score recompute, and sparse/dense
+indexer backward. Sparse forward covers regular H64 and small-top-k Prefill
+H128; it does not include the H128 decode/split-KV mode.
 
 The module packages the following operations:
 
-1. **Sparse Attention Backward** – DSA backward (FlashMLA-shape, SM90/SM100).
-2. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
+1. **Sparse Attention Forward** – sparse Prefill MQA for the supported SM100
+   H64/H128 shapes.
+2. **Sparse Attention Backward** – DSA backward for flat MQA tensors on
+   SM90/SM100.
+3. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
    ratio causal mask) that materializes dense scores.
-3. **Combined Indexer Forward + Top-K** – SM100 compact score generation,
+4. **Combined Indexer Forward + Top-K** – SM100 compact score generation,
    Top-K selection, and optional Top-K softmax in one public API call.
-4. **Indexer Top-K** – SM90+ CuTe-DSL radix top-K kernel with per-row
+5. **Indexer Top-K** – SM90+ CuTe-DSL radix top-K kernel with per-row
    ``seq_lens``.
-5. **Sparse Indexer / Attention Score Recompute** – sparse (top-K) recompute
+6. **Sparse Indexer / Attention Score Recompute** – sparse (top-K) recompute
    of indexer and attention scores for training loss.
-6. **Dense Indexer / Attention Score Recompute** – dense (full-KV) analogues
+7. **Dense Indexer / Attention Score Recompute** – dense (full-KV) analogues
    of the above.
-7. **Indexer Backward** – three-stage pipeline (score-grad, three
+8. **Indexer Backward** – three-stage pipeline (score-grad, three
    GEMMs, dtype cast) for sparse top-K score tensors.
-8. **Dense Indexer Backward** – full-KV counterpart of Indexer Backward.
+9. **Dense Indexer Backward** – full-KV counterpart of Indexer Backward.
 
 ### Architecture
 
@@ -43,7 +46,7 @@ Q, K, W ──┬─► IndexerForward ──► scores ──► IndexerTopK �
           └─► IndexerForwardTopK ──► topk_idxs, logits, predict
                                                              │
                                                              v
-                      [FlashMLA fwd — external, C++] ──► out, lse
+                              SparseAttentionForward ──► out, lse
                                                              │
                                                       dout ──┤
                                                              v
@@ -63,7 +66,7 @@ Training-score loss path:
 ## Installation
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 ---
@@ -77,6 +80,9 @@ from cudnn import DSA
 
 DSA.SparseAttentionBackward
 DSA.sparse_attention_backward_wrapper
+
+DSA.SparseAttentionForward
+DSA.sparse_attention_forward_wrapper
 
 DSA.IndexerForward
 DSA.indexer_forward_wrapper
@@ -110,10 +116,71 @@ DSA.dense_indexer_backward_wrapper
 
 ## Components
 
-### 1. Sparse Attention Backward
+### 1. Sparse Attention Forward
 
-Backward pass for DeepSeek Sparse Attention. Expects the forward outputs
-(`out`, `lse`) from FlashMLA (or the PyTorch reference).
+Sparse Prefill forward for flat MQA tensors. For query row `t`, head `h`, and
+valid top-k slot `j`, the score is
+`softmax_scale * dot(q[t,h,:], kv[topk_idxs[t,j],:])`. Invalid and OOB indices
+have score `-inf`; duplicate indices remain distinct softmax slots. The
+attention sink participates only in the output denominator, not in any stats.
+
+- **Inputs**
+  - `q`: `(total_S_q, H, D_qk)` FP16 or BF16
+  - `kv`: `(total_S_kv, D_qk)`, with the same dtype as `q` (K = V latent; MQA)
+  - `topk_idxs`: `(total_S_q, K)` INT32 global token ids; K may be any
+    nonnegative value and is padded internally to a multiple of 64
+  - `attn_sink` (optional): `(H,)` FP32
+  - `topk_length` (optional): `(total_S_q,)` INT32, clamped to `[0, K]`
+  - `softmax_scale` (optional runtime float): defaults to `1 / sqrt(D_qk)`
+  - `indexer_topk`: compile-time prefix length
+- **Outputs** — stable `TupleDict` keys:
+  - `out`: `(total_S_q, H, 512)`, with the same dtype as `q`
+  - `max_logits`: `(total_S_q, H)` FP32
+  - `lse`: `(total_S_q, H)` FP32, KV-only and excluding the sink
+  - `lse_indexer`: `(total_S_q, H)` FP32, or `None` for `indexer_topk=0`
+- **Variants**
+  - H64: `D_qk in {512, 576}`, `indexer_topk in {0, 512, 1024, 2048}`
+  - H128 small-top-k Prefill: `D_qk=512`,
+    `indexer_topk in {0, 512, 1024}`
+- **Indexer prefix constraint** — `indexer_topk <= K`; when `topk_length` is
+  supplied and indexer LSE is enabled, every row must have
+  `topk_length >= indexer_topk`, matching the tile-boundary snapshot
+  contract.
+- **Empty rows** — `out=0`, `max_logits=-inf`, `lse=+inf`; an enabled
+  `lse_indexer` is also `+inf`.
+- **Compilation lifecycle** — `SparseAttentionForward.compile()` validates
+  and primes the API object, while the concrete CuTe kernel is JIT-compiled
+  on its first `execute()`/wrapper call because padding and live DLPack
+  layouts are runtime properties.
+- **Layout and stream** — non-contiguous or under-aligned Q/KV inputs are
+  materialized on the selected stream. An explicit `stream` must be a
+  `cuda.bindings.driver.CUstream` belonging to `q.device`.
+
+For `D_qk=576`, QK uses all 576 dimensions while V/output uses only the first
+512 KV dimensions. `attn_sink=None` is equivalent to an all-`-inf` sink.
+
+```python
+import math
+
+result = DSA.sparse_attention_forward_wrapper(
+    q,
+    kv,
+    topk_idxs,
+    attn_sink=attn_sink,
+    topk_length=topk_length,
+    softmax_scale=1.0 / math.sqrt(q.shape[-1]),
+    indexer_topk=512,
+)
+out = result["out"]
+max_logits = result["max_logits"]
+lse = result["lse"]
+lse_indexer = result["lse_indexer"]
+```
+
+### 2. Sparse Attention Backward
+
+Backward pass for DeepSeek Sparse Attention. Expects the forward wrapper's
+`out` and KV-only `lse` (or equivalent tensors).
 
 - **Inputs**
   - `q`: `(total_S_q, H, D)` BF16/FP16
@@ -123,19 +190,59 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward outputs
   - `attn_sink`: `(H,)` FP32
   - `topk_idxs`: `(total_S_q, topk_max)` INT32 (global)
   - `topk_length` (optional): `(total_S_q,)` INT32 — per-query valid count
+
+On Blackwell SM100/SM103, the public backward entry point automatically selects
+the tuned kernel from the device, dtype, and tensor shape. On SM100 (10, 0) and
+SM103 (10, 3) devices, BF16 H128 with `head_dim = head_dim_v = 512` and
+`topk_max ∈ {128, 512, 1024, 1152, 2048}` uses the two-CTA specialization. H16 with
+`head_dim=576` uses the dedicated M128 sparse-row pipeline. FP16, other head
+counts and dimensions, and every other `topk_max` retain the existing
+generic/H16 selection. Other compute capabilities, including SM107, do not
+select the two-CTA path. No backend or tile-size argument is required. SM90
+continues to use its Hopper-specific implementation.
+
+The H128 specialization keeps the five tensor-core products in one
+two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to the
+caller-provided scratch workspace, converts the FP32 dKV workspace to the public BF16
+output, and completes dSink with a separate FP32 reduction kernel. The helper
+launches do not change the two-CTA topology of the core computation.
+
+On SM100 with H16/H32/H64/H96/H128, `deterministic=True` selects a bounded-wave
+M64 implementation. Queries run in same-stream waves of 128 CTAs; CTA lane
+`i` is the sole writer of FP32 dKV shard `i` in each wave. H16/H32 use a masked
+M64 head tile. H96/H128 split each query wave into ordered M64 head-block
+launches, preserving single-writer ownership without multiplying the number
+of shards. Kernel launch ordering serializes both head blocks and shard reuse
+across waves, so the protocol needs neither semaphores nor cooperative launch.
+A fixed-order two-stage reduction combines the 128 shards, and one CTA per
+head reduces `d_sink`. The additional dKV workspace is
+`128 * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)` bytes. Use
+`scratch_workspace_bytes()` as the authoritative full scratch size.
+`deterministic=True` takes precedence over the two-CTA selection: the BF16
+H128/D512 envelope also runs the bounded-wave M64 kernel when determinism is
+requested, because the two-CTA path accumulates dKV with FP32 atomics.
+
+`SparseAttentionBackward.scratch_workspace_bytes()` reports the full SM100
+scratch requirement. Pass a contiguous CUDA `uint8` tensor of at least this
+size to `execute(..., workspace=workspace)` and reuse it across calls; the
+compiled kernel initializes the dKV accumulator on every execution. The
+high-level wrapper accepts the same optional `workspace=` argument and only
+allocates convenience scratch when it is omitted.
+
 - **Outputs** — tuple `(dq, dkv, d_sink)`
-- **Constraints** — SM90 or SM100; SM90 supports the FlashMLA DSA shape with `head_dim ∈ {512, 576}`
+- **Constraints** — SM90 or Blackwell SM100/SM103; SM90 supports flat MQA tensors with `head_dim ∈ {512, 576}`
 
 ```python
 result = DSA.sparse_attention_backward_wrapper(
     q, kv, out, dout, lse, attn_sink, topk_idxs,
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
+    deterministic=True,  # optional; SM100 H16/H32/H64/H96/H128
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
 ```
 
-### 2. Indexer Forward
+### 3. Indexer Forward (score-only)
 
 Computes dense indexer scores:
 ``S[b, q, k] = sum_h ReLU(Q_h · K_h^T) · W_h`` with a ratio-causal mask.
@@ -189,7 +296,7 @@ result = DSA.indexer_forward_wrapper(
 scores = result["scores"]
 ```
 
-### 3. Combined Indexer Forward + Top-K
+### 4. Combined Indexer Forward + Top-K
 
 `DSA.indexer_forward_top_k_wrapper` provides a one-call alternative to the
 two-call dense `indexer_forward_wrapper` + `indexer_top_k_wrapper` sequence
@@ -216,7 +323,7 @@ and is not CUDA-graph-capturable; THD capture requires the caller-provided
 offsets and buffers returned by `compress_topk_cand_buffer_size_thd`. Compact
 addressing requires `0 <= q_causal_offsets[b]`; rows extending beyond the KV
 prefix are clamped to `seqlen_k_b`. THD MXFP8 uses the same caller-guaranteed
-device-side scale-prefix contract described in §2; the interface does not
+device-side scale-prefix contract described in §3; the interface does not
 validate prefix values with a device-to-host copy.
 
 ```python
@@ -236,7 +343,7 @@ predict = result["softmax"]
 lse = result["lse"]
 ```
 
-### 4. Indexer Top-K
+### 5. Indexer Top-K
 
 Radix top-K kernel for selecting candidate KV indices from indexer scores,
 with variable per-row effective length.
@@ -256,7 +363,7 @@ result = DSA.indexer_top_k_wrapper(
 indices, values = result["indices"], result["values"]
 ```
 
-### 5. Sparse Indexer Score Recompute
+### 6. Sparse Indexer Score Recompute
 
 Computes softmax over top-K entries of the indexer score:
 ``predict[b, q, i] = softmax_i(sum_h ReLU(Q_h · K_{topk[i]}^T) · W_h)``.
@@ -267,7 +374,7 @@ Computes softmax over top-K entries of the indexer score:
   `batch_idx * S_k + local_idx`.
 - **Output** — `predict`: `(B, S_q, topk)` FP32.
 
-### 6. Sparse Attn Score Recompute
+### 7. Sparse Attn Score Recompute
 
 L1-normalised head-summed softmax over top-K entries:
 ``target[b, q, i] = sum_h exp(Q_h · K_{topk[i]}^T · scale - LSE_h) / Z``.
@@ -279,9 +386,9 @@ L1-normalised head-summed softmax over top-K entries:
 - **Output** — `target`: `(B, S_q, topk)` FP32.
 - Note: the wrapper handles the `-log2(e) * lse` preprocessing internally.
 
-### 7. Dense Indexer / Dense Attn Score Recompute
+### 8. Dense Indexer / Dense Attn Score Recompute
 
-Full-KV (no top-K) analogues of §5 and §6. Each returns `{'out', 'denom'}`.
+Full-KV (no top-K) analogues of §6 and §7. Each returns `{'out', 'denom'}`.
 They apply the same ratio-causal mask as Indexer Forward; masked positions are
 written as `-inf` and excluded from `denom`. Pass the same `q_causal_offsets` to
 all dense score tensors that feed the same loss path.
@@ -293,13 +400,14 @@ implementation lives in `score_recompute`; `indexer_forward` only imports it.
 Dense Attention Score Recompute has a separate MXFP8 kernel because its score
 and normalization semantics differ from the indexer path.
 
-### 8. Indexer Backward
+### 9. Indexer Backward
 
 Three-stage sparse top-K pipeline that produces the training gradients for the
 indexer tower:
 
-1. `ScoreGradSm90` / `ScoreGradSm100` (kernel 1) — in-place score-grad precompute from
-   `attn_score` (target) and `index_score` (predict).
+1. `ScoreGradSm90` / `ScoreGradSm100` (kernel 1) — in-place score-grad precompute
+   that overwrites `attn_score` (target) and reads `index_score` (predict)
+   without modifying it.
 2. `IndexerBackwardSm90` / `IndexerBackwardSm100` (kernel 2) — three
    warp-specialised GEMMs produce `d_index_q`, `d_weights`, and a
    `dIndexK_f32` accumulator.
@@ -324,17 +432,108 @@ d_index_q, d_weights, d_index_k = (
 
 When compressed forward returns its fused `softmax`, backward can skip both
 indexer Q@K score recompute and the separate logits softmax. Pass `softmax`
-directly as `index_score`; backward consumes and overwrites this buffer, so
-pass `softmax.clone()` if it must be preserved. `attn_score` must use the same
-valid-slot mask. Because compressed forward returns global indices by default,
-also pass `topk_indices_global=True` unless forward used
-`topk_indices_global=False`. The public sparse `indexer_backward_wrapper` has a
+directly as `index_score`; backward treats this buffer as read-only.
+`attn_score` must use the same valid-slot mask. Because compressed forward
+returns global indices by default, also pass `topk_indices_global=True` unless
+forward used `topk_indices_global=False`. The public sparse
+`indexer_backward_wrapper` has a
 BSHD-shaped interface; BF16 THD tensors can use zero-copy `B=1` views (squeeze
 the singleton K head and add a batch dimension) together with global Top-K
 indices. FP8 and MXFP8 indexer backward are not currently supported because
 the backward wrapper requires BF16 Q/K/W inputs.
 
-### 9. Dense Indexer Backward
+#### SM100 sparse backward v2 (opt-in)
+
+`backend="sm100_v2"` on `IndexerBackward` / `indexer_backward_wrapper`
+selects an alternative kernel-2 (GEMM stage) implementation. `backend` is a
+string enum, one of `{"default", "sm100_v2"}` (default `"default"`; an
+unknown value raises `ValueError`). The semantics are
+**request-or-fail**: outside the envelope below the wrapper raises
+`ValueError` (or `RuntimeError` off SM100) and never silently falls back to
+the default backend.
+
+- **What it computes differently** — weights are upcast to fp32 in-register
+  (exact) and the fp32 per-slot gradient matrix is split into a two-term BF16
+  expansion (`hi + lo`) before the MMAs, so each individual product in the
+  dQ/dK contractions is exact in the fp32 accumulator when it is finite
+  there (~675x lower
+  gradient-matrix representation error than the default single-BF16 rounding,
+  measured as an aggregate over 1e6 random values; individual values gain
+  less when their `lo` term is small). `lo` is ~2^-9 of `hi`, so it starts to
+  underflow for gradient-matrix magnitudes below ~1e-35 (measured 518x at
+  1e-35, 63x at 1e-36, and no advantage left at 1e-38), and the FP32->BF16
+  conversion is non-saturating, so a magnitude at or above BF16's
+  round-to-nearest overflow threshold (`2^128 - 2^119` ~= 3.3962e38, itself
+  above BF16's 3.3895e38 maximum) becomes an infinity in `hi` and the opposite
+  infinity in `lo`, which sum to NaN rather than being clamped. `d_weights` is reduced deterministically — `d_weights` and
+  `d_index_q` are bitwise run-to-run stable; `d_index_k` stays in the same
+  fp32-atomic summation-order class as the default backend.
+- **Output dtype selects output precision** — `d_weights` and `d_index_k`
+  accept FP32 buffers, which receive the fp32 accumulators directly; **the
+  headline accuracy gains require caller-supplied FP32 buffers.** The default
+  wrapper-allocated outputs keep the input dtypes (BF16), which rounds the
+  extra accuracy back to the BF16 representation floor (~1.7e-3 relative).
+  FP32 `d_index_k` is zeroed internally (no caller pre-zero contract).
+  `d_index_q` is always BF16.
+- **Envelope** (validated by `check_support` when a plan is created, and
+  re-validated against the real tensors on every execute -- cache hits
+  included -- before any buffer is mutated) —
+  SM100 (10, 0) only; `H == 64`, `D == 128`, `block_I == 128`;
+  `topk % 128 == 0` with `128 <= topk <= 2048`; `sm_scale > 0`; contiguous
+  same-device tensors; `attn_score`/`index_score`/`topk_indices` shaped
+  `(B, S_q, topk)`. `sm_scale` folds into the gradient in kernel 2 while the
+  relu gate reads the *unscaled* score, which is equivalent for any positive
+  scale except at the underflow-to-zero boundary: for a slot whose scaled
+  score `sm_scale * S` rounds to zero the default backend drops the slot and
+  this backend keeps it, and because the gate is a step function that slot's
+  full dQ/dK contribution (`g' * w`, not scaled by `S`) is what differs. The
+  default backend's multiply preserves subnormals, so reaching it takes an
+  exact `sm_scale * S` below `2^-150` (~7.0e-46).
+- **Scratch / workspace behavior** — `attn_score` is consumed in place and left
+  holding kernel 1's `grad_signal`, while `index_score` is read-only and
+  preserved. `sm_scale` folds inside kernel 2 without touching either buffer.
+  The backend owns one piece of per-plan workspace — the
+  dynamic-ticket counter — allocated on first execute and reused by every
+  later one. A BF16 `d_index_k` additionally needs a `B * S_k * D` fp32
+  accumulator (2 MiB = 2,097,152 bytes at B=1, S_k=4096, D=128, growing with
+  `S_k`); that one comes from PyTorch's caching allocator on every call, which
+  is a pool hit in steady state — it has to be re-zeroed per call anyway, and
+  this way it stays reclaimable via `torch.cuda.empty_cache()` instead of
+  staying pinned for as long as the plan is cached. The wrapper still
+  allocates any output buffer you do not pass in.
+- **Concurrency** — executions sharing one plan must not overlap on the
+  device (the ticket counter is per-plan workspace). One plan serves one
+  device: the workspace is device-resident, and execution rejects tensors on
+  any other device before overwriting `attn_score`. The wrapper keys its
+  plan cache on the CUDA device and on the **resolved** stream (`stream` when
+  given, otherwise `torch.cuda.current_stream()` at call time), so calls that
+  differ in device or stream get a private plan and private workspace; calls
+  that land on the same cache entry must not be allowed to overlap. The key
+  is the integer stream handle, plus the calling thread's id for the one handle
+  CUDA does not make unique across host threads: `cudaStreamPerThread`
+  is the value 2 in every thread and means "the calling thread's own stream",
+  so two threads that pass it explicitly get a private plan each. Users
+  driving `IndexerBackward` objects directly must use one object per device,
+  and one per stream wherever those streams' executions can overlap; a single
+  object may target any stream if its executions are serialized.
+- **Local top-k ids** (`topk_indices_global=False`) are masked against the
+  per-batch `S_k` before the batch offset is applied, in-kernel: ids `< 0` or
+  `>= S_k` contribute nothing and can never alias a neighbouring batch.
+
+```python
+# fp32 output buffers unlock the full accuracy gain
+d_weights = torch.empty(B, S_q, H, dtype=torch.float32, device="cuda")
+d_index_k = torch.empty(B, S_k, D, dtype=torch.float32, device="cuda")
+result = DSA.indexer_backward_wrapper(
+    index_q, weights, index_k,
+    attn_score, index_score, topk_indices,
+    grad_loss=grad_loss, sm_scale=1.0, loss_coeff=1.0, block_I=128,
+    backend="sm100_v2",
+    d_weights=d_weights, d_index_k=d_index_k,
+)
+```
+
+### 10. Dense Indexer Backward
 
 Full-KV counterpart to Indexer Backward. It consumes raw dense score tensors
 and denominators produced by Dense Indexer / Dense Attn Score Recompute.
@@ -374,12 +573,21 @@ result = DSA.dense_indexer_backward_wrapper(
 
 ## Limitations
 
-- **Architecture support** — Sparse Attention Backward, Score Recompute,
-  Indexer Forward, Indexer Top-K, and Indexer Backward support SM90 and SM100.
-  The combined compressed-logits + Top-K forward is SM100-only; the standalone
-  Indexer Top-K remains SM90+.
-- **No fused forward** — the production forward is FlashMLA (C++); this
-  module ships only the CuTe-DSL kernels.
+- **CuTe DSL requirement** — install `nvidia-cutlass-dsl[cu13]>=4.5.0`.
+  Sparse Attention Forward emits the few SM100 instructions that are not yet
+  exposed by the public CuTe facade through the MLIR LLVM inline-assembly
+  interface shared by CuTe DSL 4.5 and newer releases.
+- **Architecture support** — Sparse Attention Forward supports the mapped
+  SM100-family capabilities 10.0, 10.3, and 10.7 only.
+  Sparse Attention Backward, Score Recompute, Indexer Forward, Indexer Top-K,
+  and Indexer Backward support SM90 and SM100. The combined compressed-logits
+  + Top-K forward is SM100-only; the standalone Indexer Top-K remains SM90+.
+- **Forward scope** — only the 11 supported Prefill instances described above;
+  no SM90, regular H128, FP8 cache, decode, or split-KV forward path.
+- **Sparse gather path** — the public CuTe facade does not yet expose the TMA
+  `gather4` operation. Sparse Attention Forward therefore
+  uses a feature-local LLVM inline-assembly bridge with the compiler-owned TMA
+  descriptor; the issued data movement remains hardware TMA `gather4`.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
   `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16 and MXFP8
   support `qhead_per_kv_head ∈ {32, 64}`. Both the dense and combined Top-K

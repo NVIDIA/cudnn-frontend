@@ -35,7 +35,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from .engine_ids import FAMILY_BLOCK, FROST_GEMM_ID_BASE, FROST_SDPA_BWD_ID_BASE, FROST_SDPA_FWD_ID_BASE, GDN2_ID_BASE, GDN_ID_BASE, KDA_ID_BASE
+from .engine_ids import FAMILY_BLOCK, FROST_GEMM_ID_BASE, FROST_SDPA_BWD_ID_BASE, FROST_SDPA_FWD_ID_BASE, GDN2_ID_BASE, GDN_ID_BASE, GDP_ID_BASE, KDA_ID_BASE
 
 _LOG = logging.getLogger("cudnn.engines.manifest")
 
@@ -92,6 +92,13 @@ class EngineFamily:
     # can rank -- an engine cannot see its siblings. None falls back to one
     # default plan per accepting engine, ahead of the backend's.
     heuristics: Optional[Tuple[str, str]] = None
+    # ("module", "callable") validating a graph of this family natively in
+    # python -- ``validate_graph(graph) -> bool`` runs the family's version- and
+    # arch-agnostic semantic rules with the classic error types and returns False
+    # (having raised nothing) when the graph holds a node it does not cover, so
+    # pygraph.validate() takes the classic eager C++ lowering instead. None means
+    # the family has no native validator and always validates classically.
+    validator: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -123,12 +130,15 @@ _ANCHOR_NODE_TO_FAMILY = {
     "SDPA_FP8": "frost_sdpa_fwd",
     "SDPA_MXFP8": "frost_sdpa_fwd",
     "SDPA_BWD": "frost_sdpa_bwd",
+    "SDPA_MXFP8_BWD": "frost_sdpa_bwd",
     "GDN": "gdn",
     "GDN_BWD": "gdn",
     "KDA": "kda",
     "KDA_BWD": "kda",
     "GDN2": "gdn2",
     "GDN2_BWD": "gdn2",
+    "GDP": "gdp",
+    "GDP_BWD": "gdp",
 }
 
 # ---------------------------------------------------------------------------
@@ -162,11 +172,20 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
+        GDP_ID_BASE,
+        "gdp",
+        "cudnn.linear_attention",
+        "GdpEngines",
+        slots={"gdp_frost": EngineSlot(0)},
+        analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
+    ),
+    EngineFamily(
         FROST_GEMM_ID_BASE,
         "frost_gemm",
         "cudnn.gemm.frost.engine",
         "FrostGemmEngines",
         slots={"frost_gemm": EngineSlot(0, opt_in=True)},
+        validator=("cudnn._gemm_validate", "validate_graph"),
     ),
     EngineFamily(
         FROST_SDPA_FWD_ID_BASE,
@@ -174,21 +193,23 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.sdpa.fwd.engine",
         "FrostSdpaFwdEngines",
         # Slots are FIXED FOREVER; append the next free one, never reorder.
+        # RETIRED (one engine per arch x dtype family absorbed the per-head-dim
+        # rows; kernel-flavor choice moved into the lowering — never reuse):
+        #   0 sm100_d128, 1 sm100_d256, 2 sm100_d512, 3 sm100_d128_mxfp8,
+        #   4 sm100_d128_fp8, 6 sm100_d192_d128, 9 sm100_d192_d128_fp8,
+        #   10 sm100_d192_d128_mxfp8
         slots={
-            "sdpa_fwd_prefill_sm100_d128": EngineSlot(0, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d256": EngineSlot(1, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d512": EngineSlot(2, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d128_mxfp8": EngineSlot(3, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d128_fp8": EngineSlot(4, opt_in=True),
             "sdpa_fwd_prefill_sm120": EngineSlot(5, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d192_d128": EngineSlot(6, opt_in=True),
             "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7, opt_in=True),
             "sdpa_fwd_prefill_sm80": EngineSlot(8, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d192_d128_fp8": EngineSlot(9, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d192_d128_mxfp8": EngineSlot(10, opt_in=True),
+            "sdpa_fwd_prefill_sm100": EngineSlot(11, opt_in=True),
+            "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
+            "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13, opt_in=True),
+            "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
+        validator=("cudnn._sdpa_validate", "validate_graph"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -198,8 +219,11 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         slots={
             "sdpa_bwd_sm120": EngineSlot(0, opt_in=True),
             "sdpa_bwd_sm80": EngineSlot(1, opt_in=True),
+            "sdpa_bwd_sm100": EngineSlot(2, opt_in=True),
+            "sdpa_bwd_sm100_mxfp8": EngineSlot(3, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
+        validator=("cudnn._sdpa_validate", "validate_graph"),
     ),
 )
 
@@ -253,7 +277,12 @@ def _resolve(family: EngineFamily, ref: Optional[Tuple[str, str]], what: str):
 
 
 def resolve_heuristics(family: EngineFamily):
-    """The family's plan-ranking callable, or None when it declares none."""
+    """The family's proposal callable, or None when it declares none.
+
+    The contract is ``recommend(kind, facts, offered) -> [PlanConfig]`` — pure
+    and backend-blind; placement against the backend's entries happens once
+    for every family in ``engines/heuristics._assemble``.
+    """
     return _resolve(family, family.heuristics, "heuristics")
 
 
@@ -264,6 +293,12 @@ def resolve_analyzer(family: EngineFamily):
     family's heuristics and engines then read that same record back.
     """
     return _resolve(family, family.analyzer, "analyzer")
+
+
+def resolve_validator(family: EngineFamily):
+    """The family's python-native graph validator, or None (see EngineFamily.validator)."""
+
+    return _resolve(family, family.validator, "validator")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):

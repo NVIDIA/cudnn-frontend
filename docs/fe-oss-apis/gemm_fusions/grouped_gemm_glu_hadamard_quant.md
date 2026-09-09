@@ -41,12 +41,14 @@ Let `N_out = N / 2` for `act_func="swiglu"` or `"geglu"` and `N_out = N` for `ac
   - `C`: intermediate GEMM result before activation/clamping, shape `(valid_m, N, 1)`
   - `D`: post-activation output, logical shape `(valid_m, N_out, 1)`
   - `SFD`: swizzled e4m3 scale factors for NVFP4 `D`, shape `SF(valid_m, N_out)`, present only when `D` is NVFP4
-  - `RHT`: optional Hadamard-transform output, logical shape `(valid_m, N_out, 1)`
-  - `SFRHT`: e4m3 scale factors for NVFP4 `RHT`, present only when `RHT` is NVFP4
-    - Rowwise RHT: swizzled shape `SF(valid_m, N_out)`
-    - Colwise RHT: swizzled shape `SF(N_out, valid_m)`
+  - `RHT rowwise`: optional Hadamard-transform output across feature blocks, logical shape `(valid_m, N_out, 1)`
+  - `SFRHT rowwise`: scale factors for NVFP4 rowwise `RHT`, shape `SF(valid_m, N_out)`, present only when rowwise `RHT` is NVFP4
+  - `RHT colwise`: optional NVFP4 Hadamard-transform output across token blocks, flattened in per-expert transposed order
+  - `SFRHT colwise`: scale factors for NVFP4 colwise `RHT`, flattened in per-expert ragged order
 
-For packed NVFP4 output tensors (`torch.float4_e2m1fn_x2`), the physical tensor stores two logical values per byte along the innermost dimension. The wrapper therefore allocates packed `D` and `RHT` tensors with physical second dimension `N_out / 2`. Raw `torch.uint8` tensors are not accepted as a packed FP4 container by this fusion. RHT data is always stored in the same logical `(m, feature)` orientation as `D`; `rht_rowwise` only changes the transform axis and, for quantized RHT, the `SFRHT` scale domain.
+For packed NVFP4 output tensors (`torch.float4_e2m1fn_x2`), the physical tensor stores two logical values per byte along the innermost dimension. The wrapper therefore allocates packed `D` and rowwise `RHT` tensors with physical second dimension `N_out / 2`. Raw `torch.uint8` tensors are not accepted as a packed FP4 container by this fusion.
+
+Colwise `RHT` is NVFP4-only. Its data tensor is a flat physical tensor of length `valid_m * N_out / 2`; after FP4 unpacking, each expert segment is logical `(N_out, expert_m)` with adjacent token values packed together. Expert segments are concatenated in expert order. `SFRHT colwise` is flat length `valid_m * N_out / sf_vec_size`; each expert segment is `SF(N_out, expert_m)` flattened in expert order, so the scale segment for an expert starts at `N_out * expert_m_prefix / sf_vec_size`.
 
 `L` is the expert count. `valid_m` is the `M` extent of `a_tensor`; by contract it must match the final cumulative padded offset in `padded_offsets`.
 
@@ -86,7 +88,7 @@ $$
 D = \mathrm{prob} \cdot \mathrm{ReLU}(C)^2
 $$
 
-When requested, the RHT output applies a fixed 16-wide orthonormal Hadamard transform to bf16-rounded `D`, either across feature blocks (`rht_rowwise=True`) or across token blocks (`rht_rowwise=False`).
+When requested, the RHT output applies a fixed 16-wide orthonormal Hadamard transform to bf16-rounded `D`. Rowwise RHT transforms feature blocks. Colwise RHT transforms token blocks and writes NVFP4 data in per-expert transposed order.
 
 When `D` or `RHT` is NVFP4, the kernel emits packed e2m1 data plus e4m3 scale factors. `norm_const` and `rht_norm_const` are the corresponding global encode scales.
 
@@ -138,9 +140,7 @@ result = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
     c_dtype=torch.bfloat16,
     d_dtype=torch.float4_e2m1fn_x2,
     cd_major="n",
-    rht_output=True,
-    rht_dtype=torch.float4_e2m1fn_x2,
-    rht_rowwise=False,
+    rht_colwise_dtype=torch.float4_e2m1fn_x2,
     norm_const=norm_const,
     rht_norm_const=rht_norm_const,
     mma_tiler_mn=(256, 256),
@@ -156,11 +156,11 @@ result = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
 c_tensor = result["c_tensor"]
 d_tensor = result["d_tensor"]
 sfd_tensor = result["sfd_tensor"]
-rht_tensor = result["rht_tensor"]
-sfrht_tensor = result["sfrht_tensor"]
+rht_colwise_tensor = result["rht_colwise_tensor"]
+sfrht_colwise_tensor = result["sfrht_colwise_tensor"]
 ```
 
-Set `rht_output=False` to skip the Hadamard/RHT output. Set `d_dtype=torch.bfloat16` or `rht_dtype=torch.bfloat16` to request unquantized bf16 outputs for the corresponding path.
+Leave both `rht_rowwise_dtype` and `rht_colwise_dtype` unset to skip the Hadamard/RHT output. Set `rht_rowwise_dtype=torch.bfloat16` for unquantized rowwise RHT, `rht_rowwise_dtype=torch.float4_e2m1fn_x2` for quantized rowwise RHT, or `rht_colwise_dtype=torch.float4_e2m1fn_x2` for wgrad-compatible colwise RHT.
 
 ### Class API
 
@@ -178,8 +178,8 @@ op = GroupedGemmGluHadamardQuantSm100(
     sample_alpha=alpha,
     sample_prob=prob,
     sample_sfd=sfd,
-    sample_rht=rht,
-    sample_sfrht=sfrht,
+    sample_rht_colwise=rht_colwise,
+    sample_sfrht_colwise=sfrht_colwise,
     sample_bias=bias,
     acc_dtype=torch.float32,
     mma_tiler_mn=(256, 256),
@@ -189,7 +189,6 @@ op = GroupedGemmGluHadamardQuantSm100(
     vector_f32=False,
     m_aligned=256,
     act_func="swiglu",
-    rht_rowwise=False,
 )
 assert op.check_support()
 op.compile()
@@ -204,8 +203,8 @@ op.execute(
     alpha_tensor=alpha,
     prob_tensor=prob,
     sfd_tensor=sfd,
-    rht_tensor=rht,
-    sfrht_tensor=sfrht,
+    rht_colwise_tensor=rht_colwise,
+    sfrht_colwise_tensor=sfrht_colwise,
     bias_tensor=bias,
     norm_const=norm_const,
     rht_norm_const=rht_norm_const,
@@ -290,15 +289,24 @@ result = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
   - Shape: `SF(valid_m, N_out)` = `(32, 4, ceil_div(valid_m, 128), 4, ceil_div(ceil_div(N_out, sf_vec_size), 4), 1)`
   - Layout: swizzled scale-factor layout matching `SFA`
   - Dtype: `float8_e4m3fn`
-- Output tensor **RHT** (optional)
+- Output tensor **RHT rowwise** (optional)
   - Logical shape: `(valid_m, N_out, 1)`
   - Layout: must be `n`-major
   - Dtype: `{bfloat16, float4_e2m1fn_x2}`
-  - NVFP4 `RHT` requires `SFRHT`
-- Output tensor **SFRHT** (present only with NVFP4 `RHT`)
-  - Shape: `SF(valid_m, N_out)` when `rht_rowwise=True`; `SF(N_out, valid_m)` when `rht_rowwise=False`
+  - NVFP4 rowwise `RHT` requires `SFRHT rowwise`
+- Output tensor **SFRHT rowwise** (present only with NVFP4 rowwise `RHT`)
+  - Shape: `SF(valid_m, N_out)`
   - Layout: swizzled scale-factor layout
-  - Dtype: `float8_e4m3fn`
+  - Dtype: `float8_e4m3fn`, independent of `SFA`/`SFB` dtype
+- Output tensor **RHT colwise** (optional)
+  - Logical unpacked shape: per-expert `(N_out, expert_m)` segments concatenated in expert order
+  - Physical shape: 1-D packed FP4 tensor with `valid_m * N_out / 2` elements
+  - Dtype: `float4_e2m1fn_x2`
+  - NVFP4 colwise `RHT` always requires `SFRHT colwise`
+- Output tensor **SFRHT colwise** (present with colwise `RHT`)
+  - Shape: `(valid_m * N_out / sf_vec_size,)`
+  - Layout: flattened per-expert `SF(N_out, expert_m)` segments in expert order
+  - Dtype: `float8_e4m3fn`, independent of `SFA`/`SFB` dtype
 
 ### Configuration
 
@@ -309,7 +317,8 @@ result = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
 - `sf_vec_size`: must be `16`
 - `sf_fp8_dtype_override`: `None` uses the scale format implied by `SFA`/`SFB` dtype. `"e5m3"` reinterprets `torch.float8_e4m3fn` SFA/SFB storage as UE5M3 input scale factors; this is Rubin-only and does not convert tensor contents.
 - `m_aligned`: must be `256`
-- `rht_rowwise`: selects feature-blocked Hadamard/RHT (`True`) or token-blocked Hadamard/RHT (`False`); for quantized RHT, the scale grid follows the selected axis
+- `rht_rowwise_dtype`: unset to skip rowwise RHT, `torch.bfloat16` for unquantized rowwise RHT, or `torch.float4_e2m1fn_x2` for NVFP4 rowwise RHT
+- `rht_colwise_dtype`: unset to skip colwise RHT, or `torch.float4_e2m1fn_x2` for NVFP4 colwise RHT in per-expert transposed order
 - `glu_alpha`: optional final output scale for `swiglu`/`geglu`
 - `glu_limit`: optional clamp limit applied to both gate and up blocks for `swiglu`/`geglu`
 - `norm_const`: global encode scale for NVFP4 `D`
@@ -325,6 +334,7 @@ result = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
 - NVFP4 quantization requires `N_out` divisible by `128`.
 - NVFP4 quantization is not supported with `act_func="srelu"`.
 - `sf_fp8_dtype_override="e5m3"` requires Rubin (SM107) and `SFA`/`SFB` tensors stored as `torch.float8_e4m3fn`.
-- `SFRHT` in colwise quantized mode uses the transposed scale domain `SF(N_out, valid_m)`.
+- At most one of rowwise and colwise RHT may be requested.
+- Colwise RHT is NVFP4-only and uses flat per-expert ragged scale storage.
 - `expert_cnt` must be `<= 1024`.
 - Dense and discrete weight modes are mutually exclusive.

@@ -22,7 +22,9 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
 from benchmark_utils import (
+    add_fto_alignment_arg,
     add_sweep_args,
+    fto_alignment,
     group_offsets,
     rand_e8m0,
     report_pool,
@@ -36,9 +38,9 @@ from benchmark_utils import (
 )
 
 
-def _build_plan(g, cfg, cta_group, sched):
+def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+    return jit_from_cudnn_graph(g, config=cfg)
 
 
 def _vp_moe_bs_mg(handles, gemm_pairs, fto, outs, *aux):
@@ -72,7 +74,7 @@ _COMBOS = {
 }
 
 
-def _graph_swiglu(S, N, K, E, combo):
+def _graph_swiglu(S, N, K, E, combo, alignment=1):
     block_size, a_dt, sf_dt = _COMBOS[combo]
     sf_k = K // block_size
     g = cudnn.pygraph(
@@ -109,6 +111,7 @@ def _graph_swiglu(S, N, K, E, combo):
         dim=[E, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
+        alignment_value=alignment,
     )
     sf = g.tensor(
         name="scaleFactor",
@@ -229,15 +232,15 @@ def _unfused_launch(tok, w0, w1, out, S, N, K, E):
 
 
 def _build_spec_map():
-    """Label -> (geometry cfg, cta_group, scheduler) for multi-GEMM MoE
+    """Label -> (geometry cfg, cta_group) for multi-GEMM MoE
     block-scale strategies. Dual TMEM fits two accs + SF only at cta_tile_n<=128."""
     chain = analyze(_graph_swiglu(1024, 256, 512, 2, "nvfp4")[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline not in ("sm100", "sm107") or cfg.cta_tile_n > 128 or cfg.mma_inst_m != 128:
+        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 128 or cfg.mma_tile_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = cfg.name
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 
@@ -249,6 +252,7 @@ def main() -> int:
     p.add_argument("--shape", default="8,512,4096,4096", help="G,M,N,K (even split)")
     p.add_argument("--combo", choices=tuple(_COMBOS), default="nvfp4")
     add_sweep_args(p, nsys=False)
+    add_fto_alignment_arg(p)
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -273,6 +277,7 @@ def main() -> int:
     print()
 
     offsets = group_offsets(S, E)
+    alignment = fto_alignment(args.fto_alignment, offsets)
 
     # --- baseline: unfused 2×cuBLAS batched BF16 GEMM + pointwise ---
     wbf = _mkdata_bf16(S, N, K, E)
@@ -301,12 +306,12 @@ def main() -> int:
         if spec is None:
             print(f"  {label:66s} UNKNOWN (not a sweepable MoE block-scale swiglu strategy)")
             continue
-        cfg, cta_group, sched = spec
+        cfg, cta_group = spec
         if args.stream:
             print(f"  ▶ running {label} ...", flush=True)
         try:
-            g, h = _graph_swiglu(S, N, K, E, combo)
-            plan = _build_plan(g, cfg, cta_group, sched)
+            g, h = _graph_swiglu(S, N, K, E, combo, alignment)
+            plan = _build_plan(g, cfg, cta_group)
         except (NotImplementedError, ValueError):
             continue
         try:

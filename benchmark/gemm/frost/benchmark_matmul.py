@@ -40,9 +40,9 @@ from benchmark_utils import (
 
 
 def _build_spec_map():
-    """Legacy label -> (geometry cfg, cta_group, scheduler) for every sweepable
+    """Legacy label -> (geometry cfg, cta_group) for every sweepable
     matmul strategy, via the registry funnel. Labels reconstruct the old
-    CONFIG_..._Nctamma[_static] form so --configs still accepts them."""
+    CONFIG_..._Nctamma form so --configs still accepts them."""
     chain = _FC(
         matmul=_MS(
             M=4096,
@@ -58,8 +58,9 @@ def _build_spec_map():
     )
     m = {}
     for t, cfg in _candidates(chain):
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = cfg.name
+        # A family without the CTA-pair axis (sm120) has no cta_group at all.
+        m[label] = (cfg, getattr(cfg, "cta_group", 1))
     return m
 
 
@@ -72,10 +73,16 @@ def _vp(handles, a, b, c):
     return {A: a, B: b, C: c}
 
 
-def _build_plan(g, cfg, name):
+def _build_plan(g, cfg, _name):
     """JIT-compile the recorded graph with a forced tile config."""
-    _, cta_group, scheduler = spec_for(name, _SPEC_MAP)
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = jit_from_cudnn_graph(g, config=cfg)
+    if getattr(compiled, "workspace_bytes", 0):
+        from cudnn.frost.workspace import Workspace
+
+        buf = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+        ws = Workspace(buf, compiled.workspace_bytes, "benchmark_matmul")
+        return lambda vp, stream=None: compiled(vp, stream=stream, workspace=ws)
+    return compiled
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +250,7 @@ def main() -> int:
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
                 continue
-            tok = kernel_match_token(cfg, spec[1], spec[2])
+            tok = kernel_match_token(cfg, spec[1])
             matches = [(k, v) for k, v in kern_times.items() if tok in k]
             if not matches:
                 rows.append((name, 0.0, float("inf"), "NO_KERNEL_IN_NSYS"))

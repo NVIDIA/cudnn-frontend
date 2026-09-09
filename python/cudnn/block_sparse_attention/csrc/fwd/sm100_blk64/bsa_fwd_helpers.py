@@ -9,7 +9,10 @@ from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
 from cudnn.block_sparse_attention.csrc.utils import mma_sm100_desc as sm100_desc
-from cudnn.block_sparse_attention.csrc.utils.tcgen05_mma_helpers import i64_to_i32x2
+from cudnn.block_sparse_attention.csrc.utils.tcgen05_mma_helpers import (
+    _tcgen05_mma_kind,
+    i64_to_i32x2,
+)
 
 
 @cute.jit
@@ -67,6 +70,19 @@ def tcgen05_fence_after_thread_sync() -> None:
         None,
         [],
         "tcgen05.fence::after_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def tcgen05_fence_before_thread_sync() -> None:
+    llvm.inline_asm(
+        None,
+        [],
+        "tcgen05.fence::before_thread_sync;",
         "",
         has_side_effects=True,
         is_align_stack=False,
@@ -134,6 +150,31 @@ def tmem_load_32dp32b32x(tmem_addr: Int32) -> Tuple[Float32, ...]:
 
 
 @cute.jit
+def tmem_load_red_max_32dp32b32x(
+    tmem_addr: Int32,
+) -> Tuple[Tuple[Float32, ...], Float32]:
+    """Load 32 FP32 TMEM values and return their hardware-reduced maximum."""
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 33),
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()],
+        "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32 "
+        "{"
+        "$0, $1, $2, $3, $4, $5, $6, $7, "
+        "$8, $9, $10, $11, $12, $13, $14, $15, "
+        "$16, $17, $18, $19, $20, $21, $22, $23, "
+        "$24, $25, $26, $27, $28, $29, $30, $31"
+        "}, $32, [$33];",
+        ",".join(["=r"] * 33 + ["r"]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    values = tuple(Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(32))
+    row_max = Float32(llvm.extractvalue(T.f32(), out, [32]))
+    return values, row_max
+
+
+@cute.jit
 def cvt_f32x2_to_bf16x2(a: Float32, b: Float32) -> Int32:
     return Int32(
         llvm.inline_asm(
@@ -141,6 +182,32 @@ def cvt_f32x2_to_bf16x2(a: Float32, b: Float32) -> Int32:
             [Float32(b).ir_value(), Float32(a).ir_value()],
             "cvt.rn.satfinite.bf16x2.f32 $0, $1, $2;",
             "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def cvt_f32x4_to_e4m3x4(a: Float32, b: Float32, c: Float32, d: Float32) -> Int32:
+    """Pack four FP32 values into one E4M3x4 register."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(a).ir_value(),
+                Float32(b).ir_value(),
+                Float32(c).ir_value(),
+                Float32(d).ir_value(),
+            ],
+            "{\n\t"
+            ".reg .b16 out01, out23;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 out01, $2, $1;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 out23, $4, $3;\n\t"
+            "mov.b32 $0, {out01, out23};\n\t"
+            "}",
+            "=r,f,f,f,f",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -216,6 +283,22 @@ def tmem_store_bf16x16(tmem_addr: Int32, vals: cute.Tensor) -> None:
         [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()] + [Int32(vals[i]).ir_value() for i in range(16)],
         f"tcgen05.st.sync.aligned.32x32b.x16.b32 [$0], {{{regs}}};",
         ",".join(["r"] * 17),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def tmem_store_e4m3x8(tmem_addr: Int32, vals: cute.Tensor) -> None:
+    """Store 32 packed E4M3 values (8 b32 registers) into TMEM."""
+    assert cute.size(vals) == 8
+    regs = ", ".join(f"${i + 1}" for i in range(8))
+    llvm.inline_asm(
+        None,
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()] + [Int32(vals[i]).ir_value() for i in range(8)],
+        f"tcgen05.st.sync.aligned.32x32b.x8.b32 [$0], {{{regs}}};",
+        ",".join(["r"] * 9),
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -380,6 +463,85 @@ def smem_exchange_reduce_store_bf16x32(
 
 
 @cute.jit
+def smem_exchange_reduce_scale_store_bf16x32(
+    own_exchange_smem_addr: Int32,
+    partner_exchange_smem_addr: Int32,
+    sO_smem_addr0: Int32,
+    sO_smem_addr1: Int32,
+    sO_smem_addr2: Int32,
+    sO_smem_addr3: Int32,
+    scale_smem_addr0: Int32,
+    scale_smem_addr1: Int32,
+    scale_smem_addr2: Int32,
+    scale_smem_addr3: Int32,
+) -> None:
+    """Reduce two FP32 exchange tiles, apply V scale, then convert once."""
+    load_ops = "\n\t".join(
+        f"add.u32 addr_own, own, {group * 32 * 4 * 4};\n\t"
+        f"add.u32 addr_partner, partner, {group * 32 * 4 * 4};\n\t"
+        f"ld.shared.v4.b32 {{a{group * 4 + 0}, a{group * 4 + 1}, a{group * 4 + 2}, a{group * 4 + 3}}}, [addr_own];\n\t"
+        f"ld.shared.v4.b32 {{b{group * 4 + 0}, b{group * 4 + 1}, b{group * 4 + 2}, b{group * 4 + 3}}}, [addr_partner];"
+        for group in range(8)
+    )
+    scale_load_ops = "\n\t".join(f"ld.shared.b32 v{group * 8 + item}, [${6 + group}+{item * 4}];" for group in range(4) for item in range(8))
+    add_scale_ops = "\n\t".join(
+        f"mov.b64 la, {{a{i}, a{i + 1}}};\n\t"
+        f"mov.b64 lb, {{b{i}, b{i + 1}}};\n\t"
+        f"mov.b64 lv, {{v{i}, v{i + 1}}};\n\t"
+        "add.rn.f32x2 la, la, lb;\n\t"
+        "mul.rn.f32x2 la, la, lv;\n\t"
+        f"mov.b64 {{a{i}, a{i + 1}}}, la;"
+        for i in range(0, 32, 2)
+    )
+    store_ops = "\n\t".join(
+        f"cvt.rn.satfinite.bf16x2.f32 p0, a{j + 1}, a{j + 0};\n\t"
+        f"cvt.rn.satfinite.bf16x2.f32 p1, a{j + 3}, a{j + 2};\n\t"
+        f"cvt.rn.satfinite.bf16x2.f32 p2, a{j + 5}, a{j + 4};\n\t"
+        f"cvt.rn.satfinite.bf16x2.f32 p3, a{j + 7}, a{j + 6};\n\t"
+        f"st.shared.v4.b32 [${2 + j // 8}], {{p0, p1, p2, p3}};"
+        for j in range(0, 32, 8)
+    )
+    llvm.inline_asm(
+        None,
+        [
+            Int32(own_exchange_smem_addr).ir_value(),
+            Int32(partner_exchange_smem_addr).ir_value(),
+            Int32(sO_smem_addr0).ir_value(),
+            Int32(sO_smem_addr1).ir_value(),
+            Int32(sO_smem_addr2).ir_value(),
+            Int32(sO_smem_addr3).ir_value(),
+            Int32(scale_smem_addr0).ir_value(),
+            Int32(scale_smem_addr1).ir_value(),
+            Int32(scale_smem_addr2).ir_value(),
+            Int32(scale_smem_addr3).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .b32 own;\n\t"
+        ".reg .b32 partner;\n\t"
+        ".reg .b32 addr_own;\n\t"
+        ".reg .b32 addr_partner;\n\t"
+        ".reg .b32 a<32>;\n\t"
+        ".reg .b32 b<32>;\n\t"
+        ".reg .b32 v<32>;\n\t"
+        ".reg .b32 p<4>;\n\t"
+        ".reg .b64 la;\n\t"
+        ".reg .b64 lb;\n\t"
+        ".reg .b64 lv;\n\t"
+        "mov.b32 own, $0;\n\t"
+        "mov.b32 partner, $1;\n\t"
+        f"{load_ops}\n\t"
+        f"{scale_load_ops}\n\t"
+        f"{add_scale_ops}\n\t"
+        f"{store_ops}\n\t"
+        "}\n",
+        "r,r,r,r,r,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
 def smem_exchange_reduce_store_f32x32(
     own_exchange_smem_addr: Int32,
     partner_exchange_smem_addr: Int32,
@@ -504,7 +666,8 @@ def gemm_ptx_partial(
     pred_str = "p" if zero_init_is_dynamic else "0" if zero_init else "1"
     pred_input = zero_init if zero_init_is_dynamic else not zero_init
     pred_setp = "setp.eq.b32" if zero_init_is_dynamic else "setp.ne.b32"
-    mma_instr = "tcgen05.mma.ws.cta_group::1.kind::f16"
+    mma_kind = _tcgen05_mma_kind(op)
+    mma_instr = f"tcgen05.mma.ws.cta_group::1.kind::{mma_kind}"
     mma_suffix = ", 0"
     if const_expr(not is_ts):
         assert mbar_ptr is None, "mbar_ptr must be None when a_src is not TMEM"
@@ -574,7 +737,7 @@ def gemm_ptx_partial(
                 "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 1; \n\t"
                 "@P1 bra.uni DONE; \n\t"
                 "bra.uni LAB_WAIT; \n\t"
-                "DONE: \n\t"
+                "DONE: \n\t" + ("tcgen05.fence::after_thread_sync; \n\t" if const_expr(op.a_dtype.width == 8) else "")
             )
         else:
             split_arrive_idx = 0

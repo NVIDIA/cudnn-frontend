@@ -129,13 +129,18 @@ EngineFamily(
     slots={"sdpa_fwd_prefill_sm100_d128": EngineSlot(0, opt_in=True), ...},
     analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
     heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
+    validator=("cudnn._sdpa_validate", "validate_graph"),
 ),
 ```
 
 - A family is **pure data**: strings and ints, zero imports of engine code.
   `import cudnn` must never pay the CuTe-DSL import (~1.2 s) merely to know an
-  engine exists. `analyzer` and `heuristics` are `(module, callable)` pairs for
-  the same reason, resolved only when something needs to rank.
+  engine exists. `analyzer`, `heuristics` and `validator` are `(module, callable)`
+  pairs for the same reason, resolved only when something needs them. The
+  `validator` is what lets `pygraph.validate()` skip the eager C++ lowering for
+  a graph a python engine may serve (it runs the family's semantic rules; the
+  backend's verdict is deferred to planning) — see
+  `docs/python_graph_and_execution_backends.md`, *The manifest*.
 - **A family is a KIND OF GRAPH**, not a group of engines that ship together.
   `_ANCHOR_NODE_TO_FAMILY` maps a node type to the one family that serves that
   kind of graph, so a graph belongs to exactly one family or to none, and
@@ -312,9 +317,11 @@ python/cudnn/
       kernels/
         prefill_d256_f16_sm100.py     naming: <phase>_d<dim>_<dtype-family>_sm<arch>.py
         prefill_d512_f16_sm100.py
-        prefill_f16_sm120.py
+        prefill_f16_sm120.py          general SM120 template (any head dim)
+        prefill_d256_f16_sm120.py     d256 flavor
         _common_sm100.py
-        thd_sm100.py
+        _common_sm120.py
+        thd_helpers.py
     bwd/                        future: same shape, its own api_dsl.py
 
   gemm/frost/                   engine.py + graph_analyzer.py + compiler.py
@@ -528,13 +535,13 @@ levels, with no shared vocabulary at all:
 
 - **Vocabulary per operation.** Each op defines a typed, frozen dataclass:
   `cudnn.sdpa.fwd.engines.SdpaFwdKnobs(sched_policy=None, tile_m=None,
-  tile_n=None, cga=None)`, where `None` means "no preference". SDPA's knobs
-  cannot collide with GEMM's; fields have real types instead of
-  enum-plus-int64.
+  tile_n=None, cga=None, pack_gqa=None)`, where `None` means "no
+  preference". SDPA's knobs cannot collide with GEMM's; fields have real
+  types instead of enum-plus-int64.
 - **Domains per engine.** Each `Capabilities` row advertises the values its
   lowering honors: `sched_policies = {NATURAL}`, `tile_ms = {128}`,
-  `tile_ns = {128}`, `cgas = {2}`. Two engines of the same op may honor
-  different subsets.
+  `tile_ns = {128}`, `cgas = {2}`, `pack_gqas = {False}`. Two engines of the
+  same op may honor different subsets.
 - **Per plan, not per graph.** A knob set rides on `PlanConfig.knobs`, so a
   tuning choice is part of the plan's identity: a family that wants several
   tunings ranked emits several `PlanConfig`s from `recommend()`, each with its
@@ -687,17 +694,18 @@ sdpa_bwd_sm100_d128                 (future)
   one row serves several compute capabilities. The row's `Capabilities.arches`
   set is the source of truth for exactly which; the name never enumerates
   minors.
-- Head dimensions are omitted when one engine accepts a domain of dimensions,
-  as the SM120 prefill engine does. `Capabilities.d_qk` and `d_v` are the
-  source of truth for that domain.
-- Geometry-specific engines use `d<dqk>` and append `x<dv>` only when the two
-  head dimensions differ.
+- Head dimensions never appear in engine names: one engine per
+  arch x dtype family accepts a DOMAIN of dimensions and its lowering picks
+  the kernel flavor (the smallest native shape covering the graph).
+  `Capabilities.d_shapes` (native flavor shapes) plus `d_pad_multiple`
+  (envelope alignment; 0 = exact shapes only) are the source of truth for
+  that domain.
 - No version counters. If a genuinely distinct second engine ever serves the
   same cell, give it a descriptive variant suffix (e.g. `_cga4`), not a number.
 - Names are for humans; `engine_id` is for machines. Pin by index
   (`select_plan`) or replay by id -- never by parsing a name.
-- `cudnn.sdpa.fwd.engines.engine_name(d)` computes geometry-specific names;
-  omit `d` for dimension-agnostic engines.
+- `cudnn.sdpa.fwd.engines.engine_name(arch=..., fp8=..., mxfp8=...)` computes
+  the family names (test/user convenience).
 
 
 ## Kernel templates and TemplateParams
@@ -809,6 +817,15 @@ Asserts:
     frontend-integration test that it appears in `graph.plans` and runs when
     pinned. Mark test modules `pytest.mark.L0` -- the default pytest addopts
     is `-m L0` and unmarked tests silently never run. Run
-    `ci/run_style_check_diff.sh --apply` (black, 160 cols) before pushing.
+    `pre-commit run --all-files` (black, 160 cols) before pushing.
 13. **Keep this document true.** If code and this contract disagree and you
     change the code, change this file in the same commit.
+14. **Coverage changes update the support matrix.** A change to any SDPA
+    `Capabilities` field that affects graph eligibility, or adding/retiring
+    an `EngineSpec`, updates
+    `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.
+    That tracker is the only arch x pass x head-dim x dtype view of what
+    FROST serves, it is maintained by hand from these rows, and it silently
+    rots otherwise. Knob-domain-only changes are exempt (it does not track
+    knobs). `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the
+    exact scope and is the number to cite in review.

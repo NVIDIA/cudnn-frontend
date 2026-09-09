@@ -152,6 +152,22 @@ ZERO_PRESERVING_OPS: frozenset[str] = frozenset(
 )
 
 
+def out_major_of(stride: "tuple[int, ...] | None") -> "OutMajor":
+    """A dense output's layout, read off its STRIDE alone.
+
+    Not off `dim`: cuDNN fills a derived tensor's extents only at
+    `build_operation_graph()` time, while its stride is there from the start, so
+    the extents are not available to disambiguate a degenerate N == 1. An unset
+    stride is the default layout."""
+    if not stride:
+        return "n"
+    if stride[-1] == 1:
+        return "n"
+    if stride[-2] == 1:
+        return "m"
+    raise ValueError(f"output must be N-major or M-major in the inner (M,N) plane; got stride={stride!r}")
+
+
 @dataclass(frozen=True)
 class ChainOutput:
     """One materialized GMEM output. ``source`` = where the value is taken from:
@@ -162,10 +178,15 @@ class ChainOutput:
     source: str
     dtype: Dtype
     dim: "tuple[int, int, int] | None" = None
-    stride: "tuple[int, ...] | None" = None
+    stride: "tuple[int, int, int] | None" = None
     is_reduction: bool = False
     is_quant_scale: bool = False
     quant_block_size: int | None = None
+
+    @property
+    def major(self) -> "OutMajor":
+        """Derived, not stored -- see `out_major_of`."""
+        return out_major_of(self.stride)
 
 
 @dataclass(frozen=True)
@@ -180,18 +201,22 @@ class OutputSpec:
 
     source_ref: int
     dtype: Dtype
-    major: OutMajor = "n"
     quant_idx: int | None = None
-    dim: "tuple[int, ...] | None" = None
-    stride: "tuple[int, ...] | None" = None
+    dim: "tuple[int, int, int] | None" = None
+    stride: "tuple[int, int, int] | None" = None
 
     def __post_init__(self) -> None:
+        for _f, _v in (("dim", self.dim), ("stride", self.stride)):
+            if _v is not None and len(_v) != 3:
+                raise ValueError(f"output {_f} must be rank-3 (got {_v!r})")
         if self.dtype not in SUPPORTED_DTYPES:
             raise ValueError(f"unsupported output dtype {self.dtype!r}")
-        if self.major not in ("n", "m"):
-            raise ValueError(f"output major must be 'n' or 'm' (got {self.major!r})")
-        if self.quant_idx is not None and self.dtype not in ("fp8_e4m3", "fp8_e5m2", "fp4_e2m1"):
-            raise ValueError(f"block quantize output dtype {self.dtype!r} is not supported; " "expected fp8_e4m3, fp8_e5m2, or fp4_e2m1")
+        self.major  # noqa: B018 -- reject an unsupported layout at construction
+
+    @property
+    def major(self) -> OutMajor:
+        """Derived, not stored -- see `out_major_of`."""
+        return out_major_of(self.stride)
 
 
 @dataclass(frozen=True)
@@ -222,6 +247,33 @@ class ReductionSpec:
             raise ValueError(f"reduction output dtype {self.dtype!r} must match compute_dtype " f"{self.compute_dtype!r} for direct atomic reduction")
 
 
+# What a block_scale_quantize may emit as DATA. The SCALE half has its own set on
+# `BlockQuantizeSpec.scale_dtype` -- ue5m3 lives there, not here: it is a scale
+# format, carried end to end as an opaque byte.
+QUANT_DATA_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp4_e2m1")
+
+# A sub-byte dtype packs two adjacent M rows into one byte, and those rows are
+# held by different lanes -- a read-modify-write race, not an implementation gap.
+M_MAJOR_OUT_DTYPES = ("bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2", "fp8_e8m0", "fp8_e5m3", "int8", "uint8", "int32")
+
+
+def segmented_row_scale_capacity_rows(total_rows: int, num_groups: int) -> int:
+    """Static rows needed by independently 128-row-padded group segments.
+
+    Runtime group sizes are device data. For ``total_rows=M`` split across at
+    most ``num_groups=G`` non-empty groups, the exact maximum number of 128-row
+    atoms is ``A + (M - A) // 128``, where ``A=min(M,G)``. This graph-time
+    envelope admits every valid partition without synchronizing the offsets.
+    """
+    if total_rows < 0:
+        raise ValueError(f"segmented row scale total_rows must be non-negative; got {total_rows}")
+    if num_groups < 1:
+        raise ValueError(f"segmented row scale num_groups must be positive; got {num_groups}")
+    active = min(total_rows, num_groups)
+    max_atoms = active + (total_rows - active) // 128
+    return 128 * max_atoms
+
+
 @dataclass(frozen=True)
 class BlockQuantizeSpec:
     """One block-scale quantize node (cuDNN ``block_scale_quantize``): each
@@ -234,10 +286,16 @@ class BlockQuantizeSpec:
     Col quant: compact `(B, M/block_size, N)`, F8_128x4 = the transposed atom
     `(B, rup(N,128), rup(M/bs,4))`.
 
-    ``grouped_by_moe`` (col + F8_128x4 only; declared via ``group_offset=fto``
-    on the quant node) = per-group segmented col-SF: each routed group is its
-    own compact table at its atom-quad base, same total footprint. Runtime
-    CONTRACT: every fto value must be a multiple of ``4 * block_size``."""
+    ``grouped_by_moe`` (F8_128x4 only; declared via ``group_offset=fto`` on the
+    quant node) makes each routed group its own scale segment. For col quant the
+    segment is the group's compact transposed table at its atom-quad base; the
+    runtime CONTRACT remains that every fto value is a multiple of
+    ``4 * block_size``. For row quant the segment starts at the prefix sum of
+    the preceding groups' 128-row atom counts. For fixed ``M`` and declared
+    group count ``G``, ``scale_dim[1]`` must cover the graph-time worst case
+    ``128 * (A + (M-A)//128)``, ``A=min(M,G)``. This admits every valid runtime
+    partition without reading device offsets on the host. Padding scale bytes
+    are not written by the quantizer and must be initialized to a valid value."""
 
     source_ref: int
     block_size: int
@@ -262,8 +320,8 @@ class BlockQuantizeSpec:
             raise ValueError(f"block quantize scale reordering {self.scale_reorder!r} is not supported; " "expected None or F8_128x4")
         if self.compute_dtype != "fp32":
             raise ValueError(f"block quantize compute_dtype {self.compute_dtype!r} is not supported; " "expected fp32")
-        if self.grouped_by_moe and (self.axis != 1 or self.scale_reorder != "F8_128x4"):
-            raise ValueError("grouped block quantize requires the M axis (col) and F8_128x4 scale reordering")
+        if self.grouped_by_moe and self.scale_reorder != "F8_128x4":
+            raise ValueError("grouped block quantize requires F8_128x4 scale reordering")
 
 
 @dataclass(frozen=True)
@@ -544,6 +602,7 @@ class MoeSpec:
     # time; the scheduler casts reads to Int32 so the math is dtype-agnostic.
     offset_dtype: Dtype = "int32"
     num_groups: int = 0
+    offset_multiple: int = 1
 
     def __post_init__(self) -> None:
         if self.num_experts < 1:
@@ -554,6 +613,8 @@ class MoeSpec:
             raise ValueError(f"MoE grouped matmul mode {self.mode!r} is out of POC scope; " "only 'none' is supported (gather / scatter rejected)")
         if self.offset_dtype not in ("int32", "int64"):
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
+        if self.offset_multiple < 1:
+            raise ValueError(f"first_token_offset alignment_value must be >= 1; " f"got {self.offset_multiple}")
 
 
 def _walk_dtype_fields(obj: object, found: "set[Dtype]", *, in_dtype_field: bool = False) -> None:
@@ -660,6 +721,9 @@ class FusionChain:
                     raise ValueError(f"quants[{qi}] source GEMM {g} out of range for " f"{self.num_gemms} GEMM(s)")
             elif not (0 <= q.source_ref < len(self.ops)):
                 raise ValueError(f"quants[{qi}] source op index {q.source_ref} out of range " f"for {len(self.ops)} op(s)")
+        for i, spec in enumerate(self.output_specs):
+            if spec.major == "m" and spec.dtype not in M_MAJOR_OUT_DTYPES:
+                raise ValueError(f"output_specs[{i}] is M-major, so its dtype must be one of " f"{M_MAJOR_OUT_DTYPES}; got {spec.dtype!r}.")
         quant_refs = []
         for i, spec in enumerate(self.output_specs):
             if spec.quant_idx is None:
@@ -670,6 +734,13 @@ class FusionChain:
                 raise ValueError(
                     f"output_specs[{i}] source ref {spec.source_ref} does not match "
                     f"quants[{spec.quant_idx}] source ref {self.quants[spec.quant_idx].source_ref}"
+                )
+            if spec.dtype not in QUANT_DATA_DTYPES:
+                raise ValueError(
+                    f"output_specs[{i}] carries quants[{spec.quant_idx}], so its value is that "
+                    f"node's quantized DATA and its dtype must be one of {QUANT_DATA_DTYPES}; got "
+                    f"{spec.dtype!r}. The SCALE half is a separate output and its dtype is "
+                    f"`BlockQuantizeSpec.scale_dtype`."
                 )
             quant_refs.append(spec.quant_idx)
         if sorted(quant_refs) != list(range(len(self.quants))):

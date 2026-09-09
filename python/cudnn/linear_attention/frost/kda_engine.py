@@ -3,7 +3,7 @@
 
 """FROST KDA engine: KDA nodes on the chunked prefill kernel
 (``kernel/kda_prefill_f16.py``) and KDA_BWD nodes on the chunked backward
-kernel (``kernel/kda_bprop_f16.py``), Blackwell SM100/SM103, bf16/fp16,
+kernel (``kernel/kda_bprop_f16.py``), SM100/SM103/SM107, bf16/fp16,
 BT=16.  The backward regenerates the per-chunk state checkpoints with the recompute
 kernel (``kernel/kda_recompute_f16.py``) when the graph does not provide
 one."""
@@ -30,19 +30,19 @@ def build_kda(graph):
         raise ValueError("build_kda: graph does not contain exactly one KDA/KDA_BWD node")
     node = nodes[0]
     if node.node_type.name == "KDA_BWD":
-        from .kernel import kda_bprop_f16 as bwd_mod
-        from .kernel import kda_recompute_f16 as regen_mod
+        from .kernel import kda_bprop_f16 as bwd_module
+        from .kernel import kda_recompute_f16 as recompute_module
 
-        return CompiledKdaBwd(node, bwd_mod, regen_mod)
-    from .kernel import kda_prefill_f16 as kernel_mod
+        return CompiledKdaBwd(node, bwd_module, recompute_module)
+    from .kernel import kda_prefill_f16 as kernel_module
 
-    return CompiledKda(node, kernel_mod)
+    return CompiledKda(node, kernel_module)
 
 
 class KdaFrostEngine(BaseEngine):
     """FROST chunked-kernel backend for single-node KDA graphs (THD layout).
 
-    Default KDA engine on SM100/SM103 (lowest KDA engine_id); serves KDA
+    Default KDA engine on SM100/SM103/SM107 (lowest KDA engine_id); serves KDA
     forward and KDA_BWD (with a forward checkpoint recompute when ``state_checkpoints`` is absent)."""
 
     name = "kda_frost"
@@ -53,48 +53,53 @@ class KdaFrostEngine(BaseEngine):
 
         facts = graph._facts_for(analyze)
         frost_la_gate("KdaFrostEngine", facts, "KDA")
-        ckpt = facts.checkpoint_every_n_tokens
-        if ckpt and (facts.is_bwd or ckpt % 16 != 0):
-            raise NotImplementedError(f"KdaFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 on the KDA node (got {ckpt})")
+        if facts.d_qk not in (64, 128):
+            raise NotImplementedError(f"KdaFrostEngine: q/k head dim must be 64 or 128, got {facts.d_qk}")
+        if facts.d_v not in (64, 128):
+            raise NotImplementedError(f"KdaFrostEngine: v head dim must be 64 or 128, got {facts.d_v}")
+        if facts.gate_channels != facts.d_qk:
+            raise NotImplementedError(f"KdaFrostEngine: g must carry d_qk = {facts.d_qk} channels, got {facts.gate_channels}")
+        checkpoint = facts.checkpoint_every_n_tokens
+        if checkpoint and checkpoint % 16 != 0:
+            raise NotImplementedError(f"KdaFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 (got {checkpoint})")
         if not facts.gates_at_ho:
             raise NotImplementedError(f"KdaFrostEngine: g/beta must carry HO = max(q, v) heads ({facts.h_o})")
-        fp32 = cudnn.data_type.FLOAT
-        beta_want = facts.io_dtype if facts.use_beta_sigmoid else fp32
-        if beta_want is not None and facts.beta_dtype not in (beta_want, None):
-            raise NotImplementedError(f"KdaFrostEngine: 'beta' must be {beta_want} (io-dtype logits under use_beta_sigmoid), got {facts.beta_dtype}")
+        beta_wants = (cudnn.data_type.FLOAT, facts.io_dtype)
+        if facts.beta_dtype not in beta_wants + (None,):
+            raise NotImplementedError(f"KdaFrostEngine: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
+        state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
+        for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
+            if got not in state_dtypes + (None,):
+                raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32/bf16, got {got}")
+        if not facts.state_pair_match:
+            raise NotImplementedError("KdaFrostEngine: initial_state and final_state dtypes must match")
+        gate_param_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
-            if got not in (fp32, None):
-                raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32, got {got}")
+            if got not in gate_param_dtypes + (None,):
+                raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32/bf16/fp16, got {got}")
         if facts.is_bwd:
-            for port, got in (
-                ("d_a_log", facts.d_a_log_dtype),
-                ("d_dt_bias", facts.d_dt_bias_dtype),
-                ("initial_state", facts.state_dtype),
-                ("d_final_state", facts.d_final_state_dtype),
-                ("d_initial_state", facts.d_initial_state_dtype),
-                ("dG", facts.dg_dtype),
-            ):
-                if got not in (fp32, None):
-                    raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32, got {got}")
+            for port, got, want in (("d_a_log", facts.d_a_log_dtype, facts.a_log_dtype), ("d_dt_bias", facts.d_dt_bias_dtype, facts.dt_bias_dtype)):
+                if got is not None and want is None:
+                    raise NotImplementedError(f"KdaFrostEngine: '{port}' requires its parameter input")
+                if got not in (want, None):
+                    raise NotImplementedError(f"KdaFrostEngine: '{port}' must match its parameter dtype ({want}), got {got}")
+            state_grad_want = facts.state_dtype if facts.state_dtype is not None else cudnn.data_type.FLOAT
+            for port, got in (("d_final_state", facts.d_final_state_dtype), ("d_initial_state", facts.d_initial_state_dtype)):
+                if got not in (state_grad_want, None):
+                    raise NotImplementedError(f"KdaFrostEngine: '{port}' must match the state dtype ({state_grad_want}), got {got}")
+            if facts.wants_d_initial_state and facts.d_initial_state_dtype is None:
+                raise NotImplementedError(f"KdaFrostEngine: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
+            if facts.dg_dtype not in (facts.g_dtype, None):
+                raise NotImplementedError(f"KdaFrostEngine: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
             for port, got in (("dO", facts.do_dtype), ("state_checkpoints", facts.state_checkpoints_dtype)):
                 if got not in (facts.io_dtype, None):
                     raise NotImplementedError(f"KdaFrostEngine: '{port}' must match the io dtype")
-            dbeta_want = facts.io_dtype if facts.use_beta_sigmoid and facts.io_dtype is not None else fp32
-            if facts.dbeta_dtype not in (dbeta_want, None):
-                raise NotImplementedError(f"KdaFrostEngine: 'dBeta' must be {dbeta_want}, got {facts.dbeta_dtype}")
-        else:
-            state_dtypes = (fp32, cudnn.data_type.BFLOAT16)
-            for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
-                if got not in state_dtypes + (None,):
-                    raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32/bf16, got {got}")
-            if facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
-                raise NotImplementedError("KdaFrostEngine: 'state_checkpoints' must match the io dtype")
-            if not facts.state_pair_match:
-                raise NotImplementedError("KdaFrostEngine: initial_state and final_state dtypes must match")
+            if facts.dbeta_dtype not in (facts.beta_dtype, None):
+                raise NotImplementedError(f"KdaFrostEngine: 'dBeta' must match 'beta' ({facts.beta_dtype}), got {facts.dbeta_dtype}")
+        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
+            raise NotImplementedError("KdaFrostEngine: 'state_checkpoints' must match the io dtype")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        # Bake the plan for the handle's device (via ctx), not the ambient one; a
-        # foreign raw-int handle (or none) carries no device -> None -> current.
         handle = ctx.handle if ctx is not None else None
         device = handle.device.ordinal if hasattr(handle, "device") else None
         with build_device(device):
@@ -104,37 +109,39 @@ class KdaFrostEngine(BaseEngine):
 class CompiledKda:
     """Compiled FROST KDA plan: a callable over the resolved node buffers."""
 
-    def __init__(self, node, kernel_mod):
+    def __init__(self, node, kernel_module):
         from .common.split_k import WORK_ITEM_FIELDS, build_split_table, chunk_scratch_rows, compute_ideal_chunks, max_work_items, run_table
 
         self.node = node
-        self.kernel = kernel_mod
+        self.kernel = kernel_module
         self.build_split_table = build_split_table
         self.run_table = run_table
         self.table = None
         self.kcache = None
         self.plan_name = "KdaFrostEngine (KDA)"
+        self.device = current_device()
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
+        self.allow_neg_eigval = bool(node.params.get("allow_neg_eigval", False))
         self.safe_gate = bool(node.params.get("safe_gate", False))
-        glb = node.params.get("gate_lower_bound")
-        self.gate_lower_bound = float(glb) if glb is not None else kernel_mod.DEFAULT_GATE_LOWER_BOUND
+        gate_lower_bound = node.params.get("gate_lower_bound")
+        self.gate_lower_bound = float(gate_lower_bound) if gate_lower_bound is not None else kernel_module.DEFAULT_GATE_LOWER_BOUND
         self.has_final_state = "final_state" in node.outputs
         self.has_state_checkpoints = "state_checkpoints" in node.outputs
-        self.ckpt = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
+        self.checkpoint = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
 
         q, g = node.inputs["q"], node.inputs["g"]
-        self.b_t = kernel_mod.CFG.B_T
-        self.split = self.ckpt % self.b_t == 0 and not self.batch_invariant
+        self.b_t = kernel_module.CFG.B_T
+        self.split = self.checkpoint % self.b_t == 0 and not self.batch_invariant
         total = q.dim[0]
         HO = g.dim[1]
         B = node.inputs["cu_seqlens"].dim[0] - 1
         layout = WorkspaceLayout()
-        self.off_sched = layout.add(8)
-        self.num_sm = multiprocessor_count(current_device())
+        self.off_scheduler = layout.add(8)
+        self.num_sm = multiprocessor_count(self.device)
         self.n_tiles = B * HO
         self.n_heads_out = HO
         if self.split:
@@ -151,12 +158,12 @@ class CompiledKda:
             self.off_chunk_scratch = layout.add(self.chunk_scratch_rows * HO * 4)
         from .common.host import tensormap_workspace_bytes
 
-        self.tensormap_bytes = tensormap_workspace_bytes(kernel_mod, B)
+        self.tensormap_bytes = tensormap_workspace_bytes(kernel_module, B)
         self.off_tensormaps = layout.add(self.tensormap_bytes, align=128)
         self.needs_table = self.split
-        self.ws_bytes = layout.size
+        self.workspace_size = layout.size
         regions = [
-            (self.off_sched, "int32", (2,)),
+            (self.off_scheduler, "int32", (2,)),
             (self.off_work_items, "int32", (self.work_item_rows, WORK_ITEM_FIELDS)),
             (self.off_work_count, "int32", (1,)),
         ]
@@ -169,47 +176,47 @@ class CompiledKda:
         self.carve = carve_plan("KdaFrostEngine (KDA)", regions)
 
     def workspace_bytes(self) -> int:
-        return self.ws_bytes
+        return self.workspace_size
 
     def bind(self, names) -> None:
         pos = {name: i for i, name in enumerate(names)}
-        self.iq = pos["q"]
-        self.ik = pos["k"]
-        self.iv = pos["v"]
-        self.ig = pos["g"]
-        self.ibeta = pos["beta"]
-        self.icu = pos["cu_seqlens"]
-        self.is0 = pos.get("initial_state")
-        self.io_ = pos["O"]
-        self.ifs = pos.get("final_state")
-        self.ick = pos.get("state_checkpoints")
-        self.ia_log = pos.get("a_log")
-        self.idt_bias = pos.get("dt_bias")
+        self.index_q = pos["q"]
+        self.index_k = pos["k"]
+        self.index_v = pos["v"]
+        self.index_g = pos["g"]
+        self.index_beta = pos["beta"]
+        self.index_cu_seqlens = pos["cu_seqlens"]
+        self.index_initial_state = pos.get("initial_state")
+        self.index_o = pos["O"]
+        self.index_final_state = pos.get("final_state")
+        self.index_state_checkpoints = pos.get("state_checkpoints")
+        self.index_a_log = pos.get("a_log")
+        self.index_dt_bias = pos.get("dt_bias")
 
     def run(self, views, workspace, stream) -> None:
-        q = views[self.iq]
-        k = views[self.ik]
-        v = views[self.iv]
-        g = views[self.ig]
-        beta = views[self.ibeta]
-        cu = views[self.icu]
-        state0 = views[self.is0] if self.is0 is not None else None
-        o = views[self.io_]
-        final_state = views[self.ifs] if self.ifs is not None else None
-        state_checkpoints = views[self.ick] if self.ick is not None else None
-        a_log = views[self.ia_log] if self.ia_log is not None else None
-        dt_bias = views[self.idt_bias] if self.idt_bias is not None else None
+        q = views[self.index_q]
+        k = views[self.index_k]
+        v = views[self.index_v]
+        g = views[self.index_g]
+        beta = views[self.index_beta]
+        cu = views[self.index_cu_seqlens]
+        state0 = views[self.index_initial_state] if self.index_initial_state is not None else None
+        o = views[self.index_o]
+        final_state = views[self.index_final_state] if self.index_final_state is not None else None
+        state_checkpoints = views[self.index_state_checkpoints] if self.index_state_checkpoints is not None else None
+        a_log = views[self.index_a_log] if self.index_a_log is not None else None
+        dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         stream = stream if stream is not None else 0
 
         if self.split:
-            sched_ctr, work_items, work_count, item_scratch, chunk_scratch, tensormaps = workspace.carve(self.carve)
+            scheduler_counter, work_items, work_count, item_scratch, chunk_scratch, tensormaps = workspace.carve(self.carve)
         else:
-            sched_ctr, work_items, work_count, tensormaps = workspace.carve(self.carve)
+            scheduler_counter, work_items, work_count, tensormaps = workspace.carve(self.carve)
             item_scratch = chunk_scratch = None
 
         if self.kcache is not None and (self.table is not None or not self.needs_table):
             if self.needs_table:
-                self.run_table(self.table, g, a_log, dt_bias, cu, chunk_scratch, item_scratch, work_items, work_count, sched_ctr, stream)
+                self.run_table(self.table, g, a_log, dt_bias, cu, chunk_scratch, item_scratch, work_items, work_count, scheduler_counter, stream)
             self.kernel.run_prefill(
                 self.kcache,
                 q,
@@ -226,10 +233,10 @@ class CompiledKda:
                 state_checkpoints,
                 work_items,
                 work_count,
-                sched_ctr,
+                scheduler_counter,
                 item_scratch,
                 tensormaps,
-                self.ckpt if self.has_state_checkpoints else 0,
+                self.checkpoint if self.has_state_checkpoints else 0,
                 self.scale,
                 stream,
             )
@@ -254,14 +261,14 @@ class CompiledKda:
                 a_log=a_log,
                 dt_bias=dt_bias,
                 gate_lower_bound=self.gate_lower_bound if self.safe_gate else None,
-                sched_ctr=sched_ctr,
+                scheduler_counter=scheduler_counter,
                 split=self.split,
                 stream=stream,
             )
 
-        ckpt_kwargs = {}
+        checkpoint_kwargs = {}
         if self.has_state_checkpoints:
-            ckpt_kwargs = dict(checkpoint_every_n_tokens=self.ckpt, output_state_checkpoints=state_checkpoints)
+            checkpoint_kwargs = dict(checkpoint_every_n_tokens=self.checkpoint, output_state_checkpoints=state_checkpoints)
         self.kcache = self.kernel.chunk_kda_sm100(
             q,
             k,
@@ -275,16 +282,19 @@ class CompiledKda:
             self.scale,
             use_qk_l2norm_in_kernel=self.use_qk_l2norm,
             use_beta_sigmoid_in_kernel=self.use_beta_sigmoid,
+            allow_neg_eigval=self.allow_neg_eigval,
             safe_gate=self.safe_gate,
             gate_lower_bound=self.gate_lower_bound,
             a_log=a_log,
             dt_bias=dt_bias,
             work_items=work_items,
             work_count=work_count,
-            sched_ctr=sched_ctr,
+            scheduler_counter=scheduler_counter,
             work_item_scratch=item_scratch,
             tensormap_workspace=tensormaps,
-            **ckpt_kwargs,
+            **checkpoint_kwargs,
+            device=self.device,
+            num_sm=self.num_sm,
             stream=stream,
         )
         return None
@@ -297,18 +307,19 @@ class CompiledKdaBwd:
     gradients land in HO-head scratch and are reduced back to the native head
     counts."""
 
-    def __init__(self, node, bwd_mod, regen_mod):
+    def __init__(self, node, bwd_module, recompute_module):
         from .common.split_k import WORK_ITEM_FIELDS, build_split_table, chunk_scratch_rows, compute_ideal_chunks, max_work_items, run_table
 
         self.node = node
-        self.bwd = bwd_mod
-        self.regen = regen_mod
+        self.bwd = bwd_module
+        self.recompute = recompute_module
         self.build_split_table = build_split_table
         self.run_table = run_table
         self.table = None
         self.kcache = None
-        self.regen_cache = None
+        self.recompute_cache = None
         self.plan_name = "KdaFrostEngine (KDA_BWD)"
+        self.device = current_device()
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
@@ -320,14 +331,20 @@ class CompiledKdaBwd:
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
         self.safe_gate = bool(node.params.get("safe_gate", False))
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
-        glb = node.params.get("gate_lower_bound")
-        self.gate_lower_bound = float(glb) if glb is not None else bwd_mod.DEFAULT_GATE_LOWER_BOUND
+        self.allow_neg_eigval = bool(node.params.get("allow_neg_eigval", False))
+        gate_lower_bound = node.params.get("gate_lower_bound")
+        self.gate_lower_bound = float(gate_lower_bound) if gate_lower_bound is not None else bwd_module.DEFAULT_GATE_LOWER_BOUND
         self.gate_bwd_blocks = GATE_BWD_BLOCKS
         self.has_state_checkpoints = "state_checkpoints" in node.inputs
         self.has_dstate0 = "d_initial_state" in node.outputs
+        self.has_a_log = "a_log" in node.inputs
+        self.has_dt_bias = "dt_bias" in node.inputs
 
         q, g, v = node.inputs["q"], node.inputs["g"], node.inputs["v"]
-        self.b_t = bwd_mod.CFG.B_T
+        self.b_t = bwd_module.CFG.B_T
+        self.checkpoint_cadence = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
+        self.coarse_checkpoints = self.has_state_checkpoints and self.checkpoint_cadence > self.b_t
+        self.needs_recompute = not self.has_state_checkpoints or self.coarse_checkpoints
         total = q.dim[0]
         HQ, HV = q.dim[1], v.dim[1]
         HO = g.dim[1]
@@ -336,11 +353,10 @@ class CompiledKdaBwd:
         self.io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
         self.n_heads_out, self.total = HO, total
         layout = WorkspaceLayout()
-        self.off_sched = layout.add(16)
-        self.num_sm = multiprocessor_count(current_device())
-        self.bwd_dyn_sched = B * HO <= self.num_sm
+        self.off_scheduler = layout.add(16)
+        self.num_sm = multiprocessor_count(self.device)
+        self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
-        # cuts never in batch-invariant mode
         self.split = not self.batch_invariant
         self.n_tiles = B * HO
         if self.split:
@@ -355,11 +371,21 @@ class CompiledKdaBwd:
             self.off_item_scratch = layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4)
             self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
             self.off_chunk_scratch = layout.add(self.chunk_scratch_rows * HO * 4)
-        if not self.has_state_checkpoints:
+        if self.needs_recompute:
             self.state_checkpoints_rows = max(total // self.b_t + B, 1)
             self.off_state_checkpoints = layout.add(self.state_checkpoints_rows * HO * K * V * 2)
-            self.regen_tm_bytes = tensormap_workspace_bytes(regen_mod, B)
-            self.off_regen_tensormaps = layout.add(self.regen_tm_bytes, align=128)
+            self.recompute_tensormap_bytes = tensormap_workspace_bytes(recompute_module, B)
+            self.off_recompute_tensormaps = layout.add(self.recompute_tensormap_bytes, align=128)
+        if self.coarse_checkpoints:
+            interval_chunks = self.checkpoint_cadence // self.b_t
+            span_chunks = interval_chunks
+            if not self.batch_invariant:
+                ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
+                span_chunks = interval_chunks * max(1, ideal // interval_chunks)
+            self.recompute_span_tokens = span_chunks * self.b_t
+            self.recompute_item_rows = max((total // (self.b_t * span_chunks) + 2 * B) * HO, 1)
+            self.off_work_items_recompute = layout.add(self.recompute_item_rows * WORK_ITEM_FIELDS * 4)
+            self.off_work_count_recompute = layout.add(4)
         HK = node.inputs["k"].dim[1]
         self.fold_dq = HQ < HO
         self.fold_dk = HK < HO
@@ -370,91 +396,96 @@ class CompiledKdaBwd:
             self.off_dk_ho = layout.add(total * HO * K * 2)
         if self.fold_dv:
             self.off_dv_ho = layout.add(total * HO * V * 2)
-        if self.safe_gate:
+        if self.safe_gate and self.has_a_log:
             self.off_gate_part_a = layout.add(self.gate_bwd_blocks * HO * K * 4)
+        if self.safe_gate and self.has_dt_bias:
             self.off_gate_part_dt = layout.add(self.gate_bwd_blocks * HO * K * 4)
-        self.bwd_tm_bytes = tensormap_workspace_bytes(bwd_mod, B)
-        self.off_bwd_tensormaps = layout.add(self.bwd_tm_bytes, align=128)
+        self.bwd_tensormap_bytes = tensormap_workspace_bytes(bwd_module, B)
+        self.off_bwd_tensormaps = layout.add(self.bwd_tensormap_bytes, align=128)
         self.needs_table = self.split
-        self.ws_bytes = layout.size
+        self.workspace_size = layout.size
         regions = [
-            ("sched_regen", self.off_sched, "int32", (2,)),
-            ("sched_bwd", self.off_sched + 8, "int32", (2,)),
-            ("sched_all", self.off_sched, "int32", (4,)),
+            ("scheduler_recompute", self.off_scheduler, "int32", (2,)),
+            ("scheduler_bwd", self.off_scheduler + 8, "int32", (2,)),
+            ("scheduler_all", self.off_scheduler, "int32", (4,)),
             ("work_items", self.off_work_items, "int32", (self.work_item_rows, WORK_ITEM_FIELDS)),
             ("work_count", self.off_work_count, "int32", (1,)),
-            ("bwd_tensormaps", self.off_bwd_tensormaps, "int64", (self.bwd_tm_bytes // 8,)),
+            ("bwd_tensormaps", self.off_bwd_tensormaps, "int64", (self.bwd_tensormap_bytes // 8,)),
         ]
         if self.split:
             regions.append(("item_scratch", self.off_item_scratch, "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("chunk_scratch", self.off_chunk_scratch, "float32", (self.chunk_scratch_rows, HO)))
-        if not self.has_state_checkpoints:
+        if self.needs_recompute:
             regions.append(("state_checkpoints", self.off_state_checkpoints, self.io_name, (self.state_checkpoints_rows, HO, V, K)))
-            regions.append(("regen_tensormaps", self.off_regen_tensormaps, "int64", (self.regen_tm_bytes // 8,)))
+            regions.append(("recompute_tensormaps", self.off_recompute_tensormaps, "int64", (self.recompute_tensormap_bytes // 8,)))
+        if self.coarse_checkpoints:
+            regions.append(("work_items_recompute", self.off_work_items_recompute, "int32", (self.recompute_item_rows, WORK_ITEM_FIELDS)))
+            regions.append(("work_count_recompute", self.off_work_count_recompute, "int32", (1,)))
         if self.fold_dq:
             regions.append(("dq_ho", self.off_dq_ho, self.io_name, (total, HO, K)))
         if self.fold_dk:
             regions.append(("dk_ho", self.off_dk_ho, self.io_name, (total, HO, K)))
         if self.fold_dv:
             regions.append(("dv_ho", self.off_dv_ho, self.io_name, (total, HO, V)))
-        if self.safe_gate:
+        if self.safe_gate and self.has_a_log:
             regions.append(("gate_part_a", self.off_gate_part_a, "float32", (self.gate_bwd_blocks * HO * K,)))
+        if self.safe_gate and self.has_dt_bias:
             regions.append(("gate_part_dt", self.off_gate_part_dt, "float32", (self.gate_bwd_blocks * HO * K,)))
         self.carve_names = [name for name, _off, _dt, _shape in regions]
         self.carve = carve_plan("KdaFrostEngine (KDA_BWD)", [(off, dt, shape) for _name, off, dt, shape in regions])
 
     def workspace_bytes(self) -> int:
-        return self.ws_bytes
+        return self.workspace_size
 
     def bind(self, names) -> None:
         pos = {name: i for i, name in enumerate(names)}
-        self.iq = pos["q"]
-        self.ik = pos["k"]
-        self.iv = pos["v"]
-        self.ig = pos["g"]
-        self.ibeta = pos["beta"]
-        self.icu = pos["cu_seqlens"]
-        self.ido = pos["dO"]
-        self.ick = pos.get("state_checkpoints")
-        self.is0 = pos.get("initial_state")
-        self.idfs = pos.get("d_final_state")
-        self.idq = pos["dQ"]
-        self.idk = pos["dK"]
-        self.idv = pos["dV"]
-        self.idg = pos["dG"]
-        self.idb = pos["dBeta"]
-        self.ids0 = pos.get("d_initial_state")
-        self.ia_log = pos.get("a_log")
-        self.idt_bias = pos.get("dt_bias")
-        self.ida_log = pos.get("d_a_log")
-        self.iddt_bias = pos.get("d_dt_bias")
+        self.index_q = pos["q"]
+        self.index_k = pos["k"]
+        self.index_v = pos["v"]
+        self.index_g = pos["g"]
+        self.index_beta = pos["beta"]
+        self.index_cu_seqlens = pos["cu_seqlens"]
+        self.index_do = pos["dO"]
+        self.index_state_checkpoints = pos.get("state_checkpoints")
+        self.index_initial_state = pos.get("initial_state")
+        self.index_d_final_state = pos.get("d_final_state")
+        self.index_dq = pos["dQ"]
+        self.index_dk = pos["dK"]
+        self.index_dv = pos["dV"]
+        self.index_dg = pos["dG"]
+        self.index_dbeta = pos["dBeta"]
+        self.index_d_initial_state = pos.get("d_initial_state")
+        self.index_a_log = pos.get("a_log")
+        self.index_dt_bias = pos.get("dt_bias")
+        self.index_d_a_log = pos.get("d_a_log")
+        self.index_d_dt_bias = pos.get("d_dt_bias")
 
     def run(self, views, workspace, stream) -> None:
-        q = views[self.iq]
-        k = views[self.ik]
-        v = views[self.iv]
-        g = views[self.ig]
-        beta = views[self.ibeta]
-        cu = views[self.icu]
-        do = views[self.ido]
-        state_checkpoints = views[self.ick] if self.ick is not None else None
-        state0 = views[self.is0] if self.is0 is not None else None
-        dstate_in = views[self.idfs] if self.idfs is not None else None
-        dq = views[self.idq]
-        dk = views[self.idk]
-        dv = views[self.idv]
-        dg = views[self.idg]
-        db = views[self.idb]
-        dstate0 = views[self.ids0] if self.ids0 is not None else None
-        a_log = views[self.ia_log] if self.ia_log is not None else None
-        dt_bias = views[self.idt_bias] if self.idt_bias is not None else None
-        d_a_log = views[self.ida_log] if self.ida_log is not None else None
-        d_dt_bias = views[self.iddt_bias] if self.iddt_bias is not None else None
+        q = views[self.index_q]
+        k = views[self.index_k]
+        v = views[self.index_v]
+        g = views[self.index_g]
+        beta = views[self.index_beta]
+        cu = views[self.index_cu_seqlens]
+        do = views[self.index_do]
+        state_checkpoints = views[self.index_state_checkpoints] if self.index_state_checkpoints is not None else None
+        state0 = views[self.index_initial_state] if self.index_initial_state is not None else None
+        dstate_in = views[self.index_d_final_state] if self.index_d_final_state is not None else None
+        dq = views[self.index_dq]
+        dk = views[self.index_dk]
+        dv = views[self.index_dv]
+        dg = views[self.index_dg]
+        dbeta = views[self.index_dbeta]
+        dstate0 = views[self.index_d_initial_state] if self.index_d_initial_state is not None else None
+        a_log = views[self.index_a_log] if self.index_a_log is not None else None
+        dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
+        d_a_log = views[self.index_d_a_log] if self.index_d_a_log is not None else None
+        d_dt_bias = views[self.index_d_dt_bias] if self.index_d_dt_bias is not None else None
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
-        sched_regen = region["sched_regen"]
-        sched_bwd = region["sched_bwd"]
+        scheduler_recompute = region["scheduler_recompute"]
+        scheduler_bwd = region["scheduler_bwd"]
         work_items = region["work_items"]
         work_count = region["work_count"]
 
@@ -470,15 +501,15 @@ class CompiledKdaBwd:
                     region.get("item_scratch"),
                     work_items,
                     work_count,
-                    region["sched_all"],
+                    region["scheduler_all"],
                     stream,
                 )
-            if self.has_state_checkpoints:
+            if self.has_state_checkpoints and not self.coarse_checkpoints:
                 checkpoint_series = state_checkpoints
             else:
                 checkpoint_series = region["state_checkpoints"]
-                self.regen.run_recompute(
-                    self.regen_cache,
+                self.recompute.run_recompute(
+                    self.recompute_cache,
                     k,
                     v,
                     g,
@@ -486,17 +517,20 @@ class CompiledKdaBwd:
                     dt_bias if self.safe_gate else None,
                     beta,
                     cu,
-                    state0,
+                    None if self.coarse_checkpoints else state0,
                     None,
                     checkpoint_series,
-                    work_items,
-                    work_count,
-                    sched_regen,
-                    region["sched_all"],
-                    region.get("item_scratch"),
-                    region["regen_tensormaps"],
+                    region["work_items_recompute"] if self.coarse_checkpoints else work_items,
+                    region["work_count_recompute"] if self.coarse_checkpoints else work_count,
+                    scheduler_recompute,
+                    region["scheduler_all"],
+                    None if self.coarse_checkpoints else region.get("item_scratch"),
+                    region["recompute_tensormaps"],
                     self.b_t,
                     stream,
+                    seed_state_checkpoints=state_checkpoints if self.coarse_checkpoints else None,
+                    seed_every_n_tokens=self.checkpoint_cadence if self.coarse_checkpoints else 0,
+                    seed_span_tokens=self.recompute_span_tokens if self.coarse_checkpoints else 0,
                 )
             dq_out = region["dq_ho"] if self.fold_dq else dq
             dk_out = region["dk_ho"] if self.fold_dk else dk
@@ -514,14 +548,14 @@ class CompiledKdaBwd:
                 dk_out,
                 dv_out,
                 dg,
-                db,
+                dbeta,
                 cu,
                 dstate0 if self.has_dstate0 else None,
                 dstate_in,
                 work_items,
                 work_count,
-                sched_bwd if self.bwd_dyn_sched else None,
-                region["sched_all"] if self.has_state_checkpoints else None,
+                scheduler_bwd if self.bwd_dynamic_scheduling else None,
+                region["scheduler_all"] if self.has_state_checkpoints else None,
                 region.get("item_scratch") if self.has_state_checkpoints else None,
                 region["bwd_tensormaps"],
                 self.scale,
@@ -531,7 +565,7 @@ class CompiledKdaBwd:
             )
             if self.safe_gate:
                 self.channel_gate_bwd(
-                    dg, g, a_log, dt_bias, d_a_log, d_dt_bias, region["gate_part_a"], region["gate_part_dt"], self.gate_lower_bound, stream=stream
+                    dg, g, a_log, dt_bias, d_a_log, d_dt_bias, region.get("gate_part_a"), region.get("gate_part_dt"), self.gate_lower_bound, stream=stream
                 )
             if self.fold_dq or self.fold_dk or self.fold_dv:
                 for src_ho, dst in ((dq_out, dq), (dk_out, dk), (dv_out, dv)):
@@ -558,38 +592,44 @@ class CompiledKdaBwd:
                 a_log=a_log,
                 dt_bias=dt_bias,
                 gate_lower_bound=self.gate_lower_bound if self.safe_gate else None,
-                sched_ctr=region["sched_all"],
+                scheduler_counter=region["scheduler_all"],
                 split=self.split,
                 stream=stream,
             )
 
-        if self.has_state_checkpoints:
+        if self.has_state_checkpoints and not self.coarse_checkpoints:
             checkpoint_series = state_checkpoints
         else:
             checkpoint_series = region["state_checkpoints"]
-            self.regen_cache = self.regen.chunk_kda_recompute_sm100(
+            self.recompute_cache = self.recompute.chunk_kda_recompute_sm100(
                 k,
                 v,
                 g,
                 beta,
                 cu,
-                state0,
+                None if self.coarse_checkpoints else state0,
                 None,
                 checkpoint_every_n_tokens=self.b_t,
                 output_state_checkpoints=checkpoint_series,
+                seed_state_checkpoints=state_checkpoints if self.coarse_checkpoints else None,
+                seed_every_n_tokens=self.checkpoint_cadence if self.coarse_checkpoints else 0,
+                seed_span_tokens=self.recompute_span_tokens if self.coarse_checkpoints else 0,
                 use_qk_l2norm_in_kernel=self.use_qk_l2norm,
                 safe_gate=self.safe_gate,
                 gate_lower_bound=self.gate_lower_bound,
                 a_log=a_log,
                 dt_bias=dt_bias,
                 use_beta_sigmoid=self.use_beta_sigmoid,
-                work_items=work_items,
-                work_count=work_count,
-                sched_ctr=sched_regen,
-                sched_all=region["sched_all"],
-                work_item_scratch=region.get("item_scratch"),
-                order_in_prologue=True,
-                tensormap_workspace=region["regen_tensormaps"],
+                allow_neg_eigval=self.allow_neg_eigval,
+                work_items=region["work_items_recompute"] if self.coarse_checkpoints else work_items,
+                work_count=region["work_count_recompute"] if self.coarse_checkpoints else work_count,
+                scheduler_counter=scheduler_recompute,
+                scheduler_all=region["scheduler_all"],
+                work_item_scratch=None if self.coarse_checkpoints else region.get("item_scratch"),
+                order_in_prologue=not self.coarse_checkpoints,
+                tensormap_workspace=region["recompute_tensormaps"],
+                device=self.device,
+                num_sm=self.num_sm,
                 stream=stream,
             )
 
@@ -613,7 +653,7 @@ class CompiledKdaBwd:
             dk_out,
             dv_out,
             dg,
-            db,
+            dbeta,
             cu,
             self.scale,
             use_initial_state=state0 is not None,
@@ -625,18 +665,21 @@ class CompiledKdaBwd:
             a_log=a_log,
             dt_bias=dt_bias,
             use_beta_sigmoid=self.use_beta_sigmoid,
+            allow_neg_eigval=self.allow_neg_eigval,
             work_items=work_items,
             work_count=work_count,
-            sched_ctr=sched_bwd if self.bwd_dyn_sched else None,
-            sched_all=region["sched_all"] if self.has_state_checkpoints else None,
+            scheduler_counter=scheduler_bwd if self.bwd_dynamic_scheduling else None,
+            scheduler_all=region["scheduler_all"] if self.has_state_checkpoints else None,
             work_item_scratch=region.get("item_scratch") if self.has_state_checkpoints else None,
             order_in_prologue=self.has_state_checkpoints,
             tensormap_workspace=region["bwd_tensormaps"],
+            device=self.device,
+            num_sm=self.num_sm,
             stream=stream,
         )
         if self.safe_gate:
             self.channel_gate_bwd(
-                dg, g, a_log, dt_bias, d_a_log, d_dt_bias, region["gate_part_a"], region["gate_part_dt"], self.gate_lower_bound, stream=stream
+                dg, g, a_log, dt_bias, d_a_log, d_dt_bias, region.get("gate_part_a"), region.get("gate_part_dt"), self.gate_lower_bound, stream=stream
             )
         if dq_out is not dq or dk_out is not dk or dv_out is not dv:
             for src_ho, dst in ((dq_out, dq), (dk_out, dk), (dv_out, dv)):

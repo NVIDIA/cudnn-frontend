@@ -228,8 +228,7 @@ TEST_CASE("Cuda graphs with matmul add", "[cudagraph][graph]") {
     }
 
     //// Cleanup
-    cudaGraphExecDestroy(cuda_graph_exec);
-    cudaGraphDestroy(main_cuda_graph);
-    cudaGraphDestroy(cudnn_cuda_graph_new);
+    CUDA_CHECK(cudaGraphExecDestroy(cuda_graph_exec));
+    CUDA_CHECK(cudaGraphDestroy(main_cuda_graph));
 #endif  // CUDART_VERSION < 12000
 }

@@ -67,6 +67,7 @@ python_add_library(
     
     MODULE
     pycudnn.cpp
+    gnn.cpp
     properties.cpp
 
     pygraph/pygraph.cpp

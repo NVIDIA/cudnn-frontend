@@ -11,6 +11,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import arith
 
+from cutlass._mlir.dialects import arith
+from cutlass.base_dsl.typing import Pointer
+
 from .barrier import PipelineState, advance, wait, arrive_expect_tx
 
 
@@ -105,6 +108,89 @@ class Sched(NamedTuple):
     bidx_init: object
     bidy_init: object
     bidz_init: object
+
+
+@cute.jit
+def scheduler_warp_loop_persistent(
+    sched,
+    sched_stages: int,
+    is_cga_first_cta,
+    meta_t,
+    ctr_off,
+    live_off,
+    cga_size: int,
+    cga_m: int,
+):
+    """Persistent tile scheduler over a LIVE-ONLY unit range (THD).
+
+    CLC sizes the grid to the work list, which for THD means the plan-time
+    envelope and therefore dead clusters. Here the grid is occupancy-sized and
+    the bound is a DEVICE value (``meta[live_off]``, written by the setup
+    launch), so no unit past the live total is ever handed out.
+
+    The cluster lead claims one unit with a global atomic and pushes the
+    payload into every CTA's ``tile_id_smem`` over DSMEM, then arrives each
+    peer's scheduler mbarrier -- the same shape as ``read_tile_id_arrive``.
+    Multicast is not available here: it is a clusterlaunchcontrol facility, so
+    dynamic claiming needs an explicit peer write.
+
+    ``cga_size`` is the DSMEM broadcast fan-out (CTAs per cluster); ``cga_m`` is
+    the stride the consumer's decode divides back out. They are equal while
+    CGA_N == 1, which is every config today -- taking both keeps the handout
+    correct if that ever stops holding.
+    """
+    meta = cutlass.make_array_view(meta_t)
+    ctr_ptr = Pointer(meta_t.iterator.raw_ptr(), dtype=cutlass.Int32) + ctr_off
+    state = PipelineState.start()
+    is_valid = cutlass.Int32(1)
+
+    while is_valid > cutlass.Int32(0):
+        wait(sched.mb_read_tile_id.subview(state.idx), state.phase)
+
+        # Every CTA expects the 16-byte payload on its own mbarrier, exactly as
+        # the CLC path did; the lead's remote store delivers it and completes
+        # the barrier through the transaction count.
+        if nvvm.elect_sync():
+            arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
+
+        if nvvm.elect_sync() and is_cga_first_cta:
+            uid = cutlass.Int32(nvvm.atomicrmw(nvvm.AtomicOp.ADD, ctr_ptr, cutlass.Int32(1)))
+            live = cutlass.Int32(meta[live_off])
+            valid = cutlass.Int32(arith.select((uid < live).ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
+            # Stride by CGA_M, not the cluster size: the consumer decodes the
+            # unit id back out as linear // CGA_M.
+            linear = uid * cutlass.Int32(cga_m)
+            # store_async_dsmem wants CuTe pointers; the smem arrays hand out
+            # base-DSL ones, so convert through the raw addresses.
+            _tile_ptr = cute.make_ptr(
+                cutlass.Int32,
+                sched.tile_id_smem.subview(state.idx * cutlass.Int32(8)).data_ptr().toint(cutlass.Int32),
+                cutlass.AddressSpace.smem,
+                assumed_align=16,
+            )
+            _mbar_ptr = cute.make_ptr(
+                cutlass.Int64,
+                sched.mb_scheduler.subview(state.idx).data_ptr().toint(cutlass.Int32),
+                cutlass.AddressSpace.smem,
+                assumed_align=8,
+            )
+            # One word at a time rather than a v4 payload: store_async_dsmem
+            # accepts a 2/4-tuple per its contract, but lowers whatever it was
+            # handed through Int32(value), so a tuple raises at trace time. Four
+            # scalar stores carry the same 16 bytes and so satisfy the same
+            # transaction count the arrive above expects.
+            _payload = (linear, cutlass.Int32(0), valid, cutlass.Int32(0))
+            for i in cutlass.range_constexpr(cga_size):
+                for w in cutlass.range_constexpr(4):
+                    cute.arch.store_async_dsmem(_tile_ptr + w, _payload[w], _mbar_ptr, i)
+
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+        wait(sched.mb_scheduler.subview(state.idx), state.phase)
+        validity = (sched.tile_id_smem.subview(state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        is_valid = validity & cutlass.Int32(1)
+
+        state = advance(state, sched_stages)
 
 
 @cute.jit

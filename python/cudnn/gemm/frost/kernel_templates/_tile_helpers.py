@@ -7,7 +7,7 @@ A template is RENDERED (its `@@INJECT_*@@` blocks become module-level
 constants) and then exec'd from the kernel cache under a synthetic module
 name, so it cannot use relative imports and this module is never rendered.
 Everything here therefore takes what it needs as ARGUMENTS -- a helper that
-reads an injected constant (`num_mma_m`, `tile_swizzle_n`, `ab_dtype`, ...)
+reads an injected constant (`mma_size_m`, `tile_swizzle_n`, `ab_dtype`, ...)
 has to stay in the template, or be re-signed to receive it.
 """
 
@@ -19,10 +19,13 @@ import cutlass.experimental.primitives as nvvm
 
 
 @cute.jit
-def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w):
+def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=False):
     """N-direction super-block rasterization of the (m, n) cgrp-tile coord, for
-    L2 reuse. ``swizzle_w == 1`` falls out of the math as the identity mapping.
+    L2 reuse. ``identity=True`` compiles out the general mapping when the caller
+    knows that ``swizzle_w == 1``.
     """
+    if cutlass.const_expr(identity):
+        return raw_m, raw_n
     t = raw_n * nt_m + raw_m
     blk = nt_m * swizzle_w
     sb = t // blk
@@ -73,6 +76,16 @@ def replace_tensormap_global_dim_1(desc_ptr, new_dim) -> None:
         desc_ptr,
         new_value=cutlass.Int32(new_dim),
         ord=1,
+    )
+
+
+@cute.jit
+def replace_tensormap_global_dim_2(desc_ptr, new_dim) -> None:
+    nvvm.tensormap_replace(
+        nvvm.TensormapField.GLOBAL_DIM,
+        desc_ptr,
+        new_value=cutlass.Int32(new_dim),
+        ord=2,
     )
 
 
@@ -147,7 +160,33 @@ def tcgen05_dealloc(tmem_ptr, num_cols, *, is_exclusive=False, group=None):
         nvvm.tcgen05_dealloc(tmem_ptr, num_cols, group=group)
 
 
-def tcgen05_mma_block_scale(mma_kind, cta_group, d, a, b, idesc, *, enable_input_d, scale_a, scale_b, scale_vec_size, b_collector_op=None):
+def tcgen05_mma(mma_kind, cta_group, d, a, b, idesc, scale_d, *, collector_op=None, b_collector_op=None):
+    if b_collector_op is None:
+        nvvm.tcgen05_mma(
+            mma_kind,
+            cta_group,
+            d,
+            a,
+            b,
+            idesc,
+            scale_d,
+            collector_op=collector_op,
+        )
+    else:
+        nvvm.tcgen05_mma(
+            mma_kind,
+            cta_group,
+            d,
+            a,
+            b,
+            idesc,
+            scale_d,
+            collector_op=collector_op,
+            b_collector_op=b_collector_op,
+        )
+
+
+def tcgen05_mma_block_scale(mma_kind, cta_group, d, a, b, idesc, *, enable_input_d, scale_a, scale_b, scale_vec_size, collector_op=None, b_collector_op=None):
     if b_collector_op is None:
         nvvm.tcgen05_mma_block_scale(
             mma_kind,
@@ -160,6 +199,7 @@ def tcgen05_mma_block_scale(mma_kind, cta_group, d, a, b, idesc, *, enable_input
             scale_a=scale_a,
             scale_b=scale_b,
             scale_vec_size=scale_vec_size,
+            collector_op=collector_op,
         )
     else:
         nvvm.tcgen05_mma_block_scale(
@@ -173,5 +213,6 @@ def tcgen05_mma_block_scale(mma_kind, cta_group, d, a, b, idesc, *, enable_input
             scale_a=scale_a,
             scale_b=scale_b,
             scale_vec_size=scale_vec_size,
+            collector_op=collector_op,
             b_collector_op=b_collector_op,
         )

@@ -715,6 +715,8 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 )
                 sched_counter[0] = cutlass.Int32(0)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,
@@ -2398,6 +2400,19 @@ class BlockScaledMoEGroupedGemmGluKernel:
                     expert_idx = tile_info[0]
 
                     gBias_tile = gBias_nl[(None, mma_n_coord, expert_idx)]
+
+                    # For dynamic MNKL, cuteDSL drops the 128bit alignment requirement
+                    # but we know that during runtime the alignment is always 16 bytes.
+                    gBias_tile = cute.make_tensor(
+                        cute.make_ptr(
+                            gBias_tile.element_type,
+                            gBias_tile.iterator.toint(),
+                            AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        gBias_tile.layout,
+                    )
+
                     tBs_gBias = thr_bias_g2s.partition_S(gBias_tile)
 
                     # Predicate: check if this thread's chunk is within N
@@ -3028,6 +3043,8 @@ class BlockScaledMoEGroupedGemmGluKernel:
             #
             c_pipeline.producer_tail()
             d_pipeline.producer_tail()
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     def epilog_tmem_copy_and_partition(
         self,

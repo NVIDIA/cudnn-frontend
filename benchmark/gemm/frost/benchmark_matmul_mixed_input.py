@@ -78,12 +78,12 @@ def _enum_chain():
 
 
 def _build_spec_map():
-    """Label -> (cfg, cta_group, scheduler) for every mainloop strategy the funnel accepts."""
+    """Label -> (cfg, cta_group) for every mainloop strategy the funnel accepts."""
     chain = _enum_chain()
     m = {}
     for t, cfg in _candidates(chain):
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = cfg.name
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 
@@ -96,10 +96,9 @@ def _vp(handles, a, b, c):
     return {A: a, B: b, C: c}
 
 
-def _build_plan(g, cfg, name):
+def _build_plan(g, cfg, _name):
     """JIT-compile the graph with a forced tile config -> callable kernel."""
-    _, cta_group, scheduler = spec_for(name, _SPEC_MAP)
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    return jit_from_cudnn_graph(g, config=cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +287,7 @@ def main() -> int:
             if spec is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
                 continue
-            tok = kernel_match_token(spec[0], spec[1], spec[2])
+            tok = kernel_match_token(spec[0], spec[1])
             matches = [(k, v) for k, v in kern_times.items() if tok in k]
             if not matches:
                 rows.append((name, 0.0, float("inf"), "NO_KERNEL_IN_NSYS"))

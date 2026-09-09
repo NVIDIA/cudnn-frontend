@@ -15,14 +15,14 @@ import cudnn
 from cudnn.engines import MANIFEST, is_backend_engine, is_python_engine
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell, requires_dsl, _dsl_installed, _is_plan_for
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, _dsl_installed, _is_plan_for
 
-_FROST = engine_name(512)  # matches the D=512 graphs below
+_FROST = engine_name()  # matches the D=512 graphs below
 _GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 
 
-_SM100 = requires_blackwell
-_SM100_DSL = pytest.mark.skipif(requires_blackwell.args[0] or requires_dsl.args[0], reason="needs an SM100-line GPU with the cutedsl extra")
+_SM100 = requires_pre_rubin_blackwell
+_SM100_DSL = pytest.mark.skipif(requires_pre_rubin_blackwell.args[0] or requires_dsl.args[0], reason="needs an SM100-line GPU with the cutedsl extra")
 
 # The default pytest.ini addopts is `-m L0`; mark the whole module so it runs.
 pytestmark = pytest.mark.L0
@@ -176,10 +176,11 @@ def test_default_plan_runs_and_matches_torch():
 
 
 @_SM100_DSL
-def test_envelope_lists_every_covering_flavor_smallest_first():
-    """Head-dim ENVELOPE: a (64,64) graph is eligible for every f16 flavor, and
-    the family proposes them smallest-covering-first, so the tightest tile is
-    the first python entry of the ranked list; the padded run matches torch."""
+def test_envelope_serves_small_dims_through_one_family_engine():
+    """Head-dim ENVELOPE: a (64,64) graph is served by the ONE f16 family
+    engine — kernel-flavor choice (which head-dim tile) happens inside the
+    lowering (api_dsl._pick_flavor, smallest covering flavor), not in the
+    ranked list; the padded run matches torch."""
     d = 64
     q_gpu = torch.randn(B, S, H, d, device="cuda", dtype=torch.float16).transpose(1, 2)
     k_gpu = torch.randn(B, S, H, d, device="cuda", dtype=torch.float16).transpose(1, 2)
@@ -189,14 +190,12 @@ def test_envelope_lists_every_covering_flavor_smallest_first():
     g, q, k, v, o = _build_causal_sdpa(d=d)
     _plan(g)
     names = _plan_names(g)
-    for flavor in (128, 256, 512):
-        assert any(_is_plan_for(n, engine_name(flavor)) for n in names)  # every covering flavor
+    assert any(_is_plan_for(n, engine_name()) for n in names)
     python = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id)]
-    assert _is_plan_for(names[python[0]], engine_name(128))  # tightest flavor first
     g.select_plan(python[0])
     g.check_support()
     g.build_plans()
-    assert g.selected_engine.name == engine_name(128)
+    assert g.selected_engine.name == engine_name()
 
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu}, ws)
@@ -245,7 +244,7 @@ def test_no_magic_import_required():
         "o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())\n"
         "g.validate(); g.build_operation_graph(); g.create_execution_plans([cudnn.heur_mode.A])\n"
         "names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]\n"
-        "i = next((i for i, n in enumerate(names) if n.split('[')[0] == 'sdpa_fwd_prefill_sm100_d512'), None)\n"
+        "i = next((i for i, n in enumerate(names) if n.split('[')[0] == 'sdpa_fwd_prefill_sm100'), None)\n"
         "assert i is not None, names\n"
         "g.select_plan(i)\n"
         "g.check_support()\n"

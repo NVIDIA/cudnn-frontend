@@ -13,8 +13,8 @@ SM120 envelope (see engines._sm120_fp8_spec): E4M3/E5M2 in, FP16/BF16/FP8
 out (fp8 O via a direct quantizing store, Scale_O applied pre-cast), head
 TILES any multiple of 32 up to 256 with the QK^T and P@V sides independent,
 actual head dims any multiple of 16 up to the tile via TMA zero-padding
-(what graphs can reach is further gated by the C++ sdpa_fp8 node:
-d_qk <= 128 x d_v <= 128 plus the (192, 128) MLA pair), causal /
+(graphs reach the whole range: the python-native validate defers the C++
+sdpa_fp8 node's d <= 128 gate when this engine is a candidate), causal /
 bottom-right / SWA / right-band / KV-padding masks, per-batch seq_len_q trim,
 ragged S_kv without a padding mask (skv_tile=0), dense_flex layouts, THD
 (ragged) with token- or head-major Stats, and attention sinks
@@ -24,6 +24,7 @@ Requires: SM120/SM121 (Blackwell GeForce), cutlass-dsl. Skips otherwise.
 """
 
 import math
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -31,13 +32,22 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell_geforce, requires_dsl, select_engine as _select_engine, offers_engine
+from frost_test_utils import make_dense_stats, requires_blackwell_geforce, requires_dsl, select_engine as _select_engine, offers_engine
 
 pytestmark = [requires_blackwell_geforce, requires_dsl]
 
 _E4M3_MAX = 448.0
 _E5M2_MAX = 57344.0
 _FP8_MAX = {torch.float8_e4m3fn: _E4M3_MAX, torch.float8_e5m2: _E5M2_MAX}
+
+
+class _RunResult(NamedTuple):
+    output: torch.Tensor
+    reference: torch.Tensor
+    amax: float
+    reference_amax: float
+    stats: torch.Tensor
+    reference_stats: torch.Tensor
 
 
 def _quant(x, dtype=torch.float8_e4m3fn):
@@ -96,6 +106,7 @@ def _run(
     seq_lens_kv=None,
     seq_lens_q=None,
     tiles=None,
+    pack_gqa=None,
     s_descale_gain=1.0,
     sync_debug=False,
     D=128,
@@ -105,6 +116,7 @@ def _run(
     so_val=1.0,
     layout="bshd",
     sinks=None,
+    stats_layout="contiguous",
 ):
     import cudnn
 
@@ -139,7 +151,7 @@ def _run(
         Ob = torch.zeros(B, H_q, S_q + 24, D_v, device=dev, dtype=o_dtype)[:, :, :S_q, :]
     else:
         raise ValueError(f"unknown layout {layout!r}")
-    lse = torch.empty(B, H_q, S_q, 1, device=dev, dtype=torch.float32)
+    lse = make_dense_stats(B, H_q, S_q, stats_layout)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
     def sc(val):
@@ -190,13 +202,13 @@ def _run(
         torch.float8_e5m2: cudnn.data_type.FP8_E5M2,
     }[o_dtype]
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(o_cudnn)
-    stats.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride([H_q * S_q, S_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    stats.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles)
+    _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     vp.update({o: Ob, stats: lse, amx_o: amax_o})
@@ -217,7 +229,7 @@ def _run(
     o_ref, lse_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, seq_lens_q=seq_lens_q, sinks=sinks, **ref_kw)
     # O carries Scale_O; Amax_O is the pre-scale amax (the kernel divides it
     # back out), so both compare against the unscaled reference.
-    return Ob.float() / so_val, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1), lse_ref
+    return _RunResult(Ob.float() / so_val, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1), lse_ref)
 
 
 def _ref_kwargs(sdpa_kwargs):
@@ -248,6 +260,71 @@ def _check(out, o_ref, amax_o, amax_o_ref, lse=None, lse_ref=None, tol_o=5e-2):
         assert torch.equal(torch.isfinite(lse), finite), "LSE -inf pattern differs from the reference"
         d = (lse[finite] - lse_ref[finite]).abs().max().item() if finite.any() else 0.0
         assert d <= 3e-2, f"max|LSE-ref|={d:.4f} > 0.03"
+
+
+# --- PackGQA: q_tile/G tokens x G query heads per tile -------
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "h_q,h_kv",
+    [(8, 4), (8, 2), (8, 1), (16, 1)],
+    ids=["g2", "g4", "g8_mqa", "g16_mqa"],
+)
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_pack_gqa_ratios(h_q, h_kv):
+    """Packed plans across GQA ratios (incl. MQA)."""
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(2, h_q, h_kv, 40, 256, scale=1.0 / math.sqrt(128), sdpa_kwargs=dict(use_causal_mask=True), pack_gqa=True)
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [4, 16, 25], ids=["subspan", "exact_span", "tail"])
+@torch_fork_set_rng(seed=1)
+def test_fp8_sm120_pack_gqa_tiles(s_q):
+    """Packed tile-geometry edges at G=8, q_tile=128 (token span 16/tile)."""
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(
+        1, 64, 8, s_q, 256, scale=1.0 / math.sqrt(128), sdpa_kwargs=dict(use_causal_mask=True), tiles=(128, 128), pack_gqa=True
+    )
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("o_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16_out", "e4m3_out"])
+@pytest.mark.parametrize("mask", ["none_padded", "causal", "causal_br", "swa", "sink_causal"])
+@torch_fork_set_rng(seed=2)
+def test_fp8_sm120_pack_gqa_features(mask, o_dtype):
+    """Packed plans x the fp8 mask/sink envelope x both output-dtype epilogues."""
+    kw = dict()
+    sinks = None
+    seq_lens_kv = None
+    if mask == "none_padded":
+        seq_lens_kv = [180, 240]
+    elif mask == "causal":
+        kw = dict(use_causal_mask=True)
+    elif mask == "causal_br":
+        kw = dict(use_causal_mask_bottom_right=True)
+    elif mask == "swa":
+        kw = dict(use_causal_mask=True, left_bound=17)
+    elif mask == "sink_causal":
+        kw = dict(use_causal_mask=True)
+        sinks = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(
+        2, 8, 2, 40, 256, scale=1.0 / math.sqrt(128), sdpa_kwargs=kw, seq_lens_kv=seq_lens_kv, sinks=sinks, o_dtype=o_dtype, pack_gqa=True
+    )
+    tol_o = 5e-2
+    if o_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        floor = (o_ref - o_ref.to(o_dtype).float()).abs().max().item()
+        tol_o = max(tol_o, 3 * floor)
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref, tol_o=tol_o)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=3)
+def test_fp8_sm120_pack_gqa_tile64():
+    """Packed at q_tile=64 (G must divide the smaller tile: 8/2 -> G=4)."""
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(
+        2, 8, 2, 24, 192, scale=1.0 / math.sqrt(128), sdpa_kwargs=dict(use_causal_mask=True), tiles=(64, 64), pack_gqa=True
+    )
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref)
 
 
 _MASKS = {
@@ -338,6 +415,21 @@ def test_fp8_sm120_dense_flex_layout(layout):
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=59)
+def test_fp8_sm120_strided_stats():
+    """Dense LSE is written directly through a permuted, gapped layout."""
+
+    scale = 1.0 / math.sqrt(128)
+    kwargs = dict(B=2, H_q=4, H_kv=2, S_q=128, S_kv=128, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
+    torch.manual_seed(59)
+    contiguous = _run(**kwargs)
+    torch.manual_seed(59)
+    strided = _run(**kwargs, stats_layout="strided")
+    _check(*strided)
+    torch.testing.assert_close(strided.stats, contiguous.stats, atol=0, rtol=0)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_dense_flex_offered():
     """The dense_flex capability is a DECLARED offer: a BHSD-contiguous (non
@@ -420,12 +512,13 @@ def test_fp8_sm120_fp8_out_seq_q_trim():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("D,D_v", [(48, 48), (80, 80), (112, 112), (112, 80)])
+@pytest.mark.parametrize("D,D_v", [(48, 48), (80, 80), (112, 112), (112, 80), pytest.param(144, 144, marks=pytest.mark.L1)])
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_d_envelope(D, D_v):
     """Actual head dims narrower than the 32-granule head tiles (multiples of
     16): TMA zero-fills the pad K/V columns, the Q load and O store guards
-    clip to the actual widths. Causal exercises the masked-tile path too."""
+    clip to the actual widths. Causal exercises the masked-tile path too.
+    (144, 144) pads into a 160 tile, above the C++ node's d <= 128 gate."""
     scale = 1.0 / math.sqrt(D)
     res = _run(2, 4, 2, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), D=D, D_v=D_v)
     _check(*res)
@@ -624,12 +717,12 @@ def test_fp8_sm120_fp8_output_offered():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("D", [24, 144, 288])
+@pytest.mark.parametrize("D", [24, 288])
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_off_granule_head_dim_not_offered(D):
     """Declined head dims: 24 breaks the envelope alignment (multiples of 16,
-    the TMA 16-byte global-stride rule at 1 byte/elem); 144/288 exceed the
-    C++ sdpa_fp8 node's front door (d <= 128) / the row's 256 cap."""
+    the TMA 16-byte global-stride rule at 1 byte/elem); 288 exceeds the row's
+    256 cap."""
     import cudnn
 
     assert not _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, D=D)
@@ -638,25 +731,24 @@ def test_fp8_sm120_off_granule_head_dim_not_offered(D):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_head_dim_domain_offered():
-    """Every graph the C++ front door admits is served: the d_qk <= 128 x
-    d_v <= 128 cross (multiples of 32) plus the (192, 128) MLA pair."""
+    """The whole head-tile domain is served from the graph: the d_qk <= 256 x
+    d_v <= 256 cross (multiples of 32) plus a multiple-of-16 envelope dim above
+    the C++ sdpa_fp8 node's d <= 128 gate, which the python-native validate
+    defers when this engine is a candidate."""
     import cudnn
 
-    for D in range(32, 129, 32):
-        for D_v in range(32, 129, 32):
+    for D in range(32, 257, 32):
+        for D_v in range(32, 257, 32):
             assert _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, D=D, D_v=D_v), f"({D}, {D_v}) not offered"
-    assert _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, D=192, D_v=128), "(192, 128) MLA not offered"
+    assert _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, D=144), "(144, 144) envelope not offered"
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("D", [32, 64, 96], ids=lambda d: f"d{d}")
+@pytest.mark.parametrize("D", [32, 64, 96, pytest.param(256, marks=pytest.mark.L1)], ids=lambda d: f"d{d}")
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_head_dims(D):
-    """Correctness across the widened head-dim domain (exact, no padding).
-
-    The graph front door (the C++ sdpa_fp8 node) admits d_qk <= 128 x
-    d_v <= 128 plus the (192, 128) MLA pair, so >128 uniform dims cannot
-    reach any engine; the kernel itself serves multiples of 32 up to 256."""
+    """Correctness across the head-dim domain (exact, no padding): multiples
+    of 32 up to 256, all reachable from the graph."""
     scale = 1.0 / math.sqrt(D)
     res = _run(2, 4, 4, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), D=D)
     _check(*res)
@@ -782,6 +874,7 @@ def _run_template_tail(D, D_v, *, mask, S=256):
         None,  # thd_q_lens (dense: folded out of the ABI)
         None,  # thd_kv_lens
         None,  # thd_lens_form
+        cutlass.Int32(0),  # thd_n_ctas (dense: no persistent grid)
         cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
     )
     torch.cuda.synchronize()
@@ -810,6 +903,8 @@ def _run_template_tail(D, D_v, *, mask, S=256):
         (256, 128, "causal"),
         (128, 256, "causal"),
         (224, 160, "causal"),
+        (240, 240, "causal"),  # zero-padded 240 -> 256 on both sides
+        (240, 240, "none"),
     ],
 )
 @torch_fork_set_rng(seed=0)

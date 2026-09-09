@@ -60,9 +60,3 @@ def swizzle_lin_128b(lin, *, row_stride_log2: cutlass.Constexpr[int], elem_bytes
     shift = cutlass.const_expr(row_stride_log2 - chunk_log2)
     mask = cutlass.const_expr(0x7 << chunk_log2)
     return lin ^ ((lin >> shift) & mask)
-
-
-@cute.jit
-def swizzle_lin_S(lin, *, bbits: cutlass.Constexpr[int], mbase: cutlass.Constexpr[int], sshift: cutlass.Constexpr[int]):
-    yyy = (lin >> cutlass.const_expr(mbase + sshift)) & cutlass.const_expr((1 << bbits) - 1)
-    return lin ^ (yyy << cutlass.const_expr(mbase))

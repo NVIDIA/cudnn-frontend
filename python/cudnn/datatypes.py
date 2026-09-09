@@ -246,7 +246,25 @@ def _torch_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = Fals
     return None
 
 
+_cutlass_data_type_memo: dict = {}
+
+
 def _convert_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
+    # Resolution is process-constant and this runs ~20x per grouped-GEMM wrapper call,
+    # always over the same handful of dtypes. Unhashable spellings fall through uncached.
+    try:
+        key = (data_type, interpret_uint8_as_fp4x2)
+        cached = _cutlass_data_type_memo.get(key)
+    except TypeError:
+        return _convert_to_cutlass_data_type_uncached(data_type, interpret_uint8_as_fp4x2)
+    if cached is None:
+        cached = _convert_to_cutlass_data_type_uncached(data_type, interpret_uint8_as_fp4x2)
+        if cached is not None:
+            _cutlass_data_type_memo[key] = cached
+    return cached
+
+
+def _convert_to_cutlass_data_type_uncached(data_type, interpret_uint8_as_fp4x2: bool = False):
     if is_cutlass_available():
         import cutlass
 

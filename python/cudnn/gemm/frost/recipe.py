@@ -489,7 +489,7 @@ def build(compiled) -> GemmRecipe:
         _operand(order[id(t)], f"B operand[{i}]", t, major=mm.b_major, dtype=mm.b_dtype, batch=mm.b_batch, is_b=True) for i, t in enumerate(binding.b_operands)
     ]
 
-    out_reqs = _output_align_reqs(chain, compiled.use_tma_store, vec_bytes=compiled.vec_bytes_epi)
+    out_reqs = _output_align_reqs(chain, compiled.tma_slots, vec_bytes=compiled.vec_bytes_epi)
     aux_reqs = _aux_align_reqs(chain, vec_bytes=compiled.vec_bytes_epi)
     outputs, seeds = [], []
     for i, (spec, t) in enumerate(zip(chain.outputs, binding.outputs)):
@@ -530,8 +530,12 @@ def build(compiled) -> GemmRecipe:
     heads = [(op.index, None) for op in inputs] + [(s.index, None) for s in sf]
     outs = [(o.index, None) for o in outputs]
     auxs = [(x.index, x.ref) for x in aux]
-    tma = bool(compiled.use_tma_store) and not chain.is_multi_gemm
-    arg_plan = tuple(heads + (auxs + outs[:1] if tma else outs + auxs))
+    # Taps, aux, then the TMA-C slots in slot order -- an output on the TMA
+    # surface binds a trailing TMA-only kernel parameter.
+    slots = compiled.tma_slots
+    taps = [o for i, o in enumerate(outs) if i not in slots]
+    tmas = [outs[i] for i in sorted(slots) if i < len(outs)]
+    arg_plan = tuple(heads + taps + auxs + tmas)
 
     # Block-scale multi-GEMM sends ONE A and ONE B stride triple and requires the
     # rest to match it; every other flavor sends each operand's own.

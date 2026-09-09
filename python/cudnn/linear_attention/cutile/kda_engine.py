@@ -108,7 +108,7 @@ class KdaCuTilePlan(CompiledPlan):
             if to_buffer_dtype(g.get_data_type()) != f32:
                 regions.append(("dg_cum", layout.add(total * HV * K * 4), f32, (total, HV, K)))
 
-        self.ws_bytes = layout.size
+        self.workspace_size = layout.size
         self.carve_names = [name for name, _off, _dtype, _shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dtype, shape) for _name, off, dtype, shape in regions])
         self.expect = expect_table(node)
@@ -146,7 +146,7 @@ class KdaCuTilePlan(CompiledPlan):
         self.indices = None
 
     def get_workspace_size(self) -> int:
-        return self.ws_bytes
+        return self.workspace_size
 
     def execute(self, graph, variant_pack, ctx) -> None:
         if self.ports is None:
@@ -158,8 +158,8 @@ class KdaCuTilePlan(CompiledPlan):
         check_layouts_compact(self.plan_name, self.expect, self.names, views)
         nb = dict(zip(self.names, views))
         stream = ctx.stream if ctx.stream is not None else 0
-        ws = Workspace.over(variant_pack, self.ws_bytes, self.plan_name)
-        region = dict(zip(self.carve_names, ws.carve(self.carve)))
+        workspace = Workspace.over(variant_pack, self.workspace_size, self.plan_name)
+        region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         self.common.build_chunk_table(
             region["chunk_table"],
             region["chunk_count"],
@@ -182,7 +182,7 @@ class KdaCuTilePlan(CompiledPlan):
         if self.use_beta_sigmoid:
             gate["use_beta_sigmoid_in_kernel"] = True
         if self.safe_gate:
-            gate.update(safe_gate=True, use_gate_in_kernel=True, lower_bound=self.lower_bound, A_log=nb["a_log"], dt_bias=nb["dt_bias"])
+            gate.update(safe_gate=True, use_gate_in_kernel=True, lower_bound=self.lower_bound, A_log=nb.get("a_log"), dt_bias=nb.get("dt_bias"))
         self.kernels.chunk_kda(
             nb["q"],
             nb["k"],
@@ -237,10 +237,14 @@ class KdaCuTileEngine(BaseEngine):
         cutile_la_gate("KdaCuTileEngine", facts, "KDA", facts.g_dtype if facts is not None else None)
         if facts.is_bwd and (facts.safe_gate or facts.use_beta_sigmoid):
             raise NotImplementedError("KdaCuTileEngine: raw-logit gate modes (safe_gate / use_beta_sigmoid) are forward-only")
+        if facts.is_bwd and facts.d_v != 128:
+            raise NotImplementedError(
+                f"KdaCuTileEngine: bwd requires v head dim 128 (the cuda.tile runtime rejects the fused wy/dqkg kernel otherwise), got {facts.d_v}"
+            )
         low, high = GATE_LOWER_BOUND_RANGE
-        glb = facts.gate_lower_bound
-        if glb is not None and not (low <= glb < high):
-            raise NotImplementedError(f"KdaCuTileEngine: gate_lower_bound must be in [{low}, {high}) (chunk_kda log-gate floor), got {glb}")
+        gate_lower_bound = facts.gate_lower_bound
+        if gate_lower_bound is not None and not (low <= gate_lower_bound < high):
+            raise NotImplementedError(f"KdaCuTileEngine: gate_lower_bound must be in [{low}, {high}) (chunk_kda log-gate floor), got {gate_lower_bound}")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
         return KdaCuTilePlan(graph)

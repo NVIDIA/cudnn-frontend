@@ -5,6 +5,8 @@ from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.base_dsl.typing import Pointer
+from cutlass.experimental import primitives as nvvm
 from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.scheduler import (
@@ -13,8 +15,43 @@ from cudnn.frost.tile_dsl.scheduler import (
     lpt_tile_coords,
     lpt_l2_tile_coords,
 )
-from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_PADDED, MASK_SWA
+
+# KvLoopBounds / compute_kv_loop_bounds moved to frost.tile_dsl.mask (the
+# backward needs the same tile-level bounds); re-exported here so the twelve
+# prefill kernels that import them from this module keep working.
+from cudnn.frost.tile_dsl.mask import (  # noqa: F401
+    MASK_CAUSAL,
+    MASK_PADDED,
+    MASK_SWA,
+    KvLoopBounds,
+    compute_kv_loop_bounds,
+    _div_up,
+)
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
+
+
+@cute.jit
+def sanitize_mxfp8_thd_v_sf_padding(sv_sf, kv_tile_idx, seqlen_kv):
+    """Replace fully padded V scale blocks before block-scaled BMM2.
+
+    F8_128x4 stores four 32-token V scale blocks in each 4-byte row group.
+    The packed THD tail may leave whole blocks outside the sequence; their data
+    TMA-loads as zero, but an E8M0 NaN scale would still make ``0 * NaN`` poison
+    the accumulator.  Preserve blocks containing valid tokens and replace only
+    the fully padded scale bytes with the finite scale 1.0 (0x7f).
+    """
+    remaining = seqlen_kv - kv_tile_idx * cutlass.Int32(128)
+    valid_blocks = (remaining + cutlass.Int32(31)) // cutlass.Int32(32)
+    if valid_blocks < cutlass.Int32(4):
+        lane = cute.arch.thread_idx()[0] % cutlass.Int32(32)
+        keep_mask = (cutlass.Int32(1) << (valid_blocks * cutlass.Int32(8))) - cutlass.Int32(1)
+        fill_mask = cutlass.Int32(0x7F7F7F7F) & ~keep_mask
+        for row_group in cutlass.range_constexpr(4):
+            byte_offset = lane * cutlass.Int32(16) + cutlass.Int32(row_group * 4)
+            word = Pointer(sv_sf.base.subview(byte_offset).data_ptr(), dtype=cutlass.Int32)
+            word.store((word.load(alignment=4) & keep_mask) | fill_mask, alignment=4)
+        nvvm.fence_proxy("async.shared", space="cta")
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
 class Bars(NamedTuple):
@@ -165,17 +202,6 @@ def make_classic_bars(CFG) -> Bars:
     )
 
 
-class KvLoopBounds(NamedTuple):
-    left: object
-    unmasked_lo: object
-    unmasked_hi: object
-    right: object
-
-
-def _div_up(a, b):
-    return (a + cutlass.Int32(b - 1)) // cutlass.Int32(b)
-
-
 def row_max_for_exp2(total_max):
     """Canonical masked-softmax row-max guard (FlashAttention / cuDNN form).
 
@@ -220,88 +246,6 @@ def assert_tile_n_supported(CFG):
         raise NotImplementedError(f"this kernel currently requires TILE_N=128 (got TILE_N={CFG.TILE_N})")
 
 
-def compute_kv_loop_bounds(
-    q_row_coord,
-    seqlen_q,
-    seq_kv_len,
-    window_left: int,
-    mask_flags: int,
-    tile_n: int,
-    cga_tile_m: int,
-    bottom_right: bool = False,
-    window_right: int = 0,
-) -> KvLoopBounds:
-    # window_right: compile-time diagonal-band right bound (cuDNN
-    # diagonal_band_right_bound) — the causal upper limit is widened by
-    # window_right columns. 0 = plain causal; folds out entirely.
-    left = cutlass.Int32(0)
-    right = _div_up(seq_kv_len, tile_n)
-
-    if cutlass.const_expr(bottom_right):
-        causal_diag = seq_kv_len - seqlen_q
-    else:
-        causal_diag = cutlass.Int32(0)
-
-    if cutlass.const_expr(mask_flags & MASK_CAUSAL):
-        kv_hi_caus = _div_up(q_row_coord + cutlass.Int32(cga_tile_m + window_right) + causal_diag, tile_n)
-        right = cute.math.min(right, kv_hi_caus)
-
-    if cutlass.const_expr(mask_flags & MASK_SWA):
-        # The whole band shifts with the diagonal: under BOTTOM_RIGHT the SWA
-        # lower bound is q + (S_kv - S_q) - W, same anchor the causal upper
-        # bound uses (causal_diag folds to 0 for top-left).
-        swa_base = q_row_coord + causal_diag
-        cond = swa_base > cutlass.Int32(window_left)
-        delta = swa_base - cutlass.Int32(window_left)
-        kv_lo_swa = cutlass.Int32(
-            arith.select(
-                cond.ir_value(),
-                (delta // cutlass.Int32(tile_n)).ir_value(),
-                cutlass.Int32(0).ir_value(),
-            )
-        )
-        left = cute.math.max(left, kv_lo_swa)
-
-    unmasked_hi = right
-    if cutlass.const_expr(mask_flags & MASK_PADDED):
-        unaligned = (seq_kv_len % cutlass.Int32(tile_n)) != cutlass.Int32(0)
-        lo_pad = cutlass.Int32(
-            arith.select(
-                unaligned.ir_value(),
-                (right - cutlass.Int32(1)).ir_value(),
-                right.ir_value(),
-            )
-        )
-        unmasked_hi = cute.math.min(unmasked_hi, lo_pad)
-    if cutlass.const_expr(mask_flags & MASK_CAUSAL):
-        lo_caus = (q_row_coord + cutlass.Int32(window_right) + causal_diag) // cutlass.Int32(tile_n)
-        unmasked_hi = cute.math.min(unmasked_hi, lo_caus)
-    unmasked_hi = cute.math.max(unmasked_hi, left)
-
-    unmasked_lo = left
-    if cutlass.const_expr(mask_flags & MASK_SWA):
-        anchor = q_row_coord + causal_diag + cutlass.Int32(cga_tile_m - 1 - window_left)
-        swa_unmasked_lo = _div_up(anchor, tile_n)
-        cond = anchor > cutlass.Int32(0)
-        swa_unmasked_lo = cutlass.Int32(
-            arith.select(
-                cond.ir_value(),
-                swa_unmasked_lo.ir_value(),
-                cutlass.Int32(0).ir_value(),
-            )
-        )
-        unmasked_lo = cute.math.max(unmasked_lo, swa_unmasked_lo)
-
-    unmasked_lo = cute.math.min(unmasked_lo, unmasked_hi)
-
-    return KvLoopBounds(
-        left=left,
-        unmasked_lo=unmasked_lo,
-        unmasked_hi=unmasked_hi,
-        right=right,
-    )
-
-
 class SplitHelpers(NamedTuple):
     """Split-aware decode / bounds closures, plus the two flags kernels fold on."""
 
@@ -322,9 +266,13 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
 
     ``bounds_for_tile`` is the caller's own bounds closure, taking
     ``(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor,
-    batch_idx)`` — flavors differ in whether they apply the dead-Q-tile trim, so
-    the split narrowing composes on top of whatever they already do.
-
+    batch_idx, qh_per_kh)`` — flavors differ in whether they apply the
+    dead-Q-tile trim, so the split narrowing composes on top of whatever they
+    already do.  ``qh_per_kh`` (trailing, default 1) is the graph's GQA
+    ratio; with CFG.PACK_GQA it is the packing group
+    size: the split chunks the tile's PACKED token-span bounds, so packing
+    and KV split compose; without CFG.PACK_GQA the bounds fold to the classic
+    single-head-per-tile form.
     At SPLIT_KV == 1 every closure below folds away and the traced code is the
     classic single-pass kernel.
     """
@@ -355,10 +303,8 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
 
     # Which grid does this flavor launch?  SCHED_NATURAL uses a 3-D
     # (q_super, head, batch) grid; the LPT policy flattens everything into x.
-    # NOTE this is the flavor's EFFECTIVE policy, not the requested one:
-    # make_cfg_d192 hardcodes SCHEDULER_POLICY=1 regardless of params, so a
-    # params-level check would miss it (and did -- d192 silently launched the
-    # unsplit grid because the split multiplier was only on the NATURAL branch).
+    # This must use the flavor's effective CFG policy so the helper and launch
+    # grid follow the same compile-time specialization.
     IS_LPT = CFG.SCHEDULER_POLICY != SCHED_NATURAL
 
     @cute.jit
@@ -440,17 +386,19 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
         return q, h, b % n_batch, b // n_batch
 
     @cute.jit
-    def _bounds_for_tile_split(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx):
-        """The flavor's bounds, narrowed to this split's slice of the KV range.
+    def _bounds_for_tile_split(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, qh_per_kh: int = 1):
+        """The flavor's (possibly packed) bounds, narrowed to this split's slice
+        of the KV range.
 
         Splitting the ALREADY-masked ``[left, right)`` rather than the raw KV
         extent is what keeps causal / SWA correct AND balanced: each split gets
-        an equal share of the tile's real work, not of the sequence.  The
-        unmasked band is clamped into the slice, which preserves the
-        ``left <= unmasked_lo <= unmasked_hi <= right`` invariant the mainloop
-        relies on, because clamping is monotone.
+        an equal share of the tile's real work, not of the sequence — and under
+        PackGQA that range is already in packed token-span units, so the two
+        features compose.  The unmasked band is clamped into the slice, which
+        preserves the ``left <= unmasked_lo <= unmasked_hi <= right`` invariant
+        the mainloop relies on, because clamping is monotone.
         """
-        b = bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+        b = bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, qh_per_kh)
         if cutlass.const_expr(SPLIT_KV == 1):
             return b
         lo, hi = _split_chunk(b.left, b.right, split_idx)
@@ -646,9 +594,12 @@ def make_sdpa_helpers(
                 return _lpt_q_super(row, cta_in_pair), head, batch
 
     @cute.jit
-    def _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair):
+    def _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, qh_per_kh: int = 1):
+        # Token capacity of one CGA super-tile: TILES_Q * TILE_M rows hold
+        # rows/G tokens when packing (CFG.PACK_GQA), else one token per row.
+        tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
         cga_base_super = q_super_idx - cta_in_pair
-        q_row_coord = cga_base_super * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
+        q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
         return compute_kv_loop_bounds(
             q_row_coord,
             seqlen_q,
@@ -656,13 +607,13 @@ def make_sdpa_helpers(
             CFG.WINDOW_LEFT,
             CFG.MASK_FLAGS,
             CFG.TILE_N,
-            cga_tile_m,
+            cga_tile_m // qh_per_kh if CFG.PACK_GQA else cga_tile_m,
             bottom_right=bool(CFG.BOTTOM_RIGHT),
             window_right=int(CFG.WINDOW_RIGHT),
         )
 
     @cute.jit
-    def _bounds_for_tile_qtrim(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx):
+    def _bounds_for_tile_qtrim(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, qh_per_kh: int = 1):
         """bounds_for_tile + cuDNN-style dead-Q-tile KV-loop collapse.
 
         Mirrors cuDNN fort (mma_pipeline_op_native_sdpa_prefill_sm100_nonfp8
@@ -674,17 +625,21 @@ def make_sdpa_helpers(
         empty (right := left, matching the SWA empty-tile machinery) — the
         grid stays padded-sized and a dead tile costs prologue+epilogue only.
         q_len_b == 0 (whole batch dead) collapses every tile since the base
-        row coord is always >= 0.  The row coord is the SAME cga-base value
-        _bounds_for_tile uses, and q lens are per-batch constants, so every
-        warp group calling this helper sees identical (collapsed) bounds and
-        the barrier handshakes stay in lockstep.  The epilogue's
-        SEQ_Q_LENS_PRESENT trim (applied after the sink fold) already forces
-        O := 0 / LSE := -inf for every row of a collapsed tile.
+        row coord is always >= 0.  Under PackGQA the dead-tile
+        compare is the tile's base TOKEN (rows // G) against the per-batch
+        Q length — the same token-space value the packed bounds use.  Either way
+        the row coord is the SAME cga-base value _bounds_for_tile uses and q
+        lens are per-batch constants, so every warp group calling this helper
+        sees identical (collapsed) bounds and the barrier handshakes stay in
+        lockstep.  The epilogue's SEQ_Q_LENS_PRESENT trim (applied after the
+        sink fold) already forces O := 0 / LSE := -inf for every row of a
+        collapsed tile.
         """
-        b = _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair)
+        b = _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, qh_per_kh)
         if cutlass.const_expr(int(getattr(CFG, "SEQ_Q_LENS_PRESENT", 0)) == 1):
+            tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
             cga_base_super = q_super_idx - cta_in_pair
-            q_row_coord = cga_base_super * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
+            q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
             arr = cutlass.make_array_view(seq_q_lens_tensor)
             q_len_b = cutlass.Int32(arr[batch_idx])
             tile_dead = q_row_coord >= q_len_b
@@ -744,15 +699,25 @@ def make_sdpa_helpers(
         f_head = cutlass.Int32(0)
         f_qc = cutlass.Int32(0)
         done = cutlass.Int32(0)
-        for b in cutlass.range(0, n_batch, 1, unroll=1):
+        # Sequences are visited LONGEST FIRST through batch_remap (built by the
+        # THD setup launch), so the ragged tail of the grid is short sequences.
+        remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
+        for i in cutlass.range(0, n_batch, 1, unroll=1):
+            b = cutlass.Int32(cu[remap0 + i])
             s_i = cutlass.Int32(cu[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + b])
             cb = (s_i + cutlass.Int32(cga_tile_m - 1)) // cutlass.Int32(cga_tile_m)
             units_b = cb * n_qh
+            # A zero-length sequence gives cb == 0, and units_b == 0 with it, so
+            # in_rng is false and the quotient is discarded — but arith.select
+            # evaluates BOTH arms, so divide by a clamped copy to keep the dead
+            # arm defined. units_b keeps the true cb (thd_decode_unit's tb_nz).
+            cb_nz = cute.math.max(cb, cutlass.Int32(1))
             in_rng = (done == cutlass.Int32(0)) & (u < acc + units_b)
             local = u - acc
+            # Natural order within a sequence (head-major, ascending rows).
             f_batch = cutlass.Int32(arith.select(in_rng.ir_value(), b.ir_value(), f_batch.ir_value()))
-            f_head = cutlass.Int32(arith.select(in_rng.ir_value(), (local // cb).ir_value(), f_head.ir_value()))
-            f_qc = cutlass.Int32(arith.select(in_rng.ir_value(), (local % cb).ir_value(), f_qc.ir_value()))
+            f_head = cutlass.Int32(arith.select(in_rng.ir_value(), (local // cb_nz).ir_value(), f_head.ir_value()))
+            f_qc = cutlass.Int32(arith.select(in_rng.ir_value(), (local % cb_nz).ir_value(), f_qc.ir_value()))
             done = cutlass.Int32(arith.select(in_rng.ir_value(), cutlass.Int32(1).ir_value(), done.ir_value()))
             acc = acc + units_b
         q_super = f_qc * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
@@ -762,12 +727,16 @@ def make_sdpa_helpers(
     def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
             return _thd_decode(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+        if cutlass.const_expr(CFG.PACK_GQA):
+            qh_per_kh = cutlass.Int32(1)
         return _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
 
     @cute.jit
     def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
             return _thd_decode(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+        if cutlass.const_expr(CFG.PACK_GQA):
+            qh_per_kh = cutlass.Int32(1)
         return _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
 
     @cute.jit

@@ -42,8 +42,13 @@ def get_strides_from_indices(shape, indices=[0, 1, 2, 3], gaps=[0, 0, 0, 0], rng
 
 
 def packed_token_capacity(seq_lens):
-    """Token capacity of a packed (ragged) buffer, rounded up to a multiple of 64."""
-    return max(64, ((sum(seq_lens) + 63) // 64) * 64)
+    """Token capacity of a packed (ragged) buffer: total tokens rounded up to the
+    next multiple of 64, always strictly greater than the total. The surplus
+    guarantees every ragged buffer has a capacity tail past the last ragged
+    offset — the harnesses NaN-poison that tail so an engine that reads it
+    (e.g. binding K/V views to capacity instead of live token counts,
+    GitHub #624) fails deterministically instead of only on recycled memory."""
+    return (sum(seq_lens) // 64 + 1) * 64
 
 
 def get_strides_from_layout(shape, layout, gaps=[0, 0, 0, 0], rng_geom=None):
@@ -370,8 +375,9 @@ class RandomizationContext:
             randoms_.left_bound = None if randoms_.diag_align == cudnn.diagonal_alignment.BOTTOM_RIGHT else 1
             randoms_.right_bound = rng.randint(0, randoms_.s_kv // 2)
         elif randoms["with_sliding_mask"] == "band_around_diag":
-            randoms_.left_bound = rng.randint(1, randoms_.s_kv // 2)
-            randoms_.right_bound = rng.randint(1, randoms_.s_kv // 2)
+            # s_kv == 1 leaves an empty randint range; a 1-wide band is the only option.
+            randoms_.left_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
+            randoms_.right_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
         elif randoms["with_sliding_mask"] == "causal":
             randoms_.right_bound = 0
 
@@ -382,8 +388,13 @@ class RandomizationContext:
         randoms_.shape_stats = (randoms_.batches, randoms_.h_q, randoms_.s_q, 1)
 
         if randoms_.is_ragged:  # Ideally Q, O, and Stats are all ragged
-            randoms_.stride_q = get_strides_from_layout(randoms_.shape_q, "bshd")
-            randoms_.stride_o = get_strides_from_layout(randoms_.shape_o, "bshd")
+            # Q/O strides stay None: fill_derived_fields (called before
+            # return) draws the seeded per-tensor token gaps there, with the
+            # auto-packed fallbacks for the cu / offset-multiplier forms
+            # (#538) and 1-byte data types (#537). Assigning packed strides
+            # here would bypass that knob for the whole randomized fleet —
+            # exactly how the numel()//token_stride capacity bug (issue #613)
+            # stayed invisible to these sweeps.
             if randoms_.ragged_stats_layout == "head_major":
                 # [h, t] stats: tokens contiguous within a head, heads strided by the whole packed
                 # buffer. This is FlashAttention's / PyTorch varlen's softmax_lse layout; unlike the
@@ -423,8 +434,7 @@ class RandomizationContext:
         randoms_.shape_v = (randoms_.batches, randoms_.h_v, randoms_.s_kv, randoms_.d_v)
 
         if randoms_.is_ragged:  # Ideally K ragged and V ragged
-            randoms_.stride_k = get_strides_from_layout(randoms_.shape_k, "bshd")
-            randoms_.stride_v = get_strides_from_layout(randoms_.shape_v, "bshd")
+            pass  # K/V strides stay None -> seeded token gaps in fill_derived_fields
 
         else:
             indices = [0, 1, 2]
@@ -442,6 +452,10 @@ class RandomizationContext:
             randoms_.stride_k = get_strides_from_indices(randoms_.shape_k, indices, gaps_k, rng)
             randoms_.stride_v = get_strides_from_indices(randoms_.shape_v, indices, gaps_v, rng)
 
+        # Fill whatever was left None (ragged Q/K/V/O strides) through the
+        # same derivation every ExecConfig takes — one source of truth for
+        # the ragged token-gap draw and its fallbacks.
+        randoms_.fill_derived_fields()
         return randoms_
 
 
