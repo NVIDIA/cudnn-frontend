@@ -363,6 +363,7 @@ class SdpaFwdDsl(APIBase):
         sample_v: torch.Tensor | TensorDesc,
         sample_o: torch.Tensor | TensorDesc,
         sample_lse: Optional[torch.Tensor | TensorDesc] = None,
+        sample_amax_o: Optional[torch.Tensor | TensorDesc] = None,
         is_causal: bool = False,
         causal_bottom_right: bool = False,
         window_size_left: Optional[int] = None,
@@ -403,6 +404,7 @@ class SdpaFwdDsl(APIBase):
         self.v_desc = self._make_tensor_desc(sample_v, name="v")
         self.o_desc = self._make_tensor_desc(sample_o, name="o")
         self.lse_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_lse, name="lse"), 3, "lse")
+        self.amax_o_desc = self._make_tensor_desc(sample_amax_o, name="amax_o")
 
         self.is_causal = bool(is_causal)
         self.causal_bottom_right = bool(causal_bottom_right)
@@ -454,8 +456,8 @@ class SdpaFwdDsl(APIBase):
         self._pertensor = bool(pertensor_fp8)
         # Direct-adapter-only experiment. It deliberately has no graph node or
         # engine capability: its purpose is to isolate the QK-MXFP8/BF16-PV
-        # kernel tradeoff before exposing an API contract. It writes BF16 O
-        # only; unlike the MXFP8 path, it deliberately has no Amax_O output.
+        # kernel tradeoff before exposing an API contract. It writes BF16 O;
+        # Amax_O is compiled only when ``sample_amax_o`` declares that output.
         self.pv_bf16 = bool(pv_bf16)
         self._device_cc = None  # (major, minor); set in check_support
         # Tuning-knob choice, already validated against the engine's
@@ -1001,6 +1003,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
         self._not_implemented_error_if(
+            self.amax_o_desc is not None and (not self._fp8 or self._pertensor),
+            "sample_amax_o is supported only by the block-scale MXFP8 path",
+        )
+        self._not_implemented_error_if(
             self.pack_gqa and self._fp8 and not self._pertensor,
             "PackGQA is not supported for MXFP8: the F8_128x4 sf_q scale-factor atom "
             "bundles 128 rows of ONE head and is not TMA-gatherable at token granularity "
@@ -1025,8 +1031,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.dtype_o = self.dtype
         self._not_implemented_error_if(
             self.pv_bf16 and self.dtype_o != torch.bfloat16,
-            "pv_bf16 requires BF16 O because it has no output quantization or Amax_O contract",
+            "pv_bf16 requires BF16 O",
         )
+        if self.amax_o_desc is not None:
+            self._check_dtype(self.amax_o_desc, torch.float32, name="Amax_O")
+            self._value_error_if(math.prod(self.amax_o_desc.shape) != 1, f"Amax_O must contain exactly one float32 element; got {self.amax_o_desc.shape}")
         if self.lse_desc is not None:
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
             self._check_tensor_shape(self.lse_desc, (b, h_qo, s_qo), name="LSE")
@@ -1145,8 +1154,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "D192 split_kv > 1 is validated only with cga=2",
         )
         self._not_implemented_error_if(
-            self.pv_bf16 and (self.flavor != (128, 128) or self.thd or self.split_kv != 1),
-            "pv_bf16 is an experimental direct-only MXFP8 D128 dense specialization (THD and split-KV are not wired)",
+            self.pv_bf16 and (self.flavor not in ((128, 128), (192, 128)) or self.thd or self.split_kv != 1),
+            "pv_bf16 is an experimental direct-only MXFP8 D128 or D192xD128 dense specialization (THD and split-KV are not wired)",
         )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
@@ -1314,6 +1323,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
             pv_bf16=self.pv_bf16,
+            # Preserve the existing MXFP8 kernel contract. The hybrid path
+            # compiles the atomic reduction only when its plan declares the
+            # output, so a runtime execute() argument cannot silently change
+            # the launched kernel.
+            emit_amax_o=(not self.pv_bf16) or self.amax_o_desc is not None,
         )
         if self.flavor == (192, 128):
             from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
@@ -1547,6 +1561,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._value_error_if(
             self.lse_desc is None and lse_tensor is not None,
             "this specialization was compiled without an LSE output; construct the API with sample_lse",
+        )
+        self._value_error_if(
+            self.amax_o_desc is not None and amax_o is None,
+            "amax_o is required by this compiled specialization",
+        )
+        self._value_error_if(
+            self.amax_o_desc is None and self.pv_bf16 and amax_o is not None,
+            "this hybrid specialization was compiled without Amax_O; construct the API with sample_amax_o",
         )
         if self.thd:
             pass  # bound in _execute_thd (declared packed layout)
@@ -2078,9 +2100,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         if sf_q is None or sf_k is None or (sf_v is None and not self.pv_bf16):
             raise ValueError("Frost MXFP8 execute requires sf_q/sf_k and, unless pv_bf16=True, sf_v (block-scale descale tensors)")
-        if self.pv_bf16 and amax_o is not None:
-            raise ValueError("pv_bf16 produces BF16 O only and does not produce Amax_O")
-
         km = self._k_mod
         b, h_q, h_kv = self.batch_size, self.h_q, self.h_kv
         sq, skv = self.s_q_max, self.s_k_max
@@ -2153,7 +2172,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         n_kv_tiles = self._ceil_div(skv, _SM100_TILE_N)
         sf_q_v = self._reshape_sf(sf_q, h_q, n_q_tiles, km.SF_SMEM_SIZE_Q)
         sf_k_v = self._reshape_sf(sf_k, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_K)
-        sf_v_v = self._reshape_sf(sf_k if self.pv_bf16 else sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
+        # The BF16 PV specialization keeps the common FP8-family SF_V ABI, but
+        # BMM2 does not consume it.  D192 Q/K SF tiles are 1024 B while the
+        # unused V slot is 512 B, so bind a contiguous prefix copy rather than reshaping
+        # the full K tile as if it were a V tile.
+        sf_v_v = sf_k_v[..., : km.SF_SMEM_SIZE_V].contiguous() if self.pv_bf16 else self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
 
         # has_lse=False (no Stats output): the store is compiled out; bind None.
         lse = lse_tensor
@@ -2167,13 +2190,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
 
-        if self.pv_bf16:
+        if self.pv_bf16 and self.amax_o_desc is None:
             # This unused ABI slot is compiled out of the hybrid kernel.
             amax_o_buf = self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
         else:
-            amax_o_buf = (
-                amax_o.reshape(-1)[:1] if amax_o is not None else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
-            )
+            amax_o_buf = self._amax_slot(amax_o, "amax_o", device)
             with _torch_stream_context(current_stream, device):
                 amax_o_buf.zero_()
 

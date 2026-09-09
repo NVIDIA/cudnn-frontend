@@ -362,8 +362,9 @@ def _check_mxfp8_strided_stats(d_qk, d_v, in_key):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("h_q,h_kv", [(4, 4), (4, 2)], ids=["mha", "gqa"])
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128)], ids=["d128", "d192_d128"])
 @torch_fork_set_rng(seed=61)
-def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv):
+def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
     """Validate the direct-only hybrid BF16-output contract.
 
     This deliberately exercises the direct-only adapter switch rather than a
@@ -375,15 +376,15 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv):
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("SM107 serves per-tensor FP8 d128, not block-scaled MXFP8")
 
-    b, s, d = 1, 256, 128
+    b, s = 1, 256
     dev = "cuda"
-    scale = d**-0.5
-    qf = torch.randn(b, h_q, s, d, device=dev) * 0.5
-    kf = torch.randn(b, h_kv, s, d, device=dev) * 0.5
-    v = (torch.randn(b, h_kv, s, d, device=dev) * 0.5).to(torch.bfloat16)
-    q, sf_q, dq, _ = _quantize(qf, b, h_q, s, d, torch.float8_e4m3fn, columnwise=False)
-    k, sf_k, dk, _ = _quantize(kf, b, h_kv, s, d, torch.float8_e4m3fn, columnwise=False)
-    o = torch.empty_like(qf, dtype=torch.bfloat16)
+    scale = d_qk**-0.5
+    qf = torch.randn(b, h_q, s, d_qk, device=dev) * 0.5
+    kf = torch.randn(b, h_kv, s, d_qk, device=dev) * 0.5
+    v = (torch.randn(b, h_kv, s, d_v, device=dev) * 0.5).to(torch.bfloat16)
+    q, sf_q, dq, _ = _quantize(qf, b, h_q, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    k, sf_k, dk, _ = _quantize(kf, b, h_kv, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    o = torch.empty(b, h_q, s, d_v, device=dev, dtype=torch.bfloat16)
 
     api = SdpaFwdDslSm100(
         sample_q=q,
@@ -398,13 +399,32 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv):
     )
     assert api.check_support()
     api.compile()
-    with pytest.raises(ValueError, match="does not produce Amax_O"):
+    with pytest.raises(ValueError, match="without Amax_O"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=torch.empty(1, device=dev, dtype=torch.float32))
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k)
     torch.cuda.synchronize()
 
     o_ref = _ref(q.float() * dq, k.float() * dk, v.float(), scale=scale, is_causal=True)
-    _check(o, o_ref, torch.bfloat16, "e4m3", d_qk=d)
+    _check(o, o_ref, torch.bfloat16, "e4m3", d_qk=d_qk)
+
+    amax_o = torch.empty(1, device=dev, dtype=torch.float32)
+    api_amax = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_amax_o=amax_o,
+        is_causal=True,
+        scale_softmax=scale,
+        dtype_o=torch.bfloat16,
+        split_kv=1,
+        pv_bf16=True,
+    )
+    assert api_amax.check_support()
+    api_amax.compile()
+    api_amax.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=amax_o)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(amax_o, o_ref.abs().max().reshape_as(amax_o), rtol=0.0, atol=3e-2)
 
 
 @pytest.mark.L0

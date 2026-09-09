@@ -132,6 +132,11 @@ class TemplateParams:
     # template axis because it changes the TMA maps, shared-memory layout and
     # BMM2 instruction kind. It is intentionally not wired into graph routing.
     pv_bf16: bool = False
+    # Output Amax is an independently optional graph output. It is normally
+    # enabled for the existing MXFP8 kernels; the direct QK-MXFP8/BF16-PV
+    # experiment enables it only when its plan declares an Amax_O buffer.
+    # This is plan-time state: it must never be inferred from execute() args.
+    emit_amax_o: bool = True
 
 
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
@@ -154,8 +159,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
         raise ValueError(f"{flavor}: softmax_f16 is per-tensor-FP8-only (f16/bf16 softmax already runs the f32 pipeline)")
-    if k.pv_bf16 and (not fp8 or flavor != "d128"):
-        raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128-only specialization")
+    if k.pv_bf16 and (not fp8 or flavor not in ("d128", "d192")):
+        raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128/D192 specialization")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
     if dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_O must be 0..3; got {dtype_o}")
@@ -821,6 +826,7 @@ class CfgD128:
     # retain their one-byte MXFP8 storage.
     BPE_V: int = 2
     PV_BF16: int = 0
+    EMIT_AMAX_O: int = 1
     BPE_O: int = 2
 
     CGA_M: int = 2
@@ -993,6 +999,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         BPE=b,
         BPE_V=b_v,
         PV_BF16=int(params.pv_bf16),
+        EMIT_AMAX_O=int(params.emit_amax_o),
         BPE_O=b_o,
         CGA_M=params.cta_mma,
         CTA_MMA=params.cta_mma,
@@ -1062,7 +1069,7 @@ def _d192_smem_bytes(cfg) -> int:
     o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
     qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
-    v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE // cfg.CTA_MMA)
+    v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA)
     return qo + k + v
 
 
@@ -1079,8 +1086,8 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d192: per-role regs must be multiples of 8"),
         (cfg.CGA_M == cfg.CTA_MMA and cfg.CTA_MMA in (1, 2), "d192 SM100: CGA_M must equal CTA_MMA, and CTA_MMA must be 1 (cga1) or 2 (cga2)"),
         (
-            cfg.STAGES_KV == (2 if fp8 else 1) * cfg.CTA_MMA,
-            "d192: STAGES_KV must scale with input dtype and cluster width " "(FP8: 2/4 at cga1/cga2; half: 1/2)",
+            cfg.STAGES_KV == ((3 if cfg.CTA_MMA == 2 else 1) if cfg.PV_BF16 else (2 if fp8 else 1) * cfg.CTA_MMA),
+            "d192: STAGES_KV must be 3/1 for BF16 PV at cga2/cga1, otherwise follow the input-dtype pipeline depth",
         ),
         (
             _d192_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
@@ -1094,15 +1101,15 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
         (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d192: 16 warps / 512 threads"),
         (cfg.READ_TILE_ARRIVERS == 15, f"d192: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
         (
-            cfg.TILE_K_HW_BMM1 == (32 if fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if fp8 else 16),
-            "d192: TILE_K_HW must be 32 for FP8 and 16 for BF16/FP16",
+            cfg.TILE_K_HW_BMM1 == (32 if fp8 else 16) and cfg.TILE_K_HW_BMM2 == (16 if cfg.PV_BF16 else (32 if fp8 else 16)),
+            "d192: BMM1 uses FP8 K=32; BF16 PV uses BMM2 K=16",
         ),
         (
             cfg.Q_SWZ_BYTES == (64 if fp8 else 128) and cfg.K_SWZ_BYTES == (64 if fp8 else 128),
             "d192: Q/K swizzle must be 64B for FP8 and 128B for BF16/FP16",
         ),
         (
-            cfg.V_SWZ_BYTES == v_swz_bytes(128, cfg.CTA_MMA, cfg.BPE) and cfg.O_SWZ_BYTES in ((64, 128) if fp8 else (128,)),
+            cfg.V_SWZ_BYTES == v_swz_bytes(128, cfg.CTA_MMA, cfg.BPE_V) and cfg.O_SWZ_BYTES in ((64, 128) if fp8 else (128,)),
             "d192: V/O swizzle is inconsistent with the input/output dtype",
         ),
     )
@@ -1212,11 +1219,15 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         and (params.window_right or 0) == 0
     )
     wide_role_regs = thd_swa or e5_dense_causal_regs
+    b_v = 2 if params.pv_bf16 else b
+    stages_kv = (3 if params.cta_mma == 2 else 1) if params.pv_bf16 else (2 if fp8 else 1) * params.cta_mma
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
-        BPE_V=b,
+        BPE_V=b_v,
+        PV_BF16=int(params.pv_bf16),
+        EMIT_AMAX_O=int(params.emit_amax_o),
         BPE_O=b_o,
         SPLIT_KV=int(params.split_kv),
         QO_ALIAS=0 if fp8 else 1,
@@ -1224,12 +1235,12 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         K_SWZ_BYTES=q_swz_bytes(192, b),
         CGA_M=params.cta_mma,
         CTA_MMA=params.cta_mma,
-        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b),
+        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b_v),
         O_SWZ_BYTES=o_swz_bytes(128, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
-        TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
-        STAGES_KV=(2 if fp8 else 1) * params.cta_mma,
+        TILE_K_HW_BMM2=16 if params.pv_bf16 else (32 if fp8 else tile_k_hw(params.dtype_qkv)),
+        STAGES_KV=stages_kv,
         SCHEDULER_STAGES=3 if e4_thd_swa and not params.bottom_right else 2,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
