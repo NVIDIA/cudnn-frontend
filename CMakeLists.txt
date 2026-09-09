@@ -5,6 +5,12 @@ cmake_minimum_required(VERSION 3.23)
 
 project(cudnn_frontend VERSION 1.29.0)
 
+# Introduce variables:
+# * CMAKE_INSTALL_LIBDIR
+# * CMAKE_INSTALL_BINDIR
+# * CMAKE_INSTALL_INCLUDEDIR
+include(GNUInstallDirs)
+
 option(CUDNN_FRONTEND_SKIP_JSON_LIB "Defines whether FE should not include nlohmann/json.hpp." OFF)
 option(CUDNN_FRONTEND_BUILD_SAMPLES "Defines if samples are built or not." ON)
 option(CUDNN_FRONTEND_BUILD_TESTS "Defines if unittests are built or not." ON)
@@ -70,12 +76,6 @@ endif()
 if (CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS)
     add_subdirectory(python)
 endif()
-
-# Introduce variables:
-# * CMAKE_INSTALL_LIBDIR
-# * CMAKE_INSTALL_BINDIR
-# * CMAKE_INSTALL_INCLUDEDIR
-include(GNUInstallDirs)
 
 # See https://cmake.org/cmake/help/latest/module/CMakePackageConfigHelpers.html#example-generating-package-files
 include(CMakePackageConfigHelpers)
