@@ -1,6 +1,5 @@
 # Pointwise and Reduction
 
-(pointwise)=
 ## Pointwise
 
 The pointwise operation performs an elementwise operation between two tensors. The operation used is controlled by pointwise mode `cudnn_frontend::PointwiseMode_t`.   
@@ -98,7 +97,6 @@ set_compute_data_type(DataType_t value)
     - compute_data_type
     - name
 
-(reduction)=
 ## Reduction
 
 The reduction operation reduces an input tensor using an operation controlled by `cudnn_frontend::ReductionMode_t`. The dimensions in input tensors to reduce are deduced using output tensor dimensions.

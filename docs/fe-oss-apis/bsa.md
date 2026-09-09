@@ -269,7 +269,7 @@ Correctness tests and FP32 references are under
 
 ## Acknowledgements
 
-We would like to express our gratitude to <huangyitong.hyt@alibaba-inc.com> and
-<wenting.swt@alibaba-inc.com> for providing testing and optimization feedback
+We would like to express our gratitude to [huangyitong.hyt@alibaba-inc.com](mailto:huangyitong.hyt@alibaba-inc.com) and
+[wenting.swt@alibaba-inc.com](mailto:wenting.swt@alibaba-inc.com) for providing testing and optimization feedback
 throughout the deployment process, which has continuously advanced the BSA kernel
 toward Speed of Light.
