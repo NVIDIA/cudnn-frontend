@@ -220,29 +220,38 @@ def test_gqa_mqa(hq, hkv):
     _run(hq=hq, hkv=hkv, sq=256, skv=256)
 
 
-def test_gqa_chunk_smaller_than_group(monkeypatch):
-    """The workspace budget may split one GQA group across head chunks.
+@pytest.mark.parametrize(
+    "hq,hkv,chunk",
+    [(16, 2, 4), (16, 2, 1), (12, 3, 6)],
+    ids=("gemma-half-group", "gemma-single-head", "cross-group-boundary"),
+)
+def test_gqa_non_group_aligned_head_chunks(monkeypatch, hq, hkv, chunk):
+    """The workspace budget may split or cross GQA-group boundaries.
 
     Gemma 4 has Hq=16/Hkv=2.  At long sequence lengths a whole eight-head
-    group cannot fit the stated 4 GiB S+dS budget, so the dense adapter must be
-    able to process a four-head (and eventually one-head) chunk without losing
-    the Q-head -> KV-head mapping in dQ.
+    group cannot fit the stated 4 GiB S+dS budget, so the dense adapter must
+    process four- and one-head chunks without losing the Q-head -> KV-head
+    mapping in dQ.  Hq=12/Hkv=3 additionally covers a six-head chunk that
+    crosses a four-head group boundary.
     """
     import cudnn.sdpa.bwd.api_dsl as bwd_dsl
 
     choose = bwd_dsl._sm100_head_chunk
     seen = []
 
-    def force_four(b, h_q, s_q, s_kv, bpe, budget=bwd_dsl._SM100_WS_BUDGET_BYTES, group=1):
+    def force_chunk(b, h_q, s_q, s_kv, bpe, budget=bwd_dsl._SM100_WS_BUDGET_BYTES, group=1):
         per_head = 2 * b * s_q * s_kv * bpe
-        chunk = choose(b, h_q, s_q, s_kv, bpe, budget=4 * per_head, group=group)
-        assert chunk == 4
-        seen.append((chunk, group))
-        return chunk
+        selected = choose(
+            b, h_q, s_q, s_kv, bpe, budget=chunk * per_head, group=group
+        )
+        assert selected == chunk
+        seen.append((selected, group))
+        return selected
 
-    monkeypatch.setattr(bwd_dsl, "_sm100_head_chunk", force_four)
-    _run(b=1, hq=16, hkv=2, sq=256, skv=256)
-    assert seen == [(4, 8)]
+    monkeypatch.setattr(bwd_dsl, "_sm100_head_chunk", force_chunk)
+    _run(b=1, hq=hq, hkv=hkv, sq=256, skv=256)
+    assert seen
+    assert all(item == (chunk, hq // hkv) for item in seen)
 
 
 @pytest.mark.parametrize("s,want", [(8192, 16), (16384, 4), (32768, 1)])
