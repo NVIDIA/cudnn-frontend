@@ -571,27 +571,6 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
     return (False, True)
 
 
-def _reachable_kv_tiles(facts, rows_per_tile: int, tile_n: int) -> int:
-    """Conservative KV-loop length after applying a static diagonal band.
-
-    Split-KV pays only for K/V tiles a Q tile can reach. Top-left bands cap
-    that span at the last Q row plus the right bound; a finite left window
-    caps each Q tile to its row extent plus both band offsets. Bottom-right
-    bands without a finite left window can still reach the full K/V extent.
-    Runtime sequence lengths are deliberately excluded because plan ranking
-    cannot depend on their values.
-    """
-    kv_span = facts.s_kv
-    has_right_bound = facts.causal or facts.right_band_widening
-    if has_right_bound:
-        right = facts.right_bound or 0
-        if facts.window_left is not None:
-            kv_span = min(kv_span, rows_per_tile + facts.window_left + right)
-        elif not facts.bottom_right:
-            kv_span = min(kv_span, facts.s_q + right)
-    return _ceil_div(kv_span, tile_n)
-
-
 def _split_points(
     caps: Capabilities,
     facts,
@@ -646,7 +625,7 @@ def _split_points(
     split_launch = _SplitKvLaunch(
         q_tiles=_ceil_div(facts.s_q * pack_g, rows_per_tile),
         heads_q=facts.h_q // pack_g,
-        kv_tiles=_reachable_kv_tiles(facts, rows_per_tile, tile_n or 128),
+        kv_tiles=_ceil_div(facts.s_kv, tile_n or 128),
         ctas_per_tile=cga or 1,
     )
     unsplit_launch = None
@@ -659,7 +638,7 @@ def _split_points(
                 unsplit_rows_per_tile,
             ),
             heads_q=facts.h_q // unsplit_pack_g,
-            kv_tiles=_reachable_kv_tiles(facts, unsplit_rows_per_tile, unsplit_knobs.tile_n or 128),
+            kv_tiles=_ceil_div(facts.s_kv, unsplit_knobs.tile_n or 128),
             ctas_per_tile=unsplit_knobs.cga or 1,
         )
     split = choose_split_kv(
