@@ -17,7 +17,13 @@ from cutlass.cute.runtime import make_fake_stream
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.tensor_adapter import detect_framework, get_data_ptr, get_device
 
-from . import _kernel_sm100
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+_dsl_error = cutedsl_requirement_error("Grouped weight-only NVFP4")
+if _dsl_error:
+    raise ImportError(_dsl_error)
+
+from . import _kernel_sm100  # noqa: E402
 
 if TYPE_CHECKING:
     import torch

@@ -15,6 +15,7 @@ _LAZY_EXPORTS = {
     "GdnFrostEngine": (".gdn_engine", "GdnFrostEngine"),
     "Gdn2FrostEngine": (".gdn2_engine", "Gdn2FrostEngine"),
     "KdaFrostEngine": (".kda_engine", "KdaFrostEngine"),
+    "GdpFrostEngine": (".gdp_engine", "GdpFrostEngine"),
 }
 
 
@@ -32,4 +33,4 @@ def __dir__():
     return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 
-__all__ = ["GdnFrostEngine", "KdaFrostEngine", "Gdn2FrostEngine"]
+__all__ = ["GdnFrostEngine", "KdaFrostEngine", "Gdn2FrostEngine", "GdpFrostEngine"]

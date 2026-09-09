@@ -1,10 +1,10 @@
 # Grouped weight-only NVFP4 projection (SM100/SM103)
 
 **This is an experimental API and subject to change.** It requires the optional
-CuTe DSL dependencies and a CUDA torch build:
+CuTe DSL dependencies (CuTe DSL 4.7 or newer) and a CUDA torch build:
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install 'nvidia-cudnn-frontend[cutedsl]' 'nvidia-cutlass-dsl>=4.7'
 ```
 
 The domain-scoped `GroupedGemmWeightOnlyNvfp4` and
@@ -56,7 +56,7 @@ remain device-resident and are not copied to the host for validation.
 ## Wrapper API
 
 ```python
-from cudnn.gemm.cutedsl.grouped.weight_only_nvfp4 import (
+from cudnn.gemm.ops import (
     grouped_gemm_weight_only_nvfp4,
 )
 
@@ -80,7 +80,7 @@ reuse the same compiled artifact.
 Use the class when output storage and compilation lifetime belong to the caller:
 
 ```python
-from cudnn.gemm.cutedsl.grouped.weight_only_nvfp4 import (
+from cudnn.gemm.ops import (
     GroupedGemmWeightOnlyNvfp4,
 )
 
@@ -108,3 +108,6 @@ op.execute(
 `execute()` performs metadata and pointer validation, then launches exactly one
 kernel. It does not allocate, convert, repack, synchronize, or read device data
 to the host. The operation owns no workspace.
+
+The backend-specific `cudnn.gemm.cutedsl.grouped.weight_only_nvfp4` imports
+remain available for compatibility; new callers should use `cudnn.gemm.ops`.

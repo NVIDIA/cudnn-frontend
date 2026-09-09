@@ -73,7 +73,13 @@ from cudnn.frost.tile_dsl.scheduler import (
     lpt_l2_tile_coords,
 )
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_kernel as _build_thd_meta_kernel, THD_SETUP_THREADS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_kernel, sanitize_v_tail, THD_SETUP_THREADS
+from cudnn.sdpa.fwd.kernels._common_sm120 import (
+    SCHED_L2_BUDGET_BYTES,
+    ceil_div,
+    nvvm_threadquad_reduction_max,
+    nvvm_threadquad_reduction_sum,
+)
 from cudnn.sdpa.fwd.config_sm120 import (
     FP8_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SEQ_KV_TILES,
@@ -113,75 +119,6 @@ OUT_DTYPE = {
     DTYPE_BF16: cutlass.BFloat16,
     DTYPE_FP16: cutlass.Float16,
 }[PARAMS.dtype_o]
-
-# ---------------------------------------------------------------------------
-# PTX and layout helpers.
-# ---------------------------------------------------------------------------
-
-
-@cute.jit
-def nvvm_threadquad_reduction_max(val: cutlass.Float32) -> cutlass.Float32:
-    """Butterfly thread-quad (4 lanes) reduction max via shfl.sync.bfly."""
-    val = cute.arch.fmax(
-        val,
-        prims.shfl_sync(
-            thread_mask=0xFFFFFFFF,
-            val=val,
-            offset=2,
-            mask_and_clamp=0x1F,
-            kind=prims.Shfl.BFLY,
-        ),
-    )
-    val = cute.arch.fmax(
-        val,
-        prims.shfl_sync(
-            thread_mask=0xFFFFFFFF,
-            val=val,
-            offset=1,
-            mask_and_clamp=0x1F,
-            kind=prims.Shfl.BFLY,
-        ),
-    )
-    return val
-
-
-@cute.jit
-def nvvm_threadquad_reduction_sum(val: cutlass.Float32) -> cutlass.Float32:
-    """Butterfly thread-quad (4 lanes) reduction sum via shfl.sync.bfly."""
-    val = val + prims.shfl_sync(
-        thread_mask=0xFFFFFFFF,
-        val=val,
-        offset=2,
-        mask_and_clamp=0x1F,
-        kind=prims.Shfl.BFLY,
-    )
-    val = val + prims.shfl_sync(
-        thread_mask=0xFFFFFFFF,
-        val=val,
-        offset=1,
-        mask_and_clamp=0x1F,
-        kind=prims.Shfl.BFLY,
-    )
-    return val
-
-
-@cute.jit
-def pack_to_i32(
-    src: tuple,
-    dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-) -> cutlass.Int32:
-    """Pack four 8-bit or two 16-bit values into one 32-bit register."""
-    vals = cutlass.Vector.from_elements(src, dtype)
-    return vals.bitcast(cutlass.Int32)[0]
-
-
-# L2 working-set budget used by the LPT_L2 group sizing.
-_SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
-
-
-def ceil_div(a: int, b: int) -> int:
-    """Return the ceiling division of a by b."""
-    return (a + b - 1) // b
 
 
 def round_up_head_tile(d: int) -> int:
@@ -752,58 +689,6 @@ class SM120FusedMultiHeadAttentionForward:
         return p_regs
 
     @cute.jit
-    def sanitize_v_tail(
-        self,
-        basic_params: SimpleNamespace,
-        mma_params: SimpleNamespace,
-        kv_seq_idx: cutlass.Int32,
-    ) -> None:
-        """Zero ``sV`` rows at/past this tile's valid KV extent before P @ V.
-
-        The K/V TMA descriptors span the bound buffers' CAPACITY (under THD
-        the packed totals are device values, so the views bind whole-buffer
-        extents), so rows between the valid KV length and the tile end can
-        carry UNINITIALIZED storage — including fp8 NaN bit patterns. The
-        S-side mask overwrites those columns with -inf (a select, NaN-safe),
-        but P @ V still multiplies P = 0 against the NaN V row and
-        ``0 * NaN = NaN`` poisons the whole accumulator column-free. Reached
-        only from THD specializations' first masked step (see the call
-        site): dense descriptors carry the declared S_kv, so their overhang
-        loads zero-fill in hardware — a dense PADDED graph's pad rows are
-        user memory and deliberately NOT sanitized here (whether the
-        contract requires tolerating NaN bit patterns there is an open
-        question for the sibling kernels too).
-
-        Every compute warp redundantly zeroes the full overhang (idempotent
-        zero stores race benignly), so a warp-level sync is enough for each
-        warp's own ``ldmatrix`` lanes to observe the zeros.
-        """
-        segs_per_row = self.head_tile_v // 16  # 16-byte segments per V row
-        row_lo = cute.math.max(cutlass.Int32(0), basic_params.seqlen_k - kv_seq_idx)
-        for r_it in cutlass.range_constexpr(self.kv_tile // 32):
-            row = cutlass.Int32(r_it * 32) + basic_params.lane
-            for seg in cutlass.range_constexpr(segs_per_row):
-                col = seg * 16
-                phys_row = (col // self.v_swizzle_chunk_elems) * self.kv_tile + row
-                sv_ptr = (
-                    mma_params.sV.data_ptr()
-                    + phys_row * self.v_swizzle_chunk_elems
-                    + swizzle_xor(
-                        phys_row,
-                        col % self.v_swizzle_chunk_elems,
-                        self.v_swizzle_chunk_elems,
-                        self.in_dtype.bytes,
-                    )
-                )
-                zero16 = cutlass.Vector.from_elements(
-                    tuple(self.in_dtype(0.0) for _ in range(16)),
-                    self.in_dtype,
-                )
-                if row >= row_lo:
-                    sv_ptr.store(zero16, alignment=16)
-        prims.bar_warp_sync(cute.arch.FULL_MASK)
-
-    @cute.jit
     def mma_pv(
         self,
         basic_params: SimpleNamespace,
@@ -958,7 +843,16 @@ class SM120FusedMultiHeadAttentionForward:
         )
 
         if cutlass.const_expr(self.thd_varlen and in_mask_steps and is_first_kv_tile):
-            self.sanitize_v_tail(basic_params, mma_params, kv_tile_idx * self.kv_tile)
+            sanitize_v_tail(
+                mma_params.sV,
+                basic_params.lane,
+                basic_params.seqlen_k,
+                kv_tile_idx * self.kv_tile,
+                self.in_dtype,
+                self.head_tile_v,
+                self.kv_tile,
+                self.v_swizzle_chunk_elems,
+            )
         self.mma_pv(basic_params, mma_params, p_regs)
         prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
 
@@ -1045,7 +939,7 @@ class SM120FusedMultiHeadAttentionForward:
                     _n_qh // cutlass.Int32(k.shape[2]),
                     cutlass.Int32(k.shape[1]),
                     (self.head_tile_qk + self.head_tile_v) * self.in_dtype.width // 8,
-                    _SCHED_L2_BUDGET_BYTES,
+                    SCHED_L2_BUDGET_BYTES,
                 )
             else:
                 q_tile_idx, head_idx, batch_idx = lpt_tile_coords(q_tile_idx, _n_qh, _n_batch, _q_tiles)
@@ -1629,6 +1523,8 @@ class SM120FusedMultiHeadAttentionForward:
         else:
             prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,
@@ -1786,7 +1682,7 @@ class SM120FusedMultiHeadAttentionForward:
             # Build the [kv|cu_q|cu_k|remap|live|ctr] metadata buffer DEVICE-side
             # from the caller's length tensors (no host cumsum, no H2D — issue
             # #552); the main kernel launched after it on this stream reads it.
-            _build_thd_meta_kernel(
+            build_thd_meta_kernel(
                 seq_kv_lens,
                 thd_q_lens,
                 thd_kv_lens,

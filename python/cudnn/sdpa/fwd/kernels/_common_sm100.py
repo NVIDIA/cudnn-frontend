@@ -5,6 +5,8 @@ from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.base_dsl.typing import Pointer
+from cutlass.experimental import primitives as nvvm
 from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.scheduler import (
@@ -13,8 +15,43 @@ from cudnn.frost.tile_dsl.scheduler import (
     lpt_tile_coords,
     lpt_l2_tile_coords,
 )
-from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_PADDED, MASK_SWA
+
+# KvLoopBounds / compute_kv_loop_bounds moved to frost.tile_dsl.mask (the
+# backward needs the same tile-level bounds); re-exported here so the twelve
+# prefill kernels that import them from this module keep working.
+from cudnn.frost.tile_dsl.mask import (  # noqa: F401
+    MASK_CAUSAL,
+    MASK_PADDED,
+    MASK_SWA,
+    KvLoopBounds,
+    compute_kv_loop_bounds,
+    _div_up,
+)
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
+
+
+@cute.jit
+def sanitize_mxfp8_thd_v_sf_padding(sv_sf, kv_tile_idx, seqlen_kv):
+    """Replace fully padded V scale blocks before block-scaled BMM2.
+
+    F8_128x4 stores four 32-token V scale blocks in each 4-byte row group.
+    The packed THD tail may leave whole blocks outside the sequence; their data
+    TMA-loads as zero, but an E8M0 NaN scale would still make ``0 * NaN`` poison
+    the accumulator.  Preserve blocks containing valid tokens and replace only
+    the fully padded scale bytes with the finite scale 1.0 (0x7f).
+    """
+    remaining = seqlen_kv - kv_tile_idx * cutlass.Int32(128)
+    valid_blocks = (remaining + cutlass.Int32(31)) // cutlass.Int32(32)
+    if valid_blocks < cutlass.Int32(4):
+        lane = cute.arch.thread_idx()[0] % cutlass.Int32(32)
+        keep_mask = (cutlass.Int32(1) << (valid_blocks * cutlass.Int32(8))) - cutlass.Int32(1)
+        fill_mask = cutlass.Int32(0x7F7F7F7F) & ~keep_mask
+        for row_group in cutlass.range_constexpr(4):
+            byte_offset = lane * cutlass.Int32(16) + cutlass.Int32(row_group * 4)
+            word = Pointer(sv_sf.base.subview(byte_offset).data_ptr(), dtype=cutlass.Int32)
+            word.store((word.load(alignment=4) & keep_mask) | fill_mask, alignment=4)
+        nvvm.fence_proxy("async.shared", space="cta")
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
 class Bars(NamedTuple):
@@ -165,17 +202,6 @@ def make_classic_bars(CFG) -> Bars:
     )
 
 
-class KvLoopBounds(NamedTuple):
-    left: object
-    unmasked_lo: object
-    unmasked_hi: object
-    right: object
-
-
-def _div_up(a, b):
-    return (a + cutlass.Int32(b - 1)) // cutlass.Int32(b)
-
-
 def row_max_for_exp2(total_max):
     """Canonical masked-softmax row-max guard (FlashAttention / cuDNN form).
 
@@ -218,88 +244,6 @@ def assert_tile_n_supported(CFG):
     require N_BMM2_CHUNKS == 2 (TILE_N == 128)."""
     if CFG.N_BMM2_CHUNKS != 2:
         raise NotImplementedError(f"this kernel currently requires TILE_N=128 (got TILE_N={CFG.TILE_N})")
-
-
-def compute_kv_loop_bounds(
-    q_row_coord,
-    seqlen_q,
-    seq_kv_len,
-    window_left: int,
-    mask_flags: int,
-    tile_n: int,
-    cga_tile_m: int,
-    bottom_right: bool = False,
-    window_right: int = 0,
-) -> KvLoopBounds:
-    # window_right: compile-time diagonal-band right bound (cuDNN
-    # diagonal_band_right_bound) — the causal upper limit is widened by
-    # window_right columns. 0 = plain causal; folds out entirely.
-    left = cutlass.Int32(0)
-    right = _div_up(seq_kv_len, tile_n)
-
-    if cutlass.const_expr(bottom_right):
-        causal_diag = seq_kv_len - seqlen_q
-    else:
-        causal_diag = cutlass.Int32(0)
-
-    if cutlass.const_expr(mask_flags & MASK_CAUSAL):
-        kv_hi_caus = _div_up(q_row_coord + cutlass.Int32(cga_tile_m + window_right) + causal_diag, tile_n)
-        right = cute.math.min(right, kv_hi_caus)
-
-    if cutlass.const_expr(mask_flags & MASK_SWA):
-        # The whole band shifts with the diagonal: under BOTTOM_RIGHT the SWA
-        # lower bound is q + (S_kv - S_q) - W, same anchor the causal upper
-        # bound uses (causal_diag folds to 0 for top-left).
-        swa_base = q_row_coord + causal_diag
-        cond = swa_base > cutlass.Int32(window_left)
-        delta = swa_base - cutlass.Int32(window_left)
-        kv_lo_swa = cutlass.Int32(
-            arith.select(
-                cond.ir_value(),
-                (delta // cutlass.Int32(tile_n)).ir_value(),
-                cutlass.Int32(0).ir_value(),
-            )
-        )
-        left = cute.math.max(left, kv_lo_swa)
-
-    unmasked_hi = right
-    if cutlass.const_expr(mask_flags & MASK_PADDED):
-        unaligned = (seq_kv_len % cutlass.Int32(tile_n)) != cutlass.Int32(0)
-        lo_pad = cutlass.Int32(
-            arith.select(
-                unaligned.ir_value(),
-                (right - cutlass.Int32(1)).ir_value(),
-                right.ir_value(),
-            )
-        )
-        unmasked_hi = cute.math.min(unmasked_hi, lo_pad)
-    if cutlass.const_expr(mask_flags & MASK_CAUSAL):
-        lo_caus = (q_row_coord + cutlass.Int32(window_right) + causal_diag) // cutlass.Int32(tile_n)
-        unmasked_hi = cute.math.min(unmasked_hi, lo_caus)
-    unmasked_hi = cute.math.max(unmasked_hi, left)
-
-    unmasked_lo = left
-    if cutlass.const_expr(mask_flags & MASK_SWA):
-        anchor = q_row_coord + causal_diag + cutlass.Int32(cga_tile_m - 1 - window_left)
-        swa_unmasked_lo = _div_up(anchor, tile_n)
-        cond = anchor > cutlass.Int32(0)
-        swa_unmasked_lo = cutlass.Int32(
-            arith.select(
-                cond.ir_value(),
-                swa_unmasked_lo.ir_value(),
-                cutlass.Int32(0).ir_value(),
-            )
-        )
-        unmasked_lo = cute.math.max(unmasked_lo, swa_unmasked_lo)
-
-    unmasked_lo = cute.math.min(unmasked_lo, unmasked_hi)
-
-    return KvLoopBounds(
-        left=left,
-        unmasked_lo=unmasked_lo,
-        unmasked_hi=unmasked_hi,
-        right=right,
-    )
 
 
 class SplitHelpers(NamedTuple):
@@ -359,10 +303,8 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
 
     # Which grid does this flavor launch?  SCHED_NATURAL uses a 3-D
     # (q_super, head, batch) grid; the LPT policy flattens everything into x.
-    # NOTE this is the flavor's EFFECTIVE policy, not the requested one:
-    # make_cfg_d192 hardcodes SCHEDULER_POLICY=1 regardless of params, so a
-    # params-level check would miss it (and did -- d192 silently launched the
-    # unsplit grid because the split multiplier was only on the NATURAL branch).
+    # This must use the flavor's effective CFG policy so the helper and launch
+    # grid follow the same compile-time specialization.
     IS_LPT = CFG.SCHEDULER_POLICY != SCHED_NATURAL
 
     @cute.jit

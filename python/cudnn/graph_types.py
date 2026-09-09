@@ -60,6 +60,8 @@ class NodeType(Enum):
     MOE_GROUPED_MATMUL = auto()
     BLOCK_SCALE_QUANTIZE = auto()
     BLOCK_SCALE_DEQUANTIZE = auto()
+    GDP = auto()
+    GDP_BWD = auto()
 
 
 @dataclass(eq=False)  # identity-based hash/eq: uid/name are mutable

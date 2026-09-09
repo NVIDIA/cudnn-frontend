@@ -3,7 +3,7 @@ name = "nvidia-cudnn-frontend"
 dynamic = ["version"]
 description = "NVIDIA cuDNN Frontend — Python and C++ Graph API with SOTA attention (SDPA / Flash Attention), MoE grouped GEMM fusions, and FP8/MXFP8 kernels for Hopper and Blackwell GPUs."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "Apache-2.0 AND MIT"}
 keywords = [
     "cudnn",
@@ -46,6 +46,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
+dependencies = [
+    "nvidia-cutlass-dsl[cu13]>=4.6.2",
+    "apache-tvm-ffi>=0.1.11",
+]
+
 [project.urls]
 "Homepage" = "https://github.com/NVIDIA/cudnn-frontend"
 "Documentation" = "https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/"
@@ -56,17 +61,16 @@ classifiers = [
 
 [project.optional-dependencies]
 cutedsl = [
-    # NOT pinned to the floor the FROST engines need (4.7.0): pinning it here
-    # would make this package incompatible with anything holding the DSL at an
-    # older version -- quack-kernels pins ==4.6.0, and vLLM and friends carry
-    # their own constraints. The engines check the version at support time and
-    # decline when it is too old, so an older DSL costs those engines and
-    # nothing else. See CUTEDSL_MIN_VERSION in cudnn/frost/buffers.py.
-    # Framework-neutral core only: the CuTeDSL APIs are type-erased, so torch (like
-    # jax) is opt-in via the [dependency-groups] below (`pip install --group torch`).
-    "nvidia-cutlass-dsl[cu13]>=4.5.0",
+    # nvidia-cutlass-dsl and apache-tvm-ffi moved to the required [project]
+    # dependencies above; this extra is what is left of the old CuTeDSL group.
+    # Naming cuda-python here is belt-and-braces rather than load-bearing: the
+    # required nvidia-cutlass-dsl pulls nvidia-cutlass-dsl-libs-base, which itself
+    # requires cuda-python>=12.8, so a plain `pip install nvidia-cudnn-frontend`
+    # already has it. Keeping it spelled out pins the dependency to this package
+    # instead of to a transitive detail of the DSL's packaging, and keeps
+    # `pip install nvidia-cudnn-frontend[cutedsl]` resolving for everyone who
+    # still writes it that way.
     "cuda-python",
-    "apache-tvm-ffi>=0.1.11",
 ]
 cutile = [
     # The cuTile linear-attention engines. Base cuda-tile only -- its [tileiras]
@@ -76,7 +80,7 @@ cutile = [
     # already leaves GPU wheels to the user. Engines that cannot import the
     # runtime decline in check_support, so a missing compiler costs those
     # engines and nothing else.
-    "cuda-tile>=1.4; python_version >= '3.10'",
+    "cuda-tile>=1.4",
 ]
 
 [dependency-groups]

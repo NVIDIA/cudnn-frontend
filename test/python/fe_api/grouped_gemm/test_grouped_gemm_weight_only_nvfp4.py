@@ -12,11 +12,16 @@ from cuda.bindings import driver as cuda
 
 def _imports():
     pytest.importorskip("cutlass.cute", reason="requires the nvidia-cutlass-dsl extra")
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    error = cutedsl_requirement_error("Grouped weight-only NVFP4 tests")
+    if error:
+        pytest.skip(error)
     if not torch.cuda.is_available():
         pytest.skip("requires a CUDA device")
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("PyTorch build has no float8_e4m3fn tensor dtype")
-    from cudnn.gemm.cutedsl.grouped.weight_only_nvfp4 import GroupedGemmWeightOnlyNvfp4, grouped_gemm_weight_only_nvfp4
+    from cudnn.gemm.ops import GroupedGemmWeightOnlyNvfp4, grouped_gemm_weight_only_nvfp4
 
     return GroupedGemmWeightOnlyNvfp4, grouped_gemm_weight_only_nvfp4
 

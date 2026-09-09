@@ -13,7 +13,7 @@ Usage:
     python -m benchmark.attention_training.runner --config dsv3 --dry-run
 """
 
-from ..config_types import ModelPreset, BenchmarkConfig
+from ..config_types import ModelPreset, BenchmarkConfig, fa2_on_ampere
 
 DSV3 = ModelPreset(
     name="dsv3",
@@ -33,7 +33,7 @@ CONFIG = BenchmarkConfig(
         (4096, 4096),
         (2048, 2048),
     ],
-    backends=["cudnn", "cudnn_oss", "flash_attention_4"],
+    backends=["cudnn", "cudnn_oss", "flash_attention_4"] + fa2_on_ampere(),
     data_types=["bfloat16", "fp8", "mxfp8"],
     attn_masks=["top_left", "no_mask"],  # Causal only
     profile_pass="both",  # Forward and backward

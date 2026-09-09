@@ -564,6 +564,9 @@ def _weight_only_nvfp4_grouped_m192_kernel(
     tmem.free(tmem_ptr)
 
 
+_weight_only_nvfp4_grouped_m192_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _launch_weight_only_nvfp4_grouped_m192(
     packed_weight: cute.Tensor,
@@ -1106,6 +1109,9 @@ def _weight_only_nvfp4_grouped_token_n384_kernel(
 
     pipeline.sync(barrier_id=3)
     tmem.free(tmem_ptr)
+
+
+_weight_only_nvfp4_grouped_token_n384_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit

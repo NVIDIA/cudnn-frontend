@@ -90,6 +90,8 @@ def select_engine(graph, name, tiles=None, pack_gqa=None):
     run something else. Every filter — and each ``tiles`` component — is
     None-transparent (matches any value), so a test can pin just kv_tile
     (the auto-tile_m graph_api cases) or nothing at all (the best guess).
+    Returns the pinned ``PlanConfig`` so a test can read the knobs the
+    heuristics filled in (``split_kv``, tiles, ...).
     """
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
     want_m, want_n = tiles if tiles is not None else (None, None)
@@ -105,7 +107,7 @@ def select_engine(graph, name, tiles=None, pack_gqa=None):
     index = next((i for i in range(len(names)) if _wanted(i)), None)
     assert index is not None, f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa}; plans={names}"
     graph.select_plan(index)
-    return graph
+    return graph.plans[index]
 
 
 def offers_engine(graph, name) -> bool:

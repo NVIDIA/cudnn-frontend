@@ -43,10 +43,11 @@ Each component can be used independently or combined for the full NSA pipeline.
 
 ## Installation
 
-Install the cuDNN Frontend package with the CuteDSL optional dependencies:
+Install the cuDNN Frontend package; the CuTe DSL runtime it JITs through is a
+required dependency and comes with it:
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 ---
