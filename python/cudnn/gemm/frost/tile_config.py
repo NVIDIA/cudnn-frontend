@@ -248,13 +248,18 @@ class TileConfig:
     @property
     def geometry_name(self) -> str:
         """Geometry token (no ``CONFIG_``/pipeline prefix) used in the kernel symbol."""
+        return self._geometry_base + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "")
+
+    @property
+    def _geometry_base(self) -> str:
+        """``geometry_name`` without the split-K suffix; a family with extra axes extends it."""
         return (
             f"{self.cta_tile_m}x{self.cta_tile_n}x{self.cta_tile_k_bytes}"
             f"_{self.mma_tile_m}x{self.mma_tile_n}x{self.mma_tile_k_bytes}"
             f"_cluster{self.cga_size_m}x{self.cga_size_n}"
             # Named only where it is an AXIS -- a pipeline without the CTA pair
             # declares no such field, so there is nothing to spell.
-            + (f"_{self.cta_group}ctamma" if isinstance(self, CtaPairTileConfig) else "") + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "")
+            + (f"_{self.cta_group}ctamma" if isinstance(self, CtaPairTileConfig) else "")
         )
 
     @property
@@ -513,11 +518,11 @@ class ConfigSm120(TileConfig):
             )
 
     @property
-    def geometry_name(self) -> str:
+    def _geometry_base(self) -> str:
         """The warp grid is an AXIS here (unlike the CTA-scoped families), so it
         is ALWAYS named via a ``_warpsMxN`` suffix -- no grid is implied by an
         unsuffixed spelling."""
-        base = super().geometry_name
+        base = super()._geometry_base
         if self.warp_tile_m and self.warp_tile_n:
             base += f"_warps{self.cta_tile_m // self.warp_tile_m}x{self.cta_tile_n // self.warp_tile_n}"
         return base

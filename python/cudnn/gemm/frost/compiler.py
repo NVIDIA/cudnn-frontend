@@ -3584,6 +3584,10 @@ def _check_executable(chain: FusionChain) -> None:
         raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
 
 
+# Templates that render the @@SPLITK_ONLY@@ blocks.
+_SPLITK_PIPELINES = ("sm100", "sm120")
+
+
 def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None" = None) -> TileConfig:
     """Layer split-K onto the selected config when the output grid underfills
     the GPU and K is deep.
@@ -3598,7 +3602,7 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
     - every slice keeps at least max(64 elements, 2 CTA-K tiles) of K;
     - 32, the reducer's trace-time unroll bound;
     - the CUDA grid.z limit (kernel 1's z = batch * S)."""
-    if config.split_k_slices != 1 or config.pipeline != "sm100":
+    if config.split_k_slices != 1 or config.pipeline not in _SPLITK_PIPELINES:
         return config
     if _splitk_reject_reason(chain, replace(config, split_k_slices=2)) is not None:
         return config
@@ -3839,9 +3843,8 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
     if config.split_k_slices == 1:
         return None
     reasons = []
-    # TODO: only support sm100 currently.
-    if config.pipeline != "sm100":
-        reasons.append(f"the {config.pipeline!r} pipeline (sm100 only)")
+    if config.pipeline not in _SPLITK_PIPELINES:
+        reasons.append(f"the {config.pipeline!r} pipeline ({' / '.join(_SPLITK_PIPELINES)} only)")
     if chain.has_moe:
         reasons.append("MoE grouped matmul")
     if chain.has_block_scale:
