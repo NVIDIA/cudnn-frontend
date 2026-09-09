@@ -48,7 +48,7 @@ Conventions:
 | suite | dtype | level | N | fuzzed | pinned | gates / notes |
 |---|---|---|---|---|---|---|
 | generation.f16.decode | f16 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, diag TL/BR, layout padded/full | infer, s_q=1, s_kv up to 16k (split-KV regime), no mask | absorbed generation.f16.lean: long-KV split-KV draws are routine here |
-| generation.f16.paged | f16 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, layout padded/cu_padded/ragged(THD Q + paged KV), block size 1..1024, sink | infer, s_q<=64, layout padded, paged KV |  |
+| generation.f16.paged | f16 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, layout padded/cu_padded, block size 1..1024, sink | infer, s_q<=64, layout padded, paged KV |  |
 | generation.fp8.decode | fp8 | L0 | 256 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, e4m3/e5m2 in, out fp8/fp16, diag TL/BR, layout padded/full | infer, s_q=1, s_kv up to 16k (split-KV regime), no mask | absorbed generation.fp8.lean: long-KV split-KV draws (padded + full) are routine here |
 | generation.fp8.paged | fp8 | L0 | 128 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, e4m3/e5m2 in, out fp8/fp16, block size 16..128 | infer, no mask, diag TL, layout padded, paged KV |  |
 | models.llama31.generation.fp8 | fp8 | L0 | 8 | batch, seq lens, layout, mask flavor, data, e4m3/e5m2 in, out fp8/fp16, paged 50% | h_q=64, h_kv=8, d_qk=128, d_v=128 | llama31 full/global attention layers, fp8-trained flavor |

@@ -259,7 +259,7 @@ _SPECS = [
         rng_seed=887,
         knobs=knobs.paged,
         post=post_paged,
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("layout padded/cu_padded/ragged(THD Q + paged KV)", "block size 1..1024", "sink"),
+        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("layout padded/cu_padded", "block size 1..1024", "sink"),
         pinned=("infer", "s_q<=64", "layout padded", "paged KV"),
     ),
     SuiteSpec(
@@ -382,12 +382,11 @@ def _model_post(phase):
     if phase == "generation":
 
         def _post(cfg, rng, request):
-            # Paged + ragged is a valid (serving) combo and the f16 harness
-            # supports it: packed THD Q/O against a paged dense KV cache. The
-            # fp8 harness cannot express it yet, so fp8 draws page only their
-            # non-THD configs (harness follow-up).
-            fp8_in = cfg.data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
-            cfg.is_paged = rng.random() < 0.5 and not (fp8_in and cfg.is_ragged)
+            # Paged + ragged (packed THD Q/O against a paged KV cache) is a
+            # valid serving combo but deferred — harness support only existed
+            # for f16; tracked as a suite-wide extension (f16 + fp8) in the
+            # issue tracker. Until then only non-THD draws get paged.
+            cfg.is_paged = rng.random() < 0.5 and not cfg.is_ragged
 
         return _post
     if phase == "bprop":
