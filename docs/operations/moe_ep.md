@@ -61,7 +61,7 @@ op = MoeEp(
     top_k=K,
     ep_group=ep_group,                 # None for EP1
     max_tokens_per_rank=max_tokens,
-    max_recv_size_per_rank=None,       # Defaults to P * max_tokens * K
+    max_recv_size_per_rank=None,       # Defaults to worst-case padded rows
     drop_on_overflow=False,
     output_format="bf16",
     combine_format="bf16",             # "bf16" or "mxfp8"
@@ -167,7 +167,11 @@ operation.
 The stateless training CUDA Graph path has hardware acceptance through EP32 when
 all ranks are in one direct-P2P MNNVL peer-access domain. The Python capability
 layer does not impose an EP-size ceiling; cross-MNNVL execution is not part of
-the validated support surface.
+the validated support surface. This acceptance requires one identical total
+device-execution order across all EP ranks. Unordered concurrent replay of
+distributed MoeEP graphs on independent CUDA streams is unsupported and must
+not be used. Serialize multiple streams with stream FIFO or explicit CUDA event
+dependencies; identical host submission order does not establish device order.
 
 ## Data formats
 
@@ -216,8 +220,8 @@ Stateless training uses:
 - required caller-owned forward output: `(T, H)`, BF16;
 - required caller-owned `fc1_preact`, produced by training forward with
   `generate_c=True` and retained through matching backward;
-- required caller-owned `grad_activation`: `(T, H)` view of a capacity buffer,
-  FP32;
+- required `grad_activation`: `(T, H)` BF16 view of the lane's symmetric
+  capacity buffer;
 - required caller-owned `dprob`: source-order `(T, K)`, FP32;
 - required caller-owned WGrad saved state and a fixed-capacity
   `MoeEpTrainingWgradOperands` bundle.
@@ -243,15 +247,21 @@ EP2+ execution requires:
   ordering across the group.
 
 `max_recv_size_per_rank` is the physical receive-pool capacity in token rows,
-including per-expert padding.
+including per-expert padding. An explicit capacity `P` must satisfy
+`P % 128 == 0`. The frontend reverse-maps `P` to the largest logical route
+limit whose worst-case per-expert padding is exactly `P`; a capacity that
+cannot be represented exactly is rejected.
 
 ```text
 ep_size * max_tokens_per_rank * top_k
 ```
 
-The supported correctness contract requires routing not to overflow this
-capacity. If overflow occurs, the launch may raise or drop work according to
-the configured policy, but its numerical outputs are not guaranteed usable.
+The expression above is the unbounded raw-route limit. With an explicit
+physical pool, the conservative logical limit can reject a favorable expert
+distribution that would happen to fit in `P`; this early overflow prevents any
+distribution accepted by the kernel from exceeding the prescribed pool.
+If overflow occurs, the launch may raise or drop work according to the
+configured policy, but its numerical outputs are not guaranteed usable.
 
 Private lane resources cannot grow during CUDA Graph replay. Capacity changes
 require a new operator preparation; caller-address changes require recapture.

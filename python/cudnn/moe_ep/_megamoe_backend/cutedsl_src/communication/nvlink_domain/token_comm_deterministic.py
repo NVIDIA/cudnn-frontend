@@ -54,6 +54,7 @@ _quant_spec = {
 @dataclasses.dataclass(frozen=True)
 class _ReceiveCapacity:
     raw_route_count: int
+    logical_route_count: int
     padded_route_count: int
 
 
@@ -62,13 +63,18 @@ def _compute_receive_capacity(
     world_size: int,
     max_tokens_per_rank: int,
     topk: int,
+    experts_per_rank: int,
     max_recv_size_per_rank: int,
+    padding_block: int,
 ) -> _ReceiveCapacity:
+    raw_route_count = world_size * max_tokens_per_rank * topk
+    logical_route_count = min(max_recv_size_per_rank, raw_route_count)
+    active_expert_count = min(experts_per_rank, logical_route_count)
+    padded_block_count = active_expert_count + (logical_route_count - active_expert_count) // padding_block
     return _ReceiveCapacity(
-        raw_route_count=world_size * max_tokens_per_rank * topk,
-        # max_recv_size_per_rank is the caller-provided physical pool size. Per-expert
-        # alignment consumes rows inside this budget rather than extending the pool.
-        padded_route_count=max_recv_size_per_rank,
+        raw_route_count=raw_route_count,
+        logical_route_count=logical_route_count,
+        padded_route_count=padded_block_count * padding_block,
     )
 
 
@@ -178,7 +184,9 @@ class _MetadataPushRouter(KernelComponent):
         self.expert_count = problem_desc["expert_count"]
         self.topk = problem_desc["topk"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
-        self.max_recv_size_per_rank = problem_desc["max_recv_size_per_rank"]
+        self.max_recv_size_per_rank = min(
+            problem_desc["max_recv_size_per_rank"], self.world_size * self.max_tokens_per_rank * self.topk
+        )
         self.apply_topk_at_fc1 = problem_desc["apply_topk_at_fc1"]
 
         self.token_padding_block = impl_desc["token_padding_block"]
@@ -186,8 +194,9 @@ class _MetadataPushRouter(KernelComponent):
         self.drop_on_overflow = impl_desc["drop_on_overflow"]
 
         self._validate_router_configuration()
-        token_capacity = self.receive_capacity()
+        token_capacity = self.receive_capacity(self.token_padding_block)
         self.raw_route_count = token_capacity.raw_route_count
+        self.logical_route_capacity = token_capacity.logical_route_count
         self.worst_case_token_count = token_capacity.padded_route_count
         self.expert_count_padded = round_up(self.expert_count, 4)
         self.expert_count_with_trash = self.expert_count_padded + 1
@@ -242,12 +251,14 @@ class _MetadataPushRouter(KernelComponent):
     def experts_per_rank(self) -> int:
         return self.expert_count // self.world_size
 
-    def receive_capacity(self) -> _ReceiveCapacity:
+    def receive_capacity(self, padding_block: int) -> _ReceiveCapacity:
         return _compute_receive_capacity(
             world_size=self.world_size,
             max_tokens_per_rank=self.max_tokens_per_rank,
             topk=self.topk,
+            experts_per_rank=self.experts_per_rank,
             max_recv_size_per_rank=self.max_recv_size_per_rank,
+            padding_block=padding_block,
         )
 
     def _router_launch_configuration(self) -> Tuple[int, int]:
@@ -903,14 +914,12 @@ class _MetadataPushRouter(KernelComponent):
         for expert_round in cutlass.range_constexpr(local_expert_rounds):
             local_expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
             if local_expert < Int32(self.experts_per_rank):
-                thread_local_total = (
-                    thread_local_total + padded_totals[owner_expert_begin + local_expert]
-                )
+                thread_local_total = thread_local_total + sizes[owner_expert_begin + local_expert]
         if thread_local_total > Int32(0):
             cute.arch.atomic_add(warp_totals.iterator, thread_local_total, scope="cta")
         cute.arch.sync_threads()
-        padded_local_total = warp_totals[0]
-        did_overflow = Int32(padded_local_total > Int32(self.max_recv_size_per_rank))
+        raw_local_total = warp_totals[0]
+        did_overflow = Int32(raw_local_total > Int32(self.max_recv_size_per_rank))
 
         if cutlass.const_expr(self.drop_on_overflow):
             for expert_round in cutlass.range_constexpr(local_expert_rounds):
@@ -1295,7 +1304,9 @@ class TokenCommDeterministic(KernelComponent):
         self.expert_count = problem_desc["expert_count"]
         self.topk = problem_desc["topk"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
-        self.max_recv_size_per_rank = problem_desc["max_recv_size_per_rank"]
+        self.max_recv_size_per_rank = min(
+            problem_desc["max_recv_size_per_rank"], self.world_size * self.max_tokens_per_rank * self.topk
+        )
         self.hidden_size = problem_desc["hidden_size"]
         self.quant_kind = problem_desc["quant_kind"]
         self.combine_format = problem_desc["combine_format"]
@@ -1406,11 +1417,18 @@ class TokenCommDeterministic(KernelComponent):
 
     @property
     def worst_case_sf_token_count(self) -> int:
-        return self.worst_case_token_count
+        # The SF pool has to be at least as tall as the data pool: once
+        # token_padding_block may exceed sf_padding_block, an expert's data
+        # cursor can walk past the SF-capacity-derived row count.
+        sf_capacity = self._router.receive_capacity(self.sf_padding_block).padded_route_count
+        return max(sf_capacity, self.worst_case_token_count)
 
     @property
     def max_fc1_ready_slot_count(self) -> int:
-        return ceil_div(self.worst_case_token_count, self.tokens_per_fc1_ready_slot)
+        return (
+            self._router.receive_capacity(self.tokens_per_fc1_ready_slot).padded_route_count
+            // self.tokens_per_fc1_ready_slot
+        )
 
     @property
     def router_smem_workspace(self) -> SmemWorkspace:

@@ -231,7 +231,7 @@ def _training_config(**overrides):
         "ep_group": None,
         "ep_global_ranks": (),
         "max_tokens_per_rank": 4,
-        "max_recv_size_per_rank": 4,
+        "max_recv_size_per_rank": 128,
         "drop_on_overflow": True,
         "output_format": "bf16",
         "combine_format": "bf16",
@@ -310,6 +310,7 @@ def _training_abi_prepared(name: str, max_recv_size: int = 4):
     )
     kernel_config = SimpleNamespace(
         max_recv_size_per_rank=max_recv_size,
+        physical_recv_pool_size=max_recv_size,
         effective_config=lambda cluster_count: {
             "name": name,
             "max_recv_size_per_rank": max_recv_size,
@@ -1280,21 +1281,25 @@ def _grad_output(
 
 def _assert_backward_matches(actual, expected, topk_idx) -> None:
     assert len(actual) == len(expected) == 2
-    for name, gradient, reference, close_kwargs in zip(
+    for name, gradient, reference, expected_dtype, close_kwargs in zip(
         ("grad_activation", "grad_topk_weights"),
         actual,
         expected,
+        (torch.bfloat16, torch.float32),
         _BACKWARD_CLOSE_KWARGS,
     ):
         assert gradient.shape == reference.shape
-        assert gradient.dtype == torch.float32
+        assert gradient.dtype == expected_dtype
+        assert reference.dtype == torch.float32
         assert torch.isfinite(gradient).all()
         torch.testing.assert_close(
-            gradient,
+            gradient.float(),
             reference,
             msg=lambda default, name=name: (f"{name} does not match the backward reference\n{default}"),
             **close_kwargs,
         )
+
+
 def _interleave_fc1_wgrad(
     tensor: torch.Tensor,
     interleave_size: int = 32,

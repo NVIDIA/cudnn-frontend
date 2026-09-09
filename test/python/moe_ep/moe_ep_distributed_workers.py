@@ -308,7 +308,7 @@ def _run_backward_reference_case(
         device,
     )
     num_experts = 2 * ep_size
-    max_recv_size_per_rank = 4
+    max_recv_size_per_rank = 128
 
     # Finish all collective reference work, including dense local dW, before
     # constructing or launching the production operator.

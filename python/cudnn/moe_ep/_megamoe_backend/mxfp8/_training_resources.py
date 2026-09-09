@@ -401,7 +401,7 @@ def _build_training_abi_facts(
             "intermediate": int(config.intermediate_size),
             "top_k": int(config.top_k),
             "max_tokens_per_rank": int(config.max_tokens_per_rank),
-            "max_recv_size_per_rank": int(forward.config.max_recv_size_per_rank),
+            "max_recv_size_per_rank": int(forward.config.physical_recv_pool_size),
         },
         "policy": {
             "drop_on_overflow": bool(config.drop_on_overflow),
@@ -753,7 +753,9 @@ class Mxfp8TrainingState:
         hidden = int(self.config.hidden_size)
         execution = self.views(lane=lane, token_count=capacity)
 
-        def activation_views(workspace: WorkspaceViews) -> tuple[torch.Tensor, torch.Tensor]:
+        def activation_views(
+            workspace: WorkspaceViews,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             return (
                 _typed_view(
                     workspace.symmetric["activation_data"],
@@ -963,6 +965,7 @@ class Mxfp8TrainingState:
             raise ValueError(f"lane {lane} is outside [0, {self.lane_count})")
         if phase not in ("forward", "backward"):
             raise ValueError(f"phase must be 'forward' or 'backward', got {phase!r}")
+        _runtime_debug("training-overflow.begin", lane=lane, phase=phase)
         flat = self._flat_views(0)
         global_overflow = _typed_view(
             flat.local[
@@ -989,13 +992,16 @@ class Mxfp8TrainingState:
             (1,),
         )
         global_overflow.copy_(flag)
+        _runtime_debug("training-overflow.copy.end", lane=lane, phase=phase)
         assert self._runtime is not None
         if self._runtime.world_size > 1:
+            _runtime_debug("training-overflow.all-reduce.begin", lane=lane, phase=phase)
             dist.all_reduce(
                 global_overflow,
                 op=dist.ReduceOp.MAX,
                 group=self._runtime.group,
             )
+            _runtime_debug("training-overflow.all-reduce.end", lane=lane, phase=phase)
         if not self.config.drop_on_overflow:
             assert_async = getattr(torch, "_assert_async", None)
             if assert_async is None:
@@ -1017,6 +1023,7 @@ class Mxfp8TrainingState:
                 overflow_ok,
                 f"Rubin MegaMoE receive route-pool overflow; the {phase} " "outputs are invalid",
             )
+        _runtime_debug("training-overflow.end", lane=lane, phase=phase)
         return global_overflow
 
 

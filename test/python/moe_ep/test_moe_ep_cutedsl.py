@@ -8,6 +8,56 @@ import torch
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    ("data_capacity", "scale_capacity", "expected_capacity"),
+    ((128, 128, 128), (256, 128, 256), (128, 256, 256)),
+)
+def test_deterministic_token_comm_scale_capacity_covers_data_pool(
+    data_capacity,
+    scale_capacity,
+    expected_capacity,
+):
+    from types import SimpleNamespace
+
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.nvlink_domain.token_comm_deterministic import (
+        TokenCommDeterministic,
+    )
+
+    comm = object.__new__(TokenCommDeterministic)
+    comm._router = SimpleNamespace(
+        worst_case_token_count=data_capacity,
+        receive_capacity=lambda padding_block: SimpleNamespace(padded_route_count=scale_capacity),
+    )
+    comm.sf_padding_block = 128
+
+    assert comm.worst_case_sf_token_count == expected_capacity
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("ready_padded_capacity", "ready_slots"),
+    ((256, 1), (512, 2), (1024, 4), (2304, 9)),
+)
+def test_deterministic_token_comm_uses_ready_slot_padding_contract(
+    ready_padded_capacity,
+    ready_slots,
+):
+    from types import SimpleNamespace
+
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.nvlink_domain.token_comm_deterministic import (
+        TokenCommDeterministic,
+    )
+
+    comm = object.__new__(TokenCommDeterministic)
+    comm._router = SimpleNamespace(
+        receive_capacity=lambda padding_block: SimpleNamespace(padded_route_count=ready_padded_capacity),
+    )
+    comm.tokens_per_fc1_ready_slot = 256
+
+    assert comm.max_fc1_ready_slot_count == ready_slots
+
+
+@pytest.mark.L0
 def test_rubin_cutedsl_gate_rejects_public_wheels_below_4_8(
     monkeypatch,
 ):

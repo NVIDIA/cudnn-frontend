@@ -147,6 +147,10 @@ def prepare_backward_kernel(
     local_zero, shared_zero = kernel.require_zero_workspace_leading_bytes
     device_workspace = kernel._mega_device_workspace
     pool_capacity = int(kernel.pool_token_capacity)
+    if pool_capacity != config.physical_recv_pool_size:
+        raise RuntimeError(
+            "Rubin logical receive limit did not reproduce the prescribed " f"physical pool: {pool_capacity} != " f"{config.physical_recv_pool_size}"
+        )
     fc1_preact_shape = tuple(int(extent) for extent in kernel.get_fc1_preact_shape())
     expected_preact_shape = (
         pool_capacity,

@@ -191,11 +191,14 @@ def test_internal_column_requant_config_is_disabled_by_default_and_cache_distinc
     expected_padded_capacity = (
         active_expert_count + (raw_route_count - active_expert_count) // 128
     ) * 128
-    assert default_config.max_recv_size_per_rank == expected_padded_capacity
+    assert default_config.physical_recv_pool_size == expected_padded_capacity
+    assert default_config.max_recv_size_per_rank == raw_route_count
     assert enabled_config.enable_col_quant is True
     assert enabled_config.col_quant_num_ctas == 512
     with pytest.raises(ValueError, match="max_recv_size_per_rank"):
         replace(default_config, max_recv_size_per_rank=0)
+    with pytest.raises(ValueError, match="physical_recv_pool_size"):
+        replace(default_config, physical_recv_pool_size=0)
     with pytest.raises(ValueError, match="col_quant_num_ctas"):
         replace(default_config, col_quant_num_ctas=0)
     key_args = (torch.device("cuda", 0), (10, 7), 123, ())
@@ -211,22 +214,68 @@ def test_bounded_receive_capacity_propagates_to_kernel_config():
 
     with MoeEp(
         **_forward_config(),
-        max_recv_size_per_rank=7,
+        max_recv_size_per_rank=128,
         drop_on_overflow=False,
     ) as op:
         config = Mxfp8KernelConfig.from_operator_config(op._forward_config)
 
-    assert config.max_recv_size_per_rank == 7
+    assert config.physical_recv_pool_size == 128
+    assert config.max_recv_size_per_rank == 1
     assert config.drop_on_overflow is False
 
     with pytest.raises(ValueError, match="max_recv_size_per_rank"):
         MoeEp(**_forward_config(), max_recv_size_per_rank=0)
+    with pytest.raises(ValueError, match=r"P % 128 == 0"):
+        MoeEp(**_forward_config(), max_recv_size_per_rank=7)
     with pytest.raises(ValueError, match="drop_on_overflow"):
         MoeEp(**_forward_config(), drop_on_overflow=1)
 
 
 @pytest.mark.L0
-def test_receive_capacity_is_the_physical_pool_size():
+@pytest.mark.parametrize(
+    ("physical_capacity", "logical_limit"),
+    ((128, 1), (256, 129), (384, 257)),
+)
+def test_reverse_capacity_preserves_the_prescribed_physical_pool(
+    physical_capacity,
+    logical_limit,
+):
+    from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import (
+        Mxfp8KernelConfig,
+    )
+
+    with MoeEp(
+        **_forward_config(
+            num_experts=2,
+            top_k=2,
+            max_tokens_per_rank=256,
+        ),
+        max_recv_size_per_rank=physical_capacity,
+    ) as op:
+        config = Mxfp8KernelConfig.from_operator_config(op._forward_config)
+
+    assert config.physical_recv_pool_size == physical_capacity
+    assert config.max_recv_size_per_rank == logical_limit
+
+
+@pytest.mark.L0
+def test_reverse_capacity_rejects_unrepresentable_physical_pool():
+    from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import (
+        Mxfp8KernelConfig,
+    )
+
+    with MoeEp(
+        **_forward_config(),
+        max_recv_size_per_rank=384,
+    ) as op:
+        with pytest.raises(ValueError, match="cannot be represented exactly"):
+            Mxfp8KernelConfig.from_operator_config(op._forward_config)
+
+
+@pytest.mark.L0
+def test_upstream_receive_capacity_applies_per_expert_padding():
     from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.nvlink_domain.token_comm_deterministic import (
         _compute_receive_capacity,
     )
@@ -235,10 +284,13 @@ def test_receive_capacity_is_the_physical_pool_size():
         world_size=4,
         max_tokens_per_rank=64,
         topk=2,
-        max_recv_size_per_rank=256,
+        experts_per_rank=2,
+        max_recv_size_per_rank=129,
+        padding_block=128,
     )
 
     assert capacity.raw_route_count == 512
+    assert capacity.logical_route_count == 129
     assert capacity.padded_route_count == 256
 
 
@@ -936,10 +988,10 @@ def test_gate_up_clamp_matches_moe_ep_reference():
             1,
             128,
             256,
-            32,
+            8,
             torch.int64,
             torch.float32,
-            id="topk32-boundary-int64-fp32",
+            id="topk8-boundary-int64-fp32",
         ),
     ],
 )

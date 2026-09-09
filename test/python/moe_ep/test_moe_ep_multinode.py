@@ -300,7 +300,7 @@ def test_training_prepare_multinode_rejects_rank_abi_mismatch(
         top_k=2,
         ep_group=dist.group.WORLD,
         max_tokens_per_rank=8,
-        max_recv_size_per_rank=3,
+        max_recv_size_per_rank=128,
         drop_on_overflow=True,
         combine_format="bf16",
         weight_interleave_size=32,

@@ -13,6 +13,63 @@ from ..._contracts import Fc1WeightLayout, ForwardConfig
 from ..._tuning import MoeEpTuningConfig
 from ._formats import combine_wire_format
 
+_PHYSICAL_POOL_ALIGNMENT = 128
+
+
+def _worst_case_padded_route_count(
+    logical_route_count: int,
+    *,
+    experts_per_rank: int,
+    padding_block: int,
+) -> int:
+    """Return upstream's worst-case rows for a logical route limit."""
+
+    active_expert_count = min(experts_per_rank, logical_route_count)
+    padded_block_count = active_expert_count + (logical_route_count - active_expert_count) // padding_block
+    return padded_block_count * padding_block
+
+
+def _logical_route_limit_for_physical_pool(
+    physical_pool_capacity: int,
+    *,
+    raw_route_count: int,
+    experts_per_rank: int,
+    padding_block: int,
+) -> int:
+    """Reverse-map an exact physical pool to upstream's logical limit."""
+
+    if physical_pool_capacity % _PHYSICAL_POOL_ALIGNMENT:
+        raise ValueError("max_recv_size_per_rank must satisfy P % 128 == 0, " f"got P={physical_pool_capacity}")
+
+    lower = 0
+    upper = raw_route_count
+    while lower < upper:
+        candidate = (lower + upper + 1) // 2
+        padded = _worst_case_padded_route_count(
+            candidate,
+            experts_per_rank=experts_per_rank,
+            padding_block=padding_block,
+        )
+        if padded <= physical_pool_capacity:
+            lower = candidate
+        else:
+            upper = candidate - 1
+
+    logical_route_limit = lower
+    padded_capacity = _worst_case_padded_route_count(
+        logical_route_limit,
+        experts_per_rank=experts_per_rank,
+        padding_block=padding_block,
+    )
+    if logical_route_limit <= 0 or padded_capacity != physical_pool_capacity:
+        raise ValueError(
+            "max_recv_size_per_rank physical pool capacity cannot be represented "
+            "exactly by the upstream padding contract: "
+            f"P={physical_pool_capacity}, largest logical limit="
+            f"{logical_route_limit}, padded capacity={padded_capacity}"
+        )
+    return logical_route_limit
+
 
 @dataclass(frozen=True)
 class Mxfp8KernelConfig:
@@ -29,7 +86,9 @@ class Mxfp8KernelConfig:
     fc1_weight_layout: Fc1WeightLayout
     gate_up_clamp: float | None
     generate_c: bool
-    max_recv_size_per_rank: int | None = None
+    physical_recv_pool_size: int
+    # The vendored upstream kernel interprets this field as a logical route limit.
+    max_recv_size_per_rank: int
     drop_on_overflow: bool = True
     enable_col_quant: bool = False
     col_quant_num_ctas: int = 2368
@@ -54,7 +113,11 @@ class Mxfp8KernelConfig:
     fc2_tma_stages: int | None = None
 
     def __post_init__(self) -> None:
-        if self.max_recv_size_per_rank is not None and self.max_recv_size_per_rank <= 0:
+        if self.physical_recv_pool_size <= 0:
+            raise ValueError("physical_recv_pool_size must be positive")
+        if self.physical_recv_pool_size % _PHYSICAL_POOL_ALIGNMENT:
+            raise ValueError("physical_recv_pool_size must satisfy P % 128 == 0, " f"got P={self.physical_recv_pool_size}")
+        if self.max_recv_size_per_rank <= 0:
             raise ValueError("max_recv_size_per_rank must be positive")
         if self.col_quant_num_ctas <= 0:
             raise ValueError("col_quant_num_ctas must be positive")
@@ -72,29 +135,20 @@ class Mxfp8KernelConfig:
             raise ValueError(f"ep_rank {config.ep_rank} is outside EP size {config.ep_size}")
         if config.max_tokens_per_rank is None:
             raise ValueError("MXFP8 execution requires max_tokens_per_rank")
-        token_padding_block = (
-            config.token_padding_size
-            if config.backward_wgrad_mode == "operands"
-            else 128 if config.generate_c else config.token_padding_size
-        )
-        # When no physical receive capacity is provided, preserve the previous
-        # default by accounting for worst-case per-expert padding. This is not
-        # equivalent to rounding the total route count once: every active
-        # expert owns a separately padded segment. An explicit value is already
-        # the physical pool size and is therefore used verbatim below.
+        token_padding_block = config.token_padding_size if config.backward_wgrad_mode == "operands" else 128 if config.generate_c else config.token_padding_size
         raw_route_count = config.ep_size * config.max_tokens_per_rank * config.top_k
-        active_expert_count = min(config.experts_per_rank, raw_route_count)
-        worst_case_padded_recv_size = (
-            active_expert_count
-            + (raw_route_count - active_expert_count) // token_padding_block
-        ) * token_padding_block
-        max_recv_size_per_rank = (
-            worst_case_padded_recv_size
-            if config.max_recv_size_per_rank is None
-            else config.max_recv_size_per_rank
+        worst_case_padded_recv_size = _worst_case_padded_route_count(
+            raw_route_count,
+            experts_per_rank=config.experts_per_rank,
+            padding_block=token_padding_block,
         )
-        if max_recv_size_per_rank <= 0:
-            raise ValueError("max_recv_size_per_rank must be positive")
+        physical_recv_pool_size = worst_case_padded_recv_size if config.max_recv_size_per_rank is None else config.max_recv_size_per_rank
+        logical_route_limit = _logical_route_limit_for_physical_pool(
+            physical_recv_pool_size,
+            raw_route_count=raw_route_count,
+            experts_per_rank=config.experts_per_rank,
+            padding_block=token_padding_block,
+        )
         if tuning is None:
             tuning = config.tuning
         return cls(
@@ -109,7 +163,8 @@ class Mxfp8KernelConfig:
             fc1_weight_layout=config.fc1_weight_layout,
             gate_up_clamp=config.gate_up_clamp,
             generate_c=config.generate_c,
-            max_recv_size_per_rank=max_recv_size_per_rank,
+            physical_recv_pool_size=physical_recv_pool_size,
+            max_recv_size_per_rank=logical_route_limit,
             drop_on_overflow=config.drop_on_overflow,
             combine_format=combine_wire_format(config.combine_format),
             enable_col_quant=(config.backward_wgrad_mode == "operands"),
@@ -156,6 +211,7 @@ class Mxfp8KernelConfig:
             "intermediate": self.intermediate,
             "top_k": self.top_k,
             "max_tokens_per_rank": self.max_tokens_per_rank,
+            "physical_recv_pool_size": self.physical_recv_pool_size,
             "max_recv_size_per_rank": self.max_recv_size_per_rank,
             "drop_on_overflow": self.drop_on_overflow,
             "apply_topk_in_fc1": self.apply_topk_in_fc1,

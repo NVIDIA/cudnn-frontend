@@ -694,7 +694,7 @@ def test_training_backward_rejects_missing_output_bundle_after_prepare():
         intermediate_size=256,
         top_k=2,
         max_tokens_per_rank=4,
-        max_recv_size_per_rank=4,
+        max_recv_size_per_rank=128,
         weight_interleave_size=32,
     )
     lane = MoeEpExecutionLane(0, op._operator_token)
@@ -965,7 +965,7 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
         intermediate_size=256,
         top_k=2,
         max_tokens_per_rank=4,
-        max_recv_size_per_rank=4,
+        max_recv_size_per_rank=128,
         weight_interleave_size=32,
     )
     assert hasattr(op, "prepare_training")
@@ -992,7 +992,7 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
         intermediate_size=256,
         top_k=2,
         max_tokens_per_rank=4,
-        max_recv_size_per_rank=4,
+        max_recv_size_per_rank=128,
     )
     with pytest.raises(ValueError, match="weight_interleave_size=32"):
         conventional.prepare_training()
@@ -1027,6 +1027,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
     )
     original_topk_idx = args[3].clone()
     assert args[0].shape[0] <= capacity
+    max_recv_size_per_rank = args[1].shape[0] * _round_up(capacity, 128)
     grad_output = _grad_output(device, args[0].shape[0], seed=20260902)
     expected = _fixed_training_reference(
         args,
@@ -1034,7 +1035,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         combine_format=combine_format,
         gate_up_clamp=None,
         max_tokens_per_rank=capacity,
-        max_recv_size_per_rank=capacity * args[3].shape[1],
+        max_recv_size_per_rank=max_recv_size_per_rank,
     )
     alternate_topk_idx = original_topk_idx.flip(1).contiguous()
     alternate_args = (*args[:3], alternate_topk_idx, args[4])
@@ -1044,7 +1045,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         combine_format=combine_format,
         gate_up_clamp=None,
         max_tokens_per_rank=capacity,
-        max_recv_size_per_rank=capacity * args[3].shape[1],
+        max_recv_size_per_rank=max_recv_size_per_rank,
     )
     source_weights = _fixed_training_weights(args)
     assert capacity % 128 != 0
@@ -1055,7 +1056,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         intermediate_size=256,
         top_k=2,
         max_tokens_per_rank=capacity,
-        max_recv_size_per_rank=capacity * args[3].shape[1],
+        max_recv_size_per_rank=max_recv_size_per_rank,
         drop_on_overflow=True,
         combine_format=combine_format,
         weight_interleave_size=32,
@@ -1072,8 +1073,9 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         )
         lane = op.training_lanes[0]
         symmetric = op.training_symmetric_buffers(lane)
-        assert symmetric["forward_input_scale"].shape[0] == 128
-        assert symmetric["backward_input_scale"].shape[0] == 128
+        expected_scale_rows = _round_up(capacity, 128)
+        assert symmetric["forward_input_scale"].shape[0] == expected_scale_rows
+        assert symmetric["backward_input_scale"].shape[0] == expected_scale_rows
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
@@ -1248,7 +1250,7 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
         intermediate_size=intermediate,
         top_k=1,
         max_tokens_per_rank=129,
-        max_recv_size_per_rank=129,
+        max_recv_size_per_rank=_round_up(129, 128),
         drop_on_overflow=True,
         combine_format="bf16",
         weight_interleave_size=32,
@@ -1330,6 +1332,7 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
     )
     capacity = 129
     assert activation.logical_shape[0] < capacity
+    max_recv_size_per_rank = args[1].shape[0] * _round_up(capacity, 128)
     grad_output_plain = _grad_output(
         device,
         activation.shape[0],
@@ -1342,7 +1345,7 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
         combine_format="bf16",
         gate_up_clamp=None,
         max_tokens_per_rank=capacity,
-        max_recv_size_per_rank=capacity * topk_idx.shape[1],
+        max_recv_size_per_rank=max_recv_size_per_rank,
     )
 
     op = MoeEp(
@@ -1351,7 +1354,7 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
         intermediate_size=256,
         top_k=2,
         max_tokens_per_rank=capacity,
-        max_recv_size_per_rank=capacity * topk_idx.shape[1],
+        max_recv_size_per_rank=max_recv_size_per_rank,
         drop_on_overflow=True,
         output_format="bf16",
         combine_format="bf16",

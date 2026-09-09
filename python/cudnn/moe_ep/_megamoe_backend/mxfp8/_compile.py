@@ -196,6 +196,10 @@ def prepare_kernel(
     if token_src_metadata_offset + token_src_metadata_bytes > shared_bytes:
         raise RuntimeError("Rubin token_src_metadata region exceeds shared workspace")
     pool_token_capacity = int(kernel.pool_token_capacity)
+    if pool_token_capacity != config.physical_recv_pool_size:
+        raise RuntimeError(
+            "Rubin logical receive limit did not reproduce the prescribed " f"physical pool: {pool_token_capacity} != " f"{config.physical_recv_pool_size}"
+        )
     if token_src_metadata_bytes != pool_token_capacity * 8:
         raise RuntimeError("Rubin token_src_metadata must contain one Int64 per pool token")
     col_quant_data_rows = pool_token_capacity if config.enable_col_quant else 0

@@ -45,7 +45,11 @@ op = MoeEp(
 ```
 
 `max_recv_size_per_rank` is the physical receive-pool size in token rows,
-including all per-expert padding. Padding is contained within this capacity.
+including all per-expert padding. An explicit size `P` must satisfy
+`P % 128 == 0` and must be exactly representable by the kernel's per-expert
+padding contract. The frontend passes a conservatively reverse-calculated
+logical route limit to the kernel, so some favorable route distributions can
+overflow before every physical row is used.
 
 Native training requires `weight_interleave_size=32`. FC1 payloads then use
 alternating 32-element gate/up strips.
@@ -333,6 +337,11 @@ contract.
 - One lane may be active on only one stream at a time.
 - All EP ranks must submit distributed forward/backward calls in identical
   order.
+- Unordered concurrent replay of distributed MoeEP graphs on independent CUDA
+  streams is unsupported and must not be used. Multiple streams must be
+  serialized into the same total device-execution order on every EP rank by
+  stream FIFO or explicit CUDA event dependencies; matching host submission
+  order alone is insufficient.
 - The caller owns forward/backward weight-version consistency.
 - `MoeEp.close()` releases only private runtime resources and never clears or
   frees caller memory.

@@ -194,6 +194,11 @@ class MoeEp:
     replay does not repeat this value check, so replayed routing contents must
     preserve the same dense-routing invariant. Structural tensor, workspace,
     aliasing, and overflow checks remain enabled in both modes.
+
+    ``max_recv_size_per_rank`` prescribes the physical padded receive-pool
+    rows. An explicit value ``P`` must satisfy ``P % 128 == 0``; the backend
+    reverse-calculates a conservative logical route limit whose worst-case
+    per-expert padding is exactly ``P``.
     """
 
     def __init__(
@@ -236,6 +241,8 @@ class MoeEp:
             isinstance(max_recv_size_per_rank, bool) or not isinstance(max_recv_size_per_rank, int) or max_recv_size_per_rank <= 0
         ):
             raise ValueError("max_recv_size_per_rank must be a positive integer or None")
+        if max_recv_size_per_rank is not None and max_recv_size_per_rank % 128:
+            raise ValueError("max_recv_size_per_rank must satisfy P % 128 == 0, " f"got P={max_recv_size_per_rank}")
         if not isinstance(drop_on_overflow, bool):
             raise ValueError("drop_on_overflow must be a bool")
         if not isinstance(apply_topk_in_fc1, bool):
@@ -401,7 +408,9 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
-                raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
+                raise RuntimeError(
+                    "MoeEp is unusable after an autotune runtime failure"
+                )
             from . import _backend
 
             if self._forward_backend is not None and request.device != self._forward_backend_device:
@@ -440,9 +449,7 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
-                raise RuntimeError(
-                    "MoeEp is unusable after an autotune runtime failure"
-                )
+                raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             strict_validation = self.validation_mode == "strict"
             topk_version = self._tensor_version(topk_idx) if strict_validation else None
             validate_expert_ids = strict_validation and not (
