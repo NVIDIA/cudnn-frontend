@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Direct-adapter timing for the MXFP8-QK / BF16-PV experiment.
+"""FROST-kernel timing for the MXFP8-QK / BF16-PV experiment.
 
 This does not alter graph routing. It compares the direct-only hybrid kernel
 with ordinary MXFP8 QKV and native BF16 using identical logical shapes. The
@@ -17,7 +17,13 @@ Examples (GB200):
 
 The full sweep is the Cartesian product B={1,2,4,8,16,32,64,128} and
 Sq=Sk={1024,2048,4096,8192,16384}. It intentionally takes a long time:
-every row is a 100-launch warmup followed by a 1,000-launch CUDA-event average.
+every row is a 100-launch warmup followed by a 1,000-launch profiler average.
+
+This follows benchmark_single_sdpa.py's kernel accounting: the direct adapter
+is called to exercise the specialization, but only CUDA kernels whose names
+begin ``cudnn_frost_`` or ``kernel_cutlass`` contribute to the result. Python dispatch, adapter
+layout copies, scale-factor views, output copy-back, and allocation are
+outside the reported SDPA-kernel latency.
 """
 
 import argparse
@@ -27,6 +33,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import torch
+from torch.profiler import ProfilerActivity, profile, record_function
 
 SWEEP_BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
 SWEEP_SEQLENS = (1024, 2048, 4096, 8192, 16384)
@@ -144,6 +151,59 @@ def _time_cuda_events(fn: Callable[[], None], *, warmup: int, iters: int) -> flo
     return start.elapsed_time(end) * 1000.0 / iters
 
 
+def _frost_kernel_time_us(prof) -> float:
+    """Return total device time of the compiled FROST kernels in one trace."""
+    kernels = [
+        item
+        for item in prof.key_averages()
+        if item.key.startswith(("cudnn_frost_", "kernel_cutlass"))
+    ]
+    if kernels:
+        return sum(item.device_time_total for item in kernels)
+    if not prof.key_averages():
+        raise RuntimeError(
+            "torch.profiler recorded no CUDA events; refusing to report a "
+            "zero FROST-kernel time"
+        )
+    names = ", ".join(item.key for item in prof.key_averages()[:12])
+    raise RuntimeError(
+        "torch.profiler recorded CUDA events but no FROST/CuTe kernel; "
+        f"first events: {names}"
+    )
+
+
+def _time_frost_kernel_profiler(
+    fn: Callable[[], None],
+    *,
+    warmup: int,
+    iters: int,
+    l2_flush_buffer: torch.Tensor | None,
+) -> float:
+    """Return mean FROST SDPA-kernel microseconds, excluding adapter GPU work.
+
+    This is the same profiler-filtered timing boundary used by
+    benchmark_single_sdpa.py. The direct adapter can issue layout copies and
+    setup work, but only the compiled FROST/CuTe kernel is counted.
+    """
+    if warmup < 0:
+        raise ValueError("warmup must be non-negative")
+    if iters <= 0:
+        raise ValueError("iters must be positive")
+
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
+        for _ in range(iters):
+            if l2_flush_buffer is not None:
+                l2_flush_buffer.zero_()
+            with record_function("sdpa.frost.forward"):
+                fn()
+        torch.cuda.synchronize()
+    return _frost_kernel_time_us(prof) / iters
+
+
 def _capture_cuda_graph(fn: Callable[[], None]) -> Callable[[], None]:
     """Capture one already-compiled direct API launch and return its replay."""
     torch.cuda.synchronize()
@@ -170,8 +230,10 @@ def _time_variant(
     warmup: int,
     iters: int,
     execution: str,
+    timing_mode: str,
+    l2_flush_buffer: torch.Tensor | None,
 ) -> dict[str, float]:
-    """Compile and time one variant; retain only one output buffer at a time."""
+    """Compile and time one variant with an explicit measurement boundary."""
     o = _bshd_physical_input(shape_o)
     amax_o = (
         torch.empty(1, device="cuda", dtype=torch.float32) if emit_amax_o else None
@@ -203,16 +265,26 @@ def _time_variant(
         api.execute(**execute_kwargs)
 
     timings: dict[str, float] = {}
-    if execution in ("eager", "both"):
-        timings["eager"] = _time_cuda_events(launch, warmup=warmup, iters=iters)
-    if execution in ("graph", "both"):
-        try:
-            graph_replay = _capture_cuda_graph(launch)
-        except RuntimeError as exc:
-            raise RuntimeError("variant is not CUDA-graph capturable") from exc
-        timings["cuda graph"] = _time_cuda_events(
-            graph_replay, warmup=warmup, iters=iters
+    if timing_mode == "frost-profiler":
+        timings["FROST kernel"] = _time_frost_kernel_profiler(
+            launch,
+            warmup=warmup,
+            iters=iters,
+            l2_flush_buffer=l2_flush_buffer,
         )
+    else:
+        if execution in ("eager", "both"):
+            timings["adapter eager"] = _time_cuda_events(
+                launch, warmup=warmup, iters=iters
+            )
+        if execution in ("graph", "both"):
+            try:
+                graph_replay = _capture_cuda_graph(launch)
+            except RuntimeError as exc:
+                raise RuntimeError("variant is not CUDA-graph capturable") from exc
+            timings["adapter cuda graph"] = _time_cuda_events(
+                graph_replay, warmup=warmup, iters=iters
+            )
 
     del launch, execute_kwargs, api, amax_o, o
     torch.cuda.synchronize()
@@ -232,13 +304,20 @@ def _benchmark_shape(
     warmup: int,
     iters: int,
     execution: str,
+    timing_mode: str,
     variant: str,
+    l2_flush_mb: int,
 ) -> dict[str, dict[str, float]]:
     """Run direct-adapter variants at one B, Sq=Sk, Dqk/Dv point."""
     shape_q = (batch, q_heads, seqlen, d_qk)
     shape_k = (batch, kv_heads, seqlen, d_qk)
     shape_v = (batch, kv_heads, seqlen, d_v)
     shape_o = (batch, q_heads, seqlen, d_v)
+    l2_flush_buffer = (
+        torch.empty(l2_flush_mb * 1024 * 1024, device="cuda", dtype=torch.int8)
+        if l2_flush_mb
+        else None
+    )
 
     def bf16_input(shape: tuple[int, int, int, int]) -> torch.Tensor:
         return _bshd_physical_input(shape).normal_(0.0, 0.5)
@@ -280,6 +359,8 @@ def _benchmark_shape(
                 warmup=warmup,
                 iters=iters,
                 execution=execution,
+                timing_mode=timing_mode,
+                l2_flush_buffer=l2_flush_buffer,
             )
             del v_bf16
             torch.cuda.empty_cache()
@@ -305,6 +386,8 @@ def _benchmark_shape(
                 warmup=warmup,
                 iters=iters,
                 execution=execution,
+                timing_mode=timing_mode,
+                l2_flush_buffer=l2_flush_buffer,
             )
             del v_mx, sf_v
             torch.cuda.empty_cache()
@@ -331,10 +414,13 @@ def _benchmark_shape(
             warmup=warmup,
             iters=iters,
             execution=execution,
+            timing_mode=timing_mode,
+            l2_flush_buffer=l2_flush_buffer,
         )
         del q_bf16, k_bf16, v_bf16
         torch.cuda.empty_cache()
 
+    del l2_flush_buffer
     return results
 
 
@@ -360,10 +446,27 @@ def main() -> None:
         "--iters",
         type=int,
         default=1000,
-        help="timed launches averaged for each kernel and execution mode",
+        help="launches averaged for each reported measurement",
     )
     parser.add_argument(
-        "--execution", choices=("both", "eager", "graph"), default="both"
+        "--timing-mode",
+        choices=("frost-profiler", "adapter-events"),
+        default="frost-profiler",
+        help=(
+            "frost-profiler reports only FROST/CuTe CUDA kernels, like "
+            "benchmark_single_sdpa.py; adapter-events reports full direct "
+            "adapter latency"
+        ),
+    )
+    parser.add_argument(
+        "--execution", choices=("both", "eager", "graph"), default="both",
+        help="adapter-events only: execution mode to measure",
+    )
+    parser.add_argument(
+        "--l2-flush-mb",
+        type=int,
+        default=256,
+        help="zero this many MiB before each frost-profiler launch (0 disables)",
     )
     parser.add_argument(
         "--variant",
@@ -399,6 +502,8 @@ def main() -> None:
         raise ValueError("batch and seqlen must be positive")
     if args.q_heads % args.kv_heads:
         raise ValueError("q-heads must be divisible by kv-heads")
+    if args.l2_flush_mb < 0:
+        raise ValueError("l2-flush-mb must be non-negative")
 
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
@@ -419,9 +524,10 @@ def main() -> None:
     d_labels = ",".join(label for label, _, _ in args.d_shapes)
     print(
         f"{scope}: Hq={args.q_heads} Hkv={args.kv_heads}; causal; "
-        "logical BHSD / physical BSHD (zero-copy FROST adapter); "
+        "logical BHSD / physical BSHD; "
         f"D-shapes={d_labels}; Amax_O={args.amax_o}; "
-        f"{args.warmup} warmup launches; average of {args.iters} CUDA-event timed launches per row; "
+        f"{args.warmup} warmup launches; average of {args.iters} "
+        f"{args.timing_mode} measurements per row; L2 flush={args.l2_flush_mb} MiB; "
         f"variant={args.variant}"
     )
     print(
@@ -445,7 +551,9 @@ def main() -> None:
                     warmup=args.warmup,
                     iters=args.iters,
                     execution=args.execution,
+                    timing_mode=args.timing_mode,
                     variant=args.variant,
+                    l2_flush_mb=args.l2_flush_mb,
                 )
             except torch.OutOfMemoryError:
                 print(
@@ -456,11 +564,8 @@ def main() -> None:
             else:
                 bf16_timings = results.get(BF16_NAME, {})
                 for name in (HYBRID_NAME, MXFP8_NAME, BF16_NAME):
-                    for execution in ("eager", "cuda graph"):
-                        average_us = results.get(name, {}).get(execution)
-                        if average_us is None:
-                            continue
-                        bf16_us = bf16_timings.get(execution)
+                    for measurement, average_us in results.get(name, {}).items():
+                        bf16_us = bf16_timings.get(measurement)
                         relative = (
                             f"{average_us / bf16_us:.3f}x"
                             if bf16_us is not None
@@ -468,7 +573,7 @@ def main() -> None:
                         )
                         print(
                             f"{batch:4d} {seqlen:7d} {d_qk:4d} {d_v:4d} "
-                            f"{name:38s} {execution:11s} {average_us:14.2f} {relative:>9s}"
+                            f"{name:38s} {measurement:11s} {average_us:14.2f} {relative:>9s}"
                         )
             finally:
                 # Drop tensors, API objects, and graph pools before the next point.
