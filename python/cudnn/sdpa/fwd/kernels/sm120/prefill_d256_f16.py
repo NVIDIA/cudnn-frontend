@@ -5,7 +5,7 @@
 A fused multi-head attention (FMHA) FP16/BF16 kernel for D=256 heads on the
 NVIDIA Blackwell SM120 family (SM120 and SM121) using TMA K/V loads.
 
-This is the D=256 variant of ``prefill_f16_sm120.py``: the same fused Q*K^T,
+This is the D=256 variant of ``sm120/prefill_f16.py``: the same fused Q*K^T,
 softmax, and softmax(Q*K^T)*V pipeline on SM80-era ``mma.sync.aligned.m16n8k16``
 tensor cores, with (256, 256) head tiles. To fit the larger Q, S, and O working
 set in registers, it keeps half of the Q tile in shared memory and gives every
@@ -67,7 +67,7 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import (
     thd_decode_unit,
     THD_SETUP_THREADS,
 )
-from cudnn.sdpa.fwd.kernels._common_sm120 import (
+from cudnn.sdpa.fwd.kernels.sm120._common import (
     SCHED_L2_BUDGET_BYTES,
     ceil_div,
     nvvm_threadquad_reduction_max,
@@ -1741,7 +1741,7 @@ def compile(  # noqa: A001
     caller-declared head-row stride (``>= T``, a shape — part of the cache key).
     """
 
-    # Head dims that do not tile to (256, 256) belong to prefill_f16_sm120.py.
+    # Head dims that do not tile to (256, 256) belong to sm120/prefill_f16.py.
     if pick_flavor(d_qk, d_v, fp8=False) != D256_FLAVOR:
         raise ValueError(f"SM120 SDPA d256 kernel: head dims ({d_qk}, {d_v}) do not tile to {D256_FLAVOR}")
     kernel = SM120FusedMultiHeadAttentionForward(

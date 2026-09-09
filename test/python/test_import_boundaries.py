@@ -132,7 +132,7 @@ from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 from cudnn.frost.template_loader import load_template
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-path = pathlib.Path(cudnn.__file__).parent / "sdpa/fwd/kernels/prefill_d192_d128_f16_sm100.py"
+path = pathlib.Path(cudnn.__file__).parent / "sdpa/fwd/kernels/sm100/prefill_d192_d128_f16.py"
 load_template(str(path), TemplateParams(dtype_qkv=3), tag="d192_f16_no_torch")
 
 class Ex2Probe:

@@ -224,7 +224,7 @@ class Capabilities:
     # the classic-pipeline TMEM stats race — the next tile's prologue BMM1
     # overwrote the S_acc-head (total_max, total_sum) before the correction
     # epilogue read them — and fixed by the mb_stats_read barrier (same fix as
-    # the f16 kernel's; see prefill_d128_fp8_sm100.py / _common_sm100.Bars).
+    # the f16 kernel's; see sm100/prefill_d128_fp8.py / _common_blackwell.Bars).
     single_wave_only: bool = False
     # Serve ragged S_kv on unmasked graphs by synthesizing a full-length
     # seq_len_kv and lowering through the kernel's padded path (masks the KV
@@ -618,7 +618,7 @@ def _sm100_spec() -> EngineSpec:
             cgas_by_d_shape=(((192, 128), frozenset({1, 2})),),
             split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
             # All four f16 flavor kernels wire SplitHelpers, and the adapter
-            # carves the partial slabs + launches split_combine_sm100 when
+            # carves the partial slabs + launches sm100/split_combine when
             # split_kv > 1 (dense f16 only; see mismatch's facts x knobs gate).
             split_kv_supported=True,
             pack_gqas=frozenset({False, True}),
@@ -636,7 +636,7 @@ def _sm107_spec() -> EngineSpec:
     (a version-0 descriptor addresses only 256 KiB, and Rubin's 327 KiB budget
     puts the d512 flavor's P ring at exactly that boundary).  The f16 line
     carries all four SM100 flavors, d192xd128 included
-    (``prefill_d192_d128_f16_sm107.py`` — the d128 body with ``make_cfg_d192``);
+    (``sm107/prefill_d192_d128_f16.py`` — the d128 body with ``make_cfg_d192``);
     the QUANTIZED Rubin rows are the ones that ship a strict subset.
 
     Every capability below was MEASURED on Rubin (`w2u1g-lc-0030`) against an
@@ -864,12 +864,12 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             skv_tail_via_padding=True,
             # LPT/LPT_L2 remap is in lockstep with the SM100 sibling (issue
             # #653): every decode call site threads qh_per_kh/seqlen_kv, which
-            # is what the shared _common_sm100 LPT_L2 decode demands.  The L2
+            # is what the shared _common_blackwell LPT_L2 decode demands.  The L2
             # figure the remap blocks against (CFG.L2_SIZE_MIB) is a tuning
             # hint for the grouping, not a chip capacity, so the SM100 number
             # carries to Rubin unchanged.
             # LPT_L2 needs qh_per_kh + seqlen_kv threaded through EVERY decode
-            # call site (_common_sm100._decode_initial raises otherwise).  On the
+            # call site (_common_blackwell._decode_initial raises otherwise).  On the
             # Rubin line only the shipped d128 kernel does that -- d256 and d512
             # have 0/10 sites threaded -- so the row cannot claim the policy for
             # the flavors it now serves.  Heuristics derives its proposals from

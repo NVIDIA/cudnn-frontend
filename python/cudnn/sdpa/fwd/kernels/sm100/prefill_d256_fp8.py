@@ -101,7 +101,7 @@ else:
     raise ValueError(f"prefill_sdpa_d256_fp8: unsupported DTYPE_O={CFG.DTYPE_O}")
 
 
-from cudnn.sdpa.fwd.kernels._common_sm100 import (
+from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
     KvLoopBounds,
     make_d256_bars,

@@ -52,7 +52,7 @@ def test_f16_routes_to_the_sm107_sibling(flavor):
 # Q(u)O and K(u)V slabs are 128 KiB each, putting the P transfer ring at exactly
 # 262144 (and, on the MXFP8 sibling, the scale-factor tiles near 292 KiB).  Keep
 # d128/d256 on version 0 so they stay byte-identical to the shipped
-# prefill_d128_fp8_sm107.py sibling.
+# sm107/prefill_d128_fp8.py sibling.
 _NEEDS_DESC_V1 = {(512, 512)}
 
 # (kind, loader kwargs) for every SM107 dtype family, so the check below covers
@@ -127,7 +127,7 @@ def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
     loading instead of riding the next covering envelope.
 
     PARTIALLY INVERTED 2026-09-04: d192xd128 now HAS a Rubin sibling
-    (``prefill_d192_d128_f16_sm107.py`` -- the same body as d128 with
+    (``sm107/prefill_d192_d128_f16.py`` -- the same body as d128 with
     ``make_cfg_d192``), so a d=192 f16 graph lowers onto the NATIVE kernel
     instead of riding the d256 envelope.  The pool-narrowing invariant is
     unchanged and is what this test really pins; the FP8/MXFP8 lines still have
@@ -245,7 +245,7 @@ def test_sm107_f16_accepts_the_measured_feature_set(feature):
 
 
 def test_sm107_f16_serves_d192_on_its_native_kernel():
-    """d192xd128 is a NATIVE f16 Rubin flavor (``prefill_d192_d128_f16_sm107.py``
+    """d192xd128 is a NATIVE f16 Rubin flavor (``sm107/prefill_d192_d128_f16.py``
     -- the d128 body with ``make_cfg_d192``), not an envelope ride.
 
     Both halves of that claim are pinned, because they can drift apart

@@ -11,14 +11,14 @@ trace time; the remaining SHAPE axes compile through the module's own
 via ``cute.sym_int`` — plan-time-only keys, Hard Rule 4).  The adapter
 (``api_dsl.SdpaFwdDslSm80``) owns validation, operand binding and launch.
 
-Sibling of ``prefill_f16_sm80.py`` — same online flash-attention
+Sibling of ``sm80/prefill_f16.py`` — same online flash-attention
 recipe (rowwise max / sum, exp2 softmax with scale folded into the
 exponent, threadquad butterflies, RESCALE_THRESHOLD=8.0, mask pre-pass
 on boundary iters, LPT / LPT_L2 schedulers, swizzled STG.128 epilogue),
 but with a symmetric K + V prefetch pipeline that's a small perf gain
 at d=256 but a regression at d ≤ 192 (Llama / DSv3 / GPT-OSS) — those
 flavors stay on the simpler K-only-prefetch pipeline in
-``prefill_f16_sm80.py``.
+``sm80/prefill_f16.py``.
 
 Pipeline shape (qwen, d_qk = d_v = 256):
 
@@ -1406,7 +1406,7 @@ def _sdpa_kernel(
             # trimming only in the predicated path left finite LSE on padded rows
             # whenever SQ is tile-aligned.  THD is bounded by sq_store_bound==eff_sq
             # instead (must NOT write the next packed seq's rows), so this select is
-            # gated on has_seq_len_q only.  Mirrors prefill_f16_sm80.py; the SM80
+            # gated on has_seq_len_q only.  Mirrors sm80/prefill_f16.py; the SM80
             # bprop reads this lse and masks P=0 for padded rows (inf->0 select,
             # no NaN), so the -inf is safe downstream.
             if cutlass.const_expr(has_seq_len_q):

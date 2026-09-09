@@ -258,7 +258,7 @@ elif CFG.DTYPE_O == 3:
 else:
     raise ValueError(f"prefill_sdpa_fp8: DTYPE_O={CFG.DTYPE_O} not supported " f"(expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
 
-from cudnn.sdpa.fwd.kernels._common_sm100 import (
+from cudnn.sdpa.fwd.kernels._common_blackwell import (
     KvLoopBounds,
     make_split_helpers,
     make_classic_bars,

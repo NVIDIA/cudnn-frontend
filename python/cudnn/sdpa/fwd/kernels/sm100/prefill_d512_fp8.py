@@ -3,7 +3,7 @@
 
 """SM100 (Blackwell) SDPA prefill — d_qk = d_v = 512, per-tensor FP8 (E4M3/E5M2).
 
-FP8 fork of ``prefill_d512_f16_sm100.py``: same cga4x1 role-split pipeline, same
+FP8 fork of ``sm100/prefill_d512_f16.py``: same cga4x1 role-split pipeline, same
 Q u K_ring SMEM alias, same UTCCP(Q SMEM -> TMEM) + ``mma_ts`` BMM1, same THD /
 split-KV / pack-GQA legs.  Only the dtype-driven deltas differ, and every one of
 them is derived from ``CFG`` rather than spelled as a literal:
@@ -156,7 +156,7 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_SWA,
 )
 
-from cudnn.sdpa.fwd.kernels._common_sm100 import (
+from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
     KvLoopBounds,
     compute_kv_loop_bounds,
@@ -174,7 +174,7 @@ elif CFG.DTYPE_QKV == 1:
     MMA_KIND = nvvm.Tcgen05MMAKind.F8F6F4
 else:
     raise ValueError(
-        f"prefill_sdpa_d512_fp8 (SM100): DTYPE_QKV={CFG.DTYPE_QKV} not supported (expected 0=E4M3 or 1=E5M2; BF16/FP16 ship in prefill_d512_f16_sm100.py)"
+        f"prefill_sdpa_d512_fp8 (SM100): DTYPE_QKV={CFG.DTYPE_QKV} not supported (expected 0=E4M3 or 1=E5M2; BF16/FP16 ship in sm100/prefill_d512_f16.py)"
     )
 
 # DTYPE_O is independent of DTYPE_QKV: an FP8 graph may ask for a half-precision
@@ -433,11 +433,11 @@ TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
 
 # === KV split ===
 #
-# Mechanics live in _common_sm100.make_split_helpers, shared with the other
+# Mechanics live in _common_blackwell.make_split_helpers, shared with the other
 # SM100 prefill flavors: each Q tile's KV loop range is cut into SPLIT_KV
 # contiguous chunks, each run as its own persistent tile, and each writing a
 # normalized partial O + its own LSE into a split-major workspace that
-# split_combine_sm100 folds with the exact log-sum-exp identity.  At
+# sm100/split_combine folds with the exact log-sum-exp identity.  At
 # SPLIT_KV == 1 every closure folds away and this is the classic kernel.
 _split_h = make_split_helpers(
     CFG,

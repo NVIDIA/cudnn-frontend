@@ -134,7 +134,7 @@ if CFG.DTYPE_O != CFG.DTYPE_QKV:
 OUT_STORAGE_DTYPE = STORAGE_DTYPE
 
 
-from cudnn.sdpa.fwd.kernels._common_sm100 import (
+from cudnn.sdpa.fwd.kernels._common_blackwell import (
     D256Bars as Bars,
     KvLoopBounds,
     make_d256_bars,
@@ -1549,7 +1549,7 @@ def _correction_warp_group(
             inv_sum = cutlass.Float32(1.0) / cute.math.max(total_sum, cutlass.Float32(1e-30))
 
         # --- empty KV range (zero-length sequence under the padding mask) ---
-        # Same guard as prefill_d256_fp8_sm107.py: with bounds.right <=
+        # Same guard as sm107/prefill_d256_fp8.py: with bounds.right <=
         # bounds.left the mainloop never ran, so total_max/total_sum are still 0
         # and the 1e-30 denominator floor yields LSE = log(1e-30) = -69.08 and
         # inv_sum = 1/1e-30 -> +inf, making O = (TMEM residue) * inf.
@@ -1685,7 +1685,7 @@ def _host(
     seq_q_lens_tensor: Optional[cute.Tensor] = None,
     # FROST plans must run on the caller's stream (engine contract; there is a
     # dedicated stream-respect test).  Threaded exactly as the shipped
-    # prefill_d128_fp8_sm107.py sibling does.
+    # sm107/prefill_d128_fp8.py sibling does.
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
@@ -1840,7 +1840,7 @@ def compile(  # noqa: A001
     # has_lse=False (no Stats output): the LSE argument is None-specialized and
     # the store is compiled out entirely -- no dummy buffer exists at any level,
     # which is what lets the dense graph report get_workspace_size() == 0.
-    # Mirrors the shipped prefill_d128_fp8_sm107.py.
+    # Mirrors the shipped sm107/prefill_d128_fp8.py.
     fake_lse = (
         cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,

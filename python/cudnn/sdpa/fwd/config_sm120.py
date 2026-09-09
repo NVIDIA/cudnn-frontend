@@ -104,7 +104,7 @@ class TemplateParams:
     pack_gqa: bool = False
     # KV split: each Q tile's KV-tile range [min_kv_tile, num_kv_tiles) is cut
     # into ``split_kv`` contiguous chunks, each run by its own CTA writing a
-    # partial (O, LSE) that kernels/split_combine_sm100.py reduces.  1 = off.
+    # partial (O, LSE) that kernels/sm100/split_combine.py reduces.  1 = off.
     # Opt-in only -- the graph front door never selects it.
     split_kv: int = 1
 

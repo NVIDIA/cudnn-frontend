@@ -223,7 +223,7 @@ to offset 0 and the MMA multiplies the untouched O staging slab (O comes out
 exactly zero, no crash).
 
 The f16/bf16 line carries all four SM100 flavors, d192×d128 included
-(`prefill_d192_d128_f16_sm107.py` — the d128 body with `make_cfg_d192`), so a
+(`sm107/prefill_d192_d128_f16.py` — the d128 body with `make_cfg_d192`), so a
 d=192 f16 graph lands on its NATIVE kernel. The **quantized** lines are the
 strict subset: neither has a d192×d128 sibling, and (as on SM100) the
 `(256, 256)` envelope floor keeps an inexact graph off the d256 flavor's
@@ -285,7 +285,7 @@ would silently drop the tail tile.
 
 **Scheduler policy — NATURAL only on every Rubin row.** `SCHED_LPT_L2` was
 dropped first (the ported decode sites never thread `qh_per_kh` / `seqlen_kv`,
-so `_common_sm100._decode_initial` raises); plain `SCHED_LPT` followed on
+so `_common_blackwell._decode_initial` raises); plain `SCHED_LPT` followed on
 2026-09-08 once a heuristics fallback fix let a causal graph actually reach it —
 it is silently WRONG on the ported kernels (causal d512 FP8 → NaN, masked d128
 MXFP8 → max|O-ref| ≈ 1.9). A knob is honored or the engine is ineligible. The
@@ -307,7 +307,7 @@ field that declines it, so the skip inverts when the feature lands.
 Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
 `sdpa_bwd_sm120`. Head dims are a **continuum**, not per-model flavors: the
 kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
-tile at 256 on both sides run a dedicated template, `prefill_d256_f16_sm120.py` with the same support; fp8 has no such flavor).
+tile at 256 on both sides run a dedicated template, `sm120/prefill_d256_f16.py` with the same support; fp8 has no such flavor).
 
 | Feature | FPROP<br>d ≤ 256, any ×8 | FPROP FP8<br>d ≤ 256, any ×16 | BPROP<br>d ≤ 256, any ×8 |
 |---|:--:|:--:|:--:|

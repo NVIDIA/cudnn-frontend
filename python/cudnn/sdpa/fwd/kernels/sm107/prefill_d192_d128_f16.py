@@ -17,7 +17,7 @@ by hand:
      ``..._from_view`` — a signature change, not a rename.
 
 Geometry is FROST's ``make_cfg_d192`` (d_qk=192, d_v=128) as-is.
-Same body as ``prefill_d128_f16_sm107.py`` -- the pre-upstream base kernel is
+Same body as ``sm107/prefill_d128_f16.py`` -- the pre-upstream base kernel is
 flavor-generic (it served llama/dsv3/gptoss off one file by swapping
 sdpa_config_<flavor>), and CfgD192/CfgD128 have identical field sets, so
 the ONLY difference is the config factory. the pre-upstream helper would give
@@ -174,7 +174,7 @@ else:
     raise ValueError(f"prefill_sdpa_f16: DTYPE_QKV={CFG.DTYPE_QKV} not supported " f"(expected 2=BF16, 3=FP16, or 4=TF32)")
 
 
-from cudnn.sdpa.fwd.kernels._common_sm100 import (
+from cudnn.sdpa.fwd.kernels._common_blackwell import (
     Bars,
     KvLoopBounds,
     make_classic_bars,
@@ -1886,7 +1886,7 @@ def _host(
     seq_q_lens_tensor: Optional[cute.Tensor] = None,
     # FROST plans must run on the caller's stream (engine contract; there is a
     # dedicated stream-respect test).  Threaded exactly as the shipped
-    # prefill_d128_fp8_sm107.py sibling does.
+    # sm107/prefill_d128_fp8.py sibling does.
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
@@ -2050,7 +2050,7 @@ def compile(  # noqa: A001
     # has_lse=False (no Stats output): the LSE argument is None-specialized and
     # the store is compiled out entirely -- no dummy buffer exists at any level,
     # which is what lets the dense graph report get_workspace_size() == 0.
-    # Mirrors the shipped prefill_d128_fp8_sm107.py.
+    # Mirrors the shipped sm107/prefill_d128_fp8.py.
     fake_lse = (
         cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,

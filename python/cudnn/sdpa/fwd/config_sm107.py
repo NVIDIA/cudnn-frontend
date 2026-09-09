@@ -92,7 +92,7 @@ __all__ = [
 # and the d256/d512 flavors all depend on it.
 SMEM_CAP_BYTES = 327 * 1024
 
-# ...but the CAPACITY is not the budget. The shipped prefill_d128_fp8_sm107.py
+# ...but the CAPACITY is not the budget. The shipped sm107/prefill_d128_fp8.py
 # sizes its own guard against 320 KiB ("327 KiB capacity minus reserves"), and
 # the kernels additionally spend ~2 KiB on barriers, the scheduler ring and the
 # TMEM pointer. Validating Q/K/V/O against the raw 327 KiB waves through an
@@ -537,7 +537,7 @@ def _stages_kv_d128(dtype_qkv: int, cta_mma: int, *, mxfp8: bool, tile_k: int) -
     """Rubin d128-family ring depth.
 
     Per-tensor FP8 at d128/cga2 runs a **9-stage** ring: a Rubin-specific tuning
-    carried by the shipped ``prefill_d128_fp8_sm107.py`` (which previously spelled
+    carried by the shipped ``sm107/prefill_d128_fp8.py`` (which previously spelled
     it as a post-hoc ``dataclasses.replace``), and the reason that kernel needs
     the oversized-SMEM launch mode.
 

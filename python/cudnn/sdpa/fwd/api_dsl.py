@@ -69,10 +69,10 @@ _SM100_FLAVORS = (
     (512, 512),
 )  # ordered smallest-first: (max D_QK, max D_V) envelope
 _SM100_KERNEL_FILES = {
-    (512, 512): "prefill_d512_f16_sm100.py",
-    (256, 256): "prefill_d256_f16_sm100.py",
-    (192, 128): "prefill_d192_d128_f16_sm100.py",
-    (128, 128): "prefill_d128_f16_sm100.py",
+    (512, 512): "sm100/prefill_d512_f16.py",
+    (256, 256): "sm100/prefill_d256_f16.py",
+    (192, 128): "sm100/prefill_d192_d128_f16.py",
+    (128, 128): "sm100/prefill_d128_f16.py",
 }
 # DTYPE_* codes: E4M3=0, E5M2=1, BF16=2, FP16=3. FP8 inputs (0/1) route to the
 # FP8 kernel families; the output dtype is encoded the same way.
@@ -86,35 +86,35 @@ _SM100_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # FP8 kernels use E4M3/E5M2 inputs and BF16/FP16/FP8 outputs. Block-scale
 # Per-tensor and block-scale FP8 select independently from their native maps.
 _SM100_MXFP8_KERNEL_FILES = {
-    (128, 128): "prefill_d128_mxfp8_sm100.py",
-    (192, 128): "prefill_d192_d128_mxfp8_sm100.py",
-    (256, 256): "prefill_d256_mxfp8_sm100.py",
+    (128, 128): "sm100/prefill_d128_mxfp8.py",
+    (192, 128): "sm100/prefill_d192_d128_mxfp8.py",
+    (256, 256): "sm100/prefill_d256_mxfp8.py",
 }
 # Rubin (SM107) siblings.  Separate maps rather than entries in the SM100
 # ones: the lowerings genuinely diverge (dense K=64 FP8 MMA, 576-column TMEM,
 # version-1 tcgen05 SMEM descriptors for operands above 256 KiB), which is the
 # same reason engines.py keeps one row per ARCH LINE.
 _SM107_KERNEL_FILES = {
-    (512, 512): "prefill_d512_f16_sm107.py",
-    (256, 256): "prefill_d256_f16_sm107.py",
-    (192, 128): "prefill_d192_d128_f16_sm107.py",
-    (128, 128): "prefill_d128_f16_sm107.py",
+    (512, 512): "sm107/prefill_d512_f16.py",
+    (256, 256): "sm107/prefill_d256_f16.py",
+    (192, 128): "sm107/prefill_d192_d128_f16.py",
+    (128, 128): "sm107/prefill_d128_f16.py",
 }
 _SM107_FP8_KERNEL_FILES = {
-    (512, 512): "prefill_d512_fp8_sm107.py",
-    (256, 256): "prefill_d256_fp8_sm107.py",
-    (128, 128): "prefill_d128_fp8_sm107.py",
+    (512, 512): "sm107/prefill_d512_fp8.py",
+    (256, 256): "sm107/prefill_d256_fp8.py",
+    (128, 128): "sm107/prefill_d128_fp8.py",
 }
 _SM107_MXFP8_KERNEL_FILES = {
-    (512, 512): "prefill_d512_mxfp8_sm107.py",
-    (256, 256): "prefill_d256_mxfp8_sm107.py",
-    (128, 128): "prefill_d128_mxfp8_sm107.py",
+    (512, 512): "sm107/prefill_d512_mxfp8.py",
+    (256, 256): "sm107/prefill_d256_mxfp8.py",
+    (128, 128): "sm107/prefill_d128_mxfp8.py",
 }
 _SM100_FP8_KERNEL_FILES = {
-    (128, 128): "prefill_d128_fp8_sm100.py",
-    (192, 128): "prefill_d192_d128_fp8_sm100.py",
-    (256, 256): "prefill_d256_fp8_sm100.py",
-    (512, 512): "prefill_d512_fp8_sm100.py",
+    (128, 128): "sm100/prefill_d128_fp8.py",
+    (192, 128): "sm100/prefill_d192_d128_fp8.py",
+    (256, 256): "sm100/prefill_d256_fp8.py",
+    (512, 512): "sm100/prefill_d512_fp8.py",
 }
 
 
@@ -147,8 +147,8 @@ _SM100_TILE_N = 128
 
 # Keyed by kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template. The fp8
 # family has no flavor: every head dim runs its general template.
-_SM120_KERNEL_FILES = {_SM120_D256_FLAVOR: "prefill_d256_f16_sm120.py", None: "prefill_f16_sm120.py"}
-_SM120_FP8_KERNEL_FILES = {None: "prefill_fp8_sm120.py"}
+_SM120_KERNEL_FILES = {_SM120_D256_FLAVOR: "sm120/prefill_d256_f16.py", None: "sm120/prefill_f16.py"}
+_SM120_FP8_KERNEL_FILES = {None: "sm120/prefill_fp8.py"}
 
 
 _SM120_DTYPE_QKV_CODE = {
@@ -351,7 +351,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     """Load one SM100-family module for the selected flavor and quantization
     path.  ``rubin`` routes EVERY dtype family to its SM107 sibling kernel
     (dense K=64 FP8 MMA and the version-1 SMEM descriptors baked in — see
-    prefill_d128_fp8_sm107.py and the d256/d512 siblings)."""
+    sm107/prefill_d128_fp8.py and the d256/d512 siblings)."""
 
     tag = _flavor_tag(flavor)
     if rubin:
@@ -1023,7 +1023,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.pack_gqa and self._fp8 and not self._pertensor,
             "PackGQA is not supported for MXFP8: the F8_128x4 sf_q scale-factor atom "
             "bundles 128 rows of ONE head and is not TMA-gatherable at token granularity "
-            "(see the SF layout note in prefill_d128_mxfp8_sm100.py)",
+            "(see the SF layout note in sm100/prefill_d128_mxfp8.py)",
         )
         for desc in [self.k_desc, self.v_desc]:
             self._check_dtype(desc, self.dtype, name=desc.name, extra_error_msg=f"{desc.name} must match Q dtype")
@@ -1180,7 +1180,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         if self.split_kv > 1:
             # Split-KV: partials weighted by the per-split LSE, recombined by
-            # split_combine_sm100 (which also owns the FP8 amax of the
+            # sm100/split_combine (which also owns the FP8 amax of the
             # recombined O). Structural limits mirror mismatch()'s
             # facts x knobs gate so the standalone API declines identically.
             self._not_implemented_error_if(
@@ -1463,7 +1463,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # families the combine also owns the amax of the recombined O
             # (a max over per-split partials would over-report — each split's
             # O is normalized by its own running sum).
-            from cudnn.sdpa.fwd.kernels import split_combine_sm100 as _split_combine
+            from cudnn.sdpa.fwd.kernels.sm100 import split_combine as _split_combine
 
             self._combine_kernel = _split_combine.compile(
                 b=self.batch_size,
@@ -2994,7 +2994,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # The recombine pass compiles at PLAN time; execute() only rebinds
             # the partial slabs it carves. The combine kernel is arch-agnostic
             # (one block per (q_row, head, batch), no cluster/TMEM features).
-            from cudnn.sdpa.fwd.kernels import split_combine_sm100 as _split_combine
+            from cudnn.sdpa.fwd.kernels.sm100 import split_combine as _split_combine
 
             self._combine_kernel = _split_combine.compile(
                 b=self.batch_size,
@@ -3816,8 +3816,8 @@ def _sm80_resolve_scheduler(
 _LOG2E = math.log2(math.e)
 
 _SM80_KERNEL_FILES = {
-    "d256": "prefill_d256_f16_sm80.py",
-    "f16": "prefill_f16_sm80.py",
+    "d256": "sm80/prefill_d256_f16.py",
+    "f16": "sm80/prefill_f16.py",
 }
 
 
@@ -3828,7 +3828,10 @@ def _sm80_load_kernel_module(flavor: str, params):
     generic kernel."""
     filename = _SM80_KERNEL_FILES["d256" if flavor in _SM80_D256_FLAVORS else "f16"]
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", filename)
-    return load_template(path, params, tag=f"sm80_{filename.rsplit('.', 1)[0]}")
+    # Tag from the BASENAME: `filename` carries the arch subdirectory, and a
+    # slash would land in the generated template module name.
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    return load_template(path, params, tag=f"sm80_{stem}")
 
 
 def _sm80_sched_policy_int(token: str) -> int:
