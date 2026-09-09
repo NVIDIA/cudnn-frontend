@@ -216,8 +216,10 @@ def indexer_fwd(
             sequence and be a multiple of 128 tokens. Any span satisfying those
             requirements is valid. Both scale prefixes must be ``None`` for BSHD.
         sf_vec_size: scale vector size for MXFP8, currently must be 32.
-        q_causal_offsets: optional int32 CUDA tensor of shape ``(batch,)``.
-            Each entry is the global uncompressed token index for local q[0].
+        q_causal_offsets: optional int32 CUDA tensor of shape ``(batch,)``, or
+            ``(total_q,)`` for BF16 THD inputs. A batch entry is added to every
+            local Q position in that sequence; a THD entry is added only to
+            its corresponding Q token.
 
     Returns:
         S_sum: BSHD ``(bs, seqlen_q, seqlen_k)`` or THD
@@ -372,7 +374,6 @@ def indexer_fwd(
             raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be <= seqlen_k * ratio " f"({seqlen_k_dim * ratio})")
         out_shape = (bs, seqlen_q_dim, seqlen_k_dim)
         out_buf_shape = None
-
     if n_heads_kv != 1:
         raise ValueError("SM100 indexer forward currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={n_heads_kv}")
     expected_qhead_per_kv_head = n_heads_q // n_heads_kv
@@ -382,7 +383,23 @@ def indexer_fwd(
         raise ValueError(f"qhead_per_kv_head ({qhead_per_kv_head}) must equal " f"n_heads_q // n_heads_kv ({expected_qhead_per_kv_head})")
     _validate_indexer_qhead_per_kv_head(qhead_per_kv_head, precision)
 
-    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
+    q_causal_offsets = validate_q_causal_offsets(
+        q_causal_offsets,
+        int(bs),
+        q.device,
+        stream=current_stream,
+        total_q=int(total_q) if is_varlen else None,
+    )
+    if q_causal_offsets is None:
+        q_causal_offset_mode = "none"
+    elif is_varlen and q_causal_offsets.shape[0] != int(bs):
+        q_causal_offset_mode = "token"
+    else:
+        q_causal_offset_mode = "sequence"
+    if q_causal_offset_mode == "token" and precision != "bf16":
+        raise ValueError("THD per-token q_causal_offsets currently require precision='bf16'")
+    if q_causal_offset_mode == "token" and is_compressed_logits:
+        raise ValueError("THD per-token q_causal_offsets are not supported by indexer forward Top-K")
 
     if precision == "bf16" and m_block_size // qhead_per_kv_head > 2:
         if m_block_size == 128:
@@ -482,7 +499,7 @@ def indexer_fwd(
             cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
             cu_q_scale_cute = _to_cute_tensor(cu_seqlens_q_scale_padded, leading_dim=0) if is_varlen else None
             cu_k_scale_cute = _to_cute_tensor(cu_seqlens_k_scale_padded, leading_dim=0) if is_varlen else None
-            q_offsets_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
+            q_offsets_cute = _to_cute_tensor(q_causal_offsets, assumed_align=4, leading_dim=0) if q_causal_offsets is not None else None
 
             kernel_obj = IndexerForwardSm100Mxfp8(
                 head_dim=head_dim,
@@ -565,7 +582,7 @@ def indexer_fwd(
         kv_stage,
         num_threads,
         is_varlen,
-        q_causal_offsets is not None,
+        q_causal_offset_mode,
     )
 
     if compile_key not in _compile_cache:
@@ -576,7 +593,7 @@ def indexer_fwd(
         denom_cute = _to_cute_tensor(denom_tmp)
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
-        q_offsets_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
+        q_offsets_cute = _to_cute_tensor(q_causal_offsets, assumed_align=4, leading_dim=0) if q_causal_offsets is not None else None
 
         kernel_obj = IndexerForwardSm100(
             head_dim=head_dim,
@@ -589,6 +606,7 @@ def indexer_fwd(
             is_varlen=is_varlen,
             compute_lse=False,
             is_compressed_logits=False,
+            q_causal_offset_mode=q_causal_offset_mode,
         )
 
         scale_arg = cutlass.Float32(sm_scale)

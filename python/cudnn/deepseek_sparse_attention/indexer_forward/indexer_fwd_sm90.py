@@ -65,11 +65,14 @@ class IndexerForwardSm90:
         use_unchecked_qh64: bool = False,
         use_unchecked_qh64_masked: bool = False,
         compute_lse: bool = False,
+        q_causal_offset_mode: str = "none",
     ):
         assert head_dim == 128, f"SM90 direct forward supports head_dim=128, got {head_dim}"
         supported_qhpkv = (32, 64) if qk_dtype == cutlass.Float8E4M3FN else (16, 32, 64)
         assert qhead_per_kvhead in supported_qhpkv, f"SM90 direct forward supports qhpkv in {supported_qhpkv}, got {qhead_per_kvhead}"
         assert ratio >= 1, f"ratio must be >=1, got {ratio}"
+        assert q_causal_offset_mode in ("none", "sequence", "token")
+        assert q_causal_offset_mode != "token" or is_varlen
         self.qk_dtype = qk_dtype
         self.w_dtype = w_dtype
         self.use_fp8_scales = qk_dtype == cutlass.Float8E4M3FN
@@ -80,6 +83,7 @@ class IndexerForwardSm90:
         self.is_varlen = is_varlen
         self.use_split_q_wg = self.use_fp8_scales
         self.use_fp8_prescaled_w = self.use_fp8_scales and w_dtype == Float32
+        self.q_causal_offset_mode = q_causal_offset_mode
 
         self.tile_m = 128
         self.mma_tile_n = 64
@@ -253,6 +257,32 @@ class IndexerForwardSm90:
         return cute.ceil_div(kv_limit, self.tile_n)
 
     @cute.jit
+    def _compute_per_token_k_limits(
+        self,
+        m_block: Int32,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        q_batch_offset: Int32,
+        mQCausalOffsets: cute.Tensor,
+    ):
+        q_token_base = m_block * Int32(self.q_tokens_per_tile)
+        r_kv_limits = cute.make_rmem_tensor((self.q_tokens_per_tile,), Int32)
+        r_kv_limits.fill(Int32(0))
+        kv_limit_min = seqlen_k
+        kv_limit_max = Int32(0)
+        for qi in cutlass.range_constexpr(self.q_tokens_per_tile):
+            q_local = q_token_base + Int32(qi)
+            if q_local < seqlen_q:
+                q_causal_offset = mQCausalOffsets[q_batch_offset + q_local]
+                kv_limit = (q_causal_offset + q_local + Int32(1)) // Int32(self.ratio)
+                kv_limit = kv_limit if kv_limit < seqlen_k else seqlen_k
+                kv_limit = kv_limit if kv_limit > Int32(0) else Int32(0)
+                r_kv_limits[qi] = kv_limit
+                kv_limit_min = kv_limit if kv_limit < kv_limit_min else kv_limit_min
+                kv_limit_max = kv_limit if kv_limit > kv_limit_max else kv_limit_max
+        return r_kv_limits, kv_limit_min, kv_limit_max
+
+    @cute.jit
     def _iter_n_block(self, iter_idx: Int32, n_block_max: Int32) -> Int32:
         if const_expr(self.use_fp8_scales):
             return n_block_max - Int32(1) - iter_idx
@@ -345,6 +375,7 @@ class IndexerForwardSm90:
         q_batch_offset: Int32,
         batch_idx: Int32,
         q_causal_offset: Int32,
+        kv_limits,
         sm_scale: Float32,
         kv_group_offset: Int32,
         lse_max: cute.Tensor = None,
@@ -389,10 +420,17 @@ class IndexerForwardSm90:
                     should_store = Boolean(True)
                     should_accum_lse = Boolean(True)
                     if apply_causal_mask:
-                        col_lim = (q_causal_offset + q_local + Int32(1)) // Int32(self.ratio)
-                        if k_local >= seqlen_k or k_local >= col_lim:
-                            should_store = Boolean(False)
-                            should_accum_lse = Boolean(False)
+                        if const_expr(self.q_causal_offset_mode == "token"):
+                            if q_local < seqlen_q:
+                                q_idx = q_stage_idx * self.q_tokens_per_stage + qi
+                                if k_local >= kv_limits[q_idx]:
+                                    should_store = Boolean(False)
+                                    should_accum_lse = Boolean(False)
+                        else:
+                            col_lim = (q_causal_offset + q_local + Int32(1)) // Int32(self.ratio)
+                            if k_local >= seqlen_k or k_local >= col_lim:
+                                should_store = Boolean(False)
+                                should_accum_lse = Boolean(False)
                     elif k_local >= seqlen_k:
                         should_store = Boolean(False)
                         should_accum_lse = Boolean(False)
@@ -594,11 +632,21 @@ class IndexerForwardSm90:
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
-        q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
+        q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None or self.q_causal_offset_mode == "token") else mQCausalOffsets[batch_idx]
         num_m_blocks = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m)
         if block_x < num_m_blocks:
             m_block = num_m_blocks - Int32(1) - block_x
-            n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
+            if const_expr(self.q_causal_offset_mode == "token"):
+                _, _, kv_limit_max = self._compute_per_token_k_limits(
+                    m_block,
+                    seqlen.seqlen_q,
+                    seqlen.seqlen_k,
+                    seqlen.offset_q,
+                    mQCausalOffsets,
+                )
+                n_block_max = cute.ceil_div(kv_limit_max, self.tile_n)
+            else:
+                n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
 
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx]
@@ -645,7 +693,10 @@ class IndexerForwardSm90:
                 else:
                     while iter_idx < n_block_max:
                         stage = iter_idx & Int32(1)
-                        n_block = self._iter_n_block(iter_idx, n_block_max)
+                        if const_expr(self.q_causal_offset_mode == "token"):
+                            n_block = n_block_max - Int32(1) - iter_idx
+                        else:
+                            n_block = self._iter_n_block(iter_idx, n_block_max)
                         if iter_idx >= Int32(2):
                             if stage == Int32(0):
                                 cute.arch.mbarrier_wait(mbar_KVEmpty0_ptr, kve0_phase)
@@ -727,11 +778,25 @@ class IndexerForwardSm90:
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
-        q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
+        q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None or self.q_causal_offset_mode == "token") else mQCausalOffsets[batch_idx]
         num_m_blocks = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m)
         if block_x < num_m_blocks:
             m_block = num_m_blocks - Int32(1) - block_x
-            n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
+            if const_expr(self.q_causal_offset_mode == "token"):
+                r_kv_limits, kv_limit_min, kv_limit_max = self._compute_per_token_k_limits(
+                    m_block,
+                    seqlen.seqlen_q,
+                    seqlen.seqlen_k,
+                    seqlen.offset_q,
+                    mQCausalOffsets,
+                )
+                n_block_max = cute.ceil_div(kv_limit_max, self.tile_n)
+                masked_block_count = n_block_max - kv_limit_min // Int32(self.tile_n)
+            else:
+                r_kv_limits = mQCausalOffsets
+                kv_limit_min = Int32(0)
+                n_block_max = self._compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
+                masked_block_count = Int32(0)
 
             thr_mma = tiled_mma_QK.get_slice(wg_tidx)
             tSrQ0, tSrK = _mma_partition_fragment_AB(thr_mma, sQ_0, sKV_staged, self.swap_AB)
@@ -775,7 +840,10 @@ class IndexerForwardSm90:
             iter_idx = Int32(0)
             while iter_idx < n_block_max:
                 stage = iter_idx & Int32(1)
-                n_block = self._iter_n_block(iter_idx, n_block_max)
+                if const_expr(self.q_causal_offset_mode == "token"):
+                    n_block = n_block_max - Int32(1) - iter_idx
+                else:
+                    n_block = self._iter_n_block(iter_idx, n_block_max)
                 if stage == Int32(0):
                     cute.arch.mbarrier_wait(mbar_KV0_ptr, kv0_phase)
                     kv0_phase = kv0_phase ^ Int32(1)
@@ -819,7 +887,10 @@ class IndexerForwardSm90:
                             with cute.arch.elect_one():
                                 cute.arch.mbarrier_arrive(mbar_KVEmpty1_ptr, arrive_count=128)
 
-                apply_causal_mask = Boolean(iter_idx < Int32(2)) if const_expr(self.mask_two_rightmost_nblocks) else Boolean(iter_idx == Int32(0))
+                if const_expr(self.q_causal_offset_mode == "token"):
+                    apply_causal_mask = Boolean(iter_idx < masked_block_count)
+                else:
+                    apply_causal_mask = Boolean(iter_idx < Int32(2)) if const_expr(self.mask_two_rightmost_nblocks) else Boolean(iter_idx == Int32(0))
                 if const_expr(self.use_fp8_scales):
                     self._epilogue_store_to_gmem(
                         0,
@@ -836,6 +907,7 @@ class IndexerForwardSm90:
                         seqlen.offset_q,
                         batch_idx,
                         q_causal_offset,
+                        r_kv_limits,
                         sm_scale,
                         Int32(0),
                         lse_max0 if const_expr(self.compute_lse) else None,
@@ -856,6 +928,7 @@ class IndexerForwardSm90:
                         seqlen.offset_q,
                         batch_idx,
                         q_causal_offset,
+                        r_kv_limits,
                         sm_scale,
                         Int32(0),
                         lse_max1 if const_expr(self.compute_lse) else None,
@@ -877,6 +950,7 @@ class IndexerForwardSm90:
                         seqlen.offset_q,
                         batch_idx,
                         q_causal_offset,
+                        r_kv_limits,
                         sm_scale,
                         Int32(0),
                         lse_max0 if const_expr(self.compute_lse) else None,
@@ -897,6 +971,7 @@ class IndexerForwardSm90:
                         seqlen.offset_q,
                         batch_idx,
                         q_causal_offset,
+                        r_kv_limits,
                         sm_scale,
                         Int32(0),
                         lse_max1 if const_expr(self.compute_lse) else None,
@@ -1110,6 +1185,7 @@ class IndexerForwardSm90:
                         seqlen.offset_q,
                         batch_idx,
                         q_causal_offset,
+                        mQCausalOffsets,
                         sm_scale,
                         Int32(0),
                         lse_max if const_expr(self.compute_lse) else None,

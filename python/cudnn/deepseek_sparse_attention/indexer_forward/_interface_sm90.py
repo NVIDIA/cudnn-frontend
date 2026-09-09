@@ -180,7 +180,21 @@ def indexer_fwd(
     assert qhead_per_kv_head == n_heads_q // n_heads_kv
     supported_qhpkv = _SUPPORTED_FP8_QHPKV if use_fp8_scales else _SUPPORTED_QHPKV
     assert qhead_per_kv_head in supported_qhpkv, f"qhead_per_kv_head must be one of {supported_qhpkv}, got {qhead_per_kv_head}"
-    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch_size), q.device, stream=current_stream)
+    q_causal_offsets = validate_q_causal_offsets(
+        q_causal_offsets,
+        int(batch_size),
+        q.device,
+        stream=current_stream,
+        total_q=int(total_q) if is_varlen else None,
+    )
+    if q_causal_offsets is None:
+        q_causal_offset_mode = "none"
+    elif is_varlen and q_causal_offsets.shape[0] != int(batch_size):
+        q_causal_offset_mode = "token"
+    else:
+        q_causal_offset_mode = "sequence"
+    if q_causal_offset_mode == "token" and precision != "bf16":
+        raise ValueError("THD per-token q_causal_offsets currently require precision='bf16'")
 
     if out is None:
         with _torch_stream_context(current_stream):
@@ -222,7 +236,7 @@ def indexer_fwd(
         get_broadcast_dims(w),
         get_broadcast_dims(q_scale) if q_scale is not None else None,
         get_broadcast_dims(k_scale) if k_scale is not None else None,
-        q_causal_offsets is not None,
+        q_causal_offset_mode,
     )
     if compile_key not in _compile_cache:
         q_cute = _to_cute_tensor(q)
@@ -234,7 +248,7 @@ def indexer_fwd(
         lse_cute = _to_cute_tensor(lse_out) if compute_lse else None
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
-        q_offsets_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
+        q_offsets_cute = _to_cute_tensor(q_causal_offsets, assumed_align=4, leading_dim=0) if q_causal_offsets is not None else None
         kernel_obj = IndexerForwardSm90(
             torch2cute_dtype_map[q.dtype],
             torch2cute_dtype_map[w.dtype],
@@ -245,6 +259,7 @@ def indexer_fwd(
             use_unchecked_qh64=use_unchecked_qh64,
             use_unchecked_qh64_masked=use_unchecked_qh64_masked,
             compute_lse=compute_lse,
+            q_causal_offset_mode=q_causal_offset_mode,
         )
         _compile_cache[compile_key] = cute.compile(
             kernel_obj,

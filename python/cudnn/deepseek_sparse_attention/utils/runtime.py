@@ -35,13 +35,16 @@ def validate_q_causal_offsets(
     batch: int,
     device: torch.device,
     stream: Optional[cuda.CUstream] = None,
+    total_q: Optional[int] = None,
 ) -> torch.Tensor | None:
     if q_causal_offsets is None:
         return None
     if q_causal_offsets.dtype != torch.int32:
         raise ValueError("q_causal_offsets must be int32")
-    if q_causal_offsets.ndim != 1 or q_causal_offsets.shape[0] != batch:
-        raise ValueError(f"q_causal_offsets must have shape ({batch},), got {tuple(q_causal_offsets.shape)}")
+    valid_lengths = (batch,) if total_q is None or total_q == batch else (batch, total_q)
+    if q_causal_offsets.ndim != 1 or q_causal_offsets.shape[0] not in valid_lengths:
+        expected = f"({batch},)" if len(valid_lengths) == 1 else f"({batch},) or ({total_q},)"
+        raise ValueError(f"q_causal_offsets must have shape {expected}, got {tuple(q_causal_offsets.shape)}")
     if not q_causal_offsets.is_cuda:
         raise ValueError("q_causal_offsets must be a CUDA tensor")
     if q_causal_offsets.device != device:

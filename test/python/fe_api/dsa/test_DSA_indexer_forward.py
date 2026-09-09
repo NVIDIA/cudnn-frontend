@@ -21,6 +21,7 @@ from fe_api.dsa.dsa_utils import (
 from fe_api.dsa.dsa_reference import (
     check_ref_compressed_topk,
     check_ref_indexer_forward,
+    check_ref_indexer_forward_thd,
     ref_indexer_forward,
 )
 
@@ -710,3 +711,251 @@ def test_DSA_indexer_forward_wrapper_fp8_sm90_thd_matches_dequant_reference():
         )
         if s_k < max(k_lengths):
             assert bool(torch.isneginf(result["scores"][q0:q1, s_k:]).all())
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=15)
+def test_DSA_indexer_forward_wrapper_thd_per_token_offsets_nonmonotonic():
+    major = torch.cuda.get_device_capability()[0]
+    if major not in (9, 10):
+        pytest.skip("DSA indexer forward requires SM90 or SM100")
+
+    from cudnn import DSA
+
+    device = torch.device("cuda")
+    ratio, h_q, h_kv, d = 4, 32, 1, 128
+    q_lengths = [7, 11]
+    k_lengths = [650, 533]
+    max_seqlen_k = max(k_lengths)
+    cu_seqlens_q = torch.tensor([0, 7, 18], dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.tensor([0, 650, 1183], dtype=torch.int32, device=device)
+    total_q, total_k = sum(q_lengths), sum(k_lengths)
+    q = torch.randn(total_q, h_q, d, dtype=torch.bfloat16, device=device)
+    k = torch.randn(total_k, h_kv, d, dtype=torch.bfloat16, device=device)
+    w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device)
+
+    # Each sequence begins with non-monotonic source positions in one CTA.
+    # The late row requires K blocks that the last row does not, while the
+    # early rows must remain masked in intermediate K blocks. Negative deltas
+    # and ragged CTA tails are present in both sequences.
+    q_causal_offsets = torch.tensor(
+        [
+            3,
+            2558,
+            -1,
+            252,
+            507,
+            2,
+            1017,
+            1279,
+            14,
+            2117,
+            60,
+            507,
+            -5,
+            1694,
+            24,
+            1015,
+            -7,
+            1790,
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    scores = DSA.indexer_forward_wrapper(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        qhead_per_kv_head=h_q,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max_seqlen_k,
+        q_causal_offsets=q_causal_offsets,
+    )["scores"]
+    torch.cuda.synchronize()
+
+    assert scores.shape == (total_q, max_seqlen_k)
+    assert bool(torch.isfinite(scores[0, 0]))
+    assert bool(torch.isneginf(scores[0, 1]))
+    assert bool(torch.isfinite(scores[1, 639]))
+    assert bool(torch.isneginf(scores[1, 640]))
+    assert bool(torch.isneginf(scores[0, 128]))
+    assert bool(torch.isfinite(scores[9, 529]))
+    assert bool(torch.isneginf(scores[9, 530]))
+    assert bool(torch.isneginf(scores[7:, k_lengths[1] :]).all())
+    check_ref_indexer_forward_thd(
+        q,
+        k,
+        w,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_k,
+        scores,
+        ratio,
+        q_causal_offsets,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=16)
+def test_DSA_indexer_forward_wrapper_thd_offset_modes_and_compile_cache():
+    major = torch.cuda.get_device_capability()[0]
+    if major not in (9, 10):
+        pytest.skip("DSA indexer forward requires SM90 or SM100")
+
+    from cudnn import DSA
+
+    device = torch.device("cuda")
+    ratio, h_q, h_kv, d = 4, 32, 1, 128
+    q_lengths = [5, 9]
+    k_lengths = [36, 41]
+    cu_seqlens_q = torch.tensor([0, 5, 14], dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.tensor([0, 36, 77], dtype=torch.int32, device=device)
+    total_q, total_k = sum(q_lengths), sum(k_lengths)
+    max_seqlen_k = max(k_lengths)
+    q = torch.randn(total_q, h_q, d, dtype=torch.bfloat16, device=device)
+    k = torch.randn(total_k, h_kv, d, dtype=torch.bfloat16, device=device)
+    w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device)
+    sequence_offsets = torch.tensor([140, -4], dtype=torch.int32, device=device)
+    token_offsets = torch.tensor(
+        [140] * q_lengths[0] + [-4] * q_lengths[1],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    def run(offsets):
+        return DSA.indexer_forward_wrapper(
+            q,
+            k,
+            w,
+            ratio=ratio,
+            qhead_per_kv_head=h_q,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max(q_lengths),
+            max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=offsets,
+        )["scores"]
+
+    # Keep this order: it catches compile-cache keys that distinguish only
+    # offset-present versus offset-absent instead of sequence versus token.
+    scores_sequence_first = run(sequence_offsets)
+    scores_token = run(token_offsets)
+    scores_sequence_again = run(sequence_offsets)
+    scores_none = run(None)
+    torch.cuda.synchronize()
+
+    check_ref_indexer_forward_thd(
+        q,
+        k,
+        w,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_k,
+        scores_token,
+        ratio,
+        token_offsets,
+    )
+    check_ref_indexer_forward_thd(
+        q,
+        k,
+        w,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_k,
+        scores_none,
+        ratio,
+        torch.zeros_like(token_offsets),
+    )
+    torch.testing.assert_close(scores_sequence_first, scores_token)
+    torch.testing.assert_close(scores_sequence_again, scores_token)
+    assert bool(torch.isneginf(scores_token[: q_lengths[0], k_lengths[0] :]).all())
+
+    q_bshd = torch.randn(2, 4, h_q, d, dtype=torch.bfloat16, device=device)
+    k_bshd = torch.randn(2, 8, h_kv, d, dtype=torch.bfloat16, device=device)
+    w_bshd = torch.randn(2, 4, h_q, dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match=r"must have shape \(2,\)"):
+        DSA.indexer_forward_wrapper(
+            q_bshd,
+            k_bshd,
+            w_bshd,
+            ratio=ratio,
+            qhead_per_kv_head=h_q,
+            q_causal_offsets=torch.zeros(8, dtype=torch.int32, device=device),
+        )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=17)
+def test_DSA_indexer_forward_wrapper_thd_per_token_offsets_cuda_graph_replay():
+    major = torch.cuda.get_device_capability()[0]
+    if major not in (9, 10):
+        pytest.skip("DSA indexer forward requires SM90 or SM100")
+
+    from cudnn import DSA
+
+    device = torch.device("cuda")
+    ratio, h_q, h_kv, d = 4, 32, 1, 128
+    q_lengths = [6, 10]
+    k_lengths = [132, 140]
+    cu_seqlens_q = torch.tensor([0, 6, 16], dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.tensor([0, 132, 272], dtype=torch.int32, device=device)
+    total_q, total_k = sum(q_lengths), sum(k_lengths)
+    max_seqlen_k = max(k_lengths)
+    q = torch.randn(total_q, h_q, d, dtype=torch.bfloat16, device=device)
+    k = torch.randn(total_k, h_kv, d, dtype=torch.bfloat16, device=device)
+    w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device)
+    q_causal_offset_storage = torch.empty(total_q + 1, dtype=torch.int32, device=device)
+    q_causal_offsets = q_causal_offset_storage[1:]
+    q_causal_offsets.fill_(508)
+    assert q_causal_offsets.is_contiguous()
+    assert q_causal_offsets.data_ptr() % 16 == 4
+    updated_offsets = torch.tensor(
+        [3, 522, -2, 252, 387, 6, 551, 2, 507, -4, 379, 14, 531, -8, 260, 19],
+        dtype=torch.int32,
+        device=device,
+    )
+    scores = torch.empty(total_q, max_seqlen_k, dtype=torch.float32, device=device)
+
+    def run():
+        return DSA.indexer_forward_wrapper(
+            q,
+            k,
+            w,
+            ratio=ratio,
+            qhead_per_kv_head=h_q,
+            out=scores,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max(q_lengths),
+            max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+        )["scores"]
+
+    run()  # JIT compilation is intentionally outside capture.
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_scores = run()
+    torch.cuda.synchronize()
+    initial_mask = torch.isneginf(captured_scores).clone()
+
+    q_causal_offsets.copy_(updated_offsets)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert not torch.equal(initial_mask, torch.isneginf(captured_scores))
+    check_ref_indexer_forward_thd(
+        q,
+        k,
+        w,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_k,
+        captured_scores,
+        ratio,
+        updated_offsets,
+    )
