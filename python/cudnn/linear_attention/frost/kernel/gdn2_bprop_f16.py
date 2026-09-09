@@ -43,7 +43,7 @@ from cudnn.frost.tile_dsl.barrier import (
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ss, mma_step, mma_ts_step
-from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b, swizzle_xor_128b_seg, swizzle_xor_32b
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b, swizzle_xor_32b
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.pointwise import (
     sigmoid,
@@ -1824,16 +1824,10 @@ def compute0_warp_group(
                     exp_g1 = cute.math.exp2(prefix1, fastmath=True)
                     if channel_active:
                         (
-                            sGate_exchange_ptr
-                            + f32_segment * (cfg.b_t * 32)
-                            + row0 * 32
-                            + swizzle_xor_128b_seg(row0, f32_segment, f32_segment_dim, elem_bytes=4)
+                            sGate_exchange_ptr + f32_segment * (cfg.b_t * 32) + row0 * 32 + swizzle_xor_128b(row0 ^ f32_segment, f32_segment_dim, elem_bytes=4)
                         ).store(exp_g0)
                         (
-                            sGate_exchange_ptr
-                            + f32_segment * (cfg.b_t * 32)
-                            + row1 * 32
-                            + swizzle_xor_128b_seg(row1, f32_segment, f32_segment_dim, elem_bytes=4)
+                            sGate_exchange_ptr + f32_segment * (cfg.b_t * 32) + row1 * 32 + swizzle_xor_128b(row1 ^ f32_segment, f32_segment_dim, elem_bytes=4)
                         ).store(exp_g1)
                     prefix_acc = prefix1
                     exp_g_last = exp_g1
@@ -1858,8 +1852,8 @@ def compute0_warp_group(
                 for row_pair in cutlass.range_constexpr(cfg.b_t // 2):
                     row0 = row_pair * 2
                     row1 = row0 + 1
-                    prefix_idx0 = f32_segment * (cfg.b_t * 32) + row0 * 32 + swizzle_xor_128b_seg(row0, f32_segment, f32_segment_dim, elem_bytes=4)
-                    prefix_idx1 = f32_segment * (cfg.b_t * 32) + row1 * 32 + swizzle_xor_128b_seg(row1, f32_segment, f32_segment_dim, elem_bytes=4)
+                    prefix_idx0 = f32_segment * (cfg.b_t * 32) + row0 * 32 + swizzle_xor_128b(row0 ^ f32_segment, f32_segment_dim, elem_bytes=4)
+                    prefix_idx1 = f32_segment * (cfg.b_t * 32) + row1 * 32 + swizzle_xor_128b(row1 ^ f32_segment, f32_segment_dim, elem_bytes=4)
                     gate0 = gate_conditioned[row0]
                     gate1 = gate_conditioned[row1]
                     pair_vec = nvvm.add_packed_f32x2(
@@ -2010,7 +2004,7 @@ def compute0_warp_group(
                     f32_dim_base = dim_base + f32_group * 4
                     f32_segment = f32_dim_base // 32
                     f32_segment_dim = f32_dim_base - f32_segment * 32
-                    g_prefix_idx = f32_segment * (cfg.b_t * 32) + decay_row * 32 + swizzle_xor_128b_seg(decay_row, f32_segment, f32_segment_dim, elem_bytes=4)
+                    g_prefix_idx = f32_segment * (cfg.b_t * 32) + decay_row * 32 + swizzle_xor_128b(decay_row ^ f32_segment, f32_segment_dim, elem_bytes=4)
                     exp_g_frag = (gate_prefix_ptr + g_prefix_idx).load(count=4, alignment=16)
                     f32_reg_base = reg_base + f32_group * 4
                     exp_g_regs[f32_reg_base] = exp_g_frag[0]
@@ -2740,7 +2734,7 @@ def compute2_warp_group(
                         for n in cutlass.range_constexpr(2):
                             token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
                             eg_frag[rep * 4 + cs * 2 + n] = (
-                                sGate_exchange_ptr + seg_cs * (cfg.b_t * 32) + token * 32 + swizzle_xor_128b_seg(token, seg_cs, dim_cs, elem_bytes=4)
+                                sGate_exchange_ptr + seg_cs * (cfg.b_t * 32) + token * 32 + swizzle_xor_128b(token ^ seg_cs, dim_cs, elem_bytes=4)
                             ).load()
             else:
                 f32_seg = channel // 32
@@ -2749,7 +2743,7 @@ def compute2_warp_group(
                 f16_dim = channel - f16_seg * 64
                 eg = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
                 for t in cutlass.range_constexpr(cfg.b_t):
-                    eg[t] = (sGate_exchange_ptr + f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b_seg(t, f32_seg, f32_dim, elem_bytes=4)).load()
+                    eg[t] = (sGate_exchange_ptr + f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t ^ f32_seg, f32_dim, elem_bytes=4)).load()
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_gate_done[raw_stage].arrive()
 

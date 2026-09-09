@@ -281,8 +281,8 @@ are close.
   `use_beta_sigmoid`; the cuTile engine remains the fallback for non-128
   head dims. The `gate_domain` attribute (`"log"`, the default, or
   `"linear"`) selects whether `g` is `ln(alpha)` or `alpha` itself; the
-  FROST GDN / GDP / GDN-2 engines serve `"linear"` (forward and backward,
-  `dG` with respect to `alpha`); the cuTile engine and KDA are log-only.
+  FROST GDN / KDA / GDP / GDN-2 engines serve `"linear"` (forward and
+  backward, `dG` with respect to `alpha`); the cuTile engines are log-only.
 - `KdaFrostEngine` / `KdaCuTileEngine` do the same for the single-node
   `kda` / `kda_bwd` ops (Kimi Delta Attention). KDA is GDN with a
   per-key-channel decay: its `g` is the log-space vector gate

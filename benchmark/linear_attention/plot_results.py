@@ -33,9 +33,6 @@ BACKEND_CONFIG = {
     "cudnn_state_on": {"name": "cuDNN (state on)", "color": "#2f6e00", "order": 4},
 }
 
-# Backends dropped from every chart (rows may still exist in older CSVs).
-UNAVAILABLE_BACKENDS = ("cudnn_batch_invariant",)
-
 LABEL_FONT_SIZE = 10
 LEGEND_FONT_SIZE = 8
 TITLE_FONT_SIZE = 12
@@ -110,7 +107,6 @@ def generate_charts(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     df = df[df["variant"] == variant].copy()
-    df = df[~df["backend"].isin(UNAVAILABLE_BACKENDS)].copy()
     if batch_sizes:
         df = df[df["batch_size"].isin(batch_sizes)].copy()
     if df.empty:
@@ -223,7 +219,7 @@ def main():
     parser.add_argument(
         "--stem",
         default=None,
-        help="Output file stem before the metric suffix (default: <variant>_fixed_batch / <variant>_fixed_seq when the CSV pins the group axis, else per-group stems); required when a CSV pins batch AND heads, e.g. <variant>_b1_h16",
+        help="Output file stem before the metric suffix (default: <variant>_fixed_batch / <variant>_fixed_seq when the CSV pins the group axis, else per-group stems); required when a CSV pins batch AND heads, e.g. <variant>_low_bh",
     )
     args = parser.parse_args()
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")] if args.batch_sizes else None

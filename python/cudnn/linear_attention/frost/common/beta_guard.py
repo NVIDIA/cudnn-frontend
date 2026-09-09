@@ -23,7 +23,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 
-from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b_seg
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b
 
 GUARD_MARGIN = 1.0 / 32
 GUARD_QUANT_TOL_MULT = 4.0
@@ -57,8 +57,8 @@ def beta_guard(
             f32_dim_base = dim_base + f32_group * 4
             f32_segment = f32_dim_base // 32
             f32_segment_dim = f32_dim_base - f32_segment * 32
-            row_idx = f32_segment * (cfg.b_t * 32) + decay_row * 32 + swizzle_xor_128b_seg(decay_row, f32_segment, f32_segment_dim, elem_bytes=4)
-            prev_idx = f32_segment * (cfg.b_t * 32) + prev_row * 32 + swizzle_xor_128b_seg(prev_row, f32_segment, f32_segment_dim, elem_bytes=4)
+            row_idx = f32_segment * (cfg.b_t * 32) + decay_row * 32 + swizzle_xor_128b(decay_row ^ f32_segment, f32_segment_dim, elem_bytes=4)
+            prev_idx = f32_segment * (cfg.b_t * 32) + prev_row * 32 + swizzle_xor_128b(prev_row ^ f32_segment, f32_segment_dim, elem_bytes=4)
             exp_g_frag = (gate_prefix_ptr + row_idx).load(count=4, alignment=16)
             exp_g_prev_frag = (gate_prefix_ptr + prev_idx).load(count=4, alignment=16)
             for elem in cutlass.range_constexpr(4):

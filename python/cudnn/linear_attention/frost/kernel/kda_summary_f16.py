@@ -52,7 +52,7 @@ from cudnn.frost.tile_dsl.barrier import (
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mma import desc_opaque, mma_step, mma_ts_step
-from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b, swizzle_xor_128b_seg, swizzle_xor_32b
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b, swizzle_xor_32b
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.pointwise import (
     opaque_i32,
@@ -808,7 +808,7 @@ def cg0_state_stage_left(cfg, chain, cum_chunk, chunk_count, local_chunk_idx, ro
                 scale_idx = (
                     scale_segment * (cfg.b_t * 32)
                     + (cfg.b_t - 1) * 32
-                    + swizzle_xor_128b_seg(cfg.b_t - 1, scale_segment, scale_dim - scale_segment * 32, elem_bytes=4)
+                    + swizzle_xor_128b(cfg.b_t - 1 ^ scale_segment, scale_dim - scale_segment * 32, elem_bytes=4)
                 )
                 l_scale_frag = (sGate_exchange_ptr + scale_idx).load(count=4, alignment=16)
                 for t in cutlass.range_constexpr(2):
@@ -886,7 +886,7 @@ def compute0_warp_group(
     prefix_segment = channel_dim // 32
     prefix_seg_base = prefix_segment * (cfg.b_t * 32)
     prefix_col = channel_dim - prefix_segment * 32
-    prefix_row_offsets = [opaque_i32(prefix_seg_base + swizzle_xor_128b_seg(j, prefix_segment, prefix_col, elem_bytes=4)) for j in range(8)]
+    prefix_row_offsets = [opaque_i32(prefix_seg_base + swizzle_xor_128b(j ^ prefix_segment, prefix_col, elem_bytes=4)) for j in range(8)]
     if cutlass.const_expr(cfg.gate_dtype == cutlass.Float32):
         gate_row_offsets = [opaque_i32(prefix_seg_base + swizzle_xor_128b(j, prefix_col, elem_bytes=4)) for j in range(8)]
     else:
@@ -988,7 +988,7 @@ def compute0_warp_group(
                 if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
                     row = store_row_base + cutlass.Int32(row_off)
                     value = g_prefix_regs[row_off + cfg.b_t // 2] if lane_idx >= cutlass.Int32(channel_rows) else g_prefix_regs[row_off]
-                    prefix_idx = prefix_seg_base + swizzle_xor_128b_seg(row, prefix_segment, row * 32 + prefix_col, elem_bytes=4)
+                    prefix_idx = prefix_seg_base + swizzle_xor_128b(row ^ prefix_segment, row * 32 + prefix_col, elem_bytes=4)
                 else:
                     value = g_prefix_regs[row_off]
                     prefix_idx = prefix_row_offsets[row_off % 8] + row_off * 32
@@ -1041,7 +1041,7 @@ def compute0_warp_group(
                     f32_dim_base = dim_base + f32_group * 4
                     f32_segment = f32_dim_base // 32
                     f32_segment_dim = f32_dim_base - f32_segment * 32
-                    g_prefix_idx = f32_segment * (cfg.b_t * 32) + decay_row * 32 + swizzle_xor_128b_seg(decay_row, f32_segment, f32_segment_dim, elem_bytes=4)
+                    g_prefix_idx = f32_segment * (cfg.b_t * 32) + decay_row * 32 + swizzle_xor_128b(decay_row ^ f32_segment, f32_segment_dim, elem_bytes=4)
                     exp_g_frag = (sGate_exchange_ptr + g_prefix_idx).load(count=4, alignment=16)
                     f32_reg_base = reg_base + f32_group * 4
                     for j in cutlass.range_constexpr(4):
@@ -1058,7 +1058,7 @@ def compute0_warp_group(
                     f32_segment = f32_dim_base // 32
                     f32_segment_dim = f32_dim_base - f32_segment * 32
                     exp_g_last_idx = (
-                        f32_segment * (cfg.b_t * 32) + (cfg.b_t - 1) * 32 + swizzle_xor_128b_seg(cfg.b_t - 1, f32_segment, f32_segment_dim, elem_bytes=4)
+                        f32_segment * (cfg.b_t * 32) + (cfg.b_t - 1) * 32 + swizzle_xor_128b(cfg.b_t - 1 ^ f32_segment, f32_segment_dim, elem_bytes=4)
                     )
                     exp_g_last_frag = (sGate_exchange_ptr + exp_g_last_idx).load(count=4, alignment=16)
                     for j in cutlass.range_constexpr(4):
@@ -1202,7 +1202,7 @@ def cg1_seed_chain(cfg, chain, mState_init, batch_idx, head_o, value_dim, row_lo
                 seed_scale_idx = (
                     seed_scale_segment * (cfg.b_t * 32)
                     + (cfg.b_t - 1) * 32
-                    + swizzle_xor_128b_seg(cfg.b_t - 1, seed_scale_segment, seed_scale_dim - seed_scale_segment * 32, elem_bytes=4)
+                    + swizzle_xor_128b(cfg.b_t - 1 ^ seed_scale_segment, seed_scale_dim - seed_scale_segment * 32, elem_bytes=4)
                 )
                 seed_scale_frag = (seed_exchange_ptr + seed_scale_idx).load(count=4, alignment=16)
                 for t in cutlass.range_constexpr(2):
@@ -1270,7 +1270,7 @@ def cg1_state_stage_right(
             scale_idx = (
                 scale_segment * (cfg.b_t * 32)
                 + (cfg.b_t - 1) * 32
-                + swizzle_xor_128b_seg(cfg.b_t - 1, scale_segment, scale_dim - scale_segment * 32, elem_bytes=4)
+                + swizzle_xor_128b(cfg.b_t - 1 ^ scale_segment, scale_dim - scale_segment * 32, elem_bytes=4)
             )
             scale_frag = (sGate_exchange_ptr + scale_idx).load(count=4, alignment=16)
             for t in cutlass.range_constexpr(2):
