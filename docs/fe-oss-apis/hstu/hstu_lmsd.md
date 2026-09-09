@@ -88,14 +88,14 @@ another.
 | `y`, `dy` | `(N, SD)` | BF16 | `S = 1 + concat_u + concat_x`; `y` is contiguous; `dy` may have a padded row stride |
 | `mean`, `rstd` | `(N,)` | FP32 | contiguous |
 | `mask` | `(N, D)` or `None` | `int8` | contiguous when dropout is enabled; `None` otherwise |
-| `dx`, `du` | `(N, D)` | BF16 | contiguous |
+| `dx`, `du` | `(N, D)` | BF16 | inner stride 1; each output independently supports a padded row stride |
 | `dweight`, `dbias` | `(D,)` | BF16 | contiguous; dWeight may be `None` when disabled |
 
 For BF16 matrices with a padded row stride, each row must remain 16-byte
 aligned. A cached compiled implementation accepts any runtime `N` in the
-supported range. The `x`, `u`, and `dy` row strides are runtime values and do
-not participate in the compile-cache key; `D`, dtypes, devices, and feature
-flags remain plan-time configuration.
+supported range. The `x`, `u`, `dy`, `dx`, and `du` row strides are runtime
+values and do not participate in the compile-cache key; `D`, dtypes, devices,
+and feature flags remain plan-time configuration.
 
 The launch grid adapts to the runtime row count without changing the compiled
 plan. Forward caps its persistent row blocks by the device SM count. Backward

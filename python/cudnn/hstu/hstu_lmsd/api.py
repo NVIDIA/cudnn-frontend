@@ -518,7 +518,7 @@ class HSTULMSDBwd(_HSTULMSDBase):
         for desc, name in ((self.dx_desc, "dx"), (self.du_desc, "du")):
             if desc.shape != (n, d) or desc.dtype != x.dtype:
                 raise ValueError(f"{name} must have shape ({n}, {d}) and dtype {x.dtype}")
-            _require_matrix_layout(desc, name, row_stride=d)
+            _require_matrix_layout(desc, name)
         if self.compute_dweight:
             if self.dweight_desc is None or self.dweight_workspace_desc is None:
                 raise ValueError("dweight and dweight_workspace are required when compute_dweight is True")
@@ -568,8 +568,8 @@ class HSTULMSDBwd(_HSTULMSDBase):
         fake_x = self._fake_matrix(self.x_desc, rows, dynamic_row_stride=True)
         fake_u = self._fake_matrix(self.u_desc, rows, dynamic_row_stride=True)
         fake_mask = self._fake_matrix(self.mask_desc, rows) if self.has_dropout else fake_x
-        fake_dx = self._fake_matrix(self.dx_desc, rows)
-        fake_du = self._fake_matrix(self.du_desc, rows)
+        fake_dx = self._fake_matrix(self.dx_desc, rows, dynamic_row_stride=True)
+        fake_du = self._fake_matrix(self.du_desc, rows, dynamic_row_stride=True)
         fake_mean = self._fake_vector(self.mean_desc, rows)
         fake_rstd = self._fake_vector(self.rstd_desc, rows)
         main = cute.compile(
@@ -642,8 +642,8 @@ class HSTULMSDBwd(_HSTULMSDBase):
             (dy_tensor, self.dy_desc, "dy", True, True),
             (mean_tensor, self.mean_desc, "mean", True, False),
             (rstd_tensor, self.rstd_desc, "rstd", True, False),
-            (dx_tensor, self.dx_desc, "dx", True, False),
-            (du_tensor, self.du_desc, "du", True, False),
+            (dx_tensor, self.dx_desc, "dx", True, True),
+            (du_tensor, self.du_desc, "du", True, True),
             (dbias_tensor, self.dbias_desc, "dbias", False, False),
             (dbias_workspace, self.dbias_workspace_desc, "dbias_workspace", False, False),
         ]

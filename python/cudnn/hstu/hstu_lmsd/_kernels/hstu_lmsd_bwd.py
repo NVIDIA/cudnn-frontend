@@ -152,6 +152,8 @@ class HSTULMSDBackward:
             gDYLmsd_row = domain_offset_i64(row_coord, gDYLmsd)
             gX_row = domain_offset_i64(row_coord, gX)
             gU_row = domain_offset_i64(row_coord, gU)
+            gDX_row = domain_offset_i64(row_coord, gDX)
+            gDU_row = domain_offset_i64(row_coord, gDU)
             mean = gMean[row]
             rstd = gRstd[row]
             norm_bias = -mean * rstd
@@ -164,7 +166,6 @@ class HSTULMSDBackward:
                 rDirectDX = cute.make_rmem_tensor(self.vector_size, cutlass.Float32)
                 vector_index = j * self.threads_per_row + thread_in_row
                 if const_expr(self.hidden_size % (self.threads_per_row * self.vector_size) == 0) or vector_index < self.hidden_size // self.vector_size:
-                    tile_coord = ((None, None), (row_block, j))
                     row_tile_coord = ((None, None), (0, j))
                     tXgX = thread_copy.partition_S(gX_row[row_tile_coord])
                     tXgU = thread_copy.partition_S(gU_row[row_tile_coord])
@@ -189,7 +190,7 @@ class HSTULMSDBackward:
                     if const_expr(self.has_dropout):
                         cute.copy(mask_copy_atom, tXgMask, rMask)
 
-                    tXgDU = thread_copy.partition_D(gDU[tile_coord])
+                    tXgDU = thread_copy.partition_D(gDU_row[row_tile_coord])
                     rDU = cute.make_fragment_like(tXgDU)
                     for e in cutlass.range_constexpr(self.vector_size):
                         xf = rX[e].to(cutlass.Float32)
@@ -263,8 +264,8 @@ class HSTULMSDBackward:
             for j in cutlass.range_constexpr(num_column_tiles):
                 vector_index = j * self.threads_per_row + thread_in_row
                 if const_expr(self.hidden_size % (self.threads_per_row * self.vector_size) == 0) or vector_index < self.hidden_size // self.vector_size:
-                    tile_coord = ((None, None), (row_block, j))
-                    tXgDX = thread_copy.partition_D(gDX[tile_coord])
+                    row_tile_coord = ((None, None), (0, j))
+                    tXgDX = thread_copy.partition_D(gDX_row[row_tile_coord])
                     rDX = cute.make_fragment_like(tXgDX)
                     for e in cutlass.range_constexpr(self.vector_size):
                         rDX[e] = (rDirectDX_tiles[j][e] + (rWdy_tiles[j][e] - (rXhat_tiles[j][e] * sum_xhat_wdy + sum_wdy)) * rstd).to(gX.element_type)

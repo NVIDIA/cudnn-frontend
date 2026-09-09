@@ -61,6 +61,10 @@ def test_forward_outputs_feed_explicit_backward(d):
     weight = torch.randn((d,), device="cuda", dtype=torch.bfloat16)
     bias = torch.randn((d,), device="cuda", dtype=torch.bfloat16)
     dy = torch.randn((n, 3 * d), device="cuda", dtype=torch.bfloat16)
+    dx_storage = torch.empty((n, 2 * d), device="cuda", dtype=torch.bfloat16)
+    dx = dx_storage[:, :d]
+    du_storage = torch.empty((n, 5 * d), device="cuda", dtype=torch.bfloat16)
+    du = du_storage[:, :d]
 
     forward = hstu_lmsd_forward(x, u, weight, bias, eps=eps, dropout_ratio=p, seed=29)
     y, mean, rstd, mask = forward
@@ -80,6 +84,8 @@ def test_forward_outputs_feed_explicit_backward(d):
         apply_u_silu=True,
         concat_u=True,
         concat_x=True,
+        dx_tensor=dx,
+        du_tensor=du,
     )
     expected = hstu_lmsd_backward_reference(dy, x, u, weight, bias, mask, p, eps)
     tolerances = (
@@ -206,10 +212,10 @@ def test_wrappers_reuse_compiled_binaries_across_dynamic_n_and_row_strides(monke
     first_fwd_binary = first_bwd_binary = None
     try:
         cases = (
-            (37, 512, 2048, 1536),
-            (513, 1536, 2560, 2048),
+            (37, 512, 2048, 1536, 1024, 2560),
+            (513, 1536, 2560, 2048, 3072, 3584),
         )
-        for case, (n, x_row_stride, u_row_stride, dy_row_stride) in enumerate(cases):
+        for case, (n, x_row_stride, u_row_stride, dy_row_stride, dx_row_stride, du_row_stride) in enumerate(cases):
             torch.manual_seed(3100 + n)
             d, p, eps = 512, 0.1, 1e-6
             x_storage = torch.randn((n, x_row_stride), device="cuda", dtype=torch.bfloat16)
@@ -261,6 +267,10 @@ def test_wrappers_reuse_compiled_binaries_across_dynamic_n_and_row_strides(monke
 
             dy_storage = torch.randn((n, dy_row_stride), device="cuda", dtype=torch.bfloat16)
             dy = dy_storage[:, : 3 * d]
+            dx_storage = torch.empty((n, dx_row_stride), device="cuda", dtype=torch.bfloat16)
+            dx = dx_storage[:, :d]
+            du_storage = torch.empty((n, du_row_stride), device="cuda", dtype=torch.bfloat16)
+            du = du_storage[:, :d]
             actual = hstu_lmsd_backward(
                 dy,
                 x,
@@ -274,12 +284,16 @@ def test_wrappers_reuse_compiled_binaries_across_dynamic_n_and_row_strides(monke
                 apply_u_silu=True,
                 concat_u=True,
                 concat_x=True,
+                dx_tensor=dx,
+                du_tensor=du,
             )
             expected = hstu_lmsd_backward_reference(dy, x, u, weight, bias, mask, p, eps)
             assert actual["dx_tensor"].shape == (n, d)
             assert actual["du_tensor"].shape == (n, d)
             assert actual["dweight_tensor"].shape == (d,)
             assert actual["dbias_tensor"].shape == (d,)
+            assert actual["dx_tensor"].stride() == (dx_row_stride, 1)
+            assert actual["du_tensor"].stride() == (du_row_stride, 1)
             tolerances = (
                 (2.5e-2, 2.5e-2),
                 (2.5e-2, 2.5e-2),
@@ -306,6 +320,8 @@ def test_wrappers_reuse_compiled_binaries_across_dynamic_n_and_row_strides(monke
                 assert tuple(fwd_api.x_desc.stride) != tuple(x.stride())
                 assert tuple(fwd_api.u_desc.stride) != tuple(u.stride())
                 assert tuple(bwd_api.dy_desc.stride) != tuple(dy.stride())
+                assert tuple(bwd_api.dx_desc.stride) != tuple(dx.stride())
+                assert tuple(bwd_api.du_desc.stride) != tuple(du.stride())
 
         assert compile_calls == {"forward": 1, "backward": 1}
     finally:
