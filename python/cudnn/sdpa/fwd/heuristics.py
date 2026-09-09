@@ -58,6 +58,7 @@ from cudnn.frost.tile_dsl.constants import (
 from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
     cga_tile_m,
+    d192_short_bf16_lpt_region,
     d192_square_br_as_tl,
     d256_square_br_as_tl,
     pack_gqa_supported,
@@ -387,6 +388,11 @@ def select_d192_auto_knobs(
     window_left = params.window_left
     window_right = params.window_right
     top_left = not params.bottom_right or d192_square_br_as_tl(params, s_q=s_q, s_kv=s_kv)
+    # Plain LPT has lower scheduling overhead through seven square Q work
+    # units. At eight, the winner becomes grid-dependent, so keep LPT_L2.
+    # FALLBACK deliberately supplies NATURAL; only replace a balancing policy
+    # selected by the ordinary heuristic or standalone auto path.
+    bf16_short_dense_causal_lpt = params.sched_policy != SCHED_NATURAL and d192_short_bf16_lpt_region(params, s_q=s_q, s_kv=s_kv)
 
     mx_dense_mid_causal_cga1 = (
         mxfp8
@@ -397,7 +403,12 @@ def select_d192_auto_knobs(
         and 4096 < s_kv <= 8192
         and (params.dtype_qkv == DTYPE_E5M2 or s_q >= 4096)
     )
-    sched_policy = SCHED_NATURAL if mx_dense_mid_causal_cga1 else params.sched_policy
+    if bf16_short_dense_causal_lpt:
+        sched_policy = SCHED_LPT
+    elif mx_dense_mid_causal_cga1:
+        sched_policy = SCHED_NATURAL
+    else:
+        sched_policy = params.sched_policy
 
     pt_cga1 = (
         pertensor
@@ -473,10 +484,12 @@ def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm10
         window_left=facts.window_left,
         window_right=(facts.right_bound if facts.right_band_widening else 0 if facts.causal else None),
         bottom_right=facts.bottom_right,
+        has_sink=facts.has_sink,
         seq_kv_lens_present=facts.padded,
         seq_q_lens_present=facts.seq_q_trim,
         sched_policy=sched_policy,
         thd_varlen=facts.thd,
+        qh_per_kh=facts.h_q // facts.h_kv,
         split_kv=split_kv,
     )
 

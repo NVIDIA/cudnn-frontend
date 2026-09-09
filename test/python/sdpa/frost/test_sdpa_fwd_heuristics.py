@@ -14,15 +14,18 @@ from the caller workspace, recombines correctly (O and Stats), and its
 """
 
 import math
+from dataclasses import replace
 
 import pytest
 import torch
 
 import cudnn
 from cudnn.engines.base import PlanConfig
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16, SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams, derive_d192_internal_params
 from cudnn.sdpa.fwd import engines
 from cudnn.engines.heuristics import _assemble
-from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
+from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend, select_d192_auto_knobs
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 _F16 = "sdpa_fwd_prefill_sm100"
@@ -74,6 +77,65 @@ def test_recommend_primary_reproduces_the_derived_scheduler():
     dense_f16 = [p for p in dense if p.engine_id == 20500]
     assert dense_f16[0].knobs.sched_policy == 0  # SCHED_NATURAL
     assert all(p.knobs.sched_policy == 0 for p in dense_f16), "mask-free graphs gain nothing from LPT runners"
+
+
+@pytest.mark.L0
+def test_d192_bf16_short_causal_scheduler_is_scoped():
+    params = TemplateParams(
+        dtype_qkv=DTYPE_BF16,
+        dtype_o=DTYPE_BF16,
+        window_right=0,
+        sched_policy=SCHED_LPT_L2,
+        cta_mma=2,
+    )
+
+    for seq in (512, 2048, 3584):
+        assert select_d192_auto_knobs(params, pertensor=False, s_q=seq, s_kv=seq)[0] == SCHED_LPT
+    assert select_d192_auto_knobs(replace(params, sched_policy=SCHED_NATURAL), pertensor=False, s_q=2048, s_kv=2048)[0] == SCHED_NATURAL
+
+    unchanged = (
+        (params, 4096, 4096),
+        (params, 2048, 4096),
+        (replace(params, dtype_qkv=DTYPE_FP16, dtype_o=DTYPE_FP16), 2048, 2048),
+        (replace(params, has_sink=True), 2048, 2048),
+        (replace(params, qh_per_kh=8), 2048, 2048),
+        (replace(params, cta_mma=1), 2048, 2048),
+        (replace(params, window_right=None), 2048, 2048),
+        (replace(params, bottom_right=True), 2048, 2048),
+        (replace(params, window_left=1024), 2048, 2048),
+        (replace(params, thd_varlen=True), 2048, 2048),
+        (replace(params, seq_kv_lens_present=True), 2048, 2048),
+        (replace(params, seq_q_lens_present=True), 2048, 2048),
+    )
+    for other, s_q, s_kv in unchanged:
+        assert select_d192_auto_knobs(other, pertensor=False, s_q=s_q, s_kv=s_kv)[0] == SCHED_LPT_L2
+    assert select_d192_auto_knobs(replace(params, split_kv=2), pertensor=False, s_q=2048, s_kv=2048)[0] == SCHED_NATURAL
+
+    graph_cases = (
+        ({}, SCHED_LPT),
+        ({"has_sink": True}, SCHED_LPT_L2),
+        ({"h_q": 128, "h_kv": 16}, SCHED_LPT_L2),
+    )
+    for overrides, expected in graph_cases:
+        facts_kwargs = dict(
+            s_q=2048,
+            s_kv=2048,
+            h_q=128,
+            h_kv=128,
+            d_qk=192,
+            d_v=128,
+            dtype=cudnn.data_type.BFLOAT16,
+            dtype_o=cudnn.data_type.BFLOAT16,
+        )
+        facts_kwargs.update(overrides)
+        facts = _facts(**facts_kwargs)
+        plans = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
+        assert plans[0].knobs.sched_policy == expected
+
+    short_lpt = derive_d192_internal_params(replace(params, sched_policy=SCHED_LPT), pertensor=False, batch_size=2, h_q=128, s_q=2048, s_kv=2048)
+    long_lpt = derive_d192_internal_params(replace(params, sched_policy=SCHED_LPT), pertensor=False, batch_size=2, h_q=128, s_q=4096, s_kv=4096)
+    assert short_lpt.d192_short_bf16_lpt and short_lpt.lpt_q_tiles == 0
+    assert not long_lpt.d192_short_bf16_lpt and long_lpt.lpt_q_tiles == 0
 
 
 @pytest.mark.L0
@@ -267,9 +329,24 @@ def test_assemble_strips_mode_dedups_and_our_proposals_lead():
 
 @pytest.mark.L0
 def test_fallback_kind_is_least_demanding():
-    for p in recommend("FALLBACK", _facts(), _OFFERED):
-        assert p.knobs.split_kv == 1
-        assert p.knobs.sched_policy == 0  # SCHED_NATURAL
+    facts = (
+        _facts(),
+        _facts(
+            b=2,
+            h_q=8,
+            h_kv=8,
+            s_q=2048,
+            s_kv=2048,
+            d_qk=192,
+            d_v=128,
+            dtype=cudnn.data_type.BFLOAT16,
+            dtype_o=cudnn.data_type.BFLOAT16,
+        ),
+    )
+    for case in facts:
+        for p in recommend("FALLBACK", case, _OFFERED):
+            assert p.knobs.split_kv == 1
+            assert p.knobs.sched_policy == 0  # SCHED_NATURAL
 
 
 # ---------------------------------------------------------------------------

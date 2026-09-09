@@ -90,9 +90,11 @@ class TemplateParams:
     # Compile-time LPT head/batch grouping. Keep 1 unless the selected kernel
     # and concrete graph shape opt into a divisor of B*Hq.
     lpt_head_group: int = 1
-    # Dense FP8 kernels may specialize scheduler selection/decoding to the
-    # graph's compile-time number of query tiles. Zero keeps runtime derivation.
+    # D192 FP8 kernels may specialize grouped-LPT decoding to the graph's
+    # compile-time number of query tiles. Zero keeps runtime derivation.
     lpt_q_tiles: int = 0
+    # Selects the public-source schedule used by the short D192 BF16 LPT path.
+    d192_short_bf16_lpt: bool = False
     # Optional L2 working-set budget for SCHED_LPT_L2. Zero keeps the flavor's
     # default budget.
     lpt_l2_size_mib: int = 0
@@ -1095,6 +1097,28 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
             raise ValueError(msg)
 
 
+def d192_short_bf16_lpt_region(params: TemplateParams, *, s_q: int, s_kv: int) -> bool:
+    """Whether the measured short-sequence D192 BF16 LPT path applies."""
+
+    q_rows_per_cluster = cga_tile_m(192, params.cta_mma)
+    return (
+        params.dtype_qkv == DTYPE_BF16
+        and params.split_kv == 1
+        and not params.thd_varlen
+        and not params.seq_q_lens_present
+        and not params.seq_kv_lens_present
+        and not params.pack_gqa
+        and params.qh_per_kh == 1
+        and params.cta_mma == 2
+        and not params.has_sink
+        and params.window_left is None
+        and params.window_right == 0
+        and not params.bottom_right
+        and s_q == s_kv
+        and q_rows_per_cluster <= s_q <= 7 * q_rows_per_cluster
+    )
+
+
 def d192_square_br_as_tl(params: TemplateParams, *, s_q: int, s_kv: int) -> bool:
     """Whether a D192 bottom-right mask is exactly top-left causal."""
 
@@ -1157,6 +1181,7 @@ def derive_d192_internal_params(
     groups = batch_size * h_q // pack_gqa_ratio
     lpt_head_group = 8 if fp8 and not params.thd_varlen and groups % 8 == 0 else 1
     q_rows_per_cluster = cga_tile_m(192, params.cta_mma)
+    bf16_short_square_lpt = params.sched_policy == SCHED_LPT and d192_short_bf16_lpt_region(params, s_q=s_q, s_kv=s_kv)
     lpt_q_tiles = (s_q * pack_gqa_ratio + q_rows_per_cluster - 1) // q_rows_per_cluster if fp8 and not params.thd_varlen else 0
 
     lpt_l2_size_mib = 0
@@ -1174,6 +1199,7 @@ def derive_d192_internal_params(
         params,
         lpt_head_group=lpt_head_group,
         lpt_q_tiles=lpt_q_tiles,
+        d192_short_bf16_lpt=bf16_short_square_lpt,
         lpt_l2_size_mib=lpt_l2_size_mib,
     )
 
