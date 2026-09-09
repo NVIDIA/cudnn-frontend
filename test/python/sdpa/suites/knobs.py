@@ -371,6 +371,71 @@ def fp8_thd_fwd():
     )
 
 
+def fp8_lean():
+    # fp8 twin of lean_attn(): s_q=1 decode against a long KV (513..8192), the
+    # lean/split-KV regime, with padded layouts in the mix (fp8_decode() is
+    # dense-full only) — the recent SM100 split-KV fprop bugs lived exactly in
+    # long-KV small-b*h fp8 forward.
+    return dict(
+        batches=RandomBatchSize(min=1, max=32),
+        s_q_s_kv=RandomSequenceLength(
+            s_q_min=1,
+            s_q_max=1,
+            s_kv_min=513,
+            s_kv_max=8192,
+            s_q_distribution={"s_q=1": 100, "s_q=s_kv": 0, "s_q=random": 0},
+        ),
+        d_qk_d_v=RandomHiddenDimSize(
+            d_qk_min=64,
+            d_qk_max=192,
+            d_v_min=64,
+            d_v_max=128,
+            head_dim_distribution={"d_qk=d_v": 2, "d_qk=random": 1},
+            with_high_probability=[(64, 64), (128, 128), (192, 128)],
+        ),
+        head_count=RandomHeadGenerator(min=1, max=16, head_group_options=(1, 5, 2)),
+        data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
+        output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
+        diag_align=RandomChoice(DIAG_BOTH),
+        is_ragged_or_padded_or_full=RandomChoice({"padded": 1, "full": 1}),
+    )
+
+
+def fp8_thd_chunked():
+    # fp8 twin of thd_chunked(): packed THD query chunks (s_q <= 64) against a
+    # long KV history — the varlen continuation / chunked-prefill shape. d
+    # capped at 128: fp8 ragged THD with d_qk > 128 hangs the backend kernel
+    # (see model_knobs_fp8).
+    return dict(
+        batches=RandomBatchSize(min=1, max=16, with_high_probability=[1, 4]),
+        s_q_s_kv=RandomSequenceLength(
+            s_q_min=1,
+            s_q_max=64,
+            s_kv_min=1,
+            s_kv_max=8192,
+            s_q_distribution={"s_q=1": 3, "s_q=s_kv": 1, "s_q=random": 10},
+        ),
+        d_qk_d_v=RandomHiddenDimSize(
+            d_qk_min=64,
+            d_qk_max=128,
+            d_v_min=64,
+            d_v_max=128,
+            head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0},
+            with_high_probability=[(64, 64), (128, 128)],
+        ),
+        head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
+        data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
+        output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
+        diag_align=RandomChoice(DIAG_BR_HEAVY),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "cu_ragged": 1}),
+        with_sink_token=RandomChoice({True: 1, False: 2}),
+        total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
+        declare_total_seq_len=RandomChoice({True: 1, False: 1}),
+    )
+
+
 def fp8_paged():
     return dict(
         batches=RandomBatchSize(min=1, max=4, with_high_probability=[1, 2]),

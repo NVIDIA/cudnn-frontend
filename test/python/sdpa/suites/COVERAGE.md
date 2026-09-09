@@ -48,6 +48,8 @@ Conventions:
 | generation.f16.paged | f16 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, layout padded/cu_padded/ragged(THD Q + paged KV), block size 1..1024, sink | infer, s_q<=64, layout padded, paged KV |  |
 | generation.f16.thd_chunked | f16 | L0 | 256 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, stats token/head-major, total_q/kv slack, declare totals on graph, ragged token gaps | infer, s_q<=64, layout THD (ragged) | varlen chunked generation: packed THD chunks against long KV |
 | generation.fp8.decode | fp8 | L0 | 192 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, e4m3/e5m2 in, out fp8/fp16, diag TL/BR | infer, s_q=1, no mask, layout full |  |
+| generation.fp8.lean | fp8 | L0 | 128 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, e4m3/e5m2 in, out fp8/fp16, diag TL/BR, layout padded/full | infer, s_q=1, s_kv 513..8192, no mask | fp8 lean/split-KV decode regime; padded long-KV fp8 fwd is where the SM100 split-KV bugs lived |
+| generation.fp8.thd_chunked | fp8 | L0 | 192 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, e4m3/e5m2 in, out fp8/fp16, layout ragged/cu_ragged, sink, capacity slack, declared totals | infer, s_q<=64, layout THD (ragged), d<=128 (fp8 ragged d>128 hangs the backend) | varlen chunked generation, fp8: packed THD chunks against long KV |
 | generation.fp8.paged | fp8 | L0 | 128 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, e4m3/e5m2 in, out fp8/fp16, block size 16..128 | infer, no mask, diag TL, layout padded, paged KV |  |
 | models.llama31.generation.fp8 | fp8 | L0 | 8 | batch, seq lens, layout, mask flavor, data, e4m3/e5m2 in, out fp8/fp16, paged 50% | h_q=64, h_kv=8, d_qk=128, d_v=128 | llama31 full/global attention layers, fp8-trained flavor |
 | models.llama31.generation | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data, paged 50% | h_q=64, h_kv=8, d_qk=128, d_v=128, sink=off | llama31 full/global attention layers |
@@ -85,4 +87,4 @@ Conventions:
 | models.dsv3.bprop.mxfp8 | mxfp8 | L0 | 8 | batch, seq lens, mask flavor, data, e4m3/e5m2 in, out fp16/bf16 | h_q=128, h_kv=128, d_qk=192, d_v=128, layout full, SM100+ | SM>=100; dsv3 mxfp8 flavor; no generation (no decode-shaped mxfp8 engine) |
 | models.kimi_k3.bprop.mxfp8 | mxfp8 | L0 | 8 | batch, seq lens, mask flavor, data, e4m3/e5m2 in, out fp16/bf16 | h_q=96, h_kv=96, d_qk=192, d_v=128, layout full, SM100+ | SM>=100; kimi_k3 mxfp8 flavor; no generation (no decode-shaped mxfp8 engine) |
 
-**Total configs: 7232 across 57 suites.**
+**Total configs: 7552 across 59 suites.**

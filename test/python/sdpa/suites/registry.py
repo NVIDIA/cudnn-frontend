@@ -236,6 +236,47 @@ _SPECS = [
         pinned=("infer", "s_q=1", "no mask", "layout full"),
     ),
     SuiteSpec(
+        name="generation.fp8.lean",
+        phase="generation",
+        dtype="fp8",
+        level="L0",
+        num_tests=128,
+        rng_seed=994,
+        knobs=knobs.fp8_lean,
+        exec_kind="fp8",
+        fuzzed=_COMMON_FUZZ
+        + (
+            "e4m3/e5m2 in",
+            "out fp8/fp16",
+            "diag TL/BR",
+            "layout padded/full",
+        ),
+        pinned=("infer", "s_q=1", "s_kv 513..8192", "no mask"),
+        notes="fp8 lean/split-KV decode regime; padded long-KV fp8 fwd is where the SM100 split-KV bugs lived",
+    ),
+    SuiteSpec(
+        name="generation.fp8.thd_chunked",
+        phase="generation",
+        dtype="fp8",
+        level="L0",
+        num_tests=192,
+        rng_seed=991,
+        knobs=knobs.fp8_thd_chunked,
+        exec_kind="fp8",
+        fuzzed=_COMMON_FUZZ
+        + _MASK_FUZZ
+        + (
+            "e4m3/e5m2 in",
+            "out fp8/fp16",
+            "layout ragged/cu_ragged",
+            "sink",
+            "capacity slack",
+            "declared totals",
+        ),
+        pinned=("infer", "s_q<=64", "layout THD (ragged)", "d<=128 (fp8 ragged d>128 hangs the backend)"),
+        notes="varlen chunked generation, fp8: packed THD chunks against long KV",
+    ),
+    SuiteSpec(
         name="generation.fp8.paged",
         phase="generation",
         dtype="fp8",
