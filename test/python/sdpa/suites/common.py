@@ -6,11 +6,13 @@
 The framework is a registry-driven re-organization of the test_mhas_v2.py
 fuzz coverage:
 
-  - ``registry.py`` is the master list: every suite (what is fuzzed, what is
-    pinned, how many configs, which gates) is declared there as a SuiteSpec.
-  - ``knobs.py`` holds the named RandomizationContext knob-set factories.
-  - Test files under ``context/``, ``generation/``, ``bprop/`` and ``models/``
-    are thin shims: one function per suite, calling :func:`run_suite`.
+  - Test files under ``context/``, ``generation/`` and ``bprop/`` declare
+    their suites in place: knob factory + SuiteSpec + shim, exported via a
+    per-module ``SUITES`` list.
+  - ``registry.py`` aggregates those lists, generates the model suites from
+    ``models/catalog.py``, and exposes ``REGISTRY`` — the master lookup.
+  - ``knobs.py`` keeps only shared ingredients (mask/diag tables, the 16-bit
+    family draw, model knob factories).
   - ``COVERAGE.md`` is rendered from the registry by ``gen_coverage.py``.
 
 Seeds are fully deterministic (no environment-variable overrides): a suite's
@@ -76,11 +78,17 @@ class SuiteSpec:
         return make_seeds(num_tests=self.num_tests, rng_seed=self.rng_seed)
 
 
-def suite_seeds(name):
-    """Parametrize helper: seeds for a registered suite."""
+def suite_seeds(name_or_spec):
+    """Parametrize helper: seeds for a suite (SuiteSpec or registered name).
+
+    Passing the SuiteSpec object (the norm for the random suites, whose specs
+    live in the same test module) avoids importing the registry at collection
+    time — required, since the registry itself imports the test modules."""
+    if isinstance(name_or_spec, SuiteSpec):
+        return name_or_spec.seeds()
     from sdpa.suites.registry import REGISTRY
 
-    return REGISTRY[name].seeds()
+    return REGISTRY[name_or_spec].seeds()
 
 
 def model_params(phase):
@@ -131,13 +139,14 @@ def build_config(spec, test_no):
     return cfg, rng
 
 
-def run_suite(name, env_info, test_no, request, cudnn_handle):
-    from sdpa.suites.registry import REGISTRY
+def run_suite(spec, env_info, test_no, request, cudnn_handle):
+    if not isinstance(spec, SuiteSpec):  # registered name (model suites)
+        from sdpa.suites.registry import REGISTRY
 
-    spec = REGISTRY[name]
+        spec = REGISTRY[spec]
 
     if spec.min_sm is not None and torch.cuda.get_device_capability() < spec.min_sm:
-        pytest.skip(f"{name} requires SM >= {spec.min_sm}")
+        pytest.skip(f"{spec.name} requires SM >= {spec.min_sm}")
 
     cfg, rng = build_config(spec, test_no)
 
@@ -149,7 +158,34 @@ def run_suite(name, env_info, test_no, request, cudnn_handle):
     _EXEC[spec.exec_kind](cfg, request, cudnn_handle)
 
 
+# ---- shared fuzz-column vocabulary (SuiteSpec.fuzzed building blocks) -------
+
+COMMON_FUZZ = (
+    "batch",
+    "s_q/s_kv",
+    "d_qk/d_v",
+    "heads (MHA/GQA/MQA)",
+    "strides+gaps",
+    "data",
+)
+MASK_FUZZ = ("mask: causal/left/right/band/none", "diag TL/BR")
+THD_FUZZ = (
+    "stats token/head-major",
+    "total_q/kv slack",
+    "declare totals on graph",
+    "ragged token gaps",
+)
+
+
 # ---- shared post() helpers -------------------------------------------------
+
+
+def post_mxfp8(cfg, rng, request):
+    cfg.is_mxfp8 = True
+
+
+def post_mxfp8_bwd_flags(cfg, rng, request):
+    cfg.use_causal_mask = cfg.left_bound is None and cfg.right_bound == 0
 
 
 def post_train(cfg, rng, request):

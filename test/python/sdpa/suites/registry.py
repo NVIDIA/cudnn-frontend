@@ -3,379 +3,47 @@
 
 """Master list of the sdpa/suites test framework.
 
-Every suite is one SuiteSpec: phase (context/generation/bprop), dtype,
-level, sweep size + seed, the knob set (what is fuzzed), the post hook
-(what is forced), and any platform/version gates. ``COVERAGE.md`` is
-rendered from this file by ``gen_coverage.py`` — edit here, regenerate there.
+Random-suite SuiteSpecs (and their knob factories) live next to their test
+shims in ``context/``, ``generation/`` and ``bprop/`` — each of those modules
+exports a ``SUITES`` list. This module aggregates them, generates the model
+suites from ``models/catalog.py``, and exposes ``REGISTRY``: the single
+lookup used by ``gen_coverage.py`` (which renders ``COVERAGE.md``) and the
+model-suite parametrization. The aggregation also enforces globally unique
+suite names.
 
 16-bit is one family: f16 suites draw fp16 or bf16 per config (data_type
 fuzz), exactly like the fp8 suites draw e4m3/e5m2 — no per-dtype duplicates.
 """
 
+import zlib
 from functools import partial
-
-import torch
 
 from sdpa.suites import knobs
 from sdpa.suites.common import (
     SuiteSpec,
     combine,
-    post_paged,
+    post_mxfp8,
+    post_mxfp8_bwd_flags,
     post_train,
 )
 from sdpa.suites.models.catalog import CATALOG
 
+from sdpa.suites.context import test_context_f16, test_context_fp8, test_context_mxfp8
+from sdpa.suites.generation import test_generation_f16, test_generation_fp8
+from sdpa.suites.bprop import test_bprop_f16, test_bprop_fp8, test_bprop_mxfp8
 
-def post_mxfp8(cfg, rng, request):
-    cfg.is_mxfp8 = True
-
-
-def post_mxfp8_bwd_flags(cfg, rng, request):
-    cfg.use_causal_mask = cfg.left_bound is None and cfg.right_bound == 0
-
-
-_COMMON_FUZZ = (
-    "batch",
-    "s_q/s_kv",
-    "d_qk/d_v",
-    "heads (MHA/GQA/MQA)",
-    "strides+gaps",
-    "data",
-)
-_MASK_FUZZ = ("mask: causal/left/right/band/none", "diag TL/BR")
-_THD_FUZZ = (
-    "stats token/head-major",
-    "total_q/kv slack",
-    "declare totals on graph",
-    "ragged token gaps",
-)
-
-_SPECS = [
-    # ---- context (prefill forward) ----
-    SuiteSpec(
-        name="context.f16.dense",
-        phase="context",
-        dtype="f16",
-        level="L0",
-        num_tests=512,
-        rng_seed=888,
-        knobs=knobs.dense_fwd,
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("layout padded/cu_padded/full", "sink", "bias(1:5)"),
-        pinned=("infer",),
-    ),
-    SuiteSpec(
-        name="context.f16.thd",
-        phase="context",
-        dtype="f16",
-        level="L0",
-        num_tests=768,
-        rng_seed=890,
-        knobs=knobs.thd_fwd,
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + _THD_FUZZ + ("sink",),
-        pinned=("infer", "layout THD (ragged/cu_ragged)"),
-    ),
-    SuiteSpec(
-        name="context.fp8.dense",
-        phase="context",
-        dtype="fp8",
-        level="L0",
-        num_tests=512,
-        rng_seed=999,
-        knobs=knobs.fp8_fwd,
-        exec_kind="fp8",
-        fuzzed=_COMMON_FUZZ
-        + _MASK_FUZZ
-        + (
-            "e4m3/e5m2 in",
-            "out fp8/fp16",
-            "layout padded/full",
-            "sink",
-        ),
-        pinned=("infer",),
-    ),
-    SuiteSpec(
-        name="context.fp8.thd",
-        phase="context",
-        dtype="fp8",
-        level="L0",
-        num_tests=512,
-        rng_seed=996,
-        knobs=knobs.fp8_thd_fwd,
-        exec_kind="fp8",
-        fuzzed=_COMMON_FUZZ
-        + _MASK_FUZZ
-        + (
-            "e4m3/e5m2 in",
-            "out fp8/fp16",
-            "layout ragged/cu_ragged",
-            "sink",
-            "total_q/kv slack",
-            "declare totals on graph",
-        ),
-        pinned=("infer",),
-        notes="diag BR-weighted 2:1 — production context-phase alignment",
-    ),
-    SuiteSpec(
-        name="context.f16.dense_chunked",
-        phase="context",
-        dtype="f16",
-        level="L0",
-        num_tests=128,
-        rng_seed=446,
-        knobs=knobs.dense_chunked,
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("layout padded/cu_padded/full",),
-        pinned=("infer", "s_q<=1024 chunks", "s_kv up to 16k"),
-        notes="chunked prefill, dense: query chunks against a long KV history",
-    ),
-    SuiteSpec(
-        name="context.f16.thd_chunked",
-        phase="context",
-        dtype="f16",
-        level="L0",
-        num_tests=256,
-        rng_seed=445,
-        knobs=knobs.thd_chunked,
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + _THD_FUZZ + ("layout ragged/cu_ragged",),
-        pinned=("infer", "s_q<=1024 chunks", "s_kv up to 16k", "layout THD"),
-        notes="chunked prefill, packed THD: the serving shape",
-    ),
-    SuiteSpec(
-        name="context.fp8.dense_chunked",
-        phase="context",
-        dtype="fp8",
-        level="L0",
-        num_tests=128,
-        rng_seed=992,
-        knobs=knobs.fp8_dense_chunked,
-        exec_kind="fp8",
-        fuzzed=_COMMON_FUZZ
-        + _MASK_FUZZ
-        + (
-            "e4m3/e5m2 in",
-            "out fp8/fp16",
-            "layout padded/full",
-            "sink",
-        ),
-        pinned=("infer", "s_q<=1024 chunks", "s_kv up to 16k"),
-        notes="chunked prefill, fp8 dense (d up to 192 — no ragged-hang envelope)",
-    ),
-    SuiteSpec(
-        name="context.fp8.thd_chunked",
-        phase="context",
-        dtype="fp8",
-        level="L0",
-        num_tests=192,
-        rng_seed=991,
-        knobs=knobs.fp8_thd_chunked,
-        exec_kind="fp8",
-        fuzzed=_COMMON_FUZZ
-        + _MASK_FUZZ
-        + (
-            "e4m3/e5m2 in",
-            "out fp8/fp16",
-            "layout ragged/cu_ragged",
-            "sink",
-            "capacity slack",
-            "declared totals",
-        ),
-        pinned=("infer", "s_q<=1024 chunks", "s_kv up to 16k", "layout THD", "d<=128 (fp8 ragged d>128 hangs the backend)"),
-        notes="chunked prefill, fp8 packed THD",
-    ),
-    SuiteSpec(
-        name="context.mxfp8.dense",
-        phase="context",
-        dtype="mxfp8",
-        level="L0",
-        num_tests=512,
-        rng_seed=1001,
-        knobs=knobs.mxfp8_fwd,
-        exec_kind="mxfp8",
-        min_sm=(10, 0),
-        post=post_mxfp8,
-        fuzzed=_COMMON_FUZZ
-        + _MASK_FUZZ
-        + (
-            "e4m3/e5m2 in",
-            "out fp16/bf16",
-            "sink",
-        ),
-        pinned=(
-            "infer",
-            "SM100+",
-            "layout full (mxfp8 API has no seq-len args, #646)",
-        ),
-    ),
-    SuiteSpec(
-        name="context.mxfp8.thd",
-        phase="context",
-        dtype="mxfp8",
-        level="L0",
-        num_tests=192,
-        rng_seed=1003,
-        knobs=knobs.mxfp8_thd_fwd,
-        exec_kind="mxfp8",
-        min_sm=(10, 0),
-        post=post_mxfp8,
-        fuzzed=_COMMON_FUZZ
-        + _MASK_FUZZ
-        + (
-            "e4m3/e5m2 in",
-            "out fp16/bf16",
-            "layout ragged/cu_ragged",
-            "sink",
-            "total_q/kv slack",
-            "declare totals on graph",
-        ),
-        pinned=(
-            "infer",
-            "stats token-major TH1",
-            "d=128/128 (frost THD leg)",
-            "SM100+",
-        ),
-        notes="diag BR-weighted 2:1 (production context alignment); "
-        "fwd only (no THD mxfp8 bwd engine); needs opt-in FROST engine "
-        "(CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1) — skips otherwise: the native "
-        "backend check_support-accepts THD mxfp8 but cannot execute it",
-    ),
-    # ---- generation (decode / small-s_q forward) ----
-    SuiteSpec(
-        name="generation.f16.decode",
-        phase="generation",
-        dtype="f16",
-        level="L0",
-        num_tests=384,
-        rng_seed=111,
-        knobs=knobs.decode,
-        fuzzed=_COMMON_FUZZ + ("diag TL/BR", "layout padded/full"),
-        pinned=("infer", "s_q=1", "s_kv up to 16k (split-KV regime)", "no mask"),
-        notes="absorbed generation.f16.lean: long-KV split-KV draws are routine here",
-    ),
-    SuiteSpec(
-        name="generation.f16.paged",
-        phase="generation",
-        dtype="f16",
-        level="L0",
-        num_tests=384,
-        rng_seed=887,
-        knobs=knobs.paged,
-        post=post_paged,
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("layout padded/cu_padded", "block size 1..1024", "sink"),
-        pinned=("infer", "s_q<=64", "layout padded", "paged KV"),
-    ),
-    SuiteSpec(
-        name="generation.fp8.decode",
-        phase="generation",
-        dtype="fp8",
-        level="L0",
-        num_tests=256,
-        rng_seed=993,
-        knobs=knobs.fp8_decode,
-        exec_kind="fp8",
-        fuzzed=_COMMON_FUZZ
-        + (
-            "e4m3/e5m2 in",
-            "out fp8/fp16",
-            "diag TL/BR",
-            "layout padded/full",
-        ),
-        pinned=("infer", "s_q=1", "s_kv up to 16k (split-KV regime)", "no mask"),
-        notes="absorbed generation.fp8.lean: long-KV split-KV draws (padded + full) are routine here",
-    ),
-    SuiteSpec(
-        name="generation.fp8.paged",
-        phase="generation",
-        dtype="fp8",
-        level="L0",
-        num_tests=128,
-        rng_seed=997,
-        knobs=knobs.fp8_paged,
-        exec_kind="fp8",
-        post=post_paged,
-        fuzzed=_COMMON_FUZZ
-        + (
-            "e4m3/e5m2 in",
-            "out fp8/fp16",
-            "block size 16..128",
-        ),
-        pinned=("infer", "no mask", "diag TL", "layout padded", "paged KV"),
-    ),
-    # ---- bprop (training: forward + backward) ----
-    SuiteSpec(
-        name="bprop.f16.dense",
-        phase="bprop",
-        dtype="f16",
-        level="L0",
-        num_tests=512,
-        rng_seed=844,
-        knobs=knobs.dense_bwd,
-        post=post_train,
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("layout padded/full", "deterministic", "sink", "bias(1:7)"),
-        pinned=("train"),
-    ),
-    SuiteSpec(
-        name="bprop.f16.thd",
-        phase="bprop",
-        dtype="f16",
-        level="L0",
-        num_tests=768,
-        rng_seed=845,
-        knobs=knobs.thd_bwd,
-        post=post_train,
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + _THD_FUZZ + ("deterministic", "sink"),
-        pinned=("train", "layout THD (ragged)"),
-    ),
-    SuiteSpec(
-        name="bprop.fp8.dense",
-        phase="bprop",
-        dtype="fp8",
-        level="L0",
-        num_tests=384,
-        rng_seed=998,
-        knobs=knobs.fp8_bwd,
-        exec_kind="fp8",
-        post=post_train,
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("out fp8/fp16", "deterministic", "sink"),
-        pinned=("train", "e4m3 in", "layout full"),
-    ),
-    SuiteSpec(
-        name="bprop.fp8.thd",
-        phase="bprop",
-        dtype="fp8",
-        level="L0",
-        num_tests=384,
-        rng_seed=995,
-        knobs=knobs.fp8_thd_bwd,
-        exec_kind="fp8",
-        post=post_train,
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("out fp8/fp16", "deterministic", "sink", "total_q/kv slack"),
-        pinned=(
-            "train",
-            "e4m3 in",
-            "layout THD (ragged)",
-        ),
-        notes="ragged FP8 backward requires cuDNN > 9.21.0",
-    ),
-    SuiteSpec(
-        name="bprop.mxfp8.dense",
-        phase="bprop",
-        dtype="mxfp8",
-        level="L0",
-        num_tests=384,
-        rng_seed=1002,
-        knobs=knobs.mxfp8_bwd,
-        exec_kind="mxfp8",
-        min_sm=(10, 0),
-        post=combine(post_mxfp8, post_mxfp8_bwd_flags, post_train),
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("out fp16/bf16", "sink"),
-        pinned=(
-            "train",
-            "e4m3 in",
-            "deterministic",
-            "layout full",
-            "SM100+",
-        ),
-    ),
-]
+_SPECS = []
+for _mod in (
+    test_context_f16,
+    test_context_fp8,
+    test_context_mxfp8,
+    test_generation_f16,
+    test_generation_fp8,
+    test_bprop_f16,
+    test_bprop_fp8,
+    test_bprop_mxfp8,
+):
+    _SPECS += _mod.SUITES
 
 
 def _model_post(phase):
@@ -404,7 +72,7 @@ for _preset in CATALOG:
                     dtype="fp8",
                     level="L0",
                     num_tests=8,
-                    rng_seed=__import__("zlib").crc32(f"{_preset.name}.{_phase}.fp8".encode()) % 100000,
+                    rng_seed=zlib.crc32(f"{_preset.name}.{_phase}.fp8".encode()) % 100000,
                     knobs=partial(knobs.model_knobs_fp8, _preset, _phase),
                     exec_kind="fp8",
                     post=_model_post(_phase),
@@ -426,7 +94,7 @@ for _preset in CATALOG:
                 dtype="f16",
                 level="L0",
                 num_tests=8,
-                rng_seed=__import__("zlib").crc32(f"{_preset.name}.{_phase}".encode()) % 100000,
+                rng_seed=zlib.crc32(f"{_preset.name}.{_phase}".encode()) % 100000,
                 knobs=partial(knobs.model_knobs, _preset, _phase),
                 post=_model_post(_phase),
                 fuzzed=("batch", "seq lens", "layout", "mask flavor", "data") + (("paged 50%",) if _phase == "generation" else ()),
@@ -453,7 +121,7 @@ for _preset in CATALOG:
                 dtype="mxfp8",
                 level="L0",
                 num_tests=8,
-                rng_seed=__import__("zlib").crc32(f"{_preset.name}.{_phase}.mxfp8".encode()) % 100000,
+                rng_seed=zlib.crc32(f"{_preset.name}.{_phase}.mxfp8".encode()) % 100000,
                 knobs=partial(knobs.model_knobs_mxfp8, _preset, _phase),
                 exec_kind="mxfp8",
                 min_sm=(10, 0),
