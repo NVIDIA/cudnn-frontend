@@ -17,9 +17,9 @@ and declines everything else to its siblings:
 * not under CUDA-graph capture (work items are planned on the host)
 
 The engine reproduces FlashInfer's ``recurrent_kda_training_{forward,backward}``
-bit-for-bit on the C16 route. It is opt-in (manifest slot ``opt_in=True``, pin
-``plan_name="kda_cake"`` under ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``)
-because the frozen kernels' forward token output differs from FLA ``chunk_kda``
+bit-for-bit on the C16 route. It is opt-in: ``check_support`` declines unless
+``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`` is set (then pin
+``plan_name="kda_cake"``), because the frozen kernels' forward token output differs from FLA ``chunk_kda``
 and from ``kda_frost`` by ~0.12 relative RMS in FlashInfer's own input regime,
 while the recurrent state and the data gradients agree to ~5e-3; see
 ``test/python/linear_attention/test_kda_cake.py`` for the measured surface.
@@ -55,6 +55,10 @@ class KdaCakeEngine(BaseEngine):
     def check_support(self, graph) -> None:
         import cudnn
 
+        from cudnn.engines.manifest import _ENABLE_ENV, opt_in_engines_enabled
+
+        if not opt_in_engines_enabled():
+            _decline(f"pinned-only until its forward numerics are reconciled; set {_ENABLE_ENV}=1 and plan_name='kda_cake'")
         facts = graph._facts_for(analyze)
         if facts is None or facts.op != "KDA":
             _decline("supports exactly one KDA/KDA_BWD node")

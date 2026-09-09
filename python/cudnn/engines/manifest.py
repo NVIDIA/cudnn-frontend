@@ -160,9 +160,10 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "kda",
         "cudnn.linear_attention",
         "KdaEngines",
-        # kda_cake is opt-in until its forward numerics vs FLA are reconciled (see the
-        # engine's module docstring); pin it by plan name under the opt-in flag.
-        slots={"kda_frost": EngineSlot(0), "kda_cutile": EngineSlot(1), "kda_cake": EngineSlot(2, opt_in=True)},
+        # kda_cake declines in check_support unless the opt-in flag is set (its
+        # forward numerics vs FLA are not reconciled yet); the slot itself is not
+        # gated, since no LA family may withhold its only implementations.
+        slots={"kda_frost": EngineSlot(0), "kda_cutile": EngineSlot(1), "kda_cake": EngineSlot(2)},
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(

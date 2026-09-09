@@ -21,23 +21,31 @@ when the kernels are fixed.
 """
 
 import math
-import os
 
-os.environ.setdefault("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+import pytest
+import torch
+import torch.nn.functional as F
 
-import pytest  # noqa: E402
-import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
+import cudnn
+from cudnn.linear_attention import ops as la_ops
 
-import cudnn  # noqa: E402
-from cudnn.linear_attention import ops as la_ops  # noqa: E402
-
-from .reference_kda import kda_reference  # noqa: E402
+from .reference_kda import kda_reference
 
 pytestmark = [
     pytest.mark.L0,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
 ]
+
+OPT_IN_ENV = "CUDNN_FRONTEND_ENABLE_FROST_ENGINES"
+
+
+@pytest.fixture(autouse=True)
+def opt_in(monkeypatch):
+    """kda_cake declines unless opted in. Per test, never at import: a
+    module-level env write runs during collection and would opt every later
+    test in the same pytest process in without saying so."""
+    monkeypatch.setenv(OPT_IN_ENV, "1")
+
 
 SEED = 4636
 LB = -5.0
@@ -131,13 +139,15 @@ def cake_available():
 def steps(cake_available):
     """One cake and one frost training step per shape, shared by the parity tests."""
     out = {}
-    for seq_lens, H, HV in SHAPES:
-        inputs = make_inputs(seq_lens, H, HV)
-        try:
-            cake = run_training_step(CAKE, inputs)
-        except cudnn.cudnnGraphNotSupportedError as exc:
-            pytest.skip(f"kda_cake declined: {exc}")
-        out[str(seq_lens)] = (inputs, cake, run_training_step(FROST, inputs))
+    with pytest.MonkeyPatch.context() as mp:  # module scope: the autouse fixture above is per test
+        mp.setenv(OPT_IN_ENV, "1")
+        for seq_lens, H, HV in SHAPES:
+            inputs = make_inputs(seq_lens, H, HV)
+            try:
+                cake = run_training_step(CAKE, inputs)
+            except cudnn.cudnnGraphNotSupportedError as exc:
+                pytest.skip(f"kda_cake declined: {exc}")
+            out[str(seq_lens)] = (inputs, cake, run_training_step(FROST, inputs))
     return out
 
 
