@@ -424,116 +424,6 @@ class Graph : public ICudnn, public INode {
         return sdpa_outputs;
     }
 
-    // Register an OSS NVRTC engine for SDPA by extracting tensor metadata from the SDPA node's attributes
-    error_t
-    register_oss_engine_() {
-        // Find the SDPA node in the graph's sub_nodes. Uses the virtual get_sdpa_attributes()
-        // accessor rather than dynamic_cast so this header compiles under -fno-rtti / /GR-.
-        // Covers both CompositeSDPANode and UnifiedSDPANode, which share SDPANodeBase.
-        SDPA_attributes const *sdpa_attrs = nullptr;
-        for (auto const &sub_node : sub_nodes) {
-            if (auto const *attrs = sub_node->get_sdpa_attributes()) {
-                sdpa_attrs = attrs;
-                break;
-            }
-        }
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            sdpa_attrs == nullptr, error_code_t::GRAPH_NOT_SUPPORTED, "No SDPA node found for OPENSOURCE engine");
-
-        graph::Execution_plan_list::OssSdpaEngineContext ctx;
-
-        // Q tensor
-        auto q_it = sdpa_attrs->inputs.find(SDPA_attributes::input_names::Q);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(q_it == sdpa_attrs->inputs.end() || !q_it->second,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Q tensor not found in SDPA node");
-        auto const &q = q_it->second;
-        ctx.q_uid     = q->get_uid();
-        ctx.q_stride  = q->get_stride();
-        ctx.batch     = q->get_dim()[0];
-        ctx.heads_q   = q->get_dim()[1];
-        ctx.seq_q     = q->get_dim()[2];
-        ctx.d         = q->get_dim()[3];
-
-        // K tensor — CompositeSDPANode transposes K in-place (swaps dims[2]/dims[3]
-        // and strides[2]/strides[3]) for the Q*K^T GEMM.  Detect and undo.
-        auto k_it = sdpa_attrs->inputs.find(SDPA_attributes::input_names::K);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(k_it == sdpa_attrs->inputs.end() || !k_it->second,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "K tensor not found in SDPA node");
-        auto const &k         = k_it->second;
-        auto const &k_dims    = k->get_dim();
-        auto const &k_strides = k->get_stride();
-        ctx.k_uid             = k->get_uid();
-        ctx.heads_kv          = k_dims[1];
-        if (k_dims[2] < k_dims[3]) {
-            // dims currently (B, H_kv, D, S_kv) — swapped
-            ctx.seq_kv   = k_dims[3];
-            ctx.k_stride = {k_strides[0], k_strides[1], k_strides[3], k_strides[2]};
-        } else {
-            ctx.seq_kv   = k_dims[2];
-            ctx.k_stride = k_strides;
-        }
-
-        // V tensor
-        auto v_it = sdpa_attrs->inputs.find(SDPA_attributes::input_names::V);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(v_it == sdpa_attrs->inputs.end() || !v_it->second,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "V tensor not found in SDPA node");
-        ctx.v_uid    = v_it->second->get_uid();
-        ctx.v_stride = v_it->second->get_stride();
-
-        // O tensor
-        auto o_it = sdpa_attrs->outputs.find(SDPA_attributes::output_names::O);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(o_it == sdpa_attrs->outputs.end() || !o_it->second,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "O tensor not found in SDPA node");
-        ctx.o_uid    = o_it->second->get_uid();
-        ctx.o_stride = o_it->second->get_stride();
-
-        // Max tensor (optional — only present if user called set_logit_max)
-        auto max_it = sdpa_attrs->outputs.find(SDPA_attributes::output_names::Max);
-        if (max_it != sdpa_attrs->outputs.end() && max_it->second) {
-            ctx.max_uid    = max_it->second->get_uid();
-            ctx.max_stride = max_it->second->get_stride();
-        }
-
-        // Sum_exp tensor (optional — only present if user called set_score_sum_exp)
-        auto se_it = sdpa_attrs->outputs.find(SDPA_attributes::output_names::Sum_exp);
-        if (se_it != sdpa_attrs->outputs.end() && se_it->second) {
-            ctx.sum_exp_uid    = se_it->second->get_uid();
-            ctx.sum_exp_stride = se_it->second->get_stride();
-        }
-
-        // Attention scale (use user-provided value if set, otherwise engine computes 1/sqrt(d))
-        if (sdpa_attrs->attn_scale_value.has_value()) {
-            ctx.attn_scale = sdpa_attrs->attn_scale_value.value();
-        }
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(ctx.q_uid == -1 || ctx.k_uid == -1 || ctx.v_uid == -1 || ctx.o_uid == -1,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Could not find Q/K/V/O tensors in SDPA node for OPENSOURCE engine");
-
-        // Detect SM version and instantiate the appropriate OSS engine
-        int oss_device_ordinal = 0;
-        experimental::detail::cuda_get_device(&oss_device_ordinal);
-        cudaDeviceProp oss_dev_prop;
-        experimental::detail::cuda_get_device_properties(&oss_dev_prop, oss_device_ordinal);
-        int oss_sm = oss_dev_prop.major * 10 + oss_dev_prop.minor;
-
-        std::shared_ptr<experimental::IOssSdpaEngine> engine;
-        if (oss_sm / 10 == 10) {
-            engine = std::make_shared<experimental::Sm100SdpaPrefillEngine>();
-        } else {
-            engine = std::make_shared<experimental::Sm90SdpaPrefillEngine>();
-        }
-        plans.set_oss_sdpa_engine(engine);
-        plans.set_oss_sdpa_engine_context(std::move(ctx));
-
-        return {error_code_t::OK, ""};
-    }
-
     // Register an OSS NVRTC engine for RmsNorm+SiLU by detecting the fusion pattern:
     //   RMSNormNode(X, SCALE) → Y → PointwiseNode(SWISH_FWD) → Z
     // Extracts tensor metadata and instantiates the appropriate arch-specific engine.
@@ -1114,13 +1004,6 @@ class Graph : public ICudnn, public INode {
 
     error_t
     get_workspace_size_plan_at_index(int64_t plan_index, int64_t &cudnn_workspace_size) const {
-        // OSS SDPA engine workspace: 16 bytes for tile_id_counter
-        if (plan_index == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE) {
-            cudnn_workspace_size = fe_workspace_size + experimental::Sm90SdpaPrefillEngine::get_workspace_size();
-            CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size << " (OSS SDPA engine)");
-            return {error_code_t::OK, ""};
-        }
-
         // OSS RmsNorm+SiLU engine workspace
         if (plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             cudnn_workspace_size = fe_workspace_size + plans.get_oss_rms_norm_silu_workspace_size();
@@ -1158,8 +1041,7 @@ class Graph : public ICudnn, public INode {
         }
 
         // OSS engines are not backed by cuDNN execution plans, so their workspace stays frontend-owned.
-        if (plan_index == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE ||
-            plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
+        if (plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             return get_workspace_size_plan_at_index(plan_index, cudnn_workspace_size);
         }
 
@@ -1522,21 +1404,6 @@ class Graph : public ICudnn, public INode {
         // 5. Dispatch
         void *engine_workspace = static_cast<char *>(workspace) + fe_workspace_size;
 
-        if (plan_index == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE) {
-            cudaStream_t stream = nullptr;
-            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
-            int device_ordinal = 0;
-            detail::cuda_get_device(&device_ordinal);
-            if (override_uids.empty()) {
-                CHECK_CUDNN_FRONTEND_ERROR(
-                    plans.execute_oss_sdpa_engine(ptrs, engine_workspace, device_ordinal, stream));
-            } else {
-                CHECK_CUDNN_FRONTEND_ERROR(plans.execute_oss_sdpa_engine(
-                    ptrs, engine_workspace, device_ordinal, stream, override_uids, override_shapes, override_strides));
-            }
-            return {error_code_t::OK, ""};
-        }
-
         if (plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             cudaStream_t stream = nullptr;
             _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
@@ -1686,8 +1553,7 @@ class Graph : public ICudnn, public INode {
         auto const candidate = plans.candidate;
 
         // OSS-sentinel candidates bypass the cuDNN backend and have no cudnnBackendExecutionPlan to write
-        if (candidate == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE ||
-            candidate == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
+        if (candidate == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             return {error_code_t::GRAPH_NOT_SUPPORTED, "OSS engine graphs are not serializable"};
         }
 
@@ -2254,15 +2120,6 @@ class Graph : public ICudnn, public INode {
 
         CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
         auto sm_version = context.get_sm_version();
-
-        // Check OSS SDPA engine
-        if (plans.has_oss_sdpa_engine()) {
-            auto oss_status = plans.check_oss_sdpa_engine_support(sm_version);
-            if (oss_status.is_good()) {
-                return {error_code_t::OK, ""};
-            }
-            // Fall through to check other engines
-        }
 
         // Check OSS RmsNorm+SiLU engine
         if (plans.has_oss_rms_norm_silu_engine()) {
@@ -2970,19 +2827,11 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
 
     // Register OSS engines if OPENSOURCE mode requested
     if (has_opensource) {
-        // Try SDPA OSS engine
-        auto oss_sdpa_status = register_oss_engine_();
-        if (oss_sdpa_status.is_good()) {
-            CUDNN_FE_LOG_LABEL_ENDL("INFO: Registered OSS SDPA prefill engine");
-        }
-
         // Try RmsNorm+SiLU OSS engine
         auto oss_norm_status = register_oss_rms_norm_silu_engine_();
         if (oss_norm_status.is_good()) {
             CUDNN_FE_LOG_LABEL_ENDL("INFO: Registered OSS RmsNorm+SiLU engine");
-        }
-
-        if (oss_sdpa_status.is_bad() && oss_norm_status.is_bad()) {
+        } else {
             CUDNN_FE_LOG_LABEL_ENDL("WARN: No OSS engine matched the graph pattern");
         }
     }
@@ -3046,20 +2895,6 @@ Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_b
 #else
     CUDNN_FE_LOG_BANNER("  BUILD PLANS  for policy " << static_cast<int>(policy) << "  ");
 #endif
-
-    // Build OSS SDPA engine if it passed check_support
-    if (plans.has_oss_sdpa_engine()) {
-        auto oss_status = plans.build_oss_sdpa_engine();
-        if (oss_status.is_good()) {
-            CUDNN_FE_LOG_LABEL_ENDL("INFO: OSS SDPA engine built successfully (NVRTC compilation done)");
-            if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {
-                CUDNN_FE_LOG_BANNER("  BUILD PLANS ALL OK (OSS SDPA engine)  ");
-                return {error_code_t::OK, ""};
-            }
-        } else {
-            CUDNN_FE_LOG_LABEL_ENDL("WARN: OSS SDPA engine build failed: " << oss_status.get_message());
-        }
-    }
 
     // Build OSS RmsNorm+SiLU engine if it passed check_support
     if (plans.has_oss_rms_norm_silu_engine()) {

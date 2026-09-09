@@ -27,12 +27,19 @@ from cudnn.fla import (
     restore_fla,
     short_conv_last_path,
 )
+from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+_CUTEDSL_INSTALLED, _CUTEDSL_VERSION = cutedsl_state()
 
 pytestmark = [
     pytest.mark.L0,
     pytest.mark.skipif(
         not (torch.cuda.is_available() and is_supported_causal_conv1d_update_compute_capability(torch.cuda.get_device_capability())),
         reason="the native decode short-convolution update requires a functionally supported GPU architecture",
+    ),
+    pytest.mark.skipif(
+        not _CUTEDSL_INSTALLED or cutedsl_too_old(_CUTEDSL_VERSION),
+        reason="the native decode short-convolution update requires nvidia-cutlass-dsl at or above CUTEDSL_MIN_VERSION",
     ),
     pytest.mark.skipif(
         _FLA_VERSION != "0.5.2",

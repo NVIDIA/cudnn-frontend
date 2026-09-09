@@ -20,10 +20,23 @@ def _has_supported_gpu() -> bool:
     return torch.cuda.is_available() and is_supported_causal_conv1d_update_compute_capability(torch.cuda.get_device_capability())
 
 
-pytestmark = pytest.mark.skipif(
-    not _has_supported_gpu(),
-    reason="requires a functionally supported GPU architecture",
-)
+def _has_supported_cutedsl() -> bool:
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    return installed and not cutedsl_too_old(version)
+
+
+pytestmark = [
+    pytest.mark.skipif(
+        not _has_supported_gpu(),
+        reason="requires a functionally supported GPU architecture",
+    ),
+    pytest.mark.skipif(
+        not _has_supported_cutedsl(),
+        reason="requires nvidia-cutlass-dsl at or above cudnn.frost.buffers.CUTEDSL_MIN_VERSION",
+    ),
+]
 
 
 def _load_api():

@@ -40,16 +40,16 @@ autograd.
 
 - SM90, SM100, or SM103 NVIDIA GPU
 - CUDA-enabled PyTorch
-- the cuDNN Frontend `cutedsl` optional dependencies
+- cuDNN Frontend (its CuTeDSL dependencies are required and install with it)
 
 From a source checkout:
 
 ```bash
-pip install -e ".[cutedsl]"
+pip install -e .
 pip install --group torch
 ```
 
-For a published package, install `nvidia-cudnn-frontend[cutedsl]` and a
+For a published package, install `nvidia-cudnn-frontend` and a
 compatible CUDA-enabled PyTorch separately.
 
 ## Fixed-length BSHD API

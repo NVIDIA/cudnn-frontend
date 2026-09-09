@@ -323,8 +323,6 @@ def block_sparse_attention_fp8_forward(
     if arch_family not in {10, 11, 12}:
         raise RuntimeError(f"Sage FP8 block sparse attention requires SM100-SM120, found SM{arch}")
     if arch_family in {10, 11}:
-        if batch != 1 or heads not in {4, 8}:
-            raise NotImplementedError("SM100/SM110 Sage FP8 requires B=1 and H in {4, 8}")
         if seqlen_q % 64 or seqlen_k % 64:
             raise NotImplementedError("SM100/SM110 Sage FP8 requires Sq and Sk to be multiples of 64")
         if q2k_block_nums is not None or block_sizes is not None:
