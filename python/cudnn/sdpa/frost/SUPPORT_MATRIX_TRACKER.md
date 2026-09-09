@@ -252,8 +252,8 @@ red (2026-09-08).
 | **Layout** | | |  | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| THD / ragged (packed varlen) | ❌ⁱⁱ | fp8 onlyᵛ | ❌ᵛ | ❌ᵛ | ❌ᵛ | ❌ |
-| `cu_seq_len_q/kv` prefix sums (THD only) | ❌ⁱⁱ | fp8 only | ❌ | ❌ | ❌ | ❌ |
+| THD / ragged (packed varlen) | ❌ⁱⁱ | fp8 onlyᵛ | fp8 onlyʸ | ❌ᵛ | ❌ᵛ | ❌ |
+| `cu_seq_len_q/kv` prefix sums (THD only) | ❌ⁱⁱ | fp8 only | fp8 only | ❌ | ❌ | ❌ |
 | **Masks / features** | | |  | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -289,6 +289,16 @@ a 7-arg contract against a 14-arg helper, and the metadata layout differs
 ᵛⁱ Needs the per-batch `seq_len_q` LSE trim, which the f16 Rubin kernels do not
 carry (`padded_stats=False`). KV-side padding itself is served.
 ᵛⁱⁱ The f16 Rubin kernels wire no SplitHelpers.
+
+ʸ Per-tensor FP8 **THD** at d192×d128 came free with the DSv3 port and is
+served as of 2026-09-09: that kernel *is* the shipped d128 FP8 body (only the
+config factory differs), so its THD leg is the validated wiring — 5 THD cases
+pass on `w2u1g-lc-0030`. Closing it needed both enforcement points widened
+together, the row and the standalone adapter's gate; they now share one
+constant (`config_sm107.SM107_FP8_THD_SHAPES`) so they cannot drift. d256 and
+d512 still raise at `compile()` — their ported bodies call the setup kernel with
+the pre-upstream 7-arg contract against a 14-arg helper, and their metadata
+layout is 3B+2 where the helper builds 4B+4.
 
 ˣ d192×d128 MXFP8 runs at **cga2 only** (SM100 serves the shape at cga1 and
 cga2). See the paragraph above: at cga1 this flavor's scale-factor tiles cross
@@ -413,7 +423,7 @@ feature-free d=64 graph.
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
 | f16/bf16 forward THD, split-KV, PackGQA, dense padded-Q trim | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d192×d128/d256/d512; these four are the machinery its kernels lack (optional stats IS served — `lse_optional=True`) |
-| d192×d128 quantized THD / PackGQA / split-KV | SM107 — the shape itself is served in FP8 and MXFP8 as of 2026-09-09; these three stay wired in the d128 flavor only (`thd_d_shapes` / `pack_gqa_d_shapes` / `split_d_shapes`) |
+| d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD row-wide |
 | MXFP8 forward | SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
 | Per-tensor FP8 backward | every arch |
 | MXFP8 backward outside SM100/SM103 d = 256 | every arch |

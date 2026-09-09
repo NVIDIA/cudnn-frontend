@@ -369,9 +369,28 @@ def test_fp8_rows_serve_dense_envelope():
     for arch in ("sm100", "sm107"):
         row = caps[engines.engine_name(arch=arch, fp8=True)]
         assert row.d_pad_multiple == 16, arch
-    # The d128 kernel carries the THD leg on both arch lines; sm100 adds the
-    # d192, d256, and d512 flavors' THD legs.
-    assert caps[engines.engine_name(arch="sm107", fp8=True)].thd_d_shapes == frozenset({(128, 128)})
+    # PARTIALLY INVERTED 2026-09-09: the Rubin THD leg now covers d192xd128 too.
+    # It came free with the DSv3 port -- that kernel IS the d128 body (only the
+    # config factory differs), so its THD wiring is the shipped one; validated on
+    # w2u1g-lc-0030.  d256/d512 still raise at compile() (7-arg call site vs the
+    # 14-arg helper, 3B+2 vs 4B+4 metadata), so sm100 keeps the wider set.
+    rubin_fp8 = caps[engines.engine_name(arch="sm107", fp8=True)]
+    assert rubin_fp8.thd_d_shapes == frozenset({(128, 128), (192, 128)})
+    assert caps[engines.engine_name(fp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+
+    # The row and the STANDALONE wrapper enforce the same fact at two places
+    # (rule 8b'), so they now share ONE constant instead of two copies kept in
+    # step by hand -- which is what failed when the row was widened first and a
+    # d192 THD graph died with a bare NotImplementedError inside check_support.
+    # Assert IDENTITY with the shared object, not equality with a literal: a
+    # literal here would just be a third copy to drift.
+    from cudnn.sdpa.fwd.api_dsl import _SM107_FP8_THD_SHAPES
+    from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES
+
+    assert rubin_fp8.thd_d_shapes is SM107_FP8_THD_SHAPES
+    assert _SM107_FP8_THD_SHAPES is SM107_FP8_THD_SHAPES
+    # Every THD shape must also be a shape the row SERVES at all.
+    assert SM107_FP8_THD_SHAPES <= rubin_fp8.d_shapes
     assert caps[engines.engine_name(arch="sm100", fp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert caps[engines.engine_name(mxfp8=True)].d_pad_multiple == 0
 

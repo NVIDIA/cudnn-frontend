@@ -1333,7 +1333,6 @@ def test_fp8_thd(in_key, causal):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-@_skip_on_rubin_d192_thd
 @pytest.mark.L0
 @pytest.mark.parametrize(
     ("in_key", "causal", "bottom_right"),
@@ -1358,7 +1357,6 @@ def test_fp8_d192_d128_thd(in_key, causal, bottom_right):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-@_skip_on_rubin_d192_thd
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_d192_d128_wide_swa_boundary_thd():
@@ -1379,7 +1377,6 @@ def test_fp8_d192_d128_wide_swa_boundary_thd():
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
-@_skip_on_rubin_d192_thd
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_d192_d128_thd_features():

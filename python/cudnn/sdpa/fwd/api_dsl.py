@@ -28,6 +28,7 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
+from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
     canonicalize_d192_lowering,
@@ -1227,19 +1228,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.thd and self._fp8 and (int(d_qk), int(d_v)) not in _thd_fp8_shapes,
             f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; " f"got (D_QK={d_qk}, D_V={d_v})",
         )
-        # THD on the Rubin line: only the SHIPPED d128 per-tensor FP8 kernel
-        # carries it.  Every PORTED SM107 kernel raises at compile() -- the
-        # setup-kernel call site still speaks the pre-upstream 7-arg contract
-        # against a 14-arg helper, and the metadata layout differs (3B+2 vs
-        # 4B+4).  The three SM107 engine rows already say so (`thd=False` on
-        # f16/MXFP8, `thd_d_shapes={(128,128)}` on FP8); this is the
-        # STANDALONE-wrapper twin of that decline, which the rows cannot cover
-        # because the wrapper never consults them.  Without it check_support()
-        # returns True and compile() dies with a bare TypeError on the
-        # lse_head_major kwarg -- an untyped escape, not a decline.
+        # THD on the Rubin line: only the per-tensor FP8 kernels carry it, and
+        # only at the two shapes whose BODY is the shipped d128 one -- d128
+        # itself and d192xd128, which is that same body with make_cfg_d192 (so
+        # its THD leg is the same wiring, validated on w2u1g-lc-0030).  Every
+        # OTHER ported SM107 kernel raises at compile(): the setup-kernel call
+        # site still speaks the pre-upstream 7-arg contract against a 14-arg
+        # helper, and the metadata layout differs (3B+2 vs 4B+4).
+        #
+        # This gate is the STANDALONE-wrapper twin of the rows' decline
+        # (`thd=False` on f16/MXFP8, `thd_d_shapes` on FP8), which the rows
+        # cannot cover because the wrapper never consults them.  Without it
+        # check_support() returns True and compile() dies with a bare TypeError
+        # on the lse_head_major kwarg -- an untyped escape, not a decline.
+        # KEEP THE TWO IN LOCKSTEP: widening one without the other either
+        # admits a graph that then dies untyped (row wider), or declines a graph
+        # the row advertises (wrapper wider).  Contract rule 8b'.
         self._not_implemented_error_if(
-            self.thd and self._device_cc == (10, 7) and not (self._fp8 and self._pertensor and (int(d_qk), int(d_v)) == (128, 128)),
-            f"THD/varlen on the Rubin (SM107) line is per-tensor FP8 d128 only; "
+            self.thd and self._device_cc == (10, 7) and not (self._fp8 and self._pertensor and (int(d_qk), int(d_v)) in _SM107_FP8_THD_SHAPES),
+            f"THD/varlen on the Rubin (SM107) line is per-tensor FP8 d128 / d192xd128 only; "
             f"got (D_QK={d_qk}, D_V={d_v}) on the "
             f"{'MXFP8' if (self._fp8 and not self._pertensor) else 'FP8' if self._fp8 else 'f16/bf16'} path",
         )

@@ -37,6 +37,7 @@ from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURA
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
+from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -844,7 +845,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # cga4x1 role-split geometry, and the d256 padded envelope is no
             # more validated here than on Blackwell.
             d_envelope_floors=(((192, 128), 128), ((256, 256), 255), ((512, 512), 256)),
-            thd_d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            thd_d_shapes=SM107_FP8_THD_SHAPES if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,

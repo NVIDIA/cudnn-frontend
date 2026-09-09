@@ -81,6 +81,7 @@ __all__ = [
     "make_cfg_d512",
     "make_cfg_d512_mxfp8",
     "SMEM_CAP_BYTES",
+    "SM107_FP8_THD_SHAPES",
 ]
 
 
@@ -109,6 +110,25 @@ _SMEM_FIXED_OVERHEAD = 2 * 1024  # barriers + scheduler + tmem-ptr slack
 TMEM_TOTAL_COLS = 576
 
 _DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16 = 0, 1, 2, 3
+
+# Head-dim shapes whose Rubin PER-TENSOR FP8 kernel carries the THD/varlen leg.
+#
+# ONE definition, consumed by BOTH the engine row (`engines._sm100_fp8_spec`'s
+# ``thd_d_shapes`` on the Rubin arm) and the standalone adapter's THD gate
+# (``api_dsl.SdpaFwdDslSm100.check_support``).  They are two enforcement points
+# for one fact, and contract rule 8b' exists because keeping two copies in step
+# by hand does not work: widen only the row and a graph enters the ranked list
+# then dies with a bare NotImplementedError in check_support; widen only the
+# wrapper and the row still declines.  Sharing the constant makes disagreement
+# unrepresentable rather than merely tested.
+#
+# Membership rule: the shape's kernel BODY must be the shipped d128 FP8 one.
+# d192xd128 qualifies because it IS that body (only the config factory differs),
+# so its THD wiring is the validated wiring -- confirmed on w2u1g-lc-0030.
+# d256 / d512 do NOT: those ported bodies still call the setup kernel with the
+# pre-upstream 7-arg contract against a 14-arg helper, and their metadata layout
+# is 3B+2 where the helper builds 4B+4, so they raise at compile().
+SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128)})
 
 
 # ---------------------------------------------------------------------------
