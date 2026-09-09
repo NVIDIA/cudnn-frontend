@@ -77,3 +77,9 @@ def test_context_mixed_seq_len_forms(env_info, cu_sides, diag_align, right_bound
     )
     cfg.fill_derived_fields()
     exec_sdpa(cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("test_no", suite_seeds("context.f16.chunked"), ids=lambda p: f"test{p[0]}")
+def test_context_f16_chunked(env_info, test_no, request, cudnn_handle):
+    run_suite("context.f16.chunked", env_info, test_no, request, cudnn_handle)

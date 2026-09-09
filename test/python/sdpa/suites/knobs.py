@@ -64,7 +64,7 @@ def dense_fwd():
             s_q_min=1,
             s_q_max=8192,
             s_kv_min=1,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={
                 "s_q=1": 0,
                 "s_q=s_kv": 5,
@@ -97,7 +97,7 @@ def thd_fwd():
             s_q_min=1,
             s_q_max=8192,
             s_kv_min=1,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={
                 "s_q=1": 0,
                 "s_q=s_kv": 5,
@@ -196,43 +196,17 @@ def thd_bwd():
 
 
 def decode():
-    # s_q == 1 generation step against a long KV history.
+    # s_q == 1 generation step against a long KV history (up to 16k, so the
+    # split-KV / lean regime is drawn routinely — this suite absorbed the
+    # former generation.*.lean suites), dense-full and padded layouts.
     return dict(
         batches=RandomBatchSize(min=1, max=32),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=1,
             s_q_max=1,
             s_kv_min=1,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={"s_q=1": 100, "s_q=s_kv": 1, "s_q=random": 0},
-        ),
-        d_qk_d_v=RandomHiddenDimSize(
-            d_qk_min=1,
-            d_qk_max=128,
-            d_v_min=1,
-            d_v_max=128,
-            head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 1},
-            with_high_probability=[(128, 128), (192, 128)],
-        ),
-        head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(1, 4, 1)),
-        data_type=_f16(),
-        with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
-        diag_align=RandomChoice(DIAG_BOTH),
-        is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
-        # sink_token / dropout not supported with s_q == 1
-    )
-
-
-def lean_attn():
-    # Decode against a long KV (513..8192): the lean-attention split regime.
-    return dict(
-        batches=RandomBatchSize(min=1, max=32),
-        s_q_s_kv=RandomSequenceLength(
-            s_q_min=1,
-            s_q_max=1,
-            s_kv_min=513,
-            s_kv_max=8192,
-            s_q_distribution={"s_q=1": 100, "s_q=s_kv": 0, "s_q=random": 0},
         ),
         d_qk_d_v=RandomHiddenDimSize(
             d_qk_min=1,
@@ -247,6 +221,7 @@ def lean_attn():
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"padded": 1, "full": 1}),
+        # sink_token / dropout not supported with s_q == 1
     )
 
 
@@ -258,7 +233,7 @@ def paged():
             s_q_min=1,
             s_q_max=64,
             s_kv_min=1,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={
                 "s_q=1": 0,
                 "s_q=s_kv": 5,
@@ -293,7 +268,7 @@ def fp8_fwd():
             s_q_min=1,
             s_q_max=8192,
             s_kv_min=1,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={"s_q=1": 2, "s_q=s_kv": 5, "s_q=random": 2},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -321,7 +296,7 @@ def fp8_decode():
             s_q_min=1,
             s_q_max=1,
             s_kv_min=1,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={"s_q=1": 100, "s_q=s_kv": 1, "s_q=random": 0},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -337,7 +312,9 @@ def fp8_decode():
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
         diag_align=RandomChoice(DIAG_BOTH),
-        is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
+        # padded + full: the split-KV / lean regime with per-batch lengths
+        # (this suite absorbed the former generation.fp8.lean).
+        is_ragged_or_padded_or_full=RandomChoice({"padded": 1, "full": 1}),
     )
 
 
@@ -348,7 +325,7 @@ def fp8_thd_fwd():
             s_q_min=64,
             s_q_max=8192,
             s_kv_min=64,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -371,49 +348,18 @@ def fp8_thd_fwd():
     )
 
 
-def fp8_lean():
-    # fp8 twin of lean_attn(): s_q=1 decode against a long KV (513..8192), the
-    # lean/split-KV regime, with padded layouts in the mix (fp8_decode() is
-    # dense-full only) — the recent SM100 split-KV fprop bugs lived exactly in
-    # long-KV small-b*h fp8 forward.
-    return dict(
-        batches=RandomBatchSize(min=1, max=32),
-        s_q_s_kv=RandomSequenceLength(
-            s_q_min=1,
-            s_q_max=1,
-            s_kv_min=513,
-            s_kv_max=8192,
-            s_q_distribution={"s_q=1": 100, "s_q=s_kv": 0, "s_q=random": 0},
-        ),
-        d_qk_d_v=RandomHiddenDimSize(
-            d_qk_min=64,
-            d_qk_max=192,
-            d_v_min=64,
-            d_v_max=128,
-            head_dim_distribution={"d_qk=d_v": 2, "d_qk=random": 1},
-            with_high_probability=[(64, 64), (128, 128), (192, 128)],
-        ),
-        head_count=RandomHeadGenerator(min=1, max=16, head_group_options=(1, 5, 2)),
-        data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
-        output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
-        with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
-        diag_align=RandomChoice(DIAG_BOTH),
-        is_ragged_or_padded_or_full=RandomChoice({"padded": 1, "full": 1}),
-    )
-
-
-def fp8_thd_chunked():
-    # fp8 twin of thd_chunked(): packed THD query chunks (s_q <= 64) against a
-    # long KV history — the varlen continuation / chunked-prefill shape. d
-    # capped at 128: fp8 ragged THD with d_qk > 128 hangs the backend kernel
-    # (see model_knobs_fp8).
+def fp8_chunked():
+    # fp8 twin of chunked(): chunked prefill, query chunks up to 1k against a
+    # long KV (16k), THD + padded + dense-full layouts. d capped at 128: fp8
+    # ragged THD with d_qk > 128 hangs the backend kernel (see
+    # model_knobs_fp8).
     return dict(
         batches=RandomBatchSize(min=1, max=16, with_high_probability=[1, 4]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=1,
-            s_q_max=64,
+            s_q_max=1024,
             s_kv_min=1,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={"s_q=1": 3, "s_q=s_kv": 1, "s_q=random": 10},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -429,7 +375,7 @@ def fp8_thd_chunked():
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BR_HEAVY),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "cu_ragged": 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "cu_ragged": 1, "padded": 1, "full": 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
         total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
         declare_total_seq_len=RandomChoice({True: 1, False: 1}),
@@ -443,7 +389,7 @@ def fp8_paged():
             s_q_min=64,
             s_q_max=256,
             s_kv_min=64,
-            s_kv_max=512,
+            s_kv_max=16384,
             s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -533,7 +479,7 @@ def mxfp8_fwd():
             s_q_min=128,
             s_q_max=8192,
             s_kv_min=128,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={"s_q=1": 0, "s_q=s_kv": 1, "s_q=random": 1},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -587,18 +533,19 @@ def mxfp8_bwd():
     )
 
 
-def thd_chunked():
-    # Ragged (THD) chunked generation: short query chunks (s_q <= 64) against a
-    # long KV history, packed varlen on both sides — the varlen continuation /
-    # chunked-prefill shape. Not covered by test_mhas_v2 (its THD suites are
-    # prefill-sized, its decode suites dense-only).
+def chunked():
+    # Chunked prefill (context phase): query chunks up to 1k tokens against a
+    # long KV history (up to 16k) — each chunk attends to everything cached so
+    # far. Layouts fuzz packed THD (the serving shape) alongside padded and
+    # dense-full. Not covered by test_mhas_v2 (its THD suites draw s_q ~ s_kv,
+    # its decode suites are dense-only s_q=1).
     return dict(
         batches=RandomBatchSize(min=1, max=16, with_high_probability=[1, 4]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=1,
-            s_q_max=64,
+            s_q_max=1024,
             s_kv_min=1,
-            s_kv_max=8192,
+            s_kv_max=16384,
             s_q_distribution={"s_q=1": 3, "s_q=s_kv": 1, "s_q=random": 10},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -612,8 +559,8 @@ def thd_chunked():
         head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(1, 4, 1)),
         data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
-        diag_align=RandomChoice(DIAG_BOTH),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 1}),
+        diag_align=RandomChoice(DIAG_BR_HEAVY),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "cu_ragged": 1, "padded": 1, "full": 1}),
         ragged_stats_layout=RandomChoice({"token_major": 1, "head_major": 1}),
         total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
         declare_total_seq_len=RandomChoice({True: 1, False: 1}),
