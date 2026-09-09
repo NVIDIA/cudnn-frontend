@@ -1,7 +1,6 @@
 
 # Resampling
 
-(resampling-forward)=
 ## Resampling Forward
 
 The resample operation represents the resampling of the spatial dimensions of an image to a desired value.
@@ -11,8 +10,7 @@ The output array contains two tensors:
 - The resampled output tensor.
 - The computed index tensor.
 
-```{note} The index tensor is only output in training mode of max pooling. It can be fed to backward pass for faster performance.
-```
+> **Note:** The index tensor is only output in training mode of max pooling. It can be fed to backward pass for faster performance.
 
 ### Resample Attributes
 
@@ -48,11 +46,10 @@ auto set_generate_index(bool const value) -> Resample_attributes&;
 auto set_is_inference(bool const value) -> Resample_attributes&;
 ```
 
-For more information on exact support surfaces across different versions, refer to {ref}`resamplefwd-runtime-fusion-engine` in the *Frontend Developer Guide*.
+For more information on exact support surfaces across different versions, refer to [ResampleFwd runtime fusion engine](https://docs.nvidia.com/deeplearning/cudnn/latest/developer/graph-api#resamplefwd) in the *Frontend Developer Guide*.
 
 Python API for resampling forward will be supported soon.
 
-(resampling-backward)=
 ## Resampling Backward
 
 To be supported soon.

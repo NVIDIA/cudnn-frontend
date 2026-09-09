@@ -210,33 +210,95 @@ backward) and its workspace (about one payload-equivalent of bytes).
 
 ## SM107 (Rubin, cc 10.7–11.9)
 
-Engine: `sdpa_fwd_prefill_sm107_fp8` only. **No f16/bf16 and no MXFP8 forward,
-no backward** on the Rubin line — those graphs fall through to the backend.
+Engines: `sdpa_fwd_prefill_sm107` (f16/bf16), `sdpa_fwd_prefill_sm107_fp8`
+(per-tensor FP8) and `sdpa_fwd_prefill_sm107_mxfp8` (block-scale). **No
+backward** on the Rubin line — those graphs fall through to the backend.
 
-| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | BPROP<br>no engine |
-|---|:--:|:--:|:--:|
-| FP16 / BF16 | ❌ | ❌ | ❌ |
-| FP8 E4M3 / E5M2 (per-tensor) | ⚠️ⁱ | ✅ | ❌ |
-| MXFP8 | ❌ | ❌ | ❌ |
-| O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ✅ | ✅ | — |
-| Head-dim envelope | none — runs the d128 kernelⁱ | ×16 up to 128 | — |
-| BSHD / `dense_flex` | ✅ / ❌ | ✅ / ❌ | ❌ |
-| THD + `cu_seq_len` | ❌ⁱⁱ | ✅ | ❌ |
-| Causal · bottom-right · right-band · SWA | ✅ | ✅ | ❌ |
-| Padding mask (+ stats) | ✅ | ✅ | ❌ |
-| Dense padded-Q trim | ❌ | ❌ | ❌ |
-| Attention sink | ✅ | ✅ | ❌ |
-| Bias | ❌ | ❌ | ❌ |
-| FP16 softmax accumulate (`softmax_precision=HALF`) | ❔ⁱⁱⁱ | ✅ (Rubin-only f16x2 arm) | — |
+The f16/bf16 row is a separate engine from `sdpa_fwd_prefill_sm100` (which stops
+at cc 10.6) because the lowerings diverge: the Rubin kernels build **version-1
+tcgen05 SMEM descriptors**. A version-0 descriptor's `start_address` field is 14
+bits — a 256 KiB window — and Rubin's 327 KiB per-CTA budget puts the d512
+flavor's P transfer ring at exactly 256 KiB, where a version-0 descriptor wraps
+to offset 0 and the MMA multiplies the untouched O staging slab (O comes out
+exactly zero, no crash).
 
-ⁱ Same story as SM100 footnote ⁷: no native d=64 Rubin kernel, so a d=64 FP8
-graph rides the d128 envelope (64 is a multiple of 16) at ~2× the MMA cost.
-ⁱⁱ `thd_d_shapes={(128,128)}` is exact — d=64 THD is declined.
-ⁱⁱⁱ **Accepted, not validated.** The `softmax_precision=HALF` domain is gated on
-`flavor == (128, 128)` (`fwd/api_dsl.py:1100`), and a d=64 graph's *flavor* IS
-(128,128), so the knob passes the probe and the kernel runs. What is untested is
-the f16x2 exponent arm over the zero-padded 64 → 128 region. Validate before
-relying on it; do not read ❔ as either a guarantee or a rejection.
+The f16/bf16 line carries all four SM100 flavors, d192×d128 included
+(`prefill_d192_d128_f16_sm107.py` — the d128 body with `make_cfg_d192`), so a
+d=192 f16 graph lands on its NATIVE kernel. The **quantized** lines are the
+strict subset: neither has a d192×d128 sibling, and (as on SM100) the
+`(256, 256)` envelope floor keeps an inexact graph off the d256 flavor's
+unvalidated padded path, so a d=192 FP8/MXFP8 graph is **declined** rather than
+zero-padded.
+
+| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | BPROP<br>no engine |
+|---|:--:|:--:|:--:|:--:|:--:|
+| **Data types** | | | | | |
+| FP16 / BF16 | ⚠️ⁱ | ✅ | ✅ | ✅ | ❌ |
+| FP8 E4M3 / E5M2 (per-tensor) | ⚠️ⁱ | ✅ | ✅ | ✅ | ❌ |
+| MXFP8 | ❌ | ✅ | ✅ | ⚠️ⁱᵛ | ❌ |
+| O dtype ≠ QKV — **quantized graphs only** (fp16/bf16/fp8 out) | ✅ | ✅ | ✅ | ✅ | — |
+| Head-dim envelope | none — runs the d128 kernelⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 ×16 (floor 255) | f16 ×8 · fp8 ×16 (floor 256) | — |
+| **Layout** | | | | | |
+| BSHD | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| THD / ragged (packed varlen) | ❌ⁱⁱ | fp8 onlyᵛ | ❌ᵛ | ❌ᵛ | ❌ |
+| `cu_seq_len_q/kv` prefix sums (THD only) | ❌ⁱⁱ | fp8 only | ❌ | ❌ | ❌ |
+| **Masks / features** | | | | | |
+| Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Padding mask + stats (per-batch LSE trim) | ✅ | fp8 onlyᵛⁱ | ❌ᵛⁱ | ❌ᵛⁱ | ❌ |
+| Dense padded-Q trim (O:=0, LSE:=−inf) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Attention sink | ✅ | ✅ | ✅ | ✅ | ❌ |
+| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ❌ |
+| PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ |
+| Split-KV | fp8 only | fp8 only | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ |
+| Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Bias | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ❌ |
+| FP16 softmax accumulate (`softmax_precision=HALF`) | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | ❌ | ❌ | — |
+
+ⁱ No native d=64 Rubin kernel, so a d=64 graph rides the d128 envelope (64 is a
+multiple of 8 at f16 and of 16 at fp8) at ~2× the MMA cost.
+ⁱⁱ `thd_d_shapes={(128,128)}` on the FP8 row is exact — d=64 THD is declined.
+ⁱⁱⁱ **Accepted, not validated.** `softmax_precision=HALF` is gated on
+`flavor == (128, 128)` (`fwd/api_dsl.py`), and a d=64 graph's *flavor* IS
+(128,128), so the knob passes the probe and the kernel runs. Untested is the
+f16x2 exponent arm over the zero-padded 64 → 128 region.
+ⁱᵛ **d512 MXFP8 is CORRECT but has no test module**, so it is ⚠️ not ✅: cos =
+0.9997 / LSE exact at SQ ∈ {128, 256, 384, 512} from `frost_dev/_probe_d512_mxfp8.py`,
+but SM100 has no d512 MXFP8 sibling, so the shared suite carries no d512 case to
+widen — it needs new cases, not a widened gate. Every other quantized cell above
+is covered by `test_sdpa_fwd_{fp8,mxfp8}_sm100.py` running on Rubin.
+ᵛ THD is not ported for the f16 kernels: the setup-kernel call site still speaks
+a 7-arg contract against a 14-arg helper, and the metadata layout differs
+(3B+2 vs 4B+4). `compile()` raises rather than half-serving it.
+ᵛⁱ Needs the per-batch `seq_len_q` LSE trim, which the f16 Rubin kernels do not
+carry (`padded_stats=False`). KV-side padding itself is served.
+ᵛⁱⁱ The f16 Rubin kernels wire no SplitHelpers.
+ⁱˣ Served through the padded path with synthesized full-length KV lengths
+(`skv_tail_via_padding`). REQUIRED, not an optimization: with no mask the
+kernel's KV loop bound is a floor division, so an un-synthesized ragged `S_kv`
+would silently drop the tail tile.
+
+**Scheduler policy — NATURAL only on every Rubin row.** `SCHED_LPT_L2` was
+dropped first (the ported decode sites never thread `qh_per_kh` / `seqlen_kv`,
+so `_common_sm100._decode_initial` raises); plain `SCHED_LPT` followed on
+2026-09-08 once a heuristics fallback fix let a causal graph actually reach it —
+it is silently WRONG on the ported kernels (causal d512 FP8 → NaN, masked d128
+MXFP8 → max|O-ref| ≈ 1.9). A knob is honored or the engine is ineligible. The
+SHIPPED d128 FP8 kernel does honor both and loses them here too, because
+`sched_policies` is row-wide; recovering that needs a per-shape domain
+(`sched_policies_by_d_shape`, mirroring `cgas_by_d_shape`).
+
+**Coverage.** The Rubin cells above are exercised by the SM100 suites running on
+cc 10.7 with an arch-aware engine pin — `test_sdpa_fwd_dsl_sm100.py` (f16/bf16),
+`test_sdpa_fwd_fp8_sm100.py`, `test_sdpa_fwd_mxfp8_sm100.py` — plus the
+device-independent `test_sdpa_fwd_dsl_sm107.py` / `test_sdpa_fp8_sm107.py` row
+assertions. Every ❌ in the table is a `skipif(_SM == 107, ...)` naming the row
+field that declines it, so the skip inverts when the feature lands.
 
 ---
 
@@ -331,8 +393,9 @@ feature-free d=64 graph.
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
-| f16/bf16 forward | SM107 (Rubin) |
-| MXFP8 forward | SM107, SM120, SM80 |
+| f16/bf16 forward THD, split-KV, PackGQA, dense padded-Q trim | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d192×d128/d256/d512; these four are the machinery its kernels lack (optional stats IS served — `lse_optional=True`) |
+| d192×d128 **quantized** forward | SM107 — no FP8 or MXFP8 sibling at that shape, and the d256 envelope floor declines the inexact ride |
+| MXFP8 forward | SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
 | Per-tensor FP8 backward | every arch |
 | MXFP8 backward outside SM100/SM103 d = 256 | every arch |
 | THD / ragged backward | SM80, SM120, and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ) |

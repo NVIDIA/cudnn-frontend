@@ -67,22 +67,37 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 
 from dataclasses import dataclass
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128
+from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d128
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d128(PARAMS)
-# Rubin geometry, baked post-validation (this module is only ever loaded for
-# cc10.7 by the adapter): dense-FP8 K=64 steps and the 9-stage KV ring. The
-# TMA iteration constants depend only on TILE_K/TILE_O/BPE/swizzle, so _TMA
-# is unaffected.
-import dataclasses as _dc
 
-CFG = _dc.replace(CFG, TILE_K_HW_BMM1=64, TILE_K_HW_BMM2=64, STAGES_KV=9)
+# tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
+# decision point, wired into every construction below rather than repeated as a
+# per-tile literal.  A version-0 descriptor's ``start_address`` is 14 bits = a
+# 256 KiB window; Rubin raises the per-CTA SMEM cap to 327 KiB, so an operand
+# buffer at or above 256 KiB wraps to offset 0 and the MMA multiplies whatever
+# sits at the bottom of SMEM.  This flavor's buffers all stay below the line.
+#
+# Do NOT re-literal this at a call site: the d512 MXFP8 sibling shipped NaN on
+# 100% of cells because its scale-factor tiles were declared UNDER a comment
+# claiming "every operand tile here carries desc_version=1" -- without the
+# kwarg.  A single constant makes that class of drift impossible, and
+# test_sm107_descriptor_version_matches_the_smem_budget asserts it.
+DESC_VERSION: int = 0
+# Rubin's dense-FP8 MMA runs K=64 per instruction, and every
+# ``Tcgen05InstrDesc.build`` site in this body hardcodes the matching idesc
+# ``k_dim=1``.  ``config_sm107.tile_k_hw()`` derives the 64; this guard is the
+# tripwire for the pairing, which is arch-OPPOSITE (Blackwell wants k_dim=0 with
+# TILE_K_HW=32) and fails SILENTLY -- a mismatch scrambles rows of the
+# accumulator rather than raising (rules/mma-tma-matrix.md S1).
+if CFG.TILE_K_HW_BMM1 != 64 or CFG.TILE_K_HW_BMM2 != 64:
+    raise ValueError(f"{__name__}: this body's idesc k_dim=1 requires TILE_K_HW=64 on Rubin; " f"got BMM1={CFG.TILE_K_HW_BMM1} BMM2={CFG.TILE_K_HW_BMM2}")
 Cfg = type(CFG)
 
-# Static SMEM accounting for the post-override geometry.  The 9-stage ring
+# Static SMEM accounting for the Rubin geometry.  The 9-stage ring
 # with BF16/FP16 O (~241 KiB) exceeds the STANDARD sm_10x 227 KiB per-CTA
 # opt-in, and is legal on GR100 only through the sm107 oversized-SMEM
 # launch mode (function attribute 16), which the required internal
@@ -172,7 +187,7 @@ else:
 # P -> fp8 cast bias (BAKED constant — NOT cuDNN's Scale_S; that pair is
 # accepted and ignored). P is quantized as P * 2**P_CAST_LOG2_SCALE: the
 # lazy-rescale skip bounds P by 2**RESCALE_THRESHOLD (4.0 for fp8, see
-# config_sm100.rescale_threshold), so the cast peaks at 2^(4+4) = 256 < 448
+# config_sm107.rescale_threshold), so the cast peaks at 2^(4+4) = 256 < 448
 # (e4m3 max) — no saturation — while flat-row entries (P ~ 1/S) sit four
 # binades above e4m3's subnormal cliff (quantization stays normal out to
 # S ~ 2^13). The bias rides the exp2 argument, so total_sum accumulates in
@@ -418,6 +433,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sK = SmemTile(
         base=sK_raw,
@@ -429,6 +445,7 @@ def _kernel(
         tma_loads_per_tile=TMA_QK_ITERS,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=(CFG.TILE_N // CFG.CTA_MMA) * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sV = SmemTile(
         base=sV_raw,
@@ -441,6 +458,7 @@ def _kernel(
         tma_loads_per_tile=TMA_VO_ITERS // CFG.CTA_MMA,
         tma_granu_elems=TMA_VO_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_N * TMA_VO_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     sO = SmemTile(
         base=sO_raw,
@@ -452,6 +470,7 @@ def _kernel(
         tma_loads_per_tile=TMA_O_ITERS_HOST,
         tma_granu_elems=TMA_O_GRANU_ELEMS_HOST,
         tma_subtile_stride_elems=CFG.TILE_M * TMA_O_GRANU_ELEMS_HOST,
+        desc_version=DESC_VERSION,
     )
 
     bars = make_classic_bars(CFG)
@@ -1225,6 +1244,7 @@ def _mma_warp_group(
         leading_byte_offset=LEADING_BYTE_OFFSET_QK,
         stride_byte_offset=STRIDE_BYTE_OFFSET_QK,
         layout=SMEM_LAYOUT_QKO,
+        desc_version=DESC_VERSION,
     )
     desc_ones = sOnes[0].desc()
     idesc_sum = prims.Tcgen05InstrDesc.build(

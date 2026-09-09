@@ -5,7 +5,7 @@ import math
 import torch
 
 from .helpers import get_fp8_scale_factor, get_fp8_descale_factor
-from .fp16_ref import _ScoreMask, _score_blocks, _pv, _grouped, _init_softmax_state, _prepare
+from .fp16_ref import _ScoreMask, _score_blocks, _qk, _pv, _kv_reduce, _init_softmax_state, _prepare
 
 # fmt: off
 
@@ -115,12 +115,10 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
 
     D = (o.float() * dO.transpose(1, 2)).sum(dim=-1, keepdim=True).transpose(1, 2) * o_descale * dO_descale
 
-    dO_g_v = _grouped(dO, h_v)
-    q_g_k = _grouped(q, h_k)
 
     def dP_block(start, end):
         # dO (FP8) @ V (FP8) -> dP (FP32)
-        dP = torch.einsum("bhgqd,bhkd->bhgqk", dO_g_v, v[:, :, start:end, :]).reshape(b, h_q, s_q, end - start)
+        dP = _qk(dO, v[:, :, start:end, :], h_v)
         return dP * dO_descale * v_descale
 
     # dP is quantized with one global scale, so its amax needs a pass of its own.
@@ -141,7 +139,7 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
 
         # P (FP32) -> P (FP8); P (FP8) @ dO (FP8) -> dV (FP32)
         p_quant = (p * s_scale).to(torch_itype).float()
-        dV[:, :, start:end, :] = torch.einsum("bhgqk,bhgqd->bhkd", _grouped(p_quant, h_v), dO_g_v) * s_descale * dO_descale
+        dV[:, :, start:end, :] = _kv_reduce(p_quant, dO, h_v) * s_descale * dO_descale
 
         dS = p * (dP_block(start, end) - D) * attn_scale
         # dS (FP32) -> dS (FP8)
@@ -149,7 +147,7 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
 
         # dS (FP8) @ K (FP8) -> dQ (FP32); dS^T (FP8) @ Q (FP8) -> dK (FP32)
         dQ = dQ + _pv(dS_quant, k[:, :, start:end, :], h_k) * k_descale * dP_descale
-        dK[:, :, start:end, :] = torch.einsum("bhgqk,bhgqd->bhkd", _grouped(dS_quant, h_k), q_g_k) * q_descale * dP_descale
+        dK[:, :, start:end, :] = _kv_reduce(dS_quant, q, h_k) * q_descale * dP_descale
 
     # Compute dSink_token if sink_token was provided
     # Formula: dSink = -exp(sink - logsumexp) * D summed over batch and sequence
