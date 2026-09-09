@@ -648,6 +648,33 @@ def test_dsl_sm100_gqa(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_d128", "d256", "d512"])
+@pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (8, 1)], ids=["g2", "g4", "mqa"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_dense_gqa_ratios(d_qk, d_v, h_q, h_kv):
+    """DENSE GQA/MQA across every ratio and every native f16 shape.
+
+    `test_dsl_sm100_gqa` above covers ONE ratio (8:2) and MQA (h_kv=1) appeared
+    only inside the PackGQA cases -- which the Rubin f16 row declines -- so the
+    widest head-sharing case went untested on exactly the shapes this arch
+    serves.  Dense GQA is NATIVE: `qh_per_kh` is threaded to the kernel, which
+    maps a Q head to its KV head; nothing expands K/V.  A wrong mapping is
+    therefore a silent wrong answer, and MQA is the case where an off-by-one
+    still lands on a VALID head and so cannot fault.
+
+    The FP8 and MXFP8 suites carry the same sweep."""
+    _require_dsl()
+    b, s = 2, 256
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h_q, s, d_qk, torch.float16)
+    k = _bhsd(b, h_kv, s, d_qk, torch.float16)
+    v = _bhsd(b, h_kv, s, d_v, torch.float16)
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=torch.float16, sdpa_kwargs=dict(use_causal_mask=True))
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
 # --- PackGQA: TILE_M/G tokens x G query heads per tile -------
 def _pack_gqa_case(d, h_q, h_kv, s_q, s_kv, dtype, *, sdpa_kwargs):
     q = _bhsd(2, h_q, s_q, d, dtype)
