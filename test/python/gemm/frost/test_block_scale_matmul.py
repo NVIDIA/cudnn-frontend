@@ -430,7 +430,7 @@ def test_block_scale_matmul_gate_rejects_mismatches():
     # FP8 data at block 16 — the fp8 rows are block-32 only, on every pipeline.
     with pytest.raises(NotImplementedError, match="does not support"):
         _check_block_scale_supported(analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=_DT_E8M0, a_dt=_DT_E4M3)), "sm100")
-    # Mixed width with a non-E8 scale has no UTCQMMA encoding.
+    # Mixed width with a non-E8 scale has no mixed block-scale MMA encoding.
     with pytest.raises(NotImplementedError, match="does not support"):
         _check_block_scale_supported(
             analyze(
@@ -1613,7 +1613,7 @@ def test_mma_gpu_arch_special_cases(monkeypatch):
     for ok_sm in (100, 110):
         monkeypatch.setattr(C, "_current_arch", lambda v=ok_sm: v)
         assert kr.mma_arch_reject(int8_chain, kr.GraphType.MATMUL, "sm100") is None
-    # Mixed MXFP8/MXFP4 is a baseline SM100 UTCQMMA encoding (K32); Rubin adds
+    # Mixed MXFP8/MXFP4 is a baseline SM100 block-scale MMA encoding (K32); Rubin adds
     # a K64 form, but the MMA type itself needs no narrow arch exception.
     mixed_chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E8M0, a_dt=_DT_FP4, b_dt=_DT_E4M3))
     monkeypatch.setattr(C, "_current_arch", lambda: 100)
@@ -2035,7 +2035,7 @@ def test_sm107_block_scale_matmul_numerics(combo, config_name, cta_group):
     ],
 )
 def test_mixed_mxfp8_mxfp4_numerics(fp8_on_a, fp8_torch_dt, fp8_cudnn_dt, fp8_mn_major, config_name):
-    """K32 padded and Rubin K64 native-packed UTCQMMA, both operand orders."""
+    """K32 padded and Rubin K64 native-packed mixed block-scale MMA, both operand orders."""
     dev = "cuda"
     torch.manual_seed(0)
     M = N = 256
@@ -2693,6 +2693,7 @@ def test_sm120_block_scale_registry_wiring():
     # Only the active-GPU gates may refuse -- the family range (sm < 100) or the
     # block-scale MMA special case (100 <= sm < 120) -- never the wiring itself.
     assert reason is None or "runs only on" in reason or "exists only on 120 <= SM < 130" in reason, reason
+
     # fp4 + e8m0 at block 16 is refused by the MMA-type table ...
     chain16 = analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=cudnn.data_type.FP8_E8M0))
     assert "does not support" in mma_arch_reject(chain16, GraphType.BLOCK_SCALE_MATMUL, "sm120")
@@ -2704,6 +2705,37 @@ def test_sm120_block_scale_registry_wiring():
         _build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3, a_major="m", b_major="n")
     )
     assert tmpl._extra_reject(chain_mn, cfg) is None
+
+
+@pytest.mark.parametrize("fake_a", [True, False], ids=["raw-a", "raw-b"])
+def test_sm120_rejects_one_sided_mxfp8_without_identity_scale(fake_a):
+    """The normalized MMA key stays generic, but sm120 cannot yet materialize
+    the fake side's all-one scale factors required by a one-sided graph."""
+    from cudnn.gemm.frost.kernel_registry import mma_arch_reject
+
+    g, *_ = _build_one_sided_block_scale_graph(
+        fake_a=fake_a,
+        raw_dt=cudnn.data_type.FP8_E4M3,
+        scaled_dt=cudnn.data_type.FP8_E5M2,
+        sf_dt=cudnn.data_type.FP8_E8M0,
+        block_size=32,
+    )
+    chain = analyze(g)
+
+    # This is still an existing block-scale MMA combination.  sm100 supports
+    # the renderer-level fake-dequant path; sm120 must fail before it indexes a
+    # missing scale-factor descriptor.
+    assert mma_arch_reject(chain, GraphType.BLOCK_SCALE_MATMUL, "sm100") is None
+    reason = mma_arch_reject(chain, GraphType.BLOCK_SCALE_MATMUL, "sm120")
+    assert reason is not None
+    assert "one-sided dequantization" in reason
+    assert "identity handling is not implemented" in reason
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(C, "_current_arch", lambda: 120)
+        assert _sm120_bs_template().accepts(chain, by_name(_SM120_BS_128)) == reason
+        with pytest.raises(NotImplementedError, match="one-sided dequantization"):
+            jit_from_cudnn_graph(g, config=by_name(_SM120_BS_128))
 
 
 def test_sm120_block_scale_config_rules():

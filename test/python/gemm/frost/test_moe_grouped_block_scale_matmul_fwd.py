@@ -717,7 +717,7 @@ def test_e2e_mx_combos(combo) -> None:
     ],
 )
 def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
-    """Grouped K32 padded and Rubin K64 native-packed mixed UTCQMMA."""
+    """Grouped K32 padded and Rubin K64 native-packed mixed block-scale MMA."""
     dev = "cuda"
     torch.manual_seed(0)
     E, S, N, K = 2, 256, 128, 256

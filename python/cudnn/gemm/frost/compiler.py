@@ -1761,7 +1761,7 @@ def _render_block_scale_tile_constants_sm100(
     mma_k64 = cfg.mma_tile_k_bytes == 64
     if is_sm103 and not both_fp4:
         raise NotImplementedError("the sm103 block-scale pipeline is fp4-only; " f"{bs.a_dtype} data with {bs.sf_dtype} scales runs the sm100 templates")
-    # Baseline SM100 mixed UTCQMMA uses K32 and the padded E2M1 SMEM format
+    # Baseline SM100 mixed block-scale MMA uses K32 and the padded E2M1 SMEM format
     # (16 FP4 lanes in 8 payload bytes + 8 padding bytes). Rubin's K64 form
     # consumes native packed FP4 instead.
     padded_fp4 = mixed_width and not mma_k64
@@ -1770,7 +1770,7 @@ def _render_block_scale_tile_constants_sm100(
     b_data_elem_bits = DTYPE_BITS[bs.b_dtype]
     a_smem_elem_bits = 8 if padded_fp4 and a_data_elem_bits == 4 else a_data_elem_bits
     b_smem_elem_bits = 8 if padded_fp4 and b_data_elem_bits == 4 else b_data_elem_bits
-    # K_BYTES names the byte width of the widest operand.  In a mixed UTCQMMA
+    # K_BYTES names the byte width of the widest operand.  In a mixed-width MMA
     # both sides span the same logical K, while the native packed FP4 SMEM row
     # occupies half the bytes of its FP8 peer.
     data_elem_bits = max(a_data_elem_bits, b_data_elem_bits)

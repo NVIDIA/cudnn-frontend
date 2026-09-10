@@ -501,7 +501,7 @@ class BlockScaleSpec:
     either K-block (16 or 32) — the two axes are orthogonal, so nvfp4 and mxfp4
     are just the two best-known corners — plus fp8 (e4m3/e5m2) with e8m0 scales
     at block 32. Mixed mxfp8/mxfp4 is supported in either operand order (shared
-    e8m0 scale format, block 32): SM100 uses the K32 UTCQMMA padded-E2M1 layout,
+    e8m0 scale format, block 32): SM100 uses the K32 padded-E2M1 layout,
     while Rubin additionally provides a native-packed K64 form. E5M3 scales
     require SM 10.7+.
 
@@ -589,7 +589,7 @@ class BlockScaleSpec:
     @property
     def mma_block_scale_kind(self) -> str:
         """GEMM ``nvvm.MMABlockScaleKind`` member name."""
-        # Rubin's mixed FP8/FP4 instruction is a UTCQMMA (MXF8F6F4), whose
+        # Rubin's mixed FP8/FP4 instruction is MXF8F6F4, whose
         # per-side format fields independently encode FP8 or E2M1.  MXF4NVF4
         # is the UTCOMMA path and requires FP4 on both sides.
         return "MXF4NVF4" if self.both_fp4 else "MXF8F6F4"
