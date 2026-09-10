@@ -821,8 +821,6 @@ def make_cfg_d512_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
         raise ValueError("d512 MXFP8 requires one-CTA M128 MMA")
     if cfg.TILE_M != 128 or cfg.TILE_N != 128 or cfg.TILE_K != 512 or cfg.TILE_O != 256:
         raise ValueError("d512 MXFP8 requires M128xN128, K512, and a 256-column output slice")
-    if cfg.STAGES_KV != 1:
-        raise ValueError("d512 MXFP8 requires one KV stage")
     if cfg.PACK_GQA:
         raise ValueError("d512 MXFP8 does not support PackGQA")
     return cfg, _tma_iters(cfg)

@@ -1463,7 +1463,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
             from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
 
-            auto_sched, auto_cga = select_d512_auto_knobs(params, pertensor=False)
+            auto_sched, auto_cga = select_d512_auto_knobs(params)
             params = replace(
                 params,
                 sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,

@@ -468,15 +468,9 @@ def select_d256_auto_knobs(
     return SCHED_LPT, 1
 
 
-def select_d512_auto_knobs(
-    params: Sm100TemplateParams,
-    *,
-    pertensor: bool,
-) -> tuple[int, int]:
+def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
     """Select the measured D512 scheduler and fixed MXFP8 CTA1 geometry."""
 
-    if pertensor:
-        return params.sched_policy, 2
     if params.thd_varlen:
         return SCHED_NATURAL, 1
     if params.window_right is not None:
@@ -517,7 +511,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         return selected_sched, selected_cga
     if selected_shape == (512, 512) and facts.is_mxfp8 and caps.sm_lo == 100:
         params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
-        selected_sched, selected_cga = select_d512_auto_knobs(params, pertensor=False)
+        selected_sched, selected_cga = select_d512_auto_knobs(params)
         if selected_cga not in domain:
             raise ValueError(f"D512 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
         return selected_sched, selected_cga
@@ -631,11 +625,10 @@ def _split_points(
     unsplit_launch = None
     if unsplit_knobs is not None:
         unsplit_pack_g = (facts.h_q // facts.h_kv) if unsplit_knobs.pack_gqa else 1
-        unsplit_rows_per_tile = _pack_gqa_tile_q(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.cga)
         unsplit_launch = _SplitKvLaunch(
             q_tiles=_ceil_div(
                 facts.s_q * unsplit_pack_g,
-                unsplit_rows_per_tile,
+                _pack_gqa_tile_q(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.cga),
             ),
             heads_q=facts.h_q // unsplit_pack_g,
             kv_tiles=_ceil_div(facts.s_kv, unsplit_knobs.tile_n or 128),
