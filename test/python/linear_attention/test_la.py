@@ -961,7 +961,8 @@ def test_gate_16bit_safe_gate(backend, variant, gate_dtype):
 
 @pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_bwd_meta_dtypes_match_eager(variant, gate_dtype):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_bwd_meta_dtypes_match_eager(backend, variant, gate_dtype):
     """The register_fake kernel must declare the dtypes the op really allocates,
     or AOTAutograd traces the wrong gradient dtype."""
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -1646,7 +1647,8 @@ def test_safe_gate_absent_params_bwd_bitwise(backend, variant, K, arm):
 
 @pytest.mark.parametrize("arm", ABSENT_ARMS)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_safe_gate_absent_params_bwd_op_outputs(variant, arm):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_safe_gate_absent_params_bwd_op_outputs(backend, variant, arm):
     """The raw bwd op returns an EMPTY d_a_log / d_dt_bias for an absent
     parameter, and register_fake declares the same shapes and dtypes."""
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -1989,7 +1991,8 @@ def test_torch_compile_forward(backend, variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_invalid_rank_raises(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_invalid_rank_raises(backend, variant):
     case = make_case(variant, torch.bfloat16, T=64)
     args = op_args(case)
     args[0] = case.q
@@ -1998,7 +2001,8 @@ def test_invalid_rank_raises(variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_invalid_qk_head_mismatch_raises(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_invalid_qk_head_mismatch_raises(backend, variant):
     case = make_case(variant, torch.bfloat16, T=64, H=2)
     args = thd_tensors(case)
     args[1] = args[1][:, :1].contiguous()
@@ -2007,7 +2011,8 @@ def test_invalid_qk_head_mismatch_raises(variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_invalid_gate_dtype_raises(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_invalid_gate_dtype_raises(backend, variant):
     """fp64 is rejected everywhere; fp32/bf16/fp16 gates are accepted everywhere."""
     case = make_case(variant, torch.bfloat16, T=64)
 
@@ -2024,7 +2029,8 @@ def test_invalid_gate_dtype_raises(variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_invalid_initial_state_count_raises(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_invalid_initial_state_count_raises(backend, variant):
     case = make_case(variant, torch.bfloat16, T=64)
     state0 = torch.zeros(3, case.HO, case.V, case.K, device="cuda", dtype=torch.float32)
     with pytest.raises(ValueError, match="initial"):
@@ -2032,7 +2038,8 @@ def test_invalid_initial_state_count_raises(variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_invalid_safe_gate_args_raise(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_invalid_safe_gate_args_raise(backend, variant):
     """safe_gate alone is valid (unit amplitude, zero bias); a gate parameter
     without safe_gate is not."""
     case = make_case(variant, torch.bfloat16, T=64)
@@ -2044,7 +2051,8 @@ def test_invalid_safe_gate_args_raise(variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_gate_domain_invalid_args_raise(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gate_domain_invalid_args_raise(backend, variant):
     """gate_domain is "log" or "linear", and "linear" does not combine with
     safe_gate (the safe-gate transform takes raw logits)."""
     case = make_case(variant, torch.bfloat16, T=64)
@@ -2569,7 +2577,8 @@ def test_bwd_householder_ragged_l2norm(backend, variant):
 @pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
 @pytest.mark.parametrize("n", (2, 3, 4))
 @pytest.mark.parametrize("V", [128, 64])
-def test_gdp_summary_bwd_compact_qdo_matches_port(V, n, l2norm):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdp_summary_bwd_compact_qdo_matches_port(backend, V, n, l2norm):
     """The GDP bprop summary reads q and dO on the compact token timeline (one 64-token tile per block of n
     chunks, the tile rows masked to the tokens whose readout sub-token lies in the chunk) and matches the
     expanded-timeline port's d_initial_state at bf16-ulp scale: ragged sequences with partial last blocks, with
@@ -2615,7 +2624,8 @@ def test_checkpoints_count_expanded_rows(backend, variant):
 
 
 @pytest.mark.parametrize("variant", HOUSEHOLDER_VARIANTS)
-def test_invalid_householder_rows_raise(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_invalid_householder_rows_raise(backend, variant):
     """k on the real-token timeline, or a non-positive count, is rejected at the op."""
     case = make_case(variant, torch.bfloat16, T=64)
     args = op_args(case)
@@ -2845,7 +2855,8 @@ def soften(case, beta_scale=0.02):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_product_oracle_matches_reference(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_product_oracle_matches_reference(backend, variant):
     """The chunked product oracle and the sequential fp64 reference agree to
     fp64 precision (two independent constructions of M)."""
     case = make_case(variant, torch.bfloat16, T=257)
@@ -2862,7 +2873,8 @@ def test_product_oracle_matches_reference(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_layout_pin_one_token(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_layout_pin_one_token(backend, variant):
     """One token, where the buffer holds A^T: it matches the transposed oracle elementwise, and where A is
     asymmetric (a per-channel gate) it does not match A."""
     case = make_case(variant, torch.bfloat16, T=1, H=1, K=64, V=64, seed=SEED + 3)
@@ -2884,7 +2896,8 @@ def test_layout_pin_one_token(variant):
 @pytest.mark.parametrize("producer", PRODUCERS)
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("length", [1, 63, 64, 65, 257, 1024])
-def test_m_matches_oracle_lengths(variant, length, producer):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_m_matches_oracle_lengths(backend, variant, length, producer):
     case = make_case(variant, torch.bfloat16, T=length)
     m_buf = kernel_m(case, producer)
     m_ref = oracle_m(case)
@@ -2895,7 +2908,8 @@ def test_m_matches_oracle_lengths(variant, length, producer):
 @pytest.mark.parametrize("producer", PRODUCERS)
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("gate_mode", GATE_MODES)
-def test_m_matches_oracle_gate_modes(variant, gate_mode, producer):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_m_matches_oracle_gate_modes(backend, variant, gate_mode, producer):
     dtype = torch.float16 if gate_mode == "fp16" else torch.bfloat16
     case, op_kw, oracle_kw = gate_mode_case(make_case(variant, dtype, T=256), gate_mode)
     m_buf = kernel_m(case, producer, **op_kw)
@@ -2907,7 +2921,8 @@ def test_m_matches_oracle_gate_modes(variant, gate_mode, producer):
 @pytest.mark.parametrize("producer", PRODUCERS)
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("dim_k", [64, 128])
-def test_m_matches_oracle_dims(variant, dim_k, producer):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_m_matches_oracle_dims(backend, variant, dim_k, producer):
     case = make_case(variant, torch.bfloat16, T=256, K=dim_k, V=dim_k)
     m_buf = kernel_m(case, producer)
     m_ref = oracle_m(case)
@@ -2917,7 +2932,8 @@ def test_m_matches_oracle_dims(variant, dim_k, producer):
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("dims", [(64, 128), (128, 64)])
-def test_m_summary_rectangular_case(variant, dims):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_m_summary_rectangular_case(backend, variant, dims):
     """The summary op on rectangular (K, V) cases; M is (K, K) while H is (V, K)."""
     dim_k, dim_v = dims
     case = make_case(variant, torch.bfloat16, T=256, K=dim_k, V=dim_v)
@@ -2929,7 +2945,8 @@ def test_m_summary_rectangular_case(variant, dims):
 @pytest.mark.L0
 @pytest.mark.parametrize("producer", PRODUCERS)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_m_multi_sequence_independent(variant, producer):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_m_multi_sequence_independent(backend, variant, producer):
     """Each sequence's M is independent; a zero-length sequence yields M = I exactly."""
     seq_lens = [31, 0, 93, 150]
     case = make_case(variant, torch.bfloat16, seq_lens=seq_lens)
@@ -2949,7 +2966,8 @@ def test_m_multi_sequence_independent(variant, producer):
 @pytest.mark.parametrize("producer", PRODUCERS)
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("length", [8192, 32768])
-def test_m_matches_oracle_long(variant, length, producer):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_m_matches_oracle_long(backend, variant, length, producer):
     """Long-span M accuracy (fp32 state carry in every producer path)."""
     case = soften(make_case(variant, torch.bfloat16, T=length, H=1, lo=0.9995))
     m_buf = kernel_m(case, producer)
@@ -2959,7 +2977,8 @@ def test_m_matches_oracle_long(variant, length, producer):
 
 @pytest.mark.L1
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_forward_affine_contract_long(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_forward_affine_contract_long(backend, variant):
     """At long spans the composed final state stays within kappa of the direct
     run's error against the fp64 oracle."""
     case = soften(make_case(variant, torch.bfloat16, T=8192, H=1, lo=0.9995))
@@ -2987,7 +3006,8 @@ def test_forward_affine_contract_long(variant):
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("dim_k", [64, 128])
-def test_summary_flags_bitwise_gate(variant, dim_k):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_flags_bitwise_gate(backend, variant, dim_k):
     """The GMEM-identity arm (initial_state = I, v = 0) and the summary op's
     transition output are bitwise equal."""
     case = make_case(variant, torch.bfloat16, T=257, K=dim_k, V=dim_k)
@@ -2999,7 +3019,8 @@ def test_summary_flags_bitwise_gate(variant, dim_k):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_flags_bitwise_gate_varlen(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_flags_bitwise_gate_varlen(backend, variant):
     seq_lens = [31, 0, 93, 150]
     case = make_case(variant, torch.bfloat16, seq_lens=seq_lens, K=128, V=128)
     twin = m_twin(case)
@@ -3010,7 +3031,8 @@ def test_summary_flags_bitwise_gate_varlen(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_h_parity_vs_prefill(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_h_parity_vs_prefill(backend, variant):
     """The summary H is bitwise the prefill final_state; one (sequence, head)
     tile per SM runs every sequence whole on both sides."""
     case = make_case(variant, torch.bfloat16, T=257, H=sm_count())
@@ -3023,7 +3045,8 @@ def test_summary_h_parity_vs_prefill(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_initial_state_parity_vs_prefill(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_initial_state_parity_vs_prefill(backend, variant):
     case = make_case(variant, torch.bfloat16, T=256, H=sm_count())
     N, HO, K, V = case.N, case.HO, case.K, case.V
     set_seed(SEED + 4)
@@ -3037,7 +3060,8 @@ def test_summary_initial_state_parity_vs_prefill(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", ("gdn", "gdn2", "gdp"))
-def test_gate_domain_summary_linear(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gate_domain_summary_linear(backend, variant):
     """The summary under gate_domain="linear" fed alpha matches the log
     path fed ln(alpha) in H and M."""
     case = make_case(variant, torch.bfloat16, T=256)
@@ -3438,7 +3462,8 @@ def test_piece_chain_gate_modes_match_uncut(backend, variant, mode):
 @pytest.mark.parametrize("producer", PRODUCERS)
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("dims", [(64, 64), (64, 128), (128, 64), (128, 128)])
-def test_h_matches_oracle(variant, dims, producer):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_h_matches_oracle(backend, variant, dims, producer):
     dim_k, dim_v = dims
     case = make_case(variant, torch.bfloat16, T=256, K=dim_k, V=dim_v)
     if producer == "summary":
@@ -3451,7 +3476,8 @@ def test_h_matches_oracle(variant, dims, producer):
 
 @pytest.mark.L1
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_h_matches_oracle_long(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_h_matches_oracle_long(backend, variant):
     case = soften(make_case(variant, torch.bfloat16, T=8192, H=1, lo=0.9995))
     out = run_frost(case, output_final_state=True)
     h_ref = reference(case)[1]
@@ -3465,7 +3491,8 @@ def test_h_matches_oracle_long(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_forward_affine_contract(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_forward_affine_contract(backend, variant):
     """final_state(S0) == X0 @ M_buf + H_buf, two-sided against the fp64 oracle."""
     case = make_case(variant, torch.bfloat16, T=256)
     N, HO, K, V = case.N, case.HO, case.K, case.V
@@ -3491,7 +3518,8 @@ def test_forward_affine_contract(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_backward_affine_contract(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_backward_affine_contract(backend, variant):
     """d_initial_state(dht = D0) == X_dht @ M_buf^T + X_G (transpose flip vs forward)."""
     case = make_case(variant, torch.bfloat16, T=256)
     N, HO, K, V = case.N, case.HO, case.K, case.V
@@ -3514,7 +3542,8 @@ def test_backward_affine_contract(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_vjp_superposition(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_vjp_superposition(backend, variant):
     """grads(dO, dht) == grads(dO, 0) + grads(0, dht) for every input gradient."""
     case = make_case(variant, torch.bfloat16, T=256)
     N, HO, K, V = case.N, case.HO, case.K, case.V
@@ -3544,7 +3573,8 @@ def test_vjp_superposition(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_g_matches_oracle(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_g_matches_oracle(backend, variant):
     case = make_case(variant, torch.bfloat16, T=256)
     N, HO, K, V = case.N, case.HO, case.K, case.V
     set_seed(SEED + 9)
@@ -3561,7 +3591,8 @@ def test_g_matches_oracle(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_g_multi_sequence(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_g_multi_sequence(backend, variant):
     seq_lens = [31, 93, 150]
     case = make_case(variant, torch.bfloat16, seq_lens=seq_lens)
     N, HO, K, V = case.N, case.HO, case.K, case.V
@@ -3602,7 +3633,8 @@ def run_summary_bwd(case, d_o, *, d_final_state=None, **kw):
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("dim_k", [64, 128])
-def test_summary_bwd_bitwise_vs_port(variant, dim_k):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_bwd_bitwise_vs_port(backend, variant, dim_k):
     """G from the backward summary equals the full-backward port's
     d_initial_state bitwise; one (sequence, head) tile per SM runs every
     sequence whole on both sides."""
@@ -3621,7 +3653,8 @@ def test_summary_bwd_bitwise_vs_port(variant, dim_k):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_bwd_bitwise_vs_port_with_dfs(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_bwd_bitwise_vs_port_with_dfs(backend, variant):
     case = make_case(variant, torch.bfloat16, T=257, H=sm_count())
     N, HO, K, V = case.N, case.HO, case.K, case.V
     set_seed(SEED + 14)
@@ -3638,7 +3671,8 @@ def test_summary_bwd_bitwise_vs_port_with_dfs(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_bwd_varlen_and_zero_length(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_bwd_varlen_and_zero_length(backend, variant):
     """Per-sequence independence and the zero-length passthrough
     (d_initial_state = d_final_state, or zero without one)."""
     seq_lens = [31, 0, 93, 150]
@@ -3662,7 +3696,8 @@ def test_summary_bwd_varlen_and_zero_length(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_bwd_matches_adjoint_oracle(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_bwd_matches_adjoint_oracle(backend, variant):
     """G through the backward summary against the fp64 adjoint."""
     case = make_case(variant, torch.bfloat16, T=256)
     N, HO, K, V = case.N, case.HO, case.K, case.V
@@ -3680,7 +3715,8 @@ def test_summary_bwd_matches_adjoint_oracle(variant):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_backward_affine_contract_gradient_op(variant):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_backward_affine_contract_gradient_op(backend, variant):
     """dh0(dht = D0) == X_dht @ M_buf^T + X_G with both legs from the backward
     summary."""
     case = make_case(variant, torch.bfloat16, T=256)
@@ -3705,7 +3741,8 @@ def test_backward_affine_contract_gradient_op(variant):
 @pytest.mark.L0
 @pytest.mark.parametrize("arm", ABSENT_ARMS)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_absent_params_bitwise(variant, arm):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_absent_params_bitwise(backend, variant, arm):
     """An absent a_log (unit amplitude) / dt_bias (zero bias) is bitwise the
     explicit zero tensor in H, M and G; the explicit arm's G is bitwise the
     full-backward port under the same safe gate, and the fp64 M oracle reads
@@ -3736,7 +3773,8 @@ def test_summary_absent_params_bitwise(variant, arm):
 @pytest.mark.L0
 @pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=DTYPE_IDS.get)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_bwd_sigmoid_beta_bitwise_vs_port(variant, beta_dtype):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_bwd_sigmoid_beta_bitwise_vs_port(backend, variant, beta_dtype):
     """Raw beta logits under the in-kernel sigmoid, float32 or the io dtype; the
     backward summary stays bitwise the full-backward port."""
     gate_mode = "sigmoid_beta_fp32" if beta_dtype == torch.float32 else "sigmoid_beta"
@@ -3773,7 +3811,8 @@ def summary_caches():
 @pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "initial_state"])
 @pytest.mark.parametrize("seq_lens", [[4096], STATE_CHAIN_RAGGED], ids=["1x4096", "ragged"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_chain_matches_oracle(variant, seq_lens, with_state, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_chain_matches_oracle(backend, variant, seq_lens, with_state, summary_caches):
     """H and M of a long batch on few tiles against the fp64 oracles (M through
     the product oracle, H through the sequential reference); an empty sequence
     holds H = seed and M = I."""
@@ -3796,7 +3835,8 @@ def test_summary_chain_matches_oracle(variant, seq_lens, with_state, summary_cac
 @pytest.mark.L0
 @pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "initial_state"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_chain_batch_invariant_length_rule_bitwise(variant, with_state, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_chain_batch_invariant_length_rule_bitwise(backend, variant, with_state, summary_caches):
     """Under batch_invariant a sequence's H and M are bitwise the same alone and in a batch."""
     seq_lens = [20000, 3000]
     case = soften(make_case(variant, torch.bfloat16, seq_lens=seq_lens, H=1, lo=0.99))
@@ -3812,7 +3852,8 @@ def test_summary_chain_batch_invariant_length_rule_bitwise(variant, with_state, 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_chain_affine_contract(variant, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_chain_affine_contract(backend, variant, summary_caches):
     """final_state(S0) == X0 @ M_buf + H_buf on a cut batch, two-sided against the fp64 oracle."""
     case = soften(make_case(variant, torch.bfloat16, T=2048, lo=0.99))
     s0 = random_state(case, seed=SEED + 5)
@@ -3828,7 +3869,8 @@ def test_summary_chain_affine_contract(variant, summary_caches):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_chain_cuda_graph_replay(variant, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_chain_cuda_graph_replay(backend, variant, summary_caches):
     """The summary of a cut batch captured into a CUDA graph replays bitwise the eager run."""
     case = soften(make_case(variant, torch.bfloat16, T=2048, lo=0.99))
     s0 = random_state(case, seed=SEED + 5)
@@ -3857,7 +3899,8 @@ def test_summary_chain_cuda_graph_replay(variant, summary_caches):
 @pytest.mark.L0
 @pytest.mark.parametrize("dims", [(64, 128), (128, 64)], ids=["k64_v128", "k128_v64"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_chain_rectangular(variant, dims, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_chain_rectangular(backend, variant, dims, summary_caches):
     """A rectangular state on a cut batch; M is (K, K) while H is (V, K), both against the oracles."""
     dim_k, dim_v = dims
     case = soften(make_case(variant, torch.bfloat16, T=2048, K=dim_k, V=dim_v, lo=0.99))
@@ -3901,7 +3944,8 @@ def adjoint_d_initial_state(case, d_o_full, d_final_state=None):
 @pytest.mark.parametrize("with_seed", [False, True], ids=["zero_seed", "d_final_state"])
 @pytest.mark.parametrize("seq_lens", [[4096], STATE_CHAIN_RAGGED], ids=["1x4096", "ragged"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_bwd_chain_matches_adjoint(variant, seq_lens, with_seed, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_bwd_chain_matches_adjoint(backend, variant, seq_lens, with_seed, summary_caches):
     """d_initial_state of a long batch on few tiles against the fp64 adjoint; an
     empty sequence passes d_final_state through (zero without one)."""
     case = soften(make_case(variant, torch.bfloat16, seq_lens=seq_lens, lo=0.99))
@@ -3919,7 +3963,8 @@ def test_summary_bwd_chain_matches_adjoint(variant, seq_lens, with_seed, summary
 @pytest.mark.L0
 @pytest.mark.parametrize("with_seed", [False, True], ids=["zero_seed", "d_final_state"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_bwd_chain_batch_invariant_length_rule_bitwise(variant, with_seed, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_bwd_chain_batch_invariant_length_rule_bitwise(backend, variant, with_seed, summary_caches):
     """Under batch_invariant a sequence's d_initial_state is bitwise the same alone and in a batch."""
     seq_lens = [20000, 3000]
     case = soften(make_case(variant, torch.bfloat16, seq_lens=seq_lens, H=1, lo=0.99))
@@ -3936,7 +3981,8 @@ def test_summary_bwd_chain_batch_invariant_length_rule_bitwise(variant, with_see
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_bwd_chain_affine_contract(variant, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_bwd_chain_affine_contract(backend, variant, summary_caches):
     """dh0(dht = D0) == D0 @ M_buf^T + G_buf with all three legs on a cut batch,
     two-sided against the fp64 adjoint."""
     case = soften(make_case(variant, torch.bfloat16, T=2048, lo=0.99))
@@ -3954,7 +4000,8 @@ def test_summary_bwd_chain_affine_contract(variant, summary_caches):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_bwd_chain_cuda_graph_replay(variant, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_bwd_chain_cuda_graph_replay(backend, variant, summary_caches):
     """The backward summary of a cut batch captured into a CUDA graph replays bitwise the eager run."""
     case = soften(make_case(variant, torch.bfloat16, T=2048, lo=0.99))
     d_o, _, d0 = gradient_chain_inputs(case)
@@ -4010,7 +4057,8 @@ def build_and_pin(graph, plan_name):
 @pytest.mark.L0
 @pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "initial_state"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_graph_api_summary_node_matches_op(variant, with_state, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_graph_api_summary_node_matches_op(backend, variant, with_state, summary_caches):
     """The family's summary node built through cudnn.pygraph returns
     final_state and transition bitwise the summary op's."""
     case = soften(make_case(variant, torch.bfloat16, T=1024, lo=0.99))
@@ -4048,7 +4096,8 @@ def test_graph_api_summary_node_matches_op(variant, with_state, summary_caches):
 @pytest.mark.L0
 @pytest.mark.parametrize("with_seed", [False, True], ids=["zero_seed", "d_final_state"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_graph_api_summary_bwd_node_matches_op(variant, with_seed, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_graph_api_summary_bwd_node_matches_op(backend, variant, with_seed, summary_caches):
     """The family's summary-bwd node built through cudnn.pygraph returns
     d_initial_state and transition bitwise the summary-bwd op's."""
     case = soften(make_case(variant, torch.bfloat16, T=1024, lo=0.99))
@@ -4115,7 +4164,8 @@ def compose_spans(seed, h, m):
 @pytest.mark.L0
 @pytest.mark.parametrize("cut", ["whole", "one_piece", "chain"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_bwd_transition_orientation(variant, cut, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_bwd_transition_orientation(backend, variant, cut, summary_caches):
     """The gradient op's transition is the forward summary's transition transposed: bitwise where
     one piece is walked (a span short enough to walk whole, and a one-piece batch-invariant chain),
     fp32-close over a many-piece chain (the products associate in opposite order)."""
@@ -4139,7 +4189,8 @@ def test_summary_bwd_transition_orientation(variant, cut, summary_caches):
 @pytest.mark.L0
 @pytest.mark.parametrize("dims", HEAD_DIMS, ids=lambda d: f"k{d[0]}_v{d[1]}")
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_summary_bwd_transition_orientation_dims(variant, dims, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_bwd_transition_orientation_dims(backend, variant, dims, summary_caches):
     """The transposed-transition identity at every (K, V) on a whole-walked span."""
     dim_k, dim_v = dims
     case = soften(make_case(variant, torch.bfloat16, T=64, K=dim_k, V=dim_v, lo=0.99))
@@ -4152,7 +4203,8 @@ def test_summary_bwd_transition_orientation_dims(variant, dims, summary_caches):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_two_tier_forward_assembles_whole_sequence(variant, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_two_tier_forward_assembles_whole_sequence(backend, variant, summary_caches):
     """Per-span H and M composed in fp32 seed each span's forward; o and the last final_state
     reproduce the whole-sequence forward at the family bound."""
     case = soften(make_case(variant, torch.bfloat16, T=TWO_TIER_BOUNDS[-1], lo=0.99))
@@ -4169,7 +4221,8 @@ def test_two_tier_forward_assembles_whole_sequence(variant, summary_caches):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_two_tier_backward_assembles_whole_sequence(variant, summary_caches):
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_two_tier_backward_assembles_whole_sequence(backend, variant, summary_caches):
     """Per-span G and transition composed in reverse in fp32 give each span its outgoing state
     gradient; the spans' backwards, seeded with their incoming states, reproduce every gradient of
     the whole-sequence backward at the family bound."""
