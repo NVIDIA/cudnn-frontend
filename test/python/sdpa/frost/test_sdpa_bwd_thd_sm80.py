@@ -323,25 +323,60 @@ def _plan_index(g, name=_ENGINE):
     return None
 
 
-def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True, token_gap=0, sink=None, **sdpa_kwargs):
+_GAP_ROLES = ("q", "k", "v", "o", "do", "dq", "dk", "dv")
+
+
+def _gapped(x, gap, fill=float("nan")):
+    """``x`` ([1, cap, nh, dd] compact) re-homed in a per-token record ``gap``
+    elements wider: the returned view has token stride ``nh*dd + gap`` and the
+    gap columns hold ``fill`` (NaN by default -- a read of a gap column would
+    poison the result, a write would show up in the storage).  ``gap <= 0``
+    returns ``x`` itself (a negative gap declares OVERLAPPING rows, a
+    probe-only decline that never binds data)."""
+    if gap <= 0:
+        return x
+    _, cap, nh, dd = x.shape
+    ts = nh * dd + gap
+    stor = torch.full((cap, ts), fill, device=x.device, dtype=x.dtype)
+    view = stor.as_strided((1, cap, nh, dd), (cap * ts, ts, dd, 1))
+    view.copy_(x)
+    return view
+
+
+def _gap_columns(view):
+    """The gap columns of a ``_gapped`` view's per-token records (empty for a
+    compact tensor)."""
+    _, cap, nh, dd = view.shape
+    ts = view.stride(1)
+    if ts == nh * dd:
+        return view.new_empty(0)
+    return view.as_strided((cap, ts - nh * dd), (ts, 1), view.storage_offset() + nh * dd)
+
+
+def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True, gaps=None, sink=None, **sdpa_kwargs):
     """A ragged backward graph over ``case``'s packed buffers.
 
     Everything is declared as the ENVELOPE (B, H, S_max, D) plus a per-tensor
-    ragged offset -- cuDNN's spelling of a packed tensor.  ``token_gap`` widens
-    the K/V token stride past ``H_kv * D`` (a view into an interleaved
-    per-token record), which the SM80 packed path DECLINES.  ``sink`` adds the
-    ``sink_token`` / ``dSink_token`` ports ((1, H, 1, 1) fp32); the graph's
+    ragged offset -- cuDNN's spelling of a packed tensor.  ``gaps`` maps a port
+    role (``q k v o do dq dk dv``) to extra elements on its token stride: the
+    port is then a view into a wider per-token record (``k``/``v`` at
+    ``H_kv * D`` is the fused-KV interleaved layout), which the SM80 packed
+    path serves at that stride.  The bound input buffers are re-homed in such
+    records with NaN in the gap columns.  ``sink`` adds the ``sink_token`` /
+    ``dSink_token`` ports ((1, H, 1, 1) fp32); the graph's
     ``_thd_test_ports["dsink"]`` handle finds the dSink buffer in the pack.
     """
     b, h, hkv, d, d_v, dev = case.b, case.h, case.hkv, case.d, case.d_v, "cuda"
+    gaps = dict(gaps or {})
+    assert set(gaps) <= set(_GAP_ROLES), gaps
     io = cudnn.data_type.HALF if case.dtype == torch.float16 else cudnn.data_type.BFLOAT16
     s_max_q, s_max_kv = max(max(case.lens_q), 1), max(max(case.lens_kv), 1)
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     vp, t, geom = {}, {}, {}
 
     def _port(name, s_max, nh, dd, cu, gap=0):
-        """Envelope (B, nh, s_max, dd) with compact BSHD strides (token stride
-        widened by ``gap``) and an element ragged offset of cu * token stride."""
+        """Envelope (B, nh, s_max, dd) with packed BSHD strides (token stride
+        ``nh*dd`` widened by ``gap``) and an element ragged offset of cu * token stride."""
         ts = nh * dd + gap
         stride = [s_max * ts, dd, ts, 1]
         ro_t = (torch.tensor(cu, dtype=torch.int64, device=dev) * ts).view(b + 1, 1, 1, 1)
@@ -352,11 +387,33 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
         vp[ro] = ro_t
         return x
 
-    t["q"] = _port("q", s_max_q, h, d, case.cu_q)
-    t["o"] = _port("o", s_max_q, h, d_v, case.cu_q)
-    t["do"] = _port("do", s_max_q, h, d_v, case.cu_q)
-    t["k"] = _port("k", s_max_kv, hkv, d, case.cu_k, token_gap)
-    t["v"] = _port("v", s_max_kv, hkv, d_v, case.cu_k, token_gap)
+    t["q"] = _port("q", s_max_q, h, d, case.cu_q, gaps.get("q", 0))
+    t["o"] = _port("o", s_max_q, h, d_v, case.cu_q, gaps.get("o", 0))
+    t["do"] = _port("do", s_max_q, h, d_v, case.cu_q, gaps.get("do", 0))
+    t["k"] = _port("k", s_max_kv, hkv, d, case.cu_k, gaps.get("k", 0))
+    t["v"] = _port("v", s_max_kv, hkv, d_v, case.cu_k, gaps.get("v", 0))
+    # The gradients' own records (declared below, once the node exists).
+    geom["dq"] = (
+        s_max_q,
+        [s_max_q * (h * d + gaps.get("dq", 0)), d, h * d + gaps.get("dq", 0), 1],
+        h,
+        d,
+        torch.tensor(case.cu_q, dtype=torch.int64, device=dev).view(b + 1, 1, 1, 1) * (h * d + gaps.get("dq", 0)),
+    )
+    geom["dk"] = (
+        s_max_kv,
+        [s_max_kv * (hkv * d + gaps.get("dk", 0)), d, hkv * d + gaps.get("dk", 0), 1],
+        hkv,
+        d,
+        torch.tensor(case.cu_k, dtype=torch.int64, device=dev).view(b + 1, 1, 1, 1) * (hkv * d + gaps.get("dk", 0)),
+    )
+    geom["dv"] = (
+        s_max_kv,
+        [s_max_kv * (hkv * d_v + gaps.get("dv", 0)), d_v, hkv * d_v + gaps.get("dv", 0), 1],
+        hkv,
+        d_v,
+        torch.tensor(case.cu_k, dtype=torch.int64, device=dev).view(b + 1, 1, 1, 1) * (hkv * d_v + gaps.get("dv", 0)),
+    )
 
     # Packed Stats in one of the layouts a forward emits.  head_major is
     # (1, H, head_stride) with a 64-rounded token capacity (WIDER than the
@@ -410,14 +467,16 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
         kw.update(max_total_seq_len_q=case.cap_q, max_total_seq_len_kv=case.cap_kv)
     kw.update(sdpa_kwargs)
     dq_t, dk_t, dv_t = g.sdpa_backward(**kw)
-    for out, like in ((dq_t, "q"), (dk_t, "k"), (dv_t, "v")):
-        s_max, stride, nh, dd, ro_t = geom[like]
+    for out, role in ((dq_t, "dq"), (dk_t, "dk"), (dv_t, "dv")):
+        s_max, stride, nh, dd, ro_t = geom[role]
         out.set_output(True).set_data_type(io).set_dim([b, nh, s_max, dd]).set_stride(stride)
         ro = g.tensor(name=f"{out.get_name()}_ro", dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64)
         out.set_ragged_offset(ro)
         vp[ro] = ro_t
-    vp.update({t["q"]: case.q, t["k"]: case.k, t["v"]: case.v, t["o"]: case.o, t["do"]: case.do})
+    # Inputs re-homed in their declared records (NaN gap columns: never read).
+    vp.update({t[r]: _gapped(getattr(case, r), gaps.get(r, 0)) for r in ("q", "k", "v", "o", "do")})
     g._thd_test_ports = t  # the sink/dSink handles, for the sinks test
+    g._thd_test_gaps = gaps  # the gradients' records, for _run_graph
     return g, vp, (dq_t, dk_t, dv_t)
 
 
@@ -458,9 +517,12 @@ def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, d_v=None, dtype=torch.bf
     )
     g, vp, (dq_t, dk_t, dv_t) = _build_thd_bwd_graph(case, stats_layout=stats_layout, **kw)
     _plan_graph(g)
-    dq = torch.full_like(case.q, float("nan"))
-    dk = torch.full((1, case.cap_kv, case.hkv, case.d), float("nan"), device="cuda", dtype=dtype)
-    dv = torch.full((1, case.cap_kv, case.hkv, case.d_v), float("nan"), device="cuda", dtype=dtype)
+    gaps = g._thd_test_gaps
+    # NaN-filled gradient records at the declared token strides: a gap column
+    # that stops being NaN was written, a live row that stays NaN was skipped.
+    dq = _gapped(torch.full_like(case.q, float("nan")), gaps.get("dq", 0))
+    dk = _gapped(torch.full((1, case.cap_kv, case.hkv, case.d), float("nan"), device="cuda", dtype=dtype), gaps.get("dk", 0))
+    dv = _gapped(torch.full((1, case.cap_kv, case.hkv, case.d_v), float("nan"), device="cuda", dtype=dtype), gaps.get("dv", 0))
     vp.update({dq_t: dq, dk_t: dk, dv_t: dv})
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute(vp, ws)
@@ -468,6 +530,7 @@ def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, d_v=None, dtype=torch.bf
     for name, x in (("dQ", dq), ("dK", dk), ("dV", dv)):
         live = x[0, : case.t_q] if name == "dQ" else x[0, : case.t_kv]
         assert torch.isfinite(live).all(), f"{name} has non-finite values in the packed region"
+        assert torch.isnan(_gap_columns(x)).all(), f"{name}: a gap column of the per-token record was written"
     _check(case, dq, dk, dv)
     return case, g, vp, ws, (dq, dk, dv)
 
@@ -538,6 +601,49 @@ def test_graph_thd_capacity_tail_left_untouched(variant):
     for name, x, t in (("dQ", dq, case.t_q), ("dK", dk, case.t_kv), ("dV", dv, case.t_kv)):
         assert torch.isfinite(x[0, :t]).all(), f"{name}: live rows must be finite"
         assert torch.isnan(x[0, t:]).all(), f"{name}: rows past the packed total were written"
+
+
+_GAP_CASES = {
+    # K/V (and dK/dV) as slices of an interleaved [T, 2, H_kv, D] record: the
+    # fused-KV layout torch.nn.attention.varlen users produce.
+    "kv_interleaved": dict(gaps={"k": 2 * _D, "v": 2 * _D, "dk": 2 * _D, "dv": 2 * _D}),
+    # The Q side only: Q/O/dO/dQ each in a different record.
+    "q_side": dict(gaps={"q": 8, "o": 16, "do": 24, "dq": 32}),
+    # Every port in a record of its own width.
+    "all_ports": dict(gaps={r: 8 * (i + 1) for i, r in enumerate(_GAP_ROLES)}),
+    # GQA: the dK/dV fold writes the caller's record at its stride.
+    "gqa": dict(h=4, hkv=2, gaps={r: 8 * (i + 1) for i, r in enumerate(_GAP_ROLES)}),
+    # MQA: the size-1 KV head axis wildcards its stride.
+    "mqa": dict(h=4, hkv=1, gaps={"k": 2 * _D, "v": 2 * _D, "dk": 16, "dv": 8}),
+    # A head dim inside the envelope: the staging copy reads the record, the
+    # cast and fold write it.
+    "padded_d": dict(d=96, gaps={r: 8 * (i + 1) for i, r in enumerate(_GAP_ROLES)}),
+    # The causal + deterministic relay with interleaved K/V.
+    "causal_det": dict(use_causal_mask=True, use_deterministic_algorithm=True, gaps={"k": 2 * _D, "v": 2 * _D}),
+}
+
+
+@pytest.mark.parametrize("variant", sorted(_GAP_CASES), ids=sorted(_GAP_CASES))
+def test_graph_thd_gapped_token_strides(variant):
+    """Ports declared as views into wider per-token records are read and
+    written at their own token stride: the reference matches per sequence, the
+    NaN gap columns of the inputs were never read (they would poison the
+    result) and those of the gradients never written."""
+    _run_graph((300, 128, 200), (300, 128, 200), **_GAP_CASES[variant])
+
+
+def test_graph_thd_gapped_capacity_tail_left_untouched():
+    """The capacity-tail contract on gapped records: rows past the packed total
+    and the gap columns both stay NaN, on the direct-bound MHA epilogue."""
+    gaps = {r: 8 * (i + 1) for i, r in enumerate(_GAP_ROLES)}
+    case, g, vp, ws, (dq, dk, dv) = _run_graph((256, 128), (256, 128), poison=True, pad_cap=384, gaps=gaps)
+    ws.fill_(0xFF)
+    g.execute(vp, ws)
+    torch.cuda.synchronize()
+    for name, x, t in (("dQ", dq, case.t_q), ("dK", dk, case.t_kv), ("dV", dv, case.t_kv)):
+        assert torch.isfinite(x[0, :t]).all(), f"{name}: live rows must be finite"
+        assert torch.isnan(x[0, t:]).all(), f"{name}: rows past the packed total were written"
+        assert torch.isnan(_gap_columns(x)).all(), f"{name}: a gap column was written"
 
 
 def test_graph_thd_nan_capacity_tail_unaligned_last_sequence():
@@ -832,12 +938,30 @@ def test_reject_thd_without_declared_totals():
     assert reason is not None and "max_total_seq_len" in reason
 
 
-def test_reject_thd_gapped_token_stride():
-    """K/V declared as views into a wider per-token record (token stride
-    2*H_kv*D, the fused-KV slicing layout): the SM80 packed path addresses rows
-    from H and D alone, so this is a typed plan-time decline, not a mis-read."""
-    reason = _thd_mismatch(token_gap=2 * _D)
-    assert reason is not None and "compact BSHD" in reason, reason
+def test_accept_thd_gapped_token_strides():
+    """Ports declared as views into a wider per-token record are served at
+    their own token stride: K/V at 2*H_kv*D (the fused-KV slicing layout, the
+    one the ragged sweeps draw most), and every port at once."""
+    assert _thd_mismatch(gaps={"k": 2 * _D, "v": 2 * _D}) is None
+    assert _thd_mismatch(gaps={r: 8 * (i + 1) for i, r in enumerate(_GAP_ROLES)}) is None
+    assert _thd_mismatch(h=4, hkv=2, gaps={"k": 2 * _D, "v": 2 * _D, "dk": 8, "dv": 16}) is None
+
+
+def test_reject_thd_misaligned_token_stride():
+    """A token stride off 16-byte alignment (4 fp16 elements past the row) is a
+    typed plan-time decline: the cp.async loads move 16-byte chunks."""
+    reason = _thd_mismatch(gaps={"k": 4})
+    assert reason is not None and "multiple of 8" in reason, reason
+    reason = _thd_mismatch(gaps={"dq": 12})
+    assert reason is not None and "multiple of 8" in reason, reason
+
+
+def test_reject_thd_token_stride_below_the_row():
+    """A token stride shorter than H*D (overlapping rows) never reaches the
+    packed-row rule: the layout envelope's non-overlap check (or the node)
+    declines it first."""
+    reason = _thd_mismatch(gaps={"q": -8})
+    assert reason is not None and ("refused by the node" in reason or "overlapping" in reason or ">= H*D" in reason), reason
 
 
 def test_reject_thd_bias():

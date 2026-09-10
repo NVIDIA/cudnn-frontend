@@ -1370,6 +1370,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._t_kv_cap: int = 0
         self._thd_lse_token_major: bool = False
         self._thd_lse_head_stride: int = 0
+        self._thd_token_strides: dict = {}  # port role -> the caller's packed token stride (plan-time)
         self._thd_meta_fn = None
 
     @staticmethod
@@ -1390,18 +1391,23 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         return self._t_kv_cap if self.thd else None
 
     @staticmethod
-    def _compact_bshd(desc: TensorDesc) -> bool:
-        """True when a logical-BHSD desc sits on COMPACT BSHD storage: the packed
-        path binds the caller's buffer to kernels that address rows from H and D
-        alone (head stride D, token stride H*D, element stride 1).  The batch
-        stride is not consulted -- a ragged port's sequences start at the ragged
-        offsets, and the packed view rebuilds that axis from the token extent.
-        The token stride is always checked (the packed view walks every token
-        with it, even when the envelope S_max is 1); the head and element
+    def _packed_bshd(desc: TensorDesc) -> bool:
+        """True when a logical-BHSD desc sits on PACKED BSHD rows the kernels can
+        bind directly: head stride D, element stride 1, and a token stride that
+        covers the row (``>= H*D``) and keeps every row 16-byte aligned (a
+        multiple of 8 fp16/bf16 elements -- the cp.async loads move 16-byte
+        chunks).  The token stride need not be compact: the kernels address a
+        row as ``token * token_stride + head * D`` with the port's own plan-time
+        stride, so a view into a wider per-token record (a K/V slice of an
+        interleaved ``[T, 2, H, D]`` buffer) is served at that stride.  The
+        batch stride is not consulted -- a ragged port's sequences start at the
+        ragged offsets, and the packed view rebuilds that axis from the token
+        extent.  The token stride is always checked (the packed view walks every
+        token with it, even when the envelope S_max is 1); the head and element
         strides wildcard on a size-1 extent (the analyzer's convention)."""
         _, h, _, d = (int(x) for x in desc.shape)
         st = tuple(int(x) for x in desc.stride)
-        return (int(desc.shape[1]) == 1 or st[1] == d) and st[2] == h * d and (d == 1 or st[3] == 1)
+        return (int(desc.shape[1]) == 1 or st[1] == d) and st[2] >= h * d and st[2] % 8 == 0 and (d == 1 or st[3] == 1)
 
     def _checked_lse_view(self, lse_tensor: torch.Tensor) -> torch.Tensor:
         """Validate a caller-provided Stats/LSE buffer and return the
@@ -1517,14 +1523,28 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             )
             self._value_error_if(self._has_bias, "SM80 bwd THD: bias / dBias is dense-only (a packed graph has no [B, H, S_q, S_kv] bias)")
             self._value_error_if(self._has_rope, "SM80 bwd THD: RoPE is dense-only")
-            # No staging leg: the kernels' packed fakes are compact BSHD, so a
-            # port declared as a view into a wider per-token record would be
-            # read at the wrong rows.  A decline here, not a silent mis-bind.
-            for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc, self.do_desc, self.dq_desc, self.dk_desc, self.dv_desc):
+            # No staging leg: the kernels bind the caller's packed rows directly,
+            # each port at its own plan-time token stride (the compiled fake
+            # carries it).  Anything the row arithmetic cannot express -- a
+            # head stride other than D, a token stride below the row or off
+            # 16-byte alignment -- is a decline here, not a silent mis-bind.
+            self._thd_token_strides = {}
+            for role, desc in (
+                ("q", self.q_desc),
+                ("k", self.k_desc),
+                ("v", self.v_desc),
+                ("o", self.o_desc),
+                ("do", self.do_desc),
+                ("dq", self.dq_desc),
+                ("dk", self.dk_desc),
+                ("dv", self.dv_desc),
+            ):
                 self._value_error_if(
-                    not self._compact_bshd(desc),
-                    f"SM80 bwd THD: {desc.name} must be compact BSHD (stride (S*H*D, D, H*D, 1)); got {tuple(desc.stride)} (the packed path has no staging copy)",
+                    not self._packed_bshd(desc),
+                    f"SM80 bwd THD: {desc.name} must be packed BSHD rows (head stride D, element stride 1, "
+                    f"token stride >= H*D and a multiple of 8 elements); got {tuple(desc.stride)} (the packed path has no staging copy)",
                 )
+                self._thd_token_strides[role] = int(desc.stride[2])
             self._t_q_cap = self._thd_total(int(b) * int(s_qo), self.max_total_seq_len_q)
             self._t_kv_cap = self._thd_total(int(b) * int(s_kv), self.max_total_seq_len_kv)
             self._value_error_if(self._t_q_cap <= 0 or self._t_kv_cap <= 0, "SM80 bwd THD: the packed token capacities must be > 0")
@@ -1702,6 +1722,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 lse_head_stride=self._thd_lse_head_stride,
                 out_d_qk=self.head_dim_qk,
                 out_d_v=self.head_dim_v,
+                # The caller's token strides, plan-time (compile() keeps the
+                # staged ports and the per-query-head partials compact itself).
+                thd_token_strides=tuple(self._thd_token_strides[r] for r in ("q", "k", "v", "o", "do", "dq", "dk", "dv")),
             )
             self._thd_meta_fn = self._compile_thd_meta()
         else:
@@ -2112,9 +2135,10 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         contract; padded THD with gaps between sequences is issue #737).
 
         Operands are the lowering's ``[1, H, T, D]`` views over the caller's
-        packed buffers at the plan's token capacities (compact BSHD, so the
-        ``[1, T, H, D]`` permute is a free view); Stats is the ``(T, H)`` or
-        ``(1, H, head_stride)`` view of its declared packing.  Every bound is
+        packed buffers at the plan's token capacities, each at the token stride
+        its port declared (the ``[1, T, H, D]`` permute is a free view; the
+        kernels were compiled against exactly that stride); Stats is the
+        ``(T, H)`` or ``(1, H, head_stride)`` view of its declared packing.  Every bound is
         plan-time: the kv-tile grid and the relay counter come from the
         envelope ``S_max`` (short tiles early-out), the token extents from the
         capacities -- no length is read on the host (Rule 3).
@@ -2150,32 +2174,51 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         ql, kl = seq_q_lens.view(-1), seq_kv_lens.view(-1)
 
         as_bshd = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731  [1,H,T,D] -> [1,T,H,D]
+        ts = self._thd_token_strides
 
-        def _stage_thd(t: torch.Tensor, tokens: int, nh: int, d: int, pad: bool, fd: int, name: str) -> torch.Tensor:
+        def _kernel_view(view: torch.Tensor, tokens: int, nh: int, d: int, tok_stride: int, name: str) -> torch.Tensor:
+            """The kernel-facing [1, T, H, D] view at the PLAN's token stride.
+            The artifact was compiled against exactly (T*ts, ts, D, 1); the
+            load-bearing strides (token, element, and head when H > 1) are
+            checked here, then the view is rebuilt so a size-1 axis carries the
+            compiled stride too (a view, never a copy)."""
+            st = tuple(view.stride())
+            self._value_error_if(
+                tuple(view.shape) != (1, tokens, nh, d) or view.dtype != self.dtype,
+                f"SM80 bwd THD: {name} must be a packed [1, {nh}, {tokens}, {d}] {self.dtype} view; got {tuple(view.shape)} {view.dtype}",
+            )
+            self._value_error_if(
+                st[1] != tok_stride or (d > 1 and st[3] != 1) or (nh > 1 and st[2] != d),
+                f"SM80 bwd THD: {name} must sit on the plan's packed layout (token stride {tok_stride}, head stride {d}, element stride 1); "
+                f"got stride {st} (the packed path has no staging copy)",
+            )
+            want = (max(tokens, 1) * tok_stride, tok_stride, d, 1)
+            return view if st == want else view.as_strided((1, tokens, nh, d), want, view.storage_offset())
+
+        def _stage_thd(t: torch.Tensor, tokens: int, nh: int, d: int, pad: bool, fd: int, name: str, tok_stride: int) -> torch.Tensor:
             """Kernel-facing [1, T, H, D] view of the lowering's [1, H, T, D] view,
             checked against the PLAN's geometry (the compiled artifact's static
-            head count, head dim and dtype), padded into carved staging when the
-            head dim sits inside the flavor envelope."""
+            head count, head dim, dtype and token stride), padded into carved
+            (compact) staging when the head dim sits inside the flavor envelope."""
             view = as_bshd(t)
-            self._value_error_if(
-                tuple(view.shape) != (1, tokens, nh, d) or t.dtype != self.dtype,
-                f"SM80 bwd THD: {name} must be a packed [1, {nh}, {tokens}, {d}] {self.dtype} view; got {tuple(t.shape)} {t.dtype}",
-            )
             if pad:
+                self._value_error_if(
+                    tuple(view.shape) != (1, tokens, nh, d) or t.dtype != self.dtype,
+                    f"SM80 bwd THD: {name} must be a packed [1, {nh}, {tokens}, {d}] {self.dtype} view; got {tuple(t.shape)} {t.dtype}",
+                )
                 dst = take(tokens * nh * fd, self.dtype, shape=(1, tokens, nh, fd))
                 dst[..., :d].copy_(view)
                 dst[..., d:].zero_()
                 return dst
-            self._value_error_if(not view.is_contiguous(), f"SM80 bwd THD: {name} must be compact BSHD (the packed path has no staging copy)")
-            return view
+            return _kernel_view(view, tokens, nh, d, tok_stride, name)
 
         # Staging in _thd_scratch_bytes()'s order (Q, K, V, O, dO).
         dqk, dv_ = self.head_dim_qk, self.head_dim_v
-        Q = _stage_thd(q_tensor, tq, hq, dqk, pad_qk, fdqk, "Q")
-        K = _stage_thd(k_tensor, tkv, hkv, dqk, pad_qk, fdqk, "K")
-        V = _stage_thd(v_tensor, tkv, hkv, dv_, pad_v, fdv, "V")
-        O = _stage_thd(o_tensor, tq, hq, dv_, pad_v, fdv, "O")  # noqa: E741
-        dO = _stage_thd(do_tensor, tq, hq, dv_, pad_v, fdv, "dO")
+        Q = _stage_thd(q_tensor, tq, hq, dqk, pad_qk, fdqk, "Q", ts["q"])
+        K = _stage_thd(k_tensor, tkv, hkv, dqk, pad_qk, fdqk, "K", ts["k"])
+        V = _stage_thd(v_tensor, tkv, hkv, dv_, pad_v, fdv, "V", ts["v"])
+        O = _stage_thd(o_tensor, tq, hq, dv_, pad_v, fdv, "O", ts["o"])  # noqa: E741
+        dO = _stage_thd(do_tensor, tq, hq, dv_, pad_v, fdv, "dO", ts["do"])
 
         # Stats in the packing the kernel was compiled for (the lowering shapes
         # it; the shape check here is what makes a mismatch an error rather than
@@ -2206,14 +2249,16 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             sem_q_stride = 0
             dq_sem = self._dummy("zero_i32", device, lambda: torch.zeros(1, dtype=torch.int32, device=device))
         # dK/dV: MHA at native dims binds the caller's packed views directly
-        # (the kernel epilogue stores rows kv < s_kv[b] only); GQA or a padded
-        # head dim stages per-query-head partials, which the row-bounded fold
-        # below writes into the caller's dK/dV at the caller's head dim.  The
-        # partials' rows past the packed total are never read by that fold, so
-        # they need no zero fill.
-        dk_view, dv_view = as_bshd(dk_tensor), as_bshd(dv_tensor)
-        dk_direct = not gqa and not pad_qk and dk_view.is_contiguous()
-        dv_direct = not gqa and not pad_v and dv_view.is_contiguous()
+        # (the kernel epilogue stores rows kv < s_kv[b] only, at the caller's
+        # token stride); GQA or a padded head dim stages compact per-query-head
+        # partials, which the row-bounded fold below writes into the caller's
+        # dK/dV at the caller's head dim and token stride.  The partials' rows
+        # past the packed total are never read by that fold, so they need no
+        # zero fill.  Same direct-bind rule as compile()'s fakes.
+        dk_view = _kernel_view(as_bshd(dk_tensor), tkv, hkv, dqk, ts["dk"], "dK")
+        dv_view = _kernel_view(as_bshd(dv_tensor), tkv, hkv, dv_, ts["dv"], "dV")
+        dk_direct = not gqa and not pad_qk
+        dv_direct = not gqa and not pad_v
         dk_ws = dk_view if dk_direct else take(tkv * hq * fdqk, self.dtype, shape=(1, tkv, hq, fdqk))
         dv_ws = dv_view if dv_direct else take(tkv * hq * fdv, self.dtype, shape=(1, tkv, hq, fdv))
         dot = take(hq * tq, torch.float32, shape=(1, hq, tq))
@@ -2269,14 +2314,11 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         # Row-bounded outputs straight into the caller's packed views: the cast
         # and the fold stop at cu_*[B] (read on device) and write d_qk / d_v
         # columns, so no torch copy-back touches the caller's buffers.
-        dq_view = as_bshd(dq_tensor)
-        self._value_error_if(not dq_view.is_contiguous(), "SM80 bwd THD: dQ must be compact BSHD (the packed path has no staging copy)")
+        dq_view = _kernel_view(as_bshd(dq_tensor), tq, hq, dqk, ts["dq"], "dQ")
         c.cast(_fd_tvm(dq_acc), _fd_tvm(dq_view), _fd_tvm(cu_q), _int32(b), _int32((tq * hq * dqk) // 2), launch_stream)
         if not dk_direct:
-            self._value_error_if(not dk_view.is_contiguous(), "SM80 bwd THD: dK must be compact BSHD (the packed path has no staging copy)")
             c.reduce_k(_fd_tvm(dk_ws), _fd_tvm(dk_view), _fd_tvm(cu_k), _int32(b), _int32(tkv * hkv * dqk), launch_stream)
         if not dv_direct:
-            self._value_error_if(not dv_view.is_contiguous(), "SM80 bwd THD: dV must be compact BSHD (the packed path has no staging copy)")
             c.reduce_v(_fd_tvm(dv_ws), _fd_tvm(dv_view), _fd_tvm(cu_k), _int32(b), _int32(tkv * hkv * dv_), launch_stream)
         if dsink_tensor is not None and dsink_acc is not None:
             dsink_tensor.view(-1).copy_(dsink_acc)
