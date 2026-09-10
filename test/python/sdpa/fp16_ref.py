@@ -146,10 +146,10 @@ def _score_blocks(q, k, attn_scale, mask):
         yield start, end, s
 
 
-def _prepare(q, k, v, padding, device):
-    q = q.to(dtype=torch.float32, device=device)
-    k = k.to(dtype=torch.float32, device=device)
-    v = v.to(dtype=torch.float32, device=device)
+def _prepare(q, k, v, padding, device, dtype=torch.float32):
+    q = q.to(dtype=dtype, device=device)
+    k = k.to(dtype=dtype, device=device)
+    v = v.to(dtype=dtype, device=device)
     if padding is not None:
         b = q.shape[0]
         seq_len_q, seq_len_kv = padding
