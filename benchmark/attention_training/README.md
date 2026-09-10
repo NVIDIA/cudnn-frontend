@@ -8,6 +8,7 @@ This directory contains benchmarking tools for Scaled Dot Product Attention (SDP
 
 - `Dockerfile` - Docker container setup for running benchmarks
 - `benchmark_single_sdpa.py` - Single SDPA benchmark script
+- `benchmark_nvfp4_qat_backward.py` - Triton NVFP4 QAT backward benchmark
 - `configs/` - Benchmark configuration files
   - `llama.py` - Llama 3.1 GQA benchmarks (causal + non-causal)
   - `dsv3.py` - DeepSeek V3 MLA benchmarks (asymmetric head dims, causal + non-causal)
@@ -217,6 +218,14 @@ python benchmark_single_sdpa.py \
 ```
 
 Run `python benchmark_single_sdpa.py --help` for all options.
+
+The experimental NVFP4 QAT backward API has a separate benchmark because its
+fake-quantized STE contract is not interchangeable with regular SDPA:
+
+```bash
+python benchmark/attention_training/benchmark_nvfp4_qat_backward.py \
+    --batch-size 1 --heads 16 --query-length 4096 --kv-length 4096
+```
 
 ## Comparing With `test_repro --perf`
 
