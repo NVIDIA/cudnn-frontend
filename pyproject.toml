@@ -117,9 +117,11 @@ build-backend = "setuptools.build_meta"
 packages = {find = {where = ["python", "."], include = ["cudnn*", "include"], namespaces = true}}
 package-dir = {"" = "python", "include" = "include"}
 include-package-data = true
+license-files = ["LICENSE.txt", "LICENSE-MIT.txt", "NOTICE", "THIRD_PARTY_LICENSES.txt"]
 
 [tool.setuptools.dynamic]
 version = {attr = "cudnn.__version__"}
 
 [tool.setuptools.package-data]
 include = ["**/*"]
+"cudnn.gemm.ops" = ["csrc/*.cu", "csrc/*.cuh"]

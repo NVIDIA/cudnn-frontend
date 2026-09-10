@@ -241,7 +241,7 @@ def _parse_args():
         "--mode",
         choices=MODE_DEFAULTS,
         default="smoke",
-        help="smoke keeps Qwen kernel dimensions but reduces tokens; formal requires a full 148-SM B200",
+        help="smoke keeps Qwen kernel dimensions but reduces tokens; formal uses the full workload and sampling protocol",
     )
     parser.add_argument("--preset", default=DEFAULT_PRESET)
     parser.add_argument("--layers", type=int)
@@ -366,20 +366,12 @@ def _serializable_args(args):
 
 def _pick_device(mode):
     visible = []
-    smoke_candidate = None
     for index in range(torch.cuda.device_count()):
         properties = torch.cuda.get_device_properties(index)
         visible.append(f"cuda:{index}={properties.name}/{properties.multi_processor_count}SM")
-        if properties.name == "NVIDIA B200" and properties.multi_processor_count == 148:
-            if mode == "formal":
-                return torch.device(f"cuda:{index}")
-            smoke_candidate = smoke_candidate or torch.device(f"cuda:{index}")
-        elif 100 <= properties.major * 10 + properties.minor < 120 and smoke_candidate is None:
-            smoke_candidate = torch.device(f"cuda:{index}")
-    if mode == "smoke" and smoke_candidate is not None:
-        return smoke_candidate
-    requirement = "a full 148-SM NVIDIA B200" if mode == "formal" else "an SM100-family Blackwell GPU"
-    raise RuntimeError(f"{mode} mode requires {requirement}; visible devices: " + ", ".join(visible))
+        if 100 <= properties.major * 10 + properties.minor < 120:
+            return torch.device(f"cuda:{index}")
+    raise RuntimeError(f"{mode} mode requires an SM100-family Blackwell GPU; visible devices: " + ", ".join(visible))
 
 
 def _run_experiment(args, qwen, device, properties, orders, started_utc):
@@ -939,8 +931,6 @@ def main():
         # Torch-versus-FE selector used by this matrix.
         qwen = _load_run_model()
         properties = torch.cuda.get_device_properties(device)
-        if args.mode == "formal" and (properties.name != "NVIDIA B200" or properties.multi_processor_count != 148):
-            raise RuntimeError("formal mode requires a full 148-SM NVIDIA B200, got " f"{properties.name}, {properties.multi_processor_count} SMs on {device}")
         _run_experiment(args, qwen, device, properties, orders, _utc_now())
 
 

@@ -82,6 +82,7 @@ First invocation builds the hook environments and can take >5 minutes; later run
 
 ## Conventions
 
+- Keep benchmark collection policy separate from runtime support checks: a request to measure on a particular full-SM GPU constrains the agent's measurement/reporting, not user-facing scripts. Gate on actual kernel capabilities, record device/SM-count metadata, and cover a supported non-matching GPU name and SM count in CPU-only device-selection tests.
 - `include/` is header-only: no `.cpp` files, no new required dependencies. Vendored third-party code lives in `include/cudnn_frontend/thirdparty/`.
 - Every new frontend-only Python API needs: `APIBase` subclass + wrapper, lazy export in `python/cudnn/__init__.py`, docs under `docs/fe-oss-apis/`, and pytest coverage under `test/python/fe_api/`. Full recipe: [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) and the `cutedsl-kernel-integration` skill.
 - Frontend-only OSS APIs are experimental; keep the lazy-import boundary intact (no eager `torch`/`cutlass` imports at `cudnn` import time). CuTeDSL is a required dependency now, but a tensor framework is not, and `import cudnn` still has to stay cheap.
