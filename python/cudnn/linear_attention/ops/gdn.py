@@ -88,6 +88,7 @@ def make_fprop_cache_key(
     checkpoint,
     device,
     plan_name,
+    state_pool_rows=None,
 ):
     return (
         "fprop",
@@ -120,6 +121,7 @@ def make_fprop_cache_key(
         checkpoint,
         device,
         plan_name,
+        state_pool_rows,
     )
 
 
@@ -221,6 +223,8 @@ def build_fprop_graph(
     gate_domain="log",
     a_log_dtype=None,
     dt_bias_dtype=None,
+    state_indices_dtype=None,
+    state_pool_rows=None,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -232,7 +236,13 @@ def build_fprop_graph(
     cu_t = graph.tensor([N + 1], data_type=cu_dtype, name="cu_seqlens")
     state0_t = None
     if state_dtype is not None:
-        state0_t = graph.tensor([N, HO, V, K], data_type=state_dtype, name="initial_state")
+        # With a pool-slot table the state buffer is the caller's pool, whose
+        # row count is independent of the number of sequences.
+        state_rows = N if state_pool_rows is None else state_pool_rows
+        state0_t = graph.tensor([state_rows, HO, V, K], data_type=state_dtype, name="initial_state")
+    state_indices_t = None
+    if state_indices_dtype is not None:
+        state_indices_t = graph.tensor([N], data_type=state_indices_dtype, name="state_indices")
     a_log_t = None
     dt_bias_t = None
     if a_log_dtype is not None:
@@ -247,6 +257,7 @@ def build_fprop_graph(
         beta=beta_t,
         cu_seqlens=cu_t,
         initial_state=state0_t,
+        state_indices=state_indices_t,
         a_log=a_log_t,
         dt_bias=dt_bias_t,
         scale=scale,
@@ -268,6 +279,7 @@ def build_fprop_graph(
         beta=beta_t,
         cu=cu_t,
         state0=state0_t,
+        state_indices=state_indices_t,
         a_log=a_log_t,
         dt_bias=dt_bias_t,
         O=O_t,
@@ -281,8 +293,7 @@ def build_fprop_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_net_fwd", mutates_args=())
-def gdn_fwd(
+def _gdn_fprop_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -302,6 +313,7 @@ def gdn_fwd(
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     plan_name: Optional[str] = None,
+    state_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDN forward over a cached single-node GDN pygraph in THD layout.
 
@@ -334,9 +346,19 @@ def gdn_fwd(
         raise ValueError(f"gated_delta_net: gate_domain must be 'log' or 'linear', got {gate_domain!r}")
     if gate_domain == "linear" and safe_gate:
         raise ValueError("gated_delta_net: gate_domain='linear' cannot combine with safe_gate=True")
+    state_pool_rows = None
+    if state_indices is not None:
+        if initial_state is None:
+            raise ValueError("gated_delta_net: state_indices selects rows of the initial_state pool, so initial_state is required")
+        check_dtype("state_indices", state_indices, torch.int32)
+        if state_indices.dim() != 1 or state_indices.shape[0] != N:
+            raise ValueError(f"gated_delta_net: state_indices must be [N] = [{N}]; got {tuple(state_indices.shape)}")
+        if int(checkpoint_every_n_tokens):
+            raise ValueError("gated_delta_net: state_indices cannot be combined with checkpoint_every_n_tokens")
+        state_pool_rows = int(initial_state.shape[0])
     if initial_state is not None:
         check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16))
-        if initial_state.shape[0] != N:
+        if state_indices is None and initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     for tensor_name, tensor in (
         ("k", k),
@@ -345,6 +367,7 @@ def gdn_fwd(
         ("beta", beta),
         ("cu_seqlens", cu_seqlens),
         ("initial_state", initial_state),
+        ("state_indices", state_indices),
         ("a_log", a_log),
         ("dt_bias", dt_bias),
     ):
@@ -384,6 +407,7 @@ def gdn_fwd(
         checkpoint,
         device,
         plan_name,
+        state_pool_rows,
     )
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(
@@ -410,6 +434,8 @@ def gdn_fwd(
             gate_domain=str(gate_domain),
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
+            state_indices_dtype=torch_dtype_to_cudnn(state_indices.dtype) if state_indices is not None else None,
+            state_pool_rows=state_pool_rows,
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -428,13 +454,20 @@ def gdn_fwd(
     }
     if state0 is not None:
         variant_pack[t["state0"]] = state0
+    if state_indices is not None:
+        variant_pack[t["state_indices"]] = state_indices
     if a_log is not None:
         variant_pack[t["a_log"]] = a_log
     if dt_bias is not None:
         variant_pack[t["dt_bias"]] = dt_bias
     final_state = torch.empty(0, dtype=state_out_dtype, device=device)
     if output_final_state:
-        final_state = torch.empty(N, HO, V, K, dtype=state_out_dtype, device=device)
+        if state_indices is not None:
+            # The pool is both source and destination: each sequence's final
+            # state is written back to the row it was seeded from, in place.
+            final_state = state0
+        else:
+            final_state = torch.empty(N, HO, V, K, dtype=state_out_dtype, device=device)
         variant_pack[t["fs"]] = final_state
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
     if checkpoint > 0:
@@ -443,6 +476,134 @@ def gdn_fwd(
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
     return o, final_state, state_checkpoints
+
+
+@torch.library.custom_op("cudnn::gated_delta_net_fwd", mutates_args=())
+def gdn_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    batch_invariant: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    allow_neg_eigval: bool = False,
+    safe_gate: bool = False,
+    gate_domain: str = "log",
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    checkpoint_every_n_tokens: int = 0,
+    plan_name: Optional[str] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GDN forward over sequence-ordered state (no pool indirection)."""
+    return _gdn_fprop_impl(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        batch_invariant=batch_invariant,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        safe_gate=safe_gate,
+        gate_domain=gate_domain,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        plan_name=plan_name,
+    )
+
+
+@torch.library.custom_op("cudnn::gated_delta_net_fwd_pooled", mutates_args=("initial_state",))
+def gdn_fwd_pooled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    batch_invariant: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    allow_neg_eigval: bool = False,
+    safe_gate: bool = False,
+    gate_domain: str = "log",
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    plan_name: Optional[str] = None,
+) -> torch.Tensor:
+    """GDN forward over a pool-addressed state; forward-only, no autograd.
+
+    ``initial_state`` is the caller's state pool and ``state_indices[i]`` is the
+    row holding sequence ``i``.  With ``output_final_state`` the same row is
+    overwritten with that sequence's final state, so the updated state is the
+    caller's pool rather than a returned tensor -- which is why only ``o`` comes
+    back and why the mutation is declared.
+    """
+    o, _, _ = _gdn_fprop_impl(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        batch_invariant=batch_invariant,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        safe_gate=safe_gate,
+        gate_domain=gate_domain,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        checkpoint_every_n_tokens=0,
+        plan_name=plan_name,
+        state_indices=state_indices,
+    )
+    return o
+
+
+@gdn_fwd_pooled.register_fake
+def gdn_fwd_pooled_fake(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    cu_seqlens,
+    scale,
+    initial_state,
+    state_indices,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    batch_invariant=False,
+    use_beta_sigmoid_in_kernel=False,
+    allow_neg_eigval=False,
+    safe_gate=False,
+    gate_domain="log",
+    a_log=None,
+    dt_bias=None,
+    plan_name: Optional[str] = None,
+):
+    total, H, _ = q.shape
+    HV, V = v.shape[1], v.shape[2]
+    return q.new_empty((total, max(H, HV), V))
 
 
 @gdn_fwd.register_fake
@@ -987,6 +1148,7 @@ def gated_delta_net(
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     plan_name: Optional[str] = None,
+    state_indices: Optional[torch.Tensor] = None,
 ):
     """Gated DeltaNet (GDN) linear attention.
 
@@ -1057,15 +1219,59 @@ def gated_delta_net(
         plan_name: optionally pin one execution plan by name (the plan
             API's ``get_plan_name_at_index`` names, e.g. ``gdn_frost``); a
             graph offering no such plan raises ``cudnnGraphNotSupportedError``.
+        state_indices: optional ``[N]`` int32 pool-slot table.  When given,
+            ``initial_state`` is a state **pool** ``[N_pool, HO, V, K]`` whose
+            first dimension is indexed by these row ids rather than laid out in
+            sequence order: sequence ``i`` reads its state from row
+            ``state_indices[i]`` and, under ``output_final_state``, writes its
+            final state back to that same row in place.  This lets a caller that
+            keeps a paged state pool (as vLLM and SGLang do) skip gathering the
+            active rows into a packed buffer and scattering the result back.
+            The pool may be non-compact.  Forward-only: this path is not
+            differentiable and cannot be combined with
+            ``checkpoint_every_n_tokens``.
+
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``, or
         ``(o, final_state, state_checkpoints)`` when ``checkpoint_every_n_tokens > 0``.
-        ``final_state`` is empty unless ``output_final_state=True``.
+        ``final_state`` is empty unless ``output_final_state=True``.  With
+        ``state_indices`` the returned ``final_state`` **is** the caller's pool,
+        updated in place.
     """
     if q.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
+    if state_indices is not None:
+        if int(checkpoint_every_n_tokens):
+            # The pooled op cannot honour checkpointing, so refuse rather than
+            # drop the request and hand back buffers the caller cannot interpret.
+            raise ValueError("gated_delta_net: state_indices cannot be combined with checkpoint_every_n_tokens")
+        o = torch.ops.cudnn.gated_delta_net_fwd_pooled(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens,
+            float(scale),
+            initial_state,
+            state_indices,
+            output_final_state=bool(output_final_state),
+            use_qk_l2norm_in_kernel=bool(use_qk_l2norm_in_kernel),
+            batch_invariant=bool(batch_invariant),
+            use_beta_sigmoid_in_kernel=bool(use_beta_sigmoid_in_kernel),
+            allow_neg_eigval=bool(allow_neg_eigval),
+            safe_gate=bool(safe_gate),
+            gate_domain=str(gate_domain),
+            a_log=a_log,
+            dt_bias=dt_bias,
+            plan_name=plan_name,
+        )
+        # The pool carries the updated state; hand it back as final_state so the
+        # return shape matches the packed path.
+        empty = q.new_empty(0, dtype=initial_state.dtype)
+        return o, (initial_state if output_final_state else empty)
     o, final_state, state_checkpoints = torch.ops.cudnn.gated_delta_net_fwd(
         q,
         k,
