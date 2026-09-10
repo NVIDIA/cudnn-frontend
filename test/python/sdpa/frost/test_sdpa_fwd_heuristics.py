@@ -24,6 +24,7 @@ from cudnn.sdpa.fwd import engines
 from cudnn.engines.heuristics import _assemble
 from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2
 
 _F16 = "sdpa_fwd_prefill_sm100"
 _OFFERED = {_F16: 20500, "sdpa_fwd_prefill_sm100_fp8": 20501}
@@ -139,6 +140,57 @@ def test_sm120_d192_keeps_sm120_cga_domain(engine_name, dtype, is_fp8):
     assert all(plan.knobs.cga == 1 for plan in plans)
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == engine_name)
     assert all(engines.mismatch(spec.capabilities, facts, plan.knobs) is None for plan in plans)
+
+
+@pytest.mark.L0
+def test_sm120_d512_flavor_pins_its_one_cta_tile():
+    """The d512 flavor is built for (64, 32) alone: the grid rule's tile_m and
+    the largest-fitting tile_n both yield to the kernel table
+    (config_sm120.tile_domain) on full and underfilled grids, and no runner-up
+    proposes another tile. At d128 the same table keeps kv_tile 32 out."""
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm120")
+    offered = {"sdpa_fwd_prefill_sm120": 20504}
+    for d_qk, d_v in ((264, 264), (264, 512), (512, 264), (272, 320), (384, 448), (496, 504), (512, 512)):
+        for s in (128, 16384):
+            facts = _facts(s_q=s, s_kv=s, h_q=64, h_kv=1, d_qk=d_qk, d_v=d_v, device_cc=(12, 0), device_sm_count=188)
+            plans = recommend("A", facts, offered)
+            assert plans
+            assert {(p.knobs.tile_m, p.knobs.tile_n) for p in plans} == {(64, 32)}
+            assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    facts = _facts(d_qk=128, d_v=128, device_cc=(12, 0), device_sm_count=188)
+    plans = recommend("A", facts, offered)
+    assert plans and all(p.knobs.tile_n != 32 for p in plans)
+
+
+@pytest.mark.L0
+def test_sm120_d512_sliding_window_packs_gqa():
+    """The d512 flavor packs the GQA group into its 64-row Q tile under a sliding
+    window (the packed unit's key span shrinks from 64 + W to 1 + W tokens for
+    MQA) and walks windowed units, packed or not, with plain LPT; a 128-head
+    group cannot pack into 64 rows, MHA has nothing to pack, and without a
+    window the decode rule (s_q < tile) and the L2 scheduler rule decide as
+    before."""
+    offered = {"sdpa_fwd_prefill_sm120": 20504}
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm120")
+
+    def primary(**over):
+        facts = _facts(**{**dict(s_q=16384, s_kv=16384, h_q=64, h_kv=1, d_qk=512, d_v=512, device_cc=(12, 0), device_sm_count=188), **over})
+        plans = recommend("A", facts, offered)
+        assert plans and engines.mismatch(spec.capabilities, facts, plans[0].knobs) is None
+        return plans[0].knobs
+
+    packed = primary(window_left=128)
+    assert (packed.pack_gqa, packed.tile_m, packed.sched_policy) == (True, 64, SCHED_LPT)  # packed window units walk plain LPT
+    assert primary(window_left=128, h_q=8, h_kv=1).pack_gqa is True
+    for d_qk, d_v in ((264, 512), (512, 264), (320, 384)):
+        packed = primary(window_left=128, d_qk=d_qk, d_v=d_v)
+        assert (packed.pack_gqa, packed.tile_m, packed.tile_n, packed.sched_policy) == (True, 64, 32, SCHED_LPT)
+    pro = primary(window_left=128, h_q=128, h_kv=1)  # G=128 does not divide the 64-row tile; windowed units still walk LPT
+    assert (pro.pack_gqa, pro.sched_policy) == (False, SCHED_LPT)
+    assert primary(window_left=128, h_q=64, h_kv=64).pack_gqa is False  # MHA
+    full_causal = primary()  # full causal prefill: decode rule only, L2 rule for the scheduler
+    assert (full_causal.pack_gqa, full_causal.sched_policy) == (False, SCHED_LPT_L2)
+    assert primary(window_left=128, d_qk=128, d_v=128).pack_gqa is False  # the rule is the d512 flavor's
 
 
 @pytest.mark.L0

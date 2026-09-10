@@ -51,12 +51,12 @@ def _expected_split(api):
     )
 
 
-def _sm120_case(h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True, causal=False, lse_layout="contiguous", split_kv=None):
+def _sm120_case(h_q, h_kv, s_q, s_kv, *, d=128, with_lse=False, workspace=True, causal=False, lse_layout="contiguous", split_kv=None):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("SM120 part required")
-    b, d, dev = 1, 128, "cuda"
+    b, dev = 1, "cuda"
     torch.manual_seed(0)
     q = torch.randn(b, h_q, s_q, d, device=dev, dtype=torch.float16)
     k = torch.randn(b, h_kv, s_kv, d, device=dev, dtype=torch.float16)
@@ -141,6 +141,14 @@ def test_sm120_split_with_and_without_workspace(workspace):
 def test_sm120_split_writes_the_recombined_lse():
     result = _sm120_case(8, 1, 128, 32768, with_lse=True)
     assert result.split == result.expected_split
+    assert (result.output - result.reference).abs().max().item() <= 2e-2
+
+
+def test_sm120_d512_split_recombines_o_and_lse():
+    """The d512 flavor under a KV split: its fp32 partial O (512 wide) and LSE
+    recombine through the shared combine pass."""
+    result = _sm120_case(8, 1, 64, 8192, d=512, with_lse=True, split_kv=4)
+    assert result.split == 4
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
