@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public API for the Triton NVFP4 QAT attention backward kernels."""
+"""Public API for NVFP4 QAT attention backward kernels."""
 
 from __future__ import annotations
 
@@ -57,6 +57,8 @@ class Nvfp4AttentionQatBackward(APIBase):
         *,
         is_causal: bool = False,
         softmax_scale: Optional[float] = None,
+        backend: str = "triton",
+        head_chunk: int = 0,
     ):
         """Capture the tensor contract and compile-time attention options."""
         super().__init__()
@@ -71,9 +73,22 @@ class Nvfp4AttentionQatBackward(APIBase):
         self.softmax_scale = None if softmax_scale is None else float(softmax_scale)
         self._workspace_bytes: Optional[int] = None
         self._launch_config: Optional[tuple[int, int, int, int, int]] = None
+        self.backend = backend
+        self.head_chunk = head_chunk
 
     def check_support(self) -> bool:
         """Validate the contract and derive workspace and launch metadata."""
+        self._value_error_if(self.backend not in ("triton", "cutedsl"), "backend must be 'triton' or 'cutedsl'")
+        self._value_error_if(type(self.head_chunk) is not int or self.head_chunk < 0, "head_chunk must be a nonnegative integer")
+        self._value_error_if(self.backend == "triton" and self.head_chunk != 0, "head_chunk is only supported by backend='cutedsl'")
+        if self.backend == "cutedsl":
+            from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state
+
+            message = cutedsl_requirement_error("NVFP4 QAT CuTe DSL backend")
+            if message:
+                raise NotImplementedError(message)
+            if not cutedsl_state()[0]:
+                raise ImportError("NVFP4 QAT CuTe DSL backend requires nvidia-cutlass-dsl >= 4.7.0")
         activations = (
             self.q_desc,
             self.k_desc,
@@ -116,6 +131,23 @@ class Nvfp4AttentionQatBackward(APIBase):
             self.softmax_scale = 1.0 / math.sqrt(head_dim)
         self._value_error_if(not math.isfinite(self.softmax_scale) or self.softmax_scale <= 0.0, "softmax_scale must be finite and positive")
 
+        if self.backend == "cutedsl":
+            self._not_implemented_error_if(capability != (10, 0), "NVFP4 QAT CuTe DSL backend currently supports SM100")
+            self._not_implemented_error_if(batch != 1 or self.is_causal, "NVFP4 QAT CuTe DSL backend requires B=1 and noncausal attention")
+            self._not_implemented_error_if(
+                seqlen_q != seqlen_kv or seqlen_q % 256 != 0,
+                "NVFP4 QAT CuTe DSL backend requires equal sequence lengths divisible by 256; use backend='triton' for tails",
+            )
+            chunk = self.head_chunk or heads
+            self._value_error_if(heads % chunk != 0, "head_chunk must divide the head count")
+            # Sizes only: do not import the version-specific kernel until compile.
+            fake_bytes = 3 * batch * heads * seqlen_q * head_dim * 2
+            delta_bytes = batch * heads * seqlen_q * 4
+            ds_bytes = batch * chunk * seqlen_q * seqlen_kv * 2
+            self._workspace_bytes = fake_bytes + delta_bytes + ds_bytes
+            self._is_supported = True
+            return True
+
         _, self._workspace_bytes = nvfp4_workspace_layout(
             self.q_desc.shape,
             self.k_desc.shape,
@@ -134,8 +166,14 @@ class Nvfp4AttentionQatBackward(APIBase):
         return True
 
     def compile(self) -> None:
-        """Compile the shape- and architecture-specialized Triton kernels."""
+        """Prepare the selected backend without launching kernels."""
         self._ensure_support_checked()
+        if self.backend == "cutedsl":
+            from ._cutedsl import PreparedBackward
+
+            with torch.cuda.device(self.q_desc.device):
+                self._compiled_kernel = PreparedBackward.compile(self.q_desc.shape[1], self.q_desc.shape[2], self.head_chunk or self.q_desc.shape[1])
+            return
         assert self.softmax_scale is not None
         assert self._launch_config is not None
         block_m, block_n, num_warps, dq_num_stages, dkdv_num_stages = self._launch_config
@@ -227,6 +265,22 @@ class Nvfp4AttentionQatBackward(APIBase):
         assert scale is not None
         if not math.isfinite(scale) or scale <= 0.0:
             raise ValueError("softmax_scale must be finite and positive")
+        if self.backend == "cutedsl":
+            with _stream_context(current_stream, q_tensor.device):
+                self._compiled_kernel.execute(
+                    q_tensor,
+                    k_tensor,
+                    v_tensor,
+                    high_precision_o_tensor,
+                    do_tensor,
+                    lse_tensor,
+                    dq_tensor,
+                    dk_tensor,
+                    dv_tensor,
+                    workspace,
+                    scale,
+                )
+            return
         assert self._launch_config is not None
         block_m, block_n, num_warps, dq_num_stages, dkdv_num_stages = self._launch_config
 
@@ -272,6 +326,8 @@ def nvfp4_attention_qat_backward(
     dk_tensor: Optional[torch.Tensor] = None,
     dv_tensor: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
+    backend: str = "triton",
+    head_chunk: int = 0,
 ) -> TupleDict:
     """Compute STE gradients for NVFP4 fake-quantized scaled dot-product attention.
 
@@ -286,7 +342,7 @@ def nvfp4_attention_qat_backward(
     key = tuple(
         (tensor.device, tuple(tensor.shape), tensor.dtype, tuple(tensor.stride()))
         for tensor in (q_tensor, k_tensor, v_tensor, high_precision_o_tensor, do_tensor, lse_tensor)
-    ) + (bool(is_causal),)
+    ) + (bool(is_causal), backend, head_chunk)
     op = _OBJECT_CACHE.get(key)
     if op is not None:
         _OBJECT_CACHE.move_to_end(key)
@@ -300,6 +356,8 @@ def nvfp4_attention_qat_backward(
             lse_tensor,
             is_causal=is_causal,
             softmax_scale=requested_scale,
+            backend=backend,
+            head_chunk=head_chunk,
         )
         op.check_support()
         op.compile()

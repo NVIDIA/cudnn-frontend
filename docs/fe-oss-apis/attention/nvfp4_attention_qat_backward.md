@@ -29,7 +29,7 @@ dV = fake_nvfp4(P)^T @ dO
   straight-through estimator (STE).
 - dV uses the NVFP4 fake-quantized probability.
 
-The implementation launches four kernels: fused Q fake-quantization/delta
+The default `backend="triton"` launches four kernels: fused Q fake-quantization/delta
 preprocessing, K/V fake-quantization, dQ, and dK/dV. Causal backward skips
 fully masked tiles while retaining the elementwise mask on the diagonal.
 The local-scale conversion uses precise division so exact E2M1 midpoints
@@ -114,8 +114,62 @@ workspace = torch.empty(op.scratch_workspace_bytes(), device=q.device, dtype=tor
 op.execute(q, k, v, high_precision_o, do, lse, dq, dk, dv, workspace)
 ```
 
-`compile()` materializes every shape- and architecture-specialized Triton
-kernel without launching it. `execute()` then reuses those cached artifacts.
+`compile()` materializes the selected backend's shape- and architecture-specialized
+kernels without launching them. `execute()` reuses those artifacts.
+
+## Opt-in CuTe DSL backend (SM100)
+
+Both the class constructor and wrapper accept `backend="cutedsl"`.
+The default remains `"triton"`; this is not an automatic dispatch policy.
+The CuTe DSL backend requires **CuTe DSL >= 4.7.0**, SM100, BF16, D128,
+B=1, equal query/KV head counts, noncausal attention, and equal positive
+sequence lengths divisible by 256. Unsupported declarations raise during
+`check_support()`; there is no padding, layout conversion, or silent fallback.
+Use the Triton backend for its wider support, including tails.
+
+```python
+op = Nvfp4AttentionQatBackward(
+    q, k, v, high_precision_o, do, lse,
+    backend="cutedsl", head_chunk=0,
+)
+op.check_support()
+op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), device=q.device, dtype=torch.uint8)
+op.execute(q, k, v, high_precision_o, do, lse, dq, dk, dv, workspace)
+```
+
+This backend reuses the Triton Q/delta and KV quantizers, then launches a
+two-CTA CuTe DSL dV/dS kernel and two output-buffer BF16 batched GEMMs for
+dQ/dK. The quantizers write their BSHD intermediates directly; the main kernel
+addresses caller-owned BHSD dO/dV natively. All stages honor `current_stream`.
+Compilation is plan-time-only; no mutable global configuration is switched
+between plans. The wrapper's bounded cache separates backend/head-chunk plans.
+
+The tradeoff is a materialized BF16 dS workspace. `head_chunk=0` computes all
+heads at once. A positive divisor of H reuses dS across head chunks, reducing
+its allocation at the cost of more launches. Total workspace, in bytes, is:
+
+```text
+3 * H * S * 128 * 2     # fake Q/K/V
++ H * S * 4            # raw FP32 delta
++ H_chunk * S * S * 2  # BF16 dS, reused across chunks
+```
+
+For H=3/S=32768, dS alone is 6 GiB with all heads or 2 GiB with
+`head_chunk=1`. This is not the total process memory footprint. Outputs,
+workspace and inputs must not overlap; concurrent executions need separate
+output/workspace storage. The wrapper allocates workspace each call; use the
+class API for explicit reuse and CUDA Graph capture, and warm up execution
+before capture to initialize the framework's GEMM runtime.
+
+Both backends implement the same local-scale-floor NVFP4/STE contract.
+The CuTe DSL path folds `softmax_scale` into dS before its BF16 store;
+the Triton path applies it after gradient accumulation. Expect small BF16
+rounding differences in dQ/dK, not bitwise identity.
+
+`benchmark/nvfp4_attention_qat/benchmark_backends.py` checks correctness and
+changed-input graph replay before timing complete backward with alternating
+backend order. These are backward-component measurements, not model E2E.
 
 ## Tensor contract
 
@@ -134,6 +188,9 @@ CUDA device. `softmax_scale` defaults to `1 / sqrt(128)` and must match the
 forward pass.
 
 ## Current support and limitations
+
+The following describes the default Triton backend; the opt-in CuTe DSL
+backend's narrower initial coverage is listed above.
 
 - GPU: SM100, SM103, SM120, and SM121 Blackwell.
 - Attention: MHA with equal query and KV head counts; head dimension 128.
