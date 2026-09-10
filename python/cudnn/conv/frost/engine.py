@@ -230,6 +230,17 @@ class _Sm100FrostConvPlan(CompiledPlan):
         _check_cutedsl("frost_conv dense convolution", DENSE_CUTEDSL_MIN_VERSION)
         _check_sm100()
 
+        # The dense template writes its epilogue result straight to Y; it has no
+        # path that emits a block-scale factor. Only the block-scale plan can fuse
+        # a terminal quantize, and it is selected on the presence of dequantized
+        # inputs, so a quantize without them has to be declined here rather than
+        # silently dropped.
+        if analysis.output_quantize_data is not None:
+            raise NotImplementedError(
+                "frost_conv: a fused block-scale quantize of the convolution output is only supported when both convolution "
+                "inputs are supplied by block-scale dequantize nodes"
+            )
+
         node = analysis.conv_node
         image, weight, output = analysis.image, analysis.weight, analysis.output
         tensors = (image, weight, output)
@@ -280,14 +291,21 @@ class _Sm100FrostConvPlan(CompiledPlan):
 
         _check_channels_last_3d_layout(tuple(zip(("image", "weight", "Y"), tensors)))
 
-    def __init__(self, compiled, tensors):
+    def __init__(self, compiled, tensors, device: int):
         self._compiled = compiled
         self._tensors = tuple(tensors)
         self._shapes = tuple(tuple(t.dim) for t in tensors)
         self._dtypes = tuple(_storage_dtype_name(t.data_type) for t in tensors)
         self._indices = None
+        self._device = int(device)
 
     def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
+        # The compiled artifact bakes in device properties (max active clusters), so it
+        # cannot be launched on a device other than the one it was built for.
+        launch_device = current_device()
+        if launch_device != self._device:
+            raise ValueError(f"frost_conv: plan was built for cuda:{self._device}, but execute would launch on cuda:{launch_device}")
+
         if self._indices is None:
             try:
                 self._indices = [variant_pack.index_of(tensor.uid) for tensor in self._tensors]
@@ -637,7 +655,7 @@ class FrostConvEngine(BaseEngine):
                     ab_dtype=ab_dtype,
                     c_dtype=c_dtype,
                 )
-                return _Sm100FrostConvPlan(compiled, (image, weight, output))
+                return _Sm100FrostConvPlan(compiled, (image, weight, output), current_device())
 
 
 def FrostConvEngines(ids: dict[str, int]) -> list[BaseEngine]:
