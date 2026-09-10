@@ -59,9 +59,7 @@ def measure(fn, iterations, samples):
         totals.append((finished - start) / (1000 * iterations))
         dispatches.append((submitted - start) / (1000 * iterations))
     require_exclusive_gpu()
-    return dict(
-        median_us=statistics.median(totals), min_us=min(totals), max_us=max(totals), dispatch_us=statistics.median(dispatches), samples_us=totals
-    )
+    return dict(median_us=statistics.median(totals), min_us=min(totals), max_us=max(totals), dispatch_us=statistics.median(dispatches), samples_us=totals)
 
 
 def capture(fn, repeats):
@@ -219,9 +217,7 @@ def main():
         hostname=subprocess.check_output(["hostname"], text=True).strip(),
         xla_flags=os.environ.get("XLA_FLAGS", ""),
         command_buffer_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL", "xla_gpu_graph_min_graph_size": 1},
-        gpu=subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name,uuid,driver_version,clocks.sm,clocks.mem", "--format=csv,noheader"], text=True
-        ).strip(),
+        gpu=subprocess.check_output(["nvidia-smi", "--query-gpu=name,uuid,driver_version,clocks.sm,clocks.mem", "--format=csv,noheader"], text=True).strip(),
         settings=vars(args) | {"output": str(args.output)},
         results=[],
     )

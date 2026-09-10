@@ -197,9 +197,7 @@ def block_sparse_attention_forward_jax(
         allow_empty_block_nums,
         None,
     )
-    o_tensor, lse_tensor = forward_call(c)(
-        q_tensor, k_tensor, v_tensor, q2k_block_index, q2k_block_index if q2k_block_nums is None else q2k_block_nums
-    )
+    o_tensor, lse_tensor = forward_call(c)(q_tensor, k_tensor, v_tensor, q2k_block_index, q2k_block_index if q2k_block_nums is None else q2k_block_nums)
     return BSAResult(o_tensor=o_tensor, lse_tensor=lse_tensor)
 
 

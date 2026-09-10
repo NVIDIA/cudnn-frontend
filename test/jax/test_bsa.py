@@ -62,9 +62,7 @@ def test_numerics_and_grad(layout, d, variable, bucket):
     grads = jax.jit(partial(backward, block_sparse_num=2, layout=layout, allow_empty_block_nums=variable, bucket_size_blocks=bucket))(
         do, q, k, v, o, lse, indices, q2k_block_nums=nums
     )
-    reference_grads = jax.grad(lambda q, k, v: jnp.sum(reference(q, k, v, indices, nums, layout)[0] * do.astype(jnp.float32)), argnums=(0, 1, 2))(
-        q, k, v
-    )
+    reference_grads = jax.grad(lambda q, k, v: jnp.sum(reference(q, k, v, indices, nums, layout)[0] * do.astype(jnp.float32)), argnums=(0, 1, 2))(q, k, v)
     for actual, desired in zip(grads, reference_grads):
         np.testing.assert_allclose(actual.astype(jnp.float32), desired.astype(jnp.float32), atol=3e-2, rtol=3e-2)
     grad_fn = jax.jit(
