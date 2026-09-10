@@ -7,7 +7,6 @@ from __future__ import annotations
 
 # Common
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -39,7 +38,6 @@ __all__ = [
     "_make_forward_case",
     "_naive_reference",
     "_output_as_float",
-    "_pad_wgrad_operands_for_grouped_kernel",
     "_poison_pre_reduced_for_test",
     "_poison_training_outputs_for_test",
     "_reference_backward",
@@ -634,20 +632,6 @@ def _unpack_wgrad_scale_part_bytes(
     return blocked[:rows, :columns]
 
 
-def _pack_wgrad_scale_part_bytes(logical: torch.Tensor) -> torch.Tensor:
-    """Apply grouped-wgrad's 128x4 scale-atom swizzle to raw bytes."""
-
-    if logical.ndim != 2:
-        raise ValueError("logical scale part must be rank 2")
-    rows, columns = logical.shape
-    if rows % 128 or columns % 4:
-        raise ValueError("logical scale part must have 128-aligned rows and 4-aligned columns")
-    row_atoms = rows // 128
-    column_atoms = columns // 4
-    atom_count = row_atoms * column_atoms
-    return logical.reshape(row_atoms, 128, column_atoms, 4).permute(0, 2, 1, 3).reshape(atom_count, 4, 32, 4).transpose(1, 2).reshape(-1)
-
-
 def _unpack_wgrad_scale_part(
     packed: torch.Tensor,
     rows: int,
@@ -658,105 +642,6 @@ def _unpack_wgrad_scale_part(
     return _unpack_wgrad_scale_part_bytes(packed, rows, columns).view(torch.float8_e8m0fnu).float()
 
 
-def _pad_wgrad_operand_for_grouped_kernel(
-    data: torch.Tensor,
-    scales: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    valid_route_counts: torch.Tensor,
-    *,
-    k_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Copy one operand and neutralize rows outside its valid expert ranges."""
-
-    if data.ndim != 2 or k_dim not in (0, 1):
-        raise ValueError("wgrad operand must be rank 2 with k_dim 0 or 1")
-    ends = [int(value) for value in expert_offsets.detach().cpu().tolist()]
-    valid_counts = [int(value) for value in valid_route_counts.detach().cpu().tolist()]
-    if len(ends) != len(valid_counts):
-        raise ValueError("expert offsets and valid route counts must have equal size")
-
-    padded_data = data.clone()
-    padded_scales = torch.empty_like(scales)
-    padded_scales.view(torch.uint8).fill_(127)
-    source_scale_bytes = scales.view(torch.uint8).reshape(-1)
-    padded_scale_bytes = padded_scales.view(torch.uint8).reshape(-1)
-    non_k = int(data.shape[1 - k_dim])
-    padded_non_k = _round_up(non_k, 128)
-    k_capacity = int(data.shape[k_dim])
-    previous = 0
-    scale_byte_offset = 0
-
-    for expert, (end, valid_count) in enumerate(zip(ends, valid_counts)):
-        if end < previous or end > k_capacity:
-            raise ValueError("expert offsets must be nondecreasing and fit the operand " f"K capacity ({k_capacity})")
-        extent = end - previous
-        if valid_count < 0 or valid_count > extent:
-            raise ValueError(f"expert {expert} valid route count {valid_count} exceeds " f"its padded extent {extent}")
-        if extent % 32:
-            raise ValueError("each padded expert K extent must be divisible by 32")
-        valid_end = previous + valid_count
-        if valid_end < end:
-            padded_data.narrow(k_dim, valid_end, end - valid_end).zero_()
-
-        if extent:
-            scale_columns = _round_up(extent // 32, 4)
-            scale_byte_count = padded_non_k * scale_columns
-            if scale_byte_offset + scale_byte_count > source_scale_bytes.numel():
-                raise ValueError("expert offsets exceed the scale tensor")
-            source_part = source_scale_bytes.narrow(
-                0,
-                scale_byte_offset,
-                scale_byte_count,
-            )
-            logical_scale = _unpack_wgrad_scale_part_bytes(
-                source_part,
-                padded_non_k,
-                scale_columns,
-            ).clone()
-            valid_scale_columns = (valid_count + 31) // 32
-            logical_scale[:, valid_scale_columns:].fill_(127)
-            if non_k < padded_non_k:
-                logical_scale[non_k:].fill_(127)
-            padded_scale_bytes.narrow(
-                0,
-                scale_byte_offset,
-                scale_byte_count,
-            ).copy_(_pack_wgrad_scale_part_bytes(logical_scale))
-            scale_byte_offset += scale_byte_count
-        previous = end
-
-    if previous < k_capacity:
-        padded_data.narrow(k_dim, previous, k_capacity - previous).zero_()
-    return padded_data, padded_scales
-
-
-def _pad_wgrad_operands_for_grouped_kernel(operands):
-    """Build a grouped-WGrad-compatible copy of poisoned MoeEP operands."""
-
-    replacements = {}
-    for prefix, k_dim in (("fc1", 1), ("fc2", 1)):
-        data, scales = _pad_wgrad_operand_for_grouped_kernel(
-            getattr(operands, f"{prefix}_a"),
-            getattr(operands, f"{prefix}_sfa"),
-            operands.expert_offsets,
-            operands.valid_route_counts,
-            k_dim=k_dim,
-        )
-        replacements[f"{prefix}_a"] = data
-        replacements[f"{prefix}_sfa"] = scales
-    for prefix, k_dim in (("fc1", 0), ("fc2", 0)):
-        data, scales = _pad_wgrad_operand_for_grouped_kernel(
-            getattr(operands, f"{prefix}_b"),
-            getattr(operands, f"{prefix}_sfb"),
-            operands.expert_offsets,
-            operands.valid_route_counts,
-            k_dim=k_dim,
-        )
-        replacements[f"{prefix}_b"] = data
-        replacements[f"{prefix}_sfb"] = scales
-    return replace(operands, **replacements)
-
-
 def _poison_training_outputs_for_test(forward_out, backward_out) -> None:
     """Poison caller-owned destinations without production-side fill ops.
 
@@ -764,7 +649,11 @@ def _poison_training_outputs_for_test(forward_out, backward_out) -> None:
     kernel accumulation buffer remains zero-initialized in production.
     """
 
-    for tensor in (forward_out.output, forward_out.fc1_a):
+    for tensor in (
+        forward_out.output,
+        forward_out.fc1_preact,
+        forward_out.fc1_a,
+    ):
         if tensor is not None:
             tensor.fill_(float("nan"))
     if forward_out.fc1_sfa is not None:

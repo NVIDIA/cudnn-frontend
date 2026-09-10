@@ -24,7 +24,6 @@ from moe_ep.moe_ep_test_support import (
     _grad_output,
     _interleave_fc1_wgrad,
     _output_as_float,
-    _pad_wgrad_operands_for_grouped_kernel,
     _poison_training_outputs_for_test,
     _reference_forward,
     make_distributed_forward_inputs,
@@ -385,8 +384,7 @@ def _run_backward_reference_case(
             expert_offsets=forward_out.expert_offsets,
             out=backward_out,
         )
-        padded_wgrads = _pad_wgrad_operands_for_grouped_kernel(actual_wgrads)
-        grouped_wgrads = _dense_wgrads_from_grouped_kernel(padded_wgrads)
+        grouped_wgrads = _dense_wgrads_from_grouped_kernel(actual_wgrads)
         torch.cuda.synchronize(device)
 
         # No rank may enter a local assertion while a peer is still inside a

@@ -872,7 +872,7 @@ def test_grouped_gemm_wgrad_wrapper_discrete_accepts_caller_workspace(monkeypatc
 
 @pytest.mark.L0
 def test_grouped_gemm_wgrad_workspace_size():
-    assert cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(2) == 512
+    assert cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(2) == 1024
     assert (
         cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(
             2,

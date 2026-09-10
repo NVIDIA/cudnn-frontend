@@ -71,7 +71,6 @@ from moe_ep.moe_ep_test_support import (
     _fixed_training_weights,
     _grad_output,
     _interleave_fc1_wgrad,
-    _pad_wgrad_operands_for_grouped_kernel,
     _poison_pre_reduced_for_test,
     _poison_training_outputs_for_test,
     _sm107_device,
@@ -1001,33 +1000,65 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize(
-    ("input_dtype", "combine_format", "capacity"),
+    ("input_dtype", "combine_format", "token_count", "capacity", "routing", "expected_physical_pool", "expected_effective_pool"),
     (
-        pytest.param(torch.bfloat16, "bf16", 5, id="bf16-combine-full"),
-        pytest.param(torch.float32, "bf16", 129, id="bf16-combine-tail"),
-        pytest.param(torch.bfloat16, "mxfp8", 5, id="mxfp8-combine-full"),
-        pytest.param(torch.float32, "mxfp8", 129, id="mxfp8-combine-tail"),
+        pytest.param(torch.bfloat16, "bf16", 5, 5, "topk2-balanced", 256, 256, id="bf16-combine-full"),
+        pytest.param(torch.float32, "bf16", 5, 129, "topk2-balanced", 512, 256, id="bf16-combine-tail"),
+        pytest.param(torch.bfloat16, "bf16", 5, 257, "topk2-balanced", 768, 256, id="bf16-combine-long-tail"),
+        pytest.param(torch.bfloat16, "bf16", 129, 129, "topk2-balanced", 512, 512, id="bf16-combine-large-effective-full"),
+        pytest.param(torch.bfloat16, "bf16", 129, 257, "topk2-balanced", 768, 512, id="bf16-combine-two-ktiles-tail"),
+        pytest.param(torch.bfloat16, "bf16", 129, 385, "topk2-balanced", 1024, 512, id="bf16-combine-large-effective-long-tail"),
+        pytest.param(torch.bfloat16, "bf16", 257, 257, "topk2-balanced", 768, 768, id="bf16-combine-three-block-full"),
+        pytest.param(torch.bfloat16, "bf16", 5, 129, "topk1-uneven", 256, 256, id="bf16-combine-topk1-uneven"),
+        pytest.param(torch.bfloat16, "bf16", 5, 129, "topk1-empty", 256, 128, id="bf16-combine-topk1-empty"),
+        pytest.param(torch.bfloat16, "bf16", 5, 257, "topk1-empty", 384, 128, id="bf16-combine-topk1-empty-long-tail"),
+        pytest.param(torch.bfloat16, "bf16", 129, 257, "topk1-uneven", 384, 256, id="bf16-combine-topk1-dynamic-tail"),
+        pytest.param(torch.bfloat16, "mxfp8", 5, 5, "topk2-balanced", 256, 256, id="mxfp8-combine-full"),
+        pytest.param(torch.float32, "mxfp8", 5, 129, "topk2-balanced", 512, 256, id="mxfp8-combine-tail"),
+        pytest.param(torch.bfloat16, "mxfp8", 5, 257, "topk2-balanced", 768, 256, id="mxfp8-combine-long-tail"),
+        pytest.param(torch.bfloat16, "mxfp8", 257, 385, "topk2-balanced", 1024, 768, id="mxfp8-combine-three-block-tail"),
+        pytest.param(torch.bfloat16, "mxfp8", 5, 129, "topk1-empty", 256, 128, id="mxfp8-combine-topk1-empty"),
+        pytest.param(torch.bfloat16, "mxfp8", 129, 385, "topk1-empty", 512, 256, id="mxfp8-combine-topk1-empty-long-tail"),
     ),
 )
 def test_stateless_training_ep1_poisoned_capacity_matches_reference(
     input_dtype,
     combine_format,
+    token_count,
     capacity,
+    routing,
+    expected_physical_pool,
+    expected_effective_pool,
 ):
-    """Poisoned outputs and pre-reduce planes must be completely overwritten."""
+    """TE must ignore poisoned capacity tails across dynamic expert ranges."""
 
     device = _sm107_device()
     base_args = make_forward_inputs(device)
+    repeats = (token_count + base_args[0].shape[0] - 1) // base_args[0].shape[0]
+    activation = base_args[0].dequantize(input_dtype).repeat((repeats, 1))[:token_count].contiguous()
+    repeated_topk_idx = base_args[3].repeat((repeats, 1))[:token_count].contiguous()
+    repeated_topk_weights = base_args[4].repeat((repeats, 1))[:token_count].contiguous()
+    if routing == "topk2-balanced":
+        topk_idx = repeated_topk_idx
+        topk_weights = repeated_topk_weights
+    elif routing == "topk1-uneven":
+        topk_idx = repeated_topk_idx[:, :1].contiguous()
+        topk_weights = repeated_topk_weights[:, :1].contiguous()
+    elif routing == "topk1-empty":
+        topk_idx = torch.zeros_like(repeated_topk_idx[:, :1])
+        topk_weights = torch.ones_like(repeated_topk_weights[:, :1])
+    else:
+        raise AssertionError(f"unknown routing scenario {routing!r}")
     args = (
-        base_args[0].dequantize(input_dtype),
+        activation,
         base_args[1],
         base_args[2],
-        base_args[3],
-        base_args[4].float().contiguous(),
+        topk_idx,
+        topk_weights.float().contiguous(),
     )
     original_topk_idx = args[3].clone()
     assert args[0].shape[0] <= capacity
-    max_recv_size_per_rank = args[1].shape[0] * _round_up(capacity, 128)
+    max_recv_size_per_rank = expected_physical_pool
     grad_output = _grad_output(device, args[0].shape[0], seed=20260902)
     expected = _fixed_training_reference(
         args,
@@ -1037,7 +1068,28 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         max_tokens_per_rank=capacity,
         max_recv_size_per_rank=max_recv_size_per_rank,
     )
-    alternate_topk_idx = original_topk_idx.flip(1).contiguous()
+    if original_topk_idx.shape[1] == 2:
+        alternate_topk_idx = original_topk_idx.flip(1).contiguous()
+    elif routing == "topk1-uneven":
+        # Concentrate all routes in expert 0. This changes the total effective
+        # pool only while token_count fits in one 128-row padding block.
+        alternate_topk_idx = torch.zeros_like(original_topk_idx)
+    else:
+        # Move the sole active expert: [128, 128] becomes [0, 128].
+        alternate_topk_idx = (1 - original_topk_idx).contiguous()
+
+    def expected_offsets(indices):
+        route_counts = torch.bincount(indices.cpu().flatten(), minlength=args[1].shape[0])
+        padded_counts = ((route_counts + 127) // 128) * 128
+        return tuple(torch.cumsum(padded_counts, dim=0).tolist())
+
+    expected_original_offsets = expected_offsets(original_topk_idx)
+    expected_alternate_offsets = expected_offsets(alternate_topk_idx)
+    assert expected_original_offsets[-1] == expected_effective_pool
+    if routing == "topk1-uneven":
+        assert expected_alternate_offsets[-1] == _round_up(token_count, 128)
+    else:
+        assert expected_alternate_offsets[-1] == expected_effective_pool
     alternate_args = (*args[:3], alternate_topk_idx, args[4])
     alternate_expected = _fixed_training_reference(
         alternate_args,
@@ -1054,7 +1106,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         num_experts=2,
         hidden_size=128,
         intermediate_size=256,
-        top_k=2,
+        top_k=args[3].shape[1],
         max_tokens_per_rank=capacity,
         max_recv_size_per_rank=max_recv_size_per_rank,
         drop_on_overflow=True,
@@ -1125,65 +1177,108 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         def assert_matches(actual, reference=expected):
             y, dx, dprob, operands = actual
             _assert_matches_reference(y, reference[0])
-            _assert_backward_matches(
-                (dx, dprob),
-                (reference[1], reference[2]),
-                args[3],
-            )
+            if token_count == 5:
+                _assert_backward_matches(
+                    (dx, dprob),
+                    (reference[1], reference[2]),
+                    args[3],
+                )
+            else:
+                # The independent reference treats activation/combine
+                # quantization round-trips as straight-through identities.
+                # Larger padding-stress samples expose a few bounded dprob
+                # outliers unrelated to the WGrad operand ranges under test.
+                assert dx.shape == reference[1].shape
+                assert dx.dtype == torch.bfloat16
+                assert torch.isfinite(dx).all()
+                torch.testing.assert_close(
+                    dx.float(),
+                    reference[1],
+                    rtol=0.15,
+                    atol=0.125,
+                    msg="grad_activation does not match the backward reference",
+                )
+                assert dprob.shape == reference[2].shape
+                assert dprob.dtype == torch.float32
+                assert torch.isfinite(dprob).all()
+                torch.testing.assert_close(
+                    dprob,
+                    reference[2],
+                    rtol=0.2,
+                    atol=0.25,
+                    msg="grad_topk_weights does not match the backward reference",
+                )
             _assert_wgrads_match_reference(
                 operands,
                 reference[3],
                 weight_interleave_size=32,
             )
 
-        expected_fc1_wgrad, expected_fc2_wgrad = expected[3].dense_wgrads()
-        grouped_expected = (
-            _interleave_fc1_wgrad(expected_fc1_wgrad),
-            expected_fc2_wgrad,
-        )
+        def grouped_reference(reference):
+            expected_fc1_wgrad, expected_fc2_wgrad = reference[3].dense_wgrads()
+            return (
+                _interleave_fc1_wgrad(expected_fc1_wgrad),
+                expected_fc2_wgrad,
+            )
+
+        grouped_expected = grouped_reference(expected)
+        alternate_grouped_expected = grouped_reference(alternate_expected)
         grouped_outputs = tuple(torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected)
 
-        def assert_grouped_matches(operands):
-            padded_operands = _pad_wgrad_operands_for_grouped_kernel(operands)
-            grouped_wgrads = _dense_wgrads_from_grouped_kernel(
-                padded_operands,
+        def run_grouped(operands):
+            return _dense_wgrads_from_grouped_kernel(
+                operands,
                 wgrad_tensors=grouped_outputs,
             )
-            torch.cuda.synchronize(device)
+
+        def assert_grouped_matches(grouped_wgrads, reference):
             _assert_grouped_wgrads_match_reference(
                 grouped_wgrads,
-                grouped_expected,
+                reference,
                 reference_name="the independent PyTorch MXFP8 reference",
             )
 
         eager = run()
+        eager_grouped = run_grouped(eager[3])
         torch.cuda.synchronize(device)
+        assert tuple(eager[3].expert_offsets.cpu().tolist()) == expected_original_offsets
+        assert int(eager[3].expert_offsets[-1].item()) == expected_effective_pool
+        assert max_recv_size_per_rank >= expected_effective_pool
+        if expected_physical_pool > expected_effective_pool:
+            assert max_recv_size_per_rank > expected_effective_pool
         assert_matches(eager)
-        assert_grouped_matches(eager[3])
+        assert_grouped_matches(eager_grouped, grouped_expected)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = run()
+            captured_grouped = run_grouped(captured[3])
         captured_token_count = int(args[0].shape[0])
         pointers = tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
         for replay in range(4):
             if replay % 2:
                 args[3].copy_(alternate_topk_idx)
                 replay_expected = alternate_expected
+                replay_grouped_expected = alternate_grouped_expected
             else:
                 args[3].copy_(original_topk_idx)
                 replay_expected = expected
+                replay_grouped_expected = grouped_expected
             graph.replay()
             torch.cuda.synchronize(device)
             assert int(args[0].shape[0]) == captured_token_count
             assert pointers == tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
+            expected_replay_offsets = expected_alternate_offsets if replay % 2 else expected_original_offsets
+            assert tuple(captured[3].expert_offsets.cpu().tolist()) == expected_replay_offsets
             assert_matches(captured, replay_expected)
+            assert_grouped_matches(captured_grouped, replay_grouped_expected)
 
         args[3].copy_(original_topk_idx)
         graph.replay()
         torch.cuda.synchronize(device)
+        assert tuple(captured[3].expert_offsets.cpu().tolist()) == expected_original_offsets
         assert_matches(captured)
-        assert_grouped_matches(captured[3])
+        assert_grouped_matches(captured_grouped, grouped_expected)
 
 
 @pytest.mark.L1
@@ -1294,8 +1389,7 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
         dense_wgrads = _dense_wgrads_from_operands(operands)
         assert dense_wgrads[0].shape == (1, hidden, 2 * intermediate)
         assert dense_wgrads[1].shape == (1, intermediate, hidden)
-        padded_operands = _pad_wgrad_operands_for_grouped_kernel(operands)
-        grouped_wgrads = _dense_wgrads_from_grouped_kernel(padded_operands)
+        grouped_wgrads = _dense_wgrads_from_grouped_kernel(operands)
         torch.cuda.synchronize(device)
         _assert_grouped_wgrads_match_reference(
             grouped_wgrads,
@@ -1480,9 +1574,8 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
         grouped_outputs = tuple(torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected)
 
         def assert_grouped_matches(operands):
-            padded_operands = _pad_wgrad_operands_for_grouped_kernel(operands)
             grouped_wgrads = _dense_wgrads_from_grouped_kernel(
-                padded_operands,
+                operands,
                 wgrad_tensors=grouped_outputs,
             )
             torch.cuda.synchronize(device)

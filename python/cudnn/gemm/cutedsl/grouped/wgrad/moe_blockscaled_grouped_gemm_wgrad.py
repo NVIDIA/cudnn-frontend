@@ -483,27 +483,21 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # =================================================================
         # Step 6: Launch helper kernel (both Dense and Discrete)
         # =================================================================
-        # Builds expert-wise SFA/SFB TMA descs (both modes) + C descs
-        # (Discrete only). The WgradSfTensormapConstructor is created inside
-        # the kernel body from the raw params — it has too many Constexpr
-        # fields for MLIR serialization as a kernel argument.
+        # Builds expert-wise A/B/SFA/SFB TMA descs (both modes) + C descs
+        # (Discrete only). A/B descriptors give Tensor2D inputs expert-local
+        # K bounds instead of the fixed physical-pool bound.
+        # The WgradSfTensormapConstructor is created inside the kernel body
+        # from the raw params — it has too many Constexpr fields for MLIR
+        # serialization as a kernel argument.
         # Dense passes None for C-related params; no if-else branch needed.
         sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
         sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
-        if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged):
-            a_gemm_helper = a_gemm
-            b_gemm_helper = b_gemm
-            a_op_helper = a_op
-            b_op_helper = b_op
-            a_smem_layout_helper = a_smem_layout
-            b_smem_layout_helper = b_smem_layout
-        else:
-            a_gemm_helper = None
-            b_gemm_helper = None
-            a_op_helper = None
-            b_op_helper = None
-            a_smem_layout_helper = None
-            b_smem_layout_helper = None
+        a_gemm_helper = a_gemm
+        b_gemm_helper = b_gemm
+        a_op_helper = a_op
+        b_op_helper = b_op
+        a_smem_layout_helper = a_smem_layout
+        b_smem_layout_helper = b_smem_layout
 
         # Blackwell's epilogue tile is an MLIR-backed layout and must be
         # created outside the isolated helper-kernel region. Rubin uses a

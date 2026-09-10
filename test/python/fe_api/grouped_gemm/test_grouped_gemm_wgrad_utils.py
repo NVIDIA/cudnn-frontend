@@ -73,7 +73,12 @@ def _wgrad_create_fp8_tensor(shape: tuple, data_dtype: torch.dtype) -> torch.Ten
     return torch.randint(-1, 2, (elem_cnt,), dtype=torch.bfloat16, device="cuda").to(data_dtype).reshape(shape)
 
 
-def _wgrad_create_fp4_tensor(logical_shape: tuple, packed_dim: int = -1) -> torch.Tensor:
+def _wgrad_create_fp4_tensor(
+    logical_shape: tuple,
+    packed_dim: int = -1,
+    *,
+    return_logical: bool = False,
+):
     fp4_nibble_map = {0: 0x0, 1: 0x2, -1: 0xA}
     ndim = len(logical_shape)
     packed_dim = packed_dim % ndim
@@ -97,6 +102,8 @@ def _wgrad_create_fp4_tensor(logical_shape: tuple, packed_dim: int = -1) -> torc
         inv_perm = list(range(ndim))
         inv_perm[packed_dim], inv_perm[-1] = inv_perm[-1], inv_perm[packed_dim]
         tensor = tensor.permute(inv_perm)
+    if return_logical:
+        return tensor, idx_tensor.to(torch.float32)
     return tensor
 
 
@@ -136,6 +143,35 @@ def _wgrad_assemble_scales_2d2d(raw_scales: list, non_k_size: int) -> torch.Tens
     flat_parts = [_wgrad_to_blocked(scale) for scale in raw_scales]
     all_flat = _wgrad_cat_byte_reinterpretable(flat_parts, dim=0)
     return all_flat.reshape(_wgrad_round_up(non_k_size, 128), -1)
+
+
+def _wgrad_independent_reference(
+    logical_a: torch.Tensor,
+    logical_b: torch.Tensor,
+    raw_scale_a: list,
+    raw_scale_b: list,
+    group_k_list: list,
+    sf_vec_size: int,
+    output_dtype: torch.dtype,
+    global_scale_a: torch.Tensor | None = None,
+    global_scale_b: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reference grouped WGrad without the architecture-specific grouped kernel."""
+    outputs = []
+    token_offset = 0
+    for expert_idx, tokens_i in enumerate(group_k_list):
+        token_end = token_offset + tokens_i
+        scale_a = raw_scale_a[expert_idx].float().repeat_interleave(sf_vec_size, dim=1)[:, :tokens_i]
+        scale_b = raw_scale_b[expert_idx].float().repeat_interleave(sf_vec_size, dim=1)[:, :tokens_i].T
+        a_i = logical_a[:, token_offset:token_end].float() * scale_a
+        b_i = logical_b[token_offset:token_end, :].float() * scale_b
+        output_i = a_i @ b_i
+        if global_scale_a is not None:
+            assert global_scale_b is not None
+            output_i = output_i * global_scale_a[expert_idx] * global_scale_b[expert_idx]
+        outputs.append(output_i.to(output_dtype))
+        token_offset = token_end
+    return torch.stack(outputs)
 
 
 def wgrad_to_ragged_layout(mat_2d: torch.Tensor, group_k_list: list, k_dim: int) -> torch.Tensor:
@@ -220,6 +256,8 @@ def grouped_gemm_wgrad_init(
 
 def allocate_grouped_gemm_wgrad_tensors(cfg: Dict[str, Any]) -> Dict[str, Any]:
     m, n, l = cfg["m"], cfg["n"], cfg["l"]
+    major, minor = torch.cuda.get_device_capability()
+    compute_capability = major * 10 + minor
     group_k_list = cfg["group_k_list"]
     tokens_sum = sum(group_k_list)
     ab_dtype = cfg["ab_dtype"]
@@ -228,12 +266,22 @@ def allocate_grouped_gemm_wgrad_tensors(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     is_fp4 = ab_dtype == torch.float4_e2m1fn_x2
     if is_fp4:
-        a_tensor = _wgrad_create_fp4_tensor((m, tokens_sum), packed_dim=-1)
-        b_tensor = _wgrad_create_fp4_tensor((tokens_sum, n), packed_dim=0)
+        a_tensor, logical_a = _wgrad_create_fp4_tensor(
+            (m, tokens_sum),
+            packed_dim=-1,
+            return_logical=True,
+        )
+        b_tensor, logical_b = _wgrad_create_fp4_tensor(
+            (tokens_sum, n),
+            packed_dim=0,
+            return_logical=True,
+        )
         has_global_scale = sf_vec_size == 16
     else:
         a_tensor = _wgrad_create_fp8_tensor((m, tokens_sum), ab_dtype)
         b_tensor = _wgrad_create_fp8_tensor((tokens_sum, n), ab_dtype).T.contiguous().T
+        logical_a = a_tensor.float()
+        logical_b = b_tensor.float()
         has_global_scale = False
 
     offsets_tensor = torch.tensor([sum(group_k_list[: i + 1]) for i in range(l)], dtype=torch.int32, device="cuda")
@@ -246,35 +294,54 @@ def allocate_grouped_gemm_wgrad_tensors(cfg: Dict[str, Any]) -> Dict[str, Any]:
     global_scale_b = torch.randint(1, 3, (l,), dtype=torch.float32, device="cuda") if has_global_scale else None
 
     ref_result = None
-    try:
-        from torch.nn.functional import scaled_grouped_mm, ScalingType, SwizzleType
-
-        scale_a_arg = sfa_tensor
-        scale_b_arg = sfb_tensor
-        recipe_a = ScalingType.BlockWise1x32
-        recipe_b = ScalingType.BlockWise1x32
-        if has_global_scale:
-            scale_a_arg = [sfa_tensor, global_scale_a]
-            scale_b_arg = [sfb_tensor, global_scale_b]
-            recipe_a = [ScalingType.BlockWise1x16, ScalingType.TensorWise]
-            recipe_b = [ScalingType.BlockWise1x16, ScalingType.TensorWise]
-
-        ref_result = scaled_grouped_mm(
-            a_tensor,
-            b_tensor,
-            scale_a=scale_a_arg,
-            scale_recipe_a=recipe_a,
-            scale_b=scale_b_arg,
-            scale_recipe_b=recipe_b,
-            swizzle_a=SwizzleType.SWIZZLE_32_4_4,
-            swizzle_b=SwizzleType.SWIZZLE_32_4_4,
-            offs=offsets_tensor,
-            output_dtype=cfg["wgrad_dtype"],
+    if compute_capability == 107:
+        # torch.nn.functional.scaled_grouped_mm currently launches an
+        # architecture-incompatible TMA/TMEM kernel on Rubin and reports the
+        # failure only at the next CUDA synchronization point.
+        ref_result = _wgrad_independent_reference(
+            logical_a,
+            logical_b,
+            raw_scale_a,
+            raw_scale_b,
+            group_k_list,
+            sf_vec_size,
+            cfg["wgrad_dtype"],
+            global_scale_a,
+            global_scale_b,
         )
-    except (ImportError, ValueError, RuntimeError) as exc:
-        if not isinstance(exc, ImportError) and "No gemm implementation was found" not in str(exc):
-            raise
-        ref_result = None
+    else:
+        try:
+            from torch.nn.functional import scaled_grouped_mm, ScalingType, SwizzleType
+
+            scale_a_arg = sfa_tensor
+            scale_b_arg = sfb_tensor
+            recipe_a = ScalingType.BlockWise1x32
+            recipe_b = ScalingType.BlockWise1x32
+            if has_global_scale:
+                scale_a_arg = [sfa_tensor, global_scale_a]
+                scale_b_arg = [sfb_tensor, global_scale_b]
+                recipe_a = [ScalingType.BlockWise1x16, ScalingType.TensorWise]
+                recipe_b = [ScalingType.BlockWise1x16, ScalingType.TensorWise]
+
+            ref_result = scaled_grouped_mm(
+                a_tensor,
+                b_tensor,
+                scale_a=scale_a_arg,
+                scale_recipe_a=recipe_a,
+                scale_b=scale_b_arg,
+                scale_recipe_b=recipe_b,
+                swizzle_a=SwizzleType.SWIZZLE_32_4_4,
+                swizzle_b=SwizzleType.SWIZZLE_32_4_4,
+                offs=offsets_tensor,
+                output_dtype=cfg["wgrad_dtype"],
+            )
+        except (ImportError, ValueError, RuntimeError) as exc:
+            if not isinstance(exc, ImportError) and "No gemm implementation was found" not in str(exc):
+                raise
+            ref_result = None
+    # Keep a reference-kernel failure from being reported later as a failure
+    # in GroupedGemmWgradSm100.check_support() or execute().
+    torch.cuda.synchronize()
 
     return {
         "a_tensor": a_tensor,
