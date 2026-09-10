@@ -173,7 +173,7 @@ class Capabilities:
     # `thd_causal` and `thd_gqa` were both removed on exactly that rule, once
     # sdpa_bwd_sm100 -- then the only row that set `thd` -- served the causal
     # family and then GQA. NOTHING is left here: the packed path's remaining
-    # limits (`thd_declared_totals`, compact BSHD, no bias) are not feature
+    # limits (`thd_declared_totals`, packed BSHD rows, no bias) are not feature
     # conjunctions, they are properties of the path itself and mismatch()
     # applies them to every THD row. Think twice before adding another.
     # True when THD REQUIRES sdpa(max_total_seq_len_q=..., max_total_seq_len_kv=...):
@@ -314,14 +314,18 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
                 "the packed workspace is sized from the declared token totals at build time"
             )
         # The packed path binds the caller's buffers straight to kernels whose
-        # operands are compact BSHD; it has no staging copy to fix a layout up.
+        # operands are BSHD rows; it has no staging copy to fix a layout up.
         if not facts.bshd_layout:
             return "Q/K/V/O/dO/dQ/dK/dV must be BSHD-physical under THD (the packed path has no staging copy)"
-        # COMPACT, not just BSHD-ordered: the kernels address packed rows from H
-        # and D alone (head stride D, token stride H*D, element stride 1), so a
-        # port declared as a view into a wider per-token record (a K or V slice
-        # of an interleaved [T, 2, H, D] buffer, token stride 2*H*D) would be
-        # read at the wrong rows. The batch stride is not consulted (a ragged
+        # PACKED rows, not necessarily compact: the kernels address a row as
+        # ``token * token_stride + head * D + col`` with each port's own
+        # plan-time token stride, so a port declared as a view into a wider
+        # per-token record (a K or V slice of an interleaved [T, 2, H, D]
+        # buffer, token stride 2*H*D) is served at that stride. Required: head
+        # stride D (no head stride is read), element stride 1, and a token
+        # stride that covers the row (>= H*D) and keeps every row 16-byte
+        # aligned (a multiple of 8 fp16/bf16 elements -- the cp.async loads
+        # move 16-byte chunks). The batch stride is not consulted (a ragged
         # port's sequences start at its ragged offsets). The TOKEN stride is
         # always checked: the packed view walks every token of every sequence
         # with it, so it is load-bearing even when the envelope S_max is 1.
@@ -330,11 +334,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         # keeps the ranked plan list honest.
         for name, dim, stride in facts.port_layouts:
             _, h, _, d = (int(x) for x in dim)
+            ts = int(stride[2])
             head_ok = int(dim[1]) == 1 or int(stride[1]) == d
-            token_ok = int(stride[2]) == h * d
+            token_ok = ts >= h * d and ts % 8 == 0
             elem_ok = d == 1 or int(stride[3]) == 1
             if not (head_ok and token_ok and elem_ok):
-                return f"{name} must be compact BSHD under THD (head stride D, token stride H*D); got stride {tuple(stride)}"
+                return (
+                    f"{name} must be packed BSHD rows under THD (head stride D, element stride 1, "
+                    f"token stride >= H*D and a multiple of 8 elements); got stride {tuple(stride)}"
+                )
         # A packed graph has no [B, H, S_q, S_kv] bias: the per-sequence score
         # rectangles are different sizes, and the kernels' bias read is the
         # dense one. Dense-only on every THD row.
@@ -744,9 +752,10 @@ def _sm80_spec() -> EngineSpec:
     (no tunables wired).  sm80 exactly: the kernels assume the A100's 164 KiB
     opt-in SMEM, which the sm86/sm89 parts do not have.
 
-    THD / ragged: served on the packed ``[1, T, H, D]`` path (compact BSHD
-    ports, per-batch ``seq_len_q/kv`` turned into device ``cu_seqlens`` by a
-    setup launch, Stats read in either packed packing, declared totals sizing
+    THD / ragged: served on the packed ``[1, T, H, D]`` path (BSHD ports each
+    at its own token stride -- a K/V slice of an interleaved record included --
+    per-batch ``seq_len_q/kv`` turned into device ``cu_seqlens`` by a setup
+    launch, Stats read in either packed packing, declared totals sizing
     the carved scratch -- hence ``thd_declared_totals``).  Deterministic dQ,
     sinks, GQA, the causal family and head-dim envelope padding all ride it;
     bias / dBias is dense-only (a path property, see mismatch()).  As on every

@@ -497,9 +497,13 @@ The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
 feature-free d=64 graph.
 
 ᵏ **THD / ragged backward** (`sdpa_bwd_sm80`). Q/K/V/O/dO and the gradients are
-PACKED `[1, T, H, D]` and must be **compact BSHD** (token stride `H*D`, head
-stride `D` — a K/V view into an interleaved `[T, 2, H, D]` record is declined at
-plan time; the SM80 kernels address packed rows from `H` and `D` alone).
+PACKED `[1, T, H, D]` **BSHD rows, each at its own token stride**: head stride
+`D`, element stride 1, token stride `>= H*D` and a multiple of 8 elements
+(16-byte rows for the `cp.async` loads). A compact port is the common case; a
+K/V view into an interleaved `[T, 2, H, D]` record (token stride `2*H*D`, the
+fused-KV slicing layout) is served at that stride, the gap columns never read or
+written. The strides are plan-time (the compiled fakes carry them); a compact
+port keeps the compact fake, byte-identical codegen.
 Lengths arrive as the graph's per-batch `seq_len_q/kv` (`use_padding_mask=True`)
 and become `cu_seqlens` on device in a one-warp setup launch. Like every FROST
 THD row, the packed addressing is `prefix(lengths) × token stride`: the bound
