@@ -1823,6 +1823,7 @@ def compute1_warp_group(
     sCheckpoint_raw,
     mState_init,
     mState_out,
+    mStateIdx,
     checkpoint_every_n_tokens,
     sScheduler,
     bars,
@@ -1901,13 +1902,21 @@ def compute1_warp_group(
         batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
             cfg, tile_idx, mWorkItems
         )
+        # Recurrent-state row for this sequence.  Without a pool the row IS the
+        # sequence; with one (``mStateIdx``) the caller owns a possibly
+        # non-compact pool and row ``mStateIdx[batch_idx]`` holds this sequence's
+        # state.  Serving stacks keep such a pool, so honouring the indirection
+        # here avoids a gather/scatter around every call.
+        state_slot = batch_idx
+        if cutlass.const_expr(mStateIdx is not None):
+            state_slot = cutlass.Int32(mStateIdx[batch_idx])
         n_local = write_end - compute_start
         if cutlass.const_expr(cfg.enable_checkpoints):
             checkpoint_chunks = checkpoint_every_n_tokens // cutlass.Int32(cfg.b_t)
             checkpoint_mod = compute_start % checkpoint_chunks
         if n_local > 0:
             if cutlass.const_expr(cfg.use_initial_state):
-                gState_init = mState_init[None, None, head_idx, batch_idx]
+                gState_init = mState_init[None, None, head_idx, state_slot]
                 seed_state = compute_start == 0
                 if seed_state:
                     for i in cutlass.range_constexpr(num_ldtms):
@@ -2255,7 +2264,10 @@ def compute1_warp_group(
             if cutlass.const_expr(cfg.store_final_state):
                 final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
                 if final_dst >= 0:
-                    gState_out = mState_out[None, None, head_idx, final_dst]
+                    state_dst = final_dst
+                    if cutlass.const_expr(mStateIdx is not None):
+                        state_dst = cutlass.Int32(mStateIdx[final_dst])
+                    gState_out = mState_out[None, None, head_idx, state_dst]
                     for i in cutlass.range_constexpr(num_ldtms):
                         state_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32), num=32)
                         for k in cutlass.range_constexpr(32):
@@ -2268,9 +2280,12 @@ def compute1_warp_group(
             if cutlass.const_expr(cfg.store_final_state):
                 final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
                 if final_dst >= 0:
-                    gState_out = mState_out[None, None, head_idx, final_dst]
+                    state_dst = final_dst
+                    if cutlass.const_expr(mStateIdx is not None):
+                        state_dst = cutlass.Int32(mStateIdx[final_dst])
+                    gState_out = mState_out[None, None, head_idx, state_dst]
                     if cutlass.const_expr(cfg.use_initial_state):
-                        gState_in = mState_init[None, None, head_idx, batch_idx]
+                        gState_in = mState_init[None, None, head_idx, state_slot]
                         for i in cutlass.range_constexpr(num_ldtms):
                             for k in cutlass.range_constexpr(32):
                                 if state_row_valid:
@@ -2563,6 +2578,7 @@ def host(
     cu_seqlens: cute.Tensor,
     state_in: Optional[cute.Tensor],
     state_out: Optional[cute.Tensor],
+    state_idx: Optional[cute.Tensor],
     tinv: Optional[cute.Tensor],
     work_items: Optional[cute.Tensor],
     work_count: Optional[cute.Tensor],
@@ -2718,6 +2734,7 @@ def host(
         cu_seqlens,
         state_in,
         state_out,
+        state_idx,
         tinv,
         work_items,
         work_count,
@@ -2752,6 +2769,7 @@ def frost_gdn_prefill(
     cu_seqlens: cute.Tensor,
     mState_init: Optional[cute.Tensor],
     mState_out: Optional[cute.Tensor],
+    mStateIdx: Optional[cute.Tensor],
     mTinv: Optional[cute.Tensor],
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
@@ -3052,6 +3070,7 @@ def frost_gdn_prefill(
             sCheckpoint_raw=sCheckpoint_raw,
             mState_init=mState_init,
             mState_out=mState_out,
+            mStateIdx=mStateIdx,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             sScheduler=sScheduler,
             bars=bars,
@@ -3334,6 +3353,7 @@ def get_compiled_cache(
     allow_neg_eigval: bool,
     order_gen: bool,
     tinv_source: str,
+    use_state_indices: bool,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -3370,6 +3390,7 @@ def compile(
     cu_seqlens_cute,
     state_in_cute,
     state_out_cute,
+    state_idx_cute=None,
     tinv_cute=None,
     work_items_cute=None,
     work_count_cute=None,
@@ -3415,6 +3436,7 @@ def compile(
         cu_seqlens_cute,
         state_in_cute,
         state_out_cute,
+        state_idx_cute,
         tinv_cute,
         work_items_cute,
         work_count_cute,
@@ -3448,6 +3470,7 @@ def chunk_gdn_sm100(
     dt_bias=None,
     work_item_scratch=None,
     *,
+    state_indices=None,
     tinv=None,
     beta=None,
     use_beta_sigmoid: bool = False,
@@ -3568,6 +3591,7 @@ def chunk_gdn_sm100(
         allow_neg_eigval,
         order_gen,
         tinv_source,
+        state_indices is not None,
     )
 
     if "compiled" not in cache:
@@ -3590,6 +3614,12 @@ def chunk_gdn_sm100(
         if store_final_state:
             state_out_cute = from_dlpack(output_state, assumed_align=16)
             state_out_cute.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
+
+        # Optional pool-slot table: one int32 row id per sequence.  Its presence
+        # changes the compiled kernel, so it also joins the cache key below.
+        state_idx_cute = None
+        if state_indices is not None:
+            state_idx_cute = from_dlpack(state_indices, assumed_align=4).mark_layout_dynamic()
 
         workspace_cute = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
 
@@ -3631,6 +3661,7 @@ def chunk_gdn_sm100(
             cu_seqlens_cute=cu_seqlens_cute,
             state_in_cute=state_in_cute,
             state_out_cute=state_out_cute,
+            state_idx_cute=state_idx_cute,
             tinv_cute=tinv_cute,
             work_items_cute=work_items_cute,
             work_count_cute=work_count_cute,
@@ -3713,6 +3744,7 @@ def chunk_gdn_sm100(
         cu_seqlens,
         initial_state,
         output_state,
+        state_indices,
         tinv,
         work_items,
         work_count,
@@ -3747,6 +3779,7 @@ def run_prefill(
     a_log=None,
     dt_bias=None,
     *,
+    state_indices=None,
     tinv=None,
     beta=None,
     own_prologue=True,
@@ -3784,6 +3817,7 @@ def run_prefill(
         cu_seqlens,
         initial_state,
         output_state,
+        state_indices,
         tinv,
         work_items,
         work_count,
