@@ -340,7 +340,7 @@ SF_SMEM_SIZE_V = _round_up(CFG.TILE_O, 128) * CFG.TILE_N // BLOCK_SCALE_BLOCK_SI
 SF_CONST_VALUE = 0x7F
 
 
-from cudnn.sdpa.fwd.kernels._common_sm100 import (
+from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
     make_classic_bars,
     make_sdpa_helpers,

@@ -59,7 +59,7 @@ def _kernel_module(splits, dtype_qkv, causal, cta_mma=2, pack_gqa=False, qh_per_
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "prefill_d128_f16_sm100.py")
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/prefill_d128_f16.py")
     kw = {"dtype_qkv": dtype_qkv, "split_kv": splits, "cta_mma": cta_mma, "pack_gqa": pack_gqa, "qh_per_kh": qh_per_kh}
     if causal:
         kw["window_right"] = 0
@@ -71,7 +71,7 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
     import cutlass
     import cuda.bindings.driver as cuda_driver
 
-    from cudnn.sdpa.fwd.kernels import split_combine_sm100 as comb
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     dev = "cuda"
     scale = 1.0 / math.sqrt(D)
@@ -223,7 +223,7 @@ def test_split_kv_requires_lse():
 @pytest.mark.L0
 def test_split_combine_compile_keeps_partial_lse_compact_and_strides_final_lse(monkeypatch):
     """Only the caller-visible Stats output inherits its non-compact layout."""
-    from cudnn.sdpa.fwd.kernels import split_combine_sm100 as comb
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     def fake_compact_tensor(_dtype, shape, **kwargs):
         return {"kind": "compact", "shape": tuple(shape), **kwargs}
@@ -376,10 +376,10 @@ def test_split_kv_and_cta_mma_flavor_gating():
 # a regression here shows up as a HANG, not a wrong number.
 
 _F16_FLAVORS = {
-    "d128": ("prefill_d128_f16_sm100.py", 128, 128),
-    "d192": ("prefill_d192_d128_f16_sm100.py", 192, 128),
-    "d256": ("prefill_d256_f16_sm100.py", 256, 256),
-    "d512": ("prefill_d512_f16_sm100.py", 512, 512),
+    "d128": ("sm100/prefill_d128_f16.py", 128, 128),
+    "d192": ("sm100/prefill_d192_d128_f16.py", 192, 128),
+    "d256": ("sm100/prefill_d256_f16.py", 256, 256),
+    "d512": ("sm100/prefill_d512_f16.py", 512, 512),
 }
 
 
@@ -396,7 +396,7 @@ def test_empty_splits_every_flavor(flavor):
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-    from cudnn.sdpa.fwd.kernels import split_combine_sm100 as comb
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     kmod, d_qk, d_v = _F16_FLAVORS[flavor]
     B, H, SQ, SKV, S = 1, 4, 128, 5 * TILE_N, 8
@@ -504,7 +504,7 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
     from cudnn.frost.tile_dsl.constants import DTYPE_E5M2, DTYPE_FP16
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-    from cudnn.sdpa.fwd.kernels import split_combine_sm100 as comb
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     B, H, SQ, SKV = 1, 4, 128, skv
     dev = "cuda"
@@ -613,7 +613,7 @@ def _assert_amax_is_of_the_output(amax_o, got):
 def test_split_kv_fp8(splits, cta_mma):
     from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
 
-    got, ref, amax_o = _fp8_family_split("prefill_d128_fp8_sm100.py", DTYPE_E4M3, splits, cta_mma, mx=False)
+    got, ref, amax_o = _fp8_family_split("sm100/prefill_d128_fp8.py", DTYPE_E4M3, splits, cta_mma, mx=False)
     assert (got - ref).abs().max().item() <= 5e-2
     _assert_amax_is_of_the_output(amax_o, got)
 
@@ -625,7 +625,7 @@ def test_split_kv_fp8_d192(splits, causal):
     from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
 
     got, ref, amax_o = _fp8_family_split(
-        "prefill_d192_d128_fp8_sm100.py",
+        "sm100/prefill_d192_d128_fp8.py",
         DTYPE_E4M3,
         splits,
         2,
@@ -649,7 +649,7 @@ def test_split_kv_mxfp8_d192(in_key, splits, causal):
     dtype_qkv = DTYPE_E5M2 if in_key == "e5m2" else DTYPE_E4M3
 
     got, ref, amax_o = _fp8_family_split(
-        "prefill_d192_d128_mxfp8_sm100.py",
+        "sm100/prefill_d192_d128_mxfp8.py",
         dtype_qkv,
         splits,
         2,
@@ -670,7 +670,7 @@ def test_split_kv_mxfp8_d192_rejects_dense_lse_stride():
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "prefill_d192_d128_mxfp8_sm100.py")
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/prefill_d192_d128_mxfp8.py")
     params = TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP16, split_kv=2, cta_mma=2)
     mod = load_template(path, params, tag="d192_mxfp8_split_lse_stride_reject")
     with pytest.raises(ValueError, match="dense LSE strides"):
@@ -683,7 +683,7 @@ def test_split_kv_mxfp8_d192_rejects_dense_lse_stride():
 def test_split_kv_mxfp8(splits, cta_mma):
     from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
 
-    got, ref, amax_o = _fp8_family_split("prefill_d128_mxfp8_sm100.py", DTYPE_E4M3, splits, cta_mma, mx=True)
+    got, ref, amax_o = _fp8_family_split("sm100/prefill_d128_mxfp8.py", DTYPE_E4M3, splits, cta_mma, mx=True)
     assert (got - ref).abs().max().item() <= 1.5e-1
     _assert_amax_is_of_the_output(amax_o, got)
 
@@ -696,13 +696,13 @@ def test_split_kv_mxfp8(splits, cta_mma):
 def test_combine_lse_matches_reference(splits):
     """The RECOMBINED LSE is an output too, and nothing else here checks it.
 
-    split_combine_sm100 computes lse = M + log(sum_s exp(lse_s - M)); every other
+    sm100/split_combine computes lse = M + log(sum_s exp(lse_s - M)); every other
     test only compares O, so a wrong LSE would pass all of them.
     """
     import cutlass
     import cuda.bindings.driver as cuda_driver
 
-    from cudnn.sdpa.fwd.kernels import split_combine_sm100 as comb
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     B, H, SQ, SKV = 2, 4, 128, 2048
     dev = "cuda"
@@ -769,7 +769,7 @@ def test_even_splits_every_flavor_batched(flavor, dtype):
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-    from cudnn.sdpa.fwd.kernels import split_combine_sm100 as comb
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     kmod, d_qk, d_v = _F16_FLAVORS[flavor]
     B, H, SQ, SKV, S = 3, 4, 128, 2048, 4
@@ -830,7 +830,7 @@ def _run_masked(kfile, d_qk, d_v, splits, *, B, H, KH, SQ, SKV, tp_kwargs, seq_k
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-    from cudnn.sdpa.fwd.kernels import split_combine_sm100 as comb
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     dev = "cuda"
     scale = 1.0 / math.sqrt(d_qk)
@@ -887,7 +887,7 @@ def test_split_kv_swa_causal(splits):
     W = 256
     B, H, SQ, SKV = 1, 4, 1024, 1024
     got, q, k, v, scale = _run_masked(
-        "prefill_d128_f16_sm100.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0, window_left=W)
+        "sm100/prefill_d128_f16.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0, window_left=W)
     )
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, is_causal=True, swa_window=W)
     assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
@@ -901,7 +901,7 @@ def test_split_kv_bottom_right_causal(splits):
 
     B, H, SQ, SKV = 1, 4, 128, 2048
     got, q, k, v, scale = _run_masked(
-        "prefill_d128_f16_sm100.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0, bottom_right=True)
+        "sm100/prefill_d128_f16.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0, bottom_right=True)
     )
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, is_causal=True, bottom_right=True)
     assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
@@ -916,7 +916,7 @@ def test_split_kv_padded_kv(splits):
     B, H, SQ, SKV = 2, 4, 128, 2048
     lens = torch.tensor([2048, 1531], dtype=torch.int32, device="cuda")  # 2nd ends mid-tile
     got, q, k, v, scale = _run_masked(
-        "prefill_d128_f16_sm100.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(seq_kv_lens_present=True), seq_kv_lens=lens
+        "sm100/prefill_d128_f16.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(seq_kv_lens_present=True), seq_kv_lens=lens
     )
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, seq_kv_lens=lens)
     assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2

@@ -199,7 +199,7 @@ from cudnn.frost.tile_dsl.mask import (
 # Reuse sm107 SDPA pipeline-shared helpers (KvLoopBounds + closures factory).
 # Note: dsv4 forks Bars in this file (NOT imported from _sdpa_common) per the
 # per-pipeline fork pattern in the C++-to-DSL porting notes.
-from cudnn.sdpa.fwd.kernels._common_sm100 import (
+from cudnn.sdpa.fwd.kernels._common_blackwell import (
     KvLoopBounds,
     compute_kv_loop_bounds,
     lpt_tile_coords,
@@ -2714,7 +2714,7 @@ def _host(
     total_kv_sf_tiles: cutlass.Int32 = 0,
     # FROST plans must run on the caller's stream (engine contract; there is a
     # dedicated stream-respect test).  Threaded exactly as the shipped
-    # prefill_d128_fp8_sm107.py sibling does.
+    # sm107/prefill_d128_fp8.py sibling does.
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """MXFP8 host launcher — builds TMA descriptors for Q/K/V/O + SF tensors.
@@ -2825,7 +2825,7 @@ def _host(
     # is why the d128 MXFP8 sibling passes with the per-tile form.  d256 was
     # correct at S=128 (one KV tile => one group) and wrong from S=256 on until
     # this was fixed; the same defect lives here at 4 planes.  Mirrors
-    # prefill_d256_mxfp8_sm100.py's dense/THD stride split.
+    # sm100/prefill_d256_mxfp8.py's dense/THD stride split.
     #
     # Box = ONE D-plane: each sg1 peer issues SF_NUM_BLOCKS_V/CTA_MMA per-plane
     # loads at INTERLEAVED SMEM offsets (see the loop in _tmaldg_warp_group), so
@@ -3024,7 +3024,7 @@ def compile(  # noqa: A001
     # has_lse=False (no Stats output): the LSE argument is None-specialized and
     # the store is compiled out entirely -- no dummy buffer exists at any level,
     # which is what lets the dense graph report get_workspace_size() == 0.
-    # Mirrors the shipped prefill_d128_fp8_sm107.py.
+    # Mirrors the shipped sm107/prefill_d128_fp8.py.
     fake_lse = (
         cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,

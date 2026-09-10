@@ -22,7 +22,7 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d512
 # The per-graph params are injected as a module global by the loader
 # (api._load_kernel_module) before this body executes; a plain import gets
 # the all-defaults config (dense fp16), which is what the standalone
-# `python prefill_sdpa_d512_f16_sm100.py` benchmark path uses.
+# `python sm100/prefill_d512_f16.py` benchmark path uses.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d512(PARAMS)
 Cfg = type(CFG)
@@ -91,7 +91,7 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_SWA,
 )
 
-from cudnn.sdpa.fwd.kernels._common_sm100 import (
+from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
     KvLoopBounds,
     compute_kv_loop_bounds,
@@ -335,11 +335,11 @@ TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
 
 # === KV split ===
 #
-# Mechanics live in _common_sm100.make_split_helpers, shared with the other
+# Mechanics live in _common_blackwell.make_split_helpers, shared with the other
 # SM100 prefill flavors: each Q tile's KV loop range is cut into SPLIT_KV
 # contiguous chunks, each run as its own persistent tile, and each writing a
 # normalized partial O + its own LSE into a split-major workspace that
-# split_combine_sm100 folds with the exact log-sum-exp identity.  At
+# sm100/split_combine folds with the exact log-sum-exp identity.  At
 # SPLIT_KV == 1 every closure folds away and this is the classic kernel.
 _split_h = make_split_helpers(
     CFG,

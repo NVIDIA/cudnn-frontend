@@ -37,6 +37,7 @@ from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURA
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
+from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -224,7 +225,7 @@ class Capabilities:
     # the classic-pipeline TMEM stats race — the next tile's prologue BMM1
     # overwrote the S_acc-head (total_max, total_sum) before the correction
     # epilogue read them — and fixed by the mb_stats_read barrier (same fix as
-    # the f16 kernel's; see prefill_d128_fp8_sm100.py / _common_sm100.Bars).
+    # the f16 kernel's; see sm100/prefill_d128_fp8.py / _common_blackwell.Bars).
     single_wave_only: bool = False
     # Serve ragged S_kv on unmasked graphs by synthesizing a full-length
     # seq_len_kv and lowering through the kernel's padded path (masks the KV
@@ -618,7 +619,7 @@ def _sm100_spec() -> EngineSpec:
             cgas_by_d_shape=(((192, 128), frozenset({1, 2})),),
             split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
             # All four f16 flavor kernels wire SplitHelpers, and the adapter
-            # carves the partial slabs + launches split_combine_sm100 when
+            # carves the partial slabs + launches sm100/split_combine when
             # split_kv > 1 (dense f16 only; see mismatch's facts x knobs gate).
             split_kv_supported=True,
             pack_gqas=frozenset({False, True}),
@@ -636,7 +637,7 @@ def _sm107_spec() -> EngineSpec:
     (a version-0 descriptor addresses only 256 KiB, and Rubin's 327 KiB budget
     puts the d512 flavor's P ring at exactly that boundary).  The f16 line
     carries all four SM100 flavors, d192xd128 included
-    (``prefill_d192_d128_f16_sm107.py`` — the d128 body with ``make_cfg_d192``);
+    (``sm107/prefill_d192_d128_f16.py`` — the d128 body with ``make_cfg_d192``);
     the QUANTIZED Rubin rows are the ones that ship a strict subset.
 
     Every capability below was MEASURED on Rubin (`w2u1g-lc-0030`) against an
@@ -653,9 +654,12 @@ def _sm107_spec() -> EngineSpec:
     Deliberately NOT claimed, each because the kernels lack the machinery
     rather than because it went untested:
 
-    - ``thd``: the setup-kernel call site still speaks the pre-upstream 7-arg
-      contract against a 14-arg helper, and the metadata layout differs
-      (3B+2 vs 4B+4). ``compile()`` raises rather than half-serving it.
+    - ``thd``: SERVED on EVERY f16 flavor as of 2026-09-09.  All four bodies were
+      moved onto the FROST THD contract -- the 14-arg setup helper, the 4B+4
+      metadata the SHARED decode already read (the two had disagreed, which is
+      why ``compile()`` used to raise), the persistent claim-counter scheduler,
+      the dead-unit O-store guard, and the packed-total-clamped runtime K/V
+      descriptors that keep a NaN capacity tail out of BMM2.
     - ``split_kv_supported``: these kernels wire no SplitHelpers.
     - ``pack_gqas``: no PackGQA path.
     - ``padded_stats`` / ``dense_seq_q_trim``: both need the per-batch
@@ -691,6 +695,13 @@ def _sm107_spec() -> EngineSpec:
             # MASK_FLAGS == 0 the kernel's kv_right is a floor division, so an
             # un-synthesized ragged S_kv would silently drop the tail tile.
             skv_tail_via_padding=True,
+            # SM107_F16_THD_SHAPES is the single definition, shared with the
+            # standalone adapter's gate so the two cannot drift (rule 8b').  It
+            # now covers every f16 flavor; keeping it a named constant rather
+            # than `True` is what makes a future partial arch line expressible.
+            thd=True,
+            thd_d_shapes=SM107_F16_THD_SHAPES,
+            cu_seq_len=True,
             # NATURAL ONLY -- same finding as the FP8 and MXFP8 Rubin rows:
             # every kernel this row serves is a PORT, and the ported decode
             # sites do not honor SCHED_LPT (measured on the d512 FP8 and d128
@@ -811,7 +822,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             sm_lo=107 if rubin_row else _BLACKWELL[0],
             sm_hi=_BLACKWELL[1] if rubin_row else 106,
             phase="prefill",
-            d_shapes=frozenset({(128, 128), (256, 256), (512, 512)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            # Both lines now carry all four native flavors: Rubin gained its
+            # d192x128 FP8 sibling (sm107/prefill_d192_d128_fp8.py).
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             d_pad_multiple=16,
             # The d512 flavor serves the (256, 512] band on BOTH head dims —
             # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
@@ -829,8 +842,11 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # shows run-to-run nondeterminism on long causal e5m2/GQA/sink graphs;
             # min(d_qk, d_v) > 255 admits nothing inexact. Lift both floors once the
             # kernels' padded paths are validated through test_mhas_v2.
-            # The Rubin row carries the SAME floors, minus the (192, 128) entry
-            # it has no flavor for.  It previously declared () -- which made
+            # The Rubin row carries the SAME floors, (192, 128) included since it
+            # gained that flavor -- the table is arch-INDEPENDENT
+            # (api_dsl._SM100_FP8_ENVELOPE_FLOORS), and a row that omits an entry
+            # the adapter still enforces ADMITS a graph the lowering then kills
+            # with a bare ValueError (contract rule 8b').  It previously declared () -- which made
             # mismatch() ADMIT e.g. (512, 256) and (192, 128) that
             # api_dsl._SM100_FP8_ENVELOPE_FLOORS then rejected with a bare
             # ValueError inside check_support: a plan that enters the ranked
@@ -838,8 +854,12 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # rationale transfers unchanged -- the Rubin d512 kernel is the same
             # cga4x1 role-split geometry, and the d256 padded envelope is no
             # more validated here than on Blackwell.
-            d_envelope_floors=(((256, 256), 255), ((512, 512), 256)) if rubin_row else (((192, 128), 128), ((256, 256), 255), ((512, 512), 256)),
-            thd_d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            d_envelope_floors=(((192, 128), 128), ((256, 256), 255), ((512, 512), 256)),
+            # Both lines serve THD at every native flavor.  The Rubin arm keeps a
+            # NAMED constant (shared with the standalone adapter's gate, rule 8b')
+            # rather than collapsing to `d_shapes`, so a future partial arch line
+            # stays expressible without reintroducing a boolean that cannot say it.
+            thd_d_shapes=SM107_FP8_THD_SHAPES if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
@@ -864,12 +884,12 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             skv_tail_via_padding=True,
             # LPT/LPT_L2 remap is in lockstep with the SM100 sibling (issue
             # #653): every decode call site threads qh_per_kh/seqlen_kv, which
-            # is what the shared _common_sm100 LPT_L2 decode demands.  The L2
+            # is what the shared _common_blackwell LPT_L2 decode demands.  The L2
             # figure the remap blocks against (CFG.L2_SIZE_MIB) is a tuning
             # hint for the grouping, not a chip capacity, so the SM100 number
             # carries to Rubin unchanged.
             # LPT_L2 needs qh_per_kh + seqlen_kv threaded through EVERY decode
-            # call site (_common_sm100._decode_initial raises otherwise).  On the
+            # call site (_common_blackwell._decode_initial raises otherwise).  On the
             # Rubin line only the shipped d128 kernel does that -- d256 and d512
             # have 0/10 sites threaded -- so the row cannot claim the policy for
             # the flavors it now serves.  Heuristics derives its proposals from
@@ -905,8 +925,12 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             split_kv_supported=True,
             split_d_shapes=(frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256)})),
             pack_gqas=frozenset({False, True}),
-            # SM107: only the shipped d128 sibling wires PackGQA; the ported
-            # d256/d512 kernels skip it, as they skip split-KV.
+            # SM107: PackGQA is wired in the d128 FP8 BODY, which d192xd128
+            # shares -- but the row keeps it to d128 until the d192 PackGQA
+            # path is actually validated on Rubin (a shared body is evidence
+            # the code exists, not that it is correct at a wider K).  The
+            # ported d256/d512 kernels do not wire it at all, as they do not
+            # wire split-KV.
             pack_gqa_d_shapes=(frozenset({(128, 128)}) if rubin_row else None),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
@@ -920,8 +944,10 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     f16 and FP8 rows split at the arch line: these are the SM107 sibling
     kernels (dense K=64 MMA, version-1 SMEM descriptors).  Rubin also carries a
     d512 MXFP8 flavor, which SM100 does NOT -- so this row is WIDER than its
-    Blackwell counterpart at the top end and narrower at d192xd128, which has
-    no Rubin MXFP8 sibling.
+    Blackwell counterpart at the top end.  d192xd128 now has a Rubin MXFP8
+    sibling too, but at cga2 ONLY (SM100 serves it at both widths): the wider K
+    pushes this flavor's scale-factor tiles past the 256 KiB version-0
+    descriptor window at cga1.
 
     Declined deliberately, because the ported kernels lack the machinery (not
     because it went untested): THD, split-KV, PackGQA, and the dense padded-Q
@@ -936,7 +962,11 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             sm_hi=_BLACKWELL[1],
             phase="prefill",
             # Exact native shapes only -- the SF tensors are not zero-padded.
-            d_shapes=frozenset({(128, 128), (256, 256), (512, 512)}),
+            # (192, 128) deliberately takes NO cgas_by_d_shape entry below, so it
+            # stays on the row default cgas={2}: at cga1 its four SF tiles start
+            # past the 256 KiB version-0 tcgen05 descriptor window and the UTCCP
+            # would read Q data as scale factors.  See make_cfg_d192_mxfp8.
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             d_pad_multiple=0,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),

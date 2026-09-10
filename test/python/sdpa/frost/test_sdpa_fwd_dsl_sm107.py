@@ -27,7 +27,10 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _E4M3, _BF16_OUT = 0, 2
-_FLAVORS = [(128, 128), (256, 256), (512, 512)]
+# (192, 128) is in the sweep for all three dtype families as of 2026-09-09 --
+# it is the flavor whose wider K moves SMEM offsets, so it is exactly the one
+# a DESC_VERSION check must cover, not skip.
+_FLAVORS = [(128, 128), (192, 128), (256, 256), (512, 512)]
 
 
 def _load(flavor, rubin, *, fp8=False, pertensor=False, **params):
@@ -52,7 +55,7 @@ def test_f16_routes_to_the_sm107_sibling(flavor):
 # Q(u)O and K(u)V slabs are 128 KiB each, putting the P transfer ring at exactly
 # 262144 (and, on the MXFP8 sibling, the scale-factor tiles near 292 KiB).  Keep
 # d128/d256 on version 0 so they stay byte-identical to the shipped
-# prefill_d128_fp8_sm107.py sibling.
+# sm107/prefill_d128_fp8.py sibling.
 _NEEDS_DESC_V1 = {(512, 512)}
 
 # (kind, loader kwargs) for every SM107 dtype family, so the check below covers
@@ -111,14 +114,23 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(flavor, kind, load_
     assert not re.search(r"desc_version=[01]\b", code), f"{mod.__name__}: a re-literalled desc_version bypasses DESC_VERSION"
 
 
-def test_sm107_f16_kernels_do_not_claim_thd():
-    """THD is NOT ported: the setup-kernel call site still speaks the
-    pre-upstream 7-arg contract against a 14-arg helper, and the metadata
-    layout differs (3B+2 vs 4B+4).  compile() must refuse loudly rather than
-    fail as an arity error deep in a trace -- and no engine row may advertise
-    it."""
-    mod = _load((128, 128), rubin=True, seq_kv_lens_present=True)
-    assert mod.CFG.THD_VARLEN == 0
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_sm107_f16_thd_specialization_matches_the_ported_flavors(flavor):
+    """A THD config must TRACE for a ported f16 flavor and be REFUSED for the
+    rest -- the config guard is what stops an unported body pairing its 3B+2
+    metadata with the shared 4B+4 decode (a wrong-sequence read, not a raise).
+
+    Also pins that the dense specialization stays THD-free everywhere, which is
+    what keeps `get_workspace_size() == 0` for a dense stats-less graph."""
+    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES
+
+    assert _load(flavor, rubin=True, seq_kv_lens_present=True).CFG.THD_VARLEN == 0
+
+    if flavor in SM107_F16_THD_SHAPES:
+        assert _load(flavor, rubin=True, seq_kv_lens_present=True, thd_varlen=1).CFG.THD_VARLEN == 1
+    else:
+        with pytest.raises(ValueError, match="THD/varlen"):
+            _load(flavor, rubin=True, seq_kv_lens_present=True, thd_varlen=1)
 
 
 def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
@@ -127,11 +139,15 @@ def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
     loading instead of riding the next covering envelope.
 
     PARTIALLY INVERTED 2026-09-04: d192xd128 now HAS a Rubin sibling
-    (``prefill_d192_d128_f16_sm107.py`` -- the same body as d128 with
+    (``sm107/prefill_d192_d128_f16.py`` -- the same body as d128 with
     ``make_cfg_d192``), so a d=192 f16 graph lowers onto the NATIVE kernel
-    instead of riding the d256 envelope.  The pool-narrowing invariant is
-    unchanged and is what this test really pins; the FP8/MXFP8 lines still have
-    no d192 sibling, which is why the narrowing cannot be deleted.
+    instead of riding the d256 envelope.
+
+    FULLY INVERTED 2026-09-09: the quantized lines gained their d192 siblings
+    too, so every Rubin pool now covers all four flavors.  The pool-NARROWING
+    invariant is what this test really pins and it is unchanged -- it is what
+    keeps a graph off a flavor with no Rubin module, and it must survive every
+    future arch line that ships a partial flavor set.
     """
     from cudnn.sdpa.fwd.api_dsl import (
         _SM100_FLAVORS,
@@ -144,11 +160,17 @@ def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
     assert _pick_flavor(192, 128, rubin_pool) == (192, 128)
     # Blackwell keeps its native d192xd128 kernel.
     assert _pick_flavor(192, 128, None) == (192, 128)
-    # The quantized Rubin lines have NO d192 sibling -- a d=192 FP8 graph must
-    # still ride the next covering envelope rather than KeyError.
+    # INVERTED: the quantized Rubin lines gained their d192 siblings, so a
+    # d=192 FP8 graph lands on the NATIVE kernel instead of an envelope.
     rubin_fp8_pool = tuple(f for f in _SM100_FLAVORS if f in _SM107_FP8_KERNEL_FILES)
-    assert (192, 128) not in rubin_fp8_pool
-    assert _pick_flavor(192, 128, rubin_fp8_pool) == (256, 256)
+    assert (192, 128) in rubin_fp8_pool
+    assert _pick_flavor(192, 128, rubin_fp8_pool) == (192, 128)
+    # The narrowing itself still has teeth: every Rubin pool is a SUBSET of the
+    # Blackwell flavor list, and _pick_flavor is only ever handed the pool whose
+    # kernel files exist.  A pool built from a map that lacks a flavor must not
+    # offer it -- this is the guard that survives the next partial arch line.
+    assert set(rubin_pool) <= set(_SM100_FLAVORS) and set(rubin_fp8_pool) <= set(_SM100_FLAVORS)
+    assert _pick_flavor(192, 128, tuple(f for f in rubin_fp8_pool if f != (192, 128))) != (192, 128)
     # Every flavor Rubin can pick has a module ON DISK -- the map is the only
     # thing standing between _pick_flavor and a KeyError/ImportError deep in
     # module loading, so check the file, not the map key it came from.
@@ -245,7 +267,7 @@ def test_sm107_f16_accepts_the_measured_feature_set(feature):
 
 
 def test_sm107_f16_serves_d192_on_its_native_kernel():
-    """d192xd128 is a NATIVE f16 Rubin flavor (``prefill_d192_d128_f16_sm107.py``
+    """d192xd128 is a NATIVE f16 Rubin flavor (``sm107/prefill_d192_d128_f16.py``
     -- the d128 body with ``make_cfg_d192``), not an envelope ride.
 
     Both halves of that claim are pinned, because they can drift apart
@@ -262,16 +284,26 @@ def test_sm107_f16_serves_d192_on_its_native_kernel():
     assert engines.mismatch(caps, _f16_facts(d_qk=192, d_v=128)) is None
 
 
-def test_sm107_f16_declines_thd():
-    """INVERTS-WHEN the THD setup-kernel contract is ported: the call site
-    still passes 7 args to a 14-arg helper and the metadata layout differs
-    (3B+2 vs 4B+4).  Asserted on a real facts object, not just the dataclass
-    field, so it exercises the path mismatch() actually walks."""
+def test_sm107_f16_thd_is_served_on_every_flavor():
+    """FULLY INVERTED 2026-09-09: every f16 flavor now serves THD.
+
+    The row must cover exactly `d_shapes` -- no more (a shape with no kernel
+    would KeyError inside module loading) and no less (a served shape left out
+    is a capability the engine silently declines).  Asserted on real facts
+    objects, not the dataclass field, so it walks the path mismatch() takes.
+
+    This keeps `thd_d_shapes` as a named SET rather than collapsing to `True`,
+    because that is what makes the next partial arch line expressible without
+    reintroducing a boolean that cannot describe it."""
     from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES
 
     caps = _caps("sdpa_fwd_prefill_sm107")
-    assert caps.thd is False
-    assert engines.mismatch(caps, _f16_facts(thd=True, padded=True)) is not None
+    assert caps.thd is True
+    assert caps.thd_d_shapes is SM107_F16_THD_SHAPES
+    assert SM107_F16_THD_SHAPES == caps.d_shapes, "every served f16 shape must serve THD, and no unserved one may"
+    for d_qk, d_v in sorted(caps.d_shapes):
+        assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
 
 
 def test_sm107_f16_declines_split_kv_and_pack_gqa():
@@ -358,18 +390,165 @@ def test_sm107_rows_claim_optional_stats():
 def test_rubin_mxfp8_forward_row_exists():
     """INVERTED 2026-09-04: the Rubin MXFP8 row landed (slot 16).  It is WIDER
     than its Blackwell counterpart at the top end -- Rubin has a d512 MXFP8
-    kernel and SM100 does not -- and narrower at d192xd128, which has no Rubin
-    MXFP8 sibling.  SM100's row stays capped at cc 10.6."""
+    kernel and SM100 does not.  INVERTED again 2026-09-09: d192xd128 gained a
+    Rubin MXFP8 sibling, at cga2 ONLY -- at cga1 that flavor's scale-factor
+    tiles start past the 256 KiB version-0 tcgen05 descriptor window.  SM100's
+    row stays capped at cc 10.6."""
     from cudnn.sdpa.fwd import engines
 
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
     assert caps.is_mxfp8 is True
-    assert caps.d_shapes == frozenset({(128, 128), (256, 256), (512, 512)})
+    assert caps.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert (512, 512) not in _caps("sdpa_fwd_prefill_sm100_mxfp8").d_shapes
-    assert (192, 128) not in caps.d_shapes
+    assert (192, 128) in caps.d_shapes
+    # (192, 128) takes NO cgas_by_d_shape entry, so it inherits the row default
+    # cgas={2}.  That is a DESCRIPTOR constraint, not a tuning choice: at cga1
+    # the four SF tiles land at 256-278 KiB, past the version-0 tcgen05
+    # descriptor window, and the UTCCP would read Q data as scale factors
+    # (LSE=+inf, O=NaN on every cell).  SM100 serves the same shape at {1, 2}.
+    assert caps.cgas == frozenset({2})
+    assert all(shape != (192, 128) for shape, _ in caps.cgas_by_d_shape)
+    assert _caps("sdpa_fwd_prefill_sm100_mxfp8").cgas_by_d_shape != caps.cgas_by_d_shape
     # Exact-native only: the SF tensors are not zero-padded.
     assert caps.d_pad_multiple == 0
     # The machinery the ported kernels lack stays declined.
     assert caps.thd is False and caps.split_kv_supported is False
     assert caps.pack_gqas == frozenset({False})
     assert _caps("sdpa_fwd_prefill_sm100_mxfp8").sm_hi == 106
+
+
+def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
+    """ACCEPT side of the 2026-09-09 d192 addition, one case PER DTYPE MEMBER of
+    each row's frozenset -- a row listing two dtypes is making two claims, and a
+    suite that exercises only E4M3 leaves the other as an untested assertion
+    (contract rule 12).
+
+    The shape must land on the NATIVE (192, 128) kernel, not an envelope: the
+    d256 flavor's floor (255) would otherwise swallow it onto a padded path
+    nobody validated."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+
+    for row, is_mx in (("sdpa_fwd_prefill_sm107_fp8", False), ("sdpa_fwd_prefill_sm107_mxfp8", True)):
+        caps = _caps(row)
+        assert (192, 128) in caps.d_shapes, row
+        for dt in sorted(caps.dtypes, key=lambda d: int(d)):
+            facts = _quant_facts(d_qk=192, d_v=128, dtype=dt, is_mx=is_mx)
+            assert engines.mismatch(caps, facts) is None, (row, dt)
+            assert engines._selected_d_shape(caps, facts) == (192, 128), (row, dt)
+
+
+def test_sm107_d192_mxfp8_is_cga2_only_because_of_the_descriptor_window():
+    """REJECT side, and the reason is a DESCRIPTOR constraint rather than taste.
+
+    At cga1 the K/V rings are not halved, so this flavor's four scale-factor
+    tiles start at 256-278 KiB -- past the 256 KiB version-0 tcgen05 descriptor
+    window, where ``start_address`` wraps to 0 and the UTCCP copies Q DATA bytes
+    into the SF TMEM columns (LSE=+inf, O=NaN on 100% of cells, at every shape).
+
+    Two independent guards, and this test pins BOTH: the row keeps (192, 128) on
+    the default ``cgas={2}`` so a graph cannot request cga1, and the kernel body
+    raises at import if it is ever handed one anyway.  INVERTS-WHEN DESC_VERSION
+    is derived from the layout and the version-1 SF path is validated on Rubin
+    -- which is not free: desc_version=1 on the d128/d256 MXFP8 tiles turned 21
+    green tests red (2026-09-08)."""
+    import pytest as _pytest
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
+    facts = _quant_facts(d_qk=192, d_v=128, is_mx=True)
+    # Guard 1 -- knob domain. cga2 is honored, cga1 makes the plan ineligible.
+    assert engines.mismatch(caps, facts, SdpaFwdKnobs(cga=2)) is None
+    assert engines.mismatch(caps, facts, SdpaFwdKnobs(cga=1)) is not None
+    # SM100 serves the same shape at BOTH widths -- so this is Rubin-specific,
+    # which is what makes it worth pinning rather than assuming.
+    assert 1 in engines.effective_cgas(_caps("sdpa_fwd_prefill_sm100_mxfp8"), facts, 1)
+
+    # Guard 2 -- the kernel body itself, so the constraint survives a row edit.
+    with _pytest.raises(ValueError, match="CTA_MMA must be 2"):
+        _load((192, 128), rubin=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
+
+
+def _quant_facts(**kw):
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+
+    is_mx = kw.pop("is_mx", False)
+    base = dict(
+        b=2,
+        h_q=4,
+        h_kv=4,
+        s_q=384,
+        s_kv=384,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        device_cc=(10, 7),
+    )
+    base.update(kw)
+    base["is_mxfp8" if is_mx else "is_fp8"] = True
+    return ga.SdpaGraphFacts(**base)
+
+
+def test_sm107_ones_tile_stays_inside_the_v0_descriptor_window():
+    """The row-sum "ones" tile is allocated LAST and read as an MMA operand, so
+    its OFFSET -- not its size -- has to stay under 256 KiB while DESC_VERSION
+    is 0.  At cga1 the K/V rings are not halved, and with a HALF-PRECISION O
+    the d192 tile lands at 272 KiB: its version-0 descriptor wraps to offset 0
+    and the Sigma MMA multiplies sQ instead of all-ones, so `total_sum` becomes
+    a function of Q -- wrong LSE and wrong O on every row, no crash.
+
+    Caught in review, not by a test, because the kernel docstring ARGUED cga1
+    was safe from a hand-summed figure that omitted two buffers.  The guard is
+    therefore derived from the allocator's own constants; this pins that it
+    fires exactly on the unsafe config and on nothing else, so the safe ones
+    cannot be walled off by a future over-broad tightening."""
+    import pytest as _pytest
+
+    _E4M3_OUT, _BF16 = 0, 2
+    safe = [
+        ("d128", (128, 128), 1, _E4M3_OUT),
+        ("d128", (128, 128), 1, _BF16),
+        ("d128", (128, 128), 2, _BF16),
+        ("d192", (192, 128), 1, _E4M3_OUT),
+        ("d192", (192, 128), 2, _BF16),
+    ]
+    for _id, flavor, cta, dto in safe:
+        mod = _load(flavor, rubin=True, fp8=True, pertensor=True, dtype_qkv=_E4M3, dtype_o=dto, cta_mma=cta)
+        assert mod._ONES_SMEM_OFFSET < 256 * 1024, (_id, cta, dto, mod._ONES_SMEM_OFFSET)
+
+    # The one unsafe combination: d192 x cga1 x half-precision O.
+    with _pytest.raises(ValueError, match="version-0 tcgen05 descriptor window"):
+        _load((192, 128), rubin=True, fp8=True, pertensor=True, dtype_qkv=_E4M3, dtype_o=_BF16, cta_mma=1)
+
+    # ...and the STANDALONE wrapper must decline it too, rather than letting a
+    # bare ValueError escape from compile() (contract rule 8b' -- the kernel
+    # raise and the wrapper gate are two enforcement points for one fact).
+    # Assert the wrapper's OWN decision function, so this holds from any host:
+    # the Rubin arm is unreachable on a non-cc-10.7 box, which is exactly the
+    # kind of branch that rots untested.
+    from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
+
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7)) == (2,)
+    # ...and check_support must ACT on that, not merely compute it.  The helper
+    # was extracted in review and the `_value_error_if` that consumed it got
+    # dropped in the same edit, so `supported_cgas` was computed and discarded --
+    # an explicit cga=1 then cleared support validation and died inside
+    # compile(), which is exactly the rule-8b' failure the helper exists to
+    # prevent.  Pin the CONSUMPTION, since the value alone was already correct.
+    import inspect
+
+    from cudnn.sdpa.fwd import api_dsl as _api_dsl
+
+    _src = inspect.getsource(_api_dsl.SdpaFwdDslSm100.check_support)
+    assert "supported_cgas_for(" in _src, "check_support no longer derives the CGA domain"
+    assert "self.cga not in supported_cgas" in _src, "check_support computes supported_cgas but never validates self.cga against it"
+
+    # ...and only there: Blackwell keeps both widths, and the f16 Rubin path is
+    # not narrowed (it has no quantized SF or ones tile to push over the line).
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 0)) == (1, 2)
+    assert supported_cgas_for((192, 128), fp8=False, device_cc=(10, 7)) == (1, 2)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7)) == (2,)
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7)) == (1,)

@@ -50,10 +50,13 @@ _ARCH = "sm107" if _SM == 107 else "sm100"
 # Rubin gaps the SM100 line does not have.  These are CAPABILITY declines the
 # engine row states honestly, not kernel bugs -- the graph is never served, so
 # the test cannot run.  Flip the condition to False when the gap closes.
-_skip_d192_mxfp8_on_rubin = pytest.mark.skipif(
-    _SM == 107,
-    reason="no d192xd128 MXFP8 kernel on the Rubin line; the row's exact-native d_shapes (d_pad_multiple=0) declines the shape",
-)
+#
+# INVERTED 2026-09-09: the d192xd128 MXFP8 gap CLOSED
+# (sm107/prefill_d192_d128_mxfp8.py), so every DENSE d192 case below now runs on
+# Rubin.  It runs at cga2 there and only cga2 -- at cga1 that flavor's four
+# scale-factor tiles start past the 256 KiB version-0 tcgen05 descriptor window
+# -- which the row expresses by leaving (192, 128) on its default cgas={2}, so
+# nothing here needs to say so.  THD is still declined row-wide.
 # THD/varlen is not ported to the Rubin MXFP8 kernels: the setup-kernel call
 # site still speaks the pre-upstream 7-arg contract against a 14-arg helper and
 # the metadata layout differs (3B+2 vs 4B+4), so compile() raises and the row
@@ -638,7 +641,6 @@ def test_mxfp8_masks(in_key, mask):
     _check(O, O_ref, torch.float16, in_key)
 
 
-@_skip_d192_mxfp8_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("mask", list(_MASKS))
@@ -661,7 +663,6 @@ def test_mxfp8_d192_d128(in_key, mask):
     _check(O, O_ref, torch.bfloat16, in_key, d_qk=d_qk)
 
 
-@_skip_d192_mxfp8_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
 @torch_fork_set_rng(seed=0)
@@ -686,7 +687,6 @@ def test_mxfp8_d192_d128_output_dtypes(out_key):
     assert abs(amax_value - amax_ref) <= 0.03, f"amax {amax_value:.4f} vs ref {amax_ref:.4f}"
 
 
-@_skip_d192_mxfp8_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_d192_d128_gqa_sink():
@@ -709,7 +709,6 @@ def test_mxfp8_d192_d128_gqa_sink():
     _check(O, O_ref, torch.float16, "e5m2", d_qk=d_qk)
 
 
-@_skip_d192_mxfp8_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     ("out_key", "with_sink"),
@@ -744,7 +743,6 @@ def test_mxfp8_d192_d128_leading_zero_length_kv(out_key: str, with_sink: bool):
     assert abs(result.amax.item() - result.reference.abs().max().item()) <= 0.03
 
 
-@_skip_d192_mxfp8_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_d192_d128_stats_less():
@@ -802,9 +800,27 @@ def test_mxfp8_gqa(in_key):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_d128", "d256"])
+@pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (8, 1)], ids=["g2", "g4", "mqa"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_dense_gqa_ratios(d_qk, d_v, h_q, h_kv):
+    """DENSE GQA/MQA across every ratio and shape -- see the FP8 twin.
+
+    Block-scale adds a reason to care: K and V carry PER-HEAD scale-factor
+    planes, so head sharing has to index the SF tensors by the KV head while
+    indexing Q's SF by the query head.  MQA (h_kv=1) collapses every KV-side SF
+    lookup onto plane 0, which is precisely where a stride that is really
+    `h_q`-based instead of `h_kv`-based still reads in-bounds and returns the
+    wrong exponents."""
+    scale = 1.0 / math.sqrt(d_qk)
+    O, O_ref, _ = _run(2, h_q, h_kv, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), d_qk=d_qk, d_v=d_v)
+    _check(O, O_ref, torch.float16, "e4m3")
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "d_qk,d_v",
-    [(128, 128), pytest.param(192, 128, marks=_skip_d192_mxfp8_on_rubin)],
+    [(128, 128), (192, 128)],
 )
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_bottom_right_rectangular(d_qk, d_v):
@@ -1345,7 +1361,7 @@ def test_mxfp8_thd_cu_seq_len(d):
     _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
-@_skip_d192_mxfp8_on_rubin
+@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
@@ -1371,7 +1387,7 @@ def test_mxfp8_d192_d128_thd_cross_gqa_stats(in_key):
     assert lse is not None and torch.isfinite(lse).all()
 
 
-@_skip_d192_mxfp8_on_rubin
+@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("mask", ["causal_br", "swa"])

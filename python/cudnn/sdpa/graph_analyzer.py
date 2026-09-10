@@ -1040,16 +1040,3 @@ def to_bshd_physical(t: "torch.Tensor") -> "torch.Tensor":
     if act == exp:
         return t
     return t.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
-
-
-def expand_gqa_heads(t: "torch.Tensor", h_q: int) -> "torch.Tensor":
-    """Expand K/V heads to H_q for a dense forward lowering (BHSD dim 1).
-
-    The forward kernels' native dense-GQA path is not exercised by the
-    upstream validation harness (which expands like this); keep the
-    validated shape until kernel-level dense GQA is qualified.
-    """
-    h = t.shape[1]
-    if h == h_q:
-        return t
-    return t.repeat_interleave(h_q // h, dim=1)

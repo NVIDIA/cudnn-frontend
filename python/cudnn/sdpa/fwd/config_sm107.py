@@ -75,11 +75,14 @@ __all__ = [
     "make_cfg_d128",
     "make_cfg_d128_mxfp8",
     "make_cfg_d192",
+    "make_cfg_d192_mxfp8",
     "make_cfg_d256",
     "make_cfg_d256_mxfp8",
     "make_cfg_d512",
     "make_cfg_d512_mxfp8",
     "SMEM_CAP_BYTES",
+    "SM107_FP8_THD_SHAPES",
+    "SM107_F16_THD_SHAPES",
 ]
 
 
@@ -92,7 +95,7 @@ __all__ = [
 # and the d256/d512 flavors all depend on it.
 SMEM_CAP_BYTES = 327 * 1024
 
-# ...but the CAPACITY is not the budget. The shipped prefill_d128_fp8_sm107.py
+# ...but the CAPACITY is not the budget. The shipped sm107/prefill_d128_fp8.py
 # sizes its own guard against 320 KiB ("327 KiB capacity minus reserves"), and
 # the kernels additionally spend ~2 KiB on barriers, the scheduler ring and the
 # TMEM pointer. Validating Q/K/V/O against the raw 327 KiB waves through an
@@ -108,6 +111,42 @@ _SMEM_FIXED_OVERHEAD = 2 * 1024  # barriers + scheduler + tmem-ptr slack
 TMEM_TOTAL_COLS = 576
 
 _DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16 = 0, 1, 2, 3
+
+# Head-dim shapes whose Rubin PER-TENSOR FP8 kernel carries the THD/varlen leg.
+#
+# ONE definition, consumed by BOTH the engine row (`engines._sm100_fp8_spec`'s
+# ``thd_d_shapes`` on the Rubin arm) and the standalone adapter's THD gate
+# (``api_dsl.SdpaFwdDslSm100.check_support``).  They are two enforcement points
+# for one fact, and contract rule 8b' exists because keeping two copies in step
+# by hand does not work: widen only the row and a graph enters the ranked list
+# then dies with a bare NotImplementedError in check_support; widen only the
+# wrapper and the row still declines.  Sharing the constant makes disagreement
+# unrepresentable rather than merely tested.
+#
+# Membership rule: the shape's body must carry the FROST THD contract -- the
+# 14-arg build_thd_meta_o_descs_kernel, 4B+4 metadata, (b+3) O-descriptor slots,
+# the persistent claim-counter scheduler, the dead-unit O-store guard and the
+# packed-total-clamped runtime K/V descriptors.
+#
+# All four qualify as of 2026-09-09.  d192xd128 came free -- it IS the shipped
+# d128 body, only the config factory differs -- and d256 / d512 were moved onto
+# the contract (frost_dev/port_thd_contract.py); they previously called the
+# setup kernel with the pre-upstream 7-arg signature and allocated 3B+2 where
+# the shared decode reads 4B+4.  Confirmed on w2u1g-lc-0030: 43 passed / 0
+# failed across the per-tensor FP8 THD suite.
+SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+
+# f16/bf16 flavor names whose kernel body HAS been ported to the FROST
+# setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4
+# metadata the shared decode reads).  Keyed by the `flavor` string
+# `_validate_params` already receives, so adding a ported flavor is one entry.
+_F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512"})
+
+# Head-dim shapes whose Rubin f16/bf16 kernel carries the THD/varlen leg -- the
+# same one-definition-two-consumers arrangement as SM107_FP8_THD_SHAPES above
+# (engine row + standalone adapter gate; contract rule 8b').  Must stay in step
+# with _F16_THD_FLAVORS, which is the same fact keyed by config-flavor name.
+SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +288,19 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.split_kv and k.split_kv > 1:
         raise ValueError(f"{flavor}: split_kv > 1 is not wired in the SM107 kernels (no SplitHelpers)")
-    # FP8/MXFP8 only.  The f16/bf16 Rubin kernels carry no varlen plumbing --
-    # their setup-kernel call site still speaks the pre-upstream 7-arg contract
-    # against a 14-arg helper, and the metadata layout differs (3B+2 vs 4B+4).
-    # (This guard used to repeat the same dtype set the check above already
-    # enforces, so it declined nothing.)
-    if k.thd_varlen and k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2):
-        raise ValueError(f"{flavor}: THD/varlen is FP8/MXFP8 only on SM107 (got dtype_qkv={k.dtype_qkv}); the f16/bf16 kernels carry no varlen plumbing")
+    # THD/varlen is per-FLAVOR on the Rubin line, not per-dtype.  Every
+    # QUANTIZED flavor carries it; on the f16/bf16 side only the flavors whose
+    # BODY has been ported to the FROST setup-kernel contract do -- the rest
+    # still call it with the pre-upstream 7-arg signature against a 14-arg
+    # helper, and allocate the 3B+2 metadata buffer where the SHARED decode
+    # (_common_blackwell._thd_decode) reads 4B+4 with a batch_remap.  That
+    # mismatch is a HANG or a wrong batch, not an arity error, so it is declined
+    # here rather than left to fail deep in a trace.
+    if k.thd_varlen and k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2) and flavor not in _F16_THD_FLAVORS:
+        raise ValueError(
+            f"{flavor}: THD/varlen on the SM107 f16/bf16 line is served by {sorted(_F16_THD_FLAVORS)} only "
+            f"(got dtype_qkv={k.dtype_qkv}); the other flavors' setup-kernel call sites are not ported"
+        )
 
 
 def _band_fields(params: TemplateParams) -> Tuple[int, int, int, int, int]:
@@ -537,7 +582,7 @@ def _stages_kv_d128(dtype_qkv: int, cta_mma: int, *, mxfp8: bool, tile_k: int) -
     """Rubin d128-family ring depth.
 
     Per-tensor FP8 at d128/cga2 runs a **9-stage** ring: a Rubin-specific tuning
-    carried by the shipped ``prefill_d128_fp8_sm107.py`` (which previously spelled
+    carried by the shipped ``sm107/prefill_d128_fp8.py`` (which previously spelled
     it as a post-hoc ``dataclasses.replace``), and the reason that kernel needs
     the oversized-SMEM launch mode.
 
@@ -642,7 +687,35 @@ def make_cfg_d128_mxfp8(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
 
 
 def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
+    """d_qk=192 / d_v=128, f16 and per-tensor FP8.
+
+    Same family as ``make_cfg_d128`` with a wider K: the pre-upstream base kernel
+    was flavor-generic (one body served d128 and d192xd128 by swapping the config),
+    and ``CfgD192`` only widens ``TILE_K``.
+    """
     return _make_cfg_d128_family(params, flavor="sm107 d192xd128", tile_k=192, tile_o=128, mxfp8=False)
+
+
+def make_cfg_d192_mxfp8(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
+    """d_qk=192 / d_v=128, block-scale MXFP8.
+
+    CGA2 ONLY, and that is a DESCRIPTOR constraint rather than a tuning choice.
+    At ``cta_mma=1`` the K/V rings are not halved, so the four scale-factor tiles
+    -- allocated last -- start at 256/258/276/278 KiB, i.e. past the **256 KiB
+    version-0 tcgen05 descriptor window**.  A version-0 SF descriptor there wraps
+    to offset 0 and the UTCCP copies Q DATA bytes into the SF TMEM columns:
+    ``LSE = +inf`` and ``O = NaN`` on 100 % of cells, at every shape (the exact
+    d512 MXFP8 failure in rules/mma-tma-matrix.md S6).  At ``cta_mma=2`` the
+    highest slab sits at 200 KiB and version 0 is provably safe.
+
+    So the Rubin MXFP8 engine row deliberately declares NO ``cgas_by_d_shape``
+    entry for (192, 128), leaving it on the row default ``cgas={2}``.  Lifting
+    that needs ``DESC_VERSION`` derived from the layout AND the version-1 SF path
+    validated on Rubin -- which is NOT a free widening: setting
+    ``desc_version=1`` on the d128/d256 MXFP8 tiles turned 21 green tests red
+    (2026-09-08), so the bit is not a transparent superset.
+    """
+    return _make_cfg_d128_family(params, flavor="sm107 d192xd128 mxfp8", tile_k=192, tile_o=128, mxfp8=True)
 
 
 # ---------------------------------------------------------------------------

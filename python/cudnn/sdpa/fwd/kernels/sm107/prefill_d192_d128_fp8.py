@@ -2,9 +2,31 @@
 # SPDX-License-Identifier: MIT
 
 """
-DSL prefill SDPA kernel — classic pipeline, per-tensor FP8 (E4M3 / E5M2), d=128, SM107 (Rubin).
+DSL prefill SDPA kernel — classic pipeline, per-tensor FP8 (E4M3 / E5M2),
+d_qk=192 / d_v=128, SM107 (Rubin).
 
-Verbatim sibling of ``prefill_d128_fp8_sm100.py`` (at 923fcb1a9) with the
+Geometry is ``make_cfg_d192`` (d_qk=192, d_v=128); the BODY is the same as
+``sm107/prefill_d128_fp8.py``.  The pre-upstream base kernel was flavor-generic
+(one file served d128 and d192xd128 by swapping the config), and ``CfgD192``
+only widens ``TILE_K`` over ``CfgD128``, so the config factory is the ONLY
+difference — exactly the relationship ``sm107/prefill_d192_d128_f16.py`` has to
+its own d128 sibling.
+
+SMEM at cga2, bf16-out: Q 48 KiB + K ring 48 + V ring 32 + O 64, so the last
+slab (the row-sum "ones" tile) starts at 192 KiB -- inside the 256 KiB version-0
+tcgen05 descriptor window, which is why ``DESC_VERSION`` stays 0.
+
+At **cga1 with a half-precision O** it does NOT clear that line: the K/V rings
+are not halved, and the ones tile starts at **272 KiB**.  Its descriptor would
+wrap to offset 0 and the Sigma row-sum MMA would multiply sQ instead of all-ones
+-- silently wrong LSE and O on every row, no crash (rules/mma-tma-matrix.md S6).
+The guard below is DERIVED from the same constants the allocator uses rather
+than restated as prose, because prose is what got this wrong the first time: an
+earlier revision of this docstring argued cga1 was safe "at 208 KiB", which was
+Q+K+V with sO and the ones tile omitted.  The engine row and the standalone
+adapter both keep this flavor at cga2 on Rubin.
+
+Verbatim sibling of ``sm100/prefill_d128_fp8.py`` (at 923fcb1a9) with the
 Rubin-specific deltas baked in — the ``_rubin`` sibling-module pattern from
 skills/cutedsl-kernel-integration (grouped_gemm precedent), so Rubin levers
 never touch the shipping Blackwell kernel:
@@ -45,7 +67,7 @@ count (issue #618; units past that total decode the batch == n_batch sentinel
 and drain without loads or stores).
 Ragged Stats ride the caller's declared layout (token-major (T, H) or
 head-major); the amax_o atomicMax is gated on live rows. Dense path
-byte-identical. Hunk-symmetric with prefill_d128_fp8_sm100.py.
+byte-identical. Hunk-symmetric with sm100/prefill_d128_fp8.py.
 """
 
 import os
@@ -67,12 +89,12 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 
 from dataclasses import dataclass
 
-from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d128
+from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d192
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
-CFG, _TMA = make_cfg_d128(PARAMS)
+CFG, _TMA = make_cfg_d192(PARAMS)
 
 # tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
 # decision point, wired into every construction below rather than repeated as a
@@ -114,7 +136,7 @@ _SMEM_BYTES = (
     + 2048  # barriers + scheduler + tmem-ptr slack (upper bound)
 )
 if _SMEM_BYTES > _GR100_SMEM_BUDGET:
-    raise ValueError(f"prefill_d128_fp8_sm107: SMEM {_SMEM_BYTES} B exceeds the GR100 budget ({_GR100_SMEM_BUDGET} B) — shrink STAGES_KV")
+    raise ValueError(f"prefill_d192_d128_fp8_sm107: SMEM {_SMEM_BYTES} B exceeds the GR100 budget ({_GR100_SMEM_BUDGET} B) — shrink STAGES_KV")
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
 TMA_QK_GRANU_ELEMS = _TMA.QK_GRANU_ELEMS
@@ -214,7 +236,7 @@ else:
     raise ValueError(f"prefill_sdpa_fp8: DTYPE_O={CFG.DTYPE_O} not supported (expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
 
 
-from cudnn.sdpa.fwd.kernels._common_sm100 import (
+from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
     Bars,
     KvLoopBounds,
@@ -278,11 +300,11 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 
 # === KV split ===
 #
-# Mechanics live in _common_sm100.make_split_helpers, shared with the other
+# Mechanics live in _common_blackwell.make_split_helpers, shared with the other
 # SM100-line prefill flavors: each Q tile's KV loop range is cut into SPLIT_KV
 # contiguous chunks, each run as its own persistent tile, and each writing a
 # normalized partial O + its own LSE into a split-major workspace that
-# split_combine_sm100 folds with the exact log-sum-exp identity.  At
+# sm100/split_combine folds with the exact log-sum-exp identity.  At
 # SPLIT_KV == 1 every closure folds away and this is the classic kernel.
 
 
@@ -361,16 +383,75 @@ _ONES_I32 = 0x38383838 if CFG.DTYPE_QKV == 0 else 0x3C3C3C3C
 # operand (parametrized on CTA_MMA so a future cga1 config supplies all 16
 # rows from real ones instead of walking the descriptor past the tile into
 # neighboring SMEM — functionally masked today only because the epilogue
-# reads Sigma column 0 alone; do not rely on that).  Row bytes = one
-# Q-swizzle atom, because the tile borrows the K-stage descriptor constants
-# (SMEM_LAYOUT_QKO / STRIDE_BYTE_OFFSET_QK), which assume that width; the
-# sum-MMA's K extent (TILE_N * BPE) must fit inside it — over-provisioning
-# is safe by construction (all-ones beyond K is never read), under-
-# provisioning never is.
+# reads Sigma column 0 alone; do not rely on that).
+#
+# Row bytes are the sum-MMA's OWN K extent, and the tile carries its OWN
+# descriptor constants (SMEM_LAYOUT_ONES / STRIDE_BYTE_OFFSET_ONES) rather than
+# borrowing Q's.  Borrowing them silently coupled this buffer to a swizzle
+# chosen for a DIFFERENT one: the FP8 Q swizzle is 128 B only while TILE_K * BPE
+# is a multiple of 128, and at d_qk = 192 it drops to 64 B (config_sm107
+# .q_swz_bytes) — too narrow for the 128 B K extent, so the descriptor would
+# walk past the tile into neighbouring SMEM.  Re-swizzling is free here because
+# every byte in the tile is the same value: an all-ones tile is invariant under
+# any byte permutation, so only the WIDTH is load-bearing.  At d128 this is the
+# same 128 B the Q atom happened to supply, so the shipped geometry is unchanged.
 _ONES_ROWS = 16 // CFG.CTA_MMA
-_ONES_ROW_BYTES = CFG.Q_SWZ_BYTES
-if CFG.TILE_N * CFG.BPE > _ONES_ROW_BYTES:
-    raise ValueError(f"prefill_d128_fp8_sm107: sum-MMA K ({CFG.TILE_N * CFG.BPE} B) exceeds the ones-tile row ({_ONES_ROW_BYTES} B swizzle atom)")
+_ONES_ROW_BYTES = CFG.TILE_N * CFG.BPE
+if _ONES_ROW_BYTES not in (128, 64, 32):
+    raise ValueError(f"prefill_d192_d128_fp8_sm107: ones-tile row ({_ONES_ROW_BYTES} B) is not a legal tcgen05 swizzle atom (128/64/32)")
+# ...and the FILL must cover the whole tile.  The loop below stores 512 B per
+# iteration (32 lanes x 16 B) and trip-counts as a floor division, so a tile
+# smaller than 512 B would be left UNWRITTEN -- an all-ones operand that is not
+# all ones, i.e. silently wrong row sums.  Always true today (TILE_N=128, BPE=1
+# -> 1024 B at cga2), but the atom check above alone would wave through a 32 B
+# row that the loop cannot fill.
+if (_ONES_ROWS * _ONES_ROW_BYTES) % 512 != 0:
+    raise ValueError(
+        f"prefill_d192_d128_fp8_sm107: ones tile is {_ONES_ROWS} x {_ONES_ROW_BYTES} B = "
+        f"{_ONES_ROWS * _ONES_ROW_BYTES} B, not a multiple of the 512 B the fill loop stores per iteration"
+    )
+
+
+# --- Descriptor-window guard for the ones tile (DERIVED, not asserted) ------
+# sOnes is allocated LAST and is read as an MMA operand through
+# `SmemTile.desc()`, so its byte OFFSET -- not just its size -- has to stay
+# inside the window this module's DESC_VERSION can address.  A version-0
+# tcgen05 descriptor carries a 14-bit `start_address` (a 256 KiB window) while
+# Rubin's per-CTA budget is 327 KiB, so a tile at or past 256 KiB wraps to
+# offset 0 and the Sigma row-sum MMA multiplies whatever sits at the bottom of
+# SMEM -- here that is sQ, so `total_sum` silently becomes a function of Q.
+# No crash, no NaN: just wrong LSE and wrong O on every row
+# (rules/mma-tma-matrix.md S6).
+#
+# Compute the offset the way the allocator does (declaration order, each slab
+# 1024-B aligned) rather than restating a number in prose.  A prose figure is
+# exactly what failed here: the first version of this file's docstring argued
+# cga1 was safe at "208 KiB", which was Q+K+V with sO and sOnes left out -- at
+# cga1 with a HALF-PRECISION O the ring halves do not apply and sOnes really
+# starts at 272 KiB.  Derived, this guard covers every future config too.
+def _smem_offset_of_ones() -> int:
+    off = 0
+    for nbytes in (
+        CFG.TILES_Q * CFG.TILE_M * CFG.TILE_K * CFG.BPE,  # sQ
+        CFG.STAGES_KV * (CFG.TILE_N * CFG.TILE_K // CFG.CTA_MMA) * CFG.BPE,  # sK
+        CFG.STAGES_KV * (CFG.TILE_O * CFG.TILE_N // CFG.CTA_MMA) * CFG.BPE,  # sV
+        CFG.TILES_Q * CFG.TILE_M * CFG.TILE_O * CFG.BPE_O,  # sO
+    ):
+        off = ((off + 1023) // 1024) * 1024 + nbytes
+    return ((off + 1023) // 1024) * 1024
+
+
+_ONES_SMEM_OFFSET = _smem_offset_of_ones()
+_DESC_V0_WINDOW = 256 * 1024
+if DESC_VERSION == 0 and _ONES_SMEM_OFFSET >= _DESC_V0_WINDOW:
+    raise ValueError(
+        f"prefill_d192_d128_fp8_sm107: the ones tile starts at {_ONES_SMEM_OFFSET} B, at or past the "
+        f"{_DESC_V0_WINDOW} B version-0 tcgen05 descriptor window (CTA_MMA={CFG.CTA_MMA}, "
+        f"BPE_O={CFG.BPE_O}); its descriptor would wrap to offset 0 and the row-sum MMA "
+        f"would read Q as its all-ones operand (silently wrong LSE and O). "
+        f"Serve this config at CTA_MMA=2, or move the kernel to DESC_VERSION=1 and "
+        f"re-validate -- version 1 is NOT a transparent widening (rules/mma-tma-matrix.md S6)."
+    )
 
 
 # === Kernel ===
@@ -531,6 +612,13 @@ def _kernel(
             _ones_ptr = Pointer(sOnes_raw.subview(tidx * cutlass.Int32(16) + cutlass.Int32(_i * 512)).data_ptr(), dtype=cutlass.Int32)
             _ones_ptr.store(_ones_vec, alignment=16)
 
+    # The ones tile is written by plain SMEM stores above and then read as a
+    # tcgen05 MMA operand (desc_ones) -- a generic-proxy -> async-proxy
+    # boundary, which needs a REAL fence.  fence_mbarrier_init orders mbarrier
+    # init and barrier_cta_sync is a CTA barrier; neither publishes the stores
+    # to the async proxy (frost-tile-dsl.md S1).  Without it the first launch
+    # can feed the row-sum MMA a partially-visible tile and pass on the second.
+    nvvm.fence_proxy("async.shared", space="cta")
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
 
@@ -1085,6 +1173,8 @@ SMEM_LAYOUT_K = _SWZ_ENUM[CFG.K_SWZ_BYTES]
 SMEM_LAYOUT_V = _SWZ_ENUM[CFG.V_SWZ_BYTES]
 SMEM_LAYOUT_O = _SWZ_ENUM[CFG.O_SWZ_BYTES]
 SMEM_LAYOUT_QKO = SMEM_LAYOUT_Q
+# The ones tile is descriptor-independent of Q/K (see _ONES_ROW_BYTES above).
+SMEM_LAYOUT_ONES = _SWZ_ENUM[_ONES_ROW_BYTES]
 
 # O SMEM Swizzle preset (B, 4, 3): Swz128B=(3,4,3) etc.  Third param is XOR shift, NOT B.
 _O_SWZ_B = {128: 3, 64: 2, 32: 1}[CFG.O_SWZ_BYTES]
@@ -1095,6 +1185,7 @@ LEADING_BYTE_OFFSET_QK = 0
 # (cf. rules §16).
 _MMA_K_FP8 = CFG.TILE_K_HW_BMM2
 STRIDE_BYTE_OFFSET_QK = 8 * CFG.Q_SWZ_BYTES
+STRIDE_BYTE_OFFSET_ONES = 8 * _ONES_ROW_BYTES
 
 # leading_byte_offset = 0 when (TILE_O/CTA_MMA)/8 <= 8 else TILE_N*V_SWZ_BYTES.
 _CORE_MATRIX_ROWS = 8
@@ -1242,8 +1333,8 @@ def _mma_warp_group(
         elems_per_stage=_ONES_ROWS * _ONES_ROW_BYTES,
         stages=1,
         leading_byte_offset=LEADING_BYTE_OFFSET_QK,
-        stride_byte_offset=STRIDE_BYTE_OFFSET_QK,
-        layout=SMEM_LAYOUT_QKO,
+        stride_byte_offset=STRIDE_BYTE_OFFSET_ONES,
+        layout=SMEM_LAYOUT_ONES,
         desc_version=DESC_VERSION,
     )
     desc_ones = sOnes[0].desc()
@@ -2248,7 +2339,7 @@ def _correction_warp_group(
             # Under KV split this epilogue sees only its OWN partial, and the
             # recombined O is a convex combination of the partials -- so a max
             # over partials over-reports the output amax (~2.9x at 8 splits).
-            # split_combine_sm100 computes it over the recombined O instead;
+            # sm100/split_combine computes it over the recombined O instead;
             # this write has to stay out of the way, since atomicMax only grows.
             if cutlass.const_expr(SPLIT_KV == 1):
                 if _row_valid:

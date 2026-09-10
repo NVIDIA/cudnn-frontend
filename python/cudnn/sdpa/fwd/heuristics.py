@@ -114,10 +114,10 @@ _SPLIT_KV_MIN_TILES = 2
 _SPLIT_KV_CTA_COST = 21.0
 # What ONE split's partials cost the combine pass, per wave of combine blocks,
 # in units of one KV tile of main-kernel work. The combine's own occupancy
-# (blocks/SM of split_combine_sm100) is ABSORBED into this coefficient: it is
+# (blocks/SM of sm100/split_combine) is ABSORBED into this coefficient: it is
 # one fixed kernel, so blocks/SM is a constant, and folding it in keeps a
 # cuOccupancy query -- which would need a compiled CUfunction -- off the
-# planning path. Empirical: re-measure if split_combine_sm100 changes.
+# planning path. Empirical: re-measure if sm100/split_combine changes.
 _SPLIT_KV_COMBINE_COST = 0.2
 
 
@@ -197,7 +197,7 @@ def choose_split_kv(
     CTA_COST is what a tile re-pays whatever its loop length, so it sits INSIDE
     the wave term -- once per CTA-tile, not once per split.  COMBINE_COST is
     outside it: the combine is a separate launch whose grid is ``(S_q, H, B)``
-    (split_combine_sm100), one block per output row and independent of ``s`` --
+    (sm100/split_combine), one block per output row and independent of ``s`` --
     only the per-block work grows with ``s``, since each block reduces ``s``
     partials.  Hence ``combine_rows`` (= S_q * H_q * B) and not ``base_ctas``.
 
