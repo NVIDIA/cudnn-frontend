@@ -86,6 +86,22 @@ def _reference_case(seqlen_q: int, seqlen_kv: int, *, is_causal: bool):
 
 
 @pytest.mark.L0
+def test_nvfp4_quantization_preserves_round_to_nearest_even_midpoints():
+    """An approximate reciprocal must not move an exact E2M1 tie upward."""
+    from cudnn.sdpa.bwd.qat._nvfp4 import fake_quantize_q
+
+    # 6 * scale fixes the block amax. Every other value is an exact E2M1
+    # midpoint; use both signs and include the non-power-of-two scale 15/32.
+    scales = torch.tensor([0.234375, 0.46875, 0.9375, 1.875], device="cuda")
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device="cuda")
+    block = torch.cat((midpoints, -midpoints, torch.tensor([6.0, -6.0], device="cuda")))
+    q = (scales[:, None] * block).repeat(1, 8).to(torch.bfloat16).view(1, 1, 4, 128)
+    actual = torch.empty_like(q)
+    fake_quantize_q[(1, 1)](q, actual, *q.stride(), *actual.stride(), 1, 4, block_m=32, head_dim=128, num_warps=4, num_stages=2)
+    torch.testing.assert_close(actual, _fake_quantize_nvfp4_reference(q), rtol=0, atol=0)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=31)
 def test_nvfp4_attention_qat_backward_wrapper_matches_reference():
     """Match the wrapper outputs against the NVFP4 PyTorch reference."""

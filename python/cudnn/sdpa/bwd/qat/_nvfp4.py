@@ -33,8 +33,10 @@ def _quantize_nvfp4(src_tensor, valid_src_mask):
     # converting block_amax / 6 to E4M3 underflows to zero and the encode scale
     # becomes infinite. E4M3's minimum subnormal is 2^-9.
     decode_scale = tl.maximum(block_amax / 6.0, E4M3_MIN_SUBNORMAL).to(tl.float8e4nv)
-    encode_scale = 1.0 / decode_scale.to(tl.float32)
-    quant_input = src_f32.reshape([block_rows, scale_cols, NVFP4_BLOCK_SIZE]) * encode_scale
+    # Reciprocal multiplication can perturb exact E2M1 rounding midpoints
+    # (for example 0.5859375 / 0.46875 == 1.25) and change a whole FP4 code.
+    # Preserve round-to-nearest-even before the native E2M1 conversion.
+    quant_input = tl.div_rn(src_f32.reshape([block_rows, scale_cols, NVFP4_BLOCK_SIZE]), decode_scale.to(tl.float32))
     quant_input = quant_input.reshape([block_rows, block_cols])
     quant_input = tl.where(valid_src_mask, quant_input, 0.0)
 
