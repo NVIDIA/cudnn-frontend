@@ -609,26 +609,26 @@ class FrostConvEngine(BaseEngine):
                     (post_padding, pre_padding, stride, dilation),
                     current_device(),
                 )
+            else:
+                _check_cutedsl("frost_conv dense convolution", DENSE_CUTEDSL_MIN_VERSION)
+                # Keep compiler-template imports lazy so engine discovery does not load them.
+                from .templates.sm100_conv import compile
 
-            _check_cutedsl("frost_conv dense convolution", DENSE_CUTEDSL_MIN_VERSION)
-            # Keep compiler-template imports lazy so engine discovery does not load them.
-            from .templates.sm100_conv import compile
-
-            ab_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(image.data_type)]
-            c_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(output.data_type)]
-            compiled = compile(
-                ncdhw=ncdhw,
-                ktrs=ktrs,
-                upper_padding_dhw=post_padding,
-                lower_padding_dhw=pre_padding,
-                stride_dhw=stride,
-                dilation_dhw=dilation,
-                epilogue=analysis.epilogue,
-                epilogue_attrs=analysis.epilogue_attrs,
-                ab_dtype=ab_dtype,
-                c_dtype=c_dtype,
-            )
-        return _Sm100FrostConvPlan(compiled, (image, weight, output))
+                ab_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(image.data_type)]
+                c_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(output.data_type)]
+                compiled = compile(
+                    ncdhw=ncdhw,
+                    ktrs=ktrs,
+                    upper_padding_dhw=post_padding,
+                    lower_padding_dhw=pre_padding,
+                    stride_dhw=stride,
+                    dilation_dhw=dilation,
+                    epilogue=analysis.epilogue,
+                    epilogue_attrs=analysis.epilogue_attrs,
+                    ab_dtype=ab_dtype,
+                    c_dtype=c_dtype,
+                )
+                return _Sm100FrostConvPlan(compiled, (image, weight, output))
 
 
 def FrostConvEngines(ids: dict[str, int]) -> list[BaseEngine]:
