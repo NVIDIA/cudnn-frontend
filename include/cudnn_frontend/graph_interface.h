@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <mutex>
+#include <system_error>
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
@@ -61,6 +63,39 @@ class Graph : public ICudnn, public INode {
                                            j["json_version"].get<std::string>() != GRAPH_JSON_VERSION,
                                        error_code_t::UNSUPPORTED_GRAPH_FORMAT,
                                        "Unsupported graph JSON version. Expected " + std::string(GRAPH_JSON_VERSION));
+        return {error_code_t::OK, ""};
+    }
+
+    // Rejects a serialized graph that lacks a key the deserializer reads unconditionally.
+    // Without this, the read uses the const operator[], which is JSON_ASSERT(it != end()) and
+    // therefore a no-op under NDEBUG: a truncated blob dereferences end() instead of failing.
+    static error_t
+    require_key(json const &j, char const *key) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains(key),
+                                       error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                       "Serialized graph is missing the key " + std::string(key) + ".");
+        return {error_code_t::OK, ""};
+    }
+
+    // Parses a uid that was serialized as a json object key.
+    // std::stoll throws std::invalid_argument out of the library for a key that is not a number.
+    // A corrupt key must fail like every other malformed input instead.
+    // A negative value stays valid. uid_t is signed and set_uid() takes any value.
+    // The serializer writes std::to_string(uid), so a blob can carry a negative uid.
+    static error_t
+    parse_uid_key(std::string const &key, uid_t &uid) {
+        long long value        = 0;
+        char const *const last = key.data() + key.size();
+        auto const result      = std::from_chars(key.data(), last, value);
+        // from_chars must consume the whole key.
+        // A partial parse leaves result.ptr short of the end.
+        // This rejects a trailing character, an embedded NUL, a leading space and a leading plus.
+        // The serializer writes none of those.
+        // Two keys that differ only in such a character would otherwise map to one uid.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(result.ec != std::errc() || result.ptr != last,
+                                       error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                       "Serialized graph holds a uid key that is not a valid uid: " + key);
+        uid = static_cast<uid_t>(value);
         return {error_code_t::OK, ""};
     }
 #endif
@@ -1720,6 +1755,15 @@ class Graph : public ICudnn, public INode {
                           bool run_warmup) {
         CHECK_CUDNN_FRONTEND_ERROR(check_graph_json_version(j));
 
+        // Test the keys that carry no plan data up front, so a malformed blob fails before this
+        // clears the containers below and before build_plans() does any cuDNN work.
+        // cudnn_backend_data stays at its own read: enforce_precompiled gives it a different
+        // error code, and that difference is part of the API.
+        CHECK_CUDNN_FRONTEND_ERROR(require_key(j, "behavior_notes"));
+        CHECK_CUDNN_FRONTEND_ERROR(require_key(j, "variant_pack_uids"));
+        CHECK_CUDNN_FRONTEND_ERROR(require_key(j, "variant_pack_replacements"));
+        CHECK_CUDNN_FRONTEND_ERROR(require_key(j, "fe_workspace_size"));
+
         // Clear deserialize-owned containers so a re-deserialize on the same Graph
         // does not feed prepare_variant_pack_template() with stale entries from a
         // prior deserialize call.
@@ -1730,6 +1774,8 @@ class Graph : public ICudnn, public INode {
 
         auto const has_graph_structure = j.contains("nodes") || j.contains("tensors");
         if (has_graph_structure) {
+            // has_graph_structure tests nodes and tensors, neither of which implies gid.
+            CHECK_CUDNN_FRONTEND_ERROR(require_key(j, "gid"));
             gid = j["gid"].get<uint64_t>();
 
             RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("tensors") || !j["tensors"].is_array(),
@@ -1747,6 +1793,7 @@ class Graph : public ICudnn, public INode {
             error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
             "enforce_precompiled requested, but serialized graph has no precompiled execution plan");
 
+        CHECK_CUDNN_FRONTEND_ERROR(require_key(j, "cudnn_backend_data"));
         auto serialized_plan = j["cudnn_backend_data"];
         if (device_prop != nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(device_prop, serialized_plan));
@@ -1761,8 +1808,14 @@ class Graph : public ICudnn, public INode {
         // Deserialize pass_by_values from JSON
         if (j.contains("pass_by_values")) {
             auto pass_by_values_json = j["pass_by_values"];
+            // begin() on a scalar is not end(), so the loop below would run once and it.key()
+            // would throw json::invalid_iterator out of the library.
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!pass_by_values_json.is_object(),
+                                           error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                           "Serialized graph pass_by_values must be a map.");
             for (auto it = pass_by_values_json.begin(); it != pass_by_values_json.end(); ++it) {
-                uid_t uid                       = std::stoll(it.key());
+                uid_t uid = 0;
+                CHECK_CUDNN_FRONTEND_ERROR(parse_uid_key(it.key(), uid));
                 pass_by_values_t value          = it.value().get<pass_by_values_t>();
                 deserialized_pass_by_value[uid] = value;
             }
@@ -1771,9 +1824,19 @@ class Graph : public ICudnn, public INode {
         // Deserialize workspace_modifications from JSON
         if (j.contains("workspace_modifications")) {
             auto workspace_modifications_json = j["workspace_modifications"];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!workspace_modifications_json.is_object(),
+                                           error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                           "Serialized graph workspace_modifications must be a map.");
             for (auto it = workspace_modifications_json.begin(); it != workspace_modifications_json.end(); ++it) {
-                uid_t uid                                 = std::stoll(it.key());
-                auto tuple_json                           = it.value();
+                uid_t uid = 0;
+                CHECK_CUDNN_FRONTEND_ERROR(parse_uid_key(it.key(), uid));
+                auto tuple_json = it.value();
+                // The const operator[] on an array holds no assert at all.
+                // A short entry is therefore undefined behaviour in a debug build too.
+                RETURN_CUDNN_FRONTEND_ERROR_IF(!tuple_json.is_array() || tuple_json.size() < 3,
+                                               error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                               "Serialized graph holds a workspace_modifications entry that is not a "
+                                               "list of at least three elements.");
                 auto tuple_value                          = std::make_tuple(tuple_json[0].get<int64_t>(),
                                                    tuple_json[1].get<int64_t>(),
                                                    tuple_json[2].get<std::vector<float>>());
@@ -2552,6 +2615,7 @@ class Graph : public ICudnn, public INode {
             }
         }
 
+        CHECK_CUDNN_FRONTEND_ERROR(require_key(j, "gid"));
         gid = j["gid"].get<uint64_t>();
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("tensors") || !j["tensors"].is_array(),
