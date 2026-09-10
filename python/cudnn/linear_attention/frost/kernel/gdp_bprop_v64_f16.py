@@ -3395,65 +3395,68 @@ def frost_gdp_bprop_v64_prologue(
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
 ) -> None:
-    """Single-CTA prologue. Under ``run_order`` this kernel is the first
-    work-item-table consumer, so it LPT-orders the table and zeroes both
-    consumers' scheduler rings via :func:`order_body`; it then builds the
+    """Two-CTA prologue. Under ``run_order`` this kernel is the first
+    work-item-table consumer, so block 0 LPT-orders the table and zeroes both
+    consumers' scheduler rings via :func:`order_body`; block 1 builds the
     per-batch TMA-descriptor arrays via :func:`build_descs_body`, one warp
-    per array (the extra warps only take part in the order phase)."""
+    per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
         launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
-    if cutlass.const_expr(run_order):
-        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
-        n_heads_out = cutlass.Int32(do_.shape[1])
-        order_body(
-            order_gen,
-            True,
-            b_t,
-            ORDER_THREADS,
-            ORDER_ELEMENTS,
-            tidx,
-            n_heads_out,
-            n_heads_out * n_batch,
+    bidx = cutlass.Int32(cute.arch.block_idx()[0])
+    if bidx == cutlass.Int32(0):
+        if cutlass.const_expr(run_order):
+            sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+            sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+            sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
+            n_heads_out = cutlass.Int32(do_.shape[1])
+            order_body(
+                order_gen,
+                True,
+                b_t,
+                ORDER_THREADS,
+                ORDER_ELEMENTS,
+                tidx,
+                n_heads_out,
+                n_heads_out * n_batch,
+                cu_seqlens,
+                mStaging,
+                mCount,
+                mWorkItems,
+                mScheduler,
+                sKey,
+                sIdx,
+                sSpread,
+                expand_num=expand_num,
+            )
+    else:
+        build_descs_body(
+            widx,
+            base_q,
+            base_k,
+            base_v,
+            base_do,
+            base_checkpoint,
+            base_dq,
+            base_dk,
+            base_dv,
+            desc_workspace,
             cu_seqlens,
-            mStaging,
-            mCount,
-            mWorkItems,
-            mScheduler,
-            sKey,
-            sIdx,
-            sSpread,
-            expand_num=expand_num,
+            q,
+            k,
+            v,
+            do_,
+            state_checkpoints,
+            dq,
+            dk,
+            dv,
+            n_batch,
+            checkpoint_every_n,
+            expand_num,
         )
-    build_descs_body(
-        widx,
-        base_q,
-        base_k,
-        base_v,
-        base_do,
-        base_checkpoint,
-        base_dq,
-        base_dk,
-        base_dv,
-        desc_workspace,
-        cu_seqlens,
-        q,
-        k,
-        v,
-        do_,
-        state_checkpoints,
-        dq,
-        dk,
-        dv,
-        n_batch,
-        checkpoint_every_n,
-        expand_num,
-    )
 
 
 @cute.jit
@@ -3554,7 +3557,7 @@ def prologue(
         scheduler_all,
         cutlass.Int32(batch_size),
         cutlass.Int32(b_t),
-    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+    ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 @cute.jit

@@ -1931,72 +1931,74 @@ def frost_kda_recompute_prologue(
     checkpoint_every_n: cutlass.Int32,
     seed_span_chunks: cutlass.Int32,
 ) -> None:
-    """Single-CTA prologue. Under ``run_order`` this kernel is the first
-    work-item-table consumer, so it LPT-orders the table and zeroes both
-    consumers' scheduler rings via :func:`order_body`; under ``gen_intervals``
-    it synthesizes one checkpoint-seeded work item per ``seed_span_chunks``
-    chunks (a whole number of checkpoint intervals) of every (batch, head)
-    tile.  It then builds the per-batch TMA-descriptor arrays via
-    :func:`build_descs_body`, one warp per array (the extra warps only take
-    part in the item phase)."""
+    """Two-CTA prologue. Block 0 owns the item phase: under ``run_order`` this
+    kernel is the first work-item-table consumer, so it LPT-orders the table
+    and zeroes both consumers' scheduler rings via :func:`order_body`; under
+    ``gen_intervals`` it synthesizes one checkpoint-seeded work item per
+    ``seed_span_chunks`` chunks (a whole number of checkpoint intervals) of
+    every (batch, head) tile.  Block 1 builds the per-batch TMA-descriptor
+    arrays via :func:`build_descs_body`, one warp per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
         launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
-    if cutlass.const_expr(gen_intervals):
-        n_heads_out = cutlass.Int32(gate.shape[1])
-        gen_interval_items(
-            b_t,
-            ORDER_THREADS,
-            tidx,
-            n_heads_out,
-            n_heads_out * n_batch,
-            seed_span_chunks,
+    bidx = cutlass.Int32(cute.arch.block_idx()[0])
+    if bidx == cutlass.Int32(0):
+        if cutlass.const_expr(gen_intervals):
+            n_heads_out = cutlass.Int32(gate.shape[1])
+            gen_interval_items(
+                b_t,
+                ORDER_THREADS,
+                tidx,
+                n_heads_out,
+                n_heads_out * n_batch,
+                seed_span_chunks,
+                cu_seqlens,
+                mCount,
+                mWorkItems,
+                mScheduler,
+            )
+        if cutlass.const_expr(run_order):
+            sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+            sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+            sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
+            n_heads_out = cutlass.Int32(gate.shape[1])
+            order_body(
+                order_gen,
+                has_scheduler,
+                b_t,
+                ORDER_THREADS,
+                ORDER_ELEMENTS,
+                tidx,
+                n_heads_out,
+                n_heads_out * n_batch,
+                cu_seqlens,
+                mStaging,
+                mCount,
+                mWorkItems,
+                mScheduler,
+                sKey,
+                sIdx,
+                sSpread,
+            )
+    else:
+        build_descs_body(
+            widx,
+            base_k,
+            base_v,
+            base_gate,
+            base_checkpoint,
+            desc_workspace,
             cu_seqlens,
-            mCount,
-            mWorkItems,
-            mScheduler,
+            k,
+            v,
+            gate,
+            state_checkpoints,
+            n_batch,
+            checkpoint_every_n,
         )
-    if cutlass.const_expr(run_order):
-        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
-        n_heads_out = cutlass.Int32(gate.shape[1])
-        order_body(
-            order_gen,
-            has_scheduler,
-            b_t,
-            ORDER_THREADS,
-            ORDER_ELEMENTS,
-            tidx,
-            n_heads_out,
-            n_heads_out * n_batch,
-            cu_seqlens,
-            mStaging,
-            mCount,
-            mWorkItems,
-            mScheduler,
-            sKey,
-            sIdx,
-            sSpread,
-        )
-    build_descs_body(
-        widx,
-        base_k,
-        base_v,
-        base_gate,
-        base_checkpoint,
-        desc_workspace,
-        cu_seqlens,
-        k,
-        v,
-        gate,
-        state_checkpoints,
-        n_batch,
-        checkpoint_every_n,
-    )
 
 
 @cute.jit
@@ -2081,7 +2083,7 @@ def prologue(
         cutlass.Int32(batch_size),
         checkpoint_every_n,
         seed_span_chunks,
-    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+    ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 @cute.jit

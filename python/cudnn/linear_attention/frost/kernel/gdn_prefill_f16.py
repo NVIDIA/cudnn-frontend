@@ -2385,57 +2385,59 @@ def frost_gdn_prefill_prologue(
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
 ) -> None:
-    """Single-CTA prologue: LPT-order the work-item table and zero the scheduler
-    rings via :func:`order_body`, then build the per-batch TMA-descriptor
-    arrays via :func:`build_descs_body`, one warp per array (the extra warps
-    only take part in the order phase)."""
+    """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the
+    scheduler rings via :func:`order_body`, block 1 builds the per-batch
+    TMA-descriptor arrays via :func:`build_descs_body`, one warp per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
         launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
-    sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-    sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-    sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
-    n_heads_out = cutlass.Int32(q.shape[1] if q.shape[1] >= v.shape[1] else v.shape[1])
-    order_body(
-        order_gen,
-        has_scheduler,
-        b_t,
-        ORDER_THREADS,
-        ORDER_ELEMENTS,
-        tidx,
-        n_heads_out,
-        n_heads_out * n_batch,
-        cu_seqlens,
-        mStaging,
-        mCount,
-        mWorkItems,
-        mScheduler,
-        sKey,
-        sIdx,
-        sSpread,
-        expand_num=expand_num,
-    )
-    build_descs_body(
-        widx,
-        base_q,
-        base_k,
-        base_v,
-        base_o,
-        base_checkpoint,
-        desc_workspace,
-        cu_seqlens,
-        q,
-        k,
-        v,
-        o,
-        state_checkpoints_out,
-        n_batch,
-        checkpoint_every_n,
-        expand_num,
-    )
+    bidx = cutlass.Int32(cute.arch.block_idx()[0])
+    if bidx == cutlass.Int32(0):
+        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
+        n_heads_out = cutlass.Int32(q.shape[1] if q.shape[1] >= v.shape[1] else v.shape[1])
+        order_body(
+            order_gen,
+            has_scheduler,
+            b_t,
+            ORDER_THREADS,
+            ORDER_ELEMENTS,
+            tidx,
+            n_heads_out,
+            n_heads_out * n_batch,
+            cu_seqlens,
+            mStaging,
+            mCount,
+            mWorkItems,
+            mScheduler,
+            sKey,
+            sIdx,
+            sSpread,
+            expand_num=expand_num,
+        )
+    else:
+        build_descs_body(
+            widx,
+            base_q,
+            base_k,
+            base_v,
+            base_o,
+            base_checkpoint,
+            desc_workspace,
+            cu_seqlens,
+            q,
+            k,
+            v,
+            o,
+            state_checkpoints_out,
+            n_batch,
+            checkpoint_every_n,
+            expand_num,
+        )
 
 
 @cute.jit
@@ -2530,7 +2532,7 @@ def prologue(
         scheduler_counter,
         cutlass.Int32(batch_size),
         checkpoint_every_n,
-    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+    ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 @cute.jit

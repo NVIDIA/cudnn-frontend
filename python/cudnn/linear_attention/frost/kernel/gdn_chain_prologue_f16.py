@@ -8,6 +8,8 @@ prologue.  The bprop summary's q and dO arrays address the compact token timelin
 phase rows of an expanded q buffer).  Descriptor-phase warps: 0 T pass K map (static slot), 1-2 fused summary K / V,
 3-4 recompute H K / V, 5-6 recompute M K / V (both from k), 7-9 series recompute K / V / series out, 10-14 prefill
 Q / K / V / O / checkpoints out, 15-17 bprop summary Q / K / dO, 18-25 bprop Q / K / V / dO / series in / dQ / dK / dV.
+Two blocks: block 0 builds the piece table, the work-item orders and the series items; block 1 builds the piece table
+as well and the descriptor arrays.
 """
 
 from typing import Optional
@@ -91,6 +93,7 @@ def frost_gdn_chain_prologue(
         launch_dependent_grids()
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     widx = tidx // cutlass.Int32(32)
+    bidx = cutlass.Int32(cute.arch.block_idx()[0])
     n_heads_out = cutlass.Int32(heads_out)
 
     # ---- piece table --------------------------------------------------------------------------
@@ -112,36 +115,14 @@ def frost_gdn_chain_prologue(
     nvvm.barrier_cta_sync()
     n_pieces = num_seqs * cutlass.Int32(pieces)
 
-    # ---- work-item tables -----------------------------------------------------------------------
-    sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-    sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-    sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
-    order_body(
-        False,
-        True,
-        b_t,
-        ORDER_THREADS,
-        ORDER_ELEMENTS,
-        tidx,
-        n_heads_out,
-        n_heads_out * n_pieces,
-        cu_pieces,
-        None,
-        main_count,
-        work_items,
-        scheduler,
-        sKey,
-        sIdx,
-        sSpread,
-        expand_num=expand_num,
-        pieces=pieces,
-        mRowBase=main_rows,
-    )
-    if cutlass.const_expr(work_items_summary is not None):
-        nvvm.barrier_cta_sync()
+    if bidx == cutlass.Int32(0):
+        # ---- work-item tables -----------------------------------------------------------------------
+        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
         order_body(
             False,
-            False,
+            True,
             b_t,
             ORDER_THREADS,
             ORDER_ELEMENTS,
@@ -150,140 +131,163 @@ def frost_gdn_chain_prologue(
             n_heads_out * n_pieces,
             cu_pieces,
             None,
-            summary_count,
-            work_items_summary,
-            None,
+            main_count,
+            work_items,
+            scheduler,
             sKey,
             sIdx,
             sSpread,
             expand_num=expand_num,
             pieces=pieces,
-            mRowBase=summary_rows,
+            mRowBase=main_rows,
         )
-    if cutlass.const_expr(series_items is not None):
-        gen_interval_items(
-            b_t, ORDER_THREADS, tidx, n_heads_out, n_heads_out * n_pieces, series_span_chunks, cu_pieces, series_count, series_items, None, expand_num
-        )
-
-    # ---- descriptor arrays ----------------------------------------------------------------------
-    if cutlass.const_expr(tinv_words is not None):
-        if widx == 0:
-            if nvvm.elect_sync():
-                dptr = tinv_words.iterator.raw_ptr()
-                src_words = Pointer(base_k.get_ptr(), dtype=cutlass.Int64)
-                for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-                    (dptr + i).store((src_words + i).load())
-                nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
-    if cutlass.const_expr(summary_words is not None):
-        gdn_summary_f16.build_descs_body(widx - cutlass.Int32(1), base_k, base_v, summary_words, cu_pieces, k, v, n_pieces, expand_num)
-    if cutlass.const_expr(recompute_h_words is not None):
-        gdn_recompute_f16.build_descs_body(
-            widx - cutlass.Int32(3), base_k, base_v, base_k, recompute_h_words, cu_pieces, k, v, None, n_pieces, cutlass.Int32(0), expand_num
-        )
-    if cutlass.const_expr(recompute_m_words is not None):
-        gdn_recompute_f16.build_descs_body(
-            widx - cutlass.Int32(5), base_k, base_vk, base_k, recompute_m_words, cu_pieces, k, k, None, n_pieces, cutlass.Int32(0), expand_num
-        )
-    if cutlass.const_expr(series_words is not None):
-        gdn_recompute_f16.build_descs_body(
-            widx - cutlass.Int32(7),
-            base_k,
-            base_v,
-            base_checkpoint,
-            series_words,
-            cu_pieces,
-            k,
-            v,
-            checkpoints,
-            n_pieces,
-            checkpoint_every_n,
-            expand_num,
-        )
-    if cutlass.const_expr(prefill_words is not None):
-        gdn_prefill_f16.build_descs_body(
-            widx - cutlass.Int32(10),
-            base_q,
-            base_k,
-            base_v,
-            base_o,
-            base_checkpoint,
-            prefill_words,
-            cu_pieces,
-            q,
-            k,
-            v,
-            o,
-            checkpoints,
-            n_pieces,
-            checkpoint_every_n,
-            expand_num,
-        )
-    if cutlass.const_expr(bprop_summary_words is not None):
-        gdn_bprop_summary_f16.build_descs_body(
-            widx - cutlass.Int32(15),
-            base_summary_q,
-            base_k,
-            base_summary_do,
-            bprop_summary_words,
-            cu_pieces,
-            summary_q,
-            k,
-            summary_do,
-            n_pieces,
-            expand_num,
-            summary_q_step,
-        )
-    if cutlass.const_expr(bprop_words is not None):
-        if cutlass.const_expr(compact_qdo):
-            gdp_bprop_v64_f16.build_descs_body(
-                widx - cutlass.Int32(18),
-                base_q,
+        if cutlass.const_expr(work_items_summary is not None):
+            nvvm.barrier_cta_sync()
+            order_body(
+                False,
+                False,
+                b_t,
+                ORDER_THREADS,
+                ORDER_ELEMENTS,
+                tidx,
+                n_heads_out,
+                n_heads_out * n_pieces,
+                cu_pieces,
+                None,
+                summary_count,
+                work_items_summary,
+                None,
+                sKey,
+                sIdx,
+                sSpread,
+                expand_num=expand_num,
+                pieces=pieces,
+                mRowBase=summary_rows,
+            )
+        if cutlass.const_expr(series_items is not None):
+            gen_interval_items(
+                b_t, ORDER_THREADS, tidx, n_heads_out, n_heads_out * n_pieces, series_span_chunks, cu_pieces, series_count, series_items, None, expand_num
+            )
+    else:
+        # ---- descriptor arrays ----------------------------------------------------------------------
+        if cutlass.const_expr(tinv_words is not None):
+            if widx == 0:
+                if nvvm.elect_sync():
+                    dptr = tinv_words.iterator.raw_ptr()
+                    src_words = Pointer(base_k.get_ptr(), dtype=cutlass.Int64)
+                    for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+                        (dptr + i).store((src_words + i).load())
+                    nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        if cutlass.const_expr(summary_words is not None):
+            gdn_summary_f16.build_descs_body(widx - cutlass.Int32(1), base_k, base_v, summary_words, cu_pieces, k, v, n_pieces, expand_num)
+        if cutlass.const_expr(recompute_h_words is not None):
+            gdn_recompute_f16.build_descs_body(
+                widx - cutlass.Int32(3), base_k, base_v, base_k, recompute_h_words, cu_pieces, k, v, None, n_pieces, cutlass.Int32(0), expand_num
+            )
+        if cutlass.const_expr(recompute_m_words is not None):
+            gdn_recompute_f16.build_descs_body(
+                widx - cutlass.Int32(5), base_k, base_vk, base_k, recompute_m_words, cu_pieces, k, k, None, n_pieces, cutlass.Int32(0), expand_num
+            )
+        if cutlass.const_expr(series_words is not None):
+            gdn_recompute_f16.build_descs_body(
+                widx - cutlass.Int32(7),
                 base_k,
                 base_v,
-                base_do,
                 base_checkpoint,
-                base_dq,
-                base_dk,
-                base_dv,
-                bprop_words,
+                series_words,
                 cu_pieces,
-                q,
                 k,
                 v,
-                do_,
                 checkpoints,
-                dq,
-                dk,
-                dv,
                 n_pieces,
                 checkpoint_every_n,
                 expand_num,
             )
-        else:
-            gdn_bprop_f16.build_descs_body(
-                widx - cutlass.Int32(18),
+        if cutlass.const_expr(prefill_words is not None):
+            gdn_prefill_f16.build_descs_body(
+                widx - cutlass.Int32(10),
                 base_q,
                 base_k,
                 base_v,
-                base_do,
+                base_o,
                 base_checkpoint,
-                base_dq,
-                base_dk,
-                base_dv,
-                bprop_words,
+                prefill_words,
                 cu_pieces,
                 q,
                 k,
                 v,
-                do_,
+                o,
                 checkpoints,
-                dq,
-                dk,
-                dv,
                 n_pieces,
                 checkpoint_every_n,
                 expand_num,
             )
+        if cutlass.const_expr(bprop_summary_words is not None):
+            gdn_bprop_summary_f16.build_descs_body(
+                widx - cutlass.Int32(15),
+                base_summary_q,
+                base_k,
+                base_summary_do,
+                bprop_summary_words,
+                cu_pieces,
+                summary_q,
+                k,
+                summary_do,
+                n_pieces,
+                expand_num,
+                summary_q_step,
+            )
+        if cutlass.const_expr(bprop_words is not None):
+            if cutlass.const_expr(compact_qdo):
+                gdp_bprop_v64_f16.build_descs_body(
+                    widx - cutlass.Int32(18),
+                    base_q,
+                    base_k,
+                    base_v,
+                    base_do,
+                    base_checkpoint,
+                    base_dq,
+                    base_dk,
+                    base_dv,
+                    bprop_words,
+                    cu_pieces,
+                    q,
+                    k,
+                    v,
+                    do_,
+                    checkpoints,
+                    dq,
+                    dk,
+                    dv,
+                    n_pieces,
+                    checkpoint_every_n,
+                    expand_num,
+                )
+            else:
+                gdn_bprop_f16.build_descs_body(
+                    widx - cutlass.Int32(18),
+                    base_q,
+                    base_k,
+                    base_v,
+                    base_do,
+                    base_checkpoint,
+                    base_dq,
+                    base_dk,
+                    base_dv,
+                    bprop_words,
+                    cu_pieces,
+                    q,
+                    k,
+                    v,
+                    do_,
+                    checkpoints,
+                    dq,
+                    dk,
+                    dv,
+                    n_pieces,
+                    checkpoint_every_n,
+                    expand_num,
+                )
 
 
 @cute.jit
@@ -464,7 +468,7 @@ def chain_prologue(
         dv,
         summary_q,
         summary_do,
-    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+    ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 def run_chain_prologue(
