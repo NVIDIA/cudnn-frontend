@@ -123,12 +123,17 @@ _DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16 = 0, 1, 2, 3
 # wrapper and the row still declines.  Sharing the constant makes disagreement
 # unrepresentable rather than merely tested.
 #
-# Membership rule: the shape's kernel BODY must be the shipped d128 FP8 one.
-# d192xd128 qualifies because it IS that body (only the config factory differs),
-# so its THD wiring is the validated wiring -- confirmed on w2u1g-lc-0030.
-# d256 / d512 do NOT: those ported bodies still call the setup kernel with the
-# pre-upstream 7-arg contract against a 14-arg helper, and their metadata layout
-# is 3B+2 where the helper builds 4B+4, so they raise at compile().
+# Membership rule: the shape's body must carry the FROST THD contract -- the
+# 14-arg build_thd_meta_o_descs_kernel, 4B+4 metadata, (b+3) O-descriptor slots,
+# the persistent claim-counter scheduler, the dead-unit O-store guard and the
+# packed-total-clamped runtime K/V descriptors.
+#
+# All four qualify as of 2026-09-09.  d192xd128 came free -- it IS the shipped
+# d128 body, only the config factory differs -- and d256 / d512 were moved onto
+# the contract (frost_dev/port_thd_contract.py); they previously called the
+# setup kernel with the pre-upstream 7-arg signature and allocated 3B+2 where
+# the shared decode reads 4B+4.  Confirmed on w2u1g-lc-0030: 43 passed / 0
+# failed across the per-tensor FP8 THD suite.
 SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 
 # f16/bf16 flavor names whose kernel body HAS been ported to the FROST

@@ -1185,6 +1185,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 f"SM100 DSL SDPA only supports {name}={supported}",
             )
         supported_cgas = supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc)
+        # Only a non-None request is checked: None means "let the lowering pick",
+        # which is how every graph that does not pin the knob gets here.  Dropping
+        # this check is not cosmetic -- it is precisely the rule-8b' failure the
+        # helper exists to prevent, since an explicit cga=1 on the Rubin quantized
+        # d192 path would then clear check_support() and die inside compile().
+        self._value_error_if(
+            self.cga is not None and self.cga not in supported_cgas,
+            f"SM100 DSL SDPA only supports cga in {supported_cgas}",
+        )
         self._value_error_if(
             self.flavor == (192, 128) and self.split_kv > 1 and self.cga == 1,
             "D192 split_kv > 1 is validated only with cga=2",

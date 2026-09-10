@@ -1151,6 +1151,13 @@ def _compute_warp_group(
         kv_unmasked_hi = seqlen_kv // cutlass.Int32(CFG.TILE_N)
         kv_right = seqlen_kv // cutlass.Int32(CFG.TILE_N)
         eff_seqlen_kv = seqlen_kv
+        # Bind the Q side on this arm too.  The unmasked sg0 loop below passes
+        # eff_seqlen_q to _sg0_softmax_kv_iter, and the only other binding is in
+        # the masked `else`.  It happens to trace today, but relying on that is
+        # relying on how the DSL preprocessor treats a const_expr branch's
+        # locals; at MASK_FLAGS == 0 the per-sequence length IS the scalar, so
+        # say so explicitly.
+        eff_seqlen_q = seqlen_q
     else:
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
         eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)

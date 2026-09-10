@@ -283,9 +283,10 @@ f16x2 exponent arm over the zero-padded 64 → 128 region.
 but SM100 has no d512 MXFP8 sibling, so the shared suite carries no d512 case to
 widen — it needs new cases, not a widened gate. Every other quantized cell above
 is covered by `test_sdpa_fwd_{fp8,mxfp8}_sm100.py` running on Rubin.
-ᵛ THD is not ported for the f16 kernels: the setup-kernel call site still speaks
-a 7-arg contract against a 14-arg helper, and the metadata layout differs
-(3B+2 vs 4B+4). `compile()` raises rather than half-serving it.
+ᵛ **Superseded by ᶻ** — kept only so the marker resolves for readers of an older
+revision. THD used to be unported on the f16 line (7-arg setup call against a
+14-arg helper, 3B+2 metadata where the shared decode reads 4B+4); every f16 and
+per-tensor FP8 flavor now carries the contract and serves it.
 ᵛⁱ Needs the per-batch `seq_len_q` LSE trim, which the f16 Rubin kernels do not
 carry (`padded_stats=False`). KV-side padding itself is served.
 ᵛⁱⁱ The f16 Rubin kernels wire no SplitHelpers.
@@ -441,7 +442,7 @@ feature-free d=64 graph.
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
-| f16/bf16 forward THD, split-KV, PackGQA, dense padded-Q trim | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d192×d128/d256/d512; these four are the machinery its kernels lack (optional stats IS served — `lse_optional=True`) |
+| f16/bf16 forward split-KV, PackGQA, dense padded-Q trim | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d192×d128/d256/d512, and THD on all of them as of 2026-09-09; these three are the machinery its kernels still lack (optional stats IS served — `lse_optional=True`) |
 | d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD row-wide |
 | MXFP8 forward | SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
 | Per-tensor FP8 backward | every arch |

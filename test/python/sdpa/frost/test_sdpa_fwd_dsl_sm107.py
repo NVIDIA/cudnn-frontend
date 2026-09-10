@@ -532,6 +532,20 @@ def test_sm107_ones_tile_stays_inside_the_v0_descriptor_window():
     from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
 
     assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7)) == (2,)
+    # ...and check_support must ACT on that, not merely compute it.  The helper
+    # was extracted in review and the `_value_error_if` that consumed it got
+    # dropped in the same edit, so `supported_cgas` was computed and discarded --
+    # an explicit cga=1 then cleared support validation and died inside
+    # compile(), which is exactly the rule-8b' failure the helper exists to
+    # prevent.  Pin the CONSUMPTION, since the value alone was already correct.
+    import inspect
+
+    from cudnn.sdpa.fwd import api_dsl as _api_dsl
+
+    _src = inspect.getsource(_api_dsl.SdpaFwdDslSm100.check_support)
+    assert "supported_cgas_for(" in _src, "check_support no longer derives the CGA domain"
+    assert "self.cga not in supported_cgas" in _src, "check_support computes supported_cgas but never validates self.cga against it"
+
     # ...and only there: Blackwell keeps both widths, and the f16 Rubin path is
     # not narrowed (it has no quantized SF or ones tile to push over the line).
     assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 0)) == (1, 2)
