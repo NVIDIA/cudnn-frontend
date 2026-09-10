@@ -33,7 +33,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Grouped GEMM + Wgrad](gemm_fusions/grouped_gemm_wgrad.md)
 - [Block Sparse Attention (BSA)](bsa.md)
 - [DeepSeek Sparse Attention (DSA)](dsa.md)
-- [Flex Attention](attention/flex_attention.md)
+- [Flex Attention](attention/flex_attention.md) and [mask plan design](attention/flex_attention_design.md)
 - [HSTU Attention (Blackwell SM100/SM103)](hstu/hstu_attention.md)
 - [HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)](hstu/hstu_lmsd.md)
 - [Native Sparse Attention (NSA)](nsa.md)
