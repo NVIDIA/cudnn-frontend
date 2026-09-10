@@ -2106,8 +2106,8 @@ def _render_block_scale_tile_constants_sm100(
         f"# packed data SMEM",
         f"a_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",
         f"b_dtype = {DTYPE_TO_CUTLASS[bs.b_dtype]}",
-        f"a_smem_dtype = {'cutlass.Float4E2M1FN_unpack' if padded_fp4 and a_data_elem_bits == 4 else DTYPE_TO_CUTLASS[bs.a_dtype]}",
-        f"b_smem_dtype = {'cutlass.Float4E2M1FN_unpack' if padded_fp4 and b_data_elem_bits == 4 else DTYPE_TO_CUTLASS[bs.b_dtype]}",
+        f"a_smem_dtype = {'cutlass.Uint8' if padded_fp4 and a_data_elem_bits == 4 else DTYPE_TO_CUTLASS[bs.a_dtype]}",
+        f"b_smem_dtype = {'cutlass.Uint8' if padded_fp4 and b_data_elem_bits == 4 else DTYPE_TO_CUTLASS[bs.b_dtype]}",
         f"ab_max_data_bits = {data_elem_bits}",
         # Fake-tensor dtypes: A and B may differ (mxfp8 e4m3xe5m2); NOT idesc_a/b (fp4 forces E5M2).
         f"a_fake_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",

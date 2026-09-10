@@ -265,16 +265,27 @@ def test_block_scale_matmul_gate_accepts_supported(a_dt, sf_dt, b_dt, bs):
 
 
 @pytest.mark.parametrize("a_dt,b_dt", [(_DT_FP4, _DT_E4M3), (_DT_FP4, _DT_E5M2), (_DT_E4M3, _DT_FP4), (_DT_E5M2, _DT_FP4)])
-def test_block_scale_matmul_gate_accepts_mixed_mxfp8_mxfp4(a_dt, b_dt):
-    from cudnn.gemm.frost.compiler import _check_block_scale_supported
+def test_block_scale_matmul_gate_accepts_mixed_mxfp8_mxfp4(a_dt, b_dt, monkeypatch):
+    from cudnn.gemm.frost import compiler as C
 
     chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E8M0, a_dt=a_dt, b_dt=b_dt))
-    _check_block_scale_supported(chain, "sm100")
+    C._check_block_scale_supported(chain, "sm100")
     assert chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
     cfg32 = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     cfg64 = by_name(_SM107_128 + "_1ctamma")
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
     assert select_template(chain, cfg32).accepts(chain, cfg32) is None
+    src32 = C._render_block_scale_tile_constants(cfg32, chain, select_template(chain, cfg32))
+    assigned32 = dict(re.findall(r"^(\w+) = (.*)$", src32, re.M))
+    assert assigned32["a_smem_dtype"] == ("cutlass.Uint8" if a_dt == _DT_FP4 else C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[a_dt]])
+    assert assigned32["b_smem_dtype"] == ("cutlass.Uint8" if b_dt == _DT_FP4 else C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[b_dt]])
+    assert "Float4E2M1FN_unpack" not in src32
+    monkeypatch.setattr(C, "_current_arch", lambda: 107)
     assert select_template(chain, cfg64).accepts(chain, cfg64) is None
+    src64 = C._render_block_scale_tile_constants(cfg64, chain, select_template(chain, cfg64))
+    assigned64 = dict(re.findall(r"^(\w+) = (.*)$", src64, re.M))
+    assert assigned64["a_smem_dtype"] == C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[a_dt]]
+    assert assigned64["b_smem_dtype"] == C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[b_dt]]
 
 
 def test_block_scale_matmul_gate_rejects_mismatches():
