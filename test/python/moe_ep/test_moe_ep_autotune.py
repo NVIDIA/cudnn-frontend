@@ -1,5 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Contracts and smoke coverage for the explicit MoeEP sweep autotuner."""
 
@@ -413,9 +413,7 @@ def test_autotune_api_transactions(monkeypatch):
             autotune_module,
             "allocate_training_outputs",
             lambda requirements, device, symmetric: (
-                (forward_outputs, backward_outputs)
-                if symmetric is symmetric_buffers
-                else pytest.fail("autotune used the wrong symmetric buffers")
+                (forward_outputs, backward_outputs) if symmetric is symmetric_buffers else pytest.fail("autotune used the wrong symmetric buffers")
             ),
         )
         patch.setattr(

@@ -1,5 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Ordinary/capturable stateless launch path over private lane resources."""
 
@@ -92,10 +92,7 @@ def _stage_input(
     data_in_place = value.data.data_ptr() == activation_data.data_ptr()
     scale_in_place = value.scale.data_ptr() == activation_sf.data_ptr()
     if data_in_place != scale_in_place:
-        raise ValueError(
-            "MXFP8 training input data and scale must either both use the "
-            "lane's symmetric buffers or neither use them"
-        )
+        raise ValueError("MXFP8 training input data and scale must either both use the " "lane's symmetric buffers or neither use them")
     routing_topk_idx.fill_(-1)
     if token_count == 0:
         return
@@ -175,10 +172,7 @@ def launch_training_forward(
     valid_route_counts = out.valid_route_counts
     expert_offsets = out.expert_offsets
     if out.output.data_ptr() != scratch.forward_output.data_ptr():
-        raise ValueError(
-            "out.output must be the lane's symmetric output buffer from "
-            "training_symmetric_buffers()"
-        )
+        raise ValueError("out.output must be the lane's symmetric output buffer from " "training_symmetric_buffers()")
 
     scratch.forward_overflow.zero_()
     _runtime_debug("training-forward.reset.end", lane=scratch.index)
@@ -293,15 +287,9 @@ def launch_training_backward(
     grad_y2 = out.fc2_b
     grad_y2_sf = out.fc2_sfb.view(torch.uint8).reshape(-1)
     if out.grad_activation.data_ptr() != scratch.backward_output.data_ptr():
-        raise ValueError(
-            "out.grad_activation must be the lane's symmetric grad_activation "
-            "buffer from training_symmetric_buffers()"
-        )
+        raise ValueError("out.grad_activation must be the lane's symmetric grad_activation " "buffer from training_symmetric_buffers()")
     if out.dprob.data_ptr() != scratch.dprob.data_ptr():
-        raise ValueError(
-            "out.dprob must be the lane's symmetric dprob buffer from "
-            "training_symmetric_buffers()"
-        )
+        raise ValueError("out.dprob must be the lane's symmetric dprob buffer from " "training_symmetric_buffers()")
 
     scratch.backward_overflow.zero_()
     scratch.dprob.zero_()

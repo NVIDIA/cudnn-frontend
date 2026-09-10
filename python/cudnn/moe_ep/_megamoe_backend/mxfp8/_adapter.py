@@ -1,5 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Logical MXFP8 to Rubin SM107 MegaMoE tensor staging."""
 
@@ -417,9 +417,7 @@ class Mxfp8InputAdapter:
             _MXFP8_DATA_DTYPE,
             (capacity, config.hidden),
         )
-        activation_scale_bytes = (
-            capacity * padded_sf_columns * _MXFP8_SCALE_DTYPE.itemsize
-        )
+        activation_scale_bytes = capacity * padded_sf_columns * _MXFP8_SCALE_DTYPE.itemsize
         activation_sf = _typed_view(
             symmetric["activation_scale"][:activation_scale_bytes],
             _MXFP8_SCALE_DTYPE,
