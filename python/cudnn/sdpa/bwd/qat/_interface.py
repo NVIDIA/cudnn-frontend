@@ -9,7 +9,7 @@ import math
 import torch
 import triton
 
-from ._kernels import attention_backward_dkdv, attention_backward_dq, attention_backward_preprocess
+from ._kernels import attention_backward_dkdv, attention_backward_dq
 from ._nvfp4 import fake_quantize_kv, fake_quantize_q
 from ._workspace import WorkspaceEntry, nvfp4_workspace_layout
 
@@ -58,8 +58,11 @@ def compile_nvfp4_attention_qat_backward(
             *fake_q_strides,
             heads,
             seqlen_q,
-            block_m=quant_block,
-            head_dim=head_dim,
+            quant_block,
+            head_dim,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
             grid=(triton.cdiv(seqlen_q, quant_block), batch * heads),
             num_warps=4,
             num_stages=2,
@@ -76,17 +79,6 @@ def compile_nvfp4_attention_qat_backward(
             block_n=quant_block,
             head_dim=head_dim,
             grid=(triton.cdiv(seqlen_kv, quant_block), batch * heads),
-            num_warps=4,
-            num_stages=2,
-        ),
-        attention_backward_preprocess.warmup(
-            torch.bfloat16,
-            torch.bfloat16,
-            torch.float32,
-            seqlen_q,
-            block_m=128,
-            head_dim=head_dim,
-            grid=(triton.cdiv(seqlen_q, 128), batch * heads),
             num_warps=4,
             num_stages=2,
         ),
@@ -167,7 +159,7 @@ def run_nvfp4_attention_qat_backward(
     dq_num_stages: int,
     dkdv_num_stages: int,
 ) -> None:
-    """Launch fake quantization, delta preprocessing, dQ, and dK/dV."""
+    """Launch Q/delta preprocessing, KV fake quantization, dQ, and dK/dV."""
     batch, heads, seqlen_q, head_dim = q.shape
     seqlen_kv = k.shape[2]
 
@@ -192,6 +184,9 @@ def run_nvfp4_attention_qat_backward(
         seqlen_q,
         block_m=quant_block,
         head_dim=head_dim,
+        high_precision_o=high_precision_o,
+        grad_o=grad_o,
+        delta=delta,
         num_warps=4,
         num_stages=2,
     )
@@ -211,19 +206,6 @@ def run_nvfp4_attention_qat_backward(
         heads,
         seqlen_kv,
         block_n=quant_block,
-        head_dim=head_dim,
-        num_warps=4,
-        num_stages=2,
-    )
-
-    preprocess_block = 128
-    preprocess_grid = (triton.cdiv(seqlen_q, preprocess_block), batch * heads)
-    attention_backward_preprocess[preprocess_grid](
-        high_precision_o,
-        grad_o,
-        delta,
-        seqlen_q,
-        block_m=preprocess_block,
         head_dim=head_dim,
         num_warps=4,
         num_stages=2,

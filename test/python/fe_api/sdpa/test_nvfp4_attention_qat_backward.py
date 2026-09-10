@@ -218,3 +218,50 @@ def test_nvfp4_attention_qat_backward_rejects_unsupported_contracts():
     do = torch.empty_like(q)
     with pytest.raises(ValueError, match="causal QAT backward requires equal"):
         Nvfp4AttentionQatBackward(q, k, v, o, do, lse, is_causal=True).check_support()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=61)
+def test_nvfp4_attention_qat_backward_execute_is_precompiled_and_graph_replayable(monkeypatch):
+    """First execute must reuse compilation; replay must read fresh dO values."""
+    from cudnn import Nvfp4AttentionQatBackward
+    from cudnn.sdpa.bwd.qat import _interface
+
+    inputs, expected = _reference_case(80, 96, is_causal=False)
+    q, k, v, o, do, lse, scale = inputs
+    op = Nvfp4AttentionQatBackward(q, k, v, o, do, lse, softmax_scale=scale)
+    op.check_support()
+    op.compile()
+    outputs = (torch.full_like(q, float("nan")), torch.full_like(k, float("nan")), torch.full_like(v, float("nan")))
+    workspace = torch.empty(op.scratch_workspace_bytes(), device=q.device, dtype=torch.uint8)
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("execute must not compile a new Triton specialization")
+
+    for kernel in (_interface.fake_quantize_q, _interface.fake_quantize_kv, _interface.attention_backward_dq, _interface.attention_backward_dkdv):
+        monkeypatch.setattr(kernel, "compile", unexpected_compile)
+    op.execute(q, k, v, o, do, lse, *outputs, workspace)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op.execute(q, k, v, o, do, lse, *outputs, workspace)
+    do.mul_(2)
+    graph.replay()
+    for actual, reference in zip(outputs, expected):
+        torch.testing.assert_close(actual.float(), reference * 2, rtol=4.0e-2, atol=4.0e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=67)
+def test_nvfp4_attention_qat_backward_honors_explicit_stream():
+    """Order every preprocessing and backward launch on the provided stream."""
+    import cuda.bindings.driver as cuda
+    from cudnn import nvfp4_attention_qat_backward
+
+    inputs, expected = _reference_case(65, 65, is_causal=True)
+    q, k, v, o, do, lse, scale = inputs
+    launch_stream = torch.cuda.Stream()
+    launch_stream.wait_stream(torch.cuda.current_stream())
+    result = nvfp4_attention_qat_backward(do, q, k, v, o, lse, softmax_scale=scale, is_causal=True, current_stream=cuda.CUstream(launch_stream.cuda_stream))
+    torch.cuda.current_stream().wait_stream(launch_stream)
+    for actual, reference in zip(result, expected):
+        torch.testing.assert_close(actual.float(), reference, rtol=4.0e-2, atol=4.0e-2)

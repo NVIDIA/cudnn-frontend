@@ -117,8 +117,11 @@ def fake_quantize_q(
     seqlen_q,
     block_m: tl.constexpr,
     head_dim: tl.constexpr,
+    high_precision_o=None,
+    grad_o=None,
+    delta=None,
 ):
-    """Fake-quantize one Q tile into workspace storage."""
+    """Fake-quantize Q and optionally compute the matching backward delta."""
     batch_head = tl.program_id(1)
     q_ptr += stride_h * (batch_head % num_heads) + stride_b * (batch_head // num_heads)
     fake_q_ptr += fake_stride_h * (batch_head % num_heads) + fake_stride_b * (batch_head // num_heads)
@@ -133,6 +136,11 @@ def fake_quantize_q(
         fake_q,
         mask=valid[:, None],
     )
+    if delta is not None:
+        offsets = batch_head * seqlen_q * head_dim + row_offsets[:, None] * head_dim + col_offsets[None, :]
+        o = tl.load(high_precision_o + offsets, mask=valid[:, None], other=0.0).to(tl.float32)
+        do = tl.load(grad_o + offsets, mask=valid[:, None], other=0.0).to(tl.float32)
+        tl.store(delta + batch_head * seqlen_q + row_offsets, tl.sum(o * do, axis=1), mask=valid)
 
 
 @triton.jit
