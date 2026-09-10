@@ -283,8 +283,10 @@ class WorkspaceCarver:
             )
         if not (hasattr(workspace, "numel") and hasattr(workspace, "element_size") and hasattr(workspace, "view")):
             raise TypeError(f"cudnn.sdpa: {owner} carves its scratch out of the caller's workspace and needs a torch.Tensor; got {type(workspace).__name__}")
+        if not workspace.is_contiguous():
+            raise ValueError(f"cudnn.sdpa: {owner} workspace must be contiguous; execute() never copies or allocates scratch")
         flat = workspace if workspace.dtype == torch.uint8 else workspace.view(torch.uint8)
-        flat = flat.reshape(-1)
+        flat = flat.view(-1)
         if flat.numel() < required:
             raise ValueError(
                 f"cudnn.sdpa: {owner} requires a {required}-byte workspace; the provided "
