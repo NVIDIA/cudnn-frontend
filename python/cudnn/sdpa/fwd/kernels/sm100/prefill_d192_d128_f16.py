@@ -2808,9 +2808,10 @@ def compile(  # noqa: A001
     values (they change every step under continuous batching), so the token
     extents compile DYNAMIC (``cute.sym_int``) and the cache key stays
     plan-time-only; callers must not pass them (a stray value would only mint
-    a redundant cache entry). THD ``q_stride``/... carry a ZERO batch stride
-    (the real view's batch stride is ``t_q * token_stride``, a runtime value;
-    the fake rebuilds it symbolically — batch extent is 1, it never steps).
+    a redundant cache entry). THD ``q_stride``/... carry a ZERO batch stride;
+    the fake binds the token stride for the extent-1 batch dim, exactly as
+    ``_thd_view`` does at runtime (``T * token_stride`` is never stepped and
+    overflows the int32 stride slot on long packed KV, GitHub #980).
 
     ENVELOPE: ``d_qk`` / ``d_v`` are the ACTUAL head dims (defaults = the
     flavor's full TILE_K / TILE_O). The Q/K/V/O TMA descriptors are built from
@@ -2851,9 +2852,10 @@ def compile(  # noqa: A001
             if (stride[axis] * bpe) % 16 != 0:
                 raise ValueError(f"declared stride {stride} axis {axis} must be a 16-byte multiple at BPE={bpe} (TMA global-stride rule)")
         if CFG.THD_VARLEN:
-            # Batch stride = tokens * token_stride (`_thd_view`'s envelope),
-            # a runtime value: rebuild it from the dynamic token extent.
-            return cute.runtime.make_fake_tensor(dtype, shape, (shape[1] * stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
+            # Extent-1 batch dim: bind the token stride, as _thd_view does at
+            # runtime -- T * token_stride is never stepped and overflows the int32
+            # stride slot on long packed KV with wide tokens (GitHub #980).
+            return cute.runtime.make_fake_tensor(dtype, shape, (stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
         return cute.runtime.make_fake_tensor(dtype, shape, tuple(stride), assumed_align=16)
 
     fake_q = _fake_bshd((_fake_batch, sq, qh, d_qk), q_stride)

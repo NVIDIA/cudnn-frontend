@@ -689,7 +689,14 @@ class SdpaFwdDsl(APIBase):
             buf.data_ptr() % 16 != 0,
             f"{desc.name}: runtime buffer base address must be 16-byte aligned (TMA global-address rule); got data_ptr() % 16 == {buf.data_ptr() % 16}",
         )
-        return buf.as_strided((1, tokens, h, d), (max(tokens, 1) * ts, ts, hs, es), buf.storage_offset())
+        # The batch dim has extent 1, so its stride is never stepped — but the
+        # kernel ABI checks every stride against the int32 range, and the
+        # natural value ``tokens * ts`` overflows it on long packed KV with
+        # wide tokens (h=128, d=192, ~57k tokens -> 5.7e9; GitHub #980). Bind
+        # the token stride instead: any value is semantically equivalent at
+        # extent 1, this one is always in range, and the compile key already
+        # zeroes it (``_thd_compile_kwargs``).
+        return buf.as_strided((1, tokens, h, d), (ts, ts, hs, es), buf.storage_offset())
 
     def _amax_slot(self, tensor, name: str, device: torch.device) -> torch.Tensor:
         """The caller's 1-element amax storage, or a cached dummy.
@@ -1798,8 +1805,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         The packed token totals are runtime values and compile as DYNAMIC
         extents; everything here (logical batch, heads, head dims, the Stats
         specialization, the declared strides with the batch stride zeroed —
-        ``_thd_view``'s batch stride is ``t * token_stride``, a runtime value
-        that never steps at batch extent 1) is known when the graph is built,
+        ``_thd_view`` binds the token stride for the extent-1 batch dim, which
+        never steps; ``t * token_stride`` would overflow the int32 stride slot
+        on long packed KV, GitHub #980) is known when the graph is built,
         so ``compile()`` compiles eagerly and ``_execute_thd``'s lru-cached
         call re-binds the same artifact for every packed total."""
 
@@ -3497,7 +3505,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             return None
 
         def _packed(buf, tokens, heads, d):
-            return buf.as_strided((1, tokens, heads, d), (tokens * heads * d, heads * d, d, 1), buf.storage_offset())
+            # Extent-1 batch dim: bind the token stride, not tokens * heads * d,
+            # which overflows the kernel ABI's int32 stride check on long packed
+            # KV with wide tokens (GitHub #980; same fix as _thd_view).
+            return buf.as_strided((1, tokens, heads, d), (heads * d, heads * d, d, 1), buf.storage_offset())
 
         def _view(buf, desc, tokens, heads, d):
             # declared_views: the f16 kernel addresses declared strides

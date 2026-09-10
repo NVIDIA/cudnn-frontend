@@ -2159,9 +2159,10 @@ def compile(  # noqa: A001
 
         Mirrors sm100/prefill_d128_f16.py: the head dim must be
         innermost-contiguous, and the seq/head global strides feed TMA, so they
-        obey the 16-byte global-stride rule.  Under THD the batch stride is
-        tokens * token_stride -- a RUNTIME value -- so it is rebuilt from the
-        dynamic token extent rather than taken from the declaration."""
+        obey the 16-byte global-stride rule.  Under THD the
+        fake binds the token stride for the extent-1 batch dim, as _thd_view
+        does at runtime: tokens * token_stride is never stepped and overflows
+        the int32 stride slot on long packed KV (GitHub #980)."""
         if stride is None:
             return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
         if stride[3] != 1:
@@ -2170,7 +2171,10 @@ def compile(  # noqa: A001
             if (stride[axis] * bpe) % 16 != 0:
                 raise ValueError(f"declared stride {stride} axis {axis} must be a 16-byte multiple at BPE={bpe} (TMA global-stride rule)")
         if CFG.THD_VARLEN:
-            return cute.runtime.make_fake_tensor(dtype, shape, (shape[1] * stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
+            # Extent-1 batch dim: bind the token stride, as _thd_view does at
+            # runtime -- T * token_stride is never stepped and overflows the int32
+            # stride slot on long packed KV with wide tokens (GitHub #980).
+            return cute.runtime.make_fake_tensor(dtype, shape, (stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
         return cute.runtime.make_fake_tensor(dtype, shape, tuple(stride), assumed_align=16)
 
     fake_q = _fake_bshd((_fake_batch, sq, qh, d_qk), q_stride)
