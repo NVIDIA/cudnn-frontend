@@ -35,7 +35,17 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from .engine_ids import FAMILY_BLOCK, FROST_GEMM_ID_BASE, FROST_SDPA_BWD_ID_BASE, FROST_SDPA_FWD_ID_BASE, GDN2_ID_BASE, GDN_ID_BASE, GDP_ID_BASE, KDA_ID_BASE, FROST_CONV_ID_BASE
+from .engine_ids import (
+    FAMILY_BLOCK,
+    FROST_GEMM_ID_BASE,
+    FROST_SDPA_BWD_ID_BASE,
+    FROST_SDPA_FWD_ID_BASE,
+    GDN2_ID_BASE,
+    GDN_ID_BASE,
+    GDP_ID_BASE,
+    KDA_ID_BASE,
+    FROST_CONV_ID_BASE,
+)
 
 _LOG = logging.getLogger("cudnn.engines.manifest")
 
