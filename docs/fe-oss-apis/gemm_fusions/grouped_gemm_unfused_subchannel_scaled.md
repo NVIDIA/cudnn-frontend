@@ -137,7 +137,9 @@ module (`moe_blockscaled_grouped_gemm_unfused_subchannel_scaled_rubin.py`); the
 public class and wrapper are unchanged. `sf_fp8_dtype_override="e5m3"`
 (Rubin-only) reinterprets the FP8 first-level scale factors as E5M3 — the scale
 tensors are still supplied as `torch.float8_e4m3fn` since torch has no e5m3
-dtype.
+dtype. The e5m3 path is validated byte-exact on Rubin for both dense and discrete
+weight modes (the tests re-encode the e4m3 scales as UE5M3 and compare against the
+same reference).
 
 ## Limitations
 

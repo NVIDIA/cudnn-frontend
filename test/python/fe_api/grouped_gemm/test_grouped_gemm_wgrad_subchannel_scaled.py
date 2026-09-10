@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
+from fe_api.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_subchannel_scaled_utils import (
     assert_bytes_equal,
@@ -56,6 +57,26 @@ def _run(problem, output_mode="dense", **overrides):
     return _wrapper()(**kwargs)["wgrad_tensor"]
 
 
+def _apply_sf_override(problem, sf_fp8_dtype_override):
+    """Prepare ``problem`` for ``sf_fp8_dtype_override`` and return the wrapper kwargs for it.
+
+    For ``"e5m3"`` the e4m3 first-level scale bytes are rewritten in place as UE5M3. Every
+    non-negative finite e4m3 value is exactly representable in UE5M3 (same 3-bit mantissa,
+    wider exponent range), so the dequantized reference operands are unchanged while the
+    bytes handed to the kernel differ -- a kernel still decoding them as e4m3 would fail
+    the byte-exact comparison.
+    """
+    if sf_fp8_dtype_override is None:
+        return {}
+    assert sf_fp8_dtype_override == "e5m3"
+    _skip_unless_e5m3_supported()
+    reencode_sf_tensor_as_ue5m3(problem["sfa_tensor"])
+    reencode_sf_tensor_as_ue5m3(problem["sfb_tensor"])
+    return {"sf_fp8_dtype_override": "e5m3"}
+
+
+SF_OVERRIDES = pytest.mark.parametrize("sf_fp8_dtype_override", [None, "e5m3"], ids=["sf_e4m3", "sf_e5m3"])
+
 CONFIGS = pytest.mark.parametrize(
     "mma_tiler_mn, cluster_shape_mn",
     [((128, 128), (1, 1)), ((256, 128), (2, 1))],
@@ -79,9 +100,11 @@ OUTPUT_MODES = pytest.mark.parametrize("output_mode", ["dense", "discrete"])
 @CONFIGS
 @SHAPES
 @OUTPUT_MODES
-def test_wgrad_subchannel_matches_reference(mma_tiler_mn, cluster_shape_mn, sgk, hidden, intermediate, token_counts, output_mode):
+@SF_OVERRIDES
+def test_wgrad_subchannel_matches_reference(mma_tiler_mn, cluster_shape_mn, sgk, hidden, intermediate, token_counts, output_mode, sf_fp8_dtype_override):
     problem = make_wgrad_subchannel_problem(hidden, intermediate, token_counts, sgk)
-    out = _run(problem, output_mode=output_mode, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
+    sf_kwargs = _apply_sf_override(problem, sf_fp8_dtype_override)
+    out = _run(problem, output_mode=output_mode, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn, **sf_kwargs)
     assert_bytes_equal(out, wgrad_subchannel_reference(problem))
 
 
@@ -119,14 +142,16 @@ def test_wgrad_subchannel_ones_sfa2_matches_baseline():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @OUTPUT_MODES
-def test_wgrad_subchannel_accumulate(output_mode):
+@SF_OVERRIDES
+def test_wgrad_subchannel_accumulate(output_mode, sf_fp8_dtype_override):
     # accumulate_on_output TMA-reduce-adds the bf16 tile into the caller's buffer; a
     # zero-token expert must reduce-add zeros (init preserved).
     problem = make_wgrad_subchannel_problem(512, 512, (512, 0, 512, 1024), 512)
+    sf_kwargs = _apply_sf_override(problem, sf_fp8_dtype_override)
     l = len(problem["token_counts"])
     init = torch.randn((l, 512, 512), device="cuda").to(torch.bfloat16)
     out_buf = init.clone()
-    out = _run(problem, output_mode=output_mode, wgrad_tensor=out_buf, accumulate_on_output=True)
+    out = _run(problem, output_mode=output_mode, wgrad_tensor=out_buf, accumulate_on_output=True, **sf_kwargs)
     assert out is out_buf
     assert_bytes_equal(out, wgrad_subchannel_reference(problem, out_init=init, accumulate=True))
 

@@ -103,6 +103,8 @@ subsequent `execute()`.
 
 - `sf_fp8_dtype_override="e5m3"` reinterprets the e4m3-typed first-level scale bytes
   as UE5M3; it is accepted only on Rubin (SM107) and takes part in the compile cache
-  key.
+  key. The e5m3 path is validated byte-exact on Rubin (the tests re-encode the e4m3
+  scales as UE5M3 and compare against the same reference) for dense/discrete output
+  and `accumulate_on_output`.
 - No JAX support (fp4 K-major operands and the hidden-contiguous SFA2 view are not
   expressible as row-major JAX arrays).

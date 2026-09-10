@@ -15,6 +15,8 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
+from fe_api.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
+from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_unfused_subchannel_scaled_utils import (
     build_discrete_pointers,
     make_unfused_subchannel_scaled_problem,
@@ -54,6 +56,27 @@ def _run_dense(problem, **overrides):
     return _wrapper()(**kwargs)
 
 
+def _apply_sf_override(problem, sf_fp8_dtype_override):
+    """Prepare ``problem`` for ``sf_fp8_dtype_override`` and return the wrapper kwargs for it.
+
+    For ``"e5m3"`` the e4m3 first-level scale bytes are rewritten in place as UE5M3. Every
+    non-negative finite e4m3 value is exactly representable in UE5M3 (same 3-bit mantissa,
+    wider exponent range), so ``problem["ref_d"]`` stays valid while the bytes handed to
+    the kernel differ -- a kernel still decoding them as e4m3 would fail the byte-exact
+    comparison.
+    """
+    if sf_fp8_dtype_override is None:
+        return {}
+    assert sf_fp8_dtype_override == "e5m3"
+    _skip_unless_e5m3_supported()
+    reencode_sf_tensor_as_ue5m3(problem["sfa_tensor"])
+    reencode_sf_tensor_as_ue5m3(problem["sfb_tensor"])
+    return {"sf_fp8_dtype_override": "e5m3"}
+
+
+SF_OVERRIDES = pytest.mark.parametrize("sf_fp8_dtype_override", [None, "e5m3"], ids=["sf_e4m3", "sf_e5m3"])
+
+
 def _assert_byte_exact(out_d, ref_d):
     got = out_d.squeeze(-1)
     torch.cuda.synchronize()
@@ -71,10 +94,12 @@ def _assert_byte_exact(out_d, ref_d):
     [((256, 128), (2, 1)), ((256, 256), (2, 1)), ((256, 128), (2, 2))],
     ids=["t256x128-c2x1", "t256x256-c2x1", "t256x128-c2x2"],
 )
+@SF_OVERRIDES
 @torch_fork_set_rng(seed=0)
-def test_unfused_subchannel_scaled_wrapper_dense_fp4(mma_tiler_mn, cluster_shape_mn):
+def test_unfused_subchannel_scaled_wrapper_dense_fp4(mma_tiler_mn, cluster_shape_mn, sf_fp8_dtype_override):
     problem = make_unfused_subchannel_scaled_problem(m_per_expert=256, n=256, k=512, l=2)
-    out = _run_dense(problem, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
+    sf_kwargs = _apply_sf_override(problem, sf_fp8_dtype_override)
+    out = _run_dense(problem, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn, **sf_kwargs)
     _assert_byte_exact(out["d_tensor"], problem["ref_d"])
 
 
@@ -126,11 +151,15 @@ def test_unfused_subchannel_scaled_class_api_dense():
 
 
 @pytest.mark.L0
+@SF_OVERRIDES
 @torch_fork_set_rng(seed=3)
-def test_unfused_subchannel_scaled_wrapper_discrete_fp4():
+def test_unfused_subchannel_scaled_wrapper_discrete_fp4(sf_fp8_dtype_override):
     # n=512, k=1024 with sgn=sgk=256 -> per-expert SFB2 block is 2x4 f32 =
     # 32 bytes, satisfying the 16B discrete alignment gate with l=2.
+    # The discrete SFB pointers are typed inside the kernel from self.sf_dtype, so the
+    # e5m3 leg also covers the per-expert tensormap path (re-encode before taking ptrs).
     problem = make_unfused_subchannel_scaled_problem(m_per_expert=256, n=512, k=1024, l=2, seed=3)
+    sf_kwargs = _apply_sf_override(problem, sf_fp8_dtype_override)
     ptrs = build_discrete_pointers(problem)
     out = _wrapper()(
         a_tensor=problem["a_tensor"],
@@ -145,6 +174,7 @@ def test_unfused_subchannel_scaled_wrapper_discrete_fp4():
         n=problem["n"],
         b_dtype=torch.float4_e2m1fn_x2,
         block2_shape=problem["block2_shape"],
+        **sf_kwargs,
     )
     _assert_byte_exact(out["d_tensor"], problem["ref_d"])
 
@@ -212,6 +242,19 @@ def test_unfused_subchannel_scaled_check_support_negatives():
     if (major, minor) != (10, 7):
         with pytest.raises((ValueError, AssertionError)):
             _run_dense(problem, sf_fp8_dtype_override="e5m3")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=9)
+def test_unfused_subchannel_scaled_e5m3_is_not_cached_as_e4m3():
+    """sf_fp8_dtype_override must take part in the compile cache key: identical scale
+    bytes decode differently under E4M3 and UE5M3."""
+    _skip_unless_e5m3_supported()
+    problem = make_unfused_subchannel_scaled_problem(m_per_expert=256, n=256, k=512, l=2, seed=9)
+    d_e4m3 = _run_dense(problem)["d_tensor"].float().clone()
+    d_e5m3 = _run_dense(problem, sf_fp8_dtype_override="e5m3")["d_tensor"].float().clone()
+    torch.cuda.synchronize()
+    assert not torch.equal(d_e4m3, d_e5m3), "e5m3 and e4m3 produced identical output from identical scale-factor bytes"
 
 
 @pytest.mark.L0
