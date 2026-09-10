@@ -59,9 +59,6 @@ def _run(shape: InputShape) -> None:
 
 
 def main():
-    # _FpropCTMKernel currently uses a 256x256 implicit-GEMM output tile and a
-    # 64-channel GEMM-K tile. Keep M=N*Z*P*Q at 256, K at 256, and C at 64
-    # while varying batch/spatial input shapes and convolution geometry.
     shapes = (
         InputShape(n=1, d=6, h=10, w=10, c=64, k=256, t=3, r=3, s=3),
         InputShape(n=2, d=4, h=10, w=10, c=64, k=256, t=3, r=3, s=3),
