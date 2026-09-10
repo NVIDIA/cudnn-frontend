@@ -298,10 +298,16 @@ dead-unit O-store guard, the packed-total-clamped runtime K/V descriptors (a NaN
 capacity tail otherwise wipes a tile through BMM2), the token-major Stats arm,
 and per-sequence Q lengths for the bottom-right diagonal. Validated on
 `w2u1g-lc-0030`: the whole SM100 f16 THD suite — **215 passed** where it
-previously skipped entirely — plus a per-flavor attribution sweep (B=1/2/3 ×
-none/causal/bottom-right, 9/9 per flavor). **Still declined: MXFP8 THD
-line-wide, and FP8 THD at d256/d512** — those bodies keep the pre-upstream
-7-arg setup call, and the rows decline them rather than half-serving.
+previously skipped entirely — the per-tensor FP8 THD suite at **43 passed / 0
+failed**, and a per-flavor attribution sweep (B=1/2/3 × none/causal/
+bottom-right, 9/9 per flavor). Whole-suite baseline on Rubin moved from
+**829 passed / 11 failed** on unmodified `develop` to **1111 passed / 10
+failed**; those 10 are the pre-existing set (9 ×
+`test_q_loop_bounds_match_reference`, 1 × `test_torch_ops::test_padded_seq_lens`)
+verified to reproduce at `60cb6cda`. **Still declined: MXFP8 THD line-wide** —
+those bodies keep the pre-upstream 7-arg setup call and their scale-factor
+tensors have no packed-THD layout yet, so the row declines rather than
+half-serving.
 
 ʸ Per-tensor FP8 **THD** at d192×d128 came free with the DSv3 port and is
 served as of 2026-09-09: that kernel *is* the shipped d128 FP8 body (only the
