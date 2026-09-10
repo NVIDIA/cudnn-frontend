@@ -12,27 +12,44 @@ from typing import Optional
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, DTYPE_FP16  # noqa: F401  (DTYPE_E4M3 re-exported for the FP8 template)
 
 SEQ_Q_TILES = (128, 64)
-SEQ_KV_TILES = (128, 64)
+SEQ_KV_TILES = (128, 64, 32)
 HEAD_TILE_GRANULE = 16
 SUPPORTED_HEAD_TILE_MIN = 16
-SUPPORTED_HEAD_TILE_MAX = 256
-SUPPORTED_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, SUPPORTED_HEAD_TILE_MAX + 1, HEAD_TILE_GRANULE))
+GENERAL_HEAD_TILE_MAX = 256
+SUPPORTED_HEAD_TILE_MAX = 512
+GENERAL_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, GENERAL_HEAD_TILE_MAX + 1, HEAD_TILE_GRANULE))
 FP8_HEAD_TILE_GRANULE = 32
-SUPPORTED_HEAD_TILES_FP8 = tuple(range(FP8_HEAD_TILE_GRANULE, SUPPORTED_HEAD_TILE_MAX + 1, FP8_HEAD_TILE_GRANULE))
+FP8_SUPPORTED_HEAD_TILE_MAX = 256
+SUPPORTED_HEAD_TILES_FP8 = tuple(range(FP8_HEAD_TILE_GRANULE, FP8_SUPPORTED_HEAD_TILE_MAX + 1, FP8_HEAD_TILE_GRANULE))
 
 
 D256_FLAVOR = (256, 256)
-F16_FLAVORS: frozenset[tuple[int, int]] = frozenset({D256_FLAVOR})
+D512_FLAVOR = (512, 512)
+D512_TILE = (64, 32)
+GENERAL_KV_TILES = (128, 64)
+F16_FLAVORS: frozenset[tuple[int, int]] = frozenset({D256_FLAVOR, D512_FLAVOR})
 FP8_FLAVORS: frozenset[tuple[int, int]] = frozenset()
 
 
 def pick_flavor(d_qk: int, d_v: int, fp8: bool) -> Optional[tuple[int, int]]:
-    """The flavor whose native head tiles the general template would compile
-    ``(d_qk, d_v)`` at (each dim rounded up at the dtype family's head-tile
-    granule), or ``None`` for the general template."""
+    """Select the fixed-tile flavor for the head dimensions, or the general template."""
+    if not fp8 and GENERAL_HEAD_TILE_MAX < d_qk <= D512_FLAVOR[0] and GENERAL_HEAD_TILE_MAX < d_v <= D512_FLAVOR[1]:
+        return D512_FLAVOR
     granule = FP8_HEAD_TILE_GRANULE if fp8 else HEAD_TILE_GRANULE
     tiles = (-(-d_qk // granule) * granule, -(-d_v // granule) * granule)
     return tiles if tiles in (FP8_FLAVORS if fp8 else F16_FLAVORS) else None
+
+
+def tile_domain(d_qk: int, d_v: int, fp8: bool) -> frozenset[tuple[int, int]]:
+    """The (q_tile, kv_tile) pairs the kernel serving these head dims is built for.
+
+    The d512 flavor has one tile; the general and d256 templates take any Q tile
+    with a 128- or 64-key KV tile. The ranking and the adapter intersect their
+    SMEM fit with this set, so no tile is proposed that declines at build.
+    """
+    if pick_flavor(d_qk, d_v, fp8) == D512_FLAVOR:
+        return frozenset({D512_TILE})
+    return frozenset((m, n) for m in SEQ_Q_TILES for n in GENERAL_KV_TILES)
 
 
 # SMEM the SM120 parts expose to a kernel. The adapter asks cutlass for the
@@ -55,20 +72,34 @@ def register_budgets(q_tile: int) -> tuple[int, int]:
 def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2, out_itemsize: Optional[int] = None) -> int:
     """SMEM the SM120 prefill kernel needs for one specialization.
 
-    One K tile (D_QK wide) plus one V tile (D_V wide), aliased with the
-    q_tile x D_V output staging tile. The two terms size INDEPENDENTLY:
+    The general and D=256 kernels alias one K tile (D_QK wide) plus one V
+    tile (D_V wide) with the q_tile x D_V output staging tile. The two terms size independently:
     ``itemsize`` is the QKV element, ``out_itemsize`` the staged output's, and
     FP8 differs on exactly that (1-byte KV, half-precision O). The f16 D=256
-    kernel also keeps half of its Q tile resident in shared memory.
+    kernel also keeps half of its Q tile resident in shared memory. The f16
+    D=512 kernel keeps a quarter of Q there and adds the fp32 partial-S
+    exchange between the two warps that split each Q slab's head dim. Its O
+    epilogue reuses that Q/exchange storage in two rounds, while the K/V slab
+    receives the next Q tile. It needs a third TMA barrier for those Q loads.
+    Every d512 envelope shape uses the full 512-wide storage on both sides.
 
     Lives here rather than in the adapter because the ranking must not propose
     a tile the kernel cannot fit, and two answers to that question is how a plan
     list fills with entries that decline at build.
     """
-    kv_or_o = max(kv_tile * (d_qk + d_v) * itemsize, q_tile * d_v * (itemsize if out_itemsize is None else out_itemsize))
     flavor = pick_flavor(d_qk, d_v, fp8=itemsize == 1)
-    q_resident = q_tile * (flavor[0] // 2) * itemsize if flavor == D256_FLAVOR else 0
-    return kv_or_o + q_resident + 16
+    if flavor == D512_FLAVOR:
+        d_qk, d_v = D512_FLAVOR
+    kv_or_o = max(kv_tile * (d_qk + d_v) * itemsize, q_tile * d_v * (itemsize if out_itemsize is None else out_itemsize))
+    q_resident = 0
+    exchange = 0
+    if flavor == D256_FLAVOR:
+        q_resident = q_tile * (flavor[0] // 2) * itemsize
+    elif flavor == D512_FLAVOR:
+        q_resident = q_tile * (flavor[0] // 4) * itemsize
+        exchange = q_tile * kv_tile * 4 * 2
+    barrier_bytes = 24 if flavor == D512_FLAVOR else 16
+    return kv_or_o + q_resident + exchange + barrier_bytes
 
 
 @dataclass(frozen=True)

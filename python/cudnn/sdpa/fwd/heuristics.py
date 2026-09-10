@@ -62,7 +62,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     d256_square_br_as_tl,
     pack_gqa_supported,
 )
-from cudnn.sdpa.fwd.config_sm120 import FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, smem_bytes
+from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
 from cudnn.sdpa.fwd.engines import (
     ENGINE_SPECS,
     Capabilities,
@@ -282,7 +282,7 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
         grid //= 2
     kv_tiles = -(-facts.s_kv // 128)
     fine = sm_count > 0 and (grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12))
-    tile_m = 64 if fine else 128
+    preferred_tile_m = 64 if fine else 128
     # FP8 stages a byte per KV element but still writes O in half, so the two
     # SMEM terms size differently -- see config_sm120.smem_bytes. The kernel
     # stages ENVELOPE head tiles (actual dims round up to the granule), so
@@ -292,8 +292,21 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     granule = FP8_HEAD_TILE_GRANULE if facts.is_fp8 else HEAD_TILE_GRANULE
     d_qp = -(-facts.d_qk // granule) * granule
     d_vp = -(-facts.d_v // granule) * granule
-    fits = [n for n in sorted(caps.tile_ns, reverse=True) if smem_bytes(d_qp, d_vp, tile_m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES]
-    return tile_m, (fits[0] if fits else min(caps.tile_ns))
+    # Prefer the selected query tile, then larger query and KV tiles.
+    candidate_tiles = sorted(
+        tile_domain(facts.d_qk, facts.d_v, facts.is_fp8),
+        key=lambda tile: (tile[0] == preferred_tile_m, tile[0], tile[1]),
+        reverse=True,
+    )
+    for m, n in candidate_tiles:
+        if m not in caps.tile_ms or n not in caps.tile_ns:
+            continue
+        if smem_bytes(d_qp, d_vp, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES:
+            return m, n
+    # Nothing fits: fall back to the smallest tile the kernel table admits for
+    # the row, so the decline comes from the SMEM check rather than at build.
+    admitted = [(m, n) for m, n in candidate_tiles if m in caps.tile_ms and n in caps.tile_ns] or candidate_tiles
+    return min(admitted, key=lambda tile: (tile[1], tile[0]))
 
 
 def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[int]]]:
@@ -312,7 +325,13 @@ def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[
     granule = FP8_HEAD_TILE_GRANULE if facts.is_fp8 else HEAD_TILE_GRANULE
     d_qp = -(-facts.d_qk // granule) * granule
     d_vp = -(-facts.d_v // granule) * granule
-    domain = [(m, n) for m in caps.tile_ms for n in caps.tile_ns if smem_bytes(d_qp, d_vp, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES]
+    tile_choices = tile_domain(facts.d_qk, facts.d_v, facts.is_fp8)
+    domain = [
+        (m, n)
+        for m in caps.tile_ms
+        for n in caps.tile_ns
+        if (m, n) in tile_choices and smem_bytes(d_qp, d_vp, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES
+    ]
     return sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
 
 
@@ -348,6 +367,12 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
             primary = SCHED_LPT if 1024 <= facts.s_kv <= 16384 else SCHED_NATURAL
         else:
             primary = SCHED_NATURAL
+    elif causal_ish and _sm120_d512_windowed(caps, facts):
+        # Sliding window on the d512 flavor: a unit's K/V working set is a few
+        # tiles whichever head it belongs to, so LPT_L2's per-KV-group batching
+        # has nothing to protect in L2 and its row order only costs; the plain
+        # heads-fastest LPT walk is the faster one for packed and unpacked units.
+        primary = SCHED_LPT
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
         # whether one head's K+V working set fits the L2 budget.
@@ -555,12 +580,37 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
     return cga_tile_m(512, cga)
 
 
+def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
+    """An f16 sliding-window graph on the SM120 d512 flavor.
+
+    Two rules key on it. Pack the GQA group into the Q tile: a packed unit holds
+    ``tile_m / G`` tokens, so its key span is that many tokens plus the window
+    instead of ``tile_m`` plus the window, fewer K/V tiles through the L2->SMEM
+    path and less masked-out MMA at the same DRAM bytes. And walk the units with
+    plain LPT (see :func:`_sched_points`). Without a window the decode rule
+    alone decides the packing.
+    """
+    return (
+        caps.sm_lo >= 120
+        and caps.sm_hi < 130
+        and not facts.is_fp8
+        and facts.window_left is not None
+        and pick_flavor(facts.d_qk, facts.d_v, fp8=False) == D512_FLAVOR
+    )
+
+
+def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
+    """Whether a packed set can be built at ``tile_m``: the row offers packing,
+    the batch is dense, there is a group to pack and the ratio divides the tile."""
+    return True in caps.pack_gqas and not facts.thd and facts.h_q != facts.h_kv and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m)
+
+
 def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] = None) -> Tuple[bool, ...]:
     """The pack_gqa axis, best first: ``(True, False)`` when packing wins,
     ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
-    if not (True in caps.pack_gqas and not facts.thd and facts.h_q != facts.h_kv and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m)):
+    if not _pack_gqa_eligible(caps, facts, tile_m):
         return (False,)
-    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)):
+    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)) or _sm120_d512_windowed(caps, facts):
         return (True, False)
     return (False, True)
 

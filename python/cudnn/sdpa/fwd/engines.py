@@ -1050,7 +1050,7 @@ def _sm80_spec() -> EngineSpec:
 
 
 def _sm120_spec() -> EngineSpec:
-    from cudnn.sdpa.fwd.config_sm120 import SUPPORTED_HEAD_TILES
+    from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, GENERAL_HEAD_TILE_MAX, GENERAL_HEAD_TILES
 
     return EngineSpec(
         name="sdpa_fwd_prefill_sm120",
@@ -1058,9 +1058,11 @@ def _sm120_spec() -> EngineSpec:
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
             phase="prefill",
-            # The kernel picks its Q/K and V head tiles independently, so the
-            # native shapes are the cross product of the supported tiles.
-            d_shapes=frozenset((tq, tv) for tq in SUPPORTED_HEAD_TILES for tv in SUPPORTED_HEAD_TILES),
+            # The general template picks its Q/K and V head tiles independently,
+            # so the native shapes are the cross product of the supported tiles;
+            # the d512 flavor (sm120/prefill_d512_f16.py) adds its (512, 512).
+            d_shapes=frozenset((tq, tv) for tq in GENERAL_HEAD_TILES for tv in GENERAL_HEAD_TILES) | {D512_FLAVOR},
+            d_envelope_floors=((D512_FLAVOR, GENERAL_HEAD_TILE_MAX),),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
@@ -1088,7 +1090,8 @@ def _sm120_spec() -> EngineSpec:
             # split sets ride SCHED_NATURAL.
             split_kv_supported=True,
             tile_ms=frozenset({64, 128}),
-            tile_ns=frozenset({64, 128}),
+            # 32 is the d512 flavor's KV tile alone (config_sm120.tile_domain).
+            tile_ns=frozenset({32, 64, 128}),
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
         ),

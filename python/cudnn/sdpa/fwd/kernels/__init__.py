@@ -11,10 +11,11 @@ owns.  Within a package the filename encodes the rest of the coverage matrix:
 ``<phase>_d<dim>_<dtype-family>.py``, e.g. ``sm100/prefill_d512_f16.py``
 (``f16`` covers fp16 and bf16, picked by ``TemplateParams``).
 
-A file omits the dimension when one implementation covers every supported head
-dim: ``sm120/prefill_f16.py`` and ``sm120/prefill_fp8.py`` do, while
+A file omits the dimension when one implementation covers a range of head
+dims: ``sm120/prefill_f16.py`` and ``sm120/prefill_fp8.py`` do, while
 ``sm120/prefill_d256_f16.py`` is the d256 flavor (head dims that tile at 256 on
-both sides).
+both sides). ``sm120/prefill_d512_f16.py`` serves both head dims in (256, 512]
+at multiples of eight, with two warps per Q slab splitting the head dimension.
 
 Modules shared across arch lines stay at THIS level rather than inside one
 arch's package, so the directory a file lives in always names its only owner:

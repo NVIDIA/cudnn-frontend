@@ -358,15 +358,21 @@ Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
 kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
 tile at 256 on both sides run a dedicated template, `sm120/prefill_d256_f16.py` with the same support; fp8 has no such flavor).
 
-| Feature | FPROP<br>d ≤ 256, any ×8 | FPROP FP8<br>d ≤ 256, any ×16 | BPROP<br>d ≤ 256, any ×8 |
+D512 FP16/BF16 FPROP (`sm120/prefill_d512_f16.py`) supports **both D_QK and D_V
+in (256, 512]**, in multiples of 8. It uses a 64 x 32 CTA and 512 x 512 head
+tiles: (512, 512) is **native**; smaller shapes are **envelope-served** by
+zero-padding, with the same MMA and on-chip storage cost.
+FP8 FPROP and BPROP remain limited to 256.
+
+| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], any ×8 | FPROP FP8<br>d ≤ 256, any ×16 | BPROP<br>d ≤ 256, any ×8 |
 |---|:--:|:--:|:--:|
 | **Data types** | | | |
 | FP16 / BF16 | ✅ | — | ✅ |
 | FP8 E4M3 / E5M2 (per-tensor) | — | ✅ | ❌ |
 | MXFP8 | ❌ | ❌ | ❌ |
 | O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ❌ | ✅ | — |
-| Rectangular head dims (D_QK ≠ D_V) | ✅ (independent) | ✅ (independent) | ✅ (D_QK ≥ D_V) |
-| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, ≤ 256ᵃ | ×16, ≤ 256ᵃ | ×8, ≤ 256 |
+| Rectangular head dims (D_QK ≠ D_V) | ✅ (independent within each served band) | ✅ (independent) | ✅ (D_QK ≥ D_V) |
+| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512] | ×16, ≤ 256ᵃ | ×8, ≤ 256 |
 | **Layout** | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | THD / ragged | ✅ | ✅ | ❌ |
@@ -386,8 +392,8 @@ tile at 256 on both sides run a dedicated template, `sm120/prefill_d256_f16.py` 
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ |
 
 ᵃ **Head TILE granule and head-DIM alignment are different numbers — the column
-headers quote the head-dim rule.** `SUPPORTED_HEAD_TILES` steps by 16 (f16) /
-32 (FP8), but those are the kernel's native tile sizes; an actual `D_QK`/`D_V`
+headers quote the head-dim rule.** `GENERAL_HEAD_TILES` steps by 16 (f16), and
+`SUPPORTED_HEAD_TILES_FP8` steps by 32. Those are the kernel's native tile sizes; an actual `D_QK`/`D_V`
 only has to satisfy `d_pad_multiple` — **8** on the f16 row, **16** on the FP8
 row (the TMA 16-byte global-stride rule at 2 and 1 bytes/elem) — and is
 zero-padded up to the next tile. So a d=72 f16 graph is eligible and computes
