@@ -24,9 +24,9 @@ with its CUDA/cuDNN libraries and optional Python dependencies installed; the
 scan itself needs no GPU.
 
 ```bash
-CUDA_VISIBLE_DEVICES='' python3 tests/analysis/api_index.py
+CUDA_VISIBLE_DEVICES='' python3 test/api_index/api_index.py
 CUDA_VISIBLE_DEVICES='' CUDNN_API_INDEX_PACKAGE_ROOT="$PWD/build/cudnn" \
-  python3 -m unittest discover -s tests/analysis -p test_api_index.py -v
+  python3 -m unittest discover -s test/api_index -p test_api_index.py -v
 ```
 
 The scanner defaults to `build/cudnn`; `--package-root` selects another build.
@@ -36,8 +36,8 @@ present. Run it in a fresh Python process.
 After reviewing an intentional API change, in the same environment:
 
 ```bash
-CUDA_VISIBLE_DEVICES='' python3 tests/analysis/api_index.py --write
-git diff -- tests/analysis/api_index_modules.txt tests/analysis/api_index.txt
+CUDA_VISIBLE_DEVICES='' python3 test/api_index/api_index.py --write
+git diff -- test/api_index/api_index_modules.txt test/api_index/api_index.txt
 ```
 
 `--modules` and `--index` select alternative files. Regeneration replaces only
@@ -54,9 +54,9 @@ Fixture tests run before compilation in all build jobs using only Python 3.10+
 and the standard library:
 
 ```bash
-python3 -S -m unittest discover -s tests/analysis -p test_api_index.py -v
+python3 -S -m unittest discover -s test/api_index -p test_api_index.py -v
 ```
 
 The repository test is enabled by `CUDNN_API_INDEX_PACKAGE_ROOT`; without it,
-only fixture tests run. Shared files live in `tests/analysis/`, outside GitLab's
+only fixture tests run. Shared files live in `test/api_index/`, outside GitLab's
 protected `ci/**` tree, so mirroring and release overlays update them together.
