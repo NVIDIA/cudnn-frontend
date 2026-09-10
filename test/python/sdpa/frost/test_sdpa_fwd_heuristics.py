@@ -262,6 +262,11 @@ def test_d512_mxfp8_primary_uses_measured_scheduler():
     assert (dense[0].knobs.cga, dense[0].knobs.sched_policy) == (1, 0)
     assert (thd[0].knobs.cga, thd[0].knobs.sched_policy) == (1, 0)
 
+    rubin_name = engines.engine_name(mxfp8=True, arch="sm107")
+    rubin = recommend("A", _facts(device_cc=(10, 7), **base), {rubin_name: 20511})
+    assert rubin
+    assert all((plan.knobs.cga, plan.knobs.sched_policy) == (2, 0) for plan in rubin)
+
 
 @pytest.mark.L0
 def test_assemble_strips_mode_dedups_and_our_proposals_lead():

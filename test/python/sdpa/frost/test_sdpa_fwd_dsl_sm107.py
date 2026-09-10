@@ -388,9 +388,8 @@ def test_sm107_rows_claim_optional_stats():
 
 
 def test_rubin_mxfp8_forward_row_exists():
-    """INVERTED 2026-09-04: the Rubin MXFP8 row landed (slot 16).  It is WIDER
-    than its Blackwell counterpart at the top end -- Rubin has a d512 MXFP8
-    kernel and SM100 does not.  INVERTED again 2026-09-09: d192xd128 gained a
+    """The Rubin MXFP8 row (slot 16) and Blackwell both have a d512 kernel.
+    INVERTED 2026-09-09: d192xd128 gained a
     Rubin MXFP8 sibling, at cga2 ONLY -- at cga1 that flavor's scale-factor
     tiles start past the 256 KiB version-0 tcgen05 descriptor window.  SM100's
     row stays capped at cc 10.6."""
@@ -399,7 +398,7 @@ def test_rubin_mxfp8_forward_row_exists():
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
     assert caps.is_mxfp8 is True
     assert caps.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    assert (512, 512) not in _caps("sdpa_fwd_prefill_sm100_mxfp8").d_shapes
+    assert (512, 512) in _caps("sdpa_fwd_prefill_sm100_mxfp8").d_shapes
     assert (192, 128) in caps.d_shapes
     # (192, 128) takes NO cgas_by_d_shape entry, so it inherits the row default
     # cgas={2}.  That is a DESCRIPTOR constraint, not a tuning choice: at cga1

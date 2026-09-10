@@ -92,7 +92,7 @@ _SM100_MXFP8_KERNEL_FILES = {
     (128, 128): "sm100/prefill_d128_mxfp8.py",
     (192, 128): "sm100/prefill_d192_d128_mxfp8.py",
     (256, 256): "sm100/prefill_d256_mxfp8.py",
-    (512, 512): "prefill_d512_mxfp8_sm100.py",
+    (512, 512): "sm100/prefill_d512_mxfp8.py",
 }
 # Rubin (SM107) siblings.  Separate maps rather than entries in the SM100
 # ones: the lowerings genuinely diverge (dense K=64 FP8 MMA, 576-column TMEM,
@@ -968,7 +968,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     @property
     def _quantized_q_lens_abi(self) -> bool:
         """Whether the selected quantized kernel has the dense Q-length slot."""
-        return self._fp8 and (self.flavor == (256, 256) or (not self._pertensor and self.flavor == (512, 512)))
+        return self._fp8 and (self.flavor == (256, 256) or (self._device_cc != (10, 7) and not self._pertensor and self.flavor == (512, 512)))
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
@@ -1460,7 +1460,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 h_q=self.h_q,
                 s_q=self.s_q_max,
             )
-        elif self.flavor == (512, 512) and self._fp8 and not self._pertensor:
+        elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
             from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
 
             auto_sched, auto_cga = select_d512_auto_knobs(params, pertensor=False)

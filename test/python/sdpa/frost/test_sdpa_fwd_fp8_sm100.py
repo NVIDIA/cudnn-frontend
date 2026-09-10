@@ -1879,9 +1879,13 @@ def test_fp8_envelope_floor_matches_engine_row():
 @pytest.mark.L0
 def test_fp8_d512_family_shape_maps():
     """D512 per-tensor and MXFP8 have native kernels on both arch lines."""
-    from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
+    from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes, supported_cgas_for
 
     assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
     assert (512, 512) in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
     assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
     assert (512, 512) in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 7))
+    for device_cc in ((10, 0), (10, 7)):
+        for pertensor in (False, True):
+            expected = (1,) if device_cc == (10, 0) and not pertensor else (2,)
+            assert supported_cgas_for((512, 512), fp8=True, device_cc=device_cc, pertensor=pertensor) == expected

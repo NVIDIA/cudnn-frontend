@@ -515,7 +515,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         if selected_cga not in domain:
             raise ValueError(f"D256 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
         return selected_sched, selected_cga
-    if selected_shape == (512, 512) and facts.is_mxfp8:
+    if selected_shape == (512, 512) and facts.is_mxfp8 and caps.sm_lo == 100:
         params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
         selected_sched, selected_cga = select_d512_auto_knobs(params, pertensor=False)
         if selected_cga not in domain:

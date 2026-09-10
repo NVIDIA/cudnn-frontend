@@ -148,7 +148,7 @@ BMM2_N_BLOCK_BYTE_STRIDE = CFG.TILE_N * CFG.V_SWZ_BYTES
 SF_V_COLS_PER_NBLOCK = SF_NUM_BLOCKS_K_BMM2 * SF_REGISTERS_PER_BLOCK
 
 
-from cudnn.sdpa.fwd.kernels._common_sm100 import (
+from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
     KvLoopBounds,
     make_d256_bars,
@@ -266,7 +266,7 @@ def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq
 
 
 # Each split runs one contiguous slice of a Q tile's KV range and writes a
-# split-major partial O/LSE pair for split_combine_sm100.  At SPLIT_KV == 1
+# split-major partial O/LSE pair for sm100/split_combine.  At SPLIT_KV == 1
 # these helpers fold back to the original decode and bounds path.
 _split_h = make_split_helpers(
     CFG,
