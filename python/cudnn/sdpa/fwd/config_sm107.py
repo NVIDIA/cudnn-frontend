@@ -763,7 +763,11 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     #   depth 3, desc v0:  1.0000 / 1.0000 / 1.0000 / 1.0000   (stays under)
     # `prefill_d256_f16.DESC_VERSION` is now DERIVED from the layout, so any
     # depth that fits SMEM is correct by construction. Do not re-literal it.
-    stages_kv = params.stages_kv if getattr(params, "stages_kv", None) else 2
+    # `is not None`, NOT a truth test: a truthiness check maps an explicit
+    # stages_kv=0 onto the default 2, which is a knob SUBSTITUTION -- the one
+    # thing the engine contract forbids (honored or ineligible). Out-of-domain
+    # values must reach the 2..4 check below and raise there.
+    stages_kv = params.stages_kv if getattr(params, "stages_kv", None) is not None else 2
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
     arrivers = _d256_read_tile_arrivers(cta_mma)
 

@@ -945,7 +945,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # flavors that have been validated under it.
             #
             # The ROOT CAUSE of "the ported kernels do not honor LPT" was a
-            # dropped argument, not a broken decode: every SM100 kernel calls
+            # dropped argument, not an incorrect decode: every SM100 kernel calls
             # `make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)` and the
             # SM107 port omitted it on 9 of 11 flavors. Without it the LPT
             # linearization walks a row range CTA_MMA times too large, no tile

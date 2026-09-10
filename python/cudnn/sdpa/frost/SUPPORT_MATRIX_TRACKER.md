@@ -356,7 +356,7 @@ dense and causal. Measured causal SOL on Rubin at S = 4096/8192/32768:
 neutral. The decay with S is the signature of scheduler imbalance.
 
 Still declined, and why: d128/d512 f16 and every FP8/MXFP8 flavor are
-**unvalidated** under LPT rather than known-broken (d512 is cga4×1 role-split,
+**unvalidated** under LPT rather than known-incorrect (d512 is cga4×1 role-split,
 a different scheduler shape). `SCHED_LPT_L2` is declined by **every** flavor —
 its decode needs `qh_per_kh` and `seqlen_kv`, which the SM107 call sites do not
 pass, so it raises rather than miscomputes. Both are follow-ups.

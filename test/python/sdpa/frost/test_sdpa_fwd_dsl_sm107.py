@@ -619,3 +619,45 @@ def test_sm107_d256_desc_version_follows_the_stages_kv_layout(depth):
     cfg = replace(kern.CFG, STAGES_KV=depth)
     want = 1 if depth >= 4 else 0
     assert int(kern._needs_desc_v1(cfg)) == want, f"STAGES_KV={depth} must select desc_version {want}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("bad_depth", [0, 1, 5])
+def test_sm107_d256_rejects_an_out_of_domain_stages_kv(bad_depth):
+    """An out-of-domain STAGES_KV must RAISE, never be silently defaulted.
+
+    `make_cfg_d256` reads `stages_kv` as an OPTIONAL attribute, because the
+    shared forward `TemplateParams` has no such field yet -- nothing on the
+    shipped path sets it, so this is a latent path, not a live one. It stops
+    being latent the day the knob is declared, and the failure it would have
+    then is the quiet kind: a truthiness test maps an explicit 0 onto the
+    default 2, so the engine runs a depth the caller did not ask for and the
+    2..4 check below never sees it. That is knob SUBSTITUTION, which the
+    engine contract forbids -- a knob is honored or the engine is ineligible.
+
+    Pinning 0 specifically: 1 and 5 fail under any spelling, but 0 is the only
+    value a truth test swallows, so it is the one that regresses silently.
+    """
+    from dataclasses import dataclass
+
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.config_sm107 import make_cfg_d256
+
+    @dataclass(frozen=True)
+    class _ParamsWithStagesKv(TemplateParams):
+        stages_kv: int = None
+
+    with pytest.raises(ValueError, match="STAGES_KV"):
+        make_cfg_d256(_ParamsWithStagesKv(stages_kv=bad_depth))
+
+
+@pytest.mark.L0
+def test_sm107_d256_stages_kv_defaults_when_the_attribute_is_absent():
+    """The accept side of the test above: a plain TemplateParams (no
+    `stages_kv` attribute at all) still gets the depth-2 default, so the fix
+    for the explicit-zero case did not break the only path that ships."""
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.config_sm107 import make_cfg_d256
+
+    cfg, _ = make_cfg_d256(TemplateParams())
+    assert cfg.STAGES_KV == 2
