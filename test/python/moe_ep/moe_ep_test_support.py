@@ -641,19 +641,11 @@ def _pack_wgrad_scale_part_bytes(logical: torch.Tensor) -> torch.Tensor:
         raise ValueError("logical scale part must be rank 2")
     rows, columns = logical.shape
     if rows % 128 or columns % 4:
-        raise ValueError(
-            "logical scale part must have 128-aligned rows and 4-aligned columns"
-        )
+        raise ValueError("logical scale part must have 128-aligned rows and 4-aligned columns")
     row_atoms = rows // 128
     column_atoms = columns // 4
     atom_count = row_atoms * column_atoms
-    return (
-        logical.reshape(row_atoms, 128, column_atoms, 4)
-        .permute(0, 2, 1, 3)
-        .reshape(atom_count, 4, 32, 4)
-        .transpose(1, 2)
-        .reshape(-1)
-    )
+    return logical.reshape(row_atoms, 128, column_atoms, 4).permute(0, 2, 1, 3).reshape(atom_count, 4, 32, 4).transpose(1, 2).reshape(-1)
 
 
 def _unpack_wgrad_scale_part(
@@ -663,11 +655,7 @@ def _unpack_wgrad_scale_part(
 ) -> torch.Tensor:
     """Decode one grouped-wgrad scale part as logical E8M0 values."""
 
-    return (
-        _unpack_wgrad_scale_part_bytes(packed, rows, columns)
-        .view(torch.float8_e8m0fnu)
-        .float()
-    )
+    return _unpack_wgrad_scale_part_bytes(packed, rows, columns).view(torch.float8_e8m0fnu).float()
 
 
 def _pad_wgrad_operand_for_grouped_kernel(
@@ -700,16 +688,10 @@ def _pad_wgrad_operand_for_grouped_kernel(
 
     for expert, (end, valid_count) in enumerate(zip(ends, valid_counts)):
         if end < previous or end > k_capacity:
-            raise ValueError(
-                "expert offsets must be nondecreasing and fit the operand "
-                f"K capacity ({k_capacity})"
-            )
+            raise ValueError("expert offsets must be nondecreasing and fit the operand " f"K capacity ({k_capacity})")
         extent = end - previous
         if valid_count < 0 or valid_count > extent:
-            raise ValueError(
-                f"expert {expert} valid route count {valid_count} exceeds "
-                f"its padded extent {extent}"
-            )
+            raise ValueError(f"expert {expert} valid route count {valid_count} exceeds " f"its padded extent {extent}")
         if extent % 32:
             raise ValueError("each padded expert K extent must be divisible by 32")
         valid_end = previous + valid_count
@@ -860,10 +842,7 @@ def _dequantize_wgrad_operand(
             raise ValueError("expert offsets must be nondecreasing and fit the operand " f"K capacity ({k_capacity})")
         extent = end - previous
         if valid_count < 0 or valid_count > extent:
-            raise ValueError(
-                f"expert {expert} valid route count {valid_count} exceeds "
-                f"its padded extent {extent}"
-            )
+            raise ValueError(f"expert {expert} valid route count {valid_count} exceeds " f"its padded extent {extent}")
         if extent % 32:
             raise ValueError("each padded expert K extent must be divisible by 32")
         if extent == 0:
@@ -887,12 +866,8 @@ def _dequantize_wgrad_operand(
             valid_scale_columns = (valid_count + 31) // 32
             logical_scale = logical_scale[:, :valid_scale_columns]
             if k_dim == 1:
-                expanded_scale = logical_scale.repeat_interleave(32, dim=1)[
-                    :, :valid_count
-                ]
-                output[:, previous:valid_end] = (
-                    data[:, previous:valid_end].float() * expanded_scale
-                )
+                expanded_scale = logical_scale.repeat_interleave(32, dim=1)[:, :valid_count]
+                output[:, previous:valid_end] = data[:, previous:valid_end].float() * expanded_scale
             else:
                 expanded_scale = logical_scale.repeat_interleave(
                     32,
@@ -900,9 +875,7 @@ def _dequantize_wgrad_operand(
                 )[
                     :, :valid_count
                 ].transpose(0, 1)
-                output[previous:valid_end, :] = (
-                    data[previous:valid_end, :].float() * expanded_scale
-                )
+                output[previous:valid_end, :] = data[previous:valid_end, :].float() * expanded_scale
         previous = end
         scale_byte_offset += scale_byte_count
 

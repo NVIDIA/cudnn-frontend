@@ -413,9 +413,7 @@ def test_autotune_api_transactions(monkeypatch):
             autotune_module,
             "allocate_training_outputs",
             lambda requirements, device, symmetric: (
-                (forward_outputs, backward_outputs)
-                if symmetric is symmetric_buffers
-                else pytest.fail("autotune used the wrong symmetric buffers")
+                (forward_outputs, backward_outputs) if symmetric is symmetric_buffers else pytest.fail("autotune used the wrong symmetric buffers")
             ),
         )
         patch.setattr(

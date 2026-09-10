@@ -70,11 +70,7 @@ def _is_training_mxfp8_scale_layout(tensor: torch.Tensor) -> bool:
 
     if tensor.is_contiguous():
         return True
-    return (
-        tensor.ndim == 2
-        and tensor.stride(1) == 1
-        and tensor.stride(0) >= tensor.shape[1]
-    )
+    return tensor.ndim == 2 and tensor.stride(1) == 1 and tensor.stride(0) >= tensor.shape[1]
 
 
 def _validate_tensor_representation(
@@ -456,10 +452,7 @@ def validate_training_input(
         if not value.data.is_contiguous():
             raise ValueError(f"{name} MXFP8 data must be contiguous")
         if not _is_training_mxfp8_scale_layout(value.scale):
-            raise ValueError(
-                f"{name} MXFP8 scale must be contiguous or a row-major view "
-                "with padded row stride"
-            )
+            raise ValueError(f"{name} MXFP8 scale must be contiguous or a row-major view " "with padded row stride")
     elif value.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError(f"{name} must be BF16, FP32, or an MXFP8 BlockScaledTensor")
     elif not value.is_contiguous():

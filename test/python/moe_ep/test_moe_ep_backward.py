@@ -1141,9 +1141,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
             _interleave_fc1_wgrad(expected_fc1_wgrad),
             expected_fc2_wgrad,
         )
-        grouped_outputs = tuple(
-            torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected
-        )
+        grouped_outputs = tuple(torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected)
 
         def assert_grouped_matches(operands):
             padded_operands = _pad_wgrad_operands_for_grouped_kernel(operands)
@@ -1178,12 +1176,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
             graph.replay()
             torch.cuda.synchronize(device)
             assert int(args[0].shape[0]) == captured_token_count
-            assert pointers == tuple(
-                tensor.data_ptr()
-                for bundle in (forward_out, backward_out)
-                for tensor in vars(bundle).values()
-                if tensor is not None
-            )
+            assert pointers == tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
             assert_matches(captured, replay_expected)
 
         args[3].copy_(original_topk_idx)
@@ -1256,9 +1249,7 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
         weight_interleave_size=32,
     ) as op:
         requirements = op.prepare_training(lane_count=1, device=device)
-        forward_staging, backward_staging = _allocate_training_weight_staging(
-            source_weights
-        )
+        forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         native_forward = op.pack_forward_weights(
             source_weights[0],
             out=forward_staging,
@@ -1486,9 +1477,7 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
             _interleave_fc1_wgrad(expected_fc1_wgrad),
             expected_fc2_wgrad,
         )
-        grouped_outputs = tuple(
-            torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected
-        )
+        grouped_outputs = tuple(torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected)
 
         def assert_grouped_matches(operands):
             padded_operands = _pad_wgrad_operands_for_grouped_kernel(operands)
@@ -1512,12 +1501,7 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
         with torch.cuda.graph(graph):
             captured = run()
         captured_token_count = int(activation.logical_shape[0])
-        output_pointers = tuple(
-            tensor.data_ptr()
-            for bundle in (forward_out, backward_out)
-            for tensor in vars(bundle).values()
-            if tensor is not None
-        )
+        output_pointers = tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
         native_weight_pointers = (
             native_forward.fc1.payload.data_ptr(),
             native_forward.fc1.scale.data_ptr(),
@@ -1533,10 +1517,7 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
             torch.cuda.synchronize(device)
             assert int(activation.logical_shape[0]) == captured_token_count
             assert output_pointers == tuple(
-                tensor.data_ptr()
-                for bundle in (forward_out, backward_out)
-                for tensor in vars(bundle).values()
-                if tensor is not None
+                tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None
             )
             assert native_weight_pointers == (
                 native_forward.fc1.payload.data_ptr(),

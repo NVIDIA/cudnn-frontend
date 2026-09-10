@@ -255,27 +255,18 @@ class MoeEp:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
         if sf_padding_size % 128:
-            raise ValueError(
-                "sf_padding_size must be a positive multiple of 128, "
-                f"got {sf_padding_size}"
-            )
+            raise ValueError("sf_padding_size must be a positive multiple of 128, " f"got {sf_padding_size}")
         for name, value in (
             ("tuning", tuning),
             ("forward_tuning", forward_tuning),
             ("backward_tuning", backward_tuning),
         ):
             if value is not None and not isinstance(value, MoeEpTuningConfig):
-                raise TypeError(
-                    f"{name} must be a MoeEpTuningConfig or None, "
-                    f"got {type(value).__name__}"
-                )
+                raise TypeError(f"{name} must be a MoeEpTuningConfig or None, " f"got {type(value).__name__}")
         if tuning is not None and forward_tuning is not None:
             raise ValueError("tuning and forward_tuning are aliases; pass only one")
         if validation_mode not in ("strict", "trusted"):
-            raise ValueError(
-                "validation_mode must be 'strict' or 'trusted', "
-                f"got {validation_mode!r}"
-            )
+            raise ValueError("validation_mode must be 'strict' or 'trusted', " f"got {validation_mode!r}")
         if gate_up_clamp is not None:
             if isinstance(gate_up_clamp, bool) or not isinstance(gate_up_clamp, Real):
                 raise ValueError("gate_up_clamp must be a finite real number or None")
@@ -309,28 +300,15 @@ class MoeEp:
         self.gate_up_clamp = None if gate_up_clamp is None else abs(gate_up_clamp)
         self.token_padding_size = token_padding_size
         self.sf_padding_size = sf_padding_size
-        self.forward_tuning = (
-            forward_tuning
-            if forward_tuning is not None
-            else MoeEpTuningConfig() if tuning is None else tuning
-        )
-        self.backward_tuning = (
-            backward_tuning
-            if backward_tuning is not None
-            else MoeEpTuningConfig()
-        )
+        self.forward_tuning = forward_tuning if forward_tuning is not None else MoeEpTuningConfig() if tuning is None else tuning
+        self.backward_tuning = backward_tuning if backward_tuning is not None else MoeEpTuningConfig()
         # Backward-compatible alias for inference and forward-only autotuning.
         self.tuning = self.forward_tuning
         self._validation_mode = validation_mode
         if self.forward_tuning.reduce_topk_in_kernel and (
-            self.combine_format is not MoeFormat.BF16
-            or self.output_format is not MoeFormat.BF16
-            or not self.apply_topk_in_fc1
+            self.combine_format is not MoeFormat.BF16 or self.output_format is not MoeFormat.BF16 or not self.apply_topk_in_fc1
         ):
-            raise ValueError(
-                "reduce_topk_in_kernel requires BF16 combine/output and "
-                "apply_topk_in_fc1=True"
-            )
+            raise ValueError("reduce_topk_in_kernel requires BF16 combine/output and " "apply_topk_in_fc1=True")
         if self.backward_tuning.token_back_mode != "epi_warps":
             raise ValueError("backward_tuning requires token_back_mode='epi_warps'")
         if self.backward_tuning.reduce_topk_in_kernel:
@@ -408,9 +386,7 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
-                raise RuntimeError(
-                    "MoeEp is unusable after an autotune runtime failure"
-                )
+                raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             from . import _backend
 
             if self._forward_backend is not None and request.device != self._forward_backend_device:
@@ -453,9 +429,7 @@ class MoeEp:
             strict_validation = self.validation_mode == "strict"
             topk_version = self._tensor_version(topk_idx) if strict_validation else None
             validate_expert_ids = strict_validation and not (
-                self._validated_topk_idx is topk_idx
-                and topk_version is not None
-                and topk_version == self._validated_topk_version
+                self._validated_topk_idx is topk_idx and topk_version is not None and topk_version == self._validated_topk_version
             )
             request = validate_forward(
                 self._forward_config,
