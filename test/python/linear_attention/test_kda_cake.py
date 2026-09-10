@@ -160,8 +160,10 @@ def test_vendored_bodies_match_sha256sums():
         digest, name = line.split()
         pinned[name] = digest
     digests = compiler.source_digests()
+    generated = {name for name in digests if not name.startswith("fe_")}  # fe_* helpers are first-party, not frozen exports
+    assert pinned and pinned.keys() == generated, f"SHA256SUMS must pin exactly the generated bodies; differs by {set(pinned) ^ generated}"
     for name, digest in pinned.items():
-        assert digests.get(name) == digest, f"{name} differs from its pinned digest"
+        assert digests[name] == digest, f"{name} differs from its pinned digest"
 
 
 def test_manifest_offers_kda_cake_when_opted_in():

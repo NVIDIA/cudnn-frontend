@@ -279,11 +279,13 @@ class _CakeKda:
     def _plan(self, cu_view, stream: int) -> C16Plan:
         itemsize = 8 if _is_int64(cu_view) else 4
         offsets = compiler.read_device_ints(cu_view.data_ptr(), self.n_seq + 1, itemsize, stream)
+        # Every call, not only on a cache miss: the cache key is the length tuple,
+        # which a shifted base would share while the kernels read absolute offsets.
+        if offsets[0] != 0 or offsets[-1] != self.total:
+            raise ValueError(f"{self.plan_name}: cu_seqlens must run from 0 to total_tokens ({self.total}), got {offsets[0]}..{offsets[-1]}")
         seq_lens = tuple(right - left for left, right in zip(offsets, offsets[1:]))
         plan = self._plans.get(seq_lens)
         if plan is None:
-            if offsets[0] != 0 or offsets[-1] != self.total:
-                raise ValueError(f"{self.plan_name}: cu_seqlens must run from 0 to total_tokens ({self.total}), got {offsets[0]}..{offsets[-1]}")
             plan = plan_c16(seq_lens, self.h_v, self.num_sm)
             if len(self._plans) >= self.max_cached_plans:
                 self._plans.clear()
@@ -347,8 +349,20 @@ class _CakeKda:
     def _grid(self, plan: C16Plan) -> Tuple[int, int, int]:
         return (min(plan.total_work_items, self.num_sm), 1, 1)
 
-    def _prepare(self, stream: int):
+    def _prepare(self, stream: int, views, names) -> None:
         compiler.check_not_capturing(stream, self.plan_name)
+        # The frozen kernels take raw pointers and compact TMA maps: no operand may
+        # carry padded strides (FrostLaPlan only checks the innermost dim).
+        for name, view in zip(names, views):
+            shape = tuple(int(s) for s in view.shape)
+            strides = tuple(int(s) for s in view.stride())
+            expect, acc = [], 1
+            for extent in reversed(shape):
+                expect.append(acc)
+                acc *= extent
+            expect = tuple(reversed(expect))
+            if any(e != s for e, s, n in zip(expect, strides, shape) if n > 1):
+                raise ValueError(f"{self.plan_name}: buffer for {name!r} must be contiguous (shape {shape}, strides {strides})")
 
 
 class CompiledCakeKda(_CakeKda):
@@ -366,6 +380,7 @@ class CompiledCakeKda(_CakeKda):
         self._finish_layout()
 
     def bind(self, names) -> None:
+        self.names = list(names)
         pos = {name: index for index, name in enumerate(names)}
         self.index_q = pos["q"]
         self.index_k = pos["k"]
@@ -383,7 +398,7 @@ class CompiledCakeKda(_CakeKda):
     def run(self, views, workspace, stream) -> None:
         stream = int(stream) if stream is not None else 0
         with device_context(self.device):
-            self._prepare(stream)
+            self._prepare(stream, views, self.names)
             q, k, v, g, beta = (views[i] for i in (self.index_q, self.index_k, self.index_v, self.index_g, self.index_beta))
             cu = views[self.index_cu]
             a_log, dt_bias = views[self.index_a_log], views[self.index_dt_bias]
@@ -454,6 +469,7 @@ class CompiledCakeKdaBwd(_CakeKda):
         self._finish_layout()
 
     def bind(self, names) -> None:
+        self.names = list(names)
         pos = {name: index for index, name in enumerate(names)}
         self.index_q = pos["q"]
         self.index_k = pos["k"]
@@ -478,7 +494,7 @@ class CompiledCakeKdaBwd(_CakeKda):
     def run(self, views, workspace, stream) -> None:
         stream = int(stream) if stream is not None else 0
         with device_context(self.device):
-            self._prepare(stream)
+            self._prepare(stream, views, self.names)
             q, k, v, g, beta = (views[i] for i in (self.index_q, self.index_k, self.index_v, self.index_g, self.index_beta))
             cu = views[self.index_cu]
             do = views[self.index_do]

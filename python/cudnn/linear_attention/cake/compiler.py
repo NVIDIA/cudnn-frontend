@@ -75,16 +75,17 @@ def cuda_include_dirs() -> Tuple[Path, ...]:
     for base in sys.path:
         nvidia = Path(base) / "nvidia"
         if nvidia.is_dir():
-            for wheel in ("cuda_runtime", "cuda_nvcc", "cuda_cccl"):
+            # CUDA 13 wheels: nvidia/cu13/include (+ include/cccl); CUDA 12 wheels:
+            # nvidia/cuda_runtime/include with CCCL in the sibling nvidia/cuda_cccl/include.
+            for wheel in ("cu13", "cu12", "cuda_runtime", "cuda_nvcc"):
                 candidates.append(nvidia / wheel / "include")
     candidates.append(Path("/usr/local/cuda/include"))
     for include in candidates:
         if (include / "cuda_bf16.h").is_file():
             dirs = [include]
-            for cccl in (include / "cccl", include.parent / "include" / "cccl"):
-                if (cccl / "cuda" / "std").is_dir():
+            for cccl in (include / "cccl", include.parent.parent / "cuda_cccl" / "include"):
+                if (cccl / "cuda" / "std").is_dir() and cccl not in dirs:
                     dirs.append(cccl)
-                    break
             return tuple(dirs)
     raise CakeCompileError("CUDA headers (cuda_bf16.h) not found; set CUDA_HOME or install nvidia-cuda-runtime")
 
