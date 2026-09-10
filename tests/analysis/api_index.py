@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inventory Python API declarations without importing the package. See api_index.md."""
+"""Inventory Python API declarations without importing the package. See README.md."""
 
 import argparse
 import ast
@@ -479,7 +479,7 @@ def scan(root):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--write", action="store_true", help="Regenerate api_index.txt for review")
     args = parser.parse_args(argv)
     index = args.root / "api_index.txt"
@@ -491,7 +491,7 @@ def main(argv=None):
     expected = index.read_text(encoding="utf-8") if index.exists() else ""
     if expected != actual:
         print("".join(difflib.unified_diff(expected.splitlines(True), actual.splitlines(True), fromfile="api_index.txt", tofile="scanned API")), end="")
-        print("API index mismatch. Review the API change, then run python3 tools/api_index.py --write.")
+        print("API index mismatch. Review the API change, then run python3 tests/analysis/api_index.py --write.")
         return 1
     print(f"API index matches ({len(actual.splitlines())} names).")
     return 0

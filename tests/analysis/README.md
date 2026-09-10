@@ -5,14 +5,14 @@ sorted, unique dotted name per line. Changes to public names require an explicit
 index update in the same PR. Additions and removals both fail the check.
 
 ```bash
-python3 -S tools/api_index.py
+python3 -S tests/analysis/api_index.py
 python3 -S -m unittest discover -s tests/analysis -p test_api_index.py -v
 ```
 
 After reviewing an intentional API change:
 
 ```bash
-python3 -S tools/api_index.py --write
+python3 -S tests/analysis/api_index.py --write
 git diff -- api_index.txt
 ```
 
@@ -20,8 +20,9 @@ The scanner requires only Python 3.10+ and its standard library. No cuDNN build,
 package installation, optional framework, CUDA toolkit, driver, or GPU is needed.
 GitLab's Linux and Windows build jobs run the unittest suite before compilation.
 The repository-index test compares the scanned names with `api_index.txt` and
-fails the build job on a mismatch. The shared scanner lives under `tools/` so
-GitHub/GitLab mirroring and release overlays update it with the index and tests.
+fails the build job on a mismatch. The standalone scanner lives beside the tests
+in `tests/analysis/`, so mirroring and release overlays update it with the index
+and tests.
 GitLab's `ci/**` files are protected from release overlays.
 
 ## Coverage
