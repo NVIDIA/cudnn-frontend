@@ -1786,9 +1786,10 @@ def compile(  # noqa: A001
         if stride is None:
             return cute.runtime.make_fake_compact_tensor(STORAGE_DTYPE, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
         if PARAMS.thd_varlen:
-            # Batch stride = tokens * token_stride (`_thd_view`'s envelope),
-            # a runtime value: rebuild it from the dynamic token extent.
-            return cute.runtime.make_fake_tensor(STORAGE_DTYPE, shape, (shape[1] * stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
+            # Extent-1 batch dim: bind the token stride, as _thd_view does at
+            # runtime -- T * token_stride is never stepped and overflows the int32
+            # stride slot on long packed KV with wide tokens (GitHub #980).
+            return cute.runtime.make_fake_tensor(STORAGE_DTYPE, shape, (stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
         return cute.runtime.make_fake_tensor(STORAGE_DTYPE, shape, tuple(stride), assumed_align=16)
 
     fake_q = _fake_bshd((fake_batch, sq, qh, d_qk), q_stride)

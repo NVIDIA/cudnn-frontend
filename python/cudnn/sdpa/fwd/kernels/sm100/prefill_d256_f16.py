@@ -1887,9 +1887,10 @@ def compile(  # noqa: A001
     THD/varlen: ``sq``/``skv`` are IGNORED — the packed token totals are
     runtime values (they change every step under continuous batching), so the
     token extents compile DYNAMIC (``cute.sym_int``) and the cache key stays
-    plan-time-only; callers must not pass them. THD strides carry a ZERO batch
-    stride (the real view's batch stride is ``t_q * token_stride``, a runtime
-    value; the fake rebuilds it symbolically — batch extent 1 never steps)."""
+    plan-time-only; callers must not pass them. THD ``q_stride``/... carry a ZERO batch stride;
+    the fake binds the token stride for the extent-1 batch dim, exactly as
+    ``_thd_view`` does at runtime (``T * token_stride`` is never stepped and
+    overflows the int32 stride slot on long packed KV, GitHub #980)."""
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d256 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
@@ -1921,9 +1922,10 @@ def compile(  # noqa: A001
             if (stride[axis] * bpe) % 16 != 0:
                 raise ValueError(f"declared stride {stride} axis {axis} must be a 16-byte multiple at BPE={bpe} (TMA global-stride rule)")
         if CFG.THD_VARLEN:
-            # Batch stride = tokens * token_stride (`_thd_view`'s envelope),
-            # a runtime value: rebuild it from the dynamic token extent.
-            return cute.runtime.make_fake_tensor(dtype, shape, (shape[1] * stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
+            # Extent-1 batch dim: bind the token stride, as _thd_view does at
+            # runtime -- T * token_stride is never stepped and overflows the int32
+            # stride slot on long packed KV with wide tokens (GitHub #980).
+            return cute.runtime.make_fake_tensor(dtype, shape, (stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
         return cute.runtime.make_fake_tensor(dtype, shape, tuple(stride), assumed_align=16)
 
     fake_q = _fake_bshd((_fake_batch, sq, qh, d_qk), q_stride)
