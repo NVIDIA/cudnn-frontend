@@ -71,6 +71,8 @@ pytest fe_api/                # OSS kernel tests; require `--group torch` (and `
 
 Read [test/AGENTS.md](test/AGENTS.md) before touching tests — `test/python/conftest.py` has import-order and env-var requirements that are easy to break.
 
+A numerics failure on ONE CI lane (e.g. sm103/GB300 red, sm100/B200 green, same cuDNN) is a different **dataset** before it is a different kernel: torch's CUDA Philox lays draws out by grid size, which follows the GPU's SM count, so one `manual_seed` yields different tensors on 148 vs 152 SMs. Detector (`--repro` dicts reproduce the *index*, not the data): dump the failing lane's inputs, then on the green lane monkeypatch the suite's generator to return them (`sdpa.fp8.create_sparse_int_tensor` / `torch.randn`) and rerun. Fails there too → data-dependent rounding (fp8 midpoint flips, see `assert_close_fp8_grad`), not hardware (#879, GB300 test69/test310). Before budgeting a new flip, A/B it against the previous kernel (`git show origin/develop:<kernel> > <kernel>`, rerun, restore): identical mismatch counts = pre-existing rounding; a real defect changes them and exceeds the budget's magnitude cap (GitHub #981 measured 0.42–2.0 vs flips ≤ 0.375).
+
 ## Format / lint
 
 ```bash
