@@ -791,10 +791,10 @@ def test_bwd_split_d_final_state(backend, variant, V):
         s0 = state0.detach().clone().requires_grad_(True)
         with waive_unsupported(backend, variant):
             o, final_state = pinned_op(backend, variant)(*leaves, *op_tail(case), initial_state=s0, output_final_state=True, **kw)
-        if dO is None:
-            dO = torch.randn_like(o)
-            dFinal = torch.randn_like(final_state) * 0.05
-        grads[tag] = torch.autograd.grad([o, final_state], leaves + [s0], [dO, dFinal])
+            if dO is None:
+                dO = torch.randn_like(o)
+                dFinal = torch.randn_like(final_state) * 0.05
+            grads[tag] = torch.autograd.grad([o, final_state], leaves + [s0], [dO, dFinal])
     for name, got, want in zip(list(tensors) + ["initial_state"], grads["split"], grads["uncut"]):
         assert_rms_close(f"d{name} split-vs-uncut", got, want.float(), BWD_TOL[torch.bfloat16])
 
