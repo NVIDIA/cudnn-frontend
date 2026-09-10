@@ -92,6 +92,8 @@ class Inventory:
         self.aliases = {}
         self.bases = {}
         self.exports = {}
+        self.entrypoints = set()
+        self.definitions = {}
         self.stars = []
         self.modules = set()
         self.instances = []
@@ -138,11 +140,13 @@ class Inventory:
         for node in scope_nodes(body):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.add(scope, node.name)
+                self.definitions.setdefault(scope, set()).add(node.name)
                 if node.name == "__getattr__":
                     self.lazy_getattr(node, scope, package, values)
                 continue
             if isinstance(node, ast.ClassDef):
                 self.add(scope, node.name)
+                self.definitions.setdefault(scope, set()).add(node.name)
                 name = f"{scope}.{node.name}"
                 self.bases[name] = [self.reference(base, scope) for base in node.bases if self.reference(base, scope)]
                 self.python_scope(node.body, name, package, values)
@@ -209,6 +213,8 @@ class Inventory:
                 if isinstance(target, (list, tuple)) and len(target) == 2:
                     module, attr = target
                     self.add(scope, name, self.absolute(module, package) + (f".{attr}" if attr else ""))
+                    if scope == "cudnn":
+                        self.entrypoints.add(name)
         if scope == "cudnn":
             self.aliases["cudnn._pybind_module"] = {"cudnn._compiled_module"}
             for name in values.get("symbols_to_import", []):
@@ -261,6 +267,8 @@ class Inventory:
                         if target and rest:
                             target += "." + ".".join(rest)
                 self.add(scope, name, target)
+                if scope == "cudnn":
+                    self.entrypoints.add(name)
 
     def generated_methods(self, body, module):
         tables = {}
@@ -306,7 +314,7 @@ class Inventory:
                             for name in keys(tables[table]):
                                 self.add(parent, name)
 
-    def generated_exports(self, root):
+    def generated_exports(self, root, report):
         """Resolve the engine manifest and the CPU-only geometry catalog."""
         manifest = root / "python/cudnn/engines/manifest.py"
         if manifest.exists():
@@ -318,7 +326,7 @@ class Inventory:
                     self.add("cudnn.engines", factory, f"{module}.{factory}")
 
         catalog = root / "python/cudnn/gemm/frost/tile_config.py"
-        if not catalog.exists():
+        if not report or not catalog.exists():
             return
         tree = ast.parse(catalog.read_text(encoding="utf-8"))
         for node in tree.body:
@@ -401,7 +409,7 @@ class Inventory:
                 if parent:
                     self.add(parent, ast.literal_eval(tokens[i + 2]))
 
-    def collect(self):
+    def collect(self, report=False, checked_modules=()):
         for scope, name, target in self.instances:
             if target and any(resolved in self.bases for resolved in self.resolve(target)):
                 self.add(scope, name, target)
@@ -431,7 +439,20 @@ class Inventory:
             for resolved in self.resolve(target):
                 if resolved in seen:
                     continue
-                for name in children(resolved):
+                names = children(resolved)
+                if not report and resolved in self.modules:
+                    if resolved in self.exports:
+                        names = set(self.exports[resolved])
+                    else:
+                        names = set(self.definitions.get(resolved, ()))
+                        names.update(
+                            name
+                            for name in self.members.get(resolved, ())
+                            if any(target.startswith("cudnn.") for target in self.aliases.get(f"{resolved}.{name}", ()))
+                        )
+                    if resolved == "cudnn":
+                        names.update(self.entrypoints)
+                for name in names:
                     if public(name):
                         child = f"{api}.{name}"
                         result.add(child)
@@ -440,13 +461,13 @@ class Inventory:
                             visit(child, next_target, seen | {resolved})
 
         for module in sorted(self.modules):
-            if public(module):
+            if public(module) and (report or module in checked_modules):
                 result.add(module)
                 visit(module, module, set())
         return sorted(result)
 
 
-def scan(root):
+def scan(root, report=False):
     inventory = Inventory()
     package = root / "python" / "cudnn"
     if not (package / "__init__.py").is_file():
@@ -473,17 +494,31 @@ def scan(root):
             inventory.generated_methods(body, module)
         except ValueError as error:
             raise ValueError(f"{path}: {error}") from error
-    inventory.generated_exports(root)
-    return inventory.collect()
+    checked_modules = ()
+    if not report:
+        scope = root / "tests" / "analysis" / "api_index_modules.txt"
+        checked_modules = scope.read_text(encoding="utf-8").splitlines()
+        if not checked_modules or checked_modules != sorted(set(checked_modules)):
+            raise ValueError(f"{scope}: expected sorted, unique module names")
+        for module in checked_modules:
+            if not public(module) or module not in inventory.modules:
+                raise ValueError(f"{scope}: unknown or private module: {module}")
+    inventory.generated_exports(root, report)
+    return inventory.collect(report, checked_modules)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--write", action="store_true", help="Regenerate api_index.txt for review")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--write", action="store_true", help="Regenerate api_index.txt for review")
+    mode.add_argument("--report", action="store_true", help="Print the broad exposure inventory without checking or writing the index")
     args = parser.parse_args(argv)
     index = args.root / "tests" / "analysis" / "api_index.txt"
-    actual = "\n".join(scan(args.root)) + "\n"
+    actual = "\n".join(scan(args.root, args.report)) + "\n"
+    if args.report:
+        print(actual, end="")
+        return 0
     if args.write:
         index.parent.mkdir(parents=True, exist_ok=True)
         index.write_text(actual, encoding="utf-8")
