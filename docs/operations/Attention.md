@@ -16,23 +16,23 @@ cudnn SDPA operation requires SM80 (Ampere) or newer architectures and cuda tool
 The support matrix is based on the latest cudnn backend version 9.18.1
 
 
-| Arch <br> | Datatype  <br>  | Layout  <br>                      | Paged  <br>  Attn| Masking     | Deterministic | Head dim |  
+| Arch <br /> | Datatype  <br />  | Layout  <br />                      | Paged  <br />  Attn| Masking     | Deterministic | Head dim |  
 |-----------|-------------|-------------------------------|----------|-------------------------------------------| ------------- | ---- | 
-| Ampere/Ada <br> (Prefill) |  fp16, bf16 | BHSD, BSHD, Interleaved¹, <br> Padded², Ragged³ | Yes | Yes⁴ | Yes | d <= 256 | 
-| Ampere/Ada <br> (Decode)  |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 128  |
-| Ampere/Ada <br> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | NA | Yes | Yes | d <= 128 |
+| Ampere/Ada <br /> (Prefill) |  fp16, bf16 | BHSD, BSHD, Interleaved¹, <br /> Padded², Ragged³ | Yes | Yes⁴ | Yes | d &lt;= 256 | 
+| Ampere/Ada <br /> (Decode)  |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 128  |
+| Ampere/Ada <br /> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | NA | Yes | Yes | d &lt;= 128 |
 ||
-| Hopper <br> (Prefill)      |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 256⁵ <br> (d_qk = 192, d_vo = 128)|
-| Hopper <br> (Decode)       |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 256 <br> (d_qk = 192, d_vo = 128)|
-| Hopper <br> (Bprop)        |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | NA | Yes | Yes | d <= 256 <br> (d_qk = 192, d_vo = 128)|
+| Hopper <br /> (Prefill)      |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 256⁵ <br /> (d_qk = 192, d_vo = 128)|
+| Hopper <br /> (Decode)       |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 256 <br /> (d_qk = 192, d_vo = 128)|
+| Hopper <br /> (Bprop)        |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | NA | Yes | Yes | d &lt;= 256 <br /> (d_qk = 192, d_vo = 128)|
 ||
-| Blackwell (B200/B300) <br> (Prefill)     |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes  | Yes | d <= 256 <br> (d_qk = 192, d_vo = 128) |
-| Blackwell (B200/B300) <br> (Decode)      |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 128 <br> (d_qk = 192, d_vo = 128) |
-| Blackwell (B200/B300) <br> (Bprop)       |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | NA | Yes | Yes  | d <= 128 <br> (d_qk = 192, d_vo = 128) <br> (d_qk = 256, d_vo = 256)|
+| Blackwell (B200/B300) <br /> (Prefill)     |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes  | Yes | d &lt;= 256 <br /> (d_qk = 192, d_vo = 128) |
+| Blackwell (B200/B300) <br /> (Decode)      |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 128 <br /> (d_qk = 192, d_vo = 128) |
+| Blackwell (B200/B300) <br /> (Bprop)       |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | NA | Yes | Yes  | d &lt;= 128 <br /> (d_qk = 192, d_vo = 128) <br /> (d_qk = 256, d_vo = 256)|
 ||
-| Blackwell (Consumer) <br> (Prefill) |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 256  |
-| Blackwell (Consumer) <br> (Decode)  |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 128 <br> (d_qk = 192, d_vo = 128)|
-| Blackwell (Consumer) <br> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | NA | Yes | Yes | d <= 128 |
+| Blackwell (Consumer) <br /> (Prefill) |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 256  |
+| Blackwell (Consumer) <br /> (Decode)  |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 128 <br /> (d_qk = 192, d_vo = 128)|
+| Blackwell (Consumer) <br /> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | NA | Yes | Yes | d &lt;= 128 |
 
 
 ### Glossary
@@ -40,12 +40,12 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 
 ² Padded, variable length sequences (requires padding mask). When sequences in a batch have different lengths, use `use_padding_mask=True` with sequence length tensors.
 
-&nbsp;&nbsp; *Setup:* <br>
+&nbsp;&nbsp; *Setup:* <br />
     &nbsp;&nbsp; - Set `use_padding_mask=True`  
     &nbsp;&nbsp; -  Provide `seq_len_q` tensor of shape `(B, 1, 1, 1)` with actual query sequence lengths  
     &nbsp;&nbsp; -  Provide `seq_len_kv` tensor of shape `(B, 1, 1, 1)` with actual key/value sequence lengths  
 
-&nbsp;&nbsp; *Example:*<br>
+&nbsp;&nbsp; *Example:*<br />
 &nbsp;&nbsp; Batch with sequences "aa" (length 2) and "bbb" (length 3), max length `S=8`:
   - `seq_len_q = [2, 3]`
   - `seq_len_kv = [2, 3]`
@@ -79,9 +79,9 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 
   &nbsp;&nbsp;&nbsp;&nbsp; *Example:*
 
-  &nbsp;&nbsp;&nbsp;&nbsp; Same sequences "aa" and "bbb" packed together:<br>
-  - `seq_len_q = [2, 3]`<br>
-  - `seq_len_kv = [2, 3]`<br>
+  &nbsp;&nbsp;&nbsp;&nbsp; Same sequences "aa" and "bbb" packed together:<br />
+  - `seq_len_q = [2, 3]`<br />
+  - `seq_len_kv = [2, 3]`<br />
 
       ```
       Q = aabbb  (no padding, T=5 total tokens)
@@ -91,16 +91,16 @@ The support matrix is based on the latest cudnn backend version 9.18.1
   - Strides: $[512, 64, 64, 1]$ (strides unchanged, but ignored for ragged)
   - **Ragged offset:** $[0, 2 \times H \times D, 5 \times H \times D] = [0, 128, 320]$
 
-  &nbsp;&nbsp;&nbsp;&nbsp; *Partially Packed Layout:*<br>
+  &nbsp;&nbsp;&nbsp;&nbsp; *Partially Packed Layout:*<br />
   
-  &nbsp;&nbsp;&nbsp;&nbsp; Tokens within each batch can be contiguous without being globally packed.<br>
+  &nbsp;&nbsp;&nbsp;&nbsp; Tokens within each batch can be contiguous without being globally packed.<br />
 
   - Ragged offset: $[0, 4 \times H \times D, 7 \times H \times D] = [0, 256, 448]$
       ```
       Q = aa00bbb0  (batch 0 at offset 0, batch 1 at offset 4)
       ```
 
-  &nbsp;&nbsp;&nbsp;&nbsp; *Not Supported:*<br>
+  &nbsp;&nbsp;&nbsp;&nbsp; *Not Supported:*<br />
 
   &nbsp;&nbsp;&nbsp;&nbsp; Tokens that are not contiguous within a batch cannot be represented.
 
@@ -108,7 +108,7 @@ The support matrix is based on the latest cudnn backend version 9.18.1
       ```
       Q = a0abbb00bb000000  (tokens interleaved - NOT SUPPORTED)
       ```
-&nbsp;&nbsp; **Note that Q,K,V and their gradients can be individually ragged or not.**<br> 
+&nbsp;&nbsp; **Note that Q,K,V and their gradients can be individually ragged or not.**<br /> 
 
 &nbsp;&nbsp; **Backward Pass with THD:**
 
@@ -176,7 +176,6 @@ To run the sdpa benchmarks, refer to [benchmarks/sdpa](https://github.com/NVIDIA
 - Results obtained on NVIDIA GB300 GPU
 
 ## API
-(scaled-dot-product-attention-fp16bf16-forward)=
 ### SDPA FP16/BF16 Forward 
 
 #### C++ API
@@ -498,7 +497,6 @@ stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 # Build and execute
 graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
 ```
-(scaled-dot-product-attention-fp16bf16-backward)=
 ### SDPA FP16/BF16 Backward
 
 This operation computes gradient tensors for scaled dot product attention (SDPA) using the FlashAttention-2 algorithm as described in the paper [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691). You are required to pass the stats tensor from the forward operation to the backward operation as input.
@@ -720,7 +718,6 @@ forward and backward automatically build private block metadata on the active
 CUDA stream without adding public API parameters; D256 backward builds both
 Q-to-K and K-to-Q views from one coarse classification.
 
-(scaled-dot-product-attention-torch-ops)=
 ### SDPA PyTorch Custom Ops (`cudnn::sdpa_fwd` / `cudnn::sdpa_bwd`)
 
 PyTorch custom ops (`torch.library`) exposing the full cuDNN SDPA feature
@@ -798,7 +795,6 @@ o, lse = cudnn.sdpa_torch(q, k, v, is_causal=True, cu_seqlens_q=cu, cu_seqlens_k
 
 Tests: [test/python/sdpa/test_torch_ops.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/test_torch_ops.py).
 
-(scaled-dot-product-attention-fp8-forward)=
 ### SDPA FP8 Forward
 
 This operation computes the scaled dot product attention (SDPA) in the 8-bit floating point (FP8) datatype, using the FlashAttention-2 algorithm as described in the paper [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691). It is applicable for both training and inference phases, with an option to generate a stats tensor to be used for backwards training computation.
@@ -983,7 +979,6 @@ Where:
 #### Samples and tests
 - C++ sample: [samples/cpp/sdpa](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/cpp/sdpa)
 
-(scaled-dot-product-attention-fp8-backward)=
 ### SDPA FP8 Backward
 
 This operation computes the gradients for scaled dot product attention (SDPA) 8-bit floating point (FP8) datatype, using the FlashAttention-2 algorithm as described in the paper [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691). You are required to pass the stats tensor from the forward operation to the backward operation as input.

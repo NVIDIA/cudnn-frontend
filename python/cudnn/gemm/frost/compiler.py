@@ -806,15 +806,19 @@ def _l2_swizzle_budget_bytes() -> int:
     return l2_swizzle_budget_bytes()
 
 
-def _render_tile_constants(
+def _render_tile_constants_sm100(
     cfg: TileConfig,
     chain: FusionChain,
     tmpl,
 ) -> str:
-    """Emit module-level tile + dtype constants for the config/chain, appended
-    below the template's defaults (last assignment wins). TileConfig geometry is
-    dtype-agnostic (K in bytes); resolved to element counts via the chain's A
-    dtype. Dtype constants derive from chain.matmul.{a,b}_dtype + output_dtype.
+    """Emit module-level tile + dtype constants for a tcgen05 (sm100-family)
+    template, appended below the template's defaults (last assignment wins).
+    TileConfig geometry is dtype-agnostic (K in bytes); resolved to element
+    counts via the chain's A dtype. Dtype constants derive from
+    chain.matmul.{a,b}_dtype + output_dtype. Alongside the geometry this is where
+    the TMEM budget (acc_stages, the alloc size, the drain layouts) and the
+    tcgen05 SMEM-descriptor strides are decided -- none of which exists on the
+    warp-MMA family, which has its own renderer (:func:`_render_tile_constants_sm120`).
     """
     # Both are facts of the TEMPLATE, not of the geometry: whether it consumes
     # the mixed-CGA fallback constant, and how much SMEM it holds back.
@@ -1097,6 +1101,125 @@ def _render_tile_constants(
     return "\n".join(lines)
 
 
+def _render_tile_constants_sm120(
+    cfg: TileConfig,
+    chain: FusionChain,
+    tmpl,
+) -> str:
+    """Module-level tile + dtype constants for the sm120 warp-MMA template
+    (``sm120_matmul.py``), appended below the template's defaults.
+
+    Emits exactly the names that template reads from its
+    ``INJECT_TILE_CONSTANTS`` block. CC 12.x has no Tensor Memory, no tcgen05
+    SMEM descriptors, no thread-block clusters and no TMA-store epilogue, so
+    nothing of the tcgen05 renderer's world is computed here: no TMEM budget
+    (``acc_stages``, the alloc size, the ``epi_packed_lanes`` / ``epi_dp22``
+    drain layouts), no descriptor strides, no multicast plan, no mixed-CGA
+    fallback. The one MN-major rule is the TMA group walk's: the whole SMEM
+    extent must cut into whole swizzle groups.
+    """
+    if chain.is_multi_gemm or chain.has_mainloop_fusion or chain.has_moe or chain.has_block_scale:
+        raise NotImplementedError(f"{tmpl.file} renders plain single-GEMM matmul chains only")
+    # warps_per_cta is a fact of the TEMPLATE (8 compute + TMA + CLC + 2 donors).
+    if tmpl.warps_per_cta is not None:
+        cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
+    if cfg.mma_tile_k_bytes != 32:
+        raise NotImplementedError(
+            f"plain matmul renders one 32-byte MMA-inst K; config {cfg.name!r} " f"has mma_inst_k_bytes={cfg.mma_tile_k_bytes} (block-scale only)"
+        )
+    a_dt = chain.matmul.a_dtype
+    b_dt = chain.matmul.b_dtype
+    mma_a_dt = _mma_a_dtype(chain)
+    mma_b_dt = _mma_b_dtype(chain)
+    accum_dt = chain.matmul.accum_dtype
+    out_dt = chain.output_dtype
+    elem_bytes = DTYPE_BYTES[mma_a_dt]
+    # The SMEM K-row width IS the TMA swizzle span (the template asserts it).
+    _TMA_SWIZZLE_BY_ROW_BYTES = {128: "s128b", 64: "s64b", 32: "s32b", 16: "none"}
+    if cfg.cta_tile_k_bytes not in _TMA_SWIZZLE_BY_ROW_BYTES:
+        raise ValueError(f"TileConfig {cfg.name!r}: unsupported cta_tile_k_bytes=" f"{cfg.cta_tile_k_bytes} (supported: {sorted(_TMA_SWIZZLE_BY_ROW_BYTES)})")
+    tma_swizzle_name = _TMA_SWIZZLE_BY_ROW_BYTES[cfg.cta_tile_k_bytes]
+    cta_smem_m, cta_smem_n, _cta_smem_k = cfg.cta_smem_tile_mnk(elem_bytes)
+    # An MN-major operand is TMA-loaded in swizzle-span-wide MN groups (one box
+    # each), so its SMEM extent must be a whole number of them. The kernel's
+    # ldmatrix path has no per-MMA descriptors -- the whole extent is the rule.
+    group_elems = cfg.cta_tile_k_bytes // elem_bytes
+
+    def _tma_group_elems(is_mn_major: bool, mn_extent: int, operand_name: str) -> int:
+        if not is_mn_major:
+            return 1
+        if mn_extent < group_elems or mn_extent % group_elems != 0:
+            raise ValueError(
+                f"TileConfig {cfg.name!r} cannot use {operand_name}-major input: "
+                f"SMEM extent {mn_extent} is not a multiple of the {group_elems}-element swizzle group"
+            )
+        return group_elems
+
+    a_tma_group_elems = _tma_group_elems(chain.matmul.a_major == "m", cta_smem_m, "M")
+    b_tma_group_elems = _tma_group_elems(chain.matmul.b_major == "n", cta_smem_n, "N")
+    # The template always stores STG straight from registers: no TMA-store ring,
+    # so the chunk is the outputs' own store vector width.
+    vec_bytes_epi = _epi_vec_bytes(chain, cfg)
+    lines = [
+        f"# Tile config: {cfg.name}",
+        f"mma_inst_shape_mnk = {cfg.mma_tile_mnk(elem_bytes)}",
+        f"cgrp_tile_mnk = {cfg.cga_tile_mnk(elem_bytes)}",
+        f"cta_tile_mnk = {cfg.cta_smem_tile_mnk(elem_bytes)}",
+        f"threads_per_cta = {cfg.threads_per_cta}",
+        f"cluster_shape_mnk = {cfg.cluster_shape}",
+        f"matmul_a_batch = {chain.matmul.a_batch}",
+        f"matmul_b_batch = {chain.matmul.b_batch}",
+        f"a_is_m_major = {chain.matmul.a_major == 'm'}",
+        f"b_is_n_major = {chain.matmul.b_major == 'n'}",
+        # The AB pipeline depth; the template then funds its transposed-STG
+        # epilogue staging out of it.
+        f"ab_stages = {cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)}",
+        f"a_tma_group_elems = {a_tma_group_elems}",
+        f"b_tma_group_elems = {b_tma_group_elems}",
+        # Warp-MMA pairs per warp tile per axis -- the compute-warp grid falls
+        # out of these (WARPS_M = cta_tile_m / (mma_size_m * 16)).
+        f"mma_size_m = {cfg.mma_size_m}",
+        f"mma_size_n = {cfg.mma_size_n}",
+        f"ab_tma_swizzle = _tma.TensorMapSwizzle.{tma_swizzle_name}",
+        "",
+        f"# Dtype family: A={a_dt}->MMA{mma_a_dt}, B={b_dt}->MMA{mma_b_dt}, out={out_dt} (K_BYTES={cfg.cta_tile_k_bytes})",
+        f"ab_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
+        f"cd_dtype = {'cutlass.Int8' if out_dt == 'fp4_e2m1' else DTYPE_TO_CUTLASS[out_dt]}",
+        f"mma_a_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
+        f"mma_b_dtype = {DTYPE_TO_CUTLASS[mma_b_dt]}",
+        f"mma_c_dtype = {DTYPE_TO_CUTLASS[accum_dt]}",
+        f"acc_widen_to_fp32 = {accum_dt == 'int32' and out_dt != 'int32'}",
+        f"ab_tma_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
+        "",
+        # No clusters on CC 12.x, hence no mixed-CGA fallback: the L2 N-super-block
+        # walk is never pinned, the kernel picks it per launch from the budget.
+        "tile_swizzle_n = 0",
+        f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}",
+        f"num_a_operands = {chain.num_a_operands}",
+        f"num_b_operands = {chain.num_b_operands}",
+        f"vec_bytes_epi = {vec_bytes_epi}",
+        f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store=False)}",
+        f"frost_compile_options = {_frost_compile_options()!r}",
+    ]
+    lines.extend(_quant_device_imports(chain))
+    return "\n".join(lines)
+
+
+def _render_tile_constants(
+    cfg: TileConfig,
+    chain: FusionChain,
+    tmpl,
+) -> str:
+    """Module-level tile + dtype constants for ``tmpl``, appended below the
+    template's defaults (last assignment wins). Dispatches on the TEMPLATE's
+    family: the sm120 warp-MMA template has its own renderer, which knows
+    nothing of Tensor Memory or tcgen05 descriptors; every tcgen05 template
+    takes the full one."""
+    if tmpl.pipeline == "sm120":
+        return _render_tile_constants_sm120(cfg, chain, tmpl)
+    return _render_tile_constants_sm100(cfg, chain, tmpl)
+
+
 def _cvt_f32_to_fp8_scale_bits(fn_name: str, dsl_dtype: str, rnd: str) -> list[str]:
     """A ``fp32 -> <8-bit scale> byte`` helper, emitted into the generated kernel
     so it stays self-contained. The cvt unit is natively x2, so the pair form is
@@ -1215,7 +1338,7 @@ def _b_collector_ok(cfg, arch: int | None = None) -> bool:
     """...and whether THIS geometry may ask for it. The 64-row MMA may not: measured
     `cudaErrorIllegalInstruction` at `mma_tile_m == 64` under both CTA groups, so it
     is the per-CTA instruction M that decides, not the hardware M. Block-scale never
-    reaches it (`validate_block_scale_config` requires `mma_tile_m % 128 == 0`)."""
+    reaches it (`validate_block_scale_config_sm100` requires `mma_tile_m % 128 == 0`)."""
     return _b_collector_supported(arch) and cfg.mma_tile_m == 128
 
 
@@ -1393,18 +1516,227 @@ def _mixed_cga_constants(cfg: TileConfig, fallback_cluster: tuple[int, int, int]
     ]
 
 
-def _render_block_scale_tile_constants(
+# (is_fp4, block_size, sf_dtype) -> (nvvm.MMABlockScaleKind, nvvm.ScaleVecSize,
+# nvvm.BlockScaleFormat) of the sm120 warp MMA. These are the combos the
+# instruction has a ``.kind::mx*`` for: nvfp4 (block 16 + e4m3 scales) rides
+# ``mxf4nvf4`` at scale_vec::4X, mxfp4 (block 32 + e8m0) ``mxf4`` at 2X and
+# mxfp8 (block 32 + e8m0) ``mxf8f6f4`` at 1X. fp4 + e8m0 at block 16 (4X with
+# a ue8m0 scale) is PTX ISA 9.1, above what the DSL's toolchain emits today,
+# fp4 + e4m3 at block 32 has no 2X ue4m3 form, and e5m3 scales are SM 10.7
+# silicon -- all three are absent from MMA_TYPE_SUPPORT["sm120"] too.
+_SM120_BLOCK_SCALE_MMA: dict[tuple[bool, int, str], tuple[str, str, str]] = {
+    (True, 16, "fp8_e4m3"): ("MXF4NVF4", "X4", "UE4M3"),
+    (True, 32, "fp8_e8m0"): ("MXF4", "X2", "UE8M0"),
+    (False, 32, "fp8_e8m0"): ("MXF8F6F4", "X1", "UE8M0"),
+}
+# The instruction's ``.<atype>.<btype>`` qualifiers (nvvm.MMATypes member names).
+_SM120_MMA_PTX_TYPE: dict[str, str] = {"fp4_e2m1": "e2m1", "fp8_e4m3": "e4m3", "fp8_e5m2": "e5m2"}
+
+
+def _render_block_scale_tile_constants_sm120(
     cfg: TileConfig,
     chain: FusionChain,
     tmpl,
 ) -> str:
-    """Emit module-level constants for the block-scale matmul template.
+    """Module-level constants for the sm120 block-scale template
+    (``sm120_block_scale_matmul.py``) -- the sm120 counterpart of
+    :func:`_render_tile_constants_sm120`, appended below the template's defaults.
+
+    Emits exactly the names that template reads: the dense sm120 geometry and
+    STG-epilogue facts, plus the packed-operand and scale-factor facts the
+    block-scale template adds (packed row width, SF box shape, the warp MMA's
+    kind / scale-vec / scale-format / operand types). Nothing of the tcgen05
+    renderer's world exists here: no TMEM budget, no SMEM descriptors, no
+    SMEM->TMEM (utccp) copy schedules, no multicast plan.
+    """
+    from .tile_config import _SM120_STG_STAGE_ELEMS, ConfigSm120, smem_ab_stages, validate_block_scale_config_sm120
+
+    if chain.is_multi_gemm or chain.has_mainloop_fusion or chain.has_moe:
+        raise NotImplementedError(f"{tmpl.file} renders plain single-GEMM block-scale matmul chains only")
+    # warps_per_cta is a fact of the TEMPLATE (8 compute + TMA + CLC + 2 donors).
+    if tmpl.warps_per_cta is not None:
+        cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
+    assert isinstance(cfg, ConfigSm120), f"{cfg.pipeline} is not the sm120 config family"
+    bs = chain.block_scale
+    assert bs is not None
+    # sA/sB bytes and B's TMA stride encoding take ONE packed width, read off A.
+    if DTYPE_BITS[bs.a_dtype] != DTYPE_BITS[bs.b_dtype]:
+        raise NotImplementedError(
+            f"block-scale A and B must share an element width; got {bs.a_dtype} " f"({DTYPE_BITS[bs.a_dtype]}b) x {bs.b_dtype} ({DTYPE_BITS[bs.b_dtype]}b)"
+        )
+    is_fp4 = bs.is_fp4
+    data_elem_bits = 4 if is_fp4 else 8
+    cta_k_elems = cfg.cta_tile_k_bytes * 8 // data_elem_bits
+    validate_block_scale_config_sm120(cfg, bs.block_size, cta_k_elems)
+    try:
+        mma_kind, scale_vec, sf_format = _SM120_BLOCK_SCALE_MMA[(is_fp4, bs.block_size, bs.sf_dtype)]
+    except KeyError:
+        raise NotImplementedError(
+            f"the sm120 warp MMA has no block-scale kind for {bs.a_dtype} data with "
+            f"{bs.sf_dtype} scales at block {bs.block_size} (nvfp4: block 16 + e4m3; "
+            f"mxfp4 / mxfp8: block 32 + e8m0)"
+        ) from None
+    a_major = chain.matmul.a_major
+    b_major = chain.matmul.b_major
+    # A packed sub-byte operand has no transposed ldmatrix; fp8 (1 B/elem) rides
+    # the dense template's m16n16.trans.b8 path.
+    if is_fp4 and (a_major != "k" or b_major != "k"):
+        raise ValueError(f"FP4 block-scaled inputs must be K-major (got A={a_major}-major, " f"B={b_major}-major); only mxfp8 supports M/N-major operands.")
+    cta_m = cfg.cta_tile_m
+    cta_n = cfg.cta_tile_n
+    # An MN-major (fp8) operand is TMA-loaded in swizzle-span-wide MN groups (one
+    # box each), so its SMEM extent must be a whole number of them -- the kernel's
+    # ldmatrix path has no per-MMA descriptors, the whole extent is the rule.
+    group_elems = cfg.cta_tile_k_bytes  # 1 B/elem
+
+    def _tma_group_elems(is_mn_major: bool, mn_extent: int, operand_name: str) -> int:
+        if not is_mn_major:
+            return 1
+        if mn_extent < group_elems or mn_extent % group_elems != 0:
+            raise ValueError(
+                f"block-scale config {cfg.name!r} cannot use {operand_name}-major input: "
+                f"SMEM extent {mn_extent} is not a multiple of the {group_elems}-element swizzle group"
+            )
+        return group_elems
+
+    a_tma_group_elems = _tma_group_elems(a_major == "m", cta_m, "M")
+    b_tma_group_elems = _tma_group_elems(b_major == "n", cta_n, "N")
+
+    # Packed (Float4E2M1FNx2 / Float8) element count per K row in SMEM.
+    pack = 2 if is_fp4 else 1
+    ab_packed_per_row = cta_k_elems // pack
+    sA_packed_elems = cta_m * ab_packed_per_row
+    sB_packed_elems = cta_n * ab_packed_per_row
+
+    # --- Scale factors ---------------------------------------------------------
+    # F8_128x4 atoms: 128 rows x 4 K-scales = 512 B. The per-stage TMA box holds
+    # the whole K-tile of scales (sf_k4 atoms) for every 128-block the CTA tile
+    # touches: whole blocks when the tile is a multiple of 128, the one block
+    # around it when the tile is a divisor (validate_block_scale_config_sm120).
+    sf_k = cta_k_elems // bs.block_size
+    sf_k4 = sf_k // 4
+    nb_m = -(-cta_m // 128)
+    nb_n = -(-cta_n // 128)
+    sfa_smem_bytes = nb_m * 128 * sf_k
+    sfb_smem_bytes = nb_n * 128 * sf_k
+    # The warp MMA's K is 32 bytes: 64 fp4 / 32 fp8 elements -> scales per instruction.
+    mma_k_elems = 32 * 8 // data_elem_bits
+    scales_per_inst = mma_k_elems // bs.block_size
+
+    # --- AB SMEM pipeline depth -------------------------------------------------
+    # One stage = a whole K-tile of packed A + B plus both SF boxes (+16 B, the
+    # slack the template counts). The transposed-STG epilogue staging (4 B x 528
+    # per compute warp) is taken off the budget in BYTES before the ring is
+    # sized -- not as a whole stage, which on a ~99 KB consumer part would cost
+    # a 128x128 tile its second stage (2 x 36 KB + 16.5 KB fits; 3 x 36 KB does
+    # not). The catalog's SMEM sweep counts data only, so a cataloged tile can
+    # still leave no stage here; the engine then declines the graph.
+    per_stage = sA_packed_elems + sB_packed_elems + sfa_smem_bytes + sfb_smem_bytes + 16
+    compute_warps = (cta_m // cfg.warp_tile_m) * (cta_n // cfg.warp_tile_n)
+    staging_bytes = 4 * _SM120_STG_STAGE_ELEMS * compute_warps
+    ab_stages = smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=staging_bytes)
+    if ab_stages < 1:
+        raise NotImplementedError(
+            f"block-scale {cfg.name!r}: one stage of {per_stage} B (packed A/B + SF) plus the "
+            f"{staging_bytes}-B epilogue staging does not fit the SMEM budget -- pick a smaller CTA tile"
+        )
+
+    out_dt = chain.output_dtype
+    # The template always stores STG straight from registers: no TMA-store ring,
+    # so the chunk is the outputs' own store vector width.
+    vec_bytes_epi = _epi_vec_bytes(chain, cfg)
+
+    lines = [
+        f"# Block-scale config: {cfg.name} data={bs.a_dtype}x{bs.b_dtype} sf={bs.sf_dtype} block={bs.block_size}",
+        # The warp-MMA pair in NATIVE elements: 16 x 16 x (64 fp4 | 32 fp8).
+        f"mma_inst_shape_mnk = (16, 16, {mma_k_elems})",
+        f"cgrp_tile_mnk = ({cta_m}, {cta_n}, {cta_k_elems})",
+        f"cta_tile_mnk = ({cta_m}, {cta_n}, {cta_k_elems})",
+        f"threads_per_cta = {cfg.threads_per_cta}",
+        f"cluster_shape_mnk = {cfg.cluster_shape}",
+        f"matmul_a_batch = {chain.matmul.a_batch}",
+        f"matmul_b_batch = {chain.matmul.b_batch}",
+        f"a_is_m_major = {a_major == 'm'}",
+        f"b_is_n_major = {b_major == 'n'}",
+        # The AB ring depth with the epilogue staging already funded (the
+        # template takes it as is).
+        f"ab_stages = {ab_stages}",
+        f"a_tma_group_elems = {a_tma_group_elems}",
+        f"b_tma_group_elems = {b_tma_group_elems}",
+        # Warp-MMA pairs per warp tile per axis -- the compute-warp grid falls
+        # out of these (WARPS_M = cta_tile_m / (mma_size_m * 16)).
+        f"mma_size_m = {cfg.mma_size_m}",
+        f"mma_size_n = {cfg.mma_size_n}",
+        # A packed K row is one 128-byte swizzle span (validate_block_scale_config_sm120).
+        "ab_tma_swizzle = _tma.TensorMapSwizzle.s128b",
+        "",
+        "# packed data",
+        # ab_dtype is the one-byte PACKED carrier both operands are sized by
+        # (sA/sB bytes, B's TMA stride encoding, ab_stride_elems); spelled as A's dtype.
+        f"ab_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",
+        # Fake-tensor dtypes: A and B may differ (mxfp8 e4m3 x e5m2).
+        f"a_fake_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",
+        f"b_fake_dtype = {DTYPE_TO_CUTLASS[bs.b_dtype]}",
+        f"ab_packed_per_row = {ab_packed_per_row}",
+        f"sA_packed_elems = {sA_packed_elems}",
+        f"sB_packed_elems = {sB_packed_elems}",
+        # TMA-descriptor element dtype: the NATIVE 4-bit Float4E2M1FN (not the
+        # packed pair) so cute scales the descriptor by width=4 itself; fp8 as is.
+        f"ab_tma_desc_dtype = {'cutlass.Float4E2M1FN' if is_fp4 else DTYPE_TO_CUTLASS[bs.a_dtype]}",
+        # FP4 needs the explicit B4X16 (4-bit packed) TMA format; FP8 auto-derives.
+        f"ab_tma_format = {'_tma.TensorMapDataFormat.B4X16' if is_fp4 else 'None'}",
+        "",
+        "# output",
+        f"cd_dtype = {'cutlass.Int8' if out_dt == 'fp4_e2m1' else DTYPE_TO_CUTLASS[out_dt]}",
+        # The block-scaled warp MMA accumulates in fp32; nothing to widen.
+        "mma_c_dtype = cutlass.Float32",
+        "acc_widen_to_fp32 = False",
+        # No clusters on CC 12.x, hence no mixed-CGA fallback: the L2 N-super-block
+        # walk is never pinned, the kernel picks it per launch from the budget.
+        "tile_swizzle_n = 0",
+        f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}",
+        "num_a_operands = 1",
+        "num_b_operands = 1",
+        f"vec_bytes_epi = {vec_bytes_epi}",
+        f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store=False)}",
+        f"frost_compile_options = {_frost_compile_options()!r}",
+        "",
+        "# block-scale warp MMA (nvvm.mma.block_scale member names)",
+        f"mma_block_scale_kind = {mma_kind!r}",
+        f"mma_scale_vec_size = {scale_vec!r}",
+        f"mma_sf_format = {sf_format!r}",
+        f"mma_a_ptx_type = {_SM120_MMA_PTX_TYPE[bs.a_dtype]!r}",
+        f"mma_b_ptx_type = {_SM120_MMA_PTX_TYPE[bs.b_dtype]!r}",
+        "",
+        "# scale factors (F8_128x4: 512-byte atoms of 128 rows x 4 K-scales)",
+        f"block_size = {bs.block_size}",
+        f"sf_cutlass_dtype = {DTYPE_TO_CUTLASS[bs.sf_dtype]}",
+        f"sf_scales_per_inst = {scales_per_inst}",
+        f"sfa_smem_bytes = {sfa_smem_bytes}",
+        f"sfb_smem_bytes = {sfb_smem_bytes}",
+        # SF TMA box: inner 256 fp16 (= one 512 B atom), sf_k4 atoms along K, the
+        # tile's 128-blocks along M / N.
+        f"sf_tma_box_k = {sf_k4}",
+        f"sfa_tma_box_mn = {nb_m}",
+        f"sfb_tma_box_mn = {nb_n}",
+    ]
+    lines.extend(_quant_device_imports(chain))
+    return "\n".join(lines)
+
+
+def _render_block_scale_tile_constants_sm100(
+    cfg: TileConfig,
+    chain: FusionChain,
+    tmpl,
+) -> str:
+    """Emit module-level constants for the tcgen05 block-scale matmul templates
+    (the sm100 family, and sm103 through its ``is_sm103`` branches).
 
     Bypasses the generic dtype-byte machinery (FP4 is 0.5 B/elem); resolves
     everything from the chain's BlockScaleSpec + geometry, incl. SF SMEM/TMEM
     sizing and the SMEM→TMEM (utccp) copy schedules.
     """
-    from .tile_config import CtaPairTileConfig, validate_block_scale_config
+    from .tile_config import CtaPairTileConfig, validate_block_scale_config_sm100
 
     if tmpl.warps_per_cta is not None:
         cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
@@ -1420,7 +1752,7 @@ def _render_block_scale_tile_constants(
     is_fp4 = bs.is_fp4
     is_sm103 = cfg.pipeline == "sm103"
     # The 64-byte block-scale MMA. A pipeline no longer implies it: sm100
-    # configs carry both widths and the ACTIVE arch decides (validate_block_scale_config).
+    # configs carry both widths and the ACTIVE arch decides (validate_block_scale_config_sm100).
     mma_k64 = cfg.mma_tile_k_bytes == 64
     if is_sm103 and not is_fp4:
         raise NotImplementedError("the sm103 block-scale pipeline is fp4-only; " f"{bs.a_dtype} data with {bs.sf_dtype} scales runs the sm100 templates")
@@ -1434,7 +1766,7 @@ def _render_block_scale_tile_constants(
 
     data_elem_bits = 4 if is_fp4 else 8
     cta_k_elems = cfg.cta_tile_k_bytes * 8 // data_elem_bits
-    validate_block_scale_config(cfg, bs.block_size, cta_k_elems)
+    validate_block_scale_config_sm100(cfg, bs.block_size, cta_k_elems)
 
     cta_m = cfg.cta_tile_m
     cta_n = cfg.cta_tile_n
@@ -1872,6 +2204,21 @@ def _render_block_scale_tile_constants(
     lines.extend(_mixed_cga_constants(cfg, fallback_cluster))
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
+
+
+def _render_block_scale_tile_constants(
+    cfg: TileConfig,
+    chain: FusionChain,
+    tmpl,
+) -> str:
+    """Module-level constants for the block-scale template ``tmpl``, appended
+    below the template's defaults. Dispatches on the TEMPLATE's family, like
+    :func:`_render_tile_constants`: the sm120 warp-MMA template has its own
+    renderer (no TMEM, no SMEM descriptors, no utccp schedule); every tcgen05
+    template takes the full one."""
+    if tmpl.pipeline == "sm120":
+        return _render_block_scale_tile_constants_sm120(cfg, chain, tmpl)
+    return _render_block_scale_tile_constants_sm100(cfg, chain, tmpl)
 
 
 _CTAMMA_SUFFIX = re.compile(r"_[12]ctamma$")

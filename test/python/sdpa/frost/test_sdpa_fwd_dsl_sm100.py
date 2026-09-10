@@ -12,12 +12,31 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import make_dense_stats, requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
+from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl, _dsl_installed
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
-pytestmark = requires_pre_rubin_blackwell
+pytestmark = requires_blackwell
+
+# ONE engine per arch line: pin the row that serves the device under test.
+# ``engine_name(arch=_ARCH)`` defaults to arch="sm100", whose row stops at cc 10.6, so an
+# unqualified pin fails on Rubin with "no plan for engine" for routing reasons
+# that have nothing to do with the kernel.  Same shape as
+# test_sdpa_fwd_fp8_sm100.py / test_sdpa_fwd_mxfp8_sm100.py.
+_ARCH = "sm107" if _SM == 107 else "sm100"
+
+# Features the Rubin f16 row DECLINES (it is a strict subset of its Blackwell
+# counterpart -- see engines._sm107_spec).  These are capability declines the
+# row states honestly, not kernel bugs: the graph is never served, so the test
+# cannot run.  Flip each condition when the gap closes.
+_skip_split_kv_on_rubin = pytest.mark.skipif(_SM == 107, reason="the ported Rubin f16 kernels wire no SplitHelpers (row: split_kv_supported=False)")
+_skip_pack_gqa_on_rubin = pytest.mark.skipif(_SM == 107, reason="no PackGQA path in the ported Rubin f16 kernels (row: pack_gqas={False})")
+_skip_thd_on_rubin = pytest.mark.skipif(_SM == 107, reason="THD/varlen not ported to the Rubin f16 kernels (row: thd=False)")
+_skip_stats_trim_on_rubin = pytest.mark.skipif(
+    _SM == 107,
+    reason="per-batch seq_len_q O/LSE trim not carried by the Rubin f16 kernels " "(row: padded_stats=False / dense_seq_q_trim=False)",
+)
 
 
 def _ref_sdpa(q, k, v, *, is_causal, scale):
@@ -81,7 +100,7 @@ def test_sdpa_fwd_dsl_sm100_graph_api(dtype, is_causal, d):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name())
+    _select_engine(graph, engine_name(arch=_ARCH))
     graph.check_support()
     graph.build_plans()
     # Honest workspace: no Stats output, so the kernel compiles the LSE store
@@ -224,7 +243,7 @@ def _run_dsl_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(), pack_gqa=pack_gqa)
+    _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
@@ -418,6 +437,7 @@ def test_dsl_sm100_padded(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_stats_trim_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_graph_api_padded_bottom_right_gqa():
@@ -452,6 +472,7 @@ def test_dsl_sm100_graph_api_padded_bottom_right_gqa():
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_stats_trim_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["llama_d128", "mla_d192_d128", "qwen_d256", "dsv4_d512"])
 @torch_fork_set_rng(seed=0)
@@ -522,6 +543,7 @@ def test_dsl_sm100_sink(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_thd_on_rubin  # second half of this contract test is THD-only
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_execute_sink_lse_contract():
@@ -633,6 +655,7 @@ def _pack_gqa_case(d, h_q, h_kv, s_q, s_kv, dtype, *, sdpa_kwargs):
     return q, k, v, scale, o
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_pack_gqa_false_pinned():
@@ -650,6 +673,7 @@ def test_dsl_sm100_pack_gqa_false_pinned():
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "h_q,h_kv",
@@ -666,6 +690,7 @@ def test_dsl_sm100_pack_gqa_ratios(d, h_q, h_kv):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("h_q,h_kv", [(8, 2), (64, 1), (128, 1)], ids=["g4", "g64_mqa", "g128_mqa"])
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
@@ -681,6 +706,7 @@ def test_dsl_sm100_pack_gqa_d512(dtype, h_q, h_kv):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("h_q,s_q", [(64, 1), (64, 3), (128, 4)], ids=["g64_q1", "g64_q3_mtp", "g128_q4_mtp"])
 @torch_fork_set_rng(seed=0)
@@ -701,6 +727,7 @@ def test_dsl_sm100_pack_gqa_d512_mqa_decode(h_q, s_q):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)
@@ -717,6 +744,7 @@ def test_dsl_sm100_pack_gqa_d192_d128(dtype):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "d,h_q,h_kv,s_q",
@@ -741,6 +769,7 @@ def test_dsl_sm100_pack_gqa_tiles(d, h_q, h_kv, s_q):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("s_q", [1, 129, 1023, 2048])
 @torch_fork_set_rng(seed=0)
@@ -752,6 +781,7 @@ def test_dsl_sm100_pack_gqa_tiles_deep(s_q):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "mask",
@@ -795,6 +825,7 @@ def test_dsl_sm100_pack_gqa_features(mask):
     torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_pack_gqa_qtrim():
@@ -823,6 +854,7 @@ def test_dsl_sm100_pack_gqa_qtrim():
     torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_pack_gqa_knob_contract():
@@ -842,7 +874,7 @@ def test_dsl_sm100_pack_gqa_knob_contract():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        name = engine_name()
+        name = engine_name(arch=_ARCH)
         out = []
         for i in range(len(g.plans)):
             pn = g.get_plan_name_at_index(i)
@@ -867,6 +899,7 @@ def test_dsl_sm100_pack_gqa_knob_contract():
     assert pg[0] is False and True in pg, f"full-prefill GQA should rank unpacked first with packed runner-up; got {pg}"
 
 
+@_skip_thd_on_rubin
 # THD/varlen: packed [T,H,D] + per-operand ragged_offset (exclusive-prefix-sum of
 # seq_len) + seq_len_q/kv + use_padding_mask. Each sequence attends only within
 # itself (no cross-sequence attention).
@@ -938,7 +971,7 @@ def test_dsl_sm100_thd(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro, kro: ro, vro: ro, oro: ro}
@@ -958,6 +991,7 @@ def test_dsl_sm100_thd(dtype, d):
     torch.testing.assert_close(o_out, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_thd_on_rubin
 # Issue #624: a THD caller binds K/V at BUFFER CAPACITY, not at the packed
 # total, and the descriptor extent is the host-derived capacity. Rows in
 # [total, capacity) are therefore inside the extent and get loaded. They are
@@ -1039,7 +1073,7 @@ def test_dsl_sm100_thd_nan_capacity_tail(dtype, d_qk, d_v):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_qk, kro: ro_qk, vro: ro_v, oro: ro_v}
@@ -1060,6 +1094,7 @@ def test_dsl_sm100_thd_nan_capacity_tail(dtype, d_qk, d_v):
     torch.testing.assert_close(o_out, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
@@ -1130,7 +1165,7 @@ def test_dsl_sm100_thd_cross(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_q, kro: ro_k, vro: ro_k, oro: ro_q}
@@ -1300,7 +1335,7 @@ def _run_dsl_thd_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
@@ -1445,6 +1480,7 @@ def _run_thd_stats_case(
         torch.testing.assert_close(got_lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
@@ -1457,6 +1493,7 @@ def test_dsl_sm100_thd_stats(d, stats_layout):
     _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[200, 150], d=d, mask="causal", stats_layout=stats_layout)
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L1
 @torch_fork_set_rng(seed=32)
 def test_dsl_sm100_thd_swa_stats():
@@ -1466,6 +1503,7 @@ def test_dsl_sm100_thd_swa_stats():
     _run_thd_stats_case(seq_lens_q=[150, 90], seq_lens_kv=[150, 90], mask="swa", stats_layout="token_major")
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
 @torch_fork_set_rng(seed=25)
@@ -1476,6 +1514,7 @@ def test_dsl_sm100_thd_gqa_sink_stats(stats_layout):
     _run_thd_stats_case(seq_lens_q=[130, 70], seq_lens_kv=[130, 70], H_q=8, H_kv=2, mask="causal", with_sink=True, stats_layout=stats_layout)
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L1
 @torch_fork_set_rng(seed=26)
 def test_dsl_sm100_thd_zero_length_sequence_stats():
@@ -1487,6 +1526,7 @@ def test_dsl_sm100_thd_zero_length_sequence_stats():
     _run_thd_stats_case(seq_lens_q=[128, 0, 64], seq_lens_kv=[100, 0, 0], mask="causal", stats_layout="token_major")
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
 @pytest.mark.parametrize("with_sink", [False, True], ids=["no_sink", "sink"])
@@ -1501,6 +1541,7 @@ def test_dsl_sm100_thd_all_kv_zero_stats(with_sink, stats_layout):
     _run_thd_stats_case(seq_lens_q=[64, 32], seq_lens_kv=[0, 0], mask="none", with_sink=with_sink, stats_layout=stats_layout)
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
 @torch_fork_set_rng(seed=34)
@@ -1514,6 +1555,7 @@ def test_dsl_sm100_thd_all_q_zero_stats(stats_layout):
     _run_thd_stats_case(seq_lens_q=[0, 0], seq_lens_kv=[0, 0], mask="none", stats_layout=stats_layout)
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
 @torch_fork_set_rng(seed=35)
@@ -1526,6 +1568,7 @@ def test_dsl_sm100_thd_cu_seq_len_stats(stats_layout):
     _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[200, 150], mask="causal", stats_layout=stats_layout, cu_lens=True)
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L1
 @torch_fork_set_rng(seed=36)
 def test_dsl_sm100_thd_cu_seq_len_zero_lens():
@@ -1537,6 +1580,7 @@ def test_dsl_sm100_thd_cu_seq_len_zero_lens():
     _run_thd_stats_case(seq_lens_q=[64, 32], seq_lens_kv=[0, 0], mask="none", cu_lens=True)
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=37)
 def test_dsl_sm100_thd_compile_key_plan_time_only():
@@ -1589,6 +1633,7 @@ def test_dsl_sm100_thd_compile_key_plan_time_only():
     assert info_exec.hits >= info_plan.hits + 2
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=38)
 def test_dsl_sm100_thd_over_launched_units_are_dead(monkeypatch):
@@ -1611,6 +1656,7 @@ def test_dsl_sm100_thd_over_launched_units_are_dead(monkeypatch):
     _run_thd_stats_case(seq_lens_q=[64, 32], seq_lens_kv=[0, 0], mask="none", stats_layout="token_major")
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @torch_fork_set_rng(seed=41)
@@ -1637,6 +1683,7 @@ def test_dsl_sm100_thd_multi_unit_per_cta(monkeypatch, d):
     _run_thd_stats_case(seq_lens_q=lens, seq_lens_kv=lens, d=d, mask="causal", stats_layout="head_major")
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=39)
 def test_dsl_sm100_thd_lens_never_reach_host():
@@ -1654,6 +1701,7 @@ def test_dsl_sm100_thd_lens_never_reach_host():
     _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[180, 120], mask="causal", stats_layout="head_major", cu_lens=True)
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=41)
 def test_dsl_sm100_thd_execute_never_syncs():
@@ -1691,6 +1739,7 @@ def test_dsl_sm100_thd_execute_never_syncs():
     assert torch.equal(o, o_ref)
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L1
 @torch_fork_set_rng(seed=44)
 def test_dsl_sm100_thd_cu_nonzero_base_normalized():
@@ -1725,6 +1774,7 @@ def test_dsl_sm100_thd_cu_nonzero_base_normalized():
     assert torch.equal(_run(0, 0), _run(1000, 7000))
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L1
 @torch_fork_set_rng(seed=43)
 def test_dsl_sm100_thd_d192_d128_device_meta():
@@ -1763,6 +1813,7 @@ def test_dsl_sm100_thd_d192_d128_device_meta():
         off += length
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=44)
 def test_dsl_sm100_thd_d192_d128_multi_unit_per_cta(monkeypatch):
@@ -1804,6 +1855,7 @@ def test_dsl_sm100_thd_d192_d128_multi_unit_per_cta(monkeypatch):
         off += length
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=42)
 def test_dsl_sm100_thd_execute_cuda_graph_capture():
@@ -1862,6 +1914,7 @@ def test_dsl_sm100_thd_execute_cuda_graph_capture():
     _check([64, 33])
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
@@ -1936,7 +1989,7 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        _select_engine(g, engine_name())
+        _select_engine(g, engine_name(arch=_ARCH))
         g.check_support()
         g.build_plans()
         o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
@@ -1971,6 +2024,7 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
     assert torch.equal(declared_nan, undeclared_nan), "declaring the packed total must not change the result"
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_thd_interleaved_kv_views():
@@ -2025,7 +2079,7 @@ def test_dsl_sm100_thd_interleaved_kv_views():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        _select_engine(g, engine_name())
+        _select_engine(g, engine_name(arch=_ARCH))
         g.check_support()
         g.build_plans()
         o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
@@ -2039,6 +2093,7 @@ def test_dsl_sm100_thd_interleaved_kv_views():
     assert torch.equal(o_views, o_packed), f"interleaved K/V views diverge from packed binding: max|diff|={(o_views - o_packed).abs().max().item()}"
 
 
+@_skip_thd_on_rubin
 @pytest.mark.L1
 @torch_fork_set_rng(seed=40)
 def test_dsl_sm100_thd_kv_zero_capacity_clamp():
@@ -2090,7 +2145,14 @@ def _combo_cases():
     cases, ids = [], []
     for flavor, dtype, heads, sink, layout in itertools.product(_FLAVORS, _DTYPES, ["mha", "gqa"], [False, True], ["dense", "thd"]):
         for mask in _COMBO_MASKS[layout]:
-            cases.append((flavor, dtype, heads, sink, layout, mask))
+            # THD is not ported to the Rubin f16 kernels, so its half of the
+            # cartesian is a capability decline there -- mark the PARAM, not
+            # the test, so the dense half still runs on Rubin.
+            cases.append(
+                pytest.param(flavor, dtype, heads, sink, layout, mask, marks=_skip_thd_on_rubin)
+                if layout == "thd"
+                else (flavor, dtype, heads, sink, layout, mask)
+            )
             ids.append(
                 "-".join(
                     [

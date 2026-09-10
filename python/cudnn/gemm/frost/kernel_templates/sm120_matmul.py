@@ -84,8 +84,6 @@ _N_FRAGS = _WARP_TILE_N // 8
 _N_FRAG_PAIRS = _N_FRAGS // 2
 _ACC_REGS = _M_FRAGS * _N_FRAGS * 4
 
-_EPI_N = epi_tile_mn[1]
-
 # SMEM K-row swizzle: the K-row width IS the swizzle span (the renderer derives
 # ab_tma_swizzle from cta_tile_k_bytes; cross-checked against it below). The TMA
 # s{128,64,32}b pattern == cutlass.Swizzle(b, 4, 3) with b = log2(row_bytes / 16).

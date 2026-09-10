@@ -22,6 +22,7 @@ from gemm_test_utils import (
     _SM,
     requires_sm100,
     requires_sm107,
+    requires_sm120,
     Plan as _plan,
     vp_bs as _vp_bs,
     kw as _kw,
@@ -49,6 +50,8 @@ from cudnn.gemm.frost.tile_config import (
     TileConfig,
     by_name,
     validate_block_scale_config,
+    validate_block_scale_config_sm100,
+    validate_block_scale_config_sm120,
 )
 
 pytestmark = pytest.mark.L0
@@ -460,8 +463,12 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force
             a_rt,
             b_rt,
             c,
-            _to_blocked(sfa_log).view(1, M, sf_k),
-            _to_blocked(sfb_log).view(1, N, sf_k),
+            # The F8_128x4 blob is padded to whole 128-row blocks (and 4-wide
+            # K words), so its rank-3 view carries the PADDED extents when M / N
+            # (or sf_k) are not multiples -- the kernel reads it as a base
+            # pointer plus the layout it rebuilds from the problem size.
+            _to_blocked(sfa_log).view(1, -(-M // 128) * 128, -1),
+            _to_blocked(sfb_log).view(1, -(-N // 128) * 128, -1),
         ),
         workspace=ws,
     )
@@ -1156,6 +1163,12 @@ def test_nvfp4_oob_shape(config_name):
     ],
 )
 def test_mxfp8_m_major_a_n_major_b(config_name, M, N, K):
+    _run_mxfp8_mn_major_numeric(config_name, M, N, K)
+
+
+def _run_mxfp8_mn_major_numeric(config_name, M, N, K):
+    """mxfp8 with M-major A and N-major B vs the K-major torch reference (the
+    same values re-laid-out, so the reference is unchanged)."""
     dev = "cuda"
     torch.manual_seed(0)
     bs = 32
@@ -2362,3 +2375,230 @@ def test_e5m3_block_scale_matmul_oob_shape(block_size):
     """M-OOB / K past a tile boundary is TMA zero-fill, same as every other
     block-scale combo."""
     _run_e5m3_numeric(_SM107_128, 1, block_size, M=255, N=256, K=512 + 4 * block_size)
+
+
+# =============================================================================
+# sm120 (consumer Blackwell, warp-scoped block-scaled MMA): the family's own
+# wiring, config rules, renderer and numerics. Same graphs and torch
+# references as the sm100 sections above; only the config names differ.
+# =============================================================================
+
+_SM120_BS_128 = "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"
+_SM120_BS_128_W24 = "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4"
+_SM120_BS_128x64 = "CONFIG_sm120_128x64x128_16x16x32_cluster1x1_warps4x2"
+_SM120_BS_64x128 = "CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps2x4"
+_SM120_BS_256x128 = "CONFIG_sm120_256x128x128_16x16x32_cluster1x1_warps8x1"
+
+
+def _build_dense_bf16_graph(M, N, K):
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    g.matmul(A=A, B=B, name="mm").set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    return g
+
+
+def _sm120_bs_template():
+    (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120" and t.graph_type is GraphType.BLOCK_SCALE_MATMUL]
+    return tmpl
+
+
+def test_sm120_block_scale_registry_wiring():
+    """The sm120 block-scale template: registered under the dense template's
+    class, own MMA-type table, routed to by the config family alone; fp4 stays
+    K-major, mxfp8 may be MN-major."""
+    from cudnn.gemm.frost.kernel_registry import (
+        MMA_TYPE_SUPPORT,
+        Sm120KernelTemplate,
+        _bs_key,
+        mma_arch_reject,
+    )
+
+    tmpl = _sm120_bs_template()
+    assert tmpl.file == "sm120_block_scale_matmul.py"
+    assert isinstance(tmpl, Sm120KernelTemplate)  # the dense template's class fronts both sm120 templates
+    assert tmpl.block_scale and not tmpl.supports_multi_gemm and not tmpl.supports_mainloop_fusion
+
+    cases = MMA_TYPE_SUPPORT["sm120"][GraphType.BLOCK_SCALE_MATMUL]
+    assert _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 16) in cases  # nvfp4
+    assert _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32) in cases  # mxfp4
+    assert _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32) in cases  # mxfp8 mix
+    # No warp-MMA kind: fp4 + e8m0 at block 16, fp4 + e4m3 at block 32, e5m3 scales.
+    assert _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 16) not in cases
+    assert _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32) not in cases
+    assert not any(k[1] == "fp8_e5m3" for k in cases)
+    # The renderer's instruction table mirrors the support table exactly.
+    assert set(C._SM120_BLOCK_SCALE_MMA) == {(k[0] == "fp4_e2m1", k[2][1], k[1]) for k in cases}
+    # The family's range starts at SM 10.0 for its dense template, but the
+    # block-scaled warp MMA is SM 12.x silicon: every block-scale combo is pinned
+    # to [120, 130) the way int8 is pinned on sm100.
+    from cudnn.gemm.frost.kernel_registry import MMA_GPU_ARCH_SPECIAL_CASES
+
+    assert all(MMA_GPU_ARCH_SPECIAL_CASES[("sm120", k)] == ((120, 130),) for k in cases)
+    dense_chain = analyze(_build_dense_bf16_graph(256, 256, 512))
+    bs_chain = analyze(_build_nvfp4_graph(256, 256, 512))
+    for arch, bs_ok in ((100, False), (103, False), (120, True), (121, True)):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(C, "_current_arch", lambda *a, _v=arch, **k: _v)
+            reason = mma_arch_reject(bs_chain, GraphType.BLOCK_SCALE_MATMUL, "sm120")
+            assert (reason is None) == bs_ok, (arch, reason)
+            if not bs_ok:
+                assert "exists only on 120 <= SM < 130" in reason
+            # the dense sm120 template keeps running on the whole family range
+            assert mma_arch_reject(dense_chain, GraphType.MATMUL, "sm120") is None
+
+    chain = analyze(_build_nvfp4_graph(256, 256, 512))
+    cfg = by_name(_SM120_BS_128)
+    assert select_template(chain, cfg) is tmpl
+    reason = tmpl.accepts(chain, cfg)
+    # Only the active-GPU gates may refuse -- the family range (sm < 100) or the
+    # block-scale MMA special case (100 <= sm < 120) -- never the wiring itself.
+    assert reason is None or "runs only on" in reason or "exists only on 120 <= SM < 130" in reason, reason
+    # fp4 + e8m0 at block 16 is refused by the MMA-type table ...
+    chain16 = analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=cudnn.data_type.FP8_E8M0))
+    assert "does not support" in mma_arch_reject(chain16, GraphType.BLOCK_SCALE_MATMUL, "sm120")
+    # ... MN-major fp4 by the template class (a 4-bit operand has no transposed ldmatrix) ...
+    chain_m = analyze(_build_nvfp4_graph(256, 256, 512, a_major="m"))
+    assert "must be K-major" in tmpl._extra_reject(chain_m, cfg)
+    # ... and mxfp8 M-major A / N-major B is in scope (the dense b8-transpose path).
+    chain_mn = analyze(
+        _build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3, a_major="m", b_major="n")
+    )
+    assert tmpl._extra_reject(chain_mn, cfg) is None
+
+
+def test_sm120_block_scale_config_rules():
+    """validate_block_scale_config_sm120: the CTA tile is a multiple or a divisor
+    of the 128-row SF block, and the K row is one 128-byte span. Whether the SF
+    boxes leave an AB stage in SMEM is the renderer's call. The dispatcher
+    routes an sm120 config here; the tcgen05 rules would reject every sm120
+    config outright (its warp-MMA tile is 16, never a whole SF block)."""
+    validate_block_scale_config_sm120(by_name(_SM120_BS_128), 16, 256)
+    validate_block_scale_config_sm120(by_name(_SM120_BS_128x64), 32, 128)  # a 64-wide tile sits inside one SF block
+    validate_block_scale_config_sm120(by_name(_SM120_BS_64x128), 16, 256)
+    validate_block_scale_config(by_name(_SM120_BS_128), 16, 256)  # the dispatcher takes the sm120 branch
+    with pytest.raises(NotImplementedError, match="mma_tile_m % 128"):
+        validate_block_scale_config_sm100(by_name(_SM120_BS_128), 16, 256)
+    with pytest.raises(NotImplementedError, match="multiple or a divisor of 128"):
+        validate_block_scale_config_sm120(by_name("CONFIG_sm120_128x192x128_16x16x32_cluster1x1_warps4x2"), 16, 256)
+    with pytest.raises(NotImplementedError, match="multiple or a divisor of 128"):
+        validate_block_scale_config(by_name("CONFIG_sm120_128x192x128_16x16x32_cluster1x1_warps4x2"), 16, 256)
+    with pytest.raises(NotImplementedError, match="cta_tile_k_bytes == 128"):
+        validate_block_scale_config_sm120(by_name("CONFIG_sm120_128x128x64_16x16x32_cluster1x1_warps4x2"), 16, 128)
+    # The funnel applies the same rule (stage 3), so the 192-wide tile is no candidate.
+    chain = analyze(_build_nvfp4_graph(256, 256, 512))
+    assert "divisor of 128" in _sm120_bs_template()._config_reject(chain, by_name("CONFIG_sm120_128x192x128_16x16x32_cluster1x1_warps4x2"))
+
+
+@pytest.mark.parametrize(
+    "combo, kind, vec, fmt, ptx",
+    [
+        ("nvfp4", "MXF4NVF4", "X4", "UE4M3", "e2m1"),
+        ("mxfp4", "MXF4", "X2", "UE8M0", "e2m1"),
+        ("mxfp8", "MXF8F6F4", "X1", "UE8M0", "e4m3"),
+    ],
+)
+def test_sm120_block_scale_tile_constants_render(combo, kind, vec, fmt, ptx):
+    """The sm120 block-scale renderer emits the template's names -- packed K
+    row, SF box, the warp MMA's kind / scale-vec / format -- and nothing of the
+    tcgen05 renderer's world (no TMEM budget, descriptors or utccp schedule)."""
+    is_fp4 = combo != "mxfp8"
+    bs = 16 if combo == "nvfp4" else 32
+    sf_dt = cudnn.data_type.FP8_E4M3 if combo == "nvfp4" else cudnn.data_type.FP8_E8M0
+    a_dt = cudnn.data_type.FP4_E2M1 if is_fp4 else cudnn.data_type.FP8_E4M3
+    chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=bs, sf_dt=sf_dt, a_dt=a_dt))
+    k_elems = 256 if is_fp4 else 128
+    sf_k = k_elems // bs
+    for config_name in (_SM120_BS_128, _SM120_BS_128_W24, _SM120_BS_128x64, _SM120_BS_64x128):
+        cfg = by_name(config_name)
+        nb_m = -(-cfg.cta_tile_m // 128)
+        nb_n = -(-cfg.cta_tile_n // 128)
+        tmpl = select_template(chain, cfg)
+        src = C._render_block_scale_tile_constants(cfg, chain, tmpl)
+        # The dispatcher hands an sm120 template to the sm120 renderer, verbatim.
+        assert src == C._render_block_scale_tile_constants_sm120(cfg, chain, tmpl)
+        assigned = dict(re.findall(r"^(\w+) = (.*)$", src, re.M))
+        assert assigned["mma_block_scale_kind"] == repr(kind)
+        assert assigned["mma_scale_vec_size"] == repr(vec)
+        assert assigned["mma_sf_format"] == repr(fmt)
+        assert assigned["mma_a_ptx_type"] == repr(ptx) and assigned["mma_b_ptx_type"] == repr(ptx)
+        assert assigned["cta_tile_mnk"] == f"({cfg.cta_tile_m}, {cfg.cta_tile_n}, {k_elems})"
+        assert assigned["mma_inst_shape_mnk"] == f"(16, 16, {64 if is_fp4 else 32})"
+        assert assigned["ab_packed_per_row"] == "128"  # one 128-byte swizzle span per K row
+        assert assigned["sA_packed_elems"] == str(cfg.cta_tile_m * 128)
+        assert assigned["sf_scales_per_inst"] == str((64 if is_fp4 else 32) // bs)
+        assert assigned["sf_tma_box_k"] == str(sf_k // 4)
+        assert assigned["sfa_tma_box_mn"] == str(nb_m)
+        assert assigned["sfb_tma_box_mn"] == str(nb_n)
+        # a 64-wide tile still pulls its whole 128-row block
+        assert assigned["sfa_smem_bytes"] == str(128 * nb_m * sf_k)
+        assert assigned["sfb_smem_bytes"] == str(128 * nb_n * sf_k)
+        assert assigned["ab_dtype"] == ("cutlass.Float4E2M1FNx2" if is_fp4 else "cutlass.Float8E4M3FN")
+        assert assigned["ab_tma_desc_dtype"] == ("cutlass.Float4E2M1FN" if is_fp4 else "cutlass.Float8E4M3FN")
+        assert assigned["ab_tma_format"] == ("_tma.TensorMapDataFormat.B4X16" if is_fp4 else "None")
+        assert assigned["mma_c_dtype"] == "cutlass.Float32" and assigned["acc_widen_to_fp32"] == "False"
+        assert int(assigned["ab_stages"]) >= 1
+        for banned in ("acc_stages", "tmem", "utccp", "num_sf_atoms", "sfa_col_bases", "smem_desc", "multicast", "cta_group", "idesc"):
+            assert banned not in src, banned
+    # The ring depth funds the 16.5 KB epilogue staging in BYTES: a 128x128
+    # nvfp4 stage is 36 KB, so two of them plus the staging fit a ~99 KB part
+    # (one stage would, wrongly, be all that surviving whole-stage rounding).
+    # Whether a tile fits at all is the active device's budget, decided by the
+    # renderer (not the funnel).
+    from cudnn.gemm.frost.tile_config import smem_ab_stages
+
+    staging = 4 * 528 * 8
+    cfg128 = by_name(_SM120_BS_128)
+    per_stage_128 = (128 + 128) * 128 + (128 + 128) * sf_k + 16
+    src128 = C._render_block_scale_tile_constants(cfg128, chain, select_template(chain, cfg128))
+    want = smem_ab_stages(per_stage_128, smem_fixed_reserve=2048, extra_smem_bytes=staging)
+    assert int(dict(re.findall(r"^(\w+) = (.*)$", src128, re.M))["ab_stages"]) == want
+    tall = by_name(_SM120_BS_256x128)
+    per_stage = (256 + 128) * 128 + (256 + 128) * sf_k + 16
+    if smem_ab_stages(per_stage, smem_fixed_reserve=2048, extra_smem_bytes=staging) < 1:
+        with pytest.raises(NotImplementedError, match="does not fit"):
+            C._render_block_scale_tile_constants(tall, chain, select_template(chain, tall))
+    else:
+        C._render_block_scale_tile_constants(tall, chain, select_template(chain, tall))
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "combo, config_name, M, N, K",
+    [
+        ("nvfp4", _SM120_BS_128, 256, 256, 512),
+        ("mxfp4", _SM120_BS_128, 256, 256, 512),
+        ("mxfp8", _SM120_BS_128, 256, 256, 512),
+        ("nvfp4", _SM120_BS_128_W24, 512, 384, 1024),  # 2x4 warp grid: 4 m-frags / 2 n-frags per warp
+        ("mxfp8", _SM120_BS_128_W24, 512, 256, 512),
+        ("nvfp4", _SM120_BS_128x64, 384, 320, 768),  # 64-wide tile inside one SF block
+        ("mxfp4", _SM120_BS_128x64, 256, 192, 512),
+        ("nvfp4", _SM120_BS_64x128, 320, 256, 512),  # 64-tall tile inside one SF block
+        ("mxfp8", _SM120_BS_64x128, 192, 256, 384),
+        ("nvfp4", _SM120_BS_128, 200, 136, 1088),  # M/N tails + a K tail (4.25 K-tiles)
+        ("mxfp8", _SM120_BS_128, 256, 200, 320),  # K tail (2.5 K-tiles of 128 fp8)
+    ],
+)
+def test_sm120_block_scale_matmul_numerics(combo, config_name, M, N, K):
+    _run_bs_numeric(combo, config_name, M, N, K)
+
+
+@requires_sm120
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+def test_sm120_block_scale_matmul_m_major_out(combo):
+    _run_bs_numeric(combo, _SM120_BS_128, 256, 256, 512, out_major="m")
+
+
+@requires_sm120
+@pytest.mark.parametrize("config_name", [_SM120_BS_128, _SM120_BS_128_W24])
+def test_sm120_mxfp8_m_major_a_n_major_b(config_name):
+    _run_mxfp8_mn_major_numeric(config_name, 256, 256, 512)
+
+
+@requires_sm120
+def test_sm120_fp4_rejects_non_k_major():
+    """A packed sub-byte operand has no transposed ldmatrix: fp4 must be K-major."""
+    for a_major, b_major in (("m", "k"), ("k", "n")):
+        g = _build_nvfp4_graph(256, 256, 256, a_major=a_major, b_major=b_major)
+        with pytest.raises((ValueError, NotImplementedError), match="must be K-major"):
+            jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
