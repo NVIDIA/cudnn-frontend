@@ -41,7 +41,7 @@ from gemm_test_utils import (
 from cudnn.gemm.frost import compiler as C
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
-from cudnn.gemm.frost.graph_analyzer import analyze
+from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding
 from cudnn.gemm.frost.kernel_registry import GraphType, TEMPLATES, select_template
 from cudnn.gemm.frost.tile_config import (
     CATALOG,
@@ -108,6 +108,32 @@ def _build_nvfp4_graph(
         C.set_stride([M * N, 1, M])
     C.set_output(True).set_data_type(cudnn.data_type.HALF)
     return g
+
+
+def _build_one_sided_block_scale_graph(*, fake_a, raw_dt, scaled_dt, sf_dt, block_size):
+    """Dense GEMM with one real block_scale_dequantize and one raw FP8 side."""
+    M = N = 256
+    K = 512
+    sf_k = K // block_size
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.HALF,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=raw_dt if fake_a else scaled_dt)
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K], data_type=scaled_dt if fake_a else raw_dt)
+    sf_kw = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
+    if fake_a:
+        SF = g.tensor(name="SFB", dim=[1, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=sf_dt, **sf_kw)
+        lhs = A
+        rhs = g.block_scale_dequantize(input=B, descale=SF, block_size=[block_size, 1])
+    else:
+        SF = g.tensor(name="SFA", dim=[1, M, sf_k], stride=[M * sf_k, sf_k, 1], data_type=sf_dt, **sf_kw)
+        lhs = g.block_scale_dequantize(input=A, descale=SF, block_size=[1, block_size])
+        rhs = B
+    C = g.matmul(A=lhs, B=rhs, name="mm")
+    C.set_output(True).set_data_type(cudnn.data_type.HALF)
+    return g, A, B, SF, C
 
 
 def _build_block_scale_reduction_graph(
@@ -288,6 +314,113 @@ def test_block_scale_matmul_gate_accepts_mixed_mxfp8_mxfp4(a_dt, b_dt, monkeypat
     assert assigned64["b_smem_dtype"] == C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[b_dt]]
 
 
+@pytest.mark.parametrize("fake_a", [True, False], ids=["raw_fp8_a", "raw_fp8_b"])
+def test_one_sided_dequant_normalizes_to_existing_block_scale_case(fake_a):
+    g, A, B, SF, C_out = _build_one_sided_block_scale_graph(
+        fake_a=fake_a,
+        raw_dt=_DT_E4M3,
+        scaled_dt=_DT_E5M2,
+        sf_dt=_DT_E8M0,
+        block_size=32,
+    )
+    chain, binding = analyze_with_binding(g)
+    bs = chain.block_scale
+    assert bs is not None
+    assert (bs.fake_dequant_a, bs.fake_dequant_b) == ((True, False) if fake_a else (False, True))
+    assert (bs.block_size_a, bs.block_size_b) == ((1, 32), (32, 1))
+    assert (bs.sf_dtype_a, bs.sf_dtype_b) == ("fp8_e8m0", "fp8_e8m0")
+    assert (bs.sfa_reorder, bs.sfb_reorder) == ("F8_128x4", "F8_128x4")
+    assert binding.a_operands == [A]
+    assert binding.b_operands == [B]
+    assert binding.sfa_operands == ([] if fake_a else [SF])
+    assert binding.sfb_operands == ([SF] if fake_a else [])
+    assert binding.outputs == [C_out]
+    C._check_block_scale_supported(chain, "sm100")
+
+
+def test_one_sided_dequant_does_not_expand_the_registry_cases():
+    # Normalizing raw FP8 x NVFP4 creates a full per-side key, but that key is
+    # intentionally absent from _BLOCK_SCALE_CASES.  The fake mark must not
+    # bypass or broaden the existing support table.
+    g, *_ = _build_one_sided_block_scale_graph(
+        fake_a=True,
+        raw_dt=_DT_E4M3,
+        scaled_dt=_DT_FP4,
+        sf_dt=_DT_E4M3,
+        block_size=16,
+    )
+    chain = analyze(g)
+    assert chain.block_scale.fake_dequant_a
+    with pytest.raises(NotImplementedError, match="does not support this configuration"):
+        C._check_block_scale_supported(chain, "sm100")
+
+
+@requires_sm100
+@pytest.mark.parametrize("fake_a", [True, False], ids=["raw_fp8_a", "raw_fp8_b"])
+@pytest.mark.parametrize("scaled_kind", ["mxfp8", "mxfp4"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
+        pytest.param(
+            "CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma",
+            marks=requires_sm107,
+        ),
+        pytest.param(
+            "CONFIG_sm100_128x128x128_128x128x64_cluster2x1_2ctamma",
+            marks=requires_sm107,
+        ),
+    ],
+)
+def test_one_sided_dequant_e2e(fake_a, scaled_kind, config_name):
+    """The fake side consumes a persistent TMEM unity scale and no SF buffer."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    M = N = 256
+    K = 512
+    block_size = 32
+    raw_dt = cudnn.data_type.FP8_E4M3
+    scaled_dt = cudnn.data_type.FP8_E5M2 if scaled_kind == "mxfp8" else cudnn.data_type.FP4_E2M1
+    g, A, B, SF, C_out = _build_one_sided_block_scale_graph(
+        fake_a=fake_a,
+        raw_dt=raw_dt,
+        scaled_dt=scaled_dt,
+        sf_dt=cudnn.data_type.FP8_E8M0,
+        block_size=block_size,
+    )
+    compiled = _plan(g, config=by_name(config_name))
+    raw_a = (torch.randn(1, M, K, device=dev) * 0.25).to(torch.float8_e4m3fn)
+    raw_b = (torch.randn(1, N, K, device=dev) * 0.25).to(torch.float8_e4m3fn)
+    if scaled_kind == "mxfp8":
+        scaled_a = (torch.randn(1, M, K, device=dev) * 0.25).to(torch.float8_e5m2)
+        scaled_b = (torch.randn(1, N, K, device=dev) * 0.25).to(torch.float8_e5m2)
+        scaled_a_ref = scaled_a.float().view(M, K)
+        scaled_b_ref = scaled_b.float().view(N, K)
+    else:
+        lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+        scaled_a_u8 = torch.randint(0, 256, (1, M, K // 2), dtype=torch.uint8, device=dev)
+        scaled_b_u8 = torch.randint(0, 256, (1, N, K // 2), dtype=torch.uint8, device=dev)
+        scaled_a = scaled_a_u8.view(torch.float4_e2m1fn_x2)
+        scaled_b = scaled_b_u8.view(torch.float4_e2m1fn_x2)
+        scaled_a_ref = _unpack_fp4(scaled_a_u8, lut).view(M, K)
+        scaled_b_ref = _unpack_fp4(scaled_b_u8, lut).view(N, K)
+    a, b = (raw_a, scaled_b) if fake_a else (scaled_a, raw_b)
+    sf_log = _rand_e8m0((N if fake_a else M, K // block_size), dev)
+    sf = _to_blocked(sf_log).view(1, N if fake_a else M, K // block_size)
+    out = torch.empty(1, M, N, dtype=torch.float16, device=dev)
+    compiled({A: a, B: b, SF: sf, C_out: out})
+    torch.cuda.synchronize()
+
+    a_ref = raw_a.float().view(M, K) if fake_a else scaled_a_ref
+    b_ref = scaled_b_ref if fake_a else raw_b.float().view(N, K)
+    if fake_a:
+        b_ref = b_ref * sf_log.float().repeat_interleave(block_size, 1)
+    else:
+        a_ref = a_ref * sf_log.float().repeat_interleave(block_size, 1)
+    torch.testing.assert_close(out.float().view(M, N), a_ref @ b_ref.T, rtol=2e-2, atol=2e-1)
+
+
 def test_block_scale_matmul_gate_rejects_mismatches():
     from cudnn.gemm.frost.compiler import _check_block_scale_supported
 
@@ -297,7 +430,7 @@ def test_block_scale_matmul_gate_rejects_mismatches():
     # FP8 data at block 16 — the fp8 rows are block-32 only, on every pipeline.
     with pytest.raises(NotImplementedError, match="does not support"):
         _check_block_scale_supported(analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=_DT_E8M0, a_dt=_DT_E4M3)), "sm100")
-    # Mixed width with a non-E8 scale has no UTCQMMA encoding.
+    # Mixed width with a non-E8 scale has no mixed block-scale MMA encoding.
     with pytest.raises(NotImplementedError, match="does not support"):
         _check_block_scale_supported(
             analyze(
@@ -1480,7 +1613,7 @@ def test_mma_gpu_arch_special_cases(monkeypatch):
     for ok_sm in (100, 110):
         monkeypatch.setattr(C, "_current_arch", lambda v=ok_sm: v)
         assert kr.mma_arch_reject(int8_chain, kr.GraphType.MATMUL, "sm100") is None
-    # Mixed MXFP8/MXFP4 is a baseline SM100 UTCQMMA encoding (K32); Rubin adds
+    # Mixed MXFP8/MXFP4 is a baseline SM100 block-scale MMA encoding (K32); Rubin adds
     # a K64 form, but the MMA type itself needs no narrow arch exception.
     mixed_chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E8M0, a_dt=_DT_FP4, b_dt=_DT_E4M3))
     monkeypatch.setattr(C, "_current_arch", lambda: 100)
@@ -1902,7 +2035,7 @@ def test_sm107_block_scale_matmul_numerics(combo, config_name, cta_group):
     ],
 )
 def test_mixed_mxfp8_mxfp4_numerics(fp8_on_a, fp8_torch_dt, fp8_cudnn_dt, fp8_mn_major, config_name):
-    """K32 padded and Rubin K64 native-packed UTCQMMA, both operand orders."""
+    """K32 padded and Rubin K64 native-packed mixed block-scale MMA, both operand orders."""
     dev = "cuda"
     torch.manual_seed(0)
     M = N = 256
@@ -2560,6 +2693,7 @@ def test_sm120_block_scale_registry_wiring():
     # Only the active-GPU gates may refuse -- the family range (sm < 100) or the
     # block-scale MMA special case (100 <= sm < 120) -- never the wiring itself.
     assert reason is None or "runs only on" in reason or "exists only on 120 <= SM < 130" in reason, reason
+
     # fp4 + e8m0 at block 16 is refused by the MMA-type table ...
     chain16 = analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=cudnn.data_type.FP8_E8M0))
     assert "does not support" in mma_arch_reject(chain16, GraphType.BLOCK_SCALE_MATMUL, "sm120")
@@ -2571,6 +2705,37 @@ def test_sm120_block_scale_registry_wiring():
         _build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3, a_major="m", b_major="n")
     )
     assert tmpl._extra_reject(chain_mn, cfg) is None
+
+
+@pytest.mark.parametrize("fake_a", [True, False], ids=["raw-a", "raw-b"])
+def test_sm120_rejects_one_sided_mxfp8_without_identity_scale(fake_a):
+    """The normalized MMA key stays generic, but sm120 cannot yet materialize
+    the fake side's all-one scale factors required by a one-sided graph."""
+    from cudnn.gemm.frost.kernel_registry import mma_arch_reject
+
+    g, *_ = _build_one_sided_block_scale_graph(
+        fake_a=fake_a,
+        raw_dt=cudnn.data_type.FP8_E4M3,
+        scaled_dt=cudnn.data_type.FP8_E5M2,
+        sf_dt=cudnn.data_type.FP8_E8M0,
+        block_size=32,
+    )
+    chain = analyze(g)
+
+    # This is still an existing block-scale MMA combination.  sm100 supports
+    # the renderer-level fake-dequant path; sm120 must fail before it indexes a
+    # missing scale-factor descriptor.
+    assert mma_arch_reject(chain, GraphType.BLOCK_SCALE_MATMUL, "sm100") is None
+    reason = mma_arch_reject(chain, GraphType.BLOCK_SCALE_MATMUL, "sm120")
+    assert reason is not None
+    assert "one-sided dequantization" in reason
+    assert "identity handling is not implemented" in reason
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(C, "_current_arch", lambda: 120)
+        assert _sm120_bs_template().accepts(chain, by_name(_SM120_BS_128)) == reason
+        with pytest.raises(NotImplementedError, match="one-sided dequantization"):
+            jit_from_cudnn_graph(g, config=by_name(_SM120_BS_128))
 
 
 def test_sm120_block_scale_config_rules():

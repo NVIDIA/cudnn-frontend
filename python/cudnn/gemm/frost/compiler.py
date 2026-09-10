@@ -1761,7 +1761,7 @@ def _render_block_scale_tile_constants_sm100(
     mma_k64 = cfg.mma_tile_k_bytes == 64
     if is_sm103 and not both_fp4:
         raise NotImplementedError("the sm103 block-scale pipeline is fp4-only; " f"{bs.a_dtype} data with {bs.sf_dtype} scales runs the sm100 templates")
-    # Baseline SM100 mixed UTCQMMA uses K32 and the padded E2M1 SMEM format
+    # Baseline SM100 mixed block-scale MMA uses K32 and the padded E2M1 SMEM format
     # (16 FP4 lanes in 8 payload bytes + 8 padding bytes). Rubin's K64 form
     # consumes native packed FP4 instead.
     padded_fp4 = mixed_width and not mma_k64
@@ -1770,7 +1770,7 @@ def _render_block_scale_tile_constants_sm100(
     b_data_elem_bits = DTYPE_BITS[bs.b_dtype]
     a_smem_elem_bits = 8 if padded_fp4 and a_data_elem_bits == 4 else a_data_elem_bits
     b_smem_elem_bits = 8 if padded_fp4 and b_data_elem_bits == 4 else b_data_elem_bits
-    # K_BYTES names the byte width of the widest operand.  In a mixed UTCQMMA
+    # K_BYTES names the byte width of the widest operand.  In a mixed-width MMA
     # both sides span the same logical K, while the native packed FP4 SMEM row
     # occupies half the bytes of its FP8 peer.
     data_elem_bits = max(a_data_elem_bits, b_data_elem_bits)
@@ -1911,6 +1911,8 @@ def _render_block_scale_tile_constants_sm100(
     epi_cols_per_mma_m = _epi_tile_cols(cfg)
     acc_cols_per_stage = mma_size_m * epi_cols_per_mma_m
     na, nb = chain.num_a_operands, chain.num_b_operands
+    real_na = 0 if bs.fake_dequant_a else na
+    real_nb = 0 if bs.fake_dequant_b else nb
     sf_total_cols = na * sfa_tmem_cols + nb * sfb_tmem_cols
     # Columns each instruction reads from its scale base -- ISA opUTCHMMA,
     # "Load A/B scale factors" (sf{a,b}_tmem_cols).
@@ -2012,7 +2014,7 @@ def _render_block_scale_tile_constants_sm100(
             )
     else:
         # One stage covers a whole K-tile: packed data + SF per DISTINCT operand.
-        per_stage = na * (cta_m * a_cta_k_bytes + sfa_smem_bytes) + nb * ((cta_n // cta_group) * b_cta_k_bytes + sfb_smem_bytes)
+        per_stage = na * cta_m * a_cta_k_bytes + nb * (cta_n // cta_group) * b_cta_k_bytes + real_na * sfa_smem_bytes + real_nb * sfb_smem_bytes
         ab_stages = max(1, smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=ab_reserved))
 
     out_dt = chain.output_dtype
@@ -2082,6 +2084,10 @@ def _render_block_scale_tile_constants_sm100(
         f"num_gemms = {num_gemms}",
         f"num_a_operands = {na}",
         f"num_b_operands = {nb}",
+        f"num_sfa_operands = {real_na}",
+        f"num_sfb_operands = {real_nb}",
+        f"fake_dequant_a = {bs.fake_dequant_a}",
+        f"fake_dequant_b = {bs.fake_dequant_b}",
         f"gemm_a_idx = {tuple(a for a, _ in chain.gemm_operands)}",
         f"gemm_b_idx = {tuple(b for _, b in chain.gemm_operands)}",
         f"acc_region_cols = {acc_region_cols}",
@@ -2090,6 +2096,8 @@ def _render_block_scale_tile_constants_sm100(
         f"acc_gemm_stride = {acc_gemm_stride}",
         f"sfa_col_bases = {tuple(sfa_col_bases)}",
         f"sfb_col_bases = {tuple(sfb_col_bases)}",
+        f"sfa_tmem_cols = {sfa_tmem_cols}",
+        f"sfb_tmem_cols = {sfb_tmem_cols}",
         # Mixed CGA pins the walk to the identity map: the super-block
         # rasterization is not invariant across the two cluster shapes.
         f"tile_swizzle_n = {1 if fallback_cluster is not None else 0}",
@@ -2173,6 +2181,10 @@ def _render_block_scale_tile_constants_sm100(
         f"idesc_a_dtype = {idesc_a}",
         f"idesc_b_dtype = {idesc_b}",
         f"sf_scale_format = {bs.sf_scale_format}",
+        # Four packed copies of the scale format's identity byte. E4M3 uses
+        # bias 7 (0x38), E8M0 bias 127 (0x7f), and unsigned E5M3 bias 15
+        # (0x78).  The MMA consumes these as opaque scale bytes from TMEM.
+        f"sf_one_word = { {'fp8_e4m3': 0x38383838, 'fp8_e8m0': 0x7F7F7F7F, 'fp8_e5m3': 0x78787878}[bs.sf_dtype] }",
         # The idesc M/N are the INSTRUCTION's, not the CTA tile's. They agreed while
         # one instruction covered the tile; with mma_size_m > 1 a CTA-tile M of 256 would
         # encode the M=256 enum on a 1-CTA MMA, which does not exist -> illegal instruction.
@@ -2585,58 +2597,62 @@ def _render_block_scale_template(
     # with its data). GROUPED BY KIND — all A, all B, all SFA, all SFB — so
     # single-GEMM (na=nb=1) is exactly (a, b, sfa, sfb), the legacy call order.
     na, nb = chain.num_a_operands, chain.num_b_operands
+    bs = chain.block_scale
+    assert bs is not None
+    nsa = 0 if bs.fake_dequant_a else na
+    nsb = 0 if bs.fake_dequant_b else nb
     _G = "cutlass.GridConstant[_tma.TensorMap]"
     kernel_ab_desc_params = (
         ",\n".join(
             [f"tma_a_desc_{i}: {_G}" for i in range(na)]
             + [f"tma_b_desc_{j}: {_G}" for j in range(nb)]
-            + [f"tma_sfa_desc_{i}: {_G}" for i in range(na)]
-            + [f"tma_sfb_desc_{j}: {_G}" for j in range(nb)]
+            + [f"tma_sfa_desc_{i}: {_G}" for i in range(nsa)]
+            + [f"tma_sfb_desc_{j}: {_G}" for j in range(nsb)]
         )
         + ","
     )
     ab_desc_lists = (
         "tma_a_descs = [" + ", ".join(f"tma_a_desc_{i}" for i in range(na)) + "]\n"
         "tma_b_descs = [" + ", ".join(f"tma_b_desc_{j}" for j in range(nb)) + "]\n"
-        "tma_sfa_descs = [" + ", ".join(f"tma_sfa_desc_{i}" for i in range(na)) + "]\n"
-        "tma_sfb_descs = [" + ", ".join(f"tma_sfb_desc_{j}" for j in range(nb)) + "]"
+        "tma_sfa_descs = [" + ", ".join(f"tma_sfa_desc_{i}" for i in range(nsa)) + "]\n"
+        "tma_sfb_descs = [" + ", ".join(f"tma_sfb_desc_{j}" for j in range(nsb)) + "]"
     )
     host_ab_params = (
         ",\n".join(
             [f"a_{i}: cute.Tensor" for i in range(na)]
             + [f"b_{j}: cute.Tensor" for j in range(nb)]
-            + [f"sfa_{i}: cute.Tensor" for i in range(na)]
-            + [f"sfb_{j}: cute.Tensor" for j in range(nb)]
+            + [f"sfa_{i}: cute.Tensor" for i in range(nsa)]
+            + [f"sfb_{j}: cute.Tensor" for j in range(nsb)]
         )
         + ","
     )
     host_ab_lists = (
         "_a_operands = [" + ", ".join(f"a_{i}" for i in range(na)) + "]\n"
         "_b_operands = [" + ", ".join(f"b_{j}" for j in range(nb)) + "]\n"
-        "_sfa_operands = [" + ", ".join(f"sfa_{i}" for i in range(na)) + "]\n"
-        "_sfb_operands = [" + ", ".join(f"sfb_{j}" for j in range(nb)) + "]"
+        "_sfa_operands = [" + ", ".join(f"sfa_{i}" for i in range(nsa)) + "]\n"
+        "_sfb_operands = [" + ", ".join(f"sfb_{j}" for j in range(nsb)) + "]"
     )
     host_kernel_desc_pass = (
         ",\n".join(
             [f"tma_a_desc_list[{i}]" for i in range(na)]
             + [f"tma_b_desc_list[{j}]" for j in range(nb)]
-            + [f"tma_sfa_desc_list[{i}]" for i in range(na)]
-            + [f"tma_sfb_desc_list[{j}]" for j in range(nb)]
+            + [f"tma_sfa_desc_list[{i}]" for i in range(nsa)]
+            + [f"tma_sfb_desc_list[{j}]" for j in range(nsb)]
         )
         + ","
     )
     compile_ab_fakes = "\n".join(
         [f"fake_a_{i} = _make_fake_a()" for i in range(na)]
         + [f"fake_b_{j} = _make_fake_b()" for j in range(nb)]
-        + [f"fake_sfa_{i} = _make_fake_sfa()" for i in range(na)]
-        + [f"fake_sfb_{j} = _make_fake_sfb()" for j in range(nb)]
+        + [f"fake_sfa_{i} = _make_fake_sfa()" for i in range(nsa)]
+        + [f"fake_sfb_{j} = _make_fake_sfb()" for j in range(nsb)]
     )
     compile_ab_pass = (
         ",\n".join(
             [f"fake_a_{i}" for i in range(na)]
             + [f"fake_b_{j}" for j in range(nb)]
-            + [f"fake_sfa_{i}" for i in range(na)]
-            + [f"fake_sfb_{j}" for j in range(nb)]
+            + [f"fake_sfa_{i}" for i in range(nsa)]
+            + [f"fake_sfb_{j}" for j in range(nsb)]
         )
         + ","
     )
@@ -2650,11 +2666,11 @@ def _render_block_scale_template(
     moe_host_ma_pass = ",\n".join([f"a_{i}" for i in range(na)] + [f"_a_stride_sets[{i}][0]" for i in range(na)])
     if moe_host_ma_pass:
         moe_host_ma_pass += ","
-    moe_kernel_msfa_params = ",\n".join(f"mSFA_{i}: cute.Tensor" for i in range(na))
+    moe_kernel_msfa_params = ",\n".join(f"mSFA_{i}: cute.Tensor" for i in range(nsa))
     if moe_kernel_msfa_params:
         moe_kernel_msfa_params += ","
-    moe_msfa_list = "mSFA_list = [" + ", ".join(f"mSFA_{i}" for i in range(na)) + "]"
-    moe_host_msfa_pass = ",\n".join(f"_sfa_operands[{i}]" for i in range(na))
+    moe_msfa_list = "mSFA_list = [" + ", ".join(f"mSFA_{i}" for i in range(nsa)) + "]"
+    moe_host_msfa_pass = ",\n".join(f"_sfa_operands[{i}]" for i in range(nsa))
     if moe_host_msfa_pass:
         moe_host_msfa_pass += ","
 
@@ -4911,14 +4927,16 @@ class CompiledMoeBlockScaleGemm:
 
     @property
     def workspace_bytes(self) -> int:
-        """Per-CTA A-descriptor scratch: one 128-byte tensormap slot per CTA per
-        distinct A operand. The persistent grid is shape-independent, so this is
-        constant for the plan — which is why override-shape needs no re-query."""
+        """Per-CTA scratch for dynamic A, real-SFA, and output tensormaps.
+
+        A fake SFA needs no slot. The persistent grid is shape-independent, so
+        this is constant for the plan and override-shape needs no re-query.
+        """
         return (self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS) * _MOE_DESC_SLOT_BYTES
 
     def _make_workspace(self, n_slots, caller=None):
-        """The per-CTA A-descriptor GMEM workspace (16 int64/slot, 128-byte
-        aligned). ``n_slots`` = grid_ctas * num_a_operands. Carved from the
+        """The per-CTA dynamic-descriptor workspace (16 int64/slot, 128-byte
+        aligned). ``n_slots`` covers every dynamic descriptor. Carved from the
         CALLER's buffer when execute() supplied one; otherwise from one this plan
         owns (the direct jit_from_cudnn_graph path passes no workspace)."""
         if caller is None:
@@ -4949,13 +4967,16 @@ class CompiledMoeBlockScaleGemm:
                 f"({[o.source for o in outputs_spec]}); got {len(outputs)}. "
                 "Pass outputs in slot order."
             )
-        for name, t, rank in (
+        ranked_inputs = [
             ("token", token, 3),
             ("weight", weight, 3),
-            ("sfa", sfa, 3),
-            ("sfb", sfb, 3),
             ("first_token_offset", first_token_offset, 1),
-        ):
+        ]
+        if sfa is not None:
+            ranked_inputs.append(("sfa", sfa, 3))
+        if sfb is not None:
+            ranked_inputs.append(("sfb", sfb, 3))
+        for name, t, rank in ranked_inputs:
             if len(t.shape) != rank:
                 raise ValueError(f"MoE block-scale {name} must be rank-{rank}; " f"got shape {tuple(t.shape)}")
         for spec, t in zip(outputs_spec, outputs):
@@ -5009,8 +5030,11 @@ class CompiledMoeBlockScaleGemm:
             (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
             for spec, ci in zip(outputs_spec, c_perms)
         ]
-        msfa = _maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX)
-        msfb = _maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX)
+        sf_args = []
+        if sfa is not None:
+            sf_args.append(_maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX))
+        if sfb is not None:
+            sf_args.append(_maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX))
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
         _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
@@ -5019,8 +5043,7 @@ class CompiledMoeBlockScaleGemm:
             workspace,
             a,
             b,
-            msfa,
-            msfb,
+            *sf_args,
             *_moe_launch_tail(cs, tma_slots=self.tma_slots),
             stream=_as_custream(stream),
         )
@@ -5051,12 +5074,30 @@ class CompiledMoeBlockScaleGemm:
             if _r_sf is not None:
                 raise ValueError(_r_sf)
         out = out_bufs if len(out_bufs) > 1 else out_bufs[0]
+        fake_a = self.chain.block_scale.fake_dequant_a
+        fake_b = self.chain.block_scale.fake_dequant_b
         if self.chain.is_multi_gemm or self.chain.ops:
-            pairs = [((a_bufs[ai], sfa[ai]), (b_bufs[bi], sfb[bi])) for ai, bi in self.chain.gemm_operands]
+            pairs = [
+                (
+                    (a_bufs[ai], None if fake_a else sfa[ai]),
+                    (b_bufs[bi], None if fake_b else sfb[bi]),
+                )
+                for ai, bi in self.chain.gemm_operands
+            ]
             r = self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream)
             _finalize_reductions(self.chain, out_bufs)
             return r
-        return self._launch_single(a_bufs[0], b_bufs[0], sfa[0], sfb[0], fto, out, snk, workspace=workspace, stream=stream)
+        return self._launch_single(
+            a_bufs[0],
+            b_bufs[0],
+            None if fake_a else sfa[0],
+            None if fake_b else sfb[0],
+            fto,
+            out,
+            snk,
+            workspace=workspace,
+            stream=stream,
+        )
 
     def _call_multi_gemm(self, gemm_pairs, first_token_offset, output, snke, *aux, workspace=None, stream=None):
         """Multi-GEMM MoE block-scale call:
@@ -5145,8 +5186,8 @@ class CompiledMoeBlockScaleGemm:
         # Grouped by kind (all A, all B, all SFA, all SFB); single-GEMM → a,b,sfa,sfb.
         a_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_A) for (t, _sf) in a_slots]
         b_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_B) for (t, _sf) in b_slots]
-        sfa_wrapped = [_maybe_wrap_layout(sf.permute(1, 2, 0), _LEADING_DIM_AUX) for (_t, sf) in a_slots]
-        sfb_wrapped = [_maybe_wrap_layout(sf.permute(1, 2, 0), _LEADING_DIM_AUX) for (_t, sf) in b_slots]
+        sfa_wrapped = [_maybe_wrap_layout(sf.permute(1, 2, 0), _LEADING_DIM_AUX) for (_t, sf) in a_slots if sf is not None]
+        sfb_wrapped = [_maybe_wrap_layout(sf.permute(1, 2, 0), _LEADING_DIM_AUX) for (_t, sf) in b_slots if sf is not None]
         cs = [
             (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
             for spec, ci in zip(outputs_spec, c_perms)
@@ -5213,7 +5254,9 @@ def _jit_moe_block_scale(
         _grid_ctas=grid_ctas,
         binding=binding,
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
-        _desc_slots_per_cta=chain.num_a_operands * 2 + len([m for m in store_modes if m == "tma"]),
+        _desc_slots_per_cta=chain.num_a_operands
+        + (0 if chain.block_scale.fake_dequant_a else chain.num_a_operands)
+        + len([m for m in store_modes if m == "tma"]),
         store_modes=store_modes,
         use_tma_store=use_tma,
     )

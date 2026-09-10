@@ -492,16 +492,16 @@ class BlockScaleSpec:
     (FP4/FP8) A/B each dequantized by a per-block K scale inside the MMA
     (``tcgen05.mma.kind::mx*.block_scale``).
 
-    Detected by a purely STRUCTURAL match in the analyzer: if A and/or B is the
-    output of a ``block_scale_dequantize`` node, dequant(s) + matmul fold into
-    one block-scale matmul (three shapes: dequant(A)@B, A@dequant(B),
-    dequant(A)@dequant(B); ``sfa``/``sfb`` present only for the scaled side(s)).
-    No dtype/block/arch rules here — runnability is decided at compile time.
-    Currently runs (both sides): fp4 with any of e4m3 / e8m0 / e5m3 scales at
+    Detected by a purely STRUCTURAL match in the analyzer.  Two real dequants
+    fold directly.  If exactly one side is dequantized and its peer is raw FP8,
+    the peer is normalized to a logical dequant whose scale is one; only the
+    real side has a runtime SF tensor.  No dtype/block/arch rules live here —
+    runnability is decided at compile time from the same normalized MMA key in
+    both cases.  Currently runs: fp4 with any of e4m3 / e8m0 / e5m3 scales at
     either K-block (16 or 32) — the two axes are orthogonal, so nvfp4 and mxfp4
     are just the two best-known corners — plus fp8 (e4m3/e5m2) with e8m0 scales
     at block 32. Mixed mxfp8/mxfp4 is supported in either operand order (shared
-    e8m0 scale format, block 32): SM100 uses the K32 UTCQMMA padded-E2M1 layout,
+    e8m0 scale format, block 32): SM100 uses the K32 padded-E2M1 layout,
     while Rubin additionally provides a native-packed K64 form. E5M3 scales
     require SM 10.7+.
 
@@ -511,9 +511,10 @@ class BlockScaleSpec:
 
     a_dtype: Dtype  # packed data dtype of A (mirror of matmul.a_dtype)
     b_dtype: Dtype  # packed data dtype of B
-    # Per-side scale info, kept SEPARATE for future asymmetric block-scale. A
-    # non-dequantized side has all None fields. `block_size_*` is 2D (A=[non_K,
-    # K], B=[K, non_K]); only 1D K-scaling used today (2D form is headroom).
+    # Per-side scale info, kept SEPARATE for asymmetric block-scale.  An
+    # unnormalized non-dequantized side has all None fields; a fake side has
+    # logical scale metadata plus its fake_dequant mark. `block_size_*` is 2D
+    # (A=[non_K, K], B=[K, non_K]); only 1D K-scaling is used today.
     block_size_a: "tuple[int, ...] | None" = None
     block_size_b: "tuple[int, ...] | None" = None
     sf_dtype_a: "Dtype | None" = None  # A's scale-factor dtype (None if A not scaled)
@@ -528,6 +529,14 @@ class BlockScaleSpec:
     dequant_compute_b: "Dtype | None" = None
     dequant_out_a: "Dtype | None" = None  # = MMA input type for A
     dequant_out_b: "Dtype | None" = None  # = MMA input type for B
+    # A raw FP8 operand opposite one real block-scale dequant is represented as
+    # a logical dequant by a scale of one.  These marks are deliberately NOT
+    # part of the registry's MMA-type key: capability is decided from the
+    # normalized fields above, exactly like a graph with two real dequants.
+    # Codegen uses them only to elide the runtime SF tensor / TMA / SMEM path
+    # and seed that side's still-reserved TMEM scale region with packed 1.0.
+    fake_dequant_a: bool = False
+    fake_dequant_b: bool = False
     # matmul-level dtypes (accum/output/tap) are NOT duplicated here — read
     # chain.matmul / chain.output_dtype. Only input-side info lives here.
 
@@ -539,8 +548,11 @@ class BlockScaleSpec:
 
     @property
     def both_sided(self) -> bool:
-        """True iff BOTH operands were dequantized (a side is dequantized iff
-        its scale-factor dtype is set) — the runnable case today."""
+        """True iff both operands have logical scale metadata.
+
+        Either side may be a fake dequant backed by a constant-one TMEM scale
+        region instead of a runtime scale-factor tensor.
+        """
         return self.sf_dtype_a is not None and self.sf_dtype_b is not None
 
     # Convenience scalars for the symmetric both-sided path (only valid when the
@@ -577,7 +589,7 @@ class BlockScaleSpec:
     @property
     def mma_block_scale_kind(self) -> str:
         """GEMM ``nvvm.MMABlockScaleKind`` member name."""
-        # Rubin's mixed FP8/FP4 instruction is a UTCQMMA (MXF8F6F4), whose
+        # Rubin's mixed FP8/FP4 instruction is MXF8F6F4, whose
         # per-side format fields independently encode FP8 or E2M1.  MXF4NVF4
         # is the UTCOMMA path and requires FP4 on both sides.
         return "MXF4NVF4" if self.both_fp4 else "MXF8F6F4"
