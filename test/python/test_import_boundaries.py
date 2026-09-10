@@ -93,6 +93,24 @@ def test_importing_nvfp4_qat_package_pulls_no_framework():
     assert "triton" not in imported, f"{stage} imported triton; it must not"
 
 
+def test_nvfp4_qat_missing_framework_retains_specific_install_hint():
+    """Preserve the QAT Triton extra hint alongside develop's named errors."""
+    probe = """
+import sys
+sys.modules["torch"] = None
+import cudnn
+try:
+    cudnn.Nvfp4AttentionQatBackward
+except ImportError as error:
+    assert "torch" in str(error), str(error)
+    assert "nvidia-cudnn-frontend[cutedsl,triton]" in str(error), str(error)
+else:
+    raise AssertionError("QAT API unexpectedly imported without torch")
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
 @pytest.mark.L0
 def test_ops_symbol_reports_install_hint_without_torch():
     probe = """

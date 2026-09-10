@@ -29,7 +29,12 @@ dV = fake_nvfp4(P)^T @ dO
   straight-through estimator (STE).
 - dV uses the NVFP4 fake-quantized probability.
 
-The implementation uses split Triton dQ and dK/dV kernels. The production
+The implementation launches four kernels: fused Q fake-quantization/delta
+preprocessing, K/V fake-quantization, dQ, and dK/dV. Causal backward skips
+fully masked tiles while retaining the elementwise mask on the diagonal.
+The local-scale conversion uses precise division so exact E2M1 midpoints
+preserve round-to-nearest-even; no tolerance relaxation is required.
+The production
 non-causal SM100 configuration uses 64 by 64 tiles; other supported Blackwell
 configurations use 32 by 32 tiles.
 
