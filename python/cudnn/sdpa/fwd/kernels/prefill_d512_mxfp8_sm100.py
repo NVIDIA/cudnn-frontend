@@ -58,7 +58,6 @@ from cudnn.frost.tile_dsl.barrier import (
 )
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
-    read_tile_id_arrive,
     SCHED_NATURAL,
 )
 from cudnn.frost.tile_dsl.pointwise import (
@@ -772,7 +771,8 @@ def _kernel(
     # split-P Q/K scale factors use a separate high-half transition from WG1.
     mb_sf_reuse = cutlass.Array(cutlass.Int64, 2, alignment=16, space=cutlass.AddressSpace.smem)
     mb_qk_sf_reuse = cutlass.Array(cutlass.Int64, 2, alignment=16, space=cutlass.AddressSpace.smem)
-    READ_TILE_ARRIVERS_TOTAL = CFG.READ_TILE_ARRIVERS
+    # Every payload reader releases its own shared-memory reads.
+    READ_TILE_ARRIVERS_TOTAL = CFG.READ_TILE_ARRIVERS * 32
 
     if warp_idx == 0:
         if nvvm.elect_sync():
@@ -1174,7 +1174,7 @@ def _tmaldg_warp_group(
     n_kh = n_qh // qh_per_kh
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        nvvm.mbarrier_arrive(sched.mb_read_tile_id.subview(sched_state.idx))
         q_sf_tile_base = q_row_base // cutlass.Int32(CFG.TILE_M)
 
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
@@ -1475,7 +1475,7 @@ def _tmastg_warp_group(
     sched_state = PipelineState.start()
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        nvvm.mbarrier_arrive(sched.mb_read_tile_id.subview(sched_state.idx))
 
         bars.mb_tmastg_go.wait(tmastg_go_phase)
         tmastg_go_phase = tmastg_go_phase ^ cutlass.Int32(1)
@@ -1726,7 +1726,7 @@ def _mma_warp_group(
     sched_state = PipelineState.start()
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        nvvm.mbarrier_arrive(sched.mb_read_tile_id.subview(sched_state.idx))
 
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
             bars.mb_empty_mainloop.wait(empty_mainloop_phase)
@@ -2107,7 +2107,7 @@ def _softmax_warp_group(
     tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base * 32)
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        nvvm.mbarrier_arrive(sched.mb_read_tile_id.subview(sched_state.idx))
 
         total_max = NEG_INF
         total_max_safe = NEG_INF
@@ -2243,6 +2243,9 @@ def _softmax_warp_group(
                     softmax_half=softmax_half,
                 )
                 new_p_sum_pair = row_reduction_pair(chunk_P_a)
+                if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
                 nvvm.tcgen05_st(
                     "32x32b",
                     nvvm.make_tmem_ptr(
@@ -2271,7 +2274,7 @@ def _softmax_warp_group(
                 alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
                 total_sum = total_sum * alpha_pair + new_p_sum_pair
 
-                if cutlass.const_expr(softmax_half == 0):
+                if cutlass.const_expr(softmax_half == 0 and not CFG.FUSED_CORR_SPLIT_P):
                     bars.mb_stat_empty.wait(stat_empty_phase)
                     stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
         else:
@@ -2384,6 +2387,9 @@ def _softmax_warp_group(
                     chunk_P_0a = _exp2_chunk0a_mixed(reg_S[0:P_SUBCHUNK].vec, True)
                     hoisted_sum = row_reduction_pair(chunk_P_0a)
                     chunk_P_0a_storage = chunk_P_0a.to(STORAGE_DTYPE)
+                if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a_storage)
                 chunk_P_0b_storage = zero_p_storage
                 if cutlass.const_expr(not _SWA_DENSE_EXACT_MASK) or swa_row_quadrant <= cutlass.Int32(1):
@@ -2426,8 +2432,9 @@ def _softmax_warp_group(
                     new_p_sum_pair = new_p_sum_pair + deferred_sum_1
                 alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
                 total_sum = total_sum * alpha_pair + new_p_sum_pair
-                bars.mb_stat_empty.wait(stat_empty_phase)
-                stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
+                if cutlass.const_expr(not CFG.FUSED_CORR_SPLIT_P):
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
             for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
                 parity_rt = kv_loop & cutlass.Int32(1)
                 parity_is_even = parity_rt == cutlass.Int32(0)
@@ -2490,6 +2497,10 @@ def _softmax_warp_group(
                 chunk_P_0a = _exp2_chunk0a_mixed(reg_S[0:P_SUBCHUNK].vec, False)
                 if cutlass.const_expr(not _E5_STYLE_SOFTMAX):
                     hoisted_sum = row_reduction_pair(chunk_P_0a)
+                if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
+                    # WG1 reads the overlapping score columns before these stats.
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
                 if cutlass.const_expr(_E5_STYLE_SOFTMAX):
                     hoisted_sum = row_reduction_pair(chunk_P_0a)
@@ -2536,8 +2547,9 @@ def _softmax_warp_group(
                     new_p_sum_pair = new_p_sum_pair + deferred_sum_1
                 alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
                 total_sum = total_sum * alpha_pair + new_p_sum_pair
-                bars.mb_stat_empty.wait(stat_empty_phase)
-                stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
+                if cutlass.const_expr(not CFG.FUSED_CORR_SPLIT_P):
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
                 tail_active = True
                 if tail_active:
@@ -2649,6 +2661,9 @@ def _softmax_warp_group(
                     )
                     chunk_P_0a = _exp2_chunk0a_mixed(reg_S[0:P_SUBCHUNK].vec, True)
                     hoisted_sum = row_reduction_pair(chunk_P_0a)
+                    if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
+                        bars.mb_stat_empty.wait(stat_empty_phase)
+                        stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
                     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
                     chunk_P_0b_storage = zero_p_storage
                     if cutlass.const_expr(not _SWA_DENSE_EXACT_MASK) or swa_row_quadrant >= cutlass.Int32(1):
@@ -2694,8 +2709,9 @@ def _softmax_warp_group(
                         new_p_sum_pair = new_p_sum_pair + deferred_sum_1
                     alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
                     total_sum = total_sum * alpha_pair + new_p_sum_pair
-                    bars.mb_stat_empty.wait(stat_empty_phase)
-                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
+                    if cutlass.const_expr(not CFG.FUSED_CORR_SPLIT_P):
+                        bars.mb_stat_empty.wait(stat_empty_phase)
+                        stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
 
         total_sum_scalar = total_sum[0] + total_sum[1]
         if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 2):
@@ -3090,7 +3106,7 @@ def _correction_warp_group(
         return total_max_safe, total_sum_pair, bmm1_phase_pair, bmm2_phase_pair, stat_phase
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        nvvm.mbarrier_arrive(sched.mb_read_tile_id.subview(sched_state.idx))
 
         fused_total_max_safe = cutlass.Float32(float("-inf"))
         fused_total_sum = cutlass.Vector.from_elements(
