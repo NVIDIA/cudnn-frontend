@@ -51,6 +51,17 @@ def gdn_support_gates(engine: str, facts) -> None:
         raise NotImplementedError(f"{engine}: checkpoint_every_n_tokens must be a positive multiple of 64 (got {checkpoint})")
     if not facts.gates_at_ho:
         raise NotImplementedError(f"{engine}: g/beta must carry HO = max(q, v) heads ({facts.h_o})")
+    if facts.has_state_indices:
+        if facts.state_indices_dtype != cudnn.data_type.INT32:
+            raise NotImplementedError(f"{engine}: 'state_indices' must be int32, got {facts.state_indices_dtype}")
+        if facts.is_bwd:
+            raise NotImplementedError(f"{engine}: 'state_indices' is a forward-only pool addressing mode")
+        if checkpoint:
+            # state_checkpoints are laid out per sequence, so mixing them with a
+            # pool-addressed state would need a second indirection that no kernel
+            # implements.  Decline rather than write checkpoints the caller cannot
+            # interpret.
+            raise NotImplementedError(f"{engine}: 'state_indices' cannot be combined with checkpoint_every_n_tokens")
     io = (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
     beta_wants = (cudnn.data_type.FLOAT, facts.io_dtype)
@@ -318,6 +329,7 @@ class CompiledGdn:
         self.index_beta = pos["beta"]
         self.index_cu_seqlens = pos["cu_seqlens"]
         self.index_initial_state = pos.get("initial_state")
+        self.index_state_indices = pos.get("state_indices")
         self.index_o = pos["O"]
         self.index_final_state = pos.get("final_state")
         self.index_state_checkpoints = pos.get("state_checkpoints")
@@ -332,6 +344,7 @@ class CompiledGdn:
         beta = views[self.index_beta]
         cu = views[self.index_cu_seqlens]
         state0 = views[self.index_initial_state] if self.index_initial_state is not None else None
+        state_indices = views[self.index_state_indices] if self.index_state_indices is not None else None
         o = views[self.index_o]
         final_state = views[self.index_final_state] if self.index_final_state is not None else None
         state_checkpoints = views[self.index_state_checkpoints] if self.index_state_checkpoints is not None else None
@@ -397,6 +410,7 @@ class CompiledGdn:
                 dt_bias=dt_bias if self.safe_gate else None,
                 tinv=None,
                 beta=beta,
+                state_indices=state_indices,
             )
             return
 
@@ -445,6 +459,7 @@ class CompiledGdn:
             dt_bias=dt_bias,
             work_item_scratch=item_scratch,
             **factor,
+            state_indices=state_indices,
             expand_num=self.expand_num,
             workspace=tensormaps,
             device=self.device,

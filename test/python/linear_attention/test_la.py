@@ -531,6 +531,59 @@ def test_fwd_split_initial_state(backend, variant):
     assert_rms_close("final_state vs reference", fs_split, fs_ref, STATE_TOL[torch.bfloat16])
 
 
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_fwd_state_pool_matches_packed(backend):
+    """A pool-addressed state must be indistinguishable from the sequence-ordered
+    one: same output, same final states, and nothing written outside the rows the
+    caller named.
+
+    The slots are deliberately permuted, sparse and inside an oversized pool, so
+    a kernel that ignored ``state_indices`` and used the sequence index would
+    read the wrong rows and fail here."""
+    case = make_case("gdn", torch.bfloat16, seq_lens=[128, 384, 256])
+    set_seed(SEED + 1)
+    packed0 = torch.randn(case.N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.05
+    kw = dict(output_final_state=True, use_qk_l2norm_in_kernel=True)
+
+    o_ref, fs_ref = run_fwd(backend, case, initial_state=packed0.clone(), **kw)
+
+    n_pool = case.N + 5
+    slots = torch.tensor([5, 1, 6], device="cuda", dtype=torch.int32)
+    pool = torch.full((n_pool, case.HO, case.V, case.K), float("nan"), device="cuda", dtype=torch.float32)
+    spare = [i for i in range(n_pool) if i not in slots.tolist()]
+    pool[spare] = 3.14159
+    for i, slot in enumerate(slots.tolist()):
+        pool[slot] = packed0[i]
+
+    o_pool, fs_pool = run_fwd(backend, case, initial_state=pool, state_indices=slots, **kw)
+
+    # Same arithmetic, only a different place to read and write the state.
+    torch.testing.assert_close(o_pool, o_ref, atol=0.0, rtol=0.0)
+    for i, slot in enumerate(slots.tolist()):
+        torch.testing.assert_close(pool[slot], fs_ref[i], atol=0.0, rtol=0.0)
+    assert fs_pool.data_ptr() == pool.data_ptr(), "final_state should be the caller's pool"
+    assert (pool[spare] == 3.14159).all(), "rows outside state_indices must be untouched"
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_state_pool_rejects_unsupported(backend):
+    """Every unsupported combination must raise rather than silently drop the
+    request and hand back a state the caller would misread."""
+    case = make_case("gdn", torch.bfloat16, seq_lens=[64, 128])
+    slots = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
+    pool = torch.zeros(4, case.HO, case.V, case.K, device="cuda", dtype=torch.float32)
+    kw = dict(output_final_state=True)
+
+    with pytest.raises(ValueError, match="requires initial_state|initial_state is required"):
+        run_fwd(backend, case, state_indices=slots, **kw)
+    with pytest.raises(TypeError):
+        run_fwd(backend, case, initial_state=pool, state_indices=slots.long(), **kw)
+    with pytest.raises(ValueError, match="state_indices must be"):
+        run_fwd(backend, case, initial_state=pool, state_indices=slots[:1], **kw)
+    with pytest.raises(ValueError, match="checkpoint_every_n_tokens"):
+        run_fwd(backend, case, initial_state=pool, state_indices=slots, checkpoint_every_n_tokens=64, **kw)
+
+
 @pytest.mark.parametrize("T1,T2", [(128, 128), (64, 192), (192, 121)])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_chunked_prefill(backend, variant, T1, T2):

@@ -45,6 +45,8 @@ def cutile_la_gate(engine: str, facts, op: str, dg_want) -> None:
         raise NotImplementedError(f"{engine} requires CUDA 13.3+ (found {cudart_version})")
     if facts.checkpoint_every_n_tokens > 0 or facts.wants_state_checkpoints:
         raise NotImplementedError(f"{engine}: per-chunk state_checkpoints output is not supported")
+    if facts.has_state_indices:
+        raise NotImplementedError(f"{engine}: pool-addressed state (state_indices) is FROST-only")
 
     if not facts.uniform_io:
         raise NotImplementedError(f"{engine}: q/k/v dtypes must match")
