@@ -17,8 +17,7 @@ from cutlass.jax import TensorSpec, cutlass_call
 
 if not cutlass.jax.is_available():  # pragma: no cover - guarded import surface
     raise ImportError(
-        "cudnn.jax requires the CuTeDSL JAX extensions (cutlass.jax), which need jax >= 0.5; "
-        "install/upgrade jax (`pip install --group jax` from a checkout)"
+        "cudnn.jax requires the CuTeDSL JAX extensions (cutlass.jax), which need jax >= 0.5; " "install/upgrade jax (`pip install --group jax` from a checkout)"
     )
 
 
@@ -123,9 +122,7 @@ def call(
         **kwargs,
     )
     if not initialized_outputs:
-        return invoke(
-            fn, output_shape_dtype=output_shape_dtype, input_spec=input_spec, output_spec=output_spec, input_output_aliases=input_output_aliases
-        )
+        return invoke(fn, output_shape_dtype=output_shape_dtype, input_spec=input_spec, output_spec=output_spec, input_output_aliases=input_output_aliases)
 
     if not isinstance(output_shape_dtype, (tuple, list)) or any(not hasattr(x, "shape") for x in output_shape_dtype):
         raise ValueError("initialized_outputs requires a flat output sequence")
