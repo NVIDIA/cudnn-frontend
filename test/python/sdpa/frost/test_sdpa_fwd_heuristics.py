@@ -389,7 +389,7 @@ def test_split_kv_plan_pinned_by_name_matches_reference():
     # Autotune replay: the split entry round-trips through (engine_id, knobs).
     eng_id, knobs = g.get_engine_and_knobs_at_index(split_idx)
     assert knobs.split_kv == want
-    g2, handles2, _ = _build_decodeish_graph(causal=False)
+    g2, _handles2, _ = _build_decodeish_graph(causal=False)
     cfg = g2.create_execution_plan(eng_id, knobs)
     assert cfg is not None
 

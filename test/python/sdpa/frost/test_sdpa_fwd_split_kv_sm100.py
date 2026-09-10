@@ -1163,7 +1163,7 @@ def _api_fp8_case(
 
         o = torch.zeros(b, h_q, s_q, d_v, device=dev, dtype=torch.float16)  # HALF out
         amax = torch.zeros(1, dtype=torch.float32, device=dev)
-        split_cga = 1 if d_qk in (256, 512) else 2
+        split_cga = 1 if d_qk == 256 or (mx and d_qk == 512) else 2
         split_knob = (
             1
             if force_one
