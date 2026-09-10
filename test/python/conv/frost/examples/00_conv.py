@@ -8,7 +8,7 @@ Also covers anisotropic dilation; bias is omitted.
 
 Inputs:
     X: input, in bp16, NDHWC format
-    K: filter, in bp16, NDHWC format
+    W: filter, in bp16, NDHWC format
     Y: output, in bf16, NDHWC format
 """
 
@@ -23,23 +23,23 @@ from common import InputShape, build_frost_conv_plans
 def _run(shape: InputShape) -> None:
     # Prepare inputs. conv_fprop only support NCDHW inputs with NDHWC layout.
     X_gpu = torch.rand(shape.n, shape.c, shape.d, shape.h, shape.w, dtype=torch.bfloat16, device="cuda").to(memory_format=torch.channels_last_3d)
-    K_gpu = torch.rand(shape.k, shape.c, shape.t, shape.r, shape.s, dtype=torch.bfloat16, device="cuda").to(memory_format=torch.channels_last_3d)
+    W_gpu = torch.rand(shape.k, shape.c, shape.t, shape.r, shape.s, dtype=torch.bfloat16, device="cuda").to(memory_format=torch.channels_last_3d)
 
     # torch.conv3d only accepts symmetric padding. Pad explicitly so the
     # reference also covers distinct pre/post padding.
     pre_d, pre_h, pre_w = shape.pre_padding
     post_d, post_h, post_w = shape.post_padding
     X_ref = torch.nn.functional.pad(X_gpu, (pre_w, post_w, pre_h, post_h, pre_d, post_d))
-    Y_ref = torch.conv3d(X_ref, K_gpu, stride=shape.stride, dilation=shape.dilation)
+    Y_ref = torch.conv3d(X_ref, W_gpu, stride=shape.stride, dilation=shape.dilation)
     Y_actual = torch.empty(Y_ref.shape, dtype=Y_ref.dtype, device="cuda", memory_format=torch.channels_last_3d)
 
     # Build graph.
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, compute_data_type=cudnn.data_type.FLOAT)
     X = g.tensor_like(X_gpu)
-    K = g.tensor_like(K_gpu)
+    W = g.tensor_like(W_gpu)
     Y = g.conv_fprop(
         X,
-        K,
+        W,
         name="conv",
         pre_padding=shape.pre_padding,
         post_padding=shape.post_padding,
@@ -51,7 +51,7 @@ def _run(shape: InputShape) -> None:
 
     # Run with cudnn frontend.
     workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    g.execute({X: X_gpu, K: K_gpu, Y: Y_actual}, workspace)
+    g.execute({X: X_gpu, W: W_gpu, Y: Y_actual}, workspace)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(Y_actual, Y_ref, atol=1e-4, rtol=1e-3)

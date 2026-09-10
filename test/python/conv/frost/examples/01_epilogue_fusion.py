@@ -7,7 +7,7 @@ Exercises multiple unary epilogue functions.
 
 Inputs:
     X: input, in bf16, NDHWC format
-    K: filter, in bf16, NDHWC format
+    W: filter, in bf16, NDHWC format
     Y: output, in bf16, NDHWC format
 """
 
@@ -34,12 +34,12 @@ def _run(shape: InputShape, epilogue_name: str) -> None:
 
     # Center inputs around zero so ReLU/abs exercise both branches.
     X_gpu = torch.randn(shape.n, shape.c, shape.d, shape.h, shape.w, dtype=torch.bfloat16, device="cuda").to(memory_format=torch.channels_last_3d)
-    K_gpu = torch.randn(shape.k, shape.c, shape.t, shape.r, shape.s, dtype=torch.bfloat16, device="cuda").to(memory_format=torch.channels_last_3d)
+    W_gpu = torch.randn(shape.k, shape.c, shape.t, shape.r, shape.s, dtype=torch.bfloat16, device="cuda").to(memory_format=torch.channels_last_3d)
 
     pre_d, pre_h, pre_w = shape.pre_padding
     post_d, post_h, post_w = shape.post_padding
     X_ref = torch.nn.functional.pad(X_gpu, (pre_w, post_w, pre_h, post_h, pre_d, post_d))
-    conv_ref = torch.conv3d(X_ref, K_gpu, stride=shape.stride, dilation=shape.dilation)
+    conv_ref = torch.conv3d(X_ref, W_gpu, stride=shape.stride, dilation=shape.dilation)
     Y_ref = reference_epilogue(conv_ref)
 
     g = cudnn.pygraph(
@@ -48,10 +48,10 @@ def _run(shape: InputShape, epilogue_name: str) -> None:
         compute_data_type=cudnn.data_type.FLOAT,
     )
     X = g.tensor_like(X_gpu)
-    K = g.tensor_like(K_gpu)
+    W = g.tensor_like(W_gpu)
     conv = g.conv_fprop(
         X,
-        K,
+        W,
         name="conv",
         pre_padding=shape.pre_padding,
         post_padding=shape.post_padding,
@@ -64,7 +64,7 @@ def _run(shape: InputShape, epilogue_name: str) -> None:
 
     Y_actual = torch.empty_like(Y_ref)
     workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    g.execute({X: X_gpu, K: K_gpu, Y: Y_actual}, workspace)
+    g.execute({X: X_gpu, W: W_gpu, Y: Y_actual}, workspace)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(Y_actual, Y_ref, atol=1e-2, rtol=1e-2)

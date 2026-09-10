@@ -8,7 +8,7 @@ import cudnn
 
 @dataclass(frozen=True)
 class InputShape:
-    """The input shape definition. Input X has shape (n, d, h, w, c), filter K has shape (k, t, r, s, c)."""
+    """The input shape definition. Input X has shape (n, d, h, w, c), filter W has shape (k, t, r, s, c)."""
 
     n: int
     d: int
