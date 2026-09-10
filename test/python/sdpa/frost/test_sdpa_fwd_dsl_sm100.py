@@ -12,12 +12,35 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import make_dense_stats, requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
+from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl, _dsl_installed
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
-pytestmark = requires_pre_rubin_blackwell
+pytestmark = requires_blackwell
+
+# ONE engine per arch line: pin the row that serves the device under test.
+# ``engine_name(arch=_ARCH)`` defaults to arch="sm100", whose row stops at cc 10.6, so an
+# unqualified pin fails on Rubin with "no plan for engine" for routing reasons
+# that have nothing to do with the kernel.  Same shape as
+# test_sdpa_fwd_fp8_sm100.py / test_sdpa_fwd_mxfp8_sm100.py.
+_ARCH = "sm107" if _SM == 107 else "sm100"
+
+# Features the Rubin f16 row DECLINES (it is a strict subset of its Blackwell
+# counterpart -- see engines._sm107_spec).  These are capability declines the
+# row states honestly, not kernel bugs: the graph is never served, so the test
+# cannot run.  Flip each condition when the gap closes.
+_skip_split_kv_on_rubin = pytest.mark.skipif(_SM == 107, reason="the ported Rubin f16 kernels wire no SplitHelpers (row: split_kv_supported=False)")
+_skip_pack_gqa_on_rubin = pytest.mark.skipif(_SM == 107, reason="no PackGQA path in the ported Rubin f16 kernels (row: pack_gqas={False})")
+# FULLY INVERTED 2026-09-09: every Rubin f16 flavor (d128 / d192x128 / d256 /
+# d512) now serves THD, so the THD cases below run on BOTH arch lines and the
+# `_skip_thd_on_rubin` marker is RETIRED rather than left as a no-op that reads
+# like a live gate.  What the Rubin f16 row still declines is per-FEATURE --
+# split-KV and PackGQA -- and those keep their own markers.
+_skip_stats_trim_on_rubin = pytest.mark.skipif(
+    _SM == 107,
+    reason="per-batch seq_len_q O/LSE trim not carried by the Rubin f16 kernels " "(row: padded_stats=False / dense_seq_q_trim=False)",
+)
 
 
 def _ref_sdpa(q, k, v, *, is_causal, scale):
@@ -81,7 +104,7 @@ def test_sdpa_fwd_dsl_sm100_graph_api(dtype, is_causal, d):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name())
+    _select_engine(graph, engine_name(arch=_ARCH))
     graph.check_support()
     graph.build_plans()
     # Honest workspace: no Stats output, so the kernel compiles the LSE store
@@ -224,7 +247,7 @@ def _run_dsl_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(), pack_gqa=pack_gqa)
+    _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
@@ -418,6 +441,7 @@ def test_dsl_sm100_padded(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_stats_trim_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_graph_api_padded_bottom_right_gqa():
@@ -452,6 +476,7 @@ def test_dsl_sm100_graph_api_padded_bottom_right_gqa():
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_stats_trim_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["llama_d128", "mla_d192_d128", "qwen_d256", "dsv4_d512"])
 @torch_fork_set_rng(seed=0)
@@ -623,6 +648,33 @@ def test_dsl_sm100_gqa(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_d128", "d256", "d512"])
+@pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (8, 1)], ids=["g2", "g4", "mqa"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_dense_gqa_ratios(d_qk, d_v, h_q, h_kv):
+    """DENSE GQA/MQA across every ratio and every native f16 shape.
+
+    `test_dsl_sm100_gqa` above covers ONE ratio (8:2) and MQA (h_kv=1) appeared
+    only inside the PackGQA cases -- which the Rubin f16 row declines -- so the
+    widest head-sharing case went untested on exactly the shapes this arch
+    serves.  Dense GQA is NATIVE: `qh_per_kh` is threaded to the kernel, which
+    maps a Q head to its KV head; nothing expands K/V.  A wrong mapping is
+    therefore a silent wrong answer, and MQA is the case where an off-by-one
+    still lands on a VALID head and so cannot fault.
+
+    The FP8 and MXFP8 suites carry the same sweep."""
+    _require_dsl()
+    b, s = 2, 256
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h_q, s, d_qk, torch.float16)
+    k = _bhsd(b, h_kv, s, d_qk, torch.float16)
+    v = _bhsd(b, h_kv, s, d_v, torch.float16)
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=torch.float16, sdpa_kwargs=dict(use_causal_mask=True))
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
 # --- PackGQA: TILE_M/G tokens x G query heads per tile -------
 def _pack_gqa_case(d, h_q, h_kv, s_q, s_kv, dtype, *, sdpa_kwargs):
     q = _bhsd(2, h_q, s_q, d, dtype)
@@ -633,6 +685,7 @@ def _pack_gqa_case(d, h_q, h_kv, s_q, s_kv, dtype, *, sdpa_kwargs):
     return q, k, v, scale, o
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_pack_gqa_false_pinned():
@@ -650,6 +703,7 @@ def test_dsl_sm100_pack_gqa_false_pinned():
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "h_q,h_kv",
@@ -666,6 +720,7 @@ def test_dsl_sm100_pack_gqa_ratios(d, h_q, h_kv):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("h_q,h_kv", [(8, 2), (64, 1), (128, 1)], ids=["g4", "g64_mqa", "g128_mqa"])
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
@@ -681,6 +736,7 @@ def test_dsl_sm100_pack_gqa_d512(dtype, h_q, h_kv):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("h_q,s_q", [(64, 1), (64, 3), (128, 4)], ids=["g64_q1", "g64_q3_mtp", "g128_q4_mtp"])
 @torch_fork_set_rng(seed=0)
@@ -701,6 +757,7 @@ def test_dsl_sm100_pack_gqa_d512_mqa_decode(h_q, s_q):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)
@@ -717,6 +774,7 @@ def test_dsl_sm100_pack_gqa_d192_d128(dtype):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "d,h_q,h_kv,s_q",
@@ -741,6 +799,7 @@ def test_dsl_sm100_pack_gqa_tiles(d, h_q, h_kv, s_q):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("s_q", [1, 129, 1023, 2048])
 @torch_fork_set_rng(seed=0)
@@ -752,6 +811,7 @@ def test_dsl_sm100_pack_gqa_tiles_deep(s_q):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "mask",
@@ -795,6 +855,7 @@ def test_dsl_sm100_pack_gqa_features(mask):
     torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_pack_gqa_qtrim():
@@ -823,6 +884,7 @@ def test_dsl_sm100_pack_gqa_qtrim():
     torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_pack_gqa_knob_contract():
@@ -842,7 +904,7 @@ def test_dsl_sm100_pack_gqa_knob_contract():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        name = engine_name()
+        name = engine_name(arch=_ARCH)
         out = []
         for i in range(len(g.plans)):
             pn = g.get_plan_name_at_index(i)
@@ -938,7 +1000,7 @@ def test_dsl_sm100_thd(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro, kro: ro, vro: ro, oro: ro}
@@ -1039,7 +1101,7 @@ def test_dsl_sm100_thd_nan_capacity_tail(dtype, d_qk, d_v):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_qk, kro: ro_qk, vro: ro_v, oro: ro_v}
@@ -1130,7 +1192,7 @@ def test_dsl_sm100_thd_cross(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_q, kro: ro_k, vro: ro_k, oro: ro_q}
@@ -1300,7 +1362,7 @@ def _run_dsl_thd_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
@@ -1443,6 +1505,33 @@ def _run_thd_stats_case(
         else:
             got_lse = packed_stats[cu_q[i] : cu_q[i + 1]].t().unsqueeze(0)  # (T_i, H) -> (1, H, T_i)
         torch.testing.assert_close(got_lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@pytest.mark.parametrize("mask", ["none", "causal", "causal_br", "swa"])
+@torch_fork_set_rng(seed=30)
+def test_thd_d128_runs_on_every_arch_line(mask, stats_layout):
+    """f16 THD at d128, UNSKIPPED on Rubin as of 2026-09-09.
+
+    This is the coverage for the SM107 f16 THD port, and it deliberately
+    exercises the three things that port touched rather than a happy path:
+
+    - **both Stats layouts.** The kernel picks its store arm from the STATIC
+      rank compile() baked in.  Before the port the body implemented only the
+      head-major (rank-3) arm, while `_thd_compile_kwargs` defaults to
+      TOKEN-major -- so the common path would have transposed every LSE.
+    - **ragged, non-tile-aligned sequences** ([200, 150] against TILE_M=128),
+      so a tail tile is partly masked and the per-sequence Q length actually
+      gates the LSE store.
+    - **the mask arms**, because every one of them is `const_expr`-folded: a
+      dense THD pass proves nothing about the causal THD specialization.
+
+    On Rubin this also pins the metadata contract: the body now allocates 4B+4
+    with a batch_remap, which is what the SHARED decode reads.  When the two
+    disagreed the failure was not an error -- it was tiles reading the remap
+    out of the metadata's tail and attributing rows to the wrong sequence."""
+    _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[200, 150], d=128, mask=mask, stats_layout=stats_layout)
 
 
 @pytest.mark.L0
@@ -1936,7 +2025,7 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        _select_engine(g, engine_name())
+        _select_engine(g, engine_name(arch=_ARCH))
         g.check_support()
         g.build_plans()
         o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
@@ -2025,7 +2114,7 @@ def test_dsl_sm100_thd_interleaved_kv_views():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        _select_engine(g, engine_name())
+        _select_engine(g, engine_name(arch=_ARCH))
         g.check_support()
         g.build_plans()
         o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
@@ -2090,7 +2179,10 @@ def _combo_cases():
     cases, ids = [], []
     for flavor, dtype, heads, sink, layout in itertools.product(_FLAVORS, _DTYPES, ["mha", "gqa"], [False, True], ["dense", "thd"]):
         for mask in _COMBO_MASKS[layout]:
-            cases.append((flavor, dtype, heads, sink, layout, mask))
+            # THD is not ported to the Rubin f16 kernels, so its half of the
+            # cartesian is a capability decline there -- mark the PARAM, not
+            # the test, so the dense half still runs on Rubin.
+            cases.append(pytest.param(flavor, dtype, heads, sink, layout, mask) if layout == "thd" else (flavor, dtype, heads, sink, layout, mask))
             ids.append(
                 "-".join(
                     [

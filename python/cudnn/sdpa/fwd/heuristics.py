@@ -114,10 +114,10 @@ _SPLIT_KV_MIN_TILES = 2
 _SPLIT_KV_CTA_COST = 21.0
 # What ONE split's partials cost the combine pass, per wave of combine blocks,
 # in units of one KV tile of main-kernel work. The combine's own occupancy
-# (blocks/SM of split_combine_sm100) is ABSORBED into this coefficient: it is
+# (blocks/SM of sm100/split_combine) is ABSORBED into this coefficient: it is
 # one fixed kernel, so blocks/SM is a constant, and folding it in keeps a
 # cuOccupancy query -- which would need a compiled CUfunction -- off the
-# planning path. Empirical: re-measure if split_combine_sm100 changes.
+# planning path. Empirical: re-measure if sm100/split_combine changes.
 _SPLIT_KV_COMBINE_COST = 0.2
 
 
@@ -197,7 +197,7 @@ def choose_split_kv(
     CTA_COST is what a tile re-pays whatever its loop length, so it sits INSIDE
     the wave term -- once per CTA-tile, not once per split.  COMBINE_COST is
     outside it: the combine is a separate launch whose grid is ``(S_q, H, B)``
-    (split_combine_sm100), one block per output row and independent of ``s`` --
+    (sm100/split_combine), one block per output row and independent of ``s`` --
     only the per-block work grows with ``s``, since each block reduces ``s``
     partials.  Hence ``combine_rows`` (= S_q * H_q * B) and not ``base_ctas``.
 
@@ -357,12 +357,20 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     else:
         primary = SCHED_NATURAL
     order = {SCHED_LPT_L2: (SCHED_LPT, SCHED_NATURAL), SCHED_LPT: (SCHED_LPT_L2, SCHED_NATURAL), SCHED_NATURAL: (SCHED_LPT, SCHED_LPT_L2)}
-    runners = [p for p in order[primary] if p in domain]
+    # The primary may be outside a row's DOMAIN (the SM107 rows do not carry
+    # SCHED_LPT_L2 — their kernels raise on the L2 decode).  Fall back along the
+    # SAME preference order rather than to NATURAL: dropping straight to NATURAL
+    # cost a causal Rubin FP8 graph the LPT load-balancing win, and listed
+    # NATURAL twice ([0, 1, 0]), burning an autotune slot on a duplicate plan.
+    # When the primary IS in domain this is byte-identical to the old form
+    # (order[primary] never contains primary).
+    chosen = next((p for p in (primary, *order[primary]) if p in domain), SCHED_NATURAL)
+    runners = [p for p in order[primary] if p in domain and p != chosen]
     # A mask-free graph gains nothing from either LPT remap — the grid is
     # already balanced — so don't spend autotune slots on them.
     if not causal_ish and facts.window_left is None:
         runners = []
-    return [primary if primary in domain else _sole(domain) or SCHED_NATURAL] + runners
+    return [chosen, *runners]
 
 
 def select_d192_auto_knobs(

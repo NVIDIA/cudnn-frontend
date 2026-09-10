@@ -16,12 +16,12 @@
 # limitations under the License.
 
 """Gated DeltaNet v2 (GDN-2) Cutlass DSL recompute (state/checkpoint-only) kernel
-config (fixed compile-time constants).  A fork of the BT=16 KDA schedule
-extended with the per-key erase gate (beta) and per-value write gate (w); the
-derived SMEM/TMEM sizes and offsets are stamped by ``build_cfg`` in
+config (fixed compile-time constants) for the BT=16 schedule with the
+per-key erase gate (beta) and the per-value write gate (w); the derived
+SMEM/TMEM sizes and offsets are stamped by ``build_cfg`` in
 ``gdn2_recompute_f16.py``.
 
-Target arch: Blackwell SM100 (GB200) / SM103 (GB300).
+Target arch: Blackwell SM100 / SM103.
 """
 
 from dataclasses import dataclass
@@ -57,7 +57,6 @@ class Cfg:
     SMEM_SCHEDULER_STAGES: int = 8
     SMEM_DECAY_STAGES: int = 2
     SMEM_INTERMEDIATE_STAGES: int = 2
-    SMEM_STATE_SCALE_DIAG_STAGES: int = 4
     QK_SCALE_READY_STAGES: int = 4
 
     CLUSTER_SHAPE_MNK: Tuple[int, int, int] = (1, 1, 1)

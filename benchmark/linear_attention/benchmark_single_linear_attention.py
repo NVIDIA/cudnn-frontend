@@ -42,6 +42,8 @@ _CHUNK_SIZE = {"gdn": 64, "kda": 16, "gdn2": 16, "gdp": 64}
 
 # Safe-gate lower bound for kda.
 _KDA_GATE_LOWER_BOUND = -5.0
+# raw-gate sigmoid floor; lower_bound * floor vanishes under fp32 exp, so the zero log gate reconstructs alpha = 1 exactly
+RAW_GATE_SIGMOID_FLOOR = 1e-20
 
 
 def _peak_flops_per_clock_per_sm(dtype_str):
@@ -249,7 +251,7 @@ def parse_args():
         "--seed",
         default=0,
         type=int,
-        help="RNG seed for the input draws. The gate values decide the split-K partition, so an unseeded run is not a reproducible measurement",
+        help="RNG seed for the input draws (q/k/v and the write strengths; the decay gates are all ones, so the schedule does not depend on the draw)",
     )
     return parser.parse_args()
 
@@ -571,6 +573,11 @@ else:
     # passes (the FlashKDA ABI, and what cudnn/fla differentiate).
     raw_gates = args.variant in ("kda", "gdn2")
 
+    def state_v_major(backend):
+        if backend == "fla":
+            return args.variant != "gdp"
+        return backend in ("cudnn", "flash_kda", "flash_qla")
+
     l2_flush_size_mb = 256
     l2_flush_size = l2_flush_size_mb * 1024 * 1024
     l2_flush_buffer = torch.empty(l2_flush_size, device=device, dtype=torch.int8)
@@ -702,6 +709,7 @@ else:
                 initial_state=state0,
                 output_final_state=output_final_state,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
+                state_v_first=True,
             )
 
     if args.la_backend == "flash_kda":
@@ -757,7 +765,7 @@ else:
                 raise RuntimeError(f"The installed fla does not provide GDN2 (fla.ops.gdn2): {e}") from e
 
         ## FLA takes dense (B, T, H, D) tensors; g is the log-space decay
-        ## (raw safe-gate logits in forward-only kda runs). --store_on adds
+        ## (raw safe-gate logits for kda and gdn2). --store_on adds
         ## the per-chunk state dump (fla supports it in inference mode only).
         fla_gate_kwargs = {}
         if raw_gates:
@@ -770,6 +778,7 @@ else:
             )
             if args.variant == "kda":
                 fla_gate_kwargs["use_beta_sigmoid_in_kernel"] = True
+        fla_state_kwargs = dict(state_v_first=True) if state_v_major("fla") else {}
 
         def fla_linear_attention(query, key, value, gate, beta, write_gate, state0):
             if args.variant == "gdn":
@@ -783,6 +792,7 @@ else:
                     initial_state=state0,
                     output_final_state=output_final_state,
                     use_qk_l2norm_in_kernel=use_qk_l2norm,
+                    **fla_state_kwargs,
                 )
             elif args.variant == "gdp":
                 return chunk_gated_delta_product(
@@ -812,6 +822,7 @@ else:
                             use_qk_l2norm_in_kernel=use_qk_l2norm,
                             return_intermediate_states=True,
                             **fla_gate_kwargs,
+                            **fla_state_kwargs,
                         )
                     return o, fs
                 return chunk_kda(
@@ -825,6 +836,7 @@ else:
                     output_final_state=output_final_state,
                     use_qk_l2norm_in_kernel=use_qk_l2norm,
                     **fla_gate_kwargs,
+                    **fla_state_kwargs,
                 )
             else:  # gdn2
                 # chunk_gdn2 exposes no beta-sigmoid flag, so the activation
@@ -845,6 +857,7 @@ else:
                             use_qk_l2norm_in_kernel=use_qk_l2norm,
                             return_intermediate_states=True,
                             **fla_gate_kwargs,
+                            **fla_state_kwargs,
                         )
                     return o, fs
                 return chunk_gdn2(
@@ -859,6 +872,7 @@ else:
                     output_final_state=output_final_state,
                     use_qk_l2norm_in_kernel=use_qk_l2norm,
                     **fla_gate_kwargs,
+                    **fla_state_kwargs,
                 )
 
     def get_linear_attention_function(backend):
@@ -1020,39 +1034,36 @@ else:
         )
         return b / time / 1e9 if not math.isnan(time) else 0.0  # Assume time is in msec
 
-    ## Gate generators per variant. Decays are LOG-space (alpha = exp(g)),
-    ## drawn from ranges the kernels' io-dtype arithmetic is conditioned for.
-    ## The draws stay fp32 for the log/logit/sigmoid math and narrow on the way out.
     def generate_gates():
         if args.variant == "gdn":
             # scalar decay [B, T, HO] + scalar write strength
-            gate = torch.empty(batch_size, seqlen, num_o_heads, device=device).uniform_(0.1, 1.0).log()
+            gate = torch.ones(batch_size, seqlen, num_o_heads, device=device).log()
             beta = torch.rand(batch_size, seqlen, num_o_heads, device=device)
             write_gate = None
         elif args.variant == "gdp":
             # scalar decay [B, T, HO] fp32 per real token + per-Householder
             # write strength on the expanded timeline
-            gate = torch.empty(batch_size, seqlen, num_o_heads, device=device).uniform_(0.1, 1.0).log()
+            gate = torch.ones(batch_size, seqlen, num_o_heads, device=device).log()
             beta = torch.rand(batch_size, kv_seqlen, num_o_heads, device=device)
             write_gate = None
         elif args.variant == "kda":
             # per-key-channel decay [B, T, HO, K] + post-sigmoid scalar
-            # beta; forward-only runs feed raw logits with the same effective
-            # distributions (the in-kernel activations invert them)
-            gate = torch.empty(batch_size, seqlen, num_o_heads, head_dim_qk, device=device).uniform_(0.5, 1.0).log()
+            # beta; raw_gates feeds the logits instead (the in-kernel
+            # activations invert them)
+            gate = torch.ones(batch_size, seqlen, num_o_heads, head_dim_qk, device=device).log()
             beta = torch.rand(batch_size, seqlen, num_o_heads, device=device)
             if raw_gates:
-                gate = torch.special.logit((gate / _KDA_GATE_LOWER_BOUND).clamp(1e-7, 1 - 1e-7))
+                gate = torch.special.logit((gate / _KDA_GATE_LOWER_BOUND).clamp(RAW_GATE_SIGMOID_FLOOR, 1 - 1e-7))
             else:
                 beta = beta.sigmoid()
             write_gate = None
         else:  # gdn2
             # per-key decay/erase [B, T, HO, K] + per-value write gate [B, T, HO, V];
             # raw_gates feeds decay and erase logits, as kda does
-            gate = torch.empty(batch_size, seqlen, num_o_heads, head_dim_qk, device=device).uniform_(0.5, 1.0).log()
+            gate = torch.ones(batch_size, seqlen, num_o_heads, head_dim_qk, device=device).log()
             beta = torch.rand(batch_size, seqlen, num_o_heads, head_dim_qk, device=device)
             if raw_gates:
-                gate = torch.special.logit((gate / _KDA_GATE_LOWER_BOUND).clamp(1e-7, 1 - 1e-7))
+                gate = torch.special.logit((gate / _KDA_GATE_LOWER_BOUND).clamp(RAW_GATE_SIGMOID_FLOOR, 1 - 1e-7))
             else:
                 beta = beta.sigmoid() * 2.0
             write_gate = torch.rand(batch_size, seqlen, num_o_heads, head_dim_vo, device=device).sigmoid()
@@ -1114,8 +1125,7 @@ else:
         state0 = None
         if args.initial_state:
             state0 = (torch.randn(batch_size, num_o_heads, head_dim_qk, head_dim_vo, dtype=torch.float32, device=device) * 0.05).to(state_dtype)
-            if args.la_backend in ("cudnn", "flash_kda"):
-                # cuDNN and FlashKDA state ports are V-major [N, HO, V, K]; fla and flash_qla K-major
+            if state_v_major(args.la_backend):
                 state0 = state0.transpose(-1, -2).contiguous()
             if run_bwd:
                 state0.requires_grad_(True)
@@ -1126,7 +1136,7 @@ else:
         dFinal = None
         if args.initial_state and run_bwd:
             dFinal = (torch.randn(batch_size, num_o_heads, head_dim_qk, head_dim_vo, dtype=torch.float32, device=device) * 0.05).to(state_dtype)
-            if args.la_backend in ("cudnn", "flash_kda"):
+            if state_v_major(args.la_backend):
                 dFinal = dFinal.transpose(-1, -2).contiguous()
 
         l2_flush_buffer.zero_()
@@ -1227,7 +1237,7 @@ else:
                     beta_ref = beta.detach()
                 state0_ref = state0.detach() if state0 is not None else None
                 if state0_ref is not None:
-                    if args.la_backend in ("cudnn", "flash_kda"):
+                    if state_v_major(args.la_backend) != state_v_major("fla"):
                         state0_ref = state0_ref.transpose(-1, -2).contiguous()
                     state0_ref = state0_ref.float()
                 wg_ref = None

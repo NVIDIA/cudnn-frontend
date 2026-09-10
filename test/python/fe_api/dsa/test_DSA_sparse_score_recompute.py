@@ -50,6 +50,31 @@ def _local_to_global_topk_indices(topk_indices: torch.Tensor, seqlen_k: int) -> 
     return torch.where(topk_indices >= 0, topk_indices + batch_offsets, topk_indices)
 
 
+@pytest.mark.L1
+@torch_fork_set_rng(seed=1234)
+@pytest.mark.parametrize("num_heads,head_dim,topk", [(32, 128, 128), (64, 512, 512), (128, 512, 1024), (64, 576, 1024), (128, 576, 512)])
+@pytest.mark.parametrize("has_topk_length", [False, True])
+@pytest.mark.parametrize("use_global", [False, True])
+def test_sparse_attn_sm100_tiles_match_reference(num_heads, head_dim, topk, has_topk_length, use_global):
+    from fe_api.dsa.dsa_utils import _require_exact_sm100
+
+    _require_exact_sm100()
+    from cudnn import DSA
+
+    cfg = {"b": 2, "s_q": 32, "s_kv": 2048, "head_dim": head_dim, "qhead_per_kv_head": num_heads, "topk": topk}
+    q, k, lse, local_ids, lengths = _allocate(cfg, "attention", has_topk_length)
+    # Exercise partial final tiles across n128/n64 and K-split specializations,
+    # preserving the invalid sentinel when converting to global IDs.
+    valid_topk = topk * 3 // 4 + 5
+    local_ids[..., valid_topk:] = -1
+    if lengths is not None:
+        lengths.clamp_(max=valid_topk)
+    ids = _local_to_global_topk_indices(local_ids, cfg["s_kv"]) if use_global else local_ids
+    scale = 1.0 / math.sqrt(cfg["head_dim"])
+    actual = DSA.sparse_attn_score_recompute_wrapper(q, k, lse, ids, scale, topk_length=lengths, topk_indices_global=use_global)["target"]
+    check_ref_sparse_score_recompute("attention", q, lse, local_ids, actual, aux=k, softmax_scale=scale, topk_length=lengths)
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_sparse_score_recompute_params

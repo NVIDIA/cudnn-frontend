@@ -367,7 +367,8 @@ def indexer_fwd_compress_topk(
             within the K outputs may differ, as for any two radix launches).
             Requires
             ``microbatch_rows % ratio == 0`` and ``seqlen_q % ratio == 0`` so the
-            per-window KV bound stays integral.  Default 0 = single launch.
+            per-window KV bound stays integral. Default ``-1`` enables the
+            long-sequence auto policy; pass ``0`` to force a single launch.
         cand_buffer: optional caller-provided float32 CUDA scratch buffer for the
             stage-1 compact logits.  Size it with ``compress_topk_cand_buffer_size``;
             lets callers reuse one allocation across calls.  ``None`` = allocate

@@ -104,7 +104,7 @@ class TemplateParams:
     qh_per_kh: int = 1
     # KV split: each Q tile's KV loop range is cut into ``split_kv`` contiguous
     # chunks, each run as its own persistent tile writing a partial (O, LSE)
-    # that kernels/split_combine_sm100.py reduces.  1 = off (byte-identical
+    # that kernels/sm100/split_combine.py reduces.  1 = off (byte-identical
     # codegen to the single-pass kernel).
     split_kv: int = 1
     # MMA cluster width: 2 = cga2 collective tcgen05.mma.cta_group::2 (a CTA

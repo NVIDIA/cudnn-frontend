@@ -838,7 +838,7 @@ def _run_template_tail(D, D_v, *, mask, S=256):
     if mask == "padded":
         kw["seq_kv_lens_present"] = True
         seq_kv_lens = [S, S - 73]  # batch 1 ends inside a KV tile at an odd offset
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "prefill_fp8_sm120.py")
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm120/prefill_fp8.py")
     module = load_template(path, TemplateParams(**kw), tag=f"fp8_tail_d{D}_d{D_v}_{mask}")
     fn = module.compile(compute_capability=torch.cuda.get_device_capability(), b=B, qh=H, kh=H, sq=S, skv=S, d_qk=D, d_v=D_v, has_lse=False)
 

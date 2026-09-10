@@ -248,13 +248,18 @@ class TileConfig:
     @property
     def geometry_name(self) -> str:
         """Geometry token (no ``CONFIG_``/pipeline prefix) used in the kernel symbol."""
+        return self._geometry_base + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "")
+
+    @property
+    def _geometry_base(self) -> str:
+        """``geometry_name`` without the split-K suffix; a family with extra axes extends it."""
         return (
             f"{self.cta_tile_m}x{self.cta_tile_n}x{self.cta_tile_k_bytes}"
             f"_{self.mma_tile_m}x{self.mma_tile_n}x{self.mma_tile_k_bytes}"
             f"_cluster{self.cga_size_m}x{self.cga_size_n}"
             # Named only where it is an AXIS -- a pipeline without the CTA pair
             # declares no such field, so there is nothing to spell.
-            + (f"_{self.cta_group}ctamma" if isinstance(self, CtaPairTileConfig) else "") + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "")
+            + (f"_{self.cta_group}ctamma" if isinstance(self, CtaPairTileConfig) else "")
         )
 
     @property
@@ -513,11 +518,11 @@ class ConfigSm120(TileConfig):
             )
 
     @property
-    def geometry_name(self) -> str:
+    def _geometry_base(self) -> str:
         """The warp grid is an AXIS here (unlike the CTA-scoped families), so it
         is ALWAYS named via a ``_warpsMxN`` suffix -- no grid is implied by an
         unsuffixed spelling."""
-        base = super().geometry_name
+        base = super()._geometry_base
         if self.warp_tile_m and self.warp_tile_n:
             base += f"_warps{self.cta_tile_m // self.warp_tile_m}x{self.cta_tile_n // self.warp_tile_n}"
         return base
@@ -1087,15 +1092,17 @@ def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
 
 # ---------------------------------------------------------------------------
 # Block-scaled matmul config validation (geometry-only; cta_group lives on the
-# template). The F8_128x4 SF swizzle + 32x128b.warpx4 utccp atom impose:
-# cta_tile_m/n % 128 == 0 and cta_tile_k (elements) % (4*block_size) == 0.
+# template), one function per template family plus a dispatcher. tcgen05: the
+# F8_128x4 SF swizzle + 32x128b.warpx4 utccp atom impose mma_tile_m/n % 128 == 0
+# and cta_tile_k (elements) % (4*block_size) == 0. sm120: the warp MMA reads its
+# scales from registers, so the 128-row block is a TMA-box (CTA tile) fact.
 # ---------------------------------------------------------------------------
 
 
-def validate_block_scale_config(cfg: TileConfig, block_size: int, cta_tile_k_elems: int) -> None:
-    """Raise if ``cfg``'s GEOMETRY cannot run a block-scaled matmul.
-    ``cta_tile_k_elems`` is the K-tile in *elements* (FP4: 256 on sm100 / 768
-    on sm103; FP8: 128)."""
+def validate_block_scale_config_sm100(cfg: TileConfig, block_size: int, cta_tile_k_elems: int) -> None:
+    """Raise if ``cfg``'s GEOMETRY cannot run a tcgen05 block-scaled matmul (the
+    sm100 family; sm103 differs only in its 384-byte K-tile). ``cta_tile_k_elems``
+    is the K-tile in *elements* (FP4: 256 on sm100 / 768 on sm103; FP8: 128)."""
     # The SF 128x4 swizzle gives one scale-factor word per 128-row / 128-column
     # block, and the rule is that EACH MMA INSTRUCTION must land on whole blocks —
     # so it applies to the instruction tile, not the CTA tile. They coincide at
@@ -1133,3 +1140,37 @@ def validate_block_scale_config(cfg: TileConfig, block_size: int, cta_tile_k_ele
         raise NotImplementedError(
             f"block-scaled matmul requires cta_tile_k (elements) % (4*block_size) " f"== 0; got cta_tile_k={cta_tile_k_elems}, block_size={block_size}"
         )
+
+
+def validate_block_scale_config_sm120(cfg: TileConfig, block_size: int, cta_tile_k_elems: int) -> None:
+    """Raise if ``cfg``'s GEOMETRY cannot run the sm120 warp-MMA block-scaled
+    matmul. ``cta_tile_k_elems`` is the K-tile in *elements* (FP4: 256; FP8: 128)."""
+    # The warp MMA reads its scales from registers, so the 128-row F8_128x4
+    # block is a TMA-box fact here, not an instruction one: the SF box covers
+    # whole blocks, so a CTA tile is a multiple of 128 (whole blocks) or a
+    # divisor of it (inside one block) -- never astride a block boundary.
+    for label, ext in (("cta_tile_m", cfg.cta_tile_m), ("cta_tile_n", cfg.cta_tile_n)):
+        if ext % 128 != 0 and 128 % ext != 0:
+            raise NotImplementedError(
+                f"block-scaled matmul on sm120 requires {label} to be a multiple or a divisor of 128 "
+                f"(one F8_128x4 SF block per TMA box); config {cfg.name!r} has {label}={ext}"
+            )
+    # One K-tile = one 128-byte swizzled SMEM row = one 4-scale SF word per
+    # row at block 32 fp8 (and whole words at every other combo).
+    if cfg.cta_tile_k_bytes != 128:
+        raise NotImplementedError(f"block-scaled matmul on sm120 requires cta_tile_k_bytes == 128; " f"config {cfg.name!r} has {cfg.cta_tile_k_bytes}")
+    if cta_tile_k_elems % (4 * block_size) != 0:
+        raise NotImplementedError(
+            f"block-scaled matmul requires cta_tile_k (elements) % (4*block_size) " f"== 0; got cta_tile_k={cta_tile_k_elems}, block_size={block_size}"
+        )
+    # Whether the SF boxes still leave an AB stage next to the template's
+    # epilogue staging is the renderer's call (the catalog's SMEM sweep
+    # counts data only).
+
+
+def validate_block_scale_config(cfg: TileConfig, block_size: int, cta_tile_k_elems: int) -> None:
+    """Raise if ``cfg``'s GEOMETRY cannot run a block-scaled matmul. Dispatches
+    on the config's family: the sm120 warp-MMA rules or the tcgen05 ones."""
+    if cfg.pipeline == "sm120":
+        return validate_block_scale_config_sm120(cfg, block_size, cta_tile_k_elems)
+    return validate_block_scale_config_sm100(cfg, block_size, cta_tile_k_elems)

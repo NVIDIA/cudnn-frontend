@@ -20,7 +20,7 @@ compile-time constants).  The BT=16 KDA schedule uses a 16-warp (512-thread)
 specialization with a per-key-channel decay; the derived SMEM/TMEM sizes and
 offsets are stamped by ``build_cfg`` in ``kda_prefill_f16.py``.
 
-Target arch: Blackwell SM100 (GB200) / SM103 (GB300).
+Target arch: Blackwell SM100 / SM103.
 """
 
 from dataclasses import dataclass
@@ -57,7 +57,6 @@ class Cfg:
     SMEM_O_STAGES: int = 2
     SMEM_DECAY_STAGES: int = 2
     SMEM_INTERMEDIATE_STAGES: int = 2
-    SMEM_STATE_SCALE_DIAG_STAGES: int = 4
     QK_SCALE_READY_STAGES: int = 4
     TMEM_Q_STATE_ACC_STAGES: int = 2
 

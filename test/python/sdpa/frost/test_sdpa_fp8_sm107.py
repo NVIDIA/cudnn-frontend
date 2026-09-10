@@ -4,7 +4,7 @@
 """SM107 (Rubin) routing of the per-tensor FP8 d128 SDPA kernel.
 
 The adapter routes cc10.7 per-tensor-FP8 graphs to the SM107 sibling module
-(``prefill_d128_fp8_sm107.py``), which bakes the Rubin dense-FP8 K=64 MMA
+(``sm107/prefill_d128_fp8.py``), which bakes the Rubin dense-FP8 K=64 MMA
 geometry; Blackwell keeps the untouched SM100 module. These tests pin the
 routing and both modules' derived constants — device-independent (everything
 here happens before any compile). End-to-end coverage rides the existing
@@ -53,8 +53,14 @@ def test_sm100_module_unchanged():
     assert mod.NUM_KPHASES_PV == 4
 
 
-def test_sm107_per_tensor_fp8_advertises_only_d128():
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128)})
+def test_sm107_per_tensor_fp8_native_shapes():
+    """INVERTED 2026-09-04: the SM107 port added d256 and d512 per-tensor FP8.
+    INVERTED again 2026-09-09: d192xd128 gained its Rubin sibling
+    (sm107/prefill_d192_d128_fp8.py), so both arch lines now carry all four
+    native flavors and the two shape sets are identical."""
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
     assert (256, 256) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
 
@@ -74,14 +80,29 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
-    # Kernel flavors are row DATA: Rubin has no d192, d256, or d512 sibling.
+    # Kernel flavors are row DATA.  FULLY INVERTED 2026-09-09: the Rubin line
+    # now carries all four per-tensor FP8 flavors, d192xd128 included, so the
+    # two rows agree on d_shapes.  They still differ on THD, split-KV, PackGQA
+    # and the scheduler domain -- which is the point of splitting the rows.
     assert sm100.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    assert sm107.d_shapes == frozenset({(128, 128)})
-    # d512 carries an envelope FLOOR: it serves (256, 512] on both head dims,
-    # so a smaller graph is declined rather than routed onto the d512 kernel at
-    # a multiple-x zero-padding cost.  Rubin has no d512 flavor, hence no floor.
+    assert sm107.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    assert (192, 128) in sm107.d_shapes
+    # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
+    # so a row that gains a flavor must gain its floor in the same commit --
+    # otherwise mismatch() admits a graph check_support kills (contract 8b').
+    assert dict(sm107.d_envelope_floors) == dict(sm100.d_envelope_floors)
+    # Envelope FLOORS keep an inexact graph off a flavor whose padded path is
+    # not validated.  BOTH rows carry them, and the Rubin one differs only by
+    # the (192, 128) entry it has no flavor for -- the floors' rationale is the
+    # kernel geometry (a cga4x1 d512 role-split; an unvalidated d256 padded
+    # path), which the Rubin ports inherit unchanged.  They must also match
+    # api_dsl._SM100_FP8_ENVELOPE_FLOORS, which the adapter enforces on BOTH
+    # arch lines -- a row that admits what the adapter rejects is a plan that
+    # enters the ranked list only to die in check_support.
     assert sm100.d_envelope_floors == (((192, 128), 128), ((256, 256), 255), ((512, 512), 256))
-    assert sm107.d_envelope_floors == ()
+    # INVERTED 2026-09-09: Rubin gained the d192 flavor, so it gained that
+    # flavor's floor too -- the two rows' floor tables are now identical.
+    assert sm107.d_envelope_floors == (((192, 128), 128), ((256, 256), 255), ((512, 512), 256))
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
     assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
@@ -93,18 +114,27 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # so the sched domain is the same on both rows.
     assert sm107.split_kv_supported is True
     assert sm100.split_kv_supported is True
-    assert sm107.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
+    # INVERTED: BOTH remap policies came off the Rubin row.  LPT_L2 went first
+    # (the ported decode sites never thread qh_per_kh / seqlen_kv); plain LPT
+    # followed once heuristics could actually reach it -- a causal d512 FP8
+    # graph under LPT returns NaN, and all 12 masked d512 cases go green with
+    # the row narrowed.  A knob is honored or the engine is ineligible.
+    assert sm107.sched_policies == frozenset({SCHED_NATURAL})
     assert sm100.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
 
     # Both d128 cells carry the write_thd_meta THD leg.
     assert sm100.thd and sm107.thd and sm100.cu_seq_len and sm107.cu_seq_len
 
 
-def test_sm107_row_ranks_the_lpt_remap_for_causal():
-    """The LPT/LPT_L2 remap (issue #653) is live on the Rubin row: a causal
-    per-tensor FP8 graph at cc10.7 ranks LPT_L2 first, exactly as its SM100
-    twin does, and both remap specializations template-load. Pure — facts pin
-    the device, and nothing here compiles."""
+def test_sm107_row_ranks_natural_only_for_causal():
+    """The LPT/LPT_L2 remap (issue #653) is an SM100-row property.  A causal
+    per-tensor FP8 graph ranks [LPT_L2, LPT, NATURAL] there, but the Rubin row
+    declares a SINGLE-element domain -- its ported kernels raise on the L2
+    decode and do not honor LPT -- so ranking must offer exactly [NATURAL] and
+    never bolt a fallback on beside it.  The LPT specialization still
+    template-LOADS; it is the decode that is unvalidated, which is why the ROW
+    declines rather than the template raising.  Pure — facts pin the device,
+    and nothing here compiles."""
     import cudnn as _c
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa import graph_analyzer as ga
@@ -134,12 +164,18 @@ def test_sm107_row_ranks_the_lpt_remap_for_causal():
     # the remap groups against, so the L2 variant leads on BOTH rows. Before
     # the port the Rubin row had a one-element domain and took _sched_points'
     # sole-element shortcut, which is what pinned it to NATURAL.
-    assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    # INVERTED: the Rubin row dropped SCHED_LPT_L2 (its ported kernels raise on
+    # the L2 decode), so heuristics ranks LPT first there while the SM100 twin
+    # still leads with LPT_L2.  A proposal outside the row's domain would be a
+    # heuristics bug, so the ranking must not offer it at all.
+    # The Rubin row's domain is now a single element, so ranking has one point.
+    assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_NATURAL]
     assert heuristics._sched_points(sm100, facts((10, 0))) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
 
-    # Both remap specializations template-load on the Rubin sibling.
-    for policy in (SCHED_LPT, SCHED_LPT_L2):
-        assert _load(rubin=True, sched_policy=policy).CFG.SCHEDULER_POLICY == policy
+    # The LPT specialization still template-LOADS -- it is the decode that is
+    # unvalidated on the ported kernels, which is why the ROW declines it rather
+    # than the template raising.
+    assert _load(rubin=True, sched_policy=SCHED_LPT).CFG.SCHEDULER_POLICY == SCHED_LPT
 
 
 def test_softmax_half_declines_by_row_domain():
@@ -333,9 +369,27 @@ def test_fp8_rows_serve_dense_envelope():
     for arch in ("sm100", "sm107"):
         row = caps[engines.engine_name(arch=arch, fp8=True)]
         assert row.d_pad_multiple == 16, arch
-    # The d128 kernel carries the THD leg on both arch lines; sm100 adds the
-    # d192, d256, and d512 flavors' THD legs.
-    assert caps[engines.engine_name(arch="sm107", fp8=True)].thd_d_shapes == frozenset({(128, 128)})
+    # FULLY INVERTED 2026-09-09: the Rubin per-tensor FP8 THD leg now covers every
+    # native flavor -- d192xd128 came free with the DSv3 port (same body as d128),
+    # and d256/d512 were moved onto the FROST THD contract.  Both lines now serve
+    # THD at every shape they serve dense.
+    rubin_fp8 = caps[engines.engine_name(arch="sm107", fp8=True)]
+    assert rubin_fp8.thd_d_shapes == rubin_fp8.d_shapes
+    assert caps[engines.engine_name(fp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+
+    # The row and the STANDALONE wrapper enforce the same fact at two places
+    # (rule 8b'), so they now share ONE constant instead of two copies kept in
+    # step by hand -- which is what failed when the row was widened first and a
+    # d192 THD graph died with a bare NotImplementedError inside check_support.
+    # Assert IDENTITY with the shared object, not equality with a literal: a
+    # literal here would just be a third copy to drift.
+    from cudnn.sdpa.fwd.api_dsl import _SM107_FP8_THD_SHAPES
+    from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES
+
+    assert rubin_fp8.thd_d_shapes is SM107_FP8_THD_SHAPES
+    assert _SM107_FP8_THD_SHAPES is SM107_FP8_THD_SHAPES
+    # Every THD shape must also be a shape the row SERVES at all.
+    assert SM107_FP8_THD_SHAPES <= rubin_fp8.d_shapes
     assert caps[engines.engine_name(arch="sm100", fp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert caps[engines.engine_name(mxfp8=True)].d_pad_multiple == 0
 
@@ -404,11 +458,23 @@ def test_fp8_envelope_mismatch_rules():
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=448, thd=True, padded=True))
     # d % 16 still applies inside the band (TMA 16-byte global-stride rule).
     assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=392, d_v=392))
-    # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case)
-    # but has no d192 flavor at all.
+    # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case).
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
-    assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128))
+    # INVERTED 2026-09-09: the Rubin d192 FP8 sibling landed, so the EXACT
+    # shape is now served on both rows.  Its floor (128) came with it, so the
+    # inexact region below stays declined -- d_qk zero-padded into d192 is
+    # numerically wrong, and that is a kernel property, not an arch one.
+    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
+    assert engines._selected_d_shape(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) == (192, 128)
+    for dq, dv in ((160, 96), (176, 128), (192, 96)):
+        assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)), (dq, dv)
     assert "dense-only" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))
-    # There is no Rubin d512 kernel at all.
-    assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512))
+    # INVERTED: the Rubin line gained a d512 per-tensor FP8 kernel, so the
+    # native d512 shape is now SERVED rather than declined, and the (256, 512]
+    # floor applies here exactly as on the SM100 row.
+    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512)) is None
+    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=384, d_v=448)) is None
+    # ...and straddling the floor declines on BOTH rows, identically.
+    assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=256))
+    assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=256))

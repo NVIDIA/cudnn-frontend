@@ -314,25 +314,40 @@ python/cudnn/
                                 validation
       config_sm120.py           TemplateParams + supported SM120 tile/layout
                                 vocabulary + raising validation
-      kernels/
-        prefill_d256_f16_sm100.py     naming: <phase>_d<dim>_<dtype-family>_sm<arch>.py
-        prefill_d512_f16_sm100.py
-        prefill_f16_sm120.py          general SM120 template (any head dim)
-        prefill_d256_f16_sm120.py     d256 flavor
-        _common_sm100.py
-        _common_sm120.py
-        thd_helpers.py
+      kernels/                  one package per ARCH LINE; everything below
+                                an arch package is owned by that arch alone
+        sm100/prefill_d256_f16.py     naming: <phase>_d<dim>_<dtype-family>.py
+        sm100/prefill_d512_f16.py
+        sm100/split_combine.py        the split-KV reduction pass
+        sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
+        sm120/prefill_f16.py          general SM120 template (any head dim)
+        sm120/prefill_d256_f16.py     d256 flavor
+        sm120/_common.py              SM120-only warp-level primitives
+        _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
+                                  sits ABOVE both rather than inside either
+        thd_helpers.py            SHARED by sm100/ + sm107/ + sm120/
     bwd/                        future: same shape, its own api_dsl.py
 
   gemm/frost/                   engine.py + graph_analyzer.py + compiler.py
                                 + kernel_templates/
 ```
 
-Two levels under the pass directory, always. The coverage axes (arch, phase,
-head dim, dtype family) are encoded in filenames and engine names, never in
-directory depth. A dimension may be omitted from a filename when one kernel
-implementation covers multiple dimensions. A new reader should be able to list
-`sdpa/fwd/kernels/` and see the whole coverage matrix on one screen.
+Two levels under the pass directory, always. **Arch is the one coverage axis
+that may be a directory** — `kernels/sm<arch>/` — because it partitions the
+kernels into disjoint sets that never run on the same device, and because the
+arch lines are separately owned: a Rubin change cannot touch an SM100 file if
+the two live in different directories. Every OTHER axis (phase, head dim, dtype
+family) stays in the filename and the engine name:
+`<phase>_d<dim>_<dtype-family>.py`. A dimension may be omitted when one kernel
+implementation covers multiple dimensions.
+
+A module SHARED across arch lines lives at `kernels/` level, not inside one
+arch's package (`_common_blackwell.py`, `thd_helpers.py`) — so the directory a
+file sits in always names its only owner, and a file inside `sm107/` can be
+changed without asking who else imports it.
+
+A new reader should be able to list `sdpa/fwd/kernels/*/` and see the whole
+coverage matrix on one screen.
 
 As a layer stack (each layer talks only to its neighbors):
 
@@ -577,7 +592,7 @@ honors" is a `dataclasses.fields()` walk over the spec table.
 The engine-to-kernel mapping is many-to-many by design:
 
 - One engine serves several dtypes through one template: the d512 engine
-  lowers fp16 and bf16 graphs to `prefill_d512_f16_sm100.py` with different
+  lowers fp16 and bf16 graphs to `sm100/prefill_d512_f16.py` with different
   TemplateParams.
 - One engine can drive several kernels: `EngineSpec.lower` is a hook
   `(spec, facts, knobs) -> executor`. The default (`lower_dsl_prefill`)
@@ -739,7 +754,7 @@ Asserts:
   never a module-level `assert` (stripped under `python -O`, and an
   import-time crash is undebuggable from the frontend).
 - Hardware-invariant geometry checks in a template use a raising helper (see
-  `_require` in `prefill_d512_f16_sm100.py`) and must be unreachable for any
+  `_require` in `sm100/prefill_d512_f16.py`) and must be unreachable for any
   parameter set the engine's capabilities admit.
 - Never `assert api.check_support()` -- it raises on failure and the assert is
   stripped under `-O`; call it plainly.
@@ -806,8 +821,11 @@ Asserts:
 9. **No module-level asserts on anything a user could trip.** Raise
    `ValueError` in validation functions; keep `assert` for programmer
    invariants inside tile_dsl at most.
-10. **Two directory levels under the pass, maximum.** Coverage axes go in
-    filenames and engine names, never in directory depth.
+10. **Two directory levels under the pass, maximum**, and ARCH is the only
+    coverage axis allowed to be one of them (`kernels/sm107/prefill_d128_fp8.py`).
+    Every other axis -- phase, head dim, dtype family -- goes in the filename and
+    the engine name. A module shared across arch lines stays at `kernels/` level
+    rather than inside one arch package.
 11. **Identifiers are keyed by op geometry, not model names.**
     `make_cfg_d512`, not `make_cfg_dsv4`; model provenance goes in comments
     only.
