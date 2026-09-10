@@ -12,7 +12,7 @@ import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / "ci" / "analysis" / "api_index.py"
+SCRIPT = ROOT / "tools" / "api_index.py"
 SPEC = importlib.util.spec_from_file_location("api_index", SCRIPT)
 api_index = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(api_index)
