@@ -112,6 +112,7 @@ def _select_sm100_backend(
     head_dim_v: Optional[int] = None,
     dtype: Optional[torch.dtype] = None,
     max_topk: int = 0,
+    total_s_q: Optional[int] = None,
     device_capability: Optional[Tuple[int, int]] = None,
     deterministic: bool = False,
 ) -> Tuple[str, int]:
@@ -144,6 +145,11 @@ def _select_sm100_backend(
         return "h16_m128", 128
     if num_heads == 32 and head_dim == 576:
         return "h32_m64", 64
+    if num_heads == 96 and head_dim == 576 and (total_s_q is None or total_s_q >= 1024 or max_topk >= 1024):
+        # Compose the established H64 kernel with the tuned H32 tail. Both
+        # components accumulate into one FP32 dKV workspace, which is cleared
+        # by H64 and converted once after H32 completes.
+        return "h96_h64_h32", 64
     return "generic_m64", 64
 
 
@@ -166,6 +172,10 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False):
         from .dsa_bwd_sm100_h32 import FlashAttentionDSABackwardSm100H32
 
         return FlashAttentionDSABackwardSm100H32
+    if backend == "h96_h64_h32":
+        from .dsa_bwd_sm100_h96 import FlashAttentionDSABackwardSm100H96
+
+        return FlashAttentionDSABackwardSm100H96
     if deterministic:
         return FlashAttentionDSABackwardSm100Deterministic
     return FlashAttentionDSABackwardSm100
@@ -258,6 +268,7 @@ def flash_attn_bwd_sm100(
         head_dim_v=head_dim_v,
         dtype=q.dtype,
         max_topk=max_topk,
+        total_s_q=total_S_q,
         device_capability=device_capability,
         deterministic=deterministic,
     )
