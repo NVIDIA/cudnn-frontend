@@ -500,7 +500,10 @@ class BlockScaleSpec:
     Currently runs (both sides): fp4 with any of e4m3 / e8m0 / e5m3 scales at
     either K-block (16 or 32) — the two axes are orthogonal, so nvfp4 and mxfp4
     are just the two best-known corners — plus fp8 (e4m3/e5m2) with e8m0 scales
-    at block 32. E5M3 scales additionally require SM 10.7+.
+    at block 32. Mixed mxfp8/mxfp4 is supported in either operand order (shared
+    e8m0 scale format, block 32): SM100 uses the K32 UTCQMMA padded-E2M1 layout,
+    while Rubin additionally provides a native-packed K64 form. E5M3 scales
+    require SM 10.7+.
 
     SF tensors are runtime-positional (not ``TensorRef``s), fully described here
     by per-side scalars; their logical dims derive from M/N/K/block_size. Passed
@@ -558,12 +561,26 @@ class BlockScaleSpec:
 
     @property
     def is_fp4(self) -> bool:
-        return self.a_dtype == "fp4_e2m1"
+        # Kept as the homogeneous-combo predicate it represented before mixed
+        # input widths were admitted.  Callers that need one side must inspect
+        # that side's dtype explicitly.
+        return self.both_fp4
+
+    @property
+    def both_fp4(self) -> bool:
+        return self.a_dtype == "fp4_e2m1" and self.b_dtype == "fp4_e2m1"
+
+    @property
+    def mixed_width(self) -> bool:
+        return (self.a_dtype == "fp4_e2m1") != (self.b_dtype == "fp4_e2m1")
 
     @property
     def mma_block_scale_kind(self) -> str:
         """GEMM ``nvvm.MMABlockScaleKind`` member name."""
-        return "MXF4NVF4" if self.is_fp4 else "MXF8F6F4"
+        # Rubin's mixed FP8/FP4 instruction is a UTCQMMA (MXF8F6F4), whose
+        # per-side format fields independently encode FP8 or E2M1.  MXF4NVF4
+        # is the UTCOMMA path and requires FP4 on both sides.
+        return "MXF4NVF4" if self.both_fp4 else "MXF8F6F4"
 
     @property
     def scale_vec_size(self) -> str:

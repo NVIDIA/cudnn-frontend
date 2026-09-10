@@ -1,7 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""sm100 block-scale GEMM kernel (nvfp4 / mxfp4 / mxfp8): persistent + CLC scheduler.
+"""sm100 block-scale GEMM kernel (nvfp4 / mxfp4 / mxfp8, including mixed
+MXFP8/MXFP4 on baseline SM100 K32 and Rubin K64): persistent + CLC scheduler.
 
 Serves both MMA modes; ``cta_group`` is an injected tile constant.
 
@@ -22,7 +23,8 @@ K-tile takes half as many MMAs, each consuming ``sf_scales_per_inst`` scales;
 when that outgrows a 128x4 utccp atom one SF word spans ``word_atoms`` atoms,
 and SFA is then laid out block-major while SFB is atom-major. At 32 every word
 is one atom and both collapse to the same addresses. fp4 rides the OMMA
-descriptor only at 64; at 32 it keeps the Mx descriptor's E5M2 piggy-back.
+descriptor only at 64. At 32 homogeneous fp4 keeps the Mx descriptor's E5M2
+piggy-back, while mixed fp8/fp4 uses the padded E2M1 operand encoding.
 
 Warp layout (8 warps × 32 = 256 threads/CTA):
   warps 0–3 : epilogue (warp 0 also allocates TMEM)  — setmaxnreg.inc 216
@@ -108,7 +110,7 @@ def _auto_swizzle_w(m, n, k, nt_n):
     if cutlass.const_expr(tile_swizzle_n > 0):
         return tile_swizzle_n
     budget = cutlass.Int64(swizzle_l2_budget_bytes)
-    row_bytes = (cutlass.Int64(ab_dtype.width) * k) // 8
+    row_bytes = (cutlass.Int64(ab_max_data_bits) * k) // 8
     cap = cutlass.max(budget // (row_bytes * cgrp_tile_mnk[1]), cutlass.Int64(1))
     w = cutlass.min(cutlass.Int64(nt_n), cap)
     if cutlass.min(m, n) * row_bytes <= budget and m <= n:
@@ -344,7 +346,7 @@ def _kernel(
     sB_elems = sB_packed_elems
     smem_a_list = [
         cutlass.Array(
-            ab_dtype,
+            a_smem_dtype,
             sA_elems * ab_stages,
             space=cutlass.AddressSpace.smem,
             alignment=1024,
@@ -353,7 +355,7 @@ def _kernel(
     ]
     smem_b_list = [
         cutlass.Array(
-            ab_dtype,
+            b_smem_dtype,
             sB_elems * ab_stages,
             space=cutlass.AddressSpace.smem,
             alignment=1024,
@@ -457,13 +459,13 @@ def _kernel(
     else:
         nvvm.barrier_cluster_arrive_relaxed()
 
-    sA_bytes = sA_elems * (ab_dtype.width // 8)
-    sB_bytes = sB_elems * (ab_dtype.width // 8)
+    sA_bytes = sA_elems * (a_smem_dtype.width // 8)
+    sB_bytes = sB_elems * (b_smem_dtype.width // 8)
     if cutlass.const_expr(cta_group == 1):
-        ab_only_copy_bytes = num_a_operands * sA_bytes + num_b_operands * sB_bytes
+        ab_only_copy_bytes = num_a_operands * sA_tma_bytes + num_b_operands * sB_tma_bytes
         sf_only_copy_bytes = num_a_operands * sfa_smem_bytes + num_b_operands * sfb_smem_bytes
     else:
-        ab_only_copy_bytes = (num_a_operands * sA_bytes + num_b_operands * sB_bytes) * 2
+        ab_only_copy_bytes = (num_a_operands * sA_tma_bytes + num_b_operands * sB_tma_bytes) * 2
         sf_only_copy_bytes = (num_a_operands * sfa_smem_bytes + num_b_operands * sfb_smem_bytes) * 2
 
     if cutlass.const_expr(cta_group == 2):
@@ -692,7 +694,7 @@ def _kernel(
                         if cutlass.const_expr(fallback_cluster_shape_mnk is None):
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    sA_stage.subview(n_rank * _a_rows * ab_packed_per_row),
+                                    sA_stage.subview(n_rank * _a_rows * a_packed_per_row),
                                     tma_a_desc.get_ptr(),
                                     (coord_k, coord_m_per_cta + n_rank * _a_rows, tile_l_a),
                                     ab_full_mbar_ptr.subview(stage),
@@ -708,7 +710,7 @@ def _kernel(
                                 _a_idx = n_rank * _a_per_cta + _asl
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sA_stage.subview(_a_idx * _a_rows * ab_packed_per_row),
+                                        sA_stage.subview(_a_idx * _a_rows * a_packed_per_row),
                                         tma_a_desc.get_ptr(),
                                         (coord_k, coord_m_per_cta + _a_idx * _a_rows, tile_l_a),
                                         ab_full_mbar_ptr.subview(stage),
@@ -785,7 +787,7 @@ def _kernel(
                         if cutlass.const_expr(fallback_cluster_shape_mnk is None):
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    sB_stage.subview(pair_m_idx * _b_rows * ab_packed_per_row),
+                                    sB_stage.subview(pair_m_idx * _b_rows * b_packed_per_row),
                                     tma_b_desc.get_ptr(),
                                     (coord_k, coord_n_per_cta + pair_m_idx * _b_rows, tile_l_b),
                                     ab_full_mbar_ptr.subview(stage),
@@ -801,7 +803,7 @@ def _kernel(
                                 _b_idx = pair_m_idx * _b_per_cta + _bsl
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sB_stage.subview(_b_idx * _b_rows * ab_packed_per_row),
+                                        sB_stage.subview(_b_idx * _b_rows * b_packed_per_row),
                                         tma_b_desc.get_ptr(),
                                         (coord_k, coord_n_per_cta + _b_idx * _b_rows, tile_l_b),
                                         ab_full_mbar_ptr.subview(stage),
@@ -1030,7 +1032,7 @@ def _kernel(
                     start_address=smem_a_list[i],
                     leading_byte_offset=a_smem_desc_leading_byte_offset,
                     stride_byte_offset=a_smem_desc_stride_byte_offset,
-                    layout=ab_smem_swizzle,
+                    layout=a_smem_swizzle,
                 )
                 for i in range(num_a_operands)
             ]
@@ -1039,7 +1041,7 @@ def _kernel(
                     start_address=smem_b_list[j],
                     leading_byte_offset=b_smem_desc_leading_byte_offset,
                     stride_byte_offset=b_smem_desc_stride_byte_offset,
-                    layout=ab_smem_swizzle,
+                    layout=b_smem_swizzle,
                 )
                 for j in range(num_b_operands)
             ]
@@ -1528,30 +1530,30 @@ def _host(
             tma_a_desc_list.append(
                 _tma.create_tensor_map_tiled(
                     global_address=_a_op.iterator.toint(),
-                    dtype=ab_tma_desc_dtype,
+                    dtype=a_tma_desc_dtype,
                     global_dims=[m, k_sym, a_batch],
                     global_strides=[
-                        a_stride_k * ab_dtype.width // 128,
-                        a_stride_l * ab_dtype.width // 128,
+                        a_stride_k * a_dtype.width // 128,
+                        a_stride_l * a_dtype.width // 128,
                     ],
                     box_dims=[a_tma_group_elems, cta_tile_mnk[2], 1],
-                    swizzle=ab_tma_swizzle,
-                    tma_format=ab_tma_format,
+                    swizzle=a_tma_swizzle,
+                    tma_format=a_tma_format,
                 )
             )
         else:
             tma_a_desc_list.append(
                 _tma.create_tensor_map_tiled(
                     global_address=_a_op.iterator.toint(),
-                    dtype=ab_tma_desc_dtype,
+                    dtype=a_tma_desc_dtype,
                     global_dims=[k_sym, m, a_batch],
                     global_strides=[
-                        a_stride_m * ab_dtype.width // 128,
-                        a_stride_l * ab_dtype.width // 128,
+                        a_stride_m * a_dtype.width // 128,
+                        a_stride_l * a_dtype.width // 128,
                     ],
                     box_dims=[cta_tile_mnk[2], cta_tile_mnk[0] // a_mcast_slices, 1],
-                    swizzle=ab_tma_swizzle,
-                    tma_format=ab_tma_format,
+                    swizzle=a_tma_swizzle,
+                    tma_format=a_tma_format,
                 )
             )
         sfa_fp16_tensor = cute.make_tensor(
@@ -1582,30 +1584,30 @@ def _host(
             tma_b_desc_list.append(
                 _tma.create_tensor_map_tiled(
                     global_address=_b_op.iterator.toint(),
-                    dtype=ab_tma_desc_dtype,
+                    dtype=b_tma_desc_dtype,
                     global_dims=[n, k_sym, b_batch],
                     global_strides=[
-                        b_stride_k * ab_dtype.width // 128,
-                        b_stride_l * ab_dtype.width // 128,
+                        b_stride_k * b_dtype.width // 128,
+                        b_stride_l * b_dtype.width // 128,
                     ],
                     box_dims=[b_tma_group_elems, cta_tile_mnk[2], 1],
-                    swizzle=ab_tma_swizzle,
-                    tma_format=ab_tma_format,
+                    swizzle=b_tma_swizzle,
+                    tma_format=b_tma_format,
                 )
             )
         else:
             tma_b_desc_list.append(
                 _tma.create_tensor_map_tiled(
                     global_address=_b_op.iterator.toint(),
-                    dtype=ab_tma_desc_dtype,
+                    dtype=b_tma_desc_dtype,
                     global_dims=[k_sym, n, b_batch],
                     global_strides=[
-                        b_stride_n * ab_dtype.width // 128,
-                        b_stride_l * ab_dtype.width // 128,
+                        b_stride_n * b_dtype.width // 128,
+                        b_stride_l * b_dtype.width // 128,
                     ],
                     box_dims=[cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1],
-                    swizzle=ab_tma_swizzle,
-                    tma_format=ab_tma_format,
+                    swizzle=b_tma_swizzle,
+                    tma_format=b_tma_format,
                 )
             )
         sfb_fp16_tensor = cute.make_tensor(
@@ -1716,7 +1718,8 @@ def _host(
 @lru_cache(maxsize=None)
 def compile() -> Callable:
     out_vec_elems = vec_bytes_epi // (cd_dtype.width // 8)
-    ab_stride_elems = 128 // ab_dtype.width
+    a_stride_elems = 128 // a_dtype.width
+    b_stride_elems = 128 // b_dtype.width
     sym_m = cute.sym_int64()
     sym_n = cute.sym_int64(divisibility=out_vec_elems)
     # K tails are supported: the K loop is ceil_div and the TMA descriptor's global K
@@ -1724,7 +1727,8 @@ def compile() -> Callable:
     # TMA contiguous-extent one, already gated by _tma_alignment_reject.
     sym_k = cute.sym_int64()
     # Packed K extent: same reasoning as sym_k -- no CTA-tile multiple is required.
-    sym_kp = cute.sym_int64()
+    sym_akp = cute.sym_int64()
+    sym_bkp = cute.sym_int64()
     sym_l = cute.sym_int64()
     if matmul_a_batch == 1:
         sym_a_l = 1
@@ -1738,7 +1742,7 @@ def compile() -> Callable:
     def _make_fake_a():
         return make_fake_compact_tensor(
             a_fake_dtype,
-            (sym_m, sym_kp, sym_a_l),
+            (sym_m, sym_akp, sym_a_l),
             stride_order=(0, 1, 2) if a_is_m_major else (1, 0, 2),
             assumed_align=16,
         )
@@ -1746,7 +1750,7 @@ def compile() -> Callable:
     def _make_fake_b():
         return make_fake_compact_tensor(
             b_fake_dtype,
-            (sym_n, sym_kp, sym_b_l),
+            (sym_n, sym_bkp, sym_b_l),
             stride_order=(0, 1, 2) if b_is_n_major else (1, 0, 2),
             assumed_align=16,
         )
@@ -1784,12 +1788,12 @@ def compile() -> Callable:
     # @@INJECT_COMPILE_AB_FAKES@@
 
     # The operand's unit stride (m/n when MN-major, k when K-major) never reaches TMA, so it carries no 16B contract.
-    sym_a_stride_m = cute.sym_int64() if a_is_m_major else cute.sym_int64(divisibility=ab_stride_elems)
-    sym_a_stride_k = cute.sym_int64(divisibility=ab_stride_elems) if a_is_m_major else cute.sym_int64()
-    sym_a_stride_l = cute.sym_int64(divisibility=ab_stride_elems)
-    sym_b_stride_n = cute.sym_int64() if b_is_n_major else cute.sym_int64(divisibility=ab_stride_elems)
-    sym_b_stride_k = cute.sym_int64(divisibility=ab_stride_elems) if b_is_n_major else cute.sym_int64()
-    sym_b_stride_l = cute.sym_int64(divisibility=ab_stride_elems)
+    sym_a_stride_m = cute.sym_int64() if a_is_m_major else cute.sym_int64(divisibility=a_stride_elems)
+    sym_a_stride_k = cute.sym_int64(divisibility=a_stride_elems) if a_is_m_major else cute.sym_int64()
+    sym_a_stride_l = cute.sym_int64(divisibility=a_stride_elems)
+    sym_b_stride_n = cute.sym_int64() if b_is_n_major else cute.sym_int64(divisibility=b_stride_elems)
+    sym_b_stride_k = cute.sym_int64(divisibility=b_stride_elems) if b_is_n_major else cute.sym_int64()
+    sym_b_stride_l = cute.sym_int64(divisibility=b_stride_elems)
 
     # @@INJECT_COMPILE_REDUCTION_STRIDE_DECLS@@
 

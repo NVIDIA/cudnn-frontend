@@ -245,7 +245,7 @@ _DT_FP4, _DT_E4M3, _DT_E5M2, _DT_E8M0 = (
     cudnn.data_type.FP8_E5M2,
     cudnn.data_type.FP8_E8M0,
 )
-# (a_dt, sf_dt, b_dt, block_size) for the 6 supported cases.
+# (a_dt, sf_dt, b_dt, block_size) for the supported cases.
 _SUPPORTED_BS_CASES = [
     (_DT_FP4, _DT_E4M3, _DT_FP4, 16),  # 1 nvfp4
     (_DT_FP4, _DT_E8M0, _DT_FP4, 32),  # 2 mxfp4
@@ -264,6 +264,30 @@ def test_block_scale_matmul_gate_accepts_supported(a_dt, sf_dt, b_dt, bs):
     _check_block_scale_supported(chain, "sm100")
 
 
+@pytest.mark.parametrize("a_dt,b_dt", [(_DT_FP4, _DT_E4M3), (_DT_FP4, _DT_E5M2), (_DT_E4M3, _DT_FP4), (_DT_E5M2, _DT_FP4)])
+def test_block_scale_matmul_gate_accepts_mixed_mxfp8_mxfp4(a_dt, b_dt, monkeypatch):
+    from cudnn.gemm.frost import compiler as C
+
+    chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E8M0, a_dt=a_dt, b_dt=b_dt))
+    C._check_block_scale_supported(chain, "sm100")
+    assert chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
+    cfg32 = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg64 = by_name(_SM107_128 + "_1ctamma")
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    assert select_template(chain, cfg32).accepts(chain, cfg32) is None
+    src32 = C._render_block_scale_tile_constants(cfg32, chain, select_template(chain, cfg32))
+    assigned32 = dict(re.findall(r"^(\w+) = (.*)$", src32, re.M))
+    assert assigned32["a_smem_dtype"] == ("cutlass.Uint8" if a_dt == _DT_FP4 else C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[a_dt]])
+    assert assigned32["b_smem_dtype"] == ("cutlass.Uint8" if b_dt == _DT_FP4 else C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[b_dt]])
+    assert "Float4E2M1FN_unpack" not in src32
+    monkeypatch.setattr(C, "_current_arch", lambda: 107)
+    assert select_template(chain, cfg64).accepts(chain, cfg64) is None
+    src64 = C._render_block_scale_tile_constants(cfg64, chain, select_template(chain, cfg64))
+    assigned64 = dict(re.findall(r"^(\w+) = (.*)$", src64, re.M))
+    assert assigned64["a_smem_dtype"] == C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[a_dt]]
+    assert assigned64["b_smem_dtype"] == C.DTYPE_TO_CUTLASS[_DTYPE_FROM_CUDNN[b_dt]]
+
+
 def test_block_scale_matmul_gate_rejects_mismatches():
     from cudnn.gemm.frost.compiler import _check_block_scale_supported
 
@@ -273,7 +297,7 @@ def test_block_scale_matmul_gate_rejects_mismatches():
     # FP8 data at block 16 — the fp8 rows are block-32 only, on every pipeline.
     with pytest.raises(NotImplementedError, match="does not support"):
         _check_block_scale_supported(analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=_DT_E8M0, a_dt=_DT_E4M3)), "sm100")
-    # mixed FP4 A / FP8 B (cross-family) — unsupported.
+    # Mixed width with a non-E8 scale has no UTCQMMA encoding.
     with pytest.raises(NotImplementedError, match="does not support"):
         _check_block_scale_supported(
             analyze(
@@ -282,7 +306,7 @@ def test_block_scale_matmul_gate_rejects_mismatches():
                     256,
                     512,
                     block_size=32,
-                    sf_dt=_DT_E8M0,
+                    sf_dt=_DT_E4M3,
                     a_dt=_DT_FP4,
                     b_dt=_DT_E4M3,
                 )
@@ -1456,6 +1480,13 @@ def test_mma_gpu_arch_special_cases(monkeypatch):
     for ok_sm in (100, 110):
         monkeypatch.setattr(C, "_current_arch", lambda v=ok_sm: v)
         assert kr.mma_arch_reject(int8_chain, kr.GraphType.MATMUL, "sm100") is None
+    # Mixed MXFP8/MXFP4 is a baseline SM100 UTCQMMA encoding (K32); Rubin adds
+    # a K64 form, but the MMA type itself needs no narrow arch exception.
+    mixed_chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E8M0, a_dt=_DT_FP4, b_dt=_DT_E4M3))
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    assert kr.mma_arch_reject(mixed_chain, kr.GraphType.BLOCK_SCALE_MATMUL, "sm100") is None
+    monkeypatch.setattr(C, "_current_arch", lambda: 107)
+    assert kr.mma_arch_reject(mixed_chain, kr.GraphType.BLOCK_SCALE_MATMUL, "sm100") is None
     # A family-portable combo is arch-free at this gate (stage 0 handles GPUs).
     bf16_chain = SimpleNamespace(matmul=SimpleNamespace(a_dtype="bf16", b_dtype="bf16", accum_dtype="fp32"))
     monkeypatch.setattr(C, "_current_arch", lambda: 90)
@@ -1855,6 +1886,81 @@ def test_k64_is_rejected_on_older_blackwell(monkeypatch):
 )
 def test_sm107_block_scale_matmul_numerics(combo, config_name, cta_group):
     _run_bs_numeric(combo, config_name, 256, 256, 512)
+
+
+@requires_sm100
+@pytest.mark.parametrize("fp8_on_a", [True, False], ids=["mxfp8_x_mxfp4", "mxfp4_x_mxfp8"])
+@pytest.mark.parametrize("fp8_torch_dt,fp8_cudnn_dt", [(torch.float8_e4m3fn, _DT_E4M3), (torch.float8_e5m2, _DT_E5M2)])
+@pytest.mark.parametrize("fp8_mn_major", [False, True], ids=["k_major", "mn_major"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
+        pytest.param(_SM107_128 + "_1ctamma", marks=requires_sm107),
+        pytest.param("CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma", marks=requires_sm107),
+    ],
+)
+def test_mixed_mxfp8_mxfp4_numerics(fp8_on_a, fp8_torch_dt, fp8_cudnn_dt, fp8_mn_major, config_name):
+    """K32 padded and Rubin K64 native-packed UTCQMMA, both operand orders."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    M = N = 256
+    K = 512
+    bs = 32
+    sf_k = K // bs
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+
+    fp8_a = (torch.randn(1, M, K, device=dev) * 0.5).to(fp8_torch_dt)
+    fp8_b = (torch.randn(1, N, K, device=dev) * 0.5).to(fp8_torch_dt)
+    fp4_a_u8 = torch.randint(0, 256, (1, M, K // 2), dtype=torch.uint8, device=dev)
+    fp4_b_u8 = torch.randint(0, 256, (1, N, K // 2), dtype=torch.uint8, device=dev)
+    fp4_a = fp4_a_u8.view(torch.float4_e2m1fn_x2)
+    fp4_b = fp4_b_u8.view(torch.float4_e2m1fn_x2)
+
+    if fp8_on_a:
+        a_rt, a_ref, a_dt = fp8_a, fp8_a.float().view(M, K), fp8_cudnn_dt
+        b_rt, b_ref, b_dt = fp4_b, _unpack_fp4(fp4_b_u8, lut).view(N, K), _DT_FP4
+        if fp8_mn_major:
+            a_rt = a_rt.transpose(1, 2).contiguous().transpose(1, 2)
+    else:
+        a_rt, a_ref, a_dt = fp4_a, _unpack_fp4(fp4_a_u8, lut).view(M, K), _DT_FP4
+        b_rt, b_ref, b_dt = fp8_b, fp8_b.float().view(N, K), fp8_cudnn_dt
+        if fp8_mn_major:
+            b_rt = b_rt.transpose(1, 2).contiguous().transpose(1, 2)
+
+    sfa_log = _rand_e8m0((M, sf_k), dev)
+    sfb_log = _rand_e8m0((N, sf_k), dev)
+    g = _build_nvfp4_graph(
+        M,
+        N,
+        K,
+        block_size=bs,
+        sf_dt=_DT_E8M0,
+        a_dt=a_dt,
+        b_dt=b_dt,
+        a_major="m" if fp8_on_a and fp8_mn_major else "k",
+        b_major="n" if not fp8_on_a and fp8_mn_major else "k",
+    )
+    compiled = _plan(g, **_kw(config_name))
+    assert compiled.chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
+
+    c = torch.zeros(1, M, N, dtype=torch.float16, device=dev)
+    compiled(
+        _vp_bs(
+            compiled,
+            a_rt,
+            b_rt,
+            c,
+            _to_blocked(sfa_log).view(1, M, sf_k),
+            _to_blocked(sfb_log).view(1, N, sf_k),
+        )
+    )
+    torch.cuda.synchronize()
+
+    a_deq = a_ref * sfa_log.float().repeat_interleave(bs, 1)
+    b_deq = b_ref * sfb_log.float().repeat_interleave(bs, 1)
+    torch.testing.assert_close(c[0], (a_deq @ b_deq.t()).to(torch.float16), atol=2e-1, rtol=2e-2)
 
 
 @requires_sm107

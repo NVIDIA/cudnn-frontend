@@ -175,8 +175,12 @@ def _build_graph(
     quant_axis=None,
     quant_group_offset=False,
     weight_major="k",
+    a_dt_override=None,
+    b_dt_override=None,
 ):
-    block_size, a_dt, sf_dt = _COMBOS[combo]
+    block_size, default_dt, sf_dt = _COMBOS[combo]
+    a_dt = default_dt if a_dt_override is None else a_dt_override
+    b_dt = default_dt if b_dt_override is None else b_dt_override
     sf_k = K // block_size
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -184,7 +188,7 @@ def _build_graph(
         compute_data_type=cudnn.data_type.FLOAT,
     )
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=a_dt)
-    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K] if weight_major == "k" else [K * N, N, 1], data_type=a_dt)
+    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K] if weight_major == "k" else [K * N, N, 1], data_type=b_dt)
     SFA = g.tensor(
         name="SFA",
         dim=[1, S, sf_k],
@@ -264,6 +268,18 @@ def test_analyzer_detects_moe_grouped_block_scale_matmul_fwd() -> None:
     assert chain.matmul.b_dtype == "fp4_e2m1"
     assert (chain.matmul.M, chain.matmul.N, chain.matmul.K) == (S, N, K)
     assert chain.output_dtype == "bf16"
+
+
+def test_build_graph_keeps_one_sided_dtype_overrides_independent() -> None:
+    """An override on one MMA operand must not change the other's combo default."""
+    shape = dict(E=2, S=256, N=128, K=256, num_groups=2, combo="mxfp4")
+    fp8 = cudnn.data_type.FP8_E4M3
+
+    a_mixed = analyze(_build_graph(**shape, a_dt_override=fp8))
+    assert (a_mixed.matmul.a_dtype, a_mixed.matmul.b_dtype) == ("fp8_e4m3", "fp4_e2m1")
+
+    b_mixed = analyze(_build_graph(**shape, b_dt_override=fp8))
+    assert (b_mixed.matmul.a_dtype, b_mixed.matmul.b_dtype) == ("fp4_e2m1", "fp8_e4m3")
 
 
 def test_analyzer_offset_dtype_int64() -> None:
@@ -646,6 +662,69 @@ def test_e2e_split_m_tile(cfg_name, cta_group) -> None:
 def test_e2e_mx_combos(combo) -> None:
     # mxfp4 (FP4 + E8M0, block32) / mxfp8 (FP8 E4M3 + E8M0, block32), K-major.
     _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=[0, 256, 384, 512], combo=combo)
+
+
+@requires_sm100
+@pytest.mark.parametrize("fp8_on_a", [True, False], ids=["mxfp8_x_mxfp4", "mxfp4_x_mxfp8"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        pytest.param("CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma", marks=requires_sm107),
+    ],
+)
+def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
+    """Grouped K32 padded and Rubin K64 native-packed mixed UTCQMMA."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    E, S, N, K = 2, 256, 128, 256
+    offsets_list = [0, 128]
+    bs, sf_k = 32, K // 32
+    fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    a_dt, b_dt = (fp8, fp4) if fp8_on_a else (fp4, fp8)
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+
+    tok_fp8 = (torch.randn(1, S, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    w_fp8 = (torch.randn(E, N, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    tok_u8 = torch.randint(0, 256, (1, S, K // 2), dtype=torch.uint8, device=dev)
+    w_u8 = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=dev)
+    if fp8_on_a:
+        tok_rt, tok_ref = tok_fp8, tok_fp8.float().view(S, K)
+        w_rt, w_ref = w_u8.view(torch.float4_e2m1fn_x2), _unpack_fp4(w_u8, lut).view(E, N, K)
+    else:
+        tok_rt, tok_ref = tok_u8.view(torch.float4_e2m1fn_x2), _unpack_fp4(tok_u8, lut).view(S, K)
+        w_rt, w_ref = w_fp8, w_fp8.float().view(E, N, K)
+
+    sfa_log = _rand_e8m0((S, sf_k), dev)
+    sfb_log = _rand_e8m0((E, N, sf_k), dev)
+    g = _build_graph(
+        E,
+        S,
+        N,
+        K,
+        len(offsets_list),
+        combo="mxfp8",
+        a_dt_override=a_dt,
+        b_dt_override=b_dt,
+    )
+    compiled = _plan(g, config=by_name(config_name))
+    assert compiled.chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
+
+    sfa_blk = torch.cat([_to_blocked(sfa_log[b : offsets_list[i + 1] if i + 1 < len(offsets_list) else S]) for i, b in enumerate(offsets_list)])
+    sfa_blk = _with_static_segmented_capacity(sfa_blk, S, len(offsets_list), sf_k)
+    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
+    output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
+    compiled(_vp_bs(compiled, tok_rt, w_rt, output, sfa_blk, sfb_blk, fto=offsets))
+    torch.cuda.synchronize()
+
+    tok_deq = tok_ref * sfa_log.float().repeat_interleave(bs, 1)
+    w_deq = w_ref * sfb_log.float().repeat_interleave(bs, 2)
+    ref = torch.zeros(S, N, dtype=torch.float32, device=dev)
+    for i, begin in enumerate(offsets_list):
+        end = offsets_list[i + 1] if i + 1 < len(offsets_list) else S
+        ref[begin:end] = tok_deq[begin:end] @ w_deq[i % E].T
+    torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=2e-1, rtol=2e-2)
 
 
 @pytest.mark.parametrize("cfg_name,cta_group", [(_CFG, 2), (_CFG_1CTA, 1)])
