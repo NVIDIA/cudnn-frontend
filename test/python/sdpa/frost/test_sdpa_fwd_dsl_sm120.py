@@ -258,6 +258,7 @@ def _run_dsl_graph(
     _require_dsl()
     import cudnn
 
+    from cudnn.sdpa.fwd.api_dsl import ws_align
     from cudnn.sdpa.fwd.engines import engine_name
 
     dtype = q_gpu.dtype
@@ -325,13 +326,21 @@ def _run_dsl_graph(
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name(arch="sm120"), tiles=tiles, pack_gqa=pack_gqa)
+    plan = _select_engine(graph, engine_name(arch="sm120"), tiles=tiles, pack_gqa=pack_gqa)
     graph.check_support()
     graph.build_plans()
     # Honest workspace: the SM120 kernel None-specializes the LSE store, so a
-    # stats-less graph needs no dummy-LSE chunk — dense workspace is always 0.
+    # stats-less dense graph needs no dummy-LSE chunk and no scratch at all.
+    # Only a KV split (the heuristics choose one for short-S_q, long-S_kv
+    # shapes) carves scratch: the half-precision partial O slab and the fp32
+    # partial LSE slab the combine pass reduces, each carve-aligned.
+    split_kv = plan.knobs.split_kv or 1
     expected_workspace = 0
-    assert graph.get_workspace_size() == expected_workspace
+    if split_kv > 1:
+        b, h, s_q, _ = q_gpu.shape
+        d_v = v_gpu.shape[-1]
+        expected_workspace = ws_align(split_kv * b * s_q * h * d_v * q_gpu.element_size()) + ws_align(split_kv * b * h * s_q * 4)
+    assert graph.get_workspace_size() == expected_workspace, (split_kv, graph.get_workspace_size(), expected_workspace)
 
     variant_pack[o] = o_gpu
     graph.execute(
@@ -383,6 +392,7 @@ def _run_thd_case(
     check_stats: bool = False,
     stats_layout: str = "token_major",
     cu_lens: bool = False,
+    nan_capacity_tail: bool = False,
 ) -> None:
     """Run a THD (ragged) graph on the SM120 engine vs per-sequence references.
 
@@ -405,9 +415,17 @@ def _run_thd_case(
     q_seqs = [_bhsd(1, h_q, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_q_lens]
     k_seqs = [_bhsd(1, h_kv, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_kv_lens]
     v_seqs = [_bhsd(1, h_kv, max(n, 1), d_v, dtype)[:, :, :n] for n in seq_kv_lens]
-    q_view, _, q_ro = _pack_thd([s.contiguous() for s in q_seqs], s_q_max)
-    k_view, _, k_ro = _pack_thd([s.contiguous() for s in k_seqs], s_kv_max)
-    v_view, _, v_ro = _pack_thd([s.contiguous() for s in v_seqs], s_kv_max)
+    q_view, q_storage, q_ro = _pack_thd([s.contiguous() for s in q_seqs], s_q_max)
+    k_view, k_storage, k_ro = _pack_thd([s.contiguous() for s in k_seqs], s_kv_max)
+    v_view, v_storage, v_ro = _pack_thd([s.contiguous() for s in v_seqs], s_kv_max)
+    if nan_capacity_tail:
+        # A THD caller binds K/V at buffer CAPACITY; rows in [total, capacity)
+        # were never written. NaN-poison them.
+        t_q = sum(seq_q_lens)
+        t_kv = sum(seq_kv_lens)
+        q_storage[t_q * h_q * head_dim :] = float("nan")
+        k_storage[t_kv * h_kv * head_dim :] = float("nan")
+        v_storage[t_kv * h_kv * d_v :] = float("nan")
     o_view, o_storage, o_ro = _pack_thd([torch.zeros(1, h_q, max(n, 1), d_v, dtype=dtype, device="cuda")[:, :, :n] for n in seq_q_lens], s_q_max)
     # SENTINEL fill: the kernel writes every valid packed O token (compared
     # against the reference below); everything else — the whole buffer when
@@ -525,6 +543,9 @@ def _run_thd_case(
             assert (stats_storage == _THD_SENTINEL).all(), "t_q == 0 wrote to the ragged Stats"
         return
     packed_o = o_storage[: cu[-1] * h_q * d_v].view(max(cu[-1], 1), h_q, d_v)
+    if nan_capacity_tail:
+        n_nan = int(torch.isnan(packed_o).sum())
+        assert n_nan == 0, f"{n_nan} NaNs in O -- the K/V capacity tail reached BMM2"
     if check_stats and stats_layout == "head_major":
         packed_stats = stats_storage.view(h_q, t_cap)  # (H, head_stride); tokens at [:, cu[i]:cu[i+1]]
     elif check_stats:
@@ -802,7 +823,7 @@ def test_dsl_sm120_stats_variants():
 
     _run_case(h_q=8, h_kv=1, s_q=256, s_kv=256, head_dim=128, dtype=torch.bfloat16, is_causal=True, check_stats=True)
     _run_case(q_tile=64, kv_tile=64, s_q=128, s_kv=128, head_dim=64, check_stats=True)
-    _run_case(head_dim=256, s_q=128, s_kv=128, check_stats=True)  # auto kv_tile=64
+    _run_case(head_dim=256, s_q=128, s_kv=128, check_stats=True)  # d256 flavor: default (64, 64)
     _run_case(batch=2, h_q=8, s_q=4096, s_kv=4096, head_dim=128, is_causal=True, check_stats=True)
 
 
@@ -922,8 +943,19 @@ def test_dsl_sm120_thd():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (248, 248)], ids=["d64", "d128", "d192x128", "d248"])
+@torch_fork_set_rng(seed=23)
+def test_dsl_sm120_thd_nan_capacity_tail(d_qk, d_v):
+    """THD with a NaN-poisoned capacity tail: O must be finite and correct.
+    (248, 248) runs the d256 kernel with zero-filled pad columns in the tail."""
+
+    _run_thd_case(seq_q_lens=[200, 150, 47], seq_kv_lens=[200, 150, 47], head_dim=d_qk, head_dim_v=d_v, is_causal=True, nan_capacity_tail=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [128, 256], ids=["d128", "d256"])
 @torch_fork_set_rng(seed=27)
-def test_dsl_sm120_thd_multi_unit_per_cta():
+def test_dsl_sm120_thd_multi_unit_per_cta(head_dim: int):
     """THD with more live units than the machine has CTAs.
 
     The other THD cases are small enough that every CTA is handed at most one
@@ -939,7 +971,7 @@ def test_dsl_sm120_thd_multi_unit_per_cta():
         seq_kv_lens=[1024, 768, 512, 256],
         h_q=8,
         h_kv=2,
-        head_dim=128,
+        head_dim=head_dim,
         is_causal=True,
         check_stats=True,
     )
@@ -992,14 +1024,15 @@ def test_dsl_sm120_thd_gqa_sink(stats_layout: str):
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize("head_dim", [64, 256], ids=["d64", "d256"])
 @torch_fork_set_rng(seed=26)
-def test_dsl_sm120_thd_zero_length_sequence():
+def test_dsl_sm120_thd_zero_length_sequence(head_dim: int):
     """A zero-length sequence contributes no tokens and must not perturb its
     packed neighbors (O and ragged Stats). The last sequence has Q tokens but
     ZERO keys inside a live launch: its rows must come back O := 0 with
     LSE := -inf through the kernel's row_sum <= 0 guard, not stale memory."""
 
-    _run_thd_case(seq_q_lens=[128, 0, 64], seq_kv_lens=[100, 0, 0], is_causal=True, check_stats=True)
+    _run_thd_case(seq_q_lens=[128, 0, 64], seq_kv_lens=[100, 0, 0], head_dim=head_dim, is_causal=True, check_stats=True)
 
 
 @pytest.mark.L1
@@ -1275,6 +1308,7 @@ def test_dsl_sm120_dense_flex_bhsd_contiguous():
         (208, None),
         (224, None),
         (240, None),
+        (248, None),  # d256 template, zero-padded 248 -> 256
         (256, None),
         (256, 64),
     ],
@@ -1282,6 +1316,61 @@ def test_dsl_sm120_dense_flex_bhsd_contiguous():
 @torch_fork_set_rng(seed=2)
 def test_dsl_sm120_representative_head_dimensions(head_dim: int, kv_tile: int | None):
     _run_case(head_dim=head_dim, kv_tile=kv_tile)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=2)
+def test_dsl_sm120_flavor_routing():
+    """The adapter resolves the kernel flavor from the head dims: dims the
+    general template would tile at 256 on both sides (f16: above 240) run the
+    d256 template, everything else the general one.
+    Unset tile knobs resolve exactly as on the general template; explicit knobs are honored
+    on both templates (a geometry that does not fit SMEM declines, as on the
+    general template)."""
+
+    _require_dsl()
+    from cudnn.sdpa.fwd import sdpa_fwd_wrapper_dsl_sm120
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    def _api(d_qk, d_v, **kw):
+        q = _bhsd(1, 4, 128, d_qk, torch.float16)
+        k = _bhsd(1, 4, 128, d_qk, torch.float16)
+        v = _bhsd(1, 4, 128, d_v, torch.float16)
+        o = _bhsd(1, 4, 128, d_v, torch.float16)
+        return SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, **kw)
+
+    for d_qk, d_v in ((64, 64), (128, 128), (192, 128), (256, 128), (240, 240), (256, 240)):
+        api = _api(d_qk, d_v)
+        assert api.check_support() and api.flavor is None, (d_qk, d_v)  # general template
+    ref = _api(240, 240)  # general template at the same grid: the flavor must not change the tiles
+    assert ref.check_support() and ref.flavor is None
+    for d_qk, d_v in ((256, 256), (248, 248), (256, 248)):
+        api = _api(d_qk, d_v)
+        assert api.check_support() and api.flavor == (256, 256) and (api.q_tile, api.kv_tile) == (ref.q_tile, ref.kv_tile), (d_qk, d_v)
+    api = _api(256, 256, tile_m=128)
+    assert api.check_support() and (api.q_tile, api.kv_tile) == (128, 64)  # explicit knob honored, default for the rest
+    with pytest.raises(NotImplementedError, match="shared memory"):
+        _api(256, 256, tile_n=128).check_support()  # a 128-wide KV tile does not fit at d256 in half precision
+    # The general template still takes the knobs.
+    api = _api(128, 128, tile_m=64, tile_n=64)
+    assert api.check_support() and (api.q_tile, api.kv_tile) == (64, 64)
+    q = _bhsd(1, 4, 128, 256, torch.float16)
+    with pytest.raises(NotImplementedError, match="shared memory"):
+        sdpa_fwd_wrapper_dsl_sm120(q, q, q, q_tile=128, kv_tile=128)
+
+
+@pytest.mark.L0
+def test_dsl_sm120_d256_template_rejects_dims_outside_its_envelope():
+    """The d256 template's compile() refuses head dims the adapter would never
+    route to it — a routing bug, not a user error, so it raises."""
+
+    _require_dsl()
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.config_sm120 import D256_FLAVOR, TemplateParams
+
+    module = api_dsl._load_sm120_kernel_module(D256_FLAVOR, TemplateParams(q_tile=64, kv_tile=64))
+    with pytest.raises(ValueError, match="do not tile to"):
+        module.compile(compute_capability=torch.cuda.get_device_capability(), b=1, qh=1, kh=1, sq=128, skv=128, d_qk=240, d_v=240, has_lse=False)
 
 
 @pytest.mark.L0
@@ -1538,8 +1627,8 @@ def test_dsl_sm120_head_dim_envelope(head_dim: int, head_dim_v: int):
 def test_dsl_sm120_head_dim_envelope_features():
     """The envelope composed with the feature family: padded + stats (LSE
     trim with pad columns), sink, and a THD ragged batch — plus a d=248 case
-    that forces the auto kv_tile=64 pick (per-chunk XOR phase at the smaller
-    tile)."""
+    on the d256 flavor, whose kv_tile=64 exercises the per-chunk XOR phase at
+    the smaller tile."""
     seq_q_lens = torch.tensor([150, 96], dtype=torch.int32, device="cuda")
     seq_kv_lens = torch.tensor([200, 128], dtype=torch.int32, device="cuda")
     _run_case(
@@ -1558,7 +1647,8 @@ def test_dsl_sm120_head_dim_envelope_features():
     # Envelope pad columns and a ragged S_kv tail in the SAME rightmost
     # tile: both zero-fill mechanisms at once, with the LSE checked.
     _run_case(batch=2, h_q=4, h_kv=4, s_q=192, s_kv=300, head_dim=104, head_dim_v=72, check_stats=True)
-    _run_case(head_dim=248, head_dim_v=248, s_q=128, s_kv=128)  # auto kv_tile=64
+    _run_case(head_dim=248, head_dim_v=248, s_q=128, s_kv=128)  # d256 flavor: (64, 64)
+    _run_case(head_dim=256, head_dim_v=248, s_q=128, s_kv=128)  # d256 flavor, padded on the V side only
     _run_thd_case(
         seq_q_lens=[130, 70],
         seq_kv_lens=[130, 70],
@@ -1602,8 +1692,8 @@ def test_dsl_sm120_right_band():
         seq_q_lens=seq_q_lens,
         seq_kv_lens=seq_kv_lens,
     )
-    # kv_tile=64 (auto-picked at d=248) with R a multiple of the tile: the
-    # 3-step masked frontier at the smaller tile.
+    # kv_tile=64 (the d256 flavor's, at d=248) with R a multiple of the tile:
+    # the 3-step masked frontier at the smaller tile.
     _run_case(head_dim=248, head_dim_v=248, s_q=128, s_kv=128, window_size_right=64)
     # Degenerate R >= S_kv: the widened bound clamps to full visibility.
     _run_case(batch=2, h_q=4, h_kv=4, s_q=128, s_kv=128, window_size_right=200)

@@ -6,6 +6,11 @@ name: Style check
 # run locally.
 on:
   pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
   push:
     branches:
       - develop
@@ -16,6 +21,8 @@ permissions:
 
 jobs:
   pre-commit:
+    # Draft PRs are skipped; marking one ready for review runs the check.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

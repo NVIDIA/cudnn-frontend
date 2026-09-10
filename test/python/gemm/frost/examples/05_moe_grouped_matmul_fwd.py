@@ -50,7 +50,7 @@ def _unpack_fp4(u8: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
 
 
 def _moe_config():
-    return next(c for c in CATALOG if c.name == "CONFIG_sm100_128x256x128_128x256x32_cluster2x1")
+    return next(c for c in CATALOG if c.name == "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
 
 
 def _dense_case() -> None:
@@ -82,7 +82,7 @@ def _dense_case() -> None:
     )
     out.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
 
-    compiled = jit_from_cudnn_graph(g, config=_moe_config(), cta_group=2)
+    compiled = jit_from_cudnn_graph(g, config=_moe_config())
 
     torch.manual_seed(0)
     token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
@@ -177,7 +177,7 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     )
     out.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
 
-    compiled = jit_from_cudnn_graph(g, config=_moe_config(), cta_group=2)
+    compiled = jit_from_cudnn_graph(g, config=_moe_config())
 
     # SFA reordered + padded to 128 rows PER GROUP then concatenated; SFB per-expert.
     sfa_parts = []

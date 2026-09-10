@@ -27,17 +27,16 @@ BSA is implemented with Python CuTe DSL/JIT kernels.
 
 ## Installation
 
-Install the CuTe DSL optional dependencies:
+The CuTe DSL runtime is a required dependency, so the base install is enough:
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
-The package-wide `nvidia-cutlass-dsl[cu13]>=4.5.0` dependency floor applies to
-BSA. The FP16/BF16 APIs continue to work with supported CuTe DSL 4.5 releases.
-The Sage FP8 API below performs an additional runtime check and requires
-`nvidia-cutlass-dsl>=4.6.1`; this narrower requirement does not change the
-package dependency floor or make importing `cudnn` require CuTe DSL 4.6.1.
+The package-wide `nvidia-cutlass-dsl[cu13]>=4.6.2` dependency floor applies to
+BSA. Sage FP8 relies on functionality introduced in CuTe DSL 4.6.1, which the
+package floor already satisfies. A defensive runtime check remains for
+environments that force an older DSL.
 
 ## Forward
 
@@ -168,19 +167,19 @@ backward implementation.
 
 The architecture-specific FP8 contracts are:
 
-- SM100/SM103 requires `B=1`, `H` equal to 4 or 8, and both sequence lengths
-  to be multiples of 64. It uses fixed `block_sparse_num` with full 64-token
-  KV blocks; `q2k_block_nums` and `block_sizes` are not supported. Split-KV is
-  selected internally, and the public FP8 API does not expose `kv_splits` or
-  `use_clc`.
+- SM100/SM103 accepts any positive batch and head counts and requires both
+  sequence lengths to be multiples of 64. It uses fixed `block_sparse_num`
+  with full 64-token KV blocks; `q2k_block_nums` and `block_sizes` are not
+  supported. Split-KV is selected internally, and the public FP8 API does not
+  expose `kv_splits` or `use_clc`.
 - SM120 accepts any positive batch and head counts, non-aligned Q/KV sequence
   tails, fixed or per-query-block counts, and `block_sizes` shaped `(N_kv,)`,
   `(B, N_kv)`, or `(B, H, N_kv)`. It does not use split-KV.
 
-`block_sparse_attention_fp8_forward` requires CuTe DSL 4.6.1 or newer at call
-time. Its internal Q/K/V quantizer is also implemented in CuTe DSL and is
-loaded lazily, so importing `cudnn` still works with the package-wide CuTe DSL
-4.5 dependency floor.
+`block_sparse_attention_fp8_forward` relies on functionality introduced in
+CuTe DSL 4.6.1; package-supported installations provide CuTe DSL 4.6.2 or
+newer. Its internal Q/K/V quantizer is also implemented in CuTe DSL and is
+loaded lazily, so importing `cudnn` does not eagerly import it.
 
 ## Backward
 
@@ -224,7 +223,7 @@ therefore requires full physical KV blocks and `block_sizes=None`.
 | SM90 | 64 | FP16, BF16 | each of 64, 96, 128 | MHA, GQA, MQA |
 | SM100/SM103 | 128 | FP16, BF16 | QK=V=64, 96, or 128 | MHA, GQA, MQA |
 | SM100/SM103 | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
-| SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA (B=1, H=4 or 8) |
+| SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 
@@ -270,7 +269,7 @@ Correctness tests and FP32 references are under
 
 ## Acknowledgements
 
-We would like to express our gratitude to <huangyitong.hyt@alibaba-inc.com> and
-<wenting.swt@alibaba-inc.com> for providing testing and optimization feedback
+We would like to express our gratitude to [huangyitong.hyt@alibaba-inc.com](mailto:huangyitong.hyt@alibaba-inc.com) and
+[wenting.swt@alibaba-inc.com](mailto:wenting.swt@alibaba-inc.com) for providing testing and optimization feedback
 throughout the deployment process, which has continuously advanced the BSA kernel
 toward Speed of Light.

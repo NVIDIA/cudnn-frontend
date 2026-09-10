@@ -152,7 +152,7 @@ class GdnCuTilePlan(CompiledPlan):
             self.execute_fwd(nb, region, stream)
 
     def execute_fwd(self, nb, region, stream) -> None:
-        gate = dict(use_gate_in_kernel=True, A_log=nb["a_log"], dt_bias=nb["dt_bias"]) if self.safe_gate else {}
+        gate = dict(use_gate_in_kernel=True, A_log=nb.get("a_log"), dt_bias=nb.get("dt_bias")) if self.safe_gate else {}
         self.kernels.chunk_gated_delta_rule(
             nb["q"],
             nb["k"],
@@ -209,6 +209,8 @@ class GdnCuTileEngine(BaseEngine):
         cutile_la_gate("GdnCuTileEngine", facts, "GDN", cudnn.data_type.FLOAT)
         if facts.is_bwd and facts.safe_gate:
             raise NotImplementedError("GdnCuTileEngine: safe_gate is forward-only")
+        if facts.gate_domain != "log":
+            raise NotImplementedError("GdnCuTileEngine: gate_domain='linear' has no cuTile path (the FROST GDN engine serves it)")
         if facts.use_beta_sigmoid:
             raise NotImplementedError("GdnCuTileEngine: use_beta_sigmoid has no cuTile path (the FROST GDN engine serves it)")
 

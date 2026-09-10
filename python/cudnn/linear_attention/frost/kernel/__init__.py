@@ -15,17 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Linear-attention kernels built on Cutlass primitives.
-
-GDN: ``gdn_prefill_f16.py`` (prefill, optional per-chunk H output) with
-``gdn_prefill_config.py``, and ``gdn_bprop_f16.py`` (backward) with
-``gdn_bprop_config.py``.  The tile primitives come from the shared
-``cudnn.frost.tile_dsl``; ``thd.py`` lives in ``..common``.
-
-KDA: ``kda_prefill_f16.py`` (prefill, BT=16, per-key-channel decay) with
-``kda_prefill_config.py``; ``kda_bprop_f16.py`` (backward) is a STUB.
-
-GDN-2: ``gdn2_prefill_f16.py`` (prefill, BT=16, per-key erase + per-value
-write gates) with ``gdn2_prefill_config.py``; ``gdn2_bprop_f16.py`` is a
-STUB.  KDA / GDN-2 do not store per-chunk H in the forward (small chunk);
-the backward recomputes."""
+"""Linear-attention kernels built on Cutlass primitives.  Per family (``gdn``, ``kda``, ``gdn2``): ``*_prefill_f16.py``,
+``*_bprop_f16.py``, ``*_recompute_f16.py`` (state / checkpoint-only recompute), ``*_bprop_summary_f16.py`` (the reverse
+state-gradient recurrence), ``*_summary_f16.py`` (fused H+M piece summary) and ``*_chain_prologue_f16.py``, each with its
+``*_config.py``.  GDP shares the GDN kernels except its d_v = 64 backward fork ``gdp_bprop_v64_f16.py``; GDN also has the
+chunk-factor T pass ``gdn_tinv_f16.py``.  KDA / GDN-2 store no per-chunk H in the forward; the backward recomputes."""

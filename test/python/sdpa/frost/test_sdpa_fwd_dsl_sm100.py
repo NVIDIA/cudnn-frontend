@@ -12,12 +12,35 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import make_dense_stats, requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
+from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl, _dsl_installed
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
-pytestmark = requires_pre_rubin_blackwell
+pytestmark = requires_blackwell
+
+# ONE engine per arch line: pin the row that serves the device under test.
+# ``engine_name(arch=_ARCH)`` defaults to arch="sm100", whose row stops at cc 10.6, so an
+# unqualified pin fails on Rubin with "no plan for engine" for routing reasons
+# that have nothing to do with the kernel.  Same shape as
+# test_sdpa_fwd_fp8_sm100.py / test_sdpa_fwd_mxfp8_sm100.py.
+_ARCH = "sm107" if _SM == 107 else "sm100"
+
+# Features the Rubin f16 row DECLINES (it is a strict subset of its Blackwell
+# counterpart -- see engines._sm107_spec).  These are capability declines the
+# row states honestly, not kernel bugs: the graph is never served, so the test
+# cannot run.  Flip each condition when the gap closes.
+_skip_split_kv_on_rubin = pytest.mark.skipif(_SM == 107, reason="the ported Rubin f16 kernels wire no SplitHelpers (row: split_kv_supported=False)")
+_skip_pack_gqa_on_rubin = pytest.mark.skipif(_SM == 107, reason="no PackGQA path in the ported Rubin f16 kernels (row: pack_gqas={False})")
+# FULLY INVERTED 2026-09-09: every Rubin f16 flavor (d128 / d192x128 / d256 /
+# d512) now serves THD, so the THD cases below run on BOTH arch lines and the
+# `_skip_thd_on_rubin` marker is RETIRED rather than left as a no-op that reads
+# like a live gate.  What the Rubin f16 row still declines is per-FEATURE --
+# split-KV and PackGQA -- and those keep their own markers.
+_skip_stats_trim_on_rubin = pytest.mark.skipif(
+    _SM == 107,
+    reason="per-batch seq_len_q O/LSE trim not carried by the Rubin f16 kernels " "(row: padded_stats=False / dense_seq_q_trim=False)",
+)
 
 
 def _ref_sdpa(q, k, v, *, is_causal, scale):
@@ -81,7 +104,7 @@ def test_sdpa_fwd_dsl_sm100_graph_api(dtype, is_causal, d):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name())
+    _select_engine(graph, engine_name(arch=_ARCH))
     graph.check_support()
     graph.build_plans()
     # Honest workspace: no Stats output, so the kernel compiles the LSE store
@@ -224,7 +247,7 @@ def _run_dsl_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(), pack_gqa=pack_gqa)
+    _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
@@ -418,6 +441,7 @@ def test_dsl_sm100_padded(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_stats_trim_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_graph_api_padded_bottom_right_gqa():
@@ -452,6 +476,7 @@ def test_dsl_sm100_graph_api_padded_bottom_right_gqa():
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_stats_trim_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["llama_d128", "mla_d192_d128", "qwen_d256", "dsv4_d512"])
 @torch_fork_set_rng(seed=0)
@@ -623,6 +648,33 @@ def test_dsl_sm100_gqa(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_d128", "d256", "d512"])
+@pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (8, 1)], ids=["g2", "g4", "mqa"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_dense_gqa_ratios(d_qk, d_v, h_q, h_kv):
+    """DENSE GQA/MQA across every ratio and every native f16 shape.
+
+    `test_dsl_sm100_gqa` above covers ONE ratio (8:2) and MQA (h_kv=1) appeared
+    only inside the PackGQA cases -- which the Rubin f16 row declines -- so the
+    widest head-sharing case went untested on exactly the shapes this arch
+    serves.  Dense GQA is NATIVE: `qh_per_kh` is threaded to the kernel, which
+    maps a Q head to its KV head; nothing expands K/V.  A wrong mapping is
+    therefore a silent wrong answer, and MQA is the case where an off-by-one
+    still lands on a VALID head and so cannot fault.
+
+    The FP8 and MXFP8 suites carry the same sweep."""
+    _require_dsl()
+    b, s = 2, 256
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h_q, s, d_qk, torch.float16)
+    k = _bhsd(b, h_kv, s, d_qk, torch.float16)
+    v = _bhsd(b, h_kv, s, d_v, torch.float16)
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=torch.float16, sdpa_kwargs=dict(use_causal_mask=True))
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
 # --- PackGQA: TILE_M/G tokens x G query heads per tile -------
 def _pack_gqa_case(d, h_q, h_kv, s_q, s_kv, dtype, *, sdpa_kwargs):
     q = _bhsd(2, h_q, s_q, d, dtype)
@@ -633,6 +685,7 @@ def _pack_gqa_case(d, h_q, h_kv, s_q, s_kv, dtype, *, sdpa_kwargs):
     return q, k, v, scale, o
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_pack_gqa_false_pinned():
@@ -650,6 +703,7 @@ def test_dsl_sm100_pack_gqa_false_pinned():
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "h_q,h_kv",
@@ -666,6 +720,7 @@ def test_dsl_sm100_pack_gqa_ratios(d, h_q, h_kv):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("h_q,h_kv", [(8, 2), (64, 1), (128, 1)], ids=["g4", "g64_mqa", "g128_mqa"])
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
@@ -681,6 +736,7 @@ def test_dsl_sm100_pack_gqa_d512(dtype, h_q, h_kv):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("h_q,s_q", [(64, 1), (64, 3), (128, 4)], ids=["g64_q1", "g64_q3_mtp", "g128_q4_mtp"])
 @torch_fork_set_rng(seed=0)
@@ -701,6 +757,7 @@ def test_dsl_sm100_pack_gqa_d512_mqa_decode(h_q, s_q):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)
@@ -717,6 +774,7 @@ def test_dsl_sm100_pack_gqa_d192_d128(dtype):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "d,h_q,h_kv,s_q",
@@ -741,6 +799,7 @@ def test_dsl_sm100_pack_gqa_tiles(d, h_q, h_kv, s_q):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("s_q", [1, 129, 1023, 2048])
 @torch_fork_set_rng(seed=0)
@@ -752,6 +811,7 @@ def test_dsl_sm100_pack_gqa_tiles_deep(s_q):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "mask",
@@ -795,6 +855,7 @@ def test_dsl_sm100_pack_gqa_features(mask):
     torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_pack_gqa_qtrim():
@@ -823,6 +884,7 @@ def test_dsl_sm100_pack_gqa_qtrim():
     torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_pack_gqa_knob_contract():
@@ -842,7 +904,7 @@ def test_dsl_sm100_pack_gqa_knob_contract():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        name = engine_name()
+        name = engine_name(arch=_ARCH)
         out = []
         for i in range(len(g.plans)):
             pn = g.get_plan_name_at_index(i)
@@ -938,7 +1000,7 @@ def test_dsl_sm100_thd(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro, kro: ro, vro: ro, oro: ro}
@@ -955,6 +1017,108 @@ def test_dsl_sm100_thd(dtype, d):
         o_ref[lo:hi] = ob.squeeze(0).permute(1, 0, 2)
 
     o_out = o_stor[: T * H * d].reshape(T, H, d)
+    torch.testing.assert_close(o_out, o_ref, atol=5e-2, rtol=3e-2)
+
+
+# Issue #624: a THD caller binds K/V at BUFFER CAPACITY, not at the packed
+# total, and the descriptor extent is the host-derived capacity. Rows in
+# [total, capacity) are therefore inside the extent and get loaded. They are
+# masked, so P == 0 -- but 0 * NaN == NaN, so an UNINITIALIZED capacity tail
+# wipes whole tiles of O. The setup kernel patches the K/V descriptor extent to
+# the packed total cu_k[B] device-side so those rows are TMA-OOB and land as
+# exact zeros instead. Total 397 is deliberately not a multiple of TILE_N, so
+# the last sequence's tail tile steps past it.
+@pytest.mark.L0
+# (d_qk, d_v) rather than a single d: d192/d128 is its own kernel flavor, and
+# a single-d parametrization cannot reach it.
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["llama", "dsv3", "qwen", "dsv4"])
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_nan_capacity_tail(dtype, d_qk, d_v):
+    """THD with a NaN-poisoned capacity tail: O must be finite and correct."""
+    _require_dsl()
+    import cudnn
+
+    dev = "cuda"
+    H = 8
+    seq_lens = [200, 150, 47]
+    B = len(seq_lens)
+    S_max = max(seq_lens)
+    T = sum(seq_lens)
+    cu = [0]
+    for s_i in seq_lens:
+        cu.append(cu[-1] + s_i)
+    scale = 1.0 / math.sqrt(d_qk)
+
+    q_pk = torch.randn(T, H, d_qk, device=dev, dtype=dtype)
+    k_pk = torch.randn(T, H, d_qk, device=dev, dtype=dtype)
+    v_pk = torch.randn(T, H, d_v, device=dev, dtype=dtype)
+
+    def _stride(dd):
+        return (S_max * H * dd, dd, H * dd, 1)
+
+    def _poisoned_buf(packed, dd):
+        """Capacity-sized storage; only [0, T) is live, the tail is NaN.
+
+        Returns the strided view only -- it keeps the storage alive, so there
+        is no need to bind the flat tensor as well."""
+        stor = torch.full((B * S_max * H * dd,), float("nan"), device=dev, dtype=dtype)
+        stor[: T * H * dd] = packed.reshape(-1)
+        return stor.as_strided((B, H, S_max, dd), _stride(dd))
+
+    q_gpu = _poisoned_buf(q_pk, d_qk)
+    k_gpu = _poisoned_buf(k_pk, d_qk)
+    v_gpu = _poisoned_buf(v_pk, d_v)
+    o_stor = torch.zeros(B * S_max * H * d_v, device=dev, dtype=dtype)
+    o_gpu = o_stor.as_strided((B, H, S_max, d_v), _stride(d_v))
+
+    slq = torch.tensor(seq_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+    slk = slq.clone()
+    cu_t = torch.tensor(cu, dtype=torch.int64, device=dev)
+    ro_qk = (cu_t * H * d_qk).view(B + 1, 1, 1, 1)
+    ro_v = (cu_t * H * d_v).view(B + 1, 1, 1, 1)
+
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tq = g.tensor(dim=[B, H, S_max, d_qk], stride=list(_stride(d_qk)), data_type=io, name="q")
+    tk = g.tensor(dim=[B, H, S_max, d_qk], stride=list(_stride(d_qk)), data_type=io, name="k")
+    tv = g.tensor(dim=[B, H, S_max, d_v], stride=list(_stride(d_v)), data_type=io, name="v")
+    sq = g.tensor_like(slq)
+    skv = g.tensor_like(slk)
+    qro = g.tensor_like(ro_qk)
+    kro = g.tensor_like(ro_qk)
+    vro = g.tensor_like(ro_v)
+    oro = g.tensor_like(ro_v)
+    tq.set_ragged_offset(qro)
+    tk.set_ragged_offset(kro)
+    tv.set_ragged_offset(vro)
+    o, _ = g.sdpa(
+        name="sdpa", q=tq, k=tk, v=tv, generate_stats=False, attn_scale=scale, use_causal_mask=True, use_padding_mask=True, seq_len_q=sq, seq_len_kv=skv
+    )
+    o.set_output(True).set_dim([B, H, S_max, d_v]).set_stride(list(_stride(d_v)))
+    o.set_ragged_offset(oro)
+
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    _select_engine(g, engine_name(arch=_ARCH))
+    g.check_support()
+    g.build_plans()
+    vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_qk, kro: ro_qk, vro: ro_v, oro: ro_v}
+    g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+    torch.cuda.synchronize()
+
+    o_out = o_stor[: T * H * d_v].reshape(T, H, d_v)
+    assert not torch.isnan(o_out).any(), f"{int(torch.isnan(o_out).sum())} NaNs in O -- the capacity tail reached BMM2"
+
+    o_ref = torch.zeros(T, H, d_v, device=dev, dtype=dtype)
+    for b in range(B):
+        lo, hi = cu[b], cu[b + 1]
+        qb = q_pk[lo:hi].permute(1, 0, 2).unsqueeze(0)
+        kb = k_pk[lo:hi].permute(1, 0, 2).unsqueeze(0)
+        vb = v_pk[lo:hi].permute(1, 0, 2).unsqueeze(0)
+        ob = _ref_sdpa_full(qb, kb, vb, scale=scale, is_causal=True)
+        o_ref[lo:hi] = ob.squeeze(0).permute(1, 0, 2)
     torch.testing.assert_close(o_out, o_ref, atol=5e-2, rtol=3e-2)
 
 
@@ -1028,7 +1192,7 @@ def test_dsl_sm100_thd_cross(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_q, kro: ro_k, vro: ro_k, oro: ro_q}
@@ -1198,7 +1362,7 @@ def _run_dsl_thd_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
@@ -1341,6 +1505,33 @@ def _run_thd_stats_case(
         else:
             got_lse = packed_stats[cu_q[i] : cu_q[i + 1]].t().unsqueeze(0)  # (T_i, H) -> (1, H, T_i)
         torch.testing.assert_close(got_lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@pytest.mark.parametrize("mask", ["none", "causal", "causal_br", "swa"])
+@torch_fork_set_rng(seed=30)
+def test_thd_d128_runs_on_every_arch_line(mask, stats_layout):
+    """f16 THD at d128, UNSKIPPED on Rubin as of 2026-09-09.
+
+    This is the coverage for the SM107 f16 THD port, and it deliberately
+    exercises the three things that port touched rather than a happy path:
+
+    - **both Stats layouts.** The kernel picks its store arm from the STATIC
+      rank compile() baked in.  Before the port the body implemented only the
+      head-major (rank-3) arm, while `_thd_compile_kwargs` defaults to
+      TOKEN-major -- so the common path would have transposed every LSE.
+    - **ragged, non-tile-aligned sequences** ([200, 150] against TILE_M=128),
+      so a tail tile is partly masked and the per-sequence Q length actually
+      gates the LSE store.
+    - **the mask arms**, because every one of them is `const_expr`-folded: a
+      dense THD pass proves nothing about the causal THD specialization.
+
+    On Rubin this also pins the metadata contract: the body now allocates 4B+4
+    with a batch_remap, which is what the SHARED decode reads.  When the two
+    disagreed the failure was not an error -- it was tiles reading the remap
+    out of the metadata's tail and attributing rows to the wrong sequence."""
+    _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[200, 150], d=128, mask=mask, stats_layout=stats_layout)
 
 
 @pytest.mark.L0
@@ -1510,6 +1701,32 @@ def test_dsl_sm100_thd_over_launched_units_are_dead(monkeypatch):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
+@torch_fork_set_rng(seed=41)
+def test_dsl_sm100_thd_multi_unit_per_cta(monkeypatch, d):
+    """THD with more live units than the grid has clusters (issue #618).
+
+    The persistent grid is sized to the MACHINE, so a cluster claims units
+    repeatedly off the device-bounded counter. Every other THD case here is
+    small enough that each cluster is handed at most one unit, so none of them
+    re-enters the K/V pipeline for a second one -- the regime where an
+    unmatched consumer arrival used to desynchronise the next unit's producer
+    handshake. These lengths give 48-80 live units depending on the flavor's
+    CGA tile; FROST_THD_CLUSTERS pins the grid to 4 clusters so the claim loop
+    runs deep regardless of the device's SM count, and the unpinned pass covers
+    the natural sizing.
+    """
+    _require_dsl()
+    lens = [1024, 768, 512, 256]
+
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
+    _run_thd_stats_case(seq_lens_q=lens, seq_lens_kv=lens, d=d, mask="causal", stats_layout="token_major")
+
+    monkeypatch.delenv("FROST_THD_CLUSTERS")
+    _run_thd_stats_case(seq_lens_q=lens, seq_lens_kv=lens, d=d, mask="causal", stats_layout="head_major")
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=39)
 def test_dsl_sm100_thd_lens_never_reach_host():
     """Issue #552 (D2H removal): the length tensors are consumed ONLY on
@@ -1636,6 +1853,47 @@ def test_dsl_sm100_thd_d192_d128_device_meta():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=44)
+def test_dsl_sm100_thd_d192_d128_multi_unit_per_cta(monkeypatch):
+    """d192/d128 THD where a cluster claims more than one unit (issue #618).
+
+    The sibling device_meta case is one unit per cluster, so it never re-enters
+    the K/V pipeline. FROST_THD_CLUSTERS pins the persistent grid to 4 clusters
+    against 16 live units, making every cluster run four unit ranges."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
+    b, h, s = 2, 4, 1024
+    d_qk, d_v = 192, 128
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d_qk)
+    q, k = (_bhsd(b, h, s, d_qk, dtype) for _ in range(2))
+    v = _bhsd(b, h, s, d_v, dtype)
+    o = torch.zeros_like(v)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    seq_lens = [1024, 768]
+    lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    torch.cuda.synchronize()
+    base_q = q.transpose(1, 2).reshape(b * s, h, d_qk)
+    base_k = k.transpose(1, 2).reshape(b * s, h, d_qk)
+    base_v = v.transpose(1, 2).reshape(b * s, h, d_v)
+    base_o = o.transpose(1, 2).reshape(b * s, h, d_v)
+    off = 0
+    for length in seq_lens:
+        qs = base_q[off : off + length].float()
+        ks = base_k[off : off + length].float()
+        vs = base_v[off : off + length].float()
+        scores = torch.einsum("lhd,mhd->hlm", qs, ks) * scale
+        ref = torch.einsum("hlm,mhd->lhd", torch.softmax(scores, dim=-1), vs)
+        torch.testing.assert_close(base_o[off : off + length].float(), ref, atol=5e-2, rtol=3e-2)
+        off += length
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=42)
 def test_dsl_sm100_thd_execute_cuda_graph_capture():
     """Issue #552 endgame (d128): THD execute is CUDA-GRAPH CAPTURABLE — no
@@ -1706,9 +1964,11 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
     FINITE. A caller that over-allocates and leaves the tail unwritten
     therefore poisons whole tiles through ``0 * NaN`` (issue #624).
 
-    Declaring the total clamps the TMA extent to the packed total, putting that
-    tail out of reach. Same graph, same data, only the tail fill differs: with
-    the declaration a NaN tail must be inert."""
+    Two mechanisms now put that tail out of reach: declaring the total clamps
+    the host-derived extent, and the THD setup kernel clamps the K/V extent to
+    ``cu_k[B]`` device-side regardless. Same graph, same data, only the tail
+    fill differs -- a NaN tail must be inert either way, and the two paths must
+    agree bit for bit."""
     _require_dsl()
     import cudnn
 
@@ -1765,7 +2025,7 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        _select_engine(g, engine_name())
+        _select_engine(g, engine_name(arch=_ARCH))
         g.check_support()
         g.build_plans()
         o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
@@ -1782,13 +2042,22 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
     )
     assert torch.equal(declared_nan, declared_zero), "O must not depend on the capacity tail once the total is declared"
 
-    # Control: the tail is genuinely reachable without the declaration, so the
-    # assertions above are testing the clamp rather than a benign shape.
+    # The undeclared path is NaN-safe too, and deliberately so: the THD setup
+    # kernel now patches the K/V descriptor extent to cu_k[B] device-side on
+    # every flavor, which bounds the tail without any host declaration. Before
+    # that clamp this same call poisoned ~50% of O, and this assertion was
+    # inverted -- it asserted the NaN to prove the tail was reachable.
     undeclared_nan = _run(float("nan"), declare_total=False)
-    assert torch.isnan(undeclared_nan).any(), (
-        "expected the undeclared path to read the capacity tail (issue #624); if this no longer "
-        "holds the extent is exact by other means and this test needs rethinking"
+    undeclared_zero = _run(0.0, declare_total=False)
+    assert not torch.isnan(undeclared_nan).any(), (
+        f"the device-side K/V extent clamp must bound the capacity tail with or without a declared "
+        f"total: {int(torch.isnan(undeclared_nan).sum())} NaNs in O"
     )
+    assert torch.equal(undeclared_nan, undeclared_zero), "O must not depend on the capacity tail"
+    # Declaring the total is now a host-side tightening (capacity, grid and
+    # workspace sizing) rather than the only thing standing between the kernel
+    # and the tail -- so both paths must agree bit for bit.
+    assert torch.equal(declared_nan, undeclared_nan), "declaring the packed total must not change the result"
 
 
 @pytest.mark.L0
@@ -1845,7 +2114,7 @@ def test_dsl_sm100_thd_interleaved_kv_views():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        _select_engine(g, engine_name())
+        _select_engine(g, engine_name(arch=_ARCH))
         g.check_support()
         g.build_plans()
         o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
@@ -1910,7 +2179,10 @@ def _combo_cases():
     cases, ids = [], []
     for flavor, dtype, heads, sink, layout in itertools.product(_FLAVORS, _DTYPES, ["mha", "gqa"], [False, True], ["dense", "thd"]):
         for mask in _COMBO_MASKS[layout]:
-            cases.append((flavor, dtype, heads, sink, layout, mask))
+            # THD is not ported to the Rubin f16 kernels, so its half of the
+            # cartesian is a capability decline there -- mark the PARAM, not
+            # the test, so the dense half still runs on Rubin.
+            cases.append(pytest.param(flavor, dtype, heads, sink, layout, mask) if layout == "thd" else (flavor, dtype, heads, sink, layout, mask))
             ids.append(
                 "-".join(
                     [

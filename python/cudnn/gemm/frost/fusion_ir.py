@@ -257,6 +257,23 @@ QUANT_DATA_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp4_e2m1")
 M_MAJOR_OUT_DTYPES = ("bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2", "fp8_e8m0", "fp8_e5m3", "int8", "uint8", "int32")
 
 
+def segmented_row_scale_capacity_rows(total_rows: int, num_groups: int) -> int:
+    """Static rows needed by independently 128-row-padded group segments.
+
+    Runtime group sizes are device data. For ``total_rows=M`` split across at
+    most ``num_groups=G`` non-empty groups, the exact maximum number of 128-row
+    atoms is ``A + (M - A) // 128``, where ``A=min(M,G)``. This graph-time
+    envelope admits every valid partition without synchronizing the offsets.
+    """
+    if total_rows < 0:
+        raise ValueError(f"segmented row scale total_rows must be non-negative; got {total_rows}")
+    if num_groups < 1:
+        raise ValueError(f"segmented row scale num_groups must be positive; got {num_groups}")
+    active = min(total_rows, num_groups)
+    max_atoms = active + (total_rows - active) // 128
+    return 128 * max_atoms
+
+
 @dataclass(frozen=True)
 class BlockQuantizeSpec:
     """One block-scale quantize node (cuDNN ``block_scale_quantize``): each
@@ -269,10 +286,16 @@ class BlockQuantizeSpec:
     Col quant: compact `(B, M/block_size, N)`, F8_128x4 = the transposed atom
     `(B, rup(N,128), rup(M/bs,4))`.
 
-    ``grouped_by_moe`` (col + F8_128x4 only; declared via ``group_offset=fto``
-    on the quant node) = per-group segmented col-SF: each routed group is its
-    own compact table at its atom-quad base, same total footprint. Runtime
-    CONTRACT: every fto value must be a multiple of ``4 * block_size``."""
+    ``grouped_by_moe`` (F8_128x4 only; declared via ``group_offset=fto`` on the
+    quant node) makes each routed group its own scale segment. For col quant the
+    segment is the group's compact transposed table at its atom-quad base; the
+    runtime CONTRACT remains that every fto value is a multiple of
+    ``4 * block_size``. For row quant the segment starts at the prefix sum of
+    the preceding groups' 128-row atom counts. For fixed ``M`` and declared
+    group count ``G``, ``scale_dim[1]`` must cover the graph-time worst case
+    ``128 * (A + (M-A)//128)``, ``A=min(M,G)``. This admits every valid runtime
+    partition without reading device offsets on the host. Padding scale bytes
+    are not written by the quantizer and must be initialized to a valid value."""
 
     source_ref: int
     block_size: int
@@ -297,8 +320,8 @@ class BlockQuantizeSpec:
             raise ValueError(f"block quantize scale reordering {self.scale_reorder!r} is not supported; " "expected None or F8_128x4")
         if self.compute_dtype != "fp32":
             raise ValueError(f"block quantize compute_dtype {self.compute_dtype!r} is not supported; " "expected fp32")
-        if self.grouped_by_moe and (self.axis != 1 or self.scale_reorder != "F8_128x4"):
-            raise ValueError("grouped block quantize requires the M axis (col) and F8_128x4 scale reordering")
+        if self.grouped_by_moe and self.scale_reorder != "F8_128x4":
+            raise ValueError("grouped block quantize requires F8_128x4 scale reordering")
 
 
 @dataclass(frozen=True)
@@ -477,7 +500,10 @@ class BlockScaleSpec:
     Currently runs (both sides): fp4 with any of e4m3 / e8m0 / e5m3 scales at
     either K-block (16 or 32) — the two axes are orthogonal, so nvfp4 and mxfp4
     are just the two best-known corners — plus fp8 (e4m3/e5m2) with e8m0 scales
-    at block 32. E5M3 scales additionally require SM 10.7+.
+    at block 32. Mixed mxfp8/mxfp4 is supported in either operand order (shared
+    e8m0 scale format, block 32): SM100 uses the K32 UTCQMMA padded-E2M1 layout,
+    while Rubin additionally provides a native-packed K64 form. E5M3 scales
+    require SM 10.7+.
 
     SF tensors are runtime-positional (not ``TensorRef``s), fully described here
     by per-side scalars; their logical dims derive from M/N/K/block_size. Passed
@@ -535,12 +561,26 @@ class BlockScaleSpec:
 
     @property
     def is_fp4(self) -> bool:
-        return self.a_dtype == "fp4_e2m1"
+        # Kept as the homogeneous-combo predicate it represented before mixed
+        # input widths were admitted.  Callers that need one side must inspect
+        # that side's dtype explicitly.
+        return self.both_fp4
+
+    @property
+    def both_fp4(self) -> bool:
+        return self.a_dtype == "fp4_e2m1" and self.b_dtype == "fp4_e2m1"
+
+    @property
+    def mixed_width(self) -> bool:
+        return (self.a_dtype == "fp4_e2m1") != (self.b_dtype == "fp4_e2m1")
 
     @property
     def mma_block_scale_kind(self) -> str:
         """GEMM ``nvvm.MMABlockScaleKind`` member name."""
-        return "MXF4NVF4" if self.is_fp4 else "MXF8F6F4"
+        # Rubin's mixed FP8/FP4 instruction is a UTCQMMA (MXF8F6F4), whose
+        # per-side format fields independently encode FP8 or E2M1.  MXF4NVF4
+        # is the UTCOMMA path and requires FP4 on both sides.
+        return "MXF4NVF4" if self.both_fp4 else "MXF8F6F4"
 
     @property
     def scale_vec_size(self) -> str:
@@ -579,6 +619,7 @@ class MoeSpec:
     # time; the scheduler casts reads to Int32 so the math is dtype-agnostic.
     offset_dtype: Dtype = "int32"
     num_groups: int = 0
+    offset_multiple: int = 1
 
     def __post_init__(self) -> None:
         if self.num_experts < 1:
@@ -589,6 +630,8 @@ class MoeSpec:
             raise ValueError(f"MoE grouped matmul mode {self.mode!r} is out of POC scope; " "only 'none' is supported (gather / scatter rejected)")
         if self.offset_dtype not in ("int32", "int64"):
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
+        if self.offset_multiple < 1:
+            raise ValueError(f"first_token_offset alignment_value must be >= 1; " f"got {self.offset_multiple}")
 
 
 def _walk_dtype_fields(obj: object, found: "set[Dtype]", *, in_dtype_field: bool = False) -> None:

@@ -73,7 +73,7 @@ becomes one consumer rather than the anchor.
 
 ## `Handle`
 
-```
+```text
 class Handle:
     backend_handle: int | None  # the wrapped cudnnHandle_t; None = pure-python (future)
     _ordinal: int | None        # CUDA device ordinal this handle is bound to
@@ -85,8 +85,7 @@ class Handle:
 to_backend_handle(h)          # a Handle's .backend_handle, a foreign int, or None
 ```
 
-`create_handle()` (Python, after the copy loop): `Handle(backend_handle=
-_pybind_module.create_handle(), ordinal=<current device>)`.
+`create_handle()` (Python, after the copy loop): `Handle(backend_handle=_pybind_module.create_handle(), ordinal=<current device>)`.
 
 ### `DeviceInfo` (the union `Handle.device` exposes)
 

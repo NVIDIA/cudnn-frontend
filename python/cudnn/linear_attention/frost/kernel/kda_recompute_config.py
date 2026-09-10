@@ -21,7 +21,7 @@ config (fixed compile-time constants).  The BT=16 KDA schedule uses a 16-warp
 SMEM/TMEM sizes and offsets are stamped by ``build_cfg`` in
 ``kda_recompute_f16.py``.
 
-Target arch: Blackwell SM100 (GB200) / SM103 (GB300).
+Target arch: Blackwell SM100 / SM103.
 """
 
 from dataclasses import dataclass
@@ -57,7 +57,6 @@ class Cfg:
     SMEM_SCHEDULER_STAGES: int = 8
     SMEM_DECAY_STAGES: int = 2
     SMEM_INTERMEDIATE_STAGES: int = 2
-    SMEM_STATE_SCALE_DIAG_STAGES: int = 4
     QK_SCALE_READY_STAGES: int = 4
 
     CLUSTER_SHAPE_MNK: Tuple[int, int, int] = (1, 1, 1)

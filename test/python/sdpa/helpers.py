@@ -60,6 +60,62 @@ def fill_sparse_small_int(tensor, rng, sparsity=0.8, abs_max=2):
 
     return tensor
 
+def inject_negative_score_rows(q, k, rng, *, attn_scale, k_shift=2, target=-200.0, row_fraction=1 / 16, head_axis=1, valid_rows=None):
+    """
+    Overwrite a random subset of q rows (at least one) so their attention
+    scores against every k row are deeply negative — below the fp32 exp
+    underflow cliff (score < ~-87) — while keeping every value exactly
+    representable in all tested dtypes.
+
+    Real models (e.g. Qwen2.5) routinely produce heads whose entire score row
+    is < -100. Sparse-small-int test data concentrates scores near 0 and never
+    reaches that regime, which let a masking-order bug in the decode softmax
+    (row max taken over unmasked oob kv columns) ship undetected: with all
+    valid scores negative, an oob score of 0 poisons the max and every valid
+    probability underflows to exactly 0 (pytorch/pytorch#193893).
+
+    Mechanism: draw a random +-1 direction u of length d; shift all of k by
+    +k_shift*u and set each selected q row to -m*u, with m a power of two
+    sized so the mean score -m*k_shift*d*attn_scale lands near `target`.
+    Powers of two and |k| <= abs_max + k_shift stay exact in fp8 e4m3/e5m2,
+    fp16, bf16 and fp32, preserving the suite's exact-arithmetic philosophy.
+    (Rows that are subsequently RoPE-rotated lose the guarantee — the
+    rotation mixes u across positions — which is fine: the data stays valid,
+    those tests just may not exercise the negative regime.)
+
+    GQA/MQA: inject only into the first q-head of each kv-head group — otherwise the large
+    u-aligned dK/dV partials cancel in the cross-head reduce, amplifying its staging rounding.
+
+    Args:
+        q, k: tensors whose innermost dim is d; a "row" is one index of
+            q.shape[:-1] (works for bhsd, bshd and packed thd layouts alike).
+        rng: torch.Generator on q's device.
+        attn_scale: the attention scale the test will use, so the injected
+            magnitude lands past the underflow cliff after scaling.
+        k_shift: integer amplitude of the common k component.
+        target: desired post-scale score for the selected rows.
+        row_fraction: fraction of eligible q rows to overwrite (min 1 row).
+        head_axis: which dim of q/k is the head (1 for bhsd/thd, 2 for bshd).
+        valid_rows: optional bool tensor of shape q.shape[:-1]; restricts
+            sampling to True rows (e.g. rows a padded layout actually uses).
+    """
+    d = q.shape[-1]
+    assert k.shape[-1] == d
+    u = (torch.randint(0, 2, (d,), generator=rng, device=q.device, dtype=torch.int64) * 2 - 1).to(torch.float32)
+    m = 2.0 ** math.ceil(math.log2(max(8.0, abs(target) / (k_shift * d * attn_scale))))
+    k.add_((k_shift * u).to(k.dtype))
+    lead = q.shape[:-1]
+    n_rows = math.prod(lead)
+    rows = torch.arange(n_rows, device=q.device)
+    if valid_rows is not None:
+        rows = rows[valid_rows.reshape(-1)]
+    heads_per_group = q.shape[head_axis] // max(1, k.shape[head_axis])
+    if heads_per_group > 1:
+        rows = rows[torch.unravel_index(rows, lead)[head_axis] % heads_per_group == 0]
+    count = max(1, int(rows.numel() * row_fraction))
+    sel = rows[torch.randperm(rows.numel(), generator=rng, device=q.device)[:count]]
+    q[torch.unravel_index(sel, lead)] = (-m * u).to(q.dtype)
+
 def create_sparse_int_tensor(shape, dtype, rng, *, device='cuda', sparsity=0.8, abs_max=2, memory_format=None):
     """
     Create a tensor filled with sparse small integers.
