@@ -2790,7 +2790,8 @@ Graph::get_engine_count(int64_t &count) {
 
 inline error_t
 Graph::get_knobs_for_engine(int64_t const engine, std::vector<Knob> &knobs) {
-    CHECK_CUDNN_FRONTEND_ERROR(detail::query_knobs(engine, operation_graph->get_raw_desc(), knobs));
+    CHECK_CUDNN_FRONTEND_ERROR(
+        detail::query_knobs(engine, operation_graph->get_raw_desc(), knobs, plans.get_max_shared_mem_allowed()));
 
     return {error_code_t::OK, ""};
 }
@@ -2839,8 +2840,12 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     // Query cuDNN heuristics for non-OPENSOURCE modes
     if (!cudnn_modes.empty()) {
         EngineConfigList op_graph_to_configs;
-        CHECK_CUDNN_FRONTEND_ERROR(detail::query_cudnn_heuristics_impl(
-            operation_graph, op_graph_to_configs, cudnn_modes, context.get_target_sm_count(), device_properties));
+        CHECK_CUDNN_FRONTEND_ERROR(detail::query_cudnn_heuristics_impl(operation_graph,
+                                                                       op_graph_to_configs,
+                                                                       cudnn_modes,
+                                                                       context.get_target_sm_count(),
+                                                                       device_properties,
+                                                                       plans.get_max_shared_mem_allowed()));
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Extracting engine configs.");
 
@@ -2865,8 +2870,8 @@ Graph::create_execution_plan(int64_t const engine_id, std::unordered_map<KnobTyp
     RETURN_CUDNN_FRONTEND_ERROR_IF(engine.get_status() != CUDNN_STATUS_SUCCESS,
                                    error_code_t::CUDNN_BACKEND_API_FAILED,
                                    "Failed to create engine's backend descriptor.");
-    CHECK_CUDNN_FRONTEND_ERROR(
-        detail::create_engine(engine, engine_id, operation_graph->get_raw_desc(), device_properties));
+    CHECK_CUDNN_FRONTEND_ERROR(detail::create_engine(
+        engine, engine_id, operation_graph->get_raw_desc(), device_properties, plans.get_max_shared_mem_allowed()));
 
     // Create an array of knob choices
     std::vector<detail::backend_descriptor> knob_choices;

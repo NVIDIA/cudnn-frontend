@@ -133,7 +133,8 @@ query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_
                             cudnn_frontend::EngineConfigList& configs,
                             std::vector<HeurMode_t> const& modes,
                             int32_t sm_count,
-                            std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
+                            std::shared_ptr<const DeviceProperties> device_properties = nullptr,
+                            int64_t shared_memory_limit                               = -1) {
     RETURN_CUDNN_FRONTEND_ERROR_IF(
         operation_graph == nullptr,
         error_code_t::HEURISTIC_QUERY_FAILED,
@@ -147,13 +148,13 @@ query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_
     // disable exception macro is defined. Calling build will not throw.
     // Check status of desc and return error.
     statuses = cudnn_frontend::get_heuristics_list(
-        modes, *operation_graph, allowAllConfig, configs, true, sm_count, device_properties);
+        modes, *operation_graph, allowAllConfig, configs, true, sm_count, device_properties, shared_memory_limit);
 #else
     // build() can throw
     // wrap in try catch
     try {
         statuses = cudnn_frontend::get_heuristics_list(
-            modes, *operation_graph, allowAllConfig, configs, true, sm_count, device_properties);
+            modes, *operation_graph, allowAllConfig, configs, true, sm_count, device_properties, shared_memory_limit);
     } catch (cudnn_frontend::cudnnException& e) {
         // Silly MSVC error that thinks below condition is constexpr
         // RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -287,6 +288,8 @@ class Execution_plan_list {
 
     int64_t max_workspace_allowed  = std::numeric_limits<int64_t>::max();
     int64_t max_shared_mem_allowed = 1024 * 1024 * 1024;  // Crazy high number (2GB) which will never be hit
+    // Avoid changing engine identities when the application did not request a limit.
+    bool max_shared_mem_allowed_set = false;
 
     std::vector<std::string> barred_engine_names = {};
     EngineConfigList engine_configs;
@@ -481,7 +484,13 @@ class Execution_plan_list {
 
     void
     set_max_shared_mem_allowed(int64_t const smem_allowed) {
-        max_shared_mem_allowed = smem_allowed;
+        max_shared_mem_allowed     = smem_allowed;
+        max_shared_mem_allowed_set = true;
+    }
+
+    int64_t
+    get_max_shared_mem_allowed() const {
+        return max_shared_mem_allowed_set ? max_shared_mem_allowed : -1;
     }
 
     void
