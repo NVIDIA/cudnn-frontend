@@ -2199,6 +2199,14 @@ def _softmax_warp_group(
 
                 chunk_P_0a = _exp2_chunk0a_mixed(reg_S[0:P_SUBCHUNK].vec, True)
                 hoisted_sum = row_reduction_pair(chunk_P_0a)
+                if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
+                    # Our P (keys 0-63) lands in S cols 96-111 -- the fused
+                    # warpgroup's UNREAD keys 96-111.  It arrives mb_stat_empty
+                    # only after its S-hi tcgen05.ld has landed, so waiting here
+                    # (instead of at the end of the iteration) orders the aliased
+                    # store after that read (GitHub #981 class, Rule S3).
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
                 chunk_P_0b = cute.math.exp2(reg_S[P_SUBCHUNK:CHUNK].vec, fastmath=True)
                 hoisted_sum = hoisted_sum + row_reduction_pair(chunk_P_0b)
@@ -2234,8 +2242,9 @@ def _softmax_warp_group(
                     new_p_sum_pair = new_p_sum_pair + deferred_sum_1
                 alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
                 total_sum = total_sum * alpha_pair + new_p_sum_pair
-                bars.mb_stat_empty.wait(stat_empty_phase)
-                stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
+                if cutlass.const_expr(not CFG.FUSED_CORR_SPLIT_P):
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
             for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
                 parity_rt = kv_loop & cutlass.Int32(1)
                 parity_is_even = parity_rt == cutlass.Int32(0)
@@ -2298,6 +2307,11 @@ def _softmax_warp_group(
                 chunk_P_0a = _exp2_chunk0a_mixed(reg_S[0:P_SUBCHUNK].vec, False)
                 if cutlass.const_expr(not _E5_STYLE_SOFTMAX):
                     hoisted_sum = row_reduction_pair(chunk_P_0a)
+                if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
+                    # Aliased P store into the fused warpgroup's unread S cols
+                    # 96-111: wait for its post-load mb_stat_empty arrive (#981).
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
                 if cutlass.const_expr(_E5_STYLE_SOFTMAX):
                     hoisted_sum = row_reduction_pair(chunk_P_0a)
@@ -2344,8 +2358,9 @@ def _softmax_warp_group(
                     new_p_sum_pair = new_p_sum_pair + deferred_sum_1
                 alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
                 total_sum = total_sum * alpha_pair + new_p_sum_pair
-                bars.mb_stat_empty.wait(stat_empty_phase)
-                stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
+                if cutlass.const_expr(not CFG.FUSED_CORR_SPLIT_P):
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
                 tail_active = True
                 if tail_active:
@@ -2431,6 +2446,11 @@ def _softmax_warp_group(
 
                     chunk_P_0a = _exp2_chunk0a_mixed(reg_S[0:P_SUBCHUNK].vec, True)
                     hoisted_sum = row_reduction_pair(chunk_P_0a)
+                    if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
+                        # Aliased P store into the fused warpgroup's unread S
+                        # cols 96-111: wait for its post-load arrive (#981).
+                        bars.mb_stat_empty.wait(stat_empty_phase)
+                        stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
                     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
                     chunk_P_0b = cute.math.exp2(reg_S[P_SUBCHUNK:CHUNK].vec, fastmath=True)
                     hoisted_sum = hoisted_sum + row_reduction_pair(chunk_P_0b)
@@ -2466,8 +2486,9 @@ def _softmax_warp_group(
                         new_p_sum_pair = new_p_sum_pair + deferred_sum_1
                     alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
                     total_sum = total_sum * alpha_pair + new_p_sum_pair
-                    bars.mb_stat_empty.wait(stat_empty_phase)
-                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
+                    if cutlass.const_expr(not CFG.FUSED_CORR_SPLIT_P):
+                        bars.mb_stat_empty.wait(stat_empty_phase)
+                        stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
 
         total_sum_scalar = total_sum[0] + total_sum[1]
         if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 2):
@@ -2636,6 +2657,9 @@ def _correction_warp_group(
             nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(64), cutlass.Float32),
             num=64,
         )
+        # This wait::ld must stay ahead of the mb_stat_empty arrive below: half
+        # 0 waits on that arrive before storing its P into S cols 96-111, which
+        # are our (still unread until here) keys 96-111 (GitHub #981 class).
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         if nvvm.elect_sync():
             nvvm.mbarrier_arrive(mb_qk_sf_reuse_arg.subview(parity_cur_rt))

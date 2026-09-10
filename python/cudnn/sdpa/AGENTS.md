@@ -64,7 +64,7 @@ ordered after that read.**
 
 - Some kernels have no spare TMEM and pack P into the tail of the S slot it
   was computed from (`P_EVEN_OFF`/`P_ODD_OFF` inside the `S_ACC_*` column
-  range — e.g. `prefill_d256_fp8_sm100.py`, `P_EVEN_OFF = 96` in a 128-col
+  range — e.g. `sm100/prefill_d256_fp8.py`, `P_EVEN_OFF = 96` in a 128-col
   slot). With a single softmax owner that is safe: all of S is in registers
   before any P store. It is a race the moment a row's keys are split across
   two softmax warpgroups: the half storing into the aliased columns
@@ -76,17 +76,34 @@ ordered after that read.**
   after its `tcgen05.ld` has landed (`tcgen05.wait::ld` first — the
   softmax paths otherwise never wait on loads explicitly), and the storing
   half waits on it right before the aliased store (`mb_softmax_hi_loaded`
-  in `prefill_d256_fp8_sm100.py`, mirroring `mb_softmax_max`). Do NOT try
+  in `sm100/prefill_d256_fp8.py`, mirroring `mb_softmax_max`). Do NOT try
   to fix it by swapping which half owns which keys: the alpha/stats value
   is aliased too (`STATS_*_OFF == S_ACC_*_OFF`, i.e. S column 0), so the
   half that stores alpha must also be the one that owns key 0 — the
   original ownership is forced, only the ordering was missing.
-- Detector: a kernel that matches both
-  `grep -l "mb_softmax_max" python/cudnn/sdpa/fwd/kernels/*.py` and
-  `grep -l "P_EVEN_OFF: int = " python/cudnn/sdpa/fwd/kernels/*.py` with
-  `P_EVEN_OFF < S_ACC_EVEN_OFF + 128` has this hazard class. For each P
-  store, name the warpgroup that still reads the target columns and the
-  barrier that orders the store after that read; if there is none, it is
-  a bug. The symptom in a fuzz suite is `ref == 0, gpu != 0` elements on
-  masked configs with `key mod TILE_N` in the aliased range — recover the
-  leaked keys by matching `O_gpu - O_ref` against `V` rows.
+- The same kernel family can hide the split behind a different role name.
+  `sm100/prefill_d256_mxfp8.py` has no `mb_softmax_max`: its
+  `FUSED_CORR_SPLIT_P` schedule (mxfp8 + strict top-left causal) gives
+  keys 64–127 to the *correction* warpgroup (`_fused_p1_step`), and half 0
+  stored P into cols 96–111 with nothing ordering it after that
+  warpgroup's S-hi load. There the release already existed —
+  `mb_stat_empty` is arrived right after that load — so the fix is to wait
+  on it *before* the aliased store instead of at the end of the iteration.
+  The dense split-P schedule of the same kernel is safe only because both
+  halves meet at a 256-thread named barrier (`barrier_id=8`) after their
+  loads; if that barrier ever moves below the P store, this comes back.
+- Detector: every kernel with `P_EVEN_OFF: int = ` inside the `S_ACC_*`
+  range (`grep -l "P_EVEN_OFF: int = " python/cudnn/sdpa/fwd/kernels/*/*.py`,
+  today the six d256 kernels) whose config can select
+  `SOFTMAX_WARPGROUPS == 2` (`grep -n "SOFTMAX_WARPGROUPS=2\|split_p\|fused_corr_split_p" python/cudnn/sdpa/fwd/config_*.py`)
+  — regardless of which role runs the second half. For each P store, name
+  the warpgroup that still reads the target columns and the barrier that
+  orders the store after that read; if there is none, it is a bug. Random
+  data can hide it: the lagging half usually lags only when it rescales O
+  (alpha ≠ 1), which `RESCALE_THRESHOLD` makes rare — force it with K
+  scaled by `growth ** (key // 128)` (`k_tile_growth` in
+  `test/python/sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py`; the pre-fix mxfp8
+  kernel then fails every run with inf/NaN O). The symptom in a fuzz suite
+  is `ref == 0, gpu != 0` elements on masked configs with `key mod TILE_N`
+  in the aliased range — recover the leaked keys by matching
+  `O_gpu - O_ref` against `V` rows.
