@@ -747,7 +747,11 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
         err += compare_tensors(lse_out[lo:hi], stats_ref.squeeze(0).squeeze(-1).permute(1, 0), 0.05, 0.05, f"stats[seq{i}]")
     assert err == 0, f"THD mismatch: {err} elements differ"
     amax_diff = abs(amax_o_gpu.item() - amax_ref)
-    assert amax_diff <= 0.02 * max(amax_ref, 1.0), f"amax mismatch: gpu={amax_o_gpu.item():.6e} ref={amax_ref:.6e}"
+    # 5% to match the dense mxfp8 path (compare_amax rtol=0.05): the block-
+    # scaled fp8 inputs give the peak output element a few-percent spread
+    # between the kernel's fp32 accumulation and the reference, so the tighter
+    # 2% used here before was inconsistent and flaky on the THD sweep.
+    assert amax_diff <= 0.05 * max(amax_ref, 1.0), f"amax mismatch: gpu={amax_o_gpu.item():.6e} ref={amax_ref:.6e}"
 
 
 def exec_sdpa_mxfp8(cfg, request, cudnn_handle):

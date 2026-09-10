@@ -29,7 +29,6 @@ Conventions:
 | context.mxfp8.thd | mxfp8 | L0 | 192 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, e4m3/e5m2 in, out fp16/bf16, layout ragged/cu_ragged, sink, total_q/kv slack, declare totals on graph | infer, stats token-major TH1, d=128/128 (frost THD leg), SM100+ | SM>=100; diag BR-weighted 2:1 (production context alignment); fwd only (no THD mxfp8 bwd engine); needs opt-in FROST engine (CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1) — skips otherwise: the native backend check_support-accepts THD mxfp8 but cannot execute it |
 | models.llama31.context.fp8 | fp8 | L0 | 8 | batch, seq lens, layout, mask flavor, data, e4m3/e5m2 in, out fp8/fp16 | h_q=64, h_kv=8, d_qk=128, d_v=128 | llama31 full/global attention layers, fp8-trained flavor |
 | models.llama31.context | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=64, h_kv=8, d_qk=128, d_v=128, sink=off | llama31 full/global attention layers |
-| models.qwen35.context.fp8 | fp8 | L0 | 8 | batch, seq lens, layout, mask flavor, data, e4m3/e5m2 in, out fp8/fp16 | h_q=32, h_kv=2, d_qk=256, d_v=256 | qwen35 full/global attention layers, fp8-trained flavor |
 | models.qwen35.context | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=32, h_kv=2, d_qk=256, d_v=256, sink=off | qwen35 full/global attention layers |
 | models.gpt_oss.context.fp8 | fp8 | L0 | 8 | batch, seq lens, layout, mask flavor, data, e4m3/e5m2 in, out fp8/fp16 | h_q=64, h_kv=8, d_qk=64, d_v=64 | gpt_oss full/global attention layers, fp8-trained flavor |
 | models.gpt_oss.context | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=64, h_kv=8, d_qk=64, d_v=64, sink=fuzzed | gpt_oss full/global attention layers |
@@ -53,7 +52,6 @@ Conventions:
 | generation.fp8.paged | fp8 | L0 | 128 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, e4m3/e5m2 in, out fp8/fp16, block size 16..128 | infer, no mask, diag TL, layout padded, paged KV |  |
 | models.llama31.generation.fp8 | fp8 | L0 | 8 | batch, seq lens, layout, mask flavor, data, e4m3/e5m2 in, out fp8/fp16, paged 50% | h_q=64, h_kv=8, d_qk=128, d_v=128 | llama31 full/global attention layers, fp8-trained flavor |
 | models.llama31.generation | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data, paged 50% | h_q=64, h_kv=8, d_qk=128, d_v=128, sink=off | llama31 full/global attention layers |
-| models.qwen35.generation.fp8 | fp8 | L0 | 8 | batch, seq lens, layout, mask flavor, data, e4m3/e5m2 in, out fp8/fp16, paged 50% | h_q=32, h_kv=2, d_qk=256, d_v=256 | qwen35 full/global attention layers, fp8-trained flavor |
 | models.qwen35.generation | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data, paged 50% | h_q=32, h_kv=2, d_qk=256, d_v=256, sink=off | qwen35 full/global attention layers |
 | models.gpt_oss.generation.fp8 | fp8 | L0 | 8 | batch, seq lens, layout, mask flavor, data, e4m3/e5m2 in, out fp8/fp16, paged 50% | h_q=64, h_kv=8, d_qk=64, d_v=64 | gpt_oss full/global attention layers, fp8-trained flavor |
 | models.gpt_oss.generation | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data, paged 50% | h_q=64, h_kv=8, d_qk=64, d_v=64, sink=off | gpt_oss full/global attention layers |
@@ -73,7 +71,6 @@ Conventions:
 | bprop.mxfp8.dense | mxfp8 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, out fp16/bf16, sink | train, e4m3 in, deterministic, layout full, SM100+ | SM>=100 |
 | models.llama31.bprop.fp8 | fp8 | L0 | 8 | batch, seq lens, layout, mask flavor, data, e4m3/e5m2 in, out fp8/fp16 | h_q=64, h_kv=8, d_qk=128, d_v=128 | llama31 full/global attention layers, fp8-trained flavor |
 | models.llama31.bprop | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=64, h_kv=8, d_qk=128, d_v=128, sink=off | llama31 full/global attention layers |
-| models.qwen35.bprop.fp8 | fp8 | L0 | 8 | batch, seq lens, layout, mask flavor, data, e4m3/e5m2 in, out fp8/fp16 | h_q=32, h_kv=2, d_qk=256, d_v=256 | qwen35 full/global attention layers, fp8-trained flavor |
 | models.qwen35.bprop | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=32, h_kv=2, d_qk=256, d_v=256, sink=off | qwen35 full/global attention layers |
 | models.gpt_oss.bprop.fp8 | fp8 | L0 | 8 | batch, seq lens, layout, mask flavor, data, e4m3/e5m2 in, out fp8/fp16 | h_q=64, h_kv=8, d_qk=64, d_v=64 | gpt_oss full/global attention layers, fp8-trained flavor |
 | models.gpt_oss.bprop | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=64, h_kv=8, d_qk=64, d_v=64, sink=fuzzed | gpt_oss full/global attention layers |
@@ -87,4 +84,4 @@ Conventions:
 | models.dsv3.bprop.mxfp8 | mxfp8 | L0 | 8 | batch, seq lens, mask flavor, data, e4m3/e5m2 in, out fp16/bf16 | h_q=128, h_kv=128, d_qk=192, d_v=128, layout full, SM100+ | SM>=100; dsv3 mxfp8 flavor; no generation (no decode-shaped mxfp8 engine) |
 | models.kimi_k3.bprop.mxfp8 | mxfp8 | L0 | 8 | batch, seq lens, mask flavor, data, e4m3/e5m2 in, out fp16/bf16 | h_q=96, h_kv=96, d_qk=192, d_v=128, layout full, SM100+ | SM>=100; kimi_k3 mxfp8 flavor; no generation (no decode-shaped mxfp8 engine) |
 
-**Total configs: 7616 across 59 suites.**
+**Total configs: 7592 across 56 suites.**

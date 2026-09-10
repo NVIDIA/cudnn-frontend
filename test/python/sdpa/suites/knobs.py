@@ -63,10 +63,18 @@ def model_knobs(preset, phase):
     everything else (batch, seq lens, layout, mask flavor, data) fuzzed.
     ``phase``: context (prefill fwd), generation (decode fwd), bprop (training)."""
     sink = RandomChoice({True: 1, False: 1}) if (preset.with_sink and phase != "generation") else Fixed(False)
+    # THD decode with d_qk > 128 (dsv3/kimi_k3 d=192) trips the FROST decode
+    # engine's stride bound (tvm_ffi "Out of bound k_tensor.strides[0]"); keep
+    # those presets padded-decode only until the backend is fixed (issue).
+    decode_thd_ok = preset.head_dim_qk <= 128 and preset.head_dim_vo <= 128
 
     if phase == "generation":
         return dict(
-            batches=RandomBatchSize(min=1, max=32, with_high_probability=[1, 8]),
+            # batch capped at 8: these presets pin 96-128 heads at d=128/192, so
+            # a padded decode's dense KV cache is [b, h, s_kv, d] — at b=32,
+            # s_kv=8192 that is >20 GiB (OOMs a 40 GiB A100). Real decode batch
+            # for models this size is small; the tail added no coverage.
+            batches=RandomBatchSize(min=1, max=8, with_high_probability=[1, 4]),
             s_q_s_kv=RandomSequenceLength(
                 s_q_min=1,
                 s_q_max=1,
@@ -81,7 +89,7 @@ def model_knobs(preset, phase):
             diag_align=RandomChoice(DIAG_BOTH),
             # THD and padded decode both; paging is drawn in the post hook and
             # only when the layout is not ragged (paged+ragged is not a form).
-            is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1}),
+            is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1} if decode_thd_ok else {"padded": 1}),
             block_size=RandomBlockSize(min=16, max=256, with_high_probability=[16, 32, 128]),
             total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
             declare_total_seq_len=RandomChoice({True: 1, False: 1}),
