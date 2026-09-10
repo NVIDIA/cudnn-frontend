@@ -10,6 +10,7 @@ every kv tile; the reference is plain Python on the same inputs."""
 import pytest
 import torch
 
+from cudnn.frost.tile_dsl.constants import MASK_CAUSAL, MASK_NONE, MASK_SWA
 from frost_test_utils import _dsl_installed, requires_dsl
 
 pytestmark = [pytest.mark.L0, requires_dsl]
@@ -21,7 +22,7 @@ if _dsl_installed():
     from cutlass.base_dsl.typing import Pointer
     from cutlass.cute.runtime import from_dlpack
 
-    from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_NONE, MASK_SWA, compute_q_loop_bounds, swa_kv_lo_tile
+    from cudnn.frost.tile_dsl.mask import compute_q_loop_bounds, swa_kv_lo_tile
 
     @cute.kernel
     def _probe_kernel(
