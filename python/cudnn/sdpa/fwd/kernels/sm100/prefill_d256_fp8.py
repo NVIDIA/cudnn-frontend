@@ -590,6 +590,17 @@ def _kernel(
         init_count=CFG.SOFTMAX_LANES,
         producer=Producer.THREAD,
     )
+    # Half 1 -> half 0: "my S chunk (keys 64-127) is in registers". Half 0's
+    # packed P for keys 0-63 lands in TMEM cols 96-111 of the SAME score slot
+    # -- the S of keys 96-111, which half 1 still has to read -- so that store
+    # must wait for this (GitHub #981: half 1 lagging a tile read clobbered
+    # scores and emitted garbage weights for exactly those keys).
+    mb_softmax_hi_loaded = MBarrier(
+        cutlass.Array(cutlass.Int64, 2, alignment=16, space=cutlass.AddressSpace.smem),
+        stages=2,
+        init_count=CFG.SOFTMAX_LANES,
+        producer=Producer.THREAD,
+    )
 
     sched = Sched(
         **{
@@ -647,6 +658,7 @@ def _kernel(
             if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 2):
                 for p in cutlass.range_constexpr(2):
                     mb_softmax_max[p].init()
+                    mb_softmax_hi_loaded[p].init()
             bars.mb_empty_mainloop.init()
             bars.mb_tmem_dealloc.init()
 
@@ -701,6 +713,7 @@ def _kernel(
             bottom_right_diagonal=bottom_right_diagonal,
             softmax_exchange=softmax_exchange,
             mb_softmax_max=mb_softmax_max,
+            mb_softmax_hi_loaded=mb_softmax_hi_loaded,
         )
 
     elif cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 2) and warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -731,6 +744,7 @@ def _kernel(
             bottom_right_diagonal=bottom_right_diagonal,
             softmax_exchange=softmax_exchange,
             mb_softmax_max=mb_softmax_max,
+            mb_softmax_hi_loaded=mb_softmax_hi_loaded,
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
@@ -1507,12 +1521,14 @@ def _softmax_warp_group(
     bottom_right_diagonal: cutlass.Constexpr[bool],
     softmax_exchange,
     mb_softmax_max,
+    mb_softmax_hi_loaded,
 ):
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
     tmem_base = tmem_ptr_i32.load()
 
     bmm1_done_phase_pair = cutlass.Int32(0)
     softmax_max_phase_pair = cutlass.Int32(0)
+    hi_loaded_phase_pair = cutlass.Int32(0)
     stat_empty_phase = cutlass.Int32(1)
     epilogue_state = cutlass.Int32(1)
 
@@ -1654,6 +1670,10 @@ def _softmax_warp_group(
                         ),
                         size=CHUNK,
                     )
+                    # S(keys 64-127) is in registers: release half 0's P store
+                    # into cols 96-111 (see mb_softmax_hi_loaded, GitHub #981).
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                    mb_softmax_hi_loaded[parity_rt].arrive()
                 if cutlass.const_expr(softmax_half == 1):
                     softmax_max_phase = (softmax_max_phase_pair >> parity_rt) & cutlass.Int32(1)
                     mb_softmax_max[parity_rt].wait(softmax_max_phase)
@@ -1690,6 +1710,12 @@ def _softmax_warp_group(
                     # Keep the multiply adjacent to the subtract so PTXAS can
                     # emit FFMA2 instead of a separate FMUL2/FADD2 pair.
                     reg_S_half = scale_log2 * reg_S_half - total_max_safe
+                if cutlass.const_expr(softmax_half == 0):
+                    # Our P (keys 0-63) overwrites S cols 96-111 = half 1's
+                    # unread keys 96-111; wait until half 1 holds them (#981).
+                    hi_loaded_phase = (hi_loaded_phase_pair >> parity_rt) & cutlass.Int32(1)
+                    mb_softmax_hi_loaded[parity_rt].wait(hi_loaded_phase)
+                    hi_loaded_phase_pair = hi_loaded_phase_pair ^ (cutlass.Int32(1) << parity_rt)
                 chunk_P_a = _exp2_dense_chunk_a(reg_S_half[0:P_SUBCHUNK].vec, softmax_half)
                 new_p_sum_pair = row_reduction_pair(chunk_P_a)
                 nvvm.tcgen05_st(
@@ -1802,6 +1828,10 @@ def _softmax_warp_group(
                             nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(CHUNK), cutlass.Float32),
                             num=CHUNK,
                         )
+                        # S(keys 64-127) is in registers: release half 0's P
+                        # store into cols 96-111 (mb_softmax_hi_loaded, #981).
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                        mb_softmax_hi_loaded[parity_rt].arrive()
                         masked_chunk = apply_mask_chunk(
                             raw_chunk,
                             mask_q_abs - (kv_col_base + cutlass.Int32(CHUNK)),
@@ -1837,6 +1867,12 @@ def _softmax_warp_group(
                         _stat_arrive(bars.mb_stat_full, _STAT_FULL_WARP_ARRIVALS)
 
                     reg_S_half = reg_S_half * scale_log2 - total_max_safe
+                    if cutlass.const_expr(softmax_half == 0):
+                        # Our P (keys 0-63) overwrites S cols 96-111 = half 1's
+                        # unread keys 96-111; wait until half 1 holds them (#981).
+                        hi_loaded_phase = (hi_loaded_phase_pair >> parity_rt) & cutlass.Int32(1)
+                        mb_softmax_hi_loaded[parity_rt].wait(hi_loaded_phase)
+                        hi_loaded_phase_pair = hi_loaded_phase_pair ^ (cutlass.Int32(1) << parity_rt)
                     if cutlass.const_expr(_SMEM_ALPHA_HANDOFF):
                         chunk_P_a = _exp2_masked_tail_chunk_a(reg_S_half[0:P_SUBCHUNK].vec, softmax_half)
                     else:

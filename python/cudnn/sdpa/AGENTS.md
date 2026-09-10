@@ -57,3 +57,36 @@ head-major, never dense-padded.**
 - Reviewing: if the diff touches `fwd/engines.py`, `bwd/engines.py` or
   `cudnn/engines/manifest.py` and `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` is
   untouched, ask why before approving.
+
+**Rule S3 — When P is aliased into a score slot's TMEM tail, the warpgroup
+that stores into columns another warpgroup still has to read must be
+ordered after that read.**
+
+- Some kernels have no spare TMEM and pack P into the tail of the S slot it
+  was computed from (`P_EVEN_OFF`/`P_ODD_OFF` inside the `S_ACC_*` column
+  range — e.g. `prefill_d256_fp8_sm100.py`, `P_EVEN_OFF = 96` in a 128-col
+  slot). With a single softmax owner that is safe: all of S is in registers
+  before any P store. It is a race the moment a row's keys are split across
+  two softmax warpgroups: the half storing into the aliased columns
+  overwrites the *other* half's unread S whenever that half lags a tile.
+  GitHub #981 was exactly this — garbage weights on keys 96–111, masked
+  paths only, sporadic and data-dependent (the no-mask fast path is
+  single-owner).
+- The fix is an explicit release: the reading half arrives an mbarrier
+  after its `tcgen05.ld` has landed (`tcgen05.wait::ld` first — the
+  softmax paths otherwise never wait on loads explicitly), and the storing
+  half waits on it right before the aliased store (`mb_softmax_hi_loaded`
+  in `prefill_d256_fp8_sm100.py`, mirroring `mb_softmax_max`). Do NOT try
+  to fix it by swapping which half owns which keys: the alpha/stats value
+  is aliased too (`STATS_*_OFF == S_ACC_*_OFF`, i.e. S column 0), so the
+  half that stores alpha must also be the one that owns key 0 — the
+  original ownership is forced, only the ordering was missing.
+- Detector: a kernel that matches both
+  `grep -l "mb_softmax_max" python/cudnn/sdpa/fwd/kernels/*.py` and
+  `grep -l "P_EVEN_OFF: int = " python/cudnn/sdpa/fwd/kernels/*.py` with
+  `P_EVEN_OFF < S_ACC_EVEN_OFF + 128` has this hazard class. For each P
+  store, name the warpgroup that still reads the target columns and the
+  barrier that orders the store after that read; if there is none, it is
+  a bug. The symptom in a fuzz suite is `ref == 0, gpu != 0` elements on
+  masked configs with `key mod TILE_N` in the aliased range — recover the
+  leaked keys by matching `O_gpu - O_ref` against `V` rows.
