@@ -183,6 +183,38 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
   python -m pytest test/jax/test_call.py test/jax/test_kda.py
 ```
 
+## Container tests
+
+The NGC JAX container can build the frontend from this checkout and run the full
+JAX KDA and shared-call suites without installing torch. Use an SM100/SM103 GPU:
+
+```bash
+set -o pipefail
+git archive HEAD | docker run --rm -i --gpus device=0 --shm-size=8g \
+  -e CUDA_VISIBLE_DEVICES=0 -e XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  -e JAX_PLATFORMS=cuda -e CMAKE_BUILD_PARALLEL_LEVEL=8 \
+  --entrypoint bash nvcr.io/nvidia/jax:26.07-py3 -lc '
+    set -euo pipefail
+    mkdir -p /workspace
+    cd /workspace
+    tar -xf -
+    python -m pip install ".[cutedsl]" "nvidia-cutlass-dsl[cu13]==4.7.1" pytest
+    python -c "import importlib.util; assert importlib.util.find_spec(\"torch\") is None"
+    python -m pytest -s -q test/jax
+  '
+```
+
+The archive contains committed files only. The container builds its own frontend
+extension; no host virtualenv or compiled extension is mounted. GPU CI must
+invoke the pytest command explicitly: an import-only check does not run KDA
+forward/backward kernels.
+
+Validated on SM100 with `nvcr.io/nvidia/jax:26.07-py3`: the frontend source build
+succeeded and all **21 tests passed, zero skipped**. The container used Python
+3.12.3, JAX `0.10.2.dev20260630+3757395a28`, CUDA 13.3, cuDNN 9.24.0 and
+CuTeDSL 4.7.1, with no PyTorch installation. This includes the subprocess that
+rejects torch imports while compiling and executing a jitted KDA gradient.
+
 ## Measurements and remaining blocker
 
 Measured on SM100 (148 SMs), Python 3.14, JAX 0.11.1, CuTeDSL 4.7.1,
