@@ -1156,6 +1156,7 @@ def test_sdpa_thd_batch_stride_int32_overflow_L0(env_info, request, cudnn_handle
         is_cu_seq_len=False,
         is_ragged=True,
         with_ragged_token_gap=False,  # packed contract: token stride = h*d exactly
+        with_ragged_head_gap=False,
         is_dropout=False,
         is_determin=False,
         batches=len(seq_len_kv),
