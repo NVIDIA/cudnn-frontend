@@ -155,6 +155,13 @@ def _check_matching_channels(image, weight) -> None:
         raise NotImplementedError(f"frost_conv: image/filter channels differ ({image.dim[1]} vs {weight.dim[1]})")
 
 
+def _check_conv_mode(node, expected_mode=cudnn._pybind_module.convolution_mode.CROSS_CORRELATION):
+    """Checks if the convolution mode of node matches expected_mode."""
+    conv_mode = node.params.get("convolution_mode", cudnn._pybind_module.convolution_mode.CROSS_CORRELATION)
+    if conv_mode != expected_mode:
+        raise NotImplementedError(f"frost_conv: expect convolution mode to be {expected_mode} but got {conv_mode}")
+
+
 def _check_3d_conv_geometry(node, image, weight):
     """Validate shared 3D im2col limits and return the output shape."""
     pre_padding = _tuple_param(node, "pre_padding", _ZERO)
@@ -228,6 +235,7 @@ class _Sm100FrostConvPlan(CompiledPlan):
         tensors = (image, weight, output)
         _check_5d_inputs(tuple(zip(("image", "weight", "Y"), tensors)))
         _check_matching_channels(image, weight)
+        _check_conv_mode(node)
         expected_output = _check_3d_conv_geometry(node, image, weight)
 
         image_dtype = _storage_dtype_name(image.data_type)
@@ -514,6 +522,7 @@ class _Sm100FrostBlockScaleConvPlan(CompiledPlan):
         if analysis.epilogue_node is not None and conv_output.data_type != cudnn.data_type.FLOAT:
             raise NotImplementedError("frost_conv: an explicit unary epilogue requires a FLOAT convolution intermediate")
 
+        _check_conv_mode(node)
         expected_output = _check_3d_conv_geometry(node, image, weight)
         _check_output_shapes(expected_output, (("convolution result", conv_output), ("epilogue result", epilogue_output), ("D", output)))
 
