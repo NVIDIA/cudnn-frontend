@@ -12,7 +12,7 @@ import inspect
 from pathlib import Path
 import sys
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 
 
 def public(name):
@@ -104,7 +104,7 @@ def main(argv=None):
     expected = args.index.read_text(encoding="utf-8") if args.index.exists() else ""
     if expected != actual:
         print("".join(difflib.unified_diff(expected.splitlines(True), actual.splitlines(True), fromfile=str(args.index), tofile="runtime API")), end="")
-        print("API index mismatch. Review the change, then run test/api_index/api_index.py --write with the same built package.")
+        print("API index mismatch. Review the change, then run test/python/api_index/api_index.py --write with the same built package.")
         return 1
     print(f"API index matches ({len(actual.splitlines())} names).")
     return 0
