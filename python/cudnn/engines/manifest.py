@@ -166,7 +166,10 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "kda",
         "cudnn.linear_attention",
         "KdaEngines",
-        slots={"kda_frost": EngineSlot(0), "kda_cutile": EngineSlot(1), "kda_summary_frost": EngineSlot(2)},
+        # kda_cake declines in check_support unless the opt-in flag is set (its
+        # forward numerics vs FLA are not reconciled yet); the slot itself is not
+        # gated, since no LA family may withhold its only implementations.
+        slots={"kda_frost": EngineSlot(0), "kda_cutile": EngineSlot(1), "kda_summary_frost": EngineSlot(2), "kda_cake": EngineSlot(3)},
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
