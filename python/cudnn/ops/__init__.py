@@ -18,6 +18,10 @@ _LAZY_EXPORTS = {
     "b2b_causal_conv1d": (".causal_conv1d", "b2b_causal_conv1d"),
     "causal_conv1d_update": ("._causal_conv1d_update", "causal_conv1d_update"),
     "fft_causal_conv1d": (".fft_causal_conv1d", "fft_causal_conv1d"),
+    "Nvfp4BlockScaleQuantizer": (".nvfp4", "Nvfp4BlockScaleQuantizer"),
+    "Nvfp4BlockScaleDequantizer": (".nvfp4", "Nvfp4BlockScaleDequantizer"),
+    "nvfp4_block_scale_quantize": (".nvfp4", "nvfp4_block_scale_quantize"),
+    "nvfp4_block_scale_dequantize": (".nvfp4", "nvfp4_block_scale_dequantize"),
 }
 
 __all__ = list(_LAZY_EXPORTS)
