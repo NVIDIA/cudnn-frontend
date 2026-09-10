@@ -37,7 +37,7 @@ Architecture:
 """
 
 from abc import ABC, abstractmethod
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -439,7 +439,18 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
 
 
 class WgradScaledGemmSchedExtension(MoESchedExtension):
-    """Scheduler extension for grouped GEMM wgrad (2Dx2D)."""
+    """Scheduler extension for grouped GEMM wgrad (2Dx2D).
+
+    With ``sgk`` set, the extension also serves the K-grouped second-level A
+    scale ``"sfa2"`` of the subchannel-scaled wgrad kernel (SFA2 only — wgrad
+    has no SFB2). In wgrad K is the ragged token axis, so unlike the dgrad
+    family's M-grouped sfa2 the scale group axis lies on K: the SFA2 grid is
+    ((sgm, M), (sgk, tokens_sum/sgk), 1) and an expert's view is a
+    domain_offset by token_offset // sgk whole scale COLUMNS. The host API
+    enforces token_counts[e] % sgk == 0, so every prior expert contributes
+    whole columns and the division is exact. SFA2 is loaded via LDGSTS — no
+    TMA descriptor, no tensormap slot.
+    """
 
     def __init__(
         self,
@@ -447,11 +458,13 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
         sf_vec_size: int,
         weight_mode: MoEWeightMode,
         input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
+        sgk: Optional[int] = None,
     ):
         super().__init__(tensormap_ctor)
         self.sf_vec_size = sf_vec_size
         self.weight_mode = weight_mode
         self.input_order = input_order
+        self.sgk = sgk
 
     def __extract_mlir_values__(self):
         return extract_mlir_values(self.tensormap_ctor)
@@ -463,6 +476,7 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
             sf_vec_size=self.sf_vec_size,
             weight_mode=self.weight_mode,
             input_order=self.input_order,
+            sgk=self.sgk,
         )
 
     def update_expert_info(self, offs, expert_idx):
@@ -510,6 +524,19 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
             real = rewrite_tensor_shape(gmem_tensor_in_moe_view, sf_layout.shape)
             desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr(tensor_name, expert_idx))
             return (real, desc)
+
+        if cutlass.const_expr(tensor_name == "sfa2"):
+            # SFA2: ((sgm, M), (sgk, tokens_sum/sgk), 1) 2nd-level scale,
+            # grouped along K → offset whole scale columns by
+            # token_offset // sgk (exact: all counts are sgk-aligned),
+            # preserving the pre-built hierarchical broadcast layout.
+            scale_col_offset = token_offset // self.sgk
+            scale_cols_i = tokens_i // self.sgk
+            real = cute.domain_offset(((0, 0), (0, scale_col_offset), 0), gmem_tensor_in_moe_view)
+            sgm = shape[0][0]
+            sgk = shape[1][0]
+            real_sfa2 = rewrite_tensor_shape(real, ((sgm, shape[0][1]), (sgk, scale_cols_i), c1))
+            return (real_sfa2, None)  # No TMA descriptor — LDGSTS
 
         raise ValueError(f"WgradScaledGemmSchedExtension: unknown tensor '{tensor_name}'")
 

@@ -2504,15 +2504,5 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
             )
         else:
             return ContiguousAndConsistentGroupedGemmSchedExtension(
-        # Discrete mode resolves per-expert B/SFB via prebuilt TMA descriptors;
-        # dense mode uses the contiguous grouped-GEMM scheduler extension
-        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE):
-            desc_workspace = TensormapWorkspace(workspace_ptr, ["b", "sfb"])
-            return DiscreteWeightScaledGemmSchedExtension(
-                tensormap_ctor=desc_workspace,
-                sf_vec_size=self.sf_vec_size,
-            )
-        else:
-            return ContiguousAndConsistentGroupedGemmSchedExtension(
                 sf_vec_size=self.sf_vec_size,
             )

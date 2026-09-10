@@ -1216,6 +1216,76 @@ def compute_stages_wgrad(
     return num_acc_stage, num_ab_stage, num_c_stage
 
 
+def compute_stages_wgrad_2nd_level(
+    tiled_mma: cute.TiledMma,
+    mma_tiler_mnk: Tuple[int, int, int],
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    epi_tile: cute.Tile,
+    c_dtype: Type[cutlass.Numeric],
+    c_layout: utils.LayoutEnum,
+    sf_dtype: Type[cutlass.Numeric],
+    sf_vec_size: int,
+    num_smem_capacity: int,
+    occupancy: int,
+    acc_dtype: Type[cutlass.Numeric],
+    sf2_dtype: Type[cutlass.Numeric],
+    sgk: int,
+) -> Tuple[int, int, int, int]:
+    """Pipeline stages for the wgrad kernel WITH the K-grouped second-level A
+    scale (SFA2, sgm = 1 — one f32 per M row per sgk-token K group).
+
+    Vs compute_stages_wgrad: each AB stage also carries the SFA2 slice
+    (mma_tiler_m f32), and a fixed full-CTA-tile f32 sFinalAcc buffer holds
+    the running accumulator between the acc-update warps and the epilogue.
+    num_acc_stage counts TMEM partial-accumulator stages: 3 at N=128, 1 at
+    N=256 (acc + SF TMEM columns must fit in 512). N=256 tilers land at 1 AB
+    stage — correct but slow."""
+    num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 3
+    num_c_stage = 2
+    num_tile_stage = 2
+    num_epi_stage = 1
+
+    a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, a_dtype, 1)
+    b_smem_layout_staged_one = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler_mnk, b_dtype, 1)
+    sfa_smem_layout_staged_one = blockscaled_utils.make_smem_layout_sfa(tiled_mma, mma_tiler_mnk, sf_vec_size, 1)
+    sfb_smem_layout_staged_one = blockscaled_utils.make_smem_layout_sfb(tiled_mma, mma_tiler_mnk, sf_vec_size, 1)
+    c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(c_dtype, c_layout, epi_tile, 1)
+
+    # SFA2 slice per AB stage: sgm = 1 → one f32 per mma-tile M row per
+    # CTA-tile-clamped K group (the group axis lies on K).
+    size_k = min(sgk, mma_tiler_mnk[2])
+    scale_m_per_tile = mma_tiler_mnk[0]
+    scale_k_per_tile = mma_tiler_mnk[2] // size_k
+    sfa2_bytes_per_stage = scale_m_per_tile * scale_k_per_tile * (sf2_dtype.width // 8)
+
+    ab_bytes_per_stage = (
+        cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
+        + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
+        + cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
+        + cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
+        + sfa2_bytes_per_stage
+    )
+    mbar_helpers_bytes = 1024
+    sinfo_bytes = 4 * 4 * num_tile_stage
+    c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
+    c_bytes = c_bytes_per_stage * num_c_stage
+
+    # Full-CTA-tile f32 final accumulator (subtile_cnt epi slots per epi stage)
+    cta_m = mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape)
+    cta_n = mma_tiler_mnk[1]
+    subtile_cnt = (cta_m // cute.size(epi_tile[0])) * (cta_n // cute.size(epi_tile[1]))
+    final_acc_smem_layout_one = sm100_utils.make_smem_layout_epi(acc_dtype, c_layout, epi_tile, subtile_cnt * num_epi_stage)
+    final_acc_bytes = cute.size_in_bytes(acc_dtype, final_acc_smem_layout_one)
+
+    num_ab_stage = (num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + final_acc_bytes + sinfo_bytes)) // ab_bytes_per_stage
+    assert num_ab_stage >= 1, (
+        f"SMEM overflow: full-tile sFinalAcc ({final_acc_bytes} B) leaves no " f"room for AB stages (mma_tiler={mma_tiler_mnk}); reduce mma_tiler_mn"
+    )
+
+    return num_acc_stage, num_ab_stage, num_c_stage, num_epi_stage
+
+
 def compute_stages_wgrad_bf16(
     tiled_mma: cute.TiledMma,
     mma_tiler_mnk: Tuple[int, int, int],
