@@ -1877,13 +1877,15 @@ def test_fp8_envelope_floor_matches_engine_row():
 
 
 @pytest.mark.L0
-def test_fp8_d512_mxfp8_declines():
-    """There is no d512 BLOCK-SCALE kernel on either arch line: an MXFP8 d512
-    graph must be rejected up front, not fail late in the lowering.  The
-    per-tensor d512 flavor is a different claim and exists on both."""
-    from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
+def test_fp8_d512_family_shape_maps():
+    """D512 per-tensor and MXFP8 have native kernels on both arch lines."""
+    from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes, supported_cgas_for
 
     assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
-    assert (512, 512) not in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
-    # INVERTED 2026-09-04: Rubin gained the d512 per-tensor FP8 kernel.
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
     assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 7))
+    for device_cc in ((10, 0), (10, 7)):
+        for pertensor in (False, True):
+            expected = (1,) if device_cc == (10, 0) and not pertensor else (2,)
+            assert supported_cgas_for((512, 512), fp8=True, device_cc=device_cc, pertensor=pertensor) == expected

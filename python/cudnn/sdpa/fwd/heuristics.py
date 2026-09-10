@@ -468,6 +468,16 @@ def select_d256_auto_knobs(
     return SCHED_LPT, 1
 
 
+def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
+    """Select the measured D512 scheduler and fixed MXFP8 CTA1 geometry."""
+
+    if params.thd_varlen:
+        return SCHED_NATURAL, 1
+    if params.window_right is not None:
+        return SCHED_LPT, 1
+    return params.sched_policy, 1
+
+
 def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm100TemplateParams:
     dtype_codes = {
         cudnn.data_type.FP8_E4M3: DTYPE_E4M3,
@@ -498,6 +508,12 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         selected_sched, selected_cga = select_d256_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
         if selected_cga not in domain:
             raise ValueError(f"D256 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
+        return selected_sched, selected_cga
+    if selected_shape == (512, 512) and facts.is_mxfp8 and caps.sm_lo == 100:
+        params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
+        selected_sched, selected_cga = select_d512_auto_knobs(params)
+        if selected_cga not in domain:
+            raise ValueError(f"D512 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
         return selected_sched, selected_cga
     if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
         return sched_policy, _sole(domain)

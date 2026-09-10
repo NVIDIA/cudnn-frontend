@@ -34,6 +34,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
     canonicalize_d192_lowering,
     canonicalize_d256_lowering,
+    canonicalize_d512_mxfp8_lowering,
     derive_d192_internal_params,
     derive_d256_internal_params,
     pack_gqa_supported,
@@ -91,6 +92,7 @@ _SM100_MXFP8_KERNEL_FILES = {
     (128, 128): "sm100/prefill_d128_mxfp8.py",
     (192, 128): "sm100/prefill_d192_d128_mxfp8.py",
     (256, 256): "sm100/prefill_d256_mxfp8.py",
+    (512, 512): "sm100/prefill_d512_mxfp8.py",
 }
 # Rubin (SM107) siblings.  Separate maps rather than entries in the SM100
 # ones: the lowerings genuinely diverge (dense K=64 FP8 MMA, 576-column TMEM,
@@ -344,7 +346,7 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
     raise ValueError(f"Frost SM100 DSL SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); available envelopes: {sorted(pool)}.")
 
 
-def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int]) -> tuple[int, ...]:
+def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int], pertensor: bool = True) -> tuple[int, ...]:
     """CGA widths the STANDALONE adapter serves for a kernel flavor.
 
     A module-level function, not an inline expression in ``check_support``, so a
@@ -372,6 +374,8 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
     if flavor == (192, 128):
         return (1, 2)
     if fp8 and flavor == (256, 256):
+        return (1,)
+    if device_cc != (10, 7) and fp8 and not pertensor and flavor == (512, 512):
         return (1,)
     return (2,)
 
@@ -969,9 +973,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._k_mod = None
 
     @property
-    def _d256_quantized(self) -> bool:
-        """Whether the selected kernel uses the D256 quantized length ABI."""
-        return self._fp8 and self.flavor == (256, 256)
+    def _quantized_q_lens_abi(self) -> bool:
+        """Whether the selected quantized kernel has the dense Q-length slot."""
+        return self._fp8 and (self.flavor == (256, 256) or (self._device_cc != (10, 7) and not self._pertensor and self.flavor == (512, 512)))
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
@@ -1191,7 +1195,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
             )
-        supported_cgas = supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc)
+        supported_cgas = supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor)
         # Only a non-None request is checked: None means "let the lowering pick",
         # which is how every graph that does not pin the knob gets here.  Dropping
         # this check is not cosmetic -- it is precisely the rule-8b' failure the
@@ -1312,8 +1316,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "seq_q_lens_present requires seq_kv_lens_present (padding mask)",
         )
         self._value_error_if(
-            self.seq_q_lens_present and self._fp8 and self.flavor != (256, 256),
-            "seq_q_lens_present (dense padded-Q LSE trim) is supported by the D256 FP8/MXFP8 flavor only",
+            self.seq_q_lens_present and self._fp8 and not self._quantized_q_lens_abi,
+            "seq_q_lens_present (dense padded-Q LSE trim) is not supported by the selected quantized flavor",
         )
         # KV-tail correctness: the kernel zero-fills the last KV tile via TMA
         # OOB but only *masks* those columns on the padded / causal paths. A
@@ -1463,6 +1467,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 h_q=self.h_q,
                 s_q=self.s_q_max,
             )
+        elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
+            from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
+
+            auto_sched, auto_cga = select_d512_auto_knobs(params)
+            params = replace(
+                params,
+                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                cta_mma=auto_cga if self.cga is None else params.cta_mma,
+            )
+            params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
@@ -2215,7 +2229,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             fn = km.compile(**self._thd_compile_kwargs())
             thd_lens_args = (
                 (None, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
-                if self._d256_quantized
+                if self._quantized_q_lens_abi
                 else (pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
             )
             fn(
@@ -2279,7 +2293,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
             O_dst, lse_dst = self._split_partials(workspace, O, device, current_stream)
-        dense_q_lens_args = (seq_q_t,) if self._d256_quantized else ()
+        dense_q_lens_args = (seq_q_t,) if self._quantized_q_lens_abi else ()
         self._compiled_kernel(
             Q,
             K,
@@ -2388,7 +2402,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             fn = self._k_mod.compile(**self._thd_compile_kwargs())
             thd_lens_args = (
                 (None, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
-                if self._d256_quantized
+                if self._quantized_q_lens_abi
                 else (pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
             )
             fn(
@@ -2454,7 +2468,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
             O_dst, lse_dst = self._split_partials(workspace, O, device, current_stream)
-        dense_q_lens_args = (seq_q_t,) if self._d256_quantized else ()
+        dense_q_lens_args = (seq_q_t,) if self._quantized_q_lens_abi else ()
         self._compiled_kernel(
             Q,
             K,

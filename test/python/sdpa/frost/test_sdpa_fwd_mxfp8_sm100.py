@@ -4,7 +4,7 @@
 """End-to-end tests for the FROST SM100 DSL block-scale MXFP8 SDPA-forward engine.
 
 Drives ``graph.sdpa_mxfp8`` (FP8 E4M3/E5M2 Q/K/V + per-32-block E8M0 scale factors)
-routed to the exact D128/D128, D192/D128, or D256/D256 MXFP8 engine, and
+routed to the exact D128/D128, D192/D128, D256/D256, or D512/D512 MXFP8 engine, and
 validates the output against an fp32-dequant reference. Inputs are quantized
 with the torch-only MXFP8 quantizer in ``test/python/sdpa/mxfp8_quant.py``
 (TE-equivalent semantics
@@ -483,10 +483,10 @@ def test_mxfp8_d256_bottom_right_rectangular(in_key):
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize("d", [256, 512], ids=["d256", "d512"])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_d256_right_band():
-    """Pin the MX-specific right-band lowering; shared combinations run in PT."""
-    d = 256
+def test_mxfp8_wide_right_band(d):
+    """Pin the wide MX-specific right-band lowerings."""
     out, out_ref, _ = _run(
         1,
         4,
@@ -503,12 +503,12 @@ def test_mxfp8_d256_right_band():
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize("d", [256, 512], ids=["d256", "d512"])
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_d256_dense_padding(in_key, causal):
-    """D256 masks a per-batch partial KV tile in dense storage."""
-    d = 256
+def test_mxfp8_wide_dense_padding(d, in_key, causal):
+    """Wide MXFP8 kernels mask a per-batch partial KV tile in dense storage."""
     sdpa_kwargs = dict(use_causal_mask=True) if causal else {}
     O, O_ref, amax = _run(
         2,
@@ -530,10 +530,10 @@ def test_mxfp8_d256_dense_padding(in_key, causal):
 
 @_skip_dense_q_trim_on_rubin
 @pytest.mark.L1
+@pytest.mark.parametrize("d", [256, 512], ids=["d256", "d512"])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_d256_dense_q_trim_stats_sink():
+def test_mxfp8_wide_dense_q_trim_stats_sink(d):
     """Short dense Q rows trim O/LSE even when a sink makes softmax finite."""
-    d = 256
     sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
     result = _run(
         2,
@@ -611,6 +611,149 @@ def test_mxfp8_d256_leading_zero_length_kv(out_key: str, with_sink: bool):
     _check(result.output, result.reference, _OUT[out_key], "e4m3", d_qk=d)
     assert (result.output[0] == 0).all()
     assert abs(result.amax.item() - result.reference.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", list(_MASKS))
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d512_masks(in_key, mask):
+    """D512 covers both V/O slices for every declared mask."""
+    d = 512
+    O, O_ref, amax = _run(
+        1,
+        4,
+        4,
+        256,
+        in_key,
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=_MASKS[mask],
+        d_qk=d,
+        d_v=d,
+    )
+    _check(O, O_ref, torch.float16, in_key, d_qk=d)
+    assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d512_output_dtypes(out_key):
+    """D512 writes each declared output type across the slice boundary."""
+    d = 512
+    O, O_ref, amax = _run(
+        1,
+        4,
+        4,
+        256,
+        "e4m3",
+        _OUT[out_key],
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=d,
+        d_v=d,
+    )
+    _check(O, O_ref, _OUT[out_key], "e4m3", d_qk=d)
+    assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d512_bottom_right_rectangular():
+    """D512 bottom-right causal uses the shifted diagonal for rectangular attention."""
+    d = 512
+    O, O_ref, _ = _run_rect(
+        1,
+        4,
+        128,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        d_qk=d,
+        d_v=d,
+    )
+    _check(O, O_ref, torch.float16, "e4m3", d_qk=d)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d512_gqa_sink():
+    """D512 composes unpacked GQA with a per-query-head sink."""
+    d = 512
+    sink = torch.randn(1, 4, 1, 1, dtype=torch.float32, device="cuda")
+    result = _run(
+        2,
+        4,
+        2,
+        256,
+        "e5m2",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        sink=sink,
+        d_qk=d,
+        d_v=d,
+    )
+    _check(result.output, result.reference, torch.float16, "e5m2", d_qk=d)
+    assert abs(result.amax.item() - result.reference.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("left_bound", [128, 129], ids=["reuse-p", "two-pass"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d512_dense_multi_wave_alias(left_bound):
+    """Persistent dense GQA preserves Q/O ownership in both Dv pipelines."""
+    d = 512
+    result = _run(
+        1,
+        64,
+        1,
+        512,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(use_causal_mask=True, diagonal_band_left_bound=left_bound),
+        d_qk=d,
+        d_v=d,
+    )
+    assert torch.isfinite(result.output).all()
+    _check(result.output, result.reference, torch.float16, "e4m3", d_qk=d)
+    assert abs(result.amax.item() - result.reference.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d512_leading_zero_length_kv():
+    """Both D512 output slices must zero an empty-KV batch."""
+    d = 512
+    result = _run(
+        2,
+        4,
+        4,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs={},
+        seq_lens_kv=[0, 256],
+        stats=False,
+        d_qk=d,
+        d_v=d,
+        poison_tmem_before_execute=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", d_qk=d)
+    assert (result.output[0] == 0).all()
+    assert abs(result.amax.item() - result.reference.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=59)
+def test_mxfp8_d512_strided_stats():
+    """The two D512 passes preserve the caller's Stats layout."""
+    _check_mxfp8_strided_stats(512, 512, "e4m3")
 
 
 @pytest.mark.L0
@@ -1217,7 +1360,7 @@ def test_mxfp8_thd(in_key, causal):
 
 @_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_d128", "d256"])
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_d128", "d256", "d512"])
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_multi_unit_per_cta(monkeypatch, in_key, d_qk, d_v):
@@ -1262,7 +1405,7 @@ def test_mxfp8_d256_thd(in_key, causal):
 
 @_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("bottom_right", [False, True])
 @torch_fork_set_rng(seed=0)
@@ -1293,7 +1436,7 @@ def test_mxfp8_thd_sliding_window(d, in_key, bottom_right):
 
 @_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_cross_gqa(d):
     """THD cross-attention (unequal packed Q and K/V totals) with GQA heads."""
@@ -1304,7 +1447,7 @@ def test_mxfp8_thd_cross_gqa(d):
 
 @_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_sink(d):
     """THD causal + attention sink."""
@@ -1316,7 +1459,7 @@ def test_mxfp8_thd_sink(d):
 
 @_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_stats(d):
     """THD + generate_stats: the ragged token-major TH1 LSE is written next to O."""
@@ -1328,7 +1471,7 @@ def test_mxfp8_thd_stats(d):
 
 @_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_zero_len_kv(d):
     """Zero-length Q and KV sequences (test_mhas_v2 ragged parity): the
@@ -1341,7 +1484,7 @@ def test_mxfp8_thd_zero_len_kv(d):
 
 @_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_cu_seq_len(d):
     """THD via the (B+1,) cu_seq_len prefix-sum length form."""

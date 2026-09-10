@@ -462,6 +462,21 @@ def canonicalize_d256_lowering(params: TemplateParams, *, s_q: int, s_kv: int) -
     return replace(params, bottom_right=False) if d256_square_br_as_tl(params, s_q=s_q, s_kv=s_kv) else params
 
 
+def canonicalize_d512_mxfp8_lowering(params: TemplateParams, *, s_q: int, s_kv: int) -> TemplateParams:
+    """Canonicalize an exactly square D512 MXFP8 causal diagonal."""
+
+    square_bottom_right = (
+        not params.thd_varlen
+        and not params.seq_q_lens_present
+        and not params.seq_kv_lens_present
+        and params.window_left is None
+        and params.window_right == 0
+        and params.bottom_right
+        and s_q == s_kv
+    )
+    return replace(params, bottom_right=False) if square_bottom_right else params
+
+
 def derive_d256_internal_params(
     params: TemplateParams,
     *,
@@ -792,6 +807,22 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
     _validate_cfg_d512(cfg)
     if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
         raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
+    return cfg, _tma_iters(cfg)
+
+
+def make_cfg_d512_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
+    """Build the SM100 D512 block-scale CTA1 configuration."""
+
+    cfg, _ = _make_cfg_d256(params, mxfp8=True)
+    # A 512-column MXFP8 accumulator leaves no TMEM columns for block scales.
+    # Keep the proven CTA1 M128 pipeline and emit two 256-column O slices.
+    cfg = replace(cfg, TILE_K=512, STAGES_KV=1)
+    if cfg.CTA_MMA != 1 or cfg.CGA_M != 1:
+        raise ValueError("d512 MXFP8 requires one-CTA M128 MMA")
+    if cfg.TILE_M != 128 or cfg.TILE_N != 128 or cfg.TILE_K != 512 or cfg.TILE_O != 256:
+        raise ValueError("d512 MXFP8 requires M128xN128, K512, and a 256-column output slice")
+    if cfg.PACK_GQA:
+        raise ValueError("d512 MXFP8 does not support PackGQA")
     return cfg, _tma_iters(cfg)
 
 
