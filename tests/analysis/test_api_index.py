@@ -201,7 +201,7 @@ class ApiIndexTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(api_index.main(["--root", str(self.root), "--write"]), 0)
             self.assertEqual(api_index.main(["--root", str(self.root)]), 0)
-        self.assertIn("cudnn.example.café".encode("utf-8"), (self.root / "api_index.txt").read_bytes())
+        self.assertIn("cudnn.example.café".encode("utf-8"), (self.root / "tests" / "analysis" / "api_index.txt").read_bytes())
 
     def test_generated_methods_and_module_name_collision(self):
         self.write("python/cudnn/__init__.py", "from ._builder import Builder\nfrom .graph import graph")
@@ -283,14 +283,14 @@ class ApiIndexTest(unittest.TestCase):
                 self.assertEqual(api_index.main(["--root", str(self.root)]), 1)
             self.assertIn("-cudnn.new.new_api", output.getvalue())
             api_index.main(["--root", str(self.root), "--write"])
-            with (self.root / "api_index.txt").open("a", encoding="utf-8") as stream:
+            with (self.root / "tests" / "analysis" / "api_index.txt").open("a", encoding="utf-8") as stream:
                 stream.write("cudnn\n")
             self.assertEqual(api_index.main(["--root", str(self.root)]), 1)
 
     def test_repository_api_index(self):
         result = subprocess.run([sys.executable, "-S", str(SCRIPT), "--root", str(ROOT)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        names = set((ROOT / "api_index.txt").read_text(encoding="utf-8").splitlines())
+        names = set((ROOT / "tests" / "analysis" / "api_index.txt").read_text(encoding="utf-8").splitlines())
         self.assertTrue(
             {
                 "cudnn.pygraph.add",

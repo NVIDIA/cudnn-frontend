@@ -482,9 +482,10 @@ def main(argv=None):
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--write", action="store_true", help="Regenerate api_index.txt for review")
     args = parser.parse_args(argv)
-    index = args.root / "api_index.txt"
+    index = args.root / "tests" / "analysis" / "api_index.txt"
     actual = "\n".join(scan(args.root)) + "\n"
     if args.write:
+        index.parent.mkdir(parents=True, exist_ok=True)
         index.write_text(actual, encoding="utf-8")
         print(f"Wrote {len(actual.splitlines())} names to {index}")
         return 0

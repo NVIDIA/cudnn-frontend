@@ -1,6 +1,6 @@
 # Python API index
 
-`api_index.txt` records the Python API names shipped by this source tree, one
+`tests/analysis/api_index.txt` records the Python API names shipped by this source tree, one
 sorted, unique dotted name per line. Changes to public names require an explicit
 index update in the same PR. Additions and removals both fail the check.
 
@@ -13,7 +13,7 @@ After reviewing an intentional API change:
 
 ```bash
 python3 -S tests/analysis/api_index.py --write
-git diff -- api_index.txt
+git diff -- tests/analysis/api_index.txt
 ```
 
 The scanner requires only Python 3.10+ and its standard library. No cuDNN build,
