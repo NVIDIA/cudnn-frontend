@@ -30,9 +30,10 @@ from gemm_test_utils import (
 )
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
+from cudnn.gemm.frost import compiler as C
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
-from cudnn.gemm.frost.graph_analyzer import analyze
+from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding
 from cudnn.gemm.frost.tile_config import by_name
 from test_matmul import _f8_row_scale_addr
 
@@ -177,6 +178,9 @@ def _build_graph(
     weight_major="k",
     a_dt_override=None,
     b_dt_override=None,
+    dequant_a=True,
+    dequant_b=True,
+    epilogue_relu=False,
 ):
     block_size, default_dt, sf_dt = _COMBOS[combo]
     a_dt = default_dt if a_dt_override is None else a_dt_override
@@ -209,8 +213,8 @@ def _build_graph(
         stride=[1, 1, 1],
         data_type=offset_dt,
     )
-    tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size])
-    w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1])
+    tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size]) if dequant_a else tok
+    w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1]) if dequant_b else w
     out = g.moe_grouped_matmul(
         tok_d,
         w_d,
@@ -219,6 +223,8 @@ def _build_graph(
         compute_data_type=cudnn.data_type.FLOAT,
         name="moe",
     )
+    if epilogue_relu:
+        out = g.relu(input=out, name="relu")
     if reduction_mode is not None:
         red_kwargs = {}
         if reduction_compute_dt is not None:
@@ -280,6 +286,43 @@ def test_build_graph_keeps_one_sided_dtype_overrides_independent() -> None:
 
     b_mixed = analyze(_build_graph(**shape, b_dt_override=fp8))
     assert (b_mixed.matmul.a_dtype, b_mixed.matmul.b_dtype) == ("fp4_e2m1", "fp8_e4m3")
+
+
+@pytest.mark.parametrize("fake_a", [True, False], ids=["raw_fp8_token", "raw_fp8_weight"])
+def test_analyzer_normalizes_one_sided_moe_dequant(fake_a) -> None:
+    kwargs = dict(E=2, S=256, N=128, K=256, num_groups=2, combo="mxfp4")
+    fp8 = cudnn.data_type.FP8_E4M3
+    if fake_a:
+        kwargs.update(a_dt_override=fp8, dequant_a=False)
+    else:
+        kwargs.update(b_dt_override=fp8, dequant_b=False)
+    chain, binding = analyze_with_binding(_build_graph(**kwargs))
+    bs = chain.block_scale
+    assert chain.has_moe and bs is not None
+    assert (bs.fake_dequant_a, bs.fake_dequant_b) == ((True, False) if fake_a else (False, True))
+    assert (bs.block_size_a, bs.block_size_b) == ((1, 32), (32, 1))
+    assert (bs.sf_dtype_a, bs.sf_dtype_b) == ("fp8_e8m0", "fp8_e8m0")
+    assert len(binding.sfa_operands) == (0 if fake_a else 1)
+    assert len(binding.sfb_operands) == (1 if fake_a else 0)
+    C._check_block_scale_supported(chain, "sm100")
+
+
+def test_one_sided_moe_dequant_does_not_expand_registry_cases() -> None:
+    chain = analyze(
+        _build_graph(
+            E=2,
+            S=256,
+            N=128,
+            K=256,
+            num_groups=2,
+            combo="nvfp4",
+            a_dt_override=cudnn.data_type.FP8_E4M3,
+            dequant_a=False,
+        )
+    )
+    assert chain.block_scale.fake_dequant_a
+    with pytest.raises(NotImplementedError, match="does not support this configuration"):
+        C._check_block_scale_supported(chain, "sm100")
 
 
 def test_analyzer_offset_dtype_int64() -> None:
@@ -724,6 +767,105 @@ def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
     for i, begin in enumerate(offsets_list):
         end = offsets_list[i + 1] if i + 1 < len(offsets_list) else S
         ref[begin:end] = tok_deq[begin:end] @ w_deq[i % E].T
+    torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=2e-1, rtol=2e-2)
+
+
+@requires_sm100
+@pytest.mark.parametrize("fake_a", [True, False], ids=["raw_fp8_token", "raw_fp8_weight"])
+@pytest.mark.parametrize("scaled_kind", ["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("epilogue_relu", [False, True], ids=["direct", "relu"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
+        pytest.param(
+            "CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma",
+            marks=requires_sm107,
+        ),
+        pytest.param(
+            "CONFIG_sm100_128x128x128_128x128x64_cluster2x1_2ctamma",
+            marks=requires_sm107,
+        ),
+    ],
+)
+def test_e2e_one_sided_dequant(fake_a, scaled_kind, epilogue_relu, config_name) -> None:
+    """MoE fake SF has no runtime tensor or dynamic descriptor workspace."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    E, S, N, K = 2, 256, 128, 256
+    offsets_list = [0, 128]
+    sf_k = K // 32
+    raw_dt = cudnn.data_type.FP8_E4M3
+    scaled_dt = cudnn.data_type.FP8_E5M2 if scaled_kind == "mxfp8" else cudnn.data_type.FP4_E2M1
+
+    raw_tok = (torch.randn(1, S, K, device=dev) * 0.25).to(torch.float8_e4m3fn)
+    raw_w = (torch.randn(E, N, K, device=dev) * 0.25).to(torch.float8_e4m3fn)
+    if scaled_kind == "mxfp8":
+        scaled_tok = (torch.randn(1, S, K, device=dev) * 0.25).to(torch.float8_e5m2)
+        scaled_w = (torch.randn(E, N, K, device=dev) * 0.25).to(torch.float8_e5m2)
+        scaled_tok_ref = scaled_tok.float().view(S, K)
+        scaled_w_ref = scaled_w.float().view(E, N, K)
+    else:
+        lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+        tok_u8 = torch.randint(0, 256, (1, S, K // 2), dtype=torch.uint8, device=dev)
+        w_u8 = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=dev)
+        scaled_tok = tok_u8.view(torch.float4_e2m1fn_x2)
+        scaled_w = w_u8.view(torch.float4_e2m1fn_x2)
+        scaled_tok_ref = _unpack_fp4(tok_u8, lut).view(S, K)
+        scaled_w_ref = _unpack_fp4(w_u8, lut).view(E, N, K)
+
+    tok_rt, w_rt = (raw_tok, scaled_w) if fake_a else (scaled_tok, raw_w)
+    tok_ref = raw_tok.float().view(S, K) if fake_a else scaled_tok_ref
+    w_ref = scaled_w_ref if fake_a else raw_w.float().view(E, N, K)
+    g = _build_graph(
+        E,
+        S,
+        N,
+        K,
+        len(offsets_list),
+        combo="mxfp4",
+        a_dt_override=raw_dt if fake_a else scaled_dt,
+        b_dt_override=scaled_dt if fake_a else raw_dt,
+        dequant_a=not fake_a,
+        dequant_b=fake_a,
+        epilogue_relu=epilogue_relu,
+    )
+    compiled = _plan(g, config=by_name(config_name))
+    bs = compiled.chain.block_scale
+    assert (bs.fake_dequant_a, bs.fake_dequant_b) == (fake_a, not fake_a)
+    assert compiled._compiled._desc_slots_per_cta == (compiled.chain.num_a_operands + len(compiled.binding.sfa_operands) + len(compiled._compiled.tma_slots))
+
+    sf_log = _rand_e8m0(((E, N, sf_k) if fake_a else (S, sf_k)), dev)
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
+    output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
+    bd = compiled.binding
+    variant_pack = {
+        bd.a_operands[0]: tok_rt,
+        bd.b_operands[0]: w_rt,
+        bd.first_token_offset: offsets,
+        bd.outputs[0]: output,
+    }
+    if fake_a:
+        sfb_blk = torch.cat([_to_blocked(sf_log[e]) for e in range(E)]).view(E, sf_k, N)
+        variant_pack[bd.sfb_operands[0]] = sfb_blk
+    else:
+        sfa_parts = [_to_blocked(sf_log[b : offsets_list[i + 1] if i + 1 < len(offsets_list) else S]) for i, b in enumerate(offsets_list)]
+        sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, len(offsets_list), sf_k)
+        variant_pack[bd.sfa_operands[0]] = sfa_blk
+    compiled(variant_pack)
+    torch.cuda.synchronize()
+
+    if fake_a:
+        w_ref = w_ref * sf_log.float().repeat_interleave(32, 2)
+    else:
+        tok_ref = tok_ref * sf_log.float().repeat_interleave(32, 1)
+    ref = torch.zeros(S, N, dtype=torch.float32, device=dev)
+    for i, begin in enumerate(offsets_list):
+        end = offsets_list[i + 1] if i + 1 < len(offsets_list) else S
+        ref[begin:end] = tok_ref[begin:end] @ w_ref[i % E].T
+    if epilogue_relu:
+        ref = torch.relu(ref)
     torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=2e-1, rtol=2e-2)
 
 

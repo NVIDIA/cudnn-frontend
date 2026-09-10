@@ -18,6 +18,12 @@ instruction that reads it, and the MMA is ``tcgen05_mma_block_scale``. When the
 accumulator cannot double-buffer, ``use_acc_overlap`` overlaps the two regions
 and drains the shared columns first.
 
+For a one-sided-dequant GEMM, the raw FP8 peer is represented by a fake scale
+factor.  Its TMEM region is still reserved, but it has no SF kernel argument or
+SMEM/TMA/``tcgen05_cp`` path.  The four epilogue warps seed the same 32-row
+image in the four TMEM warp partitions, emulating the real copy's ``WARPX4``
+coverage, before the MMA warp proceeds.
+
 ``mma_inst_k_bytes`` selects the MMA-inst K width. At 64 (SM 10.7+ silicon) the
 K-tile takes half as many MMAs, each consuming ``sf_scales_per_inst`` scales;
 when that outgrows a 128x4 utccp atom one SF word spans ``word_atoms`` atoms,
@@ -96,6 +102,9 @@ EPI_SYNC_BAR_ID = 1
 # Named barrier id for the TMEM-alloc handoff
 TMEM_ALLOC_BARRIER_ID = 2
 
+# Five-warp handoff after epilogue warps seed all fake-SF TMEM partitions.
+TMEM_SCALE_ONE_BARRIER_ID = 3
+
 
 @cute.jit
 def _auto_swizzle_w(m, n, k, nt_n):
@@ -136,6 +145,27 @@ def _b_collector_op(mi):
     if cutlass.const_expr(mi == mma_size_m - 1):
         return nvvm.Tcgen05MMACollectorOp.LASTUSE
     return nvvm.Tcgen05MMACollectorOp.USE
+
+
+@cute.jit
+def _fill_scale_one(tmem_base, num_cols):
+    """Fill one logical SF region with the selected format's encoded 1.0.
+
+    The F8_128x4 layout uses 32 scale rows and a 32-bit cell carries four
+    identical scale bytes.  One warp-wide ``32x32b`` store fills those rows in
+    only the issuing warp's TMEM partition.  Calling this from warp positions
+    0..3 supplies the same four-partition coverage as an SF
+    ``tcgen05.cp(..., WARPX4)``.
+    """
+    one = cutlass.Uint32(sf_one_word)
+    one_vec = cutlass.Vector.from_elements((one,), cutlass.Uint32)
+    for col in cutlass.range_constexpr(num_cols):
+        nvvm.tcgen05_st(
+            "32x32b",
+            nvvm.make_tmem_ptr(tmem_base + col, cutlass.Uint32),
+            one_vec,
+        )
+    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
 
 
 # @@SPLITK_ONLY:BEGIN@@
@@ -255,9 +285,11 @@ def _kernel(
     if warp_idx == mma_warp_id:
         for _i in cutlass.range_constexpr(num_a_operands):
             nvvm.prefetch_tensormap(tma_a_descs[_i].get_ptr())
+        for _i in cutlass.range_constexpr(num_sfa_operands):
             nvvm.prefetch_tensormap(tma_sfa_descs[_i].get_ptr())
         for _j in cutlass.range_constexpr(num_b_operands):
             nvvm.prefetch_tensormap(tma_b_descs[_j].get_ptr())
+        for _j in cutlass.range_constexpr(num_sfb_operands):
             nvvm.prefetch_tensormap(tma_sfb_descs[_j].get_ptr())
 
         # @@TMA_STORE_ONLY:BEGIN@@
@@ -369,7 +401,7 @@ def _kernel(
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
-        for _ in range(num_a_operands)
+        for _ in range(num_sfa_operands)
     ]
     smem_sfb_list = [
         cutlass.Array(
@@ -378,7 +410,7 @@ def _kernel(
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
-        for _ in range(num_b_operands)
+        for _ in range(num_sfb_operands)
     ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
@@ -463,10 +495,10 @@ def _kernel(
     sB_bytes = sB_elems * (b_smem_dtype.width // 8)
     if cutlass.const_expr(cta_group == 1):
         ab_only_copy_bytes = num_a_operands * sA_tma_bytes + num_b_operands * sB_tma_bytes
-        sf_only_copy_bytes = num_a_operands * sfa_smem_bytes + num_b_operands * sfb_smem_bytes
+        sf_only_copy_bytes = num_sfa_operands * sfa_smem_bytes + num_sfb_operands * sfb_smem_bytes
     else:
         ab_only_copy_bytes = (num_a_operands * sA_tma_bytes + num_b_operands * sB_tma_bytes) * 2
-        sf_only_copy_bytes = (num_a_operands * sfa_smem_bytes + num_b_operands * sfb_smem_bytes) * 2
+        sf_only_copy_bytes = (num_sfa_operands * sfa_smem_bytes + num_sfb_operands * sfb_smem_bytes) * 2
 
     if cutlass.const_expr(cta_group == 2):
         # Per-CTA logical tile — the cluster cancels out, so these stay compile-time
@@ -622,9 +654,7 @@ def _kernel(
                         if elect_one:
                             nvvm.mbarrier_arrive_expect_tx(sf_full_mbar_ptr.subview(stage), sf_only_copy_bytes)
 
-                for _ai in cutlass.range_constexpr(num_a_operands):
-                    sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
-                    tma_a_desc = tma_a_descs[_ai]
+                for _ai in cutlass.range_constexpr(num_sfa_operands):
                     sSFA_stage = smem_sfa_list[_ai].subview(sfa_smem_bytes * stage)
                     tma_sfa_desc = tma_sfa_descs[_ai]
                     sfa_m_block = coord_m_per_cta // 128
@@ -652,9 +682,7 @@ def _kernel(
                                 group=_CTA_GROUP,
                             )
 
-                for _bj in cutlass.range_constexpr(num_b_operands):
-                    sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
-                    tma_b_desc = tma_b_descs[_bj]
+                for _bj in cutlass.range_constexpr(num_sfb_operands):
                     sSFB_stage = smem_sfb_list[_bj].subview(sfb_smem_bytes * stage)
                     tma_sfb_desc = tma_sfb_descs[_bj]
                     if cutlass.const_expr(cta_group == 1):
@@ -686,9 +714,6 @@ def _kernel(
                 for _ai in cutlass.range_constexpr(num_a_operands):
                     sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
                     tma_a_desc = tma_a_descs[_ai]
-                    sSFA_stage = smem_sfa_list[_ai].subview(sfa_smem_bytes * stage)
-                    tma_sfa_desc = tma_sfa_descs[_ai]
-                    sfa_m_block = coord_m_per_cta // 128
                     if cutlass.const_expr(a_mcast_slices > 1):
                         _a_rows = cta_tile_mnk[0] // a_mcast_slices
                         if cutlass.const_expr(fallback_cluster_shape_mnk is None):
@@ -778,10 +803,6 @@ def _kernel(
                 for _bj in cutlass.range_constexpr(num_b_operands):
                     sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
                     tma_b_desc = tma_b_descs[_bj]
-                    sSFB_stage = smem_sfb_list[_bj].subview(sfb_smem_bytes * stage)
-                    tma_sfb_desc = tma_sfb_descs[_bj]
-                    if cutlass.const_expr(cta_group == 1):
-                        sfb_n_block = coord_n_per_cta // 128
                     if cutlass.const_expr(b_mcast_slices > 1):
                         _b_rows = cta_tile_mnk[1] // b_mcast_slices
                         if cutlass.const_expr(fallback_cluster_shape_mnk is None):
@@ -951,6 +972,11 @@ def _kernel(
         tmem_raw_addr = tmem_ptr_i32.load()
         base_col_id_root = tmem_raw_addr & 0xFFFF
         base_row_id = tmem_raw_addr >> 16
+        if cutlass.const_expr(fake_dequant_a or fake_dequant_b):
+            nvvm.barrier_cta_sync(
+                barrier_id=TMEM_SCALE_ONE_BARRIER_ID,
+                thread_count=tmem_alloc_bar_count,
+            )
         if cutlass.const_expr(cta_group == 2):
             peer_cta_rank = cta_rank_in_cluster ^ 1
         if is_pair_leader:
@@ -1052,7 +1078,7 @@ def _kernel(
                     stride_byte_offset=128,
                     layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
                 )
-                for i in range(num_a_operands)
+                for i in range(num_sfa_operands)
             ]
             desc_sfb_roots = [
                 cutlass.experimental.primitives.Tcgen05SmemDesc.build(
@@ -1061,7 +1087,7 @@ def _kernel(
                     stride_byte_offset=128,
                     layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
                 )
-                for j in range(num_b_operands)
+                for j in range(num_sfb_operands)
             ]
             while is_valid != 0:
                 acc_stage = tile_iter % acc_stages
@@ -1110,8 +1136,8 @@ def _kernel(
 
                     desc_a_bases = [desc_a_roots[i].advance_start_address(sA_bytes * stage) for i in range(num_a_operands)]
                     desc_b_bases = [desc_b_roots[j].advance_start_address(sB_bytes * stage) for j in range(num_b_operands)]
-                    desc_sfa_bases = [desc_sfa_roots[i].advance_start_address(sfa_smem_bytes * stage) for i in range(num_a_operands)]
-                    desc_sfb_bases = [desc_sfb_roots[j].advance_start_address(sfb_smem_bytes * stage) for j in range(num_b_operands)]
+                    desc_sfa_bases = [desc_sfa_roots[i].advance_start_address(sfa_smem_bytes * stage) for i in range(num_sfa_operands)]
+                    desc_sfb_bases = [desc_sfb_roots[j].advance_start_address(sfb_smem_bytes * stage) for j in range(num_sfb_operands)]
 
                     # One SF word per group of MMAs, refreshed right before they
                     # read it. A word spans word_atoms consecutive K-atoms in SMEM.
@@ -1123,7 +1149,7 @@ def _kernel(
                         pass
 
                     for sf_word in cutlass.range_constexpr(num_sf_atoms):
-                        for _bj in cutlass.range_constexpr(num_b_operands):
+                        for _bj in cutlass.range_constexpr(num_sfb_operands):
                             for block_n in cutlass.range_constexpr(num_blocks_n):
                                 for _a in cutlass.range_constexpr(word_atoms):
                                     if elect_one:
@@ -1150,7 +1176,7 @@ def _kernel(
                                 desc_a_k = desc_a_bases[_ai].advance_start_address(a_smem_k_step_bytes * mma_k)
                                 desc_b = desc_b_bases[_bj].advance_start_address(b_smem_k_step_bytes * mma_k)
                                 for mma_m in cutlass.range_constexpr(mma_size_m):
-                                    if cutlass.const_expr(mma_k_in_word == 0 and _ai not in gemm_a_idx[:gemm_i]):
+                                    if cutlass.const_expr(not fake_dequant_a and mma_k_in_word == 0 and _ai not in gemm_a_idx[:gemm_i]):
                                         for _a in cutlass.range_constexpr(word_atoms):
                                             if elect_one:
                                                 nvvm.tcgen05_cp(
@@ -1301,6 +1327,19 @@ def _kernel(
         tmem_raw_addr = tmem_ptr_i32.load()
         base_col_id_root = tmem_raw_addr & 0xFFFF
         base_row_id = tmem_raw_addr >> 16
+
+        if cutlass.const_expr(fake_dequant_a):
+            for i in cutlass.range_constexpr(num_a_operands):
+                _fill_scale_one((base_row_id << 16) | (base_col_id_root + sfa_col_bases[i]), sfa_tmem_cols)
+        if cutlass.const_expr(fake_dequant_b):
+            for j in cutlass.range_constexpr(num_b_operands):
+                _fill_scale_one((base_row_id << 16) | (base_col_id_root + sfb_col_bases[j]), sfb_tmem_cols)
+        if cutlass.const_expr(fake_dequant_a or fake_dequant_b):
+            nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+            nvvm.barrier_cta_sync(
+                barrier_id=TMEM_SCALE_ONE_BARRIER_ID,
+                thread_count=tmem_alloc_bar_count,
+            )
 
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
@@ -1525,7 +1564,7 @@ def _host(
     rest_n = (n + 127) // 128
     tma_a_desc_list = []
     tma_sfa_desc_list = []
-    for _a_op, _sfa_op in zip(_a_operands, _sfa_operands):
+    for _a_op in _a_operands:
         if cutlass.const_expr(a_is_m_major):
             tma_a_desc_list.append(
                 _tma.create_tensor_map_tiled(
@@ -1556,6 +1595,7 @@ def _host(
                     tma_format=a_tma_format,
                 )
             )
+    for _sfa_op in _sfa_operands:
         sfa_fp16_tensor = cute.make_tensor(
             cute.recast_ptr(_sfa_op.iterator, dtype=cutlass.Float16),
             cute.make_layout(
@@ -1579,7 +1619,7 @@ def _host(
         )
     tma_b_desc_list = []
     tma_sfb_desc_list = []
-    for _b_op, _sfb_op in zip(_b_operands, _sfb_operands):
+    for _b_op in _b_operands:
         if cutlass.const_expr(b_is_n_major):
             tma_b_desc_list.append(
                 _tma.create_tensor_map_tiled(
@@ -1610,6 +1650,7 @@ def _host(
                     tma_format=b_tma_format,
                 )
             )
+    for _sfb_op in _sfb_operands:
         sfb_fp16_tensor = cute.make_tensor(
             cute.recast_ptr(_sfb_op.iterator, dtype=cutlass.Float16),
             cute.make_layout(
