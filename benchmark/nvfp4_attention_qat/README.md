@@ -28,7 +28,7 @@ Source hashes, versions, hardware, workspace sizes and raw samples are saved.
 
 NVIDIA B200, 148 SMs; B1/H3/D128 BF16, dense noncausal, equal sequence
 lengths, all-head dS. FE base `8059fdf490edb4de838bb2df7096d0b39b4c8336`
-(merged PR #778); exact modified-source hashes are in
+(merged PR #778), measured implementation `c042524b1`; exact source hashes are in
 [the raw artifact](results/b200_20260910.json).
 
 | Sequence | Triton ms | CuTe DSL ms | Speedup |
@@ -58,6 +58,14 @@ runtime scale, rejected tails/contracts, workspace size/alignment, no
 execute-time compilation/JIT dispatch, allocation/copy detector, and CUDA
 Graph replay. The allocation detector is exercised with a positive failure
 control. No cross-device/multi-GPU or built-wheel test is claimed.
+
+An expanded run including the repository-wide symbol-prefix audit reported
+24 passed / 1 failed: the failing global test lists 19 definitions that are
+byte-identical to the merged base, outside this change. The new QAT kernel
+passes that AST guard after moving its unchanged name-registration call
+immediately after the kernel definition (a red/green guard check was run).
+That naming-placement-only cleanup follows measured commit `c042524b1`;
+it does not change the kernel arithmetic or launch configuration.
 
 Initial CuTe DSL support intentionally declines B>1, causal, GQA, unequal
 lengths and non-256-aligned lengths. Native tails, broader adversarial

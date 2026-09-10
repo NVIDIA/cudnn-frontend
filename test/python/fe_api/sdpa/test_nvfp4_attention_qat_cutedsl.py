@@ -2,11 +2,11 @@
 
 """Opt-in SM100 QAT backend: numerical, workspace and launch contracts."""
 
+import importlib.util
 import math
 
 import pytest
 import torch
-import cuda.bindings.driver as cuda
 
 from test_utils import torch_fork_set_rng
 from fe_api.sdpa.test_nvfp4_attention_qat_backward import _reference_case
@@ -16,10 +16,16 @@ def _available():
     from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 
     installed, version = cutedsl_state()
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0) and installed and not cutedsl_too_old(version)
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() == (10, 0)
+        and installed
+        and not cutedsl_too_old(version)
+        and importlib.util.find_spec("triton") is not None
+    )
 
 
-pytestmark = [pytest.mark.L0, pytest.mark.skipif(not _available(), reason="Requires SM100 and CuTe DSL >= 4.7.0")]
+pytestmark = [pytest.mark.L0, pytest.mark.skipif(not _available(), reason="Requires SM100, Triton, and CuTe DSL >= 4.7.0")]
 
 
 def _prepare(inputs, **options):
@@ -116,6 +122,8 @@ def test_cutedsl_precompiled_no_allocations_no_sync_and_graph_replay(monkeypatch
 
 @torch_fork_set_rng(seed=79)
 def test_cutedsl_explicit_stream_and_runtime_scale(monkeypatch):
+    import cuda.bindings.driver as cuda
+
     inputs, _ = _reference_case(256, 256, is_causal=False)
     reference, ref, ref_ws = _prepare(inputs)
     candidate, got, ws = _prepare(inputs, backend="cutedsl")

@@ -1320,6 +1320,9 @@ def _kernel(
         )
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # === Warp functions ========================================================
 
 
@@ -2296,9 +2299,6 @@ def _host(
         cluster=(CFG.CGA_M, CFG.CGA_N, 1),
         stream=stream,
     )
-
-
-_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 def compile(b: int, qh: int, kh: int, sq: int, skv: int, qh_chunk: int = 0) -> Callable:
