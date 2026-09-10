@@ -294,8 +294,8 @@ def generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
 
     return graph_bwd
 
-def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5):
-    """assert_close for fp8 SDPA gradients with a small mismatch budget.
+def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=None):
+    """assert_close for fp8 SDPA outputs/gradients with a small mismatch budget.
 
     The kernel and the reference each quantize P (with s_scale) and dS (with dP_scale) to fp8
     independently, from fp32 values that differ by ~1e-6 relative (exp2/FMA vs torch.exp). When
@@ -303,9 +303,31 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5):
     26; dS*dP_scale = 15.0 / -13.0), the two sides round to different fp8 codes and every
     gradient element fed by that value moves by one e4m3 step * |dO| (or |K|, |Q|): 0.09-0.26 for
     the suite's data, more than atol + rtol*|ref| for near-cancelling elements. That is not a
-    kernel defect and it hits a handful of elements out of 10^6-10^7 (up to one row of d), so a
-    budget of 1e-5 of the elements (at least 1) is tolerated. NaN/Inf are never budgeted, and a
-    real bug (a tile, >= 128*d elements) is orders of magnitude above the budget.
+    kernel defect and it hits a handful of elements out of 10^6-10^7, so a budget of 1e-5 of the
+    elements (at least 1) is tolerated. NaN/Inf are never budgeted, and a real bug (a tile,
+    >= 128*d elements) is orders of magnitude above the budget.
+
+    One flipped P or dS value at (i, j) feeds a whole d-row of the outputs -- O/dQ row i, dK/dV
+    row j -- so when that row's Q/K/V/dO is dense the flip costs d elements, not a handful. The
+    negative-score q rows (inject_negative_score_rows) all share one dense q vector, so their
+    dS(i, j) terms into dK row j add coherently: on GB300 CI (test310, e4m3, d192) a single
+    dS*dP_scale within 1e-5 relative of an e4m3 midpoint moved all 192 elements of one dK row by
+    0.25 (the reference recomputed with P*(1+1e-5) reproduces the kernel's row exactly). The
+    same holds for O with e5m2 P (2 mantissa bits: one step is 25% of P, 0.15-0.3 in O for
+    |v|~2). The budget therefore also counts affected d-rows.
+
+    A flip is an event per P (or dS) VALUE, so the number of rows it can touch scales with
+    rows * keys, not with rows alone: ``keys`` is the reduction length feeding each d-row (s_kv
+    for O/dQ, s_q for dK/dV) and the row budget is 1e-5 of rows * keys (at least 1). Measured
+    rate on B200: e5m2 d256 no-mask s=1093 (test_sdpa_fp8_fwd_L0[test136]) flipped 79 of 61,208
+    O rows = 1.2e-6 per P value, 2 elements per row (only the largest-|v| dims clear atol). The
+    row budget is only honoured while every deviation stays within 4*atol -- one fp8 P step
+    times |v| for this suite's sparse-int data (measured flips: 0.13-0.375). The cap is what
+    rejects a real defect: the GitHub #981 d256 fp8 corruption (garbage weights on a 16-key
+    band) measured on the unfixed kernel as 11,048 elements / 253 rows / max 2.0 (MHA),
+    1,591 / 37 / 0.42 (e4m3) and 562 / 15 / 0.69 (s=1024) -- the row counts sit inside the
+    rows * keys budget, the magnitudes never do. Do not raise the cap for a "slightly" worse
+    flip; recompute the reference with the flipped P value instead (see test310 above).
     """
     actual = actual.detach().float()
     expected = expected.detach().float()
@@ -317,12 +339,18 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5):
     if n_bad == 0:
         return
     allowed = max(1, int(actual.numel() * budget))
+    bad_rows = bad.reshape(-1, bad.shape[-1]).any(dim=-1)
+    n_bad_rows = int(bad_rows.sum().item())
+    allowed_rows = max(1, int(bad_rows.numel() * (keys or 1) * budget))
+    max_diff = diff.max().item()
     idx = tuple(bad.nonzero()[0].tolist())
     print(
-        f"%%%% '{tag}': {n_bad:,} of {actual.numel():,} elements outside atol={atol} rtol={rtol} (budget {allowed}); "
-        f"first at {idx}: actual={actual[idx].item():+.5f} expected={expected[idx].item():+.5f}; max |diff|={diff.max().item():.4f}"
+        f"%%%% '{tag}': {n_bad:,} of {actual.numel():,} elements outside atol={atol} rtol={rtol} (budget {allowed}) "
+        f"in {n_bad_rows:,} of {bad_rows.numel():,} d-rows (budget {allowed_rows} for keys={keys}); "
+        f"first at {idx}: actual={actual[idx].item():+.5f} expected={expected[idx].item():+.5f}; max |diff|={max_diff:.4f} (row-budget cap {4 * atol})"
     )
-    if n_bad > allowed or bool(nonfinite.any()):
+    within_budget = n_bad <= allowed or (n_bad_rows <= allowed_rows and max_diff <= 4 * atol)
+    if not within_budget or bool(nonfinite.any()):
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, equal_nan=False)
 
 
@@ -584,7 +612,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
         # E5M2 is less precise than E4M3, so its P quantization needs one wider step.
         atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2
-        torch.testing.assert_close(o_gpu_float, o_ref_float, atol=atol, rtol=rtol)
+        assert_close_fp8_grad(o_gpu_float, o_ref_float, atol, rtol, tag="O", keys=s_kv)
 
     # Backward pass
     if not cfg.is_infer:
@@ -752,9 +780,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
             # E5M2 is less precise than E4M3, so its P quantization needs one wider step.
             atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2
-            assert_close_fp8_grad(dQ_out, dQ_ref_float, atol, rtol, tag="dQ")
-            assert_close_fp8_grad(dK_out, dK_ref_float, atol, rtol, tag="dK")
-            assert_close_fp8_grad(dV_out, dV_ref_float, atol, rtol, tag="dV")
+            assert_close_fp8_grad(dQ_out, dQ_ref_float, atol, rtol, tag="dQ", keys=s_kv)
+            assert_close_fp8_grad(dK_out, dK_ref_float, atol, rtol, tag="dK", keys=s_qo)
+            assert_close_fp8_grad(dV_out, dV_ref_float, atol, rtol, tag="dV", keys=s_qo)
 
             if with_sink_token:
                 torch.testing.assert_close(dSink_token_gpu, dSink_token_ref, atol=0.02, rtol=0.2)
