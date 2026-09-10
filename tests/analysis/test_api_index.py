@@ -68,6 +68,21 @@ class ApiIndexTest(unittest.TestCase):
             },
         )
 
+    def test_parameterized_templates_are_scanned_without_execution(self):
+        self.write(
+            "python/cudnn/gemm/frost/kernel_templates/example.py",
+            "TILE_SIZE = INJECTED_TILE_SIZE\ndef kernel(): pass\n",
+        )
+        names = set(api_index.scan(self.root))
+        self.assertTrue(
+            {
+                "cudnn.gemm.frost.kernel_templates.example",
+                "cudnn.gemm.frost.kernel_templates.example.TILE_SIZE",
+                "cudnn.gemm.frost.kernel_templates.example.kernel",
+            }
+            <= names
+        )
+
     def test_lazy_exports_and_private_class_reexports(self):
         self.write(
             "python/cudnn/__init__.py",

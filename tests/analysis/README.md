@@ -4,6 +4,11 @@
 sorted, unique dotted name per line. Changes to public names require an explicit
 index update in the same PR. Additions and removals both fail the check.
 
+Discovery uses AST rather than runtime imports: optional dependency versions and
+backend/platform differences must not change the baseline. Parameterized kernel
+templates are included without executing them; missing import dependencies do
+not prevent scanning their declarations.
+
 ```bash
 python3 -S tests/analysis/api_index.py
 python3 -S -m unittest discover -s tests/analysis -p test_api_index.py -v
