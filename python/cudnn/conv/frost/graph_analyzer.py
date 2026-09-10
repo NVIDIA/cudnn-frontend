@@ -71,11 +71,11 @@ class OutputQuantizeData:
 class ConvGraph:
     """The kernel-relevant tensors and specialization selected from a graph."""
 
-    context: GraphContext # dtypes
+    context: GraphContext  # dtypes
     conv_node: Node
-    image: Tensor # The graph inputs. For nvfp4 inputs, the nvfp4 input tensor without scaling factor. See also block_scale_data.sfa/sfb.
+    image: Tensor  # The graph inputs. For nvfp4 inputs, the nvfp4 input tensor without scaling factor. See also block_scale_data.sfa/sfb.
     weight: Tensor
-    output: Tensor # The graph output. For nvfp4 outputs, the nvfp4 tensor without scaling factor. See also output_quantize_data.scale.
+    output: Tensor  # The graph output. For nvfp4 outputs, the nvfp4 tensor without scaling factor. See also output_quantize_data.scale.
     epilogue: str = "identity"
     epilogue_attrs: tuple[tuple[str, float], ...] = ()
     epilogue_node: Optional[Node] = None
@@ -119,14 +119,16 @@ def _match_block_scale_dequantize(graph: pygraph, output_tensor: Tensor) -> Opti
     if len(block_scale_dequantize_nodes) == 0:
         return None
     elif len(block_scale_dequantize_nodes) > 1:
-        raise NotImplementedError(f"frost_conv: expects exactly one block-scale dequantize node for tensor {output_tensor.name}, but got {len(block_scale_dequantize_nodes)}")
+        raise NotImplementedError(
+            f"frost_conv: expects exactly one block-scale dequantize node for tensor {output_tensor.name}, but got {len(block_scale_dequantize_nodes)}"
+        )
 
     block_scale_dequantize_node = block_scale_dequantize_nodes[0]
     input, scaling_factor, _ = _dequant_operands(block_scale_dequantize_node)
     return input, scaling_factor, block_scale_dequantize_node
 
 
-def _match_pointwise_epilogue_node(graph: pygraph, tensor: Tensor, supported_epilogues = SUPPORTED_UNARY_EPILOGUES) -> Optional[tuple]:
+def _match_pointwise_epilogue_node(graph: pygraph, tensor: Tensor, supported_epilogues=SUPPORTED_UNARY_EPILOGUES) -> Optional[tuple]:
     """Match an optional POINTWISE type epilogue node after a tensor."""
     epilogue_nodes = [n for n in graph.nodes if n.node_type == NodeType.POINTWISE and tensor in n.inputs.values()]
     if len(epilogue_nodes) == 0:

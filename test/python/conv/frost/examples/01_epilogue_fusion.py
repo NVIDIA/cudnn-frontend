@@ -20,7 +20,6 @@ import torch
 
 from common import InputShape, build_frost_conv_plans
 
-
 _EPILOGUES: dict[str, tuple[Callable, Callable]] = {
     "abs": (lambda g, x: g.abs(x, name="abs"), torch.abs),
     "identity": (lambda g, x: g.identity(x, name="identity"), lambda x: x),
