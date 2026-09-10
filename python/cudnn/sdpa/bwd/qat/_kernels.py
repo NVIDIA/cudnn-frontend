@@ -93,7 +93,11 @@ def attention_backward_dq(
     dq = tl.zeros([block_m, head_dim], dtype=tl.float32)
     qk_scale_log2 = softmax_scale * RCP_LN2
 
-    for start_n in tl.range(0, seqlen_kv, block_n):
+    # Entire KV tiles above this query tile's causal diagonal contribute zero.
+    end_n = seqlen_kv
+    if causal:
+        end_n = tl.minimum(seqlen_kv, start_m + block_m)
+    for start_n in tl.range(0, end_n, block_n):
         key_offsets = start_n + tl.arange(0, block_n)
         kv_valid = key_offsets < seqlen_kv
         k_tile = tl.load(
@@ -182,7 +186,12 @@ def attention_backward_dkdv(
     dv = tl.zeros([block_n, head_dim], dtype=tl.float32)
     qk_scale_log2 = softmax_scale * RCP_LN2
 
-    for start_m in tl.range(0, seqlen_q, block_m):
+    # Earlier query tiles cannot attend to any key in this KV tile. Keep the
+    # intersecting diagonal tile, whose elementwise mask is still required.
+    first_m = 0
+    if causal:
+        first_m = (start_n // block_m) * block_m
+    for start_m in tl.range(first_m, seqlen_q, block_m):
         row_offsets = start_m + tl.arange(0, block_m)
         q_valid = row_offsets < seqlen_q
         q_tile = tl.load(

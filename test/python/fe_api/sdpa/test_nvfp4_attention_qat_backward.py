@@ -124,7 +124,10 @@ def test_nvfp4_attention_qat_backward_wrapper_matches_reference():
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize(("seqlen_q", "seqlen_kv", "is_causal"), [(37, 45, False), (63, 63, True)])
+@pytest.mark.parametrize(
+    ("seqlen_q", "seqlen_kv", "is_causal"),
+    [(37, 45, False), (63, 63, True), (1, 1, True), (17, 17, True), (65, 65, True), (129, 129, True), (129, 144, False), (256, 256, True)],
+)
 @torch_fork_set_rng(seed=41)
 def test_nvfp4_attention_qat_backward_tails_and_causal(seqlen_q, seqlen_kv, is_causal):
     """Cover non-tile-aligned cross attention and causal attention."""
