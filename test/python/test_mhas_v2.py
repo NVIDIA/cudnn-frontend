@@ -369,6 +369,33 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("side,seq_lens,minimum,default_capacity", [
+    ("q", [], 256, 320),
+    ("kv", [], 128, 192),
+    ("q", [0, 7], 7, 64),
+    ("kv", [0, 7], 7, 64),
+    ("q", [0, 0], 0, 64),
+    ("kv", [0, 0], 0, 64),
+])
+def test_ragged_capacity_uses_effective_seq_lens(side, seq_lens, minimum, default_capacity):
+    cfg = ExecConfig(
+        batches=2, h_q=8, h_k=8, h_v=8, s_q=128, s_kv=64, d_qk=128, d_v=128,
+        data_type=torch.float16, is_ragged=True, **{f"seq_len_{side}": seq_lens},
+    )
+    total = f"total_{side}"
+    cfg.fill_derived_fields()
+    assert getattr(cfg, total) == default_capacity
+
+    setattr(cfg, total, minimum)
+    cfg.fill_derived_fields()
+    assert getattr(cfg, total) == minimum
+
+    setattr(cfg, total, minimum - 1)
+    with pytest.raises(AssertionError, match=total):
+        cfg.fill_derived_fields()
+
+
+@pytest.mark.L0
 def test_ragged_stride_gaps_stable_under_stride_overrides():
     """The seeded per-tensor token and head gaps must not depend on which strides
     were explicitly provided, head gaps must respect the 16-byte rule, and turning

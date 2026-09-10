@@ -234,12 +234,14 @@ class ExecConfig:
         # the drawn seq_lens (sum rounded up to 64). Explicit totals (e.g. a
         # slack-capacity fuzz) must cover the packed payload.
         if self.is_ragged:
+            seq_len_q = self.seq_len_q or [self.s_q] * (self.batches or 1)
+            seq_len_kv = self.seq_len_kv or [self.s_kv] * (self.batches or 1)
             if self.total_q is None:
-                self.total_q = packed_token_capacity(self.seq_len_q or [self.s_q] * (self.batches or 1))
+                self.total_q = packed_token_capacity(seq_len_q)
             if self.total_kv is None:
-                self.total_kv = packed_token_capacity(self.seq_len_kv or [self.s_kv] * (self.batches or 1))
-            assert self.total_q >= sum(self.seq_len_q or []), f"total_q={self.total_q} < sum(seq_len_q)"
-            assert self.total_kv >= sum(self.seq_len_kv or []), f"total_kv={self.total_kv} < sum(seq_len_kv)"
+                self.total_kv = packed_token_capacity(seq_len_kv)
+            assert self.total_q >= sum(seq_len_q), f"total_q={self.total_q} < sum(seq_len_q)"
+            assert self.total_kv >= sum(seq_len_kv), f"total_kv={self.total_kv} < sum(seq_len_kv)"
 
         # Compute strides if not provided (packed for ragged, default BHSD otherwise).
         # with_ragged_token_gap (default True): per-tensor token-stride gaps,
