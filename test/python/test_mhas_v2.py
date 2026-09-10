@@ -221,7 +221,9 @@ def test_sdpa_random_sq1_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
+        # ragged = packed-THD decode (the serving shape); was never drawn here,
+        # which is how the d=192 THD-decode view overflow (GitHub #980) hid.
+        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 1, "full" : 1}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
@@ -288,7 +290,8 @@ def test_sdpa_random_lean_attn_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
+        # ragged = packed-THD decode against a long KV (GitHub #980 coverage).
+        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 1, "full" : 1}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
