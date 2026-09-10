@@ -162,6 +162,7 @@ else:
 
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
+    store_fp32_partial_tile as _store_fp32_partial_tile,
     Bars,
     KvLoopBounds,
     make_classic_bars,
@@ -252,6 +253,9 @@ _split_h = make_split_helpers(
     dispatch_decode_payload=_dispatch_decode_payload,
 )
 SPLIT_KV = _split_h.SPLIT_KV
+# A split writes fp32 partials, replacing the SMEM/TMA O path rather than
+# widening it; the combine performs the only cast to O's dtype.
+_FP32_PARTIALS = SPLIT_KV > 1
 MAY_BE_EMPTY = _split_h.MAY_BE_EMPTY
 _decode_initial_split = _split_h.decode_initial_split
 _decode_payload_split = _split_h.decode_payload_split
@@ -322,6 +326,7 @@ def _kernel(
     descale_v_t: cute.Tensor,
     scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
+    o_partial_f32: Optional[cute.Tensor],
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -518,6 +523,7 @@ def _kernel(
             cta_id_x=cta_id_x,
             o_scale_fused=o_scale_fused,
             amax_o_tensor=amax_o_tensor,
+            o_partial_f32=o_partial_f32,
             qh_per_kh=qh_per_kh,
         )
 
@@ -930,31 +936,35 @@ def _tmastg_warp_group(
 
         for qs in cutlass.range_constexpr(CFG.TILES_Q):
             bars.mb_o_full[qs].wait(o_full_phase)
+            # fp32 partials wrote the workspace directly, so nothing is staged
+            # to copy.  Skip ONLY the store: the arrive below and any QO_ALIAS
+            # handshake after it must still run, or this warp laps the loader
+            # and the parity waits deadlock.
+            if cutlass.const_expr(not _FP32_PARTIALS):
+                # O TMA params follow O's swizzle, not V's (V and O swizzles may differ).
+                if cutlass.const_expr(CFG.THD_VARLEN):
+                    # THD: store each Q slab through this batch's pre-built descriptor
+                    # (base at the sequence's packed row, seq extent = S_q_b → a box
+                    # past S_q_b is OOB-clipped).  q_row coord is sequence-local; the
+                    # batch coord collapses to 0.  Both slabs share one descriptor.
+                    # (split_kv is dense-only — the config backstop rejects THD —
+                    # so o_batch never applies here.)
+                    # DEAD unit (batch == n_batch, over-launched envelope grid —
+                    # issue #552): no O rows exist and descriptor slot n_batch is
+                    # never built, so skip the store; the barrier protocol below
+                    # still runs.
+                    if batch_idx < n_batch:
+                        o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+                        o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(qs * CFG.TILE_M), cutlass.Int32(0))
+                        tma_store_tile(sO[qs], o_slice)
+                else:
+                    tma_store_tile(
+                        sO[qs],
+                        tma_o(cutlass.Int32(0), q_head_idx, q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE), o_batch),
+                    )
 
-            # O TMA params follow O's swizzle, not V's (V and O swizzles may differ).
-            if cutlass.const_expr(CFG.THD_VARLEN):
-                # THD: store each Q slab through this batch's pre-built descriptor
-                # (base at the sequence's packed row, seq extent = S_q_b → a box
-                # past S_q_b is OOB-clipped).  q_row coord is sequence-local; the
-                # batch coord collapses to 0.  Both slabs share one descriptor.
-                # (split_kv is dense-only — the config backstop rejects THD —
-                # so o_batch never applies here.)
-                # DEAD unit (batch == n_batch, over-launched envelope grid —
-                # issue #552): no O rows exist and descriptor slot n_batch is
-                # never built, so skip the store; the barrier protocol below
-                # still runs.
-                if batch_idx < n_batch:
-                    o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
-                    o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(qs * CFG.TILE_M), cutlass.Int32(0))
-                    tma_store_tile(sO[qs], o_slice)
-            else:
-                tma_store_tile(
-                    sO[qs],
-                    tma_o(cutlass.Int32(0), q_head_idx, q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE), o_batch),
-                )
-
-            tma_store_commit()
-            tma_store_wait(0)
+                tma_store_commit()
+                tma_store_wait(0)
 
             bars.mb_o_empty[qs].arrive()
 
@@ -1731,6 +1741,7 @@ def _correction_warp_group(
     o_scale_fused,
     amax_o_tensor,
     qh_per_kh,
+    o_partial_f32=None,
 ):
     """Correction warp group: 4 warps × 32 lanes = 128, one lane per O row.
 
@@ -1876,6 +1887,10 @@ def _correction_warp_group(
             bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
             inv_sum = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
+            # Same reason: row_dead is only bound under some mask/sink configs, but
+            # the fp32-partial store reads it unconditionally.  False here means
+            # 'not dead'; the branches below override it where it is meaningful.
+            row_dead = cutlass.Float32(0.0) > cutlass.Float32(1.0)
             lse_val = cutlass.Float32(0.0)  # pre-declare; computed in both branches
             q_row_global = (
                 q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE) + cutlass.Int32(qs * TOKENS_PER_TILE) + (tid_in_wg // cutlass.Int32(HEADS_PER_TILE))
@@ -1949,7 +1964,26 @@ def _correction_warp_group(
 
             sO_sub_base = sO[qs].base
 
-            if cutlass.const_expr(CFG.DTYPE_O <= 1):
+            if cutlass.const_expr(_FP32_PARTIALS):
+                # fp32 partials: the accumulator goes straight to the workspace,
+                # so the SMEM O tile and its TMA store are both bypassed.
+                _store_fp32_partial_tile(
+                    o_partial_f32,
+                    tmem_base_epi,
+                    tmem_O_off,
+                    inv_sum,
+                    row_dead,
+                    _row_valid,
+                    _partial_batch(batch_idx, split_idx, n_batch),
+                    q_row_global,
+                    row_head_idx,
+                    CFG.TILE_O,
+                    O_CHUNK,
+                )
+                # The TMA-store warp group still runs its handshake; release the
+                # slot even though nothing was staged.
+                bars.mb_o_empty[qs].wait(o_empty_phase)
+            elif cutlass.const_expr(CFG.DTYPE_O <= 1):
                 # FP8 output (DTYPE_O ∈ {0,1}): hand-rolled 16:4 fp8 pack +
                 # STS.128 — forces F2FP outputs into a register quad so STS.128
                 # needs no PRMT to gather them (vs the DSL store_swizzled which
@@ -2122,6 +2156,7 @@ def _host(
     thd_q_lens_tensor: Optional[cute.Tensor] = None,
     thd_kv_lens_tensor: Optional[cute.Tensor] = None,
     thd_lens_form: Optional[cutlass.Int32] = None,
+    o_partial_f32: Optional[cute.Tensor] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
@@ -2167,9 +2202,18 @@ def _host(
         swizzle=_tma_swz(CFG.V_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
+    # Under fp32 partials the epilogue writes o_tensor directly and this
+    # descriptor is never used -- but it still has to BUILD, and an fp32 element
+    # doubles the box's inner byte width past what the O swizzle allows.  Halve
+    # the box so the descriptor stays legal; nothing reads it.
+    _o_box = list(vo_box_o)
+    if _FP32_PARTIALS:
+        # fp32 is 4 bytes; scale the box by the O element's own width so
+        # the inner dimension stays inside the swizzle's byte limit.
+        _o_box[-1] = max(1, _o_box[-1] * CFG.BPE_O // 4)
     tma_o_desc = tmap.create_tensor_map_tiled_from_view(
         o_tensor,
-        box_dims=vo_box_o,
+        box_dims=tuple(_o_box),
         stride_order=stride_order,
         swizzle=_tma_swz(CFG.O_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
@@ -2249,6 +2293,7 @@ def _host(
         descale_v_t,
         scale_o_t,
         amax_o_tensor,
+        o_partial_f32,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2335,7 +2380,9 @@ def compile(  # noqa: A001
         assumed_align=16,
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
-        OUT_STORAGE_DTYPE,
+        # Under fp32 partials o_tensor IS the fp32 split workspace: the epilogue
+        # writes it directly and the TMA descriptor built from it goes unused.
+        cutlass.Float32 if _FP32_PARTIALS else OUT_STORAGE_DTYPE,
         (_o_batch, sq, qh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
@@ -2461,6 +2508,9 @@ def compile(  # noqa: A001
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,
+        # o_partial_f32 is LAST so the THD tensors keep their slots when the
+        # mode is off -- a mid-signature slot shifts them by one.
+        *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )
