@@ -72,7 +72,7 @@ def _run(shape: InputShape, epilogue_name: str) -> None:
 
 
 def main() -> None:
-    # Preserve _FpropCTMKernel's exact 256x256 implicit-GEMM output tile and
+    # Preserve _FpropKernel's exact 256x256 implicit-GEMM output tile and
     # 64-channel GEMM-K tile assumptions while varying the fused epilogue.
     shape = InputShape(n=1, d=6, h=10, w=10, c=64, k=256, t=3, r=3, s=3)
     for epilogue_name in _EPILOGUES:

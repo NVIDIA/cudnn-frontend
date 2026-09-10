@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# CTM-style FP16/BF16 implicit-GEMM fprop convolution kernel for Blackwell B200.
+# Implicit-GEMM fprop convolution kernel for Blackwell B200.
 #
 # Maps a 3D convolution onto an implicit GEMM: M = N*Z*P*Q, N_gemm = K,
 # K_gemm = T*R*S*C. Warp-specialized with explicit roles (1 TMA producer warp,
@@ -68,7 +68,7 @@ def _c_smem_swizzle(c_dtype: Type[Numeric], subtile_n: int) -> "cutlass.Swizzle"
     (not a fixed 2-byte assumption) keeps fp32 (4B) and fp8 (1B) outputs
     correct, not just fp16/bf16. The host C TMA descriptor and the device
     ``store_swizzled`` both derive from this one value, so they stay in
-    lockstep (a mismatch silently transposes the store; see descriptors.py).
+    lockstep (a mismatch silently transposes the store).
     """
     row_bytes = subtile_n * c_dtype.width // 8
     if row_bytes == 32:
@@ -216,7 +216,7 @@ def _kernel(
     tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
     epilogue_op: cutlass.Constexpr,
 ) -> None:
-    """CTM-style implicit-GEMM fprop kernel: TMA load + tcgen05 MMA + TMA store."""
+    """Implicit-GEMM fprop kernel: TMA load + tcgen05 MMA + TMA store."""
 
     # Warp / thread / cluster identity
     warp_idx = cute.arch.warp_idx()
@@ -1010,7 +1010,7 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 # Host wrapper class + compile() / verify()
 # ---------------------------------------------------------------------------
 #
-# FpropCTMKernel holds a ``PersistentConvSetup`` instance that derives the
+# FpropKernel holds a ``PersistentConvSetup`` instance that derives the
 # integer configuration (input attrs, mma/stage/byte sizes) and then launches
 # the device ``kernel``. ``__call__`` materialises the kernel arguments from the
 # setup attributes after ``_setup_attributes()``.
@@ -1456,8 +1456,8 @@ class _PersistentConvSetup:
         # descriptors + Tcgen05SmemDesc.
 
 
-class _FpropCTMKernel:
-    """CTM implicit-GEMM fprop convolution kernel (host entry point).
+class _FpropKernel:
+    """Implicit-GEMM fprop convolution kernel (host entry point).
 
     Delegates configuration to a ``PersistentConvSetup`` instance, then launches
     the device ``kernel`` with a persistent tile scheduler.
@@ -1737,7 +1737,7 @@ def compile(
     fake_b = make_fake_compact_tensor(ab_dtype, (K, T, R, S, C), stride_order=(4, 3, 2, 1, 0), assumed_align=16)
     fake_c = make_fake_compact_tensor(c_dtype, (N, Z, P, Q, K), stride_order=(4, 3, 2, 1, 0), assumed_align=16)
 
-    fprop_op = _FpropCTMKernel(
+    fprop_op = _FpropKernel(
         acc_dtype=acc_dtype,
         tile_config=tile_config,
         filter_trs=ktrs[1:],
