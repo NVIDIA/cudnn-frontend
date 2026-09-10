@@ -19,24 +19,27 @@ AST parser, kernel-template discovery, or broad exposure report.
 
 ## Run
 
-Build the Python bindings first. Use the Linux development build environment
-with its CUDA/cuDNN libraries and optional Python dependencies installed; the
-scan itself needs no GPU.
+Download the CPython 3.12 Linux wheel artifact from the pipeline wheel build.
+Use the matching Linux cuDNN wheel-test environment with PyTorch, CuTeDSL, and
+JAX installed. The scan itself needs no GPU.
 
 ```bash
-CUDA_VISIBLE_DEVICES='' python3 test/python/api_index/api_index.py
-CUDA_VISIBLE_DEVICES='' CUDNN_API_INDEX_PACKAGE_ROOT="$PWD/build/cudnn" \
+python3 -m pip install --no-deps --target api_index_wheel many_linux_wheels/*cp312-cp312*.whl
+CUDA_VISIBLE_DEVICES='' python3 test/python/api_index/api_index.py --package-root api_index_wheel/cudnn
+CUDA_VISIBLE_DEVICES='' CUDNN_API_INDEX_PACKAGE_ROOT="$PWD/api_index_wheel/cudnn" \
   python3 -m unittest discover -s test/python/api_index -p test_api_index.py -v
 ```
 
-The scanner defaults to `build/cudnn`; `--package-root` selects another build.
+The scanner defaults to `build/cudnn` for local builds; `--package-root` selects
+the installed wheel above. Match the wheel build environment when comparing
+local builds, since backend versions can change native exports.
 It checks that the selected package is used, even with an editable cuDNN install
 present. Run it in a fresh Python process.
 
 After reviewing an intentional API change, in the same environment:
 
 ```bash
-CUDA_VISIBLE_DEVICES='' python3 test/python/api_index/api_index.py --write
+CUDA_VISIBLE_DEVICES='' python3 test/python/api_index/api_index.py --package-root api_index_wheel/cudnn --write
 git diff -- test/python/api_index/api_index_modules.txt test/python/api_index/api_index.txt
 ```
 
@@ -45,14 +48,15 @@ the API baseline, not the module allowlist.
 
 ## CI and tests
 
-The full baseline check runs after compilation in `build:dev:linux:amd64` on a
-CPU runner. This keeps the backend/platform constant; release and Windows
-builds can expose different native bindings. The development image supplies
-PyTorch and CuTeDSL; the job installs JAX for the listed JAX facade.
+`analysis:api_index` downloads artifacts from
+`deploy:build_bdist_wheels:linux:amd64`, installs its CPython 3.12 wheel, and runs
+the fixture tests, runtime baseline check, and sync regression. Both jobs are in
+the analysis stage, with an explicit `needs` dependency. The wheel producer also
+runs on merge requests; its existing nightly/release behavior is preserved.
+The inspection job uses the CPU runner tag and disables GPU visibility.
 
 Use `unittest` for CPU execution; the parent `test/python` pytest configuration
-requires a GPU. Fixture tests run before compilation in all build jobs using only Python 3.10+
-and the standard library:
+requires a GPU. Fixture tests need only Python 3.10+ and the standard library:
 
 ```bash
 python3 -S -m unittest discover -s test/python/api_index -p test_api_index.py -v
