@@ -18,7 +18,7 @@
 """Gated DeltaNet (GDN) Cutlass-primitives recompute (state/H-only) kernel config (fixed
 compile-time constants; the per-compile attributes live on ``GdnCfg`` in the kernel file).
 
-Target arch: Blackwell SM100 (GB200) / SM103 (GB300).
+Target arch: Blackwell SM100 / SM103.
 """
 
 from dataclasses import dataclass
@@ -34,13 +34,20 @@ class Cfg:
 
     # --- TMA descriptor pool ---
 
-    # --- warp assignments (12 warps total) ---
-    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # T-pairwise / kk_epi / inverse
-    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # kv_decay_v / v-k*state / epi ops
-    LOAD_GATE_BETA_WARP_ID: int = 8  # gate/beta chunk loads + TMEM lifecycle
-    TMA_KV_WARP_ID: int = 9
-    TCGEN05_MMA_WARP_ID: int = 10  # sole tcgen05 issuer: KK pairs + KS/U/KV per chunk
-    EPILOGUE_WARP_ID: int = 11
+    # --- warp assignments (8 warps total) ---
+    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # kv_decay_v / v-k*state / epi ops
+    LOAD_GATE_WARP_ID: int = 4  # gate chunk loads
+    TMA_KV_WARP_ID: int = 5
+    TCGEN05_MMA_WARP_ID: int = 6  # sole tcgen05 issuer: KS/U/KV per chunk
+    EPILOGUE_WARP_ID: int = 7
+
+    # --- warp assignments with the in-kernel chunk factor (12 warps total) ---
+    INKERNEL_FACTOR_COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # T-pairwise / kk_epi / inverse
+    INKERNEL_FACTOR_COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)
+    INKERNEL_FACTOR_LOAD_GATE_WARP_ID: int = 8  # gate + beta chunk loads
+    INKERNEL_FACTOR_TMA_KV_WARP_ID: int = 9
+    INKERNEL_FACTOR_TCGEN05_MMA_WARP_ID: int = 10  # KK pairs + KS/U/KV per chunk
+    INKERNEL_FACTOR_EPILOGUE_WARP_ID: int = 11
 
     # --- register split ---
     NUM_REGS_COMPUTE_GROUP_0: int = 224
