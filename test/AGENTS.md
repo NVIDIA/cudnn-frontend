@@ -91,3 +91,15 @@ loads kernel templates by absolute path via `spec_from_file_location`, so the
 template that serves a config may come from elsewhere too. To find out which
 template a test actually compiles, log `path` at the top of `load_template` —
 do not infer it from `_pick_flavor` by reading the source.
+
+Nested conftests can also change package lookup after the initial banner.
+`linear_attention/conftest.py` inserts its own checkout's `python/cudnn` into
+`cudnn.__path__`. Running a candidate LA test by absolute path with a baseline
+package can therefore load candidate implementations and produce a false
+GREEN baseline. For RED/GREEN checks, copy only the new test changes into an
+isolated baseline worktree and collect there; verify the concrete operation
+module's `__file__` after conftest setup, not only `cudnn.__file__`.
+
+Import-regression subprocesses are separate interpreters: in-process
+`sys.path` or editable-finder changes do not automatically propagate. Carry
+the selected package/source setup into each child and verify its loaded path.
