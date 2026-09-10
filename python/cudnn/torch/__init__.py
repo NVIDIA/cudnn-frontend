@@ -23,3 +23,5 @@ On torch < 2.13 (no registry), ``cudnn.torch.install()`` applies the
 """
 
 from cudnn.torch.sdpa_provider import calls, install, served_plan_names  # noqa: F401
+
+__all__ = ["calls", "install", "served_plan_names"]
