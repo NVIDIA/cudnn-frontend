@@ -1727,9 +1727,10 @@ def compile(  # noqa: A001
     compile DYNAMIC (``cute.sym_int``) and the cache key stays plan-time-only;
     callers must not pass them. ``max_sq`` (the longest sequence's Q length,
     which sizes the per-sequence grid) is likewise a RUNTIME ``__call__``
-    argument, not a compile parameter. THD strides carry a ZERO batch stride
-    (the real view's batch stride is ``t * token_stride``, a runtime value;
-    the fake rebuilds it symbolically — batch extent 1 never steps).
+    argument, not a compile parameter. THD strides carry a ZERO batch stride;
+    the fake binds the token stride for the extent-1 batch dim, exactly as
+    ``_thd_view`` does at runtime (``T * token_stride`` is never stepped and
+    overflows the int32 stride slot on long packed KV, GitHub #980).
 
     ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
     ``None`` LSE argument) — callers that don't want stats pass no LSE buffer

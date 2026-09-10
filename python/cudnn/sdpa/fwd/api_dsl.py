@@ -1805,8 +1805,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         The packed token totals are runtime values and compile as DYNAMIC
         extents; everything here (logical batch, heads, head dims, the Stats
         specialization, the declared strides with the batch stride zeroed —
-        ``_thd_view``'s batch stride is ``t * token_stride``, a runtime value
-        that never steps at batch extent 1) is known when the graph is built,
+        ``_thd_view`` binds the token stride for the extent-1 batch dim, which
+        never steps; ``t * token_stride`` would overflow the int32 stride slot
+        on long packed KV, GitHub #980) is known when the graph is built,
         so ``compile()`` compiles eagerly and ``_execute_thd``'s lru-cached
         call re-binds the same artifact for every packed total."""
 

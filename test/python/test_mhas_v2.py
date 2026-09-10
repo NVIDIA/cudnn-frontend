@@ -1115,6 +1115,60 @@ def test_sdpa_mixed_seq_len_forms_L0(env_info, cu_sides, diag_align, right_bound
     exec_sdpa(test.cfg, request, cudnn_handle)
 
 
+@pytest.mark.L0
+def test_sdpa_thd_batch_stride_int32_overflow_L0(env_info, request, cudnn_handle):
+    """Packed-THD decode whose whole-buffer size exceeds INT32_MAX elements.
+
+    The FROST THD views bound the extent-1 batch dim with ``T * token_stride``;
+    the kernel ABI checks every stride against the int32 range, so a packed KV
+    buffer of more than 2^31 elements failed at execute with "Out of bound
+    k_tensor.strides[0]" (GitHub #980, found by the dsv3/kimi_k3 model suites:
+    h=128, d_qk=192, ~57k packed KV tokens). The random sweeps in this file
+    cannot reach that boundary within their memory budget (their largest packed
+    stride is 32 * 8192 * 32 * 192 = 1.6e9), so this pins it deterministically:
+    128 heads x d_qk=192 x 90,800 packed KV tokens = 2.23e9 > 2^31. K alone is
+    4.4 GiB -- that size is the bug's precondition, not a knob.
+    """
+    if torch.cuda.get_device_properties(0).total_memory < 16 * 2**30:
+        pytest.skip("needs a >4 GiB packed K buffer (plus V and reference)")
+    seq_len_kv = [11400] * 4 + [11300] * 4  # 90,800 tokens; each K token is 128*192 elements
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=980,
+        rng_geom_seed=980,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=False,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_cu_seq_len=False,
+        is_ragged=True,
+        with_ragged_token_gap=False,  # packed contract: token stride = h*d exactly
+        is_dropout=False,
+        is_determin=False,
+        batches=len(seq_len_kv),
+        d_qk=192,
+        d_v=64,  # keeps V at ~1.5 GiB; only K needs to cross the boundary
+        s_q=1,
+        s_kv=max(seq_len_kv),
+        h_q=128,
+        h_k=128,
+        h_v=128,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        left_bound=None,
+        right_bound=None,
+        seq_len_q=[1] * len(seq_len_kv),
+        seq_len_kv=seq_len_kv,
+    )
+    test.cfg.fill_derived_fields()
+    assert sum(seq_len_kv) * test.cfg.h_k * test.cfg.d_qk > 2**31, "config must cross the int32 element boundary"
+    test.showConfig((request.node.name, 1), request)
+
+    exec_sdpa(test.cfg, request, cudnn_handle)
+
+
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
 @pytest.mark.L0
 @pytest.mark.L1
