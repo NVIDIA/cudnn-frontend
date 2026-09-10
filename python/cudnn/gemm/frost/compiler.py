@@ -1199,6 +1199,8 @@ def _render_tile_constants_sm120(
         f"num_b_operands = {chain.num_b_operands}",
         f"vec_bytes_epi = {vec_bytes_epi}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store=False)}",
+        f"split_k_slices = {cfg.split_k_slices}",
+        *([f"splitk_reduce_elems = {_splitk_reduce_elems(chain)}"] if cfg.split_k_slices > 1 else []),
         f"frost_compile_options = {_frost_compile_options()!r}",
     ]
     lines.extend(_quant_device_imports(chain))
@@ -1699,6 +1701,8 @@ def _render_block_scale_tile_constants_sm120(
         "num_b_operands = 1",
         f"vec_bytes_epi = {vec_bytes_epi}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store=False)}",
+        f"split_k_slices = {cfg.split_k_slices}",
+        *([f"splitk_reduce_elems = {_splitk_reduce_elems(chain)}"] if cfg.split_k_slices > 1 else []),
         f"frost_compile_options = {_frost_compile_options()!r}",
         "",
         "# block-scale warp MMA (nvvm.mma.block_scale member names)",

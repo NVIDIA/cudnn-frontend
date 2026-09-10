@@ -2584,6 +2584,16 @@ def test_sm120_block_scale_matmul_numerics(combo, config_name, M, N, K):
 
 
 @requires_sm120
+@pytest.mark.parametrize(
+    "combo,config_name,S,M,N,K",
+    [("nvfp4", _SM120_BS_128, 5, 256, 256, 4096), ("mxfp8", _SM120_BS_128_W24, 3, 512, 384, 1088)],  # the second: 8.5 K-tiles over 3 slices
+    ids=("nvfp4-S5", "mxfp8-w24-ktail-S3"),
+)
+def test_sm120_block_scale_matmul_splitk_numerics(combo, config_name, S, M, N, K):
+    _run_bs_numeric(combo, config_name, M, N, K, split_k=S)
+
+
+@requires_sm120
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
 def test_sm120_block_scale_matmul_m_major_out(combo):
     _run_bs_numeric(combo, _SM120_BS_128, 256, 256, 512, out_major="m")
