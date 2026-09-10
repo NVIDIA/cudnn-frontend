@@ -18,8 +18,9 @@ git diff -- api_index.txt
 
 The scanner requires only Python 3.10+ and its standard library. No cuDNN build,
 package installation, optional framework, CUDA toolkit, driver, or GPU is needed.
-GitLab runs it as `analysis:api_index` on CPU runners through its
-`ci/analysis/api_index.sh` runner. The shared scanner lives under `tools/` so
+GitLab's Linux and Windows build jobs run the unittest suite before compilation.
+The repository-index test compares the scanned names with `api_index.txt` and
+fails the build job on a mismatch. The shared scanner lives under `tools/` so
 GitHub/GitLab mirroring and release overlays update it with the index and tests.
 GitLab's `ci/**` files are protected from release overlays.
 

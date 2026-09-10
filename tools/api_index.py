@@ -310,7 +310,7 @@ class Inventory:
         """Resolve the engine manifest and the CPU-only geometry catalog."""
         manifest = root / "python/cudnn/engines/manifest.py"
         if manifest.exists():
-            for node in ast.walk(ast.parse(manifest.read_text())):
+            for node in ast.walk(ast.parse(manifest.read_text(encoding="utf-8"))):
                 if isinstance(node, ast.Call) and dotted(node.func) == "EngineFamily":
                     fields = {keyword.arg: keyword.value for keyword in node.keywords}
                     module = literal(fields.get("module", node.args[2] if len(node.args) > 2 else None), {})
@@ -320,12 +320,12 @@ class Inventory:
         catalog = root / "python/cudnn/gemm/frost/tile_config.py"
         if not catalog.exists():
             return
-        tree = ast.parse(catalog.read_text())
+        tree = ast.parse(catalog.read_text(encoding="utf-8"))
         for node in tree.body:
             if isinstance(node, ast.ImportFrom) and node.module == "cudnn.frost.occupancy":
                 constants = {}
                 source = root / "python/cudnn/frost/occupancy.py"
-                for assignment in ast.parse(source.read_text()).body:
+                for assignment in ast.parse(source.read_text(encoding="utf-8")).body:
                     if isinstance(assignment, ast.Assign) and isinstance(assignment.value, ast.Constant):
                         constants.update({target.id: assignment.value.value for target in assignment.targets if isinstance(target, ast.Name)})
                 index = tree.body.index(node)
@@ -351,7 +351,7 @@ class Inventory:
         files = []
         types = {}
         for path in paths:
-            tokens = [m.group() for m in re.finditer(token_pattern, path.read_text(), re.S) if not m.group().startswith(("//", "/*"))]
+            tokens = [m.group() for m in re.finditer(token_pattern, path.read_text(encoding="utf-8"), re.S) if not m.group().startswith(("//", "/*"))]
             pairs, stack = {}, []
             for i, token in enumerate(tokens):
                 if token == "(":
@@ -468,7 +468,7 @@ def scan(root):
     inventory.cpp(sorted((root / "python").glob("*.cpp")) + sorted((root / "python" / "pygraph").glob("*.cpp")))
     for path, module, parent in sources:
         try:
-            body = ast.parse(path.read_text(), filename=str(path)).body
+            body = ast.parse(path.read_text(encoding="utf-8"), filename=str(path)).body
             inventory.python_scope(body, module, parent)
             inventory.generated_methods(body, module)
         except ValueError as error:
@@ -485,10 +485,10 @@ def main(argv=None):
     index = args.root / "api_index.txt"
     actual = "\n".join(scan(args.root)) + "\n"
     if args.write:
-        index.write_text(actual)
+        index.write_text(actual, encoding="utf-8")
         print(f"Wrote {len(actual.splitlines())} names to {index}")
         return 0
-    expected = index.read_text() if index.exists() else ""
+    expected = index.read_text(encoding="utf-8") if index.exists() else ""
     if expected != actual:
         print("".join(difflib.unified_diff(expected.splitlines(True), actual.splitlines(True), fromfile="api_index.txt", tofile="scanned API")), end="")
         print("API index mismatch. Review the API change, then run python3 tools/api_index.py --write.")
