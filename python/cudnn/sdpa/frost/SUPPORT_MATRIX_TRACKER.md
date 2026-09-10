@@ -332,15 +332,44 @@ PackGQA and THD families this line declines per-feature, not per-shape.
 kernel's KV loop bound is a floor division, so an un-synthesized ragged `S_kv`
 would silently drop the tail tile.
 
-**Scheduler policy — NATURAL only on every Rubin row.** `SCHED_LPT_L2` was
-dropped first (the ported decode sites never thread `qh_per_kh` / `seqlen_kv`,
-so `_common_blackwell._decode_initial` raises); plain `SCHED_LPT` followed on
-2026-09-08 once a heuristics fallback fix let a causal graph actually reach it —
-it is silently WRONG on the ported kernels (causal d512 FP8 → NaN, masked d128
-MXFP8 → max|O-ref| ≈ 1.9). A knob is honored or the engine is ineligible. The
-SHIPPED d128 FP8 kernel does honor both and loses them here too, because
-`sched_policies` is row-wide; recovering that needs a per-shape domain
-(`sched_policies_by_d_shape`, mirroring `cgas_by_d_shape`).
+**Scheduler policy — `SCHED_LPT` now served on the f16 (256, 256) Rubin
+flavor; NATURAL elsewhere.**
+
+The earlier reading — "the ported decode does not honor SCHED_LPT" — had the
+symptom right and the cause wrong. Every SM100 kernel calls
+`make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)`; the SM107 port omitted
+that argument on 9 of 11 flavors. Without it the LPT linearization walks a row
+range `CTA_MMA`× too large, no tile is ever claimed and the kernel writes
+**nothing** (cosine 0.0000, dense and causal). The two flavors that kept it,
+d128 FP8 and d192 FP8, are exactly the ones previously described as working.
+
+The argument is restored on every 2-CTA SM107 flavor. It is a **no-op under
+`SCHED_NATURAL`** (that decode branch never reads `q_tiles`), so the shipped
+path is unchanged.
+
+Only what is validated is advertised, via the new per-shape
+`sched_policies_by_d_shape` (mirroring `cgas_by_d_shape`): the f16 row serves
+`SCHED_LPT` at **(256, 256)** only. Validation: cos 1.0000 at n_kv 2/3/4/8,
+dense and causal. Measured causal SOL on Rubin at S = 4096/8192/32768:
+53.0/71.1/76.7 % under NATURAL → **62.6/79.3/77.5 %** under LPT
+(+18.2/+11.6/+1.1 %), recovering 40/51/29 % of the causal-vs-dense gap; dense is
+neutral. The decay with S is the signature of scheduler imbalance.
+
+Still declined, and why: d128/d512 f16 and every FP8/MXFP8 flavor are
+**unvalidated** under LPT rather than known-broken (d512 is cga4×1 role-split,
+a different scheduler shape). `SCHED_LPT_L2` is declined by **every** flavor —
+its decode needs `qh_per_kh` and `seqlen_kv`, which the SM107 call sites do not
+pass, so it raises rather than miscomputes. Both are follow-ups.
+
+**`STAGES_KV` on the d256 flavors is 2..4, not pinned to 2.** The old pin blamed
+a body that conflated the KV ring index with the 2-slot `S_acc` parity; the body
+in fact derives parity from the absolute `kv_loop & 1` and is depth-agnostic.
+The real constraint was the >256 KiB tcgen05 descriptor wrap: at depth 4 the last
+two V stages start at 256/288 KiB and a version-0 descriptor truncates
+`start_address` to 14 bits. `prefill_d256_f16.DESC_VERSION` is now **derived**
+from the layout, so every depth in range is correct by construction (cos 1.0000
+at 2/3/4, dense and causal). Depth is perf-neutral — dense SOL moves 0.3 points
+across all three — so the default stays 2.
 
 **Coverage.** The Rubin cells above are exercised by the SM100 suites running on
 cc 10.7 with an arch-aware engine pin — `test_sdpa_fwd_dsl_sm100.py` (f16/bf16),
