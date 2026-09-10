@@ -21,3 +21,6 @@ layout conversions.
 Run this directory separately from torch tests in GPU CI. The repository's public
 GitHub workflows currently provide no GPU test job; adding a qualified runner is
 still needed for automatic JAX qualification.
+
+For JAX/torch/GPU timing comparisons and known overhead findings, see the
+[BSA benchmark](../../benchmark/bsa/README.md). Run it separately: it imports torch.

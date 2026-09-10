@@ -1,0 +1,149 @@
+Untimed cProfile diagnostic: small BHSD, 10 warmed calls per mode.
+Source: 3faa2f03c3f9fc1c1e1b78f994cbc06e1572294b
+Captured separately from the final timing sweep. Instrumented durations are not benchmark measurements.
+
+forward / torch_eager
+         2660 function calls in 0.002 seconds
+
+   Ordered by: cumulative time
+   List reduced from 115 to 20 due to restriction <20>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       10    0.000    0.000    0.002    0.000 benchmark_jax.py:119(<lambda>)
+       10    0.000    0.000    0.002    0.000 api.py:170(block_sparse_attention_forward)
+       10    0.000    0.000    0.001    0.000 _interface.py:1723(bsa_attn_fwd)
+       10    0.000    0.000    0.000    0.000 bsa_fwd_sm100.py:68(__init__)
+       30    0.000    0.000    0.000    0.000 _utils.py:605(_get_device_index)
+       10    0.000    0.000    0.000    0.000 _interface.py:296(_dynamic_tensors_compile_key)
+       10    0.000    0.000    0.000    0.000 __init__.py:1297(current_stream)
+       90    0.000    0.000    0.000    0.000 _interface.py:308(<genexpr>)
+       10    0.000    0.000    0.000    0.000 tvm_ffi_provider.py:1053(__call__)
+       30    0.000    0.000    0.000    0.000 _utils.py:878(_get_device_index)
+       10    0.000    0.000    0.000    0.000 api.py:94(_device_arch)
+       60    0.000    0.000    0.000    0.000 _interface.py:283(_tensor_dynamic_layout_compile_key)
+       10    0.000    0.000    0.000    0.000 <string>:2(wrapper)
+       10    0.000    0.000    0.000    0.000 __init__.py:769(get_device_capability)
+       20    0.000    0.000    0.000    0.000 {built-in method torch.empty}
+       10    0.000    0.000    0.000    0.000 api.py:20(_canonical_shapes)
+       10    0.000    0.000    0.000    0.000 __init__.py:787(get_device_properties)
+       10    0.000    0.000    0.000    0.000 _utils.py:852(_get_current_device_index)
+       10    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+       10    0.000    0.000    0.000    0.000 __init__.py:33(__getattr__)
+
+
+
+forward / jax_eager
+         2240 function calls in 0.002 seconds
+
+   Ordered by: cumulative time
+   List reduced from 42 to 20 due to restriction <20>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       10    0.000    0.000    0.002    0.000 benchmark_jax.py:132(<lambda>)
+       10    0.000    0.000    0.002    0.000 benchmark_jax.py:121(<lambda>)
+       10    0.001    0.000    0.002    0.000 jax_api.py:171(block_sparse_attention_forward_jax)
+       10    0.000    0.000    0.001    0.000 jax_api.py:65(configuration)
+       60    0.000    0.000    0.000    0.000 jax_api.py:54(require_array)
+      160    0.000    0.000    0.000    0.000 array.py:516(devices)
+       10    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+       10    0.000    0.000    0.000    0.000 __init__.py:33(__getattr__)
+       10    0.000    0.000    0.000    0.000 __init__.py:16(_load_symbol)
+      470    0.000    0.000    0.000    0.000 {built-in method builtins.isinstance}
+       10    0.000    0.000    0.000    0.000 __init__.py:71(import_module)
+       10    0.000    0.000    0.000    0.000 <frozen importlib._bootstrap>:1394(_gcd_import)
+      150    0.000    0.000    0.000    0.000 jax_api.py:72(<genexpr>)
+      160    0.000    0.000    0.000    0.000 array.py:604(_check_if_deleted)
+      160    0.000    0.000    0.000    0.000 sharding_impls.py:150(device_set)
+       10    0.000    0.000    0.000    0.000 api_base.py:1126(__init__)
+       40    0.000    0.000    0.000    0.000 array.py:261(ndim)
+       10    0.000    0.000    0.000    0.000 <frozen importlib._bootstrap>:1360(_find_and_load)
+      160    0.000    0.000    0.000    0.000 array.py:269(sharding)
+       40    0.000    0.000    0.000    0.000 {built-in method builtins.getattr}
+
+
+
+forward / jax_jit
+         50 function calls in 0.001 seconds
+
+   Ordered by: cumulative time
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       10    0.000    0.000    0.001    0.000 benchmark_jax.py:133(<lambda>)
+       10    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+       10    0.000    0.000    0.000    0.000 jax_api.py:31(tree_unflatten)
+       10    0.000    0.000    0.000    0.000 api_base.py:1126(__init__)
+       10    0.000    0.000    0.000    0.000 {method 'keys' of 'dict' objects}
+
+
+
+backward / torch_eager
+         2800 function calls in 0.003 seconds
+
+   Ordered by: cumulative time
+   List reduced from 93 to 20 due to restriction <20>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       10    0.000    0.000    0.003    0.000 benchmark_jax.py:120(<lambda>)
+       10    0.000    0.000    0.003    0.000 api.py:366(block_sparse_attention_backward)
+       10    0.000    0.000    0.002    0.000 _interface.py:2049(bsa_attn_bwd)
+       10    0.000    0.000    0.001    0.000 bsa_bwd_sm100.py:2174(bsa_sm100_blk128_bwd_bucketed_k2q_csr)
+       10    0.000    0.000    0.001    0.000 _interface.py:2272(_build_bucketed_k2q_csr)
+       10    0.000    0.000    0.001    0.000 bucketed_k2q_csr.py:252(build_bucketed_k2q_csr_cutedsl)
+       40    0.000    0.000    0.000    0.000 tvm_ffi_provider.py:1053(__call__)
+       10    0.000    0.000    0.000    0.000 {built-in method torch.zeros}
+       20    0.000    0.000    0.000    0.000 __init__.py:769(get_device_capability)
+       20    0.000    0.000    0.000    0.000 __init__.py:787(get_device_properties)
+       40    0.000    0.000    0.000    0.000 bsa_bwd_prepost.py:36(_get_device_arch)
+       40    0.000    0.000    0.000    0.000 _utils.py:605(_get_device_index)
+       10    0.000    0.000    0.000    0.000 api.py:94(_device_arch)
+       80    0.000    0.000    0.000    0.000 {method 'transpose' of 'torch._C.TensorBase' objects}
+       10    0.000    0.000    0.000    0.000 api.py:20(_canonical_shapes)
+       60    0.000    0.000    0.000    0.000 {built-in method torch.empty_like}
+       50    0.000    0.000    0.000    0.000 {built-in method torch.empty}
+       10    0.000    0.000    0.000    0.000 bsa_bwd_prepost.py:146(_bwd_preprocess)
+       10    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+       10    0.000    0.000    0.000    0.000 __init__.py:1297(current_stream)
+
+
+
+backward / jax_eager
+         154615 function calls (150585 primitive calls) in 0.196 seconds
+
+   Ordered by: cumulative time
+   List reduced from 777 to 20 due to restriction <20>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       10    0.000    0.000    0.197    0.020 benchmark_jax.py:132(<lambda>)
+       10    0.000    0.000    0.197    0.020 benchmark_jax.py:122(<lambda>)
+       10    0.000    0.000    0.196    0.020 jax_api.py:206(block_sparse_attention_backward_jax)
+       10    0.002    0.000    0.194    0.019 call.py:150(wrapper)
+       20    0.000    0.000    0.185    0.009 traceback_util.py:190(reraise_with_filtered_traceback)
+       10    0.000    0.000    0.183    0.018 pjit.py:256(cache_miss)
+       10    0.000    0.000    0.163    0.016 pjit.py:132(_run_python_pjit)
+       10    0.000    0.000    0.162    0.016 pjit.py:1112(_pjit_call_impl_python)
+    50/40    0.000    0.000    0.147    0.004 profiler.py:417(wrapper)
+       10    0.000    0.000    0.116    0.012 pxla.py:1227(compile)
+       10    0.000    0.000    0.116    0.012 pxla.py:1704(from_hlo)
+       10    0.000    0.000    0.112    0.011 pxla.py:1517(_cached_compilation)
+       10    0.000    0.000    0.110    0.011 compiler.py:425(compile_or_get_cached)
+       10    0.000    0.000    0.105    0.011 compiler.py:760(_compile_and_write_cache)
+       10    0.105    0.010    0.105    0.010 compiler.py:330(backend_compile_and_load)
+       10    0.000    0.000    0.039    0.004 pjit.py:1057(_resolve_and_lower)
+       10    0.000    0.000    0.038    0.004 pjit.py:1222(_pjit_lower)
+       10    0.001    0.000    0.038    0.004 pxla.py:975(lower_sharding_computation)
+       10    0.000    0.000    0.034    0.003 pxla.py:716(_cached_lowering_to_hlo)
+       10    0.002    0.000    0.034    0.003 mlir.py:1327(lower_jaxpr_to_module)
+
+
+
+backward / jax_jit
+         50 function calls in 0.001 seconds
+
+   Ordered by: cumulative time
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       10    0.001    0.000    0.001    0.000 benchmark_jax.py:133(<lambda>)
+       10    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+       10    0.000    0.000    0.000    0.000 jax_api.py:31(tree_unflatten)
+       10    0.000    0.000    0.000    0.000 api_base.py:1126(__init__)
+       10    0.000    0.000    0.000    0.000 {method 'keys' of 'dict' objects}
