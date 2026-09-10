@@ -164,7 +164,7 @@ def launch_training_forward(
     assert out.valid_route_counts is not None
     assert out.expert_offsets is not None
     fc1_preact = out.fc1_preact
-    col_quant_data = out.fc1_a.transpose(0, 1)
+    col_quant_data = out.fc1_a
     col_quant_sf = out.fc1_sfa.view(torch.uint8).reshape(-1)
     expected_elements = int(prepared.col_quant_sf_elements)
     if col_quant_sf.numel() != expected_elements:
@@ -280,7 +280,7 @@ def launch_training_backward(
     assert out.fc2_sfa is not None
     assert out.fc2_b is not None
     assert out.fc2_sfb is not None
-    fc1_recompute = out.fc2_a.transpose(0, 1)
+    fc1_recompute = out.fc2_a
     fc1_recompute_sf = out.fc2_sfa
     fc1_col_output = out.fc1_b
     fc1_col_output_sf = out.fc1_sfb

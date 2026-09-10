@@ -306,6 +306,10 @@ class MoeEpTrainingBackwardOutputs:
 class MoeEpTrainingWgradOperands:
     """Non-owning views over caller-owned fixed-capacity WGrad operands.
 
+    ``fc1_a`` and ``fc2_a`` are contiguous token-major activations with shapes
+    ``(T, H)`` and ``(T, I)``. Their corresponding token-major gradient
+    outputs are ``fc1_b=(T, 2I)`` and ``fc2_b=(T, H)``.
+
     For expert ``e``, the physical segment starts at zero or
     ``expert_offsets[e - 1]``.  Only the next ``valid_route_counts[e]`` rows
     are defined; per-expert padding and the final capacity tail are

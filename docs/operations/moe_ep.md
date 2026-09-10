@@ -400,7 +400,8 @@ capacity, not the model's top-k value:
 
 - `fc1_b` remains gate/up-interleaved with shape `(K_pool, 2I)` and stride
   `(2I, 1)`;
-- `fc1_a` and `fc2_a` use the advertised transpose-view layouts;
+- `fc1_a` is contiguous `(K_pool, H)` and `fc2_a` is contiguous
+  `(K_pool, I)`, so both activations are directly usable in `dY.T @ X`;
 - all four scale tensors are written in the final grouped-WGrad 128x4
   interleaved layout;
 - no public compact scale, deinterleave copy, physical transpose, slot export,

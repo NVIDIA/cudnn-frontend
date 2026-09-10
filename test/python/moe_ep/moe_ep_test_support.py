@@ -779,7 +779,7 @@ def _dense_wgrads_from_operands(operands):
         operands.fc1_sfa,
         operands.expert_offsets,
         operands.valid_route_counts,
-        k_dim=1,
+        k_dim=0,
     )
     fc1_b = _dequantize_wgrad_operand(
         operands.fc1_b,
@@ -793,7 +793,7 @@ def _dense_wgrads_from_operands(operands):
         operands.fc2_sfa,
         operands.expert_offsets,
         operands.valid_route_counts,
-        k_dim=1,
+        k_dim=0,
     )
     fc2_b = _dequantize_wgrad_operand(
         operands.fc2_b,
@@ -815,8 +815,8 @@ def _dense_wgrads_from_operands(operands):
         if valid_count < 0 or valid_count > extent:
             raise ValueError(f"expert {expert} valid route count {valid_count} exceeds " f"its padded extent {extent}")
         valid_end = previous + valid_count
-        fc1_parts.append(fc1_a[:, previous:valid_end] @ fc1_b[previous:valid_end, :])
-        fc2_parts.append(fc2_a[:, previous:valid_end] @ fc2_b[previous:valid_end, :])
+        fc1_parts.append(fc1_a[previous:valid_end, :].transpose(0, 1) @ fc1_b[previous:valid_end, :])
+        fc2_parts.append(fc2_a[previous:valid_end, :].transpose(0, 1) @ fc2_b[previous:valid_end, :])
         previous = end
     return torch.stack(fc1_parts), torch.stack(fc2_parts)
 
@@ -845,7 +845,7 @@ def _run_grouped_wgrad_kernel(
     # workspace per graph call site, after which output identity must no
     # longer participate in the compile cache key.
     return cudnn.grouped_gemm_wgrad_wrapper_sm100(
-        a_tensor=getattr(operands, f"{prefix}_a"),
+        a_tensor=getattr(operands, f"{prefix}_a").transpose(0, 1),
         b_tensor=getattr(operands, f"{prefix}_b"),
         sfa_tensor=getattr(operands, f"{prefix}_sfa"),
         sfb_tensor=getattr(operands, f"{prefix}_sfb"),

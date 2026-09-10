@@ -446,7 +446,7 @@ class Mxfp8InputAdapter:
         if config.enable_col_quant:
             if col_quant_data_rows <= 0 or col_quant_sf_elements <= 0:
                 raise ValueError("enabled column requant requires positive output capacities")
-            col_quant_data = _typed_k_major_view(
+            col_quant_data = _typed_view(
                 local["col_quant_data"],
                 _MXFP8_DATA_DTYPE,
                 (col_quant_data_rows, config.hidden),

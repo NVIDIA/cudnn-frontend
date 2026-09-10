@@ -775,13 +775,16 @@ def test_private_training_state_has_no_bound_weights_or_wgrad_exporter():
 
     requirements = state.public_requirements()
     assert requirements["fc1_a"] == (
-        (config.hidden_size, forward.pool_token_capacity),
-        (forward.pool_token_capacity, 1),
+        (forward.pool_token_capacity, config.hidden_size),
+        (config.hidden_size, 1),
         torch.float8_e4m3fn,
         128,
     )
     assert requirements["fc1_b"][1] == (2 * config.intermediate_size, 1)
-    assert requirements["fc2_a"][1] == (1, config.intermediate_size)
+    assert requirements["fc2_a"][:2] == (
+        (forward.pool_token_capacity, config.intermediate_size),
+        (config.intermediate_size, 1),
+    )
     assert requirements["fc2_b"][1] == (1, forward.pool_token_capacity)
     assert requirements["grad_activation"][2] is torch.bfloat16
 
@@ -1386,6 +1389,10 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
         torch.cuda.synchronize(device)
         assert operands.valid_route_counts.tolist() == [token_count]
         assert operands.expert_offsets.tolist() == [_round_up(token_count, 128)]
+        assert operands.fc1_a.shape == (operands.fc1_b.shape[0], hidden)
+        assert operands.fc2_a.shape == (operands.fc2_b.shape[0], intermediate)
+        assert operands.fc1_a.is_contiguous()
+        assert operands.fc2_a.is_contiguous()
         dense_wgrads = _dense_wgrads_from_operands(operands)
         assert dense_wgrads[0].shape == (1, hidden, 2 * intermediate)
         assert dense_wgrads[1].shape == (1, intermediate, hidden)

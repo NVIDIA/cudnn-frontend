@@ -818,8 +818,8 @@ class Mxfp8TrainingState:
                 128,
             ),
             "fc1_a": (
-                (config.hidden_size, pool_rows),
-                (pool_rows, 1),
+                (pool_rows, config.hidden_size),
+                (config.hidden_size, 1),
                 _DATA_DTYPE,
                 128,
             ),
@@ -866,8 +866,8 @@ class Mxfp8TrainingState:
                 128,
             ),
             "fc2_a": (
-                (config.intermediate_size, pool_rows),
-                (1, config.intermediate_size),
+                backward_shapes["fc1_recompute"],
+                (backward_shapes["fc1_recompute"][1], 1),
                 _DATA_DTYPE,
                 128,
             ),

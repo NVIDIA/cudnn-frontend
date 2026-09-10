@@ -164,10 +164,10 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             fake_arguments["fc1_c"] = None
 
         if self.enable_col_quant:
-            # col_quant_data is logically (token, hidden) with token unit stride;
+            # col_quant_data is contiguous (token, hidden);
             # col_quant_sf is flat concat_e [hidden_atom][token_atom] E8M0 bytes.
             fake_arguments["col_quant_data"] = fake_tensor(
-                self.ab_dtype, aux_shapes["col_quant_data"], (0, 1), set(), 16
+                self.ab_dtype, aux_shapes["col_quant_data"], (1, 0), set(), 16
             )
             fake_arguments["col_quant_sf"] = fake_tensor(
                 cutlass.Uint8, aux_shapes["col_quant_sf"], (0,), set(), 16
@@ -515,7 +515,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 num_persistent_ctas=self._col_quant_num_ctas,
                 token_padding_block=self.token_padding_block,
                 sf_padding_block=self.sf_padding_block,
-                dst_k_major=True,
+                dst_k_major=False,
             )
 
     def get_aux_output_shapes(self) -> dict:
@@ -746,7 +746,6 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 col_quant_data,
                 self.ab_dtype,
                 aux_shapes["col_quant_data"],
-                (1, aux_shapes["col_quant_data"][0]),
             )
             self._validate_fixed_vector(
                 col_quant_sf, cutlass.Uint8, aux_shapes["col_quant_sf"][0]
