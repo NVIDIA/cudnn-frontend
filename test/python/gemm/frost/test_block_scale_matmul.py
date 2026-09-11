@@ -1470,6 +1470,7 @@ def test_config_families():
             cga_size_k=1,
             warps_per_cta=8,
             split_k_slices=1,
+            swap_ab=False,
             **({"cta_group": 1} if "cta_group" in cls.__dataclass_fields__ else {}),
         )
 
@@ -1523,6 +1524,7 @@ def test_validate_block_scale_config_arch_fork():
             cga_size_k=1,
             warps_per_cta=8,
             split_k_slices=1,
+            swap_ab=False,
             cta_group=1,
             pipeline="sm103",
         )
@@ -1573,6 +1575,7 @@ def test_select_template_dispatches_on_config_arch():
         cga_size_k=1,
         warps_per_cta=8,
         split_k_slices=1,
+        swap_ab=False,
     )
     imposter = TileConfig(**base_kw)
     # It could not even be asked for sm103's fixed K width: that is a ClassVar
@@ -1967,6 +1970,7 @@ def test_a_pipeline_that_fixes_its_k_width_still_does():
             cga_size_k=1,
             warps_per_cta=8,
             split_k_slices=1,
+            swap_ab=False,
             cta_group=1,
         )
 

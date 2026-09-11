@@ -22,15 +22,17 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
 from benchmark_utils import (
+    with_workspace,
     add_fto_alignment_arg,
     add_sweep_args,
+    expand_config_variants,
     fto_alignment,
     group_offsets,
     rand_e8m0,
     report_pool,
     resolve_nbuf,
     rotating,
-    select_configs,
+    select_config_variants,
     set_bytes,
     spec_for,
     time_ms,
@@ -40,7 +42,7 @@ from benchmark_utils import (
 
 def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg)
+    return with_workspace(jit_from_cudnn_graph(g, config=cfg))
 
 
 def _vp_moe_bs_mg(handles, gemm_pairs, fto, outs, *aux):
@@ -254,6 +256,11 @@ def main() -> int:
     add_sweep_args(p, nsys=False)
     add_fto_alignment_arg(p)
     args = p.parse_args()
+    spec_map = expand_config_variants(
+        _SPEC_MAP,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
@@ -266,7 +273,12 @@ def main() -> int:
     E, S = G, G * M
     combo = args.combo
 
-    config_names = select_configs(args.configs, _SPEC_MAP)
+    config_names = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
     per_set = set_bytes(_mkdata(S, N, K, E, combo))
     nbuf = resolve_nbuf(args.rotate_buffers, per_set)
 
@@ -302,7 +314,7 @@ def main() -> int:
 
     best = None
     for label in config_names:
-        spec = spec_for(label, _SPEC_MAP)
+        spec = spec_for(label, spec_map)
         if spec is None:
             print(f"  {label:66s} UNKNOWN (not a sweepable MoE block-scale swiglu strategy)")
             continue

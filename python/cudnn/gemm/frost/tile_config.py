@@ -7,7 +7,7 @@ A ``TileConfig`` describes ONLY dtype-independent tile geometry (cta tile,
 MMA-inst tile, cluster shape, pipeline). It does NOT carry ``cta_group`` /
 ``ab_stages`` — those are execution strategy chosen by the
 kernel template. K is stored in *bytes*, so one config covers every dtype.
-Name: ``CONFIG_<pipeline>_<CTA_M>x<CTA_N>x<K_BYTES>_<MMA_M>x<MMA_N>x<MMA_K_BYTES>_cluster<cgrp_m>x<cgrp_n>``.
+Name: ``CONFIG_<pipeline>_<CTA_M>x<CTA_N>x<K_BYTES>_<MMA_M>x<MMA_N>x<MMA_K_BYTES>_cluster<cgrp_m>x<cgrp_n>[_swapAB]``.
 A warp-scoped family (sm120) additionally ALWAYS names its compute-warp grid
 via a ``_warpsMxN`` suffix — no grid is implied by an unsuffixed spelling.
 See ``kernel_registry`` for the template registry and the support funnel.
@@ -100,8 +100,9 @@ class TileConfig:
     """One pure-geometry tile config. Dtype- AND execution-independent.
 
     Four nested tiles, outermost first -- CGA (a cluster of CTAs), CTA, warp,
-    MMA instruction -- plus the K-split axis. Each level must divide the one
-    above it. K is stored in BYTES throughout, so one config serves every dtype.
+    MMA instruction -- plus the K-split and logical A/B-orientation axes. Each
+    tile level must divide the one above it. K is stored in BYTES throughout,
+    so one config serves every dtype.
 
     NOT here, because they are not choices: `ab_stages` (the device SMEM budget
     decides), the epilogue subtile N (the output dtype and drain width decide),
@@ -142,8 +143,13 @@ class TileConfig:
 
     split_k_slices: int
 
+    swap_ab: bool
+
     def __post_init__(self) -> None:
         name = self.name
+
+        if not isinstance(self.swap_ab, bool):
+            raise ValueError(f"TileConfig {name!r}: swap_ab must be bool; got {self.swap_ab!r}")
 
         for label, v in (
             ("cta_tile_m", self.cta_tile_m),
@@ -247,8 +253,8 @@ class TileConfig:
 
     @property
     def geometry_name(self) -> str:
-        """Geometry token (no ``CONFIG_``/pipeline prefix) used in the kernel symbol."""
-        return self._geometry_base + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "")
+        """Canonical geometry token used in the TileConfig name."""
+        return self._geometry_base + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "") + ("_swapAB" if self.swap_ab else "")
 
     @property
     def _geometry_base(self) -> str:
@@ -615,6 +621,7 @@ def _geom_sm100(
         cga_size_k=1,
         warps_per_cta=_TCGEN05_WARPS_PER_CTA,
         split_k_slices=1,
+        swap_ab=False,
         cta_group=cta_group,
     )
 
@@ -641,6 +648,7 @@ def _geom_sm103(cta_tile_m: int, cta_tile_n: int, cga_size_m: int, cga_size_n: i
         cga_size_k=1,
         warps_per_cta=_TCGEN05_WARPS_PER_CTA,
         split_k_slices=1,
+        swap_ab=False,
         cta_group=cta_group,
     )
 
@@ -677,6 +685,7 @@ def _geom_sm120(
         cga_size_k=1,
         warps_per_cta=ConfigSm120.DEFAULT_WARPS_PER_CTA,
         split_k_slices=1,
+        swap_ab=False,
     )
 
 
@@ -767,7 +776,7 @@ _CONFIG_NAME_RE = re.compile(
     r"(?P<cta_m>\d+)x(?P<cta_n>\d+)x(?P<k_bytes>\d+)_"
     r"(?P<mma_m>\d+)x(?P<mma_n>\d+)x(?P<mma_k_bytes>\d+)_"
     r"cluster(?P<cga_m>\d+)x(?P<cga_n>\d+)(?:_(?P<cta_group>\d+)ctamma)?"
-    r"(?:_warps(?P<warps_m>\d+)x(?P<warps_n>\d+))?(?:_splitK(?P<split_k>\d+))?$"
+    r"(?:_warps(?P<warps_m>\d+)x(?P<warps_n>\d+))?(?:_splitK(?P<split_k>\d+))?(?P<swap_ab>_swapAB)?$"
 )
 
 
@@ -809,6 +818,7 @@ def _synthesize_config(name: str) -> TileConfig:
         # Not spelled by the name; a family with its own block size declares it.
         warps_per_cta=getattr(cls, "DEFAULT_WARPS_PER_CTA", _TCGEN05_WARPS_PER_CTA),
         split_k_slices=int(m.group("split_k") or 1),
+        swap_ab=bool(m.group("swap_ab")),
         # Only where the family HAS the axis; a name for one that does not
         # carries no such token either.
         **({"cta_group": int(m.group("cta_group") or 1)} if "cta_group" in cls.__dataclass_fields__ else {}),
@@ -1086,6 +1096,7 @@ def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
         cga_size_k=cfg.cga_size_k,
         warps_per_cta=getattr(cls, "DEFAULT_WARPS_PER_CTA", cfg.warps_per_cta),
         split_k_slices=cfg.split_k_slices,
+        swap_ab=cfg.swap_ab,
         **({"cta_group": getattr(cfg, "cta_group", 1)} if "cta_group" in cls.__dataclass_fields__ else {}),
     )
 

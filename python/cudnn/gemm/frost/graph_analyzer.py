@@ -195,6 +195,21 @@ class GemmBinding:
         return [t for t in ts if t is not None]
 
 
+def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
+    """Trade A/B runtime roles while preserving the original tensor objects."""
+    if binding is None:
+        return None
+    return GemmBinding(
+        a_operands=list(binding.b_operands),
+        b_operands=list(binding.a_operands),
+        outputs=list(binding.outputs),
+        aux=list(binding.aux),
+        sfa_operands=list(binding.sfb_operands),
+        sfb_operands=list(binding.sfa_operands),
+        first_token_offset=binding.first_token_offset,
+    )
+
+
 def _make_multi_binding(
     meta: dict,
     a_ids,

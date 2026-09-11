@@ -941,3 +941,118 @@ class FusionChain:
             f"{m.a_dtype}*{m.b_dtype}->{m.accum_dtype} | {mainloop}"
             f"epilogue: {chain} -> {self.output_dtype}{reductions}{quant}]"
         )
+
+
+def swap_ab(chain: FusionChain) -> FusionChain:
+    """Return the logical-transpose view ``C.T = B.T @ A.T`` of ``chain``.
+
+    No runtime storage moves.  Every dense non-virtual tensor swaps its last
+    two logical dimensions and strides, A/B-side metadata trades places, and
+    pointwise operation topology stays unchanged.  The binding performs the
+    corresponding tensor-role swap separately.
+
+    Quantization axes and scale metadata follow the transpose; the ordinary
+    quantization support checks decide whether the resulting layout can run.
+    MoE still requires a scheduler that routes ranges along N instead of M.
+    """
+
+    if chain.has_moe:
+        raise NotImplementedError("swap_ab is not supported for MoE: routed groups partition M, not N")
+
+    def _mn(values):
+        if values is None or len(values) < 2:
+            return values
+        return (*values[:-2], values[-1], values[-2])
+
+    def _bcast(mode):
+        return {"per_row": "per_col", "per_col": "per_row"}.get(mode, mode)
+
+    def _op(op):
+        # gen_index is the only pointwise op whose value depends on an output
+        # axis. Scalar attributes on every other op are transpose-invariant.
+        attrs = tuple((key, 3 - value if key == "axis" and value in (1, 2) else value) for key, value in op.attrs)
+        return dataclasses.replace(op, attrs=attrs) if attrs != op.attrs else op
+
+    mm = chain.matmul
+    swapped_mm = dataclasses.replace(
+        mm,
+        M=mm.N,
+        N=mm.M,
+        a_batch=mm.b_batch,
+        b_batch=mm.a_batch,
+        a_major="k" if mm.b_major == "k" else "m",
+        b_major="k" if mm.a_major == "k" else "n",
+        a_dtype=mm.b_dtype,
+        b_dtype=mm.a_dtype,
+    )
+    swapped_aux = []
+    for t in chain.aux_tensors:
+        dim, stride = t.dim, t.stride
+        if len(dim) == 1:
+            # Rank-1 aux broadcasts as (1, N). Make that axis explicit before
+            # transposing; runtime _reshape_aux_to_fake supplies the same view.
+            dim, stride = (1, dim[0]), (stride[0], stride[0])
+        swapped_aux.append(dataclasses.replace(t, dim=_mn(dim), stride=_mn(stride), bcast_mode=_bcast(t.bcast_mode)))
+    # An unset output stride means compact N-major. Materialize it before the
+    # transpose; leaving it unset would incorrectly remain N-major instead of
+    # becoming the equivalent M-major view.
+    swapped_outputs = [
+        dataclasses.replace(
+            o,
+            dim=_mn(o.dim or (mm.batch, mm.M, mm.N)),
+            stride=_mn(o.stride or (mm.M * mm.N, mm.N, 1)),
+        )
+        for o in chain.output_specs
+    ]
+    swapped_reductions = [dataclasses.replace(r, dim=_mn(r.dim)) for r in chain.reductions]
+    swapped_quants = [
+        dataclasses.replace(
+            q,
+            axis=2 if q.axis == 1 else 1,
+            # transpose=True is an API spelling of axis=1, already resolved
+            # by the analyzer. Use the explicit axis in the transformed IR.
+            transpose=False,
+            # F8_128x4 describes physical atoms, with the blocked axis last
+            # for both row and column quantization. Their storage is unchanged.
+            scale_dim=q.scale_dim if q.scale_reorder == "F8_128x4" else _mn(q.scale_dim),
+        )
+        for q in chain.quants
+    ]
+
+    block_scale = chain.block_scale
+    if block_scale is not None:
+        block_scale = dataclasses.replace(
+            block_scale,
+            a_dtype=block_scale.b_dtype,
+            b_dtype=block_scale.a_dtype,
+            block_size_a=_mn(block_scale.block_size_b),
+            block_size_b=_mn(block_scale.block_size_a),
+            sf_dtype_a=block_scale.sf_dtype_b,
+            sf_dtype_b=block_scale.sf_dtype_a,
+            sfa_reorder=block_scale.sfb_reorder,
+            sfb_reorder=block_scale.sfa_reorder,
+            dequant_compute_a=block_scale.dequant_compute_b,
+            dequant_compute_b=block_scale.dequant_compute_a,
+            dequant_out_a=block_scale.dequant_out_b,
+            dequant_out_b=block_scale.dequant_out_a,
+            fake_dequant_a=block_scale.fake_dequant_b,
+            fake_dequant_b=block_scale.fake_dequant_a,
+        )
+
+    return dataclasses.replace(
+        chain,
+        matmul=swapped_mm,
+        aux_tensors=swapped_aux,
+        ops=[_op(op) for op in chain.ops],
+        output_specs=swapped_outputs,
+        reductions=swapped_reductions,
+        quants=swapped_quants,
+        num_a_operands=chain.num_b_operands,
+        num_b_operands=chain.num_a_operands,
+        gemm_operands=[(b, a) for a, b in chain.gemm_operands],
+        mainloop_a_ops=list(chain.mainloop_b_ops),
+        mainloop_b_ops=list(chain.mainloop_a_ops),
+        mainloop_a_load_dtype=chain.mainloop_b_load_dtype,
+        mainloop_b_load_dtype=chain.mainloop_a_load_dtype,
+        block_scale=block_scale,
+    )

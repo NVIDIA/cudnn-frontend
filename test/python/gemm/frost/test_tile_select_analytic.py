@@ -16,12 +16,46 @@ Selection is pure geometry, so every invariant is checkable on CPU:
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
-from cudnn.gemm.frost.tile_config import by_name, select_config
+from cudnn.gemm.frost.tile_config import as_pipeline, by_name, select_config
 
 MS = (1, 4, 16, 32, 64, 96, 128, 129, 256, 512, 1024, 4096)
 NS = (32, 64, 128, 256, 512, 1024, 4096, 8192, 10240)
 KS = (256, 1024, 2048, 4096, 8192)
+
+
+def test_swap_ab_is_a_named_tile_config_option():
+    base = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
+    swapped = replace(base, swap_ab=True)
+    assert swapped.name == f"{base.name}_swapAB"
+    assert swapped.geometry_name.endswith("_swapAB")
+    assert by_name(swapped.name) == swapped
+    assert as_pipeline(swapped, "sm120").swap_ab is True
+
+
+def test_swap_ab_transforms_the_fusion_ir_without_moving_storage():
+    from cudnn.gemm.frost.fusion_ir import FusionChain, FusionOp, MatmulSpec, OutputSpec, TensorRef, swap_ab
+
+    chain = FusionChain(
+        matmul=MatmulSpec(M=64, N=192, K=128, batch=3, a_batch=1, b_batch=3, a_major="m", b_major="n", a_dtype="fp16", b_dtype="bf16"),
+        aux_tensors=[TensorRef("bias", (1, 1, 192), (192, 192, 1), "fp32", "per_col")],
+        ops=[FusionOp("gen_index", parent_idx=-1, attrs=(("axis", 2.0),))],
+        output_specs=[OutputSpec(source_ref=0, dtype="bf16")],
+        mainloop_a_ops=[FusionOp("relu", parent_idx=-1)],
+    )
+
+    swapped = swap_ab(chain)
+    assert (swapped.matmul.M, swapped.matmul.N, swapped.matmul.a_batch, swapped.matmul.b_batch) == (192, 64, 3, 1)
+    assert (swapped.matmul.a_major, swapped.matmul.b_major) == ("m", "n")
+    assert (swapped.matmul.a_dtype, swapped.matmul.b_dtype) == ("bf16", "fp16")
+    assert swapped.aux_tensors[0].bcast_mode == "per_row"
+    assert swapped.ops[0].attrs == (("axis", 1.0),)
+    assert swapped.output_specs[0].dim == (3, 192, 64)
+    assert swapped.output_specs[0].stride == (64 * 192, 1, 192)
+    assert swapped.out_major == "m"
+    assert not swapped.mainloop_a_ops and swapped.mainloop_b_ops == chain.mainloop_a_ops
 
 
 @pytest.mark.parametrize("block_scale", [False, True])
