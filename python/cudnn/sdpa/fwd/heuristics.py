@@ -118,7 +118,22 @@ _SPLIT_KV_CTA_COST = 21.0
 # one fixed kernel, so blocks/SM is a constant, and folding it in keeps a
 # cuOccupancy query -- which would need a compiled CUfunction -- off the
 # planning path. Empirical: re-measure if sm100/split_combine changes.
-_SPLIT_KV_COMBINE_COST = 0.2
+#
+# Re-measured for the fp32 partials the SM100 split kernels now write (was 0.2,
+# fitted when partials were half). Widening them turned out to cost the combine
+# almost nothing -- 1.05x on a 148-row x 512-split sweep, because the pass is
+# not purely bandwidth-bound -- so the move is NOT a consequence of the extra
+# bytes. It corrects a coefficient that was too large for the shapes this model
+# is asked about: the split kernel also stopped staging O through SMEM and TMA,
+# which made splitting cheaper on the main-kernel side.
+#
+# Two independent fits agree. Timing the combine directly against one KV tile of
+# main-kernel work, with the partials large enough to live in HBM rather than
+# L2, gives 0.037 (f16) / 0.039 (f32). Minimising regret over the end-to-end
+# sweep in test_split_kv_heuristic._B300_FIT gives an optimum PLATEAU of
+# [0.04, 0.155] -- every value in it makes the same 12 choices. 0.1 is that
+# plateau's midpoint, so it is the value furthest from flipping either way.
+_SPLIT_KV_COMBINE_COST = 0.1
 
 
 class _SplitKvLaunch(NamedTuple):
@@ -655,13 +670,8 @@ def _split_points(
         # This S_kv would be served through the synthesized KV-tail padding,
         # which the split cannot ride (mismatch declines the same combination).
         return [no_split]
-    if (facts.is_fp8 or facts.is_mxfp8) and facts.dtype_o not in (
-        cudnn.data_type.HALF,
-        cudnn.data_type.BFLOAT16,
-    ):
-        # The combine reduces partials in half precision; reducing QUANTIZED
-        # partials would lose what the split is meant to be neutral about.
-        return [no_split]
+    # A quantized O is a legal split target: the partials stay WIDER than the
+    # O dtype whatever it is, and the combine performs the only cast down to it.
     sm_count = facts.device_sm_count or 0
     if sm_count <= 0:
         return [no_split]

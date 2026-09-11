@@ -106,6 +106,11 @@ class TemplateParams:
     # chunks, each run as its own persistent tile writing a partial (O, LSE)
     # that kernels/sm100/split_combine.py reduces.  1 = off (byte-identical
     # codegen to the single-pass kernel).
+    #
+    # A split writes its partials as fp32, straight from the epilogue's
+    # accumulator registers and bypassing the SMEM O tile and its TMA store, so
+    # the combine reduces an unrounded input and performs the only rounding to
+    # O's dtype.  Partial-only: the caller-visible O is unchanged.
     split_kv: int = 1
     # MMA cluster width: 2 = cga2 collective tcgen05.mma.cta_group::2 (a CTA
     # pair share one MMA, each holding half of every K/V tile); 1 = cga1, one

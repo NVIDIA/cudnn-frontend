@@ -478,3 +478,88 @@ def test_fp8_envelope_mismatch_rules():
     # ...and straddling the floor declines on BOTH rows, identically.
     assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=256))
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=256))
+
+
+# --- KV split on Rubin -------------------------------------------------------
+
+
+def test_sm107_split_is_wired_only_for_per_tensor_fp8_d128():
+    """config_sm107 permits the split for the ONE Rubin kernel that wires
+    make_split_helpers, and refuses it for every other flavor.
+
+    A blanket refusal contradicted the engine row, which advertises
+    ``split_d_shapes={(128, 128)}`` on the Rubin FP8 row: a long-KV Rubin graph
+    could be handed an automatically proposed split plan and then fail at
+    compile. The gate follows the ROW, not merely whether a body wires
+    SplitHelpers -- d192xd128 FP8 does, but is neither advertised nor carries an
+    o_partial_f32 slot, so it must still decline."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg
+
+    def tp(**kw):
+        return cfg.TemplateParams(split_kv=4, **kw)
+
+    # The wired cell builds.
+    cfg.make_cfg_d128(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
+
+    # Every other Rubin cell still refuses -- same entry point for the half
+    # d128 and d192 kernels, so the gate cannot key on the flavor string alone.
+    unwired = [
+        ("d128 half", cfg.make_cfg_d128, dict(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT)),
+        ("d128 mxfp8", cfg.make_cfg_d128_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+        ("d192", cfg.make_cfg_d192, dict(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT)),
+        ("d256", cfg.make_cfg_d256, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+        ("d512", cfg.make_cfg_d512, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+    ]
+    for name, make, params in unwired:
+        with pytest.raises(ValueError, match="split_kv > 1 is not wired"):
+            make(tp(**params))
+        assert make(cfg.TemplateParams(**params)) is not None, f"{name}: unsplit must still build"
+
+
+def test_sm107_split_matches_unsplit_on_rubin():
+    """End-to-end split numerics on cc10.7 silicon.
+
+    The one executing test in this otherwise device-independent module: the
+    SM107 kernel's split path -- and the fp32 partial store it now takes
+    unconditionally -- has no other hardware coverage, since the split-KV suite
+    is marked pre-Rubin."""
+    import math
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("cc10.7 (Rubin) part required")
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h_q, s_q, s_kv, d, dev = 1, 8, 512, 8192, 128, "cuda"
+    torch.manual_seed(0)
+
+    def run(split):
+        def mk(*sh):
+            return (torch.randn(*sh, device=dev) * 0.5).to(torch.float8_e4m3fn)
+
+        torch.manual_seed(0)
+        q, k, v = mk(b, h_q, s_q, d), mk(b, 1, s_kv, d), mk(b, 1, s_kv, d)
+        o = torch.zeros(b, h_q, s_q, d, device=dev, dtype=torch.float16)
+        one = torch.ones(1, dtype=torch.float32, device=dev)
+        api = SdpaFwdDslSm100(
+            sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=torch.float16, split_kv=split, pertensor_fp8=True, scale_softmax=1.0 / math.sqrt(d)
+        )
+        assert api.check_support()
+        api.compile()
+        wsb = api.scratch_workspace_bytes()
+        ws = torch.empty(wsb, dtype=torch.uint8, device=dev) if wsb else None
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, workspace=ws, descale_q=one, descale_k=one, descale_v=one, scale_o=one)
+        torch.cuda.synchronize()
+        return api, o.float().clone(), (q, k, v)
+
+    _, base, _ = run(1)
+    for split in (2, 4, 8):
+        api, got, (q, k, v) = run(split)
+        assert api._fp32_partial_split(), "the Rubin split must take the fp32-partial path"
+        assert not torch.isnan(got).any(), f"split={split}: NaN"
+        qf = q.double()
+        kf, vf = (t.double().repeat_interleave(h_q, dim=1) for t in (k, v))
+        ref = torch.softmax(qf @ kf.transpose(-1, -2) / math.sqrt(d), dim=-1) @ vf
+        assert (got.double() - ref).abs().max().item() <= 5e-2, f"split={split}: off the oracle"
+        assert (got - base).abs().max().item() <= 5e-2, f"split={split}: diverges from unsplit"

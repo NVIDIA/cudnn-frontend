@@ -246,6 +246,60 @@ def assert_tile_n_supported(CFG):
         raise NotImplementedError(f"this kernel currently requires TILE_N=128 (got TILE_N={CFG.TILE_N})")
 
 
+@cute.jit
+def store_fp32_partial_tile(
+    o_partial_f32,
+    tmem_base,
+    tmem_o_off,
+    inv_sum,
+    row_dead,
+    row_valid,
+    o_batch,
+    q_row_global,
+    row_head_idx,
+    tile_o: cutlass.Constexpr[int],
+    chunk: cutlass.Constexpr[int],
+) -> None:
+    """Store one Q row's O tile as fp32, straight from TMEM to the workspace.
+
+    The staged path casts the accumulator into the SMEM O tile and TMA-stores
+    that, which ties the partial's width to the tile's.  Here the accumulator
+    goes to global directly, so the partial can be fp32 while the tile -- and
+    therefore the SMEM budget -- is untouched.  Shared by every flavor whose
+    epilogue holds its O accumulator in TMEM.
+
+    ``chunk`` must be the flavor's OWN TMEM read width (its ``O_CHUNK``): the
+    O region is not uniformly addressable across flavors, so reading it in a
+    different stride than the staged epilogue does silently returns the wrong
+    columns rather than failing.
+
+    ``row_dead`` cannot be dropped in favour of the zeroed ``inv_sum`` every
+    caller already computes: an empty mainloop never wrote O TMEM, so the load
+    can return NaN, and ``NaN * 0.0`` is NaN, not zero.  The staged paths avoid
+    this by not loading at all for such rows; here the select does it.
+    """
+    op = cutlass.make_array_view(o_partial_f32)
+    # The slab carries the graph's ACTUAL d_v, which an ENVELOPE flavor routinely
+    # exceeds -- d_v=64 runs on the d128 tile, so tile_o overshoots each row by 64
+    # columns.  The staged TMA path clipped that to the tensor extent; a direct
+    # store has to bound itself or it writes into the next head's row, and off the
+    # end of the slab on the last one.  Read off the tensor rather than passed in,
+    # so it cannot drift from the buffer actually bound.
+    d_v = cutlass.const_expr(o_partial_f32.shape[3])
+    for blk in cutlass.range_constexpr(tile_o // chunk):
+        addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
+        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        scaled = vals * inv_sum
+        if row_valid:
+            row_out = op[o_batch, q_row_global, row_head_idx, :]
+            for j in cutlass.range_constexpr(chunk):
+                if cutlass.const_expr(blk * chunk + j < d_v):
+                    row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
+                        arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
+                    )
+
+
 class SplitHelpers(NamedTuple):
     """Split-aware decode / bounds closures, plus the two flags kernels fold on."""
 
