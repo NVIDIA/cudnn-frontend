@@ -6,10 +6,10 @@ For public APIs and examples, see [Flex Attention](flex_attention.md).
 
 Implementation entry points in this repository:
 
-- [Plan construction](../../../python/cudnn/flex_attention/plan/builder.py)
-- [Plan ownership and signatures](../../../python/cudnn/flex_attention/plan/mask_plan.py)
-- [Planner kernels](../../../python/cudnn/flex_attention/plan/kernels/)
-- [Attention kernels](../../../python/cudnn/flex_attention/kernels/)
+- [Plan construction](https://github.com/NVIDIA/cudnn-frontend/blob/main/python/cudnn/flex_attention/plan/builder.py)
+- [Plan ownership and signatures](https://github.com/NVIDIA/cudnn-frontend/blob/main/python/cudnn/flex_attention/plan/mask_plan.py)
+- [Planner kernels](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/flex_attention/plan/kernels/)
+- [Attention kernels](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/flex_attention/kernels/)
 
 ## 1. Purpose and Scope
 

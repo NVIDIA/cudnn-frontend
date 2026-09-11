@@ -1,0 +1,18 @@
+---
+title: "Debugging"
+---
+For initial debugging, we recommend turning on the cuDNN frontend logging and checking for warnings and errors. The cuDNN frontend API logging records the execution flow through the cuDNN frontend API. This functionality is disabled by default, and can be enabled through methods described in this section.
+
+## Debugging by Using Environment Variables
+
+| Environment Variables | `CUDNN_FRONTEND_LOG_INFO=0` | `CUDNN_FRONTEND_LOG_INFO=1` |
+| --- | --- | --- |
+| `CUDNN_FRONTEND_LOG_FILE` not set | No Logging | No Logging |
+| `CUDNN_FRONTEND_LOG_FILE` set to `stdout` or `stderr` | No Logging | Logging to `cout` or `cerr` |
+| `CUDNN_FRONTEND_LOG_FILE` set to `filename.txt` | No Logging | Logging to the filename |
+
+## Debugging by Using API Calls
+
+Calling `cudnn_frontend::isLoggingEnabled() = true|false` has the same effect of setting the environment variable. Calling `cudnn_frontend::getStream() = stream_name` can be used to assign the output stream directly.
+
+For further debugging, refer to the [Error Reporting and API Logging](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/reference/troubleshooting.html#api-logging) to turn on the cuDNN backend logs.

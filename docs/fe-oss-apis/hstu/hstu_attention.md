@@ -39,7 +39,7 @@ forward and backward kernels and public API use the Apache License 2.0. Some
 low-level attention utility files build on FlashAttention and NVIDIA
 CUTLASS/CuTe DSL work and are distributed under the MIT License while retaining
 their original author copyright notices; see the repository's [licensing
-guide](../../../LICENSING.md) and [third-party notices](../../../THIRD_PARTY_LICENSES.txt).
+guide](https://github.com/NVIDIA/cudnn-frontend/blob/main/LICENSING.md) and [third-party notices](https://github.com/NVIDIA/cudnn-frontend/blob/main/THIRD_PARTY_LICENSES.txt).
 
 ## Installation
 
