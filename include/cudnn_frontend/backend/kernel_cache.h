@@ -79,21 +79,64 @@ class KernelCache : public detail::backend_descriptor {
             error_code_t::CUDNN_BACKEND_API_FAILED,
             "KernelCache::to_json: descriptor not initialized; call build() or from_json() first.");
 
-        int64_t serializationSize;
-        std::vector<char> serialization_buf;
-        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
-            get_ptr(), CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION, CUDNN_TYPE_CHAR, 0, &serializationSize, nullptr));
-        serialization_buf.resize(static_cast<size_t>(serializationSize));
+        // cuDNN serves the blob with a size query and then a fill.
+        // mutex_ cannot make the two calls atomic.
+        // ExecutionPlanBuilder_v8::build() hands the raw descriptor to cuDNN.
+        // cuDNN then inserts kernels under its own lock and never takes mutex_.
+        // So the cache can change between the two calls.
+        // The fill can then need a larger buffer, or write fewer bytes than the query reported.
+        // Retry a bounded number of times, and take the length from the written count.
+        // Each attempt asks for the size again.
+        // cuDNN before 9.27 leaves the count untouched on the SIZE_INSUFFICIENT path.
+        // Reading the count back there would repeat the same size.
+        constexpr int max_attempts = 3;
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
+            int64_t requested_size = 0;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
+                get_ptr(), CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION, CUDNN_TYPE_CHAR, 0, &requested_size, nullptr));
 
-        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(get_ptr(),
-                                                       CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION,
-                                                       CUDNN_TYPE_CHAR,
-                                                       serializationSize,
-                                                       &serializationSize,
-                                                       serialization_buf.data()));
-        std::string json_string(serialization_buf.begin(), serialization_buf.end());
-        str_json = std::move(json_string);
-        return {};
+            // An empty buffer gives a null data() pointer.
+            // cuDNN reads that as the query form of the call, not the fill form.
+            // Nothing is there to copy, so answer with an empty string.
+            if (requested_size <= 0) {
+                return {};
+            }
+
+            std::vector<char> serialization_buf(static_cast<size_t>(requested_size));
+            int64_t written          = 0;
+            auto const attempt_state = detail::get_attribute(get_ptr(),
+                                                             CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION,
+                                                             CUDNN_TYPE_CHAR,
+                                                             requested_size,
+                                                             &written,
+                                                             serialization_buf.data());
+
+            if (attempt_state == CUDNN_STATUS_SUCCESS) {
+                RETURN_CUDNN_FRONTEND_ERROR_IF(
+                    written < 0 || written > requested_size,
+                    error_code_t::CUDNN_BACKEND_API_FAILED,
+                    "KernelCache::to_json: cuDNN reported a written count outside the buffer.");
+                str_json.assign(serialization_buf.begin(), serialization_buf.begin() + written);
+                return {};
+            }
+
+            // Any status other than a short buffer is a real failure, so do not retry it.
+            if (attempt_state != CUDNN_STATUS_BAD_PARAM_SIZE_INSUFFICIENT) {
+                std::stringstream error_msg;
+                error_msg << "KernelCache::to_json: reading CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION failed with "
+                          << "message: " << detail::get_last_error_string_()
+                          << ", and code: " << detail::get_error_string(attempt_state);
+                CUDNN_FE_LOG_LABEL_ENDL("ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__);
+                return {error_code_t::CUDNN_BACKEND_API_FAILED, error_msg.str()};
+            }
+        }
+
+        {
+            std::string const error_msg =
+                "KernelCache::to_json: cuDNN reported an insufficient buffer on every attempt.";
+            CUDNN_FE_LOG_LABEL_ENDL("ERROR: " << error_msg << " at " << __FILE__ << ":" << __LINE__);
+            return {error_code_t::CUDNN_BACKEND_API_FAILED, error_msg};
+        }
 #else
         (void)str_json;
         return {error_code_t::CUDNN_BACKEND_API_FAILED,

@@ -64,17 +64,29 @@ class DeviceProperties : public detail::backend_descriptor {
                                        error_code_t::CUDNN_BACKEND_API_FAILED,
                                        "CUDNN_ATTR_DEVICEPROP_JSON_REPRESENTATION is only available starting 9.8.");
 
-        int64_t serializationSize;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(get_ptr() == nullptr,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       "DeviceProperties::serialize: descriptor not initialized; call build() first.");
+
+        int64_t serializationSize = 0;
         _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
             get_ptr(), CUDNN_ATTR_DEVICEPROP_JSON_REPRESENTATION, CUDNN_TYPE_CHAR, 0, &serializationSize, nullptr));
         serialization_buf.resize(static_cast<size_t>(serializationSize));
 
+        // The written count is what the buffer holds. A device property descriptor does not
+        // change after finalization, so the two calls agree and no retry is needed here.
+        int64_t written = 0;
         _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(get_ptr(),
                                                        CUDNN_ATTR_DEVICEPROP_JSON_REPRESENTATION,
                                                        CUDNN_TYPE_CHAR,
                                                        serializationSize,
-                                                       &serializationSize,
+                                                       &written,
                                                        serialization_buf.data()));
+        RETURN_CUDNN_FRONTEND_ERROR_IF(written < 0 || written > serializationSize,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       "DeviceProperties::serialize: cuDNN reported a written count outside the "
+                                       "buffer.");
+        serialization_buf.resize(static_cast<size_t>(written));
         return {};
 #else
         (void)serialization_buf;

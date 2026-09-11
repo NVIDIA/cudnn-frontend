@@ -105,7 +105,10 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     std::string
     getJsonRepresentation() const {
         auto status = CUDNN_STATUS_SUCCESS;
-        int64_t serializationSize;
+        // Initialized, and every error path returns: set_error_and_throw_exception only throws
+        // when NV_CUDNN_DISABLE_EXCEPTION is undefined, so a build that defines it would
+        // otherwise fall through and size the buffer from an indeterminate value.
+        int64_t serializationSize = 0;
         std::vector<char> serialization_buf;
         status = detail::get_attribute(pointer->get_backend_descriptor(),
                                        CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
@@ -118,21 +121,34 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                           status,
                                           "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
                                           "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
+            return std::string();
         }
         serialization_buf.resize(static_cast<size_t>(serializationSize));
-        status = detail::get_attribute(pointer->get_backend_descriptor(),
+        // The written count is what the buffer holds. An execution plan does not change after
+        // finalization, so the two calls agree and no retry is needed here.
+        int64_t written = 0;
+        status          = detail::get_attribute(pointer->get_backend_descriptor(),
                                        CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
                                        CUDNN_TYPE_CHAR,
                                        serializationSize,
-                                       &serializationSize,
+                                       &written,
                                        serialization_buf.data());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(this,
                                           status,
                                           "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
                                           "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
+            return std::string();
         }
-        std::string json_string(serialization_buf.begin(), serialization_buf.end());
+        if (written < 0 || written > serializationSize) {
+            set_error_and_throw_exception(this,
+                                          CUDNN_STATUS_INTERNAL_ERROR,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION returned a written count "
+                                          "outside the buffer");
+            return std::string();
+        }
+        std::string json_string(serialization_buf.begin(), serialization_buf.begin() + written);
         return json_string;
     }
 
