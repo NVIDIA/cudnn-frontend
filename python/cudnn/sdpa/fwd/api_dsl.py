@@ -611,18 +611,78 @@ class SdpaFwdDsl(APIBase):
         """Initialize state private to specific implementations."""
 
     @staticmethod
-    def _to_bshd(tensor: torch.Tensor) -> torch.Tensor:
-        """Return the compact kernel-facing BSHD tensor for logical BHSD."""
+    def _to_bshd(tensor: torch.Tensor, declared: Optional[tuple] = None) -> torch.Tensor:
+        """Return the kernel-facing BSHD tensor for logical BHSD.
 
-        view = tensor.transpose(1, 2)
-        return view if view.is_contiguous() else view.contiguous()
+        Zero-copy in two cases now, not one. The tensor is already compact
+        (the common path), OR ``declared`` names the BSHD strides this
+        artifact was COMPILED for and the view matches them -- in which case
+        the strides ride in the TMA descriptor and no repack is needed. Any
+        other layout still takes the historical normalisation copy, so no
+        existing caller changes behaviour.
 
-    @staticmethod
-    def _to_bshd_writable(tensor: torch.Tensor):
-        """Return a compact writable BSHD tensor and optional copy-back state."""
+        The second case is what lets a caller hand us Q/K/V sliced out of a
+        FUSED projection (token stride N, not h*d) with no gather. See
+        `_bshd_zero_copy_stride`.
+        """
 
         view = tensor.transpose(1, 2)
         if view.is_contiguous():
+            return view
+        if declared is not None and tuple(view.stride()) == tuple(declared):
+            return view
+        return view.contiguous()
+
+    @staticmethod
+    def _bshd_strides_of(desc) -> tuple:
+        """BSHD (b, s, h, d) strides of a logical BHSD descriptor."""
+        st = desc.stride
+        return (int(st[0]), int(st[2]), int(st[1]), int(st[3]))
+
+    @classmethod
+    def _bshd_zero_copy_stride(cls, desc, elem_bytes: int) -> Optional[tuple]:
+        """The BSHD stride tuple to COMPILE this operand at, or None for compact.
+
+        Returns None when the operand is already BSHD-compact (nothing to
+        declare) or when its layout is one TMA cannot express, in which case
+        the caller keeps the normalisation copy. The two rules are the
+        kernel's own, restated here so the decision is made BEFORE a compile
+        rather than as a raise inside one (`_fake_bshd` in every f16 prefill
+        kernel): the head dim must be innermost-contiguous, and the seq and
+        head strides must be 16-byte multiples because they are handed to TMA
+        as global strides.
+
+        Also requires the declaration to COVER the tensor (head >= d,
+        seq >= h*head, batch >= s*seq): an overlapping declaration would alias
+        distinct rows onto one address, which is a write race on O and outside
+        the kernels' addressing contract. Same reasoning as the THD arm's
+        `_thd_check_strides_native`.
+        """
+        b, h, sq, d = (int(x) for x in desc.shape)
+        bs, ss, hs, es = cls._bshd_strides_of(desc)
+        if (bs, ss, hs, es) == (sq * h * d, h * d, d, 1):
+            return None  # compact: nothing to declare
+        if es != 1:
+            return None
+        per16 = 16 // elem_bytes
+        if ss % per16 or hs % per16:
+            return None
+        if hs < d or ss < h * hs or bs < sq * ss:
+            return None
+        return (bs, ss, hs, es)
+
+    @staticmethod
+    def _to_bshd_writable(tensor: torch.Tensor, declared: Optional[tuple] = None):
+        """Return a writable BSHD tensor and optional copy-back state.
+
+        Same two zero-copy cases as `_to_bshd`. The strided case matters more
+        here: O is WRITTEN, so the historical path costs a scratch buffer AND a
+        scatter copy back, not just a gather."""
+
+        view = tensor.transpose(1, 2)
+        if view.is_contiguous():
+            return view, False, None
+        if declared is not None and tuple(view.stride()) == tuple(declared):
             return view, False, None
         scratch = torch.empty_like(view, memory_format=torch.contiguous_format)
         return view, True, scratch
@@ -1828,6 +1888,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # compiles the LSE store out — no dummy buffer at any level.
             # Split-KV REQUIRES the in-kernel LSE regardless of a Stats
             # output: the per-split LSE is the combine weight.
+            # ZERO-COPY STRIDED Q/K/V/O (dense f16/bf16). When an operand is not
+            # BSHD-compact but IS TMA-expressible, compile the artifact AT the
+            # caller's declared strides instead of repacking into a compact
+            # buffer on every execute -- which is what lets Q/K/V come straight
+            # out of a fused QKV projection (token stride N, not h*d). None per
+            # operand means compact, i.e. byte-identical to before.
+            # Paged KV: the K/V descriptors are page POOLS, not BSHD -- their
+            # strides come from _paged_compile_kwargs() below, so the dense
+            # declared entries stay None for them.
+            _bpe = 1 if self._fp8 else 2
+            self._bshd_declared = (
+                self._bshd_zero_copy_stride(self.q_desc, _bpe),
+                None if self.paged else self._bshd_zero_copy_stride(self.k_desc, _bpe),
+                None if self.paged else self._bshd_zero_copy_stride(self.v_desc, _bpe),
+                self._bshd_zero_copy_stride(self.o_desc, _bpe),
+            )
             self._compiled_kernel = self._k_mod.compile(
                 b=self.batch_size,
                 qh=self.h_q,
@@ -1838,11 +1914,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 d_v=self.head_dim_v,
                 has_lse=(self.lse_desc is not None) or self.split_kv > 1,
                 lse_stride=None if self.split_kv > 1 else self._lse_stride,
+                q_stride=self._bshd_declared[0],
+                o_stride=self._bshd_declared[3],
                 # Paged KV: the pools are bound as declared — their strides in
                 # the kernel's [num_pages, page_size, H_kv, D] order (the
                 # container's head/row axes swapped); num_pages / max_pages are
-                # dynamic extents of the artifact.
-                **(self._paged_compile_kwargs() if self.paged else {}),
+                # dynamic extents of the artifact.  They REPLACE the dense
+                # zero-copy K/V strides (which are None under paged anyway).
+                **(self._paged_compile_kwargs() if self.paged else dict(k_stride=self._bshd_declared[1], v_stride=self._bshd_declared[2])),
             )
         self._combine_kernel = None
         if self.split_kv > 1:
@@ -2116,7 +2195,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             return
 
-        Q = self._to_bshd(q_tensor)
+        # `_bshd_declared` is set only by the dense f16/bf16 compile; every
+        # other path leaves it absent, which makes these calls behave exactly
+        # as they always did (compact -> view, anything else -> copy).
+        _decl = getattr(self, "_bshd_declared", (None, None, None, None))
+        Q = self._to_bshd(q_tensor, _decl[0])
         if self.paged:
             # Page pools [num_pages, H_kv, page_size, D] -> the kernel's
             # [num_pages, page_size, H_kv, D] view; the strides carry HND/NHD
@@ -2124,9 +2207,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             K = k_tensor.permute(0, 2, 1, 3)
             V = v_tensor.permute(0, 2, 1, 3)
         else:
-            K = self._to_bshd(k_tensor)
-            V = self._to_bshd(v_tensor)
-        O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
+            K = self._to_bshd(k_tensor, _decl[1])
+            V = self._to_bshd(v_tensor, _decl[2])
+        O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor, _decl[3])
         # Trailing THD-only ABI slots (None) + the paged block tables; omitted
         # entirely on dense builds, whose compiled signature ends at seq_q_lens.
         paged_kwargs = {"block_table_tensor": block_table, "block_table_v_tensor": block_table_v} if self.paged else {}
