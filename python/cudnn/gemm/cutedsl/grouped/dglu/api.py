@@ -20,7 +20,6 @@ Discrete mode
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from functools import partial
 import math
 
 from ..backend_utils import (
@@ -833,10 +832,10 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
         api.compile()
         _cache_of_GroupedGemmDgluSm100Objects[cache_key] = api
 
-    replay = partial(dglu_block_scaled_replay, api, valid_m, n_out, l, d_dtype, sf_dtype, generate_dbias)
+    memo = (api, valid_m, n_out, l, d_dtype, sf_dtype, generate_dbias)
     if memo_key is not None:
-        _dglu_wrapper_memo[memo_key] = replay
-    return replay(call, outputs)
+        _dglu_wrapper_memo[memo_key] = memo
+    return dglu_block_scaled_run(*memo, call, outputs)
 
 
 def dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, device) -> TupleDict:
@@ -860,8 +859,8 @@ def dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size,
     )
 
 
-def dglu_block_scaled_replay(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_dbias, call: DgluCall, outputs: Optional[TupleDict] = None) -> TupleDict:
-    """Execute a derived block-scaled call; the memo binds everything but ``call``."""
+def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_dbias, call: DgluCall, outputs: Optional[TupleDict] = None) -> TupleDict:
+    """Allocate fresh outputs and execute with the current call operands."""
     if outputs is None:
         outputs = dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, call.sf_vec_size, generate_dbias, call.dprob_tensor, call.a_tensor.device)
     api.execute(
@@ -1090,39 +1089,9 @@ def _dglu_allocate_outputs(framework, valid_m, two_n, d_dtype, generate_dbias, n
     return d_row_tensor, dbias_tensor
 
 
-# Operand-metadata key -> replay callable bound to the derived result. One entry per
-# distinct (operand metadata, config), the same growth as _cache_of_GroupedGemmDgluSm100Objects.
+# Operand-metadata key -> compiled API and output allocation parameters. One entry per
+# distinct (operand metadata, config).
 _dglu_wrapper_memo: dict = {}
-
-
-def dglu_bf16_replay(api, framework, valid_m, two_n, d_dtype, generate_dbias, num_experts, call: DgluCall, d_row_tensor=None, dbias_tensor=None) -> TupleDict:
-    """Execute a derived BF16 call; the memo binds everything but ``call``."""
-    if d_row_tensor is None:
-        d_row_tensor, dbias_tensor = _dglu_allocate_outputs(framework, valid_m, two_n, d_dtype, generate_dbias, num_experts, call.a_tensor, call.current_stream)
-    api._implementation.execute(
-        a_tensor=call.a_tensor,
-        c_tensor=call.c_tensor,
-        d_row_tensor=d_row_tensor,
-        padded_offsets=call.padded_offsets,
-        alpha_tensor=call.alpha_tensor,
-        beta_tensor=call.beta_tensor,
-        prob_tensor=call.prob_tensor,
-        dprob_tensor=call.dprob_tensor,
-        b_tensor=call.b_tensor,
-        b_ptrs=call.b_ptrs,
-        dbias_tensor=dbias_tensor,
-        linear_offset=call.linear_offset if call.linear_offset is not None else (1.0 if call.act_func == "dgeglu" else 0.0),
-        current_stream=call.current_stream,
-    )
-    return TupleDict(
-        d_row_tensor=d_row_tensor,
-        d_col_tensor=None,
-        dprob_tensor=call.dprob_tensor,
-        dbias_tensor=dbias_tensor,
-        amax_tensor=None,
-        sfd_row_tensor=None,
-        sfd_col_tensor=None,
-    )
 
 
 def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = None) -> TupleDict:
@@ -1211,10 +1180,33 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
         api.compile()
         _cache_of_GroupedGemmDgluSm100Objects[cache_key] = api
 
-    replay = partial(dglu_bf16_replay, api, framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts)
     if memo_key is not None:
-        _dglu_wrapper_memo[memo_key] = replay
-    return replay(call, d_row_tensor, dbias_tensor)
+        _dglu_wrapper_memo[memo_key] = (api, framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts)
+
+    api._implementation.execute(
+        a_tensor=call.a_tensor,
+        c_tensor=call.c_tensor,
+        d_row_tensor=d_row_tensor,
+        padded_offsets=call.padded_offsets,
+        alpha_tensor=call.alpha_tensor,
+        beta_tensor=call.beta_tensor,
+        prob_tensor=call.prob_tensor,
+        dprob_tensor=call.dprob_tensor,
+        b_tensor=call.b_tensor,
+        b_ptrs=call.b_ptrs,
+        dbias_tensor=dbias_tensor,
+        linear_offset=call.linear_offset,
+        current_stream=call.current_stream,
+    )
+    return TupleDict(
+        d_row_tensor=d_row_tensor,
+        d_col_tensor=None,
+        dprob_tensor=call.dprob_tensor,
+        dbias_tensor=dbias_tensor,
+        amax_tensor=None,
+        sfd_row_tensor=None,
+        sfd_col_tensor=None,
+    )
 
 
 def grouped_gemm_dglu_wrapper_sm100(
@@ -1304,7 +1296,42 @@ def grouped_gemm_dglu_wrapper_sm100(
         epilogue_op,
         use_dynamic_sched,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+        os.getenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0",
     )
+    memo = _dglu_wrapper_memo.get(memo_key)
+    if memo is not None and memo[0].backend is GroupedGemmBackend.BF16:
+        api, memo_framework, valid_m, two_n, memo_d_dtype, memo_generate_dbias, memo_experts = memo
+        # The full path resolves this during normalization; the memo bypasses that, so
+        # apply the same default here rather than handing None to the kernel.
+        resolved_linear_offset = linear_offset if linear_offset is not None else (1.0 if act_func == "dgeglu" else 0.0)
+        d_row_tensor, dbias_tensor = _dglu_allocate_outputs(
+            memo_framework, valid_m, two_n, memo_d_dtype, memo_generate_dbias, memo_experts, a_tensor, current_stream
+        )
+        api._implementation.execute(
+            a_tensor=a_tensor,
+            c_tensor=c_tensor,
+            d_row_tensor=d_row_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            b_tensor=b_tensor,
+            b_ptrs=b_ptrs,
+            dbias_tensor=dbias_tensor,
+            linear_offset=resolved_linear_offset,
+            current_stream=current_stream,
+        )
+        return TupleDict(
+            d_row_tensor=d_row_tensor,
+            d_col_tensor=None,
+            dprob_tensor=dprob_tensor,
+            dbias_tensor=dbias_tensor,
+            amax_tensor=None,
+            sfd_row_tensor=None,
+            sfd_col_tensor=None,
+        )
+
     call = DgluCall(
         a_tensor=a_tensor,
         c_tensor=c_tensor,
@@ -1345,9 +1372,8 @@ def grouped_gemm_dglu_wrapper_sm100(
         use_single_group_runtime_offsets=use_single_group_runtime_offsets,
         current_stream=current_stream,
     )
-    memo = _dglu_wrapper_memo.get(memo_key)
     if memo is not None:
-        return memo(call)
+        return dglu_block_scaled_run(*memo, call)
 
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
