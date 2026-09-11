@@ -1,9 +1,14 @@
 # yaml-language-server: $schema=https://schema.buildwithfern.dev/docs-yml.json
 
 instances:
-  # TODO(fern-onboarding): confirm the Fern-hosted preview URL with #cdd-fern before publishing.
+  # Production. Fronted by docs.nvidia.com via Akamai once the routing is in place.
+  # TODO(fern-onboarding): confirm both Fern-hosted URLs with #cdd-fern before publishing.
   - url: nvidia-cudnn.docs.buildwithfern.com/deeplearning/cudnn
     custom-domain: docs.nvidia.com/deeplearning/cudnn
+    multi-source: true
+  # Staging. Published from develop on every docs change. No custom-domain:
+  # nothing about this instance should be reachable from docs.nvidia.com.
+  - url: nvidia-cudnn-staging.docs.buildwithfern.com/deeplearning/cudnn
     multi-source: true
 
 title: NVIDIA cuDNN
