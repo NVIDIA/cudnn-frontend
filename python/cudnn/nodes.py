@@ -97,16 +97,14 @@ class Node:
     def _validate_conv_fprop(self) -> None:
         """Validate the restricted NDHWC 3D convolution path."""
         x = self.inputs.get("image")
-        k = self.inputs.get("weight")
-        if not (x and k and x.dim and k.dim):
+        w = self.inputs.get("weight")
+        if not (x and w and x.dim and w.dim):
             return
 
         if any(extent <= 0 for extent in x.dim):
             raise ValueError(f"Node '{self.name}': X dimensions must be positive, got X{x.dim}")
-        if any(extent <= 0 for extent in k.dim):
-            raise ValueError(f"Node '{self.name}': K dimensions must be positive, got K{k.dim}")
-        if x.dim[1] != k.dim[1]:
-            raise ValueError(f"Node '{self.name}': Input channels must match for convolution: X{x.dim} vs K{k.dim}")
+        if any(extent <= 0 for extent in w.dim):
+            raise ValueError(f"Node '{self.name}': W dimensions must be positive, got W{w.dim}")
 
     def _infer_matmul(self) -> None:
         """Infer output dims for matmul: C = A @ B."""
