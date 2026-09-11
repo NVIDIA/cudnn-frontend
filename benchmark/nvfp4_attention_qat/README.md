@@ -10,7 +10,7 @@ python benchmark/nvfp4_attention_qat/benchmark_backends.py --head-chunk 1 --outp
 
 Both arms use `cudnn.Nvfp4AttentionQatBackward` with the same Q/K/V/dO and
 matching forward auxiliaries. The default Triton backend is the reference.
-The candidate explicitly selects `backend="cutedsl"`. Correctness checks
+The candidate explicitly selects `backend="frost"`. Correctness checks
 must pass before timing: finite values, pointwise atol/rtol 0.005, and
 relative L2 below 0.01 for each gradient. Changed-dO graph replay poisons
 both arms' outputs/workspaces before replay to detect stale intermediates.
@@ -26,12 +26,18 @@ Source hashes, versions, hardware, workspace sizes and raw samples are saved.
 
 ## Measured snapshot: 2026-09-10
 
+The raw JSON is preserved from before the public backend was named FROST.
+Its candidate key `cutedsl` refers to the same implementation now selected
+with `backend="frost"`; it is not a separate backend or a new measurement.
+New runs use `frost` for the candidate key. The top-level `cutedsl` version
+field still identifies the implementation dependency.
+
 NVIDIA B200, 148 SMs; B1/H3/D128 BF16, dense noncausal, equal sequence
 lengths, all-head dS. FE base `8059fdf490edb4de838bb2df7096d0b39b4c8336`
 (merged PR #778), measured implementation `c042524b1`; exact source hashes are in
 [the raw artifact](results/b200_20260910.json).
 
-| Sequence | Triton ms | CuTe DSL ms | Speedup |
+| Sequence | Triton ms | FROST ms | Speedup |
 | --- | --- | --- | --- |
 | 8192 | 1.02237 | 0.42394 | 2.412x |
 | 32768 | 13.86795 | 5.09393 | 2.722x |
@@ -53,7 +59,7 @@ eager plus changed-input graph replay, zero errors. S256 is correctness
 coverage, not a DiT performance target. This is not racecheck/synccheck.
 
 Additional local coverage: 23 passing focused tests (15 existing Triton,
-8 new CuTe DSL) including numerical reference, explicit nondefault stream,
+8 new FROST) including numerical reference, explicit nondefault stream,
 runtime scale, rejected tails/contracts, workspace size/alignment, no
 execute-time compilation/JIT dispatch, allocation/copy detector, and CUDA
 Graph replay. The allocation detector is exercised with a positive failure
@@ -67,7 +73,13 @@ immediately after the kernel definition (a red/green guard check was run).
 That naming-placement-only cleanup follows measured commit `c042524b1`;
 it does not change the kernel arithmetic or launch configuration.
 
-Initial CuTe DSL support intentionally declines B>1, causal, GQA, unequal
+After the public backend rename to `frost`, all 24 focused B200 tests passed
+(the same 23 cases plus a backend-name regression). The new regression checks
+the unchanged Triton default and rejects the draft-only `cutedsl` selector in
+both the class and wrapper. The FROST numerical tests also verify that the
+prepared implementation comes from the FROST module.
+
+Initial FROST support intentionally declines B>1, causal, GQA, unequal
 lengths and non-256-aligned lengths. Native tails, broader adversarial
 coverage, multi-device testing and further workspace reduction are follow-ups;
 the Triton default and its broader support remain unchanged.

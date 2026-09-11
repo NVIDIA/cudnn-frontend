@@ -44,6 +44,8 @@ class Nvfp4AttentionQatBackward(APIBase):
     storage. ``lse`` is the natural-log softmax statistic with shape
     ``(B, H, S_q)``. The caller supplies output tensors and a byte workspace to
     :meth:`execute`; the convenience wrapper below owns those allocations.
+    ``backend="triton"`` is the default; ``backend="frost"`` explicitly
+    selects FROST's SM100 implementation, built with CuTe DSL.
     """
 
     def __init__(
@@ -78,17 +80,17 @@ class Nvfp4AttentionQatBackward(APIBase):
 
     def check_support(self) -> bool:
         """Validate the contract and derive workspace and launch metadata."""
-        self._value_error_if(self.backend not in ("triton", "cutedsl"), "backend must be 'triton' or 'cutedsl'")
+        self._value_error_if(self.backend not in ("triton", "frost"), "backend must be 'triton' or 'frost'")
         self._value_error_if(type(self.head_chunk) is not int or self.head_chunk < 0, "head_chunk must be a nonnegative integer")
-        self._value_error_if(self.backend == "triton" and self.head_chunk != 0, "head_chunk is only supported by backend='cutedsl'")
-        if self.backend == "cutedsl":
+        self._value_error_if(self.backend == "triton" and self.head_chunk != 0, "head_chunk is only supported by backend='frost'")
+        if self.backend == "frost":
             from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state
 
-            message = cutedsl_requirement_error("NVFP4 QAT CuTe DSL backend")
+            message = cutedsl_requirement_error("NVFP4 QAT FROST backend")
             if message:
                 raise NotImplementedError(message)
             if not cutedsl_state()[0]:
-                raise ImportError("NVFP4 QAT CuTe DSL backend requires nvidia-cutlass-dsl >= 4.7.0")
+                raise ImportError("NVFP4 QAT FROST backend requires nvidia-cutlass-dsl >= 4.7.0")
         activations = (
             self.q_desc,
             self.k_desc,
@@ -131,12 +133,12 @@ class Nvfp4AttentionQatBackward(APIBase):
             self.softmax_scale = 1.0 / math.sqrt(head_dim)
         self._value_error_if(not math.isfinite(self.softmax_scale) or self.softmax_scale <= 0.0, "softmax_scale must be finite and positive")
 
-        if self.backend == "cutedsl":
-            self._not_implemented_error_if(capability != (10, 0), "NVFP4 QAT CuTe DSL backend currently supports SM100")
-            self._not_implemented_error_if(batch != 1 or self.is_causal, "NVFP4 QAT CuTe DSL backend requires B=1 and noncausal attention")
+        if self.backend == "frost":
+            self._not_implemented_error_if(capability != (10, 0), "NVFP4 QAT FROST backend currently supports SM100")
+            self._not_implemented_error_if(batch != 1 or self.is_causal, "NVFP4 QAT FROST backend requires B=1 and noncausal attention")
             self._not_implemented_error_if(
                 seqlen_q != seqlen_kv or seqlen_q % 256 != 0,
-                "NVFP4 QAT CuTe DSL backend requires equal sequence lengths divisible by 256; use backend='triton' for tails",
+                "NVFP4 QAT FROST backend requires equal sequence lengths divisible by 256; use backend='triton' for tails",
             )
             chunk = self.head_chunk or heads
             self._value_error_if(heads % chunk != 0, "head_chunk must divide the head count")
@@ -168,8 +170,8 @@ class Nvfp4AttentionQatBackward(APIBase):
     def compile(self) -> None:
         """Prepare the selected backend without launching kernels."""
         self._ensure_support_checked()
-        if self.backend == "cutedsl":
-            from ._cutedsl import PreparedBackward
+        if self.backend == "frost":
+            from ._frost import PreparedBackward
 
             with torch.cuda.device(self.q_desc.device):
                 self._compiled_kernel = PreparedBackward.compile(self.q_desc.shape[1], self.q_desc.shape[2], self.head_chunk or self.q_desc.shape[1])
@@ -265,7 +267,7 @@ class Nvfp4AttentionQatBackward(APIBase):
         assert scale is not None
         if not math.isfinite(scale) or scale <= 0.0:
             raise ValueError("softmax_scale must be finite and positive")
-        if self.backend == "cutedsl":
+        if self.backend == "frost":
             with _stream_context(current_stream, q_tensor.device):
                 self._compiled_kernel.execute(
                     q_tensor,
@@ -334,6 +336,8 @@ def nvfp4_attention_qat_backward(
     ``high_precision_o_tensor`` is the forward ``softmax(QK^T) @ V`` value
     formed from fake-quantized Q/K/V before probability fake quantization.
     ``lse_tensor`` is the matching natural-log softmax statistic.
+    Select ``backend="frost"`` for the opt-in FROST implementation; the
+    default is ``backend="triton"``.
     """
 
     if q_tensor.ndim != 4:

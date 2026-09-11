@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepared, allocation-free CuTe DSL QAT backward orchestration.
+"""Prepared, allocation-free FROST QAT backward orchestration.
 
 Version/capability checks in api.py run before importing this module.
 Q/delta and KV preprocessing reuse the public Triton quantizers; dV/dS
@@ -14,7 +14,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import torch
 
-from ._cutedsl_kernel import compile as compile_core
+from ._frost_kernel import compile as compile_core
 from ._interface import _workspace_tensor
 from ._nvfp4 import fake_quantize_kv, fake_quantize_q
 from ._workspace import _align_up

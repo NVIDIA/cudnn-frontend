@@ -100,8 +100,8 @@ def main():
             arms = {}
             case = dict(sequence=sequence, heads=args.heads, head_chunk=args.head_chunk, status="checking")
             report["cases"].append(case)
-            for backend in ("triton", "cutedsl"):
-                op = cudnn.Nvfp4AttentionQatBackward(*inputs, backend=backend, head_chunk=args.head_chunk if backend == "cutedsl" else 0)
+            for backend in ("triton", "frost"):
+                op = cudnn.Nvfp4AttentionQatBackward(*inputs, backend=backend, head_chunk=args.head_chunk if backend == "frost" else 0)
                 op.check_support()
                 op.compile()
                 outputs = tuple(torch.empty_like(t) for t in inputs[:3])
@@ -113,7 +113,7 @@ def main():
                 for _ in range(3):
                     run()
                 arms[backend] = (outputs, workspace, run)
-            case["eager_comparisons"] = compare(arms["cutedsl"][0], arms["triton"][0])
+            case["eager_comparisons"] = compare(arms["frost"][0], arms["triton"][0])
             graphs = {}
             for backend, (_, _, run) in arms.items():
                 torch.cuda.synchronize()
@@ -129,12 +129,12 @@ def main():
                     tensor.fill_(float("nan"))
             for graph in graphs.values():
                 graph.replay()
-            case["graph_comparisons"] = compare(arms["cutedsl"][0], arms["triton"][0])
+            case["graph_comparisons"] = compare(arms["frost"][0], arms["triton"][0])
             case["workspace_bytes"] = {key: arm[1].numel() for key, arm in arms.items()}
             if not args.check_only:
                 samples = {backend: [] for backend in arms}
                 for round_index in range(5):
-                    order = ("triton", "cutedsl", "cutedsl", "triton") if round_index % 2 == 0 else ("cutedsl", "triton", "triton", "cutedsl")
+                    order = ("triton", "frost", "frost", "triton") if round_index % 2 == 0 else ("frost", "triton", "triton", "frost")
                     for backend in order:
                         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                         start.record()
@@ -144,7 +144,7 @@ def main():
                         samples[backend].append(start.elapsed_time(end) / 3)
                 case["samples_ms"] = samples
                 case["median_ms"] = {key: statistics.median(values) for key, values in samples.items()}
-                case["speedup"] = case["median_ms"]["triton"] / case["median_ms"]["cutedsl"]
+                case["speedup"] = case["median_ms"]["triton"] / case["median_ms"]["frost"]
             case["status"] = "pass"
             print(json.dumps(case), flush=True)
             del graphs, arms, inputs

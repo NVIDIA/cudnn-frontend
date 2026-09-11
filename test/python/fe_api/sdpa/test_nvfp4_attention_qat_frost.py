@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Opt-in SM100 QAT backend: numerical, workspace and launch contracts."""
+"""Opt-in SM100 FROST QAT backend: numerical, workspace and launch contracts."""
 
 import importlib.util
 import math
@@ -46,12 +46,30 @@ def _close(actual, expected):
         assert (a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30) < 0.01
 
 
+def test_frost_backend_name():
+    """FROST identifies the backend, not its implementation language."""
+    from cudnn import Nvfp4AttentionQatBackward, nvfp4_attention_qat_backward
+
+    q = torch.empty((1, 2, 256, 128), device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty((1, 2, 256), device="cuda", dtype=torch.float32)
+    inputs = (q, q, q, q, q, lse)
+    assert Nvfp4AttentionQatBackward(*inputs).backend == "triton"
+    op = Nvfp4AttentionQatBackward(*inputs, backend="frost")
+    assert op.backend == "frost" and op.check_support()
+    # The old draft-only spelling is not a second public backend or alias.
+    with pytest.raises(ValueError, match="backend must be 'triton' or 'frost'"):
+        Nvfp4AttentionQatBackward(*inputs, backend="cutedsl").check_support()
+    with pytest.raises(ValueError, match="backend must be 'triton' or 'frost'"):
+        nvfp4_attention_qat_backward(*inputs, backend="cutedsl")
+
+
 @pytest.mark.parametrize("sequence,chunk", [(256, 0), (512, 1)])
 @torch_fork_set_rng(seed=71)
-def test_cutedsl_matches_triton_and_reference(sequence, chunk):
+def test_frost_matches_triton_and_reference(sequence, chunk):
     inputs, expected = _reference_case(sequence, sequence, is_causal=False)
     reference, ref, ref_ws = _prepare(inputs)
-    candidate, got, ws = _prepare(inputs, backend="cutedsl", head_chunk=chunk)
+    candidate, got, ws = _prepare(inputs, backend="frost", head_chunk=chunk)
+    assert candidate._compiled_kernel.__class__.__module__ == "cudnn.sdpa.bwd.qat._frost"
     reference.execute(*inputs[:6], *ref, ref_ws)
     candidate.execute(*inputs[:6], *got, ws)
     _close(got, ref)
@@ -62,14 +80,14 @@ def test_cutedsl_matches_triton_and_reference(sequence, chunk):
 
 
 @torch_fork_set_rng(seed=73)
-def test_cutedsl_precompiled_no_allocations_no_sync_and_graph_replay(monkeypatch):
+def test_frost_precompiled_no_allocations_no_sync_and_graph_replay(monkeypatch):
     import cutlass.cute as cute
     from cudnn.sdpa.bwd.qat import _nvfp4
     from torch.utils._python_dispatch import TorchDispatchMode
 
     inputs, _ = _reference_case(256, 256, is_causal=False)
     reference, ref, ref_ws = _prepare(inputs)
-    candidate, got, ws = _prepare(inputs, backend="cutedsl", head_chunk=1)
+    candidate, got, ws = _prepare(inputs, backend="frost", head_chunk=1)
     reference.execute(*inputs[:6], *ref, ref_ws)
 
     def forbidden(*args, **kwargs):
@@ -121,12 +139,12 @@ def test_cutedsl_precompiled_no_allocations_no_sync_and_graph_replay(monkeypatch
 
 
 @torch_fork_set_rng(seed=79)
-def test_cutedsl_explicit_stream_and_runtime_scale(monkeypatch):
+def test_frost_explicit_stream_and_runtime_scale(monkeypatch):
     import cuda.bindings.driver as cuda
 
     inputs, _ = _reference_case(256, 256, is_causal=False)
     reference, ref, ref_ws = _prepare(inputs)
-    candidate, got, ws = _prepare(inputs, backend="cutedsl")
+    candidate, got, ws = _prepare(inputs, backend="frost")
     producer = torch.cuda.current_stream()
     launch = torch.cuda.Stream()
     launch.wait_stream(producer)
@@ -160,7 +178,7 @@ def test_cutedsl_explicit_stream_and_runtime_scale(monkeypatch):
 
 
 @torch_fork_set_rng(seed=83)
-def test_cutedsl_declines_tails_causal_and_bad_chunk():
+def test_frost_declines_tails_causal_and_bad_chunk():
     from cudnn import Nvfp4AttentionQatBackward
 
     for sq, sk, options, match in (
@@ -170,38 +188,38 @@ def test_cutedsl_declines_tails_causal_and_bad_chunk():
         (256, 256, {"head_chunk": 3}, "divide the head count"),
     ):
         inputs, _ = _reference_case(sq, sk, is_causal=False)
-        op = Nvfp4AttentionQatBackward(*inputs[:6], backend="cutedsl", **options)
+        op = Nvfp4AttentionQatBackward(*inputs[:6], backend="frost", **options)
         with pytest.raises((ValueError, NotImplementedError), match=match):
             op.check_support()
 
 
 @torch_fork_set_rng(seed=89)
-def test_cutedsl_wrapper_and_zero_inputs():
+def test_frost_wrapper_and_zero_inputs():
     from cudnn import nvfp4_attention_qat_backward
 
     q = torch.zeros((1, 2, 256, 128), device="cuda", dtype=torch.bfloat16)
     lse = torch.full((1, 2, 256), math.log(256), device="cuda", dtype=torch.float32)
-    result = nvfp4_attention_qat_backward(q, q, q, q, q, lse, backend="cutedsl", head_chunk=1)
+    result = nvfp4_attention_qat_backward(q, q, q, q, q, lse, backend="frost", head_chunk=1)
     assert list(result.keys()) == ["dq_tensor", "dk_tensor", "dv_tensor"]
     for tensor in result:
         torch.testing.assert_close(tensor, torch.zeros_like(q), atol=0, rtol=0)
 
 
 @torch_fork_set_rng(seed=97)
-def test_cutedsl_old_dsl_declines_before_kernel_import(monkeypatch):
+def test_frost_old_dsl_declines_before_kernel_import(monkeypatch):
     from cudnn import Nvfp4AttentionQatBackward
     from cudnn.frost import buffers
 
     inputs, _ = _reference_case(256, 256, is_causal=False)
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
     with pytest.raises(NotImplementedError, match=r"requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
-        Nvfp4AttentionQatBackward(*inputs[:6], backend="cutedsl").check_support()
+        Nvfp4AttentionQatBackward(*inputs[:6], backend="frost").check_support()
 
 
 @torch_fork_set_rng(seed=101)
-def test_cutedsl_runtime_buffers_and_device_contract():
+def test_frost_runtime_buffers_and_device_contract():
     inputs, _ = _reference_case(256, 256, is_causal=False)
-    op, outputs, ws = _prepare(inputs, backend="cutedsl")
+    op, outputs, ws = _prepare(inputs, backend="frost")
     with pytest.raises(ValueError, match="at least"):
         op.execute(*inputs[:6], *outputs, ws[:-16])
     with pytest.raises(ValueError, match="16-byte aligned"):

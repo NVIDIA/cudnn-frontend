@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM100 D128 BF16 NVFP4 QAT dV/dS kernel.
+"""FROST SM100 D128 BF16 NVFP4 QAT dV/dS kernel.
 
 Two CTAs collaborate on a 256-KV by 128-Q tile. QKV fake quantization
 precedes this kernel; two GEMMs consume BF16 dS to produce dQ/dK.

@@ -117,11 +117,12 @@ op.execute(q, k, v, high_precision_o, do, lse, dq, dk, dv, workspace)
 `compile()` materializes the selected backend's shape- and architecture-specialized
 kernels without launching them. `execute()` reuses those artifacts.
 
-## Opt-in CuTe DSL backend (SM100)
+## Opt-in FROST backend (SM100)
 
-Both the class constructor and wrapper accept `backend="cutedsl"`.
+Both the class constructor and wrapper accept `backend="frost"`.
+FROST is the backend name; CuTe DSL is its kernel implementation technology.
 The default remains `"triton"`; this is not an automatic dispatch policy.
-The CuTe DSL backend requires **CuTe DSL >= 4.7.0**, SM100, BF16, D128,
+The FROST backend requires **CuTe DSL >= 4.7.0**, SM100, BF16, D128,
 B=1, equal query/KV head counts, noncausal attention, and equal positive
 sequence lengths divisible by 256. Unsupported declarations raise during
 `check_support()`; there is no padding, layout conversion, or silent fallback.
@@ -130,7 +131,7 @@ Use the Triton backend for its wider support, including tails.
 ```python
 op = Nvfp4AttentionQatBackward(
     q, k, v, high_precision_o, do, lse,
-    backend="cutedsl", head_chunk=0,
+    backend="frost", head_chunk=0,
 )
 op.check_support()
 op.compile()
@@ -139,8 +140,8 @@ op.execute(q, k, v, high_precision_o, do, lse, dq, dk, dv, workspace)
 ```
 
 This backend reuses the Triton Q/delta and KV quantizers, then launches a
-two-CTA CuTe DSL dV/dS kernel and two output-buffer BF16 batched GEMMs for
-dQ/dK. The quantizers write their BSHD intermediates directly; the main kernel
+two-CTA FROST dV/dS kernel implemented in CuTe DSL and two output-buffer BF16
+batched GEMMs for dQ/dK. The quantizers write their BSHD intermediates directly; the main kernel
 addresses caller-owned BHSD dO/dV natively. All stages honor `current_stream`.
 Compilation is plan-time-only; no mutable global configuration is switched
 between plans. The wrapper's bounded cache separates backend/head-chunk plans.
@@ -163,7 +164,7 @@ class API for explicit reuse and CUDA Graph capture, and warm up execution
 before capture to initialize the framework's GEMM runtime.
 
 Both backends implement the same local-scale-floor NVFP4/STE contract.
-The CuTe DSL path folds `softmax_scale` into dS before its BF16 store;
+The FROST path folds `softmax_scale` into dS before its BF16 store;
 the Triton path applies it after gradient accumulation. Expect small BF16
 rounding differences in dQ/dK, not bitwise identity.
 
@@ -189,7 +190,7 @@ forward pass.
 
 ## Current support and limitations
 
-The following describes the default Triton backend; the opt-in CuTe DSL
+The following describes the default Triton backend; the opt-in FROST
 backend's narrower initial coverage is listed above.
 
 - GPU: SM100, SM103, SM120, and SM121 Blackwell.
