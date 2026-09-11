@@ -16,11 +16,12 @@
 # limitations under the License.
 
 """Gated DeltaNet v2 (GDN-2) Cutlass DSL backward kernel config (fixed
-compile-time constants).  The BT=16 backward (channel-wise erase gate beta + per-value write gate w) mirrors the prefill's 16-warp
-(512-thread) specialization; the derived SMEM/TMEM sizes and offsets are
-stamped by ``build_cfg`` in ``gdn2_bprop_f16.py``.
+compile-time constants) for the BT=16 schedule with the channel-wise erase
+gate (beta) and the per-value write gate (w), 16 warps (512 threads); the
+derived SMEM/TMEM sizes and offsets are stamped by ``build_cfg`` in
+``gdn2_bprop_f16.py``.
 
-Target arch: Blackwell SM100 (GB200) / SM103 (GB300).
+Target arch: Blackwell SM100 / SM103.
 """
 
 from dataclasses import dataclass
@@ -30,7 +31,7 @@ from typing import Tuple
 @dataclass(frozen=True)
 class Cfg:
     # --- tile shape ---
-    B_T: int = 16  # chunk-inner token tile (BT=16 KDA schedule)
+    B_T: int = 16  # chunk-inner token tile (BT=16 schedule)
     D_K: int = 128  # query/key head dim
     D_V: int = 128  # value head dim
 
@@ -59,7 +60,6 @@ class Cfg:
     SMEM_DECAY_STAGES: int = 2
     SMEM_INTERMEDIATE_STAGES: int = 2
     SMEM_DA_DIAG_STAGES: int = 4
-    SMEM_STATE_SCALE_DIAG_STAGES: int = 2
     SMEM_DQ_STAGES: int = 1
     SMEM_DK_STAGES: int = 1
     SMEM_DGATE_STAGES: int = 1

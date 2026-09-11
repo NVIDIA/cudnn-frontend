@@ -1,6 +1,6 @@
 # Concatenate
 
-The Concatenate operation merges two or more tensors into one, along the specified axis.  The user may also specify an in-place merge.  The operation provides the capabilities of the {ref}`cudnn backend's concatenate operation                          <CUDNN_BACKEND_OPERATION_CONCAT_DESCRIPTOR>`.
+The Concatenate operation merges two or more tensors into one, along the specified axis.  The user may also specify an in-place merge.  The operation provides the capabilities of the [cudnn backend's concatenate operation](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/cudnn-graph-library.html#cudnn-backend-operation-concat-descriptor).
 
 ## C++ API
 

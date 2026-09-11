@@ -2097,6 +2097,7 @@ def chunk_bwd_kernel_dv_local(
 
     o_t = i_t * BT + r_bt
     m_t = o_t < T
+    m_A = (o_t[:, None] <= o_t[None, :]) & (m_t[:, None] & m_t[None, :])
 
     b_A = ct.zeros((BT, BT), dtype=ct.float32)
     b_g = ct.zeros((BT,), dtype=ct.float32)
@@ -2131,18 +2132,8 @@ def chunk_bwd_kernel_dv_local(
             b_A = b_A + safe_dot(b_k, b_q) * scale
 
         if USE_G or USE_G_GAMMA:
-            if H <= 16:
-                b_g_ref = ct.max(b_g, axis=0)
-                b_A = b_A * (exp2(b_g[None, :] - b_g_ref) * exp2(b_g_ref - b_g[:, None]))
-            elif USE_G:
-                g_base = bos * HV + i_h
-                b_g_ref = ct.astype(gf.load_offset(g_base + i_t * BT * HV).item(), ct.float32)
-                b_A = b_A * (exp2(b_g[None, :] - b_g_ref) * exp2(b_g_ref - b_g[:, None]))
-            else:
-                b_g_ref = b_gamma
-                b_A = b_A * (exp2(b_g[None, :] - b_g_ref) * exp2(b_g_ref - b_g[:, None]))
+            b_A = ct.where(m_A, b_A * exp2(b_g[None, :] - b_g[:, None]), ct.zeros((BT, BT), dtype=ct.float32))
 
-    m_A = (o_t[:, None] <= o_t[None, :]) & (m_t[:, None] & m_t[None, :])
     b_A = ct.astype(ct.where(m_A, b_A, ct.zeros((BT, BT), dtype=ct.float32)), do.dtype)
 
     for i_v in range(ct.cdiv(V, BV)):

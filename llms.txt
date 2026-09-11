@@ -29,6 +29,7 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 ## Open-source (frontend-only) kernel APIs
 
 - [FE OSS APIs overview — full catalog and usage pattern](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/overview.md)
+- [Flex Attention API](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/attention/flex_attention.md) and [mask plan design](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/attention/flex_attention_design.md)
 - [FROST SDPA support-matrix tracker — what the FROST SDPA engines serve, per architecture](https://github.com/NVIDIA/cudnn-frontend/blob/main/python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md)
 - [Block-sparse attention (BSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/bsa.md), [DeepSeek sparse attention (DSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/dsa.md), [Native sparse attention (NSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/nsa.md)
 - [GEMM fusions (amax, SwiGLU, sReLU, grouped/discrete MoE variants)](https://github.com/NVIDIA/cudnn-frontend/tree/main/docs/fe-oss-apis/gemm_fusions)
@@ -36,13 +37,13 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 
 ## How-to guides
 
-- [CUDA graphs](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/cuda-graphs.md)
-- [Deviceless ahead-of-time compilation](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/deviceless-ahead-of-time-compilation.md)
-- [Dynamic kernel cache](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/dynamic-kernel-cache.md)
-- [Custom execution plans](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/custom-execution-plan.md)
-- [Compile-time constants](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/CompileTimeConstants.md)
-- [Adding PyTorch custom ops](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/adding_torch_custom_ops.md)
-- [Python graph and execution backends](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/python_graph_and_execution_backends.md)
+- [CUDA graphs](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/cuda-graphs.md)
+- [Deviceless ahead-of-time compilation](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/deviceless-ahead-of-time-compilation.md)
+- [Dynamic kernel cache](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/dynamic-kernel-cache.md)
+- [Custom execution plans](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/custom-execution-plan.md)
+- [Compile-time constants](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/CompileTimeConstants.md)
+- [Adding PyTorch custom ops](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/adding_torch_custom_ops.md)
+- [Python graph and execution backends](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/python_graph_and_execution_backends.md)
 
 ## Examples
 

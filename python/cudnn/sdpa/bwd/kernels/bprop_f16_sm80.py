@@ -37,6 +37,12 @@ the tile to ``sDQ`` and then atomicAdd-ing in row-major order (consecutive lanes
 → consecutive dQ columns) drops it to 4 sectors/request → halves the dQ atomic L2
 traffic.  This is what closes the gap to cuDNN (whose dQ atomic also coalesces):
 +18 % @ B2H16S4096 (75→89 TFLOPS, ~1.0× cuDNN), +16 % @ B1H16S2048 (1.08×).
+The staging itself must be bank-conflict-free: the fragment's 8 rows per warp
+store share banks at a d_qk-word row stride (8-way conflict, about as many SMEM
+cycles per Q-iter as the MMAs take), so ``sDQ`` uses the XOR layout of
+:func:`_sdq_off` and 8 B ``v2`` pair stores (-9 % kernel time, non-causal
+B2 H64/8 S4096).  The kernel runs 8 warps/SM at the 255-register cap, so it is
+issue-bound: every non-MMA instruction in the Q-loop shows up in the runtime.
 
 **Deterministic dQ** (``TemplateParams.deterministic``): the cross-KV-tile dQ
 atomicAdd is order-non-deterministic (fp32 add is non-associative → bitwise
@@ -65,7 +71,9 @@ Named-"barrier" table (all ``nvvm.barrier_cta_sync()`` — full 256-thread CTA):
   * B1  after sg0 writes ``sP``               (sg1's dS reads it; dV's P operand is in regs)
   * B2  after sg1 writes ``sdS``/``sdSᵀ``     (dQ reads sdSᵀ; sP/sdO read done)
   * B2b after both sg stage ``sDQ``           (before the coalesced dQ atomicAdd)
-  * B3  after dQ atomicAdds                    (before next Q-iter reloads Q/dO)
+  * B3  after dQ atomicAdds                    (direct-atomic path only: before the
+                                                next Q-iter reloads Q/dO; the staged
+                                                path is already ordered by B2b + B0)
 ALL barriers are at top level (never inside a divergent ``if sg0`` arm) so the
 per-thread barrier count is identical across both sub-groups.
 
@@ -108,8 +116,9 @@ from cudnn.frost.tile_dsl.mma import load_b_smem_x4, mma_step  # noqa: E402
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16  # noqa: E402
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b  # noqa: E402
 from cudnn.frost.tile_dsl.tma import load_tile_2d, cp_async_commit, cp_async_wait  # noqa: E402
-from cudnn.frost.tile_dsl.mask import MASK_NONE, MASK_PADDED, MASK_CAUSAL, MASK_SWA  # noqa: E402
+from cudnn.frost.tile_dsl.mask import MASK_NONE, MASK_PADDED, MASK_CAUSAL, MASK_SWA, compute_q_loop_bounds, swa_kv_lo_tile  # noqa: E402
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
+from cudnn.frost.tile_dsl.scheduler import lpt_l2_tile_coords  # noqa: E402
 
 # Pull the default geometry from the flavor config (single source of truth).
 from cudnn.sdpa.bwd.config_sm80 import LLAMA_CFG as _LLAMA_CFG  # noqa: E402
@@ -121,14 +130,24 @@ _COPY_ELEMS = 8  # 16-byte cp.async chunk (8 fp16)
 # Scheduler policy (compile-time).  The bprop parallel axis is the KV-tile; under
 # causal the lowest kv-tile is the heaviest (most q-iters after the causal
 # skip), so an LPT schedule is KV-MAJOR (all kv=0 tiles first → the light high-kv
-# tiles land in the last wave, minimizing the makespan tail).
-SCHED_DEFAULT = 0  # 3-D grid (kv_tile, head, batch); no reorder (byte-identical)
-SCHED_LPT = 1  # 1-D kv-major grid for causal load-balance
+# tiles land in the last wave, minimizing the makespan tail).  Plain kv-major
+# over EVERY (head, batch) puts the resident CTAs on ~108 different heads, so
+# a head's Q / dO / dQ tiles leave L2 between its kv-tiles' visits and the dQ
+# atomics become DRAM read-modify-writes (1.4x slower than the 3-D grid at
+# B2 H64/8 S4K).  SCHED_LPT_L2 keeps kv-major order WITHIN an L2-sized group
+# of (batch, kv_head) — the 3-D grid's locality with LPT's tail — and is the
+# causal default; SCHED_LPT stays for small grids by explicit request.
+# The policy ids are the SHARED tile_dsl vocabulary (config_sm80 / api_dsl
+# pass those ids in), so the kernel compares against the same symbols:
+#   SCHED_DEFAULT (== SCHED_NATURAL): 3-D grid (kv_tile, head, batch); no reorder
+#   SCHED_LPT:    1-D kv-major grid over all heads (causal load-balance, no locality)
+#   SCHED_LPT_L2: 1-D kv-major grid within L2-sized head groups (causal default)
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL  # noqa: E402
+
+SCHED_DEFAULT = SCHED_NATURAL
 
 # TemplateParams injection seam (frost.template_loader): one uniquely named
 # module per parameter set, specialized below via cutlass.const_expr folding.
-# The shared tile_dsl scheduler vocabulary maps IDENTITY onto the internal
-# grid decode (SCHED_NATURAL == SCHED_DEFAULT == 0, SCHED_LPT == 1).
 from cudnn.sdpa.bwd.config_sm80 import TemplateParams  # noqa: E402
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
@@ -229,7 +248,8 @@ def _bprop_kernel(
     has_seq_len_q: cutlass.Constexpr[bool],  # read SEQ_LEN_Q[batch] → per-batch q-pad (dense PADDED)
     THD_VARLEN: cutlass.Constexpr[bool],  # packed [1,T,H,D] + CU_Q/CU_K; per-batch S_q/S_kv
     deterministic: cutlass.Constexpr[bool],  # gate the dQ semaphore relay (folds out → byte-identical fast path)
-    sched_policy: cutlass.Constexpr[int],  # SCHED_DEFAULT / SCHED_LPT grid decode
+    sched_policy: cutlass.Constexpr[int],  # SCHED_DEFAULT / SCHED_LPT / SCHED_LPT_L2 grid decode
+    sched_l2_bytes: cutlass.Constexpr[int],  # L2 budget sizing the SCHED_LPT_L2 head groups
     n_q_tiles: cutlass.Int32,  # runtime — ceil(SQ / tile_q) (dense); THD recomputes per-batch
     softmax_scale_log2: cutlass.Float32,  # = attn_scale * log2(e)  (for P)
     attn_scale: cutlass.Float32,  # linear scale (for dS)
@@ -281,14 +301,35 @@ def _bprop_kernel(
     PARTIAL_KV = False if cutlass.const_expr(THD_VARLEN) else ((SKV % tile_kv) != 0)
 
     # Grid decode.  SCHED_DEFAULT: plain 3-D (kv_tile, head, batch).  SCHED_LPT:
-    # 1-D kv-major flat grid — bx = kv_tile*(H*B) + head*B... no: kv-major means
-    # kv_tile = bx // (H*B), so all (head,batch) of kv=0 come first (heaviest).
+    # 1-D kv-major flat grid, kv_tile = bx // (H*B), so all (head, batch) of
+    # kv=0 come first (heaviest).  SCHED_LPT_L2: the same order within L2-sized
+    # (batch, kv_head) groups, one group block after another.
     if cutlass.const_expr(sched_policy == SCHED_LPT):
         _hb = cutlass.Int32(H) * cutlass.Int32(B)
         kv_tile = bx // _hb
         _r = bx % _hb
         head = _r % cutlass.Int32(H)
         batch = _r // cutlass.Int32(H)
+    elif cutlass.const_expr(sched_policy == SCHED_LPT_L2):
+        # Block-cyclic over L2-sized (batch, kv_head) groups, kv-major within a
+        # block: the shared fwd helper decodes (row_rank, head, batch) with the
+        # row REVERSED for the forward's heavy-high-q order; the backward's heavy
+        # tiles are LOW kv (kv-tile 0 attends every q), so undo the reversal.
+        # per_group = this group's Q + dO + fp32 dQ stream over its heads_per_kv
+        # query heads -- the bytes the group's CTAs re-touch every Q-iter.
+        _nkv = cutlass.Int32((SKV + tile_kv - 1) // tile_kv)
+        _hpk = H // Hkv
+        _row, head, batch = lpt_l2_tile_coords(
+            bx,
+            cutlass.Int32(H),
+            cutlass.Int32(B),
+            _nkv,
+            _hpk,
+            cutlass.Int32(SQ),
+            _hpk * (2 * d_qk + 2 * d_v + 4 * d_qk),
+            sched_l2_bytes,
+        )
+        kv_tile = (_nkv - cutlass.Int32(1)) - _row
     else:
         kv_tile = bx
         head = by
@@ -386,42 +427,30 @@ def _bprop_kernel(
     VV_RS = cutlass.Int32(Hkv) * cutlass.Int32(d_v)  # V read row stride (H_kv heads)
     kv_base = kv_tile * cutlass.Int32(tile_kv)
 
-    # ---- Causal compute-skip: a kv-tile [kv_base, kv_base+tile_kv) is attended
-    #      only by q >= kv_base (top-left causal) or q >= kv_base - causal_diag
-    #      (bottom-right).  Start the q-loop at the first such q-tile and run a
-    #      j-counter (q_iter = q_lo_tile + j) so the double-buffer stage parity is
-    #      relative to the loop start, not the absolute q-tile.  ~2x on causal
-    #      bprop.  Non-causal → q_lo_tile=0, n_iters=n_q_tiles (byte-identical).
-    #      SKV>SQ edge: kv-tiles past SQ get q_lo_tile >= n_q_tiles → 0 iters →
-    #      dV/dK epilogue writes 0 (those kv attend no q under causal).  The
-    #      prologue's valid_rows row-gate makes the OOB prefetch a zero-size copy.
-    if cutlass.const_expr(mask_flags & MASK_CAUSAL):
-        # A kv-tile [kv_base, kv_base+tile_kv) is attended by q whenever
-        # kv <= q + causal_diag + right_bound (band widening), i.e. the first
-        # attending q is (kv_base - causal_diag) - right_bound (BR) / kv_base -
-        # right_bound (TL).  Subtract right_bound so band-right widening doesn't
-        # drop the right_bound queries that straddle the previous kv-tile (else
-        # their dQ + this tile's dK/dV lose those contributions).  right_bound==0
-        # → byte-identical to the plain-causal skip.
-        _q_lo_abs = ((kv_base - causal_diag) if cutlass.const_expr(causal_bottom_right) else kv_base) - right_bound
-        _q_lo_t = _q_lo_abs // cutlass.Int32(tile_q)
-        q_lo_tile = cutlass.Int32(arith.maxsi(_q_lo_t.ir_value(), cutlass.Int32(0).ir_value()))
-    else:
-        q_lo_tile = cutlass.Int32(0)
-    n_iters = cutlass.Int32(arith.maxsi((n_q_tiles_eff - q_lo_tile).ir_value(), cutlass.Int32(0).ir_value()))
-    # ---- SWA compute-skip (upper bound): the window keeps kv >= anchor(q) - W
-    #      (anchor = q, or q + causal_diag under bottom-right; see _mask_p), so
-    #      no q >= kv_base + tile_kv + W - diag attends this kv-tile.  Cap the
-    #      q-loop there (the forward trims kv_left the same way).  Fully-masked
-    #      tiles run 0 iters and the epilogue stores dK = dV = 0.
-    if cutlass.const_expr(mask_flags & MASK_SWA):
-        _q_hi_abs = kv_base + cutlass.Int32(tile_kv + swa_window)
-        if cutlass.const_expr(causal_bottom_right):
-            _q_hi_abs = _q_hi_abs - causal_diag
-        _q_hi_abs = cutlass.Int32(arith.maxsi(_q_hi_abs.ir_value(), cutlass.Int32(0).ir_value()))
-        _q_hi_t = (_q_hi_abs + cutlass.Int32(tile_q - 1)) // cutlass.Int32(tile_q)
-        _q_hi_t = cutlass.Int32(arith.minsi(_q_hi_t.ir_value(), n_q_tiles_eff.ir_value()))
-        n_iters = cutlass.Int32(arith.maxsi((_q_hi_t - q_lo_tile).ir_value(), cutlass.Int32(0).ir_value()))
+    # ---- Q-loop bounds (shared tile_dsl arithmetic, the KV-major dual of the
+    #      forward's compute_kv_loop_bounds): causal trims the q-loop from below
+    #      (q above the diagonal never attends this kv-tile; ~2x on causal
+    #      bprop), the sliding window trims it from above (the forward trims
+    #      kv_left the same way).  The j-counter runs from 0 (q_iter = q_lo_tile
+    #      + j) so the double-buffer stage parity is relative to the loop start.
+    #      Non-causal, no window -> [0, n_q_tiles_eff) (byte-identical).  A
+    #      kv-tile past every attending q (SKV > SQ causal edge, or a window that
+    #      ends before it) runs 0 iters and the epilogue stores dK = dV = 0.
+    #      Under THD the per-sequence lengths feed the diagonal and tile count.
+    _qb = compute_q_loop_bounds(
+        kv_base,
+        seqlen_q=s_q_b if cutlass.const_expr(THD_VARLEN) else q_bound,
+        seq_kv_len=s_kv_b if cutlass.const_expr(THD_VARLEN) else eff_skv,
+        n_q_tiles=n_q_tiles_eff,
+        window_left=swa_window,
+        mask_flags=mask_flags,
+        tile_q=tile_q,
+        tile_kv=tile_kv,
+        bottom_right=bool(causal_bottom_right),
+        window_right=right_bound,
+    )
+    q_lo_tile = _qb.lo
+    n_iters = cutlass.Int32(arith.maxsi((_qb.hi - _qb.lo).ir_value(), cutlass.Int32(0).ir_value()))
     # THD over-provisioned grid: this CTA's kv-tile may start past the packed
     # sequence's KV length (n_kv_tiles = ceil(max_skv/tile_kv) covers the longest
     # sequence).  Force 0 q-iters for such tiles → no compute, and the dV/dK
@@ -945,10 +974,11 @@ def _bprop_kernel(
         # A kv-tile's turn is its rank among the q-tile's visitors.  The visitor
         # set is contiguous in kv_tile: the causal q_lo skip removes only higher
         # kv-tiles, the window q_hi cap removes only lower ones, so it starts at
-        # kv_first = max((q_row0 + diag - W) // tile_kv, 0) (the inverse of the
-        # q_hi cap; 0 without a window) and turn = kv_tile - kv_first.  Every
-        # visitor computes the same kv_first, so acquire (== turn) and release
-        # (turn + 1) agree.  Folds out when deterministic=False.
+        # the window's first kv-tile for the q-tile's first row (the forward's
+        # KV-loop lower bound, swa_kv_lo_tile; 0 without a window) and turn =
+        # kv_tile - kv_first.  Every visitor computes the same kv_first, so
+        # acquire (== turn) and release (turn + 1) agree.  Folds out when
+        # deterministic=False.
         if cutlass.const_expr(deterministic):
             sem_idx = (batch * cutlass.Int32(H) + head) * sem_q_stride + q_iter
             sem_ptr = Pointer(cutlass.make_array_view(DQ_SEM).data_ptr() + sem_idx, dtype=cutlass.Int32)
@@ -956,9 +986,7 @@ def _bprop_kernel(
                 _q_row0 = q_iter * cutlass.Int32(tile_q)
                 if cutlass.const_expr(causal_bottom_right):
                     _q_row0 = _q_row0 + causal_diag
-                _kv_first = (_q_row0 - cutlass.Int32(swa_window)) // cutlass.Int32(tile_kv)
-                _kv_first = cutlass.Int32(arith.maxsi(_kv_first.ir_value(), cutlass.Int32(0).ir_value()))
-                relay_turn = kv_tile - _kv_first
+                relay_turn = kv_tile - swa_kv_lo_tile(_q_row0, swa_window, tile_kv)
             else:
                 relay_turn = kv_tile
             if tidx == cutlass.Int32(0):
@@ -966,24 +994,25 @@ def _bprop_kernel(
             nvvm.barrier_cta_sync()
         if cutlass.const_expr(dq_smem_coalesce or has_rope):
             # COALESCED via SMEM staging (sDQ).  Stage the dq_acc C-fragment into
-            # sDQ[tile_q, d_qk] (each sg writes its d-col half).  The frag layout
-            # scatters (8 rows / warp) — cheap SMEM scatter.  Then ALL threads
-            # atomicAdd sDQ → GMEM dQ in row-major order: consecutive lanes hit
-            # consecutive dQ columns, so each warp's atomic request coalesces to
-            # 4 L2 sectors (vs 8 direct) → halves the dQ atomic L2 traffic.  Also
-            # the ONLY path that supports RoPE un-rotate (needs SMEM scratch).
+            # sDQ[tile_q, d_qk] (each sg writes its d-col half) as 8 B pairs at
+            # the bank-swizzled offsets of _sdq_off (the frag layout puts 8 rows
+            # under one warp store; unswizzled they share banks).  Then ALL
+            # threads atomicAdd sDQ → GMEM dQ in row-major order: consecutive
+            # lanes hit consecutive dQ columns, so each warp's atomic request
+            # coalesces to 4 L2 sectors (vs 8 direct) → halves the dQ atomic L2
+            # traffic.  Also the ONLY path that supports RoPE un-rotate (needs
+            # SMEM scratch).
             for mb in cutlass.range_constexpr(DQ_M_BLOCKS):
                 q_row_g = cutlass.Int32(mb * M_STRIDE) + warp_local * 16 + g_lane
                 q_row_g8 = q_row_g + 8
                 for nf in cutlass.range_constexpr(DQ_NFRAGS):
                     col = sg_d_base + cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
                     off = (mb * DQ_NFRAGS + nf) * 4
-                    r0 = q_row_g * cutlass.Int32(d_qk) + col
-                    r1 = q_row_g8 * cutlass.Int32(d_qk) + col
-                    Pointer(sDQ.subview(r0).data_ptr(), dtype=cutlass.Float32).store(dq_acc[off + 0])
-                    Pointer(sDQ.subview(r0 + cutlass.Int32(1)).data_ptr(), dtype=cutlass.Float32).store(dq_acc[off + 1])
-                    Pointer(sDQ.subview(r1).data_ptr(), dtype=cutlass.Float32).store(dq_acc[off + 2])
-                    Pointer(sDQ.subview(r1 + cutlass.Int32(1)).data_ptr(), dtype=cutlass.Float32).store(dq_acc[off + 3])
+                    # (col, col+1) is one 8 B pair -> a single st.shared.v2.f32.
+                    v_top = cutlass.Vector.from_elements((dq_acc[off + 0], dq_acc[off + 1]), cutlass.Float32)
+                    v_bot = cutlass.Vector.from_elements((dq_acc[off + 2], dq_acc[off + 3]), cutlass.Float32)
+                    Pointer(sDQ.subview(_sdq_off(q_row_g, col, d_qk)).data_ptr(), dtype=cutlass.Float32).store(v_top, alignment=8)
+                    Pointer(sDQ.subview(_sdq_off(q_row_g8, col, d_qk)).data_ptr(), dtype=cutlass.Float32).store(v_bot, alignment=8)
 
             nvvm.barrier_cta_sync()  # sDQ fully staged (both sg)
 
@@ -998,22 +1027,25 @@ def _bprop_kernel(
                     _cs = (q_base + qrow).to(cutlass.Int64) * cutlass.Int64(_d2 * 2) + i.to(cutlass.Int64) * cutlass.Int64(2)
                     c = rope_cs_ptr[_cs]
                     s = rope_cs_ptr[_cs + cutlass.Int64(1)]
-                    lo_off = qrow * cutlass.Int32(d_qk) + i
-                    hi_off = lo_off + cutlass.Int32(_d2)
+                    lo_off = _sdq_off(qrow, i, d_qk)
+                    hi_off = _sdq_off(qrow, i + cutlass.Int32(_d2), d_qk)
                     lo = sDQ[lo_off]
                     hi = sDQ[hi_off]
                     sDQ[lo_off] = lo * c + hi * s  # un-rotate: sin sign flipped
                     sDQ[hi_off] = hi * c - lo * s
                 nvvm.barrier_cta_sync()
 
-            # Coalesced atomicAdd: thread t owns elements {t, t+threads, …}; a
-            # warp's 32 lanes span 32 consecutive dQ cols → one coalesced request.
+            # Coalesced atomicAdd: thread t owns elements {t, t+threads, ...}; a
+            # warp's 32 lanes span 32 consecutive dQ cols -> one 4-sector request.
+            # (Keep the lanes column-consecutive: a v4 read-back with 4 atomics
+            # per thread strides the lanes 4 apart -> 16 sectors/request and the
+            # atomics run ~2x slower overall.)
             for s in cutlass.range_constexpr((tile_q * d_qk) // threads):
                 e = cutlass.Int32(s * threads) + tidx
                 row = e // cutlass.Int32(d_qk)
                 col = e % cutlass.Int32(d_qk)
                 gaddr = ((q_row_origin + q_base + row) * cutlass.Int32(H) + head) * cutlass.Int32(d_qk) + col
-                val = Pointer(sDQ.subview(e).data_ptr(), dtype=cutlass.Float32).load()
+                val = Pointer(sDQ.subview(_sdq_off(row, col, d_qk)).data_ptr(), dtype=cutlass.Float32).load()
                 # Partial last q-tile / short THD seq: skip rows q >= S_q (OOB).
                 if cutlass.const_expr(GATE_Q):
                     if (q_base + row) < q_bound:
@@ -1053,7 +1085,12 @@ def _bprop_kernel(
                 cute.arch.atomic_exch(sem_ptr, relay_turn + cutlass.Int32(1), sem="release", scope="gpu")
 
         # ---- B3: before next Q-iter overwrites the ring stage ---------------
-        nvvm.barrier_cta_sync()
+        # Direct-atomic path only.  On the staged path B2b already follows every
+        # warp's last ring-stage read (the dQ MMA precedes the staging), and the
+        # next iteration's B0 follows every warp's last sDQ read, so the next
+        # prefetch and the next staging are both ordered without a third barrier.
+        if cutlass.const_expr(not (dq_smem_coalesce or has_rope)):
+            nvvm.barrier_cta_sync()
 
         # 1-stage: reload the NEXT tile into the single slot now that every warp
         # has finished reading stage_cur (B3 barrier above).  2-stage already
@@ -1170,6 +1207,27 @@ def _bprop_kernel(
 
 
 _bprop_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def _sdq_off(row, col, d_qk: cutlass.Constexpr[int]):
+    """Element offset of (row, col) in the fp32 ``sDQ`` staging tile.
+
+    The dQ C-fragment store is 8 rows x 4 column-pairs (one 8 B ``v2`` store
+    each) per warp instruction.  With a row stride of d_qk fp32 -- a multiple
+    of 32 words -- every row lands in the same banks: 8-way conflict, ~2k SMEM
+    cycles per Q-iter against ~2.5k cycles of MMA.  XOR bits 3-4 of the column
+    with ``row & 3`` so each half-warp's 16 pairs cover all 32 banks (a 64-bit
+    access is serviced per half-warp).  The row-major read-back (32 consecutive
+    columns per warp) becomes a permutation of one 32-word block, so it stays
+    conflict-free too.  Requires d_qk % 32 == 0 (the XOR never leaves the
+    aligned 32-column block); other head dims keep the plain layout.
+    """
+    if cutlass.const_expr(d_qk % 32 == 0):
+        swz = (row & cutlass.Int32(3)) << 3
+        return row * cutlass.Int32(d_qk) + (col ^ swz)
+    else:
+        return row * cutlass.Int32(d_qk) + col
 
 
 @cute.jit
@@ -1420,6 +1478,7 @@ def _bprop_host(
     thd_varlen: cutlass.Constexpr[bool],
     deterministic: cutlass.Constexpr[bool],
     sched_policy: cutlass.Constexpr[int],
+    sched_l2_bytes: cutlass.Constexpr[int],
     n_q_tiles: cutlass.Int32,
     softmax_scale_log2: cutlass.Float32,
     attn_scale: cutlass.Float32,
@@ -1440,7 +1499,7 @@ def _bprop_host(
     # 3-D grid only (SCHED_DEFAULT); LPT+THD is a future scheduler tweak.
     if cutlass.const_expr(thd_varlen):
         grid = (grid_kv_tiles, H, grid_batch)
-    elif cutlass.const_expr(sched_policy == SCHED_LPT):
+    elif cutlass.const_expr(sched_policy == SCHED_LPT or sched_policy == SCHED_LPT_L2):
         n_kv_tiles = (SKV + tile_kv - 1) // tile_kv
         grid = (n_kv_tiles * H * B, 1, 1)
     else:
@@ -1483,6 +1542,7 @@ def _bprop_host(
         thd_varlen,
         deterministic,
         sched_policy,
+        sched_l2_bytes,
         n_q_tiles,
         softmax_scale_log2,
         attn_scale,
@@ -1754,6 +1814,7 @@ def compile(  # noqa: A001 — the template contract's entry point
         bool(p.thd_varlen),
         bool(p.deterministic),
         int(p.sched_policy),
+        int(p.sched_l2_mib) * 1024 * 1024,
         cutlass.Int32(0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),

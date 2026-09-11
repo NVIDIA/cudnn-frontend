@@ -1,0 +1,298 @@
+navigation:
+  - page: Overview
+    path: ../../index.mdx
+    slug: overview
+  - page: Quick Start
+    path: ../../quickstart.mdx
+    slug: quickstart
+  - page: Samples
+    path: ../../samples.mdx
+    slug: samples
+  - link: Release Notes
+    href: https://github.com/NVIDIA/cudnn-frontend/releases
+  - section: Installation
+    slug: installation
+    contents:
+      - section: Installing cuDNN Backend
+        path: ../../installation/backend.mdx
+        slug: backend
+        contents:
+          - page: Prerequisites
+            path: ../../installation/prerequisites.mdx
+            slug: prerequisites
+          - page: Installing cuDNN Backend on Linux
+            path: ../../installation/linux.mdx
+            slug: linux
+          - page: Installing cuDNN Backend on Windows
+            path: ../../installation/windows.mdx
+            slug: windows
+      - section: Installing cuDNN Frontend
+        path: ../../installation/frontend.mdx
+        slug: frontend
+        contents:
+          - page: cuDNN Frontend Dependencies
+            path: ../../installation/frontend-dependencies.mdx
+            slug: frontend-dependencies
+          - page: Installing the cuDNN Python Frontend
+            path: ../../installation/python-frontend-install.mdx
+            slug: python-frontend-install
+          - page: Installing the cuDNN C++ Frontend
+            path: ../../installation/cpp-frontend-install.mdx
+            slug: cpp-frontend-install
+          - page: Next Steps
+            path: ../../installation/frontend-next-steps.mdx
+            slug: frontend-next-steps
+      - page: Building and Running a cuDNN Dependent Program
+        path: ../../installation/build-run-cudnn.mdx
+        slug: build-run-cudnn
+      - page: Cross-Compiling cuDNN Samples
+        path: ../../installation/cross-compiling.mdx
+        slug: cross-compiling
+  - section: Developer Guide
+    slug: developer
+    contents:
+      - page: Overview
+        path: ../../developer/overview.mdx
+        slug: overview
+      - page: Core Concepts
+        path: ../../developer/core-concepts.mdx
+        slug: core-concepts
+      - page: Graphs
+        path: ../../developer/graph-api.mdx
+        slug: graph-api
+      - page: Hardware Forward Compatibility
+        path: ../../developer/forward-compatibility.mdx
+        slug: forward-compatibility
+      - page: Odds and Ends
+        path: ../../developer/misc.mdx
+        slug: misc
+      - page: Debugging
+        path: ../../developer/debugging.mdx
+        slug: debugging
+  - section: Frontend API
+    skip-slug: true
+    contents:
+      - section: Operations
+        slug: operations
+        contents:
+          - page: Attention
+            path: ../../operations/Attention.md
+            slug: Attention
+          - page: Block Scaling
+            path: ../../operations/BlockScaling.md
+            slug: BlockScaling
+          - page: Causal Conv1d
+            path: ../../operations/CausalConv1d.md
+            slug: CausalConv1d
+          - page: Concatenate
+            path: ../../operations/Concatenate.md
+            slug: Concatenate
+          - page: Convolutions
+            path: ../../operations/Convolutions.md
+            slug: Convolutions
+          - page: FFT Causal Conv1d
+            path: ../../operations/FFTCausalConv1d.md
+            slug: FFTCausalConv1d
+          - page: Matmul
+            path: ../../operations/Matmul.md
+            slug: Matmul
+          - page: MoE Grouped Matmul
+            path: ../../operations/MoeGroupedMatmul.md
+            slug: MoeGroupedMatmul
+          - page: Normalizations
+            path: ../../operations/Normalizations.md
+            slug: Normalizations
+          - page: Pointwise and Reduction
+            path: ../../operations/Pointwise.md
+            slug: Pointwise
+          - page: Resampling
+            path: ../../operations/Resampling.md
+            slug: Resampling
+          - page: Reshape
+            path: ../../operations/Reshape.md
+            slug: Reshape
+          - page: RoPE (Rotary Position Embedding)
+            path: ../../operations/RoPE.md
+            slug: RoPE
+          - page: Slice
+            path: ../../operations/Slice.md
+            slug: Slice
+          - page: Transpose
+            path: ../../operations/Transpose.md
+            slug: Transpose
+          - section: GNN
+            slug: gnn
+            contents:
+              - page: GNN simple aggregation
+                path: ../../operations/gnn/agg_simple.md
+                slug: agg_simple
+      - section: Utilities
+        slug: utilities
+        contents:
+          - page: Compile-time constant tensors
+            path: ../../utilities/CompileTimeConstants.md
+            slug: CompileTimeConstants
+          - page: Adding Torch Custom Ops in cuDNN Frontend
+            path: ../../utilities/adding_torch_custom_ops.md
+            slug: adding_torch_custom_ops
+          - page: CUDA Graphs
+            path: ../../utilities/cuda-graphs.md
+            slug: cuda-graphs
+          - page: Custom Execution Plan
+            path: ../../utilities/custom-execution-plan.md
+            slug: custom-execution-plan
+          - page: Deviceless Ahead-of-time Compilation
+            path: ../../utilities/deviceless-ahead-of-time-compilation.md
+            slug: deviceless-ahead-of-time-compilation
+          - page: Dynamic Shapes and Kernel Cache
+            path: ../../utilities/dynamic-kernel-cache.md
+            slug: dynamic-kernel-cache
+          - page: 'Framework integration performance: getting the best per-call performance from cuDNN Frontend'
+            path: ../../utilities/framework_integration_performance.md
+            slug: framework_integration_performance
+          - page: First-class `cudnn.Handle` — design
+            path: ../../utilities/handle_first_class_design.md
+            slug: handle_first_class_design
+          - page: Python-native `cudnn.pygraph` and pluggable execution backends
+            path: ../../utilities/python_graph_and_execution_backends.md
+            slug: python_graph_and_execution_backends
+      - section: Frontend OSS APIs
+        slug: fe-oss-apis
+        contents:
+          - page: FE-OSS APIs Overview
+            path: ../../fe-oss-apis/overview.md
+            slug: overview
+          - page: Block Sparse Attention (BSA)
+            path: ../../fe-oss-apis/bsa.md
+            slug: bsa
+          - page: Causal Conv1d
+            path: ../../fe-oss-apis/causal_conv1d.md
+            slug: causal_conv1d
+          - page: Causal Conv1d Decode Update
+            path: ../../fe-oss-apis/causal_conv1d_update.md
+            slug: causal_conv1d_update
+          - page: CSA Fused Compressor
+            path: ../../fe-oss-apis/csa.md
+            slug: csa
+          - page: DeepSeek Sparse Attention (DSA)
+            path: ../../fe-oss-apis/dsa.md
+            slug: dsa
+          - page: FLA Integration Shims
+            path: ../../fe-oss-apis/fla.md
+            slug: fla
+          - page: Native Sparse Attention (NSA)
+            path: ../../fe-oss-apis/nsa.md
+            slug: nsa
+          - page: RMSNorm + RHT + Amax (SM100)
+            path: ../../fe-oss-apis/rmsnorm_rht_amax.md
+            slug: rmsnorm_rht_amax
+          - page: Fused RMSNorm + SiLU
+            path: ../../fe-oss-apis/rmsnorm_silu.md
+            slug: rmsnorm_silu
+          - section: Attention (FE-OSS)
+            slug: attention
+            contents:
+              - page: Flex Attention
+                path: ../../fe-oss-apis/attention/flex_attention.md
+                slug: flex_attention
+              - page: Flex Attention Mask Plan Design
+                path: ../../fe-oss-apis/attention/flex_attention_design.md
+                slug: flex_attention_design
+              - page: NVFP4 Attention QAT Backward
+                path: ../../fe-oss-apis/attention/nvfp4_attention_qat_backward.md
+                slug: nvfp4_attention_qat_backward
+              - page: SDPA Backward (SM120)
+                path: ../../fe-oss-apis/attention/sdpa_bwd_sm120.md
+                slug: sdpa_bwd_sm120
+          - section: GEMM Fusions
+            slug: gemm_fusions
+            contents:
+              - page: Discrete Grouped GEMM + dSwiGLU (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/discrete_grouped_gemm_dswiglu.md
+                slug: discrete_grouped_gemm_dswiglu
+              - page: Discrete Grouped GEMM + SwiGLU (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/discrete_grouped_gemm_swiglu.md
+                slug: discrete_grouped_gemm_swiglu
+              - page: GEMM + Amax (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/gemm_amax.md
+                slug: gemm_amax
+              - page: GEMM + dsReLU (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/gemm_dsrelu.md
+                slug: gemm_dsrelu
+              - page: GEMM + RoPE + MXFP8 Projection (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/gemm_proj_rope_mxfp8.md
+                slug: gemm_proj_rope_mxfp8
+              - page: GEMM + sReLU (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/gemm_srelu.md
+                slug: gemm_srelu
+              - page: GEMM + SwiGLU (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/gemm_swiglu.md
+                slug: gemm_swiglu
+              - page: Grouped GEMM (SM100 BF16)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm.md
+                slug: grouped_gemm
+              - page: Grouped GEMM + dGLU (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md
+                slug: grouped_gemm_dglu
+              - page: Grouped GEMM + dsReLU (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_dsrelu.md
+                slug: grouped_gemm_dsrelu
+              - page: Grouped GEMM + dSwiGLU (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_dswiglu.md
+                slug: grouped_gemm_dswiglu
+              - page: Grouped GEMM + GLU (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_glu.md
+                slug: grouped_gemm_glu
+              - page: Grouped GEMM + GLU + Hadamard (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_glu_hadamard.md
+                slug: grouped_gemm_glu_hadamard
+              - page: Grouped GEMM + GLU + Hadamard + Quant (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_glu_hadamard_quant.md
+                slug: grouped_gemm_glu_hadamard_quant
+              - page: Grouped GEMM + Quant (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_quant.md
+                slug: grouped_gemm_quant
+              - page: Grouped GEMM + Quant -- Unified (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_quant_unified.md
+                slug: grouped_gemm_quant_unified
+              - page: Grouped GEMM + sReLU (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_srelu.md
+                slug: grouped_gemm_srelu
+              - page: Grouped GEMM + SwiGLU (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_swiglu.md
+                slug: grouped_gemm_swiglu
+              - page: Grouped GEMM + WGrad (Unified)
+                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_wgrad.md
+                slug: grouped_gemm_wgrad
+          - section: HSTU
+            slug: hstu
+            contents:
+              - page: HSTU Attention (Blackwell SM100/SM103)
+                path: ../../fe-oss-apis/hstu/hstu_attention.md
+                slug: hstu_attention
+              - page: HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)
+                path: ../../fe-oss-apis/hstu/hstu_lmsd.md
+                slug: hstu_lmsd
+  - section: Reference
+    slug: reference
+    contents:
+      - page: Supported Products
+        path: ../../reference/support-matrix.mdx
+        slug: support-matrix
+      - page: FAQs
+        path: ../../reference/faq.mdx
+        slug: faq
+      - page: Support
+        path: ../../reference/support.mdx
+        slug: support
+      - page: Software License Agreement
+        path: ../../reference/eula.mdx
+        slug: eula
+      - page: Acknowledgements
+        path: ../../reference/acknowledgements.mdx
+        slug: acknowledgements
+      - page: Notices
+        path: ../../reference/notices.mdx
+        slug: notices
+  - link: cuDNN Backend
+    href: https://docs.nvidia.com/deeplearning/cudnn/backend/latest/index.html

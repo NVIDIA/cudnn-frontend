@@ -246,6 +246,21 @@ def opaque_f32_zero():
 
 
 @cutlass.cute.jit
+def opaque_i32_zero():
+    """A packed-zero b32 word the optimizer cannot prove constant.
+
+    Same libNVVM immediate-constraint hazard as :func:`opaque_f32_zero`, for
+    the packed 16x2 operands (:func:`sub_f16x2` / :func:`mul_f16x2`)."""
+    return inline_ptx("mov.b32 $0, 0;", write_only_types=[cutlass.Int32])
+
+
+@cutlass.cute.jit
+def opaque_i32(value: cutlass.Int32) -> cutlass.Int32:
+    """Identity mov.b32 that pins a per-lane loop invariant in its register."""
+    return inline_ptx("mov.b32 $0, $1;", write_only_types=[cutlass.Int32], read_only_args=[value])
+
+
+@cutlass.cute.jit
 def fmul2(a_lo, a_hi, b_lo, b_hi):
     """Packed fp32 multiply (SM100 FMUL2): ``(a_lo * b_lo, a_hi * b_hi)``.
 

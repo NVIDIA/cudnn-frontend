@@ -230,7 +230,7 @@ Returns `TupleDict`: `d_tensor`, `d_col_tensor` (optional; `None` for `bfloat16`
 | Format | ab_dtype | sf_dtype | sf_vec_size | d_dtype |
 |--------|----------|----------|-------------|---------|
 | **MXFP8** | `float8_e4m3fn` or `float8_e5m2` | `float8_e8m0fnu` | 32 | `{float16, bfloat16, float8_e4m3fn, float8_e5m2, float4_e2m1fn_x2}` |
-| **NVF4** | `float4_e2m1fn_x2` or `uint8` | {`float8_e4m3fn`, `float8_e8m0fnu`} | {16, 32} | `{float16, bfloat16, float32}` |
+| **NVF4** | `float4_e2m1fn_x2` or `uint8` | \{`float8_e4m3fn`, `float8_e8m0fnu`\} | \{16, 32\} | `{float16, bfloat16, float32}` |
 
 ### Key Constraints
 

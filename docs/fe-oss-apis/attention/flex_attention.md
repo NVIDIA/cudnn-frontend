@@ -228,4 +228,33 @@ as validation errors.
 ## Benchmark
 
 The Flex-only static-mask benchmark and its protocol are documented in
-[`benchmark/flex_attention/README.md`](../../../benchmark/flex_attention/README.md).
+[`benchmark/flex_attention/README.md`](https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/flex_attention/README.md).
+
+### Reference results from the original implementation
+
+The following figures are carried over from the original FlexAttention
+repository (`docs/assets/static_mask_benchmark*.png`, source checkout revision
+`9c6cbf7`). They report measurements on NVIDIA GB300 with BF16 inputs,
+`B=1`, `S=128K`, and `Hq=Hkv=4`, for the eight static mask patterns shown above.
+The panels report forward and backward active TFLOP/s, counting only visible
+query/key pairs. The head dimensions are indicated in each figure.
+
+The figures retain their original comparison labels: PyTorch FlexAttention,
+FA4 (native causal / mask_mod), Magi backend, and FlexAttention (ours).
+Here, "ours" refers to the original implementation migrated into
+`cudnn.flex_attention`. These are pre-migration reference results; the migrated
+cuDNN Frontend wrappers have not been remeasured for these figures. The benchmark
+linked above measures the current Flex Attention implementation only.
+
+![Static-mask attention performance on NVIDIA GB300, Dqk=Dv=128](assets/static_mask_benchmark.png)
+
+![Static-mask attention performance on NVIDIA GB300, Dqk=192 and Dv=128](assets/static_mask_benchmark_d192.png)
+
+![Static-mask attention performance on NVIDIA GB300, Dqk=Dv=256](assets/static_mask_benchmark_d256.png)
+
+## Design documentation
+
+[Flex Attention Mask Plan Design](flex_attention_design.md) describes interval
+coordinates, planner stages, partial/full CSR topology, consumer-specific
+packed predicates, forward/backward consumption, and plan compatibility and
+ownership.

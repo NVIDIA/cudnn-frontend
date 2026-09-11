@@ -332,3 +332,37 @@ def st_global_v4(addr, values, dtype):
         f"st.global.v4.{ptx_type_suffix(dtype)} [$0], {{$1, $2, $3, $4}};",
         read_only_args=[addr, values[0], values[1], values[2], values[3]],
     )
+
+
+def ld_shared_v2(addr, dtype):
+    """64-bit shared load: two 32-bit registers of ``dtype`` from ``addr``."""
+    return nvvm.inline_ptx(
+        f"ld.shared.v2.{ptx_type_suffix(dtype)} {{$0, $1}}, [$2];",
+        write_only_types=[dtype] * 2,
+        read_only_args=[addr],
+    )
+
+
+def ld_shared_v4(addr, dtype):
+    """128-bit shared load: four 32-bit registers of ``dtype`` from ``addr``."""
+    return nvvm.inline_ptx(
+        f"ld.shared.v4.{ptx_type_suffix(dtype)} {{$0, $1, $2, $3}}, [$4];",
+        write_only_types=[dtype] * 4,
+        read_only_args=[addr],
+    )
+
+
+def st_shared_v2(addr, values, dtype):
+    """64-bit shared store: two 32-bit registers of ``dtype`` to ``addr``."""
+    nvvm.inline_ptx(
+        f"st.shared.v2.{ptx_type_suffix(dtype)} [$0], {{$1, $2}};",
+        read_only_args=[addr, values[0], values[1]],
+    )
+
+
+def st_shared_v4(addr, values, dtype):
+    """128-bit shared store: four 32-bit registers of ``dtype`` to ``addr``."""
+    nvvm.inline_ptx(
+        f"st.shared.v4.{ptx_type_suffix(dtype)} [$0], {{$1, $2, $3, $4}};",
+        read_only_args=[addr, values[0], values[1], values[2], values[3]],
+    )

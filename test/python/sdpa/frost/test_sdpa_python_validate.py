@@ -18,6 +18,7 @@ import pytest
 
 import cudnn
 from cudnn.engines import manifest
+from frost_test_utils import requires_sm80
 
 pytestmark = pytest.mark.L0
 
@@ -66,6 +67,7 @@ def test_valid_graph_does_not_lower(frost_candidate):
     assert g._lowered_graph is None, "validate() must not lower to C++ when a python engine is a candidate"
 
 
+@requires_sm80
 def test_classic_path_still_lowers(no_candidates):
     """No python candidate: validate() keeps the classic eager C++ lowering."""
     g, _ = _sdpa_graph(use_causal_mask=True)
@@ -73,6 +75,7 @@ def test_classic_path_still_lowers(no_candidates):
     assert g._lowered_graph is not None, "without python candidates the classic eager lowering must be unchanged"
 
 
+@requires_sm80
 def test_mixed_graph_still_lowers(frost_candidate):
     """A node outside COVERED_NODE_TYPES (pointwise on O) forces the classic eager
     lowering even with a python candidate: the routing rule is every-node-covered."""

@@ -51,7 +51,7 @@ PIPELINE_ARCH_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
 # SM ranges whose block-scale MMA issues a 64-byte K per instruction (half the
 # instruction count of sm100's 32). SILICON, not a pipeline -- an sm100-pipeline
 # kernel on a 10.7 part gets it, exactly like the B collector and the 576-column
-# TMEM. Read by preferred_mma_tile_k_bytes and validate_block_scale_config.
+# TMEM. Read by preferred_mma_tile_k_bytes and validate_block_scale_config_sm100.
 MMA_INST_K64_ARCH_RANGES: tuple[tuple[int, int], ...] = ((107, 110),)
 
 # Pointwise ops a mainloop-fusion template can transform in SMEM.
@@ -150,6 +150,10 @@ _BLOCK_SCALE_CASES = frozenset(
         _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
         _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
         _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+        _bs_key("fp4_e2m1", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
+        _bs_key("fp4_e2m1", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+        _bs_key("fp8_e4m3", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
+        _bs_key("fp8_e5m2", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
     }
 )
 
@@ -203,6 +207,16 @@ MMA_TYPE_SUPPORT: dict[str, dict[GraphType, frozenset]] = {
     },
     "sm120": {
         GraphType.MATMUL: _MATMUL_CASES,
+        GraphType.BLOCK_SCALE_MATMUL: frozenset(
+            {
+                _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 16),
+                _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
+                _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
+                _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+                _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
+                _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+            }
+        ),
     },
 }
 
@@ -219,6 +233,12 @@ MMA_GPU_ARCH_SPECIAL_CASES: dict[tuple[str, tuple], tuple[tuple[int, int], ...]]
     ("sm103", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 16)): ((107, 110),),
     ("sm103", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 32)): ((107, 110),),
     ("sm103", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32)): ((107, 110),),
+    ("sm120", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 16)): ((120, 130),),
+    ("sm120", _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32)): ((120, 130),),
+    ("sm120", _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32)): ((120, 130),),
 }
 
 
@@ -242,6 +262,19 @@ def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline
             mm = chain.matmul
             return f"the {template_pipeline} {graph_type.value} pipeline does not support " f"input/acc dtype combo {mm.a_dtype}x{mm.b_dtype}->{mm.accum_dtype}"
         return f"the {template_pipeline} {graph_type.value} pipeline does not support " f"this configuration: mma type {key}"
+    # One-sided block-scale graphs are normalized to an ordinary two-sided MMA
+    # type, with the raw FP8 operand carrying a fake-dequant marker.  Keep that
+    # marker out of the generic MMA-type key: it is a renderer capability, not a
+    # new instruction combination.  The sm120 renderer does not yet synthesize
+    # the identity scale-factor operand, however, and unconditionally indexes
+    # both TMA descriptor lists.  Reject it here before rendering/compilation.
+    if (
+        template_pipeline == "sm120"
+        and base_type is GraphType.BLOCK_SCALE_MATMUL
+        and chain.block_scale is not None
+        and (chain.block_scale.fake_dequant_a or chain.block_scale.fake_dequant_b)
+    ):
+        return "the sm120 block_scale_matmul pipeline does not support one-sided " "dequantization: fake scale-factor identity handling is not implemented"
     special = MMA_GPU_ARCH_SPECIAL_CASES.get((template_pipeline, key))
     if special is not None:
         arch = C._current_arch()
@@ -332,7 +365,7 @@ class KernelTemplate:
 
                 bs = chain.block_scale
                 assert bs is not None
-                data_elem_bits = 4 if bs.is_fp4 else 8
+                data_elem_bits = max(C.DTYPE_BITS[bs.a_dtype], C.DTYPE_BITS[bs.b_dtype])
                 cta_k_elems = config.cta_tile_k_bytes * 8 // data_elem_bits
                 validate_block_scale_config(config, bs.block_size, cta_k_elems)
             else:
@@ -421,7 +454,8 @@ class Sm120KernelTemplate(KernelTemplate):
     8-bit ones — sub-byte dtypes have no transposed load and must be K-major),
     and an N-major output stores whole (n, n+1) accumulator pairs (an M-major
     output scatters per element, so its chunk may narrow freely). Non-fp4
-    output only."""
+    output only. Fronts both sm120 templates (dense and block-scale): a packed
+    fp4 operand is 4-bit, so the MN-major gate keeps it K-major."""
 
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         from .dtypes import DTYPE_BITS, DTYPE_BYTES
@@ -517,6 +551,12 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
     ),
     _mm(
         "sm120_matmul.py",
+        supports_multi_gemm=False,
+        template_cls=Sm120KernelTemplate,
+    ),
+    _mm(
+        "sm120_block_scale_matmul.py",
+        graph_type=GraphType.BLOCK_SCALE_MATMUL,
         supports_multi_gemm=False,
         template_cls=Sm120KernelTemplate,
     ),

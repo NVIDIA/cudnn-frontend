@@ -1,0 +1,101 @@
+name: Publish docs
+
+# Publishes the Fern docs site with `fern generate --docs`.
+#
+#   develop -> staging instance   (every docs change)
+#   main    -> production instance
+#
+# Never runs on pull_request: PRs from forks cannot read repository secrets,
+# so a PR-triggered publish would authenticate as nobody and quietly ship an
+# unthemed site.
+#
+# docs.yml declares two instances, and `fern generate` hard-fails when more
+# than one is configured unless --instance names one of them. The value must
+# match an instance `url` exactly, path included.
+on:
+  push:
+    branches:
+      - develop
+      - main
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs-fern-publish.yml"
+  workflow_dispatch:
+    inputs:
+      instance:
+        description: Which instance to publish to
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+
+permissions:
+  contents: read
+
+# Serialize per instance; never let staging and production publishes interleave.
+concurrency:
+  group: docs-publish-${{ github.event.inputs.instance || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  PROD_INSTANCE: nvidia-cudnn.docs.buildwithfern.com/deeplearning/cudnn
+  STAGING_INSTANCE: nvidia-cudnn-staging.docs.buildwithfern.com/deeplearning/cudnn
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Fern CLI
+        run: npm install -g fern-api
+
+      - name: Check for FERN_TOKEN
+        id: gate
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        run: |
+          if [ -z "$FERN_TOKEN" ]; then
+            echo "::warning title=Docs not published::FERN_TOKEN is not set; skipping publish."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Select instance
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            case "${{ github.event.inputs.instance }}" in
+              production) URL="$PROD_INSTANCE" ;;
+              *)          URL="$STAGING_INSTANCE" ;;
+            esac
+          elif [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            URL="$PROD_INSTANCE"
+          else
+            URL="$STAGING_INSTANCE"
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Publishing to $URL"
+
+      # FERN_TOKEN also gates the `nvidia` global theme: without it the CLI
+      # prints one warning and then builds with no logo, favicon or colors.
+      # Fail here rather than publish a silently unbranded site.
+      - name: Verify config and theme resolve
+        if: steps.gate.outputs.ready == 'true'
+        working-directory: docs/fern
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        run: fern check
+
+      - name: Publish
+        if: steps.gate.outputs.ready == 'true'
+        working-directory: docs/fern
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        run: fern generate --docs --instance "${{ steps.target.outputs.url }}"

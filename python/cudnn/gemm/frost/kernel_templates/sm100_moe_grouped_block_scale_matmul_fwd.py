@@ -1,7 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""sm100 MoE grouped block-scale matmul fwd (nvfp4 / mxfp4 / mxfp8).
+"""sm100 MoE grouped block-scale matmul fwd (nvfp4 / mxfp4 / mxfp8,
+including mixed MXFP8/MXFP4 on baseline SM100 K32 and Rubin K64).
+
+A one-sided-dequant graph keeps the ordinary block-scale MMA.  Its raw FP8
+side has no runtime SF/SMEM/TMA path; four epilogue warps seed the fake side's
+32-row TMEM image across the four warp partitions before MMA starts.
 
 Serves both MMA modes; ``cta_group`` is an injected tile constant.
 
@@ -51,9 +56,9 @@ from cuda.bindings import driver as _cuda
 # it to the per-CTA GMEM workspace the TMA reads.
 # @@INJECT_TILE_CONSTANTS@@
 
-# Tensormap workspace slots per CTA: the A operands, plus the output descriptor
-# when the TMA-store epilogue re-dimensions it per routed group.
-moe_desc_slots = num_a_operands * 2 + n_tma_outputs
+# Tensormap workspace slots per CTA: every A operand, each real SFA, plus the
+# output descriptors that are re-dimensioned per routed group.
+moe_desc_slots = num_a_operands + num_sfa_operands + n_tma_outputs
 _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
 
 if use_acc_overlap and any(_w != epi_n for _, _w in _epi_subtile_spans(epi_cols_per_mma_m, epi_n)):
@@ -69,6 +74,7 @@ USE_PDL = True
 EPI_SMEM_STAGES = 2
 EPI_SYNC_BAR_ID = 1
 TMEM_ALLOC_BARRIER_ID = 2
+TMEM_SCALE_ONE_BARRIER_ID = 3
 
 
 @cute.jit
@@ -82,7 +88,7 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
     if cutlass.const_expr(tile_swizzle_n > 0):
         return tile_swizzle_n
     budget = cutlass.Int64(swizzle_l2_budget_bytes)
-    row_bytes = (cutlass.Int64(ab_dtype.width) * k) // 8
+    row_bytes = (cutlass.Int64(ab_max_data_bits) * k) // 8
     cap = cutlass.max(budget // (row_bytes * cgrp_tile_mnk[1]), cutlass.Int64(1))
     w = cutlass.min(cutlass.Int64(nt_n), cap)
     rows = cutlass.Int64(group_rows)
@@ -109,6 +115,20 @@ def _b_collector_op(mi):
     if cutlass.const_expr(mi == mma_size_m - 1):
         return nvvm.Tcgen05MMACollectorOp.LASTUSE
     return nvvm.Tcgen05MMACollectorOp.USE
+
+
+@cute.jit
+def _fill_scale_one(tmem_base, num_cols):
+    """Seed one 32-row SF image in the issuing warp's TMEM partition."""
+    one = cutlass.Uint32(sf_one_word)
+    one_vec = cutlass.Vector.from_elements((one,), cutlass.Uint32)
+    for col in cutlass.range_constexpr(num_cols):
+        nvvm.tcgen05_st(
+            "32x32b",
+            nvvm.make_tmem_ptr(tmem_base + col, cutlass.Uint32),
+            one_vec,
+        )
+    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
 
 
 @cute.kernel
@@ -183,9 +203,11 @@ def _kernel(
     if warp_idx == mma_warp_id:
         for _i in cutlass.range_constexpr(num_a_operands):
             nvvm.prefetch_tensormap(tma_a_descs[_i].get_ptr())
+        for _i in cutlass.range_constexpr(num_sfa_operands):
             nvvm.prefetch_tensormap(tma_sfa_descs[_i].get_ptr())
         for _j in cutlass.range_constexpr(num_b_operands):
             nvvm.prefetch_tensormap(tma_b_descs[_j].get_ptr())
+        for _j in cutlass.range_constexpr(num_sfb_operands):
             nvvm.prefetch_tensormap(tma_sfb_descs[_j].get_ptr())
 
         # @@TMA_STORE_ONLY:BEGIN@@
@@ -276,7 +298,7 @@ def _kernel(
             space=cutlass.AddressSpace.smem,
             alignment=128,
         )
-        for _ in range(num_a_operands)
+        for _ in range(num_sfa_operands)
     ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
@@ -302,7 +324,7 @@ def _kernel(
     sB_elems = sB_packed_elems
     smem_a_list = [
         cutlass.Array(
-            ab_dtype,
+            a_smem_dtype,
             sA_elems * ab_stages,
             space=cutlass.AddressSpace.smem,
             alignment=1024,
@@ -311,7 +333,7 @@ def _kernel(
     ]
     smem_b_list = [
         cutlass.Array(
-            ab_dtype,
+            b_smem_dtype,
             sB_elems * ab_stages,
             space=cutlass.AddressSpace.smem,
             alignment=1024,
@@ -325,7 +347,7 @@ def _kernel(
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
-        for _ in range(num_a_operands)
+        for _ in range(num_sfa_operands)
     ]
     smem_sfb_list = [
         cutlass.Array(
@@ -334,7 +356,7 @@ def _kernel(
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
-        for _ in range(num_b_operands)
+        for _ in range(num_sfb_operands)
     ]
 
     if cutlass.const_expr(cta_group == 2):
@@ -408,11 +430,11 @@ def _kernel(
     else:
         nvvm.barrier_cluster_arrive_relaxed()
 
-    sA_bytes = sA_elems * (ab_dtype.width // 8)
-    sB_bytes = sB_elems * (ab_dtype.width // 8)
+    sA_bytes = sA_elems * (a_smem_dtype.width // 8)
+    sB_bytes = sB_elems * (b_smem_dtype.width // 8)
     # The pair leader issues ONE expect_tx for both CTAs, so it counts twice.
-    ab_only_copy_bytes = (num_a_operands * sA_bytes + num_b_operands * sB_bytes) * cta_group
-    sf_only_copy_bytes = (num_a_operands * sfa_smem_bytes + num_b_operands * sfb_smem_bytes) * cta_group
+    ab_only_copy_bytes = (num_a_operands * sA_tma_bytes + num_b_operands * sB_tma_bytes) * cta_group
+    sf_only_copy_bytes = (num_sfa_operands * sfa_smem_bytes + num_sfb_operands * sfb_smem_bytes) * cta_group
     if cutlass.const_expr(cta_group == 2):
         pair_n_size = cgrp_tile_mnk[1] // cluster_n
     # Per-CTA output rows one MMA-M block covers. The pair splits M, so this is
@@ -736,7 +758,7 @@ def _kernel(
             for _ai in range(num_a_operands)
         ]
         sfa_desc_base_list = [
-            a_tma_workspace.iterator.raw_ptr() + (block_linear * moe_desc_slots + num_a_operands + _ai) * TENSOR_MAP_QWORDS for _ai in range(num_a_operands)
+            a_tma_workspace.iterator.raw_ptr() + (block_linear * moe_desc_slots + num_a_operands + _ai) * TENSOR_MAP_QWORDS for _ai in range(num_sfa_operands)
         ]
         sfa_desc_tma_ptr_list = [
             cute.make_ptr(
@@ -744,20 +766,20 @@ def _kernel(
                 sfa_desc_base_list[_ai].toint(),
                 mem_space=cute.AddressSpace.generic,
             )
-            for _ai in range(num_a_operands)
+            for _ai in range(num_sfa_operands)
         ]
         sfa_block_bytes = 512 * (((k // block_size) + 3) // 4)
         previous_group_begin = cutlass.Int32(-1)
         if cutlass.const_expr(moe_aligned_offsets):
             a_desc_load_list = [tma_a_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
-            sfa_desc_load_list = [tma_sfa_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
+            sfa_desc_load_list = [tma_sfa_descs[_ai].get_ptr() for _ai in range(num_sfa_operands)]
         else:
             a_desc_load_list = a_desc_tma_ptr_list
             sfa_desc_load_list = sfa_desc_tma_ptr_list
         if elect_one and cutlass.const_expr(not moe_aligned_offsets):
             for _ai in cutlass.range_constexpr(num_a_operands):
                 _copy_tensormap_to_workspace(tma_a_descs[_ai].get_ptr(), tma_a_desc_smem_list[_ai])
-            for _ai in cutlass.range_constexpr(num_a_operands):
+            for _ai in cutlass.range_constexpr(num_sfa_operands):
                 _copy_tensormap_to_workspace(tma_sfa_descs[_ai].get_ptr(), tma_sfa_desc_smem_list[_ai])
         nvvm.bar_warp_sync(0xFFFFFFFF)
 
@@ -806,7 +828,7 @@ def _kernel(
                         _fence_tensormap_acquire(a_desc_tma_ptr_list[_ai])
                     for _ai in cutlass.range_constexpr(num_a_operands):
                         if elect_one:
-                            row_base = mA_list[_ai].iterator.raw_ptr().toint() + ((group_begin * a_stride_m_list[_ai] * ab_dtype.width) >> 3)
+                            row_base = mA_list[_ai].iterator.raw_ptr().toint() + ((group_begin * a_stride_m_list[_ai] * a_dtype.width) >> 3)
                             _replace_tensormap_global_address(tma_a_desc_smem_list[_ai], row_base)
                             _replace_tensormap_global_dim_1(tma_a_desc_smem_list[_ai], group_end - group_begin)
                         nvvm.bar_warp_sync(0xFFFFFFFF)
@@ -814,9 +836,9 @@ def _kernel(
                             (cta_desc_base_list[_ai] + lane).store((tma_a_desc_smem_list[_ai].subview(lane)).load())
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         _fence_tensormap_release()
-                    for _ai in cutlass.range_constexpr(num_a_operands):
+                    for _ai in cutlass.range_constexpr(num_sfa_operands):
                         _fence_tensormap_acquire(sfa_desc_tma_ptr_list[_ai])
-                    for _ai in cutlass.range_constexpr(num_a_operands):
+                    for _ai in cutlass.range_constexpr(num_sfa_operands):
                         if elect_one:
                             sfa_base = mSFA_list[_ai].iterator.raw_ptr().toint() + start_sf_block_m * sfa_block_bytes
                             _replace_tensormap_global_address(tma_sfa_desc_smem_list[_ai], sfa_base)
@@ -868,7 +890,7 @@ def _kernel(
                         b_data_issue = b_issue
                         _b_off = 0
                     if a_issue:
-                        for _ai in cutlass.range_constexpr(num_a_operands):
+                        for _ai in cutlass.range_constexpr(num_sfa_operands):
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     smem_sfa_list[_ai].subview(sfa_smem_bytes * stage),
@@ -880,7 +902,7 @@ def _kernel(
                                     group=_CTA_GROUP,
                                 )
                     if b_issue:
-                        for _bj in cutlass.range_constexpr(num_b_operands):
+                        for _bj in cutlass.range_constexpr(num_sfb_operands):
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     smem_sfb_list[_bj].subview(sfb_smem_bytes * stage),
@@ -896,7 +918,7 @@ def _kernel(
                         for _ai in cutlass.range_constexpr(num_a_operands):
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    smem_a_list[_ai].subview(sA_elems * stage + _a_off * ab_packed_per_row),
+                                    smem_a_list[_ai].subview(sA_elems * stage + _a_off * a_packed_per_row),
                                     a_desc_load_list[_ai],
                                     (coord_k, coord_m_desc + _a_off, cutlass.Int32(0)),
                                     ab_full_mbar_ptr.subview(stage),
@@ -926,7 +948,7 @@ def _kernel(
                             else:
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sB_stage.subview(_b_off * ab_packed_per_row),
+                                        sB_stage.subview(_b_off * b_packed_per_row),
                                         tma_b_descs[_bj].get_ptr(),
                                         (coord_k, coord_n_per_cta + _b_off, coord_expert),
                                         ab_full_mbar_ptr.subview(stage),
@@ -977,6 +999,11 @@ def _kernel(
         tmem_raw_addr = tmem_ptr_i32.load()
         base_col_id_root = tmem_raw_addr & 0xFFFF
         base_row_id = tmem_raw_addr >> 16
+        if cutlass.const_expr(fake_dequant_a or fake_dequant_b):
+            nvvm.barrier_cta_sync(
+                barrier_id=TMEM_SCALE_ONE_BARRIER_ID,
+                thread_count=tmem_alloc_bar_count,
+            )
         if cutlass.const_expr(cta_group == 1):
             ab_full_phase_bit = cutlass.Int32(0)
             ab_iter = cutlass.Int32(0)
@@ -1054,7 +1081,7 @@ def _kernel(
                     start_address=smem_a_list[i],
                     leading_byte_offset=a_smem_desc_leading_byte_offset,
                     stride_byte_offset=a_smem_desc_stride_byte_offset,
-                    layout=ab_smem_swizzle,
+                    layout=a_smem_swizzle,
                 )
                 for i in range(num_a_operands)
             ]
@@ -1063,7 +1090,7 @@ def _kernel(
                     start_address=smem_b_list[j],
                     leading_byte_offset=b_smem_desc_leading_byte_offset,
                     stride_byte_offset=b_smem_desc_stride_byte_offset,
-                    layout=ab_smem_swizzle,
+                    layout=b_smem_swizzle,
                 )
                 for j in range(num_b_operands)
             ]
@@ -1074,7 +1101,7 @@ def _kernel(
                     stride_byte_offset=128,
                     layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
                 )
-                for i in range(num_a_operands)
+                for i in range(num_sfa_operands)
             ]
             desc_sfb_roots = [
                 cutlass.experimental.primitives.Tcgen05SmemDesc.build(
@@ -1083,7 +1110,7 @@ def _kernel(
                     stride_byte_offset=128,
                     layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
                 )
-                for j in range(num_b_operands)
+                for j in range(num_sfb_operands)
             ]
             while is_valid != 0:
                 while not nvvm.mbarrier_try_wait_parity(
@@ -1138,8 +1165,8 @@ def _kernel(
 
                         desc_a_bases = [desc_a_roots[i].advance_start_address(sA_bytes * stage) for i in range(num_a_operands)]
                         desc_b_bases = [desc_b_roots[j].advance_start_address(sB_bytes * stage) for j in range(num_b_operands)]
-                        desc_sfa_bases = [desc_sfa_roots[i].advance_start_address(sfa_smem_bytes * stage) for i in range(num_a_operands)]
-                        desc_sfb_bases = [desc_sfb_roots[j].advance_start_address(sfb_smem_bytes * stage) for j in range(num_b_operands)]
+                        desc_sfa_bases = [desc_sfa_roots[i].advance_start_address(sfa_smem_bytes * stage) for i in range(num_sfa_operands)]
+                        desc_sfb_bases = [desc_sfb_roots[j].advance_start_address(sfb_smem_bytes * stage) for j in range(num_sfb_operands)]
 
                         # One SF word per group of MMAs, refreshed right before they
                         # read it. A word spans word_atoms consecutive K-atoms in SMEM.
@@ -1151,7 +1178,7 @@ def _kernel(
                             pass
 
                         for sf_word in cutlass.range_constexpr(num_sf_atoms):
-                            for _bj in cutlass.range_constexpr(num_b_operands):
+                            for _bj in cutlass.range_constexpr(num_sfb_operands):
                                 for block_n in cutlass.range_constexpr(num_blocks_n):
                                     for _a in cutlass.range_constexpr(word_atoms):
                                         if elect_one:
@@ -1178,7 +1205,7 @@ def _kernel(
                                     desc_a_k = desc_a_bases[_ai].advance_start_address(a_smem_k_step_bytes * mma_k)
                                     desc_b = desc_b_bases[_bj].advance_start_address(b_smem_k_step_bytes * mma_k)
                                     for mma_m in cutlass.range_constexpr(mma_size_m):
-                                        if cutlass.const_expr(mma_k_in_word == 0 and _ai not in gemm_a_idx[:gemm_i]):
+                                        if cutlass.const_expr(not fake_dequant_a and mma_k_in_word == 0 and _ai not in gemm_a_idx[:gemm_i]):
                                             for _a in cutlass.range_constexpr(word_atoms):
                                                 if elect_one:
                                                     nvvm.tcgen05_cp(
@@ -1334,7 +1361,7 @@ def _kernel(
                         start_address=smem_a_list[i],
                         leading_byte_offset=a_smem_desc_leading_byte_offset,
                         stride_byte_offset=a_smem_desc_stride_byte_offset,
-                        layout=ab_smem_swizzle,
+                        layout=a_smem_swizzle,
                     )
                     for i in range(num_a_operands)
                 ]
@@ -1343,7 +1370,7 @@ def _kernel(
                         start_address=smem_b_list[j],
                         leading_byte_offset=b_smem_desc_leading_byte_offset,
                         stride_byte_offset=b_smem_desc_stride_byte_offset,
-                        layout=ab_smem_swizzle,
+                        layout=b_smem_swizzle,
                     )
                     for j in range(num_b_operands)
                 ]
@@ -1354,7 +1381,7 @@ def _kernel(
                         stride_byte_offset=128,
                         layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
                     )
-                    for i in range(num_a_operands)
+                    for i in range(num_sfa_operands)
                 ]
                 desc_sfb_roots = [
                     cutlass.experimental.primitives.Tcgen05SmemDesc.build(
@@ -1363,7 +1390,7 @@ def _kernel(
                         stride_byte_offset=128,
                         layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
                     )
-                    for j in range(num_b_operands)
+                    for j in range(num_sfb_operands)
                 ]
                 while is_valid != 0:
                     while not nvvm.mbarrier_try_wait_parity(
@@ -1418,8 +1445,8 @@ def _kernel(
 
                             desc_a_bases = [desc_a_roots[i].advance_start_address(sA_bytes * stage) for i in range(num_a_operands)]
                             desc_b_bases = [desc_b_roots[j].advance_start_address(sB_bytes * stage) for j in range(num_b_operands)]
-                            desc_sfa_bases = [desc_sfa_roots[i].advance_start_address(sfa_smem_bytes * stage) for i in range(num_a_operands)]
-                            desc_sfb_bases = [desc_sfb_roots[j].advance_start_address(sfb_smem_bytes * stage) for j in range(num_b_operands)]
+                            desc_sfa_bases = [desc_sfa_roots[i].advance_start_address(sfa_smem_bytes * stage) for i in range(num_sfa_operands)]
+                            desc_sfb_bases = [desc_sfb_roots[j].advance_start_address(sfb_smem_bytes * stage) for j in range(num_sfb_operands)]
 
                             # One SF word per group of MMAs, refreshed right before they
                             # read it. A word spans word_atoms consecutive K-atoms in SMEM.
@@ -1431,7 +1458,7 @@ def _kernel(
                                 pass
 
                             for sf_word in cutlass.range_constexpr(num_sf_atoms):
-                                for _bj in cutlass.range_constexpr(num_b_operands):
+                                for _bj in cutlass.range_constexpr(num_sfb_operands):
                                     for block_n in cutlass.range_constexpr(num_blocks_n):
                                         for _a in cutlass.range_constexpr(word_atoms):
                                             if elect_one:
@@ -1458,7 +1485,7 @@ def _kernel(
                                         desc_a_k = desc_a_bases[_ai].advance_start_address(a_smem_k_step_bytes * mma_k)
                                         desc_b = desc_b_bases[_bj].advance_start_address(b_smem_k_step_bytes * mma_k)
                                         for mma_m in cutlass.range_constexpr(mma_size_m):
-                                            if cutlass.const_expr(mma_k_in_word == 0 and _ai not in gemm_a_idx[:gemm_i]):
+                                            if cutlass.const_expr(not fake_dequant_a and mma_k_in_word == 0 and _ai not in gemm_a_idx[:gemm_i]):
                                                 for _a in cutlass.range_constexpr(word_atoms):
                                                     if elect_one:
                                                         nvvm.tcgen05_cp(
@@ -1581,6 +1608,19 @@ def _kernel(
         base_col_id_root = tmem_raw_addr & 0xFFFF
         base_row_id = tmem_raw_addr >> 16
 
+        if cutlass.const_expr(fake_dequant_a):
+            for i in cutlass.range_constexpr(num_a_operands):
+                _fill_scale_one((base_row_id << 16) | (base_col_id_root + sfa_col_bases[i]), sfa_tmem_cols)
+        if cutlass.const_expr(fake_dequant_b):
+            for j in cutlass.range_constexpr(num_b_operands):
+                _fill_scale_one((base_row_id << 16) | (base_col_id_root + sfb_col_bases[j]), sfb_tmem_cols)
+        if cutlass.const_expr(fake_dequant_a or fake_dequant_b):
+            nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+            nvvm.barrier_cta_sync(
+                barrier_id=TMEM_SCALE_ONE_BARRIER_ID,
+                thread_count=tmem_alloc_bar_count,
+            )
+
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
 
@@ -1605,7 +1645,7 @@ def _kernel(
         tile_l = cutlass.Int32(0)
         epi_block_linear = bidx + bidy * gridx
         d_desc_base_list = [
-            a_tma_workspace.iterator.raw_ptr() + (epi_block_linear * moe_desc_slots + num_a_operands * 2 + _di) * TENSOR_MAP_QWORDS
+            a_tma_workspace.iterator.raw_ptr() + (epi_block_linear * moe_desc_slots + num_a_operands + num_sfa_operands + _di) * TENSOR_MAP_QWORDS
             for _di in range(n_tma_outputs)
         ]
         d_desc_ptr_list = [cute.make_ptr(cutlass.Int64, _b.toint(), mem_space=cute.AddressSpace.generic) for _b in d_desc_base_list]
@@ -1843,15 +1883,15 @@ def _host(
         tma_a_desc_list.append(
             _tma.create_tensor_map_tiled(
                 global_address=_a_op.iterator.toint(),
-                dtype=ab_tma_desc_dtype,
+                dtype=a_tma_desc_dtype,
                 global_dims=[k_sym, m, 1],
                 global_strides=[
-                    a_stride_m * ab_dtype.width // 128,
-                    a_stride_l * ab_dtype.width // 128,
+                    a_stride_m * a_dtype.width // 128,
+                    a_stride_l * a_dtype.width // 128,
                 ],
                 box_dims=[cta_tile_mnk[2], cta_tile_mnk[0] // a_mcast_slices, 1],
-                swizzle=ab_tma_swizzle,
-                tma_format=ab_tma_format,
+                swizzle=a_tma_swizzle,
+                tma_format=a_tma_format,
             )
         )
     tma_b_desc_list = []
@@ -1861,30 +1901,30 @@ def _host(
             tma_b_desc_list.append(
                 _tma.create_tensor_map_tiled(
                     global_address=_b_op.iterator.toint(),
-                    dtype=ab_tma_desc_dtype,
+                    dtype=b_tma_desc_dtype,
                     global_dims=[n, k_sym, num_experts],
                     global_strides=[
-                        b_stride_k * ab_dtype.width // 128,
-                        b_stride_l * ab_dtype.width // 128,
+                        b_stride_k * b_dtype.width // 128,
+                        b_stride_l * b_dtype.width // 128,
                     ],
                     box_dims=[b_tma_group_elems, cta_tile_mnk[2], 1],
-                    swizzle=ab_tma_swizzle,
-                    tma_format=ab_tma_format,
+                    swizzle=b_tma_swizzle,
+                    tma_format=b_tma_format,
                 )
             )
         else:
             tma_b_desc_list.append(
                 _tma.create_tensor_map_tiled(
                     global_address=_b_op.iterator.toint(),
-                    dtype=ab_tma_desc_dtype,
+                    dtype=b_tma_desc_dtype,
                     global_dims=[k_sym, n, num_experts],
                     global_strides=[
-                        b_stride_n * ab_dtype.width // 128,
-                        b_stride_l * ab_dtype.width // 128,
+                        b_stride_n * b_dtype.width // 128,
+                        b_stride_l * b_dtype.width // 128,
                     ],
                     box_dims=[cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1],
-                    swizzle=ab_tma_swizzle,
-                    tma_format=ab_tma_format,
+                    swizzle=b_tma_swizzle,
+                    tma_format=b_tma_format,
                 )
             )
     rest_k = ((k_sym // block_size) + 3) // 4
@@ -1969,7 +2009,8 @@ def _host(
 @lru_cache(maxsize=None)
 def compile() -> Callable:
     out_vec_elems = vec_bytes_epi // (cd_dtype.width // 8)
-    ab_stride_elems = 16 // (ab_dtype.width // 8)
+    a_stride_elems = 16 // (a_dtype.width // 8)
+    b_stride_elems = 16 // (b_dtype.width // 8)
     sym_m = cute.sym_int64()
     sym_n = cute.sym_int64(divisibility=out_vec_elems)
     # K tails are supported: the K loop is ceil_div and the TMA descriptor's global K
@@ -1977,14 +2018,15 @@ def compile() -> Callable:
     # TMA contiguous-extent one, already gated by _tma_alignment_reject.
     sym_k = cute.sym_int64()
     # Packed K extent: same reasoning as sym_k -- no CTA-tile multiple is required.
-    sym_kp = cute.sym_int64()
+    sym_akp = cute.sym_int64()
+    sym_bkp = cute.sym_int64()
     sym_e = cute.sym_int64()
     sym_g = cute.sym_int64()
 
     def _make_fake_a():
         return make_fake_compact_tensor(
             a_fake_dtype,
-            (sym_m, sym_kp, 1),
+            (sym_m, sym_akp, 1),
             stride_order=(1, 0, 2),
             assumed_align=16,
         )
@@ -1992,7 +2034,7 @@ def compile() -> Callable:
     def _make_fake_b():
         return make_fake_compact_tensor(
             b_fake_dtype,
-            (sym_n, sym_kp, sym_e),
+            (sym_n, sym_bkp, sym_e),
             stride_order=(0, 1, 2) if b_is_n_major else (1, 0, 2),
             assumed_align=16,
         )
@@ -2032,17 +2074,17 @@ def compile() -> Callable:
         assumed_align=128,
     )
 
-    def _sym_operand_strides(is_mn_major: bool) -> tuple:
+    def _sym_operand_strides(is_mn_major: bool, stride_elems: int) -> tuple:
         # Operand is permuted to (M|N, K, L): the unit stride is mode 0 when MN-major, mode 1 when K-major, and never reaches TMA.
         unit = 0 if is_mn_major else 1
-        return tuple(cute.sym_int64() if i == unit else cute.sym_int64(divisibility=ab_stride_elems) for i in range(3))
+        return tuple(cute.sym_int64() if i == unit else cute.sym_int64(divisibility=stride_elems) for i in range(3))
 
     sym_a_strides = []
     for _ in range(num_a_operands):
-        sym_a_strides.extend(_sym_operand_strides(a_is_m_major))
+        sym_a_strides.extend(_sym_operand_strides(a_is_m_major, a_stride_elems))
     sym_b_strides = []
     for _ in range(num_b_operands):
-        sym_b_strides.extend(_sym_operand_strides(b_is_n_major))
+        sym_b_strides.extend(_sym_operand_strides(b_is_n_major, b_stride_elems))
 
     # @@INJECT_COMPILE_REDUCTION_STRIDE_DECLS@@
 

@@ -943,17 +943,18 @@ def test_dsl_sm120_thd():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (248, 248)], ids=["d64", "d128", "d192x128", "d248"])
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (248, 248), (512, 512)], ids=["d64", "d128", "d192x128", "d248", "d512"])
 @torch_fork_set_rng(seed=23)
 def test_dsl_sm120_thd_nan_capacity_tail(d_qk, d_v):
     """THD with a NaN-poisoned capacity tail: O must be finite and correct.
-    (248, 248) runs the d256 kernel with zero-filled pad columns in the tail."""
+    (248, 248) runs the d256 kernel with zero-filled pad columns in the tail;
+    (512, 512) the d512 kernel (two warps per Q slab sanitize the V tail)."""
 
     _run_thd_case(seq_q_lens=[200, 150, 47], seq_kv_lens=[200, 150, 47], head_dim=d_qk, head_dim_v=d_v, is_causal=True, nan_capacity_tail=True)
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("head_dim", [128, 256], ids=["d128", "d256"])
+@pytest.mark.parametrize("head_dim", [128, 256, 512], ids=["d128", "d256", "d512"])
 @torch_fork_set_rng(seed=27)
 def test_dsl_sm120_thd_multi_unit_per_cta(head_dim: int):
     """THD with more live units than the machine has CTAs.
@@ -1024,7 +1025,7 @@ def test_dsl_sm120_thd_gqa_sink(stats_layout: str):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("head_dim", [64, 256], ids=["d64", "d256"])
+@pytest.mark.parametrize("head_dim", [64, 256, 512], ids=["d64", "d256", "d512"])
 @torch_fork_set_rng(seed=26)
 def test_dsl_sm120_thd_zero_length_sequence(head_dim: int):
     """A zero-length sequence contributes no tokens and must not perturb its
@@ -1311,6 +1312,8 @@ def test_dsl_sm120_dense_flex_bhsd_contiguous():
         (248, None),  # d256 template, zero-padded 248 -> 256
         (256, None),
         (256, 64),
+        (504, None),  # d512 template, zero-padded 504 -> 512
+        (512, None),
     ],
 )
 @torch_fork_set_rng(seed=2)
@@ -1323,10 +1326,12 @@ def test_dsl_sm120_representative_head_dimensions(head_dim: int, kv_tile: int | 
 def test_dsl_sm120_flavor_routing():
     """The adapter resolves the kernel flavor from the head dims: dims the
     general template would tile at 256 on both sides (f16: above 240) run the
-    d256 template, everything else the general one.
+    d256 template, dimensions independently in (256, 512] the d512
+    template, everything else the general one.
     Unset tile knobs resolve exactly as on the general template; explicit knobs are honored
     on both templates (a geometry that does not fit SMEM declines, as on the
-    general template)."""
+    general template). The d512 template has one CTA tile, (64, 32), and its
+    kv_tile 32 exists for no other head dim."""
 
     _require_dsl()
     from cudnn.sdpa.fwd import sdpa_fwd_wrapper_dsl_sm120
@@ -1351,12 +1356,46 @@ def test_dsl_sm120_flavor_routing():
     assert api.check_support() and (api.q_tile, api.kv_tile) == (128, 64)  # explicit knob honored, default for the rest
     with pytest.raises(NotImplementedError, match="shared memory"):
         _api(256, 256, tile_n=128).check_support()  # a 128-wide KV tile does not fit at d256 in half precision
+    for d_qk, d_v in ((264, 264), (264, 512), (512, 264), (272, 320), (384, 448), (496, 496), (512, 512), (504, 504), (512, 504)):
+        api = _api(d_qk, d_v)
+        assert api.check_support() and api.flavor == (512, 512) and (api.q_tile, api.kv_tile) == (64, 32), (d_qk, d_v)
+    api = _api(512, 512, tile_m=64, tile_n=32)
+    assert api.check_support() and (api.q_tile, api.kv_tile) == (64, 32)  # the one explicit tile the flavor takes
+    with pytest.raises(NotImplementedError, match="shared memory"):
+        _api(512, 512, tile_n=64).check_support()  # a 64-row K plus V tile is 128 KiB at d512
+    with pytest.raises(NotImplementedError, match="shared memory"):
+        _api(512, 512, tile_m=128).check_support()  # the 128 x 512 O staging tile alone is 128 KiB
+    with pytest.raises(NotImplementedError, match="no kernel"):
+        _api(128, 128, tile_n=32).check_support()  # kv_tile 32 is the d512 flavor's alone
+    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (520, 512), (512, 520)):
+        with pytest.raises(ValueError, match="both head dimensions"):
+            _api(d_qk, d_v).check_support()
     # The general template still takes the knobs.
     api = _api(128, 128, tile_m=64, tile_n=64)
     assert api.check_support() and (api.q_tile, api.kv_tile) == (64, 64)
     q = _bhsd(1, 4, 128, 256, torch.float16)
     with pytest.raises(NotImplementedError, match="shared memory"):
         sdpa_fwd_wrapper_dsl_sm120(q, q, q, q_tile=128, kv_tile=128)
+
+
+@pytest.mark.L0
+def test_dsl_sm120_d512_template_rejects_dims_and_tiles_outside_its_table():
+    """The d512 template's compile() refuses head dims the adapter would never
+    route to it, and its kernel refuses any CTA tile but (64, 32) — routing
+    bugs, not user errors, so they raise."""
+
+    _require_dsl()
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, TemplateParams
+
+    cc = torch.cuda.get_device_capability()
+    module = api_dsl._load_sm120_kernel_module(D512_FLAVOR, TemplateParams(q_tile=64, kv_tile=32))
+    for d_qk, d_v in ((256, 256), (256, 512), (512, 256), (520, 512), (512, 520)):
+        with pytest.raises(ValueError, match="head dim"):
+            module.compile(compute_capability=cc, b=1, qh=1, kh=1, sq=128, skv=128, d_qk=d_qk, d_v=d_v, has_lse=False)
+    module = api_dsl._load_sm120_kernel_module(D512_FLAVOR, TemplateParams(q_tile=64, kv_tile=64))
+    with pytest.raises(ValueError, match=r"\(q_tile, kv_tile\) must be"):
+        module.compile(compute_capability=cc, b=1, qh=1, kh=1, sq=128, skv=128, d_qk=512, d_v=512, has_lse=False)
 
 
 @pytest.mark.L0
@@ -1759,3 +1798,68 @@ def test_dsl_sm120_bfloat16_and_tile_variants():
         is_causal=True,
         scale=0.5,
     )
+
+
+# --- d512 flavor (MQA / GQA at head_dim 512) -------
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal", "causal_br", "swa128", "band_right", "padded_qtrim", "sink_swa"])
+@torch_fork_set_rng(seed=40)
+def test_dsl_sm120_d512_features(mask: str):
+    """The d512 flavor x the dense mask / sink / trim envelope, stats checked,
+    on an MQA head layout (many Q heads over one KV head)."""
+    kw: dict = dict(batch=2, h_q=8, h_kv=1, s_q=320, s_kv=320, head_dim=512, check_stats=True)
+    if mask == "causal":
+        kw.update(is_causal=True)
+    elif mask == "causal_br":
+        kw.update(is_causal=True, causal_bottom_right=True, window_size_right=0, s_q=200)
+    elif mask == "swa128":
+        kw.update(is_causal=True, window_size_left=128)
+    elif mask == "band_right":
+        kw.update(window_size_right=8)
+    elif mask == "padded_qtrim":
+        kw.update(
+            seq_q_lens=torch.tensor([37, 290], dtype=torch.int32, device="cuda"),
+            seq_kv_lens=torch.tensor([180, 300], dtype=torch.int32, device="cuda"),
+        )
+    elif mask == "sink_swa":
+        kw.update(is_causal=True, window_size_left=128, with_sink=True)
+    _run_case(**kw)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@torch_fork_set_rng(seed=41)
+def test_dsl_sm120_d512_envelope_504(dtype: torch.dtype):
+    """504 rides the d512 template with TMA zero-filled pad columns, on both
+    sides and on the V side only; the ragged S_kv tail shares the rightmost tile."""
+    _run_case(head_dim=504, head_dim_v=504, s_q=192, s_kv=200, dtype=dtype, is_causal=True, check_stats=True)
+    _run_case(head_dim=512, head_dim_v=504, s_q=128, s_kv=128, dtype=dtype)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=42)
+def test_dsl_sm120_d512_pack_gqa_mqa():
+    """PackGQA on the d512 flavor's q_tile=64: G=64 Q heads x one token per
+    tile (an MQA decode step) and G=8 x 8 tokens."""
+    _run_case(batch=2, h_q=64, h_kv=1, s_q=3, s_kv=512, head_dim=512, is_causal=True, pack_gqa=True, check_stats=True)
+    _run_case(batch=1, h_q=8, h_kv=1, s_q=40, s_kv=256, head_dim=512, is_causal=True, pack_gqa=True, check_stats=True)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=44)
+def test_dsl_sm120_d512_pack_gqa_sliding_window():
+    """Packed units under a sliding window, the graph path's choice for windowed
+    GQA / MQA on this flavor (plain-LPT walk): G=64 x one token per unit on a
+    grid of 1024 units that the persistent CTAs walk in several rounds, and G=8
+    x 8 tokens on two batches; stats checked."""
+    _run_case(
+        batch=1, h_q=64, h_kv=1, s_q=1024, s_kv=1024, head_dim=512, dtype=torch.bfloat16, is_causal=True, window_size_left=128, pack_gqa=True, check_stats=True
+    )
+    _run_case(batch=2, h_q=8, h_kv=1, s_q=320, s_kv=320, head_dim=512, is_causal=True, window_size_left=128, pack_gqa=True, check_stats=True)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=43)
+def test_dsl_sm120_d512_long_causal_bf16():
+    """A multi-wave causal grid on an MQA head layout at head_dim 512 (bf16)."""
+    _run_case(batch=1, h_q=16, h_kv=1, s_q=2048, s_kv=2048, head_dim=512, dtype=torch.bfloat16, is_causal=True, check_stats=True)

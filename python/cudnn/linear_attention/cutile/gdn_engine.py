@@ -209,6 +209,8 @@ class GdnCuTileEngine(BaseEngine):
         cutile_la_gate("GdnCuTileEngine", facts, "GDN", cudnn.data_type.FLOAT)
         if facts.is_bwd and facts.safe_gate:
             raise NotImplementedError("GdnCuTileEngine: safe_gate is forward-only")
+        if facts.gate_domain != "log":
+            raise NotImplementedError("GdnCuTileEngine: gate_domain='linear' has no cuTile path (the FROST GDN engine serves it)")
         if facts.use_beta_sigmoid:
             raise NotImplementedError("GdnCuTileEngine: use_beta_sigmoid has no cuTile path (the FROST GDN engine serves it)")
 

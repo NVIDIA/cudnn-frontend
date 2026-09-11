@@ -1,5 +1,7 @@
 # Vendored third-party sources are kept byte-for-byte as upstream ships them.
-exclude: '^include/cudnn_frontend/thirdparty/'
+# The CAKE kernel bodies are generated exports pinned by their SHA256SUMS; the
+# first-party files next to them (fe_*, __init__.py, UPSTREAM.md) stay checked.
+exclude: '^(include/cudnn_frontend/thirdparty/|python/cudnn/linear_attention/cake/kernels/(?!fe_|__init__|UPSTREAM))'
 
 repos:
 -   repo: https://github.com/pre-commit/mirrors-clang-format

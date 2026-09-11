@@ -1,0 +1,59 @@
+---
+title: "Odds and Ends"
+---
+This section includes a random set of topics and concepts.
+
+## Thread Safety
+
+The cuDNN library is thread-safe. Its functions can be called from multiple host threads, so long as the threads do not share the same cuDNN handle simultaneously.
+
+When creating a per-thread cuDNN handle, it is recommended that a single synchronous call of [cudnnCreate()](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/cudnn-graph-library.html#cudnnCreate) be made first before each thread creates its own handle asynchronously.
+
+Per [cudnnCreate()](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/cudnn-graph-library.html#cudnnCreate), for multi-threaded applications that use the same device from different threads, the recommended programming model is to create one (or a few, as is convenient) cuDNN handles per thread and use that cuDNN handle for the entire life of the thread.
+
+## cuDNN Backend Requirements
+
+For the compatible versions of the cuDNN backend, refer to [Supported Products](/reference/support-matrix).
+
+## SM Carveout
+
+Starting in cuDNN 8.9.5, SM carveout is supported on NVIDIA Hopper GPUs, allowing expert users to reserve SMs for concurrent execution on a separate CUDA stream. Users can set a target SM count to cuDNN heuristics, and get a list of engine configs that will use that number of SMs during execution. For advanced use cases without cuDNN heuristics, users can also create the engine config from scratch with the SM carveout configured (the engines that support this feature are listed in the table below).
+
+The following code snippet is a sample for heuristics use cases.
+
+```
+// Create heuristics descriptor
+cudnnBackendDescriptor_t engHeur;
+cudnnBackendCreateDescriptor(CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR, &engHeur);
+cudnnBackendSetAttribute(engHeur, CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &opGraph);
+cudnnBackendSetAttribute(engHeur, CUDNN_ATTR_ENGINEHEUR_MODE, CUDNN_TYPE_HEUR_MODE, 1, &heurMode);
+// SM carveout
+int32_t targetSMCount = 66;
+cudnnBackendSetAttribute(engHeur, CUDNN_ATTR_ENGINEHEUR_SM_COUNT_TARGET, CUDNN_TYPE_INT32, 1, &targetSMCount);
+cudnnBackendFinalize(engHeur);
+// Create engine config descriptor
+cudnnBackendDescriptor_t engConfig;
+cudnnBackendCreateDescriptor(CUDNN_BACKEND_ENGINECFG_DESCRIPTOR, &engConfig);
+// Retrieve optimal engine config(s) from heuristics
+cudnnBackendGetAttribute(engHeur, CUDNN_ATTR_ENGINEHEUR_RESULTS, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &returnedCount, engConfig);
+// "engConfig" should now be ready with target SM count as 66
+```
+
+This feature is currently supported by normal convolutions (`Fprop`, `Dgrad`, and `Wgrad`) as well as the Conv-Bias-Act fusions.
+
+| Convolution Forward | Convolution Backward Data | Convolution Backward Filter | `cudnnConvolutionBiasActivationForward` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+|  | 6 | 58 | 61 | 62 | 64 | 65 | 66 | 67 | 68 | 69 |  | 7 | 63 | 66 | 67 | 68 | 69 | 70 | 71 | 72 | 73 | 75 | 76 |  | 17 | 62 | 64 | 65 | 66 | 68 |  | 14 | 39 | 40 | 41 | 42 | 43 |
+
+## Native CUDA Graph API
+
+For select engines, cuDNN now provides a way to directly build a CUDA graph (not to be confused with a cuDNN graph) from an execution plan and a set of variant pointers. This is a more flexible alternative to using CUDA graph capture, as it allows the updating of an existing CUDA graph with new variant pack pointers. Like other CUDA graphs, the generated graph can be executed arbitrarily many times from different streams, and can be embedded as a child node of a larger CUDA graph.
+
+Engines supporting these APIs have the behavior note `CUDNN_BEHAVIOR_NOTE_SUPPORTS_CUDA_GRAPH_NATIVE_API`.
+
+Both the C++ and Pyhton APIs consist of two functions:
+
+  - `populate_cuda_graph()`
+  - `update_cuda_graph()`
+
+For an example usage of these functions in C++, refer to the [cudagraphs.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/cpp/misc/cudagraphs.cpp) sample.

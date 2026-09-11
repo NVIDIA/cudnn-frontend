@@ -25,6 +25,7 @@ import cuda.bindings.driver as cuda
 import cudnn.flex_attention.kernels.common.pipeline as pipeline_custom
 from cudnn.flex_attention.kernels.common import device_utils as utils
 from cudnn.flex_attention.plan.kernels.packed_mask import (
+    create_mask_payload_pipeline,
     softmax_arbitrary_forward_sm100,
     softmax_arbitrary_forward_qstage1_n_direction_sm100,
 )
@@ -623,22 +624,18 @@ class _FlexAttentionForwardSm100Base:
         pipeline_mask_s1 = None
         if const_expr(self.use_smem_mask_pipeline):
             # Each N-direction stream owns one independent 2-KB mask slot.
-            # PipelineTmaAsync releases once per consumer warp, so this group
-            # counts warps rather than threads.
+            # Every thread owns different mask words. Release the slot only
+            # after every reader has arrived, not just one lane per warp.
             mask_tx_count = self.m_block_size * SM100_FWD_MASK_PAYLOAD_WORDS * 4
-            pipeline_mask_s0 = cutlass_pipeline.PipelineTmaAsync.create(
+            pipeline_mask_s0 = create_mask_payload_pipeline(
                 barrier_storage=storage.mbar_load_mask_s0.data_ptr(),
-                num_stages=1,
-                producer_group=tma_warp,
-                consumer_group=softmax_warps,
+                consumer_threads=cute.arch.WARP_SIZE * len(self.softmax0_warp_ids),
                 tx_count=mask_tx_count,
                 defer_sync=True,
             )
-            pipeline_mask_s1 = cutlass_pipeline.PipelineTmaAsync.create(
+            pipeline_mask_s1 = create_mask_payload_pipeline(
                 barrier_storage=storage.mbar_load_mask_s1.data_ptr(),
-                num_stages=1,
-                producer_group=tma_warp,
-                consumer_group=softmax_warps,
+                consumer_threads=cute.arch.WARP_SIZE * len(self.softmax1_warp_ids),
                 tx_count=mask_tx_count,
                 defer_sync=True,
             )

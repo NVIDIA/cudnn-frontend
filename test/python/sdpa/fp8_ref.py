@@ -5,7 +5,7 @@ import math
 import torch
 
 from .helpers import get_fp8_scale_factor, get_fp8_descale_factor
-from .fp16_ref import _ScoreMask, _score_blocks, _pv, _grouped, _init_softmax_state, _prepare
+from .fp16_ref import _ScoreMask, _score_blocks, _qk, _pv, _kv_reduce, _init_softmax_state, _prepare
 
 # fmt: off
 
@@ -19,20 +19,31 @@ def compute_ref(q, k, v, attn_scale,
                 torch_otype,
                 padding=None, bias=None,
                 left_bound=None, right_bound=None, diag_align=None, sink_token=None,
-                rescale_threshold=0.0):
+                rescale_threshold=0.0,
+                dtype=torch.float32, quantize_o=True, sink_in_max=True):
     """Compute forward pass reference with online softmax tiling.
-    Returns (o_quant, stats, o_amax)."""
+    Returns (o_quant, stats, o_amax); ``quantize_o=False`` returns O in fp32 instead of torch_otype.
+
+    ``dtype`` is the accumulation type. The DLFW containers run fp32 matmul in TF32
+    (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1), a 3e-4 relative error on Q@K^T that a smooth softmax
+    hides but the fp8 P cast turns into rounding flips; pass float64 when the compare has no
+    mismatch budget.
+
+    ``sink_in_max=False`` adds the sink to the row sum after the KV loop instead of seeding the
+    running max with it (the FROST SM100 kernels). Same LSE, but the running max sets the scale
+    the fp8 P cast rounds at, so the two conventions round P differently on sink rows."""
     b, s_q, h_q, d_qk = q.shape
     _, s_kv, h_k, _ = k.shape
     _, _, h_v, d_v = v.shape
     device = q.device
 
-    q, k, v = _prepare(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), padding, device)
+    q, k, v = _prepare(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), padding, device, dtype)
     mask = _ScoreMask(b, h_q, s_q, s_kv, bias=bias.float() if bias is not None else None, block_mask=None, is_alibi=False,
                       padding=padding, diag_align=diag_align, left_bound=left_bound, right_bound=right_bound, device=device)
 
-    m_old, l_old = _init_softmax_state(b, h_q, s_q, sink_token, device)
-    o = torch.zeros((b, h_q, s_q, d_v), dtype=torch.float32, device=device)
+    m_old, l_old = _init_softmax_state(b, h_q, s_q, sink_token if sink_in_max else None, device)
+    m_old, l_old = m_old.to(dtype), l_old.to(dtype)
+    o = torch.zeros((b, h_q, s_q, d_v), dtype=dtype, device=device)
 
     s_scale_effective = s_scale * (2.0 ** (-rescale_threshold))
     s_descale_effective = s_descale * (2.0 ** rescale_threshold)
@@ -63,17 +74,30 @@ def compute_ref(q, k, v, attn_scale,
         l_new = l_old + p_block.sum(dim=-1, keepdim=True)
 
         # P (FP32) -> P (FP8)
-        p_block_quant = ((p_block * s_scale_effective).to(torch_itype)).float()
+        p_block_quant = ((p_block * s_scale_effective).to(torch_itype)).to(dtype)
 
         o = o + _pv(p_block_quant, v[:, :, start:end, :], h_v) * v_descale * s_descale_effective
         m_old = m_new
         l_old = l_new
+
+    if sink_token is not None and not sink_in_max:
+        sink = sink_token.to(dtype=dtype, device=device).expand(b, h_q, s_q, 1)
+        # A row whose every key is masked has m = -inf: it is all sink (O = 0, LSE = sink).
+        m_fin = torch.where(m_old == NEG_INF, sink, m_old)
+        l_old = l_old * torch.exp(m_old - m_fin).nan_to_num() + torch.exp(sink - m_fin)
+        m_old = m_fin
+        if mask.q_row_mask is not None:
+            # Padded query rows are dead, not sink-only: the kernels write LSE = -inf there.
+            m_old = m_old.masked_fill(mask.q_row_mask, NEG_INF)
+            l_old = l_old.masked_fill(mask.q_row_mask, 0.0)
 
     o = o / l_old.clamp(min=1.0)
     stats = (m_old + torch.log(l_old)).float()
     o = o.transpose(1, 2)
 
     o_amax = o.abs().max().item()
+    if not quantize_o:
+        return o.float(), stats, o_amax
     o_scale = get_fp8_scale_factor(o_amax, torch_otype)
     o_quant = (o * o_scale).to(torch_otype)
 
@@ -115,12 +139,10 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
 
     D = (o.float() * dO.transpose(1, 2)).sum(dim=-1, keepdim=True).transpose(1, 2) * o_descale * dO_descale
 
-    dO_g_v = _grouped(dO, h_v)
-    q_g_k = _grouped(q, h_k)
 
     def dP_block(start, end):
         # dO (FP8) @ V (FP8) -> dP (FP32)
-        dP = torch.einsum("bhgqd,bhkd->bhgqk", dO_g_v, v[:, :, start:end, :]).reshape(b, h_q, s_q, end - start)
+        dP = _qk(dO, v[:, :, start:end, :], h_v)
         return dP * dO_descale * v_descale
 
     # dP is quantized with one global scale, so its amax needs a pass of its own.
@@ -141,7 +163,7 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
 
         # P (FP32) -> P (FP8); P (FP8) @ dO (FP8) -> dV (FP32)
         p_quant = (p * s_scale).to(torch_itype).float()
-        dV[:, :, start:end, :] = torch.einsum("bhgqk,bhgqd->bhkd", _grouped(p_quant, h_v), dO_g_v) * s_descale * dO_descale
+        dV[:, :, start:end, :] = _kv_reduce(p_quant, dO, h_v) * s_descale * dO_descale
 
         dS = p * (dP_block(start, end) - D) * attn_scale
         # dS (FP32) -> dS (FP8)
@@ -149,7 +171,7 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
 
         # dS (FP8) @ K (FP8) -> dQ (FP32); dS^T (FP8) @ Q (FP8) -> dK (FP32)
         dQ = dQ + _pv(dS_quant, k[:, :, start:end, :], h_k) * k_descale * dP_descale
-        dK[:, :, start:end, :] = torch.einsum("bhgqk,bhgqd->bhkd", _grouped(dS_quant, h_k), q_g_k) * q_descale * dP_descale
+        dK[:, :, start:end, :] = _kv_reduce(dS_quant, q, h_k) * q_descale * dP_descale
 
     # Compute dSink_token if sink_token was provided
     # Formula: dSink = -exp(sink - logsumexp) * D summed over batch and sequence

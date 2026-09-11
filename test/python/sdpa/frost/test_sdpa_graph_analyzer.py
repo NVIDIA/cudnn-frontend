@@ -655,10 +655,15 @@ def test_knob_request_pack_gqa_outside_domain_rejects_row():
 _SM120 = engines.engine_name(arch="sm120")
 
 
-def _mk_sm120_graph(d: int = 128, **sdpa_kwargs):
-    """A dense fp16 BSHD graph inside the SM120 row's envelope (D <= 256)."""
+def _mk_sm120_graph(d: int = 128, *, d_v: int | None = None, **sdpa_kwargs):
+    """Build a dense fp16 BSHD graph with independent Q/K and V/O dimensions."""
     g = _mk_graph()
-    q, k, v, dims, strides = _mk_qkv(g, d=d)
+    q_dims, q_strides = (B, H, S, d), (S * H * d, d, H * d, 1)
+    d_v = d if d_v is None else d_v
+    dims, strides = (B, H, S, d_v), (S * H * d_v, d_v, H * d_v, 1)
+    q = g.tensor(dim=q_dims, stride=q_strides, data_type=DTYPE, name="q")
+    k = g.tensor(dim=q_dims, stride=q_strides, data_type=DTYPE, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, **sdpa_kwargs)
     _finish_output(o, dims, strides)
     return g
@@ -766,11 +771,25 @@ def test_sm120_probe_rejects_on_sm100_family():
 def test_sm120_probe_head_dim_envelope(monkeypatch):
     # d_envelope: any multiple of 8 up to the 256 cap is served via TMA
     # zero-padding; only sub-8 alignment (TMA 16-byte global-stride rule)
-    # stays ineligible.
+    # stays ineligible. Both dimensions in (256, 512] use the d512 envelope.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert _SM120 in _eligible(_mk_sm120_graph(d=192))
     assert _SM120 in _eligible(_mk_sm120_graph(d=136))  # multiple of 8, not of 16
     assert not _eligible(_mk_sm120_graph(d=132))  # multiple of 4, not of 8
+    assert _SM120 in _eligible(_mk_sm120_graph(d=512))
+    assert _SM120 in _eligible(_mk_sm120_graph(d=504))
+    assert _SM120 in _eligible(_mk_sm120_graph(d=264))
+    assert _SM120 in _eligible(_mk_sm120_graph(d=496))
+
+
+def test_sm120_probe_full_d512_envelope_pairs(monkeypatch):
+    """Every 8-aligned Q/K and V/O pair in (256, 512] is independently eligible."""
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    for d_qk in range(264, 513, 8):
+        for d_v in range(264, 513, 8):
+            assert _SM120 in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (260, 264), (264, 260), (520, 512), (512, 520)):
+        assert _SM120 not in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
 
 
 def test_sm120_probe_accepts_right_band_widening(monkeypatch):

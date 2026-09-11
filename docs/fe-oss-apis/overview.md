@@ -33,12 +33,14 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Grouped GEMM + Wgrad](gemm_fusions/grouped_gemm_wgrad.md)
 - [Block Sparse Attention (BSA)](bsa.md)
 - [DeepSeek Sparse Attention (DSA)](dsa.md)
-- [Flex Attention](attention/flex_attention.md)
-- [HSTU Attention (Blackwell SM100/SM103)](attention/hstu.md)
+- [Flex Attention](attention/flex_attention.md) and [mask plan design](attention/flex_attention_design.md)
+- [HSTU Attention (Blackwell SM100/SM103)](hstu/hstu_attention.md)
+- [HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)](hstu/hstu_lmsd.md)
 - [Native Sparse Attention (NSA)](nsa.md)
 - [CSA Fused Compressor](csa.md)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
+- [NVFP4 Attention QAT Backward](attention/nvfp4_attention_qat_backward.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
 
 ## Installation and setup
@@ -48,6 +50,9 @@ All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package, a
 pip install nvidia-cudnn-frontend
 ```
 (`pip install nvidia-cudnn-frontend[cutedsl]` still works; the `cutedsl` extra now names only `cuda-python`. A few APIs still want extras of their own — the cuTile linear-attention engines need `[cutile]`.)
+
+The Triton NVFP4 attention QAT backward API additionally requires the
+`triton` extra. Its API page documents the framework and GPU requirements.
 
 Those required dependencies are framework-neutral. Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
 ```bash

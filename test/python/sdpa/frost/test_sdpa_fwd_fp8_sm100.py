@@ -76,10 +76,28 @@ def _quant(x, in_key):
     return (x / dq).clamp(-fmax, fmax).to(fp8), dq
 
 
+# The kernels' softmax: 128-wide KV tiles, a running max in log2 units that moves only when a
+# tile beats it by more than config_sm100.rescale_threshold (4 at fp8), P cast to the INPUT fp8
+# type for P@V (scale_s/descale_s are accepted and ignored) while the row sum keeps the fp32 P,
+# and the sink added to the sum after the loop. sdpa.fp8_ref.compute_ref is that softmax
+# (BLOCK = 128, rescale_threshold in log2 units, sink_in_max=False); its s_scale is the cast
+# scale times 2**rescale_threshold. The d128 cell casts P * 2**4
+# (prefill_d128_fp8_sm100.P_CAST_LOG2_SCALE); the others cast P as is.
+_P_RESCALE_THRESHOLD_LOG2 = 4.0
+
+
+def _p_cast_log2_scale(d_qk):
+    return 4.0 if d_qk <= 128 else 0.0
+
+
 def _ref(
-    qd,
-    kd,
-    vd,
+    q8,
+    k8,
+    v8,
+    dq,
+    dk,
+    dv,
+    in_key,
     *,
     scale,
     is_causal=False,
@@ -91,48 +109,44 @@ def _ref(
     seq_lens_kv=None,
     return_stats=False,
 ):
-    b, h_q, s_q, _ = qd.shape
-    _, h_kv, s_kv, _ = vd.shape
-    dev = qd.device
-    g = h_q // h_kv
-    k_e = kd.repeat_interleave(g, dim=1)
-    v_e = vd.repeat_interleave(g, dim=1)
-    scores = torch.matmul(qd, k_e.transpose(-1, -2)) * scale
-    i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
-    j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
-    masked = torch.zeros(1, 1, s_q, s_kv, dtype=torch.bool, device=dev)
-    if is_causal:
-        lim = i + (s_kv - s_q) if bottom_right else i
-        masked = masked | (j > lim + right_bound)
-    if swa_window is not None:
-        swa_base = i + (s_kv - s_q) if bottom_right else i
-        masked = masked | (j < swa_base - swa_window)
-    if seq_lens_kv is not None:
-        # Per-batch KV padding: columns j >= seq_len_kv[b] are padding -> masked.
-        slk = torch.as_tensor(seq_lens_kv, device=dev, dtype=torch.long).view(b, 1, 1, 1)
-        masked = masked | (j >= slk)
-    scores = scores.masked_fill(masked, float("-inf"))
+    """sdpa.fp8_ref.compute_ref on this file's bhsd fp8 tensors (fp32 O, natural-log LSE [b, h, s])."""
+    import cudnn
+    from sdpa.fp8_ref import compute_ref
 
-    def finalize(o, lse=None):
-        if seq_lens_q is not None:
-            slq = torch.as_tensor(seq_lens_q, device=dev, dtype=torch.long).view(b, 1, 1, 1)
-            valid_q = i < slq
-            o = torch.where(valid_q, o, torch.zeros_like(o))
-            if lse is not None:
-                lse = torch.where(valid_q.squeeze(-1), lse, torch.full_like(lse, float("-inf")))
-        return _ReferenceWithStats(o, lse) if lse is not None else o
-
-    if sinks is not None:
-        col = sinks.view(1, h_q, 1, 1).float().expand(b, h_q, s_q, 1).to(dev)
-        ext = torch.cat([scores, col], dim=-1)
-        probs = torch.softmax(ext, dim=-1)
-        o = torch.matmul(probs[..., :s_kv], v_e)
-        return finalize(o, torch.logsumexp(ext, dim=-1) if return_stats else None)
-    row_has_kv = torch.isfinite(scores).any(dim=-1, keepdim=True)
-    probs = torch.softmax(scores, dim=-1)
-    probs = torch.where(row_has_kv, probs, torch.zeros_like(probs))
-    o = torch.matmul(probs, v_e)
-    return finalize(o, torch.logsumexp(scores, dim=-1) if return_stats else None)
+    b, h_q, s_q, d_qk = q8.shape
+    s_kv = k8.shape[2]
+    dev = q8.device
+    padding = None
+    if seq_lens_q is not None or seq_lens_kv is not None:
+        padding = (
+            torch.as_tensor(seq_lens_q if seq_lens_q is not None else [s_q] * b, dtype=torch.int32, device=dev),
+            torch.as_tensor(seq_lens_kv if seq_lens_kv is not None else [s_kv] * b, dtype=torch.int32, device=dev),
+        )
+    s_scale = 2.0 ** (_p_cast_log2_scale(d_qk) + _P_RESCALE_THRESHOLD_LOG2)
+    o, stats, _ = compute_ref(
+        q8.transpose(1, 2),
+        k8.transpose(1, 2),
+        v8.transpose(1, 2),
+        attn_scale=scale,
+        q_descale=dq,
+        k_descale=dk,
+        v_descale=dv,
+        s_scale=s_scale,
+        s_descale=1.0 / s_scale,
+        torch_itype=_FP8[in_key],
+        torch_otype=torch.float16,
+        padding=padding,
+        left_bound=(swa_window + 1) if swa_window is not None else None,
+        right_bound=right_bound if is_causal else None,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT,
+        sink_token=sinks.view(1, h_q, 1, 1) if sinks is not None else None,
+        rescale_threshold=_P_RESCALE_THRESHOLD_LOG2,
+        dtype=torch.float64,
+        quantize_o=False,
+        sink_in_max=False,
+    )
+    o = o.transpose(1, 2)
+    return _ReferenceWithStats(o, stats.squeeze(-1)) if return_stats else o
 
 
 def _run(
@@ -258,18 +272,9 @@ def _run(
         ref_kw["sinks"] = sink.flatten()
     if return_lse:
         assert stats, "return_lse requires stats=True"
-        o_ref, lse_ref = _ref(
-            Q8.float() * dq,
-            K8.float() * dk,
-            V8.float() * dv,
-            scale=scale,
-            seq_lens_q=seq_lens_q,
-            seq_lens_kv=seq_lens_kv,
-            return_stats=True,
-            **ref_kw,
-        )
+        o_ref, lse_ref = _ref(Q8, K8, V8, dq, dk, dv, in_key, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, return_stats=True, **ref_kw)
         return _RunWithStatsResult(Ob, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1), lse_ref)
-    o_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kw)
+    o_ref = _ref(Q8, K8, V8, dq, dk, dv, in_key, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kw)
     return _RunResult(Ob, o_ref, amax_o.item(), o_ref.abs().max().item())
 
 
@@ -295,12 +300,20 @@ def _ref_kwargs(sdpa_kwargs):
     return out
 
 
-def _half_atol(in_key):
-    return 7e-2 if in_key == "e5m2" else 5e-2
+def _half_atol(in_key, d_v=None):
+    # _ref casts P the way the kernels do, so this is the residual of what the
+    # reference does NOT mirror. d128/d192/d512 cells: exp2 is MUFU, the cast
+    # reference matches to <= 0.006 (fp64, offline) except the d192 e5m2+sink
+    # path, whose kernel scales the rescale threshold by log2(e) (0.03). The
+    # d256 cell computes exp2 with ex2_emulation_2 (degree-1/2 polynomial) on
+    # part of every tile and, under a plain causal mask, for the rescale factor
+    # too: ~40% of its P values sit one fp8 step off an exact-exp2 cast, up to
+    # 0.058 on the suite's data (pack_gqa_ratios[d256-g16_mqa]).
+    return 7.5e-2 if d_v == 256 else 4e-2
 
 
 def _check(out, o_ref, out_dt, in_key, amax_o, amax_o_ref):
-    atol = _half_atol(in_key)
+    atol = _half_atol(in_key, out.shape[-1])
     diff = (out.float() - o_ref).abs().max().item()
     if out_dt in (torch.float8_e4m3fn, torch.float8_e5m2):
         floor = (o_ref - o_ref.to(out_dt).float()).abs().max().item()
@@ -1217,9 +1230,9 @@ def _run_thd(
             if stats:
                 lse_ref[cu_q[b] : cu_q[b + 1]] = sink.flatten().to(lse_ref) if sink is not None else float("-inf")
             continue
-        qb = (q8[cu_q[b] : cu_q[b + 1]].float() * dq).permute(1, 0, 2).unsqueeze(0)
-        kb = (k8[cu_k[b] : cu_k[b + 1]].float() * dk).permute(1, 0, 2).unsqueeze(0)
-        vb = (v8[cu_k[b] : cu_k[b + 1]].float() * dv).permute(1, 0, 2).unsqueeze(0)
+        qb = q8[cu_q[b] : cu_q[b + 1]].permute(1, 0, 2).unsqueeze(0)
+        kb = k8[cu_k[b] : cu_k[b + 1]].permute(1, 0, 2).unsqueeze(0)
+        vb = v8[cu_k[b] : cu_k[b + 1]].permute(1, 0, 2).unsqueeze(0)
         ref_kw = {}
         if bottom_right:
             ref_kw.update(is_causal=True, bottom_right=True)
@@ -1229,48 +1242,14 @@ def _run_thd(
             ref_kw["swa_window"] = swa_window
         if sink is not None:
             ref_kw["sinks"] = sink.flatten()
-        ob = _ref(qb, kb, vb, scale=scale, **ref_kw)
+        ob, lse_b = _ref(qb, kb, vb, dq, dk, dv, in_key, scale=scale, return_stats=True, **ref_kw)
         o_ref[cu_q[b] : cu_q[b + 1]] = ob.squeeze(0).permute(1, 0, 2)
         if stats:
-            lse_ref[cu_q[b] : cu_q[b + 1]] = (
-                _ref_lse(
-                    qb,
-                    kb,
-                    scale=scale,
-                    causal=bottom_right or causal or swa_window is not None,
-                    bottom_right=bottom_right,
-                    swa_window=swa_window,
-                    sinks=(sink.flatten() if sink is not None else None),
-                )
-                .squeeze(0)
-                .T
-            )
+            lse_ref[cu_q[b] : cu_q[b + 1]] = lse_b.squeeze(0).T
 
     o_out = o_stor[: T_q * H_q * d_v].reshape(T_q, H_q, d_v)
     lse_out = stats_stor[: T_q * H_q].reshape(T_q, H_q) if stats else None
     return o_out, o_ref, amax_o.item(), o_ref.abs().max().item(), lse_out, (lse_ref if stats else None)
-
-
-def _ref_lse(qd, kd, *, scale, causal, bottom_right=False, swa_window=None, sinks=None):
-    """Natural-log LSE reference over per-sequence scores, [1, H, S_q]."""
-    _, h_q, s_q, _ = qd.shape
-    _, h_kv, s_kv, _ = kd.shape
-    dev = qd.device
-    k_e = kd.repeat_interleave(h_q // h_kv, dim=1)
-    scores = torch.matmul(qd, k_e.transpose(-1, -2)) * scale
-    i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
-    j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
-    diag = s_kv - s_q if bottom_right else 0
-    masked = torch.zeros(1, 1, s_q, s_kv, dtype=torch.bool, device=dev)
-    if causal:
-        masked = masked | (j > i + diag)
-    if swa_window is not None:
-        masked = masked | (j < i + diag - swa_window)
-    scores = scores.masked_fill(masked, float("-inf"))
-    if sinks is not None:
-        col = sinks.view(1, h_q, 1, 1).float().expand(1, h_q, s_q, 1).to(dev)
-        scores = torch.cat([scores, col], dim=-1)
-    return torch.logsumexp(scores, dim=-1)
 
 
 @pytest.mark.L0
@@ -1537,7 +1516,7 @@ def test_fp8_sm100_execute_lse_contract():
         api.execute(lse_tensor=lse, **ex)
     api.execute(**ex)
     torch.cuda.synchronize()
-    o_ref = _ref(q8.float() * dq, q8.float() * dq, q8.float() * dq, scale=api.scale_softmax, is_causal=True)
+    o_ref = _ref(q8, q8, q8, dq, dq, dq, "e4m3", scale=api.scale_softmax, is_causal=True)
     torch.testing.assert_close(o.float(), o_ref, atol=5e-2, rtol=3e-2)
 
 
@@ -1776,13 +1755,18 @@ def test_fp8_d512_head_dim_envelope(d_qk, d_v, mask):
 @pytest.mark.L0
 @_skip_d512_on_rubin
 def test_fp8_d512_envelope_floor_declines_straddling_shapes():
-    """D256 serves its own envelope; shapes straddling the D512 floor decline."""
+    """The D512 flavor serves the (256, 512] band on both head dims; shapes
+    straddling its floor decline.  Below it the D256 flavor is exact-shape only
+    (its padded envelope is non-deterministic, see
+    test_fp8_large_flavors_serve_exact_shapes_only), so a shape such as
+    (160, 160) -- too wide for D192/128, not the D256 shape -- is declined too.
+    """
     from cudnn.sdpa.fwd.api_dsl import _fp8_envelope_covers, _sm100_fp8_shapes
 
     shapes = _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
-    for d_qk, d_v in [(160, 160), (256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
+    for d_qk, d_v in [(256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
         assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
-    for d_qk, d_v in [(272, 256), (384, 128), (512, 256)]:
+    for d_qk, d_v in [(160, 160), (272, 256), (384, 128), (512, 256)]:
         assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
 
 
@@ -1799,12 +1783,15 @@ def test_fp8_envelope_floor_matches_engine_row():
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
-def test_fp8_d512_mxfp8_declines():
-    """There is no d512 block-scale kernel: an MXFP8 d512 graph must be
-    rejected up front, not fail late in the lowering."""
-    from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
+def test_fp8_d512_family_shape_maps():
+    """D512 per-tensor and MXFP8 have native kernels on both arch lines."""
+    from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes, supported_cgas_for
 
     assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
-    assert (512, 512) not in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
-    assert (512, 512) not in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 7))
+    for device_cc in ((10, 0), (10, 7)):
+        for pertensor in (False, True):
+            expected = (1,) if device_cc == (10, 0) and not pertensor else (2,)
+            assert supported_cgas_for((512, 512), fp8=True, device_cc=device_cc, pertensor=pertensor) == expected
