@@ -32,3 +32,18 @@ as guaranteed numbers; clocks, thermals, and competing work affect results.
 
 The dense median in that run was 224.2484 ms. The kernel consumes logical
 blk128 metadata directly; the benchmark does not expand it to blk64 metadata.
+
+The fixed-top-k, full-KV-block case now selects an FA4-style SM120
+specialization. It keeps Q in registers, assigns K/V TMA traffic to a dedicated
+load warp, and aliases the K/V shared-memory backing with the O epilogue. A
+paired run against the original native blk128 kernel produced:
+
+| Implementation | 20% strided | 20% local |
+| --- | ---: | ---: |
+| Original native blk128 | 44.8605 ms | 44.6901 ms |
+| FA4-style native blk128 | 43.1693 ms | 43.0053 ms |
+| Latency reduction | 3.77% | 3.77% |
+
+The specialization is used when `q2k_block_nums=None`, `block_sizes=None`, and
+the KV sequence length is divisible by 128. Other blk128 inputs continue to use
+the general native kernel. Both paths consume blk128 metadata directly.

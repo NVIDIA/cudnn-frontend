@@ -128,6 +128,12 @@ explicitly selects the SM100/SM103 blk64 CuTe DSL path, whose shape support is
 narrower. `kv_splits` is available on SM90 and the explicit Blackwell blk64
 path; `use_clc` applies only to the explicit Blackwell blk64 path.
 
+For SM120 blk128 with fixed `block_sparse_num`, full physical KV blocks
+(`block_sizes=None`), and a KV sequence length divisible by 128, the dispatcher
+uses an FA4-style native specialization with a dedicated K/V load warp and
+register-resident Q. Variable per-row block counts, explicit block sizes, and
+partial final KV blocks use the general native blk128 kernel.
+
 `kv_splits=2..256` computes FP32 partial outputs and combines them, with
 workspace growing linearly in the split count. SM90 accepts an explicit integer
 split count. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is

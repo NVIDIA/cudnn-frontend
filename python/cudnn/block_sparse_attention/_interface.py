@@ -875,6 +875,16 @@ def _bsa_attn_fwd_sm120(
             block_sizes_t = block_sizes.contiguous().permute(2, 1, 0)
             block_sizes_mode = 3
 
+    use_fa4_blk128 = (
+        sparse_block_size == SM120_BLK128_FWD_BLOCK_SIZE and not has_block_nums and not has_block_sizes and seqlen_k % SM120_BLK128_FWD_BLOCK_SIZE == 0
+    )
+    if use_fa4_blk128:
+        from cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fa4 import (
+            BlockSparseAttnForwardSm120Blk128Fa4,
+        )
+
+        kernel_cls = BlockSparseAttnForwardSm120Blk128Fa4
+
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
     if out is None:
@@ -919,7 +929,7 @@ def _bsa_attn_fwd_sm120(
     )
 
     compile_key = (
-        f"sm120_blk{sparse_block_size}",
+        f"sm120_blk{sparse_block_size}_{'fa4' if use_fa4_blk128 else 'general'}",
         _get_device_arch(),
         q.dtype,
         head_dim,
