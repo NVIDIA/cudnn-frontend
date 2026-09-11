@@ -19,6 +19,14 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.base_dsl.typing import Pointer
 
 TENSOR_MAP_QWORDS = 128 // 8
+TENSOR_MAP_BIT21 = 1 << 21  # qword 1: encoder's "tensor >= 128 KiB" flag; tensormap.replace does not update it (issue #1013)
+
+
+@cute.jit
+def set_tensor_map_bit21(dptr, new_bytes: cutlass.Int64) -> None:
+    """Recompute bit 21 from the patched extent (as cuTensorMapEncodeTiled would)."""
+    w = (dptr + 1).load() & cutlass.Int64(~TENSOR_MAP_BIT21)
+    (dptr + 1).store((w | cutlass.Int64(TENSOR_MAP_BIT21)) if new_bytes >= cutlass.Int64(128 << 10) else w)
 
 
 @cute.jit
@@ -73,6 +81,7 @@ def emit_seq_descs(
             new_value=s_b,
             ord=seq_ord,
         )
+        set_tensor_map_bit21(dptr, cutlass.Int64(s_b) * cutlass.Int64(base_ptr.stride[0]) * cutlass.Int64(base_ptr.element_type.width // 8))
 
 
 @cute.jit
@@ -142,3 +151,4 @@ def emit_checkpoint_seq_descs(
             new_value=cnt,
             ord=seq_ord,
         )
+        set_tensor_map_bit21(dptr, cutlass.Int64(cnt) * cutlass.Int64(base_ptr.stride[0]) * cutlass.Int64(base_ptr.element_type.width // 8))

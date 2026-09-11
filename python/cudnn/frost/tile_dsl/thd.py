@@ -37,6 +37,7 @@ from cutlass._mlir.dialects import arith
 
 # int64 words per 128-byte TMA descriptor.
 TENSOR_MAP_QWORDS = 128 // 8
+TENSOR_MAP_BIT21 = 1 << 21  # qword 1: encoder's "tensor >= 128 KiB" flag; tensormap.replace does not update it (issue #1013)
 
 THD_META_WORDS = lambda b: 4 * b + 4  # noqa: E731
 THD_REMAP_OFF = lambda b: 3 * b + 2  # noqa: E731
@@ -294,6 +295,13 @@ def thd_claim_next(meta_t: cute.Tensor, ctr_off: cutlass.Int32, slot, tidx: cutl
 
 
 @cute.jit
+def set_tensor_map_bit21(dptr, new_bytes: cutlass.Int64) -> None:
+    """Recompute bit 21 from the patched extent (as cuTensorMapEncodeTiled would)."""
+    w = (dptr + 1).load() & cutlass.Int64(~TENSOR_MAP_BIT21)
+    (dptr + 1).store((w | cutlass.Int64(TENSOR_MAP_BIT21)) if new_bytes >= cutlass.Int64(128 << 10) else w)
+
+
+@cute.jit
 def emit_seq_descs(
     base_desc,
     desc_words,
@@ -352,6 +360,9 @@ def emit_seq_descs(
             new_value=cute.math.max(s_b, cutlass.Int32(1)),
             ord=seq_ord,
         )
+        set_tensor_map_bit21(
+            dptr, cutlass.Int64(cute.math.max(s_b, cutlass.Int32(1))) * cutlass.Int64(row_stride) * cutlass.Int64(base_ptr.element_type.width // 8)
+        )
 
 
 @cute.jit
@@ -392,6 +403,7 @@ __all__ = [
     "THD_SETUP_THREADS",
     "emit_clamped_desc",
     "emit_seq_descs",
+    "set_tensor_map_bit21",
     "thd_claim_next",
     "thd_decode_unit",
     "write_thd_batch_remap",
