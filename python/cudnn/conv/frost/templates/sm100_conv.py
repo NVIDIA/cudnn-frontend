@@ -941,12 +941,13 @@ def _kernel(
                 if warp_m_idx == 0:
                     k_off = k_off_base + warp_n_idx * (mma_tiler[1] // warp_n_count) + subtile_idx * subtile_n
                     band_smem_base = smem_tile_base.subview(warp_n_idx * mma_tiler_per_cta_m * subtile_n)
-                    prims.cp_async_bulk_tensor_global_shared_cta(
-                        tma_c_desc.get_ptr(),
-                        band_smem_base,
-                        (k_off, q_out, p_out, z_out, n_out),
-                        mode=prims.TMAStoreMode.IM2COL,
-                    )
+                    if prims.elect_sync():
+                        prims.cp_async_bulk_tensor_global_shared_cta(
+                            tma_c_desc.get_ptr(),
+                            band_smem_base,
+                            (k_off, q_out, p_out, z_out, n_out),
+                            mode=prims.TMAStoreMode.IM2COL,
+                        )
                     prims.cp_async_bulk_commit_group()
                     # Keep at most num_c_stage-1 inflight so the next iteration
                     # can reuse a drained SMEM stage.
