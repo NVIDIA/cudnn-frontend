@@ -288,7 +288,7 @@ class Execution_plan_list {
 
     int64_t max_workspace_allowed  = std::numeric_limits<int64_t>::max();
     int64_t max_shared_mem_allowed = 1024 * 1024 * 1024;  // Crazy high number (2GB) which will never be hit
-    // Avoid changing engine identities when the application did not request a limit.
+    // Only propagate a shared-memory limit when the application explicitly requested one.
     bool max_shared_mem_allowed_set = false;
 
     std::vector<std::string> barred_engine_names = {};
