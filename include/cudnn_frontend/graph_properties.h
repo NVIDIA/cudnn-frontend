@@ -2353,9 +2353,17 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
 // All FP8 functionality is unified in SDPA_attributes with the mma_core_mode field
 using SDPA_fp8_attributes = SDPA_attributes;
 
+template <typename DerivedClass>
+class SDPABackwardNodeBase;
+class CompositeSDPABackwardNode;
+class UnifiedSDPABackwardNode;
+
 class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     friend class Attributes<SDPA_backward_attributes>;
+    friend class SDPABackwardNodeBase<CompositeSDPABackwardNode>;
     friend class CompositeSDPABackwardNode;
+    friend class SDPABackwardNodeBase<UnifiedSDPABackwardNode>;
+    friend class UnifiedSDPABackwardNode;
     friend class Graph;
     using Tensor_t = std::shared_ptr<Tensor_attributes>;
     using Graph_t  = std::shared_ptr<Graph>;
@@ -2379,6 +2387,8 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     AttentionScoreModifier_t attention_score_modifier       = nullptr;
     AttentionScoreModifier_t attention_score_modifier_bprop = nullptr;
 
+    AttentionImplementation_t implementation = AttentionImplementation_t::AUTO;
+
     bool
     has_causal_like_masking() const {
         return right_bound.has_value();
@@ -2392,6 +2402,11 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     bool
     has_bias() const {
         return inputs.find(input_names::Bias) != inputs.end() && inputs.at(input_names::Bias) != nullptr;
+    }
+
+    bool
+    has_sink_token() const {
+        return inputs.find(input_names::SINK_TOKEN) != inputs.end() && inputs.at(input_names::SINK_TOKEN) != nullptr;
     }
 
    public:
@@ -2429,7 +2444,8 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
                                    diagonal_alignment,
                                    max_total_seq_len_q,
                                    max_total_seq_len_kv,
-                                   is_deterministic_algorithm)
+                                   is_deterministic_algorithm,
+                                   implementation)
 
     SDPA_backward_attributes&
     set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
@@ -2596,6 +2612,42 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
         outputs[SDPA_backward_attributes::output_names::DSINK_TOKEN] = value;
         return *this;
     }
+
+    SDPA_backward_attributes&
+    set_implementation(AttentionImplementation_t value) {
+        implementation = value;
+        return *this;
+    }
+
+    // Implementation is in sdpa_support_surface.h
+    error_t
+    validate_sdpa_backward_support_surface(const detail::Context& context) const;
+
+    // Internal function - do not use directly in application code
+    void
+    _auto_select_implementation(const detail::Context& context) {
+        if (verify_sdpa_backward_support_surface_for_implementation(context, AttentionImplementation_t::UNIFIED)
+                .is_good()) {
+            implementation = AttentionImplementation_t::UNIFIED;
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Auto-selected SDPA backward implementation UNIFIED");
+        } else if (verify_sdpa_backward_support_surface_for_implementation(context,
+                                                                           AttentionImplementation_t::COMPOSITE)
+                       .is_good()) {
+            implementation = AttentionImplementation_t::COMPOSITE;
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Auto-selected SDPA backward implementation COMPOSITE");
+        } else {
+            // Leave `implementation` with its previous value (usually AUTO).
+            CUDNN_FE_LOG_LABEL_ENDL(
+                "ERROR: No suitable SDPA backward implementation for given SDPA_backward_attributes");
+        }
+    }
+
+   private:
+    // Check whether implementation `impl` supports the requested features. `impl` must not be AUTO.
+    // (The `implementation` member variable is ignored.)
+    error_t
+    verify_sdpa_backward_support_surface_for_implementation(const detail::Context& context,
+                                                            AttentionImplementation_t impl) const;
 };
 
 class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attributes> {
