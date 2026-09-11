@@ -157,10 +157,9 @@ def test_memo_key_covers_every_wrapper_parameter():
 
     import cudnn.gemm.cutedsl as cutedsl
 
-    # linear_offset is not part of any op cache key either; the wrappers resolve and
-    # forward the caller's value on every call, hit or miss. current_stream is per-call
-    # state, not a cache dimension.
-    NOT_CACHE_DIMENSIONS = {"current_stream", "linear_offset"}
+    # GLU forwards linear_offset at runtime; block-scaled dGLU specializes on it.
+    # current_stream is per-call state, not a cache dimension.
+    NOT_CACHE_DIMENSIONS = {"current_stream"}
 
     checked = []
     for module_info in pkgutil.walk_packages(cutedsl.__path__, cutedsl.__name__ + "."):
@@ -182,6 +181,8 @@ def test_memo_key_covers_every_wrapper_parameter():
             start = source.index("memo_key = (") + len("memo_key = (")
             key_source = source[start : source.index("\n    )", start)]
             params = set(inspect.signature(func).parameters) - NOT_CACHE_DIMENSIONS
+            if name != "grouped_gemm_dglu_wrapper_sm100":
+                params.discard("linear_offset")
             missing = sorted(p for p in params if not re.search(rf"\b{p}\b", key_source))
             assert not missing, f"{name} parameters missing from its memo key: {missing}"
             checked.append(name)
@@ -205,7 +206,23 @@ def mxfp8_inputs(group_m_list, l=L_BS, b_major="k"):
 
 
 def raw_bytes(tensor):
-    return tensor.contiguous().view(torch.uint8)
+    return tensor.flatten().view(torch.uint8)
+
+
+def block_scaled_result(outputs, valid_m):
+    result = {}
+    quantized = outputs.get("d_tensor", outputs.get("d_row_tensor")).dtype == torch.float8_e4m3fn
+    for name, tensor in outputs.items():
+        if tensor is None or (not quantized and name in ("d_col_tensor", "sfd_row_tensor", "sfd_col_tensor")):
+            continue
+        if name == "sfd_row_tensor":
+            tensor = tensor[:, :, : valid_m // 128]
+        elif name == "sfd_col_tensor":
+            tensor = tensor[:, :, :, :, : valid_m // 128]
+        elif name not in ("amax_tensor", "dbias_tensor"):
+            tensor = tensor[:valid_m]
+        result[name] = tensor
+    return result
 
 
 class CountingMemo(dict):
@@ -228,13 +245,18 @@ def assert_hit_matches_cold(monkeypatch, module, memo_name, call, inputs_a, inpu
     memo = install_memo(monkeypatch, module, memo_name)
     call(inputs_a)
     assert memo.stores == 1 and len(memo) == 1, "the first call should miss and populate the memo"
-    warm = raw_bytes(pick(call(inputs_b))).clone()
+    warm = {name: tensor.clone() for name, tensor in pick(call(inputs_b)).items()}
     assert memo.stores == 1, "the second call should hit the memo"
     memo.clear()
-    cold = raw_bytes(pick(call(inputs_b)))
+    cold = pick(call(inputs_b))
     assert memo.stores == 2
     torch.cuda.synchronize()
-    assert torch.equal(warm, cold)
+    assert warm.keys() == cold.keys()
+    for name in warm:
+        if name == "dbias_tensor":
+            torch.testing.assert_close(warm[name].float(), cold[name].float(), rtol=0.02, atol=cold[name].float().abs().max().item() * 0.02)
+        else:
+            assert torch.equal(raw_bytes(warm[name]), raw_bytes(cold[name])), name
 
 
 def glu_block_scaled_call(inputs, **overrides):
@@ -257,15 +279,16 @@ def glu_block_scaled_call(inputs, **overrides):
 
 
 @pytest.mark.L0
-def test_glu_block_scaled_memo_hit_matches_cold_path(monkeypatch):
+@pytest.mark.parametrize("d_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("act_func,linear_offset", [("swiglu", None), ("geglu", None), ("geglu", 0.5)])
+def test_glu_block_scaled_memo_hit_matches_cold_path(monkeypatch, d_dtype, act_func, linear_offset):
     from cudnn.gemm.cutedsl.grouped.glu import api as glu_api
 
     inputs_a = mxfp8_inputs([256] * L_BS)
     inputs_b = mxfp8_inputs([512, 256, 512, 256])
     assert inputs_a["valid_m"] != inputs_b["valid_m"]
-    assert_hit_matches_cold(
-        monkeypatch, glu_api, "_glu_wrapper_memo", glu_block_scaled_call, inputs_a, inputs_b, lambda out: out["d_tensor"][: inputs_b["valid_m"]]
-    )
+    call = lambda inputs: glu_block_scaled_call(inputs, d_dtype=d_dtype, act_func=act_func, linear_offset=linear_offset)
+    assert_hit_matches_cold(monkeypatch, glu_api, "_glu_wrapper_memo", call, inputs_a, inputs_b, lambda out: block_scaled_result(out, inputs_b["valid_m"]))
 
 
 @pytest.mark.L0
@@ -310,11 +333,11 @@ def dglu_block_scaled_inputs(group_m_list):
     return inputs
 
 
-def dglu_block_scaled_call(inputs):
+def dglu_block_scaled_call(inputs, **overrides):
     from cudnn import grouped_gemm_dglu_wrapper_sm100
 
     inputs["dprob_tensor"].zero_()
-    return grouped_gemm_dglu_wrapper_sm100(
+    kwargs = dict(
         a_tensor=inputs["a_tensor"],
         c_tensor=inputs["c_tensor"],
         sfa_tensor=inputs["sfa_tensor"],
@@ -329,17 +352,54 @@ def dglu_block_scaled_call(inputs):
         d_dtype=torch.float8_e4m3fn,
         sf_vec_size=32,
     )
+    kwargs.update(overrides)
+    return grouped_gemm_dglu_wrapper_sm100(**kwargs)
 
 
 @pytest.mark.L0
-def test_dglu_block_scaled_memo_hit_matches_cold_path(monkeypatch):
+@pytest.mark.parametrize("act_func,linear_offset", [("dswiglu", None), ("dgeglu", None), ("dgeglu", 0.5)])
+def test_dglu_block_scaled_memo_hit_matches_cold_path(monkeypatch, act_func, linear_offset):
     from cudnn.gemm.cutedsl.grouped.dglu import api as dglu_api
 
     inputs_a = dglu_block_scaled_inputs([256] * L_BS)
     inputs_b = dglu_block_scaled_inputs([512, 256, 512, 256])
-    assert_hit_matches_cold(
-        monkeypatch, dglu_api, "_dglu_wrapper_memo", dglu_block_scaled_call, inputs_a, inputs_b, lambda out: out["d_row_tensor"][: inputs_b["valid_m"]]
-    )
+    call = lambda inputs: dglu_block_scaled_call(inputs, act_func=act_func, linear_offset=linear_offset, generate_dbias=True)
+    assert_hit_matches_cold(monkeypatch, dglu_api, "_dglu_wrapper_memo", call, inputs_a, inputs_b, lambda out: block_scaled_result(out, inputs_b["valid_m"]))
+
+
+@pytest.mark.L0
+def test_dglu_block_scaled_memo_keys_on_linear_offset(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.dglu import api as dglu_api
+
+    memo = install_memo(monkeypatch, dglu_api, "_dglu_wrapper_memo")
+    inputs = dglu_block_scaled_inputs([256] * L_BS)
+    default = dglu_block_scaled_call(inputs, act_func="dgeglu")
+    with pytest.raises(ValueError, match="D_row must be fp8 dtype"):
+        dglu_block_scaled_call(inputs, act_func="dgeglu", d_dtype=torch.bfloat16)
+    assert memo.stores == 1
+    changed = dglu_block_scaled_call(inputs, act_func="dgeglu", linear_offset=0.5)
+    assert memo.stores == 2
+    memo.clear()
+    cold = dglu_block_scaled_call(inputs, act_func="dgeglu", linear_offset=0.5)
+    valid_m = inputs["valid_m"]
+    assert torch.equal(raw_bytes(changed["d_row_tensor"][:valid_m]), raw_bytes(cold["d_row_tensor"][:valid_m]))
+    assert not torch.equal(raw_bytes(default["d_row_tensor"][:valid_m]), raw_bytes(changed["d_row_tensor"][:valid_m]))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("operation", ["glu", "dglu"])
+def test_block_scaled_memo_respects_dynamic_mode(monkeypatch, operation):
+    import importlib
+
+    module = importlib.import_module(f"cudnn.gemm.cutedsl.grouped.{operation}.api")
+    memo = install_memo(monkeypatch, module, f"_{operation}_wrapper_memo")
+    inputs = mxfp8_inputs([256] * L_BS) if operation == "glu" else dglu_block_scaled_inputs([256] * L_BS)
+    call = glu_block_scaled_call if operation == "glu" else dglu_block_scaled_call
+    for mode in ("1", "0", "1"):
+        monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", mode)
+        call(inputs)
+    torch.cuda.synchronize()
+    assert memo.stores == 2 and len(memo) == 2
 
 
 def wgrad_inputs(group_k_list):
@@ -382,7 +442,7 @@ def test_wgrad_memo_hit_matches_cold_path(monkeypatch):
 
     inputs_a = wgrad_inputs([256, 384])
     inputs_b = wgrad_inputs([384, 256])
-    assert_hit_matches_cold(monkeypatch, wgrad_api, "_wgrad_wrapper_memo", wgrad_call, inputs_a, inputs_b, lambda out: out["wgrad_tensor"])
+    assert_hit_matches_cold(monkeypatch, wgrad_api, "_wgrad_wrapper_memo", wgrad_call, inputs_a, inputs_b, lambda out: out)
 
 
 @pytest.mark.L0
