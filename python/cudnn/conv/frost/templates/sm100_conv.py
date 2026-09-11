@@ -829,7 +829,7 @@ def _kernel(
                 # offset would over-shoot into unwritten TMEM (reading back zero).
                 # The global k128..255 offset is applied on the STORE side
                 # (band_smem_base + k_off), not here.
-                tmem_ctm = prims.make_tmem_ptr_from_warp_row_col(
+                tmem = prims.make_tmem_ptr_from_warp_row_col(
                     tmem_raw_addr,
                     warp_m_idx,
                     base_col_id + subtile_idx * subtile_n,
@@ -839,7 +839,7 @@ def _kernel(
                 # and rejected for every other shape, so pass it only for fp8.
                 t2r_rmem = prims.tcgen05_ld(
                     t2r_inst_shape,
-                    tmem_ctm,
+                    tmem,
                     num=t2r_inst_repx,
                     offset=t2r_ld_offset if cutlass.const_expr(use_fp8_simt_epi) else None,
                 )
