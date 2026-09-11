@@ -99,8 +99,9 @@ def test_bsa_attention_forward_sm120_native_blk128():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @torch_fork_set_rng(seed=20)
-def test_bsa_attention_forward_sm120_fa4_blk128_fixed_topk():
+def test_bsa_attention_forward_sm120_fa4_blk128_fixed_topk(dtype):
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
@@ -109,9 +110,9 @@ def test_bsa_attention_forward_sm120_fa4_blk128_fixed_topk():
 
     BSA = _import_bsa()
     block_size = 128
-    batch, q_heads, kv_heads, seqlen_q, seqlen_k, dim = 2, 4, 2, 2 * block_size, 4 * block_size, 128
-    q = torch.randn((batch, q_heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((batch, kv_heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    batch, q_heads, kv_heads, seqlen_q, seqlen_k, dim = 2, 4, 2, block_size + 1, 4 * block_size, 128
+    q = torch.randn((batch, q_heads, seqlen_q, dim), device="cuda", dtype=dtype)
+    k = torch.randn((batch, kv_heads, seqlen_k, dim), device="cuda", dtype=dtype)
     v = torch.randn_like(k)
 
     q_block = torch.arange(2, device="cuda", dtype=torch.int32).view(1, 1, 2, 1)
