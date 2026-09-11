@@ -49,23 +49,54 @@ def _to_cute_ptr(tensor: torch.Tensor, assumed_align: int = 128):
     )
 
 
+def _to_discrete_ptr_table(tensor: torch.Tensor):
+    """Build the device Int64 pointer-table ABI used by discrete weights."""
+
+    import cutlass
+    from cutlass.cute.runtime import make_ptr
+    from cutlass.cute.typing import AddressSpace
+
+    address = int(tensor.data_ptr())
+    if address % 8:
+        raise ValueError(
+            f"Rubin discrete pointer-table address {address:#x} is not 8-byte aligned"
+        )
+    return make_ptr(
+        cutlass.Int64,
+        address,
+        AddressSpace.gmem,
+        assumed_align=8,
+    )
+
+
 def build_runtime_kwargs(
     inputs: Mxfp8LaunchInputs,
     resources: PreparedResources,
+    *,
+    weight_storage_mode: str = "contiguous",
 ) -> dict[str, Any]:
     import cuda.bindings.driver as cuda
 
     stream = resources.runtime.current_stream()
     weights = inputs.weights
+    if weight_storage_mode == "contiguous":
+        convert_weight = _to_cute
+    elif weight_storage_mode == "discrete":
+        convert_weight = _to_discrete_ptr_table
+    else:
+        raise ValueError(
+            "weight_storage_mode must be 'contiguous' or 'discrete', "
+            f"got {weight_storage_mode!r}"
+        )
     kwargs = {
         "activation": _to_cute(inputs.activation),
         "activation_sf": _to_cute(inputs.activation_sf),
         "topk_indices": _to_cute(inputs.topk_indices),
         "topk_scores": _to_cute(inputs.topk_scores, assumed_align=4),
-        "fc1_weight": _to_cute(weights.fc1_weight),
-        "fc1_weight_sf": _to_cute(weights.fc1_weight_sf),
-        "fc2_weight": _to_cute(weights.fc2_weight),
-        "fc2_weight_sf": _to_cute(weights.fc2_weight_sf),
+        "fc1_weight": convert_weight(weights.fc1_weight),
+        "fc1_weight_sf": convert_weight(weights.fc1_weight_sf),
+        "fc2_weight": convert_weight(weights.fc2_weight),
+        "fc2_weight_sf": convert_weight(weights.fc2_weight_sf),
         "fc1_c": (None if inputs.fc1_c is None else _to_cute(inputs.fc1_c, dynamic_layout=False)),
         "output_activation": _to_cute(inputs.output_data),
         "col_quant_data": (

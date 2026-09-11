@@ -18,6 +18,11 @@ from ......quant_def import CombineFormat, QuantKind
 from ......communication.nvlink_domain.token_comm_deterministic import TokenCommDeterministic
 from ..topk_reduce import TopkReduce
 from .glu_mxfp8_col_requant import Mxfp8ColRequant
+from .glu_mxfp8_fc12_extension import (
+    WeightStorageMode,
+    discrete_weight_descriptor_workspace_alignment,
+    discrete_weight_descriptor_workspace_size,
+)
 from .glu_mxfp8_fc12_kernel import Sm107Mxfp8GluFc12Kernel
 
 
@@ -35,6 +40,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
     fc1_output_sf_region = "rubin.glu_mxfp8.mega.fc1_output_sf"
     fc1_done_counter_region = "rubin.glu_mxfp8.mega.fc1_done_counter"
     col_quant_sizes_region = "rubin.glu_mxfp8.mega.col_quant_expert_token_sizes"
+    weight_descriptor_region = "rubin.glu_mxfp8.mega.weight_descriptors"
 
     # Reserved on top of the exact token_comm/sched SMEM to cover smem.allocate inter-allocation
     # alignment padding that _compute_stages does not model (see _smem_misc_budget_bytes).
@@ -84,6 +90,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             "fc2_tma_stages": OptionalRequirement(int),
             "enable_col_quant": OptionalRequirement(bool),
             "col_quant_num_ctas": OptionalRequirement(int),
+            "weight_storage_mode": OptionalRequirement(str),
         }
 
     def name(self) -> str:
@@ -98,7 +105,8 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             f"drop{int(self.drop_on_overflow)}_lc{self.launch_cluster_count}_"
             f"genc{int(self.generate_c)}_topkfc11_"
             f"fc2bulk{int(self.fc2_use_bulk)}x{self.fc2_tma_stages}_"
-            f"redtopk{int(self.reduce_topk_in_kernel)}"
+            f"redtopk{int(self.reduce_topk_in_kernel)}_"
+            f"weight{self.weight_storage_mode}"
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -130,6 +138,48 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         output_dtype = cutlass.BFloat16
         # Weight SF and activation SF share the E8M0 block-scale dtype for mxfp8.
         weight_sf_dtype = self.token_comm.activation_sf_dtype
+        if self.weight_storage_mode == "discrete":
+            fc1_weight_arg = make_ptr(
+                Int64, 0, AddressSpace.gmem, assumed_align=8
+            )
+            fc1_weight_sf_arg = make_ptr(
+                Int64, 0, AddressSpace.gmem, assumed_align=8
+            )
+            fc2_weight_arg = make_ptr(
+                Int64, 0, AddressSpace.gmem, assumed_align=8
+            )
+            fc2_weight_sf_arg = make_ptr(
+                Int64, 0, AddressSpace.gmem, assumed_align=8
+            )
+        else:
+            fc1_weight_arg = fake_tensor(
+                self.ab_dtype,
+                (experts, hidden, intermediate_gateup),
+                (2, 0, 1),
+                {0, 2},
+                16,
+            )
+            fc1_weight_sf_arg = fake_tensor(
+                weight_sf_dtype,
+                (experts, fc1_weight_sf_columns),
+                (1, 0),
+                {0},
+                16,
+            )
+            fc2_weight_arg = fake_tensor(
+                self.ab_dtype,
+                (experts, intermediate_downproj, hidden),
+                (2, 0, 1),
+                {0, 2},
+                16,
+            )
+            fc2_weight_sf_arg = fake_tensor(
+                weight_sf_dtype,
+                (experts, fc2_weight_sf_columns),
+                (1, 0),
+                {0},
+                16,
+            )
 
         fake_arguments = dict(
             activation=fake_tensor(self.token_comm.activation_dtype, (tokens, hidden), (1, 0), {0}, 16),
@@ -142,10 +192,10 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             ),
             topk_indices=fake_tensor(cutlass.Int32, (tokens, self.topk), (1, 0), {0}, 16),
             topk_scores=fake_tensor(cutlass.Float32, (tokens, self.topk), (1, 0), {0}, 4),
-            fc1_weight=fake_tensor(self.ab_dtype, (experts, hidden, intermediate_gateup), (2, 0, 1), {0, 2}, 16),
-            fc1_weight_sf=fake_tensor(weight_sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16),
-            fc2_weight=fake_tensor(self.ab_dtype, (experts, intermediate_downproj, hidden), (2, 0, 1), {0, 2}, 16),
-            fc2_weight_sf=fake_tensor(weight_sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {0}, 16),
+            fc1_weight=fc1_weight_arg,
+            fc1_weight_sf=fc1_weight_sf_arg,
+            fc2_weight=fc2_weight_arg,
+            fc2_weight_sf=fc2_weight_sf_arg,
             output_activation=fake_tensor(output_dtype, (tokens, hidden), (1, 0), {0}, 16),
             overflow_flag=fake_tensor(cutlass.Int32, (1,), (0,), set(), 4),
             local_workspace=make_ptr(cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=128),
@@ -164,7 +214,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             fake_arguments["fc1_c"] = None
 
         if self.enable_col_quant:
-            # col_quant_data is contiguous (token, hidden);
+            # Local integration ABI: col_quant_data is contiguous (token, hidden);
             # col_quant_sf is flat concat_e [hidden_atom][token_atom] E8M0 bytes.
             fake_arguments["col_quant_data"] = fake_tensor(
                 self.ab_dtype, aux_shapes["col_quant_data"], (1, 0), set(), 16
@@ -231,6 +281,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         # A hardcoded CTA count is not generally a multiple of that quantum, which
         # leaves a fractional resident wave.
         col_quant_num_ctas: int = -1,
+        weight_storage_mode: WeightStorageMode = "contiguous",
     ) -> "Sm107MegaMoEMxfp8GluKernel":
         """Build the ``(ProblemDesc, ImplDesc)`` pair from the legacy flat signature."""
         if static_expert_shape is None:
@@ -280,6 +331,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 "use_stg_fc1": use_stg_fc1,
                 "act_func": act_func,
                 "fc2_use_bulk": fc2_use_bulk,
+                "weight_storage_mode": weight_storage_mode,
                 # OptionalRequirement: present only when set (absent == None).
                 **({"fc2_tma_stages": fc2_tma_stages} if fc2_tma_stages is not None else {}),
                 # Col-quant keys present only when enabled
@@ -341,6 +393,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         act_func = impl_desc["act_func"]
         fc2_use_bulk = impl_desc["fc2_use_bulk"]
         fc2_tma_stages = impl_desc.get("fc2_tma_stages")
+        weight_storage_mode = impl_desc.get("weight_storage_mode") or "contiguous"
         self.enable_col_quant = bool(impl_desc.get("enable_col_quant") or False)
         self._col_quant_num_ctas = int(impl_desc.get("col_quant_num_ctas") or -1)
 
@@ -388,6 +441,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             act_func=act_func,
             fc2_use_bulk=fc2_use_bulk,
             fc2_tma_stages=fc2_tma_stages,
+            weight_storage_mode=weight_storage_mode,
         )
 
         # --- Warp topology: expand to 12 warps (or 16 for standalone token-back). ---
@@ -515,6 +569,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 num_persistent_ctas=self._col_quant_num_ctas,
                 token_padding_block=self.token_padding_block,
                 sf_padding_block=self.sf_padding_block,
+                # Local integration ABI consumed by MoeEP WGrad operands.
                 dst_k_major=False,
             )
 
@@ -606,6 +661,14 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 (self.num_experts_per_rank,),
                 buffer_space="local",
                 byte_alignment=16,
+            )
+        if self.weight_storage_mode == "discrete":
+            device_workspace.register(
+                self.weight_descriptor_region,
+                cutlass.Uint8,
+                (discrete_weight_descriptor_workspace_size(self.num_experts_per_rank),),
+                buffer_space="local",
+                byte_alignment=discrete_weight_descriptor_workspace_alignment(),
             )
         self.token_comm.register_device_workspace(device_workspace)
         device_workspace.finalize()
@@ -713,10 +776,10 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         activation_sf: cute.Tensor,  # (max_tokens_per_rank, hidden // sf_vec_size), symmetric
         topk_indices: cute.Tensor,  # (max_tokens_per_rank, topk)
         topk_scores: cute.Tensor,  # (max_tokens_per_rank, topk) Float32
-        fc1_weight: cute.Tensor,  # (experts_per_rank, hidden, intermediate_gateup)
-        fc1_weight_sf: cute.Tensor,
-        fc2_weight: cute.Tensor,  # (experts_per_rank, intermediate_downproj, hidden)
-        fc2_weight_sf: cute.Tensor,
+        fc1_weight,  # Contiguous tensor or device Int64 pointer array
+        fc1_weight_sf,
+        fc2_weight,  # Contiguous tensor or device Int64 pointer array
+        fc2_weight_sf,
         output_activation: cute.Tensor,  # (max_tokens_per_rank, topk, hidden) final combined output
         fc1_c: Optional[cute.Tensor],  # (pool_token_capacity, intermediate_gateup) when generate_c=True
         col_quant_data: Optional[cute.Tensor],  # dispatch-pool-strided fp8 segments
@@ -805,6 +868,10 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 ),
             )
 
+        weight_descriptor_workspace = None
+        if cutlass.const_expr(self.weight_storage_mode == "discrete"):
+            weight_descriptor_workspace = dw.ptr(self.weight_descriptor_region)
+
         super().__call__(
             activation_pool,
             fc1_weight,
@@ -830,6 +897,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             mega_activation_sf=activation_sf,
             mega_pre_reduced_activation=pre_reduced,
             mega_pre_reduced_activation_sf=pre_reduced_sf,
+            weight_descriptor_workspace=weight_descriptor_workspace,
         )
 
         # Top-k weights were already applied before FC1 quantization, so the

@@ -27,7 +27,7 @@ from ......helpers.ptx_helpers import (
 )
 from ..helpers.utils import swiglu_act, dswiglu_act, quant_sfd_row, quant_sfd_col
 from ......quant_def import CombineFormat
-from .....schedulers import BlockPhase
+from .....schedulers.fc12_mapping import BlockPhase
 from ..tmem_transpose import _TmemTranspose16x32Core
 from ..fwd_glu.glu_mxfp8_fc12_epilogue import Fc2OutputDest
 

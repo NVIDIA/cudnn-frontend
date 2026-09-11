@@ -1,6 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-
 """FC12 work-tile ABI and grouped or phase-interleaved task mapping."""
 
 import dataclasses
@@ -876,6 +873,11 @@ class _PhaseFc12CursorState:
             self.token_block_cumulative,
         )
 
+    @cute.jit
+    def clone(self) -> "_PhaseFc12CursorState":
+        """Fork this cursor while sharing its immutable initial SSA values."""
+        return type(self)(*self._runtime_fields(), blocks_per_token_block=self.blocks_per_token_block)
+
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
         for field in self._runtime_fields():
@@ -1074,6 +1076,20 @@ def _seek_phase_cursor(
 
 
 @cute.jit
+def resolve_phase_interleaved_fc1_claim_target(
+    minimum_claim_count: Int32, mapping_state: PhaseInterleavedFc12MappingState
+) -> Tuple[Int32, Boolean]:
+    """Resolve the static FC1 watermark or the smaller runtime stream extent."""
+    target_work_id = minimum_claim_count - Int32(1)
+    probe_cursor = _seek_phase_cursor(target_work_id, mapping_state.fc1_cursor.clone(), mapping_state)
+    stream_ends_before_target = target_work_id >= probe_cursor.expert_tile_end
+    claim_target = minimum_claim_count
+    if stream_ends_before_target:
+        claim_target = probe_cursor.expert_tile_end
+    return claim_target, stream_ends_before_target
+
+
+@cute.jit
 def _decode_phase_work_id(
     linear_work_id: Int32,
     phase: Int32,
@@ -1170,4 +1186,5 @@ __all__ = [
     "map_fc12_linear_work_id",
     "map_phase_interleaved_fc12_work_id",
     "peek_ready_bit",
+    "resolve_phase_interleaved_fc1_claim_target",
 ]

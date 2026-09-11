@@ -8,8 +8,9 @@ from typing import ClassVar, List, Literal, Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
-from cutlass.cute.typing import Pointer
-from cutlass.cutlass_dsl import Int32, extract_mlir_values, new_from_mlir_values
+from cutlass._mlir.dialects import cute as cute_ir, cute_nvgpu as cute_nvgpu_ir, llvm
+from cutlass.cute.typing import AddressSpace, Pointer
+from cutlass.cutlass_dsl import Int32, dsl_user_op, extract_mlir_values, new_from_mlir_values
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 from ......helpers.dsl_helpers import spin_peek, spin_wait
@@ -32,6 +33,87 @@ TensorRole = Literal[
     "fc2_weight",
     "fc2_weight_sf",
 ]
+WeightStorageMode = Literal["contiguous", "discrete"]
+
+_descriptor_byte_count = 128
+_discrete_weight_descriptor_roles = (
+    "fc1_weight",
+    "fc1_weight_sf",
+    "fc2_weight",
+    "fc2_weight_sf",
+)
+_discrete_weight_descriptor_slot = {
+    tensor_role: slot_index
+    for slot_index, tensor_role in enumerate(_discrete_weight_descriptor_roles)
+}
+
+
+def discrete_weight_descriptor_workspace_size(expert_count: int) -> int:
+    """Return storage bytes for four 128-byte TensorMaps per expert."""
+    if (
+        not isinstance(expert_count, int)
+        or isinstance(expert_count, bool)
+        or expert_count <= 0
+    ):
+        raise ValueError("expert_count must be a positive integer.")
+    return (
+        expert_count
+        * len(_discrete_weight_descriptor_roles)
+        * _descriptor_byte_count
+    )
+
+
+def discrete_weight_descriptor_workspace_alignment() -> int:
+    return _descriptor_byte_count
+
+
+@cute.jit
+def raw_discrete_weight_descriptor_pointer(
+    descriptor_workspace: Pointer,
+    tensor_role: TensorRole,
+    expert_idx: Int32,
+) -> Pointer:
+    """Return the 128-byte-aligned descriptor slot for one expert operand."""
+    slot_index = _discrete_weight_descriptor_slot[tensor_role]
+    byte_offset = (
+        expert_idx * len(_discrete_weight_descriptor_roles) + slot_index
+    ) * _descriptor_byte_count
+    return (descriptor_workspace + byte_offset).align(_descriptor_byte_count)
+
+
+@dsl_user_op
+def copy_discrete_weight_descriptor_pointer(
+    descriptor_workspace: Pointer,
+    tensor_role: TensorRole,
+    expert_idx: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Pointer:
+    """Convert a raw GMEM descriptor slot to the type accepted by TMA copy."""
+    raw_pointer = raw_discrete_weight_descriptor_pointer(
+        descriptor_workspace, tensor_role, expert_idx
+    )
+    generic_llvm_pointer = llvm.addrspacecast(
+        llvm.PointerType.get(AddressSpace.generic),
+        raw_pointer.llvm_ptr,
+        loc=loc,
+        ip=ip,
+    )
+    generic_pointer = cute.make_ptr(
+        raw_pointer.dtype,
+        generic_llvm_pointer,
+        AddressSpace.generic,
+        assumed_align=raw_pointer.alignment,
+        loc=loc,
+        ip=ip,
+    )
+    descriptor_pointer_type = cute_ir.PtrType.get(
+        cute_nvgpu_ir.TmaDescriptorTiledType.get(),
+        generic_pointer.memspace,
+        generic_pointer.alignment,
+    )
+    return cute_ir.recast_iter(descriptor_pointer_type, generic_pointer.value)
 
 
 @cute.jit
@@ -50,12 +132,26 @@ class GluMxFp8Fc12SchedExtension:
     fc2_spin_threshold: Int32
     fc1_ready_counter_pointer: Optional[Pointer] = None
     cluster_m: int = 1
+    weight_storage_mode: WeightStorageMode = "contiguous"
+    weight_descriptor_workspace: Optional[Pointer] = None
 
     def __post_init__(self) -> None:
         if self.sf_vec_size <= 0:
             raise ValueError(f"sf_vec_size must be positive, got {self.sf_vec_size}.")
         if self.cluster_m <= 0:
             raise ValueError(f"cluster_m must be positive, got {self.cluster_m}.")
+        if self.weight_storage_mode not in ("contiguous", "discrete"):
+            raise ValueError(
+                "weight_storage_mode must be 'contiguous' or 'discrete', got "
+                f"{self.weight_storage_mode!r}."
+            )
+        if (
+            self.weight_storage_mode == "discrete"
+            and self.weight_descriptor_workspace is None
+        ):
+            raise ValueError(
+                "Discrete weights require a weight descriptor workspace."
+            )
         object.__setattr__(self, "fc2_spin_threshold", Int32(self.fc2_spin_threshold))
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
@@ -64,6 +160,8 @@ class GluMxFp8Fc12SchedExtension:
         values.extend(extract_mlir_values(self.fc2_spin_threshold))
         if self.fc1_ready_counter_pointer is not None:
             values.extend(extract_mlir_values(self.fc1_ready_counter_pointer))
+        if self.weight_descriptor_workspace is not None:
+            values.extend(extract_mlir_values(self.weight_descriptor_workspace))
         return values
 
     def __new_from_mlir_values__(self, values: List[ir.Value]) -> "GluMxFp8Fc12SchedExtension":
@@ -81,6 +179,11 @@ class GluMxFp8Fc12SchedExtension:
         fc1_ready_counter_pointer = (
             rebuild(self.fc1_ready_counter_pointer) if self.fc1_ready_counter_pointer is not None else None
         )
+        weight_descriptor_workspace = (
+            rebuild(self.weight_descriptor_workspace)
+            if self.weight_descriptor_workspace is not None
+            else None
+        )
         if value_index != len(values):
             raise ValueError(
                 f"GluMxFp8Fc12SchedExtension MLIR value count mismatch: consumed {value_index}, got {len(values)}."
@@ -91,6 +194,8 @@ class GluMxFp8Fc12SchedExtension:
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=fc1_ready_counter_pointer,
             cluster_m=self.cluster_m,
+            weight_storage_mode=self.weight_storage_mode,
+            weight_descriptor_workspace=weight_descriptor_workspace,
         )
 
     @cute.jit
@@ -167,6 +272,16 @@ class GluMxFp8Fc12SchedExtension:
             return (_rewrite_tensor_shape(real, (shape[0], shape[1], c1)), None)
 
         elif cutlass.const_expr(tensor_name == "fc1_weight"):
+            if cutlass.const_expr(self.weight_storage_mode == "discrete"):
+                real = _rewrite_tensor_shape(
+                    gmem_tensor_in_moe_view, (shape[0], shape[1], c1)
+                )
+                descriptor = copy_discrete_weight_descriptor_pointer(
+                    self.weight_descriptor_workspace,
+                    tensor_name,
+                    expert_idx,
+                )
+                return (real, descriptor)
             real = cute.domain_offset((0, 0, expert_idx), gmem_tensor_in_moe_view)
             return (_rewrite_tensor_shape(real, (shape[0], shape[1], c1)), None)
 
@@ -178,6 +293,19 @@ class GluMxFp8Fc12SchedExtension:
             return (real, None)
 
         elif cutlass.const_expr(tensor_name == "fc1_weight_sf"):
+            if cutlass.const_expr(self.weight_storage_mode == "discrete"):
+                per_expert_shape = (shape[0], shape[1], c1)
+                sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
+                real = cute.make_tensor(
+                    gmem_tensor_in_moe_view.iterator,
+                    cute.make_layout(sf_layout.shape, stride=stride),
+                )
+                descriptor = copy_discrete_weight_descriptor_pointer(
+                    self.weight_descriptor_workspace,
+                    tensor_name,
+                    expert_idx,
+                )
+                return (real, descriptor)
             real = cute.domain_offset((0, 0, expert_idx), gmem_tensor_in_moe_view)
             per_expert_shape = (shape[0], shape[1], c1)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
@@ -216,10 +344,33 @@ class GluMxFp8Fc12SchedExtension:
             return (real, None)
 
         elif cutlass.const_expr(tensor_name == "fc2_weight"):
+            if cutlass.const_expr(self.weight_storage_mode == "discrete"):
+                real = _rewrite_tensor_shape(
+                    gmem_tensor_in_moe_view, (shape[0], shape[1], c1)
+                )
+                descriptor = copy_discrete_weight_descriptor_pointer(
+                    self.weight_descriptor_workspace,
+                    tensor_name,
+                    expert_idx,
+                )
+                return (real, descriptor)
             real = cute.domain_offset((0, 0, expert_idx), gmem_tensor_in_moe_view)
             return (_rewrite_tensor_shape(real, (shape[0], shape[1], c1)), None)
 
         elif cutlass.const_expr(tensor_name == "fc2_weight_sf"):
+            if cutlass.const_expr(self.weight_storage_mode == "discrete"):
+                per_expert_shape = (shape[0], shape[1], c1)
+                sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
+                real = cute.make_tensor(
+                    gmem_tensor_in_moe_view.iterator,
+                    cute.make_layout(sf_layout.shape, stride=stride),
+                )
+                descriptor = copy_discrete_weight_descriptor_pointer(
+                    self.weight_descriptor_workspace,
+                    tensor_name,
+                    expert_idx,
+                )
+                return (real, descriptor)
             real = cute.domain_offset((0, 0, expert_idx), gmem_tensor_in_moe_view)
             per_expert_shape = (shape[0], shape[1], c1)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
@@ -229,4 +380,8 @@ class GluMxFp8Fc12SchedExtension:
         raise ValueError(f"Unknown tensor_name: {tensor_name!r}.")
 
 
-__all__ = ["GluMxFp8Fc12SchedExtension", "TensorRole"]
+__all__ = [
+    "GluMxFp8Fc12SchedExtension",
+    "TensorRole",
+    "WeightStorageMode",
+]

@@ -195,6 +195,34 @@ class MoeEpNativeWeightLayout(str, Enum):
     FORWARD_FC2_K_MAJOR_V1 = "mxfp8.forward_fc2.k_major.blocked_sf.v1"
     BACKWARD_W2_TRANSPOSE_V1 = "mxfp8.backward_w2_transpose.contiguous.blocked_sf.v1"
     BACKWARD_W1_TRANSPOSE_GATE_UP_INTERLEAVED_32_V1 = "mxfp8.backward_w1_transpose.gate_up_interleaved_32.blocked_sf.v1"
+    BACKWARD_W2_DGRAD_NK_ROW_MAJOR_V1 = "mxfp8.backward_w2_dgrad.nk_row_major.blocked_sf.v1"
+    BACKWARD_W1_DGRAD_GATE_UP_INTERLEAVED_32_NK_ROW_MAJOR_V1 = (
+        "mxfp8.backward_w1_dgrad.gate_up_interleaved_32.nk_row_major.blocked_sf.v1"
+    )
+
+
+class MoeEpNativeWeightStorageMode(str, Enum):
+    """Addressing mode used by kernel-native training weights."""
+
+    CONTIGUOUS = "contiguous"
+    DISCRETE = "discrete"
+
+
+def parse_native_weight_storage_mode(
+    value: Union[MoeEpNativeWeightStorageMode, str],
+) -> MoeEpNativeWeightStorageMode:
+    """Normalize a native training-weight storage mode."""
+
+    if isinstance(value, MoeEpNativeWeightStorageMode):
+        return value
+    try:
+        return MoeEpNativeWeightStorageMode(value.lower())
+    except (AttributeError, ValueError) as exc:
+        choices = ", ".join(mode.value for mode in MoeEpNativeWeightStorageMode)
+        raise ValueError(
+            f"unsupported native weight storage mode {value!r}; "
+            f"expected one of: {choices}"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -254,6 +282,61 @@ class MoeEpNativeBackwardWeights:
 
     w2_transpose: MoeEpNativeWeight
     w1_transpose: MoeEpNativeWeight
+
+
+@dataclass(frozen=True)
+class MoeEpNativeDiscreteWeight:
+    """Device pointer arrays for one independently allocated expert weight."""
+
+    payload_ptrs: torch.Tensor
+    scale_ptrs: torch.Tensor
+    layout_id: Union[MoeEpNativeWeightLayout, str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.payload_ptrs, torch.Tensor):
+            raise TypeError(
+                "payload_ptrs must be a torch.Tensor, "
+                f"got {type(self.payload_ptrs).__name__}"
+            )
+        if not isinstance(self.scale_ptrs, torch.Tensor):
+            raise TypeError(
+                "scale_ptrs must be a torch.Tensor, "
+                f"got {type(self.scale_ptrs).__name__}"
+            )
+        if self.payload_ptrs.device != self.scale_ptrs.device:
+            raise ValueError(
+                f"payload_ptrs device {self.payload_ptrs.device} does not match "
+                f"scale_ptrs device {self.scale_ptrs.device}"
+            )
+        try:
+            layout_id = MoeEpNativeWeightLayout(self.layout_id)
+        except (TypeError, ValueError) as exc:
+            choices = ", ".join(layout.value for layout in MoeEpNativeWeightLayout)
+            raise ValueError(
+                f"unsupported native weight layout_id {self.layout_id!r}; "
+                f"expected one of: {choices}"
+            ) from exc
+        object.__setattr__(self, "layout_id", layout_id)
+
+    @property
+    def device(self) -> torch.device:
+        return self.payload_ptrs.device
+
+
+@dataclass(frozen=True)
+class MoeEpNativeDiscreteForwardWeights:
+    """Discrete kernel-native weights consumed by one training forward."""
+
+    fc1: MoeEpNativeDiscreteWeight
+    fc2: MoeEpNativeDiscreteWeight
+
+
+@dataclass(frozen=True)
+class MoeEpNativeDiscreteBackwardWeights:
+    """Discrete kernel-native dgrad weights in upstream row-major GEMM layout."""
+
+    w2_transpose: MoeEpNativeDiscreteWeight
+    w1_transpose: MoeEpNativeDiscreteWeight
 
 
 @dataclass(frozen=True)
@@ -348,13 +431,18 @@ __all__ = [
     "MoeEpForwardWeightStaging",
     "MoeEpForwardWeights",
     "MoeEpNativeBackwardWeights",
+    "MoeEpNativeDiscreteBackwardWeights",
+    "MoeEpNativeDiscreteForwardWeights",
+    "MoeEpNativeDiscreteWeight",
     "MoeEpNativeForwardWeights",
     "MoeEpNativeWeight",
     "MoeEpNativeWeightLayout",
+    "MoeEpNativeWeightStorageMode",
     "MoeEpTrainingBackwardOutputs",
     "MoeEpTrainingForwardOutputs",
     "MoeEpTrainingWgradOperands",
     "MoeFormat",
     "MoeTensor",
+    "parse_native_weight_storage_mode",
     "parse_format",
 ]

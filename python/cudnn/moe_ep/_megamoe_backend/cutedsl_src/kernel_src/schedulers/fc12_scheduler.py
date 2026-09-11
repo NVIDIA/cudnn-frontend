@@ -1,6 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-
 """Composable grouped and phase-interleaved FC12 schedulers."""
 
 import math
@@ -12,6 +9,7 @@ from cutlass.cutlass_dsl import Boolean, Int32, Integer, extract_mlir_values, ne
 
 from ...api import ImplDesc, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from ...helpers.device_workspace import DeviceWorkspace
+from ...helpers.dsl_helpers import spin_peek, spin_wait
 from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div
 from .base import SchedulerBase, SchedulerWorkTileBase, WorkIdAcquisitionMode
@@ -24,6 +22,7 @@ from .fc12_mapping import (
     make_fc12_done_tile,
     map_fc12_linear_work_id,
     map_phase_interleaved_fc12_work_id,
+    resolve_phase_interleaved_fc1_claim_target,
 )
 from .non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
 
@@ -47,14 +46,25 @@ def _mixed_cga_impl_requirements() -> dict:
     }
 
 
+def minimum_phase_interleave_fc1_claims(
+    *, blocks_fc1: int, blocks_fc2: int, launch_cluster_cnt_merge_as_preferred: int
+) -> int:
+    """Return the global FC1 claim watermark covering one canonical FC2 wave."""
+    effective_wave_width = launch_cluster_cnt_merge_as_preferred
+    max_dependent_token_blocks = ceil_div(effective_wave_width + blocks_fc2 - 1, blocks_fc2)
+    return max_dependent_token_blocks * blocks_fc1
+
+
 def minimum_phase_interleave_hint(
     *, blocks_fc1: int, blocks_fc2: int, launch_cluster_cnt_merge_as_preferred: int
 ) -> int:
     """Return the per-cluster FC1 prologue covering one canonical FC2 claim wave."""
-    effective_wave_width = launch_cluster_cnt_merge_as_preferred
-    max_dependent_token_blocks = ceil_div(effective_wave_width + blocks_fc2 - 1, blocks_fc2)
-    required_fc1_work = max_dependent_token_blocks * blocks_fc1
-    return max(1, ceil_div(required_fc1_work, launch_cluster_cnt_merge_as_preferred))
+    required_fc1_claims = minimum_phase_interleave_fc1_claims(
+        blocks_fc1=blocks_fc1,
+        blocks_fc2=blocks_fc2,
+        launch_cluster_cnt_merge_as_preferred=launch_cluster_cnt_merge_as_preferred,
+    )
+    return max(1, ceil_div(required_fc1_claims, launch_cluster_cnt_merge_as_preferred))
 
 
 def _to_fc12_mapping_cta_coord(cta_coord_in_preferred_cluster: cute.Coord, is_swap_ab: bool) -> cute.Coord:
@@ -339,15 +349,27 @@ class _PhaseInterleaveControlState:
     """Per-cluster phase cadence and stream exhaustion state."""
 
     def __init__(
-        self, prologue_remaining: Int32, cycle_position: Int32, fc1_exhausted: Boolean, fc2_exhausted: Boolean
+        self,
+        prologue_remaining: Int32,
+        cycle_position: Int32,
+        fc1_exhausted: Boolean,
+        fc2_exhausted: Boolean,
+        prologue_claims_synchronized: Boolean,
     ) -> None:
         self.prologue_remaining = prologue_remaining
         self.cycle_position = cycle_position
         self.fc1_exhausted = fc1_exhausted
         self.fc2_exhausted = fc2_exhausted
+        self.prologue_claims_synchronized = prologue_claims_synchronized
 
     def _fields(self) -> Tuple:
-        return (self.prologue_remaining, self.cycle_position, self.fc1_exhausted, self.fc2_exhausted)
+        return (
+            self.prologue_remaining,
+            self.cycle_position,
+            self.fc1_exhausted,
+            self.fc2_exhausted,
+            self.prologue_claims_synchronized,
+        )
 
     def __extract_mlir_values__(self) -> list:
         values = []
@@ -440,6 +462,11 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         interleave_gcd = math.gcd(self.blocks_fc1, self.blocks_fc2)
         self.interleave_fc2_slots = self.blocks_fc2 // interleave_gcd
         self.interleave_cycle_length = (self.blocks_fc1 + self.blocks_fc2) // interleave_gcd
+        self.minimum_global_fc1_claims = minimum_phase_interleave_fc1_claims(
+            blocks_fc1=self.blocks_fc1,
+            blocks_fc2=self.blocks_fc2,
+            launch_cluster_cnt_merge_as_preferred=self.launch_cluster_cnt_merge_as_preferred,
+        )
         minimum_hint = minimum_phase_interleave_hint(
             blocks_fc1=self.blocks_fc1,
             blocks_fc2=self.blocks_fc2,
@@ -569,7 +596,28 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             cycle_position=Int32(0),
             fc1_exhausted=Boolean(False),
             fc2_exhausted=Boolean(False),
+            prologue_claims_synchronized=Boolean(False),
         )
+
+    @cute.jit
+    def _wait_for_fc1_prologue_claims(
+        self,
+        fc1_exhausted: Boolean,
+        work_id_worker: NonClcMixedCgaSchedulerWorker,
+        task_mapping_state,
+    ) -> Boolean:
+        """Wait until the static FC1 watermark or the smaller runtime stream end is claimed."""
+        if not fc1_exhausted:
+            fc1_counter_pointer = work_id_worker.get_atomic_counter_pointer(Int32(0))
+            minimum_claim_count = Int32(self.minimum_global_fc1_claims)
+            if not spin_peek(fc1_counter_pointer, lambda value: value >= minimum_claim_count):
+                claim_target, stream_ends_before_target = resolve_phase_interleaved_fc1_claim_target(
+                    minimum_claim_count, task_mapping_state
+                )
+                spin_wait(fc1_counter_pointer, lambda value: value >= claim_target)
+                if stream_ends_before_target:
+                    fc1_exhausted = Boolean(True)
+        return fc1_exhausted
 
     @cute.jit
     def gen_next_work(self) -> SchedulerWorkTileBase:
@@ -582,6 +630,7 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         cycle_position = control_state.cycle_position
         fc1_exhausted = control_state.fc1_exhausted
         fc2_exhausted = control_state.fc2_exhausted
+        prologue_claims_synchronized = control_state.prologue_claims_synchronized
         resolved = Boolean(False)
 
         while not resolved:
@@ -615,6 +664,11 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
                     linear_work_id, phase, cta_id_in_mapping_cluster, task_mapping_state
                 )
                 if stream_has_work:
+                    if (not want_fc1) and (not prologue_claims_synchronized):
+                        fc1_exhausted = self._wait_for_fc1_prologue_claims(
+                            fc1_exhausted, work_id_worker, task_mapping_state
+                        )
+                        prologue_claims_synchronized = Boolean(True)
                     if prologue_remaining > Int32(0):
                         prologue_remaining = prologue_remaining - Int32(1)
                     else:
@@ -630,6 +684,7 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         control_state.cycle_position = cycle_position
         control_state.fc1_exhausted = fc1_exhausted
         control_state.fc2_exhausted = fc2_exhausted
+        control_state.prologue_claims_synchronized = prologue_claims_synchronized
         self._work_id_worker = work_id_worker
         self._task_mapping_state = task_mapping_state
         self._control_state = control_state
@@ -687,6 +742,7 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             "blocks_fc2",
             "interleave_fc2_slots",
             "interleave_cycle_length",
+            "minimum_global_fc1_claims",
         ):
             setattr(result, field_name, getattr(self, field_name))
         return result

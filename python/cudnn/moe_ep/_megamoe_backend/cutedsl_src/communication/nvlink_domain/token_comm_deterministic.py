@@ -1,6 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-
 """Metadata-push routing with a fixed token sequence and fused communication."""
 
 import dataclasses

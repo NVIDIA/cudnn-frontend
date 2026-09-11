@@ -16,6 +16,9 @@ from ._types import (
     MoeEpBackwardWeights,
     MoeEpForwardWeights,
     MoeEpNativeBackwardWeights,
+    MoeEpNativeDiscreteBackwardWeights,
+    MoeEpNativeDiscreteForwardWeights,
+    MoeEpNativeDiscreteWeight,
     MoeEpNativeForwardWeights,
     MoeEpNativeWeight,
     MoeEpNativeWeightLayout,
@@ -429,6 +432,135 @@ def validate_native_backward_weights(
         expected,
         scale_dtype=sf_dtype,
         device=device,
+    )
+
+
+def _validate_discrete_weight(
+    name: str,
+    weight: MoeEpNativeDiscreteWeight,
+    *,
+    layout_id: MoeEpNativeWeightLayout,
+    experts: int,
+    device: torch.device | None,
+    validate_pointees: bool,
+) -> torch.device:
+    if not isinstance(weight, MoeEpNativeDiscreteWeight):
+        raise TypeError(
+            f"{name} must be a MoeEpNativeDiscreteWeight, "
+            f"got {type(weight).__name__}"
+        )
+    if weight.layout_id is not layout_id:
+        raise ValueError(
+            f"{name}.layout_id must be {layout_id.value!r}, "
+            f"got {weight.layout_id.value!r}"
+        )
+    for field_name, table in (
+        ("payload_ptrs", weight.payload_ptrs),
+        ("scale_ptrs", weight.scale_ptrs),
+    ):
+        _validate_strided(f"{name}.{field_name}", table)
+        if tuple(table.shape) != (experts,):
+            raise ValueError(
+                f"{name}.{field_name} shape must be ({experts},), "
+                f"got {tuple(table.shape)}"
+            )
+        if table.dtype is not torch.int64:
+            raise ValueError(
+                f"{name}.{field_name} must have dtype torch.int64, "
+                f"got {table.dtype}"
+            )
+        if not table.is_contiguous():
+            raise ValueError(f"{name}.{field_name} must be contiguous")
+        if table.device.type != "cuda":
+            raise ValueError(
+                f"{name}.{field_name} must be a CUDA tensor, got {table.device}"
+            )
+        if table.data_ptr() % 8:
+            raise ValueError(f"{name}.{field_name} address must be 8-byte aligned")
+        if device is not None and table.device != device:
+            raise ValueError(
+                f"{name}.{field_name} must be on {device}, got {table.device}"
+            )
+        if validate_pointees and table.numel():
+            pointees = table.detach()
+            if bool((pointees <= 0).any().item()):
+                raise ValueError(
+                    f"{name}.{field_name} must contain positive, non-null pointers"
+                )
+            if bool((pointees.remainder(256) != 0).any().item()):
+                raise ValueError(
+                    f"{name}.{field_name} pointees must be 256-byte aligned"
+                )
+    return weight.device
+
+
+def validate_native_discrete_forward_weights(
+    config: ForwardConfig,
+    weights: MoeEpNativeDiscreteForwardWeights,
+    *,
+    device: torch.device | None = None,
+    validate_pointees: bool = True,
+) -> torch.device:
+    """Validate forward pointer tables; pointee extents remain caller-owned ABI."""
+
+    if not isinstance(weights, MoeEpNativeDiscreteForwardWeights):
+        raise TypeError(
+            "weights must be a MoeEpNativeDiscreteForwardWeights, "
+            f"got {type(weights).__name__}"
+        )
+    if config.fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
+        raise ValueError("native training weights require weight_interleave_size=32")
+    resolved = _validate_discrete_weight(
+        "weights.fc1",
+        weights.fc1,
+        layout_id=MoeEpNativeWeightLayout.FORWARD_FC1_GATE_UP_INTERLEAVED_32_V1,
+        experts=config.experts_per_rank,
+        device=device,
+        validate_pointees=validate_pointees,
+    )
+    return _validate_discrete_weight(
+        "weights.fc2",
+        weights.fc2,
+        layout_id=MoeEpNativeWeightLayout.FORWARD_FC2_K_MAJOR_V1,
+        experts=config.experts_per_rank,
+        device=resolved,
+        validate_pointees=validate_pointees,
+    )
+
+
+def validate_native_discrete_backward_weights(
+    config: ForwardConfig,
+    weights: MoeEpNativeDiscreteBackwardWeights,
+    *,
+    device: torch.device | None = None,
+    validate_pointees: bool = True,
+) -> torch.device:
+    """Validate backward pointer tables; pointee extents remain caller-owned ABI."""
+
+    if not isinstance(weights, MoeEpNativeDiscreteBackwardWeights):
+        raise TypeError(
+            "weights must be a MoeEpNativeDiscreteBackwardWeights, "
+            f"got {type(weights).__name__}"
+        )
+    if config.fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
+        raise ValueError("native training weights require weight_interleave_size=32")
+    resolved = _validate_discrete_weight(
+        "weights.w2_transpose",
+        weights.w2_transpose,
+        layout_id=MoeEpNativeWeightLayout.BACKWARD_W2_DGRAD_NK_ROW_MAJOR_V1,
+        experts=config.experts_per_rank,
+        device=device,
+        validate_pointees=validate_pointees,
+    )
+    return _validate_discrete_weight(
+        "weights.w1_transpose",
+        weights.w1_transpose,
+        layout_id=(
+            MoeEpNativeWeightLayout.BACKWARD_W1_DGRAD_GATE_UP_INTERLEAVED_32_NK_ROW_MAJOR_V1
+        ),
+        experts=config.experts_per_rank,
+        device=resolved,
+        validate_pointees=validate_pointees,
     )
 
 

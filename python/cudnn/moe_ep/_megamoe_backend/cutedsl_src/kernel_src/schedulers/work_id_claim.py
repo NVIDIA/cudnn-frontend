@@ -1,6 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-
 """Blackwell persistent work-ID claim backends."""
 
 import dataclasses

@@ -11,6 +11,8 @@ from ..._math import round_up
 from ..._types import (
     BlockScaledTensor,
     MoeEpNativeBackwardWeights,
+    MoeEpNativeDiscreteBackwardWeights,
+    MoeEpNativeDiscreteForwardWeights,
     MoeEpNativeForwardWeights,
     MoeEpTrainingBackwardOutputs,
     MoeEpTrainingForwardOutputs,
@@ -35,7 +37,9 @@ from ._training_resources import (
     Mxfp8TrainingState,
 )
 from ._training_weights import (
+    backward_discrete_native_to_kernel,
     backward_native_to_kernel,
+    forward_discrete_native_to_kernel,
     forward_native_to_kernel,
 )
 from ._training_wgrad import assemble_training_wgrad_operands
@@ -124,7 +128,7 @@ def launch_training_forward(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     *,
-    weights: MoeEpNativeForwardWeights,
+    weights: MoeEpNativeForwardWeights | MoeEpNativeDiscreteForwardWeights,
     out: MoeEpTrainingForwardOutputs,
 ) -> torch.Tensor:
     """Launch one stateless forward over caller-owned outputs."""
@@ -178,12 +182,22 @@ def launch_training_forward(
     _runtime_debug("training-forward.reset.end", lane=scratch.index)
 
     workspace = execution.forward.workspace
+    if state.weight_storage_mode == "discrete":
+        if not isinstance(weights, MoeEpNativeDiscreteForwardWeights):
+            raise TypeError(
+                "discrete training requires MoeEpNativeDiscreteForwardWeights"
+            )
+        kernel_weights = forward_discrete_native_to_kernel(weights)
+    else:
+        if not isinstance(weights, MoeEpNativeForwardWeights):
+            raise TypeError("contiguous training requires MoeEpNativeForwardWeights")
+        kernel_weights = forward_native_to_kernel(weights)
     inputs = Mxfp8LaunchInputs(
         activation=activation_data,
         activation_sf=activation_sf,
         topk_indices=scratch.routing_topk_idx,
         topk_scores=scratch.routing_topk_weights,
-        weights=forward_native_to_kernel(weights),
+        weights=kernel_weights,
         fc1_c=fc1_preact,
         output_data=out.output,
         col_quant_data=col_quant_data,
@@ -201,7 +215,13 @@ def launch_training_forward(
     )
     _runtime_debug("training-forward.compile.end", lane=scratch.index)
     _runtime_debug("training-forward.launch.begin", lane=scratch.index)
-    compiled.callable(**build_runtime_kwargs(inputs, execution.forward))
+    compiled.callable(
+        **build_runtime_kwargs(
+            inputs,
+            execution.forward,
+            weight_storage_mode=state.weight_storage_mode,
+        )
+    )
     _runtime_debug("training-forward.launch.end", lane=scratch.index)
     _runtime_debug("training-forward.offsets.begin", lane=scratch.index)
     _write_expert_offsets(
@@ -225,7 +245,7 @@ def launch_training_backward(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     *,
-    weights: MoeEpNativeBackwardWeights,
+    weights: MoeEpNativeBackwardWeights | MoeEpNativeDiscreteBackwardWeights,
     fc1_preact: torch.Tensor,
     fc1_a: torch.Tensor | None,
     fc1_sfa: torch.Tensor | None,
@@ -296,7 +316,16 @@ def launch_training_backward(
     _runtime_debug("training-backward.reset.end", lane=scratch.index)
 
     workspace = execution.backward.workspace
-    kernel_weights = backward_native_to_kernel(weights)
+    if state.weight_storage_mode == "discrete":
+        if not isinstance(weights, MoeEpNativeDiscreteBackwardWeights):
+            raise TypeError(
+                "discrete training requires MoeEpNativeDiscreteBackwardWeights"
+            )
+        kernel_weights = backward_discrete_native_to_kernel(weights)
+    else:
+        if not isinstance(weights, MoeEpNativeBackwardWeights):
+            raise TypeError("contiguous training requires MoeEpNativeBackwardWeights")
+        kernel_weights = backward_native_to_kernel(weights)
     inputs = Mxfp8BackwardLaunchInputs(
         grad_out=activation_data,
         grad_out_sf=activation_sf,
@@ -329,7 +358,13 @@ def launch_training_backward(
     )
     _runtime_debug("training-backward.compile.end", lane=scratch.index)
     _runtime_debug("training-backward.launch.begin", lane=scratch.index)
-    compiled.callable(**build_backward_runtime_kwargs(inputs, execution.backward))
+    compiled.callable(
+        **build_backward_runtime_kwargs(
+            inputs,
+            execution.backward,
+            weight_storage_mode=state.weight_storage_mode,
+        )
+    )
     _runtime_debug("training-backward.launch.end", lane=scratch.index)
     state.apply_overflow(lane=scratch.index, phase="backward")
 

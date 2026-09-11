@@ -9,24 +9,21 @@ documented in the parent backend `README.md`.
 - **Project**: `cutedsl_megamoe` (NVIDIA-internal repository; URL omitted).
 - **Source tree**: `cutedsl_megamoe/next/sources`.
 - **Current synchronized commit**:
-  `9b15c450e2d19472bdfaae37489317f029beb01c`.
-- **Earlier import points**:
-  - base forward:
-    `882c83e2ce4086c3cd4211fc5a2296143c5e2aea`;
-  - selected forward updates and backward dGLU:
-    `92dd334af2eeedb36087834354b58ace08e880c6`;
-  - forward column-quantization output-layout updates:
-    `5b89819cb16069dfe20a1a0ba0778d35cb428352`.
-- **Last synced**: 2026-09-02. Earlier imports occurred on 2026-08-11,
-  2026-08-17, 2026-08-20, 2026-08-24, and 2026-08-28.
-- **Vendored subset**: the recursive Python import closure required by Rubin
-  SM107 training MegaMoE forward GLU, optional forward MXFP8 column
-  requantization, and backward dGLU.
+  `aa173b4af2dc859e86de61e51d34a69c7f8cafe6`.
+- **Discrete-weight implementation**:
+  `7cc8d2eb2fb2fc9643ccd6244d6c810ed9f4341b`.
+- **Last synced**: 2026-09-11.
+- **Vendored subset**: the exact export closure produced for
+  `RubinTrainingFwdGluMegaMoE` and `RubinTrainingBwdDgluMegaMoE`, including
+  materialized source-copy modules.
 
-Complete kernel products, runners, tests, repository scaffolding, and
-unrelated Blackwell and Rubin inference sources are excluded. Three
-architecture-neutral Blackwell donor modules are retained because the Rubin
-`topk_reduce.py` and `tmem_transpose.py` source-copy shims import them.
+The export command is:
+
+```bash
+python next/export_src.py \
+  --kernels RubinTrainingFwdGluMegaMoE RubinTrainingBwdDgluMegaMoE \
+  --dst_dir <empty-directory>
+```
 
 ## Policy
 
@@ -34,22 +31,29 @@ architecture-neutral Blackwell donor modules are retained because the Rubin
   synchronized commit.
 - Repository-required copyright and BSD-3-Clause SPDX headers may be added
   where the upstream snapshot did not carry them.
-- Integration behavior belongs in the parent `_megamoe_backend` package, not
-  in the vendored source bodies.
 - Local kernel fixes should go upstream first and then be synchronized here.
   Any unavoidable local source difference must be listed below.
-- Snapshot updates must preserve the minimal recursive import closure and
-  verify source-body equality while ignoring repository-added header lines.
 
 The synchronized Python sources use BSD-3-Clause SPDX identifiers.
 `LICENSE.Apache-2.0` is retained as historical snapshot metadata.
 
 ## Local differences from upstream
 
-- `kernel_src/rubin/training/__init__.py` is reduced to a package marker. This
-  avoids importing the unused traditional-wgrad product.
+- The root `cutedsl_src/__init__.py` is a package marker rather than the
+  exporter's eager kernel re-export. The integration imports concrete kernel
+  implementation modules.
+- The forward MegaMoE column-requantization output keeps MoeEP's established
+  row-major WGrad operand ABI: fake stride `(1, 0)`, `dst_k_major=False`, and
+  row-major fixed-matrix validation. This preserves `fc1_a` as
+  `(pool_rows, hidden)` with stride `(hidden, 1)`.
+- The materialized Rubin training TMEM helper replaces two unused Blackwell
+  swap-AB extension annotations with `Any`; the extension and its now-empty
+  local `kernel_src/blackwell` package tree are omitted from the vendored
+  closure.
+- Forward epilogue comments that referenced unavailable external design
+  material are replaced with self-contained dataflow descriptions.
 - Repository-required copyright and BSD-3-Clause SPDX headers are added to
-  source files that lacked explicit headers.
+  generated empty package markers.
 
 No other vendored Python source-body differences are expected.
 
@@ -59,6 +63,10 @@ Public API validation, symmetric-workspace ownership, overflow reporting,
 input and weight staging, CUDA Graph handling, dprob materialization, and
 grouped-WGrad layout conversion live in the parent `_megamoe_backend`
 package.
+
+Discrete mode passes four caller-owned CUDA `int64[E_local]` pointer arrays
+directly to the vendored forward/backward kernels. MoeEP owns neither the
+per-expert buffers nor the pointer tables.
 
 The vendored Rubin sources require a CUTLASS DSL distribution that provides
 `cutlass.utils.rubin_helpers`. The executable backend enforces

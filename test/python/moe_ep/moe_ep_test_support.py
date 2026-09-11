@@ -33,6 +33,7 @@ __all__ = [
     "_fixed_training_weights",
     "_allocate_stateless_training_outputs",
     "_allocate_training_weight_staging",
+    "_make_discrete_training_weights",
     "_forward_config",
     "_grad_output",
     "_make_forward_case",
@@ -265,6 +266,7 @@ def _training_prepared_pair(config, pool_rows: int = 512):
     }
     forward = SimpleNamespace(
         pool_token_capacity=pool_rows,
+        config=SimpleNamespace(weight_storage_mode="contiguous"),
         workspace_requirements=WorkspaceRequirements.for_mxfp8(
             config,
             kernel_local_workspace_bytes=1024,
@@ -278,7 +280,10 @@ def _training_prepared_pair(config, pool_rows: int = 512):
     )
     backward = SimpleNamespace(
         pool_token_capacity=pool_rows,
-        config=SimpleNamespace(sf_padding_block=128),
+        config=SimpleNamespace(
+            sf_padding_block=128,
+            weight_storage_mode="contiguous",
+        ),
         workspace_requirements=WorkspaceRequirements.for_mxfp8(
             config,
             kernel_local_workspace_bytes=3072,
@@ -295,7 +300,12 @@ def _training_prepared_pair(config, pool_rows: int = 512):
     return forward, backward
 
 
-def _training_abi_prepared(name: str, max_recv_size: int = 4):
+def _training_abi_prepared(
+    name: str,
+    max_recv_size: int = 4,
+    *,
+    weight_storage_mode: str = "contiguous",
+):
     from cudnn.moe_ep._megamoe_backend._workspace import (
         BufferRegion,
         WorkspaceRequirements,
@@ -309,9 +319,11 @@ def _training_abi_prepared(name: str, max_recv_size: int = 4):
     kernel_config = SimpleNamespace(
         max_recv_size_per_rank=max_recv_size,
         physical_recv_pool_size=max_recv_size,
+        weight_storage_mode=weight_storage_mode,
         effective_config=lambda cluster_count: {
             "name": name,
             "max_recv_size_per_rank": max_recv_size,
+            "weight_storage_mode": weight_storage_mode,
             "launch_cluster_count": cluster_count,
         },
     )
@@ -1028,6 +1040,94 @@ def _allocate_training_weight_staging(weights):
         w1_transpose_scale=scale(blocked_elements(hidden, gate_up // 32)),
     )
     return forward_out, backward_out
+
+
+def _make_discrete_training_weights(forward, backward):
+    """Clone packed experts into independent allocations and build pointer tables."""
+
+    from cudnn.moe_ep import (
+        MoeEpNativeDiscreteBackwardWeights,
+        MoeEpNativeDiscreteForwardWeights,
+        MoeEpNativeDiscreteWeight,
+        MoeEpNativeWeightLayout,
+    )
+
+    def separate(packed):
+        alignment_elements = 256 // packed.element_size()
+        views = []
+        backings = []
+        for expert_index, source in enumerate(packed):
+            footprint = 1 + sum(
+                (size - 1) * stride
+                for size, stride in zip(source.shape, source.stride())
+            )
+            storage_offset = (
+                expert_index * (expert_index + 1) // 2 * alignment_elements
+            )
+            backing = torch.empty(
+                storage_offset + footprint + alignment_elements,
+                dtype=source.dtype,
+                device=source.device,
+            )
+            view = torch.as_strided(
+                backing,
+                source.shape,
+                source.stride(),
+                storage_offset,
+            )
+            view.copy_(source)
+            if view.data_ptr() % 256:
+                raise RuntimeError("discrete expert weight base must be 256-byte aligned")
+            views.append(view)
+            backings.append(backing)
+        return tuple(views), tuple(backings)
+
+    def weight(native, *, payload=None, layout_id=None):
+        if payload is None:
+            payload = native.payload
+        if layout_id is None:
+            layout_id = native.layout_id
+        payloads, payload_owners = separate(payload)
+        scales, scale_owners = separate(native.scale)
+        return (
+            MoeEpNativeDiscreteWeight(
+                torch.tensor(
+                    [value.data_ptr() for value in payloads],
+                    dtype=torch.int64,
+                    device=native.device,
+                ),
+                torch.tensor(
+                    [value.data_ptr() for value in scales],
+                    dtype=torch.int64,
+                    device=native.device,
+                ),
+                layout_id,
+            ),
+            (payloads, payload_owners, scales, scale_owners),
+        )
+
+    fc1, fc1_owners = weight(forward.fc1)
+    fc2, fc2_owners = weight(forward.fc2)
+    w2, w2_owners = weight(
+        backward.w2_transpose,
+        payload=backward.w2_transpose.payload.transpose(1, 2).contiguous(),
+        layout_id=MoeEpNativeWeightLayout.BACKWARD_W2_DGRAD_NK_ROW_MAJOR_V1,
+    )
+    w1, w1_owners = weight(
+        backward.w1_transpose,
+        payload=backward.w1_transpose.payload.transpose(1, 2).contiguous(),
+        layout_id=(
+            MoeEpNativeWeightLayout.BACKWARD_W1_DGRAD_GATE_UP_INTERLEAVED_32_NK_ROW_MAJOR_V1
+        ),
+    )
+    return (
+        MoeEpNativeDiscreteForwardWeights(fc1=fc1, fc2=fc2),
+        MoeEpNativeDiscreteBackwardWeights(
+            w2_transpose=w2,
+            w1_transpose=w1,
+        ),
+        (fc1_owners, fc2_owners, w2_owners, w1_owners),
+    )
 
 
 def _allocate_stateless_training_outputs(requirements, device, symmetric_buffers):

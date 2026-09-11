@@ -227,6 +227,7 @@ Preparation allocates only private execution lanes. It is collective over
 requirements = op.prepare_training(
     lane_count=1,
     device=None,  # current CUDA device; pass an explicit device for multi-GPU hosts
+    native_weight_storage_mode="contiguous",  # Or "discrete"
 )
 lane = op.training_lanes[0]
 symmetric = op.training_symmetric_buffers(lane)
@@ -310,6 +311,80 @@ payload or scale is written to the supplied `MoeEpForwardWeightStaging` /
 gate-then-up `MoeEpForwardWeights` / `MoeEpBackwardWeights` with compact
 axis-1 scales; already interleaved, blocked producers should construct the
 native packs directly instead of packing them again.
+
+#### Discrete expert allocations
+
+Training also accepts weights whose experts live in independent allocations.
+Bind this compile-time ABI explicitly:
+
+```python
+from cudnn import (
+    MoeEpNativeDiscreteBackwardWeights,
+    MoeEpNativeDiscreteForwardWeights,
+    MoeEpNativeDiscreteWeight,
+)
+
+requirements = op.prepare_training(
+    device=device,
+    native_weight_storage_mode="discrete",
+)
+
+native_fw = MoeEpNativeDiscreteForwardWeights(
+    fc1=MoeEpNativeDiscreteWeight(
+        fc1_payload_ptrs, fc1_scale_ptrs,
+        MoeEpNativeWeightLayout.FORWARD_FC1_GATE_UP_INTERLEAVED_32_V1,
+    ),
+    fc2=MoeEpNativeDiscreteWeight(
+        fc2_payload_ptrs, fc2_scale_ptrs,
+        MoeEpNativeWeightLayout.FORWARD_FC2_K_MAJOR_V1,
+    ),
+)
+```
+
+Build the backward bundle analogously with
+`MoeEpNativeDiscreteBackwardWeights` and the discrete-only
+`BACKWARD_W2_DGRAD_NK_ROW_MAJOR_V1` and
+`BACKWARD_W1_DGRAD_GATE_UP_INTERLEAVED_32_NK_ROW_MAJOR_V1` layout IDs. These
+IDs are intentionally distinct from the contiguous transpose IDs: the
+upstream pointer-table kernel has no stride argument and interprets each
+payload physically as row-major GEMM `(N, K)`.
+
+The per-expert discrete payload contracts are:
+
+- forward FC1: physical `(2I, H)` row-major, equivalent to the V1
+  `(H, 2I)` K-major view; gate/up uses 32-column strips;
+- forward FC2: physical `(H, I)` row-major, equivalent to the V1
+  `(I, H)` K-major view;
+- backward W2 dgrad: physical `(I, H)` row-major;
+- backward W1 dgrad: physical `(H, 2I)` row-major, with gate/up 32-column
+  strips along GEMM K.
+
+The scale pointee contracts remain the matching atom-blocked V1 layouts
+listed above. Each `payload_ptrs` and `scale_ptrs` value must be a contiguous CUDA
+`torch.int64[E_local]` table. The table address must be 8-byte aligned; every
+non-null pointee must be 256-byte aligned. MoeEP passes all four tables
+directly to the kernel and never allocates, copies, or refreshes them.
+
+Each pointee must describe one expert with the corresponding physical layout,
+dtype, and complete storage extent. Pointer tables
+cannot encode or prove those properties or pointee non-aliasing, so they are a
+caller contract.
+`validation_mode="strict"` checks non-null/alignment values eagerly and
+requires the same live table object, address, and PyTorch version to be
+validated before capture. Inference-mode tables without version counters are
+revalidated on every eager call and rejected during strict capture.
+`"trusted"` performs only structural table checks.
+
+The caller owns the tables and all pointees through kernel completion. For CUDA Graph,
+their addresses and allocations must remain live until the graph executable is
+destroyed. In-place optimizer updates are allowed. Any weight reallocation
+requires updating the table outside capture and warming up/capturing again;
+do not modify a table concurrently with a launch on another stream.
+
+`autotune_training` accepts the same `native_weight_storage_mode` argument.
+Its mode is part of the winning specialization; the subsequent
+`prepare_training` call must use the same mode. Every EP rank must select the
+same mode.
 
 ### Forward
 

@@ -3,7 +3,7 @@
 """Autonomous epilogue for the fused fc1+fc2 swap-AB MegaMoE kernel.
 
 Component boundaries use ``TensorWithContract`` to keep per-thread RMEM layout
-semantics explicit.  See ``megamoe_design.md`` for the epilogue dataflow.
+semantics explicit across transpose, activation, quantization, and store stages.
 """
 
 from typing import Optional, Tuple, Type, Union, Any
@@ -36,11 +36,10 @@ from ......helpers.ptx_helpers import (
 from ..helpers.utils import quant_sfd_row, swiglu_act
 from ......quant_def import CombineFormat
 from ......communication.token_protocol import TokenSrcMetadata
-from .....schedulers import BlockPhase
+from .....schedulers.fc12_mapping import BlockPhase
 
-# The 16x32 TMEM transpose core is architecture-neutral; reuse it via the local
-# source-copy shim rather than re-porting the transpose math or reaching into the
-# inference deliverable's directory.
+# The 16x32 TMEM transpose core is architecture-neutral; reuse the local
+# materialized source copy to keep the shared transpose implementation single-sourced.
 from ..tmem_transpose import _TmemTranspose16x32Core
 
 Fc1GateUpInterleave = 32

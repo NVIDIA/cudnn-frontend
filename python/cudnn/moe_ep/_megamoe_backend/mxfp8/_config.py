@@ -109,6 +109,7 @@ class Mxfp8KernelConfig:
     fc2_in_kernel_topk_reduce: bool = False
     act_func: str = "swiglu"
     combine_format: str = "bf16"
+    weight_storage_mode: str = "contiguous"
     fc2_use_bulk: bool = False
     fc2_tma_stages: int | None = None
 
@@ -121,6 +122,11 @@ class Mxfp8KernelConfig:
             raise ValueError("max_recv_size_per_rank must be positive")
         if self.col_quant_num_ctas <= 0:
             raise ValueError("col_quant_num_ctas must be positive")
+        if self.weight_storage_mode not in ("contiguous", "discrete"):
+            raise ValueError(
+                "weight_storage_mode must be 'contiguous' or 'discrete', "
+                f"got {self.weight_storage_mode!r}"
+            )
 
     @classmethod
     def from_operator_config(
@@ -128,6 +134,7 @@ class Mxfp8KernelConfig:
         config: ForwardConfig,
         *,
         tuning: MoeEpTuningConfig | None = None,
+        weight_storage_mode: str = "contiguous",
     ) -> "Mxfp8KernelConfig":
         if config.ep_size < 1:
             raise ValueError("MXFP8 execution requires a positive EP size")
@@ -175,6 +182,7 @@ class Mxfp8KernelConfig:
             epi_flag_batch=tuning.epi_flag_batch,
             flag_batch=tuning.token_in_flag_batch,
             fc2_in_kernel_topk_reduce=tuning.reduce_topk_in_kernel,
+            weight_storage_mode=weight_storage_mode,
         )
 
     @property
@@ -221,6 +229,7 @@ class Mxfp8KernelConfig:
             "enable_col_quant": self.enable_col_quant,
             "col_quant_num_ctas": self.col_quant_num_ctas,
             "combine_format": self.combine_format,
+            "weight_storage_mode": self.weight_storage_mode,
             "mma_tiler_mnk": list(self.mma_tiler_mnk),
             "cluster_shape_mnk": list(self.cluster_shape_mnk),
             "use_2cta_instrs": self.use_2cta_instrs,

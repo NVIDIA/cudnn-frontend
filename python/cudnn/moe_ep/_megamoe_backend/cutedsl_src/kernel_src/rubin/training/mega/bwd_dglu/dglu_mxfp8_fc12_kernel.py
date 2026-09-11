@@ -12,7 +12,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -23,15 +23,13 @@ from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 
 from ..tmem_transpose import _TmemTranspose16x32Core
 from .dglu_mxfp8_fc12_epilogue import DgluMxfp8Epilogue
-from .....schedulers import BlockPhase
+from .....schedulers.fc12_mapping import BlockPhase
 from .....schedulers.base import WorkIdAcquisitionMode
 from .....schedulers.fc12_scheduler import BlackwellFusedFc12Scheduler
 from .dglu_mxfp8_fc12_extension import DgluMxFp8Fc12SchedExtension
+from ..fwd_glu.glu_mxfp8_fc12_extension import WeightStorageMode, raw_discrete_weight_descriptor_pointer
 from ......api import ImplDesc, KernelClass, ProblemDesc, StaticOrRuntimeIntegerType
-from ..helpers.constants import (
-    SupportedMmaTileM,
-    SupportedMmaTileN,
-)
+from ..helpers.constants import SupportedMmaTileM, SupportedMmaTileN
 from ......helpers.iket_compat import iket
 from ......helpers.device_workspace import DeviceWorkspace
 from ......helpers.smem_workspace import SmemWorkspace
@@ -50,6 +48,19 @@ class _EpilogueCommView:
     fc2_output_sf: Any = None
     fc2_done_counter: Any = None
     fc2_output_workspace: Any = None
+
+
+@cute.jit
+def _int64_pointer_array_tensor(pointer_array: cute.Pointer, element_count: int):
+    return cute.make_tensor(
+        cute.make_ptr(
+            cutlass.Int64,
+            pointer_array.toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=8,
+        ),
+        cute.make_layout((element_count,)),
+    )
 
 
 # =============================================================================
@@ -92,6 +103,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
         fc2_in_kernel_topk_reduce: bool = False,
         act_func: str = "swiglu",
         gate_up_clamp: Optional[float] = None,
+        weight_storage_mode: WeightStorageMode = "contiguous",
     ) -> None:
         if not force_static_sched:
             raise NotImplementedError(
@@ -119,6 +131,16 @@ class Sm107Mxfp8DgluDfc21Kernel:
             raise ValueError(
                 f"load_balance_mode must be 'static' or 'atomic_counter'; "
                 f"got {load_balance_mode!r}."
+            )
+        if weight_storage_mode not in ("contiguous", "discrete"):
+            raise ValueError(
+                "weight_storage_mode must be 'contiguous' or 'discrete'; "
+                f"got {weight_storage_mode!r}."
+            )
+        if weight_storage_mode == "discrete" and static_expert_shape is None:
+            raise ValueError(
+                "Discrete weights require static_expert_shape so descriptor "
+                "shapes can be constructed without contiguous weight tensors."
             )
         if act_func not in ("swiglu", "geglu"):
             raise ValueError(
@@ -156,6 +178,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
         self.dfc2_recompute = dfc2_recompute
         self.dfc2_col_output = dfc2_col_output
         self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
+        self.weight_storage_mode = weight_storage_mode
         self.gate_up_clamp = abs(gate_up_clamp) if gate_up_clamp is not None else None
 
         self._validate_mma_tiler_and_cluster_shape()
@@ -728,21 +751,172 @@ class Sm107Mxfp8DgluDfc21Kernel:
         """All-warp kernel tail (NVLink release, etc.).  No-op base."""
         pass
 
+    @cute.kernel
+    def _initialize_discrete_weight_descriptors(
+        self,
+        fc1_weight_ptrs: cute.Pointer,
+        fc1_weight_sf_ptrs: cute.Pointer,
+        fc2_weight_ptrs: cute.Pointer,
+        fc2_weight_sf_ptrs: cute.Pointer,
+        fc1_n: cutlass.Int32,
+        fc1_k: cutlass.Int32,
+        fc1_stride_n: cutlass.Int64,
+        fc2_n: cutlass.Int32,
+        fc2_k: cutlass.Int32,
+        fc2_stride_n: cutlass.Int64,
+        descriptor_workspace: cute.Pointer,
+        tiled_mma: cute.TiledMma,
+        tiled_mma_sfb: cute.TiledMma,
+        b_smem_layout,
+        sfb_smem_layout,
+        cluster_layout_vmnk_shape: cutlass.Constexpr,
+        cluster_layout_sfb_vmnk_shape: cutlass.Constexpr,
+    ) -> None:
+        """Build the four expert-specific dFC2/dFC1 weight TensorMaps."""
+        expert_idx = cute.arch.block_idx()[0]
+        expert_count = self.static_expert_shape[0]
+        singleton = cutlass.Int32(1)
+        zero = cutlass.Int64(0)
+
+        fc1_weight_pointer_values = _int64_pointer_array_tensor(
+            fc1_weight_ptrs, expert_count
+        )
+        fc1_weight_sf_pointer_values = _int64_pointer_array_tensor(
+            fc1_weight_sf_ptrs, expert_count
+        )
+        fc2_weight_pointer_values = _int64_pointer_array_tensor(
+            fc2_weight_ptrs, expert_count
+        )
+        fc2_weight_sf_pointer_values = _int64_pointer_array_tensor(
+            fc2_weight_sf_ptrs, expert_count
+        )
+
+        b_operation = sm100_utils.cluster_shape_to_tma_atom_B(
+            self.cluster_shape_mn, tiled_mma.thr_id
+        )
+        sfb_operation = sm100_utils.cluster_shape_to_tma_atom_SFB(
+            self.cluster_shape_mn, tiled_mma.thr_id
+        )
+
+        fc1_weight_tensor = cute.make_tensor(
+            cute.make_ptr(
+                self.ab_dtype,
+                fc1_weight_pointer_values[expert_idx],
+                cute.AddressSpace.gmem,
+            ),
+            cute.make_layout(
+                (fc1_n, fc1_k, singleton),
+                stride=(fc1_stride_n, cutlass.Int64(1), zero),
+            ),
+        )
+        fc1_weight_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
+            b_operation,
+            fc1_weight_tensor,
+            b_smem_layout,
+            self.mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk_shape,
+        )
+        cpasync.copy_tensormap(
+            fc1_weight_atom,
+            raw_discrete_weight_descriptor_pointer(
+                descriptor_workspace, "fc1_weight", expert_idx
+            ),
+        )
+
+        fc1_weight_sf_tensor = cute.make_tensor(
+            cute.make_ptr(
+                self.sf_dtype,
+                fc1_weight_sf_pointer_values[expert_idx],
+                cute.AddressSpace.gmem,
+            ),
+            blockscaled_utils.tile_atom_to_shape_SF(
+                (fc1_n, fc1_k, singleton), self.sf_vec_size
+            ),
+        )
+        fc1_weight_sf_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
+            sfb_operation,
+            fc1_weight_sf_tensor,
+            sfb_smem_layout,
+            self.mma_tiler_sfb,
+            tiled_mma_sfb,
+            cluster_layout_sfb_vmnk_shape,
+            internal_type=cutlass.Uint64,
+        )
+        cpasync.copy_tensormap(
+            fc1_weight_sf_atom,
+            raw_discrete_weight_descriptor_pointer(
+                descriptor_workspace, "fc1_weight_sf", expert_idx
+            ),
+        )
+
+        fc2_weight_tensor = cute.make_tensor(
+            cute.make_ptr(
+                self.ab_dtype,
+                fc2_weight_pointer_values[expert_idx],
+                cute.AddressSpace.gmem,
+            ),
+            cute.make_layout(
+                (fc2_n, fc2_k, singleton),
+                stride=(fc2_stride_n, cutlass.Int64(1), zero),
+            ),
+        )
+        fc2_weight_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
+            b_operation,
+            fc2_weight_tensor,
+            b_smem_layout,
+            self.mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk_shape,
+        )
+        cpasync.copy_tensormap(
+            fc2_weight_atom,
+            raw_discrete_weight_descriptor_pointer(
+                descriptor_workspace, "fc2_weight", expert_idx
+            ),
+        )
+
+        fc2_weight_sf_tensor = cute.make_tensor(
+            cute.make_ptr(
+                self.sf_dtype,
+                fc2_weight_sf_pointer_values[expert_idx],
+                cute.AddressSpace.gmem,
+            ),
+            blockscaled_utils.tile_atom_to_shape_SF(
+                (fc2_n, fc2_k, singleton), self.sf_vec_size
+            ),
+        )
+        fc2_weight_sf_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
+            sfb_operation,
+            fc2_weight_sf_tensor,
+            sfb_smem_layout,
+            self.mma_tiler_sfb,
+            tiled_mma_sfb,
+            cluster_layout_sfb_vmnk_shape,
+            internal_type=cutlass.Uint64,
+        )
+        cpasync.copy_tensormap(
+            fc2_weight_sf_atom,
+            raw_discrete_weight_descriptor_pointer(
+                descriptor_workspace, "fc2_weight_sf", expert_idx
+            ),
+        )
+
     @cute.jit
     def __call__(
         self,
         activation: cute.Tensor,            # (token_sum_padded, hidden) grad_out
-        fc1_weight: cute.Tensor,            # (experts, hidden, intermediate_downproj)
+        fc1_weight,                         # Contiguous tensor or device Int64 pointer array
         activation_sf: cute.Tensor,         # row-SF for activation
-        fc1_weight_sf: cute.Tensor,         # dfc2-weight SF
+        fc1_weight_sf,                      # Contiguous tensor or device Int64 pointer array
         fc1_output: cute.Tensor,            # (token_sum_padded, intermediate_gateup)
         fc1_output_sf: cute.Tensor,         # (token_sum_padded_sf, intermediate_gateup_sf)
         fc1_recompute: Optional[cute.Tensor],      # (token_sum_padded, intermediate_downproj)
         fc1_recompute_sf: Optional[cute.Tensor],   # (intermediate_downproj_padded, col_sf_rows)
         fc1_col_output: Optional[cute.Tensor],     # (token_sum_padded, intermediate_gateup)
         fc1_col_output_sf: Optional[cute.Tensor],  # (intermediate_gateup_padded, col_sf_rows)
-        fc2_weight: cute.Tensor,            # (experts, intermediate_gateup, hidden)
-        fc2_weight_sf: cute.Tensor,         # (experts, hidden_padded * intermediate_gateup_sf_padded)
+        fc2_weight,                         # Contiguous tensor or device Int64 pointer array
+        fc2_weight_sf,                      # Contiguous tensor or device Int64 pointer array
         fc2_output: cute.Tensor,            # (token_sum_padded, hidden)
         fc1_preact: cute.Tensor,            # (token_sum_padded, intermediate_gateup) BFloat16
         topk_scores: cute.Tensor,           # (token_sum_padded,) Float32
@@ -767,8 +941,16 @@ class Sm107Mxfp8DgluDfc21Kernel:
         mega_activation_sf: Optional[cute.Tensor] = None,
         mega_pre_reduced_activation: Optional[cute.Tensor] = None,
         mega_pre_reduced_activation_sf: Optional[cute.Tensor] = None,
+        weight_descriptor_workspace: Optional[cute.Pointer] = None,
     ) -> None:
         """Launch the fused dfc2+dfc1 dGLU MXFP8 (backward) kernel."""
+        if cutlass.const_expr(
+            self.weight_storage_mode == "discrete"
+            and weight_descriptor_workspace is None
+        ):
+            raise ValueError(
+                "Discrete weights require weight_descriptor_workspace."
+            )
         if cutlass.const_expr(self.static_expert_shape is not None):
             (
                 experts_static,
@@ -777,20 +959,21 @@ class Sm107Mxfp8DgluDfc21Kernel:
             ) = self.static_expert_shape
             intermediate_out_static = intermediate_gateup_static * 2  # grad_y1 / dfc1-K
 
-            fc1_weight = cute.make_tensor(
-                fc1_weight.iterator,
-                cute.make_layout(
-                    (experts_static, hidden_static, intermediate_gateup_static),
-                    stride=fc1_weight.stride,
-                ),
-            )
-            fc2_weight = cute.make_tensor(
-                fc2_weight.iterator,
-                cute.make_layout(
-                    (experts_static, intermediate_out_static, hidden_static),
-                    stride=fc2_weight.stride,
-                ),
-            )
+            if cutlass.const_expr(self.weight_storage_mode == "contiguous"):
+                fc1_weight = cute.make_tensor(
+                    fc1_weight.iterator,
+                    cute.make_layout(
+                        (experts_static, hidden_static, intermediate_gateup_static),
+                        stride=fc1_weight.stride,
+                    ),
+                )
+                fc2_weight = cute.make_tensor(
+                    fc2_weight.iterator,
+                    cute.make_layout(
+                        (experts_static, intermediate_out_static, hidden_static),
+                        stride=fc2_weight.stride,
+                    ),
+                )
             activation = cute.make_tensor(
                 activation.iterator,
                 cute.make_layout(
@@ -859,14 +1042,39 @@ class Sm107Mxfp8DgluDfc21Kernel:
 
         # B_gemm (fc1 weights): (experts, hidden, intermediate_gateup) with hidden stride-1 (K-major)
         # -> (N=intermediate_gateup, K=hidden, L=experts).
-        experts, hidden_b, intermediate_gateup = fc1_weight.shape
-        fc1_weight_gemm = cute.make_tensor(
-            fc1_weight.iterator,
-            cute.make_layout(
-                (intermediate_gateup, hidden_b, experts),
-                stride=(fc1_weight.stride[2], fc1_weight.stride[1], fc1_weight.stride[0]),
-            ),
-        )
+        if cutlass.const_expr(self.weight_storage_mode == "contiguous"):
+            experts, hidden_b, intermediate_gateup = fc1_weight.shape
+            fc1_weight_gemm = cute.make_tensor(
+                fc1_weight.iterator,
+                cute.make_layout(
+                    (intermediate_gateup, hidden_b, experts),
+                    stride=(
+                        fc1_weight.stride[2],
+                        fc1_weight.stride[1],
+                        fc1_weight.stride[0],
+                    ),
+                ),
+            )
+        else:
+            experts, intermediate_gateup, hidden_b = self.static_expert_shape
+            fc1_weight_n = cutlass.Int32(intermediate_gateup)
+            fc1_weight_k = cutlass.Int32(hidden_b)
+            fc1_weight_gemm = cute.make_tensor(
+                cute.make_ptr(
+                    self.ab_dtype,
+                    fc1_weight.toint(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                cute.make_layout(
+                    (fc1_weight_n, fc1_weight_k, cutlass.Int32(1)),
+                    stride=(
+                        cutlass.Int64(hidden_b),
+                        cutlass.Int64(1),
+                        cutlass.Int64(0),
+                    ),
+                ),
+            )
 
         intermediate_downproj = fc1_output.shape[1]
         fc1_output_gemm = cute.make_tensor(
@@ -912,27 +1120,73 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 (tokens_sum_padded, hidden_padded, 1), self.sf_vec_size
             ),
         )
-        intermediate_gateup_padded_mul_hidden_padded = fc1_weight_sf.shape[1]
-        intermediate_gateup_padded = (
-            intermediate_gateup_padded_mul_hidden_padded * self.sf_vec_size
-        ) // hidden_padded
+        if cutlass.const_expr(self.weight_storage_mode == "contiguous"):
+            intermediate_gateup_padded_mul_hidden_padded = fc1_weight_sf.shape[1]
+            intermediate_gateup_padded = (
+                intermediate_gateup_padded_mul_hidden_padded * self.sf_vec_size
+            ) // hidden_padded
+            fc1_weight_sf_iterator = fc1_weight_sf.iterator
+            fc1_weight_sf_shape = (
+                intermediate_gateup_padded,
+                hidden_padded,
+                experts,
+            )
+        else:
+            fc1_weight_sf_iterator = cute.make_ptr(
+                activation_sf.element_type,
+                fc1_weight_sf.toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            fc1_weight_sf_shape = (
+                fc1_weight_n,
+                fc1_weight_k,
+                cutlass.Int32(1),
+            )
         fc1_weight_sf_gemm = cute.make_tensor(
-            fc1_weight_sf.iterator,
+            fc1_weight_sf_iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (intermediate_gateup_padded, hidden_padded, experts),
+                fc1_weight_sf_shape,
                 self.sf_vec_size,
             ),
         )
 
         # GEMM-domain transform for fc2 phase ──
-        experts2, intermediate_downproj_b2, hidden_b2 = fc2_weight.shape
-        fc2_weight_gemm = cute.make_tensor(
-            fc2_weight.iterator,
-            cute.make_layout(
-                (hidden_b2, intermediate_downproj_b2, experts2),
-                stride=(fc2_weight.stride[2], fc2_weight.stride[1], fc2_weight.stride[0]),
-            ),
-        )
+        if cutlass.const_expr(self.weight_storage_mode == "contiguous"):
+            experts2, intermediate_downproj_b2, hidden_b2 = fc2_weight.shape
+            fc2_weight_gemm = cute.make_tensor(
+                fc2_weight.iterator,
+                cute.make_layout(
+                    (hidden_b2, intermediate_downproj_b2, experts2),
+                    stride=(
+                        fc2_weight.stride[2],
+                        fc2_weight.stride[1],
+                        fc2_weight.stride[0],
+                    ),
+                ),
+            )
+        else:
+            experts2 = experts
+            intermediate_downproj_b2 = intermediate_gateup * 2
+            hidden_b2 = hidden_b
+            fc2_weight_n = cutlass.Int32(hidden_b2)
+            fc2_weight_k = cutlass.Int32(intermediate_downproj_b2)
+            fc2_weight_gemm = cute.make_tensor(
+                cute.make_ptr(
+                    self.ab_dtype,
+                    fc2_weight.toint(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                cute.make_layout(
+                    (fc2_weight_n, fc2_weight_k, cutlass.Int32(1)),
+                    stride=(
+                        cutlass.Int64(intermediate_downproj_b2),
+                        cutlass.Int64(1),
+                        cutlass.Int64(0),
+                    ),
+                ),
+            )
 
         if cutlass.const_expr(len(fc2_output.shape) == 3):
             fc2_hidden_out = fc2_output.shape[2]
@@ -964,14 +1218,34 @@ class Sm107Mxfp8DgluDfc21Kernel:
             ),
         )
 
-        hidden_padded_fc2_mul_intermediate_downproj_padded = fc2_weight_sf.shape[1]
-        hidden_padded_fc2 = (
-            hidden_padded_fc2_mul_intermediate_downproj_padded * self.sf_vec_size
-        ) // intermediate_downproj_padded
+        if cutlass.const_expr(self.weight_storage_mode == "contiguous"):
+            hidden_padded_fc2_mul_intermediate_downproj_padded = fc2_weight_sf.shape[1]
+            hidden_padded_fc2 = (
+                hidden_padded_fc2_mul_intermediate_downproj_padded
+                * self.sf_vec_size
+            ) // intermediate_downproj_padded
+            fc2_weight_sf_iterator = fc2_weight_sf.iterator
+            fc2_weight_sf_shape = (
+                hidden_padded_fc2,
+                intermediate_downproj_padded,
+                experts2,
+            )
+        else:
+            fc2_weight_sf_iterator = cute.make_ptr(
+                activation_sf.element_type,
+                fc2_weight_sf.toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            fc2_weight_sf_shape = (
+                fc2_weight_n,
+                fc2_weight_k,
+                cutlass.Int32(1),
+            )
         fc2_weight_sf_gemm = cute.make_tensor(
-            fc2_weight_sf.iterator,
+            fc2_weight_sf_iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (hidden_padded_fc2, intermediate_downproj_padded, experts2),
+                fc2_weight_sf_shape,
                 self.sf_vec_size,
             ),
         )
@@ -985,7 +1259,12 @@ class Sm107Mxfp8DgluDfc21Kernel:
         self.fc1_output_dtype: Type[cutlass.Numeric] = fc1_output_gemm.element_type
         self.sf_dtype: Type[cutlass.Numeric] = activation_sf_gemm.element_type
         self.a_major_mode = utils.LayoutEnum.from_tensor(activation_gemm).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(fc1_weight_gemm).mma_major_mode()
+        if cutlass.const_expr(self.weight_storage_mode == "contiguous"):
+            self.b_major_mode = utils.LayoutEnum.from_tensor(
+                fc1_weight_gemm
+            ).mma_major_mode()
+        else:
+            self.b_major_mode = OperandMajorMode.K
         self.fc1_output_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
 
         self._setup_attributes()
@@ -1154,6 +1433,31 @@ class Sm107Mxfp8DgluDfc21Kernel:
             )
         )
 
+        if cutlass.const_expr(self.weight_storage_mode == "discrete"):
+            self._initialize_discrete_weight_descriptors(
+                fc1_weight,
+                fc1_weight_sf,
+                fc2_weight,
+                fc2_weight_sf,
+                fc1_weight_n,
+                fc1_weight_k,
+                cutlass.Int64(hidden_b),
+                fc2_weight_n,
+                fc2_weight_k,
+                cutlass.Int64(intermediate_downproj_b2),
+                weight_descriptor_workspace,
+                tiled_mma,
+                tiled_mma_sfb,
+                b_smem_layout,
+                sfb_smem_layout,
+                self.cluster_layout_vmnk.shape,
+                self.cluster_layout_sfb_vmnk.shape,
+            ).launch(
+                grid=(expert_cnt, 1, 1),
+                block=(1, 1, 1),
+                stream=stream,
+            )
+
         # ── Scheduler params + grid + launch ──
         if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
             if cutlass.const_expr(load_balance_counter is None):
@@ -1256,6 +1560,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
             mega_activation_sf,
             mega_pre_reduced_activation,
             mega_pre_reduced_activation_sf,
+            weight_descriptor_workspace,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1339,6 +1644,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
         mega_activation_sf: Optional[cute.Tensor] = None,
         mega_pre_reduced_activation: Optional[cute.Tensor] = None,
         mega_pre_reduced_activation_sf: Optional[cute.Tensor] = None,
+        weight_descriptor_workspace: Optional[cute.Pointer] = None,
     ):
         """Device kernel for fused fc1+fc2 swap-AB GLU MXFP8 grouped GEMM."""
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, None, 0))
@@ -1376,6 +1682,8 @@ class Sm107Mxfp8DgluDfc21Kernel:
             ),
             # Fold the 2 CTAs of a cluster onto one fc1_ready slot
             cluster_m=self.epilogue._atom_thr_size,
+            weight_storage_mode=self.weight_storage_mode,
+            weight_descriptor_workspace=weight_descriptor_workspace,
             expert_token_sizes=_aux_expert_sizes,
             token_padding_block=self.token_padding_block,
             sf_padding_block=self.sf_padding_block,

@@ -18,6 +18,8 @@ from ..._types import (
     MoeEpForwardWeightStaging,
     MoeEpForwardWeights,
     MoeEpNativeBackwardWeights,
+    MoeEpNativeDiscreteBackwardWeights,
+    MoeEpNativeDiscreteForwardWeights,
     MoeEpNativeForwardWeights,
     MoeEpNativeWeight,
     MoeEpNativeWeightLayout,
@@ -215,6 +217,32 @@ def backward_native_to_kernel(
         fc1_weight_sf=weights.w2_transpose.scale,
         fc2_weight=weights.w1_transpose.payload,
         fc2_weight_sf=weights.w1_transpose.scale,
+    )
+
+
+def forward_discrete_native_to_kernel(
+    weights: MoeEpNativeDiscreteForwardWeights,
+) -> Mxfp8Weights:
+    """Map caller-owned pointer arrays to forward kernel slots without copying."""
+
+    return Mxfp8Weights(
+        fc1_weight=weights.fc1.payload_ptrs,
+        fc1_weight_sf=weights.fc1.scale_ptrs,
+        fc2_weight=weights.fc2.payload_ptrs,
+        fc2_weight_sf=weights.fc2.scale_ptrs,
+    )
+
+
+def backward_discrete_native_to_kernel(
+    weights: MoeEpNativeDiscreteBackwardWeights,
+) -> Mxfp8BackwardWeights:
+    """Map caller-owned pointer arrays to backward kernel slots without copying."""
+
+    return Mxfp8BackwardWeights(
+        fc1_weight=weights.w2_transpose.payload_ptrs,
+        fc1_weight_sf=weights.w2_transpose.scale_ptrs,
+        fc2_weight=weights.w1_transpose.payload_ptrs,
+        fc2_weight_sf=weights.w1_transpose.scale_ptrs,
     )
 
 

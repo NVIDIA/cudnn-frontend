@@ -130,7 +130,7 @@ def prepare_kernel(
     )
     import cutlass
 
-    from ..cutedsl_src.kernel_src.rubin.training.mega.fwd_glu import (
+    from ..cutedsl_src.kernel_src.rubin.training.mega.fwd_glu.glu_mxfp8_mega_moe_kernel import (
         Sm107MegaMoEMxfp8GluKernel,
     )
     from ..cutedsl_src.quant_def import CombineFormat
@@ -177,6 +177,7 @@ def prepare_kernel(
         fc2_tma_stages=config.fc2_tma_stages,
         enable_col_quant=config.enable_col_quant,
         col_quant_num_ctas=config.col_quant_num_ctas,
+        weight_storage_mode=config.weight_storage_mode,
     )
     kernel = Sm107MegaMoEMxfp8GluKernel.from_kwargs(**kernel_kwargs)
     local_bytes, shared_bytes = kernel.get_workspace_sizes()
@@ -288,6 +289,7 @@ def compile_or_get(
         compile_kwargs = build_runtime_kwargs(
             inputs,
             resources,
+            weight_storage_mode=prepared.config.weight_storage_mode,
         )
         compiled = CompiledMxfp8Kernel(
             key=key,

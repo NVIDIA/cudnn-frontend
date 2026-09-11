@@ -1,6 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-
 """Compatibility wrapper for optional in-kernel event tracing support."""
 
 try:

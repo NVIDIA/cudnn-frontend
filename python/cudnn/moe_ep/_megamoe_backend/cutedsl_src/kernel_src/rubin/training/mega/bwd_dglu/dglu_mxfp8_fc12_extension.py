@@ -49,6 +49,11 @@ class DgluMxFp8Fc12SchedExtension(GluMxFp8Fc12SchedExtension):
         fc1_ready_counter_pointer = (
             rebuild(self.fc1_ready_counter_pointer) if self.fc1_ready_counter_pointer is not None else None
         )
+        weight_descriptor_workspace = (
+            rebuild(self.weight_descriptor_workspace)
+            if self.weight_descriptor_workspace is not None
+            else None
+        )
         expert_token_sizes = rebuild(self.expert_token_sizes)
         if value_index != len(values):
             raise ValueError(
@@ -60,6 +65,8 @@ class DgluMxFp8Fc12SchedExtension(GluMxFp8Fc12SchedExtension):
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=fc1_ready_counter_pointer,
             cluster_m=self.cluster_m,
+            weight_storage_mode=self.weight_storage_mode,
+            weight_descriptor_workspace=weight_descriptor_workspace,
             expert_token_sizes=expert_token_sizes,
             token_padding_block=self.token_padding_block,
             sf_padding_block=self.sf_padding_block,

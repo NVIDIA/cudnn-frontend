@@ -14,6 +14,7 @@ import contextlib
 import math
 import threading
 import warnings
+import weakref
 from dataclasses import replace
 from numbers import Real
 from typing import Literal, Mapping, Optional, Sequence, Union
@@ -35,12 +36,17 @@ from ._types import (
     MoeEpForwardWeightStaging,
     MoeEpForwardWeights,
     MoeEpNativeBackwardWeights,
+    MoeEpNativeDiscreteBackwardWeights,
+    MoeEpNativeDiscreteForwardWeights,
+    MoeEpNativeDiscreteWeight,
     MoeEpNativeForwardWeights,
+    MoeEpNativeWeightStorageMode,
     MoeEpTrainingBackwardOutputs,
     MoeEpTrainingForwardOutputs,
     MoeEpTrainingWgradOperands,
     MoeFormat,
     MoeTensor,
+    parse_native_weight_storage_mode,
     parse_format as _parse_format,
 )
 from ._validation import (
@@ -48,6 +54,8 @@ from ._validation import (
     validate_forward,
     validate_forward_source_weights,
     validate_native_backward_weights,
+    validate_native_discrete_backward_weights,
+    validate_native_discrete_forward_weights,
     validate_native_forward_weights,
     validate_training_backward_outputs,
     validate_training_forward_outputs,
@@ -361,6 +369,13 @@ class MoeEp:
             ]
             | None
         ) = None
+        self._autotuned_training_weight_storage_mode: (
+            MoeEpNativeWeightStorageMode | None
+        ) = None
+        self._validated_discrete_pointer_tables: dict[
+            int,
+            tuple[weakref.ReferenceType[torch.Tensor], int, int],
+        ] = {}
         self._poisoned = False
         self._closed = False
 
@@ -378,6 +393,138 @@ class MoeEp:
             return tensor._version
         except RuntimeError:
             return None
+
+    @staticmethod
+    def _discrete_pointer_tables(
+        weights: (
+            MoeEpNativeDiscreteForwardWeights
+            | MoeEpNativeDiscreteBackwardWeights
+        ),
+    ) -> tuple[torch.Tensor, ...]:
+        if isinstance(weights, MoeEpNativeDiscreteForwardWeights):
+            pair = (weights.fc1, weights.fc2)
+        elif isinstance(weights, MoeEpNativeDiscreteBackwardWeights):
+            pair = (weights.w2_transpose, weights.w1_transpose)
+        else:
+            raise TypeError(
+                "discrete weights must be a forward or backward discrete bundle"
+            )
+        return tuple(
+            tensor
+            for weight in pair
+            for tensor in (weight.payload_ptrs, weight.scale_ptrs)
+        )
+
+    def _validate_discrete_pointer_lifetime(
+        self,
+        weights: (
+            MoeEpNativeDiscreteForwardWeights
+            | MoeEpNativeDiscreteBackwardWeights
+        ),
+        *,
+        validate,
+        device: torch.device,
+    ) -> None:
+        tables = self._discrete_pointer_tables(weights)
+        with torch.cuda.device(device):
+            capturing = torch.cuda.is_current_stream_capturing()
+        self._validated_discrete_pointer_tables = {
+            identity: record
+            for identity, record in self._validated_discrete_pointer_tables.items()
+            if record[0]() is not None
+        }
+
+        def is_validated(table: torch.Tensor) -> bool:
+            version = self._tensor_version(table)
+            if version is None:
+                return False
+            record = self._validated_discrete_pointer_tables.get(id(table))
+            return (
+                record is not None
+                and record[0]() is table
+                and record[1] == int(table.data_ptr())
+                and record[2] == version
+            )
+
+        if self.validation_mode == "strict" and capturing:
+            versionless = tuple(
+                index
+                for index, table in enumerate(tables)
+                if self._tensor_version(table) is None
+            )
+            if versionless:
+                raise RuntimeError(
+                    "strict CUDA Graph capture requires discrete pointer tables "
+                    "with PyTorch version counters; inference-mode tables are "
+                    f"unsupported (table indices {versionless})"
+                )
+            missing = tuple(
+                index for index, table in enumerate(tables) if not is_validated(table)
+            )
+            if missing:
+                raise RuntimeError(
+                    "discrete pointer tables must pass one strict eager validation "
+                    "before CUDA Graph capture"
+                )
+        validate_pointees = (
+            self.validation_mode == "strict"
+            and not capturing
+            and any(not is_validated(table) for table in tables)
+        )
+        validate(
+            self._forward_config,
+            weights,
+            device=device,
+            validate_pointees=validate_pointees,
+        )
+        if self.validation_mode == "strict" and not capturing:
+            for table in tables:
+                version = self._tensor_version(table)
+                if version is not None:
+                    self._validated_discrete_pointer_tables[id(table)] = (
+                        weakref.ref(table),
+                        int(table.data_ptr()),
+                        version,
+                    )
+
+    @staticmethod
+    def _native_weight_tensors(
+        weights: (
+            MoeEpNativeForwardWeights
+            | MoeEpNativeBackwardWeights
+            | MoeEpNativeDiscreteForwardWeights
+            | MoeEpNativeDiscreteBackwardWeights
+        ),
+    ) -> dict[str, torch.Tensor]:
+        if isinstance(weights, MoeEpNativeForwardWeights):
+            return {
+                "weights.fc1.payload": weights.fc1.payload,
+                "weights.fc1.scale": weights.fc1.scale,
+                "weights.fc2.payload": weights.fc2.payload,
+                "weights.fc2.scale": weights.fc2.scale,
+            }
+        if isinstance(weights, MoeEpNativeBackwardWeights):
+            return {
+                "weights.w2_transpose.payload": weights.w2_transpose.payload,
+                "weights.w2_transpose.scale": weights.w2_transpose.scale,
+                "weights.w1_transpose.payload": weights.w1_transpose.payload,
+                "weights.w1_transpose.scale": weights.w1_transpose.scale,
+            }
+        if isinstance(weights, MoeEpNativeDiscreteForwardWeights):
+            return {
+                "weights.fc1.payload_ptrs": weights.fc1.payload_ptrs,
+                "weights.fc1.scale_ptrs": weights.fc1.scale_ptrs,
+                "weights.fc2.payload_ptrs": weights.fc2.payload_ptrs,
+                "weights.fc2.scale_ptrs": weights.fc2.scale_ptrs,
+            }
+        if isinstance(weights, MoeEpNativeDiscreteBackwardWeights):
+            return {
+                "weights.w2_transpose.payload_ptrs": weights.w2_transpose.payload_ptrs,
+                "weights.w2_transpose.scale_ptrs": weights.w2_transpose.scale_ptrs,
+                "weights.w1_transpose.payload_ptrs": weights.w1_transpose.payload_ptrs,
+                "weights.w1_transpose.scale_ptrs": weights.w1_transpose.scale_ptrs,
+            }
+        raise TypeError(f"unsupported native weight bundle {type(weights).__name__}")
 
     def _get_backend(self, request):
         """Create and cache the private backend on first supported use."""
@@ -625,6 +772,7 @@ class MoeEp:
             self._forward_backend_device = device
             self._validated_topk_idx = None
             self._validated_topk_version = None
+            self._autotuned_training_weight_storage_mode = None
             return MoeEpAutotuneResult(
                 mode="inference",
                 winner=winner.tuning,
@@ -638,9 +786,16 @@ class MoeEp:
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         *,
-        forward_weights: MoeEpNativeForwardWeights,
-        backward_weights: MoeEpNativeBackwardWeights,
+        forward_weights: (
+            MoeEpNativeForwardWeights | MoeEpNativeDiscreteForwardWeights
+        ),
+        backward_weights: (
+            MoeEpNativeBackwardWeights | MoeEpNativeDiscreteBackwardWeights
+        ),
         candidates: Sequence[MoeEpTuningConfig],
+        native_weight_storage_mode: (
+            MoeEpNativeWeightStorageMode | str
+        ) = MoeEpNativeWeightStorageMode.CONTIGUOUS,
         warmup_iters: int = 3,
         timed_iters: int = 10,
         max_candidates: int = 32,
@@ -675,6 +830,9 @@ class MoeEp:
                 raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             if self._training_state is not None:
                 raise RuntimeError("autotune_training must be called before prepare_training()")
+            weight_storage_mode = parse_native_weight_storage_mode(
+                native_weight_storage_mode
+            )
 
             normalized = normalize_candidates(
                 self.tuning,
@@ -689,6 +847,7 @@ class MoeEp:
                     self._forward_backend is not None,
                     self._training_state is not None,
                     (None if self._forward_backend_device is None else str(self._forward_backend_device)),
+                    weight_storage_mode.value,
                 ),
                 self._forward_config.ep_group,
             )
@@ -729,8 +888,28 @@ class MoeEp:
                         )
                         if activation_tokens != grad_tokens:
                             raise ValueError("activation and grad_output must have the same token " f"count, got {activation_tokens} and {grad_tokens}")
-                        validate_native_forward_weights(config, forward_weights, device=device)
-                        validate_native_backward_weights(config, backward_weights, device=device)
+                        if weight_storage_mode is MoeEpNativeWeightStorageMode.DISCRETE:
+                            self._validate_discrete_pointer_lifetime(
+                                forward_weights,
+                                validate=validate_native_discrete_forward_weights,
+                                device=device,
+                            )
+                            self._validate_discrete_pointer_lifetime(
+                                backward_weights,
+                                validate=validate_native_discrete_backward_weights,
+                                device=device,
+                            )
+                        else:
+                            validate_native_forward_weights(
+                                config,
+                                forward_weights,
+                                device=device,
+                            )
+                            validate_native_backward_weights(
+                                config,
+                                backward_weights,
+                                device=device,
+                            )
                         token_count = activation_tokens
                         candidate_configs.append(config)
                     except BaseException as exc:
@@ -766,7 +945,10 @@ class MoeEp:
                     runtime_entered = True
                     phase = "training preparation"
                     with torch.cuda.device(device):
-                        state = backend.prepare_training(lane_count=1)
+                        state = backend.prepare_training(
+                            lane_count=1,
+                            native_weight_storage_mode=weight_storage_mode.value,
+                        )
                         requirements = state.public_requirements()
                         symmetric_buffers = state.public_symmetric_buffers(0)
                         forward_out, backward_out = allocate_training_outputs(
@@ -892,6 +1074,7 @@ class MoeEp:
             self._forward_backend_device = None
             self._validated_topk_idx = None
             self._validated_topk_version = None
+            self._autotuned_training_weight_storage_mode = weight_storage_mode
             return MoeEpAutotuneResult(
                 mode="training",
                 winner=winner.tuning,
@@ -957,6 +1140,9 @@ class MoeEp:
         *,
         lane_count: int = 1,
         device: torch.device | str | int | None = None,
+        native_weight_storage_mode: (
+            MoeEpNativeWeightStorageMode | str
+        ) = MoeEpNativeWeightStorageMode.CONTIGUOUS,
     ) -> Mapping[
         str,
         tuple[tuple[int, ...], tuple[int, ...], torch.dtype, int],
@@ -979,7 +1165,34 @@ class MoeEp:
                 raise RuntimeError("MoeEp training is already prepared")
             if self._fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
                 raise ValueError("prepare_training requires weight_interleave_size=32")
+            weight_storage_mode = parse_native_weight_storage_mode(
+                native_weight_storage_mode
+            )
+            if (
+                self._autotuned_training_weight_storage_mode is not None
+                and weight_storage_mode
+                is not self._autotuned_training_weight_storage_mode
+            ):
+                raise ValueError(
+                    "prepare_training native_weight_storage_mode must match the "
+                    "autotune_training mode: "
+                    f"{weight_storage_mode.value!r} != "
+                    f"{self._autotuned_training_weight_storage_mode.value!r}"
+                )
             resolved_device = _resolve_training_device(device)
+            if self._forward_config.ep_group is not None:
+                modes: list[str | None] = [None] * self._forward_config.ep_size
+                with torch.cuda.device(resolved_device):
+                    dist.all_gather_object(
+                        modes,
+                        weight_storage_mode.value,
+                        group=self._forward_config.ep_group,
+                    )
+                if any(mode != modes[0] for mode in modes[1:]):
+                    raise RuntimeError(
+                        "native_weight_storage_mode must match on every "
+                        f"expert-parallel rank; modes by rank: {modes}"
+                    )
             _validate_training_assert_capability(self._forward_config)
             from . import _backend
 
@@ -995,6 +1208,7 @@ class MoeEp:
             with torch.cuda.device(resolved_device):
                 state = self._forward_backend.prepare_training(
                     lane_count=lane_count,
+                    native_weight_storage_mode=weight_storage_mode.value,
                 )
             self._training_state = state
             self._training_lanes = tuple(MoeEpExecutionLane(index, self._operator_token) for index in range(lane_count))
@@ -1062,7 +1276,7 @@ class MoeEp:
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         *,
-        weights: MoeEpNativeForwardWeights,
+        weights: MoeEpNativeForwardWeights | MoeEpNativeDiscreteForwardWeights,
         out: MoeEpTrainingForwardOutputs,
     ) -> torch.Tensor:
         """Run forward into caller-owned prepared-training outputs."""
@@ -1081,11 +1295,18 @@ class MoeEp:
                 device=self._forward_backend_device,
                 validate_expert_ids=self.validation_mode == "strict",
             )
-            validate_native_forward_weights(
-                self._forward_config,
-                weights,
-                device=self._forward_backend_device,
-            )
+            if self._training_state.weight_storage_mode == "discrete":
+                self._validate_discrete_pointer_lifetime(
+                    weights,
+                    validate=validate_native_discrete_forward_weights,
+                    device=self._forward_backend_device,
+                )
+            else:
+                validate_native_forward_weights(
+                    self._forward_config,
+                    weights,
+                    device=self._forward_backend_device,
+                )
             validate_training_forward_outputs(
                 out,
                 self._training_requirement_subset(
@@ -1105,10 +1326,7 @@ class MoeEp:
                     **_named_moe_tensors("activation", activation),
                     "topk_idx": topk_idx,
                     "topk_weights": topk_weights,
-                    "weights.fc1.payload": weights.fc1.payload,
-                    "weights.fc1.scale": weights.fc1.scale,
-                    "weights.fc2.payload": weights.fc2.payload,
-                    "weights.fc2.scale": weights.fc2.scale,
+                    **self._native_weight_tensors(weights),
                     "out.output": out.output,
                     "out.fc1_preact": out.fc1_preact,
                     "out.fc1_a": out.fc1_a,
@@ -1143,7 +1361,7 @@ class MoeEp:
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         *,
-        weights: MoeEpNativeBackwardWeights,
+        weights: MoeEpNativeBackwardWeights | MoeEpNativeDiscreteBackwardWeights,
         fc1_preact: torch.Tensor,
         fc1_a: torch.Tensor | None = None,
         fc1_sfa: torch.Tensor | None = None,
@@ -1172,11 +1390,18 @@ class MoeEp:
                 device=self._forward_backend_device,
                 validate_expert_ids=self.validation_mode == "strict",
             )
-            validate_native_backward_weights(
-                self._forward_config,
-                weights,
-                device=self._forward_backend_device,
-            )
+            if self._training_state.weight_storage_mode == "discrete":
+                self._validate_discrete_pointer_lifetime(
+                    weights,
+                    validate=validate_native_discrete_backward_weights,
+                    device=self._forward_backend_device,
+                )
+            else:
+                validate_native_backward_weights(
+                    self._forward_config,
+                    weights,
+                    device=self._forward_backend_device,
+                )
             if fc1_preact is None:
                 raise ValueError("fc1_preact from the matching forward is required")
             backward_output = out
@@ -1218,10 +1443,7 @@ class MoeEp:
                     **_named_moe_tensors("grad_output", grad_output),
                     "topk_idx": topk_idx,
                     "topk_weights": topk_weights,
-                    "weights.w2_transpose.payload": weights.w2_transpose.payload,
-                    "weights.w2_transpose.scale": weights.w2_transpose.scale,
-                    "weights.w1_transpose.payload": weights.w1_transpose.payload,
-                    "weights.w1_transpose.scale": weights.w1_transpose.scale,
+                    **self._native_weight_tensors(weights),
                     "fc1_preact": fc1_preact,
                     "fc1_a": fc1_a,
                     "fc1_sfa": fc1_sfa,
@@ -1275,6 +1497,7 @@ class MoeEp:
                 self._forward_backend_device = None
             self._validated_topk_idx = None
             self._validated_topk_version = None
+            self._validated_discrete_pointer_tables.clear()
             self._training_state = None
             self._training_lanes = ()
             self._training_requirements = None
@@ -1321,7 +1544,11 @@ __all__ = [
     "MoeEpForwardWeightStaging",
     "MoeEpForwardWeights",
     "MoeEpNativeBackwardWeights",
+    "MoeEpNativeDiscreteBackwardWeights",
+    "MoeEpNativeDiscreteForwardWeights",
+    "MoeEpNativeDiscreteWeight",
     "MoeEpNativeForwardWeights",
+    "MoeEpNativeWeightStorageMode",
     "MoeEpTrainingBackwardOutputs",
     "MoeEpTrainingForwardOutputs",
     "MoeEpTrainingWgradOperands",

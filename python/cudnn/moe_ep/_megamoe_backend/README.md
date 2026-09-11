@@ -34,11 +34,19 @@ API.
 
 ## Native weights
 
-Training execution accepts only `MoeEpNativeForwardWeights` or
-`MoeEpNativeBackwardWeights`. Validation checks the exact versioned
-`layout_id`, shape, stride, dtype, alignment, and device. The launch adapter
-creates aliases to payload and blocked E8M0 scale tensors without allocation,
-copy, refresh, or persistent binding.
+Training has explicit contiguous and discrete native-weight specializations.
+Contiguous execution accepts `MoeEpNativeForwardWeights` and
+`MoeEpNativeBackwardWeights`; validation checks the exact versioned
+`layout_id`, shape, stride, dtype, alignment, and device.
+
+Discrete execution accepts `MoeEpNativeDiscreteForwardWeights` and
+`MoeEpNativeDiscreteBackwardWeights`. Each role supplies caller-owned CUDA
+`int64[E_local]` payload and scale pointer tables. The launch adapter passes
+their addresses directly to the specialized kernel without allocation, copy,
+refresh, or persistent binding. Pointee shape/stride/extent and table/pointee
+lifetime remain caller contracts. Discrete backward uses dedicated layout IDs
+because upstream consumes physical row-major GEMM `(N, K)` payloads rather
+than the contiguous ABI's transposed tensor layouts.
 
 `materialize_forward` and `materialize_backward` are allocation-free fallback
 transforms. They write only caller-provided staging bundles and return native

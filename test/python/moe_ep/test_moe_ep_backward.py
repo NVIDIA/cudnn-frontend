@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+import contextlib
+import os
+from dataclasses import fields, replace
 from types import SimpleNamespace
 
 import cudnn
 import pytest
 import torch
+import torch.multiprocessing as mp
 
 from cudnn.moe_ep import (
     BlockScaledTensor,
@@ -20,9 +23,13 @@ from cudnn.moe_ep import (
     MoeEpExecutionLane,
     MoeEpForwardWeights,
     MoeEpNativeBackwardWeights,
+    MoeEpNativeDiscreteBackwardWeights,
+    MoeEpNativeDiscreteForwardWeights,
+    MoeEpNativeDiscreteWeight,
     MoeEpNativeForwardWeights,
     MoeEpNativeWeight,
     MoeEpNativeWeightLayout,
+    MoeEpNativeWeightStorageMode,
     MoeEpTrainingBackwardOutputs,
     MoeEpTrainingForwardOutputs,
     MoeEpTrainingWgradOperands,
@@ -36,7 +43,9 @@ from cudnn.moe_ep._megamoe_backend.mxfp8._training_resources import (
 )
 from cudnn.moe_ep._megamoe_backend.mxfp8._training_execute import _stage_input
 from cudnn.moe_ep._megamoe_backend.mxfp8._training_weights import (
+    backward_discrete_native_to_kernel,
     backward_native_to_kernel,
+    forward_discrete_native_to_kernel,
     forward_native_to_kernel,
 )
 from cudnn.moe_ep._megamoe_backend.mxfp8._training_wgrad import (
@@ -48,8 +57,11 @@ from cudnn.moe_ep._megamoe_backend._workspace import (
     WorkspaceViews,
 )
 from cudnn.moe_ep._megamoe_backend.mxfp8._fingerprint import canonical_json_sha256
+from cudnn.moe_ep._megamoe_backend.mxfp8._config import Mxfp8KernelConfig
 from cudnn.moe_ep._validation import (
     validate_native_backward_weights,
+    validate_native_discrete_backward_weights,
+    validate_native_discrete_forward_weights,
     validate_native_forward_weights,
     validate_training_backward_outputs,
     validate_training_forward_outputs,
@@ -58,6 +70,7 @@ from cudnn.moe_ep._validation import (
     validate_training_non_aliasing,
 )
 from cudnn.moe_ep.api import _resolve_training_device
+from moe_ep.moe_ep_distributed_workers import _distributed_backward_worker
 from moe_ep.moe_ep_test_support import (
     _allocate_stateless_training_outputs,
     _allocate_training_weight_staging,
@@ -71,8 +84,10 @@ from moe_ep.moe_ep_test_support import (
     _fixed_training_weights,
     _grad_output,
     _interleave_fc1_wgrad,
+    _make_discrete_training_weights,
     _poison_pre_reduced_for_test,
     _poison_training_outputs_for_test,
+    _require_distributed_sm107,
     _sm107_device,
     _training_abi_prepared,
     _training_config,
@@ -166,6 +181,56 @@ def _native_backward(
                 device=device,
             ),
             MoeEpNativeWeightLayout.BACKWARD_W1_TRANSPOSE_GATE_UP_INTERLEAVED_32_V1,
+        ),
+    )
+
+
+def _discrete_weight(experts, layout, *, offset):
+    return MoeEpNativeDiscreteWeight(
+        payload_ptrs=torch.arange(
+            offset,
+            offset + experts * 512,
+            512,
+            dtype=torch.int64,
+        ),
+        scale_ptrs=torch.arange(
+            offset + 256,
+            offset + 256 + experts * 768,
+            768,
+            dtype=torch.int64,
+        ),
+        layout_id=layout,
+    )
+
+
+def _discrete_forward(config):
+    experts = config.experts_per_rank
+    return MoeEpNativeDiscreteForwardWeights(
+        fc1=_discrete_weight(
+            experts,
+            MoeEpNativeWeightLayout.FORWARD_FC1_GATE_UP_INTERLEAVED_32_V1,
+            offset=256,
+        ),
+        fc2=_discrete_weight(
+            experts,
+            MoeEpNativeWeightLayout.FORWARD_FC2_K_MAJOR_V1,
+            offset=4096,
+        ),
+    )
+
+
+def _discrete_backward(config):
+    experts = config.experts_per_rank
+    return MoeEpNativeDiscreteBackwardWeights(
+        w2_transpose=_discrete_weight(
+            experts,
+            MoeEpNativeWeightLayout.BACKWARD_W2_DGRAD_NK_ROW_MAJOR_V1,
+            offset=8192,
+        ),
+        w1_transpose=_discrete_weight(
+            experts,
+            MoeEpNativeWeightLayout.BACKWARD_W1_DGRAD_GATE_UP_INTERLEAVED_32_NK_ROW_MAJOR_V1,
+            offset=12288,
         ),
     )
 
@@ -430,6 +495,229 @@ def test_native_weight_validation_and_kernel_views_are_zero_copy():
     assert forward_kernel.fc2_weight.data_ptr() == forward.fc2.payload.data_ptr()
     assert backward_kernel.fc1_weight.data_ptr() == backward.w2_transpose.payload.data_ptr()
     assert backward_kernel.fc2_weight_sf.data_ptr() == backward.w1_transpose.scale.data_ptr()
+
+
+@pytest.mark.L0
+def test_discrete_native_weight_types_and_kernel_views_are_zero_copy():
+    config = _training_config(weight_interleave_size=32)
+    forward = _discrete_forward(config)
+    backward = _discrete_backward(config)
+
+    assert MoeEpNativeWeightStorageMode("contiguous").value == "contiguous"
+    assert MoeEpNativeWeightStorageMode("discrete").value == "discrete"
+    assert [field.name for field in fields(MoeEpNativeDiscreteWeight)] == [
+        "payload_ptrs",
+        "scale_ptrs",
+        "layout_id",
+    ]
+    forward_kernel = forward_discrete_native_to_kernel(forward)
+    backward_kernel = backward_discrete_native_to_kernel(backward)
+    assert forward_kernel.fc1_weight is forward.fc1.payload_ptrs
+    assert forward_kernel.fc1_weight_sf is forward.fc1.scale_ptrs
+    assert forward_kernel.fc2_weight is forward.fc2.payload_ptrs
+    assert backward_kernel.fc1_weight is backward.w2_transpose.payload_ptrs
+    assert backward_kernel.fc2_weight_sf is backward.w1_transpose.scale_ptrs
+
+
+@pytest.mark.L0
+def test_discrete_native_weight_validation_rejects_host_pointer_tables():
+    config = _training_config(weight_interleave_size=32)
+    with pytest.raises(ValueError, match="must be a CUDA tensor"):
+        validate_native_discrete_forward_weights(config, _discrete_forward(config))
+    with pytest.raises(ValueError, match="must be a CUDA tensor"):
+        validate_native_discrete_backward_weights(config, _discrete_backward(config))
+
+    backward = _discrete_backward(config)
+    wrong_layout = MoeEpNativeDiscreteBackwardWeights(
+        w2_transpose=MoeEpNativeDiscreteWeight(
+            backward.w2_transpose.payload_ptrs,
+            backward.w2_transpose.scale_ptrs,
+            MoeEpNativeWeightLayout.BACKWARD_W2_TRANSPOSE_V1,
+        ),
+        w1_transpose=backward.w1_transpose,
+    )
+    with pytest.raises(ValueError, match=r"weights\.w2_transpose\.layout_id"):
+        validate_native_discrete_backward_weights(config, wrong_layout)
+
+
+@pytest.mark.L0
+def test_discrete_native_weight_validation_checks_table_shape_and_dtype():
+    config = _training_config(weight_interleave_size=32)
+    forward = _discrete_forward(config)
+    wrong_shape = MoeEpNativeDiscreteForwardWeights(
+        fc1=MoeEpNativeDiscreteWeight(
+            forward.fc1.payload_ptrs[:1],
+            forward.fc1.scale_ptrs,
+            forward.fc1.layout_id,
+        ),
+        fc2=forward.fc2,
+    )
+    with pytest.raises(ValueError, match=r"weights\.fc1\.payload_ptrs shape"):
+        validate_native_discrete_forward_weights(config, wrong_shape)
+
+    wrong_dtype = MoeEpNativeDiscreteForwardWeights(
+        fc1=MoeEpNativeDiscreteWeight(
+            forward.fc1.payload_ptrs.to(torch.int32),
+            forward.fc1.scale_ptrs,
+            forward.fc1.layout_id,
+        ),
+        fc2=forward.fc2,
+    )
+    with pytest.raises(ValueError, match=r"must have dtype torch\.int64"):
+        validate_native_discrete_forward_weights(config, wrong_dtype)
+
+
+@pytest.mark.L0
+def test_strict_discrete_pointer_tables_must_be_warmed_before_capture(
+    monkeypatch,
+):
+    op = MoeEp(
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size=256,
+        top_k=2,
+        max_tokens_per_rank=4,
+        max_recv_size_per_rank=256,
+        weight_interleave_size=32,
+    )
+    weights = _discrete_forward(op._forward_config)
+    capturing = False
+    validations = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "device",
+        lambda device: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: capturing,
+    )
+
+    def validate(config, value, *, device, validate_pointees):
+        validations.append(validate_pointees)
+
+    op._validate_discrete_pointer_lifetime(
+        weights,
+        validate=validate,
+        device=torch.device("cuda", 0),
+    )
+    op._validate_discrete_pointer_lifetime(
+        weights,
+        validate=validate,
+        device=torch.device("cuda", 0),
+    )
+    capturing = True
+    op._validate_discrete_pointer_lifetime(
+        weights,
+        validate=validate,
+        device=torch.device("cuda", 0),
+    )
+    assert validations == [True, False, False]
+
+    replacement = MoeEpNativeDiscreteForwardWeights(
+        fc1=MoeEpNativeDiscreteWeight(
+            weights.fc1.payload_ptrs.clone(),
+            weights.fc1.scale_ptrs,
+            weights.fc1.layout_id,
+        ),
+        fc2=weights.fc2,
+    )
+    with pytest.raises(RuntimeError, match="before CUDA Graph capture"):
+        op._validate_discrete_pointer_lifetime(
+            replacement,
+            validate=validate,
+            device=torch.device("cuda", 0),
+        )
+
+    capturing = False
+    with torch.inference_mode():
+        versionless = _discrete_forward(op._forward_config)
+    op._validate_discrete_pointer_lifetime(
+        versionless,
+        validate=validate,
+        device=torch.device("cuda", 0),
+    )
+    capturing = True
+    with pytest.raises(RuntimeError, match="version counters"):
+        op._validate_discrete_pointer_lifetime(
+            versionless,
+            validate=validate,
+            device=torch.device("cuda", 0),
+        )
+    op.close()
+
+
+@pytest.mark.L0
+def test_prepare_training_rejects_cross_rank_storage_mode_mismatch(
+    monkeypatch,
+):
+    import cudnn.moe_ep.api as api_module
+
+    op = MoeEp(
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size=256,
+        top_k=2,
+        max_tokens_per_rank=4,
+        max_recv_size_per_rank=256,
+        weight_interleave_size=32,
+    )
+    op._forward_config = replace(
+        op._forward_config,
+        ep_size=2,
+        ep_group=object(),
+        ep_global_ranks=(0, 1),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "_resolve_training_device",
+        lambda device: torch.device("cuda", 0),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "device",
+        lambda device: contextlib.nullcontext(),
+    )
+
+    def gather(output, value, *, group):
+        assert value == "discrete"
+        assert group is op._forward_config.ep_group
+        output[:] = ["discrete", "contiguous"]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    with pytest.raises(RuntimeError, match="must match on every"):
+        op.prepare_training(native_weight_storage_mode="discrete")
+    op.close()
+
+
+@pytest.mark.L0
+def test_native_weight_storage_mode_separates_kernel_config_and_cache_key():
+    config = _training_config(weight_interleave_size=32)
+    contiguous = Mxfp8KernelConfig.from_operator_config(
+        config,
+        weight_storage_mode="contiguous",
+    )
+    discrete = Mxfp8KernelConfig.from_operator_config(
+        config,
+        weight_storage_mode="discrete",
+    )
+    assert contiguous != discrete
+    assert (
+        discrete.effective_config(16)["weight_storage_mode"]
+        == "discrete"
+    )
+    assert contiguous.compile_key(
+        torch.device("cuda", 0),
+        (10, 7),
+        16,
+        (),
+    ) != discrete.compile_key(
+        torch.device("cuda", 0),
+        (10, 7),
+        16,
+        (),
+    )
 
 
 @pytest.mark.L0
@@ -909,11 +1197,30 @@ def test_training_abi_fingerprint_covers_lanes_and_native_layouts():
         lane_count=2,
         source_tree_digest="source",
     )
+    discrete_forward = _training_abi_prepared(
+        "forward",
+        weight_storage_mode="discrete",
+    )
+    discrete_backward = _training_abi_prepared(
+        "backward",
+        weight_storage_mode="discrete",
+    )
+    changed_storage_mode = _build_training_abi_facts(
+        config,
+        discrete_forward,
+        discrete_backward,
+        requirements,
+        lane_count=1,
+        source_tree_digest="source",
+    )
 
-    assert first["schema_version"] == 2
+    assert first["schema_version"] == 3
     assert first["native_weight_layouts"] == [layout.value for layout in MoeEpNativeWeightLayout]
     assert canonical_json_sha256(first) == canonical_json_sha256(repeated)
     assert canonical_json_sha256(first) != canonical_json_sha256(changed_lanes)
+    assert canonical_json_sha256(first) != canonical_json_sha256(
+        changed_storage_mode
+    )
 
 
 @pytest.mark.L0
@@ -1002,6 +1309,154 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
+def test_discrete_training_forward_backward_and_graph_match_reference():
+    device = _sm107_device()
+    args = make_forward_inputs(device)
+    args = (*args[:4], args[4].float().contiguous())
+    grad_output = _grad_output(device, args[0].shape[0], seed=20260911)
+    max_tokens = args[0].shape[0]
+    expected = _fixed_training_reference(
+        args,
+        grad_output,
+        combine_format="bf16",
+        gate_up_clamp=None,
+        max_tokens_per_rank=max_tokens,
+        max_recv_size_per_rank=256,
+    )
+    source_weights = _fixed_training_weights(args)
+
+    with MoeEp(
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size=256,
+        top_k=args[3].shape[1],
+        max_tokens_per_rank=max_tokens,
+        max_recv_size_per_rank=256,
+        drop_on_overflow=True,
+        combine_format="bf16",
+        weight_interleave_size=32,
+    ) as op:
+        requirements = op.prepare_training(
+            lane_count=1,
+            device=device,
+            native_weight_storage_mode="discrete",
+        )
+        forward_staging, backward_staging = _allocate_training_weight_staging(
+            source_weights
+        )
+        packed_forward = op.pack_forward_weights(
+            source_weights[0],
+            out=forward_staging,
+        )
+        packed_backward = op.pack_backward_weights(
+            source_weights[1],
+            out=backward_staging,
+        )
+        (
+            discrete_forward,
+            discrete_backward,
+            discrete_owners,
+        ) = _make_discrete_training_weights(
+            packed_forward,
+            packed_backward,
+        )
+        assert discrete_owners
+        state = op._training_state
+        assert state is not None
+        expected_descriptor_bytes = op.experts_per_rank * 4 * 128
+        for prepared in (state.forward_prepared, state.backward_prepared):
+            descriptor_region = prepared.kernel.weight_descriptor_region
+            assert (
+                prepared.kernel._mega_device_workspace.nbytes(descriptor_region)
+                == expected_descriptor_bytes
+            )
+
+        lane = op.training_lanes[0]
+        symmetric = op.training_symmetric_buffers(lane)
+        forward_out, backward_out = _allocate_stateless_training_outputs(
+            requirements,
+            device,
+            symmetric,
+        )
+
+        def run():
+            y = op.training_forward(
+                lane,
+                args[0],
+                args[3],
+                args[4],
+                weights=discrete_forward,
+                out=forward_out,
+            )
+            dx, dprob, operands = op.training_backward(
+                lane,
+                grad_output,
+                args[3],
+                args[4],
+                weights=discrete_backward,
+                fc1_preact=forward_out.fc1_preact,
+                fc1_a=forward_out.fc1_a,
+                fc1_sfa=forward_out.fc1_sfa,
+                valid_route_counts=forward_out.valid_route_counts,
+                expert_offsets=forward_out.expert_offsets,
+                out=backward_out,
+            )
+            return y, dx, dprob, operands
+
+        eager = run()
+        torch.cuda.synchronize(device)
+        _assert_matches_reference(eager[0], expected[0])
+        _assert_backward_matches(
+            (eager[1], eager[2]),
+            (expected[1], expected[2]),
+            args[3],
+        )
+        _assert_wgrads_match_reference(
+            eager[3],
+            expected[3],
+            weight_interleave_size=32,
+        )
+
+        table_addresses = tuple(
+            table.data_ptr()
+            for bundle in (discrete_forward, discrete_backward)
+            for table in MoeEp._discrete_pointer_tables(bundle)
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert table_addresses == tuple(
+            table.data_ptr()
+            for bundle in (discrete_forward, discrete_backward)
+            for table in MoeEp._discrete_pointer_tables(bundle)
+        )
+        _assert_matches_reference(captured[0], expected[0])
+        _assert_backward_matches(
+            (captured[1], captured[2]),
+            (expected[1], expected[2]),
+            args[3],
+        )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("world_size", [2, 4], ids=["ep2", "ep4"])
+def test_discrete_training_multi_gpu_matches_reference(world_size, tmp_path):
+    _require_distributed_sm107(world_size)
+    os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    init_file = tmp_path / f"discrete_training_ep{world_size}.init"
+    mp.spawn(
+        _distributed_backward_worker,
+        args=(world_size, str(init_file), "discrete"),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
 @pytest.mark.parametrize(
     ("input_dtype", "combine_format", "token_count", "capacity", "routing", "expected_physical_pool", "expected_effective_pool"),
     (
@@ -1033,7 +1488,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
     expected_physical_pool,
     expected_effective_pool,
 ):
-    """TE must ignore poisoned capacity tails across dynamic expert ranges."""
+    """Consumers must ignore poisoned capacity tails across dynamic expert ranges."""
 
     device = _sm107_device()
     base_args = make_forward_inputs(device)

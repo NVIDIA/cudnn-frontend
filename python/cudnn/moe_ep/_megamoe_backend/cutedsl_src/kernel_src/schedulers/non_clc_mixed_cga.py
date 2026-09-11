@@ -1,6 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-
 """Reusable preferred/fallback cluster scheduling without hardware CLC."""
 
 import dataclasses
@@ -289,6 +286,16 @@ class NonClcMixedCgaSchedulerWorker:
             cta_coord_in_active_cluster[1] + inner_cluster_n * Int32(self.config.fallback_cluster_shape[1]),
             Int32(0),
         )
+
+    @cute.jit
+    def get_atomic_counter_pointer(self, stream_index: Int32) -> cute.Pointer:
+        """Return one global work-ID counter pointer for read-only observation."""
+        if cutlass.const_expr(self.work_id_mode != "atomic_counter"):
+            raise ValueError("Work-ID counters are only available in atomic_counter mode.")
+        work_id_state = self._work_id_state
+        if cutlass.const_expr(isinstance(work_id_state, FixedGroupMixedCgaAtomicCounterWorkIdState)):
+            work_id_state = work_id_state.atomic_counter_state
+        return work_id_state.counter_pointer + stream_index
 
     @cute.jit
     def claim_next_work(self, stream_index=0) -> Int32:

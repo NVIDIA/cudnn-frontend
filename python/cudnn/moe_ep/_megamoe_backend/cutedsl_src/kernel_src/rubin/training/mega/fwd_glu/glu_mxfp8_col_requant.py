@@ -26,10 +26,7 @@ from cutlass.cutlass_dsl import (
 from cutlass._mlir.dialects import arith, llvm
 from cutlass.cute.typing import AddressSpace
 
-from ......helpers.constants import (
-    Fp8E4M3FNMax,
-    Fp8E5M2Max,
-)
+from ......helpers.constants import Fp8E4M3FNMax, Fp8E5M2Max
 
 # The next/ helpers do not export these two block-size constants; they are fixed
 # by the MXFP8 spec / the dispatch pool's 32x4x4 SF atom layout, so define them

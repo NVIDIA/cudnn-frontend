@@ -23,6 +23,7 @@ from moe_ep.moe_ep_test_support import (
     _forward_config,
     _grad_output,
     _interleave_fc1_wgrad,
+    _make_discrete_training_weights,
     _output_as_float,
     _poison_training_outputs_for_test,
     _reference_forward,
@@ -32,6 +33,7 @@ from moe_ep.moe_ep_test_support import (
 
 __all__ = [
     "_distributed_autotune_worker",
+    "_distributed_backward_worker",
     "_distributed_output_worker",
     "_distributed_subgroup_output_worker",
     "_run_backward_reference_case",
@@ -296,6 +298,7 @@ def _run_backward_reference_case(
     combine_format: str = "bf16",
     gate_up_clamp: float | None = None,
     expected_global_ranks: tuple[int, ...] | None = None,
+    native_weight_storage_mode: str = "contiguous",
 ) -> None:
     """Run stateless training after the independent distributed oracle."""
 
@@ -346,6 +349,7 @@ def _run_backward_reference_case(
         requirements = op.prepare_training(
             lane_count=1,
             device=device,
+            native_weight_storage_mode=native_weight_storage_mode,
         )
         lane = op.training_lanes[0]
         forward_staging, backward_staging = _allocate_training_weight_staging(weights)
@@ -357,6 +361,14 @@ def _run_backward_reference_case(
             weights[1],
             out=backward_staging,
         )
+        discrete_owners = None
+        if native_weight_storage_mode == "discrete":
+            (
+                native_forward,
+                native_backward,
+                discrete_owners,
+            ) = _make_discrete_training_weights(native_forward, native_backward)
+            assert discrete_owners
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
@@ -439,3 +451,35 @@ def _run_backward_reference_case(
             raise assertion_error
     finally:
         op.close()
+
+
+def _distributed_backward_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    native_weight_storage_mode: str = "contiguous",
+) -> None:
+    """Run one WORLD-scoped distributed training parity case."""
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+        timeout=timedelta(seconds=180),
+    )
+    try:
+        _run_backward_reference_case(
+            device=device,
+            ep_group=dist.group.WORLD,
+            ep_rank=rank,
+            ep_size=world_size,
+            expected_global_ranks=tuple(range(world_size)),
+            native_weight_storage_mode=native_weight_storage_mode,
+        )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()

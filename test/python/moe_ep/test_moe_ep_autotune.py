@@ -20,6 +20,7 @@ from moe_ep.moe_ep_test_support import (
     _fixed_training_weights,
     _forward_config,
     _grad_output,
+    _make_discrete_training_weights,
     _reference_forward,
     _replay_cuda_graph,
     _sm107_device,
@@ -362,8 +363,14 @@ def test_autotune_api_transactions(monkeypatch):
             def __init__(self, config):
                 self.config = config
 
-            def prepare_training(self, *, lane_count):
+            def prepare_training(
+                self,
+                *,
+                lane_count,
+                native_weight_storage_mode="contiguous",
+            ):
                 assert lane_count == 1
+                assert native_weight_storage_mode == "contiguous"
                 return TrainingState()
 
             def close(self):
@@ -469,6 +476,11 @@ def test_autotune_api_transactions(monkeypatch):
         assert launches == ["forward", "backward"] * 4
         assert op._training_state is None
         assert op._forward_backend is None
+        with pytest.raises(
+            ValueError,
+            match="must match the autotune_training mode",
+        ):
+            op.prepare_training(native_weight_storage_mode="discrete")
         op.close()
 
 
@@ -618,3 +630,71 @@ def test_autotune_sm107_inference_training_and_graph():
             (training_expected[1], training_expected[2]),
             training_args[3],
         )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+def test_autotune_training_discrete_mode_binds_prepare_specialization():
+    from cudnn import MoeEp, MoeEpTuningConfig
+
+    device = _sm107_device()
+    base_args = make_forward_inputs(device)
+    training_args = (
+        base_args[0].dequantize(torch.bfloat16),
+        base_args[1],
+        base_args[2],
+        base_args[3],
+        base_args[4].float().contiguous(),
+    )
+    grad_output = _grad_output(
+        device,
+        training_args[0].shape[0],
+        seed=20260911,
+    )
+    source_weights = _fixed_training_weights(training_args)
+    with MoeEp(
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size=256,
+        top_k=2,
+        max_tokens_per_rank=training_args[0].shape[0],
+        max_recv_size_per_rank=256,
+        drop_on_overflow=True,
+        combine_format="bf16",
+        weight_interleave_size=32,
+    ) as op:
+        forward_staging, backward_staging = _allocate_training_weight_staging(
+            source_weights
+        )
+        packed_forward = op.pack_forward_weights(
+            source_weights[0],
+            out=forward_staging,
+        )
+        packed_backward = op.pack_backward_weights(
+            source_weights[1],
+            out=backward_staging,
+        )
+        native_forward, native_backward, owners = _make_discrete_training_weights(
+            packed_forward,
+            packed_backward,
+        )
+        assert owners
+        result = op.autotune_training(
+            training_args[0],
+            grad_output,
+            training_args[3],
+            training_args[4],
+            forward_weights=native_forward,
+            backward_weights=native_backward,
+            candidates=[MoeEpTuningConfig(token_in_flag_batch=2)],
+            native_weight_storage_mode="discrete",
+            warmup_iters=0,
+            timed_iters=1,
+        )
+        assert result.mode == "training"
+        op.prepare_training(
+            lane_count=1,
+            device=device,
+            native_weight_storage_mode="discrete",
+        )
+        assert op._training_state.weight_storage_mode == "discrete"

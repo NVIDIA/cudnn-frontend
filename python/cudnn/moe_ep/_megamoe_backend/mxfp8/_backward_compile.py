@@ -22,7 +22,7 @@ from ._compile import (
 from ._compile_common import _compile_kernel, _prepare_rubin_environment
 from ._config import Mxfp8KernelConfig
 from ._formats import combine_wire_format
-from ._launch import _to_cute, _to_cute_ptr
+from ._launch import _to_cute, _to_cute_ptr, _to_discrete_ptr_table
 
 
 @dataclass(frozen=True)
@@ -95,7 +95,7 @@ def prepare_backward_kernel(
     )
     import cutlass
 
-    from ..cutedsl_src.kernel_src.rubin.training.mega.bwd_dglu import (
+    from ..cutedsl_src.kernel_src.rubin.training.mega.bwd_dglu.dglu_mxfp8_mega_moe_kernel import (
         Sm107MegaMoEMxfp8DgluKernel,
     )
     from ..cutedsl_src.quant_def import CombineFormat
@@ -142,6 +142,7 @@ def prepare_backward_kernel(
         dfc2_col_output=dfc2_col_output,
         enable_grad_y2_col_quant=enable_grad_y2_col_quant,
         num_ctas_grad_y2_col_quant=config.col_quant_num_ctas,
+        weight_storage_mode=config.weight_storage_mode,
     )
     local_bytes, shared_bytes = kernel.get_workspace_sizes()
     local_zero, shared_zero = kernel.require_zero_workspace_leading_bytes
@@ -224,19 +225,30 @@ def _layout_signature(inputs: Mxfp8BackwardLaunchInputs) -> tuple:
 def build_backward_runtime_kwargs(
     inputs: Mxfp8BackwardLaunchInputs,
     resources: PreparedResources,
+    *,
+    weight_storage_mode: str = "contiguous",
 ) -> dict[str, Any]:
     import cuda.bindings.driver as cuda
 
     stream = resources.runtime.current_stream()
+    if weight_storage_mode == "contiguous":
+        convert_weight = _to_cute
+    elif weight_storage_mode == "discrete":
+        convert_weight = _to_discrete_ptr_table
+    else:
+        raise ValueError(
+            "weight_storage_mode must be 'contiguous' or 'discrete', "
+            f"got {weight_storage_mode!r}"
+        )
     return {
         "grad_out": _to_cute(inputs.grad_out),
         "grad_out_sf": _to_cute(inputs.grad_out_sf),
         "topk_idx": _to_cute(inputs.topk_idx),
         "topk_weights": _to_cute(inputs.topk_weights, assumed_align=4),
-        "fc1_weight": _to_cute(inputs.fc1_weight),
-        "fc1_weight_sf": _to_cute(inputs.fc1_weight_sf),
-        "fc2_weight": _to_cute(inputs.fc2_weight),
-        "fc2_weight_sf": _to_cute(inputs.fc2_weight_sf),
+        "fc1_weight": convert_weight(inputs.fc1_weight),
+        "fc1_weight_sf": convert_weight(inputs.fc1_weight_sf),
+        "fc2_weight": convert_weight(inputs.fc2_weight),
+        "fc2_weight_sf": convert_weight(inputs.fc2_weight_sf),
         "beta": _to_cute(inputs.beta, assumed_align=4),
         "fc1_preact": _to_cute(
             inputs.fc1_preact,
@@ -308,7 +320,11 @@ def compile_backward_or_get(
             return cached
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("MXFP8 backward kernel must be compiled before capture")
-        runtime_kwargs = build_backward_runtime_kwargs(inputs, resources)
+        runtime_kwargs = build_backward_runtime_kwargs(
+            inputs,
+            resources,
+            weight_storage_mode=prepared.config.weight_storage_mode,
+        )
         compiled = CompiledMxfp8BackwardKernel(
             key=key,
             callable=_compile_kernel(prepared.kernel, runtime_kwargs),

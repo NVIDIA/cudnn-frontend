@@ -388,7 +388,7 @@ def _build_training_abi_facts(
         source_root = Path(__file__).resolve().parents[1] / "cutedsl_src"
         source_tree_digest = source_tree_sha256(source_root)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_tree_sha256": source_tree_digest,
         "ep": {
             "size": int(config.ep_size),
@@ -409,6 +409,7 @@ def _build_training_abi_facts(
             "output_format": config.output_format,
             "apply_topk_in_fc1": bool(config.apply_topk_in_fc1),
             "fc1_weight_layout": config.fc1_weight_layout.value,
+            "native_weight_storage_mode": forward.config.weight_storage_mode,
             "gate_up_clamp": config.gate_up_clamp,
         },
         "resources": {
@@ -489,6 +490,13 @@ class Mxfp8TrainingState:
         self.device = torch.device(device)
         self.forward_prepared = forward
         self.backward_prepared = backward
+        if forward.config.weight_storage_mode != backward.config.weight_storage_mode:
+            raise ValueError(
+                "forward/backward native weight storage modes must match, got "
+                f"{forward.config.weight_storage_mode!r} and "
+                f"{backward.config.weight_storage_mode!r}"
+            )
+        self.weight_storage_mode = forward.config.weight_storage_mode
         self.stager = Mxfp8TrainingStager(config.hidden_size, config.top_k)
         self.beta = torch.ones(
             (config.experts_per_rank,),

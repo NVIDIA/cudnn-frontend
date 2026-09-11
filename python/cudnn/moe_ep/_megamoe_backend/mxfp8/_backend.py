@@ -184,6 +184,7 @@ class Mxfp8Backend:
         self,
         *,
         lane_count: int,
+        native_weight_storage_mode: str = "contiguous",
     ):
         """Allocate private per-lane state for stateless training calls."""
 
@@ -202,6 +203,7 @@ class Mxfp8Backend:
             forward_kernel_config = Mxfp8KernelConfig.from_operator_config(
                 training_config,
                 tuning=training_config.tuning,
+                weight_storage_mode=native_weight_storage_mode,
             )
             backward_tuning = training_config.backward_tuning
             if backward_tuning is None:
@@ -209,6 +211,7 @@ class Mxfp8Backend:
             backward_kernel_config = Mxfp8KernelConfig.from_operator_config(
                 training_config,
                 tuning=backward_tuning,
+                weight_storage_mode=native_weight_storage_mode,
             )
             # Graph transport must complete its cross-rank protocol before the
             # frontend applies the public trap/drop policy at graph tail.
