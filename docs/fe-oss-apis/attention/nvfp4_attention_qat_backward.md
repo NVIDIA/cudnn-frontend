@@ -9,7 +9,7 @@ scaled dot-product attention trained with NVFP4 fake quantization. It is a
 Triton port of FastVideo's attention QAT backward at commit
 `e9bbaca07d511b2ee7e16474dae6f923426223dc`:
 
-<https://github.com/hao-ai-lab/FastVideo/blob/e9bbaca07d511b2ee7e16474dae6f923426223dc/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/attn_qat_train.py>
+[https://github.com/hao-ai-lab/FastVideo/blob/e9bbaca07d511b2ee7e16474dae6f923426223dc/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/attn_qat_train.py](https://github.com/hao-ai-lab/FastVideo/blob/e9bbaca07d511b2ee7e16474dae6f923426223dc/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/attn_qat_train.py)
 
 The operation fake-quantizes Q, K, and V to the NVFP4 E2M1 data format with an
 E4M3 scale for every 16 values, then immediately dequantizes them for the

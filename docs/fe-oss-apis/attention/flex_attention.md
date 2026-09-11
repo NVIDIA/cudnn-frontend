@@ -228,7 +228,7 @@ as validation errors.
 ## Benchmark
 
 The Flex-only static-mask benchmark and its protocol are documented in
-[`benchmark/flex_attention/README.md`](../../../benchmark/flex_attention/README.md).
+[`benchmark/flex_attention/README.md`](https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/flex_attention/README.md).
 
 ### Reference results from the original implementation
 
