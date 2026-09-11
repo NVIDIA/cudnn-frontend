@@ -331,6 +331,15 @@ cudnn.gnn.CscGraph.num_dst_nodes
 cudnn.gnn.CscGraph.num_edges
 cudnn.gnn.CscGraph.num_indices
 cudnn.gnn.agg_simple
+cudnn.gnn_agg_op
+cudnn.gnn_agg_op.MAX
+cudnn.gnn_agg_op.MEAN
+cudnn.gnn_agg_op.MIN
+cudnn.gnn_agg_op.SUM
+cudnn.gnn_agg_op.name
+cudnn.gnn_agg_op.value
+cudnn.gnn_agg_simple_backward
+cudnn.gnn_agg_simple_forward
 cudnn.graph
 cudnn.graph_cache
 cudnn.heur_mode
@@ -392,6 +401,7 @@ cudnn.knob_type.STREAM_K
 cudnn.knob_type.SWAP_AB
 cudnn.knob_type.SWIZZLE
 cudnn.knob_type.TILEK
+cudnn.knob_type.TILE_CGA
 cudnn.knob_type.TILE_CGA_M
 cudnn.knob_type.TILE_CGA_N
 cudnn.knob_type.TILE_COLS
@@ -642,6 +652,11 @@ cudnn.scalar_type.name
 cudnn.scalar_type.value
 cudnn.sdpa
 cudnn.sdpa.bwd
+cudnn.sdpa.bwd.Nvfp4AttentionQatBackward
+cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.check_support
+cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.compile
+cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.execute
+cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.scratch_workspace_bytes
 cudnn.sdpa.bwd.SdpaBwdDsl
 cudnn.sdpa.bwd.SdpaBwdDsl.check_support
 cudnn.sdpa.bwd.SdpaBwdDsl.compile
@@ -657,6 +672,7 @@ cudnn.sdpa.bwd.SdpaBwdDslSm80.check_support
 cudnn.sdpa.bwd.SdpaBwdDslSm80.compile
 cudnn.sdpa.bwd.SdpaBwdDslSm80.execute
 cudnn.sdpa.bwd.SdpaBwdDslSm80.scratch_workspace_bytes
+cudnn.sdpa.bwd.nvfp4_attention_qat_backward
 cudnn.sdpa.bwd.sdpa_bwd_wrapper_dsl_sm120
 cudnn.sdpa.bwd.sdpa_bwd_wrapper_sm80
 cudnn.sdpa.fwd
