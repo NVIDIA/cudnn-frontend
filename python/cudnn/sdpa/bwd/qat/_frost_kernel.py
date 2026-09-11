@@ -853,8 +853,6 @@ class Bars(NamedTuple):
     mb_p_ready: object
     mb_stats_full: object
     mb_stats_empty: object
-    mb_ds_smem_full: object
-    mb_ds_smem_empty: object
     # MMA(dK) commit -> softmax: the dS slot's SMEM was consumed as an A operand.
     mb_ds_mma_done: object
     mb_dv_ready: object
@@ -909,11 +907,8 @@ def _make_bprop_bars(CFG):
         # lse/do_dot SMEM prefetch ring (TMASTG elect-1 STS -> softmax read).
         mb_stats_full=MBarrier(_alloc(STATS_STAGES), stages=STATS_STAGES, init_count=ONE_WARP, producer=Producer.THREAD),
         mb_stats_empty=MBarrier(_alloc(STATS_STAGES), stages=STATS_STAGES, init_count=SOFTMAX_LANES, producer=Producer.THREAD),  # (AUDIT)
-        # dS SMEM ring: softmax store_swizzled (all lanes) -> TMASTG TMA-store.
-        mb_ds_smem_full=MBarrier(_alloc(XFER_STAGES), stages=XFER_STAGES, init_count=SOFTMAX_LANES, producer=Producer.THREAD),  # (AUDIT)
-        mb_ds_smem_empty=MBarrier(_alloc(XFER_STAGES), stages=XFER_STAGES, init_count=ONE_LANE, producer=Producer.THREAD),
-        # Second consumer of a dS slot: the leader MMA's dK commit (multicast, 1
-        # arrive per CTA).  Softmax waits both before rewriting the slot.
+        # dS SMEM slot: written by softmax store_swizzled, consumed only by the
+        # leader MMA's dK (multicast commit, 1 arrive per CTA) which frees it.
         mb_ds_mma_done=MBarrier(_alloc(XFER_STAGES), stages=XFER_STAGES, init_count=MMA_COMMIT_ARRIVES, producer=Producer.MMA_COMMIT),
         # dV epilogue (post-loop, one-shot): MMA(dV) -> epilogue (compute warps).
         mb_dv_ready=MBarrier(_alloc(1), stages=1, init_count=MMA_COMMIT_ARRIVES, producer=Producer.MMA_COMMIT),
@@ -944,7 +939,6 @@ def _kernel(
     # GMEM TMA descriptors — stores
     tma_dv_desc: cutlass.GridConstant[tmap.TensorMap],  # dV  -> out [B,H,S_kv,d_v] BF16
     tma_dk_desc: cutlass.GridConstant[tmap.TensorMap],  # dK  -> out [B,H,S_kv,d_qk] BF16
-    tma_ds_desc: cutlass.GridConstant[tmap.TensorMap],  # dS  -> workspace [B,H,S_kv,S_q] FP8
     # GMEM scalar / vector inputs
     lse_tensor: cute.Tensor,  # [B, H_q, S_q]   FP32
     scaled_do_dot_tensor: cute.Tensor,  # [B, H_q, S_q]   FP32 = do_dot * attn_scale
@@ -1225,8 +1219,6 @@ def _kernel(
                 bars.mb_stats_empty[p].init()
             # dS SMEM ring (mb_ds_smem_empty pre-armed via PipelineState).
             for p in cutlass.range_constexpr(XFER_STAGES):
-                bars.mb_ds_smem_full[p].init()
-                bars.mb_ds_smem_empty[p].init()
                 bars.mb_ds_mma_done[p].init()
 
             # Scheduler ring: init on EVERY CTA (try_cancel multicast targets all).
@@ -1342,17 +1334,14 @@ def _kernel(
     elif warp_idx == cutlass.Int32(CFG.TMASTG_WARP_ID):
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_dv_desc.get_ptr())
-        nvvm.prefetch_tensormap(tma_ds_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_dk_desc.get_ptr())
-        # dS SMEM->workspace store + dV/dK SMEM->GMEM stores (stats prefetch moved
-        # to the scheduler warp so it runs concurrently with these stores).
+        # dV/dK SMEM->GMEM stores (stats prefetch lives on the scheduler warp so
+        # it runs concurrently with these stores).
         _tmastg_warp(
             tma_dv_desc=tma_dv_desc,
             tma_dk_desc=tma_dk_desc,
-            tma_ds_desc=tma_ds_desc,
             sdV=sdV,
             sdK=sdK,
-            sdS=sdS,
             bars=bars,
             sched=sched,
             seqlen_q=seqlen_q,
@@ -1496,7 +1485,6 @@ def _softmax_warp_group(
     sched_state = PipelineState.start()
     s_full_state = PipelineState.start()  # consume mb_s_acc_full
     dp_full_state = PipelineState.start()  # consume mb_dp_full
-    ds_empty_state = PipelineState.start(phase=1)  # dS SMEM ring slot free (TMASTG)
     ds_mma_done_state = PipelineState.start(phase=1)  # dS SMEM ring slot free (dK MMA)
     p_ready_state = PipelineState.start()  # produce mb_p_ready (fp8_P 2-stage ring)
     dv_ready_state = PipelineState.start()  # consume mb_dv_ready
@@ -1575,9 +1563,8 @@ def _softmax_warp_group(
             )
             chunk_dS = (reg_dP.vec * attn_scale_for_dS - dot_vec) * chunk_P
             chunk_dS_f16 = chunk_dS.to(STORAGE_DTYPE)
-            ds_slot = ds_empty_state.idx
-            bars.mb_ds_smem_empty[ds_slot].wait(ds_empty_state.phase)
-            ds_empty_state = advance(ds_empty_state, XFER_STAGES)
+            # The slot's only consumer is the dK MMA (both CTAs); its commit frees it.
+            ds_slot = ds_mma_done_state.idx
             bars.mb_ds_mma_done[ds_slot].wait(ds_mma_done_state.phase)
             ds_mma_done_state = advance(ds_mma_done_state, XFER_STAGES)
             # dS SMEM [kv, q], 128B-swizzled: f16 TILE_N=128 q = 256 B/row =
@@ -1590,7 +1577,6 @@ def _softmax_warp_group(
                 sdS_raw.subview(ds_slot * cutlass.Int32(dSBufferElems) + gblk * cutlass.Int32(P_BLOCK_BYTES) + tid_in_wg * cutlass.Int32(P_D_BLOCK))
             ).data_ptr().store_swizzled(chunk_dS_f16, alignment=128, swizzle=P_SMEM_SWIZZLE)
             nvvm.fence_proxy("async.shared", space="cta")
-            bars.mb_ds_smem_full[ds_slot].arrive()
             # dK MMA reads this slot on BOTH CTAs: every lane DSMEM-arrives leader.
             bars.mb_ds_ready[ds_slot].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
             bars.mb_stats_empty[stats_slot].arrive()
@@ -1909,10 +1895,8 @@ def _mma_warp_quiet(tmem_ptr_i32, bars) -> None:
 def _tmastg_warp(
     tma_dv_desc,
     tma_dk_desc,
-    tma_ds_desc,
     sdV,
     sdK,
-    sdS,
     bars,
     sched,
     seqlen_q,
@@ -1921,26 +1905,18 @@ def _tmastg_warp(
     cta_in_pair,
     head_base,
 ) -> None:
-    """TMA-store service warp (single sub-group):
-      per q-iter store the dS slot -> GMEM workspace [B,H,S_kv,S_q]
-        (mb_ds_smem_full wait -> TMA store -> mb_ds_smem_empty);
-      per kv-tile store dV -> GMEM out [B,H,S_kv,d_v] (mb_dv_stg_full wait ->
-        TMA store -> mb_dv_stg_empty).
-    The lse/do_dot stats prefetch now lives on the SCHEDULER warp
-    (_scheduler_stats_warp) so it runs concurrently with these TMA stores
-    instead of serialized behind them on one warp (latency-hiding for the
-    compute warp's LDS.128 LSE/DOT reads).
+    """TMA-store service warp (single sub-group): per kv-tile store dV and dK ->
+    GMEM out [B,H,S_kv,d] (mb_d?_stg_full wait -> TMA store -> mb_d?_stg_empty).
+    dS never leaves SMEM: the dK MMA consumes it here and the dQ kernel recomputes it.
+    The lse/do_dot stats prefetch lives on the SCHEDULER warp so it overlaps these stores.
     """
     tma_dv = GmemTileTma(tma_dv_desc)
     tma_dk = GmemTileTma(tma_dk_desc)
-    tma_ds = GmemTileTma(tma_ds_desc)
 
     kv_super_idx, head_idx, batch_idx = _boot_tile(sched)
-    n_q_tiles = seqlen_q // cutlass.Int32(CFG.TILE_N)
 
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
-    ds_full_state = PipelineState.start()  # consume mb_ds_smem_full
     dv_full_state = PipelineState.start()  # consume mb_dv_stg_full
     dk_full_state = PipelineState.start()  # consume mb_dk_stg_full
 
@@ -1948,32 +1924,9 @@ def _tmastg_warp(
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
         kv_block_base = kv_super_idx * cutlass.Int32(CFG.TILE_M * CFG.CTA_MMA)
         KV_ROW_OFFSET_PEER = cta_in_pair * cutlass.Int32(CFG.TILE_M)
-        # Mask: only the in-range q-tiles produce dS.  The skipped (out-of-band)
-        # q-tiles' dS-workspace regions stay ZERO (driver zero-inits the
-        # workspace per head-chunk under masks) so dK/dQ = dS·Q / dSᵀ·K are correct.
-        q_lo, q_hi = _q_loop_bounds(kv_block_base, seqlen_q, seqlen_kv)
-
-        for q_iter in cutlass.range(q_lo, q_hi, 1, unroll=1):
-            q_col_base = q_iter * cutlass.Int32(CFG.TILE_N)
-
-            # dS store for THIS q-iter (after softmax produced it).
-            ds_slot = ds_full_state.idx
-            bars.mb_ds_smem_full[ds_slot].wait(ds_full_state.phase)
-            ds_full_state = advance(ds_full_state, XFER_STAGES)
-            tma_store_tile(
-                sdS[ds_slot],
-                # workspace [B,H,S_kv,S_q] → coords innermost-first
-                # (S_q, S_kv, H, B); cf. ds_box (1,1,TILE_M,TILE_N).
-                tma_ds(q_col_base, kv_block_base + KV_ROW_OFFSET_PEER, head_idx, batch_idx),
-            )
-            tma_store_commit()
-            tma_store_wait()
-            if nvvm.elect_sync():
-                bars.mb_ds_smem_empty[ds_slot].arrive()
 
         # (c) dV store for THIS kv-tile (after the epilogue).  dV → FULL output
-        # [B,H_q,S_kv,d_v] so use the full-tensor head (head_idx + head_base);
-        # dS above stays CHUNK-local (workspace is [B,H_chunk,S_kv,S_q]).
+        # [B,H_q,S_kv,d_v] so use the full-tensor head (head_idx + head_base).
         bars.mb_dv_stg_full.wait(dv_full_state.phase)
         dv_full_state = advance(dv_full_state, 1)
         tma_store_tile(
@@ -2301,7 +2254,6 @@ def _host(
     v_tensor: cute.Tensor,
     dv_tensor: cute.Tensor,  # out  [B, S_kv, H, d_v]  BF16
     dk_tensor: cute.Tensor,  # out  [B, S_kv, H, d_qk] BF16
-    ds_tensor: cute.Tensor,  # out  [B, H, S_kv, S_q]  BF16 workspace (dQ matmul A)
     lse_tensor: cute.Tensor,
     scaled_do_dot_tensor: cute.Tensor,
     problem_size: Tuple[int, int, int, int, int, int],
@@ -2332,11 +2284,6 @@ def _host(
     # dV STG: 128B-swizzled box per sub-tile (TILE_M kv × DV_D_BLOCK BF16 d-cols);
     # TMA_DV_ITERS=4 sub-tiles.  Matches the store_swizzled sdV layout.
     dv_box = (1, CFG.TILE_M, 1, TMA_DV_GRANU_ELEMS)
-    # dS workspace STG: TILE_M kv × per-sub-tile q granu (f16: P_D_BLOCK=64,
-    # P_TMA_ITERS=2 sub-tiles — TILE_N q × 2 B = 256 B/row > the 128 B swizzle
-    # atom).  Workspace is [B, H, S_kv, S_q] (box dims 2=S_kv, 3=S_q) so the
-    # dK/dQ matmul A operand is a free [B*H, S_kv, S_q] reshape (no permute).
-    ds_box = (1, 1, CFG.TILE_M, P_D_BLOCK)
     stride_order = (3, 2, 1, 0)
 
     def _tma_swz(byte_w: int):
@@ -2372,11 +2319,6 @@ def _host(
     tma_dk_desc = tmap.create_tensor_map_tiled_from_view(
         dk_tensor, box_dims=dk_box, stride_order=stride_order, swizzle=_tma_swz(CFG.dK_SWZ_BYTES), l2_promotion=tmap.TensorMapL2Promotion.l2_128b
     )
-    # dS STG: softmax store_swizzled's fp8 dS into sdS with P_SMEM_SWIZZLE
-    # (128 B) -> descriptor swizzle must match (s128b).
-    tma_ds_desc = tmap.create_tensor_map_tiled_from_view(
-        ds_tensor, box_dims=ds_box, stride_order=stride_order, swizzle=_tma_swz(CFG.dS_SWZ_BYTES), l2_promotion=tmap.TensorMapL2Promotion.l2_128b
-    )
 
     # Grid: one cga2 cluster per (kv_block, head, batch) tile.  Head axis spans
     # QH_CHUNK heads per launch (== QH single-shot); the driver loops chunks and
@@ -2401,7 +2343,6 @@ def _host(
         tma_qdk_desc,
         tma_dv_desc,
         tma_dk_desc,
-        tma_ds_desc,
         lse_tensor,
         scaled_do_dot_tensor,
         # kernel `seqlen_kv` = REAL length (drives the PADDED mask); the grid +
@@ -2486,14 +2427,6 @@ def compile(b: int, qh: int, kh: int, sq: int, skv: int, qh_chunk: int = 0) -> C
         (skv * qh * CFG.TILE_K, CFG.TILE_K, skv * CFG.TILE_K, 1),
         assumed_align=16,
     )
-    # dS workspace [B, H_chunk, S_kv, S_q] BF16 (consumed by the dQ = dSᵀ·K GEMM).
-    # Head dim is the CHUNK count so the workspace stays ≤ the cap.
-    fake_ds = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (b, qh_chunk, skv, sq),  # [B, H_chunk, S_kv, S_q] (matmul A reshape)
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
     fake_lse = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (b, qh, sq),
@@ -2514,7 +2447,6 @@ def compile(b: int, qh: int, kh: int, sq: int, skv: int, qh_chunk: int = 0) -> C
         fake_v,
         fake_dv,
         fake_dk,
-        fake_ds,
         fake_lse,
         fake_scaled_do_dot,
         (b, qh, kh, sq, skv, qh_chunk),

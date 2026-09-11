@@ -79,7 +79,8 @@ def test_frost_matches_triton_and_reference(sequence, chunk, backend):
     for actual, golden in zip(got, expected):
         torch.testing.assert_close(actual.float(), golden, atol=0.03, rtol=0.03)
     h, s = inputs[0].shape[1:3]
-    assert ws.numel() == 3 * h * s * 128 * 2 + h * s * 4 + (chunk or h) * s * s * 2
+    # Fake Q/K/V + raw delta only: O(S), independent of the head chunk (dS never leaves SMEM).
+    assert ws.numel() == 3 * h * s * 128 * 2 + h * s * 4
 
 
 @torch_fork_set_rng(seed=73)
@@ -164,21 +165,14 @@ def test_frost_explicit_stream_and_runtime_scale(monkeypatch, backend):
         lse.copy_(scores.logsumexp(-1))
         o.copy_(scores.softmax(-1) @ fv)
         do.normal_()
-    bmm = torch.bmm
-    observed_streams = []
-
-    def checked_bmm(*args, **kwargs):
-        observed_streams.append(torch.cuda.current_stream().cuda_stream)
-        return bmm(*args, **kwargs)
-
-    monkeypatch.setattr(torch, "bmm", checked_bmm)
-    # Intentionally call outside the launch stream's torch context.
+    # Every gradient is produced by the FROST kernels; no torch GEMM remains on
+    # this route, so the stream contract is checked end to end: the forward
+    # auxiliaries were produced on `launch`, and execute is intentionally called
+    # outside that stream's torch context with an explicit current_stream.
     candidate.execute(q, k, v, o, do, lse, *got, ws, softmax_scale=scale, current_stream=cuda.CUstream(launch.cuda_stream))
     with torch.cuda.stream(launch):
         reference.execute(q, k, v, o, do, lse, *ref, ref_ws, softmax_scale=scale)
     producer.wait_stream(launch)
-    # dK is produced in-kernel; only the dQ GEMM goes through torch.bmm.
-    assert observed_streams == [launch.cuda_stream]
     _close(got, ref)
 
 

@@ -160,43 +160,38 @@ workspace = torch.empty(op.scratch_workspace_bytes(), device=q.device, dtype=tor
 op.execute(q, k, v, high_precision_o, do, lse, dq, dk, dv, workspace)
 ```
 
-This backend reuses the Triton Q/delta and KV quantizers, then launches a
-two-CTA FROST kernel implemented in CuTe DSL that produces dV and dK in-kernel
-and writes BF16 dS to the workspace, followed by one output-buffer BF16 batched
-GEMM for dQ. The quantizers write their BSHD intermediates directly; the main kernel
-addresses caller-owned BHSD dO/dV/dK natively. All stages honor `current_stream`.
-Compilation is plan-time-only; no mutable global configuration is switched
-between plans. The wrapper's bounded cache separates requested backend,
-head-chunk and workspace-limit plans.
+This backend reuses the Triton Q/delta and KV quantizers, then launches two
+two-CTA FROST kernels implemented in CuTe DSL: a dK/dV kernel that tiles over
+KV (P fake-quantized for dV, dS consumed from shared memory for dK) and a dQ
+kernel that tiles over Q and recomputes dS. Like the Triton backend it never
+materializes an S-by-S intermediate, and every gradient is accumulated in a
+fixed order, so results are bitwise reproducible. The quantizers write their
+BSHD intermediates directly; the kernels address caller-owned BHSD dO/dQ/dK/dV
+natively. All stages honor `current_stream`. Compilation is plan-time-only; no
+mutable global configuration is switched between plans. The wrapper's bounded
+cache separates requested backend, head-chunk and workspace-limit plans.
 
-The tradeoff is a materialized BF16 dS workspace. `head_chunk=0` computes all
-heads at once when no workspace limit is supplied. A positive divisor of H
-fixes the FROST head chunk, reducing dS allocation at the cost of more launches.
-With `auto`, a valid chunk is unused if Triton is selected; forced `triton`
+The FROST workspace is the same as Triton's and independent of `head_chunk`,
+which only sets the launch granularity (`head_chunk=0` launches all heads at
+once; a positive divisor of H launches H/head_chunk times per kernel). With
+`auto`, a valid chunk is unused if Triton is selected; forced `triton`
 requires `head_chunk=0`. Total FROST workspace, in bytes, is:
 
 ```text
 3 * H * S * 128 * 2     # fake Q/K/V
 + H * S * 4            # raw FP32 delta
-+ H_chunk * S * S * 2  # BF16 dS, reused across chunks
 ```
 
 Both APIs accept `workspace_limit_bytes=None` (no explicit scratch budget) or
-a nonnegative integer. With `head_chunk=0`, FROST chooses the largest divisor
-of H whose scratch fits the limit. If even one head cannot fit, `auto` tries
-Triton; explicit `frost` rejects. An explicit positive head chunk is never
-silently reduced. If the selected Triton route also exceeds the limit,
-support checking raises before compilation or allocation. The limit covers
-this API's explicit scratch only, not inputs, outputs, compiler/GEMM runtime
-storage or total process memory. Selection never queries fluctuating free
-GPU memory or recovers from an OOM by switching backend.
+a nonnegative integer. If the workspace exceeds the limit, support checking
+raises before compilation or allocation (both backends need the same scratch).
+The limit covers this API's explicit scratch only, not inputs, outputs,
+compiler runtime storage or total process memory. Selection never queries
+fluctuating free GPU memory or recovers from an OOM by switching backend.
 
-For H=3/S=32768, dS alone is 6 GiB with all heads or 2 GiB with
-`head_chunk=1`. This is not the total process memory footprint. Outputs,
-workspace and inputs must not overlap; concurrent executions need separate
-output/workspace storage. The wrapper allocates workspace each call; use the
-class API for explicit reuse and CUDA Graph capture, and warm up execution
-before capture to initialize the framework's GEMM runtime.
+Outputs, workspace and inputs must not overlap; concurrent executions need
+separate output/workspace storage. The wrapper allocates workspace each call;
+use the class API for explicit reuse and CUDA Graph capture.
 
 Both backends implement the same local-scale-floor NVFP4/STE contract.
 The FROST path folds `softmax_scale` into dS before its BF16 store;

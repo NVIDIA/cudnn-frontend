@@ -141,25 +141,22 @@ def test_auto_workspace_limit_selects_chunk_or_triton():
     from cudnn import Nvfp4AttentionQatBackward
 
     inputs = _declaration(sequence=512)
-    single = Nvfp4AttentionQatBackward(*inputs, backend="frost", head_chunk=1)
-    limit = single.scratch_workspace_bytes()
-    chunked = Nvfp4AttentionQatBackward(*inputs, workspace_limit_bytes=limit)
-    assert chunked.check_support() and chunked.selected_backend == "frost"
-    assert chunked.selected_head_chunk == 1
-    assert chunked.scratch_workspace_bytes() == limit
-    fallback = Nvfp4AttentionQatBackward(*inputs, workspace_limit_bytes=limit - 1)
-    assert fallback.check_support() and fallback.selected_backend == "triton"
-    assert "workspace_limit_bytes" in fallback.fallback_reason
-    assert fallback.scratch_workspace_bytes() <= limit - 1
+    limit = Nvfp4AttentionQatBackward(*inputs, backend="frost").scratch_workspace_bytes()
+    # FROST needs exactly the Triton scratch (fake Q/K/V + delta): both fit or neither does.
+    assert limit == Nvfp4AttentionQatBackward(*inputs, backend="triton").scratch_workspace_bytes()
+    fits = Nvfp4AttentionQatBackward(*inputs, workspace_limit_bytes=limit)
+    assert fits.check_support() and fits.selected_backend == "frost"
+    assert fits.scratch_workspace_bytes() == limit
+    with pytest.raises(NotImplementedError, match="workspace_limit_bytes"):
+        Nvfp4AttentionQatBackward(*inputs, workspace_limit_bytes=limit - 1).check_support()
     with pytest.raises(NotImplementedError, match="workspace_limit_bytes"):
         Nvfp4AttentionQatBackward(*inputs, backend="frost", workspace_limit_bytes=limit - 1).check_support()
     with pytest.raises(NotImplementedError, match="workspace_limit_bytes"):
         Nvfp4AttentionQatBackward(*inputs, workspace_limit_bytes=0).check_support()
-    # A forced positive chunk must not be silently reduced to meet the budget.
-    fixed = Nvfp4AttentionQatBackward(*inputs, head_chunk=2, workspace_limit_bytes=limit)
-    assert fixed.check_support() and fixed.selected_backend == "triton"
-    with pytest.raises(NotImplementedError, match="workspace_limit_bytes"):
-        Nvfp4AttentionQatBackward(*inputs, backend="frost", head_chunk=2, workspace_limit_bytes=limit).check_support()
+    # head_chunk only changes launch granularity, never the workspace.
+    chunked = Nvfp4AttentionQatBackward(*inputs, head_chunk=1, workspace_limit_bytes=limit)
+    assert chunked.check_support() and chunked.selected_backend == "frost"
+    assert chunked.selected_head_chunk == 1 and chunked.scratch_workspace_bytes() == limit
 
 
 @torch_fork_set_rng(seed=113)
@@ -168,8 +165,8 @@ def test_auto_workspace_selected_chunk_executes():
     from cudnn import Nvfp4AttentionQatBackward
 
     inputs, _ = _reference_case(512, 512, is_causal=False)
-    budget = Nvfp4AttentionQatBackward(*inputs[:6], backend="frost", head_chunk=1).scratch_workspace_bytes()
-    plans = [Nvfp4AttentionQatBackward(*inputs[:6], workspace_limit_bytes=budget), Nvfp4AttentionQatBackward(*inputs[:6], backend="triton")]
+    budget = Nvfp4AttentionQatBackward(*inputs[:6], backend="frost").scratch_workspace_bytes()
+    plans = [Nvfp4AttentionQatBackward(*inputs[:6], head_chunk=1, workspace_limit_bytes=budget), Nvfp4AttentionQatBackward(*inputs[:6], backend="triton")]
     results = []
     for op in plans:
         op.check_support()
@@ -218,7 +215,8 @@ def test_auto_wrapper_routes_and_cache_separation(monkeypatch):
     results = []
     for options in ({}, {"backend": "frost"}, {"backend": "triton"}, {"workspace_limit_bytes": triton_bytes}, {}):
         results.append(nvfp4_attention_qat_backward(do, q, k, v, o, lse, softmax_scale=scale, **options))
-    assert routes == ["frost", "frost", "triton", "triton", "frost"]
+    # FROST's scratch equals Triton's, so a Triton-sized budget still selects FROST.
+    assert routes == ["frost", "frost", "triton", "frost", "frost"]
     assert len(api._OBJECT_CACHE) == 4
     for invalid in ({"head_chunk": False}, {"workspace_limit_bytes": float(triton_bytes)}):
         with pytest.raises(ValueError, match="nonnegative integer"):

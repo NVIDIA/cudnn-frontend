@@ -179,14 +179,11 @@ class Nvfp4AttentionQatBackward(APIBase):
             reason = self._frost_support_reason(capability)
             if reason is None:
                 # Sizes only: no kernel import, free-memory query, or allocation.
-                fixed_bytes = 3 * heads * seqlen_q * head_dim * 2 + heads * seqlen_q * 4
-                ds_bytes_per_head = seqlen_q * seqlen_kv * 2
+                # Fake Q/K/V (BF16) + raw delta (FP32): O(S), independent of
+                # head_chunk (which only sets the launch granularity).
+                required = 3 * heads * seqlen_q * head_dim * 2 + heads * seqlen_q * 4
                 chunk = self.head_chunk or heads
-                if self.workspace_limit_bytes is not None and self.head_chunk == 0:
-                    max_chunk = min(heads, (self.workspace_limit_bytes - fixed_bytes) // ds_bytes_per_head)
-                    chunk = next((h for h in range(max_chunk, 0, -1) if heads % h == 0), 0)
-                required = fixed_bytes + chunk * ds_bytes_per_head
-                if chunk == 0 or (self.workspace_limit_bytes is not None and required > self.workspace_limit_bytes):
+                if self.workspace_limit_bytes is not None and required > self.workspace_limit_bytes:
                     reason = f"NVFP4 QAT FROST workspace does not fit workspace_limit_bytes={self.workspace_limit_bytes}"
                 else:
                     self._workspace_bytes = required

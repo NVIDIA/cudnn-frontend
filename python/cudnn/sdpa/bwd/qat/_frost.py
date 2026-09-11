@@ -3,9 +3,10 @@
 """Prepared, allocation-free FROST QAT backward orchestration.
 
 Version/capability checks in api.py run before importing this module.
-Q/delta and KV preprocessing reuse the public Triton quantizers; dV/dS
-uses CuTe DSL (dV and dK accumulate in-kernel); dQ uses one explicit
-output-buffer batched GEMM over the BF16 dS workspace.
+Q/delta and KV preprocessing reuse the public Triton quantizers; two FROST
+kernels follow: dK/dV (P fake-quantized for dV, dS consumed in SMEM) and dQ
+(dS recomputed, accumulated in TMEM). Nothing S-by-S is materialized and the
+result is deterministic.
 """
 
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import torch
 
+from ._frost_dq_kernel import compile as compile_dq
 from ._frost_kernel import compile as compile_core
 from ._interface import _workspace_tensor
 from ._nvfp4 import fake_quantize_kv, fake_quantize_q
@@ -22,12 +24,12 @@ from ._workspace import _align_up
 
 
 def workspace_layout(heads: int, sequence: int, head_chunk: int):
-    """Q/K/V in native BSHD, raw delta in BHS, chunk-local BF16 dS."""
+    """Q/K/V in native BSHD and raw delta in BHS: O(S), independent of head_chunk."""
+    del head_chunk  # launch granularity only
     entries, offset = [], 0
     for shape, dtype in (
         *((((1, sequence, heads, 128), torch.bfloat16),) * 3),
         ((1, heads, sequence), torch.float32),
-        ((1, head_chunk, sequence, sequence), torch.bfloat16),
     ):
         offset = _align_up(offset)
         entries.append((offset, shape, dtype))
@@ -46,6 +48,7 @@ class PreparedBackward:
     quant_q: object
     quant_kv: object
     core: object
+    core_dq: object
     source_strides: tuple
     fake_strides: tuple
 
@@ -88,13 +91,14 @@ class PreparedBackward:
             num_stages=2,
         )
         core = compile_core(1, heads, heads, sequence, sequence, qh_chunk=head_chunk)
+        core_dq = compile_dq(1, heads, heads, sequence, sequence, qh_chunk=head_chunk)
         # Index CompiledKernel now: materializes launch handles without a launch.
         # Execute bypasses Triton's JITFunction/cache-key construction entirely.
-        return cls(heads, sequence, head_chunk, entries, q_kernel[grid], kv_kernel[grid], core, source, fake)
+        return cls(heads, sequence, head_chunk, entries, q_kernel[grid], kv_kernel[grid], core, core_dq, source, fake)
 
     @torch.no_grad()
     def execute(self, q, k, v, o, do, lse, dq, dk, dv, workspace, scale):
-        fake_q, fake_k, fake_v, delta, ds = (_workspace_tensor(workspace, entry) for entry in self.entries)
+        fake_q, fake_k, fake_v, delta = (_workspace_tensor(workspace, entry) for entry in self.entries)
         stream = torch.cuda.current_stream(q.device).cuda_stream
         self.quant_q(
             q,
@@ -124,9 +128,11 @@ class PreparedBackward:
             stream=stream,
         )
         # Only metadata views, including the BSHD views consumed by TMA.
-        do_view, dv_view, dk_view = (t.permute(0, 2, 1, 3) for t in (do, dv, dk))
-        k_heads = fake_k[0].permute(1, 0, 2)
+        do_view, dv_view, dk_view, dq_view = (t.permute(0, 2, 1, 3) for t in (do, dv, dk, dq))
+        problem = (1, self.heads, self.heads, self.sequence, self.sequence, self.head_chunk)
+        scale_log2e = scale * math.log2(math.e)
         for base in range(0, self.heads, self.head_chunk):
+            # dK/dV (P fake-quantized for dV; dS recomputed inside the dQ kernel below).
             self.core(
                 fake_q,
                 do_view,
@@ -134,12 +140,11 @@ class PreparedBackward:
                 fake_v,
                 dv_view,
                 dk_view,
-                ds,
                 lse,
                 delta,
-                (1, self.heads, self.heads, self.sequence, self.sequence, self.head_chunk),
+                problem,
                 scale,
-                scale * math.log2(math.e),
+                scale_log2e,
                 1.0,
                 1.0,
                 1.0,
@@ -148,7 +153,17 @@ class PreparedBackward:
                 cutlass.Int32(self.sequence),
                 cuda.CUstream(stream),
             )
-            selected = slice(base, base + self.head_chunk)
-            # B=1 is intentional: no flattening of noncompact B/H dimensions
-            # and no implicit reshape copies in torch.matmul's batching path.
-            torch.bmm(ds[0].transpose(1, 2), k_heads[selected], out=dq[0, selected])
+            self.core_dq(
+                fake_q,
+                do_view,
+                fake_k,
+                fake_v,
+                dq_view,
+                lse,
+                delta,
+                problem,
+                scale,
+                scale_log2e,
+                cutlass.Int32(base),
+                cuda.CUstream(stream),
+            )
