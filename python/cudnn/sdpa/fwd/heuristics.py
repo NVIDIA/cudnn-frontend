@@ -71,6 +71,7 @@ from cudnn.sdpa.fwd.engines import (
     _band_covers_kv_tail,
     _selected_d_shape,
     effective_cgas,
+    effective_sched_policies,
     mismatch,
 )
 
@@ -360,7 +361,11 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     the graph path — the adapters keep a None-input derivation only for
     standalone wrapper users who bypass ranking.
     """
-    domain = caps.sched_policies
+    # The FLAVOR's domain, not the row-wide floor: a `sched_policies_by_d_shape`
+    # claim (the Rubin f16 / FP8 (256, 256) LPT entries) must reach the ranking,
+    # or LPT is only ever honoured when a caller REQUESTS the knob and is never
+    # proposed for the first plan -- which is the whole point of claiming it.
+    domain = effective_sched_policies(caps, facts)
     if len(domain) <= 1:
         return [_sole(domain)]
     if facts.thd and SCHED_NATURAL in domain:

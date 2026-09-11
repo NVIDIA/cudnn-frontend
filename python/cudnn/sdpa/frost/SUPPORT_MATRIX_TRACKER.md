@@ -355,9 +355,39 @@ dense and causal. Measured causal SOL on Rubin at S = 4096/8192/32768:
 (+18.2/+11.6/+1.1 %), recovering 40/51/29 % of the causal-vs-dense gap; dense is
 neutral. The decay with S is the signature of scheduler imbalance.
 
-Still declined, and why: d128/d512 f16 and every FP8/MXFP8 flavor are
-**unvalidated** under LPT rather than known-incorrect (d512 is cga4×1 role-split,
-a different scheduler shape). `SCHED_LPT_L2` is declined by **every** flavor —
+**FP8 (256, 256) and (192, 128) join the LPT claim (2026-09-11).** Validated
+through the standalone adapter on Rubin (E4M3 per-tensor scales, bf16 O, causal,
+dense and padded, (B, S) ∈ {(1,256), (2,1000), (1,4096)}) against the fp64
+kernel-mirroring `fp8_ref.compute_ref`: (256, 256) max|O−ref| 0.0078 causal /
+≤ 0.0019 dense (tol 0.075); (192, 128) 0.0397 causal / ≤ 0.0060 dense (tol
+0.04). On both flavors O and LSE under LPT are **bit-identical** to NATURAL (the
+scheduler reorders whole (batch, head, q-tile) work items; each tile's KV loop is
+unchanged), sentinel 0, two-launch 0. Perf node, d256 causal H32/2, LPT vs
+NATURAL launch-interleaved: +5.2/+5.9/+5.6/+2.0/+2.3 % at S = 2K..32K (control
+pair within 1.9 %). The FP8 row now carries
+`sched_policies_by_d_shape = (((256, 256), {NATURAL, LPT}), ((192, 128), {NATURAL, LPT}))`.
+Two FP8 flavors stay out: **(128, 128)** is also bit-identical under LPT, but
+its causal path reads 0.041–0.048 against the suite's 0.04 under NATURAL as
+well, so it gets its own look before it is claimed; **(512, 512)** — the cga4×1
+role-split kernel still calls `make_sdpa_helpers(CFG)` without
+`lpt_q_tiles_in_cga_units` (the #1001 argument, left on the d512 line), so under
+LPT it writes *nothing* (sentinel on 100 % of cells; the earlier "causal d512
+FP8 → NaN" report was that unwritten output being read). In the same
+change `heuristics._sched_points` ranks from the FLAVOR's effective domain
+(`effective_sched_policies`) rather than the row-wide floor — before it, a
+per-shape LPT claim was honoured only when a caller REQUESTED the knob and was
+never proposed for the first plan (this also makes the f16 d256 claim reach
+the graph path's ranking). Pinned by
+`test_sm107_fp8_advertises_lpt_only_for_the_validated_d_shape`,
+`test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape` and the Rubin
+e2e `test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors`.
+
+Still declined, and why: d128/d512 f16, d128 FP8 (tolerance, above) and every
+MXFP8 flavor are **unvalidated** under LPT rather than known-incorrect; d512
+(f16, FP8, MXFP8) **does not produce output** under LPT until the d512 kernels get the
+`lpt_q_tiles_in_cga_units` argument and are re-validated (cga4×1 role-split, a
+different scheduler shape — `prefill_d512_fp8.py:2533` notes the LPT range is
+`q_clusters * CTA_MMA`). `SCHED_LPT_L2` is declined by **every** flavor —
 its decode needs `qh_per_kh` and `seqlen_kv`, which the SM107 call sites do not
 pass, so it raises rather than miscomputes. Both are follow-ups.
 

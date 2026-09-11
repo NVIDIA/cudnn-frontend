@@ -327,15 +327,15 @@ def test_sm107_f16_declines_the_stats_trim_it_lacks():
 
 
 def test_sm107_rows_serve_natural_scheduling_only():
-    """SCHED_LPT is NOT honored by the ported Rubin kernels: with the row
-    claiming it, a causal graph picks LPT and comes back with max|O-ref| ~ 1.9
-    (dense stays correct).  Session 6 had already dropped SCHED_LPT_L2 for the
-    same reason -- the ported decode sites never thread qh_per_kh / seqlen_kv --
-    and LPT only stayed hidden because heuristics could not REACH it (its causal
-    primary is LPT_L2, and the old out-of-domain fallback dropped to NATURAL).
+    """The ROW-WIDE floor of every Rubin row stays NATURAL-only: LPT is claimed
+    per flavor (`sched_policies_by_d_shape`) where it is validated -- the f16
+    and, since 2026-09-11, the FP8 (256, 256) kernels -- and nowhere else.
+    SCHED_LPT_L2 is claimed by no Rubin flavor (its decode needs qh_per_kh /
+    seqlen_kv, which the SM107 call sites do not pass).
 
-    A knob is honored or the engine is ineligible.  INVERTS-WHEN the LPT decode
-    is threaded and validated on the ported Rubin kernels."""
+    (This test used to assert LPT was "not honored" by the ported kernels; the
+    cause was the dropped `lpt_q_tiles_in_cga_units` argument, fixed in #1001.
+    The per-flavor claims are pinned by the *_advertises_lpt_only_* tests.)"""
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 
     for row in ("sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_prefill_sm107_mxfp8"):
@@ -343,6 +343,9 @@ def test_sm107_rows_serve_natural_scheduling_only():
         assert caps.sched_policies == frozenset({SCHED_NATURAL}), row
         assert SCHED_LPT not in caps.sched_policies, row
         assert SCHED_LPT_L2 not in caps.sched_policies, row
+        for _shape, dom in caps.sched_policies_by_d_shape:
+            assert SCHED_LPT_L2 not in dom, row
+    assert _caps("sdpa_fwd_prefill_sm107_mxfp8").sched_policies_by_d_shape == (), "MXFP8 is unvalidated under LPT"
 
 
 def test_sched_points_falls_back_along_the_preference_order():
@@ -361,9 +364,18 @@ def test_sched_points_falls_back_along_the_preference_order():
     points = heuristics._sched_points(rubin_fp8, facts)
     assert len(points) == len(set(points)), points
     assert SCHED_LPT_L2 not in rubin_fp8.sched_policies
-    # Single-element domain today (see the row): the ranking must still be that
-    # one element, never a NATURAL fallback bolted on beside it.
+    # d128 FP8 has a single-element domain (LPT is claimed at (256, 256) only):
+    # the ranking must still be that one element, never a NATURAL fallback
+    # bolted on beside it.
     assert points == [SCHED_NATURAL], points
+
+    # The per-flavor claim must REACH the ranking: at (256, 256) the FP8 row's
+    # effective domain is {NATURAL, LPT}, the causal primary (LPT_L2) is out of
+    # domain, so the fallback walks the preference order -- LPT first, NATURAL
+    # as the autotune alternative.  Before the heuristics read the flavor's
+    # domain this returned [NATURAL] and LPT was never proposed.
+    facts256 = facts.__class__(**{**facts.__dict__, "d_qk": 256, "d_v": 256})
+    assert heuristics._sched_points(rubin_fp8, facts256) == [SCHED_LPT, SCHED_NATURAL]
 
     # ...and the multi-element case, which is the branch the single-element
     # shortcut above skips: with a causal primary (LPT_L2) OUT of domain, the
@@ -584,6 +596,45 @@ def test_sm107_advertises_lpt_only_for_the_validated_d_shape():
     # seqlen_kv, which the SM107 call sites do not pass. No flavor claims it.
     for shape in ((128, 128), (256, 256), (512, 512)):
         assert SCHED_LPT_L2 not in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1]))
+
+
+def test_sm107_fp8_advertises_lpt_only_for_the_validated_d_shape():
+    """The FP8 twin of the f16 test above: (256, 256) and (192, 128) serve LPT
+    (validated 2026-09-11 through the standalone adapter, bit-identical to
+    NATURAL -- see the row's comment); d128 and d512 do not; the row-wide floor
+    stays NATURAL; LPT_L2 nowhere."""
+    import cudnn
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+    from cudnn.sdpa.fwd import engines
+
+    caps = _caps("sdpa_fwd_prefill_sm107_fp8")
+    assert caps.sched_policies == frozenset({SCHED_NATURAL}), "the row-wide floor must stay NATURAL"
+    fp8 = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True)
+    for shape in ((256, 256), (192, 128)):
+        assert SCHED_LPT in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
+    for shape in ((128, 128), (512, 512)):
+        assert SCHED_LPT not in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
+    for shape in ((128, 128), (192, 128), (256, 256), (512, 512)):
+        assert SCHED_LPT_L2 not in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
+
+
+@pytest.mark.L0
+def test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape():
+    """Requesting LPT on the FP8 row: ACCEPTED at d256 and d192xd128, DECLINED
+    (typed, naming the knob) at d128 and d512 -- never silently downgraded
+    (engine contract, Rule 4)."""
+    import cudnn
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    caps = _caps("sdpa_fwd_prefill_sm107_fp8")
+    fp8 = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True)
+    for shape in ((256, 256), (192, 128)):
+        assert engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None, shape
+    for shape in ((128, 128), (512, 512)):
+        why = engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT))
+        assert why is not None and "sched_policy" in why, shape
 
 
 @pytest.mark.L0

@@ -1460,18 +1460,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # tile space, while a ragged batch carries its own scheduler,
             # which walks the live units through batch_remap.
             #
-            # Rubin is excluded for a different reason: the PORTED SM107
-            # kernels do not honor either LPT decode.  LPT_L2 raises outright
-            # ("SCHED_LPT_L2 decode requires qh_per_kh and seqlen_kv at every
-            # call site" -- the ported decode sites never thread them), and
-            # plain LPT is silently WRONG (measured 2026-09-08: causal d512 FP8
-            # -> NaN, masked d128 MXFP8 -> max|O-ref| ~ 1.9).  The three SM107
-            # engine rows already declare sched_policies={SCHED_NATURAL}; this
-            # is the STANDALONE-wrapper twin of that decline, which the row
-            # cannot cover because the wrapper never consults it.
-            # NOTE: the SHIPPED d128 FP8 SM107 kernel does honor both, and
-            # loses them here too -- recovering that needs a per-flavor domain
-            # (see the sched_policies_by_d_shape follow-up).
+            # Rubin is excluded for a different reason.  `_causal_sched_policy`
+            # can pick SCHED_LPT_L2, which NO SM107 kernel honours (its decode
+            # needs qh_per_kh / seqlen_kv, which the ported call sites do not
+            # pass), and plain LPT is claimed PER FLAVOR on the SM107 rows
+            # (`sched_policies_by_d_shape`: f16 (256, 256); FP8 (256, 256) and
+            # (192, 128) -- validated bit-identical to NATURAL, 2026-09-11),
+            # not row-wide: the d512 role-split kernels still lack the
+            # `lpt_q_tiles_in_cga_units` argument (#1001) and write nothing
+            # under LPT.  The wrapper never consults a row, so this derivation
+            # stays NATURAL on Rubin and a standalone caller REQUESTS
+            # `sched_policy=SCHED_LPT` for a validated flavor (the gated
+            # attention block does).  Folding the rows' per-flavor domain into
+            # this derivation is the follow-up.  (The 2026-09-08 "causal d512
+            # FP8 -> NaN" this comment used to cite was that missing argument.)
             _rubin = self._device_cc == (10, 7)
             if self.window_right is not None and not self.thd and not _rubin:
                 # Causal: balance the triangular load; pick the LPT variant by working set.

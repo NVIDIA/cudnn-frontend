@@ -114,12 +114,16 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # so the sched domain is the same on both rows.
     assert sm107.split_kv_supported is True
     assert sm100.split_kv_supported is True
-    # INVERTED: BOTH remap policies came off the Rubin row.  LPT_L2 went first
-    # (the ported decode sites never thread qh_per_kh / seqlen_kv); plain LPT
-    # followed once heuristics could actually reach it -- a causal d512 FP8
-    # graph under LPT returns NaN, and all 12 masked d512 cases go green with
-    # the row narrowed.  A knob is honored or the engine is ineligible.
+    # The Rubin ROW-WIDE floor is NATURAL: LPT_L2 is honoured by no SM107
+    # kernel (the ported decode sites never thread qh_per_kh / seqlen_kv), and
+    # plain LPT is claimed PER FLAVOR through `sched_policies_by_d_shape` --
+    # (256, 256) and (192, 128) since 2026-09-11, validated bit-identical to
+    # NATURAL; d512 stays out (its role-split kernel still lacks the #1001
+    # `lpt_q_tiles_in_cga_units` argument and writes nothing under LPT, which
+    # is what the old "causal d512 FP8 under LPT returns NaN" report was).
     assert sm107.sched_policies == frozenset({SCHED_NATURAL})
+    assert dict(sm107.sched_policies_by_d_shape) == {(256, 256): frozenset({SCHED_NATURAL, SCHED_LPT}), (192, 128): frozenset({SCHED_NATURAL, SCHED_LPT})}
+    assert sm100.sched_policies_by_d_shape == ()
     assert sm100.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
 
     # Both d128 cells carry the write_thd_meta THD leg.
@@ -128,13 +132,12 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
 
 def test_sm107_row_ranks_natural_only_for_causal():
     """The LPT/LPT_L2 remap (issue #653) is an SM100-row property.  A causal
-    per-tensor FP8 graph ranks [LPT_L2, LPT, NATURAL] there, but the Rubin row
-    declares a SINGLE-element domain -- its ported kernels raise on the L2
-    decode and do not honor LPT -- so ranking must offer exactly [NATURAL] and
-    never bolt a fallback on beside it.  The LPT specialization still
-    template-LOADS; it is the decode that is unvalidated, which is why the ROW
-    declines rather than the template raising.  Pure — facts pin the device,
-    and nothing here compiles."""
+    per-tensor FP8 graph ranks [LPT_L2, LPT, NATURAL] there.  On the Rubin row
+    the d128 FLAVOR's effective domain is the row-wide floor, {NATURAL} (LPT is
+    claimed per flavor, at (256, 256) and (192, 128) only), so ranking must
+    offer exactly [NATURAL] there and never bolt a fallback on beside it.  The
+    d256 ranking is pinned in test_sdpa_fwd_dsl_sm107.py.  Pure -- facts pin
+    the device, and nothing here compiles."""
     import cudnn as _c
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa import graph_analyzer as ga
@@ -172,9 +175,9 @@ def test_sm107_row_ranks_natural_only_for_causal():
     assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_NATURAL]
     assert heuristics._sched_points(sm100, facts((10, 0))) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
 
-    # The LPT specialization still template-LOADS -- it is the decode that is
-    # unvalidated on the ported kernels, which is why the ROW declines it rather
-    # than the template raising.
+    # The d128 LPT specialization template-LOADS (the decode is correct since
+    # #1001 and bit-identical to NATURAL); the ROW withholds the claim until the
+    # d128 causal path clears the suite tolerance under NATURAL too.
     assert _load(rubin=True, sched_policy=SCHED_LPT).CFG.SCHEDULER_POLICY == SCHED_LPT
 
 
@@ -563,3 +566,58 @@ def test_sm107_split_matches_unsplit_on_rubin():
         ref = torch.softmax(qf @ kf.transpose(-1, -2) / math.sqrt(d), dim=-1) @ vf
         assert (got.double() - ref).abs().max().item() <= 5e-2, f"split={split}: off the oracle"
         assert (got - base).abs().max().item() <= 5e-2, f"split={split}: diverges from unsplit"
+
+
+@requires_dsl
+@pytest.mark.parametrize("d_qk, d_v", [(256, 256), (192, 128)])
+@pytest.mark.parametrize("causal, b, s", [(True, 2, 1000), (False, 1, 1024)])
+def test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors(d_qk, d_v, causal, b, s):
+    """Rubin e2e for the FP8 (256, 256) and (192, 128) LPT claims: the same
+    quantized problem under SCHED_LPT and SCHED_NATURAL.  The scheduler only
+    reorders whole (batch, head, q-tile) work items -- each tile's KV loop is
+    unchanged -- so O must be BIT-IDENTICAL across the two policies (measured
+    0.0 on every case, 2026-09-11), and both stay within the module's fp32
+    oracle bound.  S=1000 causal covers a KV tail; dense needs S % 128 == 0."""
+    import torch
+    import cudnn as _c
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    torch.manual_seed(0)
+    hq, hkv = 8, 2
+    dev = "cuda"
+    fmax = 448.0
+
+    def quant(x):
+        dsc = (x.abs().amax().clamp_min(1e-8) / fmax).item()
+        return (x / dsc).clamp(-fmax, fmax).to(torch.float8_e4m3fn), torch.full((1,), dsc, device=dev, dtype=torch.float32)
+
+    q8, dq = quant(torch.randn(b, hq, s, d_qk, device=dev) * 0.5)
+    k8, dk = quant(torch.randn(b, hkv, s, d_qk, device=dev) * 0.5)
+    v8, dv = quant(torch.randn(b, hkv, s, d_v, device=dev) * 0.5)
+    outs = {}
+    for pol in (SCHED_NATURAL, SCHED_LPT):
+        out = torch.full((b, hq, s, d_v), 1.5e30, device=dev, dtype=torch.bfloat16)  # sentinel: an unclaimed tile stays visible
+        api = SdpaFwdDslSm100(
+            sample_q=q8, sample_k=k8, sample_v=v8, sample_o=out, scale_softmax=d_qk**-0.5, is_causal=causal, pertensor_fp8=True, sched_policy=pol
+        )
+        assert api.check_support()
+        api.compile()
+        api.execute(q_tensor=q8, k_tensor=k8, v_tensor=v8, o_tensor=out, descale_q=dq, descale_k=dk, descale_v=dv)
+        torch.cuda.synchronize()
+        outs[pol] = out.clone()
+    rep = hq // hkv
+    qf, kf, vf = q8.float() * dq, (k8.float() * dk).repeat_interleave(rep, 1), (v8.float() * dv).repeat_interleave(rep, 1)
+    logits = qf @ kf.transpose(-1, -2) * d_qk**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    ref = torch.softmax(logits, dim=-1) @ vf
+    scale = ref.abs().max().item()
+    for pol, out in outs.items():
+        assert torch.isfinite(out).all(), f"policy {pol}: non-finite / unwritten cells"
+        err = (out.float() - ref).abs().max().item()
+        assert err <= 0.1 * scale, f"policy {pol}: max err {err} vs fp32 reference (scale {scale})"
+    assert torch.equal(outs[SCHED_LPT], outs[SCHED_NATURAL]), "LPT must be bit-identical to NATURAL -- a different tile walk, the same per-tile math"
