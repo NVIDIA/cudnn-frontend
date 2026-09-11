@@ -121,10 +121,12 @@ Provide `block_sizes` whenever a referenced final block is only partially
 valid.
 
 `sparse_block_size=None` chooses blk64 on SM90/SM120 and blk128 on
-SM100/SM103. Passing `sparse_block_size=64` explicitly selects the SM100/SM103
-blk64 CuTe DSL path, whose shape support is narrower. `kv_splits` is available
-on SM90 and the explicit Blackwell blk64 path; `use_clc` applies only to the
-explicit Blackwell blk64 path.
+SM100/SM103. On SM120, passing `sparse_block_size=128` selects a native
+128-by-128 CTA kernel that consumes blk128 metadata directly; it does not
+expand the metadata or invoke the blk64 kernel. Passing `sparse_block_size=64`
+explicitly selects the SM100/SM103 blk64 CuTe DSL path, whose shape support is
+narrower. `kv_splits` is available on SM90 and the explicit Blackwell blk64
+path; `use_clc` applies only to the explicit Blackwell blk64 path.
 
 `kv_splits=2..256` computes FP32 partial outputs and combines them, with
 workspace growing linearly in the split count. SM90 accepts an explicit integer
@@ -225,6 +227,7 @@ therefore requires full physical KV blocks and `block_sizes=None`.
 | SM100/SM103 | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
 | SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
+| SM120 | 128 (explicit) | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 
 SM90 currently requires `S_q` to be a multiple of 64. Its fixed count may be
