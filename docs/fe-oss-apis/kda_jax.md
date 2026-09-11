@@ -127,7 +127,7 @@ forward-mode differentiation are unsupported.
 | Safe gate | `lower_bound * sigmoid(exp(a_log) * (g + dt_bias))`; default bound -5, allowed [-5, 0); omitted parameters mean 0 |
 | Beta | Direct write strength, or sigmoid of logits; `allow_neg_eigval=True` multiplies sigmoid by 2 and requires sigmoid enabled |
 | Q/K normalization | Optional in-kernel L2 normalization |
-| Scheduling | Default Frost split schedule; `batch_invariant=True` disables splitting |
+| Scheduling | Frost decay-warmup split schedule; `batch_invariant=True` disables splitting |
 | Checkpoints | Cadence 0 (backward recomputes) or 16 (saved for backward) |
 | Transformations | Eager, jit, first-order grad/vjp, recurrent scan |
 
@@ -149,6 +149,12 @@ may require materialization.
 `linear_attention/frost/kda_launch.py` composes the native launch sequence.
 The existing engine owns workspace layout; the split scheduler owns launch
 geometry, shared by torch and JAX.
+
+JAX explicitly disables the newer Frost piece-chain optimization. Its composite
+launcher retains decay-warmup splitting (or unsplit execution with
+`batch_invariant=True`); torch retains the upstream automatic piece-chain
+selection. Both use the current Frost kernels and workspace layouts. Piece-chain
+launch composition and context-parallel summary APIs are outside this JAX scope.
 
 Graph tensors come directly from JAX shape/dtype metadata; the existing
 `graph.kda` / `graph.kda_bwd` methods infer output shapes and validate the graph.
@@ -209,13 +215,19 @@ extension; no host virtualenv or compiled extension is mounted. GPU CI must
 invoke the pytest command explicitly: an import-only check does not run KDA
 forward/backward kernels.
 
-Validated on SM100 with `nvcr.io/nvidia/jax:26.07-py3`: the frontend source build
+Before the rebase, validated on SM100 with `nvcr.io/nvidia/jax:26.07-py3`: the frontend source build
 succeeded and all **21 tests passed, zero skipped**. The container used Python
 3.12.3, JAX `0.10.2.dev20260630+3757395a28`, CUDA 13.3, cuDNN 9.24.0 and
 CuTeDSL 4.7.1, with no PyTorch installation. This includes the subprocess that
 rejects torch imports while compiling and executing a jitted KDA gradient.
 
 ## Measurements and remaining blocker
+
+These measurements predate the upstream Frost piece-chain optimization and the
+rebase onto `a02378752`. They are historical, not performance qualification of the
+rebased kernels. The benchmark now compares JAX splitting against torch automatic
+scheduling; when torch selects a piece chain, total-minus-raw also includes that
+scheduling difference. Rerun qualification before drawing current overhead conclusions.
 
 Measured on SM100 (148 SMs), Python 3.14, JAX 0.11.1, CuTeDSL 4.7.1,
 torch 2.14.0+cu130, driver 580.159.03. BF16 THD inputs, H=4, K=V=128,

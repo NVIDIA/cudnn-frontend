@@ -169,6 +169,26 @@ def test_forward_and_jitted_gradients(dims, heads, dtype, checkpoint, gates, inv
         np.testing.assert_array_equal(residual.checkpoints[valid:], 0)
 
 
+@pytest.mark.parametrize("checkpoint", [0, 16])
+def test_long_sequence_forward_and_gradients(checkpoint):
+    bounds = (0, 256)
+    args, cu = inputs(bounds=bounds)
+    options = dict(checkpoint_every_n_tokens=checkpoint)
+    actual = jax.jit(partial(run, **options))(args, cu)
+    expected = reference(args, bounds)
+    for got, want in zip(actual, expected):
+        assert_close(got, want, 0.02)
+
+    def loss(args, reference_mode=False):
+        o, state = reference(args, bounds) if reference_mode else run(args, cu, **options)
+        return o.astype(jnp.float32).sum() + state.sum()
+
+    actual_grads = jax.jit(jax.grad(loss))(args)
+    expected_grads = jax.jit(jax.grad(partial(loss, reference_mode=True)))(args)
+    for got, want in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
+        assert_close(got, want, 0.06)
+
+
 def test_repeated_calls_and_dynamic_boundaries():
     args, cu = inputs(bounds=(0, 16, 35))
     invoke = jax.jit(run)

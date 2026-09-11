@@ -144,7 +144,7 @@ def build_call(metadata, config, device):
     with build_device(device):
         graph.validate()
         KdaFrostEngine().check_support(graph)
-        plan = build_kda(graph)
+        plan = build_kda(graph, enable_piece_chain=False)
     from .frost.kda_launch import make_launcher
 
     input_names, output_names = tuple(node.inputs), tuple(node.outputs)
