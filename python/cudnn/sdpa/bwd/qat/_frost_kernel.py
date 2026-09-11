@@ -1,20 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FROST SM100 D128 BF16 NVFP4 QAT dV/dS kernel.
+"""FROST SM100 D128 BF16 NVFP4 QAT dK/dV kernel.
 
-Two CTAs collaborate on a 256-KV by 128-Q tile. QKV fake quantization
-precedes this kernel; dV and dK accumulate in TMEM and one GEMM consumes
-the BF16 dS workspace to produce dQ.
-Q/K/V intermediates use BSHD, caller dO/dV use native contiguous BHSD,
-and dS uses [B,H_chunk,KV,Q]. No layout-copy adapters are needed.
+Two CTAs collaborate on a 256-KV by 128-Q tile and loop over Q. QKV fake
+quantization precedes this kernel; dV and dK accumulate in TMEM. dS is
+written to an SMEM ring and consumed there by the dK MMA; it never leaves
+the CTA pair (the companion dQ kernel recomputes it).
+Q/K/V intermediates use BSHD, caller dO/dV/dK use native contiguous BHSD.
+No layout-copy adapters are needed.
 
 P is quantized in groups of 16 KV lanes for dV only. dS retains FP32 P.
 The local-scale floor is 2^-9 and division is round-to-nearest, matching
 the public Triton QAT reference. dS folds the attention scale before its
 BF16 store, so dQ/dK are numerically close, not bitwise identical.
 
-Derived from NVIDIA VibeTile's two-CTA backward schedule.
+Derived from the existing FROST two-CTA SDPA backward schedule.
 This private module has one immutable configuration: BF16, noncausal QAT.
 Only its plan-time shape/head-chunk descriptors vary.
 """
@@ -809,7 +810,7 @@ READ_TILE_ARRIVERS_TOT = 21
 # === Bars — barrier inventory ===============================================
 #
 class Bars(NamedTuple):
-    """mbarrier inventory — dV-only single cga2 sub-group.
+    """mbarrier inventory — dK/dV single cga2 sub-group.
 
     NOTE: init counts marked (AUDIT) are provisional — re-derive with the
     barrier-inspector once the warp bodies pin the exact arrive call sites
@@ -825,10 +826,13 @@ class Bars(NamedTuple):
       mb_p_ready[1]                    softmax   -> MMA(P·dO)    ("P in S_acc[P_OFF]")
       (NO mb_s_acc_empty — natural order + in-order MMA cover the S_acc WAR)
       mb_stats_full[2]/mb_stats_empty[2]  TMASTG  -> softmax     (lse/do_dot ring)
-      mb_ds_smem_full[X]/mb_ds_smem_empty[X] softmax -> TMASTG   (dS SMEM ->
-                                                                  GMEM workspace)
+      mb_qdk_full[1]/mb_qdk_empty[1]   TMA Q#2   -> MMA(dS·Q)    (dK B, d-split)
+      mb_ds_ready[X]                   softmax   -> MMA(dS·Q)    ("dS in both CTAs' SMEM")
+      mb_ds_mma_done[X]                MMA(dS·Q) -> softmax      (dS slot free)
       mb_dv_ready[1]/mb_dv_acc_empty[1]   MMA(dV) <-> epilogue   (dV TMEM, post-loop)
       mb_dv_stg_full[1]/mb_dv_stg_empty[1] epilogue <-> TMASTG   (dV BF16 STG)
+      mb_dk_ready[1]/mb_dk_acc_empty[1]   MMA(dK) <-> epilogue   (dK TMEM, post-loop)
+      mb_dk_stg_full[1]/mb_dk_stg_empty[1] epilogue <-> TMASTG   (dK BF16 STG)
       mb_tmem_dealloc[1]               softmax/epi -> MMA quiet  (P11)
     """
 
@@ -1217,7 +1221,7 @@ def _kernel(
             for p in cutlass.range_constexpr(STATS_STAGES):
                 bars.mb_stats_full[p].init()
                 bars.mb_stats_empty[p].init()
-            # dS SMEM ring (mb_ds_smem_empty pre-armed via PipelineState).
+            # dS SMEM ring: slots are released by the dK MMA commit.
             for p in cutlass.range_constexpr(XFER_STAGES):
                 bars.mb_ds_mma_done[p].init()
 
@@ -1453,11 +1457,12 @@ def _softmax_warp_group(
                 P=exp2(scale*S-lse[q]); f16 P -> tcgen05_st S_acc[P_OFF+p_col_off]
                 (wg0 [32:63], wg1 [64:95]); arrive mb_p_ready.  NO mb_s_acc_empty.
       dSoftmax: wait mb_dp_full; tmem_load dP[wg q-half]; arrive mb_dp_empty;
-                dS=(attn_scale_for_dS*dP - do_dot[q])*P; f16 dS -> sdS SMEM ring;
-                arrive mb_ds_smem_full.
+                dS=(attn_scale_for_dS*dP - do_dot[q])*P; wait mb_ds_mma_done
+                (slot free); f16 dS -> sdS SMEM ring; arrive mb_ds_ready (leader).
     Post q-loop (per kv-tile): dV epilogue — wait mb_dv_ready; tmem_load dV
       [wg d_v-half]; BF16 -> sdV SMEM; arrive mb_dv_stg_full; arrive
-      mb_dv_acc_empty (frees dV TMEM for next tile).
+      mb_dv_acc_empty (frees dV TMEM for next tile).  The dK epilogue mirrors
+      it with mb_dk_ready / sdK / mb_dk_stg_full / mb_dk_acc_empty.
 
     f16 P is written INTO the S_acc region (single buffer, no separate ring).
     Each wg's P-write stays inside its OWN S-read q-half, so the S tmem_load ->
@@ -1835,8 +1840,8 @@ def _mma_warp(
 
             # ----- BMM dK += dS·Q[i] -> dK_acc (mma_ss, A=dS SMEM ring, B=Q dK-view) -----
             # ds_ready: dS[i] is in BOTH CTAs' SMEM rings (softmax lanes of both
-            # CTAs arrived on the leader).  The commit frees the dS slot (second
-            # arrive on mb_ds_smem_empty, next to TMASTG's) and the Q dK-view stage.
+            # CTAs arrived on the leader).  The commit frees the dS slot
+            # (mb_ds_mma_done) and the Q dK-view stage (mb_qdk_empty).
             ds_slot = ds_ready_state.idx
             bars.mb_ds_ready[ds_slot].wait(ds_ready_state.phase)
             ds_ready_state = advance(ds_ready_state, XFER_STAGES)

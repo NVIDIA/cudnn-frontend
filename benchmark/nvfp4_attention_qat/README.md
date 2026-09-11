@@ -24,10 +24,37 @@ Each CUDA Graph contains three complete backwards. Five alternating
 ABBA/BAAB rounds yield ten timing samples per arm. Reported speedup is the
 ratio of per-arm medians, not a sum of independently timed kernels.
 Compilation, allocations, reference forward construction and validation
-are excluded; preprocessing, dV/dS, and dQ/dK GEMMs are included.
+are excluded; preprocessing and both FROST kernels (dK/dV, dQ) are included.
 Source hashes, versions, hardware, workspace sizes and raw samples are saved.
 
-## Measured snapshot: 2026-09-10
+## Current implementation: dK/dV kernel + dQ recompute kernel (2026-09-10)
+
+Measured on the two-kernel implementation (`db863604a` plus later
+workspace-plumbing and comment-only changes; exact source hashes are in the
+raw artifacts) on a pre-production SM100 board: 148 SMs, reported as
+"NVIDIA Graphics Device", not a B200 product board. torch 2.13.0+cu130,
+Triton 3.7.1, CuTe DSL 4.7.0. B1/D128 BF16, dense noncausal, equal sequence
+lengths, `head_chunk=0`. Raw artifacts:
+[H3](results/sm100_two_kernel_20260910_h3.json),
+[H12](results/sm100_two_kernel_20260910_h12.json).
+
+| Heads | Sequence | Triton ms | FROST ms | Speedup | Workspace bytes (both) |
+| --- | --- | --- | --- | --- | --- |
+| 3 | 8192 | 1.03287 | 0.54076 | 1.910x | 18,972,672 |
+| 3 | 32768 | 16.94992 | 6.88940 | 2.460x | 75,890,688 |
+| 12 | 8192 | 4.12633 | 1.82194 | 2.265x | 75,890,688 |
+| 12 | 32768 | 62.74596 | 28.12887 | 2.231x | 303,562,752 |
+
+dV was bitwise equal to Triton in every case; dQ/dK relative L2 was about
+0.0032 (scale folded before the BF16 dS store, as before). The FROST
+workspace equals Triton's, `3*H*S*128*2 + H*S*4` bytes, and FROST results
+are bitwise reproducible run to run (fixed accumulation order, no atomics).
+This board is power-limited under sustained load, so the 32K samples spread
+more (Triton H3: 15.3 to 21.5 ms) than the 8K samples; treat the 32K ratios
+as indicative. These are complete backward component measurements, not
+model E2E.
+
+## Historical snapshot: 2026-09-10, original single-kernel design
 
 The raw JSON is preserved from before the public backend was named FROST.
 Its candidate key `cutedsl` refers to the same implementation now selected
@@ -35,9 +62,12 @@ with `backend="frost"`; it is not a separate backend or a new measurement.
 New runs use `frost` for the candidate key. The top-level `cutedsl` version
 field still identifies the implementation dependency.
 
+This snapshot measured implementation `c042524b1`: one FROST dV/dS kernel
+that stored BF16 dS to a workspace, followed by dQ/dK GEMMs. That design
+was replaced by the two-kernel implementation measured above.
 NVIDIA B200, 148 SMs; B1/H3/D128 BF16, dense noncausal, equal sequence
 lengths, all-head dS. FE base `8059fdf490edb4de838bb2df7096d0b39b4c8336`
-(merged PR #778), measured implementation `c042524b1`; exact source hashes are in
+(merged PR #778); exact source hashes are in
 [the raw artifact](results/b200_20260910.json).
 
 | Sequence | Triton ms | FROST ms | Speedup |
@@ -51,10 +81,9 @@ The latter fold scale before the BF16 dS store, while Triton applies scale
 after gradient accumulation. Gates are unchanged; results are not a promise
 of bitwise agreement for arbitrary data.
 
-Memory tradeoff: at 32K/H3, the candidate's total explicit scratch is
-6,518,341,632 bytes versus 75,890,688 bytes for Triton. dS alone is 6 GiB.
-`head_chunk=1` reduces dS to 2 GiB, not total process memory. This table
-does not measure that chunked configuration.
+That design needed 6,518,341,632 bytes of explicit scratch at 32K/H3 (dS
+alone 6 GiB) versus 75,890,688 bytes for Triton. The current implementation
+has no dS workspace; its scratch equals Triton's.
 
 [Memcheck artifact](results/b200_memcheck_20260910.json) and
 [log](results/b200_memcheck_20260910.log): H3/head_chunk1 at S256 and S8192,
@@ -84,7 +113,7 @@ the prepared implementation came from the FROST module.
 
 Initial FROST support intentionally declines B>1, causal, GQA, unequal
 lengths and non-256-aligned lengths. Native tails, broader adversarial
-coverage, multi-device testing and further workspace reduction are follow-ups;
+coverage and multi-device testing are follow-ups;
 Triton's implementation and broader support remain unchanged. The public
 default is now `auto`, preferring FROST and selecting Triton when FROST cannot
 serve the declaration. The historical timings above used explicit backends;
@@ -92,8 +121,8 @@ changing dispatch does not create a new measurement.
 
 ## Automatic dispatch validation
 
-With the `auto` default, all 45 focused B200 tests passed (15 original,
-12 FROST, 18 dispatch cases). Coverage includes forced-route isolation,
+At the automatic-dispatch commit `20238857a`, all 45 focused B200 tests
+passed (15 original, 12 FROST, 18 dispatch cases). Coverage includes forced-route isolation,
 old-DSL fallback before kernel import, supported-architecture selection
 (SM103/SM120/SM121 probes are metadata-only, not execution on those GPUs),
 batch/tail/causal rejection, wrapper cache separation, workspace-budget
