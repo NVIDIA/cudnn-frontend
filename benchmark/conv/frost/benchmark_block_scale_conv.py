@@ -7,7 +7,11 @@ The shape is ``N,C,D,H,W,K,T,R,S``. A and B are packed NVFP4 with E4M3
 block-16 scales; D is BF16. All tensors use compact channels-last storage while
 retaining cuDNN's logical NCDHW/KCTRS shapes. Only kernel execution is captured
 with nsys: graph construction, JIT compilation, allocation, and warmup happen
-before ``cudaProfilerStart``.
+before ``cudaProfilerStart``. Pass ``--check-correctness`` to compare each
+FROST config with native cuDNN BF16 convolution of exactly dequantized inputs
+before capture (rtol=atol=0.015625). Checks are disabled by default; failing
+configs are excluded from timing results. This reference does not require a
+native NVFP4 convolution plan.
 
 By default every catalog entry compatible with block-scale convolution and the
 requested C is measured. Use ``--configs default`` for only the heuristic
@@ -207,9 +211,72 @@ def _execute_frost(compiled, data, args) -> None:
     )
 
 
+def _initialize_check_data(data, shape: ConvShape) -> tuple[torch.Tensor, torch.Tensor]:
+    """Initialize packed FP4 operands and scales, returning exact BF16 values."""
+    image, weight, sfa, sfb, _output = data
+    generator = torch.Generator(device=image.device).manual_seed(0)
+    # All E2M1 nibble patterns are finite, including signed zero.
+    lut = torch.tensor(
+        (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6),
+        dtype=torch.bfloat16,
+        device=image.device,
+    )
+    sf_c = shape.c // _BLOCK_SIZE
+    dequantized = []
+    for operand, is_image in ((image, True), (weight, False)):
+        packed = operand.permute(0, 2, 3, 4, 1).view(torch.uint8)
+        packed.random_(0, 256, generator=generator)
+        # Powers of two make dequantization exact in BF16 and keep values small.
+        scales = (torch.randint(1, 3, (*packed.shape[:-1], sf_c), device=image.device, generator=generator) / 32).to(torch.float8_e4m3fn)
+        if is_image:
+            sfa.zero_()
+            sfa[:, :sf_c, 0] = scales.reshape(-1, sf_c)
+        else:
+            # Pack logical [K, TRSC/16] scales into the F8_128x4 layout.
+            columns = shape.t * shape.r * shape.s * sf_c
+            row_blocks, column_blocks = _ceil_div(shape.k, 128), _ceil_div(columns, 4)
+            padded = torch.zeros(row_blocks * 128, column_blocks * 4, dtype=scales.dtype, device=image.device)
+            padded[: shape.k, :columns] = scales.reshape(shape.k, columns)
+            blocks = padded.view(row_blocks, 128, column_blocks, 4).permute(0, 2, 1, 3)
+            sfb.copy_(blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1))
+        unpacked = torch.stack((lut[(packed & 0xF).long()], lut[(packed >> 4).long()]), dim=-1).flatten(-2)
+        values = unpacked * scales.to(torch.bfloat16).repeat_interleave(_BLOCK_SIZE, dim=-1)
+        dequantized.append(values.permute(0, 4, 1, 2, 3))
+    return tuple(dequantized)
+
+
+def _check_correctness(compiled, data, args, shape: ConvShape) -> None:
+    """Compare with a native BF16 cuDNN plan, excluding all OSS delegates."""
+    image, weight = _initialize_check_data(data, shape)
+    output = data[-1]
+    reference = torch.full_like(output, float("nan"))
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, compute_data_type=cudnn.data_type.FLOAT)
+    image_desc, weight_desc = graph.tensor_like(image), graph.tensor_like(weight)
+    output_desc = graph.conv_fprop(
+        image_desc,
+        weight_desc,
+        pre_padding=args.pre_padding,
+        post_padding=args.post_padding,
+        stride=args.stride,
+        dilation=args.dilation,
+    )
+    output_desc.set_output(True).set_dim(reference.shape).set_stride(reference.stride())
+    workspace, plan_name = build_cudnn_plan(graph)
+    _execute_cudnn(graph, (image_desc, weight_desc, output_desc), workspace, (image, weight, reference))
+    output.fill_(float("nan"))  # Detect missing stores as well as wrong values.
+    _execute_frost(compiled, data, args)
+    torch.cuda.synchronize()
+    tolerance = 2 * torch.finfo(torch.bfloat16).eps
+    try:
+        torch.testing.assert_close(output, reference, rtol=tolerance, atol=tolerance)
+    except AssertionError as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        raise RuntimeError(f"correctness FAILED: {args._tile_config} vs cuDNN BF16 backend (rtol=atol={tolerance})") from exc
+    print(f"[correctness] {args._tile_config}: PASS vs cuDNN BF16 backend {plan_name!r} (rtol=atol={tolerance})", flush=True)
+
+
 def _worker(args, shape: ConvShape, spatial: tuple[int, int, int], nbuf: int) -> int:
     warmup_data = _make_data(shape, spatial)
-    pool = [_make_data(shape, spatial) for _ in range(nbuf)]
 
     if args._implementation == "frost":
         compiled = _build_frost_kernel(
@@ -222,6 +289,8 @@ def _worker(args, shape: ConvShape, spatial: tuple[int, int, int], nbuf: int) ->
         )
         execute = lambda data: _execute_frost(compiled, data, args)
         plan_name = args._tile_config
+        if args.check_correctness:
+            _check_correctness(compiled, warmup_data, args, shape)
     else:
         graph, tensors, workspace, plan_name = _build_cudnn_graph(
             shape,
@@ -233,6 +302,7 @@ def _worker(args, shape: ConvShape, spatial: tuple[int, int, int], nbuf: int) ->
         )
         execute = lambda data: _execute_cudnn(graph, tensors, workspace, data)
 
+    pool = [_make_data(shape, spatial) for _ in range(nbuf)]
     for _ in range(args.warmup):
         execute(warmup_data)
     torch.cuda.synchronize()
@@ -250,12 +320,18 @@ def _worker(args, shape: ConvShape, spatial: tuple[int, int, int], nbuf: int) ->
 
 
 def _parser():
-    return make_parser(
+    parser = make_parser(
         __doc__,
         "1,128,6,10,10,256,3,3,3",
         "comma-separated tile config names or globs; 'all' sweeps block-scale-compatible catalog entries "
         "and 'default' selects the heuristic choice (default: all)",
     )
+    parser.add_argument(
+        "--check-correctness",
+        action="store_true",
+        help="check each FROST config against cuDNN BF16 backend on dequantized inputs before timing (default: disabled)",
+    )
+    return parser
 
 
 def main() -> int:
@@ -310,6 +386,8 @@ def main() -> int:
     )
     print("  [timing: nsys CUDA capture range; graph-build/JIT/warmup excluded]")
     print(f"  [rotate-buffers: {nbuf} tensor sets, {nbuf * per_set / 1024 / 1024:.0f} MB]")
+    if args.check_correctness:
+        print("  [correctness: each FROST config checked against cuDNN BF16 backend before capture; rtol=atol=0.015625]")
     print(f"  [tile sweep: {len(config_names)} configuration(s)]")
     return run_sweep(__file__, args, shape, nbuf, config_names, flops, allow_missing_cudnn=True)
 

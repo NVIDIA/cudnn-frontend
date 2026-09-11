@@ -280,6 +280,8 @@ def profile(
         "--rotate-buffers",
         str(nbuf),
     ]
+    if getattr(args, "check_correctness", False):
+        inner += ["--check-correctness"]
     if tile_config is not None:
         inner += ["--_tile-config", tile_config]
 

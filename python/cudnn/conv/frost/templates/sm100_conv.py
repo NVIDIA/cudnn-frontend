@@ -1667,8 +1667,8 @@ _DEFAULT_DTYPE: Type[Numeric] = cutlass.BFloat16
 
 def _dense_config_violation(tile_config: ConvTileConfig, channel_bytes: int) -> str | None:
     """Return why a tile cannot implement dense convolution, if anything."""
-    if tile_config.cta_tile_k_bytes not in (64, 128):
-        return f"CTA K must be 64 or 128 bytes, got {tile_config.cta_tile_k_bytes}"
+    if tile_config.cta_tile_k_bytes != 128:
+        return f"CTA K must be 128 bytes, got {tile_config.cta_tile_k_bytes}"
     if channel_bytes <= 0:
         return f"channel_bytes must be positive, got {channel_bytes}"
     if channel_bytes % tile_config.cta_tile_k_bytes:
