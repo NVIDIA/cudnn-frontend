@@ -1,0 +1,69 @@
+name: Publish docs
+
+# Publishes the Fern docs site with `fern generate --docs`.
+#
+# Runs on main, i.e. released documentation, and never on pull_request:
+# PRs from forks cannot read repository secrets, so a PR-triggered publish
+# would authenticate as nobody and quietly ship an unthemed site.
+# To publish from develop instead, add it to the branches list below.
+#
+# Requires the FERN_TOKEN repository secret (see #cdd-fern). Until that
+# secret exists the job warns and exits cleanly rather than failing every
+# push to main.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs-fern-publish.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Fern CLI
+        run: npm install -g fern-api
+
+      - name: Check for FERN_TOKEN
+        id: gate
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        run: |
+          if [ -z "$FERN_TOKEN" ]; then
+            echo "::warning title=Docs not published::FERN_TOKEN is not set; skipping publish. Request a token in #cdd-fern and add it as a repository secret."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # FERN_TOKEN also gates the `nvidia` global theme: without it the CLI
+      # prints one warning and then builds with no logo, favicon or colors.
+      # Fail here rather than publish a silently unbranded site.
+      - name: Verify config and theme resolve
+        if: steps.gate.outputs.ready == 'true'
+        working-directory: docs/fern
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        run: fern check
+
+      - name: Publish
+        if: steps.gate.outputs.ready == 'true'
+        working-directory: docs/fern
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        run: fern generate --docs
