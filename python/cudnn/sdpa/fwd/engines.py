@@ -968,12 +968,31 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # The "KNOWN COST" this note used to carry -- that the d128 FP8
             # kernel honours LPT but loses the plan because sched_policies is
             # row-wide -- is what `sched_policies_by_d_shape` below now fixes.
-            # d128 FP8 is not listed yet only because it is unvalidated here.
+            # d128 FP8 is not listed yet for the tolerance reason given there.
             sched_policies=(frozenset({SCHED_NATURAL}) if rubin_row else frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
-            # NOT claimed here. `lpt_q_tiles_in_cga_units=True` is restored on the
-            # SM107 FP8 kernels too, so LPT should work, but it has not been
-            # validated on them -- and a row claims only what it can demonstrate.
-            # The f16 row (`_sm107_spec`) carries the validated (256, 256) entry.
+            # Rubin: LPT is claimed PER FLAVOR, like the f16 row (`_sm107_spec`).
+            # `lpt_q_tiles_in_cga_units=True` is restored on every 2-CTA SM107 FP8
+            # kernel (#1001).  VALIDATED under LPT on Rubin (2026-09-11), standalone
+            # adapter, E4M3 per-tensor scales, bf16 O, causal + dense + padded,
+            # (B, S) in {(1,256), (2,1000), (1,4096)}, against the fp64
+            # kernel-mirroring `fp8_ref.compute_ref`:
+            #   (256, 256): max|O-ref| 0.0078 causal / <= 0.0019 dense (tol 0.075)
+            #   (192, 128): max|O-ref| 0.0397 causal / <= 0.0060 dense (tol 0.04)
+            # and on BOTH, O and LSE under LPT are BIT-IDENTICAL to NATURAL (the
+            # scheduler reorders whole (batch, head, q-tile) work items; each
+            # tile's KV loop is unchanged), sentinel 0, two-launch 0.  Perf node,
+            # d256 causal H32/2, LPT vs NATURAL launch-interleaved: +5.2/+5.9/
+            # +5.6/+2.0/+2.3 % at S=2K..32K (control pair within 1.9 %).
+            # NOT claimed: (128, 128) -- also bit-identical, but its causal path
+            # sits at 0.041-0.048 vs the suite's 0.04 under NATURAL too, so it
+            # gets its own look first; (512, 512) -- the cga4x1 role-split kernel
+            # still calls make_sdpa_helpers(CFG) WITHOUT lpt_q_tiles_in_cga_units
+            # (the #1001 bug, left on the d512 line), so under LPT it writes
+            # NOTHING (sentinel on 100 % of cells; the old "NaN" report was that
+            # unwritten output being read).
+            sched_policies_by_d_shape=(
+                (((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})), ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT}))) if rubin_row else ()
+            ),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
