@@ -62,6 +62,13 @@ RUBIN_DISPATCH_CASES = [
         "moe_blockscaled_grouped_gemm_wgrad_subchannel_scaled_rubin.py",
         id="grouped_gemm_wgrad_subchannel_scaled",
     ),
+    pytest.param(
+        "cudnn.gemm.cutedsl.grouped.dswiglu_subchannel_scaled.api",
+        "cudnn.gemm.cutedsl.grouped.dswiglu_subchannel_scaled.grouped_gemm_dswiglu_subchannel_scaled",
+        "BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernel",
+        "moe_blockscaled_grouped_gemm_dswiglu_subchannel_scaled_rubin.py",
+        id="grouped_gemm_dswiglu_subchannel_scaled",
+    ),
 ]
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]

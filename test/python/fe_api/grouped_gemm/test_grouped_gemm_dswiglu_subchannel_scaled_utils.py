@@ -42,7 +42,8 @@ from cutlass.cutlass_dsl import T
 
 from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import fmin
 
-from fe_api.test_fe_api_utils import ceil_div
+from fe_api.test_fe_api_utils import ceil_div, reencode_sf_tensor_as_ue5m3
+from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_unfused_subchannel_scaled_utils import (
     NVFP4_MAX_REPRESENTABLE,
     _grouped_gemm_second_level_scaled,
@@ -304,8 +305,8 @@ def _deinterleave_bands(x: torch.Tensor, band: int, dim: int = 1) -> torch.Tenso
 
 # ---------------------------------------------------------------------------
 # DSL NVFP4 quantize + second-level descale — port of
-# references/quantization/dsl.py (rowwise NVFP4-e4m3 path only; the e5m3 scale
-# branches are dropped — they need FloatNV8E5M3FNU, absent from this repo).
+# references/quantization/dsl.py (rowwise NVFP4 path; e4m3 scale bytes via the
+# PTX cvt, e5m3 scale bytes via cutlass.FloatNV8E5M3FNU -- Rubin only).
 # ---------------------------------------------------------------------------
 
 
@@ -323,8 +324,10 @@ class _QuantNvfp4:
         self.m, self.f = m, f
         self.block = int(block)
         self.norm_const = float(norm_const)
-        # This port keeps the e4m3 scale format only (the NVFP4 recipe).
-        assert str(sf_fmt) == "e4m3", f"only e4m3 scale bytes are ported, got {sf_fmt}"
+        # e5m3 (FloatNV8E5M3FNU, sm107) has no satfinite cvt -- the kernel
+        # semantics are an explicit clamp to the format max (sf_max) followed
+        # by the scalar RN .to() encode.
+        assert str(sf_fmt) in ("e4m3", "e5m3"), f"unsupported scale format {sf_fmt}"
         self.sf_fmt = str(sf_fmt)
         self.sf_max = float(sf_max)
         # When set, an extra per-first-level-block f32 second-level descale
@@ -414,8 +417,15 @@ class _QuantNvfp4:
                 # Same cvt.rn.satfinite.e4m3x2.f32 the generic conversion emits.
                 tCrSFC_up = cute.make_rmem_tensor((num_vecs,), cutlass.Float32)
                 for vi in cutlass.range_constexpr(num_vecs):
-                    sf_byte_i32, sf_up = _cvt_f32_to_e4m3_byte_and_f32(tCrSFC_pvscale[vi])
-                    sf_byte = cutlass.Uint8(sf_byte_i32)
+                    if cutlass.const_expr(self.sf_fmt == "e5m3"):
+                        pv = fmin(tCrSFC_pvscale[vi], cutlass.Float32(self.sf_max), nan=True)
+                        enc_r = cute.make_rmem_tensor((1,), cutlass.FloatNV8E5M3FNU)
+                        enc_r[0] = pv.to(cutlass.FloatNV8E5M3FNU)
+                        sf_byte = cute.recast_tensor(enc_r, cutlass.Uint8)[0]
+                        sf_up = enc_r[0].to(cutlass.Float32)
+                    else:
+                        sf_byte_i32, sf_up = _cvt_f32_to_e4m3_byte_and_f32(tCrSFC_pvscale[vi])
+                        sf_byte = cutlass.Uint8(sf_byte_i32)
                     if cutlass.const_expr(self.rowwise):
                         sf[(bidx, num_vecs * cidx + vi)] = sf_byte
                     else:
@@ -590,9 +600,11 @@ def _quant_nvfp4_two_level(
     return q, sf
 
 
-def quantize(x: torch.Tensor, fmt=None, sf2: Optional[torch.Tensor] = None, norm_const: float = 1.0, rowwise: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+def quantize(
+    x: torch.Tensor, fmt=None, sf2: Optional[torch.Tensor] = None, norm_const: float = 1.0, rowwise: bool = True, sf_fmt: str = "e4m3"
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """THE quantization entry point (harness references/quantization/dsl.py,
-    trimmed to the rowwise NVFP4-e4m3 case — the only one these tests use).
+    trimmed to the rowwise NVFP4 case with e4m3 or e5m3 (Rubin) scale bytes).
     Blockwise-quantize a bf16 or f32 (m, f) tensor at global encode scale
     norm_const with (1, 16) feature blocks; data bytes come out (m, f)-packed.
 
@@ -601,11 +613,10 @@ def quantize(x: torch.Tensor, fmt=None, sf2: Optional[torch.Tensor] = None, norm
     Second-level GENERATION is not done here.
 
     Returns (packed data bytes, scale bytes)."""
-    assert fmt is None, "only the NVFP4 (e2m1 data, e4m3 scales) format is ported"
+    assert fmt is None, "only the NVFP4 (e2m1 data, e4m3/e5m3 scales) format is ported"
     assert rowwise, "only the rowwise block orientation is ported"
     block = 16  # NVFP4 first-level vec size
-    sf_fmt = "e4m3"
-    sf_max = 448.0
+    sf_max = SF_FORMAT_MAX[sf_fmt]
     if sf2 is not None:
         return _quant_nvfp4_two_level(x, norm_const, sf2, block, sf_fmt, sf_max, rowwise=rowwise)
     return _quant_nvfp4(x, norm_const, rowwise, block, sf_fmt, sf_max)
@@ -614,6 +625,11 @@ def quantize(x: torch.Tensor, fmt=None, sf2: Optional[torch.Tensor] = None, norm
 # ---------------------------------------------------------------------------
 # SF-atom unpack (the kernel's MMA-tiled row-scale view -> flat scales).
 # ---------------------------------------------------------------------------
+
+
+# Largest finite magnitude of the first-level scale formats (e5m3 = UE5M3,
+# the Rubin FloatNV8E5M3FNU scale type).
+SF_FORMAT_MAX = {"e4m3": 448.0, "e5m3": 61440.0}
 
 
 def _sf_atom_unpack(sf_view: torch.Tensor, valid_m: int, n2: int) -> torch.Tensor:
@@ -654,6 +670,7 @@ def make_dswiglu_subchannel_problem(
     norm_const: float = 0.5,
     d_deinterleaved: bool = True,
     seed: int = 0,
+    sf_fmt: str = "e4m3",
 ):
     """Build FE-format inputs plus the byte-exact references for the dSwiGLU
     subchannel-scaled wrapper. FE n = GEMM/weight width (harness f); the
@@ -661,10 +678,19 @@ def make_dswiglu_subchannel_problem(
     (the kernel's harness-validated combination); the returned dict's
     "d_deinterleaved" key holds the effective value to pass to the wrapper.
 
+    sf_fmt="e5m3" (Rubin only, skips elsewhere) re-encodes the e4m3 first-level
+    sfa/sfb bytes in place as UE5M3 (exact: every non-negative e4m3 value is
+    representable) and sets the returned "sf_fp8_dtype_override" to "e5m3"; the
+    quantized-D references then use e5m3-encoded row scales and the e5m3 sfd2
+    norm (output scale format follows the input's).
+
     Reference mirrors the harness references/fc2_dgrad.py dswiglu path exactly
     (op order matters for byte-exactness)."""
     if not hasattr(torch, "float4_e2m1fn_x2"):
         pytest.skip("Current torch version does not support float4_e2m1fn_x2")
+    assert sf_fmt in SF_FORMAT_MAX, f"unsupported sf_fmt {sf_fmt}"
+    if sf_fmt == "e5m3":
+        _skip_unless_e5m3_supported()
     torch.manual_seed(seed)
     sgm, sgn, sgk = block2_shape
     assert m_per_expert % 256 == 0 and m_per_expert % sgm == 0
@@ -701,6 +727,11 @@ def make_dswiglu_subchannel_problem(
 
     sfa_tensor = _sf_to_mma(a_sf.reshape(1, mt, k // 16))
     sfb_tensor = _sf_to_mma(b_sf)
+    if sf_fmt == "e5m3":
+        # Same scale VALUES, UE5M3 byte encoding: the f32 reference below is
+        # unchanged while the kernel must decode the bytes as e5m3.
+        reencode_sf_tensor_as_ue5m3(sfa_tensor)
+        reencode_sf_tensor_as_ue5m3(sfb_tensor)
 
     sfa2_tensor = _sf2_strided(a_sf2.reshape(1, mt // sgm, k // sgk))
     sfb2_tensor = _sf2_strided(b_sf2)
@@ -745,10 +776,12 @@ def make_dswiglu_subchannel_problem(
         # dbias_dtype-matched atomics across tiles.
         ref_dbias = torch.stack([colsum_tilewise(d[r0:r1].contiguous(), acc_dtype=dbias_dtype) for r0, r1 in _group_ranges(group_sizes)])  # (l, 2n)
 
-    # SFD2: NVFP4 max_representable in both the quant and bf16-D modes (the
-    # d_quant_format is NVFP4 either way); the divide replays the kernel's
-    # approximate DSL '/' (not IEEE div.rn).
-    sf2_norm = NVFP4_MAX_REPRESENTABLE  # 2688.0
+    # SFD2: max(e2m1) * max(sf format) in both the quant and bf16-D modes (the
+    # d_quant_format is NVFP4 either way; 2688 for e4m3 scales, 6*61440 for
+    # e5m3); the divide replays the kernel's approximate DSL '/' (not IEEE
+    # div.rn).
+    sf2_norm = 6.0 * SF_FORMAT_MAX[sf_fmt]
+    assert sf_fmt != "e4m3" or sf2_norm == NVFP4_MAX_REPRESENTABLE  # 2688.0
     ref_sfd2_gate = second_level_descale(_second_level_block_amax(dy1, sgm, sgn), sf2_norm)
     ref_sfd2_up = second_level_descale(_second_level_block_amax(dy2, sgm, sgn), sf2_norm)
 
@@ -767,7 +800,7 @@ def make_dswiglu_subchannel_problem(
         g16 = ref_sfd2_gate.repeat_interleave(bpb, dim=1)[:, : n // d_sfn]
         u16 = ref_sfd2_up.repeat_interleave(bpb, dim=1)[:, : n // d_sfn]
         sf2_d = _interleave_bands(g16, u16, 2).contiguous()  # band = 32 // d_sfn
-        ref_d_quant, ref_d_quant_sf = quantize(d_src.contiguous(), sf2=sf2_d, norm_const=norm_const)
+        ref_d_quant, ref_d_quant_sf = quantize(d_src.contiguous(), sf2=sf2_d, norm_const=norm_const, sf_fmt=sf_fmt)
 
     if deint:
         # Deinterleaved layout: permute every n-axis output so gate bands come
@@ -800,6 +833,8 @@ def make_dswiglu_subchannel_problem(
         "dbias_dtype": dbias_dtype,
         "d_deinterleaved": deint,
         "norm_const": norm_const,
+        "sf_fmt": sf_fmt,
+        "sf_fp8_dtype_override": "e5m3" if sf_fmt == "e5m3" else None,
         # geometry
         "valid_m": mt,
         "n": n,

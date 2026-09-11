@@ -26,10 +26,14 @@ SFB2 blocks cover `(sgn cols x sgk k)`. The per-token `prob` multiply is always
 fused (pass ones for a plain GEMM). The default `vector_f32=True` configuration
 is verified **byte-exact** against a pure-torch reference.
 
-Source provenance: ported from the `bs_ggemm_harness` `dgrad_quant` kernel
-(`kernels/dgrad_quant/kernel.py` / `kernel_sm107.py`), with the upstream
-quantization epilogue removed. Reference:
-`references/fc2_dgrad.py::fc2_dgrad_gemm`.
+The kernel is a persistent, warp-specialized tcgen05 grouped GEMM: TMA loads the
+NVFP4 operands and first-level scales, a scale-load warp stages the second-level
+scales, the MMA warp emits one partial accumulator per `sgk` block, an
+accumulator-update warpgroup rescales and sums those partials by `SFA2 * SFB2`
+into a full-tile SMEM accumulator, and the epilogue warpgroup applies `alpha`,
+`prob` and the optional bias before the BF16 store. The Rubin (SM107) module
+implements the same computation with the sm107 MMA atoms and additionally
+accepts E5M3 first-level scales.
 
 ## Supported configurations
 

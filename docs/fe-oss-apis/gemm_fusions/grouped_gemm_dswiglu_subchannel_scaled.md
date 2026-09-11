@@ -35,11 +35,15 @@ global encode scale. The default `vector_f32=True` configuration is verified
 `d_quant_sf`/`sfd2` (dprob and dbias are atomics-accumulated and compared with
 tight tolerances).
 
-Source provenance: ported from the `bs_ggemm_harness` `dgrad_dglu` kernel
-(`kernels/dgrad_dglu/kernel.py`), with the deinterleaved-output capability
-transplanted from `kernels/dgrad_dglu_rht_2` (`d_deinterleaved` constexpr) and
-the dGeGLU/e5m3 paths not exposed. Reference:
-`references/fc2_dgrad.py::fc2_dgrad` (dswiglu path).
+The kernel is a persistent, warp-specialized tcgen05 grouped GEMM: TMA loads the
+NVFP4 operands and first-level scales, a scale-load warp stages the second-level
+scales, the MMA warp emits one partial accumulator per `sgk` block, an
+accumulator-update warpgroup rescales and sums those partials by `SFA2 * SFB2`
+into a full-tile SMEM accumulator, and the epilogue warpgroup applies the dSwiGLU
+backward, the `dprob`/`dbias`/`sfd2` reductions and the optional NVFP4 output
+quantization. The Rubin (SM107) module implements the same computation with the
+sm107 MMA atoms, register budgets and epilogue partitioning, and additionally
+accepts E5M3 first-level scales.
 
 ## Deinterleaved output layout (`d_deinterleaved=True`, default)
 
@@ -53,16 +57,16 @@ granularity). The fused `sfd2` output is laid out as **concatenated halves**
 directly consumable as a downstream GEMM's two-level NVFP4 input
 (`a_data, a_scales, a_scales2` with `sgk = sgn`).
 
-`d_deinterleaved=True` requires the quantized-D output (the harness-validated
+`d_deinterleaved=True` requires the quantized-D output (the validated
 combination); the BF16-D output is interleaved-only.
 
 ## Supported configurations
 
 | Aspect | Supported |
 |---|---|
-| Architecture | SM100 (the kernel also compiles/runs as-is on sm103/sm107; no Rubin-native variant) |
+| Architecture | SM100+ (Blackwell); transparent Rubin (SM107) kernel dispatch |
 | A/B dtype | FP4 (`torch.float4_e2m1fn_x2` or `torch.uint8` as packed fp4x2), k-major |
-| First-level scales | `torch.float8_e4m3fn`, `sf_vec_size = 16` (no e8m0/e5m3) |
+| First-level scales | `torch.float8_e4m3fn`, `sf_vec_size = 16` (no e8m0; e5m3 reinterpretation on Rubin via `sf_fp8_dtype_override="e5m3"`) |
 | Second-level scales | `torch.float32`; `sgn % 128 == 0` (MMA tile N), `k % sgk == 0`, `valid_m % sgm == 0` |
 | C | `torch.bfloat16` `(valid_m, 2n, 1)`, n-major, gate/up interleaved in 32-col bands |
 | D | `torch.bfloat16` `(valid_m, 2n, 1)`, or `torch.float4_e2m1fn_x2` (quantized mode, + `d_quant_sf` e4m3 + `norm_const`) |
@@ -129,6 +133,21 @@ the gmem atomic + counter-spin protocol. Outputs are **byte-exact** either way
 `(2, 2)`/`(2, 4)` additionally require the N work-tile count `ceil(n/128)` to
 be a `cluster_n` multiple. Non-eligible geometries keep the gmem protocol
 unchanged.
+
+## Architecture dispatch
+
+On Rubin (SM107) devices the API transparently selects the Rubin-native kernel
+module (`moe_blockscaled_grouped_gemm_dswiglu_subchannel_scaled_rubin.py`); the
+public class and wrapper are unchanged. `sf_fp8_dtype_override="e5m3"`
+(Rubin-only, part of the compile cache key) reinterprets the FP8 first-level
+scale factors `sfa`/`sfb` as E5M3 — the tensors are still supplied as
+`torch.float8_e4m3fn` since torch has no e5m3 dtype. The output scale format
+follows the input's: with e5m3 inputs the quantized-D row scales `d_quant_sf`
+are e5m3-encoded (same `float8_e4m3fn` storage) and the `sfd2` norm becomes
+`6 * 61440` (`max(e2m1) * max(ue5m3)`) instead of `6 * 448`. The e5m3 path is
+validated byte-exact on Rubin for the bf16-D, quantized-D (dense and discrete)
+and DSMEM-sfd2 configurations (the tests re-encode the e4m3 scales as UE5M3 and
+compare against the same reference with e5m3-encoded row scales).
 
 ## Notes
 

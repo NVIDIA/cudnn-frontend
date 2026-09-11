@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Tests for the Subchannel-Scaled dSwiGLU Grouped GEMM Kernel (SM100)
+Tests for the Subchannel-Scaled dSwiGLU Grouped GEMM Kernel (SM100+, Rubin dispatch)
 
 Second-level-scaled dSwiGLU-backward block-scaled grouped GEMM: NVFP4 A/B with
 per-(1, 16) e4m3 first-level scales plus f32 second-level (subchannel) scales,
@@ -13,12 +13,18 @@ BYTE-EXACT (``torch.equal``) against the ported harness references — do not
 loosen these to tolerance-based comparisons; find the real gap instead.
 dprob/dbias use tolerances only because their cross-tile atomic accumulation
 order is nondeterministic beyond two tiles.
+
+On Rubin the API dispatches to the sm107 kernel module transparently, so the
+whole suite doubles as its e2e coverage; the ``sf_e5m3`` ids additionally feed
+UE5M3-encoded first-level scales through ``sf_fp8_dtype_override="e5m3"`` (the
+e5m3 path is Rubin-only and skips elsewhere).
 """
 
 import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
+from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_dswiglu_subchannel_scaled_utils import (
     _sf_atom_unpack,
     _sf_to_mma,
@@ -58,6 +64,7 @@ def _run(problem, discrete=False, **overrides):
         dbias_dtype=problem["dbias_dtype"],
         block2_shape=problem["block2_shape"],
         d_deinterleaved=problem["d_deinterleaved"],
+        sf_fp8_dtype_override=problem["sf_fp8_dtype_override"],
     )
     if discrete:
         ptrs = build_discrete_pointers_dswiglu(problem)
@@ -76,6 +83,13 @@ def _run(problem, discrete=False, **overrides):
         )
     kwargs.update(overrides)
     return _wrapper()(**kwargs)
+
+
+# First-level scale format axis: e4m3 everywhere, e5m3 only on Rubin (skips
+# elsewhere). The e5m3 leg re-encodes the same scale values as UE5M3 bytes, so
+# the references are unchanged while the kernel must decode them as e5m3 and
+# emit e5m3-encoded d_quant_sf.
+SF_FORMATS = pytest.mark.parametrize("sf_fmt", ["e4m3", "e5m3"], ids=["sf_e4m3", "sf_e5m3"])
 
 
 def _check_outputs(out, problem):
@@ -144,18 +158,20 @@ def test_sf_atom_unpack_roundtrip():
 
 
 @pytest.mark.L0
+@SF_FORMATS
 @pytest.mark.parametrize("with_dbias", [False, True], ids=["nodbias", "dbias"])
 @torch_fork_set_rng(seed=0)
-def test_dswiglu_subchannel_wrapper_dense_bf16_interleaved(with_dbias):
-    problem = make_dswiglu_subchannel_problem(m_per_expert=256, n=128, k=512, l=2, with_dbias=with_dbias, d_deinterleaved=False, seed=0)
+def test_dswiglu_subchannel_wrapper_dense_bf16_interleaved(with_dbias, sf_fmt):
+    problem = make_dswiglu_subchannel_problem(m_per_expert=256, n=128, k=512, l=2, with_dbias=with_dbias, d_deinterleaved=False, seed=0, sf_fmt=sf_fmt)
     out = _run(problem)
     _check_outputs(out, problem)
 
 
 @pytest.mark.L0
+@SF_FORMATS
 @torch_fork_set_rng(seed=1)
-def test_dswiglu_subchannel_wrapper_dense_quant_deint():
-    problem = make_dswiglu_subchannel_problem(m_per_expert=256, n=128, k=512, l=2, d_quant=True, d_deinterleaved=True, with_dbias=True, seed=1)
+def test_dswiglu_subchannel_wrapper_dense_quant_deint(sf_fmt):
+    problem = make_dswiglu_subchannel_problem(m_per_expert=256, n=128, k=512, l=2, d_quant=True, d_deinterleaved=True, with_dbias=True, seed=1, sf_fmt=sf_fmt)
     out = _run(problem)
     _check_outputs(out, problem)
 
@@ -169,11 +185,12 @@ def test_dswiglu_subchannel_wrapper_dense_quant_interleaved():
 
 
 @pytest.mark.L0
+@SF_FORMATS
 @torch_fork_set_rng(seed=3)
-def test_dswiglu_subchannel_wrapper_discrete_quant_deint():
+def test_dswiglu_subchannel_wrapper_discrete_quant_deint(sf_fmt):
     # n=256, k=1024 with sgn=sgk=256 -> per-expert SFB2 block is 1x4 f32 =
     # 16 bytes, satisfying the 16B discrete alignment gate with l=2.
-    problem = make_dswiglu_subchannel_problem(m_per_expert=256, n=256, k=1024, l=2, d_quant=True, d_deinterleaved=True, seed=3)
+    problem = make_dswiglu_subchannel_problem(m_per_expert=256, n=256, k=1024, l=2, d_quant=True, d_deinterleaved=True, seed=3, sf_fmt=sf_fmt)
     out = _run(problem, discrete=True)
     _check_outputs(out, problem)
 
@@ -298,13 +315,14 @@ def test_dswiglu_subchannel_wrapper_cache():
 
 
 @pytest.mark.L0
+@SF_FORMATS
 @torch_fork_set_rng(seed=10)
-def test_dswiglu_subchannel_dsmem_rowwise_cluster22():
+def test_dswiglu_subchannel_dsmem_rowwise_cluster22(sf_fmt):
     """Rowwise-sfd2 DSMEM reduction (sgn=256, cluster (2,2): sgn/cta_n ==
     cluster_n) versus the gmem atomic + counter protocol at the same cluster
     shape: both must match the reference byte-exact AND each other bitwise
     (identical bit-pattern u32 max, order-independent)."""
-    problem = make_dswiglu_subchannel_problem(m_per_expert=256, n=256, k=512, l=2, with_dbias=True, d_quant=True, d_deinterleaved=True, seed=10)
+    problem = make_dswiglu_subchannel_problem(m_per_expert=256, n=256, k=512, l=2, with_dbias=True, d_quant=True, d_deinterleaved=True, seed=10, sf_fmt=sf_fmt)
     out_dsmem = _run(problem, cluster_shape_mn=(2, 2), dsmem_rowwise=True)
     _check_outputs(out_dsmem, problem)
     out_gmem = _run(problem, cluster_shape_mn=(2, 2), dsmem_rowwise=False)
@@ -350,3 +368,57 @@ def test_dswiglu_subchannel_cluster_negatives():
     # verifiable host-side on ragged inputs).
     with pytest.raises((ValueError, AssertionError)):
         _run(problem2, cluster_shape_mn=(4, 2))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=14)
+def test_dswiglu_subchannel_e5m3_rejected_off_rubin(monkeypatch):
+    """e5m3 scale factors decode only in the sm107 MMA op; pretend to be Blackwell."""
+    import cudnn.api_base as api_base
+    from cudnn import GroupedGemmDswigluSubchannelScaledSm100
+
+    monkeypatch.setattr(api_base, "get_device_type", lambda: "blackwell")
+    problem = make_dswiglu_subchannel_problem(m_per_expert=256, n=128, k=512, l=2, d_quant=True, d_deinterleaved=True, seed=14)
+    mt, n2 = problem["valid_m"], 2 * problem["n"]
+    d_quant = torch.zeros((1, mt, n2 // 2), dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2).permute(1, 2, 0)
+    d_quant_sf = torch.zeros((1, mt // 128, (n2 // 16) // 4, 32, 4, 4), dtype=torch.float8_e4m3fn, device="cuda").permute(3, 4, 1, 5, 2, 0)
+    dprob = torch.zeros((mt, 1, 1), dtype=torch.float32, device="cuda")
+    sfd2 = torch.zeros((1, 2 * problem["nd"], problem["sfd2_rows"]), dtype=torch.float32, device="cuda").permute(2, 1, 0)
+    api = GroupedGemmDswigluSubchannelScaledSm100(
+        sample_a=problem["a_tensor"],
+        sample_sfa=problem["sfa_tensor"],
+        sample_sfa2=problem["sfa2_tensor"],
+        sample_c=problem["c_tensor"],
+        sample_padded_offsets=problem["padded_offsets"],
+        sample_alpha=problem["alpha_tensor"],
+        sample_beta=problem["beta_tensor"],
+        sample_prob=problem["prob_tensor"],
+        sample_d=d_quant,
+        sample_dprob=dprob,
+        sample_sfd2=sfd2,
+        sample_d_quant_sf=d_quant_sf,
+        sample_norm_const=problem["norm_const_tensor"],
+        sample_b=problem["b_tensor"],
+        sample_sfb=problem["sfb_tensor"],
+        sample_sfb2=problem["sfb2_tensor"],
+        sf_fp8_dtype_override="e5m3",
+    )
+    with pytest.raises(ValueError, match="requires Rubin"):
+        api.check_support()
+
+    # Unknown override formats are rejected everywhere.
+    with pytest.raises(ValueError, match="sf_fp8_dtype_override must be"):
+        _run(problem, sf_fp8_dtype_override="e4m3")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=15)
+def test_dswiglu_subchannel_e5m3_is_not_cached_as_e4m3():
+    """sf_fp8_dtype_override must take part in the compile cache key: identical
+    scale bytes decode differently under E4M3 and UE5M3."""
+    _skip_unless_e5m3_supported()
+    problem = make_dswiglu_subchannel_problem(m_per_expert=256, n=128, k=512, l=2, d_quant=False, d_deinterleaved=False, seed=15)
+    d_e4m3 = _run(problem)["d_tensor"].float().clone()
+    d_e5m3 = _run(problem, sf_fp8_dtype_override="e5m3")["d_tensor"].float().clone()
+    torch.cuda.synchronize()
+    assert not torch.equal(d_e4m3, d_e5m3), "e5m3 and e4m3 produced identical output from identical scale-factor bytes"

@@ -30,9 +30,14 @@ arbitrary — they need not be powers of two). With `accumulate_on_output=True` 
 bf16 tile is TMA-reduce-added into the caller's output instead of stored. Experts
 with zero tokens produce zeros (or leave the accumulate target unchanged).
 
-Source provenance: ported from the `bs_ggemm_harness` `wgrad` kernel
-(`kernels/wgrad/kernel.py` / `kernel_sm107.py`). Reference:
-`references/wgrad.py::wgrad_gemm_2nd_level`.
+The kernel is a persistent, warp-specialized tcgen05 grouped GEMM over the ragged
+token axis: TMA loads the NVFP4 operands and first-level scales, the MMA warp emits
+one clean partial accumulator per `sgk`-token block, an accumulator-update
+warpgroup rescales each partial by the per-row `SFA2` and sums it into the running
+f32 accumulator, and the epilogue applies the optional global scales and stores
+(or reduce-adds) the BF16 tile. The Rubin (SM107) module implements the same
+computation with the sm107 MMA atoms and additionally accepts E5M3 first-level
+scales.
 
 ## Supported configurations
 

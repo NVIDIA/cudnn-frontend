@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-API for the Subchannel-Scaled dSwiGLU Grouped GEMM Kernel (SM100)
+API for the Subchannel-Scaled dSwiGLU Grouped GEMM Kernel (SM100+)
 
 Second-level-scaled ("subchannel-scaled") dSwiGLU-backward block-scaled grouped
 GEMM for MoE workloads: NVFP4 A (upstream gradient dY) and B (FC2 weights)
@@ -27,15 +27,17 @@ which is exactly a consumer GEMM's ``(rows, k/sgk)`` ``a_scales2`` grid with
 layout (the harness-validated combination).
 
 FE ``n`` convention: ``n`` is the GEMM/weight width (B is ``(n, k, l)``); the
-n-axis outputs cover ``2n``. SM100-only (the kernel also compiles and runs
-as-is on sm103/sm107 devices; there is no Rubin-native variant).
+n-axis outputs cover ``2n``. On Rubin (SM107) devices the API transparently
+dispatches to the Rubin-native kernel module
+(``moe_blockscaled_grouped_gemm_dswiglu_subchannel_scaled_rubin.py``), which also
+accepts ``sf_fp8_dtype_override="e5m3"`` for E5M3 first-level scales.
 """
 
 from __future__ import annotations
 
 import math
 import os
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -64,6 +66,20 @@ from .grouped_gemm_dswiglu_subchannel_scaled import (
 from ..moe_utils import MoEWeightMode
 from cutlass.cute.nvgpu import OperandMajorMode
 
+
+def _get_rubin_kernel():
+    """Lazy import of the Rubin (sm107) kernel module.
+
+    It needs a cutlass-dsl build with ``cutlass.utils.rubin_helpers``, so it is
+    only imported when a Rubin device is detected (APIBase._is_rubin_kernel).
+    """
+    from .moe_blockscaled_grouped_gemm_dswiglu_subchannel_scaled_rubin import (
+        BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107,
+    )
+
+    return BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107
+
+
 _JAX_SF_LAYOUT_ERROR = (
     "the block scale-factor tensors (sfa/sfb and the d_quant_sf output) are MMA-tiled "
     "(32, 4, m//128, 4, rest_k, l) strided views that are not expressible as JAX arrays "
@@ -72,7 +88,7 @@ _JAX_SF_LAYOUT_ERROR = (
 
 
 class GroupedGemmDswigluSubchannelScaledSm100(APIBase):
-    """API for the subchannel-scaled dSwiGLU-backward grouped GEMM on SM100 GPUs.
+    """API for the subchannel-scaled dSwiGLU-backward grouped GEMM on SM100+ GPUs.
 
     ``D2n = dSwiGLU(alpha^2 * subchannel_scaled_gemm(A, B), beta * C, prob)``
     with fused ``dprob``, optional ``dbias``, second-level output descales
@@ -125,6 +141,7 @@ class GroupedGemmDswigluSubchannelScaledSm100(APIBase):
         glu_clamp_max: Optional[float] = 7.0,
         glu_clamp_min: Optional[float] = -7.0,
         dsmem_rowwise: bool = True,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     ):
         """Initialize the GroupedGemmDswigluSubchannelScaledSm100 API.
 
@@ -191,6 +208,13 @@ class GroupedGemmDswigluSubchannelScaledSm100(APIBase):
             red.shared::cluster max + mbarrier handoff) instead of the gmem
             atomic + counter-spin protocol, when the geometry is eligible
             (quantized D + sgn/128 == cluster_n > 1). Byte-exact either way.
+        :param sf_fp8_dtype_override: Reinterpret the FP8-format first-level
+            scale factors (sfa/sfb) as E5M3 instead of the E4M3 implied by their
+            storage dtype. Rubin-only; the tensors are still supplied as
+            ``torch.float8_e4m3fn`` since torch has no e5m3 dtype. With e5m3
+            inputs the quantized-D row scales (``d_quant_sf``) are e5m3-encoded
+            too (output scale format follows the input's) and the sfd2 norm
+            becomes ``6 * 61440``.
         """
         framework = detect_framework(sample_a)
         if framework == "jax":
@@ -286,13 +310,14 @@ class GroupedGemmDswigluSubchannelScaledSm100(APIBase):
         self.glu_clamp_max = glu_clamp_max
         self.glu_clamp_min = glu_clamp_min
         self.dsmem_rowwise = dsmem_rowwise
+        self.sf_fp8_dtype_override = sf_fp8_dtype_override
 
         self._interpret_uint8_as_fp4x2 = True
         # D dtype-driven quantized-output mode (glu_hadamard_quant precedent).
         self.d_desc = self._make_tensor_desc(sample_d, name="sample_d", canonical=True)
         self.d_quant = self._is_fp4x2(self.d_desc.dtype)
         self._has_dbias = self.dbias_desc is not None
-        self._kernel = BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernel
+        self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernel
 
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._workspace = None
@@ -342,6 +367,19 @@ class GroupedGemmDswigluSubchannelScaledSm100(APIBase):
             self._value_error_if(b_k != k, f"B K dimension ({b_k}) must match A K dimension ({k})")
             l = self.expert_cnt
         n2 = 2 * n
+
+        # e5m3 is the only override currently supported; torch has no e5m3
+        # dtype, so e5m3 scale factors arrive as e4m3 storage and the Rubin
+        # kernel reinterprets the CuTe element type.
+        self._value_error_if(
+            self.sf_fp8_dtype_override not in (None, "e5m3"),
+            f"sf_fp8_dtype_override must be None or 'e5m3', got {self.sf_fp8_dtype_override!r}",
+        )
+        if self.sf_fp8_dtype_override == "e5m3":
+            self._value_error_if(
+                not self._is_rubin_kernel,
+                f"sf_fp8_dtype_override='e5m3' requires Rubin (SM107), got device type {self._device_type!r}",
+            )
 
         # ---- shapes ----
         self._check_tensor_shape(self.a_desc, (tensor_m, k, 1), "A")
@@ -616,6 +654,11 @@ class GroupedGemmDswigluSubchannelScaledSm100(APIBase):
             d_deinterleaved=self.d_deinterleaved,
             deint_n=(2 * n) if self.d_deinterleaved else 0,
             dsmem_rowwise=self.dsmem_rowwise,
+            # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
+            # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected
+            # self._kernel. The kernel maps the string to FloatNV8E5M3FNU itself, so
+            # that internal-only type is never named outside the Rubin module.
+            **({"sf_fp8_dtype_override": self.sf_fp8_dtype_override} if self.sf_fp8_dtype_override == "e5m3" else {}),
         )
         self._gemm = gemm
 
@@ -1071,6 +1114,7 @@ def grouped_gemm_dswiglu_subchannel_scaled_wrapper_sm100(
     glu_clamp_min: Optional[float] = -7.0,
     dsmem_rowwise: bool = True,
     current_stream: Optional[cuda.CUstream] = None,
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
 ) -> TupleDict:
     """Convenience wrapper for the subchannel-scaled dSwiGLU grouped GEMM.
 
@@ -1109,6 +1153,9 @@ def grouped_gemm_dswiglu_subchannel_scaled_wrapper_sm100(
             sfd2 as concatenated halves (default True; requires the quantized-D
             output). In this layout the fused sfd2 output is directly a
             consumer GEMM's a_scales2 grid with sgk = sgn.
+        sf_fp8_dtype_override: Reinterpret the FP8 first-level scale factors as
+            E5M3 (Rubin-only); the quantized-D row scales come out e5m3-encoded
+            as well. Part of the compile cache key.
         (remaining config parameters mirror the class constructor)
 
     Returns:
@@ -1250,6 +1297,7 @@ def grouped_gemm_dswiglu_subchannel_scaled_wrapper_sm100(
         glu_clamp_max,
         glu_clamp_min,
         dsmem_rowwise,
+        sf_fp8_dtype_override,
     )
     dynamic_m_key = (
         a_tensor.shape[1:],
@@ -1318,6 +1366,7 @@ def grouped_gemm_dswiglu_subchannel_scaled_wrapper_sm100(
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
             dsmem_rowwise=dsmem_rowwise,
+            sf_fp8_dtype_override=sf_fp8_dtype_override,
         )
         if is_dense:
             api = GroupedGemmDswigluSubchannelScaledSm100(

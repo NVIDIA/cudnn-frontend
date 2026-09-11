@@ -453,6 +453,9 @@ def get_dtype_max(dtype: Type[cutlass.Numeric]) -> float:
         return 6.0
     if dtype == cutlass.Float8E4M3FN:
         return 448.0
+    # Rubin-only e5m3 scale factors (absent from older cutlass-dsl wheels).
+    if getattr(cutlass, "FloatNV8E5M3FNU", None) is not None and dtype == cutlass.FloatNV8E5M3FNU:
+        return 61440.0
     raise ValueError(f"unsupported quantized dtype {dtype}")
 
 
