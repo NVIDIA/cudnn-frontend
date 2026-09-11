@@ -146,7 +146,7 @@ For a steady-state training or inference loop with fixed shapes, capture the ste
 whole iteration) into a CUDA graph once and replay it. This removes *all* per-call host
 overhead in this document at a stroke — `set_stream`, plan selection, variant-pack building,
 Python churn — leaving essentially the captured GPU work. It is the single highest-leverage step
-when the shape is stable. See `docs/cuda-graphs.md`. cuDNN `execute` is capture-safe;
+when the shape is stable. See `docs/utilities/cuda-graphs.md`. cuDNN `execute` is capture-safe;
 pre-build graphs and pre-allocate workspaces/outputs so nothing allocates during capture.
 
 ## What "good" looks like

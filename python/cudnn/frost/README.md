@@ -19,7 +19,7 @@ are never gated.
 This document is the contract for the FROST side of that mechanism. If you are
 an agent or a human adding an engine, a kernel, a knob, or an op: read "The
 rules" at the bottom first, then the section for the layer you are touching.
-`docs/python_graph_and_execution_backends.md` covers the graph IR and the
+`docs/utilities/python_graph_and_execution_backends.md` covers the graph IR and the
 backend contract from the frontend's side; this file covers what a FROST
 engine owes it.
 
@@ -140,7 +140,7 @@ EngineFamily(
   `validator` is what lets `pygraph.validate()` skip the eager C++ lowering for
   a graph a python engine may serve (it runs the family's semantic rules; the
   backend's verdict is deferred to planning) — see
-  `docs/python_graph_and_execution_backends.md`, *The manifest*.
+  `docs/utilities/python_graph_and_execution_backends.md`, *The manifest*.
 - **A family is a KIND OF GRAPH**, not a group of engines that ship together.
   `_ANCHOR_NODE_TO_FAMILY` maps a node type to the one family that serves that
   kind of graph, so a graph belongs to exactly one family or to none, and
