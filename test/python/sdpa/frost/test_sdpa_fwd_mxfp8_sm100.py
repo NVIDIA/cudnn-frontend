@@ -199,8 +199,14 @@ def _run(
     stats_layout="contiguous",
     return_lse=False,
     poison_tmem_before_execute: bool = False,
+    k_tile_growth: float = 1.0,
 ):
     """Quantize, build the sdpa_mxfp8 graph, route to the frost engine, execute.
+
+    ``k_tile_growth`` > 1 scales K by ``growth ** (key // 128)`` so every KV
+    tile raises the row max past the kernel's RESCALE_THRESHOLD and the
+    correction path rescales O on every iteration (see
+    ``test_mxfp8_d256_causal_rescale_every_tile``).
 
     Returns ``_RunResult`` or, when ``return_lse`` is set,
     ``_RunWithStatsResult``.
@@ -211,6 +217,8 @@ def _run(
     fp8 = _FP8[in_key]
     Qf = torch.randn(B, H_q, S, d_qk, device=dev) * 0.5
     Kf = torch.randn(B, H_kv, S, d_qk, device=dev) * 0.5
+    if k_tile_growth != 1.0:
+        Kf = Kf * (k_tile_growth ** (torch.arange(S, device=dev) // 128).float()).view(1, 1, S, 1)
     Vf = torch.randn(B, H_kv, S, d_v, device=dev) * 0.5
     Q8, sfq, dqq, (sqp, dsc) = _quantize(Qf, B, H_q, S, d_qk, fp8, columnwise=False)
     K8, sfk, dqk, (skp, _) = _quantize(Kf, B, H_kv, S, d_qk, fp8, columnwise=False)
@@ -427,6 +435,29 @@ def test_mxfp8_d256_masks(in_key, mask):
         d_v=256,
     )
     _check(O, O_ref, torch.float16, in_key, d_qk=256)
+    assert amax.item() > 0.0
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=981)
+def test_mxfp8_d256_causal_rescale_every_tile(in_key):
+    """Strict top-left causal at d256 runs the FUSED_CORR_SPLIT_P schedule: the
+    correction warpgroup owns keys 64-127 while half 0 stores its P into S cols
+    96-111 (P is aliased into the score slot).  That warpgroup only lags when
+    it rescales O, so scale K by 8 per KV tile to force a rescale every
+    iteration; the unordered kernel then reads clobbered scores and emits
+    inf/NaN or O(1) errors on every run (GitHub #981 class, Rule S3).  Random
+    data almost never rescales (RESCALE_THRESHOLD) and cannot catch this.
+
+    The bound is the block-scale quantization floor of this deliberately
+    extreme input, measured on the (named-barrier ordered) dense schedule:
+    ~0.13-0.16 for e4m3; the racing kernel produced >= 1.75.
+    """
+    O, O_ref, amax = _run(1, 8, 8, 1024, in_key, torch.float16, scale=1.0 / math.sqrt(256), sdpa_kwargs=_MASKS["causal"], d_qk=256, d_v=256, k_tile_growth=8.0)
+    assert torch.isfinite(O.float()).all(), "non-finite O: fused warpgroup read P-clobbered scores"
+    diff = (O.float() - O_ref).abs().max().item()
+    assert diff <= 0.3, f"max|O-ref|={diff:.4f} (quantization floor ~0.15; the unordered kernel gives >= 1.75)"
     assert amax.item() > 0.0
 
 
