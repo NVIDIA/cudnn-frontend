@@ -106,7 +106,7 @@ def make_launcher(plan, input_names, output_names):
         q, k, v, g, beta, cu = (ports[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens"))
         state0 = ports.get("initial_state")
         a, dt = ports.get("a_log"), ports.get("dt_bias")
-        items, count, sched = w["work_items"], w["work_count"], w["scheduler_all"]
+        items, count, sched = w["work_items"], w["work_count"], w["scheduler_all"] if is_bwd else w["scheduler"]
         staging = w.get("item_scratch")
         if split:
             split_k.launch(
@@ -118,6 +118,8 @@ def make_launcher(plan, input_names, output_names):
                 gate_channels=dk,
                 overhead_chunks=max(1, split_k.OVERHEAD_TOKENS // 16),
                 expand_num=1,
+                warmup_cap=split_k.warmup_cap_chunks(dk, 1),
+                full_scan=False,
                 has_scheduler=True,
                 n_heads_out=ho,
                 num_sms=num_sm,
@@ -258,6 +260,7 @@ def make_launcher(plan, input_names, output_names):
                 a,
                 dt,
                 beta,
+                None,
                 checkpoints,
                 ports["dG"],
                 ports["dBeta"],
