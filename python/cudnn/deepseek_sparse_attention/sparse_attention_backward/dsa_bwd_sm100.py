@@ -30,16 +30,12 @@ class FlashAttentionDSABackwardSm100:
         head_dim_v: int,
         block_tile: int,
         max_topk: int = 0,
-        pad_dkv_workspace: bool = False,
     ):
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
         self.same_hdim_kv = head_dim == head_dim_v
         self.block_tile = block_tile
         self.max_topk = max_topk
-        # H64/D576 uses a 640-float row stride to avoid an unfavorable L2
-        # atomic partition period. Other shapes keep their compact workspace.
-        self.dkv_workspace_dim = head_dim + (64 if pad_dkv_workspace else 0)
         self.QK_mma_tiler = (block_tile, block_tile, head_dim)
         # head_dim_main: 128-aligned portion for the main 4 sub-tiles
         head_dim_main = (head_dim // 128) * 128
@@ -209,18 +205,11 @@ class FlashAttentionDSABackwardSm100:
         return (b, h, q, workspace_bytes)
 
     @staticmethod
-    def _get_workspace_size_dKV(
-        k: int,
-        d: int,
-        b: int,
-        acc_dtype: Type[cutlass.Numeric],
-        pad_dkv_workspace: bool = False,
-    ):
+    def _get_workspace_size_dKV(k: int, d: int, b: int, acc_dtype: Type[cutlass.Numeric]):
         d = (d + 7) // 8 * 8  # round up to 8
         k = (k + 7) // 8 * 8  # round up to 8
         # FP32 versions of dKV
-        workspace_dim = d + (64 if pad_dkv_workspace else 0)
-        workspace_bytes = workspace_dim * acc_dtype.width // 8
+        workspace_bytes = d * acc_dtype.width // 8
         return (b, 1, k, workspace_bytes)
 
     def get_workspace_tensor(
@@ -266,8 +255,8 @@ class FlashAttentionDSABackwardSm100:
         return cute.make_tensor(
             dkv_iter,
             cute.make_layout(
-                (self.dkv_workspace_dim, total_seqlen_KV, (1, 1)),
-                stride=(1, Int64(self.dkv_workspace_dim), (0, 0)),
+                (head_dim, total_seqlen_KV, (1, 1)),
+                stride=(1, Int64(head_dim), (0, 0)),
             ),
         )
 
@@ -2625,7 +2614,7 @@ class FlashAttentionDSABackwardSm100:
             if topk_idx >= 0:
                 # The sparse index may address multi-million-token contexts,
                 # so form its byte-independent element offset in Int64.
-                row_ptr = dKV_acc.iterator + Int64(topk_idx) * Int64(self.dkv_workspace_dim)
+                row_ptr = dKV_acc.iterator + Int64(topk_idx) * Int64(self.head_dim)
                 lane_offset = (dp_idx // 4) * 4
                 ptr0 = row_ptr + sub_tile_idx0 * 128 + lane_offset
                 ptr1 = row_ptr + sub_tile_idx1 * 128 + lane_offset
@@ -2685,12 +2674,12 @@ class FlashAttentionDSABackwardSm100:
             topk0 = rTopkIdx[i0]
             topk1 = rTopkIdx[i1]
             if topk0 >= 0:
-                row0 = dKV_acc.iterator + Int64(topk0) * Int64(self.dkv_workspace_dim)
+                row0 = dKV_acc.iterator + Int64(topk0) * Int64(self.head_dim)
                 cute.arch.atomic_add((row0 + lane_offset4).llvm_ptr, frg00.load())
                 cute.arch.atomic_add((row0 + 128 + lane_offset4).llvm_ptr, frg10.load())
                 cute.arch.atomic_add((row0 + self.head_dim_main + lane_offset2).llvm_ptr, frg40.load())
             if topk1 >= 0:
-                row1 = dKV_acc.iterator + Int64(topk1) * Int64(self.dkv_workspace_dim)
+                row1 = dKV_acc.iterator + Int64(topk1) * Int64(self.head_dim)
                 cute.arch.atomic_add((row1 + lane_offset4).llvm_ptr, frg01.load())
                 cute.arch.atomic_add((row1 + 128 + lane_offset4).llvm_ptr, frg11.load())
                 cute.arch.atomic_add((row1 + self.head_dim_main + lane_offset2).llvm_ptr, frg41.load())

@@ -97,8 +97,8 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
 
 @pytest.mark.L0
 @pytest.mark.parametrize("num_heads", [16, 32, 64, 96, 128])
-def test_DSA_sparse_attention_backward_sm100_d576_workspace_padding_is_h64_only(num_heads):
-    """The L2-friendly dKV row padding must not inflate other backends."""
+def test_DSA_sparse_attention_backward_sm100_d576_workspace_uses_compact_rows(num_heads):
+    """All head counts retain compact dKV rows, including deterministic shards."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
     except ImportError:
@@ -108,8 +108,7 @@ def test_DSA_sparse_attention_backward_sm100_d576_workspace_padding_is_h64_only(
     padded_s_q = math.ceil(s_q / 8) * 8
     padded_s_kv = math.ceil(s_kv / 8) * 8
     lse_odo_bytes = num_heads * padded_s_q * 2 * torch.float32.itemsize
-    dkv_row_dim = 640 if num_heads == 64 else head_dim
-    expected = lse_odo_bytes + padded_s_kv * dkv_row_dim * torch.float32.itemsize
+    expected = lse_odo_bytes + padded_s_kv * head_dim * torch.float32.itemsize
     assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads) == expected
 
     deterministic_dkv_bytes = 128 * padded_s_kv * head_dim * torch.float32.itemsize
