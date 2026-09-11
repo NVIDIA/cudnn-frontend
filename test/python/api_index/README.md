@@ -63,5 +63,5 @@ python3 -S -m unittest discover -s test/python/api_index -p test_api_index.py -v
 ```
 
 The repository test is enabled by `CUDNN_API_INDEX_PACKAGE_ROOT`; without it,
-only fixture tests run. Shared files live in `test/python/api_index/`, outside GitLab's
+only fixture tests run. Shared files live in `test/python/api_index/`, outside the
 protected `ci/**` tree, so mirroring and release overlays update them together.
