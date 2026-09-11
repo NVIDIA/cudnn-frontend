@@ -132,7 +132,20 @@ class TemplateParams:
     # exp arguments are bounded (<= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE),
     # so f16 range is exact where it matters and P quantizes to FP8 either way.
     softmax_f16: bool = False
+    # Paged KV cache (FlashInfer / vLLM decode contract): K/V are page pools
+    # indexed through a per-batch ``block_table`` [B, max_pages] int32, and
+    # the per-batch KV length is the (B,) ``seq_kv_lens`` device tensor
+    # (``seq_kv_lens_present`` is therefore mandatory). ``page_size`` tokens
+    # per page. The in-page layout (HND ``[num_pages, H_kv, page_size, D]`` vs
+    # NHD ``[num_pages, page_size, H_kv, D]``) is NOT a parameter: it is the
+    # pool's strides, which the per-shape compile() already pins. Dense-only.
+    paged_kv: bool = False
+    page_size: int = 0
 
+
+# Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
+# other flavor must reject it rather than silently reading K/V as dense.
+_PAGED_KV_FLAVORS = frozenset({"d128", "d256"})
 
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
 # a flavor only honours them once its make_cfg_* threads them into a Cfg AND its
@@ -211,6 +224,23 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.pack_gqa:
         if k.thd_varlen:
             raise ValueError(f"{flavor}: pack_gqa is not supported for THD-varlen")
+    if k.paged_kv:
+        if flavor not in _PAGED_KV_FLAVORS:
+            raise ValueError(f"{flavor}: paged_kv is not implemented on this flavor; supported: {sorted(_PAGED_KV_FLAVORS)}")
+        if not k.seq_kv_lens_present:
+            raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
+        if fp8:
+            raise ValueError(f"{flavor}: paged_kv is wired for the f16/bf16 kernel only")
+        # A K/V tile is loaded as a stack of page-sized row boxes (or one box
+        # inside a page when the page is taller than the tile). Either way a
+        # box must never straddle a page, and the 128 B swizzle atom is 8 rows.
+        p = k.page_size
+        if p < 8 or p % 8 != 0:
+            raise ValueError(f"{flavor}: page_size must be a positive multiple of 8; got {p}")
+        if (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
+            raise ValueError(f"{flavor}: page_size must divide the 128-row KV tile or be a multiple of it; got {p}")
+    elif k.page_size:
+        raise ValueError(f"{flavor}: page_size requires paged_kv=True")
 
 
 def _mask_flags_from(params: TemplateParams) -> int:
@@ -407,6 +437,10 @@ class CfgD256:
     PACK_GQA: int = 0
 
     QH_PER_KH: int = 1
+
+    # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
 
 
 def _validate_cfg_d256(cfg: CfgD256) -> None:
@@ -611,6 +645,8 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d256(cfg)
     if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
@@ -930,6 +966,10 @@ class CfgD128:
 
     QH_PER_KH: int = 1
 
+    # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
+
 
 # Blackwell SM100 per-CTA dynamic SMEM cap (228 KiB physical, 227 KiB usable).
 _SM100_MAX_DYN_SMEM = 227 * 1024
@@ -1047,6 +1087,8 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d128(cfg)
     if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
