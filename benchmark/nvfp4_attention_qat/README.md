@@ -9,8 +9,11 @@ python benchmark/nvfp4_attention_qat/benchmark_backends.py --head-chunk 1 --outp
 ```
 
 Both arms use `cudnn.Nvfp4AttentionQatBackward` with the same Q/K/V/dO and
-matching forward auxiliaries. The default Triton backend is the reference.
-The candidate explicitly selects `backend="frost"`. Correctness checks
+matching forward auxiliaries. Explicit `backend="triton"` is the reference.
+The candidate defaults to `backend="auto"` and must resolve to FROST; use
+`--candidate-backend frost` to force it. Both requested and selected routes
+are recorded. This controlled benchmark fails if auto selects Triton instead
+of timing Triton against itself. Correctness checks
 must pass before timing: finite values, pointwise atol/rtol 0.005, and
 relative L2 below 0.01 for each gradient. Changed-dO graph replay poisons
 both arms' outputs/workspaces before replay to detect stale intermediates.
@@ -73,13 +76,41 @@ immediately after the kernel definition (a red/green guard check was run).
 That naming-placement-only cleanup follows measured commit `c042524b1`;
 it does not change the kernel arithmetic or launch configuration.
 
-After the public backend rename to `frost`, all 24 focused B200 tests passed
-(the same 23 cases plus a backend-name regression). The new regression checks
-the unchanged Triton default and rejects the draft-only `cutedsl` selector in
-both the class and wrapper. The FROST numerical tests also verify that the
-prepared implementation comes from the FROST module.
+At rename commit `eee52baf0`, all 24 focused B200 tests passed
+(the same 23 cases plus a backend-name regression). That run verified the
+then-current Triton default and rejection of the draft-only `cutedsl` selector
+in both the class and wrapper. The FROST numerical tests also verified that
+the prepared implementation came from the FROST module.
 
 Initial FROST support intentionally declines B>1, causal, GQA, unequal
 lengths and non-256-aligned lengths. Native tails, broader adversarial
 coverage, multi-device testing and further workspace reduction are follow-ups;
-the Triton default and its broader support remain unchanged.
+Triton's implementation and broader support remain unchanged. The public
+default is now `auto`, preferring FROST and selecting Triton when FROST cannot
+serve the declaration. The historical timings above used explicit backends;
+changing dispatch does not create a new measurement.
+
+## Automatic dispatch validation
+
+With the `auto` default, all 45 focused B200 tests passed (15 original,
+12 FROST, 18 dispatch cases). Coverage includes forced-route isolation,
+old-DSL fallback before kernel import, supported-architecture selection
+(SM103/SM120/SM121 probes are metadata-only, not execution on those GPUs),
+batch/tail/causal rejection, wrapper cache separation, workspace-budget
+chunk selection and execution, and propagation of compiler/launch errors.
+The default-selection regression was first observed failing against
+`eee52baf0` before implementing the new policy.
+
+A separate process using an actual CuTe DSL **4.6.2** installation reported
+**27 passed, 18 skipped**: FROST-specific cases were not executed, while the
+Triton/default-fallback cases passed. No QAT FROST kernel module was imported.
+Base package dependencies are still required; complete absence of `cutlass`
+is not covered by this compatibility claim.
+
+[Auto route evidence](results/b200_auto_20260910.json) covers H3/D128 at
+8K and 32K: requested `auto`, selected `frost`, all-head workspace, eager and
+changed-input graph comparisons passed. These are check-only runs, not new
+timings. Historical performance and memcheck artifacts are unchanged.
+The controlled benchmark's route guard was exercised on real DSL 4.6.2:
+it exited nonzero with `status="fail"`, reported the Triton fallback reason,
+and emitted no timing fields rather than comparing Triton against itself.

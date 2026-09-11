@@ -69,6 +69,8 @@ def main():
     parser.add_argument("--lengths", nargs="+", type=int, default=[8192, 32768])
     parser.add_argument("--heads", type=int, default=3)
     parser.add_argument("--head-chunk", type=int, default=0)
+    parser.add_argument("--candidate-backend", choices=("auto", "frost"), default="auto")
+    parser.add_argument("--workspace-limit-bytes", type=int, default=None)
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -98,11 +100,25 @@ def main():
         for sequence in args.lengths:
             inputs = make_inputs(args.heads, sequence)
             arms = {}
-            case = dict(sequence=sequence, heads=args.heads, head_chunk=args.head_chunk, status="checking")
+            case = dict(sequence=sequence, heads=args.heads, head_chunk=args.head_chunk, status="checking", routes={})
             report["cases"].append(case)
             for backend in ("triton", "frost"):
-                op = cudnn.Nvfp4AttentionQatBackward(*inputs, backend=backend, head_chunk=args.head_chunk if backend == "frost" else 0)
+                op = cudnn.Nvfp4AttentionQatBackward(
+                    *inputs,
+                    backend=args.candidate_backend if backend == "frost" else "triton",
+                    head_chunk=args.head_chunk if backend == "frost" else 0,
+                    workspace_limit_bytes=args.workspace_limit_bytes if backend == "frost" else None,
+                )
                 op.check_support()
+                case["routes"][backend] = dict(
+                    requested=op.backend,
+                    selected=op.selected_backend,
+                    head_chunk=op.selected_head_chunk,
+                    fallback_reason=op.fallback_reason,
+                    workspace_limit_bytes=op.workspace_limit_bytes,
+                )
+                if op.selected_backend != backend:
+                    raise RuntimeError(f"controlled {backend} arm selected {op.selected_backend}: {op.fallback_reason}")
                 op.compile()
                 outputs = tuple(torch.empty_like(t) for t in inputs[:3])
                 workspace = torch.empty(op.scratch_workspace_bytes(), device=inputs[0].device, dtype=torch.uint8)

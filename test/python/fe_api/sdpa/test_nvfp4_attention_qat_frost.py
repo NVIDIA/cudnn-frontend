@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Opt-in SM100 FROST QAT backend: numerical, workspace and launch contracts."""
+"""SM100 FROST QAT backend: numerical, workspace and launch contracts."""
 
 import importlib.util
 import math
@@ -31,6 +31,7 @@ pytestmark = [pytest.mark.L0, pytest.mark.skipif(not _available(), reason="Requi
 def _prepare(inputs, **options):
     from cudnn import Nvfp4AttentionQatBackward
 
+    options.setdefault("backend", "triton")
     op = Nvfp4AttentionQatBackward(*inputs[:6], softmax_scale=inputs[6], **options)
     op.check_support()
     op.compile()
@@ -53,22 +54,24 @@ def test_frost_backend_name():
     q = torch.empty((1, 2, 256, 128), device="cuda", dtype=torch.bfloat16)
     lse = torch.empty((1, 2, 256), device="cuda", dtype=torch.float32)
     inputs = (q, q, q, q, q, lse)
-    assert Nvfp4AttentionQatBackward(*inputs).backend == "triton"
+    assert Nvfp4AttentionQatBackward(*inputs).backend == "auto"
     op = Nvfp4AttentionQatBackward(*inputs, backend="frost")
     assert op.backend == "frost" and op.check_support()
     # The old draft-only spelling is not a second public backend or alias.
-    with pytest.raises(ValueError, match="backend must be 'triton' or 'frost'"):
+    with pytest.raises(ValueError, match="backend must be 'auto', 'triton', or 'frost'"):
         Nvfp4AttentionQatBackward(*inputs, backend="cutedsl").check_support()
-    with pytest.raises(ValueError, match="backend must be 'triton' or 'frost'"):
+    with pytest.raises(ValueError, match="backend must be 'auto', 'triton', or 'frost'"):
         nvfp4_attention_qat_backward(*inputs, backend="cutedsl")
 
 
 @pytest.mark.parametrize("sequence,chunk", [(256, 0), (512, 1)])
+@pytest.mark.parametrize("backend", ["auto", "frost"])
 @torch_fork_set_rng(seed=71)
-def test_frost_matches_triton_and_reference(sequence, chunk):
+def test_frost_matches_triton_and_reference(sequence, chunk, backend):
     inputs, expected = _reference_case(sequence, sequence, is_causal=False)
     reference, ref, ref_ws = _prepare(inputs)
-    candidate, got, ws = _prepare(inputs, backend="frost", head_chunk=chunk)
+    candidate, got, ws = _prepare(inputs, backend=backend, head_chunk=chunk)
+    assert candidate.selected_backend == "frost" and reference.selected_backend == "triton"
     assert candidate._compiled_kernel.__class__.__module__ == "cudnn.sdpa.bwd.qat._frost"
     reference.execute(*inputs[:6], *ref, ref_ws)
     candidate.execute(*inputs[:6], *got, ws)
@@ -87,7 +90,7 @@ def test_frost_precompiled_no_allocations_no_sync_and_graph_replay(monkeypatch):
 
     inputs, _ = _reference_case(256, 256, is_causal=False)
     reference, ref, ref_ws = _prepare(inputs)
-    candidate, got, ws = _prepare(inputs, backend="frost", head_chunk=1)
+    candidate, got, ws = _prepare(inputs, backend="auto", head_chunk=1)
     reference.execute(*inputs[:6], *ref, ref_ws)
 
     def forbidden(*args, **kwargs):
@@ -139,12 +142,13 @@ def test_frost_precompiled_no_allocations_no_sync_and_graph_replay(monkeypatch):
 
 
 @torch_fork_set_rng(seed=79)
-def test_frost_explicit_stream_and_runtime_scale(monkeypatch):
+@pytest.mark.parametrize("backend", ["auto", "frost"])
+def test_frost_explicit_stream_and_runtime_scale(monkeypatch, backend):
     import cuda.bindings.driver as cuda
 
     inputs, _ = _reference_case(256, 256, is_causal=False)
     reference, ref, ref_ws = _prepare(inputs)
-    candidate, got, ws = _prepare(inputs, backend="frost")
+    candidate, got, ws = _prepare(inputs, backend=backend)
     producer = torch.cuda.current_stream()
     launch = torch.cuda.Stream()
     launch.wait_stream(producer)
