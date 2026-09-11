@@ -654,7 +654,7 @@ def test_DSA_sparse_attention_backward_wrapper(
     )
 
 
-@pytest.mark.L1
+@pytest.mark.L0
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
 @torch_fork_set_rng(seed=422)
 def test_DSA_sparse_attention_backward_wrapper_h64_d576_topk2048(has_topk_length, request):
@@ -674,7 +674,7 @@ def test_DSA_sparse_attention_backward_wrapper_h64_d576_topk2048(has_topk_length
     )
 
 
-@pytest.mark.L1
+@pytest.mark.L0
 @pytest.mark.parametrize("num_heads", [96, 128])
 @torch_fork_set_rng(seed=423)
 def test_DSA_sparse_attention_backward_wrapper_generic_d576_head_blocks(num_heads, request):
@@ -694,7 +694,7 @@ def test_DSA_sparse_attention_backward_wrapper_generic_d576_head_blocks(num_head
     )
 
 
-@pytest.mark.L1
+@pytest.mark.L0
 @torch_fork_set_rng(seed=424)
 def test_DSA_sparse_attention_backward_wrapper_generic_d512_reducer_generations(request):
     """Exercise three sparse tiles through the generic D512 reducer."""
