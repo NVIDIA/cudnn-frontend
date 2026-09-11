@@ -65,56 +65,6 @@ def _require_16_byte_alignment(tensor: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} storage must be 16-byte aligned")
 
 
-def _storage_span(tensor: torch.Tensor) -> Tuple[int, int]:
-    start = tensor.data_ptr()
-    last_element_offset = sum((int(size) - 1) * int(stride) for size, stride in zip(tensor.shape, tensor.stride()) if size > 0)
-    return start, start + (last_element_offset + 1) * tensor.element_size()
-
-
-def _are_disjoint_fused_thd_slices(a: torch.Tensor, b: torch.Tensor) -> bool:
-    """Recognize disjoint Q/K/V slices from one fused packed THD allocation."""
-    if (
-        a.ndim != 3
-        or b.ndim != 3
-        or a.shape != b.shape
-        or a.stride() != b.stride()
-        or a.dtype != b.dtype
-        or a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr()
-    ):
-        return False
-    _, heads, head_dim = a.shape
-    token_stride, head_stride, dim_stride = map(int, a.stride())
-    token_chunk = int(heads) * int(head_dim)
-    if dim_stride != 1 or head_stride != head_dim or token_stride < 3 * token_chunk:
-        return False
-
-    a_begin = int(a.storage_offset()) % token_stride
-    b_begin = int(b.storage_offset()) % token_stride
-    a_end = a_begin + token_chunk
-    b_end = b_begin + token_chunk
-    if a_end > token_stride or b_end > token_stride:
-        return False
-    return a_end <= b_begin or b_end <= a_begin
-
-
-def _require_disjoint_writes(
-    writes: Tuple[Tuple[str, torch.Tensor], ...],
-    reads: Tuple[Tuple[str, Optional[torch.Tensor]], ...],
-) -> None:
-    comparisons = tuple(reads) + tuple(writes)
-    for write_name, write_tensor in writes:
-        write_start, write_end = _storage_span(write_tensor)
-        for other_name, other_tensor in comparisons:
-            if other_tensor is write_tensor and other_name == write_name:
-                continue
-            if other_tensor is None or other_tensor.device != write_tensor.device:
-                continue
-            other_start, other_end = _storage_span(other_tensor)
-            spans_overlap = write_start < other_end and other_start < write_end
-            if spans_overlap and not _are_disjoint_fused_thd_slices(write_tensor, other_tensor):
-                raise ValueError(f"{write_name} storage must not overlap {other_name} storage")
-
-
 def _validate_cu_seqlens_metadata(
     cu_seqlens: torch.Tensor,
     name: str,
@@ -505,21 +455,6 @@ class HSTUFwdSm100(_HSTUBase):
                 self.batch_size,
             )
 
-        _require_disjoint_writes(
-            (("o_tensor", o),),
-            (
-                ("q_tensor", q),
-                ("k_tensor", self._sample_k),
-                ("v_tensor", self._sample_v),
-                ("cu_seqlens_q_tensor", self._sample_cu_seqlens_q),
-                ("cu_seqlens_k_tensor", self._sample_cu_seqlens_k),
-                ("func_tensor", self._sample_func),
-                ("paged_kv_tensor", paged),
-                ("page_ids_tensor", page_ids),
-                ("page_indptrs_tensor", page_indptrs),
-            ),
-        )
-
         self._is_supported = True
         return True
 
@@ -607,21 +542,6 @@ class HSTUFwdSm100(_HSTUBase):
                 page_indptrs_tensor,
                 self.batch_size,
             )
-        _require_disjoint_writes(
-            (("o_tensor", o_tensor),),
-            (
-                ("q_tensor", q_tensor),
-                ("k_tensor", k_tensor),
-                ("v_tensor", v_tensor),
-                ("cu_seqlens_q_tensor", cu_seqlens_q_tensor),
-                ("cu_seqlens_k_tensor", cu_seqlens_k_tensor),
-                ("func_tensor", func_tensor),
-                ("paged_kv_tensor", paged_kv_tensor),
-                ("page_ids_tensor", page_ids_tensor),
-                ("page_indptrs_tensor", page_indptrs_tensor),
-            ),
-        )
-
         with _stream_context(current_stream, q_tensor.device):
             _interface.hstu_varlen_fwd_100(
                 q_tensor,
@@ -733,22 +653,6 @@ class HSTUBwdSm100(_HSTUBase):
             _require_16_byte_alignment(tensor, name)
         if self.deterministic:
             raise NotImplementedError("deterministic HSTU backward is not supported by HSTU SM100")
-        _require_disjoint_writes(
-            (
-                ("dq_tensor", self._sample_dq),
-                ("dk_tensor", self._sample_dk),
-                ("dv_tensor", self._sample_dv),
-            ),
-            (
-                ("do_tensor", self._sample_do),
-                ("q_tensor", q),
-                ("k_tensor", k),
-                ("v_tensor", v),
-                ("cu_seqlens_q_tensor", self._sample_cu_seqlens_q),
-                ("cu_seqlens_k_tensor", self._sample_cu_seqlens_k),
-                ("func_tensor", self._sample_func),
-            ),
-        )
         self._is_supported = True
         return True
 
@@ -823,23 +727,6 @@ class HSTUBwdSm100(_HSTUBase):
             if not _has_non_overlapping_strides(tensor):
                 raise ValueError(f"{name} must have non-overlapping strides")
             _require_16_byte_alignment(tensor, name)
-
-        _require_disjoint_writes(
-            (
-                ("dq_tensor", dq_tensor),
-                ("dk_tensor", dk_tensor),
-                ("dv_tensor", dv_tensor),
-            ),
-            (
-                ("do_tensor", do_tensor),
-                ("q_tensor", q_tensor),
-                ("k_tensor", k_tensor),
-                ("v_tensor", v_tensor),
-                ("cu_seqlens_q_tensor", cu_seqlens_q_tensor),
-                ("cu_seqlens_k_tensor", cu_seqlens_k_tensor),
-                ("func_tensor", func_tensor),
-            ),
-        )
 
         with _stream_context(current_stream, q_tensor.device):
             _interface.hstu_varlen_bwd_100(

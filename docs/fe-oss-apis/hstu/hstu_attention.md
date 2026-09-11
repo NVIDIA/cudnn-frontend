@@ -86,11 +86,13 @@ to the host before launch. Callers provide `max_seqlen_q` and `max_seqlen_k`
 explicitly; `scaling_seqlen=None` then uses the supplied `max_seqlen_q` without
 inspecting `cu_seqlens_q` on the host.
 
-Tensors must have non-overlapping storage and a 16-byte-aligned base pointer.
-The wrapper can adapt some otherwise non-contiguous packed views, but naturally
-aligned THD tensors with a contiguous last dimension avoid an internal layout
-copy. Paged-KV storage itself must be contiguous. Preallocated output or
-gradient tensors must not overlap any input or one another.
+Each tensor's strides must not map multiple logical elements to the same address,
+and its base pointer must be 16-byte aligned. The wrapper can adapt some otherwise
+non-contiguous packed views, but naturally aligned THD tensors with a contiguous
+last dimension avoid an internal layout copy. Paged-KV storage itself must be
+contiguous. The API does not compare storage spans across distinct tensors;
+callers must ensure that output writes do not overwrite live inputs or the same
+logical output element.
 
 ## High-level functions
 
@@ -137,7 +139,9 @@ dv = grads["dv_tensor"]
 The optional `dq_tensor`, `dk_tensor`, and `dv_tensor` arguments provide
 caller-owned gradient output buffers. They can be supplied independently; the
 function allocates any omitted output. Supplied buffers are overwritten and
-returned in the result dictionary.
+returned in the result dictionary. Disjoint split views from one allocation are
+supported, including `dk_tensor` and `dv_tensor` split from packed KV storage
+while `dq_tensor` uses a separate allocation.
 
 Forward and backward must use the same `alpha`, `scaling_seqlen`, mask
 configuration, and sequence metadata. `scaling_seqlen` must be positive. It is
