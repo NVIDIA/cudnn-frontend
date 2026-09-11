@@ -1,5 +1,5 @@
 jupyter
-numpy<2.0.0
+numpy
 pybind11[global]>=2.13,<3
 pytest
 pytest-xdist
