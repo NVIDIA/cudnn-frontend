@@ -109,7 +109,10 @@ class BlackwellFmhaBackwardDKDV256:
         is_persistent: bool = False,
         online_ds_scale: bool = True,
         p_scale_log2: int = 8,
+        h_r_split: int = 1,
+        s_q_split: int = 1,
     ):
+        """Fused dK/dV kernel for d=256 MXFP8 (2-CTA block-scaled MMA); see the module docstring."""
         mma_tiler = self._setup_specialization(element_dtype, acc_dtype, mma_tiler)
         self._setup_mma_tilers(mma_tiler)
         self._setup_warp_topology_and_barriers(varlen, mask_type, is_persistent, online_ds_scale)
@@ -122,6 +125,33 @@ class BlackwellFmhaBackwardDKDV256:
         if not (0 <= int(p_scale_log2) <= 126):
             raise ValueError(f"p_scale_log2 must be in [0, 126]; got {p_scale_log2}")
         self.p_scale_log2 = int(p_scale_log2)
+        # Q-head-group split. The grid is (kv tiles, h_k, b) and one cluster
+        # walks every Q head of its KV head, so at few KV heads (GQA with 1-2
+        # KV heads, small batch) most SMs idle: 2 KV heads at S=8192 is 64
+        # clusters on 148 SMs. With h_r_split = S the grid becomes
+        # (kv tiles, h_k * S, b); cluster (h_k, s) handles Q heads
+        # [s * h_r/S, (s+1) * h_r/S) and stores its dK/dV to PARTIAL slot
+        # h_k * S + s of a [B, S_kv, h_k * S, D] buffer (the host passes that
+        # buffer as dK/dV); a fixed-order fold onto the KV heads follows
+        # (kernels/bprop_chain_f16_sm120.dkv_reduce_host). h_r must be a
+        # multiple of h_r_split; 1 = the original single-pass behaviour.
+        if int(h_r_split) < 1:
+            raise ValueError(f"h_r_split must be >= 1; got {h_r_split}")
+        if int(h_r_split) > 1 and is_persistent:
+            raise ValueError("h_r_split > 1 is not implemented for the persistent scheduler")
+        self.h_r_split = int(h_r_split)
+        # Q-sequence split, same mechanism along the other axis: cluster slice s
+        # walks Q tiles [c0, c1) of its KV tile's trip range, cut into s_q_split
+        # near-equal chunks (per KV tile, so causal ranges stay balanced), and
+        # stores to its own partial slot. Slots: h_k * h_r_split * s_q_split per
+        # batch, slot = (h_k * h_r_split + h_slice) * s_q_split + q_slice. A chunk
+        # that ends up empty (fewer Q tiles than slices) is written as zeros.
+        if int(s_q_split) < 1:
+            raise ValueError(f"s_q_split must be >= 1; got {s_q_split}")
+        if int(s_q_split) > 1 and is_persistent:
+            raise ValueError("s_q_split > 1 is not implemented for the persistent scheduler")
+        self.s_q_split = int(s_q_split)
+        self.n_split = self.h_r_split * self.s_q_split
 
     def _setup_specialization(self, element_dtype, acc_dtype, mma_tiler):
         """Normalize tile orientation and set fixed instruction/type policy."""
@@ -334,6 +364,7 @@ class BlackwellFmhaBackwardDKDV256:
         num_warp_groups: Int32,
         wg_idx: Int32,
     ) -> cute.Tensor:
+        """View a per-warp-group TMEM fragment for the calling warp group."""
         ret = None
         if cutlass.const_expr(cute.rank(t.layout) == 1):
             p = cute.composition(
@@ -410,6 +441,7 @@ class BlackwellFmhaBackwardDKDV256:
         stream: cuda.CUstream,
         skip_sum_odo: bool = False,
     ):
+        """JIT entry: build operand views, MMA atoms, TMA descriptors and launch the row-dot prologue and the dK/dV kernel."""
         q_seq_max, k_seq_max, d, hb = problem_shape
         h, b = hb
         h_r, h_k = h
@@ -418,8 +450,11 @@ class BlackwellFmhaBackwardDKDV256:
         V = make_kv_head_batch_tensor(V, hb, self.varlen)
         O = make_q_head_batch_tensor(O, hb, self.varlen)
         dO_16bits = cute.make_tensor(dO_16bits.iterator, O.layout)
-        dK = make_kv_head_batch_tensor(dK, hb, self.varlen)
-        dV = make_kv_head_batch_tensor(dV, hb, self.varlen)
+        # dK/dV: with h_r_split > 1 these are the PARTIAL buffers, h_k * h_r_split
+        # slots per batch (slot = h_k * h_r_split + split); see __init__.
+        hb_out = ((h_r, h_k * self.n_split), b)
+        dK = make_kv_head_batch_tensor(dK, hb_out, self.varlen)
+        dV = make_kv_head_batch_tensor(dV, hb_out, self.varlen)
         dO = cute.make_tensor(dO.iterator, Q.layout)
         dOT = make_transposed_tensor(dO_MN, dO.layout)
         QT = make_transposed_tensor(Q_MN, Q.layout)
@@ -996,7 +1031,7 @@ class BlackwellFmhaBackwardDKDV256:
             )
 
         bwd_grid = cute_common.compute_grid(
-            cute.shape((k_seq_max, d, ((1, h_k), b))),
+            cute.shape((k_seq_max, d, ((1, h_k * self.n_split), b))),
             self.cta_tiler,
         )
         # Round up grid X to be divisible by cluster X dimension (2-CTA cluster)
@@ -1166,6 +1201,7 @@ class BlackwellFmhaBackwardDKDV256:
         cluster_layout_vmnk_sfb: cute.Layout,
         tile_sched_params: Union[utils.ClcDynamicPersistentTileSchedulerParams, None],
     ):
+        """The fused dK/dV kernel body: warp-specialized load / MMA / compute roles for one (KV tile, head slice, Q chunk)."""
         bidx, bidy, bidz = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -1886,7 +1922,12 @@ class BlackwellFmhaBackwardDKDV256:
             #  NON-PERSISTENT MODE (original code)
             # ===================================================================
             # get the current batch problem shape
+            # bidy indexes the OUTPUT slot (h_k * h_r_split + split); the input KV
+            # head and this cluster's first Q head derive from it (see __init__).
             blk_coord = (Int32(0), bidx, Int32(0), ((Int32(0), bidy), bidz))
+            bidy_kv = bidy // self.n_split
+            h_r_begin = ((bidy % self.n_split) // self.s_q_split) * (problem_shape[3][0][0] // self.h_r_split)
+            q_slice = bidy % self.s_q_split
             # problem_shape = (s_q_max, s_k_max, d: hidden dim, ((h_r: #q_head_per_kv, h_k: #kv_heads), orig_b: batch size)) mark
             problem_shape_cur_batch = problem_shape
             blk_offset = (Int32(0), Int32(0), Int32(0), ((Int32(0), Int32(0)), Int32(0)))
@@ -1925,9 +1966,26 @@ class BlackwellFmhaBackwardDKDV256:
                 window_size_right,
             )
 
-            trip_end = trip_start + trip_count
+            # This cluster's Q-tile chunk of the KV tile's trip range (s_q_split
+            # near-equal pieces). The mask classification inside compute() is
+            # relative to the FULL range start, which travels separately.
+            trip_start_full = trip_start
+            chunk_begin = trip_start + (q_slice * trip_count) // self.s_q_split
+            chunk_end = trip_start + ((q_slice + 1) * trip_count) // self.s_q_split
+            trip_start = chunk_begin
+            trip_end = chunk_end
+            trip_count = chunk_end - chunk_begin
 
-            trip_count = trip_count * problem_shape_cur_batch[3][0][0]
+            # Q heads walked by this cluster: h_r / h_r_split.
+            trip_count = trip_count * (problem_shape_cur_batch[3][0][0] // self.h_r_split)
+            # The dK/dV views carry h_k * h_r_split slots; the epilogues build
+            # their global tiles from the HB they are handed.
+            problem_shape_out = (
+                problem_shape_cur_batch[0],
+                problem_shape_cur_batch[1],
+                problem_shape_cur_batch[2],
+                ((problem_shape_cur_batch[3][0][0], problem_shape_cur_batch[3][0][1] * self.n_split), problem_shape_cur_batch[3][1]),
+            )
 
             # Cluster wait before tensor memory alloc for 2-CTA
             pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
@@ -2008,9 +2066,10 @@ class BlackwellFmhaBackwardDKDV256:
                             load_mma_VDO_pipeline,
                         ),
                         bidx,
-                        bidy,
+                        bidy_kv,
                         bidz,
                         problem_shape[3][0][1],  # h_k
+                        h_r_begin=h_r_begin,
                     )
 
                 # ///////////////////////////////////////////////////////////////////////////////
@@ -2110,6 +2169,7 @@ class BlackwellFmhaBackwardDKDV256:
                             compute_mma_P_pipeline,
                             compute_mma_dS_pipeline,
                         ),
+                        iter_start_global=trip_start_full,
                     )
                     if warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_0[-1]:
                         mma_compute_Q_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_compute_dKdV_stage)
@@ -2117,7 +2177,7 @@ class BlackwellFmhaBackwardDKDV256:
                         self.epilogue(
                             blk_coord,
                             blk_offset,
-                            problem_shape_cur_batch,
+                            problem_shape_out,
                             dK,
                             dV,
                             tDKtDK,
@@ -2130,6 +2190,13 @@ class BlackwellFmhaBackwardDKDV256:
 
                 else:
                     cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+            elif cluster_idx * self.tile_shape_K < problem_shape_cur_batch[1]:
+                # An in-range KV tile that no query row attends (causal with
+                # S_kv > S_q): its gradients are exactly zero, and the mainloop
+                # above is skipped, so the tile must be written here or the
+                # caller's dK/dV keep whatever was in the buffer.
+                if warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_1[-1]:
+                    self.epilogue_zero(blk_coord, blk_offset, problem_shape_out, dK, dV)
 
         # In persistent mode, sync across the 2-CTA cluster before TMEM dealloc
         # to prevent one CTA from freeing TMEM while partner CTA's MMA warp still accesses it.
@@ -2215,10 +2282,12 @@ class BlackwellFmhaBackwardDKDV256:
         blk_coord_b: Int32,
         num_h_k: Int32,  # total number of KV heads (replaces grid_dim_y)
         cumulative_trip_count: Int32 = Int32(0),  # accumulated trip_count across persistent tiles
+        h_r_begin: Int32 = Int32(0),  # first Q head of this cluster's slice (h_r_split)
     ):
+        """Producer warp: TMA loads of K/V once and of Q, dO, LSE, row-dot and their scale factors per Q tile and head."""
         grid_dim_y = num_h_k
 
-        blk_coord_h_r = Int32(0)
+        blk_coord_h_r = h_r_begin
         blk_coord_h_q = (blk_coord_h_r, blk_coord_h_k)
         blk_coord_h_kv = (Int32(0), blk_coord_h_k)
 
@@ -2847,6 +2916,7 @@ class BlackwellFmhaBackwardDKDV256:
         sSFDO_mn: cute.Tensor,
         cumulative_trip_count: Int32 = Int32(0),  # accumulated trip_count across persistent tiles
     ):
+        """MMA warp: block-scaled tcgen05 MMAs for S = K.Q^T, dP = V.dO^T, dK += dS^T.Q and dV += P^T.dO."""
         bidx, _, _ = cute.arch.block_idx()
         iter_count_origin = iter_count
 
@@ -3494,14 +3564,20 @@ class BlackwellFmhaBackwardDKDV256:
         # (mma_compute_KQ_pipeline, mma_compute_VDO_pipeline, compute_mma_P_pipeline, compute_mma_dS_pipeline)
         pipeline_args: tuple,
         cumulative_trip_count: Int32 = Int32(0),  # accumulated trip_count across persistent tiles
+        # Start of the KV tile's FULL trip range. iter_start/iter_end may be a
+        # chunk of it (s_q_split); the masked-leading/trailing tile counts are
+        # relative to the full range, so the tile classification below uses this.
+        iter_start_global: Optional[Int32] = None,
     ):
+        """Softmax / dS / P production for one KV tile (compute warps); see the module docstring."""
         tidx, _, _ = cute.arch.thread_idx()
         Q, K, _, _ = problem_shape
         _, blk_coord_k, _, _ = blk_coord
 
         # TODO: perhaps make it uniform register
         wg_idx_valid = (tidx % (self.num_compute_warps * self.threads_per_warp)) // 128
-        iter_start_global = iter_start
+        if cutlass.const_expr(iter_start_global is None):
+            iter_start_global = iter_start
         num_warp_groups = self.num_compute_warps // self.num_compute_0_warps
 
         tidx = tidx % 128
@@ -3864,6 +3940,41 @@ class BlackwellFmhaBackwardDKDV256:
                 iter_index = iter_start
 
     @cute.jit
+    def epilogue_zero(
+        self,
+        blk_coord: cute.Coord,
+        blk_offset: cute.Shape,
+        problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
+        dK: cute.Tensor,
+        dV: cute.Tensor,
+    ):
+        """Write zeros to this CTA's dK/dV tile (the epilogue's tile geometry) --
+        for KV tiles whose mainloop was skipped because no query row attends
+        them. Plain per-element stores from the compute warps; these tiles are
+        rare (the causal tail past S_q) so no vectorization is needed."""
+        tidx, _, _ = cute.arch.thread_idx()
+        _, K, D, HB = problem_shape
+        _, blk_coord_k, _, blk_coord_batch = blk_coord
+        mdK = cute.make_tensor(
+            dK.iterator + cute.assume(blk_offset[1] * dK.stride[0], divby=64),
+            cute.make_layout((K, self.tile_shape_dKdV_K, HB), stride=dK.stride),
+        )
+        mdV = cute.make_tensor(
+            dV.iterator + cute.assume(blk_offset[1] * dV.stride[0], divby=64),
+            cute.make_layout((K, self.tile_shape_dKdV_K, HB), stride=dV.stride),
+        )
+        rows = self.dSQ_cta_tiler[0]
+        cols = self.tile_shape_dKdV_K
+        n_threads = self.num_compute_warps * self.threads_per_warp
+        zero = Float32(0.0).to(self.element_dtype)
+        for i in cutlass.range(tidx, rows * cols, n_threads):
+            r = blk_coord_k * rows + i // cols
+            c = i % cols
+            if r < K:
+                mdK[(r, c, blk_coord_batch)] = zero
+                mdV[(r, c, blk_coord_batch)] = zero
+
+    @cute.jit
     def epilogue(
         self,
         blk_coord: cute.Coord,
@@ -3878,6 +3989,7 @@ class BlackwellFmhaBackwardDKDV256:
         # (mma_compute_dQ_pipeline, mma_compute_dQ_consumer_state)
         pipeline_args: tuple,
     ):
+        """Compute warps: scale the TMEM dK/dV accumulators and store this CTA's tile to global memory."""
         tidx, _, _ = cute.arch.thread_idx()
         _, K, D, HB = problem_shape
         _, blk_coord_k, _, blk_coord_batch = blk_coord
@@ -3961,6 +4073,7 @@ class BlackwellFmhaBackwardDKDV256:
         mma_compute_Q_consumer_state.advance()
 
     def _make_and_init_load_mma_pipeline(self, load_mma_mbar_ptr, cluster_layout_vmnk, tx_count):
+        """Create and initialise one TMA-producer / MMA-consumer pipeline with the given depth."""
         return cute_common.make_tma_umma_pipeline(
             load_mma_mbar_ptr,
             self.load_mma_all_stage,
@@ -3971,17 +4084,20 @@ class BlackwellFmhaBackwardDKDV256:
         )
 
     def make_and_init_load_mma_KQ_pipeline(self, load_mma_KQ_mbar_ptr, cluster_layout_vmnk):
+        """Load -> MMA pipeline for the K and Q operand stages."""
         tx_count = self.tma_copy_Q_bytes * 2
         tx_count += self.tma_copy_sfQ_bytes * self.k_halves * 2
         tx_count += self.tma_copy_LSE_bytes
         return self._make_and_init_load_mma_pipeline(load_mma_KQ_mbar_ptr, cluster_layout_vmnk, tx_count)
 
     def make_and_init_load_mma_KQ_aux_pipeline(self, load_mma_KQ_aux_mbar_ptr, cluster_layout_vmnk):
+        """Load -> MMA pipeline for the K/Q auxiliary (scale-factor) stages."""
         tx_count = self.tma_copy_QT_bytes * 2
         tx_count += self.tma_copy_sfQ_mn_bytes * 2
         return self._make_and_init_load_mma_pipeline(load_mma_KQ_aux_mbar_ptr, cluster_layout_vmnk, tx_count)
 
     def make_and_init_load_mma_VDO_pipeline(self, load_mma_VDO_mbar_ptr, cluster_layout_vmnk):
+        """Load -> MMA pipeline for the V and dO operand stages."""
         tx_count = (self.tma_copy_dO_bytes + self.tma_copy_dOT_bytes) * 2
         tx_count += self.tma_copy_sfdO_bytes * self.k_halves * 2
         tx_count += self.tma_copy_sfdO_mn_bytes * 2
@@ -3989,6 +4105,7 @@ class BlackwellFmhaBackwardDKDV256:
         return self._make_and_init_load_mma_pipeline(load_mma_VDO_mbar_ptr, cluster_layout_vmnk, tx_count)
 
     def _make_and_init_mma_compute_pipeline(self, mbar_ptr, num_stages, cluster_layout_vmnk):
+        """Create and initialise one MMA-producer / compute-consumer TMEM pipeline."""
         return cute_common.make_umma_async_pipeline(
             mbar_ptr,
             num_stages,
@@ -3998,15 +4115,19 @@ class BlackwellFmhaBackwardDKDV256:
         )
 
     def make_and_init_mma_compute_KQ_pipeline(self, mma_compute_KQ_mbar_ptr, cluster_layout_vmnk):
+        """MMA -> compute pipeline handing off the S = K.Q^T accumulator."""
         return self._make_and_init_mma_compute_pipeline(mma_compute_KQ_mbar_ptr, self.mma_compute_KQ_stage, cluster_layout_vmnk)
 
     def make_and_init_mma_compute_VDO_pipeline(self, mma_compute_VDO_mbar_ptr, cluster_layout_vmnk):
+        """MMA -> compute pipeline handing off the dP = V.dO^T accumulator."""
         return self._make_and_init_mma_compute_pipeline(mma_compute_VDO_mbar_ptr, self.mma_compute_VDO_stage, cluster_layout_vmnk)
 
     def make_and_init_mma_compute_dK_pipeline(self, mma_compute_dK_mbar_ptr, cluster_layout_vmnk):
+        """MMA -> compute pipeline handing off the final dK/dV accumulators."""
         return cute_common.make_pipeline_umma_async(self, mma_compute_dK_mbar_ptr, self.mma_compute_dKdV_stage, cluster_layout_vmnk)
 
     def _make_and_init_compute_mma_pipeline(self, mbar_ptr, num_stages, cluster_layout_vmnk):
+        """Create and initialise one compute-producer / MMA-consumer smem pipeline."""
         return cute_common.make_async_umma_pipeline(
             mbar_ptr,
             num_stages,
@@ -4016,7 +4137,9 @@ class BlackwellFmhaBackwardDKDV256:
         )
 
     def make_and_init_compute_mma_P_pipeline(self, compute_mma_P_mbar_ptr, cluster_layout_vmnk):
+        """Compute -> MMA pipeline publishing the quantised P tile."""
         return self._make_and_init_compute_mma_pipeline(compute_mma_P_mbar_ptr, self.compute_mma_P_stage, cluster_layout_vmnk)
 
     def make_and_init_compute_mma_dS_pipeline(self, compute_mma_dS_mbar_ptr, cluster_layout_vmnk):
+        """Compute -> MMA pipeline publishing the quantised dS tile."""
         return self._make_and_init_compute_mma_pipeline(compute_mma_dS_mbar_ptr, self.compute_mma_dS_stage, cluster_layout_vmnk)
