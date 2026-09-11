@@ -7,7 +7,7 @@ class it was tuned for in brackets) crossed with the pass; rows are features.
 Source of truth is the `Capabilities` row of each engine
 (`python/cudnn/sdpa/fwd/engines.py`, `python/cudnn/sdpa/bwd/engines.py`) — a
 cell here is ✅ only when that row admits it. Anything not listed as a row
-(dropout, ALiBi, paged KV, `block_mask`, `score_mod`, `rng_dump`,
+(dropout, ALiBi, `block_mask`, `score_mod`, `rng_dump`,
 `score_max`/`score_sum_exp`, tensor `attn_scale`, `unfuse_fma`, `Amax_S`) is
 **declined by every FROST SDPA engine on every arch**.
 
@@ -87,6 +87,25 @@ MMA as d=512.
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ᵇ · ✅ᵍ |
+| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ (d128 envelope) | ✅ᵖ | ❌ | ✅ᵖ | ❌ | ❌ |
+
+ᵖ **Paged KV (issue #920), f16/bf16 only, d128 and d256 flavors** (`d_qk, d_v <= 256`;
+d=64 rides the d128 envelope, d=192/192 the d256 one; mixed dims that would select
+d192x128 are declined). The graph is cuDNN's own paged-cache contract: K/V are page
+pools `[num_pages, H_kv, page_size, D]` — HND compact, or NHD (`[num_pages, page_size,
+H_kv, D]` storage) declared through the strides — plus `(B, 1, max_pages, 1)` int32
+block tables and `use_padding_mask` with `seq_len_q` / `seq_len_kv` (the per-batch KV
+length is read on device; `paged_attention_max_seq_len_kv` defaults to `max_pages *
+page_size`). `page_size` is a multiple of 8 that divides the 128-row KV tile or is a
+multiple of it. Any `S_q` (decode or paged prefill), GQA (PackGQA when the group
+divides the tile), Stats out, and **THD queries**: ragged Q/O (ragged offsets +
+`seq_len_q`) over the same pools — chunked prefill — with the THD scheduler walking
+the Q units (no KV split there). KV split is proposed on dense-Q paged graphs (they
+are padded by construction, and `B * H_kv` is far below the SM count at serving batch
+sizes) and recombined by `split_combine_sm100`. Not yet: sink, fp8/mxfp8 pools,
+packed (ragged-offset) block tables. Served by `prefill_d128_f16_sm100.py`'s `PAGED_KV`
+specialization (block-table indirection on the K/V TMA loads; boxes past a
+sequence's live pages are TMA-OOB zero-filled).
 
 ¹ **Reads as: on a quantized (fp8/mxfp8) graph in this column, O may be FP16,
 BF16, E4M3 or E5M2.** It does NOT mean an f16/bf16 graph may convert O — the f16
@@ -517,4 +536,5 @@ feature-free d=64 graph.
 | **Native d=64 (GPT-OSS) forward kernel** | **SM100, SM107** — served via the d128 envelope at ~2× MMA cost |
 | d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |
 | Bias forward | SM100, SM107, SM120 |
-| Dropout, ALiBi, paged KV, `block_mask`, `score_mod` | every arch, both passes |
+| Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
+| Paged KV cache | every arch except SM100/SM103 f16/bf16 d128 forward (see ᵖ); fp8/mxfp8 pools, sink, THD, packed block tables everywhere |

@@ -400,7 +400,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # per-split LSE is the combine weight; the THD/sink/padded paths
             # do not produce per-split partials). Declined HERE so a split
             # request never reaches a kernel that cannot honor it.
-            if facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim:
+            # Paged KV is padded by construction and its split composes with
+            # the per-batch lengths (the decode path — B*H_kv is far below
+            # the SM count), so it is exempt from the padded exclusion.
+            if facts.thd or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
                 return "split_kv > 1 serves dense, unpadded, sink-free graphs only"
             if capabilities.skv_tail_via_padding and facts.s_kv % (capabilities.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
                 # The lowering would serve this ragged S_kv through the padded
@@ -511,6 +514,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
 
+    if facts.has_paged_kv:
+        # Served by the d128 f16/bf16 kernel's PAGED_KV specialization
+        # (config_sm100._validate_params mirrors these as its backstop).
+        if facts.is_fp8 or facts.is_mxfp8:
+            return "paged KV is served by the f16/bf16 kernel only"
+        if not facts.padded:
+            return "paged KV requires use_padding_mask with seq_len_kv (the per-batch KV length bounds the block-table walk)"
+        if facts.d_qk > 256 or facts.d_v > 256:
+            return f"paged KV is wired on the d128 / d256 flavors only (d_qk, d_v <= 256); got ({facts.d_qk}, {facts.d_v})"
+        if (facts.d_qk > 128 or facts.d_v > 128) and not (facts.d_qk > 128 and facts.d_v > 128):
+            return f"paged KV with mixed head dims ({facts.d_qk}, {facts.d_v}) would select the d192x128 flavor, which is not wired"
+        if facts.has_sink:
+            return "paged KV with an attention sink is not validated"
+        p = facts.page_size
+        if p % 8 != 0 or (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
+            return f"page_size {p} must be a multiple of 8 that divides the 128-row KV tile or is a multiple of it"
+
     if facts.has_sink and capabilities.sink_dtypes is not None and facts.dtype not in capabilities.sink_dtypes:
         return f"sink token with dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.sink_dtypes)}"
 
@@ -612,6 +632,11 @@ def _sm100_spec() -> EngineSpec:
             right_band_widening=True,
             swa=True,
             padded=True,
+            # Paged KV caches (paged_attention_k/v_table + seq_len_kv) on the
+            # d128 flavor: block-table indirection on the K/V TMA loads, HND
+            # and NHD page layouts, KV split + combine (mismatch() holds the
+            # d128 / dense / padded / page-geometry conditions).
+            paged_kv=True,
             sink=True,
             stats=True,
             lse_optional=True,
@@ -1204,6 +1229,18 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     return spec.lower(spec, facts, knobs)
 
 
+def _table_stride(t) -> tuple:
+    """A paged block table's ``(batch, page)`` strides from its ``(B, 1, max_pages, 1)`` IR ref."""
+    s = tuple(int(x) for x in t.get_stride())
+    return (s[0], s[2])
+
+
+def _table_view(buf, ir_t, b: int):
+    """The kernel's ``(B, max_pages)`` view of a bound ``(B, 1, max_pages, 1)`` table — a
+    view of the declared layout (size-1 axes dropped), never a copy."""
+    return buf.as_strided((b, int(ir_t.get_dim()[2])), _table_stride(ir_t), buf.storage_offset())
+
+
 def lower_dsl_prefill(
     spec: EngineSpec,
     facts: "ga.SdpaGraphFacts",
@@ -1269,6 +1306,15 @@ def lower_dsl_prefill(
         # of TMA reach. Only ever tightens (see _thd_declared_total).
         max_total_seq_len_q=facts.max_total_seq_len_q,
         max_total_seq_len_kv=facts.max_total_seq_len_kv,
+        # Paged KV: K/V samples are the page pools; the adapter needs the page
+        # geometry and the declared KV maximum the masks clamp against.
+        paged_page_size=facts.page_size if facts.has_paged_kv else 0,
+        paged_max_seq_len_kv=facts.s_kv if facts.has_paged_kv else None,
+        # The tables' declared (batch, page) strides — the (B, 1, max_pages, 1)
+        # IR tensor's axes 0 and 2 — so batch-innermost / padded tables bind
+        # as views.
+        paged_table_stride=_table_stride(facts.paged_k_table_t) if facts.has_paged_kv else None,
+        paged_table_v_stride=_table_stride(facts.paged_v_table_t) if facts.has_paged_kv else None,
         dtype_o=facts.dtype_o if (facts.is_mxfp8 or facts.is_fp8) else None,
         pertensor_fp8=facts.is_fp8,
         sched_policy=knobs.sched_policy if knobs is not None else None,
@@ -1326,6 +1372,8 @@ def lower_dsl_prefill(
         seq_len_q=seq_q_t,
         cu_seq_len_q=facts.cu_seq_q_t,
         cu_seq_len_kv=facts.cu_seq_kv_t,
+        paged_k_table=facts.paged_k_table_t,
+        paged_v_table=facts.paged_v_table_t,
         bias=facts.bias_t,
         sf_q=facts.sf_q_t,
         sf_k=facts.sf_k_t,
@@ -1366,6 +1414,10 @@ def lower_dsl_prefill(
             k_buf = _ir_view(k_buf, binding.k)
             v_buf = _ir_view(v_buf, binding.v)
             o_buf = _ir_view(o_buf, binding.o)
+        elif facts.has_paged_kv:
+            # THD Q/O stay packed; the pools are ordinary dense tensors.
+            k_buf = _ir_view(k_buf, binding.k)
+            v_buf = _ir_view(v_buf, binding.v)
         # Scratch comes from the CALLER's workspace (never allocated here): the
         # CompiledPlan sized/validated it against workspace_bytes; the carver
         # re-validates so a direct call cannot silently corrupt memory.
@@ -1424,6 +1476,18 @@ def lower_dsl_prefill(
             # ExecutionContext's stream); None keeps the default stream.
             current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
         )
+        if facts.has_paged_kv:
+            # (B, 1, max_pages, 1) int32 tables bound as the kernel's flat
+            # (B, max_pages) views — a view, never a copy (Rule 1); the same
+            # buffer may back both.
+            bt_k = resolved.get(id(binding.paged_k_table))
+            bt_v = resolved.get(id(binding.paged_v_table))
+            if bt_k is None or bt_v is None:
+                raise ValueError("cudnn.sdpa: paged_attention_k_table / paged_attention_v_table requested but no buffer was provided")
+            execute_kwargs.update(
+                block_table=_table_view(bt_k, binding.paged_k_table, facts.b),
+                block_table_v=_table_view(bt_v, binding.paged_v_table, facts.b),
+            )
         if facts.is_mxfp8 or facts.is_fp8:
             execute_kwargs.update(
                 sf_q=sf_q_buf,

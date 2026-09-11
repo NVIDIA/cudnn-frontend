@@ -669,7 +669,9 @@ def _split_points(
     no_split = 1
     if not caps.split_kv_supported:
         return [no_split]
-    if facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim:
+    # Paged KV is padded by construction and the split composes with the
+    # per-batch lengths (it IS the decode lever there) — see mismatch().
+    if facts.thd or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
         return [no_split]
     if caps.skv_tail_via_padding and facts.s_kv % (caps.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
         # This S_kv would be served through the synthesized KV-tail padding,
