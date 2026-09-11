@@ -163,6 +163,7 @@ def frost_gdn_chain_prologue(
                 expand_num=expand_num,
                 pieces=pieces,
                 mRowBase=summary_rows,
+                mSlotRows=main_rows,
             )
         if cutlass.const_expr(series_items is not None):
             gen_interval_items(

@@ -417,7 +417,7 @@ class CompiledKda:
                 stream,
                 own_prologue=False,
             )
-            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, cu_pieces=cu_pieces)
+            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, main_rows=region["main_rows"])
             self.kernel.run_prefill(
                 self.kernel_cache,
                 q,
@@ -488,7 +488,7 @@ class CompiledKda:
             seed_dtype=str(state0.dtype) if state0 is not None else "float32",
             device=self.device,
         )
-        self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, main_rows=region["main_rows"])
         self.kernel_cache = self.kernel.chunk_kda_sm100(
             q,
             k,
@@ -1119,7 +1119,7 @@ class CompiledKdaBwd:
                     seed_dtype=str(state0.dtype) if state0 is not None else "float32",
                     device=self.device,
                 )
-            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, cu_pieces=cu_pieces)
+            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, main_rows=region["main_rows"])
 
         if warm:
             self.summary.run_bwd_summary(
@@ -1188,7 +1188,7 @@ class CompiledKdaBwd:
                 seed_dtype=str(dstate_in.dtype) if dstate_in is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_dx_end, dstate_in, None, None, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_dx_end, dstate_in, None, None, stream, main_rows=region["main_rows"])
 
         if not (self.has_state_checkpoints and not self.coarse_checkpoints):
             series_items = region["work_items_recompute"] if self.coarse_checkpoints else work_items
@@ -1764,7 +1764,9 @@ class CompiledKdaSummary:
                 summary_dtype=str(transition.dtype) if transition is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_summary, self.num_seqs, state_h, state_m, state_x, state0, final_state, transition, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(
+            self.chain_summary, self.num_seqs, state_h, state_m, state_x, state0, final_state, transition, stream, main_rows=region["main_rows"]
+        )
 
 
 class CompiledKdaSummaryBwd:
@@ -2258,4 +2260,6 @@ class CompiledKdaSummaryBwd:
                 summary_dtype=str(transition.dtype) if transition is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_x, dstate_in, dstate0, transition, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(
+            self.chain_reverse, self.num_seqs, state_g, state_m, state_x, dstate_in, dstate0, transition, stream, main_rows=region["main_rows"]
+        )

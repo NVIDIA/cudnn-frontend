@@ -152,6 +152,7 @@ def frost_kda_chain_prologue(
                 sSpread,
                 pieces=pieces,
                 mRowBase=summary_rows,
+                mSlotRows=main_rows,
             )
         if cutlass.const_expr(series_items is not None):
             gen_interval_items(b_t, ORDER_THREADS, tidx, n_heads_out, n_heads_out * n_pieces, series_span_chunks, cu_pieces, series_count, series_items, None)
