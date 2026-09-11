@@ -3,12 +3,12 @@
 instances:
   # Production. Fronted by docs.nvidia.com via Akamai once the routing is in place.
   # TODO(fern-onboarding): confirm both Fern-hosted URLs with #cdd-fern before publishing.
-  - url: nvidia-cudnn.docs.buildwithfern.com/deeplearning/cudnn
-    custom-domain: docs.nvidia.com/deeplearning/cudnn
+  - url: nvidia-cudnn.docs.buildwithfern.com/cudnn
+    custom-domain: docs.nvidia.com/cudnn
     multi-source: true
   # Staging. Published from develop on every docs change. No custom-domain:
   # nothing about this instance should be reachable from docs.nvidia.com.
-  - url: nvidia-cudnn-staging.docs.buildwithfern.com/deeplearning/cudnn
+  - url: nvidia-cudnn-staging.docs.buildwithfern.com/cudnn
     multi-source: true
 
 title: NVIDIA cuDNN
@@ -16,7 +16,7 @@ title: NVIDIA cuDNN
 global-theme: nvidia
 
 logo:
-  href: /deeplearning/cudnn/latest
+  href: /cudnn/latest
   right-text: cuDNN
 
 navbar-links:
@@ -30,46 +30,46 @@ versions:
 
 redirects:
   # Legacy Sphinx URLs. Sources are relative to the instance path
-  # (docs.nvidia.com/deeplearning/cudnn); destinations are absolute.
+  # (docs.nvidia.com/cudnn); destinations are absolute.
   # Order matters: specific rules first, generic .html rules last.
 
   # Installation guide used to be a separate Sphinx book at /installation/latest/.
   - source: "/installation/latest"
-    destination: "/deeplearning/cudnn/latest/installation/backend"
+    destination: "/cudnn/latest/installation/backend"
   - source: "/installation/latest/index.html"
-    destination: "/deeplearning/cudnn/latest/installation/backend"
+    destination: "/cudnn/latest/installation/backend"
   # Pages that are now nested under the backend / frontend sections.
   - source: "/installation/latest/prerequisites.html"
-    destination: "/deeplearning/cudnn/latest/installation/backend/prerequisites"
+    destination: "/cudnn/latest/installation/backend/prerequisites"
   - source: "/installation/latest/linux.html"
-    destination: "/deeplearning/cudnn/latest/installation/backend/linux"
+    destination: "/cudnn/latest/installation/backend/linux"
   - source: "/installation/latest/windows.html"
-    destination: "/deeplearning/cudnn/latest/installation/backend/windows"
+    destination: "/cudnn/latest/installation/backend/windows"
   - source: "/installation/latest/frontend-dependencies.html"
-    destination: "/deeplearning/cudnn/latest/installation/frontend/frontend-dependencies"
+    destination: "/cudnn/latest/installation/frontend/frontend-dependencies"
   - source: "/installation/latest/python-frontend-install.html"
-    destination: "/deeplearning/cudnn/latest/installation/frontend/python-frontend-install"
+    destination: "/cudnn/latest/installation/frontend/python-frontend-install"
   - source: "/installation/latest/cpp-frontend-install.html"
-    destination: "/deeplearning/cudnn/latest/installation/frontend/cpp-frontend-install"
+    destination: "/cudnn/latest/installation/frontend/cpp-frontend-install"
   - source: "/installation/latest/frontend-next-steps.html"
-    destination: "/deeplearning/cudnn/latest/installation/frontend/frontend-next-steps"
+    destination: "/cudnn/latest/installation/frontend/frontend-next-steps"
   - source: "/installation/latest/:path*.html"
-    destination: "/deeplearning/cudnn/latest/installation/:path*"
+    destination: "/cudnn/latest/installation/:path*"
   - source: "/installation/latest/:path*"
-    destination: "/deeplearning/cudnn/latest/installation/:path*"
+    destination: "/cudnn/latest/installation/:path*"
 
   # Unified cuDNN book at /latest/.
   - source: "/index.html"
-    destination: "/deeplearning/cudnn/latest"
+    destination: "/cudnn/latest"
   - source: "/index"
-    destination: "/deeplearning/cudnn/latest"
+    destination: "/cudnn/latest"
   - source: "/latest/index.html"
-    destination: "/deeplearning/cudnn/latest"
+    destination: "/cudnn/latest"
   - source: "/latest/:path*/index.html"
-    destination: "/deeplearning/cudnn/latest/:path*"
+    destination: "/cudnn/latest/:path*"
   - source: "/latest/:path*.html"
-    destination: "/deeplearning/cudnn/latest/:path*"
+    destination: "/cudnn/latest/:path*"
   - source: "/:path*/index.html"
-    destination: "/deeplearning/cudnn/:path*"
+    destination: "/cudnn/:path*"
   - source: "/:path*.html"
-    destination: "/deeplearning/cudnn/:path*"
+    destination: "/cudnn/:path*"
