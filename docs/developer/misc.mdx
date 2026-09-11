@@ -39,7 +39,7 @@ cudnnBackendGetAttribute(engHeur, CUDNN_ATTR_ENGINEHEUR_RESULTS, CUDNN_TYPE_BACK
 // "engConfig" should now be ready with target SM count as 66
 ```
 
-This feature is currently supported by normal convolutions (`Fprop`, `Dgrad`, and `Wgrad`) as well as the Conv-Bias-Act fusions.
+This feature is currently supported by normal convolutions (`Fprop`, `Dgrad`, and `Wgrad`) as well as the convolution, bias, and activation fusions.
 
 | Convolution Forward | Convolution Backward Data | Convolution Backward Filter | `cudnnConvolutionBiasActivationForward` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
