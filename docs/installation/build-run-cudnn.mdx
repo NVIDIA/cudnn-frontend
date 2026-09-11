@@ -1,0 +1,53 @@
+---
+title: "Building and Running a cuDNN Dependent Program"
+---
+## Building a cuDNN Dependent Program
+
+Because cuDNN uses symbols defined in external libraries, you need to ensure that the linker can locate these libraries while building a cuDNN dependent program. One way to achieve this is by explicitly specifying them on the linker command.
+
+**Linker Dependencies for the Dynamic cuDNN Libs**
+
+**Linux**
+
+Add `-lz` to the linker command.
+
+**Windows**
+
+No additional linker flags are required for Windows.
+
+**Linker Dependencies for the Static cuDNN Libs**
+
+<Note>
+When linking cuDNN statically, wrap the required static sublibraries with the `--start-group` and `--end-group` linker flags within the linker command.
+</Note>
+
+**Linux**
+
+Add `-lcublasLt_static -lz -lnvrtc_static -lnvrtc-builtins_static -lnvptxcompiler_static -lcudart_static` to the linker command.
+
+**Windows**
+
+Not applicable. Static cuDNN libs for Windows are not supported.
+
+## Running a cuDNN Dependent Program
+
+While running a cuDNN dependent program, in addition to the paths to the directory of cuDNN, make sure to add the path to the directory of the following libraries to the environment variable `$LD_LIBRARY_PATH` on Linux, or to the environment variable `%PATH%` on Windows.
+
+Linux
+
+- `libz.so` (required by `ld.so` at load-time)
+- `libcublasLt.so` (required by `dlopen()` at runtime when using certain matmul engines, convolution engines, legacy convolution APIs, RNN APIs, and legacy multihead attention APIs)
+- `libnvrtc.so` (required by `dlopen()` at runtime when using [runtime-compiled engines](/developer/graph-api#generic-runtime-fusion-engines))
+
+Windows
+
+- `cublasLt*.dll` (required by `LoadLibraryA()` at runtime when using certain matmul engines, convolution engines, legacy convolution APIs, RNN APIs, and legacy multihead attention APIs)
+- `nvrtc*.dll` (required by `LoadLibraryA()` at runtime when using [runtime-compiled engines](/developer/graph-api#generic-runtime-fusion-engines))
+
+<Note>
+When linking cuDNN statically, wrap the needed static sub-libraries with the `--whole-archive` and `--no-whole-archive` linker flags within the linker command.
+</Note>
+
+## Inter-Library Dependencies
+
+Since cuDNN is split into several libraries, dependencies between them need to be taken into account. For more information, refer to the [API Library Overview](/developer/overview).

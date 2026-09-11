@@ -1,0 +1,63 @@
+---
+title: "Cross-Compiling cuDNN Samples"
+---
+This section describes how to cross-compile cuDNN samples on Ubuntu.
+
+## Linux arm64-SBSA
+
+Follow the steps in this section to cross-compile cuDNN samples on Linux arm64-SBSA. Linux arm64-SBSA incorporates ARM based CPU cores for Server Base System Architecture (SBSA).
+
+### Installing the CUDA Toolkit for Linux arm64-SBSA
+
+Follow the instructions described in the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html) to install the CUDA Toolkit for the Cross SBSA variant of the toolkit.
+
+### Installing cuDNN for Linux arm64-SBSA
+
+1. Follow the instructions described in [Installing cuDNN on Linux](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/overview.html#api-changes-900) to install cuDNN for the Cross SBSA variant of the library.
+2. Install the arm64-SBSA host compiler.
+
+   ```
+   sudo apt-get -y install g++-aarch64-linux-gnu
+   ```
+
+### Cross-Compiling cuDNN Samples for Linux arm64-SBSA
+
+1. Copy the `cudnn_samples_v9` directory to your home directory.
+
+   ```
+   cp -r /usr/src/cudnn_samples_v9 $HOME
+   ```
+
+2.  For each sample, execute the following commands.
+
+    ```
+    cd $HOME/cudnn_samples_v9/(each sample)
+    sudo make TARGET_ARCH=aarch64 SBSA=1
+    ```
+
+## Linux aarch64-Jetson
+
+Follow the steps in this section to cross-compile cuDNN samples on Ubuntu. Linux aarch64-Jetson incorporates ARM based CPU cores for the Tegra platform.
+
+### Installing the CUDA Toolkit for Linux aarch64-Jetson
+
+Follow the instructions described in the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html) to install the CUDA Toolkit for the Cross Jetson variant of the toolkit.
+
+### Installing cuDNN for Linux aarch64-Jetson
+
+Follow the instructions described in [Installing cuDNN on Linux](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/overview.html#api-changes-900) to install cuDNN for the Cross Jetson variant of the library.
+
+### Cross-Compiling cuDNN Samples for Linux aarch64-Jetson
+
+1. Copy the `cudnn_samples_v9` directory to your home directory.
+
+   ```
+   cp -r /usr/src/cudnn_samples_v9 $HOME
+   ```
+
+2.  For each sample, execute the following commands.
+
+    ```
+    cd $HOME/cudnn_samples_v9/(each sample)
+    sudo make TARGET_ARCH=aarch64
+    ```
