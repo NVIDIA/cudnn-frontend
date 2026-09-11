@@ -30,19 +30,23 @@ def _worst_case_padded_route_count(
 
 
 def _logical_route_limit_for_physical_pool(
-    physical_pool_capacity: int,
+    pool_capacity_upper_bound: int,
     *,
     raw_route_count: int,
     experts_per_rank: int,
     padding_block: int,
 ) -> int:
-    """Reverse-map an exact physical pool to upstream's logical limit."""
+    """Find a logical route limit whose padded pool has the requested size."""
 
-    if physical_pool_capacity % _PHYSICAL_POOL_ALIGNMENT:
-        raise ValueError("max_recv_size_per_rank must satisfy P % 128 == 0, " f"got P={physical_pool_capacity}")
+    if pool_capacity_upper_bound % _PHYSICAL_POOL_ALIGNMENT:
+        raise ValueError("max_recv_size_per_rank must satisfy P % 128 == 0, " f"got P={pool_capacity_upper_bound}")
 
+    # The physical pool is an explicit ABI capacity. It may intentionally exceed
+    # the maximum routes this topology can produce, so do not clamp this search
+    # to raw_route_count.
+    del raw_route_count
     lower = 0
-    upper = raw_route_count
+    upper = pool_capacity_upper_bound
     while lower < upper:
         candidate = (lower + upper + 1) // 2
         padded = _worst_case_padded_route_count(
@@ -50,7 +54,7 @@ def _logical_route_limit_for_physical_pool(
             experts_per_rank=experts_per_rank,
             padding_block=padding_block,
         )
-        if padded <= physical_pool_capacity:
+        if padded <= pool_capacity_upper_bound:
             lower = candidate
         else:
             upper = candidate - 1
@@ -61,11 +65,11 @@ def _logical_route_limit_for_physical_pool(
         experts_per_rank=experts_per_rank,
         padding_block=padding_block,
     )
-    if logical_route_limit <= 0 or padded_capacity != physical_pool_capacity:
+    if logical_route_limit <= 0 or padded_capacity != pool_capacity_upper_bound:
         raise ValueError(
-            "max_recv_size_per_rank physical pool capacity cannot be represented "
-            "exactly by the upstream padding contract: "
-            f"P={physical_pool_capacity}, largest logical limit="
+            "max_recv_size_per_rank cannot be represented by the upstream "
+            "padding contract: "
+            f"P={pool_capacity_upper_bound}, largest logical limit="
             f"{logical_route_limit}, padded capacity={padded_capacity}"
         )
     return logical_route_limit
@@ -149,13 +153,14 @@ class Mxfp8KernelConfig:
             experts_per_rank=config.experts_per_rank,
             padding_block=token_padding_block,
         )
-        physical_recv_pool_size = worst_case_padded_recv_size if config.max_recv_size_per_rank is None else config.max_recv_size_per_rank
+        pool_capacity_upper_bound = worst_case_padded_recv_size if config.max_recv_size_per_rank is None else config.max_recv_size_per_rank
         logical_route_limit = _logical_route_limit_for_physical_pool(
-            physical_recv_pool_size,
+            pool_capacity_upper_bound,
             raw_route_count=raw_route_count,
             experts_per_rank=config.experts_per_rank,
             padding_block=token_padding_block,
         )
+        physical_recv_pool_size = pool_capacity_upper_bound
         if tuning is None:
             tuning = config.tuning
         return cls(

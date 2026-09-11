@@ -203,10 +203,10 @@ class MoeEp:
     preserve the same dense-routing invariant. Structural tensor, workspace,
     aliasing, and overflow checks remain enabled in both modes.
 
-    ``max_recv_size_per_rank`` prescribes the physical padded receive-pool
-    rows. An explicit value ``P`` must satisfy ``P % 128 == 0``; the backend
-    reverse-calculates a conservative logical route limit whose worst-case
-    per-expert padding is exactly ``P``.
+    ``max_recv_size_per_rank`` is the exact number of physical padded
+    receive-pool rows. An explicit value ``P`` must satisfy ``P % 128 == 0``;
+    the backend derives the corresponding logical route limit without
+    shrinking the requested backing pool.
     """
 
     def __init__(

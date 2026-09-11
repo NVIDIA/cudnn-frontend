@@ -73,7 +73,7 @@ def test_reverse_capacity_preserves_the_prescribed_physical_pool(
 
 
 @pytest.mark.L0
-def test_reverse_capacity_rejects_unrepresentable_physical_pool():
+def test_reverse_capacity_preserves_overprovisioned_physical_pool():
     from cudnn import MoeEp
     from cudnn.moe_ep._megamoe_backend.mxfp8._config import (
         Mxfp8KernelConfig,
@@ -83,8 +83,22 @@ def test_reverse_capacity_rejects_unrepresentable_physical_pool():
         **_forward_config(),
         max_recv_size_per_rank=384,
     ) as op:
-        with pytest.raises(ValueError, match="cannot be represented exactly"):
-            Mxfp8KernelConfig.from_operator_config(op._forward_config)
+        config = Mxfp8KernelConfig.from_operator_config(op._forward_config)
+
+    assert config.physical_recv_pool_size == 384
+    assert config.max_recv_size_per_rank == 257
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("physical_capacity", (127, 129))
+def test_reverse_capacity_rejects_unrepresentable_physical_pool(physical_capacity):
+    from cudnn import MoeEp
+
+    with pytest.raises(ValueError, match=r"P % 128 == 0"):
+        MoeEp(
+            **_forward_config(),
+            max_recv_size_per_rank=physical_capacity,
+        )
 
 
 @pytest.mark.L0
