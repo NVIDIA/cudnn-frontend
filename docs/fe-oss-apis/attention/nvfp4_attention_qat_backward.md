@@ -161,9 +161,10 @@ op.execute(q, k, v, high_precision_o, do, lse, dq, dk, dv, workspace)
 ```
 
 This backend reuses the Triton Q/delta and KV quantizers, then launches a
-two-CTA FROST dV/dS kernel implemented in CuTe DSL and two output-buffer BF16
-batched GEMMs for dQ/dK. The quantizers write their BSHD intermediates directly; the main kernel
-addresses caller-owned BHSD dO/dV natively. All stages honor `current_stream`.
+two-CTA FROST kernel implemented in CuTe DSL that produces dV and dK in-kernel
+and writes BF16 dS to the workspace, followed by one output-buffer BF16 batched
+GEMM for dQ. The quantizers write their BSHD intermediates directly; the main kernel
+addresses caller-owned BHSD dO/dV/dK natively. All stages honor `current_stream`.
 Compilation is plan-time-only; no mutable global configuration is switched
 between plans. The wrapper's bounded cache separates requested backend,
 head-chunk and workspace-limit plans.

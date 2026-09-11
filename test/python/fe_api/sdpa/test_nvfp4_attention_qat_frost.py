@@ -177,7 +177,8 @@ def test_frost_explicit_stream_and_runtime_scale(monkeypatch, backend):
     with torch.cuda.stream(launch):
         reference.execute(q, k, v, o, do, lse, *ref, ref_ws, softmax_scale=scale)
     producer.wait_stream(launch)
-    assert observed_streams == [launch.cuda_stream, launch.cuda_stream]
+    # dK is produced in-kernel; only the dQ GEMM goes through torch.bmm.
+    assert observed_streams == [launch.cuda_stream]
     _close(got, ref)
 
 

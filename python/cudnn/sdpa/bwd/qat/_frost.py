@@ -4,7 +4,8 @@
 
 Version/capability checks in api.py run before importing this module.
 Q/delta and KV preprocessing reuse the public Triton quantizers; dV/dS
-uses CuTe DSL and dQ/dK use explicit output-buffer batched GEMMs.
+uses CuTe DSL (dV and dK accumulate in-kernel); dQ uses one explicit
+output-buffer batched GEMM over the BF16 dS workspace.
 """
 
 from dataclasses import dataclass
@@ -123,8 +124,8 @@ class PreparedBackward:
             stream=stream,
         )
         # Only metadata views, including the BSHD views consumed by TMA.
-        do_view, dv_view = do.permute(0, 2, 1, 3), dv.permute(0, 2, 1, 3)
-        q_heads, k_heads = fake_q[0].permute(1, 0, 2), fake_k[0].permute(1, 0, 2)
+        do_view, dv_view, dk_view = (t.permute(0, 2, 1, 3) for t in (do, dv, dk))
+        k_heads = fake_k[0].permute(1, 0, 2)
         for base in range(0, self.heads, self.head_chunk):
             self.core(
                 fake_q,
@@ -132,6 +133,7 @@ class PreparedBackward:
                 fake_k,
                 fake_v,
                 dv_view,
+                dk_view,
                 ds,
                 lse,
                 delta,
@@ -150,4 +152,3 @@ class PreparedBackward:
             # B=1 is intentional: no flattening of noncompact B/H dimensions
             # and no implicit reshape copies in torch.matmul's batching path.
             torch.bmm(ds[0].transpose(1, 2), k_heads[selected], out=dq[0, selected])
-            torch.bmm(ds[0], q_heads[selected], out=dk[0, selected])
