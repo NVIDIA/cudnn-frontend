@@ -1516,7 +1516,7 @@ def test_fp8_sm100_execute_lse_contract():
         api.execute(lse_tensor=lse, **ex)
     api.execute(**ex)
     torch.cuda.synchronize()
-    o_ref = _ref(q8.float() * dq, q8.float() * dq, q8.float() * dq, scale=api.scale_softmax, is_causal=True)
+    o_ref = _ref(q8, q8, q8, dq, dq, dq, "e4m3", scale=api.scale_softmax, is_causal=True)
     torch.testing.assert_close(o.float(), o_ref, atol=5e-2, rtol=3e-2)
 
 
