@@ -696,7 +696,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_composite_boundaries(has_topk_l
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    s_q, s_kv, topk_width = 4, 129, 1024
+    s_q, s_kv, topk_width = 4, 129, 256
     num_heads, head_dim = 96, 576
     softmax_scale = 1.0 / math.sqrt(head_dim)
     lengths = torch.tensor([0, 1, 65, 129], dtype=torch.int32, device=device)
@@ -1071,7 +1071,7 @@ def test_DSA_sparse_attention_backward_sm100_specialized_masks_invalid_topk_rows
 
     device = torch.device("cuda")
     head_dim, head_dim_v = 576, 512
-    topk_width = 1024 if num_heads == 96 else 256
+    topk_width = 256
     q = torch.full((1, num_heads, head_dim), 8.0, dtype=torch.bfloat16, device=device)
     kv = torch.full((1, head_dim), -8.0, dtype=torch.bfloat16, device=device)
     dout = torch.randn(1, num_heads, head_dim_v, dtype=torch.bfloat16, device=device)
@@ -1171,7 +1171,7 @@ def test_DSA_sparse_attention_backward_sm100_specialized_handles_sink_limits(num
         cases.append((2.4e38, False))
     for sink_value, empty_row in cases:
         attn_sink = torch.full((num_heads,), sink_value, dtype=torch.float32, device=device)
-        topk_width = 1024 if num_heads == 96 else 64
+        topk_width = 64
         topk_idxs = torch.full((1, topk_width), torch.iinfo(torch.int32).max if empty_row else -1, dtype=torch.int32, device=device)
         topk_length = torch.zeros(1, dtype=torch.int32, device=device) if empty_row else None
         if empty_row:
@@ -1805,12 +1805,6 @@ def test_DSA_sparse_attention_backward_fp16_sm100_numerics(head_dim, num_heads):
     attn_sink = torch.linspace(-2.0, 2.0, num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = torch.tensor([16, 32, 48, 64], dtype=torch.int32, device=device)
-    if num_heads == 96:
-        topk_idxs = torch.cat(
-            [topk_idxs, torch.full((s_q, 1024 - topk), -1, dtype=torch.int32, device=device)],
-            dim=1,
-        )
-
     out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
