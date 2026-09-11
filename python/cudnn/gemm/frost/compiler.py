@@ -80,6 +80,7 @@ from .graph_analyzer import (
     GemmBinding,
     analyze_with_binding,
     resolve_variant_pack,
+    swap_ab_binding,
 )
 from .tile_config import DEFAULT_CONFIG, TileConfig, _sm_count
 
@@ -2936,6 +2937,15 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     return t.reshape(shape)
 
 
+def _swap_mn_view(t: object) -> object:
+    """Transpose the logical M/N axes without moving the runtime storage."""
+    if len(t.shape) == 3:
+        return t.permute(0, 2, 1)
+    if len(t.shape) == 2:
+        return t.permute(1, 0)
+    return t
+
+
 def _expected_output_shape(spec, chain: FusionChain, mnk) -> tuple[int, int, int]:
     return expected_shape(_output_rule(spec, chain), int(mnk[0]), int(mnk[1]))
 
@@ -3159,6 +3169,11 @@ class CompiledFusedGemm:
         # split-K slices for the kernel
         needs_workspace = bool(r.workspace_bytes)
         split_k_slices = self.config.split_k_slices
+        swap_ab = self.config.swap_ab
+        packed_scale_slots = frozenset(
+            o.index for o in r.outputs if o.role.startswith("quant_scale_") and self.chain.quants[int(o.role.rsplit("_", 1)[1])].scale_reorder == "F8_128x4"
+        )
+        mn_view_slots = (frozenset(o.index for o in r.outputs) | frozenset(x.index for x in r.aux)) - packed_scale_slots
         if needs_workspace:
             cta_k_elems = _cta_k_elems(self.chain, self.config)
             reduce_elems = _splitk_reduce_elems(self.chain)
@@ -3228,7 +3243,7 @@ class CompiledFusedGemm:
                 ):
                     gave_up["output layout"] += 1
                     return refuse(operands, graph_order)
-                problem += (st[1], st[2], st[0])
+                problem += (st[2], st[1], st[0]) if swap_ab and idx in mn_view_slots else (st[1], st[2], st[0])
             for idx, align in auxs:
                 v = operands[idx]
                 if tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
@@ -3307,7 +3322,14 @@ class CompiledFusedGemm:
             return launchable(
                 tuple(problem),
                 *(v.permute(1, 2, 0) for v in vs),
-                *(operands[i].permute(1, 2, 0) if ref is None else _reshape_aux_to_fake(operands[i], ref) for i, ref in tail),
+                *(
+                    (
+                        ((_swap_mn_view(operands[i]) if swap_ab and i in mn_view_slots else operands[i]).permute(1, 2, 0))
+                        if ref is None
+                        else _reshape_aux_to_fake(_swap_mn_view(operands[i]) if swap_ab else operands[i], ref)
+                    )
+                    for i, ref in tail
+                ),
                 *extra,
                 stream=_as_custream(stream),
             )
@@ -3873,8 +3895,6 @@ def _check_block_quant_supported(
         return
     if chain.has_mainloop_fusion:
         raise NotImplementedError("block_scale_quantize epilogue is not supported with mainloop fusion")
-    if any(spec.quant_idx is not None and spec.major != "n" for spec in chain.output_specs):
-        raise NotImplementedError("block_scale_quantize data outputs must be N-major")
     elem_bytes = DTYPE_BYTES[chain.output_dtype]
     vsize = vec_bytes_epi // elem_bytes
     cols_per_acc_stage = _epi_tile_cols(config)
@@ -4258,12 +4278,16 @@ def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) ->
         want = ".".join(str(v) for v in buffers.CUTEDSL_MIN_VERSION)
         raise NotImplementedError(f"frost_gemm requires nvidia-cutlass-dsl >= {want}; found {version[1]}")
     chain, _binding = analyze_with_binding(graph)
+    if config is None:
+        config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph))
+    if config.swap_ab:
+        from .fusion_ir import swap_ab
+
+        chain = swap_ab(chain)
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
     _check_executable(chain)
-    if config is None:
-        config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph))
     _check_splitk_supported(chain, config)
     if chain.is_multi_gemm and not (chain.has_moe or chain.has_block_scale):
         from .kernel_registry import select_template
@@ -4321,8 +4345,9 @@ def jit_from_cudnn_graph(
 
     `graph` is a ``cudnn.pygraph`` built after ``import cudnn.gemm.frost`` (the
     import installs the op-recording hook). `config` is a PURE-GEOMETRY tile from
-    `tile_config.CATALOG`. Execution strategy: ``cta_group`` ∈ {1, 2} and
-    picks the template (mainloop auto-detected).
+    `tile_config.CATALOG`. ``config.swap_ab`` logically lowers
+    ``C.T = B.T @ A.T`` without changing runtime buffers. Execution strategy:
+    ``cta_group`` ∈ {1, 2} and picks the template (mainloop auto-detected).
 
     Mixed CGA needs no argument and no caller change: where the GPU and the
     template both support it, the launch carries ``config``'s cluster as the
@@ -4331,6 +4356,11 @@ def jit_from_cudnn_graph(
     Everywhere else the launch is the plain fixed cluster it always was.
     """
     chain, binding = analyze_with_binding(graph)
+    if config.swap_ab:
+        from .fusion_ir import swap_ab
+
+        chain = swap_ab(chain)
+        binding = swap_ab_binding(binding)
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)

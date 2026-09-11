@@ -1028,6 +1028,54 @@ def test_dense_block_scale_quant_epilogue() -> None:
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 
 
+@requires_sm100
+@pytest.mark.parametrize("mode", ["mmajor", "swap_ab"])
+@pytest.mark.parametrize("reordered", [False, True])
+@pytest.mark.parametrize("stg", [False, True])
+def test_quantized_output_uses_normal_mmajor_store(mode, reordered, stg) -> None:
+    """Quantized data and scales must survive both M-major store paths and swap."""
+    from dataclasses import replace
+    from cudnn.gemm.frost.compiler import force_stg_epi, jit_from_cudnn_graph
+
+    M, N, K, bs = 128, 256, 128, 32
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B)
+    Q, SF = g.block_scale_quantize(input=C, block_size=bs, axis=-1)
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    Q.set_dim([1, M, N]).set_stride([M * N, 1, M] if mode == "mmajor" else [M * N, N, 1])
+    SF.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    SF.set_dim([1, M, N // bs]).set_stride([M * N // bs, N // bs, 1])
+    if reordered:
+        SF.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+
+    cfg = replace(_resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"), swap_ab=mode == "swap_ab")
+    with force_stg_epi(stg):
+        compiled = jit_from_cudnn_graph(g, config=cfg)
+    assert compiled.chain.out_major == "m"
+    assert bool(compiled.tma_slots) == (not stg)
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q = torch.empty((1, N, M) if mode == "mmajor" else (1, M, N), dtype=torch.float8_e4m3fn, device="cuda")
+    if mode == "mmajor":
+        q = q.transpose(1, 2)
+    sf = torch.empty(1, M, N // bs, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled({A: a, B: b, Q: q, SF: sf})
+    torch.cuda.synchronize()
+    assert not compiled.deferrals
+
+    mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
+    q_ref, sf_ref = _block_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    sf_got = sf.float().flatten()[_f8_row_scale_addr(M, N, bs)].unsqueeze(0) if reordered else sf.float()
+    torch.testing.assert_close(sf_got, sf_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
 def _col_quant_reference(
     x: torch.Tensor,
     block_size: int,

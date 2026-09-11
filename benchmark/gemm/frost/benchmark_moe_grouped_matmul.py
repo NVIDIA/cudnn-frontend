@@ -28,8 +28,10 @@ from cudnn.gemm.frost.fusion_ir import (
 from cudnn.gemm.frost.kernel_registry import candidates as _candidates
 
 from benchmark_utils import (
+    with_workspace,
     add_fto_alignment_arg,
     add_sweep_args,
+    expand_config_variants,
     find_cublas_time,
     fto_alignment,
     group_offsets,
@@ -38,7 +40,7 @@ from benchmark_utils import (
     report_pool,
     resolve_nbuf,
     rotating,
-    select_configs,
+    select_config_variants,
     spec_for,
     time_ms_delayed,
     time_ms_events,
@@ -53,7 +55,7 @@ def _vp_moe(handles, token, weight, fto, output):
 
 def _build_plan(g, cfg, _name):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg)
+    return with_workspace(jit_from_cudnn_graph(g, config=cfg))
 
 
 def _build_spec_map():
@@ -172,7 +174,7 @@ def _cublas_launch(buf, S: int, N: int, K: int, E: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _nsys_worker(shape, configs, warmup, iters, nbuf, fto_align_spec) -> None:
+def _nsys_worker(shape, configs, warmup, iters, nbuf, fto_align_spec, spec_map) -> None:
     G, M, N, K = (int(x) for x in shape.split(","))
     S, E = G * M, G
     wtok, ww, wout = _mkdata(S, N, K, E)  # dedicated warmup buffer
@@ -189,9 +191,9 @@ def _nsys_worker(shape, configs, warmup, iters, nbuf, fto_align_spec) -> None:
     torch.cuda.synchronize()
 
     # 2. each MoE config.
-    config_names = configs or list(_SPEC_MAP)
+    config_names = configs or list(spec_map)
     for name in config_names:
-        spec = spec_for(name, _SPEC_MAP)
+        spec = spec_for(name, spec_map)
         cfg = spec[0] if spec else None
         if cfg is None:
             continue
@@ -224,6 +226,11 @@ def main() -> int:
     add_sweep_args(parser)
     add_fto_alignment_arg(parser)
     args = parser.parse_args()
+    spec_map = expand_config_variants(
+        _SPEC_MAP,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
@@ -238,12 +245,26 @@ def main() -> int:
     nbuf = resolve_nbuf(args.rotate_buffers, per_set)
 
     if args._nsys_worker:
-        configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
-        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf, args.fto_alignment)
+        configs = (
+            select_config_variants(
+                args.configs,
+                spec_map,
+                sweep_swap_ab=args.sweep_swap_ab,
+                sweep_split_k=args.sweep_split_k,
+            )
+            if args.configs
+            else []
+        )
+        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf, args.fto_alignment, spec_map)
         return 0
 
     flops = 2 * S * N * K
-    config_names = select_configs(args.configs, _SPEC_MAP)
+    config_names = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     print(f"\n=== moe_grouped_matmul G={G} M={M} N={N} K={K}  " f"(S={S} tokens, ~{flops / 1e9:.1f} GFLOP) — BF16 ===")
 
@@ -272,7 +293,11 @@ def main() -> int:
             "--fto-alignment",
             str(args.fto_alignment),
         ]
-        if config_names:
+        if args.sweep_swap_ab:
+            inner_args.append("--sweep-swap-ab")
+        if args.sweep_split_k is not None:
+            inner_args += ["--sweep-split-k", str(args.sweep_split_k)]
+        if args.configs:
             inner_args += ["--configs", ",".join(config_names)]
         kern_times = nsys_run_and_parse(__file__, inner_args, tag="bench_moe")
         cublas_hit = find_cublas_time(kern_times)
@@ -284,7 +309,7 @@ def main() -> int:
             cublas_tflops, cublas_ms = float("nan"), float("nan")
             print("  cuBLAS kernel: not detected in nsys output")
         for name in config_names:
-            spec = spec_for(name, _SPEC_MAP)
+            spec = spec_for(name, spec_map)
             cfg = spec[0] if spec else None
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
@@ -323,7 +348,7 @@ def main() -> int:
 
         ctx_dead = False
         for name in config_names:
-            spec = spec_for(name, _SPEC_MAP)
+            spec = spec_for(name, spec_map)
             cfg = spec[0] if spec else None
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")

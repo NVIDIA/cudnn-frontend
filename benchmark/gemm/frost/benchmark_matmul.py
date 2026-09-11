@@ -5,7 +5,10 @@
 
 `--shape` is `B,M,N,K` (B independent same-shape GEMMs; B=1 = plain matmul).
 Timing modes: delayed (default) / nsys / events. `--rotate-buffers` defeats
-hot-L2 inflation on small shapes.
+hot-L2 inflation on small shapes. `--sweep-swap-ab` benchmarks both
+``swap_ab=False`` and ``swap_ab=True`` for every selected geometry.
+`--sweep-split-k N` benchmarks ``split_k_slices=1..N``. When both are
+specified, the two dimensions form a Cartesian product.
 
     python benchmark/gemm/frost/benchmark_matmul.py --shape 1,8192,8192,8192
 """
@@ -25,17 +28,20 @@ from cudnn.gemm.frost.fusion_ir import FusionChain as _FC, MatmulSpec as _MS, Ou
 from cudnn.gemm.frost.kernel_registry import candidates as _candidates
 
 from benchmark_utils import (
+    with_workspace,
     add_sweep_args,
+    expand_config_variants,
     find_cublas_time,
     kernel_match_token,
     nsys_run_and_parse,
     report_pool,
     resolve_nbuf,
     rotating,
-    select_configs,
+    select_config_variants,
     spec_for,
     time_ms_delayed,
     time_ms_events,
+    validate_config_variant_args,
 )
 
 
@@ -58,13 +64,9 @@ def _build_spec_map():
     )
     m = {}
     for t, cfg in _candidates(chain):
-        label = cfg.name
         # A family without the CTA-pair axis (sm120) has no cta_group at all.
-        m[label] = (cfg, getattr(cfg, "cta_group", 1))
+        m[cfg.name] = (cfg, getattr(cfg, "cta_group", 1))
     return m
-
-
-_SPEC_MAP = _build_spec_map()
 
 
 def _vp(handles, a, b, c):
@@ -75,14 +77,7 @@ def _vp(handles, a, b, c):
 
 def _build_plan(g, cfg, _name):
     """JIT-compile the recorded graph with a forced tile config."""
-    compiled = jit_from_cudnn_graph(g, config=cfg)
-    if getattr(compiled, "workspace_bytes", 0):
-        from cudnn.frost.workspace import Workspace
-
-        buf = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
-        ws = Workspace(buf, compiled.workspace_bytes, "benchmark_matmul")
-        return lambda vp, stream=None: compiled(vp, stream=stream, workspace=ws)
-    return compiled
+    return with_workspace(jit_from_cudnn_graph(g, config=cfg))
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +138,7 @@ def _nsys_worker(
     warmup: int,
     iters: int,
     nbuf: int,
+    spec_map: dict,
 ) -> None:
     """Inner mode re-exec'd under nsys: run each config (and cuBLAS) for
     warmup+iters launches, no timing — nsys captures it. Timed iters rotate
@@ -162,9 +158,9 @@ def _nsys_worker(
     torch.cuda.synchronize()
 
     # 2. each GEMM config.
-    config_names = configs or list(_SPEC_MAP)
+    config_names = configs or list(spec_map)
     for name in config_names:
-        spec = spec_for(name, _SPEC_MAP)
+        spec = spec_for(name, spec_map)
         if spec is None:
             continue
         cfg = spec[0]
@@ -196,6 +192,13 @@ def main() -> int:
     )
     add_sweep_args(parser)
     args = parser.parse_args()
+    validate_config_variant_args(parser, args)
+
+    spec_map = expand_config_variants(
+        _build_spec_map(),
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
@@ -208,12 +211,26 @@ def main() -> int:
     nbuf = resolve_nbuf(args.rotate_buffers, _per_set_bytes(B, M, N, K))
 
     if args._nsys_worker:
-        configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
-        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf)
+        configs = (
+            select_config_variants(
+                args.configs,
+                spec_map,
+                sweep_swap_ab=args.sweep_swap_ab,
+                sweep_split_k=args.sweep_split_k,
+            )
+            if args.configs
+            else []
+        )
+        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf, spec_map)
         return 0
 
     flops = 2 * B * M * N * K
-    config_names = select_configs(args.configs, _SPEC_MAP)
+    config_names = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     print(f"\n=== matmul B={B} {M}x{N}x{K}  (~{flops / 1e9:.1f} GFLOP) — BF16 ===")
 
@@ -231,7 +248,11 @@ def main() -> int:
     if args.timing == "nsys":
         print("  [timing: nsys median kernel duration]\n")
         inner_args = ["--shape", args.shape, "--warmup", str(args.warmup), "--iters", str(args.iters), "--rotate-buffers", str(nbuf)]
-        if config_names:
+        if args.sweep_swap_ab:
+            inner_args.append("--sweep-swap-ab")
+        if args.sweep_split_k is not None:
+            inner_args += ["--sweep-split-k", str(args.sweep_split_k)]
+        if args.configs:
             inner_args += ["--configs", ",".join(config_names)]
         kern_times = nsys_run_and_parse(__file__, inner_args, tag="benchmark_matmul")
 
@@ -245,7 +266,7 @@ def main() -> int:
             print("  cuBLAS kernel: not detected in nsys output")
 
         for name in config_names:
-            spec = spec_for(name, _SPEC_MAP)
+            spec = spec_for(name, spec_map)
             cfg = spec[0] if spec else None
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
@@ -290,7 +311,7 @@ def main() -> int:
         # first such error, short-circuit the remaining configs as CTX_DEAD.
         ctx_dead = False
         for name in config_names:
-            spec = spec_for(name, _SPEC_MAP)
+            spec = spec_for(name, spec_map)
             cfg = spec[0] if spec else None
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")

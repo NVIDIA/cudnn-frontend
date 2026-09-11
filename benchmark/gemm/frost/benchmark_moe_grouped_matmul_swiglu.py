@@ -24,14 +24,16 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
 from benchmark_utils import (
+    with_workspace,
     add_fto_alignment_arg,
     add_sweep_args,
+    expand_config_variants,
     fto_alignment,
     group_offsets,
     report_pool,
     resolve_nbuf,
     rotating,
-    select_configs,
+    select_config_variants,
     set_bytes,
     spec_for,
     time_ms,
@@ -40,7 +42,7 @@ from benchmark_utils import (
 
 def _build_plan(g, cfg, cta_group):
     """JIT-compile the graph with a forced tile config → callable kernel."""
-    return jit_from_cudnn_graph(g, config=cfg)
+    return with_workspace(jit_from_cudnn_graph(g, config=cfg))
 
 
 def _vp_moe_mg(handles, gemm_pairs, fto, outs, *aux):
@@ -206,6 +208,11 @@ def main() -> int:
     p.add_argument("--rtol", type=float, default=5e-2)
     p.add_argument("--atol", type=float, default=2e-1)
     args = p.parse_args()
+    spec_map = expand_config_variants(
+        _SPEC_MAP,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
@@ -247,11 +254,16 @@ def main() -> int:
     bl_tflops = flops / (bl_ms * 1e-3) / 1e12
     print(f"  {'unfused 2xcuBLAS batched + pointwise':54s} {bl_tflops:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms   {'1.00×':>8s}")
 
-    config_names = select_configs(args.configs, _SPEC_MAP)
+    config_names = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     best = None
     for label in config_names:
-        spec = spec_for(label, _SPEC_MAP)
+        spec = spec_for(label, spec_map)
         if spec is None:
             print(f"  {label:64s} UNKNOWN (not a sweepable MoE swiglu strategy)")
             continue
