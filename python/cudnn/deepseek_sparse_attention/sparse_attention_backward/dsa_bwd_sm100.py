@@ -2096,7 +2096,7 @@ class FlashAttentionDSABackwardSm100:
             # unbinds S's lifetime from P's publication, nothing more.
             mma_compute_S_pipeline.consumer_release(mma_compute_S_consumer_state)
             mma_compute_S_consumer_state.advance()
-            # S consumer pipeline release already orders the fenced T2R.
+            self.compute_sync_barrier.arrive_and_wait()
 
             # ======= stsm ============
             tRS_rP.store(smem_store_p.retile(tTR_rS_f16).load())
@@ -2139,6 +2139,7 @@ class FlashAttentionDSABackwardSm100:
             tTR_rdP_f16 = self.quantize(tTR_rdP, 4, scale_softmax)
 
             cute.arch.fence_view_async_tmem_load()
+            self.compute_sync_barrier.arrive_and_wait()
 
             mma_compute_dP_pipeline.consumer_release(mma_compute_dP_consumer_state)
             mma_compute_dP_consumer_state.advance()
@@ -2327,8 +2328,7 @@ class FlashAttentionDSABackwardSm100:
                 self.reduce_dKV_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
                 self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
 
-            # Advance to dKV4 (D576) or dKV2/3 (D512). In the D576 path this
-            # also lets MMA issue the disjoint tail while REDG is in flight.
+            # Advance to dKV4 (D576) or dKV2/3 (D512).
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
             mma_reduce_dKV_consumer_state.advance()
 
@@ -2337,7 +2337,7 @@ class FlashAttentionDSABackwardSm100:
             if cutlass.const_expr(not self.same_hdim_kv):
                 mma_reduce_dKV_pipeline.consumer_wait(mma_reduce_dKV_consumer_state)
 
-                # T2R dKV4, then signal MMA that TMEM is free for dKV2/dKV3
+                # T2R dKV4, then signal MMA that the score region is free for the next S.
                 rdKV4 = self.t2r_dKV_64(tdKVtdKV4)
                 cute.arch.fence_view_async_tmem_load()
                 self.t2r_dKV4_done_barrier.arrive_and_wait()
@@ -2347,8 +2347,7 @@ class FlashAttentionDSABackwardSm100:
 
                 # The 128-wide and 64-wide T2R layouts share the same KV-row
                 # coordinate (N=block_tile), so reuse the preloaded indices.
-                # Reduce dKV0 before the short tail to end one full fragment's
-                # live range early without delaying the tail behind dKV1.
+                # Issue dKV0, dKV1, then the short tail for each KV row.
                 self.reduce_dKV_0_tail_1_from_reg(mdKV_acc, rdKV0, rdKV4, rdKV1, rTopkIdx)
 
             mma_reduce_dKV_pipeline.consumer_wait(mma_reduce_dKV_consumer_state)
@@ -2497,16 +2496,13 @@ class FlashAttentionDSABackwardSm100:
         tTR_rdKV1: cute.Tensor,
         rTopkIdx: cute.Tensor,
     ):
-        """Reduce 0/tail/1, preparing two KV rows before issuing REDG."""
+        """Reduce resident dKV0/dKV1/tail fragments, preparing one KV row before REDG."""
         tidx, _, _ = cute.arch.thread_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         dp_idx = tidx_in_wg % 128
 
-        for pair in cutlass.range_constexpr(4):
-            i0 = pair * 2
-            i1 = i0 + 1
+        for i0 in cutlass.range_constexpr(8):
             coord0 = i0 * 2 - i0 % 2
-            coord1 = i1 * 2 - i1 % 2
 
             frg00 = cute.make_rmem_tensor((4,), self.acc_dtype)
             frg00[0] = tTR_rdKV0[coord0]
@@ -2522,34 +2518,14 @@ class FlashAttentionDSABackwardSm100:
             frg10[2] = tTR_rdKV1[coord0 + 16]
             frg10[3] = tTR_rdKV1[coord0 + 18]
 
-            frg01 = cute.make_rmem_tensor((4,), self.acc_dtype)
-            frg01[0] = tTR_rdKV0[coord1]
-            frg01[1] = tTR_rdKV0[coord1 + 2]
-            frg01[2] = tTR_rdKV0[coord1 + 16]
-            frg01[3] = tTR_rdKV0[coord1 + 18]
-            frg41 = cute.make_rmem_tensor((2,), self.acc_dtype)
-            frg41[0] = tTR_rdKV4[coord1]
-            frg41[1] = tTR_rdKV4[coord1 + 2]
-            frg11 = cute.make_rmem_tensor((4,), self.acc_dtype)
-            frg11[0] = tTR_rdKV1[coord1]
-            frg11[1] = tTR_rdKV1[coord1 + 2]
-            frg11[2] = tTR_rdKV1[coord1 + 16]
-            frg11[3] = tTR_rdKV1[coord1 + 18]
-
             lane_offset4 = (dp_idx // 4) * 4
             lane_offset2 = (dp_idx // 4) * 2
             topk0 = rTopkIdx[i0]
-            topk1 = rTopkIdx[i1]
             if topk0 >= 0:
                 row0 = dKV_acc.iterator + Int64(topk0) * Int64(self.head_dim)
                 cute.arch.atomic_add((row0 + lane_offset4).llvm_ptr, frg00.load())
                 cute.arch.atomic_add((row0 + 128 + lane_offset4).llvm_ptr, frg10.load())
                 cute.arch.atomic_add((row0 + self.head_dim_main + lane_offset2).llvm_ptr, frg40.load())
-            if topk1 >= 0:
-                row1 = dKV_acc.iterator + Int64(topk1) * Int64(self.head_dim)
-                cute.arch.atomic_add((row1 + lane_offset4).llvm_ptr, frg01.load())
-                cute.arch.atomic_add((row1 + 128 + lane_offset4).llvm_ptr, frg11.load())
-                cute.arch.atomic_add((row1 + self.head_dim_main + lane_offset2).llvm_ptr, frg41.load())
 
     @cute.jit
     def t2r_dKV_64(self, tdKVtdKV: cute.Tensor):
