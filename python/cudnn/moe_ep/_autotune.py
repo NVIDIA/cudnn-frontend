@@ -165,7 +165,7 @@ def allocate_training_outputs(
     device: torch.device,
     symmetric_buffers: Mapping[str, torch.Tensor],
 ) -> tuple[MoeEpTrainingForwardOutputs, MoeEpTrainingBackwardOutputs]:
-    """Bind symmetric outputs and allocate the remaining one-lane contracts."""
+    """Bind symmetric outputs and allocate the remaining training contracts."""
 
     def allocate(name: str) -> torch.Tensor:
         shape, stride, dtype, alignment = requirements[name]

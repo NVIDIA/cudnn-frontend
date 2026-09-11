@@ -352,12 +352,11 @@ def test_autotune_api_transactions(monkeypatch):
             def public_requirements(self):
                 return {name: None for name in requirement_names}
 
-            def public_symmetric_buffers(self, lane):
-                assert lane == 0
+            def public_symmetric_buffers(self):
                 return symmetric_buffers
 
-            def views(self, *, lane, token_count):
-                return lane, token_count
+            def views(self, *, token_count):
+                return token_count
 
         class TrainingBackend:
             def __init__(self, config):
@@ -366,10 +365,8 @@ def test_autotune_api_transactions(monkeypatch):
             def prepare_training(
                 self,
                 *,
-                lane_count,
                 native_weight_storage_mode="contiguous",
             ):
-                assert lane_count == 1
                 assert native_weight_storage_mode == "contiguous"
                 return TrainingState()
 
@@ -592,15 +589,13 @@ def test_autotune_sm107_inference_training_and_graph():
             timed_iters=2,
         )
         _print_candidate_timings("training", result)
-        requirements = op.prepare_training(lane_count=1, device=device)
-        lane = op.training_lanes[0]
+        requirements = op.prepare_training(device=device)
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
-            op.training_symmetric_buffers(lane),
+            op.training_symmetric_buffers(),
         )
         actual_y = op.training_forward(
-            lane,
             training_args[0],
             training_args[3],
             training_args[4],
@@ -608,7 +603,6 @@ def test_autotune_sm107_inference_training_and_graph():
             out=forward_out,
         )
         actual_dx, actual_dprob, _ = op.training_backward(
-            lane,
             grad_output,
             training_args[3],
             training_args[4],
@@ -693,7 +687,6 @@ def test_autotune_training_discrete_mode_binds_prepare_specialization():
         )
         assert result.mode == "training"
         op.prepare_training(
-            lane_count=1,
             device=device,
             native_weight_storage_mode="discrete",
         )

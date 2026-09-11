@@ -347,11 +347,9 @@ def _run_backward_reference_case(
     )
     try:
         requirements = op.prepare_training(
-            lane_count=1,
             device=device,
             native_weight_storage_mode=native_weight_storage_mode,
         )
-        lane = op.training_lanes[0]
         forward_staging, backward_staging = _allocate_training_weight_staging(weights)
         native_forward = op.pack_forward_weights(
             weights[0],
@@ -372,11 +370,10 @@ def _run_backward_reference_case(
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
-            op.training_symmetric_buffers(lane),
+            op.training_symmetric_buffers(),
         )
         _poison_training_outputs_for_test(forward_out, backward_out)
         actual_y = op.training_forward(
-            lane,
             args[0],
             args[3],
             args[4],
@@ -384,7 +381,6 @@ def _run_backward_reference_case(
             out=forward_out,
         )
         actual_dx, actual_dprob, actual_wgrads = op.training_backward(
-            lane,
             grad_output,
             args[3],
             args[4],

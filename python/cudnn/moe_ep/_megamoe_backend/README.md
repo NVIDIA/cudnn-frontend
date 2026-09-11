@@ -25,7 +25,7 @@ only:
 
 - prepared forward/backward kernels and compile caches;
 - NVSHMEM/runtime handles;
-- one local and symmetric scratch slab per execution lane;
+- one local and symmetric scratch slab for the instance;
 - private fixed-capacity transport and routing scratch used only during a call.
 
 It does not own or retain caller weights, output bundles, saved forward state,
@@ -64,9 +64,9 @@ Caller outputs are borrowed for one launch:
   kernels;
 - all forward and backward WGrad payloads, scales, and route metadata are
   required after `prepare_training()` and passed directly to the kernels;
-- combine output and dprob first land in private symmetric buffers, then copy
-  to caller buffers because remote ranks address the symmetric plane;
-- primary forward/backward outputs are required caller-owned destinations.
+- primary forward output, grad-activation, and dprob are stable views of the
+  instance-owned symmetric storage because remote ranks address that plane;
+- callers bind those exposed views into the required output bundles.
 
 Standalone top-k reduction uses persistent pre-reduction data and scale
 planes without clearing them between launches. Dense, non-overflow routing
@@ -85,9 +85,13 @@ Each phase keeps overflow state private and applies the configured policy
 before returning. EP2+ performs the scalar MAX needed for a rank-consistent
 decision. There is no public `finalize_overflow`.
 
-One lane is exclusive to one active stream. Every EP rank must submit
-distributed forward/backward launches in identical order. Distinct lanes do
-not make unordered collective-kernel overlap valid.
+One `MoeEp` instance supports only sequential work on one CUDA stream. The
+implementation does not bind or validate that stream, and stable symmetric
+addresses do not retain results across calls. A later call may overwrite
+earlier output, grad-activation, dprob, routing, and finalizer contents.
+Applications needing parallel resource isolation use multiple instances and
+must still submit distributed forward/backward launches in the same instance
+order with the required caller-owned CUDA-event dependencies on every EP rank.
 
 ## CUDA Graph
 
@@ -97,4 +101,6 @@ caller-owned. Every input, output, saved-state, native weight, and staging
 address referenced by a graph remains stable until that graph executable is
 destroyed. Routing values remain dense and valid on every replay; replay adds
 no value-validation work. Eager calls may change addresses between
-invocations.
+invocations. Multiple graphs for one instance must be captured sequentially
+and replayed sequentially on the same stream; they share and may overwrite the
+same symmetric results.

@@ -32,7 +32,6 @@ from ._types import (
     BlockScaledTensor,
     MoeEpBackwardWeightStaging,
     MoeEpBackwardWeights,
-    MoeEpExecutionLane,
     MoeEpForwardWeightStaging,
     MoeEpForwardWeights,
     MoeEpNativeBackwardWeights,
@@ -186,7 +185,7 @@ class MoeEp:
     ``__call__`` is the inference-only forward surface. Training uses
     :meth:`prepare_training`, :meth:`training_forward`, and
     :meth:`training_backward`. Caller-owned output bundles carry all explicit
-    cross-phase state; the operator retains only private runtime and lane
+    cross-phase state; the operator retains only private runtime and instance
     scratch.
 
     The backend is created lazily on the first supported forward call. Valid
@@ -359,9 +358,7 @@ class MoeEp:
         self._forward_backend_device = None
         self._validated_topk_idx = None
         self._validated_topk_version = None
-        self._operator_token = object()
         self._training_state = None
-        self._training_lanes: tuple[MoeEpExecutionLane, ...] = ()
         self._training_requirements: (
             Mapping[
                 str,
@@ -802,7 +799,7 @@ class MoeEp:
     ) -> MoeEpAutotuneResult:
         """Sweep complete training forward+backward latency and apply the winner.
 
-        This collective API uses private one-lane temporary resources. It must
+        This collective API uses private single-instance temporary resources. It must
         run before :meth:`prepare_training` and accepts kernel-native weights
         so packing allocation and source-layout conversion are not timed.
         """
@@ -946,11 +943,10 @@ class MoeEp:
                     phase = "training preparation"
                     with torch.cuda.device(device):
                         state = backend.prepare_training(
-                            lane_count=1,
                             native_weight_storage_mode=weight_storage_mode.value,
                         )
                         requirements = state.public_requirements()
-                        symmetric_buffers = state.public_symmetric_buffers(0)
+                        symmetric_buffers = state.public_symmetric_buffers()
                         forward_out, backward_out = allocate_training_outputs(
                             requirements,
                             device,
@@ -1002,7 +998,7 @@ class MoeEp:
                             },
                             device=device,
                         )
-                        execution = state.views(lane=0, token_count=token_count)
+                        execution = state.views(token_count=token_count)
 
                         def run_training_pair():
                             launch_training_forward(
@@ -1118,27 +1114,22 @@ class MoeEp:
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
 
-    @property
-    def training_lanes(self) -> tuple[MoeEpExecutionLane, ...]:
-        """Operator-bound lanes created by :meth:`prepare_training`."""
-
-        return self._training_lanes
-
     def training_symmetric_buffers(
         self,
-        lane: MoeEpExecutionLane,
     ) -> Mapping[str, torch.Tensor]:
-        """Return one lane's symmetric MXFP8 input and final-output buffers."""
+        """Return stable instance-owned symmetric input/output buffers.
+
+        Later training calls on this instance may overwrite their contents.
+        """
 
         with self._lifecycle_lock:
-            self._require_training_lane(lane)
+            self._require_training_prepared()
             assert self._training_state is not None
-            return self._training_state.public_symmetric_buffers(lane.index)
+            return self._training_state.public_symmetric_buffers()
 
     def prepare_training(
         self,
         *,
-        lane_count: int = 1,
         device: torch.device | str | int | None = None,
         native_weight_storage_mode: (
             MoeEpNativeWeightStorageMode | str
@@ -1150,8 +1141,11 @@ class MoeEp:
         """Collectively prepare private training runtime and return contracts.
 
         ``device`` defaults to the current CUDA device. No weights are retained.
-        Per-lane symmetric input and final-output buffers are available through
+        Stable symmetric input and final-output buffers are available through
         :meth:`training_symmetric_buffers`.
+
+        All training work for this instance must execute sequentially on one
+        CUDA stream. This contract is documented but not checked at runtime.
         """
 
         with self._lifecycle_lock:
@@ -1159,8 +1153,6 @@ class MoeEp:
                 raise RuntimeError("MoeEp is closed")
             if self._poisoned:
                 raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
-            if isinstance(lane_count, bool) or not isinstance(lane_count, int) or lane_count <= 0:
-                raise ValueError(f"lane_count must be a positive integer, got {lane_count!r}")
             if self._training_state is not None:
                 raise RuntimeError("MoeEp training is already prepared")
             if self._fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
@@ -1207,26 +1199,19 @@ class MoeEp:
                 self._forward_backend_device = resolved_device
             with torch.cuda.device(resolved_device):
                 state = self._forward_backend.prepare_training(
-                    lane_count=lane_count,
                     native_weight_storage_mode=weight_storage_mode.value,
                 )
             self._training_state = state
-            self._training_lanes = tuple(MoeEpExecutionLane(index, self._operator_token) for index in range(lane_count))
             self._training_requirements = state.public_requirements()
             return self._training_requirements
 
-    def _require_training_lane(
-        self,
-        lane: MoeEpExecutionLane,
-    ) -> None:
+    def _require_training_prepared(self) -> None:
         if self._closed:
             raise RuntimeError("MoeEp is closed")
         if self._poisoned:
             raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
         if self._training_state is None or self._training_requirements is None:
             raise RuntimeError("prepare_training() must be called first")
-        if not isinstance(lane, MoeEpExecutionLane) or lane._operator_token is not self._operator_token or lane not in self._training_lanes:
-            raise ValueError("execution lane does not belong to this MoeEp")
 
     def _training_requirement_subset(
         self,
@@ -1271,7 +1256,6 @@ class MoeEp:
 
     def training_forward(
         self,
-        lane: MoeEpExecutionLane,
         activation: MoeTensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -1279,10 +1263,10 @@ class MoeEp:
         weights: MoeEpNativeForwardWeights | MoeEpNativeDiscreteForwardWeights,
         out: MoeEpTrainingForwardOutputs,
     ) -> torch.Tensor:
-        """Run forward into caller-owned prepared-training outputs."""
+        """Run forward sequentially on this instance's training CUDA stream."""
 
         with self._lifecycle_lock:
-            self._require_training_lane(lane)
+            self._require_training_prepared()
             assert self._training_state is not None
             assert self._training_requirements is not None
             assert self._forward_backend_device is not None
@@ -1341,7 +1325,6 @@ class MoeEp:
 
             with torch.cuda.device(self._forward_backend_device):
                 execution = self._training_state.views(
-                    lane=lane.index,
                     token_count=token_count,
                 )
                 return launch_training_forward(
@@ -1356,7 +1339,6 @@ class MoeEp:
 
     def training_backward(
         self,
-        lane: MoeEpExecutionLane,
         grad_output: MoeTensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -1373,10 +1355,10 @@ class MoeEp:
         torch.Tensor,
         MoeEpTrainingWgradOperands,
     ]:
-        """Run backward into caller-owned outputs using explicit forward state."""
+        """Run backward sequentially using explicit caller-owned forward state."""
 
         with self._lifecycle_lock:
-            self._require_training_lane(lane)
+            self._require_training_prepared()
             assert self._training_state is not None
             assert self._forward_backend_device is not None
             if out is None:
@@ -1465,7 +1447,6 @@ class MoeEp:
 
             with torch.cuda.device(self._forward_backend_device):
                 execution = self._training_state.views(
-                    lane=lane.index,
                     token_count=token_count,
                 )
                 return launch_training_backward(
@@ -1499,7 +1480,6 @@ class MoeEp:
             self._validated_topk_version = None
             self._validated_discrete_pointer_tables.clear()
             self._training_state = None
-            self._training_lanes = ()
             self._training_requirements = None
             self._closed = True
 
@@ -1540,7 +1520,6 @@ __all__ = [
     "MoeEpAutotuneResult",
     "MoeEpBackwardWeightStaging",
     "MoeEpBackwardWeights",
-    "MoeEpExecutionLane",
     "MoeEpForwardWeightStaging",
     "MoeEpForwardWeights",
     "MoeEpNativeBackwardWeights",

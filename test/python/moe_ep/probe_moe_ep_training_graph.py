@@ -30,11 +30,9 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--diagnostic-replays", type=int, default=2)
     parser.add_argument("--burst-replays", type=int, default=100)
-    parser.add_argument("--multistream-replays", type=int, default=10)
     parser.add_argument("--max-recv-size-per-rank", type=int, default=128)
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--timeout-seconds", type=int, default=600)
-    parser.add_argument("--skip-multistream", action="store_true")
     parser.add_argument("--expect-overflow-assert", action="store_true")
     return parser.parse_args()
 
@@ -58,19 +56,20 @@ def _token_prefix(value, token_count: int):
 
 def _capture_training_graph(
     op: MoeEp,
-    lane,
     args,
     grad_output,
     native_forward,
     native_backward,
     forward_out,
     backward_out,
+    stream: torch.cuda.Stream,
 ) -> torch.cuda.CUDAGraph:
-    _runtime_debug("probe.capture.begin", lane=lane.index)
+    if torch.cuda.current_stream() != stream:
+        raise RuntimeError("training graph capture must remain on the execution stream")
+    _runtime_debug("probe.capture.begin")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         op.training_forward(
-            lane,
             args[0],
             args[3],
             args[4],
@@ -78,7 +77,6 @@ def _capture_training_graph(
             out=forward_out,
         )
         op.training_backward(
-            lane,
             grad_output,
             args[3],
             args[4],
@@ -90,29 +88,27 @@ def _capture_training_graph(
             expert_offsets=forward_out.expert_offsets,
             out=backward_out,
         )
-    _runtime_debug("probe.capture.end", lane=lane.index)
+    _runtime_debug("probe.capture.end")
     return graph
 
 
 def _capture_forward_graph(
     op: MoeEp,
-    lane,
     args,
     native_forward,
     forward_out,
 ) -> torch.cuda.CUDAGraph:
-    _runtime_debug("probe.error.capture.begin", lane=lane.index)
+    _runtime_debug("probe.error.capture.begin")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         op.training_forward(
-            lane,
             args[0],
             args[3],
             args[4],
             weights=native_forward,
             out=forward_out,
         )
-    _runtime_debug("probe.error.capture.end", lane=lane.index)
+    _runtime_debug("probe.error.capture.end")
     return graph
 
 
@@ -121,13 +117,11 @@ def _prepare_case(
     device: torch.device,
     rank: int,
     world_size: int,
-    lane_count: int,
     max_recv_size_per_rank: int,
     drop_on_overflow: bool,
 ):
     _runtime_debug(
         "probe.prepare.inputs.begin",
-        lane_count=lane_count,
         physical_capacity=max_recv_size_per_rank,
         drop_on_overflow=drop_on_overflow,
     )
@@ -157,7 +151,7 @@ def _prepare_case(
     )
     _runtime_debug("probe.operator.construct.end")
     _runtime_debug("probe.prepare_training.begin")
-    requirements = op.prepare_training(lane_count=lane_count, device=device)
+    requirements = op.prepare_training(device=device)
     _runtime_debug("probe.prepare_training.end")
     _runtime_debug("probe.pack_weights.begin")
     forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
@@ -171,13 +165,10 @@ def _prepare_case(
     )
     _runtime_debug("probe.pack_weights.end")
     _runtime_debug("probe.allocate_outputs.begin")
-    output_pairs = tuple(
-        _allocate_stateless_training_outputs(
-            requirements,
-            device,
-            op.training_symmetric_buffers(lane),
-        )
-        for lane in op.training_lanes
+    output_pair = _allocate_stateless_training_outputs(
+        requirements,
+        device,
+        op.training_symmetric_buffers(),
     )
     _runtime_debug("probe.allocate_outputs.end")
     return (
@@ -186,7 +177,7 @@ def _prepare_case(
         grad_output,
         native_forward,
         native_backward,
-        output_pairs,
+        output_pair,
     )
 
 
@@ -232,26 +223,23 @@ def _run_error_mode_assert_probe(
         device=device,
         rank=rank,
         world_size=world_size,
-        lane_count=1,
         max_recv_size_per_rank=args.max_recv_size_per_rank,
         drop_on_overflow=False,
     )
-    op, inputs, _, native_forward, _, output_pairs = case
-    lane = op.training_lanes[0]
-    forward_out = output_pairs[0][0]
+    op, inputs, _, native_forward, _, output_pair = case
+    forward_out = output_pair[0]
 
     try:
         _require_all_ranks_to_overflow(op, inputs[3], world_size)
-        _runtime_debug("probe.error.warm.forward.begin", lane=lane.index)
+        _runtime_debug("probe.error.warm.forward.begin")
         op.training_forward(
-            lane,
             _token_prefix(inputs[0], 0),
             inputs[3][:0],
             inputs[4][:0],
             weights=native_forward,
             out=forward_out,
         )
-        _runtime_debug("probe.error.warm.forward.end", lane=lane.index)
+        _runtime_debug("probe.error.warm.forward.end")
         _runtime_debug("probe.error.warm.synchronize.begin")
         torch.cuda.synchronize(device)
         _runtime_debug("probe.error.warm.synchronize.end")
@@ -263,7 +251,6 @@ def _run_error_mode_assert_probe(
     try:
         graph = _capture_forward_graph(
             op,
-            lane,
             inputs,
             native_forward,
             forward_out,
@@ -308,67 +295,59 @@ def _run_error_mode_assert_probe(
 
 
 def _run_cycle(args: argparse.Namespace, *, device: torch.device, rank: int, world_size: int, cycle: int) -> None:
-    lane_count = 1 if args.skip_multistream else 2
-    _runtime_debug("probe.cycle.begin", cycle=cycle, lane_count=lane_count)
+    _runtime_debug("probe.cycle.begin", cycle=cycle)
     case = _prepare_case(
         device=device,
         rank=rank,
         world_size=world_size,
-        lane_count=lane_count,
         max_recv_size_per_rank=args.max_recv_size_per_rank,
         drop_on_overflow=True,
     )
-    op, inputs, grad_output, native_forward, native_backward, output_pairs = case
+    op, inputs, grad_output, native_forward, native_backward, output_pair = case
+    forward_out, backward_out = output_pair
     try:
-        # Warm each lane and every kernel specialization before capture.
-        for lane, (forward_out, backward_out) in zip(
-            op.training_lanes,
-            output_pairs,
-        ):
-            _runtime_debug("probe.warm.forward.begin", cycle=cycle, lane=lane.index)
-            op.training_forward(
-                lane,
-                inputs[0],
-                inputs[3],
-                inputs[4],
-                weights=native_forward,
-                out=forward_out,
-            )
-            _runtime_debug("probe.warm.forward.end", cycle=cycle, lane=lane.index)
-            _runtime_debug("probe.warm.backward.begin", cycle=cycle, lane=lane.index)
-            op.training_backward(
-                lane,
-                grad_output,
-                inputs[3],
-                inputs[4],
-                weights=native_backward,
-                fc1_preact=forward_out.fc1_preact,
-                fc1_a=forward_out.fc1_a,
-                fc1_sfa=forward_out.fc1_sfa,
-                valid_route_counts=forward_out.valid_route_counts,
-                expert_offsets=forward_out.expert_offsets,
-                out=backward_out,
-            )
-            _runtime_debug("probe.warm.backward.end", cycle=cycle, lane=lane.index)
+        execution_stream = torch.cuda.current_stream(device)
+        _runtime_debug("probe.warm.forward.begin", cycle=cycle)
+        op.training_forward(
+            inputs[0],
+            inputs[3],
+            inputs[4],
+            weights=native_forward,
+            out=forward_out,
+        )
+        _runtime_debug("probe.warm.forward.end", cycle=cycle)
+        _runtime_debug("probe.warm.backward.begin", cycle=cycle)
+        op.training_backward(
+            grad_output,
+            inputs[3],
+            inputs[4],
+            weights=native_backward,
+            fc1_preact=forward_out.fc1_preact,
+            fc1_a=forward_out.fc1_a,
+            fc1_sfa=forward_out.fc1_sfa,
+            valid_route_counts=forward_out.valid_route_counts,
+            expert_offsets=forward_out.expert_offsets,
+            out=backward_out,
+        )
+        _runtime_debug("probe.warm.backward.end", cycle=cycle)
         _runtime_debug("probe.warm.synchronize.begin", cycle=cycle)
-        torch.cuda.synchronize(device)
+        execution_stream.synchronize()
         _runtime_debug("probe.warm.synchronize.end", cycle=cycle)
 
+        # Capture two graph executables over the same fixed instance resources.
+        # Both capture and replay stay on one stream and execute sequentially.
         graphs = tuple(
             _capture_training_graph(
                 op,
-                lane,
                 inputs,
                 grad_output,
                 native_forward,
                 native_backward,
                 forward_out,
                 backward_out,
+                execution_stream,
             )
-            for lane, (forward_out, backward_out) in zip(
-                op.training_lanes,
-                output_pairs,
-            )
+            for _ in range(2)
         )
 
         try:
@@ -380,27 +359,12 @@ def _run_cycle(args: argparse.Namespace, *, device: torch.device, rank: int, wor
             )
             for replay in range(replay_count):
                 graph_index = replay % len(graphs)
+                if torch.cuda.current_stream(device) != execution_stream:
+                    raise RuntimeError("training graph replay must remain on its capture stream")
                 graphs[graph_index].replay()
             _runtime_debug("probe.replay.enqueue.end", cycle=cycle)
-            if lane_count > 1:
-                _runtime_debug(
-                    "probe.multistream.begin",
-                    cycle=cycle,
-                    replay_count=args.multistream_replays,
-                )
-                current_stream = torch.cuda.current_stream(device)
-                streams = tuple(torch.cuda.Stream(device=device) for _ in range(lane_count))
-                for stream in streams:
-                    stream.wait_stream(current_stream)
-                for _ in range(args.multistream_replays):
-                    for stream, graph in zip(streams, graphs):
-                        with torch.cuda.stream(stream):
-                            graph.replay()
-                for stream in streams:
-                    stream.synchronize()
-                _runtime_debug("probe.multistream.end", cycle=cycle)
             _runtime_debug("probe.replay.synchronize.begin", cycle=cycle)
-            torch.cuda.synchronize(device)
+            execution_stream.synchronize()
             _runtime_debug("probe.replay.synchronize.end", cycle=cycle)
         except Exception as error:
             _runtime_debug(
@@ -422,7 +386,6 @@ def main() -> None:
     for name in (
         "diagnostic_replays",
         "burst_replays",
-        "multistream_replays",
         "max_recv_size_per_rank",
         "cycles",
         "timeout_seconds",

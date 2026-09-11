@@ -268,19 +268,18 @@ def test_stateless_training_multinode_matches_independent_reference(
 
 
 @pytest.mark.parametrize(
-    ("rank_zero_lane_count", "other_lane_count"),
+    "rank_zero_schema_delta",
     [
         pytest.param(
-            2,
             1,
             id="backward-ep8-world8-abi-mismatch",
         ),
     ],
 )
-def test_training_prepare_multinode_rejects_rank_abi_mismatch(
+def test_training_prepare_multinode_rejects_rank_schema_mismatch(
     torchrun_world,
-    rank_zero_lane_count,
-    other_lane_count,
+    monkeypatch,
+    rank_zero_schema_delta,
 ):
     world = torchrun_world
     if world.world_size != 8 or world.local_world_size != 4:
@@ -292,6 +291,26 @@ def test_training_prepare_multinode_rejects_rank_abi_mismatch(
         )
 
     from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend.mxfp8 import (
+        _training_resources as training_resources,
+    )
+
+    build_facts = training_resources._build_training_abi_facts
+
+    def build_rank_divergent_facts(*args, **kwargs):
+        facts = build_facts(*args, **kwargs)
+        if world.rank == 0:
+            facts = {
+                **facts,
+                "schema_version": int(facts["schema_version"]) + rank_zero_schema_delta,
+            }
+        return facts
+
+    monkeypatch.setattr(
+        training_resources,
+        "_build_training_abi_facts",
+        build_rank_divergent_facts,
+    )
 
     op = MoeEp(
         num_experts=16,
@@ -307,12 +326,8 @@ def test_training_prepare_multinode_rejects_rank_abi_mismatch(
     )
     caught_error = None
     try:
-        lane_count = rank_zero_lane_count if world.rank == 0 else other_lane_count
         try:
-            op.prepare_training(
-                lane_count=lane_count,
-                device=world.device,
-            )
+            op.prepare_training(device=world.device)
         except Exception as error:
             caught_error = error
 

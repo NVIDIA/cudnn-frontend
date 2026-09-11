@@ -11,7 +11,7 @@ surfaces:
 - `prepare_training`, `training_forward`, and `training_backward` for training.
 
 Training is stateless with respect to caller tensors. The operator retains
-compiled kernels, runtime state, and per-lane NVSHMEM storage, but it does not
+compiled kernels, runtime state, and one instance-owned NVSHMEM workspace, but it does not
 retain weights, saved forward state, or fallback weight staging. The symmetric
 input and final-output views it does own are handed to the caller explicitly
 by `training_symmetric_buffers`.
@@ -220,17 +220,15 @@ sequences:
 
 ### Stateless training preparation
 
-Preparation allocates only private execution lanes. It is collective over
+Preparation allocates one set of private instance resources. It is collective over
 `ep_group` and must run outside CUDA Graph capture:
 
 ```python
 requirements = op.prepare_training(
-    lane_count=1,
     device=None,  # current CUDA device; pass an explicit device for multi-GPU hosts
     native_weight_storage_mode="contiguous",  # Or "discrete"
 )
-lane = op.training_lanes[0]
-symmetric = op.training_symmetric_buffers(lane)
+symmetric = op.training_symmetric_buffers()
 ```
 
 `prepare_training` does not accept or bind weights. It returns a plain mapping
@@ -244,17 +242,16 @@ The requirements mapping contains `output`, `fc1_preact`, `fc1_a`, `fc1_sfa`,
 `valid_route_counts`, `expert_offsets`, `grad_activation`, `dprob`, `fc1_b`,
 `fc1_sfb`, `fc2_a`, `fc2_sfa`, `fc2_b`, and `fc2_sfb`.
 
-Buffers come from two places. `training_symmetric_buffers(lane)` returns the
+Buffers come from two places. `training_symmetric_buffers()` returns the
 cuDNN-allocated `forward_input`, `forward_input_scale`, `backward_input`,
 `backward_input_scale`, `output`, `grad_activation`, and `dprob` tensors for
-that lane; quantize directly into the input pairs and bind the returned output
+the instance; quantize directly into the input pairs and bind the returned output
 tensors in the public output bundles. The caller allocates the remaining
 entries of the requirements mapping. cuDNN validates exact shape, stride,
 dtype, alignment, device, and non-aliasing before launch.
 
 `device=None` binds the current CUDA device. An explicit CUDA device takes
-precedence. Every later training tensor must use the bound device. Each entry
-in `op.training_lanes` is a `MoeEpExecutionLane`.
+precedence. Every later training tensor must use the bound device.
 
 ### Native weight ABI
 
@@ -392,7 +389,6 @@ same mode.
 from cudnn import MoeEpTrainingForwardOutputs
 
 y = op.training_forward(
-    lane,
     activation,
     topk_idx,
     topk_weights,
@@ -410,10 +406,10 @@ y = op.training_forward(
 
 `activation` may be contiguous BF16/FP32 or an axis-1 MXFP8
 `BlockScaledTensor`. To avoid input staging entirely, quantize directly into
-the lane's `forward_input` and `forward_input_scale` views and build the MXFP8
+the instance's `forward_input` and `forward_input_scale` views and build the MXFP8
 input from `forward_input[:T]` and
 `forward_input_scale[:T, :ceil_div(hidden_size, 32)]`. That logical scale view
-has unit column stride and may keep the lane buffer's padded row stride;
+has unit column stride and may keep the instance buffer's padded row stride;
 training accepts it without copying. Routing metadata is still staged
 privately.
 
@@ -423,7 +419,7 @@ matching backward. `fc1_a`, `fc1_sfa`, `valid_route_counts`, and
 `expert_offsets` are also required caller-owned destinations after
 `prepare_training()`.
 
-`output` is required and must be the lane's symmetric `output` buffer, which
+`output` is required and must be the instance's symmetric `output` buffer, which
 the forward kernel writes directly. The return is a logical `(T, H)` view of
 it.
 
@@ -433,7 +429,6 @@ it.
 from cudnn import MoeEpTrainingBackwardOutputs
 
 dx, dprob, operands = op.training_backward(
-    lane,
     grad_output,
     topk_idx,
     topk_weights,
@@ -457,14 +452,14 @@ dx, dprob, operands = op.training_backward(
 ```
 
 `grad_output` has the same BF16/FP32/MXFP8 input choices as forward. To avoid
-staging, quantize it directly into the lane's `backward_input` and
+staging, quantize it directly into the instance's `backward_input` and
 `backward_input_scale` buffers and build the same logical prefix views
 described for `forward_input`. `fc1_preact` and the four forward WGrad values
 are required and passed explicitly because cuDNN does not retain the forward
 output bundle.
 
 `grad_activation` and `dprob` are required destinations, and both must be the
-corresponding buffers from `training_symmetric_buffers(lane)`; the backward
+corresponding buffers from `training_symmetric_buffers()`; the backward
 kernel writes them directly. `grad_activation` is BF16 and `dprob` is FP32.
 
 All six backward WGrad fields are required. `operands` is always a
@@ -501,23 +496,34 @@ consumable by that API.
 - The caller owns all native weights, saved forward state, WGrad operands, and
   optional pack staging.
 - cuDNN borrows caller-allocated tensors for one call and does not cache their
-  Python objects or pointers. The per-lane buffers from
-  `training_symmetric_buffers` stay cuDNN-owned for the lane's lifetime.
+  Python objects or pointers. Buffers from `training_symmetric_buffers` stay
+  cuDNN-owned for the `MoeEp` instance's lifetime.
 - The caller must provide `fc1_preact` to forward and keep it live through the
   matching backward; cuDNN has no private preactivation fallback or workspace
   alias.
 - Forward WGrad outputs, segment metadata, and backward WGrad outputs remain
   live until the independent grouped WGrad consumer completes.
-- cuDNN owns per-lane local and NVSHMEM symmetric storage; only the documented
+- cuDNN owns one set of local and NVSHMEM symmetric instance storage; only the documented
   input and final-output views are exposed to the caller.
-- One lane may be active on only one stream at a time.
+- One `MoeEp` instance does not support overlapping GPU work. Prepare, warmup,
+  eager calls, graph capture, and graph replay for that instance must use one
+  CUDA stream and execute sequentially.
+- The implementation does not bind or validate the stream. Python locking
+  serializes host submission only, and graph replay bypasses Python; violating
+  this contract may silently corrupt shared state or deadlock.
+- Stable addresses do not imply result retention. A later call may overwrite
+  the instance-owned symmetric output, grad-activation, dprob, routing, and
+  finalizer storage. Consume or copy results before the next call.
+- Applications requiring parallel resource isolation must create multiple
+  `MoeEp` instances. The caller must still establish the same instance/graph
+  launch order and required CUDA-event dependencies on every EP rank.
 - All EP ranks must submit distributed forward/backward calls in identical
   order.
-- Unordered concurrent replay of distributed MoeEP graphs on independent CUDA
-  streams is unsupported and must not be used. Multiple streams must be
-  serialized into the same total device-execution order on every EP rank, by
-  stream FIFO or explicit CUDA event dependencies; matching host submission
-  order alone is insufficient.
+- Concurrent replay of multiple graphs from one instance is unsupported,
+  including replay on independent CUDA streams. For multiple instances on
+  different streams, the caller must establish the same total device-execution
+  order on every EP rank with explicit CUDA event dependencies; matching host
+  submission order alone is insufficient.
 - The caller owns forward/backward weight-version consistency.
 - `MoeEp.close()` releases only private runtime resources and never clears or
   frees caller memory.
@@ -556,6 +562,12 @@ consumed.
 6. Keep all captured input, output, saved-state, staging, and native-pack
    addresses stable until every referencing graph executable is destroyed.
 
+If one instance is used to capture multiple training graphs, capture them
+sequentially on the same CUDA stream and replay them sequentially on that same
+stream. Concurrent replay is unsupported. All graphs share the instance-owned
+symmetric buffers, so replaying a later graph may overwrite the earlier
+graph's output, grad-activation, and dprob values.
+
 The local token count `T` is fixed by the input shapes used during capture.
 Every replay of that graph must use the same `T`, shapes, and addresses.
 Tensor contents, routing, `valid_route_counts`, and `expert_offsets` may
@@ -564,7 +576,7 @@ valid and dense because replay performs no value check. Eager invocations may
 use a different `T` and replace addresses between calls, subject to the
 configured capacity.
 
-Private lane resources cannot grow during replay. Capacity changes require a
+Private instance resources cannot grow during replay. Capacity changes require a
 new operator preparation; caller-address changes require recapture.
 
 ## Execution support
@@ -587,10 +599,9 @@ all ranks are in one direct-P2P MNNVL peer-access domain. The Python capability
 layer does not impose an EP-size ceiling; cross-MNNVL execution is not part of
 the validated support surface. This acceptance requires one identical total
 device-execution order across all EP ranks. Unordered concurrent replay of
-distributed MoeEP graphs on independent CUDA streams is unsupported and must
-not be used. Serialize multiple streams with stream FIFO or explicit CUDA
-event dependencies; identical host submission order does not establish device
-order.
+graphs from one instance is unsupported and must not be used. When separate
+instances use separate streams, establish identical CUDA-event ordering on all
+EP ranks; identical host submission order does not establish device order.
 
 ## Data formats
 
@@ -641,12 +652,12 @@ Stateless training uses:
 - `topk_weights`: contiguous `(T, K)`, FP32;
 - independent forward and backward native weight packs with exact versioned
   `layout_id` values;
-- required forward `output`, the lane's symmetric buffer: `(T, H)`, BF16;
+- required forward `output`, the instance's symmetric buffer: `(T, H)`, BF16;
 - required caller-owned `fc1_preact`, written by training forward and retained
   through the matching backward;
-- required `grad_activation`, the lane's symmetric buffer: `(T, H)` view of a
+- required `grad_activation`, the instance's symmetric buffer: `(T, H)` view of a
   capacity buffer, BF16;
-- required `dprob`, the lane's symmetric buffer: source-order `(T, K)`, FP32;
+- required `dprob`, the instance's symmetric buffer: source-order `(T, K)`, FP32;
 - required caller-owned WGrad saved state and a fixed-capacity
   `MoeEpTrainingWgradOperands` bundle.
 
@@ -667,7 +678,7 @@ EP2+ execution requires:
 - an initialized NCCL process group;
 - `nvshmem4py` and usable NVSHMEM libraries;
 - direct peer access among every pair of participating ranks; and
-- consistent rank ordering, buffer schemas, tuning, lane selection, and launch
+- consistent rank ordering, buffer schemas, tuning, instance selection, and launch
   ordering across the group.
 
 `max_recv_size_per_rank` is the physical receive-pool capacity in token rows,

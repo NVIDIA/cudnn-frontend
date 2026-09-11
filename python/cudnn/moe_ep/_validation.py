@@ -69,7 +69,7 @@ def _validate_strided(name: str, tensor: torch.Tensor) -> None:
 
 
 def _is_training_mxfp8_scale_layout(tensor: torch.Tensor) -> bool:
-    """Accept compact scales or logical views into padded lane-scale storage."""
+    """Accept compact scales or logical views into padded instance-scale storage."""
 
     if tensor.is_contiguous():
         return True

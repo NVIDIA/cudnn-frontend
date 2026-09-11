@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Ordinary/capturable stateless launch path over private lane resources."""
+"""Ordinary/capturable stateless launch path over private instance resources."""
 
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ def _stage_input(
     data_in_place = value.data.data_ptr() == activation_data.data_ptr()
     scale_in_place = value.scale.data_ptr() == activation_sf.data_ptr()
     if data_in_place != scale_in_place:
-        raise ValueError("MXFP8 training input data and scale must either both use the " "lane's symmetric buffers or neither use them")
+        raise ValueError("MXFP8 training input data and scale must either both use the " "instance's symmetric buffers or neither use them")
     routing_topk_idx.fill_(-1)
     if token_count == 0:
         return
@@ -138,18 +138,14 @@ def launch_training_forward(
     capacity = config.max_tokens_per_rank
     scratch = execution.scratch
     token_count = int(activation.logical_shape[0] if isinstance(activation, BlockScaledTensor) else activation.shape[0])
-    _runtime_debug(
-        "training-forward.begin",
-        lane=scratch.index,
-        token_count=token_count,
-    )
+    _runtime_debug("training-forward.begin", token_count=token_count)
     activation_data, activation_sf = _activation_views(
         execution,
         backward=False,
         capacity=capacity,
         hidden=config.hidden,
     )
-    _runtime_debug("training-forward.stage.begin", lane=scratch.index)
+    _runtime_debug("training-forward.stage.begin")
     _stage_input(
         state,
         activation,
@@ -160,7 +156,7 @@ def launch_training_forward(
         scratch.routing_topk_idx,
         scratch.routing_topk_weights,
     )
-    _runtime_debug("training-forward.stage.end", lane=scratch.index)
+    _runtime_debug("training-forward.stage.end")
 
     assert out.output is not None
     assert out.fc1_a is not None
@@ -176,10 +172,10 @@ def launch_training_forward(
     valid_route_counts = out.valid_route_counts
     expert_offsets = out.expert_offsets
     if out.output.data_ptr() != scratch.forward_output.data_ptr():
-        raise ValueError("out.output must be the lane's symmetric output buffer from " "training_symmetric_buffers()")
+        raise ValueError("out.output must be the instance's symmetric output buffer from " "training_symmetric_buffers()")
 
     scratch.forward_overflow.zero_()
-    _runtime_debug("training-forward.reset.end", lane=scratch.index)
+    _runtime_debug("training-forward.reset.end")
 
     workspace = execution.forward.workspace
     if state.weight_storage_mode == "discrete":
@@ -207,14 +203,14 @@ def launch_training_forward(
         shared_workspace=workspace.symmetric["kernel_shared_workspace"],
         token_count=token_count,
     )
-    _runtime_debug("training-forward.compile.begin", lane=scratch.index)
+    _runtime_debug("training-forward.compile.begin")
     compiled = compile_or_get(
         prepared,
         inputs,
         execution.forward,
     )
-    _runtime_debug("training-forward.compile.end", lane=scratch.index)
-    _runtime_debug("training-forward.launch.begin", lane=scratch.index)
+    _runtime_debug("training-forward.compile.end")
+    _runtime_debug("training-forward.launch.begin")
     compiled.callable(
         **build_runtime_kwargs(
             inputs,
@@ -222,19 +218,19 @@ def launch_training_forward(
             weight_storage_mode=state.weight_storage_mode,
         )
     )
-    _runtime_debug("training-forward.launch.end", lane=scratch.index)
-    _runtime_debug("training-forward.offsets.begin", lane=scratch.index)
+    _runtime_debug("training-forward.launch.end")
+    _runtime_debug("training-forward.offsets.begin")
     _write_expert_offsets(
         execution,
         config.token_padding_block,
         valid_route_counts,
         expert_offsets,
     )
-    _runtime_debug("training-forward.offsets.end", lane=scratch.index)
-    state.apply_overflow(lane=scratch.index, phase="forward")
+    _runtime_debug("training-forward.offsets.end")
+    state.apply_overflow(phase="forward")
 
     output = out.output[:token_count]
-    _runtime_debug("training-forward.end", lane=scratch.index)
+    _runtime_debug("training-forward.end")
     return output
 
 
@@ -264,18 +260,14 @@ def launch_training_backward(
     capacity = config.max_tokens_per_rank
     scratch = execution.scratch
     token_count = int(grad_output.logical_shape[0] if isinstance(grad_output, BlockScaledTensor) else grad_output.shape[0])
-    _runtime_debug(
-        "training-backward.begin",
-        lane=scratch.index,
-        token_count=token_count,
-    )
+    _runtime_debug("training-backward.begin", token_count=token_count)
     activation_data, activation_sf = _activation_views(
         execution,
         backward=True,
         capacity=capacity,
         hidden=config.hidden,
     )
-    _runtime_debug("training-backward.stage.begin", lane=scratch.index)
+    _runtime_debug("training-backward.stage.begin")
     _stage_input(
         state,
         grad_output,
@@ -286,7 +278,7 @@ def launch_training_backward(
         scratch.routing_topk_idx,
         scratch.routing_topk_weights,
     )
-    _runtime_debug("training-backward.stage.end", lane=scratch.index)
+    _runtime_debug("training-backward.stage.end")
 
     assert fc1_a is not None
     assert fc1_sfa is not None
@@ -307,13 +299,13 @@ def launch_training_backward(
     grad_y2 = out.fc2_b
     grad_y2_sf = out.fc2_sfb.view(torch.uint8).reshape(-1)
     if out.grad_activation.data_ptr() != scratch.backward_output.data_ptr():
-        raise ValueError("out.grad_activation must be the lane's symmetric grad_activation " "buffer from training_symmetric_buffers()")
+        raise ValueError("out.grad_activation must be the instance's symmetric grad_activation " "buffer from training_symmetric_buffers()")
     if out.dprob.data_ptr() != scratch.dprob.data_ptr():
-        raise ValueError("out.dprob must be the lane's symmetric dprob buffer from " "training_symmetric_buffers()")
+        raise ValueError("out.dprob must be the instance's symmetric dprob buffer from " "training_symmetric_buffers()")
 
     scratch.backward_overflow.zero_()
     scratch.dprob.zero_()
-    _runtime_debug("training-backward.reset.end", lane=scratch.index)
+    _runtime_debug("training-backward.reset.end")
 
     workspace = execution.backward.workspace
     if state.weight_storage_mode == "discrete":
@@ -350,14 +342,14 @@ def launch_training_backward(
         shared_workspace=workspace.symmetric["kernel_shared_workspace"],
         token_count=token_count,
     )
-    _runtime_debug("training-backward.compile.begin", lane=scratch.index)
+    _runtime_debug("training-backward.compile.begin")
     compiled = compile_backward_or_get(
         prepared,
         inputs,
         execution.backward,
     )
-    _runtime_debug("training-backward.compile.end", lane=scratch.index)
-    _runtime_debug("training-backward.launch.begin", lane=scratch.index)
+    _runtime_debug("training-backward.compile.end")
+    _runtime_debug("training-backward.launch.begin")
     compiled.callable(
         **build_backward_runtime_kwargs(
             inputs,
@@ -365,8 +357,8 @@ def launch_training_backward(
             weight_storage_mode=state.weight_storage_mode,
         )
     )
-    _runtime_debug("training-backward.launch.end", lane=scratch.index)
-    state.apply_overflow(lane=scratch.index, phase="backward")
+    _runtime_debug("training-backward.launch.end")
+    state.apply_overflow(phase="backward")
 
     grad_activation = out.grad_activation[:token_count]
 
@@ -379,7 +371,7 @@ def launch_training_backward(
         valid_route_counts=valid_route_counts,
         backward=out,
     )
-    _runtime_debug("training-backward.end", lane=scratch.index)
+    _runtime_debug("training-backward.end")
     return grad_activation, dprob, operands
 
 

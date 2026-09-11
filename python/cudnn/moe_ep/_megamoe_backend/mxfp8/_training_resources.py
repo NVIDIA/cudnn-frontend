@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Private per-lane state for graph-capable stateless MXFP8 training."""
+"""Private instance state for graph-capable stateless MXFP8 training."""
 
 from __future__ import annotations
 
@@ -54,21 +54,12 @@ _BACKWARD_PRIVATE_SYMMETRIC = frozenset({"output_data", "backward_dprob", *_ROUT
 _BACKWARD_PRIVATE_LOCAL = frozenset({"overflow_flag", "backward_aux_data", "backward_aux_scale", *_ROUTING_LOCAL})
 
 
-def _lane_name(
-    lane: int,
+def _resource_name(
     phase: str,
     space: str,
     name: str,
 ) -> str:
-    return f"lane.{lane}.{phase}.{space}.{name}"
-
-
-def _lane_fallback_name(
-    lane: int,
-    space: str,
-    name: str,
-) -> str:
-    return f"lane.{lane}.fallback.{space}.{name}"
+    return f"{phase}.{space}.{name}"
 
 
 def _clone_region(name: str, region: BufferRegion) -> BufferRegion:
@@ -87,11 +78,10 @@ def _region_map(
     return {region.name: region for region in regions}
 
 
-def _add_lane_regions(
+def _add_phase_regions(
     output: list[BufferRegion],
     requirements: WorkspaceRequirements,
     *,
-    lane: int,
     phase: str,
     space: str,
     excluded_names: frozenset[str],
@@ -102,7 +92,7 @@ def _add_lane_regions(
             continue
         output.append(
             _clone_region(
-                _lane_name(lane, phase, space, region.name),
+                _resource_name(phase, space, region.name),
                 region,
             )
         )
@@ -112,13 +102,9 @@ def build_training_workspace_requirements(
     config: ForwardConfig,
     forward: PreparedMxfp8Kernel,
     backward: PreparedMxfp8BackwardKernel,
-    *,
-    lane_count: int,
 ) -> WorkspaceRequirements:
-    """Build one deterministic root layout for private execution lanes."""
+    """Build one deterministic root layout for private instance resources."""
 
-    if isinstance(lane_count, bool) or not isinstance(lane_count, int) or lane_count <= 0:
-        raise ValueError(f"lane_count must be a positive integer, got {lane_count!r}")
     if not config.generate_c:
         raise ValueError("training preparation requires generate_c=True")
     if forward.pool_token_capacity != backward.pool_token_capacity:
@@ -129,63 +115,48 @@ def build_training_workspace_requirements(
     symmetric_regions: list[BufferRegion] = []
     local_regions: list[BufferRegion] = []
 
-    for lane in range(lane_count):
-        local_regions.extend(
-            (
-                BufferRegion(
-                    _lane_name(
-                        lane,
-                        "finalizer",
-                        "local",
-                        "global_overflow",
-                    ),
-                    torch.int32.itemsize,
-                    16,
-                ),
-                BufferRegion(
-                    _lane_name(
-                        lane,
-                        "finalizer",
-                        "local",
-                        "overflow_ok",
-                    ),
-                    torch.bool.itemsize,
-                    16,
-                ),
-            )
+    local_regions.extend(
+        (
+            BufferRegion(
+                _resource_name("finalizer", "local", "global_overflow"),
+                torch.int32.itemsize,
+                16,
+            ),
+            BufferRegion(
+                _resource_name("finalizer", "local", "overflow_ok"),
+                torch.bool.itemsize,
+                16,
+            ),
         )
-        _add_lane_regions(
-            symmetric_regions,
-            forward_requirements,
-            lane=lane,
-            phase="forward",
-            space="symmetric",
-            excluded_names=_FORWARD_PRIVATE_SYMMETRIC,
-        )
-        _add_lane_regions(
-            local_regions,
-            forward_requirements,
-            lane=lane,
-            phase="forward",
-            space="local",
-            excluded_names=_FORWARD_PRIVATE_LOCAL,
-        )
-        _add_lane_regions(
-            symmetric_regions,
-            backward_requirements,
-            lane=lane,
-            phase="backward",
-            space="symmetric",
-            excluded_names=_BACKWARD_PRIVATE_SYMMETRIC,
-        )
-        _add_lane_regions(
-            local_regions,
-            backward_requirements,
-            lane=lane,
-            phase="backward",
-            space="local",
-            excluded_names=_BACKWARD_PRIVATE_LOCAL,
-        )
+    )
+    _add_phase_regions(
+        symmetric_regions,
+        forward_requirements,
+        phase="forward",
+        space="symmetric",
+        excluded_names=_FORWARD_PRIVATE_SYMMETRIC,
+    )
+    _add_phase_regions(
+        local_regions,
+        forward_requirements,
+        phase="forward",
+        space="local",
+        excluded_names=_FORWARD_PRIVATE_LOCAL,
+    )
+    _add_phase_regions(
+        symmetric_regions,
+        backward_requirements,
+        phase="backward",
+        space="symmetric",
+        excluded_names=_BACKWARD_PRIVATE_SYMMETRIC,
+    )
+    _add_phase_regions(
+        local_regions,
+        backward_requirements,
+        phase="backward",
+        space="local",
+        excluded_names=_BACKWARD_PRIVATE_LOCAL,
+    )
 
     forward_symmetric = _region_map(forward_requirements, "symmetric")
     forward_local = _region_map(forward_requirements, "local")
@@ -195,59 +166,62 @@ def build_training_workspace_requirements(
     backward_fc1_preact_shape = tuple(int(extent) for extent in backward.kernel.get_fc1_preact_shape())
     if fc1_c_shape != backward_fc1_preact_shape:
         raise ValueError("forward fc1_c and backward fc1_preact shapes differ: " f"{fc1_c_shape} != {backward_fc1_preact_shape}")
-    for lane in range(lane_count):
-        for name in sorted(_FORWARD_PRIVATE_SYMMETRIC):
-            if name in _ROUTING_SYMMETRIC:
-                continue
-            symmetric_regions.append(
-                _clone_region(
-                    _lane_name(lane, "forward", "symmetric", name),
-                    forward_symmetric[name],
-                )
+    for name in sorted(_FORWARD_PRIVATE_SYMMETRIC):
+        if name in _ROUTING_SYMMETRIC:
+            continue
+        symmetric_regions.append(
+            _clone_region(
+                _resource_name("forward", "symmetric", name),
+                forward_symmetric[name],
             )
-        for name in sorted(_BACKWARD_PRIVATE_SYMMETRIC):
-            if name in _ROUTING_SYMMETRIC:
-                continue
-            symmetric_regions.append(
-                _clone_region(
-                    _lane_name(lane, "backward", "symmetric", name),
-                    backward_symmetric[name],
-                )
+        )
+    for name in sorted(_BACKWARD_PRIVATE_SYMMETRIC):
+        if name in _ROUTING_SYMMETRIC:
+            continue
+        symmetric_regions.append(
+            _clone_region(
+                _resource_name("backward", "symmetric", name),
+                backward_symmetric[name],
             )
-        for name in sorted(_FORWARD_PRIVATE_LOCAL):
-            if name in _ROUTING_LOCAL or name in _CALLER_OWNED_FORWARD_LOCAL:
-                continue
-            region = forward_local.get(name)
-            if region is not None:
-                local_regions.append(
-                    _clone_region(
-                        _lane_name(lane, "forward", "local", name),
-                        region,
-                    )
-                )
-        for name in sorted(_BACKWARD_PRIVATE_LOCAL):
-            if name in _ROUTING_LOCAL:
-                continue
+        )
+    for name in sorted(_FORWARD_PRIVATE_LOCAL):
+        if name in _ROUTING_LOCAL or name in _CALLER_OWNED_FORWARD_LOCAL:
+            continue
+        region = forward_local.get(name)
+        if region is not None:
             local_regions.append(
                 _clone_region(
-                    _lane_name(lane, "backward", "local", name),
-                    backward_local[name],
+                    _resource_name("forward", "local", name),
+                    region,
                 )
             )
+    for name in sorted(_BACKWARD_PRIVATE_LOCAL):
+        if name in _ROUTING_LOCAL:
+            continue
         local_regions.append(
-            BufferRegion(
-                _lane_fallback_name(lane, "local", "routing_topk_idx"),
-                int(config.max_tokens_per_rank) * config.top_k * torch.int32.itemsize,
-                alignment=16,
+            _clone_region(
+                _resource_name("backward", "local", name),
+                backward_local[name],
             )
         )
-        symmetric_regions.append(
-            BufferRegion(
-                _lane_fallback_name(lane, "symmetric", "routing_topk_weights"),
-                int(config.max_tokens_per_rank) * config.top_k * torch.float32.itemsize,
-                alignment=16,
-            )
+    local_regions.append(
+        BufferRegion(
+            _resource_name("routing", "local", "routing_topk_idx"),
+            int(config.max_tokens_per_rank) * config.top_k * torch.int32.itemsize,
+            alignment=16,
         )
+    )
+    symmetric_regions.append(
+        BufferRegion(
+            _resource_name(
+                "routing",
+                "symmetric",
+                "routing_topk_weights",
+            ),
+            int(config.max_tokens_per_rank) * config.top_k * torch.float32.itemsize,
+            alignment=16,
+        )
+    )
     return WorkspaceRequirements(
         max_tokens_per_rank=int(config.max_tokens_per_rank),
         symmetric_regions=tuple(symmetric_regions),
@@ -379,7 +353,6 @@ def _build_training_abi_facts(
     backward: PreparedMxfp8BackwardKernel,
     requirements: WorkspaceRequirements,
     *,
-    lane_count: int,
     source_tree_digest: str | None = None,
 ) -> dict[str, object]:
     """Return rank-independent JSON-safe facts for the stateless training ABI."""
@@ -413,7 +386,6 @@ def _build_training_abi_facts(
             "gate_up_clamp": config.gate_up_clamp,
         },
         "resources": {
-            "lane_count": int(lane_count),
             "workspace": _workspace_abi(requirements),
         },
         "native_weight_layouts": [layout.value for layout in MoeEpNativeWeightLayout],
@@ -448,10 +420,9 @@ def _verify_training_abi_across_ranks(
 
 
 @dataclass(frozen=True)
-class Mxfp8TrainingLaneScratch:
-    """Private fixed-capacity transport and routing tensors for one lane."""
+class Mxfp8TrainingScratch:
+    """Private fixed-capacity transport and routing tensors for one instance."""
 
-    index: int
     routing_topk_idx: torch.Tensor
     routing_topk_weights: torch.Tensor
     forward_output: torch.Tensor
@@ -463,16 +434,16 @@ class Mxfp8TrainingLaneScratch:
 
 @dataclass(frozen=True)
 class Mxfp8TrainingExecutionViews:
-    """Prepared workspaces and private scratch for one execution lane."""
+    """Prepared workspaces and private scratch for one execution."""
 
-    scratch: Mxfp8TrainingLaneScratch
+    scratch: Mxfp8TrainingScratch
     forward: PreparedResources
     backward: PreparedResources
     forward_expert_size_snapshot: torch.Tensor
 
 
 class Mxfp8TrainingState:
-    """Own only private runtime and per-lane training scratch."""
+    """Own private runtime and one set of instance training resources."""
 
     def __init__(
         self,
@@ -481,7 +452,6 @@ class Mxfp8TrainingState:
         forward: PreparedMxfp8Kernel,
         backward: PreparedMxfp8BackwardKernel,
         *,
-        lane_count: int,
         runtime_manager: Optional[RuntimeManager] = None,
         symmetric_provider: Optional[SymmetricMemoryProvider] = None,
         local_provider: Optional[LocalMemoryProvider] = None,
@@ -503,12 +473,10 @@ class Mxfp8TrainingState:
             dtype=torch.float32,
             device=self.device,
         )
-        self.lane_count = lane_count
         self.requirements = build_training_workspace_requirements(
             config,
             forward,
             backward,
-            lane_count=lane_count,
         )
         self._runtime_manager = runtime_manager or get_runtime_manager()
         self._symmetric_provider = symmetric_provider
@@ -528,7 +496,6 @@ class Mxfp8TrainingState:
                 raise RuntimeError("private training state must be prepared before CUDA graph capture")
             _runtime_debug(
                 "training-state.prepare.begin",
-                lane_count=self.lane_count,
                 local_bytes=sum(region.nbytes for region in self.requirements.local_regions),
                 symmetric_bytes=sum(region.nbytes for region in self.requirements.symmetric_regions),
             )
@@ -562,7 +529,6 @@ class Mxfp8TrainingState:
                             self.forward_prepared,
                             self.backward_prepared,
                             self.requirements,
-                            lane_count=self.lane_count,
                         )
                         abi_fingerprint = _verify_training_abi_across_ranks(
                             abi_facts,
@@ -635,23 +601,22 @@ class Mxfp8TrainingState:
         flat: WorkspaceViews,
         requirements: WorkspaceRequirements,
         *,
-        lane: int,
         phase: str,
     ) -> WorkspaceViews:
         symmetric = {}
         local = {}
         for region in requirements.symmetric_regions:
             if region.name in _ROUTING_SYMMETRIC:
-                symmetric[region.name] = flat.symmetric[_lane_fallback_name(lane, "symmetric", "routing_topk_weights")]
+                symmetric[region.name] = flat.symmetric[_resource_name("routing", "symmetric", "routing_topk_weights")]
                 continue
-            symmetric[region.name] = flat.symmetric[_lane_name(lane, phase, "symmetric", region.name)]
+            symmetric[region.name] = flat.symmetric[_resource_name(phase, "symmetric", region.name)]
         for region in requirements.local_regions:
             if phase == "forward" and region.name in _CALLER_OWNED_FORWARD_LOCAL:
                 continue
             if region.name in _ROUTING_LOCAL:
-                local[region.name] = flat.local[_lane_fallback_name(lane, "local", "routing_topk_idx")]
+                local[region.name] = flat.local[_resource_name("routing", "local", "routing_topk_idx")]
                 continue
-            local[region.name] = flat.local[_lane_name(lane, phase, "local", region.name)]
+            local[region.name] = flat.local[_resource_name(phase, "local", region.name)]
         return WorkspaceViews(
             token_count=flat.token_count,
             symmetric=MappingProxyType(symmetric),
@@ -659,20 +624,18 @@ class Mxfp8TrainingState:
             peer_mapping=flat.peer_mapping,
         )
 
-    def _lane_scratch_views(
+    def _scratch_views(
         self,
         flat: WorkspaceViews,
-        lane: int,
-    ) -> Mxfp8TrainingLaneScratch:
+    ) -> Mxfp8TrainingScratch:
         config = self.config
         capacity = int(config.max_tokens_per_rank)
         bwd_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in self.backward_prepared.kernel.get_aux_output_shapes().items()}
 
         def local_bytes(name: str) -> torch.Tensor:
-            return flat.local[_lane_fallback_name(lane, "local", name)]
+            return flat.local[_resource_name("routing", "local", name)]
 
-        return Mxfp8TrainingLaneScratch(
-            index=lane,
+        return Mxfp8TrainingScratch(
             routing_topk_idx=_typed_view(
                 local_bytes("routing_topk_idx"),
                 torch.int32,
@@ -680,8 +643,8 @@ class Mxfp8TrainingState:
             ),
             routing_topk_weights=_typed_view(
                 flat.symmetric[
-                    _lane_fallback_name(
-                        lane,
+                    _resource_name(
+                        "routing",
                         "symmetric",
                         "routing_topk_weights",
                     )
@@ -691,8 +654,7 @@ class Mxfp8TrainingState:
             ),
             forward_output=_typed_view(
                 flat.symmetric[
-                    _lane_name(
-                        lane,
+                    _resource_name(
                         "forward",
                         "symmetric",
                         "output_data",
@@ -703,8 +665,7 @@ class Mxfp8TrainingState:
             ),
             backward_output=_typed_view(
                 flat.symmetric[
-                    _lane_name(
-                        lane,
+                    _resource_name(
                         "backward",
                         "symmetric",
                         "output_data",
@@ -715,8 +676,7 @@ class Mxfp8TrainingState:
             ),
             dprob=_typed_view(
                 flat.symmetric[
-                    _lane_name(
-                        lane,
+                    _resource_name(
                         "backward",
                         "symmetric",
                         "backward_dprob",
@@ -727,8 +687,7 @@ class Mxfp8TrainingState:
             ),
             forward_overflow=_typed_view(
                 flat.local[
-                    _lane_name(
-                        lane,
+                    _resource_name(
                         "forward",
                         "local",
                         "overflow_flag",
@@ -739,8 +698,7 @@ class Mxfp8TrainingState:
             ),
             backward_overflow=_typed_view(
                 flat.local[
-                    _lane_name(
-                        lane,
+                    _resource_name(
                         "backward",
                         "local",
                         "overflow_flag",
@@ -753,13 +711,12 @@ class Mxfp8TrainingState:
 
     def public_symmetric_buffers(
         self,
-        lane: int,
     ) -> Mapping[str, torch.Tensor]:
-        """Return caller-visible views over one lane's symmetric I/O buffers."""
+        """Return caller-visible views over the instance's symmetric I/O buffers."""
 
         capacity = int(self.config.max_tokens_per_rank)
         hidden = int(self.config.hidden_size)
-        execution = self.views(lane=lane, token_count=capacity)
+        execution = self.views(token_count=capacity)
 
         def activation_views(
             workspace: WorkspaceViews,
@@ -903,12 +860,9 @@ class Mxfp8TrainingState:
     def views(
         self,
         *,
-        lane: int,
         token_count: int,
     ) -> Mxfp8TrainingExecutionViews:
         with self._lock:
-            if lane < 0 or lane >= self.lane_count:
-                raise ValueError(f"lane {lane} is outside [0, {self.lane_count})")
             col_quant_sizes_offset = self.forward_prepared.col_quant_sizes_offset
             if col_quant_sizes_offset is None:
                 raise RuntimeError("training preparation requires a persistent col-quant expert-size snapshot")
@@ -916,13 +870,11 @@ class Mxfp8TrainingState:
             forward_workspace = self._phase_workspace(
                 flat,
                 self.forward_prepared.workspace_requirements,
-                lane=lane,
                 phase="forward",
             )
             backward_workspace = self._phase_workspace(
                 flat,
                 self.backward_prepared.workspace_requirements,
-                lane=lane,
                 phase="backward",
             )
             snapshot_bytes = forward_workspace.local["kernel_local_workspace"].narrow(
@@ -937,7 +889,7 @@ class Mxfp8TrainingState:
             )
             assert self._runtime is not None
             return Mxfp8TrainingExecutionViews(
-                scratch=self._lane_scratch_views(flat, lane),
+                scratch=self._scratch_views(flat),
                 forward=PreparedResources(
                     runtime=self._runtime,
                     workspace=forward_workspace,
@@ -964,21 +916,17 @@ class Mxfp8TrainingState:
     def apply_overflow(
         self,
         *,
-        lane: int,
         phase: str,
     ) -> torch.Tensor:
         """Apply the configured policy to one phase's private overflow flag."""
 
-        if lane < 0 or lane >= self.lane_count:
-            raise ValueError(f"lane {lane} is outside [0, {self.lane_count})")
         if phase not in ("forward", "backward"):
             raise ValueError(f"phase must be 'forward' or 'backward', got {phase!r}")
-        _runtime_debug("training-overflow.begin", lane=lane, phase=phase)
+        _runtime_debug("training-overflow.begin", phase=phase)
         flat = self._flat_views(0)
         global_overflow = _typed_view(
             flat.local[
-                _lane_name(
-                    lane,
+                _resource_name(
                     "finalizer",
                     "local",
                     "global_overflow",
@@ -989,8 +937,7 @@ class Mxfp8TrainingState:
         )
         flag = _typed_view(
             flat.local[
-                _lane_name(
-                    lane,
+                _resource_name(
                     phase,
                     "local",
                     "overflow_flag",
@@ -1000,24 +947,23 @@ class Mxfp8TrainingState:
             (1,),
         )
         global_overflow.copy_(flag)
-        _runtime_debug("training-overflow.copy.end", lane=lane, phase=phase)
+        _runtime_debug("training-overflow.copy.end", phase=phase)
         assert self._runtime is not None
         if self._runtime.world_size > 1:
-            _runtime_debug("training-overflow.all-reduce.begin", lane=lane, phase=phase)
+            _runtime_debug("training-overflow.all-reduce.begin", phase=phase)
             dist.all_reduce(
                 global_overflow,
                 op=dist.ReduceOp.MAX,
                 group=self._runtime.group,
             )
-            _runtime_debug("training-overflow.all-reduce.end", lane=lane, phase=phase)
+            _runtime_debug("training-overflow.all-reduce.end", phase=phase)
         if not self.config.drop_on_overflow:
             assert_async = getattr(torch, "_assert_async", None)
             if assert_async is None:
                 raise RuntimeError("drop_on_overflow=False training requires torch._assert_async")
             overflow_ok = _typed_view(
                 flat.local[
-                    _lane_name(
-                        lane,
+                    _resource_name(
                         "finalizer",
                         "local",
                         "overflow_ok",
@@ -1031,7 +977,7 @@ class Mxfp8TrainingState:
                 overflow_ok,
                 f"Rubin MegaMoE receive route-pool overflow; the {phase} " "outputs are invalid",
             )
-        _runtime_debug("training-overflow.end", lane=lane, phase=phase)
+        _runtime_debug("training-overflow.end", phase=phase)
         return global_overflow
 
 

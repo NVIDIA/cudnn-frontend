@@ -183,10 +183,9 @@ class Mxfp8Backend:
     def prepare_training(
         self,
         *,
-        lane_count: int,
         native_weight_storage_mode: str = "contiguous",
     ):
-        """Allocate private per-lane state for stateless training calls."""
+        """Allocate private instance state for stateless training calls."""
 
         with self._lock:
             if self._closed:
@@ -252,7 +251,6 @@ class Mxfp8Backend:
                 self.device,
                 forward,
                 backward,
-                lane_count=lane_count,
             )
             try:
                 state.prepare()

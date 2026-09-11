@@ -20,7 +20,6 @@ from cudnn.moe_ep import (
     MoeEp,
     MoeEpBackwardWeightStaging,
     MoeEpBackwardWeights,
-    MoeEpExecutionLane,
     MoeEpForwardWeights,
     MoeEpNativeBackwardWeights,
     MoeEpNativeDiscreteBackwardWeights,
@@ -269,6 +268,7 @@ def test_only_stateless_training_types_are_public():
         "MoeEpTrainingResources",
         "MoeEpTrainingSlot",
         "MoeEpTrainingWeights",
+        "MoeEpExecutionLane",
     )
     for name in removed:
         assert not hasattr(cudnn, name)
@@ -316,18 +316,18 @@ def test_training_input_rejects_noncontiguous_plain_tensor():
 
 
 @pytest.mark.L0
-def test_training_input_accepts_logical_view_of_padded_lane_scale():
+def test_training_input_accepts_logical_view_of_padded_instance_scale():
     config = _training_config(
         weight_interleave_size=32,
         max_tokens_per_rank=5,
     )
     token_count = 5
     logical_scale_columns = config.hidden_size // 32
-    lane_scale = torch.empty(
+    instance_scale = torch.empty(
         (128, 16),
         dtype=torch.float8_e8m0fnu,
     )
-    scale = lane_scale[:token_count, :logical_scale_columns]
+    scale = instance_scale[:token_count, :logical_scale_columns]
     activation = BlockScaledTensor(
         data=torch.empty(
             (token_count, config.hidden_size),
@@ -435,12 +435,10 @@ def test_training_forward_propagates_trusted_validation_mode(monkeypatch):
     op._training_state = object()
     op._training_requirements = {}
     op._forward_backend_device = torch.device("cpu")
-    monkeypatch.setattr(op, "_require_training_lane", lambda lane: None)
     monkeypatch.setattr(api_module, "validate_training_input", observe_validation)
 
     with pytest.raises(ValidationObserved):
         op.training_forward(
-            None,
             None,
             None,
             None,
@@ -984,14 +982,11 @@ def test_training_backward_rejects_missing_output_bundle_after_prepare():
         max_recv_size_per_rank=128,
         weight_interleave_size=32,
     )
-    lane = MoeEpExecutionLane(0, op._operator_token)
     op._training_state = object()
     op._training_requirements = {}
-    op._training_lanes = (lane,)
     op._forward_backend_device = torch.device("cpu")
     with pytest.raises(TypeError, match="out must be a MoeEpTrainingBackwardOutputs"):
         op.training_backward(
-            lane,
             torch.empty((0, 128), dtype=torch.bfloat16),
             torch.empty((0, 2), dtype=torch.int32),
             torch.empty((0, 2), dtype=torch.float32),
@@ -1047,12 +1042,11 @@ def test_private_training_state_has_no_bound_weights_or_wgrad_exporter():
         torch.device("cpu"),
         forward,
         backward,
-        lane_count=2,
     )
     assert not hasattr(state, "weight_bindings")
     assert not hasattr(state, "wgrad_exporter")
     assert not hasattr(state, "slot_count")
-    assert state.lane_count == 2
+    assert not hasattr(state, "lane_count")
     assert all(
         "fc1_preact" not in region.name
         for region in (
@@ -1078,7 +1072,7 @@ def test_private_training_state_has_no_bound_weights_or_wgrad_exporter():
 
 
 @pytest.mark.L0
-def test_private_training_workspace_keeps_only_live_lane_scratch():
+def test_private_training_workspace_keeps_only_live_instance_scratch():
     config = _training_config(weight_interleave_size=32)
     forward, backward = _training_prepared_pair(config)
     state = Mxfp8TrainingState(
@@ -1086,7 +1080,6 @@ def test_private_training_workspace_keeps_only_live_lane_scratch():
         torch.device("cpu"),
         forward,
         backward,
-        lane_count=2,
     )
     flat = WorkspaceViews(
         token_count=0,
@@ -1095,18 +1088,15 @@ def test_private_training_workspace_keeps_only_live_lane_scratch():
         peer_mapping=object(),
     )
 
-    first = state._lane_scratch_views(flat, 0)
-    second = state._lane_scratch_views(flat, 1)
+    scratch = state._scratch_views(flat)
     forward_workspace = state._phase_workspace(
         flat,
         forward.workspace_requirements,
-        lane=0,
         phase="forward",
     )
     backward_workspace = state._phase_workspace(
         flat,
         backward.workspace_requirements,
-        lane=0,
         phase="backward",
     )
     assert "col_quant_data" not in forward_workspace.local
@@ -1114,11 +1104,10 @@ def test_private_training_workspace_keeps_only_live_lane_scratch():
     assert "kernel_local_workspace" in forward_workspace.local
     assert "backward_aux_data" in backward_workspace.local
     assert "backward_aux_scale" in backward_workspace.local
-    for field in fields(first):
-        first_value = getattr(first, field.name)
-        second_value = getattr(second, field.name)
-        if isinstance(first_value, torch.Tensor):
-            assert first_value.data_ptr() != second_value.data_ptr()
+    assert forward_workspace.local["topk_idx"].data_ptr() == scratch.routing_topk_idx.data_ptr()
+    assert backward_workspace.local["topk_idx"].data_ptr() == scratch.routing_topk_idx.data_ptr()
+    assert forward_workspace.symmetric["topk_weights"].data_ptr() == scratch.routing_topk_weights.data_ptr()
+    assert backward_workspace.symmetric["topk_weights"].data_ptr() == scratch.routing_topk_weights.data_ptr()
     names = {region.name for region in (*state.requirements.symmetric_regions, *state.requirements.local_regions)}
     removed = (
         "valid_route_counts",
@@ -1133,14 +1122,14 @@ def test_private_training_workspace_keeps_only_live_lane_scratch():
         "col_quant_sf",
     )
     assert not any(any(name.endswith(removed_name) for removed_name in removed) for name in names)
-    for lane in range(2):
-        assert f"lane.{lane}.fallback.local.routing_topk_idx" in names
-        assert f"lane.{lane}.fallback.symmetric.routing_topk_weights" in names
-        assert f"lane.{lane}.backward.local.backward_aux_data" in names
-        assert f"lane.{lane}.backward.local.backward_aux_scale" in names
-        assert f"lane.{lane}.forward.symmetric.output_data" in names
-        assert f"lane.{lane}.backward.symmetric.output_data" in names
-        assert f"lane.{lane}.backward.symmetric.backward_dprob" in names
+    assert not any(name.startswith("lane.") for name in names)
+    assert "routing.local.routing_topk_idx" in names
+    assert "routing.symmetric.routing_topk_weights" in names
+    assert "backward.local.backward_aux_data" in names
+    assert "backward.local.backward_aux_scale" in names
+    assert "forward.symmetric.output_data" in names
+    assert "backward.symmetric.output_data" in names
+    assert "backward.symmetric.backward_dprob" in names
 
 
 @pytest.mark.L0
@@ -1153,14 +1142,13 @@ def test_training_views_require_col_quant_snapshot():
         torch.device("cpu"),
         forward,
         backward,
-        lane_count=1,
     )
     with pytest.raises(RuntimeError, match="persistent col-quant expert-size snapshot"):
-        state.views(lane=0, token_count=0)
+        state.views(token_count=0)
 
 
 @pytest.mark.L0
-def test_training_abi_fingerprint_covers_lanes_and_native_layouts():
+def test_training_abi_fingerprint_covers_workspace_and_native_layouts():
     config = _training_config(
         ep_size=2,
         ep_global_ranks=(0, 1),
@@ -1178,7 +1166,6 @@ def test_training_abi_fingerprint_covers_lanes_and_native_layouts():
         forward,
         backward,
         requirements,
-        lane_count=1,
         source_tree_digest="source",
     )
     repeated = _build_training_abi_facts(
@@ -1186,15 +1173,18 @@ def test_training_abi_fingerprint_covers_lanes_and_native_layouts():
         forward,
         backward,
         requirements,
-        lane_count=1,
         source_tree_digest="source",
     )
-    changed_lanes = _build_training_abi_facts(
+    changed_requirements = WorkspaceRequirements(
+        max_tokens_per_rank=4,
+        symmetric_regions=(BufferRegion("symmetric.changed", 256),),
+        local_regions=(BufferRegion("local", 128),),
+    )
+    changed_workspace = _build_training_abi_facts(
         config,
         forward,
         backward,
-        requirements,
-        lane_count=2,
+        changed_requirements,
         source_tree_digest="source",
     )
     discrete_forward = _training_abi_prepared(
@@ -1210,14 +1200,14 @@ def test_training_abi_fingerprint_covers_lanes_and_native_layouts():
         discrete_forward,
         discrete_backward,
         requirements,
-        lane_count=1,
         source_tree_digest="source",
     )
 
     assert first["schema_version"] == 3
+    assert "lane_count" not in first["resources"]
     assert first["native_weight_layouts"] == [layout.value for layout in MoeEpNativeWeightLayout]
     assert canonical_json_sha256(first) == canonical_json_sha256(repeated)
-    assert canonical_json_sha256(first) != canonical_json_sha256(changed_lanes)
+    assert canonical_json_sha256(first) != canonical_json_sha256(changed_workspace)
     assert canonical_json_sha256(first) != canonical_json_sha256(
         changed_storage_mode
     )
@@ -1280,12 +1270,12 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
     assert hasattr(op, "prepare_training")
     assert hasattr(op, "training_forward")
     assert hasattr(op, "training_backward")
+    assert not hasattr(op, "training_lanes")
     assert not hasattr(op, "prepare_training_resources")
     assert not hasattr(op, "refresh_weights")
     assert not hasattr(op, "finalize_overflow")
     with pytest.raises(RuntimeError, match="prepare_training"):
         op.training_forward(
-            object(),
             torch.empty((0, 128), dtype=torch.bfloat16),
             torch.empty((0, 2), dtype=torch.int32),
             torch.empty((0, 2), dtype=torch.float32),
@@ -1337,7 +1327,6 @@ def test_discrete_training_forward_backward_and_graph_match_reference():
         weight_interleave_size=32,
     ) as op:
         requirements = op.prepare_training(
-            lane_count=1,
             device=device,
             native_weight_storage_mode="discrete",
         )
@@ -1371,8 +1360,7 @@ def test_discrete_training_forward_backward_and_graph_match_reference():
                 == expected_descriptor_bytes
             )
 
-        lane = op.training_lanes[0]
-        symmetric = op.training_symmetric_buffers(lane)
+        symmetric = op.training_symmetric_buffers()
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
@@ -1381,7 +1369,6 @@ def test_discrete_training_forward_backward_and_graph_match_reference():
 
         def run():
             y = op.training_forward(
-                lane,
                 args[0],
                 args[3],
                 args[4],
@@ -1389,7 +1376,6 @@ def test_discrete_training_forward_backward_and_graph_match_reference():
                 out=forward_out,
             )
             dx, dprob, operands = op.training_backward(
-                lane,
                 grad_output,
                 args[3],
                 args[4],
@@ -1571,7 +1557,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         combine_format=combine_format,
         weight_interleave_size=32,
     ) as op:
-        requirements = op.prepare_training(lane_count=1, device=device)
+        requirements = op.prepare_training(device=device)
         forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         native_forward = op.pack_forward_weights(
             source_weights[0],
@@ -1581,8 +1567,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
             source_weights[1],
             out=backward_staging,
         )
-        lane = op.training_lanes[0]
-        symmetric = op.training_symmetric_buffers(lane)
+        symmetric = op.training_symmetric_buffers()
         expected_scale_rows = _round_up(capacity, 128)
         assert symmetric["forward_input_scale"].shape[0] == expected_scale_rows
         assert symmetric["backward_input_scale"].shape[0] == expected_scale_rows
@@ -1594,7 +1579,6 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         state = op._training_state
         assert state is not None
         execution = state.views(
-            lane=lane.index,
             token_count=args[0].shape[0],
         )
 
@@ -1609,7 +1593,6 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
                 execution.backward.workspace.symmetric["kernel_shared_workspace"],
             )
             y = op.training_forward(
-                lane,
                 args[0],
                 args[3],
                 args[4],
@@ -1617,7 +1600,6 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
                 out=forward_out,
             )
             dx, dprob, operands = op.training_backward(
-                lane,
                 grad_output,
                 args[3],
                 args[4],
@@ -1680,7 +1662,6 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
             )
 
         grouped_expected = grouped_reference(expected)
-        alternate_grouped_expected = grouped_reference(alternate_expected)
         grouped_outputs = tuple(torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected)
 
         def run_grouped(operands):
@@ -1707,35 +1688,45 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         assert_matches(eager)
         assert_grouped_matches(eager_grouped, grouped_expected)
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured = run()
-            captured_grouped = run_grouped(captured[3])
+        capture_stream = torch.cuda.current_stream(device)
+        graphs = []
+        captured = None
+        for _ in range(2):
+            assert torch.cuda.current_stream(device) == capture_stream
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run()
+            graphs.append(graph)
+        assert captured is not None
         captured_token_count = int(args[0].shape[0])
         pointers = tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
         for replay in range(4):
             if replay % 2:
                 args[3].copy_(alternate_topk_idx)
                 replay_expected = alternate_expected
-                replay_grouped_expected = alternate_grouped_expected
             else:
                 args[3].copy_(original_topk_idx)
                 replay_expected = expected
-                replay_grouped_expected = grouped_expected
-            graph.replay()
+            assert torch.cuda.current_stream(device) == capture_stream
+            graphs[replay % len(graphs)].replay()
             torch.cuda.synchronize(device)
             assert int(args[0].shape[0]) == captured_token_count
             assert pointers == tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
             expected_replay_offsets = expected_alternate_offsets if replay % 2 else expected_original_offsets
             assert tuple(captured[3].expert_offsets.cpu().tolist()) == expected_replay_offsets
             assert_matches(captured, replay_expected)
-            assert_grouped_matches(captured_grouped, replay_grouped_expected)
 
         args[3].copy_(original_topk_idx)
-        graph.replay()
+        graphs[0].replay()
         torch.cuda.synchronize(device)
         assert tuple(captured[3].expert_offsets.cpu().tolist()) == expected_original_offsets
         assert_matches(captured)
+        # The loop above validates WGrad operands from both graph executables
+        # and both routing patterns. Keep the downstream grouped-WGrad smoke on
+        # the original routing contract; that API owns separate mutable
+        # descriptor workspace and is not part of MoeEp graph replay.
+        captured_grouped = run_grouped(captured[3])
+        torch.cuda.synchronize(device)
         assert_grouped_matches(captured_grouped, grouped_expected)
 
 
@@ -1801,7 +1792,7 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
         combine_format="bf16",
         weight_interleave_size=32,
     ) as op:
-        requirements = op.prepare_training(lane_count=1, device=device)
+        requirements = op.prepare_training(device=device)
         forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         native_forward = op.pack_forward_weights(
             source_weights[0],
@@ -1811,8 +1802,7 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
             source_weights[1],
             out=backward_staging,
         )
-        lane = op.training_lanes[0]
-        symmetric = op.training_symmetric_buffers(lane)
+        symmetric = op.training_symmetric_buffers()
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
@@ -1821,7 +1811,6 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
 
         _poison_training_outputs_for_test(forward_out, backward_out)
         op.training_forward(
-            lane,
             activation,
             topk_idx,
             topk_weights,
@@ -1829,7 +1818,6 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
             out=forward_out,
         )
         _, _, operands = op.training_backward(
-            lane,
             grad_output,
             topk_idx,
             topk_weights,
@@ -1908,9 +1896,8 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
         weight_interleave_size=32,
     )
     try:
-        requirements = op.prepare_training(lane_count=1, device=device)
-        lane = op.training_lanes[0]
-        symmetric = op.training_symmetric_buffers(lane)
+        requirements = op.prepare_training(device=device)
+        symmetric = op.training_symmetric_buffers()
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
@@ -1989,7 +1976,6 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
         def run():
             _poison_training_outputs_for_test(forward_out, backward_out)
             output = op.training_forward(
-                lane,
                 activation,
                 topk_idx,
                 topk_weights,
@@ -1997,7 +1983,6 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
                 out=forward_out,
             )
             grad_activation, dprob, operands = op.training_backward(
-                lane,
                 grad_output,
                 topk_idx,
                 topk_weights,

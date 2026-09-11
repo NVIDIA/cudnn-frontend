@@ -361,7 +361,7 @@ class MoeEpBackwardWeightStaging:
 
 @dataclass(frozen=True)
 class MoeEpTrainingForwardOutputs:
-    """Forward destinations, including the lane's symmetric output buffer."""
+    """Forward destinations, including the instance's symmetric output buffer."""
 
     fc1_preact: torch.Tensor
     output: torch.Tensor | None = None
@@ -373,7 +373,7 @@ class MoeEpTrainingForwardOutputs:
 
 @dataclass(frozen=True)
 class MoeEpTrainingBackwardOutputs:
-    """Backward and WGrad destinations, including the lane's symmetric input gradient."""
+    """Backward and WGrad destinations, including the instance's symmetric input gradient."""
 
     grad_activation: torch.Tensor | None = None
     dprob: torch.Tensor | None = None
@@ -412,20 +412,11 @@ class MoeEpTrainingWgradOperands:
     valid_route_counts: torch.Tensor
 
 
-@dataclass(frozen=True)
-class MoeEpExecutionLane:
-    """Operator-bound index of one mutable per-stream execution lane."""
-
-    index: int
-    _operator_token: object
-
-
 MoeTensor = Union[torch.Tensor, BlockScaledTensor]
 
 
 __all__ = [
     "BlockScaledTensor",
-    "MoeEpExecutionLane",
     "MoeEpBackwardWeightStaging",
     "MoeEpBackwardWeights",
     "MoeEpForwardWeightStaging",
