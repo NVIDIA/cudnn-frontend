@@ -6,7 +6,11 @@
 The shape is ``N,C,D,H,W,K,T,R,S``. Inputs, filters, and outputs use compact
 channels-last storage while retaining cuDNN's logical NCDHW/KCTRS shapes.
 Only kernel execution is captured: graph construction, JIT compilation,
-workspace allocation, and warmup happen before ``cudaProfilerStart``.
+workspace allocation, correctness checks, and warmup happen before
+``cudaProfilerStart``. Pass ``--check-correctness`` to check each FROST config
+against the native cuDNN backend on seeded random inputs with BF16
+rtol=atol=0.015625; a mismatch marks that config as failed and excludes it
+from the timing results. Correctness checks are disabled by default.
 By default every dense-compatible entry in ``cudnn.conv.frost.CATALOG`` is
 measured. Use ``--configs default`` for only the heuristic choice for this
 shape, or pass comma-separated config names/globs to select a subset. Pass
@@ -144,9 +148,33 @@ def _execute_frost(compiled, data) -> None:
     )
 
 
+def _check_correctness(compiled, data, args, shape: ConvShape) -> None:
+    """Compare one FROST tile with native cuDNN, outside the capture range."""
+    image, weight, output = data
+    generator = torch.Generator(device=image.device).manual_seed(0)
+    image.normal_(generator=generator)
+    # Keep the output scale near one as the convolution reduction grows.
+    reduction = shape.c * shape.t * shape.r * shape.s
+    weight.normal_(std=reduction**-0.5, generator=generator)
+    reference = torch.full_like(output, float("nan"))
+    reference_data = (image, weight, reference)
+    graph, tensors, workspace, plan_name = _build_cudnn_graph(reference_data, args.pre_padding, args.post_padding, args.stride, args.dilation)
+    _execute(graph, tensors, workspace, reference_data)
+    # Detect missing stores as well as incorrect values.
+    output.fill_(float("nan"))
+    _execute_frost(compiled, data)
+    torch.cuda.synchronize()
+    tolerance = 2 * torch.finfo(torch.bfloat16).eps
+    try:
+        torch.testing.assert_close(output, reference, rtol=tolerance, atol=tolerance)
+    except AssertionError as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        raise RuntimeError(f"correctness FAILED: {args._tile_config} vs cuDNN backend (rtol=atol={tolerance})") from exc
+    print(f"[correctness] {args._tile_config}: PASS vs cuDNN backend {plan_name!r} (rtol=atol={tolerance})", flush=True)
+
+
 def _worker(args, shape: ConvShape, output_spatial: tuple[int, int, int], nbuf: int) -> int:
     warmup_data = _make_data(shape, output_spatial)
-    pool = [_make_data(shape, output_spatial) for _ in range(nbuf)]
 
     if args._implementation == "frost":
         compiled = _build_frost_kernel(
@@ -159,6 +187,8 @@ def _worker(args, shape: ConvShape, output_spatial: tuple[int, int, int], nbuf: 
         )
         execute = lambda data: _execute_frost(compiled, data)
         plan_name = args._tile_config
+        if args.check_correctness:
+            _check_correctness(compiled, warmup_data, args, shape)
     else:
         graph, tensors, workspace, plan_name = _build_cudnn_graph(
             warmup_data,
@@ -169,6 +199,7 @@ def _worker(args, shape: ConvShape, output_spatial: tuple[int, int, int], nbuf: 
         )
         execute = lambda data: _execute(graph, tensors, workspace, data)
 
+    pool = [_make_data(shape, output_spatial) for _ in range(nbuf)]
     for _ in range(args.warmup):
         execute(warmup_data)
     torch.cuda.synchronize()
@@ -186,12 +217,19 @@ def _worker(args, shape: ConvShape, output_spatial: tuple[int, int, int], nbuf: 
 
 
 def _parser():
-    return make_parser(
+    parser = make_parser(
         __doc__,
         "1,128,128,128,128,128,3,3,3",
         "comma-separated tile config names or globs; 'all' sweeps dense-compatible catalog entries "
         "and 'default' selects the heuristic choice (default: all)",
     )
+
+    parser.add_argument(
+        "--check-correctness",
+        action="store_true",
+        help="check each FROST config against cuDNN backend before timing (default: disabled)",
+    )
+    return parser
 
 
 def main() -> int:
@@ -238,6 +276,8 @@ def main() -> int:
     )
     print("  [timing: nsys CUDA capture range; graph-build/JIT/warmup excluded]")
     print(f"  [rotate-buffers: {nbuf} tensor sets, {nbuf * per_set / 1024 / 1024:.0f} MB]")
+    if args.check_correctness:
+        print("  [correctness: each FROST config checked against cuDNN backend before capture; rtol=atol=0.015625]")
     print(f"  [tile sweep: {len(config_names)} configuration(s)]")
     return run_sweep(__file__, args, shape, nbuf, config_names, flops)
 

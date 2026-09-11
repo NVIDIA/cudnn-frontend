@@ -3578,11 +3578,12 @@ def _block_scale_config_violation(tile_config: ConvTileConfig, c: int) -> str | 
         return f"{constraint}; got CTA K={tile_config.cta_tile_k_bytes} bytes"
 
     # SFB is packed in 128-row windows and tcgen05 requires its TMEM address
-    # to be aligned at least every 64 rows. A 32-row tile would need an odd
-    # one-column TMEM shift for every other tile, which is not a legal SFB
-    # descriptor address.
-    if tile_config.cta_tile_n == 32:
-        return "block-scale convolution requires CTA N>=64 because SFB TMEM addresses are 64-row aligned"
+    # to be aligned at least every 64 rows. Any N not divisible by 64 (32,
+    # 96, 160, 224) would need an odd one-column TMEM shift on alternating
+    # tiles, which is not a legal SFB descriptor address. Without that shift,
+    # later tiles read scales for the wrong output channels.
+    if tile_config.cta_tile_n % 64:
+        return "block-scale convolution requires CTA N>=64 and divisible by 64 because SFB TMEM addresses are 64-row aligned"
 
     if tile_config.cta_group == 2 and tile_config.cta_tile_k_bytes == 96 and tile_config.cta_tile_n < 192:
         return f"2-CTA with a 96-byte K tile requires CTA N>=192, got {tile_config.cta_tile_n}"

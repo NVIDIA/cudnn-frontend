@@ -294,13 +294,45 @@ def test_block_scale_compile_rejects_invalid_explicit_config_before_cute_compile
 
 @pytest.mark.L0
 @requires_block_scale_cutedsl
+@pytest.mark.parametrize("cta_n", (32, 96, 160, 224))
+@pytest.mark.parametrize("cta_group", (1, 2))
+def test_block_scale_rejects_unaligned_sfb_tiles_before_compile(monkeypatch, cta_n, cta_group) -> None:
+    from cudnn.conv.frost.templates import sm100_block_scale_conv
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("an unaligned SFB tile must be rejected before compilation")
+
+    monkeypatch.setattr(sm100_block_scale_conv, "_compile_cached", unexpected_compile)
+    config = ConvTileConfig(128, cta_n, 128, cta_group)
+    with pytest.raises(ValueError, match=rf"{config.name}.*CTA N.*64"):
+        sm100_block_scale_conv.compile(
+            ncdhw=(1, 1024, 1, 44, 80),
+            ktrs=(1024, 3, 3, 3),
+            lower_padding_dhw=(2, 1, 1),
+            upper_padding_dhw=(0, 1, 1),
+            tile_config=config,
+        )
+
+
+@pytest.mark.L0
+@requires_block_scale_cutedsl
+def test_block_scale_sweep_keeps_only_sfb_aligned_tiles() -> None:
+    from cudnn.conv.frost.templates.sm100_block_scale_conv import _block_scale_config_violation
+
+    # This is the same predicate used by the benchmark's --configs all sweep.
+    selected = {config for config in CATALOG if _block_scale_config_violation(config, 1024) is None}
+    assert selected == {ConvTileConfig(128, n, 128, group) for n in (64, 128, 192, 256) for group in (1, 2)}
+
+
+@pytest.mark.L0
+@requires_block_scale_cutedsl
 def test_block_scale_compile_resolves_config_before_cached_compiler(monkeypatch) -> None:
     from cudnn.conv.frost.templates import sm100_block_scale_conv
 
     monkeypatch.setattr(sm100_block_scale_conv, "_compile_cached", lambda *args, **kwargs: kwargs["tile_config"])
 
     automatic = sm100_block_scale_conv.compile(ncdhw=(1, 64, 1, 1, 128), ktrs=(64, 1, 1, 1))
-    explicit_config = ConvTileConfig(128, 224, 32, 2)
+    explicit_config = ConvTileConfig(128, 192, 32, 2)
     explicit = sm100_block_scale_conv.compile(
         ncdhw=(1, 64, 1, 1, 128),
         ktrs=(64, 1, 1, 1),
@@ -410,11 +442,11 @@ def test_block_scale_kernel_derives_geometry_from_tile_config() -> None:
 
     from cudnn.conv.frost.templates.sm100_block_scale_conv import _Sm100BlockScaledPersistentDenseImplicitGemmKernel
 
-    config = ConvTileConfig(128, 224, 96, 2)
+    config = ConvTileConfig(128, 192, 96, 2)
     kernel = _Sm100BlockScaledPersistentDenseImplicitGemmKernel(cutlass.Float32, 16, config)
 
     assert kernel.tile_config == config
-    assert kernel.mma_tiler_mn == (256, 224)
+    assert kernel.mma_tiler_mn == (256, 192)
     assert kernel.preferred_cluster_shape_mn == kernel.fallback_cluster_shape_mn == (2, 1)
     assert kernel.use_2cta_instrs
     assert kernel.cta_tile_k == 192
