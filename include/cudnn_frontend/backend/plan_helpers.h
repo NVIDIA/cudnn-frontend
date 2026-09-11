@@ -96,7 +96,7 @@ create_engine(backend_descriptor& engine,
     }
 
 #if (CUDNN_VERSION >= 92700)
-    // A backend value of zero means "use the device maximum". Leave non-positive
+    // A backend value of zero means no limit was specified. Leave non-positive
     // frontend limits to the existing engine-config filter so its semantics do not change.
     if (shared_memory_limit > 0 && detail::get_backend_version() >= 92700) {
         auto const backend_shared_memory_limit =
