@@ -256,6 +256,12 @@ class Capabilities:
     # Shape-specific CGA domains for rows that lower several native flavors.
     # ``cgas`` remains the default. A split-specific entry further narrows the
     # domain for split-KV plans without changing the unsplit public domain.
+    # Per-d-shape scheduler domain, mirroring cgas_by_d_shape. Needed because
+    # sched_policies is row-wide while LPT support is per-KERNEL: the SM107 port
+    # dropped `lpt_q_tiles_in_cga_units=True` on most flavors, so a row-wide
+    # claim would advertise LPT for kernels that write nothing under it.
+    # An entry here OVERRIDES sched_policies for that flavor.
+    sched_policies_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
     cgas_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
     split_cgas_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
     pack_gqas: frozenset[bool] = frozenset({False})
@@ -315,6 +321,21 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") ->
     return min(covering, key=lambda shape: (shape[0], shape[1])) if covering else None
 
 
+def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> frozenset[int]:
+    """Scheduler domain of the native flavor the lowering will pick.
+
+    Row-wide `sched_policies` is the floor; a `sched_policies_by_d_shape` entry
+    for the selected flavor replaces it. That is what lets one Rubin row serve a
+    d256 kernel that honours LPT next to flavors that do not.
+    """
+    selected = _selected_d_shape(capabilities, facts)
+    if selected is not None:
+        for shape, shape_domain in capabilities.sched_policies_by_d_shape:
+            if shape == selected:
+                return shape_domain
+    return capabilities.sched_policies
+
+
 def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None) -> frozenset[int]:
     """CGA domain of the native flavor and split leg selected by the graph."""
 
@@ -358,7 +379,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if not isinstance(knobs, SdpaFwdKnobs):
             return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
         for value, domain, label in (
-            (knobs.sched_policy, capabilities.sched_policies, "sched_policy"),
+            (knobs.sched_policy, effective_sched_policies(capabilities, facts), "sched_policy"),
             (knobs.tile_m, capabilities.tile_ms, "tile_m"),
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
             (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv), "cga"),
@@ -702,12 +723,36 @@ def _sm107_spec() -> EngineSpec:
             thd=True,
             thd_d_shapes=SM107_F16_THD_SHAPES,
             cu_seq_len=True,
-            # NATURAL ONLY -- same finding as the FP8 and MXFP8 Rubin rows:
-            # every kernel this row serves is a PORT, and the ported decode
-            # sites do not honor SCHED_LPT (measured on the d512 FP8 and d128
-            # MXFP8 siblings; no SM107 f16 numerics suite exists yet to measure
-            # this one, so the row claims the conservative domain).
+            # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
+            #
+            # The old note here said the ported decode "does not honor
+            # SCHED_LPT". The cause was narrower than that: every SM100 kernel
+            # calls `make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)` and
+            # the SM107 port omitted the argument on 9 of 11 flavors. Without
+            # it the LPT linearization walks a row range CTA_MMA times too
+            # large, no tile is ever claimed, and the kernel writes NOTHING --
+            # cosine 0.0000, which reads like a dead kernel rather than a
+            # scheduling bug. The two flavors that kept it (d128 FP8, d192 FP8)
+            # are exactly the ones previously described as working.
+            #
+            # Restored on every 2-CTA SM107 flavor. It is a NO-OP under
+            # SCHED_NATURAL -- that decode branch never reads q_tiles -- so the
+            # shipped path is unchanged.
+            #
+            # Validated on d256 f16: cos 1.0000 at n_kv 2/3/4/8, dense AND
+            # causal. Measured causal SOL on Rubin at S=4096/8192/32768:
+            # 53.0/71.1/76.7% under NATURAL -> 62.6/79.3/77.5% under LPT
+            # (+18.2/+11.6/+1.1%), recovering 40%/51%/29% of the causal-vs-dense
+            # gap; dense itself is neutral. The decay with S is the signature of
+            # scheduler imbalance, which is what LPT exists to fix.
+            #
+            # Only (256, 256) is claimed: d128 and d512 are unvalidated under
+            # LPT here, and d512 is cga4x1 role-split with a different scheduler
+            # shape. SCHED_LPT_L2 is claimed by NO flavor -- its decode needs
+            # `qh_per_kh` and `seqlen_kv`, which the SM107 call sites do not
+            # pass, so it raises rather than miscomputes. Both are follow-ups.
             sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies_by_d_shape=(((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
@@ -896,21 +941,42 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # this domain (heuristics.py:329), so narrowing means those graphs
             # get LPT instead of going unserved: a scheduling trade, not a
             # correctness one.  Re-widen once the args are threaded everywhere.
-            # Rubin: NATURAL ONLY.  SCHED_LPT is not honored by the PORTED
-            # SM107 kernels (d256 / d512 here) -- a causal d512 FP8 graph under
-            # LPT returns NaN, and all 12 masked d512 cases go green the moment
-            # the row stops claiming it.  Session 6 had already dropped
-            # SCHED_LPT_L2 for the same reason; LPT survived only because
-            # heuristics could not REACH it (the causal primary is LPT_L2, and
-            # the old out-of-domain fallback dropped to NATURAL -- fixed in
-            # heuristics._sched_points, which is what surfaced this).
-            # KNOWN COST: the SHIPPED d128 FP8 kernel *does* honor LPT and loses
-            # that plan here, because sched_policies is row-wide.  Recovering it
-            # needs a per-d-shape domain (a `sched_policies_by_d_shape` mirroring
-            # `cgas_by_d_shape`), or the ported decode sites threaded and
-            # validated.  Correctness first: a knob is honored or the engine is
-            # ineligible, and a user could already request LPT explicitly.
+            # Rubin: NATURAL row-wide, with LPT advertised per-d-shape for the
+            # flavors that have been validated under it.
+            #
+            # The ROOT CAUSE of "the ported kernels do not honor LPT" was a
+            # dropped argument, not an incorrect decode: every SM100 kernel calls
+            # `make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)` and the
+            # SM107 port omitted it on 9 of 11 flavors. Without it the LPT
+            # linearization walks a row range CTA_MMA times too large, no tile
+            # is claimed, and the kernel writes NOTHING (cosine 0.0000). The two
+            # flavors that kept it -- d128 FP8 and d192 FP8 -- are exactly the
+            # ones this comment used to single out as working.
+            #
+            # Restored on every 2-CTA SM107 flavor; it is a no-op under
+            # SCHED_NATURAL, so the shipped path is unchanged (SM107 suite 56
+            # passed, block suite 89 passed). Validated under LPT on d256 f16:
+            # cos 1.0000 at n_kv 2/3/4/8, dense AND causal. Measured causal SOL
+            # on Rubin, S=4096/8192/32768: 53.0/71.1/76.7% NATURAL ->
+            # 62.6/79.3/77.5% LPT (+18.2/+11.6/+1.1%); dense is neutral.
+            #
+            # d512 (cga4x1 role-split) is deliberately untouched: different
+            # scheduler shape, and the old NaN report there is unexplained.
+            #
+            # SCHED_LPT_L2 stays off on Rubin for a DIFFERENT and still-open
+            # reason: its decode needs `qh_per_kh` and `seqlen_kv` at every call
+            # site and the SM107 kernels pass neither, so it raises rather than
+            # miscomputes. Threading those two arguments is the follow-up.
+            #
+            # The "KNOWN COST" this note used to carry -- that the d128 FP8
+            # kernel honours LPT but loses the plan because sched_policies is
+            # row-wide -- is what `sched_policies_by_d_shape` below now fixes.
+            # d128 FP8 is not listed yet only because it is unvalidated here.
             sched_policies=(frozenset({SCHED_NATURAL}) if rubin_row else frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+            # NOT claimed here. `lpt_q_tiles_in_cga_units=True` is restored on the
+            # SM107 FP8 kernels too, so LPT should work, but it has not been
+            # validated on them -- and a row claims only what it can demonstrate.
+            # The f16 row (`_sm107_spec`) carries the validated (256, 256) entry.
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),

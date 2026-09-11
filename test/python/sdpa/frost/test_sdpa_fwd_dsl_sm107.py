@@ -551,3 +551,112 @@ def test_sm107_ones_tile_stays_inside_the_v0_descriptor_window():
     assert supported_cgas_for((192, 128), fp8=False, device_cc=(10, 7)) == (1, 2)
     assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7)) == (2,)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7)) == (1,)
+
+
+# --- LPT on Rubin, advertised PER D-SHAPE -----------------------------------
+#
+# `sched_policies` is row-wide but LPT support is per-KERNEL: the SM107 port
+# dropped `lpt_q_tiles_in_cga_units=True` on 9 of 11 flavors, and without it the
+# LPT decode claims no tile and the kernel writes nothing. The argument is
+# restored everywhere; only the flavors validated under LPT are ADVERTISED.
+
+
+@pytest.mark.L0
+def test_sm107_advertises_lpt_only_for_the_validated_d_shape():
+    """(256, 256) serves LPT; the row-wide default stays NATURAL-only.
+
+    An accept AND a reject, because a capability that is only ever exercised on
+    its accepting side is an untested assertion (engine contract, Rule 9).
+    """
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+    from cudnn.sdpa.fwd import engines
+
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    assert caps.sched_policies == frozenset({SCHED_NATURAL}), "the row-wide floor must stay NATURAL"
+
+    d256 = engines.effective_sched_policies(caps, _f16_facts(d_qk=256, d_v=256))
+    assert SCHED_LPT in d256, "the d256 kernel honours LPT and must advertise it"
+
+    d128 = engines.effective_sched_policies(caps, _f16_facts(d_qk=128, d_v=128))
+    assert SCHED_LPT not in d128, "d128 is unvalidated under LPT; advertising it would be dishonest"
+
+    # LPT_L2 is a separate, still-open gap: its decode needs qh_per_kh and
+    # seqlen_kv, which the SM107 call sites do not pass. No flavor claims it.
+    for shape in ((128, 128), (256, 256), (512, 512)):
+        assert SCHED_LPT_L2 not in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1]))
+
+
+@pytest.mark.L0
+def test_sm107_lpt_knob_is_honored_or_ineligible_per_d_shape():
+    """Requesting LPT must be ACCEPTED at d256 and DECLINED at d128 -- never
+    silently downgraded to NATURAL (engine contract, Rule 4)."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    assert engines.mismatch(caps, _f16_facts(d_qk=256, d_v=256), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None
+    why = engines.mismatch(caps, _f16_facts(d_qk=128, d_v=128), SdpaFwdKnobs(sched_policy=SCHED_LPT))
+    assert why is not None and "sched_policy" in why
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_sm107_d256_desc_version_follows_the_stages_kv_layout(depth):
+    """STAGES_KV moves the last V stage past the 14-bit tcgen05 address window
+    at depth 4, so DESC_VERSION must be DERIVED, not a literal.
+
+    This is the guard for a silent wrong answer: at depth 4 with a version-0
+    descriptor the last two V stages alias the bottom of SMEM and the result is
+    wrong from the KV iteration that first touches one (measured cos 0.68 / 0.50
+    / 0.46 at n_kv 3/4/8).
+    """
+    from dataclasses import replace
+
+    import cudnn.sdpa.fwd.kernels.sm107.prefill_d256_f16 as kern
+
+    cfg = replace(kern.CFG, STAGES_KV=depth)
+    want = 1 if depth >= 4 else 0
+    assert int(kern._needs_desc_v1(cfg)) == want, f"STAGES_KV={depth} must select desc_version {want}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("bad_depth", [0, 1, 5])
+def test_sm107_d256_rejects_an_out_of_domain_stages_kv(bad_depth):
+    """An out-of-domain STAGES_KV must RAISE, never be silently defaulted.
+
+    `make_cfg_d256` reads `stages_kv` as an OPTIONAL attribute, because the
+    shared forward `TemplateParams` has no such field yet -- nothing on the
+    shipped path sets it, so this is a latent path, not a live one. It stops
+    being latent the day the knob is declared, and the failure it would have
+    then is the quiet kind: a truthiness test maps an explicit 0 onto the
+    default 2, so the engine runs a depth the caller did not ask for and the
+    2..4 check below never sees it. That is knob SUBSTITUTION, which the
+    engine contract forbids -- a knob is honored or the engine is ineligible.
+
+    Pinning 0 specifically: 1 and 5 fail under any spelling, but 0 is the only
+    value a truth test swallows, so it is the one that regresses silently.
+    """
+    from dataclasses import dataclass
+
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.config_sm107 import make_cfg_d256
+
+    @dataclass(frozen=True)
+    class _ParamsWithStagesKv(TemplateParams):
+        stages_kv: int = None
+
+    with pytest.raises(ValueError, match="STAGES_KV"):
+        make_cfg_d256(_ParamsWithStagesKv(stages_kv=bad_depth))
+
+
+@pytest.mark.L0
+def test_sm107_d256_stages_kv_defaults_when_the_attribute_is_absent():
+    """The accept side of the test above: a plain TemplateParams (no
+    `stages_kv` attribute at all) still gets the depth-2 default, so the fix
+    for the explicit-zero case did not break the only path that ships."""
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.config_sm107 import make_cfg_d256
+
+    cfg, _ = make_cfg_d256(TemplateParams())
+    assert cfg.STAGES_KV == 2

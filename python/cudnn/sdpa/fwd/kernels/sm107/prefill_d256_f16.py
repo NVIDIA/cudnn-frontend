@@ -50,14 +50,41 @@ CFG, _TMA = make_cfg_d256(PARAMS)
 # per-tile literal.  A version-0 descriptor's ``start_address`` is 14 bits = a
 # 256 KiB window; Rubin raises the per-CTA SMEM cap to 327 KiB, so an operand
 # buffer at or above 256 KiB wraps to offset 0 and the MMA multiplies whatever
-# sits at the bottom of SMEM.  This flavor's buffers all stay below the line.
+# sits at the bottom of SMEM.
+#
+# DERIVED, not a literal, because STAGES_KV moves the last operand's offset:
+# the buffers are laid out sQO | sK[stages] | sV[stages], so the LAST V stage
+# starts at (qBufferElems + stages*kBufferElems + (stages-1)*vBufferElems)*BPE
+# and crosses 256 KiB at STAGES_KV=4.  A hardcoded 0 there is a SILENT wrong
+# answer, and this was shipped: `config_sm107` pinned STAGES_KV to 2 and blamed
+# a ring/parity conflation in the body, but the body derives parity from the
+# absolute `kv_loop & 1` and is depth-agnostic.  Measured on Rubin (cos vs an
+# fp32 reference, n_kv = 2/3/4/8): depth 4 with v0 gives 1.0000/0.6806/0.4980/
+# 0.4640 -- wrong exactly from the KV iteration that first touches the wrapped
+# V stage -- and depth 4 with v1 gives 1.0000 across the board, dense AND
+# causal.  Depth 2 and 3 stay under the line and are correct at v0.
 #
 # Do NOT re-literal this at a call site: the d512 MXFP8 sibling shipped NaN on
 # 100% of cells because its scale-factor tiles were declared UNDER a comment
 # claiming "every operand tile here carries desc_version=1" -- without the
 # kwarg.  A single constant makes that class of drift impossible, and
 # test_sm107_descriptor_version_matches_the_smem_budget asserts it.
-DESC_VERSION: int = 0
+_TCGEN05_V0_ADDR_LIMIT = 262144  # 14-bit start_address window
+
+
+def _needs_desc_v1(cfg) -> bool:
+    """True when any MMA-operand buffer starts at or past the v0 address limit.
+
+    Uses the START of the last V stage, not the total: a buffer that merely
+    ENDS past the line is fine, it is the start address that gets truncated.
+    """
+    last_v_start = (
+        cfg.TILE_M * cfg.TILE_K + cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K // cfg.CTA_MMA) + (cfg.STAGES_KV - 1) * (cfg.TILE_O * cfg.TILE_N // cfg.CTA_MMA)
+    ) * cfg.BPE
+    return last_v_start >= _TCGEN05_V0_ADDR_LIMIT
+
+
+DESC_VERSION: int = 1 if _needs_desc_v1(CFG) else 0
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -162,7 +189,20 @@ N_O_CHUNKS = (CFG.TILE_O * CFG.BPE_O + 127) // 128
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 
-_sdpa_h = make_sdpa_helpers(CFG)
+# lpt_q_tiles_in_cga_units=True is REQUIRED, not optional: under a non-NATURAL
+# policy the LPT linearization needs q_tiles in CGA units, i.e. n_q_supers //
+# CTA_MMA. Without it the decode walks a row range CTA_MMA times too large, no
+# valid tile is ever claimed, and the kernel writes NOTHING -- cosine 0.0000 at
+# every shape, dense and causal, which reads like a dead kernel rather than a
+# scheduling bug.
+#
+# Every SM100 kernel passes it. The SM107 port dropped it on most flavors, and
+# `sdpa/fwd/engines.py` then narrowed the whole Rubin row to
+# sched_policies={SCHED_NATURAL} and blamed the ported decode -- while noting
+# that the d128 FP8 kernel "DOES honor LPT" and loses the plan anyway. That
+# kernel is one of the only two SM107 flavors that kept this argument, which is
+# the actual explanation.
+_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
 _bounds_for_tile = _sdpa_h.bounds_for_tile

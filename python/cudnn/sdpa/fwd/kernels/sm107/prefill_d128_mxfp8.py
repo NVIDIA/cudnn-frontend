@@ -211,7 +211,14 @@ vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 
 
-_sdpa_h = make_sdpa_helpers(CFG)
+# lpt_q_tiles_in_cga_units=True is REQUIRED under any non-NATURAL scheduler:
+# the LPT linearization needs q_tiles in CGA units (n_q_supers // CTA_MMA).
+# Without it the decode walks a row range CTA_MMA times too large, no tile is
+# ever claimed, and the kernel writes NOTHING -- cosine 0.0000 at every shape.
+# It is a NO-OP under SCHED_NATURAL (that decode branch never reads q_tiles),
+# so restoring it cannot change today's shipped path. Every SM100 kernel passes
+# it; the SM107 port dropped it on most flavors. Verified on d256 f16.
+_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
 _bounds_for_tile = _sdpa_h.bounds_for_tile

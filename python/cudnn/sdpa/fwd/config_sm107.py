@@ -740,26 +740,34 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
     tile_k = tile_o = 256
     tile_n = 128
-    # STAGES_KV is a BODY CONSTRAINT here, not a tuning knob -- pin it to 2.
+    # STAGES_KV is a TUNING KNOB again (2..4), and the note that said otherwise
+    # was WRONG about why.
     #
-    # This pipeline runs a Q.K(i+1) -> S.V(i) lookahead against TWO parity
-    # S_acc TMEM slots, and the body conflates the KV ring index with that
-    # parity.  At depth 2 the two coincide and everything is consistent; at
-    # depth 4 they diverge and the MMA consumes the wrong K/V tile from the
-    # third KV iteration onward -- the first time parity slot 0 is REUSED.
+    # It used to be pinned to 2, blaming a body that "conflates the KV ring
+    # index with the 2-slot S_acc parity". That diagnosis does not survive
+    # reading the body: every parity site derives parity from the ABSOLUTE
+    # `kv_loop & 1`, and K/V ride separate PipelineStates advanced in lockstep
+    # with the TMA warp, so the body is depth-agnostic.
     #
-    # Measured on Rubin (d256 FP8 e4m3, cos vs an fp32 reference), n_kv =
-    # 2/3/4/8:  depth 4 -> 0.9996 / 0.6493 / 0.5448 / --  ;
-    #           depth 2 -> 0.9996 / 0.9996 / 0.9996 / 0.9997.
-    # The f16 sibling breaks identically at depth 4, which is how this was
-    # caught: it had been green at depth 2 and regressed when the SM107 config
-    # first adopted the pre-upstream value of 4 wholesale.
+    # The real cause was the >256 KiB tcgen05 descriptor wrap. Buffers are laid
+    # out sQO | sK[stages] | sV[stages]; at depth 4 the last two V stages start
+    # at 256 KiB and 288 KiB, and a VERSION-0 descriptor truncates
+    # `start_address` to 14 bits, so those stages alias the bottom of SMEM. The
+    # answer goes wrong from the KV iteration that first touches a wrapped
+    # stage -- which is why it looked like a ring bug and why it only shows up
+    # at S_kv > 256.
     #
-    # So do NOT "restore" 4 to match the pre-upstream config or to deepen the
-    # ring for latency -- that is a silent-wrong-answer change, and it only
-    # shows up at S_kv > 256.  Deepening it needs the body's parity indexing
-    # decoupled from the ring index first.
-    stages_kv = 2
+    # Measured on Rubin, d256 f16, cos vs an fp32 reference, n_kv = 2/3/4/8:
+    #   depth 4, desc v0:  1.0000 / 0.6806 / 0.4980 / 0.4640   <- the old data
+    #   depth 4, desc v1:  1.0000 / 1.0000 / 1.0000 / 1.0000   dense AND causal
+    #   depth 3, desc v0:  1.0000 / 1.0000 / 1.0000 / 1.0000   (stays under)
+    # `prefill_d256_f16.DESC_VERSION` is now DERIVED from the layout, so any
+    # depth that fits SMEM is correct by construction. Do not re-literal it.
+    # `is not None`, NOT a truth test: a truthiness check maps an explicit
+    # stages_kv=0 onto the default 2, which is a knob SUBSTITUTION -- the one
+    # thing the engine contract forbids (honored or ineligible). Out-of-domain
+    # values must reach the 2..4 check below and raise there.
+    stages_kv = params.stages_kv if getattr(params, "stages_kv", None) is not None else 2
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
     arrivers = _d256_read_tile_arrivers(cta_mma)
 
@@ -828,10 +836,10 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
             (cfg.TILES_Q == 1, f"{flavor}: the d256 pipeline mandates TILES_Q == 1"),
             (cfg.SOFTMAX_WARPGROUPS == 1, f"{flavor}: the d256 pipeline mandates SOFTMAX_WARPGROUPS == 1"),
             (
-                cfg.STAGES_KV == 2,
-                f"{flavor}: the d256 body ties its KV ring index to the 2-slot S_acc parity, so "
-                f"STAGES_KV must be 2 (got {cfg.STAGES_KV}); a deeper ring returns WRONG RESULTS "
-                f"from the third KV iteration on, silently, and only at S_kv > 256",
+                2 <= cfg.STAGES_KV <= 4,
+                f"{flavor}: STAGES_KV must be in 2..4 (got {cfg.STAGES_KV}); the upper bound is the "
+                f"{SMEM_USABLE_BYTES // 1024} KiB Rubin carveout, and the kernel derives its tcgen05 "
+                f"descriptor version from the resulting layout so every depth in range is correct",
             ),
         ]
     )
