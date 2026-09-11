@@ -384,7 +384,7 @@ e2e `test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors`.
 
 Still declined, and why: d128/d512 f16, d128 FP8 (tolerance, above) and every
 MXFP8 flavor are **unvalidated** under LPT rather than known-incorrect; d512
-(f16, FP8, MXFP8) is **known-broken** under LPT until the d512 kernels get the
+(f16, FP8, MXFP8) **does not produce output** under LPT until the d512 kernels get the
 `lpt_q_tiles_in_cga_units` argument and are re-validated (cga4×1 role-split, a
 different scheduler shape — `prefill_d512_fp8.py:2533` notes the LPT range is
 `q_clusters * CTA_MMA`). `SCHED_LPT_L2` is declined by **every** flavor —
