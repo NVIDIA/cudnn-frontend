@@ -63,8 +63,8 @@ Raw captures aggressively reuse buffers. API allocation, cache state, CuTeDSL
 specialization, graph scheduling and unlocked clocks can differ across modes.
 Consequently **API minus raw is a comparison gap, not a precise attribution of
 framework overhead**; small negative gaps must not be interpreted as speedups
-over identical kernel execution. Inputs remain fixed, so this is a warm-cache
-synthetic workload, not a Tokamax training workload. Mode order is fixed and
+over identical kernel execution. Inputs remain fixed, so these measurements
+cover a synthetic workload with warm caches. Mode order is fixed and
 CPU affinity/clocks are not locked; retain the sample ranges when interpreting
 small differences. Custom-VJP end-to-end gradient timing, variable-count rows,
 compilation latency and peak workspace are outside this sweep.
@@ -144,5 +144,5 @@ Before performance qualification, cache a stable initialized-output callee and
 verify repeated eager calls stop compiling; profile the remaining jitted FFI
 cost; and evaluate torch launch-plan/workspace reuse against existing API
 semantics. These are follow-up runtime changes, not hidden benchmark shortcuts.
-Repeat the comparison with representative Tokamax metadata and a qualified
+Repeat the comparison with representative sparse metadata and a qualified
 source build. No runtime implementation was changed for this benchmark.
