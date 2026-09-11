@@ -569,24 +569,23 @@ class FlashAttentionDSABackwardSm100:
             self.acc_dtype,
         )
         self.initialize_dKV_workspace(mdKV_acc, mKV.shape[0], stream)
-        if cutlass.const_expr(self.same_hdim_kv):
-            self.sum_OdO(
-                mOut,
-                mdO,
-                sum_OdO,
-                mLSE,
-                mAttnSink,
-                scaled_LSE,
-                Float32(-1.0),
-                Float32(-math.log2(math.e)),
-                problem_shape,
-            ).launch(
-                grid=self._compute_sum_OdO_grid(problem_shape, self.sum_OdO_block_q),
-                block=[self.sum_OdO_num_threads_d, self.sum_OdO_num_threads_q, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                min_blocks_per_mp=1,
-            )
+        self.sum_OdO(
+            mOut,
+            mdO,
+            sum_OdO,
+            mLSE,
+            mAttnSink,
+            scaled_LSE,
+            Float32(-1.0),
+            Float32(-math.log2(math.e)),
+            problem_shape,
+        ).launch(
+            grid=self._compute_sum_OdO_grid(problem_shape, self.sum_OdO_block_q),
+            block=[self.sum_OdO_num_threads_d, self.sum_OdO_num_threads_q, 1],
+            cluster=[1, 1, 1],
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
         num_head_blocks = cute.ceil_div(problem_shape[3][0], self.block_tile)
         q_wave_size = self.q_wave_ctas if cutlass.const_expr(self.q_wave_ctas > 0) else problem_shape[0]
         if cutlass.const_expr(self.serialize_head_blocks):
@@ -614,16 +613,11 @@ class FlashAttentionDSABackwardSm100:
                     tma_tensor_dQ,
                     tma_atom_dQ_64,
                     tma_tensor_dQ_64,
-                    mOut,
-                    mdO,
-                    mLSE,
                     mKV,
                     mdQ,
                     mdKV_acc,
                     q_offset,
                     head_block_offset,
-                    mdSink,
-                    mAttnSink,
                     mTopkIdxs,
                     mTopkLength,
                     scaled_LSE,
@@ -848,16 +842,11 @@ class FlashAttentionDSABackwardSm100:
         tma_tensor_dQ: cute.Tensor,
         tma_atom_dQ_64: Optional[cute.CopyAtom],
         tma_tensor_dQ_64: Optional[cute.Tensor],
-        mOut: cute.Tensor,
-        mdO: cute.Tensor,
-        mRawLSE: cute.Tensor,
         mKV: cute.Tensor,
         mdQ: cute.Tensor,
         mdKV_acc: cute.Tensor,
         q_offset: Int32,
         head_block_offset: Int32,
-        mdSink: cute.Tensor,
-        mAttnSink: cute.Tensor,
         mTopkIdxs: cute.Tensor,
         mTopkLength: Optional[cute.Tensor],
         mLSE: cute.Tensor,
@@ -914,22 +903,6 @@ class FlashAttentionDSABackwardSm100:
         # Treat malformed negative lengths as empty as well so they cannot
         # enter the same zero-tile pipeline path.
         if topk <= 0:
-            if cutlass.const_expr(not self.same_hdim_kv):
-                if warp_idx in self.reduce_warp_id:
-                    self.compute_sum_OdO_lse(
-                        mOut,
-                        mdO,
-                        mRawLSE,
-                        mAttnSink,
-                        mSum_OdO,
-                        mLSE,
-                        None,
-                        None,
-                        token_idx,
-                        head_block_idx,
-                        None,
-                        None,
-                    )
             for linear_idx in cutlass.range(tidx, self.head_dim * self.block_tile, self.threads_per_cta):
                 head_offset = linear_idx // self.head_dim
                 dim_idx = linear_idx % self.head_dim
@@ -1207,24 +1180,6 @@ class FlashAttentionDSABackwardSm100:
 
         elif warp_idx in self.reduce_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            # Reducers otherwise wait for the first dKV fragment.  Use that
-            # prologue bubble to prepare the 64 per-head scalars, eight heads
-            # per warp, and publish them before the compute warps need P/dS.
-            if cutlass.const_expr(not self.same_hdim_kv):
-                self.compute_sum_OdO_lse(
-                    mOut,
-                    mdO,
-                    mRawLSE,
-                    mAttnSink,
-                    mSum_OdO,
-                    mLSE,
-                    sSum_OdO,
-                    sLSE,
-                    token_idx,
-                    head_block_idx,
-                    load_compute_sum_OdO_pipeline,
-                    load_compute_LSE_pipeline,
-                )
             tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
 
@@ -1264,93 +1219,6 @@ class FlashAttentionDSABackwardSm100:
 
         else:
             cute.arch.setmaxregister_decrease(self.num_regs_empty)
-
-    @cute.jit
-    def compute_sum_OdO_lse(
-        self,
-        mOut: cute.Tensor,
-        mdO: cute.Tensor,
-        mRawLSE: cute.Tensor,
-        mAttnSink: cute.Tensor,
-        mSum_OdO: cute.Tensor,
-        mScaledLSE: cute.Tensor,
-        sSum_OdO: Optional[cute.Tensor],
-        sLSE: Optional[cute.Tensor],
-        token_idx: Int32,
-        head_block_idx: Int32,
-        sum_pipeline,
-        lse_pipeline,
-    ):
-        """Compute the per-head O*dO and sink-adjusted LSE on idle warps."""
-        tidx, _, _ = cute.arch.thread_idx()
-        _, _, batch_idx = cute.arch.block_idx()
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        lane = tidx % self.threads_per_warp
-        helper_warp = warp_idx - self.reduce_warp_id[0]
-        subgroup = lane // self.sum_OdO_num_threads_d
-        lane_in_subgroup = lane % self.sum_OdO_num_threads_d
-
-        if cutlass.const_expr(sSum_OdO is not None):
-            sum_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_compute_sum_OdO_stage)
-            lse_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_compute_LSE_stage)
-            sum_pipeline.producer_acquire(sum_state)
-            lse_pipeline.producer_acquire(lse_state)
-
-        for head_round in cutlass.range_constexpr(2):
-            head_offset = head_round * 32 + helper_warp * 4 + subgroup
-            head_idx = head_block_idx * self.block_tile + head_offset
-
-            # The generic backend also handles the final partial head block
-            # of H32/H96, so guard its global accesses explicitly.
-            valid_head = head_idx < mOut.shape[0]
-
-            acc = Float32(0.0)
-            if valid_head:
-                O_head = cute.logical_divide(
-                    mOut[head_idx, None, (token_idx, batch_idx)],
-                    cute.make_layout(self.sum_OdO_elem_per_load),
-                )
-                dO_head = cute.logical_divide(
-                    mdO[head_idx, None, (token_idx, batch_idx)],
-                    cute.make_layout(self.sum_OdO_elem_per_load),
-                )
-                for idx_d in cutlass.range(
-                    lane_in_subgroup,
-                    self.head_dim_v // self.sum_OdO_elem_per_load,
-                    self.sum_OdO_num_threads_d,
-                    unroll_full=True,
-                ):
-                    O_frag = O_head[None, idx_d].load().to(self.acc_dtype)
-                    dO_frag = dO_head[None, idx_d].load().to(self.acc_dtype)
-                    acc += (O_frag * dO_frag).reduce(cute.ReductionOp.ADD, 0.0, reduction_profile=0)
-
-            acc = cute.arch.warp_reduction_sum(acc, threads_in_group=self.sum_OdO_num_threads_d)
-            if lane_in_subgroup == 0:
-                sum_odo = Float32(0.0)
-                scaled_lse = Float32(float("-inf"))
-                if valid_head:
-                    sum_odo = -acc
-                    lse = mRawLSE[head_idx, (token_idx, batch_idx)]
-                    sink = mAttnSink[head_idx, (0, batch_idx)]
-                    log2_e = Float32(math.log2(math.e))
-                    lse_log2 = lse * log2_e
-                    sink_log2 = sink * log2_e
-                    lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
-                    sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
-                    scaled_lse = -(lse_max_log2 + cute.math.log2(sum_exp2))
-                    if (lse == Float32(float("-inf")) and sink == Float32(float("-inf"))) or lse == Float32(float("inf")) or sink == Float32(float("inf")):
-                        scaled_lse = Float32(float("-inf"))
-
-                    mSum_OdO[head_idx, (token_idx, batch_idx)] = sum_odo
-                    mScaledLSE[head_idx, (token_idx, batch_idx)] = scaled_lse
-                if cutlass.const_expr(sSum_OdO is not None):
-                    sSum_OdO[head_offset, sum_state.index] = sum_odo
-                    sLSE[head_offset, lse_state.index] = scaled_lse
-
-        if cutlass.const_expr(sSum_OdO is not None):
-            cute.arch.fence_proxy("async.shared", space="cta")
-            sum_pipeline.producer_commit(sum_state)
-            lse_pipeline.producer_commit(lse_state)
 
     @cute.jit
     def load(
@@ -1410,44 +1278,43 @@ class FlashAttentionDSABackwardSm100:
         )
         load_mma_QdO_producer_state.advance()
 
-        if cutlass.const_expr(self.same_hdim_kv):
-            lse_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_compute_LSE_stage)
-            sum_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_compute_sum_OdO_stage)
-            async_copy_atom = cute.make_copy_atom(
-                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
-                self.acc_dtype,
-                num_bits_per_copy=64,
-            )
-            async_tiled_copy = cute.make_tiled_copy_tv(
-                async_copy_atom,
-                cute.make_layout(32, stride=1),
-                cute.make_layout(2, stride=1),
-            )
-            thr_async_copy = async_tiled_copy.get_slice(local_tidx)
-            gLSE = cute.flat_divide(mLSE, (self.block_tile,))
-            gSum_OdO = cute.flat_divide(mSum_OdO, (self.block_tile,))
-            head_offset = local_tidx * 2
-            valid_heads = mLSE.shape[0] - head_block_idx * self.block_tile
+        lse_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_compute_LSE_stage)
+        sum_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_compute_sum_OdO_stage)
+        async_copy_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
+            self.acc_dtype,
+            num_bits_per_copy=64,
+        )
+        async_tiled_copy = cute.make_tiled_copy_tv(
+            async_copy_atom,
+            cute.make_layout(32, stride=1),
+            cute.make_layout(2, stride=1),
+        )
+        thr_async_copy = async_tiled_copy.get_slice(local_tidx)
+        gLSE = cute.flat_divide(mLSE, (self.block_tile,))
+        gSum_OdO = cute.flat_divide(mSum_OdO, (self.block_tile,))
+        head_offset = local_tidx * 2
+        valid_heads = mLSE.shape[0] - head_block_idx * self.block_tile
 
-            load_compute_LSE_pipeline.producer_acquire(lse_state)
-            gLSE_copy = thr_async_copy.partition_S(gLSE[None, head_block_idx, (token_idx, batch_idx)])
-            sLSE_copy = thr_async_copy.partition_D(sLSE)
-            if head_offset < valid_heads:
-                cute.copy(async_copy_atom, gLSE_copy[None, 0], sLSE_copy[None, 0, lse_state.index])
-            else:
-                sLSE[head_offset, lse_state.index] = Float32(float("-inf"))
-                sLSE[head_offset + 1, lse_state.index] = Float32(float("-inf"))
-            load_compute_LSE_pipeline.producer_commit(lse_state)
+        load_compute_LSE_pipeline.producer_acquire(lse_state)
+        gLSE_copy = thr_async_copy.partition_S(gLSE[None, head_block_idx, (token_idx, batch_idx)])
+        sLSE_copy = thr_async_copy.partition_D(sLSE)
+        if head_offset < valid_heads:
+            cute.copy(async_copy_atom, gLSE_copy[None, 0], sLSE_copy[None, 0, lse_state.index])
+        else:
+            sLSE[head_offset, lse_state.index] = Float32(float("-inf"))
+            sLSE[head_offset + 1, lse_state.index] = Float32(float("-inf"))
+        load_compute_LSE_pipeline.producer_commit(lse_state)
 
-            load_compute_sum_OdO_pipeline.producer_acquire(sum_state)
-            gSum_copy = thr_async_copy.partition_S(gSum_OdO[None, head_block_idx, (token_idx, batch_idx)])
-            sSum_copy = thr_async_copy.partition_D(sSum_OdO)
-            if head_offset < valid_heads:
-                cute.copy(async_copy_atom, gSum_copy[None, 0], sSum_copy[None, 0, sum_state.index])
-            else:
-                sSum_OdO[head_offset, sum_state.index] = Float32(0.0)
-                sSum_OdO[head_offset + 1, sum_state.index] = Float32(0.0)
-            load_compute_sum_OdO_pipeline.producer_commit(sum_state)
+        load_compute_sum_OdO_pipeline.producer_acquire(sum_state)
+        gSum_copy = thr_async_copy.partition_S(gSum_OdO[None, head_block_idx, (token_idx, batch_idx)])
+        sSum_copy = thr_async_copy.partition_D(sSum_OdO)
+        if head_offset < valid_heads:
+            cute.copy(async_copy_atom, gSum_copy[None, 0], sSum_copy[None, 0, sum_state.index])
+        else:
+            sSum_OdO[head_offset, sum_state.index] = Float32(0.0)
+            sSum_OdO[head_offset + 1, sum_state.index] = Float32(0.0)
+        load_compute_sum_OdO_pipeline.producer_commit(sum_state)
 
     @cute.jit
     def _copy_kv_row(
@@ -2936,31 +2803,19 @@ class FlashAttentionDSABackwardSm100:
         )
 
     def make_and_init_load_compute_LSE_pipeline(self, load_compute_lse_mbar_ptr):
-        if self.same_hdim_kv:
-            pipeline_cls = pipeline.PipelineCpAsync
-            producer_threads = self.threads_per_warp
-        else:
-            pipeline_cls = pipeline.PipelineAsync
-            producer_threads = self.num_reduce_warps * self.threads_per_warp
-        return pipeline_cls.create(
+        return pipeline.PipelineCpAsync.create(
             barrier_storage=load_compute_lse_mbar_ptr,
             num_stages=self.load_compute_LSE_stage,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_threads),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.threads_per_warp),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.threads_per_warp * self.num_compute_warps),
             defer_sync=True,
         )
 
     def make_and_init_load_compute_sum_OdO_pipeline(self, load_compute_sum_OdO_mbar_ptr):
-        if self.same_hdim_kv:
-            pipeline_cls = pipeline.PipelineCpAsync
-            producer_threads = self.threads_per_warp
-        else:
-            pipeline_cls = pipeline.PipelineAsync
-            producer_threads = self.num_reduce_warps * self.threads_per_warp
-        return pipeline_cls.create(
+        return pipeline.PipelineCpAsync.create(
             barrier_storage=load_compute_sum_OdO_mbar_ptr,
             num_stages=self.load_compute_sum_OdO_stage,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_threads),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.threads_per_warp),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.threads_per_warp * self.num_compute_warps),
             defer_sync=True,
         )

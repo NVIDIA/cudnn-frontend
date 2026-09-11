@@ -816,6 +816,8 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
         pytest.param(576, 16, (0, 1, 127, 128, 129, 511, 512, 513), id="d576-h16-m128-boundaries"),
         pytest.param(576, 32, (0, 1, 63, 64, 65, 127, 128), id="d576-h32-m64-boundaries"),
         pytest.param(576, 64, (0, 1, 63, 64, 65, 127, 128), id="d576-h64-m64-boundaries"),
+        # Cross the standalone OdO/LSE preprocessor's 41-query block boundary.
+        pytest.param(576, 64, (0, 1, 128) * 14, id="d576-h64-odo-query-tail"),
         pytest.param(
             576,
             64,
