@@ -77,17 +77,16 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 
 
 @pytest.mark.L0
-def test_DSA_sparse_attention_backward_sm100_h96_dispatch_is_fail_closed():
-    """Keep the H96 composition off shapes where its extra launch dominates."""
+def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
+    """Select the H96 composition for every supported non-deterministic shape."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_backend
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    assert _select_sm100_backend(96, 576, max_topk=512, total_s_q=256) == ("generic_m64", 64)
-    assert _select_sm100_backend(96, 576, max_topk=512, total_s_q=1024) == ("h96_h64_h32", 64)
-    assert _select_sm100_backend(96, 576, max_topk=1024, total_s_q=256) == ("h96_h64_h32", 64)
-    assert _select_sm100_backend(96, 576, max_topk=2048, total_s_q=256, deterministic=True) == ("generic_m64", 64)
+    assert _select_sm100_backend(96, 576, max_topk=512) == ("h96_h64_h32", 64)
+    assert _select_sm100_backend(96, 576, max_topk=1024) == ("h96_h64_h32", 64)
+    assert _select_sm100_backend(96, 576, max_topk=2048, deterministic=True) == ("generic_m64", 64)
 
 
 @pytest.mark.L0
