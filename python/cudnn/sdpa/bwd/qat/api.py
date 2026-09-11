@@ -14,7 +14,7 @@ import torch
 
 from cudnn.api_base import APIBase, TupleDict
 
-from ._workspace import nvfp4_workspace_layout
+from ._workspace import frost_workspace_layout, nvfp4_workspace_layout
 
 _SUPPORTED_CAPABILITIES = {(10, 0), (10, 3), (12, 0), (12, 1)}
 
@@ -178,10 +178,9 @@ class Nvfp4AttentionQatBackward(APIBase):
         if self.backend != "triton":
             reason = self._frost_support_reason(capability)
             if reason is None:
-                # Sizes only: no kernel import, free-memory query, or allocation.
-                # Fake Q/K/V (BF16) + raw delta (FP32): O(S), independent of
-                # head_chunk (which only sets the launch granularity).
-                required = 3 * heads * seqlen_q * head_dim * 2 + heads * seqlen_q * 4
+                # Sizes only (shared layout helper, no kernel import): O(S) and
+                # independent of head_chunk, which only sets the launch granularity.
+                _, required = frost_workspace_layout(heads, seqlen_q)
                 chunk = self.head_chunk or heads
                 if self.workspace_limit_bytes is not None and required > self.workspace_limit_bytes:
                     reason = f"NVFP4 QAT FROST workspace does not fit workspace_limit_bytes={self.workspace_limit_bytes}"

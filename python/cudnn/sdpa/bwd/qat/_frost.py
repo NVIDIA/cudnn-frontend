@@ -20,21 +20,13 @@ from ._frost_dq_kernel import compile as compile_dq
 from ._frost_kernel import compile as compile_core
 from ._interface import _workspace_tensor
 from ._nvfp4 import fake_quantize_kv, fake_quantize_q
-from ._workspace import _align_up
+from ._workspace import frost_workspace_layout
 
 
 def workspace_layout(heads: int, sequence: int, head_chunk: int):
-    """Q/K/V in native BSHD and raw delta in BHS: O(S), independent of head_chunk."""
+    """Q/K/V in native BSHD and raw delta in BHS; see _workspace.frost_workspace_layout (shared with api.py)."""
     del head_chunk  # launch granularity only
-    entries, offset = [], 0
-    for shape, dtype in (
-        *((((1, sequence, heads, 128), torch.bfloat16),) * 3),
-        ((1, heads, sequence), torch.float32),
-    ):
-        offset = _align_up(offset)
-        entries.append((offset, shape, dtype))
-        offset += math.prod(shape) * dtype.itemsize
-    return tuple(entries), _align_up(offset)
+    return frost_workspace_layout(heads, sequence)
 
 
 @dataclass(frozen=True)

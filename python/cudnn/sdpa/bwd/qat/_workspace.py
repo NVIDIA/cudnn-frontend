@@ -44,3 +44,17 @@ def nvfp4_workspace_layout(
         entries.append((offset, normalized_shape, dtype))
         offset += _numel(normalized_shape) * dtype.itemsize
     return tuple(entries), _align_up(offset)
+
+
+def frost_workspace_layout(heads: int, sequence: int) -> tuple[tuple[WorkspaceEntry, ...], int]:
+    """FROST scratch: fake Q/K/V in BSHD and raw delta in BHS (O(S), independent of
+    head_chunk).  The single formula shared by api.py (sizing) and _frost.py (carving)."""
+    entries, offset = [], 0
+    for shape, dtype in (
+        *((((1, sequence, heads, 128), torch.bfloat16),) * 3),
+        ((1, heads, sequence), torch.float32),
+    ):
+        offset = _align_up(offset)
+        entries.append((offset, shape, dtype))
+        offset += _numel(shape) * dtype.itemsize
+    return tuple(entries), _align_up(offset)
