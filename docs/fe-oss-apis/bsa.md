@@ -100,7 +100,7 @@ is consumed. Values in the inactive suffix are ignored.
 - With fixed counts, `block_sparse_num` must be in `[1, K_max]`. The
   SM100/SM103 blk128 path additionally requires an even value, i.e. an even
   `block_sparse_num` in `[2, K_max]`.
-- The `block_sizes` entry for every physical KV block referenced by an active
+- The `block_sizes` entry for every caller-visible KV block referenced by an active
   `q2k_block_index` value must be in `[1, sparse_block_size]`. Entries for
   unreferenced physical KV blocks are ignored. A zero-sized referenced block is
   not supported; use `q2k_block_nums` (or the sparse index prefix) to drop the
@@ -121,10 +121,18 @@ Provide `block_sizes` whenever a referenced final block is only partially
 valid.
 
 `sparse_block_size=None` chooses blk64 on SM90/SM120 and blk128 on
-SM100/SM103. Passing `sparse_block_size=64` explicitly selects the SM100/SM103
-blk64 CuTe DSL path, whose shape support is narrower. `kv_splits` is available
-on SM90 and the explicit Blackwell blk64 path; `use_clc` applies only to the
-explicit Blackwell blk64 path.
+SM100/SM103. Passing `sparse_block_size=128` explicitly on SM120 selects the
+logical-blk128 BF16 path. It requires QK/V dimensions of 128 and `S_kv` to be
+a multiple of 128. Its logical metadata is expanded on the current CUDA stream
+and dispatched through the native SM120 blk64 kernel; Q, K, and V are not
+copied. The path supports MHA, GQA, and MQA with unpacked per-query-head
+metadata, so `pack_gqa` must be `None` or `False`.
+
+Passing `sparse_block_size=64` explicitly selects the SM100/SM103 blk64 CuTe
+DSL path, whose shape support is narrower. `kv_splits` is available on SM90 and
+the explicit Blackwell blk64 path; `use_clc` applies only to the explicit
+Blackwell blk64 path. SM120 logical blk128 requires `kv_splits=1` and
+`use_clc=None`.
 
 `kv_splits=2..256` computes FP32 partial outputs and combines them, with
 workspace growing linearly in the split count. SM90 accepts an explicit integer
@@ -225,6 +233,7 @@ therefore requires full physical KV blocks and `block_sizes=None`.
 | SM100/SM103 | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
 | SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
+| SM120 | 128 (logical, explicit) | BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 
 SM90 currently requires `S_q` to be a multiple of 64. Its fixed count may be
@@ -235,6 +244,8 @@ defaults to `False`; when it is `True`, empty rows (`q2k_block_nums == 0`)
 produce `O = 0` and `LSE = -inf`. SM90 selects the empty-row handling as a
 compile-time specialization, so the default non-empty configuration keeps its
 branch-free fast path. Split-KV execution therefore excludes empty rows.
+Regular SM120 forward accepts `block_sizes` shaped `(N_kv,)`, `(B, N_kv)`, or
+`(B, H_q, N_kv)` for both sparse block sizes.
 
 ### Backward
 
