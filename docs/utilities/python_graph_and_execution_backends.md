@@ -579,6 +579,48 @@ only to decline is why `closed_under` existed.
   function, list the cell in `_TILE_RULE_CELLS`, and put the measurement in the
   commit.
 
+### The compiled-plan cache
+
+`cute.compile` runs the whole backend once per process for every distinct
+kernel — 0.7 s for a FROST GEMM, 2.6 s for an SDPA prefill on SM100 — and the
+DSL's own file cache stores only MLIR bytecode, so a process that warms tens
+of plans pays minutes at start-up. `cudnn.frost.compiled_cache` keeps the
+exported tvm-ffi object of every kernel compiled with `--enable-tvm-ffi` and
+reloads it in milliseconds. `compile_cached(fn, *args, cache_key=, symbol=,
+**kwargs)` is the drop-in for `cute.compile` at a kernel's compile site; the
+FROST GEMM templates route through it with the digest of their generated
+source as the key (44 kernels of the GEMM suites: 44 s cold, 12 s warm).
+
+The rules, borrowed from FlashInfer's autotune cache v2 so that a stale
+artifact can never be reused by accident:
+
+- **Identity is the whole manifest, hashed.** Frontend, cutlass-dsl and
+  tvm-ffi versions, the CUDA driver, and the device's name, compute
+  capability, SM count and L2 size (FROST bakes the last two into kernels)
+  name the directory `<root>/v1/<env_hash>/`. Any change lands elsewhere; an
+  unreadable field is hashed as `"unknown"`, never skipped.
+- **An entry is reused only under its own embedded key.** `entry.json`
+  carries the full key, symbol and signature and is compared on load; the
+  object is written first and the record after it (the commit marker), both
+  via temp file + `os.replace`, so a crash or a concurrent writer never
+  yields a loadable entry without its key.
+- **Anything doubtful is a miss**: missing, malformed, mismatched, or an
+  object `load_module` refuses (an arch the device cannot run). Never an error.
+- **A hit and a miss run the same thing.** A reloaded tvm-ffi function is
+  positional-only, so it is wrapped with a kwargs wrapper built from the
+  kernel's Python signature; the miss path exports and then reloads, so a bad
+  artifact fails at build time, not at the next start-up. Kernels whose
+  in-process object converts raw pointer arguments are not cached.
+- Location: `CUDNN_FRONTEND_COMPILED_CACHE`, else
+  `$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`; `set_cache_dir()` for a
+  caller that owns a workspace (FlashInfer); `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`
+  turns it off; `stats()` reports hits / misses / bypassed / invalid per
+  process. Bump `_SCHEMA` on any incompatible change.
+
+Not yet routed: the SDPA and linear-attention kernel templates (their
+`cute.compile` calls take per-kernel keyword sets; same hook, one key per
+`(template, params, kwargs)`).
+
 ## Key invariants
 
 - **uid ownership**: the Python IR owns the whole uid namespace; every uid is
