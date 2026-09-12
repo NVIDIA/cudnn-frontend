@@ -4,6 +4,9 @@
 from importlib import import_module
 
 _SYMBOLS = {
+    "block_sparse_attention_forward_jax": (".jax_api", "block_sparse_attention_forward_jax"),
+    "block_sparse_attention_backward_jax": (".jax_api", "block_sparse_attention_backward_jax"),
+    "block_sparse_attention_jax": (".jax_api", "block_sparse_attention_jax"),
     "block_sparse_attention_forward": (".api", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".api", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".api", "block_sparse_attention_backward"),
