@@ -25,12 +25,12 @@ as guaranteed numbers; clocks, thermals, and competing work affect results.
 
 | Density | Pattern | Sparse median | Speedup vs dense | Density conversion |
 | ---: | --- | ---: | ---: | ---: |
-| 14.9776% | strided | 33.5868 ms | 6.6767x | 100.0005% |
-| 14.9776% | local | 33.4844 ms | 6.6971x | 100.3064% |
-| 20.0000% | strided | 44.8006 ms | 5.0055x | 100.1096% |
-| 20.0000% | local | 44.6532 ms | 5.0220x | 100.4401% |
+| 14.9776% | strided | 32.5618 ms | 6.8960x | 103.2852% |
+| 14.9776% | local | 32.5812 ms | 6.8919x | 103.2234% |
+| 20.0000% | strided | 43.4039 ms | 5.1734x | 103.4679% |
+| 20.0000% | local | 43.4490 ms | 5.1680x | 103.3605% |
 
-The dense median in that run was 224.2484 ms. The kernel consumes logical
+The dense median in that run was 224.5454 ms. The kernel consumes logical
 blk128 metadata directly; the benchmark does not expand it to blk64 metadata.
 
 The fixed-top-k, full-KV-block case now selects an FA4-style SM120
@@ -47,3 +47,20 @@ paired run against the original native blk128 kernel produced:
 The specialization is used when `q2k_block_nums=None`, `block_sizes=None`, and
 the KV sequence length is divisible by 128. Other blk128 inputs continue to use
 the general native kernel. Both paths consume blk128 metadata directly.
+
+The fixed-top-k main loop uses two-fold dynamic-loop unrolling. An interleaved
+61-repeat A/B run compared it with the otherwise identical non-unrolled loop;
+O and LSE were bit-exact between the two kernels.
+
+| Density | Pattern | Non-unrolled loop | Two-fold unroll | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 14.9776% | strided | 32.5327 ms | 32.3441 ms | 1.0058x |
+| 14.9776% | local | 32.6073 ms | 32.4250 ms | 1.0056x |
+| 20.0000% | strided | 43.8519 ms | 43.5766 ms | 1.0063x |
+| 20.0000% | local | 43.9766 ms | 43.7476 ms | 1.0052x |
+
+The same screening rejected output TMA stores (about 0.1%, below the adoption
+threshold), L2 K/V prefetching, fixed-bound specialization, two-Q-tile
+persistence, delayed V waits, warp-voted identity rescaling, and source-level
+QK loop reordering. Those alternatives were either neutral or slower on the
+target workload.

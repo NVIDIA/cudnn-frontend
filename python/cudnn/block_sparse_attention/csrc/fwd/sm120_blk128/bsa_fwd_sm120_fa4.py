@@ -294,10 +294,12 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                 envelope=False,
             )
 
-            logical_idx -= 1
-            while logical_idx >= 0:
+            # Two-fold unrolling reduces loop-control issue overhead while
+            # keeping the fixed-top-k bound dynamic across cached launches.
+            for load_offset in cutlass.range(num_kv_tiles - 1, unroll=2):
                 # Resolve the next sparse address before waiting for K to be
                 # consumed so the metadata load overlaps the QK work.
+                logical_idx = num_kv_tiles - 2 - load_offset
                 physical_idx = gIndices[logical_idx]
                 prims.barrier_cta_sync(
                     self.bar_k_consumed,
@@ -328,7 +330,6 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                     is_v=True,
                     envelope=False,
                 )
-                logical_idx -= 1
 
             prims.barrier_cta_sync(
                 self.bar_k_consumed,
@@ -407,8 +408,8 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                 in_mask_steps=False,
                 is_first_kv_tile=True,
             )
-            logical_idx -= 1
-            while logical_idx >= 0:
+            for compute_offset in cutlass.range(num_kv_tiles - 1, unroll=2):
+                logical_idx = num_kv_tiles - 2 - compute_offset
                 self.compute_one_kv_tile(
                     basic_params,
                     mma_params,
@@ -419,7 +420,6 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                     in_mask_steps=False,
                     is_first_kv_tile=False,
                 )
-                logical_idx -= 1
 
             ln2 = cutlass.Float32(0.6931471805599453)
             row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
