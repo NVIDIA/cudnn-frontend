@@ -18,6 +18,7 @@ _LAZY_EXPORTS = {
     "b2b_causal_conv1d": (".causal_conv1d", "b2b_causal_conv1d"),
     "causal_conv1d_update": ("._causal_conv1d_update", "causal_conv1d_update"),
     "fft_causal_conv1d": (".fft_causal_conv1d", "fft_causal_conv1d"),
+    "fwht_mxfp4_qdq": (".fwht_mxfp4_qdq", "fwht_mxfp4_qdq"),
 }
 
 __all__ = list(_LAZY_EXPORTS)
