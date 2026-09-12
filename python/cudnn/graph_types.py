@@ -282,6 +282,55 @@ def describing_tensor(uid: int, dim, stride, data_type) -> Tensor:
     return tensor
 
 
+def storage_geometry(dim, stride, data_type):
+    """A cuDNN (element) geometry as the STORAGE-slot geometry a buffer reports.
+
+    Every dtype but fp4 stores one element per slot, so the geometry is its
+    own. fp4 packs two elements per slot along the unit-stride axis (torch's
+    ``float4_e2m1fn_x2``, or a uint8 view): that extent halves and every other
+    stride halves with it. None when the extent is odd -- no slot geometry
+    spells it. Shared by the variant pack (which stores slots) and the engines
+    that compare a slot against a declaration.
+    """
+    import cudnn
+
+    dim = tuple(int(d) for d in dim)
+    if stride:
+        stride = tuple(int(x) for x in stride)
+    else:
+        acc, dense = 1, []
+        for d in reversed(dim):
+            dense.insert(0, acc)
+            acc *= d
+        stride = tuple(dense)
+    if data_type != cudnn.data_type.FP4_E2M1:
+        return dim, stride
+    # The packed axis is a unit-stride axis with an even extent above one -- a
+    # singleton axis may also carry stride 1 and must not be the one picked.
+    for c, (extent, step) in enumerate(zip(dim, stride)):
+        if step != 1 or extent <= 1 or extent % 2:
+            continue
+        if any(x % 2 for j, x in enumerate(stride) if j != c and x != 1):
+            continue
+        # a singleton axis keeps its (never stepped) unit stride
+        return tuple(d // 2 if j == c else d for j, d in enumerate(dim)), tuple(x if (j == c or x == 1) else x // 2 for j, x in enumerate(stride))
+    return None
+
+
+def storage_slot_bytes(data_type) -> "int | None":
+    """Bytes per STORAGE slot of a declared dtype: 1 for fp4 (two elements per
+    slot), the element width otherwise, None when the width is unknown."""
+    import cudnn
+
+    if data_type == cudnn.data_type.FP4_E2M1:
+        return 1
+    from .datatypes import _CUDNN_TO_FROST_DTYPE_NAME
+    from .frost.buffers import DTYPE_ITEMSIZE
+
+    name = _CUDNN_TO_FROST_DTYPE_NAME.get(data_type)
+    return None if name is None else int(DTYPE_ITEMSIZE[name])
+
+
 def byte_size(tensor: Tensor) -> int:
     """Bytes a dense tensor of this dim and dtype occupies, or 0 when the dtype
     has no known width (a bare address describes neither)."""

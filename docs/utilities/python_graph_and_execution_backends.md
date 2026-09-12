@@ -114,11 +114,41 @@ The pack's vocabulary distinguishes the position from the thing at it:
 buffer described (pointer, shape, stride, dtype), non-owning. Resolve positions
 once; ask for buffers per call.
 
-Each operand's OWN dim/stride/data_type is what the pack holds, deliberately
-not the graph's declaration: the two may differ and one engine relies on it —
-`frost_gemm` takes its M/N/K from the buffers, so a plan built for one problem
-size runs another bit-exactly. **Read the IR port for the shape the plan was
-built for; read the pack for the shape about to run.**
+**The declaration is the contract; the buffer supplies pointer, bytes and
+alignment.** That is how the cuDNN backend has always read a variant pack — it
+takes the pointer and nothing else — and callers program against it: FlashInfer
+binds a 2-D matrix to a `[1, m, k]` tensor, a flat quantizer blob to a
+`[b, bs_m, bs_k]` F8_128x4-reordered scale tensor, a 0-d scalar to `(1, 1, 1)`.
+So `_normalize` describes a slot from the graph when the buffer is a DENSE run
+of other extents that covers the declared bytes (the 2-D matrix, the flat blob,
+the 0-d scalar) — exactly what a bare address gets — and records the slot in
+`VariantPack.graph_described`, so an engine that reads the pack answers the way
+the backend does and one call cannot get two answers by plan selection. Two
+kinds of buffer keep their own description: one with the DECLARED extents under
+its own strides (a padded or transposed view of this very tensor — the strides
+carry information, and an engine that reads the pack honours them, which is how
+the linear-attention engines serve strided inputs), and one that is SMALLER
+than the declaration (a packed THD buffer under a padded declaration, say): the
+engine decides, and an engine that needs the declared extent refuses it at
+execute naming the operand (the backend would read past the allocation). A bare
+address lends the declaration outright — it carries no extent, so there is
+nothing to compare against: the caller guarantees the allocation covers the
+declared bytes and meets the engine's alignment. Rules that follow:
+
+- `override_shapes` / `override_strides` speak cuDNN **element** units in the
+  graph's axis order, like every declaration. They are written INTO the slot
+  (in the buffer's axis order, `_in_axis_order_of`), never carried around it, so
+  an engine honours them without knowing the concept exists.
+- The pack speaks **storage slots**. fp4 packs two elements per slot along the
+  unit-stride axis, so a declared or overridden fp4 geometry is converted with
+  `_storage_geometry` (extent halves, the other strides halve) before it lands
+  in a slot; an odd unit-stride extent has no slot spelling and is refused. An
+  engine's per-slot packing factor (`frost_gemm`'s `kpack`) therefore applies
+  to every slot alike — this is what stopped `frost_gemm` from doubling K on an
+  overridden fp4 operand.
+- The pack still carries the shape about to RUN: **read the IR port for the
+  shape the plan was built for; read the pack for the shape this call runs**
+  (`frost_gemm` reads its M/N/K there, so one plan serves many problem sizes).
 
 Two rules that are easy to break by accident:
 
@@ -579,6 +609,58 @@ only to decline is why `closed_under` existed.
   function, list the cell in `_TILE_RULE_CELLS`, and put the measurement in the
   commit.
 
+### Knobs: one public vocabulary, and every python plan lists the knobs it will build
+
+- `KnobType_t` (`include/cudnn_frontend/knobs.h`, mirrored as `cudnn.knob_type`)
+  is the ONE vocabulary for backend and python plans. Backend values `0..32`
+  are frozen; python-only axes live in the band from `FRONTEND_KNOB_TYPE_BASE`
+  (1000: `SCHED_POLICY`, `PACK_GQA`, `SPLIT_KV`, `PIPELINE_ARCH`, `MMA_TILE_*`,
+  `CTA_GROUP`, `WARPS_*`). Both bands are append-only; a frontend-band value
+  never reaches the backend (`convert_to_backend_knob_type` refuses it). Reuse
+  a backend type when the meaning matches (`TILE_M`, `TILE_CGA_M`, `SPLIT_K_SLC`,
+  `SWAP_AB`); mint a frontend one only for an axis the backend has no word for.
+- A python engine keeps whatever native knob object it likes in
+  `PlanConfig.knobs` (`SdpaFwdKnobs`, `SdpaBwdKnobs`, `GemmKnobs`) and converts
+  at the public boundary through `BaseEngine.knobs_to_public` /
+  `knobs_from_public`. `get_engine_and_knobs_at_index` always returns a dict
+  (`{}` when the plan has no axes, never `None`); `create_execution_plan(
+  engine_id, {cudnn.knob_type: int})` replays it; `get_plan_name_at_index`
+  prints `engine[SPLIT_KV=2, TILE_M=128, ...]`, sorted by knob name.
+- **Every python plan is listed WITH the knobs it will build.** A family's
+  `recommend(kind, facts, offered)` proposes complete `PlanConfig(engine_id,
+  knobs)` entries from facts alone; the engine builds what was listed. Families
+  with a real tuning axis — SDPA forward, SDPA backward (the SM120 row's
+  per-head-dim default tile, the MXFP8 row's sole point), frost GEMM (the tile
+  config as knobs) — all do this, so a recorded `(engine_id, knobs)` pins the
+  kernel across releases even when a default table moves. A family whose
+  kernels take no tuning decision (linear attention) lists `{}`, which IS its
+  complete record. A knob-less plan whose engine picks inside `build_plan` is a
+  bug: the record would replay a different kernel after the pick changes.
+- Knobs are performance-only: a plan computes the same function under any knob
+  value, so an autotuner may pick freely. Anything numerics-changing
+  (`softmax_precision`) is an **op attribute** declared in the op spec's
+  `python_only_attrs`: never forwarded to C++, a SET value makes the node
+  backend-unlowerable (`serialize()` and `key()` refuse it), and it surfaces as
+  a graph fact the capability rows gate on.
+
+### Accept means run
+
+For a python plan, `check_support()` accepted ⇒ `build_plans()` and
+`execute()` succeed on the buffers a caller binds as the graph declares them,
+and — when the graph has a backend plan — the result matches that plan; a
+python-only graph (GDN/KDA/…) has no cuDNN reference and is held to its
+engine's own numerics tests instead. Nothing an engine can decide from the
+DECLARATION (operand rank, blob size, scalar shape, layout) may refuse a call
+after acceptance: it is decided at `check_support`, and the pack hands the
+engine the declaration. Buffer capacity is not decidable before execute — the
+buffers arrive with the call — so a buffer smaller than its declaration is a
+caller error refused at execute, not a decline. `test/python/gemm/frost/test_flashinfer_shaped_gemm.py`
+and `test/python/sdpa/frost/test_flashinfer_shaped_sdpa.py` re-declare
+FlashInfer's graphs and buffers byte for byte and assert exactly this; a decline
+at `check_support` is reported as xfail with the row's reason, a refusal after
+acceptance fails. They are the acceptance gate for turning the opt-in rows on
+by default.
+
 ## Key invariants
 
 - **uid ownership**: the Python IR owns the whole uid namespace; every uid is
@@ -671,3 +753,20 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
   remove `selected_engine is None` branching, lowering extracted to its own
   module, op-identity dedup (NodeType vs registry keys), longer-term a typed
   `OpSpec` as the single per-op source for builder/validation/lowering.
+- **Persistent compiled-plan cache** for the JIT engines (today `cute.compile`
+  runs once per process; only generated source is cached on disk). Mirror the
+  FlashInfer autotune-cache v2 rules: the environment identity is the content
+  hash of a manifest (frontend version, `nvidia-cutlass-dsl` version incl. its
+  `libs-core` frontend, CUDA driver version, device name + CC + SM count + L2
+  bytes — frost bakes SM count and L2 into kernels) and names the cache
+  directory; every entry embeds its own key (generated-source digest,
+  `cute.compile` options, knobs) and is verified on load; any mismatch,
+  missing or malformed file is a miss, never a partial reuse; writes are
+  temp-file + `os.replace`; an incompatible format bumps the schema directory.
+  Expose the directory / cache object so a caller (FlashInfer) can point it at
+  its own workspace and ship it in an AOT wheel.
+- SDPA forward THD: padded LSE rows of a `(b, s_max, h)` stats buffer past a
+  sequence's length — the backend writes `-inf`, the python row leaves them
+  unwritten (`b == 1`; at `b > 1` the form is declined) — fill for parity. The
+  dense padded-Q `.item()` read in `sdpa/fwd/engines.py` runs at execute and
+  breaks CUDA-graph capture; decide it at `check_support` or drop it.

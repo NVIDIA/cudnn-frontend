@@ -532,10 +532,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if not facts.uniform_dtype:
         return "K/V dtypes must match Q" if (facts.is_mxfp8 or facts.is_fp8) else "K/V/O dtypes must match Q"
     if facts.thd:
-        # Ragged packing is BSHD-order by construction; the relaxation is
-        # dense-only (the THD lowering rebuilds packed [1,T,H,D] views).
-        if not facts.bshd_layout:
-            return "THD (ragged) Q/K/V/O must be BSHD-physical (stride order 3,1,2,0)"
+        # The THD lowering rebuilds packed [1, T, H, D] views from the token,
+        # head and element strides; the batch stride is never read (every
+        # sequence base comes from the ragged offsets), so it is not gated --
+        # FlashInfer declares it equal to the token stride.
+        if not facts.packed_layout:
+            return "THD (ragged) Q/K/V/O must be BSHD-physical over (H, S, D): head dim innermost, then heads, then tokens"
     elif "dense_flex" in capabilities.layouts:
         if not facts.dense_layout:
             return (
@@ -626,6 +628,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if facts.padded and facts.wants_stats and not facts.thd and not (capabilities.padded_stats or supports_dense_seq_q_trim(capabilities, facts)):
         return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
 
+    if facts.thd and facts.wants_stats and facts.stats_t is not None and facts.b > 1 and getattr(facts.stats_t, "ragged_offset", None) is None:
+        # A Stats tensor with no ragged offsets is the per-batch padded form,
+        # rows at b * s_max; the packed path writes token rows contiguously and
+        # has no per-sequence stats base to place them at. At b == 1 the two
+        # coincide (the tail rows past the length stay unwritten).
+        return "THD Stats without ragged offsets is addressed per batch ([b, h, s_max, 1]); the packed path writes packed (T, h) rows -- bind ragged stats offsets, or b == 1"
     if facts.stats_t is not None and not facts.thd:
         if facts.stats_t.get_data_type() != cudnn.data_type.FLOAT:
             return f"stats must be fp32; got {facts.stats_t.get_data_type()}"

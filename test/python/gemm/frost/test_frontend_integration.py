@@ -559,3 +559,21 @@ def test_override_shape_inside_a_max_allocation_matches_the_backend():
 
     for name, got in results.items():
         torch.testing.assert_close(got, ref, atol=0, rtol=0, msg=lambda s, name=name: f"{name} ran the wrong shape\n{s}")
+
+
+def test_moe_kernel_order_compares_the_declaration_in_storage_slots():
+    """A graph-described B operand arrives in the graph's [b, k, n] order and is
+    permuted to the kernel's (b, n, k); an fp4 declaration spells elements while
+    the slot spells x2 pairs, so the comparison must convert first."""
+    from cudnn.gemm.frost.compiler import _kernel_order
+
+    E, K, N = 4, 256, 512
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, compute_data_type=cudnn.data_type.FLOAT)
+    w_bf16 = g.tensor(name="w", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    w_fp4 = g.tensor(name="w4", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.FP4_E2M1)
+    graph_order = torch.empty(E, N, K, dtype=torch.bfloat16).permute(0, 2, 1)  # (E, K, N) strides (K*N, 1, K)
+    assert tuple(_kernel_order(graph_order, w_bf16).shape) == (E, N, K)
+    kernel_order = torch.empty(E, N, K, dtype=torch.bfloat16)  # the caller's own (b, n, k): left alone
+    assert _kernel_order(kernel_order, w_bf16) is kernel_order
+    fp4_slots = torch.empty(E, N, K // 2, dtype=torch.uint8).permute(0, 2, 1)  # (E, K/2, N) strides (K*N/2, 1, K/2)
+    assert tuple(_kernel_order(fp4_slots, w_fp4).shape) == (E, N, K // 2)

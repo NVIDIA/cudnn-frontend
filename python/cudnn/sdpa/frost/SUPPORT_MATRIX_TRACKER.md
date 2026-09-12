@@ -70,7 +70,7 @@ MMA as d=512.
 | **Layout** | | | | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |
 | Arbitrary dense B/H/S stride order (`dense_flex`) | f16 only | f16 only | f16 only | ✅ | f16 only | ✅ᵇ ᶜ · ❌ᵍ |
-| THD / ragged (packed varlen) | f16 only⁹ | ✅ | f16 only³ | ✅ | f16 + fp8³ | ✅ᵇ ʰ · ❌ᵍ |
+| THD / ragged (packed varlen)ᵏ | f16 only⁹ | ✅ | f16 only³ | ✅ | f16 + fp8³ | ✅ᵇ ʰ · ❌ᵍ |
 | `cu_seq_len_q/kv` prefix sums (THD only) | f16 only⁹ | ✅ | ✅ | ✅ | ✅ | ❌ʲ |
 | **Masks / features** | | | | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ ᵍ |
@@ -540,3 +540,15 @@ feature-free d=64 graph.
 | Bias forward | SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
 | Paged KV cache | every arch except SM100/SM103 f16/bf16 d128 forward (see ᵖ); fp8/mxfp8 pools, sink, THD, packed block tables everywhere |
+
+ᵏ **THD / ragged forward layout.** Q/K/V/O must be BSHD-ordered over **(H, S, D)**
+only — head dim innermost, then heads, then tokens (`graph_analyzer.packed_layout_ok`).
+The batch stride is not gated: every sequence base comes from the ragged offsets and
+the lowering binds the batch axis at extent 1, so its declared value is never read.
+FlashInfer declares it equal to the token stride (`h * d`), which the previous
+all-four-axes check refused at `b > 1`. Stats under THD are written as packed
+`(T, H)` rows (or head-major `(1, QH, head_stride)`): a Stats tensor **without**
+ragged offsets is the per-batch padded `[b, h, s_max, 1]` form and is declined at
+`b > 1` (the packed path has no per-sequence stats base); at `b == 1` it coincides
+with the packed form, and the rows past the sequence length stay unwritten where the
+cuDNN backend writes `-inf`.

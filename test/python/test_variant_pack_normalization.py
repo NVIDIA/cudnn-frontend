@@ -188,3 +188,104 @@ def test_shape_overrides_reach_a_migrated_plan_as_a_pack():
     g.execute(data, ws, override_uids=[q.get_uid()], override_shapes=[[total, h, d]], override_strides=[[h * d, d, 1]])
     torch.cuda.synchronize()
     torch.testing.assert_close(data[out], plain)
+
+
+# ---------------------------------------------------------------------------
+# The declaration is the contract: a caller buffer whose own geometry disagrees
+# with the graph's but covers its bytes is described AS the declaration, the
+# way a bare address is. This is how the backend has always read a buffer
+# (pointer only), and it is what lets a 2-D matrix serve a [1, m, k] tensor or
+# a flat blob serve a reordered scale tensor on a python plan too.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+def test_a_buffer_that_disagrees_with_the_declaration_is_described_from_it():
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    two_d = {A: a.view(M, K), B: b.view(K, N), C: c}  # what FlashInfer binds
+    pack = g._normalize(g._uid_to_data(two_d), ws)
+    for t, buf in ((A, a), (B, b)):
+        i = pack.index_of(t)
+        assert list(pack.native.shape(i)) == list(t.get_dim()) and list(pack.native.stride(i)) == list(t.get_stride())
+        assert i in pack.graph_described  # an engine reads it in the graph's axis order
+        assert pack.native.pointer(i) == buf.data_ptr()
+    assert pack.index_of(C) not in pack.graph_described  # bound as declared: its own description stands
+    # ... and the backend plan runs the 2-D binding bit-identically to the 3-D one.
+    g.execute(vp, ws)
+    torch.cuda.synchronize()
+    ref = c.clone()
+    c.zero_()
+    g.execute(two_d, ws)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c, ref)
+
+
+@pytest.mark.L0
+def test_the_declared_extents_under_the_callers_own_strides_are_kept():
+    """A padded / transposed view of the declared tensor: the strides carry
+    information and the engine honours them (the linear-attention engines
+    serve strided inputs this way), so the slot is NOT re-described."""
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    padded = torch.empty(1, M, 2 * K, dtype=torch.bfloat16, device="cuda")[:, :, :K]  # declared extents, row stride 2K
+    pack = g._normalize(g._uid_to_data({A: padded, B: b, C: c}), ws)
+    i = pack.index_of(A)
+    assert list(pack.native.shape(i)) == [1, M, K] and list(pack.native.stride(i)) == [2 * M * K, 2 * K, 1]
+    assert i not in pack.graph_described
+    strided_other = torch.empty(2 * M, K, dtype=torch.bfloat16, device="cuda")[::2]  # other extents AND strided: left alone too
+    pack = g._normalize(g._uid_to_data({A: strided_other, B: b, C: c}), ws)
+    assert pack.index_of(A) not in pack.graph_described
+
+
+@pytest.mark.L0
+def test_a_buffer_too_small_for_the_declaration_keeps_its_own_description():
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    half = a[:, : M // 2, :]  # a strided view spanning fewer slots than [1, M, K]
+    pack = g._normalize(g._uid_to_data({A: half, B: b, C: c}), ws)
+    i = pack.index_of(A)
+    assert list(pack.native.shape(i)) == [1, M // 2, K] and i not in pack.graph_described
+
+
+@pytest.mark.L0
+def test_a_narrower_buffer_covering_the_slot_count_but_not_the_bytes_is_not_re_described():
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    as_bytes = torch.empty(a.numel(), dtype=torch.uint8, device="cuda")  # as many SLOTS as [1, M, K] bf16, half the bytes
+    pack = g._normalize(g._uid_to_data({A: as_bytes, B: b, C: c}), ws)
+    i = pack.index_of(A)
+    assert list(pack.native.shape(i)) == [a.numel()] and i not in pack.graph_described
+
+
+@pytest.mark.L0
+def test_storage_geometry_packs_fp4_two_per_slot():
+    from cudnn.graph_types import storage_geometry as _storage_geometry
+
+    bf16, fp4 = cudnn.data_type.BFLOAT16, cudnn.data_type.FP4_E2M1
+    assert _storage_geometry([1, 256, 256], [65536, 256, 1], bf16) == ((1, 256, 256), (65536, 256, 1))
+    # row-major A [1, M, K]: K halves, the outer strides halve with it
+    assert _storage_geometry([1, 256, 256], [65536, 256, 1], fp4) == ((1, 256, 128), (32768, 128, 1))
+    # column-major B [1, K, N] (stride 1 on K): K halves, N's stride halves
+    assert _storage_geometry([1, 256, 512], [131072, 1, 256], fp4) == ((1, 128, 512), (65536, 1, 128))
+    assert _storage_geometry([1, 256, 255], [65280, 255, 1], fp4) is None  # no slot geometry spells an odd extent
+    # a singleton axis may carry stride 1 too; the packed axis is the one with the even extent above one
+    assert _storage_geometry([1, 256, 256], [1, 256, 1], fp4) == ((1, 256, 128), (1, 128, 1))
+
+
+@pytest.mark.L0
+def test_a_bare_address_for_an_fp4_tensor_is_lent_the_storage_geometry():
+    """A bare address borrows the declaration; for fp4 that is the x2 SLOT
+    geometry, so an engine's per-slot packing factor applies to it like to any
+    typed buffer (the caller guarantees the allocation covers the bytes)."""
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = g.tensor(name="a", dim=[1, 256, 256], stride=[65536, 256, 1], data_type=cudnn.data_type.FP4_E2M1)
+    b = g.tensor(name="b", dim=[1, 256, 512], stride=[131072, 1, 256], data_type=cudnn.data_type.FP4_E2M1)
+    _, ta = g._describe(0x1000, a.get_uid())
+    _, tb = g._describe(0x2000, b.get_uid())
+    assert (tuple(ta.dim), tuple(ta.stride)) == ((1, 256, 128), (32768, 128, 1))
+    assert (tuple(tb.dim), tuple(tb.stride)) == ((1, 128, 512), (65536, 1, 128))

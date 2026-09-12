@@ -1515,3 +1515,20 @@ def test_paged_split_kv_is_proposed_on_a_decode_launch(monkeypatch):
     facts = _facts(g)
     knob_sets = _knob_sets(spec, facts)
     assert any(k.split_kv and k.split_kv > 1 for k in knob_sets), knob_sets
+
+
+def test_packed_layout_ignores_the_batch_stride_a_ragged_tensor_never_reads():
+    """FlashInfer declares its packed THD Q/O with the batch stride equal to the
+    token stride (h * d): not BSHD-physical over all four axes, but every
+    sequence base comes from the ragged offsets, so only the (H, S, D) order
+    the THD lowering addresses has to hold."""
+    from cudnn.sdpa.graph_analyzer import bshd_layout_ok, packed_layout_ok
+
+    b, h, s, d = 2, 8, 87, 128
+    flashinfer_q = ((b, h, s, d), (h * d, d, h * d, 1))
+    assert not bshd_layout_ok(*flashinfer_q) and packed_layout_ok(*flashinfer_q)
+    dense_bshd = ((b, h, s, d), (s * h * d, d, h * d, 1))
+    assert bshd_layout_ok(*dense_bshd) and packed_layout_ok(*dense_bshd)
+    bhsd = ((b, h, s, d), (h * s * d, s * d, d, 1))  # heads outside tokens: not the packed order
+    assert not packed_layout_ok(*bhsd)
+    assert packed_layout_ok((1, h, s, d), (h * d, d, h * d, 1))  # b == 1 wildcards as before

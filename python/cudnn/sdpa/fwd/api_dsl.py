@@ -1100,11 +1100,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # accepted. No TMA stride/alignment gate is needed here: the TMA
         # descriptors are built over the normalized compact buffers, never
         # over the caller's strides.
-        # THD (ragged) keeps the strict BSHD stride order: the varlen path
-        # rebuilds packed [1,T,H,D] views and only that packing is defined.
-        from cudnn.sdpa.graph_analyzer import dense_layout_ok
+        # THD (ragged) keeps the BSHD order over (H, S, D): the varlen path
+        # rebuilds packed [1,T,H,D] views from the token, head and element
+        # strides, and only that packing is defined. The batch stride is
+        # never read -- every sequence base comes from the ragged offsets and
+        # the batch axis is bound at extent 1 -- so it is not gated (same rule
+        # as graph_analyzer.packed_layout_ok, which the engine gate applies).
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok, packed_layout_ok
 
-        _REQ = (3, 1, 2, 0)
         for desc_name in ["q_desc", "k_desc", "v_desc", "o_desc"]:
             d = getattr(self, desc_name)
             self._value_error_if(
@@ -1114,11 +1117,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             _shape, _stride = d.shape, d.stride
             # Paged pools are dense tensors even under THD (only Q/O are packed).
             if self.thd and not (self.paged and desc_name in ("k_desc", "v_desc")):
-                _act = tuple(ax for ax in d.stride_order if _shape[ax] != 1)
-                _exp = tuple(ax for ax in _REQ if _shape[ax] != 1)
                 self._value_error_if(
-                    _act != _exp,
-                    f"{d.name} must have d, h, s, b stride order (3, 1, 2, 0) for THD (size-1 dims wildcarded); got {d.stride_order} shape {_shape}",
+                    not packed_layout_ok(tuple(_shape), tuple(_stride)),
+                    f"{d.name} must have d, h, s stride order (head dim innermost, then heads, then tokens) for THD; got stride {tuple(_stride)} shape {tuple(_shape)}",
                 )
             else:
                 self._value_error_if(
@@ -3047,7 +3048,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # normalization needs is required: head dim innermost-contiguous
         # (stride 1), non-broadcast, non-overlapping strides, any B/H/S
         # order, padded strides allowed.
-        from cudnn.sdpa.graph_analyzer import bshd_layout_ok, dense_layout_ok
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok, packed_layout_ok
 
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
             self._value_error_if(
@@ -3055,9 +3056,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 f"{desc.name} must be rank-4 (B, H, S, D); got {desc.ndim}",
             )
             if self.thd:
+                # Same rule as the sm100 adapter and the engine gate: the packed
+                # path reads token, head and element strides; the batch stride
+                # is never stepped under ragged offsets.
                 self._value_error_if(
-                    not bshd_layout_ok(desc.shape, desc.stride),
-                    f"THD (ragged) {desc.name} must be BSHD-physical (stride order 3,1,2,0, size-1 dims wildcarded); got stride {desc.stride}",
+                    not packed_layout_ok(tuple(desc.shape), tuple(desc.stride)),
+                    f"THD (ragged) {desc.name} must have d, h, s stride order (head dim innermost, then heads, then tokens); got stride {tuple(desc.stride)}",
                 )
             else:
                 self._value_error_if(

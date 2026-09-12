@@ -33,7 +33,7 @@ from ._handle import Handle, to_backend_handle
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
-from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor
+from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor, storage_geometry, storage_slot_bytes
 from .nodes import Node, _row_major_stride
 
 _LOG = logging.getLogger("cudnn.pygraph")
@@ -66,6 +66,33 @@ def _in_axis_order_of(shape, stride, reference_stride):
     for rank, axis in enumerate(by_stride):
         permutation[reference[rank]] = axis
     return tuple(shape[a] for a in permutation), tuple(stride[a] for a in permutation)
+
+
+def _span(dim, stride) -> int:
+    """Slots from the base to one past the last addressed slot."""
+    return 1 + sum((int(d) - 1) * int(x) for d, x in zip(dim, stride)) if dim else 1
+
+
+def _numel(dim) -> int:
+    n = 1
+    for d in dim:
+        n *= int(d)
+    return n
+
+
+def _slot_bytes(data) -> "int | None":
+    """Bytes per storage slot of a caller's buffer, or None when it does not say
+    (a bare address; a producer with no dtype width). torch answers through
+    ``element_size()`` (1 for ``float4_e2m1fn_x2``), the array-interface
+    family through ``dtype.itemsize``."""
+    size = getattr(data, "element_size", None)
+    if callable(size):
+        try:
+            return int(size())
+        except Exception:  # noqa: BLE001 -- a producer whose element_size is not a plain int
+            return None
+    itemsize = getattr(getattr(data, "dtype", None), "itemsize", None)
+    return int(itemsize) if isinstance(itemsize, int) and itemsize > 0 else None
 
 
 def cudnn_graph_not_supported(message: str) -> Exception:
@@ -1999,6 +2026,44 @@ class pygraph:
                 declared = self._tensor_by_uid.get(uid)
                 name = f" ({declared.name!r})" if declared is not None and declared.name else ""
                 raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
+        # The declaration is the contract. The backend reads only the pointer,
+        # so a caller may bind a 2-D matrix to a [1, m, k] tensor, a flat blob
+        # to a reordered scale tensor, a 0-d scalar to (1, 1, 1): the graph
+        # says what the bytes mean. A DENSE buffer of other extents that covers
+        # the declared bytes is therefore re-described AS the declaration --
+        # what a bare address gets -- so an engine reading the pack answers the
+        # way the backend does. A buffer with the declared extents but its own
+        # strides, a strided view, or one too small for the declaration keeps
+        # its own description; the engine decides.
+        for i, uid in enumerate(order):
+            if i in from_graph or not native.is_filled(i):
+                continue
+            declared = self._tensor_by_uid.get(uid)
+            if declared is None or not declared.dim:
+                continue
+            storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
+            if storage is None:
+                continue
+            own = tuple(native.shape(i)), tuple(native.stride(i))
+            if own == storage:
+                continue
+            if own[0] == storage[0]:
+                # The declared extents under the caller's OWN strides (a padded
+                # or transposed view of this very tensor): those strides carry
+                # information, and an engine that reads the pack honours them.
+                continue
+            if _span(*own) != _numel(own[0]):
+                # Different extents AND gaps or overlaps between the slots: not
+                # one dense run of the declared bytes (a transposed view of a
+                # contiguous block IS one), so not ours to reinterpret.
+                continue
+            # BYTES, not slots: a uint8 view spanning as many slots as a bf16
+            # declaration covers half its bytes. Unknown widths do not qualify.
+            own_bytes, declared_bytes = _slot_bytes(uid_to_data.get(uid)), storage_slot_bytes(declared.data_type)
+            if own_bytes is None or declared_bytes is None or _span(*own) * own_bytes < _span(*storage) * declared_bytes:
+                continue
+            native.override_operand(i, list(storage[0]), list(storage[1]))
+            from_graph.append(i)
         if override_uids:
             # The backend refuses a partial override; a short list must not
             # quietly mean "keep the rest" here.
@@ -2012,7 +2077,15 @@ class pygraph:
                 i = slot_of.get(uid)
                 if i is None:
                     raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
-                native.override_operand(i, *_in_axis_order_of(tuple(override_shapes[j]), tuple(override_strides[j]), native.stride(i)))
+                # Overrides speak cuDNN element units; the slot speaks storage slots.
+                declared = self._tensor_by_uid.get(uid)
+                storage = storage_geometry(override_shapes[j], override_strides[j], declared.data_type if declared is not None else None)
+                if storage is None:
+                    raise ValueError(
+                        f"override_shapes for tensor uid {uid}: an fp4 tensor packs two elements per storage slot, so its "
+                        f"unit-stride extent must be even; got {tuple(override_shapes[j])} / {tuple(override_strides[j])}"
+                    )
+                native.override_operand(i, *_in_axis_order_of(storage[0], storage[1], native.stride(i)))
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
@@ -2034,8 +2107,10 @@ class pygraph:
         """``(pointer, Tensor)`` for one caller buffer.
 
         The Tensor carries the buffer's OWN dim/stride/data_type, which need
-        not match what the graph declared — frost_gemm takes its problem size
-        from here.
+        not match what the graph declared. ``_normalize`` then re-describes a
+        slot FROM the declaration when the two disagree and the buffer covers
+        it (the declaration is the contract, as for the backend), so what an
+        engine reads is the declaration unless the buffer is smaller.
 
         Every framework publishes the same four facts under a different
         spelling, so this asks for each spelling in turn. Two differences are
@@ -2057,7 +2132,11 @@ class pygraph:
             declared = self._tensor_by_uid.get(uid)
             if declared is None or not declared.dim:
                 return data, Tensor(uid=uid)
-            return data, describing_tensor(uid, tuple(declared.dim), tuple(declared.stride), declared.data_type)
+            # The slot speaks storage slots (fp4: two elements per slot), like
+            # every other description in the pack.
+            storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
+            dim, stride = storage if storage is not None else (tuple(declared.dim), tuple(declared.stride))
+            return data, describing_tensor(uid, tuple(dim), tuple(stride), declared.data_type)
         dim = getattr(data, "shape", None)
 
         # torch: pointer from data_ptr(), strides from stride() in ELEMENTS

@@ -132,10 +132,13 @@ class VariantPack:
     (``get_variant_pack_uids_sorted()``), so ``address`` goes straight to
     ``_execute_with_raw_ptrs`` with no copy and no per-operand hash lookup.
 
-    What the caller ACTUALLY passed is what is recorded, which need not be what
-    the graph declared: an engine reads the IR port for the shape the plan was
-    built for and this pack for the shape about to run. frost_gemm takes its
-    M/N/K from here; the backend takes only the pointer.
+    A slot describes the buffer as the GRAPH declares it whenever the caller's
+    own geometry disagrees but covers the declared bytes (``graph_described``
+    names those slots, bare addresses included); only a buffer smaller than its
+    declaration keeps its own description. Overrides are written into the slot
+    too. An engine reads the IR port for the shape the plan was built for and
+    this pack for the shape about to run; frost_gemm takes its M/N/K from here,
+    the backend takes only the pointer.
 
     Allocated per call. Two threads may execute one graph concurrently with
     different buffers, and a shared pack would hand each thread the other's

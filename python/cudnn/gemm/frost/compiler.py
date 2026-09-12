@@ -2940,6 +2940,16 @@ def _swap_mn_view(t: object) -> object:
     return t
 
 
+def _offset_vector(t):
+    """``first_token_offset`` as the rank-1 vector the launch indexes. cuDNN
+    declares it ``(E, 1, 1)`` and the variant pack hands the declaration over;
+    the trailing singleton axes carry nothing."""
+    shape = tuple(t.shape)
+    if len(shape) == 3 and shape[1:] == (1, 1):
+        return t.reshape([shape[0]])
+    return t
+
+
 def _expected_output_shape(spec, chain: FusionChain, mnk) -> tuple[int, int, int]:
     return expected_shape(_output_rule(spec, chain), int(mnk[0]), int(mnk[1]))
 
@@ -4499,6 +4509,24 @@ def _moe_operand_layout_bad(chain, token, weight) -> bool:
     return token.stride(a_unit) != 1 or weight.stride(b_unit) != 1
 
 
+def _kernel_order(buf, t):
+    """A B-side buffer described AS its declaration is in the graph's
+    ``[b, k, n]`` axis order (the variant pack lends a bare address, or a buffer
+    that disagrees with the declaration, exactly that geometry); the launch
+    reads ``(b, n, k)``. The declaration is compared in STORAGE slots -- an fp4
+    declaration spells elements, the slot spells x2 pairs -- with the same
+    tie-break ``recipe.Operand.axes`` applies on the dense path."""
+    from cudnn.graph_types import storage_geometry
+
+    try:
+        declared = storage_geometry(t.get_dim(), t.get_stride(), t.get_data_type())
+    except Exception:  # noqa: BLE001 -- an analyzer-synthesized ref has no dims
+        return buf
+    if declared is not None and declared[0] and (tuple(buf.shape), tuple(buf.stride())) == declared:
+        return buf.permute(0, 2, 1)
+    return buf
+
+
 def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     """Resolve a MoE variant-pack dict into the positional-call buffers,
     inferring (S, N, K) from shapes. Returns ``(a_bufs, b_bufs, out_bufs,
@@ -4514,12 +4542,12 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         return resolved[id(t)]
 
     a_bufs = [pull(t, "token") for t in b.a_operands]
-    b_bufs = [pull(t, "weight") for t in b.b_operands]
+    b_bufs = [_kernel_order(pull(t, "weight"), t) for t in b.b_operands]
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
     fto = pull(b.first_token_offset, "first_token_offset")
     sfa = [pull(t, "SFA") for t in b.sfa_operands]
-    sfb = [pull(t, "SFB") for t in b.sfb_operands]
+    sfb = [_kernel_order(pull(t, "SFB"), t) for t in b.sfb_operands]
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     S = a_bufs[0].shape[1]
     K = a_bufs[0].shape[2] * k_factor
@@ -4663,6 +4691,7 @@ class CompiledMoeGemm:
         return self._call_variant_pack(variant_pack, workspace, stream)
 
     def _launch_single(self, token, weight, first_token_offset, output, snke, workspace=None, stream=None):
+        first_token_offset = _offset_vector(first_token_offset)
         if len(snke) < 3:
             raise ValueError("MoE call needs problem_size (S, N, K[, ...]); " f"got {snke!r}")
         S, N, K = int(snke[0]), int(snke[1]), int(snke[2])
@@ -4759,6 +4788,7 @@ class CompiledMoeGemm:
         (token, weight) pairs deduped by tensor identity into the JIT-fixed A/B
         slots (shared token → one A operand). All matmuls share ``fto``; ``out``
         is the single fused output."""
+        first_token_offset = _offset_vector(first_token_offset)
         chain = self.chain
         if not isinstance(gemm_pairs, (list, tuple)) or not all(isinstance(p, (list, tuple)) and len(p) == 2 for p in gemm_pairs):
             raise ValueError("multi-GEMM MoE call expects a list of (token, weight) pairs as " f"the first argument; got {type(gemm_pairs).__name__}")
@@ -5031,6 +5061,7 @@ class CompiledMoeBlockScaleGemm:
         return self._call_variant_pack(variant_pack, workspace, stream)
 
     def _launch_single(self, token, weight, sfa, sfb, first_token_offset, output, snke, workspace=None, stream=None):
+        first_token_offset = _offset_vector(first_token_offset)
         if len(snke) < 3:
             raise ValueError("MoE block-scale call needs problem_size (S, N, K[, ...]); " f"got {snke!r}")
         S, N, K = int(snke[0]), int(snke[1]), int(snke[2])
@@ -5182,6 +5213,7 @@ class CompiledMoeBlockScaleGemm:
         Each GEMM is a ((token, sfa), (weight, sfb)) pair; dedup by PACKED-data
         identity (SF travels with its data → shared token+sfa collapses to one A
         operand). All matmuls share ``fto``; ``out`` is the fused output."""
+        first_token_offset = _offset_vector(first_token_offset)
         chain = self.chain
         ok = (
             isinstance(gemm_pairs, (list, tuple))
