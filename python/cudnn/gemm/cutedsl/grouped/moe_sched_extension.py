@@ -37,7 +37,7 @@ Architecture:
 """
 
 from abc import ABC, abstractmethod
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -102,13 +102,14 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
     with GLU and quantization fusion.
 
     Handles domain conversion for: a, b, c, d, d_col, prob, dprob,
-    row_scale, sfa, sfd, sfd_col, sfb.
+    row_scale, sfa, sfa2, sfd, sfd2, sfd_col, sfb, sfb2.
 
     B and SFB are discrete (per-expert pointer arrays) → use expert-wise
-    TMA descriptors from workspace.
+    TMA descriptors from workspace. SFB2 is a per-expert pointer array
+    loaded via LDGSTS (no TMA descriptor).
 
-    A, C, D, SFA are contiguous across experts (indexed by padded M offset)
-    → use global TMA descriptors with domain_offset.
+    A, C, D, SFA, SFA2 are contiguous across experts (indexed by padded M
+    offset) → use global TMA descriptors with domain_offset.
 
     Domain conversion:
         A:               (total_padded_M, K, 1)     → domain_offset M by token_offset, global desc
@@ -117,9 +118,13 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
                          (total_padded_M, N_dim, 1)  → domain_offset M by token_offset, global desc
         SFA/SFD:         (total_padded_M, K_or_N, 1) → domain_offset M by token_offset,
                                                         tile_atom_to_shape_SF layout, global desc
+        SFA2:            ((sgm, total_padded_M), (sgk, K), 1)
+                                                      → domain_offset scale_m by token_offset, LDGSTS
         SFD_col:         (total_padded_M, N, 1)      → domain_offset M by token_offset,
                                                         BlockScaledBasicChunk layout, global desc
         SFB:             template                     → tile_atom_to_shape_SF layout, expert-wise desc
+        SFB2:            per-expert Int64 pointer array
+                                                      → rebuild ((sgn, scale_n), (sgk, scale_k), 1), LDGSTS
 
     :param tensormap_ctor: DiscreteWeightTensormapConstructor for B/SFB descs
     :param sf_vec_size: Scale factor vector size
@@ -216,6 +221,61 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
             real = cute.make_tensor(real.iterator, cute.make_layout(sfd_col_layout.shape, stride=gmem_tensor_in_moe_view.stride))
             return (real, None)
 
+        elif cutlass.const_expr(tensor_name == "sfa2"):
+            # SFA2: ((sgm, total_padded_M), (sgk, K), 1) subchannel scale,
+            # grouped along M → offset scale_m by token_offset, global desc.
+            # Preserve the pre-built hierarchical layout (do NOT re-derive it).
+            real = cute.domain_offset(((0, token_offset), 0, 0), gmem_tensor_in_moe_view)
+            sgm = shape[0][0]
+            real_sfa2 = rewrite_tensor_shape(real, ((sgm, tokens_i), shape[1], c1))
+            return (real_sfa2, None)
+
+        elif cutlass.const_expr(tensor_name == "sfd2"):
+            # SFD2: ((sgm, total_padded_M), (2*sgn, N), 1) subchannel scale
+            # (sgn deinterleaved f-cols = 2*sgn interleaved D-cols per block),
+            # grouped along M → offset scale_m by token_offset, global desc.
+            real = cute.domain_offset(((0, token_offset), 0, 0), gmem_tensor_in_moe_view)
+            sgm = shape[0][0]
+            real_sfd2 = rewrite_tensor_shape(real, ((sgm, tokens_i), shape[1], c1))
+            return (real_sfd2, None)
+
+        elif cutlass.const_expr(tensor_name == "sfb2"):
+            # SFB2: discrete — load per-expert pointer from pointer array
+            # (uses LDGSTS, not TMA). gmem_tensor_in_moe_view.iterator points
+            # to an array of Int64 pointers (one per expert).
+
+            # 1. Compute address of the Int64 pointer for this expert
+            #    (each pointer is 8 bytes)
+            base_addr = gmem_tensor_in_moe_view.iterator.toint()
+            expert_ptr_addr = base_addr + expert_idx * cutlass.Int64(8)
+
+            # 2. Create tensor to load the Int64 pointer value
+            expert_ptr_tensor = cute.make_tensor(
+                cute.make_ptr(cutlass.Int64, expert_ptr_addr, cute.AddressSpace.gmem, assumed_align=8),
+                cute.make_layout((1,)),
+            )
+
+            # 3. Load the Int64 pointer value for this expert
+            expert_sfb2_ptr_int64 = expert_ptr_tensor[0]
+
+            # 4. Convert to typed pointer for SF2 data
+            expert_sfb2_ptr = cute.make_ptr(
+                gmem_tensor_in_moe_view.element_type,
+                expert_sfb2_ptr_int64,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+
+            # 5. Extract shape/stride from template and rebuild per-expert tensor
+            sgn = shape[0][0]
+            sgk = shape[1][0]
+            scale_n = shape[0][1]
+            scale_k = shape[1][1]
+            stride = gmem_tensor_in_moe_view.stride
+            new_layout = cute.make_layout(((sgn, scale_n), (sgk, scale_k), c1), stride=stride)
+            real_sfb2 = cute.make_tensor(expert_sfb2_ptr, new_layout)
+            return (real_sfb2, None)  # No TMA descriptor - uses LDGSTS
+
         else:  # "sfb"
             # SFB: discrete — rewrite with tile_atom_to_shape_SF, expert-wise desc
             per_expert_shape = (shape[0], shape[1], c1)
@@ -247,8 +307,12 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
         C/D/D_col/prob/dprob:
                          (total_padded_M, N, 1)  → domain_offset M by token_offset
         SFA/SFD:         (total_padded_M, K_or_N, 1) → domain_offset M, tile_atom_to_shape_SF
+        SFA2:            ((sgm, total_padded_M), (sgk, K), 1)
+                                                 → domain_offset scale_m by token_offset
         SFB:             (N, K, L)               → domain_offset L by expert_idx,
                                                     tile_atom_to_shape_SF
+        SFB2:            ((sgn, N), (sgk, K), L) → domain_offset L by expert_idx,
+                                                    keep hierarchical layout
         SFD_col:         (total_padded_M, N, 1)  → domain_offset M,
                                                     BlockScaledBasicChunk layout
 
@@ -333,6 +397,36 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             real = cute.make_tensor(real.iterator, cute.make_layout(sfd_col_layout.shape, stride=gmem_tensor_in_moe_view.stride))
             return (real, None)
 
+        elif cutlass.const_expr(tensor_name == "sfa2"):
+            # SFA2: ((sgm, total_padded_M), (sgk, K), 1) subchannel scale,
+            # grouped along M → offset scale_m by token_offset, global desc.
+            # Preserve the pre-built hierarchical layout (do NOT re-derive it).
+            real = cute.domain_offset(((0, token_offset), 0, 0), gmem_tensor_in_moe_view)
+            sgm = shape[0][0]
+            real_sfa2 = rewrite_tensor_shape(real, ((sgm, tokens_i), shape[1], c1))
+            return (real_sfa2, None)
+
+        elif cutlass.const_expr(tensor_name == "sfd2"):
+            # SFD2: ((sgm, total_padded_M), (2*sgn, N), 1) subchannel scale
+            # (sgn deinterleaved f-cols = 2*sgn interleaved D-cols per block),
+            # grouped along M → offset scale_m by token_offset, global desc.
+            real = cute.domain_offset(((0, token_offset), 0, 0), gmem_tensor_in_moe_view)
+            sgm = shape[0][0]
+            real_sfd2 = rewrite_tensor_shape(real, ((sgm, tokens_i), shape[1], c1))
+            return (real_sfd2, None)
+
+        elif cutlass.const_expr(tensor_name == "sfb2"):
+            # SFB2: ((sgn, N), (sgk, K), L) subchannel scale, grouped along L →
+            # offset L by expert_idx, preserve the pre-built hierarchical layout.
+            real = cute.domain_offset((0, 0, expert_idx), gmem_tensor_in_moe_view)
+            stride = gmem_tensor_in_moe_view.stride
+            new_layout = cute.make_layout(
+                (shape[0], shape[1], c1),  # keep original hierarchical shapes
+                stride=stride,
+            )
+            real_sfb2 = cute.make_tensor(real.iterator, new_layout)
+            return (real_sfb2, None)
+
         else:  # "sfb"
             # SFB: (N, K, L) → domain_offset along L by expert_idx,
             # then apply tile_atom_to_shape_SF layout, global desc
@@ -345,7 +439,18 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
 
 
 class WgradScaledGemmSchedExtension(MoESchedExtension):
-    """Scheduler extension for grouped GEMM wgrad (2Dx2D)."""
+    """Scheduler extension for grouped GEMM wgrad (2Dx2D).
+
+    With ``sgk`` set, the extension also serves the K-grouped second-level A
+    scale ``"sfa2"`` of the subchannel-scaled wgrad kernel (SFA2 only — wgrad
+    has no SFB2). In wgrad K is the ragged token axis, so unlike the dgrad
+    family's M-grouped sfa2 the scale group axis lies on K: the SFA2 grid is
+    ((sgm, M), (sgk, tokens_sum/sgk), 1) and an expert's view is a
+    domain_offset by token_offset // sgk whole scale COLUMNS. The host API
+    enforces token_counts[e] % sgk == 0, so every prior expert contributes
+    whole columns and the division is exact. SFA2 is loaded via LDGSTS — no
+    TMA descriptor, no tensormap slot.
+    """
 
     def __init__(
         self,
@@ -353,11 +458,13 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
         sf_vec_size: int,
         weight_mode: MoEWeightMode,
         input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
+        sgk: Optional[int] = None,
     ):
         super().__init__(tensormap_ctor)
         self.sf_vec_size = sf_vec_size
         self.weight_mode = weight_mode
         self.input_order = input_order
+        self.sgk = sgk
 
     def __extract_mlir_values__(self):
         return extract_mlir_values(self.tensormap_ctor)
@@ -369,6 +476,7 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
             sf_vec_size=self.sf_vec_size,
             weight_mode=self.weight_mode,
             input_order=self.input_order,
+            sgk=self.sgk,
         )
 
     def update_expert_info(self, offs, expert_idx):
@@ -416,6 +524,19 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
             real = rewrite_tensor_shape(gmem_tensor_in_moe_view, sf_layout.shape)
             desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr(tensor_name, expert_idx))
             return (real, desc)
+
+        if cutlass.const_expr(tensor_name == "sfa2"):
+            # SFA2: ((sgm, M), (sgk, tokens_sum/sgk), 1) 2nd-level scale,
+            # grouped along K → offset whole scale columns by
+            # token_offset // sgk (exact: all counts are sgk-aligned),
+            # preserving the pre-built hierarchical broadcast layout.
+            scale_col_offset = token_offset // self.sgk
+            scale_cols_i = tokens_i // self.sgk
+            real = cute.domain_offset(((0, 0), (0, scale_col_offset), 0), gmem_tensor_in_moe_view)
+            sgm = shape[0][0]
+            sgk = shape[1][0]
+            real_sfa2 = rewrite_tensor_shape(real, ((sgm, shape[0][1]), (sgk, scale_cols_i), c1))
+            return (real_sfa2, None)  # No TMA descriptor — LDGSTS
 
         raise ValueError(f"WgradScaledGemmSchedExtension: unknown tensor '{tensor_name}'")
 

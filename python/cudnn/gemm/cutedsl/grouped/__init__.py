@@ -55,6 +55,18 @@ from .unfused.api import (
     GroupedGemmSm100,
     grouped_gemm_wrapper_sm100,
 )
+from .unfused_subchannel_scaled.api import (
+    GroupedGemmUnfusedSubchannelScaledSm100,
+    grouped_gemm_unfused_subchannel_scaled_wrapper_sm100,
+)
+from .dswiglu_subchannel_scaled.api import (
+    GroupedGemmDswigluSubchannelScaledSm100,
+    grouped_gemm_dswiglu_subchannel_scaled_wrapper_sm100,
+)
+from .wgrad_subchannel_scaled.api import (
+    GroupedGemmWgradSubchannelScaledSm100,
+    grouped_gemm_wgrad_subchannel_scaled_wrapper_sm100,
+)
 
 __all__ = [
     "GroupedGemmSwigluSm100",
@@ -79,6 +91,12 @@ __all__ = [
     "grouped_gemm_wgrad_wrapper_sm100",
     "GroupedGemmSm100",
     "grouped_gemm_wrapper_sm100",
+    "GroupedGemmUnfusedSubchannelScaledSm100",
+    "grouped_gemm_unfused_subchannel_scaled_wrapper_sm100",
+    "GroupedGemmDswigluSubchannelScaledSm100",
+    "grouped_gemm_dswiglu_subchannel_scaled_wrapper_sm100",
+    "GroupedGemmWgradSubchannelScaledSm100",
+    "grouped_gemm_wgrad_subchannel_scaled_wrapper_sm100",
     "grouped_gemm_jax_sm100",
     "grouped_gemm_glu_jax_sm100",
     "grouped_gemm_dglu_jax_sm100",
