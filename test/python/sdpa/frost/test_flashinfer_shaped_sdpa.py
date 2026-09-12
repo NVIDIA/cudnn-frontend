@@ -120,7 +120,7 @@ class _Case:
             lq.set_uid(SEQ_Q_UID)
             lkv.set_uid(SEQ_KV_UID)
             seq_kwargs = dict(seq_len_q=lq, seq_len_kv=lkv)
-        O, Stats = g.sdpa(
+        out_t, stats_t = g.sdpa(
             name="sdpa",
             q=q,
             k=k,
@@ -134,15 +134,15 @@ class _Case:
         )
         ro = g.tensor_like(self.cu_q, name="ragged_o")
         ro.set_uid(RAGGED_O_UID)
-        O.set_ragged_offset(ro)
+        out_t.set_ragged_offset(ro)
         rs = g.tensor_like(self.cu_q, name="ragged_stats")
         rs.set_uid(RAGGED_STATS_UID)
-        Stats.set_ragged_offset(rs)
+        stats_t.set_ragged_offset(rs)
         if self.tokens_form:
-            O.set_ragged_offset_multiplier(h_q * d)
-            Stats.set_ragged_offset_multiplier(h_q)
-        O.set_uid(O_UID).set_output(True).set_dim([b, h_q, s_q, d]).set_stride([s_q * d * h_q, d, d * h_q, 1]).set_data_type(dt)
-        Stats.set_uid(STATS_UID).set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, h_q, s_q, 1]).set_stride([s_q * h_q, 1, h_q, 1])
+            out_t.set_ragged_offset_multiplier(h_q * d)
+            stats_t.set_ragged_offset_multiplier(h_q)
+        out_t.set_uid(O_UID).set_output(True).set_dim([b, h_q, s_q, d]).set_stride([s_q * d * h_q, d, d * h_q, 1]).set_data_type(dt)
+        stats_t.set_uid(STATS_UID).set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, h_q, s_q, 1]).set_stride([s_q * h_q, 1, h_q, 1])
         for t, uid in ((q, Q_UID), (k, K_UID), (v, V_UID)):
             t.set_uid(uid)
         g.validate()
