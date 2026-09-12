@@ -15,6 +15,8 @@ def validate_csc_graph(
     indices: Tensor,
     map_csc_to_coo: Optional[Tensor],
     num_src_nodes: int,
+    csc_rev_offsets: Optional[Tensor] = None,
+    map_rev_to_coo: Optional[Tensor] = None,
 ) -> Tuple[int, int]:
     """Validate shared CSC tensor invariants and return destination and edge counts.
 
@@ -53,6 +55,25 @@ def validate_csc_graph(
             raise TypeError(f"map_csc_to_coo dtype {map_csc_to_coo.dtype} must match offsets dtype {offsets.dtype}")
         if map_csc_to_coo.device != offsets.device:
             raise ValueError(f"map_csc_to_coo must be on {offsets.device}, got {map_csc_to_coo.device}")
+
+    if (csc_rev_offsets is None) != (map_rev_to_coo is None):
+        raise ValueError("csc_rev_offsets and map_rev_to_coo must be provided together")
+    if csc_rev_offsets is not None:
+        expected_rev_offsets_shape = (num_src_nodes + 1,)
+        if tuple(csc_rev_offsets.shape) != expected_rev_offsets_shape:
+            raise ValueError(f"csc_rev_offsets must have shape {expected_rev_offsets_shape}, got {tuple(csc_rev_offsets.shape)}")
+        if csc_rev_offsets.dtype != offsets.dtype:
+            raise TypeError(f"csc_rev_offsets dtype {csc_rev_offsets.dtype} must match offsets dtype {offsets.dtype}")
+        if csc_rev_offsets.device != offsets.device:
+            raise ValueError(f"csc_rev_offsets must be on {offsets.device}, got {csc_rev_offsets.device}")
+
+        expected_rev_map_shape = (num_edges,)
+        if tuple(map_rev_to_coo.shape) != expected_rev_map_shape:
+            raise ValueError(f"map_rev_to_coo must have shape {expected_rev_map_shape}, got {tuple(map_rev_to_coo.shape)}")
+        if map_rev_to_coo.dtype != offsets.dtype:
+            raise TypeError(f"map_rev_to_coo dtype {map_rev_to_coo.dtype} must match offsets dtype {offsets.dtype}")
+        if map_rev_to_coo.device != offsets.device:
+            raise ValueError(f"map_rev_to_coo must be on {offsets.device}, got {map_rev_to_coo.device}")
 
     return num_dst_nodes, num_edges
 

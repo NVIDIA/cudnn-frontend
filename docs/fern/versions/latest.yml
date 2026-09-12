@@ -126,6 +126,9 @@ navigation:
               - page: GNN simple aggregation
                 path: ../../operations/gnn/agg_simple.md
                 slug: agg_simple
+              - page: GAT and GATv2 attention
+                path: ../../operations/gnn/mha.md
+                slug: mha
       - section: Utilities
         slug: utilities
         contents:
