@@ -517,22 +517,8 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "The Stats output of sdpa must be an FP32 tensor.");
 
-        // Non-ragged Stats layouts other than packed BHSD are not correctly supported prior to 9.26.0.
-        // Runs post shape inference so that an unset Stats layout (always inferred as packed BHSD)
-        // is not rejected.
-        if (has_stats && !stats_out->second->get_ragged_offset() && detail::get_backend_version() < 92600) {
-            auto const& stats_dim           = stats_out->second->get_dim();
-            auto const& stats_stride        = stats_out->second->get_stride();
-            bool const stats_is_packed_bhsd = stats_dim.size() == 4 && stats_stride.size() == 4 &&
-                                              stats_stride[3] == 1 && stats_stride[2] == stats_dim[3] &&
-                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
-                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                !stats_is_packed_bhsd,
-                error_code_t::GRAPH_NOT_SUPPORTED,
-                "For cuDNN version below 9.26.0, a non-ragged Stats output must be a packed BHSD "
-                "tensor.");
-        }
+        // All layouts of Stats work in the forward for all cuDNN backend versions (unlike the
+        // backward case), so no need to check it here.
 
         // validate options for max_total_seq_len (mirrors SDPA_backward_attributes)
         {
@@ -1500,10 +1486,11 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                         "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
         }
 
-        // Non-ragged layouts other than BHSD are not correctly supported prior to 9.26.0.
-        // TODO: move to sdpa_support_surface.h (where the forward twin of this check lives)
-        // once the backward path grows a SDPA_backward_attributes support surface there —
-        // today that file serves only the forward attributes.
+        // Non-ragged Stats INPUT layouts other than packed BHSD are not correctly read prior to 9.26.0
+        // (the forward, by contrast, writes any Stats layout correctly on every version).
+        // TODO: move to sdpa_support_surface.h once the backward path grows a
+        // SDPA_backward_attributes support surface there — today that file serves only the
+        // forward attributes.
         if (detail::get_backend_version() < 92600 && !attributes.inputs.at(input_names::Stats)->get_ragged_offset()) {
             auto const& stats_dim    = attributes.inputs.at(input_names::Stats)->get_dim();
             auto const& stats_stride = attributes.inputs.at(input_names::Stats)->get_stride();
