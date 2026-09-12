@@ -1424,7 +1424,8 @@ def tmaldg_warp(
     scheduler_state = PipelineState.start(phase=1)
     tail_count = ((total_tiles - cutlass.Int32(1)) % num_ctas) + cutlass.Int32(1)
     tail_base = (total_tiles - tail_count) if tail_count * 2 >= num_ctas else total_tiles
-    tail_row = tail_base + cute.arch.smid()
+    # CTA IDs remain unique when concurrent kernels prevent one CTA per SM.
+    tail_row = tail_base + bidx
     tail_row = tail_row if tail_row < total_tiles else cutlass.Int32(1 << 28)
 
     elect_one = nvvm.elect_sync()
