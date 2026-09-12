@@ -970,6 +970,14 @@ class BlackwellFmhaBackwardDQ256:
         tile_sched_params: Union[utils.ClcDynamicPersistentTileSchedulerParams, None],
     ):
         bidx, bidy, bidz = cute.arch.block_idx()
+        # Process long causal query tiles first across heads, reducing the
+        # final-wave tail. Dense/varlen callers retain their established order.
+        if cutlass.const_expr(not self.is_persistent and not self.varlen and self.mask_type == fmha_masks.MaskEnum.WINDOW_MASK):
+            cluster_count = cute.ceil_div(problem_shape[0], self.tile_shape_Q * 2)
+            head_count = problem_shape[3][0][0] * problem_shape[3][0][1]
+            physical_cluster = bidx // 2 + cluster_count * bidy
+            bidx = (cluster_count - 1 - physical_cluster // head_count) * 2 + bidx % 2
+            bidy = physical_cluster % head_count
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         # For 2-CTA MMA: determine which CTA in the pair (0 or 1)
@@ -3434,7 +3442,6 @@ class BlackwellFmhaBackwardDQ256:
 
             if cutlass.const_expr(self.online_ds_scale):
                 self.dS_scale_exchange_barrier_0.arrive_and_wait()
-                self.dS_scale_exchange_barrier_0.arrive_and_wait()
             if is_leader_cta:
                 compute_mma_dS_pipeline_0.consumer_wait(compute_mma_dS_consumer_state_0)
                 # Copy exchanged SF only after both CTAs publish dS readiness;
@@ -3463,7 +3470,6 @@ class BlackwellFmhaBackwardDQ256:
             compute_mma_dS_consumer_state_0.advance()
 
             if cutlass.const_expr(self.online_ds_scale):
-                self.dS_scale_exchange_barrier_1.arrive_and_wait()
                 self.dS_scale_exchange_barrier_1.arrive_and_wait()
             if is_leader_cta:
                 compute_mma_dS_pipeline_1.consumer_wait(compute_mma_dS_consumer_state_1)
@@ -4258,16 +4264,6 @@ class BlackwellFmhaBackwardDQ256:
             if cutlass.const_expr(wg_idx == 0):
                 self.dS_sync_barrier_compute0.arrive()
 
-            # Wait for dP
-            mma_compute_dP_pipeline.consumer_wait(mma_compute_dP_consumer_state, peak_mma_compute_dP_status)
-            # Compute dS = dsoftmax(P, dP, sum_OdO)
-            cute.copy(tiled_t2r, tTR_tDP, tTR_rDP)
-            cute.arch.fence_view_async_tmem_load()
-            if cutlass.const_expr(wg_idx == 1):
-                if iter_count > 1:
-                    self.dS_sync_barrier_compute1.arrive()
-            mma_compute_dP_pipeline.consumer_release(mma_compute_dP_consumer_state)
-
             if is_masked_tile:
                 fmha_masks.FusedMask.apply_mask(
                     self.mask_type,
@@ -4294,6 +4290,16 @@ class BlackwellFmhaBackwardDQ256:
 
                 tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                 tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
+
+            # S is already in registers: overlap softmax with the independent
+            # dO @ V MMA, then wait only when dP is actually consumed.
+            mma_compute_dP_pipeline.consumer_wait(mma_compute_dP_consumer_state, peak_mma_compute_dP_status)
+            cute.copy(tiled_t2r, tTR_tDP, tTR_rDP)
+            cute.arch.fence_view_async_tmem_load()
+            if cutlass.const_expr(wg_idx == 1):
+                if iter_count > 1:
+                    self.dS_sync_barrier_compute1.arrive()
+            mma_compute_dP_pipeline.consumer_release(mma_compute_dP_consumer_state)
 
             # Read sum_OdO directly from global memory (q_global_idx computed earlier for LSE)
             for i in cutlass.range(0, cute.size(tTR_rDP), 2, unroll_full=True):
@@ -4328,6 +4334,14 @@ class BlackwellFmhaBackwardDQ256:
                 cp_scale_tile[cp_row, cp_col, dS_group + 1] = dS_scale_1
                 cp_scale_tile[cp_row, cp_col + 2, dS_group + 1] = dS_scale_1
 
+                # Scale storage is protected by the one-stage dS pipeline.
+                # Hand it to MMA now while compute quantizes the payload.
+                cute.arch.fence_proxy("async.shared", space="cta")
+                if cutlass.const_expr(wg_idx == 0):
+                    self.dS_scale_exchange_barrier_0.arrive()
+                else:
+                    self.dS_scale_exchange_barrier_1.arrive()
+
                 tTR_rdS_normalized = cute.make_rmem_tensor_like(tTR_rDP)
                 for i in cutlass.range_constexpr(0, 32, 2):
                     tTR_rdS_normalized[i], tTR_rdS_normalized[i + 1] = cute.arch.mul_packed_f32x2(
@@ -4339,13 +4353,6 @@ class BlackwellFmhaBackwardDQ256:
                         (inv_scale_1, inv_scale_1),
                     )
                 tTR_rdST = cute_common.quantize(tTR_rdS_normalized, 4, LOW_PRECISION_TYPE)
-                cute.arch.fence_proxy("async.shared", space="cta")
-                if cutlass.const_expr(wg_idx == 0):
-                    self.dS_scale_exchange_barrier_0.arrive_and_wait()
-                    self.dS_scale_exchange_barrier_0.arrive_and_wait()
-                else:
-                    self.dS_scale_exchange_barrier_1.arrive_and_wait()
-                    self.dS_scale_exchange_barrier_1.arrive_and_wait()
             else:
                 tTR_rdST = cute_common.quantize(tTR_rDP, 4, LOW_PRECISION_TYPE)
 

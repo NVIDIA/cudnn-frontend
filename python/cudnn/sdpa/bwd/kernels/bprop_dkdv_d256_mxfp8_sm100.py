@@ -334,50 +334,10 @@ class BlackwellFmhaBackwardDKDV256:
         num_warp_groups: Int32,
         wg_idx: Int32,
     ) -> cute.Tensor:
-        ret = None
-        if cutlass.const_expr(cute.rank(t.layout) == 1):
-            p = cute.composition(
-                t,
-                cute.make_layout(((num_warp_groups, cute.size(t) // num_warp_groups),)),
-            )
-            ret = p[(wg_idx, None)]
-        elif cutlass.const_expr(cute.rank(t.layout) == 2):
-            p = cute.composition(
-                t,
-                cute.make_layout(
-                    (
-                        t.shape[0],
-                        (num_warp_groups, cute.size(t, mode=[1]) // num_warp_groups),
-                    )
-                ),
-            )
-            ret = p[None, (wg_idx, None)]
-        elif cutlass.const_expr(cute.rank(t.layout) == 3):
-            p = cute.composition(
-                t,
-                cute.make_layout(
-                    (
-                        t.shape[0],
-                        t.shape[1],
-                        (num_warp_groups, cute.size(t, mode=[2]) // num_warp_groups),
-                    )
-                ),
-            )
-            ret = p[None, None, (wg_idx, None)]
-        else:
-            p = cute.composition(
-                t,
-                cute.make_layout(
-                    (
-                        t.shape[0],
-                        t.shape[1],
-                        t.shape[2],
-                        (num_warp_groups, cute.size(t, mode=[3]) // num_warp_groups),
-                    )
-                ),
-            )
-            ret = p[None, None, None, (wg_idx, None)]
-        return ret
+        # A contiguous column chunk owns complete 32-value scale blocks.
+        # In the two-WG path, WG0 gets columns 0:32 and WG1 gets 32:64
+        # (plus the second 64-column lane group), not two partial scales.
+        return cute_common.split_wg_interleaved(t, num_warp_groups, wg_idx)
 
     @cute.jit
     def __call__(
@@ -3788,67 +3748,43 @@ class BlackwellFmhaBackwardDKDV256:
             tTR_rdPT_scaled = cute.make_rmem_tensor_like(tTR_rVDO)
             tTR_rdPT_scaled.store(tTR_rVDO.load())
             if cutlass.const_expr(self.online_ds_scale):
-                partial_amax_0 = Float32(0.0)
-                partial_amax_1 = Float32(0.0)
-                for i in cutlass.range_constexpr(16):
-                    value_0 = tTR_rdPT_scaled[i]
-                    value_1 = tTR_rdPT_scaled[i + 16]
-                    partial_amax_0 = cute.arch.fmax(partial_amax_0, cute.arch.fmax(value_0, -value_0))
-                    partial_amax_1 = cute.arch.fmax(partial_amax_1, cute.arch.fmax(value_1, -value_1))
+                group_amax = Float32(0.0)
+                group_amax_1 = Float32(0.0)
+                for i in cutlass.range_constexpr(32):
+                    value = tTR_rdPT_scaled[i]
+                    group_amax = cute.arch.fmax(group_amax, cute.arch.fmax(value, -value))
+                    if cutlass.const_expr(cute.size(tTR_rdPT_scaled) > 32):
+                        value_1 = tTR_rdPT_scaled[i + 32]
+                        group_amax_1 = cute.arch.fmax(group_amax_1, cute.arch.fmax(value_1, -value_1))
                 dS_row = cute.get(tTR_cVDO[0], mode=[0])
-                dS_group_block = tidx // 64
-                partial_scale_0, _ = cute_common.cvt_amax_to_e8m0_rp(partial_amax_0)
-                partial_scale_1, _ = cute_common.cvt_amax_to_e8m0_rp(partial_amax_1)
-                partial_scale_tile = cute.make_tensor(
-                    sDS_scale_exchange.iterator,
-                    cute.make_layout((2, 2, 2, 64), stride=(256, 128, 64, 1)),
+                dS_group = (tidx // 64) * 2 + wg_idx_valid
+                dS_scale, inv_scale = cute_common.cvt_amax_to_e8m0_rp(group_amax)
+                if cutlass.const_expr(cute.size(tTR_rdPT_scaled) > 32):
+                    dS_scale_1, inv_scale_1 = cute_common.cvt_amax_to_e8m0_rp(group_amax_1)
+                cp_scale_tile = cute.make_tensor(
+                    sDS_scale_exchange.iterator + 512 * (1 + compute_mma_dS_producer_state.index),
+                    cute.make_layout((32, 4, 4), stride=(16, 4, 1)),
                 )
-                partial_scale_tile[wg_idx_valid, 0, dS_group_block, dS_row] = partial_scale_0
-                partial_scale_tile[wg_idx_valid, 1, dS_group_block, dS_row] = partial_scale_1
-                cute.arch.fence_proxy("async.shared", space="cta")
-                self.dS_scale_exchange_barrier.arrive_and_wait()
-
-                scale_0_value = cute.arch.fmax(
-                    partial_scale_tile[0, 0, dS_group_block, dS_row].to(Float32),
-                    partial_scale_tile[1, 0, dS_group_block, dS_row].to(Float32),
-                )
-                scale_1_value = cute.arch.fmax(
-                    partial_scale_tile[0, 1, dS_group_block, dS_row].to(Float32),
-                    partial_scale_tile[1, 1, dS_group_block, dS_row].to(Float32),
-                )
-                dS_scale_0, inv_scale_0 = cute_common.cvt_amax_to_e8m0_rp(scale_0_value * Float32(448.0))
-                dS_scale_1, inv_scale_1 = cute_common.cvt_amax_to_e8m0_rp(scale_1_value * Float32(448.0))
-
-                tTR_rdPT_normalized = cute.make_rmem_tensor_like(tTR_rdPT_scaled)
-                for i in cutlass.range_constexpr(0, 16, 2):
-                    tTR_rdPT_normalized[i], tTR_rdPT_normalized[i + 1] = cute.arch.mul_packed_f32x2(
-                        (tTR_rdPT_scaled[i], tTR_rdPT_scaled[i + 1]),
-                        (inv_scale_0, inv_scale_0),
-                    )
-                    tTR_rdPT_normalized[i + 16], tTR_rdPT_normalized[i + 17] = cute.arch.mul_packed_f32x2(
-                        (tTR_rdPT_scaled[i + 16], tTR_rdPT_scaled[i + 17]),
-                        (inv_scale_1, inv_scale_1),
-                    )
-                tTR_rdST = cute_common.quantize(tTR_rdPT_normalized, 4, LOW_PRECISION_TYPE)
-
-                self.dS_scale_exchange_barrier.arrive_and_wait()
-                if wg_idx_valid == 0:
-                    dS_group = dS_group_block * 2
-                    cp_scale_tile = cute.make_tensor(
-                        sDS_scale_exchange.iterator + 512 * (1 + compute_mma_dS_producer_state.index),
-                        cute.make_layout((32, 4, 4), stride=(16, 4, 1)),
-                    )
-                    cp_row = dS_row % 32
-                    cp_col = dS_row // 32
-                    cp_scale_tile[cp_row, cp_col, dS_group] = dS_scale_0
-                    cp_scale_tile[cp_row, cp_col + 2, dS_group] = dS_scale_0
+                cp_row = dS_row % 32
+                cp_col = dS_row // 32
+                cp_scale_tile[cp_row, cp_col, dS_group] = dS_scale
+                cp_scale_tile[cp_row, cp_col + 2, dS_group] = dS_scale
+                if cutlass.const_expr(cute.size(tTR_rdPT_scaled) > 32):
                     cp_scale_tile[cp_row, cp_col, dS_group + 1] = dS_scale_1
                     cp_scale_tile[cp_row, cp_col + 2, dS_group + 1] = dS_scale_1
+                tTR_rdPT_normalized = cute.make_rmem_tensor_like(tTR_rdPT_scaled)
+                for i in cutlass.range_constexpr(0, 32, 2):
+                    tTR_rdPT_normalized[i], tTR_rdPT_normalized[i + 1] = cute.arch.mul_packed_f32x2(
+                        (tTR_rdPT_scaled[i], tTR_rdPT_scaled[i + 1]),
+                        (inv_scale, inv_scale),
+                    )
+                    if cutlass.const_expr(cute.size(tTR_rdPT_scaled) > 32):
+                        tTR_rdPT_normalized[i + 32], tTR_rdPT_normalized[i + 33] = cute.arch.mul_packed_f32x2(
+                            (tTR_rdPT_scaled[i + 32], tTR_rdPT_scaled[i + 33]),
+                            (inv_scale_1, inv_scale_1),
+                        )
+                tTR_rdST = cute_common.quantize(tTR_rdPT_normalized, 4, LOW_PRECISION_TYPE)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                self.dS_scale_exchange_barrier.arrive_and_wait()
-                # MMA publishes this stage's scales after paired-CTA dS readiness.
-                # Keep the existing compute-only blocking handshake below.
-                self.dS_scale_exchange_barrier.arrive_and_wait()
             else:
                 tTR_rdST = cute_common.quantize(tTR_rdPT_scaled, 4, LOW_PRECISION_TYPE)
 
