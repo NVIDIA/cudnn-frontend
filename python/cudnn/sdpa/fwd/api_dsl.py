@@ -3048,7 +3048,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # normalization needs is required: head dim innermost-contiguous
         # (stride 1), non-broadcast, non-overlapping strides, any B/H/S
         # order, padded strides allowed.
-        from cudnn.sdpa.graph_analyzer import bshd_layout_ok, dense_layout_ok
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok, packed_layout_ok
 
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
             self._value_error_if(
@@ -3056,9 +3056,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 f"{desc.name} must be rank-4 (B, H, S, D); got {desc.ndim}",
             )
             if self.thd:
+                # Same rule as the sm100 adapter and the engine gate: the packed
+                # path reads token, head and element strides; the batch stride
+                # is never stepped under ragged offsets.
                 self._value_error_if(
-                    not bshd_layout_ok(desc.shape, desc.stride),
-                    f"THD (ragged) {desc.name} must be BSHD-physical (stride order 3,1,2,0, size-1 dims wildcarded); got stride {desc.stride}",
+                    not packed_layout_ok(tuple(desc.shape), tuple(desc.stride)),
+                    f"THD (ragged) {desc.name} must have d, h, s stride order (head dim innermost, then heads, then tokens); got stride {tuple(desc.stride)}",
                 )
             else:
                 self._value_error_if(
