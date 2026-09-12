@@ -17,6 +17,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [GEMM + sReLU](gemm_fusions/gemm_srelu.md)
 - [GEMM + dsReLU](gemm_fusions/gemm_dsrelu.md)
 - [Grouped GEMM (BF16)](gemm_fusions/grouped_gemm.md)
+- [Grouped GEMM weight-only NVFP4 projection](gemm_fusions/grouped_gemm_weight_only_nvfp4.md)
 - [Grouped GEMM + GLU (Unified)](gemm_fusions/grouped_gemm_glu.md)
 - [Grouped GEMM + GLU + Hadamard](gemm_fusions/grouped_gemm_glu_hadamard.md)
 - [Grouped GEMM + GLU + Hadamard + Quant](gemm_fusions/grouped_gemm_glu_hadamard_quant.md)

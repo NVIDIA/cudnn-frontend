@@ -9,6 +9,8 @@ from typing import Any
 # cudnn.gemm.ops`` stays frontend-only and torch is imported only when a
 # specific operation is first accessed. Mirrors cudnn/gemm/__init__.py.
 _LAZY_EXPORTS = {
+    "GroupedGemmWeightOnlyNvfp4": ("cudnn.gemm.cutedsl.grouped.weight_only_nvfp4", "GroupedGemmWeightOnlyNvfp4"),
+    "grouped_gemm_weight_only_nvfp4": ("cudnn.gemm.cutedsl.grouped.weight_only_nvfp4", "grouped_gemm_weight_only_nvfp4"),
     "moe_grouped_matmul": ("cudnn.gemm.ops.moe_grouped_matmul", "moe_grouped_matmul"),
     # Both semantic entry points share the existing implementation module.
     "situ_mlp": ("cudnn.gemm.ops.swiglu_mlp", "situ_mlp"),
