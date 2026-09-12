@@ -145,10 +145,15 @@ def pinned_op(backend, variant):
     return functools.partial(op(variant), plan_name=backend.plan(variant))
 
 
-@pytest.fixture(params=("frost", "cutile"))
+@pytest.fixture(params=("frost", "cutile", "hopper"))
 def backend(request):
     """One backend per run of each test; the tests pass its plan name to the
-    ops. The op graph caches are cleared around each test."""
+    ops. The op graph caches are cleared around each test.
+
+    ``hopper`` is the sm90 path and exists for KDA only, so every other variant
+    (and every architecture that is not Hopper) declines it and the test waives
+    itself through :func:`waive_unsupported` -- the same way ``cutile`` already
+    waives where it has no kernel."""
     clear_caches()
     try:
         yield Backend(request.param)
@@ -768,9 +773,12 @@ def test_bwd_split_initial_state(backend, variant):
         s0 = state0.detach().clone().requires_grad_(True)
         with waive_unsupported(backend, variant):
             o, _ = pinned_op(backend, variant)(*leaves, *op_tail(case), initial_state=s0, output_final_state=True, **kw)
-        if dO is None:
-            dO = torch.randn_like(o)
-        grads[tag] = torch.autograd.grad([o], leaves + [s0], [dO])
+            if dO is None:
+                dO = torch.randn_like(o)
+            # Inside the waiver, matching test_bwd_split_d_final_state: a
+            # forward-only backend (hopper) serves the forward and declines the
+            # backward, which is a waive, not a failure.
+            grads[tag] = torch.autograd.grad([o], leaves + [s0], [dO])
     for name, got, want in zip(list(tensors) + ["initial_state"], grads["split"], grads["uncut"]):
         assert_rms_close(f"d{name} split-vs-uncut", got, want.float(), BWD_TOL[torch.bfloat16])
 

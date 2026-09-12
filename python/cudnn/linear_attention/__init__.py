@@ -73,13 +73,14 @@ def GdnEngines(ids):
 
 
 def KdaEngines(ids):
-    """The KDA family: frost, cuTile, and the CAKE C16 training route."""
+    """The KDA family: frost, cuTile, the CAKE C16 training route, and the Hopper sm90 path."""
     return _collect(
         ids,
         ("kda_frost", "cudnn.linear_attention.frost.kda_engine", "KdaFrostEngine"),
         ("kda_cutile", "cudnn.linear_attention.cutile.kda_engine", "KdaCuTileEngine"),
         ("kda_summary_frost", "cudnn.linear_attention.frost.kda_engine", "KdaSummaryFrostEngine"),
         ("kda_cake", "cudnn.linear_attention.cake.kda_engine", "KdaCakeEngine"),
+        ("kda_hopper", "cudnn.linear_attention.hopper.kda_engine", "KdaHopperEngine"),
     )
 
 
