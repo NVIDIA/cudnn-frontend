@@ -773,9 +773,12 @@ def test_bwd_split_initial_state(backend, variant):
         s0 = state0.detach().clone().requires_grad_(True)
         with waive_unsupported(backend, variant):
             o, _ = pinned_op(backend, variant)(*leaves, *op_tail(case), initial_state=s0, output_final_state=True, **kw)
-        if dO is None:
-            dO = torch.randn_like(o)
-        grads[tag] = torch.autograd.grad([o], leaves + [s0], [dO])
+            if dO is None:
+                dO = torch.randn_like(o)
+            # Inside the waiver, matching test_bwd_split_d_final_state: a
+            # forward-only backend (hopper) serves the forward and declines the
+            # backward, which is a waive, not a failure.
+            grads[tag] = torch.autograd.grad([o], leaves + [s0], [dO])
     for name, got, want in zip(list(tensors) + ["initial_state"], grads["split"], grads["uncut"]):
         assert_rms_close(f"d{name} split-vs-uncut", got, want.float(), BWD_TOL[torch.bfloat16])
 

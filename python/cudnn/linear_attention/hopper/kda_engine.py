@@ -13,11 +13,17 @@ This engine fills that hole with a Hopper-native CuTe DSL kernel: a
 chunk-parallel PREP pass followed by a sequential SCAN over the [128, 128]
 state, built on ``warpgroup`` (wgmma) against shared memory rather than TMEM.
 
-Scope is deliberately narrow, and everything outside it is DECLINED rather than
-silently mis-served -- see :meth:`KdaHopperEngine.check_support`. The most
-important limit is that the kernel has no ``initial_state`` input: it always
-seeds the recurrence from zero, so it serves whole-sequence prefill but not
-continuation from a previous chunk's state.
+The kernel chunks at BT = 16 and arranges every exponent reaching ``exp2`` to be
+``<= 0``, so the exponentials can only underflow to zero. That matters: the
+production gate (``gate_lower_bound = -5``, mean log-decay ~ -2.5) makes a
+64-token chunk span ~118 in the exponent, and fp32 overflows at 88.
+
+``initial_state`` IS supported -- the recurrence is seeded from it, so this
+serves chunked-prefill continuation as well as whole-sequence prefill. A graph
+that omits it is handed a zero seed.
+
+Scope is otherwise deliberately narrow, and everything outside it is DECLINED
+rather than silently mis-served -- see :meth:`KdaHopperEngine.check_support`.
 """
 
 from typing import TYPE_CHECKING
@@ -59,6 +65,7 @@ class KdaHopperPlan(CompiledPlan):
         self.want_state = "final_state" in node.outputs
         self.ports = None
         self._scratch_state = None
+        self._zero_state = None
 
     def get_workspace_size(self) -> int:
         # The kernel owns its own scratch (module-level cache keyed by shape and
@@ -93,6 +100,21 @@ class KdaHopperPlan(CompiledPlan):
                 )
             final_state = self._scratch_state
 
+        # The kernel always reads a seed. A graph without initial_state means
+        # "start from zero", so hand it a zero buffer rather than declining.
+        initial_state = nb.get("initial_state")
+        if initial_state is None:
+            if self._zero_state is None:
+                self._zero_state = torch.zeros(
+                    self.n_seqs,
+                    self.h,
+                    self.v_dim,
+                    self.k,
+                    dtype=torch.float32,
+                    device=nb["q"].device,
+                )
+            initial_state = self._zero_state
+
         stream = ctx.stream if ctx.stream is not None else 0
         with torch.cuda.stream(torch.cuda.ExternalStream(stream)) if stream else _null():
             self.kernel.run(
@@ -102,6 +124,7 @@ class KdaHopperPlan(CompiledPlan):
                 nb["g"],
                 nb["beta"],
                 nb["cu_seqlens"],
+                initial_state,
                 nb["O"],
                 final_state,
             )
@@ -144,11 +167,6 @@ class KdaHopperEngine(BaseEngine):
         # Hopper path at all.
         if facts.is_bwd:
             raise NotImplementedError("KdaHopperEngine: forward only; there is no Hopper KDA backward kernel yet")
-        if facts.has_initial_state:
-            raise NotImplementedError(
-                "KdaHopperEngine: the kernel seeds the recurrence from zero and takes no initial_state, "
-                "so it serves whole-sequence prefill but not continuation from a previous chunk"
-            )
         if facts.checkpoint_every_n_tokens:
             raise NotImplementedError("KdaHopperEngine: state_checkpoints are not produced by the Hopper kernel")
         if facts.safe_gate or facts.has_a_log or facts.has_dt_bias:
@@ -182,6 +200,10 @@ class KdaHopperEngine(BaseEngine):
             raise NotImplementedError(f"KdaHopperEngine: 'beta' must be fp32, got {facts.beta_dtype}")
         if facts.final_state_dtype not in (cudnn.data_type.FLOAT, None):
             raise NotImplementedError(f"KdaHopperEngine: 'final_state' must be fp32, got {facts.final_state_dtype}")
+        # The kernel reads and writes the [128, 128] state as fp32 wgmma
+        # accumulators; a bf16 state pool would be reinterpreted, not converted.
+        if facts.state_dtype not in (cudnn.data_type.FLOAT, None):
+            raise NotImplementedError(f"KdaHopperEngine: 'initial_state' must be fp32, got {facts.state_dtype}")
         if not facts.thd_layout:
             raise NotImplementedError("KdaHopperEngine: q/k/v must be THD [total_T, heads, dim]")
 
