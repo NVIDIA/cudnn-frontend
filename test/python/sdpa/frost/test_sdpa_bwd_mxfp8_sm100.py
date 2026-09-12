@@ -361,9 +361,10 @@ def test_long_causal():
 
 
 @pytest.mark.L0
-def test_workspace_accounts_for_repack_buffers():
-    """The SF repack buffers are carved from the caller's workspace; the plan
-    must ask for them (a too-small request would corrupt memory, not fail)."""
+def test_workspace_is_kernel_scratch_only():
+    """The scale factors are read in place (canonical F8_128x4 planes through
+    TMA): the plan's workspace is exactly the kernels' own scratch -- no
+    repacked scale-factor buffers, no hidden copies (Hard Rule 2)."""
     b, hq, sq = 1, 2, 256
     g, _t, _outs = _build_graph(b, hq, hq, sq, sq, scale=1.0 / math.sqrt(_D))
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -372,14 +373,17 @@ def test_workspace_accounts_for_repack_buffers():
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
-    from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import SF_LAYOUT_SFA, SF_LAYOUT_SFB, repack_geometry
+    import cutlass
 
-    l = b * hq
-    # 4 rowwise-A + 5 rowwise/columnwise-B + 2 columnwise-B buffers (see _sf_plan)
-    sfa = repack_geometry(sq, _D // 32, l, SF_LAYOUT_SFA)[3]
-    sfb = repack_geometry(sq, _D // 32, l, SF_LAYOUT_SFB)[3]
-    sfb_t = repack_geometry(_D, sq // 32, l, SF_LAYOUT_SFB)[3]
-    assert g.get_workspace_size() >= 4 * sfa + 4 * sfb + 3 * sfb_t
+    from cudnn.sdpa.bwd.kernels._bprop_mxfp8_common_sm100 import get_workspace_size
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    kernel_scratch = ws_align(int(get_workspace_size(sq, _D, hq, b, cutlass.Float32)))
+    sf_bytes_total = 4 * b * hq * sq * (_D // 32) + 3 * b * hq * (sq // 32) * _D  # the seven canonical SF tensors
+    ws = g.get_workspace_size()
+    assert ws >= kernel_scratch
+    # Well below "kernel scratch + one repacked SF set": the SFs are not copied.
+    assert ws < kernel_scratch + sf_bytes_total
 
 
 # --------------------------------------------------------------------------- #

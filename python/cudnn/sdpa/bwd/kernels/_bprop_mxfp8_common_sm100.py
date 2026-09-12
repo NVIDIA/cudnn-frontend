@@ -49,7 +49,9 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.typing import Int32, Uint32, Float32, Boolean
-from cutlass.cute.typing import Int8
+from cutlass.cute.typing import Int8, Int64
+from cutlass.experimental import primitives as prims
+from cutlass.experimental.cuda import tensor_map as tmap
 
 # --- constants (fmha_cute/constants.py) ---------------------------------
 
@@ -1273,3 +1275,222 @@ def make_clc_fetch_pipeline(
         cta_layout_vmnk=cluster_layout_vmnk,
         defer_sync=True,
     )
+
+
+# =================== canonical F8_128x4 scale factors (native SF path) ===================
+#
+# cuDNN's F8_128x4 scale tensors are a plane of 512-byte atoms; one atom holds a
+# 128-row x 4-group E8M0 tile as 32 rows (m0 = row % 32) of 16 bytes
+# (byte = m1 * 4 + k0 with m1 = row // 32 % 4, k0 = group % 4).  The ROWWISE
+# scales (rows = S, groups along D) are plane-major:
+#   atom(l, rt, ct) at ((l * rest_m + rt) * rest_k + ct) * 512,
+# the COLUMNWISE scales (rows = D, groups along S; the ``*_T`` tensors) put the
+# 128-row D tile outside the head plane:
+#   atom(l, rt, ct) at ((rt * L + l) * rest_k + ct) * 512.
+#
+# The kernels' 2-CTA MMAs (M = 128 across the pair, 64 rows per CTA) read scale
+# factors from TMEM in the "2x2" data-path layout: a 32-bit column holds the
+# four k-blocks of one 32-row group and sub-partition ``s`` reads column
+# ``s % 2``.  Each CTA therefore needs its own 64-row half of an A-operand
+# atom -- and, for a 128-row B operand, sub-partitions 2/3 need row groups
+# m1 = 2, 3 -- in the atom positions m1 = 0, 1, i.e. the 16-byte atom row
+# shifted left by 8 bytes.  Neither TMA (bounding-box start coordinates must
+# be 16-byte aligned; an 8-byte inner-dim offset faults) nor ``tcgen05.cp``
+# (smem descriptor start is 16-byte granular) can express that shift, so each
+# CTA's load warp TMA-loads its canonical atoms into slot 0 (``cta_group::1``,
+# bytes on a per-CTA ``sf_landed`` tx-barrier) and, once they landed,
+# synthesizes the shifted "slot 1" atoms -- and, in the peer CTA, the shifted
+# A-operand slot 0 -- with 32 lanes x (8-byte load, 16-byte store).  It then
+# fences the async proxy and arrives on the LEADER's stage-full barrier
+# (arrival count SF_FULL_BARRIER_ARRIVALS: producer expect_tx + one load warp
+# per CTA; remote arrive from the peer), so the MMA warp's existing
+# ``consumer_wait`` also covers the slots and the leader's ``tcgen05.cp``
+# (cta_group::2, reads both CTAs' smem) never sees a half-built slot.  Payload
+# bytes keep using the pipeline's full barrier.
+#
+# Where the pipeline has no slack for the peer's arrive latency (the dK/dV
+# kernel), the SF slots get their own "free" barriers: the MMA warp issues a
+# ``tcgen05.commit`` (multicast to both CTAs) right after a stage's smem->TMEM
+# SF copies, and the load warp prefetches / builds / releases the next use of
+# that stage's scale factors BEFORE blocking on the payload stage's empty
+# barrier.  Two alternatives were measured and rejected: a leader-only path
+# that multicasts the atoms and writes the peer's slots through DSMEM (the
+# remote stores plus the cluster-scope proxy fence cost more than the arrive),
+# and per-pipeline arrives (three cross-CTA signals per iteration).
+
+SF_ATOM_BYTES = 512
+SF_ATOM_ROW_BYTES = 16
+SF_ATOM_ROWS = 32
+SF_SLOT_SHIFT_BYTES = 8
+# Stage-full barrier arrivals: the producer's expect_tx plus one "slots built" arrival per CTA of the pair.
+SF_FULL_BARRIER_ARRIVALS = 3
+# Multicast mask covering both CTAs of the 2-CTA pair (cluster ranks 0 and 1), for the slot-free tcgen05.commit.
+SF_PAIR_MCAST_MASK = 0b11
+
+
+def sf_atom_tiles(rows, k_groups):
+    """``(rest_m, rest_k)``: 128-row tiles and 4-group tiles of one SF plane."""
+    return (rows + 127) // 128, (k_groups + 3) // 4
+
+
+def make_sf_tensor_map(sf: cute.Tensor, rows, k_groups, planes, plane_major: bool, row_tiles_per_box: int = 1):
+    """TMA descriptor over a canonical F8_128x4 scale tensor (host-side, inside the kernel's ``@cute.jit``).
+
+    Dimensions (TMA order): 16-byte atom row, 32 rows, 4-group tile ``ct``, then
+    ``(rt, l)`` for plane-major (rowwise) tensors or ``(l, rt)`` for the
+    columnwise ``*_T`` tensors; the box is one atom column of
+    ``row_tiles_per_box`` 128-row tiles (each tile lands as 512 contiguous
+    smem bytes).  ``sf`` is the flat E8M0 tensor; ``rows`` / ``k_groups`` /
+    ``planes`` may be runtime values.
+    """
+    rest_m, rest_k = sf_atom_tiles(rows, k_groups)
+    rk = Int64(rest_k)
+    if plane_major:
+        dims = [SF_ATOM_ROW_BYTES, SF_ATOM_ROWS, rest_k, rest_m, planes]
+        strides = [1, SF_ATOM_BYTES // 16, rk * (SF_ATOM_BYTES // 16), rk * Int64(rest_m) * (SF_ATOM_BYTES // 16)]
+        box = [SF_ATOM_ROW_BYTES, SF_ATOM_ROWS, 1, row_tiles_per_box, 1]
+    else:
+        dims = [SF_ATOM_ROW_BYTES, SF_ATOM_ROWS, rest_k, planes, rest_m]
+        strides = [1, SF_ATOM_BYTES // 16, rk * (SF_ATOM_BYTES // 16), rk * Int64(planes) * (SF_ATOM_BYTES // 16)]
+        box = [SF_ATOM_ROW_BYTES, SF_ATOM_ROWS, 1, 1, row_tiles_per_box]
+    return tmap.create_tensor_map_tiled(
+        global_address=Int64(sf.iterator.toint()),
+        dtype=cutlass.Uint8,
+        global_dims=dims,
+        global_strides=strides,
+        box_dims=box,
+        swizzle=tmap.TensorMapSwizzle.none,
+        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+    )
+
+
+def smem_array(ptr: cute.Pointer, dtype):
+    """``cutlass.Array`` view (for the raw TMA / vector ld-st primitives) over a cute smem pointer."""
+    return cutlass.Array(ptr.llvm_ptr, dtype=dtype, addrspace=cutlass.AddressSpace.smem.value)
+
+
+@cute.jit
+def sf_tma_load_local(desc, smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer, plane_major: cutlass.Constexpr[bool], ct, rt, l):
+    """One canonical SF box (atom column ``ct`` of row tile(s) ``rt`` of plane ``l``) -> ``smem_ptr``, bytes on ``mbar_ptr``.
+
+    ``cta_group::1``: the box lands in the issuing CTA only and its bytes on that
+    CTA's own ``sf_landed`` barrier.  Call from one elected thread of each CTA."""
+    if cutlass.const_expr(plane_major):
+        coords = [Int32(0), Int32(0), Int32(ct), Int32(rt), Int32(l)]
+    else:
+        coords = [Int32(0), Int32(0), Int32(ct), Int32(l), Int32(rt)]
+    prims.cp_async_bulk_tensor_shared_cta_global(smem_array(smem_ptr, Int8), desc.get_ptr(), coords, smem_array(mbar_ptr, Int64))
+
+
+@cute.jit
+def sf_slots_ready_arrive_remote(full_barrier_ptr: cute.Pointer, is_leader_cta: Boolean):
+    """This CTA built its SF slots for the stage: fence the async proxy, warp sync, then one arrival on the LEADER's
+    stage-full barrier (locally in the leader, through DSMEM from the peer)."""
+    cute.arch.fence_proxy("async.shared", space="cluster")
+    cute.arch.sync_warp()
+    with cute.arch.elect_one():
+        if is_leader_cta:
+            cute.arch.mbarrier_arrive(full_barrier_ptr)
+        else:
+            cute.arch.mbarrier_arrive(full_barrier_ptr, peer_cta_rank_in_cluster=Int32(0), scope=nvvm.MemScopeKind.CLUSTER)
+
+
+def sf_issue_kv_loads(stage, kv_tile, plane, landed, smem_ptrs, tmaps, geom):
+    """dQ kernel: the canonical SF atoms of KV tile ``kv_tile`` (SFK per K half, SFK^T
+    both D tiles, SFV per K half) -> slot 0 of K stage ``stage``; bytes on ``landed``.
+
+    ``smem_ptrs = (sSFK, sSFK_mn, sSFV) base pointers``, ``tmaps = (sfk, sfkt, sfv)``,
+    ``geom = (sfk_halves, k_halves, sfk_stage_stride, sfkmn_stage_stride, sfv_stage_stride)``.
+    Module-level on purpose: the DSL forbids closure capture inside staged loops.
+    Call from one elected thread.
+    """
+    sfk_ptr, sfkmn_ptr, sfv_ptr = smem_ptrs
+    tmap_k, tmap_kt, tmap_v = tmaps
+    sfk_halves, k_halves, sfk_stage_stride, sfkmn_stage_stride, sfv_stage_stride = geom
+    for k_half in range(sfk_halves):
+        sf_tma_load_local(tmap_k, sfk_ptr + (stage * sfk_halves + k_half) * sfk_stage_stride, landed, True, k_half, kv_tile, plane)
+    sf_tma_load_local(tmap_kt, sfkmn_ptr + stage * sfkmn_stage_stride, landed, False, kv_tile, 0, plane)
+    for k_half in range(k_halves):
+        sf_tma_load_local(tmap_v, sfv_ptr + (stage * k_halves + k_half) * sfv_stage_stride, landed, True, k_half, kv_tile, plane)
+
+
+def sf_a_operand_ops(num_sf_stages, stage_stride, slot_stride, peer: bool):
+    """``sf_build_slots`` ops for an A-operand SF buffer whose ``num_sf_stages`` stages were TMA-loaded into slot 0.
+
+    Leader CTA (rows 0..63 of each 128-row tile): slot 1 = copy of the canonical
+    atom.  Peer CTA (rows 64..127): slot 0 shifted in place and slot 1 shifted,
+    so row groups m1 = 2, 3 sit in the positions the 2x2 data path reads.
+    """
+    ops = []
+    for sf_stage in range(num_sf_stages):
+        base = sf_stage * stage_stride
+        if peer:
+            ops.append((base, base, True))
+        ops.append((base, base + slot_stride, peer))
+    return tuple(ops)
+
+
+def sf_b_operand_ops(stage, sf_stages_per_stage, stage_stride, slot_stride, atoms_per_slot: int = 1):
+    """``sf_build_slots`` ops for a B-operand SF buffer: slot 1 = shifted copy of slot 0 for every atom of pipeline ``stage``."""
+    ops = []
+    for sub in range(sf_stages_per_stage):
+        for atom in range(atoms_per_slot):
+            base = (stage * sf_stages_per_stage + sub) * stage_stride + atom * SF_ATOM_BYTES
+            ops.append((base, base + slot_stride, True))
+    return tuple(ops)
+
+
+def sf_build_kv_slots(words, stage, counts, stage_strides, slot_strides, lane):
+    """dQ kernel: slot 1 of this K stage's SFK (per K half), SFV (per K half) and SFK^T (both D tiles).
+
+    ``words = (sSFK, sSFV, sSFK_mn) Int32 views``, ``counts = (sfk_halves, k_halves, kmn_atoms_per_slot)``.
+    """
+    ops = (
+        sf_b_operand_ops(stage, counts[0], stage_strides[0], slot_strides[0]),
+        sf_b_operand_ops(stage, counts[1], stage_strides[1], slot_strides[1]),
+        sf_b_operand_ops(stage, 1, stage_strides[2], slot_strides[2], counts[2]),
+    )
+    for w, o in zip(words, ops):
+        sf_build_slots(w, o, lane)
+
+
+def sf_slot_strides(layout: cute.Layout):
+    """``(stage_stride_bytes, slot_stride_bytes)`` of a staged ``(..., STAGE, slot)`` SF smem layout (E8M0 = 1 byte)."""
+    return cute.crd2idx((0, 0, 0, 1, 0), layout), cute.crd2idx((0, 0, 0, 0, 1), layout)
+
+
+def sf_build_slots(words, ops, lane):
+    """Synthesize slot atoms from TMA-landed canonical atoms; one warp, lane = atom row.
+
+    Plain trace-time helper (emits into the caller's kernel).  ``words`` is an
+    ``Int32`` smem Array over the SF buffer; ``ops`` is a tuple of
+    ``(src_byte_off, dst_byte_off, shift)`` atoms whose offsets may be runtime
+    values and whose ``shift`` flags are Python bools.  With ``shift`` the
+    destination row is ``[src bytes 8..15, 0 x 8]`` (row groups m1 = 2, 3 moved
+    to positions 0, 1); otherwise it is a plain 16-byte copy.  All loads
+    precede all stores, so an in-place shift and a copy of the same source atom
+    compose.
+    """
+    dst_words = words
+    row_words = SF_ATOM_ROW_BYTES // 4
+    vals = []
+    for src, dst, shift in ops:
+        if shift:
+            vals.append(words[src // 4 + lane * row_words + SF_SLOT_SHIFT_BYTES // 4 : 2])
+        else:
+            vals.append(words[src // 4 + lane * row_words : 4])
+    for (src, dst, shift), v in zip(ops, vals):
+        if shift:
+            dst_words[dst // 4 + lane * row_words : 4] = (v[0], v[1], Int32(0), Int32(0))
+        else:
+            dst_words[dst // 4 + lane * row_words : 4] = (v[0], v[1], v[2], v[3])
+
+
+def sf_reinit_full_barriers(pipe, num_stages: int, arrivals: int = SF_FULL_BARRIER_ARRIVALS):
+    """Raise a TMA/UMMA pipeline's full-barrier arrival count to ``arrivals`` (producer expect_tx + SF slot builders).
+
+    Call from warp 0 (the warp the DSL used for the original init) right after
+    ``create`` and before the cluster init fence.
+    """
+    for stage_idx in range(num_stages):
+        cute.arch.mbarrier_init(pipe.sync_object_full.get_barrier(stage_idx), arrivals)
