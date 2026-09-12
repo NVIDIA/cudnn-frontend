@@ -395,11 +395,37 @@ def test_block_scaled_memo_respects_dynamic_mode(monkeypatch, operation):
     memo = install_memo(monkeypatch, module, f"_{operation}_wrapper_memo")
     inputs = mxfp8_inputs([256] * L_BS) if operation == "glu" else dglu_block_scaled_inputs([256] * L_BS)
     call = glu_block_scaled_call if operation == "glu" else dglu_block_scaled_call
-    for mode in ("1", "0", "1"):
-        monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", mode)
+    for mode in ("1", "True", None, "0", "1"):
+        if mode is None:
+            monkeypatch.delenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", raising=False)
+        else:
+            monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", mode)
         call(inputs)
     torch.cuda.synchronize()
     assert memo.stores == 2 and len(memo) == 2
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("operation", ["glu", "dglu"])
+def test_block_scaled_memo_respects_overlap_margin(monkeypatch, operation):
+    import importlib
+
+    module = importlib.import_module(f"cudnn.gemm.cutedsl.grouped.{operation}.api")
+    memo = install_memo(monkeypatch, module, f"_{operation}_wrapper_memo")
+    monkeypatch.setattr(module, f"_cache_of_GroupedGemm{operation.capitalize()}Sm100Objects", {})
+    monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "True")
+    inputs = mxfp8_inputs([256] * L_BS) if operation == "glu" else dglu_block_scaled_inputs([256] * L_BS)
+    call = glu_block_scaled_call if operation == "glu" else dglu_block_scaled_call
+    apis = []
+    for margin in ("0", "8", "0"):
+        monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", margin)
+        call(inputs)
+        api = next(value[0] for key, value in memo.items() if key[-2] == margin)
+        assert api._implementation.num_cluster_overlap_margin == int(margin)
+        apis.append(api)
+    torch.cuda.synchronize()
+    assert memo.stores == 2 and len(memo) == 2
+    assert apis[0] is apis[2] and apis[0] is not apis[1]
 
 
 def wgrad_inputs(group_k_list):

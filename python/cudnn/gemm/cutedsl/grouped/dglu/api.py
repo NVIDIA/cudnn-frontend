@@ -742,6 +742,8 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
             num_experts,
         )
 
+    cache_key = (*cache_key, int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")))
+
     # ---- Cache lookup or create + compile ----
     if cache_key in _cache_of_GroupedGemmDgluSm100Objects:
         _logger.debug("grouped_gemm_dglu_wrapper_sm100: Using cached object")

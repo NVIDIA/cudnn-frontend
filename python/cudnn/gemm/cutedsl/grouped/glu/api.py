@@ -713,7 +713,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             num_experts,
         )
 
-    cache_key = backend_cache_key(GroupedGemmBackend.BLOCK_SCALED, *cache_key)
+    cache_key = backend_cache_key(GroupedGemmBackend.BLOCK_SCALED, *cache_key, int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")))
 
     # ---- Cache lookup or create + compile ----
     if cache_key in _cache_of_GroupedGemmGluSm100Objects:
