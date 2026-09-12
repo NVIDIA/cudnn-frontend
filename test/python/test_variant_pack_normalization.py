@@ -223,6 +223,24 @@ def test_a_buffer_that_disagrees_with_the_declaration_is_described_from_it():
 
 
 @pytest.mark.L0
+def test_the_declared_extents_under_the_callers_own_strides_are_kept():
+    """A padded / transposed view of the declared tensor: the strides carry
+    information and the engine honours them (the linear-attention engines
+    serve strided inputs this way), so the slot is NOT re-described."""
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    padded = torch.empty(1, M, 2 * K, dtype=torch.bfloat16, device="cuda")[:, :, :K]  # declared extents, row stride 2K
+    pack = g._normalize(g._uid_to_data({A: padded, B: b, C: c}), ws)
+    i = pack.index_of(A)
+    assert list(pack.native.shape(i)) == [1, M, K] and list(pack.native.stride(i)) == [2 * M * K, 2 * K, 1]
+    assert i not in pack.graph_described
+    strided_other = torch.empty(2 * M, K, dtype=torch.bfloat16, device="cuda")[::2]  # other extents AND strided: left alone too
+    pack = g._normalize(g._uid_to_data({A: strided_other, B: b, C: c}), ws)
+    assert pack.index_of(A) not in pack.graph_described
+
+
+@pytest.mark.L0
 def test_a_buffer_too_small_for_the_declaration_keeps_its_own_description():
     g, vp, (a, b, c) = _matmul_graph()
     A, B, C = vp.keys()

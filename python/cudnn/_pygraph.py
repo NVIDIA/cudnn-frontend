@@ -73,6 +73,13 @@ def _span(dim, stride) -> int:
     return 1 + sum((int(d) - 1) * int(x) for d, x in zip(dim, stride)) if dim else 1
 
 
+def _numel(dim) -> int:
+    n = 1
+    for d in dim:
+        n *= int(d)
+    return n
+
+
 def _slot_bytes(data) -> "int | None":
     """Bytes per storage slot of a caller's buffer, or None when it does not say
     (a bare address; a producer with no dtype width). torch answers through
@@ -2022,11 +2029,12 @@ class pygraph:
         # The declaration is the contract. The backend reads only the pointer,
         # so a caller may bind a 2-D matrix to a [1, m, k] tensor, a flat blob
         # to a reordered scale tensor, a 0-d scalar to (1, 1, 1): the graph
-        # says what the bytes mean. A buffer whose own geometry differs from
-        # the declared one but covers its bytes is therefore re-described AS
-        # the declaration -- what a bare address gets -- so an engine reading
-        # the pack answers the way the backend does. A buffer too small for the
-        # declaration keeps its own description; the engine decides.
+        # says what the bytes mean. A DENSE buffer of other extents that covers
+        # the declared bytes is therefore re-described AS the declaration --
+        # what a bare address gets -- so an engine reading the pack answers the
+        # way the backend does. A buffer with the declared extents but its own
+        # strides, a strided view, or one too small for the declaration keeps
+        # its own description; the engine decides.
         for i, uid in enumerate(order):
             if i in from_graph or not native.is_filled(i):
                 continue
@@ -2038,6 +2046,16 @@ class pygraph:
                 continue
             own = tuple(native.shape(i)), tuple(native.stride(i))
             if own == storage:
+                continue
+            if own[0] == storage[0]:
+                # The declared extents under the caller's OWN strides (a padded
+                # or transposed view of this very tensor): those strides carry
+                # information, and an engine that reads the pack honours them.
+                continue
+            if _span(*own) != _numel(own[0]):
+                # Different extents AND gaps or overlaps between the slots: not
+                # one dense run of the declared bytes (a transposed view of a
+                # contiguous block IS one), so not ours to reinterpret.
                 continue
             # BYTES, not slots: a uint8 view spanning as many slots as a bf16
             # declaration covers half its bytes. Unknown widths do not qualify.

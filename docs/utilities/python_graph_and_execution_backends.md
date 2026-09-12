@@ -119,13 +119,17 @@ alignment.** That is how the cuDNN backend has always read a variant pack — it
 takes the pointer and nothing else — and callers program against it: FlashInfer
 binds a 2-D matrix to a `[1, m, k]` tensor, a flat quantizer blob to a
 `[b, bs_m, bs_k]` F8_128x4-reordered scale tensor, a 0-d scalar to `(1, 1, 1)`.
-So `_normalize` describes a slot from the graph when the buffer's own geometry
-disagrees with the declared one but covers its bytes — exactly what a bare
-address gets — and records the slot in `VariantPack.graph_described`, so an
-engine that reads the pack answers the way the backend does and one call cannot
-get two answers by plan selection. A buffer that is SMALLER than the declaration
-keeps its own description (a packed THD buffer under a padded declaration, say):
-the engine decides, and an engine that needs the declared extent refuses it at
+So `_normalize` describes a slot from the graph when the buffer is a DENSE run
+of other extents that covers the declared bytes (the 2-D matrix, the flat blob,
+the 0-d scalar) — exactly what a bare address gets — and records the slot in
+`VariantPack.graph_described`, so an engine that reads the pack answers the way
+the backend does and one call cannot get two answers by plan selection. Two
+kinds of buffer keep their own description: one with the DECLARED extents under
+its own strides (a padded or transposed view of this very tensor — the strides
+carry information, and an engine that reads the pack honours them, which is how
+the linear-attention engines serve strided inputs), and one that is SMALLER
+than the declaration (a packed THD buffer under a padded declaration, say): the
+engine decides, and an engine that needs the declared extent refuses it at
 execute naming the operand (the backend would read past the allocation). A bare
 address lends the declaration outright — it carries no extent, so there is
 nothing to compare against: the caller guarantees the allocation covers the
