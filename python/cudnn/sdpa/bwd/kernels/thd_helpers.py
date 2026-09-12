@@ -37,7 +37,15 @@ from cudnn.frost.tile_dsl.thd import (
     write_thd_row_offsets,
 )
 
-__all__ = ["THD_BWD_META_WORDS", "THD_ROWOFF_OFF", "THD_SETUP_THREADS", "build_thd_bwd_setup_kernel", "thd_bwd_setup_host"]
+__all__ = [
+    "THD_BWD_META_WORDS",
+    "THD_ROWOFF_OFF",
+    "THD_SETUP_THREADS",
+    "build_thd_bwd_setup_kernel",
+    "thd_bwd_setup_host",
+    "build_thd_meta_kernel",
+    "thd_meta_host",
+]
 
 
 @cute.kernel
@@ -93,3 +101,34 @@ def thd_bwd_setup_host(meta_t, q_lens_t, kv_lens_t, lens_form, n_qh, n_batch, ws
     build_thd_bwd_setup_kernel(meta_t, q_lens_t, kv_lens_t, lens_form, n_qh, n_batch, ws_gran, cga_tile_m, n_clusters).launch(
         grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream
     )
+
+
+@cute.kernel
+def build_thd_meta_kernel(
+    meta_t: cute.Tensor,
+    q_lens_t: cute.Tensor,
+    kv_lens_t: cute.Tensor,
+    lens_form: cutlass.Int32,
+    n_batch: cutlass.Int32,
+) -> None:
+    """Lengths -> ``[seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1)]`` only.
+
+    The metadata a kernel that takes ``cu_seqlens`` on device needs and
+    nothing else: no blocked-workspace row offsets, no batch ranking, no claim
+    counter.  One thread does the serial cumsum (B is small); no warp
+    primitives, so it runs on every architecture the SDPA kernels do -- the
+    SM80 backward reads ``cu_q`` / ``cu_k`` straight out of this buffer.
+    """
+    tidx, _, _ = cute.arch.thread_idx()
+    if tidx == cutlass.Int32(0):
+        write_thd_meta(cutlass.make_array_view(meta_t), cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
+
+
+build_thd_meta_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def thd_meta_host(meta_t, q_lens_t, kv_lens_t, lens_form, n_batch, stream=None):
+    """One-warp launch of :func:`build_thd_meta_kernel` (see ``thd_bwd_setup_host``
+    for why the launch wrapper lives at module level)."""
+    build_thd_meta_kernel(meta_t, q_lens_t, kv_lens_t, lens_form, n_batch).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)

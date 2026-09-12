@@ -26,9 +26,10 @@ head-major, never dense-padded.**
   `_thd_lse_view`'s docstring), not something the adapter verifies:
   `as_strided` bounds-checks storage capacity, never overlap. Do not "fix"
   this with a host-side length read; an in-kernel assert is the only
-  legal detector. See the THD classification sites in `fwd/api_dsl.py`
-  (duplicated at the two THD compile-key call sites — extract rather than
-  re-copy if you touch it, per Rule 3's "suspect duplicated logic first").
+  legal detector. Classify with `graph_analyzer.thd_stats_packing(stride_h,
+  stride_s, h_q)` — the one classifier the fwd adapters, the bwd probe and the
+  bwd lowering share; never re-implement the stride test inline (Rule 3's
+  "suspect duplicated logic first").
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
