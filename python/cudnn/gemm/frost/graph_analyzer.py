@@ -576,16 +576,25 @@ def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
     return True
 
 
-def build_gemm_plan(graph: cudnn.pygraph):
+def build_gemm_plan(graph: cudnn.pygraph, knobs=None):
     """Analyze + JIT the graph into a compiled GEMM plan.
+
+    ``knobs`` (:class:`~cudnn.gemm.frost.knobs.GemmKnobs`) pins the tile config
+    a recorded plan ran with; the explicit config is re-gated through
+    :func:`~cudnn.gemm.frost.compiler.probe_chain` so a stale or foreign record
+    declines instead of compiling something the gates never admitted. Without
+    knobs the automatic strategy is used, as before.
 
     Returns a callable :class:`CompiledFusedGemm`; raises ``NotImplementedError`` /
     ``ValueError`` (type + message preserved) on rejection."""
     if not _graph_has_gemm(graph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
-    from .compiler import _graph_dynamic_shapes, jit_from_cudnn_graph, plan_config
+    from .compiler import _graph_dynamic_shapes, jit_from_cudnn_graph, plan_config, probe_chain
 
-    config = plan_config(analyze(graph), dynamic_shapes=_graph_dynamic_shapes(graph))
+    chain = analyze(graph)
+    config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), knobs=knobs)
+    if knobs is not None:
+        probe_chain(chain, config)
     return jit_from_cudnn_graph(graph, config=config)
 
 

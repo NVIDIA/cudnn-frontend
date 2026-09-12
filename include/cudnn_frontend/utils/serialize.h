@@ -692,6 +692,13 @@ NLOHMANN_JSON_SERIALIZE_ENUM(KnobType_t,
                                  {KnobType_t::SCHED_POLICY, "SCHED_POLICY"},
                                  {KnobType_t::PACK_GQA, "PACK_GQA"},
                                  {KnobType_t::SPLIT_KV, "SPLIT_KV"},
+                                 {KnobType_t::PIPELINE_ARCH, "PIPELINE_ARCH"},
+                                 {KnobType_t::MMA_TILE_M, "MMA_TILE_M"},
+                                 {KnobType_t::MMA_TILE_N, "MMA_TILE_N"},
+                                 {KnobType_t::MMA_TILE_K, "MMA_TILE_K"},
+                                 {KnobType_t::CTA_GROUP, "CTA_GROUP"},
+                                 {KnobType_t::WARPS_M, "WARPS_M"},
+                                 {KnobType_t::WARPS_N, "WARPS_N"},
                              })
 
 #endif

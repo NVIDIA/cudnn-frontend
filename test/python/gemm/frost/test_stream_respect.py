@@ -73,9 +73,11 @@ def _build_frost_plan(g):
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    if "frost_gemm" not in names:
+    # a python plan is named "frost_gemm" or "frost_gemm[<public knobs>]"
+    frost = [i for i, n in enumerate(names) if n == "frost_gemm" or n.startswith("frost_gemm[")]
+    if not frost:
         pytest.skip(f"no FROST engine claimed this graph (plans={names})")
-    g.select_plan(names.index("frost_gemm"))
+    g.select_plan(frost[0])
     g.check_support()
     g.build_plans()
     assert g.selected_engine.name == "frost_gemm"

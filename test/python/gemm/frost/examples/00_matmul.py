@@ -92,7 +92,8 @@ def _build_plans(g, *, frost: bool) -> None:
     g.create_execution_plans([cudnn.heur_mode.A])
     if frost:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-        g.select_plan(names.index("frost_gemm"))  # pin the FROST entry
+        # pin the FROST entry: a python plan is named "frost_gemm[<public knobs>]"
+        g.select_plan(next(i for i, n in enumerate(names) if n.split("[")[0] == "frost_gemm"))
     else:
         g.deselect_engines(["frost_gemm"])
     g.check_support()

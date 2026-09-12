@@ -65,7 +65,7 @@ from cutlass.experimental import primitives as prims
 from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
-from cudnn.sdpa.bwd.config_sm120 import ROW_ROUND, SUPPORTED_HEAD_DIMS, TemplateParams, padded_head_dims, validate_params
+from cudnn.sdpa.bwd.config_sm120 import DEFAULT_TILES, ROW_ROUND, SUPPORTED_HEAD_DIMS, TemplateParams, padded_head_dims, validate_params
 from cudnn.sdpa.bwd.kernels._common_sm120 import (
     _COPY_ELEMS,
     _LOG2E,
@@ -302,13 +302,7 @@ def _bwd_relay_release(relay_sem, q_block, relay_turn, warp):
 class SM120FusedMultiHeadAttentionFP16Backward:
     """Configure and launch the SM120 FMHA backward kernel chain."""
 
-    DEFAULT_TILES = {
-        32: (128, 64),
-        64: (64, 128),
-        128: (64, 64),
-        192: (32, 64),
-        256: (32, 64),
-    }
+    DEFAULT_TILES = DEFAULT_TILES  # config_sm120: shared with the family heuristics
     # (d_qk, q_tile, kv_tile) -> (warps_m_sdp, warps_m_dkv, warps_m_dq): for each
     # GEMM the 8 compute warps form an (A, 8 // A) grid; the value is A, the
     # warp count along that GEMM's own M (row) axis.

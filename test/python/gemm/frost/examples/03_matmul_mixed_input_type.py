@@ -35,7 +35,7 @@ def _run(M: int, N: int, K: int) -> None:
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    g.select_plan(names.index("frost_gemm"))  # pin the FROST entry
+    g.select_plan(next(i for i, n in enumerate(names) if n.split("[")[0] == "frost_gemm"))  # pin the FROST entry
     g.check_support()
     g.build_plans()
 

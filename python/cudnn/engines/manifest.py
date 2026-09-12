@@ -194,6 +194,12 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.gemm.frost.engine",
         "FrostGemmEngines",
         slots={"frost_gemm": EngineSlot(0, opt_in=True)},
+        # Facts + heuristics: the plan the engine would build, listed WITH its
+        # tile config spelled as public knobs, so a recorded (engine_id, knobs)
+        # pins the exact kernel (cudnn.gemm.frost.heuristics). One candidate for
+        # now; widening the proposal set is a heuristics-only change.
+        analyzer=("cudnn.gemm.frost.heuristics", "analyze_facts"),
+        heuristics=("cudnn.gemm.frost.heuristics", "recommend"),
         validator=("cudnn._gemm_validate", "validate_graph"),
     ),
     EngineFamily(
@@ -233,6 +239,9 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm100_mxfp8": EngineSlot(3, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
+        # One entry per eligible row, WITH the tiles the lowering would pick
+        # (cudnn.sdpa.bwd.heuristics), so the record pins the kernel.
+        heuristics=("cudnn.sdpa.bwd.heuristics", "recommend"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
     ),
 )
