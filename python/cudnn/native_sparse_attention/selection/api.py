@@ -32,6 +32,8 @@ class SelectionAttention(APIBase):
         acc_dtype: torch.dtype = torch.float32,
         block_size: int = 64,
         scale_softmax: Optional[float] = None,
+        *,
+        is_causal: bool = False,
     ):
         super().__init__()
         self._kernel = HopperSelectAttentionFwd
@@ -58,6 +60,7 @@ class SelectionAttention(APIBase):
         # Types and kernel configuration
         self.acc_dtype = acc_dtype
         self.block_size = block_size
+        self.is_causal = is_causal
 
         # Derived attributes (populated in check_support)
         self.input_layout = None
@@ -71,7 +74,7 @@ class SelectionAttention(APIBase):
         self.scale_softmax = scale_softmax
 
         self._logger.debug(
-            f"__init__ completed with args: sample_q {self.q_desc.shape}, sample_k {self.k_desc.shape}, sample_v {self.v_desc.shape}, sample_o {self.o_desc.shape}, sample_l {self.l_desc.shape}, sample_m {self.m_desc.shape}, sample_block_indices {self.block_indices_desc.shape}, sample_block_counts {self.block_counts_desc.shape}, sample_cum_seqlen_q {self.cum_seqlen_q_desc.shape if self.cum_seqlen_q_desc is not None else 'None'}, sample_cum_seqlen_k {self.cum_seqlen_k_desc.shape if self.cum_seqlen_k_desc is not None else 'None'}, acc_dtype {acc_dtype}, max_s_q {max_s_q}, max_s_k {max_s_k}, block_size {block_size}, scale_softmax {scale_softmax}"
+            f"__init__ completed with args: sample_q {self.q_desc.shape}, sample_k {self.k_desc.shape}, sample_v {self.v_desc.shape}, sample_o {self.o_desc.shape}, sample_l {self.l_desc.shape}, sample_m {self.m_desc.shape}, sample_block_indices {self.block_indices_desc.shape}, sample_block_counts {self.block_counts_desc.shape}, sample_cum_seqlen_q {self.cum_seqlen_q_desc.shape if self.cum_seqlen_q_desc is not None else 'None'}, sample_cum_seqlen_k {self.cum_seqlen_k_desc.shape if self.cum_seqlen_k_desc is not None else 'None'}, acc_dtype {acc_dtype}, max_s_q {max_s_q}, max_s_k {max_s_k}, block_size {block_size}, is_causal {is_causal}, scale_softmax {scale_softmax}"
         )
 
     def check_support(self) -> bool:
@@ -114,7 +117,7 @@ class SelectionAttention(APIBase):
             if self.cum_seqlen_q_desc.dtype not in (torch.int32, torch.int64):
                 raise ValueError(f"cum_seqlen_q must be int32 or int64, got {self.cum_seqlen_q_desc.dtype}")
 
-            if self.block_indices_desc.shape[:2] != (t, h_kv) and self.block_indices_desc.ndim != 3:
+            if self.block_indices_desc.ndim != 3 or self.block_indices_desc.shape[:2] != (t, h_kv):
                 raise ValueError(f"block_indices shape mismatch: expected {(t, h_kv, 'K')}, got {tuple(self.block_indices_desc.shape)}")
             if self.block_counts_desc.shape != (t, h_kv):
                 raise ValueError(f"block_counts shape mismatch: expected {(t, h_kv)}, got {tuple(self.block_counts_desc.shape)}")
@@ -140,8 +143,12 @@ class SelectionAttention(APIBase):
         _ = self._check_dtype(self.o_desc, dtype=self.dtype, name="O", extra_error_msg="O must have the same dtype as Q")
         _ = self._check_dtype(self.acc_dtype, dtype=torch.float32, name="Acc", extra_error_msg="acc_dtype must be Float32")
 
-        if self.block_size not in {16, 32, 64}:
-            raise ValueError("block_size must be 16, 32, or 64")
+        if self.gqa_group_size > 16:
+            raise ValueError(f"H_q / H_kv must be at most 16, got {self.gqa_group_size}")
+        if self.block_size not in {16, 32, 64, 128}:
+            raise ValueError("block_size must be 16, 32, 64, or 128")
+        if not isinstance(self.is_causal, bool):
+            raise ValueError(f"is_causal must be a bool, got {type(self.is_causal).__name__}")
 
         # Compute default scale_softmax if needed
         if self.scale_softmax is None:
@@ -177,6 +184,7 @@ class SelectionAttention(APIBase):
             block_size=self.block_size,
             dtype=_convert_to_cutlass_data_type(self.dtype),
             acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+            causal_within_selected_blocks=self.is_causal,
         )
 
         if self.input_layout == "T,H,D":
@@ -309,6 +317,8 @@ def selection_attention_wrapper(
     max_s_q: Optional[int] = None,
     max_s_k: Optional[int] = None,
     stream: Optional[cuda.CUstream] = None,
+    *,
+    is_causal: bool = False,
 ) -> TupleDict:
     """
     Selection Attention Wrapper that returns output tensors.
@@ -340,6 +350,18 @@ def selection_attention_wrapper(
         q_tensor.dtype,
         k_tensor.dtype,
         v_tensor.dtype,
+        o_dtype,
+        block_indices_tensor.dtype,
+        block_counts_tensor.dtype,
+        cum_seqlen_q_tensor.dtype,
+        cum_seqlen_k_tensor.dtype,
+        q_tensor.device,
+        k_tensor.device,
+        v_tensor.device,
+        block_indices_tensor.device,
+        block_counts_tensor.device,
+        cum_seqlen_q_tensor.device,
+        cum_seqlen_k_tensor.device,
         q_tensor.stride(),
         k_tensor.stride(),
         v_tensor.stride(),
@@ -348,6 +370,7 @@ def selection_attention_wrapper(
         cum_seqlen_q_tensor.stride(),
         cum_seqlen_k_tensor.stride(),
         block_size,
+        is_causal,
         scale_softmax,
         acc_dtype,
         max_s_q,
@@ -387,6 +410,7 @@ def selection_attention_wrapper(
             max_s_q=max_s_q,
             max_s_k=max_s_k,
             block_size=block_size,
+            is_causal=is_causal,
             scale_softmax=scale_softmax,
         )
         assert selection_attention.check_support()

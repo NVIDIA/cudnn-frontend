@@ -173,3 +173,65 @@ def test_nsa_selection_wrapper(
         block_counts,
         cfg,
     )
+
+
+@pytest.mark.L0
+def test_selection_attention_wrapper_cache_separates_is_causal(monkeypatch):
+    """The wrapper must not reuse a non-causal compiled plan for a causal call."""
+    try:
+        from cudnn.native_sparse_attention.selection import api as selection_api
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    plans = []
+
+    class FakeSelectionAttention:
+        def __init__(self, **kwargs):
+            self.is_causal = kwargs["is_causal"]
+            self.compile_count = 0
+            self.execute_count = 0
+            plans.append(self)
+
+        def check_support(self):
+            return True
+
+        def compile(self):
+            self.compile_count += 1
+
+        def execute(self, **kwargs):
+            self.execute_count += 1
+
+    monkeypatch.setattr(selection_api, "SelectionAttention", FakeSelectionAttention)
+    monkeypatch.setattr(selection_api, "_cache_of_SelectionAttentionObjects", {})
+
+    device = torch.device("cuda")
+    q = torch.empty((4, 2, 8), device=device, dtype=torch.bfloat16)
+    k = torch.empty((4, 1, 8), device=device, dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    block_indices = torch.zeros((4, 1, 1), device=device, dtype=torch.int32)
+    block_counts = torch.ones((4, 1), device=device, dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 4], device=device, dtype=torch.int32)
+
+    def call(is_causal):
+        """Invoke the wrapper with only the causal specialization changed."""
+        selection_api.selection_attention_wrapper(
+            q_tensor=q,
+            k_tensor=k,
+            v_tensor=v,
+            block_indices_tensor=block_indices,
+            block_counts_tensor=block_counts,
+            cum_seqlen_q_tensor=cu_seqlens,
+            cum_seqlen_k_tensor=cu_seqlens,
+            max_s_q=4,
+            max_s_k=4,
+            is_causal=is_causal,
+        )
+
+    call(False)
+    call(True)
+    call(False)
+
+    assert len(selection_api._cache_of_SelectionAttentionObjects) == 2
+    assert [plan.is_causal for plan in plans] == [False, True]
+    assert [plan.compile_count for plan in plans] == [1, 1]
+    assert [plan.execute_count for plan in plans] == [2, 1]
