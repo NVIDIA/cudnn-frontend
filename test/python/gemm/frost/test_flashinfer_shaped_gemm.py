@@ -20,8 +20,8 @@ contract under test, for the frost plan:
 
 A decline at check_support is a routing decision and is reported as xfail
 with the reason; a refusal AFTER acceptance is the defect this file exists to
-catch. Cases known to fail today carry ``xfail(strict=True)`` with the owner
-finding, so a fix flips them loud.
+catch. Every case here runs on the frost plan since the variant pack started
+describing a caller's buffer from the graph declaration (``_pygraph._normalize``).
 """
 
 from __future__ import annotations
@@ -34,16 +34,6 @@ from cudnn.engines import is_python_engine
 from gemm_test_utils import requires_sm100
 
 pytestmark = [pytest.mark.L0, requires_sm100]
-
-# Known gaps, strict so a fix flips them loud. Both are one defect in
-# gemm/frost/recipe.py: frost_gemm reads the BUFFER's own shape (rank, units)
-# where the cuDNN contract is the graph declaration plus override_shapes.
-_XFAIL_BUFFER_RANK = pytest.mark.xfail(
-    strict=True, reason="frost_gemm: refuses after check_support -- reads the buffer's rank instead of the declared [batch, ...] dims"
-)
-_XFAIL_FP4_K_UNITS = pytest.mark.xfail(
-    strict=True, reason="frost_gemm: override_shapes are fp4 ELEMENT dims but kpack=2 is applied again -- K doubles, SF blob 'too small'"
-)
 
 # FlashInfer's uid enum (gemm_base.UIDs), kept identical so a graph diff is a graph diff.
 A_UID, B_UID, ALPHA_UID, SFA_UID, SFB_UID, A_SCALE_UID, B_SCALE_UID, BIAS_UID, O_UID = range(9)
@@ -196,7 +186,6 @@ def _bf16_case(M: int, N: int, K: int, *, override_cache_m: int | None = None):
     return build, {A_UID: a, B_UID: b}, override
 
 
-@_XFAIL_BUFFER_RANK
 @pytest.mark.parametrize("mnk", [(256, 512, 256), (13, 256, 128)])
 def test_mm_bf16_two_d_buffers(mnk):
     build, pack, _ = _bf16_case(*mnk)
@@ -287,7 +276,6 @@ def _fp4_case(M: int, N: int, K: int, *, nvfp4: bool, alpha: bool, override_cach
 @pytest.mark.skipif(_FP4_X2 is None, reason="torch has no float4_e2m1fn_x2")
 @pytest.mark.parametrize("mnk", [(256, 512, 256), (13, 256, 128)], ids=["m256", "m13"])
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp4", "mxfp4_alpha"])
-@_XFAIL_BUFFER_RANK
 def test_mm_fp4_flat_scale_blobs(mnk, kind):
     build, pack, _ = _fp4_case(*mnk, nvfp4=kind == "nvfp4", alpha=kind.endswith("alpha"))
     _accept_means_run(build, pack)
@@ -295,7 +283,6 @@ def test_mm_fp4_flat_scale_blobs(mnk, kind):
 
 @pytest.mark.skipif(_FP4_X2 is None, reason="torch has no float4_e2m1fn_x2")
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp4"])
-@_XFAIL_FP4_K_UNITS
 def test_mm_fp4_override_shape_path(kind):
     build, pack, override = _fp4_case(200, 512, 256, nvfp4=kind == "nvfp4", alpha=False, override_cache_m=256)
     _accept_means_run(build, pack, override=override)
@@ -399,7 +386,6 @@ def _mxfp8_case(B: int, M: int, N: int, K: int):
 
 
 @pytest.mark.parametrize("bmnk", [(1, 256, 512, 256), (16, 128, 256, 1024)], ids=["b1", "b16"])
-@_XFAIL_BUFFER_RANK
 def test_bmm_mxfp8_flat_scale_blobs(bmnk):
     build, pack = _mxfp8_case(*bmnk)
     _accept_means_run(build, pack)
