@@ -132,6 +132,19 @@ def bshd_layout_ok(dim: tuple, stride: tuple) -> bool:
     return act == exp
 
 
+def packed_layout_ok(dim: tuple, stride: tuple) -> bool:
+    """BSHD order over (H, S, D) only, for a ragged (THD) tensor. With ragged
+    offsets every sequence's base comes from the offset table and the batch
+    axis is never stepped (the THD lowering binds it at extent 1), so its
+    declared stride carries no information -- FlashInfer declares it equal to
+    the token stride. The per-token layout the kernels address natively is
+    what has to hold: D innermost, then H, then S."""
+    order = tuple(ax for ax in _stride_order(dim, stride) if ax != 0)
+    act = tuple(ax for ax in order if dim[ax] != 1)
+    exp = tuple(ax for ax in _REQ_STRIDE_ORDER if ax != 0 and dim[ax] != 1)
+    return act == exp
+
+
 def dense_layout_ok(dim: tuple, stride: tuple) -> bool:
     """Relaxed DENSE layout soundness for a rank-4 (B, H, S, D) tensor: the
     real requirement of the SM100 DSL lowering, which normalizes any such
@@ -197,6 +210,9 @@ class SdpaGraphFacts:
     # graphs, where ``uniform_dtype`` already covers them.
     uniform_out_dtype: bool = True
     bshd_layout: bool = True  # all of Q/K/V/O in BSHD-physical order
+    # BSHD order over (H, S, D) only -- what a ragged (THD) tensor has to
+    # satisfy, its batch stride being unread under ragged offsets (packed_layout_ok).
+    packed_layout: bool = True
     # Relaxed dense-layout soundness: every one of Q/K/V/O has the head dim
     # innermost-contiguous (stride 1) with non-broadcast, non-overlapping
     # strides — any B/H/S order, padded strides allowed (see dense_layout_ok).
@@ -564,6 +580,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     # about the ragged Q/O only.
     _bshd_ports = [(q_dim, q_stride), (o_dim, o_stride)] if paged else _layout_ports
     bshd = all(bshd_layout_ok(d, s) for d, s in _bshd_ports)
+    packed = all(packed_layout_ok(d, s) for d, s in _bshd_ports)
     dense_layout = all(dense_layout_ok(d, s) for d, s in _layout_ports)
 
     # descale_q/k/v are the block-scale SF tensors for MXFP8, or scalar per-tensor
@@ -699,6 +716,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         uniform_dtype=uniform,
         uniform_out_dtype=uniform_out,
         bshd_layout=bshd,
+        packed_layout=packed,
         dense_layout=dense_layout,
         port_layouts=(tuple((name, dims[name], strides[name]) for name, _ in rank4_ports) if is_backward else ()),
         is_mxfp8=is_mxfp8,

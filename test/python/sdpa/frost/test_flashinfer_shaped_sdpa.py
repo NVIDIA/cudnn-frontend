@@ -13,9 +13,9 @@ forms exist: the legacy element-unit offsets, and the token-unit direct form
 
 Contract under test for the frost plan: it serves the graph (FlashInfer is the
 caller this suite exists for, so a decline FAILS), builds, runs, and O / valid
-LSE rows match the cuDNN backend plan. The two known gaps -- the sm100 row's
-THD stride-order decline at b > 1, and the padded LSE rows left unwritten --
-carry ``xfail(strict=True)`` so a fix flips them loud.
+LSE rows match the cuDNN backend plan. The one known gap -- the padded LSE
+rows left unwritten where the backend writes -inf -- carries
+``xfail(strict=True)`` so a fix flips it loud.
 """
 
 from __future__ import annotations
@@ -232,14 +232,18 @@ class _Case:
         return ("ok", out, lse)
 
 
-def _accept_means_run(case: _Case, *, padded_rows_too: bool = True):
+def _accept_means_run(case: _Case, *, padded_rows_too: bool = True, decline_ok: str | None = None):
     """The frost plan must serve the graph (a decline is a failure here: FlashInfer
     is the caller this suite exists for) and match the backend on O and on every
     valid LSE row. ``padded_rows_too`` also holds the rows past each sequence's
-    length to the backend's value (-inf), the contract of the padded form."""
+    length to the backend's value (-inf), the contract of the padded form.
+    ``decline_ok`` names the one reason a decline IS the right answer for the
+    case (a form the kernels cannot address); anything else still fails."""
     ref = case.run(use_frost=False)
     assert ref[0] == "ok", f"the cuDNN backend itself declined this FlashInfer graph: {ref}"
     got = case.run(use_frost=True)
+    if got[0] == "declined" and decline_ok is not None and decline_ok in got[2]:
+        return  # the documented, correct decline: the backend serves this form
     assert got[0] == "ok", f"frost declined FlashInfer's graph at {got[1]}: {got[2][:300]}"
     torch.testing.assert_close(got[1].float(), ref[1].float(), atol=2e-2, rtol=2e-2)
     if not case.padded_lse:
@@ -251,14 +255,9 @@ def _accept_means_run(case: _Case, *, padded_rows_too: bool = True):
             assert torch.equal(got[2][i, n:], ref[2][i, n:]), f"batch {i}: padded LSE rows differ from the backend's (-inf): {got[2][i, n:n + 4, 0].tolist()}"
 
 
-_XFAIL_THD_BATCH = pytest.mark.xfail(
-    strict=True,
-    reason="sdpa_fwd_prefill_sm100 declines FlashInfer's packed THD at b > 1: BSHD-physical stride-order check on a batch stride that ragged offsets never read",
-)
 _XFAIL_PADDED_LSE = pytest.mark.xfail(strict=True, reason="frost leaves the padded LSE rows of a (b, s_max, h) stats buffer unwritten; the backend writes -inf")
 
 
-@_XFAIL_THD_BATCH
 @pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
 @pytest.mark.parametrize("d", [128, 192])
 def test_ragged_prefill_batch_of_two(form, d):
@@ -266,11 +265,18 @@ def test_ragged_prefill_batch_of_two(form, d):
     _accept_means_run(_Case([68, 87], [400, 512], s_q_max=128, s_kv_max=512, d=d, tokens_form=form == "tokens"))
 
 
-@_XFAIL_THD_BATCH
 @pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
 def test_ragged_prefill_batch_of_two_padded_lse(form):
-    """b > 1 with FlashInfer's padded (b, s_max, h) LSE buffer and no stats offsets: valid rows match."""
-    _accept_means_run(_Case([68, 87], [400, 512], s_q_max=128, s_kv_max=512, tokens_form=form == "tokens", padded_lse=True), padded_rows_too=False)
+    """b > 1 with FlashInfer's padded (b, s_max, h) LSE buffer and no stats offsets.
+
+    The packed path writes Stats as contiguous (T, h) rows and has no per-sequence
+    stats base, so this form is a documented decline (the backend serves it) --
+    never a plan that writes the second sequence's rows at the wrong place."""
+    _accept_means_run(
+        _Case([68, 87], [400, 512], s_q_max=128, s_kv_max=512, tokens_form=form == "tokens", padded_lse=True),
+        padded_rows_too=False,
+        decline_ok="THD Stats without ragged offsets",
+    )
 
 
 @pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
