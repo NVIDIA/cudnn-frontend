@@ -4509,6 +4509,24 @@ def _moe_operand_layout_bad(chain, token, weight) -> bool:
     return token.stride(a_unit) != 1 or weight.stride(b_unit) != 1
 
 
+def _kernel_order(buf, t):
+    """A B-side buffer described AS its declaration is in the graph's
+    ``[b, k, n]`` axis order (the variant pack lends a bare address, or a buffer
+    that disagrees with the declaration, exactly that geometry); the launch
+    reads ``(b, n, k)``. The declaration is compared in STORAGE slots -- an fp4
+    declaration spells elements, the slot spells x2 pairs -- with the same
+    tie-break ``recipe.Operand.axes`` applies on the dense path."""
+    from cudnn.graph_types import storage_geometry
+
+    try:
+        declared = storage_geometry(t.get_dim(), t.get_stride(), t.get_data_type())
+    except Exception:  # noqa: BLE001 -- an analyzer-synthesized ref has no dims
+        return buf
+    if declared is not None and declared[0] and (tuple(buf.shape), tuple(buf.stride())) == declared:
+        return buf.permute(0, 2, 1)
+    return buf
+
+
 def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     """Resolve a MoE variant-pack dict into the positional-call buffers,
     inferring (S, N, K) from shapes. Returns ``(a_bufs, b_bufs, out_bufs,
@@ -4523,26 +4541,13 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             raise KeyError(f"variant pack is missing a buffer for {role}")
         return resolved[id(t)]
 
-    def kernel_order(buf, t):
-        """A B-side buffer described AS its declaration is in the graph's
-        ``[b, k, n]`` axis order (the variant pack lends a bare address, or a
-        buffer that disagrees with the declaration, exactly that geometry); the
-        launch reads ``(b, n, k)``. Same tie-break as ``recipe.Operand.axes``."""
-        try:
-            declared = tuple(int(d) for d in t.get_dim()), tuple(int(x) for x in t.get_stride())
-        except Exception:  # noqa: BLE001 -- an analyzer-synthesized ref has no dims
-            return buf
-        if declared[0] and (tuple(buf.shape), tuple(buf.stride())) == declared:
-            return buf.permute(0, 2, 1)
-        return buf
-
     a_bufs = [pull(t, "token") for t in b.a_operands]
-    b_bufs = [kernel_order(pull(t, "weight"), t) for t in b.b_operands]
+    b_bufs = [_kernel_order(pull(t, "weight"), t) for t in b.b_operands]
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
     fto = pull(b.first_token_offset, "first_token_offset")
     sfa = [pull(t, "SFA") for t in b.sfa_operands]
-    sfb = [kernel_order(pull(t, "SFB"), t) for t in b.sfb_operands]
+    sfb = [_kernel_order(pull(t, "SFB"), t) for t in b.sfb_operands]
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     S = a_bufs[0].shape[1]
     K = a_bufs[0].shape[2] * k_factor

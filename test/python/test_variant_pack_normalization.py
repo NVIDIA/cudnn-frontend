@@ -234,8 +234,19 @@ def test_a_buffer_too_small_for_the_declaration_keeps_its_own_description():
 
 
 @pytest.mark.L0
+def test_a_narrower_buffer_covering_the_slot_count_but_not_the_bytes_is_not_re_described():
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    as_bytes = torch.empty(a.numel(), dtype=torch.uint8, device="cuda")  # as many SLOTS as [1, M, K] bf16, half the bytes
+    pack = g._normalize(g._uid_to_data({A: as_bytes, B: b, C: c}), ws)
+    i = pack.index_of(A)
+    assert list(pack.native.shape(i)) == [a.numel()] and i not in pack.graph_described
+
+
+@pytest.mark.L0
 def test_storage_geometry_packs_fp4_two_per_slot():
-    from cudnn._pygraph import _storage_geometry
+    from cudnn.graph_types import storage_geometry as _storage_geometry
 
     bf16, fp4 = cudnn.data_type.BFLOAT16, cudnn.data_type.FP4_E2M1
     assert _storage_geometry([1, 256, 256], [65536, 256, 1], bf16) == ((1, 256, 256), (65536, 256, 1))

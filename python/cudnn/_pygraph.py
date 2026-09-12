@@ -33,7 +33,7 @@ from ._handle import Handle, to_backend_handle
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
-from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor
+from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor, storage_geometry, storage_slot_bytes
 from .nodes import Node, _row_major_stride
 
 _LOG = logging.getLogger("cudnn.pygraph")
@@ -68,30 +68,24 @@ def _in_axis_order_of(shape, stride, reference_stride):
     return tuple(shape[a] for a in permutation), tuple(stride[a] for a in permutation)
 
 
-def _storage_geometry(dim, stride, data_type):
-    """A cuDNN (element) geometry as the STORAGE-slot geometry a buffer reports.
-
-    Every dtype but fp4 stores one element per slot, so the geometry is its
-    own. fp4 packs two elements per slot along the unit-stride axis (torch's
-    ``float4_e2m1fn_x2``, or a uint8 view): that extent halves and every other
-    stride halves with it. None when the extent is odd -- no slot geometry
-    spells it.
-    """
-    dim = tuple(int(d) for d in dim)
-    stride = tuple(int(x) for x in stride) if stride else _row_major_stride(dim)
-    if data_type != cudnn.data_type.FP4_E2M1:
-        return dim, stride
-    if 1 not in stride:
-        return None
-    c = stride.index(1)
-    if dim[c] % 2 or any(x % 2 for j, x in enumerate(stride) if j != c and x != 1):
-        return None
-    return tuple(d // 2 if j == c else d for j, d in enumerate(dim)), tuple(x if j == c else x // 2 for j, x in enumerate(stride))
-
-
 def _span(dim, stride) -> int:
     """Slots from the base to one past the last addressed slot."""
     return 1 + sum((int(d) - 1) * int(x) for d, x in zip(dim, stride)) if dim else 1
+
+
+def _slot_bytes(data) -> "int | None":
+    """Bytes per storage slot of a caller's buffer, or None when it does not say
+    (a bare address; a producer with no dtype width). torch answers through
+    ``element_size()`` (1 for ``float4_e2m1fn_x2``), the array-interface
+    family through ``dtype.itemsize``."""
+    size = getattr(data, "element_size", None)
+    if callable(size):
+        try:
+            return int(size())
+        except Exception:  # noqa: BLE001 -- a producer whose element_size is not a plain int
+            return None
+    itemsize = getattr(getattr(data, "dtype", None), "itemsize", None)
+    return int(itemsize) if isinstance(itemsize, int) and itemsize > 0 else None
 
 
 def cudnn_graph_not_supported(message: str) -> Exception:
@@ -2039,11 +2033,16 @@ class pygraph:
             declared = self._tensor_by_uid.get(uid)
             if declared is None or not declared.dim:
                 continue
-            storage = _storage_geometry(declared.dim, declared.stride, declared.data_type)
+            storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
             if storage is None:
                 continue
             own = tuple(native.shape(i)), tuple(native.stride(i))
-            if own == storage or _span(*own) < _span(*storage):
+            if own == storage:
+                continue
+            # BYTES, not slots: a uint8 view spanning as many slots as a bf16
+            # declaration covers half its bytes. Unknown widths do not qualify.
+            own_bytes, declared_bytes = _slot_bytes(uid_to_data.get(uid)), storage_slot_bytes(declared.data_type)
+            if own_bytes is None or declared_bytes is None or _span(*own) * own_bytes < _span(*storage) * declared_bytes:
                 continue
             native.override_operand(i, list(storage[0]), list(storage[1]))
             from_graph.append(i)
@@ -2062,7 +2061,7 @@ class pygraph:
                     raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
                 # Overrides speak cuDNN element units; the slot speaks storage slots.
                 declared = self._tensor_by_uid.get(uid)
-                storage = _storage_geometry(override_shapes[j], override_strides[j], declared.data_type if declared is not None else None)
+                storage = storage_geometry(override_shapes[j], override_strides[j], declared.data_type if declared is not None else None)
                 if storage is None:
                     raise ValueError(
                         f"override_shapes for tensor uid {uid}: an fp4 tensor packs two elements per storage slot, so its "
