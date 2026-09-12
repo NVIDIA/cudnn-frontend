@@ -21,6 +21,5 @@ def get_dtype(dtype):
 
 
 def tensormap_workspace_bytes(mod, B: int) -> int:
-    """Runtime TMA-descriptor block for a kernel module: per-batch arrays +
-    static slots + 128 alignment slack."""
-    return TENSOR_MAP_QWORDS * 8 * (mod.TENSORMAP_DESC_ARRAYS * B + mod.TENSORMAP_STATIC_SLOTS) + 128
+    """Runtime TMA-descriptor block for a kernel module, its per-batch arrays plus 128 alignment slack."""
+    return TENSOR_MAP_QWORDS * 8 * mod.TENSORMAP_DESC_ARRAYS * B + 128

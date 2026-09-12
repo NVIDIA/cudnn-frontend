@@ -26,17 +26,15 @@ from typing import Tuple
 @dataclass(frozen=True)
 class Cfg:
     # --- tile shape ---
-    B_T: int = 64  # chunk size / token tile (the mma N or K of every GEMM)
-    D_K: int = 128  # default key head dim (contraction of the K*state GEMM, output dim of the KV update); per-compile 64 or 128
-    D_V: int = 128  # default value head dim (rows of chain H); per-compile 64 or 128
+    B_T: int = 64
 
     # --- warp assignments (12 warps total) ---
-    CHAIN_M_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # transition chain epilogues (identity seed, V = 0)
-    CHAIN_H_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # state chain epilogues (zero / initial_state seed, consumes V)
-    LOAD_GATE_WARP_ID: int = 8  # gate chunk loads
-    TMA_WARP_ID: int = 9  # K / V TMA loads + chunk-factor bulk loads
-    TCGEN05_MMA_WARP_ID: int = 10  # sole tcgen05 issuer: both chains' KS / U / KV per chunk; TMEM lifecycle
-    REGISTER_POOL_WARP_ID: int = 11  # setmaxnreg.dec only: the CTA launches at 168 regs/thread and this warp's share feeds the chain groups
+    CHAIN_M_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)
+    CHAIN_H_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)
+    LOAD_GATE_WARP_ID: int = 8
+    TMA_WARP_ID: int = 9
+    TCGEN05_MMA_WARP_ID: int = 10
+    REGISTER_POOL_WARP_ID: int = 11
 
     # --- register split (12 warps launched at 168 regs/thread: 4 x 24 + 8 x 240 = 2016 = 12 x 168) ---
     NUM_REGS_CHAIN: int = 240

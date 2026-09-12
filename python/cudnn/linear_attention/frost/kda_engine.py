@@ -587,7 +587,6 @@ class CompiledKdaBwd:
         self.io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
         self.n_heads_out, self.total = HO, total
         self.num_sm = multiprocessor_count(self.device)
-        self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.num_seqs = B
         self.pieces, self.unit_chunks = choose_pieces(
@@ -836,7 +835,7 @@ class CompiledKdaBwd:
                 dstate_in,
                 work_items,
                 work_count,
-                scheduler_bwd if self.bwd_dynamic_scheduling else None,
+                scheduler_bwd,
                 region["scheduler_all"] if self.has_state_checkpoints else None,
                 region.get("item_scratch") if self.has_state_checkpoints else None,
                 region["bwd_tensormaps"],
@@ -934,7 +933,7 @@ class CompiledKdaBwd:
                 allow_neg_eigval=self.allow_neg_eigval,
                 work_items=work_items,
                 work_count=work_count,
-                scheduler_counter=scheduler_bwd if self.bwd_dynamic_scheduling else None,
+                scheduler_counter=scheduler_bwd,
                 scheduler_all=region["scheduler_all"] if self.has_state_checkpoints else None,
                 work_item_scratch=region.get("item_scratch") if self.has_state_checkpoints else None,
                 order_in_prologue=self.has_state_checkpoints,
@@ -1822,7 +1821,6 @@ class CompiledKdaSummaryBwd:
         self.num_seqs = B
         self.dim_k, self.dim_v = K, V
         self.num_sm = multiprocessor_count(self.device)
-        self.dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.pieces, self.unit_chunks = choose_pieces(
             num_seqs=B,
@@ -1968,7 +1966,7 @@ class CompiledKdaSummaryBwd:
                 dstate_in,
                 work_items,
                 work_count,
-                region["scheduler_main"] if self.dynamic_scheduling else None,
+                region["scheduler_main"],
                 region["scheduler_all"],
                 region.get("item_scratch"),
                 region["tensormaps"],
@@ -2024,7 +2022,7 @@ class CompiledKdaSummaryBwd:
             allow_neg_eigval=self.allow_neg_eigval,
             work_items=work_items,
             work_count=work_count,
-            scheduler_counter=region["scheduler_main"] if self.dynamic_scheduling else None,
+            scheduler_counter=region["scheduler_main"],
             scheduler_all=region["scheduler_all"],
             work_item_scratch=region.get("item_scratch"),
             order_in_prologue=True,

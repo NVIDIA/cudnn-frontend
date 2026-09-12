@@ -1103,7 +1103,6 @@ def gen_interval_items(
 @cute.jit
 def order_body(
     gen: cutlass.Constexpr[bool],
-    has_scheduler: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
     n_threads: cutlass.Constexpr[int],
     order_elements: cutlass.Constexpr[int],
@@ -1131,13 +1130,13 @@ def order_body(
     items from the piece-wise ``cu_seqlens``, the row bases ``mRowBase`` of this
     table and the main table's row bases ``mSlotRows`` that number the flat slots
     (``mCount`` holds their number).  Thread 0 also zeroes the
-    scheduler ticket rings.  Caller owns ``sKey``/``sIdx`` (``n_threads *
+    scheduler ticket ring when one is passed.  Caller owns ``sKey``/``sIdx`` (``n_threads *
     order_elements`` Int32 each) and a 2-cell ``sSpread``.  CTA-wide barriers
     inside: every thread of the calling CTA must reach it."""
     capacity = cutlass.const_expr(n_threads * order_elements)
 
     # ---- zero the scheduler ticket rings ---------------------------------------------
-    if cutlass.const_expr(has_scheduler):
+    if cutlass.const_expr(mScheduler is not None):
         if tidx == 0:
             si = cutlass.Int32(0)
             while si < mScheduler.shape[0]:
@@ -1243,7 +1242,6 @@ def launch(
     expand_num: cutlass.Constexpr[int],
     warmup_cap: cutlass.Constexpr[int],
     full_scan: cutlass.Constexpr[bool],
-    has_scheduler: cutlass.Constexpr[bool],
     n_heads_out: cutlass.Constexpr[int],
     num_sms: cutlass.Constexpr[int],
     n_tiles: cutlass.Int32,
@@ -1489,7 +1487,6 @@ def build_split_table(
         bool(log_gate),
         bool(safe_gate),
         gate_channels,
-        scheduler_counter is not None,
         str(cu_seqlens.dtype),
         str(gate.dtype),
         str(a_log.dtype) if a_log is not None else "none",
@@ -1526,7 +1523,6 @@ def build_split_table(
             int(expand_num),
             warmup_cap,
             full_scan,
-            scheduler_counter is not None,
             int(n_heads_out),
             int(num_sms),
             cutlass.Int32(n_tiles),
@@ -1542,7 +1538,7 @@ def build_split_table(
             item_scratch_c,
             work_items_c,
             work_count_c,
-            from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic() if scheduler_counter is not None else None,
+            from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic(),
             cutlass.Int32(n_scan_ctas),
             cutlass.Int32(n_scan_blocks),
             cutlass.Int32(n_walk_ctas),
