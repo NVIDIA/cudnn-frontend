@@ -41,6 +41,10 @@ if TYPE_CHECKING:
 HOPPER_SM = 90
 HEAD_DIM = 128
 
+# DLPack alignment hint per port. cu_seqlens is int32 and only 4-byte aligned;
+# everything else is a 16-byte-aligned device allocation.
+_ALIGN = {"cu_seqlens": 4}
+
 
 class KdaHopperPlan(CompiledPlan):
     """Bind the node's ports and hand them to the vendored sm90 kernel.
@@ -65,7 +69,10 @@ class KdaHopperPlan(CompiledPlan):
         self.want_state = "final_state" in node.outputs
         self.ports = None
         self._scratch_state = None
+        self._scratch_state_cute = None
         self._zero_state = None
+        self._zero_state_cute = None
+        self._device = None
 
     def get_workspace_size(self) -> int:
         # The kernel owns its own scratch (module-level cache keyed by shape and
@@ -74,6 +81,7 @@ class KdaHopperPlan(CompiledPlan):
 
     def execute(self, graph, variant_pack, ctx) -> None:
         import torch
+        from cutlass.cute.runtime import from_dlpack
 
         if self.ports is None:
             self.ports = bind_ports(graph, variant_pack)
@@ -81,11 +89,17 @@ class KdaHopperPlan(CompiledPlan):
             self.names = list(slots.inputs) + list(slots.outputs)
             self.indices = list(slots.inputs.values()) + list(slots.outputs.values())
         views = variant_pack.operands(self.indices)
-        # Operands arrive as cuDNN OperandBuffer views; the vendored kernel is a
-        # torch-level API (it allocates its own scratch and goes through
-        # from_dlpack), so borrow them as tensors. OperandBuffer implements the
-        # DLPack protocol, so this is a view -- no copy.
-        nb = {name: torch.from_dlpack(view) for name, view in zip(self.names, views)}
+        # Operands arrive as cuDNN OperandBuffer views, which implement DLPack,
+        # so convert them STRAIGHT to CuTe tensors. Borrowing them as torch
+        # tensors first would cost two DLPack conversions per operand instead of
+        # one, and the kernel only ever wanted the CuTe form -- that double
+        # conversion was the single largest term in this engine's dispatch cost.
+        nb = {name: from_dlpack(view, assumed_align=_ALIGN.get(name, 16)) for name, view in zip(self.names, views)}
+
+        if self._device is None:
+            # One-time: the scratch buffers below need a torch device, and the
+            # operand views do not carry one directly.
+            self._device = torch.from_dlpack(views[0]).device
 
         final_state = nb.get("final_state")
         if final_state is None:
@@ -96,9 +110,10 @@ class KdaHopperPlan(CompiledPlan):
                     self.v_dim,
                     self.k,
                     dtype=torch.float32,
-                    device=nb["q"].device,
+                    device=self._device,
                 )
-            final_state = self._scratch_state
+                self._scratch_state_cute = from_dlpack(self._scratch_state, assumed_align=16)
+            final_state = self._scratch_state_cute
 
         # The kernel always reads a seed. A graph without initial_state means
         # "start from zero", so hand it a zero buffer rather than declining.
@@ -111,31 +126,31 @@ class KdaHopperPlan(CompiledPlan):
                     self.v_dim,
                     self.k,
                     dtype=torch.float32,
-                    device=nb["q"].device,
+                    device=self._device,
                 )
-            initial_state = self._zero_state
+                self._zero_state_cute = from_dlpack(self._zero_state, assumed_align=16)
+            initial_state = self._zero_state_cute
 
-        stream = ctx.stream if ctx.stream is not None else 0
-        with torch.cuda.stream(torch.cuda.ExternalStream(stream)) if stream else _null():
-            self.kernel.run(
-                nb["q"],
-                nb["k"],
-                nb["v"],
-                nb["g"],
-                nb["beta"],
-                nb["cu_seqlens"],
-                initial_state,
-                nb["O"],
-                final_state,
-            )
-
-
-class _null:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, *exc):
-        return False
+        # Hand the stream down explicitly rather than pushing a torch stream
+        # context for the kernel to read back out of thread-local state.
+        stream_ptr = ctx.stream if ctx.stream else torch.cuda.current_stream().cuda_stream
+        self.kernel.run_cute(
+            nb["q"],
+            nb["k"],
+            nb["v"],
+            nb["g"],
+            nb["beta"],
+            nb["cu_seqlens"],
+            initial_state,
+            nb["O"],
+            final_state,
+            self.total,
+            self.h,
+            self.k,
+            self.n_seqs,
+            self._device,
+            stream_ptr,
+        )
 
 
 class KdaHopperEngine(BaseEngine):

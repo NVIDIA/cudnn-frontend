@@ -748,6 +748,17 @@ def _pick_nseg(T, N, H):
 
 
 def _ws(nch, H, N, nseg, device):
+    """Scratch buffers for one shape, returned as ALREADY-CONVERTED CuTe tensors.
+
+    These eleven buffers are keyed by shape and never change identity, so
+    re-running ``from_dlpack`` on them at every launch is pure overhead -- it was
+    11 of the 20 conversions per call, and DLPack conversion dominated this
+    kernel's host time. Convert once, here, and hand the same CuTe tensors to
+    every launch; only the caller's own operands need per-call conversion.
+
+    The torch buffers are kept alive in the cache entry: the CuTe tensors borrow
+    their memory and do not own it.
+    """
     key = (nch, H, N, nseg, str(device))
     w = _WS.get(key)
     if w is None:
@@ -755,7 +766,7 @@ def _ws(nch, H, N, nseg, device):
         kg = torch.empty((c * 16, 128), dtype=torch.bfloat16, device=device)
         ut = torch.empty((c * 16, 128), dtype=torch.bfloat16, device=device)
         nop = max(N * H * nseg, 1)
-        w = (
+        buffers = (
             torch.empty((c * 16, 128), dtype=torch.bfloat16, device=device),
             torch.empty((c * 16, 128), dtype=torch.bfloat16, device=device),
             kg,
@@ -768,48 +779,60 @@ def _ws(nch, H, N, nseg, device):
             torch.empty((nop, 128, 128), dtype=torch.bfloat16, device=device),
             torch.empty((nop, 128, 128), dtype=torch.float32, device=device),
         )
+        w = (buffers, tuple(from_dlpack(b, assumed_align=16) for b in buffers))
         _WS[key] = w
-    return w
+    return w[1]
 
 
 def run(q, k, v, g, beta, cu_seqlens, initial_state, o, final_state):
+    """Launch from torch tensors (standalone / test entry point).
+
+    Converts the nine operands to CuTe tensors and defers to :func:`run_cute`.
+    A caller that already holds CuTe tensors -- cuDNN's engine reaches them
+    straight off the variant pack -- should call that directly and skip the
+    torch round trip, which is two DLPack conversions per operand rather than
+    one.
+    """
     T, H, D = q.shape
     N = initial_state.shape[0]
+    run_cute(
+        from_dlpack(q, assumed_align=16),
+        from_dlpack(k, assumed_align=16),
+        from_dlpack(v, assumed_align=16),
+        from_dlpack(g, assumed_align=16),
+        from_dlpack(beta, assumed_align=16),
+        from_dlpack(cu_seqlens, assumed_align=4),
+        from_dlpack(initial_state, assumed_align=16),
+        from_dlpack(o, assumed_align=16),
+        from_dlpack(final_state, assumed_align=16),
+        T,
+        H,
+        D,
+        N,
+        q.device,
+        torch.cuda.current_stream().cuda_stream,
+    )
+
+
+def run_cute(mQ, mK, mV, mG, mB, mCu, mIS, mO, mFS, T, H, D, N, device, stream_ptr):
+    """Launch from already-converted CuTe tensors on an explicit stream.
+
+    ``stream_ptr`` is a raw CUDA stream handle, so the caller does not have to
+    push a torch stream context just so this function can read it back out of
+    thread-local state.
+    """
     nch = T // 16 + N + 1
     max_chunks = (T + 15) // 16
     nseg = _pick_nseg(T, N, H)
 
-    mw, qg, kg, ut, z, av, kgt, utt, ss, mt, ct = _ws(nch, H, N, nseg, q.device)
+    # Already CuTe tensors, converted once per shape (see _ws).
+    ws = _ws(nch, H, N, nseg, device)
 
     key = (T, H, N, D)
     fn = _CACHE.get(key)
-    stream = cudadrv.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cudadrv.CUstream(stream_ptr)
 
-    def _t(x):
-        return from_dlpack(x, assumed_align=16)
-
-    args = (
-        _t(q),
-        _t(k),
-        _t(v),
-        _t(g),
-        _t(beta),
-        from_dlpack(cu_seqlens, assumed_align=4),
-        _t(initial_state),
-        _t(mw),
-        _t(qg),
-        _t(kg),
-        _t(ut),
-        _t(z),
-        _t(av),
-        _t(kgt),
-        _t(utt),
-        _t(ss),
-        _t(mt),
-        _t(ct),
-        _t(o),
-        _t(final_state),
-    )
+    args = (mQ, mK, mV, mG, mB, mCu, mIS, *ws, mO, mFS)
     if fn is None:
         fn = cute.compile(kda_launch, *args, N, H, max_chunks, nch, nseg, stream)
         _CACHE[key] = fn
