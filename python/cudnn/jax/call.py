@@ -4,6 +4,7 @@
 """cudnn.jax.call: cutlass.jax.cutlass_call with cuDNN conveniences."""
 
 from typing import Any, Callable, Mapping, Optional, Sequence
+from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
@@ -95,8 +96,10 @@ def call(
         *accumulates into* rather than fully writes (atomic max/add). For each entry,
         ``init_fn(ShapeDtypeStruct) -> jax.Array`` produces the pre-initialized buffer
         (e.g. :func:`zeros_init`), which is appended as a trailing input and donated to
-        that output via ``input_output_aliases`` — the bridge drops aliased inputs from
-        the kernel's argument list, so ``fn``'s signature stays exactly the kernel's.
+        that output via ``input_output_aliases``. This wrapper restores initialized
+        outputs to their declared positions in ``fn``'s argument list. Explicit
+        aliases retain the underlying bridge's contract (aliased outputs omitted).
+        Initialized outputs require a flat output sequence.
     """
     output_leaves = jax.tree.leaves(
         output_shape_dtype,
@@ -104,6 +107,31 @@ def call(
     )
     initialized_outputs = dict(initialized_outputs or {})
     input_output_aliases = dict(input_output_aliases or {})
+    if initialized_outputs:
+        if not isinstance(output_shape_dtype, (tuple, list)) or len(output_shape_dtype) != len(output_leaves):
+            raise ValueError("initialized_outputs requires a flat output sequence")
+        if set(initialized_outputs) & set(input_output_aliases.values()):
+            raise ValueError("an initialized output cannot also have an explicit input alias")
+        if any(i < 0 or i >= len(output_leaves) for i in initialized_outputs):
+            raise ValueError("initialized output index is out of range")
+
+    @lru_cache(maxsize=None)
+    def initialized_launcher(input_count):
+        def launch(stream, *buffers, **launch_kwargs):
+            inputs = buffers[:input_count]
+            initialized = dict(
+                zip(
+                    sorted(initialized_outputs),
+                    buffers[input_count : input_count + len(initialized_outputs)],
+                )
+            )
+            remaining = iter(buffers[input_count + len(initialized_outputs) :])
+            outputs = tuple(
+                initialized[i] if i in initialized else next(remaining) for i in range(len(output_leaves)) if i not in input_output_aliases.values()
+            )
+            fn(stream, *inputs, *outputs, **launch_kwargs)
+
+        return launch
 
     def wrapper(*arrays: Any) -> Any:
         inits = []
@@ -119,7 +147,7 @@ def call(
             full_input_spec = tuple(input_spec) + tuple(extra_specs)
 
         return cutlass_call(
-            fn,
+            initialized_launcher(len(arrays)) if inits else fn,
             output_shape_dtype=output_shape_dtype,
             input_spec=full_input_spec,
             output_spec=output_spec,

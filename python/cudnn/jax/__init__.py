@@ -31,3 +31,28 @@ __all__ = [
     "zeros_init",
     "neg_inf_init",
 ]
+
+
+def __getattr__(name):
+    if name in (
+        "kimi_delta_attention",
+        "kimi_delta_attention_fwd",
+        "kimi_delta_attention_bwd",
+        "KdaResidual",
+        "KdaGradients",
+    ):
+        from cudnn.linear_attention import jax_api as kda
+
+        value = getattr(kda, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ += [
+    "kimi_delta_attention",
+    "kimi_delta_attention_fwd",
+    "kimi_delta_attention_bwd",
+    "KdaResidual",
+    "KdaGradients",
+]

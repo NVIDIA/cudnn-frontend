@@ -18,10 +18,11 @@ from ..graph_analyzer import analyze
 from .engine import FrostLaPlan, frost_la_gate, summary_support_gates
 
 
-def build_kda(graph):
+def build_kda(graph, *, enable_piece_chain=True):
     """Import the kernel module (pulls in the Cutlass primitives) and wrap the
     single node; cute.compile is cached inside the kernel per static config and
-    runs on first execute, when the real buffers are known."""
+    runs on first execute, when the real buffers are known. Exported launchers
+    supporting only the split/unsplit schedule can disable piece chains."""
     nodes = list(graph.nodes)
     if len(nodes) != 1 or getattr(nodes[0].node_type, "name", None) not in ("KDA", "KDA_BWD"):
         raise ValueError("build_kda: graph does not contain exactly one KDA/KDA_BWD node")
@@ -30,10 +31,10 @@ def build_kda(graph):
         from .kernel import kda_bprop_f16 as bwd_module
         from .kernel import kda_recompute_f16 as recompute_module
 
-        return CompiledKdaBwd(node, bwd_module, recompute_module)
+        return CompiledKdaBwd(node, bwd_module, recompute_module, enable_piece_chain=enable_piece_chain)
     from .kernel import kda_prefill_f16 as kernel_module
 
-    return CompiledKda(node, kernel_module)
+    return CompiledKda(node, kernel_module, enable_piece_chain=enable_piece_chain)
 
 
 class KdaFrostEngine(BaseEngine):
@@ -110,7 +111,7 @@ class CompiledKda:
     last filled piece gathered into ``final_state``).  A rectangular state chains like a square one: the transition
     summary runs k in place of v, so M is (DK, DK) while H and X are (DV, DK)."""
 
-    def __init__(self, node, kernel_module):
+    def __init__(self, node, kernel_module, *, enable_piece_chain=True):
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
         from .kernel.kda_chain_prologue_f16 import run_chain_prologue
@@ -164,6 +165,7 @@ class CompiledKda:
             batch_invariant=self.batch_invariant,
             expand_num=1,
         )
+        self.pieces = self.pieces if enable_piece_chain else 0
         self.chain = self.pieces > 0
         self.split = not self.chain and not self.batch_invariant
         self.length_rule = self.chain and self.batch_invariant
@@ -222,6 +224,7 @@ class CompiledKda:
         regions.append(("tensormaps", layout.add(self.tensormap_bytes, align=128), "int64", (self.tensormap_bytes // 8,)))
         self.needs_table = self.split
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 
@@ -528,7 +531,7 @@ class CompiledKdaBwd:
     is passed back), G from the bprop summary, a reverse fp32 chain seeding every piece's outgoing gradient, piece 0 of
     every sequence gathered into ``d_initial_state``."""
 
-    def __init__(self, node, bwd_module, recompute_module):
+    def __init__(self, node, bwd_module, recompute_module, *, enable_piece_chain=True):
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
@@ -601,6 +604,7 @@ class CompiledKdaBwd:
             reverse=True,
             expand_num=1,
         )
+        self.pieces = self.pieces if enable_piece_chain else 0
         self.chain = self.pieces > 0
         self.split = not self.chain and not self.batch_invariant
         self.length_rule = self.chain and self.batch_invariant
@@ -709,6 +713,7 @@ class CompiledKdaBwd:
         regions.append(("bwd_tensormaps", layout.add(self.bwd_tensormap_bytes, align=128), "int64", (self.bwd_tensormap_bytes // 8,)))
         self.needs_table = self.split
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 
