@@ -786,8 +786,8 @@ class BlackwellFmhaBackwardDKDV256:
         # - SFB (B operand's SF): use cluster_shape_to_tma_atom_SFB + cluster_layout_vmnk_sfb
 
         sfa_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
-        # SFB (B operand's SF: sfQ, sfDO, sfQ_mn, sfDO_mn) uses multicast
-        sfb_mcast_op = cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.ONE)
+        # SFB readiness must include both CTAs' local SF transfers.
+        sfb_mcast_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.TWO)
         sfK_smem_layout = cute.slice_(sfK_smem_layout_staged, (None, None, None, 0, 0))
         tma_atom_sfK, tma_tensor_sfK = cute.nvgpu.make_tiled_tma_atom_A(
             sfa_op,
@@ -917,7 +917,7 @@ class BlackwellFmhaBackwardDKDV256:
             # Dedicated exchange storage: dKdV keeps four dS pipeline stages,
             # so reusing stage 0 could overwrite a stage still consumed by MMA.
             sDS_scale_exchange: cute.struct.Align[
-                cute.struct.MemRange[self.sf_dtype, 512],
+                cute.struct.MemRange[self.sf_dtype, 512 * (1 + self.compute_mma_dS_stage)],
                 128,
             ]
             sP: cute.struct.Align[
@@ -962,7 +962,9 @@ class BlackwellFmhaBackwardDKDV256:
 
         sum_OdO, scaled_LSE, _ = cute_common.get_workspace_tensor(self, problem_shape, workspace, self.acc_dtype, needs_dq_acc=False)
 
-        tma_lse_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        # Compute follows the leader's MMA completion, so the load barrier
+        # must also account for the peer CTA's local LSE and Sum transfers.
+        tma_lse_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.TWO)
         tma_atom_LSE, tma_tensor_LSE = cpasync.make_tiled_tma_atom(tma_lse_op, scaled_LSE, LSE_smem_layout, (self.cta_tiler[1],))
         tma_atom_sum_OdO, tma_tensor_sum_OdO = cpasync.make_tiled_tma_atom(tma_lse_op, sum_OdO, sum_OdO_smem_layout, (self.cta_tiler[1],))
 
@@ -1299,7 +1301,7 @@ class BlackwellFmhaBackwardDKDV256:
         )
 
         sDS = storage.sDS.get_tensor(dS_smem_layout_staged.outer, swizzle=dS_smem_layout_staged.inner)
-        sDS_scale_exchange = storage.sDS_scale_exchange.get_tensor(cute.make_layout(512))
+        sDS_scale_exchange = storage.sDS_scale_exchange.get_tensor(cute.make_layout(512 * (1 + self.compute_mma_dS_stage)))
 
         sP = storage.sP.get_tensor(P_smem_layout_staged.outer, swizzle=P_smem_layout_staged.inner)
 
@@ -1689,6 +1691,7 @@ class BlackwellFmhaBackwardDKDV256:
 
                         self.mma(
                             tmem,
+                            sDS_scale_exchange,
                             KQ_tiled_mma,
                             VDO_tiled_mma,
                             dSQ_tiled_mma,
@@ -2022,6 +2025,7 @@ class BlackwellFmhaBackwardDKDV256:
                     # NOTE: HERE
                     self.mma(
                         tmem,
+                        sDS_scale_exchange,
                         KQ_tiled_mma,
                         VDO_tiled_mma,
                         dSQ_tiled_mma,
@@ -2143,6 +2147,8 @@ class BlackwellFmhaBackwardDKDV256:
             tmem.relinquish_alloc_permit()
             tmem._num_allocated_columns = self.tmem_alloc_cols
             tmem.free(tmem_ptr)
+
+    bwd.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def load(
@@ -2794,6 +2800,7 @@ class BlackwellFmhaBackwardDKDV256:
     def mma(
         self,
         tmem: utils.TmemAllocator,
+        sDS_scale_exchange: cute.Tensor,
         KQ_tiled_mma: cute.TiledMma,
         VDO_tiled_mma: cute.TiledMma,
         dSQ_tiled_mma: cute.TiledMma,
@@ -3311,6 +3318,14 @@ class BlackwellFmhaBackwardDKDV256:
 
             if is_leader_cta:
                 compute_mma_dS_pipeline.consumer_wait(compute_mma_dS_consumer_state, peak_dS_consumer_status)
+                if cutlass.const_expr(self.online_ds_scale):
+                    stage_scales = cute.make_tensor(
+                        sDS_scale_exchange.iterator + 512 * (1 + compute_mma_dS_consumer_state.index),
+                        cute.make_layout(512),
+                    )
+                    with cute.arch.elect_one():
+                        d256_primitives.copy_mxfp8_scale_tile_to_tmem(stage_scales, tDKtSFDS)
+                    cute.arch.fence_view_async_tmem_store()
                 load_mma_KQ_pipeline.consumer_release(load_mma_KQ_release_state)
                 # dK = dS * QT
                 for k_block in cutlass.range_constexpr(cute.size(tDKrDS, mode=[2])):
@@ -3436,6 +3451,14 @@ class BlackwellFmhaBackwardDKDV256:
             compute_mma_P_consumer_state.advance()
             if is_leader_cta:
                 compute_mma_dS_pipeline.consumer_wait(compute_mma_dS_consumer_state)
+                if cutlass.const_expr(self.online_ds_scale):
+                    stage_scales = cute.make_tensor(
+                        sDS_scale_exchange.iterator + 512 * (1 + compute_mma_dS_consumer_state.index),
+                        cute.make_layout(512),
+                    )
+                    with cute.arch.elect_one():
+                        d256_primitives.copy_mxfp8_scale_tile_to_tmem(stage_scales, tDKtSFDS)
+                    cute.arch.fence_view_async_tmem_store()
                 # dK = dS * QT
                 for k_block in cutlass.range_constexpr(cute.size(tDKrDS, mode=[2])):
                     sf_kblock_coord = (None, None, k_block)
@@ -3812,7 +3835,7 @@ class BlackwellFmhaBackwardDKDV256:
                 if wg_idx_valid == 0:
                     dS_group = dS_group_block * 2
                     cp_scale_tile = cute.make_tensor(
-                        sDS_scale_exchange.iterator,
+                        sDS_scale_exchange.iterator + 512 * (1 + compute_mma_dS_producer_state.index),
                         cute.make_layout((32, 4, 4), stride=(16, 4, 1)),
                     )
                     cp_row = dS_row % 32
@@ -3823,10 +3846,8 @@ class BlackwellFmhaBackwardDKDV256:
                     cp_scale_tile[cp_row, cp_col + 2, dS_group + 1] = dS_scale_1
                 cute.arch.fence_proxy("async.shared", space="cta")
                 self.dS_scale_exchange_barrier.arrive_and_wait()
-                if wg_idx_valid == 0 and tidx == 0:
-                    d256_primitives.copy_mxfp8_scale_tile_to_tmem(sDS_scale_exchange, tDKtSFDS)
-                if wg_idx_valid == 0:
-                    cute.arch.fence_view_async_tmem_store()
+                # MMA publishes this stage's scales after paired-CTA dS readiness.
+                # Keep the existing compute-only blocking handshake below.
                 self.dS_scale_exchange_barrier.arrive_and_wait()
             else:
                 tTR_rdST = cute_common.quantize(tTR_rdPT_scaled, 4, LOW_PRECISION_TYPE)
@@ -3971,21 +3992,22 @@ class BlackwellFmhaBackwardDKDV256:
         )
 
     def make_and_init_load_mma_KQ_pipeline(self, load_mma_KQ_mbar_ptr, cluster_layout_vmnk):
+        # TWO completion counts both CTAs, including their SF and scalar loads.
         tx_count = self.tma_copy_Q_bytes * 2
-        tx_count += self.tma_copy_sfQ_bytes * self.k_halves * 2
-        tx_count += self.tma_copy_LSE_bytes
+        tx_count += self.tma_copy_sfQ_bytes * self.k_halves * 4
+        tx_count += 2 * self.tma_copy_LSE_bytes
         return self._make_and_init_load_mma_pipeline(load_mma_KQ_mbar_ptr, cluster_layout_vmnk, tx_count)
 
     def make_and_init_load_mma_KQ_aux_pipeline(self, load_mma_KQ_aux_mbar_ptr, cluster_layout_vmnk):
         tx_count = self.tma_copy_QT_bytes * 2
-        tx_count += self.tma_copy_sfQ_mn_bytes * 2
+        tx_count += self.tma_copy_sfQ_mn_bytes * 4
         return self._make_and_init_load_mma_pipeline(load_mma_KQ_aux_mbar_ptr, cluster_layout_vmnk, tx_count)
 
     def make_and_init_load_mma_VDO_pipeline(self, load_mma_VDO_mbar_ptr, cluster_layout_vmnk):
         tx_count = (self.tma_copy_dO_bytes + self.tma_copy_dOT_bytes) * 2
-        tx_count += self.tma_copy_sfdO_bytes * self.k_halves * 2
-        tx_count += self.tma_copy_sfdO_mn_bytes * 2
-        tx_count += self.tma_copy_sum_OdO_bytes
+        tx_count += self.tma_copy_sfdO_bytes * self.k_halves * 4
+        tx_count += self.tma_copy_sfdO_mn_bytes * 4
+        tx_count += 2 * self.tma_copy_sum_OdO_bytes
         return self._make_and_init_load_mma_pipeline(load_mma_VDO_mbar_ptr, cluster_layout_vmnk, tx_count)
 
     def _make_and_init_mma_compute_pipeline(self, mbar_ptr, num_stages, cluster_layout_vmnk):
