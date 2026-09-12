@@ -189,10 +189,7 @@ class _Case:
             g.check_support()
         except (NotImplementedError, cudnn.cudnnGraphNotSupportedError) as exc:
             return ("declined", "check_support", str(exc))
-        try:
-            g.build_plans()
-        except NotImplementedError as exc:
-            return ("declined", "build_plans", str(exc))
+        g.build_plans()  # accepted above: a failure from here on is the finding, not a decline
         out = torch.empty_like(self.q)  # packed (T, h, d)
         lse = torch.empty(self.t_q, self.h_q, device="cuda", dtype=torch.float32)  # packed (T, h) stats
         ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")

@@ -108,9 +108,9 @@ def _plan_indices(g) -> tuple[int | None, int | None]:
 def _run(build, pack, *, use_frost: bool, override=None):
     """Build one graph, pin the frost (or first backend) plan, run it.
 
-    Returns ``("ok", out)`` or ``("declined", where, reason)``; any exception
-    from execute after a successful check_support propagates -- that is the
-    contract violation."""
+    Returns ``("ok", out)`` or ``("declined", "check_support", reason)``; any
+    exception from build_plans or execute after a successful check_support
+    propagates -- that is the contract violation."""
     handle = cudnn.create_handle()
     g, out_t = build(handle)
     g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -122,12 +122,7 @@ def _run(build, pack, *, use_frost: bool, override=None):
         g.check_support()
     except (NotImplementedError, cudnn.cudnnGraphNotSupportedError) as exc:
         return ("declined", "check_support", str(exc))
-    try:
-        g.build_plans()
-    except NotImplementedError as exc:
-        # A build-time decline is still a decline the plan walk would skip; it
-        # is recorded separately because a pinned (autotune) plan cannot skip.
-        return ("declined", "build_plans", str(exc))
+    g.build_plans()  # accepted above: a failure from here on is the finding, not a decline
     out = out_t()
     kwargs = {}
     if override is not None:
