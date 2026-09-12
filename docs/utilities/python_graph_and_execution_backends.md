@@ -753,10 +753,8 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
   temp-file + `os.replace`; an incompatible format bumps the schema directory.
   Expose the directory / cache object so a caller (FlashInfer) can point it at
   its own workspace and ship it in an AOT wheel.
-- SDPA forward THD at `b > 1`: the BSHD-physical stride-order check declines
-  FlashInfer's packed layout (batch stride == token stride); with ragged
-  offsets the batch stride is never read, so require only the (h, s, d) order.
-  Padded LSE rows of a `(b, s_max, h)` stats buffer: the backend writes `-inf`,
-  the python rows leave them unwritten — fill for parity. The dense padded-Q
-  `.item()` read in `sdpa/fwd/engines.py` runs at execute and breaks CUDA-graph
-  capture; decide it at `check_support` or drop it.
+- SDPA forward THD: padded LSE rows of a `(b, s_max, h)` stats buffer past a
+  sequence's length — the backend writes `-inf`, the python row leaves them
+  unwritten (`b == 1`; at `b > 1` the form is declined) — fill for parity. The
+  dense padded-Q `.item()` read in `sdpa/fwd/engines.py` runs at execute and
+  breaks CUDA-graph capture; decide it at `check_support` or drop it.
