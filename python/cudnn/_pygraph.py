@@ -2114,7 +2114,11 @@ class pygraph:
             declared = self._tensor_by_uid.get(uid)
             if declared is None or not declared.dim:
                 return data, Tensor(uid=uid)
-            return data, describing_tensor(uid, tuple(declared.dim), tuple(declared.stride), declared.data_type)
+            # The slot speaks storage slots (fp4: two elements per slot), like
+            # every other description in the pack.
+            storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
+            dim, stride = storage if storage is not None else (tuple(declared.dim), tuple(declared.stride))
+            return data, describing_tensor(uid, tuple(dim), tuple(stride), declared.data_type)
         dim = getattr(data, "shape", None)
 
         # torch: pointer from data_ptr(), strides from stride() in ELEMENTS

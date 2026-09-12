@@ -255,3 +255,17 @@ def test_storage_geometry_packs_fp4_two_per_slot():
     # column-major B [1, K, N] (stride 1 on K): K halves, N's stride halves
     assert _storage_geometry([1, 256, 512], [131072, 1, 256], fp4) == ((1, 128, 512), (65536, 1, 128))
     assert _storage_geometry([1, 256, 255], [65280, 255, 1], fp4) is None  # no slot geometry spells an odd extent
+
+
+@pytest.mark.L0
+def test_a_bare_address_for_an_fp4_tensor_is_lent_the_storage_geometry():
+    """A bare address borrows the declaration; for fp4 that is the x2 SLOT
+    geometry, so an engine's per-slot packing factor applies to it like to any
+    typed buffer (the caller guarantees the allocation covers the bytes)."""
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = g.tensor(name="a", dim=[1, 256, 256], stride=[65536, 256, 1], data_type=cudnn.data_type.FP4_E2M1)
+    b = g.tensor(name="b", dim=[1, 256, 512], stride=[131072, 1, 256], data_type=cudnn.data_type.FP4_E2M1)
+    _, ta = g._describe(0x1000, a.get_uid())
+    _, tb = g._describe(0x2000, b.get_uid())
+    assert (tuple(ta.dim), tuple(ta.stride)) == ((1, 256, 128), (32768, 128, 1))
+    assert (tuple(tb.dim), tuple(tb.stride)) == ((1, 128, 512), (65536, 1, 128))

@@ -125,7 +125,11 @@ address gets — and records the slot in `VariantPack.graph_described`, so an
 engine that reads the pack answers the way the backend does and one call cannot
 get two answers by plan selection. A buffer that is SMALLER than the declaration
 keeps its own description (a packed THD buffer under a padded declaration, say):
-the engine decides. Rules that follow:
+the engine decides, and an engine that needs the declared extent refuses it at
+execute naming the operand (the backend would read past the allocation). A bare
+address lends the declaration outright — it carries no extent, so there is
+nothing to compare against: the caller guarantees the allocation covers the
+declared bytes and meets the engine's alignment. Rules that follow:
 
 - `override_shapes` / `override_strides` speak cuDNN **element** units in the
   graph's axis order, like every declaration. They are written INTO the slot
@@ -638,11 +642,15 @@ only to decline is why `closed_under` existed.
 ### Accept means run
 
 For a python plan, `check_support()` accepted ⇒ `build_plans()` and
-`execute()` succeed on the buffers a caller binds, and the result matches the
-cuDNN backend plan on the same graph. Nothing an engine learns only at execute
-(buffer rank, blob size, scalar shape) may refuse a call after acceptance: what
-can be decided from the declaration is decided at `check_support`, and the pack
-hands the engine the declaration. `test/python/gemm/frost/test_flashinfer_shaped_gemm.py`
+`execute()` succeed on the buffers a caller binds as the graph declares them,
+and — when the graph has a backend plan — the result matches that plan; a
+python-only graph (GDN/KDA/…) has no cuDNN reference and is held to its
+engine's own numerics tests instead. Nothing an engine can decide from the
+DECLARATION (operand rank, blob size, scalar shape, layout) may refuse a call
+after acceptance: it is decided at `check_support`, and the pack hands the
+engine the declaration. Buffer capacity is not decidable before execute — the
+buffers arrive with the call — so a buffer smaller than its declaration is a
+caller error refused at execute, not a decline. `test/python/gemm/frost/test_flashinfer_shaped_gemm.py`
 and `test/python/sdpa/frost/test_flashinfer_shaped_sdpa.py` re-declare
 FlashInfer's graphs and buffers byte for byte and assert exactly this; a decline
 at `check_support` is reported as xfail with the row's reason, a refusal after
