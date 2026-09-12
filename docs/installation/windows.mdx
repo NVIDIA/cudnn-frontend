@@ -1,0 +1,113 @@
+---
+title: "Installing cuDNN Backend on Windows"
+---
+## Installing the CUDA Toolkit for Windows
+
+Refer to the following instructions for installing CUDA on Windows, including the CUDA driver and toolkit: [NVIDIA CUDA Installation Guide for Windows](https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/index.html).
+
+## Downloading cuDNN Backend for Windows
+
+cuDNN Backend is available at [https://developer.nvidia.com/cudnn](https://developer.nvidia.com/cudnn). Click on the green buttons that describe your target platform and choose one of the following installer formats:
+
+- **Graphical Installation** (executable) - the graphical installer bundles the available per-CUDA cuDNN versions in one package, where the desired CUDA version can be selected at install time through the graphical user interface.
+- **Tarball Installation** (zip) - per-CUDA cuDNN versions are provided as separate tarballs (zip) at [https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/](https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/). These `.zip` archives do not replace the graphical installer and are not meant for general consumption, as they are not installers.
+
+For each release, a JSON manifest is provided such as **redistrib_9.x.y.z.json**, which corresponds to the cuDNN 9.x.y.z release label which includes the release date, the name of each component, license name, relative URL for each platform, and checksums.
+
+Details on parsing these JSON files are described in [Parsing Redistrib JSON](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html#parsing-redistrib-json).
+
+## Installing cuDNN Backend for Windows Software
+
+The following steps describe how to install the downloaded cuDNN Backend for Windows software. You must replace `9.x` and `9.x.y.z` with your specific cuDNN version.
+
+**Graphical Installation**
+
+Install cuDNN by executing the cuDNN installer and following the on-screen prompts.
+
+**Tarball Installation**
+
+In the following steps, the package directory path is referred to as `<packagepath>`.
+
+1. Navigate to your `<packagepath>` directory containing the cuDNN package.
+2. Unzip the cuDNN package.
+
+   ```
+   cudnn-windows-x86_64-*-archive.zip
+   ```
+
+3. Copy the following files from the unzipped package into the NVIDIA cuDNN directory.
+
+   4. Copy `bin\cudnn*.dll` to `C:\Program Files\NVIDIA\CUDNN\v9.x\bin`.
+   5. Copy `include\cudnn*.h` to `C:\Program Files\NVIDIA\CUDNN\v9.x\include`.
+   6. Copy `lib\x64\cudnn*.lib` to `C:\Program Files\NVIDIA\CUDNN\v9.x\lib`.
+
+7. Set the following environment variable to point to where cuDNN is located. To access the value of the `$(PATH)` environment variable, perform the following steps:
+
+   8. Open a command prompt from the **Start** menu.
+   9. Type `Run` and hit **Enter**.
+   10. Issue the `control sysdm.cpl` command.
+   11. Select the **Advanced** tab at the top of the window.
+   12. Click **Environment Variables** at the bottom of the window.
+   13. Add the NVIDIA cuDNN `bin` directory path to the PATH variable:
+
+       ```text
+       Variable Name: PATH
+       Value to Add: C:\Program Files\NVIDIA\CUDNN\v9.x\bin
+       ```
+
+14. Add cuDNN to your Visual Studio project.
+
+    15. Open the Visual Studio project, right-click on the project name in **Solution Explorer**, and choose **Properties**.
+    16. Click **VC++ Directories** and append `C:\Program Files\NVIDIA\CUDNN\v9.x\include` to the **Include Directories** field.
+    17. Click **Linker > General** and append `C:\Program Files\NVIDIA\CUDNN\v9.x\lib\x64` to the **Additional Library Directories** field.
+    18. Click **Linker > Input** and append `cudnn.lib` to the **Additional Dependencies** field and click **OK**.
+
+## Upgrading cuDNN
+
+Navigate to the directory containing cuDNN and delete the old cuDNN `bin`, `lib`, and `header` files. Remove the path to the directory containing cuDNN from the `$(PATH)` environment variable. Reinstall a newer cuDNN version by following the steps in [Installing cuDNN On Windows](/installation/backend/windows#installing-cudnn-backend-for-windows-software).
+
+## Python Wheels - Windows Installation
+
+NVIDIA provides Python Wheels for installing cuDNN through `pip`, primarily for the use of cuDNN with Python. With this installation method, the cuDNN installation environment is managed via `pip`. Additional care must be taken to set up your host environment to use cuDNN outside the `pip` environment.
+
+<Note>
+Before issuing the following commands, you must replace `9.x.y.z` with your respective cuDNN version. On Windows, only the `x86_64` architecture is supported.
+</Note>
+
+### Prerequisites
+
+If your `pip` and `wheel` Python modules are not up-to-date, then use the following command to upgrade these Python modules. If these Python modules are out-of-date, then the commands which follow later in this section may fail.
+
+```
+py -m pip install --upgrade pip wheel
+```
+
+### Installing cuDNN with Pip
+
+To install cuDNN for CUDA 13, run:
+
+```
+py -m pip install nvidia-cudnn-cu13
+```
+
+To install cuDNN for CUDA 12, run:
+
+```
+py -m pip install nvidia-cudnn-cu12
+```
+
+To install cuDNN for a specific release version, include the release version in the command. For example, to install cuDNN 9.x.y.z for CUDA 13, run:
+
+```
+py -m pip install nvidia-cudnn-cu13==9.x.y.z
+```
+
+To install cuDNN 9.x.y.z for CUDA 12, run:
+
+```
+py -m pip install nvidia-cudnn-cu12==9.x.y.z
+```
+
+<Note>
+Only one CUDA toolkit version of cuDNN 9 can be installed at a time.
+</Note>

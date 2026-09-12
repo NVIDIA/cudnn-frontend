@@ -63,8 +63,11 @@ def flash_attn_bwd_sm90(
         dq: pre-allocated (total_S_q, nheads, headdim), optional
         dkv: pre-allocated (total_S_kv, headdim), optional
         d_sink: pre-allocated (nheads,), optional
-        topk_idxs: (total_S_q, topk_max) int32, global indices
-        topk_length: (total_S_q,) int32, per-query valid count, optional
+        topk_idxs: (total_S_q, topk_max) int32, global KV indices.
+            Entries outside `[0, S_kv)` are ignored in both compact and
+            non-compact modes.
+        topk_length: (total_S_q,) int32, optional per-query valid prefix
+            length, clamped to `[0, topk_max]` by the kernel.
         need_d_sink: return and compute d_sink when True
 
     Returns:

@@ -23,8 +23,12 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _candidates
 
 from benchmark_utils import (
+    with_workspace,
+    add_fto_alignment_arg,
     add_sweep_args,
+    expand_config_variants,
     find_cublas_time,
+    fto_alignment,
     group_offsets,
     kernel_match_token,
     nsys_run_and_parse,
@@ -32,7 +36,7 @@ from benchmark_utils import (
     report_pool,
     resolve_nbuf,
     rotating,
-    select_configs,
+    select_config_variants,
     set_bytes,
     spec_for,
     time_ms_delayed,
@@ -47,10 +51,9 @@ def _vp_moe_bs(handles, token, weight, sfa, sfb, fto, output):
     return {TOK: token, W: weight, SFA: sfa, SFB: sfb, FTO: fto, OUT: output}
 
 
-def _build_plan(g, cfg, name):
+def _build_plan(g, cfg, _name):
     """JIT-compile the recorded graph with a forced tile config -> compiled kernel."""
-    _, cta_group = spec_for(name, _SPEC_MAP)
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+    return with_workspace(jit_from_cudnn_graph(g, config=cfg))
 
 
 # combo : (is_fp4, block_size, a_dtype, sf_dtype)
@@ -64,7 +67,7 @@ _COMBOS = {
 # Graph + data setup.
 
 
-def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str):
+def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str, alignment: int = 1):
     is_fp4, block_size, a_dt, sf_dt = _COMBOS[combo]
     sf_k = K // block_size
     g = cudnn.pygraph(
@@ -93,6 +96,7 @@ def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str):
         dim=[E, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
+        alignment_value=alignment,
     )
     tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size])
     w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1])
@@ -114,8 +118,8 @@ def _build_spec_map():
     chain = analyze(_graph_moe_bs(512, 256, 512, 2, "nvfp4")[0])
     m = {}
     for t, cfg in _candidates(chain):
-        label = f"{cfg.name}_{t.cta_group}ctamma"
-        m[label] = (cfg, t.cta_group)
+        label = cfg.name
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 
@@ -197,10 +201,11 @@ def _cublas_launch(buf, S: int, N: int, K: int, E: int) -> None:
 # Worker mode (re-exec'd under nsys).
 
 
-def _nsys_worker(shape, combo, configs, warmup, iters, nbuf, no_baseline=False) -> None:
+def _nsys_worker(shape, combo, configs, warmup, iters, nbuf, fto_align_spec, spec_map, no_baseline=False) -> None:
     G, M, N, K = (int(x) for x in shape.split(","))
     S, E = G * M, G
     offsets = group_offsets(S, E)
+    alignment = fto_alignment(fto_align_spec, offsets)
     print(f"[worker] shape G={G} M={M} N={N} K={K} (S={S}) combo={combo}, " f"configs={len(configs)}, warmup={warmup}, iters={iters}, rotate={nbuf}")
 
     # 1. BF16 batched-GEMM reference.
@@ -218,13 +223,13 @@ def _nsys_worker(shape, combo, configs, warmup, iters, nbuf, no_baseline=False) 
     pool = _mkdata_pool(S, N, K, E, combo, nbuf)
 
     # 2. each MoE-block-scale config.
-    for name in configs or list(_SPEC_MAP):
-        spec = spec_for(name, _SPEC_MAP)
+    for name in configs or list(spec_map):
+        spec = spec_for(name, spec_map)
         cfg = spec[0] if spec else None
         if cfg is None:
             continue
         try:
-            g, h = _graph_moe_bs(S, N, K, E, combo)
+            g, h = _graph_moe_bs(S, N, K, E, combo, alignment)
             plan = _build_plan(g, cfg, name)
             for _ in range(warmup):
                 plan(_vp_moe_bs(h, wset[0], wset[1], wset[2], wset[3], offsets, wset[4]))
@@ -254,7 +259,13 @@ def main() -> int:
         help="skip the cuBLAS BF16 reference; its BF16 tensor set is never " "allocated, which is the larger footprint on big shapes",
     )
     add_sweep_args(parser)
+    add_fto_alignment_arg(parser)
     args = parser.parse_args()
+    spec_map = expand_config_variants(
+        _SPEC_MAP,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
@@ -271,12 +282,26 @@ def main() -> int:
     nbuf = resolve_nbuf(args.rotate_buffers, per_set_bytes, free_divisor=4)
 
     if args._nsys_worker:
-        configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
-        _nsys_worker(args.shape, combo, configs, args.warmup, args.iters, nbuf, args.no_baseline)
+        configs = (
+            select_config_variants(
+                args.configs,
+                spec_map,
+                sweep_swap_ab=args.sweep_swap_ab,
+                sweep_split_k=args.sweep_split_k,
+            )
+            if args.configs
+            else []
+        )
+        _nsys_worker(args.shape, combo, configs, args.warmup, args.iters, nbuf, args.fto_alignment, spec_map, args.no_baseline)
         return 0
 
     flops = 2 * S * N * K
-    config_names = select_configs(args.configs, _SPEC_MAP)
+    config_names = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     print(f"\n=== moe_block_scale_matmul G={G} M={M} N={N} K={K}  " f"(S={S} tokens, ~{flops / 1e9:.1f} GFLOP) — {combo} ===")
 
@@ -294,8 +319,25 @@ def main() -> int:
 
     if args.timing == "nsys":
         print("  [timing: nsys median kernel duration]\n")
-        inner = ["--shape", args.shape, "--combo", combo, "--warmup", str(args.warmup), "--iters", str(args.iters), "--rotate-buffers", str(nbuf)]
-        if config_names:
+        inner = [
+            "--shape",
+            args.shape,
+            "--combo",
+            combo,
+            "--warmup",
+            str(args.warmup),
+            "--iters",
+            str(args.iters),
+            "--rotate-buffers",
+            str(nbuf),
+            "--fto-alignment",
+            str(args.fto_alignment),
+        ]
+        if args.sweep_swap_ab:
+            inner.append("--sweep-swap-ab")
+        if args.sweep_split_k is not None:
+            inner += ["--sweep-split-k", str(args.sweep_split_k)]
+        if args.configs:
             inner += ["--configs", ",".join(config_names)]
         if args.no_baseline:
             inner += ["--no-baseline"]
@@ -310,7 +352,7 @@ def main() -> int:
             cublas_tflops, cublas_ms = float("nan"), float("nan")
             print("  cuBLAS kernel: not detected in nsys output")
         for name in config_names:
-            spec = spec_for(name, _SPEC_MAP)
+            spec = spec_for(name, spec_map)
             cfg = spec[0] if spec else None
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
@@ -329,6 +371,7 @@ def main() -> int:
         else:
             print("  [timing: torch.cuda.Event wall-clock (incl ~50us/call host overhead)]\n")
         offsets = group_offsets(S, E)
+        alignment = fto_alignment(args.fto_alignment, offsets)
         cublas_tflops, cublas_ms = 0.0, float("nan")
         if not args.no_baseline:
             wbf = _mkdata_bf16(S, N, K, E)
@@ -361,7 +404,7 @@ def main() -> int:
 
         ctx_dead = False
         for name in config_names:
-            spec = spec_for(name, _SPEC_MAP)
+            spec = spec_for(name, spec_map)
             cfg = spec[0] if spec else None
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")
@@ -371,7 +414,7 @@ def main() -> int:
                 if args.stream:
                     print(f"  ▶ running {name} ...", flush=True)
                 try:
-                    g, h = _graph_moe_bs(S, N, K, E, combo)
+                    g, h = _graph_moe_bs(S, N, K, E, combo, alignment)
                     plan = _build_plan(g, cfg, name)
                     ms = timer(
                         rotating(

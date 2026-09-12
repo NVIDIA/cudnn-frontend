@@ -142,7 +142,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.28.0"
+__version__ = "1.29.0"
 
 
 def _tensor(
@@ -306,13 +306,24 @@ _EAGER_PUBLIC_NAMES = (
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
+_OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+    "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+}
 
 _LAZY_OPTIONAL_IMPORTS = {
     "gnn": (".gnn", None),
+    "FlexAttentionBwd": (".flex_attention", "FlexAttentionBwd"),
+    "FlexAttentionFwd": (".flex_attention", "FlexAttentionFwd"),
+    "create_mask_plan": (".flex_attention", "create_mask_plan"),
+    "flex_attn_func": (".flex_attention", "flex_attn_func"),
+    "sdpa_torch": (".sdpa.fwd.torch_op", "sdpa"),
     "BSA": (".block_sparse_attention", "BSA"),
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
+    "Nvfp4AttentionQatBackward": (".sdpa.bwd", "Nvfp4AttentionQatBackward"),
+    "nvfp4_attention_qat_backward": (".sdpa.bwd", "nvfp4_attention_qat_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
     "CSA": (".csa", "CSA"),
     "CSACompressorForward": (".csa", "CSACompressorForward"),
@@ -356,6 +367,10 @@ _LAZY_OPTIONAL_IMPORTS = {
     "grouped_gemm_srelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_srelu_wrapper_sm100"),
     "GroupedGemmDsreluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDsreluSm100"),
     "grouped_gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_wrapper_sm100"),
+    "hstu_attention_forward": (".hstu.hstu_attention", "hstu_attention_forward"),
+    "hstu_attention_backward": (".hstu.hstu_attention", "hstu_attention_backward"),
+    "hstu_lmsd_forward": (".hstu.hstu_lmsd", "hstu_lmsd_forward"),
+    "hstu_lmsd_backward": (".hstu.hstu_lmsd", "hstu_lmsd_backward"),
     "GroupedGemmQuantSm100": (".gemm.cutedsl.grouped", "GroupedGemmQuantSm100"),
     "grouped_gemm_quant_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_quant_wrapper_sm100"),
     "GroupedGemmGluSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluSm100"),
@@ -382,10 +397,57 @@ def _load_optional_symbol(name: str) -> Any:
         module = importlib.import_module(module_name, package=__name__)
         value = module if attr_name is None else getattr(module, attr_name)
     except Exception as e:
-        raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
+        raise ImportError(_optional_dependency_message(name, e)) from e
 
     globals()[name] = value
     return value
+
+
+# `cuda` (cuda-python) is deliberately NOT here: it is a separate dependency the
+# `[cutedsl]` extra installs, so a missing `cuda` wants that install, not a DSL upgrade.
+_DSL_STACK_MODULES = ("cutlass", "tvm_ffi", "nvidia_cutlass_dsl", "cudnn")
+
+
+def _missing_non_dsl_module(error: BaseException):
+    """Name of the missing module when the failure is a ModuleNotFoundError outside
+    the CuTe DSL stack, else None.
+
+    Walks the exception chain; the first ModuleNotFoundError decides. ``cudnn``
+    counts as the DSL stack because a kernel package failing to import on an old
+    DSL surfaces as a missing cudnn.* submodule.
+    """
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ModuleNotFoundError):
+            name = error.name or ""
+            top = name.split(".", 1)[0]
+            return name if top and top not in _DSL_STACK_MODULES else None
+        error = error.__cause__ or error.__context__
+    return None
+
+
+def _optional_dependency_message(name: str, error: Exception) -> str:
+    install_hint = _OPTIONAL_DEPENDENCY_INSTALL_HINTS.get(name, _OPTIONAL_DEPENDENCY_INSTALL_HINT)
+    # A DSL that is installed but below the floor must not be reported as a
+    # missing dependency: "pip install [cutedsl]" would change nothing. The
+    # converse holds too: a failure that is plainly NOT the DSL's -- a missing
+    # third-party module such as torch -- must not be blamed on the DSL version
+    # just because an old DSL happens to be installed.
+    missing = _missing_non_dsl_module(error)
+    if missing is not None:
+        # Name the module: the install hint alone does not fetch a missing framework
+        # (torch, jax) and only fetches cuda-python via the extra.
+        return f"{name} requires the {missing!r} module, which is not installed. {install_hint}: {error}"
+    try:
+        from .frost.buffers import cutedsl_requirement_error
+
+        too_old = cutedsl_requirement_error(name)
+    except Exception:
+        too_old = None
+    if too_old is not None:
+        return f"{too_old}: {error}"
+    return f"{name} requires optional dependencies. {install_hint}: {error}"
 
 
 def __getattr__(name: str) -> Any:
@@ -420,6 +482,17 @@ def __getattr__(name: str) -> Any:
         _jax = importlib.import_module(".jax", __name__)
         globals()["jax"] = _jax
         return _jax
+
+    if name == "torch":
+        # `import cudnn; cudnn.torch.install()` works like `import cudnn.torch`,
+        # mirroring the `jax` branch above. Deferred so `import cudnn` never
+        # eagerly imports torch; the submodule raises its own descriptive error
+        # when torch (or the 2.13+ flash-impl registry) is unavailable — which
+        # is why this is NOT a _LAZY_OPTIONAL_IMPORTS entry: that path would
+        # blame the `[cutedsl]` extra for a missing framework.
+        _torch_mod = importlib.import_module(".torch", __name__)
+        globals()["torch"] = _torch_mod
+        return _torch_mod
 
     if name == "fla":
         # `import cudnn; cudnn.fla.accelerate_fla()` works like `import cudnn.fla`.

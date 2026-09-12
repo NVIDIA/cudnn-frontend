@@ -35,6 +35,7 @@ from cudnn.engines import is_python_engine
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph, probe_supported
 from cudnn.gemm.frost.graph_analyzer import resolve_variant_pack
 from cudnn.gemm.frost.recipe import _output_rule, expected_shape
+from cudnn.gemm.frost.tile_config import DEFAULT_CONFIG
 
 pytestmark = pytest.mark.L0
 
@@ -133,6 +134,17 @@ def _aux_graph():
     Y = g.add(a=C, b=bias, name="bias_add")
     Y.set_output(True).set_data_type(BF16)
     return g
+
+
+def _rectangular_aux_graph(m=128, n=256, k=128):
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1])
+    B = g.tensor(name="B", dim=[1, k, n], stride=[k * n, 1, k])
+    bias = g.tensor(name="bias", dim=[1, 1, n], stride=[n, n, 1], data_type=F32)
+    C = g.matmul(A=A, B=B, name="mm")
+    Y = g.add(a=C, b=bias, name="bias_add")
+    Y.set_stride([m * n, n, 1]).set_output(True).set_data_type(BF16)
+    return g, A, B, bias, Y
 
 
 def _epilogue_graph():
@@ -253,8 +265,10 @@ def test_every_decline_names_its_reason():
     compiled = jit_from_cudnn_graph(_plain_graph())
     assert compiled.lowered is not None and compiled.declined is None
     compiled.recipe = replace(compiled.recipe, workspace_bytes=4096)
-    assert compiled._lower() is None
-    assert compiled.declined == "needs workspace"
+    lowered = compiled._lower()
+    assert lowered is not None and compiled.declined is None
+    with pytest.raises(ValueError, match="needs a workspace"):
+        lowered(_bound_buffers(compiled, *_good()), stream=None)
 
 
 @requires_sm100
@@ -517,6 +531,62 @@ def test_one_buffer_in_two_roles_reads_each_role_s_own_axis_order():
     # The graph declares B [b, K, N], so B's N axis is the buffer's LAST -- which
     # makes the product A @ A, not A @ A.T. Asymmetric by construction.
     torch.testing.assert_close(c.float(), (a.float() @ a.float()), atol=2e-1, rtol=2e-2)
+
+
+@requires_sm100
+def test_swap_ab_transposes_only_the_logical_views():
+    """A rectangular fused graph catches every accidental physical transpose.
+
+    The generated kernel sees B.T @ A.T and an M-major C.T, while the caller
+    keeps the original A/B/C buffers and variant-pack tensor identities.
+    """
+    m, n, k = 128, 256, 128
+    g, A, B, bias, Y = _rectangular_aux_graph(m, n, k)
+    compiled = jit_from_cudnn_graph(g, replace(DEFAULT_CONFIG, swap_ab=True))
+
+    assert (compiled.chain.matmul.M, compiled.chain.matmul.N) == (n, m)
+    assert compiled.chain.out_major == "m"
+    assert compiled.chain.aux_tensors[0].bcast_mode == "per_row"
+    assert compiled.binding.a_operands == [B]
+    assert compiled.binding.b_operands == [A]
+
+    a = torch.randn(1, m, k, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(1, n, k, dtype=torch.bfloat16, device="cuda")
+    bias_buf = torch.randn(1, 1, n, dtype=torch.float32, device="cuda")
+    out = torch.empty(1, m, n, dtype=torch.bfloat16, device="cuda")
+    compiled({A: a, B: b, bias: bias_buf, Y: out})
+    torch.cuda.synchronize()
+
+    ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()) + bias_buf
+    torch.testing.assert_close(out.float(), ref, atol=2e-1, rtol=2e-2)
+    assert dict(compiled.deferrals) == {}
+
+
+@requires_sm100
+@pytest.mark.parametrize("scalar,step", [(False, 1), (False, 2), (True, 1)])
+@pytest.mark.parametrize("stg", [False, True])
+def test_swap_ab_rank1_aux_keeps_its_broadcast_axis(scalar, step, stg):
+    from cudnn.gemm.frost.compiler import force_stg_epi
+
+    m, n, k = 128, 256, 128
+    size = 1 if scalar else n
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1])
+    B = g.tensor(name="B", dim=[1, k, n], stride=[n * k, 1, k])
+    bias = g.tensor(name="bias", dim=[size], stride=[step], data_type=F32)
+    Y = g.add(a=g.matmul(A=A, B=B), b=bias).set_output(True).set_data_type(F32)
+    torch.manual_seed(0)
+    a = torch.randint(-2, 3, (1, m, k), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 3, (1, n, k), device="cuda").to(torch.bfloat16)
+    bias_buf = (torch.arange(size * step, device="cuda", dtype=torch.float32) + 0.25)[::step]
+    out = torch.empty(1, m, n, device="cuda", dtype=torch.float32)
+    with force_stg_epi(stg):
+        compiled = jit_from_cudnn_graph(g, replace(DEFAULT_CONFIG, swap_ab=True))
+    compiled({A: a, B: b, bias: bias_buf, Y: out})
+    torch.cuda.synchronize()
+    ref = (a.float() @ b.float().transpose(1, 2)) + bias_buf
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+    assert not compiled.deferrals
 
 
 @requires_sm100

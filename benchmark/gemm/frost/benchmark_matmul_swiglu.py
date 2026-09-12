@@ -22,12 +22,23 @@ from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
-from benchmark_utils import add_sweep_args, report_pool, resolve_nbuf, rotating, select_configs, set_bytes, spec_for, time_ms
+from benchmark_utils import (
+    add_sweep_args,
+    expand_config_variants,
+    report_pool,
+    resolve_nbuf,
+    rotating,
+    select_config_variants,
+    set_bytes,
+    spec_for,
+    time_ms,
+    with_workspace,
+)
 
 
 def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+    return with_workspace(jit_from_cudnn_graph(g, config=cfg))
 
 
 def _vp_mg(handles, gemm_pairs, outs, *aux):
@@ -136,10 +147,10 @@ def _build_spec_map():
     chain = analyze(_graph_swiglu(1, 256, 256, 256, "bf16", "bf16")[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.cgrp_size_n != 1 or cfg.mma_inst_m != 128:
+        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.cga_size_n != 1 or cfg.mma_tile_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma"
-        m[label] = (cfg, t.cta_group)
+        label = cfg.name
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 
@@ -158,6 +169,11 @@ def main() -> int:
     p.add_argument("--rtol", type=float, default=2e-2)
     p.add_argument("--atol", type=float, default=2e-1)
     args = p.parse_args()
+    spec_map = expand_config_variants(
+        _SPEC_MAP,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
@@ -197,11 +213,16 @@ def main() -> int:
     print(f"  {'unfused 2xcuBLAS + pointwise':52s} {bl_tflops:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms   {'1.00×':>8s}")
 
     # --- candidate (config, cta_group) strategies ---
-    config_names = select_configs(args.configs, _SPEC_MAP)
+    config_names = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     best = None
     for label in config_names:
-        spec = spec_for(label, _SPEC_MAP)
+        spec = spec_for(label, spec_map)
         if spec is None:
             print(f"  {label:62s} UNKNOWN (not a sweepable swiglu strategy)")
             continue

@@ -253,6 +253,71 @@ def test_bsa_attention_forward_sm100_blk64():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(("seqlen_k", "expected"), [(4 * 64, False), (4 * 64 - 1, True)])
+def test_bsa_attention_forward_sm100_blk64_detects_partial_kv_tail(seqlen_k, expected):
+    _import_bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    k = torch.empty((1, 2, seqlen_k, 128), dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+
+    assert interface._sm100_blk64_has_partial_kv_tail(k, v) is expected
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=859)
+def test_bsa_attention_forward_sm100_blk64_partial_kv_tail_matches_reference():
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major not in {10, 11}:
+        pytest.skip("partial-tail exact KV layout is specific to SM100/SM110 blk64")
+
+    BSA = _import_bsa()
+    block_size = 64
+    batch, heads, seqlen_q, seqlen_k, dim = 1, 1, block_size, block_size + 1, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k = torch.tensor([0, 1], device="cuda", dtype=torch.int32).view(1, 1, 1, 2)
+    block_sparse_num = 2
+    block_sizes = torch.tensor([block_size, 1], device="cuda", dtype=torch.int32)
+
+    result = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sparse_num,
+        block_sizes,
+        sparse_block_size=block_size,
+        use_clc=False,
+    )
+    mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+
+    assert torch.isfinite(result["o_tensor"]).all()
+    assert torch.isfinite(result["lse_tensor"]).all()
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+    result_bshd = BSA.block_sparse_attention_forward(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        q2k,
+        block_sparse_num,
+        block_sizes,
+        sparse_block_size=block_size,
+        layout="bshd",
+        use_clc=False,
+    )
+    assert torch.isfinite(result_bshd["o_tensor"]).all()
+    assert torch.isfinite(result_bshd["lse_tensor"]).all()
+    torch.testing.assert_close(result_bshd["o_tensor"].transpose(1, 2), result["o_tensor"], atol=0, rtol=0)
+    torch.testing.assert_close(result_bshd["lse_tensor"], result["lse_tensor"], atol=0, rtol=0)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=2029)
 def test_bsa_attention_forward_sm100_blk64_split_kv_clc_persistent_tiles():
     if not torch.cuda.is_available():

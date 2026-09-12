@@ -42,8 +42,13 @@ def get_strides_from_indices(shape, indices=[0, 1, 2, 3], gaps=[0, 0, 0, 0], rng
 
 
 def packed_token_capacity(seq_lens):
-    """Token capacity of a packed (ragged) buffer, rounded up to a multiple of 64."""
-    return max(64, ((sum(seq_lens) + 63) // 64) * 64)
+    """Token capacity of a packed (ragged) buffer: total tokens rounded up to the
+    next multiple of 64, always strictly greater than the total. The surplus
+    guarantees every ragged buffer has a capacity tail past the last ragged
+    offset — the harnesses NaN-poison that tail so an engine that reads it
+    (e.g. binding K/V views to capacity instead of live token counts,
+    GitHub #624) fails deterministically instead of only on recycled memory."""
+    return (sum(seq_lens) // 64 + 1) * 64
 
 
 def get_strides_from_layout(shape, layout, gaps=[0, 0, 0, 0], rng_geom=None):
@@ -137,6 +142,17 @@ class ExecConfig:
     # fp8/mxfp8 harnesses (#537). Configs with explicit strides are
     # unaffected (the gap only fills strides left None).
     with_ragged_token_gap: bool = True
+    # Packed (THD) token capacities, first-class: buffer allocation sizes the
+    # packed Q/O and K/V buffers from these (not a locally recomputed
+    # sum-of-seq-lens), knobs may fuzz slack capacity beyond the packed
+    # minimum, and when declare_total_seq_len is True they are declared on
+    # the graph via sdpa(max_total_seq_len_q/kv=...). None -> derived as
+    # packed_token_capacity(seq_len_*) in fill_derived_fields.
+    total_q: int = None
+    total_kv: int = None
+    # Declare total_q/total_kv on the forward graph (max_total_seq_len_q/kv).
+    # The backward graph always declares them (it must size dq_acc).
+    declare_total_seq_len: bool = False
     rescale_threshold: float = None
 
     diag_align: cudnn.diagonal_alignment = None
@@ -205,6 +221,17 @@ class ExecConfig:
             self.shape_o = (self.batches, self.h_q, self.s_q, self.d_v)
         if self.shape_stats is None and all(x is not None for x in [self.batches, self.h_q, self.s_q]):
             self.shape_stats = (self.batches, self.h_q, self.s_q, 1)
+
+        # Packed token capacities: default to the minimal packed capacity of
+        # the drawn seq_lens (sum rounded up to 64). Explicit totals (e.g. a
+        # slack-capacity fuzz) must cover the packed payload.
+        if self.is_ragged:
+            if self.total_q is None:
+                self.total_q = packed_token_capacity(self.seq_len_q or [self.s_q] * (self.batches or 1))
+            if self.total_kv is None:
+                self.total_kv = packed_token_capacity(self.seq_len_kv or [self.s_kv] * (self.batches or 1))
+            assert self.total_q >= sum(self.seq_len_q or []), f"total_q={self.total_q} < sum(seq_len_q)"
+            assert self.total_kv >= sum(self.seq_len_kv or []), f"total_kv={self.total_kv} < sum(seq_len_kv)"
 
         # Compute strides if not provided (packed for ragged, default BHSD otherwise).
         # with_ragged_token_gap (default True): per-tensor token-stride gaps,
@@ -352,10 +379,27 @@ class RandomizationContext:
         randoms_.with_ragged_offset_multiplier = randoms["is_ragged_or_padded_or_full"] in ("ragged_mult", "cu_ragged_mult")
 
         if randoms["is_ragged_or_padded_or_full"] != "full":
-            # ~10% chance of 0-length sequence for each batch
-            randoms_.seq_len_q = [0 if rng.random() < 0.1 else rng.randint(1, randoms_.s_q) for _ in range(randoms_.batches)]
-            # ~10% chance of 0-length sequence for each batch (independent of seq_len_q)
-            randoms_.seq_len_kv = [0 if rng.random() < 0.1 else rng.randint(1, randoms_.s_kv) for i in range(randoms_.batches)]
+            # Per-batch lengths draw U(0, s_max) — zero is a legal length, not
+            # a special case — with an extra ~3% forced-zero boost per entry
+            # (a pure uniform would make zeros ~1/(s+1) rare and zero-length
+            # handling would go untested in practice). Q and KV draw
+            # independently.
+            randoms_.seq_len_q = [0 if rng.random() < 0.03 else rng.randint(0, randoms_.s_q) for _ in range(randoms_.batches)]
+            randoms_.seq_len_kv = [0 if rng.random() < 0.03 else rng.randint(0, randoms_.s_kv) for i in range(randoms_.batches)]
+
+        # Packed token capacities (first-class). Default is the minimal packed
+        # capacity; the optional total_token_slack knob widens capacity beyond
+        # it in whole 64-token steps — a buffer bigger than its payload, the
+        # normal shape of a reused/pooled varlen workspace.
+        if randoms_.is_ragged:
+            slack = randoms.get("total_token_slack", "packed")
+            def _capacity(seq_lens):
+                cap = packed_token_capacity(seq_lens)
+                if slack == "slack":
+                    cap += 64 * rng.randint(1, 4)
+                return cap
+            randoms_.total_q = _capacity(randoms_.seq_len_q)
+            randoms_.total_kv = _capacity(randoms_.seq_len_kv)
 
         # Decide the left and right bounds for the sliding window mask (None = no bound)
         randoms_.left_bound = None
@@ -370,8 +414,9 @@ class RandomizationContext:
             randoms_.left_bound = None if randoms_.diag_align == cudnn.diagonal_alignment.BOTTOM_RIGHT else 1
             randoms_.right_bound = rng.randint(0, randoms_.s_kv // 2)
         elif randoms["with_sliding_mask"] == "band_around_diag":
-            randoms_.left_bound = rng.randint(1, randoms_.s_kv // 2)
-            randoms_.right_bound = rng.randint(1, randoms_.s_kv // 2)
+            # s_kv == 1 leaves an empty randint range; a 1-wide band is the only option.
+            randoms_.left_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
+            randoms_.right_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
         elif randoms["with_sliding_mask"] == "causal":
             randoms_.right_bound = 0
 
@@ -393,7 +438,7 @@ class RandomizationContext:
                 # [h, t] stats: tokens contiguous within a head, heads strided by the whole packed
                 # buffer. This is FlashAttention's / PyTorch varlen's softmax_lse layout; unlike the
                 # token-major one its sequence stride is 1 instead of h_q.
-                t_q = packed_token_capacity(randoms_.seq_len_q)
+                t_q = randoms_.total_q
                 randoms_.stride_stats = (randoms_.h_q * t_q, t_q, 1, 1)
             else:
                 randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bshd")

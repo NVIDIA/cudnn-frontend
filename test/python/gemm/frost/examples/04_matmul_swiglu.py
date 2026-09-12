@@ -66,7 +66,7 @@ def _dense_case(M: int, N: int, K: int) -> None:
     DQ = g.mul(a=MU, b=scale, name="dequant")
     DQ.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
-    compiled = jit_from_cudnn_graph(g, cta_group=1)
+    compiled = jit_from_cudnn_graph(g, config=by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1"))
 
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device="cuda")
@@ -120,7 +120,7 @@ def _block_scale_case(combo: str, M: int, N: int, K: int) -> None:
     Y.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
-    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=1)
+    compiled = jit_from_cudnn_graph(g, config=cfg)
 
     if combo == "nvfp4":
         lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)

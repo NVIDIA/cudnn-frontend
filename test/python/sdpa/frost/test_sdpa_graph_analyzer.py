@@ -655,10 +655,15 @@ def test_knob_request_pack_gqa_outside_domain_rejects_row():
 _SM120 = engines.engine_name(arch="sm120")
 
 
-def _mk_sm120_graph(d: int = 128, **sdpa_kwargs):
-    """A dense fp16 BSHD graph inside the SM120 row's envelope (D <= 256)."""
+def _mk_sm120_graph(d: int = 128, *, d_v: int | None = None, **sdpa_kwargs):
+    """Build a dense fp16 BSHD graph with independent Q/K and V/O dimensions."""
     g = _mk_graph()
-    q, k, v, dims, strides = _mk_qkv(g, d=d)
+    q_dims, q_strides = (B, H, S, d), (S * H * d, d, H * d, 1)
+    d_v = d if d_v is None else d_v
+    dims, strides = (B, H, S, d_v), (S * H * d_v, d_v, H * d_v, 1)
+    q = g.tensor(dim=q_dims, stride=q_strides, data_type=DTYPE, name="q")
+    k = g.tensor(dim=q_dims, stride=q_strides, data_type=DTYPE, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, **sdpa_kwargs)
     _finish_output(o, dims, strides)
     return g
@@ -766,11 +771,25 @@ def test_sm120_probe_rejects_on_sm100_family():
 def test_sm120_probe_head_dim_envelope(monkeypatch):
     # d_envelope: any multiple of 8 up to the 256 cap is served via TMA
     # zero-padding; only sub-8 alignment (TMA 16-byte global-stride rule)
-    # stays ineligible.
+    # stays ineligible. Both dimensions in (256, 512] use the d512 envelope.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert _SM120 in _eligible(_mk_sm120_graph(d=192))
     assert _SM120 in _eligible(_mk_sm120_graph(d=136))  # multiple of 8, not of 16
     assert not _eligible(_mk_sm120_graph(d=132))  # multiple of 4, not of 8
+    assert _SM120 in _eligible(_mk_sm120_graph(d=512))
+    assert _SM120 in _eligible(_mk_sm120_graph(d=504))
+    assert _SM120 in _eligible(_mk_sm120_graph(d=264))
+    assert _SM120 in _eligible(_mk_sm120_graph(d=496))
+
+
+def test_sm120_probe_full_d512_envelope_pairs(monkeypatch):
+    """Every 8-aligned Q/K and V/O pair in (256, 512] is independently eligible."""
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    for d_qk in range(264, 513, 8):
+        for d_v in range(264, 513, 8):
+            assert _SM120 in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (260, 264), (264, 260), (520, 512), (512, 520)):
+        assert _SM120 not in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
 
 
 def test_sm120_probe_accepts_right_band_widening(monkeypatch):
@@ -1399,3 +1418,71 @@ def test_bwd_dsink_fact():
     facts = _facts(g)
     assert facts.has_sink and facts.has_dsink
     assert facts.sink_t is not None and facts.dsink_t is not None
+
+
+# --- paged KV caches (issue #920) -------------------------------------------
+
+
+def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False):
+    """cuDNN's paged-cache contract: K/V page pools [num_pages, H_kv, page_size, D]
+    (HND compact, or NHD storage declared via strides) + (B, 1, max_pages, 1)
+    int32 block tables + per-batch lengths."""
+    g = _mk_graph()
+    b, h, kh = B, H, 2
+    q = g.tensor(dim=(b, h, 1, d), stride=(h * d, d, d, 1), data_type=DTYPE, name="q")
+    num_pages = b * max_pages
+    if hnd:
+        strides = (kh * page_size * d, page_size * d, d, 1)
+    else:
+        strides = (page_size * kh * d, d, kh * d, 1)
+    k = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=DTYPE, name="k")
+    v = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=DTYPE, name="v")
+    tk = g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tk")
+    tv = tk if one_table else g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tv")
+    slq = g.tensor(dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="slq")
+    slk = g.tensor(dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="slk")
+    kw = dict(paged_attention_k_table=tk, paged_attention_v_table=tv)
+    if max_seq_len is not None:
+        kw["paged_attention_max_seq_len_kv"] = max_seq_len
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_padding_mask=padding, seq_len_q=slq, seq_len_kv=slk, **kw)
+    _finish_output(o, (b, h, 1, d), (h * d, d, d, 1))
+    return g
+
+
+def test_paged_facts_hnd_and_nhd():
+    for hnd in (True, False):
+        facts = _facts(_mk_paged_graph(hnd=hnd))
+        assert facts.has_paged_kv and facts.page_size == 16
+        assert facts.s_kv == 8 * 16 and facts.h_kv == 2 and facts.padded
+        assert tuple(facts.paged_k_table_t.get_dim()) == (B, 1, 8, 1)
+        assert facts.paged_k_table_t is not None and facts.paged_v_table_t is not None
+        assert engines.engine_name() in _eligible(_mk_paged_graph(hnd=hnd))
+
+
+def test_paged_facts_declared_max_seq_len_and_single_table():
+    facts = _facts(_mk_paged_graph(max_seq_len=100, one_table=True))
+    assert facts.s_kv == 100
+    assert facts.paged_k_table_t is facts.paged_v_table_t
+    assert engines.engine_name() in _eligible(_mk_paged_graph(max_seq_len=100, one_table=True))
+
+
+def test_paged_probe_declines():
+    assert not _eligible(_mk_paged_graph(page_size=48)), "page_size must divide 128 or be a multiple of it"
+    assert engines.engine_name() in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
+    assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d256 flavors only"
+    assert not _eligible(_mk_paged_graph(padding=False)), "paged KV needs the padding mask (per-batch KV lengths)"
+    facts = ga.analyze(_mk_paged_graph(max_seq_len=8 * 16 + 1))
+    assert facts.invalid is not None, "a declared max S_kv beyond the block table's reach is invalid"
+
+
+def test_paged_split_kv_is_proposed_on_a_decode_launch(monkeypatch):
+    """The padded exclusion on split-KV is lifted for paged graphs: a B=2, H_kv=2
+    decode launch over 128k tokens must be offered a split plan."""
+    monkeypatch.setattr(ga, "_device_sm_count", lambda: 148)
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    g = _mk_paged_graph(page_size=128, max_pages=1024)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    facts = _facts(g)
+    knob_sets = _knob_sets(spec, facts)
+    assert any(k.split_kv and k.split_kv > 1 for k in knob_sets), knob_sets

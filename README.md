@@ -38,11 +38,11 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 *   **[Grouped GEMM + Quant (Unified)](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/grouped/quant):** Unified grouped GEMM quant API with per-row gating for MoE FC2/dFC1 workloads.
 *   **[Grouped GEMM + Wgrad](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/grouped/wgrad):** Unified BF16 and legacy block-scaled grouped GEMM weight-gradient API supporting dense and discrete output layouts for MoE workloads.
 *   **[BSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/block_sparse_attention/):** Block-sparse attention forward and backward CuTe DSL kernels for block-level routing metadata.
+*   **[Flex Attention](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/flex_attention/):** SM90/SM100/SM103 CuTe DSL attention with reusable arbitrary interval-mask plans and PyTorch autograd.
+*   **[HSTU Attention](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/hstu/hstu_attention/):** Packed variable-length HSTU attention forward and backward CuTe DSL kernels for Blackwell SM100/SM103 GPUs, using SiLU scores without softmax.
 *   **[NSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/native_sparse_attention/):** Native Sparse attention as described in the Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention.
 *   **[SDPA Backward: SM100, D=256](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/sdpa):** SDPA Backward pass for D=256 on SM100.
-*   **[cudnn SDPA Fprop](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/sdpa):** Open sourcing the Hopper and Blackwell fprop kernels with stats.
 *   **[Fused RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/rms_norm_silu):** Implementation of a fused kernel of RMS normalization followed by SiLU (Swish) activation.
-*   **[SDPA PyTorch Op](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/experimental/ops):** PyTorch custom operator for cuDNN-accelerated Scaled Dot-Product Attention with autograd and `torch.compile` support.
 *   **[DSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/deepseek_sparse_attention):** DSA/CSA kernels for DSv4 and DSv3.2 for fprop and bprop.
 
 Contributor credits for these OSS CuTe DSL kernels are listed in [Acknowledgements](ACKNOWLEDGEMENTS.md).
@@ -57,32 +57,38 @@ Contributor credits for these OSS CuTe DSL kernels are listed in [Acknowledgemen
 
 #### Llama 3.1 style Forward and Bprop with causal masking (GB300)
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/attention_training/results/llama3.1/gb300/llama3.1_top_left.png" alt="Llama 3.1 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/attention_training/results/llama3.1/gb300/llama3.1_top_left.png" alt="Llama 3.1 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
 #### Deepseek v3 style Forward and Bprop with causal masking (GB300)
 
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/attention_training/results/dsv3/gb300/dsv3_top_left.png" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/attention_training/results/dsv3/gb300/dsv3_top_left.png" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
 ## New OSS Linear Attention Kernels
 
 #### GDN Forward and Bprop (GB300)
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/linear_attention/results/gdn/gb300/gdn_fixed_batch_flops.png" alt="GDN Linear Attention Benchmark on GB300" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/gdn/gb300/gdn_fixed_batch_flops.png" alt="GDN Linear Attention Benchmark on GB300" width="600"/>
 </p>
 
 #### KDA Forward and Bprop (GB300)
 
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/linear_attention/results/kda/gb300/kda_fixed_batch_flops.png" alt="KDA Linear Attention Benchmark on GB300" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/kda/gb300/kda_fixed_batch_flops.png" alt="KDA Linear Attention Benchmark on GB300" width="600"/>
 </p>
 
 #### GDN-2 Forward and Bprop (GB300)
 
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/linear_attention/results/gdn2/gb300/gdn2_fixed_batch_flops.png" alt="GDN-2 Linear Attention Benchmark on GB300" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/gdn2/gb300/gdn2_fixed_batch_flops.png" alt="GDN-2 Linear Attention Benchmark on GB300" width="600"/>
+</p>
+
+#### GDP Forward and Bprop (GB300)
+
+<p align="center">
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/gdp/gb300/gdp_fixed_batch_flops.png" alt="GDP Linear Attention Benchmark on GB300" width="600"/>
 </p>
 
 ## Key Features
@@ -102,7 +108,7 @@ pip install nvidia-cudnn-frontend
 ```
 
 **Requirements:**
-*   Python 3.9+
+*   Python 3.10+
 *   NVIDIA driver and CUDA Toolkit
 *   NVIDIA cuDNN (minimum 8.5.0)
 
@@ -144,7 +150,7 @@ cmake --build . -j16
 *   **Blog & Deep Dives:** [nvidia.github.io/cudnn-frontend](https://nvidia.github.io/cudnn-frontend/) — release notes, installation guides, and technical deep-dives (MXFP8 attention, FP8 scale layouts, etc.)
 *   **C++ Samples:** See [`samples/cpp`](samples/cpp) for end-to-end examples covering convolution, matmul, SDPA / Flash Attention, normalization, and more.
 *   **Python Samples:** See [`samples/python`](samples/python) for Jupyter notebooks and PyTorch integration patterns.
-*   **OSS Kernels:** See [`python/cudnn/`](python/cudnn/) for source of SDPA, grouped GEMM + SwiGLU/GLU, RMSNorm + SiLU, Native Sparse Attention, and other open-sourced kernels.
+*   **OSS Kernels:** See [`python/cudnn/`](python/cudnn/) for source of SDPA, Flex Attention, grouped GEMM + SwiGLU/GLU, RMSNorm + SiLU, Native Sparse Attention, and other open-sourced kernels.
 *   **PyTorch Custom Ops:** See [`python/cudnn/experimental/ops`](python/cudnn/experimental/ops) for `torch.compile`-compatible wrappers around cuDNN kernels.
 
 ## 🤝 Contributing

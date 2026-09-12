@@ -57,7 +57,7 @@ def _unpack_fp4(u8: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
 
 def _moe_config():
     # cta_tile_n=128 fits the block-scale dual TMEM budget too.
-    return next(c for c in CATALOG if c.name == "CONFIG_sm100_128x128x128_128x128x32_cluster2x1")
+    return next(c for c in CATALOG if c.name == "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma")
 
 
 def _swiglu_ref(tok_f32, w0_f32, w1_f32, offsets_list, S, N, num_groups, E, scale):
@@ -119,7 +119,7 @@ def _dense_case() -> None:
     dq = g.mul(a=mu, b=sf, name="dequant")
     dq.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
-    compiled = jit_from_cudnn_graph(g, config=_moe_config(), cta_group=2)
+    compiled = jit_from_cudnn_graph(g, config=_moe_config())
 
     torch.manual_seed(0)
     token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
@@ -204,7 +204,7 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = jit_from_cudnn_graph(g, config=_moe_config(), cta_group=2)
+    compiled = jit_from_cudnn_graph(g, config=_moe_config())
 
     # SFA reordered + padded to 128 rows PER GROUP then concatenated; SFB per-expert.
     sfa_parts = []

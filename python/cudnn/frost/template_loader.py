@@ -16,7 +16,7 @@ lets a module exist once. Both halves of that sentence are load-bearing:
   functions are *defined* — passing them as runtime kernel arguments would
   turn compile-time specialization into runtime branching (and dtype cannot
   be a runtime branch at all: the MMA instructions differ).
-- ``import prefill_d512_f16_sm100`` executes the body once and caches it in
+- ``import sm100/prefill_d512_f16`` executes the body once and caches it in
   ``sys.modules``; one module name = one parameter set. But one process
   legitimately needs several specializations of the same file alive at once
   (a causal-fp16 graph and a dense-bf16 graph in the same session).

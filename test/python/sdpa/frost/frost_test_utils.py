@@ -24,6 +24,14 @@ def _active_sm():
 
 _SM = _active_sm()
 
+# Floor for anything that needs a backend SDPA plan or a DSL kernel: the
+# backend declines SDPA below Ampere and the DSL has no sm_7x target, so a
+# Turing card (the fallback GPU on a runner whose Ampere board has dropped
+# out) must skip these rather than fail them.
+requires_sm80 = pytest.mark.skipif(
+    _SM is None or _SM < 80,
+    reason="needs an SM80+ GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
 requires_blackwell = pytest.mark.skipif(
     _SM is None or not (100 <= _SM <= 119),
     reason="needs an SM100-line GPU (100 <= SM <= 119), have " + ("none" if _SM is None else f"sm_{_SM}"),
@@ -53,6 +61,8 @@ def _dsl_usable():
     """
     from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 
+    if _SM is not None and _SM < 80:
+        return False, f"cutedsl has no sm_{_SM} target (needs SM80+)"
     installed, version = cutedsl_state()
     if not installed:
         return False, "needs the cutedsl extra (nvidia-cutlass-dsl)"
@@ -90,6 +100,8 @@ def select_engine(graph, name, tiles=None, pack_gqa=None):
     run something else. Every filter — and each ``tiles`` component — is
     None-transparent (matches any value), so a test can pin just kv_tile
     (the auto-tile_m graph_api cases) or nothing at all (the best guess).
+    Returns the pinned ``PlanConfig`` so a test can read the knobs the
+    heuristics filled in (``split_kv``, tiles, ...).
     """
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
     want_m, want_n = tiles if tiles is not None else (None, None)
@@ -105,7 +117,7 @@ def select_engine(graph, name, tiles=None, pack_gqa=None):
     index = next((i for i in range(len(names)) if _wanted(i)), None)
     assert index is not None, f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa}; plans={names}"
     graph.select_plan(index)
-    return graph
+    return graph.plans[index]
 
 
 def offers_engine(graph, name) -> bool:

@@ -42,6 +42,18 @@ class _FrostGemmPlan(CompiledPlan):
     def get_workspace_size(self) -> int:
         return int(getattr(self._compiled, "workspace_bytes", 0) or 0)
 
+    def get_workspace_size_for_shapes(self, override_uids, override_shapes) -> int:
+        """Workspace for an override-shape execute."""
+        sized = getattr(self._compiled, "workspace_bytes_for", None)
+        if sized is None or not self.get_workspace_size():
+            return self.get_workspace_size()
+        out_uid = self._compiled.binding.outputs[0].get_uid()
+        for uid, shape in zip(override_uids or (), override_shapes or ()):
+            if uid == out_uid and len(shape) == 3:
+                b, m, n = (int(x) for x in shape)
+                return sized(b, m, n)
+        return self.get_workspace_size()
+
     def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
         indices = self._operand_indices
         if indices is None:
@@ -54,11 +66,12 @@ class _FrostGemmPlan(CompiledPlan):
         operands = variant_pack.operands(indices)
         required = self.get_workspace_size()
         if required:
-            # Scratch is carved from the CALLER's workspace: stable pointers, so
-            # a plan stays safe to capture in a CUDA graph. Only the MoE
-            # launchers need it, and they take the variant-pack dict.
-            self._compiled(dict(zip(self._tensors, operands)), Workspace.over(variant_pack, required, "frost_gemm"), stream=ctx.stream)
-            return
+            sized = getattr(self._compiled, "workspace_bytes_for", None)
+            if sized is not None:
+                out = operands[self._tensors.index(self._compiled.binding.outputs[0])].shape
+                if len(out) == 3:
+                    required = sized(int(out[0]), int(out[1]), int(out[2]))
+        workspace = Workspace.over(variant_pack, required, "frost_gemm") if required else None
         launch = self._launch
         if launch is not None:
             # Which bound tensor holds which operand was settled at build, so
@@ -71,7 +84,9 @@ class _FrostGemmPlan(CompiledPlan):
             if borrowed:
                 flags = tuple(i in borrowed for i in indices)
                 graph_order = flags if any(flags) else None
-            launch(operands, graph_order, stream=ctx.stream)
+            launch(operands, graph_order, stream=ctx.stream, workspace=workspace)
+        elif workspace is not None:
+            self._compiled(dict(zip(self._tensors, operands)), workspace, stream=ctx.stream)
         else:
             self._compiled(dict(zip(self._tensors, operands)), stream=ctx.stream)
 

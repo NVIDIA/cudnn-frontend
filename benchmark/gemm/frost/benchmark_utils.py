@@ -15,45 +15,69 @@ import argparse
 import csv
 import fnmatch
 import io
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import replace
 from typing import Callable
 
 import torch
 
 from cudnn.gemm.frost.tile_config import by_name as _by_name
 
-# Config selection
 
-LABEL_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma$")
+class _PlanWithWorkspace:
+    """Own scratch alongside its non-owning Workspace view, outside timing."""
+
+    def __init__(self, compiled):
+        from cudnn.frost.workspace import Workspace
+
+        self.compiled = compiled
+        self.buffer = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+        self.workspace = Workspace(self.buffer, compiled.workspace_bytes, "frost benchmark")
+
+    def __call__(self, variant_pack, stream=None):
+        return self.compiled(variant_pack, stream=stream, workspace=self.workspace)
+
+
+def with_workspace(compiled):
+    """Prepare a fixed-shape benchmark plan for warmup and repeated launches.
+
+    Split-K partials and MoE descriptor scratch use the same caller-owned
+    workspace contract. Keep the allocation alive for as long as the callable;
+    Workspace itself only retains a pointer, not the tensor that owns it.
+    """
+    return _PlanWithWorkspace(compiled) if compiled.workspace_bytes else compiled
+
+
+# Config selection
 
 
 def spec_for(label, spec_map):
-    """(geometry cfg, cta_group) for a --configs label, or None.
+    """(config, cta_group) for a --configs label, or None.
 
     The sweep map comes from the registry funnel over CATALOG; a label naming a
-    geometry outside it (e.g. a num_mma_m > 1 tile, which `by_name` synthesizes) is
-    still runnable, so parse it rather than calling it unsweepable."""
+    geometry outside it (e.g. a mma_size_m > 1 tile, which `by_name` synthesizes) is
+    still runnable, so parse the complete canonical name rather than calling it
+    unsweepable.  ``cta_group`` is part of TileConfig geometry; do not strip its
+    suffix and carry a second, potentially inconsistent value beside the config."""
     spec = spec_map.get(label)
     if spec is not None:
         return spec
-    m = LABEL_RE.match(label)
-    if m is None:
-        return None
     try:
-        cfg = _by_name(m.group(1))
+        cfg = _by_name(label)
     except (KeyError, NotImplementedError):
         return None
-    return cfg, int(m.group(2))
+    return cfg, getattr(cfg, "cta_group", 1)
 
 
 def select_configs(arg, spec_map):
     """--configs value -> concrete label list. A token carrying a glob
-    (`CONFIG_sm107_*`) is expanded against the sweep map; anything else is kept
+    (`CONFIG_sm100_*`) is expanded against the sweep map; anything else is kept
     verbatim so `spec_for` can still synthesize an off-catalog geometry."""
     if not arg:
         return list(spec_map)
@@ -71,9 +95,55 @@ def select_configs(arg, spec_map):
     return list(dict.fromkeys(out))
 
 
+def expand_config_variants(spec_map, *, sweep_swap_ab: bool = False, sweep_split_k: int | None = None):
+    """Expand a base config map over the requested swap-AB / split-K axes."""
+    split_k_values = range(1, sweep_split_k + 1) if sweep_split_k is not None else (1,)
+    swap_ab_values = (False, True) if sweep_swap_ab else (False,)
+    expanded = {}
+    for cfg, _cta_group in spec_map.values():
+        for split_k_slices in split_k_values:
+            for swap_ab in swap_ab_values:
+                variant = replace(cfg, split_k_slices=split_k_slices, swap_ab=swap_ab)
+                expanded[variant.name] = (variant, getattr(variant, "cta_group", 1))
+    return expanded
+
+
+def select_config_variants(arg, spec_map, *, sweep_swap_ab: bool = False, sweep_split_k: int | None = None):
+    """Select labels, expanding explicit selections over enabled variant axes.
+
+    With no ``--configs`` filter, ``spec_map`` already contains the complete
+    Cartesian product produced by :func:`expand_config_variants`.
+    """
+    selected = select_configs(arg, spec_map)
+    if not arg or (not sweep_swap_ab and sweep_split_k is None):
+        return selected
+    expanded = []
+    seen_bases = set()
+    for name in selected:
+        spec = spec_for(name, spec_map)
+        if spec is None:
+            expanded.append(name)
+            continue
+        cfg = spec[0]
+        base = replace(
+            cfg,
+            split_k_slices=1 if sweep_split_k is not None else cfg.split_k_slices,
+            swap_ab=False if sweep_swap_ab else cfg.swap_ab,
+        )
+        if base.name in seen_bases:
+            continue
+        seen_bases.add(base.name)
+        split_k_values = range(1, sweep_split_k + 1) if sweep_split_k is not None else (cfg.split_k_slices,)
+        swap_ab_values = (False, True) if sweep_swap_ab else (cfg.swap_ab,)
+        for split_k_slices in split_k_values:
+            for swap_ab in swap_ab_values:
+                expanded.append(replace(cfg, split_k_slices=split_k_slices, swap_ab=swap_ab).name)
+    return list(dict.fromkeys(expanded))
+
+
 # Argument surface
 
-CONFIGS_HELP = "comma-separated config names or globs, e.g. 'CONFIG_sm107_*' (default: sweep all)"
+CONFIGS_HELP = "comma-separated config names or globs, e.g. 'CONFIG_sm100_*' (default: sweep all)"
 
 ROTATE_HELP = (
     "allocate N independent copies of every tensor and rotate the timed launches "
@@ -104,7 +174,37 @@ def add_sweep_args(parser, *, nsys: bool = True, warmup: int = 10, iters: int = 
     parser.add_argument("--rotate-buffers", default="auto", metavar="N", help=ROTATE_HELP)
     if nsys:
         parser.add_argument("--_nsys-worker", action="store_true", help=argparse.SUPPRESS)
+    add_config_variant_args(parser)
     return parser
+
+
+def add_config_variant_args(parser):
+    """Add the orthogonal tile-config sweep dimensions used by GEMM benches."""
+
+    def positive_int(value: str) -> int:
+        parsed = int(value)
+        if parsed < 1:
+            raise argparse.ArgumentTypeError("must be at least 1")
+        return parsed
+
+    parser.add_argument(
+        "--sweep-swap-ab",
+        action="store_true",
+        help="sweep both the ordinary and swap_ab=True variant of every selected tile config",
+    )
+    parser.add_argument(
+        "--sweep-split-k",
+        type=positive_int,
+        default=None,
+        metavar="N",
+        help="sweep split_k_slices from 1 through N for every selected tile config",
+    )
+    return parser
+
+
+def validate_config_variant_args(parser, args) -> None:
+    if args.sweep_split_k is not None and args.sweep_split_k < 1:
+        parser.error("--sweep-split-k must be at least 1")
 
 
 # Buffer rotation (defeat a hot L2 on small shapes)
@@ -216,10 +316,12 @@ def time_ms(timed_fn: Callable, warmup_fn: Callable | None = None, *, warmup: in
 
 def kernel_match_token(cfg, cta_group: int) -> str:
     """The substring the demangled symbol carries. `compiler` names the kernel
-    `<template_file_stem>_<geometry_name>`, so it reads `..._1ctamma_128x256x128_...`.
-    The --configs LABEL is not usable here at all: it spells the pipeline before
-    the geometry and the cta_group after it, so it is never a substring."""
-    return f"{cta_group}ctamma_{cfg.geometry_name}"
+    `<template_stem>_<geometry_name>`, and geometry_name now ends in the MMA
+    mode, so it reads
+    `..._128x256x128_128x256x32_cluster2x1_1ctamma`. The --configs LABEL is not
+    usable here at all: it spells the pipeline before the geometry, so it is
+    never a substring."""
+    return cfg.geometry_name
 
 
 def parse_nsys_stats(text: str) -> dict[str, float]:
@@ -335,6 +437,48 @@ def rand_e8m0(shape, dev):
     """Random E8M0 scale bytes centred on 2^0 (biased exponent 127). The graph
     declares the SF as FP8_E8M0, so the blob must carry that dtype."""
     return torch.randint(125, 129, shape, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
+
+
+FTO_ALIGNMENT_HELP = (
+    "value for the `alignment_value` attribute on the first_token_offset tensor: a "
+    "promise that every routed-group start is a multiple of it. It lets FROST address "
+    "A / SFA / D through the ORIGINAL TMA descriptors instead of rewriting them per "
+    "group, for every config whose cluster tile M (and, block-scale, 128) divides it. "
+    "'auto' reads the promise off the offsets this bench lays out; 1 (default) makes "
+    "none, i.e. every config keeps the per-group descriptor patch."
+)
+
+
+def add_fto_alignment_arg(parser) -> None:
+    """The `--fto-alignment` knob, shared by every MoE bench."""
+    parser.add_argument("--fto-alignment", default="1", help=FTO_ALIGNMENT_HELP)
+
+
+def fto_alignment(spec, offsets) -> int:
+    """Resolve `--fto-alignment` against the offsets the bench actually lays out.
+
+    `auto` is their GCD. An explicit value is CHECKED here because the KERNEL does
+    not check it -- the offsets live on the device, so a false promise is undefined
+    behaviour that silently reads another group's scale factors."""
+    vals = [int(v) for v in (offsets.tolist() if hasattr(offsets, "tolist") else offsets)]
+    if str(spec).strip().lower() == "auto":
+        auto = 0
+        for v in vals:
+            auto = math.gcd(auto, v)
+        # All-zero (a single routed group) constrains nothing; claim no promise
+        # rather than an arbitrarily large one.
+        return auto or 1
+    n = int(spec)
+    if n < 1:
+        raise SystemExit(f"--fto-alignment must be >= 1 or 'auto', got {spec!r}")
+    bad = [v for v in vals if v % n]
+    if bad:
+        raise SystemExit(
+            f"--fto-alignment {n} is not true of this bench's routed-group offsets "
+            f"({bad[:4]}{'...' if len(bad) > 4 else ''}): the promise is unchecked at "
+            "runtime and would miscompute."
+        )
+    return n
 
 
 def group_offsets(S: int, E: int) -> torch.Tensor:

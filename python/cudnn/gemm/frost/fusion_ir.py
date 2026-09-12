@@ -257,6 +257,23 @@ QUANT_DATA_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp4_e2m1")
 M_MAJOR_OUT_DTYPES = ("bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2", "fp8_e8m0", "fp8_e5m3", "int8", "uint8", "int32")
 
 
+def segmented_row_scale_capacity_rows(total_rows: int, num_groups: int) -> int:
+    """Static rows needed by independently 128-row-padded group segments.
+
+    Runtime group sizes are device data. For ``total_rows=M`` split across at
+    most ``num_groups=G`` non-empty groups, the exact maximum number of 128-row
+    atoms is ``A + (M - A) // 128``, where ``A=min(M,G)``. This graph-time
+    envelope admits every valid partition without synchronizing the offsets.
+    """
+    if total_rows < 0:
+        raise ValueError(f"segmented row scale total_rows must be non-negative; got {total_rows}")
+    if num_groups < 1:
+        raise ValueError(f"segmented row scale num_groups must be positive; got {num_groups}")
+    active = min(total_rows, num_groups)
+    max_atoms = active + (total_rows - active) // 128
+    return 128 * max_atoms
+
+
 @dataclass(frozen=True)
 class BlockQuantizeSpec:
     """One block-scale quantize node (cuDNN ``block_scale_quantize``): each
@@ -269,10 +286,16 @@ class BlockQuantizeSpec:
     Col quant: compact `(B, M/block_size, N)`, F8_128x4 = the transposed atom
     `(B, rup(N,128), rup(M/bs,4))`.
 
-    ``grouped_by_moe`` (col + F8_128x4 only; declared via ``group_offset=fto``
-    on the quant node) = per-group segmented col-SF: each routed group is its
-    own compact table at its atom-quad base, same total footprint. Runtime
-    CONTRACT: every fto value must be a multiple of ``4 * block_size``."""
+    ``grouped_by_moe`` (F8_128x4 only; declared via ``group_offset=fto`` on the
+    quant node) makes each routed group its own scale segment. For col quant the
+    segment is the group's compact transposed table at its atom-quad base; the
+    runtime CONTRACT remains that every fto value is a multiple of
+    ``4 * block_size``. For row quant the segment starts at the prefix sum of
+    the preceding groups' 128-row atom counts. For fixed ``M`` and declared
+    group count ``G``, ``scale_dim[1]`` must cover the graph-time worst case
+    ``128 * (A + (M-A)//128)``, ``A=min(M,G)``. This admits every valid runtime
+    partition without reading device offsets on the host. Padding scale bytes
+    are not written by the quantizer and must be initialized to a valid value."""
 
     source_ref: int
     block_size: int
@@ -297,8 +320,8 @@ class BlockQuantizeSpec:
             raise ValueError(f"block quantize scale reordering {self.scale_reorder!r} is not supported; " "expected None or F8_128x4")
         if self.compute_dtype != "fp32":
             raise ValueError(f"block quantize compute_dtype {self.compute_dtype!r} is not supported; " "expected fp32")
-        if self.grouped_by_moe and (self.axis != 1 or self.scale_reorder != "F8_128x4"):
-            raise ValueError("grouped block quantize requires the M axis (col) and F8_128x4 scale reordering")
+        if self.grouped_by_moe and self.scale_reorder != "F8_128x4":
+            raise ValueError("grouped block quantize requires F8_128x4 scale reordering")
 
 
 @dataclass(frozen=True)
@@ -469,15 +492,18 @@ class BlockScaleSpec:
     (FP4/FP8) A/B each dequantized by a per-block K scale inside the MMA
     (``tcgen05.mma.kind::mx*.block_scale``).
 
-    Detected by a purely STRUCTURAL match in the analyzer: if A and/or B is the
-    output of a ``block_scale_dequantize`` node, dequant(s) + matmul fold into
-    one block-scale matmul (three shapes: dequant(A)@B, A@dequant(B),
-    dequant(A)@dequant(B); ``sfa``/``sfb`` present only for the scaled side(s)).
-    No dtype/block/arch rules here — runnability is decided at compile time.
-    Currently runs (both sides): fp4 with any of e4m3 / e8m0 / e5m3 scales at
+    Detected by a purely STRUCTURAL match in the analyzer.  Two real dequants
+    fold directly.  If exactly one side is dequantized and its peer is raw FP8,
+    the peer is normalized to a logical dequant whose scale is one; only the
+    real side has a runtime SF tensor.  No dtype/block/arch rules live here —
+    runnability is decided at compile time from the same normalized MMA key in
+    both cases.  Currently runs: fp4 with any of e4m3 / e8m0 / e5m3 scales at
     either K-block (16 or 32) — the two axes are orthogonal, so nvfp4 and mxfp4
     are just the two best-known corners — plus fp8 (e4m3/e5m2) with e8m0 scales
-    at block 32. E5M3 scales additionally require SM 10.7+.
+    at block 32. Mixed mxfp8/mxfp4 is supported in either operand order (shared
+    e8m0 scale format, block 32): SM100 uses the K32 padded-E2M1 layout,
+    while Rubin additionally provides a native-packed K64 form. E5M3 scales
+    require SM 10.7+.
 
     SF tensors are runtime-positional (not ``TensorRef``s), fully described here
     by per-side scalars; their logical dims derive from M/N/K/block_size. Passed
@@ -485,9 +511,10 @@ class BlockScaleSpec:
 
     a_dtype: Dtype  # packed data dtype of A (mirror of matmul.a_dtype)
     b_dtype: Dtype  # packed data dtype of B
-    # Per-side scale info, kept SEPARATE for future asymmetric block-scale. A
-    # non-dequantized side has all None fields. `block_size_*` is 2D (A=[non_K,
-    # K], B=[K, non_K]); only 1D K-scaling used today (2D form is headroom).
+    # Per-side scale info, kept SEPARATE for asymmetric block-scale.  An
+    # unnormalized non-dequantized side has all None fields; a fake side has
+    # logical scale metadata plus its fake_dequant mark. `block_size_*` is 2D
+    # (A=[non_K, K], B=[K, non_K]); only 1D K-scaling is used today.
     block_size_a: "tuple[int, ...] | None" = None
     block_size_b: "tuple[int, ...] | None" = None
     sf_dtype_a: "Dtype | None" = None  # A's scale-factor dtype (None if A not scaled)
@@ -502,6 +529,14 @@ class BlockScaleSpec:
     dequant_compute_b: "Dtype | None" = None
     dequant_out_a: "Dtype | None" = None  # = MMA input type for A
     dequant_out_b: "Dtype | None" = None  # = MMA input type for B
+    # A raw FP8 operand opposite one real block-scale dequant is represented as
+    # a logical dequant by a scale of one.  These marks are deliberately NOT
+    # part of the registry's MMA-type key: capability is decided from the
+    # normalized fields above, exactly like a graph with two real dequants.
+    # Codegen uses them only to elide the runtime SF tensor / TMA / SMEM path
+    # and seed that side's still-reserved TMEM scale region with packed 1.0.
+    fake_dequant_a: bool = False
+    fake_dequant_b: bool = False
     # matmul-level dtypes (accum/output/tap) are NOT duplicated here — read
     # chain.matmul / chain.output_dtype. Only input-side info lives here.
 
@@ -513,8 +548,11 @@ class BlockScaleSpec:
 
     @property
     def both_sided(self) -> bool:
-        """True iff BOTH operands were dequantized (a side is dequantized iff
-        its scale-factor dtype is set) — the runnable case today."""
+        """True iff both operands have logical scale metadata.
+
+        Either side may be a fake dequant backed by a constant-one TMEM scale
+        region instead of a runtime scale-factor tensor.
+        """
         return self.sf_dtype_a is not None and self.sf_dtype_b is not None
 
     # Convenience scalars for the symmetric both-sided path (only valid when the
@@ -535,12 +573,26 @@ class BlockScaleSpec:
 
     @property
     def is_fp4(self) -> bool:
-        return self.a_dtype == "fp4_e2m1"
+        # Kept as the homogeneous-combo predicate it represented before mixed
+        # input widths were admitted.  Callers that need one side must inspect
+        # that side's dtype explicitly.
+        return self.both_fp4
+
+    @property
+    def both_fp4(self) -> bool:
+        return self.a_dtype == "fp4_e2m1" and self.b_dtype == "fp4_e2m1"
+
+    @property
+    def mixed_width(self) -> bool:
+        return (self.a_dtype == "fp4_e2m1") != (self.b_dtype == "fp4_e2m1")
 
     @property
     def mma_block_scale_kind(self) -> str:
         """GEMM ``nvvm.MMABlockScaleKind`` member name."""
-        return "MXF4NVF4" if self.is_fp4 else "MXF8F6F4"
+        # Rubin's mixed FP8/FP4 instruction is MXF8F6F4, whose
+        # per-side format fields independently encode FP8 or E2M1.  MXF4NVF4
+        # is the UTCOMMA path and requires FP4 on both sides.
+        return "MXF4NVF4" if self.both_fp4 else "MXF8F6F4"
 
     @property
     def scale_vec_size(self) -> str:
@@ -579,6 +631,7 @@ class MoeSpec:
     # time; the scheduler casts reads to Int32 so the math is dtype-agnostic.
     offset_dtype: Dtype = "int32"
     num_groups: int = 0
+    offset_multiple: int = 1
 
     def __post_init__(self) -> None:
         if self.num_experts < 1:
@@ -589,6 +642,8 @@ class MoeSpec:
             raise ValueError(f"MoE grouped matmul mode {self.mode!r} is out of POC scope; " "only 'none' is supported (gather / scatter rejected)")
         if self.offset_dtype not in ("int32", "int64"):
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
+        if self.offset_multiple < 1:
+            raise ValueError(f"first_token_offset alignment_value must be >= 1; " f"got {self.offset_multiple}")
 
 
 def _walk_dtype_fields(obj: object, found: "set[Dtype]", *, in_dtype_field: bool = False) -> None:
@@ -886,3 +941,118 @@ class FusionChain:
             f"{m.a_dtype}*{m.b_dtype}->{m.accum_dtype} | {mainloop}"
             f"epilogue: {chain} -> {self.output_dtype}{reductions}{quant}]"
         )
+
+
+def swap_ab(chain: FusionChain) -> FusionChain:
+    """Return the logical-transpose view ``C.T = B.T @ A.T`` of ``chain``.
+
+    No runtime storage moves.  Every dense non-virtual tensor swaps its last
+    two logical dimensions and strides, A/B-side metadata trades places, and
+    pointwise operation topology stays unchanged.  The binding performs the
+    corresponding tensor-role swap separately.
+
+    Quantization axes and scale metadata follow the transpose; the ordinary
+    quantization support checks decide whether the resulting layout can run.
+    MoE still requires a scheduler that routes ranges along N instead of M.
+    """
+
+    if chain.has_moe:
+        raise NotImplementedError("swap_ab is not supported for MoE: routed groups partition M, not N")
+
+    def _mn(values):
+        if values is None or len(values) < 2:
+            return values
+        return (*values[:-2], values[-1], values[-2])
+
+    def _bcast(mode):
+        return {"per_row": "per_col", "per_col": "per_row"}.get(mode, mode)
+
+    def _op(op):
+        # gen_index is the only pointwise op whose value depends on an output
+        # axis. Scalar attributes on every other op are transpose-invariant.
+        attrs = tuple((key, 3 - value if key == "axis" and value in (1, 2) else value) for key, value in op.attrs)
+        return dataclasses.replace(op, attrs=attrs) if attrs != op.attrs else op
+
+    mm = chain.matmul
+    swapped_mm = dataclasses.replace(
+        mm,
+        M=mm.N,
+        N=mm.M,
+        a_batch=mm.b_batch,
+        b_batch=mm.a_batch,
+        a_major="k" if mm.b_major == "k" else "m",
+        b_major="k" if mm.a_major == "k" else "n",
+        a_dtype=mm.b_dtype,
+        b_dtype=mm.a_dtype,
+    )
+    swapped_aux = []
+    for t in chain.aux_tensors:
+        dim, stride = t.dim, t.stride
+        if len(dim) == 1:
+            # Rank-1 aux broadcasts as (1, N). Make that axis explicit before
+            # transposing; runtime _reshape_aux_to_fake supplies the same view.
+            dim, stride = (1, dim[0]), (stride[0], stride[0])
+        swapped_aux.append(dataclasses.replace(t, dim=_mn(dim), stride=_mn(stride), bcast_mode=_bcast(t.bcast_mode)))
+    # An unset output stride means compact N-major. Materialize it before the
+    # transpose; leaving it unset would incorrectly remain N-major instead of
+    # becoming the equivalent M-major view.
+    swapped_outputs = [
+        dataclasses.replace(
+            o,
+            dim=_mn(o.dim or (mm.batch, mm.M, mm.N)),
+            stride=_mn(o.stride or (mm.M * mm.N, mm.N, 1)),
+        )
+        for o in chain.output_specs
+    ]
+    swapped_reductions = [dataclasses.replace(r, dim=_mn(r.dim)) for r in chain.reductions]
+    swapped_quants = [
+        dataclasses.replace(
+            q,
+            axis=2 if q.axis == 1 else 1,
+            # transpose=True is an API spelling of axis=1, already resolved
+            # by the analyzer. Use the explicit axis in the transformed IR.
+            transpose=False,
+            # F8_128x4 describes physical atoms, with the blocked axis last
+            # for both row and column quantization. Their storage is unchanged.
+            scale_dim=q.scale_dim if q.scale_reorder == "F8_128x4" else _mn(q.scale_dim),
+        )
+        for q in chain.quants
+    ]
+
+    block_scale = chain.block_scale
+    if block_scale is not None:
+        block_scale = dataclasses.replace(
+            block_scale,
+            a_dtype=block_scale.b_dtype,
+            b_dtype=block_scale.a_dtype,
+            block_size_a=_mn(block_scale.block_size_b),
+            block_size_b=_mn(block_scale.block_size_a),
+            sf_dtype_a=block_scale.sf_dtype_b,
+            sf_dtype_b=block_scale.sf_dtype_a,
+            sfa_reorder=block_scale.sfb_reorder,
+            sfb_reorder=block_scale.sfa_reorder,
+            dequant_compute_a=block_scale.dequant_compute_b,
+            dequant_compute_b=block_scale.dequant_compute_a,
+            dequant_out_a=block_scale.dequant_out_b,
+            dequant_out_b=block_scale.dequant_out_a,
+            fake_dequant_a=block_scale.fake_dequant_b,
+            fake_dequant_b=block_scale.fake_dequant_a,
+        )
+
+    return dataclasses.replace(
+        chain,
+        matmul=swapped_mm,
+        aux_tensors=swapped_aux,
+        ops=[_op(op) for op in chain.ops],
+        output_specs=swapped_outputs,
+        reductions=swapped_reductions,
+        quants=swapped_quants,
+        num_a_operands=chain.num_b_operands,
+        num_b_operands=chain.num_a_operands,
+        gemm_operands=[(b, a) for a, b in chain.gemm_operands],
+        mainloop_a_ops=list(chain.mainloop_b_ops),
+        mainloop_b_ops=list(chain.mainloop_a_ops),
+        mainloop_a_load_dtype=chain.mainloop_b_load_dtype,
+        mainloop_b_load_dtype=chain.mainloop_a_load_dtype,
+        block_scale=block_scale,
+    )

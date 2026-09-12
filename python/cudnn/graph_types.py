@@ -60,6 +60,16 @@ class NodeType(Enum):
     MOE_GROUPED_MATMUL = auto()
     BLOCK_SCALE_QUANTIZE = auto()
     BLOCK_SCALE_DEQUANTIZE = auto()
+    GDP = auto()
+    GDP_BWD = auto()
+    GDN_SUMMARY = auto()
+    KDA_SUMMARY = auto()
+    GDN2_SUMMARY = auto()
+    GDP_SUMMARY = auto()
+    GDN_SUMMARY_BWD = auto()
+    KDA_SUMMARY_BWD = auto()
+    GDN2_SUMMARY_BWD = auto()
+    GDP_SUMMARY_BWD = auto()
 
 
 @dataclass(eq=False)  # identity-based hash/eq: uid/name are mutable
@@ -80,6 +90,11 @@ class Tensor:
         uid_assigned: True if UID was explicitly assigned
         reordering_type: Memory layout transformation type
         ragged_offset: Tensor for variable-length tensor offsets
+        alignment_value: caller's promise that every VALUE this tensor holds is a
+            multiple of it (1 = no promise). Unlike every other attribute here it
+            constrains the CONTENTS, not the layout, and it is not validated --
+            violating it is undefined behaviour. Only the MoE
+            first_token_offset tensor reads it.
     """
 
     name: str = ""
@@ -101,6 +116,7 @@ class Tensor:
     reordering_type: Any = None
     ragged_offset: Optional["Tensor"] = None
     ragged_offset_multiplier: int = 1
+    alignment_value: int = 1
     scalar_type: Any = None  # cudnn.scalar_type for tensor_scalar-created scalars
     # weakref to the owning graph (set at registration): identity mutations
     # (set_name / set_uid) delegate to the graph so its indexes stay coherent.
@@ -121,6 +137,14 @@ class Tensor:
         """Set the data type."""
         self._guard()
         self.data_type = dtype
+        return self
+
+    def set_alignment_value(self, value: int) -> "Tensor":
+        """Promise every value this tensor holds is a multiple of `value`."""
+        self._guard()
+        if value < 1:
+            raise ValueError(f"alignment_value must be >= 1, got {value}")
+        self.alignment_value = value
         return self
 
     def set_name(self, name: str) -> "Tensor":
@@ -240,9 +264,9 @@ def describing_tensor(uid: int, dim, stride, data_type) -> Tensor:
     """A Tensor describing a caller's buffer, built without the dataclass
     ``__init__``.
 
-    ``execute()`` builds one of these per operand per call, and the generated
-    ``__init__`` sets seventeen attributes and runs two default factories to do
-    it: 0.71 us against 0.29 for assigning the four that are known. Every field
+    ``execute()`` builds one of these per operand per call; the generated
+    ``__init__`` would set seventeen attributes and run two default factories
+    where only four fields are known. Every field
     left unset resolves to the class attribute the dataclass already installed
     for its default, so the result is indistinguishable from ``Tensor(...)`` --
     ``test_describing_tensor_matches_the_dataclass`` compares them field by
