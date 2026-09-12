@@ -239,6 +239,9 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm100_mxfp8": EngineSlot(3, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
+        # One entry per eligible row, WITH the tiles the lowering would pick
+        # (cudnn.sdpa.bwd.heuristics), so the record pins the kernel.
+        heuristics=("cudnn.sdpa.bwd.heuristics", "recommend"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
     ),
 )
