@@ -69,10 +69,20 @@ def test_backend_mirror_values_are_frozen():
 def test_frontend_only_band():
     kt = cudnn.knob_type
     assert cudnn.FRONTEND_KNOB_TYPE_BASE == 1000
-    fe_only = {kt.SCHED_POLICY: 1000, kt.PACK_GQA: 1001, kt.SPLIT_KV: 1002}
-    for knob, value in fe_only.items():
-        assert int(knob) == value
-        assert cudnn.is_frontend_knob_type(knob)
+    fe_only = {
+        "SCHED_POLICY": 1000,
+        "PACK_GQA": 1001,
+        "SPLIT_KV": 1002,
+        "PIPELINE_ARCH": 1003,
+        "MMA_TILE_M": 1004,
+        "MMA_TILE_N": 1005,
+        "MMA_TILE_K": 1006,
+        "CTA_GROUP": 1007,
+        "WARPS_M": 1008,
+        "WARPS_N": 1009,
+    }
+    # The frontend band is persisted too: append-only, frozen here like the backend band.
+    assert {name: int(member) for name, member in kt.__members__.items() if cudnn.is_frontend_knob_type(member)} == fe_only
     for knob in (kt.TILE_M, kt.TILE_N, kt.TILE_CGA_M, kt.STREAM_K, kt.SPLIT_K_SLC):
         assert not cudnn.is_frontend_knob_type(knob)
     # the python enum is the C++ enum: round-trips through the integer

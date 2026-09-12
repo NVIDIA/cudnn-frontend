@@ -4118,8 +4118,19 @@ def _graph_dynamic_shapes(graph) -> bool:
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
-def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False) -> TileConfig:
-    """Choose the automatic tile strategy for one analyzed fusion chain."""
+def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+    """Choose the tile strategy for one analyzed fusion chain.
+
+    ``knobs`` (a :class:`~cudnn.gemm.frost.knobs.GemmKnobs`, the replay of a
+    recorded ``(engine_id, knobs)`` plan) names one TileConfig exactly and
+    bypasses the automatic pick; a request that does not spell a canonical
+    config is a decline (NotImplementedError), never a silent snap to a
+    neighbour. Without knobs this is the automatic strategy."""
+    if knobs is not None:
+        try:
+            return knobs.to_config()
+        except (KeyError, ValueError, NotImplementedError) as exc:
+            raise NotImplementedError(f"frost_gemm: knobs do not name a canonical tile config: {exc}") from exc
     from .kernel_registry import preferred_strategy
     from .tile_config import select_config
 
@@ -4287,15 +4298,27 @@ def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) ->
     # of faulting deep in cute -- and so the --gpu-arch target pin, which lands in
     # cutedsl at the floor, is always available by the time a plan compiles. An
     # internal RC passes: cutedsl_too_old judges only the public wheel.
+    probe_cutedsl()
+    chain, _binding = analyze_with_binding(graph)
+    if config is None:
+        config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph))
+    probe_chain(chain, config)
+
+
+def probe_cutedsl() -> None:
+    """The cutedsl floor gate shared by check_support and the family heuristics."""
     installed, version = buffers.cutedsl_state()
     if not installed:
         raise NotImplementedError("frost_gemm requires the cutedsl extra (nvidia-cutlass-dsl)")
     if buffers.cutedsl_too_old(version):
         want = ".".join(str(v) for v in buffers.CUTEDSL_MIN_VERSION)
         raise NotImplementedError(f"frost_gemm requires nvidia-cutlass-dsl >= {want}; found {version[1]}")
-    chain, _binding = analyze_with_binding(graph)
-    if config is None:
-        config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph))
+
+
+def probe_chain(chain: FusionChain, config: TileConfig) -> None:
+    """The chain-level gates of :func:`probe_supported` for one explicit
+    ``config``: what the family heuristics run before listing a plan, so a plan
+    in the ranked list is one the engine will build (facts in, no graph needed)."""
     if config.swap_ab:
         from .fusion_ir import swap_ab
 

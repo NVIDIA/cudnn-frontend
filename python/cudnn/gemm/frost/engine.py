@@ -110,10 +110,33 @@ class FrostGemmEngine(BaseEngine):
             # at the engine boundary that is a decline, not a user error.
             raise NotImplementedError(f"frost_gemm: {exc}") from exc
 
+    # Public knob vocabulary (BaseEngine contract). The native knob form is
+    # GemmKnobs -- one TileConfig spelled as the shared knob types -- and the
+    # family heuristics (cudnn.gemm.frost.heuristics) attach it to every plan
+    # they list, so a recorded (engine_id, knobs) pins the exact kernel.
+    def knobs_to_public(self, knobs) -> dict:
+        from .knobs import GemmKnobs
+
+        if knobs is None:
+            return {}
+        if isinstance(knobs, dict):
+            return dict(knobs)
+        if isinstance(knobs, GemmKnobs):
+            return knobs.to_public()
+        return super().knobs_to_public(knobs)
+
+    def knobs_from_public(self, public: dict):
+        from .knobs import GemmKnobs
+
+        return GemmKnobs.from_public(public) if public else None
+
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
         from .graph_analyzer import build_gemm_plan
         from cudnn.frost.device import build_device
 
+        knobs = plan.knobs if plan is not None else None
+        if isinstance(knobs, dict):  # a replayed public record, not yet converted
+            knobs = self.knobs_from_public(knobs)
         # Bake the plan for the device of the handle the graph carries (via ctx),
         # not whatever CUDA device is current at build time. A foreign raw-int
         # handle (or none) carries no device -> None -> classic current-device.
@@ -121,7 +144,7 @@ class FrostGemmEngine(BaseEngine):
         device = handle.device.ordinal if hasattr(handle, "device") else None
         try:
             with build_device(device):
-                return _FrostGemmPlan(build_gemm_plan(graph))
+                return _FrostGemmPlan(build_gemm_plan(graph, knobs=knobs))
         except (NotImplementedError, ValueError) as exc:
             raise NotImplementedError(f"frost_gemm: {exc}") from exc
 

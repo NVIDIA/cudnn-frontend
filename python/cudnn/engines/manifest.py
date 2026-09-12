@@ -194,6 +194,12 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.gemm.frost.engine",
         "FrostGemmEngines",
         slots={"frost_gemm": EngineSlot(0, opt_in=True)},
+        # Facts + heuristics: the plan the engine would build, listed WITH its
+        # tile config spelled as public knobs, so a recorded (engine_id, knobs)
+        # pins the exact kernel (cudnn.gemm.frost.heuristics). One candidate for
+        # now; widening the proposal set is a heuristics-only change.
+        analyzer=("cudnn.gemm.frost.heuristics", "analyze_facts"),
+        heuristics=("cudnn.gemm.frost.heuristics", "recommend"),
         validator=("cudnn._gemm_validate", "validate_graph"),
     ),
     EngineFamily(

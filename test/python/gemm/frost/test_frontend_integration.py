@@ -91,10 +91,16 @@ def _plan_names(g):
     return [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
 
 
+def _is_plan_for(plan_name, engine):
+    """A python plan is named ``engine`` or ``engine[<public knobs>]``."""
+    return plan_name == engine or plan_name.startswith(engine + "[")
+
+
 def _index_of(g, name):
     names = _plan_names(g)
-    assert name in names, f"no plan named {name!r} in {names}"
-    return names.index(name)
+    hits = [i for i, n in enumerate(names) if _is_plan_for(n, name)]
+    assert hits, f"no plan for engine {name!r} in {names}"
+    return hits[0]
 
 
 def _pin_frost(g):
@@ -292,7 +298,7 @@ def test_frost_is_one_entry_of_the_ranked_list():
     g, _A, _B, _bias, _Y = _build_matmul_bias_relu()
     _plan(g)
     names = _plan_names(g)
-    assert names.count(_FROST) == 1
+    assert sum(1 for n in names if _is_plan_for(n, _FROST)) == 1
     assert g.get_execution_plan_count() == len(names)
     assert sum(1 for p in g.plans if is_python_engine(p.engine_id)) == 1
 

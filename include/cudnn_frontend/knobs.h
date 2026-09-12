@@ -64,6 +64,21 @@ enum class KnobType_t : int64_t {
     // 1 = off. The backend's counterpart is the on/off STREAM_K mode, a
     // different mechanism, hence a distinct knob.
     SPLIT_KV = 1002,
+    // ---- tile geometry axes the backend has no word for (FROST GEMM tiles;
+    // together with TILE_M/TILE_N/TILEK/TILE_CGA_M/TILE_CGA_N/SPLIT_K_SLC/SWAP_AB
+    // they name one TileConfig exactly) ---------------------------------------
+    // Kernel template family as its SM number (100 -> "sm100").
+    PIPELINE_ARCH = 1003,
+    // MMA-instruction tile M / N (elements) and K (BYTES, like TILEK here).
+    MMA_TILE_M = 1004,
+    MMA_TILE_N = 1005,
+    MMA_TILE_K = 1006,
+    // CTAs cooperating on one MMA tile (1 or 2); distinct from the cluster
+    // shape (TILE_CGA_M/N), which may be wider than the pair.
+    CTA_GROUP = 1007,
+    // Warp grid over the CTA tile for warp-scoped MMA families (sm120).
+    WARPS_M = 1008,
+    WARPS_N = 1009,
     // Knobs are performance-only: a plan must compute the same function
     // whichever knob values it runs with, so an autotuner may pick any of
     // them. Anything that changes numerics (e.g. a reduced-precision softmax

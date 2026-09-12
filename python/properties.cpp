@@ -265,7 +265,14 @@ init_properties(py::module_& m) {
         // frontend-only band (knobs.h): never handed to the backend
         .value("SCHED_POLICY", cudnn_frontend::KnobType_t::SCHED_POLICY)
         .value("PACK_GQA", cudnn_frontend::KnobType_t::PACK_GQA)
-        .value("SPLIT_KV", cudnn_frontend::KnobType_t::SPLIT_KV);
+        .value("SPLIT_KV", cudnn_frontend::KnobType_t::SPLIT_KV)
+        .value("PIPELINE_ARCH", cudnn_frontend::KnobType_t::PIPELINE_ARCH)
+        .value("MMA_TILE_M", cudnn_frontend::KnobType_t::MMA_TILE_M)
+        .value("MMA_TILE_N", cudnn_frontend::KnobType_t::MMA_TILE_N)
+        .value("MMA_TILE_K", cudnn_frontend::KnobType_t::MMA_TILE_K)
+        .value("CTA_GROUP", cudnn_frontend::KnobType_t::CTA_GROUP)
+        .value("WARPS_M", cudnn_frontend::KnobType_t::WARPS_M)
+        .value("WARPS_N", cudnn_frontend::KnobType_t::WARPS_N);
     m.attr("FRONTEND_KNOB_TYPE_BASE") = py::int_(cudnn_frontend::FRONTEND_KNOB_TYPE_BASE);
     m.def(
         "is_frontend_knob_type",
