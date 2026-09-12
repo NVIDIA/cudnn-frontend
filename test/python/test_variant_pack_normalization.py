@@ -255,6 +255,8 @@ def test_storage_geometry_packs_fp4_two_per_slot():
     # column-major B [1, K, N] (stride 1 on K): K halves, N's stride halves
     assert _storage_geometry([1, 256, 512], [131072, 1, 256], fp4) == ((1, 128, 512), (65536, 1, 128))
     assert _storage_geometry([1, 256, 255], [65280, 255, 1], fp4) is None  # no slot geometry spells an odd extent
+    # a singleton axis may carry stride 1 too; the packed axis is the one with the even extent above one
+    assert _storage_geometry([1, 256, 256], [1, 256, 1], fp4) == ((1, 256, 128), (1, 128, 1))
 
 
 @pytest.mark.L0

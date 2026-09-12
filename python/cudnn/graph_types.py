@@ -305,12 +305,15 @@ def storage_geometry(dim, stride, data_type):
         stride = tuple(dense)
     if data_type != cudnn.data_type.FP4_E2M1:
         return dim, stride
-    if 1 not in stride:
-        return None
-    c = stride.index(1)
-    if dim[c] % 2 or any(x % 2 for j, x in enumerate(stride) if j != c and x != 1):
-        return None
-    return tuple(d // 2 if j == c else d for j, d in enumerate(dim)), tuple(x if j == c else x // 2 for j, x in enumerate(stride))
+    # The packed axis is a unit-stride axis with an even extent above one -- a
+    # singleton axis may also carry stride 1 and must not be the one picked.
+    for c, (extent, step) in enumerate(zip(dim, stride)):
+        if step != 1 or extent <= 1 or extent % 2:
+            continue
+        if any(x % 2 for j, x in enumerate(stride) if j != c and x != 1):
+            continue
+        return tuple(d // 2 if j == c else d for j, d in enumerate(dim)), tuple(x if j == c else x // 2 for j, x in enumerate(stride))
+    return None
 
 
 def storage_slot_bytes(data_type) -> "int | None":
