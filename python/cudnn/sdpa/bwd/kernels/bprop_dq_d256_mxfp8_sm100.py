@@ -3082,8 +3082,6 @@ class BlackwellFmhaBackwardDQ256:
             mma_compute_dQ_pipeline_1,
         ) = pipeline_args
 
-        tmem.wait_for_alloc()
-
         load_mma_K_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_K_stage)
         if cutlass.const_expr(self.is_persistent):
             n_advance = cumulative_trip_count % Int32(2 * self.load_mma_K_stage)
@@ -3577,8 +3575,6 @@ class BlackwellFmhaBackwardDQ256:
             compute_mma_dS_pipeline,
             mma_compute_dQ_pipeline,
         ) = pipeline_args
-        tmem.wait_for_alloc()
-
         load_mma_K_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_K_stage)
         n_advance = cumulative_trip_count % Int32(2 * self.load_mma_K_stage)
         for _ in cutlass.range_constexpr(2 * self.load_mma_K_stage):

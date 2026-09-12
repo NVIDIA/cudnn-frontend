@@ -2835,11 +2835,6 @@ class BlackwellFmhaBackwardDKDV256:
             compute_mma_dS_pipeline,
             mma_compute_dK_pipeline,
         ) = pipeline_args
-        # TODO: TMEM pointers are fixed after cluster sync
-        # therefore, this wait shall be trivial.
-        tmem.wait_for_alloc()
-
-        # self.tmem_alloc_barrier.arrive_and_wait()
         load_mma_KQ_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_all_stage)
         load_mma_KQ_aux_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_all_stage)
         load_mma_VDO_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_all_stage)
@@ -2952,7 +2947,6 @@ class BlackwellFmhaBackwardDKDV256:
             None,
             load_mma_KQ_consumer_state.index * self.k_halves,
         )
-        # if tidx == 256:
 
         # Prologue: K @ Q
         # Only leader CTA waits for pipeline in 2-CTA mode
@@ -3892,11 +3886,8 @@ class BlackwellFmhaBackwardDKDV256:
         ) = cute_common.epilogue_tmem_copy_and_partition(load_op, tdKtdK, cdK, gdK, dp_idx, self.acc_dtype)
 
         cute.copy(tiled_t2r_dK, tTR_tdK, tTR_rdK)
-        # if bidx == 1 and tidx == 0:
         for i in cutlass.range(cute.size(tTR_rdK), unroll_full=True):
-            # if tidx == 0 and bidx == 1:
             tTR_rdK[i] = scale_softmax * tTR_rdK[i]
-            # if tidx == 0 and bidx == 1:
 
         cute.arch.fence_view_async_tmem_load()
         cute_common.store(self, tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
