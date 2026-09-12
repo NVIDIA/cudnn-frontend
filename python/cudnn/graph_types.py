@@ -312,7 +312,8 @@ def storage_geometry(dim, stride, data_type):
             continue
         if any(x % 2 for j, x in enumerate(stride) if j != c and x != 1):
             continue
-        return tuple(d // 2 if j == c else d for j, d in enumerate(dim)), tuple(x if j == c else x // 2 for j, x in enumerate(stride))
+        # a singleton axis keeps its (never stepped) unit stride
+        return tuple(d // 2 if j == c else d for j, d in enumerate(dim)), tuple(x if (j == c or x == 1) else x // 2 for j, x in enumerate(stride))
     return None
 
 
