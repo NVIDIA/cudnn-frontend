@@ -182,13 +182,14 @@ def test_sm107_row_ranks_natural_only_for_causal():
 
 
 def test_softmax_half_declines_by_row_domain():
-    """A HALF request on the sm100 row declines through the generic knob
-    domain gate; the sm107 row admits it. Pure — facts pin the device."""
+    """The sdpa(softmax_precision=HALF) op attribute is a graph FACT: the sm100
+    row declines it through its capability domain; the sm107 row admits it.
+    Pure — facts pin the device."""
     import cudnn as _c
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.fwd import engines
 
-    def facts(cc):
+    def facts(cc, softmax_precision=None):
         return ga.SdpaGraphFacts(
             b=1,
             h_q=4,
@@ -201,16 +202,19 @@ def test_softmax_half_declines_by_row_domain():
             dtype_o=_c.data_type.BFLOAT16,
             is_fp8=True,
             device_cc=cc,
+            softmax_precision=softmax_precision,
         )
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     sm100 = caps[engines.engine_name(fp8=True)]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
-    half = engines.SdpaFwdKnobs(softmax_precision=_c.data_type.HALF)
+    half = _c.data_type.HALF
 
-    assert "domain" in engines.mismatch(sm100, facts((10, 0)), half)
-    assert engines.mismatch(sm107, facts((10, 7)), half) is None
-    # And the rows keep their arch lanes regardless of the knob.
+    assert "softmax_precision" in engines.mismatch(sm100, facts((10, 0), half), None)
+    assert engines.mismatch(sm107, facts((10, 7), half), None) is None
+    # It is not a tuning knob: the knob vocabulary has no such axis.
+    assert "softmax_precision" not in engines.SdpaFwdKnobs.__dataclass_fields__
+    # And the rows keep their arch lanes regardless of the attribute.
     assert "SM107-119" in engines.mismatch(sm107, facts((10, 0)), None)
     assert "SM100-106" in engines.mismatch(sm100, facts((10, 7)), None)
 
@@ -264,26 +268,33 @@ def test_softmax_f16_rejects_half_inputs():
         make_cfg_d128(TemplateParams(dtype_qkv=_FP16, softmax_f16=True))
 
 
-def test_softmax_points_never_propose_half():
-    """propose() fills the axis with FLOAT where the row serves it — HALF is
-    numerics-changing and reachable by explicit request only."""
+def test_softmax_precision_is_never_a_heuristic_axis():
+    """HALF is numerics-changing, so it is not a tuning axis at all: the
+    heuristics' knob vocabulary has no softmax field, and the only way to get
+    the f16x2 arm is the sdpa(softmax_precision=HALF) op attribute, which a
+    row admits or declines through its capability domain (never degraded)."""
     import cudnn as _c
-    from cudnn.sdpa.fwd.engines import Capabilities
-    from cudnn.sdpa.fwd.heuristics import _softmax_points
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import Capabilities, SdpaFwdKnobs, mismatch
 
-    lit = Capabilities(
-        sm_lo=100,
-        sm_hi=119,
-        phase="prefill",
-        d_shapes=frozenset({(128, 128)}),
-        softmax_precisions=frozenset({_c.data_type.FLOAT, _c.data_type.HALF}),
+    assert "softmax_precision" not in SdpaFwdKnobs.__dataclass_fields__
+    assert not hasattr(heuristics, "_softmax_points")
+
+    base = dict(
+        b=1, h_q=4, h_kv=4, s_q=256, s_kv=256, d_qk=128, d_v=128, dtype=_c.data_type.FP8_E4M3, dtype_o=_c.data_type.BFLOAT16, is_fp8=True, device_cc=(10, 7)
     )
-    assert _softmax_points(lit) == [_c.data_type.FLOAT]
+    lit = Capabilities(
+        sm_lo=100, sm_hi=119, phase="prefill", d_shapes=frozenset({(128, 128)}), softmax_precisions=frozenset({_c.data_type.FLOAT, _c.data_type.HALF})
+    )
     dark = Capabilities(sm_lo=100, sm_hi=119, phase="prefill", d_shapes=frozenset({(128, 128)}))
-    assert _softmax_points(dark) == [None]
-    # A HALF-only row must still not get HALF auto-proposed (numerics-changing).
-    half_only = Capabilities(sm_lo=100, sm_hi=119, phase="prefill", d_shapes=frozenset({(128, 128)}), softmax_precisions=frozenset({_c.data_type.HALF}))
-    assert _softmax_points(half_only) == [None]
+    # No request: every row runs its f32 pipeline, nothing to gate.
+    for caps in (lit, dark):
+        assert "softmax_precision" not in (mismatch(caps, ga.SdpaGraphFacts(**base), None) or "")
+    # An explicit HALF request: honored by the row that carries the arm, declined by the one that does not.
+    half = ga.SdpaGraphFacts(**base, softmax_precision=_c.data_type.HALF)
+    assert "softmax_precision" not in (mismatch(lit, half, None) or "")
+    assert "softmax_precision" in mismatch(dark, half, None)
 
 
 @requires_dsl

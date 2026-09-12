@@ -1074,6 +1074,8 @@ class pygraph:
                 return node  # no lowering branch at all
             if spec_entry[1].get("python_only"):
                 return node  # declared python-only: lowering raises by design
+            if any(node.params.get(attr) is not None for attr in spec_entry[1].get("python_only_attrs", ())):
+                return node  # an op attribute the backend has no field for is SET: python engines only
         return None
 
     def _backend_lowerable(self) -> bool:
@@ -1197,14 +1199,19 @@ class pygraph:
 
     def get_plan_name_at_index(self, index: int) -> str:
         """Name of the plan at ``index`` in the ranked list. A python plan
-        reports its engine name (plus its knobs when it has several plans); a
-        backend plan reports the backend's own name."""
+        reports its engine name plus its public knobs when it has any
+        (``sdpa_fwd_prefill_sm100[TILE_M=128, TILE_N=128]``, sorted by knob
+        name so the same plan always prints the same); a backend plan reports
+        the backend's own name."""
         if not self._planning_done:
             return self._lowered_graph.get_plan_name_at_index(index)
         cfg = self._plans[self._check_plan_index(index)]
         eng = self._engine_for(cfg)
         if eng is not None:
-            return f"{eng.name}[{cfg.knobs}]" if cfg.knobs is not None else eng.name
+            from .engines.base import public_knobs_repr
+
+            public = eng.knobs_to_public(cfg.knobs)
+            return f"{eng.name}[{public_knobs_repr(public)}]" if public else eng.name
         cfg = self._materialize_backend_plan(index)
         if cfg.cpp_index is None:
             # Delegating entry: the backend holds candidates it does not expose
@@ -1663,7 +1670,11 @@ class pygraph:
         Answered from the unified list, NOT forwarded to C++ with a unified
         index — that would report the backend's entry for a python plan's slot.
         The pair is what ``create_execution_plan()`` replays, so it must name the
-        same engine the caller just looked at."""
+        same engine the caller just looked at.
+
+        ``knobs`` is always a ``{cudnn.knob_type: int}`` dict (empty when the
+        plan has no tuning axes, never ``None``), for backend and python plans
+        alike: one record shape for autotuners to persist."""
         from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
         if not self._planning_done:
@@ -1674,7 +1685,10 @@ class pygraph:
                 f"plan {index} delegates to the backend's own choice among candidates it does not expose "
                 f"as plans (heur_mode.OPENSOURCE); there is no (engine_id, knobs) pair to replay"
             )
-        return (cfg.engine_id, cfg.knobs)
+        eng = self._engine_for(cfg)
+        if eng is not None:
+            return (cfg.engine_id, eng.knobs_to_public(cfg.knobs))
+        return (cfg.engine_id, dict(cfg.knobs) if cfg.knobs else {})
 
     def get_behavior_notes_for_plan_at_index(self, index: int, *args, **kwargs):
         """Classic backend behaviour notes for the plan at ``index``.
@@ -1743,6 +1757,11 @@ class pygraph:
         ``create_execution_plan(...)`` then ``get_execution_plan_count() - 1``
         addresses the plan just added — for a python engine id as well as a
         backend one, which is the whole point of one id space.
+
+        ``knobs`` is the public ``{cudnn.knob_type: int}`` dict that
+        ``get_engine_and_knobs_at_index`` reported (``None`` / ``{}`` for a plan
+        without tuning axes). A python engine's native knob object is accepted
+        too, for callers that already hold one.
         """
         from .engines.base import PlanConfig
         from .engines.engine_ids import is_python_engine
@@ -1755,6 +1774,8 @@ class pygraph:
                 raise ValueError(f"no python engine on this graph owns engine_id {engine_id}")
             if len(owners) > 1:
                 raise ValueError(f"engine_id {engine_id} is owned by {[e.name for e in owners]} — ambiguous dispatch")
+            if knobs is None or isinstance(knobs, dict):
+                knobs = owners[0].knobs_from_public(knobs or {})
             entry = PlanConfig(engine_id, knobs)
         else:
             entry = PlanConfig(engine_id, knobs, cpp_index=self._append_backend_plan(engine_id, knobs))
@@ -2295,9 +2316,10 @@ class pygraph:
                 kw = {"name": node.name}
                 if node.compute_data_type is not None:
                     kw["compute_data_type"] = _library_type(node.compute_data_type)
+                python_only = spec.get("python_only_attrs", ())
                 for pk, pv in node.params.items():
-                    if pk.startswith("_") or pk.startswith("dropout_"):
-                        continue
+                    if pk.startswith("_") or pk.startswith("dropout_") or pk in python_only:
+                        continue  # python-only attrs never reach C++ (_unlowerable_node keeps a SET one off the backend)
                     # user callbacks (score_mod, ...) get a shimmed graph so
                     # closures over IR tensors keep working (see _CallbackGraphShim)
                     kw[pk] = _wrap_callback(pv, lower_tensor) if callable(pv) else pv
@@ -3310,6 +3332,13 @@ _CAPTURED_OPS = {
         out_kwargs=("rng_dump", "score_max", "score_sum_exp"),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims},
+        # Op attributes the cuDNN backend has no field for: never forwarded to
+        # C++; when SET they make the node backend-unlowerable so only a python
+        # engine that honors them can serve the graph. `softmax_precision`
+        # (cudnn.data_type.FLOAT | HALF, default FLOAT) asks for the softmax
+        # accumulator precision -- numerics-changing, hence an op attribute
+        # rather than a tuning knob.
+        python_only_attrs=("softmax_precision",),
     ),
     "sdpa_backward": dict(
         node_type=NodeType.SDPA_BWD,
@@ -3325,6 +3354,7 @@ _CAPTURED_OPS = {
         out_kwargs=("rng_dump", "score_max", "score_sum_exp"),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_S": _AMAX, "Amax_O": _AMAX},
+        python_only_attrs=("softmax_precision",),  # see "sdpa"
     ),
     "sdpa_fp8_backward": dict(
         node_type=NodeType.SDPA_FP8_BWD,

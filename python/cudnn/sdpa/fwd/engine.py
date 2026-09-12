@@ -104,10 +104,30 @@ class FrostSdpaFwdEngine(BaseEngine):
         if reason is not None:
             raise NotImplementedError(f"{self.name}: {reason}")
 
+    # Public knob vocabulary (BaseEngine contract): the native SdpaFwdKnobs
+    # travels inside PlanConfig; callers see {cudnn.knob_type: int}.
+    def knobs_to_public(self, knobs) -> dict:
+        from .engines import SdpaFwdKnobs
+
+        if knobs is None:
+            return {}
+        if isinstance(knobs, dict):
+            return dict(knobs)
+        if isinstance(knobs, SdpaFwdKnobs):
+            return knobs.to_public()
+        return super().knobs_to_public(knobs)
+
+    def knobs_from_public(self, public: dict):
+        from .engines import SdpaFwdKnobs
+
+        return SdpaFwdKnobs.from_public(public) if public else None
+
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
         from .engines import build
 
         knobs = plan.knobs if plan is not None else None
+        if isinstance(knobs, dict):  # a replayed public record, not yet converted
+            knobs = self.knobs_from_public(knobs)
         try:
             return _FrostSdpaFwdPlan(self.name, build(self._spec, graph, knobs))
         except (NotImplementedError, ValueError, ImportError) as exc:

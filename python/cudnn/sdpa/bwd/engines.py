@@ -72,15 +72,39 @@ _BLACKWELL_GEFORCE = (120, 129)
 class SdpaBwdKnobs:
     """Per-plan tuning request for the SDPA-backward engines.
 
-    This is the operation's knob *vocabulary* — typed fields, no global enum.
-    ``None`` means "no preference". Travels as ``PlanConfig.knobs``; each
-    engine's :class:`Capabilities` row advertises the domain it honors, and the
-    probe rejects the engine for any request outside that domain (a knob is
-    honored or the engine is ineligible — never silently degraded).
+    Typed fields internally; ``None`` means "no preference". Travels as
+    ``PlanConfig.knobs``; each engine's :class:`Capabilities` row advertises the
+    domain it honors, and the probe rejects the engine for any request outside
+    that domain (a knob is honored or the engine is ineligible — never silently
+    degraded). Publicly each field is one ``cudnn.knob_type`` of the shared
+    vocabulary (``to_public`` / ``from_public``): ``TILE_M`` / ``TILE_N``.
     """
 
     tile_m: Optional[int] = None  # Q sequence tile width (q_tile)
     tile_n: Optional[int] = None  # KV sequence tile width (kv_tile)
+
+    _PUBLIC_KNOBS = (("tile_m", "TILE_M"), ("tile_n", "TILE_N"))
+
+    def to_public(self) -> dict:
+        """``{cudnn.knob_type: int}`` for every field that is set."""
+        kt = cudnn.knob_type
+        return {getattr(kt, member): int(getattr(self, field)) for field, member in self._PUBLIC_KNOBS if getattr(self, field) is not None}
+
+    @classmethod
+    def from_public(cls, public: dict) -> "SdpaBwdKnobs":
+        """Inverse of :meth:`to_public`. Rejects knob types this operation has no field for."""
+        kt = cudnn.knob_type
+        by_type = {getattr(kt, member): field for field, member in cls._PUBLIC_KNOBS}
+        kwargs = {}
+        for knob, value in public.items():
+            knob = kt(int(knob)) if not isinstance(knob, kt) else knob
+            field = by_type.get(knob)
+            if field is None:
+                raise ValueError(f"knob {knob.name} is not a tuning axis of the SDPA-backward engines")
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
+            kwargs[field] = value
+        return cls(**kwargs)
 
 
 @dataclass(frozen=True)

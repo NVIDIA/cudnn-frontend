@@ -565,10 +565,35 @@ def test_knob_request_outside_domain_rejects_engine():
     # A value no row's domain contains: honored or ineligible, never degraded.
     g = _mk_eligible_graph()
     assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=99))
-    # softmax_precision=1 is cudnn.data_type.DOUBLE — in no row's domain (the
-    # fp8 rows serve FLOAT, and the sm107 row additionally HALF), so an
-    # explicit request declines everywhere.
-    assert not _eligible(g, engines.SdpaFwdKnobs(softmax_precision=1))
+
+
+def _mk_softmax_precision_graph(precision):
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True, softmax_precision=precision)
+    _finish_output(o, dims, strides)
+    return g
+
+
+def test_softmax_precision_is_an_op_attribute_not_a_knob():
+    """sdpa(softmax_precision=) is numerics-changing, so it is a graph FACT the
+    capability rows gate on — not a tuning axis an autotuner could pick."""
+    import cudnn as _c
+
+    assert "softmax_precision" not in engines.SdpaFwdKnobs.__dataclass_fields__
+    # FLOAT is the pipeline every row runs: same eligibility as no request.
+    assert _eligible(_mk_softmax_precision_graph(_c.data_type.FLOAT)) == _eligible(_mk_eligible_graph())
+    # HALF exists only in the per-tensor-FP8 SM107 arm; a bf16 graph declines everywhere.
+    g_half = _mk_softmax_precision_graph(_c.data_type.HALF)
+    assert ga.analyze(g_half).softmax_precision == _c.data_type.HALF
+    assert not _eligible(g_half)
+    # Anything else is a malformed request, reported on the facts.
+    g_bad = _mk_softmax_precision_graph(_c.data_type.DOUBLE)
+    assert "softmax_precision must be" in (ga.analyze(g_bad).invalid or "")
+    assert not _eligible(g_bad)
+    # The attribute never reaches the cuDNN backend: a SET value makes the node backend-unlowerable.
+    assert g_half._unlowerable_node() is not None
+    assert _mk_softmax_precision_graph(None)._unlowerable_node() is None
 
 
 def test_knob_request_lpt_sched_is_in_domain():

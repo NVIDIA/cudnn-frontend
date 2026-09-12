@@ -126,7 +126,7 @@ class TemplateParams:
     # lacks it and uses the manual load + software reduction. Auto-set from the device
     # capability at compile time (MXFP8 only; the f16/fp8 kernels do not read it).
     fused_ldtm_stat: bool = False
-    # softmax_precision knob = cudnn.data_type.HALF: exponent + P-cast run as
+    # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
     # scalar f32 ex2. Per-tensor FP8 on the SM107 sibling kernel only — the
     # exp arguments are bounded (<= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE),

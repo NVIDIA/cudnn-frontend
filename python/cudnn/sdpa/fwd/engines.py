@@ -78,11 +78,27 @@ _BLACKWELL_GEFORCE = (120, 129)
 class SdpaFwdKnobs:
     """Per-plan tuning request for the SDPA-forward engines.
 
-    This is the operation's knob *vocabulary* — typed fields, no global enum.
-    ``None`` means "no preference". Travels as ``PlanConfig.knobs``; each
-    engine's :class:`Capabilities` row advertises the domain it honors, and the
-    probe rejects the engine for any request outside that domain (a knob is
-    honored or the engine is ineligible — never silently degraded).
+    Typed fields internally; ``None`` means "no preference". Travels as
+    ``PlanConfig.knobs``; each engine's :class:`Capabilities` row advertises the
+    domain it honors, and the probe rejects the engine for any request outside
+    that domain (a knob is honored or the engine is ineligible — never silently
+    degraded).
+
+    At the public surface every tuning field is one ``cudnn.knob_type`` of the
+    shared vocabulary (``to_public`` / ``from_public``), the same dict shape a
+    backend plan reports: ``tile_m/tile_n`` and ``cga`` reuse the backend's
+    ``TILE_M`` / ``TILE_N`` / ``TILE_CGA_M`` (a cga of 2 IS a 2-CTA M-cluster,
+    the backend's own encoding of its 2-CTA SDPA variant); ``sched_policy``,
+    ``pack_gqa`` and ``split_kv`` are frontend-only types (the backend's
+    split-KV counterpart, ``STREAM_K``, is an on/off mode, not a chunk count,
+    hence the distinct ``SPLIT_KV``).
+
+    Knobs are performance-only: every value computes the same function, so an
+    autotuner may pick any of them. The softmax accumulator precision (the
+    Rubin f16x2 exponent arm) changes numerics and is therefore NOT a knob: it
+    is the ``sdpa(..., softmax_precision=)`` op attribute, read from the graph
+    into ``SdpaGraphFacts.softmax_precision`` and gated by each row's
+    ``Capabilities.softmax_precisions`` in :func:`mismatch`.
     """
 
     sched_policy: Optional[int] = None  # tile-scheduler policy (SCHED_NATURAL, ...)
@@ -93,12 +109,49 @@ class SdpaFwdKnobs:
     # KV-split count: each Q tile's KV range cut into this many chunks, each
     # run by its own CTA, recombined by the split_combine pass. 1 = off.
     split_kv: Optional[int] = None
-    # Softmax accumulation precision as a cudnn.data_type value. Served rows
-    # declare their domain: the per-tensor FP8 d128 rows serve FLOAT, and the
-    # sm107 (Rubin) row additionally HALF — its kernel's f16x2 exponent arm.
-    # HALF is numerics-changing, so it is honored on explicit request only,
-    # never auto-proposed (see heuristics._softmax_points).
-    softmax_precision: Optional[int] = None
+
+    # field name -> cudnn.knob_type member name (resolved lazily: the compiled
+    # module is not importable at class-definition time in every build).
+    _PUBLIC_KNOBS = (
+        ("sched_policy", "SCHED_POLICY"),
+        ("tile_m", "TILE_M"),
+        ("tile_n", "TILE_N"),
+        ("cga", "TILE_CGA_M"),
+        ("pack_gqa", "PACK_GQA"),
+        ("split_kv", "SPLIT_KV"),
+    )
+
+    def to_public(self) -> dict:
+        """``{cudnn.knob_type: int}`` for every tuning field that is set (bools as 0/1)."""
+        kt = cudnn.knob_type
+        out = {}
+        for field, member in self._PUBLIC_KNOBS:
+            value = getattr(self, field)
+            if value is not None:
+                out[getattr(kt, member)] = int(value)
+        return out
+
+    @classmethod
+    def from_public(cls, public: dict) -> "SdpaFwdKnobs":
+        """Inverse of :meth:`to_public`. Rejects knob types this operation has no field for."""
+        kt = cudnn.knob_type
+        by_type = {getattr(kt, member): field for field, member in cls._PUBLIC_KNOBS}
+        kwargs = {}
+        for knob, value in public.items():
+            knob = kt(int(knob)) if not isinstance(knob, kt) else knob
+            field = by_type.get(knob)
+            if field is None:
+                raise ValueError(f"knob {knob.name} is not a tuning axis of the SDPA-forward engines")
+            if isinstance(value, bool):
+                value = int(value)
+            if not isinstance(value, int):
+                # A persisted record carries ints; "0" or 1.0 would round-trip to
+                # a different native knob than the one recorded.
+                raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
+            if field == "pack_gqa" and value not in (0, 1):
+                raise ValueError(f"knob PACK_GQA must be 0 or 1, got {value}")
+            kwargs[field] = bool(value) if field == "pack_gqa" else value
+        return cls(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -375,6 +428,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return facts.invalid
     if facts.is_backward:
         return "this engine serves sdpa() forward graphs only"
+    if facts.softmax_precision is not None and facts.softmax_precision not in capabilities.softmax_precisions:
+        # The op attribute sdpa(softmax_precision=HALF): numerics-changing, so
+        # honored only by a row whose lowering carries that arm — never degraded.
+        return f"requested softmax_precision={facts.softmax_precision} is outside this engine's domain {sorted(capabilities.softmax_precisions, key=int)}"
     if knobs is not None:
         if not isinstance(knobs, SdpaFwdKnobs):
             return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
@@ -384,12 +441,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
             (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv), "cga"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
-            (knobs.softmax_precision, capabilities.softmax_precisions, "softmax_precision"),
         ):
             if value is not None and value not in domain:
-                # key=int: knob domains mix plain ints with cudnn.data_type
-                # members (softmax_precision), and the pybind enum defines no
-                # ordering of its own.
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
         if knobs.split_kv is not None and knobs.split_kv < 1:
             return f"requested split_kv={knobs.split_kv} is not a split count (1 = off)"
@@ -1323,7 +1376,7 @@ def lower_dsl_prefill(
         cga=knobs.cga if knobs is not None else None,
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
-        softmax_precision=knobs.softmax_precision if knobs is not None else None,
+        softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
         # SM80-only PLAN-TIME axes (bias presence/dtype are compile-time
         # specializations of that template): forwarded only to adapters whose
         # constructor declares them — every other row's mismatch gated the

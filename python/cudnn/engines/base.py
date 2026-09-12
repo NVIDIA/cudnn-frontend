@@ -75,6 +75,13 @@ class PlanConfig:
     field, so cuDNN and python plans are interchangeable in the ranked list.
     One engine may propose several plans differing only in knobs.
 
+    ``knobs`` here is the engine's NATIVE form (a python engine may keep a typed
+    config object). At the public surface — ``get_engine_and_knobs_at_index``,
+    ``create_execution_plan``, ``get_plan_name_at_index`` — every plan speaks
+    the one shared vocabulary instead: ``{cudnn.knob_type: int}``, backend and
+    python alike, converted through ``BaseEngine.knobs_to_public`` /
+    ``knobs_from_public``. That pair is what autotuners persist and replay.
+
     ``cpp_index`` is set only on backend entries: the position this plan holds
     in the lowered graph's own plan list, so building it is one
     ``build_plan_at_index`` instead of a rebuild from (engine_id, knobs).
@@ -401,5 +408,54 @@ class BaseEngine(ABC):
         """
         raise NotImplementedError(f"Engine '{self.name}' must implement execute() or build_plan()")
 
+    # ------------------------------------------------------------------
+    # Public knob vocabulary
+    # ------------------------------------------------------------------
+    # Every plan in the ranked list is described to callers as
+    # ``(engine_id, {cudnn.knob_type: int})`` -- the same pair the backend's
+    # plans answer in, so an autotuner persists and replays one shape of record
+    # for both. An engine keeps whatever native knob form it likes in
+    # ``PlanConfig.knobs`` and converts at this boundary. Knob TYPES are the
+    # shared ``KnobType_t`` vocabulary (knobs.h): reuse a backend type where the
+    # meaning matches, add to the frontend-only band otherwise -- never a
+    # private namespace.
+
+    def knobs_to_public(self, knobs: Any) -> Dict[Any, int]:
+        """Native ``PlanConfig.knobs`` -> ``{cudnn.knob_type: int}``.
+
+        Default: ``None`` (no tuning axes) is ``{}``; a dict is passed through.
+        Engines with a typed knob object override this."""
+        if knobs is None:
+            return {}
+        if isinstance(knobs, dict):
+            return dict(knobs)
+        raise TypeError(
+            f"engine {self.name!r} carries knobs of type {type(knobs).__name__} but does not implement "
+            "knobs_to_public(); every engine must speak the shared {cudnn.knob_type: int} vocabulary"
+        )
+
+    def knobs_from_public(self, public: Dict[Any, int]) -> Any:
+        """``{cudnn.knob_type: int}`` -> native ``PlanConfig.knobs`` (replay path).
+
+        Default: an empty dict means "no preference" (``None``); anything else
+        is passed through as a dict. Engines with a typed knob object override."""
+        if not public:
+            return None
+        return dict(public)
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name={self.name!r}, engine_id={self.engine_id})"
+
+
+def public_knobs_repr(public: Dict[Any, int]) -> str:
+    """Stable, greppable rendering of a public knob dict: ``TILE_M=128, SPLIT_KV=2``.
+
+    Keys render by knob-type NAME (``cudnn.knob_type`` members carry one; a bare
+    int falls back to its number), sorted by name, so the same plan always
+    prints the same way regardless of dict order. Plan names wrap it in
+    ``engine[...]``."""
+    items = []
+    for k, v in public.items():
+        name = getattr(k, "name", None) or str(int(k))
+        items.append((name, int(v)))
+    return ", ".join(f"{n}={v}" for n, v in sorted(items))

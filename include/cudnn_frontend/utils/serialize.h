@@ -684,6 +684,14 @@ NLOHMANN_JSON_SERIALIZE_ENUM(KnobType_t,
                                  {KnobType_t::TILE_M, "TILE_M"},
                                  {KnobType_t::TILE_N, "TILE_N"},
                                  {KnobType_t::WARP_SPEC_CFG, "WARP_SPEC_CFG"},
+                                 {KnobType_t::SWAP_AB, "SWAP_AB"},
+                                 {KnobType_t::INPUT_TMA_ENABLE, "INPUT_TMA_ENABLE"},
+                                 {KnobType_t::OUTPUT_TMA_ENABLE, "OUTPUT_TMA_ENABLE"},
+                                 {KnobType_t::TILE_CGA, "TILE_CGA"},
+                                 // frontend-only band (knobs.h)
+                                 {KnobType_t::SCHED_POLICY, "SCHED_POLICY"},
+                                 {KnobType_t::PACK_GQA, "PACK_GQA"},
+                                 {KnobType_t::SPLIT_KV, "SPLIT_KV"},
                              })
 
 #endif

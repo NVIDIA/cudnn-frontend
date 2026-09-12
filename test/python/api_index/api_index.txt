@@ -7,6 +7,7 @@ cudnn.DeviceInfo.oversized_shared_memory_per_block
 cudnn.DeviceInfo.shared_memory_per_block_optin
 cudnn.DeviceInfo.sm_count
 cudnn.DeviceInfo.sm_version
+cudnn.FRONTEND_KNOB_TYPE_BASE
 cudnn.Graph
 cudnn.Graph.set_io_tuples
 cudnn.GraphContext
@@ -259,6 +260,8 @@ cudnn.engines.BaseEngine.check_support
 cudnn.engines.BaseEngine.engine_id
 cudnn.engines.BaseEngine.execute
 cudnn.engines.BaseEngine.get_workspace_size
+cudnn.engines.BaseEngine.knobs_from_public
+cudnn.engines.BaseEngine.knobs_to_public
 cudnn.engines.BaseEngine.name
 cudnn.engines.BaseEngine.numerical_notes
 cudnn.engines.CPP_OSS_ENGINE_ID_BASE
@@ -288,6 +291,7 @@ cudnn.engines.PlanConfig.mode
 cudnn.engines.decline_types
 cudnn.engines.is_backend_engine
 cudnn.engines.is_python_engine
+cudnn.engines.public_knobs_repr
 cudnn.experimental.ops
 cudnn.experimental.ops.moe_grouped_matmul
 cudnn.experimental.ops.swiglu_mlp
@@ -363,6 +367,7 @@ cudnn.hstu.hstu_attention.hstu_attention_forward
 cudnn.hstu.hstu_lmsd
 cudnn.hstu.hstu_lmsd.hstu_lmsd_backward
 cudnn.hstu.hstu_lmsd.hstu_lmsd_forward
+cudnn.is_frontend_knob_type
 cudnn.jax
 cudnn.jax.TensorSpec
 cudnn.jax.call
@@ -390,9 +395,12 @@ cudnn.knob_type.MULTIPLY
 cudnn.knob_type.NOT_SET
 cudnn.knob_type.OCCUPANCY
 cudnn.knob_type.OUTPUT_TMA_ENABLE
+cudnn.knob_type.PACK_GQA
 cudnn.knob_type.REDUCTION_MODE
+cudnn.knob_type.SCHED_POLICY
 cudnn.knob_type.SPECFILT
 cudnn.knob_type.SPLIT_COLS
+cudnn.knob_type.SPLIT_KV
 cudnn.knob_type.SPLIT_K_BUF
 cudnn.knob_type.SPLIT_K_SLC
 cudnn.knob_type.SPLIT_P_SLC

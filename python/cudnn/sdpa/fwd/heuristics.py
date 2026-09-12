@@ -720,20 +720,12 @@ def _split_points(
     return [split, no_split]
 
 
-def _softmax_points(caps: Capabilities) -> List[Optional[int]]:
-    """Softmax-precision candidates.
-
-    FLOAT when the row serves it, else the row's sole point. HALF is NEVER
-    proposed: it changes numerics (f16x2 exponent), so it is reachable only
-    by explicit request — auto-proposing it is the CUDNN_SOFTMAX_PRECISION
-    environment-knob failure mode this vocabulary exists to avoid. Flipping the
-    Rubin-FP8 default to HALF is a separate, evidence-carrying change.
-    """
-    if cudnn.data_type.FLOAT in caps.softmax_precisions:
-        return [cudnn.data_type.FLOAT]
-    sole = _sole(caps.softmax_precisions)
-    # A HALF-only row still never gets HALF proposed — same numerics rule.
-    return [None if sole == cudnn.data_type.HALF else sole]
+# NOTE: the softmax accumulator precision is NOT a knob axis. It changes
+# numerics (the Rubin f16x2 exponent arm), so it is the
+# sdpa(softmax_precision=) op attribute: a graph FACT that engines.mismatch
+# gates against Capabilities.softmax_precisions. Heuristics never propose it —
+# auto-proposing it was the CUDNN_SOFTMAX_PRECISION environment-knob failure
+# mode this vocabulary exists to avoid.
 
 
 # ---------------------------------------------------------------------------
@@ -792,7 +784,6 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
             cga=cga,
             pack_gqa=True if packed_first else unpacked_pack,
             split_kv=split_value,
-            softmax_precision=_softmax_points(caps)[0],
         )
 
     unsplit_leg = _leg(1)
@@ -856,7 +847,6 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
         cga=cga,
         pack_gqa=False if False in caps.pack_gqas else _sole(caps.pack_gqas),
         split_kv=1,  # the fallback never splits: least-demanding means one kernel, no partial workspace
-        softmax_precision=_sole(caps.softmax_precisions),
     )
 
 

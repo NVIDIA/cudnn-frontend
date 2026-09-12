@@ -7,42 +7,82 @@
 
 namespace cudnn_frontend {
 
-enum class KnobType_t {
-    NOT_SET,
+// The one knob vocabulary every plan in the ranked list speaks, backend and
+// frontend (python) engines alike: an autotune result is ``(engine_id, knobs)``
+// with knobs keyed by this enum, so the integer values are a persisted contract.
+//
+//  * ``0 .. FRONTEND_KNOB_TYPE_BASE-1`` mirror ``cudnnBackendKnobType_t`` (mapped
+//    by the two converters below; the numbers need not match the backend's).
+//  * ``FRONTEND_KNOB_TYPE_BASE ..`` are frontend-only knobs, for tuning axes the
+//    backend has no word for. They never reach the backend
+//    (``convert_to_backend_knob_type`` refuses them).
+//
+// Both bands are APPEND-ONLY: never insert, renumber, or reuse a value.
+enum class KnobType_t : int64_t {
+    NOT_SET = 0,
 
-    SWIZZLE,
-    TILE_SIZE,
-    EDGE,
-    MULTIPLY,
-    SPLIT_K_BUF,
-    TILEK,
-    STAGES,
-    REDUCTION_MODE,
-    SPLIT_K_SLC,
-    IDX_MODE,
-    SPECFILT,
-    KERNEL_CFG,
-    WORKSPACE,
-    TILE_CGA_M,
-    TILE_CGA_N,
-    BLOCK_SIZE,
-    OCCUPANCY,
-    ARRAY_SIZE_PER_THREAD,
-    SPLIT_COLS,
-    TILE_ROWS,
-    TILE_COLS,
-    LOAD_SIZE,
-    CTA_COUNT,
-    STREAM_K,
-    SPLIT_P_SLC,
-    TILE_M,
-    TILE_N,
-    WARP_SPEC_CFG,
-    SWAP_AB,
-    INPUT_TMA_ENABLE,
-    OUTPUT_TMA_ENABLE,
-    TILE_CGA,
+    SWIZZLE               = 1,
+    TILE_SIZE             = 2,
+    EDGE                  = 3,
+    MULTIPLY              = 4,
+    SPLIT_K_BUF           = 5,
+    TILEK                 = 6,
+    STAGES                = 7,
+    REDUCTION_MODE        = 8,
+    SPLIT_K_SLC           = 9,
+    IDX_MODE              = 10,
+    SPECFILT              = 11,
+    KERNEL_CFG            = 12,
+    WORKSPACE             = 13,
+    TILE_CGA_M            = 14,
+    TILE_CGA_N            = 15,
+    BLOCK_SIZE            = 16,
+    OCCUPANCY             = 17,
+    ARRAY_SIZE_PER_THREAD = 18,
+    SPLIT_COLS            = 19,
+    TILE_ROWS             = 20,
+    TILE_COLS             = 21,
+    LOAD_SIZE             = 22,
+    CTA_COUNT             = 23,
+    STREAM_K              = 24,
+    SPLIT_P_SLC           = 25,
+    TILE_M                = 26,
+    TILE_N                = 27,
+    WARP_SPEC_CFG         = 28,
+    SWAP_AB               = 29,
+    INPUT_TMA_ENABLE      = 30,
+    OUTPUT_TMA_ENABLE     = 31,
+    TILE_CGA              = 32,
+
+    // ---- frontend-only band -------------------------------------------------
+    // Tile-scheduler policy (an engine-declared enumeration, e.g. natural /
+    // LPT / LPT-L2 for the FROST SDPA engines).
+    SCHED_POLICY = 1000,
+    // Pack the query heads of a GQA/MQA group into one tile (0/1).
+    PACK_GQA = 1001,
+    // Number of KV chunks each Q tile is split across, recombined afterwards;
+    // 1 = off. The backend's counterpart is the on/off STREAM_K mode, a
+    // different mechanism, hence a distinct knob.
+    SPLIT_KV = 1002,
+    // Knobs are performance-only: a plan must compute the same function
+    // whichever knob values it runs with, so an autotuner may pick any of
+    // them. Anything that changes numerics (e.g. a reduced-precision softmax
+    // accumulator) is a graph attribute / numerical note, never a knob.
 };
+
+// First value of the frontend-only band; everything below mirrors the backend.
+constexpr int64_t FRONTEND_KNOB_TYPE_BASE = 1000;
+
+inline constexpr bool
+is_frontend_knob_type(KnobType_t const knob_type) {
+    return static_cast<int64_t>(knob_type) >= FRONTEND_KNOB_TYPE_BASE;
+}
+
+// The persisted values: a renumbering here silently re-targets every stored
+// (engine_id, knobs) record downstream.
+static_assert(static_cast<int64_t>(KnobType_t::TILE_CGA) == 32, "backend-mirror knob values are append-only");
+static_assert(static_cast<int64_t>(KnobType_t::SCHED_POLICY) == FRONTEND_KNOB_TYPE_BASE,
+              "frontend-only knobs start at FRONTEND_KNOB_TYPE_BASE");
 
 class Knob {
    public:
@@ -57,6 +97,12 @@ class Knob {
 
 static inline cudnnStatus_t
 convert_to_backend_knob_type(KnobType_t const knob_type, cudnnBackendKnobType_t& cudnn_knob_type) {
+    // Frontend-only knobs have no backend counterpart by construction; a caller
+    // handing one to a backend engine gets a loud NOT_SUPPORTED, never a
+    // silently mis-mapped knob.
+    if (is_frontend_knob_type(knob_type)) {
+        return cudnnStatus_t::CUDNN_STATUS_NOT_SUPPORTED;
+    }
     switch (knob_type) {
         case KnobType_t::SWIZZLE:
             cudnn_knob_type = CUDNN_KNOB_TYPE_SWIZZLE;

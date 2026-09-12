@@ -261,7 +261,17 @@ init_properties(py::module_& m) {
         .value("SWAP_AB", cudnn_frontend::KnobType_t::SWAP_AB)
         .value("INPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::INPUT_TMA_ENABLE)
         .value("OUTPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::OUTPUT_TMA_ENABLE)
-        .value("TILE_CGA", cudnn_frontend::KnobType_t::TILE_CGA);
+        .value("TILE_CGA", cudnn_frontend::KnobType_t::TILE_CGA)
+        // frontend-only band (knobs.h): never handed to the backend
+        .value("SCHED_POLICY", cudnn_frontend::KnobType_t::SCHED_POLICY)
+        .value("PACK_GQA", cudnn_frontend::KnobType_t::PACK_GQA)
+        .value("SPLIT_KV", cudnn_frontend::KnobType_t::SPLIT_KV);
+    m.attr("FRONTEND_KNOB_TYPE_BASE") = py::int_(cudnn_frontend::FRONTEND_KNOB_TYPE_BASE);
+    m.def(
+        "is_frontend_knob_type",
+        [](cudnn_frontend::KnobType_t const knob_type) { return cudnn_frontend::is_frontend_knob_type(knob_type); },
+        py::arg("knob_type"),
+        "True for knobs in the frontend-only band (>= FRONTEND_KNOB_TYPE_BASE); they have no backend counterpart.");
 
     py::class_<cudnn_frontend::Knob, std::shared_ptr<cudnn_frontend::Knob>>(m, "knob")
         .def(py::init<cudnn_frontend::KnobType_t, int64_t, int64_t, int64_t>(),

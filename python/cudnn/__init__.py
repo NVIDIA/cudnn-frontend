@@ -25,6 +25,8 @@ symbols_to_import = [
     "reduction_mode",
     "behavior_note",
     "knob_type",
+    "FRONTEND_KNOB_TYPE_BASE",
+    "is_frontend_knob_type",
     "create_kernel_cache",
     "create_device_properties",
     "numerical_note",

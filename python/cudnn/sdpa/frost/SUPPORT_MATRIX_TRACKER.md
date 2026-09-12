@@ -288,14 +288,16 @@ red (2026-09-08).
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ❌ |
-| FP16 softmax accumulate (`softmax_precision=HALF`) | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |
+| FP16 softmax accumulate (`sdpa(softmax_precision=HALF)` op attribute) | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |
 
 ⁱ No native d=64 Rubin kernel, so a d=64 graph rides the d128 envelope (64 is a
 multiple of 8 at f16 and of 16 at fp8) at ~2× the MMA cost.
 ⁱⁱ `thd_d_shapes={(128,128)}` on the FP8 row is exact — d=64 THD is declined.
-ⁱⁱⁱ **Accepted, not validated.** `softmax_precision=HALF` is gated on
+ⁱⁱⁱ **Accepted, not validated.** `softmax_precision=HALF` (requested as the
+`sdpa()` op attribute — numerics-changing, so it is a graph fact gated by the
+row's `softmax_precisions`, not a tuning knob) is gated on
 `flavor == (128, 128)` (`fwd/api_dsl.py`), and a d=64 graph's *flavor* IS
-(128,128), so the knob passes the probe and the kernel runs. Untested is the
+(128,128), so the request passes the probe and the kernel runs. Untested is the
 f16x2 exponent arm over the zero-padded 64 → 128 region.
 ⁱᵛ **d512 MXFP8 is CORRECT but has no test module**, so it is ⚠️ not ✅: cos =
 0.9997 / LSE exact at SQ ∈ {128, 256, 384, 512} from `frost_dev/_probe_d512_mxfp8.py`,

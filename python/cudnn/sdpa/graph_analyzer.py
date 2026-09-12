@@ -20,7 +20,7 @@ variant-pack resolution and TensorDesc construction.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 import cudnn
@@ -325,6 +325,12 @@ class SdpaGraphFacts:
     descale_s_t: Any = None
     scale_s_t: Any = None
     amax_s_t: Any = None
+    # Softmax accumulation precision the GRAPH asks for, as a cudnn.data_type:
+    # HALF when the graph's intermediate_data_type is HALF (the f16x2 exponent
+    # arm; numerics-changing, so it is a graph attribute and never a tuning
+    # knob), None otherwise (= the f32 pipeline every row runs). Engines whose
+    # capability row does not list the requested precision decline.
+    softmax_precision: Optional[Any] = None
 
 
 def _single_sdpa_node(graph: "cudnn.pygraph") -> Optional[Any]:
@@ -791,7 +797,19 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     node = _single_sdpa_node(graph)
     if node is None:
         return None
-    return _extract_facts(_record_from_node(node))
+    facts = _extract_facts(_record_from_node(node))
+    if facts.invalid is not None:
+        return facts
+    # sdpa(..., softmax_precision=...) is a python-only op attribute (see
+    # _pygraph._CAPTURED_OPS): FLOAT / None is the f32 pipeline every row runs,
+    # HALF asks for the f16 softmax accumulator arm. Numerics-changing, so it
+    # is a fact the capability rows gate on, never a tuning knob.
+    requested = node.params.get("softmax_precision")
+    if requested is None or requested == cudnn.data_type.FLOAT:
+        return facts
+    if requested == cudnn.data_type.HALF:
+        return replace(facts, softmax_precision=cudnn.data_type.HALF)
+    return replace(facts, invalid=f"cudnn.sdpa: softmax_precision must be cudnn.data_type.FLOAT or HALF; got {requested}")
 
 
 # ---------------------------------------------------------------------------
