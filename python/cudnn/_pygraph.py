@@ -2545,12 +2545,18 @@ def _moe_bwd_dweight_dims(node):
 
 
 def _linear_attention_final_state_dims(node):
-    # [N, HO, V, K]
+    # [N, HO, V, K], one row per sequence -- or, when the state is addressed
+    # through a ``state_indices`` pool-slot table, the caller's pool
+    # [N_pool, HO, V, K], since the final state is written back into it in place.
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, max(q[1], v[1]), v[2], q[2]]
+    rows = cu.dim[0] - 1
+    state0 = node.inputs.get("initial_state")
+    if node.inputs.get("state_indices") is not None and state0 is not None and state0.dim:
+        rows = state0.dim[0]
+    return [rows, max(q[1], v[1]), v[2], q[2]]
 
 
 def _linear_attention_summary_final_dims(node):
@@ -2759,7 +2765,7 @@ _STRUCTURED_OPS = {
     # ---- linear attention ----------------------------------------------------
     "gdn": dict(
         node_type=NodeType.GDN,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
         attrs=(
             "scale",
             "output_final_state",

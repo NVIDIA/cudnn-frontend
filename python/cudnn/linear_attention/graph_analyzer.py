@@ -111,6 +111,8 @@ class LaGraphFacts:
 
     # ports present / requested
     has_initial_state: bool = False
+    has_state_indices: bool = False
+    state_indices_dtype: Any = None
     has_a_log: bool = False
     has_dt_bias: bool = False
     wants_d_initial_state: bool = False
@@ -176,6 +178,10 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = f"{node.node_type.name} node '{node.name}' is missing output(s) {missing_out}"
     elif not is_summary and "d_initial_state" in outs and "initial_state" not in ins:
         invalid = "d_initial_state requires initial_state"
+    elif "state_indices" in ins and "initial_state" not in ins:
+        invalid = "state_indices selects rows of the initial_state pool, so it requires initial_state"
+    elif "state_indices" in ins and is_bwd:
+        invalid = "state_indices is a forward-only pool addressing mode"
     elif not safe_gate and ("a_log" in ins or "dt_bias" in ins):
         invalid = "a_log/dt_bias require safe_gate=True"
     elif gate_domain not in ("log", "linear"):
@@ -308,6 +314,8 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         d_a_log_dtype=out_dt.get("d_a_log"),
         d_dt_bias_dtype=out_dt.get("d_dt_bias"),
         has_initial_state="initial_state" in ins,
+        has_state_indices="state_indices" in ins,
+        state_indices_dtype=in_dt.get("state_indices"),
         has_a_log="a_log" in ins,
         has_dt_bias="dt_bias" in ins,
         wants_d_initial_state="d_initial_state" in outs,
