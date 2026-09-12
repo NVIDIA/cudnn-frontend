@@ -28,18 +28,14 @@ from typing import Tuple
 @dataclass(frozen=True)
 class Cfg:
     # --- tile shape ---
-    B_T: int = 64  # chunk size / token tile (the mma N or K of every GEMM)
-    D_K: int = 128  # query/key head dim (contraction of the KK/QK/K*state/Q*state GEMMs, output dim of the KV update)
-    D_V: int = 128  # value head dim (output dim of the K*state/Q*state/U/QKV GEMMs and of the KV update)
-
-    # --- TMA descriptor pool ---
+    B_T: int = 64
 
     # --- warp assignments (12 warps total) ---
-    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # T-pairwise / qk_epi
-    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # kv_decay_v / v-k*state / epi ops
-    LOAD_GATE_WARP_ID: int = 8  # gate chunk loads
+    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)
+    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)
+    LOAD_GATE_WARP_ID: int = 8
     TMA_QKV_WARP_ID: int = 9
-    TCGEN05_MMA_WARP_ID: int = 10  # sole tcgen05 issuer: fused KK/QK pairs + KS/QS/U/QKV/KV per chunk
+    TCGEN05_MMA_WARP_ID: int = 10
     EPILOGUE_WARP_ID: int = 11
 
     # --- register split ---

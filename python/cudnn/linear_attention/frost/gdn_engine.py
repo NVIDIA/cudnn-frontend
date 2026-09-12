@@ -128,10 +128,12 @@ def chunk_factor_pass(
     expand_num,
     device,
     stream,
+    tinv_rows,
+    tinv_row_count,
     publish_desc=True,
 ):
-    """Run the T pass over ``cu`` (compile on the first call; ``workspace`` holds its K tensor map,
-    published by the pass itself or, ``publish_desc=False``, by the caller's prologue) and return its
+    """Run the T pass over ``cu`` (compile on the first call; ``workspace`` holds its per-batch K and tinv
+    descriptor arrays, emitted by the pass itself or, ``publish_desc=False``, by the caller's prologue) and return its
     compiled cache."""
     from .kernel import gdn_tinv_f16 as tinv_module
 
@@ -150,11 +152,26 @@ def chunk_factor_pass(
             allow_neg_eigval=allow_neg_eigval,
             expand_num=expand_num,
             workspace=workspace,
+            row_table=tinv_rows,
+            row_count=tinv_row_count,
             device=device,
             stream=stream,
             publish_desc=publish_desc,
         )
-    tinv_module.run_tinv(cache, k, g, beta, cu, tinv, workspace, stream, a_log=a_log if safe_gate else None, dt_bias=dt_bias if safe_gate else None)
+    tinv_module.run_tinv(
+        cache,
+        k,
+        g,
+        beta,
+        cu,
+        tinv,
+        workspace,
+        stream,
+        a_log=a_log if safe_gate else None,
+        dt_bias=dt_bias if safe_gate else None,
+        row_table=tinv_rows,
+        row_count=tinv_row_count,
+    )
     return cache
 
 
@@ -276,7 +293,6 @@ class CompiledGdn:
             regions.append(("tensormaps", layout.add(self.tensormap_words * 8), "int64", (self.tensormap_words,)))
             regions.append(("scheduler", layout.add(8), "int32", (2,)))
             self.n_tiles = B * HO
-            self.prefill_dynamic_scheduling = self.split or self.n_tiles > self.num_sm
             if self.split:
                 self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
                 self.work_item_rows = max_work_items(total, B, HO, self.ideal, self.b_t, self.num_sm)
@@ -294,8 +310,10 @@ class CompiledGdn:
 
             rows = tinv_module.tinv_rows(self.q_rows, self.num_pieces, self.expand_num, self.b_t)
             regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
-            tinv_words = tensormap_workspace_bytes(tinv_module, 0) // 8
+            tinv_words = tensormap_workspace_bytes(tinv_module, self.num_pieces) // 8
             regions.append(("tinv_tensormaps", layout.add(tinv_words * 8, align=128), "int64", (tinv_words,)))
+            regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
+            regions.append(("tinv_row_count", layout.add(4), "int32", (1,)))
         if self.use_qk_l2norm:
             regions.append(("q_n", layout.add(self.q_rows * HQ * K * 2), self.io_name, (self.q_rows, HQ, K)))
             regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
@@ -352,7 +370,6 @@ class CompiledGdn:
 
         tensormaps = region["tensormaps"]
         scheduler_counter = region["scheduler"]
-        prefill_counter = scheduler_counter if self.prefill_dynamic_scheduling else None
         work_items = region["work_items"]
         work_count = region["work_count"]
         item_scratch = region.get("item_scratch")
@@ -387,7 +404,7 @@ class CompiledGdn:
                 state_checkpoints,
                 work_items,
                 work_count,
-                prefill_counter,
+                scheduler_counter,
                 item_scratch,
                 tensormaps,
                 self.checkpoint,
@@ -436,7 +453,7 @@ class CompiledGdn:
             self.scale,
             work_items=work_items,
             work_count=work_count,
-            scheduler_counter=prefill_counter,
+            scheduler_counter=scheduler_counter,
             checkpoint_every_n_tokens=self.checkpoint,
             output_state_checkpoints=state_checkpoints,
             log_gate=self.log_gate,
@@ -482,6 +499,9 @@ class CompiledGdn:
             work_items_summary=summary_items,
             scheduler=region["scheduler_all"],
             tinv_words=region["tinv_tensormaps"],
+            tinv=tinv,
+            tinv_rows=region["tinv_rows"],
+            tinv_row_count=region["tinv_row_count"],
             summary_words=region.get("fused_tensormaps"),
             prefill_words=region["tensormaps"],
             q=q,
@@ -499,6 +519,8 @@ class CompiledGdn:
             cu_pieces,
             tinv,
             region["tinv_tensormaps"],
+            tinv_rows=region["tinv_rows"],
+            tinv_row_count=region["tinv_row_count"],
             log_gate=self.log_gate,
             safe_gate=self.safe_gate,
             a_log=a_log,
@@ -571,7 +593,7 @@ class CompiledGdn:
                 seed_dtype=str(state0.dtype) if state0 is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, main_rows=region["main_rows"])
         if warm:
             self.kernel.run_prefill(
                 self.kernel_cache,
@@ -700,7 +722,6 @@ class CompiledGdnBwd:
         self.cu_name = "int32" if node.inputs["cu_seqlens"].get_data_type().name == "INT32" else "int64"
 
         self.num_sm = multiprocessor_count(self.device)
-        self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.num_seqs = B
         self.n_heads_out, self.total = HO, total
@@ -850,8 +871,10 @@ class CompiledGdnBwd:
 
             rows = tinv_module.tinv_rows(self.q_rows, self.num_pieces, self.expand_num, self.b_t)
             regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
-            tinv_words = tensormap_workspace_bytes(tinv_module, 0) // 8
+            tinv_words = tensormap_workspace_bytes(tinv_module, self.num_pieces) // 8
             regions.append(("tinv_tensormaps", layout.add(tinv_words * 8, align=128), "int64", (tinv_words,)))
+            regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
+            regions.append(("tinv_row_count", layout.add(4), "int32", (1,)))
         self.needs_table = self.split
         self.recompute_orders = self.needs_recompute and not self.coarse_checkpoints
         self.bwd_orders = not self.recompute_orders
@@ -979,6 +1002,8 @@ class CompiledGdnBwd:
                     cu,
                     tinv,
                     region["tinv_tensormaps"],
+                    tinv_rows=region["tinv_rows"],
+                    tinv_row_count=region["tinv_row_count"],
                     log_gate=self.log_gate,
                     safe_gate=self.safe_gate,
                     a_log=a_log,
@@ -1051,7 +1076,7 @@ class CompiledGdnBwd:
                 dstate_in,
                 work_items,
                 work_count,
-                scheduler_bwd if self.bwd_dynamic_scheduling else None,
+                scheduler_bwd,
                 region["scheduler_all"] if self.bwd_orders else None,
                 region.get("item_scratch") if self.bwd_orders else None,
                 region["tensormaps"],
@@ -1073,6 +1098,8 @@ class CompiledGdnBwd:
                     cu,
                     tinv,
                     region["tinv_tensormaps"],
+                    tinv_rows=region["tinv_rows"],
+                    tinv_row_count=region["tinv_row_count"],
                     log_gate=self.log_gate,
                     safe_gate=self.safe_gate,
                     a_log=a_log,
@@ -1166,7 +1193,7 @@ class CompiledGdnBwd:
                 allow_neg_eigval=self.allow_neg_eigval,
                 work_items=work_items,
                 work_count=work_count,
-                scheduler_counter=scheduler_bwd if self.bwd_dynamic_scheduling else None,
+                scheduler_counter=scheduler_bwd,
                 scheduler_all=region["scheduler_all"] if self.bwd_orders else None,
                 work_item_scratch=region.get("item_scratch") if self.bwd_orders else None,
                 order_in_prologue=self.bwd_orders,
@@ -1257,6 +1284,9 @@ class CompiledGdnBwd:
             series_items=region.get("work_items_recompute"),
             series_count=region.get("work_count_recompute"),
             tinv_words=region["tinv_tensormaps"],
+            tinv=tinv,
+            tinv_rows=region["tinv_rows"],
+            tinv_row_count=region["tinv_row_count"],
             summary_words=region.get("fused_tensormaps"),
             recompute_m_words=region["recompute_tensormaps_m"],
             series_words=region.get("recompute_tensormaps_series"),
@@ -1282,6 +1312,8 @@ class CompiledGdnBwd:
             cu_pieces,
             tinv,
             region["tinv_tensormaps"],
+            tinv_rows=region["tinv_rows"],
+            tinv_row_count=region["tinv_row_count"],
             log_gate=self.log_gate,
             safe_gate=self.safe_gate,
             a_log=a_log,
@@ -1409,7 +1441,7 @@ class CompiledGdnBwd:
                     seed_dtype=str(state0.dtype) if state0 is not None else "float32",
                     device=self.device,
                 )
-            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, cu_pieces=cu_pieces)
+            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, main_rows=region["main_rows"])
 
         if warm:
             self.summary.run_bwd_summary(
@@ -1474,7 +1506,7 @@ class CompiledGdnBwd:
                 seed_dtype=str(dstate_in.dtype) if dstate_in is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_dx_end, dstate_in, None, None, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_dx_end, dstate_in, None, None, stream, main_rows=region["main_rows"])
 
         if not (self.has_state_checkpoints and not self.coarse_checkpoints):
             series_items = region["work_items_recompute"] if self.coarse_checkpoints else work_items
@@ -1754,8 +1786,10 @@ class CompiledGdnSummary:
 
             rows = tinv_module.tinv_rows(total // self.num_householder, self.num_pieces, self.num_householder, self.b_t)
             regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
-            tinv_words = tensormap_workspace_bytes(tinv_module, 0) // 8
+            tinv_words = tensormap_workspace_bytes(tinv_module, self.num_pieces) // 8
             regions.append(("tinv_tensormaps", layout.add(tinv_words * 8, align=128), "int64", (tinv_words,)))
+            regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
+            regions.append(("tinv_row_count", layout.add(4), "int32", (1,)))
         else:
             off_scheduler = layout.add(16)
             tensormap_words = tensormap_workspace_bytes(recompute_module, B) // 8
@@ -1769,8 +1803,10 @@ class CompiledGdnSummary:
 
             rows = tinv_module.tinv_rows(total // self.num_householder, B, self.num_householder, self.b_t)
             regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
-            tinv_words = tensormap_workspace_bytes(tinv_module, 0) // 8
+            tinv_words = tensormap_workspace_bytes(tinv_module, B) // 8
             regions.append(("tinv_tensormaps", layout.add(tinv_words * 8, align=128), "int64", (tinv_words,)))
+            regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
+            regions.append(("tinv_row_count", layout.add(4), "int32", (1,)))
             if self.split:
                 self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
                 self.work_item_rows = max_work_items(total, B, HO, self.ideal, self.b_t, self.num_sm)
@@ -1842,6 +1878,8 @@ class CompiledGdnSummary:
             cu,
             tinv,
             region["tinv_tensormaps"],
+            tinv_rows=region["tinv_rows"],
+            tinv_row_count=region["tinv_row_count"],
             log_gate=self.log_gate,
             safe_gate=self.safe_gate,
             a_log=a_log,
@@ -2020,6 +2058,9 @@ class CompiledGdnSummary:
             work_items=work_items,
             scheduler=region["scheduler_all"],
             tinv_words=region["tinv_tensormaps"],
+            tinv=tinv,
+            tinv_rows=region["tinv_rows"],
+            tinv_row_count=region["tinv_row_count"],
             summary_words=region.get("fused_tensormaps"),
             k=k,
             v=v,
@@ -2033,6 +2074,8 @@ class CompiledGdnSummary:
             cu_pieces,
             tinv,
             region["tinv_tensormaps"],
+            tinv_rows=region["tinv_rows"],
+            tinv_row_count=region["tinv_row_count"],
             log_gate=self.log_gate,
             safe_gate=self.safe_gate,
             a_log=a_log,
@@ -2107,7 +2150,9 @@ class CompiledGdnSummary:
                 summary_dtype=str(transition.dtype) if transition is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_summary, self.num_seqs, state_h, state_m, state_x, state0, final_state, transition, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(
+            self.chain_summary, self.num_seqs, state_h, state_m, state_x, state0, final_state, transition, stream, main_rows=region["main_rows"]
+        )
 
 
 class CompiledGdnSummaryBwd:
@@ -2166,7 +2211,6 @@ class CompiledGdnSummaryBwd:
         self.cu_name = "int32" if node.inputs["cu_seqlens"].get_data_type().name == "INT32" else "int64"
 
         self.num_sm = multiprocessor_count(self.device)
-        self.dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.n_heads_out, self.total = HO, total
         self.num_seqs = B
@@ -2220,8 +2264,10 @@ class CompiledGdnSummaryBwd:
 
             rows = tinv_module.tinv_rows(total // self.num_householder, self.num_pieces, self.num_householder, self.b_t)
             regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
-            tinv_words = tensormap_workspace_bytes(tinv_module, 0) // 8
+            tinv_words = tensormap_workspace_bytes(tinv_module, self.num_pieces) // 8
             regions.append(("tinv_tensormaps", layout.add(tinv_words * 8, align=128), "int64", (tinv_words,)))
+            regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
+            regions.append(("tinv_row_count", layout.add(4), "int32", (1,)))
         else:
             off_scheduler = layout.add(16)
             tensormap_words = tensormap_workspace_bytes(summary_module, B) // 8
@@ -2242,8 +2288,10 @@ class CompiledGdnSummaryBwd:
 
             rows = tinv_module.tinv_rows(total // self.num_householder, B, self.num_householder, self.b_t)
             regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
-            tinv_words = tensormap_workspace_bytes(tinv_module, 0) // 8
+            tinv_words = tensormap_workspace_bytes(tinv_module, B) // 8
             regions.append(("tinv_tensormaps", layout.add(tinv_words * 8, align=128), "int64", (tinv_words,)))
+            regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
+            regions.append(("tinv_row_count", layout.add(4), "int32", (1,)))
         if self.use_qk_l2norm:
             q_rows = total // self.num_householder
             regions.append(("q_n", layout.add(q_rows * HQ * K * 2), self.io_name, (q_rows, HQ, K)))
@@ -2319,6 +2367,8 @@ class CompiledGdnSummaryBwd:
             cu,
             tinv,
             region["tinv_tensormaps"],
+            tinv_rows=region["tinv_rows"],
+            tinv_row_count=region["tinv_row_count"],
             log_gate=self.log_gate,
             safe_gate=self.safe_gate,
             a_log=a_log,
@@ -2359,7 +2409,7 @@ class CompiledGdnSummaryBwd:
                 dstate_in,
                 work_items,
                 work_count,
-                region["scheduler_main"] if self.dynamic_scheduling else None,
+                region["scheduler_main"],
                 region["scheduler_all"],
                 region.get("item_scratch"),
                 region["tensormaps"],
@@ -2408,7 +2458,7 @@ class CompiledGdnSummaryBwd:
             d_final_state=dstate_in,
             work_items=work_items,
             work_count=work_count,
-            scheduler_counter=region["scheduler_main"] if self.dynamic_scheduling else None,
+            scheduler_counter=region["scheduler_main"],
             scheduler_all=region["scheduler_all"],
             work_item_scratch=region.get("item_scratch"),
             order_in_prologue=True,
@@ -2523,6 +2573,9 @@ class CompiledGdnSummaryBwd:
             work_items=work_items,
             scheduler=region["scheduler_all"],
             tinv_words=region["tinv_tensormaps"],
+            tinv=tinv,
+            tinv_rows=region["tinv_rows"],
+            tinv_row_count=region["tinv_row_count"],
             recompute_m_words=region["recompute_tensormaps_m"],
             bprop_summary_words=region["summary_tensormaps"],
             k=k,
@@ -2538,6 +2591,8 @@ class CompiledGdnSummaryBwd:
             cu_pieces,
             tinv,
             region["tinv_tensormaps"],
+            tinv_rows=region["tinv_rows"],
+            tinv_row_count=region["tinv_row_count"],
             log_gate=self.log_gate,
             safe_gate=self.safe_gate,
             a_log=a_log,
@@ -2659,4 +2714,6 @@ class CompiledGdnSummaryBwd:
                 summary_dtype=str(transition.dtype) if transition is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_x, dstate_in, dstate0, transition, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(
+            self.chain_reverse, self.num_seqs, state_g, state_m, state_x, dstate_in, dstate0, transition, stream, main_rows=region["main_rows"]
+        )

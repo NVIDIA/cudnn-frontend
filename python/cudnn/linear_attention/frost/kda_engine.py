@@ -417,7 +417,7 @@ class CompiledKda:
                 stream,
                 own_prologue=False,
             )
-            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, cu_pieces=cu_pieces)
+            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, main_rows=region["main_rows"])
             self.kernel.run_prefill(
                 self.kernel_cache,
                 q,
@@ -488,7 +488,7 @@ class CompiledKda:
             seed_dtype=str(state0.dtype) if state0 is not None else "float32",
             device=self.device,
         )
-        self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, main_rows=region["main_rows"])
         self.kernel_cache = self.kernel.chunk_kda_sm100(
             q,
             k,
@@ -587,7 +587,6 @@ class CompiledKdaBwd:
         self.io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
         self.n_heads_out, self.total = HO, total
         self.num_sm = multiprocessor_count(self.device)
-        self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.num_seqs = B
         self.pieces, self.unit_chunks = choose_pieces(
@@ -836,7 +835,7 @@ class CompiledKdaBwd:
                 dstate_in,
                 work_items,
                 work_count,
-                scheduler_bwd if self.bwd_dynamic_scheduling else None,
+                scheduler_bwd,
                 region["scheduler_all"] if self.has_state_checkpoints else None,
                 region.get("item_scratch") if self.has_state_checkpoints else None,
                 region["bwd_tensormaps"],
@@ -934,7 +933,7 @@ class CompiledKdaBwd:
                 allow_neg_eigval=self.allow_neg_eigval,
                 work_items=work_items,
                 work_count=work_count,
-                scheduler_counter=scheduler_bwd if self.bwd_dynamic_scheduling else None,
+                scheduler_counter=scheduler_bwd,
                 scheduler_all=region["scheduler_all"] if self.has_state_checkpoints else None,
                 work_item_scratch=region.get("item_scratch") if self.has_state_checkpoints else None,
                 order_in_prologue=self.has_state_checkpoints,
@@ -1119,7 +1118,7 @@ class CompiledKdaBwd:
                     seed_dtype=str(state0.dtype) if state0 is not None else "float32",
                     device=self.device,
                 )
-            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, cu_pieces=cu_pieces)
+            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, main_rows=region["main_rows"])
 
         if warm:
             self.summary.run_bwd_summary(
@@ -1188,7 +1187,7 @@ class CompiledKdaBwd:
                 seed_dtype=str(dstate_in.dtype) if dstate_in is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_dx_end, dstate_in, None, None, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_dx_end, dstate_in, None, None, stream, main_rows=region["main_rows"])
 
         if not (self.has_state_checkpoints and not self.coarse_checkpoints):
             series_items = region["work_items_recompute"] if self.coarse_checkpoints else work_items
@@ -1764,7 +1763,9 @@ class CompiledKdaSummary:
                 summary_dtype=str(transition.dtype) if transition is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_summary, self.num_seqs, state_h, state_m, state_x, state0, final_state, transition, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(
+            self.chain_summary, self.num_seqs, state_h, state_m, state_x, state0, final_state, transition, stream, main_rows=region["main_rows"]
+        )
 
 
 class CompiledKdaSummaryBwd:
@@ -1820,7 +1821,6 @@ class CompiledKdaSummaryBwd:
         self.num_seqs = B
         self.dim_k, self.dim_v = K, V
         self.num_sm = multiprocessor_count(self.device)
-        self.dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.pieces, self.unit_chunks = choose_pieces(
             num_seqs=B,
@@ -1966,7 +1966,7 @@ class CompiledKdaSummaryBwd:
                 dstate_in,
                 work_items,
                 work_count,
-                region["scheduler_main"] if self.dynamic_scheduling else None,
+                region["scheduler_main"],
                 region["scheduler_all"],
                 region.get("item_scratch"),
                 region["tensormaps"],
@@ -2022,7 +2022,7 @@ class CompiledKdaSummaryBwd:
             allow_neg_eigval=self.allow_neg_eigval,
             work_items=work_items,
             work_count=work_count,
-            scheduler_counter=region["scheduler_main"] if self.dynamic_scheduling else None,
+            scheduler_counter=region["scheduler_main"],
             scheduler_all=region["scheduler_all"],
             work_item_scratch=region.get("item_scratch"),
             order_in_prologue=True,
@@ -2258,4 +2258,6 @@ class CompiledKdaSummaryBwd:
                 summary_dtype=str(transition.dtype) if transition is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_x, dstate_in, dstate0, transition, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(
+            self.chain_reverse, self.num_seqs, state_g, state_m, state_x, dstate_in, dstate0, transition, stream, main_rows=region["main_rows"]
+        )

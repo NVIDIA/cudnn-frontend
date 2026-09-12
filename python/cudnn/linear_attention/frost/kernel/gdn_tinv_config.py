@@ -26,32 +26,28 @@ from typing import Tuple
 @dataclass(frozen=True)
 class Cfg:
     # --- tile shape ---
-    B_T: int = 64  # chunk size / token tile (the mma M, N of the K K^T GEMM)
-    D_K: int = 128  # default key head dim (contraction of the K K^T GEMM); the per-compile cfg carries 64 or 128
-
-    # --- work split (one CTA per SM, persistent over rows_per_cta tile rows x heads_per_cta heads) ---
-    MAX_ROWS_PER_CTA: int = 128  # sRows capacity; the host picks rows_per_cta <= this for one wave of CTAs
+    B_T: int = 64
 
     # --- warp assignments (12 warps total) ---
-    COMPUTE_GROUP_WARP_IDS: Tuple[Tuple[int, ...], ...] = ((0, 1, 2, 3), (4, 5, 6, 7))  # pair inverses; group g takes pairs g, g + 2, ...
-    TMA_K_WARP_ID: int = 8  # K tile loads
-    TCGEN05_MMA_WARP_ID: int = 9  # sole tcgen05 issuer: the pair's [K0;K1] @ [K0;K1]^T
-    EPILOGUE_WARP_ID: int = 10  # tile stores
-    LOAD_GATE_WARP_ID: int = 11  # gate cumsum + beta loads
+    COMPUTE_GROUP_WARP_IDS: Tuple[Tuple[int, ...], ...] = ((0, 1, 2, 3), (4, 5, 6, 7))
+    TMA_K_WARP_ID: int = 8
+    TCGEN05_MMA_WARP_ID: int = 9
+    EPILOGUE_WARP_ID: int = 10
+    LOAD_GATE_WARP_ID: int = 11
 
     # --- register split ---
-    LAUNCH_REGS: int = 168  # the DSL's per-thread register cap at launch; setmaxregister redistributes it per role
+    LAUNCH_REGS: int = 168
     NUM_REGS_OTHER: int = 96
 
     THREADS_PER_WARP: int = 32
 
     # --- SMEM stage counts ---
-    SMEM_K_STAGES: int = 4  # two-box K stages (32 KB each for bf16/fp16) kept in flight by the TMA warp
-    SMEM_TILE_STAGES: int = 4  # 8 KB tile stages per compute group (finished tiles awaiting the store warp)
-    SMEM_GATE_STAGES: int = 4  # gate cumsum / beta stages per compute group (1 KB each), filled by the gate warp
+    SMEM_K_STAGES: int = 4
+    SMEM_TILE_STAGES: int = 4
+    SMEM_GATE_STAGES: int = 4
 
     # --- TMEM stage counts ---
-    TMEM_ACC_STAGES: int = 4  # 128-column accumulator stages (pair GEMM results awaiting their compute group)
+    TMEM_ACC_STAGES: int = 4
 
     BUFFER_ALIGN_BYTES: int = 1024
 

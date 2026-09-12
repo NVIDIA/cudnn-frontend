@@ -975,14 +975,18 @@ def piece_item_bounds(
     n_heads_out,
     mCuPieces,
     mRowBase,
+    mSlotRows,
     item,
     expand_num: cutlass.Constexpr[int] = 1,
 ):
     """(slot, head, row_start, row_end, num_chunks, final_dst, dstate_dst) of piece-table
     row ``item``: the owning sequence by binary search over ``mRowBase`` (each sequence's
-    first row, ``[num_seqs + 1]``, the chain prologue's piece table), then the slot and head
-    within its block of ``filled_slots * n_heads_out`` rows; the kernel rows are the slot's
-    ``cu_pieces``; the last filled slot stores ``final_state``, slot 0 ``d_initial_state``."""
+    first row in this table, ``[num_seqs + 1]``, the chain prologue's piece table), then the
+    slot and head within its block of ``filled_slots * n_heads_out`` rows; the flat slot is
+    ``item // n_heads_out`` when this IS the main table (``mSlotRows`` None) and otherwise
+    the sequence's first slot ``mSlotRows[seq] // n_heads_out`` (the main table's row bases)
+    plus the slot within the sequence; the kernel rows are the slot's ``cu_pieces``; the
+    last filled slot stores ``final_state``, slot 0 ``d_initial_state``."""
     lo = cutlass.Int32(0)
     hi = cutlass.Int32(mRowBase.shape[0]) - cutlass.Int32(2)
     while lo < hi:
@@ -996,7 +1000,10 @@ def piece_item_bounds(
     slot_in_seq = local // n_heads_out
     head_idx = local - slot_in_seq * n_heads_out
     last = (mRowBase[batch_idx + 1] - mRowBase[batch_idx]) // n_heads_out - cutlass.Int32(1)
-    slot = batch_idx * cutlass.Int32(pieces) + slot_in_seq
+    if cutlass.const_expr(mSlotRows is None):
+        slot = item // n_heads_out
+    else:
+        slot = mSlotRows[batch_idx] // n_heads_out + slot_in_seq
     row_start = load_cu(expand_num, mCuPieces, slot)
     row_end = load_cu(expand_num, mCuPieces, slot + 1)
     num_chunks = cute.ceil_div(row_end - row_start, b_t)
@@ -1018,13 +1025,14 @@ def write_item(
     expand_num: cutlass.Constexpr[int] = 1,
     pieces: cutlass.Constexpr[int] = 0,
     mRowBase=None,
+    mSlotRows=None,
 ):
     """Final-table row ``dst`` from source item ``src``: the walk's staged row, (``gen``) the
     synthesized uncut item ``(0, nc, 0, nc)``, or (``pieces``) the piece item regenerated from
-    ``mCuSeqlens`` (then the piece-wise ``cu_pieces``) and ``mRowBase``."""
+    ``mCuSeqlens`` (then the piece-wise ``cu_pieces``), ``mRowBase`` and ``mSlotRows``."""
     if cutlass.const_expr(pieces > 0):
         slot, head_idx, row_start, row_end, num_chunks, final_dst, dstate_dst = piece_item_bounds(
-            b_t, pieces, n_heads_out, mCuSeqlens, mRowBase, src, expand_num
+            b_t, pieces, n_heads_out, mCuSeqlens, mRowBase, mSlotRows, src, expand_num
         )
         mWorkItems[dst, 0] = slot
         mWorkItems[dst, 1] = head_idx
@@ -1095,7 +1103,6 @@ def gen_interval_items(
 @cute.jit
 def order_body(
     gen: cutlass.Constexpr[bool],
-    has_scheduler: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
     n_threads: cutlass.Constexpr[int],
     order_elements: cutlass.Constexpr[int],
@@ -1115,19 +1122,21 @@ def order_body(
     expand_num: cutlass.Constexpr[int] = 1,
     pieces: cutlass.Constexpr[int] = 0,
     mRowBase: cute.Tensor | None = None,
+    mSlotRows: cute.Tensor | None = None,
 ):
     """Bitonic-sort the staged items by ``compute_end - compute_start``,
     longest first, into ``work_items``; with ``gen`` synthesize the uncut item
     per (batch, head) from ``cu_seqlens`` instead, with ``pieces`` the piece
-    items from the piece-wise ``cu_seqlens`` and the row bases ``mRowBase``
+    items from the piece-wise ``cu_seqlens``, the row bases ``mRowBase`` of this
+    table and the main table's row bases ``mSlotRows`` that number the flat slots
     (``mCount`` holds their number).  Thread 0 also zeroes the
-    scheduler ticket rings.  Caller owns ``sKey``/``sIdx`` (``n_threads *
+    scheduler ticket ring when one is passed.  Caller owns ``sKey``/``sIdx`` (``n_threads *
     order_elements`` Int32 each) and a 2-cell ``sSpread``.  CTA-wide barriers
     inside: every thread of the calling CTA must reach it."""
     capacity = cutlass.const_expr(n_threads * order_elements)
 
     # ---- zero the scheduler ticket rings ---------------------------------------------
-    if cutlass.const_expr(has_scheduler):
+    if cutlass.const_expr(mScheduler is not None):
         if tidx == 0:
             si = cutlass.Int32(0)
             while si < mScheduler.shape[0]:
@@ -1145,7 +1154,7 @@ def order_body(
     if (n > cutlass.Int32(capacity)) or (n <= cutlass.Int32(num_ctas)):
         i = tidx
         while i < n:
-            write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, i, expand_num, pieces, mRowBase)
+            write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, i, expand_num, pieces, mRowBase, mSlotRows)
             i = i + cutlass.Int32(n_threads)
     else:
         if tidx == 0:
@@ -1163,7 +1172,7 @@ def order_body(
             if i < n:
                 if cutlass.const_expr(pieces > 0):
                     slot, head_idx, row_start, row_end, key, final_dst, dstate_dst = piece_item_bounds(
-                        b_t, pieces, n_heads_out, mCuSeqlens, mRowBase, i, expand_num
+                        b_t, pieces, n_heads_out, mCuSeqlens, mRowBase, mSlotRows, i, expand_num
                     )
                 elif cutlass.const_expr(gen):
                     batch_idx, head_idx, batch_start, batch_end, batch_num_chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, i, expand_num)
@@ -1185,7 +1194,7 @@ def order_body(
             # ---- every key equal and nothing to sort ---------------------------------
             i2 = tidx
             while i2 < n:
-                write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i2, i2, expand_num, pieces, mRowBase)
+                write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i2, i2, expand_num, pieces, mRowBase, mSlotRows)
                 i2 = i2 + cutlass.Int32(n_threads)
         else:
             # ---- bitonic sort, descending: k = subsequence width, j = distance -------
@@ -1218,7 +1227,7 @@ def order_body(
                 i = tidx + cutlass.Int32(e * n_threads)
                 if i < n:
                     src = sIdx[i]
-                    write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, src, expand_num, pieces, mRowBase)
+                    write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, src, expand_num, pieces, mRowBase, mSlotRows)
 
 
 @cute.jit
@@ -1233,7 +1242,6 @@ def launch(
     expand_num: cutlass.Constexpr[int],
     warmup_cap: cutlass.Constexpr[int],
     full_scan: cutlass.Constexpr[bool],
-    has_scheduler: cutlass.Constexpr[bool],
     n_heads_out: cutlass.Constexpr[int],
     num_sms: cutlass.Constexpr[int],
     n_tiles: cutlass.Int32,
@@ -1418,7 +1426,7 @@ def build_split_table(
     a_log=None,
     dt_bias=None,
     gate_lower_bound=None,
-    scheduler_counter=None,
+    scheduler_counter,
     split=True,
     expand_num=1,
     stream,
@@ -1479,7 +1487,6 @@ def build_split_table(
         bool(log_gate),
         bool(safe_gate),
         gate_channels,
-        scheduler_counter is not None,
         str(cu_seqlens.dtype),
         str(gate.dtype),
         str(a_log.dtype) if a_log is not None else "none",
@@ -1516,7 +1523,6 @@ def build_split_table(
             int(expand_num),
             warmup_cap,
             full_scan,
-            scheduler_counter is not None,
             int(n_heads_out),
             int(num_sms),
             cutlass.Int32(n_tiles),
@@ -1532,7 +1538,7 @@ def build_split_table(
             item_scratch_c,
             work_items_c,
             work_count_c,
-            from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic() if scheduler_counter is not None else None,
+            from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic(),
             cutlass.Int32(n_scan_ctas),
             cutlass.Int32(n_scan_blocks),
             cutlass.Int32(n_walk_ctas),
