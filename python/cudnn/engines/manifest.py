@@ -34,7 +34,17 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from .engine_ids import FAMILY_BLOCK, FROST_GEMM_ID_BASE, FROST_SDPA_BWD_ID_BASE, FROST_SDPA_FWD_ID_BASE, GDN2_ID_BASE, GDN_ID_BASE, GDP_ID_BASE, KDA_ID_BASE
+from .engine_ids import (
+    FAMILY_BLOCK,
+    FROST_GEMM_ID_BASE,
+    FROST_SDPA_BWD_ID_BASE,
+    FROST_SDPA_FWD_ID_BASE,
+    GDN2_ID_BASE,
+    GDN_ID_BASE,
+    GDP_ID_BASE,
+    KDA_ID_BASE,
+    FROST_CONV_ID_BASE,
+)
 
 _LOG = logging.getLogger("cudnn.engines.manifest")
 
@@ -124,6 +134,7 @@ _ANCHOR_NODE_TO_FAMILY = {
     "MATMUL": "frost_gemm",
     "MATMUL_FP8": "frost_gemm",
     "MOE_GROUPED_MATMUL": "frost_gemm",
+    "CONV_FPROP": "frost_conv",
     "SDPA": "frost_sdpa_fwd",
     "SDPA_FP8": "frost_sdpa_fwd",
     "SDPA_MXFP8": "frost_sdpa_fwd",
@@ -243,6 +254,13 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         # (cudnn.sdpa.bwd.heuristics), so the record pins the kernel.
         heuristics=("cudnn.sdpa.bwd.heuristics", "recommend"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
+    ),
+    EngineFamily(
+        FROST_CONV_ID_BASE,
+        "frost_conv",
+        "cudnn.conv.frost.engine",
+        "FrostConvEngines",
+        slots={"frost_conv": EngineSlot(0, opt_in=True)},
     ),
 )
 

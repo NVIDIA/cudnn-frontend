@@ -1066,7 +1066,16 @@ class pygraph:
         node for at all (GDN/KDA/...) must NOT be lowered — the lowering loop
         silently skips such nodes and would hand C++ an incomplete graph.
         """
+        # The cuDNN backend block-scale descriptor currently accepts the
+        # matrix-style block-size vector, but not the rank-5
+        # (1, C-block, 1, 1, 1) vector used by convolution. Let the Frost
+        # convolution engine consume that public graph directly instead of
+        # failing backend lowering before engine selection. Block-scale matmul
+        # keeps its existing C++ lowering path.
+        has_convolution = any(node.node_type == NodeType.CONV_FPROP for node in self._nodes)
         for node in self._nodes:
+            if has_convolution and node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE and len(node.params.get("block_size") or ()) == 5:
+                return node
             if node.node_type in (NodeType.MATMUL, NodeType.POINTWISE):
                 continue
             spec_entry = _CAPTURED_BY_TYPE.get(node.node_type) or _STRUCTURED_BY_TYPE.get(node.node_type)
