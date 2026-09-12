@@ -22,6 +22,11 @@ class FlashAttentionDSABackwardSm100:
     num_dkv_shards = 1
     q_wave_ctas = 0
     serialize_head_blocks = False
+    initialize_dkv = True
+    finalize_dkv = True
+    run_sum_odo = True
+    run_dsink = True
+    bwd_num_heads = 0
 
     def __init__(
         self,
@@ -562,33 +567,40 @@ class FlashAttentionDSABackwardSm100:
             mKV.shape[0],
             self.acc_dtype,
         )
-        self.initialize_dKV_workspace(mdKV_acc, mKV.shape[0], stream)
+        if cutlass.const_expr(self.initialize_dkv):
+            self.initialize_dKV_workspace(mdKV_acc, mKV.shape[0], stream)
 
         # ============ Sum OdO ============
         sum_OdO_scale = Float32(-1.0)
         LSE_scale = Float32(-math.log2(math.e))
 
-        sum_OdO_grid = self._compute_sum_OdO_grid(problem_shape, self.sum_OdO_block_q)
+        if cutlass.const_expr(self.run_sum_odo):
+            sum_OdO_grid = self._compute_sum_OdO_grid(problem_shape, self.sum_OdO_block_q)
 
-        self.sum_OdO(
-            mOut,
-            mdO,
-            sum_OdO,
-            mLSE,
-            mAttnSink,
-            scaled_LSE,
-            sum_OdO_scale,
-            LSE_scale,
-            problem_shape,
-        ).launch(
-            grid=sum_OdO_grid,
-            block=[self.sum_OdO_num_threads_d, self.sum_OdO_num_threads_q, 1],
-            cluster=[1, 1, 1],
-            stream=stream,
-            min_blocks_per_mp=1,
-        )
+            self.sum_OdO(
+                mOut,
+                mdO,
+                sum_OdO,
+                mLSE,
+                mAttnSink,
+                scaled_LSE,
+                sum_OdO_scale,
+                LSE_scale,
+                problem_shape,
+            ).launch(
+                grid=sum_OdO_grid,
+                block=[self.sum_OdO_num_threads_d, self.sum_OdO_num_threads_q, 1],
+                cluster=[1, 1, 1],
+                stream=stream,
+                min_blocks_per_mp=1,
+            )
 
-        num_head_blocks = cute.ceil_div(problem_shape[3][0], self.block_tile)
+        if cutlass.const_expr(self.bwd_num_heads > 0):
+            bwd_problem_shape = (problem_shape[0], problem_shape[1], problem_shape[2], (self.bwd_num_heads, problem_shape[3][1]))
+        else:
+            bwd_problem_shape = problem_shape
+
+        num_head_blocks = cute.ceil_div(bwd_problem_shape[3][0], self.block_tile)
         q_wave_size = self.q_wave_ctas if cutlass.const_expr(self.q_wave_ctas > 0) else problem_shape[0]
         if cutlass.const_expr(self.serialize_head_blocks):
             num_head_block_phases = num_head_blocks
@@ -599,7 +611,7 @@ class FlashAttentionDSABackwardSm100:
         for q_offset in cutlass.range(0, problem_shape[0], q_wave_size, unroll=1):
             for head_block_offset in cutlass.range(0, num_head_block_phases, unroll=1):
                 self.bwd(
-                    problem_shape,
+                    bwd_problem_shape,
                     QK_tiled_mma,
                     dOV_tiled_mma,
                     dOP_tiled_mma,
@@ -648,7 +660,7 @@ class FlashAttentionDSABackwardSm100:
                     sum_OdO_smem_layout,
                     valid_smem_layout,
                 ).launch(
-                    grid=(q_wave_size, head_blocks_per_launch, problem_shape[3][1]),
+                    grid=(q_wave_size, head_blocks_per_launch, bwd_problem_shape[3][1]),
                     block=[self.threads_per_cta, 1, 1],
                     cluster=[1, 1, 1],
                     smem=self.shared_storage.size_in_bytes(),
@@ -661,26 +673,28 @@ class FlashAttentionDSABackwardSm100:
         self.num_threads_seq = 4 if self.max_topk == 2048 else self.block_seq
         self.convert_elem_per_load = 4
 
-        self.finalize_dKV(mdKV_acc, mdKV, mKV.shape[0], stream)
+        if cutlass.const_expr(self.finalize_dkv):
+            self.finalize_dKV(mdKV_acc, mdKV, mKV.shape[0], stream)
 
-        dSink_grid = (
-            self.dSink_grid_q(problem_shape),
-            problem_shape[3][0],
-            problem_shape[3][1],
-        )
-        self.sum_dSink(
-            sum_OdO,
-            scaled_LSE,
-            mAttnSink,
-            mdSink,
-            problem_shape,
-        ).launch(
-            grid=dSink_grid,
-            block=[self.dSink_num_threads, 1, 1],
-            cluster=[1, 1, 1],
-            stream=stream,
-            min_blocks_per_mp=1,
-        )
+        if cutlass.const_expr(self.run_dsink):
+            dSink_grid = (
+                self.dSink_grid_q(problem_shape),
+                problem_shape[3][0],
+                problem_shape[3][1],
+            )
+            self.sum_dSink(
+                sum_OdO,
+                scaled_LSE,
+                mAttnSink,
+                mdSink,
+                problem_shape,
+            ).launch(
+                grid=dSink_grid,
+                block=[self.dSink_num_threads, 1, 1],
+                cluster=[1, 1, 1],
+                stream=stream,
+                min_blocks_per_mp=1,
+            )
 
     @cute.kernel
     def convert(
