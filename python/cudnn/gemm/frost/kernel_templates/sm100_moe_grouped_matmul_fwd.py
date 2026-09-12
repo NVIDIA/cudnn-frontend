@@ -355,6 +355,7 @@ def _kernel(
         c_dtype=mma_c_dtype,
         n_dim=mma_inst_shape_mnk[1],
         m_dim=mma_inst_shape_mnk[0],
+        k_dim=mma_k_dim,
         a_major=mma_a_major,
         b_major=mma_b_major,
     )

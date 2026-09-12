@@ -827,14 +827,9 @@ def _render_tile_constants_sm100(
         cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
     fallback_cluster = _mixed_cga_fallback(cfg, tmpl.file)
     smem_fixed_reserve = tmpl.smem_fixed_reserve
-    # The 64-byte MMA-inst K exists only for the BLOCK-SCALE MMA; plain matmul
-    # has no such instruction, so a geometry carrying it has no template here.
+    _check_mma_k_dim(chain, cfg)
     # CTAs one MMA instruction spans; 1 on a family whose MMA has no pair.
     ctas_per_mma = cfg.ctas_per_mma
-    if cfg.mma_tile_k_bytes != 32:
-        raise NotImplementedError(
-            f"plain matmul renders one 32-byte MMA-inst K; config {cfg.name!r} " f"has mma_inst_k_bytes={cfg.mma_tile_k_bytes} (block-scale only)"
-        )
     # a_dt/b_dt: GMEM dtypes (what TMA loads). mma_a_dt/mma_b_dt: the MMA
     # instruction dtype — equal to the GMEM dtype (no implicit cast).
     a_dt = chain.matmul.a_dtype
@@ -905,6 +900,7 @@ def _render_tile_constants_sm100(
     lines = [
         f"# Tile config: {cfg.name}",
         f"mma_inst_shape_mnk = {cfg.mma_tile_mnk(elem_bytes)}",
+        f"mma_k_dim = {int(cfg.mma_tile_k_bytes == 64)}",
         f"cta_group = {ctas_per_mma}",
         f"cgrp_tile_mnk = {cfg.cga_tile_mnk(elem_bytes)}",
         # Template `cta_tile_mnk` = per-CTA SMEM/TMA box dims (B's N halved under
@@ -1125,9 +1121,7 @@ def _render_tile_constants_sm120(
     if tmpl.warps_per_cta is not None:
         cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
     if cfg.mma_tile_k_bytes != 32:
-        raise NotImplementedError(
-            f"plain matmul renders one 32-byte MMA-inst K; config {cfg.name!r} " f"has mma_inst_k_bytes={cfg.mma_tile_k_bytes} (block-scale only)"
-        )
+        raise NotImplementedError(f"sm120 matmul requires mma_tile_k_bytes=32; config {cfg.name!r} has {cfg.mma_tile_k_bytes}")
     a_dt = chain.matmul.a_dtype
     b_dt = chain.matmul.b_dtype
     mma_a_dt = _mma_a_dtype(chain)
@@ -3450,6 +3444,27 @@ def _check_mma_n_dim(
 _TMA_BOX_DIM_MAX = 256
 
 
+def _check_mma_k_dim(chain: FusionChain, config: TileConfig) -> None:
+    """Dense MMA K width: shared by candidate enumeration, precheck, and render."""
+    if config.mma_tile_k_bytes == 32:
+        return
+    if config.mma_tile_k_bytes != 64 or config.pipeline != "sm100":
+        raise NotImplementedError(f"plain matmul supports mma_tile_k_bytes=32, or 64 for sm100 FP8; config {config.name!r}")
+    fp8_dtypes = ("fp8_e4m3", "fp8_e5m2")
+    if _mma_a_dtype(chain) not in fp8_dtypes or _mma_b_dtype(chain) not in fp8_dtypes:
+        raise NotImplementedError(f"plain matmul at mma_tile_k_bytes=64 requires FP8 E4M3/E5M2 A and B; config {config.name!r}")
+    from .kernel_registry import MMA_INST_K64_ARCH_RANGES
+
+    arch = _current_arch()
+    if arch is None or not any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES):
+        spans = " or ".join(f"{lo} <= SM < {hi}" for lo, hi in MMA_INST_K64_ARCH_RANGES)
+        active = "unknown" if arch is None else f"sm_{arch}"
+        raise NotImplementedError(f"plain FP8 at mma_tile_k_bytes=64 needs {spans}, but the active GPU is {active}; config {config.name!r}")
+    # Dense K64 uses full M datapaths: hardware M=128 (1CTA) or 256 (2CTA).
+    if config.mma_tile_m != 128:
+        raise NotImplementedError(f"plain FP8 mma_tile_k_bytes=64 requires mma_tile_m=128 per CTA; config {config.name!r}")
+
+
 def _check_dtype_config_compat(
     chain: FusionChain,
     config: TileConfig,
@@ -3457,6 +3472,7 @@ def _check_dtype_config_compat(
     """Reject (chain, config) where the config K_BYTES isn't a multiple of the
     MMA dtype's element width. The config's own SMEM N drives the N-major-B
     swizzle-group check."""
+    _check_mma_k_dim(chain, config)
     mma_dt = _mma_a_dtype(chain)
     elem_bytes = DTYPE_BYTES.get(mma_dt)
     if elem_bytes is None:

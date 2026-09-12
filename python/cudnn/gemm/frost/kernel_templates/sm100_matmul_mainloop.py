@@ -326,7 +326,8 @@ def _kernel(
     sA_elems = cta_tile_mnk[0] * cta_tile_mnk[2]
     sB_elems = cta_tile_mnk[1] * cta_tile_mnk[2]
     smem_a = cutlass.Array(ab_dtype, sA_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024)
-    smem_b = cutlass.Array(ab_dtype, sB_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024)
+    # Mainloop reads B values, so mixed FP8 formats need B's own dtype.
+    smem_b = cutlass.Array(mma_b_dtype, sB_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024)
     if cutlass.const_expr(mainloop_a_cast):
         smem_a_load = cutlass.Array(
             ab_load_a_dtype,
@@ -424,6 +425,7 @@ def _kernel(
         c_dtype=mma_c_dtype,
         n_dim=mma_inst_shape_mnk[1],
         m_dim=mma_inst_shape_mnk[0],
+        k_dim=mma_k_dim,
         a_major=mma_a_major,
         b_major=mma_b_major,
     )

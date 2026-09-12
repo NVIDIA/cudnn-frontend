@@ -4,6 +4,8 @@
 """Benchmark every CATALOG config on a single matmul shape vs cuBLAS.
 
 `--shape` is `B,M,N,K` (B independent same-shape GEMMs; B=1 = plain matmul).
+`--dtype` selects bf16 (default), fp16, fp8 (E4M3 inputs / BF16 output), or
+fp32. FP32 currently runs only the cuBLAS reference: FROST has no FP32 MMA.
 Timing modes: delayed (default) / nsys / events. `--rotate-buffers` defeats
 hot-L2 inflation on small shapes. `--sweep-swap-ab` benchmarks both
 ``swap_ab=False`` and ``swap_ab=True`` for every selected geometry.
@@ -11,6 +13,8 @@ hot-L2 inflation on small shapes. `--sweep-swap-ab` benchmarks both
 specified, the two dimensions form a Cartesian product.
 
     python benchmark/gemm/frost/benchmark_matmul.py --shape 1,8192,8192,8192
+    python benchmark/gemm/frost/benchmark_matmul.py --dtype fp8 --shape 1,4096,4096,4096
+    python benchmark/gemm/frost/benchmark_matmul.py --dtype fp16 --shape 1,4096,4096,4096
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ import cudnn.gemm.frost  # noqa: F401
 import torch
 
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
-from cudnn.gemm.frost.fusion_ir import FusionChain as _FC, MatmulSpec as _MS, OutputSpec as _OS
+from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _candidates
 
 from benchmark_utils import (
@@ -44,24 +48,23 @@ from benchmark_utils import (
     validate_config_variant_args,
 )
 
+_DTYPES = {
+    "bf16": (cudnn.data_type.BFLOAT16, torch.bfloat16),
+    "fp16": (cudnn.data_type.HALF, torch.float16),
+    "fp8": (cudnn.data_type.FP8_E4M3, torch.float8_e4m3fn),
+    "fp32": (cudnn.data_type.FLOAT, torch.float32),
+}
 
-def _build_spec_map():
+
+def _output_dtype(dtype: str) -> str:
+    return "bf16" if dtype == "fp8" else dtype
+
+
+def _build_spec_map(g):
     """Legacy label -> (geometry cfg, cta_group) for every sweepable
     matmul strategy, via the registry funnel. Labels reconstruct the old
     CONFIG_..._Nctamma form so --configs still accepts them."""
-    chain = _FC(
-        matmul=_MS(
-            M=4096,
-            N=4096,
-            K=4096,
-            a_major="k",
-            b_major="k",
-            a_dtype="bf16",
-            b_dtype="bf16",
-            accum_dtype="fp32",
-        ),
-        output_specs=[_OS(source_ref=-1, dtype="bf16")],
-    )
+    chain = analyze(g)
     m = {}
     for t, cfg in _candidates(chain):
         # A family without the CTA-pair axis (sm120) has no cta_group at all.
@@ -85,25 +88,42 @@ def _build_plan(g, cfg, _name):
 # ---------------------------------------------------------------------------
 
 
-def _graph_matmul(batch: int, M: int, N: int, K: int):
+def _graph_matmul(batch: int, M: int, N: int, K: int, dtype: str = "bf16"):
     g = cudnn.pygraph(
-        io_data_type=cudnn.data_type.BFLOAT16,
+        io_data_type=_DTYPES[dtype][0],
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
     A = g.tensor(name="A", dim=[batch, M, K], stride=[M * K, K, 1])
     Bt = g.tensor(name="B", dim=[batch, K, N], stride=[K * N, 1, K])
     C = g.matmul(A=A, B=Bt, name="mm")
-    C.set_output(True)
+    C.set_output(True).set_data_type(_DTYPES[_output_dtype(dtype)][0])
     return g, (A, Bt, C)
 
 
-def _mkdata(batch: int, M: int, N: int, K: int):
+def _mkdata(batch: int, M: int, N: int, K: int, dtype: str = "bf16"):
     torch.manual_seed(0)
-    a = torch.empty(batch, M, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device="cuda")
-    b = torch.empty(batch, N, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device="cuda")
-    c = torch.empty(batch, M, N, dtype=torch.bfloat16, device="cuda")
+    tin, tout = _DTYPES[dtype][1], _DTYPES[_output_dtype(dtype)][1]
+    a = torch.empty(batch, M, K, dtype=torch.int32).random_(-2, 2).to(dtype=tin, device="cuda")
+    b = torch.empty(batch, N, K, dtype=torch.int32).random_(-2, 2).to(dtype=tin, device="cuda")
+    c = torch.empty(batch, M, N, dtype=tout, device="cuda")
     return a, b, c
+
+
+def _make_cublas_call(dtype: str):
+    if dtype != "fp8":
+        return lambda t: torch.matmul(t[0], t[1].transpose(-1, -2), out=t[2])
+
+    # Unit per-tensor scales give an ordinary FP8 GEMM, without block scaling.
+    scale = torch.ones((), dtype=torch.float32, device="cuda")
+
+    def call(t):
+        a, b, c = t
+        # _scaled_mm is 2D-only. Reuse the output buffers for each batch slice.
+        for aa, bb, cc in zip(a, b, c):
+            torch.ops.aten._scaled_mm.out(aa, bb.t(), scale, scale, out_dtype=cc.dtype, use_fast_accum=False, out=cc)
+
+    return call
 
 
 # ---------------------------------------------------------------------------
@@ -111,10 +131,10 @@ def _mkdata(batch: int, M: int, N: int, K: int):
 # ---------------------------------------------------------------------------
 
 
-def _mkdata_pool(batch: int, M: int, N: int, K: int, nbuf: int):
+def _mkdata_pool(batch: int, M: int, N: int, K: int, nbuf: int, dtype: str = "bf16"):
     """`nbuf` independent (a, b, c) triples at distinct GMEM addresses (nbuf<=1
     returns the single base triple)."""
-    a, b, c = _mkdata(batch, M, N, K)
+    a, b, c = _mkdata(batch, M, N, K, dtype)
     pool = [(a, b, c)]
     # Distinct allocations (clone → fresh GMEM); contents don't matter for timing.
     for _ in range(max(0, nbuf - 1)):
@@ -122,9 +142,9 @@ def _mkdata_pool(batch: int, M: int, N: int, K: int, nbuf: int):
     return pool
 
 
-def _per_set_bytes(batch: int, M: int, N: int, K: int) -> int:
-    # BF16 = 2 bytes/elem; a:(batch,M,K) b:(batch,N,K) c:(batch,M,N).
-    return 2 * batch * (M * K + N * K + M * N)
+def _per_set_bytes(batch: int, M: int, N: int, K: int, dtype: str = "bf16") -> int:
+    tin, tout = _DTYPES[dtype][1], _DTYPES[_output_dtype(dtype)][1]
+    return batch * (tin.itemsize * (M * K + N * K) + tout.itemsize * M * N)
 
 
 # ---------------------------------------------------------------------------
@@ -139,22 +159,23 @@ def _nsys_worker(
     iters: int,
     nbuf: int,
     spec_map: dict,
+    dtype: str = "bf16",
 ) -> None:
     """Inner mode re-exec'd under nsys: run each config (and cuBLAS) for
     warmup+iters launches, no timing — nsys captures it. Timed iters rotate
     across the pool; warmup uses a dedicated buffer."""
     B, M, N, K = (int(x) for x in shape.split(","))
-    wa, wb, wc = _mkdata(B, M, N, K)  # dedicated warmup buffer
-    pool = _mkdata_pool(B, M, N, K, nbuf)  # rotation pool for timed iters
+    wa, wb, wc = _mkdata(B, M, N, K, dtype)  # dedicated warmup buffer
+    pool = _mkdata_pool(B, M, N, K, nbuf, dtype)  # rotation pool for timed iters
+    cublas_call = _make_cublas_call(dtype)
 
-    print(f"[worker] shape={B}x{M}x{N}x{K}, configs={len(configs)}, " f"warmup={warmup}, iters={iters}, rotate_buffers={nbuf}")
+    print(f"[worker] shape={B}x{M}x{N}x{K}, dtype={dtype}, configs={len(configs)}, " f"warmup={warmup}, iters={iters}, rotate_buffers={nbuf}")
 
     # 1. cuBLAS.
     for _ in range(warmup):
-        torch.matmul(wa, wb.transpose(-1, -2), out=wc)
+        cublas_call((wa, wb, wc))
     for i in range(iters):
-        a, b, c = pool[i % nbuf]
-        torch.matmul(a, b.transpose(-1, -2), out=c)
+        cublas_call(pool[i % nbuf])
     torch.cuda.synchronize()
 
     # 2. each GEMM config.
@@ -165,7 +186,7 @@ def _nsys_worker(
             continue
         cfg = spec[0]
         try:
-            g, h = _graph_matmul(B, M, N, K)
+            g, h = _graph_matmul(B, M, N, K, dtype)
             plan = _build_plan(g, cfg, name)
             for _ in range(warmup):
                 plan(_vp(h, wa, wb, wc))
@@ -190,15 +211,15 @@ def main() -> int:
         default="1,4096,4096,4096",
         help="B,M,N,K (default 1,4096,4096,4096; B = batch / number of " "independent same-shape GEMMs)",
     )
+    parser.add_argument(
+        "--dtype",
+        choices=tuple(_DTYPES),
+        default="bf16",
+        help="input dtype (default bf16); fp8 = E4M3 with BF16 output; fp32 = FP32 cuBLAS reference only, TF32 disabled",
+    )
     add_sweep_args(parser)
     args = parser.parse_args()
     validate_config_variant_args(parser, args)
-
-    spec_map = expand_config_variants(
-        _build_spec_map(),
-        sweep_swap_ab=args.sweep_swap_ab,
-        sweep_split_k=args.sweep_split_k,
-    )
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
@@ -208,7 +229,21 @@ def main() -> int:
     if len(parts) != 4:
         sys.exit("--shape must be B,M,N,K (four values; use B=1 for a plain matmul)")
     B, M, N, K = parts
-    nbuf = resolve_nbuf(args.rotate_buffers, _per_set_bytes(B, M, N, K))
+    if args.dtype == "fp32":
+        torch.set_float32_matmul_precision("highest")
+    g, _ = _graph_matmul(B, M, N, K, args.dtype)
+    spec_map = expand_config_variants(
+        _build_spec_map(g),
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
+    per_set_bytes = _per_set_bytes(B, M, N, K, args.dtype)
+    nbuf = resolve_nbuf(args.rotate_buffers, per_set_bytes)
+    if args.dtype == "fp32" and not spec_map:
+        print("  [FROST does not support FP32 inputs; running the FP32 cuBLAS reference only (TF32 disabled)]")
+        if args.configs:
+            print("  [--configs ignored: no FROST FP32 configurations]")
+        args.configs = None
 
     if args._nsys_worker:
         configs = (
@@ -221,7 +256,7 @@ def main() -> int:
             if args.configs
             else []
         )
-        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf, spec_map)
+        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf, spec_map, args.dtype)
         return 0
 
     flops = 2 * B * M * N * K
@@ -232,9 +267,12 @@ def main() -> int:
         sweep_split_k=args.sweep_split_k,
     )
 
-    print(f"\n=== matmul B={B} {M}x{N}x{K}  (~{flops / 1e9:.1f} GFLOP) — BF16 ===")
+    dtype_label = "FP8 E4M3 in / BF16 out" if args.dtype == "fp8" else args.dtype.upper()
+    print(f"\n=== matmul B={B} {M}x{N}x{K}  (~{flops / 1e9:.1f} GFLOP) — {dtype_label} ===")
+    if args.dtype == "fp8" and B > 1:
+        print(f"  [FP8 cuBLAS reference: {B} separate GEMM launches per batch]")
 
-    report_pool(nbuf, _per_set_bytes(B, M, N, K))
+    report_pool(nbuf, per_set_bytes)
 
     rows: list[tuple[str, float, float, str]] = []  # (name, tflops, ms, note)
     t0 = time.time()
@@ -247,7 +285,7 @@ def main() -> int:
 
     if args.timing == "nsys":
         print("  [timing: nsys median kernel duration]\n")
-        inner_args = ["--shape", args.shape, "--warmup", str(args.warmup), "--iters", str(args.iters), "--rotate-buffers", str(nbuf)]
+        inner_args = ["--shape", args.shape, "--dtype", args.dtype, "--warmup", str(args.warmup), "--iters", str(args.iters), "--rotate-buffers", str(nbuf)]
         if args.sweep_swap_ab:
             inner_args.append("--sweep-swap-ab")
         if args.sweep_split_k is not None:
@@ -259,6 +297,8 @@ def main() -> int:
         cublas_hit = find_cublas_time(kern_times)
         if cublas_hit:
             cublas_name, cublas_ms = cublas_hit
+            if args.dtype == "fp8":
+                cublas_ms *= B  # nsys reports one 2D _scaled_mm launch.
             cublas_tflops = flops / (cublas_ms * 1e-3) / 1e12
             print(f"  cuBLAS kernel: {cublas_name}")
         else:
@@ -289,13 +329,14 @@ def main() -> int:
                 "includes ~50us/call Python+TVM-FFI dispatch overhead; use "
                 "--timing delayed or --timing nsys for kernel-only timing]\n"
             )
-        wa, wb, wc = _mkdata(B, M, N, K)  # dedicated warmup buffer
-        pool = _mkdata_pool(B, M, N, K, nbuf)  # rotation pool for timed iters
+        wa, wb, wc = _mkdata(B, M, N, K, args.dtype)  # dedicated warmup buffer
+        pool = _mkdata_pool(B, M, N, K, nbuf, args.dtype)  # rotation pool for timed iters
+        cublas_call = _make_cublas_call(args.dtype)
         if args.stream:
             print("  ▶ running cuBLAS reference ...", flush=True)
         cublas_ms = timer(
-            rotating(lambda t: torch.matmul(t[0], t[1].transpose(-1, -2), out=t[2]), pool),
-            lambda: torch.matmul(wa, wb.transpose(-1, -2), out=wc),
+            rotating(cublas_call, pool),
+            lambda: cublas_call((wa, wb, wc)),
             warmup=args.warmup,
             iters=args.iters,
         )
@@ -321,7 +362,7 @@ def main() -> int:
                 if args.stream:
                     print(f"  ▶ running {name} ...", flush=True)
                 try:
-                    g, h = _graph_matmul(B, M, N, K)
+                    g, h = _graph_matmul(B, M, N, K, args.dtype)
                     plan = _build_plan(g, cfg, name)
                     ms = timer(
                         rotating(
