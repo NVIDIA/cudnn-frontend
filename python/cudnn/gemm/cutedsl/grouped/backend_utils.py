@@ -9,6 +9,9 @@ from typing import Iterator, Optional
 
 from cuda.bindings import driver as cuda
 
+from cudnn.api_base import ceil_div
+from cudnn.tensor_adapter import get_device, get_shape, get_strides
+
 
 class GroupedGemmBackend(str, Enum):
     BF16 = "bf16"
@@ -38,6 +41,31 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
         launch_stream = torch.cuda.ExternalStream(handle, device=device)
     with torch.cuda.stream(launch_stream):
         yield
+
+
+def wrapper_operand_meta(tensor):
+    """Everything a wrapper's derivation reads off an operand, and nothing else.
+
+    Deliberately not the object's identity: CPython recycles a freed tensor's address,
+    so an id-keyed memo answers for tensors it never saw. Data pointers are excluded --
+    they vary per call and nothing derived depends on them; execute() re-checks them.
+    """
+    if tensor is None or not hasattr(tensor, "shape"):
+        return tensor
+    device = get_device(tensor)
+    return (get_shape(tensor), get_strides(tensor), tensor.dtype, device.type, device.index)
+
+
+def block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device):
+    """MMA-interleaved (sfd_row, sfd_col) output scale-factor buffers for a (valid_m, n_out) result."""
+    import torch
+
+    mma_permute_order = (3, 4, 1, 5, 2, 0)
+    mma_shape_row = (1, ceil_div(valid_m, 128), ceil_div(ceil_div(n_out, sf_vec_size), 4), 32, 4, 4)
+    mma_shape_col = (1, ceil_div(n_out, 128), ceil_div(ceil_div(valid_m, sf_vec_size), 4), 32, 4, 4)
+    sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=device).permute(mma_permute_order)
+    sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=device).permute(mma_permute_order)
+    return sfd_row_tensor, sfd_col_tensor
 
 
 def select_grouped_gemm_backend(

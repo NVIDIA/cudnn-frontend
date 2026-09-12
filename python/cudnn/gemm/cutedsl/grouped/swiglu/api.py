@@ -967,6 +967,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
         m_aligned,
         discrete_col_sfd,
         prob_tensor is not None,
+        l,
     )
 
     if cache_key in _cache_of_GroupedGemmSwigluSm100Objects:
