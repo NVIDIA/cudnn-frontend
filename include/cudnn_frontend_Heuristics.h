@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <limits>
 #include <vector>
 #include <mutex>
 
@@ -118,7 +120,8 @@ class EngineHeuristics_v8 : public BackendDescriptor {
     std::shared_ptr<const DeviceProperties> device_properties = nullptr;
     std::vector<ManagedOpaqueDescriptor> m_heuristic_results;  //! storage of heuristic results
     std::string opGraphTag;
-    int32_t target_sm_count = -1;
+    int32_t target_sm_count     = -1;
+    int64_t shared_memory_limit = -1;
 
     static std::mutex &
     get_heur_b_mutex() {
@@ -165,6 +168,12 @@ class EngineHeuristicsBuilder_v8 {
     auto
     setSMCount(int32_t sm_count_) -> EngineHeuristicsBuilder_v8 & {
         m_heuristics.target_sm_count = sm_count_;
+        return *this;
+    }
+
+    auto
+    setSharedMemoryLimit(int64_t shared_memory_limit_) -> EngineHeuristicsBuilder_v8 & {
+        m_heuristics.shared_memory_limit = shared_memory_limit_;
         return *this;
     }
     /** @} */
@@ -251,6 +260,27 @@ class EngineHeuristicsBuilder_v8 {
                     "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: SetAttribute CUDNN_ATTR_ENGINEHEUR_SM_COUNT_TARGET Failed");
                 return std::move(m_heuristics);
             };
+        }
+#endif
+
+#if (CUDNN_VERSION >= 92700)
+        // A backend value of zero means no limit was specified. Leave non-positive
+        // frontend limits to the existing engine-config filter so its semantics do not change.
+        if (m_heuristics.shared_memory_limit > 0 && detail::get_backend_version() >= 92700) {
+            auto const shared_memory_limit = static_cast<int32_t>(
+                std::min<int64_t>(m_heuristics.shared_memory_limit, std::numeric_limits<int32_t>::max()));
+            status = detail::set_attribute(m_heuristics.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_ENGINEHEUR_SHARED_MEMORY_LIMIT,
+                                           CUDNN_TYPE_INT32,
+                                           1,
+                                           &shared_memory_limit);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(&m_heuristics,
+                                              status,
+                                              "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: SetAttribute "
+                                              "CUDNN_ATTR_ENGINEHEUR_SHARED_MEMORY_LIMIT Failed");
+                return std::move(m_heuristics);
+            }
         }
 #endif
 
@@ -345,12 +375,14 @@ get_heuristics_list_impl(cudnnBackendHeurMode_t heur_mode,
                          std::function<bool(cudnnBackendDescriptor_t)> filter_fn,
                          int32_t sm_count,
                          EngineConfigList &filtered_configs,
-                         std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
+                         std::shared_ptr<const DeviceProperties> device_properties = nullptr,
+                         int64_t shared_memory_limit                               = -1) {
     auto heuristics = EngineHeuristicsBuilder_v8()
                           .setDeviceProperties(device_properties)
                           .setOperationGraph(opGraph)
                           .setHeurMode(heur_mode)
                           .setSMCount(sm_count)
+                          .setSharedMemoryLimit(shared_memory_limit)
                           .build();
     NV_CUDNN_RETURN_IF_ERROR(heuristics);
     auto num_config = heuristics.getEngineConfigCount();
@@ -370,7 +402,8 @@ get_heuristics_list(std::vector<std::string> const &modes,
                     EngineConfigList &filtered_configs,
                     bool evaluate_all                                         = false,
                     int32_t sm_count                                          = -1,
-                    std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
+                    std::shared_ptr<const DeviceProperties> device_properties = nullptr,
+                    int64_t shared_memory_limit                               = -1) {
     std::vector<cudnnStatus_t> statuses;
 
     // Try building the heuristics for each mode
@@ -380,30 +413,40 @@ get_heuristics_list(std::vector<std::string> const &modes,
             mode.find("heuristics_mode_a") != std::string::npos) {
             auto heur_mode = CUDNN_HEUR_MODE_A;
             NV_CUDNN_FE_TRY();
-            auto status_l =
-                get_heuristics_list_impl(heur_mode, opGraph, filter_fn, sm_count, filtered_configs, device_properties);
+            auto status_l = get_heuristics_list_impl(
+                heur_mode, opGraph, filter_fn, sm_count, filtered_configs, device_properties, shared_memory_limit);
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_l, true);
             NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
 
         } else if (mode.find("heuristics_fallback") != std::string::npos) {
             NV_CUDNN_FE_TRY();
-            auto status_l = get_heuristics_list_impl(
-                CUDNN_HEUR_MODE_FALLBACK, opGraph, filter_fn, sm_count, filtered_configs, device_properties);
+            auto status_l = get_heuristics_list_impl(CUDNN_HEUR_MODE_FALLBACK,
+                                                     opGraph,
+                                                     filter_fn,
+                                                     sm_count,
+                                                     filtered_configs,
+                                                     device_properties,
+                                                     shared_memory_limit);
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_l, true);
             NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
         } else if (mode.find("heuristics_mode_b") != std::string::npos) {
             auto heur_mode = CUDNN_HEUR_MODE_B;
             NV_CUDNN_FE_TRY();
-            auto status_l =
-                get_heuristics_list_impl(heur_mode, opGraph, filter_fn, sm_count, filtered_configs, device_properties);
+            auto status_l = get_heuristics_list_impl(
+                heur_mode, opGraph, filter_fn, sm_count, filtered_configs, device_properties, shared_memory_limit);
 
             // Between cudnn version 8.3 and 8.6, when heur_mode_b heuristics did not succeed,
             // there was no fallback to the instant mode. We are here manually adding instant mode
             // to the heur_mode_b to alleviate this issue.
 #if (CUDNN_VERSION >= 8300) && (CUDNN_VERSION < 8600)
             if (status_l != CUDNN_STATUS_SUCCESS) {
-                status_l = get_heuristics_list_impl(
-                    CUDNN_HEUR_MODE_INSTANT, opGraph, filter_fn, sm_count, filtered_configs, device_properties);
+                status_l = get_heuristics_list_impl(CUDNN_HEUR_MODE_INSTANT,
+                                                    opGraph,
+                                                    filter_fn,
+                                                    sm_count,
+                                                    filtered_configs,
+                                                    device_properties,
+                                                    shared_memory_limit);
             }
 #endif
             NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(status_l, true);
@@ -412,8 +455,8 @@ get_heuristics_list(std::vector<std::string> const &modes,
         }
         catch (cudnn_frontend::cudnnException &) {
             NV_CUDNN_FE_TRY();
-            auto status_ =
-                get_heuristics_list_impl(heur_mode, opGraph, filter_fn, sm_count, filtered_configs, device_properties);
+            auto status_ = get_heuristics_list_impl(
+                heur_mode, opGraph, filter_fn, sm_count, filtered_configs, device_properties, shared_memory_limit);
             statuses.push_back(status_);
             NV_CUDNN_FE_CATCH(NV_CUDNN_SET_STATUS_BREAK_OR_CONTINUE(e.getCudnnStatus(), true));
         }
@@ -433,7 +476,8 @@ get_heuristics_list(std::vector<cudnn_frontend::HeurMode_t> const &modes,
                     EngineConfigList &filtered_configs,
                     bool evaluate_all                                         = false,
                     int32_t sm_count                                          = -1,
-                    std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
+                    std::shared_ptr<const DeviceProperties> device_properties = nullptr,
+                    int64_t shared_memory_limit                               = -1) {
     std::unordered_map<HeurMode_t, std::string> mode_to_string = {
         {HeurMode_t::A, "heuristics_mode_a"},
         {HeurMode_t::B, "heuristics_mode_b"},
@@ -445,8 +489,14 @@ get_heuristics_list(std::vector<cudnn_frontend::HeurMode_t> const &modes,
         return mode_to_string.at(mode);
     });
 
-    return get_heuristics_list(
-        string_modes, opGraph, filter_fn, filtered_configs, evaluate_all, sm_count, device_properties);
+    return get_heuristics_list(string_modes,
+                               opGraph,
+                               filter_fn,
+                               filtered_configs,
+                               evaluate_all,
+                               sm_count,
+                               device_properties,
+                               shared_memory_limit);
 }
 
 template <std::size_t SIZE>
