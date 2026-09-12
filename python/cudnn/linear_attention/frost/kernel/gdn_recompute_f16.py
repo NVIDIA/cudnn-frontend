@@ -57,7 +57,7 @@ TMEM layout (512 columns):
   Y / decayed-U input        64     <-- slot 0 = Y (V - K*state), slot 1 = decayed U (b16)
 
 The chunk factor comes from the tiles of ``gdn_tinv_f16.py`` (same k / gate / beta / cu_seqlens); the TMA warp loads
-one 8192 B tile per chunk into the T_inv ring through the static tinv tensor map.
+one 8192 B tile per chunk into the T_inv ring through the tiles' per-batch tensor map, built by the prologue like K's.
 
 Warp assignments (8 warps = 256 threads):
   warps 0-3     : compute group 1 - state restage/rescale, Y = V - K*state,
@@ -2126,7 +2126,7 @@ def chunk_gdn_recompute_sm100(
             runs; the state is (HO, DK, DK)-shaped.
         tinv: ``(tinv_rows, HO, B_T, B_T)`` io dtype, the chunk-factor tiles of
             ``gdn_tinv_f16.chunk_gdn_tinv_sm100`` (same k / gate / beta / cu_seqlens /
-            expand_num), bulk-loaded one tile per chunk (REQUIRED)
+            expand_num), TMA-loaded one tile per chunk through their per-batch tensor map (REQUIRED)
         expand_num: multiply every device-side ``cu_seqlens`` value by this
             factor (GDP's ``num_householder``-expanded timeline; 1 = off)
         workspace: ``(>= tensormap_workspace_bytes(module, B) // 8,)`` int64,

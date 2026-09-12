@@ -2780,8 +2780,8 @@ def chunk_gdn2_summary_sm100(
     as H and writes M = I.  Tensors share one device with a stride-1 innermost dim; outer strides are free.  safe_gate: gate =
     ``lower_bound * sigmoid(exp(a_log) * (gate + dt_bias))``; use_beta_sigmoid: ``beta`` holds logits; beta_guard: guarded effective beta
     (``common/beta_guard.py``); work_items / work_count: REQUIRED split-K table, an item seeds when ``compute_start == 0`` and stores when
-    ``write_end == batch_num_chunks``; scheduler_counter: zeroed ``[ticket, done]`` scratch enabling the work-stealing scheduler (None keeps
-    the static CTA stride); scheduler_all: the ring the prologue zeroes under order_in_prologue; work_item_scratch: staged items to
+    ``write_end == batch_num_chunks``; scheduler_counter: zeroed ``[ticket, done]`` scratch of the work-stealing scheduler (REQUIRED);
+    scheduler_all: the ring the prologue zeroes under order_in_prologue; work_item_scratch: staged items to
     LPT-order (None synthesizes the uncut table); tensormap_workspace: ``tensormap_workspace_bytes(this module, num_seqs)`` bytes.
     """
     HK = k.shape[1]

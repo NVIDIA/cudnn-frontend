@@ -2691,7 +2691,7 @@ def chunk_kda_summary_sm100(
     else alpha in (0, 1] floored at 1e-10; safe_gate overrides with ``lower_bound * sigmoid(exp(a_log) * (gate + dt_bias))``.
     use_beta_sigmoid: ``beta`` holds io-dtype logits, else fp32 post-sigmoid.  work_items / work_count: REQUIRED; an item seeds when
     ``compute_start == 0`` and stores when ``write_end == batch_num_chunks``.  scheduler_counter: ``[ticket, done]`` work-stealing
-    scratch zeroed before every launch (None: static CTA stride; the ordering prologue zeroes ``scheduler_all``).  work_item_scratch:
+    scratch zeroed before every launch (REQUIRED; the ordering prologue zeroes ``scheduler_all``).  work_item_scratch:
     staged items the prologue LPT-orders (None: uncut table from ``cu_seqlens``).  own_prologue: launch the prologue here."""
     HK = k.shape[1]
     HO = gate.shape[1]
@@ -2819,6 +2819,7 @@ def chunk_kda_summary_sm100(
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_placeholder = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
+        cache["prologue_scheduler_all"] = run_order
         scheduler_placeholder = None
         if run_order:
             scheduler_placeholder = from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic()
@@ -2906,7 +2907,7 @@ def run_summary(
             work_item_scratch,
             work_count,
             work_items,
-            scheduler_all,
+            scheduler_all if cache["prologue_scheduler_all"] else None,
             tensormap_workspace,
             cu_stream,
         )

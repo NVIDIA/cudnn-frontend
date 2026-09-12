@@ -1426,7 +1426,7 @@ def build_split_table(
     a_log=None,
     dt_bias=None,
     gate_lower_bound=None,
-    scheduler_counter=None,
+    scheduler_counter,
     split=True,
     expand_num=1,
     stream,

@@ -2834,11 +2834,10 @@ def chunk_kda_recompute_sm100(
             (b, h) sequence).  Each item computes chunks ``[compute_start, write_end)``
             and writes checkpoints only for ``[write_start, write_end)``.
         work_count: ``(1,)`` int32 device-side item count (REQUIRED)
-        scheduler_counter: ``(2,)`` int32 device scratch ``[ticket, done]`` enabling
-            the dynamic (work-stealing) tile scheduler; must be zeroed before
-            every launch (the split-table stage and the order-generating
-            prologue both zero it when passed as ``scheduler_counter``).
-            None keeps the static CTA stride.
+        scheduler_counter: ``(2,)`` int32 device scratch ``[ticket, done]`` of the
+            work-stealing tile scheduler (REQUIRED); must be zeroed before every
+            launch (the split-table stage and the order-generating prologue both
+            zero it when passed as ``scheduler_counter``).
     """
     HK = k.shape[1]
     HO = gate.shape[1]
@@ -3016,6 +3015,7 @@ def chunk_kda_recompute_sm100(
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_placeholder = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
+        cache["prologue_scheduler_all"] = run_order or gen_intervals
         scheduler_placeholder = None
         if run_order or gen_intervals:
             scheduler_placeholder = from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic()
@@ -3118,7 +3118,7 @@ def run_recompute(
             work_item_scratch,
             work_count,
             work_items,
-            scheduler_all,
+            scheduler_all if cache["prologue_scheduler_all"] else None,
             tensormap_workspace,
             checkpoint_every_n_tokens,
             (seed_span_tokens or seed_every_n_tokens) // CFG.B_T,

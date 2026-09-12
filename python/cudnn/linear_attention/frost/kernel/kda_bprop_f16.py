@@ -4509,6 +4509,7 @@ def chunk_kda_bwd_sm100(
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_placeholder = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
+        cache["prologue_scheduler_all"] = run_order
         scheduler_placeholder = None
         if run_order:
             scheduler_placeholder = from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic()
@@ -4628,7 +4629,7 @@ def run_bwd(
             work_item_scratch,
             work_count,
             work_items,
-            scheduler_all,
+            scheduler_all if cache["prologue_scheduler_all"] else None,
             tensormap_workspace,
             cu_stream,
         )

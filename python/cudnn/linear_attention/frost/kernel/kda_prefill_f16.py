@@ -3124,11 +3124,10 @@ def chunk_kda_sm100(
             (b, h) sequence).  Each item computes chunks ``[compute_start, write_end)``
             and writes O/checkpoints only for ``[write_start, write_end)``.
         work_count: ``(1,)`` int32 device-side item count (REQUIRED)
-        scheduler_counter: ``(2,)`` int32 device scratch ``[ticket, done]`` enabling
-            the dynamic (work-stealing) tile scheduler; must be zeroed before
-            every launch (the split-table stage and the order-generating
-            prologue both zero it when passed as ``scheduler_counter``).
-            None keeps the static CTA stride.
+        scheduler_counter: ``(2,)`` int32 device scratch ``[ticket, done]`` of the
+            work-stealing tile scheduler (REQUIRED); must be zeroed before every
+            launch (the split-table stage and the order-generating prologue both
+            zero it when passed as ``scheduler_counter``).
     """
     HQ = q.shape[1]
     HK = k.shape[1]

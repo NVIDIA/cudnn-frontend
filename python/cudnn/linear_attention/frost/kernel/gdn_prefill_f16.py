@@ -3496,7 +3496,7 @@ def chunk_gdn_sm100(
         dt_bias: ``(HO,)`` float32/bf16/fp16 safe-gate per-head bias, or None for zero bias
         tinv: ``(tinv_rows, HO, B_T, B_T)`` io dtype, the chunk-factor tiles of
             ``gdn_tinv_f16.chunk_gdn_tinv_sm100`` (same k / gate / beta / cu_seqlens /
-            expand_num), bulk-loaded one tile per chunk; or None to build the
+            expand_num), TMA-loaded one tile per chunk through their per-batch tensor map; or None to build the
             chunk factor in compute group 0, which needs ``beta``
         beta: ``(total_tokens, HO)`` update gate, post-sigmoid, or raw logits
             (float32 or the io dtype) when ``use_beta_sigmoid``; required when
