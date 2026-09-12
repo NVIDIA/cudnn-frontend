@@ -55,6 +55,7 @@ import logging
 import os
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -147,9 +148,10 @@ def _dist_version(name: str) -> str:
 def environment_manifest(device: Optional[int] = None) -> Dict[str, str]:
     """Everything a compiled object depends on, as deterministic strings.
 
-    A field that cannot be read becomes ``"unknown"`` -- and is hashed as such,
-    so an environment that cannot identify itself shares nothing with one that
-    can. Never loosen a field to widen hits: a wrong hit is a wrong kernel.
+    A field that cannot be read becomes ``"unknown"``, and :func:`compile_cached`
+    then persists nothing: an environment that cannot identify itself must not
+    share an entry with one that happens to carry the same unknowns. Never
+    loosen a field to widen hits: a wrong hit is a wrong kernel.
     """
     import cudnn
 
@@ -278,7 +280,10 @@ def _export(entry: Path, compiled: Any, key: str, symbol: str, manifest: Dict[st
     if not (env_dir / _MANIFEST).exists():
         _write_atomic(env_dir / _MANIFEST, (_canonical(manifest) + "\n").encode("utf-8"))
     entry.mkdir(parents=True, exist_ok=True)
-    tmp = entry / f".{_OBJECT}.{os.getpid()}.tmp"
+    # Unique per export, not per process: two threads may export the same
+    # entry concurrently (nothing serializes compiles), and a shared temp name
+    # would let one publish the other's half-written object.
+    tmp = entry / f".{_OBJECT}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
     try:
         compiled.export_to_c(str(tmp), function_name=symbol)
         os.replace(tmp, entry / _OBJECT)
@@ -307,6 +312,11 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
     manifest = environment_manifest()
+    if any(v == "unknown" for v in manifest.values()):
+        # An environment that cannot identify itself shares nothing: two
+        # incompatible stacks with the same unknowns would otherwise hash alike.
+        _count("bypassed")
+        return cute.compile(fn, *args, **kwargs)
     entry = _entry_dir(get_cache_dir(), manifest, f"{cache_key}|{symbol}|{options}")
     loaded = _try_load(entry, cache_key, symbol, fn)
     if loaded is not None:

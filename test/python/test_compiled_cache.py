@@ -58,6 +58,20 @@ def test_disabled_or_uncacheable_compiles_as_before(monkeypatch):
     assert len(calls) == 3 and cc.stats()["bypassed"] == 3
 
 
+def test_an_environment_that_cannot_identify_itself_persists_nothing(monkeypatch, tmp_path):
+    import cutlass.cute as cute
+
+    monkeypatch.setattr(cute, "compile", lambda fn, *a, **k: "compiled")
+    monkeypatch.setattr(cc, "environment_manifest", lambda device=None: {"schema": cc._SCHEMA, "cudnn_frontend": "1.30.0", "cuda_driver": "unknown"})
+    cc.set_cache_dir(tmp_path)
+    try:
+        cc.reset_stats()
+        assert cc.compile_cached(lambda x: x, 1, cache_key="k", options="--enable-tvm-ffi") == "compiled"
+    finally:
+        cc.set_cache_dir(None)
+    assert cc.stats()["bypassed"] == 1 and not list(tmp_path.rglob("*"))
+
+
 def test_a_foreign_or_corrupt_entry_is_a_miss(tmp_path):
     cc.reset_stats()
     entry = tmp_path / "e"
