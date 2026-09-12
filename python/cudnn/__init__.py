@@ -144,7 +144,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.29.0"
+__version__ = "1.30.0"
 
 
 def _tensor(
