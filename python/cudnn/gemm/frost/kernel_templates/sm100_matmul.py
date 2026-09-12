@@ -426,6 +426,7 @@ def _kernel(
         m_dim=mma_inst_shape_mnk[0],
         a_major=mma_a_major,
         b_major=mma_b_major,
+        k_dim=mma_k_dim,
     )
 
     # Per-CTA logical tile — the cluster cancels out, so these stay compile-time

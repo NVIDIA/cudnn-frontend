@@ -433,9 +433,9 @@ class CtaPairTileConfig(TileConfig):
 @dataclass(frozen=True)
 class ConfigSm100(CtaPairTileConfig):
     """sm100 geometry — every axis is free, including ``mma_tile_k_bytes``
-    ∈ {32, 64} and the 2-CTA MMA pair. The 64-byte block-scale MMA is SM 10.7+
-    SILICON, so which of the two a given GPU may issue is decided by
-    :func:`validate_block_scale_config`, not by the config family."""
+    ∈ {32, 64} and the 2-CTA MMA pair. The 64-byte dense FP8 / block-scale MMA
+    depends on the active GPU and operand types, checked by the registry's
+    config gates rather than the geometry family."""
 
     MMA_TILE_K_BYTES: ClassVar[tuple[int, ...]] = (32, 64)
     # The widest SMEM row swizzle.
