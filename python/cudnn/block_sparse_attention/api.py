@@ -208,7 +208,7 @@ def block_sparse_attention_forward(
         if isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256:
             raise ValueError("SM90 kv_splits must be an integer in [1, 256]")
 
-    if arch_family in {9, 12} and sparse_block_size != 64:
+    if arch_family == 9 and sparse_block_size != 64:
         raise NotImplementedError(f"SM{arch} only provides a blk64 forward path")
     if arch_family == 9:
         if head_dim not in {64, 96, 128} or value_dim not in {64, 96, 128}:
@@ -218,6 +218,10 @@ def block_sparse_attention_forward(
     elif arch_family == 12:
         if head_dim != 128 or value_dim != 128:
             raise NotImplementedError("SM120 forward requires QK and V dimensions of 128")
+        if sparse_block_size == 128 and q_tensor.dtype != torch.bfloat16:
+            raise NotImplementedError("SM120 blk128 forward requires BF16")
+        if sparse_block_size == 128 and seqlen_k % 128:
+            raise NotImplementedError("SM120 blk128 forward requires seqlen_k to be a multiple of 128")
     elif sparse_block_size == 64:
         if q_tensor.dtype != torch.bfloat16 or head_dim != 128 or value_dim != 128:
             raise NotImplementedError("SM100/SM110 blk64 forward requires BF16 and QK=V=128")
@@ -286,6 +290,21 @@ def block_sparse_attention_forward(
                 raise NotImplementedError("kv_splits is currently exposed only by the SM90 and " "SM100/SM110 blk64 CuTe DSL paths")
             if use_clc is not None:
                 raise NotImplementedError("use_clc is currently exposed only by the SM100/SM110 blk64 CuTe DSL path")
+            if arch_family == 12 and sparse_block_size == 128:
+                from .csrc.fwd.sm120_blk128.metadata import lower_sm120_blk128_metadata
+
+                with torch.cuda.nvtx.range("bsa_sm120_blk128_lower_metadata"):
+                    lowered_metadata = lower_sm120_blk128_metadata(
+                        q2k_block_index,
+                        block_sparse_num,
+                        block_sizes,
+                        q2k_block_nums,
+                        seqlen_q=seqlen_q,
+                    )
+                q2k_block_index = lowered_metadata.q2k_block_index
+                block_sparse_num = lowered_metadata.block_sparse_num
+                block_sizes = lowered_metadata.block_sizes
+                q2k_block_nums = lowered_metadata.q2k_block_nums
             out, lse = _interface.bsa_attn_fwd(
                 q_tensor,
                 k_tensor,
