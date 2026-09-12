@@ -160,7 +160,7 @@ def test_sdpa_fwd_knobs_round_trip():
     # A persisted record is ints; anything that would round-trip to a different
     # native knob than the one recorded is refused rather than coerced.
     assert SdpaFwdKnobs.from_public({kt.PACK_GQA: True}) == SdpaFwdKnobs(pack_gqa=True)
-    for bad in ({kt.PACK_GQA: 2}, {kt.PACK_GQA: "0"}, {kt.TILE_M: 128.0}, {kt.SPLIT_KV: "4"}):
+    for bad in ({kt.PACK_GQA: 2}, {kt.PACK_GQA: "0"}, {kt.TILE_M: 128.0}, {kt.SPLIT_KV: "4"}, {kt.SCHED_POLICY: True}):
         with pytest.raises(ValueError):
             SdpaFwdKnobs.from_public(bad)
     # numerics-changing requests are not knobs: the softmax accumulator precision

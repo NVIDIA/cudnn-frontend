@@ -143,6 +143,8 @@ class SdpaFwdKnobs:
             if field is None:
                 raise ValueError(f"knob {knob.name} is not a tuning axis of the SDPA-forward engines")
             if isinstance(value, bool):
+                if field != "pack_gqa":
+                    raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
                 value = int(value)
             if not isinstance(value, int):
                 # A persisted record carries ints; "0" or 1.0 would round-trip to

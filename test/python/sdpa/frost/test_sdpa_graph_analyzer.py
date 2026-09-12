@@ -594,6 +594,10 @@ def test_softmax_precision_is_an_op_attribute_not_a_knob():
     # The attribute never reaches the cuDNN backend: a SET value makes the node backend-unlowerable.
     assert g_half._unlowerable_node() is not None
     assert _mk_softmax_precision_graph(None)._unlowerable_node() is None
+    # serialize() is the backend format, which has no field for the attribute:
+    # refused rather than emitted as (and later executed as) the f32 pipeline.
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="serialize"):
+        g_half.serialize()
 
 
 def test_knob_request_lpt_sched_is_in_domain():

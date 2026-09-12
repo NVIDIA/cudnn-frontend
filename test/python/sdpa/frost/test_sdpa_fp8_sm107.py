@@ -293,7 +293,11 @@ def test_softmax_precision_is_never_a_heuristic_axis():
         assert "softmax_precision" not in (mismatch(caps, ga.SdpaGraphFacts(**base), None) or "")
     # An explicit HALF request: honored by the row that carries the arm, declined by the one that does not.
     half = ga.SdpaGraphFacts(**base, softmax_precision=_c.data_type.HALF)
-    assert "softmax_precision" not in (mismatch(lit, half, None) or "")
+    # The row that carries the arm reaches the same verdict as for no request,
+    # i.e. the softmax gate (which runs before every other gate) passed. Compared
+    # with the no-request verdict rather than asserted None so the unit stays
+    # device- and DSL-independent (the later gates need both).
+    assert mismatch(lit, half, None) == mismatch(lit, ga.SdpaGraphFacts(**base), None)
     assert "softmax_precision" in mismatch(dark, half, None)
 
 

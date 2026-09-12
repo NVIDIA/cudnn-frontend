@@ -2163,6 +2163,12 @@ class pygraph:
         if self._lowered_graph is None:
             # Serialization is the cuDNN graph format by definition — lower on
             # demand (independent of which plan is selected for execution).
+            node = self._unlowerable_node()
+            if node is not None:
+                # As key(): the format has no field for what the backend cannot
+                # lower, so a blob would silently drop it (a SET softmax_precision
+                # would deserialize as the f32 pipeline).
+                raise cudnn_graph_not_supported(f"serialize() is the cuDNN backend's graph format; the {node.node_type.name} node has no backend lowering")
             self.validate()
             if self._lowered_graph is None:  # python engines registered
                 self._lowered_graph = self._lower_to_cpp()
