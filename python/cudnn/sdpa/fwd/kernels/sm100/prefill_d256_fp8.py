@@ -58,6 +58,7 @@ from cudnn.frost.tile_dsl.barrier import (
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
     read_tile_id_arrive,
+    read_clc_payload,
     SCHED_NATURAL,
 )
 from cudnn.frost.tile_dsl.pointwise import (
@@ -325,10 +326,8 @@ def _scheduler_warp_loop_predecode(
         wait(sched.mb_scheduler.subview(state.idx), state.phase)
 
         payload_base = state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)
-        validity = sched.tile_id_smem.subview(payload_base + cutlass.Int32(2)).load()
+        nxt_q, nxt_hb, validity = read_clc_payload(sched, payload_base)
         if nvvm.elect_sync():
-            nxt_q = sched.tile_id_smem.subview(payload_base + cutlass.Int32(0)).load()
-            nxt_hb = sched.tile_id_smem.subview(payload_base + cutlass.Int32(1)).load()
             q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
                 nxt_q,
                 nxt_hb,
@@ -1105,7 +1104,8 @@ def _tmaldg_warp_group(
 
         wait(mb_decoded.subview(sched_state.idx), sched_state.phase)
         payload_base = sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)
-        nxt_v = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(2)).load())
+        _nq, _nh, nxt_v = read_clc_payload(sched, payload_base)
+        nxt_v = cute.arch.make_warp_uniform(nxt_v)
         q_super_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(3)).load())
         head_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(4)).load())
         batch_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(5)).load())
@@ -1222,7 +1222,7 @@ def _tmastg_warp_group(
 
         wait(mb_decoded.subview(sched_state.idx), sched_state.phase)
         payload_base = sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)
-        nxt_v = sched.tile_id_smem.subview(payload_base + cutlass.Int32(2)).load()
+        _nq, _nh, nxt_v = read_clc_payload(sched, payload_base)
         q_super_idx = sched.tile_id_smem.subview(payload_base + cutlass.Int32(3)).load()
         head_idx = sched.tile_id_smem.subview(payload_base + cutlass.Int32(4)).load()
         batch_idx = sched.tile_id_smem.subview(payload_base + cutlass.Int32(5)).load()
@@ -1500,10 +1500,11 @@ def _mma_warp_group(
         wait(mb_decoded.subview(sched_state.idx), sched_state.phase)
         payload_base = sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)
         if cutlass.const_expr(CFG.MASK_FLAGS == 0 and SPLIT_KV == 1):
-            nxt_v = sched.tile_id_smem.subview(payload_base + cutlass.Int32(2)).load()
+            _nq, _nh, nxt_v = read_clc_payload(sched, payload_base)
             is_valid_tile = nxt_v & cutlass.Int32(1)
         else:
-            nxt_v = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(2)).load())
+            _nq, _nh, nxt_v = read_clc_payload(sched, payload_base)
+            nxt_v = cute.arch.make_warp_uniform(nxt_v)
             is_valid_tile = nxt_v & cutlass.Int32(1)
             kv_left = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(6)).load())
             kv_right = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(9)).load())
@@ -2253,7 +2254,8 @@ def _softmax_warp_group(
 
         wait(mb_decoded.subview(sched_state.idx), sched_state.phase)
         payload_base = sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)
-        nxt_v = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(2)).load())
+        _nq, _nh, nxt_v = read_clc_payload(sched, payload_base)
+        nxt_v = cute.arch.make_warp_uniform(nxt_v)
         q_super_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(3)).load())
         batch_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(5)).load())
         is_valid_tile = nxt_v & cutlass.Int32(1)
@@ -2610,7 +2612,7 @@ def _correction_warp_group(
 
         wait(mb_decoded.subview(sched_state.idx), sched_state.phase)
         payload_base = sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)
-        nxt_v = sched.tile_id_smem.subview(payload_base + cutlass.Int32(2)).load()
+        _nq, _nh, nxt_v = read_clc_payload(sched, payload_base)
         q_super_idx = sched.tile_id_smem.subview(payload_base + cutlass.Int32(3)).load()
         head_idx = sched.tile_id_smem.subview(payload_base + cutlass.Int32(4)).load()
         batch_idx = sched.tile_id_smem.subview(payload_base + cutlass.Int32(5)).load()
