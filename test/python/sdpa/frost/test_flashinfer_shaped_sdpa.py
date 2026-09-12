@@ -11,10 +11,11 @@ equal to the sequence stride) with per-tensor ragged offsets, packed
 forms exist: the legacy element-unit offsets, and the token-unit direct form
 (``cu_seq_len_q/kv`` + ``set_ragged_offset_multiplier``, cuDNN >= 9.24).
 
-Contract under test for the frost plan: accepted at check_support => builds,
-runs, and O / valid LSE rows match the cuDNN backend plan. A decline is xfail
-with the reason (today: the THD stride-order check at b > 1). Known contract
-gaps carry ``xfail(strict=True)`` so a fix flips them loud.
+Contract under test for the frost plan: it serves the graph (FlashInfer is the
+caller this suite exists for, so a decline FAILS), builds, runs, and O / valid
+LSE rows match the cuDNN backend plan. The two known gaps -- the sm100 row's
+THD stride-order decline at b > 1, and the padded LSE rows left unwritten --
+carry ``xfail(strict=True)`` so a fix flips them loud.
 """
 
 from __future__ import annotations
@@ -68,26 +69,47 @@ def _frost_decline_reasons(g) -> str:
 class _Case:
     """One FlashInfer prefill call: lengths, packed buffers, and the graph it builds."""
 
-    def __init__(self, lens_q, lens_kv, *, h_q=8, h_kv=4, d=128, causal=True, tokens_form=False, dtype=torch.bfloat16):
+    def __init__(
+        self,
+        lens_q,
+        lens_kv,
+        *,
+        s_q_max=None,
+        s_kv_max=None,
+        h_q=8,
+        h_kv=4,
+        d=128,
+        d_v=None,
+        causal=True,
+        tokens_form=False,
+        padded_lse=False,
+        dtype=torch.bfloat16,
+    ):
         torch.manual_seed(0)
         dev = torch.device("cuda")
         self.b, self.h_q, self.h_kv, self.d, self.causal, self.tokens_form = len(lens_q), h_q, h_kv, d, causal, tokens_form
+        self.d_v = d if d_v is None else d_v  # FlashInfer's d192/d128 MLA-style shapes split the two
+        # FlashInfer's two Stats bindings: packed (T, h) through ragged stats offsets
+        # (batch_offsets_stats), or the padded (b, s_max, h) buffer with no offsets.
+        self.padded_lse = padded_lse
         self.lens_q = torch.tensor(lens_q, dtype=torch.int32, device=dev)
         self.lens_kv = torch.tensor(lens_kv, dtype=torch.int32, device=dev)
-        self.s_q, self.s_kv = max(lens_q), max(lens_kv)
+        # FlashInfer declares max_token_per_sequence / max_sequence_kv, normally above the longest sequence.
+        self.s_q, self.s_kv = s_q_max or max(lens_q), s_kv_max or max(lens_kv)
+        assert self.s_q >= max(lens_q) and self.s_kv >= max(lens_kv)
         zero = torch.zeros(1, dtype=torch.int32, device=dev)
         self.cu_q = torch.cat([zero, torch.cumsum(self.lens_q, 0).int()])
         self.cu_kv = torch.cat([zero, torch.cumsum(self.lens_kv, 0).int()])
         t_q, t_kv = int(self.cu_q[-1]), int(self.cu_kv[-1])
         self.q = torch.randn(t_q, h_q, d, device=dev, dtype=dtype)
         self.k = torch.randn(t_kv, h_kv, d, device=dev, dtype=dtype)
-        self.v = torch.randn(t_kv, h_kv, d, device=dev, dtype=dtype)
+        self.v = torch.randn(t_kv, h_kv, self.d_v, device=dev, dtype=dtype)
         self.scale = 1.0 / math.sqrt(d)
         self.dtype = dtype
         self.t_q = t_q
 
     def build(self, handle):
-        b, h_q, h_kv, d, s_q, s_kv = self.b, self.h_q, self.h_kv, self.d, self.s_q, self.s_kv
+        b, h_q, h_kv, d, d_v, s_q, s_kv = self.b, self.h_q, self.h_kv, self.d, self.d_v, self.s_q, self.s_kv
         g = cudnn.pygraph(
             handle=handle, io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT
         )
@@ -96,7 +118,7 @@ class _Case:
         # Q: batch stride == one token (h*d) == the s stride; ragged offsets say where each batch starts.
         q = g.tensor(name="q", dim=(b, h_q, s_q, d), stride=(h_q * d, h_stride, s_stride, d_stride), data_type=dt)
         k = g.tensor(name="k", dim=(b, h_kv, s_kv, d), stride=(h_kv * d * s_kv, d, h_kv * d, 1), data_type=dt)
-        v = g.tensor(name="v", dim=(b, h_kv, s_kv, d), stride=(h_kv * d * s_kv, d, h_kv * d, 1), data_type=dt)
+        v = g.tensor(name="v", dim=(b, h_kv, s_kv, d_v), stride=(h_kv * d_v * s_kv, d_v, h_kv * d_v, 1), data_type=dt)
         rq = g.tensor_like(self.cu_q, name="ragged_q")
         rk = g.tensor_like(self.cu_kv, name="ragged_k")
         rv = g.tensor_like(self.cu_kv, name="ragged_v")
@@ -108,7 +130,7 @@ class _Case:
         if self.tokens_form:
             q.set_ragged_offset_multiplier(h_q * d)
             k.set_ragged_offset_multiplier(h_kv * d)
-            v.set_ragged_offset_multiplier(h_kv * d)
+            v.set_ragged_offset_multiplier(h_kv * d_v)
             cu_q = g.tensor_like(self.cu_q, name="cu_seq_lens_q")
             cu_kv = g.tensor_like(self.cu_kv, name="cu_seq_lens_kv")
             cu_q.set_uid(SEQ_Q_UID)
@@ -135,13 +157,15 @@ class _Case:
         ro = g.tensor_like(self.cu_q, name="ragged_o")
         ro.set_uid(RAGGED_O_UID)
         out_t.set_ragged_offset(ro)
-        rs = g.tensor_like(self.cu_q, name="ragged_stats")
-        rs.set_uid(RAGGED_STATS_UID)
-        stats_t.set_ragged_offset(rs)
+        if not self.padded_lse:
+            rs = g.tensor_like(self.cu_q, name="ragged_stats")
+            rs.set_uid(RAGGED_STATS_UID)
+            stats_t.set_ragged_offset(rs)
         if self.tokens_form:
-            out_t.set_ragged_offset_multiplier(h_q * d)
-            stats_t.set_ragged_offset_multiplier(h_q)
-        out_t.set_uid(O_UID).set_output(True).set_dim([b, h_q, s_q, d]).set_stride([s_q * d * h_q, d, d * h_q, 1]).set_data_type(dt)
+            out_t.set_ragged_offset_multiplier(h_q * d_v)
+            if not self.padded_lse:
+                stats_t.set_ragged_offset_multiplier(h_q)
+        out_t.set_uid(O_UID).set_output(True).set_dim([b, h_q, s_q, d_v]).set_stride([s_q * d_v * h_q, d_v, d_v * h_q, 1]).set_data_type(dt)
         stats_t.set_uid(STATS_UID).set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, h_q, s_q, 1]).set_stride([s_q * h_q, 1, h_q, 1])
         for t, uid in ((q, Q_UID), (k, K_UID), (v, V_UID)):
             t.set_uid(uid)
@@ -150,11 +174,17 @@ class _Case:
         return g
 
     def pack(self, out, lse):
-        b, h_q, h_kv, d = self.b, self.h_q, self.h_kv, self.d
+        b, h_q, h_kv, d, d_v = self.b, self.h_q, self.h_kv, self.d, self.d_v
         if self.tokens_form:
-            offs_q, offs_kv, offs_o, offs_s = self.cu_q, self.cu_kv, self.cu_q, self.cu_q
-        else:  # legacy element-unit offsets
-            offs_q, offs_kv, offs_o, offs_s = self.cu_q * (h_q * d), self.cu_kv * (h_kv * d), self.cu_q * (h_q * d), self.cu_q * h_q
+            offs_q, offs_k, offs_v, offs_o, offs_s = self.cu_q, self.cu_kv, self.cu_kv, self.cu_q, self.cu_q
+        else:  # legacy element-unit offsets (batch_offsets_* = cu * (h * d) per tensor)
+            offs_q, offs_k, offs_v, offs_o, offs_s = (
+                self.cu_q * (h_q * d),
+                self.cu_kv * (h_kv * d),
+                self.cu_kv * (h_kv * d_v),
+                self.cu_q * (h_q * d_v),
+                self.cu_q * h_q,
+            )
         pack = {
             Q_UID: self.q,
             K_UID: self.k,
@@ -162,11 +192,12 @@ class _Case:
             O_UID: out,
             STATS_UID: lse,
             RAGGED_Q_UID: offs_q,
-            RAGGED_K_UID: offs_kv,
-            RAGGED_V_UID: offs_kv,
+            RAGGED_K_UID: offs_k,
+            RAGGED_V_UID: offs_v,
             RAGGED_O_UID: offs_o,
-            RAGGED_STATS_UID: offs_s,
         }
+        if not self.padded_lse:
+            pack[RAGGED_STATS_UID] = offs_s
         if self.tokens_form:
             pack[SEQ_Q_UID], pack[SEQ_KV_UID] = self.cu_q, self.cu_kv
         else:
@@ -190,32 +221,79 @@ class _Case:
         except (NotImplementedError, cudnn.cudnnGraphNotSupportedError) as exc:
             return ("declined", "check_support", str(exc))
         g.build_plans()  # accepted above: a failure from here on is the finding, not a decline
-        out = torch.empty_like(self.q)  # packed (T, h, d)
-        lse = torch.empty(self.t_q, self.h_q, device="cuda", dtype=torch.float32)  # packed (T, h) stats
+        out = torch.empty(self.t_q, self.h_q, self.d_v, device="cuda", dtype=self.dtype)  # packed (T, h, d_v)
+        if self.padded_lse:
+            lse = torch.full((self.b, self.s_q, self.h_q), float("nan"), device="cuda", dtype=torch.float32)  # FlashInfer's lse buffer
+        else:
+            lse = torch.empty(self.t_q, self.h_q, device="cuda", dtype=torch.float32)  # packed (T, h) stats
         ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
         g.execute(self.pack(out, lse), ws, handle=handle)
         torch.cuda.synchronize()
         return ("ok", out, lse)
 
 
-def _accept_means_run(case: _Case):
+def _accept_means_run(case: _Case, *, padded_rows_too: bool = True):
+    """The frost plan must serve the graph (a decline is a failure here: FlashInfer
+    is the caller this suite exists for) and match the backend on O and on every
+    valid LSE row. ``padded_rows_too`` also holds the rows past each sequence's
+    length to the backend's value (-inf), the contract of the padded form."""
     ref = case.run(use_frost=False)
     assert ref[0] == "ok", f"the cuDNN backend itself declined this FlashInfer graph: {ref}"
     got = case.run(use_frost=True)
-    if got[0] == "declined":
-        pytest.xfail(f"frost declined at {got[1]}: {got[2][:220]}")
+    assert got[0] == "ok", f"frost declined FlashInfer's graph at {got[1]}: {got[2][:300]}"
     torch.testing.assert_close(got[1].float(), ref[1].float(), atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(got[2], ref[2], atol=2e-3, rtol=2e-3)
+    if not case.padded_lse:
+        torch.testing.assert_close(got[2], ref[2], atol=2e-3, rtol=2e-3)
+        return
+    for i, n in enumerate(case.lens_q.tolist()):
+        torch.testing.assert_close(got[2][i, :n], ref[2][i, :n], atol=2e-3, rtol=2e-3)
+        if padded_rows_too:
+            assert torch.equal(got[2][i, n:], ref[2][i, n:]), f"batch {i}: padded LSE rows differ from the backend's (-inf): {got[2][i, n:n + 4, 0].tolist()}"
 
 
+_XFAIL_THD_BATCH = pytest.mark.xfail(
+    strict=True,
+    reason="sdpa_fwd_prefill_sm100 declines FlashInfer's packed THD at b > 1: BSHD-physical stride-order check on a batch stride that ragged offsets never read",
+)
+_XFAIL_PADDED_LSE = pytest.mark.xfail(strict=True, reason="frost leaves the padded LSE rows of a (b, s_max, h) stats buffer unwritten; the backend writes -inf")
+
+
+@_XFAIL_THD_BATCH
 @pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
 @pytest.mark.parametrize("d", [128, 192])
 def test_ragged_prefill_batch_of_two(form, d):
     """FlashInfer's main prefill path: b > 1 ragged Q/K/V/O with packed stats."""
-    _accept_means_run(_Case([68, 87], [400, 512], d=d, tokens_form=form == "tokens"))
+    _accept_means_run(_Case([68, 87], [400, 512], s_q_max=128, s_kv_max=512, d=d, tokens_form=form == "tokens"))
+
+
+@_XFAIL_THD_BATCH
+@pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
+def test_ragged_prefill_batch_of_two_padded_lse(form):
+    """b > 1 with FlashInfer's padded (b, s_max, h) LSE buffer and no stats offsets: valid rows match."""
+    _accept_means_run(_Case([68, 87], [400, 512], s_q_max=128, s_kv_max=512, tokens_form=form == "tokens", padded_lse=True), padded_rows_too=False)
 
 
 @pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
 def test_ragged_prefill_single_sequence(form):
     """b == 1 (the form frost's THD path serves today): O and packed LSE must match the backend."""
-    _accept_means_run(_Case([68], [400], tokens_form=form == "tokens"))
+    _accept_means_run(_Case([68], [400], s_q_max=87, s_kv_max=512, tokens_form=form == "tokens"))
+
+
+_HEAD_SHAPES = [pytest.param(128, 128, True, id="d128_causal"), pytest.param(192, 128, False, id="d192_128_dense")]
+
+
+@pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
+@pytest.mark.parametrize("d, d_v, causal", _HEAD_SHAPES)
+def test_ragged_prefill_single_sequence_padded_lse_valid_rows(form, d, d_v, causal):
+    """b == 1, padded LSE buffer: the valid rows match the backend."""
+    _accept_means_run(
+        _Case([68], [400], s_q_max=87, s_kv_max=512, d=d, d_v=d_v, causal=causal, tokens_form=form == "tokens", padded_lse=True), padded_rows_too=False
+    )
+
+
+@_XFAIL_PADDED_LSE
+@pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
+@pytest.mark.parametrize("d, d_v, causal", _HEAD_SHAPES)
+def test_ragged_prefill_single_sequence_padded_lse_rows(form, d, d_v, causal):
+    """b == 1, padded LSE buffer: the rows past the sequence length hold the backend's -inf."""
+    _accept_means_run(_Case([68], [400], s_q_max=87, s_kv_max=512, d=d, d_v=d_v, causal=causal, tokens_form=form == "tokens", padded_lse=True))
