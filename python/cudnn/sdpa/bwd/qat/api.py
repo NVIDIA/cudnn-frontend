@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public API for the Triton NVFP4 QAT attention backward kernels."""
+"""Public API for NVFP4 QAT attention backward kernels."""
 
 from __future__ import annotations
 
@@ -14,9 +14,21 @@ import torch
 
 from cudnn.api_base import APIBase, TupleDict
 
-from ._workspace import nvfp4_workspace_layout
+from ._workspace import frost_workspace_layout, nvfp4_workspace_layout
 
 _SUPPORTED_CAPABILITIES = {(10, 0), (10, 3), (12, 0), (12, 1)}
+
+
+def _validate_backend_options(backend, head_chunk, workspace_limit_bytes):
+    """Validate before wrapper cache lookup too (bool/int keys compare equal)."""
+    if backend not in ("auto", "triton", "frost"):
+        raise ValueError("backend must be 'auto', 'triton', or 'frost'")
+    if type(head_chunk) is not int or head_chunk < 0:
+        raise ValueError("head_chunk must be a nonnegative integer")
+    if backend == "triton" and head_chunk != 0:
+        raise ValueError("head_chunk requires backend='auto' or 'frost'")
+    if workspace_limit_bytes is not None and (type(workspace_limit_bytes) is not int or workspace_limit_bytes < 0):
+        raise ValueError("workspace_limit_bytes must be a nonnegative integer or None")
 
 
 @contextmanager
@@ -44,6 +56,9 @@ class Nvfp4AttentionQatBackward(APIBase):
     storage. ``lse`` is the natural-log softmax statistic with shape
     ``(B, H, S_q)``. The caller supplies output tensors and a byte workspace to
     :meth:`execute`; the convenience wrapper below owns those allocations.
+    ``backend="auto"`` prefers FROST, built with CuTe DSL, and selects Triton
+    when FROST cannot serve the declaration. Explicit backend names force a
+    route. Selection occurs during :meth:`check_support`, never at execute time.
     """
 
     def __init__(
@@ -57,6 +72,9 @@ class Nvfp4AttentionQatBackward(APIBase):
         *,
         is_causal: bool = False,
         softmax_scale: Optional[float] = None,
+        backend: str = "auto",
+        head_chunk: int = 0,
+        workspace_limit_bytes: Optional[int] = None,
     ):
         """Capture the tensor contract and compile-time attention options."""
         super().__init__()
@@ -71,9 +89,48 @@ class Nvfp4AttentionQatBackward(APIBase):
         self.softmax_scale = None if softmax_scale is None else float(softmax_scale)
         self._workspace_bytes: Optional[int] = None
         self._launch_config: Optional[tuple[int, int, int, int, int]] = None
+        self.backend = backend
+        self.head_chunk = head_chunk
+        self.workspace_limit_bytes = workspace_limit_bytes
+        self._selected_backend: Optional[str] = None
+        self._selected_head_chunk = 0
+        self._fallback_reason: Optional[str] = None
+
+    @property
+    def selected_backend(self) -> Optional[str]:
+        """Resolved backend, or ``None`` before successful support checking."""
+        return self._selected_backend
+
+    @property
+    def selected_head_chunk(self) -> int:
+        """Resolved FROST head chunk; zero before selection or for Triton."""
+        return self._selected_head_chunk
+
+    @property
+    def fallback_reason(self) -> Optional[str]:
+        """Why auto selected Triton, or ``None`` for a forced or FROST route."""
+        return self._fallback_reason
+
+    def _frost_support_reason(self, capability) -> Optional[str]:
+        """Known support rejections only; never import the version-specific kernel."""
+        batch, _, sequence, _ = self.q_desc.shape
+        if capability != (10, 0):
+            return "NVFP4 QAT FROST backend currently supports SM100"
+        if batch != 1 or self.is_causal:
+            return "NVFP4 QAT FROST backend requires B=1 and noncausal attention"
+        if sequence != self.k_desc.shape[2] or sequence % 256 != 0:
+            return "NVFP4 QAT FROST backend requires equal sequence lengths divisible by 256"
+        from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state
+
+        if not cutedsl_state()[0]:
+            return "NVFP4 QAT FROST backend requires nvidia-cutlass-dsl >= 4.7.0"
+        return cutedsl_requirement_error("NVFP4 QAT FROST backend")
 
     def check_support(self) -> bool:
-        """Validate the contract and derive workspace and launch metadata."""
+        """Validate once, resolve the backend, and freeze workspace/launch metadata."""
+        if self._is_supported:
+            return True
+        _validate_backend_options(self.backend, self.head_chunk, self.workspace_limit_bytes)
         activations = (
             self.q_desc,
             self.k_desc,
@@ -93,6 +150,7 @@ class Nvfp4AttentionQatBackward(APIBase):
         batch, heads, seqlen_q, head_dim = self.q_desc.shape
         batch_k, heads_k, seqlen_kv, head_dim_k = self.k_desc.shape
         self._value_error_if(min(batch, heads, seqlen_q, seqlen_kv) < 1, "B, H, S_q, and S_kv must be positive")
+        self._value_error_if(self.head_chunk != 0 and heads % self.head_chunk != 0, "head_chunk must divide the head count")
         self._value_error_if((batch_k, heads_k) != (batch, heads), "q and k must have matching batch and head counts")
         self._value_error_if(self.v_desc.shape != self.k_desc.shape, "v must have the same shape as k")
         self._value_error_if(head_dim != 128 or head_dim_k != 128, f"NVFP4 attention QAT backward requires D=128, got {head_dim} and {head_dim_k}")
@@ -116,11 +174,35 @@ class Nvfp4AttentionQatBackward(APIBase):
             self.softmax_scale = 1.0 / math.sqrt(head_dim)
         self._value_error_if(not math.isfinite(self.softmax_scale) or self.softmax_scale <= 0.0, "softmax_scale must be finite and positive")
 
+        reason = None
+        if self.backend != "triton":
+            reason = self._frost_support_reason(capability)
+            if reason is None:
+                # Sizes only (shared layout helper, no kernel import): O(S) and
+                # independent of head_chunk, which only sets the launch granularity.
+                _, required = frost_workspace_layout(heads, seqlen_q)
+                chunk = self.head_chunk or heads
+                if self.workspace_limit_bytes is not None and required > self.workspace_limit_bytes:
+                    reason = f"NVFP4 QAT FROST workspace does not fit workspace_limit_bytes={self.workspace_limit_bytes}"
+                else:
+                    self._workspace_bytes = required
+                    self._selected_backend = "frost"
+                    self._selected_head_chunk = chunk
+                    self._is_supported = True
+                    self._logger.info("NVFP4 QAT selected FROST (head_chunk=%s, workspace_bytes=%s)", chunk, required)
+                    return True
+            if self.backend == "frost":
+                raise NotImplementedError(reason)
+
         _, self._workspace_bytes = nvfp4_workspace_layout(
             self.q_desc.shape,
             self.k_desc.shape,
             self.v_desc.shape,
             self.lse_desc.shape,
+        )
+        self._not_implemented_error_if(
+            self.workspace_limit_bytes is not None and self._workspace_bytes > self.workspace_limit_bytes,
+            f"NVFP4 QAT Triton requires {self._workspace_bytes} workspace bytes, exceeding workspace_limit_bytes={self.workspace_limit_bytes}",
         )
 
         optimized_sm100 = capability == (10, 0) and not self.is_causal and seqlen_kv % 16 == 0
@@ -130,12 +212,21 @@ class Nvfp4AttentionQatBackward(APIBase):
         dq_num_stages = 2 if optimized_sm100 else fallback_stages
         dkdv_num_stages = 3 if optimized_sm100 else fallback_stages
         self._launch_config = (block_size, block_size, num_warps, dq_num_stages, dkdv_num_stages)
+        self._selected_backend = "triton"
+        self._fallback_reason = reason
         self._is_supported = True
+        self._logger.info("NVFP4 QAT selected Triton (reason=%s)", reason or "explicit backend")
         return True
 
     def compile(self) -> None:
-        """Compile the shape- and architecture-specialized Triton kernels."""
+        """Prepare the selected backend without launching kernels."""
         self._ensure_support_checked()
+        if self.selected_backend == "frost":
+            from ._frost import PreparedBackward
+
+            with torch.cuda.device(self.q_desc.device):
+                self._compiled_kernel = PreparedBackward.compile(self.q_desc.shape[1], self.q_desc.shape[2], self.selected_head_chunk)
+            return
         assert self.softmax_scale is not None
         assert self._launch_config is not None
         block_m, block_n, num_warps, dq_num_stages, dkdv_num_stages = self._launch_config
@@ -227,6 +318,22 @@ class Nvfp4AttentionQatBackward(APIBase):
         assert scale is not None
         if not math.isfinite(scale) or scale <= 0.0:
             raise ValueError("softmax_scale must be finite and positive")
+        if self.selected_backend == "frost":
+            with _stream_context(current_stream, q_tensor.device):
+                self._compiled_kernel.execute(
+                    q_tensor,
+                    k_tensor,
+                    v_tensor,
+                    high_precision_o_tensor,
+                    do_tensor,
+                    lse_tensor,
+                    dq_tensor,
+                    dk_tensor,
+                    dv_tensor,
+                    workspace,
+                    scale,
+                )
+            return
         assert self._launch_config is not None
         block_m, block_n, num_warps, dq_num_stages, dkdv_num_stages = self._launch_config
 
@@ -272,21 +379,28 @@ def nvfp4_attention_qat_backward(
     dk_tensor: Optional[torch.Tensor] = None,
     dv_tensor: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
+    backend: str = "auto",
+    head_chunk: int = 0,
+    workspace_limit_bytes: Optional[int] = None,
 ) -> TupleDict:
     """Compute STE gradients for NVFP4 fake-quantized scaled dot-product attention.
 
     ``high_precision_o_tensor`` is the forward ``softmax(QK^T) @ V`` value
     formed from fake-quantized Q/K/V before probability fake quantization.
     ``lse_tensor`` is the matching natural-log softmax statistic.
+    ``backend="auto"`` prefers FROST and selects Triton for known unsupported
+    declarations. Explicit ``"frost"``/``"triton"`` force a backend. An optional
+    ``workspace_limit_bytes`` bounds scratch, not total process memory.
     """
 
     if q_tensor.ndim != 4:
         raise ValueError(f"q must be rank-4 BHSD, got shape {tuple(q_tensor.shape)}")
+    _validate_backend_options(backend, head_chunk, workspace_limit_bytes)
     requested_scale = None if softmax_scale is None else float(softmax_scale)
     key = tuple(
         (tensor.device, tuple(tensor.shape), tensor.dtype, tuple(tensor.stride()))
         for tensor in (q_tensor, k_tensor, v_tensor, high_precision_o_tensor, do_tensor, lse_tensor)
-    ) + (bool(is_causal),)
+    ) + (bool(is_causal), backend, head_chunk, workspace_limit_bytes)
     op = _OBJECT_CACHE.get(key)
     if op is not None:
         _OBJECT_CACHE.move_to_end(key)
@@ -300,6 +414,9 @@ def nvfp4_attention_qat_backward(
             lse_tensor,
             is_causal=is_causal,
             softmax_scale=requested_scale,
+            backend=backend,
+            head_chunk=head_chunk,
+            workspace_limit_bytes=workspace_limit_bytes,
         )
         op.check_support()
         op.compile()
