@@ -3,7 +3,11 @@
 
 import json
 
-import cudnn_repro.log_parser as log_parser
+import pytest
+
+import cudnn.repro.log_parser as log_parser
+
+pytestmark = pytest.mark.L0
 
 
 def payload(gid, tag, dtype):

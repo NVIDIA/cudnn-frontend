@@ -22,6 +22,7 @@ def main() -> None:
     """Main entry point for the repro tool."""
     parser = argparse.ArgumentParser(description="Generate pytest sdpa repro command from cuDNN Frontend log.")
     parser.add_argument("logfile", help="Path to sdpa log (use '-' to read from stdin)")
+    parser.add_argument("output", nargs="?", help="Write the command(s) here instead of stdout")
     parser.add_argument("--all", action="store_true", help="Emit commands for every context entry (default: only the last one)")
     args = parser.parse_args()
     debug_repro = os.environ.get("CUDNN_DEBUG_REPRO", "0") == "1"
@@ -33,6 +34,7 @@ def main() -> None:
 
     selected = entries if args.all else [entries[-1]]
     full_log_text = "\n".join(lines)
+    commands = []
 
     for idx, (raw_line, payload) in enumerate(selected):
         operation = operations.select_operation(payload)
@@ -40,14 +42,19 @@ def main() -> None:
         seed = annotated_payload.get("repro_metadata", {}).get("rng_data_seed")
         cfg = operation.build_cfg(raw_line, annotated_payload, seed)
         command = repro_command.build_pretty_command(cfg)
+        commands.append(command)
 
-        print(command)
+        if not args.output:
+            print(command)
 
         if debug_repro:
             suffix = f"_{idx}" if args.all else ""
             utils.try_write_text(Path(f"cudnn_repro_log{suffix}.txt"), full_log_text)
             utils.try_write_text(Path(f"cudnn_repro_payload{suffix}.json"), utils.format_json_pretty(annotated_payload))
             utils.try_write_text(Path(f"cudnn_repro_command{suffix}.txt"), command)
+
+    if args.output:
+        Path(args.output).write_text("\n\n".join(commands) + "\n")
 
 
 if __name__ == "__main__":

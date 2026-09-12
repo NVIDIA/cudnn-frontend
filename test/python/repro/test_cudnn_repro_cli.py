@@ -5,11 +5,12 @@ import json
 import os
 import subprocess
 import sys
-from pathlib import Path
+
+import pytest
 
 from .helpers import tensor_list
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+pytestmark = pytest.mark.L0
 
 
 def fwd_payload(gid, diagonal_alignment):
@@ -53,11 +54,10 @@ def write_log(tmp_path):
 
 def run_cli(tmp_path, *args, debug=False):
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(PACKAGE_ROOT)
     if debug:
         env["CUDNN_DEBUG_REPRO"] = "1"
     return subprocess.run(
-        [sys.executable, "-m", "cudnn_repro", *args],
+        [sys.executable, "-m", "cudnn.repro", *args],
         cwd=tmp_path,
         env=env,
         check=True,
@@ -84,6 +84,30 @@ def test_cli_all_emits_every_context_entry(tmp_path):
     assert proc.stdout.count("test/python/test_mhas_v2.py::test_repro") == 2
     assert "cudnn.diagonal_alignment.TOP_LEFT" in proc.stdout
     assert "cudnn.diagonal_alignment.BOTTOM_RIGHT" in proc.stdout
+
+
+def test_cli_output_file_replaces_stdout(tmp_path):
+    log_path = write_log(tmp_path)
+    out_path = tmp_path / "repro.sh"
+
+    proc = run_cli(tmp_path, str(log_path), str(out_path))
+
+    assert proc.stdout == ""
+    written = out_path.read_text()
+    assert written.count("test/python/test_mhas_v2.py::test_repro") == 1
+    assert "cudnn.diagonal_alignment.BOTTOM_RIGHT" in written
+
+
+def test_cli_output_file_all_holds_every_command(tmp_path):
+    log_path = write_log(tmp_path)
+    out_path = tmp_path / "repro.sh"
+
+    run_cli(tmp_path, "--all", str(log_path), str(out_path))
+
+    written = out_path.read_text()
+    assert written.count("test/python/test_mhas_v2.py::test_repro") == 2
+    assert "cudnn.diagonal_alignment.TOP_LEFT" in written
+    assert "cudnn.diagonal_alignment.BOTTOM_RIGHT" in written
 
 
 def test_cli_debug_writes_default_files(tmp_path):
