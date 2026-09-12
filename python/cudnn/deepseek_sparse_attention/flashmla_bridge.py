@@ -1,0 +1,780 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Current FlashMLA provider for semantic cuDNN DSA training APIs.
+
+This module does not contain or vendor a sparse-attention forward kernel.  It
+dynamically calls ``flash_mla.flash_mla_sparse_fwd`` from the external,
+MIT-licensed `deepseek-ai/FlashMLA <https://github.com/deepseek-ai/FlashMLA>`_
+package, then connects its ``out`` and KV-only ``lse`` to the cuDNN Frontend
+DSA backward and score-recompute APIs.
+
+The adapter was developed against upstream FlashMLA commit
+``15f13e5030374295491c5ce31b02d7e63a7772c6``.  FlashMLA remains a separate,
+optional dependency; no FlashMLA or vLLM implementation source is copied into
+cuDNN Frontend.
+
+The initial contract is deliberately narrow: exact SM100 (validated on B200),
+BF16, one flat MQA KV stream, QK dimension 512 or 576, V dimension 512, and
+16/32/64/128 query heads.  FlashMLA itself launches 64- or 128-head kernels, so smaller
+cuDNN backward head counts are zero-padded to 64 for forward and sliced back
+before returning.  KV and aligned raw-forward Top-K inputs without lengths use
+zero-copy singleton-head views.  Length-bearing forward, safe-default training,
+and score-recompute calls materialize safety-normalized indices because the
+provider may speculatively read an inactive valid suffix and its invalid-index
+contract is wider than the current cuDNN backward contract.  Training callers
+with an explicitly trusted compact producer may bypass that metadata work.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from importlib import import_module, metadata as importlib_metadata
+from inspect import getsourcefile, signature
+from numbers import Real
+from pathlib import Path
+from typing import Any, Callable, Optional, Tuple
+
+import torch
+
+from cudnn.api_base import TupleDict
+
+_FLASHMLA_REVISION = "15f13e5030374295491c5ce31b02d7e63a7772c6"
+_FLASHMLA_DISTRIBUTION_VERSION = "1.0.0+15f13e5"
+_FLASHMLA_INSTALL_HINT = (
+    f"Install official deepseek-ai/FlashMLA revision {_FLASHMLA_REVISION}, whose "
+    f"distribution version is {_FLASHMLA_DISTRIBUTION_VERSION}, and make sure its "
+    "compiled extension is importable in this Python environment."
+)
+_SM100_CAPABILITY = (10, 0)
+_SUPPORTED_HEADS = (16, 32, 64, 128)
+_SUPPORTED_HEAD_DIMS = (512, 576)
+_VALUE_DIM = 512
+_MAX_C_STRIDE = (1 << 31) - 1
+_SCORE_TOPK_TILE = 128
+_FLASHMLA_SPARSE_FWD_CALL = "(q, kv, indices, *, sm_scale, d_v, attn_sink, topk_length)"
+_validated_flashmla_sparse_fwd: Optional[Callable[..., Any]] = None
+
+
+class SparseAttentionBackendUnavailableError(RuntimeError):
+    """No compatible sparse-attention forward backend is available."""
+
+
+@dataclass(frozen=True)
+class _FlashMLASparseForwardPlan:
+    """Host-side launch adaptation for the external FlashMLA kernel."""
+
+    num_heads: int
+    launch_num_heads: int
+    head_dim: int
+    value_dim: int
+    topk: int
+    launch_topk: int
+    topk_tile: int
+
+    @property
+    def pads_heads(self) -> bool:
+        return self.launch_num_heads != self.num_heads
+
+    @property
+    def pads_topk(self) -> bool:
+        return self.launch_topk != self.topk
+
+
+@dataclass(frozen=True)
+class _FlashMLALaunchInputs:
+    q: torch.Tensor
+    kv: torch.Tensor
+    indices: torch.Tensor
+    attn_sink: Optional[torch.Tensor]
+    topk_length: Optional[torch.Tensor]
+    plan: _FlashMLASparseForwardPlan
+
+
+def _require_plain_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    return value
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _plan_flashmla_sparse_forward(
+    num_heads: int,
+    head_dim: int,
+    topk: int,
+) -> _FlashMLASparseForwardPlan:
+    """Plan the minimal H/Top-K padding without importing FlashMLA or CUDA.
+
+    On the pinned upstream SM100 implementation, the H64 path consumes Top-K
+    tiles of 64.  H128/D512 uses its 64-wide small-Top-K path through K1280;
+    other H128 cases use 128-wide tiles.  H16/H32 are padded only to H64;
+    already aligned Top-K tensors remain zero-copy in the raw forward adapter.
+    """
+
+    num_heads = _require_plain_int(num_heads, "num_heads")
+    head_dim = _require_plain_int(head_dim, "head_dim")
+    topk = _require_plain_int(topk, "topk")
+    if num_heads not in _SUPPORTED_HEADS:
+        raise ValueError(f"num_heads must be one of {_SUPPORTED_HEADS}, got {num_heads}")
+    if head_dim not in _SUPPORTED_HEAD_DIMS:
+        raise ValueError(f"head_dim must be one of {_SUPPORTED_HEAD_DIMS}, got {head_dim}")
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+
+    launch_num_heads = 64 if num_heads <= 64 else 128
+    use_h128_small_topk = launch_num_heads == 128 and head_dim == 512 and topk <= 1280
+    topk_tile = 64 if launch_num_heads == 64 or use_h128_small_topk else 128
+    return _FlashMLASparseForwardPlan(
+        num_heads=num_heads,
+        launch_num_heads=launch_num_heads,
+        head_dim=head_dim,
+        value_dim=_VALUE_DIM,
+        topk=topk,
+        launch_topk=_round_up(topk, topk_tile),
+        topk_tile=topk_tile,
+    )
+
+
+def _probe_flashmla_sparse_fwd_signature(sparse_fwd: Callable[..., Any]) -> None:
+    """Fail closed unless ``sparse_fwd`` accepts the bridge's complete call."""
+
+    try:
+        sparse_fwd_signature = signature(sparse_fwd)
+    except Exception as exc:
+        raise SparseAttentionBackendUnavailableError(
+            "The installed 'flash_mla.flash_mla_sparse_fwd' callable has no inspectable "
+            f"Python signature; expected {_FLASHMLA_SPARSE_FWD_CALL}. {_FLASHMLA_INSTALL_HINT}"
+        ) from exc
+
+    sentinel = object()
+    try:
+        sparse_fwd_signature.bind(
+            sentinel,
+            sentinel,
+            sentinel,
+            sm_scale=1.0,
+            d_v=_VALUE_DIM,
+            attn_sink=None,
+            topk_length=None,
+        )
+    except TypeError as exc:
+        raise SparseAttentionBackendUnavailableError(
+            "The installed 'flash_mla.flash_mla_sparse_fwd' has incompatible signature "
+            f"{sparse_fwd_signature}; expected support for {_FLASHMLA_SPARSE_FWD_CALL}. "
+            f"{_FLASHMLA_INSTALL_HINT}"
+        ) from exc
+
+
+def _probe_flashmla_provider_identity(flash_mla: Any, sparse_fwd: Callable[..., Any]) -> None:
+    """Require one pinned wheel to own the imported provider implementation.
+
+    FlashMLA's module-level ``__version__`` is the generic ``1.0.0``.  Its
+    official build metadata is more specific: ``setup.py`` appends the Git
+    short SHA to the ``flash_mla`` distribution version, and that identity is
+    retained in a built wheel.  The pinned revision reports
+    ``1.0.0+15f13e5``.  Version metadata alone is insufficient because a
+    package earlier on ``sys.path`` could otherwise borrow an installed
+    wheel's identity.  Require the imported package, the Python callable, and
+    the compiled extension actually bound in that callable's globals to appear
+    in that same distribution's file manifest.
+
+    This check runs only when resolving a new provider callable.  It performs
+    no device work and is cached together with the signature probe.
+    """
+
+    try:
+        distribution = importlib_metadata.distribution("flash_mla")
+        installed_version = distribution.version
+        distribution_files = distribution.files
+    except importlib_metadata.PackageNotFoundError as exc:
+        raise SparseAttentionBackendUnavailableError(
+            "The imported 'flash_mla' package has no installed distribution metadata, "
+            f"so its declared build identity cannot be checked. {_FLASHMLA_INSTALL_HINT}"
+        ) from exc
+    except Exception as exc:
+        raise SparseAttentionBackendUnavailableError(
+            "Cannot read the installed 'flash_mla' distribution metadata, so its " f"build identity cannot be checked. {_FLASHMLA_INSTALL_HINT}"
+        ) from exc
+
+    if installed_version != _FLASHMLA_DISTRIBUTION_VERSION:
+        raise SparseAttentionBackendUnavailableError(
+            f"The installed 'flash_mla' distribution version {installed_version!r} is "
+            f"incompatible with this adapter; expected {_FLASHMLA_DISTRIBUTION_VERSION!r} "
+            f"from revision {_FLASHMLA_REVISION}. The adapter's head and Top-K padding "
+            "must not be used with an unverified provider launch policy."
+        )
+
+    if not distribution_files:
+        raise SparseAttentionBackendUnavailableError(
+            "The installed 'flash_mla' distribution has no file manifest, so the "
+            f"imported provider cannot be tied to its pinned build. {_FLASHMLA_INSTALL_HINT}"
+        )
+
+    provider_globals = getattr(sparse_fwd, "__globals__", None)
+    flash_mla_cuda = provider_globals.get("flash_mla_cuda") if isinstance(provider_globals, dict) else None
+    if not callable(getattr(flash_mla_cuda, "sparse_prefill_fwd", None)):
+        raise SparseAttentionBackendUnavailableError(
+            "The imported FlashMLA sparse-forward callable does not bind a callable " f"'flash_mla_cuda.sparse_prefill_fwd'. {_FLASHMLA_INSTALL_HINT}"
+        )
+
+    try:
+        owned_paths = {Path(distribution.locate_file(relative_path)).resolve() for relative_path in distribution_files}
+        provider_paths = {
+            "package": Path(flash_mla.__file__).resolve(),
+            "sparse forward callable": Path(getsourcefile(sparse_fwd)).resolve(),
+            "compiled sparse-forward extension": Path(flash_mla_cuda.__file__).resolve(),
+        }
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise SparseAttentionBackendUnavailableError(
+            "Cannot resolve the imported FlashMLA package, sparse-forward callable, "
+            f"and compiled extension to files owned by the pinned distribution. {_FLASHMLA_INSTALL_HINT}"
+        ) from exc
+    for label, provider_path in provider_paths.items():
+        if provider_path not in owned_paths:
+            raise SparseAttentionBackendUnavailableError(
+                f"The imported FlashMLA {label} at {provider_path} is not owned by the "
+                f"pinned {_FLASHMLA_DISTRIBUTION_VERSION!r} distribution. Remove shadowed "
+                f"or editable source trees from the import path. {_FLASHMLA_INSTALL_HINT}"
+            )
+
+
+def _resolve_flashmla_sparse_fwd() -> Callable[..., Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Resolve and compatibility-probe the entry point without caching failures."""
+
+    global _validated_flashmla_sparse_fwd
+
+    try:
+        flash_mla = import_module("flash_mla")
+    except Exception as exc:
+        raise SparseAttentionBackendUnavailableError(f"Cannot import optional dependency 'flash_mla'. {_FLASHMLA_INSTALL_HINT}") from exc
+
+    sparse_fwd = getattr(flash_mla, "flash_mla_sparse_fwd", None)
+    if not callable(sparse_fwd):
+        raise SparseAttentionBackendUnavailableError(
+            "The imported 'flash_mla' package does not export a callable " f"'flash_mla_sparse_fwd'. {_FLASHMLA_INSTALL_HINT}"
+        )
+    if sparse_fwd is not _validated_flashmla_sparse_fwd:
+        _probe_flashmla_provider_identity(flash_mla, sparse_fwd)
+        _probe_flashmla_sparse_fwd_signature(sparse_fwd)
+        _validated_flashmla_sparse_fwd = sparse_fwd
+    return sparse_fwd
+
+
+def _normalize_softmax_scale(softmax_scale: Optional[float], head_dim: int) -> float:
+    if softmax_scale is None:
+        scale = 1.0 / math.sqrt(head_dim)
+    else:
+        if isinstance(softmax_scale, bool) or not isinstance(softmax_scale, Real):
+            raise TypeError(f"softmax_scale must be a host real scalar or None, got {type(softmax_scale).__name__}")
+        scale = float(softmax_scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"softmax_scale must be finite and positive, got {scale}")
+    return scale
+
+
+def _check_tensor(value: Any, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(value).__name__}")
+    return value
+
+
+def _validate_flashmla_contract(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    topk_length: Optional[torch.Tensor],
+    softmax_scale: Optional[float],
+) -> tuple[_FlashMLASparseForwardPlan, float]:
+    q = _check_tensor(q, "q")
+    kv = _check_tensor(kv, "kv")
+    indices = _check_tensor(indices, "indices")
+    if attn_sink is not None:
+        attn_sink = _check_tensor(attn_sink, "attn_sink")
+    if topk_length is not None:
+        topk_length = _check_tensor(topk_length, "topk_length")
+
+    if q.ndim != 3:
+        raise ValueError(f"q must have shape (S_q, H, D), got {tuple(q.shape)}")
+    if kv.ndim != 2:
+        raise ValueError(f"kv must have shape (S_kv, D), got {tuple(kv.shape)}")
+    if indices.ndim != 2:
+        raise ValueError(f"indices must have shape (S_q, topk), got {tuple(indices.shape)}")
+    if q.shape[0] <= 0 or kv.shape[0] <= 0:
+        raise ValueError(f"q and kv sequence lengths must be positive, got {q.shape[0]} and {kv.shape[0]}")
+
+    s_q, num_heads, head_dim = q.shape
+    if kv.shape[1] != head_dim:
+        raise ValueError(f"kv must have shape (S_kv, {head_dim}), got {tuple(kv.shape)}")
+    if indices.shape[0] != s_q:
+        raise ValueError(f"indices must have shape ({s_q}, topk), got {tuple(indices.shape)}")
+    plan = _plan_flashmla_sparse_forward(num_heads, head_dim, indices.shape[1])
+
+    if q.dtype != torch.bfloat16:
+        raise TypeError(f"q must have dtype torch.bfloat16, got {q.dtype}")
+    if kv.dtype != torch.bfloat16:
+        raise TypeError(f"kv must have dtype torch.bfloat16, got {kv.dtype}")
+    if indices.dtype != torch.int32:
+        raise TypeError(f"indices must have dtype torch.int32, got {indices.dtype}")
+
+    if attn_sink is not None:
+        if attn_sink.shape != (num_heads,):
+            raise ValueError(f"attn_sink must have shape {(num_heads,)}, got {tuple(attn_sink.shape)}")
+        if attn_sink.dtype != torch.float32:
+            raise TypeError(f"attn_sink must have dtype torch.float32, got {attn_sink.dtype}")
+    if topk_length is not None:
+        if topk_length.shape != (s_q,):
+            raise ValueError(f"topk_length must have shape {(s_q,)}, got {tuple(topk_length.shape)}")
+        if topk_length.dtype != torch.int32:
+            raise TypeError(f"topk_length must have dtype torch.int32, got {topk_length.dtype}")
+
+    tensors = [q, kv, indices]
+    if attn_sink is not None:
+        tensors.append(attn_sink)
+    if topk_length is not None:
+        tensors.append(topk_length)
+    if q.device.type != "cuda":
+        raise RuntimeError(f"the FlashMLA bridge is CUDA-only; q is on {q.device}")
+    mismatched = [str(t.device) for t in tensors if t.device != q.device]
+    if mismatched:
+        raise ValueError(f"all inputs must share q's device {q.device}; mismatches: {mismatched}")
+    capability = torch.cuda.get_device_capability(q.device)
+    if capability != _SM100_CAPABILITY:
+        raise RuntimeError(
+            "this prototype is fail-closed to exact SM100 (validated on NVIDIA B200); "
+            f"device {q.device} has compute capability {capability[0]}.{capability[1]}"
+        )
+
+    for name, tensor in (
+        ("q", q),
+        ("kv", kv),
+        ("indices", indices),
+        ("attn_sink", attn_sink),
+        ("topk_length", topk_length),
+    ):
+        if tensor is None:
+            continue
+        if tensor.stride(-1) != 1:
+            raise ValueError(f"{name}'s last dimension must be contiguous, got stride {tensor.stride()}")
+        if any(stride < 0 or stride > _MAX_C_STRIDE for stride in tensor.stride()):
+            raise ValueError(f"{name} has a stride that cannot be represented by FlashMLA's int32 ABI: {tensor.stride()}")
+
+    return plan, _normalize_softmax_scale(softmax_scale, head_dim)
+
+
+def _prepare_flashmla_launch_inputs(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    topk_length: Optional[torch.Tensor],
+    plan: _FlashMLASparseForwardPlan,
+) -> _FlashMLALaunchInputs:
+    """Apply only the singleton-head views and padding described by ``plan``."""
+
+    if plan.pads_heads:
+        q_launch = q.new_zeros((q.shape[0], plan.launch_num_heads, plan.head_dim))
+        q_launch[:, : plan.num_heads, :].copy_(q)
+        if attn_sink is None:
+            sink_launch = None
+        else:
+            sink_launch = attn_sink.new_zeros((plan.launch_num_heads,))
+            sink_launch[: plan.num_heads].copy_(attn_sink)
+    else:
+        q_launch = q
+        sink_launch = attn_sink
+
+    # FlashMLA models this as one MQA KV head.  unsqueeze is a zero-copy view.
+    kv_launch = kv.unsqueeze(1)
+    if plan.pads_topk:
+        indices_launch = indices.new_full((indices.shape[0], 1, plan.launch_topk), -1)
+        indices_launch[:, 0, : plan.topk].copy_(indices)
+    else:
+        # Likewise, aligned flat Top-K indices gain only a singleton-head view.
+        indices_launch = indices.unsqueeze(1)
+
+    return _FlashMLALaunchInputs(
+        q=q_launch,
+        kv=kv_launch,
+        indices=indices_launch,
+        attn_sink=sink_launch,
+        topk_length=topk_length,
+        plan=plan,
+    )
+
+
+def _normalize_sparse_index_slots(
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    s_kv: int,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Mask unsafe slots and bound lengths without changing slot positions."""
+
+    topk = indices.shape[1]
+    valid = (indices >= 0) & (indices < s_kv)
+    bounded_length = None
+    if topk_length is not None:
+        bounded_length = topk_length.clamp(min=0, max=topk)
+        positions = torch.arange(topk, dtype=torch.int32, device=indices.device).unsqueeze(0)
+        valid = valid & (positions < bounded_length.unsqueeze(1))
+    return torch.where(valid, indices, -1), bounded_length
+
+
+def _normalize_cudnn_sparse_metadata(
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    s_kv: int,
+    *,
+    trusted_compact_metadata: bool = False,
+    _compactify: Optional[Callable[[torch.Tensor], Any]] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Make FlashMLA metadata safe for cuDNN backward and recompute.
+
+    FlashMLA treats every negative or ``>= S_kv`` index as invalid.  Current
+    cuDNN DSA backward only guards negative sentinels without lengths, and it
+    assumes every entry in a compact active prefix is valid when lengths are
+    present.  Normalize high sentinels to ``-1`` in both cases.  For the
+    length form, also mask the inactive suffix, compact valid entries to the
+    front, and derive a new length.  This is asynchronous GPU work: there is
+    no device-to-host validation or synchronization in the adapter.
+
+    Out-of-contract length values are clamped to the physical ``[0, K]``
+    envelope before masking.  An asynchronous device assert would poison the
+    CUDA context on failure, while a strict host check would synchronize the
+    hot path; clamping gives the downstream kernels a memory-safe contract.
+
+    ``trusted_compact_metadata`` is the explicit zero-work normalization
+    alternative for a producer that already satisfies the narrower cuDNN
+    backward contract.  Later launch preparation can still pad an unaligned
+    Top-K or make metadata contiguous where the downstream kernel requires it.
+    """
+
+    if trusted_compact_metadata:
+        # This is an explicit caller contract, not a property inferred from
+        # device data.  Inspecting the values here would either synchronize or
+        # launch the same metadata kernels this fast path exists to avoid.
+        return indices, topk_length
+
+    normalized, _ = _normalize_sparse_index_slots(indices, topk_length, s_kv)
+    if topk_length is None:
+        return normalized, None
+
+    if _compactify is None:
+        # Lazy import preserves the optional CuTe DSL boundary at module import.
+        from .indexer_top_k.api import compactify_wrapper
+
+        _compactify = compactify_wrapper
+    compact = _compactify(normalized)
+    return compact["indices"], compact["topk_length"]
+
+
+def _validate_flashmla_outputs(
+    outputs: Any,
+    launch: _FlashMLALaunchInputs,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not isinstance(outputs, (tuple, list)) or len(outputs) != 3:
+        raise RuntimeError("flash_mla_sparse_fwd must return (output, max_logits, lse)")
+    output, max_logits, lse = outputs
+    for name, tensor in (("output", output), ("max_logits", max_logits), ("lse", lse)):
+        if not isinstance(tensor, torch.Tensor):
+            raise RuntimeError(f"FlashMLA returned non-tensor {name}: {type(tensor).__name__}")
+        if tensor.device != launch.q.device:
+            raise RuntimeError(f"FlashMLA returned {name} on {tensor.device}, expected {launch.q.device}")
+
+    plan = launch.plan
+    expected_output = (launch.q.shape[0], plan.launch_num_heads, plan.value_dim)
+    expected_aux = (launch.q.shape[0], plan.launch_num_heads)
+    if output.shape != expected_output or output.dtype != torch.bfloat16:
+        raise RuntimeError(f"FlashMLA output must be BF16 {expected_output}, got {output.dtype} {tuple(output.shape)}")
+    if max_logits.shape != expected_aux or max_logits.dtype != torch.float32:
+        raise RuntimeError(f"FlashMLA max_logits must be FP32 {expected_aux}, got {max_logits.dtype} {tuple(max_logits.shape)}")
+    if lse.shape != expected_aux or lse.dtype != torch.float32:
+        raise RuntimeError(f"FlashMLA lse must be FP32 {expected_aux}, got {lse.dtype} {tuple(lse.shape)}")
+
+    if plan.pads_heads:
+        output = output[:, : plan.num_heads, :].contiguous()
+        max_logits = max_logits[:, : plan.num_heads].contiguous()
+        lse = lse[:, : plan.num_heads].contiguous()
+    return output, max_logits, lse
+
+
+def _launch_flashmla_sparse_forward(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    topk_length: Optional[torch.Tensor],
+    plan: _FlashMLASparseForwardPlan,
+    scale: float,
+    sparse_fwd: Callable[..., Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> TupleDict:
+    """Launch a dependency and contract that the caller already validated."""
+
+    launch = _prepare_flashmla_launch_inputs(q, kv, indices, attn_sink, topk_length, plan)
+    outputs = sparse_fwd(
+        launch.q,
+        launch.kv,
+        launch.indices,
+        sm_scale=scale,
+        d_v=plan.value_dim,
+        attn_sink=launch.attn_sink,
+        topk_length=launch.topk_length,
+    )
+    output, max_logits, lse = _validate_flashmla_outputs(outputs, launch)
+    return TupleDict(output=output, max_logits=max_logits, lse=lse)
+
+
+def _run_flashmla_sparse_forward(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    topk_length: Optional[torch.Tensor],
+    softmax_scale: Optional[float],
+) -> tuple[TupleDict, float]:
+    plan, scale = _validate_flashmla_contract(q, kv, indices, attn_sink, topk_length, softmax_scale)
+    sparse_fwd = _resolve_flashmla_sparse_fwd()
+    # The external dispatcher and current cuDNN wrappers inspect current-device
+    # state.  Keep preparation, launch, and padded-output slicing under q's
+    # device guard so a multi-GPU caller does not accidentally route by another
+    # device or enqueue adapter work on another device's current stream.
+    with torch.cuda.device(q.device):
+        # The pinned provider may speculatively read a valid suffix index even
+        # when topk_length excludes it; if that KV row contains NaN, the
+        # ignored slot can contaminate the output.  Make the semantic length
+        # contract explicit in the metadata presented to the provider.  Pass
+        # the same bounded length used by the mask so an out-of-contract value
+        # cannot make the provider address beyond the physical Top-K extent.
+        if topk_length is not None:
+            indices, topk_length = _normalize_sparse_index_slots(indices, topk_length, kv.shape[0])
+        result = _launch_flashmla_sparse_forward(
+            q,
+            kv,
+            indices,
+            attn_sink,
+            topk_length,
+            plan,
+            scale,
+            sparse_fwd,
+        )
+    return result, scale
+
+
+def sparse_attention_forward(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> TupleDict:
+    """Run token-indexed sparse-attention forward without autograd wiring.
+
+    This provider-neutral semantic entry point currently dispatches to the
+    separately installed official FlashMLA implementation.  Backend selection
+    is private and may change without changing this API.
+
+    ``q`` is ``(S_q, H, D)``, ``kv`` is ``(S_kv, D)``, and ``indices`` is
+    ``(S_q, topk)`` with global positions into the flat KV stream.  Invalid
+    indices may be ``-1`` or at least ``S_kv``.  ``topk_length``, when given,
+    is clamped to the physical ``[0, topk]`` range.  The returned ``lse``
+    excludes the attention sink, matching cuDNN DSA backward.  Invalid entries
+    and the inactive suffix are safety-masked before the current provider
+    launch.
+
+    Use :func:`sparse_attention` for an autograd-enabled call.
+    """
+
+    result, _ = _run_flashmla_sparse_forward(q, kv, indices, attn_sink, topk_length, softmax_scale)
+    return result
+
+
+class _FlashMLACudnnSparseAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, kv, indices, attn_sink, topk_length, softmax_scale, trusted_compact_metadata):
+        plan, scale = _validate_flashmla_contract(q, kv, indices, attn_sink, topk_length, softmax_scale)
+        # Fail before launching metadata-normalization kernels when the
+        # optional external forward is absent or incompatible.
+        sparse_fwd = _resolve_flashmla_sparse_fwd()
+        with torch.cuda.device(q.device):
+            safe_indices, safe_topk_length = _normalize_cudnn_sparse_metadata(
+                indices,
+                topk_length,
+                kv.shape[0],
+                trusted_compact_metadata=trusted_compact_metadata,
+            )
+            result = _launch_flashmla_sparse_forward(
+                q,
+                kv,
+                safe_indices,
+                attn_sink,
+                safe_topk_length,
+                plan,
+                scale,
+                sparse_fwd,
+            )
+        output, max_logits, lse = result
+        ctx.softmax_scale = scale
+        ctx.has_topk_length = safe_topk_length is not None
+        tensors = [q, kv, output, lse, attn_sink, safe_indices]
+        if safe_topk_length is not None:
+            tensors.append(safe_topk_length)
+        ctx.save_for_backward(*tensors)
+        ctx.mark_non_differentiable(max_logits, lse)
+        return output, max_logits, lse
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, dout, _dmax_logits, _dlse):
+        if dout is None:
+            return (None,) * 7
+        saved = ctx.saved_tensors
+        q, kv, output, lse, attn_sink, indices = saved[:6]
+        topk_length = saved[6] if ctx.has_topk_length else None
+
+        # Import lazily so importing the bridge remains cheap and does not JIT
+        # or initialize the CuTe DSL backward until a gradient is requested.
+        from .sparse_attention_backward.api import sparse_attention_backward_wrapper
+
+        with torch.cuda.device(q.device):
+            result = sparse_attention_backward_wrapper(
+                q,
+                kv,
+                output,
+                dout,
+                lse,
+                attn_sink,
+                indices,
+                softmax_scale=ctx.softmax_scale,
+                topk_length=topk_length,
+            )
+        needs = ctx.needs_input_grad
+        return (
+            result["dq"] if needs[0] else None,
+            result["dkv"] if needs[1] else None,
+            None,
+            result["d_sink"] if needs[3] else None,
+            None,
+            None,
+            None,
+        )
+
+
+def sparse_attention(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    trusted_compact_metadata: bool = False,
+) -> TupleDict:
+    """Run token-indexed sparse attention with cuDNN DSA autograd.
+
+    The current forward provider is the separately installed official
+    FlashMLA implementation.  cuDNN Frontend owns metadata normalization,
+    backward, and score recompute; the provider is an implementation detail.
+
+    Gradients are provided for ``q``, ``kv``, and ``attn_sink``.  Top-K
+    indices/lengths and ``softmax_scale`` are non-differentiable.  FlashMLA's
+    ``max_logits`` and KV-only ``lse`` are returned for diagnostics and score
+    recompute but are explicitly non-differentiable outputs.  Before forward,
+    invalid indices are normalized to the current cuDNN backward contract;
+    with ``topk_length``, valid active entries are compacted and a safe length
+    is derived.  Forward and backward therefore consume identical metadata.
+
+    Set ``trusted_compact_metadata=True`` only when the producer guarantees
+    that every active-prefix index is in ``[0, S_kv)`` and every length is in
+    ``[0, K]``; every inactive-suffix index must be invalid (negative or at
+    least ``S_kv``).  Without lengths, every nonnegative index must be below
+    ``S_kv``.  The explicit fast path skips the device scan, mask, and
+    compactification.  FlashMLA Top-K alignment padding and a downstream
+    kernel's required contiguous copy can still occur; violating the trusted
+    contract can cause an illegal memory access in the tuned cuDNN backward
+    kernel or let an ignored provider load contaminate the output.
+    """
+
+    if attn_sink is None:
+        raise ValueError("attn_sink is required by the cuDNN DSA training backward")
+    if not isinstance(trusted_compact_metadata, bool):
+        raise TypeError("trusted_compact_metadata must be a bool, got " f"{type(trusted_compact_metadata).__name__}")
+    output, max_logits, lse = _FlashMLACudnnSparseAttention.apply(
+        q,
+        kv,
+        indices,
+        attn_sink,
+        topk_length,
+        softmax_scale,
+        trusted_compact_metadata,
+    )
+    return TupleDict(output=output, max_logits=max_logits, lse=lse)
+
+
+def sparse_attention_score_recompute(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    lse: torch.Tensor,
+    indices: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    stream: Optional[Any] = None,
+) -> TupleDict:
+    """Run cuDNN attention-score recompute from a sparse-forward tuple.
+
+    This is a single-flat-sequence adapter over
+    :func:`DSA.sparse_attn_score_recompute_wrapper`.  It safety-normalizes the
+    wider invalid-index contract accepted by the current FlashMLA provider,
+    masks the inactive suffix, and uses the non-compact recompute path so every
+    returned target slot stays aligned with the caller's original ``indices``
+    position.  The launch-only tail is padded to a conservative 128-slot tile
+    and sliced away afterward.
+    """
+
+    if stream is not None:
+        raise NotImplementedError("the B200 bridge prototype supports only the current PyTorch stream")
+
+    _, scale = _validate_flashmla_contract(q, kv, indices, None, topk_length, softmax_scale)
+    lse = _check_tensor(lse, "lse")
+    expected_lse = (q.shape[0], q.shape[1])
+    if lse.shape != expected_lse or lse.dtype != torch.float32:
+        raise ValueError(f"lse must be FP32 {expected_lse}, got {lse.dtype} {tuple(lse.shape)}")
+    if lse.device != q.device:
+        raise ValueError(f"lse must be on q's device {q.device}, got {lse.device}")
+    if lse.stride(-1) != 1:
+        raise ValueError(f"lse's last dimension must be contiguous, got stride {lse.stride()}")
+
+    from .score_recompute.api import sparse_attn_score_recompute_wrapper
+
+    with torch.cuda.device(q.device):
+        safe_indices, _ = _normalize_sparse_index_slots(indices, topk_length, kv.shape[0])
+        launch_topk = _round_up(indices.shape[1], _SCORE_TOPK_TILE)
+        if launch_topk == indices.shape[1]:
+            launch_indices = safe_indices
+        else:
+            launch_indices = indices.new_full((indices.shape[0], launch_topk), -1)
+            launch_indices[:, : indices.shape[1]].copy_(safe_indices)
+        result = sparse_attn_score_recompute_wrapper(
+            q.unsqueeze(0),
+            kv.unsqueeze(0),
+            lse.unsqueeze(0),
+            launch_indices.unsqueeze(0),
+            scale,
+            qhead_per_kv_head=q.shape[1],
+            topk_length=None,
+            topk_indices_global=False,
+            stream=stream,
+        )
+        target = result["target"].squeeze(0)[:, : indices.shape[1]].contiguous()
+    return TupleDict(target=target, indices=safe_indices)
+
+
+__all__ = [
+    "SparseAttentionBackendUnavailableError",
+    "sparse_attention",
+    "sparse_attention_forward",
+    "sparse_attention_score_recompute",
+]
