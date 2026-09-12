@@ -4128,9 +4128,15 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None)
     neighbour. Without knobs this is the automatic strategy."""
     if knobs is not None:
         try:
-            return knobs.to_config()
+            config = knobs.to_config()
         except (KeyError, ValueError, NotImplementedError) as exc:
             raise NotImplementedError(f"frost_gemm: knobs do not name a canonical tile config: {exc}") from exc
+        if dynamic_shapes and config.split_k_slices != 1:
+            # Same rule as the automatic pick below: the slice count is fixed at
+            # plan time and a runtime K may not tile it, so a replayed record
+            # does not get to bypass it.
+            raise NotImplementedError("frost_gemm: split-K plans do not support dynamic shapes")
+        return config
     from .kernel_registry import preferred_strategy
     from .tile_config import select_config
 

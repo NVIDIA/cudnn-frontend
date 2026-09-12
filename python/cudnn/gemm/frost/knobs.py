@@ -157,6 +157,9 @@ class GemmKnobs:
                 if value not in (0, 1):
                     raise ValueError(f"knob SWAP_AB must be 0 or 1, got {value}")
                 kwargs[field] = bool(value)
+            elif field == "split_k_slices" and value < 1:
+                # 0 would spell the same name as one slice and replay as it
+                raise ValueError(f"knob SPLIT_K_SLC must be >= 1, got {value}")
             else:
                 kwargs[field] = value
         missing = [member for field, member, required in cls._PUBLIC_KNOBS if required and field not in kwargs]

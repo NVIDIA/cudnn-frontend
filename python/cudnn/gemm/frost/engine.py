@@ -135,14 +135,14 @@ class FrostGemmEngine(BaseEngine):
         from cudnn.frost.device import build_device
 
         knobs = plan.knobs if plan is not None else None
-        if isinstance(knobs, dict):  # a replayed public record, not yet converted
-            knobs = self.knobs_from_public(knobs)
         # Bake the plan for the device of the handle the graph carries (via ctx),
         # not whatever CUDA device is current at build time. A foreign raw-int
         # handle (or none) carries no device -> None -> classic current-device.
         handle = ctx.handle if ctx is not None else None
         device = handle.device.ordinal if hasattr(handle, "device") else None
         try:
+            if isinstance(knobs, dict):  # a replayed public record, not yet converted
+                knobs = self.knobs_from_public(knobs)  # a malformed record is a decline, not an abort
             with build_device(device):
                 return _FrostGemmPlan(build_gemm_plan(graph, knobs=knobs))
         except (NotImplementedError, ValueError) as exc:

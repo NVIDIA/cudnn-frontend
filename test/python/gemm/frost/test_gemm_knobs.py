@@ -29,8 +29,17 @@ M, N, K = 256, 512, 256
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cfg", [DEFAULT_CONFIG] + list(CATALOG[::97]), ids=lambda c: c.name)
-def test_knobs_name_every_catalog_config_exactly(cfg):
+def test_knobs_name_the_whole_catalog():
+    """Every catalog entry round-trips (one test, not ~16k parametrized ids)."""
+    for cfg in (DEFAULT_CONFIG, *CATALOG):
+        knobs = GemmKnobs.from_config(cfg)
+        assert knobs.config_name == cfg.name, cfg.name
+        assert knobs.to_config() == cfg, cfg.name
+        assert GemmKnobs.from_public(knobs.to_public()) == knobs, cfg.name
+
+
+@pytest.mark.parametrize("cfg", [DEFAULT_CONFIG, *CATALOG[::97]], ids=lambda c: c.name)
+def test_knobs_name_a_catalog_config_exactly(cfg):
     knobs = GemmKnobs.from_config(cfg)
     assert knobs.config_name == cfg.name
     assert knobs.to_config() == cfg
@@ -84,10 +93,26 @@ def test_from_public_rejects_foreign_or_incomplete_records():
         GemmKnobs.from_public({**good, kt.TILE_N: "256"})
     with pytest.raises(ValueError, match="SWAP_AB must be 0 or 1"):
         GemmKnobs.from_public({**good, kt.SWAP_AB: 2})
+    with pytest.raises(ValueError, match="SPLIT_K_SLC must be >= 1"):
+        GemmKnobs.from_public({**good, kt.SPLIT_K_SLC: 0})  # would otherwise spell (and replay as) one slice
     # a well-formed record that names no config the family constructors admit
     # (N=100 is not a tcgen05 N tile; the geometry check refuses it)
     with pytest.raises((KeyError, NotImplementedError)):
         GemmKnobs.from_public({**good, kt.TILE_N: 100}).to_config()
+
+
+def test_replayed_split_k_record_declines_under_dynamic_shapes():
+    """The automatic pick never adds split-K to a dynamic-shape graph; a
+    replayed record does not get to bypass that rule. The knobs branch of
+    plan_config never reads the chain, so none is needed here."""
+    from dataclasses import replace
+
+    from cudnn.gemm.frost.compiler import plan_config
+
+    knobs = GemmKnobs.from_config(replace(DEFAULT_CONFIG, split_k_slices=2))
+    assert plan_config(None, dynamic_shapes=False, knobs=knobs).split_k_slices == 2
+    with pytest.raises(NotImplementedError, match="dynamic shapes"):
+        plan_config(None, dynamic_shapes=True, knobs=knobs)
 
 
 # ---------------------------------------------------------------------------
