@@ -517,8 +517,25 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "The Stats output of sdpa must be an FP32 tensor.");
 
-        // All layouts of Stats work in the forward for all cuDNN backend versions (unlike the
-        // backward case), so no need to check it here.
+        // The forward Stats store honours the declared B/H/S strides since cuDNN 9.12 (backend
+        // commit 543ae842a7); before that a non-ragged Stats output was written at packed-BHSD
+        // offsets whatever its declared layout. The backward *read* of a non-ragged Stats input has
+        // the same limitation until 9.26 -- that guard lives in CompositeSDPABackwardNode.
+        // Runs post shape inference so that an unset Stats layout (always inferred as packed BHSD)
+        // is not rejected.
+        if (has_stats && !stats_out->second->get_ragged_offset() && detail::get_backend_version() < 91200) {
+            auto const& stats_dim           = stats_out->second->get_dim();
+            auto const& stats_stride        = stats_out->second->get_stride();
+            bool const stats_is_packed_bhsd = stats_dim.size() == 4 && stats_stride.size() == 4 &&
+                                              stats_stride[3] == 1 && stats_stride[2] == stats_dim[3] &&
+                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
+                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !stats_is_packed_bhsd,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "For cuDNN version below 9.12.0, a non-ragged Stats output must be a packed BHSD "
+                "tensor.");
+        }
 
         // validate options for max_total_seq_len (mirrors SDPA_backward_attributes)
         {
@@ -1487,7 +1504,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         }
 
         // Non-ragged Stats INPUT layouts other than packed BHSD are not correctly read prior to 9.26.0
-        // (the forward, by contrast, writes any Stats layout correctly on every version).
+        // (the forward store honours the declared layout since 9.12; see SDPANodeBase).
         // TODO: move to sdpa_support_surface.h once the backward path grows a
         // SDPA_backward_attributes support surface there — today that file serves only the
         // forward attributes.
