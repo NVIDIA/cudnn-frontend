@@ -2821,6 +2821,10 @@ def _import_kernel(src: str) -> object:
     mod = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
+    # The template's compile() keys its persistent object on this digest: the
+    # rendered source carries the tile config, dtypes, fusion chain and the
+    # --gpu-arch option, so it IS the kernel's identity.
+    mod.FROST_SOURCE_DIGEST = digest
     return mod
 
 

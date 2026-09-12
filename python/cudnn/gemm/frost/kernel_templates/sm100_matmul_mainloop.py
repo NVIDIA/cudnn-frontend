@@ -44,6 +44,7 @@ from cudnn.gemm.frost.kernel_templates._tile_helpers import (
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass._mlir_helpers.vector as _cvec
 import cutlass
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from cutlass.cute.runtime import make_fake_stream
@@ -1774,7 +1775,7 @@ def compile() -> Callable:
     fake_splitk_partials = make_fake_tensor(cutlass.Float32, (sym_partials_elems,), stride=(1,), assumed_align=16)
     # @@SPLITK_ONLY:END@@
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-    return cute.compile(
+    return _compile_cached(
         _host,
         problem_size,
         # @@INJECT_COMPILE_AB_PASS@@
@@ -1788,4 +1789,7 @@ def compile() -> Callable:
         # @@SPLITK_ONLY:END@@
         stream=_fake_stream,
         options=frost_compile_options,
+        # persistent object across processes (cudnn.frost.compiled_cache); the digest of THIS source is the key
+        cache_key=globals().get("FROST_SOURCE_DIGEST"),
+        symbol="frost_gemm",
     )
