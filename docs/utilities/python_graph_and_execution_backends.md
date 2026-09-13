@@ -343,20 +343,33 @@ are close.
   head), so a long sequence on few tiles leaves SMs idle. `choose_mode`
   (`frost/common/piece_chain.py`) fixes the scheme at build from the declared
   shapes and the device's SM count, identically for the forward and the
-  backward, and it is not a node attribute. `chain` cuts every sequence into
-  `P = num_sm // (B * HO)` unit-aligned pieces (at least 3 for a forward plan
-  and 2 for a backward plan, at most 16, each at least 4 chunk units of
-  `lcm(expand_num, checkpoint cadence)` chunks) wherever that has room,
-  `warmup` (the decay-warmup split-K of `frost/common/split_k.py`) serves the
-  band where it has not, and `uncut` runs one item per (sequence, head). Under
+  backward, and it is not a node attribute. `chain` cuts the batch into one
+  wave of `B * P` unit-aligned pieces, `P = min(num_sm // (B * HO), 16,
+  total_chunks // (4 * B * unit))` with `unit = lcm(expand_num, checkpoint
+  cadence)` chunks (one wave of tiles, at most 16 pieces, every piece at
+  least 4 units long), and it is chosen only when `P >= 3` for a forward plan
+  or `P >= 2` for a backward plan; every piece spans
+  `ceil(total_chunks / (B * P))` chunks whichever
+  sequence it belongs to, so a sequence fills `ceil(len / span)` slots and an
+  uneven batch walks the same critical path as an even one (when the
+  per-sequence ceilings would overflow the wave the span is recomputed against
+  `B * P - (B - 1)` slots). `warmup` (the decay-warmup split-K of
+  `frost/common/split_k.py`) serves the band where the chain has no room, and
+  `uncut` runs one item per (sequence, head). Under
   `batch_invariant` the geometry comes from the length rule alone, `P =
   clamp(ceil(total / 8192), 1, 16)` slots per sequence, of which each fills
-  `clamp(ceil(len / 8192), 1, P)` on device, `uncut` when `total <= 8192`, so a
-  sequence's outputs are bitwise the same alone and in any batch. The chain is
-  exact. The chain prologue writes the piece-wise `cu_pieces` (real tokens)
-  and the work-item tables (every filled slot per head, plus an empty
-  sequence's slot 0 as a passthrough; the summary table only for sequences
-  with two or more filled slots); a summary launch produces every multi-piece
+  `clamp(ceil(len / 8192), 1, P)` on device, `uncut` when `total <= 8192`
+  (except for the summary ops, which keep a one-piece chain there so that the
+  emitting state chain below still composes their tail), so a sequence's
+  outputs are bitwise the same alone and in any batch. The chain is
+  exact. The chain prologue writes the piece-wise `cu_pieces` (real tokens,
+  the slots flat in sequence order: sequence `b` owns slots
+  `main_rows[b] // HO .. main_rows[b + 1] // HO`) and the work-item tables
+  (every filled slot per head, plus an empty sequence's slot 0 as a
+  passthrough; the summary table, which the main ops' summary launch walks,
+  only for sequences with two or more filled slots, a one-piece sequence's
+  `X` being its seed; the summary ops summarize every filled piece over the
+  main table, below); a summary launch produces every multi-piece
   sequence's per-piece state from a zero seed (H) and transition (M) in fp32
   (GDN's summaries read the T pass, the beta-folded chunk factor of
   `kernel/gdn_tinv_f16.py`; a GDN prefill or bprop builds the factor itself

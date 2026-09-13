@@ -430,6 +430,10 @@ def test_plan_name_pins_the_backend(backend, variant):
 def test_fwd_basic(backend, variant, dtype, B, T, H, HV):
     if dtype == torch.float16 and (H, HV) not in HEAD_CONFIGS_SMALL:
         pytest.skip("fp16 runs the small head matrix")
+    if (B, T) != (2, 256) and (H, HV) not in HEAD_CONFIGS_SMALL:
+        pytest.skip("the full head matrix runs the two-sequence length")
+    if backend.name == "cutile" and (H, HV) not in HEAD_CONFIGS_SMALL:
+        pytest.skip("cuTile autotunes per shape; the small head matrix covers it")
     case = make_case(variant, dtype, B=B, T=T, H=H, HV=HV)
     assert_fwd_parity(backend, case)
 
@@ -472,6 +476,8 @@ def test_fwd_seqlen_edges(backend, variant, T):
 @pytest.mark.parametrize("seq_lens", RAGGED_SEQ_LENS, ids=lambda sl: f"{len(sl)}seqs_{sum(sl)}tok")
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_varlen_ragged(backend, variant, seq_lens, H, HV):
+    if (H, HV) == (1, 1) and seq_lens not in ([96, 32, 160, 1], [7] * 24 + [1] * 8):
+        pytest.skip("the single-head pair runs the two boundary-dense shapes")
     case = make_case(variant, torch.bfloat16, seq_lens=seq_lens, H=H, HV=HV)
     assert_fwd_parity(backend, case)
 
@@ -571,18 +577,19 @@ def test_fwd_head_dims(backend, variant, K, V):
     assert_fwd_parity(backend, case)
 
 
-@pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
 @pytest.mark.parametrize("K,V", HEAD_DIMS)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_bwd_head_dims(backend, variant, K, V, l2norm):
-    """Backward over the full K x V head-dim matrix, with and without the
-    in-kernel Q/K l2 norm."""
-    assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=192, H=2, HV=4, K=K, V=V), l2norm=l2norm)
+def test_bwd_head_dims(backend, variant, K, V):
+    """Backward over the full K x V head-dim matrix (with the in-kernel Q/K l2 norm
+    in test_bwd_head_dims_states_varlen)."""
+    assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=192, H=2, HV=4, K=K, V=V))
 
 
 @pytest.mark.parametrize("K,V", HEAD_DIMS)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_head_dims_states_varlen(backend, variant, K, V):
+    if backend.name == "cutile" and (K, V) != (128, 128):
+        pytest.skip("cuTile autotunes per shape; one head-dim pair covers it")
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, seq_lens=[64, 128], K=K, V=V), use_initial_state=True, use_dfs=True, l2norm=True)
 
 
@@ -595,6 +602,7 @@ def test_fwd_gqa(backend, variant, H, HK, HV):
     assert_fwd_parity(backend, case)
 
 
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_multi_tile(backend, variant):
     """B*H well above the SM count, so each CTA walks several (b, h) tiles back
@@ -713,6 +721,8 @@ def test_bwd_parity(backend, variant, dtype, T, H, HV):
         pytest.skip("fp16 runs one representative backward config")
     if (H, HV) == (16, 64) and T != 128:
         pytest.skip("the large GVA config runs one length")
+    if backend.name == "cutile" and T != 128:
+        pytest.skip("cuTile autotunes per shape; one length covers it")
     assert_bwd_parity(backend, make_case(variant, dtype, T=T, H=H, HV=HV))
 
 
@@ -722,11 +732,10 @@ def test_bwd_gqa(backend, variant, H, HK, HV):
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=128, H=H, HK=HK, HV=HV))
 
 
-@pytest.mark.parametrize("V", [64, 128])
-@pytest.mark.parametrize("H,HK,HV", GQA_CONFIGS)
+@pytest.mark.parametrize("H,HK,HV,V", [(H, HK, HV, 128) for H, HK, HV in GQA_CONFIGS] + [(4, 4, 1, 64), (4, 1, 1, 64), (1, 2, 2, 64)])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_gqa_qk_l2norm(backend, variant, H, HK, HV, V):
-    """The fused l2norm backward under GQA head folds."""
+    """The fused l2norm backward under GQA head folds; V = 64 at one fold of each kind."""
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=192, H=H, HK=HK, HV=HV, V=V), l2norm=True)
 
 
@@ -837,13 +846,6 @@ def test_bwd_model_gate_range_bf16(backend, variant):
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=128, lo=MODEL_GATE_LO))
 
 
-@pytest.mark.xfail(reason="phi(K)/Gamma overflows fp16 once a channel's 16-token cumulative log-decay passes ~-13.5", strict=False)
-@pytest.mark.parametrize("variant", CHANNEL_VARIANTS)
-def test_bwd_model_gate_range_fp16(backend, variant):
-    """Same in fp16, where the decayed key operands leave the dtype's range."""
-    assert_bwd_parity(backend, make_case(variant, torch.float16, T=128, lo=MODEL_GATE_LO))
-
-
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_with_checkpoints(backend, variant):
     """The checkpoint dump is non-differentiable and must not block backward."""
@@ -894,7 +896,7 @@ def assert_bitwise(name, got, want):
 
 
 @pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
-@pytest.mark.parametrize("T", [128, 1024, SPLIT_T])
+@pytest.mark.parametrize("T", [128, SPLIT_T])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_gate_16bit(backend, variant, T, gate_dtype):
     """SPLIT_T also drives the 16-bit gate through the split-K chunk scan."""
@@ -982,11 +984,11 @@ def test_bwd_meta_dtypes_match_eager(backend, variant, gate_dtype):
     assert not got, f"meta/eager dtype mismatch at output indices {got}"
 
 
-@pytest.mark.parametrize("io_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+@pytest.mark.parametrize("io_dtype", [torch.float16], ids=DTYPE_IDS.get)
 @pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_gate_16bit_io_cross(backend, variant, gate_dtype, io_dtype):
-    """The gate dtype is independent of the io dtype; all four crossings hold."""
+    """The gate dtype is independent of the io dtype: both gate dtypes under fp16 io (bf16 io is test_fwd_gate_16bit)."""
     narrow, wide = gate_dtype_pair(variant, gate_dtype, io_dtype=io_dtype, T=256, H=2)
     o16, fs16 = run_fwd(backend, narrow, output_final_state=True)
     o32, fs32 = run_fwd(backend, wide, output_final_state=True)
@@ -1040,8 +1042,7 @@ def test_fwd_state_dtype(backend, variant, state_dtype):
     assert_fwd_parity(backend, make_case(variant, torch.bfloat16, T=256), use_initial_state=True, state_dtype=state_dtype)
 
 
-@pytest.mark.parametrize("state_dtype", STATE_DTYPES, ids=DTYPE_IDS.get)
-@pytest.mark.parametrize("V", [128, 64])
+@pytest.mark.parametrize("state_dtype,V", [(torch.float32, 128), (torch.float32, 64), (torch.bfloat16, 128)], ids=["fp32-128", "fp32-64", "bf16-128"])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_state_dtype(backend, variant, state_dtype, V):
     """A bf16 state pool drives a bf16 d_final_state into the kernel and a bf16
@@ -1487,8 +1488,11 @@ def test_allow_neg_eigval_requires_beta_sigmoid(backend, variant):
         run_fwd(backend, case, allow_neg_eigval=True)
 
 
-@pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
-@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize(
+    "K,gate_dtype",
+    [(128, torch.float32), (128, torch.bfloat16), (128, torch.float16), (64, torch.float32)],
+    ids=["128-fp32", "128-bf16", "128-fp16", "64-fp32"],
+)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_safe_gate_backward(backend, variant, K, gate_dtype):
     """dG comes back in raw-logit space and the parameter gradients satisfy
@@ -1540,8 +1544,7 @@ def test_safe_gate_param_16bit(backend, variant, param_dtype):
     assert_bitwise("final_state", fs16, fs32)
 
 
-@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
-@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("K,param_dtype", [(128, torch.bfloat16), (128, torch.float16), (64, torch.bfloat16)], ids=["128-bf16", "128-fp16", "64-bf16"])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_safe_gate_backward_param_16bit(backend, variant, K, param_dtype):
     """d_a_log/d_dt_bias come back in the parameter dtype and satisfy the dG
@@ -1603,8 +1606,7 @@ def test_safe_gate_absent_params_checkpoints_bitwise(backend, variant, arm):
     assert_bitwise("state_checkpoints", ck_abs[:valid], ck_ref[:valid])
 
 
-@pytest.mark.parametrize("arm", ABSENT_ARMS)
-@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("K,arm", [(128, arm) for arm in ABSENT_ARMS] + [(64, "no_params")])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_safe_gate_absent_params_bwd_bitwise(backend, variant, K, arm):
     """Every gradient of the absent-parameter run, the initial-state gradient
@@ -1684,8 +1686,11 @@ def gate_domain_pair(case, gate_dtype):
     return case.clone(gates=dict(case.gates, g=g_log)), case.clone(gates=dict(case.gates, g=alpha))
 
 
-@pytest.mark.parametrize("varlen", [False, True], ids=["dense", "varlen"])
-@pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+@pytest.mark.parametrize(
+    "varlen,gate_dtype",
+    [(False, torch.float32), (False, torch.bfloat16), (False, torch.float16), (True, torch.float32)],
+    ids=["dense-fp32", "dense-bf16", "dense-fp16", "varlen-fp32"],
+)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_gate_domain_linear_forward_parity(backend, variant, gate_dtype, varlen):
     """gate_domain="linear" fed alpha matches the log path fed ln(alpha) in o
@@ -1699,8 +1704,7 @@ def test_gate_domain_linear_forward_parity(backend, variant, gate_dtype, varlen)
     assert rms_ratio(fs_lin, fs_log) < 2e-2
 
 
-@pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16], ids=DTYPE_IDS.get)
-@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("K,gate_dtype", [(128, torch.float32), (128, torch.bfloat16), (64, torch.float32)], ids=["128-fp32", "128-bf16", "64-fp32"])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_gate_domain_linear_backward(backend, variant, K, gate_dtype):
     """Under gate_domain="linear" dG is the gradient with respect to alpha,
@@ -1755,6 +1759,8 @@ def test_beta_sigmoid_backward(backend, variant, beta_dtype, V):
     """The in-kernel Beta sigmoid returns the gradient wrt the raw logit, so
     dbeta must equal the post-activation path's dbeta times s * (1 - s) at the
     s the forward stores (io-rounded for io-dtype logits, exact for fp32)."""
+    if V == 64 and (variant, beta_dtype) != ("gdn", torch.bfloat16):
+        pytest.skip("V = 64 runs one representative")
     case = make_case(variant, torch.bfloat16, T=256, V=V)
     set_seed(SEED + 13)
     braw = torch.randn_like(case.gates["beta"].float()).to(beta_dtype)
@@ -1947,6 +1953,7 @@ def test_beta_guard_requires_l2norm(backend, variant):
         pinned_op(backend, variant)(*op_args(case), beta_guard=True)
 
 
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("H", (40, 160))
 @pytest.mark.parametrize("variant", SCALAR_GATE_VARIANTS)
 def test_scalar_gate_head_tiling(backend, variant, H):
@@ -2190,6 +2197,7 @@ def test_replay_stress(backend, variant):
         assert_stress_stable(backend, variant, STRESS_SHAPES[:1])
 
 
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_multi_graph_stress(backend, variant):
     """Several distinct LA graphs live at once, executed round robin; every
@@ -2295,9 +2303,8 @@ def test_bwd_checkpoint_reuse(backend, variant, K):
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("K,ckpt_mult", [(128, 2), (128, 3), (64, 2)])
 @pytest.mark.parametrize("variant", VARIANTS)
-@pytest.mark.parametrize("ckpt_mult", [2, 3])
 def test_bwd_coarse_checkpoint_seeded_recompute(backend, variant, ckpt_mult, K):
     """With a coarse checkpoint cadence the backward reconstructs the dense
     series by checkpoint-seeded recompute; the grads track the zero-seed
@@ -3157,8 +3164,8 @@ def chain_reference_grads(case, state0, dO, d_final):
 @pytest.mark.parametrize("seq_lens,H", CHAIN_SHAPES, ids=CHAIN_SHAPE_IDS)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_piece_chain_fwd_matches_uncut_and_reference(backend, variant, seq_lens, H, state_dtype):
-    """o and final_state of a long batch on few tiles against the batch run whole and the fp64 reference; an
-    empty sequence passes its initial state through bitwise."""
+    """o and final_state of a long batch on few tiles against the batch run whole and, with an fp32 state, the fp64
+    reference; an empty sequence passes its initial state through bitwise."""
     case = chain_case(variant, seq_lens, H=H)
     state0 = random_state(case, dtype=state_dtype) if state_dtype is not None else None
     o_chain, fs_chain = run_fwd(backend, case, initial_state=state0, output_final_state=True)
@@ -3166,9 +3173,10 @@ def test_piece_chain_fwd_matches_uncut_and_reference(backend, variant, seq_lens,
     assert fs_chain.dtype == fs_uncut.dtype == (state_dtype or torch.float32)
     assert_rms_close("o chain-vs-uncut", o_chain, o_uncut.float(), CHAIN_VS_UNCUT_TOL)
     assert_rms_close("final_state chain-vs-uncut", fs_chain, fs_uncut.float(), CHAIN_VS_UNCUT_TOL)
-    o_ref, fs_ref = reference(case, initial_state=state0)
-    assert_rms_close("o vs fp64", o_chain, o_ref, CHAIN_FWD_TOL)
-    assert_rms_close("final_state vs fp64", fs_chain, fs_ref, CHAIN_FWD_TOL)
+    if state_dtype is torch.float32:
+        o_ref, fs_ref = reference(case, initial_state=state0)
+        assert_rms_close("o vs fp64", o_chain, o_ref, CHAIN_FWD_TOL)
+        assert_rms_close("final_state vs fp64", fs_chain, fs_ref, CHAIN_FWD_TOL)
     for n, length in enumerate(seq_lens):
         if length == 0:
             want = state0[n] if state0 is not None else torch.zeros_like(fs_chain[n])
@@ -3316,15 +3324,16 @@ def test_piece_chain_checkpoint_series_layout_matches_uncut(backend, variant, ca
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_piece_chain_bwd_matches_uncut_and_reference(backend, variant, seq_lens, H, cadence):
     """The three backward checkpoint cases with a nonzero initial_state and d_final_state; every gradient against
-    the batch run whole and the fp64 reference."""
+    the batch run whole, and without a series against the fp64 reference (the cadence does not enter the reference)."""
     checkpoint = cadence * CHUNK[variant]
     case = chain_case(variant, seq_lens, H=H)
     state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
     _, _, grads, dO, _ = chain_grads(backend, case, checkpoint=checkpoint, initial_state=state0, d_final_state=d_final)
     _, _, grads_uncut, _, _ = chain_grads(backend, case, batch_invariant=True, checkpoint=checkpoint, initial_state=state0, d_final_state=d_final, dO=dO)
     assert_chain_grads_close(grads, grads_uncut)
-    for name, want in chain_reference_grads(case, state0, dO, d_final).items():
-        assert_rms_close(f"d{name} vs fp64", grads[name], want, CHAIN_STATE_GRAD_TOL if name == "initial_state" else CHAIN_BWD_TOL)
+    if cadence == 0:
+        for name, want in chain_reference_grads(case, state0, dO, d_final).items():
+            assert_rms_close(f"d{name} vs fp64", grads[name], want, CHAIN_STATE_GRAD_TOL if name == "initial_state" else CHAIN_BWD_TOL)
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)

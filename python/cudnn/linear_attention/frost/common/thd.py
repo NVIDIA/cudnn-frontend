@@ -85,6 +85,56 @@ def emit_seq_descs(
 
 
 @cute.jit
+def emit_tile_seq_descs(
+    base_desc,
+    desc_words,
+    cu_seqlens,
+    base_ptr,
+    n_batch: cutlass.Int32,
+    b_t: cutlass.Constexpr[int],
+    seq_ord: cutlass.Constexpr[int],
+    expand_num: cutlass.Constexpr[int] = 1,
+    lanes: cutlass.Constexpr[int] = 1,
+) -> None:
+    """Per-BATCH descriptor array for the chunk-factor tile buffer ``(row, head, b_t, b_t)`` of gdn_tinv_f16.  Sequence b
+    owns the tile rows from ``cu[b] // b_t + b`` (one padding row per sequence keeps that base closed-form), so
+    GLOBAL_ADDRESS advances by that row times ``base_ptr.stride[0]`` and GLOBAL_DIM[``seq_ord``] is capped to the
+    sequence's chunk count.  ``expand_num`` scales the loaded ``cu`` values onto GDP's sub-token timeline (1 = off);
+    ``lanes`` as in :func:`emit_seq_descs`."""
+    desc_base = desc_words.iterator.raw_ptr()
+    src_words = Pointer(base_desc.get_ptr(), dtype=cutlass.Int64)
+    cu = cutlass.make_array_view(cu_seqlens)
+    base = base_ptr.iterator.raw_ptr()
+    first = cutlass.Int32(0)
+    if cutlass.const_expr(lanes > 1):
+        first = cutlass.Int32(cute.arch.thread_idx()[0]) % cutlass.Int32(lanes)
+    for b in cutlass.range(first, n_batch, lanes, unroll=1):
+        cu_b = cutlass.Int32(cu[b])
+        s_b = cutlass.Int32(cu[b + cutlass.Int32(1)]) - cu_b
+        if cutlass.const_expr(expand_num > 1):
+            cu_b = cu_b * cutlass.Int32(expand_num)
+            s_b = s_b * cutlass.Int32(expand_num)
+        row_b = cu_b // cutlass.Int32(b_t) + b
+        n_b = (s_b + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
+        dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
+        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+            (dptr + i).store((src_words + i).load())
+        addr = base + cutlass.Int64(row_b) * cutlass.Int64(base_ptr.stride[0])
+        nvvm.tensormap_replace(
+            nvvm.TensormapField.GLOBAL_ADDRESS,
+            dptr,
+            new_value=addr.toint(cutlass.Int64),
+        )
+        nvvm.tensormap_replace(
+            nvvm.TensormapField.GLOBAL_DIM,
+            dptr,
+            new_value=n_b,
+            ord=seq_ord,
+        )
+        set_tensor_map_bit21(dptr, cutlass.Int64(n_b) * cutlass.Int64(base_ptr.stride[0]) * cutlass.Int64(base_ptr.element_type.width // 8))
+
+
+@cute.jit
 def emit_checkpoint_seq_descs(
     base_desc,
     desc_words,

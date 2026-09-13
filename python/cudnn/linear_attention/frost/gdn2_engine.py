@@ -481,7 +481,7 @@ class CompiledGdn2:
                 seed_dtype=str(state0.dtype) if state0 is not None else None,
                 device=self.device,
             )
-        self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, main_rows=region["main_rows"])
 
         if warm:
             self.kernel.run_prefill(
@@ -611,7 +611,6 @@ class CompiledGdn2Bwd:
         self.cu_name = "int32" if node.inputs["cu_seqlens"].get_data_type().name == "INT32" else "int64"
         self.n_heads_out, self.total = HO, total
         self.num_sm = multiprocessor_count(self.device)
-        self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.num_seqs = B
         self.pieces, self.unit_chunks = choose_pieces(
@@ -892,7 +891,7 @@ class CompiledGdn2Bwd:
                 dstate_in,
                 work_items,
                 work_count,
-                scheduler_bwd if self.bwd_dynamic_scheduling else None,
+                scheduler_bwd,
                 region["scheduler_all"] if not self.order_in_recompute else None,
                 region.get("item_scratch") if not self.order_in_recompute else None,
                 region["bwd_tensormaps"],
@@ -996,7 +995,7 @@ class CompiledGdn2Bwd:
                 beta_guard=self.beta_guard,
                 work_items=work_items,
                 work_count=work_count,
-                scheduler_counter=scheduler_bwd if self.bwd_dynamic_scheduling else None,
+                scheduler_counter=scheduler_bwd,
                 scheduler_all=region["scheduler_all"] if not self.order_in_recompute else None,
                 work_item_scratch=region.get("item_scratch") if not self.order_in_recompute else None,
                 order_in_prologue=not self.order_in_recompute,
@@ -1177,7 +1176,7 @@ class CompiledGdn2Bwd:
                     seed_dtype=str(state0.dtype) if state0 is not None else None,
                     device=self.device,
                 )
-            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, cu_pieces=cu_pieces)
+            self.run_state_chain(self.chain_forward, self.num_seqs, state_h, state_m, state_x, state0, None, None, stream, main_rows=region["main_rows"])
 
         if warm:
             self.summary.run_bwd_summary(
@@ -1246,7 +1245,7 @@ class CompiledGdn2Bwd:
                 seed_dtype=str(dstate_in.dtype) if dstate_in is not None else None,
                 device=self.device,
             )
-        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_dx_end, dstate_in, None, None, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_dx_end, dstate_in, None, None, stream, main_rows=region["main_rows"])
 
         if not (self.has_state_checkpoints and not self.coarse_checkpoints):
             series_items = region["work_items_recompute"] if self.coarse_checkpoints else work_items
@@ -1848,7 +1847,9 @@ class CompiledGdn2Summary:
                 summary_dtype=str(transition.dtype) if transition is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_summary, self.num_seqs, state_h, state_m, state_x, state0, final_state, transition, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(
+            self.chain_summary, self.num_seqs, state_h, state_m, state_x, state0, final_state, transition, stream, main_rows=region["main_rows"]
+        )
 
 
 class CompiledGdn2SummaryBwd:
@@ -1905,7 +1906,6 @@ class CompiledGdn2SummaryBwd:
         self.num_seqs = B
         self.dim_k, self.dim_v = K, V
         self.num_sm = multiprocessor_count(self.device)
-        self.dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.pieces, self.unit_chunks = choose_pieces(
             num_seqs=B,
@@ -2051,7 +2051,7 @@ class CompiledGdn2SummaryBwd:
                 dstate_in,
                 work_items,
                 work_count,
-                region["scheduler_main"] if self.dynamic_scheduling else None,
+                region["scheduler_main"],
                 region["scheduler_all"],
                 region.get("item_scratch"),
                 region["tensormaps"],
@@ -2109,7 +2109,7 @@ class CompiledGdn2SummaryBwd:
             beta_guard=self.beta_guard,
             work_items=work_items,
             work_count=work_count,
-            scheduler_counter=region["scheduler_main"] if self.dynamic_scheduling else None,
+            scheduler_counter=region["scheduler_main"],
             scheduler_all=region["scheduler_all"],
             work_item_scratch=region.get("item_scratch"),
             order_in_prologue=True,
@@ -2352,4 +2352,6 @@ class CompiledGdn2SummaryBwd:
                 summary_dtype=str(transition.dtype) if transition is not None else "float32",
                 device=self.device,
             )
-        self.run_state_chain(self.chain_reverse, self.num_seqs, state_g, state_m, state_x, dstate_in, dstate0, transition, stream, cu_pieces=cu_pieces)
+        self.run_state_chain(
+            self.chain_reverse, self.num_seqs, state_g, state_m, state_x, dstate_in, dstate0, transition, stream, main_rows=region["main_rows"]
+        )

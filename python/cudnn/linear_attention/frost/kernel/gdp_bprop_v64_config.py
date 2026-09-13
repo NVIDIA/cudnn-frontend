@@ -29,16 +29,12 @@ from typing import Tuple
 @dataclass(frozen=True)
 class Cfg:
     # --- tile shape ---
-    B_T: int = 64  # chunk size / token tile (the mma N or K of every GEMM)
-    D_K: int = 128  # query/key head dim
-    D_V: int = 64  # value head dim (this fork serves d_v = 64 only)
-
-    # --- TMA descriptor pool ---
+    B_T: int = 64
 
     # --- warp assignments (16 warps total) ---
-    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # T-pairwise / kk_epi / qk_epi / inverse / parts
-    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # dstate prep / dV-dK-dQ epilogues / dq dot
-    COMPUTE_GROUP_2_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)  # dK inter rescale / attn read / dGate K parts / dK fold
+    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)
+    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)
+    COMPUTE_GROUP_2_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)
     TCGEN05_MMA_WARP_ID: int = 12
     TMA_QKV_WARP_ID: int = 13
     LOAD_GATE_BETA_WARP_ID: int = 14
