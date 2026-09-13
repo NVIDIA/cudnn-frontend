@@ -244,12 +244,13 @@ def test_prune_retires_dead_environments_oldest_first_and_keeps_the_current_one(
     empty_manifest = env(cc._SCHEMA, "c" * 24, 100_000, 9000, manifest="{}")
     wrong_schema = env(cc._SCHEMA, "d" * 24, 100_000, 9000, manifest=json.dumps({"schema": "v9", "cudnn_frontend": "1.30.0"}))
     corrupt = env(cc._SCHEMA, "e" * 24, 100_000, 9000, manifest="{not json")
+    empty_version = env(cc._SCHEMA, "f" * 24, 100_000, 9000, manifest=json.dumps({"schema": cc._SCHEMA, "cudnn_frontend": ""}))
     cc.reset_stats()
     assert cc.prune(tmp_path, limit=0) == 0  # 0 = never prune
     assert cc.prune(tmp_path, limit=2500, keep=cur) == 2
     assert not dead.exists() and not old.exists() and mid.exists() and cur.exists()
     assert (foreign / "caller_owned.bin").exists() and no_manifest.exists() and odd_name.exists()
-    assert other_tool.exists() and empty_manifest.exists() and wrong_schema.exists() and corrupt.exists()
+    assert other_tool.exists() and empty_manifest.exists() and wrong_schema.exists() and corrupt.exists() and empty_version.exists()
     assert cc.stats()["pruned"] == 2
     assert cc.prune(tmp_path, limit=2500, keep=cur) == 0  # under the cap: nothing to do
     # a symlink planted in the root is neither followed nor a deletion target

@@ -452,7 +452,10 @@ def _is_our_environment(env: Path, schema: str) -> bool:
     this schema and a cudnn_frontend version. A same-shaped directory another
     tool made (or a half-written one) is not ours and is never removed."""
     manifest = _read_json(env / _MANIFEST)
-    return isinstance(manifest, dict) and manifest.get("schema") == schema and isinstance(manifest.get("cudnn_frontend"), str)
+    if not isinstance(manifest, dict) or manifest.get("schema") != schema:
+        return False
+    version = manifest.get("cudnn_frontend")
+    return isinstance(version, str) and bool(version.strip())
 
 
 def _prune_once(root: Path, current_env: Path) -> None:
