@@ -258,11 +258,6 @@ class Capabilities:
     # Dense padded + stats needs the per-batch seq_len_q LSE trim (padded
     # q-rows write LSE=-inf / O=0, cuDNN >= 9.14).
     padded_stats: bool = False
-    # THD graphs whose Stats has NO ragged offsets (per-batch padded (b, s_max, h)
-    # rows, FlashInfer's form): the kernel stores per batch and the adapter
-    # fills the tail rows with -inf. Rows whose kernels lack the per-batch THD
-    # store keep False and decline the form (the backend serves it).
-    thd_padded_stats: bool = False
     # Dense padded graphs carrying per-batch seq_len_q: the kernel's epilogue
     # trims padded q rows (O := 0, LSE := -inf). Rows whose kernel lacks the
     # trim keep False: lower_dsl_prefill then drops the buffer instead of
@@ -350,6 +345,11 @@ class Capabilities:
     # APPENDED at the end deliberately: Capabilities evolves append-only, so a
     # positional construction of an older field never silently rebinds.
     pack_gqa_d_shapes: Optional[frozenset] = None
+    # THD graphs whose Stats has NO ragged offsets (per-batch padded (b, s_max, h)
+    # rows, FlashInfer's form): the kernel stores per batch and the adapter
+    # fills the tail rows with -inf. Rows whose kernels lack the per-batch THD
+    # store keep False and decline the form (the backend serves it).
+    thd_padded_stats: bool = False
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:

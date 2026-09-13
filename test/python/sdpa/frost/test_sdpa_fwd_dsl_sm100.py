@@ -662,6 +662,8 @@ def test_dsl_sm100_thd_padded_stats_execute_checks_the_buffer():
         )
     with pytest.raises(ValueError, match="padded lse_tensor must have"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse[:, :, :-1])
+    with pytest.raises(ValueError, match="lse_tensor must be on"):  # a host pointer would reach the raw CUDA fill
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse.cpu())
     with pytest.raises(ValueError, match="lse_tensor must be float32"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse.to(torch.bfloat16))
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse)

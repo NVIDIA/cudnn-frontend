@@ -618,7 +618,13 @@ class SdpaFwdDsl(APIBase):
         """A per-batch padded Stats buffer holds exactly B*H_q*s_max fp32 values;
         the declared strides are then applied over it (the caller may hand any
         view of that storage -- rank-4 graph Stats, (b, s_max, h) -- so the
-        element count, not the shape, is the contract)."""
+        element count, not the shape, is the contract). The device is checked
+        first: the seed hands ``data_ptr()`` to a raw CUDA fill on the launch
+        stream, which would fault on a host or foreign-device pointer."""
+        self._value_error_if(
+            lse_tensor.device != self.q_desc.device or lse_tensor.device.type != "cuda",
+            f"lse_tensor must be on {self.q_desc.device}; got {lse_tensor.device}",
+        )
         self._value_error_if(dtype_name(lse_tensor) != "float32", f"lse_tensor must be float32; got {lse_tensor.dtype}")
         expected = self.batch_size * self.h_q * self.s_q_max
         self._value_error_if(

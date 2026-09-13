@@ -262,8 +262,10 @@ def _accept_means_run(case: _Case, *, padded_rows_too: bool = True, decline_ok: 
 @pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
 @pytest.mark.parametrize("d", [128, 192])
 def test_ragged_prefill_batch_of_two(form, d):
-    """FlashInfer's main prefill path: b > 1 ragged Q/K/V/O with packed stats."""
-    _accept_means_run(_Case([68, 87], [400, 512], s_q_max=128, s_kv_max=512, d=d, tokens_form=form == "tokens"))
+    """FlashInfer's main prefill path: b > 1 ragged Q/K/V/O with packed stats.
+    d=192 is FlashInfer's (192, 128) MLA-style pair, a native THD shape on
+    every row (a (192, 192) THD graph rides the envelope on SM100 only)."""
+    _accept_means_run(_Case([68, 87], [400, 512], s_q_max=128, s_kv_max=512, d=d, d_v=min(d, 128), tokens_form=form == "tokens"))
 
 
 @pytest.mark.parametrize("form", ["legacy_offsets", "tokens"])
