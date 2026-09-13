@@ -1,7 +1,6 @@
 
 # Convolutions
 
-(convolution-fprop)=
 ## Convolution Fprop
 
 Convolution fprop computes:
@@ -53,7 +52,6 @@ set_convolution_mode(ConvolutionMode_t mode_)
 
 The symmetric-padding overload accepts `padding` in place of `pre_padding` and `post_padding`.
 
-(convolution-dgrad)=
 ## Convolution Dgrad
 
 Convolution dgrad computes data gradient during backpropagation.
@@ -102,7 +100,6 @@ set_convolution_mode(ConvolutionMode_t mode_)
 
 The symmetric-padding overload accepts `padding` in place of `pre_padding` and `post_padding`.
 
-(convolution-wgrad)=
 ## Convolution Wgrad
 
 Convolution wgrad computes weight gradient during backpropagation.

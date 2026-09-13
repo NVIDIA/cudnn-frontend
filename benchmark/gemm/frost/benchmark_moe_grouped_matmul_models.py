@@ -42,14 +42,18 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
 from benchmark_utils import (
+    with_workspace,
+    add_fto_alignment_arg,
     add_sweep_args,
     ceil_div,
     even_offsets,
+    expand_config_variants,
+    fto_alignment,
     rand_e8m0,
     report_pool,
     resolve_nbuf,
     rotating,
-    select_configs,
+    select_config_variants,
     set_bytes,
     spec_for,
     time_ms,
@@ -141,7 +145,7 @@ def _operands(g, S: int, N: int, K: int, E: int, dtype: str, offsets: list[int])
     return (tok_d, w0_d, w1_d), [tok], [w0, w1], [sfa], [sfb0, sfb1]
 
 
-def _graph(S: int, N: int, K: int, E: int, variant: str, dtype: str = "bf16", offsets: list[int] | None = None):
+def _graph(S: int, N: int, K: int, E: int, variant: str, dtype: str = "bf16", offsets: list[int] | None = None, alignment: int = 1):
     """Dual MoE grouped matmul (token shared → loaded once, two accumulators)
     feeding the model's GLU epilogue. ``offsets`` sizes the SFA blob under mxfp8
     (defaults to an even split, which is what the config sweep probes with)."""
@@ -153,7 +157,13 @@ def _graph(S: int, N: int, K: int, E: int, variant: str, dtype: str = "bf16", of
     offsets = offsets if offsets is not None else even_offsets(S, E)
     (a, b0, b1), a_ops, b_ops, sfa_ops, sfb_ops = _operands(g, S, N, K, E, dtype, offsets)
     # fto MUST be the SAME tensor for both matmuls (shared routed-group layout).
-    fto = g.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(
+        name="first_token_offset",
+        dim=[E, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.INT32,
+        alignment_value=alignment,
+    )
 
     consts: list[tuple] = []
 
@@ -355,10 +365,10 @@ def _build_spec_map(variant: str, dtype: str) -> dict[str, tuple]:
     n_cap = 128 if dtype == "mxfp8" else 256
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.mma_inst_m != 128:
+        if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.mma_tile_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma"
-        m[label] = (cfg, t.cta_group)
+        label = cfg.name
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 
@@ -369,6 +379,9 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
     N, K = spec["N"], spec["K"]
     S, E = args.tokens, args.experts
     offsets = even_offsets(S, E)
+    # `even_offsets` spreads the remainder, so the promise is the GCD of the
+    # actual starts, not S//E.
+    alignment = fto_alignment(args.fto_alignment, offsets)
     variant = spec["variant"]
 
     flops = 2 * (2 * S * N * K)  # 2 grouped GEMMs, each 2*S*N*K
@@ -405,8 +418,17 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
         bl_label = "unfused per-group cuBLAS bf16 + pointwise" + ("" if bl_sets is pool else " [no rotation]")
         print(f"  {bl_label:64s} {flops / (bl_ms * 1e-3) / 1e12:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms", flush=True)
 
-    spec_map = _build_spec_map(variant, args.dtype)
-    labels = select_configs(args.configs, spec_map)
+    spec_map = expand_config_variants(
+        _build_spec_map(variant, args.dtype),
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
+    labels = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
     print(f"  sweeping {len(labels)} configs (each JITs once, ~15-25 s)", flush=True)
 
     best = None
@@ -419,8 +441,8 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
         if args.stream:
             print(f"  ▶ running {label} ...", flush=True)
         try:
-            g, h = _graph(S, N, K, E, variant, args.dtype, offsets)
-            plan = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+            g, h = _graph(S, N, K, E, variant, args.dtype, offsets, alignment)
+            plan = with_workspace(jit_from_cudnn_graph(g, config=cfg))
         except (NotImplementedError, ValueError) as e:
             print(f"  {label:64s} SKIP: {type(e).__name__}: {str(e)[:40]}", flush=True)
             continue
@@ -461,6 +483,7 @@ def main() -> int:
     p.add_argument("-S", "--tokens", type=int, default=None, help="token count (required)")
     p.add_argument("-E", "--experts", type=int, default=None, help="expert count (required)")
     add_sweep_args(p, nsys=False)
+    add_fto_alignment_arg(p)
     p.add_argument("--no-verify", action="store_true", help="skip the torch reference check")
     p.add_argument("--no-baseline", action="store_true", help="skip the unfused per-group cuBLAS baseline")
     p.add_argument("--list-models", action="store_true")

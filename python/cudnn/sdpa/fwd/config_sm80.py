@@ -5,7 +5,7 @@
 
 One frozen dataclass per kernel flavor (the model families the head-dim
 envelopes are named after), all served by the same kernel skeleton
-(``kernels/prefill_f16_sm80.py``; qwen d=256 by ``prefill_d256_f16_sm80.py``).
+(``kernels/sm80/prefill_f16.py``; qwen d=256 by ``sm80/prefill_d256_f16.py``).
 Knob provenance per flavor:
 
 - **gptoss** (d_qk = d_v = 64): picked from the A100-PCIE-40GB perf sweep. At

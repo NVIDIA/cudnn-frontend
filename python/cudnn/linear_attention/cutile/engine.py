@@ -30,6 +30,8 @@ def cutile_la_gate(engine: str, facts, op: str, dg_want) -> None:
         raise NotImplementedError(f"{engine} supports exactly one {op}/{op}_BWD node")
     if facts.invalid:
         raise NotImplementedError(f"{engine}: {facts.invalid}")
+    if facts.allow_neg_eigval:
+        raise NotImplementedError(f"{engine}: allow_neg_eigval has no cuTile path (the FROST engines serve it)")
     if buffers.current_sm() is None:
         raise NotImplementedError(f"{engine} requires a CUDA device")
     try:
@@ -65,11 +67,12 @@ def cutile_la_gate(engine: str, facts, op: str, dg_want) -> None:
         ("final_state", facts.final_state_dtype),
         ("d_final_state", facts.d_final_state_dtype),
         ("d_initial_state", facts.d_initial_state_dtype),
-        ("a_log", facts.a_log_dtype),
-        ("dt_bias", facts.dt_bias_dtype),
     ):
         if got not in (fp32, None):
             raise NotImplementedError(f"{engine}: '{port}' must be fp32 (callers convert), got {got}")
+    for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
+        if got not in (fp32, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF, None):
+            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16, got {got}")
 
     io = facts.io_dtype
     if not facts.is_bwd:

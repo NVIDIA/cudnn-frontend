@@ -259,8 +259,8 @@ class pygraph:
         the backend path. Populated after create_execution_plans().
 
         Cached, because ``execute()`` asks on every call and answering means
-        walking every registered engine for the one declaring this id — 2.75 us
-        to re-derive something that only ``select_plan`` can change. Keyed on
+        walking every registered engine for the one declaring this id, re-deriving
+        something that only ``select_plan`` can change. Keyed on
         the config OBJECT, so replanning invalidates it without needing a hook
         on every writer of ``_plan_index``.
         """
@@ -291,9 +291,13 @@ class pygraph:
         name: str = "",
         uid: Optional[int] = None,
         ragged_offset_multiplier: int = 1,
+        alignment_value: int = 1,
         **kwargs,
     ) -> Tensor:
-        """Create a tensor."""
+        """Create a tensor.
+
+        `alignment_value` promises every VALUE the tensor holds is a multiple of
+        it; it constrains the contents, not the layout, and is not validated."""
         if not name:
             name = f"tensor_{len(self._tensors)}"
         if data_type is not None and getattr(data_type, "name", None) == "NOT_SET":
@@ -330,6 +334,7 @@ class pygraph:
             ragged_offset=ragged_offset,
             reordering_type=reordering_type,
             ragged_offset_multiplier=ragged_offset_multiplier,
+            alignment_value=alignment_value,
             uid=uid if uid is not None else self._alloc_uid(),
             uid_assigned=uid is not None,
             dim_assigned=True,  # graph inputs: the user specified the layout
@@ -402,8 +407,11 @@ class pygraph:
         if self._frozen:
             raise RuntimeError(f"cannot {what} after lowering/planning — the graph is frozen (planning is one-shot; build a new graph)")
         # a mutation while merely validated (python-engine graphs stay mutable
-        # until planning) must re-validate later — never run on stale inference
+        # until planning) must re-validate later — never run on stale inference,
+        # and never plan on candidates matched against the pre-mutation graph
+        # (validate() may have cached them before the freeze).
         self._is_validated = False
+        self._candidates = None
 
     def _freeze(self) -> None:
         """Freeze the ENTIRE public graph surface.
@@ -816,15 +824,59 @@ class pygraph:
                 t.stride = _row_major_stride(t.dim)
             if not t.is_pass_by_value:
                 t.validate()
-        self._is_validated = True
         # Classic parity: C++ validation happens HERE, so a config the backend
         # rejects raises from validate() where callers catch it to skip. Skipped
         # only for a graph the backend has no lowering for (GDN/KDA/...), or when
         # the caller registered its own engine — the pre-existing exemption.
+        #
+        # A graph whose engine family declares a python-native validator, and for
+        # which the manifest offers a python engine, validates natively instead
+        # (issue #704): the eager C++ round-trip couples a graph a FROST engine
+        # fully serves to the installed backend's version (an attribute the
+        # backend is too old to *validate* but will never execute). The family's
+        # validator runs its version- and arch-agnostic semantic rules with the
+        # classic error types and returns False -- classic lowering -- when the
+        # graph holds a node it does not cover. The backend's own verdict is
+        # deferred to planning, where a decline is recorded (backend_plan_entries)
+        # and surfaced by plan() only if no python engine proposes a plan either.
         if self._backend_lowerable() and self._lowered_graph is None:
-            self._lowered_graph = self._lower_to_cpp()
-            self._lowered_graph.validate()
-            self._verify_uid_ownership()
+            validator = self._python_native_validator()
+            if not (validator is not None and validator(self)):
+                self._lowered_graph = self._lower_to_cpp()
+                try:
+                    self._lowered_graph.validate()
+                    self._verify_uid_ownership()
+                except Exception:
+                    # A rejected lowering must not survive: the next validate()
+                    # would find _lowered_graph set, skip the backend check, and mark
+                    # the rejected graph valid.
+                    self._reset_lowered_state()
+                    raise
+        # Only a graph that passed EVERY check above is validated: a rejection
+        # (python-native or C++) leaves the flag False so build()/plan() re-run
+        # validate() and raise again instead of planning a rejected graph.
+        self._is_validated = True
+
+    def _python_native_validator(self):
+        """The graph's family validator when validate() may skip the eager C++
+        lowering: the graph belongs to one engine family, that family declares a
+        python-native validator (manifest.EngineFamily.validator), AND the manifest
+        offers a python engine for it (frost engines available and enabled).
+        None otherwise: without a candidate the backend is the only possible
+        server, so classic timing -- raise its rejection from validate() -- must
+        hold. The validator itself still returns False for a graph holding a node
+        it does not cover, which also means classic lowering."""
+        from .engines import manifest
+
+        if not self._nodes:
+            return None
+        family = manifest.family_for(self)
+        if family is None:
+            return None
+        validator = manifest.resolve_validator(family)
+        if validator is None or not self._candidate_engines():
+            return None
+        return validator
 
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
@@ -957,7 +1009,7 @@ class pygraph:
 
         A failure here is the backend DECLINING (a python engine may still
         serve the graph), recorded as backend_plan_entries() records one. Not
-        routed through that, which also runs the ~178 ms C++ plan query a
+        routed through that, which also runs the C++ plan query that
         the heuristics may never ask for.
         """
         import cudnn
@@ -969,12 +1021,7 @@ class pygraph:
         except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
             _LOG.warning("backend could not build this graph, treating as a decline: %s", exc)
             self._backend_declined = exc
-            self._lowered_graph = None
-            self._cpp_tensors.clear()
-            self._cpp_bog_done = False
-            self._cpp_plans_created = False
-            self._backend_mode_spans.clear()
-            self._backend_entries = []
+            self._reset_lowered_state()
 
     def _attach_facts(self) -> None:
         """Describe this frozen graph in its family's vocabulary.
@@ -1044,10 +1091,9 @@ class pygraph:
         those would silently run a python engine on a failing device and call it a
         routing decision.
 
-        The query costs a real ``create_execution_plans`` on the lowered graph
-        (~178 ms on sm100/9.26 for a 1024^3 bf16 matmul): there is no cheaper way
-        to obtain a RANKED list today, since ``get_engine_and_knobs_at_index``
-        indexes the plan list, not the engine list.
+        The query costs a real ``create_execution_plans`` on the lowered graph;
+        there is no cheaper way to obtain a RANKED list, since
+        ``get_engine_and_knobs_at_index`` indexes the plan list, not the engine list.
 
         Answered ONCE per graph: a second C++ create_execution_plans() appends
         to the same plan list (``enqueue_engine_configs`` -> ``back_inserter``),
@@ -1088,12 +1134,7 @@ class pygraph:
             _LOG.warning("backend could not lower this graph, treating as a decline: %s", exc)
             # Roll back: a half-lowered graph makes a later build_operation_graph()
             # walk into the descriptor that just failed.
-            self._lowered_graph = None
-            self._cpp_tensors.clear()
-            self._cpp_bog_done = False
-            self._cpp_plans_created = False
-            self._backend_mode_spans.clear()
-            self._backend_entries = []
+            self._reset_lowered_state()
             return self._backend_entries
         try:
             # "Which engines does it offer?" — here only an unsupported-graph
@@ -1272,6 +1313,17 @@ class pygraph:
     def _build_context(self, handle: Any = None) -> Any:
         h = handle if handle is not None else self._handle
         return ExecutionContext(handle=h, stream=self._resolve_stream(h))
+
+    def _reset_lowered_state(self) -> None:
+        """Drop every artifact of a C++ lowering (graph, tensors, BOG/plan flags,
+        backend entries) so a later lowering starts from the IR, not from a
+        half-built or rejected descriptor."""
+        self._lowered_graph = None
+        self._cpp_tensors.clear()
+        self._cpp_bog_done = False
+        self._cpp_plans_created = False
+        self._backend_mode_spans.clear()
+        self._backend_entries = []
 
     def _verify_uid_ownership(self) -> None:
         # Verify the uid-ownership invariant (see _lower_to_cpp): every C++
@@ -1543,11 +1595,15 @@ class pygraph:
             raise RuntimeError("Call build() first")
 
         if self.selected_engine is not None:
-            # The overload args (handle, override_uids/shapes/strides) describe the
-            # problem, and CompiledPlan.get_workspace_size() takes none of them: a
-            # compiled python plan's workspace is a property of the plan. A
-            # shape-dependent one would have to say so through that API.
-            return self._compiled_plans[self._plan_index].get_workspace_size()
+            # A compiled python plan's workspace is normally a property of the
+            # plan. A shape-dependent one (frost split-K partials) says so by
+            # exposing get_workspace_size_for_shapes, which follows the overrides.
+            plan = self._compiled_plans[self._plan_index]
+            if override_shapes is not None:
+                sized = getattr(plan, "get_workspace_size_for_shapes", None)
+                if sized is not None:
+                    return sized(override_uids, override_shapes)
+            return plan.get_workspace_size()
 
         # Same reason execute() addresses by index; the overload args pass through.
         cfg = self._materialize_backend_plan(self._plan_index) if self._plans else None
@@ -1563,10 +1619,15 @@ class pygraph:
         self._reject_if_barred(self._check_plan_index(index))
         cfg = self._plans[index]
         if self._engine_for(cfg) is not None:
-            # Overload args accepted and not consulted — see get_workspace_size().
+            # Shape-dependent plans consult the overrides — see get_workspace_size().
             if index not in self._compiled_plans:
                 self._build_plan_at(index)
-            return self._compiled_plans[index].get_workspace_size()
+            plan = self._compiled_plans[index]
+            if override_shapes is not None:
+                sized = getattr(plan, "get_workspace_size_for_shapes", None)
+                if sized is not None:
+                    return sized(override_uids, override_shapes)
+            return plan.get_workspace_size()
         cfg = self._materialize_backend_plan(index)
         if cfg.cpp_index is None:  # delegating entry
             return self._lowered_graph.get_workspace_size(to_backend_handle(handle), override_uids, override_shapes, override_strides)
@@ -1761,7 +1822,7 @@ class pygraph:
             # A JIT engine must compile for the device/stream it will run on, so
             # build the caller context here. Only here: a steady-state execute()
             # otherwise discarded this (a cudnnGetStream round-trip + an
-            # ExecutionContext alloc, ~2.9us) on every already-built call.
+            # ExecutionContext alloc) on every already-built call.
             caller_ctx = self._build_context(handle) if handle is not None else None
             if not self._planning_done:
                 self.create_execution_plans()
@@ -1961,12 +2022,10 @@ class pygraph:
         BYTES for the array-interface family and in ELEMENTS for torch/DLPack,
         and an absent stride means dense row-major rather than unknown.
 
-        Ordered by what it costs to ask (measured, 4096x4x128): reading
-        attributes is 0.52 us for torch and 0.72 for cupy, while the DLPack
-        capsule round trip is 1.5-8.6. The expensive case is specifically torch
-        bfloat16, whose ``__cuda_array_interface__`` raises because the
-        protocol cannot spell bf16 — which is why the last branch is last and
-        not the only one.
+        Ordered by what it costs to ask: attribute reads before the DLPack
+        capsule round trip. The expensive case is torch bfloat16, whose
+        ``__cuda_array_interface__`` raises because the protocol cannot spell
+        bf16, which is why the last branch is last and not the only one.
 
         A bare address carries no geometry, so it borrows the graph's: the
         backend has always accepted a raw pointer, and an engine that reads the
@@ -2386,8 +2445,11 @@ _install_pointwise_builders()
 #   attrs              scalar/enum/list params stored in node.params verbatim
 #                      and forwarded as keywords at lowering
 #   outputs            output ports, in C++ return order
+#   maybe              per-output presence predicate over the node (an output
+#                      whose predicate is False is skipped, and comes back None)
 #   infer              per-output IR-side shape inference (introspection; cuDNN
 #                      re-infers at build) — best-effort, None on failure
+#   dtype_like         per-output data_type copied from a named input port
 #   push_output_dims   True for ops whose output dims cuDNN cannot infer
 #                      (dgrad/wgrad/reduction/reshape/...): IR dims are pushed
 #   no_cdt             True for bindings without a compute_data_type kwarg
@@ -2463,6 +2525,33 @@ def _linear_attention_final_state_dims(node):
     return [cu.dim[0] - 1, max(q[1], v[1]), v[2], q[2]]
 
 
+def _linear_attention_summary_final_dims(node):
+    # [N, HO, V, K]
+    k, v, g = node.inputs["k"].dim, node.inputs["v"].dim, node.inputs["g"].dim
+    cu = node.inputs.get("cu_seqlens")
+    if cu is None or not cu.dim:
+        return None
+    return [cu.dim[0] - 1, g[1], v[2], k[2]]
+
+
+def _linear_attention_transition_dims(node):
+    # [N, HO, K, K]
+    k, g = node.inputs["k"].dim, node.inputs["g"].dim
+    cu = node.inputs.get("cu_seqlens")
+    if cu is None or not cu.dim:
+        return None
+    return [cu.dim[0] - 1, g[1], k[2], k[2]]
+
+
+def linear_attention_summary_bwd_dims(node):
+    # [N, HO, V, K]
+    k, g, do = node.inputs["k"].dim, node.inputs["g"].dim, node.inputs["dO"].dim
+    cu = node.inputs.get("cu_seqlens")
+    if cu is None or not cu.dim:
+        return None
+    return [cu.dim[0] - 1, g[1], do[2], k[2]]
+
+
 def _linear_attention_state_checkpoints_dims(node):
     n = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
@@ -2476,6 +2565,12 @@ def _linear_attention_o_dims(node):
     # [total_T, HO, V]: the output lives at the gate heads (HO = max(q, v))
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
     return [v[0], max(q[1], v[1]), v[2]]
+
+
+def _gdp_o_dims(node):
+    # [total_T, HO, V]: O follows q's rows; k/v carry the num_householder expansion
+    q, v = node.inputs["q"].dim, node.inputs["v"].dim
+    return [q[0], max(q[1], v[1]), v[2]]
 
 
 def _block_quant_scale_dims(node):
@@ -2637,7 +2732,17 @@ _STRUCTURED_OPS = {
     "gdn": dict(
         node_type=NodeType.GDN,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "safe_gate", "batch_invariant"),
+        attrs=(
+            "scale",
+            "output_final_state",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+        ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
@@ -2649,12 +2754,12 @@ _STRUCTURED_OPS = {
     "gdn_bwd": dict(
         node_type=NodeType.GDN_BWD,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
-        attrs=("scale", "use_qk_l2norm", "use_beta_sigmoid", "safe_gate", "batch_invariant"),
+        attrs=("scale", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
-            "d_a_log": lambda n: bool(n.params.get("safe_gate", False)),
-            "d_dt_bias": lambda n: bool(n.params.get("safe_gate", False)),
+            "d_a_log": lambda n: "a_log" in n.inputs,
+            "d_dt_bias": lambda n: "dt_bias" in n.inputs,
         },
         infer={
             "dQ": _like("q"),
@@ -2666,6 +2771,109 @@ _STRUCTURED_OPS = {
             "d_a_log": _like("a_log"),
             "d_dt_bias": _like("dt_bias"),
         },
+        dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
+        python_only=True,
+    ),
+    "gdn_summary": dict(
+        node_type=NodeType.GDN_SUMMARY,
+        inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=("output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        outputs=("final_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
+    "gdn_summary_bwd": dict(
+        node_type=NodeType.GDN_SUMMARY_BWD,
+        inputs=("q", "k", "g", "beta", "cu_seqlens", "dO", "d_final_state", "a_log", "dt_bias"),
+        attrs=("output_transition", "scale", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        outputs=("d_initial_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
+    "gdp": dict(
+        node_type=NodeType.GDP,
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=(
+            "num_householder",
+            "scale",
+            "output_final_state",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+        ),
+        outputs=("O", "final_state", "state_checkpoints"),
+        maybe={
+            "final_state": lambda n: bool(n.params.get("output_final_state", False)),
+            "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+        },
+        infer={"O": _gdp_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
+        python_only=True,
+    ),
+    "gdp_bwd": dict(
+        node_type=NodeType.GDP_BWD,
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        attrs=(
+            "num_householder",
+            "scale",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+        ),
+        outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
+        maybe={
+            "d_initial_state": lambda n: "initial_state" in n.inputs,
+            "d_a_log": lambda n: "a_log" in n.inputs,
+            "d_dt_bias": lambda n: "dt_bias" in n.inputs,
+        },
+        infer={
+            "dQ": _like("q"),
+            "dK": _like("k"),
+            "dV": _like("v"),
+            "dG": _like("g"),
+            "dBeta": _like("beta"),
+            "d_initial_state": _like("initial_state"),
+            "d_a_log": _like("a_log"),
+            "d_dt_bias": _like("dt_bias"),
+        },
+        dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
+        python_only=True,
+    ),
+    "gdp_summary": dict(
+        node_type=NodeType.GDP_SUMMARY,
+        inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=("num_householder", "output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        outputs=("final_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
+    "gdp_summary_bwd": dict(
+        node_type=NodeType.GDP_SUMMARY_BWD,
+        inputs=("q", "k", "g", "beta", "cu_seqlens", "dO", "d_final_state", "a_log", "dt_bias"),
+        attrs=(
+            "num_householder",
+            "output_transition",
+            "scale",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+        ),
+        outputs=("d_initial_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
         python_only=True,
     ),
     "kda": dict(
@@ -2677,7 +2885,9 @@ _STRUCTURED_OPS = {
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
             "use_beta_sigmoid",
+            "allow_neg_eigval",
             "safe_gate",
+            "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
         ),
@@ -2692,12 +2902,22 @@ _STRUCTURED_OPS = {
     "kda_bwd": dict(
         node_type=NodeType.KDA_BWD,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
-        attrs=("scale", "use_qk_l2norm", "use_beta_sigmoid", "safe_gate", "gate_lower_bound", "batch_invariant"),
+        attrs=(
+            "scale",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
-            "d_a_log": lambda n: bool(n.params.get("safe_gate", False)),
-            "d_dt_bias": lambda n: bool(n.params.get("safe_gate", False)),
+            "d_a_log": lambda n: "a_log" in n.inputs,
+            "d_dt_bias": lambda n: "dt_bias" in n.inputs,
         },
         infer={
             "dQ": _like("q"),
@@ -2709,6 +2929,35 @@ _STRUCTURED_OPS = {
             "d_a_log": _like("a_log"),
             "d_dt_bias": _like("dt_bias"),
         },
+        dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
+        python_only=True,
+    ),
+    "kda_summary": dict(
+        node_type=NodeType.KDA_SUMMARY,
+        inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=("output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "gate_lower_bound", "batch_invariant"),
+        outputs=("final_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
+    "kda_summary_bwd": dict(
+        node_type=NodeType.KDA_SUMMARY_BWD,
+        inputs=("q", "k", "g", "beta", "cu_seqlens", "dO", "d_final_state", "a_log", "dt_bias"),
+        attrs=(
+            "output_transition",
+            "scale",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
+        outputs=("d_initial_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
         python_only=True,
     ),
     "gdn2": dict(
@@ -2720,8 +2969,10 @@ _STRUCTURED_OPS = {
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
             "use_beta_sigmoid",
+            "allow_neg_eigval",
             "beta_guard",
             "safe_gate",
+            "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
         ),
@@ -2736,12 +2987,23 @@ _STRUCTURED_OPS = {
     "gdn2_bwd": dict(
         node_type=NodeType.GDN2_BWD,
         inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
-        attrs=("scale", "use_qk_l2norm", "use_beta_sigmoid", "beta_guard", "safe_gate", "gate_lower_bound", "batch_invariant"),
+        attrs=(
+            "scale",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "beta_guard",
+            "safe_gate",
+            "gate_domain",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
-            "d_a_log": lambda n: bool(n.params.get("safe_gate", False)),
-            "d_dt_bias": lambda n: bool(n.params.get("safe_gate", False)),
+            "d_a_log": lambda n: "a_log" in n.inputs,
+            "d_dt_bias": lambda n: "dt_bias" in n.inputs,
         },
         infer={
             "dQ": _like("q"),
@@ -2754,6 +3016,46 @@ _STRUCTURED_OPS = {
             "d_a_log": _like("a_log"),
             "d_dt_bias": _like("dt_bias"),
         },
+        dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
+        python_only=True,
+    ),
+    "gdn2_summary": dict(
+        node_type=NodeType.GDN2_SUMMARY,
+        inputs=("k", "v", "g", "beta", "w", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=(
+            "output_transition",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "beta_guard",
+            "safe_gate",
+            "gate_domain",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
+        outputs=("final_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
+    "gdn2_summary_bwd": dict(
+        node_type=NodeType.GDN2_SUMMARY_BWD,
+        inputs=("q", "k", "g", "beta", "cu_seqlens", "dO", "d_final_state", "a_log", "dt_bias"),
+        attrs=(
+            "output_transition",
+            "scale",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "beta_guard",
+            "safe_gate",
+            "gate_domain",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
+        outputs=("d_initial_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
         python_only=True,
     ),
     # ---- convolution ---------------------------------------------------------

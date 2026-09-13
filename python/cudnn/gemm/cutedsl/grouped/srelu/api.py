@@ -10,6 +10,7 @@ SReLU output quantization in MoE (Mixture of Experts) workloads.
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Optional, Tuple
 
@@ -102,6 +103,7 @@ class GroupedGemmSreluSm100(APIBase):
         discrete_col_sfd: bool = False,
         b_major: str = "k",
         use_dynamic_sched: bool = False,
+        tanh_clamp_scale: Optional[float] = None,
     ):
         """Initialize the GroupedGemmSreluSm100 API.
 
@@ -133,6 +135,9 @@ class GroupedGemmSreluSm100(APIBase):
         :param discrete_col_sfd: Enable discrete col-major scale factor tensor
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
+        :param tanh_clamp_scale: Optional soft-clamp scale ``s``. When set, computes
+            ``(s * tanh(relu(x) / s)) ** 2`` instead of plain ``relu(x) ** 2``; must be
+            finite and > 0. ``None`` (default) is bit-identical to today's SReLU.
         """
         framework = detect_framework(sample_a)
         if framework == "jax":
@@ -218,6 +223,12 @@ class GroupedGemmSreluSm100(APIBase):
         self.m_aligned = m_aligned
         self.discrete_col_sfd = discrete_col_sfd
         self.use_dynamic_sched = use_dynamic_sched
+        if tanh_clamp_scale is not None:
+            self._value_error_if(
+                not math.isfinite(tanh_clamp_scale) or tanh_clamp_scale <= 0.0,
+                f"tanh_clamp_scale must be finite and positive, got {tanh_clamp_scale}",
+            )
+        self.tanh_clamp_scale = tanh_clamp_scale
         if self.weight_mode == MoEWeightMode.DENSE:
             self.b_major = b_major
 
@@ -579,6 +590,7 @@ class GroupedGemmSreluSm100(APIBase):
             weight_mode=self.weight_mode,
             use_dynamic_sched=self.use_dynamic_sched,
             epilogue_type=EpilogueType.SRELU.value,
+            tanh_clamp_scale=self.tanh_clamp_scale,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -1186,6 +1198,7 @@ def grouped_gemm_srelu_wrapper_sm100(
     m_aligned: int = 256,
     discrete_col_sfd: bool = False,
     use_dynamic_sched: bool = False,
+    tanh_clamp_scale: Optional[float] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM SReLU operation.
@@ -1222,6 +1235,9 @@ def grouped_gemm_srelu_wrapper_sm100(
         vector_f32: Use vectorized f32
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Enable discrete col-major scale factor tensor
+        tanh_clamp_scale: Optional soft-clamp scale ``s``. When set, computes
+            ``(s * tanh(relu(x) / s)) ** 2`` instead of plain ``relu(x) ** 2``; must be
+            finite and > 0. ``None`` (default) is bit-identical to today's SReLU.
         current_stream: CUDA stream
 
     Returns:
@@ -1439,6 +1455,7 @@ def grouped_gemm_srelu_wrapper_sm100(
             m_aligned,
             discrete_col_sfd,
             use_dynamic_sched,
+            float(tanh_clamp_scale) if tanh_clamp_scale is not None else None,
         )
     else:
         cache_key = (
@@ -1479,6 +1496,7 @@ def grouped_gemm_srelu_wrapper_sm100(
             use_dynamic_sched,
             b_major,
             num_experts,
+            float(tanh_clamp_scale) if tanh_clamp_scale is not None else None,
         )
 
     if cache_key in _cache_of_GroupedGemmSreluSm100Objects:
@@ -1511,6 +1529,7 @@ def grouped_gemm_srelu_wrapper_sm100(
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
                 use_dynamic_sched=use_dynamic_sched,
+                tanh_clamp_scale=tanh_clamp_scale,
             )
         else:
             grouped_gemm_srelu = GroupedGemmSreluSm100(
@@ -1539,6 +1558,7 @@ def grouped_gemm_srelu_wrapper_sm100(
                 discrete_col_sfd=discrete_col_sfd,
                 use_dynamic_sched=use_dynamic_sched,
                 b_major=b_major,
+                tanh_clamp_scale=tanh_clamp_scale,
             )
 
         assert grouped_gemm_srelu.check_support(), "Unsupported configuration"

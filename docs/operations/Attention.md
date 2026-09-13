@@ -16,23 +16,23 @@ cudnn SDPA operation requires SM80 (Ampere) or newer architectures and cuda tool
 The support matrix is based on the latest cudnn backend version 9.18.1
 
 
-| Arch <br> | Datatype  <br>  | Layout  <br>                      | Paged  <br>  Attn| Masking     | Deterministic | Head dim |  
+| Arch <br /> | Datatype  <br />  | Layout  <br />                      | Paged  <br />  Attn| Masking     | Deterministic | Head dim |  
 |-----------|-------------|-------------------------------|----------|-------------------------------------------| ------------- | ---- | 
-| Ampere/Ada <br> (Prefill) |  fp16, bf16 | BHSD, BSHD, Interleaved¹, <br> Padded², Ragged³ | Yes | Yes⁴ | Yes | d <= 256 | 
-| Ampere/Ada <br> (Decode)  |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 128  |
-| Ampere/Ada <br> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | NA | Yes | Yes | d <= 128 |
+| Ampere/Ada <br /> (Prefill) |  fp16, bf16 | BHSD, BSHD, Interleaved¹, <br /> Padded², Ragged³ | Yes | Yes⁴ | Yes | d &lt;= 256 | 
+| Ampere/Ada <br /> (Decode)  |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 128  |
+| Ampere/Ada <br /> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | NA | Yes | Yes | d &lt;= 128 |
 ||
-| Hopper <br> (Prefill)      |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 256⁵ <br> (d_qk = 192, d_vo = 128)|
-| Hopper <br> (Decode)       |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 256 <br> (d_qk = 192, d_vo = 128)|
-| Hopper <br> (Bprop)        |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | NA | Yes | Yes | d <= 256 <br> (d_qk = 192, d_vo = 128)|
+| Hopper <br /> (Prefill)      |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 256⁵ <br /> (d_qk = 192, d_vo = 128)|
+| Hopper <br /> (Decode)       |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 256 <br /> (d_qk = 192, d_vo = 128)|
+| Hopper <br /> (Bprop)        |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | NA | Yes | Yes | d &lt;= 256 <br /> (d_qk = 192, d_vo = 128)|
 ||
-| Blackwell (B200/B300) <br> (Prefill)     |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes  | Yes | d <= 256 <br> (d_qk = 192, d_vo = 128) |
-| Blackwell (B200/B300) <br> (Decode)      |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 128 <br> (d_qk = 192, d_vo = 128) |
-| Blackwell (B200/B300) <br> (Bprop)       |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | NA | Yes | Yes  | d <= 128 <br> (d_qk = 192, d_vo = 128) <br> (d_qk = 256, d_vo = 256)|
+| Blackwell (B200/B300) <br /> (Prefill)     |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes  | Yes | d &lt;= 256 <br /> (d_qk = 192, d_vo = 128) |
+| Blackwell (B200/B300) <br /> (Decode)      |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 128 <br /> (d_qk = 192, d_vo = 128) |
+| Blackwell (B200/B300) <br /> (Bprop)       |  fp8, fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | NA | Yes | Yes  | d &lt;= 128 <br /> (d_qk = 192, d_vo = 128) <br /> (d_qk = 256, d_vo = 256)|
 ||
-| Blackwell (Consumer) <br> (Prefill) |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 256  |
-| Blackwell (Consumer) <br> (Decode)  |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 128 <br> (d_qk = 192, d_vo = 128)|
-| Blackwell (Consumer) <br> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | NA | Yes | Yes | d <= 128 |
+| Blackwell (Consumer) <br /> (Prefill) |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 256  |
+| Blackwell (Consumer) <br /> (Decode)  |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | Yes | Yes | Yes | d &lt;= 128 <br /> (d_qk = 192, d_vo = 128)|
+| Blackwell (Consumer) <br /> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | NA | Yes | Yes | d &lt;= 128 |
 
 
 ### Glossary
@@ -40,12 +40,12 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 
 ² Padded, variable length sequences (requires padding mask). When sequences in a batch have different lengths, use `use_padding_mask=True` with sequence length tensors.
 
-&nbsp;&nbsp; *Setup:* <br>
+&nbsp;&nbsp; *Setup:* <br />
     &nbsp;&nbsp; - Set `use_padding_mask=True`  
     &nbsp;&nbsp; -  Provide `seq_len_q` tensor of shape `(B, 1, 1, 1)` with actual query sequence lengths  
     &nbsp;&nbsp; -  Provide `seq_len_kv` tensor of shape `(B, 1, 1, 1)` with actual key/value sequence lengths  
 
-&nbsp;&nbsp; *Example:*<br>
+&nbsp;&nbsp; *Example:*<br />
 &nbsp;&nbsp; Batch with sequences "aa" (length 2) and "bbb" (length 3), max length `S=8`:
   - `seq_len_q = [2, 3]`
   - `seq_len_kv = [2, 3]`
@@ -79,9 +79,9 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 
   &nbsp;&nbsp;&nbsp;&nbsp; *Example:*
 
-  &nbsp;&nbsp;&nbsp;&nbsp; Same sequences "aa" and "bbb" packed together:<br>
-  - `seq_len_q = [2, 3]`<br>
-  - `seq_len_kv = [2, 3]`<br>
+  &nbsp;&nbsp;&nbsp;&nbsp; Same sequences "aa" and "bbb" packed together:<br />
+  - `seq_len_q = [2, 3]`<br />
+  - `seq_len_kv = [2, 3]`<br />
 
       ```
       Q = aabbb  (no padding, T=5 total tokens)
@@ -91,16 +91,16 @@ The support matrix is based on the latest cudnn backend version 9.18.1
   - Strides: $[512, 64, 64, 1]$ (strides unchanged, but ignored for ragged)
   - **Ragged offset:** $[0, 2 \times H \times D, 5 \times H \times D] = [0, 128, 320]$
 
-  &nbsp;&nbsp;&nbsp;&nbsp; *Partially Packed Layout:*<br>
+  &nbsp;&nbsp;&nbsp;&nbsp; *Partially Packed Layout:*<br />
   
-  &nbsp;&nbsp;&nbsp;&nbsp; Tokens within each batch can be contiguous without being globally packed.<br>
+  &nbsp;&nbsp;&nbsp;&nbsp; Tokens within each batch can be contiguous without being globally packed.<br />
 
   - Ragged offset: $[0, 4 \times H \times D, 7 \times H \times D] = [0, 256, 448]$
       ```
       Q = aa00bbb0  (batch 0 at offset 0, batch 1 at offset 4)
       ```
 
-  &nbsp;&nbsp;&nbsp;&nbsp; *Not Supported:*<br>
+  &nbsp;&nbsp;&nbsp;&nbsp; *Not Supported:*<br />
 
   &nbsp;&nbsp;&nbsp;&nbsp; Tokens that are not contiguous within a batch cannot be represented.
 
@@ -108,7 +108,7 @@ The support matrix is based on the latest cudnn backend version 9.18.1
       ```
       Q = a0abbb00bb000000  (tokens interleaved - NOT SUPPORTED)
       ```
-&nbsp;&nbsp; **Note that Q,K,V and their gradients can be individually ragged or not.**<br> 
+&nbsp;&nbsp; **Note that Q,K,V and their gradients can be individually ragged or not.**<br /> 
 
 &nbsp;&nbsp; **Backward Pass with THD:**
 
@@ -176,7 +176,6 @@ To run the sdpa benchmarks, refer to [benchmarks/sdpa](https://github.com/NVIDIA
 - Results obtained on NVIDIA GB300 GPU
 
 ## API
-(scaled-dot-product-attention-fp16bf16-forward)=
 ### SDPA FP16/BF16 Forward 
 
 #### C++ API
@@ -498,7 +497,6 @@ stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 # Build and execute
 graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
 ```
-(scaled-dot-product-attention-fp16bf16-backward)=
 ### SDPA FP16/BF16 Backward
 
 This operation computes gradient tensors for scaled dot product attention (SDPA) using the FlashAttention-2 algorithm as described in the paper [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691). You are required to pass the stats tensor from the forward operation to the backward operation as input.
@@ -709,97 +707,94 @@ CuTe DSL forward and explicit backward kernels driven by per-query-block lists
 of selected key/value blocks. It is a standalone Python FE OSS API and is
 separate from the cuDNN Graph API described above.
 
+### HSTU Attention FE OSS API (SM100/SM103)
 
-(scaled-dot-product-attention-pytorch-op)=
-### SDPA PyTorch Custom Op (Experimental)
+The experimental [HSTU Attention API](../fe-oss-apis/hstu/hstu_attention.md)
+provides packed-variable-length forward and backward CuTe DSL kernels for
+Blackwell SM100/SM103 GPUs. HSTU applies SiLU to scaled QK scores without
+softmax, supports its specialized mask modes, and exposes the sequence
+normalization factor separately as `scaling_seqlen`. FP16 and BF16 arbitrary-mask
+forward and backward automatically build private block metadata on the active
+CUDA stream without adding public API parameters; D256 backward builds both
+Q-to-K and K-to-Q views from one coarse classification.
 
-A high-level PyTorch custom operator that wraps the cuDNN SDPA forward and backward graphs into a single, autograd-compatible function. This provides a drop-in replacement for `torch.nn.functional.scaled_dot_product_attention` that routes computation through cuDNN.
+### SDPA PyTorch Custom Ops (`cudnn::sdpa_fwd` / `cudnn::sdpa_bwd`)
 
-**Key features:**
-- Full autograd support (forward + backward)
-- `torch.compile` compatible via FakeTensor/meta registration
-- Graph caching for efficient repeated execution
-- Supports FP16, BF16 datatypes
-- Supports causal masking, sliding window, padding mask, GQA/MQA, and ragged tensors
+PyTorch custom ops (`torch.library`) exposing the full cuDNN SDPA feature
+surface — the features `torch.nn.functional.scaled_dot_product_attention`'s
+aten contract cannot express:
 
-**Limitations:**
-- `attn_mask` and `dropout` are not yet supported
-- FP8 is not supported (use the Graph API directly)
-- For head dimension `256`, the specialized backward path currently supports only plain BHSD inputs. `seq_len_q`, `seq_len_kv`, `cumulative_seq_len_q`, and `cumulative_seq_len_kv` are not supported on that backward path.
+- **attention sinks** — per-Q-head logits folded into the softmax denominator
+- **diagonal bands** — `window_left` and `window_right`. The two bounds use
+  different conventions, matching `diagonal_band_left_bound` /
+  `diagonal_band_right_bound`: `window_left` counts visible tokens *including*
+  self (so FA2's `(w, 0)` maps to `window_left = w + 1`), while `window_right`
+  is the last visible column *past* the diagonal, with no offset (FA2's
+  `(_, r)` maps to `window_right = r`). `window_right=0` is exactly causal;
+  `window_right > 0` admits future columns and so cannot be combined with
+  `is_causal`, which the op rejects rather than silently resolving.
+- **bottom-right causal alignment** — inference-style diagonals
+- **padded batches** — per-batch actual lengths via `seq_len_q` / `seq_len_kv`
+- **THD / varlen packing** — FlashAttention-style `(T, H, D)` + `cu_seqlens`
 
-#### Python API
+The ops build cuDNN pygraph `sdpa` / `sdpa_backward` nodes; the engine Router
+picks the best serving plan (FROST OSS kernels or cuDNN-backend engines) per
+configuration. Graphs are cached per configuration (bounded, thread-safe;
+cuDNN handles are thread-local).
 
-```python
-from cudnn.experimental.ops import scaled_dot_product_attention
-
-output = scaled_dot_product_attention(
-    query,                        # (B, H_q, S_q, D) — FP16 or BF16
-    key,                          # (B, H_k, S_kv, D)
-    value,                        # (B, H_v, S_kv, D_v)
-    attn_mask=None,               # Not yet supported, must be None
-    dropout_p=0.0,                # Not yet supported, must be 0.0
-    is_causal=False,              # Apply causal (upper-triangular) mask
-    scale=None,                   # Attention scale, defaults to 1/sqrt(D)
-    enable_gqa=False,             # Enable grouped-query attention (H_q > H_k)
-    *,
-    diagonal_alignment=0,         # 0 = TOP_LEFT, 1 = BOTTOM_RIGHT
-    left_bound=-1,                # Sliding window left bound (-1 = disabled)
-    right_bound=-1,               # Sliding window right bound (-1 = disabled)
-    seq_len_q=None,               # Actual query seq lengths (B, 1, 1, 1) INT32
-    seq_len_kv=None,              # Actual key/value seq lengths (B, 1, 1, 1) INT32
-    cumulative_seq_len_q=None,    # Ragged offset for Q (B+1, 1, 1, 1) INT32
-    cumulative_seq_len_kv=None,   # Ragged offset for KV (B+1, 1, 1, 1) INT32
-)
-```
-
-**Args:**
-- `query` (torch.Tensor): Query tensor in BHSD layout `(B, H_q, S_q, D)`.
-- `key` (torch.Tensor): Key tensor in BHSD layout `(B, H_k, S_kv, D)`.
-- `value` (torch.Tensor): Value tensor in BHSD layout `(B, H_v, S_kv, D_v)`.
-- `attn_mask` (Optional[torch.Tensor]): Not yet supported. Must be `None`.
-- `dropout_p` (float): Not yet supported. Must be `0.0`.
-- `is_causal` (bool): If `True`, applies a causal mask (sets `right_bound=0`).
-- `scale` (Optional[float]): Attention scale factor. Defaults to `1/sqrt(D)`.
-- `enable_gqa` (bool): When `False`, raises `ValueError` if `H_q != H_k`. Set to `True` for grouped-query or multi-query attention.
-- `diagonal_alignment` (int): `0` for TOP_LEFT, `1` for BOTTOM_RIGHT alignment.
-- `left_bound` (int): Left sliding-window bound. `-1` disables.
-- `right_bound` (int): Right sliding-window bound. `-1` disables. `0` for causal.
-- `seq_len_q` (Optional[torch.Tensor]): Per-batch query sequence lengths `(B, 1, 1, 1)` INT32.
-- `seq_len_kv` (Optional[torch.Tensor]): Per-batch key/value sequence lengths `(B, 1, 1, 1)` INT32.
-- `cumulative_seq_len_q` (Optional[torch.Tensor]): Ragged offset for Q `(B+1, 1, 1, 1)` INT32.
-- `cumulative_seq_len_kv` (Optional[torch.Tensor]): Ragged offset for KV `(B+1, 1, 1, 1)` INT32.
-
-For head dimension `256`, backward support is narrower than the general SDPA op contract: the specialized `d=256` backward path requires plain BHSD tensors and does not support `seq_len_q`, `seq_len_kv`, `cumulative_seq_len_q`, or `cumulative_seq_len_kv`.
-
-**Returns:**
-- `output` (torch.Tensor): Attention output `(B, H_q, S_q, D_v)`.
-
-#### Example Usage
+#### Usage
 
 ```python
 import torch
-from cudnn.experimental.ops import scaled_dot_product_attention
+import cudnn
 
-B, H, S, D = 2, 8, 1024, 128
+_ = cudnn.sdpa_torch  # lazy public export: importing registers cudnn::sdpa_fwd / cudnn::sdpa_bwd
 
-q = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
-k = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
-v = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
+# Dense BHSD with sinks + sliding window
+o, lse = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, is_causal=True,
+                                  window_left=128, sinks=sinks, return_lse=True)
 
-# Forward
-output = scaled_dot_product_attention(q, k, v, is_causal=True)
+# THD / varlen (FA-style packed (T, H, D) + cu_seqlens), differentiable:
+q, k, v = (t.requires_grad_(True) for t in (q_thd, k_thd, v_thd))
+o, lse = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, is_causal=True,
+                                  cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                                  max_seqlen_q=mx, max_seqlen_kv=mx,
+                                  return_lse=True)
+o.backward(grad)  # routes through cudnn::sdpa_bwd via register_autograd
 
-# Backward (autograd handles this automatically)
-loss = output.sum()
-loss.backward()
-# q.grad, k.grad, v.grad are now populated
+# Or through the python wrapper (same op underneath). It defaults to
+# return_lse=False; autograd needs the stats, so ask for them explicitly:
+o, lse = cudnn.sdpa_torch(q, k, v, is_causal=True, cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                          max_seqlen_q=mx, max_seqlen_kv=mx, return_lse=True)
 ```
 
-#### Tests
+#### Contracts and limits
 
-- Python tests: [test/python/test_cudnn_sdpa_op.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/test_cudnn_sdpa_op.py)
+- Dense tensors are BHSD `(B, H, S, D)` (any strides; the graph declares the
+  actual layout). Varlen tensors are packed `(T, H, D)`; non-contiguous views
+  (e.g. K/V slices of a fused `(T, 2, H, D)` KV projection) are declared with
+  their true strides. On the varlen path, a non-dense innermost dim or a
+  misaligned base pointer is repaired by one copy (warned as slow path); the
+  dense path declares the given strides as-is.
+- One io dtype per call (`fp16` or `bf16`); mixed-dtype inputs are rejected.
+- `sdpa_bwd` serves the **THD/varlen** path. Dense backward and sink backward
+  (dSink) are follow-ups and raise `NotImplementedError`. It consumes a
+  **padded** `(B, H, max_seqlen_q, 1)` fp32 LSE (backend restriction: bprop
+  THD rejects ragged LSE on SM8X/SM12X).
+- Autograd (`register_autograd`) requires `return_lse=True` on the forward;
+  the glue converts the packed TH1 stats to the padded layout device-side.
+- Both ops ship `register_fake` meta kernels. `cudnn::sdpa_fwd` passes
+  `torch.library.opcheck` on the dense and varlen paths, including
+  dynamic-shape AOT dispatch (`torch.compile`-ready); the opcheck autograd
+  case exercises `cudnn::sdpa_bwd` through the registered backward.
 
-(scaled-dot-product-attention-fp8-forward)=
+#### Requirements
+
+- `nvidia-cudnn-frontend`, cuDNN backend ≥ 9.6 (THD token-major
+  stats), sm80+.
+
+Tests: [test/python/sdpa/test_torch_ops.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/test_torch_ops.py).
+
 ### SDPA FP8 Forward
 
 This operation computes the scaled dot product attention (SDPA) in the 8-bit floating point (FP8) datatype, using the FlashAttention-2 algorithm as described in the paper [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691). It is applicable for both training and inference phases, with an option to generate a stats tensor to be used for backwards training computation.
@@ -984,7 +979,6 @@ Where:
 #### Samples and tests
 - C++ sample: [samples/cpp/sdpa](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/cpp/sdpa)
 
-(scaled-dot-product-attention-fp8-backward)=
 ### SDPA FP8 Backward
 
 This operation computes the gradients for scaled dot product attention (SDPA) 8-bit floating point (FP8) datatype, using the FlashAttention-2 algorithm as described in the paper [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691). You are required to pass the stats tensor from the forward operation to the backward operation as input.

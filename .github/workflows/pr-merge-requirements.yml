@@ -22,6 +22,8 @@ permissions:
 
 jobs:
   merge-requirements:
+    # Draft PRs are skipped; marking one ready for review runs the check.
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - name: Check milestone and project assignment

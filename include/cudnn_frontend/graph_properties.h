@@ -2389,6 +2389,11 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
         return right_bound.has_value() && diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT;
     }
 
+    bool
+    has_bias() const {
+        return inputs.find(input_names::Bias) != inputs.end() && inputs.at(input_names::Bias) != nullptr;
+    }
+
    public:
     enum class input_names {
         Q,
@@ -2606,6 +2611,11 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
 
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
+
+    bool
+    has_bias() const {
+        return inputs.find(input_names::Bias) != inputs.end() && inputs.at(input_names::Bias) != nullptr;
+    }
 
    public:
     enum class input_names {

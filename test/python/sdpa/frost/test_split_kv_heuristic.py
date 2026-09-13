@@ -185,16 +185,20 @@ def test_exactly_balanced_launch_never_splits():
 _FIT_S_Q = 512
 
 # (base_ctas, chosen split) pinned against a per-split sweep on B300 (148 SMs,
-# d128, 512 KV tiles, S_q=512, bf16, mask-free), re-measured for the two-kernel
-# cost model. A change that moves any of these is a policy change and needs its
-# own measurement.
+# d128, 512 KV tiles, S_q=512, bf16, mask-free). A change that moves any of
+# these is a policy change and needs its own measurement.
 #
-# The model matches the measured optimum on 8 of 12; mean regret 1.009, worst
-# 1.035. The misses (88, 100, 150, 160) all sit within ~10% of a FULL machine,
-# where the measured curve is nearly flat -- e.g. base=88 spans 2.264..2.512 ms
-# across every split -- so the ranking there is worth little and the model
-# prefers the cheap answer. Regret, not exact agreement, is the bar.
-_B300_FIT = [(8, 16), (16, 8), (32, 4), (64, 2), (88, 1), (100, 1), (120, 1), (128, 1), (150, 2), (160, 2), (200, 2), (296, 1)]
+# Re-swept end-to-end (split kernel + combine) once SM100 splits started writing
+# fp32 partials, which changed BOTH kernels: the epilogue stopped staging O
+# through SMEM and TMA, and the combine reads wider partials. The measured
+# optimum moved at 88 (1 -> 4), 150 (2 -> 4) and 160 (2 -> 4), so these entries
+# and _SPLIT_KV_COMBINE_COST were refitted together.
+#
+# The model now matches the measured optimum on 11 of 12; mean regret 1.0001,
+# worst 1.0007. The one miss is base=100, where split 1 and split 4 measure
+# 0.6701 vs 0.6706 ms -- a 0.07% tie the ranking cannot meaningfully resolve.
+# Regret, not exact agreement, is the bar.
+_B300_FIT = [(8, 16), (16, 8), (32, 4), (64, 2), (88, 4), (100, 4), (120, 1), (128, 1), (150, 4), (160, 4), (200, 2), (296, 1)]
 
 
 @pytest.mark.parametrize("base_ctas,expected", _B300_FIT, ids=[f"{b}ctas" for b, _ in _B300_FIT])
@@ -283,7 +287,9 @@ def test_split_domains_match_the_wired_lowerings():
         "sdpa_fwd_prefill_sm100",
         "sdpa_fwd_prefill_sm100_mxfp8",
         "sdpa_fwd_prefill_sm100_fp8",
+        "sdpa_fwd_prefill_sm107_fp8",
         "sdpa_fwd_prefill_sm120",
+        "sdpa_fwd_prefill_sm120_fp8",
     }, f"split domains drifted from the wired lowerings: {sorted(advertising)}"
 
 
@@ -376,3 +382,147 @@ def test_decode_rows_barely_pay_for_the_combine():
     prefill = choose_split_kv(q_tiles=1, heads_q=8, batch=1, kv_tiles=512, sm_count=B200_SMS, ctas_per_tile=2, combine_rows=8 * 4096)
     assert decode > 1
     assert decode >= prefill
+
+
+# --- a quantized O is a legal split target ---------------------------------
+#
+# The split kernels write HALF partials whatever the O dtype and the combine
+# performs the only cast down to it, so nothing about an FP8 output makes the
+# reduction narrower. Both the eligibility gate and the candidate generator
+# used to decline it; these pin that they no longer do.
+
+
+def _fp8_caps():
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    return next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm100_fp8").capabilities
+
+
+def _fp8_facts(dtype_o, *, mx=False):
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+
+    return ga.SdpaGraphFacts(
+        b=1,
+        h_q=8,
+        h_kv=1,
+        s_q=512,
+        s_kv=16384,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=dtype_o,
+        is_fp8=not mx,
+        is_mxfp8=mx,
+        device_sm_count=B200_SMS,
+        device_cc=(10, 0),
+    )
+
+
+@pytest.mark.parametrize("out_name", ["FP8_E4M3", "FP8_E5M2", "HALF", "BFLOAT16"])
+@pytest.mark.parametrize("mx", [False, True], ids=["fp8", "mxfp8"])
+def test_quantized_output_does_not_block_a_split(out_name, mx):
+    """mismatch() must not decline split_kv on the O dtype alone."""
+    import cudnn
+
+    why = mismatch(_fp8_caps(), _fp8_facts(getattr(cudnn.data_type, out_name), mx=mx), SdpaFwdKnobs(split_kv=4)) or ""
+    assert "split_kv" not in why, f"quantized O declined the split: {why}"
+
+
+@pytest.mark.parametrize("out_name", ["FP8_E4M3", "FP8_E5M2"])
+def test_quantized_output_still_gets_split_candidates(out_name):
+    """And the generator must actually PROPOSE one — passing the eligibility
+    gate is not enough if the candidate list is still hard-coded to [1]."""
+    import cudnn
+
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    points = _split_points(_fp8_caps(), _fp8_facts(getattr(cudnn.data_type, out_name)), 128, 128, 2)
+    assert points[0] > 1, f"a decode-shaped FP8-out graph got no split: {points}"
+    assert points[-1] == 1, "no-split must remain reachable behind the chosen split"
+
+
+def test_quantized_and_half_outputs_choose_the_same_split():
+    """The O dtype is not a performance input: partials are half either way, so
+    the chooser must land on the same split for an FP8 and a bf16 output."""
+    import cudnn
+
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    caps = _fp8_caps()
+    fp8 = _split_points(caps, _fp8_facts(cudnn.data_type.FP8_E4M3), 128, 128, 2)
+    half = _split_points(caps, _fp8_facts(cudnn.data_type.BFLOAT16), 128, 128, 2)
+    assert fp8 == half, f"O dtype moved the split choice: {fp8} vs {half}"
+
+
+def test_every_combine_call_site_matches_the_compiled_arity():
+    """The combine is invoked POSITIONALLY, so adding a parameter to its host
+    silently breaks every call site that was not updated with it.
+
+    The failure is a TypeError raised only when a split actually runs, so a
+    missed site hides until some shape happens to split -- and the arms that
+    never split (dense half, THD) look fine either way. Compare the sites
+    against the signature instead of waiting for a shape to find them."""
+    import ast
+    import inspect
+
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+
+    # _host's parameters, minus the trailing `stream` keyword.
+    params = [p for p in inspect.signature(split_combine._host).parameters if p != "stream"]
+    expected = len(params)
+
+    tree = ast.parse(inspect.getsource(api_dsl))
+    sites = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "_combine_kernel"]
+    assert sites, "no combine call sites found — did the attribute get renamed?"
+    bad = [(n.lineno, len(n.args)) for n in sites if len(n.args) != expected]
+    assert not bad, f"combine call sites passing != {expected} positional args ({params}): {bad}"
+
+
+def test_every_split_capable_sm100_kernel_has_the_slot():
+    """A split-capable SM100 kernel either carries the o_partial_f32 slot, or the
+    adapter must know it does not.
+
+    _fp32_partial_split() is unconditional for SM100, so a kernel that wires
+    make_split_helpers WITHOUT the slot gets handed an argument it never
+    declares -- a launch-time arity error on whatever shape happens to split.
+    That is exactly how sm100/prefill_d512_mxfp8 arrived: split-capable from the
+    day it landed, written against the staged epilogue. Scanning the directory
+    means the NEXT such kernel fails here instead of in production.
+
+    A kernel without the slot is fine, provided _SLOTLESS_FLAVORS records it and
+    the predicate excludes that flavor.
+    """
+    import pathlib
+
+    from cudnn.sdpa.fwd import api_dsl
+
+    # (mxfp8, d_shape) pairs the adapter deliberately keeps on half partials.
+    _SLOTLESS_FLAVORS = {"prefill_d512_mxfp8.py"}
+
+    kdir = pathlib.Path(api_dsl.__file__).parent / "kernels" / "sm100"
+    assert kdir.is_dir(), f"kernel directory moved: {kdir}"
+
+    offenders = []
+    for f in sorted(kdir.glob("prefill_*.py")):
+        src = f.read_text()
+        if "make_split_helpers" not in src:
+            continue  # not split-capable, nothing to carry
+        if "o_partial_f32" in src:
+            continue  # wired
+        if f.name in _SLOTLESS_FLAVORS:
+            continue  # known, and excluded by _fp32_partial_split
+        offenders.append(f.name)
+
+    assert not offenders, (
+        f"split-capable SM100 kernels with no o_partial_f32 slot: {offenders}. "
+        "Either port the fp32 partial store into them, or exclude their flavor in "
+        "api_dsl.SdpaFwdDsl._fp32_partial_split and list them in _SLOTLESS_FLAVORS."
+    )
+
+    # ...and the recorded exceptions must still be real, or this guard rots.
+    for name in _SLOTLESS_FLAVORS:
+        src = (kdir / name).read_text()
+        assert "make_split_helpers" in src, f"{name}: no longer split-capable; drop it from _SLOTLESS_FLAVORS"
+        assert "o_partial_f32" not in src, f"{name}: now carries the slot; drop it from _SLOTLESS_FLAVORS and let the predicate return True"

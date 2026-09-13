@@ -33,9 +33,6 @@ BACKEND_CONFIG = {
     "cudnn_state_on": {"name": "cuDNN (state on)", "color": "#2f6e00", "order": 4},
 }
 
-# Backends dropped from every chart (rows may still exist in older CSVs).
-UNAVAILABLE_BACKENDS = ()
-
 LABEL_FONT_SIZE = 10
 LEGEND_FONT_SIZE = 8
 TITLE_FONT_SIZE = 12
@@ -68,6 +65,30 @@ METRIC_CONFIG = (
 )
 
 
+def _clear_legend(ax, legend, margin=0.04):
+    """Raise the y-limit until no bar reaches under the legend box.
+
+    The legend sits upper-left and its height is set by the backend count in
+    FIGURE units, while bar heights are data units, so a fixed fractional
+    headroom does not track it: one dominant series in the leftmost group still
+    clips.  Measure the rendered box instead and solve for the limit.
+    """
+    bars = [(patch.get_x() + patch.get_width() / 2, patch.get_height()) for c in ax.containers for patch in c]
+    if not bars:
+        return
+    for _ in range(3):
+        ax.figure.canvas.draw()
+        box = legend.get_window_extent().transformed(ax.transData.inverted())
+        under = [h for x, h in bars if box.x0 <= x <= box.x1 and h >= box.y0]
+        if not under:
+            return
+        top = ax.get_ylim()[1]
+        frac = (box.y0 / top) - margin
+        if frac <= 0:
+            return
+        ax.set_ylim(0, max(under) / frac)
+
+
 def get_backend_display_name(backend: str, cudnn_version: Optional[str] = None) -> str:
     return BACKEND_CONFIG.get(backend, {}).get("name", backend)
 
@@ -80,11 +101,12 @@ def generate_charts(
     variant: str = "gdn",
     batch_sizes: Optional[List[int]] = None,
     x_axis: str = "seqlen",
+    dims_label: Optional[str] = None,
+    stem: Optional[str] = None,
 ) -> list:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     df = df[df["variant"] == variant].copy()
-    df = df[~df["backend"].isin(UNAVAILABLE_BACKENDS)].copy()
     if batch_sizes:
         df = df[df["batch_size"].isin(batch_sizes)].copy()
     if df.empty:
@@ -128,8 +150,9 @@ def generate_charts(
             head_dim = sub["head_dim"].iloc[0]
             gpu_info = f" ({gpu_name})" if gpu_name else ""
             group_label = f"Batch = {group_val}" if x_axis == "seqlen" else f"Sequence Length = {group_val}"
+            dims = dims_label if dims_label else f"d = {head_dim}"
             fig.suptitle(
-                f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, d = {head_dim}{gpu_info}",
+                f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, {dims}, " f"use_qk_l2norm = True{gpu_info}",
                 fontsize=TITLE_FONT_SIZE,
             )
 
@@ -155,20 +178,24 @@ def generate_charts(
                 ax.set_xlabel(x_label, fontsize=LABEL_FONT_SIZE)
                 ax.set_ylabel(y_label, fontsize=LABEL_FONT_SIZE)
                 ax.set_title(pass_name, fontsize=TITLE_FONT_SIZE)
-                ax.legend(title="Backend", fontsize=LEGEND_FONT_SIZE, loc="upper left")
+                legend = ax.legend(title="Backend", fontsize=LEGEND_FONT_SIZE, loc="upper left", framealpha=0.9)
+                _clear_legend(ax, legend)
                 ax.tick_params(axis="x", rotation=45)
                 for container in ax.containers:
                     ax.bar_label(container, fmt=bar_fmt, fontsize=BAR_LABEL_FONT_SIZE)
 
             plt.tight_layout()
             gv = int(group_val)
-            if df[group_col].nunique() == 1:
+            pinned = df[group_col].nunique() == 1
+            if stem is not None:
+                file_stem = stem if pinned else f"{stem}_{gv}"
+            elif pinned:
                 # the sweep pinned the group dimension: fixed-batch (seqlen
                 # sweep) / fixed-seq (batch sweep) result-tree naming
-                stem = f"{variant}_fixed_batch" if x_axis == "seqlen" else f"{variant}_fixed_seq"
+                file_stem = f"{variant}_fixed_batch" if x_axis == "seqlen" else f"{variant}_fixed_seq"
             else:
-                stem = f"{variant}_b{gv}" if x_axis == "seqlen" else f"{variant}_t{gv}_bsweep"
-            output_path = output_dir / f"{stem}{file_suffix}.png"
+                file_stem = f"{variant}_b{gv}" if x_axis == "seqlen" else f"{variant}_t{gv}_bsweep"
+            output_path = output_dir / f"{file_stem}{file_suffix}.png"
             plt.savefig(output_path, dpi=150, bbox_inches="tight")
             plt.close()
             saved_paths.append(output_path)
@@ -184,9 +211,15 @@ def main():
     parser.add_argument("--gpu-name", default="", help="GPU name for the chart title")
     parser.add_argument("--cudnn-version", default=None, help="cuDNN backend version for the legend (e.g. 9.24.0)")
     parser.add_argument("--variant", default="gdn", help="Linear attention variant to plot")
+    parser.add_argument("--dims-label", default=None, help="Head-dim label for the chart title (default: 'd = <head_dim>')")
     parser.add_argument("--batch-sizes", default=None, help="Comma-separated batch sizes to plot (default: all in the CSV)")
     parser.add_argument(
         "--x-axis", default="seqlen", choices=("seqlen", "batch"), help="Bar-group axis: seqlen (one chart per batch) or batch (one chart per seqlen)"
+    )
+    parser.add_argument(
+        "--stem",
+        default=None,
+        help="Output file stem before the metric suffix (default: <variant>_fixed_batch / <variant>_fixed_seq when the CSV pins the group axis, else per-group stems); required when a CSV pins batch AND heads, e.g. <variant>_low_bh",
     )
     args = parser.parse_args()
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")] if args.batch_sizes else None
@@ -198,7 +231,17 @@ def main():
         raise ValueError(f"CSV is missing expected columns: {missing}")
 
     output_dir = args.output_dir if args.output_dir is not None else args.csv.parent
-    generate_charts(df, output_dir, gpu_name=args.gpu_name, cudnn_version=args.cudnn_version, variant=args.variant, batch_sizes=batch_sizes, x_axis=args.x_axis)
+    generate_charts(
+        df,
+        output_dir,
+        gpu_name=args.gpu_name,
+        cudnn_version=args.cudnn_version,
+        variant=args.variant,
+        batch_sizes=batch_sizes,
+        x_axis=args.x_axis,
+        dims_label=args.dims_label,
+        stem=args.stem,
+    )
 
 
 if __name__ == "__main__":

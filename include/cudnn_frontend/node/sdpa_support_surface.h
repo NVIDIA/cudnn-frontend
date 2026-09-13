@@ -159,10 +159,6 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
                                    error_code_t::ATTRIBUTE_NOT_SET,
                                    "Intermediate tensor data type needs to be set as internal tensors require it.");
 
-    // The Stats layout check (packed BHSD required prior to 9.26.0) lives in
-    // SDPANode::post_validate_node(), as it must run after shape inference has
-    // filled in the dim/stride of an unset Stats output.
-
     if (mma_core_mode == DataType_t::FP8_E4M3 || mma_core_mode == DataType_t::FP8_E5M2) {
         // FP8 specific validation
 
@@ -185,18 +181,35 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
         RETURN_CUDNN_FRONTEND_ERROR_IF(is_bias, error_code_t::GRAPH_NOT_SUPPORTED, "SDPA FP8 does not support bias");
 
         // validate basic dimension requirements
-        // d_qk=192 with d_v=128 is only supported starting from cuDNN 9.19
+        // Extended native FP8 shapes are enabled only with backend versions
+        // that expose the corresponding graph surface.
         bool const d192_v128_supported = (detail::get_backend_version() >= 91900);
+        // Head dims in (256, 512] on BOTH sides are served by the frontend-only
+        // FROST SM100 per-tensor FP8 prefill engine
+        // (sdpa_fwd_prefill_sm100_fp8, the d512 kernel flavor), which runs the
+        // band through its native d = 512 tile with TMA zero-padding. The floor
+        // is the engine's: below it the flavor would pad by more than 2x, and
+        // no smaller FP8 flavor reaches above 192/128. The cuDNN backend itself
+        // has no plan for the band, so a graph that does not select that engine
+        // still fails at plan creation.
+        bool const d512_supported =
+            (d_qk > 256) && (d_qk <= 512) && (d_v > 256) && (d_v <= 512) && (d_qk % 16 == 0) && (d_v % 16 == 0);
+        bool const d256_v256_supported = (detail::get_backend_version() >= 92600);
         if (prop_major >= 10) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
-                ((d_qk > 128) || (d_qk % 16 != 0)) && !(d192_v128_supported && d_qk == 192 && d_v == 128),
+                ((d_qk > 128) || (d_qk % 16 != 0)) && !(d192_v128_supported && d_qk == 192 && d_v == 128) &&
+                    !(d256_v256_supported && d_qk == 256 && d_v == 256) && !d512_supported,
                 error_code_t::GRAPH_NOT_SUPPORTED,
                 "hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk "
-                "should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)");
+                "should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+) "
+                "or d_qk == d_v == 256 (requires cuDNN 9.26+) or both head dims are in (256, 512] and multiples of 16");
             RETURN_CUDNN_FRONTEND_ERROR_IF(
-                ((d_v > 128) || (d_v % 16 != 0)),
+                ((d_v > 128) || (d_v % 16 != 0)) && !(d256_v256_supported && d_qk == 256 && d_v == 256) &&
+                    !d512_supported,
                 error_code_t::GRAPH_NOT_SUPPORTED,
-                "hidden_dim d_v should be less than or equal to 128 and hidden_dim d_v should be multiple of 16");
+                "hidden_dim d_v should be less than or equal to 128 and hidden_dim d_v should be multiple of 16 "
+                "unless d_qk == d_v == 256 (requires cuDNN 9.26+) or both head dims are in (256, 512] and multiples of "
+                "16");
         } else {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 (d_qk > 256) || (d_qk % 16 != 0) || (d_v > 256) || (d_v % 16 != 0),

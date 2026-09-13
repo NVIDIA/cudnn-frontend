@@ -554,6 +554,9 @@ def gemm_proj_rope_mxfp8_kernel(
         tmem.free(tmem_ptr)
 
 
+gemm_proj_rope_mxfp8_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def gemm_proj_rope_mxfp8_host(
     mA: cute.Tensor,

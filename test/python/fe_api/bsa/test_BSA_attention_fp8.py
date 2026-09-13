@@ -38,15 +38,16 @@ def _require_sm100_fp8():
     return _import_bsa()
 
 
-def _make_block_index(heads: int, seqlen_q: int, seqlen_k: int, topk: int) -> torch.Tensor:
+def _make_block_index(batch: int, heads: int, seqlen_q: int, seqlen_k: int, topk: int) -> torch.Tensor:
     num_q_blocks = math.ceil(seqlen_q / 64)
     num_kv_blocks = math.ceil(seqlen_k / 64)
-    result = torch.empty((1, heads, num_q_blocks, topk), device="cuda", dtype=torch.int32)
+    result = torch.empty((batch, heads, num_q_blocks, topk), device="cuda", dtype=torch.int32)
     block_ids = torch.arange(num_kv_blocks, device="cuda")
-    for head in range(heads):
-        for q_block in range(num_q_blocks):
-            selected = torch.roll(block_ids, shifts=head + q_block)[:topk].sort().values
-            result[0, head, q_block] = selected.to(torch.int32)
+    for batch_idx in range(batch):
+        for head in range(heads):
+            for q_block in range(num_q_blocks):
+                selected = torch.roll(block_ids, shifts=batch_idx * 7 + head + q_block)[:topk].sort().values
+                result[batch_idx, head, q_block] = selected.to(torch.int32)
     return result
 
 
@@ -135,17 +136,18 @@ def test_bsa_fp8_interface_quantizes_before_private_launch(monkeypatch):
 
 
 @pytest.mark.L0
-def test_bsa_fp8_forward_accepts_bf16_and_returns_documented_tupledict(monkeypatch):
+@pytest.mark.parametrize(("batch", "heads"), ((1, 4), (1, 3), (2, 3)))
+def test_bsa_fp8_forward_accepts_positive_batch_and_head_counts(monkeypatch, batch, heads):
     BSA = _import_bsa()
     api = importlib.import_module("cudnn.block_sparse_attention.api")
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(api, "_device_arch", lambda tensor: 100)
 
-    shape = (1, 4, 64, 128)
+    shape = (batch, heads, 64, 128)
     q = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
     k = torch.empty_like(q)
     v = torch.empty_like(q)
-    q2k = torch.zeros((1, 4, 1, 1), device="cuda", dtype=torch.int32)
+    q2k = torch.zeros((batch, heads, 1, 1), device="cuda", dtype=torch.int32)
     expected = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
 
     def fake_forward(*args, **kwargs):
@@ -172,12 +174,13 @@ def test_bsa_fp8_forward_accepts_bf16_and_returns_documented_tupledict(monkeypat
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(("batch", "heads"), ((1, 4), (2, 3)))
 @torch_fork_set_rng(seed=20260709)
-def test_bsa_fp8_private_cutedsl_quantizer_matches_recipe():
+def test_bsa_fp8_private_cutedsl_quantizer_matches_recipe(batch, heads):
     _require_sm100_fp8()
     quantizer = importlib.import_module("cudnn.block_sparse_attention._fp8_quant")
 
-    batch, heads, seqlen_q, seqlen_k, head_dim = 1, 4, 128, 192, 128
+    seqlen_q, seqlen_k, head_dim = 128, 192, 128
     q = torch.randn((batch, heads, seqlen_q, head_dim), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((batch, heads, seqlen_k, head_dim), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
@@ -236,7 +239,7 @@ def test_bsa_fp8_sm100_auto_split_uses_workspace_fallback(monkeypatch):
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface, "_get_device_arch", lambda: 100)
 
-    batch, heads, seqlen_q, seqlen_k, head_dim, topk = 1, 4, 64, 64, 128, 128
+    batch, heads, seqlen_q, seqlen_k, head_dim, topk = 2, 3, 64, 64, 128, 128
     q = torch.empty((batch, heads, seqlen_q, head_dim), device="cuda", dtype=torch.float8_e4m3fn)
     k = torch.empty((batch, heads, seqlen_k, head_dim), device="cuda", dtype=torch.float8_e4m3fn)
     v = torch.empty_like(k)
@@ -321,14 +324,15 @@ def test_bsa_fp8_split_workspace_estimate_uses_bf16_output_size():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(("batch", "heads"), ((1, 4), (2, 3)))
 @torch_fork_set_rng(seed=2026)
-def test_bsa_fp8_sm100_bf16_forward_matches_reference():
+def test_bsa_fp8_sm100_bf16_forward_matches_reference(batch, heads):
     BSA = _require_sm100_fp8()
-    batch, heads, seqlen_q, seqlen_k, head_dim, topk = 1, 4, 128, 640, 128, 5
+    seqlen_q, seqlen_k, head_dim, topk = 128, 640, 128, 5
     q = torch.randn((batch, heads, seqlen_q, head_dim), device="cuda", dtype=torch.bfloat16) * 0.5
     k = torch.randn((batch, heads, seqlen_k, head_dim), device="cuda", dtype=torch.bfloat16) * 0.5
     v = torch.randn_like(k) * 0.5
-    q2k = _make_block_index(heads, seqlen_q, seqlen_k, topk)
+    q2k = _make_block_index(batch, heads, seqlen_q, seqlen_k, topk)
 
     block_sizes = torch.full((seqlen_k // 64,), 64, device="cuda", dtype=torch.int32)
     mask = block_sparse_mask(q2k, topk, block_sizes, seqlen_q, seqlen_k, 64)

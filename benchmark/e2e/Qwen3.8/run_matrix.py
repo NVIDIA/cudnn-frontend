@@ -385,7 +385,7 @@ def _pick_device(mode):
 def _run_experiment(args, qwen, device, properties, orders, started_utc):
     import cudnn
     from cudnn import _env as cudnn_env
-    import cudnn.experimental.ops.sdpa as sdpamod
+    import cudnn.sdpa.fwd.torch_op as sdpamod
     import cudnn.fla as cfla
     import fla
     import fla.layers.attn as fla_attn
@@ -396,8 +396,6 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
     backend_floor = 92300
     if cudnn.backend_version() < backend_floor:
         raise RuntimeError("d256 FE arm requires cuDNN backend " f">= {backend_floor}; got {cudnn.backend_version()}")
-    if any(hasattr(sdpamod, name) for name in ("sdpa_fwd_d256", "sdpa_bwd_d256")):
-        raise RuntimeError("loaded FE SDPA module predates #682 and still exposes the legacy standalone d256 stacks")
 
     from cudnn.gemm.ops import swiglu_mlp as public_swiglu_mlp
 
@@ -572,10 +570,8 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
         "frost_compiler": _source_record(frost_compiler_module.__file__),
         "frost_tile_config": _source_record(frost_tile_config_module.__file__),
         "frost_kernel_registry": _source_record(frost_kernel_registry_module.__file__),
-        "frost_kernel_template_1ctamma": _source_record(frost_template_dir / "sm100_matmul_1ctamma.py"),
-        "frost_kernel_template_2ctamma": _source_record(frost_template_dir / "sm100_matmul_2ctamma.py"),
-        "frost_mainloop_template_1ctamma": _source_record(frost_template_dir / "sm100_matmul_mainloop_1ctamma.py"),
-        "frost_mainloop_template_2ctamma": _source_record(frost_template_dir / "sm100_matmul_mainloop_2ctamma.py"),
+        "frost_kernel_template": _source_record(frost_template_dir / "sm100_matmul.py"),
+        "frost_mainloop_template": _source_record(frost_template_dir / "sm100_matmul_mainloop.py"),
         "cudnn_fla": _source_record(cfla.__file__),
         "cudnn_fla_gdn_adapter": _source_record(gdnmod.__file__),
         "cudnn_fla_gated_mlp_adapter": _source_record(gated_mlp_adapter_module.__file__),

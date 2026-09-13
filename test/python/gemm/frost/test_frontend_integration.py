@@ -26,6 +26,25 @@ M, N, K = 256, 256, 128
 _FROST = "frost_gemm"
 
 
+def _build_plans_or_skip(g) -> None:
+    """`build_plans()`, but a BACKEND-side NVRTC failure is an environment
+    precondition, not a product failure.
+
+    The tests that need it run the same graph twice -- once on the native cuDNN
+    plan as the reference -- so cuDNN has to JIT its own kernel. `cuda.pathfinder`
+    resolves libnvrtc from site-packages BEFORE $CUDA_PATH, and cuDNN dlopens it
+    by absolute path, so neither LD_LIBRARY_PATH nor LD_PRELOAD can redirect it:
+    a wheel too old for the active SM fails here and only here. Skip loudly
+    instead of reporting it as a FROST regression.
+    """
+    try:
+        g.build_plans()
+    except Exception as e:  # noqa: BLE001 -- the backend raises its own type
+        if "NVRTC" in str(e) or "runtime kernel compilation" in str(e):
+            pytest.skip(f"the cuDNN backend could not JIT its own kernel (nvrtc/backend version mismatch): {str(e)[:120]}")
+        raise
+
+
 def _build_matmul_bias_relu():
     """A recorded bf16 matmul + per-col bias + relu graph → (g, A, B, bias, Y)."""
     g = cudnn.pygraph(
@@ -116,7 +135,10 @@ def test_select_frost_engine_runs_frost():
     torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
 
 
-_OVERRIDE_SHAPES = [(256, 256, 128), (1024, 512, 512), (200, 768, 256), (333, 512, 264)]
+_OVERRIDE_CASES = {
+    "dense": ((256, 256, 128), ((1024, 512, 512), (200, 768, 256), (333, 512, 264))),
+    "splitk": ((128, 128, 16384), ((256, 256, 16384), (128, 256, 16384), (64, 128, 16384))),
+}
 
 
 def _build_matmul_uids(m, n, k):
@@ -141,30 +163,36 @@ def _mm_operands(m, n, k):
 
 
 @_GPU
-def test_override_shape_frost():
+@pytest.mark.parametrize("case", _OVERRIDE_CASES, ids=tuple(_OVERRIDE_CASES))
+def test_override_shape_frost(case):
     """A FROST plan built for one problem size runs OTHER sizes through the native
     override-shape API — ``get_workspace_size_plan_at_index`` /
     ``execute_plan_at_index`` with ``override_uids/shapes/strides`` — and through
     plain ``execute`` with new-shape buffers. The compiled kernel is shape-agnostic
     (M/N/K symbolic), so no rebuild; results are bit-exact (small-int inputs)."""
     h = cudnn.create_handle()
-    m0, n0, k0 = 256, 256, 128
+    (m0, n0, k0), override_shapes = _OVERRIDE_CASES[case]
     g, _A, _B, _C = _build_matmul_uids(m0, n0, k0)
     _plan(g)
     frost = _index_of(g, _FROST)
     g.select_plan(frost)
     g.check_support()
-    g.build_plans()  # one JIT compile, at the anchor shape
+    _build_plans_or_skip(g)  # one JIT compile, at the anchor shape
+    ws0 = g.get_workspace_size()
+    if case == "splitk" and ws0 == 0:
+        pytest.skip("auto selector did not split at this anchor")
 
-    for m, n, k in _OVERRIDE_SHAPES:
+    ou = [1, 2, 3]
+    for m, n, k in override_shapes:
         a, b, ref = _mm_operands(m, n, k)
-        ou = [1, 2, 3]
         osh = [[1, m, k], [1, k, n], [1, m, n]]
         ost = [[m * k, k, 1], [k * n, 1, k], [m * n, n, 1]]
 
         # (a) native override-shape API: workspace query + indexed execute.
         wsz = g.get_workspace_size_plan_at_index(frost, h, ou, osh, ost)
-        assert wsz == 0  # FROST owns its workspace at any shape
+        # dense gemm is 0
+        # splitK: ws0 = S * B * m0 * n0 * 4, wsz = S * B * m * n * 4
+        assert wsz == ws0 * (m * n) // (m0 * n0)
         ws = torch.empty(max(wsz, 1), device="cuda", dtype=torch.uint8)
         c = torch.empty(1, m, n, dtype=torch.bfloat16, device="cuda")
         g.execute_plan_at_index(
@@ -513,7 +541,7 @@ def test_override_shape_inside_a_max_allocation_matches_the_backend():
         index = _index_of(g, _FROST) if want_frost else _first_backend_index(g)
         g.select_plan(index)
         g.check_support()
-        g.build_plans()
+        _build_plans_or_skip(g)
 
         h = cudnn.create_handle()
         wsz = g.get_workspace_size_plan_at_index(index, h, uids, shapes, strides)

@@ -25,12 +25,10 @@ _CUDNN_DT = {"bf16": cudnn.data_type.BFLOAT16, "fp16": cudnn.data_type.HALF}
 _TORCH_DT = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 # N=128 cta_group=1 geometry — small enough that dual-GEMM (2 acc) and triple fit.
-_CFG_N128 = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 128 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 1 and c.cgrp_size_n == 1)
-_CFG_N256 = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 1 and c.cgrp_size_n == 1)
+_CFG_N128 = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 128 and c.cta_tile_k_bytes == 128 and c.cga_size_m == 1 and c.cga_size_n == 1)
+_CFG_N256 = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cga_size_m == 1 and c.cga_size_n == 1)
 # cluster2x1 N=256 geometry for the 2-CTA-MMA templates.
-_CFG_N256_C2 = next(
-    c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 2 and c.cgrp_size_n == 1
-)
+_CFG_N256_C2 = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cga_size_m == 2 and c.cga_size_n == 1)
 
 # Every multi-GEMM-capable plain-matmul strategy: (label, cta_group, config).
 _STRATEGIES = [

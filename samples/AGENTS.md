@@ -9,6 +9,7 @@ Usage examples for the C++ graph API and the Python API. Build commands: [../AGE
 | `cpp/` | Current C++ graph-API samples, grouped by topic (`convolution/`, `matmul/`, `sdpa/`, `norm/`, `moe_grouped_matmul/`, ...) — Catch2 cases in binary `build/bin/samples` |
 | `legacy_samples/` | Frozen samples for the legacy flat API — binary `build/bin/legacy_samples`. Don't add here. |
 | `python/` | Numbered Jupyter notebooks (`00_introduction.ipynb` ...) — the Python tutorial sequence |
+| `frost/` | Standalone Python scripts for the FROST engines: `gemm/` and `linear_attention/`, numbered, each self-checking against a reference |
 | `llama/`, `llm_coverage/` | End-to-end LLaMA tie-out scripts and per-op coverage scripts (plain `.py`, see their READMEs) |
 
 ## Running

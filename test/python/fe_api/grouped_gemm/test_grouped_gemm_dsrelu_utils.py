@@ -354,15 +354,20 @@ def run_grouped_gemm_dsrelu_ref(
     d_dtype: torch.dtype = torch.float32,
     sf_vec_size: int = 16,
     sf_dtype: torch.dtype = torch.float8_e8m0fnu,
+    tanh_clamp_scale: Optional[float] = None,
 ) -> Dict[str, torch.Tensor]:
     """Run reference implementation for grouped GEMM dSReLU backward.
 
     Based on the reference in contiguous_blockscaled_grouped_gemm_dsrelu_quant_fusion.py
 
-    The dSReLU backward pass computes:
+    The dSReLU backward pass computes, with tanh_clamp_scale=None (plain, unclamped):
     1. GEMM: ref = alpha * (SFA * A) @ (SFB * B)^T per group
     2. dprob = sum over N of (relu(C)^2 * ref)
     3. D = 2 * relu(C) * ref * prob
+
+    or, with tanh_clamp_scale=s set (t = tanh(relu(C)/s), c = s*t):
+    2. dprob = sum over N of (c^2 * ref)
+    3. D = 2 * c * (1 - t^2) * ref * prob
 
     :param a_ref: A tensor (tensor_m, k, 1) in float32
     :param b_ref: B tensor (n, k, l) in float32
@@ -380,6 +385,8 @@ def run_grouped_gemm_dsrelu_ref(
     :param d_dtype: Output D tensor dtype
     :param sf_vec_size: Scale factor vector size
     :param sf_dtype: Scale factor dtype
+    :param tanh_clamp_scale: Optional soft-clamp scale ``s``, must match the forward pass that
+        produced ``c_ref``. ``None`` (default) is the plain unclamped reference.
     :return: Dictionary of reference tensors
     """
     n, k, l = b_ref.shape
@@ -400,20 +407,33 @@ def run_grouped_gemm_dsrelu_ref(
         start = end
     ref = ref.permute((1, 2, 0))  # shape [M, N, 1]
 
-    # Step 2: Apply dsquared-ReLU backward elementwise
+    # Step 2: Apply d(optionally soft-clamped)squared-ReLU backward elementwise
     c_full = c_ref.clone()
     c_relu = torch.relu(c_full)
-    ref_dprob = c_relu**2 * ref
+    if tanh_clamp_scale is not None:
+        t = torch.tanh(c_relu / tanh_clamp_scale)
+        c = tanh_clamp_scale * t
+        one_minus_t2 = (1 - t) * (1 + t)
+    else:
+        c = c_relu
+        one_minus_t2 = None
+    ref_dprob = c**2 * ref
+    # Chunked sum models the kernel's per-32-column reduction order -- keep this shape even
+    # though the values above may now be the clamped c instead of relu(C).
     chunk_sums = [torch.sum(chunk, dim=1, keepdim=True) for chunk in torch.split(ref_dprob, 32, dim=1)]
     ref_dprob = torch.sum(torch.cat(chunk_sums, dim=1), dim=1, keepdim=True)
     ref_tensors["dprob_ref"] = ref_dprob
 
-    # Step 3: Compute dSReLU formula
+    # Step 3: Compute d(optionally soft-clamped)SReLU formula
     prob = prob_tensor.expand(-1, n, -1)
-    ref_d = 2 * c_relu * ref * prob
+    if tanh_clamp_scale is not None:
+        ref_d = 2 * c * one_minus_t2 * ref * prob
+    else:
+        ref_d = 2 * c * ref * prob
 
     ref_tensors["d_ref"] = ref_d.clone()
-    ref_d_srelu = (c_relu**2 * prob).to(d_dtype).to(torch.float32)
+    # Output-dtype rounding already modelled by the .to(d_dtype).to(torch.float32) round-trip.
+    ref_d_srelu = (c**2 * prob).to(d_dtype).to(torch.float32)
     ref_tensors["d_srelu_ref"] = ref_d_srelu.clone()
 
     if generate_dbias:
@@ -490,6 +510,7 @@ def check_ref_grouped_gemm_dsrelu(
         d_dtype=cfg["d_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
         sf_dtype=cfg["sf_dtype"],
+        tanh_clamp_scale=cfg.get("tanh_clamp_scale"),
     )
 
     torch.testing.assert_close(outputs["dprob_tensor"].float(), ref_tensors["dprob_ref"].float(), atol=atol, rtol=rtol)

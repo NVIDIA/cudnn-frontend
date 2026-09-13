@@ -192,6 +192,10 @@ class SdpaGraphFacts:
     # dtypes / layout
     dtype: Optional[Any] = None  # Q dtype as cudnn.data_type (None if unrecognized)
     uniform_dtype: bool = True  # K/V (and O, for half) dtypes equal Q's
+    # Quantized graphs only: the half-precision operands (O; and dO_f16 / dQ /
+    # dK / dV on the MXFP8 backward) share ``dtype_o``. Always True on half
+    # graphs, where ``uniform_dtype`` already covers them.
+    uniform_out_dtype: bool = True
     bshd_layout: bool = True  # all of Q/K/V/O in BSHD-physical order
     # Relaxed dense-layout soundness: every one of Q/K/V/O has the head dim
     # innermost-contiguous (stride 1) with non-broadcast, non-overlapping
@@ -216,11 +220,21 @@ class SdpaGraphFacts:
     has_dropout: bool = False
     has_score_mod: bool = False
     has_paged_kv: bool = False
+    # Paged KV (paged_attention_k_table / v_table): K/V are page pools
+    # [num_pages, H_kv, page_size, D]; ``s_kv`` is the declared
+    # paged_attention_max_seq_len_kv (else what the block tables address). The
+    # in-page layout (HND/NHD) is only the pools' strides, and the tables'
+    # extents live on their IR refs — neither is a separate fact.
+    page_size: int = 0
     has_alibi: bool = False
     has_unfuse_fma: bool = False
     has_block_mask: bool = False
     has_rng_dump: bool = False
-    is_backward: bool = False  # sdpa_backward() node (NodeType.SDPA_BWD)
+    is_backward: bool = False  # sdpa_backward() / sdpa_mxfp8_backward() node (NodeType.SDPA_BWD / SDPA_MXFP8_BWD)
+    # MXFP8 backward: any of amax_dQ / amax_dK / amax_dV requested as a real
+    # output. The op returns the ports unconditionally; only set_output(True)
+    # ones count (same convention as amax_s_t on the FP8 forward).
+    has_amax_dgrad: bool = False
     right_bound: Optional[int] = None  # raw resolved right band (0 == causal)
     deterministic: bool = False  # sdpa_backward(use_deterministic_algorithm=True)
     has_dbias: bool = False  # dBias output requested (backward)
@@ -261,6 +275,10 @@ class SdpaGraphFacts:
     sink_t: Any = None
     seq_kv_t: Any = None
     seq_q_t: Any = None
+    # Paged KV block tables, (B, 1, max_pages, 1) int32; when the graph declares
+    # only one of the pair both refs point at it.
+    paged_k_table_t: Any = None
+    paged_v_table_t: Any = None
     # (B+1,) prefix-sum IR refs (cuDNN 9.24+ cu_seq_len form); None when the
     # graph carries the per-batch seq_len_* form on that side instead.
     cu_seq_q_t: Any = None
@@ -277,6 +295,20 @@ class SdpaGraphFacts:
     dv_t: Any = None
     dbias_t: Any = None
     dsink_t: Any = None
+    # MXFP8 backward-only refs: the transposed-quantization payloads (each
+    # contraction axis needs its own 1x32 quantization), the half-precision dO,
+    # their block-scale tensors, and the (declined-by-default) amax outputs.
+    q_T_t: Any = None
+    k_T_t: Any = None
+    dO_T_t: Any = None
+    dO_f16_t: Any = None
+    sf_q_T_t: Any = None
+    sf_k_T_t: Any = None
+    sf_dO_t: Any = None
+    sf_dO_T_t: Any = None
+    amax_dq_t: Any = None
+    amax_dk_t: Any = None
+    amax_dv_t: Any = None
     # MXFP8 block-scale (descale) tensors + Amax_O output.
     sf_q_t: Any = None
     sf_k_t: Any = None
@@ -305,7 +337,13 @@ def _single_sdpa_node(graph: "cudnn.pygraph") -> Optional[Any]:
     if len(nodes) != 1:
         return None
     node = nodes[0]
-    if node.node_type not in (cudnn.NodeType.SDPA, cudnn.NodeType.SDPA_BWD, cudnn.NodeType.SDPA_MXFP8, cudnn.NodeType.SDPA_FP8):
+    if node.node_type not in (
+        cudnn.NodeType.SDPA,
+        cudnn.NodeType.SDPA_BWD,
+        cudnn.NodeType.SDPA_MXFP8,
+        cudnn.NodeType.SDPA_FP8,
+        cudnn.NodeType.SDPA_MXFP8_BWD,
+    ):
         return None
     return node
 
@@ -327,11 +365,19 @@ def _record_from_node(node: Any) -> dict:
         rec["o"] = node.outputs.get("O")
     if node.outputs.get("Stats") is not None:
         rec["stats"] = node.outputs.get("Stats")
-    rec["_is_backward"] = node.node_type == cudnn.NodeType.SDPA_BWD
+    is_mxfp8_bwd = node.node_type == cudnn.NodeType.SDPA_MXFP8_BWD
+    rec["_is_backward"] = node.node_type == cudnn.NodeType.SDPA_BWD or is_mxfp8_bwd
+    rec["_is_mxfp8_bwd"] = is_mxfp8_bwd
     if rec["_is_backward"]:
-        for port in ("dQ", "dK", "dV", "dBias", "dSink_token"):
+        for port in ("dQ", "dK", "dV", "dBias", "dSink_token", "amax_dQ", "amax_dK", "amax_dV"):
             if rec.get(port) is None:
                 rec[port] = node.outputs.get(port)
+    if is_mxfp8_bwd:
+        # sdpa_mxfp8_backward names its half-precision forward output ``o_f16``
+        # (and its half-precision gradient ``dO_f16``); the plain ``dO`` port is
+        # the FP8 payload. Alias O so the shared shape/layout logic sees it.
+        if rec.get("o") is None:
+            rec["o"] = rec.get("o_f16")
     # Output-style kwargs (passed as sdpa() arguments but recorded in
     # node.outputs): fold each one in so engines see every requested output.
     # Missing one here lets an engine that never writes it pass the probe and
@@ -342,7 +388,7 @@ def _record_from_node(node: Any) -> dict:
     # MXFP8 / per-tensor FP8: descale_q/k/v (+ scale_o, etc. for FP8) arrive via
     # node.inputs above; Amax_S / Amax_O are outputs. The FP8 input dtype + these ports
     # distinguish these ops from plain sdpa().
-    rec["_is_mxfp8"] = node.node_type == cudnn.NodeType.SDPA_MXFP8
+    rec["_is_mxfp8"] = node.node_type in (cudnn.NodeType.SDPA_MXFP8, cudnn.NodeType.SDPA_MXFP8_BWD)
     rec["_is_fp8"] = node.node_type == cudnn.NodeType.SDPA_FP8
     rec["amax_o"] = node.outputs.get("Amax_O")
     rec["amax_s"] = node.outputs.get("Amax_S")
@@ -369,12 +415,23 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     if q is None or k is None or v is None or o is None:
         return _invalid("missing q/k/v/o on the sdpa node")
 
+    is_mxfp8_bwd = bool(rec.get("_is_mxfp8_bwd"))
     rank4_ports = [("q", q), ("k", k), ("v", v), ("o", o)]
     if is_backward:
         for name in ("dO", "dQ", "dK", "dV"):
             t = rec.get(name)
             if t is None:
                 return _invalid(f"missing {name} on the sdpa_backward node")
+            rank4_ports.append((name, t))
+    if is_mxfp8_bwd:
+        # The transposed-quantization payloads and the half-precision dO are
+        # first-class operands of the MXFP8 backward (each contraction axis
+        # needs its own 1x32 quantization; a transposed payload is not the
+        # transpose of the payload).
+        for name in ("q_T", "k_T", "dO_T", "dO_f16"):
+            t = rec.get(name)
+            if t is None:
+                return _invalid(f"missing {name} on the sdpa_mxfp8_backward node")
             rank4_ports.append((name, t))
 
     dims = {}
@@ -413,12 +470,48 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
             v_stride = (v_stride[0], v_stride[1], v_stride[3], v_stride[2])
         dims["k"], dims["v"] = k_dim, v_dim
         strides["k"], strides["v"] = k_stride, v_stride
-    _, h_kv, s_kv, _ = k_dim
+    table_k, table_v = rec.get("paged_attention_k_table"), rec.get("paged_attention_v_table")
+    paged = table_k is not None or table_v is not None
+    page_size = 0
     d_v = v_dim[-1]
-    if k_dim != (b, h_kv, s_kv, d_qk):
-        return _invalid(f"K shape mismatch (q_dim={q_dim}, k_dim={k_dim})")
-    if v_dim != (b, h_kv, s_kv, d_v):
-        return _invalid(f"V shape mismatch (k_dim={k_dim}, v_dim={v_dim})")
+    if paged:
+        # cuDNN paged-cache contract: K/V are page POOLS [num_pages, H_kv,
+        # page_size, D] (the in-page layout rides the strides), addressed
+        # through (B, 1, max_pages, 1) int32 block tables; the logical S_kv is
+        # the declared maximum, else what the tables can address.
+        if is_backward:
+            return _invalid("paged KV caches are forward-only")
+        _, h_kv, page_size, _ = k_dim
+        if k_dim[3] != d_qk:
+            return _invalid(f"paged K container head dim must equal Q's (q_dim={q_dim}, k_dim={k_dim})")
+        if v_dim[:3] != k_dim[:3]:
+            return _invalid(f"paged K/V containers must share [num_pages, H_kv, page_size] (k_dim={k_dim}, v_dim={v_dim})")
+        tables = [t for t in (table_k, table_v) if t is not None]
+        for t in tables:
+            td = tuple(t.get_dim())
+            if len(td) != 4 or td[0] != b or td[1] != 1 or td[3] != 1:
+                return _invalid(f"paged block table must be (B, 1, max_pages, 1) = ({b}, 1, *, 1); got {td}")
+            if t.get_data_type() != cudnn.data_type.INT32:
+                return _invalid(f"paged block table must be int32; got {t.get_data_type()}")
+            if getattr(t, "ragged_offset", None) is not None:
+                return _invalid("packed (ragged-offset) paged block tables are not supported")
+        max_pages = tuple(tables[0].get_dim())[2]
+        if any(tuple(t.get_dim())[2] != max_pages for t in tables):
+            return _invalid("paged K and V block tables must have the same max_pages extent")
+        declared_max = rec.get("paged_attention_max_seq_len_kv")
+        s_kv = int(declared_max) if declared_max is not None else max_pages * page_size
+        if s_kv > max_pages * page_size:
+            return _invalid(f"paged_attention_max_seq_len_kv ({s_kv}) exceeds what the block table addresses ({max_pages} pages x {page_size})")
+        if (k_stride[1] > k_stride[2]) != (v_stride[1] > v_stride[2]):
+            return _invalid("paged K and V containers must share an in-page layout (both HND or both NHD)")
+        table_k = table_k if table_k is not None else table_v
+        table_v = table_v if table_v is not None else table_k
+    else:
+        _, h_kv, s_kv, _ = k_dim
+        if k_dim != (b, h_kv, s_kv, d_qk):
+            return _invalid(f"K shape mismatch (q_dim={q_dim}, k_dim={k_dim})")
+        if v_dim != (b, h_kv, s_kv, d_v):
+            return _invalid(f"V shape mismatch (k_dim={k_dim}, v_dim={v_dim})")
     if o_dim != (b, h_q, s_q, d_v):
         return _invalid(f"O shape mismatch (q_dim={q_dim}, o_dim={o_dim})")
     if is_backward:
@@ -426,6 +519,11 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
             return _invalid("dO shape mismatch")
         if dims["dQ"] != dims["q"] or dims["dK"] != dims["k"] or dims["dV"] != dims["v"]:
             return _invalid("dQ/dK/dV must match Q/K/V shapes")
+    if is_mxfp8_bwd:
+        if dims["q_T"] != dims["q"] or dims["k_T"] != dims["k"]:
+            return _invalid("q_T / k_T must match the Q / K shapes")
+        if dims["dO_T"] != dims["dO"] or dims["dO_f16"] != dims["dO"]:
+            return _invalid("dO_T / dO_f16 must match the dO shape")
     if any(x <= 0 for x in (b, h_q, h_kv, s_q, s_kv, d_qk, d_v)):
         return _invalid("B/H/S/D must all be > 0")
     if h_q % h_kv != 0:
@@ -436,24 +534,50 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     _fp8_family = is_mxfp8 or is_fp8
     q_dtype = q.get_data_type() if q.get_data_type() in _KNOWN_DTYPES else None
     o_dtype = o.get_data_type() if o.get_data_type() in _KNOWN_DTYPES else None
+    # Half-precision side of a quantized graph: O (and, for the MXFP8 backward,
+    # dO_f16 / dQ / dK / dV) share one dtype that is independent of the FP8
+    # payloads. ``uniform_out_dtype`` records whether they agree; the half rows
+    # fold this into ``uniform_dtype`` (everything equals Q there).
+    uniform_out = True
     if _fp8_family:
         # FP8 in: O dtype is independent of the input; only K/V must match Q.
-        uniform = all(t.get_data_type() == q_dtype for t in (k, v))
+        _fp8_ports = [k, v] + ([rec["dO"], rec["q_T"], rec["k_T"], rec["dO_T"]] if is_mxfp8_bwd else [])
+        uniform = all(t.get_data_type() == q_dtype for t in _fp8_ports)
+        if is_mxfp8_bwd:
+            uniform_out = all(t.get_data_type() == o_dtype for t in (rec["dO_f16"], rec["dQ"], rec["dK"], rec["dV"]))
     else:
         _uniform_ports = [k, v, o] + ([rec["dO"], rec["dQ"], rec["dK"], rec["dV"]] if is_backward else [])
         uniform = all(t.get_data_type() == q_dtype for t in _uniform_ports)
     _layout_ports = [(q_dim, q_stride), (k_dim, k_stride), (v_dim, v_stride), (o_dim, o_stride)]
     if is_backward:
         _layout_ports += [(dims[name], strides[name]) for name in ("dO", "dQ", "dK", "dV")]
-    bshd = all(bshd_layout_ok(d, s) for d, s in _layout_ports)
+    if is_mxfp8_bwd:
+        _layout_ports += [(dims[name], strides[name]) for name in ("q_T", "k_T", "dO_T", "dO_f16")]
+    # Paged pools are not BSHD tensors (an HND pool has its head stride above
+    # the row stride); the BSHD fact — what the THD lowering gates on — is
+    # about the ragged Q/O only.
+    _bshd_ports = [(q_dim, q_stride), (o_dim, o_stride)] if paged else _layout_ports
+    bshd = all(bshd_layout_ok(d, s) for d, s in _bshd_ports)
     dense_layout = all(dense_layout_ok(d, s) for d, s in _layout_ports)
 
     # descale_q/k/v are the block-scale SF tensors for MXFP8, or scalar per-tensor
     # descales for FP8. Both arrive on the same-named node.inputs ports.
     dsc_q, dsc_k, dsc_v = rec.get("descale_q"), rec.get("descale_k"), rec.get("descale_v")
     if _fp8_family and (dsc_q is None or dsc_k is None or dsc_v is None):
-        op = "sdpa_mxfp8" if is_mxfp8 else "sdpa_fp8"
+        op = "sdpa_mxfp8_backward" if is_mxfp8_bwd else "sdpa_mxfp8" if is_mxfp8 else "sdpa_fp8"
         return _invalid(f"{op} requires descale_q / descale_k / descale_v")
+    # The MXFP8 backward additionally carries one block-scale tensor per
+    # transposed payload and for dO (see the port table in _pygraph.py).
+    dsc_q_T, dsc_k_T, dsc_dO, dsc_dO_T = (rec.get(n) for n in ("descale_q_T", "descale_k_T", "descale_dO", "descale_dO_T"))
+    if is_mxfp8_bwd and any(t is None for t in (dsc_q_T, dsc_k_T, dsc_dO, dsc_dO_T)):
+        return _invalid("sdpa_mxfp8_backward requires descale_q_T / descale_k_T / descale_dO / descale_dO_T")
+
+    def _real_output(t):
+        """The op RETURNS its amax ports unconditionally; only a real
+        (non-virtual, set_output(True)) tensor is a requested output."""
+        return t if (t is not None and not getattr(t, "is_virtual", True)) else None
+
+    amax_dq, amax_dk, amax_dv = (_real_output(rec.get(n)) if is_mxfp8_bwd else None for n in ("amax_dQ", "amax_dK", "amax_dV"))
 
     # Masks: resolve cuDNN's several spellings to (causal, bottom_right, window_left).
     use_causal = bool(rec.get("use_causal_mask", False))
@@ -504,7 +628,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     kv_lens_given = seq_len_kv is not None or cu_seq_kv is not None
     seq_q_trim = False
     if thd:
-        if getattr(k, "ragged_offset", None) is None or getattr(v, "ragged_offset", None) is None:
+        # Paged KV: the pools are addressed through the block tables, so only
+        # Q (and O) are ragged — chunked prefill over a paged cache.
+        if not paged and (getattr(k, "ragged_offset", None) is None or getattr(v, "ragged_offset", None) is None):
             return _invalid("THD (ragged) requires ragged Q, K, and V")
         if not q_lens_given or not kv_lens_given:
             return _invalid("THD (ragged) requires seq_len_q/cu_seq_len_q and seq_len_kv/cu_seq_len_kv")
@@ -565,6 +691,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         d_v=d_v,
         dtype=q_dtype,
         uniform_dtype=uniform,
+        uniform_out_dtype=uniform_out,
         bshd_layout=bshd,
         dense_layout=dense_layout,
         port_layouts=(tuple((name, dims[name], strides[name]) for name, _ in rank4_ports) if is_backward else ()),
@@ -583,7 +710,10 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         has_bias=rec.get("bias") is not None,
         has_dropout=rec.get("dropout") is not None,
         has_score_mod=rec.get("fn") is not None,
-        has_paged_kv=(rec.get("paged_attention_k_table") is not None or rec.get("paged_attention_v_table") is not None),
+        has_paged_kv=paged,
+        page_size=page_size,
+        paged_k_table_t=table_k,
+        paged_v_table_t=table_v,
         has_alibi=bool(rec.get("use_alibi_mask")),
         has_unfuse_fma=bool(rec.get("unfuse_fma")),
         has_block_mask=rec.get("block_mask") is not None,
@@ -617,6 +747,18 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         dv_t=rec.get("dV"),
         dbias_t=rec.get("dBias"),
         dsink_t=rec.get("dSink_token"),
+        q_T_t=(rec.get("q_T") if is_mxfp8_bwd else None),
+        k_T_t=(rec.get("k_T") if is_mxfp8_bwd else None),
+        dO_T_t=(rec.get("dO_T") if is_mxfp8_bwd else None),
+        dO_f16_t=(rec.get("dO_f16") if is_mxfp8_bwd else None),
+        sf_q_T_t=(dsc_q_T if is_mxfp8_bwd else None),
+        sf_k_T_t=(dsc_k_T if is_mxfp8_bwd else None),
+        sf_dO_t=(dsc_dO if is_mxfp8_bwd else None),
+        sf_dO_T_t=(dsc_dO_T if is_mxfp8_bwd else None),
+        amax_dq_t=amax_dq,
+        amax_dk_t=amax_dk,
+        amax_dv_t=amax_dv,
+        has_amax_dgrad=any(t is not None for t in (amax_dq, amax_dk, amax_dv)),
         sink_t=sink_token,
         seq_kv_t=seq_len_kv,
         seq_q_t=seq_len_q,
@@ -670,6 +812,9 @@ class SdpaBinding:
     # (B+1,) prefix-sum form (cuDNN 9.24+); at most one form per side.
     cu_seq_len_q: Any = None
     cu_seq_len_kv: Any = None
+    # Paged KV block tables.
+    paged_k_table: Any = None
+    paged_v_table: Any = None
     # MXFP8 block-scale (descale) tensors + Amax_O output.
     sf_q: Any = None
     sf_k: Any = None
@@ -693,6 +838,15 @@ class SdpaBinding:
     dv: Any = None
     dbias: Any = None
     dsink: Any = None
+    # MXFP8 backward: transposed payloads, half-precision dO, their SF tensors.
+    q_T: Any = None
+    k_T: Any = None
+    dO_T: Any = None
+    dO_f16: Any = None
+    sf_q_T: Any = None
+    sf_k_T: Any = None
+    sf_dO: Any = None
+    sf_dO_T: Any = None
 
     # Built once on first use and reused. Rebuilding it per execute cost ~1.3 us
     # per bound operand: three passes over the bound list and five dict
@@ -723,6 +877,8 @@ class SdpaBinding:
                 self.seq_len_q,
                 self.cu_seq_len_q,
                 self.cu_seq_len_kv,
+                self.paged_k_table,
+                self.paged_v_table,
                 self.sf_q,
                 self.sf_k,
                 self.sf_v,
@@ -743,6 +899,14 @@ class SdpaBinding:
                 self.dv,
                 self.dbias,
                 self.dsink,
+                self.q_T,
+                self.k_T,
+                self.dO_T,
+                self.dO_f16,
+                self.sf_q_T,
+                self.sf_k_T,
+                self.sf_dO,
+                self.sf_dO_T,
             )
             if t is not None
         ]
@@ -936,16 +1100,3 @@ def to_bshd_physical(t: "torch.Tensor") -> "torch.Tensor":
     if act == exp:
         return t
     return t.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
-
-
-def expand_gqa_heads(t: "torch.Tensor", h_q: int) -> "torch.Tensor":
-    """Expand K/V heads to H_q for a dense forward lowering (BHSD dim 1).
-
-    The forward kernels' native dense-GQA path is not exercised by the
-    upstream validation harness (which expands like this); keep the
-    validated shape until kernel-level dense GQA is qualified.
-    """
-    h = t.shape[1]
-    if h == h_q:
-        return t
-    return t.repeat_interleave(h_q // h, dim=1)

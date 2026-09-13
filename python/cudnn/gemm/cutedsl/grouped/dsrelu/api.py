@@ -27,6 +27,7 @@ from ..backend_utils import _torch_stream_context
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
+import math
 import os
 from typing import Tuple, Optional
 
@@ -240,6 +241,7 @@ class GroupedGemmDsreluSm100(APIBase):
         use_dynamic_sched: bool = False,
         use_dsrelu_reuse: bool = False,
         deterministic: bool = False,
+        tanh_clamp_scale: Optional[float] = None,
     ):
         """Initialize the GroupedGemmDsreluSm100 API.
 
@@ -275,7 +277,10 @@ class GroupedGemmDsreluSm100(APIBase):
         :param discrete_col_sfd: Generate discrete col-major scale factor tensor
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
-        :param use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob
+        :param use_dsrelu_reuse: Reuse relu(C)^2 (or, when clamped, c^2) between d_srelu and dprob
+        :param tanh_clamp_scale: Optional soft-clamp scale ``s``, must match the forward pass that
+            produced ``sample_c``. Must be finite and > 0. ``None`` (default) is bit-identical
+            to today's unclamped DSRELU.
         :param deterministic: Compute dprob and dbias run-to-run bit-exactly. dprob and dbias keep
             their shapes and dtypes; what the flag adds is the two scratch tensors above, which the
             kernel writes instead, and a reduction the caller runs after execute():
@@ -381,6 +386,12 @@ class GroupedGemmDsreluSm100(APIBase):
         self.use_dynamic_sched = use_dynamic_sched
         self.use_dsrelu_reuse = use_dsrelu_reuse
         self.deterministic = deterministic
+        if tanh_clamp_scale is not None:
+            self._value_error_if(
+                not math.isfinite(tanh_clamp_scale) or tanh_clamp_scale <= 0.0,
+                f"tanh_clamp_scale must be finite and positive, got {tanh_clamp_scale}",
+            )
+        self.tanh_clamp_scale = tanh_clamp_scale
 
         self._interpret_uint8_as_fp4x2 = True
         self._has_dbias = self.dbias_desc is not None
@@ -913,6 +924,7 @@ class GroupedGemmDsreluSm100(APIBase):
             generate_d_srelu=self._generate_d_srelu,
             use_dsrelu_reuse=self.use_dsrelu_reuse,
             deterministic=self.deterministic,
+            tanh_clamp_scale=self.tanh_clamp_scale,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -1659,6 +1671,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
     use_dynamic_sched: bool = False,
     use_dsrelu_reuse: bool = False,
     deterministic: Optional[bool] = None,
+    tanh_clamp_scale: Optional[float] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM dSReLU backward operation.
@@ -1698,7 +1711,10 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Generate discrete col-major scale factor tensor
         use_dynamic_sched: Enable dynamic tile scheduling for load balancing
-        use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob
+        use_dsrelu_reuse: Reuse relu(C)^2 (or, when clamped, c^2) between d_srelu and dprob
+        tanh_clamp_scale: Optional soft-clamp scale ``s``, must match the forward pass that
+            produced ``c_tensor``. Must be finite and > 0. ``None`` (default) is
+            bit-identical to today's unclamped DSRELU.
         deterministic: Make dprob and dbias bit-exact run to run; raises NotImplementedError
             for any framework other than torch. Every returned tensor keeps its usual shape and
             dtype -- the slot workspaces and the fixed-order reductions into them are internal to
@@ -2014,6 +2030,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             use_dynamic_sched,
             use_dsrelu_reuse,
             deterministic,
+            float(tanh_clamp_scale) if tanh_clamp_scale is not None else None,
         )
     else:
         cache_key = (
@@ -2047,6 +2064,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             deterministic,
             b_major,
             num_experts,
+            float(tanh_clamp_scale) if tanh_clamp_scale is not None else None,
         )
 
     # ---- Cache lookup or create + compile ----
@@ -2087,6 +2105,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
                 use_dynamic_sched=use_dynamic_sched,
                 use_dsrelu_reuse=use_dsrelu_reuse,
                 deterministic=deterministic,
+                tanh_clamp_scale=tanh_clamp_scale,
             )
         else:
             api = GroupedGemmDsreluSm100(
@@ -2122,6 +2141,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
                 use_dynamic_sched=use_dynamic_sched,
                 use_dsrelu_reuse=use_dsrelu_reuse,
                 deterministic=deterministic,
+                tanh_clamp_scale=tanh_clamp_scale,
             )
 
         if not api.check_support():

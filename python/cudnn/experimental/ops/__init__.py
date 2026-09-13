@@ -5,8 +5,6 @@ import importlib
 import sys
 from typing import Any
 
-from .sdpa import scaled_dot_product_attention
-
 # moe_grouped_matmul / swiglu_mlp live with the rest of the GEMM family in
 # cudnn.gemm.ops (their modules import torch). Expose them here lazily so that
 # importing this package does not eagerly pull in those kernel modules; the
@@ -31,7 +29,6 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
-    "scaled_dot_product_attention",
     "moe_grouped_matmul",
     "swiglu_mlp",
 ]

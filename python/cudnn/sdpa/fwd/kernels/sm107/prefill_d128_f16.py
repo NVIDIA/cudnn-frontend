@@ -1,0 +1,2277 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+"""
+DSL prefill SDPA kernel — classic pipeline, f16/bf16, d=128, SM107 (Rubin).
+
+Ported from the pre-upstream kernel ``prefill_sdpa_f16.py``
+by the port script. The kernel BODY is the pre-upstream one,
+unchanged — only the DSL surface moved (the pre-upstream ops -> public cutlass/nvvm/cute, and
+the pre-upstream tile library -> cudnn.frost.tile_dsl). Two things are NOT mechanical and were done
+by hand:
+
+  1. **Config.** The pre-upstream kernels picked a flavor with an env var;
+     FROST forbids env-var configuration, so this reads TemplateParams via the
+     FROST_TEMPLATE_PARAMS global (engine contract §5/§6).
+  2. **TMA descriptors.** ``create_tensor_map_tiled_from_tensor`` became
+     ``..._from_view`` — a signature change, not a rename.
+
+Geometry is FROST's ``make_cfg_d128`` as-is. the pre-upstream helper would give
+STAGES_KV = 2*CTA_MMA (4 at cga2) where FROST gives 2; the deeper ring is a
+PERF lever and this port is for FUNCTIONAL coverage first, so it is deliberately
+not taken here.
+
+Original pre-upstream header follows.
+
+Port (from the pre-upstream DSL) of the pre-upstream prefill SDPA kernel
+(llama flavor: FP16, d_qk = d_v = 128, TILES_Q = 2, two softmax
+warpgroups, four correction warps, persistent try_cancel scheduler).
+
+Same kernel shape as the C++ source: pipeline, TMEM/SMEM layout,
+barrier inventory + init counts, scheduler, warp dispatch, register
+split match.  Canonical reference port; reaches ~0.99x C++ TFLOPS.
+
+THD / varlen is **NOT** ported.  The pre-upstream body carried a packed-varlen
+entry point (``CFG.THD_VARLEN=1``: packed ``[1,T,H,D]`` + ``cu_seqlens`` coord
+offset, per-batch O TMA-descriptor array, packed ``[1,QH,T]`` LSE), but its
+setup-kernel call site still speaks the pre-upstream 7-arg contract against a
+14-arg helper and the metadata layout differs (3B+2 vs 4B+4).  ``compile()``
+raises on ``CFG.THD_VARLEN`` rather than half-serving it, ``config_sm107``
+rejects THD for f16/bf16, and no engine row advertises it.  Only the dense
+``[B,S,H,D]`` path is served.
+"""
+
+import os
+import sys
+from functools import lru_cache
+from typing import Callable, Optional, Tuple
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_DIR = os.path.normpath(os.path.join(_HERE, "..", "..", "..", "..", ".."))
+_PYTHON_DIR = os.path.join(_REPO_DIR, "python")
+_CONFIGS_DIR = os.path.normpath(os.path.join(_HERE, "..", "configs"))
+# Shared THD / varlen device helpers (build_o_descs_kernel + TENSOR_MAP_QWORDS).
+_COMMON_SDPA_DIR = os.path.normpath(os.path.join(_HERE, "..", "..", "..", "common", "sdpa"))
+for _p in (_PYTHON_DIR, _CONFIGS_DIR, _COMMON_SDPA_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from cutlass.base_dsl.typing import Pointer
+from cutlass.experimental import primitives as nvvm
+from cutlass.experimental.primitives import vote_sync, VoteSync
+from cutlass.experimental.cuda import tensor_map as tmap
+from cutlass._mlir.dialects import arith
+
+import cutlass
+from cutlass.experimental import primitives as prims
+import cutlass.cute as cute
+import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
+
+from dataclasses import dataclass
+
+# Config comes from the FROST template loader, NOT an env var: the pre-upstream
+# kernels picked a flavor with an env var + a sdpa_config_<flavor> module, which the
+# FROST engine contract forbids ("no environment variables for configuration" —
+# parameters travel as typed dataclasses). The loader injects
+# FROST_TEMPLATE_PARAMS before this body runs; the default keeps a direct
+# `import` usable as a standalone driver.
+from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d128
+
+PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
+CFG, _TMA = make_cfg_d128(PARAMS)
+
+# tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
+# decision point, wired into every construction below rather than repeated as a
+# per-tile literal.  A version-0 descriptor's ``start_address`` is 14 bits = a
+# 256 KiB window; Rubin raises the per-CTA SMEM cap to 327 KiB, so an operand
+# buffer at or above 256 KiB wraps to offset 0 and the MMA multiplies whatever
+# sits at the bottom of SMEM.  This flavor's buffers all stay below the line.
+#
+# Do NOT re-literal this at a call site: the d512 MXFP8 sibling shipped NaN on
+# 100% of cells because its scale-factor tiles were declared UNDER a comment
+# claiming "every operand tile here carries desc_version=1" -- without the
+# kwarg.  A single constant makes that class of drift impossible, and
+# test_sm107_descriptor_version_matches_the_smem_budget asserts it.
+DESC_VERSION: int = 0
+Cfg = type(CFG)
+TMA_QK_ITERS = _TMA.QK_ITERS
+TMA_VO_ITERS = _TMA.VO_ITERS
+TMA_QK_GRANU_ELEMS = _TMA.QK_GRANU_ELEMS
+TMA_VO_GRANU_ELEMS = _TMA.VO_GRANU_ELEMS
+
+# O TMA box / store params follow O's swizzle, not V's (under cga2 V may drop to a narrower swizzle while O stays Swz128B).
+TMA_O_GRANU_ELEMS_HOST = CFG.O_SWZ_BYTES // CFG.BPE
+TMA_O_ITERS_HOST = (CFG.TILE_O * CFG.BPE) // CFG.O_SWZ_BYTES
+
+from typing import NamedTuple
+
+from cudnn.frost.tile_dsl.barrier import (
+    PipelineState,
+    advance,
+    cga_arrive,
+    cga_wait,
+    # `wait` (free fn) — still used for sched.mb_* (Sched is not in Bars yet;
+    # only the per-kernel Bars NamedTuple was migrated to MBarrier in this step).
+    wait,
+)
+from cudnn.frost.tile_dsl.scheduler import (
+    Sched,
+    scheduler_warp_loop,
+    scheduler_warp_loop_persistent,
+    read_tile_id_arrive,
+    read_clc_payload,
+    SCHED_NATURAL,
+    SCHED_LPT,
+    SCHED_LPT_L2,
+)
+from cudnn.frost.tile_dsl.pointwise import (
+    tmem_load_max_reduction_tile,
+    row_reduction_pair,
+    row_max_reduction,
+    vec_scale_pair,
+)
+from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
+from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
+from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait
+from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
+from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
+from cudnn.frost.tile_dsl.mask import (
+    apply_mask_chunk,
+    MASK_NONE,
+    MASK_PADDED,
+    MASK_CAUSAL,
+    MASK_SWA,
+)
+
+# Storage dtype + MMA kind dispatch — folded at trace time on CFG.DTYPE_QKV.
+if CFG.DTYPE_QKV == 2:
+    STORAGE_DTYPE = cutlass.BFloat16
+    P_STORAGE_DTYPE = cutlass.BFloat16
+    MMA_KIND = nvvm.Tcgen05MMAKind.F16
+    IS_TF32 = False
+elif CFG.DTYPE_QKV == 3:
+    STORAGE_DTYPE = cutlass.Float16
+    P_STORAGE_DTYPE = cutlass.Float16
+    MMA_KIND = nvvm.Tcgen05MMAKind.F16
+    IS_TF32 = False
+elif CFG.DTYPE_QKV == 4:
+    # TF32: 4-byte FP32 storage, kind::tf32 MMA (HW rounds operands to a
+    # 10-bit mantissa).  Mirrors the C++ prefill_sdpa_f16.cu IS_TF32 path.
+    # Three TF32-specific deltas vs BF16/FP16 (all folded on IS_TF32 below):
+    #   1. V (the transposed BMM2 operand) SmemDesc + TMA use
+    #      SWIZZLE_128B_ATOM_32B (enc=1, leading=TILE_N*128, stride=512).
+    #      Standard Swz128B with kind::tf32 + b_trans silently returns all-0.
+    #   2. P TMEM packing is 1:1 (one FP32 cell per prob) vs 2:1 for
+    #      fp16/bf16, so P aliases the FULL S_acc slot, not just its tail.
+    #   3. BPE=4 doubles every SMEM/TMA byte count (sized off CFG.BPE).
+    STORAGE_DTYPE = cutlass.Float32
+    P_STORAGE_DTYPE = cutlass.Float32
+    MMA_KIND = nvvm.Tcgen05MMAKind.TF32
+    IS_TF32 = True
+else:
+    raise ValueError(f"prefill_sdpa_f16: DTYPE_QKV={CFG.DTYPE_QKV} not supported " f"(expected 2=BF16, 3=FP16, or 4=TF32)")
+
+
+from cudnn.sdpa.fwd.kernels._common_blackwell import (
+    Bars,
+    KvLoopBounds,
+    make_classic_bars,
+    compute_kv_loop_bounds,
+    lpt_tile_coords,
+    make_sdpa_helpers,
+)
+
+CGA_SIZE = CFG.CGA_M * CFG.CGA_N
+
+CTA_GROUP_KIND = nvvm.CTAGroup.CTA_2 if CFG.CTA_MMA == 2 else nvvm.CTAGroup.CTA_1
+
+# Per-CTA buffer element counts + collective TMA transaction byte counts.
+# K (seq rows) and V (d_v cols) shrink by CTA_MMA; Q / O are per-CTA full.
+# At cga2 leader's expect_tx = per-CTA elems * BPE * CTA_MMA (collective bytes).
+qBufferElems = CFG.TILE_M * CFG.TILE_K
+kBufferElems = CFG.TILE_N * CFG.TILE_K // CFG.CTA_MMA
+vBufferElems = CFG.TILE_O * CFG.TILE_N // CFG.CTA_MMA
+oBufferElems = CFG.TILE_M * CFG.TILE_O
+
+# Q∪O alias (dsv3 TF32): O reuses Q's SMEM slab once BMM1 has consumed Q.
+# Each of the TILES_Q slabs is sized to max(Q,O) so sQ[qs] and sO[qs] coincide;
+# for the classic flavors d_qk >= d_v so the slab is qBufferElems.  TMA-STG
+# arrives mb_q_o_alias after O drains; TMA-LDG waits it before reloading Q.
+IS_QO_ALIAS = bool(CFG.QO_ALIAS)
+QO_SLAB_ELEMS = max(qBufferElems, oBufferElems)
+
+qTmaTransactionBytes = qBufferElems * CFG.BPE * CFG.CTA_MMA
+kTmaTransactionBytes = kBufferElems * CFG.BPE * CFG.CTA_MMA
+vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
+
+
+CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+
+
+# lpt_q_tiles_in_cga_units=True is REQUIRED under any non-NATURAL scheduler:
+# the LPT linearization needs q_tiles in CGA units (n_q_supers // CTA_MMA).
+# Without it the decode walks a row range CTA_MMA times too large, no tile is
+# ever claimed, and the kernel writes NOTHING -- cosine 0.0000 at every shape.
+# It is a NO-OP under SCHED_NATURAL (that decode branch never reads q_tiles),
+# so restoring it cannot change today's shipped path. Every SM100 kernel passes
+# it; the SM107 port dropped it on most flavors. Verified on d256 f16.
+_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
+_decode_initial = _sdpa_h.decode_initial
+_decode_payload = _sdpa_h.decode_payload
+_bounds_for_tile = _sdpa_h.bounds_for_tile
+# Q-side per-sequence length.  Under THD `seqlen_q` is the PACKED TOTAL (the
+# adapter's problem_size seq slots are 0 and _host reads the dynamic extent), so
+# every mask/bounds consumer needs the SEQUENCE's own S_q_b instead.  Sequence 0
+# starts at cu_q[0] == 0, which makes the packed total accidentally right for it
+# and wrong for every later sequence -- the exact "seq 0 exact, seq 1 garbage"
+# signature this kernel had.  Folds to the scalar on the dense path.
+_resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
+_resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
+
+# THD / varlen — flat-grid decode + tma-offset closures (CFG-bound) from the
+# factory; O-descriptor builder + TENSOR_MAP_QWORDS from the shared
+# the shared pre-upstream THD helper.  Gated by CFG.THD_VARLEN (folds out otherwise).
+# Supported at cga1 and cga2 (TILES_Q=2 → two Q slabs / O stores per tile).
+# seq_kv_lens overloaded as the THD metadata buffer (int32 len 3B+2):
+#   [0..B-1]=seq_kv_lens  [B..2B]=cu_q(B+1)  [2B+1..3B+1]=cu_k(B+1)
+# THD: FROST's builder is NOT the pre-upstream one, which was 7-arg, O-descriptors-
+# only build_o_descs_kernel; FROST does per-execute meta + O (+ K/V base descs)
+# in one elected-thread kernel with a 14-arg contract, and ships a dedicated
+# f16/bf16 entry point. The import is corrected here; the CALL SITE still speaks
+# the pre-upstream contract and is taken from the shipped fp8 SM107 sibling when THD
+# is wired (dense path first — see the module header).
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
+
+_TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
+_dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
+_dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
+_thd_tma_offsets = _sdpa_h.thd_tma_offsets
+
+
+# P (BMM2 operand) aliases the TAIL of each 128-col S_acc slot since BMM1
+# finishes (and softmax loads S into registers) before P is written.
+# fp16/bf16 pack 2 probs per FP32 cell → P width = TILE_N/2 ≤ 64 cols → P
+# sits at slot offset 64.  TF32 is 1:1 → P width = TILE_N, so P aliases the
+# FULL slot (offset 0 / 128).  Mirrors C++ S_bmm2_0 = S_acc_cols - S_bmm2_cols.
+_P0_OFF = 0 if IS_TF32 else 64
+_P1_OFF = 128 if IS_TF32 else 192
+
+
+@dataclass(frozen=True)
+class KernelTmemLayout:
+    """Column offsets for the classic 2-sub-tile SDPA pipeline.
+
+    Stats deliberately sit outside S_acc/O ranges so BMM1's next-iter
+    write doesn't clobber them.  P aliases the tail of S_acc[qs] since
+    BMM1 finishes before P is written.
+    """
+
+    # Rubin SM10.7 cap; requires is_exclusive=True on tcgen05_alloc.
+    TOTAL_COLS: int = 576
+
+    S0_OFF: int = 0
+    S1_OFF: int = 128
+
+    O0_OFF: int = 256
+    O1_OFF: int = 384
+
+    P0_OFF: int = _P0_OFF
+    P1_OFF: int = _P1_OFF
+
+    # qs stride = 8 cols.
+    STATS_OFF: int = 544
+
+
+LAYOUT = KernelTmemLayout()
+
+
+# === Kernel ===
+
+
+@cute.kernel
+def _kernel(
+    tma_q_desc: cutlass.GridConstant[tmap.TensorMap],
+    tma_k_desc: cutlass.GridConstant[tmap.TensorMap],
+    tma_v_desc: cutlass.GridConstant[tmap.TensorMap],
+    tma_o_desc: cutlass.GridConstant[tmap.TensorMap],
+    lse_tensor: Optional[cute.Tensor],
+    sinks_tensor: cute.Tensor,
+    seq_kv_lens_tensor: cute.Tensor,
+    o_desc_words: cute.Tensor,
+    seqlen_q: cutlass.Int32,
+    seqlen_kv: cutlass.Int32,
+    n_q_supers: cutlass.Int32,
+    n_qh: cutlass.Int32,
+    n_batch: cutlass.Int32,
+    qh_per_kh: cutlass.Int32,
+    scale_softmax_log2: cutlass.Float32,
+) -> None:
+
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    tidx, _, _ = cute.arch.thread_idx()
+
+    bidx = cute.arch.block_idx()[0]
+    bidy = cute.arch.block_idx()[1]
+    bidz = cute.arch.block_idx()[2]
+
+    # SMEM allocations in natural Q/K/V/O order — Tcgen05SmemDesc.build truncates
+    # start_address past ~256 KiB so this order keeps the data buffers in low SMEM.
+    # QO_ALIAS: one Q∪O slab (TILES_Q × max(Q,O) elems); sO points into it and
+    # strides by QO_SLAB_ELEMS so sO[qs] coincides with sQ[qs].  Else: separate
+    # Q and O buffers (the classic layout).
+    if cutlass.const_expr(IS_QO_ALIAS):
+        sQ_raw = cutlass.Array(STORAGE_DTYPE, CFG.TILES_Q * QO_SLAB_ELEMS, alignment=1024, space=cutlass.AddressSpace.smem)
+        sO_raw = sQ_raw
+        _SO_STAGE_ELEMS = QO_SLAB_ELEMS
+    else:
+        sQ_raw = cutlass.Array(STORAGE_DTYPE, CFG.TILES_Q * qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+        sO_raw = cutlass.Array(STORAGE_DTYPE, CFG.TILES_Q * oBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+        _SO_STAGE_ELEMS = oBufferElems
+    sK_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * kBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+    sV_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * vBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+
+    sQ = SmemTile(
+        base=sQ_raw,
+        elems_per_stage=qBufferElems,
+        stages=CFG.TILES_Q,
+        leading_byte_offset=LEADING_BYTE_OFFSET_QK,
+        stride_byte_offset=STRIDE_BYTE_OFFSET_QK,
+        layout=SMEM_LAYOUT_QKO,
+        tma_loads_per_tile=TMA_QK_ITERS,
+        tma_granu_elems=TMA_QK_GRANU_ELEMS,
+        tma_subtile_stride_elems=CFG.TILE_M * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
+    )
+    sK = SmemTile(
+        base=sK_raw,
+        elems_per_stage=kBufferElems,
+        stages=CFG.STAGES_KV,
+        leading_byte_offset=LEADING_BYTE_OFFSET_QK,
+        stride_byte_offset=STRIDE_BYTE_OFFSET_QK,
+        layout=SMEM_LAYOUT_QKO,
+        tma_loads_per_tile=TMA_QK_ITERS,
+        tma_granu_elems=TMA_QK_GRANU_ELEMS,
+        tma_subtile_stride_elems=(CFG.TILE_N // CFG.CTA_MMA) * TMA_QK_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
+    )
+    sV = SmemTile(
+        base=sV_raw,
+        elems_per_stage=vBufferElems,
+        stages=CFG.STAGES_KV,
+        leading_byte_offset=LEADING_BYTE_OFFSET_PV,
+        stride_byte_offset=STRIDE_BYTE_OFFSET_PV,
+        layout=SMEM_LAYOUT_V,
+        # V is split along d_v under cga2 → tma_loads_per_tile = TMA_VO_ITERS / CTA_MMA.
+        tma_loads_per_tile=TMA_VO_ITERS // CFG.CTA_MMA,
+        tma_granu_elems=TMA_VO_GRANU_ELEMS,
+        tma_subtile_stride_elems=CFG.TILE_N * TMA_VO_GRANU_ELEMS,
+        desc_version=DESC_VERSION,
+    )
+    sO = SmemTile(
+        base=sO_raw,
+        elems_per_stage=_SO_STAGE_ELEMS,
+        stages=CFG.TILES_Q,
+        leading_byte_offset=0,
+        stride_byte_offset=0,
+        layout=SMEM_LAYOUT_QKO,
+        tma_loads_per_tile=TMA_O_ITERS_HOST,
+        tma_granu_elems=TMA_O_GRANU_ELEMS_HOST,
+        tma_subtile_stride_elems=CFG.TILE_M * TMA_O_GRANU_ELEMS_HOST,
+        desc_version=DESC_VERSION,
+    )
+
+    bars = make_classic_bars(CFG)
+
+    tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
+
+    # tile_id_smem stride 8 Int32/stage (32 B) = 16 B try_cancel payload + 16 B padding.
+    sched = Sched(
+        **{
+            "mb_scheduler": cutlass.Array(cutlass.Int64, CFG.SCHEDULER_STAGES, alignment=16, space=cutlass.AddressSpace.smem),
+            "mb_read_tile_id": cutlass.Array(cutlass.Int64, CFG.SCHEDULER_STAGES, alignment=16, space=cutlass.AddressSpace.smem),
+            "tile_id_smem": cutlass.Array(cutlass.Int32, CFG.SCHEDULER_STAGES * 8, alignment=16, space=cutlass.AddressSpace.smem),
+            "bidx_init": bidx,
+            "bidy_init": bidy,
+            "bidz_init": bidz,
+        }
+    )
+
+    # Scheduler mbar arrive count — stays kernel-local (sched is NOT in Bars).
+    READ_TILE_ARRIVERS_TOTAL = ((CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS) + CFG.CORRECTION_WARPS + 1 + 1) * CGA_SIZE + (CFG.CGA_M // CFG.CTA_MMA)
+
+    if warp_idx == 0:
+        if nvvm.elect_sync():
+            # range_constexpr → Python-int loop variable so bars.mb_X[qs].init()
+            # can index the per-stage init_count tuple (mb_bmm2_ready) at trace
+            # time.  Loop bounds are small (TILES_Q=2, STAGES_KV=2-4) — unroll
+            # is free.
+            for qs in cutlass.range_constexpr(CFG.TILES_Q):
+                bars.mb_q_full[qs].init()
+                bars.mb_q_empty[qs].init()
+                bars.mb_bmm1_done[qs].init()
+                bars.mb_bmm2_done[qs].init()
+                bars.mb_stat_full[qs].init()
+                bars.mb_stat_empty[qs].init()
+                bars.mb_o_full[qs].init()
+                bars.mb_o_empty[qs].init()
+                if cutlass.const_expr(IS_QO_ALIAS):
+                    bars.mb_q_o_alias[qs].init()
+                for c in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
+                    bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + c].init()
+            for ks in cutlass.range_constexpr(CFG.STAGES_KV):
+                bars.mb_k_full[ks].init()
+                bars.mb_k_empty[ks].init()
+                bars.mb_v_full[ks].init()
+                bars.mb_v_empty[ks].init()
+            for s in range(CFG.SCHEDULER_STAGES):
+                nvvm.mbarrier_init(sched.mb_scheduler.subview(s), CFG.ONE_LANE)
+                nvvm.mbarrier_init(sched.mb_read_tile_id.subview(s), READ_TILE_ARRIVERS_TOTAL)
+            bars.mb_tmem_dealloc.init()
+            bars.mb_empty_mainloop.init()
+
+    nvvm.fence_mbarrier_init()
+    nvvm.barrier_cta_sync()
+
+    # P4: cluster fence gates cga2 cross-CTA arrive_on_peer on peer init.
+    if cutlass.const_expr(CFG.CTA_MMA == 2):
+        cga_arrive()
+        cga_wait()
+
+    # @cute.kernel stages if/else — use Python ternaries so the chosen
+    # expression flows into the trace (variables in branches aren't visible outside).
+    cta_id_x = cute.arch.block_idx_in_cluster() if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int32(0)
+    cta_in_pair = (cta_id_x & cutlass.Int32(1)) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int32(0)
+    leader_cta_id = (cta_id_x & cutlass.Int32(~1 & 0xFFFFFFFF)) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int32(0)
+    mcast_mask = (cutlass.Int32(3) << leader_cta_id) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int32(0)
+    # TMA-load self-bit mask: each peer's cta_group::2 TMA targets its own bit;
+    # cga2 routing strips bit-24 so bytes land on leader's mbar.
+    tma_mcast_mask = (cutlass.Int16(1) << cta_in_pair) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int16(0)
+    is_leader = cta_in_pair == cutlass.Int32(0)
+
+    # === Per-warp role dispatch ===
+    if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
+        nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        _softmax_warp_group(
+            sub_tile_id=0,
+            seqlen_q=seqlen_q,
+            seqlen_kv=seqlen_kv,
+            scale_log2=scale_softmax_log2,
+            tmem_ptr_i32=tmem_ptr_i32,
+            sQ=sQ,
+            bars=bars,
+            sched=sched,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
+            n_q_supers=n_q_supers,
+            n_qh=n_qh,
+            n_batch=n_batch,
+            leader_cta_id=leader_cta_id,
+            cta_in_pair=cta_in_pair,
+        )
+
+    elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
+        nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        _softmax_warp_group(
+            sub_tile_id=1,
+            seqlen_q=seqlen_q,
+            seqlen_kv=seqlen_kv,
+            scale_log2=scale_softmax_log2,
+            tmem_ptr_i32=tmem_ptr_i32,
+            sQ=sQ,
+            bars=bars,
+            sched=sched,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
+            n_q_supers=n_q_supers,
+            n_qh=n_qh,
+            n_batch=n_batch,
+            leader_cta_id=leader_cta_id,
+            cta_in_pair=cta_in_pair,
+        )
+
+    elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
+        nvvm.setmaxregister(CFG.CORRECTION_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        _correction_warp_group(
+            seqlen_q=seqlen_q,
+            seqlen_kv=seqlen_kv,
+            sO=sO,
+            tmem_ptr_i32=tmem_ptr_i32,
+            tidx=tidx,
+            bars=bars,
+            sched=sched,
+            lse_tensor=lse_tensor,
+            sinks_tensor=sinks_tensor,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
+            n_q_supers=n_q_supers,
+            n_qh=n_qh,
+            n_batch=n_batch,
+            leader_cta_id=leader_cta_id,
+            cta_in_pair=cta_in_pair,
+            cta_id_x=cta_id_x,
+        )
+
+    elif warp_idx == CFG.MMA_WARP_ID:
+        # Under cga2 the non-leader CTA runs the quiet body (alloc + dealloc only).
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(CFG.CTA_MMA == 2):
+            if is_leader:
+                _mma_warp_group(
+                    seqlen_q=seqlen_q,
+                    seqlen_kv=seqlen_kv,
+                    sQ=sQ,
+                    sK=sK,
+                    sV=sV,
+                    tmem_ptr_i32=tmem_ptr_i32,
+                    bars=bars,
+                    sched=sched,
+                    seq_kv_lens_tensor=seq_kv_lens_tensor,
+                    n_q_supers=n_q_supers,
+                    n_qh=n_qh,
+                    n_batch=n_batch,
+                    mcast_mask=mcast_mask,
+                    cta_in_pair=cta_in_pair,
+                )
+            else:
+                _mma_warp_quiet(tmem_ptr_i32, bars)
+        else:
+            _mma_warp_group(
+                seqlen_q=seqlen_q,
+                seqlen_kv=seqlen_kv,
+                sQ=sQ,
+                sK=sK,
+                sV=sV,
+                tmem_ptr_i32=tmem_ptr_i32,
+                bars=bars,
+                sched=sched,
+                seq_kv_lens_tensor=seq_kv_lens_tensor,
+                n_q_supers=n_q_supers,
+                n_qh=n_qh,
+                n_batch=n_batch,
+                mcast_mask=mcast_mask,
+                cta_in_pair=cta_in_pair,
+            )
+
+    elif warp_idx == CFG.TMALDG_WARP_ID:
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
+        nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
+        nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
+        _tmaldg_warp_group(
+            tma_q_desc=tma_q_desc,
+            tma_k_desc=tma_k_desc,
+            tma_v_desc=tma_v_desc,
+            o_desc_words=o_desc_words,
+            sQ=sQ,
+            sK=sK,
+            sV=sV,
+            bars=bars,
+            sched=sched,
+            seqlen_q=seqlen_q,
+            seqlen_kv=seqlen_kv,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
+            n_q_supers=n_q_supers,
+            n_qh=n_qh,
+            n_batch=n_batch,
+            qh_per_kh=qh_per_kh,
+            is_leader=is_leader,
+            cta_in_pair=cta_in_pair,
+            tma_mcast_mask=tma_mcast_mask,
+        )
+
+    elif warp_idx == CFG.TMASTG_WARP_ID:
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        _tmastg_warp_group(
+            tma_o_desc=tma_o_desc,
+            sO=sO,
+            bars=bars,
+            sched=sched,
+            n_q_supers=n_q_supers,
+            n_qh=n_qh,
+            n_batch=n_batch,
+            cta_in_pair=cta_in_pair,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
+            o_desc_words=o_desc_words,
+        )
+
+    else:  # warp_idx == CFG.SCHED_WARP_ID
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        # try_cancel.multicast::cluster::all — only (0,0,0) CTA issues; at cga1
+        # cta_id_x == 0 always, so flag is 1 unconditionally.
+        is_cga_first_cta = cta_id_x == cutlass.Int32(0)
+        if cutlass.const_expr(CFG.THD_VARLEN):
+            # THD: PERSISTENT grid + a device-bounded claim counter, so no unit
+            # past the live total is ever handed out.  The counter and the live
+            # total are the last two slots of the 4B+4 metadata buffer that the
+            # setup kernel writes -- nothing consumed them before, which is the
+            # other half of why this kernel's THD output was wrong: the dense
+            # CLC path hands out tiles against a grid that is the persistent
+            # cluster count, not the work list, so the tile -> unit mapping is
+            # off for every tile.  n_batch is a kernel ARGUMENT: do not
+            # re-derive it from the metadata tensor's layout, which is not
+            # always a flat 1-D view.  Identical call to the SM100 f16 sibling
+            # and to this file's FP8 sibling.
+            scheduler_warp_loop_persistent(
+                sched,
+                CFG.SCHEDULER_STAGES,
+                is_cga_first_cta,
+                seq_kv_lens_tensor,
+                cutlass.Int32(4) * n_batch + cutlass.Int32(3),
+                cutlass.Int32(4) * n_batch + cutlass.Int32(2),
+                CGA_SIZE,
+                CFG.CGA_M,
+            )
+        else:
+            scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta, CGA_SIZE)
+
+
+# === TMA-LDG warp ===
+
+
+@cute.jit
+def _tmaldg_warp_group(
+    tma_q_desc,
+    tma_k_desc,
+    tma_v_desc,
+    o_desc_words,
+    sQ,
+    sK,
+    sV,
+    bars,
+    sched,
+    seqlen_q,
+    seqlen_kv,
+    seq_kv_lens_tensor,
+    n_q_supers,
+    n_qh,
+    n_batch,
+    qh_per_kh,
+    is_leader,
+    cta_in_pair,
+    tma_mcast_mask,
+):
+    """Unified TMA-LDG warp — cga1 / cga2 x MASK_NONE / PADDED / CAUSAL / SWA.
+
+    Spill-free in CFG.OTHER_REGS via q_row_base pre-multiplied after each
+    scheduler decode (gives ptxas a live use of nxt_q before the loop
+    back-edge, keeping the LDS.128 result in uniform registers).
+    """
+    q_empty_phase = cutlass.Int32(1)
+    kv_state = PipelineState.start(phase=1)
+
+    # Q-reload gate: under QO_ALIAS the next tile's Q-load must wait for the
+    # prior tile's O (sharing the slab) to drain — TMA-STG fires mb_q_o_alias
+    # (strictly after MMA consumed Q).  Else gate on mb_q_empty (MMA commit).
+    # Both bootstrap consumer-side via q_empty_phase=1.
+    mb_q_reload = bars.mb_q_o_alias if cutlass.const_expr(IS_QO_ALIAS) else bars.mb_q_empty
+
+    tma_q = GmemTileTma(tma_q_desc)
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        # THD: K/V ride the setup kernel's RUNTIME descriptors (o_desc_words
+        # slots n_batch+1 / n_batch+2), whose seq extent is CLAMPED to the
+        # packed KV total cu_k[B].  The plan-time descriptors describe the
+        # buffer's CAPACITY instead, so using them here reads the tail past the
+        # packed total: the last sequence's tile steps into it, and a poisoned
+        # tail wipes the whole tile through BMM2 (0 * NaN == NaN).  Through the
+        # clamped descriptors those rows are TMA-OOB and land as EXACT ZEROS.
+        # Same closure shape as GmemTileTma, so every load site stays
+        # branch-free.  Mirrors sm107/prefill_d128_fp8.py.
+        _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
+        tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
+    else:
+        tma_k = GmemTileTma(tma_k_desc)
+        tma_v = GmemTileTma(tma_v_desc)
+
+    q_super_idx, head_idx, batch_idx = _dispatch_decode_initial(
+        sched.bidx_init,
+        sched.bidy_init,
+        sched.bidz_init,
+        cta_in_pair,
+        n_q_supers,
+        n_qh,
+        n_batch,
+        seq_kv_lens_tensor,
+    )
+    # GQA: K/V are indexed by kv-head, not Q-head.
+    kv_head_idx = cute.arch.make_warp_uniform(head_idx // qh_per_kh)
+    q_row_base = cute.arch.make_warp_uniform(q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M))
+    q_seq_off, kv_seq_off, tma_batch = _thd_tma_offsets(seq_kv_lens_tensor, batch_idx, n_batch)
+
+    if cutlass.const_expr(CFG.MASK_FLAGS == 0):
+        kv_left = cutlass.Int32(0)
+        kv_right = seqlen_kv // cutlass.Int32(CFG.TILE_N)
+    else:
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+        bounds_init = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair)
+        kv_left = bounds_init.left
+        kv_right = bounds_init.right
+
+    is_valid_tile = cutlass.Int32(1)
+    sched_state = PipelineState.start()
+
+    # the DSL's TMA descriptors is element-typed; contiguous coord is in ELEMENTS not bytes.
+    K_ROW_OFFSET_PEER = cta_in_pair * cutlass.Int32(CFG.TILE_N // CFG.CTA_MMA)
+    V_COL_OFFSET_PEER = cta_in_pair * cutlass.Int32(CFG.TILE_O // CFG.CTA_MMA)
+
+    while is_valid_tile > cutlass.Int32(0):
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+
+        if cutlass.const_expr(CFG.MASK_FLAGS != 0) and (kv_right <= kv_left):
+            pass
+        else:
+            # Prologue interleave Q[0] -> K[first] -> Q[1] -> V[first] -> mainloop —
+            # K load starts before Q[1] is issued and V before kv mainloop.
+            kv_row_base = kv_left * CFG.TILE_N
+
+            mb_q_reload[0].wait(q_empty_phase)
+            if cutlass.const_expr(CFG.CTA_MMA == 2):
+                bars.mb_q_full[0].arrive(n_bytes=qTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
+            else:
+                bars.mb_q_full[0].arrive(n_bytes=qTmaTransactionBytes, pred=nvvm.elect_sync())
+            tma_load_tile(
+                sQ[0],
+                tma_q(cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(0 * CFG.TILE_M) + q_seq_off, tma_batch),
+                bars.mb_q_full[0].smem_ptr,
+                cta_group=CFG.CTA_MMA,
+                mcast_mask=tma_mcast_mask,
+            )
+
+            bars.mb_k_empty[kv_state.idx].wait(kv_state.phase)
+            if cutlass.const_expr(CFG.CTA_MMA == 2):
+                bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
+            else:
+                bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes, pred=nvvm.elect_sync())
+            tma_load_tile(
+                sK[kv_state.idx],
+                # THD: the per-sequence KV offset and the collapsed batch coord are
+                # NOT optional here.  The packed batch extent is 1, so a load at
+                # batch_idx > 0 is OOB and zero-fills -- this prologue K tile was
+                # the one load site in this file still passing batch_idx instead of
+                # tma_batch, and omitting kv_seq_off.  Both fold to the dense values
+                # (0, batch_idx) when THD is off, which is why it looked harmless.
+                tma_k(cutlass.Int32(0), kv_head_idx, kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch),
+                bars.mb_k_full[kv_state.idx].smem_ptr,
+                cta_group=CFG.CTA_MMA,
+                mcast_mask=tma_mcast_mask,
+            )
+
+            mb_q_reload[1].wait(q_empty_phase)
+            if cutlass.const_expr(CFG.CTA_MMA == 2):
+                bars.mb_q_full[1].arrive(n_bytes=qTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
+            else:
+                bars.mb_q_full[1].arrive(n_bytes=qTmaTransactionBytes, pred=nvvm.elect_sync())
+            tma_load_tile(
+                sQ[1],
+                tma_q(cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(1 * CFG.TILE_M) + q_seq_off, tma_batch),
+                bars.mb_q_full[1].smem_ptr,
+                cta_group=CFG.CTA_MMA,
+                mcast_mask=tma_mcast_mask,
+            )
+            q_empty_phase = q_empty_phase ^ 1
+
+            bars.mb_v_empty[kv_state.idx].wait(kv_state.phase)
+            if cutlass.const_expr(CFG.CTA_MMA == 2):
+                bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
+            else:
+                bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
+            tma_load_tile(
+                sV[kv_state.idx],
+                tma_v(V_COL_OFFSET_PEER, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
+                bars.mb_v_full[kv_state.idx].smem_ptr,
+                cta_group=CFG.CTA_MMA,
+                mcast_mask=tma_mcast_mask,
+            )
+            kv_state = advance(kv_state, CFG.STAGES_KV)
+
+            for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1):
+                kv_row_base = kv_loop * CFG.TILE_N
+
+                bars.mb_k_empty[kv_state.idx].wait(kv_state.phase)
+                if cutlass.const_expr(CFG.CTA_MMA == 2):
+                    bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
+                else:
+                    bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes, pred=nvvm.elect_sync())
+                tma_load_tile(
+                    sK[kv_state.idx],
+                    tma_k(cutlass.Int32(0), kv_head_idx, kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch),
+                    bars.mb_k_full[kv_state.idx].smem_ptr,
+                    cta_group=CFG.CTA_MMA,
+                    mcast_mask=tma_mcast_mask,
+                )
+
+                bars.mb_v_empty[kv_state.idx].wait(kv_state.phase)
+                if cutlass.const_expr(CFG.CTA_MMA == 2):
+                    bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
+                else:
+                    bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
+                tma_load_tile(
+                    sV[kv_state.idx],
+                    tma_v(V_COL_OFFSET_PEER, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
+                    bars.mb_v_full[kv_state.idx].smem_ptr,
+                    cta_group=CFG.CTA_MMA,
+                    mcast_mask=tma_mcast_mask,
+                )
+
+                kv_state = advance(kv_state, CFG.STAGES_KV)
+
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+        nxt_q = cute.arch.make_warp_uniform(nxt_q)
+        nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+        nxt_v = cute.arch.make_warp_uniform(nxt_v)
+        q_super_idx, head_idx, batch_idx = _dispatch_decode_payload(
+            nxt_q,
+            nxt_hb,
+            cta_in_pair,
+            n_q_supers,
+            n_qh,
+            n_batch,
+            seq_kv_lens_tensor,
+        )
+        kv_head_idx = cute.arch.make_warp_uniform(head_idx // qh_per_kh)
+        # q_row_base compute right after decode drives ptxas R2UR.
+        q_row_base = cute.arch.make_warp_uniform(q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M))
+        q_seq_off, kv_seq_off, tma_batch = _thd_tma_offsets(seq_kv_lens_tensor, batch_idx, n_batch)
+        is_valid_tile = nxt_v & cutlass.Int32(1)
+        sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+        if cutlass.const_expr(CFG.MASK_FLAGS != 0):
+            eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+            bounds_next = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair)
+            kv_left = bounds_next.left
+            kv_right = bounds_next.right
+
+    # cga2: drain trailing empty mbar arrives so SMEM isn't torn down while
+    # leader's multicast commits are still in-flight.
+    if cutlass.const_expr(CFG.CTA_MMA == 2):
+        for _qs in cutlass.range_constexpr(CFG.TILES_Q):
+            mb_q_reload[_qs].wait(q_empty_phase)
+        q_empty_phase = q_empty_phase ^ cutlass.Int32(1)
+        for _ks in cutlass.range_constexpr(CFG.STAGES_KV):
+            bars.mb_k_empty[kv_state.idx].wait(kv_state.phase)
+            bars.mb_v_empty[kv_state.idx].wait(kv_state.phase)
+            kv_state = advance(kv_state, CFG.STAGES_KV)
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+
+# === TMA-STG warp ===
+
+
+@cute.jit
+def _tmastg_warp_group(
+    tma_o_desc,
+    sO,
+    bars,
+    sched,
+    n_q_supers,
+    n_qh,
+    n_batch,
+    cta_in_pair,
+    seq_kv_lens_tensor,
+    o_desc_words,
+):
+    """Persistent O-store warp.  First tile from blockIdx; subsequent tiles
+    via scheduler warp's clusterlaunchcontrol.try_cancel.async.
+    """
+    o_full_phase = cutlass.Int32(0)  # consumer waits — first-arrive flips 0 → 1
+
+    tma_o = GmemTileTma(tma_o_desc)
+
+    q_super_idx, head_idx, batch_idx = _dispatch_decode_initial(
+        sched.bidx_init,
+        sched.bidy_init,
+        sched.bidz_init,
+        cta_in_pair,
+        n_q_supers,
+        n_qh,
+        n_batch,
+        seq_kv_lens_tensor,
+    )
+    is_valid_tile = cutlass.Int32(1)
+    sched_state = PipelineState.start()
+
+    while is_valid_tile > cutlass.Int32(0):
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+
+        q_row_base = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
+
+        for qs in cutlass.range_constexpr(CFG.TILES_Q):
+            bars.mb_o_full[qs].wait(o_full_phase)
+
+            # O TMA params follow O's swizzle (NOT V's) — under gptoss cga2 V drops to Swz64B while O stays Swz128B.
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                # THD: store each Q slab through this batch's pre-built descriptor
+                # (base at the sequence's packed row, seq extent = S_q_b → a box
+                # past S_q_b is OOB-clipped).  q_row coord is sequence-local; the
+                # batch coord collapses to 0.  Both slabs share one descriptor.
+                #
+                # DEAD unit (batch_idx == n_batch, the over-launched persistent
+                # grid's sentinel): no O rows exist for it and the setup kernel
+                # never builds descriptor slot n_batch, so storing through it
+                # writes a tile to an unbuilt descriptor.  The barrier protocol
+                # below still runs -- only the store is skipped.  This guard is
+                # unnecessary under an exactly-sized grid, which is why the
+                # pre-upstream body did not have it and why it only started
+                # mattering when the scheduler became persistent.
+                if batch_idx < n_batch:
+                    o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+                    o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(qs * CFG.TILE_M), cutlass.Int32(0))
+                    tma_store_tile(sO[qs], o_slice)
+            else:
+                tma_store_tile(
+                    sO[qs],
+                    tma_o(cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(qs * CFG.TILE_M), batch_idx),
+                )
+
+            tma_store_commit()
+            tma_store_wait(0)
+
+            bars.mb_o_empty[qs].arrive()
+            # QO_ALIAS: O[qs] has drained to GMEM → the shared Q∪O slab is free
+            # for TMA-LDG to clobber with the next tile's Q[qs].
+            if cutlass.const_expr(IS_QO_ALIAS):
+                bars.mb_q_o_alias[qs].arrive()
+
+        o_full_phase = o_full_phase ^ 1
+
+        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+        q_super_idx, head_idx, batch_idx = _dispatch_decode_payload(
+            nxt_q,
+            nxt_hb,
+            cta_in_pair,
+            n_q_supers,
+            n_qh,
+            n_batch,
+            seq_kv_lens_tensor,
+        )
+        is_valid_tile = nxt_v & cutlass.Int32(1)
+        sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+
+
+# === BMM1 / BMM2 SMEM + idesc constants ===
+
+# Per-tensor swizzle layout enum: SWIZZLE_128B_ATOM_32B=1, Swz128B=2,
+# Swz64B=4, Swz32B=6.
+_SWZ_ENUM = {128: 2, 64: 4, 32: 6}
+_SWZ_ATOM_32B = 1  # required on the transposed BMM2 operand (V) under kind::tf32
+SMEM_LAYOUT_Q = _SWZ_ENUM[CFG.Q_SWZ_BYTES]
+SMEM_LAYOUT_K = _SWZ_ENUM[CFG.K_SWZ_BYTES]
+# V is the B-transposed BMM2 operand → TF32 needs SWIZZLE_128B_ATOM_32B.
+# Q/K (BMM1, non-transposed) and O keep standard swizzle for all dtypes.
+SMEM_LAYOUT_V = _SWZ_ATOM_32B if IS_TF32 else _SWZ_ENUM[CFG.V_SWZ_BYTES]
+SMEM_LAYOUT_O = _SWZ_ENUM[CFG.O_SWZ_BYTES]
+SMEM_LAYOUT_QKO = SMEM_LAYOUT_Q
+
+# O SMEM swizzle: third param is the XOR shift offset (=3 across all widths), NOT the B value.
+_O_SWZ_B = {128: 3, 64: 2, 32: 1}[CFG.O_SWZ_BYTES]
+_O_SMEM_SWIZZLE = cutlass.Swizzle(_O_SWZ_B, 4, 3)
+
+LEADING_BYTE_OFFSET_QK = 0
+STRIDE_BYTE_OFFSET_QK = 8 * CFG.Q_SWZ_BYTES
+
+# leading_byte_offset = 0 when (TILE_O/CTA_MMA)/8 <= 8 else TILE_N*V_SWZ_BYTES
+# TF32 ATOM32 override (mirrors C++ prefill_sdpa_f16.cu:803-806): the
+# SWIZZLE_128B_ATOM_32B mode pins leading = TILE_N*128, stride = 512 (NOT
+# the standard 8*V_SWZ).  Standard formulas with kind::tf32 silently zero C.
+_CORE_MATRIX_ROWS = 8
+_V_PC_COLS = CFG.TILE_O // CFG.CTA_MMA
+_LEADING_PV_STD = 0 if (_V_PC_COLS // _CORE_MATRIX_ROWS) <= 8 else CFG.TILE_N * CFG.V_SWZ_BYTES
+LEADING_BYTE_OFFSET_PV = (CFG.TILE_N * 128) if IS_TF32 else _LEADING_PV_STD
+STRIDE_BYTE_OFFSET_PV = 512 if IS_TF32 else (8 * CFG.V_SWZ_BYTES)
+
+NUM_KPHASES_PV = CFG.TILE_N // CFG.TILE_K_HW_BMM2
+NUM_KPHASES_PV_PER_CHUNK = NUM_KPHASES_PV // CFG.N_BMM2_CHUNKS
+
+
+@cute.jit
+def _mma_warp_quiet(tmem_ptr_i32, bars):
+    """Minimal quiet body for the non-leader CTA's MMA-warp slot under cga2.
+
+    Non-leader still participates in TMEM alloc / release lock (warp-collective
+    .sync.aligned ops) and TMEM-publish named barriers — leader's MMA reads
+    through the cluster crossbar from peer's TMEM during cga2 collective MMA.
+    """
+    # All-lanes warp-collective ops — NO elect_sync gating.
+    tmem_alloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND, is_exclusive=True)
+    # Match lead MMA's named-barrier arrive count (lead is +1 on both publish barriers).
+    nvvm.barrier_cta_arrive(1, 32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
+    nvvm.barrier_cta_arrive(2, 32 * (CFG.CORRECTION_WARPS + 1))
+
+    bars.mb_tmem_dealloc.wait(cutlass.Int32(0))
+    tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
+
+
+@cute.jit
+def _mma_warp_group(
+    seqlen_q,
+    seqlen_kv,
+    sQ,
+    sK,
+    sV,
+    tmem_ptr_i32,
+    bars,
+    sched,
+    seq_kv_lens_tensor,
+    n_q_supers,
+    n_qh,
+    n_batch,
+    mcast_mask,
+    cta_in_pair,
+):
+    """Unified MMA warp — cga1 / cga2-leader x MASK_NONE / PADDED / CAUSAL / SWA,
+    spill-free in CFG.OTHER_REGS (40).  Non-leader under cga2 uses _mma_warp_quiet.
+    """
+    tmem_alloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND, is_exclusive=True)
+    nvvm.barrier_cta_arrive(1, 32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
+    nvvm.barrier_cta_arrive(2, 32 * (CFG.CORRECTION_WARPS + 1))
+
+    tmem_raw = nvvm.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
+
+    # idesc M is COLLECTIVE (per-CTA M * CTA_MMA): cga2 tcgen05.mma.cta_group::2
+    # reads both peers' A and produces 2*LOCAL_M output rows.
+    idesc_qk = prims.Tcgen05InstrDesc.build(
+        c_dtype=cutlass.Float32,
+        a_dtype=STORAGE_DTYPE,
+        b_dtype=STORAGE_DTYPE,
+        n_dim=CFG.TILE_N,
+        m_dim=CFG.TILE_M * CFG.CTA_MMA,
+    )
+    idesc_pv = prims.Tcgen05InstrDesc.build(
+        c_dtype=cutlass.Float32,
+        a_dtype=STORAGE_DTYPE,
+        b_dtype=STORAGE_DTYPE,
+        n_dim=CFG.TILE_O,
+        m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        b_major=1,
+    )
+    bmm1_desc = MmaDesc(
+        M=CFG.TILE_M * CFG.CTA_MMA,
+        N=CFG.TILE_N,
+        K=CFG.TILE_K,
+        bpe_a=CFG.BPE,
+        bpe_b=CFG.BPE,
+        tile_k_hw=CFG.TILE_K_HW_BMM1,
+        btranspose=False,
+        cta_group=CFG.CTA_MMA,
+        idesc=idesc_qk,
+        kind=MMA_KIND,
+    )
+    # BMM2 V uses non-default K_SUBTILE = V_SWZ_BYTES/BPE (cga2 V Swz64B on dsv3/gptoss).
+    bmm2_desc = MmaDesc(
+        M=CFG.TILE_M * CFG.CTA_MMA,
+        N=CFG.TILE_O,
+        K=CFG.TILE_N,
+        bpe_a=CFG.BPE,
+        bpe_b=CFG.BPE,
+        tile_k_hw=CFG.TILE_K_HW_BMM2,
+        btranspose=True,
+        k_subtile=CFG.V_SWZ_BYTES // CFG.BPE,
+        cta_group=CFG.CTA_MMA,
+        idesc=idesc_pv,
+        kind=MMA_KIND,
+    )
+
+    desc_Q0 = sQ[0].desc()
+    desc_Q1 = sQ[1].desc()
+
+    if cutlass.const_expr(CFG.MASK_FLAGS == 0):
+        kv_left = cutlass.Int32(0)
+        kv_right = seqlen_kv // cutlass.Int32(CFG.TILE_N)
+    else:
+        q_super_idx, _hd, batch_idx = _dispatch_decode_initial(
+            sched.bidx_init,
+            sched.bidy_init,
+            sched.bidz_init,
+            cta_in_pair,
+            n_q_supers,
+            n_qh,
+            n_batch,
+            seq_kv_lens_tensor,
+        )
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+        bounds_init = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair)
+        kv_left = bounds_init.left
+        kv_right = bounds_init.right
+
+    q_full_phase = cutlass.Int32(0)
+    kv_state = PipelineState.start(phase=0)
+    bmm2_ready_phase = cutlass.Int32(0)
+    # Initialised unconditionally so type is stable across const_expr branches.
+    empty_mainloop_phase = cutlass.Int32(0)
+
+    is_valid_tile = cutlass.Int32(1)
+    sched_state = PipelineState.start()
+
+    while is_valid_tile > cutlass.Int32(0):
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+
+        if cutlass.const_expr(CFG.MASK_FLAGS != 0) and (kv_right <= kv_left):
+            # Empty mainloop: fire both bmm2_done so softmax/correction phase trackers stay in lockstep.
+            bars.mb_empty_mainloop.wait(empty_mainloop_phase)
+            empty_mainloop_phase = empty_mainloop_phase ^ cutlass.Int32(1)
+            elect_p = nvvm.elect_sync()
+            bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+            bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+        else:
+            # Prologue: BMM1[sub0], BMM1[sub1] for kv=kv_left
+            bars.mb_q_full[0].wait(q_full_phase)
+            bars.mb_k_full[kv_state.idx].wait(kv_state.phase)
+            desc_K = sK[kv_state.idx].desc()
+            mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
+            elect_p = nvvm.elect_sync()
+            bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+            bars.mb_q_full[1].wait(q_full_phase)
+            mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
+            elect_p = nvvm.elect_sync()
+            bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+            bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+            q_full_phase = q_full_phase ^ 1
+
+            # Mainloop kv = kv_left+1 .. kv_right-1 (empty when n_kv == 1)
+            for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1):
+                old_state = kv_state
+                kv_state = advance(kv_state, CFG.STAGES_KV)
+
+                bars.mb_v_full[old_state.idx].wait(old_state.phase)
+                desc_V = sV[old_state.idx].desc()
+                is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
+
+                # BMM2 sub-tile 0
+                bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
+                accum_b2 = is_not_first_bmm2
+                for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                    mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P0_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O0_OFF)), local_k, accum_b2)
+                    accum_b2 = cutlass.Boolean(True)
+                # Chunk 1 folds out at TILE_N=64 (N_BMM2_CHUNKS=1).
+                if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
+                    bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase)
+                    for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                        mma_ts_step(
+                            bmm2_desc,
+                            (tmem_raw.subview(LAYOUT.P0_OFF)),
+                            desc_V,
+                            (tmem_raw.subview(LAYOUT.O0_OFF)),
+                            NUM_KPHASES_PV_PER_CHUNK + local_k,
+                            cutlass.Boolean(True),
+                        )
+                elect_p = nvvm.elect_sync()
+                bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+                # BMM1 sub 0 for next kv
+                bars.mb_k_full[kv_state.idx].wait(kv_state.phase)
+                desc_K = sK[kv_state.idx].desc()
+                mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
+                elect_p = nvvm.elect_sync()
+                bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+                # BMM2 sub-tile 1
+                bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
+                accum_b2 = is_not_first_bmm2
+                for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                    mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P1_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O1_OFF)), local_k, accum_b2)
+                    accum_b2 = cutlass.Boolean(True)
+                if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
+                    bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase)
+                    for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                        mma_ts_step(
+                            bmm2_desc,
+                            (tmem_raw.subview(LAYOUT.P1_OFF)),
+                            desc_V,
+                            (tmem_raw.subview(LAYOUT.O1_OFF)),
+                            NUM_KPHASES_PV_PER_CHUNK + local_k,
+                            cutlass.Boolean(True),
+                        )
+                elect_p = nvvm.elect_sync()
+                bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+                # BMM1 sub 1 for next kv
+                mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
+                elect_p = nvvm.elect_sync()
+                bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+                bmm2_ready_phase = bmm2_ready_phase ^ 1
+
+            # Epilogue: BMM2 for last kv (always runs — n_kv >= 1).
+            # Under QO_ALIAS the TMA-LDG Q-reload gate is mb_q_o_alias (fired by
+            # TMA-STG after O drains), so MMA does NOT fire mb_q_empty.
+            if cutlass.const_expr(not IS_QO_ALIAS):
+                elect_p = nvvm.elect_sync()
+                for qs in cutlass.range_constexpr(CFG.TILES_Q):
+                    bars.mb_q_empty[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+            bars.mb_v_full[kv_state.idx].wait(kv_state.phase)
+            desc_V = sV[kv_state.idx].desc()
+            is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))
+
+            bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
+            accum_b2 = is_not_first_bmm2_epi
+            for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P0_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O0_OFF)), local_k, accum_b2)
+                accum_b2 = cutlass.Boolean(True)
+            if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
+                bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase)
+                for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                    mma_ts_step(
+                        bmm2_desc,
+                        (tmem_raw.subview(LAYOUT.P0_OFF)),
+                        desc_V,
+                        (tmem_raw.subview(LAYOUT.O0_OFF)),
+                        NUM_KPHASES_PV_PER_CHUNK + local_k,
+                        cutlass.Boolean(True),
+                    )
+            elect_p = nvvm.elect_sync()
+            bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+            bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
+            accum_b2 = is_not_first_bmm2_epi
+            for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P1_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O1_OFF)), local_k, accum_b2)
+                accum_b2 = cutlass.Boolean(True)
+            if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
+                bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase)
+                for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                    mma_ts_step(
+                        bmm2_desc,
+                        (tmem_raw.subview(LAYOUT.P1_OFF)),
+                        desc_V,
+                        (tmem_raw.subview(LAYOUT.O1_OFF)),
+                        NUM_KPHASES_PV_PER_CHUNK + local_k,
+                        cutlass.Boolean(True),
+                    )
+            elect_p = nvvm.elect_sync()
+            bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+            bars.mb_v_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+            bmm2_ready_phase = bmm2_ready_phase ^ 1
+            kv_state = advance(kv_state, CFG.STAGES_KV)
+
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+        if cutlass.const_expr(CFG.MASK_FLAGS == 0):
+            _nq, _nh, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+            is_valid_tile = nxt_v & cutlass.Int32(1)
+        else:
+            nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+            nxt_q = cute.arch.make_warp_uniform(nxt_q)
+            nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+            nxt_v = cute.arch.make_warp_uniform(nxt_v)
+            q_super_idx, _hd, batch_idx = _dispatch_decode_payload(
+                nxt_q,
+                nxt_hb,
+                cta_in_pair,
+                n_q_supers,
+                n_qh,
+                n_batch,
+                seq_kv_lens_tensor,
+            )
+            is_valid_tile = nxt_v & cutlass.Int32(1)
+            eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+            bounds_next = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair)
+            kv_left = bounds_next.left
+            kv_right = bounds_next.right
+        sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+
+    bars.mb_tmem_dealloc.wait(cutlass.Int32(0))
+    tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
+
+
+@cute.jit
+def _softmax_kv_body(
+    apply_mask: bool,
+    sub_tile_id: int,
+    kv_loop,
+    tmem_ptr_i32,
+    bars,
+    q_abs,
+    eff_seqlen_kv,
+    eff_seqlen_q,
+    scale_log2,
+    total_max,
+    total_sum,
+    bmm1_phase,
+    stat_empty_phase,
+    leader_cta_id,
+):
+    """Per-iter kv body for the softmax warp group.
+
+    Compile-time apply_mask (Python bool) picks the load+max strategy:
+    apply_mask=False uses fused tcgen05.ld.red.f32.max (HW row-max);
+    apply_mask=True uses tcgen05.ld + apply_mask_chunk + software row-max
+    (HW max can't observe NEG_INFINITY written after the load).
+
+    Returns updated (total_max, total_sum, bmm1_phase, stat_empty_phase).
+    """
+    tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
+    tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
+    stats_off = LAYOUT.STATS_OFF + sub_tile_id * 8
+    CHUNK = 64
+    # fp16/bf16 pack 2 probs per FP32 TMEM cell (CHUNK//2); TF32 is 1:1 (CHUNK).
+    P_COLS_PER_CHUNK = CHUNK if IS_TF32 else CHUNK // 2
+    N_CHUNKS = CFG.N_BMM2_CHUNKS
+    NEG_INF = cutlass.Float32(-3.4028235e38)
+    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
+
+    bars.mb_bmm1_done[sub_tile_id].wait(bmm1_phase)
+    bmm1_phase = bmm1_phase ^ 1
+
+    # Hoist all TMEM address math to a single base load — Rubin tcgen05.ld/st
+    # auto-derives row from warp_id_in_warpgroup; address only needs the column.
+    tmem_base = tmem_ptr_i32.load()
+    s_addr_base = tmem_base + cutlass.Int32(tmem_S_off)
+    p_addr_base = tmem_base + cutlass.Int32(tmem_P_off)
+    stats_addr = tmem_base + cutlass.Int32(stats_off)
+
+    # apply_mask is a Python bool — wrap in cutlass.const_expr so the DSL folds
+    # at trace time instead of staging cf.if (the two arms produce Vectors
+    # built via different MLIR op sequences and the tracer would error).
+    if cutlass.const_expr(apply_mask):
+        kv_col_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+        # Python comprehensions (not for+append) so the tracer sees fully-formed lists.
+        raw_chunks = [
+            nvvm.tcgen05_ld(
+                "32x32b",
+                nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32),
+                num=CHUNK,
+            )
+            for c in range(N_CHUNKS)
+        ]
+        # Bottom-right causal: runtime SKV-SQ diagonal offset (folds out when
+        # CFG.BOTTOM_RIGHT is 0 — top-left masking is unchanged).
+        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
+        chunks_S = [
+            apply_mask_chunk(
+                raw_chunks[c],
+                q_abs,
+                kv_col_base + cutlass.Int32(c * CHUNK),
+                eff_seqlen_kv,
+                CFG.WINDOW_LEFT,
+                CFG.MASK_FLAGS,
+                N=CHUNK,
+                bottom_right=CFG.BOTTOM_RIGHT,
+                causal_diag=causal_diag,
+                window_right=CFG.WINDOW_RIGHT,
+            )
+            for c in range(N_CHUNKS)
+        ]
+        chunks_max = [row_max_reduction(chunks_S[c]) for c in range(N_CHUNKS)]
+        # vec_concat handles single-element lists too; keeps tracer Vector type uniform across N_CHUNKS.
+        reg_S_vec = vec_concat(chunks_S)
+        current_max_unscaled = chunks_max[0]
+        for m in chunks_max[1:]:
+            current_max_unscaled = cute.math.max(current_max_unscaled, m)
+    else:
+        reg_S_tile, current_max_unscaled = tmem_load_max_reduction_tile(
+            s_addr_base,
+            num_elems=CFG.TILE_N,
+        )
+        reg_S_vec = reg_S_tile.vec
+
+    # Pass size=CFG.TILE_N explicitly — Vector.shape[0] is an MLIR value
+    # (not Python int) for vec_concat-built vectors, so auto-detect can't recover the length.
+    reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
+    current_max = current_max_unscaled * scale_log2
+
+    # Named-barrier wg0/wg1 sync: sub_tile_id==1 waits at TOP for sub_tile_id==0's bottom arrive.
+    if sub_tile_id == 1:
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+
+    # Online softmax with RESCALE_THRESHOLD skip.
+    old_total_max = total_max
+    is_first = total_max == NEG_INF
+    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
+    total_max = cutlass.Float32(
+        arith.select(
+            update_cond.ir_value(),
+            current_max.ir_value(),
+            total_max.ir_value(),
+        )
+    )
+    exp_input = cutlass.Float32(
+        arith.select(
+            is_first.ir_value(),
+            NEG_INF.ir_value(),
+            (old_total_max - total_max).ir_value(),
+        )
+    )
+    alpha = cute.math.exp2(exp_input, fastmath=True)
+    new_total_max = total_max
+
+    alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
+    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+    bars.mb_stat_full[sub_tile_id].arrive()
+
+    # Rescale full reg_S in one vector op — emits same FFMA2 sequence as explicit half-tile rescales.
+    reg_S = reg_S * scale_log2 - new_total_max
+
+    # Chunk 0 manual unroll — the DSL's @cute.jit tracer makes the loop iter an
+    # MLIR value, breaking Python slice.indices() math inside RegTile[].
+    chunk_S_0 = reg_S[0:CHUNK].vec
+    chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
+    # Hoist chunk 0's sum before the cast to overlap with the cast's FFMA chain.
+    hoisted_sum = row_reduction_pair(chunk_P_0)
+    chunk_P_0_fp16 = chunk_P_0.to(STORAGE_DTYPE)
+    nvvm.tcgen05_st(
+        "32x32b",
+        nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32),
+        chunk_P_0_fp16,
+    )
+    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+    bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+    # Chunk 1 folds out at TILE_N=64 (N_CHUNKS=1).
+    deferred_P_1 = None
+    if cutlass.const_expr(N_CHUNKS == 2):
+        chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
+        deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+        chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
+        nvvm.tcgen05_st(
+            "32x32b",
+            nvvm.make_tmem_ptr(
+                p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK),
+                cutlass.Float32,
+            ),
+            chunk_P_1_fp16,
+        )
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+    # wg0 fires bottom sync to release wg1 spinning at TOP barrier.
+    if sub_tile_id == 0:
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+
+    new_p_sum_pair = hoisted_sum
+    if cutlass.const_expr(N_CHUNKS == 2):
+        new_p_sum_pair = new_p_sum_pair + row_reduction_pair(deferred_P_1)
+    alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
+    total_sum = total_sum * alpha_pair + new_p_sum_pair
+
+    bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase)
+    stat_empty_phase = stat_empty_phase ^ 1
+
+    return total_max, total_sum, bmm1_phase, stat_empty_phase
+
+
+@cute.jit
+def _softmax_warp_group(
+    sub_tile_id: int,
+    seqlen_q,
+    seqlen_kv,
+    scale_log2: cutlass.Float32,
+    tmem_ptr_i32,
+    sQ,
+    bars,
+    sched,
+    seq_kv_lens_tensor,
+    n_q_supers,
+    n_qh,
+    n_batch,
+    leader_cta_id,
+    cta_in_pair,
+):
+    """Softmax warp group (one of two): online softmax per kv iter.
+
+    Each lane owns one row of the 128 x 128 S_acc tile, loads its 128 fp32
+    cols with a single tcgen05.ld.red.max, runs online softmax (total_max +
+    total_sum tracking with RESCALE_THRESHOLD skip), publishes alpha to
+    corr, writes P to TMEM cols at S_acc tail, fires bmm2_ready[sub][chunk].
+    """
+    # Wait on MMA's TMEM-publish named barrier BEFORE any tmem_ptr_i32.load() —
+    # without it softmax can race MMA's tcgen05_alloc and read a stale base.
+    nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
+
+    tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
+    tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
+
+    NEG_INF = cutlass.Float32(-3.4028235e38)
+
+    CHUNK = 64
+    P_COLS_PER_CHUNK = CHUNK // 2
+    stats_off = LAYOUT.STATS_OFF + sub_tile_id * 8
+
+    # Phase trackers persist across tile boundaries (barriers don't reset).
+    bmm1_phase = cutlass.Int32(0)
+    stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
+    # init phase=1; both softmax wgs wait on slot [0] not [SoftmaxGid].
+    epilogue_state = cutlass.Int32(1)
+
+    # total_sum kept as Vector[Float32, 2] (even/odd partials) so per-iter update lowers to packed FMUL2 + FADD2.
+    total_max = NEG_INF
+    total_sum = cutlass.Vector.from_elements(
+        (cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        cutlass.Float32,
+    )
+
+    q_super_idx, head_idx, batch_idx = _dispatch_decode_initial(
+        sched.bidx_init,
+        sched.bidy_init,
+        sched.bidz_init,
+        cta_in_pair,
+        n_q_supers,
+        n_qh,
+        n_batch,
+        seq_kv_lens_tensor,
+    )
+    is_valid_tile = cutlass.Int32(1)
+    sched_state = PipelineState.start()
+
+    eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+    eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+    bounds = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair)
+
+    softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
+    tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
+
+    while is_valid_tile > cutlass.Int32(0):
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+
+        # Top-of-tile mb_o_empty[0] wait: without it softmax can race into the
+        # next tile while TMA-STG is still draining the prior tile's O slot.
+        bars.mb_o_empty[0].wait(epilogue_state)
+        epilogue_state = epilogue_state ^ cutlass.Int32(1)
+
+        total_max = NEG_INF
+        total_sum = cutlass.Vector.from_elements(
+            (cutlass.Float32(0.0), cutlass.Float32(0.0)),
+            cutlass.Float32,
+        )
+        q_row_coord = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
+        q_abs = q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M) + tid_in_wg
+        # Bootstrap stat_empty wait BEFORE kv loop — lifts wait off per-iter
+        # critical path so alpha publish + stat_full fire happen back-to-back.
+        bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase)
+        stat_empty_phase = stat_empty_phase ^ 1
+        # 3-segment kv loop: LEFT-masked / fully-unmasked / RIGHT-masked.
+        # At MASK_NONE bounds collapse so the two masked sub-loops have empty range and fold out.
+        if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
+            for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
+                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                    False,
+                    sub_tile_id,
+                    kv_loop,
+                    tmem_ptr_i32,
+                    bars,
+                    q_abs,
+                    eff_seqlen_kv,
+                    eff_seqlen_q,
+                    scale_log2,
+                    total_max,
+                    total_sum,
+                    bmm1_phase,
+                    stat_empty_phase,
+                    leader_cta_id,
+                )
+        else:
+            for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
+                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                    True,
+                    sub_tile_id,
+                    kv_loop,
+                    tmem_ptr_i32,
+                    bars,
+                    q_abs,
+                    eff_seqlen_kv,
+                    eff_seqlen_q,
+                    scale_log2,
+                    total_max,
+                    total_sum,
+                    bmm1_phase,
+                    stat_empty_phase,
+                    leader_cta_id,
+                )
+            for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
+                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                    False,
+                    sub_tile_id,
+                    kv_loop,
+                    tmem_ptr_i32,
+                    bars,
+                    q_abs,
+                    eff_seqlen_kv,
+                    eff_seqlen_q,
+                    scale_log2,
+                    total_max,
+                    total_sum,
+                    bmm1_phase,
+                    stat_empty_phase,
+                    leader_cta_id,
+                )
+            for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
+                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                    True,
+                    sub_tile_id,
+                    kv_loop,
+                    tmem_ptr_i32,
+                    bars,
+                    q_abs,
+                    eff_seqlen_kv,
+                    eff_seqlen_q,
+                    scale_log2,
+                    total_max,
+                    total_sum,
+                    bmm1_phase,
+                    stat_empty_phase,
+                    leader_cta_id,
+                )
+
+        # End-of-kv: publish (total_max, total_sum_final) to TMEM Stats — corr reads it for LSE.
+        total_sum_scalar = total_sum[0] + total_sum[1]
+
+        stats_addr_epi = tmem_ptr_i32.load() + cutlass.Int32(stats_off)
+        stats_vec_epi = cutlass.Vector.from_elements((total_max, total_sum_scalar), cutlass.Float32)
+        nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr_epi, cutlass.Float32), stats_vec_epi)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_stat_full[sub_tile_id].arrive()
+
+        # make_warp_uniform on scheduler-payload loads keeps nxt_* in uniform
+        # registers across the back-edge so ptxas doesn't STL them.
+        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+        nxt_q = cute.arch.make_warp_uniform(nxt_q)
+        nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+        nxt_v = cute.arch.make_warp_uniform(nxt_v)
+        q_super_idx, head_idx, batch_idx = _dispatch_decode_payload(
+            nxt_q,
+            nxt_hb,
+            cta_in_pair,
+            n_q_supers,
+            n_qh,
+            n_batch,
+            seq_kv_lens_tensor,
+        )
+        is_valid_tile = nxt_v & cutlass.Int32(1)
+        sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+        bounds = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair)
+
+
+@cute.jit
+def _correction_warp_group(
+    seqlen_q,
+    seqlen_kv,
+    sO,
+    tmem_ptr_i32,
+    tidx,
+    bars,
+    sched,
+    lse_tensor: Optional[cute.Tensor],
+    sinks_tensor: cute.Tensor,
+    seq_kv_lens_tensor,
+    n_q_supers,
+    n_qh,
+    n_batch,
+    leader_cta_id,
+    cta_in_pair,
+    cta_id_x,
+):
+    """Correction warp group: 4 warps x 32 lanes = 128 lanes, 1 lane per O row.
+
+    Per kv iter rescales O by alpha (skipped when all_alpha_one warp ballot
+    fires); per-tile epilogue normalizes O by 1/total_sum, casts to fp16,
+    swizzled-stores to sO, fires o_full for TMA-STG.  Holds the P14
+    end-of-tile catch-up flip on bmm2_done_phase (needed at n_kv=1 multi-wave).
+    """
+    # Wait on MMA's TMEM-publish named barrier BEFORE any tmem_ptr_i32.load() —
+    # without it correction can race MMA's tcgen05_alloc and read a stale base.
+    nvvm.barrier_cta_sync(barrier_id=2, thread_count=32 * (CFG.CORRECTION_WARPS + 1))
+
+    # Read tidx directly from PTX sreg — cute.arch.thread_idx() in @cute.jit may yield warp-uniform via folding.
+    tid_raw = cute.arch.thread_idx()[0]
+    tid_in_wg = tid_raw - cutlass.Int32(CFG.CORR_WARP_BASE * 32)
+
+    # O_CHUNK=16 (halved from 32) shortens the alpha-rescale live range —
+    # at 32, the DSL's register allocator spilled correction-warp regs to the stack.
+    O_CHUNK = 16
+    N_CHUNKS_O = CFG.TILE_O // O_CHUNK
+    # Use O_SWZ_B (NOT V_SWZ_B): under cga2 V is split along d_v and may drop
+    # to a narrower swizzle while O is full-row.  V-based stride here silently
+    # produces correct TMEM but garbled SMEM → wrong O after TMA-STG.
+    TMA_O_ITERS = (CFG.TILE_O * CFG.BPE) // CFG.O_SWZ_BYTES
+    D_BLOCK_SIZE = CFG.TILE_O // TMA_O_ITERS
+    TMA_O_GRANU_ELEMS = CFG.TILE_M * D_BLOCK_SIZE
+
+    stat_full_phase = cutlass.Int32(0)
+    # bmm2_done starts at phase=0; iter 0 is skipped, first wait at kv_loop=1.
+    bmm2_done_phase = cutlass.Int32(0)
+    o_empty_phase = cutlass.Int32(1)  # bootstrap
+
+    q_super_idx, head_idx, batch_idx = _dispatch_decode_initial(
+        sched.bidx_init,
+        sched.bidy_init,
+        sched.bidz_init,
+        cta_in_pair,
+        n_q_supers,
+        n_qh,
+        n_batch,
+        seq_kv_lens_tensor,
+    )
+    is_valid_tile = cutlass.Int32(1)
+    sched_state = PipelineState.start()
+
+    eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+    eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+    bounds = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair)
+
+    while is_valid_tile > cutlass.Int32(0):
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        # Iter-0 lifted out of kv loop: MMA's iter-0 BMM2 uses init_d=False
+        # to overwrite O garbage, so alpha-rescale is unnecessary in iter 0.
+        if bounds.right > bounds.left:
+            for qs in cutlass.range_constexpr(CFG.TILES_Q):
+                bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+            for qs in cutlass.range_constexpr(CFG.TILES_Q):
+                bars.mb_stat_full[qs].wait(stat_full_phase)
+                bars.mb_stat_empty[qs].arrive()
+            stat_full_phase = stat_full_phase ^ 1
+        else:
+            # Empty-mainloop: corr fires (DSMEM-arrive on leader at cga2); MMA fires bmm2_done[0/1] via multicast.
+            bars.mb_empty_mainloop.arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+        for kv_loop in cutlass.range(bounds.left + cutlass.Int32(1), bounds.right, 1, unroll=1):
+            tmem_base_iter = tmem_ptr_i32.load()
+            for qs in cutlass.range_constexpr(CFG.TILES_Q):
+                stats_off = LAYOUT.STATS_OFF + qs * 8
+                tmem_O_off = LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF
+
+                bars.mb_stat_full[qs].wait(stat_full_phase)
+
+                stats_addr = tmem_base_iter + cutlass.Int32(stats_off)
+                stats_vec = nvvm.tcgen05_ld(
+                    "32x32b",
+                    nvvm.make_tmem_ptr(stats_addr, cutlass.Float32),
+                    num=2,
+                )
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                alpha = stats_vec[0]
+
+                # all_alpha_one ballot: when every lane has alpha==1.0 the entire rescale loop skips.
+                alpha_is_one = alpha == cutlass.Float32(1.0)
+                all_alpha_one = vote_sync(0xFFFFFFFF, alpha_is_one, VoteSync.ALL)
+
+                bars.mb_stat_empty[qs].arrive()
+
+                bars.mb_bmm2_done[qs].wait(bmm2_done_phase)
+
+                # vec_scale_pair emits nvvm.mul_packed_f32x2 → FMUL2.  Without it
+                # plain o_chunk*alpha lowers to scalar FMUL inside the runtime-if
+                # (downstream fp32 tcgen05_st doesn't force packed regs).
+                # Per-chunk cfence keeps ptxas from sinking the next chunk's
+                # tcgen05_ld ahead of the prior tcgen05_st (TMEM-col anti-dep).
+                if ~all_alpha_one:
+                    for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
+                        o_addr = tmem_base_iter + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
+                        o_chunk = nvvm.tcgen05_ld(
+                            "32x32b",
+                            nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
+                            num=O_CHUNK,
+                        )
+                        o_scaled = vec_scale_pair(o_chunk, alpha, O_CHUNK)
+                        nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), o_scaled)
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+
+                bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+            stat_full_phase = stat_full_phase ^ 1
+            bmm2_done_phase = bmm2_done_phase ^ 1
+
+        # === End-of-kv epilogue ===
+        tmem_base_epi = tmem_ptr_i32.load()
+        for qs in cutlass.range_constexpr(CFG.TILES_Q):
+            stats_off = LAYOUT.STATS_OFF + qs * 8
+            tmem_O_off = LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF
+
+            bars.mb_bmm2_done[qs].wait(bmm2_done_phase)
+
+            # Wait the (total_max, total_sum_final) publish from softmax's epilogue.
+            bars.mb_stat_full[qs].wait(stat_full_phase)
+
+            stats_addr = tmem_base_epi + cutlass.Int32(stats_off)
+            stats_vec = nvvm.tcgen05_ld(
+                "32x32b",
+                nvvm.make_tmem_ptr(stats_addr, cutlass.Float32),
+                num=2,
+            )
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+            total_max_scaled = stats_vec[0]  # log2-units (softmax stores it scaled)
+            total_sum = stats_vec[1]
+
+            # Fire stat_empty so softmax's NEXT-tile iter 0 wait can pass.
+            bars.mb_stat_empty[qs].arrive()
+
+            inv_sum = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
+            lse_val = cutlass.Float32(0.0)
+            # With sinks: fold the lift-the-max rescale into threshold_beta so O is scaled by scale/new_sum in one FMUL.
+            LN2 = cutlass.Float32(0.6931471805599453)
+            total_max_nat = total_max_scaled * LN2
+            if cutlass.const_expr(CFG.HAS_SINK):
+                sinks_arr = cutlass.make_array_view(sinks_tensor)
+                sink_logit = sinks_arr[head_idx]
+                new_max = cute.math.max(total_max_nat, sink_logit)
+                scale = cute.math.exp(total_max_nat - new_max, fastmath=True)
+                new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True)
+                lse_val = new_max + cute.math.log(new_sum, fastmath=True)
+                inv_sum = scale / new_sum
+            else:
+                lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
+                # Safe inverse: avoid div by 0 on fully-masked rows.
+                inv_sum = cutlass.Float32(1.0) / cute.math.max(total_sum, cutlass.Float32(1e-30))
+            # --- empty KV range (fully-masked / zero-length KV for this tile) ---
+            # Same guard as prefill_d256_{f16,fp8,mxfp8}_sm107.py.  With
+            # bounds.right <= bounds.left the kv loop ran ZERO iterations, so
+            # BMM2 never overwrote the O accumulator (mma_ss overwrites only on
+            # its first k-step) and TMEM still holds the PREVIOUS persistent
+            # tile's O -- residue, possibly a NaN bit pattern.
+            #
+            # The softmax warp still publishes (total_max = -inf, total_sum = 0)
+            # for an empty range, so LSE is already right on both arms: no-sink
+            # gives -inf + log(0) = -inf (this kernel puts NO 1e-30 floor on the
+            # log -- if one is ever added, the select below must cover lse_val
+            # too, or it leaks log(1e-30) = -69.08), and the sink arm folds to
+            # exactly sink_logit.  inv_sum, however, is 1/max(0, 1e-30) = 1e30
+            # (no sink) or 0 (sink), so O = residue * 1e30 -> +-inf/NaN, or
+            # residue * 0 -> NaN.  Zero O with a SELECT, never a multiply.
+            _kv_empty = bounds.right <= bounds.left
+            if cutlass.const_expr(not CFG.HAS_SINK):
+                lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
+
+            # OOB-row guard: under cga2 the cluster's Q rows can exceed seqlen_q;
+            # without the guard the write aliases the next head's LSE slot.
+            q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
+                # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
+                _cu = cutlass.make_array_view(seq_kv_lens_tensor)
+                _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
+                _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+                if cutlass.const_expr(lse_tensor is not None):
+                    if q_row_global < _s_q_b:
+                        lse_arr = cutlass.make_array_view(lse_tensor)
+                        # The packed ragged Stats buffer is written in the
+                        # CALLER's declared layout, selected by the STATIC rank
+                        # compile() baked in: token-major rank-2 [T, QH] (the
+                        # DEFAULT -- _thd_compile_kwargs only sets head-major
+                        # when the caller asks) or head-major rank-3
+                        # [1, QH, head_stride].  Serving only the rank-3 arm
+                        # would silently transpose every LSE on the common path.
+                        if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                            lse_row = lse_arr[_cu_q_b + q_row_global, :]
+                            lse_row[head_idx] = lse_val
+                        else:
+                            lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
+                            lse_row[_cu_q_b + q_row_global] = lse_val
+            else:
+                if cutlass.const_expr(lse_tensor is not None):
+                    if q_row_global < seqlen_q:
+                        lse_arr = cutlass.make_array_view(lse_tensor)
+                        lse_row = lse_arr[batch_idx, head_idx, :]
+                        lse_row[q_row_global] = lse_val
+
+            sO_sub_base = sO[qs].base
+
+            for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
+                o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
+                o_chunk = nvvm.tcgen05_ld(
+                    "32x32b",
+                    nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
+                    num=O_CHUNK,
+                )
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                o_scaled = o_chunk * inv_sum
+                # SELECT the zero for an empty KV range -- see _kv_empty above.
+                # NB: a plain `for` statement, not a comprehension -- the DSL
+                # preprocessor only rewrites statement-level range_constexpr
+                # loops ("range_constexpr should be preprocessed by preprocessor").
+                _o_elems = []
+                for _i in cutlass.range_constexpr(O_CHUNK):
+                    _o_elems.append(cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_i].ir_value())))
+                o_scaled = cutlass.Vector.from_elements(tuple(_o_elems), cutlass.Float32)
+                o_fp16 = o_scaled.to(STORAGE_DTYPE)
+
+                col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
+                block_idx_const = (chunk_idx * O_CHUNK) // D_BLOCK_SIZE
+                block_offset_const = block_idx_const * TMA_O_GRANU_ELEMS
+                smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(D_BLOCK_SIZE)
+
+                smem_ptr = sO_sub_base.subview(smem_offset).data_ptr()
+                # mb_o_empty[qs] wait gates the FIRST SMEM store (not the
+                # earlier TMEM-load loop), keeping TMEM-load/FFMA/cast overlapped
+                # with TMA-STG draining the prior persistent tile.
+                if chunk_idx == 0:
+                    bars.mb_o_empty[qs].wait(o_empty_phase)
+                smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+
+            # fence_proxy needed before TMA reads SMEM written by tcgen05_st (via store_swizzled).
+            nvvm.fence_proxy("async.shared", space="cta")
+
+            bars.mb_o_full[qs].arrive()
+
+        stat_full_phase = stat_full_phase ^ 1
+        o_empty_phase = o_empty_phase ^ 1
+        # P14 catch-up flip — bmm2_done_phase ^= 1 AFTER epilogue wait
+        # (mainloop flips n_kv-1 times, MMA fires n_kv times; +1 here matches —
+        # without this, n_kv=1 multi-wave deadlocks on the 2nd tile).
+        bmm2_done_phase = bmm2_done_phase ^ 1
+
+        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+        q_super_idx, head_idx, batch_idx = _dispatch_decode_payload(
+            nxt_q,
+            nxt_hb,
+            cta_in_pair,
+            n_q_supers,
+            n_qh,
+            n_batch,
+            seq_kv_lens_tensor,
+        )
+        is_valid_tile = nxt_v & cutlass.Int32(1)
+        sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+        bounds = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair)
+
+    # End-of-warp tmem_dealloc: under cga2 each corr lane ALSO DSMEM-arrives
+    # on the peer so the peer's local mbar accumulates the full CGA-total count.
+    if cutlass.const_expr(CFG.CTA_MMA == 2):
+        peer_cta = cta_id_x ^ cutlass.Int32(1)
+        bars.mb_tmem_dealloc.arrive_on_peer(peer_cta)
+    bars.mb_tmem_dealloc.arrive()
+
+
+# === Host launcher ===
+
+
+@cute.jit
+def _host(
+    q_tensor: cute.Tensor,
+    k_tensor: cute.Tensor,
+    v_tensor: cute.Tensor,
+    o_tensor: cute.Tensor,
+    lse_tensor: Optional[cute.Tensor],
+    sinks_tensor: cute.Tensor,
+    seq_kv_lens_tensor: cute.Tensor,
+    o_desc_words: cute.Tensor,
+    problem_size: Tuple[int, int, int, int, int, int],
+    scale_softmax_log2: cutlass.Float32,
+    n_thd_units: cutlass.Int32,
+    # FROST passes the dense padded-Q trim tensor POSITIONALLY on every call.
+    # These kernels have no Q-trim epilogue (Capabilities.dense_seq_q_trim=False)
+    # so it is accepted and unused -- but the SLOT is mandatory: without it the
+    # adapter's 12th positional lands on `stream` and execute dies with
+    # "got multiple values for argument 'stream'".
+    seq_q_lens_tensor: Optional[cute.Tensor] = None,
+    # THD device metadata build (issue #552): the CALLER's Q/KV length tensors
+    # -- (B,) per-batch lengths or (B+1,) cu prefix sums, per side via
+    # thd_lens_form (bit 0: Q is cu, bit 1: KV is cu) -- consumed only by the
+    # setup kernel, which writes the metadata buffer (seq_kv_lens_tensor)
+    # device-side.  None (folded out of the ABI) for dense graphs.  Same ABI
+    # tail as the shipped sm107/prefill_d128_fp8.py sibling.
+    thd_q_lens_tensor: Optional[cute.Tensor] = None,
+    thd_kv_lens_tensor: Optional[cute.Tensor] = None,
+    thd_lens_form: Optional[cutlass.Int32] = None,
+    # FROST plans must run on the caller's stream (engine contract; there is a
+    # dedicated stream-respect test).  Threaded exactly as the shipped
+    # sm107/prefill_d128_fp8.py sibling does.
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    B, QH, KH, SQ, SKV, _ = problem_size
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        # Packed token totals are RUNTIME values, so the adapter passes 0 in the
+        # problem_size seq slots by THD contract and the real extents come off
+        # the (dynamic) tensors.  Without this the whole kernel runs at
+        # SQ = SKV = 0: descriptor extents, loop bounds and the scheduler's tile
+        # count all collapse, and the output is uniformly wrong at every shape,
+        # every mask and every Stats layout -- no crash.  Both the SM100 f16
+        # sibling and this file's own FP8 sibling have always done this; the
+        # Rubin f16 body predates the contract.
+        SQ = q_tensor.shape[1]
+        SKV = k_tensor.shape[1]
+
+    # Tensors are [B, S, H, D] with stride_order=(3, 2, 1, 0); D is fastest.
+    # K is split along seq under cga2 — box rows are per-CTA.  V is split along d_v
+    # (plumbed via num_iters//CTA_MMA).  O's TMA box inner dim follows O's swizzle, NOT V's.
+    _O_GRANU_ELEMS = CFG.O_SWZ_BYTES // CFG.BPE
+    qk_box_q = (1, CFG.TILE_M, 1, TMA_QK_GRANU_ELEMS)
+    qk_box_k = (1, CFG.TILE_N // CFG.CTA_MMA, 1, TMA_QK_GRANU_ELEMS)
+    vo_box_v = (1, CFG.TILE_N, 1, TMA_VO_GRANU_ELEMS)
+    vo_box_o = (1, CFG.TILE_M, 1, _O_GRANU_ELEMS)
+    stride_order = (3, 2, 1, 0)
+
+    # Per-tensor TMA swizzle tracks per-CTA inner bytes (derived from CFG.*_SWZ_BYTES).
+    def _tma_swz(byte_w: int):
+        return tmap.TensorMapSwizzle.s128b if byte_w == 128 else tmap.TensorMapSwizzle.s64b if byte_w == 64 else tmap.TensorMapSwizzle.s32b
+
+    tma_q_desc = tmap.create_tensor_map_tiled_from_view(
+        q_tensor,
+        box_dims=qk_box_q,
+        stride_order=stride_order,
+        swizzle=_tma_swz(CFG.Q_SWZ_BYTES),
+        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+    )
+    tma_k_desc = tmap.create_tensor_map_tiled_from_view(
+        k_tensor,
+        box_dims=qk_box_k,
+        stride_order=stride_order,
+        swizzle=_tma_swz(CFG.K_SWZ_BYTES),
+        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+    )
+    # V TMA: TF32 needs SWIZZLE_128B_ATOM_32B (transposed BMM2 operand) — same
+    # 128-B swizzle line / box geometry as standard Swz128B, just the atom mode.
+    # Standard Swz128B with kind::tf32 + b_trans silently returns all-zero O.
+    _v_tma_swz = tmap.TensorMapSwizzle.s128b_atom_32b if IS_TF32 else _tma_swz(CFG.V_SWZ_BYTES)
+    tma_v_desc = tmap.create_tensor_map_tiled_from_view(
+        v_tensor,
+        box_dims=vo_box_v,
+        stride_order=stride_order,
+        swizzle=_v_tma_swz,
+        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+    )
+    tma_o_desc = tmap.create_tensor_map_tiled_from_view(
+        o_tensor,
+        box_dims=vo_box_o,
+        stride_order=stride_order,
+        swizzle=_tma_swz(CFG.O_SWZ_BYTES),
+        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+    )
+
+    # Each cluster pair (CTA_MMA CTAs) collectively covers TILE_M*TILES_Q*CTA_MMA Q rows;
+    # without the cluster-wide divisor cga2 over-launches and OOB clusters collide in GMEM.
+    rows_per_cluster = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+    q_clusters = (SQ + rows_per_cluster - 1) // rows_per_cluster
+    grid_q_supers = q_clusters * CFG.CTA_MMA
+    q_supers = grid_q_supers
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        # THD: build the per-batch O descriptor array (reuse tma_o_desc over the
+        # packed [1,T,QH,D_v] O as base), then launch the exact flat
+        # batch-outermost grid (n_thd_units = Σ_b ceil(S_q_b/CGA_TILE_M)*QH,
+        # host-computed); grid_x = n_thd_units * CGA_M.  Works at cga1 (CGA_M=1).
+        # Builds the [seq_kv|cu_q|cu_k|batch_remap|live|ctr] metadata buffer
+        # (4B+4) device-side from the caller's length tensors -- no host cumsum,
+        # no H2D -- then the per-batch O descriptor array.  The 4B+4 layout is
+        # NOT optional here: this kernel's decode is the shared
+        # _common_blackwell._thd_decode, which reads batch_remap at 3*n_batch+2
+        # and relies on the dead-unit sentinel.  It was already using that
+        # decode while allocating the pre-upstream 3B+2 buffer, which is why
+        # compile() used to raise rather than half-serve THD.
+        #
+        # Per-token element stride of packed O is o_tensor.stride[1] (= QH*d_v),
+        # NOT CFG.TILE_O -- those coincide only at QH == 1.
+        _build_o_descs_kernel(
+            o_tensor,
+            tma_o_desc,
+            tma_k_desc,
+            tma_v_desc,
+            o_desc_words,
+            seq_kv_lens_tensor,
+            thd_q_lens_tensor,
+            thd_kv_lens_tensor,
+            thd_lens_form,
+            cutlass.Int32(QH),
+            cutlass.Int32(B),
+            cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int32(CGA_TILE_M),
+            n_thd_units,
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
+        grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
+    else:
+        # Grid Python-folds on Cfg constant (avoids DSL if-staging).
+        grid_shape = (grid_q_supers, QH, B) if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL) else (grid_q_supers * QH * B, 1, 1)
+    _kernel(
+        tma_q_desc,
+        tma_k_desc,
+        tma_v_desc,
+        tma_o_desc,
+        lse_tensor,
+        sinks_tensor,
+        seq_kv_lens_tensor,
+        o_desc_words,
+        cutlass.Int32(SQ),
+        cutlass.Int32(SKV),
+        cutlass.Int32(q_supers),
+        cutlass.Int32(QH),
+        cutlass.Int32(B),
+        cutlass.Int32(QH // KH),
+        scale_softmax_log2,
+    ).launch(
+        grid=grid_shape,
+        block=[CFG.THREADS_PER_CTA, 1, 1],
+        cluster=(CFG.CTA_MMA, 1, 1),
+        stream=stream,
+    )
+
+
+@lru_cache(maxsize=None)
+def compile(  # noqa: A001
+    b: int = 1,
+    qh: int = 1,
+    kh: int = 1,
+    sq: int = 256,
+    skv: int = 128,
+    d_qk: int = CFG.TILE_K,
+    d_v: int = CFG.TILE_O,
+    has_lse: bool = True,
+    lse_head_major: bool = False,
+    lse_head_stride: int = 0,
+    # The f16 THD compile key carries the caller's DECLARED packed strides
+    # (api_dsl._thd_compile_kwargs), unlike the quantized path which selects an
+    # exact kernel module and needs none.  Same contract as the SM100 sibling.
+    q_stride: Optional[tuple] = None,
+    k_stride: Optional[tuple] = None,
+    v_stride: Optional[tuple] = None,
+    o_stride: Optional[tuple] = None,
+    lse_stride: Optional[tuple] = None,
+) -> Callable:
+    """Compile a kernel with ALL dims concrete to pin TMA descriptor strides at compile time.
+
+    THD/varlen: q/k/v/o/lse are PACKED with batch dim 1 ([1,T,H,D]); ``b`` is the
+    LOGICAL batch (sequence count) driving n_batch / metadata + O-desc sizes."""
+    # ---- FROST adapter ABI ------------------------------------------------
+    # lower_dsl_prefill calls EVERY kernel with the full forward signature.
+    # This body carries only what the port brought over, so anything
+    # it cannot honor RAISES rather than being silently ignored: a raise here
+    # means the engine's Capabilities row is lying, which is the failure we
+    # want loud.  (Capabilities: lse_optional=False, no strided Stats.)
+    if lse_stride is not None:
+        raise NotImplementedError(f"{__name__}: strided Stats not ported (contiguous [B, H, S] only)")
+    if d_qk > CFG.TILE_K or d_v > CFG.TILE_O or d_qk <= 0 or d_v <= 0:
+        raise ValueError(f"{__name__}: envelope is 0 < d_qk <= {CFG.TILE_K}, 0 < d_v <= {CFG.TILE_O}; " f"got ({d_qk}, {d_v})")
+    if lse_stride is not None and CFG.THD_VARLEN:
+        raise ValueError("dense LSE strides are not valid for a THD workspace")
+    _fake_batch = 1 if CFG.THD_VARLEN else b
+    if CFG.THD_VARLEN:
+        # Dynamic packed token totals: one symbol per ragged group (Q/O and the
+        # LSE share t_q; K/V share t_kv), so a new packed total RE-BINDS the
+        # same compiled artifact instead of minting a new one (issue #552).
+        # Without this the compile pins sq/skv to whatever the plan-time
+        # envelope happened to be and every execute fails the ABI shape check.
+        sq = cute.sym_int(divisibility=1)
+        skv = cute.sym_int(divisibility=1)
+
+    def _fake_bshd(shape, stride, dtype=STORAGE_DTYPE, bpe=CFG.BPE):
+        """BSHD fake tensor, compact or at the caller's DECLARED strides.
+
+        Mirrors sm100/prefill_d128_f16.py: the head dim must be
+        innermost-contiguous, and the seq/head global strides feed TMA, so they
+        obey the 16-byte global-stride rule.  Under THD the
+        fake binds the token stride for the extent-1 batch dim, as _thd_view
+        does at runtime: tokens * token_stride is never stepped and overflows
+        the int32 stride slot on long packed KV (GitHub #980)."""
+        if stride is None:
+            return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
+        if stride[3] != 1:
+            raise ValueError(f"declared stride {stride}: the head dim must be innermost-contiguous (stride[3] == 1)")
+        for axis in (1, 2):
+            if (stride[axis] * bpe) % 16 != 0:
+                raise ValueError(f"declared stride {stride} axis {axis} must be a 16-byte multiple at BPE={bpe} (TMA global-stride rule)")
+        if CFG.THD_VARLEN:
+            # Extent-1 batch dim: bind the token stride, as _thd_view does at
+            # runtime -- T * token_stride is never stepped and overflows the int32
+            # stride slot on long packed KV with wide tokens (GitHub #980).
+            return cute.runtime.make_fake_tensor(dtype, shape, (stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
+        return cute.runtime.make_fake_tensor(dtype, shape, tuple(stride), assumed_align=16)
+
+    fake_q = _fake_bshd((_fake_batch, sq, qh, d_qk), q_stride)
+    fake_k = _fake_bshd((_fake_batch, skv, kh, d_qk), k_stride)
+    fake_v = _fake_bshd((_fake_batch, skv, kh, d_v), v_stride)
+    fake_o = _fake_bshd((_fake_batch, sq, qh, d_v), o_stride)
+
+    if not has_lse:
+        # No Stats output: the LSE argument is None-specialized and the store is
+        # compiled out entirely -- no dummy buffer at any level, which is what
+        # lets a stats-less graph report get_workspace_size() == 0.
+        if lse_head_major or lse_head_stride:
+            raise ValueError("lse_head_major / lse_head_stride require has_lse=True")
+        fake_lse = None
+    elif CFG.THD_VARLEN:
+        # Packed ragged Stats in the CALLER's declared layout (align 4: the
+        # store is a scalar f32 and the caller's buffer only guarantees element
+        # alignment).  The epilogue branches on the STATIC rank, so the layout
+        # is fully encoded here.  Mirrors sm107/prefill_d128_fp8.py.
+        if lse_head_major:
+            _lse_hs = lse_head_stride if lse_head_stride else sq
+            fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1, qh, _lse_hs), stride_order=(2, 1, 0), assumed_align=4)
+        else:
+            if lse_head_stride:
+                raise ValueError("lse_head_stride is head-major-only (token-major (T, H) is compact)")
+            fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (sq, qh), stride_order=(1, 0), assumed_align=4)
+    else:
+        if lse_head_major or lse_head_stride:
+            raise ValueError("lse_head_major / lse_head_stride are THD-only (dense LSE is compact (B, H, Sq))")
+        fake_lse = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (_fake_batch, qh, sq),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
+    # Sinks tensor always part of the ABI; read only when CFG.HAS_SINK == 1 (compile-time fold).
+    fake_sinks = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (qh,),
+        stride_order=(0,),
+        assumed_align=16,
+    )
+    # seq_kv_lens always part of the ABI; read only when CFG.SEQ_KV_LENS_PRESENT == 1
+    # (compile-time fold).  THD overloads it as
+    # [seq_kv_lens(B)|cu_q(B+1)|cu_k(B+1)|batch_remap(B)|live|ctr] (length 4B+4)
+    # -- the layout the SHARED decode (_common_blackwell._thd_decode) reads and
+    # the adapter allocates (api_dsl: (4*b + 4)*4 bytes).
+    _skv_len = (4 * b + 4) if CFG.THD_VARLEN else b
+    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (_skv_len,),
+        stride_order=(0,),
+        assumed_align=16,
+    )
+    # Per-batch O TMA-descriptor array (16 int64 = 128 B each) + 1 pad slot for
+    # the dead-unit sentinel + the two runtime K/V descriptor slots the setup
+    # kernel writes (n_batch+1 / n_batch+2).  Matches the adapter's
+    # o_desc_slots = b + 3.  Dummy 1-elem when THD off (never read).
+    _odesc_len = ((b + 3) * _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1
+    fake_o_desc = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int64,
+        (_odesc_len,),
+        stride_order=(0,),
+        assumed_align=16,
+    )
+    # Caller-side Q/KV length tensors, read ONLY by the THD setup kernel.  The
+    # extent is DYNAMIC because the two accepted forms differ in length -- (B,)
+    # per-batch lengths or (B+1,) cu prefix sums -- and which one arrives rides
+    # the runtime thd_lens_form bitmask, so pinning either would fail the ABI
+    # shape check on the other.  align 4: bound directly, only natural int32
+    # alignment is guaranteed.  None on dense, where the branch folds out.
+    if CFG.THD_VARLEN:
+        fake_thd_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
+        fake_thd_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
+        fake_thd_lens_form = cutlass.Int32(0)
+    else:
+        fake_thd_q_lens = fake_thd_kv_lens = fake_thd_lens_form = None
+    return cute.compile(
+        _host,
+        fake_q,
+        fake_k,
+        fake_v,
+        fake_o,
+        fake_lse,
+        fake_sinks,
+        fake_seq_kv_lens,
+        fake_o_desc,
+        (b, qh, kh, sq, skv, 0),
+        cutlass.Float32(0.0),
+        cutlass.Int32(0),
+        None,  # seq_q_lens_tensor: no Q-trim epilogue on this kernel
+        fake_thd_q_lens,
+        fake_thd_kv_lens,
+        fake_thd_lens_form,
+        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        options="--enable-tvm-ffi",
+    )

@@ -101,13 +101,14 @@ def is_right_padded(mask):
 
 def load_runtime():
     import cudnn
-    import cudnn.experimental.ops.sdpa as cudnn_sdpa_module
+
+    _ = cudnn.sdpa_torch  # registers cudnn::sdpa_fwd / cudnn::sdpa_bwd
     import diffusers
     import diffusers.models.transformers.transformer_qwenimage as qwen_module
     import torch
     import torch.nn.functional as F
 
-    return torch, F, cudnn, cudnn_sdpa_module, diffusers, qwen_module
+    return torch, F, cudnn, diffusers, qwen_module
 
 
 def install_joint_attention_dispatch(qwen_module, *, text_tokens, counters=None, torch_probe=None):
@@ -117,7 +118,7 @@ def install_joint_attention_dispatch(qwen_module, *, text_tokens, counters=None,
     projections around this function.  The treatment therefore changes only
     the joint SDPA core (plus the exact padding-layout adapter when needed).
     """
-    import cudnn.experimental.ops.sdpa as cudnn_sdpa_module
+    import cudnn
     import torch
     import torch.nn.functional as F
 
@@ -128,7 +129,7 @@ def install_joint_attention_dispatch(qwen_module, *, text_tokens, counters=None,
     if torch_probe is None:
         torch_probe = {}
     original = qwen_module.dispatch_attention_fn
-    cudnn_sdpa = cudnn_sdpa_module.scaled_dot_product_attention
+    _ = cudnn.sdpa_torch  # registers cudnn::sdpa_fwd / cudnn::sdpa_bwd
 
     def _validate(q, k, v, attn_mask, dropout_p, is_causal, parallel_config):
         if q.ndim != 4 or k.shape != q.shape or v.shape != q.shape:
@@ -238,16 +239,22 @@ def install_joint_attention_dispatch(qwen_module, *, text_tokens, counters=None,
                 seq_len_kv = (image_tokens + text_valid.sum(dim=-1, dtype=torch.int32)).reshape(batch, 1, 1, 1)
                 reordered = True
         qt, kt, vt = (tensor.transpose(1, 2) for tensor in (q, k, v))
-        out = cudnn_sdpa(
+        if dropout_p:
+            raise NotImplementedError("cudnn::sdpa_fwd does not serve dropout")
+        # torch's SDPA APIs treat scale=None as "use the default"; the op's
+        # schema takes a required float, so resolve it here.
+        attn_scale = scale if scale is not None else qt.shape[-1] ** -0.5
+        out, _ = torch.ops.cudnn.sdpa_fwd(
             qt,
             kt,
             vt,
-            dropout_p=dropout_p,
+            attn_scale,
             is_causal=is_causal,
-            scale=scale,
             seq_len_q=seq_len_q,
             seq_len_kv=seq_len_kv,
-        ).transpose(1, 2)
+            return_lse=False,
+        )
+        out = out.transpose(1, 2)
         if reordered:
             out = torch.cat([out[:, image_tokens:], out[:, :image_tokens]], dim=1)
         return out
@@ -327,7 +334,7 @@ def _main():
     if args.inspect:
         print(json.dumps({"shape": shape, "model": OFFICIAL_MODEL, "diffusers": DIFFUSERS_ANCHOR, "recipe": NUMERICAL_RECIPE}, indent=2))
         return
-    torch, _, cudnn, _, _, qwen_module = load_runtime()
+    torch, _, cudnn, _, qwen_module = load_runtime()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda")
