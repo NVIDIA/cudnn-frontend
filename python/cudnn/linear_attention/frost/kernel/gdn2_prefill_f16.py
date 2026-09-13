@@ -71,7 +71,7 @@ TMEM layout (512 columns allocated):
 Warp assignments (16 warps = 512 threads):
   warps 0-7     : compute group 0 - Gate prefix scan, decay/restore operands, left state halves (two ping-pong groups)
   warps 8-11    : compute group 1 - state seed, right state halves, Y / U staging, O drain, state / checkpoint rows
-  warp  12      : super MMA warp - register-MMA KK and the Neumann T_inv
+  warp  12      : register-MMA warp - KK and the Neumann T_inv
   warp  13      : MMA warp       - every tcgen05 GEMM; TMEM lifecycle
   warp  14      : TMA load warp  - loads Q, K, V, Beta, W, Gate
   warp  15      : epilogue warp  - register-MMA A tile, O and checkpoint TMA stores
