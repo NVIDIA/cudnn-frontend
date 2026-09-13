@@ -87,7 +87,7 @@ Warp assignments (16 warps = 512 threads):
   warps 0-3     : compute group 0 - Gate prefix scan, decay operands, raw Q/K ring, state copy
   warps 4-7     : compute group 1 - dstate seed, Y / dU / -Beta.dY stagings, U / dY reads, dBeta, dV, dstate capture
   warps 8-11    : compute group 2 - dQ / dK assembly, L2-norm projection, dGate assembly + reverse cumsum, store staging
-  warp  12      : super MMA warp - register-MMA KK, T_inv, dM and the dBeta M-term
+  warp  12      : register-MMA warp - KK, T_inv, dM and the dBeta M-term
   warp  13      : MMA warp       - every tcgen05 GEMM; TMEM lifecycle
   warp  14      : TMA load warp  - loads Q, K, Gate, dO, V and the entering state
   warp  15      : epilogue warp  - register-MMA A / dA tiles, dQ / dK / dV / dGate TMA stores
