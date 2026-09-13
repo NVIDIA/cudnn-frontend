@@ -62,6 +62,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import uuid
@@ -382,9 +383,11 @@ def _dir_bytes_and_mtime(path: Path):
     for dirpath, _dirs, files in os.walk(path, followlinks=False):
         for name in files:
             try:
-                st = os.stat(os.path.join(dirpath, name))
+                st = os.stat(os.path.join(dirpath, name), follow_symlinks=False)
             except OSError:
                 continue
+            if not stat.S_ISREG(st.st_mode):
+                continue  # a symlinked file would count its target's size
             total += st.st_size
             newest = max(newest, st.st_mtime)
     return total, newest

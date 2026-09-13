@@ -259,6 +259,10 @@ def test_prune_retires_dead_environments_oldest_first_and_keeps_the_current_one(
     (tmp_path / cc._SCHEMA / "link").symlink_to(outside, target_is_directory=True)
     assert cc.prune(tmp_path, limit=1, keep=cur) == 1 and not mid.exists() and cur.exists()
     assert (outside / "victim").exists() and (tmp_path / cc._SCHEMA / "link").is_symlink()
+    # a symlinked FILE inside an environment counts nothing: the target's size must not push a live environment out
+    before = cc._dir_bytes_and_mtime(cur)[0]
+    (cur / "entry_x" / "planted").symlink_to(outside / "victim")
+    assert cc._dir_bytes_and_mtime(cur)[0] == before
     monkeypatch.setenv(cc._ENV_MAX_BYTES, "0")
     assert cc.max_bytes() == 0
     monkeypatch.setenv(cc._ENV_MAX_BYTES, "not-a-number")
