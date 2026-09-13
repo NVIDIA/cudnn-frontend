@@ -214,11 +214,13 @@ def test_prune_retires_dead_environments_oldest_first_and_keeps_the_current_one(
     import os
     import time
 
-    def env(schema, name, size, age_s, manifest=True):
+    def env(schema, name, size, age_s, manifest=None):
         d = tmp_path / schema / (cc._digest(name) if len(name) != 24 else name)
         d.mkdir(parents=True)
+        if manifest is None:
+            manifest = json.dumps({"schema": schema, "cudnn_frontend": "1.30.0", "cutlass_dsl": "4.7.1"})
         if manifest:
-            (d / cc._MANIFEST).write_text("{}")
+            (d / cc._MANIFEST).write_text(manifest)
         e = d / "entry_x"
         e.mkdir()
         (e / cc._OBJECT).write_bytes(b"x" * size)
@@ -236,13 +238,18 @@ def test_prune_retires_dead_environments_oldest_first_and_keeps_the_current_one(
     foreign = tmp_path / "flashinfer" / "existing_artifact"
     foreign.mkdir(parents=True)
     (foreign / "caller_owned.bin").write_bytes(b"z" * 100_000)
-    no_manifest = env(cc._SCHEMA, "half_written", 100_000, 9000, manifest=False)
+    no_manifest = env(cc._SCHEMA, "half_written", 100_000, 9000, manifest="")
     odd_name = env(cc._SCHEMA, "x" * 24, 100_000, 9000)  # 24 chars but not a hex digest
+    other_tool = env(cc._SCHEMA, "b" * 24, 100_000, 9000, manifest='{"producer": "another-tool"}')  # right shape, not our manifest
+    empty_manifest = env(cc._SCHEMA, "c" * 24, 100_000, 9000, manifest="{}")
+    wrong_schema = env(cc._SCHEMA, "d" * 24, 100_000, 9000, manifest=json.dumps({"schema": "v9", "cudnn_frontend": "1.30.0"}))
+    corrupt = env(cc._SCHEMA, "e" * 24, 100_000, 9000, manifest="{not json")
     cc.reset_stats()
     assert cc.prune(tmp_path, limit=0) == 0  # 0 = never prune
     assert cc.prune(tmp_path, limit=2500, keep=cur) == 2
     assert not dead.exists() and not old.exists() and mid.exists() and cur.exists()
     assert (foreign / "caller_owned.bin").exists() and no_manifest.exists() and odd_name.exists()
+    assert other_tool.exists() and empty_manifest.exists() and wrong_schema.exists() and corrupt.exists()
     assert cc.stats()["pruned"] == 2
     assert cc.prune(tmp_path, limit=2500, keep=cur) == 0  # under the cap: nothing to do
     # a symlink planted in the root is neither followed nor a deletion target

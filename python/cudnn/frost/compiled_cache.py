@@ -402,9 +402,9 @@ def prune(root: Optional[Path] = None, limit: Optional[int] = None, keep: Option
     Other schema versions' roots are dead outright and go first. A directory
     another live process is still reading only costs that process misses.
     Only directories this cache made are candidates -- a ``v<N>`` schema
-    directory, under it an environment named by our digest and carrying our
-    manifest; a caller who points the root at a shared directory keeps
-    everything else, uncounted.
+    directory, under it an environment named by our digest whose manifest
+    parses and names that schema and a cudnn_frontend version; a caller who
+    points the root at a shared directory keeps everything else, uncounted.
     """
     root = Path(root) if root is not None else get_cache_dir()
     limit = max_bytes() if limit is None else limit
@@ -420,7 +420,7 @@ def prune(root: Optional[Path] = None, limit: Optional[int] = None, keep: Option
         for env in schema_dir.iterdir():
             if env.is_symlink() or not env.is_dir() or not _DIGEST_DIR.fullmatch(env.name):
                 continue
-            if not env.resolve().is_relative_to(resolved_root) or not (env / _MANIFEST).is_file():
+            if not env.resolve().is_relative_to(resolved_root) or not _is_our_environment(env, schema_dir.name):
                 continue
             size, mtime = _dir_bytes_and_mtime(env)
             envs.append((schema_dir.name != _SCHEMA, mtime, size, env))
@@ -442,6 +442,14 @@ def prune(root: Optional[Path] = None, limit: Optional[int] = None, keep: Option
     if removed:
         _count("pruned", removed)
     return removed
+
+
+def _is_our_environment(env: Path, schema: str) -> bool:
+    """An environment directory this cache wrote: its manifest parses and names
+    this schema and a cudnn_frontend version. A same-shaped directory another
+    tool made (or a half-written one) is not ours and is never removed."""
+    manifest = _read_json(env / _MANIFEST)
+    return isinstance(manifest, dict) and manifest.get("schema") == schema and isinstance(manifest.get("cudnn_frontend"), str)
 
 
 def _prune_once(root: Path, current_env: Path) -> None:
