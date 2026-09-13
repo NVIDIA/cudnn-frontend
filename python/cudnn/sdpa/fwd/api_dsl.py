@@ -614,11 +614,25 @@ class SdpaFwdDsl(APIBase):
     # normalization-copy fallback (AGENTS.md Hard Rule 2) — so the router
     # picks an engine that honors them instead.
 
+    def _checked_padded_lse(self, lse_tensor):
+        """A per-batch padded Stats buffer holds exactly B*H_q*s_max fp32 values;
+        the declared strides are then applied over it (the caller may hand any
+        view of that storage -- rank-4 graph Stats, (b, s_max, h) -- so the
+        element count, not the shape, is the contract)."""
+        self._value_error_if(dtype_name(lse_tensor) != "float32", f"lse_tensor must be float32; got {lse_tensor.dtype}")
+        expected = self.batch_size * self.h_q * self.s_q_max
+        self._value_error_if(
+            lse_tensor.numel() != expected,
+            f"padded lse_tensor must have B*H_q*S_q_max = {expected} elements; got {lse_tensor.numel()}",
+        )
+        return lse_tensor
+
     def _thd_padded_lse_view(self, lse_tensor):
         """The per-batch padded (b, h, s_max) Stats view in the declared strides,
         or None when this plan does not bind one."""
         if lse_tensor is None or not self.thd_stats_padded:
             return None
+        self._checked_padded_lse(lse_tensor)
         return lse_tensor.as_strided((self.batch_size, self.h_q, self.s_q_max), self._lse_stride, lse_tensor.storage_offset())
 
     def _seed_padded_lse(self, LSE, current_stream) -> None:
@@ -2312,6 +2326,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         qh = self.h_q
         if self.thd_stats_padded:
             # per-batch padded (b, h, s_max, 1) in the declared strides: the rank selects the kernel's per-batch store
+            self._checked_padded_lse(lse_tensor)
             return lse_tensor.as_strided((self.batch_size, qh, self.s_q_max, 1), (*self._lse_stride, 1), lse_tensor.storage_offset())
         if self.thd_stats_head_major:
             head_stride = self.thd_stats_head_stride
@@ -3717,8 +3732,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             lse = None
             if lse_tensor is not None:
                 if self.thd_stats_padded:
-                    # per-batch padded (b, h, s_max) in the declared strides
-                    lse = lse_tensor.as_strided((self.batch_size, self.h_q, self.s_q_max), self._lse_stride, lse_tensor.storage_offset())
+                    lse = self._thd_padded_lse_view(lse_tensor)  # per-batch padded (b, h, s_max) in the declared strides, checked
                 elif self.thd_stats_head_major:
                     head_stride = self.thd_stats_head_stride
                     lse = lse_tensor.as_strided((self.h_q, head_stride), (head_stride, 1), lse_tensor.storage_offset())
@@ -4014,8 +4028,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         lse = None
         if lse_tensor is not None:
             if self.thd_stats_padded:
-                # per-batch padded (b, h, s_max) in the declared strides
-                lse = lse_tensor.as_strided((self.batch_size, self.h_q, self.s_q_max), self._lse_stride, lse_tensor.storage_offset())
+                lse = self._thd_padded_lse_view(lse_tensor)  # per-batch padded (b, h, s_max) in the declared strides, checked
             elif self.thd_stats_head_major:
                 head_stride = self.thd_stats_head_stride
                 lse = lse_tensor.as_strided((self.h_q, head_stride), (head_stride, 1), lse_tensor.storage_offset())
