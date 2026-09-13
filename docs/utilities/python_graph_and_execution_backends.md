@@ -666,6 +666,28 @@ only to decline is why `closed_under` existed.
   backend-unlowerable (`serialize()` and `key()` refuse it), and it surfaces as
   a graph fact the capability rows gate on.
 
+### One kernel per layout class, not per shape (SDPA THD)
+
+A `compile()` of an SDPA template used to pin batch, head extents and every
+stride in its fakes, so FlashInfer's serving shapes minted one 2.6 s kernel per
+`(b, qh, kh, strides)`: 126 forward kernels in FlashInfer's cuDNN attention
+tests. The kernels never needed that — `_host` reads `B / QH / KH` from
+`problem_size` at run time and the THD token totals were already `sym_int`.
+Under `compile(dynamic_bhk=True)` (THD only) the template rebinds `b`, `qh`,
+`kh` (and a padded LSE's `s_max`) to `cute.sym_int()` right after the cache
+key is taken, keeps plain ints for the `problem_size` fake, and gives the
+metadata / O-descriptor fakes fresh symbols (`SymInt` has no `__add__`); a
+packed declared stride is passed as `None` so the compact fake derives it from
+the dynamic extents, a padded LSE in a compact dim order passes that order
+(`lse_padded_order`), and anything else keeps its static key. The adapter
+canonicalizes the key (`b = qh = kh = 0`, `lse_padded_rows = 1`) when the
+module offers `dynamic_bhk`. What stays static: `d`, dtypes, masks, the GQA
+ratio (`CFG.QH_PER_KH`), paged pool strides, dense (non-THD) shapes. Two DSL
+facts shaped this: `and` is staged, so `const_expr(CFG.PACK_GQA and
+q.shape[2] != ...)` must nest its constant test outside; a `const_expr` on a
+dynamic extent or stride is an error, which is why the padded-Stats store
+selects on the fake's RANK (rank-4) and not on `shape[0] > 1`.
+
 ### Accept means run
 
 For a python plan, `check_support()` accepted ⇒ `build_plans()` and
