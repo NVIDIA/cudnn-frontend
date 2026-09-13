@@ -140,8 +140,9 @@ declared bytes and meets the engine's alignment. Rules that follow:
   output becomes that output), and a buffer of the declared extents whose
   slots are as wide as the declaration's is read AS the declared dtype
   (FlashInfer binds packed fp4 data and the e4m3 scale blob as `uint8`; the
-  backend read a pointer and never knew). Only a buffer too small for the
-  declaration keeps its own dtype with its own description.
+  backend read a pointer and never knew). A buffer too small for the
+  declaration, or whose slots are not as wide as the declaration's, keeps its
+  own dtype with its own description.
 - `override_shapes` / `override_strides` speak cuDNN **element** units in the
   graph's axis order, like every declaration. They are written INTO the slot
   (in the buffer's axis order, `_in_axis_order_of`), never carried around it, so

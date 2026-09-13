@@ -130,10 +130,14 @@ dtype_name(DLDataType dtype) {
         return "float8_e5m2";
     } else if (code == kDLFloat8_e8m0fnu) {
         return "float8_e8m0fnu";
-    } else if (code == kDLFloat4_e2m1fn && bits == 4) {
+    } else if (code == kDLFloat4_e2m1fn && bits == 4 && dtype.lanes == 2) {
         return "float4_e2m1fn_x2";  // two elements per slot, as torch spells the storage dtype
     }
-    return "code" + std::to_string(code) + "_" + std::to_string(bits);
+    std::string name = "code" + std::to_string(code) + "_" + std::to_string(bits);
+    if (dtype.lanes != 1) {
+        name += "_x" + std::to_string(dtype.lanes);
+    }
+    return name;
 }
 
 bool
