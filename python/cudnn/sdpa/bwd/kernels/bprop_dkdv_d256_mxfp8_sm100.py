@@ -1824,6 +1824,9 @@ class BlackwellFmhaBackwardDKDV256:
                             self.epilogue_sync_barrier.arrive_and_wait()
                         cumulative_trip_count_compute = cumulative_trip_count_compute + trip_count
                         persistent_iter = persistent_iter + Int32(1)
+                    elif trip_count <= 0:
+                        if warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_0[-1]:
+                            self.zero_epilogue(blk_coord, blk_offset, problem_shape_cur_batch, dK, dV)
 
                     # Sync all non-sched warps before advancing to next persistent tile
                     self.persistent_tile_barrier.arrive_and_wait()
@@ -2094,6 +2097,9 @@ class BlackwellFmhaBackwardDKDV256:
 
                 else:
                     cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+            elif trip_count <= 0:
+                if warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_0[-1]:
+                    self.zero_epilogue(blk_coord, blk_offset, problem_shape_cur_batch, dK, dV)
 
         # In persistent mode, sync across the 2-CTA cluster before TMEM dealloc
         # to prevent one CTA from freeing TMEM while partner CTA's MMA warp still accesses it.
@@ -3813,6 +3819,31 @@ class BlackwellFmhaBackwardDKDV256:
             iter_index += 1
             if iter_index == iter_end:
                 iter_index = iter_start
+
+    @cute.jit
+    def zero_epilogue(self, blk_coord, blk_offset, problem_shape, dK: cute.Tensor, dV: cute.Tensor):
+        """A fully masked KV tile still owns valid output rows: overwrite them.
+
+        Use the normal epilogue's per-CTA row ownership and varlen offset, but
+        do not read TMEM or wait/advance pipelines: no MMA was issued here.
+        Only the first compute warpgroup calls this helper in each CTA.
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        _, K, D, HB = problem_shape
+        mdK = cute.make_tensor(
+            dK.iterator + cute.assume(blk_offset[1] * dK.stride[0], divby=64),
+            cute.make_layout((K, self.tile_shape_dKdV_K, HB), stride=dK.stride),
+        )
+        mdV = cute.make_tensor(
+            dV.iterator + cute.assume(blk_offset[1] * dV.stride[0], divby=64),
+            cute.make_layout((K, self.tile_shape_dKdV_K, HB), stride=dV.stride),
+        )
+        for index in cutlass.range(tidx % 128, self.dSQ_cta_tiler[0] * self.tile_shape_dKdV_K, 128):
+            row = blk_coord[1] * self.dSQ_cta_tiler[0] + index // self.tile_shape_dKdV_K
+            col = index % self.tile_shape_dKdV_K
+            if row < K and col < D:
+                mdK[row, col, blk_coord[3]] = self.element_dtype(0.0)
+                mdV[row, col, blk_coord[3]] = self.element_dtype(0.0)
 
     @cute.jit
     def epilogue(
