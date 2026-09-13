@@ -705,9 +705,18 @@ def make_sdpa_helpers(
 
     @cute.jit
     def _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, scalar_seqlen_kv):
+        """Per-batch KV length, clamped to [0, scalar_seqlen_kv].
+
+        The clamp mirrors _resolve_seqlen_q and is load-bearing under PAGED_KV,
+        where scalar_seqlen_kv is the block table's capacity
+        (max_pages * PAGE_SIZE): a device length above it would put n_pages_b
+        past the end of the table row, so the page walk would read a block-table
+        entry outside the batch's row and hand TMA an arbitrary page id. Every
+        caller goes through here, including the per-tile loop update.
+        """
         if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT == 1):
             arr = cutlass.make_array_view(seq_kv_lens_tensor)
-            return cutlass.Int32(arr[batch_idx])
+            return cute.math.max(cutlass.Int32(0), cute.math.min(cutlass.Int32(arr[batch_idx]), scalar_seqlen_kv))
         return scalar_seqlen_kv
 
     @cute.jit

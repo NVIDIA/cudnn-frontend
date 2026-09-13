@@ -580,12 +580,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "paged KV requires use_padding_mask with seq_len_kv (the per-batch KV length bounds the block-table walk)"
         if facts.d_qk > 256 or facts.d_v > 256:
             return f"paged KV is wired on the d128 / d256 flavors only (d_qk, d_v <= 256); got ({facts.d_qk}, {facts.d_v})"
-        if (facts.d_qk > 128 or facts.d_v > 128) and not (facts.d_qk > 128 and facts.d_v > 128):
+        # Decide on the FLAVOR the lowering will pick, not on head-dim
+        # inequalities: (128, 192) and (256, 128) both cover to the wired d256,
+        # while only (192, 128) lands on the unwired d192x128.
+        from cudnn.sdpa.fwd.api_dsl import _pick_flavor
+
+        if _pick_flavor(facts.d_qk, facts.d_v) == (192, 128):
             return f"paged KV with mixed head dims ({facts.d_qk}, {facts.d_v}) would select the d192x128 flavor, which is not wired"
         if facts.has_sink:
             return "paged KV with an attention sink is not validated"
         p = facts.page_size
-        if p % 8 != 0 or (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
+        if p < 8 or p % 8 != 0 or (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
             return f"page_size {p} must be a multiple of 8 that divides the 128-row KV tile or is a multiple of it"
 
     if facts.has_sink and capabilities.sink_dtypes is not None and facts.dtype not in capabilities.sink_dtypes:

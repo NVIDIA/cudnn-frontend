@@ -539,7 +539,7 @@ feature-free d=64 graph.
 | d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |
 | Bias forward | SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
-| Paged KV cache | every arch except SM100/SM103 f16/bf16 d128 forward (see ᵖ); fp8/mxfp8 pools, sink, THD, packed block tables everywhere |
+| Paged KV cache | every arch except SM100/SM103 f16/bf16 d128 / d256 forward (see ᵖ); fp8/mxfp8 pools, sink, packed block tables everywhere |
 
 ᵏ **THD / ragged forward layout.** Q/K/V/O must be BSHD-ordered over **(H, S, D)**
 only — head dim innermost, then heads, then tokens (`graph_analyzer.packed_layout_ok`).
