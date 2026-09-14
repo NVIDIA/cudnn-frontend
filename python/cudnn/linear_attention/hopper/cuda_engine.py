@@ -131,8 +131,106 @@ class KdaHopperCudaPlan(CompiledPlan):
         )
 
 
+class KdaHopperCudaBwdPlan(CompiledPlan):
+    """Bind the node's ports and run the four backward kernels.
+
+    Destination-passing: dQ/dK/dV/dG/dBeta (and d_initial_state when asked for)
+    are written in place. Unlike the forward, this kernel needs real scratch --
+    chunk tables, the UT factors, and three [NCS,H,128,128] state arrays -- so
+    the plan declares a workspace and carves it in cuda_bwd_host._layout rather
+    than allocating anything of its own.
+    """
+
+    takes_variant_pack = True
+    plan_name = "KdaHopperCudaEngine"
+
+    def __init__(self, graph):
+        (node,) = graph.nodes
+        q, cu = (node.inputs[p] for p in ("q", "cu_seqlens"))
+        self.total, self.h, self.k = (int(d) for d in q.dim)
+        self.n_seqs = int(cu.dim[0]) - 1
+        self.ports = None
+        self._zeros = {}
+        self._scratch_dis = None
+        self._device = None
+
+    def get_workspace_size(self) -> int:
+        from . import cuda_bwd_host
+
+        return cuda_bwd_host.workspace_bytes(self.total, self.h, self.n_seqs)
+
+    def _zero(self, key, shape, torch):
+        """A zero buffer standing in for an absent optional input.
+
+        Cached per plan: the kernel reads these every call, and reallocating (or
+        re-zeroing) one per execute would show up directly in the launch path.
+        """
+        buf = self._zeros.get(key)
+        if buf is None:
+            buf = torch.zeros(*shape, dtype=torch.float32, device=self._device)
+            self._zeros[key] = buf
+        return int(buf.data_ptr())
+
+    def execute(self, graph, variant_pack, ctx) -> None:
+        import torch
+
+        from . import cuda_bwd_host
+
+        if self.ports is None:
+            self.ports = bind_ports(graph, variant_pack)
+            (slots,) = self.ports.values()
+            self.names = list(slots.inputs) + list(slots.outputs)
+            self.indices = list(slots.inputs.values()) + list(slots.outputs.values())
+        views = variant_pack.operands(self.indices)
+
+        # Raw device addresses -- no DLPack conversion on this route.
+        addr = {name: int(view.data_ptr()) for name, view in zip(self.names, views)}
+
+        if self._device is None:
+            self._device = torch.from_dlpack(views[0]).device
+
+        state_shape = (self.n_seqs, self.h, self.k, self.k)
+        # initial_state and d_final_state are optional; absent means "zero".
+        initial_state = addr.get("initial_state") or self._zero("s0", state_shape, torch)
+        d_final_state = addr.get("d_final_state") or self._zero("dfs", state_shape, torch)
+
+        # The kernel always writes d_initial_state; a graph that did not ask for
+        # it gets a scratch buffer whose result is dropped.
+        if "d_initial_state" in addr:
+            d_initial_state = addr["d_initial_state"]
+        else:
+            if self._scratch_dis is None:
+                self._scratch_dis = torch.empty(*state_shape, dtype=torch.float32, device=self._device)
+            d_initial_state = int(self._scratch_dis.data_ptr())
+
+        stream = ctx.stream if ctx.stream else torch.cuda.current_stream().cuda_stream
+        cuda_bwd_host.launch(
+            device=self._device.index if self._device.index is not None else 0,
+            stream=int(stream),
+            workspace=int(variant_pack.workspace),
+            dO=addr["dO"],
+            q=addr["q"],
+            k=addr["k"],
+            v=addr["v"],
+            g=addr["g"],
+            beta=addr["beta"],
+            cu_seqlens=addr["cu_seqlens"],
+            initial_state=initial_state,
+            d_final_state=d_final_state,
+            dq=addr["dQ"],
+            dk=addr["dK"],
+            dv=addr["dV"],
+            dg=addr["dG"],
+            dbeta=addr["dBeta"],
+            d_initial_state=d_initial_state,
+            total_tokens=self.total,
+            n_heads=self.h,
+            n_seqs=self.n_seqs,
+        )
+
+
 class KdaHopperCudaEngine(BaseEngine):
-    """Hopper (sm90) fused-CUDA backend for single-node KDA forward graphs (THD)."""
+    """Hopper (sm90) fused-CUDA backend for single-node KDA graphs, both directions (THD)."""
 
     name = "kda_hopper_cuda"
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
@@ -155,16 +253,34 @@ class KdaHopperCudaEngine(BaseEngine):
         # the first execute() fail: an engine that cannot compile should decline.
         try:
             from ..cake import compiler  # noqa: F401
-            from . import cuda_host
+
+            if facts.is_bwd:
+                from . import cuda_bwd_host  # noqa: F401
+            else:
+                from . import cuda_host  # noqa: F401
 
             compiler.cuda_include_dirs()
         except Exception as exc:  # noqa: BLE001 -- any import/toolkit failure is a decline
             raise NotImplementedError(f"KdaHopperCudaEngine needs NVRTC and a CUDA include tree: {exc}") from exc
 
-        # --- scope. Identical to the CuTe DSL engine's: same operation, same
-        # kernel envelope, so a graph either engine declines is declined by both.
+        # --- scope. The forward envelope matches the CuTe DSL engine's, so a
+        # graph either declines is declined by both; the backward is served
+        # only here, since kda_engine.py has no backward kernel.
+        # --- direction-specific dtypes. The gradient ports are fixed by the
+        # kernel: dQ/dK/dV are written as bf16, dG/dBeta/d_initial_state as fp32.
         if facts.is_bwd:
-            raise NotImplementedError("KdaHopperCudaEngine: forward only; there is no Hopper KDA backward kernel yet")
+            for label, dtype, want in (
+                ("dO", facts.do_dtype, cudnn.data_type.BFLOAT16),
+                ("dQ", facts.dq_dtype, cudnn.data_type.BFLOAT16),
+                ("dK", facts.dk_dtype, cudnn.data_type.BFLOAT16),
+                ("dV", facts.dv_dtype, cudnn.data_type.BFLOAT16),
+                ("dG", facts.dg_dtype, cudnn.data_type.FLOAT),
+                ("dBeta", facts.dbeta_dtype, cudnn.data_type.FLOAT),
+                ("d_initial_state", facts.d_initial_state_dtype, cudnn.data_type.FLOAT),
+                ("d_final_state", facts.d_final_state_dtype, cudnn.data_type.FLOAT),
+            ):
+                if dtype not in (want, None):
+                    raise NotImplementedError(f"KdaHopperCudaEngine: '{label}' must be {want}, got {dtype}")
         if facts.checkpoint_every_n_tokens:
             raise NotImplementedError("KdaHopperCudaEngine: state_checkpoints are not produced by the Hopper kernel")
         if facts.safe_gate or facts.has_a_log or facts.has_dt_bias:
@@ -202,4 +318,7 @@ class KdaHopperCudaEngine(BaseEngine):
             raise NotImplementedError("KdaHopperCudaEngine: q/k/v must be THD [total_T, heads, dim]")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
+        (node,) = graph.nodes
+        if node.node_type == NodeType.KDA_BWD:
+            return KdaHopperCudaBwdPlan(graph)
         return KdaHopperCudaPlan(graph)
