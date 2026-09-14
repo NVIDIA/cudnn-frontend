@@ -83,13 +83,24 @@ O and LSE were bit-exact between the two kernels.
 | 20.0000% | strided | 43.8519 ms | 43.5766 ms | 1.0063x |
 | 20.0000% | local | 43.9766 ms | 43.7476 ms | 1.0052x |
 
-The current loop uses four-fold unrolling. A new 101-pair run against the
+The current loop uses four-fold unrolling. Its initial 101-pair run against the
 two-fold `9869b9b6` baseline on a Server Edition GPU measured 1.0034x–1.0041x
 across both densities and address patterns. This small incremental gain is
 **not** the additional 1.05x target. Full O/LSE tensors were bit-exact in a
 separate four-case check; FP16/BF16 tests cover the four-way loop and its tails.
 See [the screening log](SM120_OPTIMIZATION.md#four-fold-unroll-checkpoint) for
 the paired table and acceptance limits.
+
+The latest checkpoint additionally balances an underfilled final scheduling
+wave. It only divides those final Q tiles into 64-row work units; every work
+unit still loads native KV128 blocks and consumes the original blk128 sparse
+metadata. There is no blk64-kernel call, metadata expansion, quantization,
+extra scratch allocation, or second kernel launch. SM-count planning happens
+at JIT tracing, not on cache hits. The latest 101-pair run against `9869b9b6`
+measured 1.0079x–1.0114x across the four cases. This includes the earlier
+unrolling gain and **still does not meet 1.05x**. See the
+[final-wave checkpoint](SM120_OPTIMIZATION.md#final-wave-scheduling-checkpoint)
+for timings, accuracy coverage, and the distinction from internal KV tiling.
 
 The same screening rejected output TMA stores (about 0.1%, below the adoption
 threshold), L2 K/V prefetching, fixed-bound specialization, two-Q-tile

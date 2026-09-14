@@ -85,8 +85,9 @@ Doubling the exchange buffers and sharing row state within each thread quad
 also remained spill-free and bit-exact in the 20% strided full-size check,
 but did not improve performance.
 
-**The additional 5% target has not been achieved in this screening.** Only the
-four-fold-unroll checkpoint below is adopted. Other experimental sources,
+**The additional 5% target has not been achieved in this screening.** The
+four-fold-unroll and final-wave scheduling checkpoints below are adopted.
+Other experimental sources,
 tests, and profiles remain in the local ignored agent workspace; no
 infrastructure addresses, GPU identifiers, or host names are recorded here.
 
@@ -136,6 +137,81 @@ strided/local. There is no stable additional benefit; it is not adopted.
 An earlier array-rebinding variant failed its top-k-3 reference test and was
 discarded without timing. Passing only top-k 1 or 2 is insufficient to verify
 the lookahead pipeline's loop-carried state.
+
+## Instruction-overlap follow-up
+
+Three prototypes explicitly interleave small groups of exp2/probability
+packing with their PV fragments inside a native KV128 tile. Groups of 16,
+32, and 64 selected K rows measured 1.0043x, 1.0033x, and 1.0012x against
+`9869b9b6` in 31-pair, 20% strided screening. Moving the local maximum
+reduction into QK, with PV groups of 16/32/64/128 rows, measured 1.0043x /
+1.0033x / 1.0014x / 1.0040x. Reordering PV into groups of one/two/four output
+column pairs measured 1.0043x / 1.0028x / 1.0036x. All ten candidates passed
+BF16 reference tests at top-k 1/2/3/223 and full-shape bitwise O/LSE checks.
+These ratios mostly reflect the already adopted unroll-four gain and do not
+demonstrate a stable additional improvement.
+
+The generated baseline SASS already interleaves many `MUFU` exponentials with
+PV `HMMA` instructions even though the Python source calls softmax before PV.
+An explicitly interleaved prototype remains spill-free but does not gain
+materially. Source-level sequential calls therefore do not prove that their
+instructions execute sequentially, nor does moving them into one helper prove
+new overlap. This is direct generated-code evidence, not a profiler timing.
+
+## Final-wave scheduling checkpoint
+
+The full target has 8,920 logical Q blocks. On the measured 188-SM device,
+8,836 fill 47 waves and the last 84 use fewer than half of the SMs. The
+scheduler keeps the full waves unchanged and assigns two 64-row Q CTAs to
+each of those last logical Q blocks. This gives 168 smaller CTAs for the
+final wave. It does not change KV block size, expand metadata, call a blk64
+kernel, quantize tensors, or add a second kernel launch. Both CTA shapes load
+complete physical KV128 blocks through the same native kernel specialization.
+
+The final recorded 101-pair run, with ten warmup pairs per case, measured:
+
+| Density | Pattern | Baseline `9869b9b6` | Current checkpoint | Ratio |
+| ---: | --- | ---: | ---: | ---: |
+| 14.9776% | strided | 31.5949 ms | 31.3348 ms | 1.0083x |
+| 14.9776% | local | 31.7997 ms | 31.5128 ms | 1.0091x |
+| 20.0000% | strided | 43.1518 ms | 42.8118 ms | 1.0079x |
+| 20.0000% | local | 44.2680 ms | 43.7693 ms | 1.0114x |
+
+These are total ratios against the original two-fold-unroll baseline, not
+additional gains on top of the four-fold checkpoint. Two earlier independent
+101-pair prototype runs were positive in all four cases, spanning
+1.0065x–1.0103x. **All four cases still fail the 1.05x acceptance gate.**
+The raw samples and source hashes are retained in the ignored benchmark
+workspace. No timing is taken while profiling or running another GPU test.
+
+An additional 101-pair isolation run used the pre-scheduling `69360b3e`
+kernel (already unroll-four and uniform-donation) as the baseline. Its
+strided/local ratios were 1.0049x / 1.0050x at 15% and 1.0033x / 1.0046x at
+20%. This identifies the smaller incremental scheduling benefit without
+counting the earlier unrolling improvement twice. The final full-shape cubin
+retains a zero-byte stack and the 168-register static reservation.
+
+The optimization only splits a remainder when doubling it still fits in one
+wave. SM count is queried while tracing the launch plan, never during a cache
+hit. The cache-hit query-counter test was verified RED by temporarily querying
+in the constructor (which the BSA wrapper invokes on cache hits), then GREEN
+after moving the query into tracing. No host tensor read or new scratch
+allocation is introduced.
+
+The final BSA forward and paired-harness regression run passed 33 tests with
+nine unsupported-configuration skips. New FP16/BF16 tests exercise every output
+row across all-tail, unsplit, full-wave, and mixed-wave shapes, using partial Q,
+GQA, and query-dependent noncontiguous KV selections. A separate eight-case
+comparison was bit-exact against the pre-scheduling checkout. The full target
+also passed complete O/LSE bitwise comparisons at both densities and patterns.
+
+An expanded exploratory test at Q=12,161, top-k=1 exceeded its strict
+`atol=1e-3, rtol=1e-2` BF16 FP32-reference bound at two of 3,113,216 output
+elements. The unchanged checkout reproduced the same indices and errors; an
+additional control proved the entire candidate O/LSE tensors identical to it.
+This is recorded as a pre-existing reference-bound exceedance, not a passing
+strict-reference test. The committed tests retain the existing BSA suite's
+FP32-reference tolerances; no production accuracy tolerance was relaxed.
 
 ## Four-fold-unroll checkpoint
 
@@ -194,11 +270,16 @@ three donor warps released registers at two different instruction sites. PTX
 requires all four warps in a warpgroup to execute the same `setmaxnreg`
 instruction; see the
 [PTX register-adjustment contract](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#miscellaneous-instructions-setmaxnreg).
-The native BSA specialization now performs donation once in a
+At `69360b3e`, the native BSA specialization moved donation into a
 `warp >= load_warp_id` branch, before selecting the individual load-warp role.
-Generated SASS has one deallocation instruction rather than two. Register
+That checkpoint's SASS had one deallocation instruction rather than two. Register
 budgets, sparse traversal, arithmetic, and launch dimensions are unchanged.
 This is a correctness hardening, not a claimed performance optimization.
+
+The later final-wave checkpoint uses `warp >= compute_warps` separately in
+its full and tail specializations. Both boundaries (eight and four warps)
+remain warpgroup-aligned; each participating warpgroup executes one uniform
+donation site.
 
 The BSA forward and paired-harness regression run passed 24 tests, with nine
 unsupported-configuration skips. A separate 101-pair run passed full-tensor

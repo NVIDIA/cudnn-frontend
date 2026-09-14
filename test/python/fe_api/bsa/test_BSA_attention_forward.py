@@ -137,6 +137,73 @@ def test_bsa_attention_forward_sm120_fa4_blk128_fixed_topk(dtype, block_sparse_n
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("wave_kind,block_sparse_num", (("tail_only", 3), ("unsplit", 1), ("full", 5), ("mixed", 3)))
+@torch_fork_set_rng(seed=20)
+def test_bsa_attention_forward_sm120_blk128_wave_boundaries(dtype, wave_kind, block_sparse_num):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("native blk128 wave scheduling requires SM120")
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    full_wave_q_blocks = sm_count // 2 if sm_count % 2 == 0 else sm_count
+    q_blocks = {
+        "tail_only": 2,
+        "unsplit": sm_count // 4 + 1,
+        "full": full_wave_q_blocks,
+        "mixed": full_wave_q_blocks + 2,
+    }[wave_kind]
+    sequence = (q_blocks - 1) * 128 + 1
+    BSA = _import_bsa()
+    q = torch.randn((1, 2, sequence, 128), device="cuda", dtype=dtype)
+    k = torch.randn((1, 1, 768, 128), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    q_block = torch.arange(q_blocks, device="cuda", dtype=torch.int32).view(1, 1, -1, 1)
+    head = torch.arange(2, device="cuda", dtype=torch.int32).view(1, 2, 1, 1)
+    slots = torch.tensor([0, 2, 3, 5, 1], device="cuda", dtype=torch.int32).view(1, 1, 1, 5)
+    q2k = ((3 * q_block + 7 * head + slots) % 6).contiguous()
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num=block_sparse_num, sparse_block_size=128)
+
+    # Exercise every output row, including the Q64 boundary inside blk128 and
+    # the final partial Q tile. Per-query metadata prevents accidental reuse
+    # of the first sparse row from passing this check.
+    block_sizes = torch.full((6,), 128, device="cuda", dtype=torch.int32)
+    mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, sequence, 768, 128)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+def test_bsa_sm120_wave_planning_is_not_repeated_on_cache_hits(monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("native blk128 wave scheduling requires SM120")
+    BSA = _import_bsa()
+    from cudnn.block_sparse_attention import _interface
+    from cudnn.block_sparse_attention.csrc.fwd.sm120_blk128 import bsa_fwd_sm120_fa4
+
+    query_count = 0
+    original_query = bsa_fwd_sm120_fa4._device_sm_count
+
+    def counted_query():
+        nonlocal query_count
+        query_count += 1
+        return original_query()
+
+    monkeypatch.setattr(bsa_fwd_sm120_fa4, "_device_sm_count", counted_query)
+    monkeypatch.setattr(_interface.bsa_attn_fwd, "compile_cache", {})
+    q = torch.zeros((1, 1, 129, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros((1, 1, 256, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.ones_like(k)
+    indices = torch.zeros((1, 1, 2, 1), device="cuda", dtype=torch.int32)
+    first = BSA.block_sparse_attention_forward(q, k, v, indices, block_sparse_num=1, sparse_block_size=128)
+    assert query_count > 0
+    trace_query_count = query_count
+    second = BSA.block_sparse_attention_forward(q, k, v, indices, block_sparse_num=1, sparse_block_size=128)
+    assert query_count == trace_query_count
+    torch.testing.assert_close(first["o_tensor"], torch.ones_like(q), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(second["o_tensor"], first["o_tensor"], atol=0.0, rtol=0.0)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=18)
 def test_bsa_attention_forward_sm120_native_blk128_variable_blocks_and_layout():
     if not torch.cuda.is_available():

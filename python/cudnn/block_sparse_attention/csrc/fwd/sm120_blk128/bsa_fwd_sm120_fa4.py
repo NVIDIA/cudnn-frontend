@@ -20,13 +20,25 @@ from cudnn.sdpa.fwd.kernels.sm120.prefill_f16 import (
 SM120_FA4_BLK128_FWD_BLOCK_SIZE = 128
 
 
+def _device_sm_count() -> int:
+    """Read launch-planning metadata during JIT tracing, not cached execution."""
+    result, device = cuda.cuCtxGetDevice()
+    if result != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError("Cannot query the current CUDA device")
+    result, sm_count = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device)
+    if result != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError("Cannot query the CUDA SM count")
+    return sm_count
+
+
 class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
     """Native blk128 sparse attention using the SM120 FA4-style warp split.
 
-    Eight compute warps own 16 query rows each while one load warp streams
-    complete 128x128 K/V blocks selected directly by the sparse metadata.
-    Q stays in registers and the K/V shared-memory backing is reused by the O
-    epilogue. Three low-register warps reserve registers for the compute warps.
+    Full CTAs use eight compute warps, each owning 16 query rows. An
+    underfilled final scheduling wave may use four-compute-warp CTAs for
+    64 query rows. Both paths load complete native 128x128 K/V blocks and
+    address the original blk128 sparse metadata without expansion.
+    Q stays in registers; the K/V backing is reused by the O epilogue.
 
     This specialization intentionally covers the fixed-top-k, full-KV-block
     workload. The general native blk128 kernel remains the fallback for
@@ -135,11 +147,15 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
         tma_k_desc = kv_tma_desc(mK, is_v=False)
         tma_v_desc = kv_tma_desc(mV, is_v=True)
         log2_e = 1.44269504088896340736
-        grid = (
-            ceil_div(mQ.shape[0], self.q_tile),
-            mQ.shape[3],
-            mQ.shape[2],
-        )
+        num_q_tiles = ceil_div(mQ.shape[0], self.q_tile)
+        total_tiles = num_q_tiles * mQ.shape[3] * mQ.shape[2]
+        # Split only an underfilled final wave that still fits in one wave
+        # after doubling its CTAs. K/V tiles and metadata stay native blk128.
+        sm_count = _device_sm_count()
+        remainder = total_tiles % sm_count
+        tail_tiles = remainder if remainder <= sm_count // 2 else 0
+        full_tiles = total_tiles - tail_tiles
+        grid = (full_tiles + 2 * tail_tiles, 1, 1)
         self.kernel(
             mQ,
             mK,
@@ -151,6 +167,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
             tma_k_desc,
             tma_v_desc,
             softmax_scale * log2_e,
+            full_tiles,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
@@ -171,6 +188,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
         tma_k_desc: cutlass.GridConstant[cuda_experimental.TensorMap],
         tma_v_desc: cutlass.GridConstant[cuda_experimental.TensorMap],
         softmax_scale_log2: cutlass.Float32,
+        full_tiles: cutlass.Constexpr[int],
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         lane = tidx % cute.arch.WARP_SIZE
@@ -202,29 +220,69 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
         prims.fence_mbarrier_init()
         prims.barrier_cta_sync(0)
 
-        q_tile_idx, batch_idx, head_idx = cute.arch.block_idx()
-        self._run_sparse_unit(
-            mQ,
-            mK,
-            mV,
-            mO,
-            mLSE,
-            blocksparse_indices_q2k,
-            block_sparse_num,
-            tma_k_desc,
-            tma_v_desc,
-            softmax_scale_log2,
-            sKV,
-            sK,
-            sV,
-            k_tma_mbar,
-            v_tma_mbar,
-            lane,
-            warp,
-            q_tile_idx,
-            batch_idx,
-            head_idx,
-        )
+        linear_idx, _, _ = cute.arch.block_idx()
+        num_q_tiles = ceil_div(mQ.shape[0], self.q_tile)
+        if linear_idx < full_tiles:
+            q_tile_idx = linear_idx % num_q_tiles
+            batch_idx = (linear_idx // num_q_tiles) % mQ.shape[3]
+            head_idx = linear_idx // (num_q_tiles * mQ.shape[3])
+            q_offset = cutlass.Int32(0)
+            self._run_sparse_unit(
+                mQ,
+                mK,
+                mV,
+                mO,
+                mLSE,
+                blocksparse_indices_q2k,
+                block_sparse_num,
+                tma_k_desc,
+                tma_v_desc,
+                softmax_scale_log2,
+                sKV,
+                sK,
+                sV,
+                k_tma_mbar,
+                v_tma_mbar,
+                lane,
+                warp,
+                q_tile_idx,
+                batch_idx,
+                head_idx,
+                q_offset,
+                False,
+            )
+
+        else:
+            tail_idx = linear_idx - full_tiles
+            logical_idx = full_tiles + tail_idx // 2
+            q_tile_idx = logical_idx % num_q_tiles
+            batch_idx = (logical_idx // num_q_tiles) % mQ.shape[3]
+            head_idx = logical_idx // (num_q_tiles * mQ.shape[3])
+            q_offset = (tail_idx % 2) * 64
+            self._run_sparse_unit(
+                mQ,
+                mK,
+                mV,
+                mO,
+                mLSE,
+                blocksparse_indices_q2k,
+                block_sparse_num,
+                tma_k_desc,
+                tma_v_desc,
+                softmax_scale_log2,
+                sKV,
+                sK,
+                sV,
+                k_tma_mbar,
+                v_tma_mbar,
+                lane,
+                warp,
+                q_tile_idx,
+                batch_idx,
+                head_idx,
+                q_offset,
+                True,
+            )
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
@@ -251,8 +309,12 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
         q_tile_idx: cutlass.Int32,
         batch_idx: cutlass.Int32,
         head_idx: cutlass.Int32,
+        q_offset: cutlass.Int32,
+        is_tail: cutlass.Constexpr[bool],
     ) -> None:
-        q_seq_idx = q_tile_idx * self.q_tile
+        compute_warps = 4 if is_tail else 8
+        pipeline_threads = compute_warps * 32 + 32
+        q_seq_idx = q_tile_idx * self.q_tile + q_offset
         seqlen_q = cutlass.Int32(mQ.shape[0])
         seqlen_k = cutlass.Int32(mK.shape[0])
 
@@ -268,9 +330,9 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
         gIndices = blocksparse_indices_q2k[None, q_tile_idx, head_idx, batch_idx]
         num_kv_tiles = block_sparse_num
 
-        # Register donation is warpgroup-uniform: the load warp and its
-        # three donor warps must execute the same setmaxnreg instruction.
-        if warp >= self.load_warp_id:
+        # The compute boundary is a whole warpgroup in both specializations.
+        # Every non-compute warpgroup executes the same donation instruction.
+        if warp >= compute_warps:
             prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
 
         if warp == self.load_warp_id:
@@ -306,7 +368,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                 physical_idx = gIndices[logical_idx]
                 prims.barrier_cta_sync(
                     self.bar_k_consumed,
-                    thread_count=self.threads_kv_pipeline,
+                    thread_count=pipeline_threads,
                 )
                 self.load_one_kv_tile(
                     sK,
@@ -321,7 +383,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
 
                 prims.barrier_cta_sync(
                     self.bar_v_consumed,
-                    thread_count=self.threads_kv_pipeline,
+                    thread_count=pipeline_threads,
                 )
                 self.load_one_kv_tile(
                     sV,
@@ -336,13 +398,13 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
 
             prims.barrier_cta_sync(
                 self.bar_k_consumed,
-                thread_count=self.threads_kv_pipeline,
+                thread_count=pipeline_threads,
             )
             prims.barrier_cta_sync(
                 self.bar_v_consumed,
-                thread_count=self.threads_kv_pipeline,
+                thread_count=pipeline_threads,
             )
-        elif warp < self.load_warp_id:
+        elif warp < compute_warps:
             prims.setmaxregister(self.compute_regs, prims.SetMaxRegisterAction.INCREASE)
 
             compute_warp_idx = warp
@@ -367,6 +429,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
 
             basic_params = SimpleNamespace(
                 phase_base=cutlass.Int32(0),
+                pipeline_threads=pipeline_threads,
                 seqlen_q=seqlen_q,
                 seqlen_k=seqlen_k,
                 head_dim_qk=cutlass.Int32(self.head_tile_qk),
@@ -447,7 +510,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
 
             prims.barrier_cta_sync(
                 self.bar_compute_sync,
-                thread_count=self.threads_compute,
+                thread_count=compute_warps * 32,
             )
 
             # K/V are dead after the compute barrier, so their backing becomes
@@ -482,3 +545,37 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                     gO_ptr = o_ptr + o_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
                     sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * (16 * 16) + lane * 8
                     gO_ptr.store(sO_ptr.load(count=8, alignment=16), alignment=16)
+
+    @cute.jit
+    def compute_one_kv_tile(
+        self,
+        basic_params: SimpleNamespace,
+        mma_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        q_regs: cutlass.Array,
+        num_kv_tiles: cutlass.Int32,
+        kv_tile_idx: cutlass.Int32,
+        in_mask_steps: cutlass.Constexpr[bool],
+        is_first_kv_tile: cutlass.Constexpr[bool],
+    ) -> None:
+        """Compute one native KV block with the selected CTA's barrier count."""
+        phase = (num_kv_tiles - 1 - kv_tile_idx) & cutlass.Int32(1)
+        k_mbar = basic_params.k_tma_mbar
+        v_mbar = basic_params.v_tma_mbar
+        while not prims.mbarrier_try_wait_parity(k_mbar, phase):
+            pass
+        s_regs = self.mma_qk(basic_params, mma_params, q_regs)
+        prims.barrier_cta_arrive(self.bar_k_consumed, basic_params.pipeline_threads)
+        while not prims.mbarrier_try_wait_parity(v_mbar, phase):
+            pass
+        p_regs = self.online_softmax(
+            basic_params,
+            mma_params,
+            softmax_params,
+            s_regs,
+            kv_tile_idx * self.kv_tile,
+            in_mask_steps,
+            is_first_kv_tile,
+        )
+        self.mma_pv(basic_params, mma_params, p_regs)
+        prims.barrier_cta_arrive(self.bar_v_consumed, basic_params.pipeline_threads)
