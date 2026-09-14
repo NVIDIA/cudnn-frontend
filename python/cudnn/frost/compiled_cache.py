@@ -44,7 +44,10 @@ cached (the reload path has no converter); everything else is.
 
 Location: ``CUDNN_FRONTEND_COMPILED_CACHE`` (a directory), else
 ``$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`` (``~/.cache`` when unset).
-``CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`` turns the cache off. A caller
+``CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`` turns the cache off;
+``CUDNN_FRONTEND_COMPILED_CACHE_MAX_BYTES`` caps the root (4 GiB by default, 0 = never
+prune): a process's first write removes whole dead environment directories,
+oldest first, until the root fits. A caller
 that manages its own workspace (FlashInfer) points :func:`set_cache_dir` at
 it once per process.
 """
@@ -57,6 +60,9 @@ import inspect
 import json
 import logging
 import os
+import re
+import shutil
+import stat
 import tempfile
 import threading
 import uuid
@@ -66,14 +72,19 @@ from typing import Any, Callable, Dict, Optional
 _SCHEMA = "v2"  # v2: the record carries the runtime wrapper spec, not a Python signature
 _ENV_DIR = "CUDNN_FRONTEND_COMPILED_CACHE"
 _ENV_DISABLE = "CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"
+_ENV_MAX_BYTES = "CUDNN_FRONTEND_COMPILED_CACHE_MAX_BYTES"
+_DEFAULT_MAX_BYTES = 4 * 1024**3  # every environment the root has seen, together
 _OBJECT = "kernel.o"
 _ENTRY = "entry.json"
 _MANIFEST = "manifest.json"
+_SCHEMA_DIR = re.compile(r"v[0-9]+")  # the shape of a schema directory name ...
+_DIGEST_DIR = re.compile(r"[0-9a-f]{24}")  # ... and of an environment / entry directory name (see _digest)
 
 _LOG = logging.getLogger("cudnn.frost.compiled_cache")
 _LOCK = threading.Lock()
 _dir_override: Optional[Path] = None
-_stats = {"hits": 0, "misses": 0, "bypassed": 0, "invalid": 0, "export_failed": 0}
+_stats = {"hits": 0, "misses": 0, "bypassed": 0, "invalid": 0, "export_failed": 0, "pruned": 0}
+_pruned_this_process = False
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +130,7 @@ def get_cache_dir() -> Path:
 
 
 def stats() -> Dict[str, int]:
-    """Counters for this process: hits, misses, bypassed (not cacheable), invalid (entry rejected), export_failed."""
+    """Counters for this process: hits, misses, bypassed (not cacheable), invalid (entry rejected), export_failed, pruned (environment directories removed)."""
     with _LOCK:
         return dict(_stats)
 
@@ -130,9 +141,9 @@ def reset_stats() -> None:
             _stats[k] = 0
 
 
-def _count(name: str) -> None:
+def _count(name: str, n: int = 1) -> None:
     with _LOCK:
-        _stats[name] += 1
+        _stats[name] += n
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +366,111 @@ def _rebuild_wrapper(raw: Callable, spec: Dict[str, Any]) -> Optional[Callable]:
     )
 
 
+def max_bytes() -> int:
+    """The size the whole root may grow to before old environments are removed:
+    ``CUDNN_FRONTEND_COMPILED_CACHE_MAX_BYTES`` (0 disables pruning), else 4 GiB."""
+    raw = os.environ.get(_ENV_MAX_BYTES)
+    if raw is None or raw == "":
+        return _DEFAULT_MAX_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_MAX_BYTES
+
+
+def _dir_bytes_and_mtime(path: Path):
+    total, newest = 0, 0.0
+    for dirpath, _dirs, files in os.walk(path, followlinks=False):
+        for name in files:
+            try:
+                st = os.stat(os.path.join(dirpath, name), follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue  # a symlinked file would count its target's size
+            total += st.st_size
+            newest = max(newest, st.st_mtime)
+    return total, newest
+
+
+def prune(root: Optional[Path] = None, limit: Optional[int] = None, keep: Optional[Path] = None) -> int:
+    """Remove whole ENVIRONMENT directories, oldest first, until the root is under
+    ``limit`` bytes. Returns the number removed.
+
+    The manifest hashes the package's source, so every edited checkout -- and
+    every CI commit -- lands in a new environment directory that will never be
+    hit again; on a runner with a persistent home that is a few hundred MB per
+    commit, forever. Whole directories go, never single entries: an
+    environment is either current (``keep``, this process's own) or dead.
+    Other schema versions' roots are dead outright and go first. A directory
+    another live process is still reading only costs that process misses.
+    Only directories this cache made are candidates -- a ``v<N>`` schema
+    directory, under it an environment named by our digest whose manifest
+    parses and names that schema and a cudnn_frontend version; a caller who
+    points the root at a shared directory keeps everything else, uncounted.
+    """
+    root = Path(root) if root is not None else get_cache_dir()
+    limit = max_bytes() if limit is None else limit
+    if limit <= 0 or not root.is_dir():
+        return 0
+    resolved_root = root.resolve()
+    envs = []
+    # Symlinks are never followed and nothing outside the resolved root is ever
+    # a deletion target: a link planted in the cache must not redirect rmtree.
+    for schema_dir in root.iterdir():
+        if schema_dir.is_symlink() or not schema_dir.is_dir() or not _SCHEMA_DIR.fullmatch(schema_dir.name):
+            continue
+        for env in schema_dir.iterdir():
+            if env.is_symlink() or not env.is_dir() or not _DIGEST_DIR.fullmatch(env.name):
+                continue
+            if not env.resolve().is_relative_to(resolved_root) or not _is_our_environment(env, schema_dir.name):
+                continue
+            size, mtime = _dir_bytes_and_mtime(env)
+            envs.append((schema_dir.name != _SCHEMA, mtime, size, env))
+    total = sum(e[2] for e in envs)
+    removed = 0
+    # dead schemas first, then oldest first; the current environment is never a candidate
+    for _dead_schema, _mtime, size, env in sorted(envs, key=lambda e: (not e[0], e[1])):
+        if total <= limit:
+            break
+        if keep is not None and env.resolve() == Path(keep).resolve():
+            continue
+        try:
+            shutil.rmtree(env)
+        except OSError as exc:
+            _LOG.warning("compiled-plan cache: could not remove %s (%s)", env, exc)
+            continue
+        total -= size
+        removed += 1
+    if removed:
+        _count("pruned", removed)
+    return removed
+
+
+def _is_our_environment(env: Path, schema: str) -> bool:
+    """An environment directory this cache wrote: its manifest parses and names
+    this schema and a cudnn_frontend version. A same-shaped directory another
+    tool made (or a half-written one) is not ours and is never removed."""
+    manifest = _read_json(env / _MANIFEST)
+    if not isinstance(manifest, dict) or manifest.get("schema") != schema:
+        return False
+    version = manifest.get("cudnn_frontend")
+    return isinstance(version, str) and bool(version.strip())
+
+
+def _prune_once(root: Path, current_env: Path) -> None:
+    """Run :func:`prune` the first time this process writes an entry."""
+    global _pruned_this_process
+    with _LOCK:
+        if _pruned_this_process:
+            return
+        _pruned_this_process = True
+    try:
+        prune(root, keep=current_env)
+    except Exception as exc:  # noqa: BLE001 -- housekeeping never fails a compile
+        _LOG.warning("compiled-plan cache: prune failed (%s)", exc)
+
+
 # ---------------------------------------------------------------------------
 # The drop-in
 # ---------------------------------------------------------------------------
@@ -430,7 +546,8 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
         # incompatible stacks with the same unknowns would otherwise hash alike.
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
-    entry = _entry_dir(get_cache_dir(), manifest, f"{cache_key}|{symbol}|{options}")
+    root = get_cache_dir()  # one root for the export and the prune that follows it
+    entry = _entry_dir(root, manifest, f"{cache_key}|{symbol}|{options}")
     loaded = _try_load(entry, cache_key, symbol)
     if loaded is not None:
         _count("hits")
@@ -449,6 +566,7 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
         _count("export_failed")
         _LOG.warning("compiled-plan cache: could not persist %s (%s); the kernel will be recompiled next process", entry, exc)
         return compiled
+    _prune_once(root, entry.parent)  # this process's first write: retire dead environments
     # Hand back the artifact rather than the in-process object, so a hit and a
     # miss run the same thing and a bad artifact fails here, not next start-up.
     loaded = _try_load(entry, cache_key, symbol)

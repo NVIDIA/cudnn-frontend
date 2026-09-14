@@ -748,8 +748,18 @@ artifact can never be reused by accident:
 - Location: `CUDNN_FRONTEND_COMPILED_CACHE`, else
   `$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`; `set_cache_dir()` for a
   caller that owns a workspace (FlashInfer); `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`
-  turns it off; `stats()` reports hits / misses / bypassed / invalid per
-  process. Bump `_SCHEMA` on any incompatible change.
+  turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned
+  per process. Bump `_SCHEMA` on any incompatible change.
+- **Dead environments are retired.** The manifest hashes the package's source,
+  so every edited checkout and every CI commit mints an environment directory
+  that will never be hit again — a few hundred MB per commit on a runner with a
+  persistent home. A process's first write runs `prune()`: whole environment
+  directories go (never single entries), dead schema roots first, then oldest
+  first, until the root is under `CUDNN_FRONTEND_COMPILED_CACHE_MAX_BYTES`
+  (4 GiB by default; 0 disables); the process's own environment is never a
+  candidate. CI should still point `CUDNN_FRONTEND_COMPILED_CACHE` at a
+  job-local directory: nothing there is ever warm across commits, and the cap
+  is a backstop, not a policy.
 
 Not yet routed: kernels compiled from real tensors at call time (the
 linear-attention `chunk_*` launchers, the SDPA adapters' `_dot_fn` /
