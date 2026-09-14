@@ -414,8 +414,12 @@ def test_paged_kernel_gqa_group_not_dividing_tile():
 @pytest.mark.L0
 def test_paged_adapter_cuda_graph_replay_no_host_sync():
     """The adapter's execute path captured once at fixed B; seq_lens CONTENT
-    changes between replays.  ``set_sync_debug_mode("error")`` during capture
-    makes any blocking D2H raise (python/cudnn/AGENTS.md Rule 3)."""
+    changes between replays.  ``set_sync_debug_mode("error")`` around the
+    captured execute makes any blocking D2H raise (python/cudnn/AGENTS.md
+    Rule 3).  The mode is armed INSIDE the capture context: torch's own
+    ``CUDAGraph.capture_begin`` / ``capture_end`` synchronize the device, and
+    arming it outside them raises on torch's sync, not on the adapter's, and
+    leaves the stream capturing with no way to end it (an unusable context)."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     B, H, KH, P, max_pages = 8, 16, 4, 16, 64
@@ -448,12 +452,13 @@ def test_paged_adapter_cuda_graph_replay_no_host_sync():
         api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        with torch.cuda.graph(g, stream=s):
+    prev_sync_mode = torch.cuda.get_sync_debug_mode()
+    with torch.cuda.graph(g, stream=s):
+        torch.cuda.set_sync_debug_mode("error")
+        try:
             api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
+        finally:
+            torch.cuda.set_sync_debug_mode(prev_sync_mode)
     scale = 1.0 / math.sqrt(D)
     for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
         seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
