@@ -79,8 +79,8 @@ MMA as d=512.
 | Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ · ❌ᵍ |
 | Padding mask (`seq_len_q/kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | THD onlyᵇ ʰ · ❌ᵍ |
 | THD + causal family (top-left / bottom-right / SWA / band) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ʰ · ❌ᵍ |
-| Padding mask + stats (per-batch LSE trim) | ✅ | f16/fp8 only⁴ | f16/fp8 only⁴ | ✅ | f16/fp8 only⁴ | ❌ |
-| Dense padded-Q trim (O:=0, LSE:=−inf) | f16 only⁵ | f16 only⁵ | f16 only⁵ | ✅ | f16 only⁵ | ❌ |
+| Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ ʰ |
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -114,8 +114,8 @@ row has no `out_dtypes` domain and `facts.uniform_dtype` requires O == Q there.
 ² The d512 FP8 flavor serves head dims in (256, 512] on both axes; a smaller
 graph is declined rather than routed onto it at >2× zero-padding cost.
 ³ The d192×d128 fp8/mxfp8 kernels are dense-only; d512 has no MXFP8 kernel.
-⁴ MXFP8 lacks the `SEQ_Q_LENS_PRESENT` epilogue trim (`padded_stats=False`).
-⁵ FP8 and MXFP8 rows are not plumbed for the dense padded-Q trim.
+⁴ Every SM100 / SM103 flavor carries the `SEQ_Q_LENS_PRESENT` epilogue trim (f16, per-tensor FP8 and MXFP8 alike, #1037).
+⁵ Every forward kernel trims dense padded Q natively; there is no `dense_seq_q_trim` capability any more -- a graph with per-batch Q lengths compiles the trim specialization on every row.
 ⁶ Served through the padded path with synthesized full-length KV lengths, or
 natively when the causal band covers the KV tail.
 ⁷ **No d=64 kernel exists on SM100.** `_SM100_FLAVORS` is
@@ -279,8 +279,8 @@ red (2026-09-08).
 | Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Padding mask + stats (per-batch LSE trim) | ✅ | fp8 onlyᵛⁱ | fp8 onlyᵛⁱ | ❌ᵛⁱ | ❌ᵛⁱ | ❌ |
-| Dense padded-Q trim (O:=0, LSE:=−inf) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ | ❌ |
@@ -308,8 +308,7 @@ is covered by `test_sdpa_fwd_{fp8,mxfp8}_sm100.py` running on Rubin.
 revision. THD used to be unported on the f16 line (7-arg setup call against a
 14-arg helper, 3B+2 metadata where the shared decode reads 4B+4); every f16 and
 per-tensor FP8 flavor now carries the contract and serves it.
-ᵛⁱ Needs the per-batch `seq_len_q` LSE trim, which the f16 Rubin kernels do not
-carry (`padded_stats=False`). KV-side padding itself is served.
+ᵛⁱ Every Rubin template carries the per-batch `seq_len_q` trim (bounds collapse for tiles past the length, O:=0 / LSE:=−inf on the rows past it; #1037), so the rows claim `padded_stats`.
 ᵛⁱⁱ The f16 Rubin kernels wire no SplitHelpers.
 
 ᶻ **f16/bf16 THD is served on EVERY flavor** as of 2026-09-09 (d128, d192×d128,
@@ -528,7 +527,7 @@ feature-free d=64 graph.
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
-| f16/bf16 forward split-KV, PackGQA, dense padded-Q trim | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d192×d128/d256/d512, and THD on all of them as of 2026-09-09; these three are the machinery its kernels still lack (optional stats IS served — `lse_optional=True`) |
+| f16/bf16 forward split-KV, PackGQA | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d192×d128/d256/d512, THD on all of them as of 2026-09-09, and the dense padded-Q trim as of #1037; these two are the machinery its kernels still lack (optional stats IS served — `lse_optional=True`) |
 | d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD row-wide |
 | MXFP8 forward | SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
 | Per-tensor FP8 backward | every arch |

@@ -877,6 +877,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             lse_optional=True,
             thd=True,
             thd_padded_stats=True,
+            padded_stats=True,
             cu_seq_len=True,
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
@@ -999,8 +1000,6 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             thd=True,
             thd_padded_stats=True,
             cu_seq_len=True,
-            # D256 carries the dense padded-Q epilogue trim; the older D128 and
-            # D192/D128 siblings remain KV-padding-only for dense graphs.
             padded_stats=True,
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
@@ -1113,8 +1112,8 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     descriptor window at cga1.
 
     Declined deliberately, because the ported kernels lack the machinery (not
-    because it went untested): THD, split-KV, PackGQA, and the dense padded-Q
-    trim.  Optional stats IS served (``lse_optional=True`` below -- has_lse=False
+    because it went untested): THD, split-KV and PackGQA (the dense padded-Q
+    trim is carried since #1037).  Optional stats IS served (``lse_optional=True`` below -- has_lse=False
     is a real specialization on every Rubin kernel, not an accepted-and-ignored
     flag).  See _sm107_spec for the same list on f16.
     """
