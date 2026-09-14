@@ -380,7 +380,7 @@ def test_DSA_sparse_attention_backward_d576_2cta_dispatch_fallback(head_dim_v, d
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
 @pytest.mark.parametrize("head_dim", [512, 576], ids=["d512", "d576"])
 @torch_fork_set_rng(seed=20260829)
-def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_oob_indices(head_dim, has_topk_length, topk):
+def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_oob_indices(head_dim, has_topk_length, topk, monkeypatch):
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
@@ -434,6 +434,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
     dkv = torch.full_like(kv, float("nan"))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+    two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if head_dim == 576 else None
     result = DSA.sparse_attention_backward_wrapper(
         q,
         kv,
@@ -455,10 +456,8 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
             key[0] == "h128_2cta_m64" and key[-2:] == expected_cache_suffix for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
         ), "H128/D512 call did not execute the two-CTA backend"
     else:
-        # The D576 route compiles through its own plan cache; assert the selection instead.
-        assert _interface_sm100._select_sm100_backend(
-            num_heads, head_dim, head_dim_v=head_dim_v, dtype=dtype, max_topk=topk, device_capability=torch.cuda.get_device_capability()
-        ) == ("h128_d576_2cta_m64", 64)
+        # The D576 route compiles through its own plan cache; assert that its launch entry ran.
+        assert two_cta_calls, "H128/D576 call did not execute the two-CTA backend"
 
     assert not torch.isnan(result["dq"]).any()
     assert not torch.isnan(result["dkv"]).any()

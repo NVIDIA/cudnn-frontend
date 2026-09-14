@@ -192,9 +192,9 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward wrapper's
   - `attn_sink`: `(H,)` FP32
   - `topk_idxs`: `(total_S_q, topk_max)` INT32 (global)
   - `topk_length` (optional): `(total_S_q,)` INT32 — per-query valid count.
-    The H128/D576 two-CTA backend clamps it to `[0, topk_max]` and ignores
-    every slot after that prefix, including valid indices pointing to
-    nonfinite KV rows; the other backends expect `topk_length <= topk_max`.
+    The H128 two-CTA backends (D512 and D576) clamp it to `[0, topk_max]`
+    and ignore every slot after that prefix, including valid indices pointing
+    to nonfinite KV rows; the other backends expect `topk_length <= topk_max`.
     Omitting this tensor uses all `topk_max` slots.
 
 On Blackwell SM100/SM103, the public backward entry point automatically selects
