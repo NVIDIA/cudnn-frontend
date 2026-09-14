@@ -695,7 +695,7 @@ def make_sdpa_helpers(
             cga_base_super = q_super_idx - cta_in_pair
             q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
             arr = cutlass.make_array_view(seq_q_lens_tensor)
-            q_len_b = cutlass.Int32(arr[batch_idx])
+            q_len_b = cutlass.Int32(arr[cutlass.Int32(batch_idx)])  # batch_idx may arrive as a raw arith value from the decode
             tile_dead = q_row_coord >= q_len_b
             dead_lo = cutlass.Int32(arith.select(tile_dead.ir_value(), b.left.ir_value(), b.unmasked_lo.ir_value()))
             dead_hi = cutlass.Int32(arith.select(tile_dead.ir_value(), b.left.ir_value(), b.unmasked_hi.ir_value()))
@@ -731,7 +731,7 @@ def make_sdpa_helpers(
             return cutlass.Int32(cu[q0 + batch_idx + cutlass.Int32(1)]) - cutlass.Int32(cu[q0 + batch_idx])
         if cutlass.const_expr(int(getattr(CFG, "SEQ_Q_LENS_PRESENT", 0)) == 1 and int(CFG.BOTTOM_RIGHT) == 1):
             arr = cutlass.make_array_view(seq_q_lens_tensor)
-            return cute.math.max(cutlass.Int32(0), cute.math.min(cutlass.Int32(arr[batch_idx]), scalar_seqlen_q))
+            return cute.math.max(cutlass.Int32(0), cute.math.min(cutlass.Int32(arr[cutlass.Int32(batch_idx)]), scalar_seqlen_q))
         return scalar_seqlen_q
 
     _thd_on = int(getattr(CFG, "THD_VARLEN", 0))

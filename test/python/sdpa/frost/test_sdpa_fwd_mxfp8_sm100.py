@@ -561,10 +561,11 @@ def test_mxfp8_wide_dense_padding(d, in_key, causal):
 
 @_skip_dense_q_trim_on_rubin
 @pytest.mark.L1
-@pytest.mark.parametrize("d", [256, 512], ids=["d256", "d512"])
+@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_128", "d256", "d512"])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_wide_dense_q_trim_stats_sink(d):
-    """Short dense Q rows trim O/LSE even when a sink makes softmax finite."""
+def test_mxfp8_dense_q_trim_stats_sink(d, d_v):
+    """Short dense Q rows trim O/LSE even when a sink makes softmax finite --
+    on every SM100 MXFP8 flavor."""
     sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
     result = _run(
         2,
@@ -579,7 +580,7 @@ def test_mxfp8_wide_dense_q_trim_stats_sink(d):
         seq_lens_q=[129, 0],
         seq_lens_kv=[200, 256],
         d_qk=d,
-        d_v=d,
+        d_v=d_v,
         return_lse=True,
     )
     _check(result.output, result.reference, torch.float16, "e4m3", d_qk=d)

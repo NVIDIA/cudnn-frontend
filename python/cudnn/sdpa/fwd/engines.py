@@ -895,7 +895,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             thd=True,
             thd_padded_stats=True,
             cu_seq_len=True,
-            dense_seq_q_trim_d_shapes=frozenset({(256, 256), (512, 512)}),
+            dense_seq_q_trim=True,
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
@@ -1020,7 +1020,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # D256 carries the dense padded-Q epilogue trim; the older D128 and
             # D192/D128 siblings remain KV-padding-only for dense graphs.
             padded_stats=True,
-            dense_seq_q_trim_d_shapes=(frozenset() if rubin_row else frozenset({(256, 256)})),
+            # every SM100 flavor trims dense padded Q; the Rubin templates do not carry it yet
+            dense_seq_q_trim=not rubin_row,
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the

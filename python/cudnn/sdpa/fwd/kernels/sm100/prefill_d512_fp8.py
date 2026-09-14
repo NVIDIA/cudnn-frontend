@@ -2197,22 +2197,20 @@ def _host(
     descale_v_t: cute.Tensor,
     scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
+    # Dense padded-Q trim: separate (B,)-int32 per-batch Q lengths; None (and
+    # absent from the compiled ABI) unless CFG.SEQ_Q_LENS_PRESENT. Directly
+    # after amax_o, then the THD slots: the quantized adapter paths pass both
+    # positionally in that order (api_dsl._execute_fp8 / _execute_thd).
+    seq_q_lens_tensor: Optional[cute.Tensor] = None,
     # THD device metadata build (issue #552): the CALLER's Q/KV length
     # tensors — (B,) per-batch lengths or (B+1,) cu prefix sums, per side via
     # thd_lens_form (bit 0: Q is cu, bit 1: KV is cu) — consumed only by the
     # setup kernel, which writes the [kv|cu_q|cu_k] metadata buffer
     # (seq_kv_lens_tensor) device-side. None (folded out of the ABI) for
-    # dense graphs.  These sit DIRECTLY after amax_o because the FP8 adapter
-    # passes them positionally there (api_dsl._execute_fp8).
+    # dense graphs.
     thd_q_lens_tensor: Optional[cute.Tensor] = None,
     thd_kv_lens_tensor: Optional[cute.Tensor] = None,
     thd_lens_form: Optional[cutlass.Int32] = None,
-    # Dense padded-Q trim: separate (B,)-int32 per-batch Q lengths; None (and
-    # absent from the compiled ABI) unless CFG.SEQ_Q_LENS_PRESENT.  LAST in the
-    # list, after the THD slots, for the positional reason above — the FP8
-    # engine row does not declare dense_seq_q_trim today, so the flag is always
-    # 0 here and the parameter folds out.
-    seq_q_lens_tensor: Optional[cute.Tensor] = None,
     o_partial_f32: Optional[cute.Tensor] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -2576,10 +2574,10 @@ def compile(  # noqa: A001
         fake_descale_v,
         fake_scale_o,
         fake_amax_o,
+        fake_seq_q_lens,
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,
-        fake_seq_q_lens,
         *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",

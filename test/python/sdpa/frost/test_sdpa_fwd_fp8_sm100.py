@@ -716,11 +716,13 @@ def test_fp8_d256_padding(in_key, causal):
 
 
 @pytest.mark.L1
-@_skip_d256_on_rubin
+@pytest.mark.skipif(_SM == 107, reason="dense padded-Q trim not carried by the Rubin FP8 templates yet")
+@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_128", "d256"])
 @torch_fork_set_rng(seed=0)
-def test_fp8_d256_dense_q_trim_stats_sink():
-    """Short dense Q rows trim O/LSE even when a sink makes softmax finite."""
-    d = 256
+def test_fp8_dense_q_trim_stats_sink(d, d_v):
+    """Short dense Q rows trim O/LSE even when a sink makes softmax finite --
+    on every SM100 per-tensor FP8 flavor (FlashInfer hands per-batch Q lengths
+    with every padded dense graph)."""
     sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
     result = _run(
         2,
@@ -736,7 +738,7 @@ def test_fp8_d256_dense_q_trim_stats_sink():
         seq_lens_q=[129, 0],
         seq_lens_kv=[200, 256],
         d_qk=d,
-        d_v=d,
+        d_v=d_v,
         return_lse=True,
     )
     _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)

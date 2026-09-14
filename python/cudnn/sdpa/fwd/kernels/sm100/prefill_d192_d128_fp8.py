@@ -300,7 +300,9 @@ _sdpa_h = make_sdpa_helpers(
 )
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
-_bounds_for_tile = _sdpa_h.bounds_for_tile
+# qtrim variant: collapses the KV loop for CGA tiles entirely past the
+# per-batch actual Q length (SEQ_Q_LENS_PRESENT; folds to plain bounds otherwise).
+_bounds_for_tile = _sdpa_h.bounds_for_tile_qtrim
 _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 
 
@@ -342,15 +344,9 @@ _DENSE_ORDINARY_STORE_P_BEFORE_REDUCE = bool(
 )
 
 
-@cute.jit
-def _bounds_for_tile_uniform(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, qh_per_kh: int = 1):
-    """Uniform bounds signature for the shared KV-split helper."""
-    return _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, qh_per_kh)
-
-
 _split_h = make_split_helpers(
     CFG,
-    bounds_for_tile=_bounds_for_tile_uniform,
+    bounds_for_tile=_bounds_for_tile,
     dispatch_decode_initial=_dispatch_decode_initial,
     dispatch_decode_payload=_dispatch_decode_payload,
 )
@@ -376,7 +372,7 @@ _dispatch_decode_payload_mma = _sdpa_h_mma_runtime.dispatch_decode_payload
 
 _split_h_mma_runtime = make_split_helpers(
     CFG,
-    bounds_for_tile=_bounds_for_tile_uniform,
+    bounds_for_tile=_bounds_for_tile,
     dispatch_decode_initial=_dispatch_decode_initial_mma,
     dispatch_decode_payload=_dispatch_decode_payload_mma,
 )
@@ -402,6 +398,7 @@ def _load_effective_lengths(
     seqlen_q,
     seqlen_kv,
     n_batch,
+    seq_q_lens_tensor=None,
 ):
     if cutlass.const_expr(_PREDECODE_THD_LENGTHS):
         if cutlass.const_expr(initial):
@@ -416,7 +413,7 @@ def _load_effective_lengths(
             eff_seqlen_q = seqlen_q
         return eff_seqlen_q, eff_seqlen_kv
     return (
-        _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch),
+        _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor),
         _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv),
     )
 
@@ -428,8 +425,8 @@ def _swa_segment_bounds(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair):
         eff_seqlen_q,
         eff_seqlen_kv,
         cta_in_pair,
-        None,
-        None,
+        seq_q_lens_tensor,
+        batch_idx,
         cutlass.Int32(0),
         CFG.QH_PER_KH,
     )
@@ -688,6 +685,7 @@ def _kernel(
     descale_v_t: cute.Tensor,
     scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
+    seq_q_lens_tensor: Optional[cute.Tensor] = None,
     o_partial_f32: Optional[cute.Tensor] = None,
 ) -> None:
 
@@ -898,6 +896,7 @@ def _kernel(
             score_bars=score_bars,
             sched=sched,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_tensor=seq_q_lens_tensor,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
             n_batch=n_batch,
@@ -926,6 +925,7 @@ def _kernel(
             score_bars=score_bars,
             sched=sched,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_tensor=seq_q_lens_tensor,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
             n_batch=n_batch,
@@ -953,6 +953,7 @@ def _kernel(
             lse_tensor=lse_tensor,
             sinks_tensor=sinks_tensor,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_tensor=seq_q_lens_tensor,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
             n_batch=n_batch,
@@ -980,6 +981,7 @@ def _kernel(
                     score_bars=score_bars,
                     sched=sched,
                     seq_kv_lens_tensor=seq_kv_lens_tensor,
+                    seq_q_lens_tensor=seq_q_lens_tensor,
                     n_q_supers=n_q_supers,
                     n_qh=n_qh,
                     n_batch=n_batch,
@@ -1000,6 +1002,7 @@ def _kernel(
                 score_bars=score_bars,
                 sched=sched,
                 seq_kv_lens_tensor=seq_kv_lens_tensor,
+                seq_q_lens_tensor=seq_q_lens_tensor,
                 n_q_supers=n_q_supers,
                 n_qh=n_qh,
                 n_batch=n_batch,
@@ -1025,6 +1028,7 @@ def _kernel(
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_tensor=seq_q_lens_tensor,
             o_desc_words=o_desc_words,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
@@ -1047,6 +1051,7 @@ def _kernel(
             n_batch=n_batch,
             cta_in_pair=cta_in_pair,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_tensor=seq_q_lens_tensor,
             o_desc_words=o_desc_words,
         )
 
@@ -1087,6 +1092,7 @@ def _tmaldg_warp_group(
     seqlen_q,
     seqlen_kv,
     seq_kv_lens_tensor,
+    seq_q_lens_tensor,
     o_desc_words,
     n_q_supers,
     n_qh,
@@ -1141,8 +1147,10 @@ def _tmaldg_warp_group(
     elif cutlass.const_expr(CFG.MASK_FLAGS == 0):
         kv_left, kv_right = _nomask_range_split(seqlen_kv, split_idx)
     else:
-        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
-        bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
+        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
+            True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch, seq_q_lens_tensor
+        )
+        bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, CFG.QH_PER_KH)
         kv_left = bounds_init.left
         kv_right = bounds_init.right
 
@@ -1296,14 +1304,16 @@ def _tmaldg_warp_group(
                 kv_left = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(segment_base).load())
                 kv_right = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(segment_base + cutlass.Int32(4)).load())
             else:
-                eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
+                eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
+                    False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch, seq_q_lens_tensor
+                )
                 bounds_next = _bounds_for_tile_split(
                     q_super_idx,
                     eff_seqlen_q,
                     eff_seqlen_kv,
                     cta_in_pair,
-                    None,
-                    None,
+                    seq_q_lens_tensor,
+                    batch_idx,
                     split_idx,
                     CFG.QH_PER_KH,
                 )
@@ -1336,6 +1346,7 @@ def _tmastg_warp_group(
     n_batch,
     cta_in_pair,
     seq_kv_lens_tensor,
+    seq_q_lens_tensor,
     o_desc_words,
 ):
     """Persistent O-store warp; tiles claimed via scheduler's try_cancel.async."""
@@ -1462,6 +1473,7 @@ def _mma_warp_group(
     score_bars,
     sched,
     seq_kv_lens_tensor,
+    seq_q_lens_tensor,
     n_q_supers,
     n_qh,
     n_batch,
@@ -1546,8 +1558,8 @@ def _mma_warp_group(
             kv_left, kv_right = _nomask_range_split(seqlen_kv, split_idx)
         else:
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
-            bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor)
+            bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, CFG.QH_PER_KH)
             kv_left = bounds_init.left
             kv_right = bounds_init.right
 
@@ -1796,8 +1808,10 @@ def _mma_warp_group(
                 kv_left, kv_right = _nomask_range_split(seqlen_kv, split_idx)
             else:
                 eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-                eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
-                bounds_next = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
+                eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor)
+                bounds_next = _bounds_for_tile_split(
+                    q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, CFG.QH_PER_KH
+                )
                 kv_left = bounds_next.left
                 kv_right = bounds_next.right
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -2103,6 +2117,7 @@ def _softmax_warp_group(
     score_bars,
     sched,
     seq_kv_lens_tensor,
+    seq_q_lens_tensor,
     n_q_supers,
     n_qh,
     n_batch,
@@ -2144,7 +2159,9 @@ def _softmax_warp_group(
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
 
-    eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
+    eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
+        True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch, seq_q_lens_tensor
+    )
     if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
         decoded_swa_left, decoded_swa_left_pad_start, decoded_swa_left_end, decoded_swa_right_start, decoded_swa_right = _load_swa_segment_bounds(
             True, sched, cutlass.Int32(0)
@@ -2156,7 +2173,7 @@ def _softmax_warp_group(
             right=decoded_swa_right,
         )
     else:
-        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
+        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, CFG.QH_PER_KH)
 
     if cutlass.const_expr(MERGE_SOFTMAX_WGS):
         softmax_wg_base = cutlass.Int32(CFG.SOFTMAX_WG0_BASE) + sub_tile_id * cutlass.Int32(CFG.SOFTMAX_WG1_BASE - CFG.SOFTMAX_WG0_BASE)
@@ -2301,7 +2318,9 @@ def _softmax_warp_group(
         if cutlass.const_expr(SPLIT_KV > 1):
             split_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(decoded_base + cutlass.Int32(4)).load())
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
-        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
+        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
+            False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch, seq_q_lens_tensor
+        )
         if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
             decoded_swa_left, decoded_swa_left_pad_start, decoded_swa_left_end, decoded_swa_right_start, decoded_swa_right = _load_swa_segment_bounds(
                 False, sched, decoded_base
@@ -2313,7 +2332,7 @@ def _softmax_warp_group(
                 right=decoded_swa_right,
             )
         else:
-            bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
+            bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, CFG.QH_PER_KH)
 
 
 @cute.jit
@@ -2329,6 +2348,7 @@ def _correction_warp_group(
     lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor,
+    seq_q_lens_tensor,
     n_q_supers,
     n_qh,
     n_batch,
@@ -2374,8 +2394,10 @@ def _correction_warp_group(
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
 
-    eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
-    bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
+    eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
+        True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch, seq_q_lens_tensor
+    )
+    bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, CFG.QH_PER_KH)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -2503,6 +2525,20 @@ def _correction_warp_group(
                     )
                 )
                 inv_sum = o_scale_fused * beta
+
+            if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
+                # Dense padded-Q trim: q rows >= seq_len_q[b] write O := 0 / LSE := -inf,
+                # applied AFTER the sink branch (a trimmed row is dead even with a sink).
+                # Folded into row_dead so the O store's select sanitizes the row even
+                # when the padded Q rows held NaN (0 * NaN is NaN).
+                _sq_arr = cutlass.make_array_view(seq_q_lens_tensor)
+                _q_len_b = cutlass.Int32(_sq_arr[batch_idx])
+                row_trim = q_row_global >= _q_len_b
+                neg_inf_trim = cutlass.Float32(float("-inf"))
+                lse_val = cutlass.Float32(arith.select(row_trim.ir_value(), neg_inf_trim.ir_value(), lse_val.ir_value()))
+                inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
+                beta = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
+                row_dead = row_dead | row_trim
 
             # cga2 OOB-row guard: cluster Q rows can exceed the live sequence.
             if cutlass.const_expr(CFG.THD_VARLEN):
@@ -2711,8 +2747,10 @@ def _correction_warp_group(
         if cutlass.const_expr(SPLIT_KV > 1):
             split_idx = sched.tile_id_smem.subview(decoded_base + cutlass.Int32(4)).load()
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
-        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
-        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
+        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
+            False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch, seq_q_lens_tensor
+        )
+        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, CFG.QH_PER_KH)
 
     # tmem_dealloc fan-out: fire one arrive per lane; cga2 also DSMEM-arrives
     # on the peer so peer's local mbar accumulates the full CGA count.
@@ -2744,6 +2782,9 @@ def _host(
     descale_v_t: cute.Tensor,
     scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
+    # Dense padded-Q trim: separate (B,)-int32 lengths. None folds the
+    # parameter and all consumers out when the specialization is disabled.
+    seq_q_lens_tensor: Optional[cute.Tensor] = None,
     thd_q_lens_tensor: Optional[cute.Tensor] = None,
     thd_kv_lens_tensor: Optional[cute.Tensor] = None,
     thd_lens_form: Optional[cutlass.Int32] = None,
@@ -2884,6 +2925,7 @@ def _host(
         descale_v_t,
         scale_o_t,
         amax_o_tensor,
+        seq_q_lens_tensor,
         o_partial_f32,
     ).launch(
         grid=grid_shape,
@@ -3059,6 +3101,8 @@ def compile(  # noqa: A001
             assumed_align=4,
         )
 
+    fake_seq_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=4) if CFG.SEQ_Q_LENS_PRESENT else None
+
     fake_o_desc = cute.runtime.make_fake_compact_tensor(
         cutlass.Int64,
         ((cute.sym_int(divisibility=1) if dynamic_bhk else (((b + 3) * _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1)),),
@@ -3092,6 +3136,7 @@ def compile(  # noqa: A001
         _fake_scale(),
         _fake_scale(),
         fake_amax_o,
+        fake_seq_q_lens,
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,
