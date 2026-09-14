@@ -2690,6 +2690,17 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         i0 = hoist_band_indices[h_group][2 * pair]
                         i1 = hoist_band_indices[h_group][2 * pair + 1]
                         v0, v1 = cute.arch.fma_packed_f32x2((r_score[i0], r_score[i1]), (softmax_scale_log2_e, softmax_scale_log2_e), (lse, lse))
+                        # Invalid slots carry zero-filled K and V, so their score
+                        # is exactly zero and this argument equals the folded
+                        # negative LSE, which exceeds 128 (exp2 overflow) when
+                        # every valid logit and the sink are far below zero.  A
+                        # valid slot's argument is log2 of a probability, never
+                        # above about log2(N_TILE), so clamping at 64 changes no
+                        # valid value while keeping P and dS finite; the zero K
+                        # and V rows then contribute exact zeros to dQ, and the
+                        # rows are never scattered to dKV.
+                        v0 = cute.arch.fmin(v0, Float32(64.0))
+                        v1 = cute.arch.fmin(v1, Float32(64.0))
                         v0 = cute.math.exp2(v0, fastmath=True)
                         v1 = cute.math.exp2(v1, fastmath=True)
                         r_score[i0] = v0
