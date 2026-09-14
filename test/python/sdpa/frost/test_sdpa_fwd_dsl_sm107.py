@@ -317,13 +317,15 @@ def test_sm107_f16_declines_split_kv_and_pack_gqa():
     assert engines.mismatch(caps, _f16_facts(), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
 
 
-def test_sm107_f16_declines_the_stats_trim_it_lacks():
-    """padded_stats / dense_seq_q_trim both need the per-batch seq_len_q LSE
-    trim (padded q rows write LSE=-inf, O=0), which these kernels do not
-    carry.  INVERTS-WHEN that epilogue lands."""
-    caps = _caps("sdpa_fwd_prefill_sm107")
-    assert caps.padded_stats is False
-    assert caps.dense_seq_q_trim is False
+def test_sm107_rows_carry_the_padded_stats_trim():
+    """Every Rubin template carries the per-batch seq_len_q trim (padded q
+    rows write LSE=-inf, O=0), so the rows serve dense padded Stats and the
+    Capabilities record has no dense_seq_q_trim field left to declare."""
+    from cudnn.sdpa.fwd import engines
+
+    for row in ("sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_prefill_sm107_mxfp8"):
+        assert _caps(row).padded_stats is True, row
+    assert not hasattr(engines.Capabilities, "dense_seq_q_trim")
 
 
 def test_sm107_rows_serve_natural_scheduling_only():

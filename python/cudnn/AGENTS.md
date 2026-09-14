@@ -124,13 +124,6 @@ neither names the thing that breaks it most directly: a device-to-host read.
 Known violations, all pre-existing and each needing a kernel-side change, so
 none is precedent:
 
-- The FP8/MXFP8 `seq_len_q` guard in `sdpa/fwd/engines.py`. This one cannot be
-  lifted to `check_support()`: `use_padding_mask=True` requires a `seq_len_q`
-  tensor even when only KV is padded, so no static rule separates "declares
-  per-batch Q lengths" from "the lengths are actually short" — declining the
-  declaration would drop the KV-only-padding population these kernels serve
-  correctly. It goes away when the FP8 kernels get the epilogue trim; until
-  then the read is what keeps a short length from being silently ignored.
 - `cu_seqlens_{q,k}.to(dtype=..., device="cpu")` in the SM80 packed-THD backward
   (`sdpa/bwd/kernels/bprop_f16_sm80.py`). Reachable only through the standalone
   wrapper: the registered `sdpa_bwd_sm80` spec declares `thd=False`, so

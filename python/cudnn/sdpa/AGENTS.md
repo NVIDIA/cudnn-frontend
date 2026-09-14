@@ -44,7 +44,7 @@ head-major, never dense-padded.**
   `out_dtypes`, `d_shapes` / `d_pad_multiple` / `d_envelope_floors` /
   `thd_d_shapes`, the mask and feature booleans (`causal`, `bottom_right`,
   `right_band_widening`, `swa`, `padded`, `padded_stats`,
-  `dense_seq_q_trim`, `sink`, `thd`, `cu_seq_len`, `bias`, `decode`,
+  `sink`, `thd`, `cu_seq_len`, `bias`, `decode`,
   `layouts`, ...), and adding or retiring an `EngineSpec` row. A change
   confined to knob domains (`tile_ms`, `sched_policies`, ...) does not
   need a matrix edit — the matrix deliberately does not track knobs.

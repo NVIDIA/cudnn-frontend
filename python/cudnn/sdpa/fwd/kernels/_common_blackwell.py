@@ -319,7 +319,7 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
     """Split-aware decode / bounds closures shared by the SM100 prefill flavors.
 
     ``bounds_for_tile`` is the caller's own bounds closure, taking
-    ``(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor,
+    ``(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_addr,
     batch_idx, qh_per_kh)`` — flavors differ in whether they apply the
     dead-Q-tile trim, so the split narrowing composes on top of whatever they
     already do.  ``qh_per_kh`` (trailing, default 1) is the graph's GQA
@@ -440,7 +440,7 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
         return q, h, b % n_batch, b // n_batch
 
     @cute.jit
-    def _bounds_for_tile_split(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, qh_per_kh: int = 1):
+    def _bounds_for_tile_split(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, qh_per_kh: int = 1):
         """The flavor's (possibly packed) bounds, narrowed to this split's slice
         of the KV range.
 
@@ -452,7 +452,7 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
         preserves the ``left <= unmasked_lo <= unmasked_hi <= right`` invariant
         the mainloop relies on, because clamping is monotone.
         """
-        b = bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, qh_per_kh)
+        b = bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, qh_per_kh)
         if cutlass.const_expr(SPLIT_KV == 1):
             return b
         lo, hi = _split_chunk(b.left, b.right, split_idx)
@@ -667,14 +667,14 @@ def make_sdpa_helpers(
         )
 
     @cute.jit
-    def _bounds_for_tile_qtrim(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, qh_per_kh: int = 1):
+    def _bounds_for_tile_qtrim(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, qh_per_kh: int = 1):
         """bounds_for_tile + cuDNN-style dead-Q-tile KV-loop collapse.
 
         Mirrors cuDNN fort (mma_pipeline_op_native_sdpa_prefill_sm100_nonfp8
         .cpp:916-921): when the CGA tile's base Q row is at/past this batch's
         actual Q length (SEQ_Q_LENS_PRESENT dense padded-Q trim; q lens are
-        the SEPARATE (B,)-int32 ``seq_q_lens_tensor`` kernel parameter — cuDNN
-        SEQLEN_Q / FA seqused_q style — ``None`` unless the flag is set, so
+        the SEPARATE (B,)-int32 ``seq_q_lens_addr`` kernel parameter — cuDNN
+        SEQLEN_Q / FA seqused_q style — ``0`` unless the flag is set, so
         the read below folds out with the branch), collapse the KV loop to
         empty (right := left, matching the SWA empty-tile machinery) — the
         grid stays padded-sized and a dead tile costs prologue+epilogue only.
@@ -694,8 +694,8 @@ def make_sdpa_helpers(
             tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
             cga_base_super = q_super_idx - cta_in_pair
             q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
-            arr = cutlass.make_array_view(seq_q_lens_tensor)
-            q_len_b = cutlass.Int32(arr[batch_idx])
+            arr = cute.make_tensor(cute.make_ptr(cutlass.Int32, seq_q_lens_addr, cute.AddressSpace.gmem, assumed_align=4), cute.make_layout(1 << 24))
+            q_len_b = cutlass.Int32(arr[cutlass.Int32(batch_idx)])  # batch_idx may arrive as a raw arith value from the decode
             tile_dead = q_row_coord >= q_len_b
             dead_lo = cutlass.Int32(arith.select(tile_dead.ir_value(), b.left.ir_value(), b.unmasked_lo.ir_value()))
             dead_hi = cutlass.Int32(arith.select(tile_dead.ir_value(), b.left.ir_value(), b.unmasked_hi.ir_value()))
@@ -707,11 +707,11 @@ def make_sdpa_helpers(
     def _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, scalar_seqlen_kv):
         if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT == 1):
             arr = cutlass.make_array_view(seq_kv_lens_tensor)
-            return cutlass.Int32(arr[batch_idx])
+            return cutlass.Int32(arr[cutlass.Int32(batch_idx)])  # batch_idx may be a raw arith value after a payload read
         return scalar_seqlen_kv
 
     @cute.jit
-    def _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, scalar_seqlen_q, n_batch, seq_q_lens_tensor=None):
+    def _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, scalar_seqlen_q, n_batch, seq_q_lens_addr=0):
         """Per-batch Q length for the bottom-right causal diagonal.
 
         Bottom-right anchors the diagonal at the per-batch corner
@@ -719,7 +719,7 @@ def make_sdpa_helpers(
         cu_seqlen_q difference from the packed [kv_lens | cu_q | cu_kv] metadata
         buffer (same layout _thd_decode / _thd_tma_offsets read); dense padded
         graphs carrying per-batch Q lengths read the SEPARATE (B,)-int32
-        ``seq_q_lens_tensor`` (cuDNN SEQLEN_Q style), clamped to [0, S_q].
+        ``seq_q_lens_addr`` (cuDNN SEQLEN_Q style), clamped to [0, S_q].
         KV-only padding (and every non-BR mask, where seqlen_q only feeds the
         unused diagonal) keeps the scalar S_q, so both reads fold out unless
         CAUSAL_BOTTOM_RIGHT is set together with THD_VARLEN or
@@ -730,8 +730,8 @@ def make_sdpa_helpers(
             q0 = n_batch
             return cutlass.Int32(cu[q0 + batch_idx + cutlass.Int32(1)]) - cutlass.Int32(cu[q0 + batch_idx])
         if cutlass.const_expr(int(getattr(CFG, "SEQ_Q_LENS_PRESENT", 0)) == 1 and int(CFG.BOTTOM_RIGHT) == 1):
-            arr = cutlass.make_array_view(seq_q_lens_tensor)
-            return cute.math.max(cutlass.Int32(0), cute.math.min(cutlass.Int32(arr[batch_idx]), scalar_seqlen_q))
+            arr = cute.make_tensor(cute.make_ptr(cutlass.Int32, seq_q_lens_addr, cute.AddressSpace.gmem, assumed_align=4), cute.make_layout(1 << 24))
+            return cute.math.max(cutlass.Int32(0), cute.math.min(cutlass.Int32(arr[cutlass.Int32(batch_idx)]), scalar_seqlen_q))
         return scalar_seqlen_q
 
     _thd_on = int(getattr(CFG, "THD_VARLEN", 0))

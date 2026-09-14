@@ -55,6 +55,15 @@ from cudnn.sdpa.fwd.config_sm120 import (
 )
 
 
+def _q_lens_addr(t: Optional[torch.Tensor]) -> int:
+    """Kernel-side slot for the per-batch Q lengths: the (B,) int32 tensor's device address, 0 when absent.
+
+    A raw Int64 scalar rather than a tensor parameter: on SM107 prefill_d512_mxfp8 the extra cute.Tensor parameter
+    alone pushed ptxas from 159 to 254 registers (+28 percent device time); the same reads through a raw pointer
+    cost nothing. The caller keeps the tensor alive across execute (it is the graph's own seq_len_q buffer)."""
+    return 0 if t is None else int(t.data_ptr())
+
+
 def dtype_name(buffer) -> str:
     """The buffer's dtype as a bare name, whoever produced it.
 
@@ -1132,8 +1141,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     @property
     def _quantized_q_lens_abi(self) -> bool:
-        """Whether the selected quantized kernel has the dense Q-length slot."""
-        return self._fp8 and (self.flavor == (256, 256) or (self._device_cc != (10, 7) and not self._pertensor and self.flavor == (512, 512)))
+        """Whether the selected quantized kernel takes the dense Q-length slot
+        positionally after amax_o: every fp8 / mxfp8 flavor on every arch line."""
+        return self._fp8
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
@@ -1917,6 +1927,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "this specialization was compiled without sink support; construct the API with has_sink=True",
         )
         self._check_seq_lens_contract(seq_q_lens, seq_kv_lens)
+        if self.seq_q_lens_present:
+            # Dense Q lengths are passed as a raw address, so validate the
+            # storage before bypassing the compiled launcher's tensor binding.
+            self._value_error_if(
+                seq_q_lens.device.type != "cuda" or seq_q_lens.device.index != q_tensor.device.index,
+                f"seq_q_lens must be a CUDA tensor on the same device as q_tensor ({q_tensor.device}); got {seq_q_lens.device}",
+            )
         self._value_error_if(
             self.lse_desc is not None and lse_tensor is None,
             "lse_tensor is required by this compiled specialization",
@@ -2031,9 +2048,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             else self._dummy("seq_kv", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
         )
         # Dense padded-Q trim: per-batch Q lengths are their OWN kernel
-        # parameter (compiled in only when seq_q_lens_present — the kernel
-        # signature is specialized on `None`, so the flag-off ABI is
-        # unchanged). The caller's (B,)-int32 device tensor is bound directly
+        # Int64 address parameter (0 when absent; all reads fold out unless
+        # seq_q_lens_present). The caller's (B,)-int32 device tensor is bound
         # as a validated view — zero allocations/copies on the execute hot
         # path, stable pointer (CUDA-graph-capture friendly).
         seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
@@ -2064,7 +2080,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 (b, h, self.h_kv, sq, self.s_k_max, 0),
                 cutlass.Float32(scale_softmax_log2),
                 cutlass.Int32(0),
-                seq_q_t,
+                _q_lens_addr(seq_q_t),
                 **({"o_partial_f32": o_partial} if self._fp32_partial_split() else {}),
                 **paged_kwargs,
                 stream=current_stream,
@@ -2093,7 +2109,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 (self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, 0),
                 cutlass.Float32(scale_softmax_log2),
                 cutlass.Int32(0),
-                seq_q_t,
+                _q_lens_addr(seq_q_t),
                 **({"o_partial_f32": o_partial} if self._fp32_partial_split() else {}),
                 **paged_kwargs,
                 stream=current_stream,
@@ -2479,7 +2495,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             (self.batch_size, self.h_q, self.h_kv, 0, 0, 0),
             cutlass.Float32(scale_softmax_log2),
             cutlass.Int32(pack.units),
-            None,
+            0,  # seq_q_lens_addr: dense-only, unread on the paged path
             pack.q_lens_dev,
             pack.kv_lens_dev,
             cutlass.Int32(pack.lens_form),
@@ -2628,7 +2644,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # already built (packed totals + SF tile extents are dynamic).
             fn = km.compile(**self._thd_compile_kwargs())
             thd_lens_args = (
-                (None, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
+                (0, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))  # 0: no dense Q-length address on THD
                 if self._quantized_q_lens_abi
                 else (pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
             )
@@ -2693,7 +2709,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
             O_dst, lse_dst = self._split_partials(workspace, device, current_stream)
-        dense_q_lens_args = (seq_q_t,) if self._quantized_q_lens_abi else ()
+        dense_q_lens_args = (_q_lens_addr(seq_q_t),) if self._quantized_q_lens_abi else ()
         self._compiled_kernel(
             Q,
             K,
@@ -2810,7 +2826,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # already built (the packed totals are dynamic extents).
             fn = self._k_mod.compile(**self._thd_compile_kwargs())
             thd_lens_args = (
-                (None, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
+                (0, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))  # 0: no dense Q-length address on THD
                 if self._quantized_q_lens_abi
                 else (pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
             )
@@ -2877,7 +2893,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
             O_dst, lse_dst = self._split_partials(workspace, device, current_stream)
-        dense_q_lens_args = (seq_q_t,) if self._quantized_q_lens_abi else ()
+        dense_q_lens_args = (_q_lens_addr(seq_q_t),) if self._quantized_q_lens_abi else ()
         self._compiled_kernel(
             Q,
             K,
@@ -3857,7 +3873,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.O if pack is not None else o_dst,
             lse_dst,
             sinks_t,
-            pack.seq_q_dummy if pack is not None else seq_q_t,
+            pack.seq_q_dummy if pack is not None else seq_q_t,  # SM120 kernels keep a tensor slot
             pack.meta if pack is not None else seq_kv_t,
             amax_o_buf.view(torch.int32),
             cutlass.Float32(scale_softmax_log2),
@@ -4130,7 +4146,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.O,
             lse,
             sinks_t,
-            pack.seq_q_dummy,
+            pack.seq_q_dummy,  # SM120 kernels keep a tensor slot
             pack.meta,
             cutlass.Float32(scale_softmax_log2),
             cutlass.Int32(pack.max_sq),

@@ -357,7 +357,7 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
         (B, H, KH, 1, 0, 0),
         cutlass.Float32(scale * math.log2(math.e)),
         cutlass.Int32(0),
-        None,
+        0,  # seq_q_lens_addr: no per-batch Q lengths
         **_partial_kwargs(splits, o_p),
         block_table_tensor=bt,
         block_table_v_tensor=bt,
