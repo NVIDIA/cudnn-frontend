@@ -167,6 +167,11 @@ class IndexerBackwardSm90:
         self.SCHED_BARRIER_WG0 = 4
         self.SCHED_BARRIER_WG1 = 5
 
+        # dK staging-buffer lifetime barriers.  Each compute WG owns a
+        # disjoint D/2 half, so they can synchronize independently.
+        self.DK_STAGING_BARRIER_WG0 = 6
+        self.DK_STAGING_BARRIER_WG1 = 7
+
     @cute.jit
     def _dense_num_k_blocks(self, q_token, seqlen_q, seqlen_k, q_causal_offset):
         """Return dense K blocks that can contain valid ratio-causal columns."""
@@ -673,6 +678,7 @@ class IndexerBackwardSm90:
         compute_wg_idx,
     ):
         wg_tidx = tidx % self.WARPGROUP_SIZE
+        dk_staging_barrier_id = self.DK_STAGING_BARRIER_WG0 if compute_wg_idx == 0 else self.DK_STAGING_BARRIER_WG1
 
         # ---- Step 0: Load Q (TMA), grad_signal, weights — 256 threads cooperate ----
         self._load_q_and_scores(
@@ -951,6 +957,15 @@ class IndexerBackwardSm90:
             # reading sdK_staging before we overwrite it (both WGs do their own reduce)
             cute.arch.cp_async_bulk_wait_group(0, read=True)
 
+            # The bulk-group wait is thread-local, while the MMA accumulator is
+            # scattered across all threads in the two compute WGs.  Make sure
+            # every thread has finished its previous staging-buffer read before
+            # any thread starts overwriting fragments owned by a different row.
+            cute.arch.barrier(
+                barrier_id=dk_staging_barrier_id,
+                number_of_threads=self.WARPGROUP_SIZE,
+            )
+
             # Stage acc_dK × sm_scale to SMEM via partition (no cute.get needed)
             for ei in cutlass.range(0, cute.size(acc_dK), unroll=64):
                 tCsDK_staging[ei] = acc_dK[ei] * Float32(sm_scale)
@@ -958,6 +973,15 @@ class IndexerBackwardSm90:
             warpgroup.wait_group(0)  # GEMM3 done — sK no longer needed
 
             cute.arch.fence_view_async_shared()
+
+            # A row's 64 FP32 values are produced by multiple threads, while
+            # the row-reduce launchers issue one bulk reduce per row. The proxy
+            # fence publishes each producer's writes; this execution barrier
+            # makes every launcher wait for all producers in the warpgroup.
+            cute.arch.barrier(
+                barrier_id=dk_staging_barrier_id,
+                number_of_threads=self.WARPGROUP_SIZE,
+            )
 
             # Per-WG dK bulk reduce: each WG handles its D/2 half independently
             my_ni = wg_tidx
