@@ -5,8 +5,6 @@
 
 #pragma once
 
-#include <algorithm>
-#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -96,17 +94,8 @@ create_engine(backend_descriptor& engine,
     }
 
 #if (CUDNN_VERSION >= 92700)
-    // A backend value of zero means no limit was specified. Leave non-positive
-    // frontend limits to the existing engine-config filter so its semantics do not change.
-    if (shared_memory_limit > 0 && detail::get_backend_version() >= 92700) {
-        auto const backend_shared_memory_limit =
-            static_cast<int32_t>(std::min<int64_t>(shared_memory_limit, std::numeric_limits<int32_t>::max()));
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(engine.get_ptr(),
-                                                       CUDNN_ATTR_ENGINE_SHARED_MEMORY_LIMIT,
-                                                       CUDNN_TYPE_INT32,
-                                                       1,
-                                                       &backend_shared_memory_limit));
-    }
+    _CUDNN_CHECK_CUDNN_ERROR(detail::set_shared_memory_limit_if_supported(
+        engine.get_ptr(), CUDNN_ATTR_ENGINE_SHARED_MEMORY_LIMIT, shared_memory_limit));
 #else
     (void)shared_memory_limit;
 #endif
