@@ -2489,7 +2489,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             (self.batch_size, self.h_q, self.h_kv, 0, 0, 0),
             cutlass.Float32(scale_softmax_log2),
             cutlass.Int32(pack.units),
-            None,
+            0,  # seq_q_lens_addr: dense-only, unread on the paged path
             pack.q_lens_dev,
             pack.kv_lens_dev,
             cutlass.Int32(pack.lens_form),
@@ -2638,7 +2638,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # already built (packed totals + SF tile extents are dynamic).
             fn = km.compile(**self._thd_compile_kwargs())
             thd_lens_args = (
-                (None, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
+                (0, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))  # 0: no dense Q-length address on THD
                 if self._quantized_q_lens_abi
                 else (pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
             )
@@ -2820,7 +2820,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # already built (the packed totals are dynamic extents).
             fn = self._k_mod.compile(**self._thd_compile_kwargs())
             thd_lens_args = (
-                (None, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
+                (0, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))  # 0: no dense Q-length address on THD
                 if self._quantized_q_lens_abi
                 else (pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
             )
