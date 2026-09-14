@@ -583,6 +583,16 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         dK.set_ragged_offset(k_ragged_offset)
         dV.set_ragged_offset(v_ragged_offset)
         dO.set_ragged_offset(o_ragged_offset)
+        if cfg.with_ragged_offset_multiplier:
+            # the offset tables are in multiplier units; the gradients share Q/K/V/O's tables
+            q.set_ragged_offset_multiplier(cfg.d_qk)
+            k.set_ragged_offset_multiplier(cfg.d_qk)
+            v.set_ragged_offset_multiplier(cfg.d_v)
+            o.set_ragged_offset_multiplier(cfg.d_v)
+            dQ.set_ragged_offset_multiplier(cfg.d_qk)
+            dK.set_ragged_offset_multiplier(cfg.d_qk)
+            dV.set_ragged_offset_multiplier(cfg.d_v)
+            dO.set_ragged_offset_multiplier(cfg.d_v)
 
     try:
         graph.validate()

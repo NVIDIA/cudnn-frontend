@@ -268,7 +268,7 @@ def test_sdpa_random_bwd_unified_L0(env_info, test_no, request, cudnn_handle):
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "ragged_mult" : 1, "padded" : 1, "full" : 2}),  # ragged/padded reach the unified engine on SM100/SM107 (composite elsewhere under AUTO)
         is_deterministic=RandomChoice({True : 0, False : 1}),
         with_sink_token=RandomChoice({True : 0, False : 1}),
     ) as randomization_ctx:
