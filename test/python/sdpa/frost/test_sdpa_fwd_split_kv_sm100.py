@@ -135,7 +135,7 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
         (B, H, KH, SQ, SKV, 0),
         cutlass.Float32(scale * math.log2(math.e)),
         cutlass.Int32(0),
-        None,
+        0,  # seq_q_lens_addr: no per-batch Q lengths
         **_partial_kwargs(splits, o_p),
         stream=stream,
     )
@@ -468,7 +468,7 @@ def test_empty_splits_every_flavor(flavor):
         (B, H, H, SQ, SKV, 0),
         cutlass.Float32(scale * _math.log2(_math.e)),
         cutlass.Int32(0),
-        None,
+        0,  # seq_q_lens_addr: no per-batch Q lengths
         **_partial_kwargs(S, o_p),
         stream=stream,
     )
@@ -796,7 +796,7 @@ def test_combine_lse_matches_reference(splits):
         (B, H, H, SQ, SKV, 0),
         cutlass.Float32(scale * math.log2(math.e)),
         cutlass.Int32(0),
-        None,
+        0,  # seq_q_lens_addr: no per-batch Q lengths
         **_partial_kwargs(splits, o_p),
         stream=stream,
     )
@@ -867,7 +867,7 @@ def test_even_splits_every_flavor_batched(flavor, dtype):
         (B, H, H, SQ, SKV, 0),
         cutlass.Float32(scale * math.log2(math.e)),
         cutlass.Int32(0),
-        None,
+        0,  # seq_q_lens_addr: no per-batch Q lengths
         **_partial_kwargs(S, o_p),
         stream=stream,
     )
@@ -931,7 +931,7 @@ def _run_masked(kfile, d_qk, d_v, splits, *, B, H, KH, SQ, SKV, tp_kwargs, seq_k
         (B, H, KH, SQ, SKV, 0),
         cutlass.Float32(scale * math.log2(math.e)),
         cutlass.Int32(0),
-        seq_q_lens,
+        (seq_q_lens.data_ptr() if seq_q_lens is not None else 0),  # seq_q_lens_addr
         **_partial_kwargs(splits, o_p),
         stream=stream,
     )
