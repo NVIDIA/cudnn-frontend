@@ -1534,6 +1534,23 @@ def _compute_warp_group(
             # (measured -2.359e+38 instead of -inf), and beta becomes 1e30 so
             # O is (TMEM residue) * 1e30.
             _row_empty = final_ell == cutlass.Float32(0.0)
+            # A row with no live key inside a live tile -- bottom-right rows above the diagonal, a left band
+            # past the last key -- read off the mask geometry: the finite mask sentinel leaves final_ell at N
+            # (or NaN once the scaled sentinel overflows), so the local test above cannot see it.
+            if cutlass.const_expr(CFG.MASK_FLAGS != 0):
+                _q_row_geo = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + tid_in_wg
+                _diag = (eff_seqlen_kv - eff_seqlen_q) if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+                _last_k = eff_seqlen_kv - cutlass.Int32(1)
+                if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
+                    _last_k = cute.math.min(_last_k, _q_row_geo + _diag + cutlass.Int32(CFG.WINDOW_RIGHT))
+                _first_k = cutlass.Int32(0)
+                if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
+                    _first_k = cute.math.max(_first_k, _q_row_geo + _diag - cutlass.Int32(CFG.WINDOW_LEFT))
+                _row_empty = _row_empty | (_first_k > _last_k)
+            if cutlass.const_expr(CFG.HAS_SINK):
+                # A keyless row with a sink holds the sink's mass alone: LSE = sink_logit, selected rather than
+                # computed (the overflowed sentinel NaNs the fold); O is zeroed by the _row_empty select below.
+                lse = cutlass.Float32(arith.select(_row_empty.ir_value(), cutlass.Float32(sink_logit).ir_value(), lse.ir_value()))
             if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
                 # Dense padded-Q trim: rows >= seq_len_q[b] are dead -- O := 0 through the
                 # _row_empty select below, LSE := -inf (even with a sink), beta := 0. The
