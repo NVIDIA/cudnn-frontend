@@ -19,15 +19,19 @@
 // Two edits from the campaign artifact, both mechanical:
 //   * the host launcher (kda_launch / kda_workspace_bytes) is removed -- NVRTC
 //     compiles device code only, and the launch is reproduced in cuda_host.py;
-//   * kda_fused is given C linkage so it can be looked up by plain name.
+//   * kda_fused is given C linkage so it can be looked up by plain name;
+//   * the two host-only includes are replaced (see below).
 // The device code itself is unmodified.
 
-#include "kda.cuh"
+// "kda.cuh" declared only kda_launch/kda_workspace_bytes, both removed above,
+// and <cstdint> is a host C++ header NVRTC does not ship. NVRTC gets the two
+// fixed-width types this body actually uses directly; nvcc supplied them
+// through the <cuda_runtime.h> chain.
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
 
 #include <cuda_bf16.h>
 #include <mma.h>
-
-#include <cstdint>
 
 namespace {
 
@@ -906,4 +910,14 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
 
 // Host-readable copy of the kernel's dynamic shared-memory requirement, so the
 // launcher never has to restate sizeof(FusedSmem) and cannot drift from it.
-extern "C" __device__ unsigned long long kda_fused_smem_bytes = sizeof(FusedSmem);
+// The launcher must know sizeof(FusedSmem) to size the dynamic shared-memory
+// allocation. It cannot be read back from the module: NVRTC internalises a
+// __device__ variable no kernel references (it lands in the cubin as a LOCAL
+// symbol, which cuModuleGetGlobal cannot resolve), and nvrtcAddNameExpression
+// does not apply to variables. So cuda_host.py owns the number and passes it
+// in, and this assert makes any future change to the struct a loud compile
+// error in CI rather than a silently undersized launch.
+#ifdef KDA_FUSED_SMEM_BYTES
+static_assert(sizeof(FusedSmem) == KDA_FUSED_SMEM_BYTES,
+              "cuda_host.SMEM_BYTES disagrees with sizeof(FusedSmem); update it");
+#endif

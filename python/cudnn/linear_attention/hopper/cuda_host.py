@@ -16,12 +16,9 @@ unrelated kernel in cake's directory.
 
 from __future__ import annotations
 
-import ctypes
 import threading
 from pathlib import Path
 from typing import Dict, Tuple
-
-from cuda.bindings import driver as cu
 
 from cudnn.frost.device import compute_capability, device_context
 
@@ -35,6 +32,14 @@ KERNEL_NAME = "kda_fused"
 CHUNK = 16
 BLOCK = 128
 
+# sizeof(FusedSmem) in the kernel body. Restated here because NVRTC internalises
+# an unreferenced __device__ variable, so the value cannot be read back out of
+# the module. The body carries a static_assert against the -D below, so if the
+# struct ever changes this becomes a compile error naming this constant rather
+# than an undersized shared-memory allocation.
+SMEM_BYTES = 94464
+_SMEM_DEFINE = (f"-DKDA_FUSED_SMEM_BYTES={SMEM_BYTES}",)
+
 # The campaign kernel targets ~264 resident CTAs; a launch splits each sequence
 # into P pieces so N*H*P lands near that without exceeding the number of chunks
 # a sequence actually has. Restated from the artifact's kda_launch.
@@ -42,7 +47,6 @@ TARGET_CTAS = 264
 
 _LOCK = threading.Lock()
 _LIBRARIES: Dict[Tuple[str, int], "compiler.KernelLibrary"] = {}
-_SMEM_BYTES: Dict[int, int] = {}
 
 
 def _arch_for_device(device: int) -> str:
@@ -69,35 +73,6 @@ def _library(device: int) -> "compiler.KernelLibrary":
             lib = compiler.KernelLibrary(KERNEL_DIR / KERNEL_BODY, _arch_for_device(device), int(device))
             _LIBRARIES[key] = lib
         return lib
-
-
-def _smem_bytes(device: int) -> int:
-    """``sizeof(FusedSmem)`` read out of the compiled module.
-
-    The kernel publishes it as a device global so the launcher never restates
-    the struct layout -- a Python copy would drift silently the first time the
-    kernel's staging buffers changed.
-    """
-    cached = _SMEM_BYTES.get(device)
-    if cached is not None:
-        return cached
-    lib = _library(device)
-    with _LOCK:
-        cached = _SMEM_BYTES.get(device)
-        if cached is not None:
-            return cached
-        with device_context(device):
-            ptr, size = compiler._ck(
-                cu.cuModuleGetGlobal(lib.module, b"kda_fused_smem_bytes"),
-                "cuModuleGetGlobal(kda_fused_smem_bytes)",
-            )
-            buf = ctypes.c_ulonglong()
-            compiler._ck(
-                cu.cuMemcpyDtoH(ctypes.addressof(buf), ptr, min(int(size), 8)),
-                "cuMemcpyDtoH(kda_fused_smem_bytes)",
-            )
-        _SMEM_BYTES[device] = int(buf.value)
-        return _SMEM_BYTES[device]
 
 
 def pieces_per_sequence(total_tokens: int, n_seqs: int, n_heads: int) -> int:
@@ -129,7 +104,7 @@ def launch(
     n_heads: int,
 ) -> None:
     """One ``kda_fused`` launch. All tensor arguments are device addresses."""
-    smem = _smem_bytes(device)
+    smem = SMEM_BYTES
     func = _library(device).function(KERNEL_NAME, dynamic_smem=smem)
     p = pieces_per_sequence(total_tokens, n_seqs, n_heads)
 
