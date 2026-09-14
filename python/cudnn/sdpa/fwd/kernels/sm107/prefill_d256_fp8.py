@@ -1667,6 +1667,9 @@ def _correction_warp_group(
         # zeroed with a SELECT and never with a multiply by zero -- NaN * 0 is
         # NaN (rules/frost-gotchas.md, the empty-reduction-axis row).
         _kv_empty = bounds.right <= bounds.left
+        # A row with no live key inside a live tile (bottom-right rows above the diagonal, KV padding) keeps
+        # total_sum == 0; the tile-level test misses it, and log(1e-30) would give it a finite LSE.
+        _kv_empty = _kv_empty | (total_sum <= cutlass.Float32(0.0))
         if cutlass.const_expr(not CFG.HAS_SINK):
             # With a sink the row still has mass (the sink logit itself), and the
             # branch above already yields LSE = sink_logit correctly because

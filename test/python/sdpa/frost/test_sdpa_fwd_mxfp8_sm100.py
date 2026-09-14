@@ -562,7 +562,7 @@ def test_mxfp8_wide_dense_padding(d, in_key, causal):
     assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
 
 
-@pytest.mark.L1
+@pytest.mark.L0
 @pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_128", "d256", "d512"])
 @pytest.mark.parametrize("band", [False, True], ids=["br", "br_band"])
 @torch_fork_set_rng(seed=0)
@@ -597,7 +597,7 @@ def test_mxfp8_dense_q_trim_bottom_right(d, d_v, band):
     torch.testing.assert_close(result.stats[1, :, :129], result.reference_stats[1, :, :129], atol=5e-2, rtol=3e-2)
 
 
-@pytest.mark.L1
+@pytest.mark.L0
 @pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_128", "d256", "d512"])
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_dense_q_trim_stats_sink(d, d_v):

@@ -715,8 +715,8 @@ def test_fp8_d256_padding(in_key, causal):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-@pytest.mark.L1
-@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_128", "d256"])
+@pytest.mark.L0
+@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), pytest.param(256, 256, marks=_skip_d256_on_rubin)], ids=["d128", "d192_128", "d256"])
 @pytest.mark.parametrize("band", [False, True], ids=["br", "br_band"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_dense_q_trim_bottom_right(d, d_v, band):
@@ -725,7 +725,7 @@ def test_fp8_dense_q_trim_bottom_right(d, d_v, band):
     Batches: full Q, mid-tile Q (129 of 256), empty Q."""
     kw = dict(use_causal_mask_bottom_right=True)
     if band:
-        kw["diagonal_band_left_bound"] = 65  # window = 64
+        kw["left_bound"] = 65  # window = 64; sdpa_fp8 spells the band as left_bound
     result = _run(
         3,
         8,
@@ -749,7 +749,7 @@ def test_fp8_dense_q_trim_bottom_right(d, d_v, band):
     torch.testing.assert_close(result.stats[1, :, :129], result.reference_stats[1, :, :129], atol=5e-2, rtol=3e-2)
 
 
-@pytest.mark.L1
+@pytest.mark.L0
 @pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_128", "d256"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_dense_q_trim_stats_sink(d, d_v):

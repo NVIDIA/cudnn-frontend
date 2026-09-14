@@ -1948,6 +1948,9 @@ def _correction_warp_group(
         # -69.08 and inv_sum +inf, and O becomes (TMEM residue) * inf -- NaN,
         # since the residue can be a NaN bit pattern.  Zero O with a SELECT.
         _kv_empty = bounds.right <= bounds.left
+        # A row with no live key inside a live tile (bottom-right rows above the diagonal, KV padding) keeps
+        # total_sum == 0; the tile-level test misses it, and log(1e-30) would give it a finite LSE.
+        _kv_empty = _kv_empty | (total_sum <= cutlass.Float32(0.0))
         if cutlass.const_expr(not CFG.HAS_SINK):
             # A sink leaves real mass and the branch above already yields
             # LSE = sink_logit there; without one an empty row is -inf.

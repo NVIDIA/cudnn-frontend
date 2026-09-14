@@ -1662,6 +1662,9 @@ def _correction_warp_group(
         # zero; with a poisoned accumulator it is NaN, so zero it with a SELECT
         # rather than a multiply (NaN * 0 = NaN).
         _kv_empty = bounds.right <= bounds.left
+        # A row with no live key inside a live tile (bottom-right rows above the diagonal, KV padding) keeps
+        # total_sum == 0; the tile-level test misses it, and log(1e-30) would give it a finite LSE.
+        _kv_empty = _kv_empty | (total_sum <= cutlass.Float32(0.0))
         if cutlass.const_expr(not CFG.HAS_SINK):
             # A sink leaves the row with mass, and the branch above already
             # gives LSE = sink_logit there; without one, LSE is -inf.
