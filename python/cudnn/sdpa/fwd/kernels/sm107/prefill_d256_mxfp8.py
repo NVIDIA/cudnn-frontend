@@ -549,6 +549,12 @@ def _kernel(
         if _off < cutlass.Int32(SF_SMEM_SIZE_P):
             sP_SF_raw.subview(_off).store(cutlass.Int8(0x7F))
 
+    # The fill above is a generic-proxy SMEM store that tcgen05.cp (async proxy)
+    # reads; fence_mbarrier_init orders mbarrier init and barrier_cta_sync is a
+    # CTA barrier -- neither publishes the stores to the async proxy
+    # (frost-tile-dsl.md S1).  Without it a first launch can copy a
+    # partially-visible scale-factor tile and pass on the second.
+    nvvm.fence_proxy("async.shared", space="cta")
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
 
