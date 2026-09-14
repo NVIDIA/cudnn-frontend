@@ -145,15 +145,19 @@ def pinned_op(backend, variant):
     return functools.partial(op(variant), plan_name=backend.plan(variant))
 
 
-@pytest.fixture(params=("frost", "cutile", "hopper"))
+@pytest.fixture(params=("frost", "cutile", "hopper", "hopper_cuda"))
 def backend(request):
     """One backend per run of each test; the tests pass its plan name to the
     ops. The op graph caches are cleared around each test.
 
-    ``hopper`` is the sm90 path and exists for KDA only, so every other variant
-    (and every architecture that is not Hopper) declines it and the test waives
-    itself through :func:`waive_unsupported` -- the same way ``cutile`` already
-    waives where it has no kernel."""
+    ``hopper`` and ``hopper_cuda`` are the two sm90 paths and exist for KDA
+    only, so every other variant (and every architecture that is not Hopper)
+    declines them and the test waives itself through
+    :func:`waive_unsupported` -- the same way ``cutile`` already waives where
+    it has no kernel. ``hopper`` is the CuTe DSL forward; ``hopper_cuda`` is
+    the NVRTC-compiled CUDA one and is the only sm90 backend that also serves
+    the backward, so it is the only one for which the bwd cases do not waive
+    on Hopper."""
     clear_caches()
     try:
         yield Backend(request.param)
