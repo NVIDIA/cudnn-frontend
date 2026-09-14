@@ -2,9 +2,7 @@
 
 This directory is the **source for NVIDIA cuDNN product documentation**, published with Fern Docs to `docs.nvidia.com/cudnn`.
 
-[cuDNN](https://developer.nvidia.com/cudnn) is the CUDA Deep Neural Network library: GPU-accelerated primitives and fusion patterns for deep learning workloads. The docs here describe installation and the graph-oriented frontend APIs (Python and C++). The lower-level C backend API is maintained in the `cudnn/cudnn` repository under `docs/` and published separately at `docs.nvidia.com/deeplearning/cudnn/backend/`.
-
-API Markdown under `operations/`, `utilities/`, and `fe-oss-apis/` is maintained in this repository with the library code.
+The docs here describe installation and the graph-oriented frontend APIs (Python and C++). The lower-level C backend API published at `docs.nvidia.com/deeplearning/cudnn/backend/` is not maintained here.
 
 ## What lives here
 
