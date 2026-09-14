@@ -2319,7 +2319,20 @@ def _correction_warp_group(
             # (with a sink the denominator is finite but the O numerator is an
             # empty sum).  total_sum >= 2^P_CAST_LOG2_SCALE for any alive row
             # so this never fires spuriously.
+            q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
             row_dead = total_sum <= cutlass.Float32(0.0)
+            # A row with no live key inside a live tile -- bottom-right rows above the diagonal, a left band past
+            # the last key, a zero KV length -- read off the mask geometry: with the finite mask sentinel a keyless
+            # row's softmax sum is N (or NaN once the scaled sentinel overflows), so total_sum cannot tell it apart.
+            if cutlass.const_expr(CFG.MASK_FLAGS != 0):
+                _diag = (eff_seqlen_kv - eff_seqlen_q) if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+                _last_k = eff_seqlen_kv - cutlass.Int32(1)
+                if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
+                    _last_k = cute.math.min(_last_k, q_row_global + _diag + cutlass.Int32(CFG.WINDOW_RIGHT))
+                _first_k = cutlass.Int32(0)
+                if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
+                    _first_k = cute.math.max(_first_k, q_row_global + _diag - cutlass.Int32(CFG.WINDOW_LEFT))
+                row_dead = row_dead | (_first_k > _last_k)
             if cutlass.const_expr(CFG.HAS_SINK):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = sinks_arr[head_idx]
@@ -2329,6 +2342,8 @@ def _correction_warp_group(
                 # into the same units, then take the constant back out of the LSE.
                 new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True) * cutlass.Float32(2.0**P_CAST_LOG2_SCALE)
                 lse_val = new_max + cute.math.log(new_sum, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
+                # a keyless row with a sink holds the sink's mass alone; selected, since the fold above may be NaN
+                lse_val = cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(sink_logit).ir_value(), lse_val.ir_value()))
                 inv_sum = scale / new_sum
             else:
                 # total_sum carries 2^P_CAST_LOG2_SCALE — subtract the constant.
@@ -2341,7 +2356,6 @@ def _correction_warp_group(
                 inv_sum = cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
 
             # OOB-row guard: under cga2 cluster Q rows can exceed seqlen_q (else write aliases next head's LSE slot).
-            q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
             if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
                 # Dense padded-Q trim: q rows >= seq_len_q[b] write O := 0 / LSE := -inf,
                 # applied AFTER the sink branch (a trimmed row is dead even with a sink).

@@ -1679,6 +1679,11 @@ def _correction_warp_group(
             # A sink leaves the row with mass, and the branch above already
             # gives LSE = sink_logit there; without one, LSE is -inf.
             lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
+        else:
+            # A keyless row with a sink holds the sink's mass alone: LSE = sink_logit. The finite mask
+            # sentinel, scaled, can overflow to -inf and NaN the sink fold, so the value is selected, not
+            # computed; O is zeroed by the same _kv_empty select below.
+            lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(sink_logit).ir_value(), lse_val.ir_value()))
 
         if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
             # Dense padded-Q trim: q rows >= seq_len_q[b] write O := 0 / LSE := -inf

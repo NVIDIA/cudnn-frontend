@@ -563,6 +563,42 @@ def test_mxfp8_wide_dense_padding(d, in_key, causal):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_dense_q_trim_bottom_right_sink(d):
+    """Keyless rows (bottom-right, S_kv < S_q) WITH a sink: the row's mass is
+    the sink alone, so LSE = sink_logit and O = 0 -- a kernel that lets the
+    masked scores through its softmax returns NaN there. scale * log2(e) > 1 makes the
+    scaled sentinel overflow, the case that trips a finite-sentinel mask."""
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    result = _run(
+        3,
+        8,
+        8,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=0.75,  # scale * log2(e) > 1: the scaled finite sentinel overflows, the case a sum-based dead-row test misses
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        sink=sink,
+        seq_lens_q=[256, 129, 0],
+        seq_lens_kv=[200, 256, 128],
+        d_qk=d,
+        d_v=d,
+        return_lse=True,
+    )
+    # scale 0.75 sharpens the softmax (scores ~12x the 1/sqrt(d) norm), which widens the e4m3 P-quantization
+    # noise on the WIDE flavor: develop measures the same 0.06 on d256 with this graph, so it gets 0.08 here.
+    diff = (result.output.float() - result.reference).abs().max().item()
+    assert diff <= (0.05 if d == 128 else 0.08), f"max|O-ref|={diff:.4f}"
+    assert (result.output[0, :, :56] == 0).all() and (result.output[1, :, 129:] == 0).all() and (result.output[2] == 0).all()
+    assert torch.isfinite(result.stats[0]).all(), "keyless rows with a sink must carry the sink logit, not NaN"
+    torch.testing.assert_close(result.stats[0, :, :56], sink.view(8, 1).expand(8, 56), atol=1e-4, rtol=0)
+    torch.testing.assert_close(result.stats[0], result.reference_stats[0], atol=5e-2, rtol=3e-2)
+    assert torch.isneginf(result.stats[1, :, 129:]).all() and torch.isneginf(result.stats[2]).all()
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_128", "d256", "d512"])
 @pytest.mark.parametrize("band", [False, True], ids=["br", "br_band"])
 @torch_fork_set_rng(seed=0)
