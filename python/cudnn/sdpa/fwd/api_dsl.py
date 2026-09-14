@@ -1129,6 +1129,42 @@ class SdpaFwdDsl(APIBase):
         """
 
 
+def _sf_storage_order_bytes(sf: torch.Tensor, name: str) -> torch.Tensor:
+    """Flat 1-D int8 view of an MXFP8 scale-factor tensor, in STORAGE order.
+
+    An F8_128x4 scale-factor tensor is an OPAQUE byte layout: the kernel's
+    scale-factor descriptors read the reordered atom stream that the producer
+    laid down in memory, not the tensor's logical element order. The two differ
+    the moment the tensor is handed over as a PERMUTED view of the buffer the
+    producer wrote — which is legal, and is what the reordering helpers here
+    produce (they build the atom-shaped tensor and permute it into the logical
+    ``[.., mn, k]`` shape the graph declares).
+
+    So bind by storage order: when the tensor is not already contiguous, permute
+    its dims into descending-stride order — which restores the order the bytes
+    actually sit in — then view it as bytes. Every step is a metadata-only view,
+    so the kernel sees the producer's bytes and no copy is made.
+    ``.contiguous()`` would do the opposite on such a view: materialize the
+    LOGICAL order, i.e. a different byte stream than the descriptors read.
+
+    A tensor that is still not contiguous after the permutation is not a dense
+    buffer (overlapping or gapped strides); there is no byte stream to bind, so
+    it is rejected by name.
+    """
+    flat = sf
+    if not flat.is_contiguous():
+        # Descending stride, ties resolved by dim index so the order is total.
+        flat = flat.permute(*sorted(range(flat.dim()), key=lambda i: (-flat.stride(i), i)))
+        if not flat.is_contiguous():
+            raise ValueError(
+                f"MXFP8 SF tensor {name} is not a dense F8_128x4 buffer: shape {tuple(sf.shape)}, "
+                f"strides {tuple(sf.stride())} do not describe a gap-free, non-overlapping byte stream"
+            )
+    if flat.dtype != torch.int8:
+        flat = flat.view(torch.int8)
+    return flat.reshape(-1)
+
+
 class SdpaFwdDslSm100(SdpaFwdDsl):
     """SM100 (Blackwell) SDPA forward via the FROST DSL template kernels."""
 
@@ -2516,16 +2552,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         tile is 128 rows × d/32 d-blocks and a V tile is 128 rows × 4 s-blocks, so
         each tile is exactly ``sf_smem_size`` E8M0 bytes and this is a pure reshape.
 
-        A reordered tensor is an opaque byte layout: callers legally bind it under
-        any shape with the right byte count (the graph declares logical
-        ``[B, H, s_padded, d/32]`` dims; TE-style producers hand over flat
+        A reordered tensor is an opaque byte layout bound by STORAGE order
+        (:func:`_sf_storage_order_bytes`): callers legally bind it under any
+        shape with the right byte count, including a permuted view of the
+        buffer the reordering produced (the graph declares logical
+        ``[B, H, s_padded, d/32]`` dims; other producers hand over flat
         ``[B·H·s_padded, 4]`` swizzle output).  So B comes from the graph facts,
         never from ``sf.shape[0]``, and only the total size is validated.
         """
         b = self.batch_size
-        flat = sf.contiguous()
-        if flat.dtype != torch.int8:
-            flat = flat.view(torch.int8)
+        flat = _sf_storage_order_bytes(sf, "sf")
         if flat.numel() != b * h * n_tiles * sf_smem_size:
             raise ValueError(
                 f"MXFP8 SF size mismatch: got {flat.numel()} bytes, expected "
@@ -2552,11 +2588,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         Scale bytes for valid or partially valid 32-element blocks must be
         finite. Fully padded V blocks are sanitized in shared memory before
         BMM2, so arbitrary bytes in the physical tail cannot turn TMA-zeroed
-        data into NaNs through ``0 * NaN``."""
-        flat = sf.contiguous()
-        if flat.dtype != torch.int8:
-            flat = flat.view(torch.int8)
-        flat = flat.reshape(-1)
+        data into NaNs through ``0 * NaN``.
+
+        Like the dense path, the buffer is an opaque byte layout bound by
+        STORAGE order (:func:`_sf_storage_order_bytes`), so a permuted view of
+        the packed buffer binds without a copy and without reordering the
+        bytes the kernel's descriptors read."""
+        flat = _sf_storage_order_bytes(sf, name)
         row = h * sf_smem_size
         if flat.numel() == 0:
             with _torch_stream_context(current_stream, sf.device):
