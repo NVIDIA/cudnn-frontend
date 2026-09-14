@@ -55,7 +55,7 @@ Optional live preview (`fern docs dev` at `http://localhost:3000`) uses the Fern
 
 GitHub Actions run Fern from `.github/workflows/`:
 
-- [`docs-fern.yml`](../.github/workflows/docs-fern.yml) — `fern check` and self-closing `<img>` lint on pull requests and pushes
+- [`docs-fern.yml`](../.github/workflows/docs-fern.yml) — `fern check` and a lint for unclosed HTML image tags on pull requests and pushes
 - [`docs-fern-publish.yml`](../.github/workflows/docs-fern-publish.yml) — `fern generate --docs` to staging (`develop`) and production (`main`)
 
 Publishing uses the `FERN_TOKEN` repository secret on `develop` and `main`. Fork pull requests cannot publish; merged changes on those branches trigger the publish workflow when `docs/**` changes.
