@@ -144,6 +144,11 @@ def _select_sm100_backend(
         return "h16_m128", 128
     if num_heads == 32 and head_dim == 576:
         return "h32_m64", 64
+    if num_heads == 96 and head_dim == 576:
+        # Compose the established H64 kernel with the tuned H32 tail. Both
+        # components accumulate into one FP32 dKV workspace, which is cleared
+        # by H64 and converted once after H32 completes.
+        return "h96_h64_h32", 64
     return "generic_m64", 64
 
 
@@ -166,6 +171,10 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False):
         from .dsa_bwd_sm100_h32 import FlashAttentionDSABackwardSm100H32
 
         return FlashAttentionDSABackwardSm100H32
+    if backend == "h96_h64_h32":
+        from .dsa_bwd_sm100_h96 import FlashAttentionDSABackwardSm100H96
+
+        return FlashAttentionDSABackwardSm100H96
     if deterministic:
         return FlashAttentionDSABackwardSm100Deterministic
     return FlashAttentionDSABackwardSm100
