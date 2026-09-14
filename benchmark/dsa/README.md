@@ -90,7 +90,13 @@ python benchmark_dsa_sparse_attention_backward.py --seqlens 4096,8192,16384 --to
 python benchmark_dsa_sparse_attention_backward.py --head-dim 576   # 512 value dims + 64 RoPE dims
 python benchmark_dsa_sparse_attention_backward.py --nheads 16 --head-dim 576  # SM100 H16/D576 M128 backend
 python benchmark_dsa_sparse_attention_backward.py --nheads 128  # SM100 (10, 0) BF16 H128/D512 two-CTA backend
+python benchmark_dsa_sparse_attention_backward.py --nheads 128 --head-dim 576 --csv d576_2cta.csv  # SM100/SM103 BF16 H128/D576 two-CTA backend
 ```
+
+The H128/D576 two-CTA route uses the same public-wrapper measurement, including
+workspace allocation and initialization. Add `--no-topk-length` to cover the
+variant without a lengths tensor; the default passes a full-length tensor.
+The existing benchmark arguments and CSV format apply to both variants.
 
 Options:
 
