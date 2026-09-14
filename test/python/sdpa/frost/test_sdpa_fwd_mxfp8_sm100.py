@@ -142,11 +142,18 @@ def _ref(
     i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
     j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
     masked = torch.zeros(1, 1, s_q, s_kv, dtype=torch.bool, device=dev)
+    # Bottom-right anchors the diagonal at each batch's corner (seq_len_q[b], seq_len_kv[b]),
+    # not at the padded (S_q, S_kv): a shorter Q keeps its rows aligned with the END of its KV.
+    diag = 0
+    if bottom_right:
+        slq_d = torch.as_tensor(seq_lens_q if seq_lens_q is not None else [s_q] * b, device=dev, dtype=torch.long).view(b, 1, 1, 1)
+        slk_d = torch.as_tensor(seq_lens_kv if seq_lens_kv is not None else [s_kv] * b, device=dev, dtype=torch.long).view(b, 1, 1, 1)
+        diag = slk_d - slq_d
     if is_causal:
-        lim = i + (s_kv - s_q) if bottom_right else i
+        lim = i + diag
         masked = masked | (j > lim + right_bound)
     if swa_window is not None:
-        swa_base = i + (s_kv - s_q) if bottom_right else i
+        swa_base = i + diag
         masked = masked | (j < swa_base - swa_window)
     if seq_lens_kv is not None:
         # Per-batch KV padding: columns j >= seq_len_kv[b] are padding -> masked.
@@ -553,6 +560,41 @@ def test_mxfp8_wide_dense_padding(d, in_key, causal):
     )
     _check(O, O_ref, torch.float16, in_key, d_qk=d)
     assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_128", "d256", "d512"])
+@pytest.mark.parametrize("band", [False, True], ids=["br", "br_band"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_dense_q_trim_bottom_right(d, d_v, band):
+    """Short per-batch Q under bottom-right causal (and with a left band): the
+    diagonal anchors at (seq_len_q[b], seq_len_kv[b]) for the VALID rows, so the
+    tile bounds and the per-element mask must use the same per-batch Q length
+    -- a mask still anchored at the padded S_q drops keys the valid rows must
+    see. Batches: full Q, mid-tile Q (129 of 256), empty Q."""
+    kw = dict(use_causal_mask_bottom_right=True)
+    if band:
+        kw["diagonal_band_left_bound"] = 65  # window = 64
+    result = _run(
+        3,
+        8,
+        8,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=kw,
+        seq_lens_q=[256, 129, 0],
+        seq_lens_kv=[200, 256, 128],
+        d_qk=d,
+        d_v=d_v,
+        return_lse=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", d_qk=d)
+    assert (result.output[1, :, 129:] == 0).all() and (result.output[2] == 0).all()
+    assert torch.isneginf(result.stats[1, :, 129:]).all() and torch.isneginf(result.stats[2]).all()
+    torch.testing.assert_close(result.stats[0], result.reference_stats[0], atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(result.stats[1, :, :129], result.reference_stats[1, :, :129], atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L1
