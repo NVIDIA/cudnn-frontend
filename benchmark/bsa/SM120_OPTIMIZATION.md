@@ -140,6 +140,27 @@ the harness. These are control measurements, not an optimized-kernel result.
 
 ## Hardware-counter follow-up
 
+### Warpgroup-uniform register donation
+
+Inspection of register-pressure experiments found that the load warp and the
+three donor warps released registers at two different instruction sites. PTX
+requires all four warps in a warpgroup to execute the same `setmaxnreg`
+instruction; see the
+[PTX register-adjustment contract](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#miscellaneous-instructions-setmaxnreg).
+The native BSA specialization now performs donation once in a
+`warp >= load_warp_id` branch, before selecting the individual load-warp role.
+Generated SASS has one deallocation instruction rather than two. Register
+budgets, sparse traversal, arithmetic, and launch dimensions are unchanged.
+This is a correctness hardening, not a claimed performance optimization.
+
+The BSA forward and paired-harness regression run passed 24 tests, with nine
+unsupported-configuration skips. A separate 101-pair run passed full-tensor
+bitwise O/LSE checks for both densities and both address patterns. Ratios
+against `9869b9b6` were 1.0033x / 1.0038x at 15% strided/local and 1.0028x /
+1.0036x at 20% strided/local, retaining the small unroll checkpoint gain.
+
+### Measured pipeline utilization
+
 Nsight Compute 2026.3 profiled the `1759da44` checkpoint on the same Server
 Edition GPU at 20% density. The kernel was compiled and warmed up before
 collection. Strided used 22 replay passes; local used 13. Neither GPU clocks

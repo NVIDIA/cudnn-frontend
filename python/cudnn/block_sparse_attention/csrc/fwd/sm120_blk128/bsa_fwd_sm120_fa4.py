@@ -268,9 +268,12 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
         gIndices = blocksparse_indices_q2k[None, q_tile_idx, head_idx, batch_idx]
         num_kv_tiles = block_sparse_num
 
-        if warp == self.load_warp_id:
+        # Register donation is warpgroup-uniform: the load warp and its
+        # three donor warps must execute the same setmaxnreg instruction.
+        if warp >= self.load_warp_id:
             prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
 
+        if warp == self.load_warp_id:
             logical_idx = num_kv_tiles - 1
             physical_idx = gIndices[logical_idx]
             self.load_one_kv_tile(
@@ -479,5 +482,3 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                     gO_ptr = o_ptr + o_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
                     sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * (16 * 16) + lane * 8
                     gO_ptr.store(sO_ptr.load(count=8, alignment=16), alignment=16)
-        else:
-            prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
