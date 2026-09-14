@@ -388,7 +388,7 @@ class CtaPairTileConfig(TileConfig):
     # one at all: splitting it measured within noise of a single instruction,
     # cuBLAS does not do it either, and neither the CTA pair nor the block-scale
     # pipeline can express it.
-    MMA_SIZE_M_MAX: ClassVar[int] = 2
+    MMA_SIZE_M_MAX: ClassVar[int] = 4
 
     cta_group: int
 
@@ -400,6 +400,9 @@ class CtaPairTileConfig(TileConfig):
         object.__setattr__(self, "warp_tile_k_bytes", self.cta_tile_k_bytes)
         if self.cta_group not in (1, 2):
             raise NotImplementedError(f"TileConfig {self.name!r}: cta_group must be 1 or 2, got {self.cta_group}")
+        # CTA pairs occupy adjacent M positions within a cluster.
+        if self.cta_group == 2 and self.cga_size_m % 2:
+            raise NotImplementedError(f"TileConfig {self.name!r}: 2-CTA MMA needs cga_size_m % 2 == 0; got {self.cga_size_m}")
         # The M/N hardware bounds of the tcgen05 instruction: M is the two TMEM
         # row layouts (128 full lanes / 64 packed half-lanes); N is the idesc
         # n_dim, encoded with its 3 LSBs dropped. Checked BEFORE the generic
@@ -555,37 +558,17 @@ def config_class_for_pipeline(pipeline: str) -> type[TileConfig]:
         raise KeyError(f"no config family for pipeline {pipeline!r}; known: " f"{sorted(_CONFIG_CLASS_BY_PIPELINE)}") from None
 
 
-# ---------------------------------------------------------------------------
-# Catalog — pure-geometry enumeration. cta_group / mainloop are NOT
-# enumerated here; the registry expands each geometry across accepting templates.
-# Axes: M ∈ _M_AXES (the UTCMMA instruction M and how many of them the CTA tile
-# spans — cta_tile_m is the PRODUCT, not an axis), cta_n ∈ {8..256 step 8},
-# K_bytes ∈ {128,64}, cluster ∈ _CLUSTERS. N < 8 / N % 8 rejected by
-# __post_init__ (tcgen05 idesc n_dim is a multiple of 8). 2-CTA templates accept
-# only cga_size_m % 2 == 0 (registry predicate).
-# ---------------------------------------------------------------------------
+# Catalog geometry axes; the registry filters graph/template support.
+# CTA M = mma_tile_m * mma_size_m; cluster M * N <= MAX_CLUSTER_SIZE.
+# Enumerate mma_size_m=1 first to preserve first-match config lookups.
+_MMA_TILE_M_VALUES: tuple[int, ...] = (128, 64)
+_MMA_SIZE_M_VALUES: tuple[int, ...] = (1, 2, 4)
+_M_AXES: tuple[tuple[int, int], ...] = tuple((mma_tile_m, mma_size_m) for mma_size_m in _MMA_SIZE_M_VALUES for mma_tile_m in _MMA_TILE_M_VALUES)
 
-# (mma_tile_m, mma_size_m) — the UTCMMA instruction M and how many of them one CTA
-# tile spans; cta_tile_m is their product. mma_size_m == 1 first, so a lookup like
-# `next(c for c in CATALOG if c.cta_tile_m == 128)` still lands on the unsplit tile.
-_M_AXES: tuple[tuple[int, int], ...] = ((128, 1), (64, 1), (128, 2), (64, 2))
-
-_CLUSTERS: tuple[tuple[int, int], ...] = (
-    (1, 1),
-    (1, 2),
-    (1, 4),
-    (1, 8),
-    (1, 16),
-    (2, 1),
-    (2, 2),
-    (2, 4),
-    (2, 8),
-    (4, 1),
-    (4, 2),
-    (4, 4),
-    (8, 1),
-    (8, 2),
-    (16, 1),
+_CGA_SIZE_M_VALUES: tuple[int, ...] = (1, 2, 4, 8, 16)
+_CGA_SIZE_N_VALUES: tuple[int, ...] = (1, 2, 4, 8, 16)
+_CLUSTERS: tuple[tuple[int, int], ...] = tuple(
+    (cga_m, cga_n) for cga_m in _CGA_SIZE_M_VALUES for cga_n in _CGA_SIZE_N_VALUES if cga_m * cga_n <= MAX_CLUSTER_SIZE
 )
 
 
@@ -728,6 +711,8 @@ def _build_catalog() -> tuple[TileConfig, ...]:
                         continue
                     for cga_m, cga_n in _CLUSTERS:
                         for cta_group in (1, 2):
+                            if cga_m % cta_group:
+                                continue
                             cfgs.append(_geom_sm100(mma_m * mma_size_m, cta_n, k_bytes, mma_m, cta_n, mma_k_bytes, cga_m, cga_n, cta_group))
     # sm103 block-scale geometries: M pinned to 128 by the 1-CTA MMA atom;
     # clusters share the sm100 enumeration (the templates use the same generic
@@ -735,6 +720,8 @@ def _build_catalog() -> tuple[TileConfig, ...]:
     for cta_n in (256, 128):
         for cga_m, cga_n in _CLUSTERS:
             for cta_group in (1, 2):
+                if cga_m % cta_group:
+                    continue
                 cfgs.append(_geom_sm103(128, cta_n, cga_m, cga_n, cta_group))
 
     # sm120: sweep the warp-MMA geometries over CTA tile x K width x warp grid.

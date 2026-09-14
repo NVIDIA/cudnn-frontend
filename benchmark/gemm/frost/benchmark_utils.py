@@ -61,7 +61,7 @@ def spec_for(label, spec_map):
     """(config, cta_group) for a --configs label, or None.
 
     The sweep map comes from the registry funnel over CATALOG; a label naming a
-    geometry outside it (e.g. a mma_size_m > 1 tile, which `by_name` synthesizes) is
+    geometry outside it (e.g. a custom cluster or K tile that `by_name` synthesizes) is
     still runnable, so parse the complete canonical name rather than calling it
     unsweepable.  ``cta_group`` is part of TileConfig geometry; do not strip its
     suffix and carry a second, potentially inconsistent value beside the config."""
