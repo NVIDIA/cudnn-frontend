@@ -1622,19 +1622,22 @@ def _correction_warp_group(
         # DSL if-staging requires names used after the conditional to be bound on every path
         total_max_scaled = cutlass.Float32(0.0)
         total_sum = cutlass.Float32(0.0)
-        if bounds.right > bounds.left:
-            bars.mb_stat_full.wait(stat_mbar_state)
-            stats_addr_epi = tmem_base_epi + cutlass.Int32(LAYOUT.STATS_OFF)
-            stats_vec_epi = nvvm.tcgen05_ld(
-                "32x32b",
-                nvvm.make_tmem_ptr(stats_addr_epi, cutlass.Float32),
-                num=2,
-            )
-            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-            total_max_scaled = stats_vec_epi[0]
-            total_sum = stats_vec_epi[1]
-            bars.mb_stat_empty.arrive()
-            stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
+        # Consumed for EVERY tile: the softmax publishes the end-of-tile stats and waits stat_empty at the next
+        # tile start unconditionally, so skipping this on an empty range (zero KV, or a Q-trim-collapsed tile)
+        # leaves one stat_full unconsumed and deadlocks the next tile of a persistent worker. The empty tile's
+        # (-FLT_MAX, 0) stats fall into the _kv_empty selects below.
+        bars.mb_stat_full.wait(stat_mbar_state)
+        stats_addr_epi = tmem_base_epi + cutlass.Int32(LAYOUT.STATS_OFF)
+        stats_vec_epi = nvvm.tcgen05_ld(
+            "32x32b",
+            nvvm.make_tmem_ptr(stats_addr_epi, cutlass.Float32),
+            num=2,
+        )
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        total_max_scaled = stats_vec_epi[0]
+        total_sum = stats_vec_epi[1]
+        bars.mb_stat_empty.arrive()
+        stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
 
         LN2 = cutlass.Float32(0.6931471805599453)
         total_max_nat = total_max_scaled * LN2
