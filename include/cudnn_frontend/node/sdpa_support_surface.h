@@ -987,19 +987,27 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
             // TODO(nvbugs/5102117): the feature-parity backend MRs lift these one by one (deterministic
             // multi-kernel, masks/bias/score modifiers, dropout, paged/variable-length, FP8). Until then
             // every feature below routes to the composite implementation under AUTO.
-            std::unordered_set<SDPA_backward_attributes::input_names> const allowed_input_names{
-                input_names::Q,
-                input_names::K,
-                input_names::V,
-                input_names::O,
-                input_names::dO,
-                input_names::Stats,
-                input_names::Attn_scale};
+            // Ragged (THD) layouts, padding masks and max_total_seq_len reach the unified engine on SM100/SM107
+            // from the dev line that follows 9.28.0 (the SM80/SM90 generic emitters are wired in a later MR).
+            // TODO(nvbugs/5102117): bump the floor to the release these land in.
+            int32_t const unified_sm_major = context.get_sm_version() / 10;
+            bool const unified_layouts_ok  = effective_cudnn_ver >= 92800 && unified_sm_major == 10;
+            std::unordered_set<SDPA_backward_attributes::input_names> allowed_input_names{input_names::Q,
+                                                                                          input_names::K,
+                                                                                          input_names::V,
+                                                                                          input_names::O,
+                                                                                          input_names::dO,
+                                                                                          input_names::Stats,
+                                                                                          input_names::Attn_scale};
+            if (unified_layouts_ok) {
+                allowed_input_names.insert(input_names::SEQ_LEN_Q);
+                allowed_input_names.insert(input_names::SEQ_LEN_KV);
+            }
             for (const auto& [key, value] : inputs) {
                 if (allowed_input_names.find(key) == allowed_input_names.end() && value != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
                             "Unified SDPA backward node doesn't yet support inputs other than Q, K, V, O, dO, Stats, "
-                            "Attn_scale"};
+                            "Attn_scale (and the sequence lengths on SM100/SM107)"};
                 }
             }
 
@@ -1012,7 +1020,8 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
                 }
             }
 
-            if (alibi_mask || padding_mask || left_bound.has_value() || right_bound.has_value()) {
+            if (alibi_mask || (padding_mask && !unified_layouts_ok) || left_bound.has_value() ||
+                right_bound.has_value()) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
                         "Unified SDPA backward node doesn't yet support alibi, padding or diagonal-band masks"};
             }
@@ -1027,18 +1036,18 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
                         "Unified SDPA backward node doesn't yet support the deterministic algorithm"};
             }
-            if (max_total_seq_len_q.has_value() || max_total_seq_len_kv.has_value()) {
+            if (!unified_layouts_ok && (max_total_seq_len_q.has_value() || max_total_seq_len_kv.has_value())) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
                         "Unified SDPA backward node doesn't yet support max_total_seq_len_q/kv"};
             }
             for (const auto& [key, value] : inputs) {
-                if (value != nullptr && value->get_ragged_offset() != nullptr) {
+                if (!unified_layouts_ok && value != nullptr && value->get_ragged_offset() != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
                             "Unified SDPA backward node doesn't yet support ragged (packed) layouts"};
                 }
             }
             for (const auto& [key, value] : outputs) {
-                if (value != nullptr && value->get_ragged_offset() != nullptr) {
+                if (!unified_layouts_ok && value != nullptr && value->get_ragged_offset() != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
                             "Unified SDPA backward node doesn't yet support ragged (packed) layouts"};
                 }
