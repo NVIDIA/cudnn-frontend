@@ -2238,14 +2238,14 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
+        # Per-thread warp / lane identity used for warp specialization
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = tidx // 32
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        # total_tokens is the last padded offset (0 => nothing to do for this launch)
         total_tokens = padded_offsets[self.expert_cnt - 1]
 
-        #
-        # Prefetch tma desc
-        #
+        # TMA warp prefetches all TMA descriptors up front (B/SFB only for dense)
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_sfa)
@@ -2257,26 +2257,20 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
-        #
-        # Setup cta/thread coordinates
-        #
-        # Coords inside cluster
+        # Block/cluster coordinates and this CTA's MMA V (leader/follower) coordinate
         bidx, _, _ = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
-
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
 
-        #
-        # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
-        #
+        # Allocate this CTA's shared storage struct
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
-        # Initialize mainloop ab_pipeline (barrier) and states
+        # Initialize mainloop ab_pipeline and states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_tma_producer)
@@ -2290,8 +2284,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             defer_sync=True,
         )
 
-        # scale_pipeline: scale-load warp (producer) -> accumulator-update warpgroup (consumer),
-        # staging sfa2/sfb2 in sSFA2/sSFB2 via cp.async.
+        # Initialize scale_pipeline and states
         scale_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             self.threads_per_warp * 1,
@@ -2308,8 +2301,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             defer_sync=True,
         )
 
-        # Initialize acc_pipeline (barrier) and states. Consumer is the accumulator-update
-        # warpgroup (warps 0-3), not the epilogue.
+        # Initialize acc_pipeline and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_acc_consumer_threads = len(self.accumulator_update_warp_id) * (2 if use_2cta_instrs else 1)
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_acc_consumer_threads)
@@ -2322,7 +2314,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             defer_sync=True,
         )
 
-        # Initialize epi_pipeline (barrier) connecting accumulator update -> epilogue
+        # Initialize epi_pipeline and states
         epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.threads_per_warp * len(self.accumulator_update_warp_id))
         epi_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.threads_per_warp * len(self.epilog_warp_id))
         epi_pipeline = pipeline.PipelineAsync.create(
@@ -2332,8 +2324,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             consumer_group=epi_pipeline_consumer_group,
         )
 
-        # Load C pipeline
-        # Threads/warps participating in tma store pipeline
+        # Initialize c_pipeline and states (TMA loads of the forward activations for the epilogue)
         c_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         c_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
@@ -2348,7 +2339,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             defer_sync=True,
         )
 
-        # Initialize tile info pipeline (barrier) and states
+        # Initialize tile_info_pipeline and states
         tile_info_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             self.threads_per_warp * 1,
@@ -2364,6 +2355,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             consumer_group=tile_info_pipeline_consumer_group,
         )
 
+        # Create and initialize the persistent MoE tile scheduler
         scheduler = MoEPersistentTileScheduler.create(
             sched_params,
             padded_offsets,
@@ -2374,7 +2366,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         )
         scheduler.internal_init()
 
-        # dBias SMEM setup
+        # SMEM view for the per-warp dbias partial sums
         if cutlass.const_expr(self.generate_dbias):
             sDbias = storage.sDbias.get_tensor(
                 cute.make_layout(
@@ -2383,7 +2375,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 )
             )
 
-        # Tensor memory dealloc barrier init
+        # TMEM allocator holding the accumulator plus SFA/SFB scale columns
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
@@ -2414,14 +2406,11 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 # arrive below carries no release — this fence does).
                 cute.arch.fence_acq_rel_cluster()
 
-        # Cluster arrive after barrier init
+        # Relaxed cluster arrive; the matching cluster_wait happens before specialization
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_arrive_relaxed()
 
-        #
-        # Setup smem tensor A/B/D/Scale
-        #
-        # (EPI_TILE_M, EPI_TILE_N, STAGE)
+        # Materialize SMEM tensor views over the staged buffers
         sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner)
         sD = storage.sD.get_tensor(d_smem_layout_staged.outer, swizzle=d_smem_layout_staged.inner)
         # Full-CTA-tile final accumulator buffer (always allocated)
@@ -2450,25 +2439,16 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             # regPerSubtile == 4 in the epilogue SFD path.
             _sfd_stage_size = 128 * 32 * 4 // self.sf_vec_size
             sSFDRowStage_flat = storage.sSFDRowStage.get_tensor(cute.make_layout(_sfd_stage_size))
-        # (MMA, MMA_M, MMA_K, STAGE)
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
-        # (MMA, MMA_N, MMA_K, STAGE)
         sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
-        # (granularity_m, repeat_m), (granularity_k, repeat_k), num_scale_stage)
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
-        # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
-        # (MMA, MMA_M, MMA_K, STAGE)
         sSFA2 = storage.sSFA2.get_tensor(sfa2_smem_layout_staged)
-        # (MMA, MMA_N, MMA_K, STAGE)
         sSFB2 = storage.sSFB2.get_tensor(sfb2_smem_layout_staged)
-        # (expert_idx, tile_m_idx, tile_n_idx, k_tile_cnt)
         info_layout = cute.make_layout((4, self.num_tile_stage), stride=(1, 4))
         sInfo = sched_storage.sInfo.get_tensor(info_layout)
 
-        #
-        # Compute multicast mask for A/B buffer full
-        #
+        # Multicast masks — must create ALL when any mcast or 2CTA is active
         a_full_mcast_mask = None
         b_full_mcast_mask = None
         sfa_full_mcast_mask = None
@@ -2479,16 +2459,12 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             sfa_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2)
             sfb_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_sfb_vmnk, block_in_cluster_coord_sfb_vmnk, mcast_mode=1)
 
-        #
-        # Partition shared/tensor memory tensor for TiledMMA_A/B/D
-        #
-        # (MMA, MMA_M, MMA_K, STAGE)
+        # SMEM fragments for MMA (used by MMA warp)
         tCrA = tiled_mma.make_fragment_A(sA)
-        # (MMA, MMA_N, MMA_K, STAGE)
         tCrB = tiled_mma.make_fragment_B(sB)
-        # (MMA, MMA_M, MMA_N)
+
+        # TMEM accumulator shape
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
-        # (MMA, MMA_M, MMA_N, STAGE)
         if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
             tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
             tCtAcc_fake = cute.make_tensor(
@@ -2506,9 +2482,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         else:
             tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
-        #
-        # Preparing LDGSTS partition for second level scale factor tensor (scale warp)
-        #
+        # Preparing LDGSTS partition for second level scale factor tensor
         lane_idx = cute.arch.lane_idx()
         atom_scale2_copy = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(),
@@ -2518,14 +2492,13 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         tiled_copy_sfa2 = cute.make_tiled_copy_tv(atom_scale2_copy, cute.make_layout((32,)), cute.make_layout((1,)))
         tiled_copy_sfb2 = cute.make_tiled_copy_tv(atom_scale2_copy, cute.make_layout((32,)), cute.make_layout((1,)))
 
+        # Per-lane G2S partition of the SFA2/SFB2 SMEM destinations
         thr_copy_sfa2 = tiled_copy_sfa2.get_slice(lane_idx)
         thr_copy_sfb2 = tiled_copy_sfb2.get_slice(lane_idx)
         tAsSFA2 = thr_copy_sfa2.partition_D(sSFA2)
         tBsSFB2 = thr_copy_sfb2.partition_D(sSFB2)
 
-        #
         # Scale viewed as C tensor
-        #
         # N/M extents use the CTA-tile-clamped scale block size (scale_size_*),
         # so the view spans exactly one CTA tile (size * per_tile == cta extent)
         # regardless of whether sg{m,n} exceed the tile (e.g. sgn=512 > 128).
@@ -2548,34 +2521,30 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         sSFA2_view_as_C = cute.make_tensor(sSFA2.iterator, sSFA2_view_as_C_layout)
         sSFB2_view_as_C = cute.make_tensor(sSFB2.iterator, sSFB2_view_as_C_layout)
 
-        # Number of MMA k-tiles that share the same second-level scale factor.
-        # sgk may span multiple mma_tiler[2] k-tiles (e.g. sgk=512, mma_tiler_K=256 -> 2):
-        # those k-tiles are summed into one MMA partial and scaled once.
+        # Number of K MMA tiles that share a single second-level scale block
         k_tile_same_scale_factor = self.sgk // self.mma_tiler[2]
 
-        #
-        # Cluster wait before tensor memory alloc
-        #
+        # Cluster sync before warp specialization
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_wait()
         else:
             self.cta_sync_barrier.arrive_and_wait()
 
+        # No tokens routed to any expert this launch => every warp exits early
         if total_tokens <= 0:
             cute.arch.nvvm.exit()
         k_tile_cnt = cute.ceil_div(cute.size(mB_nkl, mode=[1]), self.mma_tiler[2])
 
-        #
-        # Specialized Schedule warp (MoE Persistent Tile Scheduler)
-        #
+        # ==============================================================
+        # Scheduler warp (MoE Persistent Tile Scheduler)
+        # ==============================================================
         if warp_idx == self.sched_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_sched_warps)
             work_tile_info = scheduler.initial_work_tile_info()
 
             tile_info_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_tile_stage)
-
+            # Publish each valid work tile's info into the tile-info pipeline
             while work_tile_info.is_valid_tile:
-                # sInfo format: (expert_idx, tile_m_idx, tile_n_idx, k_tile_cnt)
                 tile_info_pipeline.producer_acquire(tile_info_producer_state)
                 with cute.arch.elect_one():
                     sInfo[(0, tile_info_producer_state.index)] = work_tile_info.expert_idx
@@ -2590,7 +2559,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
 
                 work_tile_info = scheduler.advance_to_next_work()
 
-            # Send invalid tile signal: expert_idx = -1
+            # Push a sentinel tile (expert_idx = -1) to signal end of work
             tile_info_pipeline.producer_acquire(tile_info_producer_state)
             with cute.arch.elect_one():
                 sInfo[(0, tile_info_producer_state.index)] = cutlass.Int32(-1)
@@ -2603,18 +2572,17 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             tile_info_producer_state.advance()
             tile_info_pipeline.producer_tail(tile_info_producer_state)
 
-        #
-        # Specialized TMA load warp
-        #
+        # ==============================================================
+        # DMA / TMA load warp
+        # ==============================================================
         if warp_idx == self.tma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             ext = self._make_extension(workspace_ptr)
 
             ab_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_ab_stage)
-
             tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
 
-            # Get the first tile info
+            # Prime the loop with the first work tile from the scheduler
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             for idx in cutlass.range(4, unroll_full=True):
@@ -2631,10 +2599,9 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     tile_n_idx=tile_info[2],
                     k_tile_cnt=tile_info[3],
                 )
-                # assert(k_tile_cnt == work_tile_info.k_tile_cnt)
                 ext.update_expert_info(padded_offsets, work_tile_info.expert_idx)
 
-                # Get per-expert real tensors + TMA desc ptrs via extension
+                # Resolve this expert's A/B and first-level SFA/SFB gmem tensors, then tile them
                 real_a, _ = ext.get_gmem_tensor("a", mA_mkl, padded_offsets, work_tile_info)
                 real_b, desc_ptr_b = ext.get_gmem_tensor("b", mB_nkl, padded_offsets, work_tile_info)
                 real_sfa, _ = ext.get_gmem_tensor("sfa", mSFA_mkl, padded_offsets, work_tile_info)
@@ -2658,13 +2625,12 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     )
                     real_sfb = cute.make_tensor(real_sfb.iterator, cute.make_layout(new_shape, stride=new_stride))
 
-                # local_tile on per-expert tensors
                 gA_mkl = cute.local_tile(real_a, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None))
                 gB_nkl = cute.local_tile(real_b, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None))
                 gSFA_mkl = cute.local_tile(real_sfa, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None))
                 gSFB_nkl = cute.local_tile(real_sfb, cute.slice_(self.mma_tiler_sfb, (0, None, None)), (None, None, None))
 
-                # MMA partition
+                # MMA partition on gmem tensors
                 thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
                 thr_mma_sfb = tiled_mma_sfb.get_slice(mma_tile_coord_v)
                 tCgA = thr_mma.partition_A(gA_mkl)
@@ -2713,7 +2679,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 tBsSFB = cute.filter_zeros(tBsSFB)
                 tBgSFB = cute.filter_zeros(tBgSFB)
 
-                # Slice to per mma tile index (L=0 since domain already offset'd)
+                # Fix this tile's M/N coordinate and slice each operand down to it
                 mma_tile_coord_m = work_tile_info.tile_m_idx // cute.size(tiled_mma.thr_id.shape)
                 mma_tile_coord_n = work_tile_info.tile_n_idx
                 tAgA_slice = tAgA[(None, mma_tile_coord_m, None, 0)]
@@ -2724,14 +2690,12 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     slice_n = mma_tile_coord_n // 2
                 tBgSFB_slice = tBgSFB[(None, slice_n, None, 0)]
 
-                # Peek (try_wait) AB buffer empty
+                # Peek whether the first AB buffer stage is free before the k loop
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if k_tile_cnt > 0:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
 
-                #
-                # Tma load loop
-                #
+                # k_tile loop
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     tAgA_k = tAgA_slice[(None, k_tile)]
                     tBgB_k = tBgB_slice[(None, k_tile)]
@@ -2742,16 +2706,15 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     tAsSFA_pipe = tAsSFA[(None, ab_producer_state.index)]
                     tBsSFB_pipe = tBsSFB[(None, ab_producer_state.index)]
 
+                    # Acquire the stage, then TMA-load A/B/SFA/SFB for this k tile on one barrier
                     tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
-
-                    # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
                     ab_producer_state_next = ab_producer_state.clone()
                     ab_producer_state_next.advance()
+                    # Peek the next stage's emptiness so the next acquire can be non-blocking
                     if k_tile < k_tile_cnt - 1:
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state_next)
 
-                    # TMA load A (contiguous, global desc)
                     cute.copy(
                         tma_atom_a,
                         tAgA_k,
@@ -2759,7 +2722,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                         tma_bar_ptr=tma_bar,
                         mcast_mask=a_full_mcast_mask,
                     )
-                    # TMA load B (discrete, per-expert desc from workspace)
                     cute.copy(
                         tma_atom_b,
                         tBgB_k,
@@ -2768,7 +2730,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                         mcast_mask=b_full_mcast_mask,
                         tma_desc_ptr=desc_ptr_b,
                     )
-                    # TMA load SFA (contiguous, global desc)
                     cute.copy(
                         tma_atom_sfa,
                         tAgSFA_k,
@@ -2776,7 +2737,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                         tma_bar_ptr=tma_bar,
                         mcast_mask=sfa_full_mcast_mask,
                     )
-                    # TMA load SFB (discrete, per-expert desc from workspace)
                     cute.copy(
                         tma_atom_sfb,
                         tBgSFB_k,
@@ -2785,13 +2745,9 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                         mcast_mask=sfb_full_mcast_mask,
                         tma_desc_ptr=desc_ptr_sfb,
                     )
-
-                    # Peek (try_wait) AB buffer empty for next k_tile
                     ab_producer_state = ab_producer_state_next
 
-                #
-                # Advance to next tile
-                #
+                # Get next tile from scheduler
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
@@ -2799,20 +2755,18 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 cute.arch.fence_proxy("async.shared", space="cta")
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
-            #
-            # Wait A/B buffer empty
-            #
             ab_pipeline.producer_tail(ab_producer_state)
 
+        # ==============================================================
+        # Second level scale load warp
+        # ==============================================================
         if warp_idx == self.scale_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
 
-            # print(f"[{os.path.basename(__file__)}:{inspect.currentframe().f_lineno}] sfa2_tensor: {sfa2_tensor}")
-            # print(f"[{os.path.basename(__file__)}:{inspect.currentframe().f_lineno}] sfb2_tensor: {sfb2_tensor}")
             ext = self._make_extension(workspace_ptr)
-            scale_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_scale_stage)
 
             tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
+            # Prime the loop with the first work tile from the scheduler
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             for idx in cutlass.range(4, unroll_full=True):
@@ -2835,9 +2789,11 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 k_tile_cnt = work_tile_info.k_tile_cnt
                 ext.update_expert_info(padded_offsets, work_tile_info.expert_idx)
 
+                # Get current tensors
                 mSFA2_mkl_current, _ = ext.get_gmem_tensor("sfa2", sfa2_tensor, padded_offsets, work_tile_info)
                 mSFB2_nkl_current, _ = ext.get_gmem_tensor("sfb2", sfb2_tensor, padded_offsets, work_tile_info)
 
+                # Create global memory tiled tensors
                 gSFA2_mkl = cute.local_tile(mSFA2_mkl_current, cute.slice_(self.cta_tile_shape_mnk, (None, 0, None)), (None, None, None))
                 gSFB2_nkl = cute.local_tile(mSFB2_nkl_current, cute.slice_(self.cta_tile_shape_mnk, (0, None, None)), (None, None, None))
 
@@ -2846,6 +2802,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 cSFB2_nkl = cute.make_identity_tensor(cute.shape(mSFB2_nkl_current))
                 cSFA2 = cute.local_tile(cSFA2_mkl, cute.slice_(self.cta_tile_shape_mnk, (None, 0, None)), (None, None, None))
                 cSFB2 = cute.local_tile(cSFB2_nkl, cute.slice_(self.cta_tile_shape_mnk, (0, None, None)), (None, None, None))
+
                 # Partition tensors
                 tAgSFA2_mkl = thr_copy_sfa2.partition_S(gSFA2_mkl)
                 tBgSFB2_nkl = thr_copy_sfb2.partition_S(gSFB2_nkl)
@@ -2854,9 +2811,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
 
                 mma_tile_coord_mnl = (work_tile_info.tile_m_idx, work_tile_info.tile_n_idx, 0)
 
-                #
                 # Prepare the mask for scaleA/scaleB
-                #
                 tApSFA2 = cute.make_rmem_tensor(
                     cute.make_layout(cute.filter_zeros(cute.slice_(tAsSFA2, (None, None, None, 0))).shape),
                     cutlass.Boolean,
@@ -2866,27 +2821,18 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     cutlass.Boolean,
                 )
 
-                # print(f"[{os.path.basename(__file__)}:{inspect.currentframe().f_lineno}] tApSFA2.layout: {tApSFA2.layout}")
-                # print(f"[{os.path.basename(__file__)}:{inspect.currentframe().f_lineno}] tBpSFB2.layout: {tBpSFB2.layout}")
-
                 # Peek (try_wait) SCALE buffer empty
                 scale_producer_state.reset_count()
                 peek_scale_empty_status = cutlass.Boolean(1)
                 if scale_producer_state.count < k_tile_cnt:
                     peek_scale_empty_status = scale_pipeline.producer_try_acquire(scale_producer_state)
 
-                #
-                # load loop
-                #
+                # k_tile loop
                 for k_tile in cutlass.range(0, k_tile_cnt // k_tile_same_scale_factor, 1, unroll=1):
-                    #
+
                     # Slice to per mma tile index
-                    #
                     tAsSFA2_pipe = cute.filter_zeros(tAsSFA2[(None, None, None, scale_producer_state.index)])
                     tBsSFB2_pipe = cute.filter_zeros(tBsSFB2[(None, None, None, scale_producer_state.index)])
-
-                    # print(f"[{os.path.basename(__file__)}:{inspect.currentframe().f_lineno}] tAgSFA2_mkl.layout: {tAgSFA2_mkl.layout}")
-                    # print(f"[{os.path.basename(__file__)}:{inspect.currentframe().f_lineno}] tBgSFB2_nkl.layout: {tBgSFB2_nkl.layout}")
 
                     tAgSFA2_k = cute.filter_zeros(
                         tAgSFA2_mkl[
@@ -2940,9 +2886,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                         )
                     )
 
-                    # {$nv-internal-release begin}
-                    # TODO: Skip more unnecessary load
-                    # {$nv-internal-release end}
+                    # Skip more unnecessary load
                     for i in cutlass.range_constexpr(cute.size(tApSFA2, mode=[1])):
                         tApSFA2[((0, 0), i, (0, 0))] = cute.elem_less(tAcSFA2_compact[(i)][0], mSFA2_mkl_current.shape[0])
                     for i in cutlass.range_constexpr(cute.size(tBpSFB2, mode=[1])):
@@ -2972,29 +2916,21 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
-        #
-        # Specialized MMA warp
-        #
+        # ==============================================================
+        # MMA warp
+        # ==============================================================
         if warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
-            #
-            # Bar sync for retrieve tensor memory ptr from shared mem
-            #
+            # Wait for TMEM allocation and view the accumulator region
             tmem.wait_for_alloc()
-
-            #
-            # Retrieving tensor memory ptr and make accumulator tensor
-            #
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
 
-            # Make SFA tmem tensor
+            # SFA TMEM tensor
             sfa_tmem_ptr = cute.recast_ptr(
                 acc_tmem_ptr + self.num_accumulator_tmem_cols,
                 dtype=self.sf_dtype,
             )
-            # (MMA, MMA_M, MMA_K)
             tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
                 tiled_mma,
                 self.mma_tiler,
@@ -3003,12 +2939,11 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             )
             tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
 
-            # Make SFB tmem tensor
+            # SFB TMEM tensor
             sfb_tmem_ptr = cute.recast_ptr(
                 acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols,
                 dtype=self.sf_dtype,
             )
-            # (MMA, MMA_N, MMA_K)
             tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
                 tiled_mma,
                 self.mma_tiler,
@@ -3017,8 +2952,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             )
             tCtSFB = cute.make_tensor(sfb_tmem_ptr, tCtSFB_layout)
 
-            # Partition for S2T copy of SFA/SFB
-            #
+            # S2T copy partition for SFA/SFB
             (
                 tiled_copy_s2t_sfa,
                 tCsSFA_compact_s2t,
@@ -3034,8 +2968,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             acc_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_acc_stage)
 
             tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
-
-            # Get the first tile info (sInfo format: expert_idx, tile_m_idx, tile_n_idx, k_tile_cnt)
+            # Prime the loop with the first work tile from the scheduler
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             for idx in cutlass.range(4, unroll_full=True):
@@ -3047,18 +2980,18 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
 
             while is_valid_tile:
 
-                # Peek (try_wait) AB buffer full for k_tile = 0
+                # Peek AB buffer full
                 peek_ab_full_status = cutlass.Boolean(1)
                 if k_tile_cnt > 0 and is_leader_cta:
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
-                # Peek (try_wait) Acc buffer empty for k_tile = 0
+                # Peek Acc buffer empty
                 acc_producer_state.reset_count()
                 peek_acc_empty_status = cutlass.Boolean(1)
                 if acc_producer_state.count < k_tile_cnt and is_leader_cta:
                     peek_acc_empty_status = acc_pipeline.producer_try_acquire(acc_producer_state)
 
-                # sInfo: (expert_idx, tile_m_idx, tile_n_idx, k_tile_cnt)
+                # This tile's (M, N, L) MMA coordinate
                 mma_tile_coord_mnl = (
                     tile_info[1] // cute.size(tiled_mma.thr_id.shape),
                     tile_info[2],
@@ -3086,28 +3019,29 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     )
                     tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
 
+                # k_tile loop
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
 
-                    # Set the correct accumulator buffer for each k_tile
                     tCtAcc = tCtAcc_base[(None, None, None, acc_stage_index)]
 
+                    # Acquire a fresh accumulator stage at the start of each scale block
                     if k_tile % k_tile_same_scale_factor == 0:
                         if is_leader_cta:
-                            # Wait for accumulator buffer empty
                             acc_pipeline.producer_acquire(acc_producer_state, peek_acc_empty_status)
 
-                    # Reset the ACCUMULATE field for each tile
+                    # Reset the ACCUMULATE field for the first tile within each scale block
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile % k_tile_same_scale_factor > 0)
 
                     if is_leader_cta:
-                        # Conditionally wait for AB buffer full
+                        # Wait for this k tile's operands, then stage SFA/SFB from SMEM into TMEM
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+
+                        # Peek the next stage's fullness so the acquire can be non-blocking
                         ab_consumer_state_next = ab_consumer_state.clone()
                         ab_consumer_state_next.advance()
                         if k_tile < k_tile_cnt - 1:
                             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state_next)
 
-                        #  Copy SFA/SFB from smem to tmem
                         s2t_stage_coord = (
                             None,
                             None,
@@ -3128,9 +3062,8 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                             tCtSFB_compact_s2t,
                         )
 
-                        # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
+                        # Issue one block-scaled MMA per K block, binding SFA/SFB each time
                         num_kblocks = cute.size(tCrA, mode=[2])
-
                         for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
                             kblock_coord = (
                                 None,
@@ -3138,8 +3071,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                                 kblock_idx,
                                 ab_consumer_state.index,
                             )
-
-                            # Set SFA/SFB tensor to tiled_mma
                             sf_kblock_coord = (None, None, kblock_idx)
                             tiled_mma.set(
                                 tcgen05.Field.SFA,
@@ -3157,28 +3088,23 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                                 tCrB[kblock_coord],
                                 tCtAcc,
                             )
-                            # Enable accumulate on tCtAcc after first kblock
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                        # Async arrive AB buffer empty
                         ab_pipeline.consumer_release(ab_consumer_state)
                         ab_consumer_state = ab_consumer_state_next
 
+                    # At the end of each scale block, commit the accumulator stage to consumers
                     if k_tile % k_tile_same_scale_factor == k_tile_same_scale_factor - 1:
                         if is_leader_cta:
-                            # Async arrive accumulator buffer full(each kblock)
                             acc_pipeline.producer_commit(acc_producer_state)
 
-                        # Peek (try_wait) Acc buffer empty for k_tile = k_tile + 1
                         acc_producer_state.advance()
                         acc_stage_index = acc_producer_state.index
                         if acc_producer_state.count < k_tile_cnt:
                             if is_leader_cta:
                                 peek_acc_empty_status = acc_pipeline.producer_try_acquire(acc_producer_state)
 
-                #
-                # Advance to next tile
-                #
+                # Get next tile from scheduler
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
@@ -3186,14 +3112,13 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 cute.arch.fence_proxy("async.shared", space="cta")
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
-            #
+
             # Wait for accumulator buffer empty
-            #
             acc_pipeline.producer_tail(acc_producer_state)
 
-        #
-        # Specialized Accumulator Update Warp
-        #
+        # ==============================================================
+        # Accumulator Update warps
+        # ==============================================================
         # Bounds compare, not `in`: tuple membership makes the 4.5 wheel's AST
         # if-region flattening choke on captured Python objects.
         if warp_idx >= self.accumulator_update_warp_id[0] and warp_idx <= self.accumulator_update_warp_id[-1]:
@@ -3206,14 +3131,12 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             # tCtAcc_base: Read partial accumulators from MMA (via acc_pipeline stages)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
-            # Final accumulated result is written to SMEM (sFinalAcc), not TMEM
-
-            # Shape-only partition on global tensor for partitioning setup
+            # Shape-only partition on global tensor (invariant setup for t2r copy atom)
             thr_mma_epi = tiled_mma.get_slice(mma_tile_coord_v)
             gD_mnl_shape = cute.local_tile(mD_mnl, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None))
             tCgD_shape = thr_mma_epi.partition_C(gD_mnl_shape)
 
-            # Setup copy operations and partition tensors
+            # Call partitioning function to setup copy operations
             acc_tidx = tidx
             (
                 tiled_copy_t2r,
@@ -3241,18 +3164,15 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 num_bits_per_copy=self.acc_dtype.width,
             )
 
-            # Initialize pipeline states
             # Consumer of acc_pipeline (receives partial accumulators from MMA)
             acc_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_acc_stage)
-            # consumer of scale_pipeline (receives scale factors from scale load warp)
+            # Consumer of scale_pipeline (receives second-level scales from the scale load warp)
             scale_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_scale_stage)
             # Producer for epi_pipeline (sends final accumulator to epilogue)
             epi_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_epi_stage)
 
-            # Initialize scheduler consumption
             tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
-
-            # Get first tile info from scheduler
+            # Prime the loop with the first work tile from the scheduler
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             for idx in cutlass.range(4, unroll_full=True):
@@ -3291,7 +3211,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 if scale_consumer_state.count < k_tile_cnt:
                     peek_scale_full_status = scale_pipeline.consumer_try_wait(scale_consumer_state)
 
-                # Loop over k_tiles to accumulate partial accumulators
+                # k_tile loop
                 for k_tile_idx in cutlass.range(0, k_tile_cnt // k_tile_same_scale_factor, 1, unroll=1):
 
                     # Wait for scale buffer full
@@ -3308,9 +3228,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     cute.copy(scale_atom_copy, tTR_sSFA_slice, tTR_rSFA)
                     cute.copy(scale_atom_copy, tTR_sSFB_slice, tTR_rSFB)
 
-                    #
                     # Async arrive scale buffer empty
-                    #
                     scale_pipeline.consumer_release(scale_consumer_state)
                     scale_consumer_state.advance()
 
@@ -3323,14 +3241,14 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     # Group modes for subtile iteration
                     tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
 
-                    # Process each subtile (gate/up interleaving handled by layout)
+                    # Process each subtile
                     subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                     for subtile_idx in cutlass.range(subtile_cnt):
-                        # Load partial accumulator subtile from TMEM to registers.
+                        # Load partial accumulator from TMEM to register
                         tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
-                        # Second-level scale-multiply-accumulate: final += partial * sfa2 * sfb2.
+                        # Accumulate: final += partial * (SFA2 * SFB2)
                         tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
                         acc_vec = tTR_rAcc.load()
                         final_vec = tTR_rAcc_subtile.load()
@@ -3387,9 +3305,9 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             # Signal epilogue that no more tiles
             epi_pipeline.producer_tail(epi_producer_state)
 
-        #
-        # Specialized epilogue warps
-        #
+        # ==============================================================
+        # Epilogue warps
+        # ==============================================================
         # Bounds compare, not `in` (see accumulator warps above). Both sides are
         # dynamic here (epilog_warp_id starts at 4, so neither const-folds like
         # the accumulator group's `>= 0`), so combine with bitwise `&`, not
@@ -3397,29 +3315,16 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         # 4.5 wheel's tracer rejects.
         if (warp_idx >= self.epilog_warp_id[0]) & (warp_idx <= self.epilog_warp_id[-1]):
             cute.arch.warpgroup_reg_alloc(self.num_regs_epilogue_warps)
-            #
-            # Alloc tensor memory buffer
-            #
+            # Allocate TMEM (this warpgroup owns the allocation), then view the accumulator region
             tmem.allocate(self.num_tmem_alloc_cols)
-
-            #
-            # Bar sync for retrieve tensor memory ptr from shared memory
-            #
             tmem.wait_for_alloc()
-
-            #
-            # Retrieving tensor memory ptr and make accumulator tensor
-            #
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            # (MMA, MMA_M, MMA_N, STAGE)
             # Final accumulator now lives in SMEM (sFinalAcc); TMEM here is only used by
             # MMA partials + SF. tCtAcc_base is a shape/TV-layout carrier for the t2r
             # template below — it is never dereferenced as the load source in the epilogue.
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
-            #
             # Partition for epilogue (SMEM/TMEM/register - invariant across experts)
-            #
             epi_tidx = tidx % 128
 
             # Shape-only partition on global tensor (invariant setup for t2r copy atom)
@@ -3478,13 +3383,13 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
 
             epi_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_epi_stage)
 
-            # Load C pipeline
+            # c_pipeline states
             c_pipeline_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_c_stage)
             # C is now produced by this epilogue warp group (warp epilog_warp_id[0]
             # issues the TMA); previously a dedicated warp owned this producer state.
             c_pipeline_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_c_stage)
 
-            # Threads/warps participating in tma store pipeline
+            # Initialize d_pipeline (TMA store) owned by the epilogue warpgroup
             d_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
                 32 * len(self.epilog_warp_id),
@@ -3497,9 +3402,8 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
 
             tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
 
-            # Get the first tile info (sInfo format: expert_idx, tile_m_idx, tile_n_idx, k_tile_cnt)
+            # Prime the loop with the first work tile from the scheduler
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
-
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             for idx in cutlass.range(4, unroll_full=True):
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
@@ -4298,9 +4202,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 epi_pipeline.consumer_release(epi_consumer_state)
                 epi_consumer_state.advance()
 
-                #
-                # Advance to next tile
-                #
+                # Get next tile from scheduler
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
