@@ -2038,12 +2038,30 @@ def _correction_warp_group(
             # residue * 0 -> NaN.  Zero O with a SELECT, never a multiply -- and
             # BEFORE the amax fold below, or one dead row's NaN permanently
             # inflates the graph's Amax_O for every live row (atomicMax only grows).
-            _kv_empty = bounds.right <= bounds.left
-            if cutlass.const_expr(not CFG.HAS_SINK):
-                lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
-
             # OOB-row guard: under cga2 cluster Q rows can exceed seqlen_q (else write aliases next head's LSE slot).
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
+            _kv_empty = bounds.right <= bounds.left
+            # A row with no live key inside a live tile -- bottom-right rows above the diagonal, a left band
+            # past the last key, a zero KV length -- read off the mask geometry: these kernels mask with a
+            # finite sentinel, so a keyless row's softmax sum is N, not 0, and cannot tell itself apart.
+            if cutlass.const_expr(CFG.MASK_FLAGS != 0):
+                _diag = (eff_seqlen_kv - eff_seqlen_q) if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+                _last_k = eff_seqlen_kv - cutlass.Int32(1)
+                if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
+                    _last_k = cute.math.min(_last_k, q_row_global + _diag + cutlass.Int32(CFG.WINDOW_RIGHT))
+                _first_k = cutlass.Int32(0)
+                if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
+                    _first_k = cute.math.max(_first_k, q_row_global + _diag - cutlass.Int32(CFG.WINDOW_LEFT))
+                _kv_empty = _kv_empty | (_first_k > _last_k)
+            if cutlass.const_expr(not CFG.HAS_SINK):
+                # A sink leaves real mass and the branch above already yields
+                # LSE = sink_logit there; without one an empty row is -inf.
+                lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
+            else:
+                # A keyless row with a sink holds the sink's mass alone: LSE = sink_logit. The finite mask
+                # sentinel, scaled, can overflow to -inf and NaN the sink fold, so the value is selected, not
+                # computed; O is zeroed by the same _kv_empty select below.
+                lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(sink_logit).ir_value(), lse_val.ir_value()))
             if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
                 # Dense padded-Q trim: q rows >= seq_len_q[b] write O := 0 / LSE := -inf
                 # (after the sink branch: a trimmed row is dead even with a sink); folded

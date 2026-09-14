@@ -526,6 +526,64 @@ def test_dsl_sm100_bottom_right_padded_seq_q(d_qk, d_v):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["llama_d128", "mla_d192_d128", "qwen_d256", "dsv4_d512"])
+@pytest.mark.parametrize("with_sink", [False, True], ids=["nosink", "sink"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_bottom_right_keyless_rows(d_qk, d_v, with_sink):
+    """Bottom-right with seq_len_kv[b] < seq_len_q[b]: rows above the diagonal
+    have no live key inside a live tile. Without a sink they are exactly
+    O = 0 / LSE = -inf; with one the row's mass is the sink alone, so
+    LSE = sink_logit and O = 0. scale * log2(e) > 1 overflows a finite mask
+    sentinel, the case a softmax-sum dead-row test misses (NaN under a sink)."""
+    _require_dsl()
+    dtype = torch.float16
+    b, h_q, h_kv, s = 3, 8, 4, 256
+    scale = 0.75
+    q = _bhsd(b, h_q, s, d_qk, dtype)
+    k = _bhsd(b, h_kv, s, d_qk, dtype)
+    v = _bhsd(b, h_kv, s, d_v, dtype)
+    seq_q_lens = torch.tensor([256, 129, 0], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    seq_kv_lens = torch.tensor([200, 256, 128], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    sink = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_len_kv=seq_kv_lens,
+        seq_len_q=seq_q_lens,
+        sink=sink,
+        return_stats=True,
+    )
+    lse = lse.squeeze(-1)  # dense Stats storage is (B, H, S, 1)
+    o_ref, lse_ref = _ref_sdpa_full(
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=True,
+        bottom_right=True,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+        sinks=sink.flatten() if with_sink else None,
+        return_stats=True,
+    )
+    assert torch.isfinite(o.float()).all(), "keyless rows must not NaN the output"
+    # batch 0: diagonal 200 - 256 = -56 -> rows 0..55 keyless; batch 1 trims at 129; batch 2 is empty
+    assert (o[0, :, :56] == 0).all() and (o[1, :, 129:] == 0).all() and (o[2] == 0).all()
+    assert torch.isneginf(lse[1, :, 129:]).all() and torch.isneginf(lse[2]).all()
+    if with_sink:
+        torch.testing.assert_close(lse[0, :, :56], sink.view(h_q, 1).expand(h_q, 56), atol=1e-4, rtol=0)
+    else:
+        assert torch.isneginf(lse[0, :, :56]).all()
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse[0], lse_ref[0], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse[1, :, :129], lse_ref[1, :, :129], atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)
