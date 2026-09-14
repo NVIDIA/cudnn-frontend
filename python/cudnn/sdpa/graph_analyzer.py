@@ -905,6 +905,17 @@ class SdpaBinding:
     sf_k_T: Any = None
     sf_dO: Any = None
     sf_dO_T: Any = None
+    # Ragged-offset tensors of the THD ports (issue #737): bound by the caller
+    # like any other operand, consumed by the rows that read them on device.
+    ro_q: Any = None
+    ro_k: Any = None
+    ro_v: Any = None
+    ro_o: Any = None
+    ro_do: Any = None
+    ro_dq: Any = None
+    ro_dk: Any = None
+    ro_dv: Any = None
+    ro_stats: Any = None
 
     # Built once on first use and reused. Rebuilding it per execute cost ~1.3 us
     # per bound operand: three passes over the bound list and five dict
@@ -965,6 +976,15 @@ class SdpaBinding:
                 self.sf_k_T,
                 self.sf_dO,
                 self.sf_dO_T,
+                self.ro_q,
+                self.ro_k,
+                self.ro_v,
+                self.ro_o,
+                self.ro_do,
+                self.ro_dq,
+                self.ro_dk,
+                self.ro_dv,
+                self.ro_stats,
             )
             if t is not None
         ]

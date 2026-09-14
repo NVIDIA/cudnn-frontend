@@ -525,12 +525,18 @@ fused-KV slicing layout) is served at that stride, the gap columns never read or
 written. The strides are plan-time (the compiled fakes carry them); a compact
 port keeps the compact fake, byte-identical codegen.
 Lengths arrive as the graph's per-batch `seq_len_q/kv` (`use_padding_mask=True`)
-and become `cu_seqlens` on device in a one-warp setup launch. Like every FROST
-THD row, the packed addressing is `prefix(lengths) × token stride`: the bound
-ragged-offset VALUES are not read, so sequences must be adjacent (TE-style
-padded THD with gaps between sequences, `cu_seqlens_padded != cu_seqlens`, is
-not served and is runtime data that cannot be declined at plan time — issue
-#737 tracks reading the offsets on device). **Declared
+and become `cu_seqlens` on device in a one-warp setup launch, which also reads
+**the bound ragged offsets of every port** (issue #737): each of Q/K/V/O/dO,
+dQ/dK/dV and Stats places sequence `b` at its own token origin `ro[b] × M / ts`
+(`M` the port's `ragged_offset_multiplier`, `ts` its token stride), so a padded
+layout with gaps between sequences (TE's `cu_seqlens_padded`, per side or per
+port) is read and written where the caller put it and the gap rows are never
+touched; a port bound without an offset takes `prefix(lengths)`. The internal
+accumulators stay packed at `prefix(lengths)`. Contract: offsets are whole
+tokens — an offset that is not a multiple of the port's token stride makes the
+sequence **dead** on device (length 0, its rows untouched, the metadata flag word
+set); it cannot be declined at plan time because the values are device data.
+**Declared
 `max_total_seq_len_q/kv` are required** (the fp32 dQ accumulator, the
 per-query-head dK/dV partials and do_dot are sized from them at build time).
 Ragged Stats is read in either packed packing — token-major `(T, H)` or
