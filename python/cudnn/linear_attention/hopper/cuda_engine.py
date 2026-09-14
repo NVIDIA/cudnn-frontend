@@ -1,0 +1,205 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Hopper (sm90) KDA engine backed by a fused CUDA C++ kernel.
+
+Second sm90 KDA path, alongside ``kda_engine.KdaHopperEngine``. Same operation,
+same envelope, different implementation: one fused ``__global__`` compiled with
+NVRTC and launched through the driver API, rather than a CuTe DSL PREP+SCAN pair.
+
+Why both exist: on H100 SXM at the production gate, measured with one harness on
+one node with FlashKDA as an in-run control, the fused kernel is **53.9 us**
+geomean over ten shapes against the CuTe DSL kernel's **368.5 us** and FlashKDA's
+**438.3 us** -- 8.12x FlashKDA, winning all ten shapes. It runs at 1.6-1.8x of
+the minimum-memory-traffic roofline, so it is close to bandwidth-bound; FlashKDA
+sits ~26x above that roofline because its cost is a serial scan on ~12 CTAs.
+
+It is a separate engine rather than a replacement because the two have different
+dependency footprints: this one needs NVRTC and a CUDA toolkit include tree, the
+CuTe DSL one needs ``nvidia-cutlass-dsl``. Neither is guaranteed present, so
+declining independently is better than one engine with two failure modes.
+"""
+
+from typing import TYPE_CHECKING
+
+from cudnn import behavior_note
+from cudnn.engines.base import BaseEngine, CompiledPlan, bind_ports
+from cudnn.frost import buffers
+from cudnn.graph_types import NodeType
+
+from ..graph_analyzer import analyze
+
+if TYPE_CHECKING:
+    from cudnn._pygraph import pygraph
+
+HOPPER_SM = 90
+HEAD_DIM = 128
+
+
+class KdaHopperCudaPlan(CompiledPlan):
+    """Bind the node's ports and launch the fused kernel.
+
+    Destination-passing: ``o`` and ``final_state`` are written in place. The
+    kernel always produces a final state, so a graph that did not ask for one
+    gets a scratch buffer whose result is dropped.
+    """
+
+    takes_variant_pack = True
+    plan_name = "KdaHopperCudaEngine"
+
+    def __init__(self, graph):
+        (node,) = graph.nodes
+        q, v, cu = (node.inputs[p] for p in ("q", "v", "cu_seqlens"))
+        self.total, self.h, self.k = (int(d) for d in q.dim)
+        self.v_dim = int(v.dim[2])
+        self.n_seqs = int(cu.dim[0]) - 1
+        self.ports = None
+        self._scratch_state = None
+        self._zero_state = None
+        self._device = None
+
+    def get_workspace_size(self) -> int:
+        # The kernel declares a workspace and never touches it, so nothing is
+        # carved out of the caller's.
+        return 0
+
+    def execute(self, graph, variant_pack, ctx) -> None:
+        import torch
+
+        from . import cuda_host
+
+        if self.ports is None:
+            self.ports = bind_ports(graph, variant_pack)
+            (slots,) = self.ports.values()
+            self.names = list(slots.inputs) + list(slots.outputs)
+            self.indices = list(slots.inputs.values()) + list(slots.outputs.values())
+        views = variant_pack.operands(self.indices)
+
+        # The kernel takes raw device addresses, so unlike the CuTe DSL path
+        # there is no DLPack conversion at all on this route -- the OperandBuffer
+        # already knows its pointer.
+        addr = {name: int(view.data_ptr()) for name, view in zip(self.names, views)}
+
+        if self._device is None:
+            self._device = torch.from_dlpack(views[0]).device
+
+        if "final_state" in addr:
+            final_state = addr["final_state"]
+        else:
+            if self._scratch_state is None:
+                self._scratch_state = torch.empty(
+                    self.n_seqs,
+                    self.h,
+                    self.v_dim,
+                    self.k,
+                    dtype=torch.float32,
+                    device=self._device,
+                )
+            final_state = int(self._scratch_state.data_ptr())
+
+        # A graph without initial_state means "seed from zero".
+        if "initial_state" in addr:
+            initial_state = addr["initial_state"]
+        else:
+            if self._zero_state is None:
+                self._zero_state = torch.zeros(
+                    self.n_seqs,
+                    self.h,
+                    self.v_dim,
+                    self.k,
+                    dtype=torch.float32,
+                    device=self._device,
+                )
+            initial_state = int(self._zero_state.data_ptr())
+
+        stream = ctx.stream if ctx.stream else torch.cuda.current_stream().cuda_stream
+        cuda_host.launch(
+            device=self._device.index if self._device.index is not None else 0,
+            stream=int(stream),
+            q=addr["q"],
+            k=addr["k"],
+            v=addr["v"],
+            g=addr["g"],
+            beta=addr["beta"],
+            cu_seqlens=addr["cu_seqlens"],
+            initial_state=initial_state,
+            o=addr["O"],
+            final_state=final_state,
+            total_tokens=self.total,
+            n_seqs=self.n_seqs,
+            n_heads=self.h,
+        )
+
+
+class KdaHopperCudaEngine(BaseEngine):
+    """Hopper (sm90) fused-CUDA backend for single-node KDA forward graphs (THD)."""
+
+    name = "kda_hopper_cuda"
+    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
+
+    def check_support(self, graph: "pygraph") -> None:
+        import cudnn
+
+        facts = graph._facts_for(analyze)
+        if facts is None or facts.op != "KDA":
+            raise NotImplementedError("KdaHopperCudaEngine supports exactly one KDA node")
+        if facts.invalid:
+            raise NotImplementedError(f"KdaHopperCudaEngine: {facts.invalid}")
+
+        sm = buffers.current_sm()
+        if sm != HOPPER_SM:
+            raise NotImplementedError(f"KdaHopperCudaEngine is the Hopper path and requires SM90 (found {sm})")
+
+        # NVRTC and a CUDA include tree are the hard dependency here, in place of
+        # the CuTe DSL engine's nvidia-cutlass-dsl. Probe it rather than letting
+        # the first execute() fail: an engine that cannot compile should decline.
+        try:
+            from ..cake import compiler  # noqa: F401
+            from . import cuda_host
+
+            compiler.cuda_include_dirs()
+        except Exception as exc:  # noqa: BLE001 -- any import/toolkit failure is a decline
+            raise NotImplementedError(f"KdaHopperCudaEngine needs NVRTC and a CUDA include tree: {exc}") from exc
+
+        # --- scope. Identical to the CuTe DSL engine's: same operation, same
+        # kernel envelope, so a graph either engine declines is declined by both.
+        if facts.is_bwd:
+            raise NotImplementedError("KdaHopperCudaEngine: forward only; there is no Hopper KDA backward kernel yet")
+        if facts.checkpoint_every_n_tokens:
+            raise NotImplementedError("KdaHopperCudaEngine: state_checkpoints are not produced by the Hopper kernel")
+        if facts.safe_gate or facts.has_a_log or facts.has_dt_bias:
+            raise NotImplementedError("KdaHopperCudaEngine: the kernel takes log-space g directly; " "safe_gate/a_log/dt_bias are unsupported")
+        if facts.use_beta_sigmoid:
+            raise NotImplementedError("KdaHopperCudaEngine: beta must be post-sigmoid; use_beta_sigmoid_in_kernel is unsupported")
+        if facts.use_qk_l2norm:
+            raise NotImplementedError("KdaHopperCudaEngine: q/k must be pre-normalized; use_qk_l2norm_in_kernel is unsupported")
+        if getattr(facts, "gate_domain", "log") != "log":
+            raise NotImplementedError("KdaHopperCudaEngine: gate_domain='linear' is unsupported")
+
+        # The kernel bakes in q * 1/sqrt(D) and takes no scale argument, so any
+        # other scale would be silently ignored and produce a wrong answer.
+        if facts.scale is not None and abs(facts.scale - HEAD_DIM**-0.5) > 1e-9:
+            raise NotImplementedError(f"KdaHopperCudaEngine: only the default scale 1/sqrt({HEAD_DIM}) is supported, got {facts.scale}")
+        if facts.cu_dtype not in (cudnn.data_type.INT32, None):
+            raise NotImplementedError(f"KdaHopperCudaEngine: cu_seqlens must be int32, got {facts.cu_dtype}")
+        if facts.d_qk != HEAD_DIM or facts.d_v != HEAD_DIM:
+            raise NotImplementedError(f"KdaHopperCudaEngine: head dims must be {HEAD_DIM}, got K={facts.d_qk} V={facts.d_v}")
+        if not (facts.h_q == facts.h_k == facts.h_v):
+            raise NotImplementedError(
+                "KdaHopperCudaEngine: grouped heads are unsupported; q/k/v head counts must match " f"(got {facts.h_q}/{facts.h_k}/{facts.h_v})"
+            )
+        if facts.io_dtype not in (cudnn.data_type.BFLOAT16, None):
+            raise NotImplementedError(f"KdaHopperCudaEngine: q/k/v must be bf16, got {facts.io_dtype}")
+        if facts.g_dtype not in (cudnn.data_type.FLOAT, None):
+            raise NotImplementedError(f"KdaHopperCudaEngine: 'g' must be fp32, got {facts.g_dtype}")
+        if facts.beta_dtype not in (cudnn.data_type.FLOAT, None):
+            raise NotImplementedError(f"KdaHopperCudaEngine: 'beta' must be fp32, got {facts.beta_dtype}")
+        if facts.final_state_dtype not in (cudnn.data_type.FLOAT, None):
+            raise NotImplementedError(f"KdaHopperCudaEngine: 'final_state' must be fp32, got {facts.final_state_dtype}")
+        if facts.state_dtype not in (cudnn.data_type.FLOAT, None):
+            raise NotImplementedError(f"KdaHopperCudaEngine: 'initial_state' must be fp32, got {facts.state_dtype}")
+        if not facts.thd_layout:
+            raise NotImplementedError("KdaHopperCudaEngine: q/k/v must be THD [total_T, heads, dim]")
+
+    def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
+        return KdaHopperCudaPlan(graph)

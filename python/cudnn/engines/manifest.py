@@ -175,6 +175,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "kda_summary_frost": EngineSlot(2),
             "kda_cake": EngineSlot(3),
             "kda_hopper": EngineSlot(4),
+            "kda_hopper_cuda": EngineSlot(5),
         },
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
