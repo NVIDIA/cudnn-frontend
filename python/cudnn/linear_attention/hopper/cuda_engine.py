@@ -1,23 +1,46 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Hopper (sm90) KDA engine backed by a fused CUDA C++ kernel.
+"""Hopper (sm90) KDA engine backed by fused CUDA C++ kernels, both directions.
 
 Second sm90 KDA path, alongside ``kda_engine.KdaHopperEngine``. Same operation,
-same envelope, different implementation: one fused ``__global__`` compiled with
-NVRTC and launched through the driver API, rather than a CuTe DSL PREP+SCAN pair.
+different implementation: CUDA C++ compiled with NVRTC and launched through the
+driver API, rather than a CuTe DSL PREP+SCAN pair.
 
-Why both exist: on H100 SXM at the production gate, measured with one harness on
-one node with FlashKDA as an in-run control, the fused kernel is **53.9 us**
-geomean over ten shapes against the CuTe DSL kernel's **368.5 us** and FlashKDA's
-**438.3 us** -- 8.12x FlashKDA, winning all ten shapes. It runs at 1.6-1.8x of
-the minimum-memory-traffic roofline, so it is close to bandwidth-bound; FlashKDA
-sits ~26x above that roofline because its cost is a serial scan on ~12 CTAs.
+Forward is one fused ``__global__``. Backward is four (``k_meta``, ``k_prep``,
+``k_scan_t``, ``k_bwd``) over a carved workspace, and is the only sm90 KDA
+backward there is -- ``kda_engine`` has a forward kernel only, so before this a
+Hopper backward fell to ``kda_cutile``.
 
-It is a separate engine rather than a replacement because the two have different
-dependency footprints: this one needs NVRTC and a CUDA toolkit include tree, the
-CuTe DSL one needs ``nvidia-cutlass-dsl``. Neither is guaranteed present, so
-declining independently is better than one engine with two failure modes.
+Why both engines exist: they have different dependency footprints. This one
+needs NVRTC and a CUDA toolkit include tree, the CuTe DSL one needs
+``nvidia-cutlass-dsl``. Neither is guaranteed present, so declining
+independently is better than one engine with two failure modes.
+
+On performance, read these as KERNEL figures, measured standalone on H100 SXM at
+the production gate with an in-run control -- not as what a caller sees through
+this engine:
+
+* forward: 53.9 us geomean over ten shapes, against the CuTe DSL kernel's
+  368.5 us and FlashKDA's 438.3 us (8.12x FlashKDA, winning all ten). It runs
+  at 1.6-1.8x of the minimum-memory-traffic roofline, so it is close to
+  bandwidth-bound; FlashKDA sits ~26x above that roofline because its cost is a
+  serial scan on ~12 CTAs.
+* backward: 316.2 us geomean over six shapes against the cuTile backward's
+  1765.4 us (5.58x per-call, 4.37x pipelined).
+
+The gap between those and the engine matters here and is not yet closed. The
+cuDNN FE op/graph layer costs a fixed ~115 us per call, measured on this path
+as engine-minus-direct-launch across four shapes. The forward kernel is fast
+enough (47-63 us) that this DOMINATES per-call latency, so the 8.12x does not
+survive to the caller per-call; pipelined, the overhead overlaps with GPU work
+and falls to ~0 at the larger shapes. Engine-level timing against FlashKDA on
+SXM has NOT been measured yet, so no engine-level speedup is claimed.
+
+Correctness IS established for both directions on H100 at the production gate
+(``gate_lower_bound = -5``) with a non-zero ``initial_state``: forward 6/6
+workloads on both outputs, backward 6/6 shapes on all six gradients scored by
+the campaign definition's three-term checker.
 """
 
 from typing import TYPE_CHECKING
