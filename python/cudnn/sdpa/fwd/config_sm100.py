@@ -80,7 +80,7 @@ class TemplateParams:
     has_sink: bool = False
     seq_kv_lens_present: bool = False
     # Dense padded-Q trim: per-batch seq_len_q is a SEPARATE (B,)-int32
-    # kernel parameter (seq_q_lens_tensor — mirrors cuDNN's distinct SEQLEN_Q
+    # kernel parameter (seq_q_lens_addr — mirrors cuDNN's distinct SEQLEN_Q
     # pointer / FA's seqused_q; compiled into the signature only under this
     # flag); q rows >= seq_len_q[b] write O := 0 / LSE := -inf (cuDNN >= 9.14
     # convention). Dense-only — THD carries per-sequence Q lengths via

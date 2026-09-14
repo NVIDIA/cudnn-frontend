@@ -55,6 +55,15 @@ from cudnn.sdpa.fwd.config_sm120 import (
 )
 
 
+def _q_lens_addr(t: Optional[torch.Tensor]) -> int:
+    """Kernel-side slot for the per-batch Q lengths: the (B,) int32 tensor's device address, 0 when absent.
+
+    A raw Int64 scalar rather than a tensor parameter: on SM107 prefill_d512_mxfp8 the extra cute.Tensor parameter
+    alone pushed ptxas from 159 to 254 registers (+28 percent device time); the same reads through a raw pointer
+    cost nothing. The caller keeps the tensor alive across execute (it is the graph's own seq_len_q buffer)."""
+    return 0 if t is None else int(t.data_ptr())
+
+
 def dtype_name(buffer) -> str:
     """The buffer's dtype as a bare name, whoever produced it.
 
@@ -2065,7 +2074,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 (b, h, self.h_kv, sq, self.s_k_max, 0),
                 cutlass.Float32(scale_softmax_log2),
                 cutlass.Int32(0),
-                seq_q_t,
+                _q_lens_addr(seq_q_t),
                 **({"o_partial_f32": o_partial} if self._fp32_partial_split() else {}),
                 **paged_kwargs,
                 stream=current_stream,
@@ -2094,7 +2103,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 (self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, 0),
                 cutlass.Float32(scale_softmax_log2),
                 cutlass.Int32(0),
-                seq_q_t,
+                _q_lens_addr(seq_q_t),
                 **({"o_partial_f32": o_partial} if self._fp32_partial_split() else {}),
                 **paged_kwargs,
                 stream=current_stream,
@@ -2694,7 +2703,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
             O_dst, lse_dst = self._split_partials(workspace, device, current_stream)
-        dense_q_lens_args = (seq_q_t,) if self._quantized_q_lens_abi else ()
+        dense_q_lens_args = (_q_lens_addr(seq_q_t),) if self._quantized_q_lens_abi else ()
         self._compiled_kernel(
             Q,
             K,
@@ -2878,7 +2887,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
             O_dst, lse_dst = self._split_partials(workspace, device, current_stream)
-        dense_q_lens_args = (seq_q_t,) if self._quantized_q_lens_abi else ()
+        dense_q_lens_args = (_q_lens_addr(seq_q_t),) if self._quantized_q_lens_abi else ()
         self._compiled_kernel(
             Q,
             K,
@@ -3858,7 +3867,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.O if pack is not None else o_dst,
             lse_dst,
             sinks_t,
-            pack.seq_q_dummy if pack is not None else seq_q_t,
+            _q_lens_addr(pack.seq_q_dummy if pack is not None else seq_q_t),
             pack.meta if pack is not None else seq_kv_t,
             amax_o_buf.view(torch.int32),
             cutlass.Float32(scale_softmax_log2),
@@ -4131,7 +4140,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.O,
             lse,
             sinks_t,
-            pack.seq_q_dummy,
+            _q_lens_addr(pack.seq_q_dummy),
             pack.meta,
             cutlass.Float32(scale_softmax_log2),
             cutlass.Int32(pack.max_sq),
