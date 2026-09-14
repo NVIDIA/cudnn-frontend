@@ -204,6 +204,15 @@ class Capabilities:
     # the row's workspace is sized from the packed token totals at BUILD time,
     # before any buffer exists.
     thd_declared_totals: bool = False
+    # True when the row READS the bound ragged offsets on device and places each
+    # port's sequences at its own token origin (issue #737), so a padded THD
+    # layout (gaps between sequences, TE's cu_seqlens_padded) is served where
+    # the caller put it. False = the row derives every origin as
+    # prefix(lengths) and never reads the offset values (the packed contract).
+    # A path property of each row, not a feature conjunction: it gates only the
+    # rules that assume prefix(lengths) addressing (the head-major Stats head
+    # stride bound below).
+    thd_ragged_offsets: bool = False
     # s_q == 1 (decode-shaped) graphs; rows whose kernels are prefill-only gate
     # them off.
     decode: bool = True
@@ -412,11 +421,19 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
                     f"THD stats must be packed token-major (stride_h == 1, stride_s == {facts.h_q}) "
                     f"or head-major (stride_s == 1, stride_h == head stride); got stride {s_stride}"
                 )
-            # Head-major: the head stride is the caller's, and the kernel reads
-            # [0, h, row] at it for every row below the packed token extent the
-            # adapter binds (min(B * S_max, declared) -- see thd_total_q). A
-            # shorter stride would put the later heads past the buffer.
-            if head_major and facts.max_total_seq_len_q is not None and stride_h < min(facts.b * facts.s_q, facts.max_total_seq_len_q):
+            # Head-major: the head stride is the caller's, and a row that places
+            # the Stats rows at prefix(lengths) reads [0, h, row] at it for every
+            # row below the packed token extent the adapter binds (min(B * S_max,
+            # declared) -- see thd_total_q); a shorter stride would put the later
+            # heads past the buffer. A row that reads the Stats port's own
+            # ragged offsets reaches only the rows the caller placed, so the
+            # bound does not apply (thd_ragged_offsets).
+            if (
+                head_major
+                and not capabilities.thd_ragged_offsets
+                and facts.max_total_seq_len_q is not None
+                and stride_h < min(facts.b * facts.s_q, facts.max_total_seq_len_q)
+            ):
                 return (
                     f"THD head-major stats head stride {stride_h} must cover the packed token total " f"{min(facts.b * facts.s_q, facts.max_total_seq_len_q)}"
                 )
@@ -578,6 +595,30 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     stats_stride_h, stats_stride_s = (int(stats_geom[1][1]), int(stats_geom[1][2])) if thd else (0, 0)
     stats_token_major = thd and ga.thd_stats_packing(stats_stride_h, stats_stride_s, facts.h_q) == "token_major"
     stats_head_stride = stats_stride_h if (thd and not stats_token_major) else 0
+    # Ragged offsets per port (issue #737).  Every ragged port carries its own
+    # offset tensor and multiplier; a row that derives sequence origins from
+    # them (sdpa_bwd_sm80) gets the plan-time spec here and the tensors at
+    # execute, one that still assumes prefix(lengths) ignores both.
+    _ro_ports = (
+        ("q", facts.q_t),
+        ("k", facts.k_t),
+        ("v", facts.v_t),
+        ("o", facts.o_t),
+        ("do", facts.do_t),
+        ("dq", facts.dq_t),
+        ("dk", facts.dk_t),
+        ("dv", facts.dv_t),
+        ("stats", facts.stats_t),
+    )
+    _ro_tensors = {role: getattr(t, "ragged_offset", None) for role, t in _ro_ports} if thd else {}
+    _ro_tensors = {role: ro for role, ro in _ro_tensors.items() if ro is not None}
+    _ro_dtypes = {cudnn.data_type.INT32: torch.int32, cudnn.data_type.INT64: torch.int64}
+    for role, ro in _ro_tensors.items():
+        if ro.get_data_type() not in _ro_dtypes:
+            raise ValueError(f"cudnn.sdpa: the {role} ragged offset must be int32 or int64; got {ro.get_data_type()}")
+    _thd_ragged_offsets = {
+        role: (_ro_dtypes[ro.get_data_type()], int(getattr(dict(_ro_ports)[role], "ragged_offset_multiplier", 1) or 1)) for role, ro in _ro_tensors.items()
+    }
     # Sink ports: geometry straight from the IR tensors (fp32 (1, H_q, 1, 1)).
     sink_geom = (tuple(facts.sink_t.get_dim()), tuple(facts.sink_t.get_stride())) if facts.has_sink else None
     dsink_geom = (tuple(facts.dsink_t.get_dim()), tuple(facts.dsink_t.get_stride())) if facts.has_dsink else None
@@ -597,12 +638,18 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         "max_total_seq_len_kv": facts.max_total_seq_len_kv,
         "thd_stats_token_major": stats_token_major,
         "thd_stats_head_stride": stats_head_stride,
+        # The ports that bind a ragged offset, with the offset dtype and the
+        # multiplier (issue #737): plan-time facts a row that reads the offsets
+        # on device compiles against; the VALUES are bound at execute below.
+        "thd_ragged_offsets": _thd_ragged_offsets,
         "has_bias": facts.has_bias,
         "bias_is_fp32": (facts.bias_t.get_data_type() == cudnn.data_type.FLOAT) if facts.bias_t is not None else True,
         "bias_batch": int(facts.bias_t.get_dim()[0]) if facts.bias_t is not None else 1,
         "has_rope": False,  # RoPE-fused multi-node graphs never reach the analyzer
     }
     _extra_ctor = {k: v for k, v in _extra_ctor.items() if k in inspect.signature(adapter_cls.__init__).parameters}
+    # Only an adapter that reads the offsets on device takes them at execute.
+    _execute_takes_ro = "thd_ragged_offsets" in inspect.signature(adapter_cls.execute).parameters
     api = adapter_cls(
         sample_q=_desc(q_geom, facts.dtype, "q"),
         sample_k=_desc(k_geom, facts.dtype, "k"),
@@ -654,6 +701,15 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dsink=facts.dsink_t if facts.has_dsink else None,
         bias=facts.bias_t if facts.has_bias else None,
         dbias=facts.dbias_t if facts.has_dbias else None,
+        ro_q=_ro_tensors.get("q"),
+        ro_k=_ro_tensors.get("k"),
+        ro_v=_ro_tensors.get("v"),
+        ro_o=_ro_tensors.get("o"),
+        ro_do=_ro_tensors.get("do"),
+        ro_dq=_ro_tensors.get("dq"),
+        ro_dk=_ro_tensors.get("dk"),
+        ro_dv=_ro_tensors.get("dv"),
+        ro_stats=_ro_tensors.get("stats"),
     )
 
     def _canonical_view(buf, geom):
@@ -726,6 +782,25 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dsink_buf = _canonical_view(resolved[id(binding.dsink)], dsink_geom) if binding.dsink is not None else None
         bias_buf = _canonical_view(resolved[id(binding.bias)], bias_geom) if binding.bias is not None else None
         dbias_buf = _canonical_view(resolved[id(binding.dbias)], dbias_geom) if binding.dbias is not None else None
+        # The bound ragged-offset tensors, flattened ((B+1, 1, 1, 1) in the
+        # graph); only for an adapter that consumes them (issue #737).
+        _ro_kw = {}
+        if _execute_takes_ro and thd:
+            _ro_kw["thd_ragged_offsets"] = {
+                role: resolved[id(ref)].reshape(-1)
+                for role, ref in (
+                    ("q", binding.ro_q),
+                    ("k", binding.ro_k),
+                    ("v", binding.ro_v),
+                    ("o", binding.ro_o),
+                    ("do", binding.ro_do),
+                    ("dq", binding.ro_dq),
+                    ("dk", binding.ro_dk),
+                    ("dv", binding.ro_dv),
+                    ("stats", binding.ro_stats),
+                )
+                if ref is not None
+            }
         api.execute(
             q_tensor=q_buf,
             k_tensor=k_buf,
@@ -752,6 +827,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             # engine plan passes ctx.stream); None keeps the adapter's
             # torch-current-stream fallback.
             current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
+            **_ro_kw,
         )
         return None
 
@@ -782,10 +858,12 @@ def _sm80_spec() -> EngineSpec:
     launch, Stats read in either packed packing, declared totals sizing
     the carved scratch -- hence ``thd_declared_totals``).  Deterministic dQ,
     sinks, GQA, the causal family and head-dim envelope padding all ride it;
-    bias / dBias is dense-only (a path property, see mismatch()).  As on every
-    FROST THD row the packed addressing is ``prefix(lengths) x token stride``
-    and the bound ragged-offset values are not read: sequences must be
-    adjacent (padded THD with inter-sequence gaps is issue #737).
+    bias / dBias is dense-only (a path property, see mismatch()).  The row
+    READS the bound ragged offsets on device (``thd_ragged_offsets``, issue
+    #737): every port's sequences sit at their own token origins
+    (``ro[b] * multiplier / token_stride``), so a padded THD layout with gaps
+    between sequences is served where the caller put it; whole-token offsets
+    are the contract (a violation makes the sequence dead on device).
     """
     return EngineSpec(
         name="sdpa_bwd_sm80",
@@ -814,6 +892,7 @@ def _sm80_spec() -> EngineSpec:
             # build time; B * S_max would be the fallback and is far larger
             # than any packed buffer.
             thd_declared_totals=True,
+            thd_ragged_offsets=True,  # per-port token origins from the bound offsets (issue #737)
             decode=False,  # prefill kernels only
             layouts=frozenset({"bshd", "dense_flex"}),
             # The kernels READ the declared stats strides natively (the

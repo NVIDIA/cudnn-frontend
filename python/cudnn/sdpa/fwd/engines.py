@@ -247,11 +247,14 @@ class Capabilities:
     # pre-existing allocation on that path, tracked with its other
     # TemplateParams-conversion follow-ups.
     lse_optional: bool = False
-    # THD lowerings assume FULLY-PACKED storage: the packed addressing is
-    # re-derived as prefix(lens) x token stride, and the graph's bound
-    # ragged-offset values are never read. TE-style padded THD (offsets
+    # The FORWARD THD lowerings assume FULLY-PACKED storage: the packed
+    # addressing is re-derived as prefix(lens) x token stride, and the graph's
+    # bound ragged-offset values are never read. TE-style padded THD (offsets
     # from cu_seqlens_padded != cu_seqlens, gaps between sequences) is NOT
-    # served — and being runtime data, cannot be declined at plan time.
+    # served by them — and being runtime data, cannot be declined at plan
+    # time (issue #737). The SM80 backward row reads the offsets on device
+    # (bwd/engines.py Capabilities.thd_ragged_offsets); the forward rows are
+    # the remaining work on that issue.
     thd: bool = False
     # cu_seq_len_q / cu_seq_len_kv (B+1,) prefix sums (cuDNN 9.24+). Serving
     # rows consume the form on THD host-side (lens = adjacent differences of

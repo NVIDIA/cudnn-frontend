@@ -57,6 +57,29 @@ THD_CTR_OFF = lambda b: 4 * b + 3  # noqa: E731    persistent-scheduler claim co
 THD_ROWOFF_OFF = lambda b: 4 * b + 4  # noqa: E731
 THD_BWD_META_WORDS = lambda b: 5 * b + 5  # noqa: E731
 
+# --- optional PER-PORT ORIGINS extension (issue #737) ------------------------
+# A ragged graph binds one ragged-offset tensor PER PORT, and a padded THD
+# layout (TE's ``cu_seqlens_padded``) puts a sequence's rows somewhere other
+# than ``prefix(lengths)``.  A kernel that honours the bound offsets reads each
+# port's per-sequence TOKEN origin from here: ``org_p[b] = ro_p[b] * M_p / ts_p``
+# (``M`` the port's ragged-offset multiplier, ``ts`` its token stride -- both
+# plan-time), written by the setup launch (write_thd_port_origin).  Lengths are
+# unchanged (``cu_*`` still carries ``prefix(lengths)``: the masks, the loop
+# bounds and every INTERNAL packed buffer keep using it).  A port bound
+# without a ragged offset copies its side's ``cu`` so its origin is the packed
+# one.  ``THD_ORG_DEAD`` marks a sequence whose offset is not a whole number of
+# tokens (the contract): every port's origin for that sequence is set to it,
+# the kernels treat the sequence as length 0 (its rows are never read or
+# written -- there is no correct address to write to), and the flag word is
+# set so a test can assert on it without a host read on the hot path.
+# Appends after the backward extension:
+#
+#   [ ...the forward layout... | row_off(B+1) | org_0(B) | ... | org_{P-1}(B) | flag ]
+THD_ORG_OFF = lambda b, port: 5 * b + 5 + port * b  # noqa: E731
+THD_ORG_FLAG_OFF = lambda b, n_ports: 5 * b + 5 + n_ports * b  # noqa: E731
+THD_ORG_META_WORDS = lambda b, n_ports: 5 * b + 6 + n_ports * b  # noqa: E731
+THD_ORG_DEAD = -1
+
 # Threads for a THD setup launch. The metadata write itself is one elected
 # thread; the batch-remap ranking that follows is parallel over batches, so the
 # block is sized for that (B > THD_SETUP_THREADS just loops).
@@ -392,18 +415,71 @@ def emit_clamped_desc(
     nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, dptr, new_value=extent, ord=seq_ord)
 
 
+@cute.jit
+def write_thd_port_origin(
+    meta, ro, mult: cutlass.Constexpr[int], ts: cutlass.Constexpr[int], org_off: cutlass.Int32, flag_off: cutlass.Int32, n_batch: cutlass.Int32
+) -> None:
+    """Single-thread body: one port's per-sequence TOKEN origins from its bound
+    ragged offsets (issue #737).
+
+    ``org[b] = ro[b] * mult / ts`` for ``b < n_batch``; ``ro`` is the bound
+    offset tensor (int32 or int64, ``n_batch + 1`` entries, the last one
+    unread), ``mult`` the port's ragged-offset multiplier and ``ts`` its token
+    stride, both plan-time.  An offset that is not a whole number of tokens
+    violates the contract: the origin is written as ``THD_ORG_DEAD`` and the
+    flag word set (the caller propagates DEAD to the sequence's other ports).
+    """
+    for b in cutlass.range(0, n_batch, 1, unroll=1):
+        v = cutlass.Int64(ro[b]) * cutlass.Int64(mult)
+        q = v // cutlass.Int64(ts)
+        if v - q * cutlass.Int64(ts) != cutlass.Int64(0):
+            meta[org_off + b] = cutlass.Int32(THD_ORG_DEAD)
+            meta[flag_off] = cutlass.Int32(1)
+        else:
+            meta[org_off + b] = cutlass.Int32(q)
+
+
+@cute.jit
+def copy_thd_cu_as_origin(meta, cu_off: cutlass.Int32, org_off: cutlass.Int32, n_batch: cutlass.Int32) -> None:
+    """Single-thread body: a port bound WITHOUT a ragged offset takes its
+    side's ``prefix(lengths)`` (``cu_off`` = the cu array's offset) as origin."""
+    for b in cutlass.range(0, n_batch, 1, unroll=1):
+        meta[org_off + b] = meta[cu_off + b]
+
+
+@cute.jit
+def propagate_thd_dead_origins(meta, org0_off: cutlass.Int32, n_ports: cutlass.Constexpr[int], n_batch: cutlass.Int32) -> None:
+    """Single-thread body: a sequence dead on ANY port is dead on every port
+    (the kernels test one port's origin and treat the sequence as length 0)."""
+    for b in cutlass.range(0, n_batch, 1, unroll=1):
+        dead = cutlass.Int32(0)
+        for p in cutlass.range_constexpr(n_ports):
+            if meta[org0_off + cutlass.Int32(p) * n_batch + b] == cutlass.Int32(THD_ORG_DEAD):
+                dead = cutlass.Int32(1)
+        if dead != cutlass.Int32(0):
+            for p in cutlass.range_constexpr(n_ports):
+                meta[org0_off + cutlass.Int32(p) * n_batch + b] = cutlass.Int32(THD_ORG_DEAD)
+
+
 __all__ = [
     "TENSOR_MAP_QWORDS",
     "THD_BWD_META_WORDS",
     "THD_CTR_OFF",
     "THD_LIVE_OFF",
     "THD_META_WORDS",
+    "THD_ORG_DEAD",
+    "THD_ORG_FLAG_OFF",
+    "THD_ORG_META_WORDS",
+    "THD_ORG_OFF",
     "THD_REMAP_OFF",
     "THD_ROWOFF_OFF",
     "THD_SETUP_THREADS",
     "emit_clamped_desc",
     "emit_seq_descs",
     "set_tensor_map_bit21",
+    "copy_thd_cu_as_origin",
+    "propagate_thd_dead_origins",
+    "write_thd_port_origin",
     "thd_claim_next",
     "thd_decode_unit",
     "write_thd_batch_remap",
