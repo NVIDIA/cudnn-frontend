@@ -114,6 +114,7 @@ class IndexerBackwardSm90:
         topk_indices_global: bool = True,
         ratio: int = 1,
     ):
+        """Initialize the SM90 warp-specialized Indexer backward kernel."""
         self.head_dim = head_dim
         self.heads = heads
         self.block_I = block_I
@@ -677,6 +678,7 @@ class IndexerBackwardSm90:
         mbar,
         compute_wg_idx,
     ):
+        """Run one compute warpgroup and its staged dK reduction."""
         wg_tidx = tidx % self.WARPGROUP_SIZE
         dk_staging_barrier_id = self.DK_STAGING_BARRIER_WG0 if compute_wg_idx == 0 else self.DK_STAGING_BARRIER_WG1
 
