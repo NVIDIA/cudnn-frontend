@@ -1132,9 +1132,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     @property
     def _quantized_q_lens_abi(self) -> bool:
-        """Whether the selected quantized kernel has the dense Q-length slot:
-        every SM100 fp8 / mxfp8 flavor; the Rubin templates not yet."""
-        return self._fp8 and self._device_cc != (10, 7)
+        """Whether the selected quantized kernel takes the dense Q-length slot
+        positionally after amax_o: every fp8 / mxfp8 flavor on every arch line."""
+        return self._fp8
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")

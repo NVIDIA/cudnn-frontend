@@ -255,20 +255,11 @@ class Capabilities:
     # the inherent tolist); dense cu graphs stay declined until the kernels
     # grow a CU read mode (len = cu[b+1] - cu[b]) — see mismatch().
     cu_seq_len: bool = False
-    # Dense padded + stats needs the per-batch seq_len_q LSE trim (padded
-    # q-rows write LSE=-inf / O=0, cuDNN >= 9.14).
+    # Dense padded + stats: the per-batch seq_len_q LSE trim (padded q-rows
+    # write LSE=-inf / O=0, cuDNN >= 9.14). Every kernel carries the dense
+    # padded-Q trim itself (a graph with per-batch Q lengths compiles the
+    # SEQ_Q_LENS_PRESENT specialization), so there is no separate capability.
     padded_stats: bool = False
-    # Dense padded graphs carrying per-batch seq_len_q: the kernel's epilogue
-    # trims padded q rows (O := 0, LSE := -inf). Rows whose kernel lacks the
-    # trim keep False: lower_dsl_prefill then drops the buffer instead of
-    # binding it, and _execute runtime-rejects lengths shorter than S_q (a
-    # kernel property must live here, not in an adapter-class test — a future
-    # row reusing an adapter for a trim-less kernel would silently inherit
-    # the wrong answer otherwise).
-    dense_seq_q_trim: bool = False
-    # A unified engine row may contain only some native flavors with the trim.
-    # The smallest native shape covering the graph selects this override.
-    dense_seq_q_trim_d_shapes: frozenset[tuple[int, int]] = frozenset()
     # s_q == 1 (decode-shaped) graphs; the SM80 prefill kernels are gated off.
     decode: bool = True
 
@@ -412,12 +403,6 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
                     domain = split_domain
                     break
     return domain
-
-
-def supports_dense_seq_q_trim(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
-    """Whether the graph-selected native flavor trims dense padded Q rows."""
-
-    return capabilities.dense_seq_q_trim or _selected_d_shape(capabilities, facts) in capabilities.dense_seq_q_trim_d_shapes
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> Optional[str]:
@@ -630,8 +615,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
         if not capabilities.bottom_right:
             return "graph uses bottom-right causal, which this kernel does not support"
-    if facts.padded and facts.wants_stats and not facts.thd and not (capabilities.padded_stats or supports_dense_seq_q_trim(capabilities, facts)):
-        return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
+    if facts.padded and facts.wants_stats and not facts.thd and not capabilities.padded_stats:
+        return "padding mask with generate_stats is not supported by this kernel"
 
     if (
         facts.thd
@@ -717,7 +702,6 @@ def _sm100_spec() -> EngineSpec:
             thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
-            dense_seq_q_trim=True,
             # Ragged S_kv with an uncovered tail is served through the padded
             # path with synthesized full-length per-batch KV lengths (see
             # lower_dsl_prefill's synth_kv_padding) — mathematically identical,
@@ -779,8 +763,6 @@ def _sm107_spec() -> EngineSpec:
       descriptors that keep a NaN capacity tail out of BMM2.
     - ``split_kv_supported``: these kernels wire no SplitHelpers.
     - ``pack_gqas``: no PackGQA path.
-    - ``padded_stats`` / ``dense_seq_q_trim``: both need the per-batch
-      ``seq_len_q`` LSE trim, which these kernels do not carry.
     - ``softmax_precisions``: the f16x2 exponent arm lives only in the d128 FP8
       sibling.
     """
@@ -818,6 +800,7 @@ def _sm107_spec() -> EngineSpec:
             # than `True` is what makes a future partial arch line expressible.
             thd=True,
             thd_padded_stats=True,
+            padded_stats=True,
             thd_d_shapes=SM107_F16_THD_SHAPES,
             cu_seq_len=True,
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
@@ -895,7 +878,6 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             thd=True,
             thd_padded_stats=True,
             cu_seq_len=True,
-            dense_seq_q_trim=True,
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
@@ -1020,8 +1002,6 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # D256 carries the dense padded-Q epilogue trim; the older D128 and
             # D192/D128 siblings remain KV-padding-only for dense graphs.
             padded_stats=True,
-            # every SM100 flavor trims dense padded Q; the Rubin templates do not carry it yet
-            dense_seq_q_trim=not rubin_row,
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the
@@ -1161,6 +1141,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            padded_stats=True,
             # See the f16 SM107 row: has_lse=False is a real specialization on
             # every Rubin kernel, not an accepted-and-ignored flag.
             lse_optional=True,
@@ -1219,7 +1200,6 @@ def _sm80_spec() -> EngineSpec:
             # The kernels implement the dense padded-Q trim natively
             # (per-batch ``seq_len_q`` forward kwarg): rows >= seq_len_q[b]
             # are written explicitly by the kernel (O := 0, LSE := -inf).
-            dense_seq_q_trim=True,
             lse_optional=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             skv_tile=0,  # the kernels' is_even_k path serves ragged S_kv
@@ -1256,7 +1236,6 @@ def _sm120_spec() -> EngineSpec:
             stats=True,
             lse_optional=True,
             padded_stats=True,
-            dense_seq_q_trim=True,
             thd=True,
             thd_padded_stats=True,
             # No KV-tail rule: the kernel walks KV tiles right-to-left and its
@@ -1346,14 +1325,11 @@ def lower_dsl_prefill(
 
     seq_q_t = facts.seq_q_t if facts.padded else None
     seq_kv_t = facts.seq_kv_t if facts.padded else None
-    # Mirrors the seq_q_lens_present constructor argument below. Execute
-    # forwards seq_q only when the compiled specialization consumes it (or THD,
-    # which sources cu_seqlens from it) — the adapter rejects mismatches, so a
-    # buffer a trim-less kernel can't honor is dropped here rather than
-    # erroring at execute (the row declares plumbed-ness; see
-    # Capabilities.dense_seq_q_trim).
-    dense_seq_q_trim = supports_dense_seq_q_trim(spec.capabilities, facts)
-    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and dense_seq_q_trim
+    # Mirrors the seq_q_lens_present constructor argument below: a dense padded
+    # graph carrying per-batch Q lengths compiles the kernel's trim
+    # specialization (every kernel has one), and execute forwards the buffer
+    # (THD sources cu_seqlens from it instead).
+    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None
     api = _adapter(api_type)(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
@@ -1527,22 +1503,6 @@ def lower_dsl_prefill(
         dk_buf = resolved.get(id(binding.descale_k)) if binding.descale_k is not None else None
         dv_buf = resolved.get(id(binding.descale_v)) if binding.descale_v is not None else None
         so_buf = resolved.get(id(binding.scale_o)) if binding.scale_o is not None else None
-        # Rows whose kernel lacks the dense padded-Q trim (dense_seq_q_trim
-        # False) drop the per-batch Q lengths, which is harmless only while
-        # every seq_len_q equals S_q -- a shorter one writes O and a finite
-        # LSE past the valid length. Checked here because the lengths are
-        # device values (its own Rule 3 known-violation entry; the descale
-        # scalars themselves no longer read back at all).
-        # THD is exempt: ragged lengths ARE shorter than S_q by construction,
-        # and the packed layout gives each sequence its own extent, so
-        # nothing is written past a valid length.
-        if not dense_seq_q_trim and not facts.thd and seq_q_buf is not None:
-            min_seq_q = int(seq_q_buf.min().item())
-            if min_seq_q < int(facts.s_q):
-                raise NotImplementedError(
-                    f"{spec.name}: per-batch seq_len_q shorter than S_q={facts.s_q} is not plumbed "
-                    f"(no dense padded-Q trim in this kernel); got min {min_seq_q}"
-                )
         execute_kwargs = dict(
             q_tensor=q_buf,
             k_tensor=k_buf,
@@ -1672,7 +1632,6 @@ def _sm120_fp8_spec() -> EngineSpec:
             lse_optional=True,
             thd=True,
             padded_stats=True,
-            dense_seq_q_trim=True,
             skv_tile=0,
             # dense_flex: any dense layout with the head dim
             # innermost-contiguous is normalized to the kernel's compact BSHD

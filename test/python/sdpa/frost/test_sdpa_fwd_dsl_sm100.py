@@ -37,10 +37,6 @@ _skip_pack_gqa_on_rubin = pytest.mark.skipif(_SM == 107, reason="no PackGQA path
 # `_skip_thd_on_rubin` marker is RETIRED rather than left as a no-op that reads
 # like a live gate.  What the Rubin f16 row still declines is per-FEATURE --
 # split-KV and PackGQA -- and those keep their own markers.
-_skip_stats_trim_on_rubin = pytest.mark.skipif(
-    _SM == 107,
-    reason="per-batch seq_len_q O/LSE trim not carried by the Rubin f16 kernels " "(row: padded_stats=False / dense_seq_q_trim=False)",
-)
 
 
 def _ref_sdpa(q, k, v, *, is_causal, scale):
@@ -441,7 +437,6 @@ def test_dsl_sm100_padded(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_stats_trim_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_graph_api_padded_bottom_right_gqa():
@@ -476,7 +471,6 @@ def test_dsl_sm100_graph_api_padded_bottom_right_gqa():
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_stats_trim_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["llama_d128", "mla_d192_d128", "qwen_d256", "dsv4_d512"])
 @torch_fork_set_rng(seed=0)

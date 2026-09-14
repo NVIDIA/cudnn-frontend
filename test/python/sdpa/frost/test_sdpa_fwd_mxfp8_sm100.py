@@ -65,10 +65,6 @@ _skip_thd_mxfp8_on_rubin = pytest.mark.skipif(
     _SM == 107,
     reason="THD/varlen not ported to the Rubin MXFP8 kernels (row sets thd=False)",
 )
-_skip_dense_q_trim_on_rubin = pytest.mark.skipif(
-    _SM == 107,
-    reason="dense padded-Q O/LSE trim not carried by the Rubin kernels (row sets dense_seq_q_trim=False / padded_stats=False)",
-)
 pytestmark = [requires_blackwell, requires_dsl]
 
 
@@ -559,7 +555,6 @@ def test_mxfp8_wide_dense_padding(d, in_key, causal):
     assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
 
 
-@_skip_dense_q_trim_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_128", "d256", "d512"])
 @torch_fork_set_rng(seed=0)

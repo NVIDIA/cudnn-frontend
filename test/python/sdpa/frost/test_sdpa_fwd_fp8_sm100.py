@@ -716,7 +716,6 @@ def test_fp8_d256_padding(in_key, causal):
 
 
 @pytest.mark.L1
-@pytest.mark.skipif(_SM == 107, reason="dense padded-Q trim not carried by the Rubin FP8 templates yet")
 @pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_128", "d256"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_dense_q_trim_stats_sink(d, d_v):
