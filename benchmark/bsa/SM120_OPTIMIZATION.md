@@ -90,6 +90,53 @@ four-fold-unroll checkpoint below is adopted. Other experimental sources,
 tests, and profiles remain in the local ignored agent workspace; no
 infrastructure addresses, GPU identifiers, or host names are recorded here.
 
+## Lookahead and register-lifetime screening
+
+The next experiment keeps the packed BF16 probabilities for the current KV
+block while preparing the next block's QK and softmax. The next output
+correction is deferred until the current PV has completed, preserving the
+attention arithmetic order. In the half-warpgroup version, warps 0–3 follow
+the original order and warps 4–7 use lookahead. The all-warp version applies
+lookahead to all eight compute warps. These are local prototypes, not enabled
+kernel paths.
+
+All ratios below are 31-pair, 20% strided screening results against
+`9869b9b6`, not against the already improved checkout. Each listed candidate
+passed BF16 reference tests at top-k 1, 2, 3, and 223, including partial Q and
+GQA, followed by full-shape bitwise O/LSE checks.
+
+| Candidate | Baseline / candidate time | Decision |
+| --- | ---: | --- |
+| One K/one V buffer, compact lookahead P, half/all warps | 0.7938x / 0.7612x | Reject |
+| One K/two V buffers, compact lookahead P, half/all warps | 0.9668x / 0.9158x | Reject |
+| Two V buffers, asymmetric 232/248 compute register budgets | 0.9717x | Reject |
+| Two V buffers, reload Q for each QK, half/all warps | 0.8813x / 0.8027x | Reject |
+| Two V buffers, reload Q and use 232/248 budgets | 0.8000x | Reject |
+| Two V buffers, pack P into consumed score registers, half/all warps | 0.9699x / 0.9148x | Reject |
+| Separate normal/lookahead code paths, 232/248 or 224/256 budgets | 0.9677x / 0.9793x | Reject |
+| Limit QK / PV fragment lookahead with a warp barrier every two groups | 0.9448x / 0.9594x | Reject |
+| Limit both QK and PV fragment lookahead, every two / four groups | 0.9687x / 0.9650x | Reject |
+
+Adding the second V buffer improves this particular lookahead pipeline, but
+does not beat the baseline. Register pressure remains important: the
+one-stage, non-unrolled compact-P variants have 88/48-byte stacks for
+half/all warps. The two-V versions have 96/80-byte stacks; separately
+specializing the two compute paths still reports a 104-byte maximum stack.
+Reloading Q removes stack allocation in the measured half-warp variant, but
+its extra loads and changed schedule produce a net slowdown. Stack size alone
+is not a measure of runtime spill traffic or performance.
+
+A separate source-order experiment interleaves the two softmax rows and
+rescales each O pair immediately after packing P. It passed reference tests
+and full-shape bitwise checks for all four workload cases. However, 101-pair
+measurements **against the current unroll-four, uniform-donation checkout**
+gave 1.0008x / 0.9976x at 15% strided/local and 1.0007x / 1.0005x at 20%
+strided/local. There is no stable additional benefit; it is not adopted.
+
+An earlier array-rebinding variant failed its top-k-3 reference test and was
+discarded without timing. Passing only top-k 1 or 2 is insufficient to verify
+the lookahead pipeline's loop-carried state.
+
 ## Four-fold-unroll checkpoint
 
 Both producer and compute loops now use four-fold instead of two-fold
