@@ -1927,6 +1927,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "this specialization was compiled without sink support; construct the API with has_sink=True",
         )
         self._check_seq_lens_contract(seq_q_lens, seq_kv_lens)
+        if self.seq_q_lens_present:
+            # Dense Q lengths are passed as a raw address, so validate the
+            # storage before bypassing the compiled launcher's tensor binding.
+            self._value_error_if(
+                seq_q_lens.device.type != "cuda" or seq_q_lens.device.index != q_tensor.device.index,
+                f"seq_q_lens must be a CUDA tensor on the same device as q_tensor ({q_tensor.device}); got {seq_q_lens.device}",
+            )
         self._value_error_if(
             self.lse_desc is not None and lse_tensor is None,
             "lse_tensor is required by this compiled specialization",
@@ -2041,9 +2048,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             else self._dummy("seq_kv", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
         )
         # Dense padded-Q trim: per-batch Q lengths are their OWN kernel
-        # parameter (compiled in only when seq_q_lens_present — the kernel
-        # signature is specialized on `None`, so the flag-off ABI is
-        # unchanged). The caller's (B,)-int32 device tensor is bound directly
+        # Int64 address parameter (0 when absent; all reads fold out unless
+        # seq_q_lens_present). The caller's (B,)-int32 device tensor is bound
         # as a validated view — zero allocations/copies on the execute hot
         # path, stable pointer (CUDA-graph-capture friendly).
         seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None

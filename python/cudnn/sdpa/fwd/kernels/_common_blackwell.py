@@ -674,7 +674,7 @@ def make_sdpa_helpers(
         .cpp:916-921): when the CGA tile's base Q row is at/past this batch's
         actual Q length (SEQ_Q_LENS_PRESENT dense padded-Q trim; q lens are
         the SEPARATE (B,)-int32 ``seq_q_lens_addr`` kernel parameter — cuDNN
-        SEQLEN_Q / FA seqused_q style — ``None`` unless the flag is set, so
+        SEQLEN_Q / FA seqused_q style — ``0`` unless the flag is set, so
         the read below folds out with the branch), collapse the KV loop to
         empty (right := left, matching the SWA empty-tile machinery) — the
         grid stays padded-sized and a dead tile costs prologue+epilogue only.
