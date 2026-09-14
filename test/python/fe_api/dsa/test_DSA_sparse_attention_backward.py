@@ -29,6 +29,21 @@ from fe_api.dsa.dsa_reference import (
 _TWO_CTA_CAPABILITIES = ((10, 0), (10, 3))
 
 
+def _spy_d576_two_cta_execute(monkeypatch):
+    """Count calls into the D576 two-CTA launch path; the selector alone does not prove the route ran."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100_d576
+
+    calls = []
+    real_execute = _interface_sm100_d576._execute_d576_2cta
+
+    def counted_execute(*args, **kwargs):
+        calls.append(1)
+        return real_execute(*args, **kwargs)
+
+    monkeypatch.setattr(_interface_sm100_d576, "_execute_d576_2cta", counted_execute)
+    return calls
+
+
 def _allocate(cfg, has_topk_length: bool):
     total_s_q = cfg["s_q"]
     total_s_kv = cfg["s_kv"]
@@ -841,7 +856,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_composite_boundaries(has_topk_l
 )
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
 @torch_fork_set_rng(seed=576)
-def test_DSA_sparse_attention_backward_d576_2cta_numerics(s_q, topk, has_topk_length):
+def test_DSA_sparse_attention_backward_d576_2cta_numerics(s_q, topk, has_topk_length, monkeypatch):
     """Compare the two-CTA gradients with the PyTorch reference in both cluster regimes."""
     _require_sm100()
     if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
@@ -857,6 +872,7 @@ def test_DSA_sparse_attention_backward_d576_2cta_numerics(s_q, topk, has_topk_le
     out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=softmax_scale)
     dout = torch.randn_like(out)
 
+    two_cta_calls = _spy_d576_two_cta_execute(monkeypatch)
     result = DSA.sparse_attention_backward_wrapper(
         q,
         kv,
@@ -868,6 +884,7 @@ def test_DSA_sparse_attention_backward_d576_2cta_numerics(s_q, topk, has_topk_le
         topk_length=topk_length,
         softmax_scale=softmax_scale,
     )
+    assert two_cta_calls, "the wrapper did not execute the H128/D576 two-CTA backend"
     check_ref_dsa_sparse_attention_backward(
         q,
         kv,
@@ -912,6 +929,7 @@ def test_DSA_sparse_attention_backward_d576_2cta_ignored_nan_and_workspace_reuse
         """Fail the test if execute() reaches a compile or an allocation."""
         pytest.fail("execute() must not compile kernels or allocate tensors")
 
+    two_cta_calls = _spy_d576_two_cta_execute(monkeypatch)
     for _ in range(2):
         q, kv, attn_sink, _, _ = _allocate(cfg, False)
         # Reserve the final, legally allocated KV row for ignored suffixes.
@@ -981,6 +999,9 @@ def test_DSA_sparse_attention_backward_d576_2cta_ignored_nan_and_workspace_reuse
                 )
         side_stream.synchronize()
 
+        assert len(two_cta_calls) == 1, "each call must run exactly one H128/D576 two-CTA launch sequence"
+        two_cta_calls.clear()
+        assert plan._backend == "h128_d576_2cta_m64"
         assert result["dq"] is dq_buffer
         assert result["dkv"] is dkv_buffer
         assert all(torch.isfinite(result[name]).all() for name in ("dq", "dkv", "d_sink"))
