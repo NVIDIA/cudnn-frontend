@@ -3867,7 +3867,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.O if pack is not None else o_dst,
             lse_dst,
             sinks_t,
-            _q_lens_addr(pack.seq_q_dummy if pack is not None else seq_q_t),
+            pack.seq_q_dummy if pack is not None else seq_q_t,  # SM120 kernels keep a tensor slot
             pack.meta if pack is not None else seq_kv_t,
             amax_o_buf.view(torch.int32),
             cutlass.Float32(scale_softmax_log2),
@@ -4140,7 +4140,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.O,
             lse,
             sinks_t,
-            _q_lens_addr(pack.seq_q_dummy),
+            pack.seq_q_dummy,  # SM120 kernels keep a tensor slot
             pack.meta,
             cutlass.Float32(scale_softmax_log2),
             cutlass.Int32(pack.max_sq),
