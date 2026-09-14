@@ -521,20 +521,49 @@ def test_sm107_ones_tile_stays_inside_the_v0_descriptor_window():
     import pytest as _pytest
 
     _E4M3_OUT, _BF16 = 0, 2
+    # (id, flavor, cta_mma, dtype_o, per-tensor?).  The MXFP8 rows matter on
+    # their own: those kernels carry FOUR scale-factor slabs the per-tensor
+    # sibling does not, so their ones tile sits ~7 KiB higher and a guard that
+    # forgot the SF slabs would under-report the offset rather than fire.
     safe = [
-        ("d128", (128, 128), 1, _E4M3_OUT),
-        ("d128", (128, 128), 1, _BF16),
-        ("d128", (128, 128), 2, _BF16),
-        ("d192", (192, 128), 1, _E4M3_OUT),
-        ("d192", (192, 128), 2, _BF16),
+        ("d128", (128, 128), 1, _E4M3_OUT, True),
+        ("d128", (128, 128), 1, _BF16, True),
+        ("d128", (128, 128), 2, _BF16, True),
+        ("d192", (192, 128), 1, _E4M3_OUT, True),
+        ("d192", (192, 128), 2, _BF16, True),
+        ("d128-mx", (128, 128), 1, _E4M3_OUT, False),
+        ("d128-mx", (128, 128), 1, _BF16, False),
+        ("d128-mx", (128, 128), 2, _E4M3_OUT, False),
+        ("d128-mx", (128, 128), 2, _BF16, False),
+        ("d192-mx", (192, 128), 2, _E4M3_OUT, False),
+        ("d192-mx", (192, 128), 2, _BF16, False),
     ]
-    for _id, flavor, cta, dto in safe:
-        mod = _load(flavor, rubin=True, fp8=True, pertensor=True, dtype_qkv=_E4M3, dtype_o=dto, cta_mma=cta)
+    for _id, flavor, cta, dto, pertensor in safe:
+        mod = _load(flavor, rubin=True, fp8=True, pertensor=pertensor, dtype_qkv=_E4M3, dtype_o=dto, cta_mma=cta)
         assert mod._ONES_SMEM_OFFSET < 256 * 1024, (_id, cta, dto, mod._ONES_SMEM_OFFSET)
+
+    # d192 MXFP8 x cga1 never reaches the ones guard: its own CTA_MMA raise
+    # fires first (the four SF tiles cross the window before the ones tile
+    # does).  Pin WHICH guard speaks, so a future reordering cannot silently
+    # swap a precise diagnostic for a vaguer one.
+    with _pytest.raises(ValueError, match="CTA_MMA must be 2"):
+        _load((192, 128), rubin=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16, cta_mma=1)
 
     # The one unsafe combination: d192 x cga1 x half-precision O.
     with _pytest.raises(ValueError, match="version-0 tcgen05 descriptor window"):
         _load((192, 128), rubin=True, fp8=True, pertensor=True, dtype_qkv=_E4M3, dtype_o=_BF16, cta_mma=1)
+
+
+def test_sm107_mxfp8_tmem_map_fills_the_rubin_allocation_exactly():
+    """The row-sum (Sigma) columns took the 32 TMEM columns the scale-factor
+    tiles used to leave free: at d192 the map ends EXACTLY at the 576-column
+    Rubin allocation, at d128 at 564.  The import-time raise catches an
+    overflow; this pins the layout so a re-literalled offset that still fits
+    cannot drift unnoticed."""
+    for flavor, end in (((192, 128), 576), ((128, 128), 564)):
+        mod = _load(flavor, rubin=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=2)
+        assert mod.LAYOUT.TOTAL_COLS == 576, flavor
+        assert mod.LAYOUT.SF_V_OFF + mod.SF_TMEM_COLS_V == end, (flavor, mod.LAYOUT.SF_V_OFF, mod.SF_TMEM_COLS_V)
 
     # ...and the STANDALONE wrapper must decline it too, rather than letting a
     # bare ValueError escape from compile() (contract rule 8b' -- the kernel

@@ -1597,6 +1597,17 @@ def _mma_warp_group(
                 kv_right = bounds_next.right
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
 
+    # P6/P15 drain: mb_stats_read is a cross-CTA arrive on the leader, and the
+    # LAST tile's arrives are still in flight when this warp leaves the
+    # persistent loop -- nothing downstream waits them, so they would land on a
+    # CTA that may already have torn its SMEM down.  stats_read_phase is flipped
+    # at the END of every tile body, so after the loop it holds the phase the
+    # NEXT tile's prologue would have waited, i.e. exactly the phase the LAST
+    # tile's correction arrives complete.  Leader only: the quiet (non-leader)
+    # MMA arm never waits this ring.
+    for _qs in cutlass.range_constexpr(CFG.TILES_Q):
+        bars.mb_stats_read[_qs].wait(stats_read_phase)
+
     bars.mb_tmem_dealloc.wait(cutlass.Int32(0))
     tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
 
