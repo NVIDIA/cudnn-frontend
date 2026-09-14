@@ -1666,10 +1666,20 @@ def _correction_warp_group(
         # before execute on purpose (poison_tmem_before_execute), so O must be
         # zeroed with a SELECT and never with a multiply by zero -- NaN * 0 is
         # NaN (rules/frost-gotchas.md, the empty-reduction-axis row).
+        q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + tid_in_wg
         _kv_empty = bounds.right <= bounds.left
-        # A row with no live key inside a live tile (bottom-right rows above the diagonal, KV padding) keeps
-        # total_sum == 0; the tile-level test misses it, and log(1e-30) would give it a finite LSE.
-        _kv_empty = _kv_empty | (total_sum <= cutlass.Float32(0.0))
+        # A row with no live key inside a live tile -- bottom-right rows above the diagonal, a left band
+        # past the last key, a zero KV length -- read off the mask geometry: these kernels mask with a
+        # finite sentinel, so a keyless row's softmax sum is N, not 0, and cannot tell itself apart.
+        if cutlass.const_expr(CFG.MASK_FLAGS != 0):
+            _diag = (eff_seqlen_kv - eff_seqlen_q) if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+            _last_k = eff_seqlen_kv - cutlass.Int32(1)
+            if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
+                _last_k = cute.math.min(_last_k, q_row_global + _diag + cutlass.Int32(CFG.WINDOW_RIGHT))
+            _first_k = cutlass.Int32(0)
+            if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
+                _first_k = cute.math.max(_first_k, q_row_global + _diag - cutlass.Int32(CFG.WINDOW_LEFT))
+            _kv_empty = _kv_empty | (_first_k > _last_k)
         if cutlass.const_expr(not CFG.HAS_SINK):
             # With a sink the row still has mass (the sink logit itself), and the
             # branch above already yields LSE = sink_logit correctly because
@@ -1677,7 +1687,6 @@ def _correction_warp_group(
             # no mass at all and LSE is -inf.
             lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
 
-        q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + tid_in_wg
         if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
             # Dense padded-Q trim: q rows >= seq_len_q[b] write O := 0 / LSE := -inf
             # (after the sink branch: a trimmed row is dead even with a sink); folded

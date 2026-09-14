@@ -716,7 +716,7 @@ def test_fp8_d256_padding(in_key, causal):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), pytest.param(256, 256, marks=_skip_d256_on_rubin)], ids=["d128", "d192_128", "d256"])
+@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_128", "d256"])
 @pytest.mark.parametrize("band", [False, True], ids=["br", "br_band"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_dense_q_trim_bottom_right(d, d_v, band):
@@ -744,6 +744,9 @@ def test_fp8_dense_q_trim_bottom_right(d, d_v, band):
     )
     _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
     assert (result.output[1, :, 129:] == 0).all() and (result.output[2] == 0).all()
+    # batch 0: S_kv 200 < S_q 256 under bottom-right puts rows 0..55 above the diagonal -- keyless inside a
+    # live tile, so exactly O = 0 / LSE = -inf (a finite mask sentinel would leave them a uniform average).
+    assert (result.output[0, :, :56] == 0).all() and torch.isneginf(result.stats[0, :, :56]).all()
     assert torch.isneginf(result.stats[1, :, 129:]).all() and torch.isneginf(result.stats[2]).all()
     torch.testing.assert_close(result.stats[0], result.reference_stats[0], atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(result.stats[1, :, :129], result.reference_stats[1, :, :129], atol=5e-2, rtol=3e-2)
