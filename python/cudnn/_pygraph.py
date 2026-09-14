@@ -30,7 +30,7 @@ from cudnn import _pybind_module
 
 from ._device import ensure_current_context
 from ._handle import Handle, to_backend_handle
-from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
+from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _dlpack_lanes, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
 from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor, storage_geometry, storage_slot_bytes
@@ -1992,7 +1992,7 @@ class pygraph:
                 # slot that borrowed one is named here.
                 from_graph.append(i)
             ptr, tensor = self._describe(data, order[i])
-            native.set_operand(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type))
+            native.set_operand(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type), _dlpack_lanes(tensor.data_type))
         if strict:
             hole = native.first_unfilled()
             if hole >= 0:
@@ -2032,7 +2032,8 @@ class pygraph:
                         f"override_shapes for tensor uid {uid}: an fp4 tensor packs two elements per storage slot, so its "
                         f"unit-stride extent must be even; got {tuple(override_shapes[j])} / {tuple(override_strides[j])}"
                     )
-                native.override_operand(i, *_in_axis_order_of(storage[0], storage[1], native.stride(i)))
+                dtype = (*_dlpack_code_bits(declared.data_type), _dlpack_lanes(declared.data_type)) if declared is not None else (0, 0, 1)
+                native.override_operand(i, *_in_axis_order_of(storage[0], storage[1], native.stride(i)), *dtype)
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
@@ -2065,7 +2066,14 @@ class pygraph:
                 storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
                 if storage is None:
                     continue
-                layout.set(i, list(storage[0]), list(storage[1]), storage_slot_bytes(declared.data_type) or 0)
+                layout.set(
+                    i,
+                    list(storage[0]),
+                    list(storage[1]),
+                    storage_slot_bytes(declared.data_type) or 0,
+                    *_dlpack_code_bits(declared.data_type),
+                    _dlpack_lanes(declared.data_type),
+                )
             self._declared_layout_native = layout
         return layout
 
