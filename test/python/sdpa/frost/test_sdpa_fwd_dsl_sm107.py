@@ -711,3 +711,17 @@ def test_sm107_d256_stages_kv_defaults_when_the_attribute_is_absent():
 
     cfg, _ = make_cfg_d256(TemplateParams())
     assert cfg.STAGES_KV == 2
+
+
+@pytest.mark.L0
+def test_thd_stats_padded_is_appended_to_the_public_signature():
+    """The adapters' constructors are public and not keyword-only; an old
+    positional call (..., thd, max_total_seq_len_q, max_total_seq_len_kv) must
+    keep binding the same way, so the new parameter is the LAST one."""
+    import inspect
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl
+
+    params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
+    assert params[-1] == "thd_stats_padded"
+    assert params.index("thd") + 1 == params.index("max_total_seq_len_q")

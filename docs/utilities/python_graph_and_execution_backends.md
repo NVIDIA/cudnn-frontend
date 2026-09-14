@@ -840,8 +840,8 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
   remove `selected_engine is None` branching, lowering extracted to its own
   module, op-identity dedup (NodeType vs registry keys), longer-term a typed
   `OpSpec` as the single per-op source for builder/validation/lowering.
-- SDPA forward THD: padded LSE rows of a `(b, s_max, h)` stats buffer past a
-  sequence's length — the backend writes `-inf`, the python row leaves them
-  unwritten (`b == 1`; at `b > 1` the form is declined) — fill for parity. The
-  dense padded-Q `.item()` read in `sdpa/fwd/engines.py` runs at execute and
-  breaks CUDA-graph capture; decide it at `check_support` or drop it.
+- SDPA forward THD, padded Stats: the `-inf` seed of the `(b, s_max, h)` buffer
+  is a separate D32 memset ahead of the kernel; fold the tail-row write into the
+  kernel's persistent schedule to save the launch on that path. The dense
+  padded-Q `.item()` read in `sdpa/fwd/engines.py` runs at execute and breaks
+  CUDA-graph capture; decide it at `check_support` or drop it.

@@ -168,6 +168,7 @@ class SM120FusedMultiHeadAttentionForward:
         split_kv: int = 1,
         thd_batch: int = 1,
         thd_lse_head_major: bool = False,
+        thd_lse_padded: bool = False,
         head_tile_qk: int = 128,
         head_tile_v: int = 128,
         kv_tile: int = SEQ_KV_TILES[0],
@@ -247,6 +248,7 @@ class SM120FusedMultiHeadAttentionForward:
         self.thd_varlen = thd_varlen
         self.thd_batch = thd_batch
         self.thd_lse_head_major = thd_lse_head_major
+        self.thd_lse_padded = thd_lse_padded  # THD Stats without ragged offsets: per-batch (B, H, s_max) rows
 
         self.head_tile_qk = head_tile_qk
         self.head_tile_v = head_tile_v
@@ -1208,7 +1210,10 @@ class SM120FusedMultiHeadAttentionForward:
                             # NEXT sequence — never written, and there is no
                             # padded region to trim.
                             if lse_q_idx < seqlen_q:
-                                if cutlass.const_expr(self.thd_lse_head_major):
+                                if cutlass.const_expr(self.thd_lse_padded):
+                                    # per-batch padded Stats (B, H, s_max), no ragged offsets
+                                    lse_arr[batch_idx, _lse_head, lse_q_idx] = lse_out
+                                elif cutlass.const_expr(self.thd_lse_head_major):
                                     lse_row = lse_arr[_lse_head, :]
                                     lse_row[q_row_base + lse_q_idx] = lse_out
                                 else:
@@ -1581,7 +1586,10 @@ class SM120FusedMultiHeadAttentionForward:
                 # only the static modes are trace-checkable; head_stride >= T
                 # and the (T, H) extent are validated by the adapter at
                 # execute, which builds both views from the same total.
-                if cutlass.const_expr(self.thd_lse_head_major):
+                if cutlass.const_expr(self.thd_lse_padded):
+                    if cutlass.const_expr(len(lse.shape) != 3):
+                        raise ValueError("padded THD LSE must be rank-3 (B, H, s_max)")
+                elif cutlass.const_expr(self.thd_lse_head_major):
                     if cutlass.const_expr(lse.shape[0] != q.shape[2]):
                         raise ValueError("head-major THD LSE must have shape (H, head_stride) with head_stride >= T")
                     if cutlass.const_expr(lse.stride != (lse.shape[1], 1)):
@@ -1723,6 +1731,7 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_head_major: bool = False,
     lse_head_stride: int = 0,
+    lse_padded_rows: int = 0,
     q_stride: Optional[tuple[int, int, int, int]] = None,
     k_stride: Optional[tuple[int, int, int, int]] = None,
     v_stride: Optional[tuple[int, int, int, int]] = None,
@@ -1770,6 +1779,7 @@ def compile(  # noqa: A001
         thd_varlen=PARAMS.thd_varlen,
         thd_batch=b,
         thd_lse_head_major=lse_head_major,
+        thd_lse_padded=bool(lse_padded_rows),
         head_tile_qk=round_up_head_tile(d_qk),
         head_tile_v=round_up_head_tile(d_v),
         q_tile=PARAMS.q_tile,
@@ -1780,7 +1790,7 @@ def compile(  # noqa: A001
     )
     if PARAMS.split_kv > 1 and not has_lse:
         raise ValueError("SM120 SDPA: split_kv > 1 requires an LSE output (the per-split LSE drives the combine)")
-    if lse_stride is not None and (PARAMS.thd_varlen or PARAMS.split_kv > 1):
+    if lse_stride is not None and ((PARAMS.thd_varlen and not lse_padded_rows) or PARAMS.split_kv > 1):
         raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
     fake_batch = 1 if PARAMS.thd_varlen else b
     if PARAMS.thd_varlen:
@@ -1809,7 +1819,7 @@ def compile(  # noqa: A001
     fake_v = _fake_bshd((fake_batch, skv, kh, d_v), v_stride)
     fake_o = _fake_bshd((o_fake_batch, sq, qh, d_v), o_stride)
     if PARAMS.thd_varlen:
-        fake_lse_shape = (qh, lse_head_stride) if lse_head_major else (sq, qh)
+        fake_lse_shape = (b, qh, lse_padded_rows) if lse_padded_rows else ((qh, lse_head_stride) if lse_head_major else (sq, qh))
     else:
         fake_lse_shape = (lse_fake_batch, qh, sq)
     if not has_lse:
@@ -1823,7 +1833,7 @@ def compile(  # noqa: A001
             else cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32,
                 fake_lse_shape,
-                stride_order=(1, 0) if PARAMS.thd_varlen else (2, 1, 0),
+                stride_order=(1, 0) if (PARAMS.thd_varlen and not lse_padded_rows) else (2, 1, 0),
                 assumed_align=4,
             )
         )

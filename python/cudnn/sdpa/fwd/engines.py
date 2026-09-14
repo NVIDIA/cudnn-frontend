@@ -345,6 +345,11 @@ class Capabilities:
     # APPENDED at the end deliberately: Capabilities evolves append-only, so a
     # positional construction of an older field never silently rebinds.
     pack_gqa_d_shapes: Optional[frozenset] = None
+    # THD graphs whose Stats has NO ragged offsets (per-batch padded (b, s_max, h)
+    # rows, FlashInfer's form): the kernel stores per batch and the adapter
+    # fills the tail rows with -inf. Rows whose kernels lack the per-batch THD
+    # store keep False and decline the form (the backend serves it).
+    thd_padded_stats: bool = False
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -628,12 +633,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if facts.padded and facts.wants_stats and not facts.thd and not (capabilities.padded_stats or supports_dense_seq_q_trim(capabilities, facts)):
         return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
 
-    if facts.thd and facts.wants_stats and facts.stats_t is not None and facts.b > 1 and getattr(facts.stats_t, "ragged_offset", None) is None:
+    if (
+        facts.thd
+        and facts.wants_stats
+        and facts.stats_t is not None
+        and getattr(facts.stats_t, "ragged_offset", None) is None
+        and not capabilities.thd_padded_stats
+    ):
         # A Stats tensor with no ragged offsets is the per-batch padded form,
-        # rows at b * s_max; the packed path writes token rows contiguously and
-        # has no per-sequence stats base to place them at. At b == 1 the two
-        # coincide (the tail rows past the length stay unwritten).
-        return "THD Stats without ragged offsets is addressed per batch ([b, h, s_max, 1]); the packed path writes packed (T, h) rows -- bind ragged stats offsets, or b == 1"
+        # rows at b * s_max; a kernel without the per-batch THD store writes
+        # packed (T, h) rows and has no per-sequence stats base to place them at.
+        return "THD Stats without ragged offsets is addressed per batch ([b, h, s_max, 1]); this kernel writes packed (T, h) rows -- bind ragged stats offsets"
     if facts.stats_t is not None and not facts.thd:
         if facts.stats_t.get_data_type() != cudnn.data_type.FLOAT:
             return f"stats must be fp32; got {facts.stats_t.get_data_type()}"
@@ -704,6 +714,7 @@ def _sm100_spec() -> EngineSpec:
             stats=True,
             lse_optional=True,
             thd=True,
+            thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
             dense_seq_q_trim=True,
@@ -806,6 +817,7 @@ def _sm107_spec() -> EngineSpec:
             # now covers every f16 flavor; keeping it a named constant rather
             # than `True` is what makes a future partial arch line expressible.
             thd=True,
+            thd_padded_stats=True,
             thd_d_shapes=SM107_F16_THD_SHAPES,
             cu_seq_len=True,
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
@@ -881,6 +893,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             stats=True,
             lse_optional=True,
             thd=True,
+            thd_padded_stats=True,
             cu_seq_len=True,
             dense_seq_q_trim_d_shapes=frozenset({(256, 256), (512, 512)}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
@@ -1002,6 +1015,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             stats=True,
             lse_optional=True,
             thd=True,
+            thd_padded_stats=True,
             cu_seq_len=True,
             # D256 carries the dense padded-Q epilogue trim; the older D128 and
             # D192/D128 siblings remain KV-padding-only for dense graphs.
@@ -1243,6 +1257,7 @@ def _sm120_spec() -> EngineSpec:
             padded_stats=True,
             dense_seq_q_trim=True,
             thd=True,
+            thd_padded_stats=True,
             # No KV-tail rule: the kernel walks KV tiles right-to-left and its
             # first (masked) step always covers the rightmost — and therefore
             # any partial — tile, comparing columns against seqlen_k regardless
@@ -1363,6 +1378,8 @@ def lower_dsl_prefill(
         cu_seq_kv_lens=facts.cu_seq_kv_t is not None,
         has_sink=facts.has_sink,
         thd=facts.thd,
+        # THD Stats without ragged offsets = FlashInfer's per-batch padded (b, s_max, h) buffer
+        thd_stats_padded=(facts.thd and facts.stats_t is not None and getattr(facts.stats_t, "ragged_offset", None) is None),
         # Caller-declared packed token totals (issue #624): when present the
         # adapter binds EXACT token extents instead of the buffer-derived
         # capacity, putting an over-allocated buffer's uninitialized tail out
