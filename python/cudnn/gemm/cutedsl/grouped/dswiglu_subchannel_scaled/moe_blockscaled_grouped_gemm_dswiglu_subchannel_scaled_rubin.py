@@ -74,10 +74,6 @@ from ..moe_kernel_helpers import (
     sigmoid_f32,
     get_dtype_rcp_limits,
     get_dtype_max,
-    get_amax_smem_size,
-    is_valid_layouts,
-    is_valid_mma_tiler_and_cluster_shape,
-    is_valid_tensor_alignment,
     atomic_add_bf16x2,
     nanosleep,
     red_smem_cluster_max_f32,
@@ -215,10 +211,7 @@ def _deinterleave_n_coord_tensor(t, mode=1, n_static=None):
 # cluster peers — the rowwise-sfd2 DSMEM geometry (sgn/cta_n == cluster_n) —
 # and enables A/SFA multicast. Cluster M stays 2: wider cluster-M tiles need a
 # per-expert-M cluster-tile-multiple gate the FE API cannot verify host-side
-# on ragged inputs (the kernel's static can_implement still accepts the full
-# harness set (2,1)/(4,1)/(2,2)/(2,4)/(4,2) with that gate, for parity).
-VALID_CTA_SHAPES = ((256, 128),)
-VALID_CLUSTER_SHAPES = ((2, 1), (2, 2), (2, 4))
+# on ragged inputs.
 DEFAULT_CTA_SHAPE = (256, 128)
 DEFAULT_CLUSTER_SHAPE = (2, 1)
 
@@ -274,146 +267,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
     FIX_PAD_SIZE = 256
-
-    @staticmethod
-    def is_valid_dtypes_and_scale_factor_vec_size(
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
-        d_dtype: Type[cutlass.Numeric],
-    ) -> bool:
-        """
-        Check if the data type / scale-factor vector-size combination is valid.
-
-        :return: True if valid, False otherwise
-        """
-        is_valid = True
-        if ab_dtype not in {
-            cutlass.Float4E2M1FN,
-        }:
-            is_valid = False
-
-        if sf_vec_size not in {16}:
-            is_valid = False
-
-        if sf_dtype not in {cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, cutlass.FloatNV8E5M3FNU}:
-            is_valid = False
-
-        if sf_dtype in {cutlass.Float8E4M3FN, cutlass.FloatNV8E5M3FNU} and sf_vec_size == 32:
-            is_valid = False
-        if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
-            is_valid = False
-
-        if acc_dtype not in {cutlass.Float32}:
-            is_valid = False
-
-        if d_dtype not in {
-            cutlass.Float32,
-            cutlass.Float16,
-            cutlass.BFloat16,
-            cutlass.Float8E5M2,
-            cutlass.Float8E4M3FN,
-            cutlass.Float4E2M1FN,
-        }:
-            is_valid = False
-
-        if ab_dtype.width == 8 and d_dtype.width != 8:
-            is_valid = False
-
-        return is_valid
-
-    @staticmethod
-    def can_implement(
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
-        d_dtype: Type[cutlass.Numeric],
-        use_2cta_instrs: bool,
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-        m: int,
-        n: int,
-        k: int,
-        l: int,
-        a_major: str,
-        b_major: str,
-        cd_major: str,
-        m_aligned: int,
-        act_func: str,
-        weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
-        sgn: int = 256,
-        sgk: int = 256,
-    ) -> bool:
-        FPS = BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107.FIX_PAD_SIZE
-        result = True
-        if m_aligned != FPS:
-            result = False
-        if not BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107.is_valid_dtypes_and_scale_factor_vec_size(
-            ab_dtype, sf_dtype, sf_vec_size, acc_dtype, d_dtype
-        ):
-            result = False
-        if not is_valid_layouts(ab_dtype, d_dtype, a_major, b_major, cd_major):
-            result = False
-        # Only supported launch configs for now: mma tiler (256, 128) with
-        # M-only clusters (2,1)/(4,1), or 2D clusters (2,2)/(2,4)/(4,2)
-        # (cluster_n > 1 makes N-adjacent work tiles cluster peers — the
-        # rowwise-sfd2 DSMEM geometry — and enables A/SFA multicast; total
-        # cluster size stays <= 8, the portable limit).
-        if tuple(mma_tiler_mn) != (256, 128) or tuple(cluster_shape_mn) not in (
-            (2, 1),
-            (4, 1),
-            (2, 2),
-            (2, 4),
-            (4, 2),
-        ):
-            result = False
-        # cluster_n > 1: the scheduler decomposes over CLUSTER N tiles, so
-        # the N work-tile count (n here is the GEMM half-width; tiles =
-        # ceil(n / cta_n), expert-uniform) must be a cluster_n multiple or
-        # the last N cluster's peers would map past the edge.
-        if cluster_shape_mn[1] > 1:
-            _n_work_tiles = -(-n // mma_tiler_mn[1])
-            if _n_work_tiles % cluster_shape_mn[1] != 0:
-                result = False
-        if not is_valid_mma_tiler_and_cluster_shape(
-            use_2cta_instrs,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            m_aligned,
-            FPS,
-            allowed_cluster_tiler_m=(128, 256, 512),
-        ):
-            result = False
-        # Cluster (4,1)/(4,2) widens the cluster M tile to 512 rows sharing
-        # one multicast B load: a cluster must never straddle an expert
-        # boundary, so per-expert M must be a cluster-tile multiple.
-        _cluster_tiler_m = (cluster_shape_mn[0] // (2 if use_2cta_instrs else 1)) * mma_tiler_mn[0]
-        if (m // l) % _cluster_tiler_m != 0:
-            result = False
-        if not is_valid_tensor_alignment(m, n, k, l, ab_dtype, d_dtype, a_major, b_major, cd_major):
-            result = False
-        if not (a_major == "k"):
-            result = False
-        if act_func not in ["dswiglu", "dgeglu"]:
-            result = False
-        # SFD2 blocking (deinterleaved): one sfd2 block = sgn gate/up
-        # f-columns. The single per-thread atomic-max target / read-back and
-        # the tile_n_idx // sfd2_n_contrib block math require every N work
-        # tile to sit inside one block: sgn must be a multiple of the tile
-        # f-width.
-        if sgn % mma_tiler_mn[1] != 0:
-            result = False
-        # Discrete SFB2 per-expert base pointers are declared 16B-aligned in
-        # the sched extension (assumed_align=16). With back-to-back per-expert
-        # f32 (ceil(n/sgn), ceil(k/sgk)) blocks, every base past the first is
-        # misaligned unless the block byte size is a multiple of 16.
-        if weight_mode == MoEWeightMode.DISCRETE and l > 1:
-            sfb2_block_bytes = ((n + sgn - 1) // sgn) * ((k + sgk - 1) // sgk) * 4
-            if sfb2_block_bytes % 16 != 0:
-                result = False
-        return result
 
     def __init__(
         self,
@@ -744,9 +597,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             self.cta_tile_shape_mnk_d[1] // self.epi_tile[1],
         )
 
-        # enable direct store D when it is NVFP4 input, BFlat16 output
-        self.store_d_directly = False
-
         # Setup A/B/D/Scale stage count in shared memory and ACC stage count in tensor memory
         # (num_epi_stage: pipeline stages for epi_pipeline, accumulator update -> epilogue)
         (
@@ -770,7 +620,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             self.sf_vec_size,
             self.num_smem_capacity,
             self.occupancy,
-            self.store_d_directly,
             self.generate_dbias,
             self.enable_breuse,
             acc_dtype=self.acc_dtype,
@@ -817,24 +666,16 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             self.num_c_stage,
         )
 
-        if cutlass.const_expr(not self.store_d_directly):
-            self.d_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-                self.d_dtype,
-                self.d_layout,
-                self.epi_tile,
-                self.num_d_stage,
-            )
-        else:
-            self.d_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-                self.d_dtype,
-                self.d_layout,
-                self.epi_tile,
-                1,
-            )
+        self.d_smem_layout_staged = sm100_utils.make_smem_layout_epi(
+            self.d_dtype,
+            self.d_layout,
+            self.epi_tile,
+            self.num_d_stage,
+        )
 
         # Full-CTA-tile SMEM buffer for the final accumulator; the "stage" mode of the
         # epi layout doubles as the subtile-slot index (subtile_cnt slots per epi stage).
-        # Always allocated (unlike sD, which is conditional on store_d_directly).
+        # Always allocated.
         self.final_acc_subtile_cnt = (self.cta_tile_shape_mnk[0] // cute.size(self.epi_tile[0])) * (self.cta_tile_shape_mnk[1] // cute.size(self.epi_tile[1]))
         self.final_acc_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.acc_dtype,
@@ -865,7 +706,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
 
         self.scale_size_m = size_m
         self.scale_size_n = size_n
-        self.scale_size_k = size_k
 
         self.scale_m_per_tile = self.cta_tile_shape_mnk[0] // size_m
         self.scale_n_per_tile = self.cta_tile_shape_mnk[1] // size_n
@@ -900,21 +740,8 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         if self.enable_breuse and self.mma_tiler[1] in {192, 256}:
             self.num_acc_stage = 1
 
-        # Second-level design: the final accumulator lives in SMEM (sFinalAcc) and the
-        # accumulator-update warpgroup consumes one MMA partial per k-tile, so the
-        # overlapping-accumulator TMEM trick is disabled here.
-        self.overlapping_accum = False
-
-        # To prefetch more accumulator when overlapping_accum is enabled in epilogue
+        # To prefetch more accumulator in epilogue
         self.epilogue_prefetch_more = self.d_dtype.width == 8 and self.a_dtype.width == 8
-
-        # To generate dprob
-        self.generate_dprob = True
-
-        # Use ptx fp8 fp32 convert. The ptx pack path (cvt_f32x4_to_f8x4_pack_i32)
-        # only encodes 8-bit fp8x2 outputs; fp4 (Float4E2M1FN) outputs must fall
-        # back to the generic .to() conversion.
-        self.use_fp8_ptx_cvt = cutlass.const_expr(self.d_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2))
 
         # Compute number of TMEM columns for SFA/SFB/Accumulator.
         sf_atom_mn = 32
@@ -924,8 +751,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         if self.enable_breuse:
             self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[1] * self.num_acc_stage * 2
-        elif self.overlapping_accum:
-            self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
         else:
             self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[1] * self.num_acc_stage
         if self.cta_tile_shape_mnk[1] == 192 and not self.enable_breuse:
@@ -933,10 +758,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             self.num_accumulator_tmem_stride = self.num_accumulator_tmem_cols - 192
         else:
             self.num_accumulator_tmem_stride = self.num_accumulator_tmem_cols
-
-        self.epi_tile_n_required = cute.size(self.epi_tile[1])
-        # Only when overlapping_accum is enabled, we need to release accumulator buffer early in epilogue
-        self.iter_acc_early_release_in_epilogue = (self.num_sf_tmem_cols + self.epi_tile_n_required - 1) // self.epi_tile_n_required - 1
 
     def get_desc_workspace_bytes(self) -> int:
         """Return descriptor workspace size in bytes."""
@@ -1114,7 +935,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         dbias_tensor: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the GEMM.
 
@@ -1384,42 +1204,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             mma_inst_shape_mnk_sfb,
         )
 
-        tiled_mma_bkeep = None
-        tiled_mma_breuse = None
-        if cutlass.const_expr(self.enable_breuse):
-            tiled_mma_bkeep = sm107_utils.make_blockscaled_trivial_tiled_mma(
-                self.a_dtype,
-                self.b_dtype,
-                self.a_major_mode,
-                self.b_major_mode,
-                self.sf_dtype,
-                self.sf_vec_size,
-                self.cta_group,
-                mma_inst_shape_mnk,
-                a_collector_op=CollectorOp.DISCARD,
-                b_collector_op=CollectorOp.FILL,
-                atom_layout_mnk=atom_layout_mnk,
-                permutation_mnk=permutation_mnk,
-            )
-            tiled_mma_bkeep.set(tcgen05.Field.NEGATE_A, False)
-            tiled_mma_bkeep.set(tcgen05.Field.NEGATE_B, False)
-            tiled_mma_breuse = sm107_utils.make_blockscaled_trivial_tiled_mma(
-                self.a_dtype,
-                self.b_dtype,
-                self.a_major_mode,
-                self.b_major_mode,
-                self.sf_dtype,
-                self.sf_vec_size,
-                self.cta_group,
-                mma_inst_shape_mnk,
-                a_collector_op=CollectorOp.DISCARD,
-                b_collector_op=CollectorOp.LASTUSE,
-                atom_layout_mnk=atom_layout_mnk,
-                permutation_mnk=permutation_mnk,
-            )
-            tiled_mma_breuse.set(tcgen05.Field.NEGATE_A, False)
-            tiled_mma_breuse.set(tcgen05.Field.NEGATE_B, False)
-
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
         # Setup TMA load for A
@@ -1491,23 +1275,15 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         )
 
         # Setup TMA store for D
-        tma_atom_d = None
-        tma_tensor_d = None
-        if cutlass.const_expr(not self.store_d_directly):
-            d_smem_layout = cute.slice_(self.d_smem_layout_staged, (None, None, 0))
-            tma_atom_d, tma_tensor_d = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileS2GOp(),
-                d,
-                d_smem_layout,
-                self.epi_tile,
-            )
-            if cutlass.const_expr(self.d_deinterleaved):
-                tma_tensor_d = _deinterleave_n_coord_tensor(tma_tensor_d, n_static=self.deint_n)
-        else:
-            if cutlass.const_expr(self.d_deinterleaved):
-                tma_tensor_d = _deinterleave_n_coord_tensor(d, n_static=self.deint_n)
-            else:
-                tma_tensor_d = d
+        d_smem_layout = cute.slice_(self.d_smem_layout_staged, (None, None, 0))
+        tma_atom_d, tma_tensor_d = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(),
+            d,
+            d_smem_layout,
+            self.epi_tile,
+        )
+        if cutlass.const_expr(self.d_deinterleaved):
+            tma_tensor_d = _deinterleave_n_coord_tensor(tma_tensor_d, n_static=self.deint_n)
 
         # Compute grid size using MoE scheduler
         # dGLU output has shape (m, 2*N_half, 1), but scheduling is over (m, N_half)
@@ -1525,8 +1301,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         self.buffer_align_bytes = 1024
 
         # Define shared storage for kernel
-        # sD is not needed when storing D directly (and not generating SFD)
-        sD_size = 0 if (not self.generate_sfd and self.store_d_directly) else cute.cosize(self.d_smem_layout_staged.outer)
+        sD_size = cute.cosize(self.d_smem_layout_staged.outer)
         SchedulerStorage = MoEPersistentTileScheduler.make_storage_struct(self.num_tile_stage, self.use_dynamic_sched)
 
         @cute.struct
@@ -1540,8 +1315,8 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             # red.shared::cluster maxes for a tile have been fenced).
             row_dsmem_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 if self.row_dsmem else 0]
             scheduler: SchedulerStorage
-            c_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_c_stage]
-            c_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_c_stage]
+            # C TMA-load pipeline barriers: num_c_stage full + num_c_stage empty.
+            c_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_c_stage * 2]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
@@ -1666,8 +1441,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         # Launch the main kernel
         self.kernel(
             tiled_mma,
-            tiled_mma_bkeep,
-            tiled_mma_breuse,
             tiled_mma_sfb,
             tma_atom_a,
             tma_tensor_a,
@@ -1708,7 +1481,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             self.final_acc_smem_layout_staged,
             self.epi_tile,
             sched_params,
-            epilogue_op,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1795,7 +1567,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
     @cute.jit
     def amax_reduction_per_thread(self, vec_fp32, amax_fp32) -> None:
         vec_fp32_ssa = vec_fp32
-        abs_acc_values_ir = cutlass._mlir.dialects.math.absf(vec_fp32_ssa.ir_value())
+        abs_acc_values_ir = math.absf(vec_fp32_ssa.ir_value())
         abs_acc_values = type(vec_fp32_ssa)(abs_acc_values_ir, vec_fp32_ssa.shape, vec_fp32_ssa.dtype)
         subtile_amax = abs_acc_values.reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
         return cute.arch.fmax(amax_fp32, subtile_amax)
@@ -1804,54 +1576,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
     def second_level_scale_row_wise_gen(self, thread_tile_amax, tgSFD2):
         thread_gmem_ptr = tgSFD2.iterator.llvm_ptr
         _ = atomic_max_float32(ptr=thread_gmem_ptr, value=thread_tile_amax)
-
-    @cute.jit
-    def cvt_f32x4_to_f8x4_pack_i32(self, fp32x4, fp8_type, loc=None, ip=None):
-        fp32x4 = fp32x4.load()
-        src_vec4 = fp32x4.ir_value(loc=loc, ip=ip) if hasattr(fp32x4, "ir_value") else fp32x4
-
-        src0 = Float32(vector.extract(src_vec4, [], [0])).ir_value(loc=loc, ip=ip)
-        src1 = Float32(vector.extract(src_vec4, [], [1])).ir_value(loc=loc, ip=ip)
-        src2 = Float32(vector.extract(src_vec4, [], [2])).ir_value(loc=loc, ip=ip)
-        src3 = Float32(vector.extract(src_vec4, [], [3])).ir_value(loc=loc, ip=ip)
-
-        cvt_instruction = ""
-        if cutlass.const_expr(fp8_type == cutlass.Float8E8M0FNU):
-            cvt_instruction = "cvt.rp.satfinite.ue8m0x2.f32"
-        elif cutlass.const_expr(fp8_type == cutlass.Float8E4M3FN):
-            cvt_instruction = "cvt.rn.satfinite.e4m3x2.f32"
-        else:
-            with cute.arch.elect_one():
-                cute.printf("error: unsupported fp8 element type")
-            return
-
-        asm_tmpl = (
-            "{\n"
-            "  .reg .b16 lo;\n"
-            "  .reg .b16 hi;\n"
-            f"  {cvt_instruction} lo, $2, $1;\n"
-            f"  {cvt_instruction} hi, $4, $3;\n"
-            "  mov.b32 $0, {lo, hi};\n"
-            "}"
-        )
-        packed_i32 = llvm.inline_asm(
-            T.i32(),
-            [src0, src1, src2, src3],
-            asm_tmpl,
-            "=r,f,f,f,f",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-
-        return packed_i32
-
-    @cute.jit
-    def cvt_f32x4_to_f8x4(self, fp32x4, fp8x4, loc=None, ip=None):
-        packed_i32 = self.cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8x4.element_type)
-        fp8x4_i32 = cute.recast_tensor(fp8x4, cutlass.Int32)
-        fp8x4_i32[0] = cutlass.Int32(packed_i32)
-        return
 
     @cute.jit
     def cvt_f32_to_f8_to_f32(self, fp32x1, fp8_type, loc=None, ip=None):
@@ -1928,7 +1652,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         tCompute.store(src)
         tTR_rAcc_frg = cute.logical_divide(tCompute, cute.make_layout(self.sf_vec_size))
         acc_frg = tTR_rAcc_frg.load()
-        abs_acc_frg_ir = cutlass._mlir.dialects.math.absf(acc_frg.ir_value())
+        abs_acc_frg_ir = math.absf(acc_frg.ir_value())
         abs_acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
 
         sfd2_scale = cute.arch.rcp_approx(sfd2_descale)
@@ -1985,59 +1709,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     vec[ei] = vec[ei] * acc_scale
 
         acc_vec = tiled_copy_r2s.retile(tCompute).load()
-        if cutlass.const_expr(not self.use_fp8_ptx_cvt):
-            tRSrD.store(acc_vec.to(self.d_dtype))
-        else:
-            tRSrD_i32 = cute.recast_tensor(tRSrD, cutlass.Int32)
-            for ei in cutlass.range_constexpr(0, self.sf_vec_size, 4):
-                fp32x4 = cute.make_rmem_tensor(4, cutlass.Float32)
-                fp32x4[0] = acc_vec[ei + 0]
-                fp32x4[1] = acc_vec[ei + 1]
-                fp32x4[2] = acc_vec[ei + 2]
-                fp32x4[3] = acc_vec[ei + 3]
-                fp8x4_i32 = self.cvt_f32x4_to_f8x4_pack_i32(fp32x4, self.d_dtype)
-                tRSrD_i32[ei // 4] = cutlass.Int32(fp8x4_i32)
-
-    @cute.jit
-    def stg_256(self, ptr, vec8_f32, *, loc=None, ip=None):
-        """
-        Store 8xf32 (256b) to global memory with L1::no_allocate.
-        ptr: pointer (byte addressable)
-        vec8_f32: vector<8xf32> to store
-        """
-        dst = ptr.ir_value(loc=loc, ip=ip) if hasattr(ptr, "ir_value") else ptr
-        src = vec8_f32.ir_value(loc=loc, ip=ip) if hasattr(vec8_f32, "ir_value") else vec8_f32
-        dummy = llvm.inline_asm(
-            T.i32(),
-            [
-                dst,
-                vector.extract(src, [], [0], loc=loc, ip=ip),
-                vector.extract(src, [], [1], loc=loc, ip=ip),
-                vector.extract(src, [], [2], loc=loc, ip=ip),
-                vector.extract(src, [], [3], loc=loc, ip=ip),
-                vector.extract(src, [], [4], loc=loc, ip=ip),
-                vector.extract(src, [], [5], loc=loc, ip=ip),
-                vector.extract(src, [], [6], loc=loc, ip=ip),
-                vector.extract(src, [], [7], loc=loc, ip=ip),
-            ],
-            "st.global.L1::no_allocate.v8.f32 [$1], {$2, $3, $4, $5, $6, $7, $8, $9}; mov.u32 $0, 0;",
-            "=r,l,f,f,f,f,f,f,f,f",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-
-    @cute.jit
-    def store_global_memory_256b(self, dst: cute.Tensor, src: cute.Tensor):
-        vec_shape = cute.make_layout(8)
-        dst_f32 = cute.flatten(cute.recast_tensor(dst, cutlass.Float32))
-        src_f32 = cute.flatten(cute.recast_tensor(src, cutlass.Float32))
-        dst_vf32x8 = cute.logical_divide(dst_f32, vec_shape)
-        src_vf32x8 = cute.logical_divide(src_f32, vec_shape)
-        for ei in cutlass.range_constexpr(dst_vf32x8.shape[1]):
-            self.stg_256(dst_vf32x8[None, ei].iterator.llvm_ptr, src_vf32x8[None, ei].load())
+        tRSrD.store(acc_vec.to(self.d_dtype))
 
     @cute.jit
     def dbias_reduction(
@@ -2243,21 +1915,20 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     ftz=False,
                 )
                 # calculate dprob
-                if cutlass.const_expr(self.generate_dprob):
-                    (
-                        dprob_swiglu[i + 0],
-                        dprob_swiglu[i + 1],
-                    ) = cute.arch.mul_packed_f32x2(
-                        (ab2_vec_acc_type[0], ab2_vec_acc_type[1]),
-                        swish,
-                    )
-                    (
-                        dprob_swiglu[i + 0],
-                        dprob_swiglu[i + 1],
-                    ) = cute.arch.mul_packed_f32x2(
-                        (dprob_swiglu[i + 0], dprob_swiglu[i + 1]),
-                        (acc_vec[i + 0], acc_vec[i + 1]),
-                    )
+                (
+                    dprob_swiglu[i + 0],
+                    dprob_swiglu[i + 1],
+                ) = cute.arch.mul_packed_f32x2(
+                    (ab2_vec_acc_type[0], ab2_vec_acc_type[1]),
+                    swish,
+                )
+                (
+                    dprob_swiglu[i + 0],
+                    dprob_swiglu[i + 1],
+                ) = cute.arch.mul_packed_f32x2(
+                    (dprob_swiglu[i + 0], dprob_swiglu[i + 1]),
+                    (acc_vec[i + 0], acc_vec[i + 1]),
+                )
                 # calculate dswiglu
                 acc_vec_prob = cute.arch.mul_packed_f32x2(
                     (acc_vec[i + 0], acc_vec[i + 1]),
@@ -2321,8 +1992,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 )
             d1_vec = d1_vec.load()
             d2_vec = d2_vec.load()
-            if cutlass.const_expr(self.generate_dprob):
-                dprob_swiglu = dprob_swiglu.load()
+            dprob_swiglu = dprob_swiglu.load()
             return d1_vec, d2_vec, dprob_swiglu
         else:
             ab1_f32 = cute.make_rmem_tensor(ab1_vec_load.shape, cutlass.Float32)
@@ -2356,9 +2026,8 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             swish = ab1_vec_load * sig
 
             # calculate dprob
-            if cutlass.const_expr(self.generate_dprob):
-                dprob_swiglu = ab2_vec_load * swish
-                dprob_swiglu = acc_vec * dprob_swiglu
+            dprob_swiglu = ab2_vec_load * swish
+            dprob_swiglu = acc_vec * dprob_swiglu
 
             # calculate dswiglu
             d1_vec = acc_vec * mProb * ab2_vec_load * sig * (1 + ab1_vec_load * (1 - sig))
@@ -2384,13 +2053,11 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             dglu_clamp_min = -7.0
         if cutlass.const_expr(dglu_alpha is None):
             dglu_alpha = 1.702
-        LOG2_E = cutlass.Float32(1.4426950408889634)
         x_dtype = x1_vec_load.element_type
         geglu_max_value = x_dtype(dglu_clamp_max)
         geglu_min_value = x_dtype(dglu_clamp_min)
         geglu_max_value_f32 = cutlass.Float32(dglu_clamp_max)
         geglu_min_value_f32 = cutlass.Float32(dglu_clamp_min)
-        zero_x_dtype = x_dtype(0.0)
         fmul2 = partial(cute.arch.mul_packed_f32x2, rnd="rn", ftz=False)
         fadd2 = partial(cute.arch.add_packed_f32x2, rnd="rn", ftz=False)
         dglu_alpha_tuple = (dglu_alpha, dglu_alpha)
@@ -2477,17 +2144,15 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 x2_filter_1 = y2_1 if x2_filter_1 >= geglu_min_value else cutlass.Float32(0.0)
                 dx2_vec[i], dx2_vec[i + 1] = fmul2((dy2_0, dy2_1), (cutlass.Float32(x2_filter_0), cutlass.Float32(x2_filter_1)))
 
-                if cutlass.const_expr(self.generate_dprob):
-                    prob_grad, prob_grad_1 = fmul2(
-                        (dy1_pre_0, dy1_pre_1),
-                        y1,
-                    )
-                    dprob_swiglu[i] = prob_grad
-                    dprob_swiglu[i + 1] = prob_grad_1
+                prob_grad, prob_grad_1 = fmul2(
+                    (dy1_pre_0, dy1_pre_1),
+                    y1,
+                )
+                dprob_swiglu[i] = prob_grad
+                dprob_swiglu[i + 1] = prob_grad_1
             dx1_vec = dx1_vec.load()
             dx2_vec = dx2_vec.load()
-            if cutlass.const_expr(self.generate_dprob):
-                dprob_swiglu = dprob_swiglu.load()
+            dprob_swiglu = dprob_swiglu.load()
             return dx1_vec, dx2_vec, dprob_swiglu
         else:
             element_count = cute.size(x1_vec_load)
@@ -2519,9 +2184,8 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 dx1_vec[i] = x1_filter * dy1
                 dx2_vec[i] = x2_filter * dy2
 
-                if cutlass.const_expr(self.generate_dprob):
-                    prob_grad = y1 * sigmoid_out * (y2 + linear_offset) * fc2_dgrad
-                    dprob_swiglu[i] = prob_grad
+                prob_grad = y1 * sigmoid_out * (y2 + linear_offset) * fc2_dgrad
+                dprob_swiglu[i] = prob_grad
 
             return dx1_vec.load(), dx2_vec.load(), dprob_swiglu.load()
 
@@ -2530,8 +2194,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
     def kernel(
         self,
         tiled_mma: cute.TiledMma,
-        tiled_mma_bkeep: Optional[cute.TiledMma],
-        tiled_mma_breuse: Optional[cute.TiledMma],
         tiled_mma_sfb: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
@@ -2572,7 +2234,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         final_acc_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
         sched_params: MoESchedulerParams,
-        epilogue_op: cutlass.Constexpr,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -2592,8 +2253,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 cpasync.prefetch_descriptor(tma_atom_b)
                 cpasync.prefetch_descriptor(tma_atom_sfb)
             cpasync.prefetch_descriptor(tma_atom_c)
-            if cutlass.const_expr(not self.store_d_directly):
-                cpasync.prefetch_descriptor(tma_atom_d)
+            cpasync.prefetch_descriptor(tma_atom_d)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
@@ -2601,7 +2261,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         # Setup cta/thread coordinates
         #
         # Coords inside cluster
-        bidx, bidy, bidz = cute.arch.block_idx()
+        bidx, _, _ = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -2680,7 +2340,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             len(self.epilog_warp_id),
         )
         c_pipeline = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.c_full_mbar_ptr.data_ptr(),
+            barrier_storage=storage.c_mbar_ptr.data_ptr(),
             num_stages=self.num_c_stage,
             producer_group=c_producer_group,
             consumer_group=c_consumer_group,
@@ -2763,9 +2423,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         #
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
         sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner)
-        sD = None
-        if cutlass.const_expr(not self.store_d_directly):
-            sD = storage.sD.get_tensor(d_smem_layout_staged.outer, swizzle=d_smem_layout_staged.inner)
+        sD = storage.sD.get_tensor(d_smem_layout_staged.outer, swizzle=d_smem_layout_staged.inner)
         # Full-CTA-tile final accumulator buffer (always allocated)
         sFinalAcc = storage.sFinalAcc.get_tensor(final_acc_smem_layout_staged.outer, swizzle=final_acc_smem_layout_staged.inner)
         # bf16 alias of the same bytes for the NVFP4 dGLU relay (see the epilogue).
@@ -2831,22 +2489,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
-        if cutlass.const_expr(self.overlapping_accum):
-            num_acc_stage_overlapped = 2
-            tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage_overlapped))
-            tCtAcc_fake = cute.make_tensor(
-                tCtAcc_fake.iterator,
-                cute.make_layout(
-                    tCtAcc_fake.shape,
-                    stride=(
-                        tCtAcc_fake.stride[0],
-                        tCtAcc_fake.stride[1],
-                        tCtAcc_fake.stride[2],
-                        (256 - self.num_sf_tmem_cols) * tCtAcc_fake.stride[0][1],
-                    ),
-                ),
-            )
-        elif cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
+        if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
             tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
             tCtAcc_fake = cute.make_tensor(
                 tCtAcc_fake.iterator,
@@ -3194,13 +2837,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
 
                 mSFA2_mkl_current, _ = ext.get_gmem_tensor("sfa2", sfa2_tensor, padded_offsets, work_tile_info)
                 mSFB2_nkl_current, _ = ext.get_gmem_tensor("sfb2", sfb2_tensor, padded_offsets, work_tile_info)
-
-                # print(f"[{os.path.basename(__file__)}:{inspect.currentframe().f_lineno}] mSFA2_mkl_current.layout: {mSFA2_mkl_current.layout}")
-                # print(f"[{os.path.basename(__file__)}:{inspect.currentframe().f_lineno}] mSFB2_nkl_current.layout: {mSFB2_nkl_current.layout}")
-
-                # if tidx == 352:
-                #    cute.printf("bidx: {}, mSFA2_mkl_current: {}", bidz, mSFA2_mkl_current)
-                #    cute.printf("bidx: {}, mSFB2_nkl_current: {}", bidz, mSFB2_nkl_current)
 
                 gSFA2_mkl = cute.local_tile(mSFA2_mkl_current, cute.slice_(self.cta_tile_shape_mnk, (None, 0, None)), (None, None, None))
                 gSFB2_nkl = cute.local_tile(mSFB2_nkl_current, cute.slice_(self.cta_tile_shape_mnk, (0, None, None)), (None, None, None))
@@ -3853,13 +3489,11 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 pipeline.Agent.Thread,
                 32 * len(self.epilog_warp_id),
             )
-            d_pipeline = None
-            if cutlass.const_expr(not self.store_d_directly):
-                num_d_stages = self.num_d_stage // 2
-                d_pipeline = pipeline.PipelineTmaStore.create(
-                    num_stages=num_d_stages,
-                    producer_group=d_producer_group,
-                )
+            num_d_stages = self.num_d_stage // 2
+            d_pipeline = pipeline.PipelineTmaStore.create(
+                num_stages=num_d_stages,
+                producer_group=d_producer_group,
+            )
 
             tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
 
@@ -3930,10 +3564,9 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     bSFD2_gate = tCgSFD2_gate[(None, None, None, *mma_tile_coord_mnl)]
                     tgSFD2_gate = cute.local_partition(bSFD2_gate, thread_tiler, tidx)
 
-                if cutlass.const_expr(not self.store_d_directly):
-                    bSG_sD, bSG_gD_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_d, tCgD_loop, epi_tile, sD)
-                    bSG_gD = bSG_gD_partitioned[(None, None, None, mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], 0)]
-                    bSG_gD = cute.group_modes(bSG_gD, 1, cute.rank(bSG_gD))
+                bSG_sD, bSG_gD_partitioned = self.epilog_gmem_copy_and_partition(tma_atom_d, tCgD_loop, epi_tile, sD)
+                bSG_gD = bSG_gD_partitioned[(None, None, None, mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], 0)]
+                bSG_gD = cute.group_modes(bSG_gD, 1, cute.rank(bSG_gD))
 
                 epi_stage_index = 0
 
@@ -3958,7 +3591,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     tCgSFDRow_mnl = cute.filter_zeros(tCgSFDRow_mnl)
                     tCrSFDRow = cute.make_rmem_tensor(tCgSFDRow_mnl[(None, None, None, 0, 0, 0)].layout, self.sf_dtype)
                     tCrSFDRow_pvscale = cute.make_rmem_tensor_like(tCrSFDRow, cutlass.Float32)
-                    tCgSFDRow_mn = tCgSFDRow_mnl[(None, None, None, None, None, 0)]
 
                     # SMEM staging for coalesced SFD stores. One store event
                     # (2 subtiles x d1/d2) covers one contiguous
@@ -3995,8 +3627,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     + tidx % 128
                 )
                 mProb = real_prob[mPosition, 0, 0]
-                if cutlass.const_expr(self.generate_dprob):
-                    dProbVal = cutlass.Float32(0.0)
+                dProbVal = cutlass.Float32(0.0)
 
                 #
                 # Build C (up/gate forward activations) GMEM->SMEM partition and
@@ -4009,7 +3640,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 real_c, _ = epi_ext.get_gmem_tensor("c", mC_mnl, padded_offsets, epi_work_tile_info)
                 gC_mnl_loop = cute.local_tile(real_c, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
                 tCgC_loop = thr_mma_epi.partition_C(gC_mnl_loop)
-                bGS_sC, bGS_gC_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC_loop, epi_tile, sC)
+                bGS_sC, bGS_gC_partitioned = self.epilog_gmem_copy_and_partition(tma_atom_c, tCgC_loop, epi_tile, sC)
                 bGS_gC = bGS_gC_partitioned[(None, None, None, mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], 0)]
                 bGS_gC = cute.group_modes(bGS_gC, 1, cute.rank(bGS_gC))
                 c_subtile_cnt = cute.size(bGS_gC.shape, mode=[1])
@@ -4143,10 +3774,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc)
                     ab1_vec_load = tiled_copy_r2s.retile(tRS_rC1)
                     ab2_vec_load = tiled_copy_r2s.retile(tRS_rC2)
-                    if cutlass.const_expr(self.generate_dprob):
-                        dprob_swiglu = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
-                    else:
-                        dprob_swiglu = None
+                    dprob_swiglu = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
 
                     #
                     # Apply alpha, act, and prob
@@ -4157,28 +3785,27 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     elif cutlass.const_expr(self.act_func == "dgeglu"):
                         d1_vec, d2_vec, dprob_swiglu = self.dgeglu(acc_vec, ab1_vec_load, ab2_vec_load, mProb, linear_offset, dprob_swiglu)
 
-                    if cutlass.const_expr(self.generate_dprob):
-                        # dprob sum reduction
-                        if cutlass.const_expr(self.vectorized_f32):
-                            dprob_pair_0 = cutlass.Float32(0.0)
-                            dprob_pair_1 = cutlass.Float32(0.0)
-                            for j in cutlass.range(0, cute.size(dprob_swiglu.shape), 2, unroll_full=True):
-                                (
-                                    dprob_pair_0,
-                                    dprob_pair_1,
-                                ) = cute.arch.add_packed_f32x2(
-                                    (dprob_pair_0, dprob_pair_1),
-                                    (dprob_swiglu[j], dprob_swiglu[j + 1]),
-                                    rnd="rn",
-                                    ftz=False,
-                                )
-                            dProbVal += dprob_pair_0 + dprob_pair_1
-                        else:
-                            dProbVal += dprob_swiglu.reduce(
-                                cute.ReductionOp.ADD,
-                                cutlass.Float32(0.0),
-                                0,
+                    # dprob sum reduction
+                    if cutlass.const_expr(self.vectorized_f32):
+                        dprob_pair_0 = cutlass.Float32(0.0)
+                        dprob_pair_1 = cutlass.Float32(0.0)
+                        for j in cutlass.range(0, cute.size(dprob_swiglu.shape), 2, unroll_full=True):
+                            (
+                                dprob_pair_0,
+                                dprob_pair_1,
+                            ) = cute.arch.add_packed_f32x2(
+                                (dprob_pair_0, dprob_pair_1),
+                                (dprob_swiglu[j], dprob_swiglu[j + 1]),
+                                rnd="rn",
+                                ftz=False,
                             )
+                        dProbVal += dprob_pair_0 + dprob_pair_1
+                    else:
+                        dProbVal += dprob_swiglu.reduce(
+                            cute.ReductionOp.ADD,
+                            cutlass.Float32(0.0),
+                            0,
+                        )
 
                     #
                     # Generate dBias
@@ -4502,10 +4129,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc)
                         ab1_vec_load = tiled_copy_r2s.retile(tRS_rC1)
                         ab2_vec_load = tiled_copy_r2s.retile(tRS_rC2)
-                        if cutlass.const_expr(self.generate_dprob):
-                            dprob_swiglu = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
-                        else:
-                            dprob_swiglu = None
+                        dprob_swiglu = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
 
                         #
                         # Apply alpha, act, and prob
@@ -4552,14 +4176,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                                 local_n_tile * self.epi_tile_cnt[1] // 2 + (real_subtile_idx // 2),
                             )
 
-                            tCgSFDRow = tCgSFDRow_mn[
-                                (
-                                    None,
-                                    None,
-                                    None,
-                                    *sfd_row_idx_mn,
-                                )
-                            ]
                             if cutlass.const_expr(self.sf_dtype == cutlass.FloatNV8E5M3FNU):
                                 # Scalar clamp + RN .to() per element: no PTX cvt
                                 # (and no known-good vector .to()) exists for e5m3.
@@ -4571,10 +4187,8 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                                 for sfi in cutlass.range_constexpr(cute.size(tCrSFDRow.shape)):
                                     pv_sf = fmin(tCrSFDRow_pvscale[sfi], Float32(61440.0), nan=True)
                                     tCrSFDRow[sfi] = pv_sf.to(cutlass.FloatNV8E5M3FNU)
-                            elif cutlass.const_expr(not self.use_fp8_ptx_cvt):
-                                tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
                             else:
-                                self.cvt_f32x4_to_f8x4(tCrSFDRow_pvscale, tCrSFDRow)
+                                tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
                             if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
                                 # Coalesced SFD store: scatter this thread's SF
                                 # bytes into the SMEM stage at their atom-layout
@@ -4640,73 +4254,42 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                     #
                     # Store D
                     #
-                    if cutlass.const_expr(self.store_d_directly):
-                        self.epilog_sync_barrier.arrive_and_wait()
-                        d_idx_mn = (mma_tile_coord_mnl[0], mma_tile_coord_mnl[1])
-                        d_epilogue_subtile = (
-                            cute.make_layout(128),
-                            cute.make_layout(self.mma_tiler[1] * 2),
-                        )
-                        gD_sub_loop = cute.local_tile(real_d, d_epilogue_subtile, (None, None, None))
-                        tCgD_mnl_loop = thr_copy_t2r.partition_D(gD_sub_loop)
-                        tCgD_mnl_loop = cute.filter_zeros(tCgD_mnl_loop)
-                        tCgD1 = tCgD_mnl_loop[
-                            (
-                                None,
-                                0,  # T2R_M
-                                2 * real_subtile_idx + 0,  # T2R_N
-                                *d_idx_mn,  # RestM/N
-                                0,  # RestL
-                            )
-                        ]
-                        tCgD2 = tCgD_mnl_loop[
-                            (
-                                None,
-                                0,  # T2R_M
-                                2 * real_subtile_idx + 1,  # T2R_N
-                                *d_idx_mn,  # RestM/N
-                                0,  # RestL
-                            )
-                        ]
-                        self.store_global_memory_256b(tCgD1, tRS_rD1)
-                        self.store_global_memory_256b(tCgD2, tRS_rD2)
-                    else:
-                        if warp_idx == self.epilog_warp_id[0]:
-                            d_pipeline.producer_acquire()
-                        self.epilog_sync_barrier.arrive_and_wait()
-                        d1_buffer = num_prev_subtiles % self.num_d_stage
-                        num_prev_subtiles = num_prev_subtiles + 1
+                    if warp_idx == self.epilog_warp_id[0]:
+                        d_pipeline.producer_acquire()
+                    self.epilog_sync_barrier.arrive_and_wait()
+                    d1_buffer = num_prev_subtiles % self.num_d_stage
+                    num_prev_subtiles = num_prev_subtiles + 1
+                    cute.copy(
+                        tiled_copy_r2s,
+                        tRS_rD1,
+                        tRS_sD[(None, None, None, d1_buffer)],
+                    )
+                    d2_buffer = num_prev_subtiles % self.num_d_stage
+                    num_prev_subtiles = num_prev_subtiles + 1
+                    cute.copy(
+                        tiled_copy_r2s,
+                        tRS_rD2,
+                        tRS_sD[(None, None, None, d2_buffer)],
+                    )
+                    # Fence and barrier to make sure shared memory store is visible to TMA store
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    self.epilog_sync_barrier.arrive_and_wait()
+                    #
+                    # TMA store D to global memory
+                    #
+                    if warp_idx == self.epilog_warp_id[0]:
                         cute.copy(
-                            tiled_copy_r2s,
-                            tRS_rD1,
-                            tRS_sD[(None, None, None, d1_buffer)],
+                            tma_atom_d,
+                            bSG_sD[(None, d1_buffer)],
+                            bSG_gD[(None, 2 * real_subtile_idx + 0)],
                         )
-                        d2_buffer = num_prev_subtiles % self.num_d_stage
-                        num_prev_subtiles = num_prev_subtiles + 1
                         cute.copy(
-                            tiled_copy_r2s,
-                            tRS_rD2,
-                            tRS_sD[(None, None, None, d2_buffer)],
+                            tma_atom_d,
+                            bSG_sD[(None, d2_buffer)],
+                            bSG_gD[(None, 2 * real_subtile_idx + 1)],
                         )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        self.epilog_sync_barrier.arrive_and_wait()
-                        #
-                        # TMA store D to global memory
-                        #
-                        if warp_idx == self.epilog_warp_id[0]:
-                            cute.copy(
-                                tma_atom_d,
-                                bSG_sD[(None, d1_buffer)],
-                                bSG_gD[(None, 2 * real_subtile_idx + 0)],
-                            )
-                            cute.copy(
-                                tma_atom_d,
-                                bSG_sD[(None, d2_buffer)],
-                                bSG_gD[(None, 2 * real_subtile_idx + 1)],
-                            )
-                            # Fence and barrier to make sure shared memory store is visible to TMA store
-                            d_pipeline.producer_commit()
+                        d_pipeline.producer_commit()
                     self.epilog_sync_barrier.arrive_and_wait()
 
                 #
@@ -4726,12 +4309,11 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
-                if cutlass.const_expr(self.generate_dprob):
-                    real_dprob, _ = epi_ext.get_gmem_tensor("dprob", dprob, padded_offsets, epi_work_tile_info)
-                    _ = atomic_add_float32(
-                        ptr=real_dprob[(mPosition, None, None)].iterator.llvm_ptr,
-                        value=dProbVal,
-                    )
+                real_dprob, _ = epi_ext.get_gmem_tensor("dprob", dprob, padded_offsets, epi_work_tile_info)
+                _ = atomic_add_float32(
+                    ptr=real_dprob[(mPosition, None, None)].iterator.llvm_ptr,
+                    value=dProbVal,
+                )
 
             #
             # Wait for outstanding C TMA loads (producer side) to drain
@@ -4748,8 +4330,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             #
             # Wait for D store complete
             #
-            if cutlass.const_expr(not self.store_d_directly):
-                d_pipeline.producer_tail()
+            d_pipeline.producer_tail()
         #
 
     def epilog_tmem_copy_and_partition(
@@ -5000,7 +4581,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
 
     def epilog_gmem_copy_and_partition(
         self,
-        tidx: cutlass.Int32,
         atom: Union[cute.CopyAtom, cute.TiledCopy],
         gD_mnl: cute.Tensor,
         epi_tile: cute.Tile,
@@ -5010,8 +4590,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         - partition register array (source) and global memory (destination) for none TMA store version;
         - partition shared memory (source) and global memory (destination) for TMA store version.
 
-        :param tidx: The thread index in epilogue warp groups
-        :type tidx: cutlass.Int32
         :param atom: The copy_atom_c to be used for TMA store version, or tiled_copy_t2r for none TMA store version
         :type atom: cute.CopyAtom or cute.TiledCopy
         :param gD_mnl: The global tensor D
@@ -5059,7 +4637,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         sf_vec_size: int,
         num_smem_capacity: int,
         occupancy: int,
-        store_d_directly: bool,
         generate_dbias: bool = False,
         enable_breuse: bool = False,
         acc_dtype: Type[cutlass.Numeric] = None,
@@ -5105,8 +4682,8 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         num_acc_stage = 3 if (mma_tiler_mnk[1] == 128 and not enable_breuse) else num_acc_stage
 
         # Default C/D stages
-        num_c_stage = 4 if a_dtype.width == 8 else (4 if store_d_directly else 2)
-        num_d_stage = 2 if a_dtype.width == 8 else (0 if store_d_directly else 2)
+        num_c_stage = 4 if a_dtype.width == 8 else 2
+        num_d_stage = 2
 
         # Default Tile info stages
         num_tile_stage = 2
@@ -5221,8 +4798,6 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         d_bytes = d_bytes_per_stage * num_d_stage
         if d_dtype == cutlass.Float8E5M2 or d_dtype == cutlass.Float8E4M3FN:
             d_bytes = d_bytes * 2
-        # AMAX bytes
-        amax_bytes = get_amax_smem_size() if d_dtype == cutlass.BFloat16 else 0
         # dBias transpose buffer: (128, 64) column-major FP32 = 32 KB
         dbias_bytes = 128 * 64 * cute.size_in_bytes(cutlass.Float32, cute.make_layout((1,))) if generate_dbias else 0
         # Pipeline stages for epi_pipeline (accumulator-update -> epilogue handoff).
@@ -5249,7 +4824,7 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
         cta_m_rows = mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape)
         row_dsmem_bytes = 2 * (2 * cta_m_rows) * 4 if row_dsmem else 0
 
-        epi_bytes = c_bytes + d_bytes + amax_bytes + dbias_bytes + final_acc_bytes + row_dsmem_bytes
+        epi_bytes = c_bytes + d_bytes + dbias_bytes + final_acc_bytes + row_dsmem_bytes
 
         # Calculate A/B stages:
         # Start with total smem per CTA (capacity / occupancy)
@@ -5260,5 +4835,4 @@ class BlockScaledSubChannelMoEGroupedGemmDgluDbiasKernelSm107:
             f"SMEM overflow: full-tile sFinalAcc ({final_acc_bytes} B) leaves no room for " f"AB stages (mma_tiler={mma_tiler_mnk}); reduce mma_tiler_mn"
         )
 
-        total_bytes = occupancy * (ab_bytes_per_stage * num_ab_stage + epi_bytes + sinfo_bytes + mbar_helpers_bytes)
         return num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_epi_stage

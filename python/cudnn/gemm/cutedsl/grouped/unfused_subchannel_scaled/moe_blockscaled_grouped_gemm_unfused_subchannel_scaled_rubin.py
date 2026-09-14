@@ -28,7 +28,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass.cute.typing import Float32, Int32, AddressSpace
+from cutlass.cute.typing import Int32, AddressSpace
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -45,21 +45,8 @@ from ..moe_sched_extension import (
 )
 from ..moe_kernel_helpers import (
     compute_grid,
-    can_implement,
     epilog_gmem_copy_and_partition,
-    is_valid_dtypes_and_scale_factor_vec_size,
-    is_valid_layouts,
-    is_valid_tensor_alignment,
-    FIX_PAD_SIZE,
 )
-
-# Valid launch-config space for THIS kernel (can_implement still prunes per
-# problem). cta shape == mma_tiler_mn. The upstream B-reuse (512, 256) tile and
-# N=192 tiles are deliberately NOT exposed yet — Blackwell-kernel parity first.
-VALID_CTA_SHAPES = ((256, 128), (256, 256))
-VALID_CLUSTER_SHAPES = ((1, 1), (2, 1), (2, 2), (4, 1), (4, 2))
-DEFAULT_CTA_SHAPE = (256, 128)
-DEFAULT_CLUSTER_SHAPE = (2, 1)
 
 
 class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
@@ -88,88 +75,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
     """
 
     FIX_PAD_SIZE = 256
-
-    @staticmethod
-    def can_implement(
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
-        d_dtype: Type[cutlass.Numeric],
-        use_2cta_instrs: bool,
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-        m: int,
-        n: int,
-        k: int,
-        l: int,
-        a_major: str,
-        b_major: str,
-        cd_major: str,
-        m_aligned: int,
-        weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
-        sgn: int = 256,
-        sgk: int = 256,
-    ) -> bool:
-        result = None
-        # B-reuse case: 2CTA + mma_tiler_mn[0] = 512 (two 256-M instructions per tile)
-        if use_2cta_instrs and mma_tiler_mn[0] == 512:
-            # Pad alignment: per CTA tile = 256 M rows
-            result = (
-                is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size, acc_dtype, d_dtype)
-                and is_valid_layouts(ab_dtype, d_dtype, a_major, b_major, cd_major)
-                and is_valid_tensor_alignment(m, n, k, l, ab_dtype, d_dtype, a_major, b_major, cd_major)
-                and mma_tiler_mn[1] in {192, 256}
-                and cluster_shape_mn[0] % 2 == 0
-                and m_aligned % mma_tiler_mn[0] == 0
-                and m % mma_tiler_mn[0] == 0
-            )
-        # Allow N=192 in addition to the shared helper's N=256 constraint.
-        elif mma_tiler_mn[1] == 192:
-            result = (
-                m_aligned == FIX_PAD_SIZE
-                and ab_dtype.width != 8
-                and is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size, acc_dtype, d_dtype)
-                and is_valid_layouts(ab_dtype, d_dtype, a_major, b_major, cd_major)
-                and is_valid_tensor_alignment(m, n, k, l, ab_dtype, d_dtype, a_major, b_major, cd_major)
-                and a_major == "k"
-                and b_major == "k"
-                and n % 64 == 0
-                and m % 256 == 0
-                and use_2cta_instrs
-                and mma_tiler_mn[0] == 256
-                and cluster_shape_mn[0] % 2 == 0
-            )
-        else:
-            result = can_implement(
-                ab_dtype,
-                sf_dtype,
-                sf_vec_size,
-                acc_dtype,
-                d_dtype,
-                use_2cta_instrs,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                m,
-                n,
-                k,
-                l,
-                a_major,
-                b_major,
-                cd_major,
-                m_aligned,
-                fix_pad_size=BlockScaledSubChannelMoEGroupedGemmKernelSm107.FIX_PAD_SIZE,
-                allowed_mma_tiler_n=(256, 128),
-            )
-        # Discrete SFB2 per-expert base pointers are declared 16B-aligned in
-        # the sched extension (assumed_align=16). With back-to-back per-expert
-        # f32 (ceil(n/sgn), ceil(k/sgk)) blocks, every base past the first is
-        # misaligned unless the block byte size is a multiple of 16.
-        if weight_mode == MoEWeightMode.DISCRETE and l > 1:
-            sfb2_block_bytes = ((n + sgn - 1) // sgn) * ((k + sgk - 1) // sgk) * 4
-            if sfb2_block_bytes % 16 != 0:
-                result = False
-        return result
 
     def __init__(
         self,
@@ -292,11 +197,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
         self.weight_mode = weight_mode
         self.use_dynamic_sched = use_dynamic_sched
 
-        self.epilogue_use_functor = False
-
-        self.num_epilog_warps = len(self.epilog_warp_id)
-        self.num_accumulator_update_warps = len(self.accumulator_update_warp_id)
-
     # ------------------------------------------------------------------
     # _setup_attributes
     # ------------------------------------------------------------------
@@ -388,12 +288,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
             self.mma_inst_shape_mn[1],
             mma_inst_shape_k * mma_inst_tile_k,
         )
-        self.cta_tile_shape_mnk_d = (
-            self.mma_tiler_d[0] // cute.size(tiled_mma.thr_id.shape),
-            self.mma_tiler_d[1],
-            self.mma_tiler_d[2],
-        )
-
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma.thr_id.shape,),
@@ -526,12 +420,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
         else:
             self.bias_smem_layout_staged = cute.make_layout((1, 1))
 
-        # Second-level design: the final accumulator lives in SMEM (sFinalAcc) and the
-        # accumulator-update warpgroup consumes one MMA partial per k-tile, so the
-        # overlapping-accumulator TMEM trick is disabled here.
-        self.overlapping_accum = False
-        self.epilogue_prefetch_more = False
-
         sf_atom_mn = 32
         sf_pack_factor = 32 // self.sf_vec_size
         self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k * sf_pack_factor
@@ -540,8 +428,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
         if self.enable_breuse:
             # Breuse: 2 accumulators (bkeep + breuse) active simultaneously
             self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[1] * self.num_acc_stage * 2
-        elif self.overlapping_accum:
-            self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
         else:
             self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[1] * self.num_acc_stage
         # N=192 non-breuse: 192 cols don't fill a full TMEM row, so pack two acc stages
@@ -554,7 +440,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
             self.num_accumulator_tmem_stride = self.num_accumulator_tmem_cols
 
         self.epi_tile_n_required = cute.size(self.epi_tile[1])
-        self.iter_acc_early_release_in_epilogue = (self.num_sf_tmem_cols + self.epi_tile_n_required - 1) // self.epi_tile_n_required - 1
 
     # ------------------------------------------------------------------
     # _compute_stages (with bias support)
@@ -794,7 +679,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
         prob: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the GEMM.
 
@@ -943,42 +827,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
             mma_inst_shape_mnk_sfb,
         )
 
-        tiled_mma_bkeep = None
-        tiled_mma_breuse = None
-        if cutlass.const_expr(self.enable_breuse):
-            tiled_mma_bkeep = sm107_utils.make_blockscaled_trivial_tiled_mma(
-                self.a_dtype,
-                self.b_dtype,
-                self.a_major_mode,
-                self.b_major_mode,
-                self.sf_dtype,
-                self.sf_vec_size,
-                self.cta_group,
-                mma_inst_shape_mnk,
-                a_collector_op=CollectorOp.DISCARD,
-                b_collector_op=CollectorOp.FILL,
-                atom_layout_mnk=atom_layout_mnk,
-                permutation_mnk=permutation_mnk,
-            )
-            tiled_mma_bkeep.set(tcgen05.Field.NEGATE_A, False)
-            tiled_mma_bkeep.set(tcgen05.Field.NEGATE_B, False)
-            tiled_mma_breuse = sm107_utils.make_blockscaled_trivial_tiled_mma(
-                self.a_dtype,
-                self.b_dtype,
-                self.a_major_mode,
-                self.b_major_mode,
-                self.sf_dtype,
-                self.sf_vec_size,
-                self.cta_group,
-                mma_inst_shape_mnk,
-                a_collector_op=CollectorOp.DISCARD,
-                b_collector_op=CollectorOp.LASTUSE,
-                atom_layout_mnk=atom_layout_mnk,
-                permutation_mnk=permutation_mnk,
-            )
-            tiled_mma_breuse.set(tcgen05.Field.NEGATE_A, False)
-            tiled_mma_breuse.set(tcgen05.Field.NEGATE_B, False)
-
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
         a_op = sm100_utils.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, tiled_mma.thr_id)
@@ -1069,7 +917,7 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
 
         # ---- Grid computation via MoE scheduler ----
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            b_n, b_k, b_l = cute.shape(b)  # B is (N, K, L)
+            b_n, b_k, _ = cute.shape(b)  # B is (N, K, L)
             sched_expert_shape = (self.expert_cnt, b_n, b_k)
         else:
             sched_expert_shape = (self.expert_cnt, n, k)
@@ -1142,8 +990,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
         # ---- Launch ----
         self.kernel(
             tiled_mma,
-            tiled_mma_bkeep,
-            tiled_mma_breuse,
             tiled_mma_sfb,
             tma_atom_a,
             tma_tensor_a,
@@ -1175,7 +1021,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
             self.bias_smem_layout_staged,
             self.epi_tile,
             self.sched_params,
-            epilogue_op,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1332,8 +1177,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
     def kernel(
         self,
         tiled_mma: cute.TiledMma,
-        tiled_mma_bkeep: Optional[cute.TiledMma],
-        tiled_mma_breuse: Optional[cute.TiledMma],
         tiled_mma_sfb: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
@@ -1365,7 +1208,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
         bias_smem_layout_staged: Optional[cute.Layout],
         epi_tile: cute.Tile,
         sched_params: MoESchedulerParams,
-        epilogue_op: cutlass.Constexpr,
     ):
         """GPU device kernel for persistent MoE grouped GEMM."""
         warp_idx = cute.arch.warp_idx()
@@ -1383,7 +1225,7 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
         total_token = padded_offsets[self.expert_cnt - 1]
 
-        bidx, bidy, bidz = cute.arch.block_idx()
+        bidx, _, _ = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -1514,13 +1356,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
             sfa_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2)
             sfb_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_sfb_vmnk, block_in_cluster_coord_sfb_vmnk, mcast_mode=1)
 
-        # MMA partition (for tCtAcc_fake shape computation only)
-        thr_mma_common = tiled_mma.get_slice(0)
-        tCsA_common = thr_mma_common.partition_A(sA)
-        tCsB_common = thr_mma_common.partition_B(sB)
-        tCsA_common = cute.filter_zeros(tCsA_common)
-        tCsB_common = cute.filter_zeros(tCsB_common)
-
         # ---- cp.async (LDGSTS) machinery for second-level scale loads (scale warp) ----
         atom_scale2_copy = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(),
@@ -1564,22 +1399,7 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
 
         # TMEM accumulator shape
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
-        if cutlass.const_expr(self.overlapping_accum):
-            num_acc_stage_overlapped = 2
-            tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage_overlapped))
-            tCtAcc_fake = cute.make_tensor(
-                tCtAcc_fake.iterator,
-                cute.make_layout(
-                    tCtAcc_fake.shape,
-                    stride=(
-                        tCtAcc_fake.stride[0],
-                        tCtAcc_fake.stride[1],
-                        tCtAcc_fake.stride[2],
-                        (256 - self.num_sf_tmem_cols) * tCtAcc_fake.stride[0][1],
-                    ),
-                ),
-            )
-        elif cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
+        if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
             tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
             tCtAcc_fake = cute.make_tensor(
                 tCtAcc_fake.iterator,
@@ -2391,17 +2211,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernelSm107:
 
                 for subtile_idx in cutlass.range(0, subtile_cnt, 1, unroll=1):
                     real_subtile_idx = subtile_idx
-                    if cutlass.const_expr(self.overlapping_accum):
-                        if reverse_subtile:
-                            real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - subtile_idx
-
-                    # C1 fix: fence + early release for overlapping_accum
-                    if cutlass.const_expr(self.overlapping_accum):
-                        if subtile_idx == self.iter_acc_early_release_in_epilogue:
-                            cute.arch.fence_view_async_tmem_load()
-                            with cute.arch.elect_one():
-                                acc_pipeline.consumer_release(acc_consumer_state)
-                            acc_consumer_state.advance()
 
                     # Load the final accumulator subtile from SMEM (written by acc-update warp).
                     final_slot = epi_stage_index * subtile_cnt + real_subtile_idx

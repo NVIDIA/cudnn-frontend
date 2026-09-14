@@ -79,8 +79,8 @@ SF_OVERRIDES = pytest.mark.parametrize("sf_fp8_dtype_override", [None, "e5m3"], 
 
 CONFIGS = pytest.mark.parametrize(
     "mma_tiler_mn, cluster_shape_mn",
-    [((128, 128), (1, 1)), ((256, 128), (2, 1))],
-    ids=["t128x128-c1x1", "t256x128-c2x1"],
+    [((128, 128), (1, 1)), ((256, 128), (2, 1)), ((256, 128), (2, 2))],
+    ids=["t128x128-c1x1", "t256x128-c2x1", "t256x128-c2x2"],
 )
 
 # Each set has an empty expert and a single-block expert; token counts are sgk-aligned.

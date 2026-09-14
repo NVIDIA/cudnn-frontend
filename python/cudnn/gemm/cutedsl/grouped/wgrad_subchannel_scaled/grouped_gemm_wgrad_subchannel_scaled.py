@@ -91,7 +91,6 @@ VALID_CLUSTER_SHAPES = (
     (4, 4),
 )
 DEFAULT_CTA_SHAPE = (256, 128)
-DEFAULT_CLUSTER_SHAPE = (2, 1)
 
 
 def _using_internal_cutlass_dsl() -> bool:
@@ -197,7 +196,6 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
 
         self.epilog_sync_bar_id = 1
         self.tmem_alloc_sync_bar_id = 2
-        self.tmem_dealloc_sync_bar_id = 3
 
         self.architecture = "sm_100"
         self.smem_capacity = utils.get_smem_capacity_in_bytes(self.architecture)
@@ -272,7 +270,6 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
             self.c_layout,
             self.c_dtype,
         )
-        self.epi_tile_n = cute.size(self.epi_tile[1])
         # The acc-update warpgroup's SFA2-as-C partition fixes the epi M
         # iterator at 0 (the dgrad_quant scheme) — needs one epi tile per M.
         assert cute.size(self.epi_tile[0]) == self.cta_tile_shape_mnk[0], (
@@ -340,7 +337,6 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
         size_m = self.sgm if self.sgm < self.cta_tile_shape_mnk[0] else self.cta_tile_shape_mnk[0]
         size_k = self.sgk if self.sgk < self.cta_tile_shape_mnk[2] else self.cta_tile_shape_mnk[2]
         self.scale_size_m = size_m
-        self.scale_size_k = size_k
         self.scale_m_per_tile = self.cta_tile_shape_mnk[0] // size_m
         self.scale_k_per_tile = self.cta_tile_shape_mnk[2] // size_k
 
@@ -374,7 +370,6 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
         # columns (no overlapping-accum trick: at N=256 num_acc_stage is 1, so
         # 256 acc + 48 SF <= 512; at N=128, 384 + 32 <= 512).
         sf_atom_mn = 32
-        mma_inst_tile_k = 4
         self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
         self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
@@ -451,16 +446,10 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
         the SFA2-as-C SMEM partition for the accumulator-update warpgroup.
         One subtile's partial (tTR_rAcc) is live at a time; tTR_rAcc_final
         spans the full CTA tile grouped by epi subtile."""
-        if cutlass.const_expr(self.mma_tiler[0] == 64):
-            tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)),
-                self.acc_dtype,
-            )
-        else:
-            tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
-                self.acc_dtype,
-            )
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+            self.acc_dtype,
+        )
 
         tAcc_epi = cute.flat_divide(tCtAcc_base[((None, None), 0, 0, None)], epi_tile)
         tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tAcc_epi[(None, None, 0, 0, 0)])
@@ -842,11 +831,6 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
             sfa2_gemm,
             tma_atom_c,
             tma_tensor_c,
-            a_gemm,
-            b_gemm,
-            c_gemm,
-            sfa_gemm,
-            sfb_gemm,
             offs,
             sched_params,
             workspace.iterator,
@@ -902,10 +886,6 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
         b_smem_layout=None,
     ):
         """Build per-expert TMA descriptors (identical to wgrad_baseline)."""
-        from ..moe_utils import (
-            WgradSfTensormapConstructor,
-        )
-
         ctor = WgradSfTensormapConstructor(
             sf_vec_size=self.sf_vec_size,
             weight_mode=self.weight_mode,
@@ -964,11 +944,6 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
         sfa2_tensor: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
-        a_gemm: cute.Tensor,
-        b_gemm: cute.Tensor,
-        c_gemm: cute.Tensor,
-        sfa_gemm: cute.Tensor,
-        sfb_gemm: cute.Tensor,
         offs: cute.Tensor,
         sched_params: MoESchedulerParams,
         workspace_ptr,
@@ -992,7 +967,7 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
         lane_idx = cute.arch.lane_idx()
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
-        bidx, bidy, bidz = cute.arch.block_idx()
+        bidx, _, _ = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -1215,10 +1190,7 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
         k_tile_same_scale_factor = self.sgk // self.mma_tiler[2]
 
         # Build extension
-        from ..moe_utils import (
-            TensormapWorkspace,
-            WgradSfTensormapConstructor,
-        )
+        from ..moe_utils import TensormapWorkspace
 
         slot_names = WgradSfTensormapConstructor.slot_names(self.input_order, self.weight_mode)
         desc_workspace = TensormapWorkspace(workspace_ptr, slot_names)
@@ -1416,10 +1388,7 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
                 tAgA_slice = tAgA[(None, mma_tile_m, None, 0)]
                 tBgB_slice = tBgB[(None, work_tile_info.tile_n_idx, None, 0)]
                 tAgSFA_slice = tAgSFA[(None, mma_tile_m, None, 0)]
-                slice_n = work_tile_info.tile_n_idx
-                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
-                    slice_n = work_tile_info.tile_n_idx // 2
-                tBgSFB_slice = tBgSFB[(None, slice_n, None, 0)]
+                tBgSFB_slice = tBgSFB[(None, work_tile_info.tile_n_idx, None, 0)]
 
                 ab_producer.reset()
                 peek_ab_empty_status = ab_producer.try_acquire()
@@ -1654,13 +1623,6 @@ class BlockScaledSubChannelMoEGroupedGemmWgradKernel:
                 k_tile_cnt = work_tile_info.k_tile_cnt
 
                 tCtSFB_mma = tCtSFB
-                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
-                    offset = cutlass.Int32((work_tile_info.tile_n_idx % 2) * 2)
-                    shifted_ptr = cute.recast_ptr(
-                        acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols + offset,
-                        dtype=self.sf_dtype,
-                    )
-                    tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
 
                 acc_producer_state.reset_count()
                 peek_acc_empty_status = cutlass.Boolean(1)

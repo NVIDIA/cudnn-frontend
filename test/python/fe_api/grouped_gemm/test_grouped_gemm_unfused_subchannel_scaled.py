@@ -112,6 +112,20 @@ def test_unfused_subchannel_scaled_wrapper_dense_bias():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("with_bias", [False, True], ids=["nobias", "bias"])
+@torch_fork_set_rng(seed=7)
+def test_unfused_subchannel_scaled_wrapper_dense_scalar_f32(with_bias):
+    """``vector_f32=False`` selects the scalar (non-packed) f32 epilogue arithmetic.
+
+    Covers both epilogue variants (alpha*prob only, and alpha + prob*bias) through the
+    scalar branches, which are otherwise unexercised by the default-``True`` tests.
+    """
+    problem = make_unfused_subchannel_scaled_problem(m_per_expert=256, n=256, k=512, l=2, with_bias=with_bias, seed=7)
+    out = _run_dense(problem, vector_f32=False)
+    _assert_byte_exact(out["d_tensor"], problem["ref_d"])
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=2)
 def test_unfused_subchannel_scaled_class_api_dense():
     from cudnn import GroupedGemmUnfusedSubchannelScaledSm100

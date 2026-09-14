@@ -758,7 +758,6 @@ class GroupedGemmUnfusedSubchannelScaledSm100(APIBase):
             prob=prob_cute_fake,
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
-            epilogue_op=lambda x: x,
             options="--enable-tvm-ffi",
         )
 

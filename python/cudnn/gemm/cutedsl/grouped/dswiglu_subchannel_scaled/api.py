@@ -35,7 +35,6 @@ accepts ``sf_fp8_dtype_override="e5m3"`` for E5M3 first-level scales.
 
 from __future__ import annotations
 
-import math
 import os
 from typing import Literal, Optional, Tuple
 
@@ -44,7 +43,7 @@ import cutlass.cute as cute
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type, is_power_of_2
+from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
@@ -52,10 +51,8 @@ from cudnn.tensor_adapter import (
     cuda_is_available,
     default_stream,
     detect_framework,
-    framework_dtype,
     get_compute_capability,
     get_data_ptr,
-    get_device,
 )
 
 from .grouped_gemm_dswiglu_subchannel_scaled import (
@@ -1212,7 +1209,7 @@ def grouped_gemm_dswiglu_subchannel_scaled_wrapper_sm100(
         l = num_experts
 
     n2 = 2 * n_gemm
-    sgm, sgn, sgk = block2_shape
+    sgm, sgn, _ = block2_shape
     device = a_tensor.device
 
     if d_quant:

@@ -25,11 +25,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass.cute.typing import Float32, Int32, AddressSpace
-
-from cutlass._mlir.dialects.nvvm import (
-    SetMaxRegisterAction,
-)
+from cutlass.cute.typing import Int32, AddressSpace
 
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
@@ -37,7 +33,6 @@ from ..moe_persistent_scheduler import (
     MoEWorkTileInfo,
 )
 from ..moe_utils import (
-    compute_expert_token_range,
     MoEWeightMode,
     TensormapWorkspace,
     store_tma_desc,
@@ -47,19 +42,9 @@ from ..moe_sched_extension import (
     ContiguousAndConsistentGroupedGemmSchedExtension,
 )
 from ..moe_kernel_helpers import (
-    compute_stages,
     compute_grid,
-    can_implement,
     epilog_gmem_copy_and_partition,
 )
-
-# Valid launch-config space for THIS kernel (can_implement still prunes per
-# problem). cta shape == mma_tiler_mn. Default matches dgrad_dglu's pinned
-# config for iso-tile benchmark baselines.
-VALID_CTA_SHAPES = ((256, 128), (256, 256))
-VALID_CLUSTER_SHAPES = ((1, 1), (2, 1), (2, 2), (4, 1), (4, 2))
-DEFAULT_CTA_SHAPE = (256, 128)
-DEFAULT_CLUSTER_SHAPE = (2, 1)
 
 
 class BlockScaledSubChannelMoEGroupedGemmKernel:
@@ -82,58 +67,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
     """
 
     FIX_PAD_SIZE = 256
-
-    @staticmethod
-    def can_implement(
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
-        d_dtype: Type[cutlass.Numeric],
-        use_2cta_instrs: bool,
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-        m: int,
-        n: int,
-        k: int,
-        l: int,
-        a_major: str,
-        b_major: str,
-        cd_major: str,
-        m_aligned: int,
-        weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
-        sgn: int = 256,
-        sgk: int = 256,
-    ) -> bool:
-        result = can_implement(
-            ab_dtype,
-            sf_dtype,
-            sf_vec_size,
-            acc_dtype,
-            d_dtype,
-            use_2cta_instrs,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            m,
-            n,
-            k,
-            l,
-            a_major,
-            b_major,
-            cd_major,
-            m_aligned,
-            fix_pad_size=BlockScaledSubChannelMoEGroupedGemmKernel.FIX_PAD_SIZE,
-            allowed_mma_tiler_n=(256, 128),
-        )
-        # Discrete SFB2 per-expert base pointers are declared 16B-aligned in
-        # the sched extension (assumed_align=16). With back-to-back per-expert
-        # f32 (ceil(n/sgn), ceil(k/sgk)) blocks, every base past the first is
-        # misaligned unless the block byte size is a multiple of 16.
-        if weight_mode == MoEWeightMode.DISCRETE and l > 1:
-            sfb2_block_bytes = ((n + sgn - 1) // sgn) * ((k + sgk - 1) // sgk) * 4
-            if sfb2_block_bytes % 16 != 0:
-                result = False
-        return result
 
     def __init__(
         self,
@@ -235,12 +168,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
         self.weight_mode = weight_mode
         self.use_dynamic_sched = use_dynamic_sched
 
-        self.epilogue_use_functor = False
-
-        # Cache warp-group sizes for the compute warps
-        self.num_accumulator_update_warps = len(self.accumulator_update_warp_id)
-        self.num_epilog_warps = len(self.epilog_warp_id)
-
     # ------------------------------------------------------------------
     # _setup_attributes
     # ------------------------------------------------------------------
@@ -308,12 +235,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
             self.mma_inst_shape_mn[0],
             self.mma_inst_shape_mn[1],
             mma_inst_shape_k * mma_inst_tile_k,
-        )
-
-        self.cta_tile_shape_mnk_d = (
-            self.mma_tiler_d[0] // cute.size(tiled_mma.thr_id.shape),
-            self.mma_tiler_d[1],
-            self.mma_tiler_d[2],
         )
 
         # Cluster layouts (V, M, N, K) for A/B and for SFB multicast partitioning
@@ -418,7 +339,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
 
         self.scale_size_m = size_m
         self.scale_size_n = size_n
-        self.scale_size_k = size_k
 
         # How many scale blocks fit along each CTA-tile dimension
         self.scale_m_per_tile = self.cta_tile_shape_mnk[0] // size_m
@@ -478,19 +398,14 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
         else:
             self.bias_smem_layout_staged = cute.make_layout((1, 1))
 
-        self.overlapping_accum = self.num_acc_stage == 1 and self.mma_tiler[1] == 256
-        self.epilogue_prefetch_more = False
-
         # TMEM column budget: accumulator columns followed by SFA/SFB scale columns
         sf_atom_mn = 32
         self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
         self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
-        self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[1] * self.num_acc_stage
 
-        # Epilogue N tile width and how early the accumulator TMEM can be released
+        # Epilogue N tile width
         self.epi_tile_n_required = cute.size(self.epi_tile[1])
-        self.iter_acc_early_release_in_epilogue = (self.num_sf_tmem_cols + self.epi_tile_n_required - 1) // self.epi_tile_n_required - 1
 
     # ------------------------------------------------------------------
     # _compute_stages (with bias support)
@@ -781,7 +696,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
         prob: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the GEMM.
 
@@ -891,8 +805,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
             sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b.shape, self.sf_vec_size)
             sfb = cute.make_tensor(sfb.iterator, sfb_layout)
         else:
-            c1 = cutlass.Int32(1)
-            c0 = cutlass.Int64(0)
             c1_64 = 1
             if cutlass.const_expr(b_major_mode == OperandMajorMode.K):
                 b_template_stride = (b_stride_size, c1_64, c0)
@@ -1027,7 +939,7 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
 
         # ---- Grid computation via MoE scheduler ----
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            b_n, b_k, b_l = cute.shape(b)  # B is (N, K, L)
+            b_n, b_k, _ = cute.shape(b)  # B is (N, K, L)
             sched_expert_shape = (self.expert_cnt, b_n, b_k)
         else:
             sched_expert_shape = (self.expert_cnt, n, k)
@@ -1132,7 +1044,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
             self.bias_smem_layout_staged,
             self.epi_tile,
             self.sched_params,
-            epilogue_op,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1316,7 +1227,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
         bias_smem_layout_staged: Optional[cute.Layout],
         epi_tile: cute.Tile,
         sched_params: MoESchedulerParams,
-        epilogue_op: cutlass.Constexpr,
     ):
         """GPU device kernel for the persistent second-level-scaled MoE grouped GEMM."""
         # Per-thread warp / lane identity used for warp specialization
@@ -1338,7 +1248,7 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
         total_token = padded_offsets[self.expert_cnt - 1]
 
         # Block/cluster coordinates and this CTA's MMA V (leader/follower) coordinate
-        bidx, bidy, bidz = cute.arch.block_idx()
+        bidx, _, _ = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -1474,13 +1384,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
             b_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1)
             sfa_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2)
             sfb_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_sfb_vmnk, block_in_cluster_coord_sfb_vmnk, mcast_mode=1)
-
-        # MMA partition (for tCtAcc_fake shape computation only)
-        thr_mma_common = tiled_mma.get_slice(0)
-        tCsA_common = thr_mma_common.partition_A(sA)
-        tCsB_common = thr_mma_common.partition_B(sB)
-        tCsA_common = cute.filter_zeros(tCsA_common)
-        tCsB_common = cute.filter_zeros(tCsB_common)
 
         # Preparing LDGSTS partition for second level scale factor tensor
         atom_scale2_copy = cute.make_copy_atom(
@@ -1722,7 +1625,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
             cute.arch.setmaxregister_decrease(self.num_regs_uniform_warps)
 
             ext = self._make_extension(workspace_ptr)
-            scale_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_scale_stage)
 
             # Bias load shares this warp (a dedicated 13th warp would break the
             # setmaxregister warpgroup alignment). One 2-stage cp.async produce
@@ -2005,8 +1907,6 @@ class BlockScaledSubChannelMoEGroupedGemmKernel:
                     tile_info[2],
                     tile_info[0],
                 )
-
-                acc_stage_index = acc_producer_state.index
 
                 # k_tile loop
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
