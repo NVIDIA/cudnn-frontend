@@ -88,6 +88,7 @@ registers.  The only d-specific subtlety was the dQ d-col-split swizzle, now
 handled d-agnostically via load_b_smem_x4(col_base=...).
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 import math
 from functools import lru_cache
 from typing import Optional, Tuple
@@ -1615,11 +1616,14 @@ def _dsink_host(
 # ===========================================================================
 @lru_cache(maxsize=None)
 def _compile_do_dot(B, H, SQ, d_v, io_is_bf16):
+    _cache_key = _template_key(globals(), locals(), "_compile_do_dot")
     io_dtype = cutlass.BFloat16 if io_is_bf16 else cutlass.Float16
     fo = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SQ, H, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
     fdo = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SQ, H, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
     fdt = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (B, H, SQ), stride_order=(2, 1, 0), assumed_align=16)
-    return cute.compile(_do_dot_host, fo, fdo, fdt, d_v, io_dtype, cutlass.Int32(0), cuda.CUstream(0), options="--enable-tvm-ffi")
+    return _compile_cached(
+        _do_dot_host, fo, fdo, fdt, d_v, io_dtype, cutlass.Int32(0), cuda.CUstream(0), options="--enable-tvm-ffi", cache_key=_cache_key, symbol="frost_sdpa_bwd"
+    )
 
 
 def scratch_bytes(
@@ -1717,6 +1721,7 @@ def compile(  # noqa: A001 — the template contract's entry point
     that layout (the #712 analogue for the backward's loads; ``None`` keeps
     the packed compact fake, byte-identical codegen).
     """
+    _cache_key = _template_key(globals(), locals(), "compile")
     p = PARAMS
     io_dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
     mask_flags = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0) | (MASK_PADDED if p.has_seq_kv_lens else 0)
@@ -1776,7 +1781,7 @@ def compile(  # noqa: A001 — the template contract's entry point
     fsem = _fake(cutlass.Int32, (cute.sym_int(divisibility=1) if sem_units is None else sem_units,), (0,), align=4)
     fstream = cuda.CUstream(0)
 
-    main = cute.compile(
+    main = _compile_cached(
         _bprop_host,
         fq,
         fk,
@@ -1826,20 +1831,65 @@ def compile(  # noqa: A001 — the template contract's entry point
         cutlass.Int32(0),
         fstream,
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_bwd",
     )
     fo = _fake(io_dtype, (_b, _sq, h, p.d_v), r4)
-    do_dot = cute.compile(_do_dot_host, fo, fdo, fdt, p.d_v, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+    do_dot = _compile_cached(
+        _do_dot_host, fo, fdo, fdt, p.d_v, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi", cache_key=_cache_key, symbol="frost_sdpa_bwd_1"
+    )
     fdq_out = _fake(io_dtype, (_b, _sq, h, p.d_qk), r4)
-    cast = cute.compile(_cast_host, fdq_acc, fdq_out, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+    cast = _compile_cached(
+        _cast_host, fdq_acc, fdq_out, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi", cache_key=_cache_key, symbol="frost_sdpa_bwd_2"
+    )
     reduce_k = reduce_v = None
     if gqa:
         fdk_out = _fake(io_dtype, (_b, _skv, h_kv, p.d_qk), r4)
         fdv_out = _fake(io_dtype, (_b, _skv, h_kv, p.d_v), r4)
-        reduce_k = cute.compile(_dkv_reduce_host, fdk_ws, fdk_out, p.d_qk, h, h_kv, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
-        reduce_v = cute.compile(_dkv_reduce_host, fdv_ws, fdv_out, p.d_v, h, h_kv, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+        reduce_k = _compile_cached(
+            _dkv_reduce_host,
+            fdk_ws,
+            fdk_out,
+            p.d_qk,
+            h,
+            h_kv,
+            io_dtype,
+            cutlass.Int32(0),
+            fstream,
+            options="--enable-tvm-ffi",
+            cache_key=_cache_key,
+            symbol="frost_sdpa_bwd_3",
+        )
+        reduce_v = _compile_cached(
+            _dkv_reduce_host,
+            fdv_ws,
+            fdv_out,
+            p.d_v,
+            h,
+            h_kv,
+            io_dtype,
+            cutlass.Int32(0),
+            fstream,
+            options="--enable-tvm-ffi",
+            cache_key=_cache_key,
+            symbol="frost_sdpa_bwd_4",
+        )
     dsink = None
     if p.has_sink:
         fsinks = _fake(cutlass.Float32, (h,), (0,), align=4)
         fdsink = _fake(cutlass.Float32, (h,), (0,), align=4)
-        dsink = cute.compile(_dsink_host, fl, fdt, fsinks, fdsink, fcuq, bool(p.thd_varlen), cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+        dsink = _compile_cached(
+            _dsink_host,
+            fl,
+            fdt,
+            fsinks,
+            fdsink,
+            fcuq,
+            bool(p.thd_varlen),
+            cutlass.Int32(0),
+            fstream,
+            options="--enable-tvm-ffi",
+            cache_key=_cache_key,
+            symbol="frost_sdpa_bwd_5",
+        )
     return CompiledBwd(main=main, do_dot=do_dot, cast=cast, reduce_k=reduce_k, reduce_v=reduce_v, dsink=dsink, sem_q_stride=sem_q_stride)

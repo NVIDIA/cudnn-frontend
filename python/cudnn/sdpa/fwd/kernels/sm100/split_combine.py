@@ -14,6 +14,7 @@ One block per (q_row, head, batch); the block's threads stride over d_v, and
 each thread walks the split axis in registers.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from typing import Callable, Optional, Tuple
 
 from functools import lru_cache
@@ -215,6 +216,7 @@ def compile(  # noqa: A001
     performs the only cast down to ``dtype_o``, applying ``scale_o``
     (``has_scale_o``) at that single point.  It defaults to ``dtype_o``.
     """
+    _cache_key = _template_key(globals(), locals(), "compile")
     elem = _ELEM[dtype_o]
     elem_partial = _ELEM[dtype_partial or dtype_o]
 
@@ -233,7 +235,7 @@ def compile(  # noqa: A001
     fake_amax_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_amax else None
     fake_scale_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_scale_o else None
 
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_o_partial,
         fake_lse_partial,
@@ -245,4 +247,6 @@ def compile(  # noqa: A001
         cutlass.Int32(0),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

@@ -22,11 +22,37 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import replace
 from typing import Callable
 
 import torch
 
 from cudnn.gemm.frost.tile_config import by_name as _by_name
+
+
+class _PlanWithWorkspace:
+    """Own scratch alongside its non-owning Workspace view, outside timing."""
+
+    def __init__(self, compiled):
+        from cudnn.frost.workspace import Workspace
+
+        self.compiled = compiled
+        self.buffer = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+        self.workspace = Workspace(self.buffer, compiled.workspace_bytes, "frost benchmark")
+
+    def __call__(self, variant_pack, stream=None):
+        return self.compiled(variant_pack, stream=stream, workspace=self.workspace)
+
+
+def with_workspace(compiled):
+    """Prepare a fixed-shape benchmark plan for warmup and repeated launches.
+
+    Split-K partials and MoE descriptor scratch use the same caller-owned
+    workspace contract. Keep the allocation alive for as long as the callable;
+    Workspace itself only retains a pointer, not the tensor that owns it.
+    """
+    return _PlanWithWorkspace(compiled) if compiled.workspace_bytes else compiled
+
 
 # Config selection
 
@@ -69,6 +95,52 @@ def select_configs(arg, spec_map):
     return list(dict.fromkeys(out))
 
 
+def expand_config_variants(spec_map, *, sweep_swap_ab: bool = False, sweep_split_k: int | None = None):
+    """Expand a base config map over the requested swap-AB / split-K axes."""
+    split_k_values = range(1, sweep_split_k + 1) if sweep_split_k is not None else (1,)
+    swap_ab_values = (False, True) if sweep_swap_ab else (False,)
+    expanded = {}
+    for cfg, _cta_group in spec_map.values():
+        for split_k_slices in split_k_values:
+            for swap_ab in swap_ab_values:
+                variant = replace(cfg, split_k_slices=split_k_slices, swap_ab=swap_ab)
+                expanded[variant.name] = (variant, getattr(variant, "cta_group", 1))
+    return expanded
+
+
+def select_config_variants(arg, spec_map, *, sweep_swap_ab: bool = False, sweep_split_k: int | None = None):
+    """Select labels, expanding explicit selections over enabled variant axes.
+
+    With no ``--configs`` filter, ``spec_map`` already contains the complete
+    Cartesian product produced by :func:`expand_config_variants`.
+    """
+    selected = select_configs(arg, spec_map)
+    if not arg or (not sweep_swap_ab and sweep_split_k is None):
+        return selected
+    expanded = []
+    seen_bases = set()
+    for name in selected:
+        spec = spec_for(name, spec_map)
+        if spec is None:
+            expanded.append(name)
+            continue
+        cfg = spec[0]
+        base = replace(
+            cfg,
+            split_k_slices=1 if sweep_split_k is not None else cfg.split_k_slices,
+            swap_ab=False if sweep_swap_ab else cfg.swap_ab,
+        )
+        if base.name in seen_bases:
+            continue
+        seen_bases.add(base.name)
+        split_k_values = range(1, sweep_split_k + 1) if sweep_split_k is not None else (cfg.split_k_slices,)
+        swap_ab_values = (False, True) if sweep_swap_ab else (cfg.swap_ab,)
+        for split_k_slices in split_k_values:
+            for swap_ab in swap_ab_values:
+                expanded.append(replace(cfg, split_k_slices=split_k_slices, swap_ab=swap_ab).name)
+    return list(dict.fromkeys(expanded))
+
+
 # Argument surface
 
 CONFIGS_HELP = "comma-separated config names or globs, e.g. 'CONFIG_sm100_*' (default: sweep all)"
@@ -102,7 +174,37 @@ def add_sweep_args(parser, *, nsys: bool = True, warmup: int = 10, iters: int = 
     parser.add_argument("--rotate-buffers", default="auto", metavar="N", help=ROTATE_HELP)
     if nsys:
         parser.add_argument("--_nsys-worker", action="store_true", help=argparse.SUPPRESS)
+    add_config_variant_args(parser)
     return parser
+
+
+def add_config_variant_args(parser):
+    """Add the orthogonal tile-config sweep dimensions used by GEMM benches."""
+
+    def positive_int(value: str) -> int:
+        parsed = int(value)
+        if parsed < 1:
+            raise argparse.ArgumentTypeError("must be at least 1")
+        return parsed
+
+    parser.add_argument(
+        "--sweep-swap-ab",
+        action="store_true",
+        help="sweep both the ordinary and swap_ab=True variant of every selected tile config",
+    )
+    parser.add_argument(
+        "--sweep-split-k",
+        type=positive_int,
+        default=None,
+        metavar="N",
+        help="sweep split_k_slices from 1 through N for every selected tile config",
+    )
+    return parser
+
+
+def validate_config_variant_args(parser, args) -> None:
+    if args.sweep_split_k is not None and args.sweep_split_k < 1:
+        parser.error("--sweep-split-k must be at least 1")
 
 
 # Buffer rotation (defeat a hot L2 on small shapes)

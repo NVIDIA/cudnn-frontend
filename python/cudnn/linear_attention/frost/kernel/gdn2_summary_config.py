@@ -28,17 +28,15 @@ from typing import Tuple
 @dataclass(frozen=True)
 class Cfg:
     # --- tile shape ---
-    B_T: int = 16  # chunk-inner token tile (BT=16 schedule)
-    D_K: int = 128  # key head dim (also the M state's row dim)
-    D_V: int = 128  # value head dim
+    B_T: int = 16
 
     # --- warp assignments (16 warps = 512 threads) ---
-    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)  # decay/beta-operand materialize (2-group ping-pong)
-    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)  # both state packs, Y (w*v - erase) / U staging of both chains, H / M stores
-    SUPER_MMA_WARP_ID: int = 12  # register-MMA KK + Neumann T_inv of the even local chunks, shared by both chains
-    TCGEN05_MMA_WARP_ID: int = 13  # tcgen05 state GEMMs of both chains
-    TMA_WARP_ID: int = 14  # k/v/gate/beta/w TMA loads
-    SUPER_MMA_TWIN_WARP_ID: int = 15  # register-MMA KK + Neumann T_inv of the odd local chunks
+    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)
+    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)
+    SUPER_MMA_WARP_ID: int = 12
+    TCGEN05_MMA_WARP_ID: int = 13
+    TMA_WARP_ID: int = 14
+    SUPER_MMA_TWIN_WARP_ID: int = 15
 
     # --- register split ---
     NUM_REGS_COMPUTE_GROUP_0: int = 160

@@ -13,6 +13,7 @@ import torch
 
 from cudnn.gemm.frost.compiler import force_stg_epi as _force_stg_epi, jit_from_cudnn_graph
 from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
+from cudnn.gemm.frost.kernel_registry import MMA_INST_K64_ARCH_RANGES
 from cudnn.gemm.frost.tile_config import by_name
 
 # --- GPU / arch gate -------------------------------------------------------
@@ -92,12 +93,13 @@ requires_int8_mma = pytest.mark.skipif(
     reason="int8 MMA exists only on " + " or ".join(f"{lo} <= SM < {hi}" for lo, hi in INT8_SM_RANGES) + ", have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
-# A K=64 block-scale geometry RENDERS anywhere (the width is an idesc field and
-# the OMMA descriptor is a host-side bit-pack); it RUNS only on 107 <= SM < 110,
-# which is what validate_block_scale_config gates on.
+# Dense FP8 and block-scale K64 tests share the engine's active-arch ranges.
 requires_mma_k64 = pytest.mark.skipif(
-    _SM is None or not (107 <= _SM < 110),
-    reason="the 64-byte block-scale MMA runs only on 107 <= SM < 110, have " + ("none" if _SM is None else f"sm_{_SM}"),
+    _SM is None or not any(lo <= _SM < hi for lo, hi in MMA_INST_K64_ARCH_RANGES),
+    reason="the 64-byte MMA requires "
+    + " or ".join(f"{lo} <= SM < {hi}" for lo, hi in MMA_INST_K64_ARCH_RANGES)
+    + ", have "
+    + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
 

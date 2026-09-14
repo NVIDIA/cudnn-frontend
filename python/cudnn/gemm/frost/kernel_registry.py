@@ -48,10 +48,10 @@ PIPELINE_ARCH_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
     "sm120": ((100, 130),),
 }
 
-# SM ranges whose block-scale MMA issues a 64-byte K per instruction (half the
+# SM ranges whose dense FP8 / block-scale MMA issues a 64-byte K (half the
 # instruction count of sm100's 32). SILICON, not a pipeline -- an sm100-pipeline
 # kernel on a 10.7 part gets it, exactly like the B collector and the 576-column
-# TMEM. Read by preferred_mma_tile_k_bytes and validate_block_scale_config_sm100.
+# TMEM. Shared by the dense and block-scale config gates and auto selection.
 MMA_INST_K64_ARCH_RANGES: tuple[tuple[int, int], ...] = ((107, 110),)
 
 # Pointwise ops a mainloop-fusion template can transform in SMEM.

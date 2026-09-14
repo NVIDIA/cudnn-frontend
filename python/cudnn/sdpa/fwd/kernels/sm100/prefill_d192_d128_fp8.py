@@ -26,6 +26,7 @@ metadata and runtime TMA descriptors, and a device-bounded work counter. Dense
 specializations fold the THD path out.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable, NamedTuple, Optional, Tuple
 
@@ -74,6 +75,7 @@ from cudnn.frost.tile_dsl.barrier import (
 )
 from cudnn.frost.tile_dsl.scheduler import (
     read_tile_id_arrive,
+    read_clc_payload,
     SCHED_NATURAL,
 )
 from cudnn.frost.tile_dsl.pointwise import (
@@ -531,8 +533,13 @@ def _scheduler_warp_loop_predecode(
     while is_valid > cutlass.Int32(0):
         wait(sched.mb_read_tile_id.subview(state.idx), state.phase)
 
-        if nvvm.elect_sync():
-            arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
+        # THD_VARLEN hands the payload over with explicit per-peer DSMEM
+        # stores, so each CTA still arms its own barrier there.  The CLC
+        # branch below instead has the leader arm every CTA (see the
+        # canonical-ordering note in scheduler_warp_loop).
+        if cutlass.const_expr(CFG.THD_VARLEN):
+            if nvvm.elect_sync():
+                arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
 
         if nvvm.elect_sync() and is_cga_first_cta:
             if cutlass.const_expr(CFG.THD_VARLEN):
@@ -562,6 +569,12 @@ def _scheduler_warp_loop_predecode(
                     for word in cutlass.range_constexpr(4):
                         cute.arch.store_async_dsmem(tile_ptr + word, payload[word], mbar_ptr, cta_rank)
             else:
+                for cta_rank in cutlass.range_constexpr(CGA_SIZE):
+                    if cutlass.const_expr(cta_rank == 0):
+                        arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
+                    else:
+                        peer_mb = nvvm.mapa(sched.mb_scheduler.subview(state.idx), cutlass.Int32(cta_rank))
+                        nvvm.mbarrier_arrive_expect_tx(peer_mb, 16, scope=nvvm.MemScope.CLUSTER)
                 nvvm.clusterlaunchcontrol_try_cancel(
                     sched.tile_id_smem.subview(state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)),
                     sched.mb_scheduler.subview(state.idx),
@@ -573,9 +586,10 @@ def _scheduler_warp_loop_predecode(
 
         wait(sched.mb_scheduler.subview(state.idx), state.phase)
         payload_base = state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)
-        nxt_q = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base).load())
-        nxt_hb = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(1)).load())
-        nxt_v = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(2)).load())
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, payload_base)
+        nxt_q = cute.arch.make_warp_uniform(nxt_q)
+        nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+        nxt_v = cute.arch.make_warp_uniform(nxt_v)
         q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
             nxt_q,
             nxt_hb,
@@ -1759,12 +1773,13 @@ def _mma_warp_group(
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         if cutlass.const_expr(CFG.MASK_FLAGS == 0 and SPLIT_KV == 1):
-            nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS) + cutlass.Int32(2))).load()
+            _nq, _nh, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS))
             is_valid_tile = nxt_v & cutlass.Int32(1)
         else:
-            nxt_q = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS) + cutlass.Int32(0))).load())
-            nxt_hb = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS) + cutlass.Int32(1))).load())
-            nxt_v = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS) + cutlass.Int32(2))).load())
+            nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS))
+            nxt_q = cute.arch.make_warp_uniform(nxt_q)
+            nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+            nxt_v = cute.arch.make_warp_uniform(nxt_v)
             q_super_idx, _hd, batch_idx, split_idx = _decode_payload_split_mma(
                 nxt_q,
                 nxt_hb,
@@ -2505,7 +2520,11 @@ def _correction_warp_group(
                         if cutlass.const_expr(len(lse_tensor.shape) == 2):
                             lse_arr[_cu_q_b + q_row_global, head_idx] = lse_val
                         else:
-                            lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
+                            if cutlass.const_expr(len(lse_tensor.shape) == 4):
+                                # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
+                                lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
+                            else:
+                                lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
             else:
                 _row_valid = q_row_global < seqlen_q
                 if _row_valid:
@@ -2739,8 +2758,11 @@ def _host(
     # K box rows are per-CTA (TILE_N/CTA_MMA); O box inner must match O's swizzle, not V's.
     # O box sized in BPE_O — O may be written at BF16/FP16 (DTYPE_O != DTYPE_QKV).
     _O_GRANU_ELEMS = CFG.O_SWZ_BYTES // CFG.BPE_O
-    if cutlass.const_expr(CFG.PACK_GQA and q_tensor.shape[2] != k_tensor.shape[2] * CFG.QH_PER_KH):
-        raise ValueError(f"CFG.QH_PER_KH ({CFG.QH_PER_KH}) does not match tensor head extents H_q={q_tensor.shape[2]}, H_kv={k_tensor.shape[2]}")
+    if cutlass.const_expr(CFG.PACK_GQA):
+        # nested: `and` is staged by the DSL, and under dynamic_bhk the head extents
+        # are runtime values -- PackGQA is dense-only, so this branch never sees them
+        if cutlass.const_expr(q_tensor.shape[2] != k_tensor.shape[2] * CFG.QH_PER_KH):
+            raise ValueError(f"CFG.QH_PER_KH ({CFG.QH_PER_KH}) does not match tensor head extents H_q={q_tensor.shape[2]}, H_kv={k_tensor.shape[2]}")
     qk_box_q = (1, CFG.TILE_M // HEADS_PER_TILE, HEADS_PER_TILE, TMA_QK_GRANU_ELEMS)
     # Expose D192 as three contiguous chunks so one rank-5 K TMA covers a tile.
     k_rank5_layout = cute.make_layout(
@@ -2881,6 +2903,9 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_head_major: bool = False,
     lse_head_stride: int = 0,
+    lse_padded_rows: int = 0,
+    lse_padded_order: tuple = (3, 2, 1, 0),
+    dynamic_bhk: bool = False,
     lse_stride: Optional[tuple[int, int, int]] = None,
     d_qk: int = CFG.TILE_K,
     d_v: int = CFG.TILE_O,
@@ -2897,6 +2922,21 @@ def compile(  # noqa: A001
     Under THD, ``sq``/``skv`` become dynamic packed-token extents and ``b``
     remains the logical sequence count. ``has_lse=False`` specializes the LSE
     argument to ``None`` and removes the Stats store while retaining amax."""
+    _cache_key = _template_key(globals(), locals(), "compile")
+    _b0, _qh0, _kh0 = b, qh, kh  # the problem_size fake: runtime scalars, values immaterial
+    if dynamic_bhk:
+        # Batch and head extents compile DYNAMIC: one artifact per layout class,
+        # not per (b, qh, kh) -- serving shapes vary in all three. The kernel
+        # already reads B / QH / KH from problem_size at run time; only the fakes
+        # pinned them. A packed stride (None) derives from the dynamic extents;
+        # a declared stride stays the fixed number it is.
+        if not CFG.THD_VARLEN:
+            raise ValueError("dynamic_bhk is THD-only (dense shapes still pin the fakes)")
+        b = cute.sym_int(divisibility=1)
+        qh = cute.sym_int(divisibility=1)
+        kh = cute.sym_int(divisibility=1)
+        if lse_padded_rows:
+            lse_padded_rows = cute.sym_int(divisibility=1)
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"fp8 d192 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE) % 16 != 0:
@@ -2907,8 +2947,12 @@ def compile(  # noqa: A001
         raise ValueError("fp8 d192 THD requires the native (192, 128) head shape")
     if SPLIT_KV > 1 and not has_lse:
         raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
-    if lse_stride is not None and (CFG.THD_VARLEN or SPLIT_KV > 1):
+    if lse_stride is not None and ((CFG.THD_VARLEN and not lse_padded_rows) or SPLIT_KV > 1):
         raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
+    if lse_padded_rows and not CFG.THD_VARLEN:
+        raise ValueError("lse_padded_rows is THD-only (a dense LSE is the compact (B, H, S_q) form)")
+    if lse_stride is not None and CFG.THD_VARLEN and not lse_padded_rows:
+        raise ValueError("THD LSE is packed (token-major (T, H) or head-major (1, QH, head_stride)); declared strides serve the padded form only")
     _fake_batch = 1 if CFG.THD_VARLEN else b
     _o_batch = _fake_batch * SPLIT_KV
     _lse_batch = b * SPLIT_KV
@@ -2944,7 +2988,20 @@ def compile(  # noqa: A001
             raise ValueError("lse_head_major / lse_head_stride require has_lse=True")
         fake_lse = None
     elif CFG.THD_VARLEN:
-        if lse_head_major:
+        if lse_padded_rows:
+            # Per-batch padded Stats without ragged offsets (FlashInfer's (b, s_max, h)
+            # buffer): rank-4 (B, QH, s_max, 1) in the caller's strides -- the RANK is
+            # what selects the per-batch store, so nothing about the extents or
+            # strides has to be static. Rows past a sequence's length are the
+            # adapter's to fill (-inf), as the backend does.
+            if lse_head_major or lse_head_stride:
+                raise ValueError("lse_padded_rows excludes lse_head_major / lse_head_stride")
+            fake_lse = (
+                cute.runtime.make_fake_tensor(cutlass.Float32, (b, qh, lse_padded_rows, 1), (*lse_stride, 1), assumed_align=4)
+                if lse_stride
+                else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, lse_padded_rows, 1), stride_order=lse_padded_order, assumed_align=4)
+            )
+        elif lse_head_major:
             _lse_hs = lse_head_stride if lse_head_stride else sq
             fake_lse = cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32,
@@ -2983,7 +3040,7 @@ def compile(  # noqa: A001
     )
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        ((4 * b + 4) if CFG.THD_VARLEN else b,),
+        ((cute.sym_int(divisibility=1) if dynamic_bhk else ((4 * b + 4) if CFG.THD_VARLEN else b)),),
         stride_order=(0,),
         assumed_align=16,
     )
@@ -3004,7 +3061,7 @@ def compile(  # noqa: A001
 
     fake_o_desc = cute.runtime.make_fake_compact_tensor(
         cutlass.Int64,
-        (((b + 3) * _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1,),
+        ((cute.sym_int(divisibility=1) if dynamic_bhk else (((b + 3) * _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1)),),
         stride_order=(0,),
         assumed_align=16,
     )
@@ -3016,7 +3073,7 @@ def compile(  # noqa: A001
         fake_thd_q_lens = None
         fake_thd_kv_lens = None
         fake_thd_lens_form = None
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -3026,7 +3083,7 @@ def compile(  # noqa: A001
         fake_sinks,
         fake_seq_kv_lens,
         fake_o_desc,
-        (b, qh, kh, 0, 0, 0) if CFG.THD_VARLEN else (b, qh, kh, sq, skv, 0),
+        (_b0, _qh0, _kh0, 0, 0, 0) if CFG.THD_VARLEN else (_b0, _qh0, _kh0, sq, skv, 0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
         cutlass.Int32(0),
@@ -3041,4 +3098,6 @@ def compile(  # noqa: A001
         *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

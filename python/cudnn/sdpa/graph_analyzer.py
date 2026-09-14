@@ -20,7 +20,7 @@ variant-pack resolution and TensorDesc construction.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 import cudnn
@@ -132,6 +132,19 @@ def bshd_layout_ok(dim: tuple, stride: tuple) -> bool:
     return act == exp
 
 
+def packed_layout_ok(dim: tuple, stride: tuple) -> bool:
+    """BSHD order over (H, S, D) only, for a ragged (THD) tensor. With ragged
+    offsets every sequence's base comes from the offset table and the batch
+    axis is never stepped (the THD lowering binds it at extent 1), so its
+    declared stride carries no information -- FlashInfer declares it equal to
+    the token stride. The per-token layout the kernels address natively is
+    what has to hold: D innermost, then H, then S."""
+    order = tuple(ax for ax in _stride_order(dim, stride) if ax != 0)
+    act = tuple(ax for ax in order if dim[ax] != 1)
+    exp = tuple(ax for ax in _REQ_STRIDE_ORDER if ax != 0 and dim[ax] != 1)
+    return act == exp
+
+
 def dense_layout_ok(dim: tuple, stride: tuple) -> bool:
     """Relaxed DENSE layout soundness for a rank-4 (B, H, S, D) tensor: the
     real requirement of the SM100 DSL lowering, which normalizes any such
@@ -197,6 +210,9 @@ class SdpaGraphFacts:
     # graphs, where ``uniform_dtype`` already covers them.
     uniform_out_dtype: bool = True
     bshd_layout: bool = True  # all of Q/K/V/O in BSHD-physical order
+    # BSHD order over (H, S, D) only -- what a ragged (THD) tensor has to
+    # satisfy, its batch stride being unread under ragged offsets (packed_layout_ok).
+    packed_layout: bool = True
     # Relaxed dense-layout soundness: every one of Q/K/V/O has the head dim
     # innermost-contiguous (stride 1) with non-broadcast, non-overlapping
     # strides — any B/H/S order, padded strides allowed (see dense_layout_ok).
@@ -220,6 +236,12 @@ class SdpaGraphFacts:
     has_dropout: bool = False
     has_score_mod: bool = False
     has_paged_kv: bool = False
+    # Paged KV (paged_attention_k_table / v_table): K/V are page pools
+    # [num_pages, H_kv, page_size, D]; ``s_kv`` is the declared
+    # paged_attention_max_seq_len_kv (else what the block tables address). The
+    # in-page layout (HND/NHD) is only the pools' strides, and the tables'
+    # extents live on their IR refs — neither is a separate fact.
+    page_size: int = 0
     has_alibi: bool = False
     has_unfuse_fma: bool = False
     has_block_mask: bool = False
@@ -269,6 +291,10 @@ class SdpaGraphFacts:
     sink_t: Any = None
     seq_kv_t: Any = None
     seq_q_t: Any = None
+    # Paged KV block tables, (B, 1, max_pages, 1) int32; when the graph declares
+    # only one of the pair both refs point at it.
+    paged_k_table_t: Any = None
+    paged_v_table_t: Any = None
     # (B+1,) prefix-sum IR refs (cuDNN 9.24+ cu_seq_len form); None when the
     # graph carries the per-batch seq_len_* form on that side instead.
     cu_seq_q_t: Any = None
@@ -315,6 +341,12 @@ class SdpaGraphFacts:
     descale_s_t: Any = None
     scale_s_t: Any = None
     amax_s_t: Any = None
+    # Softmax accumulation precision the GRAPH asks for, as a cudnn.data_type:
+    # HALF when the graph's intermediate_data_type is HALF (the f16x2 exponent
+    # arm; numerics-changing, so it is a graph attribute and never a tuning
+    # knob), None otherwise (= the f32 pipeline every row runs). Engines whose
+    # capability row does not list the requested precision decline.
+    softmax_precision: Optional[Any] = None
 
 
 def _single_sdpa_node(graph: "cudnn.pygraph") -> Optional[Any]:
@@ -460,12 +492,48 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
             v_stride = (v_stride[0], v_stride[1], v_stride[3], v_stride[2])
         dims["k"], dims["v"] = k_dim, v_dim
         strides["k"], strides["v"] = k_stride, v_stride
-    _, h_kv, s_kv, _ = k_dim
+    table_k, table_v = rec.get("paged_attention_k_table"), rec.get("paged_attention_v_table")
+    paged = table_k is not None or table_v is not None
+    page_size = 0
     d_v = v_dim[-1]
-    if k_dim != (b, h_kv, s_kv, d_qk):
-        return _invalid(f"K shape mismatch (q_dim={q_dim}, k_dim={k_dim})")
-    if v_dim != (b, h_kv, s_kv, d_v):
-        return _invalid(f"V shape mismatch (k_dim={k_dim}, v_dim={v_dim})")
+    if paged:
+        # cuDNN paged-cache contract: K/V are page POOLS [num_pages, H_kv,
+        # page_size, D] (the in-page layout rides the strides), addressed
+        # through (B, 1, max_pages, 1) int32 block tables; the logical S_kv is
+        # the declared maximum, else what the tables can address.
+        if is_backward:
+            return _invalid("paged KV caches are forward-only")
+        _, h_kv, page_size, _ = k_dim
+        if k_dim[3] != d_qk:
+            return _invalid(f"paged K container head dim must equal Q's (q_dim={q_dim}, k_dim={k_dim})")
+        if v_dim[:3] != k_dim[:3]:
+            return _invalid(f"paged K/V containers must share [num_pages, H_kv, page_size] (k_dim={k_dim}, v_dim={v_dim})")
+        tables = [t for t in (table_k, table_v) if t is not None]
+        for t in tables:
+            td = tuple(t.get_dim())
+            if len(td) != 4 or td[0] != b or td[1] != 1 or td[3] != 1:
+                return _invalid(f"paged block table must be (B, 1, max_pages, 1) = ({b}, 1, *, 1); got {td}")
+            if t.get_data_type() != cudnn.data_type.INT32:
+                return _invalid(f"paged block table must be int32; got {t.get_data_type()}")
+            if getattr(t, "ragged_offset", None) is not None:
+                return _invalid("packed (ragged-offset) paged block tables are not supported")
+        max_pages = tuple(tables[0].get_dim())[2]
+        if any(tuple(t.get_dim())[2] != max_pages for t in tables):
+            return _invalid("paged K and V block tables must have the same max_pages extent")
+        declared_max = rec.get("paged_attention_max_seq_len_kv")
+        s_kv = int(declared_max) if declared_max is not None else max_pages * page_size
+        if s_kv > max_pages * page_size:
+            return _invalid(f"paged_attention_max_seq_len_kv ({s_kv}) exceeds what the block table addresses ({max_pages} pages x {page_size})")
+        if (k_stride[1] > k_stride[2]) != (v_stride[1] > v_stride[2]):
+            return _invalid("paged K and V containers must share an in-page layout (both HND or both NHD)")
+        table_k = table_k if table_k is not None else table_v
+        table_v = table_v if table_v is not None else table_k
+    else:
+        _, h_kv, s_kv, _ = k_dim
+        if k_dim != (b, h_kv, s_kv, d_qk):
+            return _invalid(f"K shape mismatch (q_dim={q_dim}, k_dim={k_dim})")
+        if v_dim != (b, h_kv, s_kv, d_v):
+            return _invalid(f"V shape mismatch (k_dim={k_dim}, v_dim={v_dim})")
     if o_dim != (b, h_q, s_q, d_v):
         return _invalid(f"O shape mismatch (q_dim={q_dim}, o_dim={o_dim})")
     if is_backward:
@@ -507,7 +575,12 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         _layout_ports += [(dims[name], strides[name]) for name in ("dO", "dQ", "dK", "dV")]
     if is_mxfp8_bwd:
         _layout_ports += [(dims[name], strides[name]) for name in ("q_T", "k_T", "dO_T", "dO_f16")]
-    bshd = all(bshd_layout_ok(d, s) for d, s in _layout_ports)
+    # Paged pools are not BSHD tensors (an HND pool has its head stride above
+    # the row stride); the BSHD fact — what the THD lowering gates on — is
+    # about the ragged Q/O only.
+    _bshd_ports = [(q_dim, q_stride), (o_dim, o_stride)] if paged else _layout_ports
+    bshd = all(bshd_layout_ok(d, s) for d, s in _bshd_ports)
+    packed = all(packed_layout_ok(d, s) for d, s in _bshd_ports)
     dense_layout = all(dense_layout_ok(d, s) for d, s in _layout_ports)
 
     # descale_q/k/v are the block-scale SF tensors for MXFP8, or scalar per-tensor
@@ -578,7 +651,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     kv_lens_given = seq_len_kv is not None or cu_seq_kv is not None
     seq_q_trim = False
     if thd:
-        if getattr(k, "ragged_offset", None) is None or getattr(v, "ragged_offset", None) is None:
+        # Paged KV: the pools are addressed through the block tables, so only
+        # Q (and O) are ragged — chunked prefill over a paged cache.
+        if not paged and (getattr(k, "ragged_offset", None) is None or getattr(v, "ragged_offset", None) is None):
             return _invalid("THD (ragged) requires ragged Q, K, and V")
         if not q_lens_given or not kv_lens_given:
             return _invalid("THD (ragged) requires seq_len_q/cu_seq_len_q and seq_len_kv/cu_seq_len_kv")
@@ -641,6 +716,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         uniform_dtype=uniform,
         uniform_out_dtype=uniform_out,
         bshd_layout=bshd,
+        packed_layout=packed,
         dense_layout=dense_layout,
         port_layouts=(tuple((name, dims[name], strides[name]) for name, _ in rank4_ports) if is_backward else ()),
         is_mxfp8=is_mxfp8,
@@ -658,7 +734,10 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         has_bias=rec.get("bias") is not None,
         has_dropout=rec.get("dropout") is not None,
         has_score_mod=rec.get("fn") is not None,
-        has_paged_kv=(rec.get("paged_attention_k_table") is not None or rec.get("paged_attention_v_table") is not None),
+        has_paged_kv=paged,
+        page_size=page_size,
+        paged_k_table_t=table_k,
+        paged_v_table_t=table_v,
         has_alibi=bool(rec.get("use_alibi_mask")),
         has_unfuse_fma=bool(rec.get("unfuse_fma")),
         has_block_mask=rec.get("block_mask") is not None,
@@ -736,7 +815,19 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     node = _single_sdpa_node(graph)
     if node is None:
         return None
-    return _extract_facts(_record_from_node(node))
+    facts = _extract_facts(_record_from_node(node))
+    if facts.invalid is not None:
+        return facts
+    # sdpa(..., softmax_precision=...) is a python-only op attribute (see
+    # _pygraph._CAPTURED_OPS): FLOAT / None is the f32 pipeline every row runs,
+    # HALF asks for the f16 softmax accumulator arm. Numerics-changing, so it
+    # is a fact the capability rows gate on, never a tuning knob.
+    requested = node.params.get("softmax_precision")
+    if requested is None or requested == cudnn.data_type.FLOAT:
+        return facts
+    if requested == cudnn.data_type.HALF:
+        return replace(facts, softmax_precision=cudnn.data_type.HALF)
+    return replace(facts, invalid=f"cudnn.sdpa: softmax_precision must be cudnn.data_type.FLOAT or HALF; got {requested}")
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +848,9 @@ class SdpaBinding:
     # (B+1,) prefix-sum form (cuDNN 9.24+); at most one form per side.
     cu_seq_len_q: Any = None
     cu_seq_len_kv: Any = None
+    # Paged KV block tables.
+    paged_k_table: Any = None
+    paged_v_table: Any = None
     # MXFP8 block-scale (descale) tensors + Amax_O output.
     sf_q: Any = None
     sf_k: Any = None
@@ -819,6 +913,8 @@ class SdpaBinding:
                 self.seq_len_q,
                 self.cu_seq_len_q,
                 self.cu_seq_len_kv,
+                self.paged_k_table,
+                self.paged_v_table,
                 self.sf_q,
                 self.sf_k,
                 self.sf_v,

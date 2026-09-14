@@ -78,11 +78,27 @@ _BLACKWELL_GEFORCE = (120, 129)
 class SdpaFwdKnobs:
     """Per-plan tuning request for the SDPA-forward engines.
 
-    This is the operation's knob *vocabulary* — typed fields, no global enum.
-    ``None`` means "no preference". Travels as ``PlanConfig.knobs``; each
-    engine's :class:`Capabilities` row advertises the domain it honors, and the
-    probe rejects the engine for any request outside that domain (a knob is
-    honored or the engine is ineligible — never silently degraded).
+    Typed fields internally; ``None`` means "no preference". Travels as
+    ``PlanConfig.knobs``; each engine's :class:`Capabilities` row advertises the
+    domain it honors, and the probe rejects the engine for any request outside
+    that domain (a knob is honored or the engine is ineligible — never silently
+    degraded).
+
+    At the public surface every tuning field is one ``cudnn.knob_type`` of the
+    shared vocabulary (``to_public`` / ``from_public``), the same dict shape a
+    backend plan reports: ``tile_m/tile_n`` and ``cga`` reuse the backend's
+    ``TILE_M`` / ``TILE_N`` / ``TILE_CGA_M`` (a cga of 2 IS a 2-CTA M-cluster,
+    the backend's own encoding of its 2-CTA SDPA variant); ``sched_policy``,
+    ``pack_gqa`` and ``split_kv`` are frontend-only types (the backend's
+    split-KV counterpart, ``STREAM_K``, is an on/off mode, not a chunk count,
+    hence the distinct ``SPLIT_KV``).
+
+    Knobs are performance-only: every value computes the same function, so an
+    autotuner may pick any of them. The softmax accumulator precision (the
+    Rubin f16x2 exponent arm) changes numerics and is therefore NOT a knob: it
+    is the ``sdpa(..., softmax_precision=)`` op attribute, read from the graph
+    into ``SdpaGraphFacts.softmax_precision`` and gated by each row's
+    ``Capabilities.softmax_precisions`` in :func:`mismatch`.
     """
 
     sched_policy: Optional[int] = None  # tile-scheduler policy (SCHED_NATURAL, ...)
@@ -93,12 +109,51 @@ class SdpaFwdKnobs:
     # KV-split count: each Q tile's KV range cut into this many chunks, each
     # run by its own CTA, recombined by the split_combine pass. 1 = off.
     split_kv: Optional[int] = None
-    # Softmax accumulation precision as a cudnn.data_type value. Served rows
-    # declare their domain: the per-tensor FP8 d128 rows serve FLOAT, and the
-    # sm107 (Rubin) row additionally HALF — its kernel's f16x2 exponent arm.
-    # HALF is numerics-changing, so it is honored on explicit request only,
-    # never auto-proposed (see heuristics._softmax_points).
-    softmax_precision: Optional[int] = None
+
+    # field name -> cudnn.knob_type member name (resolved lazily: the compiled
+    # module is not importable at class-definition time in every build).
+    _PUBLIC_KNOBS = (
+        ("sched_policy", "SCHED_POLICY"),
+        ("tile_m", "TILE_M"),
+        ("tile_n", "TILE_N"),
+        ("cga", "TILE_CGA_M"),
+        ("pack_gqa", "PACK_GQA"),
+        ("split_kv", "SPLIT_KV"),
+    )
+
+    def to_public(self) -> dict:
+        """``{cudnn.knob_type: int}`` for every tuning field that is set (bools as 0/1)."""
+        kt = cudnn.knob_type
+        out = {}
+        for field, member in self._PUBLIC_KNOBS:
+            value = getattr(self, field)
+            if value is not None:
+                out[getattr(kt, member)] = int(value)
+        return out
+
+    @classmethod
+    def from_public(cls, public: dict) -> "SdpaFwdKnobs":
+        """Inverse of :meth:`to_public`. Rejects knob types this operation has no field for."""
+        kt = cudnn.knob_type
+        by_type = {getattr(kt, member): field for field, member in cls._PUBLIC_KNOBS}
+        kwargs = {}
+        for knob, value in public.items():
+            knob = kt(int(knob)) if not isinstance(knob, kt) else knob
+            field = by_type.get(knob)
+            if field is None:
+                raise ValueError(f"knob {knob.name} is not a tuning axis of the SDPA-forward engines")
+            if isinstance(value, bool):
+                if field != "pack_gqa":
+                    raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
+                value = int(value)
+            if not isinstance(value, int):
+                # A persisted record carries ints; "0" or 1.0 would round-trip to
+                # a different native knob than the one recorded.
+                raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
+            if field == "pack_gqa" and value not in (0, 1):
+                raise ValueError(f"knob PACK_GQA must be 0 or 1, got {value}")
+            kwargs[field] = bool(value) if field == "pack_gqa" else value
+        return cls(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -290,6 +345,11 @@ class Capabilities:
     # APPENDED at the end deliberately: Capabilities evolves append-only, so a
     # positional construction of an older field never silently rebinds.
     pack_gqa_d_shapes: Optional[frozenset] = None
+    # THD graphs whose Stats has NO ragged offsets (per-batch padded (b, s_max, h)
+    # rows, FlashInfer's form): the kernel stores per batch and the adapter
+    # fills the tail rows with -inf. Rows whose kernels lack the per-batch THD
+    # store keep False and decline the form (the backend serves it).
+    thd_padded_stats: bool = False
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -375,6 +435,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return facts.invalid
     if facts.is_backward:
         return "this engine serves sdpa() forward graphs only"
+    if facts.softmax_precision is not None and facts.softmax_precision not in capabilities.softmax_precisions:
+        # The op attribute sdpa(softmax_precision=HALF): numerics-changing, so
+        # honored only by a row whose lowering carries that arm — never degraded.
+        return f"requested softmax_precision={facts.softmax_precision} is outside this engine's domain {sorted(capabilities.softmax_precisions, key=int)}"
     if knobs is not None:
         if not isinstance(knobs, SdpaFwdKnobs):
             return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
@@ -384,12 +448,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
             (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv), "cga"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
-            (knobs.softmax_precision, capabilities.softmax_precisions, "softmax_precision"),
         ):
             if value is not None and value not in domain:
-                # key=int: knob domains mix plain ints with cudnn.data_type
-                # members (softmax_precision), and the pybind enum defines no
-                # ordering of its own.
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
         if knobs.split_kv is not None and knobs.split_kv < 1:
             return f"requested split_kv={knobs.split_kv} is not a split count (1 = off)"
@@ -400,7 +460,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # per-split LSE is the combine weight; the THD/sink/padded paths
             # do not produce per-split partials). Declined HERE so a split
             # request never reaches a kernel that cannot honor it.
-            if facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim:
+            # Paged KV is padded by construction and its split composes with
+            # the per-batch lengths (the decode path — B*H_kv is far below
+            # the SM count), so it is exempt from the padded exclusion.
+            if facts.thd or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
                 return "split_kv > 1 serves dense, unpadded, sink-free graphs only"
             if capabilities.skv_tail_via_padding and facts.s_kv % (capabilities.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
                 # The lowering would serve this ragged S_kv through the padded
@@ -474,10 +537,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if not facts.uniform_dtype:
         return "K/V dtypes must match Q" if (facts.is_mxfp8 or facts.is_fp8) else "K/V/O dtypes must match Q"
     if facts.thd:
-        # Ragged packing is BSHD-order by construction; the relaxation is
-        # dense-only (the THD lowering rebuilds packed [1,T,H,D] views).
-        if not facts.bshd_layout:
-            return "THD (ragged) Q/K/V/O must be BSHD-physical (stride order 3,1,2,0)"
+        # The THD lowering rebuilds packed [1, T, H, D] views from the token,
+        # head and element strides; the batch stride is never read (every
+        # sequence base comes from the ragged offsets), so it is not gated --
+        # FlashInfer declares it equal to the token stride.
+        if not facts.packed_layout:
+            return "THD (ragged) Q/K/V/O must be BSHD-physical over (H, S, D): head dim innermost, then heads, then tokens"
     elif "dense_flex" in capabilities.layouts:
         if not facts.dense_layout:
             return (
@@ -510,6 +575,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     ):
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
+
+    if facts.has_paged_kv:
+        # Served by the d128 f16/bf16 kernel's PAGED_KV specialization
+        # (config_sm100._validate_params mirrors these as its backstop).
+        if facts.is_fp8 or facts.is_mxfp8:
+            return "paged KV is served by the f16/bf16 kernel only"
+        if not facts.padded:
+            return "paged KV requires use_padding_mask with seq_len_kv (the per-batch KV length bounds the block-table walk)"
+        if facts.d_qk > 256 or facts.d_v > 256:
+            return f"paged KV is wired on the d128 / d256 flavors only (d_qk, d_v <= 256); got ({facts.d_qk}, {facts.d_v})"
+        if (facts.d_qk > 128 or facts.d_v > 128) and not (facts.d_qk > 128 and facts.d_v > 128):
+            return f"paged KV with mixed head dims ({facts.d_qk}, {facts.d_v}) would select the d192x128 flavor, which is not wired"
+        if facts.has_sink:
+            return "paged KV with an attention sink is not validated"
+        p = facts.page_size
+        if p % 8 != 0 or (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
+            return f"page_size {p} must be a multiple of 8 that divides the 128-row KV tile or is a multiple of it"
 
     if facts.has_sink and capabilities.sink_dtypes is not None and facts.dtype not in capabilities.sink_dtypes:
         return f"sink token with dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.sink_dtypes)}"
@@ -551,6 +633,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if facts.padded and facts.wants_stats and not facts.thd and not (capabilities.padded_stats or supports_dense_seq_q_trim(capabilities, facts)):
         return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
 
+    if (
+        facts.thd
+        and facts.wants_stats
+        and facts.stats_t is not None
+        and getattr(facts.stats_t, "ragged_offset", None) is None
+        and not capabilities.thd_padded_stats
+    ):
+        # A Stats tensor with no ragged offsets is the per-batch padded form,
+        # rows at b * s_max; a kernel without the per-batch THD store writes
+        # packed (T, h) rows and has no per-sequence stats base to place them at.
+        return "THD Stats without ragged offsets is addressed per batch ([b, h, s_max, 1]); this kernel writes packed (T, h) rows -- bind ragged stats offsets"
     if facts.stats_t is not None and not facts.thd:
         if facts.stats_t.get_data_type() != cudnn.data_type.FLOAT:
             return f"stats must be fp32; got {facts.stats_t.get_data_type()}"
@@ -612,10 +705,16 @@ def _sm100_spec() -> EngineSpec:
             right_band_widening=True,
             swa=True,
             padded=True,
+            # Paged KV caches (paged_attention_k/v_table + seq_len_kv) on the
+            # d128 flavor: block-table indirection on the K/V TMA loads, HND
+            # and NHD page layouts, KV split + combine (mismatch() holds the
+            # d128 / dense / padded / page-geometry conditions).
+            paged_kv=True,
             sink=True,
             stats=True,
             lse_optional=True,
             thd=True,
+            thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
             dense_seq_q_trim=True,
@@ -718,6 +817,7 @@ def _sm107_spec() -> EngineSpec:
             # now covers every f16 flavor; keeping it a named constant rather
             # than `True` is what makes a future partial arch line expressible.
             thd=True,
+            thd_padded_stats=True,
             thd_d_shapes=SM107_F16_THD_SHAPES,
             cu_seq_len=True,
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
@@ -793,6 +893,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             stats=True,
             lse_optional=True,
             thd=True,
+            thd_padded_stats=True,
             cu_seq_len=True,
             dense_seq_q_trim_d_shapes=frozenset({(256, 256), (512, 512)}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
@@ -914,6 +1015,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             stats=True,
             lse_optional=True,
             thd=True,
+            thd_padded_stats=True,
             cu_seq_len=True,
             # D256 carries the dense padded-Q epilogue trim; the older D128 and
             # D192/D128 siblings remain KV-padding-only for dense graphs.
@@ -968,12 +1070,31 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # The "KNOWN COST" this note used to carry -- that the d128 FP8
             # kernel honours LPT but loses the plan because sched_policies is
             # row-wide -- is what `sched_policies_by_d_shape` below now fixes.
-            # d128 FP8 is not listed yet only because it is unvalidated here.
+            # d128 FP8 is not listed yet for the tolerance reason given there.
             sched_policies=(frozenset({SCHED_NATURAL}) if rubin_row else frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
-            # NOT claimed here. `lpt_q_tiles_in_cga_units=True` is restored on the
-            # SM107 FP8 kernels too, so LPT should work, but it has not been
-            # validated on them -- and a row claims only what it can demonstrate.
-            # The f16 row (`_sm107_spec`) carries the validated (256, 256) entry.
+            # Rubin: LPT is claimed PER FLAVOR, like the f16 row (`_sm107_spec`).
+            # `lpt_q_tiles_in_cga_units=True` is restored on every 2-CTA SM107 FP8
+            # kernel (#1001).  VALIDATED under LPT on Rubin (2026-09-11), standalone
+            # adapter, E4M3 per-tensor scales, bf16 O, causal + dense + padded,
+            # (B, S) in {(1,256), (2,1000), (1,4096)}, against the fp64
+            # kernel-mirroring `fp8_ref.compute_ref`:
+            #   (256, 256): max|O-ref| 0.0078 causal / <= 0.0019 dense (tol 0.075)
+            #   (192, 128): max|O-ref| 0.0397 causal / <= 0.0060 dense (tol 0.04)
+            # and on BOTH, O and LSE under LPT are BIT-IDENTICAL to NATURAL (the
+            # scheduler reorders whole (batch, head, q-tile) work items; each
+            # tile's KV loop is unchanged), sentinel 0, two-launch 0.  Perf node,
+            # d256 causal H32/2, LPT vs NATURAL launch-interleaved: +5.2/+5.9/
+            # +5.6/+2.0/+2.3 % at S=2K..32K (control pair within 1.9 %).
+            # NOT claimed: (128, 128) -- also bit-identical, but its causal path
+            # sits at 0.041-0.048 vs the suite's 0.04 under NATURAL too, so it
+            # gets its own look first; (512, 512) -- the cga4x1 role-split kernel
+            # still calls make_sdpa_helpers(CFG) WITHOUT lpt_q_tiles_in_cga_units
+            # (the #1001 bug, left on the d512 line), so under LPT it writes
+            # NOTHING (sentinel on 100 % of cells; the old "NaN" report was that
+            # unwritten output being read).
+            sched_policies_by_d_shape=(
+                (((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})), ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT}))) if rubin_row else ()
+            ),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
@@ -1136,6 +1257,7 @@ def _sm120_spec() -> EngineSpec:
             padded_stats=True,
             dense_seq_q_trim=True,
             thd=True,
+            thd_padded_stats=True,
             # No KV-tail rule: the kernel walks KV tiles right-to-left and its
             # first (masked) step always covers the rightmost — and therefore
             # any partial — tile, comparing columns against seqlen_k regardless
@@ -1183,6 +1305,18 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     if reason is not None:
         raise ValueError(reason)
     return spec.lower(spec, facts, knobs)
+
+
+def _table_stride(t) -> tuple:
+    """A paged block table's ``(batch, page)`` strides from its ``(B, 1, max_pages, 1)`` IR ref."""
+    s = tuple(int(x) for x in t.get_stride())
+    return (s[0], s[2])
+
+
+def _table_view(buf, ir_t, b: int):
+    """The kernel's ``(B, max_pages)`` view of a bound ``(B, 1, max_pages, 1)`` table — a
+    view of the declared layout (size-1 axes dropped), never a copy."""
+    return buf.as_strided((b, int(ir_t.get_dim()[2])), _table_stride(ir_t), buf.storage_offset())
 
 
 def lower_dsl_prefill(
@@ -1244,12 +1378,23 @@ def lower_dsl_prefill(
         cu_seq_kv_lens=facts.cu_seq_kv_t is not None,
         has_sink=facts.has_sink,
         thd=facts.thd,
+        # THD Stats without ragged offsets = FlashInfer's per-batch padded (b, s_max, h) buffer
+        thd_stats_padded=(facts.thd and facts.stats_t is not None and getattr(facts.stats_t, "ragged_offset", None) is None),
         # Caller-declared packed token totals (issue #624): when present the
         # adapter binds EXACT token extents instead of the buffer-derived
         # capacity, putting an over-allocated buffer's uninitialized tail out
         # of TMA reach. Only ever tightens (see _thd_declared_total).
         max_total_seq_len_q=facts.max_total_seq_len_q,
         max_total_seq_len_kv=facts.max_total_seq_len_kv,
+        # Paged KV: K/V samples are the page pools; the adapter needs the page
+        # geometry and the declared KV maximum the masks clamp against.
+        paged_page_size=facts.page_size if facts.has_paged_kv else 0,
+        paged_max_seq_len_kv=facts.s_kv if facts.has_paged_kv else None,
+        # The tables' declared (batch, page) strides — the (B, 1, max_pages, 1)
+        # IR tensor's axes 0 and 2 — so batch-innermost / padded tables bind
+        # as views.
+        paged_table_stride=_table_stride(facts.paged_k_table_t) if facts.has_paged_kv else None,
+        paged_table_v_stride=_table_stride(facts.paged_v_table_t) if facts.has_paged_kv else None,
         dtype_o=facts.dtype_o if (facts.is_mxfp8 or facts.is_fp8) else None,
         pertensor_fp8=facts.is_fp8,
         sched_policy=knobs.sched_policy if knobs is not None else None,
@@ -1258,7 +1403,7 @@ def lower_dsl_prefill(
         cga=knobs.cga if knobs is not None else None,
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
-        softmax_precision=knobs.softmax_precision if knobs is not None else None,
+        softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
         # SM80-only PLAN-TIME axes (bias presence/dtype are compile-time
         # specializations of that template): forwarded only to adapters whose
         # constructor declares them — every other row's mismatch gated the
@@ -1307,6 +1452,8 @@ def lower_dsl_prefill(
         seq_len_q=seq_q_t,
         cu_seq_len_q=facts.cu_seq_q_t,
         cu_seq_len_kv=facts.cu_seq_kv_t,
+        paged_k_table=facts.paged_k_table_t,
+        paged_v_table=facts.paged_v_table_t,
         bias=facts.bias_t,
         sf_q=facts.sf_q_t,
         sf_k=facts.sf_k_t,
@@ -1347,6 +1494,10 @@ def lower_dsl_prefill(
             k_buf = _ir_view(k_buf, binding.k)
             v_buf = _ir_view(v_buf, binding.v)
             o_buf = _ir_view(o_buf, binding.o)
+        elif facts.has_paged_kv:
+            # THD Q/O stay packed; the pools are ordinary dense tensors.
+            k_buf = _ir_view(k_buf, binding.k)
+            v_buf = _ir_view(v_buf, binding.v)
         # Scratch comes from the CALLER's workspace (never allocated here): the
         # CompiledPlan sized/validated it against workspace_bytes; the carver
         # re-validates so a direct call cannot silently corrupt memory.
@@ -1405,6 +1556,18 @@ def lower_dsl_prefill(
             # ExecutionContext's stream); None keeps the default stream.
             current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
         )
+        if facts.has_paged_kv:
+            # (B, 1, max_pages, 1) int32 tables bound as the kernel's flat
+            # (B, max_pages) views — a view, never a copy (Rule 1); the same
+            # buffer may back both.
+            bt_k = resolved.get(id(binding.paged_k_table))
+            bt_v = resolved.get(id(binding.paged_v_table))
+            if bt_k is None or bt_v is None:
+                raise ValueError("cudnn.sdpa: paged_attention_k_table / paged_attention_v_table requested but no buffer was provided")
+            execute_kwargs.update(
+                block_table=_table_view(bt_k, binding.paged_k_table, facts.b),
+                block_table_v=_table_view(bt_v, binding.paged_v_table, facts.b),
+            )
         if facts.is_mxfp8 or facts.is_fp8:
             execute_kwargs.update(
                 sf_q=sf_q_buf,

@@ -71,6 +71,7 @@ from cudnn.sdpa.fwd.engines import (
     _band_covers_kv_tail,
     _selected_d_shape,
     effective_cgas,
+    effective_sched_policies,
     mismatch,
 )
 
@@ -360,7 +361,11 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     the graph path — the adapters keep a None-input derivation only for
     standalone wrapper users who bypass ranking.
     """
-    domain = caps.sched_policies
+    # The FLAVOR's domain, not the row-wide floor: a `sched_policies_by_d_shape`
+    # claim (the Rubin f16 / FP8 (256, 256) LPT entries) must reach the ranking,
+    # or LPT is only ever honoured when a caller REQUESTS the knob and is never
+    # proposed for the first plan -- which is the whole point of claiming it.
+    domain = effective_sched_policies(caps, facts)
     if len(domain) <= 1:
         return [_sole(domain)]
     if facts.thd and SCHED_NATURAL in domain:
@@ -664,7 +669,9 @@ def _split_points(
     no_split = 1
     if not caps.split_kv_supported:
         return [no_split]
-    if facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim:
+    # Paged KV is padded by construction and the split composes with the
+    # per-batch lengths (it IS the decode lever there) — see mismatch().
+    if facts.thd or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
         return [no_split]
     if caps.skv_tail_via_padding and facts.s_kv % (caps.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
         # This S_kv would be served through the synthesized KV-tail padding,
@@ -713,20 +720,12 @@ def _split_points(
     return [split, no_split]
 
 
-def _softmax_points(caps: Capabilities) -> List[Optional[int]]:
-    """Softmax-precision candidates.
-
-    FLOAT when the row serves it, else the row's sole point. HALF is NEVER
-    proposed: it changes numerics (f16x2 exponent), so it is reachable only
-    by explicit request — auto-proposing it is the CUDNN_SOFTMAX_PRECISION
-    environment-knob failure mode this vocabulary exists to avoid. Flipping the
-    Rubin-FP8 default to HALF is a separate, evidence-carrying change.
-    """
-    if cudnn.data_type.FLOAT in caps.softmax_precisions:
-        return [cudnn.data_type.FLOAT]
-    sole = _sole(caps.softmax_precisions)
-    # A HALF-only row still never gets HALF proposed — same numerics rule.
-    return [None if sole == cudnn.data_type.HALF else sole]
+# NOTE: the softmax accumulator precision is NOT a knob axis. It changes
+# numerics (the Rubin f16x2 exponent arm), so it is the
+# sdpa(softmax_precision=) op attribute: a graph FACT that engines.mismatch
+# gates against Capabilities.softmax_precisions. Heuristics never propose it —
+# auto-proposing it was the CUDNN_SOFTMAX_PRECISION environment-knob failure
+# mode this vocabulary exists to avoid.
 
 
 # ---------------------------------------------------------------------------
@@ -785,7 +784,6 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
             cga=cga,
             pack_gqa=True if packed_first else unpacked_pack,
             split_kv=split_value,
-            softmax_precision=_softmax_points(caps)[0],
         )
 
     unsplit_leg = _leg(1)
@@ -849,7 +847,6 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
         cga=cga,
         pack_gqa=False if False in caps.pack_gqas else _sole(caps.pack_gqas),
         split_kv=1,  # the fallback never splits: least-demanding means one kernel, no partial workspace
-        softmax_precision=_sole(caps.softmax_precisions),
     )
 
 

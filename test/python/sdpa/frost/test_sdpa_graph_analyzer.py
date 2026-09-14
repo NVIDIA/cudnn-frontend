@@ -565,10 +565,39 @@ def test_knob_request_outside_domain_rejects_engine():
     # A value no row's domain contains: honored or ineligible, never degraded.
     g = _mk_eligible_graph()
     assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=99))
-    # softmax_precision=1 is cudnn.data_type.DOUBLE — in no row's domain (the
-    # fp8 rows serve FLOAT, and the sm107 row additionally HALF), so an
-    # explicit request declines everywhere.
-    assert not _eligible(g, engines.SdpaFwdKnobs(softmax_precision=1))
+
+
+def _mk_softmax_precision_graph(precision):
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True, softmax_precision=precision)
+    _finish_output(o, dims, strides)
+    return g
+
+
+def test_softmax_precision_is_an_op_attribute_not_a_knob():
+    """sdpa(softmax_precision=) is numerics-changing, so it is a graph FACT the
+    capability rows gate on — not a tuning axis an autotuner could pick."""
+    import cudnn as _c
+
+    assert "softmax_precision" not in engines.SdpaFwdKnobs.__dataclass_fields__
+    # FLOAT is the pipeline every row runs: same eligibility as no request.
+    assert _eligible(_mk_softmax_precision_graph(_c.data_type.FLOAT)) == _eligible(_mk_eligible_graph())
+    # HALF exists only in the per-tensor-FP8 SM107 arm; a bf16 graph declines everywhere.
+    g_half = _mk_softmax_precision_graph(_c.data_type.HALF)
+    assert ga.analyze(g_half).softmax_precision == _c.data_type.HALF
+    assert not _eligible(g_half)
+    # Anything else is a malformed request, reported on the facts.
+    g_bad = _mk_softmax_precision_graph(_c.data_type.DOUBLE)
+    assert "softmax_precision must be" in (ga.analyze(g_bad).invalid or "")
+    assert not _eligible(g_bad)
+    # The attribute never reaches the cuDNN backend: a SET value makes the node backend-unlowerable.
+    assert g_half._unlowerable_node() is not None
+    assert _mk_softmax_precision_graph(None)._unlowerable_node() is None
+    # serialize() is the backend format, which has no field for the attribute:
+    # refused rather than emitted as (and later executed as) the f32 pipeline.
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="serialize"):
+        g_half.serialize()
 
 
 def test_knob_request_lpt_sched_is_in_domain():
@@ -1418,3 +1447,88 @@ def test_bwd_dsink_fact():
     facts = _facts(g)
     assert facts.has_sink and facts.has_dsink
     assert facts.sink_t is not None and facts.dsink_t is not None
+
+
+# --- paged KV caches (issue #920) -------------------------------------------
+
+
+def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False):
+    """cuDNN's paged-cache contract: K/V page pools [num_pages, H_kv, page_size, D]
+    (HND compact, or NHD storage declared via strides) + (B, 1, max_pages, 1)
+    int32 block tables + per-batch lengths."""
+    g = _mk_graph()
+    b, h, kh = B, H, 2
+    q = g.tensor(dim=(b, h, 1, d), stride=(h * d, d, d, 1), data_type=DTYPE, name="q")
+    num_pages = b * max_pages
+    if hnd:
+        strides = (kh * page_size * d, page_size * d, d, 1)
+    else:
+        strides = (page_size * kh * d, d, kh * d, 1)
+    k = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=DTYPE, name="k")
+    v = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=DTYPE, name="v")
+    tk = g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tk")
+    tv = tk if one_table else g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tv")
+    slq = g.tensor(dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="slq")
+    slk = g.tensor(dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="slk")
+    kw = dict(paged_attention_k_table=tk, paged_attention_v_table=tv)
+    if max_seq_len is not None:
+        kw["paged_attention_max_seq_len_kv"] = max_seq_len
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_padding_mask=padding, seq_len_q=slq, seq_len_kv=slk, **kw)
+    _finish_output(o, (b, h, 1, d), (h * d, d, d, 1))
+    return g
+
+
+def test_paged_facts_hnd_and_nhd():
+    for hnd in (True, False):
+        facts = _facts(_mk_paged_graph(hnd=hnd))
+        assert facts.has_paged_kv and facts.page_size == 16
+        assert facts.s_kv == 8 * 16 and facts.h_kv == 2 and facts.padded
+        assert tuple(facts.paged_k_table_t.get_dim()) == (B, 1, 8, 1)
+        assert facts.paged_k_table_t is not None and facts.paged_v_table_t is not None
+        assert engines.engine_name() in _eligible(_mk_paged_graph(hnd=hnd))
+
+
+def test_paged_facts_declared_max_seq_len_and_single_table():
+    facts = _facts(_mk_paged_graph(max_seq_len=100, one_table=True))
+    assert facts.s_kv == 100
+    assert facts.paged_k_table_t is facts.paged_v_table_t
+    assert engines.engine_name() in _eligible(_mk_paged_graph(max_seq_len=100, one_table=True))
+
+
+def test_paged_probe_declines():
+    assert not _eligible(_mk_paged_graph(page_size=48)), "page_size must divide 128 or be a multiple of it"
+    assert engines.engine_name() in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
+    assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d256 flavors only"
+    assert not _eligible(_mk_paged_graph(padding=False)), "paged KV needs the padding mask (per-batch KV lengths)"
+    facts = ga.analyze(_mk_paged_graph(max_seq_len=8 * 16 + 1))
+    assert facts.invalid is not None, "a declared max S_kv beyond the block table's reach is invalid"
+
+
+def test_paged_split_kv_is_proposed_on_a_decode_launch(monkeypatch):
+    """The padded exclusion on split-KV is lifted for paged graphs: a B=2, H_kv=2
+    decode launch over 128k tokens must be offered a split plan."""
+    monkeypatch.setattr(ga, "_device_sm_count", lambda: 148)
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    g = _mk_paged_graph(page_size=128, max_pages=1024)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    facts = _facts(g)
+    knob_sets = _knob_sets(spec, facts)
+    assert any(k.split_kv and k.split_kv > 1 for k in knob_sets), knob_sets
+
+
+def test_packed_layout_ignores_the_batch_stride_a_ragged_tensor_never_reads():
+    """FlashInfer declares its packed THD Q/O with the batch stride equal to the
+    token stride (h * d): not BSHD-physical over all four axes, but every
+    sequence base comes from the ragged offsets, so only the (H, S, D) order
+    the THD lowering addresses has to hold."""
+    from cudnn.sdpa.graph_analyzer import bshd_layout_ok, packed_layout_ok
+
+    b, h, s, d = 2, 8, 87, 128
+    flashinfer_q = ((b, h, s, d), (h * d, d, h * d, 1))
+    assert not bshd_layout_ok(*flashinfer_q) and packed_layout_ok(*flashinfer_q)
+    dense_bshd = ((b, h, s, d), (s * h * d, d, h * d, 1))
+    assert bshd_layout_ok(*dense_bshd) and packed_layout_ok(*dense_bshd)
+    bhsd = ((b, h, s, d), (h * s * d, s * d, d, 1))  # heads outside tokens: not the packed order
+    assert not packed_layout_ok(*bhsd)
+    assert packed_layout_ok((1, h, s, d), (h * d, d, h * d, 1))  # b == 1 wildcards as before

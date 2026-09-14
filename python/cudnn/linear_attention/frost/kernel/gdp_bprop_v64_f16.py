@@ -40,7 +40,7 @@ Algorithm overview (per chunk c, iterated c = NT-1 .. 0):
                 (dY == dV == d(Y); T read transposed)
   dA          : dA_eff[BT,BT]= dO(SMEM) @ U^T(SMEM) -> shared acc
                 (sV holds U; CG0 masks it -> sDa for dQ/dK)
-  dM core     : dM[BT,BT]    = dY(SMEM) @ U^T(SMEM) -- the WY
+  dM core     : dM[BT,BT]    = dY(SMEM) @ U^T(SMEM), the WY
                 inverse backward T^T dT T^T collapsed via
                 T^T dU = dY and T Y = U (Beta folds through
                 sTinv's column scale into both factors); CG0
@@ -330,38 +330,34 @@ def make_bars(cfg) -> GdpBpropV64Bars:
     )
 
 
-# ---- Dynamic tile scheduler ----------------------------------------------------------
+# ---- dynamic tile scheduler ----------------------------------------------------------
 
 
 @cute.jit
 def scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, tile_idx, num_ctas, tail_base, tail_row, elect_one):
     """TMA-LDG-warp side: pull the next tile off the global ticket, publish it."""
-    if cutlass.const_expr(cfg.dynamic_scheduling):
-        sentinel = cutlass.Int32(1 << 28)
-        pinned = tail_row if tile_idx < tail_base else sentinel
-        bars.mb_scheduler_done[scheduler_state.idx].wait(scheduler_state.phase)
-        if elect_one:
-            fetched = cutlass.Int32(nvvm.atomicrmw("add", mScheduler.iterator, cutlass.Int32(1), mem_order="relaxed", syncscope="gpu"))
-            granted = num_ctas + fetched
-            sScheduler[scheduler_state.idx] = granted if granted < tail_base else pinned
-        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
-        next_tile = sScheduler[scheduler_state.idx]
-        if elect_one:
-            bars.mb_scheduler_ready[scheduler_state.idx].arrive()
-        return next_tile, advance(scheduler_state, cfg.scheduler_stages)
-    return tile_idx + num_ctas, scheduler_state
+    sentinel = cutlass.Int32(1 << 28)
+    pinned = tail_row if tile_idx < tail_base else sentinel
+    bars.mb_scheduler_done[scheduler_state.idx].wait(scheduler_state.phase)
+    if elect_one:
+        fetched = cutlass.Int32(nvvm.atomicrmw("add", mScheduler.iterator, cutlass.Int32(1), mem_order="relaxed", syncscope="gpu"))
+        granted = num_ctas + fetched
+        sScheduler[scheduler_state.idx] = granted if granted < tail_base else pinned
+    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+    next_tile = sScheduler[scheduler_state.idx]
+    if elect_one:
+        bars.mb_scheduler_ready[scheduler_state.idx].arrive()
+    return next_tile, advance(scheduler_state, cfg.scheduler_stages)
 
 
 @cute.jit
-def scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, tile_idx, num_ctas, elect_one):
+def scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one):
     """Consumer side: read the TMA-LDG warp's published next tile."""
-    if cutlass.const_expr(cfg.dynamic_scheduling):
-        bars.mb_scheduler_ready[scheduler_state.idx].wait(scheduler_state.phase)
-        next_tile = sScheduler[scheduler_state.idx]
-        if elect_one:
-            bars.mb_scheduler_done[scheduler_state.idx].arrive()
-        return next_tile, advance(scheduler_state, cfg.scheduler_stages)
-    return tile_idx + num_ctas, scheduler_state
+    bars.mb_scheduler_ready[scheduler_state.idx].wait(scheduler_state.phase)
+    next_tile = sScheduler[scheduler_state.idx]
+    if elect_one:
+        bars.mb_scheduler_done[scheduler_state.idx].arrive()
+    return next_tile, advance(scheduler_state, cfg.scheduler_stages)
 
 
 @cute.jit
@@ -505,7 +501,7 @@ def tmastg_warp(
                     tma_store_commit()
                 tma_store_wait(0)
                 bars.mb_dq_tmastg_done[dq_idx].arrive()
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, tile_idx, num_ctas, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
 
 @cute.jit
@@ -758,7 +754,7 @@ def gate_warp(
                     pos = lane_idx + col * cfg.threads_per_warp
                     if st_offset + pos < write_end_token:
                         gDbeta[pos] = sBeta[pos, 0, beta_store_idx].to(mDbeta.element_type)
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, tile_idx, num_ctas, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
 
 @cute.jit
@@ -1537,7 +1533,7 @@ def tcgen05_mma_warp(
                 bars.mb_dk_total_acc_ready[0].arrive(cta_group=1)
                 bars.mb_k_mma_done[k_idx].arrive(cta_group=1)
 
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, tile_idx, num_ctas, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
     bars.mb_dk_total_acc_done[0].wait(dk_total_index.phase)
     bars.mb_tmem_done[0].wait(0)
@@ -1583,7 +1579,7 @@ def tmaldg_warp(
     scheduler_state = PipelineState.start(phase=1)
     tail_count = ((total_tiles - cutlass.Int32(1)) % num_ctas) + cutlass.Int32(1)
     tail_base = (total_tiles - tail_count) if tail_count * 2 >= num_ctas else total_tiles
-    tail_row = tail_base + cute.arch.smid()
+    tail_row = tail_base + bidx
     tail_row = tail_row if tail_row < total_tiles else cutlass.Int32(1 << 28)
 
     elect_one = nvvm.elect_sync()
@@ -2002,7 +1998,7 @@ def compute0_warp_group(
                 thread_count=cfg.inverse_barrier_threads,
             )
 
-            # ---- Beta column-scaling in place: T^-1[i,j] *= Beta[j] ------------------
+            # ---- Beta column scaling in place: T^-1[i,j] *= Beta[j] ------------------
             beta_col = []
             for k in cutlass.range_constexpr(num_vals):
                 beta_col.append(sBeta[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, beta_idx])
@@ -2162,6 +2158,7 @@ def compute0_warp_group(
             for off in [1, 2]:
                 for rp in cutlass.range_constexpr(2):
                     row_part[rp] += nvvm.shfl_sync(0xFFFFFFFF, row_part[rp], off, 31, kind=nvvm.Shfl.BFLY)
+
             # ---- dGate column fold ---------------------------------------------------
             nvvm.barrier_cta_sync_aligned(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
             col_lo, col_hi = warp_reduce_scatter_sum_16_elements(col_part, lane_idx)
@@ -2198,7 +2195,7 @@ def compute0_warp_group(
                     sBeta[crow_r, 0, beta_idx] = db
 
             bars.mb_beta_done[beta_idx].arrive()
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, tile_idx, num_ctas, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
     for _ in range(cfg.smem_a_stages):
         bars.mb_a_done[a_index.idx].wait(a_index.phase)
         a_index = advance(a_index, cfg.smem_a_stages)
@@ -2723,7 +2720,7 @@ def compute1_warp_group(
             bars.mb_dbeta_cg1_ready[0].arrive()
             nvvm.barrier_cta_sync_aligned(cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads)
 
-            # ---- dQ family ------------------------------------------------------------
+            # ---- dQ family -----------------------------------------------------------
             dq_tok0 = cg1_warp_id * 16 + lane_idx // 4
             if block_last:
                 bars.mb_dq_acc_total_ready[0].wait(dq_total_ready_index.phase)
@@ -2815,7 +2812,7 @@ def compute1_warp_group(
                 sCumsumlog[cg1_tidx, 0, gate_idx] = sCumsumlog[cg1_tidx, 0, gate_idx] - gsum
             bars.mb_gate_done[gate_idx].arrive()
             bars.mb_dgate_cg1_ready[0].arrive()
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, tile_idx, num_ctas, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
     bars.mb_tmem_done[0].arrive()
 
@@ -2992,7 +2989,7 @@ def compute2_warp_group(
             decay_scale_vals = [decay_scale_fp32[(k // 4) * 2 + (k % 2)] for k in range(num_vals)]
             bars.mb_cg2_chunk_ready[0].arrive()
 
-            # ---- inv_k row (fused l2norm) ----------------------------------------------
+            # ---- inv_k row (fused l2norm) --------------------------------------------
             fused_inv_k = cutlass.Float32(1.0)
             if cutlass.const_expr(cfg.fused_l2norm):
                 gInvK = cute.domain_offset((batch_start + abs_chunk * cfg.b_t,), mInvK[None, head_idx])
@@ -3189,7 +3186,7 @@ def compute2_warp_group(
                             nvvm.MMALayout.COL,
                         )
 
-            # ---- dK l2norm projection --------------------------------------------------
+            # ---- dK l2norm projection ------------------------------------------------
             if cutlass.const_expr(cfg.fused_l2norm):
                 nvvm.barrier_cta_sync_aligned(cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads)
                 part_pk = [acc_zero] * 16
@@ -3288,7 +3285,7 @@ def compute2_warp_group(
                                 if dstate_row_valid:
                                     gDstate0[dstate_gmem_row, i * ldtm_width + kk] = cutlass.Float32(0.0).to(mDstate0_out.element_type)
 
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, tile_idx, num_ctas, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
     bars.mb_tmem_done[0].arrive()
 
@@ -3395,65 +3392,67 @@ def frost_gdp_bprop_v64_prologue(
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
 ) -> None:
-    """Single-CTA prologue. Under ``run_order`` this kernel is the first
-    work-item-table consumer, so it LPT-orders the table and zeroes both
-    consumers' scheduler rings via :func:`order_body`; it then builds the
+    """Two-CTA prologue. Under ``run_order`` this kernel is the first
+    work-item-table consumer, so block 0 LPT-orders the table and zeroes both
+    consumers' scheduler rings via :func:`order_body`; block 1 builds the
     per-batch TMA-descriptor arrays via :func:`build_descs_body`, one warp
-    per array (the extra warps only take part in the order phase)."""
+    per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
         launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
-    if cutlass.const_expr(run_order):
-        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
-        n_heads_out = cutlass.Int32(do_.shape[1])
-        order_body(
-            order_gen,
-            True,
-            b_t,
-            ORDER_THREADS,
-            ORDER_ELEMENTS,
-            tidx,
-            n_heads_out,
-            n_heads_out * n_batch,
+    bidx = cutlass.Int32(cute.arch.block_idx()[0])
+    if bidx == cutlass.Int32(0):
+        if cutlass.const_expr(run_order):
+            sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+            sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+            sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
+            n_heads_out = cutlass.Int32(do_.shape[1])
+            order_body(
+                order_gen,
+                b_t,
+                ORDER_THREADS,
+                ORDER_ELEMENTS,
+                tidx,
+                n_heads_out,
+                n_heads_out * n_batch,
+                cu_seqlens,
+                mStaging,
+                mCount,
+                mWorkItems,
+                mScheduler,
+                sKey,
+                sIdx,
+                sSpread,
+                expand_num=expand_num,
+            )
+    else:
+        build_descs_body(
+            widx,
+            base_q,
+            base_k,
+            base_v,
+            base_do,
+            base_checkpoint,
+            base_dq,
+            base_dk,
+            base_dv,
+            desc_workspace,
             cu_seqlens,
-            mStaging,
-            mCount,
-            mWorkItems,
-            mScheduler,
-            sKey,
-            sIdx,
-            sSpread,
-            expand_num=expand_num,
+            q,
+            k,
+            v,
+            do_,
+            state_checkpoints,
+            dq,
+            dk,
+            dv,
+            n_batch,
+            checkpoint_every_n,
+            expand_num,
         )
-    build_descs_body(
-        widx,
-        base_q,
-        base_k,
-        base_v,
-        base_do,
-        base_checkpoint,
-        base_dq,
-        base_dk,
-        base_dv,
-        desc_workspace,
-        cu_seqlens,
-        q,
-        k,
-        v,
-        do_,
-        state_checkpoints,
-        dq,
-        dk,
-        dv,
-        n_batch,
-        checkpoint_every_n,
-        expand_num,
-    )
 
 
 @cute.jit
@@ -3554,7 +3553,7 @@ def prologue(
         scheduler_all,
         cutlass.Int32(batch_size),
         cutlass.Int32(b_t),
-    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+    ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 @cute.jit
@@ -3580,7 +3579,7 @@ def host(
     inv_k: Optional[cute.Tensor],
     work_items: Optional[cute.Tensor],
     work_count: Optional[cute.Tensor],
-    scheduler_counter: Optional[cute.Tensor],
+    scheduler_counter: cute.Tensor,
     scale: cutlass.Float32,
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
@@ -3696,7 +3695,7 @@ def frost_gdp_bprop_v64(
     mInvK: Optional[cute.Tensor],
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
-    mScheduler: Optional[cute.Tensor],
+    mScheduler: cute.Tensor,
     tensormap_workspace: cute.Tensor,
     n_desc: cutlass.Int32,
 ):
@@ -4287,7 +4286,6 @@ def frost_gdp_bprop_v64(
     nvvm.barrier_cta_sync()
 
     # ---- warp specialization ---------------------------------------------------------
-
     if warp_idx >= cfg.compute_group_0_warp_ids[0] and warp_idx <= cfg.compute_group_0_warp_ids[-1]:
         compute0_warp_group(
             cfg,
@@ -4488,6 +4486,8 @@ class GdpBpropV64Cfg:
     acc_dtype: Type[cutlass.Numeric]
     max_active_clusters: int
     is_GQA: bool
+    d_k: int
+    d_v: int
     log_gate: bool = False
     safe_gate: bool = False
     beta_sigmoid: bool = False
@@ -4496,8 +4496,6 @@ class GdpBpropV64Cfg:
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
     b_t: int = CFG.B_T
-    d_k: int = CFG.D_K
-    d_v: int = CFG.D_V
     expand_num: int = 1
     compute_group_0_warp_ids: Tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
     compute_group_1_warp_ids: Tuple[int, ...] = CFG.COMPUTE_GROUP_1_WARP_IDS
@@ -4513,7 +4511,6 @@ class GdpBpropV64Cfg:
     threads_per_warp: int = CFG.THREADS_PER_WARP
     threads_per_cta: int = 0
     cluster_shape_mnk: Tuple[int, int, int] = CFG.CLUSTER_SHAPE_MNK
-    dynamic_scheduling: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- named barrier slots (ids 1-6; 0 is the CTA-wide sync) -----------------------
@@ -4591,13 +4588,14 @@ def build_cfg(
     beta_sigmoid: bool = False,
     allow_neg_eigval: bool = False,
     fused_l2norm: bool = False,
-    dynamic_scheduling: bool = False,
-    d_k: int = CFG.D_K,
-    d_v: int = CFG.D_V,
+    d_k: int,
+    d_v: int,
     expand_num: int = 1,
 ) -> GdpBpropV64Cfg:
     """Build the per-compile ``GdpBpropV64Cfg`` (io_dtype in {Float16, BFloat16};
     acc is always Float32)."""
+    if d_v != 64:
+        raise ValueError(f"gdp_bprop_v64 serves d_v = 64 only, got d_v={d_v}")
     cfg = GdpBpropV64Cfg(
         use_initial_state=use_initial_state,
         use_dstate_in=use_dstate_in,
@@ -4611,7 +4609,6 @@ def build_cfg(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         fused_l2norm=fused_l2norm,
-        dynamic_scheduling=dynamic_scheduling,
         d_k=d_k,
         d_v=d_v,
         expand_num=expand_num,
@@ -4637,7 +4634,6 @@ def build_cfg(
 
 
 TENSORMAP_DESC_ARRAYS = 8  # per-batch runtime TMA descriptors: Q, K, V, dO, checkpoints, dQ, dK, dV
-TENSORMAP_STATIC_SLOTS = 0
 
 
 @functools.cache
@@ -4667,7 +4663,6 @@ def get_compiled_cache(
     beta_sigmoid: bool = False,
     allow_neg_eigval: bool = False,
     fused_l2norm: bool = False,
-    dynamic_scheduling: bool = False,
     run_order: bool = False,
     order_gen: bool = False,
 ):
@@ -4686,14 +4681,13 @@ def compile(
     beta_sigmoid: bool = False,
     allow_neg_eigval: bool = False,
     fused_l2norm: bool = False,
-    dynamic_scheduling: bool = False,
     *,
     num_sm: int,
     h_q: int,
     h_k: int,
     h_v: int,
-    d_k: int = CFG.D_K,
-    d_v: int = CFG.D_V,
+    d_k: int,
+    d_v: int,
     expand_num: int = 1,
     q_cute,
     k_cute,
@@ -4733,7 +4727,6 @@ def compile(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         fused_l2norm=fused_l2norm,
-        dynamic_scheduling=dynamic_scheduling,
         d_k=d_k,
         d_v=d_v,
         expand_num=expand_num,
@@ -4878,7 +4871,8 @@ def chunk_gdn_bwd_sm100(
 
     cu_stream = cuda.CUstream(int(stream))
 
-    dynamic_scheduling = scheduler_counter is not None
+    if scheduler_counter is None:
+        raise ValueError("scheduler_counter is required")
     run_order = bool(order_in_prologue)
     order_gen = run_order and work_item_scratch is None
     if run_order and scheduler_all is None:
@@ -4913,7 +4907,6 @@ def chunk_gdn_bwd_sm100(
         use_beta_sigmoid,
         allow_neg_eigval,
         fused_l2norm,
-        dynamic_scheduling,
         run_order,
         order_gen,
     )
@@ -4931,9 +4924,7 @@ def chunk_gdn_bwd_sm100(
         work_items_cute = from_dlpack(work_items, assumed_align=16)
         work_items_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_cute = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-        scheduler_counter_cute = None
-        if dynamic_scheduling:
-            scheduler_counter_cute = from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic()
+        scheduler_counter_cute = from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic()
         a_log_cute = from_dlpack(a_log, assumed_align=4) if a_log is not None else None
         dt_bias_cute = from_dlpack(dt_bias, assumed_align=4) if dt_bias is not None else None
         inv_q_cute = from_dlpack(inv_q, assumed_align=4).mark_layout_dynamic(leading_dim=1) if fused_l2norm else None
@@ -4949,7 +4940,6 @@ def chunk_gdn_bwd_sm100(
             beta_sigmoid=use_beta_sigmoid,
             allow_neg_eigval=allow_neg_eigval,
             fused_l2norm=fused_l2norm,
-            dynamic_scheduling=dynamic_scheduling,
             num_sm=num_sm,
             h_q=HQ,
             h_k=HK,
@@ -4986,19 +4976,19 @@ def chunk_gdn_bwd_sm100(
     compiled = cache["compiled"]
 
     if own_prologue and "prologue" not in cache:
-        checkpoints_pl = from_dlpack(state_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        cu_pl = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
-        staging_pl = None
+        checkpoints_placeholder = from_dlpack(state_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
+        staging_placeholder = None
         if run_order and not order_gen:
-            staging_pl = from_dlpack(work_item_scratch, assumed_align=16)
-            staging_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_pl = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-        work_items_pl = from_dlpack(work_items, assumed_align=16)
-        work_items_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        scheduler_all_pl = None
+            staging_placeholder = from_dlpack(work_item_scratch, assumed_align=16)
+            staging_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+        work_count_placeholder = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
+        work_items_placeholder = from_dlpack(work_items, assumed_align=16)
+        work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+        scheduler_all_placeholder = None
         if run_order:
-            scheduler_all_pl = from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic()
-        workspace_pl = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
+            scheduler_all_placeholder = from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic()
+        workspace_placeholder = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
         cache["prologue"] = cute.compile(
             prologue,
             io_dtype,
@@ -5013,13 +5003,13 @@ def chunk_gdn_bwd_sm100(
             from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            checkpoints_pl,
-            cu_pl,
-            staging_pl,
-            work_count_pl,
-            work_items_pl,
-            scheduler_all_pl,
-            workspace_pl,
+            checkpoints_placeholder,
+            cu_placeholder,
+            staging_placeholder,
+            work_count_placeholder,
+            work_items_placeholder,
+            scheduler_all_placeholder,
+            workspace_placeholder,
             cu_stream,
             options="--enable-tvm-ffi",
         )

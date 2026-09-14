@@ -7,7 +7,7 @@ class it was tuned for in brackets) crossed with the pass; rows are features.
 Source of truth is the `Capabilities` row of each engine
 (`python/cudnn/sdpa/fwd/engines.py`, `python/cudnn/sdpa/bwd/engines.py`) — a
 cell here is ✅ only when that row admits it. Anything not listed as a row
-(dropout, ALiBi, paged KV, `block_mask`, `score_mod`, `rng_dump`,
+(dropout, ALiBi, `block_mask`, `score_mod`, `rng_dump`,
 `score_max`/`score_sum_exp`, tensor `attn_scale`, `unfuse_fma`, `Amax_S`) is
 **declined by every FROST SDPA engine on every arch**.
 
@@ -70,7 +70,7 @@ MMA as d=512.
 | **Layout** | | | | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |
 | Arbitrary dense B/H/S stride order (`dense_flex`) | f16 only | f16 only | f16 only | ✅ | f16 only | ✅ᵇ ᶜ · ❌ᵍ |
-| THD / ragged (packed varlen) | f16 only⁹ | ✅ | f16 only³ | ✅ | f16 + fp8³ | ✅ᵇ ʰ · ❌ᵍ |
+| THD / ragged (packed varlen)ᵏ | f16 only⁹ | ✅ | f16 only³ | ✅ | f16 + fp8³ | ✅ᵇ ʰ · ❌ᵍ |
 | `cu_seq_len_q/kv` prefix sums (THD only) | f16 only⁹ | ✅ | ✅ | ✅ | ✅ | ❌ʲ |
 | **Masks / features** | | | | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ ᵍ |
@@ -87,6 +87,25 @@ MMA as d=512.
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ᵇ · ✅ᵍ |
+| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ (d128 envelope) | ✅ᵖ | ❌ | ✅ᵖ | ❌ | ❌ |
+
+ᵖ **Paged KV (issue #920), f16/bf16 only, d128 and d256 flavors** (`d_qk, d_v <= 256`;
+d=64 rides the d128 envelope, d=192/192 the d256 one; mixed dims that would select
+d192x128 are declined). The graph is cuDNN's own paged-cache contract: K/V are page
+pools `[num_pages, H_kv, page_size, D]` — HND compact, or NHD (`[num_pages, page_size,
+H_kv, D]` storage) declared through the strides — plus `(B, 1, max_pages, 1)` int32
+block tables and `use_padding_mask` with `seq_len_q` / `seq_len_kv` (the per-batch KV
+length is read on device; `paged_attention_max_seq_len_kv` defaults to `max_pages *
+page_size`). `page_size` is a multiple of 8 that divides the 128-row KV tile or is a
+multiple of it. Any `S_q` (decode or paged prefill), GQA (PackGQA when the group
+divides the tile), Stats out, and **THD queries**: ragged Q/O (ragged offsets +
+`seq_len_q`) over the same pools — chunked prefill — with the THD scheduler walking
+the Q units (no KV split there). KV split is proposed on dense-Q paged graphs (they
+are padded by construction, and `B * H_kv` is far below the SM count at serving batch
+sizes) and recombined by `split_combine_sm100`. Not yet: sink, fp8/mxfp8 pools,
+packed (ragged-offset) block tables. Served by `prefill_d128_f16_sm100.py`'s `PAGED_KV`
+specialization (block-table indirection on the K/V TMA loads; boxes past a
+sequence's live pages are TMA-OOB zero-filled).
 
 ¹ **Reads as: on a quantized (fp8/mxfp8) graph in this column, O may be FP16,
 BF16, E4M3 or E5M2.** It does NOT mean an f16/bf16 graph may convert O — the f16
@@ -269,14 +288,16 @@ red (2026-09-08).
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ❌ |
-| FP16 softmax accumulate (`softmax_precision=HALF`) | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |
+| FP16 softmax accumulate (`sdpa(softmax_precision=HALF)` op attribute) | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |
 
 ⁱ No native d=64 Rubin kernel, so a d=64 graph rides the d128 envelope (64 is a
 multiple of 8 at f16 and of 16 at fp8) at ~2× the MMA cost.
 ⁱⁱ `thd_d_shapes={(128,128)}` on the FP8 row is exact — d=64 THD is declined.
-ⁱⁱⁱ **Accepted, not validated.** `softmax_precision=HALF` is gated on
+ⁱⁱⁱ **Accepted, not validated.** `softmax_precision=HALF` (requested as the
+`sdpa()` op attribute — numerics-changing, so it is a graph fact gated by the
+row's `softmax_precisions`, not a tuning knob) is gated on
 `flavor == (128, 128)` (`fwd/api_dsl.py`), and a d=64 graph's *flavor* IS
-(128,128), so the knob passes the probe and the kernel runs. Untested is the
+(128,128), so the request passes the probe and the kernel runs. Untested is the
 f16x2 exponent arm over the zero-padded 64 → 128 region.
 ⁱᵛ **d512 MXFP8 is CORRECT but has no test module**, so it is ⚠️ not ✅: cos =
 0.9997 / LSE exact at SQ ∈ {128, 256, 384, 512} from `frost_dev/_probe_d512_mxfp8.py`,
@@ -355,9 +376,39 @@ dense and causal. Measured causal SOL on Rubin at S = 4096/8192/32768:
 (+18.2/+11.6/+1.1 %), recovering 40/51/29 % of the causal-vs-dense gap; dense is
 neutral. The decay with S is the signature of scheduler imbalance.
 
-Still declined, and why: d128/d512 f16 and every FP8/MXFP8 flavor are
-**unvalidated** under LPT rather than known-incorrect (d512 is cga4×1 role-split,
-a different scheduler shape). `SCHED_LPT_L2` is declined by **every** flavor —
+**FP8 (256, 256) and (192, 128) join the LPT claim (2026-09-11).** Validated
+through the standalone adapter on Rubin (E4M3 per-tensor scales, bf16 O, causal,
+dense and padded, (B, S) ∈ {(1,256), (2,1000), (1,4096)}) against the fp64
+kernel-mirroring `fp8_ref.compute_ref`: (256, 256) max|O−ref| 0.0078 causal /
+≤ 0.0019 dense (tol 0.075); (192, 128) 0.0397 causal / ≤ 0.0060 dense (tol
+0.04). On both flavors O and LSE under LPT are **bit-identical** to NATURAL (the
+scheduler reorders whole (batch, head, q-tile) work items; each tile's KV loop is
+unchanged), sentinel 0, two-launch 0. Perf node, d256 causal H32/2, LPT vs
+NATURAL launch-interleaved: +5.2/+5.9/+5.6/+2.0/+2.3 % at S = 2K..32K (control
+pair within 1.9 %). The FP8 row now carries
+`sched_policies_by_d_shape = (((256, 256), {NATURAL, LPT}), ((192, 128), {NATURAL, LPT}))`.
+Two FP8 flavors stay out: **(128, 128)** is also bit-identical under LPT, but
+its causal path reads 0.041–0.048 against the suite's 0.04 under NATURAL as
+well, so it gets its own look before it is claimed; **(512, 512)** — the cga4×1
+role-split kernel still calls `make_sdpa_helpers(CFG)` without
+`lpt_q_tiles_in_cga_units` (the #1001 argument, left on the d512 line), so under
+LPT it writes *nothing* (sentinel on 100 % of cells; the earlier "causal d512
+FP8 → NaN" report was that unwritten output being read). In the same
+change `heuristics._sched_points` ranks from the FLAVOR's effective domain
+(`effective_sched_policies`) rather than the row-wide floor — before it, a
+per-shape LPT claim was honoured only when a caller REQUESTED the knob and was
+never proposed for the first plan (this also makes the f16 d256 claim reach
+the graph path's ranking). Pinned by
+`test_sm107_fp8_advertises_lpt_only_for_the_validated_d_shape`,
+`test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape` and the Rubin
+e2e `test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors`.
+
+Still declined, and why: d128/d512 f16, d128 FP8 (tolerance, above) and every
+MXFP8 flavor are **unvalidated** under LPT rather than known-incorrect; d512
+(f16, FP8, MXFP8) **does not produce output** under LPT until the d512 kernels get the
+`lpt_q_tiles_in_cga_units` argument and are re-validated (cga4×1 role-split, a
+different scheduler shape — `prefill_d512_fp8.py:2533` notes the LPT range is
+`q_clusters * CTA_MMA`). `SCHED_LPT_L2` is declined by **every** flavor —
 its decode needs `qh_per_kh` and `seqlen_kv`, which the SM107 call sites do not
 pass, so it raises rather than miscomputes. Both are follow-ups.
 
@@ -487,4 +538,12 @@ feature-free d=64 graph.
 | **Native d=64 (GPT-OSS) forward kernel** | **SM100, SM107** — served via the d128 envelope at ~2× MMA cost |
 | d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |
 | Bias forward | SM100, SM107, SM120 |
-| Dropout, ALiBi, paged KV, `block_mask`, `score_mod` | every arch, both passes |
+| Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
+| Paged KV cache | every arch except SM100/SM103 f16/bf16 d128 forward (see ᵖ); fp8/mxfp8 pools, sink, THD, packed block tables everywhere |
+
+ᵏ **THD / ragged forward layout.** Q/K/V/O must be BSHD-ordered over **(H, S, D)**
+only — head dim innermost, then heads, then tokens (`graph_analyzer.packed_layout_ok`).
+The batch stride is not gated: every sequence base comes from the ragged offsets and
+the lowering binds the batch axis at extent 1, so its declared value is never read.
+FlashInfer declares it equal to the token stride (`h * d`), which the previous
+all-four-axes check refused at `b > 1`. Stats under THD are written in the caller's declared layout: packed `(T, H)` rows, head-major `(1, QH, head_stride)`, or -- a Stats tensor **without** ragged offsets -- the per-batch padded form -- the graph's logical `[b, h, s_max, 1]` Stats view over FlashInfer's physical, contiguous `(b, s_max, h)` `return_lse` buffer (declared strides `[s_max*h, 1, h, 1]`; the adapter rebuilds the view with `as_strided`, nothing is allocated in the logical order), stored per batch through the declared strides on every THD row (SM100 / SM107 / SM120, `Capabilities.thd_padded_stats`); the adapter seeds that buffer with `-inf` on the launch stream first, so the rows past a sequence's length read the backend's value. On SM100 / SM107 the THD templates compile with DYNAMIC batch and head extents (`compile(dynamic_bhk=True)`): one artifact per layout class (d, dtypes, masks, GQA ratio, packed vs declared strides), not per shape.

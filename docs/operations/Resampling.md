@@ -46,7 +46,7 @@ auto set_generate_index(bool const value) -> Resample_attributes&;
 auto set_is_inference(bool const value) -> Resample_attributes&;
 ```
 
-For more information on exact support surfaces across different versions, refer to [ResampleFwd runtime fusion engine](https://docs.nvidia.com/deeplearning/cudnn/latest/developer/graph-api#resamplefwd) in the *Frontend Developer Guide*.
+For more information on exact support surfaces across different versions, refer to [ResampleFwd runtime fusion engine](https://docs.nvidia.com/cudnn/latest/developer/graph-api#resamplefwd) in the *Frontend Developer Guide*.
 
 Python API for resampling forward will be supported soon.
 

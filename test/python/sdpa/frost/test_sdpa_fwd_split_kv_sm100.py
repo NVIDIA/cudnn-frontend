@@ -1053,6 +1053,32 @@ def test_split_kv_padded_q_trim(flavor, splits):
     assert (got - ref)[live.expand_as(got)].abs().max().item() <= 2e-2
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("splits", [8, 16], ids=lambda s: f"split{s}")
+def test_split_kv_cga1_empty_splits_multiwave(splits):
+    """cga1 (Q∪O alias) + more CTAs than SMs + batches whose splits come out EMPTY.
+
+    TMA-STG advances the Q∪O alias gate for every tile, empty ones included;
+    the d128 TMA-LDG warp skipped the empty-tile wait, so after a persistent
+    CTA drained an empty split its alias parity was one behind and the next
+    live tile's Q load raced the previous O drain.  Observed as the LONG batch
+    coming back wrong (max|dO| ~ 2e-2, LSE off by 4e-2) only when
+    B*H*splits > SM count and some other batch has fewer tiles than splits —
+    single-wave, uniform-length and cga2 runs were all clean, which is why the
+    existing split suite never saw it.  Fix: the d192 kernel's return edge
+    (mb_qo_slab_free, PR #575) ported to d128.
+    """
+    from test_sdpa_fwd_dsl_sm100 import _ref_sdpa_full
+
+    B, H, SQ, SKV = 3, 8, 1, 4224
+    lens = torch.tensor([4000, 1, 129], dtype=torch.int32, device="cuda")
+    got, q, k, v, scale = _run_masked(
+        "sm100/prefill_d128_f16.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(seq_kv_lens_present=True), seq_kv_lens=lens, cta_mma=1
+    )
+    ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, seq_kv_lens=lens)
+    assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-3
+
+
 # --- the adapter honors the heuristic's split knob ---------------------------
 
 

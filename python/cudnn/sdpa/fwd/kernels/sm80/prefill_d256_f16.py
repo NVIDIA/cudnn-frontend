@@ -77,6 +77,7 @@ Layout choices (same as the shared kernel):
   the inner-loop ldmatrix instruction count vs the x2 helper.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Optional
 
@@ -1722,6 +1723,7 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     ``PARAMS.has_lse = False`` compiles the LSE store out entirely (the LSE
     argument is None-specialized) — no buffer and no dummy at any level.
     """
+    _cache_key = _template_key(globals(), locals(), "compile")
     p = PARAMS
     if p.thd_varlen and p.has_bias:
         raise ValueError("sm80: bias + THD is not supported (varlen has no single [1,H,SQ,SKV] bias shape)")
@@ -1832,7 +1834,7 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     # Stream not used during trace; passed through to launch().  Use a
     # null stream sentinel — cute.compile only inspects type, not value.
     fake_stream = cuda.CUstream(0)
-    return cute.compile(
+    return _compile_cached(
         _sdpa_host,
         fake_q,
         fake_k,
@@ -1877,4 +1879,6 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
         fake_thd_nb,
         fake_stream,
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

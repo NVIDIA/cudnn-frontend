@@ -632,6 +632,116 @@ def test_dsl_sm100_execute_sink_lse_contract():
 
 
 @pytest.mark.L0
+def test_thd_padded_lse_order_is_cutes_stride_order_for_every_compact_layout():
+    """The dynamic THD plan hands the kernel a COMPACT LSE fake in the caller's
+    dim order instead of explicit strides. CuTe's ``stride_order`` is per axis
+    (the rank of its stride), the inverse of "axes sorted by stride"; the two
+    agree only on self-inverse orders such as FlashInfer's (b, s_max, h), so
+    every one of the six (b, h, s_max) storage orders is checked against the
+    strides CuTe derives. A gapped layout has no compact order."""
+    _require_dsl()
+    from itertools import permutations
+    from types import SimpleNamespace
+
+    import cutlass
+    import cutlass.cute as cute
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s = 2, 3, 5
+    shape = (b, h, s, 1)
+    for storage_order in permutations(range(3)):  # slowest axis first
+        st, acc = [0, 0, 0], 1
+        for ax in reversed(storage_order):
+            st[ax] = acc
+            acc *= shape[ax]
+        api = SimpleNamespace(_lse_stride=tuple(st), batch_size=b, h_q=h, s_q_max=s)
+        order = SdpaFwdDslSm100._thd_padded_lse_order(api)
+        assert order is not None, (storage_order, st)
+        fake = cute.runtime.make_fake_compact_tensor(cutlass.Float32, shape, stride_order=order, assumed_align=4)
+        got = tuple(fake.stride)
+        assert all(shape[i] == 1 or got[i] == st[i] for i in range(4)), f"storage order {storage_order}: declared {st}, order {order}, CuTe derived {got}"
+    gapped = SimpleNamespace(_lse_stride=(h * s * 2, s * 2, 2), batch_size=b, h_q=h, s_q_max=s)
+    assert SdpaFwdDslSm100._thd_padded_lse_order(gapped) is None
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout():
+    """A padded Stats whose (b, h, s_max) storage order is (h, s_max, b) --
+    logical strides (1, s_max*b, b). The order and its inverse differ, and the
+    wrong one pins the h axis to stride 1 in the compiled fake, so the kernel
+    (whose other strides are dynamic) binds a layout the buffer does not have.
+    Rows must equal the contiguous layout's, tails -inf."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 256, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
+
+    def run(lse):
+        api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True, thd_stats_padded=True)
+        assert api.check_support()
+        api.compile()
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse)
+        torch.cuda.synchronize()
+        return api
+
+    ref = torch.full((b, h, s), float("nan"), dtype=torch.float32, device="cuda")
+    run(ref)
+    hsb = torch.full((h, s, b), float("nan"), dtype=torch.float32, device="cuda").permute(2, 0, 1)  # (b, h, s) view, strides (1, s*b, b)
+    api = run(hsb)
+    assert tuple(hsb.stride()) == (1, s * b, b)
+    assert SdpaFwdDslSm100._thd_padded_lse_order(api) == (1, 3, 2, 0)  # the axis list sorted by stride would be (3, 0, 2, 1)
+    for i, n in enumerate(lens.tolist()):
+        torch.testing.assert_close(hsb[i, :, :n], ref[i, :, :n], atol=0, rtol=0)
+        assert torch.isneginf(hsb[i, :, n:]).all(), f"batch {i}: rows past the length are not -inf"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_padded_stats_execute_checks_the_buffer():
+    """A per-batch padded Stats buffer is bound through the DECLARED (b, h, s_max)
+    strides, so execute() first checks that the runtime buffer is exactly
+    B*H_q*s_max fp32 values: a larger or smaller storage would be silently
+    re-addressed (or fail inside as_strided) otherwise. The right-sized buffer
+    runs, and its rows past each sequence's length read -inf."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 256, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    lse = torch.full((b, h, s), float("nan"), dtype=torch.float32, device="cuda")
+    lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True, thd_stats_padded=True)
+    assert api.check_support() and api.thd_stats_padded
+    api.compile()
+    with pytest.raises(ValueError, match="padded lse_tensor must have"):
+        api.execute(
+            q_tensor=q,
+            k_tensor=k,
+            v_tensor=v,
+            o_tensor=o,
+            seq_q_lens=lens,
+            seq_kv_lens=lens,
+            lse_tensor=torch.empty(b, h, s + 1, dtype=torch.float32, device="cuda"),
+        )
+    with pytest.raises(ValueError, match="padded lse_tensor must have"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse[:, :, :-1])
+    with pytest.raises(ValueError, match="lse_tensor must be on"):  # a host pointer would reach the raw CUDA fill
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse.cpu())
+    with pytest.raises(ValueError, match="lse_tensor must be float32"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse.to(torch.bfloat16))
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse)
+    torch.cuda.synchronize()
+    for i, n in enumerate(lens.tolist()):
+        assert torch.isfinite(lse[i, :, :n]).all(), f"batch {i}: valid rows not written"
+        assert torch.isneginf(lse[i, :, n:]).all(), f"batch {i}: rows past the length are not -inf"
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)

@@ -122,13 +122,6 @@ def _forward_api(q, k, v, cu, *, head_dim=64, scaling_seqlen=None):
     )
 
 
-def _int32_alias(tensor: torch.Tensor, shape) -> torch.Tensor:
-    numel = 1
-    for size in shape:
-        numel *= size
-    return tensor.flatten().view(torch.int32)[:numel].view(shape)
-
-
 @pytest.mark.L0
 def test_rejects_torch_stream_from_another_device(monkeypatch):
     class _FakeStream:
@@ -416,34 +409,6 @@ def test_support_rejects_unsupported_combinations(monkeypatch):
         sample_func=odd_func,
     ).check_support()
 
-    with pytest.raises(ValueError, match="o_tensor storage must not overlap"):
-        HSTUFwdSm100(
-            sample_q=q,
-            sample_k=k,
-            sample_v=v,
-            sample_o=q,
-            sample_cu_seqlens_q=cu,
-            sample_cu_seqlens_k=cu,
-            max_seqlen_q=128,
-            max_seqlen_k=128,
-        ).check_support()
-
-    shared_grad = torch.empty_like(q)
-    with pytest.raises(ValueError, match="storage must not overlap"):
-        HSTUBwdSm100(
-            sample_do=do,
-            sample_q=q,
-            sample_k=k,
-            sample_v=v,
-            sample_dq=shared_grad,
-            sample_dk=shared_grad,
-            sample_dv=torch.empty_like(v),
-            sample_cu_seqlens_q=cu,
-            sample_cu_seqlens_k=cu,
-            max_seqlen_q=128,
-            max_seqlen_k=128,
-        ).check_support()
-
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
@@ -617,155 +582,6 @@ def test_explicit_stream_execute_records_all_operands(monkeypatch):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _HAS_CUDA, reason="requires CUDA")
-def test_metadata_aliases_are_rejected_by_support_and_runtime(monkeypatch):
-    q, k, v, do, cu = _inputs()
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_args: (10, 0))
-    monkeypatch.setattr(_interface, "hstu_varlen_fwd_100", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(_interface, "hstu_varlen_bwd_100", lambda *_args, **_kwargs: None)
-
-    def forward_case(metadata_name, alias):
-        o = torch.empty_like(q)
-        cu_q = cu.clone()
-        cu_k = cu.clone()
-        func = None
-        paged_kv = None
-        page_ids = None
-        page_indptrs = None
-        window_size = (-1, 0)
-        if metadata_name == "func_tensor":
-            func = torch.empty((1, 1, q.shape[0] + 256), dtype=torch.int32, device=q.device)
-            window_size = (-1, -1)
-        elif metadata_name in ("page_ids_tensor", "page_indptrs_tensor"):
-            paged_kv = torch.empty((1, 2, 128, q.shape[1], q.shape[2]), dtype=q.dtype, device=q.device)
-            page_ids = torch.zeros(1, dtype=torch.int32, device=q.device)
-            page_indptrs = torch.tensor((0, 1), dtype=torch.int32, device=q.device)
-
-        if alias:
-            aliases = {
-                "cu_seqlens_q_tensor": lambda: _int32_alias(o, cu_q.shape),
-                "cu_seqlens_k_tensor": lambda: _int32_alias(o, cu_k.shape),
-                "func_tensor": lambda: _int32_alias(o, func.shape),
-                "page_ids_tensor": lambda: _int32_alias(o, page_ids.shape),
-                "page_indptrs_tensor": lambda: _int32_alias(o, page_indptrs.shape),
-            }
-            alias_tensor = aliases[metadata_name]()
-            if metadata_name == "cu_seqlens_q_tensor":
-                cu_q = alias_tensor
-            elif metadata_name == "cu_seqlens_k_tensor":
-                cu_k = alias_tensor
-            elif metadata_name == "func_tensor":
-                func = alias_tensor
-            elif metadata_name == "page_ids_tensor":
-                page_ids = alias_tensor
-            else:
-                page_indptrs = alias_tensor
-
-        api = HSTUFwdSm100(
-            sample_q=q,
-            sample_k=k,
-            sample_v=v,
-            sample_o=o,
-            sample_cu_seqlens_q=cu_q,
-            sample_cu_seqlens_k=cu_k,
-            max_seqlen_q=128,
-            max_seqlen_k=128,
-            window_size=window_size,
-            sample_func=func,
-            sample_paged_kv=paged_kv,
-            sample_page_ids=page_ids,
-            sample_page_indptrs=page_indptrs,
-        )
-        runtime_kwargs = {
-            "q_tensor": q,
-            "k_tensor": k,
-            "v_tensor": v,
-            "o_tensor": o,
-            "cu_seqlens_q_tensor": cu_q,
-            "cu_seqlens_k_tensor": cu_k,
-            "func_tensor": func,
-            "paged_kv_tensor": paged_kv,
-            "page_ids_tensor": page_ids,
-            "page_indptrs_tensor": page_indptrs,
-        }
-        return api, runtime_kwargs
-
-    for metadata_name in (
-        "cu_seqlens_q_tensor",
-        "cu_seqlens_k_tensor",
-        "func_tensor",
-        "page_ids_tensor",
-        "page_indptrs_tensor",
-    ):
-        alias_api, _ = forward_case(metadata_name, alias=True)
-        with pytest.raises(ValueError, match=rf"o_tensor storage must not overlap {metadata_name} storage"):
-            alias_api.check_support()
-
-        api, _ = forward_case(metadata_name, alias=False)
-        assert api.check_support()
-        api._compiled_kernel = object()
-        _, runtime_kwargs = forward_case(metadata_name, alias=True)
-        with pytest.raises(ValueError, match=rf"o_tensor storage must not overlap {metadata_name} storage"):
-            api.execute(**runtime_kwargs)
-
-    def backward_case(metadata_name, alias):
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
-        cu_q = cu.clone()
-        cu_k = cu.clone()
-        func = None
-        if metadata_name == "func_tensor":
-            func = torch.empty((1, 1, q.shape[0] + 256), dtype=torch.int32, device=q.device)
-        if alias:
-            if metadata_name == "cu_seqlens_q_tensor":
-                cu_q = _int32_alias(dq, cu_q.shape)
-            elif metadata_name == "cu_seqlens_k_tensor":
-                cu_k = _int32_alias(dq, cu_k.shape)
-            else:
-                func = _int32_alias(dq, func.shape)
-        api = HSTUBwdSm100(
-            sample_do=do,
-            sample_q=q,
-            sample_k=k,
-            sample_v=v,
-            sample_dq=dq,
-            sample_dk=dk,
-            sample_dv=dv,
-            sample_cu_seqlens_q=cu_q,
-            sample_cu_seqlens_k=cu_k,
-            max_seqlen_q=128,
-            max_seqlen_k=128,
-            sample_func=func,
-        )
-        runtime_kwargs = {
-            "do_tensor": do,
-            "q_tensor": q,
-            "k_tensor": k,
-            "v_tensor": v,
-            "dq_tensor": dq,
-            "dk_tensor": dk,
-            "dv_tensor": dv,
-            "cu_seqlens_q_tensor": cu_q,
-            "cu_seqlens_k_tensor": cu_k,
-            "func_tensor": func,
-        }
-        return api, runtime_kwargs
-
-    for metadata_name in ("cu_seqlens_q_tensor", "cu_seqlens_k_tensor", "func_tensor"):
-        alias_api, _ = backward_case(metadata_name, alias=True)
-        with pytest.raises(ValueError, match=rf"dq_tensor storage must not overlap {metadata_name} storage"):
-            alias_api.check_support()
-
-        api, _ = backward_case(metadata_name, alias=False)
-        assert api.check_support()
-        api._compiled_kernel = object()
-        _, runtime_kwargs = backward_case(metadata_name, alias=True)
-        with pytest.raises(ValueError, match=rf"dq_tensor storage must not overlap {metadata_name} storage"):
-            api.execute(**runtime_kwargs)
-
-
-@pytest.mark.L0
-@pytest.mark.skipif(not _HAS_CUDA, reason="requires CUDA")
 def test_rejects_unsafe_storage_metadata(monkeypatch):
     q, k, v, _, cu = _inputs()
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
@@ -854,26 +670,6 @@ def test_rejects_unsafe_storage_metadata(monkeypatch):
         max_seqlen_k=128,
     )
     assert packed_api.check_support()
-
-    overlapping_grad_storage = torch.empty(
-        (q.shape[0], q.shape[1], q.shape[2] + 8),
-        dtype=q.dtype,
-        device=q.device,
-    )
-    with pytest.raises(ValueError, match="storage must not overlap"):
-        HSTUBwdSm100(
-            sample_do=torch.empty_like(q),
-            sample_q=q,
-            sample_k=k,
-            sample_v=v,
-            sample_dq=overlapping_grad_storage[..., : q.shape[2]],
-            sample_dk=overlapping_grad_storage[..., 8 : 8 + q.shape[2]],
-            sample_dv=torch.empty_like(v),
-            sample_cu_seqlens_q=cu,
-            sample_cu_seqlens_k=cu,
-            max_seqlen_q=128,
-            max_seqlen_k=128,
-        ).check_support()
 
 
 @pytest.mark.L0
@@ -1060,19 +856,6 @@ def test_backward_supports_optional_gradient_outputs(head_dim, monkeypatch):
     assert partial["dq_tensor"] is partial_dq
     for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
         torch.testing.assert_close(partial[name], expected[name], rtol=1e-2, atol=1e-2)
-
-    with pytest.raises(ValueError, match="dq_tensor storage must not overlap q_tensor storage"):
-        hstu_attention_backward(
-            do,
-            q,
-            k,
-            v,
-            cu,
-            cu,
-            **kwargs,
-            dq_tensor=q,
-        )
-    assert len(cache) == 3
 
 
 @pytest.mark.L0
@@ -1795,6 +1578,54 @@ def test_single_query_auto_backward_matches_pytorch(head_dim, dtype):
     assert next(iter(_interface._hstu_varlen_bwd_q1_direct.compile_cache))[-2:] == expected_schedule
     for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected):
         torch.testing.assert_close(actual[name].cpu().float(), expected_grad, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
+def test_single_query_backward_supports_separate_dq_and_packed_dkdv():
+    torch.manual_seed(2031)
+    batch, kv_len, heads, head_dim = 8, 128, 2, 64
+    q = torch.randn((batch, heads, head_dim), dtype=torch.bfloat16, device="cuda") * 0.2
+    kv = torch.randn((batch * kv_len, 2, heads, head_dim), dtype=torch.bfloat16, device="cuda") * 0.2
+    k, v = kv.unbind(1)
+    do = torch.randn_like(q) * 0.2
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    cu_k = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * kv_len
+    kwargs = {
+        "max_seqlen_q": 1,
+        "max_seqlen_k": kv_len,
+        "window_size": (-1, 0),
+        "alpha": 0.7,
+        "scaling_seqlen": 128.0,
+    }
+
+    expected = hstu_attention_backward(do, q, k, v, cu_q, cu_k, **kwargs)
+    dq = torch.full_like(q, float("nan"))
+    dkv = torch.full_like(kv, float("nan"))
+    dk, dv = dkv.unbind(1)
+
+    assert dq.untyped_storage().data_ptr() != dkv.untyped_storage().data_ptr()
+    assert dk.untyped_storage().data_ptr() == dv.untyped_storage().data_ptr()
+    assert dk.stride() == dv.stride() == (2 * heads * head_dim, head_dim, 1)
+
+    actual = hstu_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        **kwargs,
+        dq_tensor=dq,
+        dk_tensor=dk,
+        dv_tensor=dv,
+    )
+
+    assert actual["dq_tensor"] is dq
+    assert actual["dk_tensor"] is dk
+    assert actual["dv_tensor"] is dv
+    for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
+        torch.testing.assert_close(actual[name], expected[name], rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.L1

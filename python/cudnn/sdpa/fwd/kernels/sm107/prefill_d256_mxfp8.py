@@ -29,6 +29,7 @@ Dense path (THD_VARLEN=0) folds to identity (cu_sf=0, tma_batch=batch_idx) —
 byte-identical.  Public-API MXFP8 THD glue is a follow-up (THD-aware quantizer).
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 import os
 import sys
 from functools import lru_cache
@@ -111,6 +112,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     Sched,
     scheduler_warp_loop,
     read_tile_id_arrive,
+    read_clc_payload,
     SCHED_NATURAL,
     SCHED_LPT,
     SCHED_LPT_L2,
@@ -716,7 +718,7 @@ def _kernel(
     else:  # warp_idx == CFG.SCHED_WARP_ID
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
-        scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+        scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta, CGA_SIZE)
 
 
 # === TMA-LDG warp group ===
@@ -893,9 +895,10 @@ def _tmaldg_warp_group(
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_q = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0))).load())
-        nxt_hb = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1))).load())
-        nxt_v = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load())
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+        nxt_q = cute.arch.make_warp_uniform(nxt_q)
+        nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+        nxt_v = cute.arch.make_warp_uniform(nxt_v)
         q_super_idx, head_idx, batch_idx = _dispatch_decode_payload(
             nxt_q,
             nxt_hb,
@@ -991,9 +994,7 @@ def _tmastg_warp_group(
         o_full_phase = o_full_phase ^ cutlass.Int32(1)
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_q = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0))).load()
-        nxt_hb = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1))).load()
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         q_super_idx, head_idx, batch_idx = _dispatch_decode_payload(
             nxt_q,
             nxt_hb,
@@ -1350,12 +1351,13 @@ def _mma_warp_group(
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         if cutlass.const_expr(CFG.MASK_FLAGS == 0):
-            nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+            _nq, _nh, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
             is_valid_tile = nxt_v & cutlass.Int32(1)
         else:
-            nxt_q = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0))).load())
-            nxt_hb = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1))).load())
-            nxt_v = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load())
+            nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+            nxt_q = cute.arch.make_warp_uniform(nxt_q)
+            nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+            nxt_v = cute.arch.make_warp_uniform(nxt_v)
             q_super_idx, _hd, batch_idx = _dispatch_decode_payload(
                 nxt_q,
                 nxt_hb,
@@ -1743,9 +1745,10 @@ def _softmax_warp_group(
         bars.mb_stat_full.arrive()
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_q = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0))).load())
-        nxt_hb = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1))).load())
-        nxt_v = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load())
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+        nxt_q = cute.arch.make_warp_uniform(nxt_q)
+        nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+        nxt_v = cute.arch.make_warp_uniform(nxt_v)
         q_super_idx, head_idx, batch_idx = _dispatch_decode_payload(
             nxt_q,
             nxt_hb,
@@ -2022,9 +2025,7 @@ def _correction_warp_group(
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_q = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0))).load()
-        nxt_hb = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1))).load()
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         q_super_idx, head_idx, batch_idx = _dispatch_decode_payload(
             nxt_q,
             nxt_hb,
@@ -2295,6 +2296,7 @@ def compile(  # noqa: A001
     # let it fail as an arity error deep in the trace -- and so no engine row
     # can advertise thd=True for this kernel and appear to work.  The dense
     # path is unaffected: CFG.THD_VARLEN is 0 and every THD branch folds out.
+    _cache_key = _template_key(globals(), locals(), "compile")
     if CFG.THD_VARLEN:
         raise NotImplementedError(f"{__name__}: THD/varlen not ported to the FROST setup-kernel contract")
     # ---- FROST adapter ABI ------------------------------------------------
@@ -2408,7 +2410,7 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -2434,6 +2436,8 @@ def compile(  # noqa: A001
         total_kv_sf_tiles=cutlass.Int32(_kv_sf_tiles),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )
 
 

@@ -25,6 +25,8 @@ symbols_to_import = [
     "reduction_mode",
     "behavior_note",
     "knob_type",
+    "FRONTEND_KNOB_TYPE_BASE",
+    "is_frontend_knob_type",
     "create_kernel_cache",
     "create_device_properties",
     "numerical_note",
@@ -142,7 +144,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.29.0"
+__version__ = "1.30.0"
 
 
 def _tensor(

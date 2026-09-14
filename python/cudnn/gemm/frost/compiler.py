@@ -80,6 +80,7 @@ from .graph_analyzer import (
     GemmBinding,
     analyze_with_binding,
     resolve_variant_pack,
+    swap_ab_binding,
 )
 from .tile_config import DEFAULT_CONFIG, TileConfig, _sm_count
 
@@ -826,14 +827,9 @@ def _render_tile_constants_sm100(
         cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
     fallback_cluster = _mixed_cga_fallback(cfg, tmpl.file)
     smem_fixed_reserve = tmpl.smem_fixed_reserve
-    # The 64-byte MMA-inst K exists only for the BLOCK-SCALE MMA; plain matmul
-    # has no such instruction, so a geometry carrying it has no template here.
+    _check_mma_k_dim(chain, cfg)
     # CTAs one MMA instruction spans; 1 on a family whose MMA has no pair.
     ctas_per_mma = cfg.ctas_per_mma
-    if cfg.mma_tile_k_bytes != 32:
-        raise NotImplementedError(
-            f"plain matmul renders one 32-byte MMA-inst K; config {cfg.name!r} " f"has mma_inst_k_bytes={cfg.mma_tile_k_bytes} (block-scale only)"
-        )
     # a_dt/b_dt: GMEM dtypes (what TMA loads). mma_a_dt/mma_b_dt: the MMA
     # instruction dtype — equal to the GMEM dtype (no implicit cast).
     a_dt = chain.matmul.a_dtype
@@ -904,6 +900,7 @@ def _render_tile_constants_sm100(
     lines = [
         f"# Tile config: {cfg.name}",
         f"mma_inst_shape_mnk = {cfg.mma_tile_mnk(elem_bytes)}",
+        f"mma_k_dim = {int(cfg.mma_tile_k_bytes == 64)}",
         f"cta_group = {ctas_per_mma}",
         f"cgrp_tile_mnk = {cfg.cga_tile_mnk(elem_bytes)}",
         # Template `cta_tile_mnk` = per-CTA SMEM/TMA box dims (B's N halved under
@@ -1124,9 +1121,7 @@ def _render_tile_constants_sm120(
     if tmpl.warps_per_cta is not None:
         cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
     if cfg.mma_tile_k_bytes != 32:
-        raise NotImplementedError(
-            f"plain matmul renders one 32-byte MMA-inst K; config {cfg.name!r} " f"has mma_inst_k_bytes={cfg.mma_tile_k_bytes} (block-scale only)"
-        )
+        raise NotImplementedError(f"sm120 matmul requires mma_tile_k_bytes=32; config {cfg.name!r} has {cfg.mma_tile_k_bytes}")
     a_dt = chain.matmul.a_dtype
     b_dt = chain.matmul.b_dtype
     mma_a_dt = _mma_a_dtype(chain)
@@ -2826,6 +2821,10 @@ def _import_kernel(src: str) -> object:
     mod = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
+    # The template's compile() keys its persistent object on this digest: the
+    # rendered source carries the tile config, dtypes, fusion chain and the
+    # --gpu-arch option, so it IS the kernel's identity.
+    mod.FROST_SOURCE_DIGEST = digest
     return mod
 
 
@@ -2934,6 +2933,25 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     it = iter(extents)
     shape = tuple(next(it) if r else 1 for r in real)
     return t.reshape(shape)
+
+
+def _swap_mn_view(t: object) -> object:
+    """Transpose the logical M/N axes without moving the runtime storage."""
+    if len(t.shape) == 3:
+        return t.permute(0, 2, 1)
+    if len(t.shape) == 2:
+        return t.permute(1, 0)
+    return t
+
+
+def _offset_vector(t):
+    """``first_token_offset`` as the rank-1 vector the launch indexes. cuDNN
+    declares it ``(E, 1, 1)`` and the variant pack hands the declaration over;
+    the trailing singleton axes carry nothing."""
+    shape = tuple(t.shape)
+    if len(shape) == 3 and shape[1:] == (1, 1):
+        return t.reshape([shape[0]])
+    return t
 
 
 def _expected_output_shape(spec, chain: FusionChain, mnk) -> tuple[int, int, int]:
@@ -3159,6 +3177,11 @@ class CompiledFusedGemm:
         # split-K slices for the kernel
         needs_workspace = bool(r.workspace_bytes)
         split_k_slices = self.config.split_k_slices
+        swap_ab = self.config.swap_ab
+        packed_scale_slots = frozenset(
+            o.index for o in r.outputs if o.role.startswith("quant_scale_") and self.chain.quants[int(o.role.rsplit("_", 1)[1])].scale_reorder == "F8_128x4"
+        )
+        mn_view_slots = (frozenset(o.index for o in r.outputs) | frozenset(x.index for x in r.aux)) - packed_scale_slots
         if needs_workspace:
             cta_k_elems = _cta_k_elems(self.chain, self.config)
             reduce_elems = _splitk_reduce_elems(self.chain)
@@ -3228,7 +3251,7 @@ class CompiledFusedGemm:
                 ):
                     gave_up["output layout"] += 1
                     return refuse(operands, graph_order)
-                problem += (st[1], st[2], st[0])
+                problem += (st[2], st[1], st[0]) if swap_ab and idx in mn_view_slots else (st[1], st[2], st[0])
             for idx, align in auxs:
                 v = operands[idx]
                 if tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
@@ -3307,7 +3330,14 @@ class CompiledFusedGemm:
             return launchable(
                 tuple(problem),
                 *(v.permute(1, 2, 0) for v in vs),
-                *(operands[i].permute(1, 2, 0) if ref is None else _reshape_aux_to_fake(operands[i], ref) for i, ref in tail),
+                *(
+                    (
+                        ((_swap_mn_view(operands[i]) if swap_ab and i in mn_view_slots else operands[i]).permute(1, 2, 0))
+                        if ref is None
+                        else _reshape_aux_to_fake(_swap_mn_view(operands[i]) if swap_ab else operands[i], ref)
+                    )
+                    for i, ref in tail
+                ),
                 *extra,
                 stream=_as_custream(stream),
             )
@@ -3428,6 +3458,27 @@ def _check_mma_n_dim(
 _TMA_BOX_DIM_MAX = 256
 
 
+def _check_mma_k_dim(chain: FusionChain, config: TileConfig) -> None:
+    """Dense MMA K width: shared by candidate enumeration, precheck, and render."""
+    if config.mma_tile_k_bytes == 32:
+        return
+    if config.mma_tile_k_bytes != 64 or config.pipeline != "sm100":
+        raise NotImplementedError(f"plain matmul supports mma_tile_k_bytes=32, or 64 for sm100 FP8; config {config.name!r}")
+    fp8_dtypes = ("fp8_e4m3", "fp8_e5m2")
+    if _mma_a_dtype(chain) not in fp8_dtypes or _mma_b_dtype(chain) not in fp8_dtypes:
+        raise NotImplementedError(f"plain matmul at mma_tile_k_bytes=64 requires FP8 E4M3/E5M2 A and B; config {config.name!r}")
+    from .kernel_registry import MMA_INST_K64_ARCH_RANGES
+
+    arch = _current_arch()
+    if arch is None or not any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES):
+        spans = " or ".join(f"{lo} <= SM < {hi}" for lo, hi in MMA_INST_K64_ARCH_RANGES)
+        active = "unknown" if arch is None else f"sm_{arch}"
+        raise NotImplementedError(f"plain FP8 at mma_tile_k_bytes=64 needs {spans}, but the active GPU is {active}; config {config.name!r}")
+    # Dense K64 uses full M datapaths: hardware M=128 (1CTA) or 256 (2CTA).
+    if config.mma_tile_m != 128:
+        raise NotImplementedError(f"plain FP8 mma_tile_k_bytes=64 requires mma_tile_m=128 per CTA; config {config.name!r}")
+
+
 def _check_dtype_config_compat(
     chain: FusionChain,
     config: TileConfig,
@@ -3435,6 +3486,7 @@ def _check_dtype_config_compat(
     """Reject (chain, config) where the config K_BYTES isn't a multiple of the
     MMA dtype's element width. The config's own SMEM N drives the N-major-B
     swizzle-group check."""
+    _check_mma_k_dim(chain, config)
     mma_dt = _mma_a_dtype(chain)
     elem_bytes = DTYPE_BYTES.get(mma_dt)
     if elem_bytes is None:
@@ -3873,8 +3925,6 @@ def _check_block_quant_supported(
         return
     if chain.has_mainloop_fusion:
         raise NotImplementedError("block_scale_quantize epilogue is not supported with mainloop fusion")
-    if any(spec.quant_idx is not None and spec.major != "n" for spec in chain.output_specs):
-        raise NotImplementedError("block_scale_quantize data outputs must be N-major")
     elem_bytes = DTYPE_BYTES[chain.output_dtype]
     vsize = vec_bytes_epi // elem_bytes
     cols_per_acc_stage = _epi_tile_cols(config)
@@ -4082,8 +4132,25 @@ def _graph_dynamic_shapes(graph) -> bool:
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
-def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False) -> TileConfig:
-    """Choose the automatic tile strategy for one analyzed fusion chain."""
+def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+    """Choose the tile strategy for one analyzed fusion chain.
+
+    ``knobs`` (a :class:`~cudnn.gemm.frost.knobs.GemmKnobs`, the replay of a
+    recorded ``(engine_id, knobs)`` plan) names one TileConfig exactly and
+    bypasses the automatic pick; a request that does not spell a canonical
+    config is a decline (NotImplementedError), never a silent snap to a
+    neighbour. Without knobs this is the automatic strategy."""
+    if knobs is not None:
+        try:
+            config = knobs.to_config()
+        except (KeyError, ValueError, NotImplementedError) as exc:
+            raise NotImplementedError(f"frost_gemm: knobs do not name a canonical tile config: {exc}") from exc
+        if dynamic_shapes and config.split_k_slices != 1:
+            # Same rule as the automatic pick below: the slice count is fixed at
+            # plan time and a runtime K may not tile it, so a replayed record
+            # does not get to bypass it.
+            raise NotImplementedError("frost_gemm: split-K plans do not support dynamic shapes")
+        return config
     from .kernel_registry import preferred_strategy
     from .tile_config import select_config
 
@@ -4251,19 +4318,35 @@ def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) ->
     # of faulting deep in cute -- and so the --gpu-arch target pin, which lands in
     # cutedsl at the floor, is always available by the time a plan compiles. An
     # internal RC passes: cutedsl_too_old judges only the public wheel.
+    probe_cutedsl()
+    chain, _binding = analyze_with_binding(graph)
+    if config is None:
+        config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph))
+    probe_chain(chain, config)
+
+
+def probe_cutedsl() -> None:
+    """The cutedsl floor gate shared by check_support and the family heuristics."""
     installed, version = buffers.cutedsl_state()
     if not installed:
         raise NotImplementedError("frost_gemm requires the cutedsl extra (nvidia-cutlass-dsl)")
     if buffers.cutedsl_too_old(version):
         want = ".".join(str(v) for v in buffers.CUTEDSL_MIN_VERSION)
         raise NotImplementedError(f"frost_gemm requires nvidia-cutlass-dsl >= {want}; found {version[1]}")
-    chain, _binding = analyze_with_binding(graph)
+
+
+def probe_chain(chain: FusionChain, config: TileConfig) -> None:
+    """The chain-level gates of :func:`probe_supported` for one explicit
+    ``config``: what the family heuristics run before listing a plan, so a plan
+    in the ranked list is one the engine will build (facts in, no graph needed)."""
+    if config.swap_ab:
+        from .fusion_ir import swap_ab
+
+        chain = swap_ab(chain)
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
     _check_executable(chain)
-    if config is None:
-        config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph))
     _check_splitk_supported(chain, config)
     if chain.is_multi_gemm and not (chain.has_moe or chain.has_block_scale):
         from .kernel_registry import select_template
@@ -4321,8 +4404,9 @@ def jit_from_cudnn_graph(
 
     `graph` is a ``cudnn.pygraph`` built after ``import cudnn.gemm.frost`` (the
     import installs the op-recording hook). `config` is a PURE-GEOMETRY tile from
-    `tile_config.CATALOG`. Execution strategy: ``cta_group`` ∈ {1, 2} and
-    picks the template (mainloop auto-detected).
+    `tile_config.CATALOG`. ``config.swap_ab`` logically lowers
+    ``C.T = B.T @ A.T`` without changing runtime buffers. Execution strategy:
+    ``cta_group`` ∈ {1, 2} and picks the template (mainloop auto-detected).
 
     Mixed CGA needs no argument and no caller change: where the GPU and the
     template both support it, the launch carries ``config``'s cluster as the
@@ -4331,6 +4415,11 @@ def jit_from_cudnn_graph(
     Everywhere else the launch is the plain fixed cluster it always was.
     """
     chain, binding = analyze_with_binding(graph)
+    if config.swap_ab:
+        from .fusion_ir import swap_ab
+
+        chain = swap_ab(chain)
+        binding = swap_ab_binding(binding)
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
@@ -4424,6 +4513,33 @@ def _moe_operand_layout_bad(chain, token, weight) -> bool:
     return token.stride(a_unit) != 1 or weight.stride(b_unit) != 1
 
 
+def _declared_storage(t, memo: dict):
+    """``storage_geometry`` of a bound cuDNN tensor, computed once per binding:
+    three pybind reads per operand per call otherwise."""
+    key = id(t)
+    if key not in memo:
+        from cudnn.graph_types import storage_geometry
+
+        try:
+            memo[key] = storage_geometry(t.get_dim(), t.get_stride(), t.get_data_type())
+        except Exception:  # noqa: BLE001 -- an analyzer-synthesized ref has no dims
+            memo[key] = None
+    return memo[key]
+
+
+def _kernel_order(buf, t, memo: "dict | None" = None):
+    """A B-side buffer described AS its declaration is in the graph's
+    ``[b, k, n]`` axis order (the variant pack lends a bare address, or a buffer
+    that disagrees with the declaration, exactly that geometry); the launch
+    reads ``(b, n, k)``. The declaration is compared in STORAGE slots -- an fp4
+    declaration spells elements, the slot spells x2 pairs -- with the same
+    tie-break ``recipe.Operand.axes`` applies on the dense path."""
+    declared = _declared_storage(t, {} if memo is None else memo)
+    if declared is not None and declared[0] and (tuple(buf.shape), tuple(buf.stride())) == declared:
+        return buf.permute(0, 2, 1)
+    return buf
+
+
 def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     """Resolve a MoE variant-pack dict into the positional-call buffers,
     inferring (S, N, K) from shapes. Returns ``(a_bufs, b_bufs, out_bufs,
@@ -4432,6 +4548,14 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     if b is None:
         raise NotImplementedError("variant-pack call is not yet wired up for this graph type")
     resolved = resolve_variant_pack(variant_pack, b)
+    # the binding's tensors are fixed, so their declared geometry is too
+    memo = getattr(compiled, "_declared_storage_memo", None)
+    if memo is None:
+        memo = {}
+        try:
+            compiled._declared_storage_memo = memo
+        except AttributeError:  # a compiled object that refuses new attributes: per-call memo
+            pass
 
     def pull(t, role):
         if t is None or id(t) not in resolved:
@@ -4439,12 +4563,12 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         return resolved[id(t)]
 
     a_bufs = [pull(t, "token") for t in b.a_operands]
-    b_bufs = [pull(t, "weight") for t in b.b_operands]
+    b_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
     fto = pull(b.first_token_offset, "first_token_offset")
     sfa = [pull(t, "SFA") for t in b.sfa_operands]
-    sfb = [pull(t, "SFB") for t in b.sfb_operands]
+    sfb = [_kernel_order(pull(t, "SFB"), t, memo) for t in b.sfb_operands]
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     S = a_bufs[0].shape[1]
     K = a_bufs[0].shape[2] * k_factor
@@ -4588,6 +4712,7 @@ class CompiledMoeGemm:
         return self._call_variant_pack(variant_pack, workspace, stream)
 
     def _launch_single(self, token, weight, first_token_offset, output, snke, workspace=None, stream=None):
+        first_token_offset = _offset_vector(first_token_offset)
         if len(snke) < 3:
             raise ValueError("MoE call needs problem_size (S, N, K[, ...]); " f"got {snke!r}")
         S, N, K = int(snke[0]), int(snke[1]), int(snke[2])
@@ -4684,6 +4809,7 @@ class CompiledMoeGemm:
         (token, weight) pairs deduped by tensor identity into the JIT-fixed A/B
         slots (shared token → one A operand). All matmuls share ``fto``; ``out``
         is the single fused output."""
+        first_token_offset = _offset_vector(first_token_offset)
         chain = self.chain
         if not isinstance(gemm_pairs, (list, tuple)) or not all(isinstance(p, (list, tuple)) and len(p) == 2 for p in gemm_pairs):
             raise ValueError("multi-GEMM MoE call expects a list of (token, weight) pairs as " f"the first argument; got {type(gemm_pairs).__name__}")
@@ -4956,6 +5082,7 @@ class CompiledMoeBlockScaleGemm:
         return self._call_variant_pack(variant_pack, workspace, stream)
 
     def _launch_single(self, token, weight, sfa, sfb, first_token_offset, output, snke, workspace=None, stream=None):
+        first_token_offset = _offset_vector(first_token_offset)
         if len(snke) < 3:
             raise ValueError("MoE block-scale call needs problem_size (S, N, K[, ...]); " f"got {snke!r}")
         S, N, K = int(snke[0]), int(snke[1]), int(snke[2])
@@ -5107,6 +5234,7 @@ class CompiledMoeBlockScaleGemm:
         Each GEMM is a ((token, sfa), (weight, sfb)) pair; dedup by PACKED-data
         identity (SF travels with its data → shared token+sfa collapses to one A
         operand). All matmuls share ``fto``; ``out`` is the fused output."""
+        first_token_offset = _offset_vector(first_token_offset)
         chain = self.chain
         ok = (
             isinstance(gemm_pairs, (list, tuple))

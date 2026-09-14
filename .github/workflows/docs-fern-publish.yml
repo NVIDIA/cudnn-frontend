@@ -39,8 +39,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PROD_INSTANCE: nvidia-cudnn.docs.buildwithfern.com/deeplearning/cudnn
-  STAGING_INSTANCE: nvidia-cudnn-staging.docs.buildwithfern.com/deeplearning/cudnn
+  PROD_INSTANCE: nvidia-cudnn.docs.buildwithfern.com/cudnn
+  STAGING_INSTANCE: nvidia-cudnn-staging.docs.buildwithfern.com/cudnn
 
 jobs:
   publish:
