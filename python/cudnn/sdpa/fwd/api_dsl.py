@@ -2102,6 +2102,45 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             O_view.copy_(O_scratch)
         self._logger.debug("execute completed")
 
+    def _thd_dynamic_bhk(self) -> bool:
+        """Whether this THD plan compiles its batch and head extents dynamic:
+        the kernel module offers it, and a padded LSE (if any) is in a compact
+        order the fake can express. Decided once per plan: this is asked on
+        every execute (the compile kwargs are rebuilt per call) and
+        ``inspect.signature`` alone cost 60 us a call."""
+        cached = getattr(self, "_thd_dynamic_bhk_cached", None)
+        if cached is not None:
+            return cached
+        import inspect
+
+        dyn = bool(self.thd and self._k_mod is not None and "dynamic_bhk" in inspect.signature(self._k_mod.compile).parameters)
+        if dyn and self.lse_desc is not None and self.thd_stats_padded and self._thd_padded_lse_order() is None:
+            dyn = False
+        self._thd_dynamic_bhk_cached = dyn
+        return dyn
+
+    def _thd_padded_lse_order(self):
+        """CuTe's ``stride_order`` for a padded (b, h, s_max, 1) LSE whose declared
+        strides are compact in SOME dim order, else None: per AXIS, the rank of
+        that axis's stride (0 = fastest) -- ``make_fake_compact_tensor`` reads it
+        as ``stride_order.index(rank)``. FlashInfer's (b, s_max, h) is (3, 1, 2, 0).
+        Memoized: asked per execute."""
+        if self._lse_stride is None:
+            return None
+        cached = getattr(self, "_thd_padded_lse_order_cached", ())
+        if cached != ():
+            return cached
+        shape = (self.batch_size, self.h_q, self.s_q_max, 1)
+        st = (*self._lse_stride, 1)
+        axes = sorted(range(4), key=lambda i: (st[i], -i))  # fastest axis first
+        expect, acc = [0] * 4, 1
+        for i in axes:
+            expect[i] = acc
+            acc *= shape[i]
+        compact = all(shape[i] == 1 or expect[i] == st[i] for i in range(4))
+        self._thd_padded_lse_order_cached = tuple(axes.index(i) for i in range(4)) if compact else None
+        return self._thd_padded_lse_order_cached
+
     def _thd_compile_kwargs(self) -> dict:
         """The THD compile key — PLAN-TIME-ONLY by contract (issue #552).
 
@@ -2119,10 +2158,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return (0, ts, hs, es)
 
         has_lse = self.lse_desc is not None
+        # Dynamic batch / head extents (the kernels read them at run time; only the
+        # fakes pinned them): one artifact per LAYOUT class. A packed declared
+        # stride derives from the dynamic extents and is passed as None; a
+        # padded LSE in a compact order passes that order. Anything else keeps
+        # the static key for that operand.
+        dyn = self._thd_dynamic_bhk()
         kwargs = dict(
-            b=self.batch_size,
-            qh=self.h_q,
-            kh=self.h_kv,
+            b=0 if dyn else self.batch_size,
+            qh=0 if dyn else self.h_q,
+            kh=0 if dyn else self.h_kv,
             # The Stats layout is a per-shape specialization (like d_qk/d_v):
             # has_lse=False compiles the store out; token-major binds the
             # packed rank-2 (T, H) view; head-major carries the caller-declared
@@ -2131,26 +2176,41 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lse_head_major=has_lse and self.thd_stats_head_major,
             lse_head_stride=(self.thd_stats_head_stride if (has_lse and self.thd_stats_head_major) else 0),
             # padded per-batch Stats: the (B, QH, s_max) fake in the declared strides
-            lse_padded_rows=(self.s_q_max if (has_lse and self.thd_stats_padded) else 0),
-            lse_stride=(self._lse_stride if (has_lse and self.thd_stats_padded) else None),
+            lse_padded_rows=((1 if dyn else self.s_q_max) if (has_lse and self.thd_stats_padded) else 0),
+            lse_stride=(self._lse_stride if (has_lse and self.thd_stats_padded and not (dyn and self._thd_padded_lse_order() is not None)) else None),
         )
+        if dyn:
+            kwargs["dynamic_bhk"] = True
+            if has_lse and self.thd_stats_padded and self._thd_padded_lse_order() is not None:
+                kwargs["lse_padded_order"] = self._thd_padded_lse_order()
         if self._fp8:
             # FP8/MXFP8 THD serves only native packed contracts. Flavor
             # selection chooses the exact kernel module, so no stride or
             # head-dim entries are needed in this per-module compile key.
             return kwargs
+
+        def _stride_key(desc):
+            key, packed = self._thd_declared(desc)
+            return None if (dyn and packed) else (0, *key)
+
         kwargs.update(
             d_qk=self.head_dim_qk,
             d_v=self.head_dim_v,
-            q_stride=_key(self.q_desc),
-            # Paged pools bind as declared (strides in the kernel's
-            # [num_pages, page_size, H_kv, D] order); no token-stride key.
-            k_stride=self._paged_pool_stride(self.k_desc) if self.paged else _key(self.k_desc),
-            v_stride=self._paged_pool_stride(self.v_desc) if self.paged else _key(self.v_desc),
-            o_stride=_key(self.o_desc),
+            q_stride=_stride_key(self.q_desc),
+            k_stride=self._paged_pool_stride(self.k_desc) if self.paged else _stride_key(self.k_desc),
+            v_stride=self._paged_pool_stride(self.v_desc) if self.paged else _stride_key(self.v_desc),
+            o_stride=_stride_key(self.o_desc),
         )
         if self.paged:
-            kwargs.update(block_table_stride=self.paged_table_stride, block_table_v_stride=self.paged_table_v_stride)
+            # A compact (max_pages, 1) table derives from the dynamic extents under
+            # dynamic_bhk (max_pages varies per graph; it is the paged path's last
+            # per-shape key); a declared non-compact table keeps its strides.
+            n_pages = -(-int(self.paged_max_seq_len_kv) // int(self.paged_page_size)) if self.paged_max_seq_len_kv else None
+
+            def _table_key(declared):
+                return None if (dyn and declared is not None and n_pages is not None and tuple(declared) == (n_pages, 1)) else declared
+
+            kwargs.update(block_table_stride=_table_key(self.paged_table_stride), block_table_v_stride=_table_key(self.paged_table_v_stride))
         return kwargs
 
     def _thd_unit_envelope(self) -> int:
@@ -2392,7 +2452,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # key (a runtime value the kernel rebuilds symbolically).
         kwargs = self._thd_compile_kwargs()
         if not self.paged:
-            kwargs.update(k_stride=(0, *pack.K.stride()[1:]), v_stride=(0, *pack.V.stride()[1:]))
+            # the bound views' strides; packed ones derive from the dynamic extents
+            # under dynamic_bhk and stay out of the key
+            def _view_key(t, h):
+                st = tuple(int(x) for x in t.stride()[1:])
+                return None if (kwargs.get("dynamic_bhk") and st == (h * t.shape[-1], t.shape[-1], 1)) else (0, *st)
+
+            kwargs.update(k_stride=_view_key(pack.K, self.h_kv), v_stride=_view_key(pack.V, self.h_kv))
         fn = self._k_mod.compile(**kwargs)
         self._seed_padded_lse(LSE, current_stream)
         # Paged pools: the block tables follow the THD length slots in the ABI.
