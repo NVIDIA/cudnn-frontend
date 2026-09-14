@@ -1377,6 +1377,7 @@ def _compute_warp_group(
         kv_unmasked_hi = seqlen_kv // cutlass.Int32(CFG.TILE_N)
         kv_right = seqlen_kv // cutlass.Int32(CFG.TILE_N)
         eff_seqlen_kv = seqlen_kv
+        eff_seqlen_q = seqlen_q  # no mask: the padded S_q is the diagonal's anchor; the helpers still take the value
     else:
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
         eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor)
