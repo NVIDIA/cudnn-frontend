@@ -294,9 +294,9 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                 envelope=False,
             )
 
-            # Two-fold unrolling reduces loop-control issue overhead while
+            # Four-fold unrolling reduces loop-control issue overhead while
             # keeping the fixed-top-k bound dynamic across cached launches.
-            for load_offset in cutlass.range(num_kv_tiles - 1, unroll=2):
+            for load_offset in cutlass.range(num_kv_tiles - 1, unroll=4):
                 # Resolve the next sparse address before waiting for K to be
                 # consumed so the metadata load overlaps the QK work.
                 logical_idx = num_kv_tiles - 2 - load_offset
@@ -408,7 +408,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                 in_mask_steps=False,
                 is_first_kv_tile=True,
             )
-            for compute_offset in cutlass.range(num_kv_tiles - 1, unroll=2):
+            for compute_offset in cutlass.range(num_kv_tiles - 1, unroll=4):
                 logical_idx = num_kv_tiles - 2 - compute_offset
                 self.compute_one_kv_tile(
                     basic_params,

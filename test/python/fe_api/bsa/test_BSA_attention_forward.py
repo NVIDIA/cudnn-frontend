@@ -100,7 +100,7 @@ def test_bsa_attention_forward_sm120_native_blk128():
 
 @pytest.mark.L0
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-@pytest.mark.parametrize("block_sparse_num", (1, 2, 3))
+@pytest.mark.parametrize("block_sparse_num", (1, 2, 3, 4, 5))
 @torch_fork_set_rng(seed=20)
 def test_bsa_attention_forward_sm120_fa4_blk128_fixed_topk(dtype, block_sparse_num):
     if not torch.cuda.is_available():
@@ -111,15 +111,15 @@ def test_bsa_attention_forward_sm120_fa4_blk128_fixed_topk(dtype, block_sparse_n
 
     BSA = _import_bsa()
     block_size = 128
-    batch, q_heads, kv_heads, seqlen_q, seqlen_k, dim = 2, 4, 2, block_size + 1, 4 * block_size, 128
+    batch, q_heads, kv_heads, seqlen_q, seqlen_k, dim = 2, 4, 2, block_size + 1, 6 * block_size, 128
     q = torch.randn((batch, q_heads, seqlen_q, dim), device="cuda", dtype=dtype)
     k = torch.randn((batch, kv_heads, seqlen_k, dim), device="cuda", dtype=dtype)
     v = torch.randn_like(k)
 
     q_block = torch.arange(2, device="cuda", dtype=torch.int32).view(1, 1, 2, 1)
     batch_head = torch.arange(batch * q_heads, device="cuda", dtype=torch.int32).view(batch, q_heads, 1, 1)
-    slots = torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32).view(1, 1, 1, 3)
-    q2k = ((q_block + batch_head + slots) % 4).contiguous()
+    slots = torch.tensor([0, 2, 3, 5, 1], device="cuda", dtype=torch.int32).view(1, 1, 1, 5)
+    q2k = ((q_block + batch_head + slots) % 6).contiguous()
 
     result = BSA.block_sparse_attention_forward(
         q,
@@ -129,7 +129,7 @@ def test_bsa_attention_forward_sm120_fa4_blk128_fixed_topk(dtype, block_sparse_n
         block_sparse_num=block_sparse_num,
         sparse_block_size=block_size,
     )
-    block_sizes = torch.full((4,), block_size, device="cuda", dtype=torch.int32)
+    block_sizes = torch.full((6,), block_size, device="cuda", dtype=torch.int32)
     mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
     o_ref, lse_ref = attention_reference(q, k, v, mask)
     torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)

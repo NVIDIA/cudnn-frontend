@@ -22,7 +22,7 @@ Screening uses 10 warmup pairs and 31 timed pairs; it is not final acceptance.
 | Delay denominator thread-quad sum until epilogue | 0.9904x | Reject |
 | FTZ maximum reduction | 1.0001x | No demonstrated benefit |
 | Four independent softmax partial sums | 1.0000x | No demonstrated benefit |
-| Four-fold main-loop unroll | 1.0045x | Insufficient; needs repeatability check |
+| Four-fold main-loop unroll | 1.0045x | Small validated gain; see checkpoint below |
 | Eight-fold main-loop unroll | 0.9981x | Reject |
 | Stagger the initial QK of the two compute warp groups | 0.9998x | No demonstrated benefit |
 | Fifth-degree FP32 exp2 polynomial on 25% / 50% / 100% of pairs | 0.9795x / 0.9588x / 0.9181x | Reject |
@@ -37,6 +37,11 @@ Screening uses 10 warmup pairs and 31 timed pairs; it is not final acceptance.
 | Compute register budget 224 / 232 instead of 240 | 0.9789x / 0.9901x | Reject |
 | Native NVVM MMA intrinsic instead of inline PTX MMA | 1.0004x | No demonstrated benefit |
 | Normalize two selected blk128 blocks together | 0.7550x | Reject |
+| Two-block normalization, half Q staged in SMEM | 0.8570x | Reject |
+| Two-block normalization, O staged in SMEM | 0.7001x | Reject |
+| QK D-outer loop / groups of two / groups of four column pairs | 1.0010x / 1.0010x / 1.0005x | No demonstrated benefit |
+| Head-interleaved CTA work | 0.9345x | Reject |
+| 64-byte / 32-byte K/V TMA swizzle | 0.9926x / 0.9810x | Reject |
 
 Except for the initial denominator-only experiment, the candidates above
 passed BF16 FP32-reference tests with top-k counts 1, 2, 3, and 223, partial Q
@@ -57,10 +62,48 @@ stack/local memory. Their static register reservation is 168 per thread;
 compute warps dynamically request 240 via register donation. The static
 reservation is not the compute warp's register limit.
 
-**The additional 5% target has not been achieved in this screening.** None of
-these experiments replaces the committed kernel. Experimental sources,
+The joint-two-block candidate reports a 208-byte stack with local load/store
+instructions. Staging O in shared memory reduced that stack to 96 bytes but
+did not recover performance. Another internal-Q64/full-K128 prototype reused
+one shared buffer for K and V to allow two resident CTAs. Although its small
+reference tests passed, one full-size comparison exceeded the output tolerance
+(two elements); a repeat did not reproduce that failure. It is rejected
+without an accuracy or performance claim.
+
+**The additional 5% target has not been achieved in this screening.** Only the
+four-fold-unroll checkpoint below is adopted. Other experimental sources,
 tests, and profiles remain in the local ignored agent workspace; no
 infrastructure addresses, GPU identifiers, or host names are recorded here.
+
+## Four-fold-unroll checkpoint
+
+Both producer and compute loops now use four-fold instead of two-fold
+dynamic unrolling. The sparse traversal, MMA arithmetic, BF16 storage, and
+physical K/V block size are unchanged. The top-k count stays a runtime value;
+there is no external blk64 expansion or quantization.
+
+The reusable paired harness measured the following with 101 timed pairs and
+10 warmup pairs per case, using the same device and seed as the control.
+
+| Density | Pattern | Baseline `9869b9b6` | Four-fold unroll | Ratio |
+| ---: | --- | ---: | ---: | ---: |
+| 14.9776% | strided | 31.4372 ms | 31.3286 ms | 1.0035x |
+| 14.9776% | local | 31.6646 ms | 31.5479 ms | 1.0037x |
+| 20.0000% | strided | 43.0268 ms | 42.8518 ms | 1.0041x |
+| 20.0000% | local | 45.2612 ms | 45.1096 ms | 1.0034x |
+
+Two other independent 101-pair runs were positive in all four cases, spanning
+1.0018x–1.0043x. One of those runs checked the **entire O and LSE tensors**
+bit-for-bit against the saved baseline for all four cases and passed. This is
+distinct from the sampled FP32-reference checks in the public paired harness.
+The FP16/BF16 unit tests now exercise top-k counts 1–5, covering all four-way
+loop tails and one complete unrolled group, with partial Q, GQA, and
+noncontiguous selected KV blocks.
+The related BSA forward and paired-harness regression run passed 24 tests;
+nine tests for unsupported configurations were skipped on this device.
+
+These measurements justify a small checkpoint, not a 5% success claim. All
+four cases still fail the 1.05x acceptance gate.
 
 ## Paired-harness control
 
