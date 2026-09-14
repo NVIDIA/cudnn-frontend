@@ -343,7 +343,7 @@ def test_sm107_rows_serve_natural_scheduling_only():
 
     lpt_l2_flavors = {
         "sdpa_fwd_prefill_sm107": set(),
-        "sdpa_fwd_prefill_sm107_fp8": {(192, 128)},
+        "sdpa_fwd_prefill_sm107_fp8": {(128, 128), (192, 128)},
         "sdpa_fwd_prefill_sm107_mxfp8": {(128, 128), (192, 128)},
     }
     for row, l2_shapes in lpt_l2_flavors.items():
@@ -375,10 +375,10 @@ def test_sched_points_falls_back_along_the_preference_order():
     points = heuristics._sched_points(rubin_fp8, facts)
     assert len(points) == len(set(points)), points
     assert SCHED_LPT_L2 not in rubin_fp8.sched_policies
-    # d128 FP8 has a single-element domain (LPT is claimed at (256, 256) only):
-    # the ranking must still be that one element, never a NATURAL fallback
-    # bolted on beside it.
-    assert points == [SCHED_NATURAL], points
+    # d128 FP8 claims {NATURAL, LPT, LPT_L2} (2026-09-14).  These facts have
+    # h_q == h_kv (no GQA) and a tiny grid, so the Rubin rule leads with LPT
+    # and keeps both other policies as autotune runners.
+    assert points == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], points
 
     # The per-flavor claim must REACH the ranking: at (256, 256) the FP8 row's
     # effective domain is {NATURAL, LPT}, the causal primary (LPT_L2) is out of
@@ -388,21 +388,26 @@ def test_sched_points_falls_back_along_the_preference_order():
     facts256 = facts.__class__(**{**facts.__dict__, "d_qk": 256, "d_v": 256})
     assert heuristics._sched_points(rubin_fp8, facts256) == [SCHED_LPT, SCHED_NATURAL]
 
-    # (192, 128) FP8 threads the LPT_L2 decode inputs and claims LPT_L2, so the
-    # causal primary IS in domain: the ranking leads with it and keeps both
-    # fallbacks as autotune runners.  A mask-free graph gains nothing from
-    # either remap, so dense ranks NATURAL alone.
+    # (192, 128) FP8 claims LPT_L2 too.  Without GQA the Rubin rule still leads
+    # with LPT on this few-wave grid; give the KV heads Q heads to share and
+    # the causal primary becomes LPT_L2, which IS in domain now, so the ranking
+    # leads with it and keeps both fallbacks as autotune runners.  A mask-free
+    # graph gains nothing from either remap: NATURAL alone.
     facts192 = facts.__class__(**{**facts.__dict__, "d_qk": 192, "d_v": 128})
-    assert heuristics._sched_points(rubin_fp8, facts192) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    assert heuristics._sched_points(rubin_fp8, facts192) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
+    gqa192 = facts.__class__(**{**facts192.__dict__, "h_kv": 2})
+    assert heuristics._sched_points(rubin_fp8, gqa192) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
     dense192 = facts.__class__(**{**facts192.__dict__, "causal": False})
     assert heuristics._sched_points(rubin_fp8, dense192) == [SCHED_NATURAL]
 
     # ...and the multi-element case, which is the branch the single-element
-    # shortcut above skips: with a causal primary (LPT_L2) OUT of domain, the
-    # fallback must walk the preference order rather than dropping straight to
-    # NATURAL -- the bug this function was fixed for.
-    widened = dataclasses.replace(rubin_fp8, sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT}))
-    widened_points = heuristics._sched_points(widened, facts)
+    # shortcut above skips: with a causal primary (LPT_L2, a GQA graph) OUT of
+    # a {NATURAL, LPT} domain, the fallback must walk the preference order
+    # rather than dropping straight to NATURAL -- the bug this function was
+    # fixed for.  The per-shape claims are cleared so the row-wide domain is
+    # the one in force.
+    widened = dataclasses.replace(rubin_fp8, sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT}), sched_policies_by_d_shape=())
+    widened_points = heuristics._sched_points(widened, facts.__class__(**{**facts.__dict__, "h_kv": 2}))
     assert widened_points[0] == SCHED_LPT, widened_points
     assert set(widened_points) == {SCHED_NATURAL, SCHED_LPT}, widened_points
     assert len(widened_points) == len(set(widened_points)), widened_points
@@ -648,13 +653,12 @@ def test_sm107_advertises_lpt_only_for_the_validated_d_shape():
 
 
 def test_sm107_fp8_advertises_lpt_only_for_the_validated_d_shape():
-    """The FP8 twin of the f16 test above: (256, 256) and (192, 128) serve LPT
-    (validated 2026-09-11 through the standalone adapter, bit-identical to
-    NATURAL -- see the row's comment); d128 and d512 do not; the row-wide floor
-    stays NATURAL.  LPT_L2 needs qh_per_kh / seqlen_kv at every decode call
-    site: the d128 and d192x128 kernels thread them, (192, 128) is validated
-    bit-identical under LPT_L2 and claims it (2026-09-14); d128 waits with its
-    LPT claim; d256 / d512 pass neither argument."""
+    """The FP8 twin of the f16 test above: (256, 256), (192, 128) and -- since
+    2026-09-14 -- (128, 128) serve LPT (validated through the standalone
+    adapter, bit-identical to NATURAL -- see the row's comment); d512 does
+    not; the row-wide floor stays NATURAL.  LPT_L2 needs qh_per_kh / seqlen_kv
+    at every decode call site: the d128 and d192x128 kernels thread them and
+    both claim it; d256 / d512 pass neither argument."""
     import cudnn
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa.fwd import engines
@@ -662,20 +666,20 @@ def test_sm107_fp8_advertises_lpt_only_for_the_validated_d_shape():
     caps = _caps("sdpa_fwd_prefill_sm107_fp8")
     assert caps.sched_policies == frozenset({SCHED_NATURAL}), "the row-wide floor must stay NATURAL"
     fp8 = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True)
-    for shape in ((256, 256), (192, 128)):
+    for shape in ((256, 256), (192, 128), (128, 128)):
         assert SCHED_LPT in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
-    for shape in ((128, 128), (512, 512)):
-        assert SCHED_LPT not in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
-    assert SCHED_LPT_L2 in engines.effective_sched_policies(caps, _f16_facts(d_qk=192, d_v=128, **fp8))
-    for shape in ((128, 128), (256, 256), (512, 512)):
+    assert SCHED_LPT not in engines.effective_sched_policies(caps, _f16_facts(d_qk=512, d_v=512, **fp8))
+    for shape in ((192, 128), (128, 128)):
+        assert SCHED_LPT_L2 in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
+    for shape in ((256, 256), (512, 512)):
         assert SCHED_LPT_L2 not in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
 
 
 @pytest.mark.L0
 def test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape():
-    """Requesting LPT on the FP8 row: ACCEPTED at d256 and d192xd128, DECLINED
-    (typed, naming the knob) at d128 and d512; LPT_L2: ACCEPTED at d192xd128
-    only -- never silently downgraded (engine contract, Rule 4)."""
+    """Requesting LPT on the FP8 row: ACCEPTED at d256, d192xd128 and d128,
+    DECLINED (typed, naming the knob) at d512; LPT_L2: ACCEPTED at d192xd128
+    and d128 only -- never silently downgraded (engine contract, Rule 4)."""
     import cudnn
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2
     from cudnn.sdpa.fwd import engines
@@ -683,13 +687,13 @@ def test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape():
 
     caps = _caps("sdpa_fwd_prefill_sm107_fp8")
     fp8 = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True)
-    for shape in ((256, 256), (192, 128)):
+    for shape in ((256, 256), (192, 128), (128, 128)):
         assert engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None, shape
-    for shape in ((128, 128), (512, 512)):
-        why = engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT))
-        assert why is not None and "sched_policy" in why, shape
-    assert engines.mismatch(caps, _f16_facts(d_qk=192, d_v=128, **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT_L2)) is None
-    for shape in ((128, 128), (256, 256), (512, 512)):
+    why = engines.mismatch(caps, _f16_facts(d_qk=512, d_v=512, **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT))
+    assert why is not None and "sched_policy" in why
+    for shape in ((192, 128), (128, 128)):
+        assert engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT_L2)) is None, shape
+    for shape in ((256, 256), (512, 512)):
         why = engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT_L2))
         assert why is not None and "sched_policy" in why, shape
 
@@ -802,8 +806,9 @@ def _mxfp8_facts(**kw):
 def test_sm107_mxfp8_advertises_lpt_and_lpt_l2_per_d_shape():
     """INVERTED 2026-09-14 (the row was NATURAL-only): d128 and d192x128 claim
     LPT and LPT_L2, d256 and d512 do not, the row-wide floor stays NATURAL --
-    and the claim REACHES the ranking (causal leads with LPT_L2, dense stays
-    NATURAL).  An accept AND a reject per shape (engine contract, Rule 9)."""
+    and the claim REACHES the ranking: a causal GQA graph leads with LPT_L2, a
+    causal graph without GQA on a few-wave grid leads with LPT, dense stays
+    NATURAL.  An accept AND a reject per shape (engine contract, Rule 9)."""
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa.fwd import engines, heuristics
 
@@ -812,7 +817,8 @@ def test_sm107_mxfp8_advertises_lpt_and_lpt_l2_per_d_shape():
     for shape in ((128, 128), (192, 128)):
         dom = engines.effective_sched_policies(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1]))
         assert dom == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}), (shape, dom)
-        assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1], causal=True)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], shape
+        assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1], causal=True, h_kv=2)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], shape
+        assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1], causal=True)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], shape
         assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1])) == [SCHED_NATURAL], shape
     for shape in ((256, 256), (512, 512)):
         dom = engines.effective_sched_policies(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1]))
@@ -906,3 +912,33 @@ def test_mxfp8_sched_policies_are_bit_identical_to_natural(d_qk, d_v, causal, b,
                 outs[pol], outs[SCHED_NATURAL]
             ), f"policy {pol}: O must be bit-identical to NATURAL -- a different tile walk, the same per-tile math"
             assert torch.equal(lses[pol], lses[SCHED_NATURAL]), f"policy {pol}: LSE must be bit-identical to NATURAL"
+
+
+@pytest.mark.L0
+def test_sm107_causal_ranking_picks_the_policy_by_gqa_and_wave_count():
+    """The Rubin causal rule (heuristics._sched_points, 2026-09-14), pinned on
+    the two charted layouts.  Perf node, kernel-level, vs NATURAL:
+    DSv3 d192x128 H128 (no GQA) -- LPT_L2 -9.7 % at S=2K, LPT +16 % at S=4K,
+    LPT -6.5 / -13 / -7.9 % at S=8K/16K/32K, LPT_L2 within 1 % there; Llama
+    d128 H64/8 (GQA) -- LPT_L2 +4.2..+7.6 % at every S.  So: without GQA
+    LPT_L2 has nothing to group and is never proposed first; LPT leads while
+    the grid is at most 24 waves of 2-CTA clusters and NATURAL beyond; with
+    GQA the L2-budget rule (LPT_L2) stands.  SM100 keeps its own rule."""
+    import cudnn
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+    from cudnn.sdpa.fwd import heuristics
+
+    fp8 = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True, causal=True, b=1)
+    rubin = _caps("sdpa_fwd_prefill_sm107_fp8")
+    dsv3 = dict(h_q=128, h_kv=128, d_qk=192, d_v=128, **fp8)
+    # 1 x 128 heads x 8 q-clusters / 106 clusters = 9.7 waves -> LPT; 19 waves at S=4K -> LPT; 39 waves at S=8K -> NATURAL.
+    assert heuristics._sched_points(rubin, _f16_facts(s_q=2048, s_kv=2048, **dsv3)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
+    assert heuristics._sched_points(rubin, _f16_facts(s_q=4096, s_kv=4096, **dsv3)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
+    for s in (8192, 16384, 32768):
+        assert heuristics._sched_points(rubin, _f16_facts(s_q=s, s_kv=s, **dsv3)) == [SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2], s
+    llama = dict(h_q=64, h_kv=8, d_qk=128, d_v=128, **fp8)
+    for s in (2048, 8192, 32768):
+        assert heuristics._sched_points(rubin, _f16_facts(s_q=s, s_kv=s, **llama)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], s
+    # The SM100 row is untouched by the Rubin rule: the L2-budget primary stays.
+    sm100 = _caps("sdpa_fwd_prefill_sm100_fp8")
+    assert heuristics._sched_points(sm100, _f16_facts(s_q=2048, s_kv=2048, device_cc=(10, 0), **dsv3)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]

@@ -1068,22 +1068,34 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # tile's KV loop is unchanged), sentinel 0, two-launch 0.  Perf node,
             # d256 causal H32/2, LPT vs NATURAL launch-interleaved: +5.2/+5.9/
             # +5.6/+2.0/+2.3 % at S=2K..32K (control pair within 1.9 %).
-            # (192, 128) serves SCHED_LPT_L2 as well (2026-09-14): O and LSE
-            # under LPT_L2 are bit-identical to NATURAL on the same inputs
-            # (dense and causal, sentinel 0).  Heuristics rank LPT_L2 first for
-            # every causal graph whose per-head K+V fits the L2 budget -- which
-            # is every charted shape -- and plain LPT is the autotune runner:
-            # on the perf node LPT loses at many-wave causal shapes (d192x128
-            # H128, S=8K/16K: -6.5 % / -13 % vs NATURAL) where LPT_L2 does not.
-            # NOT claimed: (128, 128) -- also bit-identical, but its causal path
-            # sits at 0.041-0.048 vs the suite's 0.04 under NATURAL too, so it
-            # gets its own look first; (512, 512) -- the cga4x1 role-split kernel
+            # (192, 128) and (128, 128) serve SCHED_LPT_L2 as well (2026-09-14):
+            # O and LSE under LPT_L2 are bit-identical to NATURAL on the same
+            # inputs (dense and causal, sentinel 0).  (128, 128) joins the LPT
+            # claim at the same time: bit-identical too, and the 0.041-0.048
+            # its e5m2 causal path reads against the suite's 0.04 comes out of
+            # the same bits under every policy, so it is not a scheduler
+            # question.  Perf node, kernel-level d128 H64/8 causal vs NATURAL:
+            # LPT_L2 +4.2/+7.6/+7.0/+5.9/+5.4 %, LPT +5.3/+5.8/+4.2/+2.0/+1.1 %
+            # at S=2K..32K.  What heuristics PROPOSE depends on GQA
+            # (heuristics._sched_points): with K/V heads shared across Q heads
+            # LPT_L2 leads; with h_q == h_kv (the DSv3 layout) it has nothing to
+            # group and measured -9.7 % at S=2K (d192x128 H128), so the Rubin
+            # rule picks LPT at few waves (+16 % at S=4K) and NATURAL at many
+            # (LPT -6.5 / -13 / -7.9 % at S=8K/16K/32K).  Every policy in the
+            # domain stays an autotune runner.
+            # NOT claimed: (512, 512) -- the cga4x1 role-split kernel
             # still calls make_sdpa_helpers(CFG) WITHOUT lpt_q_tiles_in_cga_units
             # (the #1001 bug, left on the d512 line), so under LPT it writes
             # NOTHING (sentinel on 100 % of cells; the old "NaN" report was that
             # unwritten output being read).
             sched_policies_by_d_shape=(
-                (((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})), ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}))) if rubin_row else ()
+                (
+                    ((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),
+                    ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+                    ((128, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+                )
+                if rubin_row
+                else ()
             ),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),

@@ -116,10 +116,11 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     assert sm100.split_kv_supported is True
     # The Rubin ROW-WIDE floor is NATURAL, and every LPT variant is claimed PER
     # FLAVOR through `sched_policies_by_d_shape`: plain LPT at (256, 256) and
-    # (192, 128) since 2026-09-11, LPT_L2 at (192, 128) since 2026-09-14 (its
-    # decode needs qh_per_kh / seqlen_kv at every call site, which the d128 and
-    # d192x128 kernels thread and the d256 / d512 kernels do not) -- each
-    # validated bit-identical to NATURAL; d512 stays out (its role-split kernel
+    # (192, 128) since 2026-09-11, LPT + LPT_L2 at (192, 128) and (128, 128)
+    # since 2026-09-14 (LPT_L2's decode needs qh_per_kh / seqlen_kv at every
+    # call site, which the d128 and d192x128 kernels thread and the d256 /
+    # d512 kernels do not) -- each validated bit-identical to NATURAL; d512
+    # stays out (its role-split kernel
     # still lacks the #1001 `lpt_q_tiles_in_cga_units` argument and writes
     # nothing under LPT, which is what the old "causal d512 FP8 under LPT
     # returns NaN" report was).
@@ -127,6 +128,7 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     assert dict(sm107.sched_policies_by_d_shape) == {
         (256, 256): frozenset({SCHED_NATURAL, SCHED_LPT}),
         (192, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+        (128, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
     }
     assert sm100.sched_policies_by_d_shape == ()
     assert sm100.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
@@ -135,14 +137,15 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     assert sm100.thd and sm107.thd and sm100.cu_seq_len and sm107.cu_seq_len
 
 
-def test_sm107_row_ranks_natural_only_for_causal():
-    """The LPT/LPT_L2 remap (issue #653) is an SM100-row property.  A causal
-    per-tensor FP8 graph ranks [LPT_L2, LPT, NATURAL] there.  On the Rubin row
-    the d128 FLAVOR's effective domain is the row-wide floor, {NATURAL} (LPT is
-    claimed per flavor, at (256, 256) and (192, 128) only), so ranking must
-    offer exactly [NATURAL] there and never bolt a fallback on beside it.  The
-    d256 ranking is pinned in test_sdpa_fwd_dsl_sm107.py.  Pure -- facts pin
-    the device, and nothing here compiles."""
+def test_sm107_row_ranks_lpt_first_for_a_few_wave_causal_grid():
+    """A causal per-tensor FP8 graph ranks [LPT_L2, LPT, NATURAL] on the SM100
+    row (the L2-budget rule).  The Rubin d128 flavor claims the same three
+    policies since 2026-09-14, but these facts have h_q == h_kv -- no K/V
+    sharing for LPT_L2 to group -- and a 1.2-wave grid, so the Rubin rule leads
+    with plain LPT and keeps the other two as autotune runners (measured on the
+    perf node: see heuristics._sched_points).  The d256 ranking is pinned in
+    test_sdpa_fwd_dsl_sm107.py.  Pure -- facts pin the device, and nothing
+    here compiles."""
     import cudnn as _c
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa import graph_analyzer as ga
@@ -169,21 +172,18 @@ def test_sm107_row_ranks_natural_only_for_causal():
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
     # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, far inside the L2 budget
-    # the remap groups against, so the L2 variant leads on BOTH rows. Before
-    # the port the Rubin row had a one-element domain and took _sched_points'
-    # sole-element shortcut, which is what pinned it to NATURAL.
-    # INVERTED: the Rubin row dropped SCHED_LPT_L2 (its ported kernels raise on
-    # the L2 decode), so heuristics ranks LPT first there while the SM100 twin
-    # still leads with LPT_L2.  A proposal outside the row's domain would be a
-    # heuristics bug, so the ranking must not offer it at all.
-    # The Rubin row's domain is now a single element, so ranking has one point.
-    assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_NATURAL]
+    # the SM100 rule groups against, so LPT_L2 leads there.  The Rubin row's
+    # d128 domain is {NATURAL, LPT, LPT_L2} too, but h_q == h_kv: LPT_L2 has
+    # nothing to group, and 1 x 8 x 16 tiles over 106 clusters is 1.2 waves,
+    # so the Rubin rule leads with LPT.  Both rows keep every domain member in
+    # the ranking (autotune), and neither proposes anything outside it.
+    assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
     assert heuristics._sched_points(sm100, facts((10, 0))) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
 
-    # The d128 LPT specialization template-LOADS (the decode is correct since
-    # #1001 and bit-identical to NATURAL); the ROW withholds the claim until the
-    # d128 causal path clears the suite tolerance under NATURAL too.
+    # Both d128 remap specializations template-LOAD (the decode is correct
+    # since #1001 and bit-identical to NATURAL -- the Rubin e2e below).
     assert _load(rubin=True, sched_policy=SCHED_LPT).CFG.SCHEDULER_POLICY == SCHED_LPT
+    assert _load(rubin=True, sched_policy=SCHED_LPT_L2).CFG.SCHEDULER_POLICY == SCHED_LPT_L2
 
 
 def test_softmax_half_declines_by_row_domain():
@@ -589,12 +589,12 @@ def test_sm107_split_matches_unsplit_on_rubin():
 
 
 @requires_dsl
-@pytest.mark.parametrize("d_qk, d_v", [(256, 256), (192, 128)])
+@pytest.mark.parametrize("d_qk, d_v", [(256, 256), (192, 128), (128, 128)])
 @pytest.mark.parametrize("causal, b, s", [(True, 2, 1000), (False, 1, 1024)])
 def test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors(d_qk, d_v, causal, b, s):
-    """Rubin e2e for the FP8 (256, 256) and (192, 128) scheduler claims: the
-    same quantized problem under EVERY policy the row claims for the flavor
-    (LPT on both; LPT_L2 on (192, 128) as well since 2026-09-14) and under
+    """Rubin e2e for the FP8 (256, 256), (192, 128) and (128, 128) scheduler
+    claims: the same quantized problem under EVERY policy the row claims for
+    the flavor (LPT on all three; LPT_L2 on (192, 128) and (128, 128)) and under
     SCHED_NATURAL.  The scheduler only reorders whole (batch, head, q-tile)
     work items -- each tile's KV loop is unchanged -- so O must be
     BIT-IDENTICAL across the policies (measured 0.0 on every case), and all

@@ -1631,7 +1631,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # MXFP8 kernels honour (the f16, d256 and d512 call sites do not
             # pass its qh_per_kh / seqlen_kv inputs), and every LPT variant is
             # claimed PER FLAVOR on the SM107 rows (`sched_policies_by_d_shape`:
-            # f16 (256, 256) LPT; FP8 (256, 256) LPT, (192, 128) LPT + LPT_L2;
+            # f16 (256, 256) LPT; FP8 (256, 256) LPT, (128, 128) and (192, 128)
+            # LPT + LPT_L2;
             # MXFP8 (128, 128) and (192, 128) LPT + LPT_L2 -- each validated
             # bit-identical to NATURAL), not row-wide: the d512 role-split
             # kernels still lack the

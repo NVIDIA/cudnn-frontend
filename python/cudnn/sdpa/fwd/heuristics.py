@@ -87,6 +87,15 @@ _MAX_SETS_PER_ENGINE = 6
 # LPT_L2's block-cyclic head grouping only pays when ONE head's K+V working set
 # can actually stay L2-resident.
 _SM100_L2_BUDGET_BYTES = 50 * 1024 * 1024
+# Rubin, causal, NO GQA (h_q == h_kv): the LPT-vs-NATURAL crossover in grid WAVES
+# (work items per persistent 2-CTA cluster).  Perf node, kernel-level, d192x128
+# FP8 H128 causal, NATURAL = 1.00: LPT 1.00 / 1.16 / 0.93 / 0.87 / 0.92 and
+# LPT_L2 0.90 / - / 1.00 / - / 0.99 at S = 2K / 4K / 8K / 16K / 32K, i.e. LPT
+# pays at 10-19 waves and costs from 39 waves on, LPT_L2 never pays there.
+# 256 = the 2-CTA flavors' q rows per cluster; 106 clusters = the 212-SM part / 2.
+_SM107_CGA_Q_ROWS = 256
+_SM107_CLUSTERS = 106
+_SM107_NO_GQA_LPT_MAX_WAVES = 24
 
 # The SM80 kernels' L2 grouping budget is a per-flavor MiB table fed to the
 # template (sched_l2_mib); the adapter owns that table. For POINT ORDERING all
@@ -393,6 +402,16 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # has nothing to protect in L2 and its row order only costs; the plain
         # heads-fastest LPT walk is the faster one for packed and unpacked units.
         primary = SCHED_LPT
+    elif causal_ish and caps.sm_lo >= 107 and int(facts.h_q) == int(facts.h_kv):
+        # Rubin without GQA: every KV head is read by exactly one Q head, so
+        # LPT_L2 has no K/V sharing to group -- and it is not free (-10 % at
+        # S=2K, see the constants above).  Plain LPT balances the triangle
+        # while the grid is a few waves and costs at many, so choose by wave
+        # count.  GQA shapes keep the L2 rule below (llama d128 H64/8 on the
+        # same node: LPT_L2 +4..8 % over NATURAL at every S).  Rubin only until
+        # the SM100 line is measured the same way.
+        waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / _SM107_CLUSTERS
+        primary = SCHED_LPT if waves <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
         # whether one head's K+V working set fits the L2 budget.
@@ -402,8 +421,9 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     else:
         primary = SCHED_NATURAL
     order = {SCHED_LPT_L2: (SCHED_LPT, SCHED_NATURAL), SCHED_LPT: (SCHED_LPT_L2, SCHED_NATURAL), SCHED_NATURAL: (SCHED_LPT, SCHED_LPT_L2)}
-    # The primary may be outside a row's DOMAIN (the SM107 rows do not carry
-    # SCHED_LPT_L2 — their kernels raise on the L2 decode).  Fall back along the
+    # The primary may be outside a row's DOMAIN (the SM107 f16 rows and the
+    # d256 / d512 flavors carry no SCHED_LPT_L2 -- their kernels do not thread
+    # its decode inputs).  Fall back along the
     # SAME preference order rather than to NATURAL: dropping straight to NATURAL
     # cost a causal Rubin FP8 graph the LPT load-balancing win, and listed
     # NATURAL twice ([0, 1, 0]), burning an autotune slot on a duplicate plan.
