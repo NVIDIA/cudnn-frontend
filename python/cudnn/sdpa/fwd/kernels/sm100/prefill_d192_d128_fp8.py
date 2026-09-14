@@ -425,8 +425,8 @@ def _swa_segment_bounds(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair):
         eff_seqlen_q,
         eff_seqlen_kv,
         cta_in_pair,
-        seq_q_lens_tensor,
-        batch_idx,
+        None,  # THD-only predecode segment: no dense Q lengths in scope (SEQ_Q_LENS_PRESENT is dense-only)
+        None,
         cutlass.Int32(0),
         CFG.QH_PER_KH,
     )
