@@ -1165,7 +1165,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # never read -- every sequence base comes from the ragged offsets and
         # the batch axis is bound at extent 1 -- so it is not gated (same rule
         # as graph_analyzer.packed_layout_ok, which the engine gate applies).
-        from cudnn.sdpa.graph_analyzer import dense_layout_ok, packed_layout_ok
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok, packed_layout_ok, thd_stats_packing
 
         for desc_name in ["q_desc", "k_desc", "v_desc", "o_desc"]:
             d = getattr(self, desc_name)
@@ -1285,10 +1285,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self._lse_stride = tuple(int(stride) for stride in self.lse_desc.stride)
             elif self.thd:
                 stride_h, stride_s = tuple(self.lse_desc.stride[1:])
-                token_major = (stride_h, stride_s) == (1, h_qo)
-                head_major = not token_major and stride_s == 1 and stride_h >= 1
+                packing = thd_stats_packing(stride_h, stride_s, h_qo)
+                head_major = packing == "head_major"
                 self._value_error_if(
-                    not token_major and not head_major,
+                    packing is None,
                     f"THD LSE must be packed token-major (stride_h == 1, stride_s == H) "
                     f"or head-major (stride_s == 1, stride_h == head_stride); got stride {self.lse_desc.stride}",
                 )
@@ -3208,7 +3208,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # normalization needs is required: head dim innermost-contiguous
         # (stride 1), non-broadcast, non-overlapping strides, any B/H/S
         # order, padded strides allowed.
-        from cudnn.sdpa.graph_analyzer import dense_layout_ok, packed_layout_ok
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok, packed_layout_ok, thd_stats_packing
 
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
             self._value_error_if(
@@ -3259,10 +3259,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 self._lse_stride = tuple(int(stride) for stride in self.lse_desc.stride)
             elif self.thd:
                 stride_h, stride_s = tuple(self.lse_desc.stride[1:])
-                token_major = (stride_h, stride_s) == (1, h_q)
-                head_major = not token_major and stride_s == 1 and stride_h >= 1
+                packing = thd_stats_packing(stride_h, stride_s, h_q)
+                head_major = packing == "head_major"
                 self._value_error_if(
-                    not token_major and not head_major,
+                    packing is None,
                     f"THD LSE must be packed token-major (stride_h == 1, stride_s == H) "
                     f"or head-major (stride_s == 1, stride_h == head_stride); got stride {self.lse_desc.stride}",
                 )
