@@ -197,3 +197,35 @@ skip select a warmed native blk128 invocation. Ignore timing ratios printed
 while the profiler is attached. Run the paired acceptance benchmark separately
 without profiling. Raw profiler reports can contain machine details and must
 not be committed or shared without sanitization.
+
+## Normalization-removal diagnostic
+
+This experiment is **not an attention implementation and is never an
+acceptance candidate**. It replaces probabilities with BF16-rounded raw QK
+scores, retains the complete QK/PV tensor work and sparse traversal, and sets
+the final normalization to one. Separate tests verify this linear-algebra
+result for top-k 1, 2, 3, and 223 and explicitly confirm that it differs from
+attention. No production kernel or attention accuracy check is weakened.
+
+With 101 paired samples per case, against `9869b9b6`:
+
+| Density | Pattern | Attention baseline | Linear diagnostic | Baseline / diagnostic |
+| ---: | --- | ---: | ---: | ---: |
+| 14.9776% | strided | 31.3471 ms | 29.8411 ms | 1.0505x |
+| 14.9776% | local | 31.5826 ms | 30.0435 ms | 1.0512x |
+| 20.0000% | strided | 42.9921 ms | 40.9665 ms | 1.0494x |
+| 20.0000% | local | 46.6794 ms | 43.8664 ms | 1.0641x |
+
+A separate 20% strided Nsight Compute capture counted exactly
+4,073,799,680 warp-level tensor instructions, matching
+`1115 Q blocks * 8 heads * 8 compute warps * 223 KV blocks * 256 MMAs`.
+The QK computation was therefore not dead-code-eliminated. Tensor FP
+utilization was 97.26% in that capture.
+
+This is a directional estimate of normalization overhead for this pipeline,
+not a universal performance bound. Removing normalization also changes
+register allocation, scheduling, operand values, and potentially clocks.
+In particular, the diagnostic's approximately 1.05x ratio must **not** be
+reported as achieving the requested attention speedup. It motivates focusing
+on overlapping normalization with tensor work rather than expecting small
+softmax instruction rewrites alone to deliver another 5%.
