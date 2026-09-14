@@ -40,11 +40,11 @@ USE_PDL = True
 
 @cute.kernel
 def frost_gdn2_chain_prologue(
-    pieces: cutlass.Constexpr[int],
+    pieces: cutlass.Int32,
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
-    heads_out: cutlass.Constexpr[int],
+    heads_out: cutlass.Int32,
     base_q: cutlass.GridConstant[tma.TensorMap],
     base_k: cutlass.GridConstant[tma.TensorMap],
     base_v: cutlass.GridConstant[tma.TensorMap],
@@ -145,7 +145,7 @@ def frost_gdn2_chain_prologue(
             sKey,
             sIdx,
             sSpread,
-            pieces=pieces,
+            chain=True,
             mRowBase=main_rows,
         )
         if cutlass.const_expr(work_items_summary is not None):
@@ -166,7 +166,7 @@ def frost_gdn2_chain_prologue(
                 sKey,
                 sIdx,
                 sSpread,
-                pieces=pieces,
+                chain=True,
                 mRowBase=summary_rows,
                 mSlotRows=main_rows,
             )
@@ -318,11 +318,11 @@ def frost_gdn2_chain_prologue(
 
 @cute.jit
 def chain_prologue(
-    pieces: cutlass.Constexpr[int],
+    pieces: cutlass.Int32,
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
-    heads_out: cutlass.Constexpr[int],
+    heads_out: cutlass.Int32,
     series_span_chunks: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
     cu_seqlens: cute.Tensor,
@@ -569,11 +569,11 @@ def run_chain_prologue(
             series_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         cache["compiled"] = cute.compile(
             chain_prologue,
-            int(pieces),
+            cutlass.Int32(int(pieces)),
             int(unit_chunks),
             int(b_t),
             bool(length_rule),
-            int(heads_out),
+            cutlass.Int32(int(heads_out)),
             cutlass.Int32(series_span_chunks),
             cutlass.Int32(checkpoint_every_n_tokens),
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
@@ -610,9 +610,11 @@ def run_chain_prologue(
             from_dlpack(dw, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dw is not None else None,
             from_dlpack(dbeta, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dbeta is not None else None,
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     cache["compiled"](
+        int(pieces),
+        int(heads_out),
         series_span_chunks,
         checkpoint_every_n_tokens,
         cu_seqlens,

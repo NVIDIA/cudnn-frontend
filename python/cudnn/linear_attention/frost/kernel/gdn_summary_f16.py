@@ -748,13 +748,14 @@ def chain_warp_group(
                 if cutlass.const_expr(cfg.use_initial_state):
                     gState_init = mState_init[None, None, head_idx, batch_idx]
                     if seed_state:
+                        seed_vw = 16 // (mState_init.element_type.width // 8)
+                        seed_src = (gState_init.iterator + gState_init.layout((state_gmem_row, 0))).raw_ptr()
                         for i in cutlass.range_constexpr(num_ldtms):
                             words = []
-                            for k in cutlass.range_constexpr(32):
-                                v = gState_init[state_gmem_row, i * ldtm_width + k]
-                                if cutlass.const_expr(cfg.state_dtype != cfg.acc_dtype):
-                                    v = v.to(cfg.acc_dtype)
-                                words.append(v)
+                            for g in cutlass.range_constexpr(ldtm_width // seed_vw):
+                                seed_chunk = (seed_src + i * ldtm_width + g * seed_vw).load(count=seed_vw, alignment=16)
+                                for t in cutlass.range_constexpr(seed_vw):
+                                    words.append(seed_chunk[t].to(cfg.acc_dtype))
                             nvvm.tcgen05_st(
                                 "32x32b",
                                 nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
@@ -930,14 +931,18 @@ def chain_warp_group(
             state_acc_index = advance(state_acc_index, cfg.tmem_state_acc_stages)
             if write_end == batch_num_chunks:
                 gState_out = mState_out[None, None, head_idx, batch_idx]
+                state_vw = 16 // (mState_out.element_type.width // 8)
+                state_dst = (gState_out.iterator + gState_out.layout((state_gmem_row, 0))).raw_ptr()
                 for i in cutlass.range_constexpr(num_ldtms):
                     state_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32), num=32)
-                    for k in cutlass.range_constexpr(32):
-                        val = state_vec[k]
-                        if cutlass.const_expr(cfg.state_dtype != cfg.acc_dtype):
-                            val = val.to(cfg.state_dtype)
-                        if state_row_valid:
-                            gState_out[state_gmem_row, i * ldtm_width + k] = val
+                    if state_row_valid:
+                        for g in cutlass.range_constexpr(ldtm_width // state_vw):
+                            (state_dst + i * ldtm_width + g * state_vw).store(
+                                cutlass.Vector.from_elements(
+                                    tuple(state_vec[g * state_vw + t].to(mState_out.element_type) for t in range(state_vw)), mState_out.element_type
+                                ),
+                                alignment=16,
+                            )
         else:
             if write_end == batch_num_chunks:
                 gState_out = mState_out[None, None, head_idx, batch_idx]
@@ -1725,7 +1730,7 @@ def compile(
         scheduler_counter_cute,
         workspace_cute,
         stream,
-        options="--enable-tvm-ffi --opt-level 3",
+        options="--enable-tvm-ffi --opt-level 2",
     )
 
 
@@ -1832,12 +1837,9 @@ def chunk_gdn_summary_sm100(
 
         state_in_cute = None
         if use_initial_state:
-            state_in_cute = from_dlpack(initial_state, assumed_align=16)
-            state_in_cute.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
-        state_out_cute = from_dlpack(output_state, assumed_align=16)
-        state_out_cute.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
-        transition_out_cute = from_dlpack(output_transition, assumed_align=16)
-        transition_out_cute.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
+            state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        state_out_cute = from_dlpack(output_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        transition_out_cute = from_dlpack(output_transition, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
         workspace_cute = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
 
@@ -1915,7 +1917,7 @@ def chunk_gdn_summary_sm100(
             tinv_placeholder,
             workspace_placeholder,
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
         cache["prologue"](

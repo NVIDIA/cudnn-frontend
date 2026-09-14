@@ -130,6 +130,7 @@ class LaGraphFacts:
     gate_lower_bound: Optional[float] = None
     checkpoint_every_n_tokens: int = 0
     batch_invariant: bool = False
+    overwrite_initial_state: bool = False
     num_householder: int = 1
 
 
@@ -169,6 +170,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     num_householder = params.get("num_householder", 1)
     num_householder = 1 if num_householder is None else int(num_householder)
     batch_invariant = bool(params.get("batch_invariant", False))
+    overwrite_initial_state = bool(params.get("overwrite_initial_state", False))
     invalid = None
     missing_in = [p for p in required_in if p not in ins]
     missing_out = [p for p in required_out if p not in outs]
@@ -204,6 +206,10 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "state_checkpoints output requires checkpoint_every_n_tokens > 0"
     elif is_bwd and checkpoint > 0 and "state_checkpoints" not in ins:
         invalid = "checkpoint_every_n_tokens > 0 on a bwd node requires the state_checkpoints input"
+    elif overwrite_initial_state and not is_bwd and not ("initial_state" in ins and "final_state" in outs):
+        invalid = "overwrite_initial_state requires the initial_state input and the final_state output (one buffer may serve both)"
+    elif overwrite_initial_state and is_bwd and not ("d_final_state" in ins and "d_initial_state" in outs):
+        invalid = "overwrite_initial_state on a bwd node requires the d_final_state input and the d_initial_state output (one buffer may serve both)"
     elif bool(params.get("allow_neg_eigval", False)) and not bool(params.get("use_beta_sigmoid", False)):
         invalid = "allow_neg_eigval requires use_beta_sigmoid=True (the 2x rides on the fused sigmoid)"
     elif num_householder < 1:
@@ -331,5 +337,6 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         gate_lower_bound=float(params["gate_lower_bound"]) if params.get("gate_lower_bound") is not None else None,
         checkpoint_every_n_tokens=checkpoint,
         batch_invariant=batch_invariant,
+        overwrite_initial_state=overwrite_initial_state,
         num_householder=num_householder,
     )

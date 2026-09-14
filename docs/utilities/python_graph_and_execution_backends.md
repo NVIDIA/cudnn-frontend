@@ -439,6 +439,34 @@ are close.
   item yields `H = 0`, `M = I`) and one emitting state chain composes them,
   its tail being `final_state` (in reverse, `d_initial_state`) and its running
   product `transition`.
+- In-place state update. The main ops' `overwrite_initial_state` attribute
+  (fwd and bwd nodes of GDN, KDA, GDN-2 and GDP) lets one buffer serve as
+  `initial_state` and `final_state` (in the backward, as `d_final_state` and
+  `d_initial_state`): the planner keeps the chain and the uncut schedule and
+  never takes the split-K cut, so the CTA that reads a sequence's incoming
+  state (or outgoing gradient) at its first chunk is the one that writes the
+  outgoing state (incoming gradient) at its last, after the read. The chain
+  is safe as well: the state chain consumes the seed (the reverse chain the
+  outgoing gradient) before the seeded main kernel writes the final state
+  (piece 0 the initial-state gradient). The attribute requires the
+  `initial_state` input and the `final_state` output (bwd: `d_final_state`
+  and `d_initial_state`); binding distinct buffers stays allowed. The torch
+  ops expose it on the forward only (`cudnn::<op>_fwd_overwrite_state`, a mutating
+  op without an autograd formula, inference use); autograd never lets a
+  backward mutate an incoming gradient, so the backward alias is a graph-API
+  contract for callers that own their gradient buffers.
+- Pool-addressed state. The main ops' forward nodes take an optional int32
+  `state_indices` input of `[N]` row ids: `initial_state` is then a pool
+  `[N_pool, HO, V, K]` whose row `state_indices[i]` seeds sequence `i`, and
+  `final_state` (the pool itself under `overwrite_initial_state`, or a
+  distinct buffer of the pool's shape) receives that sequence's final state
+  at the same row. The pool may pad its slot stride to any 16-byte multiple,
+  as serving stacks do; each row stays a dense `[HO, V, K]` block. The chain
+  seeds its state chain through the table and the prefill writes through it; the split-K cut stays available when the two
+  buffers are distinct. Forward only, and not combined with
+  `checkpoint_every_n_tokens`. The torch ops route `state_indices` through
+  `cudnn::<op>_fwd_overwrite_state`, so the caller's pool is updated in place
+  and comes back as `final_state`.
 - Context parallelism across devices. The state ops are the per-span
   summaries of a two-tier scheme: every rank summarizes its span at once, the
   ranks exchange the summaries, and every rank runs its span's main op seeded

@@ -2450,7 +2450,7 @@ def chunk_kda_bwd_summary_sm100(
             scheduler_placeholder,
             workspace_placeholder,
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
         cache["prologue"](

@@ -1190,7 +1190,7 @@ def compile(
         rows_cute,
         row_count_cute,
         stream,
-        options="--enable-tvm-ffi --opt-level 3",
+        options="--enable-tvm-ffi --opt-level 2",
     )
 
 

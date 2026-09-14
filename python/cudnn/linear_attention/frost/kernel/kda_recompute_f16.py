@@ -3039,7 +3039,7 @@ def chunk_kda_recompute_sm100(
             cutlass.Int32(checkpoint_every_n_tokens),
             cutlass.Int32((seed_span_tokens or seed_every_n_tokens) // CFG.B_T),
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
         cache["prologue"](

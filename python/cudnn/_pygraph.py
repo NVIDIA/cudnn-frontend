@@ -2849,6 +2849,7 @@ _STRUCTURED_OPS = {
             "safe_gate",
             "gate_domain",
             "batch_invariant",
+            "overwrite_initial_state",
         ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
@@ -2861,7 +2862,17 @@ _STRUCTURED_OPS = {
     "gdn_bwd": dict(
         node_type=NodeType.GDN_BWD,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
-        attrs=("scale", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        attrs=(
+            "scale",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+            "overwrite_initial_state",
+        ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
@@ -2901,7 +2912,7 @@ _STRUCTURED_OPS = {
     ),
     "gdp": dict(
         node_type=NodeType.GDP,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
         attrs=(
             "num_householder",
             "scale",
@@ -2913,6 +2924,7 @@ _STRUCTURED_OPS = {
             "safe_gate",
             "gate_domain",
             "batch_invariant",
+            "overwrite_initial_state",
         ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
@@ -2935,6 +2947,7 @@ _STRUCTURED_OPS = {
             "safe_gate",
             "gate_domain",
             "batch_invariant",
+            "overwrite_initial_state",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -2985,7 +2998,7 @@ _STRUCTURED_OPS = {
     ),
     "kda": dict(
         node_type=NodeType.KDA,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
         attrs=(
             "scale",
             "output_final_state",
@@ -2997,6 +3010,7 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
+            "overwrite_initial_state",
         ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
@@ -3019,6 +3033,7 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
+            "overwrite_initial_state",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3069,7 +3084,7 @@ _STRUCTURED_OPS = {
     ),
     "gdn2": dict(
         node_type=NodeType.GDN2,
-        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
         attrs=(
             "scale",
             "output_final_state",
@@ -3082,6 +3097,7 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
+            "overwrite_initial_state",
         ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
@@ -3105,6 +3121,7 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
+            "overwrite_initial_state",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={

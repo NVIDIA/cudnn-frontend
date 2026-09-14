@@ -1518,11 +1518,18 @@ def compute2_warp_group(
             dstate_acc_index = advance(dstate_acc_index, cfg.tmem_dstate_acc_stages)
             if write_start == 0:
                 gDstate0 = mDstate0_out[None, None, head_idx, batch_idx]
+                dstate0_vw = 16 // (mDstate0_out.element_type.width // 8)
+                dstate0_dst = (gDstate0.iterator + gDstate0.layout((dstate_gmem_row, 0))).raw_ptr()
                 for i in cutlass.range_constexpr(num_ldtms):
                     dstate0_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_dstate_acc_col + i * ldtm_width, cutlass.Float32), num=32)
-                    for kk in cutlass.range_constexpr(32):
-                        if dstate_row_valid:
-                            gDstate0[dstate_gmem_row, i * ldtm_width + kk] = dstate0_vec[kk].to(mDstate0_out.element_type)
+                    if dstate_row_valid:
+                        for g in cutlass.range_constexpr(ldtm_width // dstate0_vw):
+                            (dstate0_dst + i * ldtm_width + g * dstate0_vw).store(
+                                cutlass.Vector.from_elements(
+                                    tuple(dstate0_vec[g * dstate0_vw + t].to(mDstate0_out.element_type) for t in range(dstate0_vw)), mDstate0_out.element_type
+                                ),
+                                alignment=16,
+                            )
             if cutlass.const_expr(not cfg.use_dstate_in):
                 bars.mb_dstate_scale_acc_done[dstate_idx].arrive()
         else:
@@ -2665,7 +2672,7 @@ def chunk_gdn_bwd_summary_sm100(
             tinv_placeholder,
             workspace_placeholder,
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
         cache["prologue"](

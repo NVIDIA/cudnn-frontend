@@ -868,10 +868,14 @@ def compute1_warp_group(
                     seed_row = seed_row + (seed_len + seed_every_n_tokens - cutlass.Int32(1)) // seed_every_n_tokens
                     seed_b = seed_b + cutlass.Int32(1)
                 gSeed = mSeedCheckpoints[None, None, head_idx, seed_row]
+                checkpoint_vw = 16 // (mSeedCheckpoints.element_type.width // 8)
+                checkpoint_src = (gSeed.iterator + gSeed.layout((state_gmem_row, 0))).raw_ptr()
                 for i in cutlass.range_constexpr(num_ldtms):
                     seed_words = []
-                    for seed_kk in cutlass.range_constexpr(32):
-                        seed_words.append(gSeed[state_gmem_row, i * ldtm_width + seed_kk].to(cfg.acc_dtype))
+                    for checkpoint_group in cutlass.range_constexpr(ldtm_width // checkpoint_vw):
+                        checkpoint_chunk = (checkpoint_src + i * ldtm_width + checkpoint_group * checkpoint_vw).load(count=checkpoint_vw, alignment=16)
+                        for checkpoint_elem in cutlass.range_constexpr(checkpoint_vw):
+                            seed_words.append(checkpoint_chunk[checkpoint_elem].to(cfg.acc_dtype))
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
@@ -881,18 +885,20 @@ def compute1_warp_group(
             if cutlass.const_expr(cfg.use_initial_state or cfg.seed_identity):
                 if cutlass.const_expr(cfg.use_initial_state):
                     gState_init = mState_init[None, None, head_idx, batch_idx]
+                    seed_vw = 16 // (mState_init.element_type.width // 8)
+                    seed_src = (gState_init.iterator + gState_init.layout((state_gmem_row, 0))).raw_ptr()
                 seed_state = compute_start == 0
                 if seed_state:
                     for i in cutlass.range_constexpr(num_ldtms):
                         words = []
-                        for k in cutlass.range_constexpr(32):
-                            if cutlass.const_expr(cfg.seed_identity):
-                                v = cutlass.Float32(1.0) if state_gmem_row == i * ldtm_width + k else cutlass.Float32(0.0)
-                            else:
-                                v = gState_init[state_gmem_row, i * ldtm_width + k]
-                                if cutlass.const_expr(cfg.state_dtype != cfg.acc_dtype):
-                                    v = v.to(cfg.acc_dtype)
-                            words.append(v)
+                        if cutlass.const_expr(cfg.seed_identity):
+                            for k in cutlass.range_constexpr(32):
+                                words.append(cutlass.Float32(1.0) if state_gmem_row == i * ldtm_width + k else cutlass.Float32(0.0))
+                        else:
+                            for g in cutlass.range_constexpr(ldtm_width // seed_vw):
+                                seed_chunk = (seed_src + i * ldtm_width + g * seed_vw).load(count=seed_vw, alignment=16)
+                                for t in cutlass.range_constexpr(seed_vw):
+                                    words.append(seed_chunk[t].to(cfg.acc_dtype))
                         nvvm.tcgen05_st(
                             "32x32b",
                             nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
@@ -1102,14 +1108,18 @@ def compute1_warp_group(
             if cutlass.const_expr(cfg.store_final_state):
                 if write_end == batch_num_chunks:
                     gState_out = mState_out[None, None, head_idx, batch_idx]
+                    state_vw = 16 // (mState_out.element_type.width // 8)
+                    state_dst = (gState_out.iterator + gState_out.layout((state_gmem_row, 0))).raw_ptr()
                     for i in cutlass.range_constexpr(num_ldtms):
                         state_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32), num=32)
-                        for k in cutlass.range_constexpr(32):
-                            val = state_vec[k]
-                            if cutlass.const_expr(cfg.state_dtype != cfg.acc_dtype):
-                                val = val.to(cfg.state_dtype)
-                            if state_row_valid:
-                                gState_out[state_gmem_row, i * ldtm_width + k] = val
+                        if state_row_valid:
+                            for g in cutlass.range_constexpr(ldtm_width // state_vw):
+                                (state_dst + i * ldtm_width + g * state_vw).store(
+                                    cutlass.Vector.from_elements(
+                                        tuple(state_vec[g * state_vw + t].to(mState_out.element_type) for t in range(state_vw)), mState_out.element_type
+                                    ),
+                                    alignment=16,
+                                )
         else:
             if cutlass.const_expr(cfg.store_final_state):
                 write_passthrough = write_end == batch_num_chunks
@@ -2045,7 +2055,7 @@ def compile(
         seed_every_n_tokens,
         workspace_cute,
         stream,
-        options="--enable-tvm-ffi --opt-level 3",
+        options="--enable-tvm-ffi --opt-level 2",
     )
 
 
@@ -2226,13 +2236,11 @@ def chunk_gdn_recompute_sm100(
 
         state_in_cute = None
         if use_initial_state:
-            state_in_cute = from_dlpack(initial_state, assumed_align=16)
-            state_in_cute.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
+            state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
         state_out_cute = None
         if store_final_state:
-            state_out_cute = from_dlpack(output_state, assumed_align=16)
-            state_out_cute.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
+            state_out_cute = from_dlpack(output_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
         seed_checkpoints_cute = None
         if seed_checkpoints:
@@ -2330,7 +2338,7 @@ def chunk_gdn_recompute_sm100(
             tinv_placeholder,
             workspace_placeholder,
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
         cache["prologue"](
