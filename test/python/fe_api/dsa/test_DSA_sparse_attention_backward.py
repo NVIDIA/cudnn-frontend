@@ -1041,6 +1041,10 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
     major, minor = torch.cuda.get_device_capability()
     if major * 10 + minor < 100:
         pytest.skip("sink-normalization regression test targets the SM100 kernel")
+    if num_heads == 128 and (major, minor) not in _TWO_CTA_CAPABILITIES:
+        # The H128 case covers the D576 two-CTA route; elsewhere H128/D576 runs
+        # the generic M64 kernel, which this PR does not change.
+        pytest.skip("the H128/D576 sink-normalization case targets the two-CTA route (SM100-class GPUs)")
 
     device = torch.device("cuda")
     s_q = 5
