@@ -794,7 +794,10 @@ def indexer_backward_wrapper(
         topk_indices_global: whether ``topk_indices`` already contains global
             flat KV ids. The cudnn top-k wrapper returns local per-batch ids by
             default, so this wrapper defaults to ``False`` and lets the kernel
-            add the batch offset internally.
+            validate each local id and add the batch offset internally. On
+            SM100, both conventions use the same optimized Gather4 path when
+            the installed CuTe DSL exposes it; converting local ids in a
+            separate launch is unnecessary for this backward kernel.
         sm_scale: indexer softmax scale baked into the forward via the
             weights-scaling trick.
         loss_coeff: coefficient scaling the KL-divergence loss in the

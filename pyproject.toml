@@ -82,11 +82,16 @@ cutile = [
     # engines and nothing else.
     "cuda-tile>=1.4",
 ]
+triton = [
+    # Framework-specific Triton FE OSS kernels. Torch remains in the explicit
+    # torch dependency group so callers can choose the matching CUDA wheel.
+    "triton>=3.7.0; sys_platform == 'linux' and python_version >= '3.10'",
+]
 
 [dependency-groups]
 dev = [
     "jupyter",
-    "numpy<2.0.0",
+    "numpy",
     "pybind11[global]>=2.13,<3",
     "pytest",
     "pytest-xdist",
@@ -123,3 +128,4 @@ version = {attr = "cudnn.__version__"}
 
 [tool.setuptools.package-data]
 include = ["**/*"]
+"cudnn.linear_attention.cake.kernels" = ["*.cu", "SHA256SUMS", "UPSTREAM.md"]

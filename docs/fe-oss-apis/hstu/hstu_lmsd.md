@@ -203,5 +203,5 @@ grads = hstu_lmsd_backward(
 assert grads["dweight_tensor"] is None
 ```
 
-See the focused tests in [`test/python/fe_api/hstu/hstu_lmsd/`](../../../test/python/fe_api/hstu/hstu_lmsd/)
+See the focused tests in [`test/python/fe_api/hstu/hstu_lmsd/`](https://github.com/NVIDIA/cudnn-frontend/tree/main/test/python/fe_api/hstu/hstu_lmsd/)
 for complete function calls.

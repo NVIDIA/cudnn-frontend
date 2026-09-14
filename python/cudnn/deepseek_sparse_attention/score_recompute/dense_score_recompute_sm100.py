@@ -534,7 +534,9 @@ class DenseScoreRecomputeSm100:
         tmem_ptr = cute.make_ptr(Float32, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
         tStS_ref = cute.make_tensor(tmem_ptr, tStS_fake.layout)
 
-        warp_group_idx = tidx // self.WARPGROUP_SIZE
+        # Each warp belongs to one warpgroup. Preserve that uniformity across
+        # the load/MMA and epilogue branches to avoid redundant collectives.
+        warp_group_idx = cute.arch.make_warp_uniform(tidx // self.WARPGROUP_SIZE)
 
         # =====================================================================
         # Warpgroup 0 (warps 0-3): Load + MMA + Scheduler

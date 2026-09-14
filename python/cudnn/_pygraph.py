@@ -30,10 +30,10 @@ from cudnn import _pybind_module
 
 from ._device import ensure_current_context
 from ._handle import Handle, to_backend_handle
-from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
+from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _dlpack_lanes, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
-from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor
+from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor, storage_geometry, storage_slot_bytes
 from .nodes import Node, _row_major_stride
 
 _LOG = logging.getLogger("cudnn.pygraph")
@@ -186,6 +186,7 @@ class pygraph:
         # Backend operand order + the reusable pointer array handed to execute.
         # Both are properties of the frozen graph, so they outlive any one call.
         self._sorted_uids: Optional[List[int]] = None
+        self._declared_layout_native = None  # DeclaredLayout for _sorted_uids; see _declared_layout
         self._selected_engine_cache = None  # (plan config, engine); see selected_engine
 
     # =========================================================================
@@ -259,8 +260,8 @@ class pygraph:
         the backend path. Populated after create_execution_plans().
 
         Cached, because ``execute()`` asks on every call and answering means
-        walking every registered engine for the one declaring this id — 2.75 us
-        to re-derive something that only ``select_plan`` can change. Keyed on
+        walking every registered engine for the one declaring this id, re-deriving
+        something that only ``select_plan`` can change. Keyed on
         the config OBJECT, so replanning invalidates it without needing a hook
         on every writer of ``_plan_index``.
         """
@@ -1009,7 +1010,7 @@ class pygraph:
 
         A failure here is the backend DECLINING (a python engine may still
         serve the graph), recorded as backend_plan_entries() records one. Not
-        routed through that, which also runs the ~178 ms C++ plan query a
+        routed through that, which also runs the C++ plan query that
         the heuristics may never ask for.
         """
         import cudnn
@@ -1074,6 +1075,8 @@ class pygraph:
                 return node  # no lowering branch at all
             if spec_entry[1].get("python_only"):
                 return node  # declared python-only: lowering raises by design
+            if any(node.params.get(attr) is not None for attr in spec_entry[1].get("python_only_attrs", ())):
+                return node  # an op attribute the backend has no field for is SET: python engines only
         return None
 
     def _backend_lowerable(self) -> bool:
@@ -1091,10 +1094,9 @@ class pygraph:
         those would silently run a python engine on a failing device and call it a
         routing decision.
 
-        The query costs a real ``create_execution_plans`` on the lowered graph
-        (~178 ms on sm100/9.26 for a 1024^3 bf16 matmul): there is no cheaper way
-        to obtain a RANKED list today, since ``get_engine_and_knobs_at_index``
-        indexes the plan list, not the engine list.
+        The query costs a real ``create_execution_plans`` on the lowered graph;
+        there is no cheaper way to obtain a RANKED list, since
+        ``get_engine_and_knobs_at_index`` indexes the plan list, not the engine list.
 
         Answered ONCE per graph: a second C++ create_execution_plans() appends
         to the same plan list (``enqueue_engine_configs`` -> ``back_inserter``),
@@ -1198,14 +1200,19 @@ class pygraph:
 
     def get_plan_name_at_index(self, index: int) -> str:
         """Name of the plan at ``index`` in the ranked list. A python plan
-        reports its engine name (plus its knobs when it has several plans); a
-        backend plan reports the backend's own name."""
+        reports its engine name plus its public knobs when it has any
+        (``sdpa_fwd_prefill_sm100[TILE_M=128, TILE_N=128]``, sorted by knob
+        name so the same plan always prints the same); a backend plan reports
+        the backend's own name."""
         if not self._planning_done:
             return self._lowered_graph.get_plan_name_at_index(index)
         cfg = self._plans[self._check_plan_index(index)]
         eng = self._engine_for(cfg)
         if eng is not None:
-            return f"{eng.name}[{cfg.knobs}]" if cfg.knobs is not None else eng.name
+            from .engines.base import public_knobs_repr
+
+            public = eng.knobs_to_public(cfg.knobs)
+            return f"{eng.name}[{public_knobs_repr(public)}]" if public else eng.name
         cfg = self._materialize_backend_plan(index)
         if cfg.cpp_index is None:
             # Delegating entry: the backend holds candidates it does not expose
@@ -1664,7 +1671,11 @@ class pygraph:
         Answered from the unified list, NOT forwarded to C++ with a unified
         index — that would report the backend's entry for a python plan's slot.
         The pair is what ``create_execution_plan()`` replays, so it must name the
-        same engine the caller just looked at."""
+        same engine the caller just looked at.
+
+        ``knobs`` is always a ``{cudnn.knob_type: int}`` dict (empty when the
+        plan has no tuning axes, never ``None``), for backend and python plans
+        alike: one record shape for autotuners to persist."""
         from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
         if not self._planning_done:
@@ -1675,7 +1686,10 @@ class pygraph:
                 f"plan {index} delegates to the backend's own choice among candidates it does not expose "
                 f"as plans (heur_mode.OPENSOURCE); there is no (engine_id, knobs) pair to replay"
             )
-        return (cfg.engine_id, cfg.knobs)
+        eng = self._engine_for(cfg)
+        if eng is not None:
+            return (cfg.engine_id, eng.knobs_to_public(cfg.knobs))
+        return (cfg.engine_id, dict(cfg.knobs) if cfg.knobs else {})
 
     def get_behavior_notes_for_plan_at_index(self, index: int, *args, **kwargs):
         """Classic backend behaviour notes for the plan at ``index``.
@@ -1744,6 +1758,11 @@ class pygraph:
         ``create_execution_plan(...)`` then ``get_execution_plan_count() - 1``
         addresses the plan just added — for a python engine id as well as a
         backend one, which is the whole point of one id space.
+
+        ``knobs`` is the public ``{cudnn.knob_type: int}`` dict that
+        ``get_engine_and_knobs_at_index`` reported (``None`` / ``{}`` for a plan
+        without tuning axes). A python engine's native knob object is accepted
+        too, for callers that already hold one.
         """
         from .engines.base import PlanConfig
         from .engines.engine_ids import is_python_engine
@@ -1756,6 +1775,8 @@ class pygraph:
                 raise ValueError(f"no python engine on this graph owns engine_id {engine_id}")
             if len(owners) > 1:
                 raise ValueError(f"engine_id {engine_id} is owned by {[e.name for e in owners]} — ambiguous dispatch")
+            if knobs is None or isinstance(knobs, dict):
+                knobs = owners[0].knobs_from_public(knobs or {})
             entry = PlanConfig(engine_id, knobs)
         else:
             entry = PlanConfig(engine_id, knobs, cpp_index=self._append_backend_plan(engine_id, knobs))
@@ -1823,7 +1844,7 @@ class pygraph:
             # A JIT engine must compile for the device/stream it will run on, so
             # build the caller context here. Only here: a steady-state execute()
             # otherwise discarded this (a cudnnGetStream round-trip + an
-            # ExecutionContext alloc, ~2.9us) on every already-built call.
+            # ExecutionContext alloc) on every already-built call.
             caller_ctx = self._build_context(handle) if handle is not None else None
             if not self._planning_done:
                 self.create_execution_plans()
@@ -1971,7 +1992,7 @@ class pygraph:
                 # slot that borrowed one is named here.
                 from_graph.append(i)
             ptr, tensor = self._describe(data, order[i])
-            native.set_operand(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type))
+            native.set_operand(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type), _dlpack_lanes(tensor.data_type))
         if strict:
             hole = native.first_unfilled()
             if hole >= 0:
@@ -1979,6 +2000,17 @@ class pygraph:
                 declared = self._tensor_by_uid.get(uid)
                 name = f" ({declared.name!r})" if declared is not None and declared.name else ""
                 raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
+        # The declaration is the contract. The backend reads only the pointer,
+        # so a caller may bind a 2-D matrix to a [1, m, k] tensor, a flat blob
+        # to a reordered scale tensor, a 0-d scalar to (1, 1, 1): the graph
+        # says what the bytes mean. A DENSE buffer of other extents that covers
+        # the declared bytes is therefore re-described AS the declaration --
+        # what a bare address gets -- so an engine reading the pack answers the
+        # way the backend does. A buffer with the declared extents but its own
+        # strides, a strided view, or one too small for the declaration keeps
+        # its own description; the engine decides. The rule runs natively, one
+        # crossing per pack: this is on every execute's critical path.
+        from_graph.extend(native.describe_from(self._declared_layout(order), from_graph))
         if override_uids:
             # The backend refuses a partial override; a short list must not
             # quietly mean "keep the rest" here.
@@ -1992,7 +2024,16 @@ class pygraph:
                 i = slot_of.get(uid)
                 if i is None:
                     raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
-                native.override_operand(i, *_in_axis_order_of(tuple(override_shapes[j]), tuple(override_strides[j]), native.stride(i)))
+                # Overrides speak cuDNN element units; the slot speaks storage slots.
+                declared = self._tensor_by_uid.get(uid)
+                storage = storage_geometry(override_shapes[j], override_strides[j], declared.data_type if declared is not None else None)
+                if storage is None:
+                    raise ValueError(
+                        f"override_shapes for tensor uid {uid}: an fp4 tensor packs two elements per storage slot, so its "
+                        f"unit-stride extent must be even; got {tuple(override_shapes[j])} / {tuple(override_strides[j])}"
+                    )
+                dtype = (*_dlpack_code_bits(declared.data_type), _dlpack_lanes(declared.data_type)) if declared is not None else (0, 0, 1)
+                native.override_operand(i, *_in_axis_order_of(storage[0], storage[1], native.stride(i)), *dtype)
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
@@ -2010,12 +2051,40 @@ class pygraph:
                 workspace_ptr, workspace_bytes = extent
         return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph))
 
+    def _declared_layout(self, order: List[int]):
+        """The storage-slot geometry each slot of ``order`` was declared with,
+        built once per graph: the declaration is fixed once the graph is, and
+        ``storage_geometry`` per operand per execute was a measurable share of
+        the host path. Reset with ``_sorted_uids``."""
+        layout = self._declared_layout_native
+        if layout is None:
+            layout = _pybind_module.DeclaredLayout(len(order))
+            for i, uid in enumerate(order):
+                declared = self._tensor_by_uid.get(uid)
+                if declared is None or not declared.dim:
+                    continue
+                storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
+                if storage is None:
+                    continue
+                layout.set(
+                    i,
+                    list(storage[0]),
+                    list(storage[1]),
+                    storage_slot_bytes(declared.data_type) or 0,
+                    *_dlpack_code_bits(declared.data_type),
+                    _dlpack_lanes(declared.data_type),
+                )
+            self._declared_layout_native = layout
+        return layout
+
     def _describe(self, data: Any, uid: int):
         """``(pointer, Tensor)`` for one caller buffer.
 
         The Tensor carries the buffer's OWN dim/stride/data_type, which need
-        not match what the graph declared — frost_gemm takes its problem size
-        from here.
+        not match what the graph declared. ``_normalize`` then re-describes a
+        slot FROM the declaration when the two disagree and the buffer covers
+        it (the declaration is the contract, as for the backend), so what an
+        engine reads is the declaration unless the buffer is smaller.
 
         Every framework publishes the same four facts under a different
         spelling, so this asks for each spelling in turn. Two differences are
@@ -2023,12 +2092,10 @@ class pygraph:
         BYTES for the array-interface family and in ELEMENTS for torch/DLPack,
         and an absent stride means dense row-major rather than unknown.
 
-        Ordered by what it costs to ask (measured, 4096x4x128): reading
-        attributes is 0.52 us for torch and 0.72 for cupy, while the DLPack
-        capsule round trip is 1.5-8.6. The expensive case is specifically torch
-        bfloat16, whose ``__cuda_array_interface__`` raises because the
-        protocol cannot spell bf16 — which is why the last branch is last and
-        not the only one.
+        Ordered by what it costs to ask: attribute reads before the DLPack
+        capsule round trip. The expensive case is torch bfloat16, whose
+        ``__cuda_array_interface__`` raises because the protocol cannot spell
+        bf16, which is why the last branch is last and not the only one.
 
         A bare address carries no geometry, so it borrows the graph's: the
         backend has always accepted a raw pointer, and an engine that reads the
@@ -2039,7 +2106,11 @@ class pygraph:
             declared = self._tensor_by_uid.get(uid)
             if declared is None or not declared.dim:
                 return data, Tensor(uid=uid)
-            return data, describing_tensor(uid, tuple(declared.dim), tuple(declared.stride), declared.data_type)
+            # The slot speaks storage slots (fp4: two elements per slot), like
+            # every other description in the pack.
+            storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
+            dim, stride = storage if storage is not None else (tuple(declared.dim), tuple(declared.stride))
+            return data, describing_tensor(uid, tuple(dim), tuple(stride), declared.data_type)
         dim = getattr(data, "shape", None)
 
         # torch: pointer from data_ptr(), strides from stride() in ELEMENTS
@@ -2145,6 +2216,12 @@ class pygraph:
         if self._lowered_graph is None:
             # Serialization is the cuDNN graph format by definition — lower on
             # demand (independent of which plan is selected for execution).
+            node = self._unlowerable_node()
+            if node is not None:
+                # As key(): the format has no field for what the backend cannot
+                # lower, so a blob would silently drop it (a SET softmax_precision
+                # would deserialize as the f32 pipeline).
+                raise cudnn_graph_not_supported(f"serialize() is the cuDNN backend's graph format; the {node.node_type.name} node has no backend lowering")
             self.validate()
             if self._lowered_graph is None:  # python engines registered
                 self._lowered_graph = self._lower_to_cpp()
@@ -2186,6 +2263,7 @@ class pygraph:
         # The loaded graph carries its own variant_pack, so an order cached while
         # this container held a different graph no longer describes it.
         self._sorted_uids = None
+        self._declared_layout_native = None
 
     def _lower_to_cpp(self) -> Any:
         """Lower Python graph to C++ (the internal ``_pybind_module.backend_graph``)."""
@@ -2298,9 +2376,10 @@ class pygraph:
                 kw = {"name": node.name}
                 if node.compute_data_type is not None:
                     kw["compute_data_type"] = _library_type(node.compute_data_type)
+                python_only = spec.get("python_only_attrs", ())
                 for pk, pv in node.params.items():
-                    if pk.startswith("_") or pk.startswith("dropout_"):
-                        continue
+                    if pk.startswith("_") or pk.startswith("dropout_") or pk in python_only:
+                        continue  # python-only attrs never reach C++ (_unlowerable_node keeps a SET one off the backend)
                     # user callbacks (score_mod, ...) get a shimmed graph so
                     # closures over IR tensors keep working (see _CallbackGraphShim)
                     kw[pk] = _wrap_callback(pv, lower_tensor) if callable(pv) else pv
@@ -2528,6 +2607,33 @@ def _linear_attention_final_state_dims(node):
     return [cu.dim[0] - 1, max(q[1], v[1]), v[2], q[2]]
 
 
+def _linear_attention_summary_final_dims(node):
+    # [N, HO, V, K]
+    k, v, g = node.inputs["k"].dim, node.inputs["v"].dim, node.inputs["g"].dim
+    cu = node.inputs.get("cu_seqlens")
+    if cu is None or not cu.dim:
+        return None
+    return [cu.dim[0] - 1, g[1], v[2], k[2]]
+
+
+def _linear_attention_transition_dims(node):
+    # [N, HO, K, K]
+    k, g = node.inputs["k"].dim, node.inputs["g"].dim
+    cu = node.inputs.get("cu_seqlens")
+    if cu is None or not cu.dim:
+        return None
+    return [cu.dim[0] - 1, g[1], k[2], k[2]]
+
+
+def linear_attention_summary_bwd_dims(node):
+    # [N, HO, V, K]
+    k, g, do = node.inputs["k"].dim, node.inputs["g"].dim, node.inputs["dO"].dim
+    cu = node.inputs.get("cu_seqlens")
+    if cu is None or not cu.dim:
+        return None
+    return [cu.dim[0] - 1, g[1], do[2], k[2]]
+
+
 def _linear_attention_state_checkpoints_dims(node):
     n = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
@@ -2716,6 +2822,7 @@ _STRUCTURED_OPS = {
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
+            "gate_domain",
             "batch_invariant",
         ),
         outputs=("O", "final_state", "state_checkpoints"),
@@ -2729,7 +2836,7 @@ _STRUCTURED_OPS = {
     "gdn_bwd": dict(
         node_type=NodeType.GDN_BWD,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
-        attrs=("scale", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "batch_invariant"),
+        attrs=("scale", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
@@ -2749,6 +2856,24 @@ _STRUCTURED_OPS = {
         dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
         python_only=True,
     ),
+    "gdn_summary": dict(
+        node_type=NodeType.GDN_SUMMARY,
+        inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=("output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        outputs=("final_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
+    "gdn_summary_bwd": dict(
+        node_type=NodeType.GDN_SUMMARY_BWD,
+        inputs=("q", "k", "g", "beta", "cu_seqlens", "dO", "d_final_state", "a_log", "dt_bias"),
+        attrs=("output_transition", "scale", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        outputs=("d_initial_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
     "gdp": dict(
         node_type=NodeType.GDP,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
@@ -2761,6 +2886,7 @@ _STRUCTURED_OPS = {
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
+            "gate_domain",
             "batch_invariant",
         ),
         outputs=("O", "final_state", "state_checkpoints"),
@@ -2782,6 +2908,7 @@ _STRUCTURED_OPS = {
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
+            "gate_domain",
             "batch_invariant",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
@@ -2803,6 +2930,34 @@ _STRUCTURED_OPS = {
         dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
         python_only=True,
     ),
+    "gdp_summary": dict(
+        node_type=NodeType.GDP_SUMMARY,
+        inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=("num_householder", "output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        outputs=("final_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
+    "gdp_summary_bwd": dict(
+        node_type=NodeType.GDP_SUMMARY_BWD,
+        inputs=("q", "k", "g", "beta", "cu_seqlens", "dO", "d_final_state", "a_log", "dt_bias"),
+        attrs=(
+            "num_householder",
+            "output_transition",
+            "scale",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+        ),
+        outputs=("d_initial_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
     "kda": dict(
         node_type=NodeType.KDA,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
@@ -2814,6 +2969,7 @@ _STRUCTURED_OPS = {
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
+            "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
         ),
@@ -2835,6 +2991,7 @@ _STRUCTURED_OPS = {
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
+            "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
         ),
@@ -2857,6 +3014,34 @@ _STRUCTURED_OPS = {
         dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
         python_only=True,
     ),
+    "kda_summary": dict(
+        node_type=NodeType.KDA_SUMMARY,
+        inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=("output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "gate_lower_bound", "batch_invariant"),
+        outputs=("final_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
+    "kda_summary_bwd": dict(
+        node_type=NodeType.KDA_SUMMARY_BWD,
+        inputs=("q", "k", "g", "beta", "cu_seqlens", "dO", "d_final_state", "a_log", "dt_bias"),
+        attrs=(
+            "output_transition",
+            "scale",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
+        outputs=("d_initial_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
     "gdn2": dict(
         node_type=NodeType.GDN2,
         inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
@@ -2869,6 +3054,7 @@ _STRUCTURED_OPS = {
             "allow_neg_eigval",
             "beta_guard",
             "safe_gate",
+            "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
         ),
@@ -2891,6 +3077,7 @@ _STRUCTURED_OPS = {
             "allow_neg_eigval",
             "beta_guard",
             "safe_gate",
+            "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
         ),
@@ -2912,6 +3099,45 @@ _STRUCTURED_OPS = {
             "d_dt_bias": _like("dt_bias"),
         },
         dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
+        python_only=True,
+    ),
+    "gdn2_summary": dict(
+        node_type=NodeType.GDN2_SUMMARY,
+        inputs=("k", "v", "g", "beta", "w", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=(
+            "output_transition",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "beta_guard",
+            "safe_gate",
+            "gate_domain",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
+        outputs=("final_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
+        python_only=True,
+    ),
+    "gdn2_summary_bwd": dict(
+        node_type=NodeType.GDN2_SUMMARY_BWD,
+        inputs=("q", "k", "g", "beta", "cu_seqlens", "dO", "d_final_state", "a_log", "dt_bias"),
+        attrs=(
+            "output_transition",
+            "scale",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "beta_guard",
+            "safe_gate",
+            "gate_domain",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
+        outputs=("d_initial_state", "transition"),
+        maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
+        infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
         python_only=True,
     ),
     # ---- convolution ---------------------------------------------------------
@@ -3166,6 +3392,13 @@ _CAPTURED_OPS = {
         out_kwargs=("rng_dump", "score_max", "score_sum_exp"),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims},
+        # Op attributes the cuDNN backend has no field for: never forwarded to
+        # C++; when SET they make the node backend-unlowerable so only a python
+        # engine that honors them can serve the graph. `softmax_precision`
+        # (cudnn.data_type.FLOAT | HALF, default FLOAT) asks for the softmax
+        # accumulator precision -- numerics-changing, hence an op attribute
+        # rather than a tuning knob.
+        python_only_attrs=("softmax_precision",),
     ),
     "sdpa_backward": dict(
         node_type=NodeType.SDPA_BWD,
@@ -3181,6 +3414,7 @@ _CAPTURED_OPS = {
         out_kwargs=("rng_dump", "score_max", "score_sum_exp"),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_S": _AMAX, "Amax_O": _AMAX},
+        python_only_attrs=("softmax_precision",),  # see "sdpa"
     ),
     "sdpa_fp8_backward": dict(
         node_type=NodeType.SDPA_FP8_BWD,

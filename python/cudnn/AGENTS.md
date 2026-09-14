@@ -124,13 +124,6 @@ neither names the thing that breaks it most directly: a device-to-host read.
 Known violations, all pre-existing and each needing a kernel-side change, so
 none is precedent:
 
-- The FP8/MXFP8 `seq_len_q` guard in `sdpa/fwd/engines.py`. This one cannot be
-  lifted to `check_support()`: `use_padding_mask=True` requires a `seq_len_q`
-  tensor even when only KV is padded, so no static rule separates "declares
-  per-batch Q lengths" from "the lengths are actually short" — declining the
-  declaration would drop the KV-only-padding population these kernels serve
-  correctly. It goes away when the FP8 kernels get the epilogue trim; until
-  then the read is what keeps a short length from being silently ignored.
 - `cu_seqlens_{q,k}.to(dtype=..., device="cpu")` in the SM80 packed-THD backward
   (`sdpa/bwd/kernels/bprop_f16_sm80.py`). Reachable only through the standalone
   wrapper: the registered `sdpa_bwd_sm80` spec declares `thd=False`, so
@@ -348,6 +341,6 @@ The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) do
 ## Other notes
 
 - `wrapper.py` `Graph` context manager (the pythonic graph builder) requires cuDNN backend ≥ 9.12 (`backend_version() >= 91200`) and builds plans on `__exit__`.
-- Torch custom ops live in `experimental/ops/` (pattern doc: `docs/adding_torch_custom_ops.md`); they cache built graphs per config and use stable `_UIDs` enums.
+- Torch custom ops live in `experimental/ops/` (pattern doc: `docs/utilities/adding_torch_custom_ops.md`); they cache built graphs per config and use stable `_UIDs` enums.
 - dtype conversions go through `datatypes.py`, which probes torch/cutlass availability lazily — keep it that way.
 - Formatting: black, line length 160.

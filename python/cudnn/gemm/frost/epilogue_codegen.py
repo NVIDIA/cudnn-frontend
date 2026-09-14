@@ -603,12 +603,14 @@ def _dense_store_offset(i: int, is_fp4: bool, batch: int) -> str:
     return f"(tile_l * out_stride_l_{i} + {base})" if batch > 1 else f"({base})"
 
 
-def _emit_mmajor_scatter(tap_idx: int, i: int, source_var: str, dtype: Dtype, batch: int, vsize: int, *, row_pred: str | None = None) -> list[str]:
+def _emit_mmajor_scatter(
+    tap_idx: int, i: int, source_var: str, dtype: Dtype, batch: int, vsize: int, *, row_pred: str | None = None, converted: bool = False
+) -> list[str]:
     """Per-element scatter for an M-major (or arbitrarily strided) dense
     output: vsize scalar stores through the output's own runtime strides."""
     tap_var = f"_tap_{tap_idx}"
     l_term = f"tile_l * out_stride_l_{i} + " if batch > 1 else ""
-    lines = [f"{tap_var} = {_store_cast_expr(source_var, dtype)}"]
+    lines = [f"{tap_var} = {source_var if converted else _store_cast_expr(source_var, dtype)}"]
     for e in range(vsize):
         store = (
             f"(gC_tap_{tap_idx}_ptr + {l_term}row * out_stride_m_{i} + "
@@ -652,13 +654,14 @@ def _emit_tap_store(
     offset_expr: str = "linear_idx",
     *,
     row_pred: str | None = None,
+    converted: bool = False,
 ) -> list[str]:
     """Store one N-major tap vector: ``offset_expr`` in ``_tap_store_elems``-wide
     chunks (a wide dtype co-materialized with a block-quant splits into <=32B
     sub-stores). An M-major output goes through `_emit_mmajor_scatter`."""
     tap_var = f"_tap_{tap_idx}"
     store_elems = _tap_store_elems(chain, tap_dtype, dim, stride, vsize)
-    lines = [f"{tap_var} = {_store_cast_expr(source_var, tap_dtype)}"]
+    lines = [f"{tap_var} = {source_var if converted else _store_cast_expr(source_var, tap_dtype)}"]
     # The STG arm sits inside `row < M` / `col_j + vsize <= N`; the TMA arm has
     # neither -- its store is clipped by the descriptor's global extent instead.
     # `_tap_store_elems` divides both N and `col_j`, so a sub-chunk is wholly
@@ -1487,35 +1490,9 @@ def generate(
     for si in output_order:
         spec = specs[si]
         src = _parent_value(spec.source_ref)
-        if si in tma_slots:
-            _tma_j = sorted(tma_slots).index(si)
-            _ov = tma_out_value(_tma_j)
-            if spec.quant_idx is not None:
-                body_lines.extend(
-                    _emit_block_quant(
-                        chain.quants[spec.quant_idx],
-                        spec.quant_idx,
-                        src,
-                        spec.dtype,
-                        _ov,
-                        _scale_tap_idx(spec.quant_idx),
-                        quant_batch_expr,
-                        chain.matmul.M,
-                        vsize,
-                        store_row_pred,
-                    )
-                )
-            else:
-                body_lines.append(f"{_ov} = {_store_cast_expr(src, spec.dtype)}")
-            body_lines.append(tma_out_ready_marker(_tma_j))
-            continue
-        tap_idx = _tap_of[si]
-        if spec.major == "m":
-            body_lines.extend(_emit_mmajor_scatter(tap_idx, si, src, spec.dtype, chain.matmul.batch, vsize, row_pred=store_row_pred))
-            continue
-        offset_expr = _dense_store_offset(si, spec.dtype == "fp4_e2m1", chain.matmul.batch)
-        if spec.quant_idx is not None:
-            qv = f"_tap_{tap_idx}"
+        converted = spec.quant_idx is not None
+        if converted:
+            qv = f"_quant_data_{si}"
             body_lines.extend(
                 _emit_block_quant(
                     chain.quants[spec.quant_idx],
@@ -1530,20 +1507,23 @@ def generate(
                     store_row_pred,
                 )
             )
-            _align = max(vsize // 2, 4) if spec.dtype == "fp4_e2m1" else f"VEC_BYTES_TAP_{tap_idx}"
-            # fp4 is packed 2-per-byte, so its tap tensor is Int8 (B, M, N/2).
-            _st = f"(gC_tap_{tap_idx}_ptr + {offset_expr}).store({qv}, alignment={_align})"
-            # A quant tap's DATA store does not go through `_emit_tap_store`, so it
-            # needs the arm's row bound applied here too. Without it a MoE tile,
-            # which overhangs its routed group into the NEXT one, writes rows that
-            # group's own tile also writes -- two tiles racing on the same bytes.
-            if store_row_pred is None:
-                body_lines.append(_st)
-            else:
-                body_lines.append(f"if ({store_row_pred}) & (col_j + {vsize} <= N):")
-                body_lines.append(f"    {_st}")
-        else:
-            body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, row_pred=store_row_pred))
+            src = qv
+        # Quantized values (including packed FP4) are already converted. All
+        # dense outputs use the same layout/store dispatch after this point.
+        if si in tma_slots:
+            _tma_j = sorted(tma_slots).index(si)
+            _ov = tma_out_value(_tma_j)
+            body_lines.append(f"{_ov} = {src if converted else _store_cast_expr(src, spec.dtype)}")
+            body_lines.append(tma_out_ready_marker(_tma_j))
+            continue
+        tap_idx = _tap_of[si]
+        if spec.major == "m":
+            body_lines.extend(_emit_mmajor_scatter(tap_idx, si, src, spec.dtype, chain.matmul.batch, vsize, row_pred=store_row_pred, converted=converted))
+            continue
+        offset_expr = _dense_store_offset(si, spec.dtype == "fp4_e2m1", chain.matmul.batch)
+        body_lines.extend(
+            _emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, row_pred=store_row_pred, converted=converted)
+        )
 
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)

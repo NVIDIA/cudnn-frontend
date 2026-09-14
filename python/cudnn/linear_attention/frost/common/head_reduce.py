@@ -102,13 +102,13 @@ compiled_cache = {}
 
 
 def head_group_reduce(src, dst, *, stream) -> None:
-    """Reduce ``src (total, HO, D)`` into ``dst (total, H, D)`` — or the
-    rank-2 ``(total, HO)`` into ``(total, H)`` — by summing each group of
+    """Reduce ``src (total, HO, D)`` into ``dst (total, H, D)``, or the
+    rank-2 ``(total, HO)`` into ``(total, H)``, by summing each group of
     ``r = HO // H`` consecutive heads (fp32 accumulation).
 
     ``src`` is contiguous (kernel-internal wide buffer); ``dst`` needs a
     stride-1 innermost dim with free outer strides (f16/bf16 outer strides
-    must be even — word-pair stores). Same-dtype (f16/bf16, or fp32),
+    must be even, word-pair stores). Same-dtype (f16/bf16, or fp32),
     DLPack-compatible CUDA tensors; the f16/bf16 inner extent ``D`` must be
     even.  Compile-cache-and-replay per ``(dtype, HO, H, D)``."""
     if len(src.shape) == 2:
@@ -153,4 +153,4 @@ def head_group_reduce(src, dst, *, stream) -> None:
     compiled_cache[key](src, dst, total_words, out_row_words, out_head_words, grid_x, cu_stream)
 
 
-frost_head_reduce.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_head_reduce.set_name_prefix("cudnn", remove_cutlass_symbol=False)

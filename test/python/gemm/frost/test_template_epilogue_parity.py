@@ -55,8 +55,10 @@ _MOE_BS_2 = [
 # sm120 is warp-scoped MMA: the accumulators are already in registers, so there
 # is no LDTM shape, no TMEM row base and no span list to share -- and its store
 # is transposed-STG only. It shares no epilogue region with the tcgen05
-# families, so it is its own family here rather than a member of one.
-_SM120 = [("sm120_matmul.py", 1)]
+# families, so it is its own family here rather than a member of one. The
+# block-scale template is the same kernel with scale words riding the AB stage
+# and a block-scaled warp MMA; its epilogue is the dense one verbatim.
+_SM120 = [("sm120_matmul.py", 1), ("sm120_block_scale_matmul.py", 1)]
 
 # SETUP (LDTM shape + row base + span list) depends on the DRAIN LAYOUT, which
 # the compiler hands down as `epi_packed_lanes` / `epi_dp22` -- not on the MMA

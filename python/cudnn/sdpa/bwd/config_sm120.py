@@ -12,6 +12,10 @@ from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 SEQ_Q_TILES = (32, 64, 128)
 SEQ_KV_TILES = (64, 128)
 SUPPORTED_HEAD_DIMS = (32, 64, 128, 192, 256)
+# (q_tile, kv_tile) the kernel runs at for a padded d_qk when a tile is left at
+# 0. Lives here (not on the kernel class) so the family heuristics can list the
+# pair as the plan's public knobs without importing the DSL.
+DEFAULT_TILES = {32: (128, 64), 64: (64, 128), 128: (64, 64), 192: (32, 64), 256: (32, 64)}
 ROW_ROUND = 128
 
 

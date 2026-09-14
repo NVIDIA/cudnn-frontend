@@ -37,6 +37,7 @@ a crash -- it surfaces as an intermittent hang whose output is correct on every
 launch that completes.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable, NamedTuple, Optional, Tuple
 
@@ -61,7 +62,7 @@ from cudnn.frost.tile_dsl.barrier import (
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_NONE, MASK_PADDED, apply_mask_chunk, compute_kv_loop_bounds
 from cudnn.frost.tile_dsl.mma import mma_ts
-from cudnn.frost.tile_dsl.scheduler import Sched, read_tile_id_arrive, scheduler_warp_loop, scheduler_warp_loop_persistent
+from cudnn.frost.tile_dsl.scheduler import Sched, read_tile_id_arrive, scheduler_warp_loop, scheduler_warp_loop_persistent, read_clc_payload
 from cudnn.frost.tile_dsl.tma import (
     cp_async_bulk_shared_cluster_shared_cta,
     tma_load_tile,
@@ -536,9 +537,10 @@ def _tmaldg_warp_group(
 
         # --- next tile ----------------------------------------------------
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_q = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0)).load())
-        nxt_hb = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1)).load())
-        nxt_v = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2)).load())
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+        nxt_q = cute.arch.make_warp_uniform(nxt_q)
+        nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+        nxt_v = cute.arch.make_warp_uniform(nxt_v)
         q_block, head_idx, batch_idx, q_tok, kv_tok, ws_row, seqlen_q, seqlen_kv = _decode_payload(
             nxt_q, nxt_hb, cta_in_pair, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv
         )
@@ -663,9 +665,7 @@ def _mma_warp_leader(bars, sched, sOperand, sRing, tmem_ptr_i32, meta_t, n_batch
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         # The q block is read on this arm too: the causal kv bound depends on it.
-        nxt_q = sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0)).load()
-        nxt_hb = sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1)).load()
-        nxt_v = sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2)).load()
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         q_block, _head, _batch, _q_tok, _kv_tok, _ws_row, seqlen_q, seqlen_kv = _decode_payload(
             nxt_q, nxt_hb, cta_in_pair, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv
         )
@@ -704,7 +704,7 @@ def _mma_warp_non_leader(bars, sched, tmem_ptr_i32, meta_t, n_batch, n_qh, cta_i
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_v = sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2)).load()
+        _nq, _nh, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
@@ -784,9 +784,7 @@ def _tmastg_warp_group(bars, sched, sCast, tma_s, tma_ds, meta_t, n_batch, n_qh,
             smem_state = advance(smem_state, 1)
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_q = sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0)).load()
-        nxt_hb = sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1)).load()
-        nxt_v = sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2)).load()
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         q_block, head_idx, batch_idx, q_tok, kv_tok, ws_row, seqlen_q, seqlen_kv = _decode_payload(
             nxt_q, nxt_hb, cta_in_pair, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv
         )
@@ -1090,9 +1088,10 @@ def _compute_warp_group(
             )
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_q = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0)).load())
-        nxt_hb = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1)).load())
-        nxt_v = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2)).load())
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+        nxt_q = cute.arch.make_warp_uniform(nxt_q)
+        nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+        nxt_v = cute.arch.make_warp_uniform(nxt_v)
         q_block, head_idx, batch_idx, q_tok, kv_tok, ws_row, seqlen_q, seqlen_kv = _decode_payload(
             nxt_q, nxt_hb, cta_in_pair, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv
         )
@@ -1359,7 +1358,7 @@ def _kernel(
                 CFG.CGA_M,
             )
         else:
-            scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+            scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta, CGA_SIZE)
 
 
 # ---------------------------------------------------------------------------
@@ -1559,6 +1558,7 @@ def compile(  # noqa: A001
     chunk.  ``head_base`` / ``batch_base`` are RUNTIME args, so one
     compiled artifact serves every chunk.
     """
+    _cache_key = _template_key(globals(), locals(), "compile")
     if CFG.THD_VARLEN:
         # Packed token totals are RUNTIME values (they change every step under
         # continuous batching), so the token extents compile DYNAMIC and the
@@ -1671,7 +1671,7 @@ def compile(  # noqa: A001
         fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=16)
         fake_desc_words = cute.runtime.make_fake_compact_tensor(cutlass.Int64, (1,), stride_order=(0,), assumed_align=16)
 
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -1694,6 +1694,8 @@ def compile(  # noqa: A001
         cutlass.Int32(0),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_bwd",
     )
 
 

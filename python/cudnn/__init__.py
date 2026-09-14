@@ -25,6 +25,8 @@ symbols_to_import = [
     "reduction_mode",
     "behavior_note",
     "knob_type",
+    "FRONTEND_KNOB_TYPE_BASE",
+    "is_frontend_knob_type",
     "create_kernel_cache",
     "create_device_properties",
     "numerical_note",
@@ -142,7 +144,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.29.0"
+__version__ = "1.30.0"
 
 
 def _tensor(
@@ -306,6 +308,10 @@ _EAGER_PUBLIC_NAMES = (
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
+_OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+    "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+}
 
 _LAZY_OPTIONAL_IMPORTS = {
     "gnn": (".gnn", None),
@@ -318,6 +324,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
+    "Nvfp4AttentionQatBackward": (".sdpa.bwd", "Nvfp4AttentionQatBackward"),
+    "nvfp4_attention_qat_backward": (".sdpa.bwd", "nvfp4_attention_qat_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
     "CSA": (".csa", "CSA"),
     "CSACompressorForward": (".csa", "CSACompressorForward"),
@@ -422,6 +430,7 @@ def _missing_non_dsl_module(error: BaseException):
 
 
 def _optional_dependency_message(name: str, error: Exception) -> str:
+    install_hint = _OPTIONAL_DEPENDENCY_INSTALL_HINTS.get(name, _OPTIONAL_DEPENDENCY_INSTALL_HINT)
     # A DSL that is installed but below the floor must not be reported as a
     # missing dependency: "pip install [cutedsl]" would change nothing. The
     # converse holds too: a failure that is plainly NOT the DSL's -- a missing
@@ -431,7 +440,7 @@ def _optional_dependency_message(name: str, error: Exception) -> str:
     if missing is not None:
         # Name the module: the install hint alone does not fetch a missing framework
         # (torch, jax) and only fetches cuda-python via the extra.
-        return f"{name} requires the {missing!r} module, which is not installed. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {error}"
+        return f"{name} requires the {missing!r} module, which is not installed. {install_hint}: {error}"
     try:
         from .frost.buffers import cutedsl_requirement_error
 
@@ -440,7 +449,7 @@ def _optional_dependency_message(name: str, error: Exception) -> str:
         too_old = None
     if too_old is not None:
         return f"{too_old}: {error}"
-    return f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {error}"
+    return f"{name} requires optional dependencies. {install_hint}: {error}"
 
 
 def __getattr__(name: str) -> Any:

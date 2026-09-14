@@ -44,6 +44,7 @@ from cudnn.gemm.frost.kernel_templates._tile_helpers import (
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass._mlir_helpers.vector as _cvec
 import cutlass
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from cutlass.cute.runtime import make_fake_stream
@@ -326,7 +327,8 @@ def _kernel(
     sA_elems = cta_tile_mnk[0] * cta_tile_mnk[2]
     sB_elems = cta_tile_mnk[1] * cta_tile_mnk[2]
     smem_a = cutlass.Array(ab_dtype, sA_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024)
-    smem_b = cutlass.Array(ab_dtype, sB_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024)
+    # Mainloop reads B values, so mixed FP8 formats need B's own dtype.
+    smem_b = cutlass.Array(mma_b_dtype, sB_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024)
     if cutlass.const_expr(mainloop_a_cast):
         smem_a_load = cutlass.Array(
             ab_load_a_dtype,
@@ -424,6 +426,7 @@ def _kernel(
         c_dtype=mma_c_dtype,
         n_dim=mma_inst_shape_mnk[1],
         m_dim=mma_inst_shape_mnk[0],
+        k_dim=mma_k_dim,
         a_major=mma_a_major,
         b_major=mma_b_major,
     )
@@ -1772,7 +1775,7 @@ def compile() -> Callable:
     fake_splitk_partials = make_fake_tensor(cutlass.Float32, (sym_partials_elems,), stride=(1,), assumed_align=16)
     # @@SPLITK_ONLY:END@@
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-    return cute.compile(
+    return _compile_cached(
         _host,
         problem_size,
         # @@INJECT_COMPILE_AB_PASS@@
@@ -1786,4 +1789,7 @@ def compile() -> Callable:
         # @@SPLITK_ONLY:END@@
         stream=_fake_stream,
         options=frost_compile_options,
+        # persistent object across processes (cudnn.frost.compiled_cache); the digest of THIS source is the key
+        cache_key=globals().get("FROST_SOURCE_DIGEST"),
+        symbol="frost_gemm",
     )

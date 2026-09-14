@@ -1,11 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""cudnn.linear_attention.frost: the FROST linear-attention engines —
-Gated DeltaNet, Kimi Delta Attention, and Gated DeltaNet v2 on the SM100
-chunked kernels built on Cutlass primitives. All three serve forward and
-backward on SM100/SM103/SM107 and rank ahead of the cuTile fallbacks, except
-GDN-2, which does not have a cuTile fallback."""
+"""cudnn.linear_attention.frost: the FROST linear-attention engines (GDN, KDA, GDN-2, GDP) on the SM100 chunked kernels
+built on Cutlass primitives; forward and backward on SM100/SM103/SM107, ranked ahead of the cuTile fallbacks."""
 
 # Lazy: importing one family's engine must not drag its neighbours in.
 import importlib
@@ -16,6 +13,10 @@ _LAZY_EXPORTS = {
     "Gdn2FrostEngine": (".gdn2_engine", "Gdn2FrostEngine"),
     "KdaFrostEngine": (".kda_engine", "KdaFrostEngine"),
     "GdpFrostEngine": (".gdp_engine", "GdpFrostEngine"),
+    "GdnSummaryFrostEngine": (".gdn_engine", "GdnSummaryFrostEngine"),
+    "Gdn2SummaryFrostEngine": (".gdn2_engine", "Gdn2SummaryFrostEngine"),
+    "KdaSummaryFrostEngine": (".kda_engine", "KdaSummaryFrostEngine"),
+    "GdpSummaryFrostEngine": (".gdp_engine", "GdpSummaryFrostEngine"),
 }
 
 
@@ -33,4 +34,13 @@ def __dir__():
     return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 
-__all__ = ["GdnFrostEngine", "KdaFrostEngine", "Gdn2FrostEngine", "GdpFrostEngine"]
+__all__ = [
+    "GdnFrostEngine",
+    "KdaFrostEngine",
+    "Gdn2FrostEngine",
+    "GdpFrostEngine",
+    "GdnSummaryFrostEngine",
+    "KdaSummaryFrostEngine",
+    "Gdn2SummaryFrostEngine",
+    "GdpSummaryFrostEngine",
+]

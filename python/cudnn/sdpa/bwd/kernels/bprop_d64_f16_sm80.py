@@ -44,6 +44,7 @@ Validation: f16 rel ~3.8e-4, bf16 ~3.4e-3 (dQ/dK/dV) at S=512; multi-tile
 (S_q=768) also validated.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 import math
 from functools import lru_cache
 from typing import Optional, Tuple
@@ -637,6 +638,7 @@ def _bprop_host(
 
 @lru_cache(maxsize=None)
 def _compile_main(B, H, SQ, SKV, d, io_is_bf16):
+    _cache_key = _template_key(globals(), locals(), "_compile_main")
     io_dtype = cutlass.BFloat16 if io_is_bf16 else cutlass.Float16
     mk = cute.runtime.make_fake_compact_tensor
     fq = mk(io_dtype, (B, SQ, H, d), stride_order=(3, 2, 1, 0), assumed_align=16)
@@ -650,7 +652,7 @@ def _compile_main(B, H, SQ, SKV, d, io_is_bf16):
     fdv = mk(io_dtype, (B, SKV, H, d), stride_order=(3, 2, 1, 0), assumed_align=16)
     fl = mk(cutlass.Float32, (B, H, SQ), stride_order=(2, 1, 0), assumed_align=16)
     fdt = mk(cutlass.Float32, (B, H, SQ), stride_order=(2, 1, 0), assumed_align=16)
-    return cute.compile(
+    return _compile_cached(
         _bprop_host,
         fq,
         fk,
@@ -668,16 +670,30 @@ def _compile_main(B, H, SQ, SKV, d, io_is_bf16):
         cutlass.Float32(0.0),
         cuda.CUstream(0),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_bwd",
     )
 
 
 @lru_cache(maxsize=None)
 def _compile_unpermute(B, H, SQ, d, io_is_bf16):
+    _cache_key = _template_key(globals(), locals(), "_compile_unpermute")
     io_dtype = cutlass.BFloat16 if io_is_bf16 else cutlass.Float16
     mk = cute.runtime.make_fake_compact_tensor
     fdq_acc = mk(cutlass.Float32, (B, H, SQ, d), stride_order=(3, 2, 1, 0), assumed_align=16)
     fdq_out = mk(io_dtype, (B, SQ, H, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    return cute.compile(_unpermute_host, fdq_acc, fdq_out, d, io_dtype, cutlass.Int32(0), cuda.CUstream(0), options="--enable-tvm-ffi")
+    return _compile_cached(
+        _unpermute_host,
+        fdq_acc,
+        fdq_out,
+        d,
+        io_dtype,
+        cutlass.Int32(0),
+        cuda.CUstream(0),
+        options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_bwd",
+    )
 
 
 def scratch_bytes(*, B: int, SQ: int, SKV: int, H: int, io_bytes: int = 2, need_do_dot: bool = True) -> int:

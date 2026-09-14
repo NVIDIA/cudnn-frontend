@@ -250,6 +250,9 @@ def build_thd_meta_o_descs_kernel(
     o_row_stride: cutlass.Int32,
     cga_tile_m: cutlass.Int32,
     n_clusters: cutlass.Int32,
+    # False under paged KV: K/V are page pools addressed through block tables,
+    # so no packed-total clamp exists (the descriptors are pool-shaped).
+    clamp_kv: cutlass.Constexpr[bool] = True,
 ) -> None:
     """Per-execute THD setup for the f16/bf16 flavors, one elected thread —
     ``build_thd_meta_o_kv_descs_kernel`` plus the persistent scheduler's
@@ -289,9 +292,10 @@ def build_thd_meta_o_descs_kernel(
         # without touching memory — no fill kernel, and nothing written into
         # the caller's buffer. Mirrors build_thd_meta_o_kv_descs_kernel, which
         # the FP8/MXFP8 flavors have used for this since they were written.
-        t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
-        emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=2)
-        emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
+        if cutlass.const_expr(clamp_kv):
+            t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
+            emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=2)
+            emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU,
             from_proxy=nvvm.Proxy.GENERIC,

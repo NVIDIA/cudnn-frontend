@@ -499,10 +499,19 @@ def main() -> int:
         store_modes = {"tma": ["tma"], "stg": ["stg"], "both": ["tma", "stg"]}[args.frost_store]
         offsets = bu.group_offsets(S, E)
         alignment = bu.fto_alignment(args.fto_alignment, offsets)
-        spec_map = _frost_spec_map(args.combo, args.output_mode, alignment)
+        spec_map = bu.expand_config_variants(
+            _frost_spec_map(args.combo, args.output_mode, alignment),
+            sweep_swap_ab=args.sweep_swap_ab,
+            sweep_split_k=args.sweep_split_k,
+        )
         wset = _frost_set(S, N, K, E, args.combo, args.output_mode)
         pool = [wset] + [_frost_set(S, N, K, E, args.combo, args.output_mode) for _ in range(max(0, nbuf - 1))]
-        for cname in bu.select_configs(args.configs, spec_map):
+        for cname in bu.select_config_variants(
+            args.configs,
+            spec_map,
+            sweep_swap_ab=args.sweep_swap_ab,
+            sweep_split_k=args.sweep_split_k,
+        ):
             spec = bu.spec_for(cname, spec_map)
             if spec is None:
                 print(f"  {cname:52s} UNKNOWN config")
@@ -516,7 +525,7 @@ def main() -> int:
                 try:
                     g, h = _frost_graph(S, N, K, E, args.combo, args.output_mode, alignment)
                     with C.force_stg_epi(store == "stg"):
-                        plan = jit_from_cudnn_graph(g, config=cfg)
+                        plan = bu.with_workspace(jit_from_cudnn_graph(g, config=cfg))
                 except (NotImplementedError, ValueError) as e:
                     print(f"  {label:52s} UNSUPPORTED: {type(e).__name__}: {str(e)[:60]}")
                     continue

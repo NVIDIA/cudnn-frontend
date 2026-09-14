@@ -85,6 +85,33 @@ def test_importing_cudnn_ops_pulls_no_framework():
 
 
 @pytest.mark.L0
+def test_importing_nvfp4_qat_package_pulls_no_framework():
+    """Import the QAT namespace without materializing torch or Triton."""
+    stage = "import cudnn.sdpa.bwd.qat"
+    imported = _imported_by(stage)
+    _assert_absent(imported, stage)
+    assert "triton" not in imported, f"{stage} imported triton; it must not"
+
+
+def test_nvfp4_qat_missing_framework_retains_specific_install_hint():
+    """Preserve the QAT Triton extra hint alongside develop's named errors."""
+    probe = """
+import sys
+sys.modules["torch"] = None
+import cudnn
+try:
+    cudnn.Nvfp4AttentionQatBackward
+except ImportError as error:
+    assert "torch" in str(error), str(error)
+    assert "nvidia-cudnn-frontend[cutedsl,triton]" in str(error), str(error)
+else:
+    raise AssertionError("QAT API unexpectedly imported without torch")
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.L0
 def test_ops_symbol_reports_install_hint_without_torch():
     probe = """
 import importlib.abc
@@ -132,7 +159,7 @@ from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 from cudnn.frost.template_loader import load_template
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-path = pathlib.Path(cudnn.__file__).parent / "sdpa/fwd/kernels/prefill_d192_d128_f16_sm100.py"
+path = pathlib.Path(cudnn.__file__).parent / "sdpa/fwd/kernels/sm100/prefill_d192_d128_f16.py"
 load_template(str(path), TemplateParams(dtype_qkv=3), tag="d192_f16_no_torch")
 
 class Ex2Probe:

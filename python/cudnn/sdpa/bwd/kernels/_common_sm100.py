@@ -5,7 +5,7 @@
 
 Today this is the persistent-scheduler tile decode. It is a deliberate copy of
 the ``SCHED_NATURAL`` / ``SPLIT_PIPELINE == 1`` arm of
-``cudnn.sdpa.fwd.kernels._common_sm100.make_sdpa_helpers`` rather than an import
+``cudnn.sdpa.fwd.kernels._common_blackwell.make_sdpa_helpers`` rather than an import
 of it: that factory also carries split-KV, pack-GQA and THD, none of which the
 backward has, and cross-pass imports between kernel trees are the coupling the
 FROST engine contract warns about. The arithmetic below is identical, so the two
