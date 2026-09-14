@@ -42,6 +42,11 @@ Screening uses 10 warmup pairs and 31 timed pairs; it is not final acceptance.
 | QK D-outer loop / groups of two / groups of four column pairs | 1.0010x / 1.0010x / 1.0005x | No demonstrated benefit |
 | Head-interleaved CTA work | 0.9345x | Reject |
 | 64-byte / 32-byte K/V TMA swizzle | 0.9926x / 0.9810x | Reject |
+| Initial / per-iteration warp staggering plus delayed V wait | 0.9998x / 0.8986x | Reject |
+| Two V buffers plus per-iteration staggering and delayed V wait | 0.8653x | Reject |
+| Four / two dedicated softmax warps, S/P exchanged through SMEM | 0.8396x / 0.8580x | Reject |
+| Two softmax warps with SMEM row state, compute budget 224 / 216 | 0.8558x / 0.8743x | Reject |
+| Two S/P exchange buffers and quad-shared row state | 0.8629x | Reject |
 
 Except for the initial denominator-only experiment, the candidates above
 passed BF16 FP32-reference tests with top-k counts 1, 2, 3, and 223, partial Q
@@ -69,6 +74,16 @@ one shared buffer for K and V to allow two resident CTAs. Although its small
 reference tests passed, one full-size comparison exceeded the output tolerance
 (two elements); a repeat did not reproduce that failure. It is rejected
 without an accuracy or performance claim.
+
+The dedicated-softmax prototypes keep FP32 S and row state, BF16 P, and
+native K128 loads. Their 20% strided full-shape O/LSE comparisons were
+bit-exact. The four-warp and initial two-warp versions report 64-byte and
+40-byte stacks. Moving row state into SMEM and using a 216-register compute
+budget eliminated stack/spill code, but remained slower. Removing a spill
+does not by itself establish a net latency improvement.
+Doubling the exchange buffers and sharing row state within each thread quad
+also remained spill-free and bit-exact in the 20% strided full-size check,
+but did not improve performance.
 
 **The additional 5% target has not been achieved in this screening.** Only the
 four-fold-unroll checkpoint below is adopted. Other experimental sources,
@@ -122,3 +137,63 @@ FP32-reference sample checks pass before and after timing.
 Absolute times drift during sustained runs; the ratios compare adjacent
 launches on the same GPU. Raw samples and source hashes are saved locally by
 the harness. These are control measurements, not an optimized-kernel result.
+
+## Hardware-counter follow-up
+
+Nsight Compute 2026.3 profiled the `1759da44` checkpoint on the same Server
+Edition GPU at 20% density. The kernel was compiled and warmed up before
+collection. Strided used 22 replay passes; local used 13. Neither GPU clocks
+nor caches were forcibly controlled, and the profiler warns that measurements
+can vary. These are diagnostic profiles, **not** acceptance timings.
+
+| Counter | Strided | Local |
+| --- | ---: | ---: |
+| Tensor FP pipeline utilization, elapsed-cycle basis | 93.70% | 93.83% |
+| L1/TEX throughput | 48.53% | 48.59% |
+| L2 throughput | 38.39% | 38.41% |
+| L2 hit rate | 97.05% | 99.25% |
+| DRAM throughput | 6.75% | 1.91% |
+| Local-memory spill requests | 0 | 0 |
+
+The profiler identifies Tensor FP as the limiting pipeline. In the strided
+profile, the leading warp stalls are fixed-latency execution dependencies
+(36.6% of cycles between issues) and math-pipeline contention (35.6%).
+Low issue-slot utilization alone therefore does not imply that the tensor
+pipeline is idle. See NVIDIA's
+[metric definitions](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-decoder).
+
+At unchanged clocks and tensor instruction count, raising throughput by 1.05x
+from 93.7% utilization would require approximately 98.4% utilization. This is
+a directional estimate from the measured profile, not a proof that another
+5% is achievable or impossible. It explains why extra memory buffering and
+source-level MMA reordering have not delivered large gains.
+
+The spill-free two-softmax-warp prototype was also profiled with 22 replay
+passes. Tensor FP utilization fell to 80.32%, while L1/TEX throughput rose to
+77.39%; local-memory spill requests remained zero. CTA-barrier waits became
+the leading stall reason (41.8% of cycles between issues). These observations
+are consistent with the extra S/P exchange and synchronization offsetting the
+benefit of moving softmax out of the MMA warps.
+
+To inspect the current checkout with the existing benchmark, use a private,
+ignored output directory and a supported local Nsight Compute installation:
+
+```bash
+VSA_PROFILE_DIR=/path/to/ignored/agent/agent_profiles
+mkdir -p "$VSA_PROFILE_DIR"
+ncu --clock-control none --cache-control none \
+    --kernel-name 'regex:.*BlockSparseAttnForwardSm120Blk128Fa4.*' \
+    --launch-skip 10 --launch-count 1 \
+    --section SpeedOfLight --section ComputeWorkloadAnalysis \
+    --section MemoryWorkloadAnalysis \
+    --export "$VSA_PROFILE_DIR/blk128_checkpoint" \
+    python benchmark/bsa/benchmark_sm120_blk128_pair.py \
+    --baseline-source python/cudnn/block_sparse_attention/csrc/fwd/sm120_blk128/bsa_fwd_sm120_fa4.py \
+    --densities 0.20 --patterns strided --warmup 10 --repeats 3
+```
+
+Here both variants use the same checkout; the kernel-name filter and launch
+skip select a warmed native blk128 invocation. Ignore timing ratios printed
+while the profiler is attached. Run the paired acceptance benchmark separately
+without profiling. Raw profiler reports can contain machine details and must
+not be committed or shared without sanitization.
