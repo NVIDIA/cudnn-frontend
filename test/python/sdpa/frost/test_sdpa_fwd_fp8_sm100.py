@@ -716,6 +716,39 @@ def test_fp8_d256_padding(in_key, causal):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [256], ids=["d256"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_dense_q_trim_bottom_right_multiwave(d):
+    """More Q tiles than SMs (3 x 8 heads x 8 tiles of 128 rows), batches of
+    different lengths, bottom-right: a persistent worker crosses batches, and
+    the second tile's diagonal and keyless-row test must use ITS batch's
+    lengths (the wide templates take the next tile's bounds from the scheduler
+    payload and used to keep the previous batch's lengths)."""
+    result = _run(
+        3,
+        8,
+        8,
+        1024,
+        1024,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_lens_q=[1024, 640, 0],
+        seq_lens_kv=[800, 1024, 512],
+        d_qk=d,
+        d_v=d,
+        return_lse=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+    # batch 0: diagonal 800 - 1024 = -224 -> rows 0..223 keyless; batch 1: diagonal +384, no keyless row; batch 2 empty
+    assert (result.output[0, :, :224] == 0).all() and torch.isneginf(result.stats[0, :, :224]).all()
+    assert (result.output[1, :, 640:] == 0).all() and (result.output[2] == 0).all()
+    torch.testing.assert_close(result.stats[0, :, 224:], result.reference_stats[0, :, 224:], atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(result.stats[1, :, :640], result.reference_stats[1, :, :640], atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_dense_q_trim_bottom_right_sink(d):

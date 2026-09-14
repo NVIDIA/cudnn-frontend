@@ -1418,6 +1418,9 @@ def _tmaldg_warp_group(
         q_super_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(3)).load())
         head_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(4)).load())
         batch_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(5)).load())
+        # the next tile may belong to another batch: its lengths feed the mask diagonal and the keyless-row test
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor)
         kv_head_idx = cute.arch.make_warp_uniform(head_idx // qh_per_kh)
         q_row_base = cute.arch.make_warp_uniform(q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M))
         q_seq_off, kv_seq_off, tma_batch = _thd_tma_offsets(seq_kv_lens_tensor, batch_idx, n_batch)
@@ -2751,6 +2754,9 @@ def _softmax_warp_group(
         nxt_v = cute.arch.make_warp_uniform(nxt_v)
         q_super_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(3)).load())
         batch_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(5)).load())
+        # the next tile may belong to another batch: its lengths feed the mask diagonal and the keyless-row test
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor)
         if cutlass.const_expr(SPLIT_KV > 1):
             split_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(10)).load())
         is_valid_tile = nxt_v & cutlass.Int32(1)
@@ -3491,6 +3497,9 @@ def _correction_warp_group(
         q_super_idx = sched.tile_id_smem.subview(payload_base + cutlass.Int32(3)).load()
         head_idx = sched.tile_id_smem.subview(payload_base + cutlass.Int32(4)).load()
         batch_idx = sched.tile_id_smem.subview(payload_base + cutlass.Int32(5)).load()
+        # the next tile may belong to another batch: its lengths feed the mask diagonal and the keyless-row test
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor)
         if cutlass.const_expr(SPLIT_KV > 1):
             split_idx = sched.tile_id_smem.subview(payload_base + cutlass.Int32(10)).load()
         is_valid_tile = nxt_v & cutlass.Int32(1)

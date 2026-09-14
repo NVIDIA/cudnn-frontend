@@ -707,7 +707,7 @@ def make_sdpa_helpers(
     def _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, scalar_seqlen_kv):
         if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT == 1):
             arr = cutlass.make_array_view(seq_kv_lens_tensor)
-            return cutlass.Int32(arr[batch_idx])
+            return cutlass.Int32(arr[cutlass.Int32(batch_idx)])  # batch_idx may be a raw arith value after a payload read
         return scalar_seqlen_kv
 
     @cute.jit
