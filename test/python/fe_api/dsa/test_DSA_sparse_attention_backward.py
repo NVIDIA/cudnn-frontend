@@ -1138,9 +1138,10 @@ def test_DSA_sparse_attention_backward_sm90_scales_ds_before_conversion(dtype, k
     s_q, s_kv, num_heads, head_dim, head_dim_v = 1, 64, 32, 576, 512
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    # Zero scores make P exactly uniform.  Only KV row zero contributes to
-    # dQ, so the result exposes the dS conversion without reduction noise.
+    # Q is nonzero only where KV is zero, so scores remain zero and P is
+    # exactly uniform.  The Q tail makes dKV[:, head_dim_v:] a pure dK term.
     q = torch.zeros(s_q, num_heads, head_dim, dtype=dtype, device=device)
+    q[..., head_dim_v:] = 0.25
     kv = torch.zeros(s_kv, head_dim, dtype=dtype, device=device)
     kv[0, :head_dim_v] = kv_value
     attn_sink = torch.full((num_heads,), -math.inf, dtype=torch.float32, device=device)
@@ -1175,8 +1176,14 @@ def test_DSA_sparse_attention_backward_sm90_scales_ds_before_conversion(dtype, k
     old_dq_value = (prematurely_narrowed_ds.float() * kv_scalar.float()).to(dtype).item()
     assert expected_dq_value != old_dq_value
 
+    q_tail_scalar = torch.tensor(0.25, dtype=dtype)
+    expected_dkv_tail_value = (ds_scaled.float() * q_tail_scalar.float() * num_heads).to(dtype).item()
+    old_dkv_tail_value = (prematurely_narrowed_ds.float() * q_tail_scalar.float() * num_heads).to(dtype).item()
+    assert expected_dkv_tail_value != old_dkv_tail_value
+
     expected_dq = torch.zeros_like(q)
     expected_dq[:, :, :head_dim_v] = expected_dq_value
+    assert torch.equal(result["dkv"][0, head_dim_v:], torch.full_like(result["dkv"][0, head_dim_v:], expected_dkv_tail_value))
     assert torch.equal(result["dq"], expected_dq)
     assert torch.isfinite(result["dkv"]).all()
     assert torch.isfinite(result["d_sink"]).all()
