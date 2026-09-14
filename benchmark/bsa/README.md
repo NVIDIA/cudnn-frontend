@@ -1,5 +1,8 @@
 # SM120 native blk128 BSA benchmark
 
+See [the optimization screening log](SM120_OPTIMIZATION.md) for ongoing
+same-device comparisons against the current kernel and the additional 5% goal.
+
 This benchmark covers the native SM120 BF16 block-sparse attention forward
 kernel with the target workload:
 
