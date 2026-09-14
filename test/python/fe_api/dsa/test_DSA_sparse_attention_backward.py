@@ -1235,6 +1235,77 @@ def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "dtype,kv_value,dout_value",
+    [
+        pytest.param(torch.bfloat16, 14.8125, 0.2255859375, id="bf16-rounding"),
+        pytest.param(torch.float16, 10.0, 1000.0, id="fp16-intermediate-overflow"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm90_scales_ds_before_conversion(dtype, kv_value, dout_value):
+    """Scale dS in FP32 before narrowing it for the Hopper MMA operands."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm90()
+    device = torch.device("cuda")
+    s_q, s_kv, num_heads, head_dim, head_dim_v = 1, 64, 32, 576, 512
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    # Q is nonzero only where KV is zero, so scores remain zero and P is
+    # exactly uniform.  The Q tail makes dKV[:, head_dim_v:] a pure dK term.
+    q = torch.zeros(s_q, num_heads, head_dim, dtype=dtype, device=device)
+    q[..., head_dim_v:] = 0.25
+    kv = torch.zeros(s_kv, head_dim, dtype=dtype, device=device)
+    kv[0, :head_dim_v] = kv_value
+    attn_sink = torch.full((num_heads,), -math.inf, dtype=torch.float32, device=device)
+    topk_idxs = torch.arange(s_kv, dtype=torch.int32, device=device).view(1, -1)
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, softmax_scale=softmax_scale)
+    dout = torch.full_like(out, dout_value)
+
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+    )
+    torch.cuda.synchronize()
+
+    # Mirror the intended cast graph using scalar values that are exact in
+    # FP32.  The BF16 case moves by one output ULP if dS is narrowed before
+    # scaling; the FP16 case overflows that premature conversion to infinity.
+    kv_scalar = torch.tensor(kv_value, dtype=dtype)
+    dout_scalar = torch.tensor(dout_value, dtype=dtype)
+    out_scalar = (kv_scalar.float() / s_kv).to(dtype)
+    dp = head_dim_v * dout_scalar.float() * kv_scalar.float()
+    delta = head_dim_v * out_scalar.float() * dout_scalar.float()
+    ds_unscaled = (dp - delta) / s_kv
+    ds_scaled = (ds_unscaled * softmax_scale).to(dtype)
+    expected_dq_value = (ds_scaled.float() * kv_scalar.float()).to(dtype).item()
+    prematurely_narrowed_ds = (ds_unscaled.to(dtype).float() * softmax_scale).to(dtype)
+    old_dq_value = (prematurely_narrowed_ds.float() * kv_scalar.float()).to(dtype).item()
+    assert expected_dq_value != old_dq_value
+
+    q_tail_scalar = torch.tensor(0.25, dtype=dtype)
+    expected_dkv_tail_value = (ds_scaled.float() * q_tail_scalar.float() * num_heads).to(dtype).item()
+    old_dkv_tail_value = (prematurely_narrowed_ds.float() * q_tail_scalar.float() * num_heads).to(dtype).item()
+    assert expected_dkv_tail_value != old_dkv_tail_value
+
+    expected_dq = torch.zeros_like(q)
+    expected_dq[:, :, :head_dim_v] = expected_dq_value
+    assert torch.equal(result["dkv"][0, head_dim_v:], torch.full_like(result["dkv"][0, head_dim_v:], expected_dkv_tail_value))
+    assert torch.equal(result["dq"], expected_dq)
+    assert torch.isfinite(result["dkv"]).all()
+    assert torch.isfinite(result["d_sink"]).all()
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=436)
 @pytest.mark.parametrize("compact", [True, False], ids=["compact", "non-compact"])
 def test_DSA_sparse_attention_backward_sm90_padded_topk_columns_contribute_zero(compact):
