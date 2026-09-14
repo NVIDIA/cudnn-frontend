@@ -1030,7 +1030,7 @@ def test_DSA_sparse_attention_backward_d576_2cta_ignored_nan_and_workspace_reuse
 @pytest.mark.parametrize("num_heads", [32, 128])
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
 @torch_fork_set_rng(seed=418)
-def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(num_heads, has_topk_length):
+def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(num_heads, has_topk_length, monkeypatch):
     """The 576/512 specialization must include sink mass in every gradient."""
     try:
         from cudnn import DSA
@@ -1074,6 +1074,7 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
     dout = out.clone()
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+    two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if num_heads == 128 else None
     result = DSA.sparse_attention_backward_wrapper(
         q,
         kv,
@@ -1087,6 +1088,8 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
         stream=stream,
     )
 
+    if num_heads == 128:
+        assert two_cta_calls, "the wrapper did not execute the H128/D576 two-CTA backend"
     check_ref_dsa_sparse_attention_backward(
         q,
         kv,
@@ -1497,7 +1500,7 @@ def test_DSA_sparse_attention_backward_sm100_specialized_handles_sink_limits(num
 )
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["sentinel-padding", "lengths"])
 @pytest.mark.parametrize("head_dim,expected_backend", [(512, "h128_2cta_m64"), (576, "h128_d576_2cta_m64")], ids=["d512", "d576"])
-def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim, expected_backend, s_q, topk, has_topk_length):
+def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim, expected_backend, s_q, topk, has_topk_length, monkeypatch):
     """Both H128 two-CTA routes must implement the empty and saturating softmax limits.
 
     A finite sink such as 2.4e38 overflows to +inf when rescaled by log2(e);
@@ -1512,16 +1515,14 @@ def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_backend
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
     num_heads, head_dim_v = 128, 512
     softmax_scale = 192**-0.5
-    assert _select_sm100_backend(
-        num_heads, head_dim, head_dim_v=head_dim_v, dtype=torch.bfloat16, max_topk=topk, device_capability=torch.cuda.get_device_capability()
-    ) == (expected_backend, 64)
+    two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if head_dim == 576 else None
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     kv = torch.randn(1, head_dim, dtype=torch.bfloat16, device=device)
@@ -1560,11 +1561,17 @@ def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim
         for name in ("dq", "dkv", "d_sink"):
             assert torch.equal(result[name], torch.zeros_like(result[name])), f"{name} must be zero for sink={sink_value}"
 
+    # Prove the route that produced these results, not just the selector.
+    if head_dim == 576:
+        assert two_cta_calls, "the wrapper did not execute the H128/D576 two-CTA backend"
+    else:
+        assert any(key[0] == expected_backend and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache)
+
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=676)
 @pytest.mark.parametrize("head_dim,expected_backend", [(512, "h128_2cta_m64"), (576, "h128_d576_2cta_m64")], ids=["d512", "d576"])
-def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_negative_lse(head_dim, expected_backend):
+def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_negative_lse(head_dim, expected_backend, monkeypatch):
     """Padded slots must not overflow when every valid logit and the sink are far below zero.
 
     The two-CTA kernels zero-fill K and V for invalid slots, so those scores are
@@ -1579,16 +1586,14 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_backend
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
     s_q, s_kv, topk, num_heads, valid_slots = 4, 300, 128, 128, 3
     softmax_scale = head_dim**-0.5
-    assert _select_sm100_backend(
-        num_heads, head_dim, head_dim_v=512, dtype=torch.bfloat16, max_topk=topk, device_capability=torch.cuda.get_device_capability()
-    ) == (expected_backend, 64)
+    two_cta_calls = _spy_d576_two_cta_execute(monkeypatch) if head_dim == 576 else None
 
     # Every logit is about -10 * head_dim * softmax_scale (below -200 nats) and the sink is disabled.
     q = torch.full((s_q, num_heads, head_dim), 10.0, dtype=torch.bfloat16, device=device)
@@ -1609,6 +1614,10 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
     unselected[topk_idxs[:, :valid_slots].flatten().long()] = False
     assert torch.equal(result["dkv"][unselected], torch.zeros_like(result["dkv"][unselected]))
     assert (result["dq"] != 0).any()
+    if head_dim == 576:
+        assert two_cta_calls, "the wrapper did not execute the H128/D576 two-CTA backend"
+    else:
+        assert any(key[0] == expected_backend and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache)
 
 
 @pytest.mark.L0

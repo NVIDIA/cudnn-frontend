@@ -2698,9 +2698,11 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         # above about log2(N_TILE), so clamping at 64 changes no
                         # valid value while keeping P and dS finite; the zero K
                         # and V rows then contribute exact zeros to dQ, and the
-                        # rows are never scattered to dKV.
-                        v0 = cute.arch.fmin(v0, Float32(64.0))
-                        v1 = cute.arch.fmin(v1, Float32(64.0))
+                        # rows are never scattered to dKV.  nan=True keeps a
+                        # NaN LSE or sink propagating (PTX min.NaN), as the
+                        # generic and D576 kernels do.
+                        v0 = cute.arch.fmin(v0, Float32(64.0), nan=True)
+                        v1 = cute.arch.fmin(v1, Float32(64.0), nan=True)
                         v0 = cute.math.exp2(v0, fastmath=True)
                         v1 = cute.math.exp2(v1, fastmath=True)
                         r_score[i0] = v0
