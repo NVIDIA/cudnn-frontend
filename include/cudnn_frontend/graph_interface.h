@@ -2354,9 +2354,18 @@ class Graph : public ICudnn, public INode {
         return *this;
     }
 
+    /**
+     * @brief Sets the maximum dynamic shared memory, in bytes, allowed for an execution plan.
+     *
+     * Call this before create_execution_plans() to let supported backends use the limit while
+     * selecting pipeline stages. For direct-engine flows, call it before get_knobs_for_engine()
+     * or create_execution_plan(). Changing the limit after a query does not regenerate existing
+     * engine configurations or resize their pipeline stages; it only affects subsequent queries
+     * and the existing post-query engine-config filter.
+     */
     Graph &
-    deselect_shared_mem_greater_than(int64_t const workspace) {
-        plans.set_max_shared_mem_allowed(workspace);
+    deselect_shared_mem_greater_than(int64_t const shared_memory_limit) {
+        plans.set_max_shared_mem_allowed(shared_memory_limit);
         return *this;
     }
 

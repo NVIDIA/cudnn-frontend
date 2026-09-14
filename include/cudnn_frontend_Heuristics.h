@@ -5,8 +5,6 @@
 
 #pragma once
 
-#include <algorithm>
-#include <limits>
 #include <vector>
 #include <mutex>
 
@@ -264,23 +262,15 @@ class EngineHeuristicsBuilder_v8 {
 #endif
 
 #if (CUDNN_VERSION >= 92700)
-        // A backend value of zero means no limit was specified. Leave non-positive
-        // frontend limits to the existing engine-config filter so its semantics do not change.
-        if (m_heuristics.shared_memory_limit > 0 && detail::get_backend_version() >= 92700) {
-            auto const shared_memory_limit = static_cast<int32_t>(
-                std::min<int64_t>(m_heuristics.shared_memory_limit, std::numeric_limits<int32_t>::max()));
-            status = detail::set_attribute(m_heuristics.pointer->get_backend_descriptor(),
-                                           CUDNN_ATTR_ENGINEHEUR_SHARED_MEMORY_LIMIT,
-                                           CUDNN_TYPE_INT32,
-                                           1,
-                                           &shared_memory_limit);
-            if (status != CUDNN_STATUS_SUCCESS) {
-                set_error_and_throw_exception(&m_heuristics,
-                                              status,
-                                              "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: SetAttribute "
-                                              "CUDNN_ATTR_ENGINEHEUR_SHARED_MEMORY_LIMIT Failed");
-                return std::move(m_heuristics);
-            }
+        status = detail::set_shared_memory_limit_if_supported(m_heuristics.pointer->get_backend_descriptor(),
+                                                              CUDNN_ATTR_ENGINEHEUR_SHARED_MEMORY_LIMIT,
+                                                              m_heuristics.shared_memory_limit);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_heuristics,
+                                          status,
+                                          "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: SetAttribute "
+                                          "CUDNN_ATTR_ENGINEHEUR_SHARED_MEMORY_LIMIT Failed");
+            return std::move(m_heuristics);
         }
 #endif
 
