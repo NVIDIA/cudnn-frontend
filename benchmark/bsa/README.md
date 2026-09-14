@@ -3,6 +3,27 @@
 See [the optimization screening log](SM120_OPTIMIZATION.md) for ongoing
 same-device comparisons against the current kernel and the additional 5% goal.
 
+For a kernel-to-kernel A/B comparison, save the baseline version of
+`python/cudnn/block_sparse_attention/csrc/fwd/sm120_blk128/bsa_fwd_sm120_fa4.py`
+as `baseline.py` under your local ignored agent workspace, then run:
+
+```bash
+python benchmark/bsa/benchmark_sm120_blk128_pair.py \
+  --baseline-source /path/to/agent/agent_space/baseline.py \
+  --repeats 101 --min-speedup 1.05 --fail-below-target \
+  --json /path/to/agent/agent_benchmark/paired.json
+```
+
+The saved source and installed candidate use the same installed dependencies.
+This isolates the kernel-file change; it does not reproduce another checkout's
+entire dependency environment. The script compiles both variants, alternates
+A/B and B/A launches, checks representative rows against FP32 before and after
+timing, and exits nonzero if any requested density/pattern misses the target.
+Repeat the run in separate processes before accepting a small gain. A 1.05x
+speedup means a 4.76% latency reduction; use `--min-speedup 1.052631579` if the
+requirement is a full 5% latency reduction. JSON includes raw event samples and
+source hashes, but no host name, IP address, GPU UUID, or source paths.
+
 This benchmark covers the native SM120 BF16 block-sparse attention forward
 kernel with the target workload:
 
