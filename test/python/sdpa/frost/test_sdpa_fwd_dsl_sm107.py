@@ -329,25 +329,34 @@ def test_sm107_rows_carry_the_padded_stats_trim():
 
 
 def test_sm107_rows_serve_natural_scheduling_only():
-    """The ROW-WIDE floor of every Rubin row stays NATURAL-only: LPT is claimed
-    per flavor (`sched_policies_by_d_shape`) where it is validated -- the f16
-    and, since 2026-09-11, the FP8 (256, 256) kernels -- and nowhere else.
-    SCHED_LPT_L2 is claimed by no Rubin flavor (its decode needs qh_per_kh /
-    seqlen_kv, which the SM107 call sites do not pass).
+    """The ROW-WIDE floor of every Rubin row stays NATURAL-only: every LPT
+    variant is claimed per flavor (`sched_policies_by_d_shape`) where it is
+    validated.  SCHED_LPT_L2 needs `qh_per_kh` / `seqlen_kv` at every decode
+    call site, which only the d128 / d192x128 FP8 and MXFP8 kernels pass, so it
+    may appear ONLY on those flavors -- INVERTED 2026-09-14 (it used to appear
+    on none, and the MXFP8 row claimed nothing beyond NATURAL).
 
     (This test used to assert LPT was "not honored" by the ported kernels; the
     cause was the dropped `lpt_q_tiles_in_cga_units` argument, fixed in #1001.
-    The per-flavor claims are pinned by the *_advertises_lpt_only_* tests.)"""
+    The per-flavor claims are pinned by the *_advertises_lpt_* tests.)"""
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 
-    for row in ("sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_prefill_sm107_mxfp8"):
+    lpt_l2_flavors = {
+        "sdpa_fwd_prefill_sm107": set(),
+        "sdpa_fwd_prefill_sm107_fp8": {(192, 128)},
+        "sdpa_fwd_prefill_sm107_mxfp8": {(128, 128), (192, 128)},
+    }
+    for row, l2_shapes in lpt_l2_flavors.items():
         caps = _caps(row)
         assert caps.sched_policies == frozenset({SCHED_NATURAL}), row
         assert SCHED_LPT not in caps.sched_policies, row
         assert SCHED_LPT_L2 not in caps.sched_policies, row
-        for _shape, dom in caps.sched_policies_by_d_shape:
-            assert SCHED_LPT_L2 not in dom, row
-    assert _caps("sdpa_fwd_prefill_sm107_mxfp8").sched_policies_by_d_shape == (), "MXFP8 is unvalidated under LPT"
+        claimed_l2 = {shape for shape, dom in caps.sched_policies_by_d_shape if SCHED_LPT_L2 in dom}
+        assert claimed_l2 == l2_shapes, (row, claimed_l2)
+    assert dict(_caps("sdpa_fwd_prefill_sm107_mxfp8").sched_policies_by_d_shape) == {
+        (128, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+        (192, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+    }, "MXFP8 claims LPT and LPT_L2 exactly where its kernels thread the decode inputs"
 
 
 def test_sched_points_falls_back_along_the_preference_order():
@@ -378,6 +387,15 @@ def test_sched_points_falls_back_along_the_preference_order():
     # domain this returned [NATURAL] and LPT was never proposed.
     facts256 = facts.__class__(**{**facts.__dict__, "d_qk": 256, "d_v": 256})
     assert heuristics._sched_points(rubin_fp8, facts256) == [SCHED_LPT, SCHED_NATURAL]
+
+    # (192, 128) FP8 threads the LPT_L2 decode inputs and claims LPT_L2, so the
+    # causal primary IS in domain: the ranking leads with it and keeps both
+    # fallbacks as autotune runners.  A mask-free graph gains nothing from
+    # either remap, so dense ranks NATURAL alone.
+    facts192 = facts.__class__(**{**facts.__dict__, "d_qk": 192, "d_v": 128})
+    assert heuristics._sched_points(rubin_fp8, facts192) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    dense192 = facts.__class__(**{**facts192.__dict__, "causal": False})
+    assert heuristics._sched_points(rubin_fp8, dense192) == [SCHED_NATURAL]
 
     # ...and the multi-element case, which is the branch the single-element
     # shortcut above skips: with a causal primary (LPT_L2) OUT of domain, the
@@ -633,7 +651,10 @@ def test_sm107_fp8_advertises_lpt_only_for_the_validated_d_shape():
     """The FP8 twin of the f16 test above: (256, 256) and (192, 128) serve LPT
     (validated 2026-09-11 through the standalone adapter, bit-identical to
     NATURAL -- see the row's comment); d128 and d512 do not; the row-wide floor
-    stays NATURAL; LPT_L2 nowhere."""
+    stays NATURAL.  LPT_L2 needs qh_per_kh / seqlen_kv at every decode call
+    site: the d128 and d192x128 kernels thread them, (192, 128) is validated
+    bit-identical under LPT_L2 and claims it (2026-09-14); d128 waits with its
+    LPT claim; d256 / d512 pass neither argument."""
     import cudnn
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa.fwd import engines
@@ -645,17 +666,18 @@ def test_sm107_fp8_advertises_lpt_only_for_the_validated_d_shape():
         assert SCHED_LPT in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
     for shape in ((128, 128), (512, 512)):
         assert SCHED_LPT not in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
-    for shape in ((128, 128), (192, 128), (256, 256), (512, 512)):
+    assert SCHED_LPT_L2 in engines.effective_sched_policies(caps, _f16_facts(d_qk=192, d_v=128, **fp8))
+    for shape in ((128, 128), (256, 256), (512, 512)):
         assert SCHED_LPT_L2 not in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
 
 
 @pytest.mark.L0
 def test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape():
     """Requesting LPT on the FP8 row: ACCEPTED at d256 and d192xd128, DECLINED
-    (typed, naming the knob) at d128 and d512 -- never silently downgraded
-    (engine contract, Rule 4)."""
+    (typed, naming the knob) at d128 and d512; LPT_L2: ACCEPTED at d192xd128
+    only -- never silently downgraded (engine contract, Rule 4)."""
     import cudnn
-    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
@@ -665,6 +687,10 @@ def test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape():
         assert engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None, shape
     for shape in ((128, 128), (512, 512)):
         why = engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT))
+        assert why is not None and "sched_policy" in why, shape
+    assert engines.mismatch(caps, _f16_facts(d_qk=192, d_v=128, **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT_L2)) is None
+    for shape in ((128, 128), (256, 256), (512, 512)):
+        why = engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT_L2))
         assert why is not None and "sched_policy" in why, shape
 
 
@@ -756,3 +782,127 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
     assert params[-1] == "thd_stats_padded"
     assert params.index("thd") + 1 == params.index("max_total_seq_len_q")
+
+
+# --- MXFP8 scheduler-policy claims (2026-09-14) -------------------------------
+# The d128 and d192x128 MXFP8 kernels thread qh_per_kh / seqlen_kv into every
+# decode call site (the LPT_L2 cost-model inputs the shared decode raises
+# without), so they honour LPT AND LPT_L2; d256 / d512 pass neither and stay
+# NATURAL.  Pure tests first (row + ranking), then the Rubin e2e that is the
+# evidence for the claim.
+
+
+def _mxfp8_facts(**kw):
+    import cudnn
+
+    return _f16_facts(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True, **kw)
+
+
+@pytest.mark.L0
+def test_sm107_mxfp8_advertises_lpt_and_lpt_l2_per_d_shape():
+    """INVERTED 2026-09-14 (the row was NATURAL-only): d128 and d192x128 claim
+    LPT and LPT_L2, d256 and d512 do not, the row-wide floor stays NATURAL --
+    and the claim REACHES the ranking (causal leads with LPT_L2, dense stays
+    NATURAL).  An accept AND a reject per shape (engine contract, Rule 9)."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+    from cudnn.sdpa.fwd import engines, heuristics
+
+    caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
+    assert caps.sched_policies == frozenset({SCHED_NATURAL}), "the row-wide floor must stay NATURAL"
+    for shape in ((128, 128), (192, 128)):
+        dom = engines.effective_sched_policies(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1]))
+        assert dom == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}), (shape, dom)
+        assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1], causal=True)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], shape
+        assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1])) == [SCHED_NATURAL], shape
+    for shape in ((256, 256), (512, 512)):
+        dom = engines.effective_sched_policies(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1]))
+        assert dom == frozenset({SCHED_NATURAL}), (shape, dom)
+        assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1], causal=True)) == [SCHED_NATURAL], shape
+
+
+@pytest.mark.L0
+def test_sm107_mxfp8_sched_knob_is_honored_or_ineligible_per_d_shape():
+    """Requesting LPT or LPT_L2 on the MXFP8 row: ACCEPTED at d128 and
+    d192x128, DECLINED (typed, naming the knob) at d256 and d512 -- never
+    silently downgraded (engine contract, Rule 4)."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
+    for pol in (SCHED_LPT, SCHED_LPT_L2):
+        for shape in ((128, 128), (192, 128)):
+            assert engines.mismatch(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1]), SdpaFwdKnobs(sched_policy=pol)) is None, (pol, shape)
+        for shape in ((256, 256), (512, 512)):
+            why = engines.mismatch(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1]), SdpaFwdKnobs(sched_policy=pol))
+            assert why is not None and "sched_policy" in why, (pol, shape)
+
+
+@pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128)])
+@pytest.mark.parametrize("causal, b, hq, hkv, s", [(True, 2, 16, 4, 2048), (False, 1, 8, 2, 1024)])
+def test_mxfp8_sched_policies_are_bit_identical_to_natural(d_qk, d_v, causal, b, hq, hkv, s):
+    """Rubin e2e behind the MXFP8 (128, 128) and (192, 128) LPT / LPT_L2
+    claims: the same block-scaled problem under EVERY policy the row claims
+    for the flavor.  The scheduler only reorders whole (batch, head, q-tile)
+    work items -- each tile's KV loop is unchanged -- so O and LSE must be
+    BIT-IDENTICAL to NATURAL, every cell written (sentinel-filled O, NaN-filled
+    LSE), and all within the fp32 oracle bound.  The causal case is a
+    multi-wave grid (256 work items over ~106 clusters) so the persistent
+    loop walks the remapped order for several rounds."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 MXFP8 kernels serve cc10.7 only")
+    from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
+    policies = sorted(engines.effective_sched_policies(caps, _mxfp8_facts(d_qk=d_qk, d_v=d_v, causal=causal)))
+    assert SCHED_NATURAL in policies and len(policies) == 3, policies
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    qf = torch.randn(b, hq, s, d_qk, device=dev) * 0.5
+    kf = torch.randn(b, hkv, s, d_qk, device=dev) * 0.5
+    vf = torch.randn(b, hkv, s, d_v, device=dev) * 0.5
+
+    def mx(x, h, d, columnwise):
+        data_d, _, swz_d, data_s, _, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, s, d, 32, torch.float8_e4m3fn, with_ref=False)
+        data, swz = (data_s, swz_s) if columnwise else (data_d, swz_d)
+        return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), swz.contiguous()  # BHSD view over BSHD storage
+
+    q8, sfq = mx(qf, hq, d_qk, False)
+    k8, sfk = mx(kf, hkv, d_qk, False)
+    v8, sfv = mx(vf, hkv, d_v, True)
+    outs, lses = {}, {}
+    for pol in policies:
+        out = torch.full((b, s, hq, d_v), 1.5e30, device=dev, dtype=torch.bfloat16).transpose(1, 2)  # sentinel: an unclaimed tile stays visible
+        lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
+        api = SdpaFwdDslSm100(
+            q8, k8, v8, out, lse, scale_softmax=d_qk**-0.5, is_causal=causal, pertensor_fp8=False, dtype_o=torch.bfloat16, sched_policy=pol, cga=2
+        )
+        assert api.check_support()
+        api.compile()
+        api.execute(q8, k8, v8, out, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        torch.cuda.synchronize()
+        outs[pol], lses[pol] = out.clone(), lse.clone()
+    rep = hq // hkv
+    logits = qf @ kf.repeat_interleave(rep, 1).transpose(-1, -2) * d_qk**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    ref = torch.softmax(logits, dim=-1) @ vf.repeat_interleave(rep, 1)
+    scale = ref.abs().max().item()
+    for pol in policies:
+        assert torch.isfinite(outs[pol]).all(), f"policy {pol}: non-finite / unwritten O cells"
+        assert torch.isfinite(lses[pol]).all(), f"policy {pol}: unwritten LSE rows"
+        err = (outs[pol].float() - ref).abs().max().item()
+        assert err <= 0.1 * scale, f"policy {pol}: max err {err} vs fp32 reference (scale {scale})"
+    for pol in policies:
+        if pol != SCHED_NATURAL:
+            assert torch.equal(
+                outs[pol], outs[SCHED_NATURAL]
+            ), f"policy {pol}: O must be bit-identical to NATURAL -- a different tile walk, the same per-tile math"
+            assert torch.equal(lses[pol], lses[SCHED_NATURAL]), f"policy {pol}: LSE must be bit-identical to NATURAL"

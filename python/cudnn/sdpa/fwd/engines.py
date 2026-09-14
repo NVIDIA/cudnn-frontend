@@ -828,9 +828,11 @@ def _sm107_spec() -> EngineSpec:
             #
             # Only (256, 256) is claimed: d128 and d512 are unvalidated under
             # LPT here, and d512 is cga4x1 role-split with a different scheduler
-            # shape. SCHED_LPT_L2 is claimed by NO flavor -- its decode needs
-            # `qh_per_kh` and `seqlen_kv`, which the SM107 call sites do not
-            # pass, so it raises rather than miscomputes. Both are follow-ups.
+            # shape. SCHED_LPT_L2 is claimed by NO f16 flavor -- its decode
+            # needs `qh_per_kh` and `seqlen_kv` at every call site, which the
+            # f16 kernels do not pass (the d128 / d192x128 FP8 and MXFP8
+            # kernels do; see those rows), so it raises rather than
+            # miscomputes. Both are follow-ups.
             sched_policies=frozenset({SCHED_NATURAL}),
             sched_policies_by_d_shape=(((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),),
             tile_ms=frozenset({128}),
@@ -1042,10 +1044,11 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # d512 (cga4x1 role-split) is deliberately untouched: different
             # scheduler shape, and the old NaN report there is unexplained.
             #
-            # SCHED_LPT_L2 stays off on Rubin for a DIFFERENT and still-open
-            # reason: its decode needs `qh_per_kh` and `seqlen_kv` at every call
-            # site and the SM107 kernels pass neither, so it raises rather than
-            # miscomputes. Threading those two arguments is the follow-up.
+            # SCHED_LPT_L2 is claimed PER FLAVOR too, and only where the kernel
+            # threads `qh_per_kh` / `seqlen_kv` into every decode call site --
+            # the LPT_L2 cost model's inputs, which the shared decode raises
+            # without at trace time.  The d128 and d192x128 kernels do (through
+            # make_split_helpers); the d256 and d512 kernels do not.
             #
             # The "KNOWN COST" this note used to carry -- that the d128 FP8
             # kernel honours LPT but loses the plan because sched_policies is
@@ -1065,6 +1068,13 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # tile's KV loop is unchanged), sentinel 0, two-launch 0.  Perf node,
             # d256 causal H32/2, LPT vs NATURAL launch-interleaved: +5.2/+5.9/
             # +5.6/+2.0/+2.3 % at S=2K..32K (control pair within 1.9 %).
+            # (192, 128) serves SCHED_LPT_L2 as well (2026-09-14): O and LSE
+            # under LPT_L2 are bit-identical to NATURAL on the same inputs
+            # (dense and causal, sentinel 0).  Heuristics rank LPT_L2 first for
+            # every causal graph whose per-head K+V fits the L2 budget -- which
+            # is every charted shape -- and plain LPT is the autotune runner:
+            # on the perf node LPT loses at many-wave causal shapes (d192x128
+            # H128, S=8K/16K: -6.5 % / -13 % vs NATURAL) where LPT_L2 does not.
             # NOT claimed: (128, 128) -- also bit-identical, but its causal path
             # sits at 0.041-0.048 vs the suite's 0.04 under NATURAL too, so it
             # gets its own look first; (512, 512) -- the cga4x1 role-split kernel
@@ -1073,7 +1083,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # NOTHING (sentinel on 100 % of cells; the old "NaN" report was that
             # unwritten output being read).
             sched_policies_by_d_shape=(
-                (((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})), ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT}))) if rubin_row else ()
+                (((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})), ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}))) if rubin_row else ()
             ),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
@@ -1145,18 +1155,35 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             # every Rubin kernel, not an accepted-and-ignored flag.
             lse_optional=True,
             skv_tail_via_padding=True,
-            # NATURAL ONLY.  Session 6 dropped SCHED_LPT_L2 from this row
-            # (the ported decode sites never thread qh_per_kh / seqlen_kv);
-            # SCHED_LPT is ALSO not honored, and that stayed hidden because
-            # heuristics could not reach it: its causal primary is LPT_L2, and
-            # the old out-of-domain fallback dropped straight to NATURAL.  Fixing
-            # that fallback (heuristics._sched_points) made causal graphs pick
-            # LPT here for the first time and turned 23 green MXFP8 tests red
-            # with max|O-ref| ~ 1.9-4.1 -- dense stayed correct, every masked
-            # shape did not.  A knob is honored or the engine is ineligible, so
-            # the row claims only what its kernels serve.  INVERTS-WHEN the LPT
-            # decode is threaded and validated on the ported Rubin kernels.
+            # NATURAL row-wide; LPT and LPT_L2 claimed PER FLAVOR, like the f16
+            # and FP8 rows, where the kernel honours them.
+            #
+            # This row was NATURAL-only until 2026-09-14.  The report that kept
+            # it there -- causal MXFP8 graphs under LPT turning 23 green tests
+            # red with max|O-ref| ~ 1.9-4.1 while dense stayed correct -- has
+            # the #1001 signature: the SM107 port had dropped
+            # `lpt_q_tiles_in_cga_units=True`, so the LPT decode claimed no
+            # tile and the kernel wrote nothing (dense graphs rank NATURAL and
+            # never took that path).  With the argument restored the d128 and
+            # d192x128 MXFP8 kernels honour LPT, and they now thread
+            # `qh_per_kh` / `seqlen_kv` into every decode call site (the
+            # LPT_L2 cost-model inputs the shared decode raises without), so
+            # they honour LPT_L2 as well.  VALIDATED on Rubin through the
+            # standalone adapter (E4M3 block scales, bf16 O, dense and causal):
+            # O and LSE under LPT and under LPT_L2 are BIT-IDENTICAL to NATURAL
+            # -- the scheduler reorders whole (batch, head, q-tile) work items,
+            # each tile's KV loop is unchanged -- with a sentinel-filled O
+            # (0 unwritten cells); and the MXFP8 suite, whose causal cases now
+            # rank LPT_L2 first, stays green.  Pinned by the Rubin e2e
+            # test_mxfp8_sched_policies_are_bit_identical_to_natural.
+            # NOT claimed: (256, 256) and (512, 512) -- their kernels thread
+            # neither argument, and d512 (cga4x1 role-split) still lacks the
+            # #1001 argument and writes nothing under LPT.
             sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies_by_d_shape=(
+                ((128, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+                ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+            ),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),

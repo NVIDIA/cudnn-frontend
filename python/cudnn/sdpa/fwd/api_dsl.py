@@ -1627,12 +1627,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # which walks the live units through batch_remap.
             #
             # Rubin is excluded for a different reason.  `_causal_sched_policy`
-            # can pick SCHED_LPT_L2, which NO SM107 kernel honours (its decode
-            # needs qh_per_kh / seqlen_kv, which the ported call sites do not
-            # pass), and plain LPT is claimed PER FLAVOR on the SM107 rows
-            # (`sched_policies_by_d_shape`: f16 (256, 256); FP8 (256, 256) and
-            # (192, 128) -- validated bit-identical to NATURAL, 2026-09-11),
-            # not row-wide: the d512 role-split kernels still lack the
+            # can pick SCHED_LPT_L2, which only the d128 / d192x128 FP8 and
+            # MXFP8 kernels honour (the f16, d256 and d512 call sites do not
+            # pass its qh_per_kh / seqlen_kv inputs), and every LPT variant is
+            # claimed PER FLAVOR on the SM107 rows (`sched_policies_by_d_shape`:
+            # f16 (256, 256) LPT; FP8 (256, 256) LPT, (192, 128) LPT + LPT_L2;
+            # MXFP8 (128, 128) and (192, 128) LPT + LPT_L2 -- each validated
+            # bit-identical to NATURAL), not row-wide: the d512 role-split
+            # kernels still lack the
             # `lpt_q_tiles_in_cga_units` argument (#1001) and write nothing
             # under LPT.  The wrapper never consults a row, so this derivation
             # stays NATURAL on Rubin and a standalone caller REQUESTS

@@ -114,15 +114,20 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # so the sched domain is the same on both rows.
     assert sm107.split_kv_supported is True
     assert sm100.split_kv_supported is True
-    # The Rubin ROW-WIDE floor is NATURAL: LPT_L2 is honoured by no SM107
-    # kernel (the ported decode sites never thread qh_per_kh / seqlen_kv), and
-    # plain LPT is claimed PER FLAVOR through `sched_policies_by_d_shape` --
-    # (256, 256) and (192, 128) since 2026-09-11, validated bit-identical to
-    # NATURAL; d512 stays out (its role-split kernel still lacks the #1001
-    # `lpt_q_tiles_in_cga_units` argument and writes nothing under LPT, which
-    # is what the old "causal d512 FP8 under LPT returns NaN" report was).
+    # The Rubin ROW-WIDE floor is NATURAL, and every LPT variant is claimed PER
+    # FLAVOR through `sched_policies_by_d_shape`: plain LPT at (256, 256) and
+    # (192, 128) since 2026-09-11, LPT_L2 at (192, 128) since 2026-09-14 (its
+    # decode needs qh_per_kh / seqlen_kv at every call site, which the d128 and
+    # d192x128 kernels thread and the d256 / d512 kernels do not) -- each
+    # validated bit-identical to NATURAL; d512 stays out (its role-split kernel
+    # still lacks the #1001 `lpt_q_tiles_in_cga_units` argument and writes
+    # nothing under LPT, which is what the old "causal d512 FP8 under LPT
+    # returns NaN" report was).
     assert sm107.sched_policies == frozenset({SCHED_NATURAL})
-    assert dict(sm107.sched_policies_by_d_shape) == {(256, 256): frozenset({SCHED_NATURAL, SCHED_LPT}), (192, 128): frozenset({SCHED_NATURAL, SCHED_LPT})}
+    assert dict(sm107.sched_policies_by_d_shape) == {
+        (256, 256): frozenset({SCHED_NATURAL, SCHED_LPT}),
+        (192, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+    }
     assert sm100.sched_policies_by_d_shape == ()
     assert sm100.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
 
@@ -587,19 +592,41 @@ def test_sm107_split_matches_unsplit_on_rubin():
 @pytest.mark.parametrize("d_qk, d_v", [(256, 256), (192, 128)])
 @pytest.mark.parametrize("causal, b, s", [(True, 2, 1000), (False, 1, 1024)])
 def test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors(d_qk, d_v, causal, b, s):
-    """Rubin e2e for the FP8 (256, 256) and (192, 128) LPT claims: the same
-    quantized problem under SCHED_LPT and SCHED_NATURAL.  The scheduler only
-    reorders whole (batch, head, q-tile) work items -- each tile's KV loop is
-    unchanged -- so O must be BIT-IDENTICAL across the two policies (measured
-    0.0 on every case, 2026-09-11), and both stay within the module's fp32
-    oracle bound.  S=1000 causal covers a KV tail; dense needs S % 128 == 0."""
+    """Rubin e2e for the FP8 (256, 256) and (192, 128) scheduler claims: the
+    same quantized problem under EVERY policy the row claims for the flavor
+    (LPT on both; LPT_L2 on (192, 128) as well since 2026-09-14) and under
+    SCHED_NATURAL.  The scheduler only reorders whole (batch, head, q-tile)
+    work items -- each tile's KV loop is unchanged -- so O must be
+    BIT-IDENTICAL across the policies (measured 0.0 on every case), and all
+    stay within the module's fp32 oracle bound.  S=1000 causal covers a KV
+    tail; dense needs S % 128 == 0."""
     import torch
     import cudnn as _c
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    caps = {sp.name: sp.capabilities for sp in engines.ENGINE_SPECS}[engines.engine_name(arch="sm107", fp8=True)]
+    facts = ga.SdpaGraphFacts(
+        b=b,
+        h_q=8,
+        h_kv=2,
+        s_q=s,
+        s_kv=s,
+        d_qk=d_qk,
+        d_v=d_v,
+        dtype=_c.data_type.FP8_E4M3,
+        dtype_o=_c.data_type.BFLOAT16,
+        is_fp8=True,
+        causal=causal,
+        device_cc=(10, 7),
+    )
+    policies = sorted(engines.effective_sched_policies(caps, facts))
+    assert {SCHED_NATURAL, SCHED_LPT} <= set(policies), policies
 
     torch.manual_seed(0)
     hq, hkv = 8, 2
@@ -614,7 +641,7 @@ def test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors(d_qk, d_v, c
     k8, dk = quant(torch.randn(b, hkv, s, d_qk, device=dev) * 0.5)
     v8, dv = quant(torch.randn(b, hkv, s, d_v, device=dev) * 0.5)
     outs = {}
-    for pol in (SCHED_NATURAL, SCHED_LPT):
+    for pol in policies:
         out = torch.full((b, hq, s, d_v), 1.5e30, device=dev, dtype=torch.bfloat16)  # sentinel: an unclaimed tile stays visible
         api = SdpaFwdDslSm100(
             sample_q=q8, sample_k=k8, sample_v=v8, sample_o=out, scale_softmax=d_qk**-0.5, is_causal=causal, pertensor_fp8=True, sched_policy=pol
@@ -635,4 +662,8 @@ def test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors(d_qk, d_v, c
         assert torch.isfinite(out).all(), f"policy {pol}: non-finite / unwritten cells"
         err = (out.float() - ref).abs().max().item()
         assert err <= 0.1 * scale, f"policy {pol}: max err {err} vs fp32 reference (scale {scale})"
-    assert torch.equal(outs[SCHED_LPT], outs[SCHED_NATURAL]), "LPT must be bit-identical to NATURAL -- a different tile walk, the same per-tile math"
+    for pol in policies:
+        if pol != SCHED_NATURAL:
+            assert torch.equal(
+                outs[pol], outs[SCHED_NATURAL]
+            ), f"policy {pol} must be bit-identical to NATURAL -- a different tile walk, the same per-tile math"
