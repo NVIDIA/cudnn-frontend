@@ -10,6 +10,7 @@ import pathlib
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
+import cutlass
 import pytest
 import torch
 
@@ -565,75 +566,181 @@ def test_moe_grouped_matmul_fwd_auto_config_n_major_small_n() -> None:
 
 
 @pytest.mark.L0
-def test_moe_tma_store_uses_rank2_output_descriptor() -> None:
+@pytest.mark.parametrize("major", ("n", "m"))
+def test_moe_tma_store_uses_rank2_output_descriptor(major: str) -> None:
     """MoE's output is one flat (S, N) surface, so its TMA store must not carry
     the fixed-one batch dimension paid by ordinary batched GEMM. Besides being
     redundant in the descriptor, that extra coordinate selects UTMASTG.3D
     instead of UTMASTG.2D in SASS."""
-    from cudnn.gemm.frost.compiler import _epi_n, _host_tma_c_descs, _tma_store_sequence
+    from cudnn.gemm.frost.compiler import _epi_n, _host_tma_c_descs, _tma_c_plumbing, _tma_store_sequence
 
-    chain = analyze(_build_graph(E=4, S=512, N=256, K=128))
+    g = _build_graph(E=4, S=512, N=256, K=128)
+    if major == "m":
+        g.tensors["moe::OUT_0"].set_stride([512 * 256, 1, 512])
+        g.tensors["first_token_offset"].set_alignment_value(8)
+    chain = analyze(g)
     cfg = by_name(_CFG)
     epi_n = _epi_n(cfg, chain.output_dtype)
     host = _host_tma_c_descs(chain, cfg, frozenset({0}), epi_n)
     sequence = _tma_store_sequence(chain, cfg, frozenset({0}), epi_n)
 
-    assert "global_dims=[n, m]" in host
-    assert f"box_dims=[{epi_n}, epi_tile_mn[0]]" in host
+    assert ("global_dims=[m, n]" if major == "m" else "global_dims=[n, m]") in host
+    assert (f"box_dims=[64, {epi_n}]" if major == "m" else f"box_dims=[{epi_n}, epi_tile_mn[0]]") in host
     assert "out_stride_l_0" not in host
-    assert "(col, coord_m)" in sequence
+    assert ("(coord_m + 0, col)" if major == "m" else "(col, coord_m)") in sequence
     assert "tile_l" not in sequence
+    assert f"tma_c_m_major = ({major == 'm'},)" in _tma_c_plumbing(chain)["INJECT_TMA_C_LISTS"]
 
 
+def test_moe_dim0_descriptor_patch_ir() -> None:
+    """Keep the dim-0 update below the public NVVM ordinal verifier, with
+    memory side effects so the following descriptor copy cannot pass it."""
+    import cutlass.cute as cute
+    from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import replace_tensormap_global_dim_0
+
+    @cute.kernel
+    def patch_dim(new_dim: cutlass.Int32):
+        desc = cutlass.Array(cutlass.Int64, 16, space=cutlass.AddressSpace.smem, alignment=128)
+        replace_tensormap_global_dim_0(desc, new_dim)
+
+    @cute.jit
+    def host(new_dim: cutlass.Int32):
+        patch_dim(new_dim).launch(grid=(1, 1, 1), block=(32, 1, 1))
+
+    modules = []
+
+    def capture_ir(dsl, module, function_name):
+        modules.append(str(module))
+
+    # Only trace IR: this also runs with public DSL builds that cannot target
+    # the local GPU's architecture, and never launches a synthetic descriptor.
+    cute.compile.to_precompiled_mlir(host, 104, options="--gpu-arch=sm_100a", trace_finalize_hooks=capture_ir)
+    src = "\n".join(modules)
+    assert "llvm.inline_asm has_side_effects" in src
+    assert "tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [$0], 0, $1;" in src
+    assert '"r,r,~{memory}"' in src
+    assert "nvvm.tensormap.replace" not in src
+
+
+@requires_sm100
 @pytest.mark.parametrize("cta_group", (1, 2))
-def test_moe_m_major_output(cta_group: int) -> None:
-    """A routed MoE output may be M-major. It takes STG: TMA would clip D to
-    `group_end` on the INNERMOST dim of a transposed descriptor, whose extent TMA
-    requires to be 16-byte aligned, and routed group bounds are runtime data --
-    a group ending at row 100 (200 B) faults, 104 (208 B) does not."""
-    from cudnn.gemm.frost.compiler import _epi_vec_bytes, _store_modes, jit_from_cudnn_graph
+@pytest.mark.parametrize(
+    "offset_multiple,bounds,S,store_mode,global_descriptors",
+    [
+        (1, [0, 100, 300], 512, "stg", False),
+        (4, [0, 104, 304], 512, "stg", False),
+        (8, [0, 104, 304], 512, "tma", False),
+        (256, [0, 256, 256], 512, "tma", True),
+        (8, [0, 104, 304], 510, "stg", False),
+        (256, [0, 256, 256], 510, "stg", False),
+        (256, [0, 256, 256], 504, "tma", False),
+    ],
+)
+@pytest.mark.parametrize("tap", (False, True))
+def test_moe_m_major_output(cta_group: int, offset_multiple: int, bounds: list[int], S: int, store_mode: str, global_descriptors: bool, tap: bool) -> None:
+    """TMA needs a promise of 16-byte group boundaries, independently for each
+    output layout. Partial groups must clip on M even beside an N-major tap."""
+    from cudnn.gemm.frost.compiler import _moe_aligned_offsets, _store_modes, jit_from_cudnn_graph
     from cudnn.gemm.frost.graph_analyzer import analyze
     from cudnn.gemm.frost.tile_config import by_name
 
-    S, N, K, E = 512, 256, 128, 3
-    bounds = [0, 100, 300]  # neither tile- nor 16-byte-aligned
+    N, K, E = 256, 128, 3
+    ldm = 512  # Keep the column stride aligned even when the endpoint S is not.
     BF = cudnn.data_type.BFLOAT16
-    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1" if cta_group == 1 else "CONFIG_sm100_128x256x128_128x256x32_cluster2x1")
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma" if cta_group == 1 else "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
 
     def build():
         g = cudnn.pygraph(io_data_type=BF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
         tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=BF)
         w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=BF)
         fto = g.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+        fto.set_alignment_value(offset_multiple)
         out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+        if tap:
+            tap_tensor = g.identity(input=out, name="tap")
+            out = g.relu(input=tap_tensor, name="relu")
+            tap_tensor.set_data_type(cudnn.data_type.FLOAT).set_output(True).set_stride([S * N, N, 1])
         out.set_data_type(BF).set_output(True)
-        out.set_stride([S * N, 1, S])
+        out.set_stride([ldm * N, 1, ldm])
         return g, tok, w, fto, out
 
     g, _, _, _, _ = build()
     chain = analyze(g)
-    assert chain.out_major == "m"
-    assert _store_modes(chain, cfg) == ("stg",)
+    assert tuple(out.major for out in chain.output_specs) == (("n", "m") if tap else ("m",))
+    assert chain.moe.offset_multiple == offset_multiple
+    assert _store_modes(chain, cfg) == (("tma", store_mode) if tap else (store_mode,))
+    assert _moe_aligned_offsets(chain, cfg) is global_descriptors
 
     torch.manual_seed(0)
     tk = torch.randn(1, S, K, device="cuda", dtype=torch.bfloat16)
     wt = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16)
     ft = torch.tensor(bounds, device="cuda", dtype=torch.int32)
     slack = 4096
-    raw = torch.full((2 * S * N + slack,), 0xAB, device="cuda", dtype=torch.uint8)
-    out = raw.view(torch.bfloat16)[: S * N].view(1, N, S).transpose(1, 2)
+    raw = torch.full((2 * ldm * N + slack,), 0xAB, device="cuda", dtype=torch.uint8)
+    storage = raw[: 2 * ldm * N].view(1, N, 2 * ldm)
+    out = storage.view(torch.bfloat16).transpose(1, 2)[:, :S, :]
     out.zero_()
-    tail = raw[2 * S * N :].clone()
-    gg, tt, ww, ff, oo = build()
-    jit_from_cudnn_graph(gg, config=cfg)({tt: tk, ww: wt, ff: ft, oo: out})
+    tail = raw[2 * ldm * N :].clone()
+    compiled = jit_from_cudnn_graph(g, config=cfg)
+    assert f"moe_aligned_offsets = {global_descriptors}\n" in pathlib.Path(compiled.generated_path).read_text()
+    tap_out = torch.full((1, S, N), float("nan"), device="cuda", dtype=torch.float32) if tap else None
+    compiled(_vp_moe(compiled, tk, wt, ft, [tap_out, out] if tap else out))
     torch.cuda.synchronize()
 
     ref = torch.zeros(1, S, N, device="cuda", dtype=torch.float32)
     b = bounds + [S]
     for gi in range(E):
         ref[0, b[gi] : b[gi + 1]] = tk[0, b[gi] : b[gi + 1]].float() @ wt[gi].float().T
-    assert torch.equal(raw[2 * S * N :], tail), "the store ran past the output"
+    if tap:
+        torch.testing.assert_close(tap_out, ref, atol=1e-4, rtol=1e-4)
+        ref = ref.relu()
+    assert torch.equal(raw[2 * ldm * N :], tail), "the store ran past the output"
+    assert (storage[:, :, 2 * S :] == 0xAB).all(), "the store overwrote column padding"
     assert (out.float() - ref).abs().max().item() < 0.5
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "offset_multiple,S,store_modes",
+    [
+        (1, 768, ("stg", "stg", "stg")),
+        (4, 768, ("tma", "stg", "stg")),
+        (8, 768, ("tma", "tma", "stg")),
+        (12, 768, ("tma", "stg", "stg")),
+        (16, 768, ("tma", "tma", "tma")),
+        (24, 768, ("tma", "tma", "stg")),
+        (16, 772, ("tma", "stg", "stg")),
+        (16, 776, ("tma", "tma", "stg")),
+        (16, 767, ("stg", "stg", "stg")),
+    ],
+)
+def test_moe_m_major_alignment_is_per_output_dtype(offset_multiple: int, S: int, store_modes: tuple[str, ...]) -> None:
+    from cudnn.gemm.frost.compiler import _store_modes, jit_from_cudnn_graph
+
+    ldm = (S + 15) // 16 * 16
+    g = _build_graph(E=4, S=S, N=256, K=128)
+    fto = next(t for t in g.tensors.values() if t.get_name() == "first_token_offset")
+    fto.set_alignment_value(offset_multiple)
+    # One promise can suffice for fp32/bf16 while fp8 still needs STG.
+    mm = g.tensors["moe::OUT_0"].set_data_type(cudnn.data_type.FLOAT)
+    c = g.identity(input=mm, name="float")
+    h = g.relu(input=c, name="half")
+    z = g.relu(input=h, name="byte")
+    for t, dt in ((c, cudnn.data_type.FLOAT), (h, cudnn.data_type.BFLOAT16), (z, cudnn.data_type.FP8_E4M3)):
+        t.set_data_type(dt).set_output(True).set_stride([ldm * 256, 1, ldm])
+    chain = analyze(g)
+    assert chain.moe.offset_multiple == offset_multiple
+    assert _store_modes(chain, by_name(_CFG)) == store_modes
+    torch.manual_seed(0)
+    token = torch.randint(-2, 3, (1, S, 128), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-2, 3, (4, 256, 128), device="cuda").to(torch.bfloat16)
+    offsets = torch.tensor([0, 96, 96, 288], dtype=torch.int32, device="cuda")
+    outputs = [torch.empty(1, 256, ldm, dtype=dt, device="cuda").transpose(1, 2)[:, :S, :] for dt in (torch.float32, torch.bfloat16, torch.float8_e4m3fn)]
+    compiled = jit_from_cudnn_graph(g, config=by_name(_CFG))
+    compiled(_vp_moe(compiled, token, weight, offsets, outputs))
+    ref = _ref_f32(token, weight, offsets, S, 256, 4).unsqueeze(0)
+    for actual, expected in zip(outputs, (ref, ref.relu(), ref.relu())):
+        torch.testing.assert_close(actual.float(), expected.to(actual.dtype).float(), atol=0, rtol=0)
 
 
 def test_moe_grouped_matmul_fwd_rejects_m_major_token() -> None:

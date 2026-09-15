@@ -178,17 +178,11 @@ def allowed_store_vsize(dim, stride, dtype: str) -> int:
     declared-layout alignment (``tensor_alignment`` over its ``dim`` + ``stride``)
     in elements. The store width is derived from the tensor, not fixed then
     rejected — it never exceeds what the buffer's row stride / contiguous extent
-    can address (the ptr layer is re-checked at run time). Raises below the
-    4-byte scalar-store floor."""
+    can address (the ptr layer is re-checked at run time). Byte and halfword
+    stores are legal too: the minimum access is one whole dtype element,
+    naturally aligned to its size, rather than a fixed 4-byte word."""
     elem_bytes = DTYPE_BYTES[dtype]
     align_bytes = tensor_alignment(dim, stride, elem_bytes)
-    if align_bytes < 4:
-        raise ValueError(
-            f"output row stride must be at least 4-byte aligned but got alignment "
-            f"{align_bytes} bytes for dim={dim}, stride={stride}, dtype={dtype!r}. "
-            f"PTX scalar store requires 4-byte natural alignment; sub-32-bit "
-            f"element stores are not supported by this kernel."
-        )
     return align_bytes // elem_bytes
 
 

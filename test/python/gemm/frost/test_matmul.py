@@ -3631,8 +3631,8 @@ def test_splitk_output_dtypes(io_dt, out_dt, torch_in, torch_out):
 @pytest.mark.parametrize("N", (250, 255), ids=("Nmod4", "Nodd"))
 def test_splitk_n_not_multiple_of_4(N):
     # splitk_reduce_elems clamps to divide N (2 for 250, 1 for 255), so reducer
-    # groups never cross a workspace row. fp32 output: odd N with a 2-byte dtype
-    # is rejected engine-wide (row stride must be 4-byte aligned).
+    # groups never cross a workspace row. The output store may narrow further
+    # to a byte or halfword according to its own dtype and layout alignment.
     if N % 2 and _current_arch() == 120:
         pytest.skip("the sm120 template stores whole (n, n+1) accumulator pairs; odd N is rejected")
     g, A, Bt, C = _splitk_graph(1, 256, N, 4096, out_dt=cudnn.data_type.FLOAT)
