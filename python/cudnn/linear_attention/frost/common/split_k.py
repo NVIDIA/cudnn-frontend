@@ -267,7 +267,7 @@ def common_span(
     b_t: cutlass.Constexpr[int],
     overhead_chunks: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
-    n_heads_out: cutlass.Constexpr[int],
+    n_heads_out: cutlass.Int32,
     num_sms: cutlass.Constexpr[int],
     n_tiles,
     ideal_chunks,
@@ -464,7 +464,7 @@ def frost_split_k_plan(
     b_t: cutlass.Constexpr[int],
     overhead_chunks: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
-    n_heads_out: cutlass.Constexpr[int],
+    n_heads_out: cutlass.Int32,
     num_sms: cutlass.Constexpr[int],
     n_tiles: cutlass.Int32,
     ideal_chunks: cutlass.Int32,
@@ -518,7 +518,7 @@ def frost_split_k_scan_channel(
     gate_channels: cutlass.Constexpr[int],
     overhead_chunks: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
-    n_heads_out: cutlass.Constexpr[int],
+    n_heads_out: cutlass.Int32,
     num_sms: cutlass.Constexpr[int],
     n_tiles: cutlass.Int32,
     ideal_chunks: cutlass.Int32,
@@ -661,7 +661,7 @@ def frost_split_k_scan_scalar(
     safe_gate: cutlass.Constexpr[bool],
     overhead_chunks: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
-    n_heads_out: cutlass.Constexpr[int],
+    n_heads_out: cutlass.Int32,
     num_sms: cutlass.Constexpr[int],
     n_tiles: cutlass.Int32,
     ideal_chunks: cutlass.Int32,
@@ -767,7 +767,7 @@ def frost_split_k_walk(
     expand_num: cutlass.Constexpr[int],
     warmup_cap: cutlass.Constexpr[int],
     full_scan: cutlass.Constexpr[bool],
-    n_heads_out: cutlass.Constexpr[int],
+    n_heads_out: cutlass.Int32,
     num_sms: cutlass.Constexpr[int],
     n_tiles: cutlass.Int32,
     ideal_chunks: cutlass.Int32,
@@ -1241,7 +1241,7 @@ def launch(
     expand_num: cutlass.Constexpr[int],
     warmup_cap: cutlass.Constexpr[int],
     full_scan: cutlass.Constexpr[bool],
-    n_heads_out: cutlass.Constexpr[int],
+    n_heads_out: cutlass.Int32,
     num_sms: cutlass.Constexpr[int],
     n_tiles: cutlass.Int32,
     ideal_chunks: cutlass.Int32,
@@ -1455,6 +1455,7 @@ def run_table(r, gate, a_log, dt_bias, cu_seqlens, chunk_scratch, item_scratch, 
     buffers move between calls; every scalar comes from the recipe
     (``expand_num`` is compiled in)."""
     r.compiled(
+        r.n_heads_out,
         r.n_tiles,
         r.ideal_chunks,
         r.batch_size,
@@ -1551,7 +1552,6 @@ def build_split_table(
         bool(split),
         b_t,
         scan_rows,
-        n_heads_out,
         num_sms,
         bool(log_gate),
         bool(safe_gate),
@@ -1574,7 +1574,7 @@ def build_split_table(
         item_scratch_c = None
         if split:
             chunk_scratch_c = from_dlpack(chunk_scratch, assumed_align=4)
-            chunk_scratch_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            chunk_scratch_c.mark_layout_dynamic(leading_dim=1)
             item_scratch_c = from_dlpack(item_scratch, assumed_align=4)
             item_scratch_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_items_c = from_dlpack(work_items, assumed_align=4)
@@ -1593,7 +1593,7 @@ def build_split_table(
             int(expand_num),
             warmup_cap,
             full_scan,
-            int(n_heads_out),
+            cutlass.Int32(n_heads_out),
             int(num_sms),
             cutlass.Int32(n_tiles),
             cutlass.Int32(ideal_chunks),
@@ -1616,6 +1616,7 @@ def build_split_table(
             options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
         )
     compiled_cache[key](
+        n_heads_out,
         n_tiles,
         ideal_chunks,
         batch_size,

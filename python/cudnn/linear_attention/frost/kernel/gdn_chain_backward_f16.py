@@ -502,10 +502,6 @@ def build_chain_backward(
         dseed_name,
         int(device),
         int(num_sm),
-        HQ,
-        HK,
-        HV,
-        HO,
         DK,
         DV,
         summary_q.shape[1],
@@ -532,8 +528,6 @@ def build_chain_backward(
     if key not in chain_backward_cache:
         tinv_cfg = gdn_tinv_f16.build_cfg(
             io_dtype,
-            n_heads_out=HO,
-            h_k=HK,
             num_sm=num_sm,
             log_gate=log_gate,
             safe_gate=safe_gate,
@@ -549,7 +543,6 @@ def build_chain_backward(
                 io_dtype,
                 get_dtype(state_h.dtype),
                 max_active_clusters=num_sm,
-                is_GQA=HK >= HV,
                 use_initial_state=False,
                 log_gate=log_gate,
                 safe_gate=safe_gate,
@@ -557,15 +550,11 @@ def build_chain_backward(
                 d_v=DV,
                 expand_num=expand_num,
             )
-            summary_cfg.h_k = HK
-            summary_cfg.h_v = HV
-            summary_cfg.n_heads_out = HO
         else:
             transition_cfg = gdn_recompute_f16.build_cfg(
                 io_dtype,
                 get_dtype(state_m.dtype),
                 max_active_clusters=num_sm,
-                is_GQA=HK >= HO,
                 use_initial_state=False,
                 store_final_state=True,
                 enable_checkpoints=False,
@@ -578,16 +567,12 @@ def build_chain_backward(
                 d_v=DK,
                 expand_num=expand_num,
             )
-            transition_cfg.h_k = HK
-            transition_cfg.h_v = HO
-            transition_cfg.n_heads_out = HO
         series_cfg = None
         if series:
             series_cfg = gdn_recompute_f16.build_cfg(
                 io_dtype,
                 get_dtype(state_x.dtype) if not coarse else cutlass.Float32,
                 max_active_clusters=num_sm,
-                is_GQA=HK >= HV,
                 use_initial_state=not coarse,
                 store_final_state=False,
                 enable_checkpoints=True,
@@ -598,13 +583,9 @@ def build_chain_backward(
                 d_v=DV,
                 expand_num=expand_num,
             )
-            series_cfg.h_k = HK
-            series_cfg.h_v = HV
-            series_cfg.n_heads_out = HO
         bwd_summary_cfg = gdn_bprop_summary_f16.build_cfg(
             io_dtype,
             max_active_clusters=num_sm,
-            is_GQA=summary_q.shape[1] >= summary_do.shape[1],
             use_dstate_in=False,
             log_gate=log_gate,
             safe_gate=safe_gate,
@@ -612,13 +593,9 @@ def build_chain_backward(
             d_v=DV,
             expand_num=expand_num,
         )
-        bwd_summary_cfg.h_q = summary_q.shape[1]
-        bwd_summary_cfg.h_k = HK
-        bwd_summary_cfg.h_v = summary_do.shape[1]
         bprop_cfg = bprop_module.build_cfg(
             io_dtype,
             max_active_clusters=num_sm,
-            is_GQA=HQ >= HV,
             use_initial_state=True,
             use_dstate_in=True,
             use_dstate0=dstate0 is not None,
@@ -632,9 +609,6 @@ def build_chain_backward(
             expand_num=expand_num,
             **({} if compact_qdo else dict(tinv_source="gmem")),
         )
-        bprop_cfg.h_q = HQ
-        bprop_cfg.h_k = HK
-        bprop_cfg.h_v = HV
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)

@@ -119,6 +119,10 @@ def chain_backward_host(
     dstate0: Optional[cute.Tensor],
     stream: cuda.CUstream,
 ) -> None:
+    heads_out = cutlass.Int32(gate.shape[1])
+    q_ratio = heads_out // cutlass.Int32(q.shape[1])
+    k_ratio = heads_out // cutlass.Int32(k.shape[1])
+    v_ratio = heads_out // cutlass.Int32(v.shape[1])
     kda_chain_prologue_f16.chain_prologue(
         pieces,
         unit_chunks,
@@ -221,6 +225,8 @@ def chain_backward_host(
         )
     kda_bprop_summary_f16.host(
         bwd_summary_cfg,
+        q_ratio,
+        k_ratio,
         a_log,
         dt_bias,
         beta,
@@ -278,6 +284,9 @@ def chain_backward_host(
         )
     kda_bprop_f16.host(
         bprop_cfg,
+        q_ratio,
+        k_ratio,
+        v_ratio,
         a_log,
         dt_bias,
         beta,
@@ -396,10 +405,6 @@ def build_chain_backward(
         dseed_name,
         int(device),
         int(num_sm),
-        HQ,
-        HK,
-        HV,
-        HO,
         DK,
         DV,
         int(unit_chunks),
@@ -432,9 +437,7 @@ def build_chain_backward(
         summary_cfg = None
         transition_cfg = None
         if fused_h_m:
-            summary_cfg = kda_summary_f16.build_cfg(
-                io_dtype, gate_dtype, use_initial_state=False, k_ratio=HO // HK, v_ratio=HO // HV, n_heads_out=HO, d_v=DV, **flags
-            )
+            summary_cfg = kda_summary_f16.build_cfg(io_dtype, gate_dtype, use_initial_state=False, d_v=DV, **flags)
         else:
             transition_cfg = kda_recompute_f16.build_cfg(
                 io_dtype,
@@ -444,9 +447,6 @@ def build_chain_backward(
                 store_final_state=True,
                 enable_checkpoints=False,
                 seed_checkpoints=False,
-                k_ratio=HO // HK,
-                v_ratio=1,
-                n_heads_out=HO,
                 seed_identity=True,
                 v_is_zero=True,
                 d_v=DK,
@@ -462,25 +462,16 @@ def build_chain_backward(
                 store_final_state=False,
                 enable_checkpoints=True,
                 seed_checkpoints=coarse,
-                k_ratio=HO // HK,
-                v_ratio=HO // HV,
-                n_heads_out=HO,
                 d_v=DV,
                 **flags,
             )
-        bwd_summary_cfg = kda_bprop_summary_f16.build_cfg(
-            io_dtype, gate_dtype, use_dstate_in=False, q_ratio=HO // HQ, k_ratio=HO // HK, n_heads_out=HO, d_v=do.shape[2], **flags
-        )
+        bwd_summary_cfg = kda_bprop_summary_f16.build_cfg(io_dtype, gate_dtype, use_dstate_in=False, d_v=do.shape[2], **flags)
         bprop_cfg = kda_bprop_f16.build_cfg(
             io_dtype,
             gate_dtype,
             use_dstate_in=True,
             use_dstate0=dstate0 is not None,
             use_initial_state=True,
-            q_ratio=HO // HQ,
-            k_ratio=HO // HK,
-            v_ratio=HO // HV,
-            n_heads_out=HO,
             d_v=DV,
             **flags,
         )

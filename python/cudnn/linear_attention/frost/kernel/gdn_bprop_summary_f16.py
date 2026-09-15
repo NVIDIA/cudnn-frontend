@@ -829,6 +829,8 @@ def tmaldg_warp(
     mScheduler,
     sScheduler,
     bars,
+    q_ratio,
+    k_ratio,
 ):
     """TMA-LDG warp role (warp 13): every Q/K/dO TMA load and the chunk-factor tile TMA loads; a dO stage is recycled
     after both its readers (the dU intra GEMM and CG0) release it."""
@@ -897,14 +899,13 @@ def tmaldg_warp(
         tma_subtile_stride_elems=cfg.b_t * granule_elements,
     )
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
-
     while tile_idx < total_tiles:
         batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
             cfg, tile_idx, mWorkItems
         )
         head_o = head_idx
-        head_q = head_idx if cfg.q_ratio == 1 else head_idx // cutlass.Int32(cfg.q_ratio)
-        head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
+        head_q = head_idx // q_ratio
+        head_k = head_idx // k_ratio
         slot = batch_idx * desc_qwords
         desc_q_slot = (desc_q_base + slot).tospace(cutlass.AddressSpace.generic)
         desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
@@ -1783,11 +1784,10 @@ def host(
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
 ):
-    h_q = cfg.h_q
-    h_k = cfg.h_k
-    h_v = cfg.h_v
     batch_size = cu_seqlens.shape[0] - 1
-    heads_out = h_q if h_q >= h_v else h_v
+    heads_out = cutlass.Int32(gate.shape[1])
+    q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
+    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
 
     # ---- SMEM sizing: per-buffer element cosizes -------------------------------------
     bpe = cfg.io_dtype.width // 8
@@ -1809,9 +1809,6 @@ def host(
     cfg.tma_do_bytes = do_tile_elements * bpe
     cfg.tma_tinv_bytes = tinv_tile_elements * bpe
 
-    cfg.n_heads_out = heads_out
-    cfg.q_ratio = heads_out // h_q
-    cfg.k_ratio = heads_out // h_k
     num_descs = batch_size
 
     # ---- launch ----------------------------------------------------------------------
@@ -1819,6 +1816,8 @@ def host(
 
     frost_gdn_bprop_summary(
         cfg,
+        q_ratio,
+        k_ratio,
         gate,
         a_log,
         dt_bias,
@@ -1849,6 +1848,8 @@ def host(
 @cute.kernel
 def frost_gdn_bprop_summary(
     cfg: cutlass.Constexpr,
+    q_ratio: cute.FastDivmodDivisorV2,
+    k_ratio: cute.FastDivmodDivisorV2,
     mGate: cute.Tensor,
     mA_log: Optional[cute.Tensor],
     mDt_bias: Optional[cute.Tensor],
@@ -1877,71 +1878,20 @@ def frost_gdn_bprop_summary(
     num_ctas = cute.arch.grid_dim()[0]
 
     total_tiles = mCount[0]
-    if cutlass.const_expr(cfg.is_GQA):
-        h_r = cfg.h_q // cfg.h_v
-        h_qv = cfg.h_v
-        mQ = cute.make_tensor(
-            mQ.iterator,
-            cute.make_layout(
-                (mQ.shape[0], mQ.shape[2], (h_r, h_qv)),
-                stride=(mQ.stride[0], mQ.stride[2], (mQ.stride[1], h_r * mQ.stride[1])),
-            ),
-        )
-        mK = cute.make_tensor(
-            mK.iterator,
-            cute.make_layout(
-                (mK.shape[0], mK.shape[2], (h_r, h_qv)),
-                stride=(mK.stride[0], mK.stride[2], (0, mK.stride[1])),
-            ),
-        )
-    else:
-        h_r = cfg.h_v // cfg.h_q
-        h_qv = cfg.h_q
-        mQ = cute.make_tensor(
-            mQ.iterator,
-            cute.make_layout(
-                (mQ.shape[0], mQ.shape[2], (h_r, h_qv)),
-                stride=(mQ.stride[0], mQ.stride[2], (0, mQ.stride[1])),
-            ),
-        )
-        mK = cute.make_tensor(
-            mK.iterator,
-            cute.make_layout(
-                (mK.shape[0], mK.shape[2], (h_r, h_qv)),
-                stride=(mK.stride[0], mK.stride[2], (0, mK.stride[1])),
-            ),
-        )
-    mGate = cute.make_tensor(
-        mGate.iterator,
-        cute.make_layout(
-            (mGate.shape[0], (h_r, h_qv)),
-            stride=(mGate.stride[0], (mGate.stride[1], h_r * mGate.stride[1])),
-        ),
-    )
     if cutlass.const_expr(mDstate0 is not None):
         mDstate0 = cute.make_tensor(
             mDstate0.iterator,
             cute.make_layout(
-                (mDstate0.shape[2], mDstate0.shape[3], (h_r, h_qv), mDstate0.shape[0]),
-                stride=(
-                    mDstate0.stride[2],
-                    mDstate0.stride[3],
-                    (mDstate0.stride[1], h_r * mDstate0.stride[1]),
-                    mDstate0.stride[0],
-                ),
+                (mDstate0.shape[2], mDstate0.shape[3], mDstate0.shape[1], mDstate0.shape[0]),
+                stride=(mDstate0.stride[2], mDstate0.stride[3], mDstate0.stride[1], mDstate0.stride[0]),
             ),
         )
     if cutlass.const_expr(mDstate_in is not None):
         mDstate_in = cute.make_tensor(
             mDstate_in.iterator,
             cute.make_layout(
-                (mDstate_in.shape[2], mDstate_in.shape[3], (h_r, h_qv), mDstate_in.shape[0]),
-                stride=(
-                    mDstate_in.stride[2],
-                    mDstate_in.stride[3],
-                    (mDstate_in.stride[1], h_r * mDstate_in.stride[1]),
-                    mDstate_in.stride[0],
-                ),
+                (mDstate_in.shape[2], mDstate_in.shape[3], mDstate_in.shape[1], mDstate_in.shape[0]),
+                stride=(mDstate_in.stride[2], mDstate_in.stride[3], mDstate_in.stride[1], mDstate_in.stride[0]),
             ),
         )
 
@@ -2243,6 +2193,8 @@ def frost_gdn_bprop_summary(
             mScheduler=mScheduler,
             sScheduler=sScheduler,
             bars=bars,
+            q_ratio=q_ratio,
+            k_ratio=k_ratio,
         )
 
     if warp_idx == cfg.load_gate_beta_warp_id:
@@ -2286,7 +2238,6 @@ class GdnBpropSummaryCfg:
     io_dtype: Type[cutlass.Numeric]
     acc_dtype: Type[cutlass.Numeric]
     max_active_clusters: int
-    is_GQA: bool
     d_k: int
     d_v: int
     log_gate: bool = False
@@ -2351,16 +2302,12 @@ class GdnBpropSummaryCfg:
     tma_k_bytes: int = 0
     tma_do_bytes: int = 0
     tma_tinv_bytes: int = 0
-    n_heads_out: int = 0
-    q_ratio: int = 1
-    k_ratio: int = 1
 
 
 def build_cfg(
     io_dtype: Type[cutlass.Numeric],
     *,
     max_active_clusters: int,
-    is_GQA: bool,
     use_dstate_in: bool = False,
     log_gate: bool = False,
     safe_gate: bool = False,
@@ -2376,7 +2323,6 @@ def build_cfg(
         io_dtype=io_dtype,
         acc_dtype=cutlass.Float32,
         max_active_clusters=max_active_clusters,
-        is_GQA=is_GQA,
         log_gate=log_gate,
         safe_gate=safe_gate,
         d_k=d_k,
@@ -2417,13 +2363,9 @@ def get_compiled_cache(
     dstate0_dtype_str: str,
     device: int,
     num_sm: int,
-    HQ: int,
-    HK: int,
-    HV: int,
     DK: int,
     DV: int,
     expand_num: int,
-    is_GQA: bool,
     use_dstate_in: bool = False,
     log_gate: bool = False,
     safe_gate: bool = False,
@@ -2437,15 +2379,11 @@ def get_compiled_cache(
 
 def compile(
     io_dtype,
-    is_GQA: bool,
     use_dstate_in: bool = False,
     log_gate: bool = False,
     safe_gate: bool = False,
     *,
     num_sm: int,
-    h_q: int,
-    h_k: int,
-    h_v: int,
     d_k: int,
     d_v: int,
     expand_num: int = 1,
@@ -2471,7 +2409,6 @@ def compile(
     cfg = build_cfg(
         io_dtype,
         max_active_clusters=num_sm,
-        is_GQA=is_GQA,
         use_dstate_in=use_dstate_in,
         log_gate=log_gate,
         safe_gate=safe_gate,
@@ -2479,9 +2416,6 @@ def compile(
         d_v=d_v,
         expand_num=expand_num,
     )
-    cfg.h_q = h_q
-    cfg.h_k = h_k
-    cfg.h_v = h_v
 
     return cute.compile(
         host,
@@ -2552,7 +2486,6 @@ def chunk_gdn_bwd_summary_sm100(
     DK = q.shape[2]
     DV = do.shape[2]
     B = cu_seqlens.shape[0] - 1
-    is_GQA = HQ >= HV
     io_dtype = get_dtype(q.dtype)
 
     cu_stream = cuda.CUstream(int(stream))
@@ -2576,13 +2509,9 @@ def chunk_gdn_bwd_summary_sm100(
         str(d_initial_state.dtype),
         device,
         num_sm,
-        HQ,
-        HK,
-        HV,
         DK,
         DV,
         expand_num,
-        is_GQA,
         d_final_state is not None,
         log_gate,
         safe_gate,
@@ -2608,14 +2537,10 @@ def chunk_gdn_bwd_summary_sm100(
         dt_bias_cute = from_dlpack(dt_bias, assumed_align=4) if dt_bias is not None else None
         cache["compiled"] = compile(
             io_dtype,
-            is_GQA,
             use_dstate_in=d_final_state is not None,
             log_gate=log_gate,
             safe_gate=safe_gate,
             num_sm=num_sm,
-            h_q=HQ,
-            h_k=HK,
-            h_v=HV,
             d_k=DK,
             d_v=DV,
             expand_num=expand_num,

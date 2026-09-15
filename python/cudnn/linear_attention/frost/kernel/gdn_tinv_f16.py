@@ -148,35 +148,36 @@ def tmastg_warp(
     desc_tinv_base,
     sTinv_tma,
     bars,
+    heads_out,
 ):
     """Epilogue warp role (warp 10): every published tile SMEM -> GMEM (TMA store through its batch's tinv descriptor)
     in pair order; a tile stage returns to its compute group once the store has read it."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
     NG = len(cfg.compute_group_warp_ids)
     TS = cfg.smem_tile_stages
-    heads_out = cutlass.Int32(cfg.n_heads_out)
     zero = cutlass.Int32(0)
     elect_one = nvvm.elect_sync()
 
     # ---- descriptor acquire, one per batch of the block ------------------------------
+    r0 = item_begin // heads_out
+    head0 = item_begin - r0 * heads_out.divisor
     if n_tiles > cutlass.Int32(0):
-        batch_first = mRows[item_begin // heads_out, 1]
+        batch_first = mRows[r0, 1]
         batch_last = mRows[(item_begin + n_tiles - cutlass.Int32(1)) // heads_out, 1]
         if elect_one:
             for b in cutlass.range(batch_first, batch_last + cutlass.Int32(1), unroll=1):
                 tma_tensormap_acquire((desc_tinv_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic))
+    # ---- (row, head) of pair p's first member: two items per pair, carried with one wrap, no division ----
+    pair_rows = cutlass.Int32(2) // heads_out
+    pair_heads = cutlass.Int32(2) - pair_rows * heads_out.divisor
     for p in cutlass.range(n_pairs):
         group = p % cutlass.Int32(NG)
         j = p // cutlass.Int32(NG)
         t0 = 2 * p
         have_m1 = t0 + cutlass.Int32(1) < n_tiles
-        t1 = t0 + cutlass.Int32(1) if have_m1 else t0
-        item0 = item_begin + t0
-        item1 = item_begin + t1
-        r0 = item0 // heads_out
-        r1 = item1 // heads_out
-        head0 = item0 - r0 * heads_out
-        head1 = item1 - r1 * heads_out
+        wrap1 = head0 + cutlass.Int32(1) == heads_out.divisor
+        r1 = r0 + cutlass.Int32(1) if have_m1 and wrap1 else r0
+        head1 = (cutlass.Int32(0) if wrap1 else head0 + cutlass.Int32(1)) if have_m1 else head0
         tile_row0 = mRows[r0, 0]
         tile_row1 = mRows[r1, 0]
         desc_tinv0 = (desc_tinv_base + mRows[r0, 1] * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
@@ -200,6 +201,11 @@ def tmastg_warp(
             bars.mb_tile_done[tile_slot0].arrive()
             if have_m1:
                 bars.mb_tile_done[tile_slot1].arrive()
+        head0 = head0 + pair_heads
+        r0 = r0 + pair_rows
+        wrap0 = head0 >= heads_out.divisor
+        head0 = head0 - heads_out.divisor if wrap0 else head0
+        r0 = r0 + cutlass.Int32(1) if wrap0 else r0
 
 
 @cute.jit
@@ -217,6 +223,7 @@ def gate_warp(
     sCumsumlog,
     sBeta,
     bars,
+    heads_out,
 ):
     """Gate producer (warp 11): the gate cumsum and beta of both members of pair p into stage (p // groups) % SMEM_GATE_STAGES
     of group p % groups's ring, in pair order; every lane arrives on the stage's ready barrier after its own stores, the
@@ -225,21 +232,26 @@ def gate_warp(
     NG = len(cfg.compute_group_warp_ids)
     GS = cfg.smem_gate_stages
     n_cols = cfg.b_t // cfg.threads_per_warp
-    heads_out = cutlass.Int32(cfg.n_heads_out)
     oob_neutral = cutlass.Float32(0.0) if cutlass.const_expr(cfg.log_gate) else cutlass.Float32(1.0)
+    r0 = item_begin // heads_out
+    head0 = item_begin - r0 * heads_out.divisor
+    pair_rows = cutlass.Int32(2) // heads_out
+    pair_heads = cutlass.Int32(2) - pair_rows * heads_out.divisor
     for p in cutlass.range(n_pairs):
         group = p % cutlass.Int32(NG)
         j = p // cutlass.Int32(NG)
         gate_slot = group * cutlass.Int32(GS) + j % cutlass.Int32(GS)
         t0 = 2 * p
         have_m1 = t0 + cutlass.Int32(1) < n_tiles
+        wrap1 = head0 + cutlass.Int32(1) == heads_out.divisor
+        r1 = r0 + cutlass.Int32(1) if wrap1 else r0
+        head1 = cutlass.Int32(0) if wrap1 else head0 + cutlass.Int32(1)
         bars.mb_gate_done[gate_slot].wait(((j // cutlass.Int32(GS)) & cutlass.Int32(1)) ^ cutlass.Int32(1))
         for member in cutlass.range_constexpr(2):
             member_live = cutlass.Boolean(True) if cutlass.const_expr(member == 0) else have_m1
             if member_live:
-                item = item_begin + t0 + cutlass.Int32(member)
-                r = item // heads_out
-                head_idx = item - r * heads_out
+                r = r0 if cutlass.const_expr(member == 0) else r1
+                head_idx = head0 if cutlass.const_expr(member == 0) else head1
                 chunk_offset = mRows[r, 2] + mRows[r, 0] * cutlass.Int32(cfg.b_t)
                 member_end = mRows[r, 3]
 
@@ -323,6 +335,11 @@ def gate_warp(
                         beta_value = (sigmoid(beta_value) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(mBeta.element_type).to(cutlass.Float32)
                     sBeta[pos, 0, member, gate_slot] = beta_value if valids[col] else cutlass.Float32(0.0)
         bars.mb_gate_ready[gate_slot].arrive()
+        head0 = head0 + pair_heads
+        r0 = r0 + pair_rows
+        wrap0 = head0 >= heads_out.divisor
+        head0 = head0 - heads_out.divisor if wrap0 else head0
+        r0 = r0 + cutlass.Int32(1) if wrap0 else r0
 
 
 @cute.jit
@@ -389,41 +406,42 @@ def tmaldg_warp(
     desc_k_base,
     sK_tma,
     bars,
+    heads_out,
+    k_ratio,
 ):
     """TMA-LDG warp role (warp 8): K tiles of pair p into K stage p % SMEM_K_STAGES, as far
     ahead as the ring allows."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
     KS = cfg.smem_k_stages
     half_elements = cfg.b_t * 64
-    heads_out = cutlass.Int32(cfg.n_heads_out)
     zero = cutlass.Int32(0)
     elect_one = nvvm.elect_sync()
 
     # ---- descriptor acquire, one per batch of the block ------------------------------
+    r0 = item_begin // heads_out
+    head_o0 = item_begin - r0 * heads_out.divisor
     if n_tiles > cutlass.Int32(0):
-        batch_first = mRows[item_begin // heads_out, 1]
+        batch_first = mRows[r0, 1]
         batch_last = mRows[(item_begin + n_tiles - cutlass.Int32(1)) // heads_out, 1]
         if elect_one:
             for b in cutlass.range(batch_first, batch_last + cutlass.Int32(1), unroll=1):
                 tma_tensormap_acquire((desc_k_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic))
+    pair_rows = cutlass.Int32(2) // heads_out
+    pair_heads = cutlass.Int32(2) - pair_rows * heads_out.divisor
     for p in cutlass.range(n_pairs):
         k_stage = p % cutlass.Int32(KS)
         done_phase = ((p // cutlass.Int32(KS)) & cutlass.Int32(1)) ^ cutlass.Int32(1)
         t0 = 2 * p
         have_m1 = t0 + cutlass.Int32(1) < n_tiles
-        t1 = t0 + cutlass.Int32(1) if have_m1 else t0
-        item0 = item_begin + t0
-        item1 = item_begin + t1
-        r0 = item0 // heads_out
-        r1 = item1 // heads_out
+        wrap1 = head_o0 + cutlass.Int32(1) == heads_out.divisor
+        r1 = r0 + cutlass.Int32(1) if have_m1 and wrap1 else r0
+        head_o1 = (cutlass.Int32(0) if wrap1 else head_o0 + cutlass.Int32(1)) if have_m1 else head_o0
         token0 = mRows[r0, 0] * cutlass.Int32(cfg.b_t)
         token1 = mRows[r1, 0] * cutlass.Int32(cfg.b_t)
         desc_k0 = (desc_k_base + mRows[r0, 1] * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         desc_k1 = (desc_k_base + mRows[r1, 1] * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
-        head_o0 = item0 - r0 * heads_out
-        head_o1 = item1 - r1 * heads_out
-        head_k0 = head_o0 if cfg.k_ratio == 1 else head_o0 // cutlass.Int32(cfg.k_ratio)
-        head_k1 = head_o1 if cfg.k_ratio == 1 else head_o1 // cutlass.Int32(cfg.k_ratio)
+        head_k0 = head_o0 // k_ratio
+        head_k1 = head_o1 // k_ratio
 
         # ---- K load ------------------------------------------------------------------
         mb_k_ready_stage = bars.mb_k_ready[k_stage]
@@ -435,6 +453,11 @@ def tmaldg_warp(
             tma_load_tile(
                 sK_tma[k_stage].shifted(half_elements), tma_slice_runtime_desc(desc_k1, zero, head_k1, token1), mb_k_ready_stage.smem_ptr, acquire=False
             )
+        head_o0 = head_o0 + pair_heads
+        r0 = r0 + pair_rows
+        wrap0 = head_o0 >= heads_out.divisor
+        head_o0 = head_o0 - heads_out.divisor if wrap0 else head_o0
+        r0 = r0 + cutlass.Int32(1) if wrap0 else r0
 
 
 @cute.jit
@@ -763,7 +786,9 @@ def host(
     stream: cuda.CUstream,
 ):
     # ---- grid: one CTA per SM, capped by the tile count ------------------------------
-    num_ctas = cutlass.min(cutlass.Int32(cfg.num_sm), cutlass.Int32(tinv.shape[0]) * cutlass.Int32(cfg.n_heads_out))
+    heads_out = cutlass.Int32(gate.shape[1])
+    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
+    num_ctas = cutlass.min(cutlass.Int32(cfg.num_sm), cutlass.Int32(tinv.shape[0]) * heads_out)
 
     # ---- SMEM sizing: per-buffer element cosizes -------------------------------------
     bpe = cfg.io_dtype.width // 8
@@ -791,7 +816,21 @@ def host(
         frost_gdn_tinv_prologue(cfg.b_t, cfg.expand_num, base_desc_k, base_desc_tinv, k_desc, cu_seqlens, k, tinv, rows, row_count).launch(
             grid=(1, 1, 1), block=(cfg.threads_per_warp, 1, 1), stream=stream, use_pdl=USE_PDL
         )
-    frost_gdn_tinv(cfg, k_desc, gate, a_log, dt_bias, beta, rows, row_count, tinv, cutlass.Int32(cu_seqlens.shape[0] - 1)).launch(
+    frost_gdn_tinv(
+        cfg,
+        cute.FastDivmodDivisorV2(heads_out),
+        k_ratio,
+        cute.FastDivmodDivisorV2(num_ctas),
+        k_desc,
+        gate,
+        a_log,
+        dt_bias,
+        beta,
+        rows,
+        row_count,
+        tinv,
+        cutlass.Int32(cu_seqlens.shape[0] - 1),
+    ).launch(
         grid=(num_ctas, 1, 1),
         block=(cfg.threads_per_cta, 1, 1),
         stream=stream,
@@ -803,6 +842,9 @@ def host(
 @cute.kernel
 def frost_gdn_tinv(
     cfg: cutlass.Constexpr,
+    heads_out: cute.FastDivmodDivisorV2,
+    k_ratio: cute.FastDivmodDivisorV2,
+    num_ctas: cute.FastDivmodDivisorV2,
     mDesc: cute.Tensor,
     mGate: cute.Tensor,
     mA_log: Optional[cute.Tensor],
@@ -821,12 +863,10 @@ def frost_gdn_tinv(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane_idx = tidx % cutlass.Int32(cfg.threads_per_warp)
     bidx = cutlass.Int32(cute.arch.block_idx()[0])
-    num_ctas = cutlass.Int32(cute.arch.grid_dim()[0])
-    heads_out = cutlass.Int32(cfg.n_heads_out)
     arr_words = num_batches * cutlass.Int32(TENSOR_MAP_QWORDS)
     desc_k_base = mDesc.iterator.raw_ptr()
     desc_tinv_base = desc_k_base + arr_words
-    n_items = cutlass.Int32(mCount[0]) * heads_out
+    n_items = cutlass.Int32(mCount[0]) * heads_out.divisor
     item_begin = (bidx * n_items) // num_ctas
     n_tiles = ((bidx + cutlass.Int32(1)) * n_items) // num_ctas - item_begin
     n_pairs = (n_tiles + cutlass.Int32(1)) // cutlass.Int32(2)
@@ -937,6 +977,8 @@ def frost_gdn_tinv(
             desc_k_base=desc_k_base,
             sK_tma=sK_tma,
             bars=bars,
+            heads_out=heads_out,
+            k_ratio=k_ratio,
         )
     elif warp_idx == cfg.tcgen05_mma_warp_id:
         tcgen05_mma_warp(
@@ -956,6 +998,7 @@ def frost_gdn_tinv(
             desc_tinv_base=desc_tinv_base,
             sTinv_tma=sTinv_tma,
             bars=bars,
+            heads_out=heads_out,
         )
     elif warp_idx == cfg.load_gate_warp_id:
         gate_warp(
@@ -972,6 +1015,7 @@ def frost_gdn_tinv(
             sCumsumlog=sCumsumlog,
             sBeta=sBeta,
             bars=bars,
+            heads_out=heads_out,
         )
     else:
         for group in cutlass.range_constexpr(NG):
@@ -1019,8 +1063,6 @@ class GdnTinvCfg:
 
     io_dtype: Type[cutlass.Numeric]
     acc_dtype: Type[cutlass.Numeric]
-    n_heads_out: int
-    k_ratio: int
     d_k: int
     log_gate: bool = False
     safe_gate: bool = False
@@ -1063,8 +1105,6 @@ class GdnTinvCfg:
 def build_cfg(
     io_dtype: Type[cutlass.Numeric],
     *,
-    n_heads_out: int,
-    h_k: int,
     num_sm: int,
     log_gate: bool = False,
     safe_gate: bool = False,
@@ -1074,15 +1114,11 @@ def build_cfg(
     expand_num: int = 1,
 ) -> GdnTinvCfg:
     """Build the per-compile ``GdnTinvCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32)."""
-    if n_heads_out % h_k != 0:
-        raise ValueError(f"heads_out ({n_heads_out}) must be a multiple of the k head count ({h_k})")
     if d_k not in KEY_DIMS:
         raise ValueError(f"the chunk-factor pass serves d_k in {KEY_DIMS}, got d_k={d_k}")
     cfg = GdnTinvCfg(
         io_dtype=io_dtype,
         acc_dtype=cutlass.Float32,
-        n_heads_out=n_heads_out,
-        k_ratio=n_heads_out // h_k,
         num_sm=num_sm,
         log_gate=log_gate,
         safe_gate=safe_gate,
@@ -1122,8 +1158,6 @@ def get_compiled_cache(
     dt_bias_dtype_str: str,
     beta_dtype_str: str,
     device: int,
-    HK: int,
-    HO: int,
     DK: int,
     expand_num: int,
     log_gate: bool,
@@ -1144,8 +1178,6 @@ def compile(
     allow_neg_eigval: bool = False,
     publish_desc: bool = True,
     *,
-    h_k: int,
-    n_heads_out: int,
     num_sm: int,
     d_k: int,
     expand_num: int = 1,
@@ -1164,8 +1196,6 @@ def compile(
     """JIT-compile the chunk-factor pass for one static config."""
     cfg = build_cfg(
         io_dtype,
-        n_heads_out=n_heads_out,
-        h_k=h_k,
         num_sm=num_sm,
         log_gate=log_gate,
         safe_gate=safe_gate,
@@ -1262,8 +1292,6 @@ def chunk_gdn_tinv_sm100(
         str(dt_bias.dtype) if dt_bias is not None else "none",
         str(beta.dtype),
         device,
-        HK,
-        HO,
         DK,
         expand_num,
         log_gate,
@@ -1292,8 +1320,6 @@ def chunk_gdn_tinv_sm100(
             use_beta_sigmoid,
             allow_neg_eigval,
             publish_desc,
-            h_k=HK,
-            n_heads_out=HO,
             d_k=DK,
             expand_num=expand_num,
             num_sm=multiprocessor_count(device),

@@ -51,7 +51,7 @@ def warmup_backward_host(
     expand_num: cutlass.Constexpr[int],
     warmup_cap: cutlass.Constexpr[int],
     full_scan: cutlass.Constexpr[bool],
-    n_heads_out: cutlass.Constexpr[int],
+    n_heads_out: cutlass.Int32,
     num_sms: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
     bprop: cutlass.Constexpr,
@@ -335,10 +335,6 @@ def build_warmup_backward(
         str(state_in.dtype) if state_in is not None else "none",
         int(device),
         int(num_sm),
-        HQ,
-        HK,
-        HV,
-        HO,
         DK,
         DV,
         int(b_t),
@@ -362,8 +358,6 @@ def build_warmup_backward(
         if tinv_pass:
             tinv_cfg = gdn_tinv_f16.build_cfg(
                 io_dtype,
-                n_heads_out=HO,
-                h_k=HK,
                 num_sm=num_sm,
                 log_gate=log_gate,
                 safe_gate=safe_gate,
@@ -378,7 +372,6 @@ def build_warmup_backward(
                 io_dtype,
                 get_dtype(state_in.dtype) if state_in is not None else cutlass.Float32,
                 max_active_clusters=num_sm,
-                is_GQA=HK >= HV,
                 use_initial_state=state_in is not None,
                 store_final_state=False,
                 enable_checkpoints=True,
@@ -389,9 +382,6 @@ def build_warmup_backward(
                 d_v=DV,
                 expand_num=expand_num,
             )
-            recompute_cfg.h_k = HK
-            recompute_cfg.h_v = HV
-            recompute_cfg.n_heads_out = HO
 
         gate_table_placeholder = None
         dt_bias_table_placeholder = None
@@ -407,7 +397,7 @@ def build_warmup_backward(
             item_scratch_placeholder = from_dlpack(item_scratch, assumed_align=4)
             item_scratch_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
             chunk_scratch_placeholder = from_dlpack(chunk_scratch, assumed_align=4)
-            chunk_scratch_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            chunk_scratch_placeholder.mark_layout_dynamic(leading_dim=1)
         if dt_bias is not None:
             dt_bias_table_placeholder = from_dlpack(dt_bias, assumed_align=4)
             dt_bias_table_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=tuple(range(len(dt_bias.shape))), divisibility=1)
@@ -436,7 +426,7 @@ def build_warmup_backward(
             facts.expand_num,
             facts.warmup_cap,
             facts.full_scan,
-            facts.n_heads_out,
+            cutlass.Int32(facts.n_heads_out),
             facts.num_sms,
             io_dtype,
             bprop_module,
@@ -554,6 +544,7 @@ def run_warmup_backward(
     """Replay the head of the warmup or uncut backward: one crossing into the DSL.  The plan validated the contract at
     build, so nothing here raises."""
     compiled(
+        facts.n_heads_out,
         facts.n_tiles,
         facts.ideal_chunks,
         facts.batch_size,

@@ -49,7 +49,7 @@ def warmup_forward_host(
     expand_num: cutlass.Constexpr[int],
     warmup_cap: cutlass.Constexpr[int],
     full_scan: cutlass.Constexpr[bool],
-    n_heads_out: cutlass.Constexpr[int],
+    n_heads_out: cutlass.Int32,
     num_sms: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
     order_gen: cutlass.Constexpr[bool],
@@ -247,9 +247,6 @@ def build_warmup_forward(
         str(state_src.dtype) if state_src is not None else "none",
         int(device),
         int(num_sm),
-        HQ,
-        HK,
-        HV,
         DK,
         DV,
         int(b_t),
@@ -281,10 +278,6 @@ def build_warmup_forward(
             log_gate=log_gate,
             beta_sigmoid=use_beta_sigmoid,
             allow_neg_eigval=allow_neg_eigval,
-            q_ratio=HO // HQ,
-            k_ratio=HO // HK,
-            v_ratio=HO // HV,
-            n_heads_out=HO,
             max_active_clusters=num_sm,
             d_k=DK,
             d_v=DV,
@@ -304,7 +297,7 @@ def build_warmup_forward(
             item_scratch_placeholder = from_dlpack(item_scratch, assumed_align=4)
             item_scratch_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
             chunk_scratch_placeholder = from_dlpack(chunk_scratch, assumed_align=4)
-            chunk_scratch_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            chunk_scratch_placeholder.mark_layout_dynamic(leading_dim=1)
         if dt_bias is not None:
             dt_bias_table_placeholder = from_dlpack(dt_bias, assumed_align=4)
             dt_bias_table_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=tuple(range(len(dt_bias.shape))), divisibility=1)
@@ -326,7 +319,7 @@ def build_warmup_forward(
             facts.expand_num,
             facts.warmup_cap,
             facts.full_scan,
-            facts.n_heads_out,
+            cutlass.Int32(facts.n_heads_out),
             facts.num_sms,
             io_dtype,
             not split,
@@ -405,6 +398,7 @@ def run_warmup_forward(
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches.  The
     plan validated the contract at build, so nothing here raises."""
     compiled(
+        facts.n_heads_out,
         facts.n_tiles,
         facts.ideal_chunks,
         facts.batch_size,

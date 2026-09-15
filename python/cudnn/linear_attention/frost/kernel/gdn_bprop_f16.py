@@ -449,7 +449,6 @@ def tmastg_warp(
         tma_granu_elems=granule_elements,
         tma_subtile_stride_elems=cfg.b_t * granule_elements,
     )
-    heads_out = cutlass.Int32(cfg.n_heads_out)
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
 
     while tile_idx < total_tiles:
@@ -1487,6 +1486,9 @@ def tmaldg_warp(
     mScheduler,
     sScheduler,
     bars,
+    q_ratio,
+    k_ratio,
+    v_ratio,
 ):
     """TMA-LDG warp role (warp 13): persistent tile loop issuing every
     Q/K/V/dO/state TMA load and the chunk-factor tile TMA loads."""
@@ -1580,15 +1582,14 @@ def tmaldg_warp(
         tma_subtile_stride_elems=cfg.d_v * 64,
     )
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
-
     while tile_idx < total_tiles:
         batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
             cfg, tile_idx, mWorkItems
         )
         head_o = head_idx
-        head_q = head_idx if cfg.q_ratio == 1 else head_idx // cutlass.Int32(cfg.q_ratio)
-        head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
-        head_v = head_idx if cfg.v_ratio == 1 else head_idx // cutlass.Int32(cfg.v_ratio)
+        head_q = head_idx // q_ratio
+        head_k = head_idx // k_ratio
+        head_v = head_idx // v_ratio
         slot = batch_idx * desc_qwords
         desc_q_slot = (desc_q_base + slot).tospace(cutlass.AddressSpace.generic)
         desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
@@ -2138,6 +2139,7 @@ def compute1_warp_group(
     sDa,
     sDm,
     mInvQ,
+    q_ratio,
     sL2ReductionQ,
     sScheduler,
     bars,
@@ -2242,6 +2244,7 @@ def compute1_warp_group(
             cfg, tile_idx, mWorkItems
         )
         num_item_chunks = compute_end - write_start
+        head_q = head_idx // q_ratio
 
         # ---- chunks NT-1 .. 0 (backward) ---------------------------------------------
         for rev_idx in cutlass.range(num_item_chunks):
@@ -2649,7 +2652,7 @@ def compute1_warp_group(
             # ---- inv_q row (fused l2norm) --------------------------------------------
             fused_inv_q = cutlass.Float32(1.0)
             if cutlass.const_expr(cfg.fused_l2norm):
-                gInvQ = cute.domain_offset((batch_start + chunk_idx * cfg.b_t,), mInvQ[None, head_idx])
+                gInvQ = cute.domain_offset((batch_start + chunk_idx * cfg.b_t,), mInvQ[None, head_q])
                 pos_valid_q = batch_start + chunk_idx * cfg.b_t + cg1_tidx < batch_end
                 fused_inv_q = gInvQ[min(cg1_tidx, batch_end - (batch_start + chunk_idx * cfg.b_t) - 1)] if pos_valid_q else cutlass.Float32(1.0)
 
@@ -2748,6 +2751,7 @@ def compute2_warp_group(
     sdK,
     sDstate_trans,
     mInvK,
+    k_ratio,
     sL2ReductionK,
     sScheduler,
     bars,
@@ -2828,6 +2832,7 @@ def compute2_warp_group(
             cfg, tile_idx, mWorkItems
         )
         num_item_chunks = compute_end - write_start
+        head_k = head_idx // k_ratio
 
         # ---- dstate seed prologue ----------------------------------------------------
         if cutlass.const_expr(cfg.use_dstate_in):
@@ -2901,7 +2906,7 @@ def compute2_warp_group(
             # ---- inv_k row (fused l2norm) --------------------------------------------
             fused_inv_k = cutlass.Float32(1.0)
             if cutlass.const_expr(cfg.fused_l2norm):
-                gInvK = cute.domain_offset((batch_start + abs_chunk * cfg.b_t,), mInvK[None, head_idx])
+                gInvK = cute.domain_offset((batch_start + abs_chunk * cfg.b_t,), mInvK[None, head_k])
                 pos_valid_k = batch_start + abs_chunk * cfg.b_t + cg2_tidx < batch_end
                 fused_inv_k = gInvK[min(cg2_tidx, batch_end - (batch_start + abs_chunk * cfg.b_t) - 1)] if pos_valid_k else cutlass.Float32(1.0)
 
@@ -3522,11 +3527,11 @@ def host(
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
 ):
-    h_q = cfg.h_q
-    h_k = cfg.h_k
-    h_v = cfg.h_v
     batch_size = cu_seqlens.shape[0] - 1
-    heads_out = h_q if h_q >= h_v else h_v
+    heads_out = cutlass.Int32(gate.shape[1])
+    q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
+    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
+    v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[1]))
 
     # ---- SMEM sizing: per-buffer element cosizes -------------------------------------
     bpe = cfg.io_dtype.width // 8
@@ -3561,10 +3566,6 @@ def host(
     cfg.tma_state_bytes = state_tile_elements * bpe
     cfg.tma_tinv_bytes = tinv_tile_elements * bpe
 
-    cfg.n_heads_out = heads_out
-    cfg.q_ratio = heads_out // h_q
-    cfg.k_ratio = heads_out // h_k
-    cfg.v_ratio = heads_out // h_v
     num_descs = batch_size
 
     # ---- launch ----------------------------------------------------------------------
@@ -3572,6 +3573,9 @@ def host(
 
     frost_gdn_bprop(
         cfg,
+        q_ratio,
+        k_ratio,
+        v_ratio,
         gate,
         a_log,
         dt_bias,
@@ -3612,6 +3616,9 @@ def host(
 @cute.kernel
 def frost_gdn_bprop(
     cfg: cutlass.Constexpr,
+    q_ratio: cute.FastDivmodDivisorV2,
+    k_ratio: cute.FastDivmodDivisorV2,
+    v_ratio: cute.FastDivmodDivisorV2,
     mGate: cute.Tensor,
     mA_log: Optional[cute.Tensor],
     mDt_bias: Optional[cute.Tensor],
@@ -3649,121 +3656,20 @@ def frost_gdn_bprop(
     num_ctas = cute.arch.grid_dim()[0]
 
     total_tiles = mCount[0]
-    if cutlass.const_expr(cfg.is_GQA):
-        h_r = cfg.h_q // cfg.h_v
-        h_qv = cfg.h_v
-        mQ = cute.make_tensor(
-            mQ.iterator,
-            cute.make_layout(
-                (mQ.shape[0], mQ.shape[2], (h_r, h_qv)),
-                stride=(mQ.stride[0], mQ.stride[2], (mQ.stride[1], h_r * mQ.stride[1])),
-            ),
-        )
-        mK = cute.make_tensor(
-            mK.iterator,
-            cute.make_layout(
-                (mK.shape[0], mK.shape[2], (h_r, h_qv)),
-                stride=(mK.stride[0], mK.stride[2], (0, mK.stride[1])),
-            ),
-        )
-        mV = cute.make_tensor(
-            mV.iterator,
-            cute.make_layout(
-                (mV.shape[2], mV.shape[0], (h_r, h_qv)),
-                stride=(mV.stride[2], mV.stride[0], (0, mV.stride[1])),
-            ),
-        )
-    else:
-        h_r = cfg.h_v // cfg.h_q
-        h_qv = cfg.h_q
-        mQ = cute.make_tensor(
-            mQ.iterator,
-            cute.make_layout(
-                (mQ.shape[0], mQ.shape[2], (h_r, h_qv)),
-                stride=(mQ.stride[0], mQ.stride[2], (0, mQ.stride[1])),
-            ),
-        )
-        mK = cute.make_tensor(
-            mK.iterator,
-            cute.make_layout(
-                (mK.shape[0], mK.shape[2], (h_r, h_qv)),
-                stride=(mK.stride[0], mK.stride[2], (0, mK.stride[1])),
-            ),
-        )
-        mV = cute.make_tensor(
-            mV.iterator,
-            cute.make_layout(
-                (mV.shape[2], mV.shape[0], (h_r, h_qv)),
-                stride=(mV.stride[2], mV.stride[0], (mV.stride[1], h_r * mV.stride[1])),
-            ),
-        )
-    mGate = cute.make_tensor(
-        mGate.iterator,
-        cute.make_layout(
-            (mGate.shape[0], (h_r, h_qv)),
-            stride=(mGate.stride[0], (mGate.stride[1], h_r * mGate.stride[1])),
-        ),
-    )
-    mBeta = cute.make_tensor(
-        mBeta.iterator,
-        cute.make_layout(
-            (mBeta.shape[0], (h_r, h_qv)),
-            stride=(mBeta.stride[0], (mBeta.stride[1], h_r * mBeta.stride[1])),
-        ),
-    )
-    mDgate = cute.make_tensor(
-        mDgate.iterator,
-        cute.make_layout(
-            (mDgate.shape[0], (h_r, h_qv)),
-            stride=(mDgate.stride[0], (mDgate.stride[1], h_r * mDgate.stride[1])),
-        ),
-    )
-    mDbeta = cute.make_tensor(
-        mDbeta.iterator,
-        cute.make_layout(
-            (mDbeta.shape[0], (h_r, h_qv)),
-            stride=(mDbeta.stride[0], (mDbeta.stride[1], h_r * mDbeta.stride[1])),
-        ),
-    )
-    if cutlass.const_expr(cfg.fused_l2norm):
-        mInvQ = cute.make_tensor(
-            mInvQ.iterator,
-            cute.make_layout(
-                (mInvQ.shape[0], (cfg.q_ratio, cfg.h_q)),
-                stride=(mInvQ.stride[0], (0, mInvQ.stride[1])),
-            ),
-        )
-        mInvK = cute.make_tensor(
-            mInvK.iterator,
-            cute.make_layout(
-                (mInvK.shape[0], (cfg.k_ratio, cfg.h_k)),
-                stride=(mInvK.stride[0], (0, mInvK.stride[1])),
-            ),
-        )
     if cutlass.const_expr(mDstate0 is not None):
         mDstate0 = cute.make_tensor(
             mDstate0.iterator,
             cute.make_layout(
-                (mDstate0.shape[2], mDstate0.shape[3], (h_r, h_qv), mDstate0.shape[0]),
-                stride=(
-                    mDstate0.stride[2],
-                    mDstate0.stride[3],
-                    (mDstate0.stride[1], h_r * mDstate0.stride[1]),
-                    mDstate0.stride[0],
-                ),
+                (mDstate0.shape[2], mDstate0.shape[3], mDstate0.shape[1], mDstate0.shape[0]),
+                stride=(mDstate0.stride[2], mDstate0.stride[3], mDstate0.stride[1], mDstate0.stride[0]),
             ),
         )
     if cutlass.const_expr(mDstate_in is not None):
         mDstate_in = cute.make_tensor(
             mDstate_in.iterator,
             cute.make_layout(
-                (mDstate_in.shape[2], mDstate_in.shape[3], (h_r, h_qv), mDstate_in.shape[0]),
-                stride=(
-                    mDstate_in.stride[2],
-                    mDstate_in.stride[3],
-                    (mDstate_in.stride[1], h_r * mDstate_in.stride[1]),
-                    mDstate_in.stride[0],
-                ),
+                (mDstate_in.shape[2], mDstate_in.shape[3], mDstate_in.shape[1], mDstate_in.shape[0]),
+                stride=(mDstate_in.stride[2], mDstate_in.stride[3], mDstate_in.stride[1], mDstate_in.stride[0]),
             ),
         )
 
@@ -4238,6 +4144,7 @@ def frost_gdn_bprop(
             sDa=sDa,
             sDm=sDm,
             mInvQ=mInvQ,
+            q_ratio=q_ratio,
             sL2ReductionQ=sL2ReductionQ,
             sScheduler=sScheduler,
             bars=bars,
@@ -4260,6 +4167,7 @@ def frost_gdn_bprop(
             sdK=sdK,
             sDstate_trans=sDstate_trans,
             mInvK=mInvK,
+            k_ratio=k_ratio,
             sL2ReductionK=sL2ReductionK,
             sScheduler=sScheduler,
             bars=bars,
@@ -4321,6 +4229,9 @@ def frost_gdn_bprop(
             mScheduler=mScheduler,
             sScheduler=sScheduler,
             bars=bars,
+            q_ratio=q_ratio,
+            k_ratio=k_ratio,
+            v_ratio=v_ratio,
         )
 
     if warp_idx == cfg.load_gate_beta_warp_id:
@@ -4378,7 +4289,6 @@ class GdnBpropCfg:
     io_dtype: Type[cutlass.Numeric]
     acc_dtype: Type[cutlass.Numeric]
     max_active_clusters: int
-    is_GQA: bool
     d_k: int
     d_v: int
     log_gate: bool = False
@@ -4464,17 +4374,12 @@ class GdnBpropCfg:
     tma_do_bytes: int = 0
     tma_state_bytes: int = 0
     tma_tinv_bytes: int = 0
-    n_heads_out: int = 0
-    q_ratio: int = 1
-    k_ratio: int = 1
-    v_ratio: int = 1
 
 
 def build_cfg(
     io_dtype: Type[cutlass.Numeric],
     *,
     max_active_clusters: int,
-    is_GQA: bool,
     use_initial_state: bool = False,
     use_dstate_in: bool = False,
     use_dstate0: bool = False,
@@ -4500,7 +4405,6 @@ def build_cfg(
         io_dtype=io_dtype,
         acc_dtype=cutlass.Float32,
         max_active_clusters=max_active_clusters,
-        is_GQA=is_GQA,
         log_gate=log_gate,
         safe_gate=safe_gate,
         beta_sigmoid=beta_sigmoid,
@@ -4548,13 +4452,9 @@ def get_compiled_cache(
     dstate0_dtype_str: str,
     device: int,
     num_sm: int,
-    HQ: int,
-    HK: int,
-    HV: int,
     DK: int,
     DV: int,
     expand_num: int,
-    is_GQA: bool,
     use_initial_state: bool = False,
     use_dstate_in: bool = False,
     use_dstate0: bool = False,
@@ -4573,7 +4473,6 @@ def get_compiled_cache(
 
 def compile(
     io_dtype,
-    is_GQA: bool,
     use_initial_state: bool = False,
     use_dstate_in: bool = False,
     use_dstate0: bool = False,
@@ -4585,9 +4484,6 @@ def compile(
     tinv_source: str = "compute",
     *,
     num_sm: int,
-    h_q: int,
-    h_k: int,
-    h_v: int,
     d_k: int,
     d_v: int,
     expand_num: int = 1,
@@ -4621,7 +4517,6 @@ def compile(
     cfg = build_cfg(
         io_dtype,
         max_active_clusters=num_sm,
-        is_GQA=is_GQA,
         use_initial_state=use_initial_state,
         use_dstate_in=use_dstate_in,
         use_dstate0=use_dstate0,
@@ -4635,9 +4530,6 @@ def compile(
         d_v=d_v,
         expand_num=expand_num,
     )
-    cfg.h_q = h_q
-    cfg.h_k = h_k
-    cfg.h_v = h_v
 
     return cute.compile(
         host,
@@ -4776,7 +4668,6 @@ def chunk_gdn_bwd_sm100(
     DK = q.shape[2]
     DV = v.shape[2]
     B = cu_seqlens.shape[0] - 1
-    is_GQA = HQ >= HV
     io_dtype = get_dtype(q.dtype)
 
     cu_stream = cuda.CUstream(int(stream))
@@ -4803,13 +4694,9 @@ def chunk_gdn_bwd_sm100(
         str(d_initial_state.dtype) if d_initial_state is not None else "none",
         device,
         num_sm,
-        HQ,
-        HK,
-        HV,
         DK,
         DV,
         expand_num,
-        is_GQA,
         use_initial_state,
         d_final_state is not None,
         d_initial_state is not None,
@@ -4844,7 +4731,6 @@ def chunk_gdn_bwd_sm100(
         inv_k_cute = from_dlpack(inv_k, assumed_align=4).mark_layout_dynamic(leading_dim=1) if fused_l2norm else None
         cache["compiled"] = compile(
             io_dtype,
-            is_GQA,
             use_initial_state=use_initial_state,
             use_dstate_in=d_final_state is not None,
             use_dstate0=d_initial_state is not None,
@@ -4855,9 +4741,6 @@ def chunk_gdn_bwd_sm100(
             fused_l2norm=fused_l2norm,
             tinv_source=tinv_source,
             num_sm=num_sm,
-            h_q=HQ,
-            h_k=HK,
-            h_v=HV,
             d_k=DK,
             d_v=DV,
             expand_num=expand_num,

@@ -286,10 +286,6 @@ def build_chain_forward(
         seed_name,
         int(device),
         int(num_sm),
-        HQ,
-        HK,
-        HV,
-        HO,
         DK,
         DV,
         int(unit_chunks),
@@ -310,8 +306,6 @@ def build_chain_forward(
     if key not in chain_forward_cache:
         tinv_cfg = gdn_tinv_f16.build_cfg(
             io_dtype,
-            n_heads_out=HO,
-            h_k=HK,
             num_sm=num_sm,
             log_gate=log_gate,
             safe_gate=safe_gate,
@@ -324,7 +318,6 @@ def build_chain_forward(
             io_dtype,
             get_dtype(state_h.dtype),
             max_active_clusters=num_sm,
-            is_GQA=HK >= HV,
             use_initial_state=False,
             log_gate=log_gate,
             safe_gate=safe_gate,
@@ -332,14 +325,10 @@ def build_chain_forward(
             d_v=DV,
             expand_num=expand_num,
         )
-        summary_cfg.h_k = HK
-        summary_cfg.h_v = HV
-        summary_cfg.n_heads_out = HO
         prefill_cfg = gdn_prefill_f16.build_cfg(
             io_dtype,
             state_dtype,
             max_active_clusters=num_sm,
-            is_GQA=HQ >= HV,
             use_initial_state=True,
             store_final_state=final_state is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
@@ -350,9 +339,6 @@ def build_chain_forward(
             d_v=DV,
             expand_num=expand_num,
         )
-        prefill_cfg.h_q = HQ
-        prefill_cfg.h_k = HK
-        prefill_cfg.h_v = HV
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)

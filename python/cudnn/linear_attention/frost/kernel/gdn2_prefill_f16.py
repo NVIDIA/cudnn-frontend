@@ -910,6 +910,9 @@ def tmaldg_warp(
     desc_beta_base,
     desc_w_base,
     bars,
+    q_ratio,
+    k_ratio,
+    v_ratio,
 ) -> None:
     """TMA-LDG warp role (warp 14). Persistent scheduler loop issuing the
     per-chunk Q/K/V/Beta/W/Gate G->S loads."""
@@ -993,9 +996,9 @@ def tmaldg_warp(
             cfg, tile_idx, mWorkItems
         )
         head_o = head_idx
-        head_q = head_idx if cfg.q_ratio == 1 else head_idx // cutlass.Int32(cfg.q_ratio)
-        head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
-        head_v = head_idx if cfg.v_ratio == 1 else head_idx // cutlass.Int32(cfg.v_ratio)
+        head_q = head_idx // q_ratio
+        head_k = head_idx // k_ratio
+        head_v = head_idx // v_ratio
         slot = batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
         desc_q_slot = (desc_q_base + slot).tospace(cutlass.AddressSpace.generic)
         desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
@@ -2540,12 +2543,19 @@ def host(
     scale: cutlass.Float32,
     stream,
 ) -> None:
+    heads_out = cutlass.Int32(raw_gate.shape[1])
+    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
+    q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
+    v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[1]))
     num_sequences = cu_seqlens.shape[0] - 1
 
     # ---- launch ----------------------------------------------------------------------
     grid_shape = (cfg.max_active_clusters, 1, 1)
     frost_gdn2_prefill(
         cfg,
+        q_ratio,
+        k_ratio,
+        v_ratio,
         tensormap_workspace,
         cutlass.Int32(num_sequences),
         q,
@@ -2579,6 +2589,9 @@ def host(
 @cute.kernel
 def frost_gdn2_prefill(
     cfg: cutlass.Constexpr,
+    q_ratio: cute.FastDivmodDivisorV2,
+    k_ratio: cute.FastDivmodDivisorV2,
+    v_ratio: cute.FastDivmodDivisorV2,
     tensormap_workspace: cute.Tensor,
     n_desc: cutlass.Int32,
     mQ: cute.Tensor,
@@ -2781,6 +2794,9 @@ def frost_gdn2_prefill(
             desc_beta_base,
             desc_w_base,
             bars,
+            q_ratio=q_ratio,
+            k_ratio=k_ratio,
+            v_ratio=v_ratio,
         )
     elif warp_idx == cfg.super_mma_warp_id:
         super_mma_warp(
@@ -2909,10 +2925,6 @@ class Gdn2PrefillCfg:
     beta_sigmoid: bool
     allow_neg_eigval: bool
     beta_guard: bool
-    q_ratio: int
-    k_ratio: int
-    v_ratio: int
-    n_heads_out: int
     max_active_clusters: int
     d_k: int
     d_v: int
@@ -2999,10 +3011,6 @@ def build_cfg(
     beta_sigmoid: bool,
     allow_neg_eigval: bool,
     beta_guard: bool = False,
-    q_ratio: int,
-    k_ratio: int,
-    v_ratio: int,
-    n_heads_out: int,
     max_active_clusters: int,
     d_k: int,
     d_v: int,
@@ -3024,10 +3032,6 @@ def build_cfg(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         beta_guard=beta_guard,
-        q_ratio=q_ratio,
-        k_ratio=k_ratio,
-        v_ratio=v_ratio,
-        n_heads_out=n_heads_out,
         max_active_clusters=max_active_clusters,
         d_k=d_k,
         d_v=d_v,
@@ -3095,9 +3099,6 @@ def get_compiled_cache(
     cu_dtype_str: str,
     device: int,
     num_sm: int,
-    HQ: int,
-    HK: int,
-    HV: int,
     DK: int,
     DV: int,
     use_initial_state: bool,
@@ -3131,10 +3132,6 @@ def compile(
     beta_sigmoid: bool,
     allow_neg_eigval: bool,
     beta_guard: bool,
-    q_ratio: int,
-    k_ratio: int,
-    v_ratio: int,
-    n_heads_out: int,
     *,
     d_k: int,
     d_v: int,
@@ -3177,10 +3174,6 @@ def compile(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         beta_guard=beta_guard,
-        q_ratio=q_ratio,
-        k_ratio=k_ratio,
-        v_ratio=v_ratio,
-        n_heads_out=n_heads_out,
         max_active_clusters=num_sm,
         d_k=d_k,
         d_v=d_v,
@@ -3311,9 +3304,6 @@ def chunk_gdn2_sm100(
     else:
         state_dtype_src = "float32"
 
-    q_ratio = HO // HQ
-    k_ratio = HO // HK
-    v_ratio = HO // HV
     gate_scale_log2 = gate_lower_bound * LOG2_E
 
     if not safe_gate:
@@ -3331,9 +3321,6 @@ def chunk_gdn2_sm100(
         str(cu_seqlens.dtype),
         device,
         num_sm,
-        HQ,
-        HK,
-        HV,
         DK,
         DV,
         use_initial_state,
@@ -3397,10 +3384,6 @@ def chunk_gdn2_sm100(
             use_beta_sigmoid,
             allow_neg_eigval,
             beta_guard,
-            q_ratio,
-            k_ratio,
-            v_ratio,
-            HO,
             d_k=DK,
             d_v=DV,
             num_sm=num_sm,

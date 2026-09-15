@@ -338,7 +338,6 @@ def tmastg_warp(
         )
         checkpoint_store_cnt = cutlass.Int32(0)
         checkpoint_chunks = checkpoint_every_n_tokens // cutlass.Int32(cfg.b_t)
-    heads_out = cutlass.Int32(cfg.n_heads_out)
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
 
     while tile_idx < total_tiles:
@@ -1014,6 +1013,9 @@ def tmaldg_warp(
     mScheduler,
     sScheduler,
     bars,
+    q_ratio,
+    k_ratio,
+    v_ratio,
 ):
     """TMA-LDG warp role (warp 9): persistent scheduler loop + per-chunk
     Q/K/V G->S TMA loads, plus the chunk-factor tile TMA loads at the V
@@ -1068,15 +1070,14 @@ def tmaldg_warp(
         tma_subtile_stride_elems=bt * elements_per_128b,
     )
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
-
     while tile_idx < total_tiles:
         batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
             cfg, tile_idx, mWorkItems
         )
 
-        head_q = head_idx if cfg.q_ratio == 1 else head_idx // cutlass.Int32(cfg.q_ratio)
-        head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
-        head_v = head_idx if cfg.v_ratio == 1 else head_idx // cutlass.Int32(cfg.v_ratio)
+        head_q = head_idx // q_ratio
+        head_k = head_idx // k_ratio
+        head_v = head_idx // v_ratio
         slot = batch_idx * desc_qwords
         desc_q_slot = (desc_q_base + slot).tospace(cutlass.AddressSpace.generic)
         desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
@@ -2590,109 +2591,32 @@ def host(
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
 ):
-    h_q = cfg.h_q
-    h_k = cfg.h_k
-    h_v = cfg.h_v
     batch_size = cu_seqlens.shape[0] - 1
-    heads_out = h_q if h_q >= h_v else h_v
+    heads_out = cutlass.Int32(gate.shape[1])
+    q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
+    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
+    v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[1]))
 
-    # ---- GQA reshapes: fold the head group into the Q head axis ----------------------
-    if cutlass.const_expr(cfg.is_GQA):
-        h_r = h_q // h_v
-        h_qv = h_v
-        q = cute.make_tensor(
-            q.iterator,
-            cute.make_layout(
-                (q.shape[0], q.shape[2], (h_r, h_v)),
-                stride=(q.stride[0], q.stride[2], (q.stride[1], h_r * q.stride[1])),
-            ),
-        )
-        k = cute.make_tensor(
-            k.iterator,
-            cute.make_layout(
-                (k.shape[0], k.shape[2], (h_r, h_v)),
-                stride=(k.stride[0], k.stride[2], (0, k.stride[1])),
-            ),
-        )
-        v = cute.make_tensor(
-            v.iterator,
-            cute.make_layout(
-                (v.shape[2], v.shape[0], (h_r, h_v)),
-                stride=(v.stride[2], v.stride[0], (0, v.stride[1])),
-            ),
-        )
-    else:
-        h_r = h_v // h_q
-        h_qv = h_q
-        q = cute.make_tensor(
-            q.iterator,
-            cute.make_layout(
-                (q.shape[0], q.shape[2], (h_r, h_q)),
-                stride=(q.stride[0], q.stride[2], (0, q.stride[1])),
-            ),
-        )
-        k = cute.make_tensor(
-            k.iterator,
-            cute.make_layout(
-                (k.shape[0], k.shape[2], (h_r, h_q)),
-                stride=(k.stride[0], k.stride[2], (0, k.stride[1])),
-            ),
-        )
-        v = cute.make_tensor(
-            v.iterator,
-            cute.make_layout(
-                (v.shape[2], v.shape[0], (h_r, h_q)),
-                stride=(v.stride[2], v.stride[0], (v.stride[1], h_r * v.stride[1])),
-            ),
-        )
-
-    gate = cute.make_tensor(
-        gate.iterator,
-        cute.make_layout(
-            (gate.shape[0], (h_r, h_qv)),
-            stride=(gate.stride[0], (gate.stride[1], h_r * gate.stride[1])),
-        ),
-    )
-    if cutlass.const_expr(beta is not None):
-        beta = cute.make_tensor(
-            beta.iterator,
-            cute.make_layout(
-                (beta.shape[0], (h_r, h_qv)),
-                stride=(beta.stride[0], (beta.stride[1], h_r * beta.stride[1])),
-            ),
-        )
+    # ---- head-major views: (tokens, dim, heads) k / q, (dim, tokens, heads) v / o, (V, K, heads, seqs) states ----
+    q = cute.make_tensor(q.iterator, cute.make_layout((q.shape[0], q.shape[2], q.shape[1]), stride=(q.stride[0], q.stride[2], q.stride[1])))
+    k = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[2], k.shape[1]), stride=(k.stride[0], k.stride[2], k.stride[1])))
+    v = cute.make_tensor(v.iterator, cute.make_layout((v.shape[2], v.shape[0], v.shape[1]), stride=(v.stride[2], v.stride[0], v.stride[1])))
     if cutlass.const_expr(o is not None):
-        o = cute.make_tensor(
-            o.iterator,
-            cute.make_layout(
-                (o.shape[2], o.shape[0], (h_r, h_qv)),
-                stride=(o.stride[2], o.stride[0], (o.stride[1], h_r * o.stride[1])),
-            ),
-        )
+        o = cute.make_tensor(o.iterator, cute.make_layout((o.shape[2], o.shape[0], o.shape[1]), stride=(o.stride[2], o.stride[0], o.stride[1])))
     if cutlass.const_expr(state_in is not None):
         state_in = cute.make_tensor(
             state_in.iterator,
             cute.make_layout(
-                (state_in.shape[2], state_in.shape[3], (h_r, h_qv), state_in.shape[0]),
-                stride=(
-                    state_in.stride[2],
-                    state_in.stride[3],
-                    (state_in.stride[1], h_r * state_in.stride[1]),
-                    state_in.stride[0],
-                ),
+                (state_in.shape[2], state_in.shape[3], state_in.shape[1], state_in.shape[0]),
+                stride=(state_in.stride[2], state_in.stride[3], state_in.stride[1], state_in.stride[0]),
             ),
         )
     if cutlass.const_expr(state_out is not None):
         state_out = cute.make_tensor(
             state_out.iterator,
             cute.make_layout(
-                (state_out.shape[2], state_out.shape[3], (h_r, h_qv), state_out.shape[0]),
-                stride=(
-                    state_out.stride[2],
-                    state_out.stride[3],
-                    (state_out.stride[1], h_r * state_out.stride[1]),
-                    state_out.stride[0],
-                ),
+                (state_out.shape[2], state_out.shape[3], state_out.shape[1], state_out.shape[0]),
+                stride=(state_out.stride[2], state_out.stride[3], state_out.stride[1], state_out.stride[0]),
             ),
         )
 
@@ -2718,10 +2642,6 @@ def host(
     cfg.tma_o_bytes = o_tile_elements * bpe
     cfg.tma_tinv_bytes = tinv_tile_elements * bpe
 
-    cfg.n_heads_out = heads_out
-    cfg.q_ratio = heads_out // h_q
-    cfg.k_ratio = heads_out // h_k
-    cfg.v_ratio = heads_out // h_v
     num_descs = batch_size
 
     # ---- launch ----------------------------------------------------------------------
@@ -2729,6 +2649,9 @@ def host(
 
     frost_gdn_prefill(
         cfg,
+        q_ratio,
+        k_ratio,
+        v_ratio,
         gate,
         a_log,
         dt_bias,
@@ -2765,6 +2688,9 @@ def host(
 @cute.kernel
 def frost_gdn_prefill(
     cfg: cutlass.Constexpr,
+    q_ratio: cute.FastDivmodDivisorV2,
+    k_ratio: cute.FastDivmodDivisorV2,
+    v_ratio: cute.FastDivmodDivisorV2,
     mGate: cute.Tensor,
     mA_log: Optional[cute.Tensor],
     mDt_bias: Optional[cute.Tensor],
@@ -3153,6 +3079,9 @@ def frost_gdn_prefill(
             mScheduler=mScheduler,
             sScheduler=sScheduler,
             bars=bars,
+            q_ratio=q_ratio,
+            k_ratio=k_ratio,
+            v_ratio=v_ratio,
         )
 
     if warp_idx == cfg.epilogue_warp_id:
@@ -3189,7 +3118,6 @@ class GdnPrefillCfg:
     acc_dtype: Type[cutlass.Numeric]
     state_dtype: Type[cutlass.Numeric]
     max_active_clusters: int
-    is_GQA: bool
     use_initial_state: bool
     store_final_state: bool
     enable_checkpoints: bool
@@ -3257,10 +3185,6 @@ class GdnPrefillCfg:
     tma_v_bytes: int = 0
     tma_o_bytes: int = 0
     tma_tinv_bytes: int = 0
-    n_heads_out: int = 0
-    q_ratio: int = 1
-    k_ratio: int = 1
-    v_ratio: int = 1
 
 
 def build_cfg(
@@ -3268,7 +3192,6 @@ def build_cfg(
     state_dtype: Type[cutlass.Numeric],
     *,
     max_active_clusters: int,
-    is_GQA: bool,
     use_initial_state: bool,
     store_final_state: bool = True,
     enable_checkpoints: bool = False,
@@ -3291,7 +3214,6 @@ def build_cfg(
         acc_dtype=cutlass.Float32,
         state_dtype=state_dtype,
         max_active_clusters=max_active_clusters,
-        is_GQA=is_GQA,
         use_initial_state=use_initial_state,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
@@ -3342,13 +3264,9 @@ def get_compiled_cache(
     beta_dtype_str: str,
     device: int,
     num_sm: int,
-    HQ: int,
-    HK: int,
-    HV: int,
     DK: int,
     DV: int,
     expand_num: int,
-    is_GQA: bool,
     use_initial_state: bool,
     store_final_state: bool,
     enable_checkpoints: bool,
@@ -3368,7 +3286,6 @@ def get_compiled_cache(
 def compile(
     io_dtype,
     state_dtype,
-    is_GQA: bool,
     use_initial_state: bool,
     store_final_state: bool,
     enable_checkpoints: bool,
@@ -3379,9 +3296,6 @@ def compile(
     tinv_source: str = "compute",
     *,
     num_sm: int,
-    h_q: int,
-    h_k: int,
-    h_v: int,
     d_k: int,
     d_v: int,
     expand_num: int = 1,
@@ -3412,7 +3326,6 @@ def compile(
         io_dtype,
         state_dtype,
         max_active_clusters=num_sm,
-        is_GQA=is_GQA,
         use_initial_state=use_initial_state,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
@@ -3425,9 +3338,6 @@ def compile(
         d_v=d_v,
         expand_num=expand_num,
     )
-    cfg.h_q = h_q
-    cfg.h_k = h_k
-    cfg.h_v = h_v
 
     return cute.compile(
         host,
@@ -3547,7 +3457,6 @@ def chunk_gdn_sm100(
     DK = q.shape[2]
     DV = v.shape[2]
     B = cu_seqlens.shape[0] - 1
-    is_GQA = HQ >= HV
     use_initial_state = initial_state is not None
     store_final_state = output_state is not None
     enable_checkpoints = checkpoint_every_n_tokens > 0
@@ -3584,13 +3493,10 @@ def chunk_gdn_sm100(
         str(beta.dtype) if beta is not None else "none",
         device,
         num_sm,
-        HQ,
         k.shape[1],
-        HV,
         DK,
         DV,
         expand_num,
-        is_GQA,
         use_initial_state,
         store_final_state,
         enable_checkpoints,
@@ -3639,7 +3545,6 @@ def chunk_gdn_sm100(
         cache["compiled"] = compile(
             io_dtype,
             state_dtype,
-            is_GQA,
             use_initial_state,
             store_final_state,
             enable_checkpoints,
@@ -3649,9 +3554,7 @@ def chunk_gdn_sm100(
             allow_neg_eigval,
             tinv_source,
             num_sm=num_sm,
-            h_q=HQ,
             h_k=k.shape[1],
-            h_v=HV,
             d_k=DK,
             d_v=DV,
             expand_num=expand_num,
