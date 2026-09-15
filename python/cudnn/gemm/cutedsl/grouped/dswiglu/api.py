@@ -20,7 +20,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from cudnn.api_base import TensorDesc, APIBase, TupleDict, ceil_div, is_power_of_2
 from cudnn.tensor_adapter import (
     cuda_is_available,
     default_stream,
@@ -120,13 +120,13 @@ class GroupedGemmDswigluSm100(APIBase):
         :param discrete_col_sfd: Boolean, True to generate discrete col-major scale factor tensor
         :param epilogue_op: Optional epilogue operation. Valid values: None, "none", "identity", "relu", "srelu"
         """
-        framework = detect_framework(sample_a)
+        framework = "torch" if isinstance(sample_a, TensorDesc) else detect_framework(sample_a)
         if sample_a is not None and framework != "torch":
             if framework == "jax":
                 raise ValueError(
                     "GroupedGemmDswigluSm100 only supports dense weight mode, whose expert-outermost strided "
                     "B layout (n, k, l) is not expressible as JAX arrays (row-major only); "
-                    "use torch tensors for this backward API"
+                    "use torch tensors for this backward API, or grouped_gemm_dswiglu_jax_sm100 for canonical MXFP8 JAX arrays"
                 )
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmDswigluSm100; pass torch tensors")
         if acc_dtype is None:
@@ -822,7 +822,7 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         raise ValueError(
             "grouped_gemm_dswiglu_wrapper_sm100 only supports dense weight mode, whose expert-outermost strided "
             "B layout (n, k, l) is not expressible as JAX arrays (row-major only); "
-            "use torch tensors for this backward API"
+            "use torch tensors for this backward API, or grouped_gemm_dswiglu_jax_sm100 for canonical MXFP8 JAX arrays"
         )
     import torch
 
