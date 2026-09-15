@@ -924,6 +924,7 @@ The current FP8 support is a subset of the options supported in FP16 and BF16 su
 - Requires Hopper (SM90) or newer architecture.
 - Head dimension must be a multiple of 16.
 - Limited masking options compared to FP16/BF16 (causal and padding masks only).
+- On Hopper (SM90), a padding mask cannot be combined with a left diagonal band bound (sliding window): the FP8 kernel hangs when a batch has `seq_len_q > seq_len_kv`, so the frontend declines the combination (GitHub #1009).
 - Requires explicit scale/descale tensors for all FP8 inputs and outputs.
 
 #### Tensors
