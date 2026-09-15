@@ -905,6 +905,13 @@ def _split_points(
     no_split = 1
     if not caps.split_kv_supported:
         return [no_split]
+    # split_kv_supported is a ROW-wide flag; split_d_shapes narrows it to the
+    # flavors that actually wire SplitHelpers. mismatch() already honours that
+    # for an explicitly REQUESTED split, but this function proposes one on its
+    # own, so it has to consult the same set or it hands back a knob the
+    # lowering will reject (d64 wires no split; see config_sm100.CfgD64).
+    if caps.split_d_shapes is not None and _selected_d_shape(caps, facts) not in caps.split_d_shapes:
+        return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
     if facts.thd or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:

@@ -83,6 +83,7 @@ def dtype_name(buffer) -> str:
 
 
 _SM100_FLAVORS = (
+    (64, 64),
     (128, 128),
     (192, 128),
     (256, 256),
@@ -97,6 +98,10 @@ _SM100_KERNEL_FILES = {
     (256, 256): "sm100/prefill_d256_f16.py",
     (192, 128): "sm100/prefill_d192_d128_f16.py",
     (128, 128): "sm100/prefill_d128_f16.py",
+    # Same file as (128, 128): one pipeline, two head-dim geometries, selected
+    # by TemplateParams.d_flavor. d<=64 graphs used to ride the d128 envelope
+    # and pay a zero-filled 128-wide MMA tile for it.
+    (64, 64): "sm100/prefill_d128_f16.py",
 }
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
@@ -426,6 +431,11 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
     if device_cc == (10, 7) and fp8 and flavor == (192, 128):
         return (2,)
     if flavor == (192, 128):
+        return (1, 2)
+    # d64: cga1 is the tuned width (halved slabs clear the SMEM cap without the
+    # Q/O alias, and a 2-CTA cluster only widens the Q rows a cluster must cover
+    # under a narrow band). cga2 still builds, so both are offered.
+    if flavor == (64, 64):
         return (1, 2)
     if fp8 and flavor == (256, 256):
         return (1,)
@@ -2069,7 +2079,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             pack_gqa=self.pack_gqa,
             qh_per_kh=int(self.q_desc.shape[1]) // int(self.k_desc.shape[1]),
             split_kv=self.split_kv,
-            cta_mma=(1 if self._fp8 and self.flavor == (256, 256) else 2) if self.cga is None else self.cga,
+            # d64 defaults to cga1, the width cuDNN's own native kernel picks
+            # for this geometry: the collective cga2 MMA exists to halve
+            # per-CTA K/V, which the halved d64 slabs no longer need, and a
+            # 2-CTA cluster doubles the Q rows a cluster must cover -- wasted
+            # work under a narrow diagonal band.
+            cta_mma=(1 if (self._fp8 and self.flavor == (256, 256)) or self.flavor == (64, 64) else 2) if self.cga is None else self.cga,
+            d_flavor=64 if self.flavor == (64, 64) else 128,
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
             paged_kv=self.paged,
