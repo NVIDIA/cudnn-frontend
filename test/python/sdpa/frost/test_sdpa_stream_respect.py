@@ -18,9 +18,9 @@ import torch
 
 import cudnn
 from cudnn.engines import is_python_engine
-from frost_test_utils import requires_blackwell, requires_dsl, _dsl_installed
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
 
-pytestmark = [pytest.mark.L0, requires_blackwell, requires_dsl]
+pytestmark = [pytest.mark.L0, requires_pre_rubin_blackwell, requires_dsl]
 
 _B, _H, _S = 2, 8, 256
 _HALF, _F32 = cudnn.data_type.HALF, cudnn.data_type.FLOAT

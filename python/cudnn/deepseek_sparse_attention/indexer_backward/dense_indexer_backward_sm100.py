@@ -62,6 +62,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
+from cutlass._mlir.dialects import nvvm
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils as utils
@@ -86,6 +88,27 @@ from cudnn.deepseek_sparse_attention.utils.seqlen import seqlen_info as _seqlen_
 
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
 fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
+
+
+@dsl_user_op
+def _tcgen05_fence_after_thread_sync(*, loc=None, ip=None):
+    """Order subsequent tcgen05 operations after an inter-thread wait."""
+    nvvm.tcgen05_fence(
+        nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _tcgen05_fence_before_thread_sync(*, loc=None, ip=None):
+    """Order prior tcgen05 operations before an inter-thread signal."""
+    nvvm.tcgen05_fence(
+        nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC,
+        loc=loc,
+        ip=ip,
+    )
+
 
 DENOM_EPS = 1e-10
 CLIP_LOG_MIN = -100.0
@@ -354,7 +377,9 @@ MBAR_2Q_DK_EMPTY = 3  # Reduce → MMA (1×/block)
 MBAR_2Q_GS_LOADED_0 = 4  # Load → Compute (2-stage K pipeline)
 MBAR_2Q_GS_LOADED_1 = 5
 MBAR_2Q_W_LOADED = 6
-NUM_2Q_BARRIERS = 7
+MBAR_2Q_DQ_DONE = 7  # MMA → Compute (one-shot, final q0/q1 GEMM3 completion)
+MBAR_2Q_REDUCE_DONE = 8  # Reduce → Compute warp 0 (one-shot, final dK T2R completion)
+NUM_2Q_BARRIERS = 9
 
 
 class DenseIndexerBackward2QGemmSm100:
@@ -369,7 +394,7 @@ class DenseIndexerBackward2QGemmSm100:
       Offset 256:  dQ_q0  (128 cols) — Q token 0 persistent accumulator
       Offset 384:  dQ_q1  (128 cols) — Q token 1 persistent accumulator
 
-    Barriers: 7 custom.
+    Barriers: 9 custom.
     Grid: (ceil(seqlen_q/2), batch, 1).
     """
 
@@ -525,7 +550,7 @@ class DenseIndexerBackward2QGemmSm100:
         sdS_layout = _make_smem_layout_a(tmma3, self.gemm3_tiler, self.q_dtype, 2)  # 2-stage
         sdS_store_layout = _make_smem_layout_epi(
             self.q_dtype,
-            LayoutEnum.COL_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             (self.heads_padded, self.block_I),
             2,
         )
@@ -963,15 +988,20 @@ class DenseIndexerBackward2QGemmSm100:
             cute.group_modes(gdQ_q1, 0, 2),
         )
 
-        # Init all custom barriers (warp 0)
-        if warp_idx == 0:
+        # Initialize each custom barrier exactly once.
+        if tidx == 0:
             cute.arch.mbarrier_init(mbar + MBAR_2Q_S_FULL, 1)
             cute.arch.mbarrier_init(mbar + MBAR_2Q_DS_READY, self.WARPGROUP_SIZE)
             cute.arch.mbarrier_init(mbar + MBAR_2Q_DK_FULL, 1)
             cute.arch.mbarrier_init(mbar + MBAR_2Q_DK_EMPTY, self.WARPGROUP_SIZE)
-            cute.arch.mbarrier_init(mbar + MBAR_2Q_GS_LOADED_0, 1)
-            cute.arch.mbarrier_init(mbar + MBAR_2Q_GS_LOADED_1, 1)
-            cute.arch.mbarrier_init(mbar + MBAR_2Q_W_LOADED, 1)
+            cute.arch.mbarrier_init(mbar + MBAR_2Q_GS_LOADED_0, self.WARP_SIZE)
+            cute.arch.mbarrier_init(mbar + MBAR_2Q_GS_LOADED_1, self.WARP_SIZE)
+            cute.arch.mbarrier_init(mbar + MBAR_2Q_W_LOADED, self.WARP_SIZE)
+            cute.arch.mbarrier_init(mbar + MBAR_2Q_DQ_DONE, 1)
+            cute.arch.mbarrier_init(
+                mbar + MBAR_2Q_REDUCE_DONE,
+                self.WARPGROUP_SIZE,
+            )
         cute.arch.sync_threads()
 
         # Pre-compute accumulator shapes/layouts
@@ -1072,6 +1102,7 @@ class DenseIndexerBackward2QGemmSm100:
                     sGradSignal_q1_0,
                     sGradSignal_q1_1,
                     sW_full,
+                    sdS_store,
                     sdS,
                     sdQ_epi_slice,
                     s_acc_shape,
@@ -1096,6 +1127,18 @@ class DenseIndexerBackward2QGemmSm100:
                     num_kv_blocks,
                 )
                 if warp_idx == self.compute_warp_id[0]:
+                    # The reduce warpgroup issues asynchronous TMEM loads.
+                    # All 128 reducer threads arrive only after their final
+                    # tcgen05.wait::ld fence, making TMEM deallocation safe.
+                    # A zero-K batch issues no reducer load (and therefore no
+                    # REDUCE_DONE arrival); preserve the pre-existing empty
+                    # path instead of waiting on an event that cannot occur.
+                    if num_kv_blocks > 0:
+                        cute.arch.mbarrier_wait(
+                            mbar + MBAR_2Q_REDUCE_DONE,
+                            Int32(0),
+                        )
+                        _tcgen05_fence_after_thread_sync()
                     cute.arch.dealloc_tmem(tmem_ptr_base, self.tmem_alloc_cols)
 
             elif warp_idx in self.reduce_warp_id:
@@ -1201,8 +1244,8 @@ class DenseIndexerBackward2QGemmSm100:
                     sW_full[self.heads + idx] = mW_b[q1_local, idx]
 
         cute.arch.fence_view_async_shared()
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive(mbar + MBAR_2Q_W_LOADED)
+        # Every load-warp lane publishes its own sW stores.
+        cute.arch.mbarrier_arrive(mbar + MBAR_2Q_W_LOADED)
 
         # --- TMA Q load (q0) ---
         Q_q0_producer.reset()
@@ -1271,8 +1314,7 @@ class DenseIndexerBackward2QGemmSm100:
                         bi,
                     )
                 cute.arch.fence_view_async_shared()
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(mbar + MBAR_2Q_GS_LOADED_0)
+                cute.arch.mbarrier_arrive(mbar + MBAR_2Q_GS_LOADED_0)
             else:
                 self._load_grad_signal_to_buf(
                     mGS_b,
@@ -1292,8 +1334,7 @@ class DenseIndexerBackward2QGemmSm100:
                         bi,
                     )
                 cute.arch.fence_view_async_shared()
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(mbar + MBAR_2Q_GS_LOADED_1)
+                cute.arch.mbarrier_arrive(mbar + MBAR_2Q_GS_LOADED_1)
 
     # =========================================================================
     # MMA warp (2Q): Sequential loop, 6 GEMMs per K block
@@ -1363,6 +1404,9 @@ class DenseIndexerBackward2QGemmSm100:
             # Wait for K[bi] ready
             K_handle = K_consumer.wait_and_advance()
             k_stage = K_handle.index
+            # This also orders the next tcgen05 MMA after the earlier
+            # DK_EMPTY wait when the single dK TMEM buffer is being reused.
+            _tcgen05_fence_after_thread_sync()
 
             # ---- Phase A (Q token 0) ----
             # GEMM1: S = Q_q0 @ K[bi]
@@ -1382,6 +1426,7 @@ class DenseIndexerBackward2QGemmSm100:
             # Wait for dS from Compute (Phase A)
             cute.arch.mbarrier_wait(mbar + MBAR_2Q_DS_READY, ds_ready_phase)
             ds_ready_phase ^= 1
+            _tcgen05_fence_after_thread_sync()
 
             # GEMM2: dK = dS_q0^T @ Q_q0 (ACCUMULATE=False, clear)
             tmma2.set(tcgen05.Field.ACCUMULATE, False)
@@ -1395,7 +1440,7 @@ class DenseIndexerBackward2QGemmSm100:
                 )
                 tmma2.set(tcgen05.Field.ACCUMULATE, True)
 
-            # GEMM3: dQ_q0 += dS @ Kt[bi]
+            # GEMM3: dQ_q0 += dS_q0 @ K^T
             tmma3.set(tcgen05.Field.ACCUMULATE, not is_first_dq_q0)
             is_first_dq_q0 = False
             for k_block in cutlass.range(0, cute.size(tDQrDS, mode=[2]), unroll=4):
@@ -1427,6 +1472,7 @@ class DenseIndexerBackward2QGemmSm100:
                 # Wait for dS from Compute (Phase B)
                 cute.arch.mbarrier_wait(mbar + MBAR_2Q_DS_READY, ds_ready_phase)
                 ds_ready_phase ^= 1
+                _tcgen05_fence_after_thread_sync()
 
                 # GEMM2: dK += dS_q1^T @ Q_q1 (ACCUMULATE=True!)
                 tmma2.set(tcgen05.Field.ACCUMULATE, True)
@@ -1439,7 +1485,7 @@ class DenseIndexerBackward2QGemmSm100:
                         tDkDk,
                     )
 
-                # GEMM3: dQ_q1 += dS @ Kt[bi]
+                # GEMM3: dQ_q1 += dS_q1 @ K^T
                 tmma3.set(tcgen05.Field.ACCUMULATE, not is_first_dq_q1)
                 is_first_dq_q1 = False
                 for k_block in cutlass.range(0, cute.size(tDQrDS, mode=[2]), unroll=4):
@@ -1459,6 +1505,12 @@ class DenseIndexerBackward2QGemmSm100:
             # Release K stage
             K_handle.release()
 
+        # GEMM3 accumulates dQ in TMEM asynchronously. Commit a dedicated
+        # one-shot completion only after the final q0/q1 GEMM3 has been
+        # issued, so Compute cannot race its TMEM epilogue readback.
+        with cute.arch.elect_one():
+            tcgen05.commit(mbar + MBAR_2Q_DQ_DONE)
+
     # =========================================================================
     # Helper: dS/dW computation for one block (same as 1Q)
     # =========================================================================
@@ -1475,11 +1527,20 @@ class DenseIndexerBackward2QGemmSm100:
         w_reg_h1: Float32,
     ):
         """Compute dS and accumulate dW for one block using grad_signal from sGS."""
+        use_stmatrix_ds = const_expr(
+            self.heads_padded == 64 and self.block_I == 128,
+        )
         for ei in cutlass.range(0, cute.size(tSrS), 2, unroll_full=True):
-            h0 = cute.get(tCcS[ei], mode=[0, 0])
-            n0 = cute.get(tCcS[ei], mode=[0, 1])
-            h1 = cute.get(tCcS[ei + 1], mode=[0, 0])
-            n1 = cute.get(tCcS[ei + 1], mode=[0, 1])
+            if const_expr(use_stmatrix_ds):
+                h0 = cute.get(tCcS[ei], mode=[0])
+                n0 = cute.get(tCcS[ei], mode=[1])
+                h1 = cute.get(tCcS[ei + 1], mode=[0])
+                n1 = cute.get(tCcS[ei + 1], mode=[1])
+            else:
+                h0 = cute.get(tCcS[ei], mode=[0, 0])
+                n0 = cute.get(tCcS[ei], mode=[0, 1])
+                h1 = cute.get(tCcS[ei + 1], mode=[0, 0])
+                n1 = cute.get(tCcS[ei + 1], mode=[0, 1])
 
             tSrS[ei], tSrS[ei + 1] = mul_packed_f32x2(
                 (tSrS[ei], tSrS[ei + 1]),
@@ -1488,8 +1549,15 @@ class DenseIndexerBackward2QGemmSm100:
             s0 = tSrS[ei]
             s1 = tSrS[ei + 1]
 
-            w0 = w_reg_h0 if h0 == my_first_h else w_reg_h1
-            w1 = w_reg_h0 if h1 == my_first_h else w_reg_h1
+            if const_expr(use_stmatrix_ds):
+                # 16dp256b8x alternates pairs between the thread's low/high
+                # head; both elements in a pair use the same weight.
+                pair_weight = w_reg_h0 if (ei // 2) % 2 == 0 else w_reg_h1
+                w0 = pair_weight
+                w1 = pair_weight
+            else:
+                w0 = w_reg_h0 if h0 == my_first_h else w_reg_h1
+                w1 = w_reg_h0 if h1 == my_first_h else w_reg_h1
             gs0 = sGS[n0]
             gs1 = sGS[n1]
 
@@ -1523,6 +1591,7 @@ class DenseIndexerBackward2QGemmSm100:
         sGradSignal_q1_0,
         sGradSignal_q1_1,
         sW_full,
+        sdS_store,
         sdS,
         sdQ_epi_slice,
         s_acc_shape,
@@ -1557,45 +1626,110 @@ class DenseIndexerBackward2QGemmSm100:
             Float32,
         )
 
-        # --- TMEM readback (S, single-buffered) ---
-        tiled_tmem_load_s = tcgen05.make_tmem_copy(tmem_load_atom, tStS)
-        thr_tmem_load_s = tiled_tmem_load_s.get_slice(wg_tidx)
-        tStS_t2r = thr_tmem_load_s.partition_S(tStS)
-
-        # Logical GEMM views for direct dS writes (stage 0/1).
-        # Writing through the same A-operand view that GEMM2/GEMM3 read from
-        # guarantees layout compatibility (stmatrix epilogue layout differs
-        # from the swizzled A-operand layout, so coord writes are required).
-        sdS_gemm_view_0 = cute.composition(
-            sdS[None, None, None, 0],
-            cute.make_layout((self.heads_padded, self.block_I)),
+        # The production H64 x I128 tile has the same 16dp256b8x ownership as
+        # the sparse kernel. Derive STMatrix R2S ownership directly from the
+        # TMEM load; other factory shapes retain native coordinate stores.
+        use_stmatrix_ds = const_expr(
+            self.heads_padded == 64 and self.block_I == 128,
         )
-        sdS_gemm_view_1 = cute.composition(
-            sdS[None, None, None, 1],
-            cute.make_layout((self.heads_padded, self.block_I)),
-        )
+        if const_expr(use_stmatrix_ds):
+            tStS_epi = tStS[((None, None), 0, 0)]
+            tiled_tmem_load_s = tcgen05.make_tmem_copy(
+                tmem_load_atom,
+                tStS_epi,
+            )
+            thr_tmem_load_s = tiled_tmem_load_s.get_slice(wg_tidx)
+            tStS_t2r = thr_tmem_load_s.partition_S(tStS_epi)
 
-        cS = cute.make_identity_tensor(s_acc_shape)
-        tCcS = thr_tmem_load_s.partition_D(cS)
+            smem_store_atom = sm100_utils_basic.get_smem_store_op(
+                LayoutEnum.ROW_MAJOR,
+                self.q_dtype,
+                self.acc_dtype,
+                tiled_tmem_load_s,
+            )
+            tiled_smem_store = cute.make_tiled_copy_D(
+                smem_store_atom,
+                tiled_tmem_load_s,
+            )
+            thr_smem_store = tiled_smem_store.get_slice(wg_tidx)
+            tRS_sdS = thr_smem_store.partition_D(sdS_store)
+
+            cS = cute.make_identity_tensor(
+                (self.heads_padded, self.block_I),
+            )
+            tCcS = thr_tmem_load_s.partition_D(cS)
+            my_first_h = warp_id_in_wg * 16 + lane_id // 4
+            my_second_h = my_first_h + 8
+        else:
+            tiled_tmem_load_s = tcgen05.make_tmem_copy(
+                tmem_load_atom,
+                tStS,
+            )
+            thr_tmem_load_s = tiled_tmem_load_s.get_slice(wg_tidx)
+            tStS_t2r = thr_tmem_load_s.partition_S(tStS)
+
+            sdS_gemm_view_0 = cute.composition(
+                sdS[None, None, None, 0],
+                cute.make_layout((self.heads_padded, self.block_I)),
+            )
+            sdS_gemm_view_1 = cute.composition(
+                sdS[None, None, None, 1],
+                cute.make_layout((self.heads_padded, self.block_I)),
+            )
+            cS = cute.make_identity_tensor(s_acc_shape)
+            tCcS = thr_tmem_load_s.partition_D(cS)
+            my_first_h = cute.get(tCcS[0], mode=[0, 0])
+            my_second_h = my_first_h
+            for ei in cutlass.range(cute.size(tCcS), unroll_full=True):
+                h_check = cute.get(tCcS[ei], mode=[0, 0])
+                if h_check != my_first_h:
+                    my_second_h = h_check
         tSrS_shape = tCcS.shape
-        my_first_h = cute.get(tCcS[0], mode=[0, 0])
-        my_second_h = my_first_h
-        for ei in cutlass.range(cute.size(tCcS), unroll_full=True):
-            h_check = cute.get(tCcS[ei], mode=[0, 0])
-            if h_check != my_first_h:
-                my_second_h = h_check
 
-        # --- TMEM readback (dQ_q0 and dQ_q1) ---
-        tiled_tmem_load_dq0 = tcgen05.make_tmem_copy(tmem_load_atom, tDqDq_0)
+        # dQ uses the same canonical 2-D ownership for H64 x D128.
+        use_stmatrix_dq = const_expr(
+            self.heads_padded == 64 and self.head_dim_padded == 128,
+        )
+        if const_expr(use_stmatrix_dq):
+            tDqDq_0_load_view = tDqDq_0[((None, None), 0, 0)]
+            tDqDq_1_load_view = tDqDq_1[((None, None), 0, 0)]
+            cDQ = cute.make_identity_tensor(
+                (self.heads_padded, self.head_dim_padded),
+            )
+        else:
+            tDqDq_0_load_view = tDqDq_0
+            tDqDq_1_load_view = tDqDq_1
+            cDQ = cute.make_identity_tensor(dq_acc_shape)
+
+        tiled_tmem_load_dq0 = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            tDqDq_0_load_view,
+        )
         thr_tmem_load_dq0 = tiled_tmem_load_dq0.get_slice(wg_tidx)
-        tDqDq_0_t2r = thr_tmem_load_dq0.partition_S(tDqDq_0)
-        cDQ = cute.make_identity_tensor(dq_acc_shape)
+        tDqDq_0_t2r = thr_tmem_load_dq0.partition_S(tDqDq_0_load_view)
         tCcDQ = thr_tmem_load_dq0.partition_D(cDQ)
         tDQrDQ_shape = tCcDQ.shape
 
-        tiled_tmem_load_dq1 = tcgen05.make_tmem_copy(tmem_load_atom, tDqDq_1)
+        tiled_tmem_load_dq1 = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            tDqDq_1_load_view,
+        )
         thr_tmem_load_dq1 = tiled_tmem_load_dq1.get_slice(wg_tidx)
-        tDqDq_1_t2r = thr_tmem_load_dq1.partition_S(tDqDq_1)
+        tDqDq_1_t2r = thr_tmem_load_dq1.partition_S(tDqDq_1_load_view)
+
+        if const_expr(use_stmatrix_dq):
+            smem_store_atom_dq = sm100_utils_basic.get_smem_store_op(
+                LayoutEnum.ROW_MAJOR,
+                self.q_dtype,
+                self.acc_dtype,
+                tiled_tmem_load_dq0,
+            )
+            tiled_smem_store_dq = cute.make_tiled_copy_D(
+                smem_store_atom_dq,
+                tiled_tmem_load_dq0,
+            )
+            thr_smem_store_dq = tiled_smem_store_dq.get_slice(wg_tidx)
+            tRDQ_sdQ = thr_smem_store_dq.partition_D(sdQ_epi_slice)
 
         # Wait for W loaded
         cute.arch.mbarrier_wait(mbar + MBAR_2Q_W_LOADED, Int32(0))
@@ -1636,6 +1770,7 @@ class DenseIndexerBackward2QGemmSm100:
             # Wait for S ready from MMA (Phase A)
             cute.arch.mbarrier_wait(mbar + MBAR_2Q_S_FULL, s_full_phase)
             s_full_phase ^= 1
+            _tcgen05_fence_after_thread_sync()
             cute.copy(tiled_tmem_load_s, tStS_t2r, tSrS)
 
             # Compute dS_q0 + accumulate dW_q0
@@ -1669,7 +1804,21 @@ class DenseIndexerBackward2QGemmSm100:
             for ei in cutlass.range(cute.size(tSrS), unroll_full=True):
                 tSrS_f16[ei] = self.q_dtype(tSrS[ei])
 
-            if bi % 2 == 0:
+            if const_expr(use_stmatrix_ds):
+                tRS_rdS = tiled_smem_store.retile(tSrS_f16)
+                if bi % 2 == 0:
+                    cute.copy(
+                        tiled_smem_store,
+                        tRS_rdS,
+                        tRS_sdS[(None, None, None, 0)],
+                    )
+                else:
+                    cute.copy(
+                        tiled_smem_store,
+                        tRS_rdS,
+                        tRS_sdS[(None, None, None, 1)],
+                    )
+            elif bi % 2 == 0:
                 for ei in cutlass.range(cute.size(tSrS_f16), unroll_full=True):
                     h = cute.get(tCcS[ei], mode=[0, 0])
                     n = cute.get(tCcS[ei], mode=[0, 1])
@@ -1681,6 +1830,7 @@ class DenseIndexerBackward2QGemmSm100:
                     sdS_gemm_view_1[h, n] = tSrS_f16[ei]
 
             cute.arch.fence_proxy("async.shared", space="cta")
+            _tcgen05_fence_before_thread_sync()
             cute.arch.mbarrier_arrive(mbar + MBAR_2Q_DS_READY)
 
             # ---- Phase B (Q token 1, guarded) ----
@@ -1688,6 +1838,7 @@ class DenseIndexerBackward2QGemmSm100:
                 # Wait for S ready from MMA (Phase B)
                 cute.arch.mbarrier_wait(mbar + MBAR_2Q_S_FULL, s_full_phase)
                 s_full_phase ^= 1
+                _tcgen05_fence_after_thread_sync()
                 cute.copy(tiled_tmem_load_s, tStS_t2r, tSrS)
 
                 # Compute dS_q1 + accumulate dW_q1, using sW_full offset by heads
@@ -1721,7 +1872,21 @@ class DenseIndexerBackward2QGemmSm100:
                 for ei in cutlass.range(cute.size(tSrS), unroll_full=True):
                     tSrS_f16_b[ei] = self.q_dtype(tSrS[ei])
 
-                if bi % 2 == 0:
+                if const_expr(use_stmatrix_ds):
+                    tRS_rdS_b = tiled_smem_store.retile(tSrS_f16_b)
+                    if bi % 2 == 0:
+                        cute.copy(
+                            tiled_smem_store,
+                            tRS_rdS_b,
+                            tRS_sdS[(None, None, None, 0)],
+                        )
+                    else:
+                        cute.copy(
+                            tiled_smem_store,
+                            tRS_rdS_b,
+                            tRS_sdS[(None, None, None, 1)],
+                        )
+                elif bi % 2 == 0:
                     for ei in cutlass.range(cute.size(tSrS_f16_b), unroll_full=True):
                         h = cute.get(tCcS[ei], mode=[0, 0])
                         n = cute.get(tCcS[ei], mode=[0, 1])
@@ -1733,6 +1898,7 @@ class DenseIndexerBackward2QGemmSm100:
                         sdS_gemm_view_1[h, n] = tSrS_f16_b[ei]
 
                 cute.arch.fence_proxy("async.shared", space="cta")
+                _tcgen05_fence_before_thread_sync()
                 cute.arch.mbarrier_arrive(mbar + MBAR_2Q_DS_READY)
 
         # DK_FULL is committed after both dQ GEMM3 phases for every K block.
@@ -1749,20 +1915,39 @@ class DenseIndexerBackward2QGemmSm100:
             cute.make_layout((self.heads_padded, self.head_dim_padded)),
         )
 
+        # The per-block S barriers only cover GEMM1. Wait for the MMA warp's
+        # final GEMM3 commit before reading either persistent dQ accumulator.
+        cute.arch.mbarrier_wait(mbar + MBAR_2Q_DQ_DONE, Int32(0))
+        _tcgen05_fence_after_thread_sync()
+
         # ---- Epilogue: dQ for q0 via TMA store ----
         tDQrDQ_q0 = cute.make_rmem_tensor(tDQrDQ_shape, Float32)
         cute.copy(tiled_tmem_load_dq0, tDqDq_0_t2r, tDQrDQ_q0)
 
         tDQrDQ_q0_bf16 = cute.make_rmem_tensor(tDQrDQ_q0.shape, self.q_dtype)
-        for ei in cutlass.range(cute.size(tDQrDQ_q0), unroll_full=True):
-            tDQrDQ_q0_bf16[ei] = self.q_dtype(tDQrDQ_q0[ei] * Float32(sm_scale))
+        for ei in cutlass.range(0, cute.size(tDQrDQ_q0), 2):
+            scaled0, scaled1 = mul_packed_f32x2(
+                (tDQrDQ_q0[ei], tDQrDQ_q0[ei + 1]),
+                (Float32(sm_scale), Float32(sm_scale)),
+            )
+            tDQrDQ_q0_bf16[ei] = self.q_dtype(scaled0)
+            tDQrDQ_q0_bf16[ei + 1] = self.q_dtype(scaled1)
 
         cute.arch.fence_view_async_tmem_load()
+        _tcgen05_fence_before_thread_sync()
 
-        for ei in cutlass.range(cute.size(tDQrDQ_q0_bf16), unroll_full=True):
-            h = cute.get(tCcDQ[ei], mode=[0, 0])
-            d = cute.get(tCcDQ[ei], mode=[0, 1])
-            sdQ_gemm_view[h, d] = tDQrDQ_q0_bf16[ei]
+        if const_expr(use_stmatrix_dq):
+            tRDQ_rdQ_q0 = tiled_smem_store_dq.retile(tDQrDQ_q0_bf16)
+            cute.copy(
+                tiled_smem_store_dq,
+                tRDQ_rdQ_q0,
+                tRDQ_sdQ,
+            )
+        else:
+            for ei in cutlass.range(cute.size(tDQrDQ_q0_bf16), unroll_full=True):
+                h = cute.get(tCcDQ[ei], mode=[0, 0])
+                d = cute.get(tCcDQ[ei], mode=[0, 1])
+                sdQ_gemm_view[h, d] = tDQrDQ_q0_bf16[ei]
 
         self.compute_sync_barrier.arrive_and_wait()
         cute.arch.fence_proxy("async.shared", space="cta")
@@ -1786,15 +1971,29 @@ class DenseIndexerBackward2QGemmSm100:
             cute.copy(tiled_tmem_load_dq1, tDqDq_1_t2r, tDQrDQ_q1)
 
             tDQrDQ_q1_bf16 = cute.make_rmem_tensor(tDQrDQ_q1.shape, self.q_dtype)
-            for ei in cutlass.range(cute.size(tDQrDQ_q1), unroll_full=True):
-                tDQrDQ_q1_bf16[ei] = self.q_dtype(tDQrDQ_q1[ei] * Float32(sm_scale))
+            for ei in cutlass.range(0, cute.size(tDQrDQ_q1), 2):
+                scaled0, scaled1 = mul_packed_f32x2(
+                    (tDQrDQ_q1[ei], tDQrDQ_q1[ei + 1]),
+                    (Float32(sm_scale), Float32(sm_scale)),
+                )
+                tDQrDQ_q1_bf16[ei] = self.q_dtype(scaled0)
+                tDQrDQ_q1_bf16[ei + 1] = self.q_dtype(scaled1)
 
             cute.arch.fence_view_async_tmem_load()
+            _tcgen05_fence_before_thread_sync()
 
-            for ei in cutlass.range(cute.size(tDQrDQ_q1_bf16), unroll_full=True):
-                h = cute.get(tCcDQ[ei], mode=[0, 0])
-                d = cute.get(tCcDQ[ei], mode=[0, 1])
-                sdQ_gemm_view[h, d] = tDQrDQ_q1_bf16[ei]
+            if const_expr(use_stmatrix_dq):
+                tRDQ_rdQ_q1 = tiled_smem_store_dq.retile(tDQrDQ_q1_bf16)
+                cute.copy(
+                    tiled_smem_store_dq,
+                    tRDQ_rdQ_q1,
+                    tRDQ_sdQ,
+                )
+            else:
+                for ei in cutlass.range(cute.size(tDQrDQ_q1_bf16), unroll_full=True):
+                    h = cute.get(tCcDQ[ei], mode=[0, 0])
+                    d = cute.get(tCcDQ[ei], mode=[0, 1])
+                    sdQ_gemm_view[h, d] = tDQrDQ_q1_bf16[ei]
 
             self.compute_sync_barrier.arrive_and_wait()
             cute.arch.fence_proxy("async.shared", space="cta")
@@ -1804,32 +2003,78 @@ class DenseIndexerBackward2QGemmSm100:
                 cute.copy(tma_atom_dQ_q1, tdQsdQ_q1, tdQgdQ_q1_mkl)
                 dQ_store_pipeline.producer_commit()
 
-        # ---- Epilogue: dW for q0 via warp reduction ----
-        # mdW_b is the per-batch view: (S_q, H) BSHD or (T_q, H) THD with T-offset
-        # already applied. q*_local indexes within the batch.
-        HEADS_PER_WARP = const_expr(self.heads_padded // 4)
-        warp_base_h = warp_id_in_wg * Int32(HEADS_PER_WARP)
-        for h_local in cutlass.range_constexpr(HEADS_PER_WARP):
-            h = warp_base_h + h_local
-            my_partial = Float32(0.0)
-            for ei in cutlass.range(cute.size(dw_accum_q0), unroll_full=True):
-                if cute.get(tCcS[ei], mode=[0, 0]) == h:
-                    my_partial = my_partial + dw_accum_q0[ei]
-            total = cute.arch.warp_reduction_sum(my_partial)
-            if lane_id == 0:
-                mdW_b[q0_local, h] = self.q_dtype(total)
+        if warp_idx == compute_warp0:
+            dQ_store_pipeline.producer_acquire()
 
-        # ---- Epilogue: dW for q1 via warp reduction (guarded) ----
-        if has_q1:
+        # ---- Epilogue: dW for q0/q1 ----
+        # The production ownership gives each thread two heads; four adjacent
+        # lanes cover disjoint columns for those heads. Reduce only that
+        # 4-lane subgroup instead of scanning the fragment once per head and
+        # issuing 16 full-warp reductions for each Q token.
+        if const_expr(use_stmatrix_ds):
+            q0_sum_low = Float32(0.0)
+            q0_sum_high = Float32(0.0)
+            q1_sum_low = Float32(0.0)
+            q1_sum_high = Float32(0.0)
+            for ei in cutlass.range(
+                cute.size(dw_accum_q0),
+                unroll_full=True,
+            ):
+                if (ei // 2) % 2 == 0:
+                    q0_sum_low = q0_sum_low + dw_accum_q0[ei]
+                    q1_sum_low = q1_sum_low + dw_accum_q1[ei]
+                else:
+                    q0_sum_high = q0_sum_high + dw_accum_q0[ei]
+                    q1_sum_high = q1_sum_high + dw_accum_q1[ei]
+
+            q0_sum_low = cute.arch.warp_reduction_sum(
+                q0_sum_low,
+                threads_in_group=4,
+            )
+            q0_sum_high = cute.arch.warp_reduction_sum(
+                q0_sum_high,
+                threads_in_group=4,
+            )
+            q1_sum_low = cute.arch.warp_reduction_sum(
+                q1_sum_low,
+                threads_in_group=4,
+            )
+            q1_sum_high = cute.arch.warp_reduction_sum(
+                q1_sum_high,
+                threads_in_group=4,
+            )
+            if lane_id % 4 == 0:
+                h0 = warp_id_in_wg * 16 + lane_id // 4
+                mdW_b[q0_local, h0] = self.q_dtype(q0_sum_low)
+                mdW_b[q0_local, h0 + 8] = self.q_dtype(q0_sum_high)
+                if has_q1:
+                    mdW_b[q1_local, h0] = self.q_dtype(q1_sum_low)
+                    mdW_b[q1_local, h0 + 8] = self.q_dtype(q1_sum_high)
+        else:
+            # General-shape fallback: retain the complete native-coordinate
+            # scan and full-warp reduction.
+            HEADS_PER_WARP = const_expr(self.heads_padded // 4)
+            warp_base_h = warp_id_in_wg * Int32(HEADS_PER_WARP)
             for h_local in cutlass.range_constexpr(HEADS_PER_WARP):
                 h = warp_base_h + h_local
-                my_partial = Float32(0.0)
-                for ei in cutlass.range(cute.size(dw_accum_q1), unroll_full=True):
+                q0_partial = Float32(0.0)
+                for ei in cutlass.range(cute.size(dw_accum_q0), unroll_full=True):
                     if cute.get(tCcS[ei], mode=[0, 0]) == h:
-                        my_partial = my_partial + dw_accum_q1[ei]
-                total = cute.arch.warp_reduction_sum(my_partial)
+                        q0_partial = q0_partial + dw_accum_q0[ei]
+                q0_total = cute.arch.warp_reduction_sum(q0_partial)
                 if lane_id == 0:
-                    mdW_b[q1_local, h] = self.q_dtype(total)
+                    mdW_b[q0_local, h] = self.q_dtype(q0_total)
+
+            if has_q1:
+                for h_local in cutlass.range_constexpr(HEADS_PER_WARP):
+                    h = warp_base_h + h_local
+                    q1_partial = Float32(0.0)
+                    for ei in cutlass.range(cute.size(dw_accum_q1), unroll_full=True):
+                        if cute.get(tCcS[ei], mode=[0, 0]) == h:
+                            q1_partial = q1_partial + dw_accum_q1[ei]
+                    q1_total = cute.arch.warp_reduction_sum(q1_partial)
+                    if lane_id == 0:
+                        mdW_b[q1_local, h] = self.q_dtype(q1_total)
 
         # Ensure the final q0/q1 TMA store has completed before the CTA exits.
         dQ_store_pipeline.producer_tail()
@@ -1873,11 +2118,20 @@ class DenseIndexerBackward2QGemmSm100:
             # 1. Wait DK_FULL
             cute.arch.mbarrier_wait(mbar + MBAR_2Q_DK_FULL, dk_full_phase)
             dk_full_phase ^= 1
+            _tcgen05_fence_after_thread_sync()
 
             # 2. T2R readback dK
             tDKrDK = cute.make_rmem_tensor(tDKrDK_shape, Float32)
             cute.copy(tiled_tmem_load_dk, tDkDk_t2r, tDKrDK)
             cute.arch.fence_view_async_tmem_load()
+            _tcgen05_fence_before_thread_sync()
+
+            # Every reducer thread participates in this one-shot lifetime
+            # handshake. fence_view_async_tmem_load lowers to
+            # tcgen05.wait::ld.sync.aligned, so arrival means this thread has
+            # fully consumed its final TMEM fragment.
+            if bi == num_kv_blocks - 1:
+                cute.arch.mbarrier_arrive(mbar + MBAR_2Q_REDUCE_DONE)
 
             # 3. Signal DK_EMPTY immediately after T2R (single-buffered)
             cute.arch.mbarrier_arrive(mbar + MBAR_2Q_DK_EMPTY)

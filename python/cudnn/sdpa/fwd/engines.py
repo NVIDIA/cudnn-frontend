@@ -25,6 +25,7 @@ engines may share one template. Neither direction is 1:1.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from functools import partial
@@ -32,9 +33,11 @@ from typing import Any, Callable, Optional
 
 import cudnn
 
-from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
+from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
+from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -43,6 +46,7 @@ from cudnn.sdpa import graph_analyzer as ga
 # at build time. Capabilities/mismatch below stay import-free.
 _SM100 = "SdpaFwdDslSm100"
 _SM120 = "SdpaFwdDslSm120"
+_SM80 = "SdpaFwdDslSm80"
 
 
 def _adapter(name: str):
@@ -74,17 +78,82 @@ _BLACKWELL_GEFORCE = (120, 129)
 class SdpaFwdKnobs:
     """Per-plan tuning request for the SDPA-forward engines.
 
-    This is the operation's knob *vocabulary* — typed fields, no global enum.
-    ``None`` means "no preference". Travels as ``PlanConfig.knobs``; each
-    engine's :class:`Capabilities` row advertises the domain it honors, and the
-    probe rejects the engine for any request outside that domain (a knob is
-    honored or the engine is ineligible — never silently degraded).
+    Typed fields internally; ``None`` means "no preference". Travels as
+    ``PlanConfig.knobs``; each engine's :class:`Capabilities` row advertises the
+    domain it honors, and the probe rejects the engine for any request outside
+    that domain (a knob is honored or the engine is ineligible — never silently
+    degraded).
+
+    At the public surface every tuning field is one ``cudnn.knob_type`` of the
+    shared vocabulary (``to_public`` / ``from_public``), the same dict shape a
+    backend plan reports: ``tile_m/tile_n`` and ``cga`` reuse the backend's
+    ``TILE_M`` / ``TILE_N`` / ``TILE_CGA_M`` (a cga of 2 IS a 2-CTA M-cluster,
+    the backend's own encoding of its 2-CTA SDPA variant); ``sched_policy``,
+    ``pack_gqa`` and ``split_kv`` are frontend-only types (the backend's
+    split-KV counterpart, ``STREAM_K``, is an on/off mode, not a chunk count,
+    hence the distinct ``SPLIT_KV``).
+
+    Knobs are performance-only: every value computes the same function, so an
+    autotuner may pick any of them. The softmax accumulator precision (the
+    Rubin f16x2 exponent arm) changes numerics and is therefore NOT a knob: it
+    is the ``sdpa(..., softmax_precision=)`` op attribute, read from the graph
+    into ``SdpaGraphFacts.softmax_precision`` and gated by each row's
+    ``Capabilities.softmax_precisions`` in :func:`mismatch`.
     """
 
     sched_policy: Optional[int] = None  # tile-scheduler policy (SCHED_NATURAL, ...)
     tile_m: Optional[int] = None  # Q sequence tile width
     tile_n: Optional[int] = None  # KV sequence tile width
-    cga: Optional[int] = None  # cluster size (CTAs cooperating per tile)
+    cga: Optional[int] = None  # CTA group width used by one cooperative MMA tile
+    pack_gqa: Optional[bool] = None  # Head packing for GQA/MQA
+    # KV-split count: each Q tile's KV range cut into this many chunks, each
+    # run by its own CTA, recombined by the split_combine pass. 1 = off.
+    split_kv: Optional[int] = None
+
+    # field name -> cudnn.knob_type member name (resolved lazily: the compiled
+    # module is not importable at class-definition time in every build).
+    _PUBLIC_KNOBS = (
+        ("sched_policy", "SCHED_POLICY"),
+        ("tile_m", "TILE_M"),
+        ("tile_n", "TILE_N"),
+        ("cga", "TILE_CGA_M"),
+        ("pack_gqa", "PACK_GQA"),
+        ("split_kv", "SPLIT_KV"),
+    )
+
+    def to_public(self) -> dict:
+        """``{cudnn.knob_type: int}`` for every tuning field that is set (bools as 0/1)."""
+        kt = cudnn.knob_type
+        out = {}
+        for field, member in self._PUBLIC_KNOBS:
+            value = getattr(self, field)
+            if value is not None:
+                out[getattr(kt, member)] = int(value)
+        return out
+
+    @classmethod
+    def from_public(cls, public: dict) -> "SdpaFwdKnobs":
+        """Inverse of :meth:`to_public`. Rejects knob types this operation has no field for."""
+        kt = cudnn.knob_type
+        by_type = {getattr(kt, member): field for field, member in cls._PUBLIC_KNOBS}
+        kwargs = {}
+        for knob, value in public.items():
+            knob = kt(int(knob)) if not isinstance(knob, kt) else knob
+            field = by_type.get(knob)
+            if field is None:
+                raise ValueError(f"knob {knob.name} is not a tuning axis of the SDPA-forward engines")
+            if isinstance(value, bool):
+                if field != "pack_gqa":
+                    raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
+                value = int(value)
+            if not isinstance(value, int):
+                # A persisted record carries ints; "0" or 1.0 would round-trip to
+                # a different native knob than the one recorded.
+                raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
+            if field == "pack_gqa" and value not in (0, 1):
+                raise ValueError(f"knob PACK_GQA must be 0 or 1, got {value}")
+            kwargs[field] = bool(value) if field == "pack_gqa" else value
+        return cls(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -102,20 +171,40 @@ class Capabilities:
     sm_lo: int
     sm_hi: int
     phase: str
-    d_qk: frozenset[int]
-    d_v: frozenset[int]
-    # Head-dim ENVELOPE: when True the lowering ALSO serves any graph with
-    # d_qk/d_v <= the native caps (both multiples of 8, the TMA 16-byte
-    # global-stride rule at 2 bytes/elem) via TMA zero-padding — the kernel's
-    # descriptors carry the ACTUAL extents, so padded contraction columns load
-    # as exact zeros (S/softmax unchanged) and O stores past d_v are
-    # OOB-clipped. False = only the native dims above are eligible (FP8/MXFP8,
-    # whose SF plumbing is not audited for zero-padding).
-    d_envelope: bool = False
-    # Alignment rule for envelope rows: graph head dims must be multiples of
-    # this. 8 = the TMA 16-byte global-stride rule at 2 bytes/elem (SM100 DSL
-    # rows). 1 = no constraint (the SM80 lowering pads host-side).
+    # Head-dim DOMAIN. One engine per arch x dtype family: the head dim is a
+    # LOWERING concern — the adapter picks the smallest kernel flavor whose
+    # native shape covers the graph (api_dsl._pick_flavor) — not an engine
+    # identity. ``d_shapes`` is the set of NATIVE flavor shapes (d_qk, d_v)
+    # that lowering picks among.
+    d_shapes: frozenset
+    # Envelope + alignment rule. When > 0: any graph (d_qk, d_v) componentwise
+    # <= some native shape AND a multiple of this is served via TMA
+    # zero-padding — the kernel's descriptors carry the ACTUAL extents, so
+    # padded contraction columns load as exact zeros (S/softmax unchanged) and
+    # O stores past d_v are OOB-clipped. 8 = the TMA 16-byte global-stride
+    # rule at 2 bytes/elem (f16/bf16), 16 = the same rule at 1 byte/elem
+    # (per-tensor FP8), 1 = no constraint (the SM80 lowering pads host-side).
+    # 0 = NO envelope: exact native shapes only (MXFP8, whose SF plumbing is
+    # not audited for zero-padding).
     d_pad_multiple: int = 8
+    # Shapes whose kernels carry the THD leg. None = THD (when the ``thd``
+    # capability is set) serves the same head-dim domain as dense — the f16
+    # THD compile key carries the head dims, so THD rides the envelope. A set
+    # = THD graphs must match one of these NATIVE shapes exactly: the
+    # quantized rows' packed THD compile key carries no head-dim entries
+    # (native-tile contract), so their envelope is dense-only.
+    thd_d_shapes: Optional[frozenset] = None
+    # Per-native-shape ENVELOPE FLOOR: a tuple of ``((d_qk, d_v), min_dim)``
+    # pairs (a tuple, not a dict, so the row stays hashable). A shape with a
+    # floor serves graphs whose head dims are in ``(min_dim, shape]`` rather
+    # than ``(0, shape]``, so a kernel whose geometry is tuned for a large head
+    # dim does not silently swallow a much smaller graph at a multiple-x
+    # zero-padding cost. The floor applies to BOTH head dims and only to
+    # ENVELOPE matches — an exact ``d_shapes`` hit always passes. Example: the
+    # d512 FP8 flavor floors at 256, so it serves (256, 512] on both dims
+    # (at most 2x padding) and a d256 graph is declined rather than routed
+    # onto it. ``()`` = no floors.
+    d_envelope_floors: tuple = ()
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
     is_mxfp8: bool = False  # block-scale MXFP8 engine (FP8 in + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 engine (FP8 in + scalar descales)
@@ -140,23 +229,20 @@ class Capabilities:
 
     causal: bool = False
     bottom_right: bool = False
-    bottom_right_with_swa: bool = False  # kernel gap: BR diagonal excludes SWA
-    # Kernel gap (pre-existing): for a DENSE padded graph the BR diagonal is
-    # computed as seq_len_kv[b] - GLOBAL S_q, but cuDNN semantics for a dense
-    # padded graph carrying per-batch seq_len_q anchor it at
-    # (seq_len_q[b], seq_len_kv[b]) — any batch with seq_len_q[b] < S_q gets a
-    # wrongly shifted diagonal (extra zeroed rows at the top). KV-only padding
-    # (no seq_len_q tensor) is unaffected: there the actual Q length IS S_q.
-    bottom_right_padded_seq_q: bool = False
     swa: bool = False
     padded: bool = False
     sink: bool = False
+    # Optional dtype subset for sink support. None means every dtype served by
+    # the engine; a subset lets one exact-shape flavor decline an unsupported
+    # low-precision sink path without affecting its non-sink coverage.
+    sink_dtypes: Optional[frozenset] = None
     stats: bool = False
-    # The adapter accepts lse_tensor=None (its kernel None-specializes the LSE
-    # store), so a stats-less graph needs no dummy-LSE workspace chunk. Every
-    # lower_dsl_prefill row sets True (the SM100 FP8/MXFP8 flavors were the
-    # last holdouts); the SM80 row keeps the False default but lowers through
-    # its own adapter (lower_sm80_prefill), which never reads this flag.
+    # The adapter accepts lse_tensor=None, so a stats-less graph needs no
+    # dummy-LSE workspace chunk. Every row sets True. The SM100/SM120 kernels
+    # None-specialize the LSE store (compiled out entirely); the SM80 kernels
+    # still compute LSE into a kernel-internal buffer when unbound — a
+    # pre-existing allocation on that path, tracked with its other
+    # TemplateParams-conversion follow-ups.
     lse_optional: bool = False
     # THD lowerings assume FULLY-PACKED storage: the packed addressing is
     # re-derived as prefix(lens) x token stride, and the graph's bound
@@ -169,23 +255,23 @@ class Capabilities:
     # the inherent tolist); dense cu graphs stay declined until the kernels
     # grow a CU read mode (len = cu[b+1] - cu[b]) — see mismatch().
     cu_seq_len: bool = False
-    # Dense padded + stats needs the per-batch seq_len_q LSE trim (padded
-    # q-rows write LSE=-inf / O=0, cuDNN >= 9.14). Plumbed for the half
-    # kernels via SEQ_Q_LENS_PRESENT; the FP8/MXFP8 kernels lack the epilogue
-    # trim, so their specs keep this False.
+    # Dense padded + stats: the per-batch seq_len_q LSE trim (padded q-rows
+    # write LSE=-inf / O=0, cuDNN >= 9.14). Every kernel carries the dense
+    # padded-Q trim itself (a graph with per-batch Q lengths compiles the
+    # SEQ_Q_LENS_PRESENT specialization), so there is no separate capability.
     padded_stats: bool = False
     # s_q == 1 (decode-shaped) graphs; the SM80 prefill kernels are gated off.
     decode: bool = True
 
     # Escape hatch for kernels whose persistent multi-wave rescheduling is
-    # numerically broken: eligible only when the whole grid fits in one wave
+    # numerically invalid: eligible only when the whole grid fits in one wave
     # (B*H_q*ceil(S_q/512) <= SM_count / CTA_MMA). NO CURRENT ROW SETS THIS.
     # Historical user: the fp8 d128 row, whose multi-wave wrong-O bug (14-19%
     # mismatched elements, some tiles left unwritten NaN) was root-caused to
     # the classic-pipeline TMEM stats race — the next tile's prologue BMM1
     # overwrote the S_acc-head (total_max, total_sum) before the correction
     # epilogue read them — and fixed by the mb_stats_read barrier (same fix as
-    # the f16 kernel's; see prefill_d128_fp8_sm100.py / _common_sm100.Bars).
+    # the f16 kernel's; see sm100/prefill_d128_fp8.py / _common_blackwell.Bars).
     single_wave_only: bool = False
     # Serve ragged S_kv on unmasked graphs by synthesizing a full-length
     # seq_len_kv and lowering through the kernel's padded path (masks the KV
@@ -213,6 +299,48 @@ class Capabilities:
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
     cgas: frozenset[int] = frozenset()
+    # Shape-specific CGA domains for rows that lower several native flavors.
+    # ``cgas`` remains the default. A split-specific entry further narrows the
+    # domain for split-KV plans without changing the unsplit public domain.
+    # Per-d-shape scheduler domain, mirroring cgas_by_d_shape. Needed because
+    # sched_policies is row-wide while LPT support is per-KERNEL: the SM107 port
+    # dropped `lpt_q_tiles_in_cga_units=True` on most flavors, so a row-wide
+    # claim would advertise LPT for kernels that write nothing under it.
+    # An entry here OVERRIDES sched_policies for that flavor.
+    sched_policies_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
+    cgas_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
+    split_cgas_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
+    pack_gqas: frozenset[bool] = frozenset({False})
+    # Does this row's lowering wire the KV-split path (kernel SplitHelpers +
+    # adapter carving the partial slabs + launching the combine)? A GATE, not a
+    # domain: WHICH splits are worth trying is a device-derived search space
+    # (heuristics.split_kv_candidates), not a per-row constant. Fail-closed —
+    # a row that accepts split_kv > 1 without the plumbing leaves untouched
+    # partial slots at lse_partial = 0, which corrupt the combine's
+    # log-sum-exp rather than raising.
+    split_kv_supported: bool = False
+    # Shapes whose kernel flavors wire SplitHelpers. None = every flavor in
+    # d_shapes does (f16/SM120). A set = split_kv > 1 is honored only when
+    # the graph's dims are covered by a member (the quantized families wire
+    # the split path in the d128 flavor only).
+    split_d_shapes: Optional[frozenset] = None
+    # Softmax-precision domain (cudnn.data_type values). Empty = unserved.
+    # Arch-dependent membership (the f16x2 exponent arm exists only in the
+    # SM107 sibling kernel) is expressed by SPLITTING the row per arch line —
+    # each row declares exactly what its own lowering carries — not by a
+    # knob x arch notch here.
+    softmax_precisions: frozenset[int] = frozenset()
+    # PackGQA, like split-KV, can be wired per FLAVOR rather than per row: the
+    # SM107 line ships it only in the d128 per-tensor FP8 kernel, while the
+    # ported d256/d512 siblings skip it.  None = every shape the row serves.
+    # APPENDED at the end deliberately: Capabilities evolves append-only, so a
+    # positional construction of an older field never silently rebinds.
+    pack_gqa_d_shapes: Optional[frozenset] = None
+    # THD graphs whose Stats has NO ragged offsets (per-batch padded (b, s_max, h)
+    # rows, FlashInfer's form): the kernel stores per batch and the adapter
+    # fills the tail rows with -inf. Rows whose kernels lack the per-batch THD
+    # store keep False and decline the form (the backend serves it).
+    thd_padded_stats: bool = False
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -227,6 +355,54 @@ def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
     if facts.bottom_right:
         return r == 0
     return facts.s_q + r <= facts.s_kv
+
+
+def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> Optional[tuple[int, int]]:
+    """Smallest native flavor whose envelope covers this graph -- honouring the
+    per-shape envelope floors, so the knob domains (cga, split) describe the
+    flavor the lowering will actually pick (api_dsl._pick_flavor walks the same
+    floors). An exact native shape is always its own selection."""
+
+    floors = dict(capabilities.d_envelope_floors)
+    covering = [
+        shape
+        for shape in capabilities.d_shapes
+        if facts.d_qk <= shape[0] and facts.d_v <= shape[1] and ((facts.d_qk, facts.d_v) == shape or min(facts.d_qk, facts.d_v) > floors.get(shape, 0))
+    ]
+    return min(covering, key=lambda shape: (shape[0], shape[1])) if covering else None
+
+
+def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> frozenset[int]:
+    """Scheduler domain of the native flavor the lowering will pick.
+
+    Row-wide `sched_policies` is the floor; a `sched_policies_by_d_shape` entry
+    for the selected flavor replaces it. That is what lets one Rubin row serve a
+    d256 kernel that honours LPT next to flavors that do not.
+    """
+    selected = _selected_d_shape(capabilities, facts)
+    if selected is not None:
+        for shape, shape_domain in capabilities.sched_policies_by_d_shape:
+            if shape == selected:
+                return shape_domain
+    return capabilities.sched_policies
+
+
+def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None) -> frozenset[int]:
+    """CGA domain of the native flavor and split leg selected by the graph."""
+
+    selected = _selected_d_shape(capabilities, facts)
+    domain = capabilities.cgas
+    if selected is not None:
+        for shape, shape_domain in capabilities.cgas_by_d_shape:
+            if shape == selected:
+                domain = shape_domain
+                break
+        if (split_kv or 1) > 1:
+            for shape, split_domain in capabilities.split_cgas_by_d_shape:
+                if shape == selected:
+                    domain = split_domain
+                    break
+    return domain
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> Optional[str]:
@@ -244,17 +420,61 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return facts.invalid
     if facts.is_backward:
         return "this engine serves sdpa() forward graphs only"
+    if facts.softmax_precision is not None and facts.softmax_precision not in capabilities.softmax_precisions:
+        # The op attribute sdpa(softmax_precision=HALF): numerics-changing, so
+        # honored only by a row whose lowering carries that arm — never degraded.
+        return f"requested softmax_precision={facts.softmax_precision} is outside this engine's domain {sorted(capabilities.softmax_precisions, key=int)}"
     if knobs is not None:
         if not isinstance(knobs, SdpaFwdKnobs):
             return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
         for value, domain, label in (
-            (knobs.sched_policy, capabilities.sched_policies, "sched_policy"),
+            (knobs.sched_policy, effective_sched_policies(capabilities, facts), "sched_policy"),
             (knobs.tile_m, capabilities.tile_ms, "tile_m"),
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
-            (knobs.cga, capabilities.cgas, "cga"),
+            (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv), "cga"),
+            (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
         ):
             if value is not None and value not in domain:
-                return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
+                return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
+        if knobs.split_kv is not None and knobs.split_kv < 1:
+            return f"requested split_kv={knobs.split_kv} is not a split count (1 = off)"
+        if knobs.split_kv is not None and knobs.split_kv > 1:
+            if not capabilities.split_kv_supported:
+                return "split_kv > 1 is not wired in this engine's lowering"
+            # Facts x knobs: the split path is structurally dense-only (the
+            # per-split LSE is the combine weight; the THD/sink/padded paths
+            # do not produce per-split partials). Declined HERE so a split
+            # request never reaches a kernel that cannot honor it.
+            # Paged KV is padded by construction and its split composes with
+            # the per-batch lengths (the decode path — B*H_kv is far below
+            # the SM count), so it is exempt from the padded exclusion.
+            if facts.thd or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
+                return "split_kv > 1 serves dense, unpadded, sink-free graphs only"
+            if capabilities.skv_tail_via_padding and facts.s_kv % (capabilities.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
+                # The lowering would serve this ragged S_kv through the padded
+                # kernel path (synthesized per-batch KV lengths) — the same
+                # path the split cannot ride. Mirror lower_dsl_prefill's
+                # synth_kv_padding predicate so the plan is never listed.
+                return "split_kv > 1 cannot ride the synthesized KV-tail padding this S_kv needs"
+            # No gate on the O dtype: the partials are never narrower than it,
+            # and the combine performs the only cast down to it.
+            if capabilities.split_d_shapes is not None and not any(facts.d_qk <= sq and facts.d_v <= sv for sq, sv in capabilities.split_d_shapes):
+                return (
+                    f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel " f"flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+                )
+        if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:
+            # _selected_d_shape, not the raw dims: the FP8 rows carry
+            # d_pad_multiple=16, so an inexact graph (D=112) lowers onto the
+            # smallest covering NATIVE flavor (d128) -- which is the kernel
+            # whose PackGQA wiring the set is describing.
+            if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
+                return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel " f"flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+        if knobs.pack_gqa:
+            if facts.thd:
+                return "PackGQA is currently not supported for THD/ragged graphs"
+            _pg_tile_m = knobs.tile_m if knobs.tile_m is not None else max(capabilities.tile_ms)
+            if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m):
+                return f"PackGQA requires h_q/h_kv to divide tile_m: h_q/h_kv = {facts.h_q}/{facts.h_kv} does not tile at tile_m={_pg_tile_m}"
     cc = facts.device_cc
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
@@ -267,21 +487,29 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if cutedsl_too_old(version):
         want = ".".join(str(v) for v in CUTEDSL_MIN_VERSION)
         return f"requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
-    if capabilities.d_envelope:
-        # Envelope row: native caps are upper bounds (TMA zero-padding semantics
-        # — see Capabilities.d_envelope). Alignment: TMA global strides must be
-        # 16-byte multiples; compact BSHD H-stride is D * 2 bytes -> D % 8.
-        cap_qk, cap_v = max(capabilities.d_qk), max(capabilities.d_v)
-        if facts.d_qk > cap_qk or facts.d_v > cap_v:
-            return f"serves D_QK<={cap_qk}/D_V<={cap_v} (envelope); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+    shapes = sorted(capabilities.d_shapes)
+    if capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
+        # Envelope family: native flavor shapes are upper bounds (TMA
+        # zero-padding semantics — see Capabilities.d_shapes/d_pad_multiple);
+        # the lowering picks the smallest covering flavor. An EXACT native
+        # shape is served above, so only inexact graphs walk the envelope —
+        # where a per-shape floor (d_envelope_floors) may also apply.
+        floors = dict(capabilities.d_envelope_floors)
+        if not any(facts.d_qk <= sq and facts.d_v <= sv and min(facts.d_qk, facts.d_v) > floors.get((sq, sv), 0) for sq, sv in capabilities.d_shapes):
+            return f"no kernel-flavor envelope covers (D_QK={facts.d_qk}, D_V={facts.d_v}); native shapes: {shapes}"
         m = capabilities.d_pad_multiple
         if m > 1 and (facts.d_qk % m != 0 or facts.d_v % m != 0):
             return (
                 f"envelope zero-padding requires D_QK/D_V multiples of {m} (TMA 16-byte "
-                f"global-stride constraint at 2 bytes/elem); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+                f"global-stride constraint); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
             )
-    elif facts.d_qk not in capabilities.d_qk or facts.d_v not in capabilities.d_v:
-        return f"serves D_QK in {sorted(capabilities.d_qk)}/D_V in {sorted(capabilities.d_v)}; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+    elif not capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
+        return f"serves exact native shapes {shapes} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+    if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
+        return (
+            f"THD (ragged) rides the packed native-tile leg on this engine "
+            f"(shapes {sorted(capabilities.thd_d_shapes)}); the head-dim envelope is dense-only"
+        )
     if facts.s_q == 1 and not capabilities.decode:
         return "s_q == 1 (decode) is out of scope for the SM80 prefill kernels"
     if facts.dtype not in capabilities.dtypes:
@@ -294,10 +522,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if not facts.uniform_dtype:
         return "K/V dtypes must match Q" if (facts.is_mxfp8 or facts.is_fp8) else "K/V/O dtypes must match Q"
     if facts.thd:
-        # Ragged packing is BSHD-order by construction; the relaxation is
-        # dense-only (the THD lowering rebuilds packed [1,T,H,D] views).
-        if not facts.bshd_layout:
-            return "THD (ragged) Q/K/V/O must be BSHD-physical (stride order 3,1,2,0)"
+        # The THD lowering rebuilds packed [1, T, H, D] views from the token,
+        # head and element strides; the batch stride is never read (every
+        # sequence base comes from the ragged offsets), so it is not gated --
+        # FlashInfer declares it equal to the token stride.
+        if not facts.packed_layout:
+            return "THD (ragged) Q/K/V/O must be BSHD-physical over (H, S, D): head dim innermost, then heads, then tokens"
     elif "dense_flex" in capabilities.layouts:
         if not facts.dense_layout:
             return (
@@ -331,6 +561,34 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
 
+    if facts.has_paged_kv:
+        # Served by the d128 f16/bf16 kernel's PAGED_KV specialization
+        # (config_sm100._validate_params mirrors these as its backstop).
+        if facts.is_fp8 or facts.is_mxfp8:
+            return "paged KV is served by the f16/bf16 kernel only"
+        if not facts.padded:
+            return "paged KV requires use_padding_mask with seq_len_kv (the per-batch KV length bounds the block-table walk)"
+        if facts.d_qk > 256 or facts.d_v > 256:
+            return f"paged KV is wired on the d128 / d256 flavors only (d_qk, d_v <= 256); got ({facts.d_qk}, {facts.d_v})"
+        if (facts.d_qk > 128 or facts.d_v > 128) and not (facts.d_qk > 128 and facts.d_v > 128):
+            return f"paged KV with mixed head dims ({facts.d_qk}, {facts.d_v}) would select the d192x128 flavor, which is not wired"
+        if facts.has_sink:
+            return "paged KV with an attention sink is not validated"
+        p = facts.page_size
+        if p % 8 != 0 or (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
+            return f"page_size {p} must be a multiple of 8 that divides the 128-row KV tile or is a multiple of it"
+
+    if facts.has_sink and capabilities.sink_dtypes is not None and facts.dtype not in capabilities.sink_dtypes:
+        return f"sink token with dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.sink_dtypes)}"
+
+    if facts.has_bias and capabilities.bias and facts.bias_t is not None:
+        # uniform_dtype covers K/V/O only; the serving adapters compile the
+        # bias load as fp32 or the io dtype, so anything else must decline
+        # HERE, not ValueError at execute.
+        bias_dt = facts.bias_t.get_data_type()
+        if bias_dt not in (cudnn.data_type.FLOAT, facts.dtype):
+            return f"bias dtype {bias_dt} must be fp32 or match the Q/K/V dtype ({facts.dtype})"
+
     if facts.right_band_widening and facts.right_bound is not None and facts.right_bound < 0:
         return f"negative diagonal_band_right_bound ({facts.right_bound}) is not supported"
 
@@ -346,20 +604,44 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if (facts.seq_q_t is not None and facts.cu_seq_q_t is not None) or (facts.seq_kv_t is not None and facts.cu_seq_kv_t is not None):
             return "seq_len_* and cu_seq_len_* on the same side is ambiguous (backend precedence is not replicated here)"
 
+    if facts.amax_s_t is not None:
+        # The FROST FP8 kernels no longer compute Amax_S (dropped: nothing
+        # consumed it and the atomicMax serialized the epilogue); a graph that
+        # DECLARES the output must go to an engine that writes it.
+        return "graph requests the Amax_S output, which the FROST engines do not produce"
+
     if facts.bottom_right:
         if not (facts.causal or facts.right_band_widening):
             return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
         if not capabilities.bottom_right:
             return "graph uses bottom-right causal, which this kernel does not support"
-        if facts.window_left is not None and not capabilities.bottom_right_with_swa:
-            return "bottom-right causal combined with a sliding window is not supported"
-        if facts.padded and not facts.thd and facts.seq_q_t is not None and not capabilities.bottom_right_padded_seq_q:
-            return (
-                "bottom-right causal with a dense padding mask carrying per-batch seq_len_q is not "
-                "supported (kernel anchors the BR diagonal at the global S_q, not seq_len_q[b])"
-            )
     if facts.padded and facts.wants_stats and not facts.thd and not capabilities.padded_stats:
-        return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
+        return "padding mask with generate_stats is not supported by this kernel"
+
+    if (
+        facts.thd
+        and facts.wants_stats
+        and facts.stats_t is not None
+        and getattr(facts.stats_t, "ragged_offset", None) is None
+        and not capabilities.thd_padded_stats
+    ):
+        # A Stats tensor with no ragged offsets is the per-batch padded form,
+        # rows at b * s_max; a kernel without the per-batch THD store writes
+        # packed (T, h) rows and has no per-sequence stats base to place them at.
+        return "THD Stats without ragged offsets is addressed per batch ([b, h, s_max, 1]); this kernel writes packed (T, h) rows -- bind ragged stats offsets"
+    if facts.stats_t is not None and not facts.thd:
+        if facts.stats_t.get_data_type() != cudnn.data_type.FLOAT:
+            return f"stats must be fp32; got {facts.stats_t.get_data_type()}"
+        stats_dim = tuple(facts.stats_t.get_dim())
+        stats_stride = tuple(facts.stats_t.get_stride())
+        expected_dim = (facts.b, facts.h_q, facts.s_q, 1)
+        if stats_dim != expected_dim:
+            return f"stats must be (B, H_q, S_q, 1) = {expected_dim}; got {stats_dim}"
+        if not ga.dense_layout_ok(stats_dim, stats_stride):
+            return (
+                "stats must use a dense-compatible B/H/S permutation or padded layout "
+                f"with non-broadcast, non-overlapping-by-span strides; got {stats_stride}"
+            )
 
     if capabilities.single_wave_only:
         # See Capabilities.single_wave_only. 512 = TILES_Q * TILE_M * CTA_MMA
@@ -370,7 +652,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if clusters > resident:
             return (
                 f"launch needs {clusters} Q-tile clusters but only {resident} fit in one wave; "
-                "the fp8 kernel's persistent multi-wave rescheduling is numerically broken (gated)"
+                "the fp8 kernel's persistent multi-wave rescheduling is numerically invalid (gated)"
             )
 
     if capabilities.skv_tile and facts.s_kv % capabilities.skv_tile != 0 and not capabilities.skv_tail_via_padding:
@@ -389,18 +671,111 @@ class EngineSpec:
     lower: "Callable[[EngineSpec, ga.SdpaGraphFacts, Optional[SdpaFwdKnobs]], Any]"
 
 
-def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
-    d_v = d if d_v is None else d_v
-    suffix = f"d{d}" if d_v == d else f"d{d}_d{d_v}"
+def _sm100_spec() -> EngineSpec:
+    """f16/bf16 SM100-family engine: ONE row; the adapter picks the smallest
+    kernel flavor (d128 / d192xd128 / d256 / d512) covering the graph's head
+    dims (api_dsl._pick_flavor), and every flavor serves its envelope via TMA
+    zero-padding. sm_hi=106: no f16 lowering exists on the Rubin line — when
+    one lands it gets its own row (the per-arch-line row doctrine)."""
     return EngineSpec(
-        name=f"sdpa_fwd_prefill_sm100_{suffix}",
+        name="sdpa_fwd_prefill_sm100",
         capabilities=Capabilities(
             sm_lo=_BLACKWELL[0],
+            sm_hi=106,
+            phase="prefill",
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            causal=True,
+            bottom_right=True,
+            right_band_widening=True,
+            swa=True,
+            padded=True,
+            # Paged KV caches (paged_attention_k/v_table + seq_len_kv) on the
+            # d128 flavor: block-table indirection on the K/V TMA loads, HND
+            # and NHD page layouts, KV split + combine (mismatch() holds the
+            # d128 / dense / padded / page-geometry conditions).
+            paged_kv=True,
+            sink=True,
+            stats=True,
+            lse_optional=True,
+            thd=True,
+            thd_padded_stats=True,
+            cu_seq_len=True,
+            padded_stats=True,
+            # Ragged S_kv with an uncovered tail is served through the padded
+            # path with synthesized full-length per-batch KV lengths (see
+            # lower_dsl_prefill's synth_kv_padding) — mathematically identical,
+            # costs only the padded-path overhead. Same mechanism the FP8 row
+            # has always used.
+            skv_tail_via_padding=True,
+            # The f16/bf16 lowering serves any dense B/H/S stride permutation
+            # (padded strides included) with the head dim innermost; the
+            # FP8/MXFP8 rows stay on the strict BSHD gate until their padded /
+            # scale-factor paths are validated against relaxed layouts.
+            layouts=frozenset({"bshd", "dense_flex"}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            tile_ms=frozenset({128}),
+            tile_ns=frozenset({128}),
+            cgas=frozenset({2}),
+            cgas_by_d_shape=(((192, 128), frozenset({1, 2})),),
+            split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
+            # All four f16 flavor kernels wire SplitHelpers, and the adapter
+            # carves the partial slabs + launches sm100/split_combine when
+            # split_kv > 1 (dense f16 only; see mismatch's facts x knobs gate).
+            split_kv_supported=True,
+            pack_gqas=frozenset({False, True}),
+        ),
+        lower=partial(lower_dsl_prefill, api_type=_SM100),
+    )
+
+
+def _sm107_spec() -> EngineSpec:
+    """f16/bf16 Rubin (SM107) engine — the per-arch-line sibling of
+    ``sdpa_fwd_prefill_sm100``, which stops at cc 10.6.
+
+    The lowerings diverge enough to need their own row rather than a widened
+    SM100 one: the Rubin kernels build **version-1 tcgen05 SMEM descriptors**
+    (a version-0 descriptor addresses only 256 KiB, and Rubin's 327 KiB budget
+    puts the d512 flavor's P ring at exactly that boundary).  The f16 line
+    carries all four SM100 flavors, d192xd128 included
+    (``sm107/prefill_d192_d128_f16.py`` — the d128 body with ``make_cfg_d192``);
+    the QUANTIZED Rubin rows are the ones that ship a strict subset.
+
+    Every capability below was MEASURED on Rubin (`w2u1g-lc-0030`) against an
+    explicit fp32 reference, not inherited from the SM100 row:
+
+    - causal / bottom-right / right-band / SWA: validated on all three flavors,
+      cos = 1.000000. ``window_right`` is load-bearing rather than decorative —
+      ``bounds_for_tile`` already trims KV *tiles* by it, so a right-banded
+      graph is silently wrong unless the element-level mask gets it too.
+    - padded: per-batch ``seq_len_kv``, deliberately ragged and NOT tile
+      aligned, so a tail tile is partly masked.
+    - sink, and GQA 4:1.
+
+    Deliberately NOT claimed, each because the kernels lack the machinery
+    rather than because it went untested:
+
+    - ``thd``: SERVED on EVERY f16 flavor as of 2026-09-09.  All four bodies were
+      moved onto the FROST THD contract -- the 14-arg setup helper, the 4B+4
+      metadata the SHARED decode already read (the two had disagreed, which is
+      why ``compile()`` used to raise), the persistent claim-counter scheduler,
+      the dead-unit O-store guard, and the packed-total-clamped runtime K/V
+      descriptors that keep a NaN capacity tail out of BMM2.
+    - ``split_kv_supported``: these kernels wire no SplitHelpers.
+    - ``pack_gqas``: no PackGQA path.
+    - ``softmax_precisions``: the f16x2 exponent arm lives only in the d128 FP8
+      sibling.
+    """
+    return EngineSpec(
+        name="sdpa_fwd_prefill_sm107",
+        capabilities=Capabilities(
+            sm_lo=107,
             sm_hi=_BLACKWELL[1],
             phase="prefill",
-            d_qk=frozenset({d}),
-            d_v=frozenset({d_v}),
-            d_envelope=True,  # native tile box d; smaller dims via TMA zero-padding
+            # All four f16 flavors have a Rubin module -- api_dsl._SM107_KERNEL_FILES
+            # is the other half of this claim, and _pick_flavor lands a d=192
+            # graph on the NATIVE kernel rather than the d256 envelope.
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
@@ -409,16 +784,57 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            # The LSE store is const_expr'd out on a None lse_tensor, and
+            # compile(has_lse=False) binds no dummy buffer at any level -- so a
+            # stats-less graph reports get_workspace_size() == 0.
             lse_optional=True,
+            # Ragged S_kv with an uncovered tail rides the padded path with
+            # synthesized full-length per-batch KV lengths (lower_dsl_prefill's
+            # synth_kv_padding).  It is REQUIRED, not an optimization: at
+            # MASK_FLAGS == 0 the kernel's kv_right is a floor division, so an
+            # un-synthesized ragged S_kv would silently drop the tail tile.
+            skv_tail_via_padding=True,
+            # SM107_F16_THD_SHAPES is the single definition, shared with the
+            # standalone adapter's gate so the two cannot drift (rule 8b').  It
+            # now covers every f16 flavor; keeping it a named constant rather
+            # than `True` is what makes a future partial arch line expressible.
             thd=True,
-            cu_seq_len=True,
+            thd_padded_stats=True,
             padded_stats=True,
-            # The f16/bf16 lowering serves any dense B/H/S stride permutation
-            # (padded strides included) with the head dim innermost; the
-            # FP8/MXFP8 rows stay on the strict BSHD gate until their padded /
-            # scale-factor paths are validated against relaxed layouts.
-            layouts=frozenset({"bshd", "dense_flex"}),
+            thd_d_shapes=SM107_F16_THD_SHAPES,
+            cu_seq_len=True,
+            # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
+            #
+            # The old note here said the ported decode "does not honor
+            # SCHED_LPT". The cause was narrower than that: every SM100 kernel
+            # calls `make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)` and
+            # the SM107 port omitted the argument on 9 of 11 flavors. Without
+            # it the LPT linearization walks a row range CTA_MMA times too
+            # large, no tile is ever claimed, and the kernel writes NOTHING --
+            # cosine 0.0000, which reads like a dead kernel rather than a
+            # scheduling bug. The two flavors that kept it (d128 FP8, d192 FP8)
+            # are exactly the ones previously described as working.
+            #
+            # Restored on every 2-CTA SM107 flavor. It is a NO-OP under
+            # SCHED_NATURAL -- that decode branch never reads q_tiles -- so the
+            # shipped path is unchanged.
+            #
+            # Validated on d256 f16: cos 1.0000 at n_kv 2/3/4/8, dense AND
+            # causal. Measured causal SOL on Rubin at S=4096/8192/32768:
+            # 53.0/71.1/76.7% under NATURAL -> 62.6/79.3/77.5% under LPT
+            # (+18.2/+11.6/+1.1%), recovering 40%/51%/29% of the causal-vs-dense
+            # gap; dense itself is neutral. The decay with S is the signature of
+            # scheduler imbalance, which is what LPT exists to fix.
+            #
+            # Only (256, 256) is claimed: d128 and d512 are unvalidated under
+            # LPT here, and d512 is cga4x1 role-split with a different scheduler
+            # shape. SCHED_LPT_L2 is claimed by NO f16 flavor -- its decode
+            # needs `qh_per_kh` and `seqlen_kv` at every call site, which the
+            # f16 kernels do not pass (the d128 / d192x128 FP8 and MXFP8
+            # kernels do; see those rows), so it raises rather than
+            # miscomputes. Both are follow-ups.
             sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies_by_d_shape=(((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
@@ -427,21 +843,29 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
     )
 
 
-def _sm100_mxfp8_spec(d: int) -> EngineSpec:
-    """d128 block-scale MXFP8 engine (E4M3/E5M2 in + per-32-block E8M0 SF, half out).
+def _sm100_mxfp8_spec() -> EngineSpec:
+    """Block-scale MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF).
 
-    THD/varlen is deferred (dense execute only for v1), so thd=False here even
-    though the kernel itself supports it.
+    THD/varlen on all four native shapes rides the shared packed lowering
+    (write_thd_meta envelope design, issue #552; packed
+    Q/K/V/O contract only). The SF tensors travel PACKED
+    per-sequence-TILE-padded ([1, H, Σ_b ceil(S_b/128), SF_SMEM] tile sequences
+    in cu_seqlens order — see api_dsl._reshape_sf_packed); the graph's declared
+    SF dims stay the dense capacity, like the ragged Q/K/V storage.
     """
 
     return EngineSpec(
-        name=f"sdpa_fwd_prefill_sm100_d{d}_mxfp8",
+        name="sdpa_fwd_prefill_sm100_mxfp8",
         capabilities=Capabilities(
             sm_lo=_BLACKWELL[0],
-            sm_hi=_BLACKWELL[1],
+            sm_hi=106,  # no Rubin MXFP8 lowering
             phase="prefill",
-            d_qk=frozenset({d}),
-            d_v=frozenset({d}),
+            # Exact native shapes only (d_pad_multiple=0): the SF plumbing is
+            # not audited for envelope zero-padding.
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            d_pad_multiple=0,
+            thd_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_mxfp8=True,
@@ -453,33 +877,117 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
             sink=True,
             stats=True,
             lse_optional=True,
-            sched_policies=frozenset({SCHED_NATURAL}),
+            thd=True,
+            thd_padded_stats=True,
+            padded_stats=True,
+            cu_seq_len=True,
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            cgas_by_d_shape=(((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})), ((512, 512), frozenset({1}))),
+            split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
+            # The split path also needs a half-precision O (mismatch's
+            # facts x knobs gate).
+            split_kv_supported=True,
+            # PackGQA is currently not supported for the MXFP8 SDPA engine:
+            # the F8_128x4 sf_q scale-factor atom bundles 128 rows of ONE
+            # head, so a packed tile's interleaved (token, head) rows cannot
+            # gather their scale factors at token granularity.
+            pack_gqas=frozenset({False}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
-def _sm100_fp8_spec(d: int) -> EngineSpec:
-    """d128 per-tensor FP8 engine (E4M3/E5M2 in + scalar descales, half/FP8 out).
+def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
+    """Per-tensor FP8 engine with scalar descales.
+
+    ONE row per ARCH LINE (``arch``: "sm100" = pre-Rubin Blackwell 100-106,
+    "sm107" = Rubin line 107-119): the two lowerings genuinely diverge and a
+    shared row could only describe their union with knob x arch notches.
+    Within a row the head dim is a LOWERING concern — the adapter picks the
+    kernel flavor covering the graph. Each row declares
+    exactly what its own kernels carry:
+
+    - d_shapes: the sm100 row picks among d128, d192xd128, d256, and d512;
+      Rubin has only the d128 sibling, so wider Rubin graphs are ineligible at
+      probe time instead of failing during lowering.
+    - The ENVELOPE (d_pad_multiple=16, the TMA 16-byte global-stride rule at
+      1 byte/elem): smaller head dims ride TMA zero-padding — exact in FP8,
+      and the descales are scalars so no per-column plumbing is affected.
+      THD keeps native dims (thd_d_shapes: the packed THD compile key
+      carries no head-dim entries).
+    - softmax_precisions: the f16x2 exponent arm lives only in the SM107
+      sibling kernel, so only that row admits HALF. FLOAT is the pipeline
+      every flavor already runs.
+    - thd_d_shapes: all SM100 native flavors carry the
+      write_thd_meta THD leg; the SM107 row carries its d128 sibling.
+    - split_kv_supported / split_d_shapes: both d128 kernels wire SplitHelpers;
+      SM100 d192x128 and d256 carry the same split contract.
+    - sched_policies: both rows serve the full {NATURAL, LPT, LPT_L2} domain
+      (issue #653) — the SM107 sibling threads qh_per_kh/seqlen_kv through
+      every decode call site, which is what the shared LPT_L2 decode requires,
+      so its remap is in lockstep with the SM100 twin (place() hands the
+      adapter an explicit policy from this domain).
 
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
-    in-kernel amax_s (= max over rows of 1/total_sum) stays well-defined — no
-    fully-masked row can poison the global amax.  THD/varlen is still deferred
-    (dense execute only for v1), so thd=False.
+    per-row softmax normalization stays well-defined — no
+    fully-masked row can poison the global amax. THD/varlen rides the shared
+    packed lowering on all SM100 native shapes (write_thd_meta envelope
+    design, issue #552; packed Q/K/V/O contract only). Rubin keeps the
+    d128-only SM107 sibling.
     """
 
+    rubin_row = arch == "sm107"
     return EngineSpec(
-        name=f"sdpa_fwd_prefill_sm100_d{d}_fp8",
+        name=f"sdpa_fwd_prefill_{arch}_fp8",
         capabilities=Capabilities(
-            sm_lo=_BLACKWELL[0],
-            sm_hi=_BLACKWELL[1],
+            # Ranges, not the parts that exist today (see sm_lo above): the
+            # split point is the Rubin line — 100-106 runs the SM100 modules,
+            # 107-119 the SM107 sibling.
+            sm_lo=107 if rubin_row else _BLACKWELL[0],
+            sm_hi=_BLACKWELL[1] if rubin_row else 106,
             phase="prefill",
-            d_qk=frozenset({d}),
-            d_v=frozenset({d}),
+            # Both lines now carry all four native flavors: Rubin gained its
+            # d192x128 FP8 sibling (sm107/prefill_d192_d128_fp8.py).
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            d_pad_multiple=16,
+            # The d512 flavor serves the (256, 512] band on BOTH head dims —
+            # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
+            # Below that floor it declines rather than swallowing e.g. a d256
+            # graph onto a kernel whose cga4x1 role-split geometry is tuned for
+            # d = 512.  The d192x128 flavor serves ONLY its exact shape: with
+            # d_qk zero-padded into it (144/160/176) the kernel's output is wrong
+            # (4-19% of elements off by O(1) against the fp32 reference on
+            # SM100; d_v padding and the d128/d512 flavors' padding are exact),
+            # so a floor of 128 (min(d_qk, d_v) > 128 is unreachable at d_v <=
+            # 128) keeps every inexact graph off it until the kernel's Q/K
+            # padding is fixed.  Mirrored by api_dsl._SM100_FP8_ENVELOPE_FLOORS.
+            # The D256 flavor (#860) likewise serves only its exact shape for now: the
+            # classic battery routed onto its padded envelope (d_qk in (128, 256))
+            # shows run-to-run nondeterminism on long causal e5m2/GQA/sink graphs;
+            # min(d_qk, d_v) > 255 admits nothing inexact. Lift both floors once the
+            # kernels' padded paths are validated through test_mhas_v2.
+            # The Rubin row carries the SAME floors, (192, 128) included since it
+            # gained that flavor -- the table is arch-INDEPENDENT
+            # (api_dsl._SM100_FP8_ENVELOPE_FLOORS), and a row that omits an entry
+            # the adapter still enforces ADMITS a graph the lowering then kills
+            # with a bare ValueError (contract rule 8b').  It previously declared () -- which made
+            # mismatch() ADMIT e.g. (512, 256) and (192, 128) that
+            # api_dsl._SM100_FP8_ENVELOPE_FLOORS then rejected with a bare
+            # ValueError inside check_support: a plan that enters the ranked
+            # list only to die in the lowering (contract rule 1).  The floors'
+            # rationale transfers unchanged -- the Rubin d512 kernel is the same
+            # cga4x1 role-split geometry, and the d256 padded envelope is no
+            # more validated here than on Blackwell.
+            d_envelope_floors=(((192, 128), 128), ((256, 256), 255), ((512, 512), 256)),
+            # Both lines serve THD at every native flavor.  The Rubin arm keeps a
+            # NAMED constant (shared with the standalone adapter's gate, rule 8b')
+            # rather than collapsing to `d_shapes`, so a future partial arch line
+            # stays expressible without reintroducing a boolean that cannot say it.
+            thd_d_shapes=SM107_FP8_THD_SHAPES if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
@@ -491,137 +999,259 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             sink=True,
             stats=True,
             lse_optional=True,
-            # The fp8 kernel lacks the SEQ_Q_LENS_PRESENT epilogue trim, but its
-            # only reachable padded+stats population is KV-only padding with
-            # full-length seq_len_q (the fp8 suite; test_mhas_v2 fp8 padding
-            # comes only via paged/THD, both ineligible here), where the trim
-            # is a no-op. Dense fp8 padding with SHORT seq_len_q + stats would
-            # report untrimmed LSE — plumb the trim before relying on it.
+            thd=True,
+            thd_padded_stats=True,
+            cu_seq_len=True,
             padded_stats=True,
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the
             # gated 132/192/200-cluster repros, 3x each).
             skv_tail_via_padding=True,
-            sched_policies=frozenset({SCHED_NATURAL}),
+            # LPT/LPT_L2 remap is in lockstep with the SM100 sibling (issue
+            # #653): every decode call site threads qh_per_kh/seqlen_kv, which
+            # is what the shared _common_blackwell LPT_L2 decode demands.  The L2
+            # figure the remap blocks against (CFG.L2_SIZE_MIB) is a tuning
+            # hint for the grouping, not a chip capacity, so the SM100 number
+            # carries to Rubin unchanged.
+            # LPT_L2 needs qh_per_kh + seqlen_kv threaded through EVERY decode
+            # call site (_common_blackwell._decode_initial raises otherwise).  On the
+            # Rubin line only the shipped d128 kernel does that -- d256 and d512
+            # have 0/10 sites threaded -- so the row cannot claim the policy for
+            # the flavors it now serves.  Heuristics derives its proposals from
+            # this domain (heuristics.py:329), so narrowing means those graphs
+            # get LPT instead of going unserved: a scheduling trade, not a
+            # correctness one.  Re-widen once the args are threaded everywhere.
+            # Rubin: NATURAL row-wide, with LPT advertised per-d-shape for the
+            # flavors that have been validated under it.
+            #
+            # The ROOT CAUSE of "the ported kernels do not honor LPT" was a
+            # dropped argument, not an incorrect decode: every SM100 kernel calls
+            # `make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)` and the
+            # SM107 port omitted it on 9 of 11 flavors. Without it the LPT
+            # linearization walks a row range CTA_MMA times too large, no tile
+            # is claimed, and the kernel writes NOTHING (cosine 0.0000). The two
+            # flavors that kept it -- d128 FP8 and d192 FP8 -- are exactly the
+            # ones this comment used to single out as working.
+            #
+            # Restored on every 2-CTA SM107 flavor; it is a no-op under
+            # SCHED_NATURAL, so the shipped path is unchanged (SM107 suite 56
+            # passed, block suite 89 passed). Validated under LPT on d256 f16:
+            # cos 1.0000 at n_kv 2/3/4/8, dense AND causal. Measured causal SOL
+            # on Rubin, S=4096/8192/32768: 53.0/71.1/76.7% NATURAL ->
+            # 62.6/79.3/77.5% LPT (+18.2/+11.6/+1.1%); dense is neutral.
+            #
+            # d512 (cga4x1 role-split) is deliberately untouched: different
+            # scheduler shape, and the old NaN report there is unexplained.
+            #
+            # SCHED_LPT_L2 is claimed PER FLAVOR too, and only where the kernel
+            # threads `qh_per_kh` / `seqlen_kv` into every decode call site --
+            # the LPT_L2 cost model's inputs, which the shared decode raises
+            # without at trace time.  The d128 and d192x128 kernels do (through
+            # make_split_helpers); the d256 and d512 kernels do not.
+            #
+            # The "KNOWN COST" this note used to carry -- that the d128 FP8
+            # kernel honours LPT but loses the plan because sched_policies is
+            # row-wide -- is what `sched_policies_by_d_shape` below now fixes.
+            # d128 FP8 is not listed yet for the tolerance reason given there.
+            sched_policies=(frozenset({SCHED_NATURAL}) if rubin_row else frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+            # Rubin: LPT is claimed PER FLAVOR, like the f16 row (`_sm107_spec`).
+            # `lpt_q_tiles_in_cga_units=True` is restored on every 2-CTA SM107 FP8
+            # kernel (#1001).  VALIDATED under LPT on Rubin (2026-09-11), standalone
+            # adapter, E4M3 per-tensor scales, bf16 O, causal + dense + padded,
+            # (B, S) in {(1,256), (2,1000), (1,4096)}, against the fp64
+            # kernel-mirroring `fp8_ref.compute_ref`:
+            #   (256, 256): max|O-ref| 0.0078 causal / <= 0.0019 dense (tol 0.075)
+            #   (192, 128): max|O-ref| 0.0397 causal / <= 0.0060 dense (tol 0.04)
+            # and on BOTH, O and LSE under LPT are BIT-IDENTICAL to NATURAL (the
+            # scheduler reorders whole (batch, head, q-tile) work items; each
+            # tile's KV loop is unchanged), sentinel 0, two-launch 0.  Perf node,
+            # d256 causal H32/2, LPT vs NATURAL launch-interleaved: +5.2/+5.9/
+            # +5.6/+2.0/+2.3 % at S=2K..32K (control pair within 1.9 %).
+            # (192, 128) and (128, 128) serve SCHED_LPT_L2 as well (2026-09-14):
+            # O and LSE under LPT_L2 are bit-identical to NATURAL on the same
+            # inputs (dense and causal, sentinel 0).  (128, 128) joins the LPT
+            # claim at the same time: bit-identical too, and the 0.041-0.048
+            # its e5m2 causal path reads against the suite's 0.04 comes out of
+            # the same bits under every policy, so it is not a scheduler
+            # question.  Perf node, kernel-level d128 H64/8 causal vs NATURAL:
+            # LPT_L2 +4.2/+7.6/+7.0/+5.9/+5.4 %, LPT +5.3/+5.8/+4.2/+2.0/+1.1 %
+            # at S=2K..32K.  What heuristics PROPOSE depends on GQA
+            # (heuristics._sched_points): with K/V heads shared across Q heads
+            # LPT_L2 leads; with h_q == h_kv (the DSv3 layout) it has nothing to
+            # group and measured -9.7 % at S=2K (d192x128 H128), so the Rubin
+            # rule picks LPT at few waves (+16 % at S=4K) and NATURAL at many
+            # (LPT -6.5 / -13 / -7.9 % at S=8K/16K/32K).  Every policy in the
+            # domain stays an autotune runner.
+            # NOT claimed: (512, 512) -- the cga4x1 role-split kernel
+            # still calls make_sdpa_helpers(CFG) WITHOUT lpt_q_tiles_in_cga_units
+            # (the #1001 bug, left on the d512 line), so under LPT it writes
+            # NOTHING (sentinel on 100 % of cells; the old "NaN" report was that
+            # unwritten output being read).
+            sched_policies_by_d_shape=(
+                (
+                    ((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),
+                    ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+                    ((128, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+                )
+                if rubin_row
+                else ()
+            ),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            cgas_by_d_shape=((((256, 256), frozenset({1})),) if rubin_row else (((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})))),
+            split_cgas_by_d_shape=(() if rubin_row else (((192, 128), frozenset({2})),)),
+            # f16x2-softmax arm: only the SM107 sibling kernel carries the
+            # path (MUFU EX2.F16x2 exists below cc10.7 but no other file wires
+            # it). FLOAT is the f32 pipeline every flavor already runs.
+            softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
+            split_kv_supported=True,
+            split_d_shapes=(frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256)})),
+            pack_gqas=frozenset({False, True}),
+            # SM107: PackGQA is wired in the d128 FP8 BODY, which d192xd128
+            # shares -- but the row keeps it to d128 until the d192 PackGQA
+            # path is actually validated on Rubin (a shared body is evidence
+            # the code exists, not that it is correct at a wider K).  The
+            # ported d256/d512 kernels do not wire it at all, as they do not
+            # wire split-KV.
+            pack_gqa_d_shapes=(frozenset({(128, 128)}) if rubin_row else None),
+        ),
+        lower=partial(lower_dsl_prefill, api_type=_SM100),
+    )
+
+
+def _sm107_mxfp8_spec() -> EngineSpec:
+    """Block-scale MXFP8 on Rubin (E4M3/E5M2 + per-32-block E8M0 SF).
+
+    Rubin's own row rather than a widened SM100 one, for the same reason the
+    f16 and FP8 rows split at the arch line: these are the SM107 sibling
+    kernels (dense K=64 MMA, version-1 SMEM descriptors).  Rubin also carries a
+    d512 MXFP8 flavor, which SM100 does NOT -- so this row is WIDER than its
+    Blackwell counterpart at the top end.  d192xd128 now has a Rubin MXFP8
+    sibling too, but at cga2 ONLY (SM100 serves it at both widths): the wider K
+    pushes this flavor's scale-factor tiles past the 256 KiB version-0
+    descriptor window at cga1.
+
+    Declined deliberately, because the ported kernels lack the machinery (not
+    because it went untested): THD, split-KV and PackGQA (the dense padded-Q
+    trim is carried since #1037).  Optional stats IS served (``lse_optional=True`` below -- has_lse=False
+    is a real specialization on every Rubin kernel, not an accepted-and-ignored
+    flag).  See _sm107_spec for the same list on f16.
+    """
+    return EngineSpec(
+        name="sdpa_fwd_prefill_sm107_mxfp8",
+        capabilities=Capabilities(
+            sm_lo=107,
+            sm_hi=_BLACKWELL[1],
+            phase="prefill",
+            # Exact native shapes only -- the SF tensors are not zero-padded.
+            # (192, 128) deliberately takes NO cgas_by_d_shape entry below, so it
+            # stays on the row default cgas={2}: at cga1 its four SF tiles start
+            # past the 256 KiB version-0 tcgen05 descriptor window and the UTCCP
+            # would read Q data as scale factors.  See make_cfg_d192_mxfp8.
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            d_pad_multiple=0,
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            is_mxfp8=True,
+            causal=True,
+            bottom_right=True,
+            right_band_widening=True,
+            swa=True,
+            padded=True,
+            sink=True,
+            stats=True,
+            padded_stats=True,
+            # See the f16 SM107 row: has_lse=False is a real specialization on
+            # every Rubin kernel, not an accepted-and-ignored flag.
+            lse_optional=True,
+            skv_tail_via_padding=True,
+            # NATURAL row-wide; LPT and LPT_L2 claimed PER FLAVOR, like the f16
+            # and FP8 rows, where the kernel honours them.
+            #
+            # This row was NATURAL-only until 2026-09-14.  The report that kept
+            # it there -- causal MXFP8 graphs under LPT turning 23 green tests
+            # red with max|O-ref| ~ 1.9-4.1 while dense stayed correct -- has
+            # the #1001 signature: the SM107 port had dropped
+            # `lpt_q_tiles_in_cga_units=True`, so the LPT decode claimed no
+            # tile and the kernel wrote nothing (dense graphs rank NATURAL and
+            # never took that path).  With the argument restored the d128 and
+            # d192x128 MXFP8 kernels honour LPT, and they now thread
+            # `qh_per_kh` / `seqlen_kv` into every decode call site (the
+            # LPT_L2 cost-model inputs the shared decode raises without), so
+            # they honour LPT_L2 as well.  VALIDATED on Rubin through the
+            # standalone adapter (E4M3 block scales, bf16 O, dense and causal):
+            # O and LSE under LPT and under LPT_L2 are BIT-IDENTICAL to NATURAL
+            # -- the scheduler reorders whole (batch, head, q-tile) work items,
+            # each tile's KV loop is unchanged -- with a sentinel-filled O
+            # (0 unwritten cells); and the MXFP8 suite, whose causal cases now
+            # rank LPT_L2 first, stays green.  Pinned by the Rubin e2e
+            # test_mxfp8_sched_policies_are_bit_identical_to_natural.
+            # NOT claimed: (256, 256) and (512, 512) -- their kernels thread
+            # neither argument, and d512 (cga4x1 role-split) still lacks the
+            # #1001 argument and writes nothing under LPT.
+            sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies_by_d_shape=(
+                ((128, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+                ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+            ),
+            tile_ms=frozenset({128}),
+            tile_ns=frozenset({128}),
+            cgas=frozenset({2}),
+            # d256 MXFP8 runs cga1 (FROST rule: d256 quantized requires cta_mma=1;
+            # heuristics.py:492 enforces it, so the row cannot declare otherwise).
+            cgas_by_d_shape=((((256, 256), frozenset({1})),)),
+            pack_gqas=frozenset({False}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
 def _sm80_spec() -> EngineSpec:
-    """SM80 (A100) prefill row: lowers onto the ``cudnn.sdpa`` SM80 APIBase
-    adapter (``fwd/api.py``), which owns kernel-flavor selection
-    (gptoss/llama/dsv3/qwen), host-side head-dim padding (hence
+    """SM80 (A100) prefill row: lowers through ``lower_dsl_prefill`` onto the
+    ``SdpaFwdDslSm80`` adapter (``fwd/api_dsl.py``), which owns kernel-flavor
+    selection (gptoss/llama/dsv3/qwen), host-side head-dim padding (hence
     ``d_pad_multiple=1``), BHSD<->BSHD normalization, and per-shape kernel
     caching — the CuTe-DSL JIT happens on the first execute.  THD graphs are
-    gated off (the standalone wrappers serve THD); knob domains are empty
-    (no tunables wired)."""
+    gated off (the standalone wrapper's varlen path serves THD); knob domains
+    are empty (no tunables wired)."""
     return EngineSpec(
         name="sdpa_fwd_prefill_sm80",
         capabilities=Capabilities(
             sm_lo=80,
             sm_hi=80,  # A100 exactly: the kernels assume its 164 KiB opt-in SMEM
             phase="prefill",
-            d_qk=frozenset({256}),
-            d_v=frozenset({256}),
-            d_envelope=True,  # flavor envelopes; host-side zero-padding
+            d_shapes=frozenset({(256, 256)}),  # flavor envelopes; host-side zero-padding
             d_pad_multiple=1,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             bias=True,
-            alibi=True,
-            block_mask=True,
-            score_max=True,
-            score_sum_exp=True,
             right_band_widening=True,
             causal=True,
             bottom_right=True,
-            bottom_right_with_swa=True,
-            bottom_right_padded_seq_q=True,
             swa=True,
             padded=True,
             sink=True,
             stats=True,
             padded_stats=True,
             decode=False,
+            # The kernels implement the dense padded-Q trim natively
+            # (per-batch ``seq_len_q`` forward kwarg): rows >= seq_len_q[b]
+            # are written explicitly by the kernel (O := 0, LSE := -inf).
+            lse_optional=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             skv_tile=0,  # the kernels' is_even_k path serves ragged S_kv
-            sched_policies=frozenset(),
+            # The static-grid remap serves all three policies (the template's
+            # sched_policy field); the adapter maps the explicit int to its
+            # kernel token and derives only when the knob is None.
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
         ),
-        lower=lower_sm80_prefill,
+        lower=partial(lower_dsl_prefill, api_type=_SM80),
     )
-
-
-def lower_sm80_prefill(spec: EngineSpec, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None):
-    """Lower the SM80 prefill row through the ``cudnn.sdpa`` SM80 adapter."""
-    from cudnn.sdpa.fwd.api import sdpa_fwd_wrapper_sm80
-
-    binding = ga.SdpaBinding(
-        q=facts.q_t,
-        k=facts.k_t,
-        v=facts.v_t,
-        o=facts.o_t,
-        stats=facts.stats_t,
-        bias=facts.bias_t,
-        sink_token=facts.sink_t,
-        seq_len_kv=facts.seq_kv_t,
-        seq_len_q=facts.seq_q_t,
-        block_mask=facts.block_mask_t,
-        score_max=facts.score_max_t,
-        score_sum_exp=facts.score_sum_exp_t,
-    )
-    mask_args = ga.adapter_mask_args(facts)
-    wants_score_stats = facts.has_score_max or facts.has_score_sum_exp
-
-    def _execute(variant_pack, stream=None):
-        resolved = ga.resolve_variant_pack(variant_pack, binding)
-        # dense_flex delivery: the adapter requires BSHD-physical buffers, so
-        # normalize here (zero-copy when already BSHD; repeat_interleave's
-        # GQA expansion is BHSD-contiguous and always needs it).
-        q_buf = ga.to_bshd_physical(resolved[id(facts.q_t)])
-        k_buf = ga.to_bshd_physical(ga.expand_gqa_heads(resolved[id(facts.k_t)], facts.h_q))
-        v_buf = ga.to_bshd_physical(ga.expand_gqa_heads(resolved[id(facts.v_t)], facts.h_q))
-
-        out = sdpa_fwd_wrapper_sm80(
-            q_buf,
-            k_buf,
-            v_buf,
-            scale_softmax=facts.scale,
-            return_score_stats=wants_score_stats,
-            # Stream from the caller's handle (ExecutionContext.stream);
-            # None keeps the current stream.
-            current_stream=stream,
-            **mask_args,
-            **ga.adapter_feature_buffers(facts, resolved),
-        )
-
-        # copy_ casts in place; no .to() (which would allocate a staging
-        # tensor per execute). The kernel outputs are contiguous, so the
-        # reshapes are pure views.
-        resolved[id(facts.o_t)].copy_(out["o_tensor"])
-        if facts.wants_stats:
-            stats_buf = resolved.get(id(facts.stats_t))
-            if stats_buf is not None:
-                stats_buf.copy_(out["lse_tensor"].view(stats_buf.shape))
-        if wants_score_stats:
-            for t_ref, key in ((facts.score_max_t, "score_max"), (facts.score_sum_exp_t, "score_sum_exp")):
-                buf = resolved.get(id(t_ref)) if t_ref is not None else None
-                if buf is not None:
-                    buf.copy_(out[key].view(buf.shape))
-        return None
-
-    # Executor contract (engine._FrostSdpaFwdPlan): torch-native host code,
-    # no carved scratch — workspace_bytes 0 means _execute(variant_pack).
-    _execute.workspace_bytes = 0
-    _execute.binding = binding
-    return _execute
 
 
 def _sm120_spec() -> EngineSpec:
-    from cudnn.sdpa.fwd.config_sm120 import SUPPORTED_HEAD_TILES
+    from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, GENERAL_HEAD_TILE_MAX, GENERAL_HEAD_TILES
 
     return EngineSpec(
         name="sdpa_fwd_prefill_sm120",
@@ -629,14 +1259,14 @@ def _sm120_spec() -> EngineSpec:
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
             phase="prefill",
-            d_qk=frozenset(SUPPORTED_HEAD_TILES),
-            d_v=frozenset(SUPPORTED_HEAD_TILES),
-            d_envelope=True,
+            # The general template picks its Q/K and V head tiles independently,
+            # so the native shapes are the cross product of the supported tiles;
+            # the d512 flavor (sm120/prefill_d512_f16.py) adds its (512, 512).
+            d_shapes=frozenset((tq, tv) for tq in GENERAL_HEAD_TILES for tv in GENERAL_HEAD_TILES) | {D512_FLAVOR},
+            d_envelope_floors=((D512_FLAVOR, GENERAL_HEAD_TILE_MAX),),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
-            bottom_right_with_swa=True,
-            bottom_right_padded_seq_q=True,
             swa=True,
             right_band_widening=True,
             padded=True,
@@ -645,6 +1275,7 @@ def _sm120_spec() -> EngineSpec:
             lse_optional=True,
             padded_stats=True,
             thd=True,
+            thd_padded_stats=True,
             # No KV-tail rule: the kernel walks KV tiles right-to-left and its
             # first (masked) step always covers the rightmost — and therefore
             # any partial — tile, comparing columns against seqlen_k regardless
@@ -653,10 +1284,17 @@ def _sm120_spec() -> EngineSpec:
             skv_tile=0,
             cu_seq_len=True,
             layouts=frozenset({"bshd", "dense_flex"}),
-            sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # The kernel's inline chunking + the shared split_combine pass
+            # (the combine is one block per row — arch-agnostic). The config
+            # backstop bars a split under the LPT remaps, so the heuristic's
+            # split sets ride SCHED_NATURAL.
+            split_kv_supported=True,
             tile_ms=frozenset({64, 128}),
-            tile_ns=frozenset({64, 128}),
+            # 32 is the d512 flavor's KV tile alone (config_sm120.tile_domain).
+            tile_ns=frozenset({32, 64, 128}),
             cgas=frozenset({1}),
+            pack_gqas=frozenset({False, True}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -687,6 +1325,18 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     return spec.lower(spec, facts, knobs)
 
 
+def _table_stride(t) -> tuple:
+    """A paged block table's ``(batch, page)`` strides from its ``(B, 1, max_pages, 1)`` IR ref."""
+    s = tuple(int(x) for x in t.get_stride())
+    return (s[0], s[2])
+
+
+def _table_view(buf, ir_t, b: int):
+    """The kernel's ``(B, max_pages)`` view of a bound ``(B, 1, max_pages, 1)`` table — a
+    view of the declared layout (size-1 axes dropped), never a copy."""
+    return buf.as_strided((b, int(ir_t.get_dim()[2])), _table_stride(ir_t), buf.storage_offset())
+
+
 def lower_dsl_prefill(
     spec: EngineSpec,
     facts: "ga.SdpaGraphFacts",
@@ -713,13 +1363,11 @@ def lower_dsl_prefill(
 
     seq_q_t = facts.seq_q_t if facts.padded else None
     seq_kv_t = facts.seq_kv_t if facts.padded else None
-    # Mirrors the seq_q_lens_present constructor argument below. Execute
-    # forwards seq_q only when the compiled specialization consumes it (or THD,
-    # which sources cu_seqlens from it) — the adapter rejects mismatches, so a
-    # buffer the FP8/MXFP8 kernels can't honor (dense padded-Q trim is not
-    # plumbed there — known gap) is dropped here rather than erroring at
-    # execute.
-    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and not (facts.is_mxfp8 or facts.is_fp8)
+    # Mirrors the seq_q_lens_present constructor argument below: a dense padded
+    # graph carrying per-batch Q lengths compiles the kernel's trim
+    # specialization (every kernel has one), and execute forwards the buffer
+    # (THD sources cu_seqlens from it instead).
+    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None
     api = _adapter(api_type)(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
@@ -736,8 +1384,8 @@ def lower_dsl_prefill(
         seq_kv_lens_present=facts.padded or synth_kv_padding,
         # Dense padded-Q trim (q rows >= seq_len_q[b] -> O := 0, LSE := -inf):
         # enabled whenever a dense padded graph carries per-batch Q lengths.
-        # THD carries Q lengths via cu_seqlens; the FP8/MXFP8 kernels are not
-        # plumbed (their specs also keep padded_stats=False).
+        # THD carries Q lengths via cu_seqlens; support is selected per native
+        # flavor above because only kernels with a quantized Q-length ABI consume it.
         seq_q_lens_present=seq_q_lens_present,
         # cu_seq_len form (THD-only; the probe declined dense cu graphs): the
         # adapter's seq-lens execute arguments carry (B+1,) prefix sums.
@@ -745,12 +1393,44 @@ def lower_dsl_prefill(
         cu_seq_kv_lens=facts.cu_seq_kv_t is not None,
         has_sink=facts.has_sink,
         thd=facts.thd,
+        # THD Stats without ragged offsets = FlashInfer's per-batch padded (b, s_max, h) buffer
+        thd_stats_padded=(facts.thd and facts.stats_t is not None and getattr(facts.stats_t, "ragged_offset", None) is None),
+        # Caller-declared packed token totals (issue #624): when present the
+        # adapter binds EXACT token extents instead of the buffer-derived
+        # capacity, putting an over-allocated buffer's uninitialized tail out
+        # of TMA reach. Only ever tightens (see _thd_declared_total).
+        max_total_seq_len_q=facts.max_total_seq_len_q,
+        max_total_seq_len_kv=facts.max_total_seq_len_kv,
+        # Paged KV: K/V samples are the page pools; the adapter needs the page
+        # geometry and the declared KV maximum the masks clamp against.
+        paged_page_size=facts.page_size if facts.has_paged_kv else 0,
+        paged_max_seq_len_kv=facts.s_kv if facts.has_paged_kv else None,
+        # The tables' declared (batch, page) strides — the (B, 1, max_pages, 1)
+        # IR tensor's axes 0 and 2 — so batch-innermost / padded tables bind
+        # as views.
+        paged_table_stride=_table_stride(facts.paged_k_table_t) if facts.has_paged_kv else None,
+        paged_table_v_stride=_table_stride(facts.paged_v_table_t) if facts.has_paged_kv else None,
         dtype_o=facts.dtype_o if (facts.is_mxfp8 or facts.is_fp8) else None,
         pertensor_fp8=facts.is_fp8,
         sched_policy=knobs.sched_policy if knobs is not None else None,
         tile_m=knobs.tile_m if knobs is not None else None,
         tile_n=knobs.tile_n if knobs is not None else None,
         cga=knobs.cga if knobs is not None else None,
+        pack_gqa=knobs.pack_gqa if knobs is not None else None,
+        split_kv=knobs.split_kv if knobs is not None else None,
+        softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
+        # SM80-only PLAN-TIME axes (bias presence/dtype are compile-time
+        # specializations of that template): forwarded only to adapters whose
+        # constructor declares them — every other row's mismatch gated the
+        # operands off already.
+        **(
+            {
+                "bias_present": facts.bias_t is not None,
+                "bias_fp32": facts.bias_t is not None and facts.bias_t.get_data_type() == cudnn.data_type.FLOAT,
+            }
+            if "bias_present" in inspect.signature(_adapter(api_type).__init__).parameters
+            else {}
+        ),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -769,6 +1449,13 @@ def lower_dsl_prefill(
     api_scratch_bytes = api.scratch_workspace_bytes()
     total_workspace_bytes = synth_kv_bytes + api_scratch_bytes
 
+    # SM80-only feature operand (bias): the row's capability gate admitted it,
+    # and the adapter's execute() declares the matching optional keyword —
+    # forwarded below only when both hold. ALiBi / block_mask / score-stats
+    # graphs never reach a FROST row (every capability row declines them, so
+    # the backend serves them).
+    _extra_exec_keys = {"bias_tensor"} & set(inspect.signature(type(api).execute).parameters)
+
     binding = ga.SdpaBinding(
         q=facts.q_t,
         k=facts.k_t,
@@ -780,6 +1467,9 @@ def lower_dsl_prefill(
         seq_len_q=seq_q_t,
         cu_seq_len_q=facts.cu_seq_q_t,
         cu_seq_len_kv=facts.cu_seq_kv_t,
+        paged_k_table=facts.paged_k_table_t,
+        paged_v_table=facts.paged_v_table_t,
+        bias=facts.bias_t,
         sf_q=facts.sf_q_t,
         sf_k=facts.sf_k_t,
         sf_v=facts.sf_v_t,
@@ -788,9 +1478,6 @@ def lower_dsl_prefill(
         descale_k=facts.descale_k_t,
         descale_v=facts.descale_v_t,
         scale_o=facts.scale_o_t,
-        amax_s=facts.amax_s_t,
-        descale_s=facts.descale_s_t,
-        scale_s=facts.scale_s_t,
     )
 
     def _ir_view(buf, ir_t):
@@ -822,6 +1509,10 @@ def lower_dsl_prefill(
             k_buf = _ir_view(k_buf, binding.k)
             v_buf = _ir_view(v_buf, binding.v)
             o_buf = _ir_view(o_buf, binding.o)
+        elif facts.has_paged_kv:
+            # THD Q/O stay packed; the pools are ordinary dense tensors.
+            k_buf = _ir_view(k_buf, binding.k)
+            v_buf = _ir_view(v_buf, binding.v)
         # Scratch comes from the CALLER's workspace (never allocated here): the
         # CompiledPlan sized/validated it against workspace_bytes; the carver
         # re-validates so a direct call cannot silently corrupt memory.
@@ -832,7 +1523,8 @@ def lower_dsl_prefill(
         # lse_optional (the kernel compiles the LSE store out) — no dummy.
         lse_buf = resolved.get(id(binding.stats)) if binding.stats is not None else None
         # Shared presence-checked resolution (graph_analyzer.resolve_feature_operands);
-        # bias/block_mask/alibi stay None for these rows (mismatch gates them).
+        # bias flows only to adapters declaring the keyword (the SM80 row);
+        # every other feature operand is gated off by mismatch for all rows.
         feature_ops = ga.resolve_feature_operands(facts, resolved)
         sinks_buf = feature_ops.sinks
         seq_kv_buf = feature_ops.seq_kv_lens
@@ -849,20 +1541,6 @@ def lower_dsl_prefill(
         dk_buf = resolved.get(id(binding.descale_k)) if binding.descale_k is not None else None
         dv_buf = resolved.get(id(binding.descale_v)) if binding.descale_v is not None else None
         so_buf = resolved.get(id(binding.scale_o)) if binding.scale_o is not None else None
-        amax_s_buf = resolved.get(id(binding.amax_s)) if binding.amax_s is not None else None
-        ds_buf = resolved.get(id(binding.descale_s)) if binding.descale_s is not None else None
-        ss_buf = resolved.get(id(binding.scale_s)) if binding.scale_s is not None else None
-        # The quantized DENSE lowerings drop the per-batch Q trim, which is
-        # harmless only while every seq_len_q equals S_q -- a shorter one writes
-        # O and a finite LSE past the valid length. Checked here because the
-        # lengths are device values; this path already reads the descale
-        # scalars back. THD is exempt: ragged lengths ARE shorter than S_q by
-        # construction, and the packed layout gives each sequence its own
-        # extent, so nothing is written past a valid length.
-        if (facts.is_mxfp8 or facts.is_fp8) and not facts.thd and seq_q_buf is not None and not seq_q_lens_present:
-            min_seq_q = int(seq_q_buf.min().item())
-            if min_seq_q < int(facts.s_q):
-                raise NotImplementedError(f"per-tensor FP8/MXFP8: per-batch seq_len_q shorter than S_q={facts.s_q} is not plumbed; got min {min_seq_q}")
         execute_kwargs = dict(
             q_tensor=q_buf,
             k_tensor=k_buf,
@@ -877,6 +1555,18 @@ def lower_dsl_prefill(
             # ExecutionContext's stream); None keeps the default stream.
             current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
         )
+        if facts.has_paged_kv:
+            # (B, 1, max_pages, 1) int32 tables bound as the kernel's flat
+            # (B, max_pages) views — a view, never a copy (Rule 1); the same
+            # buffer may back both.
+            bt_k = resolved.get(id(binding.paged_k_table))
+            bt_v = resolved.get(id(binding.paged_v_table))
+            if bt_k is None or bt_v is None:
+                raise ValueError("cudnn.sdpa: paged_attention_k_table / paged_attention_v_table requested but no buffer was provided")
+            execute_kwargs.update(
+                block_table=_table_view(bt_k, binding.paged_k_table, facts.b),
+                block_table_v=_table_view(bt_v, binding.paged_v_table, facts.b),
+            )
         if facts.is_mxfp8 or facts.is_fp8:
             execute_kwargs.update(
                 sf_q=sf_q_buf,
@@ -887,10 +1577,11 @@ def lower_dsl_prefill(
                 descale_k=dk_buf,
                 descale_v=dv_buf,
                 scale_o=so_buf,
-                amax_s=amax_s_buf,
-                descale_s=ds_buf,
-                scale_s=ss_buf,
             )
+        if _extra_exec_keys:
+            # SM80 feature operand (mismatch admitted it for this row).
+            if feature_ops.bias is not None and "bias_tensor" in _extra_exec_keys:
+                execute_kwargs["bias_tensor"] = feature_ops.bias
         if api_scratch_bytes:
             execute_kwargs["workspace"] = carver.remaining()
         api.execute(**execute_kwargs)
@@ -907,56 +1598,54 @@ def lower_dsl_prefill(
 
 
 def engine_name(
-    d: Optional[int] = None,
     phase: str = "prefill",
     arch: str = "sm100",
     mxfp8: bool = False,
     fp8: bool = False,
-    d_v: Optional[int] = None,
 ) -> str:
-    """The registered engine name for a coverage cell (test/user convenience)."""
+    """The registered engine name for a coverage cell (test/user convenience).
 
-    name = f"sdpa_fwd_{phase}_{arch}"
-    if d is not None:
-        if d_v is None or d_v == d:
-            name += f"_d{d}"
-        else:
-            name += f"_d{d}_d{d_v}"
+    One engine per arch x dtype family — head dims are a lowering concern
+    (kernel-flavor pick), not part of the engine identity."""
+
     suffix = "_mxfp8" if mxfp8 else "_fp8" if fp8 else ""
-    return name + suffix
+    return f"sdpa_fwd_{phase}_{arch}" + suffix
 
 
 # ORDER MATTERS: this is the PREFERENCE order — ``engine.FrostSdpaFwdEngines()``
 # wraps the specs in it, so the plans they propose reach graph.plans in this
-# order and the build walk tries them top-down. With head-dim envelopes every
-# small-d graph is eligible for ALL covering f16 flavors, so the f16 rows are
-# listed smallest-first to make first-eligible == smallest-covering flavor
-# (the tightest tile, least padded work). We deliberately keep mismatch() a
-# pure upper-bound check instead of rejecting non-tightest flavors: an
-# explicit select_plan() of a larger covering flavor stays legal (useful for
-# flavor A/B testing), only the ranking prefers the tightest.
+# order and the build walk tries them top-down. One engine per arch x dtype
+# family: kernel-FLAVOR choice (which head-dim tile) happens inside the
+# lowering (api_dsl._pick_flavor, smallest covering flavor — the tightest
+# tile, least padded work), so at most one row of a family is eligible per
+# device and the order only breaks ties across families.
 # Engine IDS do NOT follow this order — they are pinned per name in
-# engine._ID_OFFSETS and never move.
+# engines/manifest.py and never move.
 def _sm120_fp8_spec() -> EngineSpec:
-    """SM120 per-tensor FP8 engine (E4M3 in + scalar descales, FP16 out).
+    """SM120 per-tensor FP8 engine (E4M3/E5M2 in + scalar descales, FP16/BF16/FP8 out).
 
-    P quantization follows the backend's FORT ordering: Amax_S on the unscaled
-    softmax result, then Scale_S, then the e4m3 cast, with Descale_S folded into
-    o_scale_fused. (cuDNN's Scale_S/Descale_S scale the softmax OUTPUT, not the
-    scores.) The SM100 FP8 row deliberately does NOT do this: its lazy-rescale
-    skip leaves P bounded by 2^RESCALE_THRESHOLD rather than 1, so e4m3's range
-    above 1.0 is already spent and a caller Scale_S would saturate it. It
-    honours a reciprocal pair analytically instead and declines anything else.
+    P quantization follows the backend's FORT ordering: the softmax denominator
+    reads the unscaled result, then Scale_S multiplies P, then the fp8 cast,
+    with Descale_S folded into o_scale_fused. (cuDNN's Scale_S/Descale_S scale
+    the softmax OUTPUT, not the scores.) The SM100 FP8 row deliberately does
+    NOT do this: its lazy-rescale skip leaves P bounded by 2^RESCALE_THRESHOLD
+    rather than 1, so e4m3's range above 1.0 is already spent and a caller
+    Scale_S would saturate it. It honours a reciprocal pair analytically
+    instead and declines anything else.
 
     Same mma.sync architecture as the f16 SM120 cell with the MMA lowered to
     m16n8k32 e4m3; ``descale_q*descale_k`` folds into the softmax scale and
-    ``descale_v*scale_o`` into an epilogue scalar, so the kernel adds only the
-    Amax_S/Amax_O atomics over the f16 sibling. E4M3 only (no E5M2 tag in the
-    kernel yet), FP16 O only, head dims any multiple of 32 up to 256 with the
-    QK^T and P@V sides independent (exact — no zero-padding envelope on the
-    8-bit fragment path), and no sink (Amax_S semantics with a sink column are
-    undefined here). THD (ragged) is served with token-major Stats; head-major
-    ragged Stats stays f16-only (the fp8 kernel carries no such specialization).
+    ``descale_v*scale_o`` into an epilogue scalar, so beyond those the kernel
+    adds only the Amax_O atomic (no Amax_S — the shared mismatch rule declines
+    graphs that declare one). E4M3/E5M2 QKV supported; O may
+    be FP16, BF16, or FP8 (either flavor — a direct quantizing store applies
+    ``scale_o`` before the cast, and Amax_O stays the pre-cast fp32 amax).
+    Head TILES any multiple of 32 up to 256 with the QK^T and P@V sides
+    independent; actual head dims may be any multiple of 16 up to the tile
+    (TMA 16-byte global-stride rule at 1 byte/elem) via TMA zero-padding.
+    Attention sinks fold into the softmax denominator: the sink is a virtual
+    column with no V row — it rescales O and enters the LSE. THD (ragged) is
+    served with token- or head-major Stats.
     """
     from cudnn.sdpa.fwd.config_sm120 import SUPPORTED_HEAD_TILES_FP8
 
@@ -966,40 +1655,48 @@ def _sm120_fp8_spec() -> EngineSpec:
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
             phase="prefill",
-            d_qk=frozenset(SUPPORTED_HEAD_TILES_FP8),
-            d_v=frozenset(SUPPORTED_HEAD_TILES_FP8),
-            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
-            out_dtypes=frozenset({cudnn.data_type.HALF}),
+            d_shapes=frozenset((tq, tv) for tq in SUPPORTED_HEAD_TILES_FP8 for tv in SUPPORTED_HEAD_TILES_FP8),
+            d_pad_multiple=16,  # TMA 16-byte global-stride rule at 1 byte/elem
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
             causal=True,
             bottom_right=True,
-            bottom_right_with_swa=True,
-            bottom_right_padded_seq_q=True,
             swa=True,
+            right_band_widening=True,
             padded=True,
+            sink=True,
             stats=True,
             lse_optional=True,
             thd=True,
-            # Same caveat as the SM100 fp8 row: no SEQ_Q_LENS epilogue trim,
-            # but fp8 graphs cannot carry seq_len_q here (lower_dsl_prefill
-            # forces seq_q_lens_present=False for the fp8 family).
             padded_stats=True,
-            sched_policies=frozenset({SCHED_NATURAL}),
+            skv_tile=0,
+            # dense_flex: any dense layout with the head dim
+            # innermost-contiguous is normalized to the kernel's compact BSHD
+            # by the shared adapter (one gather copy in, one scatter copy
+            # back for O; zero-copy when already BSHD-physical).
+            layouts=frozenset({"bshd", "dense_flex"}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # The kernel's inline chunking (same shape as the f16 sibling) + the
+            # shared split_combine pass. Under a split the kernel stands its amax
+            # down and the combine reports the amax of the RECOMBINED O.
+            split_kv_supported=True,
             tile_ms=frozenset({64, 128}),
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
+            pack_gqas=frozenset({False, True}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
 
 
 ENGINE_SPECS = (
-    _sm100_spec(128),
-    _sm100_spec(192, d_v=128),
-    _sm100_spec(256),
-    _sm100_spec(512),
-    _sm100_mxfp8_spec(128),
-    _sm100_fp8_spec(128),
+    _sm100_spec(),
+    _sm100_mxfp8_spec(),
+    _sm100_fp8_spec(),
+    _sm100_fp8_spec(arch="sm107"),
+    _sm107_spec(),
+    _sm107_mxfp8_spec(),
     _sm120_spec(),
     _sm120_fp8_spec(),
     _sm80_spec(),

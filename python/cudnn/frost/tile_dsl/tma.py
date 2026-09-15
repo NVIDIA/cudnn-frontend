@@ -41,7 +41,16 @@ def cp_async_bulk_shared_cluster_shared_cta(dst_mem, src_mem, mbar, size, *, pre
 
 
 @cute.jit
-def tma_load_tile(smem_tile, gmem_slice, mbar, *, cta_group: int = 1, mcast_mask=None, acquire: cutlass.Constexpr[bool] = True):
+def tma_load_tile(
+    smem_tile,
+    gmem_slice,
+    mbar,
+    *,
+    cta_group: int = 1,
+    mcast_mask=None,
+    acquire: cutlass.Constexpr[bool] = True,
+    l2_cache_hint=None,
+):
     num_iters = smem_tile.tma_loads_per_tile
     granu_elems = smem_tile.tma_granu_elems
     sub_stride = smem_tile.tma_subtile_stride_elems
@@ -70,6 +79,7 @@ def tma_load_tile(smem_tile, gmem_slice, mbar, *, cta_group: int = 1, mcast_mask
                     tma_desc_ptr,
                     coords,
                     mbar,
+                    l2_cache_hint=l2_cache_hint,
                 )
             else:
                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
@@ -80,6 +90,7 @@ def tma_load_tile(smem_tile, gmem_slice, mbar, *, cta_group: int = 1, mcast_mask
                     [],
                     multicast_mask=mcast_mask,
                     group=nvvm.CTAGroup.CTA_2,
+                    l2_cache_hint=l2_cache_hint,
                 )
 
 
@@ -264,4 +275,94 @@ def tma_tensormap_acquire(desc_ptr):
         128,
         from_proxy=nvvm.Proxy.GENERIC,
         to_proxy=nvvm.Proxy.TENSORMAP,
+    )
+
+
+def ptx_type_suffix(dtype) -> str:
+    """PTX type suffix for a 32-bit global ld/st: ``f32`` for floats, ``b32`` for bit patterns."""
+    return "f32" if dtype == cutlass.Float32 else "b32"
+
+
+def ld_global(addr, dtype):
+    """32-bit global load: one register of ``dtype`` from ``addr``."""
+    return nvvm.inline_ptx(
+        f"ld.global.{ptx_type_suffix(dtype)} $0, [$1];",
+        write_only_types=[dtype],
+        read_only_args=[addr],
+    )
+
+
+def ld_global_v2(addr, dtype):
+    """64-bit global load: two 32-bit registers of ``dtype`` from ``addr``."""
+    return nvvm.inline_ptx(
+        f"ld.global.v2.{ptx_type_suffix(dtype)} {{$0, $1}}, [$2];",
+        write_only_types=[dtype] * 2,
+        read_only_args=[addr],
+    )
+
+
+def ld_global_v4(addr, dtype):
+    """128-bit global load: four 32-bit registers of ``dtype`` from ``addr``."""
+    return nvvm.inline_ptx(
+        f"ld.global.v4.{ptx_type_suffix(dtype)} {{$0, $1, $2, $3}}, [$4];",
+        write_only_types=[dtype] * 4,
+        read_only_args=[addr],
+    )
+
+
+def st_global(addr, value, dtype):
+    """32-bit global store: one register of ``dtype`` to ``addr``."""
+    nvvm.inline_ptx(
+        f"st.global.{ptx_type_suffix(dtype)} [$0], $1;",
+        read_only_args=[addr, value],
+    )
+
+
+def st_global_v2(addr, values, dtype):
+    """64-bit global store: two 32-bit registers of ``dtype`` to ``addr``."""
+    nvvm.inline_ptx(
+        f"st.global.v2.{ptx_type_suffix(dtype)} [$0], {{$1, $2}};",
+        read_only_args=[addr, values[0], values[1]],
+    )
+
+
+def st_global_v4(addr, values, dtype):
+    """128-bit global store: four 32-bit registers of ``dtype`` to ``addr``."""
+    nvvm.inline_ptx(
+        f"st.global.v4.{ptx_type_suffix(dtype)} [$0], {{$1, $2, $3, $4}};",
+        read_only_args=[addr, values[0], values[1], values[2], values[3]],
+    )
+
+
+def ld_shared_v2(addr, dtype):
+    """64-bit shared load: two 32-bit registers of ``dtype`` from ``addr``."""
+    return nvvm.inline_ptx(
+        f"ld.shared.v2.{ptx_type_suffix(dtype)} {{$0, $1}}, [$2];",
+        write_only_types=[dtype] * 2,
+        read_only_args=[addr],
+    )
+
+
+def ld_shared_v4(addr, dtype):
+    """128-bit shared load: four 32-bit registers of ``dtype`` from ``addr``."""
+    return nvvm.inline_ptx(
+        f"ld.shared.v4.{ptx_type_suffix(dtype)} {{$0, $1, $2, $3}}, [$4];",
+        write_only_types=[dtype] * 4,
+        read_only_args=[addr],
+    )
+
+
+def st_shared_v2(addr, values, dtype):
+    """64-bit shared store: two 32-bit registers of ``dtype`` to ``addr``."""
+    nvvm.inline_ptx(
+        f"st.shared.v2.{ptx_type_suffix(dtype)} [$0], {{$1, $2}};",
+        read_only_args=[addr, values[0], values[1]],
+    )
+
+
+def st_shared_v4(addr, values, dtype):
+    """128-bit shared store: four 32-bit registers of ``dtype`` to ``addr``."""
+    nvvm.inline_ptx(
+        f"st.shared.v4.{ptx_type_suffix(dtype)} [$0], {{$1, $2, $3, $4}};",
+        read_only_args=[addr, values[0], values[1], values[2], values[3]],
     )

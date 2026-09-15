@@ -18,9 +18,11 @@ angles here, because each catches what the other misses:
   itself. test_sdpa_stream_respect.py captures the handle-carrying path; this
   file captures the one where the fallback picks the stream.
 
-Scoped to the dense f16 rows, which are clean. The THD and per-tensor FP8 rows
-still read device memory back; each needs a kernel-side change and is listed
-under Rule 3 in python/cudnn/AGENTS.md. Widen the parametrization as they land.
+Scoped to the dense f16 rows, which are clean. The per-tensor FP8 rows still
+read device memory back (listed under Rule 3 in python/cudnn/AGENTS.md). The
+SM80 backward's THD path is asserted sync-free by
+``test_sdpa_bwd_thd_sm80.py::test_graph_thd_execute_does_not_sync``; widen the
+parametrization here as the other rows land.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ import torch
 
 import cudnn
 from cudnn.engines import is_python_engine
-from frost_test_utils import requires_blackwell, requires_dsl
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
 
 pytestmark = [pytest.mark.L0]
 
@@ -88,7 +90,7 @@ def _build(d):
     return g, vp, ws, o_buf
 
 
-@requires_blackwell
+@requires_pre_rubin_blackwell
 @requires_dsl
 @pytest.mark.parametrize("d", [256, 512])
 def test_execute_reads_no_device_memory_to_the_host(monkeypatch, d):
@@ -126,7 +128,7 @@ def test_execute_reads_no_device_memory_to_the_host(monkeypatch, d):
     assert not caught
 
 
-@requires_blackwell
+@requires_pre_rubin_blackwell
 @requires_dsl
 def test_execute_without_a_handle_is_cuda_graph_capturable():
     """The no-handle path, which is the one that resolves the stream itself.

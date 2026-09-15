@@ -6,6 +6,7 @@
 #pragma once
 
 #include <ostream>
+#include <utility>
 
 namespace cudnn_frontend {
 
@@ -134,7 +135,7 @@ class BackendDescriptor {
      * Initializes the member variables as passed.
      */
     BackendDescriptor(ManagedOpaqueDescriptor pointer_, cudnnStatus_t status_, std::string err_msg_)
-        : pointer(pointer_), status(status_), err_msg(err_msg_) {}
+        : pointer(std::move(pointer_)), status(status_), err_msg(std::move(err_msg_)) {}
     BackendDescriptor() = default;
 
     virtual ~BackendDescriptor() {};

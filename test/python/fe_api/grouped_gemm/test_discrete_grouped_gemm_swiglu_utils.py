@@ -367,6 +367,9 @@ def run_discrete_grouped_gemm_ref(
     generate_amax: bool = False,
     c_dtype: torch.dtype = torch.bfloat16,
     d_dtype: torch.dtype = torch.float32,
+    act_func: str = "swiglu",
+    situ_beta1: float = 4.0,
+    situ_beta2: float = 25.0,
 ) -> Dict[str, torch.Tensor]:
     """Run reference implementation for discrete grouped GEMM GLU (SwiGLU).
 
@@ -432,8 +435,12 @@ def run_discrete_grouped_gemm_ref(
     ref_gate = ref.index_select(1, gate_idx)
     ref_up = ref.index_select(1, up_idx)
 
-    # SwiGLU: up * (gate * sigmoid(gate))
-    ref_gate = ref_gate * torch.sigmoid(ref_gate)
+    if act_func == "situglu":
+        ref_gate = situ_beta1 * torch.tanh(ref_gate / situ_beta1) * torch.sigmoid(ref_gate)
+        ref_up = situ_beta2 * torch.tanh(ref_up / situ_beta2)
+    else:
+        # SwiGLU: up * (gate * sigmoid(gate))
+        ref_gate = ref_gate * torch.sigmoid(ref_gate)
     ref_after_swiglu = ref_up * ref_gate
 
     # Step 4: Apply prob
@@ -496,6 +503,9 @@ def check_ref_discrete_grouped_gemm(
         generate_amax=(outputs.get("amax_tensor") is not None),
         c_dtype=cfg["c_dtype"],
         d_dtype=cfg["d_dtype"],
+        act_func=cfg.get("act_func", "swiglu"),
+        situ_beta1=cfg.get("situ_beta1", 4.0),
+        situ_beta2=cfg.get("situ_beta2", 25.0),
     )
 
     torch.cuda.synchronize()

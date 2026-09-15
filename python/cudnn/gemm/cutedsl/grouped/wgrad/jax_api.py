@@ -195,10 +195,13 @@ def grouped_gemm_wgrad_jax_sm100(
             jax.ShapeDtypeStruct((m, n), framework_dtype(wgrad_dtype, "jax")),
             jax.ShapeDtypeStruct((workspace_bytes,), jnp.uint8),
         ),
-        # Both donated: the template so the returned token has defined (zero) bytes
-        # (the kernel never writes it); the workspace because the helper kernel writes
-        # the per-expert TMA descriptors into it (XLA inputs are immutable).
-        initialized_outputs={0: zeros_init, 1: zeros_init},
+        # Only zero what the kernel does not write. Zero-filling an output the
+        # kernel overwrites is a full-size device write on every dispatch, and it
+        # scales with the output -- the dominant host-visible cost of the JAX path.
+        # The template keeps its zeros: the kernel writes through wgrad_ptrs and never
+        # touches this buffer, so zeros are the only defined value it can carry. The
+        # workspace is written by the descriptor helper before the kernel reads it.
+        initialized_outputs={0: zeros_init},
         kernel=kernel,
         mac=mac,
     )(a_tensor, b_tensor, offsets_tensor, wgrad_ptrs)

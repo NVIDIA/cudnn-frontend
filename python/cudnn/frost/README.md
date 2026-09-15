@@ -19,7 +19,7 @@ are never gated.
 This document is the contract for the FROST side of that mechanism. If you are
 an agent or a human adding an engine, a kernel, a knob, or an op: read "The
 rules" at the bottom first, then the section for the layer you are touching.
-`docs/python_graph_and_execution_backends.md` covers the graph IR and the
+`docs/utilities/python_graph_and_execution_backends.md` covers the graph IR and the
 backend contract from the frontend's side; this file covers what a FROST
 engine owes it.
 
@@ -129,13 +129,18 @@ EngineFamily(
     slots={"sdpa_fwd_prefill_sm100_d128": EngineSlot(0, opt_in=True), ...},
     analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
     heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
+    validator=("cudnn._sdpa_validate", "validate_graph"),
 ),
 ```
 
 - A family is **pure data**: strings and ints, zero imports of engine code.
   `import cudnn` must never pay the CuTe-DSL import (~1.2 s) merely to know an
-  engine exists. `analyzer` and `heuristics` are `(module, callable)` pairs for
-  the same reason, resolved only when something needs to rank.
+  engine exists. `analyzer`, `heuristics` and `validator` are `(module, callable)`
+  pairs for the same reason, resolved only when something needs them. The
+  `validator` is what lets `pygraph.validate()` skip the eager C++ lowering for
+  a graph a python engine may serve (it runs the family's semantic rules; the
+  backend's verdict is deferred to planning) — see
+  `docs/utilities/python_graph_and_execution_backends.md`, *The manifest*.
 - **A family is a KIND OF GRAPH**, not a group of engines that ship together.
   `_ANCHOR_NODE_TO_FAMILY` maps a node type to the one family that serves that
   kind of graph, so a graph belongs to exactly one family or to none, and
@@ -309,23 +314,41 @@ python/cudnn/
                                 validation
       config_sm120.py           TemplateParams + supported SM120 tile/layout
                                 vocabulary + raising validation
-      kernels/
-        prefill_d256_f16_sm100.py     naming: <phase>_d<dim>_<dtype-family>_sm<arch>.py
-        prefill_d512_f16_sm100.py
-        prefill_f16_sm120.py
-        _common_sm100.py
-        thd_sm100.py
+      kernels/                  one package per ARCH LINE; everything below
+                                an arch package is owned by that arch alone
+        sm100/prefill_d256_f16.py     naming: <phase>_d<dim>_<dtype-family>.py
+        sm100/prefill_d512_f16.py
+        sm100/split_combine.py        the split-KV reduction pass
+        sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
+        sm120/prefill_f16.py          general SM120 template (any head dim)
+        sm120/prefill_d256_f16.py     d256 flavor
+        sm120/prefill_d512_f16.py     d512 flavor
+        sm120/_common.py              SM120-only warp-level primitives
+        _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
+                                  sits ABOVE both rather than inside either
+        thd_helpers.py            SHARED by sm100/ + sm107/ + sm120/
     bwd/                        future: same shape, its own api_dsl.py
 
   gemm/frost/                   engine.py + graph_analyzer.py + compiler.py
                                 + kernel_templates/
 ```
 
-Two levels under the pass directory, always. The coverage axes (arch, phase,
-head dim, dtype family) are encoded in filenames and engine names, never in
-directory depth. A dimension may be omitted from a filename when one kernel
-implementation covers multiple dimensions. A new reader should be able to list
-`sdpa/fwd/kernels/` and see the whole coverage matrix on one screen.
+Two levels under the pass directory, always. **Arch is the one coverage axis
+that may be a directory** — `kernels/sm<arch>/` — because it partitions the
+kernels into disjoint sets that never run on the same device, and because the
+arch lines are separately owned: a Rubin change cannot touch an SM100 file if
+the two live in different directories. Every OTHER axis (phase, head dim, dtype
+family) stays in the filename and the engine name:
+`<phase>_d<dim>_<dtype-family>.py`. A dimension may be omitted when one kernel
+implementation covers multiple dimensions.
+
+A module SHARED across arch lines lives at `kernels/` level, not inside one
+arch's package (`_common_blackwell.py`, `thd_helpers.py`) — so the directory a
+file sits in always names its only owner, and a file inside `sm107/` can be
+changed without asking who else imports it.
+
+A new reader should be able to list `sdpa/fwd/kernels/*/` and see the whole
+coverage matrix on one screen.
 
 As a layer stack (each layer talks only to its neighbors):
 
@@ -506,8 +529,9 @@ expressible, with one discipline separating them:
 - The box is pure data: per-axis fields on `Capabilities`. Covers most of the
   surface; adding an engine is writing a row, not logic.
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
-  (e.g. `bottom_right_with_swa: bool`). The matcher encodes the SHAPE of the
-  interaction once; each engine's row supplies the VERDICT. When a future
+  (e.g. `padded_stats: bool` — padding mask + generate_stats needs the
+  per-batch LSE trim). The matcher encodes the SHAPE of the interaction once;
+  each engine's row supplies the VERDICT. When a future
   kernel supports the conjunction, flip its flag -- never edit the matcher.
   This is what keeps interaction checks from regressing into a per-engine
   if-ladder: shared code may know about kinds of interactions, never about
@@ -527,13 +551,13 @@ levels, with no shared vocabulary at all:
 
 - **Vocabulary per operation.** Each op defines a typed, frozen dataclass:
   `cudnn.sdpa.fwd.engines.SdpaFwdKnobs(sched_policy=None, tile_m=None,
-  tile_n=None, cga=None)`, where `None` means "no preference". SDPA's knobs
-  cannot collide with GEMM's; fields have real types instead of
-  enum-plus-int64.
+  tile_n=None, cga=None, pack_gqa=None)`, where `None` means "no
+  preference". SDPA's knobs cannot collide with GEMM's; fields have real
+  types instead of enum-plus-int64.
 - **Domains per engine.** Each `Capabilities` row advertises the values its
   lowering honors: `sched_policies = {NATURAL}`, `tile_ms = {128}`,
-  `tile_ns = {128}`, `cgas = {2}`. Two engines of the same op may honor
-  different subsets.
+  `tile_ns = {128}`, `cgas = {2}`, `pack_gqas = {False}`. Two engines of the
+  same op may honor different subsets.
 - **Per plan, not per graph.** A knob set rides on `PlanConfig.knobs`, so a
   tuning choice is part of the plan's identity: a family that wants several
   tunings ranked emits several `PlanConfig`s from `recommend()`, each with its
@@ -569,7 +593,7 @@ honors" is a `dataclasses.fields()` walk over the spec table.
 The engine-to-kernel mapping is many-to-many by design:
 
 - One engine serves several dtypes through one template: the d512 engine
-  lowers fp16 and bf16 graphs to `prefill_d512_f16_sm100.py` with different
+  lowers fp16 and bf16 graphs to `sm100/prefill_d512_f16.py` with different
   TemplateParams.
 - One engine can drive several kernels: `EngineSpec.lower` is a hook
   `(spec, facts, knobs) -> executor`. The default (`lower_dsl_prefill`)
@@ -686,17 +710,18 @@ sdpa_bwd_sm100_d128                 (future)
   one row serves several compute capabilities. The row's `Capabilities.arches`
   set is the source of truth for exactly which; the name never enumerates
   minors.
-- Head dimensions are omitted when one engine accepts a domain of dimensions,
-  as the SM120 prefill engine does. `Capabilities.d_qk` and `d_v` are the
-  source of truth for that domain.
-- Geometry-specific engines use `d<dqk>` and append `x<dv>` only when the two
-  head dimensions differ.
+- Head dimensions never appear in engine names: one engine per
+  arch x dtype family accepts a DOMAIN of dimensions and its lowering picks
+  the kernel flavor (the smallest native shape covering the graph).
+  `Capabilities.d_shapes` (native flavor shapes) plus `d_pad_multiple`
+  (envelope alignment; 0 = exact shapes only) are the source of truth for
+  that domain.
 - No version counters. If a genuinely distinct second engine ever serves the
   same cell, give it a descriptive variant suffix (e.g. `_cga4`), not a number.
 - Names are for humans; `engine_id` is for machines. Pin by index
   (`select_plan`) or replay by id -- never by parsing a name.
-- `cudnn.sdpa.fwd.engines.engine_name(d)` computes geometry-specific names;
-  omit `d` for dimension-agnostic engines.
+- `cudnn.sdpa.fwd.engines.engine_name(arch=..., fp8=..., mxfp8=...)` computes
+  the family names (test/user convenience).
 
 
 ## Kernel templates and TemplateParams
@@ -730,7 +755,7 @@ Asserts:
   never a module-level `assert` (stripped under `python -O`, and an
   import-time crash is undebuggable from the frontend).
 - Hardware-invariant geometry checks in a template use a raising helper (see
-  `_require` in `prefill_d512_f16_sm100.py`) and must be unreachable for any
+  `_require` in `sm100/prefill_d512_f16.py`) and must be unreachable for any
   parameter set the engine's capabilities admit.
 - Never `assert api.check_support()` -- it raises on failure and the assert is
   stripped under `-O`; call it plainly.
@@ -797,8 +822,11 @@ Asserts:
 9. **No module-level asserts on anything a user could trip.** Raise
    `ValueError` in validation functions; keep `assert` for programmer
    invariants inside tile_dsl at most.
-10. **Two directory levels under the pass, maximum.** Coverage axes go in
-    filenames and engine names, never in directory depth.
+10. **Two directory levels under the pass, maximum**, and ARCH is the only
+    coverage axis allowed to be one of them (`kernels/sm107/prefill_d128_fp8.py`).
+    Every other axis -- phase, head dim, dtype family -- goes in the filename and
+    the engine name. A module shared across arch lines stays at `kernels/` level
+    rather than inside one arch package.
 11. **Identifiers are keyed by op geometry, not model names.**
     `make_cfg_d512`, not `make_cfg_dsv4`; model provenance goes in comments
     only.
@@ -808,6 +836,15 @@ Asserts:
     frontend-integration test that it appears in `graph.plans` and runs when
     pinned. Mark test modules `pytest.mark.L0` -- the default pytest addopts
     is `-m L0` and unmarked tests silently never run. Run
-    `ci/run_style_check_diff.sh --apply` (black, 160 cols) before pushing.
+    `pre-commit run --all-files` (black, 160 cols) before pushing.
 13. **Keep this document true.** If code and this contract disagree and you
     change the code, change this file in the same commit.
+14. **Coverage changes update the support matrix.** A change to any SDPA
+    `Capabilities` field that affects graph eligibility, or adding/retiring
+    an `EngineSpec`, updates
+    `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.
+    That tracker is the only arch x pass x head-dim x dtype view of what
+    FROST serves, it is maintained by hand from these rows, and it silently
+    rots otherwise. Knob-domain-only changes are exempt (it does not track
+    knobs). `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the
+    exact scope and is the number to cite in review.

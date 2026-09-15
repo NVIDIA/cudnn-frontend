@@ -12,9 +12,9 @@ pre-scaled):
     S_t = (I - beta_t k_t^T k_t) Diag(alpha_t) S_{t-1} + beta_t k_t^T v_t
     o_t = q_t S_t
 
-with scalar per-token write strength ``beta_t``. The decay is applied FIRST
-(``S_dec = Diag(alpha_t) S_{t-1}``) and the delta-rule correction reads the
-already-decayed state, so unlike GDN the order matters. Supports grouped
+where ``S_t`` is the recurrent state and ``beta_t`` the scalar per-token
+write strength. The decay is applied first and the delta-rule correction
+reads the already-decayed state, so unlike GDN the order matters. Supports grouped
 heads (every input's head count must divide ``HO = max(Hq, Hv)``; heads are
 replicated onto the HO output heads), an optional initial state, and varlen
 packed batches via ``cu_seqlens``.
@@ -38,24 +38,24 @@ def rms_ratio(out: torch.Tensor, ref: torch.Tensor) -> float:
     return ((out - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt().clamp_min(1e-12)).item()
 
 
-def _recurrent_dense(q, k, v, alpha, beta, S0):
-    """Dense recurrence in [B, HV, T, *] layout, fp64. Returns (o, S_T).
+def recurrent_dense(q, k, v, alpha, beta, state0):
+    """Dense recurrence in [B, HV, T, *] layout, fp64. Returns (o, final state).
 
     ``alpha`` is per-key-channel: [B, HV, T, K] (GDN's is scalar [B, HV, T])."""
     T = q.shape[2]
-    S = S0
+    state = state0
     outs = []
     for t in range(T):
         kt = k[:, :, t, :]
         vt = v[:, :, t, :]
         at = alpha[:, :, t, :]  # [B, HV, K] per-channel decay
         bt = beta[:, :, t]
-        S = at[..., None] * S  # decay first: Diag(alpha) S, per-K-row scaling
-        kt_S = (kt.unsqueeze(-2) @ S).squeeze(-2)
-        residual = vt - kt_S  # reads the already-decayed state (no scalar alpha here)
-        S = S + bt[..., None, None] * (kt.unsqueeze(-1) @ residual.unsqueeze(-2))
-        outs.append((q[:, :, t, :].unsqueeze(-2) @ S).squeeze(-2))
-    return torch.stack(outs, dim=2), S
+        state = at[..., None] * state  # decay first: Diag(alpha) state, per-K-row scaling
+        kt_state = (kt.unsqueeze(-2) @ state).squeeze(-2)
+        residual = vt - kt_state  # reads the already-decayed state (no scalar alpha here)
+        state = state + bt[..., None, None] * (kt.unsqueeze(-1) @ residual.unsqueeze(-2))
+        outs.append((q[:, :, t, :].unsqueeze(-2) @ state).squeeze(-2))
+    return torch.stack(outs, dim=2), state
 
 
 def kda_reference(
@@ -68,6 +68,11 @@ def kda_reference(
     scale: Optional[float] = None,
     initial_state: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    safe_gate: bool = False,
+    gate_lower_bound: Optional[float] = None,
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    use_beta_sigmoid: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """KDA reference.
 
@@ -76,12 +81,17 @@ def kda_reference(
             (log-space per-channel decay); beta: ``[B, T, Hb]`` (scalar per
             token/head). Head counts must divide ``HO = max(Hq, Hv)``.
         scale: applied to q; defaults to ``1/sqrt(K)``.
-        initial_state: ``[B, HO, K, V]`` (or ``[N, HO, K, V]`` with cu_seqlens).
+        initial_state: ``[B, HO, V, K]`` (or ``[N, HO, V, K]`` with cu_seqlens), V-major.
         cu_seqlens: packed varlen boundaries (requires B == 1).
+        safe_gate: treat ``g`` as raw logits and use the log decay
+            ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``
+            (differentiable; a_log ``[Hg]``, dt_bias ``[Hg, K]``).
+        gate_lower_bound: safe-gate lower bound in log space (default -5.0).
+        use_beta_sigmoid: treat ``beta`` as raw logits; apply ``sigmoid``.
 
     Returns:
         ``(o, final_state)`` in fp64: o ``[B, T, HO, V]``, final_state
-        ``[B, HO, K, V]`` (``[N, HO, K, V]`` with cu_seqlens).
+        ``[B, HO, V, K]`` (``[N, HO, V, K]`` with cu_seqlens), V-major.
     """
     K = q.shape[-1]
     if scale is None:
@@ -89,15 +99,29 @@ def kda_reference(
 
     HO = max(q.shape[2], v.shape[2])
 
-    def expand(x):
-        r = HO // x.shape[2]
-        return x.repeat_interleave(r, dim=2) if r > 1 else x
-
-    qf = expand(q.double() * scale)
-    kf = expand(k.double())
-    vf = expand(v.double())
-    alphaf = expand(g.double().exp())  # [B, T, HO, K]
-    betaf = expand(beta.double())
+    qf = q.double() * scale
+    kf = k.double()
+    vf = v.double()
+    gf = g.double()
+    if safe_gate:
+        lb = -5.0 if gate_lower_bound is None else float(gate_lower_bound)
+        gf = lb * torch.sigmoid(a_log.double().exp()[:, None] * (gf + dt_bias.double()))
+    alphaf = gf.exp()  # [B, T, HO, K]
+    betaf = beta.double()
+    if use_beta_sigmoid:
+        betaf = betaf.sigmoid()
+    # expand tensors for grouped heads (view, no copy), as in the sdpa references
+    if q.shape[2] != HO:
+        qf = qf.unsqueeze(3).expand(-1, -1, -1, HO // q.shape[2], -1).reshape(q.shape[0], q.shape[1], HO, -1)
+    if k.shape[2] != HO:
+        kf = kf.unsqueeze(3).expand(-1, -1, -1, HO // k.shape[2], -1).reshape(k.shape[0], k.shape[1], HO, -1)
+    if v.shape[2] != HO:
+        vf = vf.unsqueeze(3).expand(-1, -1, -1, HO // v.shape[2], -1).reshape(v.shape[0], v.shape[1], HO, -1)
+    if g.shape[2] != HO:
+        alphaf = alphaf.unsqueeze(3).expand(-1, -1, -1, HO // g.shape[2], -1).reshape(g.shape[0], g.shape[1], HO, -1)
+    if beta.shape[2] != HO:
+        # direct-reference callers only: the op and the kernels take beta at HO heads
+        betaf = betaf.unsqueeze(3).expand(-1, -1, -1, HO // beta.shape[2]).reshape(beta.shape[0], beta.shape[1], HO)
 
     # [B, T, HO, *] -> [B, HO, T, *]
     qf = qf.permute(0, 2, 1, 3)
@@ -112,11 +136,11 @@ def kda_reference(
     if cu_seqlens is None:
         B = q.shape[0]
         if initial_state is None:
-            S0 = torch.zeros(B, HV, K, V, dtype=torch.float64, device=q.device)
+            state0 = torch.zeros(B, HV, K, V, dtype=torch.float64, device=q.device)
         else:
-            S0 = initial_state.double()
-        o, S = _recurrent_dense(qf, kf, vf, alphaf, betaf, S0)
-        return o.permute(0, 2, 1, 3), S
+            state0 = initial_state.double().transpose(-1, -2).contiguous()
+        o, state = recurrent_dense(qf, kf, vf, alphaf, betaf, state0)
+        return o.permute(0, 2, 1, 3), state.transpose(-1, -2).contiguous()
 
     assert q.shape[0] == 1, "cu_seqlens requires packed batch B == 1"
     bounds = cu_seqlens.tolist()
@@ -124,17 +148,17 @@ def kda_reference(
     for n in range(len(bounds) - 1):
         s, e = bounds[n], bounds[n + 1]
         if initial_state is None:
-            S0 = torch.zeros(1, HV, K, V, dtype=torch.float64, device=q.device)
+            state0 = torch.zeros(1, HV, K, V, dtype=torch.float64, device=q.device)
         else:
-            S0 = initial_state[n : n + 1].double()
+            state0 = initial_state[n : n + 1].double().transpose(-1, -2).contiguous()
         if e == s:
-            states.append(S0)
+            states.append(state0)
             continue
-        o_n, S_n = _recurrent_dense(qf[:, :, s:e], kf[:, :, s:e], vf[:, :, s:e], alphaf[:, :, s:e], betaf[:, :, s:e], S0)
+        o_n, state_n = recurrent_dense(qf[:, :, s:e], kf[:, :, s:e], vf[:, :, s:e], alphaf[:, :, s:e], betaf[:, :, s:e], state0)
         outs.append(o_n)
-        states.append(S_n)
+        states.append(state_n)
     if outs:
         o = torch.cat(outs, dim=2).permute(0, 2, 1, 3)
     else:
         o = qf.new_zeros(1, 0, HV, V)
-    return o, torch.cat(states, dim=0)
+    return o, torch.cat(states, dim=0).transpose(-1, -2).contiguous()

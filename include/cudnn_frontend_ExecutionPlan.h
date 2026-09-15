@@ -407,11 +407,14 @@ class ExecutionPlanBuilder_v8 {
 
 #if (CUDNN_VERSION >= 90400)
         if (m_execution_plan.kernel_cache) {
-            status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+            // Copy the descriptor pointer by value under the KernelCache lock. This ensures that the right pointer is
+            // passed to the backend, bypassing lazy materialization thread-safety hazards.
+            cudnnBackendDescriptor_t kc_desc = m_execution_plan.kernel_cache->get_ptr_locked();
+            status                           = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
                                            CUDNN_ATTR_EXECUTION_PLAN_KERNEL_CACHE,
                                            CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                            1,
-                                           &m_execution_plan.kernel_cache->get_ptr());
+                                           &kc_desc);
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(&m_execution_plan,
                                               status,

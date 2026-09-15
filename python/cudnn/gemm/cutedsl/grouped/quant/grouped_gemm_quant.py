@@ -543,6 +543,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 )
                 sched_counter[0] = cutlass.Int32(0)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     # ------------------------------------------------------------------
     # __call__
     # ------------------------------------------------------------------
@@ -1854,6 +1856,9 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                         if reverse_subtile:
                             real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - subtile_idx
 
+                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
+                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
                     # C1 fix: fence + early release for overlapping_accum
                     if cutlass.const_expr(self.overlapping_accum):
                         if subtile_idx == self.iter_acc_early_release_in_epilogue:
@@ -1861,9 +1866,6 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                             with cute.arch.elect_one():
                                 acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
-
-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                     if cutlass.const_expr(self.enable_bias):
                         # m7 fix: use real_subtile_idx directly (matches contiguous)
@@ -2017,6 +2019,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
             d_pipeline.producer_tail()
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     # ------------------------------------------------------------------
     # Internal: create extension based on weight_mode

@@ -9,15 +9,21 @@ Supports:
     - Dense (contiguous 3-D B) / Discrete (per-expert pointer array B) weight layout
     - FP8/FP4 output quantization with row/column scale factors (SFD)
     - Optional routing-probability (prob) fusion
-    - DSRELU backward epilogue: dA = acc·relu(C)·2·prob; dprob = Σ_n(relu(C)²·acc)
+    - DSRELU backward epilogue: dA = acc·relu(C)·2·prob; dprob = Σ_n(relu(C)²·acc);
+      optionally soft-clamped, see ``tanh_clamp_scale``
     - NONE epilogue for testing (identity, no SReLU gate)
 
 EpilogueType.NONE:
     out[m,n] = alpha · (SFA·A ★ SFB·B)[m,n] · prob[m]
 
-EpilogueType.DSRELU (backward through scaled srelu):
+EpilogueType.DSRELU (backward through scaled srelu), unclamped (``tanh_clamp_scale=None``):
     out[m,n] = alpha · acc[m,n] · relu(C[m,n]) · 2 · prob[m]
     dprob[m] += Σ_n( relu(C[m,n])² · alpha · acc[m,n] )
+
+EpilogueType.DSRELU, soft-clamped (``tanh_clamp_scale=s``): let t = tanh(relu(C)/s), c = s·t
+(the unclamped equations above are the s -> infinity limit):
+    out[m,n] = alpha · acc[m,n] · c[m,n] · 2 · (1 - t[m,n]²) · prob[m]
+    dprob[m] += Σ_n( c[m,n]² · alpha · acc[m,n] )
 
 C is the forward SReLU input, and alpha · acc is the upstream gradient
 from the following GEMM.
@@ -71,8 +77,8 @@ from ..moe_sched_extension import (
     ContiguousAndConsistentGroupedGemmSchedExtension,
 )
 from ..moe_kernel_helpers import (
-    fmin,
     fmax,
+    tanh_clamp_unit,
     atomic_add_float32,
     atomic_max_float32,
     compute_stages,
@@ -95,8 +101,11 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
     """Block-scaled grouped GEMM backward kernel with MoE tile scheduling and DSRELU.
 
     Computes the backward pass through the SReLU epilogue:
-        out[m,n] = alpha * acc[m,n] * relu(C[m,n]) * 2 * prob[m]   (DSRELU)
-        dprob[m] += sum_n( relu(C[m,n])^2 * alpha * acc[m,n] )      (DSRELU)
+        out[m,n] = alpha * acc[m,n] * relu(C[m,n]) * 2 * prob[m]   (DSRELU, tanh_clamp_scale=None)
+        dprob[m] += sum_n( relu(C[m,n])^2 * alpha * acc[m,n] )      (DSRELU, tanh_clamp_scale=None)
+    or, with tanh_clamp_scale=s set (t = tanh(relu(C)/s), c = s*t):
+        out[m,n] = alpha * acc[m,n] * c[m,n] * 2 * (1 - t[m,n]^2) * prob[m]
+        dprob[m] += sum_n( c[m,n]^2 * alpha * acc[m,n] )
     or identity (NONE epilogue):
         out[m,n] = alpha * acc[m,n] * prob[m]
 
@@ -115,7 +124,15 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
     :param weight_mode: ``MoEWeightMode.DENSE`` or ``MoEWeightMode.DISCRETE``.
     :param use_dynamic_sched: Enable dynamic tile scheduling.
     :param epilogue_type: Epilogue type (``EpilogueType.NONE`` or ``EpilogueType.DSRELU``).
-    :param use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob.
+    :param tanh_clamp_scale: Optional soft-clamp scale ``s``; must match the forward kernel
+        that produced the saved ``C`` -- a mismatch silently produces wrong gradients (and a
+        wrong regenerated fc2 input when ``generate_d_srelu`` is set). Trace-time constant;
+        ``None`` (default) is bit-identical to the unclamped path.
+    :param use_dsrelu_reuse: Reuse relu(C)^2 (or, when clamped, c^2) between d_srelu and dprob.
+    :param deterministic: Compute ``dprob`` run-to-run bit-exactly. ``dprob`` must then carry
+        one slot per N-tile so that each ``(token, tile_n)`` pair has a single writer, and the
+        caller reduces over that dimension afterwards. Rationale and cost:
+        docs/fe-oss-apis/gemm_fusions/grouped_gemm_dsrelu.md#deterministic-dprob.
     """
 
     FIX_PAD_SIZE = 256
@@ -176,6 +193,8 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         generate_dbias: bool = False,
         generate_d_srelu: bool = False,
         use_dsrelu_reuse: bool = False,
+        deterministic: bool = False,
+        tanh_clamp_scale: Optional[float] = None,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -245,6 +264,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         self.generate_dbias = generate_dbias
         self.generate_d_srelu = generate_d_srelu
         self.use_dsrelu_reuse = use_dsrelu_reuse
+        self.deterministic = deterministic
         self.dbias_cross_warp_reduce = generate_dbias
 
         self.weight_mode = weight_mode
@@ -252,6 +272,9 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
 
         self.epilogue_use_functor = False
         self.epilogue_type = epilogue_type
+        # Trace-time constant; must match the forward kernel's scale (see class docstring)
+        # and key the compile cache (see dsrelu/api.py).
+        self.tanh_clamp_scale = float(tanh_clamp_scale) if tanh_clamp_scale is not None else None
 
         self.num_epilog_warps = len(self.epilog_warp_id)
 
@@ -403,6 +426,9 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         )
 
         self.overlapping_accum = self.num_acc_stage == 1 and self.mma_tiler[1] == 256
+        # Level 1 of the deterministic dprob fix. overlapping_accum is what reverses the
+        # subtile loop, so it is the only case where a running sum sees a varying order.
+        self.dprob_slot_parking = self.deterministic and self.overlapping_accum
         self.epilogue_prefetch_more = False
         self.use_fp8_ptx_cvt = True
 
@@ -591,6 +617,8 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                 )
                 sched_counter[0] = cutlass.Int32(0)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     # ------------------------------------------------------------------
     # __call__
     # ------------------------------------------------------------------
@@ -617,7 +645,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         padded_offsets: cute.Tensor,
         alpha: cute.Tensor,
         prob: cute.Tensor,
-        dprob: Optional[cute.Tensor],  # OUTPUT: dL/d(prob), shape (M,1,1), Float32
+        dprob: Optional[cute.Tensor],  # OUTPUT: dL/d(prob), shape (M,1,1) -- (M,grid_n,1) if deterministic, Float32
         dbias_tensor: Optional[cute.Tensor],  # OUTPUT: dL/d(bias), shape (L,N), BF16 (accumulated via atomic)
         d_srelu: Optional[cute.Tensor],  # OUTPUT: recomputed SReLU activation, shape (M,N,1)
         sfd_col_d_srelu_tensor: Optional[cute.Tensor],  # OUTPUT: column SF for d_srelu when FP8-quantized
@@ -1028,11 +1056,17 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         warp_idx,
         sDbias,
         dbias_gmem_2d,
-        expert_idx,
         n_base,
         dbias_n_total,
+        dbias_row_idx,
     ) -> None:
-        """Sum dA across M within this subtile and atomic-add to dbias[expert, n].
+        """Sum dA across M within this subtile and atomic-add to dbias[dbias_row_idx, n].
+
+        ``dbias_row_idx`` is the expert normally, or -- under ``deterministic`` -- this CTA's
+        absolute M-block, which gives every ``(M-block, n)`` pair a single writer so the caller
+        can reduce per expert in a fixed order afterwards. Only the row differs: the slots stay
+        bf16, so both modes issue the same packed store. Determinism comes from the single writer
+        and the fixed-order reduction, not from a wider accumulator.
 
         Adapted from moe_blockscaled_grouped_gemm_dglu_dbias.py's dbias_reduction,
         which handled two interleaved vectors (d1, d2). Here we have a single
@@ -1110,12 +1144,10 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                     cta_sum_a = cta_sum_a + rDst_w[0]
                     cta_sum_b = cta_sum_b + rDst_w[1]
                 if n_offset < dbias_n_total:
-                    gmem_ptr = dbias_gmem_2d[(expert_idx, n_offset, None)].iterator.llvm_ptr
-                    atomic_add_bf16x2(gmem_ptr, cta_sum_a, cta_sum_b)
+                    atomic_add_bf16x2(dbias_gmem_2d[(dbias_row_idx, n_offset, None)].iterator.llvm_ptr, cta_sum_a, cta_sum_b)
         else:
             if lane_idx < 16 and n_offset < dbias_n_total:
-                gmem_ptr = dbias_gmem_2d[(expert_idx, n_offset, None)].iterator.llvm_ptr
-                atomic_add_bf16x2(gmem_ptr, sum_a, sum_b)
+                atomic_add_bf16x2(dbias_gmem_2d[(dbias_row_idx, n_offset, None)].iterator.llvm_ptr, sum_a, sum_b)
 
     @cute.jit
     def quant_sfd_row(self, tile_idx, tiled_copy_r2s, src, pvscale, norm_const, rcp_limit, tRSrD):
@@ -1332,7 +1364,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         padded_offsets: cute.Tensor,
         alpha: cute.Tensor,
         prob: cute.Tensor,
-        dprob: Optional[cute.Tensor],  # dL/d(prob) output, shape (M,1,1), Float32
+        dprob: Optional[cute.Tensor],  # dL/d(prob) output, shape (M,1,1) -- (M,grid_n,1) if deterministic, Float32
         mDbias_tensor: Optional[cute.Tensor],  # dL/d(bias) output, shape (L,N), BF16
         workspace_ptr,
         cluster_layout_vmnk: cute.Layout,
@@ -2102,6 +2134,19 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                 real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
                 mProb = real_prob[mPosition, 0, 0]
 
+                if cutlass.const_expr(self.epilogue_type == EpilogueType.DSRELU.value and self.tanh_clamp_scale is not None):
+                    # Soft-clamp constants, once per tile. The clamped epilogue below is written in
+                    # t = tanh(relu(C)/s) alone, so s enters the per-element math only through these:
+                    #   d_srelu = t^2 * s^2 * w         = t^2 * clamp_k_srelu
+                    #   dprob  += t^2 * s^2 * g         = (t^2 g) * clamp_s2
+                    #   dgrad   = g * (t - t^3) * (2sw) = g * (t - t^3) * clamp_k_dgrad
+                    # clamp_k_srelu must be the same expression as prob_scale in the forward kernel
+                    # (regen must reproduce the forward bit for bit when C is stored in fp32).
+                    clamp_s_rcp = cutlass.Float32(1.0 / self.tanh_clamp_scale)
+                    clamp_s2 = cutlass.Float32(self.tanh_clamp_scale * self.tanh_clamp_scale)
+                    clamp_k_srelu = cutlass.Float32(mProb) * clamp_s2
+                    clamp_k_dgrad = cutlass.Float32(mProb) * cutlass.Float32(2.0 * self.tanh_clamp_scale)
+
                 # Accumulator for dprob: summed over N subtiles, written once per tile
                 dProbVal = cutlass.Float32(0.0)
 
@@ -2118,11 +2163,27 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
 
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
+                # Deterministic dprob, level 1: park each subtile's partial in its own slot and
+                # sum canonically after the loop, instead of a running sum over a traversal
+                # order that flips with the pipeline phase.
+                #
+                # Only needed when overlapping_accum is on, because that is the only thing that
+                # reverses the loop; otherwise real_subtile_idx == subtile_idx and the running
+                # sum already runs 0..subtile_cnt-1. Skipping the array there keeps the
+                # dynamically-indexed local-memory allocation out of those configurations.
+                if cutlass.const_expr(self.dprob_slot_parking and dprob is not None):
+                    dProbParts = cute.make_rmem_tensor(cute.make_layout((subtile_cnt,)), cutlass.Float32)
+                    for part_idx in cutlass.range_constexpr(subtile_cnt):
+                        dProbParts[part_idx] = cutlass.Float32(0.0)
+
                 for subtile_idx in cutlass.range(0, subtile_cnt, 1, unroll=1):
                     real_subtile_idx = subtile_idx
                     if cutlass.const_expr(self.overlapping_accum):
                         if reverse_subtile:
                             real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - subtile_idx
+
+                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
+                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                     if cutlass.const_expr(self.overlapping_accum):
                         if subtile_idx == self.iter_acc_early_release_in_epilogue:
@@ -2130,9 +2191,6 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                             with cute.arch.elect_one():
                                 acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
-
-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                     # Apply alpha scaling
                     if cutlass.const_expr(self.vectorized_f32):
@@ -2171,66 +2229,149 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                         # Here acc_vec is the upstream gradient from the following GEMM,
                         # and c_vec is the saved forward SReLU input.
                         c_forward = c_vec.load()
-                        c_relu = cute.where(c_forward > 0, c_forward, cute.full_like(c_forward, 0))
-                        tRelu = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
-                        tRelu.store(c_relu)
-                        if cutlass.const_expr(self.use_dsrelu_reuse):
-                            tRelu2 = self.compute_relu2(tTR_rAcc, tRelu)
+                        if cutlass.const_expr(self.tanh_clamp_scale is not None):
+                            # t = tanh(relu(C)/s)
+                            # d_srelu = t^2 * s^2 * w         = t^2 * clamp_k_srelu
+                            # dprob  += t^2 * s^2 * g         = (t^2 g) * clamp_s2
+                            # dgrad   = g * (t - t^3) * (2sw) = g * (t - t^3) * clamp_k_dgrad
+                            # relu and the t <= 1 cap are one saturating multiply inside
+                            # tanh_clamp_unit (see moe_kernel_helpers)
+                            tCompute.store(c_forward)
+                            if cutlass.const_expr(self.generate_d_srelu):
+                                tComputeSrelu = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
                             if cutlass.const_expr(dprob is not None):
-                                dProbVal = dProbVal + self.compute_dprob_from_relu2(
-                                    tTR_rAcc,
-                                    acc_vec,
-                                    tRelu2,
-                                )
-                            if cutlass.const_expr(self.generate_d_srelu):
-                                tComputeSrelu = self.scale_srelu_from_relu2(
-                                    tTR_rAcc,
-                                    tRelu2,
-                                    mProb,
-                                )
-                        else:
-                            if cutlass.const_expr(self.generate_d_srelu):
-                                tComputeSrelu = self.compute_srelu(tRelu, mProb)
-                        probx2 = 2 * mProb
-                        if cutlass.const_expr(self.vectorized_f32):
-                            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-                                tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
-                                    (tRelu[i], tRelu[i + 1]),
-                                    (acc_vec[i], acc_vec[i + 1]),
-                                    rnd="rn",
-                                    ftz=False,
-                                )
-                                tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
-                                    (tCompute[i], tCompute[i + 1]),
-                                    (cutlass.Float32(probx2), cutlass.Float32(probx2)),
-                                    rnd="rn",
-                                    ftz=False,
-                                )
-                        else:
-                            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                                tCompute[i] = tRelu[i] * acc_vec[i] * cutlass.Float32(probx2)
-
-                        # Accumulate dprob: dprob[m] += sum_n(relu(C)^2 * upstream_grad)
-                        if cutlass.const_expr(dprob is not None and not self.use_dsrelu_reuse):
-                            tDprob = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
+                                dprob_acc = cutlass.Float32(0.0)
                             if cutlass.const_expr(self.vectorized_f32):
                                 for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-                                    tDprob[i], tDprob[i + 1] = cute.arch.mul_packed_f32x2(
-                                        (tRelu[i], tRelu[i + 1]),
-                                        (tRelu[i], tRelu[i + 1]),
+                                    u0, u1 = cute.arch.mul_packed_f32x2(
+                                        (tCompute[i], tCompute[i + 1]),
+                                        (clamp_s_rcp, clamp_s_rcp),
                                         rnd="rn",
                                         ftz=False,
                                     )
-                                    tDprob[i], tDprob[i + 1] = cute.arch.mul_packed_f32x2(
-                                        (tDprob[i], tDprob[i + 1]),
+                                    t0 = tanh_clamp_unit(u0)
+                                    t1 = tanh_clamp_unit(u1)
+                                    t2_0, t2_1 = cute.arch.mul_packed_f32x2(
+                                        (t0, t1),
+                                        (t0, t1),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
+                                    if cutlass.const_expr(dprob is not None):
+                                        p0, p1 = cute.arch.mul_packed_f32x2(
+                                            (t2_0, t2_1),
+                                            (acc_vec[i], acc_vec[i + 1]),
+                                            rnd="rn",
+                                            ftz=False,
+                                        )
+                                        dprob_acc += p0 + p1
+                                    if cutlass.const_expr(self.generate_d_srelu):
+                                        tComputeSrelu[i], tComputeSrelu[i + 1] = cute.arch.mul_packed_f32x2(
+                                            (t2_0, t2_1),
+                                            (clamp_k_srelu, clamp_k_srelu),
+                                            rnd="rn",
+                                            ftz=False,
+                                        )
+                                    v0, v1 = cute.arch.fma_packed_f32x2(
+                                        (-t2_0, -t2_1),
+                                        (t0, t1),
+                                        (t0, t1),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
+                                    gk0, gk1 = cute.arch.mul_packed_f32x2(
                                         (acc_vec[i], acc_vec[i + 1]),
+                                        (clamp_k_dgrad, clamp_k_dgrad),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
+                                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                                        (gk0, gk1),
+                                        (v0, v1),
                                         rnd="rn",
                                         ftz=False,
                                     )
                             else:
                                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                                    tDprob[i] = tRelu[i] * tRelu[i] * acc_vec[i]
-                            dProbVal = dProbVal + tDprob.load().reduce(cute.ReductionOp.ADD, cutlass.Float32(0.0), 0)
+                                    t = tanh_clamp_unit(tCompute[i] * clamp_s_rcp)
+                                    t2 = t * t
+                                    if cutlass.const_expr(dprob is not None):
+                                        dprob_acc += t2 * acc_vec[i]
+                                    if cutlass.const_expr(self.generate_d_srelu):
+                                        tComputeSrelu[i] = t2 * clamp_k_srelu
+                                    tCompute[i] = acc_vec[i] * clamp_k_dgrad * (t - t2 * t)
+                            if cutlass.const_expr(dprob is not None):
+                                dprob_partial = dprob_acc * clamp_s2
+                        else:
+                            c_relu = cute.where(c_forward > 0, c_forward, cute.full_like(c_forward, 0))
+                            tRelu = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
+                            tRelu.store(c_relu)
+
+                            if cutlass.const_expr(self.use_dsrelu_reuse):
+                                tRelu2 = self.compute_relu2(tTR_rAcc, tRelu)
+                                if cutlass.const_expr(dprob is not None):
+                                    dprob_partial = self.compute_dprob_from_relu2(
+                                        tTR_rAcc,
+                                        acc_vec,
+                                        tRelu2,
+                                    )
+                                if cutlass.const_expr(self.generate_d_srelu):
+                                    tComputeSrelu = self.scale_srelu_from_relu2(
+                                        tTR_rAcc,
+                                        tRelu2,
+                                        mProb,
+                                    )
+                            else:
+                                if cutlass.const_expr(self.generate_d_srelu):
+                                    tComputeSrelu = self.compute_srelu(tRelu, mProb)
+                            probx2 = 2 * mProb
+                            if cutlass.const_expr(self.vectorized_f32):
+                                for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+                                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                                        (tRelu[i], tRelu[i + 1]),
+                                        (acc_vec[i], acc_vec[i + 1]),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
+                                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                                        (tCompute[i], tCompute[i + 1]),
+                                        (cutlass.Float32(probx2), cutlass.Float32(probx2)),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
+                            else:
+                                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                                    tCompute[i] = tRelu[i] * acc_vec[i] * cutlass.Float32(probx2)
+
+                            # Accumulate dprob: dprob[m] += sum_n(relu(C)^2 * upstream_grad)
+                            if cutlass.const_expr(dprob is not None and not self.use_dsrelu_reuse):
+                                tDprob = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
+                                if cutlass.const_expr(self.vectorized_f32):
+                                    for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+                                        tDprob[i], tDprob[i + 1] = cute.arch.mul_packed_f32x2(
+                                            (tRelu[i], tRelu[i + 1]),
+                                            (tRelu[i], tRelu[i + 1]),
+                                            rnd="rn",
+                                            ftz=False,
+                                        )
+                                        tDprob[i], tDprob[i + 1] = cute.arch.mul_packed_f32x2(
+                                            (tDprob[i], tDprob[i + 1]),
+                                            (acc_vec[i], acc_vec[i + 1]),
+                                            rnd="rn",
+                                            ftz=False,
+                                        )
+                                else:
+                                    for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                                        tDprob[i] = tRelu[i] * tRelu[i] * acc_vec[i]
+                                dprob_partial = tDprob.load().reduce(cute.ReductionOp.ADD, cutlass.Float32(0.0), 0)
+
+                        # Single home for both producers above -- their guards are mutually
+                        # exclusive on use_dsrelu_reuse, so exactly one has run.
+                        if cutlass.const_expr(dprob is not None):
+                            if cutlass.const_expr(self.dprob_slot_parking):
+                                dProbParts[real_subtile_idx] = dprob_partial
+                            else:
+                                dProbVal = dProbVal + dprob_partial
                     else:
                         # NONE epilogue: dA = acc * prob (identity, no SReLU gate)
                         if cutlass.const_expr(self.vectorized_f32):
@@ -2245,19 +2386,28 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                                 tCompute[i] = acc_vec[i] * mProb
 
-                    # dbias reduction: sum dA across M for each N, atomic-add to dbias[expert, n]
+                    # This tile's row in any M-block-indexed output. token_offset is the expert's
+                    # start and a multiple of cta_tile_m, so the division is exact.
+                    global_m_block = epi_work_tile_info.tile_m_idx + epi_ext.token_offset // self.cta_tile_shape_mnk[0]
+
+                    # dbias reduction: sum dA across M for each N, atomic-add to dbias[row, n]
                     if cutlass.const_expr(self.generate_dbias):
                         dA_vec = tCompute.load()
                         n_base = epi_work_tile_info.tile_n_idx * self.mma_tiler[1] + real_subtile_idx * self.epi_tile[1]
                         dbias_n_total = cute.size(mDbias_tensor, mode=[1])
+                        # Deterministic dbias is keyed by the absolute M-block instead of the
+                        # expert, so each (M-block, n) has one writer.
+                        dbias_row_idx = expert_idx
+                        if cutlass.const_expr(self.deterministic):
+                            dbias_row_idx = global_m_block
                         self.dbias_reduction(
                             dA_vec,
                             warp_idx,
                             sDbias,
                             mDbias_tensor,
-                            expert_idx,
                             n_base,
                             dbias_n_total,
+                            dbias_row_idx,
                         )
 
                     if cutlass.const_expr(self.generate_amax):
@@ -2294,12 +2444,11 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                                 d_rcp_limits,
                                 tRS_rD_srelu,
                             )
-                        global_sfd_m = epi_work_tile_info.tile_m_idx + epi_ext.token_offset // self.cta_tile_shape_mnk[0]
                         if cutlass.const_expr(self.mma_tiler[1] == 256):
                             sfd_n = epi_work_tile_info.tile_n_idx * 2 + (real_subtile_idx >> 2)
                         else:
                             sfd_n = epi_work_tile_info.tile_n_idx
-                        sfd_row_idx_mn = (global_sfd_m, sfd_n)
+                        sfd_row_idx_mn = (global_m_block, sfd_n)
                         sfd_col_idx_mn = sfd_row_idx_mn
                         if cutlass.const_expr(self.discrete_col_sfd):
                             sfd_col_idx_mn = (
@@ -2356,8 +2505,21 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                 if cutlass.const_expr(self.epilogue_type == EpilogueType.DSRELU.value):
                     if cutlass.const_expr(dprob is not None):
                         real_dprob, _ = epi_ext.get_gmem_tensor("dprob", dprob, padded_offsets, epi_work_tile_info)
+                        if cutlass.const_expr(self.dprob_slot_parking):
+                            # Canonical fixed-order sum over the per-subtile slots.
+                            dProbVal = cutlass.Float32(0.0)
+                            for part_idx in cutlass.range_constexpr(subtile_cnt):
+                                dProbVal = dProbVal + dProbParts[part_idx]
+                        if cutlass.const_expr(self.deterministic):
+                            # Level 2: this tile owns the (token, tile_n) slot outright -- one CTA
+                            # per (tile_m, tile_n), one thread per token within it -- so no other
+                            # N-tile's partial lands here. The add is therefore uncontended; the
+                            # atomic is redundant but kept so both modes share one store path.
+                            dprob_slot = real_dprob[(mPosition, epi_work_tile_info.tile_n_idx, None)]
+                        else:
+                            dprob_slot = real_dprob[(mPosition, None, None)]
                         _ = atomic_add_float32(
-                            ptr=real_dprob[(mPosition, None, None)].iterator.llvm_ptr,
+                            ptr=dprob_slot.iterator.llvm_ptr,
                             value=dProbVal,
                         )
 
@@ -2377,6 +2539,8 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
             d_pipeline.producer_tail()
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     # ------------------------------------------------------------------
     # Internal: create extension based on weight_mode

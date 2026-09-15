@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 import weakref
-from typing import Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -64,6 +64,7 @@ class GroupedGemmWgradBf16API(APIBase):
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
     ) -> None:
@@ -106,6 +107,7 @@ class GroupedGemmWgradBf16API(APIBase):
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1)))
         self.accumulate_on_output = accumulate_on_output
         self.sf_vec_size = sf_vec_size
+        self.sf_fp8_dtype_override = sf_fp8_dtype_override
         self._scale_controls = (
             sample_sfa,
             sample_sfb,
@@ -264,6 +266,8 @@ class GroupedGemmWgradBf16API(APIBase):
             raise ValueError("BF16 wgrad forbids scale and global-scale tensors")
         if self.sf_vec_size != 16:
             raise ValueError(f"BF16 wgrad requires sf_vec_size=16, got {self.sf_vec_size}")
+        if self.sf_fp8_dtype_override is not None:
+            raise ValueError(f"BF16 wgrad forbids sf_fp8_dtype_override, got {self.sf_fp8_dtype_override!r}")
         if self.offsets_desc.shape != (self.expert_cnt,):
             raise ValueError(f"sample_offsets must have shape {(self.expert_cnt,)}, got {self.offsets_desc.shape}")
         if self.offsets_desc.stride != (1,):

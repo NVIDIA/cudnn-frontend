@@ -18,11 +18,11 @@ The framework-side autograd wiring stays in the caller (e.g. a ``torch.autograd.
 that calls the forward wrapper in ``forward()`` and the backward wrapper in
 ``backward()``); these APIs are pure kernels-plus-validation.
 
-Validated envelope (``check_support``): compute capability 10.0, BF16 ``kv``/``score``/
+Validated envelope (``check_support``): compute capability major >= 10 (SM100+), BF16 ``kv``/``score``/
 ``out``, FP32 ``ape``, int32 ``cu_seqlens``/``cu_seqlens_comp``, int32 flat offsets
 (``total_tokens * coff * head_dim < 2**31``), and per ratio:
 
-- ``ratio == 4``, ``coff in {1, 2}`` (``coff == 2`` is the production CSA/HCA
+- ``ratio in {2, 4}``, ``coff in {1, 2}`` (``coff == 2`` is the production CSA/HCA
   configuration, ``coff == 1`` the own-block window form) — served by the generic
   kernels in ``compressor_sm100.py`` (whole window in registers; optimal at small
   ratios, register-bound beyond ``ratio = 32``);
@@ -35,7 +35,7 @@ Validated envelope (``check_support``): compute capability 10.0, BF16 ``kv``/``s
 Numerics contract (see the kernel modules and docs/fe-oss-apis/csa.md for details):
 fp32 arithmetic with one final bf16 rounding, ``mul.rn``/``fma.rn`` pinned in PTX.
 Forward, ``dKV`` and ``dScore`` are bitwise run-to-run deterministic in BOTH families.
-At ``ratio == 4`` dKV/dScore are additionally bit-identical to the fp32-intermediate
+At ``ratio in {2, 4}`` dKV/dScore are additionally bit-identical to the fp32-intermediate
 eager autograd; at ``ratio == 128`` the contract is faithfulness to that
 fp32-intermediate eager reference: out/dKV/dScore match it within final-bf16 rounding
 at the gate tolerances (differing elements <= max(1, 0.1%), max_abs <= 1.6e-2,
@@ -66,8 +66,8 @@ from cudnn.api_base import APIBase, TupleDict
 
 from .compressor_sm100 import (
     CU_ALIGN_BYTES,
+    MINIMUM_COMPUTE_CAPABILITY_MAJOR,
     PTR_ALIGN_BYTES,
-    SUPPORTED_COMPUTE_CAPABILITY,
     precompile_bwd,
     precompile_fwd,
     run_bwd,
@@ -198,10 +198,10 @@ class _CSACompressorBase(APIBase):
         APIs; there is no soft fallback path inside this API.
         """
         self._logger.debug("Entering check_support")
-        if self.ratio == 4:
+        if self.ratio in (2, 4):
             self._value_error_if(
                 self.coff not in (1, 2),
-                f"CSA compressor at ratio=4 is validated for coff in {{1, 2}} (coff=2 is the production CSA/HCA form), got coff={self.coff}",
+                f"CSA compressor at ratio={self.ratio} is validated for coff in {{1, 2}} (coff=2 is the production CSA/HCA form), got coff={self.coff}",
             )
         elif self.ratio == 128:
             self._value_error_if(
@@ -211,7 +211,7 @@ class _CSACompressorBase(APIBase):
         else:
             self._value_error_if(
                 True,
-                f"CSA compressor is validated for ratio in {{4, 128}} only, got ratio={self.ratio}, coff={self.coff}",
+                f"CSA compressor is validated for ratio in {{2, 4, 128}} only, got ratio={self.ratio}, coff={self.coff}",
             )
         self._value_error_if(
             self.kv_desc.ndim != 2,
@@ -321,8 +321,9 @@ class _CSACompressorBase(APIBase):
 
         capability = torch.cuda.get_device_capability(target)
         self._runtime_error_if(
-            capability != SUPPORTED_COMPUTE_CAPABILITY,
-            f"CSA compressor requires compute capability {SUPPORTED_COMPUTE_CAPABILITY} (the only validated architecture so far), found SM{capability[0]}.{capability[1]} on {target}",
+            capability[0] < MINIMUM_COMPUTE_CAPABILITY_MAJOR,
+            f"CSA compressor requires compute capability major >= {MINIMUM_COMPUTE_CAPABILITY_MAJOR} "
+            f"(SM100+), found SM{capability[0]}.{capability[1]} on {target}",
         )
 
         self.total_tokens = total_tokens
@@ -598,11 +599,11 @@ def csa_compressor_forward_wrapper(
         cu_seqlens_comp: ``(B + 1,)`` int32 cumulative compressed-block counts,
             ``cu_seqlens_comp[b + 1] - cu_seqlens_comp[b] == seqlen_b // ratio``.
         ratio: compression ratio (tokens per output block); validated envelope:
-            {4, 128} (the wrappers route to the matching kernel family by ratio).
+            {2, 4, 128} (the wrappers route to the matching kernel family by ratio).
         head_dim: output feature dimension; inferred from ``kv`` width when omitted.
         coff: 1 for the own-block window form (window = ``ratio`` tokens, no overlap) or
             2 for the overlapping-window form (window = ``2 * ratio``); validated
-            envelope: {1, 2} at both ratios (ratio=128 additionally requires head_dim
+            envelope: {1, 2} at all ratios (ratio=128 additionally requires head_dim
             in {128, 512}).
         total_comp: output row count. Defaults to ``cu_seqlens_comp[-1]`` (synchronizes);
             pass it explicitly (e.g. a static CUDA-graph capacity, which must be

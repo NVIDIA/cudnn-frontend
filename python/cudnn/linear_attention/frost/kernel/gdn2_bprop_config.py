@@ -15,23 +15,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gated DeltaNet v2 (GDN-2) Cutlass DSL backward kernel config — STUB.
+"""Gated DeltaNet v2 (GDN-2) Cutlass DSL backward kernel config (fixed
+compile-time constants) for the BT=16 schedule with the channel-wise erase
+gate (beta) and the per-value write gate (w), 16 warps (512 threads); the
+derived SMEM/TMEM sizes and offsets are stamped by ``build_cfg`` in
+``gdn2_bprop_f16.py``.
 
-The FROST GDN-2 backward is not implemented yet (see ``gdn2_bprop_f16.py``);
-these constants mirror the prefill config's tile shape for when the backward
-kernel lands.
-
-Target arch: Blackwell SM100 (GB200) / SM103 (GB300).
+Target arch: Blackwell SM100 / SM103.
 """
 
 from dataclasses import dataclass
+from typing import Tuple
 
 
 @dataclass(frozen=True)
 class Cfg:
+    # --- tile shape ---
     B_T: int = 16
-    D_K: int = 128
-    D_V: int = 128
+
+    # --- warp assignments (16 warps = 512 threads) ---
+    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)
+    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)
+    COMPUTE_GROUP_2_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)
+    SUPER_MMA_WARP_ID: int = 12
+    TCGEN05_MMA_WARP_ID: int = 13
+    TMA_WARP_ID: int = 14
+    EPILOGUE_WARP_ID: int = 15
+
+    # --- register split ---
+    NUM_REGS_COMPUTE_GROUP_0: int = 128
+    NUM_REGS_COMPUTE_GROUP_1: int = 184
+    NUM_REGS_COMPUTE_GROUP_2: int = 144
+    NUM_REGS_OTHER: int = 56
+
+    THREADS_PER_WARP: int = 32
+
+    BUFFER_ALIGN_BYTES: int = 1024
+
+    # --- SMEM / TMEM ring stage counts ---
+    SMEM_RAW_STAGES: int = 2
+    SMEM_STATE_STAGES: int = 1
+    SMEM_DECAY_STAGES: int = 2
+    SMEM_INTERMEDIATE_STAGES: int = 2
+    SMEM_DA_DIAG_STAGES: int = 4
+    SMEM_DQ_STAGES: int = 1
+    SMEM_DK_STAGES: int = 1
+    SMEM_DGATE_STAGES: int = 1
+    SMEM_DB_STAGES: int = 1
+    SMEM_DV_STAGES: int = 2
+    SMEM_DWO_STAGES: int = 2
+
+    CLUSTER_SHAPE_MNK: Tuple[int, int, int] = (1, 1, 1)
 
 
 CFG = Cfg()

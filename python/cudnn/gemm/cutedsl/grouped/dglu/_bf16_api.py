@@ -27,6 +27,8 @@ from cudnn.tensor_adapter import (
     get_compute_capability,
     get_data_ptr,
     get_device,
+    get_shape,
+    get_strides,
     get_version,
     is_torch_tensor,
     to_host_list,
@@ -82,6 +84,9 @@ class GroupedGemmDgluBf16API(APIBase):
         else:
             raise ValueError("Provide sample_b for dense mode or (num_experts, b_shape, b_dtype) " "for discrete mode, but not both")
 
+        # A canonical TensorDesc is rebuilt and re-checked for every operand on every
+        # launch, which is the largest single cost in execute(). See _validate_live_tensor.
+        self._live_desc_cache: dict = {}
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", canonical=True)
         self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", canonical=True)
         self.c_desc = self._make_tensor_desc(sample_c, name="sample_c", canonical=True)
@@ -494,6 +499,14 @@ class GroupedGemmDgluBf16API(APIBase):
         self._compiled_kernel = tensor_api
 
     def _validate_live_tensor(self, tensor: torch.Tensor, sample: TensorDesc, name: str, *, dynamic_m: bool = False) -> TensorDesc:
+        # The outcome of this check is decided entirely by (shape, stride, dtype, device),
+        # so memoize on exactly that. An operand differing in any of them takes a different
+        # key, misses, and is checked in full; nothing is skipped on the strength of a
+        # tensor's identity. Data-pointer alignment is checked by the caller, not here.
+        key = (name, dynamic_m, get_shape(tensor), get_strides(tensor), tensor.dtype, get_device(tensor))
+        hit = self._live_desc_cache.get(key)
+        if hit is not None:
+            return hit
         desc = self._make_tensor_desc(tensor, name=name, canonical=True)
         if desc.dtype != sample.dtype:
             raise ValueError(f"{name} dtype mismatch: expected {sample.dtype}, got {desc.dtype}")
@@ -506,6 +519,7 @@ class GroupedGemmDgluBf16API(APIBase):
                 raise ValueError(f"{name} layout mismatch: expected stride order {sample.stride_order}, got {desc.stride_order}")
         elif desc.shape != sample.shape or desc.stride != sample.stride:
             raise ValueError(f"{name} descriptor mismatch: expected shape/stride {sample.shape}/{sample.stride}, " f"got {desc.shape}/{desc.stride}")
+        self._live_desc_cache[key] = desc
         return desc
 
     def execute(

@@ -9,6 +9,9 @@ from typing import Iterator, Optional
 
 from cuda.bindings import driver as cuda
 
+from cudnn.api_base import ceil_div
+from cudnn.tensor_adapter import get_device, get_shape, get_strides
+
 
 class GroupedGemmBackend(str, Enum):
     BF16 = "bf16"
@@ -38,6 +41,31 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
         launch_stream = torch.cuda.ExternalStream(handle, device=device)
     with torch.cuda.stream(launch_stream):
         yield
+
+
+def wrapper_operand_meta(tensor):
+    """Everything a wrapper's derivation reads off an operand, and nothing else.
+
+    Deliberately not the object's identity: CPython recycles a freed tensor's address,
+    so an id-keyed memo answers for tensors it never saw. Data pointers are excluded --
+    they vary per call and nothing derived depends on them; execute() re-checks them.
+    """
+    if tensor is None or not hasattr(tensor, "shape"):
+        return tensor
+    device = get_device(tensor)
+    return (get_shape(tensor), get_strides(tensor), tensor.dtype, device.type, device.index)
+
+
+def block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device):
+    """MMA-interleaved (sfd_row, sfd_col) output scale-factor buffers for a (valid_m, n_out) result."""
+    import torch
+
+    mma_permute_order = (3, 4, 1, 5, 2, 0)
+    mma_shape_row = (1, ceil_div(valid_m, 128), ceil_div(ceil_div(n_out, sf_vec_size), 4), 32, 4, 4)
+    mma_shape_col = (1, ceil_div(n_out, 128), ceil_div(ceil_div(valid_m, sf_vec_size), 4), 32, 4, 4)
+    sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=device).permute(mma_permute_order)
+    sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=device).permute(mma_permute_order)
+    return sfd_row_tensor, sfd_col_tensor
 
 
 def select_grouped_gemm_backend(
@@ -79,14 +107,8 @@ def backend_cache_key(backend, *components):
 def rubin_single_group_offsets_kwarg(is_rubin_kernel, use_single_group_runtime_offsets):
     """Return the ``use_single_group_runtime_offsets`` kwarg for a kernel constructor.
 
-    The Rubin (sm107) grouped GEMM kernels predate ``use_single_group_runtime_offsets``
-    and do not accept it, so forwarding it unconditionally is a ``TypeError`` even when
-    it is ``False``. Send it only to kernels that implement it, and reject an explicit
-    request on Rubin rather than silently ignoring it and running a different schedule
-    than the caller asked for.
+    All grouped GEMM kernels accepting this helper implement
+    ``use_single_group_runtime_offsets``. Keep the helper so the call sites share a
+    single constructor-argument policy.
     """
-    if not is_rubin_kernel:
-        return {"use_single_group_runtime_offsets": use_single_group_runtime_offsets}
-    if use_single_group_runtime_offsets:
-        raise NotImplementedError("The Rubin grouped GEMM kernels do not support use_single_group_runtime_offsets")
-    return {}
+    return {"use_single_group_runtime_offsets": use_single_group_runtime_offsets}

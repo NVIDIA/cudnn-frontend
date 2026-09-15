@@ -492,7 +492,10 @@ def _sparse_attn_score_recompute(
                 topk_length_cute,
                 cutlass.Float32(softmax_scale),
                 current_stream,
-                options=compile_options(),
+                # O2 avoids the n128 attention kernel's register-spill
+                # regression in CuTeDSL 4.6.2. Keep the default optimization
+                # for n64 configurations, which can regress at O2.
+                options=compile_options("--opt-level 2" if n_block_size == 128 else ""),
             )
 
         with torch.cuda.nvtx.range("sparse_attn_score_recompute"):

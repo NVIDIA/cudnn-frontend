@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
+
 import torch
 import pytest
 from test_low_precision_matmul import (
@@ -115,6 +117,78 @@ def create_sf_layout_tensor(l, mn, nk, sf_vec_size):
     cute_f32_torch_tensor_cpu = torch.zeros(mma_shape, dtype=torch.float32).permute(mma_permute_order)
 
     return cute_f32_torch_tensor_cpu, sf_k
+
+
+_UE5M3_BIAS = 15
+_UE5M3_NAN_BYTE = 0xFF
+
+
+def ue5m3_decode_byte(byte: int) -> float:
+    """Decode a single UE5M3 byte to float."""
+    if byte == _UE5M3_NAN_BYTE:
+        return float("nan")
+    exp = (byte >> 3) & 0x1F
+    mant = byte & 0x07
+    if exp == 0:
+        return (2.0 ** (1 - _UE5M3_BIAS)) * (mant / 8.0)
+    return (2.0 ** (exp - _UE5M3_BIAS)) * (1.0 + mant / 8.0)
+
+
+@functools.lru_cache(maxsize=None)
+def _ue5m3_lut(device) -> torch.Tensor:
+    """All finite UE5M3 values, indexed by byte (0x00..0xFE).
+
+    Memoized per device: building it is a 255-iteration Python loop plus a
+    host-to-device copy, which otherwise dominates the encode for tensors of
+    scale-factor size. Callers share one tensor, so treat it as read-only --
+    never mutate it or apply an in-place op to it.
+    """
+    return torch.tensor(
+        [ue5m3_decode_byte(b) for b in range(_UE5M3_NAN_BYTE)],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def f32_to_ue5m3_bytes(values: torch.Tensor) -> torch.Tensor:
+    """Round-to-nearest-even encode a float tensor to UE5M3, returned as uint8."""
+    lut = _ue5m3_lut(values.device)
+    flat = values.detach().to(torch.float32).reshape(-1)
+
+    is_nan = flat.isnan()
+    max_finite = lut[-1]
+    # UE5M3 can't express negative values or values larger than its maximum representable value (the last one from the LUT).
+    # NaN compares False against both bounds, so it passes through here and picks up the NaN byte at the end.
+    out_of_range = (flat < 0) | (flat > max_finite)
+    if out_of_range.any():
+        offenders = flat[out_of_range]
+        raise ValueError(f"{offenders.numel()} value(s) outside the finite UE5M3 range [0, {max_finite.item()}], e.g. {offenders[0].item()}")
+
+    # Find the next larger and next smaller LUT entries for each value. For NAN it returns len(lut) which is clamped
+    hi = torch.searchsorted(lut, flat).clamp(max=lut.numel() - 1)
+    lo = (hi - 1).clamp(min=0)
+    # Round to nearest
+    d_lo = flat - lut[lo]
+    d_hi = lut[hi] - flat
+    idx = torch.where(d_hi < d_lo, hi, lo)
+    # lo and hi are adjacent, so exactly one of them is even; ties take that one.
+    idx = torch.where(d_lo == d_hi, torch.where(lo % 2 == 0, lo, hi), idx)
+
+    return idx.to(torch.uint8).masked_fill(is_nan, _UE5M3_NAN_BYTE).reshape(values.shape)
+
+
+def ue5m3_bytes_to_fp32(encoded: torch.Tensor) -> torch.Tensor:
+    """Decode a UE5M3 byte tensor to float."""
+    lut = _ue5m3_lut(encoded.device)
+    return lut[encoded.view(torch.uint8).to(torch.int)]
+
+
+def reencode_sf_tensor_as_ue5m3(sf_tensor: torch.Tensor) -> torch.Tensor:
+    """Rewrite an e4m3-valued scale-factor tensor's bytes as UE5M3, in place."""
+    assert sf_tensor.dtype == torch.float8_e4m3fn, f"expected e4m3 storage, got {sf_tensor.dtype}"
+    encoded = f32_to_ue5m3_bytes(sf_tensor.to(torch.float32))
+    sf_tensor.view(torch.uint8).copy_(encoded)
+    return sf_tensor
 
 
 # Create scale factor tensor SFA/SFB

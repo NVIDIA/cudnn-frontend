@@ -27,6 +27,7 @@ from cudnn.tensor_adapter import (
     get_data_ptr,
     get_device,
     get_shape,
+    get_strides,
     get_version,
     is_torch_tensor,
     to_host_list,
@@ -121,6 +122,10 @@ class GroupedGemmBf16API(APIBase):
         else:
             raise ValueError("Provide sample_b for dense mode or (num_experts, b_shape, b_dtype) " "for discrete mode, but not both")
 
+        # A canonical TensorDesc is rebuilt and re-checked for every operand on every
+        # launch, which is the largest single cost in execute(). See _validate_live_tensor.
+        self._live_desc_cache: dict = {}
+        self._launch_stream_cache: dict = {}
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", canonical=True)
         self.c_desc = self._make_tensor_desc(sample_c, name="sample_c", canonical=True)
         self.d_desc = self._make_tensor_desc(sample_d, name="sample_d", canonical=True)
@@ -253,15 +258,23 @@ class GroupedGemmBf16API(APIBase):
             return
         import torch
 
-        handle = int(current_stream)
-        torch_current = torch.cuda.current_stream(b_ptrs.device)
-        torch_default = torch.cuda.default_stream(b_ptrs.device)
-        if handle == torch_current.cuda_stream:
-            launch_stream = torch_current
-        elif handle == torch_default.cuda_stream:
-            launch_stream = torch_default
-        else:
-            launch_stream = torch.cuda.ExternalStream(handle, device=b_ptrs.device)
+        # record_stream only ever reads launch_stream.cuda_stream, which equals the handle
+        # we keyed on, so any Stream object wrapping that handle behaves identically here
+        # -- that is what makes caching by (device, handle) safe even though which branch
+        # produced it can change. Without it every launch pays two torch stream queries.
+        key = (b_ptrs.device, int(current_stream))
+        launch_stream = self._launch_stream_cache.get(key)
+        if launch_stream is None:
+            handle = int(current_stream)
+            torch_current = torch.cuda.current_stream(b_ptrs.device)
+            torch_default = torch.cuda.default_stream(b_ptrs.device)
+            if handle == torch_current.cuda_stream:
+                launch_stream = torch_current
+            elif handle == torch_default.cuda_stream:
+                launch_stream = torch_default
+            else:
+                launch_stream = torch.cuda.ExternalStream(handle, device=b_ptrs.device)
+            self._launch_stream_cache[key] = launch_stream
         b_ptrs.record_stream(launch_stream)
 
     def check_support(self) -> bool:
@@ -533,6 +546,14 @@ class GroupedGemmBf16API(APIBase):
         *,
         dynamic_m: bool = False,
     ) -> TensorDesc:
+        # The outcome of this check is decided entirely by (shape, stride, dtype, device),
+        # so memoize on exactly that. An operand differing in any of them takes a different
+        # key, misses, and is checked in full; nothing is skipped on the strength of a
+        # tensor's identity. Data-pointer alignment is checked by the caller, not here.
+        key = (name, dynamic_m, get_shape(tensor), get_strides(tensor), tensor.dtype, get_device(tensor))
+        hit = self._live_desc_cache.get(key)
+        if hit is not None:
+            return hit
         desc = self._make_tensor_desc(tensor, name=name, canonical=True)
         if desc.dtype != sample.dtype:
             raise ValueError(f"{name} dtype mismatch: expected {sample.dtype}, got {desc.dtype}")
@@ -545,6 +566,7 @@ class GroupedGemmBf16API(APIBase):
                 raise ValueError(f"{name} layout mismatch: expected stride order {sample.stride_order}, " f"got {desc.stride_order}")
         elif desc.shape != sample.shape or desc.stride != sample.stride:
             raise ValueError(f"{name} descriptor mismatch: expected shape/stride " f"{sample.shape}/{sample.stride}, got {desc.shape}/{desc.stride}")
+        self._live_desc_cache[key] = desc
         return desc
 
     def execute(
