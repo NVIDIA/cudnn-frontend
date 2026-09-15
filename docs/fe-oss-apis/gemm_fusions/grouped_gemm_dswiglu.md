@@ -382,12 +382,37 @@ kernel-facing forms above keep working unchanged:
 Flat SF buffers must already contain the packed MMA-tiled scale bytes in physical
 order. Ordinary row-major logical scales need packing before this API is called.
 
-These layouts prepare the contiguous MXFP8 path for a separate JAX bridge; these
-eager entry points still require torch tensors. Unified GLU/dGLU APIs are separate.
+These layouts are also used by the JAX entry point below. The eager wrapper
+still requires torch tensors. Unified GLU/dGLU APIs are separate.
 
 When `A` is canonical (2-D), the wrapper returns natural-shaped outputs:
 `d_row`/`d_col (valid_m, 2N)` row-major, `dprob (valid_m,)`, and
 `sfd_row`/`sfd_col` as C-contiguous physical `(1, ceil(mn/128), rest, 32, 4, 4)` buffers.
+
+### JAX entry point
+
+`cudnn.grouped_gemm_dswiglu_jax_sm100` runs the contiguous-weight MXFP8 fusion
+through `cudnn.jax.call`, eagerly or under `jax.jit`. All operands are ordinary
+JAX arrays managed by XLA. The eager torch wrapper remains a separate entry point.
+
+Use canonical `A (m,k)`, `B (experts,n,k)`, and `prob (m,)` (fp32 or bf16).
+Scale factors are E8M0 arrays, or uint8 bit patterns, containing the packed
+MMA-tiled physical bytes; physical 6-D and flat buffers are accepted. Pass explicit
+fp32 `alpha (experts,)`, `norm_const (1,)`, and int32 `padded_offsets (experts,)`.
+Offsets must be nondecreasing multiples of 256 in `[0,m]`; `m` must be a positive
+multiple of 256. These device values are the caller's responsibility.
+
+Backward also requires saved `C (m,2n)` and explicit fp32 `beta (experts,)`.
+It returns `d_row_tensor`, `d_col_tensor`, `dprob_tensor`, physical
+`sfd_row_tensor`/`sfd_col_tensor`, and `amax_tensor=None`.
+
+This initial bridge supports FP8 e4m3/e5m2 A/B and FP8 D, with E8M0 block
+scales of vector size 32. Packed FP4, BF16 D, bias, and discrete-column SF layout
+are outside its contract. Outputs are initialized to zero (raw zero bytes for SF)
+to define untouched padding; backward dprob also requires initialization for atomic
+accumulation. CUDA graph compatibility uses the standard CuTeDSL JAX bridge.
+This API supplies the fused backward operation explicitly; it does not register
+an automatic `jax.grad` rule. Full TE training integration is separate validation.
 
 ### Data Types
 

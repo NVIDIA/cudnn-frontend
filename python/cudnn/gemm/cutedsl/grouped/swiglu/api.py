@@ -21,7 +21,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from cudnn.api_base import TensorDesc, APIBase, TupleDict, ceil_div, is_power_of_2
 from cudnn.tensor_adapter import (
     cuda_is_available,
     default_stream,
@@ -45,7 +45,8 @@ from ..canonical import (
 _JAX_SF_LAYOUT_ERROR = (
     "the block scale-factor tensors (sfa/sfb and the sfd outputs) are MMA-tiled "
     "(32, 4, m//128, 4, rest_k, l) strided views that are not expressible as JAX arrays "
-    "(a row-major JAX array of that shape has different memory); pass torch tensors"
+    "(a row-major JAX array of that shape has different memory); pass torch tensors. "
+    "For canonical MXFP8 JAX arrays, use grouped_gemm_swiglu_jax_sm100"
 )
 
 
@@ -121,7 +122,7 @@ class GroupedGemmSwigluSm100(APIBase):
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Boolean, True to generate discrete col-major scale factor tensor. Only applies when already output scale factor tensors are provided.
         """
-        framework = detect_framework(sample_a)
+        framework = "torch" if isinstance(sample_a, TensorDesc) else detect_framework(sample_a)
         if framework == "jax":
             raise ValueError(f"GroupedGemmSwigluSm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
         if framework != "torch":
