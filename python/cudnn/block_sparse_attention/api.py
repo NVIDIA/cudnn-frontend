@@ -208,7 +208,7 @@ def block_sparse_attention_forward(
         if isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256:
             raise ValueError("SM90 kv_splits must be an integer in [1, 256]")
 
-    if arch_family in {9, 12} and sparse_block_size != 64:
+    if arch_family == 9 and sparse_block_size != 64:
         raise NotImplementedError(f"SM{arch} only provides a blk64 forward path")
     if arch_family == 9:
         if head_dim not in {64, 96, 128} or value_dim not in {64, 96, 128}:
@@ -294,6 +294,7 @@ def block_sparse_attention_forward(
                 block_sparse_num,
                 block_sizes,
                 q2k_block_nums=q2k_block_nums,
+                sparse_block_size=sparse_block_size,
                 allow_empty_block_nums=allow_empty_block_nums,
                 softmax_scale=softmax_scale,
                 pack_gqa=pack_gqa,
