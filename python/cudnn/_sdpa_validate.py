@@ -28,6 +28,21 @@ Error-type parity with the pybind ``throw_if`` mapping:
 it to skip a config); ``ATTRIBUTE_NOT_SET`` / ``INVALID_VALUE`` ->
 ``std::invalid_argument`` -> ``ValueError``.
 
+One composite is covered beyond the single-node graphs: the SDPA
+**epilogue-gate tail** ``sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)``
+(``cudnn._sdpa_tail.match_gate_tail``), which the Rubin d256 kernels fuse.  It
+is validated natively for a reason beyond version-coupling: the classic C++
+``pre_validate_node`` needs a rank-4 dim + stride on the sdpa node's O, and the
+lowering pushes op-output dim/stride only when USER-assigned, so an undeclared
+virtual O_v would surface as a bare ``ValueError`` out of planning
+(``create_execution_plans`` catches only the typed declines).  The native
+validator turns that into the typed not-supported with the fix in the message.
+Scope: the family's validator runs whenever a python SDPA engine is OFFERED
+(``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``), on EVERY arch with such an engine
+-- not only where a row serves the tail -- so the tail validates natively there
+and the backend's own verdict on it is deferred to planning, as for every
+python-validated graph.  With the engines disabled nothing changes (classic path).
+
 Import-light on purpose: only the IR types. Never import ``cudnn.sdpa`` (that
 pulls torch/cutlass) or the compiled binding at module scope.
 """
@@ -36,6 +51,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from ._sdpa_tail import GateTail, match_gate_tail
 from .graph_types import NodeType
 
 _FWD_TYPES = (NodeType.SDPA, NodeType.SDPA_FP8, NodeType.SDPA_MXFP8)
@@ -119,15 +135,57 @@ def _has(node, port: str) -> bool:
 
 def validate_graph(graph) -> bool:
     """The frost_sdpa families' native validator (engines.manifest.EngineFamily.validator):
-    validate every node when all of them are SDPA-family; return False without
-    raising when the graph holds a node this module does not cover, so the caller
-    falls back to the classic eager C++ lowering."""
+    validate every node when all of them are SDPA-family, or the whole graph when
+    it is exactly the epilogue-gate tail; return False without raising when the
+    graph holds any other node this module does not cover, so the caller falls
+    back to the classic eager C++ lowering."""
     nodes = list(graph._nodes)
-    if not nodes or any(n.node_type not in COVERED_NODE_TYPES for n in nodes):
+    if not nodes:
         return False
-    for node in nodes:
-        validate_node(node)
+    if all(n.node_type in COVERED_NODE_TYPES for n in nodes):
+        for node in nodes:
+            validate_node(node)
+        return True
+    tail = match_gate_tail(nodes)
+    if tail is None:
+        return False
+    _validate_gate_tail(tail)
     return True
+
+
+def _validate_gate_tail(tail: GateTail) -> None:
+    """The three-node ``sdpa -> sigmoid(G) -> mul`` graph, with classic error semantics.
+
+    The sdpa node is validated as usual (its own virtual O carries the inferred or
+    declared dim/stride).  Then the tail's own contract:
+
+    * G and the final O (the mul output) are rank-4 with a unit stride on the
+      head dim -- ``_check_dim_stride`` parity, as if they were sdpa ports;
+    * dims(G) == dims(O): the pointwise mul would broadcast a smaller G, the
+      fused epilogue does not (GRAPH_NOT_SUPPORTED parity: a legal graph the
+      python engines decline, and one the C++ frontend accepts unfused);
+    * the sdpa node's virtual O_v must carry USER-assigned dim AND stride
+      (``set_dim`` / ``set_stride``).  Required, not stylistic: the C++
+      ``pre_validate_node`` needs both on the sdpa node's O and the lowering
+      pushes op-output attributes only when user-assigned, so an undeclared
+      O_v would fail planning with ``ATTRIBUTE_NOT_SET`` -> a bare ValueError
+      that ``create_execution_plans`` does not treat as a decline.  FROST binds
+      the mul output as the kernel's O and never materialises O_v.
+    """
+    node = tail.sdpa
+    validate_node(node)
+    _check_dim_stride(node, "G", tail.gate)
+    _check_dim_stride(node, "O", tail.o_final)
+    if list(tail.gate.get_dim()) != list(tail.o_final.get_dim()):
+        raise _not_supported(
+            f"The gate G of the fused sdpa epilogue (O * sigmoid(G)) must have exactly O's shape (B, H_q, S_q, D_v); "
+            f"got G {list(tail.gate.get_dim())} vs O {list(tail.o_final.get_dim())}"
+        )
+    if not (getattr(tail.o_virtual, "dim_assigned", False) and getattr(tail.o_virtual, "stride_assigned", False)):
+        raise _not_supported(
+            "The sdpa node's virtual O feeding O * sigmoid(G) must declare dim AND stride (set_dim / set_stride): "
+            "the classic frontend requires them on the sdpa output and the fused lowering binds the mul output as O"
+        )
 
 
 def validate_node(node) -> None:

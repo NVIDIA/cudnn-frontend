@@ -644,8 +644,17 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
 
 def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     """Whether a packed set can be built at ``tile_m``: the row offers packing,
-    the batch is dense, there is a group to pack and the ratio divides the tile."""
-    return True in caps.pack_gqas and not facts.thd and facts.h_q != facts.h_kv and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m)
+    the batch is dense, the graph carries no fused epilogue gate (its per-head
+    gate tile cannot address a packed tile's interleaved rows -- mismatch()
+    declines the same pair), there is a group to pack and the ratio divides
+    the tile."""
+    return (
+        True in caps.pack_gqas
+        and not facts.thd
+        and not facts.has_epilogue_gate
+        and facts.h_q != facts.h_kv
+        and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m)
+    )
 
 
 def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] = None) -> Tuple[bool, ...]:
@@ -695,6 +704,11 @@ def _split_points(
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
     if facts.thd or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
+        return [no_split]
+    if facts.has_epilogue_gate:
+        # The fused O * sigmoid(G) epilogue lives in the unsplit kernel; the
+        # combine would write the un-gated O (mismatch declines the same pair,
+        # so this is hygiene: never PROPOSE a knob the row cannot honour).
         return [no_split]
     if caps.skv_tail_via_padding and facts.s_kv % (caps.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
         # This S_kv would be served through the synthesized KV-tail padding,

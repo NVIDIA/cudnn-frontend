@@ -778,10 +778,19 @@ def test_sm107_d256_stages_kv_defaults_when_the_attribute_is_absent():
 def test_thd_stats_padded_is_appended_to_the_public_signature():
     """The adapters' constructors are public and not keyword-only; an old
     positional call (..., thd, max_total_seq_len_q, max_total_seq_len_kv) must
-    keep binding the same way, so extensions must follow the legacy prefix."""
+    keep binding the same way, so every new parameter is APPENDED after the
+    legacy prefix, in the order it landed.
+
+    Tail history: ``thd_stats_padded`` closed the legacy prefix; #931 / #983
+    appended ``sample_amax_o``, ``pv_bf16`` and ``stats_log2``; the fused
+    epilogue gate then appended ``sample_gate`` and ``has_amax_o`` after those,
+    and the SM100 adapter's ``execute`` gained a trailing ``gate`` after
+    ``block_table_v``.  The pin moves with the tail: every addition must sit
+    after the prefix in landing order, so a positional caller of any earlier
+    signature still binds where it always did."""
     import inspect
 
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100
 
     params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
     legacy_tail = [
@@ -791,9 +800,16 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     ]
     assert params[params.index("paged_table_stride") : params.index("thd_stats_padded") + 1] == legacy_tail
     extension_start = params.index("sample_amax_o")
-    assert params[extension_start : extension_start + 3] == ["sample_amax_o", "pv_bf16", "stats_log2"]
+    assert extension_start == params.index("thd_stats_padded") + 1, params[extension_start - 1 : extension_start + 1]
+    assert params[extension_start:] == ["sample_amax_o", "pv_bf16", "stats_log2", "sample_gate", "has_amax_o"], params[extension_start:]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert params.index("thd") + 1 == params.index("max_total_seq_len_q")
+    # Both gate parameters default OFF, so every pre-gate call site is untouched.
+    sig = inspect.signature(SdpaFwdDsl.__init__).parameters
+    assert sig["sample_gate"].default is None and sig["has_amax_o"].default is True
+    exec_params = list(inspect.signature(SdpaFwdDslSm100.execute).parameters)
+    assert exec_params[-2:] == ["block_table_v", "gate"], exec_params[-3:]
+    assert inspect.signature(SdpaFwdDslSm100.execute).parameters["gate"].default is None
 
 
 # --- MXFP8 scheduler-policy claims (2026-09-14) -------------------------------
@@ -1028,3 +1044,825 @@ def test_sm107_stats_log2_specializes_every_dtype_and_flavor(flavor, kind, load_
     assert natural is not log2
     assert natural.CFG.STATS_LOG2 == 0
     assert log2.CFG.STATS_LOG2 == 1
+
+
+# ============================================================================
+# Fused epilogue gate -- O := O * sigmoid(G) (PR-A, 2026-09-15)
+#
+# The Rubin d256 f16/bf16 and per-tensor FP8 kernels carry the gate behind
+# ``TemplateParams.epilogue_gate`` (a module-cache key) / ``CFG.EPILOGUE_GATE``
+# (const_expr seams).  Four enforcement points share ONE constant,
+# ``config_sm107.SM107_EPILOGUE_GATE_SHAPES``: the two engine rows
+# (``epilogue_gate_d_shapes``), the standalone adapter's rule-8b twin in
+# ``SdpaFwdDslSm100.check_support``, the config validator
+# (``_EPILOGUE_GATE_FLAVORS``) and the gated-attention block's geometry pin.
+# The tests below walk them in that order -- rows, config/template, adapter --
+# and end with the Rubin e2e that is the evidence behind every claim.
+# ============================================================================
+
+_GATE_ROWS = ("sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm107_fp8")
+_D256 = (256, 256)
+_GATE_SEAMS = (
+    "cfg",
+    "kernel_params",
+    "smem",
+    "bars",
+    "init",
+    "dispatch_corr",
+    "dispatch_tmaldg",
+    "tmaldg_state",
+    "tmaldg_issue",
+    "corr_state",
+    "corr_prologue",
+    "corr_chunk",
+    "corr_release",
+    "host_desc",
+    "host_launch",
+    "compile",
+)
+# The fork-era module knobs the production kernels must NOT carry (engine
+# contract rule 5: no module-level knobs; the block drives the adapter).
+_RETIRED_GATE_KNOBS = ("GATE_SOURCE", "GATE_ISSUE", "GATE_MATH", "AMAX_O", "KEEP_SASS")
+# cta_mma=1 is what the adapter pins for FP8 d256 (supported_cgas_for((256, 256), fp8=True) == (1,)).
+_FP8_LOAD_KW = dict(fp8=True, pertensor=True, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
+
+
+def _gate_facts(**kw):
+    """f16 facts for a GATED (256, 256) graph; the gate dtype defaults to Q's."""
+    import cudnn
+
+    kw.setdefault("d_qk", 256)
+    kw.setdefault("d_v", 256)
+    kw.setdefault("has_epilogue_gate", True)
+    kw.setdefault("epilogue_gate_dtype", kw.get("dtype", cudnn.data_type.HALF))
+    return _f16_facts(**kw)
+
+
+def _fp8_gate_facts(**kw):
+    """Per-tensor FP8 facts for a GATED (256, 256) graph with a bf16 G."""
+    import cudnn
+
+    kw.setdefault("dtype", cudnn.data_type.FP8_E4M3)
+    kw.setdefault("dtype_o", cudnn.data_type.BFLOAT16)
+    kw.setdefault("epilogue_gate_dtype", cudnn.data_type.BFLOAT16)
+    return _gate_facts(is_fp8=True, **kw)
+
+
+def _fp8_ungated_kw(**kw):
+    """The UNGATED per-tensor FP8 (256, 256) facts kwargs -- the control next to ``_fp8_gate_facts``."""
+    import cudnn
+
+    base = dict(is_fp8=True, d_qk=256, d_v=256, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16)
+    base.update(kw)
+    return base
+
+
+def _gate_kernel_modules():
+    """(f16, fp8) d256 Rubin modules loaded with the gate ON."""
+    return _load(_D256, rubin=True, epilogue_gate=True), _load(_D256, rubin=True, epilogue_gate=True, **_FP8_LOAD_KW)
+
+
+# --- Rows / mismatch -----------------------------------------------------------
+
+
+def test_sm107_gate_rows_claim_exactly_d256():
+    """Both Rubin rows claim the gate at EXACTLY (256, 256) -- and nothing else
+    does.  The exact-dims rule is deliberate (plan S7 Q6): a d=200 graph rides the
+    (256, 256) envelope for plain attention, but the gate tile would multiply the
+    zero-padded columns too and nobody has validated a padded G, so the envelope
+    flavor is declined with the gate's own reason rather than silently served."""
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES
+
+    assert SM107_EPILOGUE_GATE_SHAPES == frozenset({_D256})
+    for row in _GATE_ROWS:
+        caps = _caps(row)
+        assert caps.epilogue_gate is True, row
+        assert caps.epilogue_gate_d_shapes == frozenset({_D256}), row
+        assert caps.epilogue_gate_d_shapes is SM107_EPILOGUE_GATE_SHAPES, f"{row}: the row must consume the shared constant, not a copy"
+    for spec in engines.ENGINE_SPECS:
+        if spec.name not in _GATE_ROWS:
+            assert spec.capabilities.epilogue_gate is False, spec.name
+            assert spec.capabilities.epilogue_gate_d_shapes is None, spec.name
+    # No new engine row: the gate is a FEATURE of the two existing Rubin rows.
+    assert len(engines.ENGINE_SPECS) == 9
+
+    f16, fp8 = _caps(_GATE_ROWS[0]), _caps(_GATE_ROWS[1])
+    assert engines.mismatch(f16, _gate_facts()) is None
+    assert engines.mismatch(fp8, _fp8_gate_facts()) is None
+    # Every other flavor -- and the d=200 envelope ride -- declines by the gate's reason.
+    for d_qk, d_v in ((128, 128), (192, 128), (512, 512), (200, 200)):
+        why = engines.mismatch(f16, _gate_facts(d_qk=d_qk, d_v=d_v))
+        assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
+    for d_qk, d_v in ((128, 128), (192, 128), (512, 512)):
+        why = engines.mismatch(fp8, _fp8_gate_facts(d_qk=d_qk, d_v=d_v))
+        assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
+    # An UNGATED graph is untouched by the new fields on every row.
+    assert engines.mismatch(f16, _f16_facts(d_qk=256, d_v=256)) is None
+    assert engines.mismatch(f16, _f16_facts(d_qk=128, d_v=128)) is None
+
+
+def test_sm107_gate_accepts_every_dtype_member():
+    """A frozenset field is one claim PER MEMBER (contract rule 9).  f16 row:
+    HALF and BFLOAT16, gate dtype == Q's.  FP8 row: every input dtype x every O
+    dtype the row lists, with the bf16 gate the kernel stages
+    (``GATE_STORAGE_DTYPE = cutlass.BFloat16``); a HALF gate on that row is an
+    asserted decline naming the axis."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+
+    f16 = _caps(_GATE_ROWS[0])
+    assert f16.epilogue_gate_dtypes is None, "None = G must equal Q's dtype"
+    for dt in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+        assert engines.mismatch(f16, _gate_facts(dtype=dt, dtype_o=dt, epilogue_gate_dtype=dt)) is None, dt
+    # ...and a gate of the OTHER half dtype declines, naming the gate dtype.
+    why = engines.mismatch(f16, _gate_facts(dtype=cudnn.data_type.HALF, dtype_o=cudnn.data_type.HALF, epilogue_gate_dtype=cudnn.data_type.BFLOAT16))
+    assert why is not None and "gate dtype" in why, why
+
+    fp8 = _caps(_GATE_ROWS[1])
+    assert fp8.epilogue_gate_dtypes == frozenset({cudnn.data_type.BFLOAT16})
+    assert fp8.dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
+    assert fp8.out_dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
+    for dt in sorted(fp8.dtypes, key=int):
+        for dto in sorted(fp8.out_dtypes, key=int):
+            assert engines.mismatch(fp8, _fp8_gate_facts(dtype=dt, dtype_o=dto)) is None, (dt, dto)
+    why = engines.mismatch(fp8, _fp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.HALF))
+    assert why is not None and "gate dtype" in why, why
+    # The MXFP8 row is PR-B: it must decline the tail outright.
+    why = engines.mismatch(
+        _caps("sdpa_fwd_prefill_sm107_mxfp8"), _mxfp8_facts(d_qk=256, d_v=256, has_epilogue_gate=True, epilogue_gate_dtype=cudnn.data_type.BFLOAT16)
+    )
+    assert why is not None and "epilogue" in why, why
+
+
+def test_sm107_gate_declines_the_interactions():
+    """Gate x THD is REACHABLE (the f16 row serves THD at d256), gate x paged
+    is REACHABLE (paged is wired on d256), so both must be declined by the gate
+    block itself -- and the knob interactions (split, PackGQA) by their knob
+    blocks.  Structural: the split flavors and the gate flavors are disjoint on
+    every row, so no lowering can ever be asked to gate a partial."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    f16, fp8 = _caps(_GATE_ROWS[0]), _caps(_GATE_ROWS[1])
+    assert engines.mismatch(f16, _f16_facts(d_qk=256, d_v=256, thd=True, padded=True)) is None, "THD at d256 is served -- the interaction is live"
+    why = engines.mismatch(f16, _gate_facts(thd=True, padded=True))
+    assert why is not None and "dense-only" in why, why
+    paged = dict(has_paged_kv=True, padded=True, page_size=128)
+    # Neither Rubin row claims paged KV today, so gate x paged is declined by the feature table first;
+    # the gate block carries its own paged decline for the day a gate row gains paged, so pin THAT on
+    # a synthetic row that does (the gate block runs before the paged block in mismatch()).
+    assert not f16.paged_kv and not fp8.paged_kv
+    why = engines.mismatch(f16, _gate_facts(**paged))
+    assert why is not None and "paged" in why, why
+    why = engines.mismatch(dataclasses.replace(f16, paged_kv=True), _gate_facts(**paged))
+    assert why is not None and "paged" in why and "gate" in why, why
+    # Knob interactions: a split or packed plan can never carry the gate.
+    why = engines.mismatch(fp8, _fp8_gate_facts(), SdpaFwdKnobs(split_kv=2))
+    assert why is not None and "gate" in why, why
+    # PackGQA on the REAL fp8 row is declined by its flavor table first (pack_gqa_d_shapes = {(128, 128)}); the
+    # gate clause is what returns on a row that WOULD pack a d256 graph, so pin it on that synthetic row.
+    why = engines.mismatch(fp8, _fp8_gate_facts(h_kv=2), SdpaFwdKnobs(pack_gqa=True))
+    assert why is not None, why
+    packs_d256 = dataclasses.replace(fp8, pack_gqas=frozenset({False, True}), pack_gqa_d_shapes=None)
+    assert engines.mismatch(packs_d256, _f16_facts(**_fp8_ungated_kw(h_kv=2)), SdpaFwdKnobs(pack_gqa=True)) is None, "the control must pack"
+    why = engines.mismatch(packs_d256, _fp8_gate_facts(h_kv=2), SdpaFwdKnobs(pack_gqa=True))
+    assert why is not None and "gate" in why, why
+    for row in _GATE_ROWS:
+        caps = _caps(row)
+        assert not ((caps.split_d_shapes or frozenset()) & caps.epilogue_gate_d_shapes), row
+        assert not ((caps.pack_gqa_d_shapes or frozenset()) & caps.epilogue_gate_d_shapes), row
+    # A broadcast G / an undeclared O_v are DECLINES (legal graphs for the backend), never facts.invalid.
+    why = engines.mismatch(f16, _gate_facts(epilogue_gate_shape_ok=False))
+    assert why is not None and "shape" in why, why
+    # A G the kernel cannot TMA-load zero-copy (head-major / unaligned strides) is the row's twin of the
+    # adapter's "TMA-expressible" ValueError (rule 8b: both halves, or the row admits what the adapter rejects).
+    why = engines.mismatch(f16, _gate_facts(epilogue_gate_layout_ok=False))
+    assert why is not None and "zero-copy" in why, why
+    why = engines.mismatch(f16, _gate_facts(sdpa_o_virtual_declared=False))
+    assert why is not None and "set_dim" in why, why
+    for ok in (None, cudnn.data_type.FLOAT, cudnn.data_type.HALF):
+        assert engines.mismatch(f16, _gate_facts(sdpa_o_virtual_dtype=ok)) is None, ok
+    why = engines.mismatch(f16, _gate_facts(sdpa_o_virtual_dtype=cudnn.data_type.BFLOAT16))
+    assert why is not None and "virtual O" in why, why
+
+
+def test_epilogue_gate_is_not_a_knob():
+    """The gate is a graph FACT (the tail is there or it is not), never a tuning
+    axis: the knob vocabulary has no such field and the heuristics cannot
+    propose it (contract rule 4)."""
+    from cudnn.sdpa.fwd import engines, heuristics
+
+    assert "epilogue_gate" not in engines.SdpaFwdKnobs.__dataclass_fields__
+    assert not hasattr(heuristics, "_epilogue_gate_points")
+    # ...but it IS a template-params field (the module-cache key) with the gate OFF by default.
+    assert TemplateParams.__dataclass_fields__["epilogue_gate"].default is False
+
+
+def test_sm107_gate_row_matches_the_adapter_twin():
+    """Rule 8b': a row decline has a STANDALONE-WRAPPER twin, and the two must
+    read ONE constant.  Iterate ROWS (not one named row -- the d_envelope_floors
+    lesson), check identity with the shared object, and pin that
+    ``check_support`` CONSUMES it rather than a private literal."""
+    import inspect
+
+    from cudnn.sdpa.fwd import api_dsl, engines
+    from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES
+
+    gate_rows = [s for s in engines.ENGINE_SPECS if s.capabilities.epilogue_gate]
+    assert {s.name for s in gate_rows} == set(_GATE_ROWS)
+    for spec in gate_rows:
+        assert spec.capabilities.epilogue_gate_d_shapes is SM107_EPILOGUE_GATE_SHAPES, spec.name
+        assert spec.capabilities.epilogue_gate_d_shapes <= spec.capabilities.d_shapes, spec.name
+    assert api_dsl._SM107_EPILOGUE_GATE_SHAPES is SM107_EPILOGUE_GATE_SHAPES
+    src = inspect.getsource(api_dsl.SdpaFwdDslSm100.check_support)
+    assert "_SM107_EPILOGUE_GATE_SHAPES" in src, "check_support no longer consumes the shared gate-shape constant"
+    assert "gate_desc" in src, "check_support does not look at the gate descriptor at all"
+    # The config validator is the third consumer, keyed by flavor string.
+    from cudnn.sdpa.fwd import config_sm107
+
+    assert config_sm107._EPILOGUE_GATE_FLAVORS == frozenset({"sm107 d256"})
+    assert "SM107_EPILOGUE_GATE_SHAPES" in config_sm107.__all__
+
+
+# --- Config / template -----------------------------------------------------------
+
+
+def test_sm107_gate_template_loads_for_d256_only():
+    """The config backstop behind the rows: a gated (256, 256) module loads on
+    BOTH dtype families with ``CFG.EPILOGUE_GATE == 1``; every other flavor
+    raises at config build (a body without the seams would trace an ungated
+    epilogue and silently return O instead of O * sigmoid(G))."""
+    f16, fp8 = _gate_kernel_modules()
+    assert f16.CFG.EPILOGUE_GATE == 1 and fp8.CFG.EPILOGUE_GATE == 1
+    assert f16.CFG.GATE_BPE == 2 and fp8.CFG.GATE_BPE == 2, "the gate is 2 B/elem on both kernels (Q dtype / bf16)"
+    assert "sm107" in f16.__name__ and "sm107" in fp8.__name__
+    for flavor in ((128, 128), (192, 128), (512, 512)):
+        with pytest.raises(ValueError, match="epilogue_gate"):
+            _load(flavor, rubin=True, epilogue_gate=True)
+        with pytest.raises(ValueError, match="epilogue_gate"):
+            _load(flavor, rubin=True, epilogue_gate=True, **_FP8_LOAD_KW)
+    # MXFP8 d256 is PR-B: same flavor family, different flavor string, refused.
+    with pytest.raises(ValueError, match="epilogue_gate"):
+        _load(_D256, rubin=True, epilogue_gate=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16_OUT)
+    # The SM100 line has no gated body at all.
+    with pytest.raises(ValueError, match="epilogue_gate"):
+        _load(_D256, rubin=False, epilogue_gate=True)
+    # The feature interactions are refused by the config too (backstop of the rows / adapter twin).
+    for bad in (
+        dict(thd_varlen=True, seq_kv_lens_present=True),
+        dict(split_kv=2),
+        dict(pack_gqa=True, qh_per_kh=4),
+        dict(paged_kv=True, page_size=128, seq_kv_lens_present=True),
+    ):
+        # split_kv > 1 is refused by the (earlier) SplitHelpers guard on this flavor; the rest by the gate rule.
+        with pytest.raises(ValueError, match="epilogue_gate|split_kv > 1 is not wired"):
+            _load(_D256, rubin=True, epilogue_gate=True, **bad)
+
+
+def test_sm107_gate_off_is_the_default_module():
+    """Gate on/off are TWO coexisting specializations of one template, and
+    gate-off is the module every pre-gate caller already loads: same
+    ``TemplateParams``, same module object, same source digest."""
+    assert TemplateParams() == TemplateParams(epilogue_gate=False)
+    for kw in ({}, _FP8_LOAD_KW):
+        off = _load(_D256, rubin=True, **kw)
+        assert off is _load(_D256, rubin=True, epilogue_gate=False, **kw)
+        assert off.CFG.EPILOGUE_GATE == 0
+        on = _load(_D256, rubin=True, epilogue_gate=True, **kw)
+        assert on is not off
+        assert (
+            on.FROST_SOURCE_DIGEST != off.FROST_SOURCE_DIGEST
+        ), "the digest must key the gate so the compiled cache cannot hand a gated artifact to an ungated caller"
+        assert on.__file__ == off.__file__, "one template file, two specializations"
+
+
+def test_sm107_gate_smem_tally():
+    """The gate adds ONE 64 KiB staging tile (TILES_Q x TILE_M x TILE_O x 2 B,
+    NOT divided by CTA_MMA -- each CTA of a cga2 pair gates its own full-width
+    128 q rows).  Pure arithmetic on the shared tally, then the validator: depth
+    2 fits at every configuration the block and engine path run, depth 3 does
+    not, and the raise NAMES the gate term so a reader sees why a depth that
+    fits ungated no longer does."""
+    from dataclasses import dataclass
+
+    from cudnn.sdpa.fwd.config_sm107 import SMEM_USABLE_BYTES, make_cfg_d256, sdpa_smem_bytes
+
+    KIB = 1024
+    fixed = 2 * KIB  # _SMEM_FIXED_OVERHEAD: barriers + scheduler ring + tmem ptr
+
+    def tally(*, cta_mma, stages_kv, bpe_qkv, bpe_o, gate_bpe):
+        return sdpa_smem_bytes(128, 128, 256, 256, 1, stages_kv, cta_mma, bpe_qkv, bpe_o, qo_alias=True, gate_bpe=gate_bpe) + fixed
+
+    # Gate-off numbers are today's (194 / 162 KiB); the gate term is +64 KiB.
+    assert tally(cta_mma=2, stages_kv=2, bpe_qkv=2, bpe_o=2, gate_bpe=0) == 194 * KIB
+    assert tally(cta_mma=1, stages_kv=2, bpe_qkv=1, bpe_o=1, gate_bpe=0) == 162 * KIB
+    assert tally(cta_mma=2, stages_kv=2, bpe_qkv=2, bpe_o=2, gate_bpe=2) == 258 * KIB  # d256 f16 cga2 (block + engine path)
+    assert tally(cta_mma=1, stages_kv=2, bpe_qkv=1, bpe_o=1, gate_bpe=2) == 226 * KIB  # d256 fp8 e4m3-O (block's fully-fused mode)
+    assert tally(cta_mma=1, stages_kv=2, bpe_qkv=1, bpe_o=2, gate_bpe=2) == 258 * KIB  # d256 fp8 bf16-O (unfused fp8)
+    assert tally(cta_mma=2, stages_kv=3, bpe_qkv=2, bpe_o=2, gate_bpe=2) == 322 * KIB > SMEM_USABLE_BYTES
+    assert tally(cta_mma=1, stages_kv=3, bpe_qkv=1, bpe_o=2, gate_bpe=2) == 322 * KIB > SMEM_USABLE_BYTES
+    # ...and the same shapes carry the 4-CTA-wide gate term a d128 cga2 flavor would need (TILES_Q=2): not claimed.
+    assert sdpa_smem_bytes(128, 128, 128, 128, 2, 4, 2, 2, 2, qo_alias=False, gate_bpe=2) + fixed == 322 * KIB
+
+    @dataclass(frozen=True)
+    class _ParamsWithStagesKv(TemplateParams):
+        stages_kv: int = None
+
+    cfg, _ = make_cfg_d256(_ParamsWithStagesKv(stages_kv=2, epilogue_gate=True))
+    assert cfg.EPILOGUE_GATE == 1 and cfg.STAGES_KV == 2
+    cfg, _ = make_cfg_d256(_ParamsWithStagesKv(stages_kv=3, epilogue_gate=False))
+    assert cfg.STAGES_KV == 3, "depth 3 still fits UNGATED (290 KiB)"
+    with pytest.raises(ValueError, match="GATE") as ei:
+        make_cfg_d256(_ParamsWithStagesKv(stages_kv=3, epilogue_gate=True))
+    assert "322 KiB" in str(ei.value) and "EPILOGUE_GATE=1" in str(ei.value), str(ei.value)
+    # FP8 twins: e4m3-O and bf16-O at depth 2 fit; bf16-O at depth 3 does not.
+    for dto in (_E4M3, _BF16_OUT):
+        cfg, _ = make_cfg_d256(_ParamsWithStagesKv(stages_kv=2, epilogue_gate=True, dtype_qkv=_E4M3, dtype_o=dto, cta_mma=1))
+        assert cfg.EPILOGUE_GATE == 1
+    with pytest.raises(ValueError, match="GATE"):
+        make_cfg_d256(_ParamsWithStagesKv(stages_kv=3, epilogue_gate=True, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1))
+
+
+def test_sm107_gate_desc_version_unchanged():
+    """The gate tile is allocated AFTER every MMA operand (sQO, sK, sV) and is
+    never an MMA / UTCCP operand itself, so it cannot move an operand across
+    the 256 KiB version-0 tcgen05 descriptor window: DESC_VERSION and its
+    STAGES_KV derivation are identical with the gate on and off, on both
+    kernels.  (The FP8 sibling now derives it too -- its literal 0 was one
+    depth away from the same wrap.)"""
+    from dataclasses import replace
+
+    for kw in ({}, _FP8_LOAD_KW):
+        off = _load(_D256, rubin=True, **kw)
+        on = _load(_D256, rubin=True, epilogue_gate=True, **kw)
+        assert on.DESC_VERSION == off.DESC_VERSION == 0, (kw, on.DESC_VERSION, off.DESC_VERSION)
+        assert callable(getattr(on, "_needs_desc_v1", None)), f"{on.__name__}: DESC_VERSION must be DERIVED, not a literal"
+        for depth in (2, 3, 4):
+            want = int(off._needs_desc_v1(replace(off.CFG, STAGES_KV=depth)))
+            assert int(on._needs_desc_v1(replace(on.CFG, STAGES_KV=depth))) == want, (kw, depth)
+            # ...and both agree with the layout: the LAST V stage's START (Q(u)O byte-max + K ring + the
+            # preceding V stages) crossing the 14-bit window.  The gate tile is not in this sum.
+            c = on.CFG
+            qo = max(c.TILE_M * c.TILE_K * c.BPE, c.TILE_M * c.TILE_O * c.BPE_O)
+            k_stage = (c.TILE_N * c.TILE_K // c.CTA_MMA) * c.BPE
+            v_stage = (c.TILE_O * c.TILE_N // c.CTA_MMA) * c.BPE
+            assert want == int(qo + depth * k_stage + (depth - 1) * v_stage >= 256 * 1024), (kw, depth, want)
+        # The f16 cga2 layout crosses at depth 4 exactly as the existing STAGES_KV test pins; fp8 bf16-O cga1 too.
+        assert int(on._needs_desc_v1(replace(on.CFG, STAGES_KV=4))) == 1, kw
+
+
+def test_sm107_gate_kernel_signatures_are_append_only():
+    """Public-API signatures evolve append-only (AGENTS.md): both kernels'
+    ``compile`` gain their gate parameters at the END (fp8 also ``has_amax``),
+    both ``_host`` gain ``gate_tensor`` LAST -- after ``stream``, which every
+    caller passes by keyword.  A ``gate_stride`` handed to an UNGATED module is
+    a ValueError, not a silently ignored kwarg."""
+    import inspect
+
+    f16, fp8 = _gate_kernel_modules()
+    f16_c = list(inspect.signature(f16.compile).parameters)
+    fp8_c = list(inspect.signature(fp8.compile).parameters)
+    assert f16_c[-1] == "gate_stride", f16_c[-3:]
+    assert fp8_c[-2:] == ["gate_stride", "has_amax"], fp8_c[-3:]
+    for params in (f16_c, fp8_c):
+        assert params.index("lse_stride") < params.index("gate_stride")
+        assert params[: params.index("gate_stride")] == [p for p in params if p not in ("gate_stride", "has_amax")]
+    for mod in (f16, fp8):
+        sig = inspect.signature(mod.compile).parameters
+        assert sig["gate_stride"].default is None
+        host = list(inspect.signature(mod._host).parameters)
+        assert host[-2:] == ["stream", "gate_tensor"], (mod.__name__, host[-3:])
+        assert inspect.signature(mod._host).parameters["gate_tensor"].default is None
+    assert inspect.signature(fp8.compile).parameters["has_amax"].default is True
+    assert "gate_tensor" in inspect.signature(fp8._kernel).parameters and "tma_gate_desc" in inspect.signature(fp8._kernel).parameters
+    assert "gate_tensor" in inspect.signature(f16._kernel).parameters and "tma_gate_desc" in inspect.signature(f16._kernel).parameters
+
+    # Ungated modules refuse a gate stride before any trace.
+    for kw in ({}, _FP8_LOAD_KW):
+        off = _load(_D256, rubin=True, **kw)
+        with pytest.raises(ValueError, match="epilogue_gate"):
+            off.compile(b=1, qh=1, kh=1, sq=256, skv=256, gate_stride=(256 * 256, 256, 256, 1))
+
+
+def test_sm107_gate_seams_are_named_once():
+    """Every splice in both kernels is marked ``# == EPILOGUE_FUSION_SEAM(<name>) ==``
+    -- the 16 names exactly once each, so a reviewer can walk the fusion in
+    pipeline order with one grep and a dropped / duplicated seam is visible.
+    And none of the fork's module knobs survived the port (contract rule 5)."""
+    import re
+
+    f16, fp8 = _gate_kernel_modules()
+    for mod in (f16, fp8):
+        with open(mod.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        seams = re.findall(r"# == EPILOGUE_FUSION_SEAM\((\w+)\) ==", src)
+        counts = {name: seams.count(name) for name in set(seams)}
+        assert set(seams) == set(_GATE_SEAMS), f"{mod.__name__}: seams {sorted(set(seams) ^ set(_GATE_SEAMS))} missing or unknown"
+        assert all(n == 1 for n in counts.values()), f"{mod.__name__}: duplicated seams {[k for k, n in counts.items() if n != 1]}"
+        code = _code_lines(src)
+        for knob in _RETIRED_GATE_KNOBS:
+            assert not re.search(rf"^{knob}\b\s*[:=]", code, re.M), f"{mod.__name__}: fork-era module knob {knob} survived"
+            assert not re.search(rf"\b{knob}\b", code), f"{mod.__name__}: fork-era knob {knob} is still referenced"
+        assert 'options="--enable-tvm-ffi"' in code, f"{mod.__name__}: compile options must stay the production ones"
+
+
+# --- Adapter accept / reject (CPU; the device capability is monkeypatched) ------
+
+
+def _desc(shape, dtype, name, stride=None):
+    """A BSHD-physical (BHSD-logical) TensorDesc with no storage behind it."""
+    from cudnn.api_base import TensorDesc
+
+    b, h, s, d = shape
+    stride = tuple(stride) if stride is not None else (s * h * d, d, h * d, 1)
+    return TensorDesc(
+        dtype=dtype, shape=tuple(shape), stride=stride, stride_order=TensorDesc._compute_stride_order(tuple(shape), stride), device="cuda", name=name
+    )
+
+
+def _fake_cc(monkeypatch, cc):
+    """check_support reads the LIVE device; pin it so the Rubin arm runs on any host."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: cc)
+
+
+def _gate_api(
+    *,
+    b=1,
+    h=8,
+    h_kv=None,
+    s=512,
+    d=256,
+    d_v=None,
+    dtype=None,
+    fp8=False,
+    pertensor=True,
+    gate_dtype=None,
+    gate_shape=None,
+    gate_stride=None,
+    with_gate=True,
+    **kw,
+):
+    """A d256-shaped SdpaFwdDslSm100 built from descriptors only."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    h_kv = h if h_kv is None else h_kv
+    d_v = d if d_v is None else d_v
+    dtype = dtype or torch.float16
+    qkv_dtype = torch.float8_e4m3fn if fp8 else dtype
+    o_dtype = torch.bfloat16 if fp8 else dtype
+    gate_dtype = gate_dtype or (torch.bfloat16 if fp8 else dtype)
+    q = _desc((b, h, s, d), qkv_dtype, "q")
+    k = _desc((b, h_kv, s, d), qkv_dtype, "k")
+    v = _desc((b, h_kv, s, d_v), qkv_dtype, "v")
+    o = _desc((b, h, s, d_v), o_dtype, "o")
+    if with_gate:
+        kw["sample_gate"] = _desc(gate_shape or (b, h, s, d_v), gate_dtype, "gate", stride=gate_stride)
+    if fp8:
+        kw.update(pertensor_fp8=pertensor, dtype_o=o_dtype)
+    return SdpaFwdDslSm100(q, k, v, o, None, **kw)
+
+
+def _stub_compiled(monkeypatch, api):
+    """Let execute() reach its presence contracts without a kernel or a stream."""
+    api._compiled_kernel = object()
+    monkeypatch.setattr(api, "_get_default_stream", lambda stream: stream)
+
+
+def test_gate_check_support_declines_typed(monkeypatch):
+    """Rule 8b twins of the rows' gate claims, on the STANDALONE adapter -- each
+    a typed decline (ValueError for a malformed request, NotImplementedError for
+    "not mine"), never a bare escape from compile().  The accept side first, so
+    a decline cannot pass by the whole path being dead."""
+    import torch
+
+    _fake_cc(monkeypatch, (10, 7))
+    for dt in (torch.float16, torch.bfloat16):
+        api = _gate_api(dtype=dt)
+        assert api.check_support()
+        assert api.gate_desc is not None and api.gate_desc.dtype == dt
+        assert api._gate_declared is None, "a compact G declares no stride"
+        assert api.template_params().epilogue_gate is True
+    assert _gate_api(with_gate=False).template_params().epilogue_gate is False
+    assert _gate_api(fp8=True).check_support(), "bf16 G on the per-tensor FP8 path"
+    assert _gate_api(fp8=True, has_amax_o=False).check_support(), "the Amax_O fold-out is a quantized-path option"
+
+    # Malformed requests -> ValueError.
+    with pytest.raises(ValueError, match="GATE"):
+        _gate_api(gate_shape=(1, 8, 256, 256)).check_support()
+    with pytest.raises(ValueError, match="GATE"):
+        _gate_api(gate_dtype=torch.bfloat16).check_support()
+    with pytest.raises(ValueError, match="GATE"):
+        _gate_api(fp8=True, gate_dtype=torch.float16).check_support()
+    # A G whose head stride is not a 16-byte multiple is not TMA-expressible; the adapter never hides that behind a copy.
+    with pytest.raises(ValueError, match="TMA-expressible"):
+        _gate_api(gate_stride=(512 * 8 * 260, 260, 8 * 260, 1)).check_support()
+    with pytest.raises(ValueError, match="has_amax_o"):
+        _gate_api(with_gate=False, has_amax_o=False).check_support()
+
+    # "Not mine" -> NotImplementedError, naming the axis.
+    for d, d_v in ((128, 128), (192, 128), (512, 512)):
+        with pytest.raises(NotImplementedError, match="256"):
+            _gate_api(d=d, d_v=d_v).check_support()
+    with pytest.raises(NotImplementedError, match="dense-only"):
+        _gate_api(thd=True).check_support()
+    # split_kv=2: the PRE-EXISTING SM107 split guard ("split_kv > 1 on cc10.7 is wired only for per-tensor FP8
+    # d128") fires first, gate on or off -- the gate's own split clause is unreachable on Rubin, because the
+    # only split-wired flavor (fp8 d128) is declined by the gate's head-dim guard before it.  Pinned on the
+    # shared "split_kv" token so either ordering is a typed decline.
+    with pytest.raises(NotImplementedError, match="split_kv"):
+        _gate_api(split_kv=2).check_support()
+    with pytest.raises(NotImplementedError, match="PackGQA"):
+        _gate_api(h_kv=2, pack_gqa=True).check_support()
+    with pytest.raises(NotImplementedError, match="MXFP8"):
+        _gate_api(fp8=True, pertensor=False).check_support()
+    # Paged KV: K/V are page pools; the d256 f16 flavor serves paged, the gate does not ride it.
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    pool = _desc((16, 8, 128, 256), torch.float16, "k")
+    with pytest.raises(NotImplementedError, match="paged"):
+        SdpaFwdDslSm100(
+            _desc((1, 8, 512, 256), torch.float16, "q"),
+            pool,
+            _desc((16, 8, 128, 256), torch.float16, "v"),
+            _desc((1, 8, 512, 256), torch.float16, "o"),
+            None,
+            seq_kv_lens_present=True,
+            paged_page_size=128,
+            paged_max_seq_len_kv=512,
+            sample_gate=_desc((1, 8, 512, 256), torch.float16, "gate"),
+        ).check_support()
+
+    # Execute presence contracts, both directions, plus the Amax_O fold-out.
+    t = torch.empty(1)
+    api = _gate_api()
+    assert api.check_support()
+    _stub_compiled(monkeypatch, api)
+    with pytest.raises(ValueError, match="gate"):
+        api.execute(t, t, t, t)
+    plain = _gate_api(with_gate=False)
+    assert plain.check_support()
+    _stub_compiled(monkeypatch, plain)
+    with pytest.raises(ValueError, match="sample_gate"):
+        plain.execute(t, t, t, t, gate=t)
+    no_amax = _gate_api(fp8=True, with_gate=False, has_amax_o=False)
+    assert no_amax.check_support()
+    _stub_compiled(monkeypatch, no_amax)
+    with pytest.raises(ValueError, match="has_amax_o"):
+        no_amax.execute(t, t, t, t, amax_o=t)
+
+
+def test_gate_check_support_declines_other_arch_lines(monkeypatch):
+    """The gate is served by the Rubin d256 kernels ONLY: the SM100 arm of the
+    same adapter and the SM120 / SM80 adapters all decline it typed."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120, SdpaFwdDslSm80
+
+    _fake_cc(monkeypatch, (10, 0))
+    with pytest.raises(NotImplementedError, match="Rubin"):
+        _gate_api().check_support()
+    assert _gate_api(with_gate=False).check_support(), "the ungated d256 graph is served on SM100"
+    for cls in (SdpaFwdDslSm120, SdpaFwdDslSm80):
+        q = _desc((1, 8, 512, 128), torch.float16, "q")
+        api = cls(q, q, q, _desc((1, 8, 512, 128), torch.float16, "o"), None, sample_gate=_desc((1, 8, 512, 128), torch.float16, "gate"))
+        with pytest.raises(NotImplementedError, match="SM107"):
+            api.check_support()
+
+
+# --- Rubin e2e, standalone adapter ----------------------------------------------
+#
+# Sentinel-filled O (an unwritten tile stays visible), NaN-filled LSE, and the
+# two-launch trick (a first-launch race shows as a second-launch delta) on every
+# run.  Tolerances are the shared SM10x suites' (O atol 5e-2 / rtol 3e-2, LSE
+# atol 2e-2); bitwise claims are ``torch.equal``.
+
+_GATE_O_TOL = dict(atol=5e-2, rtol=3e-2)
+_GATE_LSE_TOL = dict(atol=2e-2, rtol=2e-2)
+
+
+def _rubin_only():
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the fused epilogue gate is served by the sm107 d256 kernels (cc10.7) only")
+
+
+def _gate_problem(b, h, h_kv, s, d, dtype, *, seed=0):
+    """BSHD-physical / BHSD-logical Q, K, V and a gate G of O's shape."""
+    import torch
+
+    torch.manual_seed(seed)
+    dev = "cuda"
+    q = (torch.randn(b, s, h, d, device=dev) * 0.5).to(dtype).transpose(1, 2)
+    k = (torch.randn(b, s, h_kv, d, device=dev) * 0.5).to(dtype).transpose(1, 2)
+    v = (torch.randn(b, s, h_kv, d, device=dev) * 0.5).to(dtype).transpose(1, 2)
+    gate = (torch.randn(b, s, h, d, device=dev) * 2.0).to(dtype).transpose(1, 2)
+    return q, k, v, gate
+
+
+def _gate_reference(q, k, v, gate, *, causal, scale, seq_kv_lens=None):
+    """fp32 softmax(QK^T) V * sigmoid(G) and the fp64 natural-log LSE (-inf on an empty row)."""
+    import torch
+
+    rep = q.shape[1] // k.shape[1]
+    kf, vf = k.float().repeat_interleave(rep, 1), v.float().repeat_interleave(rep, 1)
+    logits = q.float() @ kf.transpose(-1, -2) * scale
+    s_q, s_kv = q.shape[2], k.shape[2]
+    if causal:
+        i = torch.arange(s_q, device=q.device).view(s_q, 1)
+        j = torch.arange(s_kv, device=q.device).view(1, s_kv)
+        logits = logits.masked_fill(j > i + (s_kv - s_q), float("-inf"))
+    if seq_kv_lens is not None:
+        cols = torch.arange(s_kv, device=q.device).view(1, 1, 1, s_kv)
+        logits = logits.masked_fill(cols >= seq_kv_lens.view(-1, 1, 1, 1), float("-inf"))
+    lse = torch.logsumexp(logits.double(), dim=-1).float()
+    p = torch.softmax(logits, dim=-1).nan_to_num(0.0)  # an empty row is all -inf: O = 0
+    return (p @ vf) * torch.sigmoid(gate.float()), lse
+
+
+def _run_gated(q, k, v, gate, *, causal, cga=None, sched_policy=None, seq_kv_lens=None, with_lse=True, gate_on=True):
+    """Build, compile and launch TWICE; return (api, O, LSE) with the sentinel / two-launch checks done."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d_v = q.shape[0], q.shape[1], q.shape[2], v.shape[3]
+    dtype = q.dtype
+    out = torch.full((b, s, h, d_v), 1.5e30, device=q.device, dtype=torch.float32).to(dtype).transpose(1, 2)  # sentinel (inf in fp16)
+    sentinel = out[0, 0, 0, 0].item()
+    lse = torch.full((b, h, s), float("nan"), device=q.device, dtype=torch.float32) if with_lse else None
+    api = SdpaFwdDslSm100(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        is_causal=causal,
+        scale_softmax=q.shape[3] ** -0.5,
+        seq_kv_lens_present=seq_kv_lens is not None,
+        cga=cga,
+        sched_policy=sched_policy,
+        **({"sample_gate": gate} if gate_on else {}),
+    )
+    assert api.check_support()
+    api.compile()
+    kw = dict(lse_tensor=lse, seq_kv_lens=seq_kv_lens)
+    if gate_on:
+        kw["gate"] = gate
+    api.execute(q, k, v, out, **kw)
+    torch.cuda.synchronize()
+    first_o, first_lse = out.clone(), (lse.clone() if lse is not None else None)
+    api.execute(q, k, v, out, **kw)
+    torch.cuda.synchronize()
+    assert torch.equal(out, first_o), "two-launch delta on O: a first-launch race (missing fence_proxy?)"
+    assert lse is None or torch.equal(lse, first_lse), "two-launch delta on LSE"
+    assert torch.isfinite(out.float()).all() and not (out == sentinel).any(), "unwritten (sentinel) or non-finite O cells"
+    return api, out, lse
+
+
+@pytest.mark.parametrize(
+    "dtype, causal, s, cga",
+    [
+        ("fp16", False, 512, None),
+        ("fp16", True, 1000, None),
+        ("bf16", False, 512, None),
+        ("bf16", True, 1000, None),
+    ],
+    ids=["fp16-dense-512", "fp16-causal-1000", "bf16-dense-512", "bf16-causal-1000"],
+)
+def test_sm107_gate_matches_the_fp32_oracle(dtype, causal, s, cga):
+    """Rubin e2e for the f16/bf16 row's gate claim: O == softmax(QK^T)V *
+    sigmoid(G) against the fp32 oracle at the shared tolerance; LSE is the
+    plain (ungated) fp64 log-sum-exp.  S=1000 causal covers a KV tail.  Always
+    the default cga (2): the f16 d256 flavor serves cga2 ONLY on Rubin -- see
+    test_sm107_gate_f16_d256_declines_an_explicit_cga1."""
+    import torch
+
+    _rubin_only()
+    dt = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype]
+    b, h, h_kv, d = 2, 8, 2, 256
+    q, k, v, gate = _gate_problem(b, h, h_kv, s, d, dt)
+    _, out, lse = _run_gated(q, k, v, gate, causal=causal, cga=cga)
+    ref_o, ref_lse = _gate_reference(q, k, v, gate, causal=causal, scale=d**-0.5)
+    torch.testing.assert_close(out.float(), ref_o, **_GATE_O_TOL)
+    torch.testing.assert_close(lse, ref_lse, **_GATE_LSE_TOL)
+
+
+def test_sm107_gate_f16_d256_declines_an_explicit_cga1():
+    """The f16 d256 flavor is cga2-only on Rubin (``supported_cgas_for((256, 256),
+    fp8=False, (10, 7)) == (2,)``: at cga1 the Q-union-O alias plus the K/V rings
+    at STAGES_KV=2 exceed the 320 KiB carveout), with or without the gate.  The
+    PR-A plan's Q18 assumed (1, 2) and asked for a cga=1 oracle case; the adapter
+    declines it before any kernel loads (measured on the dev node 2026-09-15:
+    "only supports cga in (2,)").  Pin the decline with the gate ON so a widening
+    of the flavor's cga domain has to come back here and add the oracle case."""
+    import torch
+
+    _rubin_only()
+    b, h, h_kv, s, d = 2, 8, 2, 1000, 256
+    q, k, v, gate = _gate_problem(b, h, h_kv, s, d, torch.bfloat16)
+    with pytest.raises(ValueError, match="cga"):
+        _run_gated(q, k, v, gate, causal=True, cga=1)
+
+
+@pytest.mark.parametrize("dtype", ["fp16", "bf16"])
+def test_sm107_gate_dead_padded_entry_is_exactly_zero(dtype):
+    """sdpa-invariants S1/S2: a batch entry with seq_kv_len == 0 runs ZERO KV
+    iterations, so its epilogue must SELECT zero, never multiply the (possibly
+    NaN) accumulator residue -- and the gate fma must sit BEFORE that select,
+    so a +-1e4 gate on the dead entry cannot leak through: O exactly 0, LSE
+    exactly -inf.  The live entry stays on the oracle."""
+    import torch
+
+    _rubin_only()
+    dt = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype]
+    b, h, h_kv, s, d = 2, 8, 2, 512, 256
+    q, k, v, gate = _gate_problem(b, h, h_kv, s, d, dt)
+    sign = torch.where(torch.arange(s * h * d, device="cuda") % 2 == 0, 1.0, -1.0).view(s, h, d)
+    gate.transpose(1, 2)[1] = (sign * 1e4).to(dt)
+    lens = torch.tensor([s, 0], dtype=torch.int32, device="cuda")
+    _, out, lse = _run_gated(q, k, v, gate, causal=False, seq_kv_lens=lens)
+    assert (out[1] == 0).all(), "the dead entry must be EXACTLY zero (select, not residue * 0)"
+    assert torch.isneginf(lse[1]).all(), "an empty row's LSE is -inf (no floor may leak: -69.08 = log 1e-30)"
+    ref_o, ref_lse = _gate_reference(q, k, v, gate, causal=False, scale=d**-0.5, seq_kv_lens=lens)
+    torch.testing.assert_close(out[0].float(), ref_o[0], **_GATE_O_TOL)
+    torch.testing.assert_close(lse[0], ref_lse[0], **_GATE_LSE_TOL)
+
+
+def test_sm107_gate_reads_a_strided_slab_bitwise():
+    """G sliced out of a fused projection slab (token stride N, not h*d) is
+    read ZERO-COPY through the declared BSHD stride and yields the BITWISE
+    same O as a compact G with the same values -- first G alone, then Q/K/V/G
+    all strided, which is what the gated attention block runs."""
+    import torch
+
+    _rubin_only()
+    b, h, s, d = 2, 8, 512, 256
+    dt = torch.bfloat16
+    q, k, v, gate = _gate_problem(b, h, h, s, d, dt)
+    api_c, out_c, lse_c = _run_gated(q, k, v, gate, causal=True)
+    assert api_c._gate_declared is None
+
+    n = 4 * h * d  # a [B, S, N] slab: q | k | v | gate column blocks
+    slab = torch.zeros(b, s, n, device="cuda", dtype=dt)
+    for i, t in enumerate((q, k, v, gate)):
+        slab[:, :, i * h * d : (i + 1) * h * d] = t.transpose(1, 2).reshape(b, s, h * d)
+    sliced = [slab[:, :, i * h * d : (i + 1) * h * d].view(b, s, h, d).transpose(1, 2) for i in range(4)]
+    assert torch.equal(sliced[3], gate) and not sliced[3].is_contiguous()
+
+    # G strided alone.
+    api_g, out_g, lse_g = _run_gated(q, k, v, sliced[3], causal=True)
+    assert api_g._gate_declared == (s * n, n, d, 1), api_g._gate_declared
+    assert api_g._bshd_zero_copy_stride(api_g.gate_desc, 2) == (s * n, n, d, 1)
+    assert torch.equal(out_g, out_c) and torch.equal(lse_g, lse_c), "a strided G must read bitwise as the compact one"
+    # Everything strided (the block's layout).
+    api_s, out_s, lse_s = _run_gated(*sliced, causal=True)
+    assert api_s._gate_declared == (s * n, n, d, 1)
+    assert all(st == (s * n, n, d, 1) for st in api_s._bshd_declared[:3]), api_s._bshd_declared
+    assert torch.equal(out_s, out_c) and torch.equal(lse_s, lse_c), "strided Q/K/V/G must read bitwise as compact"
+
+
+def test_sm107_gate_lse_is_bitwise_independent_of_the_gate():
+    """The gate multiplies the fp32 pre-cast accumulator in the epilogue and
+    nothing upstream of it: the published LSE is BITWISE the ungated kernel's,
+    and O is the ungated O times sigmoid(G) to rounding."""
+    import torch
+
+    _rubin_only()
+    b, h, h_kv, s, d = 2, 8, 2, 1000, 256
+    q, k, v, gate = _gate_problem(b, h, h_kv, s, d, torch.bfloat16)
+    _, out_on, lse_on = _run_gated(q, k, v, gate, causal=True, gate_on=True)
+    _, out_off, lse_off = _run_gated(q, k, v, gate, causal=True, gate_on=False)
+    assert torch.equal(lse_on, lse_off), "LSE must not depend on the gate"
+    torch.testing.assert_close(out_on.float(), out_off.float() * torch.sigmoid(gate.float()), **_GATE_O_TOL)
+    assert not torch.equal(out_on, out_off), "the gate must actually apply (a +-2 sigma G is far from sigmoid == 1)"
+
+
+def test_sm107_gate_lpt_is_bitwise_natural():
+    """The f16 row claims LPT at (256, 256); the scheduler only reorders whole
+    work items, so O and LSE under SCHED_LPT with the gate ON are BITWISE the
+    NATURAL run's (a multi-wave causal grid so the persistent loop walks the
+    remapped order for several rounds)."""
+    import torch
+
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+    from cudnn.sdpa.fwd import engines
+
+    _rubin_only()
+    caps = _caps(_GATE_ROWS[0])
+    assert SCHED_LPT in engines.effective_sched_policies(caps, _gate_facts(causal=True))
+    b, h, h_kv, s, d = 2, 16, 4, 1024, 256
+    q, k, v, gate = _gate_problem(b, h, h_kv, s, d, torch.bfloat16)
+    _, out_nat, lse_nat = _run_gated(q, k, v, gate, causal=True, sched_policy=SCHED_NATURAL)
+    _, out_lpt, lse_lpt = _run_gated(q, k, v, gate, causal=True, sched_policy=SCHED_LPT)
+    assert torch.equal(out_lpt, out_nat), "LPT must be bit-identical to NATURAL -- a different tile walk, the same per-tile math"
+    assert torch.equal(lse_lpt, lse_nat)
+    ref_o, _ = _gate_reference(q, k, v, gate, causal=True, scale=d**-0.5)
+    torch.testing.assert_close(out_nat.float(), ref_o, **_GATE_O_TOL)
