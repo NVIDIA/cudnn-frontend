@@ -70,17 +70,21 @@ baseline must not be combined with the Server Edition measurements above.
 
 ## Validation and limits
 
-- The final publication refresh, including the portable three-path harness,
-  archive-integrity checks, and DSL-version guard, passed **66 tests with
-  19 skips** across the entire BSA directory, with the pinned legacy archive
-  enabled.
+- The latest reviewer-fix refresh passed **67 tests with 19 skips** across
+  the entire BSA directory, with the pinned legacy archive enabled. This
+  includes the concurrent-output CLI regression, observed RED before the
+  exclusive-create fix and GREEN afterward, plus all 12 prior harness cases.
+- The publication checkpoint `daa7e0a8`, including the portable three-path
+  harness, archive-integrity checks, and DSL-version guard, passed
+  **66 tests with 19 skips**. See the [three-path validation record](SM120_THREE_PATHS.md#validation)
+  for the earlier 65-test checkpoint.
 - The September 15 MR refresh reran the entire `test/python/fe_api/bsa`
   directory: **53 passed, 19 skipped**, with no failures. The narrower forward
   and paired-harness checkpoint previously passed 33 tests with nine skips.
   The CuTe BSA path was exercised on SM120; unsupported configurations were
   skipped. The local frontend backend-version probe was unavailable, so this
   is not a claim that backend Graph API or other GPU-architecture CI passed.
-- `pre-commit run --from-ref upstream/develop --to-ref HEAD` passed the Black,
+- `pre-commit run --from-ref "$(git merge-base upstream/develop HEAD)" --to-ref HEAD` passed the Black,
   Black Jupyter, and SPDX hooks; no changed C++ files required clang-format.
 - FP16/BF16 tests cover top-k 1-5, partial Q, GQA, noncontiguous and
   query-dependent KV selections, all-tail/full/mixed/unsplit scheduling, and

@@ -257,7 +257,8 @@ def _run(args, hashes, legacy):
         "records": records,
     }
     args.json.parent.mkdir(parents=True, exist_ok=True)
-    args.json.write_text(json.dumps(report, indent=2) + "\n")
+    with args.json.open("x", encoding="utf-8") as output:
+        output.write(json.dumps(report, indent=2) + "\n")
 
 
 if __name__ == "__main__":

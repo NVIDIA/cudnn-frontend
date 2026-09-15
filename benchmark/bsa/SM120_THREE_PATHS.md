@@ -41,10 +41,18 @@ The earlier 0.8%-1.1% gain used the already optimized FA4-style native128 `9869b
 
 ## Validation
 
-- After promotion to the portable public harness, the complete BSA suite passed
-  **65 tests with 19 skips**, with all 12 new harness cases enabled. These
-  include archive integrity, output preservation, argument validation, full
-  small FP32 references, and an end-to-end CLI smoke run.
+- The latest reviewer-fix validation passed **67 tests with 19 skips** across
+  the complete BSA suite, with all 13 harness cases enabled. These include
+  archive integrity, output preservation, argument validation, full small
+  FP32 references, and end-to-end CLI smoke runs.
+- Historical checkpoints were **65 passed, 19 skipped** at `9211954a`
+  (portable harness) and **66 passed, 19 skipped** at `daa7e0a8` (one added
+  DSL-version-guard test). The new concurrent-output CLI case brings the
+  current total to 67; it was observed RED before the exclusive-create fix
+  and GREEN afterward.
+- JSON output uses exclusive creation. A report created after argument
+  validation is preserved and causes `FileExistsError`; choose a fresh
+  output filename before rerunning.
 - Five local harness tests passed: balanced launch order, timing arithmetic, pinned-source checks, and full FP32-reference checks for all three paths on small BF16 top-k 1/3 strided/local workloads.
 - Before and after timing, all four target cases passed sampled FP32-reference checks for all three paths.
 - PR #1010 and native64 complete O/LSE tensors were bitwise identical in every target case.

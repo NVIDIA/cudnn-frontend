@@ -112,12 +112,30 @@ def test_three_path_full_reference(monkeypatch, legacy_source_dir, pattern, topk
 
 
 @pytest.mark.gpu_exclusive
-def test_three_path_cli_smoke(monkeypatch, legacy_source_dir, tmp_path):
+@pytest.mark.parametrize("concurrent_output", [False, True])
+def test_three_path_cli_smoke(monkeypatch, legacy_source_dir, tmp_path, concurrent_output):
+    """Validate CLI reports and preserve files created after argument checks."""
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("three-path benchmark requires SM120")
     bench = _load_benchmark(monkeypatch)
     output = tmp_path / "three_paths.json"
-    bench.main(["--legacy-source-dir", str(legacy_source_dir), "--sequence", "512", "--heads", "2", "--warmup", "1", "--repeats", "6", "--json", str(output)])
+    argv = ["--legacy-source-dir", str(legacy_source_dir), "--sequence", "512", "--heads", "2", "--warmup", "1", "--repeats", "6", "--json", str(output)]
+    if concurrent_output:
+        original_run = bench._run
+
+        def create_concurrent_report(*args, **kwargs):
+            """Simulate another writer after CLI checks but before report output."""
+            output.write_text("preserve the other process's report\n", encoding="utf-8")
+            return original_run(*args, **kwargs)
+
+        monkeypatch.setattr(bench, "_run", create_concurrent_report)
+        with pytest.raises(FileExistsError):
+            bench.main(argv)
+        assert output.read_text(encoding="utf-8") == "preserve the other process's report\n"
+        assert not any(name.startswith("_sm120_pr1010_benchmark") for name in sys.modules)
+        return
+
+    bench.main(argv)
     report = json.loads(output.read_text())
     assert len(report["records"]) == 4
     assert all(len(samples) == 6 for record in report["records"] for samples in record["samples_ms"].values())
