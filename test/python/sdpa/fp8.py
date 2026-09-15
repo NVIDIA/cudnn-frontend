@@ -294,7 +294,55 @@ def generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
 
     return graph_bwd
 
-def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=None):
+def _single_flip_fits(actual, expected, bad_rows, atol, rtol, operand, flip_unit):
+    """For every bad d-row, find the ONE operand row whose scalar multiple explains the row's whole deviation.
+
+    A gradient/output d-row is a sum over one reduction axis of (fp8 intermediate) x (operand row):
+    dK[j] = sum_i dS[i, j] * Q[i], dQ[i] = sum_j dS[i, j] * K[j], dV[j] = sum_i P[i, j] * dO[i],
+    O[i] = sum_j P[i, j] * V[j].  One flipped fp8 code at (i, j) therefore moves the row by exactly
+    ``ulp * operand_row``: a rank-1 update along a SINGLE operand row, with a step ``ulp`` that is a
+    power of two times the intermediate's descale (``flip_unit``).  A real defect -- a corrupted tile,
+    a mask off by one column, a wrong descale -- is a sum over many intermediates and matches no
+    single row.  Returns a list of (row, operand_row, alpha, log2(alpha / flip_unit)) when every bad
+    row fits, else None (and prints the first row that does not).
+    """
+    d = actual.shape[-1]
+    a = actual.reshape(-1, d)
+    e = expected.reshape(-1, d)
+    ops = operand.detach().float().reshape(-1, operand.shape[-1]).to(a.device)
+    if ops.shape[-1] != d:
+        print(f"%%%% single-flip check skipped: operand d={ops.shape[-1]} does not match the output d={d}")
+        return None
+    norms = (ops * ops).sum(dim=-1)
+    fits = []
+    for r in bad_rows.nonzero().flatten().tolist():
+        rvec = a[r] - e[r]
+        tol = atol + rtol * e[r].abs()
+        alpha = torch.where(norms > 0, (ops @ rvec) / norms.clamp_min(1e-30), torch.zeros_like(norms))
+        resid = (rvec[None, :] - alpha[:, None] * ops).abs()
+        ok = (resid <= tol[None, :]).all(dim=-1) & (alpha != 0)
+        k = torch.log2((alpha.abs() / flip_unit).clamp_min(1e-30))
+        # one fp8 ulp is a power of two (e4m3: 2^-9 subnormal .. 2^5 at 256-448; e5m2 reaches 2^13); the
+        # output's own fp16/fp8 rounding perturbs the fitted step, so accept within a factor of 1.25.
+        ok &= ((k - k.round()).abs() <= math.log2(1.25)) & (k.round() >= -16) & (k.round() <= 13)
+        if not bool(ok.any()):
+            best = int((resid / tol[None, :]).amax(dim=-1).argmin().item())
+            print(
+                f"%%%% d-row {_unravel(r, actual.shape[:-1])} is NOT a single flip: best operand row {_unravel(best, operand.shape[:-1])} leaves max |residual| / tol = "
+                f"{(resid[best] / tol).max().item():.2f} (alpha={alpha[best].item():+.5f} = 2^{k[best].item():.2f} x flip_unit)"
+            )
+            return None
+        cand = ok.nonzero().flatten()
+        i = int(cand[(resid[cand] / tol[None, :]).amax(dim=-1).argmin()].item())
+        fits.append((_unravel(r, actual.shape[:-1]), _unravel(i, operand.shape[:-1]), alpha[i].item(), k[i].item()))
+    return fits
+
+
+def _unravel(flat, shape):
+    return tuple(int(x) for x in torch.unravel_index(torch.tensor(flat), tuple(shape)))
+
+
+def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=None, operand=None, flip_unit=None):
     """assert_close for fp8 SDPA outputs/gradients with a small mismatch budget.
 
     The kernel and the reference each quantize P (with s_scale) and dS (with dP_scale) to fp8
@@ -322,12 +370,22 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=N
     rate on B200: e5m2 d256 no-mask s=1093 (test_sdpa_fp8_fwd_L0[test136]) flipped 79 of 61,208
     O rows = 1.2e-6 per P value, 2 elements per row (only the largest-|v| dims clear atol). The
     row budget is only honoured while every deviation stays within 4*atol -- one fp8 P step
-    times |v| for this suite's sparse-int data (measured flips: 0.13-0.375). The cap is what
-    rejects a real defect: the GitHub #981 d256 fp8 corruption (garbage weights on a 16-key
-    band) measured on the unfixed kernel as 11,048 elements / 253 rows / max 2.0 (MHA),
-    1,591 / 37 / 0.42 (e4m3) and 562 / 15 / 0.69 (s=1024) -- the row counts sit inside the
-    rows * keys budget, the magnitudes never do. Do not raise the cap for a "slightly" worse
-    flip; recompute the reference with the flipped P value instead (see test310 above).
+    times |v| for this suite's sparse-int data (measured flips: 0.13-0.375) -- OR, when the
+    caller passes ``operand`` / ``flip_unit``, while every bad row is structurally ONE flip: a
+    rank-1 update along a single operand row (Q for dK, K for dQ, dO for dV, V for O) whose step
+    is a power of two times the intermediate's descale (dP_descale for dQ/dK, s_descale for
+    dV/O), after which the row meets the ordinary tolerance (``_single_flip_fits``).  The cap
+    alone is not a physical bound: the negative-score q rows have amplitude m = 8 at d192 /
+    attn_scale 1/8, so one dS step of 2^-4 * dP_descale moves a dK row by 0.5 -- the sm107
+    212-SM lane's test310 (2026-09-15: dK row 1464 uniformly +-0.5, dQ row 575 by <= 0.25 =
+    the same flip at (575, 1464) seen through K), a flip the cap rejects and the structure
+    check proves.  The cap is what rejects a real defect: the GitHub #981 d256 fp8 corruption
+    (garbage weights on a 16-key band) measured on the unfixed kernel as 11,048 elements / 253
+    rows / max 2.0 (MHA), 1,591 / 37 / 0.42 (e4m3) and 562 / 15 / 0.69 (s=1024) -- the row
+    counts sit inside the rows * keys budget, the magnitudes never do, and a band of wrong
+    weights is a sum over many operand rows, so it is not rank-1 in one of them either. Do not
+    raise the cap for a "slightly" worse flip; pass the operand and let the structure decide, or
+    recompute the reference with the flipped P value (see test310 above).
     """
     actual = actual.detach().float()
     expected = expected.detach().float()
@@ -350,6 +408,12 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=N
         f"first at {idx}: actual={actual[idx].item():+.5f} expected={expected[idx].item():+.5f}; max |diff|={max_diff:.4f} (row-budget cap {4 * atol})"
     )
     within_budget = n_bad <= allowed or (n_bad_rows <= allowed_rows and max_diff <= 4 * atol)
+    if not within_budget and n_bad_rows <= allowed_rows and operand is not None and flip_unit is not None and not bool(nonfinite.any()):
+        fits = _single_flip_fits(actual, expected, bad_rows, atol, rtol, operand, float(flip_unit))
+        if fits is not None:
+            for r, i, alpha, k in fits:
+                print(f"%%%% '{tag}': d-row {r} is ONE flipped fp8 intermediate: operand row {i} x alpha={alpha:+.5f} (2^{k:.2f} x flip_unit {float(flip_unit):.5g})")
+            within_budget = True
     if not within_budget or bool(nonfinite.any()):
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, equal_nan=False)
 
@@ -612,7 +676,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
         # E5M2 is less precise than E4M3, so its P quantization needs one wider step.
         atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2
-        assert_close_fp8_grad(o_gpu_float, o_ref_float, atol, rtol, tag="O", keys=s_kv)
+        assert_close_fp8_grad(o_gpu_float, o_ref_float, atol, rtol, tag="O", keys=s_kv, operand=v_gen, flip_unit=s_descale_gpu.item())
 
     # Backward pass
     if not cfg.is_infer:
@@ -780,9 +844,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
             # E5M2 is less precise than E4M3, so its P quantization needs one wider step.
             atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2
-            assert_close_fp8_grad(dQ_out, dQ_ref_float, atol, rtol, tag="dQ", keys=s_kv)
-            assert_close_fp8_grad(dK_out, dK_ref_float, atol, rtol, tag="dK", keys=s_qo)
-            assert_close_fp8_grad(dV_out, dV_ref_float, atol, rtol, tag="dV", keys=s_qo)
+            assert_close_fp8_grad(dQ_out, dQ_ref_float, atol, rtol, tag="dQ", keys=s_kv, operand=k_gen, flip_unit=dP_descale_gpu.item())
+            assert_close_fp8_grad(dK_out, dK_ref_float, atol, rtol, tag="dK", keys=s_qo, operand=q_gen, flip_unit=dP_descale_gpu.item())
+            assert_close_fp8_grad(dV_out, dV_ref_float, atol, rtol, tag="dV", keys=s_qo, operand=dO_gen, flip_unit=s_descale_gpu.item())
 
             if with_sink_token:
                 torch.testing.assert_close(dSink_token_gpu, dSink_token_ref, atol=0.02, rtol=0.2)

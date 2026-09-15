@@ -736,12 +736,16 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
         torch.cuda.synchronize()
         outs[with_stats] = out.clone()
     assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested (Sigma normalizes O in both specializations)"
-    # The exact LSE of the problem the kernel saw: dequantized fp8 Q/K, fp32 logits.
+    # The exact LSE of the problem the kernel saw: dequantized fp8 Q/K, fp64 logits.  fp64, not fp32: the
+    # DLFW containers run fp32 matmul in TF32 (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1, and torch's own default
+    # on Blackwell+), a ~3e-4 relative error per logit that a 1024-column log-sum-exp averages down to
+    # ~2e-5 but a causal row with one valid column keeps whole -- 1.3e-4 on the sm107 CI lane, read as a
+    # kernel failure (2026-09-15).  cf. fp8_ref.compute_ref_forward's ``dtype`` note.
     rep = hq // hkv
-    logits = (q8.float() * dq) @ (k8.float() * dk).repeat_interleave(rep, 1).transpose(-1, -2) * d_qk**-0.5
+    logits = (q8.double() * dq.double()) @ (k8.double() * dk.double()).repeat_interleave(rep, 1).transpose(-1, -2) * d_qk**-0.5
     if causal:
         logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
-    lse_ref = torch.logsumexp(logits.double(), dim=-1).float()
+    lse_ref = torch.logsumexp(logits, dim=-1).float()
     assert torch.isfinite(lse).all(), "unwritten LSE rows"
     err = (lse - lse_ref).abs()
     assert (
