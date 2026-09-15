@@ -947,3 +947,62 @@ def test_sm107_causal_ranking_picks_the_policy_by_gqa_and_wave_count():
     sm120 = _caps("sdpa_fwd_prefill_sm120")
     f16 = dict(dtype=cudnn.data_type.HALF, dtype_o=cudnn.data_type.HALF, causal=True, b=1, h_q=32, h_kv=32, d_qk=128, d_v=128)
     assert heuristics._sched_points(sm120, _f16_facts(s_q=2048, s_kv=2048, device_cc=(12, 0), **f16)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128)])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_mxfp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal):
+    """Rubin e2e for the MXFP8 d128 / d192x128 kernels (row-sum-in-MMA since
+    #1059): the PUBLISHED Stats is the fp32 log-sum-exp of the block-scaled
+    problem the kernel saw, not the log of the quantized-P sum that
+    normalizes O -- cuDNN's mxfp8 backward recomputes P = exp(S - Stats), and
+    the fp8 twin lost a dK row to exactly that (test_mhas_v2 fp8_bwd_ragged
+    test31).  (1) LSE within 1e-4 of the exact value from the DEQUANTIZED
+    inputs; (2) O bit-identical with and without Stats."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 MXFP8 kernels serve cc10.7 only")
+    from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    torch.manual_seed(0)
+    b, hq, hkv, s = 2, 8, 2, 1024
+    dev = "cuda"
+    qf = torch.randn(b, hq, s, d_qk, device=dev) * 0.5
+    kf = torch.randn(b, hkv, s, d_qk, device=dev) * 0.5
+    vf = torch.randn(b, hkv, s, d_v, device=dev) * 0.5
+
+    def mx(x, h, d, columnwise):
+        data_d, ref_d, swz_d, data_s, ref_s, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, s, d, 32, torch.float8_e4m3fn, with_ref=True)
+        data, ref, swz = (data_s, ref_s, swz_s) if columnwise else (data_d, ref_d, swz_d)
+        return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), ref.float().reshape(b, h, s, d), swz.contiguous()
+
+    q8, q_deq, sfq = mx(qf, hq, d_qk, False)
+    k8, k_deq, sfk = mx(kf, hkv, d_qk, False)
+    v8, _, sfv = mx(vf, hkv, d_v, True)
+    outs = {}
+    lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
+    for with_stats in (True, False):
+        out = torch.full((b, s, hq, d_v), 1.5e30, device=dev, dtype=torch.bfloat16).transpose(1, 2)
+        api = SdpaFwdDslSm100(
+            q8, k8, v8, out, lse if with_stats else None, scale_softmax=d_qk**-0.5, is_causal=causal, pertensor_fp8=False, dtype_o=torch.bfloat16, cga=2
+        )
+        assert api.check_support()
+        api.compile()
+        api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        torch.cuda.synchronize()
+        outs[with_stats] = out.clone()
+    assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested (the MMA row-sum normalizes O in both specializations)"
+    rep = hq // hkv
+    logits = q_deq @ k_deq.repeat_interleave(rep, 1).transpose(-1, -2) * d_qk**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    lse_ref = torch.logsumexp(logits.double(), dim=-1).float()
+    assert torch.isfinite(lse).all(), "unwritten LSE rows"
+    err = (lse - lse_ref).abs()
+    assert (
+        err.max().item() <= 1e-4
+    ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (quantized-sum LSE reads ~1e-3..1e-2)"

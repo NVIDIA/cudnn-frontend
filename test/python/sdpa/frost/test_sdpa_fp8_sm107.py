@@ -667,3 +667,71 @@ def test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors(d_qk, d_v, c
             assert torch.equal(
                 outs[pol], outs[SCHED_NATURAL]
             ), f"policy {pol} must be bit-identical to NATURAL -- a different tile walk, the same per-tile math"
+
+
+@pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128)])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal):
+    """Rubin e2e: the PUBLISHED Stats is the fp32 log-sum-exp of the problem the
+    kernel actually saw (cuDNN's definition -- its fp8 backward recomputes
+    P = exp(S - Stats) from it), NOT the log of the fp8-QUANTIZED P sum that
+    normalizes O.  The d128 / d192x128 fp8 kernels sum P in the MMA (Sigma,
+    #580) for O; until 2026-09-15 that quantized sum also fed the LSE: max
+    1.3e-2 / rms 2.9e-3 off the exact value on test_mhas_v2
+    fp8_bwd_ragged test31 (212-SM dataset; native cuDNN: 2e-5), enough to flip
+    one fp8 dS rounding in the native backward and lose a dK row.  No P scale
+    fixes it (3 mantissa bits) -- only the fp32 register row-sum, which the
+    stats-requested specialization now carries.  Two claims:
+    (1) LSE within 1e-4 of the exact fp32 log-sum-exp (this would read >1e-3
+        on most rows with the quantized sum);
+    (2) O is BIT-IDENTICAL with and without Stats -- the row-sum only feeds the
+        LSE, Sigma normalizes O in both specializations."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    torch.manual_seed(0)
+    b, hq, hkv, s = 2, 8, 2, 1024
+    dev = "cuda"
+    fmax = 448.0
+
+    def quant(x):
+        dsc = (x.abs().amax().clamp_min(1e-8) / fmax).item()
+        return (x / dsc).clamp(-fmax, fmax).to(torch.float8_e4m3fn), torch.full((1,), dsc, device=dev, dtype=torch.float32)
+
+    q8, dq = quant(torch.randn(b, hq, s, d_qk, device=dev) * 0.5)
+    k8, dk = quant(torch.randn(b, hkv, s, d_qk, device=dev) * 0.5)
+    v8, dv = quant(torch.randn(b, hkv, s, d_v, device=dev) * 0.5)
+    outs = {}
+    lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
+    for with_stats in (True, False):
+        out = torch.full((b, hq, s, d_v), 1.5e30, device=dev, dtype=torch.bfloat16)
+        api = SdpaFwdDslSm100(
+            sample_q=q8,
+            sample_k=k8,
+            sample_v=v8,
+            sample_o=out,
+            sample_lse=lse if with_stats else None,
+            scale_softmax=d_qk**-0.5,
+            is_causal=causal,
+            pertensor_fp8=True,
+        )
+        assert api.check_support()
+        api.compile()
+        api.execute(q_tensor=q8, k_tensor=k8, v_tensor=v8, o_tensor=out, lse_tensor=lse if with_stats else None, descale_q=dq, descale_k=dk, descale_v=dv)
+        torch.cuda.synchronize()
+        outs[with_stats] = out.clone()
+    assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested (Sigma normalizes O in both specializations)"
+    # The exact LSE of the problem the kernel saw: dequantized fp8 Q/K, fp32 logits.
+    rep = hq // hkv
+    logits = (q8.float() * dq) @ (k8.float() * dk).repeat_interleave(rep, 1).transpose(-1, -2) * d_qk**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    lse_ref = torch.logsumexp(logits.double(), dim=-1).float()
+    assert torch.isfinite(lse).all(), "unwritten LSE rows"
+    err = (lse - lse_ref).abs()
+    assert (
+        err.max().item() <= 1e-4
+    ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (quantized-sum LSE reads ~1e-3..1e-2)"
