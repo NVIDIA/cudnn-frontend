@@ -2862,7 +2862,7 @@ _SF_ATOM_ROWS = 128  # F8_128x4: the SF blob is padded to whole 128-row blocks
 
 
 def _moe_required_offset_multiple(chain, cfg) -> int:
-    """Divisor every routed-group start must carry for the GLOBAL-descriptor path."""
+    """Divisor of every group boundary, including S, for the GLOBAL-descriptor path."""
     req = cfg.cga_tile_mn[0]
     if chain.block_scale is not None:
         req = math.lcm(req, _SF_ATOM_ROWS)
@@ -2871,12 +2871,14 @@ def _moe_required_offset_multiple(chain, cfg) -> int:
 
 def _moe_aligned_offsets(chain, cfg) -> bool:
     """Can this (graph, geometry) address A and SFA globally, skipping the
-    per-routed-group TMA-descriptor rewrite? The promise is the caller's
-    `alignment_value` on the first_token_offset tensor; 1 (the default) never
-    qualifies, so an un-annotated graph keeps the rewrite."""
+    per-routed-group TMA-descriptor rewrite? `alignment_value` promises only
+    the explicit first_token_offset values; S (matmul.M), the implicit last
+    endpoint, must independently satisfy the same tile/SF alignment. The
+    default promise of 1 never qualifies, so un-annotated graphs keep the rewrite."""
     if not chain.has_moe or chain.moe is None:
         return False
-    return chain.moe.offset_multiple % _moe_required_offset_multiple(chain, cfg) == 0
+    required = _moe_required_offset_multiple(chain, cfg)
+    return chain.moe.offset_multiple % required == 0 and chain.matmul.M % required == 0
 
 
 # TMEM accumulator stages: 2 = MMA of tile N+1 overlaps the epilogue of tile N.

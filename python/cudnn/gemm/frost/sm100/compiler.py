@@ -275,9 +275,13 @@ def _tma_c_plumbing(chain: FusionChain, tma_slots: "frozenset[int]" = frozenset(
             "INJECT_COMPILE_TMA_C_PASS": "",
         }
     n_out = max(1, len(tma_slots))
+    c_lists = "tma_c_descs = [" + ", ".join(f"tma_c_desc_{i}" for i in range(n_out)) + "]"
+    if chain.has_moe:
+        # Group clipping follows M, which is dim 0 only on M-major descriptors.
+        c_lists += f"\ntma_c_m_major = {tuple(chain.output_specs[slot].major == 'm' for slot in sorted(tma_slots))!r}"
     return {
         "INJECT_KERNEL_TMA_C_PARAMS": ",\n".join(f"tma_c_desc_{i}: cutlass.GridConstant[_tma.TensorMap]" for i in range(n_out)) + ",",
-        "INJECT_TMA_C_LISTS": "tma_c_descs = [" + ", ".join(f"tma_c_desc_{i}" for i in range(n_out)) + "]",
+        "INJECT_TMA_C_LISTS": c_lists,
         "INJECT_HOST_TMA_C_PARAMS": ",\n".join(f"c_{i}: cute.Tensor" for i in range(n_out)) + ",",
         "INJECT_HOST_TMA_C_LISTS": "_tma_c_outputs = [" + ", ".join(f"c_{i}" for i in range(n_out)) + "]",
         "INJECT_HOST_TMA_C_PASS": ",\n".join(f"tma_c_desc_list[{i}]" for i in range(n_out)) + ",",
@@ -1672,7 +1676,7 @@ def _render_block_scale_tile_constants(
                 )
 
     # --- AB SMEM pipeline depth ----------------------------------------------
-    from ..tile_config import smem_ab_stages
+    from ..tile_config import smem_ab_budget_bytes, smem_ab_stages
 
     # TMA-store stages output through a fixed SMEM-D buffer; reserve it before
     # sizing the AB pipeline (else SMEM overflows the cap).
@@ -1698,9 +1702,27 @@ def _render_block_scale_tile_constants(
                 f"block-scale {cfg.name!r}: only {ab_stages} 128-B AB chunk " f"stages fit in SMEM — the sm103 pipeline needs >= 3 (one " f"K-tile in flight)"
             )
     else:
-        # One stage covers a whole K-tile: packed data + SF per DISTINCT operand.
-        per_stage = na * cta_m * a_cta_k_bytes + nb * (cta_n // cta_group) * b_cta_k_bytes + real_na * sfa_smem_bytes + real_nb * sfb_smem_bytes
-        ab_stages = max(1, smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=ab_reserved))
+        # Each DISTINCT operand has its own 1024-aligned ring, in template
+        # allocation order. Only real dequant operands allocate an SF ring.
+        ring_stage_bytes = [cta_m * a_cta_k_bytes] * na + [(cta_n // cta_group) * b_cta_k_bytes] * nb + [sfa_smem_bytes] * real_na + [sfb_smem_bytes] * real_nb
+        ab_stages = smem_ab_stages(sum(ring_stage_bytes), smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=ab_reserved)
+        smem_budget = smem_ab_budget_bytes(tmpl.smem_fixed_reserve)
+        while ab_stages:
+            # The fixed reserve covers control storage and the aligned start
+            # of the first ring. Pad whole rings, not individual stages.
+            ring_bytes = 0
+            for stage_bytes in ring_stage_bytes:
+                ring_bytes = align_up(ring_bytes, 1024) + stage_bytes * ab_stages
+            # Dense puts the 1024-aligned D buffer AFTER the SF rings. MoE
+            # puts it before them; its payload is a multiple of 1024 bytes
+            # and is already covered by ab_reserved. STG needs no final pad.
+            if use_tma_store_epi and chain.moe is None:
+                ring_bytes = align_up(ring_bytes, 1024)
+            if ring_bytes + ab_reserved <= smem_budget:
+                break
+            ab_stages -= 1
+        if ab_stages < 1:
+            raise NotImplementedError(f"block-scale {cfg.name!r}: no AB stage fits in SMEM including buffer alignment padding")
 
     out_dt = chain.output_dtype
     epi_store_dt = _epi_store_dtype(chain, cfg)
@@ -3369,7 +3391,7 @@ _SF_ATOM_ROWS = 128  # F8_128x4: the SF blob is padded to whole 128-row blocks
 
 
 def _moe_required_offset_multiple(chain, cfg) -> int:
-    """Divisor every routed-group start must carry for the GLOBAL-descriptor path."""
+    """Divisor of every group boundary, including S, for the GLOBAL-descriptor path."""
     req = cfg.cga_tile_mn[0]
     if chain.block_scale is not None:
         req = math.lcm(req, _SF_ATOM_ROWS)
@@ -3378,12 +3400,14 @@ def _moe_required_offset_multiple(chain, cfg) -> int:
 
 def _moe_aligned_offsets(chain, cfg) -> bool:
     """Can this (graph, geometry) address A and SFA globally, skipping the
-    per-routed-group TMA-descriptor rewrite? The promise is the caller's
-    `alignment_value` on the first_token_offset tensor; 1 (the default) never
-    qualifies, so an un-annotated graph keeps the rewrite."""
+    per-routed-group TMA-descriptor rewrite? `alignment_value` promises only
+    the explicit first_token_offset values; S (matmul.M), the implicit last
+    endpoint, must independently satisfy the same tile/SF alignment. The
+    default promise of 1 never qualifies, so un-annotated graphs keep the rewrite."""
     if not chain.has_moe or chain.moe is None:
         return False
-    return chain.moe.offset_multiple % _moe_required_offset_multiple(chain, cfg) == 0
+    required = _moe_required_offset_multiple(chain, cfg)
+    return chain.moe.offset_multiple % required == 0 and chain.matmul.M % required == 0
 
 
 # TMEM accumulator stages: 2 = MMA of tile N+1 overlaps the epilogue of tile N.
@@ -3541,8 +3565,11 @@ def _output_store_mode(
         return "stg"
 
     if out.major == "m":
-        # Same granule on a RUNTIME bound: MoE clips D per routed group.
-        if chain.has_moe:
+        # MoE clips D per routed group. Explicit offsets and the implicit last
+        # endpoint S must both satisfy the contiguous 16-byte granule; padding
+        # the column stride does not align S, and alignment_value only covers
+        # values stored in first_token_offset.
+        if chain.has_moe and (chain.moe.offset_multiple * carrier % 16 or chain.matmul.M * carrier % 16):
             return "stg"
         # A block taller than the drain emits ZERO stores.
         if cfg.epi_tile_m % _mmajor_atom_m(out.dtype):

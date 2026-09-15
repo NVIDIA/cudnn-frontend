@@ -30,6 +30,7 @@ from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
     moe_group_at as _moe_group_at,
     moe_swizzle_tile as _moe_swizzle_tile,
     replace_tensormap_global_address as _replace_tensormap_global_address,
+    replace_tensormap_global_dim_0 as _replace_tensormap_global_dim_0,
     replace_tensormap_global_dim_1 as _replace_tensormap_global_dim_1,
     tcgen05_alloc as _tcgen05_alloc,
     tcgen05_dealloc as _tcgen05_dealloc,
@@ -1197,7 +1198,10 @@ def _kernel(
                         _scratch = tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS)
                         _fence_tensormap_acquire(d_desc_ptr_list[_di])
                         if elect_one:
-                            _replace_tensormap_global_dim_1(_scratch, group_end)
+                            if cutlass.const_expr(tma_c_m_major[_di]):
+                                _replace_tensormap_global_dim_0(_scratch, group_end)
+                            else:
+                                _replace_tensormap_global_dim_1(_scratch, group_end)
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         if lane < TENSOR_MAP_QWORDS:
                             (d_desc_base_list[_di] + lane).store((_scratch.subview(lane)).load())

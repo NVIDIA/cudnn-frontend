@@ -16,6 +16,7 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
+from cutlass._mlir.dialects import llvm
 
 
 @cute.jit
@@ -67,6 +68,22 @@ def moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
     tile_m = off // cur_S
     tile_n = base_n + off - tile_m * cur_S
     return tile_m, tile_n
+
+
+@cute.jit
+def replace_tensormap_global_dim_0(desc_ptr, new_dim) -> None:
+    # Public DSL/NVVM builds reject ordinal 0 despite PTX using zero-based
+    # dimensions. Patch the shared-memory descriptor directly with legal PTX.
+    # The write must stay ordered before the caller copies/fences the descriptor.
+    llvm.inline_asm(
+        None,
+        [desc_ptr.data_ptr().toint(dtype=cutlass.Int32).ir_value(), cutlass.Int32(new_dim).ir_value()],
+        "tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [$0], 0, $1;",
+        "r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 @cute.jit

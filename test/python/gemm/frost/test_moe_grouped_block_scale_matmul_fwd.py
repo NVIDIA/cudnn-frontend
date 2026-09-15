@@ -7,6 +7,8 @@ dequant + group-loop reference. Covers the BxE > E case."""
 
 from __future__ import annotations
 
+import pathlib
+
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
@@ -182,6 +184,8 @@ def _build_graph(
     dequant_a=True,
     dequant_b=True,
     epilogue_relu=False,
+    output_major="n",
+    offset_multiple=1,
 ):
     block_size, default_dt, sf_dt = _COMBOS[combo]
     a_dt = default_dt if a_dt_override is None else a_dt_override
@@ -214,6 +218,7 @@ def _build_graph(
         stride=[1, 1, 1],
         data_type=offset_dt,
     )
+    fto.set_alignment_value(offset_multiple)
     tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size]) if dequant_a else tok
     w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1]) if dequant_b else w
     out = g.moe_grouped_matmul(
@@ -256,6 +261,9 @@ def _build_graph(
             q_scale.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
         return g
     out.set_data_type(output_dt).set_output(True)
+    if output_major == "m":
+        ldm = _ceil_div(S, 8) * 8  # Align BF16 column strides independently of S.
+        out.set_stride([ldm * N, 1, ldm])
     return g
 
 
@@ -451,6 +459,8 @@ def _run_e2e(
     quant_scale_torch_dt=torch.float8_e8m0fnu,
     quant_scale_reorder=False,
     weight_major="k",
+    output_major="n",
+    offset_multiple=1,
 ):
     dev = "cuda"
     torch.manual_seed(0)
@@ -504,6 +514,8 @@ def _run_e2e(
             quant_scale_reorder=quant_scale_reorder,
             quant_scale_dim=quant_scale_shape if quant_scale_reorder else None,
             weight_major=weight_major,
+            output_major=output_major,
+            offset_multiple=offset_multiple,
         ),
         config=cfg,
         cta_group=cta_group,
@@ -519,7 +531,10 @@ def _run_e2e(
         b = offsets_list[gi]
         e = offsets_list[gi + 1] if gi + 1 < num_groups else S
         sfa_parts.append(_to_blocked(sfa_log[b:e]))
-    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
+    # Byte views also support empty E8M0 segments, which torch.cat's generic
+    # CUDA path does not implement for that dtype.
+    sfa_live = torch.cat([part.view(torch.uint8) for part in sfa_parts]).view(sfa_log.dtype)
+    sfa_blk = _with_static_segmented_capacity(sfa_live, S, num_groups, sf_k)
     sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=offset_torch_dt, device=dev)
     if quant:
@@ -542,7 +557,14 @@ def _run_e2e(
             )
         output = [term, red]
     else:
-        output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
+        if output_major == "m":
+            ldm = _ceil_div(S, 8) * 8
+            raw = torch.full((2 * ldm * N + 4096,), 0xAB, device=dev, dtype=torch.uint8)
+            storage = raw[: 2 * ldm * N].view(1, N, 2 * ldm)
+            output = storage.view(torch.bfloat16).transpose(1, 2)[:, :S, :]
+            output.fill_(float("nan"))
+        else:
+            output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
 
     compiled(_vp_bs(compiled, tok_rt, w_rt, output, sfa_blk, sfb_blk, fto=offsets))
     torch.cuda.synchronize()
@@ -580,6 +602,43 @@ def _run_e2e(
         )
     else:
         torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=tol[0], rtol=tol[1])
+        if output_major == "m":
+            assert (raw[2 * ldm * N :] == 0xAB).all(), "the store ran past the output"
+            assert (storage[:, :, 2 * S :] == 0xAB).all(), "the store overwrote column padding"
+    return compiled
+
+
+@requires_sm100
+@pytest.mark.parametrize("combo", ("nvfp4", "mxfp4", "mxfp8"))
+@pytest.mark.parametrize("cta_group", (1, 2))
+@pytest.mark.parametrize(
+    "offset_multiple,bounds,S,store_mode,global_descriptors",
+    [
+        (8, [0, 104, 104, 304], 512, "tma", False),
+        (256, [0, 256, 256, 512], 512, "tma", True),
+        (256, [0, 256, 256], 510, "stg", False),
+        (256, [0, 256, 256], 504, "tma", False),
+    ],
+)
+def test_moe_block_scale_m_major_output(combo, cta_group, offset_multiple, bounds, S, store_mode, global_descriptors):
+    from cudnn.gemm.frost.compiler import _moe_aligned_offsets, _store_modes
+
+    compiled = _run_e2e(
+        E=3,
+        S=S,
+        N=256,
+        K=256,
+        offsets_list=bounds,
+        combo=combo,
+        config_name="CONFIG_sm100_128x256x128_128x256x32_cluster1x1" if cta_group == 1 else _CFG,
+        cta_group=cta_group,
+        output_major="m",
+        offset_multiple=offset_multiple,
+    )
+    assert compiled.chain.moe.offset_multiple == offset_multiple
+    assert _store_modes(compiled.chain, compiled._compiled.config) == (store_mode,)
+    assert _moe_aligned_offsets(compiled.chain, compiled._compiled.config) is global_descriptors
+    assert f"moe_aligned_offsets = {global_descriptors}\n" in pathlib.Path(compiled.generated_path).read_text()
 
 
 def _run_nonpacked_e2e(combo, config_name, cta_group, mode):
