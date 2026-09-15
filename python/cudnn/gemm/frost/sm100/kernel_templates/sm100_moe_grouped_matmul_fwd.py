@@ -22,7 +22,7 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
-from cudnn.gemm.frost.kernel_templates._tile_helpers import (
+from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
     fence_tensormap_acquire as _fence_tensormap_acquire,

@@ -175,7 +175,7 @@ covers them all at once:
   compile arch*, which the earlier constants did not. cutedsl derives the compile
   target from the ambient CUDA device (`torch.cuda.get_device_capability`), so a
   build for handle-GPU-A while GPU-B is current baked A's constants into a
-  B-targeted kernel. `_frost_compile_options()` (in `gemm/frost/compiler.py`) now
+  B-targeted kernel. `_frost_compile_options()` (in each `gemm/frost/<family>/compiler.py`) now
   pins `--gpu-arch sm_<scope>` into the `cute.compile()` options string, so the
   compile target follows the scope. The arch is part of the baked, content-hashed
   source, so a cross-arch kernel can no longer collide in the JIT cache with a

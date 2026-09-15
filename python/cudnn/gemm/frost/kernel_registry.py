@@ -25,7 +25,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
+from . import arch_family
 from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain
 from .tile_config import CATALOG, TileConfig, as_mma_tile_k, as_pipeline, config_class_for_pipeline
 
@@ -47,6 +49,25 @@ PIPELINE_ARCH_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
     "sm103": ((103, 110),),
     "sm120": ((100, 130),),
 }
+
+# The per-arch SOURCE TREE (``cudnn/gemm/frost/<family>/``, see ``arch_family``)
+# a pipeline family's templates ship in. sm103 is a tcgen05 pipeline and rides
+# the sm100 tree. A new pipeline needs an entry here AND in PIPELINE_ARCH_RANGES.
+PIPELINE_FAMILY: dict[str, str] = {
+    "sm100": "sm100",
+    "sm103": "sm100",
+    "sm120": "sm120",
+}
+
+
+def template_path(template_file: str) -> Path:
+    """Where ``template_file`` ships: the ``kernel_templates/`` of the arch tree
+    its pipeline prefix names (:data:`PIPELINE_FAMILY`). Resolved off the
+    TEMPLATE, not off whichever compiler copy is running, because one family may
+    render another's template where both run (an sm120 config on an SM 10.x
+    part, or a render-only host with no GPU at all)."""
+    return arch_family.template_dir(PIPELINE_FAMILY[_pipeline_from_file(template_file)]) / template_file
+
 
 # SM ranges whose dense FP8 / block-scale MMA issues a 64-byte K (half the
 # instruction count of sm100's 32). SILICON, not a pipeline -- an sm100-pipeline
@@ -294,7 +315,7 @@ class KernelTemplate:
     it is a TileConfig axis, and which modes a pipeline issues is a fact of the
     config family (``_CTA_GROUPS_BY_PIPELINE``), not of the template."""
 
-    file: str  # template filename under kernel_templates/
+    file: str  # template filename; ships under <family>/kernel_templates/ (see template_path)
     pipeline: str  # pipeline family from the filename; pairs with config_<pipeline>
     graph_type: GraphType  # the single graph type this template supports
     # ``None`` = take the config's. The warp count is a config axis; a template
@@ -317,6 +338,11 @@ class KernelTemplate:
             GraphType.BLOCK_SCALE_MATMUL,
             GraphType.MOE_BLOCK_SCALE,
         )
+
+    @property
+    def path(self) -> Path:
+        """The template source on disk (:func:`template_path`)."""
+        return template_path(self.file)
 
     # stage 0: active-GPU SM ranges (from the template's pipeline-family prefix)
 
@@ -512,6 +538,10 @@ def _mm(
     if pipeline not in PIPELINE_ARCH_RANGES:
         raise KeyError(
             f"template {file!r}: pipeline family {pipeline!r} has no SM-range entry in " f"PIPELINE_ARCH_RANGES — add one when introducing a new family"
+        )
+    if pipeline not in PIPELINE_FAMILY:
+        raise KeyError(
+            f"template {file!r}: pipeline family {pipeline!r} has no arch-tree entry in " f"PIPELINE_FAMILY — say which cudnn/gemm/frost/<family>/ it ships in"
         )
     cls = template_cls or (MainloopKernelTemplate if supports_mainloop_fusion else KernelTemplate)
     return cls(

@@ -8,7 +8,7 @@ bf16 GEMMs; at bf16 there is no descale epilogue, so nothing is fused here.
 
 WHY THIS EXISTS -- the one thing the generic GEMM cannot express
 ---------------------------------------------------------------
-``gemm/frost/kernel_templates/sm100_matmul.py`` carries a single batch axis
+``gemm/frost/sm100/kernel_templates/sm100_matmul.py`` carries a single batch axis
 ``l`` with ONE uniform stride.  The SDPA operands are BSHD ``[B, S, H, D]``, so
 the batch element is the PAIR ``(b, h)`` at offset ``b*(S*H*D) + h*D`` -- a
 two-level stride that no single uniform stride can express.  Flattening it
@@ -21,8 +21,8 @@ become **4-D** ``[k, m, h, b]`` (``cuTensorMapEncodeTiled`` allows 5), with
 single flat ``l`` -- ``_decode_bh`` splits it only where a TMA coordinate is
 formed, which is the whole change.
 
-KEEP IN SYNC WITH ``gemm/frost/kernel_templates/sm100_matmul.py``
------------------------------------------------------------------
+KEEP IN SYNC WITH ``gemm/frost/sm100/kernel_templates/sm100_matmul.py``
+-----------------------------------------------------------------------
 This file is a FORK of that template, taken from its rendered dense-bf16
 expansion (config ``sm100_128x256x128_128x256x32_cluster2x1_2ctamma``, no
 epilogue fusion, TMA-store epilogue).  The mainloop, the CLC scheduler, the
@@ -48,7 +48,7 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
-from cudnn.gemm.frost.kernel_templates._tile_helpers import (
+from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
