@@ -879,6 +879,11 @@ def _bsa_attn_fwd_sm120(
         sparse_block_size == SM120_BLK128_FWD_BLOCK_SIZE and not has_block_nums and not has_block_sizes and seqlen_k % SM120_BLK128_FWD_BLOCK_SIZE == 0
     )
     if use_fa4_blk128:
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        requirement_error = cutedsl_requirement_error("SM120 FA4-style blk128 forward")
+        if requirement_error is not None:
+            raise RuntimeError(requirement_error)
         from cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fa4 import (
             BlockSparseAttnForwardSm120Blk128Fa4,
         )

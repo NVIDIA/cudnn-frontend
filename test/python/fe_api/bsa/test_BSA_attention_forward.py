@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import builtins
 import importlib
 from types import SimpleNamespace
 
@@ -14,7 +15,35 @@ from fe_api.bsa.bsa_utils import make_fixed_metadata, make_variable_metadata, su
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
-def _import_bsa():
+@pytest.mark.L0
+def test_sm120_fa4_blk128_rejects_old_dsl_before_kernel_import(monkeypatch):
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("FA4-style blk128 is specific to SM120")
+    BSA = _import_bsa()
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.6.2")))
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fa4":
+            raise AssertionError("The FA4 kernel must not be imported with an unsupported DSL")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    q = torch.zeros((1, 1, 128, 128), device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros((1, 1, 1, 1), device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match=r"requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"):
+        BSA.block_sparse_attention_forward(q, q, q, indices, block_sparse_num=1, sparse_block_size=128)
+
+
+def _import_bsa(require_fa4=False):
+    if require_fa4:
+        from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+        installed, version = cutedsl_state()
+        if not installed or cutedsl_too_old(version):
+            pytest.skip("FA4-style blk128 requires a supported CuTe DSL version")
     try:
         from cudnn import BSA
 
@@ -109,7 +138,7 @@ def test_bsa_attention_forward_sm120_fa4_blk128_fixed_topk(dtype, block_sparse_n
     if major != 12:
         pytest.skip("FA4-style blk128 forward is specific to SM120")
 
-    BSA = _import_bsa()
+    BSA = _import_bsa(require_fa4=True)
     block_size = 128
     batch, q_heads, kv_heads, seqlen_q, seqlen_k, dim = 2, 4, 2, block_size + 1, 6 * block_size, 128
     q = torch.randn((batch, q_heads, seqlen_q, dim), device="cuda", dtype=dtype)
@@ -152,7 +181,7 @@ def test_bsa_attention_forward_sm120_blk128_wave_boundaries(dtype, wave_kind, bl
         "mixed": full_wave_q_blocks + 2,
     }[wave_kind]
     sequence = (q_blocks - 1) * 128 + 1
-    BSA = _import_bsa()
+    BSA = _import_bsa(require_fa4=True)
     q = torch.randn((1, 2, sequence, 128), device="cuda", dtype=dtype)
     k = torch.randn((1, 1, 768, 128), device="cuda", dtype=dtype)
     v = torch.randn_like(k)
@@ -176,7 +205,7 @@ def test_bsa_attention_forward_sm120_blk128_wave_boundaries(dtype, wave_kind, bl
 def test_bsa_sm120_wave_planning_is_not_repeated_on_cache_hits(monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("native blk128 wave scheduling requires SM120")
-    BSA = _import_bsa()
+    BSA = _import_bsa(require_fa4=True)
     from cudnn.block_sparse_attention import _interface
     from cudnn.block_sparse_attention.csrc.fwd.sm120_blk128 import bsa_fwd_sm120_fa4
 

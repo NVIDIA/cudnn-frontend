@@ -70,9 +70,10 @@ baseline must not be combined with the Server Edition measurements above.
 
 ## Validation and limits
 
-- The publication refresh, including the portable three-path harness and its
-  archive-integrity checks, passed **65 tests with 19 skips** across the entire
-  BSA directory, with the pinned legacy archive enabled.
+- The final publication refresh, including the portable three-path harness,
+  archive-integrity checks, and DSL-version guard, passed **66 tests with
+  19 skips** across the entire BSA directory, with the pinned legacy archive
+  enabled.
 - The September 15 MR refresh reran the entire `test/python/fe_api/bsa`
   directory: **53 passed, 19 skipped**, with no failures. The narrower forward
   and paired-harness checkpoint previously passed 33 tests with nine skips.
@@ -95,6 +96,9 @@ baseline must not be combined with the Server Edition measurements above.
   [accuracy note](SM120_OPTIMIZATION.md#final-wave-scheduling-checkpoint).
 - The optimized specialization requires fixed top-k, `q2k_block_nums=None`,
   `block_sizes=None`, full physical KV blocks, and QK/V dimensions 128.
+  It requires CuTe DSL 4.7.0 or newer and rejects an older public DSL before
+  importing the specialized kernel. The import-guard regression was observed
+  RED before the fix and GREEN afterward; GPU kernel arithmetic is unchanged.
   Other supported blk128 inputs use the general native kernel. Existing
   SM120 default blk64 behavior and the public function signature are unchanged.
 - These are single-GPU forward results. The earlier multi-GPU dual-stream

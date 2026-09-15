@@ -136,7 +136,10 @@ register-resident Q, and a four-fold-unrolled sparse loop. Most CTAs process
 while still loading full KV128 blocks and using the parent Q block's original
 metadata. This is Q-work scheduling, not KV128-to-KV64 lowering. Variable
 per-row block counts, explicit block sizes, and partial final KV blocks use
-the general native blk128 kernel. See the
+the general native blk128 kernel. The FA4-style specialization requires
+`nvidia-cutlass-dsl >= 4.7.0`; an older public DSL version is rejected with
+a version-specific error before the specialized kernel is imported. The
+package-wide downstream dependency floor is unchanged. See the
 [SM120 optimization summary](../../benchmark/bsa/SM120_REVIEW_SUMMARY.md) for
 measured gains and limitations.
 
