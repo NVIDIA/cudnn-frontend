@@ -112,12 +112,16 @@ def test_shared_template_code_sits_above_the_trees():
     assert (AF.FROST_DIR / "kernel_templates" / "split_k_reduction_epilogue_fusion.py").is_file()
     assert (AF.template_dir("sm100") / "_tile_helpers.py").is_file()
     assert not (AF.template_dir("sm120") / "_tile_helpers.py").exists()
+    import re
+
     for path in AF.template_files():
         src = path.read_text()
-        if "split_k_reduction_epilogue_fusion" in src:
-            assert "from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import" in src, path.name
-        if "_tile_helpers" in src:
-            assert "from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import" in src, path.name
+        # Import statements only: a template may MENTION a helper module it deliberately does not import.
+        imports = re.findall(r"^from (cudnn\.gemm\.frost[\w.]*) import", src, re.M)
+        if any(mod.endswith("split_k_reduction_epilogue_fusion") for mod in imports):
+            assert "cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion" in imports, path.name
+        if any(mod.endswith("_tile_helpers") for mod in imports):
+            assert "cudnn.gemm.frost.sm100.kernel_templates._tile_helpers" in imports, path.name
             assert path.parent == AF.template_dir("sm100"), path.name
 
 

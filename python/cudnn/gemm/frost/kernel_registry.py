@@ -596,6 +596,22 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         supports_multi_gemm=False,
         template_cls=Sm120KernelTemplate,
     ),
+    _mm(
+        # The warp-MMA MoE kernel: grouped persistent scheduler, A addressed by
+        # coordinate on one global descriptor (no tensormap scratch to reserve).
+        "sm120_moe_grouped_matmul_fwd.py",
+        graph_type=GraphType.MOE,
+        supports_multi_gemm=False,
+        template_cls=Sm120KernelTemplate,
+    ),
+    _mm(
+        # Its block-scale sibling: the same scheduler carrying each group's first
+        # SFA block; A and SFA both addressed by coordinate.
+        "sm120_moe_grouped_block_scale_matmul_fwd.py",
+        graph_type=GraphType.MOE_BLOCK_SCALE,
+        supports_multi_gemm=False,
+        template_cls=Sm120KernelTemplate,
+    ),
 )
 
 

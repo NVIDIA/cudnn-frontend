@@ -831,21 +831,27 @@ def _render_tile_constants(
     chain: FusionChain,
     tmpl,
 ) -> str:
-    """Module-level tile + dtype constants for the sm120 warp-MMA template
-    (``sm120_matmul.py``), appended below the template's defaults.
+    """Module-level tile + dtype constants for the sm120 warp-MMA templates
+    (``sm120_matmul.py`` and its MoE sibling ``sm120_moe_grouped_matmul_fwd.py``),
+    appended below the template's defaults.
 
-    Emits exactly the names that template reads from its
+    Emits exactly the names those templates read from their
     ``INJECT_TILE_CONSTANTS`` block. CC 12.x has no Tensor Memory, no tcgen05
     SMEM descriptors, no thread-block clusters and no TMA-store epilogue, so
     nothing of the tcgen05 renderer's world is computed here: no TMEM budget
     (``acc_stages``, the alloc size, the ``epi_packed_lanes`` / ``epi_dp22``
     drain layouts), no descriptor strides, no multicast plan, no mixed-CGA
     fallback. The one MN-major rule is the TMA group walk's: the whole SMEM
-    extent must cut into whole swizzle groups.
+    extent must cut into whole swizzle groups. The MoE template additionally
+    takes the persistent grid size and the ``first_token_offset`` dtype; it
+    patches no descriptor, so it needs neither ``a_tma_box_m`` nor
+    ``moe_aligned_offsets``.
     """
     _check_own_family(tmpl)
-    if chain.is_multi_gemm or chain.has_mainloop_fusion or chain.has_moe or chain.has_block_scale:
+    if chain.is_multi_gemm or chain.has_mainloop_fusion or chain.has_block_scale:
         raise NotImplementedError(f"{tmpl.file} renders plain single-GEMM matmul chains only")
+    if chain.has_moe and chain.matmul.a_major != "k":
+        raise NotImplementedError(f"{tmpl.file} loads the MoE token through a K-major TMA box; got a {chain.matmul.a_major}-major token")
     # warps_per_cta is a fact of the TEMPLATE (8 compute + TMA + CLC + 2 donors).
     if tmpl.warps_per_cta is not None:
         cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
@@ -927,6 +933,13 @@ def _render_tile_constants(
         *([f"splitk_reduce_elems = {_splitk_reduce_elems(chain)}"] if cfg.split_k_slices > 1 else []),
         f"frost_compile_options = {_frost_compile_options()!r}",
     ]
+    if chain.has_moe:
+        # MoE grouped matmul: the grouped persistent scheduler launches a FIXED
+        # grid of co-resident CTAs and pulls tiles off a global counter.
+        lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
+        # first_token_offset dtype (int32/int64) drives the compile() fake; the
+        # scheduler casts its reads to Int32.
+        lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
 
@@ -1245,22 +1258,29 @@ def _render_block_scale_tile_constants(
     chain: FusionChain,
     tmpl,
 ) -> str:
-    """Module-level constants for the sm120 block-scale template
-    (``sm120_block_scale_matmul.py``) -- the block-scale counterpart of
-    :func:`_render_tile_constants`, appended below the template's defaults.
+    """Module-level constants for the sm120 block-scale templates
+    (``sm120_block_scale_matmul.py`` and its MoE sibling
+    ``sm120_moe_grouped_block_scale_matmul_fwd.py``) -- the block-scale
+    counterpart of :func:`_render_tile_constants`, appended below the template's
+    defaults.
 
-    Emits exactly the names that template reads: the dense sm120 geometry and
+    Emits exactly the names those templates read: the dense sm120 geometry and
     STG-epilogue facts, plus the packed-operand and scale-factor facts the
-    block-scale template adds (packed row width, SF box shape, the warp MMA's
+    block-scale templates add (packed row width, SF box shape, the warp MMA's
     kind / scale-vec / scale-format / operand types). Nothing of the tcgen05
     renderer's world exists here: no TMEM budget, no SMEM descriptors, no
-    SMEM->TMEM (utccp) copy schedules, no multicast plan.
+    SMEM->TMEM (utccp) copy schedules, no multicast plan. The MoE template
+    additionally takes the persistent grid size and the ``first_token_offset``
+    dtype; it patches no descriptor (A and SFA are addressed by coordinate), so
+    it needs neither ``a_tma_box_m`` nor ``moe_aligned_offsets``.
     """
     _check_own_family(tmpl)
     from ..tile_config import _SM120_STG_STAGE_ELEMS, ConfigSm120, smem_ab_stages, validate_block_scale_config_sm120
 
-    if chain.is_multi_gemm or chain.has_mainloop_fusion or chain.has_moe:
+    if chain.is_multi_gemm or chain.has_mainloop_fusion:
         raise NotImplementedError(f"{tmpl.file} renders plain single-GEMM block-scale matmul chains only")
+    if chain.has_moe and chain.matmul.a_major != "k":
+        raise NotImplementedError(f"{tmpl.file} loads the MoE token through a K-major TMA box; got a {chain.matmul.a_major}-major token")
     # warps_per_cta is a fact of the TEMPLATE (8 compute + TMA + CLC + 2 donors).
     if tmpl.warps_per_cta is not None:
         cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
@@ -1430,6 +1450,12 @@ def _render_block_scale_tile_constants(
         f"sfa_tma_box_mn = {nb_m}",
         f"sfb_tma_box_mn = {nb_n}",
     ]
+    if chain.has_moe:
+        # MoE grouped block-scale matmul: the grouped persistent scheduler
+        # launches a FIXED grid of co-resident CTAs and pulls tiles off a
+        # global counter; first_token_offset's dtype drives the compile() fake.
+        lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
+        lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
 
@@ -3375,8 +3401,8 @@ def _precheck_moe(
         raise NotImplementedError(reason)
     if chain.matmul.a_major != "k":
         raise NotImplementedError(
-            "MoE grouped matmul supports only K-major token: the per-group A "
-            "descriptor patch walks the token rows by their M stride "
+            "MoE grouped matmul supports only K-major token: the grouped A walk "
+            "is a K-major TMA box offset to the routed group's first row "
             f"(got token {chain.matmul.a_major}-major)"
         )
     _arch_reason = select_template(chain, config).active_reject(config)
@@ -3428,8 +3454,8 @@ def _precheck_moe_block_scale(
         raise NotImplementedError(reason)
     if chain.matmul.a_major != "k":
         raise NotImplementedError(
-            "MoE block-scale matmul supports only K-major token: the per-group A "
-            "descriptor patch walks the token rows by their M stride "
+            "MoE block-scale matmul supports only K-major token: the grouped A walk "
+            "is a K-major TMA box offset to the routed group's first row "
             f"(got token {chain.matmul.a_major}-major)"
         )
     if chain.reductions:
@@ -4116,7 +4142,10 @@ def _jit_moe(
         aux_names=[aux.name for aux in chain.aux_tensors],
         binding=binding,
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
-        _desc_slots_per_cta=chain.num_a_operands + len([m for m in store_modes if m == "tma"]),
+        # The sm120 MoE template addresses A by coordinate on ONE global
+        # descriptor and stores STG, so it patches no tensormap: the workspace
+        # holds only the scheduler counter (template: moe_desc_slots = 0).
+        _desc_slots_per_cta=0,
         store_modes=store_modes,
         use_tma_store=use_tma,
     )
@@ -4543,9 +4572,11 @@ def _jit_moe_block_scale(
         _grid_ctas=grid_ctas,
         binding=binding,
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
-        _desc_slots_per_cta=chain.num_a_operands
-        + (0 if chain.block_scale.fake_dequant_a else chain.num_a_operands)
-        + len([m for m in store_modes if m == "tma"]),
+        # The sm120 MoE block-scale template addresses A and SFA by coordinate
+        # on one global descriptor each and stores STG, so it patches no
+        # tensormap: the workspace holds only the scheduler counter (template:
+        # moe_desc_slots = 0).
+        _desc_slots_per_cta=0,
         store_modes=store_modes,
         use_tma_store=use_tma,
     )

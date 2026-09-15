@@ -59,8 +59,15 @@ _MOE_BS_2 = [
 # is transposed-STG only. It shares no epilogue region with the tcgen05
 # families, so it is its own family here rather than a member of one. The
 # block-scale template is the same kernel with scale words riding the AB stage
-# and a block-scaled warp MMA; its epilogue is the dense one verbatim.
-_SM120 = [("sm120_matmul.py", 1), ("sm120_block_scale_matmul.py", 1)]
+# and a block-scaled warp MMA; its epilogue is the dense one verbatim. The MoE
+# templates are the dense kernels under the grouped persistent scheduler, their
+# store masked at group_end instead of M.
+_SM120 = [
+    ("sm120_matmul.py", 1),
+    ("sm120_block_scale_matmul.py", 1),
+    ("sm120_moe_grouped_matmul_fwd.py", 1),
+    ("sm120_moe_grouped_block_scale_matmul_fwd.py", 1),
+]
 
 # SETUP (LDTM shape + row base + span list) depends on the DRAIN LAYOUT, which
 # the compiler hands down as `epi_packed_lanes` / `epi_dp22` -- not on the MMA

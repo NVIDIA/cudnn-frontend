@@ -2885,7 +2885,7 @@ def test_no_template_hardcodes_the_staging_alignment() -> None:
     from cudnn.gemm.frost.compiler import _TMA_STORE_EPI_PIPELINES
 
     files = template_files()
-    assert len(files) == 8, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
+    assert len(files) == 10, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
     for path in files:
         src = path.read_text()
         assert "alignment=64" not in src, path.name
