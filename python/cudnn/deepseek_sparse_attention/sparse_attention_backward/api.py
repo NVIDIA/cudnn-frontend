@@ -345,6 +345,10 @@ def sparse_attention_backward_wrapper(
     ``workspace`` must hold at least
     ``SparseAttentionBackward.scratch_workspace_bytes()`` bytes.
     """
+    # SM100 routing depends on contiguity (the two-CTA plan launches without
+    # copies), so a plan built from strided inputs must not be reused for
+    # contiguous ones or vice versa; the exact strides do not matter beyond that.
+    all_inputs_contiguous = all(t.is_contiguous() for t in (q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length) if t is not None)
     key = (
         q.device,
         q.dtype,
@@ -359,9 +363,7 @@ def sparse_attention_backward_wrapper(
         int(block_tile),
         softmax_scale,
         bool(deterministic),
-        # SM100 routing depends on contiguity, so strided inputs get their own plan.
-        tuple(t.stride() for t in (q, kv, out, dout, lse, attn_sink, topk_idxs)),
-        topk_length.stride() if topk_length is not None else None,
+        all_inputs_contiguous,
     )
     obj = _cache_of_SparseAttentionBackwardObjects.get(key)
     if obj is None:
