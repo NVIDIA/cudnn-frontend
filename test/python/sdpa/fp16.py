@@ -86,7 +86,8 @@ def validate_config(cfg):
 
     if cfg.is_cu_seq_len:
         assert cfg.is_padding == True, "is_cu_seq_len=True requires is_padding=True"
-        assert cfg.is_train == False, "is_cu_seq_len=True is forward-only (cu_seq_len is not plumbed for backward)"
+        # cu_seq_len_q / cu_seq_len_kv reach the backward graph too (unified backward, cuDNN 9.28+); the composite
+        # backward waives them through the support surface.
         assert cfg.cu_seq_len_sides in ("both", "q", "kv"), f"invalid cu_seq_len_sides={cfg.cu_seq_len_sides}"
 
     assert isinstance(cfg.seq_len_q, (list, tuple)), "input 'seq_len_q' must be list or tuple"
@@ -112,6 +113,10 @@ def validate_config(cfg):
     if cudnn_version < "9.13.1" and cfg.implementation == cudnn.attention_implementation.UNIFIED:
         print("@@@@ Overall result: WAIVED, unified SDPA implementation requires cudnn 9.13.1 or higher.")
         pytest.skip("unified SDPA implementation requires cudnn 9.13.1 or higher")
+
+    if cudnn_version < "9.27.0" and cfg.is_train and cfg.implementation == cudnn.attention_implementation.UNIFIED:
+        print("@@@@ Overall result: WAIVED, unified SDPA backward implementation requires cudnn 9.27.0 or higher.")
+        pytest.skip("unified SDPA backward implementation requires cudnn 9.27.0 or higher")
 
     if cfg.s_q == cfg.s_kv == 1:
         print("@@@@ Overall result: WAIVED, skipping known issue of s_q == s_kv == 1.")
@@ -511,8 +516,10 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
     bias = graph.tensor(uid=int(TensorUid.bias), dim=bias_dim, stride=bias_stride, data_type=cudnn_dtype) if cfg.is_bias else None
     dBias = graph.tensor(uid=int(TensorUid.dBias), dim=bias_dim, stride=bias_stride, data_type=cudnn_dtype) if cfg.is_bias and not(cfg.d_qk == 256 and cfg.d_v == 256) else None
 
-    seq_len_q = graph.tensor(uid=int(TensorUid.seq_len_q), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_padding else None
-    seq_len_kv = graph.tensor(uid=int(TensorUid.seq_len_kv), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_padding else None
+    seq_len_q = graph.tensor(uid=int(TensorUid.seq_len_q), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if (cfg.is_padding and not cfg.is_cu_seq_len_q()) else None
+    seq_len_kv = graph.tensor(uid=int(TensorUid.seq_len_kv), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if (cfg.is_padding and not cfg.is_cu_seq_len_kv()) else None
+    cu_seq_len_q = graph.tensor(uid=int(TensorUid.cu_seq_len_q), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_cu_seq_len_q() else None
+    cu_seq_len_kv = graph.tensor(uid=int(TensorUid.cu_seq_len_kv), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_cu_seq_len_kv() else None
 
     seed = offset = dropout_tuple = None
     if cfg.is_dropout:
@@ -537,6 +544,8 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         use_padding_mask=cfg.is_padding,
         seq_len_q=seq_len_q,
         seq_len_kv=seq_len_kv,
+        cu_seq_len_q=cu_seq_len_q,
+        cu_seq_len_kv=cu_seq_len_kv,
         max_total_seq_len_q=max_t_q,
         max_total_seq_len_kv=max_t_kv,
         diagonal_band_left_bound=cfg.left_bound,
@@ -546,6 +555,7 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         use_deterministic_algorithm=cfg.is_determin,
         sink_token=sink_token,
         dSink_token=dSink_token,
+        implementation=cfg.implementation,
     )
 
     dQ.set_uid(int(dq_uid_out)).set_output(True).set_dim(cfg.shape_q).set_stride(cfg.stride_q)
@@ -576,6 +586,16 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         dK.set_ragged_offset(k_ragged_offset)
         dV.set_ragged_offset(v_ragged_offset)
         dO.set_ragged_offset(o_ragged_offset)
+        if cfg.with_ragged_offset_multiplier:
+            # the offset tables are in multiplier units; the gradients share Q/K/V/O's tables
+            q.set_ragged_offset_multiplier(cfg.d_qk)
+            k.set_ragged_offset_multiplier(cfg.d_qk)
+            v.set_ragged_offset_multiplier(cfg.d_v)
+            o.set_ragged_offset_multiplier(cfg.d_v)
+            dQ.set_ragged_offset_multiplier(cfg.d_qk)
+            dK.set_ragged_offset_multiplier(cfg.d_qk)
+            dV.set_ragged_offset_multiplier(cfg.d_v)
+            dO.set_ragged_offset_multiplier(cfg.d_v)
 
     try:
         graph.validate()
@@ -587,6 +607,14 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
     except cudnn.cudnnGraphNotSupportedError as e:
         print(f"@@@@ Overall result: WAIVED, not supported backward graph. {e}")
         pytest.skip("not supported backward graph")
+    except RuntimeError as e:
+        # AUTO found no implementation for this attribute set on this device (e.g. cumulative sequence
+        # lengths off SM10x): nothing to test, the per-implementation surfaces are exercised elsewhere.
+        if "No suitable implementation" not in str(e):
+            print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during backward graph build. {e}")
+            pytest.fail("unexpected exception during backward graph build", pytrace=False)
+        print(f"@@@@ Overall result: WAIVED, no SDPA backward implementation supports this graph. {e}")
+        pytest.skip("no SDPA backward implementation supports this graph")
     except Exception as e:
         print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during backward graph build. {e}")
         pytest.fail("unexpected exception during backward graph build", pytrace=False)
@@ -607,6 +635,8 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         int(TensorUid.dBias): tensors.get(TensorUid.dBias),
         int(TensorUid.seq_len_q): tensors.get(TensorUid.seq_len_q),
         int(TensorUid.seq_len_kv): tensors.get(TensorUid.seq_len_kv),
+        int(TensorUid.cu_seq_len_q): tensors.get(TensorUid.cu_seq_len_q),
+        int(TensorUid.cu_seq_len_kv): tensors.get(TensorUid.cu_seq_len_kv),
         int(TensorUid.q_ragged_offset): tensors.get(TensorUid.q_ragged_offset),
         int(TensorUid.k_ragged_offset): tensors.get(TensorUid.k_ragged_offset),
         int(TensorUid.v_ragged_offset): tensors.get(TensorUid.v_ragged_offset),

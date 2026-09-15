@@ -386,6 +386,8 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        bool const use_padding_mask,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
                        py::object const& max_total_seq_len_q,
                        py::object const& max_total_seq_len_kv,
                        bool const use_causal_mask,
@@ -402,7 +404,8 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        std::optional<PyCallback> fn,
                        std::optional<PyCallback> fn_bprop,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token) {
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
+                       cudnn_frontend::AttentionImplementation_t const& implementation) {
     auto attributes =
         cudnn_frontend::graph::SDPA_backward_attributes()
             .set_bias(bias)
@@ -411,12 +414,15 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
             .set_padding_mask(use_padding_mask)
             .set_seq_len_q(seq_len_q)
             .set_seq_len_kv(seq_len_kv)
+            .set_cu_seq_len_q(cu_seq_len_q)
+            .set_cu_seq_len_kv(cu_seq_len_kv)
             .set_diagonal_alignment(
                 diagonal_alignment)  // for backwards compatibility, this must be called prior to set_causal_mask_*
             .set_causal_mask(use_causal_mask)
             .set_causal_mask_bottom_right(use_causal_mask_bottom_right)
             .set_deterministic_algorithm(use_deterministic_algorithm)
             .set_compute_data_type(compute_data_type)
+            .set_implementation(implementation)
             .set_name(name);
 
     // Score modification callbacks
@@ -1235,6 +1241,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("use_padding_mask", false),
           py::arg_v("seq_len_q", nullptr),
           py::arg_v("seq_len_kv", nullptr),
+          py::arg_v("cu_seq_len_q", nullptr),
+          py::arg_v("cu_seq_len_kv", nullptr),
           py::arg_v("max_total_seq_len_q", py::none()),
           py::arg_v("max_total_seq_len_kv", py::none()),
           py::arg_v("use_causal_mask", false),
@@ -1252,6 +1260,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("score_mod_bprop", std::nullopt),
           py::arg_v("sink_token", nullptr),
           py::arg_v("dSink_token", nullptr),
+          py::arg_v("implementation", cudnn_frontend::AttentionImplementation_t::AUTO),
           R"pbdoc(
                 Compute the key, query, value gradients of scaled dot product attention.
 
@@ -1280,6 +1289,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     score_mod_bprop (Optional[callable]): An optional callback function for the backward pass of the attention score modification. Default is None.
                     sink_token (Optional[cudnn_tensor]): The sink attention token tensor for backward. Shape is (1, h_q, 1, 1), type is float32.
                     dSink_token (Optional[cudnn_tensor]): The sink attention token gradient tensor. Shape is (1, h_q, 1, 1), type is float32.
+                    implementation (Optional[cudnn.attention_implementation]): One of {"AUTO", "COMPOSITE", "UNIFIED"}. Almost all users should use "AUTO" (the default), which picks UNIFIED when the requested features are supported by it and COMPOSITE otherwise.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
                     diagonal_band_left_bround (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
