@@ -1707,8 +1707,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._logger.debug("check_support completed successfully")
         return True
 
-    def compile(self) -> None:
-        self._logger.debug("Entering compile")
+    def template_params(self) -> Sm100TemplateParams:
+        """The compile-time record ``compile()`` loads the kernel module with.
+
+        Exposed (rather than inlined in ``compile``) so a caller that swaps in a
+        FORK of this flavor's kernel -- the gated attention block's
+        ``fuse_gate`` path -- loads it with the SAME record instead of
+        re-typing it, which is how the two would otherwise drift (engine
+        contract S6: ``TemplateParams`` is the OUTPUT of the match).  Pure
+        extraction of the former ``compile()`` prologue; requires
+        ``check_support()``.
+        """
         self._ensure_support_checked()
         # MXFP8 on cc10.3+ fuses the S_acc row-max into the LDTM (the fp8/f16 kernels
         # don't read this flag). Auto-set from the device capability so an SM103 run
@@ -1846,6 +1855,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 cta_mma=auto_cga if self.cga is None else params.cta_mma,
             )
             params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
+        return params
+
+    def compile(self) -> None:
+        self._logger.debug("Entering compile")
+        self._ensure_support_checked()
+        params = self.template_params()
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
