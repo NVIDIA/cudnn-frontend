@@ -402,14 +402,17 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # has nothing to protect in L2 and its row order only costs; the plain
         # heads-fastest LPT walk is the faster one for packed and unpacked units.
         primary = SCHED_LPT
-    elif causal_ish and caps.sm_lo >= 107 and int(facts.h_q) == int(facts.h_kv):
-        # Rubin without GQA: every KV head is read by exactly one Q head, so
+    elif causal_ish and 107 <= caps.sm_lo < 120 and int(facts.h_q) == int(facts.h_kv):
+        # Rubin (cc 10.7-11.x) without GQA: every KV head is read by exactly one Q head, so
         # LPT_L2 has no K/V sharing to group -- and it is not free (-10 % at
         # S=2K, see the constants above).  Plain LPT balances the triangle
         # while the grid is a few waves and costs at many, so choose by wave
         # count.  GQA shapes keep the L2 rule below (llama d128 H64/8 on the
         # same node: LPT_L2 +4..8 % over NATURAL at every S).  Rubin only until
         # the SM100 line is measured the same way.
+        # The bound is the arch LINE, not `>= 107`: the SM120 rows sit at sm_lo=120 and
+        # keep the SM100/SM120 L2-budget rule below (the wave-count constants above
+        # are Rubin's cluster count and CGA rows, unmeasured on GeForce Blackwell).
         waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / _SM107_CLUSTERS
         primary = SCHED_LPT if waves <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
     elif causal_ish:

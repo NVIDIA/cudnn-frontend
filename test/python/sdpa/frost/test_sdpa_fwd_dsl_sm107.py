@@ -942,3 +942,8 @@ def test_sm107_causal_ranking_picks_the_policy_by_gqa_and_wave_count():
     # The SM100 row is untouched by the Rubin rule: the L2-budget primary stays.
     sm100 = _caps("sdpa_fwd_prefill_sm100_fp8")
     assert heuristics._sched_points(sm100, _f16_facts(s_q=2048, s_kv=2048, device_cc=(10, 0), **dsv3)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    # SM120 (sm_lo=120) is NOT the Rubin line even though 120 >= 107: a causal no-GQA
+    # GeForce-Blackwell graph keeps the SM100/SM120 L2-budget primary too (PR #1059 review).
+    sm120 = _caps("sdpa_fwd_prefill_sm120")
+    f16 = dict(dtype=cudnn.data_type.HALF, dtype_o=cudnn.data_type.HALF, causal=True, b=1, h_q=32, h_kv=32, d_qk=128, d_v=128)
+    assert heuristics._sched_points(sm120, _f16_facts(s_q=2048, s_kv=2048, device_cc=(12, 0), **f16)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
