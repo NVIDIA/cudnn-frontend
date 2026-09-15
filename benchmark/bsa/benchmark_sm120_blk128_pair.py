@@ -22,6 +22,7 @@ from benchmark_sm120_blk128 import _make_block_indices, _rounded_topk, _validate
 
 
 def _parse_args(argv=None):
+    """Validate paired-run options and prevent JSON from replacing source files."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-source", type=Path, required=True)
     parser.add_argument("--sequence", type=int, default=142720)
@@ -50,6 +51,7 @@ def _parse_args(argv=None):
 
 
 def _summarize(baseline_ms, candidate_ms):
+    """Validate paired timings and report median-based speedup and latency."""
     if not baseline_ms or len(baseline_ms) != len(candidate_ms):
         raise ValueError("timings must contain the same positive number of paired samples")
     if any(not math.isfinite(value) or value <= 0 for value in (*baseline_ms, *candidate_ms)):
@@ -68,6 +70,7 @@ def _summarize(baseline_ms, candidate_ms):
 
 @torch.no_grad()
 def main(argv=None):
+    """Interleave saved and current kernels, restoring dispatch and cache state."""
     args = _parse_args(argv)
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         raise RuntimeError("This benchmark requires an SM120 GPU")
@@ -83,6 +86,7 @@ def main(argv=None):
     records = []
 
     def call(q2k, topk):
+        """Invoke the public blk128 wrapper on this run's shared Q/K/V tensors."""
         return BSA.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num=topk, sparse_block_size=128)
 
     try:
@@ -102,6 +106,7 @@ def main(argv=None):
                     _validate_samples(q, k, v, result["o_tensor"], result["lse_tensor"], q2k, 128)
 
                 def run(name):
+                    """Select a precompiled variant without compiling inside timing."""
                     key, compiled = variants[name]
                     _interface.bsa_attn_fwd.compile_cache.clear()
                     _interface.bsa_attn_fwd.compile_cache[key] = compiled

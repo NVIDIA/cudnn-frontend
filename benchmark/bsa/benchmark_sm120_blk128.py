@@ -19,10 +19,12 @@ from cudnn import BSA
 
 
 def _rounded_topk(num_blocks: int, density: float) -> int:
+    """Round density to a nearest block count, clamped to [1, num_blocks]."""
     return max(1, min(num_blocks, math.floor(density * num_blocks + 0.5)))
 
 
 def _coprime_step(num_blocks: int) -> int:
+    """Choose a modular stride that visits every KV block before repeating."""
     step = min(997, num_blocks - 1)
     while step > 1 and math.gcd(step, num_blocks) != 1:
         step -= 1
@@ -36,6 +38,7 @@ def _make_block_indices(
     pattern: str,
     device: torch.device,
 ) -> torch.Tensor:
+    """Build unique per-head, per-query KV selections in [1, H, Q, topk]."""
     q_idx = torch.arange(num_blocks, device=device, dtype=torch.int64).view(1, -1, 1)
     h_idx = torch.arange(heads, device=device, dtype=torch.int64).view(-1, 1, 1)
     k_idx = torch.arange(topk, device=device, dtype=torch.int64).view(1, 1, -1)
@@ -49,6 +52,7 @@ def _make_block_indices(
 
 
 def _time_cuda(fn: Callable[[], object], warmup: int, repeats: int) -> tuple[list[float], float]:
+    """Return CUDA-event samples and mean wall time in ms after warmup."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -73,6 +77,7 @@ def _validate_samples(
     block_indices: torch.Tensor,
     block_size: int,
 ) -> tuple[float, float]:
+    """Check two boundary query/head pairs against FP32 sparse attention."""
     sample_pairs = ((0, 0), (q.shape[1] - 1, q.shape[2] - 1))
     within_block = torch.arange(block_size, device=q.device, dtype=torch.int64)
     max_out_error = 0.0
@@ -94,6 +99,7 @@ def _validate_samples(
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse workload, timing, and dense-relative acceptance options."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sequence", type=int, default=142720)
     parser.add_argument("--heads", type=int, default=8)
@@ -108,6 +114,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 @torch.no_grad()
 def main(argv: Sequence[str] | None = None) -> int:
+    """Compare BF16 blk128 to cuDNN dense SDPA and optionally enforce a target."""
     args = _parse_args(argv)
     block_size = 128
     head_dim = 128
@@ -129,6 +136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     v = torch.randn(shape, device=device, dtype=torch.bfloat16)
 
     def dense_call() -> torch.Tensor:
+        """Execute dense noncausal attention using the cuDNN SDPA backend."""
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
             return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
@@ -145,6 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             block_indices = _make_block_indices(args.heads, num_blocks, topk, pattern, device)
 
             def sparse_call():
+                """Execute native blk128 attention with the current sparse mask."""
                 return BSA.block_sparse_attention_forward(
                     q,
                     k,

@@ -17,6 +17,7 @@ pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclu
 
 @pytest.mark.L0
 def test_sm120_fa4_blk128_rejects_old_dsl_before_kernel_import(monkeypatch):
+    """Reject an unsupported installed DSL before importing the FA4 kernel."""
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("FA4-style blk128 is specific to SM120")
     BSA = _import_bsa()
@@ -26,6 +27,7 @@ def test_sm120_fa4_blk128_rejects_old_dsl_before_kernel_import(monkeypatch):
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
+        """Fail if the unsupported-DSL path reaches the specialized kernel import."""
         if name == "cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fa4":
             raise AssertionError("The FA4 kernel must not be imported with an unsupported DSL")
         return original_import(name, *args, **kwargs)
@@ -38,6 +40,7 @@ def test_sm120_fa4_blk128_rejects_old_dsl_before_kernel_import(monkeypatch):
 
 
 def _import_bsa(require_fa4=False):
+    """Load BSA or skip unavailable dependencies, optionally checking the FA4 floor."""
     if require_fa4:
         from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 
@@ -98,6 +101,7 @@ def test_bsa_attention_forward_fixed_blocks():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=17)
 def test_bsa_attention_forward_sm120_native_blk128():
+    """Compare native blk128 forward output and LSE with the FP32 reference."""
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
@@ -132,6 +136,7 @@ def test_bsa_attention_forward_sm120_native_blk128():
 @pytest.mark.parametrize("block_sparse_num", (1, 2, 3, 4, 5))
 @torch_fork_set_rng(seed=20)
 def test_bsa_attention_forward_sm120_fa4_blk128_fixed_topk(dtype, block_sparse_num):
+    """Cover fixed top-k 1-5, GQA, partial Q, and query-dependent KV selections."""
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
@@ -170,6 +175,7 @@ def test_bsa_attention_forward_sm120_fa4_blk128_fixed_topk(dtype, block_sparse_n
 @pytest.mark.parametrize("wave_kind,block_sparse_num", (("tail_only", 3), ("unsplit", 1), ("full", 5), ("mixed", 3)))
 @torch_fork_set_rng(seed=20)
 def test_bsa_attention_forward_sm120_blk128_wave_boundaries(dtype, wave_kind, block_sparse_num):
+    """Validate all query rows across full, split-tail, mixed, and unsplit waves."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("native blk128 wave scheduling requires SM120")
     sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
@@ -203,6 +209,7 @@ def test_bsa_attention_forward_sm120_blk128_wave_boundaries(dtype, wave_kind, bl
 
 @pytest.mark.L0
 def test_bsa_sm120_wave_planning_is_not_repeated_on_cache_hits(monkeypatch):
+    """Ensure cached launches reuse the SM-count decision made during tracing."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("native blk128 wave scheduling requires SM120")
     BSA = _import_bsa(require_fa4=True)
@@ -213,6 +220,7 @@ def test_bsa_sm120_wave_planning_is_not_repeated_on_cache_hits(monkeypatch):
     original_query = bsa_fwd_sm120_fa4._device_sm_count
 
     def counted_query():
+        """Count device-metadata queries while preserving the actual SM count."""
         nonlocal query_count
         query_count += 1
         return original_query()
@@ -235,6 +243,7 @@ def test_bsa_sm120_wave_planning_is_not_repeated_on_cache_hits(monkeypatch):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=18)
 def test_bsa_attention_forward_sm120_native_blk128_variable_blocks_and_layout():
+    """Check variable counts, valid block sizes, empty rows, and BHSD/BSHD layouts."""
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
@@ -297,6 +306,7 @@ def test_bsa_attention_forward_sm120_native_blk128_variable_blocks_and_layout():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=19)
 def test_bsa_attention_forward_sm120_native_blk128_partial_q_and_kv_tiles():
+    """Verify native128 masking for partial final query and key/value tiles."""
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()

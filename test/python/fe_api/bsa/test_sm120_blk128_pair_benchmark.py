@@ -12,6 +12,7 @@ pytestmark = pytest.mark.L0
 
 
 def _load_benchmark(monkeypatch):
+    """Load the checkout's paired harness only with a supported CuTe DSL."""
     from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 
     installed, version = cutedsl_state()
@@ -27,6 +28,7 @@ def _load_benchmark(monkeypatch):
 
 
 def test_pair_benchmark_summary(monkeypatch):
+    """Check median arithmetic and reject empty, nonpositive, or NaN timings."""
     benchmark = _load_benchmark(monkeypatch)
     report = benchmark._summarize([10.0, 12.0, 11.0], [5.0, 6.0, 5.5])
     assert report["speedup"] == 2.0
@@ -41,6 +43,7 @@ def test_pair_benchmark_summary(monkeypatch):
 
 @pytest.mark.gpu_exclusive
 def test_pair_benchmark_sm120_smoke(monkeypatch, tmp_path):
+    """Check target failure, report privacy, and kernel/cache restoration on SM120."""
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("paired blk128 benchmark requires SM120")
     benchmark = _load_benchmark(monkeypatch)

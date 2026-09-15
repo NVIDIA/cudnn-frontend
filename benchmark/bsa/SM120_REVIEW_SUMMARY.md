@@ -39,7 +39,7 @@ gains (10.6%-11.4% lower latency), not gains against the already optimized
 `9869b9b6` baseline below. The report includes both tables, raw samples,
 accuracy checks, and reproducible commands.
 
-The current kernel checkpoint is `e0602027`. The additional-speedup baseline
+The measured optimization checkpoint is `e0602027`. The additional-speedup baseline
 is `9869b9b6`, which already includes FA4-style execution and two-fold
 unrolling. A 101-pair run with ten warmup pairs per case and seed `20260914`
 used one RTX PRO 6000 Blackwell **Server Edition**, SM120, with PyTorch
@@ -70,6 +70,11 @@ baseline must not be combined with the Server Edition measurements above.
 
 ## Validation and limits
 
+- The documentation-only review follow-up adds docstrings to touched
+  functions and kernel helpers. After stripping docstrings, all eight
+  modified Python files have identical ASTs to `3c6e02dd`; no executable
+  statements or numerical tolerances changed. Historical timing artifacts
+  retain their measured source hashes, not the documentation-refresh hashes.
 - The latest reviewer-fix refresh passed **67 tests with 19 skips** across
   the entire BSA directory, with the pinned legacy archive enabled. This
   includes the concurrent-output CLI regression, observed RED before the

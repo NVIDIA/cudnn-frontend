@@ -101,12 +101,15 @@ def make_calls(q, k, v, indices128, topk, legacy):
     torch.testing.assert_close(indices64[:, :, ::2], indices64[:, :, 1::2], rtol=0, atol=0)
 
     def native128():
+        """Run the current native128 wrapper with the original logical mask."""
         return BSA.block_sparse_attention_forward(q, k, v, indices128, block_sparse_num=topk, sparse_block_size=128)
 
     def native64():
+        """Run native64 with its equivalent mask already prepared outside timing."""
         return BSA.block_sparse_attention_forward(q, k, v, indices64, block_sparse_num=2 * topk, sparse_block_size=64)
 
     def pr1010():
+        """Run the pinned adapter, including its per-call metadata conversion."""
         return legacy.api.block_sparse_attention_forward(q, k, v, indices128, block_sparse_num=topk, sparse_block_size=128)
 
     return dict(native128=native128, native64=native64, pr1010=pr1010)
@@ -151,6 +154,7 @@ def validate_results(q, k, v, indices128, results, *, full_reference=False):
 
 
 def summarize(samples):
+    """Validate balanced samples and compute median-based three-path ratios."""
     if set(samples) != set(NAMES) or len({len(values) for values in samples.values()}) != 1:
         raise ValueError("All three paths must have equal sample counts")
     if any(not values or any(not math.isfinite(value) or value <= 0 for value in values) for values in samples.values()):
@@ -167,6 +171,7 @@ def summarize(samples):
 
 
 def _parse_args(argv=None):
+    """Validate the legacy archive, balanced timing options, and new JSON path."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--legacy-source-dir", type=Path, required=True, help="Archived PR #1010 block_sparse_attention package directory")
     parser.add_argument("--sequence", type=int, default=142720)
@@ -188,6 +193,7 @@ def _parse_args(argv=None):
 
 @torch.no_grad()
 def main(argv=None):
+    """Verify the SM120 checkout and archive, then run an isolated comparison."""
     args = _parse_args(argv)
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         raise RuntimeError("This benchmark requires an SM120 GPU")
@@ -197,6 +203,7 @@ def main(argv=None):
 
 
 def _run(args, hashes, legacy):
+    """Validate and time all paths, then exclusively create the JSON report."""
     torch.manual_seed(20260915)
     shape = (1, args.heads, args.sequence, 128)
     q, k, v = [torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3)]

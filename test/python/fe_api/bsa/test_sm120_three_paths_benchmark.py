@@ -14,6 +14,7 @@ pytestmark = pytest.mark.L0
 
 
 def _load_benchmark(monkeypatch):
+    """Load the checkout's three-path harness with version-gated dependencies."""
     from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 
     installed, version = cutedsl_state()
@@ -29,6 +30,7 @@ def _load_benchmark(monkeypatch):
 
 @pytest.fixture
 def legacy_source_dir():
+    """Return the explicitly supplied archive or skip legacy-dependent cases."""
     source = os.environ.get("SM120_PR1010_SOURCE_DIR")
     if source is None:
         pytest.skip("set SM120_PR1010_SOURCE_DIR to the archived PR #1010 BSA package for legacy comparisons")
@@ -36,6 +38,7 @@ def legacy_source_dir():
 
 
 def test_three_path_summary_and_balanced_order(monkeypatch):
+    """Check launch-order balance, timing arithmetic, and invalid-sample guards."""
     bench = _load_benchmark(monkeypatch)
     assert len(bench.ORDERS) == 6
     for position in range(3):
@@ -56,12 +59,14 @@ def test_three_path_summary_and_balanced_order(monkeypatch):
 
 @pytest.mark.parametrize("option,value", [("--sequence", "129"), ("--heads", "0"), ("--warmup", "-1"), ("--repeats", "7")])
 def test_three_path_invalid_arguments(monkeypatch, tmp_path, option, value):
+    """Reject invalid workload dimensions and unbalanced timing options."""
     bench = _load_benchmark(monkeypatch)
     with pytest.raises(SystemExit):
         bench._parse_args(["--legacy-source-dir", str(tmp_path), "--json", str(tmp_path / "output.json"), option, value])
 
 
 def test_three_path_archive_and_output_guards(monkeypatch, tmp_path):
+    """Reject missing archive files and preserve reports present at CLI parsing."""
     bench = _load_benchmark(monkeypatch)
     output = tmp_path / "output.json"
     args = ["--legacy-source-dir", str(tmp_path), "--json", str(output)]
@@ -79,6 +84,7 @@ def test_three_path_archive_and_output_guards(monkeypatch, tmp_path):
 
 
 def test_three_path_tampered_archive(monkeypatch, legacy_source_dir, tmp_path):
+    """Reject an archived API that differs from the pinned Git revision."""
     bench = _load_benchmark(monkeypatch)
     for relative in bench.LEGACY_FILES:
         copied = tmp_path / relative
@@ -96,6 +102,7 @@ def test_three_path_tampered_archive(monkeypatch, legacy_source_dir, tmp_path):
 @pytest.mark.parametrize("topk", [1, 3])
 @torch.no_grad()
 def test_three_path_full_reference(monkeypatch, legacy_source_dir, pattern, topk):
+    """Compare every small-workload output row with FP32 and clean up imports."""
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("three-path benchmark requires SM120")
     bench = _load_benchmark(monkeypatch)

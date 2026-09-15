@@ -58,6 +58,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
         has_block_nums: bool = False,
         block_sizes_mode: int = 0,
     ):
+        """Configure FP16/BF16 native128 with fixed top-k and FP32 accumulation."""
         assert dtype in (cutlass.Float16, cutlass.BFloat16)
         assert acc_dtype == cutlass.Float32
         assert head_dim == 128 and value_dim == 128
@@ -91,6 +92,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ) -> None:
+        """Build stride-aware KV descriptors and plan full/tail CTAs during tracing."""
         del blocksparse_num_blocks_q2k, blocksparse_varblk
 
         assert mQ.shape[1] == mK.shape[1] == 128
@@ -106,6 +108,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
             tensor: cute.Tensor,
             is_v: cutlass.Constexpr[bool],
         ) -> cuda_experimental.TensorMap:
+            """Describe a full native KV128 tile without packing or reordering GMEM."""
             if cutlass.const_expr(is_v):
                 batch = tensor.shape[3]
                 heads = tensor.shape[2]
@@ -190,6 +193,11 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
         softmax_scale_log2: cutlass.Float32,
         full_tiles: cutlass.Constexpr[int],
     ) -> None:
+        """Initialize TMA barriers and dispatch one full-Q128 or tail-Q64 CTA.
+
+        Tail CTAs split only query rows; both variants consume complete KV128
+        tiles using the original logical sparse metadata.
+        """
         tidx, _, _ = cute.arch.thread_idx()
         lane = tidx % cute.arch.WARP_SIZE
         warp = cute.arch.warp_idx()
@@ -312,6 +320,12 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
         q_offset: cutlass.Int32,
         is_tail: cutlass.Constexpr[bool],
     ) -> None:
+        """Run one sparse query unit with four or eight compute warps.
+
+        A dedicated load warp issues native KV128 TMA transfers. Compute
+        warps keep Q in registers, apply online softmax, and reuse dead KV
+        shared storage for the output epilogue.
+        """
         compute_warps = 4 if is_tail else 8
         pipeline_threads = compute_warps * 32 + 32
         q_seq_idx = q_tile_idx * self.q_tile + q_offset

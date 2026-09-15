@@ -39,6 +39,7 @@ class BlockSparseAttnForwardSm120Blk128(BatchedStaticSchedulerMixin):
         has_block_nums: bool = True,
         block_sizes_mode: int = 0,
     ):
+        """Configure native 128x128 tiles, GQA, dtypes, and optional metadata."""
         self.dtype = dtype
         self.acc_dtype = acc_dtype
         assert self.dtype in [cutlass.Float16, cutlass.BFloat16], "SM120 blk128 fwd supports fp16/bf16"
@@ -66,6 +67,7 @@ class BlockSparseAttnForwardSm120Blk128(BatchedStaticSchedulerMixin):
         self.block_sizes_mode = block_sizes_mode
 
     def check_dim(self, tensor: cute.Tensor | list[cute.Tensor], mode: int):
+        """Require the selected mode to have 128 contiguous elements."""
         if isinstance(tensor, list):
             for t in tensor:
                 self.check_dim(t, mode)
@@ -97,6 +99,7 @@ class BlockSparseAttnForwardSm120Blk128(BatchedStaticSchedulerMixin):
         O_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
     ):
+        """Compute a query block from native KV128 tiles, honoring valid sizes."""
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -448,6 +451,7 @@ class BlockSparseAttnForwardSm120Blk128(BatchedStaticSchedulerMixin):
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
+        """Build TMA and shared-memory layouts, then launch on the supplied stream."""
         self.check_dim([mQ, mK, mO], 1)
         self.check_dim(mV, 0)
 
@@ -494,6 +498,8 @@ class BlockSparseAttnForwardSm120Blk128(BatchedStaticSchedulerMixin):
 
         @cute.struct
         class SharedStorage:
+            """Hold single-stage Q/K/V data and their TMA synchronization barriers."""
+
             Q_barrier: cute.struct.MemRange[cutlass.Int64, self.q_stage * 2]
             K_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
             V_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
@@ -612,6 +618,7 @@ def gemm_smem_zero_acc(
     tCsB: cute.Tensor,
     smem_tiled_copy_B: cute.TiledCopy,
 ) -> None:
+    """Clear the accumulator and multiply register A by shared-memory B tiles."""
     acc.fill(0.0)
     tCrB_copy_view = smem_tiled_copy_B.retile(tCrB)
     cute.copy(smem_tiled_copy_B, tCsB[None, None, 0], tCrB_copy_view[None, None, 0])
@@ -640,6 +647,7 @@ def gemm_rs_smem(
     tCsB: cute.Tensor,
     smem_tiled_copy_B: cute.TiledCopy,
 ) -> None:
+    """Accumulate register A times shared-memory B without clearing prior output."""
     tCrB_copy_view = smem_tiled_copy_B.retile(tCrB)
     cute.copy(smem_tiled_copy_B, tCsB[None, None, 0], tCrB_copy_view[None, None, 0])
     for k_block_idx in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
@@ -664,6 +672,7 @@ def mask(
     tScS: cute.Tensor,
     varblk: cutlass.Int32,
 ):
+    """Set score columns outside the current block's valid size to negative infinity."""
     tSrS_mn = layout_utils.reshape_acc_to_mn(tSrS)
     tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
 
@@ -680,6 +689,7 @@ def online_softmax(
     row_sum: cute.Tensor,
     softmax_scale_log2e: cutlass.Float32,
 ) -> cute.Tensor:
+    """Update row maxima/sums and exponentiated scores, returning output rescaling."""
     tSrS_mn = layout_utils.reshape_acc_to_mn(tSrS)
     row_scale = cute.make_rmem_tensor_like(row_max, cutlass.Float32)
 
@@ -721,6 +731,7 @@ def finalize_softmax(
     row_sum: cute.Tensor,
     softmax_scale_log2e: cutlass.Float32,
 ) -> cute.Tensor:
+    """Reduce row sums and return normalization factors plus natural-log LSE."""
     row_sum.store(kernel_utils.warp_reduce(row_sum.load(), operator.add, width=4))
     final_ratio = cute.make_rmem_tensor_like(row_sum, cutlass.Float32)
     lse = cute.make_rmem_tensor_like(row_sum, cutlass.Float32)
@@ -741,6 +752,7 @@ def rescale_o_for_next_acc(
     tOrO: cute.ThrMma,
     prev_ratio_m: cute.Tensor,
 ):
+    """Rescale accumulated output rows before adding the next probability/V tile."""
     tOrO_mn = layout_utils.reshape_acc_to_mn(tOrO)
     for m in cutlass.range(cute.size(prev_ratio_m), unroll_full=True):
         tOrO_mn[m, None].store(tOrO_mn[m, None].load() * prev_ratio_m[m])

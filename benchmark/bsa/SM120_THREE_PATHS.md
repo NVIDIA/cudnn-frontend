@@ -1,12 +1,13 @@
 # Same-device SM120 three-path comparison
 
-Date: September 15, 2026. These are new local measurements, not ratios of historical runs on different GPUs.
+Measurement date: September 15, 2026. Ratios compare paths on the same local
+device, not historical runs on different GPUs.
 
 ## Setup and fairness
 
 - One RTX PRO 6000 Blackwell Server Edition, SM120, 188 SMs.
 - BF16 Q/K/V BHSD `[1, 8, 142720, 128]`; PyTorch `2.13.0+cu130`; seed `20260915`.
-- Current native blk128: branch revision `97102524`, kernel checkpoint `e0602027`.
+- Measured native blk128: branch revision `97102524`, kernel checkpoint `e0602027`.
 - Native blk64: the checkout's original SM120 CuTe BSA kernel. Its source and BSA shared utilities are unchanged from PR #1010.
 - Closed PR #1010: exact archived API, interface, and metadata source at `1d5ed9d5`, loaded as an isolated package with the same installed dependencies. The archived files are byte-checked against Git before timing.
 - All three paths use the same Q/K/V and exactly the same selected KV tokens. For 15% density this is 167/1115 KV128 blocks or 334/2230 KV64 blocks (actual 14.9776%); at 20% it is 223/1115 or 446/2230.
@@ -60,6 +61,14 @@ The earlier 0.8%-1.1% gain used the already optimized FA4-style native128 `9869b
 - Small full-reference tests use the existing BSA suite's `O: atol=rtol=3e-2`, `LSE: atol=rtol=2e-3` bounds. An initial temporary harness incorrectly applied the long-output cross-path absolute O bound to top-k=1/3 small cases; four checks failed at near-zero outputs. The harness was corrected to use the established small-reference contract, then all five tests passed. No production kernel or production test tolerance was changed.
 
 ## Artifacts and reproduction
+
+The JSON files retain the original measured revisions, source hashes, and
+timing samples. The subsequent review fixes add exclusive report creation,
+a concurrent-output regression, and function docstrings; they do not replace
+these results with new latency measurements. Kernel docstring additions were
+checked for AST equivalence after stripping docstrings. Current source-file
+hashes therefore differ from the historical hashes without a change to the
+kernel's executable statements.
 
 - [Comparison harness](benchmark_sm120_three_paths.py)
 - [Run 1 raw event samples and source hashes](results/sm120_three_paths_20260915_run1.json)
