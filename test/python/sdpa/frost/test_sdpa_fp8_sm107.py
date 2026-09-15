@@ -740,7 +740,7 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
     # DLFW containers run fp32 matmul in TF32 (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1, and torch's own default
     # on Blackwell+), a ~3e-4 relative error per logit that a 1024-column log-sum-exp averages down to
     # ~2e-5 but a causal row with one valid column keeps whole -- 1.3e-4 on the sm107 CI lane, read as a
-    # kernel failure (2026-09-15).  cf. fp8_ref.compute_ref_forward's ``dtype`` note.
+    # kernel failure (2026-09-15).  cf. fp8_ref.compute_ref's ``dtype`` note.
     rep = hq // hkv
     logits = (q8.double() * dq.double()) @ (k8.double() * dk.double()).repeat_interleave(rep, 1).transpose(-1, -2) * d_qk**-0.5
     if causal:
