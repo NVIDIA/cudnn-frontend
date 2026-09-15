@@ -1,6 +1,42 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+r"""Run paired native SM120 blk128 kernel comparisons and harness regressions.
+
+Requires this checkout's CuTe BSA package, CUDA-enabled PyTorch, an SM120 GPU,
+CuTe DSL >= 4.7.0, and pytest dependencies (see test_BSA_attention_forward.py).
+From the repository root, run the small harness tests:
+
+    (cd test/python && CUDA_VISIBLE_DEVICES=0 python -m pytest -q fe_api/bsa/test_sm120_blk128_pair_benchmark.py)
+
+For an A/B measurement, save a trusted baseline kernel source locally. To
+reproduce the two-fold-unroll baseline, extract commit 9869b9b6 without
+switching branches:
+
+    git fetch https://github.com/tiffany940107/cudnn-frontend.git bsa-sm120-native-blk128-fa4-style
+    mkdir -p agent/agent_space agent/agent_benchmark
+    VSA_BASELINE_ROOT="$(mktemp -d -p agent/agent_space blk128_baseline.XXXXXX)"
+    git archive 9869b9b6 python/cudnn/block_sparse_attention/csrc/fwd/sm120_blk128/bsa_fwd_sm120_fa4.py | tar -x -C "$VSA_BASELINE_ROOT"
+    VSA_BASELINE_SOURCE="$VSA_BASELINE_ROOT/python/cudnn/block_sparse_attention/csrc/fwd/sm120_blk128/bsa_fwd_sm120_fa4.py"
+    CUDA_VISIBLE_DEVICES=0 python benchmark/bsa/benchmark_sm120_blk128_pair.py \
+      --baseline-source "$VSA_BASELINE_SOURCE" --sequence 142720 --heads 8 \
+      --densities 0.15 0.20 --patterns strided local --warmup 10 --repeats 101 \
+      --seed 20260914 --min-speedup 1.05 --fail-below-target \
+      --json agent/agent_benchmark/paired_repeat.json
+
+Only use trusted baseline files: the harness imports and executes them.
+Choose fresh report paths, use an idle GPU without a profiler, and repeat in
+independent processes. The harness alternates A/B and B/A, excludes compilation,
+checks sampled FP32-reference rows, and restores the kernel class/compile cache.
+It compares a saved kernel file with the checkout, not complete environments;
+its sampled accuracy checks do not establish full-tensor bitwise equivalence.
+
+--fail-below-target returns nonzero if any case misses the speedup gate; that
+alone is not a correctness failure. A 1.05x speedup is a 4.76% latency reduction;
+use --min-speedup 1.052631579 for a full 5% latency reduction. See PR #1070 for
+measured results and limitations; do not combine ratios from different baselines.
+"""
+
 import importlib.util
 import json
 from pathlib import Path

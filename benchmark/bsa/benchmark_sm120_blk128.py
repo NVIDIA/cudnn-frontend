@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Benchmark the native SM120 blk128 BF16 block-sparse attention kernel."""
+"""Benchmark the native SM120 blk128 BF16 block-sparse attention kernel.
+
+Usage and requirements: test/python/fe_api/bsa/test_BSA_attention_forward.py.
+"""
 
 from __future__ import annotations
 

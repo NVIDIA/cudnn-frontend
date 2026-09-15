@@ -1,6 +1,55 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+r"""Reproduce the same-mask native128/native64/PR #1010 comparison on SM120.
+
+Install this checkout and the test dependencies described in the repository
+agent guide. CUDA-enabled PyTorch and CuTe DSL >= 4.7.0 are required. Verify
+that the native128 kernel module resolves to this checkout, not another
+editable install (see test_BSA_attention_forward.py).
+
+From the repository root, prepare the pinned legacy source in a local ignored
+workspace. These commands fetch source only; they do not switch branches:
+
+    git fetch https://github.com/tiffany940107/cudnn-frontend.git bsa-sm120-blk128-bf16
+    mkdir -p agent/agent_space agent/agent_benchmark
+    VSA_LEGACY_ROOT="$(mktemp -d -p agent/agent_space pr1010.XXXXXX)"
+    git archive 1d5ed9d596d51087bcc2f81cc44a1f7ea260189f python/cudnn/block_sparse_attention | tar -x -C "$VSA_LEGACY_ROOT"
+    export SM120_PR1010_SOURCE_DIR="$(realpath "$VSA_LEGACY_ROOT/python/cudnn/block_sparse_attention")"
+
+Run all cases in this file, including archive integrity and CLI output safety:
+
+    (cd test/python && CUDA_VISIBLE_DEVICES=0 python -m pytest -q fe_api/bsa/test_sm120_three_paths_benchmark.py)
+
+Without SM120_PR1010_SOURCE_DIR, legacy-dependent cases skip; tests never
+download code themselves. Unsupported GPU/DSL cases also skip.
+
+Run the full workload on an otherwise idle GPU:
+
+    CUDA_VISIBLE_DEVICES=0 python benchmark/bsa/benchmark_sm120_three_paths.py \
+      --legacy-source-dir "$SM120_PR1010_SOURCE_DIR" \
+      --sequence 142720 --heads 8 --warmup 12 --repeats 102 \
+      --json agent/agent_benchmark/three_paths_repeat.json
+
+Defaults cover BF16 BHSD [1, 8, 142720, 128], densities 0.15/0.20, and both
+strided (dispersed KV addresses) and local (consecutive, cyclic KV addresses)
+patterns. Actual top-k is rounded to whole KV128 blocks. Each path shares
+Q/K/V and the same selected tokens. Native64 metadata preparation is outside
+timing; the pinned PR #1010 wrapper's per-call conversion is inside timing.
+Compilation and validation are excluded. All six path-order permutations
+are balanced; repeats must be a positive multiple of six.
+
+Use a new JSON filename for each independent process run. Exclusive creation
+preserves a report created even after argument validation. Keep reports local
+and sanitize them before sharing. For a quick smoke run, use --sequence 512
+--heads 2 --warmup 1 --repeats 6; its timing is not a full-workload result.
+
+Small full FP32 references use O atol=rtol=3e-2 and LSE atol=rtol=2e-3.
+Long-workload cross-path checks use O atol=3e-4, rtol=3e-2 and LSE atol=3e-6,
+rtol=1e-6. Native64/PR1010 outputs are bitwise equal; native128 uses different
+online-softmax grouping and is checked numerically, not bitwise.
+"""
+
 import importlib.util
 import json
 import os
@@ -81,6 +130,22 @@ def test_three_path_archive_and_output_guards(monkeypatch, tmp_path):
     with pytest.raises(SystemExit):
         bench._parse_args(args)
     assert output.read_text() == "preserve me"
+
+
+def test_three_path_missing_revision_hint(monkeypatch, tmp_path):
+    """Point missing-history errors to the existing source-preparation instructions."""
+    bench = _load_benchmark(monkeypatch)
+
+    def missing_revision(command, **kwargs):
+        """Simulate a checkout without the pinned legacy Git object."""
+        raise bench.subprocess.CalledProcessError(128, command)
+
+    monkeypatch.setattr(bench.subprocess, "check_output", missing_revision)
+    instruction_path = "test/python/fe_api/bsa/test_sm120_three_paths_benchmark.py"
+    with pytest.raises(RuntimeError, match=instruction_path) as error:
+        bench.verify_sources(tmp_path)
+    assert isinstance(error.value.__cause__, bench.subprocess.CalledProcessError)
+    assert (Path(__file__).resolve().parents[4] / instruction_path).is_file()
 
 
 def test_three_path_tampered_archive(monkeypatch, legacy_source_dir, tmp_path):

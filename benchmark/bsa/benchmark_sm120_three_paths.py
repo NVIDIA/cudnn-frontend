@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare native KV128, native KV64, and the pinned PR #1010 adapter."""
+"""Compare native KV128, native KV64, and the pinned PR #1010 adapter.
+
+Usage and archive preparation: test/python/fe_api/bsa/test_sm120_three_paths_benchmark.py.
+"""
 
 from __future__ import annotations
 
@@ -42,7 +45,9 @@ def verify_sources(legacy_source_dir):
                 stderr=subprocess.DEVNULL,
             )
         except subprocess.CalledProcessError as exc:
-            raise RuntimeError("Fetch the PR #1010 revision as described in SM120_THREE_PATHS.md before benchmarking") from exc
+            raise RuntimeError(
+                "Fetch the PR #1010 revision as described in test/python/fe_api/bsa/test_sm120_three_paths_benchmark.py before benchmarking"
+            ) from exc
         saved = (legacy_source_dir / relative).read_bytes()
         if source != saved:
             raise ValueError(f"Archived PR source mismatch: {relative}")

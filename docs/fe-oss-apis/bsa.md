@@ -139,9 +139,7 @@ per-row block counts, explicit block sizes, and partial final KV blocks use
 the general native blk128 kernel. The FA4-style specialization requires
 `nvidia-cutlass-dsl >= 4.7.0`; an older public DSL version is rejected with
 a version-specific error before the specialized kernel is imported. The
-package-wide downstream dependency floor is unchanged. See the
-[SM120 optimization summary](../../benchmark/bsa/SM120_REVIEW_SUMMARY.md) for
-measured gains and limitations.
+package-wide downstream dependency floor is unchanged.
 
 `kv_splits=2..256` computes FP32 partial outputs and combines them, with
 workspace growing linearly in the split count. SM90 accepts an explicit integer

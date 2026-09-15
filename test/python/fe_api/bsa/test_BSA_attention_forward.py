@@ -1,6 +1,40 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+r"""BSA forward correctness tests, including native SM120 blk128.
+
+Install this checkout with its CUDA/cuDNN and Python test dependencies as
+described in the repository agent guide. SM120 FA4-style tests require a
+CUDA-enabled PyTorch build and CuTe DSL >= 4.7.0. Verify the actual imported
+kernel path before testing, especially with multiple editable checkouts.
+From the repository root:
+
+    python -c 'import cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fa4 as k; print(k.__file__)'
+    (cd test/python && CUDA_VISIBLE_DEVICES=0 python -m pytest -q fe_api/bsa/test_BSA_attention_forward.py -k sm120)
+    (cd test/python && CUDA_VISIBLE_DEVICES=0 python -m pytest -q fe_api/bsa)
+
+The full directory also contains other BSA tests. Unsupported configurations
+skip; legacy-comparison cases require SM120_PR1010_SOURCE_DIR, whose preparation
+and full-workload commands are in test_sm120_three_paths_benchmark.py.
+test_sm120_blk128_pair_benchmark.py documents saved-kernel A/B measurements.
+
+For a fresh single-GPU comparison with PyTorch's cuDNN dense SDPA backend:
+
+    CUDA_VISIBLE_DEVICES=0 python benchmark/bsa/benchmark_sm120_blk128.py \
+      --sequence 142720 --heads 8 --densities 0.15 0.20 \
+      --patterns strided local --warmup 5 --repeats 21 --fail-below-target
+
+This benchmark uses BF16 BHSD [1, 8, 142720, 128] and native KV128; its 4.5x
+gate applies to the slowest 20%-density case. A missed performance gate is
+not itself an accuracy failure. Measure on an idle GPU without a profiler.
+
+Production blk128 consumes original sparse metadata with no KV128-to-KV64
+expansion. FP16/BF16 reference tests cover fixed/variable counts, partial Q/KV,
+GQA, layouts, and full/tail scheduling. The FA4-style path keeps FP32 accumulators
+and BF16 probabilities for BF16 inputs; it does not use FP8/INT8 quantization.
+These are single-GPU tests; multi-GPU overlap prototypes are not in this PR.
+"""
+
 import builtins
 import importlib
 from types import SimpleNamespace

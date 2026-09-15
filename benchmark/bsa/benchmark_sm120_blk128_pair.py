@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Interleave a saved SM120 blk128 kernel source and the installed checkout."""
+"""Interleave a saved SM120 blk128 kernel source and the installed checkout.
+
+Usage and baseline preparation: test/python/fe_api/bsa/test_sm120_blk128_pair_benchmark.py.
+"""
 
 from __future__ import annotations
 
