@@ -1151,7 +1151,7 @@ class _PersistentConvSetup:
     attributes, mma/tile shapes, SMEM byte sizes, pipeline stage counts, and
     can_implement checks.
 
-    Conv->GEMM mapping: M=N*Z*P*Q, N=K, K=T*R*S*C.
+    Convolution to GEMM mapping: M=N*Z*P*Q, N=K, K=T*R*S*C.
     A is NDHWC C-major, B is KTRSC C-major, C is NZPQK K-major.
 
     :note: A and B tensor must be C major; C tensor must be K major.
