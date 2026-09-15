@@ -14,8 +14,7 @@ From the repository root:
     (cd test/python && CUDA_VISIBLE_DEVICES=0 python -m pytest -q fe_api/bsa)
 
 The full directory also contains other BSA tests. Unsupported configurations
-skip; legacy-comparison cases require SM120_PR1010_SOURCE_DIR, whose preparation
-and full-workload commands are in test_sm120_three_paths_benchmark.py.
+skip.
 
 For a fresh single-GPU comparison with PyTorch's cuDNN dense SDPA backend:
 
