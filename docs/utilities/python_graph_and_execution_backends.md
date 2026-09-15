@@ -463,8 +463,10 @@ are close.
   at the same row. The pool may pad its slot stride to any 16-byte multiple,
   as serving stacks do; each row stays a dense `[HO, V, K]` block. The chain
   seeds its state chain through the table and the prefill writes through it; the split-K cut stays available when the two
-  buffers are distinct. Forward only, and not combined with
-  `checkpoint_every_n_tokens`. The torch ops route `state_indices` through
+  buffers are distinct. Forward only, not combined with
+  `checkpoint_every_n_tokens`, and served by the FROST engines only: the
+  cuTile engines, the KDA CAKE engine and the Hopper KDA engine decline a
+  graph with `state_indices`. The torch ops route `state_indices` through
   `cudnn::<op>_fwd_overwrite_state`, so the caller's pool is updated in place
   and comes back as `final_state`.
 - Context parallelism across devices. The state ops are the per-span

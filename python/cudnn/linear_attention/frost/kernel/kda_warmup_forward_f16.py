@@ -352,7 +352,7 @@ def build_warmup_forward(
             dt_bias_table_placeholder,
             from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=1),
             from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
+            from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
             from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
             from_dlpack(state_in, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_in is not None else None,
             from_dlpack(state_out, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_out is not None else None,

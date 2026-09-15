@@ -3364,7 +3364,7 @@ def chunk_gdn2_sm100(
         beta_cute = from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=2)
         w_cute = from_dlpack(w, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         o_cute = from_dlpack(output, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
 
         state_in_cute = None
         if use_initial_state:
@@ -3438,7 +3438,7 @@ def chunk_gdn2_sm100(
         beta_placeholder = from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         w_placeholder = from_dlpack(w, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         o_placeholder = from_dlpack(output, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
         workspace_placeholder = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
         state_checkpoints_placeholder = None
         if state_checkpoints_for_descs is not None:
