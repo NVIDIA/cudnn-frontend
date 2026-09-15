@@ -29,6 +29,16 @@ two 64-token KV blocks.
 
 ## Performance evidence
 
+For the direct comparison requested during review, see the
+[same-device native128/native64/PR #1010 report](SM120_THREE_PATHS.md).
+Two independent 102-sample runs measured 1.1188x-1.1278x versus native64 and
+1.1196x-1.1285x versus the closed PR's adapter. All paths use the same Q/K/V
+and selected tokens; native64 preprocessing is excluded and the adapter's
+per-call conversion is included. These are approximately 12%-13% throughput
+gains (10.6%-11.4% lower latency), not gains against the already optimized
+`9869b9b6` baseline below. The report includes both tables, raw samples,
+accuracy checks, and reproducible commands.
+
 The current kernel checkpoint is `e0602027`. The additional-speedup baseline
 is `9869b9b6`, which already includes FA4-style execution and two-fold
 unrolling. A 101-pair run with ten warmup pairs per case and seed `20260914`
@@ -60,6 +70,9 @@ baseline must not be combined with the Server Edition measurements above.
 
 ## Validation and limits
 
+- The publication refresh, including the portable three-path harness and its
+  archive-integrity checks, passed **65 tests with 19 skips** across the entire
+  BSA directory, with the pinned legacy archive enabled.
 - The September 15 MR refresh reran the entire `test/python/fe_api/bsa`
   directory: **53 passed, 19 skipped**, with no failures. The narrower forward
   and paired-harness checkpoint previously passed 33 tests with nine skips.
