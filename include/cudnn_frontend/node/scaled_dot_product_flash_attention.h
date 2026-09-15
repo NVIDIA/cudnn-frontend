@@ -1163,8 +1163,8 @@ class SDPABackwardNodeBase : public NodeCRTP<DerivedT> {
     // [n, 1, 1, 1] form the cuDNN backend requires (see promote_1d_index_tensor_to_4d).
     void
     promote_index_tensors_to_4d() {
-        // TODO: Handle CU_SEQ_LEN_Q and CU_SEQ_LEN_KV once bprop supports these.
-        for (auto& key : {input_names::SEQ_LEN_Q, input_names::SEQ_LEN_KV}) {
+        for (auto& key :
+             {input_names::SEQ_LEN_Q, input_names::SEQ_LEN_KV, input_names::CU_SEQ_LEN_Q, input_names::CU_SEQ_LEN_KV}) {
             auto const it = attributes.inputs.find(key);
             if (it != attributes.inputs.end()) {
                 promote_1d_index_tensor_to_4d(it->second);
@@ -1304,6 +1304,8 @@ class SDPABackwardNodeBase : public NodeCRTP<DerivedT> {
 
         add_input(input_names::SEQ_LEN_Q);
         add_input(input_names::SEQ_LEN_KV);
+        add_input(input_names::CU_SEQ_LEN_Q);
+        add_input(input_names::CU_SEQ_LEN_KV);
 
         for (auto name :
              {input_names::Q, input_names::K, input_names::V, input_names::O, input_names::dO, input_names::Stats}) {
@@ -2303,6 +2305,10 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
             auto s_kv     = attributes.inputs[input_names::K]->get_dim()[2];
             auto s_kv_ptr = has_input(input_names::SEQ_LEN_KV) ? attributes.inputs[input_names::SEQ_LEN_KV] : nullptr;
             auto s_q_ptr  = has_input(input_names::SEQ_LEN_Q) ? attributes.inputs[input_names::SEQ_LEN_Q] : nullptr;
+            auto cu_s_kv_ptr =
+                has_input(input_names::CU_SEQ_LEN_KV) ? attributes.inputs[input_names::CU_SEQ_LEN_KV] : nullptr;
+            auto cu_s_q_ptr =
+                has_input(input_names::CU_SEQ_LEN_Q) ? attributes.inputs[input_names::CU_SEQ_LEN_Q] : nullptr;
 
             subgraph_output = attn::score_modifiers::sliding_window_mask(subgraph,
                                                                          subgraph_output,
@@ -2313,8 +2319,8 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
                                                                          s_kv,
                                                                          s_q_ptr,
                                                                          s_kv_ptr,
-                                                                         /*cu_s_q_ptr=*/nullptr,
-                                                                         /*cu_s_kv_ptr=*/nullptr);
+                                                                         cu_s_q_ptr,
+                                                                         cu_s_kv_ptr);
         }
 
         if (subgraph) {
@@ -2384,6 +2390,23 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
             set_tensor_desc(attributes.inputs, input_names::SEQ_LEN_Q, CUDNN_ATTR_OPERATION_SDPA_BWD_SEQ_LEN_QDESC));
         CHECK_CUDNN_FRONTEND_ERROR(
             set_tensor_desc(attributes.inputs, input_names::SEQ_LEN_KV, CUDNN_ATTR_OPERATION_SDPA_BWD_SEQ_LEN_KVDESC));
+
+        // Cumulative sequence lengths (cu_seqlens, b + 1 entries per side) need cuDNN 9.28.0.
+        // TODO(nvbugs/5102117): bump the floor to the release these land in.
+        if (has_input(input_names::CU_SEQ_LEN_Q) || has_input(input_names::CU_SEQ_LEN_KV)) {
+            auto v928_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Cumulative sequence lengths in the unified SDPA backward node require cuDNN 9.28.0"};
+#if (CUDNN_VERSION >= 92800)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92800, v928_error);
+            CHECK_CUDNN_FRONTEND_ERROR(set_tensor_desc(
+                attributes.inputs, input_names::CU_SEQ_LEN_Q, CUDNN_ATTR_OPERATION_SDPA_BWD_CU_SEQ_LEN_QDESC));
+            CHECK_CUDNN_FRONTEND_ERROR(set_tensor_desc(
+                attributes.inputs, input_names::CU_SEQ_LEN_KV, CUDNN_ATTR_OPERATION_SDPA_BWD_CU_SEQ_LEN_KVDESC));
+#else
+            return v928_error;
+#endif
+        }
 
         // Sink token, packed token totals and the score-modifier subgraph need cuDNN 9.21.0.
         bool const has_sink = has_input(input_names::SINK_TOKEN) || has_output(output_names::DSINK_TOKEN);

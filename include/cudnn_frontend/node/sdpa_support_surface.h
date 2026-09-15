@@ -778,17 +778,33 @@ SDPA_backward_attributes::validate_sdpa_backward_support_surface(const detail::C
                                     error_code_t::GRAPH_NOT_SUPPORTED,
                                     "Bias mask data type cannot be boolean");
 
-    // validate options for padding mask
-    auto const& seq_len_q     = inputs.find(input_names::SEQ_LEN_Q);
-    bool const has_seq_len_q  = (seq_len_q != inputs.end()) && (seq_len_q->second != nullptr);
-    auto const& seq_len_kv    = inputs.find(input_names::SEQ_LEN_KV);
-    bool const has_seq_len_kv = (seq_len_kv != inputs.end()) && (seq_len_kv->second != nullptr);
-    RETURN_CUDNN_FRONTEND_ERROR_IF(padding_mask && (!has_seq_len_q || !has_seq_len_kv),
+    // validate options for padding mask: padding requires a per-sequence length tensor on each side. Each side
+    // independently uses exactly one representation -- per-batch (seq_len_*) or cumulative (cu_seq_len_*) -- and
+    // the two sides may use different forms.
+    auto const has = [&](input_names name) {
+        auto it = inputs.find(name);
+        return it != inputs.end() && it->second != nullptr;
+    };
+    bool const has_seq_len_q     = has(input_names::SEQ_LEN_Q);
+    bool const has_seq_len_kv    = has(input_names::SEQ_LEN_KV);
+    bool const has_cu_seq_len_q  = has(input_names::CU_SEQ_LEN_Q);
+    bool const has_cu_seq_len_kv = has(input_names::CU_SEQ_LEN_KV);
+    RETURN_CUDNN_FRONTEND_ERROR_IF(has_seq_len_q && has_cu_seq_len_q,
                                    error_code_t::ATTRIBUTE_NOT_SET,
-                                   "Padding mask requires seq_len_q and seq_len_kv to be set.");
-    RETURN_CUDNN_FRONTEND_ERROR_IF((!padding_mask && !attention_score_modifier) && (has_seq_len_q || has_seq_len_kv),
+                                   "SEQ_LEN_Q and CU_SEQ_LEN_Q are mutually exclusive");
+    RETURN_CUDNN_FRONTEND_ERROR_IF(has_seq_len_kv && has_cu_seq_len_kv,
                                    error_code_t::ATTRIBUTE_NOT_SET,
-                                   "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
+                                   "SEQ_LEN_KV and CU_SEQ_LEN_KV are mutually exclusive");
+    bool const has_any_seq_len_q  = has_seq_len_q || has_cu_seq_len_q;
+    bool const has_any_seq_len_kv = has_seq_len_kv || has_cu_seq_len_kv;
+    RETURN_CUDNN_FRONTEND_ERROR_IF(padding_mask && !(has_any_seq_len_q && has_any_seq_len_kv),
+                                   error_code_t::ATTRIBUTE_NOT_SET,
+                                   "Padding mask requires seq_len_q/seq_len_kv (or cu_seq_len_q/cu_seq_len_kv) "
+                                   "to be set.");
+    RETURN_CUDNN_FRONTEND_ERROR_IF(
+        (!padding_mask && !attention_score_modifier) && (has_any_seq_len_q || has_any_seq_len_kv),
+        error_code_t::ATTRIBUTE_NOT_SET,
+        "seq_len_q/seq_len_kv (or cu_seq_len_q/cu_seq_len_kv) needs to be set only if padding mask is enabled.");
 
     // validate options for max_total_seq_len
     RETURN_CUDNN_FRONTEND_ERROR_IF((max_total_seq_len_q.has_value() || max_total_seq_len_kv.has_value()) && !is_ragged,
@@ -961,6 +977,15 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
         case AttentionImplementation_t::COMPOSITE:
             // The composite backward node is the historical default and accepts the full attribute
             // surface; its remaining limits are enforced by validate_sdpa_backward_support_surface().
+            // Cumulative sequence lengths are a unified-only feature.
+            for (auto key : {input_names::CU_SEQ_LEN_Q, input_names::CU_SEQ_LEN_KV}) {
+                auto it = inputs.find(key);
+                if (it != inputs.end() && it->second != nullptr) {
+                    return {error_code_t::GRAPH_NOT_SUPPORTED,
+                            "Composite SDPA backward node doesn't support cumulative sequence lengths (CU_SEQ_LEN_Q / "
+                            "CU_SEQ_LEN_KV)"};
+                }
+            }
             break;
         case AttentionImplementation_t::UNIFIED: {
             // cuDNN 9.27.0 is the first release whose heuristics can select the unified SDPA bprop
@@ -1002,6 +1027,8 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
             if (unified_layouts_ok) {
                 allowed_input_names.insert(input_names::SEQ_LEN_Q);
                 allowed_input_names.insert(input_names::SEQ_LEN_KV);
+                allowed_input_names.insert(input_names::CU_SEQ_LEN_Q);
+                allowed_input_names.insert(input_names::CU_SEQ_LEN_KV);
             }
             for (const auto& [key, value] : inputs) {
                 if (allowed_input_names.find(key) == allowed_input_names.end() && value != nullptr) {

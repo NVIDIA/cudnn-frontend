@@ -390,6 +390,8 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        bool const use_padding_mask,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
                        py::object const& max_total_seq_len_q,
                        py::object const& max_total_seq_len_kv,
                        bool const use_causal_mask,
@@ -416,6 +418,8 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
             .set_padding_mask(use_padding_mask)
             .set_seq_len_q(seq_len_q)
             .set_seq_len_kv(seq_len_kv)
+            .set_cu_seq_len_q(cu_seq_len_q)
+            .set_cu_seq_len_kv(cu_seq_len_kv)
             .set_diagonal_alignment(
                 diagonal_alignment)  // for backwards compatibility, this must be called prior to set_causal_mask_*
             .set_causal_mask(use_causal_mask)
@@ -1245,6 +1249,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("use_padding_mask", false),
           py::arg_v("seq_len_q", nullptr),
           py::arg_v("seq_len_kv", nullptr),
+          py::arg_v("cu_seq_len_q", nullptr),
+          py::arg_v("cu_seq_len_kv", nullptr),
           py::arg_v("max_total_seq_len_q", py::none()),
           py::arg_v("max_total_seq_len_kv", py::none()),
           py::arg_v("use_causal_mask", false),
