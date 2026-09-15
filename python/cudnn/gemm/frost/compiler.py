@@ -920,6 +920,7 @@ def _render_tile_constants_sm100(
         f"multicast_a = {cfg.multicast_a}",
         f"multicast_b = {cfg.multicast_b}",
         f"a_mcast_slices = {a_mcast_slices}",
+        f"a_tma_box_m = {_a_tma_box_m(cfg, a_mcast_slices)}",
         f"b_mcast_slices = {b_mcast_slices}",
         f"ab_empty_full_mask = {ab_empty_full_mask}",
         f"ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{smem_swizzle_name}",
@@ -2103,6 +2104,7 @@ def _render_block_scale_tile_constants_sm100(
         f"multicast_a = {cfg.multicast_a}",
         f"multicast_b = {cfg.multicast_b}",
         f"a_mcast_slices = {bs_a_mcast_slices}",
+        f"a_tma_box_m = {_a_tma_box_m(cfg, bs_a_mcast_slices)}",
         f"b_mcast_slices = {bs_b_mcast_slices}",
         f"ab_empty_full_mask = {bs_ab_empty_full_mask}",
         "",
@@ -3458,6 +3460,17 @@ def _check_mma_n_dim(
 _TMA_BOX_DIM_MAX = 256
 
 
+def _a_tma_box_m(cfg: TileConfig, mcast_slices: int) -> int:
+    """Rows per K-major A copy, subdividing each multicast slice as needed.
+
+    The boxes partition the same SMEM tile and complete the same byte-counted
+    barrier. A 512-row tile uses two 256-row boxes; non-power-of-two forced
+    tiles also need an exact divisor so the last copy cannot cross a tile edge.
+    """
+    rows = cfg.cta_tile_m // mcast_slices
+    return rows if rows <= _TMA_BOX_DIM_MAX else math.gcd(rows, _TMA_BOX_DIM_MAX)
+
+
 def _check_mma_k_dim(chain: FusionChain, config: TileConfig) -> None:
     """Dense MMA K width: shared by candidate enumeration, precheck, and render."""
     if config.mma_tile_k_bytes == 32:
@@ -3497,11 +3510,14 @@ def _check_dtype_config_compat(
             f"{config.cta_tile_k_bytes} which is not divisible by "
             f"elem_bytes={elem_bytes} for dtype {chain.matmul.a_dtype!r}."
         )
-    # The whole CTA tile is TMA-loaded in one box per operand, and
-    # cuTensorMapEncodeTiled caps every boxDim at 256. Without this the launch
-    # dies at descriptor creation with a bare cudaErrorInvalidValue.
+    # sm100 partitions K-major A into boxes of _a_tma_box_m rows (M-major
+    # already walks swizzle groups). Other operands still need the whole
+    # extent to fit cuTensorMapEncodeTiled's per-dimension ceiling.
     smem_m, smem_n, _ = config.cta_smem_tile_mnk(elem_bytes)
-    for label, extent in (("cta_tile_m", smem_m), ("per-CTA SMEM N", smem_n)):
+    box_extents = [("per-CTA SMEM N", smem_n)]
+    if config.pipeline != "sm100":
+        box_extents.append(("cta_tile_m", smem_m))
+    for label, extent in box_extents:
         if extent > _TMA_BOX_DIM_MAX:
             raise NotImplementedError(
                 f"TileConfig {config.name!r}: {label}={extent} exceeds the TMA "

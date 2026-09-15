@@ -309,6 +309,11 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
             f"{flavor}: THD/varlen on the SM107 f16/bf16 line is served by {sorted(_F16_THD_FLAVORS)} only "
             f"(got dtype_qkv={k.dtype_qkv}); the other flavors' setup-kernel call sites are not ported"
         )
+    if k.seq_q_lens_present:
+        if k.thd_varlen:
+            raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
+        if not k.seq_kv_lens_present:
+            raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT (padding mask)")
 
 
 def _band_fields(params: TemplateParams) -> Tuple[int, int, int, int, int]:

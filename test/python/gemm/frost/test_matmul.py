@@ -2480,6 +2480,8 @@ def test_import_kernel_publishes_by_rename(tmp_path, monkeypatch):
         ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 2),
         ("CONFIG_sm100_256x256x128_128x256x32_cluster1x1", 2),
         ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 2),
+        ("CONFIG_sm100_256x128x128_64x128x32_cluster1x1", 4),
+        ("CONFIG_sm100_512x128x128_128x128x32_cluster1x1", 4),
     ],
 )
 def test_num_mma_m_is_derived_from_the_two_tiles(name: str, mma_size_m: int) -> None:
@@ -2500,9 +2502,9 @@ def test_num_mma_m_is_derived_from_the_two_tiles(name: str, mma_size_m: int) -> 
         ("CONFIG_sm100_128x128x128_32x128x32_cluster1x1", "mma_tile_m=32"),
         ("CONFIG_sm100_128x512x128_128x512x32_cluster1x1", "mma_tile_n=512"),
         ("CONFIG_sm100_128x24x128_128x12x32_cluster1x1", "mma_tile_n=12"),
-        # At most 2 instructions along M this pass...
-        ("CONFIG_sm100_256x128x128_64x128x32_cluster1x1", "mma_size_m=4"),
-        ("CONFIG_sm100_512x128x128_128x128x32_cluster1x1", "mma_size_m=4"),
+        # At most 4 instructions along M...
+        ("CONFIG_sm100_512x128x128_64x128x32_cluster1x1", "mma_size_m=8"),
+        ("CONFIG_sm100_1024x128x128_128x128x32_cluster1x1", "mma_size_m=8"),
         # ... and N is not an instruction-count axis at all.
         ("CONFIG_sm100_128x256x128_128x128x32_cluster1x1", "N is not split"),
     ],
@@ -2511,6 +2513,26 @@ def test_illegal_mma_decomposition_rejected(name: str, reason: str) -> None:
     with pytest.raises(NotImplementedError) as e:
         by_name(name)
     assert reason in str(e.value)
+
+
+def test_catalog_cta_pairs_stay_inside_clusters() -> None:
+    for cfg in CATALOG:
+        assert cfg.cga_size_m % cfg.ctas_per_mma == 0, cfg.name
+        assert cfg.multicast_b_factor >= 1, cfg.name
+
+
+@pytest.mark.parametrize("pipeline,k_bytes,mma_k_bytes", [("sm100", 128, 32), ("sm103", 384, 48)])
+@pytest.mark.parametrize("cga_m,cga_n", [(1, 2), (3, 1)])
+@pytest.mark.parametrize("source", ["by_name", "constructor"])
+def test_cta_pair_rejects_odd_cluster_m(pipeline, k_bytes, mma_k_bytes, cga_m, cga_n, source) -> None:
+    from dataclasses import replace
+
+    name = f"CONFIG_{pipeline}_128x128x{k_bytes}_128x128x{mma_k_bytes}_cluster{cga_m}x{cga_n}"
+    with pytest.raises(NotImplementedError, match="cga_size_m % 2 == 0"):
+        if source == "by_name":
+            by_name(f"{name}_2ctamma")
+        else:
+            replace(by_name(f"{name}_1ctamma"), cta_group=2)
 
 
 def test_catalog_enumerates_the_mma_m_axis() -> None:
@@ -2536,7 +2558,7 @@ def test_catalog_enumerates_the_mma_m_axis() -> None:
     sm120_axis = {c.mma_size_m for c in CATALOG if c.pipeline == "sm120"}
     assert sm120_axis == {c.warp_tile_m // 16 for c in CATALOG if c.pipeline == "sm120"}
     assert {1, 2} <= sm120_axis
-    assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm100"} == {1, 2}
+    assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm100"} == {1, 2, 4}
     assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm103"} == {1}
     # cta_tile_m=128 is the one value two axes produce (128x1 and 64x2).
     assert next(c for c in sm100 if c.cta_tile_m == 128).mma_size_m == 1
@@ -2547,7 +2569,56 @@ def test_catalog_enumerates_the_mma_m_axis() -> None:
     g.matmul(A=A, B=B, name="mm").set_output(True)
     # Split tiles reach the funnel: whichever families serve THIS device, the
     # candidates carry more than the unsplit tile.
-    assert {1, 2} <= {cfg.mma_size_m for _t, cfg in candidates(analyze(g))}
+    assert {1, 2, 4} <= {cfg.mma_size_m for _t, cfg in candidates(analyze(g))}
+
+
+@requires_sm100
+@pytest.mark.parametrize("mma_m", (64, 128))
+@pytest.mark.parametrize("cta_group,cluster", ((1, "1x1"), (2, "2x1"), (1, "2x2"), (2, "4x2")))
+@pytest.mark.parametrize("a_major,out_major,stg", (("k", "n", False), ("m", "m", False), ("k", "n", True)))
+def test_four_mma_m_tiles(mma_m, cta_group, cluster, a_major, out_major, stg):
+    """All four M blocks, a second CTA tile, M/K tails, both drains and multicast.
+
+    At MMA M=128 an unsliced A load needs two TMA boxes. Do not turn a build
+    rejection into a skip: these geometries must compile and execute.
+    """
+    cfg = by_name(f"CONFIG_sm100_{4 * mma_m}x64x128_{mma_m}x64x32_cluster{cluster}_{cta_group}ctamma")
+    M, N, K = 1152, 256, 264
+    g = _build_graph(M, N, K, "bf16", "bf16", a_major=a_major, out_major=out_major)
+    compiled = _plan(g, config=cfg, force_stg_epi=stg)
+    a, b, c = _mkdata(M, N, K, "bf16", "bf16", a_major=a_major, out_major=out_major)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c, _reference(a, b, "bf16"), rtol=0, atol=0)
+
+
+@requires_sm100
+def test_benchmark_sweeps_four_mma_m_configs(monkeypatch):
+    bench_dir = pathlib.Path(__file__).resolve().parents[4] / "benchmark" / "gemm" / "frost"
+    monkeypatch.syspath_prepend(str(bench_dir))
+    from benchmark_matmul import _build_spec_map
+    from benchmark_utils import select_config_variants
+
+    specs = _build_spec_map(_build_graph(1152, 256, 264, "bf16", "bf16"))
+    default = select_config_variants(None, specs)
+    globbed = select_config_variants("CONFIG_sm100_512x64x128_*", specs)
+    for cta_group, cluster in ((1, "1x1"), (2, "2x1")):
+        name = f"CONFIG_sm100_512x64x128_128x64x32_cluster{cluster}_{cta_group}ctamma"
+        assert name in default and name in globbed
+        assert specs[name][0].mma_size_m == 4
+
+
+@requires_sm107
+@pytest.mark.parametrize("mma_k_bytes", (32, 64))
+@pytest.mark.parametrize("cta_group", (1, 2))
+def test_four_mma_m_fp8(mma_k_bytes, cta_group):
+    cfg = by_name(f"CONFIG_sm100_512x128x128_128x128x{mma_k_bytes}_cluster{cta_group}x1_{cta_group}ctamma")
+    M, N, K = 1152, 256, 272
+    compiled = _plan(_build_graph(M, N, K, "fp8_e4m3", "bf16"), config=cfg)
+    a, b, c = _mkdata(M, N, K, "fp8_e4m3", "bf16")
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c, _reference(a, b, "bf16"), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -3129,7 +3200,7 @@ def test_the_a_and_b_collectors_can_never_both_be_live():
         if len(fns) < 2:
             continue
         both += 1
-        for mma_size_m in (1, 2):
+        for mma_size_m in (1, 2, 4):
             for num_gemms in (1, 2, 3):
                 for num_a_operands in (1, 2):
                     for b_ok in (True, False):

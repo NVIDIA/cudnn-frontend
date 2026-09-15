@@ -1327,7 +1327,7 @@ def test_e2e_sm107(combo, cfg_name, cta_group) -> None:
 
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("cta_group", [1, 2])
-@pytest.mark.parametrize("cta_m,cta_n", [(128, 256), (256, 128), (256, 256)])
+@pytest.mark.parametrize("cta_m,cta_n", [(128, 256), (256, 128), (256, 256), (512, 128)])
 @requires_sm107
 def test_e2e_sm107_multi_mma_m(combo, cta_group, cta_m, cta_n) -> None:
     # The grouped pipeline with the CTA tile split along M. The per-group-padded
@@ -1336,7 +1336,8 @@ def test_e2e_sm107_multi_mma_m(combo, cta_group, cta_m, cta_n) -> None:
     # count exceeds one, i.e. at cta_m/cta_n = 256).
     cluster = "cluster1x1" if cta_group == 1 else "cluster2x1"
     name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_128x{cta_n}x64_{cluster}"
-    _run_e2e(E=4, S=512, N=256, K=256, offsets_list=[0, 128, 256, 384], combo=combo, config_name=name, cta_group=cta_group)
+    group_m = cta_m * cta_group if cta_m == 512 else 128
+    _run_e2e(E=4, S=4 * group_m, N=256, K=256, offsets_list=[i * group_m for i in range(4)], combo=combo, config_name=name, cta_group=cta_group)
 
 
 @pytest.mark.parametrize("cfg_name,cta_group", [(_SM107_CFG, 2), (_SM107_CFG_1CTA, 1)])

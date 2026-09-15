@@ -718,32 +718,34 @@ def _kernel(
                     if cutlass.const_expr(a_mcast_slices > 1):
                         _a_rows = cta_tile_mnk[0] // a_mcast_slices
                         if cutlass.const_expr(fallback_cluster_shape_mnk is None):
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    sA_stage.subview(n_rank * _a_rows * a_packed_per_row),
-                                    tma_a_desc.get_ptr(),
-                                    (coord_k, coord_m_per_cta + n_rank * _a_rows, tile_l_a),
-                                    ab_full_mbar_ptr.subview(stage),
-                                    [],
-                                    multicast_mask=tma_mcast_mask_a,
-                                    group=_CTA_GROUP,
-                                )
+                            for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                        sA_stage.subview(n_rank * _a_rows * a_packed_per_row + _am * a_tma_box_m * a_packed_per_row),
+                                        tma_a_desc.get_ptr(),
+                                        (coord_k, coord_m_per_cta + n_rank * _a_rows + _am * a_tma_box_m, tile_l_a),
+                                        ab_full_mbar_ptr.subview(stage),
+                                        [],
+                                        multicast_mask=tma_mcast_mask_a,
+                                        group=_CTA_GROUP,
+                                    )
                         else:
                             _a_per_cta = a_mcast_slices >> _preferred_cluster_n_shift
                             if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
                                 _a_per_cta = a_mcast_slices >> _fallback_cluster_n_shift
                             for _asl in cutlass.range(_a_per_cta):
                                 _a_idx = n_rank * _a_per_cta + _asl
-                                if elect_one:
-                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sA_stage.subview(_a_idx * _a_rows * a_packed_per_row),
-                                        tma_a_desc.get_ptr(),
-                                        (coord_k, coord_m_per_cta + _a_idx * _a_rows, tile_l_a),
-                                        ab_full_mbar_ptr.subview(stage),
-                                        [],
-                                        multicast_mask=tma_mcast_mask_a,
-                                        group=_CTA_GROUP,
-                                    )
+                                for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                            sA_stage.subview(_a_idx * _a_rows * a_packed_per_row + _am * a_tma_box_m * a_packed_per_row),
+                                            tma_a_desc.get_ptr(),
+                                            (coord_k, coord_m_per_cta + _a_idx * _a_rows + _am * a_tma_box_m, tile_l_a),
+                                            ab_full_mbar_ptr.subview(stage),
+                                            [],
+                                            multicast_mask=tma_mcast_mask_a,
+                                            group=_CTA_GROUP,
+                                        )
                     elif cutlass.const_expr(multicast_a):
                         if n_rank == 0:
                             if cutlass.const_expr(a_is_m_major):
@@ -763,16 +765,17 @@ def _kernel(
                                             group=_CTA_GROUP,
                                         )
                             else:
-                                if elect_one:
-                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sA_stage,
-                                        tma_a_desc.get_ptr(),
-                                        (coord_k, coord_m_per_cta, tile_l_a),
-                                        ab_full_mbar_ptr.subview(stage),
-                                        [],
-                                        multicast_mask=tma_mcast_mask_a,
-                                        group=_CTA_GROUP,
-                                    )
+                                for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                            sA_stage.subview(_am * a_tma_box_m * a_packed_per_row),
+                                            tma_a_desc.get_ptr(),
+                                            (coord_k, coord_m_per_cta + _am * a_tma_box_m, tile_l_a),
+                                            ab_full_mbar_ptr.subview(stage),
+                                            [],
+                                            multicast_mask=tma_mcast_mask_a,
+                                            group=_CTA_GROUP,
+                                        )
                     else:
                         if cutlass.const_expr(a_is_m_major):
                             for m_group in cutlass.range_constexpr(cta_tile_mnk[0] // a_tma_group_elems):
@@ -791,16 +794,17 @@ def _kernel(
                                         group=_CTA_GROUP,
                                     )
                         else:
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    sA_stage,
-                                    tma_a_desc.get_ptr(),
-                                    (coord_k, coord_m_per_cta, tile_l_a),
-                                    ab_full_mbar_ptr.subview(stage),
-                                    [],
-                                    multicast_mask=tma_mcast_mask_a,
-                                    group=_CTA_GROUP,
-                                )
+                            for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                        sA_stage.subview(_am * a_tma_box_m * a_packed_per_row),
+                                        tma_a_desc.get_ptr(),
+                                        (coord_k, coord_m_per_cta + _am * a_tma_box_m, tile_l_a),
+                                        ab_full_mbar_ptr.subview(stage),
+                                        [],
+                                        multicast_mask=tma_mcast_mask_a,
+                                        group=_CTA_GROUP,
+                                    )
                 for _bj in cutlass.range_constexpr(num_b_operands):
                     sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
                     tma_b_desc = tma_b_descs[_bj]
@@ -1591,7 +1595,7 @@ def _host(
                         a_stride_m * a_dtype.width // 128,
                         a_stride_l * a_dtype.width // 128,
                     ],
-                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[0] // a_mcast_slices, 1],
+                    box_dims=[cta_tile_mnk[2], a_tma_box_m, 1],
                     swizzle=a_tma_swizzle,
                     tma_format=a_tma_format,
                 )

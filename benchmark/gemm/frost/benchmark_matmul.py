@@ -3,6 +3,10 @@
 
 """Benchmark every CATALOG config on a single matmul shape vs cuBLAS.
 
+The default sweep includes sm100 MMA counts along M of 1, 2, and 4. For
+example, ``--configs 'CONFIG_sm100_512x*x128_128x*x32_cluster2x1_2ctamma'``
+selects four 128-row MMAs per CTA; resource-infeasible tiles report ERR.
+
 `--shape` is `B,M,N,K` (B independent same-shape GEMMs; B=1 = plain matmul).
 `--dtype` selects bf16 (default), fp16, fp8 (E4M3 inputs / BF16 output), or
 fp32. FP32 currently runs only the cuBLAS reference: FROST has no FP32 MMA.

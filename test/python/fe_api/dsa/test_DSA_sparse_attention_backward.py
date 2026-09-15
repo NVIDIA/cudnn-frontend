@@ -128,6 +128,26 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("num_heads", [16, 32, 64, 96, 128])
+def test_DSA_sparse_attention_backward_sm100_d576_workspace_uses_compact_rows(num_heads):
+    """All head counts retain compact dKV rows, including deterministic shards."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    s_q, s_kv, head_dim = 7, 1025, 576
+    padded_s_q = math.ceil(s_q / 8) * 8
+    padded_s_kv = math.ceil(s_kv / 8) * 8
+    lse_odo_bytes = num_heads * padded_s_q * 2 * torch.float32.itemsize
+    expected = lse_odo_bytes + padded_s_kv * head_dim * torch.float32.itemsize
+    assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads) == expected
+
+    deterministic_dkv_bytes = 128 * padded_s_kv * head_dim * torch.float32.itemsize
+    assert flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == lse_odo_bytes + deterministic_dkv_bytes
+
+
 def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False):
     """Run one deterministic case against bitwise and numerical contracts."""
     from cudnn import DSA
@@ -628,7 +648,10 @@ def _run_DSA_sparse_attention_backward_wrapper(
     topk,
     has_topk_length,
     request,
+    allow_unsupported=True,
+    s_q_default=1024,
 ):
+    """Run wrapper backward against reference gradients, optionally skipping unsupported cases."""
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
@@ -645,7 +668,7 @@ def _run_DSA_sparse_attention_backward_wrapper(
         topk=topk,
         has_topk_length=has_topk_length,
         min_compute_capability=90,
-        s_q_default=1024,
+        s_q_default=s_q_default,
         s_kv_default=4096,
     )
     cfg["h_q"] = num_heads
@@ -679,6 +702,8 @@ def _run_DSA_sparse_attention_backward_wrapper(
             stream=stream,
         )
     except (ValueError, NotImplementedError, RuntimeError) as e:
+        if not allow_unsupported:
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
 
     dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
@@ -717,6 +742,7 @@ def test_DSA_sparse_attention_backward_wrapper(
     has_topk_length,
     request,
 ):
+    """Check wrapper gradients against the reference over the shared DSA parameter set."""
     _run_DSA_sparse_attention_backward_wrapper(
         dtype=dtype,
         acc_dtype=acc_dtype,
@@ -726,6 +752,65 @@ def test_DSA_sparse_attention_backward_wrapper(
         topk=topk,
         has_topk_length=has_topk_length,
         request=request,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
+@torch_fork_set_rng(seed=422)
+def test_DSA_sparse_attention_backward_wrapper_h64_d576_topk2048(has_topk_length, request):
+    """Cover the primary H64/D576 training shape beyond one sparse tile."""
+    _require_sm100()
+    _run_DSA_sparse_attention_backward_wrapper(
+        dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        head_dim=576,
+        head_dim_v=512,
+        num_heads=64,
+        topk=2048,
+        has_topk_length=has_topk_length,
+        request=request,
+        allow_unsupported=False,
+        s_q_default=8,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("num_heads", [96, 128])
+@torch_fork_set_rng(seed=423)
+def test_DSA_sparse_attention_backward_wrapper_generic_d576_head_blocks(num_heads, request):
+    """Guard the other head counts that share the generic D576 pipeline."""
+    _require_sm100()
+    _run_DSA_sparse_attention_backward_wrapper(
+        dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        head_dim=576,
+        head_dim_v=512,
+        num_heads=num_heads,
+        topk=128,
+        has_topk_length=True,
+        request=request,
+        allow_unsupported=False,
+        s_q_default=3,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=424)
+def test_DSA_sparse_attention_backward_wrapper_generic_d512_reducer_generations(request):
+    """Exercise three sparse tiles through the generic D512 reducer."""
+    _require_sm100()
+    _run_DSA_sparse_attention_backward_wrapper(
+        dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        head_dim=512,
+        head_dim_v=512,
+        num_heads=64,
+        topk=129,
+        has_topk_length=False,
+        request=request,
+        allow_unsupported=False,
+        s_q_default=3,
     )
 
 
@@ -1118,6 +1203,15 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
         pytest.param(576, 32, (0, 1, 64, 65, 128, 0), id="d576-mixed"),
         pytest.param(576, 16, (0, 1, 127, 128, 129, 511, 512, 513), id="d576-h16-m128-boundaries"),
         pytest.param(576, 32, (0, 1, 63, 64, 65, 127, 128), id="d576-h32-m64-boundaries"),
+        pytest.param(576, 64, (0, 1, 63, 64, 65, 127, 128), id="d576-h64-m64-boundaries"),
+        # Cross the standalone OdO/LSE preprocessor's 41-query block boundary.
+        pytest.param(576, 64, (0, 1, 128) * 14, id="d576-h64-odo-query-tail"),
+        pytest.param(
+            576,
+            64,
+            (0, 1, 63, 64, 65, 127, 128, 129, 511, 512, 513, 1023, 1024, 1025, 2047, 2048),
+            id="d576-h64-topk2048-boundaries",
+        ),
         pytest.param(576, 128, (-3, 0, 1, 63, 64, 65, 127, 128, 129), id="d576-h128-two-cta-length-boundaries"),
     ],
 )
@@ -1142,8 +1236,13 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
 
     device = torch.device("cuda")
     s_q = len(topk_length_values) if topk_length_values is not None else 2
-    is_h16 = head_dim == 576 and num_heads == 16
-    s_kv, topk = (640, 513) if is_h16 else (256, 128)
+    max_topk_length = max(topk_length_values)
+    if head_dim == 576 and num_heads == 16:
+        s_kv, topk = 640, 513
+    elif head_dim == 576 and num_heads == 64 and max_topk_length > 128:
+        s_kv, topk = 2112, 2048
+    else:
+        s_kv, topk = 256, 128
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
@@ -1153,9 +1252,9 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
 
     # D512 covers defensive negative handling around the 64-row tile boundary.
     # D576/H16 covers both sides of the dedicated kernel's 128-row boundary and
-    # its final feature/top-k tails. D576/H32 covers the corresponding M64
-    # boundary (a partial 64-row CTA on SM100), and every case also exercises
-    # the all-empty fast path, where the expected gradients are exactly zero.
+    # its final feature/top-k tails. D576/H32 and H64 cover the corresponding
+    # M64 boundaries; the extended H64 case crosses every power-of-two boundary
+    # through topk=2048. Every case also exercises the all-empty fast path.
     # D576/H128 covers the two-CTA route, including lengths above max_topk.
     topk_length_cases = [torch.zeros(s_q, dtype=torch.int32, device=device)]
     if topk_length_values is not None:
@@ -1652,6 +1751,77 @@ def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32():
     p_sink = torch.exp(attn_sink.view(1, -1) - torch.logaddexp(lse, attn_sink.view(1, -1)))
     expected_d_sink = (-p_sink * (out.float() * dout.float()).sum(dim=-1)).sum(dim=0)
     torch.testing.assert_close(result["d_sink"], expected_d_sink, atol=2e-5, rtol=2e-3)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "dtype,kv_value,dout_value",
+    [
+        pytest.param(torch.bfloat16, 14.8125, 0.2255859375, id="bf16-rounding"),
+        pytest.param(torch.float16, 10.0, 1000.0, id="fp16-intermediate-overflow"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm90_scales_ds_before_conversion(dtype, kv_value, dout_value):
+    """Scale dS in FP32 before narrowing it for the Hopper MMA operands."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm90()
+    device = torch.device("cuda")
+    s_q, s_kv, num_heads, head_dim, head_dim_v = 1, 64, 32, 576, 512
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    # Q is nonzero only where KV is zero, so scores remain zero and P is
+    # exactly uniform.  The Q tail makes dKV[:, head_dim_v:] a pure dK term.
+    q = torch.zeros(s_q, num_heads, head_dim, dtype=dtype, device=device)
+    q[..., head_dim_v:] = 0.25
+    kv = torch.zeros(s_kv, head_dim, dtype=dtype, device=device)
+    kv[0, :head_dim_v] = kv_value
+    attn_sink = torch.full((num_heads,), -math.inf, dtype=torch.float32, device=device)
+    topk_idxs = torch.arange(s_kv, dtype=torch.int32, device=device).view(1, -1)
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, softmax_scale=softmax_scale)
+    dout = torch.full_like(out, dout_value)
+
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+    )
+    torch.cuda.synchronize()
+
+    # Mirror the intended cast graph using scalar values that are exact in
+    # FP32.  The BF16 case moves by one output ULP if dS is narrowed before
+    # scaling; the FP16 case overflows that premature conversion to infinity.
+    kv_scalar = torch.tensor(kv_value, dtype=dtype)
+    dout_scalar = torch.tensor(dout_value, dtype=dtype)
+    out_scalar = (kv_scalar.float() / s_kv).to(dtype)
+    dp = head_dim_v * dout_scalar.float() * kv_scalar.float()
+    delta = head_dim_v * out_scalar.float() * dout_scalar.float()
+    ds_unscaled = (dp - delta) / s_kv
+    ds_scaled = (ds_unscaled * softmax_scale).to(dtype)
+    expected_dq_value = (ds_scaled.float() * kv_scalar.float()).to(dtype).item()
+    prematurely_narrowed_ds = (ds_unscaled.to(dtype).float() * softmax_scale).to(dtype)
+    old_dq_value = (prematurely_narrowed_ds.float() * kv_scalar.float()).to(dtype).item()
+    assert expected_dq_value != old_dq_value
+
+    q_tail_scalar = torch.tensor(0.25, dtype=dtype)
+    expected_dkv_tail_value = (ds_scaled.float() * q_tail_scalar.float() * num_heads).to(dtype).item()
+    old_dkv_tail_value = (prematurely_narrowed_ds.float() * q_tail_scalar.float() * num_heads).to(dtype).item()
+    assert expected_dkv_tail_value != old_dkv_tail_value
+
+    expected_dq = torch.zeros_like(q)
+    expected_dq[:, :, :head_dim_v] = expected_dq_value
+    assert torch.equal(result["dkv"][0, head_dim_v:], torch.full_like(result["dkv"][0, head_dim_v:], expected_dkv_tail_value))
+    assert torch.equal(result["dq"], expected_dq)
+    assert torch.isfinite(result["dkv"]).all()
+    assert torch.isfinite(result["d_sink"]).all()
 
 
 @pytest.mark.L0
