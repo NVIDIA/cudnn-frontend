@@ -968,6 +968,12 @@ class SdpaBinding:
             )
             if t is not None
         ]
+        # One tensor can occupy two slots -- a single paged block table serving
+        # both K and V is the ordinary case. Counting it twice would mark its
+        # name and uid ambiguous below, so resolve_variant_pack would ignore
+        # variant-pack entries keyed by either identifier. Dedupe by identity.
+        _seen: set = set()
+        bound = [t for t in bound if id(t) not in _seen and not _seen.add(id(t))]
         name_counts: dict = {}
         uid_counts: dict = {}
         names, uids = [], []

@@ -575,6 +575,13 @@ class SdpaFwdDsl(APIBase):
         self.paged_max_seq_len_kv = None if paged_max_seq_len_kv is None else int(paged_max_seq_len_kv)
         self.paged_table_stride = None if paged_table_stride is None else tuple(int(s) for s in paged_table_stride)
         self.paged_table_v_stride = None if paged_table_v_stride is None else tuple(int(s) for s in paged_table_v_stride)
+        # A block table is (batch, max_pages), so its declared stride must name
+        # both axes. The execute-time comparison zips got/want/shape, and zip
+        # truncates -- a one-element declaration would silently skip the
+        # page-axis check and still enter the compile key.
+        for _name, _st in (("paged_table_stride", self.paged_table_stride), ("paged_table_v_stride", self.paged_table_v_stride)):
+            if _st is not None and len(_st) != 2:
+                raise ValueError(f"{_name} must have exactly two entries (batch, page); got {_st}")
 
         self.batch_size: Optional[int] = None
         self.s_q_max: Optional[int] = None
@@ -1946,6 +1953,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     raise ValueError(
                         f"paged KV: {name} must match the declared pool {tuple(d.shape)} / {tuple(d.stride)}; got {tuple(t.shape)} / {tuple(t.stride())}"
                     )
+            # The launch device comes from Q, and the fake descriptors carry no
+            # device, so a pool or block table allocated on another GPU would
+            # reach the kernel as a foreign-device pointer with nothing on the
+            # binder path to catch it.
+            for name, t in (("block_table", block_table), ("block_table_v", block_table_v), ("k_tensor", k_tensor), ("v_tensor", v_tensor)):
+                if t.device != q_tensor.device:
+                    raise ValueError(f"paged KV: {name} is on {t.device}, but the launch device is {q_tensor.device} (from q_tensor)")
         elif block_table is not None or block_table_v is not None:
             raise ValueError("block_table given but the adapter was not built for paged KV")
         # Run on the caller's stream (ExecutionContext.stream, resolved from the
