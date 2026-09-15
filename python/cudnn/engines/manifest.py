@@ -178,6 +178,10 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "kda_hopper_cuda": EngineSlot(5),
         },
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
+        # Ordering only, and only on Hopper: slot order is identity, not
+        # preference, so without this the slot-1 cuTile engine wins every sm90
+        # graph by default despite the two sm90 engines being faster there.
+        heuristics=("cudnn.linear_attention.kda_heuristics", "recommend"),
     ),
     EngineFamily(
         GDN2_ID_BASE,
