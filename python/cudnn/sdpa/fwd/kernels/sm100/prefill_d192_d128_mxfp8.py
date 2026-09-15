@@ -272,12 +272,16 @@ def _exp2_emulated_scalar(x):
 # MXFP8 storage dtype dispatch — keyed off CFG.DTYPE_QKV (0=E4M3, 1=E5M2).
 if CFG.DTYPE_QKV == 0:
     STORAGE_DTYPE = cutlass.Float8E4M3FN
-    P_STORAGE_DTYPE = cutlass.Float8E4M3FN
 elif CFG.DTYPE_QKV == 1:
     STORAGE_DTYPE = cutlass.Float8E5M2
-    P_STORAGE_DTYPE = cutlass.Float8E5M2
 else:
     raise ValueError(f"prefill_sdpa_mxfp8: DTYPE_QKV={CFG.DTYPE_QKV} not supported " f"(expected 0=E4M3 or 1=E5M2)")
+
+# Q/K stay MXFP8.  The hybrid specialization changes only the P leg: P is
+# retained in TMEM as BF16 and V is fetched/stored as BF16, so BMM2 is a
+# non-block-scale BF16 MMA.  The Q/K SF machinery below remains unchanged.
+P_STORAGE_DTYPE = cutlass.BFloat16 if CFG.PV_BF16 else STORAGE_DTYPE
+V_STORAGE_DTYPE = cutlass.BFloat16 if CFG.PV_BF16 else STORAGE_DTYPE
 
 MMA_KIND = nvvm.MMABlockScaleKind.MXF8F6F4
 SCALE_VEC_SIZE = nvvm.Tcgen05MMAScaleVecSize.BLOCK32
@@ -364,7 +368,7 @@ oBufferElems = CFG.TILE_M * CFG.TILE_O
 
 qTmaTransactionBytes = qBufferElems * CFG.BPE * CFG.CTA_MMA
 kTmaTransactionBytes = kBufferElems * CFG.BPE * CFG.CTA_MMA
-vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
+vTmaTransactionBytes = vBufferElems * CFG.BPE_V * CFG.CTA_MMA
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 # The adapter uses a machine-sized THD grid; the setup kernel publishes the
@@ -654,8 +658,10 @@ class KernelTmemLayout:
     O1_OFF: int = 384
 
     # Logical P0 occupies physical S_acc_1; logical P1 occupies S_acc_0.
-    P0_OFF: int = 224
-    P1_OFF: int = 96
+    # BF16 P needs twice the TMEM footprint of FP8 P, so move each start back
+    # by 32 columns without touching Q/K SF scratch at the slot heads.
+    P0_OFF: int = 192 if CFG.PV_BF16 else 224
+    P1_OFF: int = 64 if CFG.PV_BF16 else 96
 
     SF_HEAD_OFFSET: int = 8
     SF_AFTER_P_OFFSET: int = 32
@@ -703,7 +709,7 @@ _O_SWZ_B = {128: 3, 64: 2, 32: 1}[CFG.O_SWZ_BYTES]
 _O_SMEM_SWIZZLE = cutlass.Swizzle(_O_SWZ_B, 4, 3)
 LEADING_BYTE_OFFSET_QK = 0
 
-_MMA_K_FP8 = _MXFP8_TILE_K_HW
+_MMA_K_PV = CFG.TILE_K_HW_BMM2
 STRIDE_BYTE_OFFSET_QK = 8 * CFG.Q_SWZ_BYTES
 
 # leading_byte_offset = 0 when (TILE_O/CTA_MMA)/8 <= 8 else TILE_N*V_SWZ_BYTES
@@ -712,7 +718,7 @@ _V_PC_COLS = CFG.TILE_O // CFG.CTA_MMA
 LEADING_BYTE_OFFSET_PV = 0 if (_V_PC_COLS // _CORE_MATRIX_ROWS) <= 8 else CFG.TILE_N * CFG.V_SWZ_BYTES
 STRIDE_BYTE_OFFSET_PV = 8 * CFG.V_SWZ_BYTES
 
-NUM_KPHASES_PV = CFG.TILE_N // _MMA_K_FP8
+NUM_KPHASES_PV = CFG.TILE_N // _MMA_K_PV
 NUM_KPHASES_PV_PER_CHUNK = NUM_KPHASES_PV // CFG.N_BMM2_CHUNKS
 
 
@@ -754,7 +760,7 @@ def _kernel(
 
     sQ_raw = cutlass.Array(STORAGE_DTYPE, CFG.TILES_Q * qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sK_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * kBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
-    sV_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * vBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+    sV_raw = cutlass.Array(V_STORAGE_DTYPE, CFG.STAGES_KV * vBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sO_raw = cutlass.Array(OUT_STORAGE_DTYPE, CFG.TILES_Q * oBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sStats_raw = cutlass.Array(
         cutlass.Float32,
@@ -766,8 +772,6 @@ def _kernel(
     # SF buffers sized in BYTES (uint8 storage).
     sQ_SF_raw = cutlass.Array(cutlass.Int8, CFG.TILES_Q * SF_SMEM_SIZE_Q, alignment=1024, space=cutlass.AddressSpace.smem)
     sK_SF_raw = cutlass.Array(cutlass.Int8, CFG.STAGES_KV * SF_SMEM_SIZE_K, alignment=1024, space=cutlass.AddressSpace.smem)
-    sP_SF_raw = cutlass.Array(cutlass.Int8, CFG.STAGES_KV * SF_SMEM_SIZE_P, alignment=1024, space=cutlass.AddressSpace.smem)
-    sV_SF_raw = cutlass.Array(cutlass.Int8, CFG.STAGES_KV * SF_SMEM_SIZE_V, alignment=1024, space=cutlass.AddressSpace.smem)
 
     sQ = SmemTile(
         base=sQ_raw,
@@ -831,22 +835,30 @@ def _kernel(
         stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
         layout=SMEM_LAYOUT_SF,
     )
-    sP_SF = SmemTile(
-        base=sP_SF_raw,
-        elems_per_stage=SF_SMEM_SIZE_P,
-        stages=CFG.STAGES_KV,
-        leading_byte_offset=SF_LEADING_BYTE_OFFSET,
-        stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
-        layout=SMEM_LAYOUT_SF,
-    )
-    sV_SF = SmemTile(
-        base=sV_SF_raw,
-        elems_per_stage=SF_SMEM_SIZE_V,
-        stages=CFG.STAGES_KV,
-        leading_byte_offset=SF_LEADING_BYTE_OFFSET,
-        stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
-        layout=SMEM_LAYOUT_SF,
-    )
+    if cutlass.const_expr(CFG.PV_BF16):
+        # BF16 BMM2 has no scale operands. Preserve the generic helper
+        # signatures by borrowing Q/K SF tiles; hybrid code never reads them.
+        sP_SF = sQ_SF
+        sV_SF = sK_SF
+    else:
+        sP_SF_raw = cutlass.Array(cutlass.Int8, CFG.STAGES_KV * SF_SMEM_SIZE_P, alignment=1024, space=cutlass.AddressSpace.smem)
+        sV_SF_raw = cutlass.Array(cutlass.Int8, CFG.STAGES_KV * SF_SMEM_SIZE_V, alignment=1024, space=cutlass.AddressSpace.smem)
+        sP_SF = SmemTile(
+            base=sP_SF_raw,
+            elems_per_stage=SF_SMEM_SIZE_P,
+            stages=CFG.STAGES_KV,
+            leading_byte_offset=SF_LEADING_BYTE_OFFSET,
+            stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
+            layout=SMEM_LAYOUT_SF,
+        )
+        sV_SF = SmemTile(
+            base=sV_SF_raw,
+            elems_per_stage=SF_SMEM_SIZE_V,
+            stages=CFG.STAGES_KV,
+            leading_byte_offset=SF_LEADING_BYTE_OFFSET,
+            stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
+            layout=SMEM_LAYOUT_SF,
+        )
 
     bars = make_classic_bars(CFG)
 
@@ -951,12 +963,13 @@ def _kernel(
                     sched.initial_decoded_smem.subview(3).store(initial_split)
 
     # P_SF SMEM fill 0x7F (constant 1.0); MUST happen BEFORE cga_arrive so both peers see filled SMEM.
-    SF_TOTAL_BYTES_P = SF_SMEM_SIZE_P * CFG.STAGES_KV
-    _SF_P_ITERS = (SF_TOTAL_BYTES_P + CFG.THREADS_PER_CTA - 1) // CFG.THREADS_PER_CTA
-    for _i in cutlass.range_constexpr(_SF_P_ITERS):
-        _off = tidx + cutlass.Int32(_i * CFG.THREADS_PER_CTA)
-        if _off < cutlass.Int32(SF_TOTAL_BYTES_P):
-            sP_SF_raw.subview(_off).store(cutlass.Int8(0x7F))
+    if cutlass.const_expr(not CFG.PV_BF16):
+        SF_TOTAL_BYTES_P = SF_SMEM_SIZE_P * CFG.STAGES_KV
+        _SF_P_ITERS = (SF_TOTAL_BYTES_P + CFG.THREADS_PER_CTA - 1) // CFG.THREADS_PER_CTA
+        for _i in cutlass.range_constexpr(_SF_P_ITERS):
+            _off = tidx + cutlass.Int32(_i * CFG.THREADS_PER_CTA)
+            if _off < cutlass.Int32(SF_TOTAL_BYTES_P):
+                sP_SF_raw.subview(_off).store(cutlass.Int8(0x7F))
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
@@ -1141,7 +1154,8 @@ def _kernel(
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_q_sf_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_sf_desc.get_ptr())
-        nvvm.prefetch_tensormap(tma_v_sf_desc.get_ptr())
+        if cutlass.const_expr(not CFG.PV_BF16):
+            nvvm.prefetch_tensormap(tma_v_sf_desc.get_ptr())
         _tmaldg_warp_group(
             tma_q_desc=tma_q_desc,
             tma_k_desc=tma_k_desc,
@@ -1334,7 +1348,7 @@ def _tmaldg_warp_group(
     # SF expect_tx scales by CTA_MMA under cga2 (2× SMEM size on leader); cga1 → SF_SMEM_SIZE.
     Q_SF_EXPECT_BYTES = SF_SMEM_SIZE_Q * CFG.CTA_MMA
     K_SF_EXPECT_BYTES = SF_SMEM_SIZE_K * CFG.CTA_MMA
-    V_SF_EXPECT_BYTES = SF_SMEM_SIZE_V * CFG.CTA_MMA
+    V_SF_EXPECT_BYTES = 0 if CFG.PV_BF16 else SF_SMEM_SIZE_V * CFG.CTA_MMA
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -1446,13 +1460,14 @@ def _tmaldg_warp_group(
                 mcast_mask=tma_mcast_mask,
                 acquire=False,
             )
-            tma_load_tile(
-                sV_SF[kv_state.idx].shifted(v_sf_peer_off),
-                tma_v_sf(v_sf_peer_row, cu_sf_k_base + kv_left, kv_head_idx, tma_batch, coord_0=cutlass.Int32(0)),
-                bars.mb_v_full[kv_state.idx].smem_ptr,
-                cta_group=CFG.CTA_MMA,
-                mcast_mask=sf_mcast_mask,
-            )
+            if cutlass.const_expr(not CFG.PV_BF16):
+                tma_load_tile(
+                    sV_SF[kv_state.idx].shifted(v_sf_peer_off),
+                    tma_v_sf(v_sf_peer_row, cu_sf_k_base + kv_left, kv_head_idx, tma_batch, coord_0=cutlass.Int32(0)),
+                    bars.mb_v_full[kv_state.idx].smem_ptr,
+                    cta_group=CFG.CTA_MMA,
+                    mcast_mask=sf_mcast_mask,
+                )
             kv_state = advance(kv_state, CFG.STAGES_KV)
 
             for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=2):
@@ -1516,13 +1531,14 @@ def _tmaldg_warp_group(
                     mcast_mask=tma_mcast_mask,
                     acquire=False,
                 )
-                tma_load_tile(
-                    sV_SF[kv_state.idx].shifted(v_sf_peer_off),
-                    tma_v_sf(v_sf_peer_row, cu_sf_k_base + kv_loop, kv_head_idx, tma_batch, coord_0=cutlass.Int32(0)),
-                    bars.mb_v_full[kv_state.idx].smem_ptr,
-                    cta_group=CFG.CTA_MMA,
-                    mcast_mask=sf_mcast_mask,
-                )
+                if cutlass.const_expr(not CFG.PV_BF16):
+                    tma_load_tile(
+                        sV_SF[kv_state.idx].shifted(v_sf_peer_off),
+                        tma_v_sf(v_sf_peer_row, cu_sf_k_base + kv_loop, kv_head_idx, tma_batch, coord_0=cutlass.Int32(0)),
+                        bars.mb_v_full[kv_state.idx].smem_ptr,
+                        cta_group=CFG.CTA_MMA,
+                        mcast_mask=sf_mcast_mask,
+                    )
 
                 kv_state = advance(kv_state, CFG.STAGES_KV)
 
@@ -1751,22 +1767,46 @@ def _mma_warp_group(
         sf_blocks_per_step=_MXFP8_SF_BLOCKS_PER_STEP,
         scale_vec_size=SCALE_VEC_SIZE,
     )
-    bmm2_desc = MmaDesc(
-        M=CFG.TILE_M * CFG.CTA_MMA,
-        N=CFG.TILE_O,
-        K=CFG.TILE_N,
-        bpe_a=CFG.BPE,
-        bpe_b=CFG.BPE,
-        tile_k_hw=_MXFP8_TILE_K_HW,
-        btranspose=True,
-        k_subtile=CFG.V_SWZ_BYTES // CFG.BPE,
-        cta_group=CFG.CTA_MMA,
-        idesc=idesc_pv_bs,
-        kind=MMA_KIND,
-        is_block_scale=True,
-        sf_blocks_per_step=_MXFP8_SF_BLOCKS_PER_STEP,
-        scale_vec_size=SCALE_VEC_SIZE,
-    )
+    bmm2_desc = bmm1_desc
+    if cutlass.const_expr(CFG.PV_BF16):
+        idesc_pv = prims.Tcgen05InstrDesc.build(
+            c_dtype=cutlass.Float32,
+            a_dtype=cutlass.BFloat16,
+            b_dtype=cutlass.BFloat16,
+            n_dim=CFG.TILE_O,
+            m_dim=CFG.TILE_M * CFG.CTA_MMA,
+            b_major=1,
+        )
+        bmm2_desc = MmaDesc(
+            M=CFG.TILE_M * CFG.CTA_MMA,
+            N=CFG.TILE_O,
+            K=CFG.TILE_N,
+            bpe_a=2,
+            bpe_b=2,
+            tile_k_hw=CFG.TILE_K_HW_BMM2,
+            btranspose=True,
+            k_subtile=CFG.V_SWZ_BYTES // CFG.BPE_V,
+            cta_group=CFG.CTA_MMA,
+            idesc=idesc_pv,
+            kind=nvvm.Tcgen05MMAKind.F16,
+        )
+    else:
+        bmm2_desc = MmaDesc(
+            M=CFG.TILE_M * CFG.CTA_MMA,
+            N=CFG.TILE_O,
+            K=CFG.TILE_N,
+            bpe_a=CFG.BPE,
+            bpe_b=CFG.BPE,
+            tile_k_hw=_MXFP8_TILE_K_HW,
+            btranspose=True,
+            k_subtile=CFG.V_SWZ_BYTES // CFG.BPE,
+            cta_group=CFG.CTA_MMA,
+            idesc=idesc_pv_bs,
+            kind=MMA_KIND,
+            is_block_scale=True,
+            sf_blocks_per_step=_MXFP8_SF_BLOCKS_PER_STEP,
+            scale_vec_size=SCALE_VEC_SIZE,
+        )
 
     desc_Q0 = sQ[0].desc()
     desc_Q1 = sQ[1].desc()
@@ -1891,14 +1931,17 @@ def _mma_warp_group(
     def _utccp_bmm2_sf(tmem_sf_p, tmem_sf_v, smem_desc_p, smem_desc_v):
         # SF_P is the constant P_SF; SF_V is per-kv-tile.  Both single-block (llama).
         # desc_P_SF_0 passed explicitly (DSL-value closure capture is unstaged).
-        nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_p, smem_desc_p, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
-        nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_v, smem_desc_v, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
+        if cutlass.const_expr(not CFG.PV_BF16):
+            nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_p, smem_desc_p, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
+            nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_v, smem_desc_v, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
 
     def _utccp_bmm2_p_sf(tmem_sf_p, smem_desc_p):
-        nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_p, smem_desc_p, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
+        if cutlass.const_expr(not CFG.PV_BF16):
+            nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_p, smem_desc_p, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
 
     def _utccp_bmm2_v_sf(tmem_sf_v, smem_desc_v):
-        nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_v, smem_desc_v, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
+        if cutlass.const_expr(not CFG.PV_BF16):
+            nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_v, smem_desc_v, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
 
     if cutlass.const_expr(CFG.MASK_FLAGS == 0 and SPLIT_KV == 1):
         kv_left = cutlass.Int32(0)
@@ -2341,7 +2384,7 @@ def _softmax_kv_body(
         tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
         tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
     CHUNK = 64
-    P_COLS_PER_CHUNK = CHUNK // 4
+    P_COLS_PER_CHUNK = CHUNK // (2 if CFG.PV_BF16 else 4)
     NEG_INF = cutlass.Float32(-3.4028235e38)
     RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
 
@@ -2528,7 +2571,7 @@ def _softmax_kv_body(
     )
     if cutlass.const_expr(not _THD_SWA_STORE_P_BEFORE_REDUCE):
         sum_a_pair = row_reduction_pair_64(reg_P_a)
-    p_a_fp16 = reg_P_a.to(STORAGE_DTYPE)
+    p_a_fp16 = reg_P_a.to(P_STORAGE_DTYPE)
     # P0 writes physical S1 after S1 is read.  P1 is deliberately one S0
     # token behind, so P1(i) waits for the read of next S0(i+1).
     if cutlass.const_expr(MERGE_SOFTMAX_WGS):
@@ -2549,7 +2592,7 @@ def _softmax_kv_body(
             sum_a_pair = row_reduction_pair_64(reg_P_a)
 
     reg_P_b = _exp2_mixed_late(reg_S_b)
-    p_b_fp16 = reg_P_b.to(STORAGE_DTYPE)
+    p_b_fp16 = reg_P_b.to(P_STORAGE_DTYPE)
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp16)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -3091,8 +3134,9 @@ def _correction_warp_group(
                 bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
                 bars.mb_o_empty[qs].wait(o_empty_phase)
             else:
-                _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
-                _amax_o_local = cutlass.Float32(0.0)
+                if cutlass.const_expr(CFG.EMIT_AMAX_O):
+                    _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
+                    _amax_o_local = cutlass.Float32(0.0)
 
                 for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                     o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
@@ -3110,7 +3154,8 @@ def _correction_warp_group(
                         tuple(cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)),
                         cutlass.Float32,
                     )
-                    _amax_o_local = cute.math.max(_amax_o_local, _max_abs_reduction(o_scaled), ftz=True)
+                    if cutlass.const_expr(CFG.EMIT_AMAX_O):
+                        _amax_o_local = cute.math.max(_amax_o_local, _max_abs_reduction(o_scaled), ftz=True)
                     o_out = o_scaled.to(OUT_STORAGE_DTYPE)
 
                     col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
@@ -3130,7 +3175,7 @@ def _correction_warp_group(
 
             # The global amax is independent of the O TMA store.  Publish O
             # first so the store warp can overlap this atomic and the next qs.
-            if cutlass.const_expr(SPLIT_KV == 1):
+            if cutlass.const_expr(SPLIT_KV == 1 and CFG.EMIT_AMAX_O):
                 if cutlass.const_expr(CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS == 0):
                     _amax_o_warp_input = cutlass.Float32(0.0)
                     if _row_valid:
@@ -3442,7 +3487,7 @@ def compile(  # noqa: A001
         assumed_align=16,
     )
     fake_v = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
+        V_STORAGE_DTYPE,
         (_fake_batch, skv, kh, CFG.TILE_O),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
