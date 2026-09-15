@@ -117,6 +117,7 @@ def launch(
     gate_lower_bound: float = -5.0,
     flags: int = 0,
     q_scale: float = DEFAULT_Q_SCALE,
+    n_qk_heads: int = 0,
 ) -> None:
     """One ``kda_fused`` launch. All tensor arguments are device addresses.
 
@@ -138,6 +139,8 @@ def launch(
     params.f32(gate_lower_bound)
     params.i32(flags)
     params.f32(q_scale)
+    # q/k head count; equal to n_heads unless value heads are grouped.
+    params.i32(n_qk_heads or n_heads)
 
     compiler.launch(
         func,

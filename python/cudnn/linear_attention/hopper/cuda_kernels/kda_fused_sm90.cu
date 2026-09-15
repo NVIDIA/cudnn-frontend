@@ -395,7 +395,8 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                                          const float* __restrict__ gdt_bias,
                                          float gate_lb,
                                          int flags,
-                                         float q_scale) {
+                                         float q_scale,
+                                         int HQ) {
     extern __shared__ __align__(128) char raws[];
     FusedSmem& sm = *reinterpret_cast<FusedSmem*>(raws);
 
@@ -405,6 +406,13 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int lg = lane >> 2, tg = lane & 3;
     const int HD = H * kDim;
+    // Grouped value attention: cuDNN carries the gate, beta, state and output at
+    // HO = max(H_q, H_v) heads, which is what `H` is here, while q and k keep
+    // their own (smaller) head count. Only their addressing differs -- each
+    // value head reads the query head it is grouped under, and several CTAs
+    // therefore stage the same q/k rows, which costs a re-read and no logic.
+    const int HDQ   = HQ * kDim;
+    const int qhead = (HQ == H) ? head : head / (H / HQ);
 
     // Fusion flags are uniform across the block, so these branches are free.
     const bool f_l2   = (flags & KDA_FLAG_L2NORM) != 0;
@@ -440,10 +448,11 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
 #pragma unroll
         for (int it = 0; it < 2; ++it) {
             const int i = (tid >> 4) + 8 * it, d = 8 * (tid & 15);
-            const int tk  = tb + i;
-            const long ix = static_cast<long>(tk) * HD + head * kDim + d;
-            cp16(&R.k[i * kDim + d], gk + ix, tk < s1);
-            cp16(&R.q[i * kDim + d], gq + ix, tk < s1);
+            const int tk   = tb + i;
+            const long ix  = static_cast<long>(tk) * HD + head * kDim + d;
+            const long ixq = static_cast<long>(tk) * HDQ + qhead * kDim + d;
+            cp16(&R.k[i * kDim + d], gk + ixq, tk < s1);
+            cp16(&R.q[i * kDim + d], gq + ixq, tk < s1);
             cp16(&R.v[i * kLdA + d], gv + ix, tk < s1);
         }
         if (tid < kChunk) cp4(&R.beta[tid], gbeta + static_cast<long>(tb + tid) * H + head, tb + tid < s1);

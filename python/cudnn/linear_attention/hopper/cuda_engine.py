@@ -91,8 +91,11 @@ class KdaHopperCudaPlan(CompiledPlan):
     def __init__(self, graph):
         (node,) = graph.nodes
         q, v, cu = (node.inputs[p] for p in ("q", "v", "cu_seqlens"))
-        self.total, self.h, self.k = (int(d) for d in q.dim)
+        self.total, self.h_qk, self.k = (int(d) for d in q.dim)
         self.v_dim = int(v.dim[2])
+        # cuDNN carries the gate, beta, state and output at HO = max(H_q, H_v).
+        # The kernel's head grid is HO; q and k address themselves at h_qk.
+        self.h = max(self.h_qk, int(v.dim[1]))
         self.n_seqs = int(cu.dim[0]) - 1
         self.ports = None
         self._scratch_state = None
@@ -214,6 +217,7 @@ class KdaHopperCudaPlan(CompiledPlan):
             gate_lower_bound=self.gate_lower_bound,
             flags=self.flags,
             q_scale=self.q_scale,
+            n_qk_heads=self.h_qk,
         )
         # A bf16 final_state was written through an fp32 staging buffer.
         marshal.write_back(staged_fs, caller_fs, stream)
@@ -450,10 +454,15 @@ class KdaHopperCudaEngine(BaseEngine):
             raise NotImplementedError(f"KdaHopperCudaEngine: cu_seqlens must be int32 or int64, got {facts.cu_dtype}")
         if facts.d_qk != HEAD_DIM or facts.d_v != HEAD_DIM:
             raise NotImplementedError(f"KdaHopperCudaEngine: head dims must be {HEAD_DIM}, got K={facts.d_qk} V={facts.d_v}")
-        if not (facts.h_q == facts.h_k == facts.h_v):
-            raise NotImplementedError(
-                "KdaHopperCudaEngine: grouped heads are unsupported; q/k/v head counts must match " f"(got {facts.h_q}/{facts.h_k}/{facts.h_v})"
-            )
+        # Grouped VALUE attention: more value heads than query heads, each query
+        # head shared by a contiguous group. The forward kernel runs its head
+        # grid at HO = max(H_q, H_v) and remaps q/k; the backward does not.
+        if facts.h_q != facts.h_k:
+            raise NotImplementedError(f"KdaHopperCudaEngine: q and k head counts must match (got {facts.h_q}/{facts.h_k})")
+        if facts.h_v < facts.h_q or (facts.h_q and facts.h_v % facts.h_q):
+            raise NotImplementedError(f"KdaHopperCudaEngine: value heads must be a whole multiple of query heads (got {facts.h_q}/{facts.h_v})")
+        if facts.is_bwd and facts.h_v != facts.h_q:
+            raise NotImplementedError(f"KdaHopperCudaEngine: the backward kernel needs equal head counts (got {facts.h_q}/{facts.h_v})")
         if facts.io_dtype not in (cudnn.data_type.BFLOAT16, None):
             raise NotImplementedError(f"KdaHopperCudaEngine: q/k/v must be bf16, got {facts.io_dtype}")
         # The kernel reads the gate and beta in fp32. FlashInfer passes both at
