@@ -41,7 +41,8 @@ pytestmark = [pytest.mark.L0, requires_matmul_gpu]
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
 from cudnn.gemm.frost.compiler import force_stg_epi as _force_stg_epi, _current_arch, _epi_chunk_elems, _epi_vec_bytes
-from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES
+from cudnn.gemm.frost.arch_family import active_family, template_dir, template_files
+from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES, PIPELINE_FAMILY
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import CATALOG, ConfigSm120, by_name
 
@@ -288,6 +289,10 @@ def _compatible(
         return False, (f"B N-major per-MMA SMEM N={mma_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
     if not any(lo <= _current_arch() < hi for lo, hi in PIPELINE_ARCH_RANGES[cfg.pipeline]):
         return False, f"the {cfg.pipeline} pipeline does not run on sm_{_current_arch()}"
+    if PIPELINE_FAMILY[cfg.pipeline] != active_family():
+        # Each arch tree's compiler renders its own pipelines only; the process
+        # picked its tree from the GPU (or CUDNN_FRONTEND_GEMM_ARCH_FAMILY).
+        return False, f"the {cfg.pipeline} pipeline is served by the {PIPELINE_FAMILY[cfg.pipeline]} arch tree; this process runs the {active_family()} tree"
     if cfg.pipeline == "sm120":
         # MN-major operands ride a transposing ldmatrix: b16 for 16-bit dtypes,
         # the SM 12x byte-granule m16n16.trans.b8 form for 8-bit ones. Sub-byte
@@ -2402,7 +2407,7 @@ def test_cache_dir_falls_back_when_unwritable(tmp_path, monkeypatch, caplog):
     try:
         _usable_cache_dir.cache_clear()
         monkeypatch.setenv("CUDNN_FRONTEND_GEMM_KERNEL_CACHE", str(readonly / "nested"))
-        with caplog.at_level(logging.WARNING, logger="cudnn.gemm.frost.compiler"):
+        with caplog.at_level(logging.WARNING, logger=_cache_dir.__module__):  # the active family's compiler
             got = _cache_dir()
         assert got == _fallback_cache_dir()
         assert os.access(got, os.W_OK)
@@ -2879,9 +2884,8 @@ def test_no_template_hardcodes_the_staging_alignment() -> None:
 
     from cudnn.gemm.frost.compiler import _TMA_STORE_EPI_PIPELINES
 
-    tmpl_dir = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
-    files = sorted(p for p in tmpl_dir.glob("sm*.py"))
-    assert len(files) == 8, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
+    files = template_files()
+    assert len(files) == 10, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
     for path in files:
         src = path.read_text()
         assert "alignment=64" not in src, path.name
@@ -3073,8 +3077,7 @@ def test_templates_take_the_chunk_from_the_rendered_constant() -> None:
     from `epi_chunk_elems`, which differs per store arm."""
     import pathlib
 
-    tmpl_dir = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
-    for path in sorted(tmpl_dir.glob("sm*.py")):
+    for path in template_files():
         src = path.read_text()
         assert "vsize = epi_chunk_elems" in src, path.name
         assert "vsize = (VEC_BYTES" not in src, path.name
@@ -3095,12 +3098,6 @@ _VERSION_GATED_KWARGS = {
 }
 
 
-def _template_dir():
-    # kernel_templates has no __init__.py (it is exec'd per render), so go
-    # through the package that does.
-    return pathlib.Path(cudnn.gemm.frost.__file__).parent / "kernel_templates"
-
-
 def test_templates_route_version_gated_kwargs_through_the_guarded_wrappers():
     """Every template must reach these ops through `_tile_helpers`, which emits
     the kwarg only on the branch that wants it. Calling `nvvm.<op>` directly and
@@ -3109,7 +3106,7 @@ def test_templates_route_version_gated_kwargs_through_the_guarded_wrappers():
     import ast
 
     offenders = []
-    for path in sorted(_template_dir().glob("sm*.py")):
+    for path in template_files():
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if (
@@ -3154,7 +3151,7 @@ def test_the_collector_helpers_are_one_text_across_every_template():
     import ast
 
     blobs = {}
-    for path in sorted(_template_dir().glob("sm*.py")):
+    for path in template_files():
         lines = path.read_text().split("\n")
         defs = [n for n in ast.parse("\n".join(lines)).body if isinstance(n, ast.FunctionDef) and n.name.endswith("_collector_op")]
         if not defs:
@@ -3195,7 +3192,7 @@ def test_the_a_and_b_collectors_can_never_both_be_live():
     each other only because the two helpers bail on `mma_size_m` from opposite
     sides -- nothing else pins it, so this does."""
     both = 0
-    for path in sorted(_template_dir().glob("sm*.py")):
+    for path in template_files():
         fns = _load_collector_helpers(path, {})
         if len(fns) < 2:
             continue
@@ -3222,7 +3219,7 @@ def test_every_a_collector_chain_starts_with_fill_and_ends_with_lastuse():
     compile-time property -- a chain that began with USE would pick up a stale
     entry and silently multiply in the wrong operand."""
     seen = 0
-    for path in sorted(_template_dir().glob("sm*.py")):
+    for path in template_files():
         for name, n_key in (("_a_collector_op", "num_gemms"), ("_b_collector_op", "mma_size_m")):
             for n in (1, 2, 3):
                 consts = dict(mma_size_m=1, num_gemms=1, num_a_operands=1, b_collector_ok=True)
@@ -3247,7 +3244,7 @@ def test_the_guarded_wrappers_keep_the_kwarg_off_the_default_branch():
     import ast
     import inspect
 
-    import cudnn.gemm.frost.kernel_templates._tile_helpers as helpers
+    import cudnn.gemm.frost.sm100.kernel_templates._tile_helpers as helpers
 
     for fn_name, kwarg in _VERSION_GATED_KWARGS.items():
         fn = getattr(helpers, fn_name)
@@ -3294,12 +3291,9 @@ def test_sm120_registry_wiring() -> None:
     assert ("bf16", "bf16", "fp32") in MMA_TYPE_SUPPORT["sm120"][GraphType.MATMUL]
     assert ("int8", "int8", "int32") in MMA_TYPE_SUPPORT["sm120"][GraphType.MATMUL]
 
-    # the template file itself ships with the package
-    from pathlib import Path
-
-    import cudnn.gemm.frost.compiler as C
-
-    assert (Path(C.__file__).parent / "kernel_templates" / "sm120_matmul.py").is_file()
+    # the template file itself ships with the package -- in the sm120 tree,
+    # whichever family's compiler this process runs
+    assert tmpl.path.is_file() and tmpl.path.parent == template_dir("sm120")
 
 
 def test_sm120_tile_config_family() -> None:
@@ -3501,11 +3495,12 @@ def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
 
 def test_sm120_render_smoke() -> None:
     """Render the sm120 template end-to-end (real tile constants + epilogue
-    snippets) on whatever GPU is active — no cute.compile, so this covers the
-    sm100 CI too. The source must be marker-free, parseable, and carry the
-    STG-only sm120 contract constants."""
-    from cudnn.gemm.frost.compiler import _render_template
-    from cudnn.gemm.frost.epilogue_codegen import generate
+    snippets) on whatever GPU is active — no cute.compile, and through the
+    sm120 tree's compiler by name (the facade is the active GPU's tree), so this
+    covers the sm100 CI too. The source must be marker-free, parseable, and
+    carry the STG-only sm120 contract constants."""
+    from cudnn.gemm.frost.sm120.compiler import _render_template
+    from cudnn.gemm.frost.sm120.epilogue_codegen import generate
 
     cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     for a_major in ("k", "m"):

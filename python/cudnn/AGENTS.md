@@ -291,6 +291,10 @@ python/cudnn/gemm/
 │   ├── grouped/<fusion>/            # dglu, dsrelu, dswiglu, glu, glu_hadamard,
 │   │                                #   quant, srelu, swiglu, unfused, wgrad
 │   └── discrete_grouped/<fusion>/   # dswiglu, swiglu (per-expert weight pointers)
+├── frost/                           # the FROST GEMM engine (JIT fused matmul chains from cuDNN graphs)
+│   ├── sm100/, sm120/               #   one tree per arch family: compiler.py + epilogue_codegen.py + kernel_templates/
+│   ├── compiler.py, epilogue_codegen.py  # facades: become the active family's module (arch_family.py)
+│   └── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
 ├── ops/                             # backend-independent torch custom-op contracts
 └── reference/                       # pure-PyTorch MATMUL/POINTWISE correctness engine
 ```

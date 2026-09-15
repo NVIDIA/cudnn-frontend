@@ -329,8 +329,18 @@ python/cudnn/
         thd_helpers.py            SHARED by sm100/ + sm107/ + sm120/
     bwd/                        future: same shape, its own api_dsl.py
 
-  gemm/frost/                   engine.py + graph_analyzer.py + compiler.py
-                                + kernel_templates/
+  gemm/frost/                   engine.py + graph_analyzer.py + the arch-neutral
+                                layer (recipe, tile_config, kernel_registry ...);
+                                compiler.py / epilogue_codegen.py are FACADES that
+                                become the active arch tree's module on first
+                                import (arch_family.py picks it from the GPU, or
+                                CUDNN_FRONTEND_GEMM_ARCH_FAMILY)
+    sm100/                      compiler.py + epilogue_codegen.py
+                                + kernel_templates/ (sm100_*, sm103_*, _tile_helpers)
+    sm120/                      compiler.py + epilogue_codegen.py
+                                + kernel_templates/ (sm120_*)
+    kernel_templates/           SHARED by both trees (the split-K reduction), so
+                                it sits above them like thd_helpers.py does
 ```
 
 Two levels under the pass directory, always. **Arch is the one coverage axis
