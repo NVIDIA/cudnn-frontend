@@ -18,8 +18,6 @@
 
 #include "backend/execution_helpers.h"
 #include "backend/plan_helpers.h"
-#include "experimental/sm90_sdpa_prefill_engine.h"
-#include "experimental/sm100_sdpa_prefill_engine.h"
 #include "experimental/sm100_rms_norm_silu_engine.h"
 
 namespace cudnn_frontend {
@@ -809,13 +807,6 @@ class Execution_plan_list {
 
     error_t
     is_plan_index_executable(int64_t const index) const {
-        // OSS SDPA engine path
-        if (index == OSS_SDPA_ENGINE_CANDIDATE) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                !oss_sdpa_engine_built_, error_code_t::GRAPH_EXECUTION_FAILED, "OSS SDPA engine not built.");
-            return {error_code_t::OK, ""};
-        }
-
         // OSS RmsNorm+SiLU engine path
         if (index == OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -832,222 +823,6 @@ class Execution_plan_list {
                                        "Plan index " + std::to_string(index) + " did not build.");
 
         return {error_code_t::OK, ""};
-    }
-
-    // ================================================================
-    // Open-source NVRTC engine support
-    // ================================================================
-
-    static constexpr int64_t OSS_SDPA_ENGINE_CANDIDATE = -2;
-
-    // Context cached from the Graph for OSS engine execution
-    struct OssSdpaEngineContext {
-        int64_t batch = 0, heads_q = 0, heads_kv = 0, seq_q = 0, seq_kv = 0, d = 0;
-        int64_t q_uid = -1, k_uid = -1, v_uid = -1, o_uid = -1, max_uid = -1, sum_exp_uid = -1;
-        std::vector<int64_t> q_stride, k_stride, v_stride, o_stride;
-        std::vector<int64_t> max_stride, sum_exp_stride;
-        std::optional<float> attn_scale;
-        // Pre-computed slot indices into the variant pack template (set by prepare_variant_pack_template)
-        int q_slot = -1, k_slot = -1, v_slot = -1, o_slot = -1, max_slot = -1, sum_exp_slot = -1;
-    };
-
-    void
-    set_oss_sdpa_engine(std::shared_ptr<experimental::IOssSdpaEngine> engine) {
-        oss_sdpa_engine_ = std::move(engine);
-    }
-
-    void
-    set_oss_sdpa_engine_context(OssSdpaEngineContext ctx) {
-        oss_sdpa_ctx_ = std::move(ctx);
-    }
-
-    bool
-    has_oss_sdpa_engine() const {
-        return oss_sdpa_engine_ != nullptr;
-    }
-
-    bool
-    is_oss_sdpa_candidate() const {
-        return candidate == OSS_SDPA_ENGINE_CANDIDATE;
-    }
-
-    error_t
-    check_oss_sdpa_engine_support(int64_t sm_version) {
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !oss_sdpa_engine_, error_code_t::GRAPH_NOT_SUPPORTED, "No OSS engine registered");
-        cudnn_frontend::experimental::AttentionShape_t shape = {
-            static_cast<uint32_t>(oss_sdpa_ctx_.batch),
-            static_cast<uint32_t>(oss_sdpa_ctx_.heads_q),
-            static_cast<uint32_t>(oss_sdpa_ctx_.heads_kv),
-            static_cast<uint32_t>(oss_sdpa_ctx_.heads_kv),
-            static_cast<uint32_t>(oss_sdpa_ctx_.seq_q),
-            static_cast<uint32_t>(oss_sdpa_ctx_.seq_kv),
-            static_cast<uint32_t>(oss_sdpa_ctx_.d),
-            static_cast<uint32_t>(oss_sdpa_ctx_.d),
-        };
-        auto status = oss_sdpa_engine_->check_support(shape, sm_version);
-        if (status.is_good()) {
-            oss_sdpa_engine_supported_ = true;
-            candidate                  = OSS_SDPA_ENGINE_CANDIDATE;
-        }
-        return status;
-    }
-
-    error_t
-    build_oss_sdpa_engine() {
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !oss_sdpa_engine_supported_, error_code_t::GRAPH_NOT_SUPPORTED, "OSS engine not supported");
-        auto status = oss_sdpa_engine_->build();
-        if (status.is_good()) {
-            oss_sdpa_engine_built_ = true;
-            candidate              = OSS_SDPA_ENGINE_CANDIDATE;
-        }
-        return status;
-    }
-
-    // Flat-array execute: takes pre-indexed pointer array (from VariantPackTemplate)
-    error_t
-    execute_oss_sdpa_engine(void* const* ptrs, void* workspace, int device, cudaStream_t stream) const {
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !oss_sdpa_engine_built_, error_code_t::GRAPH_EXECUTION_FAILED, "OSS engine not built");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            oss_sdpa_ctx_.q_slot < 0 || oss_sdpa_ctx_.k_slot < 0 || oss_sdpa_ctx_.v_slot < 0 ||
-                oss_sdpa_ctx_.o_slot < 0 || oss_sdpa_ctx_.max_slot < 0 || oss_sdpa_ctx_.sum_exp_slot < 0,
-            error_code_t::INVALID_VARIANT_PACK,
-            "OSS SDPA slot indices not initialized. Call prepare_variant_pack_template() first.");
-
-        void* q_ptr       = ptrs[oss_sdpa_ctx_.q_slot];
-        void* k_ptr       = ptrs[oss_sdpa_ctx_.k_slot];
-        void* v_ptr       = ptrs[oss_sdpa_ctx_.v_slot];
-        void* o_ptr       = ptrs[oss_sdpa_ctx_.o_slot];
-        void* max_ptr     = ptrs[oss_sdpa_ctx_.max_slot];
-        void* sum_exp_ptr = ptrs[oss_sdpa_ctx_.sum_exp_slot];
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!q_ptr || !k_ptr || !v_ptr || !o_ptr,
-                                       error_code_t::INVALID_VARIANT_PACK,
-                                       "Missing Q/K/V/O pointers for OSS engine");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!max_ptr || !sum_exp_ptr,
-                                       error_code_t::INVALID_VARIANT_PACK,
-                                       "Missing max/sum_exp pointers for OSS engine");
-
-        return oss_sdpa_engine_->execute(static_cast<int>(oss_sdpa_ctx_.batch),
-                                         static_cast<int>(oss_sdpa_ctx_.heads_q),
-                                         static_cast<int>(oss_sdpa_ctx_.heads_kv),
-                                         static_cast<int>(oss_sdpa_ctx_.seq_q),
-                                         static_cast<int>(oss_sdpa_ctx_.seq_kv),
-                                         static_cast<int>(oss_sdpa_ctx_.d),
-                                         q_ptr,
-                                         oss_sdpa_ctx_.q_stride,
-                                         k_ptr,
-                                         oss_sdpa_ctx_.k_stride,
-                                         v_ptr,
-                                         oss_sdpa_ctx_.v_stride,
-                                         o_ptr,
-                                         oss_sdpa_ctx_.o_stride,
-                                         max_ptr,
-                                         oss_sdpa_ctx_.max_stride,
-                                         sum_exp_ptr,
-                                         oss_sdpa_ctx_.sum_exp_stride,
-                                         workspace,
-                                         device,
-                                         stream,
-                                         oss_sdpa_ctx_.attn_scale);
-    }
-
-    // Flat-array overload with dynamic shape overrides
-    error_t
-    execute_oss_sdpa_engine(void* const* ptrs,
-                            void* workspace,
-                            int device,
-                            cudaStream_t stream,
-                            std::vector<int64_t> const& override_uids,
-                            std::vector<std::vector<int64_t>> const& override_shapes,
-                            std::vector<std::vector<int64_t>> const& override_strides) const {
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !oss_sdpa_engine_built_, error_code_t::GRAPH_EXECUTION_FAILED, "OSS engine not built");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            override_uids.size() != override_shapes.size() || override_uids.size() != override_strides.size(),
-            error_code_t::INVALID_VALUE,
-            "override_uids/shapes/strides must have the same size");
-
-        // Build uid → index lookup for overrides
-        std::unordered_map<int64_t, size_t> uid_to_idx;
-        for (size_t i = 0; i < override_uids.size(); ++i) {
-            uid_to_idx[override_uids[i]] = i;
-        }
-        auto resolve_shape = [&](int64_t uid, std::vector<int64_t> const& def) -> std::vector<int64_t> const& {
-            auto it = uid_to_idx.find(uid);
-            return (it != uid_to_idx.end()) ? override_shapes[it->second] : def;
-        };
-        auto resolve_stride = [&](int64_t uid, std::vector<int64_t> const& def) -> std::vector<int64_t> const& {
-            auto it = uid_to_idx.find(uid);
-            return (it != uid_to_idx.end()) ? override_strides[it->second] : def;
-        };
-
-        // Resolve shapes
-        std::vector<int64_t> q_def = {oss_sdpa_ctx_.batch, oss_sdpa_ctx_.heads_q, oss_sdpa_ctx_.seq_q, oss_sdpa_ctx_.d};
-        auto const& q_shape        = resolve_shape(oss_sdpa_ctx_.q_uid, q_def);
-        auto const& q_stride       = resolve_stride(oss_sdpa_ctx_.q_uid, oss_sdpa_ctx_.q_stride);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(q_shape.size() < 4, error_code_t::INVALID_VALUE, "Q shape must have >=4 dims");
-        int64_t batch = q_shape[0], heads_q = q_shape[1], seq_q = q_shape[2], d = q_shape[3];
-        RETURN_CUDNN_FRONTEND_ERROR_IF(d != oss_sdpa_ctx_.d,
-                                       error_code_t::INVALID_VALUE,
-                                       "Cannot change d dynamically (compiled=" + std::to_string(oss_sdpa_ctx_.d) +
-                                           ", got=" + std::to_string(d) + ")");
-
-        std::vector<int64_t> k_def = {
-            oss_sdpa_ctx_.batch, oss_sdpa_ctx_.heads_kv, oss_sdpa_ctx_.seq_kv, oss_sdpa_ctx_.d};
-        auto const& k_shape  = resolve_shape(oss_sdpa_ctx_.k_uid, k_def);
-        auto const& k_stride = resolve_stride(oss_sdpa_ctx_.k_uid, oss_sdpa_ctx_.k_stride);
-        int64_t heads_kv = k_shape[1], seq_kv = k_shape[2];
-
-        auto const& v_stride   = resolve_stride(oss_sdpa_ctx_.v_uid, oss_sdpa_ctx_.v_stride);
-        auto const& o_stride   = resolve_stride(oss_sdpa_ctx_.o_uid, oss_sdpa_ctx_.o_stride);
-        auto const& max_stride = resolve_stride(oss_sdpa_ctx_.max_uid, oss_sdpa_ctx_.max_stride);
-        auto const& se_stride  = resolve_stride(oss_sdpa_ctx_.sum_exp_uid, oss_sdpa_ctx_.sum_exp_stride);
-
-        // Validate slot indices
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            oss_sdpa_ctx_.q_slot < 0 || oss_sdpa_ctx_.k_slot < 0 || oss_sdpa_ctx_.v_slot < 0 ||
-                oss_sdpa_ctx_.o_slot < 0 || oss_sdpa_ctx_.max_slot < 0 || oss_sdpa_ctx_.sum_exp_slot < 0,
-            error_code_t::INVALID_VARIANT_PACK,
-            "OSS SDPA slot indices not initialized. Call prepare_variant_pack_template() first.");
-
-        // Pointers from pre-indexed slots
-        void* q_ptr       = ptrs[oss_sdpa_ctx_.q_slot];
-        void* k_ptr       = ptrs[oss_sdpa_ctx_.k_slot];
-        void* v_ptr       = ptrs[oss_sdpa_ctx_.v_slot];
-        void* o_ptr       = ptrs[oss_sdpa_ctx_.o_slot];
-        void* max_ptr     = ptrs[oss_sdpa_ctx_.max_slot];
-        void* sum_exp_ptr = ptrs[oss_sdpa_ctx_.sum_exp_slot];
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !q_ptr || !k_ptr || !v_ptr || !o_ptr, error_code_t::INVALID_VARIANT_PACK, "Missing Q/K/V/O pointers");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !max_ptr || !sum_exp_ptr, error_code_t::INVALID_VARIANT_PACK, "Missing max/sum_exp pointers");
-
-        return oss_sdpa_engine_->execute(static_cast<int>(batch),
-                                         static_cast<int>(heads_q),
-                                         static_cast<int>(heads_kv),
-                                         static_cast<int>(seq_q),
-                                         static_cast<int>(seq_kv),
-                                         static_cast<int>(d),
-                                         q_ptr,
-                                         q_stride,
-                                         k_ptr,
-                                         k_stride,
-                                         v_ptr,
-                                         v_stride,
-                                         o_ptr,
-                                         o_stride,
-                                         max_ptr,
-                                         max_stride,
-                                         sum_exp_ptr,
-                                         se_stride,
-                                         workspace,
-                                         device,
-                                         stream,
-                                         oss_sdpa_ctx_.attn_scale);
     }
 
     // ================================================================
@@ -1141,14 +916,6 @@ class Execution_plan_list {
     // Set pre-computed slot indices for OSS engines (called by prepare_variant_pack_template)
     void
     set_oss_slot_indices(std::function<int(int64_t)> const& slot_for) {
-        if (is_oss_sdpa_candidate()) {
-            oss_sdpa_ctx_.q_slot       = slot_for(oss_sdpa_ctx_.q_uid);
-            oss_sdpa_ctx_.k_slot       = slot_for(oss_sdpa_ctx_.k_uid);
-            oss_sdpa_ctx_.v_slot       = slot_for(oss_sdpa_ctx_.v_uid);
-            oss_sdpa_ctx_.o_slot       = slot_for(oss_sdpa_ctx_.o_uid);
-            oss_sdpa_ctx_.max_slot     = slot_for(oss_sdpa_ctx_.max_uid);
-            oss_sdpa_ctx_.sum_exp_slot = slot_for(oss_sdpa_ctx_.sum_exp_uid);
-        }
         if (is_oss_rms_norm_silu_candidate()) {
             oss_rms_norm_silu_ctx_.x_slot               = slot_for(oss_rms_norm_silu_ctx_.x_uid);
             oss_rms_norm_silu_ctx_.y_slot               = slot_for(oss_rms_norm_silu_ctx_.y_uid);
@@ -1209,11 +976,6 @@ class Execution_plan_list {
     }
 
    private:
-    std::shared_ptr<experimental::IOssSdpaEngine> oss_sdpa_engine_;
-    bool oss_sdpa_engine_supported_ = false;
-    bool oss_sdpa_engine_built_     = false;
-    OssSdpaEngineContext oss_sdpa_ctx_;
-
     std::shared_ptr<experimental::IOssNormEngine> oss_rms_norm_silu_engine_;
     bool oss_rms_norm_silu_supported_ = false;
     bool oss_rms_norm_silu_built_     = false;

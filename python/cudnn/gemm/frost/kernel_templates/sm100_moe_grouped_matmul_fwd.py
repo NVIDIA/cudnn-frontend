@@ -38,6 +38,7 @@ from cudnn.gemm.frost.kernel_templates._tile_helpers import (
 )
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.runtime import make_fake_stream
@@ -355,6 +356,7 @@ def _kernel(
         c_dtype=mma_c_dtype,
         n_dim=mma_inst_shape_mnk[1],
         m_dim=mma_inst_shape_mnk[0],
+        k_dim=mma_k_dim,
         a_major=mma_a_major,
         b_major=mma_b_major,
     )
@@ -680,16 +682,17 @@ def _kernel(
                     if a_data_issue:
                         for _ai in cutlass.range_constexpr(num_a_operands):
                             sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    sA_stage.subview(_a_off * cta_tile_mnk[2]),
-                                    a_desc_load_list[_ai],
-                                    (coord_k, coord_m_desc + _a_off, cutlass.Int32(0)),
-                                    ab_full_mbar_ptr.subview(stage),
-                                    [],
-                                    multicast_mask=tma_mcast_mask_a,
-                                    group=_CTA_GROUP,
-                                )
+                            for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                        sA_stage.subview(_a_off * cta_tile_mnk[2] + _am * a_tma_box_m * cta_tile_mnk[2]),
+                                        a_desc_load_list[_ai],
+                                        (coord_k, coord_m_desc + _a_off + _am * a_tma_box_m, cutlass.Int32(0)),
+                                        ab_full_mbar_ptr.subview(stage),
+                                        [],
+                                        multicast_mask=tma_mcast_mask_a,
+                                        group=_CTA_GROUP,
+                                    )
                     b_issue = (not multicast_b) or (pair_m_idx == 0)
                     if cutlass.const_expr(b_mcast_slices > 1):
                         b_data_issue = True
@@ -1376,7 +1379,7 @@ def _host(
                     a_stride_m * ab_dtype.width // 128,
                     a_stride_l * ab_dtype.width // 128,
                 ],
-                box_dims=[cta_tile_mnk[2], cta_tile_mnk[0] // a_mcast_slices, 1],
+                box_dims=[cta_tile_mnk[2], a_tma_box_m, 1],
                 swizzle=ab_tma_swizzle,
             )
         )
@@ -1523,7 +1526,7 @@ def compile() -> Callable:
     )
     # @@INJECT_COMPILE_AUX_FAKES@@
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-    return cute.compile(
+    return _compile_cached(
         _host,
         problem_size,
         fake_first_token_offset,
@@ -1536,4 +1539,7 @@ def compile() -> Callable:
         # @@TMA_STORE_ONLY:END@@
         stream=_fake_stream,
         options=frost_compile_options,
+        # persistent object across processes (cudnn.frost.compiled_cache); the digest of THIS source is the key
+        cache_key=globals().get("FROST_SOURCE_DIGEST"),
+        symbol="frost_gemm",
     )

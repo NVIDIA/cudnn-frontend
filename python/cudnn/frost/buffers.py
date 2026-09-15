@@ -18,6 +18,7 @@ no tensor-library dependency on the execute path.
 from __future__ import annotations
 
 import ctypes
+import re as _re
 import struct
 
 from cudnn import _pybind_module
@@ -456,6 +457,8 @@ def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int
 # version, so the check belongs where an engine can still decline.
 CUTEDSL_MIN_VERSION = (4, 7, 0)
 
+_RELEASE_INT = _re.compile(r"^(\d+)")  # leading integer of one version component ("2rc1" -> 2)
+
 _DSL_STATE = None
 
 
@@ -506,11 +509,37 @@ def cutedsl_too_old(version):
     dist, ver = version
     if dist != "nvidia-cutlass-dsl":
         return False
-    try:
-        parts = tuple(int(x) for x in ver.split("+", 1)[0].split(".")[:3])
-    except ValueError:
+    # PEP 440 public versions: keep the leading integer of each release component
+    # so a prerelease of X ("4.6.2a0", "4.6.2rc1") compares as X -- below the
+    # floor it is too old, at/above it is not. Local labels ("+...") are dropped,
+    # and a dotted post/dev segment ("4.6.post1", "4.6.2.dev0") ends the release
+    # segment: what precedes it is the version being compared.
+    parts = []
+    for component in ver.split("+", 1)[0].split(".")[:3]:
+        m = _RELEASE_INT.match(component)
+        if m is None:
+            break
+        parts.append(int(m.group(1)))
+    if not parts:
         return False
-    return len(parts) == 3 and parts < CUTEDSL_MIN_VERSION
+    # A short public version ("4.6") means the omitted components are zero
+    # ("4.6.0"), so it compares against the floor instead of slipping past it.
+    parts += [0] * (3 - len(parts))
+    return tuple(parts) < CUTEDSL_MIN_VERSION
+
+
+def cutedsl_requirement_error(what):
+    """Message naming the installed DSL version when it is below the floor, else None.
+
+    Route checks and the lazy-import wrappers use it so a too-old DSL reads as a
+    version problem, not as a missing dependency: pyproject's floor is the
+    downstream floor (4.6.2), below this one (see AGENTS.md Rule 7).
+    """
+    installed, version = cutedsl_state()
+    if not installed or not cutedsl_too_old(version):
+        return None
+    floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
+    return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
 
 
 def current_device_id():

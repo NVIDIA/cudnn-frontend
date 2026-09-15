@@ -33,8 +33,8 @@ Legacy flat API (`include/cudnn_frontend_*.h`: Tensor, Operation, ExecutionPlan,
 
 ## experimental/ and generated/
 
-- `generated/` holds **open-sourced kernel source embedded as raw C++ string literals** (`inline constexpr const char <name>_source[]`, namespace `cudnn_frontend::experimental::generated`) — SDPA prefill (sm90/sm100) and RMSNorm+SiLU. These files are large and machine-produced; don't hand-edit kernel bodies casually, and don't "clean them up".
-- `experimental/` is the NVRTC glue that compiles those strings at runtime (`IOssSdpaEngine`: `check_support`/`build`/`execute`, per-arch engines, `nvrtc_shim.h`).
+- `generated/` holds **open-sourced kernel source embedded as raw C++ string literals** (`inline constexpr const char <name>_source[]`, namespace `cudnn_frontend::experimental::generated`) — RMSNorm+SiLU. These files are large and machine-produced; don't hand-edit kernel bodies casually, and don't "clean them up".
+- `experimental/` is the NVRTC glue that compiles those strings at runtime (`IOssNormEngine`: `check_support`/`build`/`execute`, per-arch engines, `nvrtc_shim.h`).
 
 ## Versioning
 

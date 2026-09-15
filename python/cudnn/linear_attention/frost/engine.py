@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Engine layer shared by the FROST linear-attention families: the
-check_support core all three run, and the compiled-plan wrapper their
-``build_plan`` returns."""
+"""Engine layer shared by the FROST linear-attention families: the check_support core of every engine, the summary
+engines' dtype gates, and the compiled-plan wrapper their ``build_plan`` returns."""
 
 from __future__ import annotations
 
@@ -15,7 +14,7 @@ from cudnn.frost.workspace import Workspace
 
 def frost_la_gate(engine: str, facts, op: str) -> None:
     """The FROST LA engines' shared check_support core: the analyzer record,
-    the device/DSL environment, and the gates common to all three kernels."""
+    the device/DSL environment, and the gates common to every family."""
     if facts is None or facts.op != op:
         raise NotImplementedError(f"{engine} supports exactly one {op}/{op}_BWD node")
     if facts.invalid:
@@ -36,13 +35,39 @@ def frost_la_gate(engine: str, facts, op: str) -> None:
     if not facts.thd_layout:
         raise NotImplementedError(f"{engine}: q/k/v must be THD [total_T, heads, dim]")
     if facts.h_k not in (facts.h_q, facts.h_v):
-        raise NotImplementedError(f"{engine}: k heads ({facts.h_k}) must match q's ({facts.h_q}) or v's ({facts.h_v}; canonical GQA shares grouped k/v heads)")
+        raise NotImplementedError(f"{engine}: k heads ({facts.h_k}) must match q's ({facts.h_q}) or v's ({facts.h_v})")
     if facts.h_v != facts.h_q and max(facts.h_q, facts.h_v) % min(facts.h_q, facts.h_v) != 0:
         raise NotImplementedError(f"{engine}: q heads ({facts.h_q}) and v heads ({facts.h_v}) must be equal or one a multiple of the other")
     if facts.g_dtype not in (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF, None):
         raise NotImplementedError(f"{engine}: 'g' must be fp32/fp16/bf16, got {facts.g_dtype}")
     if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
         raise NotImplementedError(f"{engine}: 'cu_seqlens' must be int32/int64, got {facts.cu_dtype}")
+
+
+def summary_support_gates(engine: str, facts, graph) -> None:
+    """The summary dtype gates shared across the FROST state engines."""
+    if not facts.gates_at_ho:
+        raise NotImplementedError(f"{engine}: g/beta must carry HO = max(k, v) heads ({facts.h_o})")
+    beta_wants = (cudnn.data_type.FLOAT, facts.io_dtype)
+    if facts.beta_dtype not in beta_wants + (None,):
+        raise NotImplementedError(f"{engine}: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
+    gate_param_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
+    for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
+        if got not in gate_param_dtypes + (None,):
+            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16, got {got}")
+    (node,) = list(graph.nodes)
+    state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
+    state_ports = [(name, node.inputs.get(name)) for name in ("initial_state", "d_final_state")]
+    state_ports += [(name, node.outputs.get(name)) for name in ("final_state", "transition", "d_initial_state")]
+    for port, tensor in state_ports:
+        if tensor is not None and tensor.get_data_type() not in state_dtypes:
+            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16, got {tensor.get_data_type()}")
+    if not facts.state_pair_match:
+        raise NotImplementedError(f"{engine}: initial_state and final_state dtypes must match")
+    d_final_state = node.inputs.get("d_final_state")
+    d_initial_state = node.outputs.get("d_initial_state")
+    if d_final_state is not None and d_initial_state is not None and d_final_state.get_data_type() != d_initial_state.get_data_type():
+        raise NotImplementedError(f"{engine}: d_final_state and d_initial_state dtypes must match")
 
 
 def dense_layout_message(plan_name, ports, offender) -> str:

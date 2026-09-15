@@ -11,7 +11,8 @@ Serves both MMA modes; ``cta_group`` is an injected tile constant.
                follower CLC-consumes only; both CTAs load their operand slice.
 
 The CTA tile may span several MMA instructions along M (``mma_size_m``, each
-``mma_inst_shape_mnk``): the TMA still loads the whole tile in one go, the MMA
+``mma_inst_shape_mnk``): TMA fills the whole tile using boxes of at most 256
+rows for K-major A (swizzle groups for M-major A), the MMA
 warp issues one instruction per (M, N) sub-block into its own TMEM column
 region, and the epilogue drains one MMA-M block per pass.
 
@@ -55,6 +56,7 @@ from cudnn.gemm.frost.kernel_templates._tile_helpers import (
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass._mlir_helpers.vector as _cvec
 import cutlass
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from cutlass.cute.runtime import make_fake_stream
@@ -122,8 +124,20 @@ def _auto_swizzle_w(m, n, k, nt_n):
 # @@SPLITK_ONLY:BEGIN@@
 from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import (
     SPLITK_REDUCE_THREADS,
+    SPLITK_REDUCE_TILE_M,
     _splitk_reduce_kernel,
+    splitk_reduce_tile_n,
 )
+
+
+@cute.jit
+def _splitk_epilogue(vec_f32, row, col_j, tile_l, M, N, vsize, taps, strides, aux):
+    """epilogue function for split-K reduction"""
+    # @@INJECT_SPLITK_EPILOGUE_BINDINGS@@
+    # @@INJECT_REDUCE_AUX_VIEWS@@
+
+    # @@INJECT_REDUCE_EPILOGUE@@
+
 
 # @@SPLITK_ONLY:END@@
 
@@ -414,6 +428,7 @@ def _kernel(
         m_dim=mma_inst_shape_mnk[0],
         a_major=mma_a_major,
         b_major=mma_b_major,
+        k_dim=mma_k_dim,
     )
 
     # Per-CTA logical tile — the cluster cancels out, so these stay compile-time
@@ -461,6 +476,8 @@ def _kernel(
 
     if warp_idx == scheduler_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(USE_PDL):
+            nvvm.griddepcontrol("wait")
         sched_iter = cutlass.Int32(0)
         clc_empty_phase = cutlass.Int32(1)
         clc_full_phase = cutlass.Int32(0)
@@ -499,11 +516,6 @@ def _kernel(
                 nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
 
             sched_iter += 1
-
-        if cutlass.const_expr(USE_PDL and split_k_slices > 1):
-            # Fire launch_dependents when the CLC scheduler runs dry, one tile
-            # earlier than the MMA-warp signal
-            nvvm.griddepcontrol("launch_dependents")
 
         if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
             if is_cluster_leader_cta:
@@ -576,32 +588,34 @@ def _kernel(
                     if cutlass.const_expr(a_mcast_slices > 1):
                         _a_rows = cta_tile_mnk[0] // a_mcast_slices
                         if cutlass.const_expr(fallback_cluster_shape_mnk is None):
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    sA_stage.subview(n_rank * _a_rows * cta_tile_mnk[2]),
-                                    tma_a_desc.get_ptr(),
-                                    (coord_k, coord_m_per_cta + n_rank * _a_rows, tile_l_a),
-                                    ab_full_mbar_ptr.subview(stage),
-                                    [],
-                                    multicast_mask=tma_mcast_mask_a,
-                                    group=_CTA_GROUP,
-                                )
+                            for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                        sA_stage.subview(n_rank * _a_rows * cta_tile_mnk[2] + _am * a_tma_box_m * cta_tile_mnk[2]),
+                                        tma_a_desc.get_ptr(),
+                                        (coord_k, coord_m_per_cta + n_rank * _a_rows + _am * a_tma_box_m, tile_l_a),
+                                        ab_full_mbar_ptr.subview(stage),
+                                        [],
+                                        multicast_mask=tma_mcast_mask_a,
+                                        group=_CTA_GROUP,
+                                    )
                         else:
                             _a_per_cta = a_mcast_slices >> _preferred_cluster_n_shift
                             if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
                                 _a_per_cta = a_mcast_slices >> _fallback_cluster_n_shift
                             for _asl in cutlass.range(_a_per_cta):
                                 _a_idx = n_rank * _a_per_cta + _asl
-                                if elect_one:
-                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sA_stage.subview(_a_idx * _a_rows * cta_tile_mnk[2]),
-                                        tma_a_desc.get_ptr(),
-                                        (coord_k, coord_m_per_cta + _a_idx * _a_rows, tile_l_a),
-                                        ab_full_mbar_ptr.subview(stage),
-                                        [],
-                                        multicast_mask=tma_mcast_mask_a,
-                                        group=_CTA_GROUP,
-                                    )
+                                for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                            sA_stage.subview(_a_idx * _a_rows * cta_tile_mnk[2] + _am * a_tma_box_m * cta_tile_mnk[2]),
+                                            tma_a_desc.get_ptr(),
+                                            (coord_k, coord_m_per_cta + _a_idx * _a_rows + _am * a_tma_box_m, tile_l_a),
+                                            ab_full_mbar_ptr.subview(stage),
+                                            [],
+                                            multicast_mask=tma_mcast_mask_a,
+                                            group=_CTA_GROUP,
+                                        )
                     elif cutlass.const_expr(multicast_a):
                         if n_rank == 0:
                             if cutlass.const_expr(a_is_m_major):
@@ -621,16 +635,17 @@ def _kernel(
                                             group=_CTA_GROUP,
                                         )
                             else:
-                                if elect_one:
-                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sA_stage,
-                                        tma_a_desc.get_ptr(),
-                                        (coord_k, coord_m_per_cta, tile_l_a),
-                                        ab_full_mbar_ptr.subview(stage),
-                                        [],
-                                        multicast_mask=tma_mcast_mask_a,
-                                        group=_CTA_GROUP,
-                                    )
+                                for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                            sA_stage.subview(_am * a_tma_box_m * cta_tile_mnk[2]),
+                                            tma_a_desc.get_ptr(),
+                                            (coord_k, coord_m_per_cta + _am * a_tma_box_m, tile_l_a),
+                                            ab_full_mbar_ptr.subview(stage),
+                                            [],
+                                            multicast_mask=tma_mcast_mask_a,
+                                            group=_CTA_GROUP,
+                                        )
                     else:
                         if cutlass.const_expr(a_is_m_major):
                             for m_group in cutlass.range_constexpr(cta_tile_mnk[0] // a_tma_group_elems):
@@ -649,16 +664,17 @@ def _kernel(
                                         group=_CTA_GROUP,
                                     )
                         else:
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    sA_stage,
-                                    tma_a_desc.get_ptr(),
-                                    (coord_k, coord_m_per_cta, tile_l_a),
-                                    ab_full_mbar_ptr.subview(stage),
-                                    [],
-                                    multicast_mask=tma_mcast_mask_a,
-                                    group=_CTA_GROUP,
-                                )
+                            for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                        sA_stage.subview(_am * a_tma_box_m * cta_tile_mnk[2]),
+                                        tma_a_desc.get_ptr(),
+                                        (coord_k, coord_m_per_cta + _am * a_tma_box_m, tile_l_a),
+                                        ab_full_mbar_ptr.subview(stage),
+                                        [],
+                                        multicast_mask=tma_mcast_mask_a,
+                                        group=_CTA_GROUP,
+                                    )
 
                 for _bj in cutlass.range_constexpr(num_b_operands):
                     sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
@@ -973,7 +989,9 @@ def _kernel(
                     nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
                 tile_iter += 1
 
-            if cutlass.const_expr(USE_PDL):
+            # Dense only: an early-launched reducer would pile its many small CTAs
+            # onto the few idle SMs, so split-K leaves the trigger to grid exit.
+            if cutlass.const_expr(USE_PDL and split_k_slices == 1):
                 nvvm.griddepcontrol("launch_dependents")
 
             tail_stage = acc_stage
@@ -1025,7 +1043,8 @@ def _kernel(
                         empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
                         nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
                     tile_iter += 1
-                if cutlass.const_expr(USE_PDL):
+                # Dense only, same reason as above.
+                if cutlass.const_expr(USE_PDL and split_k_slices == 1):
                     nvvm.griddepcontrol("launch_dependents")
                 nvvm.tcgen05_relinquish_alloc_permit(group=_CTA_GROUP)
                 peer_mbar = nvvm.mapa(tmem_dealloc_mbar_ptr, peer_cta_rank)
@@ -1293,7 +1312,7 @@ def _host(
                         a_stride_m * ab_dtype.width // 128,
                         a_stride_l * ab_dtype.width // 128,
                     ],
-                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[0] // a_mcast_slices, 1],
+                    box_dims=[cta_tile_mnk[2], a_tma_box_m, 1],
                     swizzle=ab_tma_swizzle,
                 )
             )
@@ -1385,19 +1404,24 @@ def _host(
         m,
         n,
         batch,
-        out_stride_m_0,
-        out_stride_n_0,
-        out_stride_l_0,
-        # @@INJECT_SPLITK_OUTPUT@@
         splitk_partials,
+        (
+            # @@INJECT_HOST_TAP_PASS@@
+        ),
+        (
+            # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
+        ),
+        (
+            # @@INJECT_HOST_AUX_PASS@@
+        ),
+        _splitk_epilogue,
         split_k_slices,
         splitk_reduce_elems,
-        cd_dtype,
         USE_PDL,
     ).launch(
         grid=(
-            m,
-            (n + SPLITK_REDUCE_THREADS * splitk_reduce_elems - 1) // (SPLITK_REDUCE_THREADS * splitk_reduce_elems),
+            (m + SPLITK_REDUCE_TILE_M - 1) // SPLITK_REDUCE_TILE_M,
+            (n + splitk_reduce_tile_n(split_k_slices, splitk_reduce_elems) - 1) // splitk_reduce_tile_n(split_k_slices, splitk_reduce_elems),
             batch,
         ),
         block=(SPLITK_REDUCE_THREADS, 1, 1),
@@ -1483,7 +1507,7 @@ def compile() -> Callable:
     fake_splitk_partials = make_fake_tensor(cutlass.Float32, (sym_partials_elems,), stride=(1,), assumed_align=16)
     # @@SPLITK_ONLY:END@@
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-    return cute.compile(
+    return _compile_cached(
         _host,
         problem_size,
         # @@INJECT_COMPILE_AB_PASS@@
@@ -1497,4 +1521,7 @@ def compile() -> Callable:
         # @@SPLITK_ONLY:END@@
         stream=_fake_stream,
         options=frost_compile_options,
+        # persistent object across processes (cudnn.frost.compiled_cache); the digest of THIS source is the key
+        cache_key=globals().get("FROST_SOURCE_DIGEST"),
+        symbol="frost_gemm",
     )

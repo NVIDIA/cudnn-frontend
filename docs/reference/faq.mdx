@@ -1,0 +1,23 @@
+---
+title: "FAQs"
+---
+**Q: How does mixed precision training work?**
+A: Several components need to work together to make mixed precision training possible. cuDNN needs to support the layers with the required datatype config and have optimized kernels that run very fast. In addition, there is a module called automatic mixed precision (AMP) in frameworks which intelligently decides which op can run in a lower precision without affecting convergence and minimize the number of type conversions/transposes in the entire graph. These work together to give you speed up. For more information, refer to [Mixed Precision Numerical Accuracy](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/developer/legacy-api.html#mixed-precision-numerical-accuracy).
+
+**Q: How can I pick the fastest convolution kernels with cuDNN version 9.0.0?**
+
+A:  In the cuDNN Graph API introduced sincecuDNN v8, convolution kernels are grouped by similar computation and numerical properties into engines. Every engine has a queryable set of  performance tuning knobs. A computation case such as a convolution operation graph can be computed using different valid combinations of engines and their knobs, known as an engine configuration. Users can query an array of engine configurations for any given computation case ordered by performance, from fastest to slowest according to cuDNN's own heuristics. Alternately, users can generate all possible engine configurations by querying the engine count and available knobs for each engine. This generated list could be used for auto-tuning or the user could create their own heuristics.
+
+**Q: Why is cuDNN version 9.0 convolution API call much slower on the first call than subsequent calls?**
+
+A: Due to the library split, cuDNN version 9.0 API will only load the necessary kernels on the first API call that requires it. In previous versions prior to 8.0, this load would have been observed in the first cuDNN API call that triggers CUDA context initialization, typically `cudnnCreate()`. Starting in version 8.0, this is delayed until the first sub-library call that triggers CUDA context initialization. Users who desire to have CUDA context preloaded can call the new `cudnn*VersionCheck` API, which has the side effect of initializing a CUDA context. This will reduce the run time for all subsequent API calls.
+
+**Q: How do I build the cuDNN version 9.0.0 split library?**
+
+A:  cuDNN v9.0 library is split into multiple sub-libraries. Each library contains a subset of the APIs. Users can link directly against the individual libraries or link with a `dlopen` layer which follows a plugin architecture.
+
+To link against an individual library, users can directly specify it and its dependencies on the linker command line. For example, for linking with just the graph API part of the library: `-lcudnn_graph`
+
+Alternatively, the user can continue to link against a shim layer (`-libcudnn`) which can dlopen the correct library that provides the implementation of the function. When the function is called for the first time, the dynamic loading of the library takes place.
+
+Linker argument is `-lcudnn`.

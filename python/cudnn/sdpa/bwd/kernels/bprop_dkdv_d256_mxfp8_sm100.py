@@ -364,51 +364,10 @@ class BlackwellFmhaBackwardDKDV256:
         num_warp_groups: Int32,
         wg_idx: Int32,
     ) -> cute.Tensor:
-        """View a per-warp-group TMEM fragment for the calling warp group."""
-        ret = None
-        if cutlass.const_expr(cute.rank(t.layout) == 1):
-            p = cute.composition(
-                t,
-                cute.make_layout(((num_warp_groups, cute.size(t) // num_warp_groups),)),
-            )
-            ret = p[(wg_idx, None)]
-        elif cutlass.const_expr(cute.rank(t.layout) == 2):
-            p = cute.composition(
-                t,
-                cute.make_layout(
-                    (
-                        t.shape[0],
-                        (num_warp_groups, cute.size(t, mode=[1]) // num_warp_groups),
-                    )
-                ),
-            )
-            ret = p[None, (wg_idx, None)]
-        elif cutlass.const_expr(cute.rank(t.layout) == 3):
-            p = cute.composition(
-                t,
-                cute.make_layout(
-                    (
-                        t.shape[0],
-                        t.shape[1],
-                        (num_warp_groups, cute.size(t, mode=[2]) // num_warp_groups),
-                    )
-                ),
-            )
-            ret = p[None, None, (wg_idx, None)]
-        else:
-            p = cute.composition(
-                t,
-                cute.make_layout(
-                    (
-                        t.shape[0],
-                        t.shape[1],
-                        t.shape[2],
-                        (num_warp_groups, cute.size(t, mode=[3]) // num_warp_groups),
-                    )
-                ),
-            )
-            ret = p[None, None, None, (wg_idx, None)]
-        return ret
+        # A contiguous column chunk owns complete 32-value scale blocks.
+        # In the two-WG path, WG0 gets columns 0:32 and WG1 gets 32:64
+        # (plus the second 64-column lane group), not two partial scales.
+        return cute_common.split_wg_interleaved(t, num_warp_groups, wg_idx)
 
     @cute.jit
     def __call__(
@@ -821,8 +780,8 @@ class BlackwellFmhaBackwardDKDV256:
         # - SFB (B operand's SF): use cluster_shape_to_tma_atom_SFB + cluster_layout_vmnk_sfb
 
         sfa_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
-        # SFB (B operand's SF: sfQ, sfDO, sfQ_mn, sfDO_mn) uses multicast
-        sfb_mcast_op = cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.ONE)
+        # SFB readiness must include both CTAs' local SF transfers.
+        sfb_mcast_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.TWO)
         sfK_smem_layout = cute.slice_(sfK_smem_layout_staged, (None, None, None, 0, 0))
         tma_atom_sfK, tma_tensor_sfK = cute.nvgpu.make_tiled_tma_atom_A(
             sfa_op,
@@ -952,7 +911,7 @@ class BlackwellFmhaBackwardDKDV256:
             # Dedicated exchange storage: dKdV keeps four dS pipeline stages,
             # so reusing stage 0 could overwrite a stage still consumed by MMA.
             sDS_scale_exchange: cute.struct.Align[
-                cute.struct.MemRange[self.sf_dtype, 512],
+                cute.struct.MemRange[self.sf_dtype, 512 * (1 + self.compute_mma_dS_stage)],
                 128,
             ]
             sP: cute.struct.Align[
@@ -997,7 +956,9 @@ class BlackwellFmhaBackwardDKDV256:
 
         sum_OdO, scaled_LSE, _ = cute_common.get_workspace_tensor(self, problem_shape, workspace, self.acc_dtype, needs_dq_acc=False)
 
-        tma_lse_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        # Compute follows the leader's MMA completion, so the load barrier
+        # must also account for the peer CTA's local LSE and Sum transfers.
+        tma_lse_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.TWO)
         tma_atom_LSE, tma_tensor_LSE = cpasync.make_tiled_tma_atom(tma_lse_op, scaled_LSE, LSE_smem_layout, (self.cta_tiler[1],))
         tma_atom_sum_OdO, tma_tensor_sum_OdO = cpasync.make_tiled_tma_atom(tma_lse_op, sum_OdO, sum_OdO_smem_layout, (self.cta_tiler[1],))
 
@@ -1335,7 +1296,7 @@ class BlackwellFmhaBackwardDKDV256:
         )
 
         sDS = storage.sDS.get_tensor(dS_smem_layout_staged.outer, swizzle=dS_smem_layout_staged.inner)
-        sDS_scale_exchange = storage.sDS_scale_exchange.get_tensor(cute.make_layout(512))
+        sDS_scale_exchange = storage.sDS_scale_exchange.get_tensor(cute.make_layout(512 * (1 + self.compute_mma_dS_stage)))
 
         sP = storage.sP.get_tensor(P_smem_layout_staged.outer, swizzle=P_smem_layout_staged.inner)
 
@@ -1725,6 +1686,7 @@ class BlackwellFmhaBackwardDKDV256:
 
                         self.mma(
                             tmem,
+                            sDS_scale_exchange,
                             KQ_tiled_mma,
                             VDO_tiled_mma,
                             dSQ_tiled_mma,
@@ -1897,6 +1859,9 @@ class BlackwellFmhaBackwardDKDV256:
                             self.epilogue_sync_barrier.arrive_and_wait()
                         cumulative_trip_count_compute = cumulative_trip_count_compute + trip_count
                         persistent_iter = persistent_iter + Int32(1)
+                    elif trip_count <= 0:
+                        if warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_0[-1]:
+                            self.zero_epilogue(blk_coord, blk_offset, problem_shape_cur_batch, dK, dV)
 
                     # Sync all non-sched warps before advancing to next persistent tile
                     self.persistent_tile_barrier.arrive_and_wait()
@@ -2081,6 +2046,7 @@ class BlackwellFmhaBackwardDKDV256:
                     # NOTE: HERE
                     self.mma(
                         tmem,
+                        sDS_scale_exchange,
                         KQ_tiled_mma,
                         VDO_tiled_mma,
                         dSQ_tiled_mma,
@@ -2190,13 +2156,14 @@ class BlackwellFmhaBackwardDKDV256:
 
                 else:
                     cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
-            elif cluster_idx * self.tile_shape_K < problem_shape_cur_batch[1]:
+            elif trip_count <= 0:
                 # An in-range KV tile that no query row attends (causal with
                 # S_kv > S_q): its gradients are exactly zero, and the mainloop
                 # above is skipped, so the tile must be written here or the
-                # caller's dK/dV keep whatever was in the buffer.
-                if warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_1[-1]:
-                    self.epilogue_zero(blk_coord, blk_offset, problem_shape_out, dK, dV)
+                # caller's dK/dV keep whatever was in the buffer. The view has
+                # h_k * n_split output slots, so hand the epilogue problem_shape_out.
+                if warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_0[-1]:
+                    self.zero_epilogue(blk_coord, blk_offset, problem_shape_out, dK, dV)
 
         # In persistent mode, sync across the 2-CTA cluster before TMEM dealloc
         # to prevent one CTA from freeing TMEM while partner CTA's MMA warp still accesses it.
@@ -2210,6 +2177,8 @@ class BlackwellFmhaBackwardDKDV256:
             tmem.relinquish_alloc_permit()
             tmem._num_allocated_columns = self.tmem_alloc_cols
             tmem.free(tmem_ptr)
+
+    bwd.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def load(
@@ -2863,6 +2832,7 @@ class BlackwellFmhaBackwardDKDV256:
     def mma(
         self,
         tmem: utils.TmemAllocator,
+        sDS_scale_exchange: cute.Tensor,
         KQ_tiled_mma: cute.TiledMma,
         VDO_tiled_mma: cute.TiledMma,
         dSQ_tiled_mma: cute.TiledMma,
@@ -2938,11 +2908,6 @@ class BlackwellFmhaBackwardDKDV256:
             compute_mma_dS_pipeline,
             mma_compute_dK_pipeline,
         ) = pipeline_args
-        # FIXME: TMEM pointers are fixed after cluster sync
-        # therefore, this wait shall be trivial.
-        tmem.wait_for_alloc()
-
-        # self.tmem_alloc_barrier.arrive_and_wait()
         load_mma_KQ_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_all_stage)
         load_mma_KQ_aux_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_all_stage)
         load_mma_VDO_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_all_stage)
@@ -3055,7 +3020,6 @@ class BlackwellFmhaBackwardDKDV256:
             None,
             load_mma_KQ_consumer_state.index * self.k_halves,
         )
-        # if tidx == 256:
 
         # Prologue: K @ Q
         # Only leader CTA waits for pipeline in 2-CTA mode
@@ -3381,6 +3345,14 @@ class BlackwellFmhaBackwardDKDV256:
 
             if is_leader_cta:
                 compute_mma_dS_pipeline.consumer_wait(compute_mma_dS_consumer_state, peak_dS_consumer_status)
+                if cutlass.const_expr(self.online_ds_scale):
+                    stage_scales = cute.make_tensor(
+                        sDS_scale_exchange.iterator + 512 * (1 + compute_mma_dS_consumer_state.index),
+                        cute.make_layout(512),
+                    )
+                    with cute.arch.elect_one():
+                        d256_primitives.copy_mxfp8_scale_tile_to_tmem(stage_scales, tDKtSFDS)
+                    cute.arch.fence_view_async_tmem_store()
                 load_mma_KQ_pipeline.consumer_release(load_mma_KQ_release_state)
                 # dK = dS * QT
                 for k_block in cutlass.range_constexpr(cute.size(tDKrDS, mode=[2])):
@@ -3506,6 +3478,14 @@ class BlackwellFmhaBackwardDKDV256:
             compute_mma_P_consumer_state.advance()
             if is_leader_cta:
                 compute_mma_dS_pipeline.consumer_wait(compute_mma_dS_consumer_state)
+                if cutlass.const_expr(self.online_ds_scale):
+                    stage_scales = cute.make_tensor(
+                        sDS_scale_exchange.iterator + 512 * (1 + compute_mma_dS_consumer_state.index),
+                        cute.make_layout(512),
+                    )
+                    with cute.arch.elect_one():
+                        d256_primitives.copy_mxfp8_scale_tile_to_tmem(stage_scales, tDKtSFDS)
+                    cute.arch.fence_view_async_tmem_store()
                 # dK = dS * QT
                 for k_block in cutlass.range_constexpr(cute.size(tDKrDS, mode=[2])):
                     sf_kblock_coord = (None, None, k_block)
@@ -3574,7 +3554,7 @@ class BlackwellFmhaBackwardDKDV256:
         Q, K, _, _ = problem_shape
         _, blk_coord_k, _, _ = blk_coord
 
-        # FIXME: perhaps make it uniform register
+        # TODO: perhaps make it uniform register
         wg_idx_valid = (tidx % (self.num_compute_warps * self.threads_per_warp)) // 128
         if cutlass.const_expr(iter_start_global is None):
             iter_start_global = iter_start
@@ -3841,69 +3821,43 @@ class BlackwellFmhaBackwardDKDV256:
             tTR_rdPT_scaled = cute.make_rmem_tensor_like(tTR_rVDO)
             tTR_rdPT_scaled.store(tTR_rVDO.load())
             if cutlass.const_expr(self.online_ds_scale):
-                partial_amax_0 = Float32(0.0)
-                partial_amax_1 = Float32(0.0)
-                for i in cutlass.range_constexpr(16):
-                    value_0 = tTR_rdPT_scaled[i]
-                    value_1 = tTR_rdPT_scaled[i + 16]
-                    partial_amax_0 = cute.arch.fmax(partial_amax_0, cute.arch.fmax(value_0, -value_0))
-                    partial_amax_1 = cute.arch.fmax(partial_amax_1, cute.arch.fmax(value_1, -value_1))
+                group_amax = Float32(0.0)
+                group_amax_1 = Float32(0.0)
+                for i in cutlass.range_constexpr(32):
+                    value = tTR_rdPT_scaled[i]
+                    group_amax = cute.arch.fmax(group_amax, cute.arch.fmax(value, -value))
+                    if cutlass.const_expr(cute.size(tTR_rdPT_scaled) > 32):
+                        value_1 = tTR_rdPT_scaled[i + 32]
+                        group_amax_1 = cute.arch.fmax(group_amax_1, cute.arch.fmax(value_1, -value_1))
                 dS_row = cute.get(tTR_cVDO[0], mode=[0])
-                dS_group_block = tidx // 64
-                partial_scale_0, _ = cute_common.cvt_amax_to_e8m0_rp(partial_amax_0)
-                partial_scale_1, _ = cute_common.cvt_amax_to_e8m0_rp(partial_amax_1)
-                partial_scale_tile = cute.make_tensor(
-                    sDS_scale_exchange.iterator,
-                    cute.make_layout((2, 2, 2, 64), stride=(256, 128, 64, 1)),
+                dS_group = (tidx // 64) * 2 + wg_idx_valid
+                dS_scale, inv_scale = cute_common.cvt_amax_to_e8m0_rp(group_amax)
+                if cutlass.const_expr(cute.size(tTR_rdPT_scaled) > 32):
+                    dS_scale_1, inv_scale_1 = cute_common.cvt_amax_to_e8m0_rp(group_amax_1)
+                cp_scale_tile = cute.make_tensor(
+                    sDS_scale_exchange.iterator + 512 * (1 + compute_mma_dS_producer_state.index),
+                    cute.make_layout((32, 4, 4), stride=(16, 4, 1)),
                 )
-                partial_scale_tile[wg_idx_valid, 0, dS_group_block, dS_row] = partial_scale_0
-                partial_scale_tile[wg_idx_valid, 1, dS_group_block, dS_row] = partial_scale_1
-                cute.arch.fence_proxy("async.shared", space="cta")
-                self.dS_scale_exchange_barrier.arrive_and_wait()
-
-                scale_0_value = cute.arch.fmax(
-                    partial_scale_tile[0, 0, dS_group_block, dS_row].to(Float32),
-                    partial_scale_tile[1, 0, dS_group_block, dS_row].to(Float32),
-                )
-                scale_1_value = cute.arch.fmax(
-                    partial_scale_tile[0, 1, dS_group_block, dS_row].to(Float32),
-                    partial_scale_tile[1, 1, dS_group_block, dS_row].to(Float32),
-                )
-                dS_scale_0, inv_scale_0 = cute_common.cvt_amax_to_e8m0_rp(scale_0_value * Float32(448.0))
-                dS_scale_1, inv_scale_1 = cute_common.cvt_amax_to_e8m0_rp(scale_1_value * Float32(448.0))
-
-                tTR_rdPT_normalized = cute.make_rmem_tensor_like(tTR_rdPT_scaled)
-                for i in cutlass.range_constexpr(0, 16, 2):
-                    tTR_rdPT_normalized[i], tTR_rdPT_normalized[i + 1] = cute.arch.mul_packed_f32x2(
-                        (tTR_rdPT_scaled[i], tTR_rdPT_scaled[i + 1]),
-                        (inv_scale_0, inv_scale_0),
-                    )
-                    tTR_rdPT_normalized[i + 16], tTR_rdPT_normalized[i + 17] = cute.arch.mul_packed_f32x2(
-                        (tTR_rdPT_scaled[i + 16], tTR_rdPT_scaled[i + 17]),
-                        (inv_scale_1, inv_scale_1),
-                    )
-                tTR_rdST = cute_common.quantize(tTR_rdPT_normalized, 4, LOW_PRECISION_TYPE)
-
-                self.dS_scale_exchange_barrier.arrive_and_wait()
-                if wg_idx_valid == 0:
-                    dS_group = dS_group_block * 2
-                    cp_scale_tile = cute.make_tensor(
-                        sDS_scale_exchange.iterator,
-                        cute.make_layout((32, 4, 4), stride=(16, 4, 1)),
-                    )
-                    cp_row = dS_row % 32
-                    cp_col = dS_row // 32
-                    cp_scale_tile[cp_row, cp_col, dS_group] = dS_scale_0
-                    cp_scale_tile[cp_row, cp_col + 2, dS_group] = dS_scale_0
+                cp_row = dS_row % 32
+                cp_col = dS_row // 32
+                cp_scale_tile[cp_row, cp_col, dS_group] = dS_scale
+                cp_scale_tile[cp_row, cp_col + 2, dS_group] = dS_scale
+                if cutlass.const_expr(cute.size(tTR_rdPT_scaled) > 32):
                     cp_scale_tile[cp_row, cp_col, dS_group + 1] = dS_scale_1
                     cp_scale_tile[cp_row, cp_col + 2, dS_group + 1] = dS_scale_1
+                tTR_rdPT_normalized = cute.make_rmem_tensor_like(tTR_rdPT_scaled)
+                for i in cutlass.range_constexpr(0, 32, 2):
+                    tTR_rdPT_normalized[i], tTR_rdPT_normalized[i + 1] = cute.arch.mul_packed_f32x2(
+                        (tTR_rdPT_scaled[i], tTR_rdPT_scaled[i + 1]),
+                        (inv_scale, inv_scale),
+                    )
+                    if cutlass.const_expr(cute.size(tTR_rdPT_scaled) > 32):
+                        tTR_rdPT_normalized[i + 32], tTR_rdPT_normalized[i + 33] = cute.arch.mul_packed_f32x2(
+                            (tTR_rdPT_scaled[i + 32], tTR_rdPT_scaled[i + 33]),
+                            (inv_scale_1, inv_scale_1),
+                        )
+                tTR_rdST = cute_common.quantize(tTR_rdPT_normalized, 4, LOW_PRECISION_TYPE)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                self.dS_scale_exchange_barrier.arrive_and_wait()
-                if wg_idx_valid == 0 and tidx == 0:
-                    d256_primitives.copy_mxfp8_scale_tile_to_tmem(sDS_scale_exchange, tDKtSFDS)
-                if wg_idx_valid == 0:
-                    cute.arch.fence_view_async_tmem_store()
-                self.dS_scale_exchange_barrier.arrive_and_wait()
             else:
                 tTR_rdST = cute_common.quantize(tTR_rdPT_scaled, 4, LOW_PRECISION_TYPE)
 
@@ -3940,21 +3894,15 @@ class BlackwellFmhaBackwardDKDV256:
                 iter_index = iter_start
 
     @cute.jit
-    def epilogue_zero(
-        self,
-        blk_coord: cute.Coord,
-        blk_offset: cute.Shape,
-        problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
-        dK: cute.Tensor,
-        dV: cute.Tensor,
-    ):
-        """Write zeros to this CTA's dK/dV tile (the epilogue's tile geometry) --
-        for KV tiles whose mainloop was skipped because no query row attends
-        them. Plain per-element stores from the compute warps; these tiles are
-        rare (the causal tail past S_q) so no vectorization is needed."""
+    def zero_epilogue(self, blk_coord, blk_offset, problem_shape, dK: cute.Tensor, dV: cute.Tensor):
+        """A fully masked KV tile still owns valid output rows: overwrite them.
+
+        Use the normal epilogue's per-CTA row ownership and varlen offset, but
+        do not read TMEM or wait/advance pipelines: no MMA was issued here.
+        Only the first compute warpgroup calls this helper in each CTA.
+        """
         tidx, _, _ = cute.arch.thread_idx()
         _, K, D, HB = problem_shape
-        _, blk_coord_k, _, blk_coord_batch = blk_coord
         mdK = cute.make_tensor(
             dK.iterator + cute.assume(blk_offset[1] * dK.stride[0], divby=64),
             cute.make_layout((K, self.tile_shape_dKdV_K, HB), stride=dK.stride),
@@ -3963,16 +3911,12 @@ class BlackwellFmhaBackwardDKDV256:
             dV.iterator + cute.assume(blk_offset[1] * dV.stride[0], divby=64),
             cute.make_layout((K, self.tile_shape_dKdV_K, HB), stride=dV.stride),
         )
-        rows = self.dSQ_cta_tiler[0]
-        cols = self.tile_shape_dKdV_K
-        n_threads = self.num_compute_warps * self.threads_per_warp
-        zero = Float32(0.0).to(self.element_dtype)
-        for i in cutlass.range(tidx, rows * cols, n_threads):
-            r = blk_coord_k * rows + i // cols
-            c = i % cols
-            if r < K:
-                mdK[(r, c, blk_coord_batch)] = zero
-                mdV[(r, c, blk_coord_batch)] = zero
+        for index in cutlass.range(tidx % 128, self.dSQ_cta_tiler[0] * self.tile_shape_dKdV_K, 128):
+            row = blk_coord[1] * self.dSQ_cta_tiler[0] + index // self.tile_shape_dKdV_K
+            col = index % self.tile_shape_dKdV_K
+            if row < K and col < D:
+                mdK[row, col, blk_coord[3]] = self.element_dtype(0.0)
+                mdV[row, col, blk_coord[3]] = self.element_dtype(0.0)
 
     @cute.jit
     def epilogue(
@@ -4047,11 +3991,8 @@ class BlackwellFmhaBackwardDKDV256:
         ) = cute_common.epilogue_tmem_copy_and_partition(load_op, tdKtdK, cdK, gdK, dp_idx, self.acc_dtype)
 
         cute.copy(tiled_t2r_dK, tTR_tdK, tTR_rdK)
-        # if bidx == 1 and tidx == 0:
         for i in cutlass.range(cute.size(tTR_rdK), unroll_full=True):
-            # if tidx == 0 and bidx == 1:
             tTR_rdK[i] = scale_softmax * tTR_rdK[i]
-            # if tidx == 0 and bidx == 1:
 
         cute.arch.fence_view_async_tmem_load()
         cute_common.store(self, tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
@@ -4084,24 +4025,24 @@ class BlackwellFmhaBackwardDKDV256:
         )
 
     def make_and_init_load_mma_KQ_pipeline(self, load_mma_KQ_mbar_ptr, cluster_layout_vmnk):
-        """Load -> MMA pipeline for the K and Q operand stages."""
+        # TWO completion counts both CTAs, including their SF and scalar loads.
         tx_count = self.tma_copy_Q_bytes * 2
-        tx_count += self.tma_copy_sfQ_bytes * self.k_halves * 2
-        tx_count += self.tma_copy_LSE_bytes
+        tx_count += self.tma_copy_sfQ_bytes * self.k_halves * 4
+        tx_count += 2 * self.tma_copy_LSE_bytes
         return self._make_and_init_load_mma_pipeline(load_mma_KQ_mbar_ptr, cluster_layout_vmnk, tx_count)
 
     def make_and_init_load_mma_KQ_aux_pipeline(self, load_mma_KQ_aux_mbar_ptr, cluster_layout_vmnk):
         """Load -> MMA pipeline for the K/Q auxiliary (scale-factor) stages."""
         tx_count = self.tma_copy_QT_bytes * 2
-        tx_count += self.tma_copy_sfQ_mn_bytes * 2
+        tx_count += self.tma_copy_sfQ_mn_bytes * 4
         return self._make_and_init_load_mma_pipeline(load_mma_KQ_aux_mbar_ptr, cluster_layout_vmnk, tx_count)
 
     def make_and_init_load_mma_VDO_pipeline(self, load_mma_VDO_mbar_ptr, cluster_layout_vmnk):
         """Load -> MMA pipeline for the V and dO operand stages."""
         tx_count = (self.tma_copy_dO_bytes + self.tma_copy_dOT_bytes) * 2
-        tx_count += self.tma_copy_sfdO_bytes * self.k_halves * 2
-        tx_count += self.tma_copy_sfdO_mn_bytes * 2
-        tx_count += self.tma_copy_sum_OdO_bytes
+        tx_count += self.tma_copy_sfdO_bytes * self.k_halves * 4
+        tx_count += self.tma_copy_sfdO_mn_bytes * 4
+        tx_count += 2 * self.tma_copy_sum_OdO_bytes
         return self._make_and_init_load_mma_pipeline(load_mma_VDO_mbar_ptr, cluster_layout_vmnk, tx_count)
 
     def _make_and_init_mma_compute_pipeline(self, mbar_ptr, num_stages, cluster_layout_vmnk):

@@ -24,18 +24,21 @@ Kernel 2 — Warp specialization (16 warps, 512 threads):
   Warps 2-3:   Idle
   Warps 4-7:   Compute warpgroup
                (per-block sGradSignal load, TMEM readback S → dS → dW, dQ TMA store)
-  Warps 8-11:  K loading warpgroup (TMA Gather4 for global IDs; manual
-               cp.async fallback for local IDs, 3-stage sK)
+  Warps 8-11:  K loading warpgroup (TMA Gather4 for either ID convention
+               when available; manual cp.async fallback otherwise, 3-stage sK)
   Warps 12-15: Reduce warpgroup (wide TMEM readback → padded ping-pong SMEM
                → cp.reduce.async.bulk to f32 gmem, 2-stage)
 
 TopkIdxs are pre-loaded into SMEM cooperatively by all 512 threads before warp dispatch.
 K/dK are flattened in ``__call__`` to a 2D ``(B*S_k, D)`` view so the kernel
-indexes them by **global flat KV ids**. ``topk_indices_global=True`` (default,
-matches the public fwd convention): ``mTopkIdx`` already carries
-``b * seqlen_k + local`` and is loaded directly. ``topk_indices_global=False``:
-ids are local-per-batch; the kernel adds ``batch_idx * S_k_per_batch`` to
-convert (const_expr-branched). (THD will reuse the same flat-id contract:
+indexes them by **global flat KV ids**. With ``topk_indices_global=True``
+(``indexer_forward_top_k_wrapper``'s default), ``mTopkIdx`` already carries
+``b * seqlen_k + local`` and is loaded directly. With
+``topk_indices_global=False`` (the backward wrapper's compatibility default),
+the kernel validates local ids against ``S_k_per_batch`` and adds
+``batch_idx * S_k_per_batch`` in registers. Both conventions feed the same
+Gather4 path when the installed CuTe DSL supports it; callers do not need a
+separate local-to-global launch. (THD will reuse the same flat-id contract:
 ``cu_seqlens_k[b] + local`` indexes the ``(T_k, D)`` packed buffer.)
 grad_signal (precomputed by kernel 1) is loaded per topk-block by the compute warpgroup.
 
@@ -440,16 +443,15 @@ class IndexerBackwardSm100:
             # established TopK=512 dispatch policy unchanged.
             and (topk == 512 or total_rows > persistent_grid_size)
         )
-        # Gather4 consumes explicit row coordinates, so short-row local IDs can
-        # be normalized to flat global IDs in registers before issue.  Keep the
-        # established TopK=512 local-ID fallback unchanged; the new policy is
-        # deliberately scoped to the 128/256/384 specializations evaluated
-        # here.
+        # Gather4 consumes explicit row coordinates, so local IDs can be
+        # range-checked and normalized to flat global IDs in registers before
+        # issue. This preserves the local-ID OOB contract without a separate
+        # conversion kernel or temporary index tensor.
         # Public DSL 4.5.x wheels do not contain the private MLIR operation
         # needed to construct a Gather4 descriptor. Keep those wheels on the
         # existing manual cp.async loader; both paths feed identical BF16 K
         # tiles into the same FP32 GEMMs.
-        self.use_tma_gather = _HAS_TMA_GATHER4 and (topk_indices_global or (self.use_persistent and topk in (128, 256, 384)))
+        self.use_tma_gather = _HAS_TMA_GATHER4
         self.use_cross_row_persistent = self.use_persistent and self.use_tma_gather
 
         # GEMM tilers (M, N, K) — cute.gemm, SMEM operands, TMEM acc
@@ -3429,9 +3431,10 @@ def indexer_backward_sm100(
     #
     # ``topk_indices_global`` selects the topk-id contract:
     #   True  (default): mTopkIdx carries global flat ids — load directly.
-    #   False (legacy):  mTopkIdx carries local-per-batch ids — kernel adds
-    #                    ``batch_idx * S_k_per_batch`` to convert to global
-    #                    flat for the (B*S_k, D) K/dK view.
+    #   False:           mTopkIdx carries local-per-batch ids — kernel checks
+    #                    the per-batch bound and adds ``batch_idx * S_k`` in
+    #                    registers for the flat (B*S_k, D) K/dK view.
+    # Both conventions use Gather4 when the installed DSL supports it.
     # Const_expr-branched in the kernel, so it **is** part of the compile key.
     # THD packed varlen is supported at the wrapper level by treating the
     # packed tensors as a single B=1 BSHD batch (sparse path's topk indices

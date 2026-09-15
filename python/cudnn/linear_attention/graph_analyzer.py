@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Engine-agnostic linear-attention graph analysis: ``graph.nodes`` -> :class:`LaGraphFacts`.
+"""Engine-agnostic linear-attention graph analysis from ``graph.nodes`` to :class:`LaGraphFacts`.
 
-One analyzer serves the three LA families (gdn / kda / gdn2 — single dedicated
+One analyzer serves the LA families (gdn / kda / gdn2 / gdp, single dedicated
 nodes sharing the THD port vocabulary). :func:`analyze` is the callable each
 family names in ``engines/manifest.py``; PLANNING runs it once per frozen
 graph and attaches the record, so the family's engines read that same record
@@ -35,29 +35,37 @@ def to_buffer_dtype(dt) -> str:
 LA_NODE_OPS = {
     cudnn.NodeType.GDN: ("GDN", False),
     cudnn.NodeType.GDN_BWD: ("GDN", True),
+    cudnn.NodeType.GDN_SUMMARY: ("GDN_SUMMARY", False),
+    cudnn.NodeType.GDN_SUMMARY_BWD: ("GDN_SUMMARY", True),
     cudnn.NodeType.KDA: ("KDA", False),
     cudnn.NodeType.KDA_BWD: ("KDA", True),
+    cudnn.NodeType.KDA_SUMMARY: ("KDA_SUMMARY", False),
+    cudnn.NodeType.KDA_SUMMARY_BWD: ("KDA_SUMMARY", True),
     cudnn.NodeType.GDN2: ("GDN2", False),
     cudnn.NodeType.GDN2_BWD: ("GDN2", True),
+    cudnn.NodeType.GDN2_SUMMARY: ("GDN2_SUMMARY", False),
+    cudnn.NodeType.GDN2_SUMMARY_BWD: ("GDN2_SUMMARY", True),
     cudnn.NodeType.GDP: ("GDP", False),
     cudnn.NodeType.GDP_BWD: ("GDP", True),
+    cudnn.NodeType.GDP_SUMMARY: ("GDP_SUMMARY", False),
+    cudnn.NodeType.GDP_SUMMARY_BWD: ("GDP_SUMMARY", True),
 }
 
 
 @dataclass(frozen=True)
 class LaGraphFacts:
-    """What a single-LA graph asks for. Pure description — no support
-    judgment: head-dim limits, dtype sets, and feature coverage are per-engine
+    """What a single-LA graph asks for. Pure description with no support
+    judgment; head-dim limits, dtype sets, and feature coverage are per-engine
     knowledge, matched in each engine's ``check_support``. ``invalid`` is the
-    one exception: a graph-consistency error (malformed regardless of which
-    kernel would run — a missing required port, ``d_initial_state`` without
+    one exception, a graph-consistency error (malformed regardless of which
+    kernel would run, a missing required port, ``d_initial_state`` without
     ``initial_state``, a_log/dt_bias without safe_gate, d_a_log/d_dt_bias
     without their parameter); when set,
     every engine is ineligible."""
 
     invalid: Optional[str] = None
 
-    op: str = ""  # "GDN" | "KDA" | "GDN2" | "GDP"
+    op: str = ""  # "GDN" | "KDA" | "GDN2" | "GDP" | the family + "_SUMMARY"
     is_bwd: bool = False
 
     # geometry (THD; zeros when the port ranks are not declared)
@@ -107,11 +115,13 @@ class LaGraphFacts:
     has_dt_bias: bool = False
     wants_d_initial_state: bool = False
     wants_state_checkpoints: bool = False
+    wants_transition: bool = False
 
     # attributes
     scale: Optional[float] = None
     use_qk_l2norm: bool = False
     safe_gate: bool = False
+    gate_domain: str = "log"
     use_beta_sigmoid: bool = False
     allow_neg_eigval: bool = False
     beta_guard: bool = False
@@ -124,7 +134,7 @@ class LaGraphFacts:
 def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     """Facts for a single-LA graph, or None if the graph is anything else.
 
-    Pure: attaching and caching is the graph's job (create_execution_plans
+    Pure; attaching and caching is the graph's job (create_execution_plans
     -> _attach_facts). This is the callable the LA families name in their
     manifest ``analyzer`` entries."""
     nodes = list(graph.nodes)
@@ -135,19 +145,28 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     if kind is None:
         return None
     op, is_bwd = kind
+    is_summary = op.endswith("_SUMMARY")
     ins, outs, params = node.inputs, node.outputs, node.params
 
-    required_in = ["q", "k", "v", "g", "beta", "cu_seqlens"]
-    if op == "GDN2":
+    if is_summary:
+        required_in = ["q", "k", "g", "beta", "cu_seqlens"] if is_bwd else ["k", "v", "g", "beta", "cu_seqlens"]
+    else:
+        required_in = ["q", "k", "v", "g", "beta", "cu_seqlens"]
+    if op == "GDN2" or (op == "GDN2_SUMMARY" and not is_bwd):
         required_in.append("w")
     if is_bwd:
         required_in.append("dO")
-    required_out = (["dQ", "dK", "dV", "dG", "dBeta"] + (["dW"] if op == "GDN2" else [])) if is_bwd else ["O"]
+    if is_summary:
+        required_out = ["d_initial_state"] if is_bwd else ["final_state"]
+    else:
+        required_out = (["dQ", "dK", "dV", "dG", "dBeta"] + (["dW"] if op == "GDN2" else [])) if is_bwd else ["O"]
 
     safe_gate = bool(params.get("safe_gate", False))
+    gate_domain = params.get("gate_domain") or "log"
     checkpoint = int(params.get("checkpoint_every_n_tokens", 0) or 0)
     num_householder = params.get("num_householder", 1)
     num_householder = 1 if num_householder is None else int(num_householder)
+    batch_invariant = bool(params.get("batch_invariant", False))
     invalid = None
     missing_in = [p for p in required_in if p not in ins]
     missing_out = [p for p in required_out if p not in outs]
@@ -155,13 +174,17 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = f"{node.node_type.name} node '{node.name}' is missing input(s) {missing_in}"
     elif missing_out:
         invalid = f"{node.node_type.name} node '{node.name}' is missing output(s) {missing_out}"
-    elif "d_initial_state" in outs and "initial_state" not in ins:
+    elif not is_summary and "d_initial_state" in outs and "initial_state" not in ins:
         invalid = "d_initial_state requires initial_state"
     elif not safe_gate and ("a_log" in ins or "dt_bias" in ins):
         invalid = "a_log/dt_bias require safe_gate=True"
+    elif gate_domain not in ("log", "linear"):
+        invalid = f"gate_domain must be 'log' or 'linear', got {gate_domain!r}"
+    elif gate_domain == "linear" and safe_gate:
+        invalid = "gate_domain='linear' cannot combine with safe_gate=True (the safe-gate transform takes raw logits)"
     elif ("d_a_log" in outs or "d_dt_bias" in outs) and not is_bwd:
         invalid = "d_a_log/d_dt_bias are outputs of a bwd node"
-    elif is_bwd and any((d in outs) != (p in ins) for d, p in (("d_a_log", "a_log"), ("d_dt_bias", "dt_bias"))):
+    elif is_bwd and not is_summary and any((d in outs) != (p in ins) for d, p in (("d_a_log", "a_log"), ("d_dt_bias", "dt_bias"))):
         invalid = "d_a_log is present iff a_log is, and d_dt_bias iff dt_bias"
     elif is_bwd and any(list(outs[d].dim or []) != list(ins[p].dim or []) for d, p in (("d_a_log", "a_log"), ("d_dt_bias", "dt_bias")) if d in outs):
         invalid = "d_a_log/d_dt_bias dims must match a_log/dt_bias"
@@ -169,9 +192,9 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "gate_lower_bound requires safe_gate=True"
     elif checkpoint < 0:
         invalid = "checkpoint_every_n_tokens must be non-negative"
-    elif not is_bwd and checkpoint > 0 and "state_checkpoints" not in outs:
+    elif not is_bwd and not is_summary and checkpoint > 0 and "state_checkpoints" not in outs:
         invalid = "checkpoint_every_n_tokens > 0 requires the state_checkpoints output"
-    elif not is_bwd and checkpoint == 0 and "state_checkpoints" in outs:
+    elif not is_bwd and not is_summary and checkpoint == 0 and "state_checkpoints" in outs:
         invalid = "state_checkpoints output requires checkpoint_every_n_tokens > 0"
     elif is_bwd and checkpoint > 0 and "state_checkpoints" not in ins:
         invalid = "checkpoint_every_n_tokens > 0 on a bwd node requires the state_checkpoints input"
@@ -183,21 +206,52 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "GDP k/v/beta rows must equal q rows * num_householder (the sub-token expansion)"
     elif op == "GDP" and ins["q"].dim and any(t is not None and t.dim and int(t.dim[0]) != int(ins["q"].dim[0]) for t in (ins["g"], ins.get("dO"))):
         invalid = "GDP g and dO rows must equal q rows (real tokens)"
+    elif (
+        op == "GDP_SUMMARY"
+        and ins["g"].dim
+        and any(t is not None and t.dim and int(t.dim[0]) != int(ins["g"].dim[0]) * num_householder for t in (ins["k"], ins.get("v"), ins["beta"]))
+    ):
+        invalid = "GDP_SUMMARY k/v/beta rows must equal g rows * num_householder (the sub-token expansion)"
+    elif op == "GDP_SUMMARY" and is_bwd and ins["g"].dim and any(t.dim and int(t.dim[0]) != int(ins["g"].dim[0]) for t in (ins["q"], ins["dO"])):
+        invalid = "GDP_SUMMARY q and dO rows must equal g rows (real tokens)"
     if invalid is not None:
         return LaGraphFacts(invalid=invalid, op=op, is_bwd=is_bwd)
 
     in_dt = {name: t.get_data_type() for name, t in ins.items()}
     out_dt = {name: t.get_data_type() for name, t in outs.items()}
-    q, k, v = ins["q"], ins["k"], ins["v"]
+    q, k, v = ins.get("q"), ins["k"], ins.get("v")
 
-    thd_layout = all(t.dim and len(t.dim) == 3 for t in (q, k, v))
-    if thd_layout:
-        _, h_q, d_qk = (int(d) for d in q.dim)
-        h_k, h_v, d_v = int(k.dim[1]), int(v.dim[1]), int(v.dim[2])
+    if is_summary and is_bwd:
+        g, do = ins["g"], ins["dO"]
+        thd_layout = all(t.dim and len(t.dim) == 3 for t in (q, k, do))
+        if thd_layout:
+            _, h_q, d_qk = (int(d) for d in q.dim)
+            h_k = int(k.dim[1])
+            h_v, d_v = int(do.dim[1]), int(do.dim[2])
+        else:
+            h_q = h_k = h_v = d_qk = d_v = 0
+        h_o = int(g.dim[1]) if g.dim and len(g.dim) > 1 else max(h_q, h_v)
+        total_t = int(g.dim[0]) if g.dim else 0
+    elif is_summary:
+        g = ins["g"]
+        thd_layout = all(t.dim and len(t.dim) == 3 for t in (k, v))
+        if thd_layout:
+            h_k, d_qk = int(k.dim[1]), int(k.dim[2])
+            h_v, d_v = int(v.dim[1]), int(v.dim[2])
+        else:
+            h_k = h_v = d_qk = d_v = 0
+        h_q = h_k
+        h_o = int(g.dim[1]) if g.dim and len(g.dim) > 1 else max(h_q, h_v)
+        total_t = int(g.dim[0]) if g.dim else 0
     else:
-        h_q = h_k = h_v = d_qk = d_v = 0
-    h_o = max(h_q, h_v)
-    total_t = int(q.dim[0]) if thd_layout else 0
+        thd_layout = all(t.dim and len(t.dim) == 3 for t in (q, k, v))
+        if thd_layout:
+            _, h_q, d_qk = (int(d) for d in q.dim)
+            h_k, h_v, d_v = int(k.dim[1]), int(v.dim[1]), int(v.dim[2])
+        else:
+            h_q = h_k = h_v = d_qk = d_v = 0
+        h_o = max(h_q, h_v)
+        total_t = int(q.dim[0]) if thd_layout else 0
     cu = ins["cu_seqlens"]
     n_seq = int(cu.dim[0]) - 1 if cu.dim else 0
     checkpoint_port = ins.get("state_checkpoints")
@@ -206,7 +260,10 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     state_checkpoint_rows = int(checkpoint_port.dim[0]) if checkpoint_port is not None and checkpoint_port.dim else 0
     gates_at_ho = all(t is None or not t.dim or (len(t.dim) > 1 and int(t.dim[1]) == h_o) for t in (ins["g"], ins["beta"], ins.get("w")))
     gate_channels = int(ins["g"].dim[2]) if ins["g"].dim and len(ins["g"].dim) == 3 else 0
-    io_dtypes = {in_dt["q"], in_dt["k"], in_dt["v"]} - {None}
+    if is_summary:
+        io_dtypes = ({in_dt["q"], in_dt["k"]} if is_bwd else {in_dt["k"], in_dt["v"]}) - {None}
+    else:
+        io_dtypes = {in_dt["q"], in_dt["k"], in_dt["v"]} - {None}
     state_dtypes = {in_dt.get("initial_state"), out_dt.get("final_state")} - {None}
     scale = params.get("scale")
 
@@ -225,7 +282,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         state_checkpoint_rows=state_checkpoint_rows,
         gates_at_ho=gates_at_ho,
         gate_channels=gate_channels,
-        io_dtype=in_dt["q"],
+        io_dtype=in_dt["k"] if is_summary else in_dt["q"],
         uniform_io=len(io_dtypes) <= 1,
         g_dtype=in_dt["g"],
         beta_dtype=in_dt["beta"],
@@ -255,14 +312,16 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         has_dt_bias="dt_bias" in ins,
         wants_d_initial_state="d_initial_state" in outs,
         wants_state_checkpoints="state_checkpoints" in outs,
+        wants_transition="transition" in outs,
         scale=float(scale) if scale is not None else None,
         use_qk_l2norm=bool(params.get("use_qk_l2norm", False)),
         safe_gate=safe_gate,
+        gate_domain=gate_domain,
         use_beta_sigmoid=bool(params.get("use_beta_sigmoid", False)),
         allow_neg_eigval=bool(params.get("allow_neg_eigval", False)),
         beta_guard=bool(params.get("beta_guard", False)),
         gate_lower_bound=float(params["gate_lower_bound"]) if params.get("gate_lower_bound") is not None else None,
         checkpoint_every_n_tokens=checkpoint,
-        batch_invariant=bool(params.get("batch_invariant", False)),
+        batch_invariant=batch_invariant,
         num_householder=num_householder,
     )

@@ -391,9 +391,13 @@ def create_container_and_page_table(tensor, block_size):
 
     reshaped = torch.cat((cat_tensor.clone()).chunk(blocks_per_batch, dim=2), dim=0)
 
+    # Page p of batch b lives at pool index p*B + b (the chunk/cat above). The
+    # table is stored ROW-MAJOR — each batch's page list contiguous, strides
+    # (table_size, table_size, 1, 1) on the (B, 1, table_size, 1) declaration —
+    # which is what every framework hands cuDNN (FlashInfer, vLLM, SGLang,
+    # Megatron/TE, PyTorch all keep [B, max_pages] int32 row-major).
     table_size = math.ceil(S/block_size)
-    page_table = torch.linspace(0, B*table_size-1, B*table_size, device='cuda', dtype=torch.int32).reshape(table_size,1,B,1)
-    page_table = torch.transpose(page_table,0,2)
+    page_table = torch.arange(B*table_size, device='cuda', dtype=torch.int32).reshape(table_size, B).t().contiguous().reshape(B, 1, table_size, 1)
 
     return(reshaped, page_table)
 

@@ -56,7 +56,7 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import TensorDesc
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
-from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
+from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _sf_storage_order_bytes, _torch_stream_context, ws_align
 
 _HEAD_DIM = 256
 _SF_BLOCK = 32
@@ -619,12 +619,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             """View a tensor as the kernel's fp16/bf16 element type."""
             return from_dlpack(t.permute(0, 2, 1, 3).contiguous().view(b, s, h_kv_, h_r_, d).permute(1, 4, 3, 2, 0), assumed_align=16)
 
-        def sf_bytes(t):
-            """Byte size of one scale-factor plane set."""
-            flat = t.contiguous()
-            if flat.dtype != torch.int8:
-                flat = flat.view(torch.int8)
-            return flat.reshape(-1)
+        def sf_bytes(t, name="sf"):
+            # Scale factors are an opaque F8_128x4 byte layout bound by STORAGE order (a permuted view
+            # binds zero-copy and keeps the producer's byte stream); same helper as the forward binder.
+            return _sf_storage_order_bytes(t, name)
 
         with _torch_stream_context(current_stream, q_tensor.device):
             carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm100_mxfp8")
@@ -633,7 +631,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             for name, src, _rows, _kg, _l, _layout, _pm in self._sf_plan():
                 rk, fn = repacks[name]
                 dst = carver.take(rk.dst_bytes, torch.int8)
-                fn(from_dlpack(sf_bytes(extras[src]), assumed_align=16), from_dlpack(dst, assumed_align=16), stream)
+                fn(from_dlpack(sf_bytes(extras[src], src), assumed_align=16), from_dlpack(dst, assumed_align=16), stream)
                 ct = from_dlpack(dst, assumed_align=16)
                 ct.element_type = E8M0
                 sf_bufs[name] = ct

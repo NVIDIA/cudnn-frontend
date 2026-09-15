@@ -4,7 +4,7 @@
 """SM107 (Rubin) routing of the per-tensor FP8 d128 SDPA kernel.
 
 The adapter routes cc10.7 per-tensor-FP8 graphs to the SM107 sibling module
-(``prefill_d128_fp8_sm107.py``), which bakes the Rubin dense-FP8 K=64 MMA
+(``sm107/prefill_d128_fp8.py``), which bakes the Rubin dense-FP8 K=64 MMA
 geometry; Blackwell keeps the untouched SM100 module. These tests pin the
 routing and both modules' derived constants — device-independent (everything
 here happens before any compile). End-to-end coverage rides the existing
@@ -53,8 +53,14 @@ def test_sm100_module_unchanged():
     assert mod.NUM_KPHASES_PV == 4
 
 
-def test_sm107_per_tensor_fp8_advertises_only_d128():
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128)})
+def test_sm107_per_tensor_fp8_native_shapes():
+    """INVERTED 2026-09-04: the SM107 port added d256 and d512 per-tensor FP8.
+    INVERTED again 2026-09-09: d192xd128 gained its Rubin sibling
+    (sm107/prefill_d192_d128_fp8.py), so both arch lines now carry all four
+    native flavors and the two shape sets are identical."""
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
     assert (256, 256) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
 
@@ -74,14 +80,29 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
-    # Kernel flavors are row DATA: Rubin has no d192, d256, or d512 sibling.
+    # Kernel flavors are row DATA.  FULLY INVERTED 2026-09-09: the Rubin line
+    # now carries all four per-tensor FP8 flavors, d192xd128 included, so the
+    # two rows agree on d_shapes.  They still differ on THD, split-KV, PackGQA
+    # and the scheduler domain -- which is the point of splitting the rows.
     assert sm100.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    assert sm107.d_shapes == frozenset({(128, 128)})
-    # d512 carries an envelope FLOOR: it serves (256, 512] on both head dims,
-    # so a smaller graph is declined rather than routed onto the d512 kernel at
-    # a multiple-x zero-padding cost.  Rubin has no d512 flavor, hence no floor.
-    assert sm100.d_envelope_floors == (((512, 512), 256),)
-    assert sm107.d_envelope_floors == ()
+    assert sm107.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    assert (192, 128) in sm107.d_shapes
+    # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
+    # so a row that gains a flavor must gain its floor in the same commit --
+    # otherwise mismatch() admits a graph check_support kills (contract 8b').
+    assert dict(sm107.d_envelope_floors) == dict(sm100.d_envelope_floors)
+    # Envelope FLOORS keep an inexact graph off a flavor whose padded path is
+    # not validated.  BOTH rows carry them, and the Rubin one differs only by
+    # the (192, 128) entry it has no flavor for -- the floors' rationale is the
+    # kernel geometry (a cga4x1 d512 role-split; an unvalidated d256 padded
+    # path), which the Rubin ports inherit unchanged.  They must also match
+    # api_dsl._SM100_FP8_ENVELOPE_FLOORS, which the adapter enforces on BOTH
+    # arch lines -- a row that admits what the adapter rejects is a plan that
+    # enters the ranked list only to die in check_support.
+    assert sm100.d_envelope_floors == (((192, 128), 128), ((256, 256), 255), ((512, 512), 256))
+    # INVERTED 2026-09-09: Rubin gained the d192 flavor, so it gained that
+    # flavor's floor too -- the two rows' floor tables are now identical.
+    assert sm107.d_envelope_floors == (((192, 128), 128), ((256, 256), 255), ((512, 512), 256))
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
     assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
@@ -93,18 +114,38 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # so the sched domain is the same on both rows.
     assert sm107.split_kv_supported is True
     assert sm100.split_kv_supported is True
-    assert sm107.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
+    # The Rubin ROW-WIDE floor is NATURAL, and every LPT variant is claimed PER
+    # FLAVOR through `sched_policies_by_d_shape`: plain LPT at (256, 256) and
+    # (192, 128) since 2026-09-11, LPT + LPT_L2 at (192, 128) and (128, 128)
+    # since 2026-09-14 (LPT_L2's decode needs qh_per_kh / seqlen_kv at every
+    # call site, which the d128 and d192x128 kernels thread and the d256 /
+    # d512 kernels do not) -- each validated bit-identical to NATURAL; d512
+    # stays out (its role-split kernel
+    # still lacks the #1001 `lpt_q_tiles_in_cga_units` argument and writes
+    # nothing under LPT, which is what the old "causal d512 FP8 under LPT
+    # returns NaN" report was).
+    assert sm107.sched_policies == frozenset({SCHED_NATURAL})
+    assert dict(sm107.sched_policies_by_d_shape) == {
+        (256, 256): frozenset({SCHED_NATURAL, SCHED_LPT}),
+        (192, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+        (128, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+    }
+    assert sm100.sched_policies_by_d_shape == ()
     assert sm100.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
 
     # Both d128 cells carry the write_thd_meta THD leg.
     assert sm100.thd and sm107.thd and sm100.cu_seq_len and sm107.cu_seq_len
 
 
-def test_sm107_row_ranks_the_lpt_remap_for_causal():
-    """The LPT/LPT_L2 remap (issue #653) is live on the Rubin row: a causal
-    per-tensor FP8 graph at cc10.7 ranks LPT_L2 first, exactly as its SM100
-    twin does, and both remap specializations template-load. Pure — facts pin
-    the device, and nothing here compiles."""
+def test_sm107_row_ranks_lpt_first_for_a_few_wave_causal_grid():
+    """A causal per-tensor FP8 graph ranks [LPT_L2, LPT, NATURAL] on the SM100
+    row (the L2-budget rule).  The Rubin d128 flavor claims the same three
+    policies since 2026-09-14, but these facts have h_q == h_kv -- no K/V
+    sharing for LPT_L2 to group -- and a 1.2-wave grid, so the Rubin rule leads
+    with plain LPT and keeps the other two as autotune runners (measured on the
+    perf node: see heuristics._sched_points).  The d256 ranking is pinned in
+    test_sdpa_fwd_dsl_sm107.py.  Pure -- facts pin the device, and nothing
+    here compiles."""
     import cudnn as _c
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa import graph_analyzer as ga
@@ -131,25 +172,29 @@ def test_sm107_row_ranks_the_lpt_remap_for_causal():
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
     # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, far inside the L2 budget
-    # the remap groups against, so the L2 variant leads on BOTH rows. Before
-    # the port the Rubin row had a one-element domain and took _sched_points'
-    # sole-element shortcut, which is what pinned it to NATURAL.
-    assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    # the SM100 rule groups against, so LPT_L2 leads there.  The Rubin row's
+    # d128 domain is {NATURAL, LPT, LPT_L2} too, but h_q == h_kv: LPT_L2 has
+    # nothing to group, and 1 x 8 x 16 tiles over 106 clusters is 1.2 waves,
+    # so the Rubin rule leads with LPT.  Both rows keep every domain member in
+    # the ranking (autotune), and neither proposes anything outside it.
+    assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
     assert heuristics._sched_points(sm100, facts((10, 0))) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
 
-    # Both remap specializations template-load on the Rubin sibling.
-    for policy in (SCHED_LPT, SCHED_LPT_L2):
-        assert _load(rubin=True, sched_policy=policy).CFG.SCHEDULER_POLICY == policy
+    # Both d128 remap specializations template-LOAD (the decode is correct
+    # since #1001 and bit-identical to NATURAL -- the Rubin e2e below).
+    assert _load(rubin=True, sched_policy=SCHED_LPT).CFG.SCHEDULER_POLICY == SCHED_LPT
+    assert _load(rubin=True, sched_policy=SCHED_LPT_L2).CFG.SCHEDULER_POLICY == SCHED_LPT_L2
 
 
 def test_softmax_half_declines_by_row_domain():
-    """A HALF request on the sm100 row declines through the generic knob
-    domain gate; the sm107 row admits it. Pure — facts pin the device."""
+    """The sdpa(softmax_precision=HALF) op attribute is a graph FACT: the sm100
+    row declines it through its capability domain; the sm107 row admits it.
+    Pure — facts pin the device."""
     import cudnn as _c
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.fwd import engines
 
-    def facts(cc):
+    def facts(cc, softmax_precision=None):
         return ga.SdpaGraphFacts(
             b=1,
             h_q=4,
@@ -162,16 +207,19 @@ def test_softmax_half_declines_by_row_domain():
             dtype_o=_c.data_type.BFLOAT16,
             is_fp8=True,
             device_cc=cc,
+            softmax_precision=softmax_precision,
         )
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     sm100 = caps[engines.engine_name(fp8=True)]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
-    half = engines.SdpaFwdKnobs(softmax_precision=_c.data_type.HALF)
+    half = _c.data_type.HALF
 
-    assert "domain" in engines.mismatch(sm100, facts((10, 0)), half)
-    assert engines.mismatch(sm107, facts((10, 7)), half) is None
-    # And the rows keep their arch lanes regardless of the knob.
+    assert "softmax_precision" in engines.mismatch(sm100, facts((10, 0), half), None)
+    assert engines.mismatch(sm107, facts((10, 7), half), None) is None
+    # It is not a tuning knob: the knob vocabulary has no such axis.
+    assert "softmax_precision" not in engines.SdpaFwdKnobs.__dataclass_fields__
+    # And the rows keep their arch lanes regardless of the attribute.
     assert "SM107-119" in engines.mismatch(sm107, facts((10, 0)), None)
     assert "SM100-106" in engines.mismatch(sm100, facts((10, 7)), None)
 
@@ -225,26 +273,37 @@ def test_softmax_f16_rejects_half_inputs():
         make_cfg_d128(TemplateParams(dtype_qkv=_FP16, softmax_f16=True))
 
 
-def test_softmax_points_never_propose_half():
-    """propose() fills the axis with FLOAT where the row serves it — HALF is
-    numerics-changing and reachable by explicit request only."""
+def test_softmax_precision_is_never_a_heuristic_axis():
+    """HALF is numerics-changing, so it is not a tuning axis at all: the
+    heuristics' knob vocabulary has no softmax field, and the only way to get
+    the f16x2 arm is the sdpa(softmax_precision=HALF) op attribute, which a
+    row admits or declines through its capability domain (never degraded)."""
     import cudnn as _c
-    from cudnn.sdpa.fwd.engines import Capabilities
-    from cudnn.sdpa.fwd.heuristics import _softmax_points
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import Capabilities, SdpaFwdKnobs, mismatch
 
-    lit = Capabilities(
-        sm_lo=100,
-        sm_hi=119,
-        phase="prefill",
-        d_shapes=frozenset({(128, 128)}),
-        softmax_precisions=frozenset({_c.data_type.FLOAT, _c.data_type.HALF}),
+    assert "softmax_precision" not in SdpaFwdKnobs.__dataclass_fields__
+    assert not hasattr(heuristics, "_softmax_points")
+
+    base = dict(
+        b=1, h_q=4, h_kv=4, s_q=256, s_kv=256, d_qk=128, d_v=128, dtype=_c.data_type.FP8_E4M3, dtype_o=_c.data_type.BFLOAT16, is_fp8=True, device_cc=(10, 7)
     )
-    assert _softmax_points(lit) == [_c.data_type.FLOAT]
+    lit = Capabilities(
+        sm_lo=100, sm_hi=119, phase="prefill", d_shapes=frozenset({(128, 128)}), softmax_precisions=frozenset({_c.data_type.FLOAT, _c.data_type.HALF})
+    )
     dark = Capabilities(sm_lo=100, sm_hi=119, phase="prefill", d_shapes=frozenset({(128, 128)}))
-    assert _softmax_points(dark) == [None]
-    # A HALF-only row must still not get HALF auto-proposed (numerics-changing).
-    half_only = Capabilities(sm_lo=100, sm_hi=119, phase="prefill", d_shapes=frozenset({(128, 128)}), softmax_precisions=frozenset({_c.data_type.HALF}))
-    assert _softmax_points(half_only) == [None]
+    # No request: every row runs its f32 pipeline, nothing to gate.
+    for caps in (lit, dark):
+        assert "softmax_precision" not in (mismatch(caps, ga.SdpaGraphFacts(**base), None) or "")
+    # An explicit HALF request: honored by the row that carries the arm, declined by the one that does not.
+    half = ga.SdpaGraphFacts(**base, softmax_precision=_c.data_type.HALF)
+    # The row that carries the arm reaches the same verdict as for no request,
+    # i.e. the softmax gate (which runs before every other gate) passed. Compared
+    # with the no-request verdict rather than asserted None so the unit stays
+    # device- and DSL-independent (the later gates need both).
+    assert mismatch(lit, half, None) == mismatch(lit, ga.SdpaGraphFacts(**base), None)
+    assert "softmax_precision" in mismatch(dark, half, None)
 
 
 @requires_dsl
@@ -333,9 +392,27 @@ def test_fp8_rows_serve_dense_envelope():
     for arch in ("sm100", "sm107"):
         row = caps[engines.engine_name(arch=arch, fp8=True)]
         assert row.d_pad_multiple == 16, arch
-    # The d128 kernel carries the THD leg on both arch lines; sm100 adds the
-    # d192, d256, and d512 flavors' THD legs.
-    assert caps[engines.engine_name(arch="sm107", fp8=True)].thd_d_shapes == frozenset({(128, 128)})
+    # FULLY INVERTED 2026-09-09: the Rubin per-tensor FP8 THD leg now covers every
+    # native flavor -- d192xd128 came free with the DSv3 port (same body as d128),
+    # and d256/d512 were moved onto the FROST THD contract.  Both lines now serve
+    # THD at every shape they serve dense.
+    rubin_fp8 = caps[engines.engine_name(arch="sm107", fp8=True)]
+    assert rubin_fp8.thd_d_shapes == rubin_fp8.d_shapes
+    assert caps[engines.engine_name(fp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+
+    # The row and the STANDALONE wrapper enforce the same fact at two places
+    # (rule 8b'), so they now share ONE constant instead of two copies kept in
+    # step by hand -- which is what failed when the row was widened first and a
+    # d192 THD graph died with a bare NotImplementedError inside check_support.
+    # Assert IDENTITY with the shared object, not equality with a literal: a
+    # literal here would just be a third copy to drift.
+    from cudnn.sdpa.fwd.api_dsl import _SM107_FP8_THD_SHAPES
+    from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES
+
+    assert rubin_fp8.thd_d_shapes is SM107_FP8_THD_SHAPES
+    assert _SM107_FP8_THD_SHAPES is SM107_FP8_THD_SHAPES
+    # Every THD shape must also be a shape the row SERVES at all.
+    assert SM107_FP8_THD_SHAPES <= rubin_fp8.d_shapes
     assert caps[engines.engine_name(arch="sm100", fp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert caps[engines.engine_name(mxfp8=True)].d_pad_multiple == 0
 
@@ -372,10 +449,16 @@ def test_fp8_envelope_mismatch_rules():
     sm100 = caps[engines.engine_name(fp8=True)]
     assert engines.mismatch(sm100, _fp8_facts()) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
-    # The d192xd128 flavor serves its envelope too (kernel takes d_qk/d_v).
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=96)) is None
-    # D256xD256 extends that envelope in both dimensions.
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=160)) is None
+    # The d192xd128 and D256 flavors serve ONLY their exact shapes (floors 128 / 255):
+    # d_qk zero-padded into d192 is numerically wrong and the D256 padded envelope is
+    # nondeterministic in test_mhas_v2, so the row declines the whole (128, 256) inexact
+    # region and the classic backend verdict applies there.
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128)) is None
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256)) is None
+    for dq, dv in ((160, 96), (176, 128), (192, 96), (160, 160), (224, 208)):
+        assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=dq, d_v=dv)), (dq, dv)
+    assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=192, d_v=128)) == (192, 128)
+    assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=256, d_v=256)) == (256, 256)
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=256))
     assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
@@ -398,11 +481,269 @@ def test_fp8_envelope_mismatch_rules():
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=448, thd=True, padded=True))
     # d % 16 still applies inside the band (TMA 16-byte global-stride rule).
     assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=392, d_v=392))
-    # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case)
-    # but has no d192 flavor at all.
+    # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case).
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
-    assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128))
+    # INVERTED 2026-09-09: the Rubin d192 FP8 sibling landed, so the EXACT
+    # shape is now served on both rows.  Its floor (128) came with it, so the
+    # inexact region below stays declined -- d_qk zero-padded into d192 is
+    # numerically wrong, and that is a kernel property, not an arch one.
+    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
+    assert engines._selected_d_shape(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) == (192, 128)
+    for dq, dv in ((160, 96), (176, 128), (192, 96)):
+        assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)), (dq, dv)
     assert "dense-only" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))
-    # There is no Rubin d512 kernel at all.
-    assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512))
+    # INVERTED: the Rubin line gained a d512 per-tensor FP8 kernel, so the
+    # native d512 shape is now SERVED rather than declined, and the (256, 512]
+    # floor applies here exactly as on the SM100 row.
+    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512)) is None
+    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=384, d_v=448)) is None
+    # ...and straddling the floor declines on BOTH rows, identically.
+    assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=256))
+    assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=256))
+
+
+# --- KV split on Rubin -------------------------------------------------------
+
+
+def test_sm107_split_is_wired_only_for_per_tensor_fp8_d128():
+    """config_sm107 permits the split for the ONE Rubin kernel that wires
+    make_split_helpers, and refuses it for every other flavor.
+
+    A blanket refusal contradicted the engine row, which advertises
+    ``split_d_shapes={(128, 128)}`` on the Rubin FP8 row: a long-KV Rubin graph
+    could be handed an automatically proposed split plan and then fail at
+    compile. The gate follows the ROW, not merely whether a body wires
+    SplitHelpers -- d192xd128 FP8 does, but is neither advertised nor carries an
+    o_partial_f32 slot, so it must still decline."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg
+
+    def tp(**kw):
+        return cfg.TemplateParams(split_kv=4, **kw)
+
+    # The wired cell builds.
+    cfg.make_cfg_d128(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
+
+    # Every other Rubin cell still refuses -- same entry point for the half
+    # d128 and d192 kernels, so the gate cannot key on the flavor string alone.
+    unwired = [
+        ("d128 half", cfg.make_cfg_d128, dict(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT)),
+        ("d128 mxfp8", cfg.make_cfg_d128_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+        ("d192", cfg.make_cfg_d192, dict(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT)),
+        ("d256", cfg.make_cfg_d256, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+        ("d512", cfg.make_cfg_d512, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+    ]
+    for name, make, params in unwired:
+        with pytest.raises(ValueError, match="split_kv > 1 is not wired"):
+            make(tp(**params))
+        assert make(cfg.TemplateParams(**params)) is not None, f"{name}: unsplit must still build"
+
+
+def test_sm107_split_matches_unsplit_on_rubin():
+    """End-to-end split numerics on cc10.7 silicon.
+
+    The one executing test in this otherwise device-independent module: the
+    SM107 kernel's split path -- and the fp32 partial store it now takes
+    unconditionally -- has no other hardware coverage, since the split-KV suite
+    is marked pre-Rubin."""
+    import math
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("cc10.7 (Rubin) part required")
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h_q, s_q, s_kv, d, dev = 1, 8, 512, 8192, 128, "cuda"
+    torch.manual_seed(0)
+
+    def run(split):
+        def mk(*sh):
+            return (torch.randn(*sh, device=dev) * 0.5).to(torch.float8_e4m3fn)
+
+        torch.manual_seed(0)
+        q, k, v = mk(b, h_q, s_q, d), mk(b, 1, s_kv, d), mk(b, 1, s_kv, d)
+        o = torch.zeros(b, h_q, s_q, d, device=dev, dtype=torch.float16)
+        one = torch.ones(1, dtype=torch.float32, device=dev)
+        api = SdpaFwdDslSm100(
+            sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=torch.float16, split_kv=split, pertensor_fp8=True, scale_softmax=1.0 / math.sqrt(d)
+        )
+        assert api.check_support()
+        api.compile()
+        wsb = api.scratch_workspace_bytes()
+        ws = torch.empty(wsb, dtype=torch.uint8, device=dev) if wsb else None
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, workspace=ws, descale_q=one, descale_k=one, descale_v=one, scale_o=one)
+        torch.cuda.synchronize()
+        return api, o.float().clone(), (q, k, v)
+
+    _, base, _ = run(1)
+    for split in (2, 4, 8):
+        api, got, (q, k, v) = run(split)
+        assert api._fp32_partial_split(), "the Rubin split must take the fp32-partial path"
+        assert not torch.isnan(got).any(), f"split={split}: NaN"
+        qf = q.double()
+        kf, vf = (t.double().repeat_interleave(h_q, dim=1) for t in (k, v))
+        ref = torch.softmax(qf @ kf.transpose(-1, -2) / math.sqrt(d), dim=-1) @ vf
+        assert (got.double() - ref).abs().max().item() <= 5e-2, f"split={split}: off the oracle"
+        assert (got - base).abs().max().item() <= 5e-2, f"split={split}: diverges from unsplit"
+
+
+@requires_dsl
+@pytest.mark.parametrize("d_qk, d_v", [(256, 256), (192, 128), (128, 128)])
+@pytest.mark.parametrize("causal, b, s", [(True, 2, 1000), (False, 1, 1024)])
+def test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors(d_qk, d_v, causal, b, s):
+    """Rubin e2e for the FP8 (256, 256), (192, 128) and (128, 128) scheduler
+    claims: the same quantized problem under EVERY policy the row claims for
+    the flavor (LPT on all three; LPT_L2 on (192, 128) and (128, 128)) and under
+    SCHED_NATURAL.  The scheduler only reorders whole (batch, head, q-tile)
+    work items -- each tile's KV loop is unchanged -- so O must be
+    BIT-IDENTICAL across the policies (measured 0.0 on every case), and all
+    stay within the module's fp32 oracle bound.  S=1000 causal covers a KV
+    tail; dense needs S % 128 == 0."""
+    import torch
+    import cudnn as _c
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    caps = {sp.name: sp.capabilities for sp in engines.ENGINE_SPECS}[engines.engine_name(arch="sm107", fp8=True)]
+    facts = ga.SdpaGraphFacts(
+        b=b,
+        h_q=8,
+        h_kv=2,
+        s_q=s,
+        s_kv=s,
+        d_qk=d_qk,
+        d_v=d_v,
+        dtype=_c.data_type.FP8_E4M3,
+        dtype_o=_c.data_type.BFLOAT16,
+        is_fp8=True,
+        causal=causal,
+        device_cc=(10, 7),
+    )
+    policies = sorted(engines.effective_sched_policies(caps, facts))
+    assert {SCHED_NATURAL, SCHED_LPT} <= set(policies), policies
+
+    torch.manual_seed(0)
+    hq, hkv = 8, 2
+    dev = "cuda"
+    fmax = 448.0
+
+    def quant(x):
+        dsc = (x.abs().amax().clamp_min(1e-8) / fmax).item()
+        return (x / dsc).clamp(-fmax, fmax).to(torch.float8_e4m3fn), torch.full((1,), dsc, device=dev, dtype=torch.float32)
+
+    q8, dq = quant(torch.randn(b, hq, s, d_qk, device=dev) * 0.5)
+    k8, dk = quant(torch.randn(b, hkv, s, d_qk, device=dev) * 0.5)
+    v8, dv = quant(torch.randn(b, hkv, s, d_v, device=dev) * 0.5)
+    outs = {}
+    for pol in policies:
+        out = torch.full((b, hq, s, d_v), 1.5e30, device=dev, dtype=torch.bfloat16)  # sentinel: an unclaimed tile stays visible
+        api = SdpaFwdDslSm100(
+            sample_q=q8, sample_k=k8, sample_v=v8, sample_o=out, scale_softmax=d_qk**-0.5, is_causal=causal, pertensor_fp8=True, sched_policy=pol
+        )
+        assert api.check_support()
+        api.compile()
+        api.execute(q_tensor=q8, k_tensor=k8, v_tensor=v8, o_tensor=out, descale_q=dq, descale_k=dk, descale_v=dv)
+        torch.cuda.synchronize()
+        outs[pol] = out.clone()
+    rep = hq // hkv
+    qf, kf, vf = q8.float() * dq, (k8.float() * dk).repeat_interleave(rep, 1), (v8.float() * dv).repeat_interleave(rep, 1)
+    logits = qf @ kf.transpose(-1, -2) * d_qk**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    ref = torch.softmax(logits, dim=-1) @ vf
+    scale = ref.abs().max().item()
+    for pol, out in outs.items():
+        assert torch.isfinite(out).all(), f"policy {pol}: non-finite / unwritten cells"
+        err = (out.float() - ref).abs().max().item()
+        assert err <= 0.1 * scale, f"policy {pol}: max err {err} vs fp32 reference (scale {scale})"
+    for pol in policies:
+        if pol != SCHED_NATURAL:
+            assert torch.equal(
+                outs[pol], outs[SCHED_NATURAL]
+            ), f"policy {pol} must be bit-identical to NATURAL -- a different tile walk, the same per-tile math"
+
+
+@pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128)])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("half_softmax", [False, True], ids=["f32-exp", "f16x2-exp"])
+def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
+    """Rubin e2e: the PUBLISHED Stats is the fp32 log-sum-exp of the problem the
+    kernel actually saw (cuDNN's definition -- its fp8 backward recomputes
+    P = exp(S - Stats) from it), NOT the log of the fp8-QUANTIZED P sum that
+    normalizes O.  The d128 / d192x128 fp8 kernels sum P in the MMA (Sigma,
+    #580) for O; until 2026-09-15 that quantized sum also fed the LSE: max
+    1.3e-2 / rms 2.9e-3 off the exact value on test_mhas_v2
+    fp8_bwd_ragged test31 (212-SM dataset; native cuDNN: 2e-5), enough to flip
+    one fp8 dS rounding in the native backward and lose a dK row.  No P scale
+    fixes it (3 mantissa bits) -- only the fp32 register row-sum, which the
+    stats-requested specialization now carries.  Two claims:
+    (1) LSE within 1e-4 of the exact fp32 log-sum-exp (this would read >1e-3
+        on most rows with the quantized sum);
+    (2) O is BIT-IDENTICAL with and without Stats -- the row-sum only feeds the
+        LSE, Sigma normalizes O in both specializations.
+    The softmax_precision=HALF arm (f16x2 exponent, d128 only) holds the same
+    bound: its Stats denominator is a separate fp32 exponent of the same
+    arguments (summing its f16 P measured rms 3.6e-4 off the exact value --
+    the f16 exp-argument rounding and MUFU EX2.F16x2's 2^-9.9 do not average
+    out), while O keeps the f16x2 P."""
+    import torch
+    import cudnn as _c
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
+    if half_softmax and (d_qk, d_v) != (128, 128):
+        pytest.skip("the f16x2 exponent arm lives on the d128 sibling only")
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    precision = _c.data_type.HALF if half_softmax else _c.data_type.FLOAT
+
+    torch.manual_seed(0)
+    b, hq, hkv, s = 2, 8, 2, 1024
+    dev = "cuda"
+    fmax = 448.0
+
+    def quant(x):
+        dsc = (x.abs().amax().clamp_min(1e-8) / fmax).item()
+        return (x / dsc).clamp(-fmax, fmax).to(torch.float8_e4m3fn), torch.full((1,), dsc, device=dev, dtype=torch.float32)
+
+    q8, dq = quant(torch.randn(b, hq, s, d_qk, device=dev) * 0.5)
+    k8, dk = quant(torch.randn(b, hkv, s, d_qk, device=dev) * 0.5)
+    v8, dv = quant(torch.randn(b, hkv, s, d_v, device=dev) * 0.5)
+    outs = {}
+    lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
+    for with_stats in (True, False):
+        out = torch.full((b, hq, s, d_v), 1.5e30, device=dev, dtype=torch.bfloat16)
+        api = SdpaFwdDslSm100(
+            sample_q=q8,
+            sample_k=k8,
+            sample_v=v8,
+            sample_o=out,
+            sample_lse=lse if with_stats else None,
+            scale_softmax=d_qk**-0.5,
+            is_causal=causal,
+            pertensor_fp8=True,
+            softmax_precision=precision,
+        )
+        assert api.check_support()
+        api.compile()
+        api.execute(q_tensor=q8, k_tensor=k8, v_tensor=v8, o_tensor=out, lse_tensor=lse if with_stats else None, descale_q=dq, descale_k=dk, descale_v=dv)
+        torch.cuda.synchronize()
+        outs[with_stats] = out.clone()
+    assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested (Sigma normalizes O in both specializations)"
+    # The exact LSE of the problem the kernel saw: dequantized fp8 Q/K, fp32 logits.
+    rep = hq // hkv
+    logits = (q8.float() * dq) @ (k8.float() * dk).repeat_interleave(rep, 1).transpose(-1, -2) * d_qk**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    lse_ref = torch.logsumexp(logits.double(), dim=-1).float()
+    assert torch.isfinite(lse).all(), "unwritten LSE rows"
+    err = (lse - lse_ref).abs()
+    assert (
+        err.max().item() <= 1e-4
+    ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (quantized-sum LSE reads ~1e-3..1e-2)"

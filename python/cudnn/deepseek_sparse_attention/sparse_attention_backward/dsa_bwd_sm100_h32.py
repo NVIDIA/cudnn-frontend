@@ -398,6 +398,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         sdS_store: cute.Tensor,
         sdQ: cute.Tensor,
         sdQ4: cute.Tensor,
+        sValid: cute.Tensor,
         scale_softmax: Float32,
         tile_count: Int32,
         pipelines,
@@ -472,8 +473,12 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     (softmax_scale_log2_e, softmax_scale_log2_e),
                     lse,
                 )
+                valid_bits = self._load_topk_valid_word(sValid, cute.get(tTR_cS[i], mode=[0]))
+                row_is_valid = self._topk_row_is_valid(valid_bits, cute.get(tTR_cS[i], mode=[0]))
                 tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                 tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
+                tTR_rS[i] = self._select_valid_probability(tTR_rS[i], row_is_valid)
+                tTR_rS[i + 1] = self._select_valid_probability(tTR_rS[i + 1], row_is_valid)
             tTR_rS_f16 = self.quantize(tTR_rS, 2)
 
             cute.copy(tiled_t2r_dP, tTR_tdP, tTR_rdP)
@@ -785,19 +790,23 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     local_row_idx = cute.get(tTR_cdKV[coord_base], mode=[1])
                     global_row_idx = row_base + local_row_idx
                     if full_tiles:
-                        rTopkIdx[i] = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                        topk_idx = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                        rTopkIdx[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                     else:
                         if global_row_idx < topk:
-                            rTopkIdx[i] = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                            topk_idx = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                            rTopkIdx[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                         else:
                             rTopkIdx[i] = Int32(-1)
                     local_row_idx_64 = cute.get(tTR_cdKV_64[coord_base], mode=[1])
                     global_row_idx_64 = row_base + local_row_idx_64
                     if full_tiles:
-                        rTopkIdx_64[i] = mTopkIdxs[global_row_idx_64, (token_idx, batch_idx)]
+                        topk_idx = mTopkIdxs[global_row_idx_64, (token_idx, batch_idx)]
+                        rTopkIdx_64[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                     else:
                         if global_row_idx_64 < topk:
-                            rTopkIdx_64[i] = mTopkIdxs[global_row_idx_64, (token_idx, batch_idx)]
+                            topk_idx = mTopkIdxs[global_row_idx_64, (token_idx, batch_idx)]
+                            rTopkIdx_64[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                         else:
                             rTopkIdx_64[i] = Int32(-1)
 

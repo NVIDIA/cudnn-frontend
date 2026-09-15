@@ -80,9 +80,9 @@ class TemplateParams:
     has_sink: bool = False
     seq_kv_lens_present: bool = False
     # Dense padded-Q trim: per-batch seq_len_q is a SEPARATE (B,)-int32
-    # kernel parameter (seq_q_lens_tensor — mirrors cuDNN's distinct SEQLEN_Q
-    # pointer / FA's seqused_q; compiled into the signature only under this
-    # flag); q rows >= seq_len_q[b] write O := 0 / LSE := -inf (cuDNN >= 9.14
+    # kernel parameter (seq_q_lens_addr — mirrors cuDNN's distinct SEQLEN_Q
+    # pointer / FA's seqused_q; its reads compile out unless this flag is
+    # set); q rows >= seq_len_q[b] write O := 0 / LSE := -inf (cuDNN >= 9.14
     # convention). Dense-only — THD carries per-sequence Q lengths via
     # cu_seqlens instead.
     seq_q_lens_present: bool = False
@@ -104,8 +104,13 @@ class TemplateParams:
     qh_per_kh: int = 1
     # KV split: each Q tile's KV loop range is cut into ``split_kv`` contiguous
     # chunks, each run as its own persistent tile writing a partial (O, LSE)
-    # that kernels/split_combine_sm100.py reduces.  1 = off (byte-identical
+    # that kernels/sm100/split_combine.py reduces.  1 = off (byte-identical
     # codegen to the single-pass kernel).
+    #
+    # A split writes its partials as fp32, straight from the epilogue's
+    # accumulator registers and bypassing the SMEM O tile and its TMA store, so
+    # the combine reduces an unrounded input and performs the only rounding to
+    # O's dtype.  Partial-only: the caller-visible O is unchanged.
     split_kv: int = 1
     # MMA cluster width: 2 = cga2 collective tcgen05.mma.cta_group::2 (a CTA
     # pair share one MMA, each holding half of every K/V tile); 1 = cga1, one
@@ -121,13 +126,26 @@ class TemplateParams:
     # lacks it and uses the manual load + software reduction. Auto-set from the device
     # capability at compile time (MXFP8 only; the f16/fp8 kernels do not read it).
     fused_ldtm_stat: bool = False
-    # softmax_precision knob = cudnn.data_type.HALF: exponent + P-cast run as
+    # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
     # scalar f32 ex2. Per-tensor FP8 on the SM107 sibling kernel only — the
     # exp arguments are bounded (<= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE),
     # so f16 range is exact where it matters and P quantizes to FP8 either way.
     softmax_f16: bool = False
+    # Paged KV cache (FlashInfer / vLLM decode contract): K/V are page pools
+    # indexed through a per-batch ``block_table`` [B, max_pages] int32, and
+    # the per-batch KV length is the (B,) ``seq_kv_lens`` device tensor
+    # (``seq_kv_lens_present`` is therefore mandatory). ``page_size`` tokens
+    # per page. The in-page layout (HND ``[num_pages, H_kv, page_size, D]`` vs
+    # NHD ``[num_pages, page_size, H_kv, D]``) is NOT a parameter: it is the
+    # pool's strides, which the per-shape compile() already pins. Dense-only.
+    paged_kv: bool = False
+    page_size: int = 0
 
+
+# Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
+# other flavor must reject it rather than silently reading K/V as dense.
+_PAGED_KV_FLAVORS = frozenset({"d128", "d256"})
 
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
 # a flavor only honours them once its make_cfg_* threads them into a Cfg AND its
@@ -206,6 +224,23 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.pack_gqa:
         if k.thd_varlen:
             raise ValueError(f"{flavor}: pack_gqa is not supported for THD-varlen")
+    if k.paged_kv:
+        if flavor not in _PAGED_KV_FLAVORS:
+            raise ValueError(f"{flavor}: paged_kv is not implemented on this flavor; supported: {sorted(_PAGED_KV_FLAVORS)}")
+        if not k.seq_kv_lens_present:
+            raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
+        if fp8:
+            raise ValueError(f"{flavor}: paged_kv is wired for the f16/bf16 kernel only")
+        # A K/V tile is loaded as a stack of page-sized row boxes (or one box
+        # inside a page when the page is taller than the tile). Either way a
+        # box must never straddle a page, and the 128 B swizzle atom is 8 rows.
+        p = k.page_size
+        if p < 8 or p % 8 != 0:
+            raise ValueError(f"{flavor}: page_size must be a positive multiple of 8; got {p}")
+        if (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
+            raise ValueError(f"{flavor}: page_size must divide the 128-row KV tile or be a multiple of it; got {p}")
+    elif k.page_size:
+        raise ValueError(f"{flavor}: page_size requires paged_kv=True")
 
 
 def _mask_flags_from(params: TemplateParams) -> int:
@@ -403,6 +438,10 @@ class CfgD256:
 
     QH_PER_KH: int = 1
 
+    # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
+
 
 def _validate_cfg_d256(cfg: CfgD256) -> None:
     """Consistency checks on the (mostly hardcoded) d256 geometry."""
@@ -460,6 +499,21 @@ def canonicalize_d256_lowering(params: TemplateParams, *, s_q: int, s_kv: int) -
     """Apply strictly equivalent D256 lowering canonicalizations."""
 
     return replace(params, bottom_right=False) if d256_square_br_as_tl(params, s_q=s_q, s_kv=s_kv) else params
+
+
+def canonicalize_d512_mxfp8_lowering(params: TemplateParams, *, s_q: int, s_kv: int) -> TemplateParams:
+    """Canonicalize an exactly square D512 MXFP8 causal diagonal."""
+
+    square_bottom_right = (
+        not params.thd_varlen
+        and not params.seq_q_lens_present
+        and not params.seq_kv_lens_present
+        and params.window_left is None
+        and params.window_right == 0
+        and params.bottom_right
+        and s_q == s_kv
+    )
+    return replace(params, bottom_right=False) if square_bottom_right else params
 
 
 def derive_d256_internal_params(
@@ -591,6 +645,8 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d256(cfg)
     if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
@@ -795,6 +851,22 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
     return cfg, _tma_iters(cfg)
 
 
+def make_cfg_d512_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
+    """Build the SM100 D512 block-scale CTA1 configuration."""
+
+    cfg, _ = _make_cfg_d256(params, mxfp8=True)
+    # A 512-column MXFP8 accumulator leaves no TMEM columns for block scales.
+    # Keep the proven CTA1 M128 pipeline and emit two 256-column O slices.
+    cfg = replace(cfg, TILE_K=512, STAGES_KV=1)
+    if cfg.CTA_MMA != 1 or cfg.CGA_M != 1:
+        raise ValueError("d512 MXFP8 requires one-CTA M128 MMA")
+    if cfg.TILE_M != 128 or cfg.TILE_N != 128 or cfg.TILE_K != 512 or cfg.TILE_O != 256:
+        raise ValueError("d512 MXFP8 requires M128xN128, K512, and a 256-column output slice")
+    if cfg.PACK_GQA:
+        raise ValueError("d512 MXFP8 does not support PackGQA")
+    return cfg, _tma_iters(cfg)
+
+
 # ---------------------------------------------------------------------------
 # d128 flavor — d_qk = d_v = 128, SM100 (Blackwell), cga2 (Llama-class models)
 # ---------------------------------------------------------------------------
@@ -893,6 +965,10 @@ class CfgD128:
     PACK_GQA: int = 0
 
     QH_PER_KH: int = 1
+
+    # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
 
 
 # Blackwell SM100 per-CTA dynamic SMEM cap (228 KiB physical, 227 KiB usable).
@@ -1011,6 +1087,8 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d128(cfg)
     if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:

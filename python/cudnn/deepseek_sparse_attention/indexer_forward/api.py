@@ -346,7 +346,12 @@ def indexer_forward_top_k_wrapper(
     ``(total_q, top_k)``. Caller-owned candidate and output buffers may be
     supplied to avoid per-call allocation. Indices are global KV ids by
     default; set ``topk_indices_global=False`` for local ids matching
-    ``indexer_top_k_wrapper``, and use the same convention downstream.
+    ``indexer_top_k_wrapper``, and use the same convention downstream. Local
+    ids also avoid conversion temporaries when a fully preallocated CUDA-graph
+    path must have zero extra allocations; the default global conversion is
+    capture-safe but uses the graph's private pool. Leave ``microbatch_rows``
+    at ``-1`` for the compatible BSHD long-sequence auto policy, or pass ``0``
+    to force a single launch.
     Set ``deterministic=True`` to resolve exact-value ties at the K-th boundary
     toward the smallest local KV indices. This makes the selected set
     reproducible, although output slot order remains unspecified.

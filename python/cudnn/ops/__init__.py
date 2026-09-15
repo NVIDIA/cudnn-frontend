@@ -32,7 +32,9 @@ def __getattr__(name: str) -> Any:
     try:
         value = getattr(importlib.import_module(module_name, __name__), attr_name)
     except ImportError as error:
-        raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {error}") from error
+        from cudnn import _optional_dependency_message
+
+        raise ImportError(_optional_dependency_message(name, error)) from error
 
     globals()[name] = value
     return value

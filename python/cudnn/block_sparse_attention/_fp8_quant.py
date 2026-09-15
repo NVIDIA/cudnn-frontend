@@ -407,8 +407,6 @@ def _quantize_sage_bhsd(
     if seqlen_k < 1:
         raise ValueError("Sage FP8 quantization requires positive batch, head, and sequence counts")
     is_sm120 = torch.cuda.get_device_capability(q_bhsd.device)[0] == 12
-    if not is_sm120 and (batch_size != 1 or num_heads not in (4, 8)):
-        raise ValueError("Sage FP8 v1 requires B=1, H in {4, 8}, and D=128")
     if not is_sm120 and (seqlen_q % 64 or seqlen_k % 64):
         raise ValueError("Q and K/V sequence lengths must be multiples of 64")
 

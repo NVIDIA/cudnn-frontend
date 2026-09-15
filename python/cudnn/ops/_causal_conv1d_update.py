@@ -163,6 +163,14 @@ def _validated_native_update(
     _validate_semantic_contract(x, conv_state, weight, bias, cache_seqlens, conv_state_indices)
     _require_native_subset(x, conv_state, weight, cache_seqlens)
 
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    # The kernel module imports cutlass.experimental (DSL >= 4.7); decline by
+    # version here instead of surfacing a ModuleNotFoundError from inside it.
+    too_old = cutedsl_requirement_error("causal_conv1d_update")
+    if too_old is not None:
+        raise NotImplementedError(too_old)
+
     from cudnn.causal_conv1d_update_sm100 import _causal_conv1d_update
 
     return _causal_conv1d_update(
