@@ -1100,14 +1100,23 @@ def _sm80_thd_backward(
     dot = torch.empty(1, h_q, t_q, dtype=torch.float32, device=dev)
     dummy_i32 = torch.zeros(1, dtype=torch.int32, device=dev)
     dummy_f32 = torch.zeros(1, dtype=torch.float32, device=dev)
-    c.do_dot(_fd_tvm(o), _fd_tvm(do), _fd_tvm(dot), _int32(h_q * t_q), stream)
+    # The wrapper's operands are fully packed: every port's token origin IS its
+    # side's cu (issue #737; the graph path derives them from the bound ragged
+    # offsets instead).  Per-sequence rows are walked over an envelope, so the
+    # Q side uses the max_s_q hint when given (any upper bound) and the packed
+    # total otherwise.
+    from cudnn.sdpa.bwd.kernels.thd_helpers import SM80_BWD_ORG_KV_SIDE
+
+    org = torch.stack([(cu_k_t if kv_side else cu_q_t)[:n_seq] for kv_side in SM80_BWD_ORG_KV_SIDE]).contiguous()
+    s_q_env = min(int(max_s_q), t_q) if max_s_q is not None else t_q
+    c.do_dot(_fd_tvm(o), _fd_tvm(do), _fd_tvm(dot), _fd_tvm(cu_q_t), _fd_tvm(org), _int32(s_q_env), _int32(n_seq * s_q_env * h_q), stream)
     dsink = None
     if sinks is not None:
         # Natural-log logits (the kernel applies log2e itself); one warp per
         # (sequence, head) row over that sequence's tokens; zero-init target.
         sinks_b = sinks.to(dtype=torch.float32, device=dev).reshape(h_q).contiguous()
         dsink = torch.zeros(h_q, dtype=torch.float32, device=dev)
-        c.dsink(_fd_tvm(lse_t), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink), _fd_tvm(cu_q_t), _int32(n_seq * h_q), stream)
+        c.dsink(_fd_tvm(lse_t), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink), _fd_tvm(cu_q_t), _fd_tvm(org), _int32(n_seq * h_q), stream)
     # Deterministic relay counter: one int32 per (sequence, head, q-tile),
     # sized from the max_s_q hint (any upper bound) or, without one, from the
     # packed total — host shape metadata, so no D2H read.  Fresh zeros every
@@ -1144,6 +1153,7 @@ def _sm80_thd_backward(
         cu_k=cu_k_t,
         seq_q=dummy_i32,
         dq_sem=dq_sem,
+        org=org,
         n_q_tiles=(t_q + params.tile_q - 1) // params.tile_q,
         scale_log2=float(scale_softmax) * _BWD_LOG2E,
         attn_scale=float(scale_softmax),
@@ -1155,14 +1165,14 @@ def _sm80_thd_backward(
         grid_batch=n_seq,
         stream=stream,
     )
-    # THD cast / fold ABI: bounded by cu_*[n_seq] on device, at the envelope
-    # width here (the wrapper slices the head-dim padding below).
-    c.cast(_fd_tvm(dq_acc), _fd_tvm(dQ_k), _fd_tvm(cu_q_t), _int32(n_seq), _int32((t_q * h_q * fdqk) // 2), stream)
+    # THD cast / fold ABI: per (sequence, row) below the sequence's length, at
+    # the envelope width here (the wrapper slices the head-dim padding below).
+    c.cast(_fd_tvm(dq_acc), _fd_tvm(dQ_k), _fd_tvm(cu_q_t), _fd_tvm(org), _int32(s_q_env), _int32((n_seq * s_q_env * h_q * fdqk) // 2), stream)
     if h_q != h_kv:
         dK_k = torch.zeros(1, t_kv, h_kv, fdqk, dtype=q.dtype, device=dev)
         dV_k = torch.zeros(1, t_kv, h_kv, fdv, dtype=q.dtype, device=dev)
-        c.reduce_k(_fd_tvm(dk_ws), _fd_tvm(dK_k), _fd_tvm(cu_k_t), _int32(n_seq), _int32(t_kv * h_kv * fdqk), stream)
-        c.reduce_v(_fd_tvm(dv_ws), _fd_tvm(dV_k), _fd_tvm(cu_k_t), _int32(n_seq), _int32(t_kv * h_kv * fdv), stream)
+        c.reduce_k(_fd_tvm(dk_ws), _fd_tvm(dK_k), _fd_tvm(cu_k_t), _fd_tvm(org), _int32(max_s_kv), _int32(n_seq * max_s_kv * h_kv * fdqk), stream)
+        c.reduce_v(_fd_tvm(dv_ws), _fd_tvm(dV_k), _fd_tvm(cu_k_t), _fd_tvm(org), _int32(max_s_kv), _int32(n_seq * max_s_kv * h_kv * fdv), stream)
     else:
         dK_k, dV_k = dk_ws, dv_ws
     if pad_qk:
@@ -1236,6 +1246,7 @@ def _sm80_bwd_call(
     cu_k,
     seq_q,
     dq_sem,
+    org,
     n_q_tiles,
     scale_log2,
     attn_scale,
@@ -1248,7 +1259,8 @@ def _sm80_bwd_call(
     stream,
 ):
     """Invoke one compiled main-bprop artifact (the traced ``_bprop_host``
-    ABI: 17 tensors, then 9 runtime scalars and the launch stream)."""
+    ABI: 18 tensors -- the last the THD per-port origins ``ORG``, a dummy on
+    the dense path -- then 9 runtime scalars and the launch stream)."""
     import cutlass
     from cutlass.cute.runtime import from_dlpack as _fd
 
@@ -1275,6 +1287,7 @@ def _sm80_bwd_call(
         fd(cu_k),
         fd(seq_q),
         fd(dq_sem),
+        fd(org),
         cutlass.Int32(n_q_tiles),
         cutlass.Float32(scale_log2),
         cutlass.Float32(attn_scale),
@@ -1334,12 +1347,23 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         max_total_seq_len_kv: Optional[int] = None,
         thd_stats_token_major: bool = False,
         thd_stats_head_stride: Optional[int] = None,
+        thd_ragged_offsets: Optional[dict] = None,
         **kwargs,
     ) -> None:
         # SM80-only plan-time facts (scratch sizing + template identity); the
         # base contract carries everything else.  The THD keywords are base
         # parameters, spelled out here because the lowering forwards a keyword
         # only when it appears in THIS signature (a bare **kwargs hides them).
+        #
+        # ``thd_ragged_offsets`` (issue #737): the ports that bind a ragged
+        # offset in the graph, ``{role: (offset dtype, multiplier)}`` with role
+        # in thd_helpers.SM80_BWD_ORG_PORTS -- plan-time; the offset VALUES
+        # arrive at execute.  Each such port's per-sequence token origin is
+        # derived on device from its own offsets (``ro[b] * multiplier /
+        # token_stride``), so a padded layout with gaps between sequences is
+        # addressed where the caller put it; a port without an offset takes the
+        # packed origin ``prefix(lengths)``.
+        self._thd_ro_spec: dict = dict(thd_ragged_offsets or {})
         self._has_bias = bool(has_bias)
         self._bias_is_fp32 = bool(bias_is_fp32)
         self._bias_batch = int(bias_batch)
@@ -1372,6 +1396,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._thd_lse_head_stride: int = 0
         self._thd_token_strides: dict = {}  # port role -> the caller's packed token stride (plan-time)
         self._thd_meta_fn = None
+        self._thd_has_ro: int = 0  # bitmask over SM80_BWD_ORG_PORTS: the port binds a ragged offset
+        self._thd_meta_view: Optional[torch.Tensor] = None  # the last execute's metadata (a view into the caller's workspace; tests read the dead flag)
 
     @staticmethod
     def _thd_total(capacity: int, declared: Optional[int]) -> int:
@@ -1561,13 +1587,35 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             self._thd_lse_head_stride = 0 if self._thd_lse_token_major else int(self.thd_stats_head_stride or 0)
             # A head stride shorter than the bound extent puts the later heads'
             # rows past the buffer (the kernel reads [0, h, row] at that stride
-            # for every row < t_q_cap).
+            # for every row < t_q_cap) -- when the Stats rows are placed by
+            # prefix(lengths).  With the Stats port's own ragged offsets the
+            # rows it reaches are the caller's (issue #737), bounded by the
+            # offsets' contract, not by this capacity.
             self._value_error_if(
-                bool(self._thd_lse_head_stride) and self._thd_lse_head_stride < self._t_q_cap,
+                bool(self._thd_lse_head_stride) and "stats" not in self._thd_ro_spec and self._thd_lse_head_stride < self._t_q_cap,
                 f"SM80 bwd THD: Stats head stride {self._thd_lse_head_stride} must cover the packed token capacity {self._t_q_cap}",
             )
             # The envelope Stats desc describes the packing, not a dense layout.
             self._lse_stride = None
+            # Ragged offsets (issue #737): every named port must be one the
+            # origins block has a row for, with a positive integer multiplier
+            # and an int32 / int64 offset tensor.  The token stride the offsets
+            # are divided by is the port's declared one (Stats: H for the
+            # token-major packing, 1 for head-major).  Whole-token offsets are
+            # the contract; a violation is caught on device (a dead sequence),
+            # not here, because the values are device data.
+            from cudnn.sdpa.bwd.kernels.thd_helpers import SM80_BWD_ORG_PORTS
+
+            for role, spec in self._thd_ro_spec.items():
+                self._value_error_if(role not in SM80_BWD_ORG_PORTS, f"SM80 bwd THD: unknown ragged-offset port {role!r}; expected one of {SM80_BWD_ORG_PORTS}")
+                ro_dtype, mult = spec
+                self._value_error_if(ro_dtype not in (torch.int32, torch.int64), f"SM80 bwd THD: {role} ragged offsets must be int32 or int64; got {ro_dtype}")
+                self._value_error_if(
+                    not isinstance(mult, int) or isinstance(mult, bool) or mult <= 0,
+                    f"SM80 bwd THD: {role} ragged-offset multiplier must be a positive int; got {mult!r}",
+                )
+            self._thd_token_strides["stats"] = int(h_qo) if self._thd_lse_token_major else 1
+            self._thd_has_ro = sum(1 << SM80_BWD_ORG_PORTS.index(role) for role in self._thd_ro_spec)
 
         self._value_error_if(not torch.cuda.is_available(), "CUDA must be available for SM80 BPROP")
         # Plan-time device parity: the kernels bind the Stats pointer directly
@@ -1743,27 +1791,44 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._logger.debug("compile completed")
 
     def _compile_thd_meta(self):
-        """Plan-time JIT of the lengths -> cu_seqlens setup launch.
+        """Plan-time JIT of the setup launch: lengths -> cu_seqlens, plus the
+        per-port token origins from the bound ragged offsets (issue #737).
 
         The backward node carries per-batch ``(B,)`` lengths only (no
-        cu_seq_len port), so the fakes are ``(B,)`` int32 and the metadata is
-        the shared ``[seq_kv(B) | cu_q(B+1) | cu_k(B+1) | ...]`` layout of
-        ``tile_dsl.thd`` (``THD_META_WORDS`` words; the remap / live / ctr tail
-        is unused here).
+        cu_seq_len port), so the length fakes are ``(B,)`` int32; each port
+        that binds a ragged offset gets a ``(B + 1,)`` fake in its declared
+        dtype, the others a 1-element dummy (their origins copy ``cu``).  The
+        metadata is the shared ``tile_dsl.thd`` layout with the origins
+        extension: ``[seq_kv(B) | cu_q(B+1) | cu_k(B+1) | ... | org(9 x B) | flag]``.
+        The multipliers and token strides are plan-time constexprs.
         """
         import cutlass
         from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
-        from cudnn.frost.tile_dsl.thd import THD_META_WORDS
-        from cudnn.sdpa.bwd.kernels.thd_helpers import thd_meta_host
+        from cudnn.frost.tile_dsl.thd import THD_ORG_META_WORDS
+        from cudnn.sdpa.bwd.kernels.thd_helpers import SM80_BWD_N_ORG_PORTS, SM80_BWD_ORG_PORTS, thd_sm80_bwd_meta_host
 
         b = self.batch_size
         i32 = lambda n: make_fake_compact_tensor(cutlass.Int32, (n,), stride_order=(0,), assumed_align=4)  # noqa: E731
+        _ct = {torch.int32: cutlass.Int32, torch.int64: cutlass.Int64}
+
+        def _ro_fake(role):
+            spec = self._thd_ro_spec.get(role)
+            if spec is None:
+                return make_fake_compact_tensor(cutlass.Int64, (1,), stride_order=(0,), assumed_align=8)
+            return make_fake_compact_tensor(_ct[spec[0]], (b + 1,), stride_order=(0,), assumed_align=8)
+
+        mults = tuple(int(self._thd_ro_spec[r][1]) if r in self._thd_ro_spec else 1 for r in SM80_BWD_ORG_PORTS)
+        tss = tuple(int(self._thd_token_strides[r]) for r in SM80_BWD_ORG_PORTS)
         return cutlass.cute.compile(
-            thd_meta_host,
-            i32(THD_META_WORDS(b)),
+            thd_sm80_bwd_meta_host,
+            i32(THD_ORG_META_WORDS(b, SM80_BWD_N_ORG_PORTS)),
             i32(b),
             i32(b),
+            *(_ro_fake(r) for r in SM80_BWD_ORG_PORTS),
+            int(self._thd_has_ro),
+            mults,
+            tss,
             cutlass.Int32(0),
             cutlass.Int32(0),
             make_fake_stream(use_tvm_ffi_env_stream=False),
@@ -1830,8 +1895,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         """Packed-path scratch, sized from the token CAPACITIES (build time):
         head-dim pad staging at packed extents, then the kernel-internal
         buffers in execute's carve order, then the cu_seqlens metadata."""
-        from cudnn.frost.tile_dsl.thd import THD_META_WORDS
+        from cudnn.frost.tile_dsl.thd import THD_ORG_META_WORDS
         from cudnn.sdpa.bwd.config_sm80 import LLAMA_CFG
+        from cudnn.sdpa.bwd.kernels.thd_helpers import SM80_BWD_N_ORG_PORTS
 
         elem = 2
         b, hq, hkv = self.batch_size, self.h_q, self.h_kv
@@ -1854,7 +1920,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         total += ws_align(tkv * hq * fdqk * elem)  # dK per-query-head partials (the bounded fold writes the caller's dK)
         total += ws_align(tkv * hq * fdv * elem)  # dV per-query-head partials
         total += ws_align(hq * tq * 4)  # do_dot fp32
-        total += ws_align(THD_META_WORDS(b) * 4)  # [seq_kv | cu_q | cu_k | ...] int32
+        total += ws_align(THD_ORG_META_WORDS(b, SM80_BWD_N_ORG_PORTS) * 4)  # [seq_kv | cu_q | cu_k | ... | org(9 x B) | flag] int32
         return total
 
     # ------------------------------------------------------------------
@@ -1879,6 +1945,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         bias_tensor: Optional[torch.Tensor] = None,
         dbias_tensor: Optional[torch.Tensor] = None,
         rope_freqs: Optional[torch.Tensor] = None,
+        thd_ragged_offsets: Optional[dict] = None,
     ) -> None:
         """Run the compiled SM80 backward on the adapter's carved workspace (Rule 1:
         no per-call allocation; the dsink launch passes the dense dummy ``cu``).
@@ -1929,6 +1996,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 self._execute_thd(
                     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor,
                     seq_q_lens=seq_q_lens, seq_kv_lens=seq_kv_lens, sink_tensor=sink_tensor, dsink_tensor=dsink_tensor,
+                    thd_ragged_offsets=thd_ragged_offsets,
                     scale_val=scale_val, take=_take, device=device, launch_stream=launch_stream,
                 )  # fmt: skip
                 self._logger.debug("execute completed (THD)")
@@ -2049,11 +2117,14 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 sinks_b = sink_tensor.reshape(-1)
                 self._value_error_if(sinks_b.dtype != torch.float32 or not sinks_b.is_contiguous(), "sinks must be contiguous fp32")
             cu_dummy = self._dummy("zero_i32", device, lambda: torch.zeros(1, dtype=torch.int32, device=device))
+            # The THD per-port origins slot (issue #737): a 1x1 dummy the dense
+            # kernels never read (the fake is rank-2, so the dummy is too).
+            org_dummy = self._dummy("zero_i32_1x1", device, lambda: torch.zeros(1, 1, dtype=torch.int32, device=device))
 
             # --- launch chain: do_dot → (dSink) → main → dQ cast → (GQA reduce)
             c.do_dot(_fd_tvm(O), _fd_tvm(dO), _fd_tvm(dot), _int32(b * hq * sq), launch_stream)
             if sink_tensor is not None:
-                c.dsink(_fd_tvm(lse), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink_acc), _fd_tvm(cu_dummy), _int32(b * hq), launch_stream)
+                c.dsink(_fd_tvm(lse), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink_acc), _fd_tvm(cu_dummy), _fd_tvm(org_dummy), _int32(b * hq), launch_stream)
             _sm80_bwd_call(
                 c.main,
                 q=Q,
@@ -2073,6 +2144,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 cu_k=cu_dummy,
                 seq_q=seq_q_b,
                 dq_sem=dq_sem,
+                org=org_dummy,
                 n_q_tiles=(sq + p_.tile_q - 1) // p_.tile_q,
                 scale_log2=scale_val * _BWD_LOG2E,
                 attn_scale=scale_val,
@@ -2122,6 +2194,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         seq_kv_lens,
         sink_tensor,
         dsink_tensor,
+        thd_ragged_offsets,
         scale_val,
         take,
         device,
@@ -2130,9 +2203,15 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         """The packed chain: setup launch (lengths -> cu_seqlens on device) ->
         do_dot -> [dSink] -> main -> dQ cast -> [GQA reduce].
 
-        Sequence ``b`` starts at token ``cu_*[b] = prefix(lengths)[b]`` on
-        every port: the bound ragged-offset values are not read (the FROST THD
-        contract; padded THD with gaps between sequences is issue #737).
+        Sequence ``b``'s rows of a port that binds a ragged offset start at
+        the TOKEN origin the setup launch derives from that offset
+        (``ro[b] * multiplier / token_stride``, issue #737), so a padded layout
+        with gaps between sequences is read and written where the caller put
+        it; a port without an offset starts at ``cu_*[b] = prefix(lengths)[b]``.
+        The internal packed buffers (dQ accumulator, do_dot, dK/dV partials)
+        are always at ``prefix(lengths)``.  An offset that is not a whole
+        number of tokens makes the sequence dead on device: length 0, nothing
+        read or written, and the metadata's flag word set.
 
         Operands are the lowering's ``[1, H, T, D]`` views over the caller's
         packed buffers at the plan's token capacities, each at the token stride
@@ -2149,7 +2228,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         ``[cu_*[B], capacity)`` keeps whatever the caller left there (cuDNN's
         own contract, which the ragged sweeps assert with a NaN-filled tail).
         """
-        from cudnn.frost.tile_dsl.thd import THD_META_WORDS
+        from cudnn.frost.tile_dsl.thd import THD_ORG_META_WORDS, THD_ORG_OFF
+        from cudnn.sdpa.bwd.kernels.thd_helpers import SM80_BWD_N_ORG_PORTS, SM80_BWD_ORG_PORTS
 
         p_ = self._params
         c = self._compiled_kernel
@@ -2172,6 +2252,27 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             # launch was compiled for exactly B of them.
             self._value_error_if(t.numel() != b, f"SM80 bwd THD: {name} must hold B = {b} per-batch lengths; got {t.numel()}")
         ql, kl = seq_q_lens.view(-1), seq_kv_lens.view(-1)
+
+        # Ragged offsets: exactly the ports the plan declared, each a contiguous
+        # (B + 1,) tensor of the declared dtype on the device.  Ports without an
+        # offset bind a device dummy the setup kernel never reads.
+        ros = dict(thd_ragged_offsets or {})
+        self._value_error_if(
+            set(ros) != set(self._thd_ro_spec),
+            f"SM80 bwd THD: ragged offsets must be bound for exactly the plan's ports {sorted(self._thd_ro_spec)}; got {sorted(ros)}",
+        )
+        ro_bufs = []
+        for role in SM80_BWD_ORG_PORTS:
+            if role in ros:
+                t = ros[role]
+                want_dtype = self._thd_ro_spec[role][0]
+                self._value_error_if(
+                    t.dtype != want_dtype or t.device != device or not t.is_contiguous() or t.numel() != b + 1,
+                    f"SM80 bwd THD: {role} ragged offsets must be a contiguous ({b + 1},) {want_dtype} tensor on {device}; got {tuple(t.shape)} {t.dtype} {t.device}",
+                )
+                ro_bufs.append(t.view(-1))
+            else:
+                ro_bufs.append(self._dummy("zero_i64", device, lambda: torch.zeros(1, dtype=torch.int64, device=device)))
 
         as_bshd = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731  [1,H,T,D] -> [1,T,H,D]
         ts = self._thd_token_strides
@@ -2262,10 +2363,13 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         dk_ws = dk_view if dk_direct else take(tkv * hq * fdqk, self.dtype, shape=(1, tkv, hq, fdqk))
         dv_ws = dv_view if dv_direct else take(tkv * hq * fdv, self.dtype, shape=(1, tkv, hq, fdv))
         dot = take(hq * tq, torch.float32, shape=(1, hq, tq))
-        meta = take(THD_META_WORDS(b), torch.int32)
-        # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | ...]: the cu slices the kernels bind.
+        meta = take(THD_ORG_META_WORDS(b, SM80_BWD_N_ORG_PORTS), torch.int32)
+        # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | ... | org(9 x B) | flag]: the cu
+        # slices and the per-port origins block the kernels bind.
         cu_q = meta[b : 2 * b + 1]
         cu_k = meta[2 * b + 1 : 3 * b + 2]
+        org = meta[THD_ORG_OFF(b, 0) : THD_ORG_OFF(b, SM80_BWD_N_ORG_PORTS)].view(SM80_BWD_N_ORG_PORTS, b)
+        self._thd_meta_view = meta
         dummy_i32 = self._dummy("zero_i32", device, lambda: torch.zeros(1, dtype=torch.int32, device=device))
         dummy_f32 = self._dummy("zero_f32", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
         if sink_tensor is not None:
@@ -2275,10 +2379,13 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         # --- launch chain ---------------------------------------------------
         # lens_form 0: both sides are per-batch lengths (the only form the
         # backward node carries); the setup launch normalises them to cu.
-        self._thd_meta_fn(_fd_tvm(meta), _fd_tvm(ql), _fd_tvm(kl), _int32(0), _int32(b), launch_stream)
-        c.do_dot(_fd_tvm(O), _fd_tvm(dO), _fd_tvm(dot), _int32(hq * tq), launch_stream)
+        self._thd_meta_fn(_fd_tvm(meta), _fd_tvm(ql), _fd_tvm(kl), *(_fd_tvm(t) for t in ro_bufs), _int32(0), _int32(b), launch_stream)
+        # Per-sequence kernels walk the envelope S_max rows of every sequence
+        # (plan-time; rows past a sequence's length early-out).
+        s_q_env, s_k_env = self.s_q_max, self.s_k_max
+        c.do_dot(_fd_tvm(O), _fd_tvm(dO), _fd_tvm(dot), _fd_tvm(cu_q), _fd_tvm(org), _int32(s_q_env), _int32(b * s_q_env * hq), launch_stream)
         if sink_tensor is not None:
-            c.dsink(_fd_tvm(lse), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink_acc), _fd_tvm(cu_q), _int32(b * hq), launch_stream)
+            c.dsink(_fd_tvm(lse), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink_acc), _fd_tvm(cu_q), _fd_tvm(org), _int32(b * hq), launch_stream)
         _sm80_bwd_call(
             c.main,
             q=Q,
@@ -2298,6 +2405,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             cu_k=cu_k,
             seq_q=dummy_i32,
             dq_sem=dq_sem,
+            org=org,
             n_q_tiles=(tq + p_.tile_q - 1) // p_.tile_q,
             scale_log2=scale_val * _BWD_LOG2E,
             attn_scale=scale_val,
@@ -2315,11 +2423,11 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         # and the fold stop at cu_*[B] (read on device) and write d_qk / d_v
         # columns, so no torch copy-back touches the caller's buffers.
         dq_view = _kernel_view(as_bshd(dq_tensor), tq, hq, dqk, ts["dq"], "dQ")
-        c.cast(_fd_tvm(dq_acc), _fd_tvm(dq_view), _fd_tvm(cu_q), _int32(b), _int32((tq * hq * dqk) // 2), launch_stream)
+        c.cast(_fd_tvm(dq_acc), _fd_tvm(dq_view), _fd_tvm(cu_q), _fd_tvm(org), _int32(s_q_env), _int32((b * s_q_env * hq * dqk) // 2), launch_stream)
         if not dk_direct:
-            c.reduce_k(_fd_tvm(dk_ws), _fd_tvm(dk_view), _fd_tvm(cu_k), _int32(b), _int32(tkv * hkv * dqk), launch_stream)
+            c.reduce_k(_fd_tvm(dk_ws), _fd_tvm(dk_view), _fd_tvm(cu_k), _fd_tvm(org), _int32(s_k_env), _int32(b * s_k_env * hkv * dqk), launch_stream)
         if not dv_direct:
-            c.reduce_v(_fd_tvm(dv_ws), _fd_tvm(dv_view), _fd_tvm(cu_k), _int32(b), _int32(tkv * hkv * dv_), launch_stream)
+            c.reduce_v(_fd_tvm(dv_ws), _fd_tvm(dv_view), _fd_tvm(cu_k), _fd_tvm(org), _int32(s_k_env), _int32(b * s_k_env * hkv * dv_), launch_stream)
         if dsink_tensor is not None and dsink_acc is not None:
             dsink_tensor.view(-1).copy_(dsink_acc)
 
