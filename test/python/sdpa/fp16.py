@@ -609,6 +609,14 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
     except cudnn.cudnnGraphNotSupportedError as e:
         print(f"@@@@ Overall result: WAIVED, not supported backward graph. {e}")
         pytest.skip("not supported backward graph")
+    except RuntimeError as e:
+        # AUTO found no implementation for this attribute set on this device (e.g. cumulative sequence
+        # lengths off SM10x): nothing to test, the per-implementation surfaces are exercised elsewhere.
+        if "No suitable implementation" not in str(e):
+            print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during backward graph build. {e}")
+            pytest.fail("unexpected exception during backward graph build", pytrace=False)
+        print(f"@@@@ Overall result: WAIVED, no SDPA backward implementation supports this graph. {e}")
+        pytest.skip("no SDPA backward implementation supports this graph")
     except Exception as e:
         print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during backward graph build. {e}")
         pytest.fail("unexpected exception during backward graph build", pytrace=False)
