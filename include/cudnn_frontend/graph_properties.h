@@ -2427,6 +2427,8 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
         Dropout_scale,
         Dropout_scale_inv,
         SINK_TOKEN,
+        CU_SEQ_LEN_Q,
+        CU_SEQ_LEN_KV,
     };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { dQ, dK, dV, dBias, RNG_DUMP, DSINK_TOKEN };
@@ -2504,6 +2506,19 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     SDPA_backward_attributes&
     set_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
         inputs[SDPA_backward_attributes::input_names::SEQ_LEN_KV] = value;
+        return *this;
+    }
+
+    // Cumulative sequence lengths (b + 1 entries per side); mutually exclusive with the per-batch form.
+    SDPA_backward_attributes&
+    set_cu_seq_len_q(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_backward_attributes::input_names::CU_SEQ_LEN_Q] = std::move(value);
+        return *this;
+    }
+
+    SDPA_backward_attributes&
+    set_cu_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_backward_attributes::input_names::CU_SEQ_LEN_KV] = std::move(value);
         return *this;
     }
 
