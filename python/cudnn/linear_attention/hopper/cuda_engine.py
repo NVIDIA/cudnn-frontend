@@ -322,6 +322,16 @@ class KdaHopperCudaEngine(BaseEngine):
                     raise NotImplementedError(f"KdaHopperCudaEngine: '{label}' must be {want}, got {dtype}")
         if facts.checkpoint_every_n_tokens:
             raise NotImplementedError("KdaHopperCudaEngine: state_checkpoints are not produced by the Hopper kernel")
+        # Pool-addressed state (PR #1002). getattr, not attribute access: this
+        # engine must decline these both before that PR lands, when the facts do
+        # not exist yet, and after, when they do. Silently ignoring either would
+        # read and write the wrong rows of the caller's pool -- and since the
+        # KDA heuristics make this the default engine on sm90, it would be the
+        # one that did so.
+        if getattr(facts, "has_state_indices", False):
+            raise NotImplementedError("KdaHopperCudaEngine: state_indices (pool-addressed state) is unsupported")
+        if getattr(facts, "overwrite_initial_state", False):
+            raise NotImplementedError("KdaHopperCudaEngine: overwrite_initial_state is unsupported")
         if facts.safe_gate or facts.has_a_log or facts.has_dt_bias:
             raise NotImplementedError("KdaHopperCudaEngine: the kernel takes log-space g directly; " "safe_gate/a_log/dt_bias are unsupported")
         if facts.use_beta_sigmoid:
