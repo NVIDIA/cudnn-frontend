@@ -34,6 +34,7 @@ from cudnn.frost import buffers
 from cudnn.graph_types import NodeType
 
 from ..graph_analyzer import analyze
+from .layout import declared_layout_reason
 
 if TYPE_CHECKING:
     from cudnn._pygraph import pygraph
@@ -182,6 +183,15 @@ class KdaHopperEngine(BaseEngine):
         # Hopper path at all.
         if facts.is_bwd:
             raise NotImplementedError("KdaHopperEngine: forward only; there is no Hopper KDA backward kernel yet")
+        # The kernel builds its state slabs at a fixed stride=(128, 1) and
+        # indexes q/k/v/o as packed THD, so a padded operand is read as if it
+        # were packed. Declining here routes such a graph to an engine that
+        # honours strides. (The kernel this replaced tolerated some of these;
+        # the campaign's faster one does not, so the gate travels with it.)
+        (node,) = graph.nodes
+        reason = declared_layout_reason(node, "KdaHopperEngine")
+        if reason is not None:
+            raise NotImplementedError(reason)
         if facts.checkpoint_every_n_tokens:
             raise NotImplementedError("KdaHopperEngine: state_checkpoints are not produced by the Hopper kernel")
         if facts.safe_gate or facts.has_a_log or facts.has_dt_bias:

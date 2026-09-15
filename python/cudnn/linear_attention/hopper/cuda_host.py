@@ -70,7 +70,7 @@ def _library(device: int) -> "compiler.KernelLibrary":
     with _LOCK:
         lib = _LIBRARIES.get(key)
         if lib is None:
-            lib = compiler.KernelLibrary(KERNEL_DIR / KERNEL_BODY, _arch_for_device(device), int(device))
+            lib = compiler.KernelLibrary(KERNEL_DIR / KERNEL_BODY, _arch_for_device(device), int(device), _SMEM_DEFINE)
             _LIBRARIES[key] = lib
         return lib
 

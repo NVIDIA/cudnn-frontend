@@ -47,6 +47,7 @@ KERNEL_BODY = "kda_bwd_sm90.cu"
 # naming the constant rather than a wrong grid or an undersized allocation.
 BT = 64  # chunk length
 DH = 128  # head dim (K == V == 128)
+PNT = 512  # k_prep threads
 BNT = 512  # k_bwd threads
 SMEM_PREP = 220160
 SMEM_SCAN = 198144
@@ -83,6 +84,7 @@ _DEFINES = (
     "-DKDA_BWD_CHECK_CONSTANTS",
     f"-DKDA_BWD_BT={BT}",
     f"-DKDA_BWD_DH={DH}",
+    f"-DKDA_BWD_PNT={PNT}",
     f"-DKDA_BWD_BNT={BNT}",
     f"-DKDA_BWD_SMEM_PREP={SMEM_PREP}",
     f"-DKDA_BWD_SMEM_SCAN={SMEM_SCAN}",
@@ -377,7 +379,7 @@ def launch(
         compiler.launch(
             lib.function(f"k_prep<{'true' if full else 'false'}>"),
             grid=(ncs, H, 1),
-            block=(512, 1, 1),
+            block=(PNT, 1, 1),
             dynamic_smem=SMEM_PREP,
             stream=stream,
             params=prep,

@@ -89,10 +89,75 @@ def test_is_the_default_on_hopper():
 
 @requires_hopper
 def test_plan_name_still_overrides():
-    """Ranking is a default, not a lock: naming another engine still runs it."""
+    """Ranking is a default, not a lock: naming another engine still runs it.
+
+    Asserted positively -- that cuTile's own kernels ran -- because merely not
+    seeing ``kda_fused`` would also pass if the call had fallen through to some
+    unrelated engine.
+    """
     q, k, v, g, beta, cu, s0 = make_case()
     kernels = launched_kernels(lambda: kimi_delta_attention(q, k, v, g, beta, cu, initial_state=s0, output_final_state=True, plan_name="kda_cutile"))
+    assert any("chunk_" in name for name in kernels), f"expected cuTile chunk_* kernels, got {kernels[:3]}"
     assert not any("kda_fused" in name for name in kernels), f"plan_name ignored, got {kernels[:3]}"
+
+
+@requires_hopper
+def test_strided_inputs_are_not_misread():
+    """A padded q slice and a padded initial_state must not change the answer.
+
+    The kernels take addresses and never see a stride, so before the layout
+    guard an ordinary fused-projection slice was read as if it were packed:
+    reviewer-measured relative errors of 7.0 on o and 15.5/10.4 on o/state.
+    """
+    # Two sequences, so the padded state axis has extent > 1 -- a padded axis of
+    # size 1 is still "contiguous" to torch and would not exercise anything.
+    q, k, v, g, beta, cu, s0 = make_case(T=512, H=4, N=2)
+
+    # q as a slice of a wider fused-projection buffer: innermost contiguous,
+    # outer stride padded.
+    wide_q = torch.empty(q.shape[0], q.shape[1] * 2, q.shape[2], dtype=q.dtype, device=q.device)
+    wide_q[:, : q.shape[1]] = q
+    strided_q = wide_q[:, : q.shape[1]]
+    assert not strided_q.is_contiguous()
+
+    wide_s = torch.empty(s0.shape[0], s0.shape[1] * 2, s0.shape[2], s0.shape[3], dtype=s0.dtype, device=s0.device)
+    wide_s[:, : s0.shape[1]] = s0
+    strided_s = wide_s[:, : s0.shape[1]]
+    assert not strided_s.is_contiguous()
+
+    ref_o, ref_fs = kimi_delta_attention(q, k, v, g, beta, cu, initial_state=s0, output_final_state=True, plan_name=ENGINE)[:2]
+    got_o, got_fs = kimi_delta_attention(strided_q, k, v, g, beta, cu, initial_state=strided_s, output_final_state=True, plan_name=ENGINE)[:2]
+    torch.cuda.synchronize()
+    torch.testing.assert_close(got_o.float(), ref_o.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(got_fs, ref_fs, atol=2e-2, rtol=2e-2)
+
+
+@requires_hopper
+def test_absent_initial_state_is_zeroed_on_the_execution_stream():
+    """Omitting initial_state must equal passing an explicit zero state.
+
+    The seed buffer is cached but re-zeroed on the execution stream every call.
+    Filling it with torch.zeros on the ambient stream left no dependency on the
+    stream the kernel runs on, so a fresh plan could read whatever the
+    allocation held. Running on a side stream after dirtying the allocator is
+    what makes that visible.
+    """
+    q, k, v, g, beta, cu, s0 = make_case(T=512, H=4)
+    zeros = torch.zeros_like(s0)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        # Dirty the allocator so a recycled block is full of non-zeros.
+        junk = torch.full_like(s0, 3.5)
+        del junk
+        seeded_o, seeded_fs = kimi_delta_attention(q, k, v, g, beta, cu, initial_state=zeros, output_final_state=True, plan_name=ENGINE)[:2]
+        bare_o, bare_fs = kimi_delta_attention(q, k, v, g, beta, cu, output_final_state=True, plan_name=ENGINE)[:2]
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(bare_o.float(), seeded_o.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(bare_fs, seeded_fs, atol=2e-2, rtol=2e-2)
 
 
 @requires_hopper

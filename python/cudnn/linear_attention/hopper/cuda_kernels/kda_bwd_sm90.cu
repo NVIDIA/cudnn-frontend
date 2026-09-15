@@ -2094,6 +2094,7 @@ k_meta(const int* __restrict__ cu,
 #ifdef KDA_BWD_CHECK_CONSTANTS
 static_assert(BT == KDA_BWD_BT, "cuda_bwd_host.BT disagrees with the kernel");
 static_assert(DH == KDA_BWD_DH, "cuda_bwd_host.DH disagrees with the kernel");
+static_assert(PNT == KDA_BWD_PNT, "cuda_bwd_host.PNT disagrees with the kernel");
 static_assert(BNT == KDA_BWD_BNT, "cuda_bwd_host.BNT disagrees with the kernel");
 static_assert(SMEM_PREP == KDA_BWD_SMEM_PREP, "cuda_bwd_host.SMEM_PREP disagrees with the kernel");
 static_assert(SMEM_SCAN == KDA_BWD_SMEM_SCAN, "cuda_bwd_host.SMEM_SCAN disagrees with the kernel");
