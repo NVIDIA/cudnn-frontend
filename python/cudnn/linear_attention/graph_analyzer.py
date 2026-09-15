@@ -184,6 +184,13 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "state_indices selects rows of the initial_state pool, so it requires initial_state"
     elif "state_indices" in ins and is_bwd:
         invalid = "state_indices is a forward-only pool addressing mode"
+    elif (
+        "state_indices" in ins
+        and ins["state_indices"].dim
+        and ins["cu_seqlens"].dim
+        and (len(ins["state_indices"].dim) != 1 or int(ins["state_indices"].dim[0]) != int(ins["cu_seqlens"].dim[0]) - 1)
+    ):
+        invalid = f"state_indices must be [num_seqs] = [{int(ins['cu_seqlens'].dim[0]) - 1}], one pool slot per sequence; got {list(ins['state_indices'].dim)}"
     elif not safe_gate and ("a_log" in ins or "dt_bias" in ins):
         invalid = "a_log/dt_bias require safe_gate=True"
     elif gate_domain not in ("log", "linear"):

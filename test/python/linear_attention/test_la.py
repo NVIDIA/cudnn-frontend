@@ -1461,6 +1461,35 @@ def test_safe_gate_forward_parity(backend, variant):
     assert rms_ratio(fs_raw, fs_eff) < 2e-2
 
 
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_safe_gate_head_switch_same_process(backend, variant):
+    """Head counts are runtime values of one compiled host, so the second head configuration of a process reuses the host
+    the first one compiled; the per-head safe-gate parameters (a_log, dt_bias) ride along as placeholders of every
+    launcher.  Five configurations in one process through the warmup and chain forwards, the standalone summary and the
+    backward, with explicit parameters and then with a_log absent, each forward against the fp64 reference."""
+    configs = ((2, 2, 2), (4, 1, 1), (3, 3, 3), (1, 2, 2), (2, 2, 4))
+    for i, (H, HK, HV) in enumerate(configs):
+        for T in ((256, SPLIT_T) if i < 2 else (256,)):
+            case, kw, oracle = gate_mode_case(make_case(variant, torch.bfloat16, T=T, H=H, HK=HK, HV=HV), "safe", params="random", seed=SEED + 31 + i)
+            o, fs = run_fwd(backend, case, output_final_state=True, **kw)
+            o_ref, fs_ref = reference(case, **oracle)
+            assert_rms_close(f"o[{H}/{HK}/{HV}, T={T}]", o, o_ref, FWD_TOL[case.dtype])
+            assert_rms_close(f"final_state[{H}/{HK}/{HV}, T={T}]", fs, fs_ref, STATE_TOL[case.dtype])
+        h_buf, m_buf = run_summary(case, **kw)
+        assert torch.isfinite(h_buf).all() and torch.isfinite(m_buf).all(), f"summary[{H}/{HK}/{HV}]"
+        o_abs, _ = run_fwd(backend, case, output_final_state=True, **dict(kw, a_log=None))
+        assert torch.isfinite(o_abs).all(), f"absent a_log [{H}/{HK}/{HV}]"
+        args = thd_tensors(case)
+        for t in args[:3]:
+            t.requires_grad_(True)
+        with waive_unsupported(backend, variant):
+            o, _ = pinned_op(backend, variant)(*args, *op_tail(case), **kw)
+            o.sum().backward()
+        for name, leaf in zip(("dq", "dk", "dv"), args[:3]):
+            assert leaf.grad is not None and bool(torch.isfinite(leaf.grad).all()), f"{name}[{H}/{HK}/{HV}]"
+
+
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_allow_neg_eigval_parity(backend, variant):
     """The fused ``2 * sigmoid(beta)`` matches the same activation fed
@@ -4537,3 +4566,30 @@ def test_state_indices_rejects_unsupported(backend):
         run_fwd(backend, case, initial_state=pool, state_indices=slots, checkpoint_every_n_tokens=64, **kw)
     with pytest.raises(ValueError, match="dense"):
         run_fwd(backend, case, initial_state=pool.transpose(2, 3), state_indices=slots, **kw)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_state_indices_graph_declines_wrong_table_shape(backend):
+    """A hand-built graph whose ``state_indices`` tensor is not ``[num_seqs]`` is declined before any plan builds: the
+    table addresses one pool slot per sequence, and the graph path checks the declared shape like the op path does."""
+    case = make_case("gdn", torch.bfloat16, seq_lens=[64, 128], lo=0.99)
+    pool = random_state(case.clone(N=4), seed=SEED + 3)
+    names = LEAF_NAMES["gdn"]
+    inputs = dict(zip(names, op_args(case)[: len(names)]))
+    inputs.update(cu_seqlens=case.cu, initial_state=pool)
+    for bad in (torch.zeros(case.N + 1, dtype=torch.int32, device="cuda"), torch.zeros(case.N, 1, dtype=torch.int32, device="cuda")):
+        graph = cudnn.pygraph()
+        ports = {name: graph.tensor(list(t.shape), stride=list(t.stride()), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
+        ports["state_indices"] = graph.tensor(list(bad.shape), stride=list(bad.stride()), data_type=CUDNN_DTYPE[bad.dtype], name="state_indices")
+        o_port, fs_port, _ = graph.gdn(**ports, scale=1.0 / math.sqrt(case.K), output_final_state=True, name="gdn")
+        o_port.set_output(True).set_data_type(CUDNN_DTYPE[torch.bfloat16])
+        fs_port.set_output(True).set_data_type(CUDNN_DTYPE[torch.float32])
+        graph.validate()
+        graph.build_operation_graph()
+        with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+            graph.create_execution_plans([cudnn.heur_mode.A])
+            plan_names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+            if "gdn_frost" in plan_names:
+                graph.select_plan(plan_names.index("gdn_frost"))
+            graph.check_support()

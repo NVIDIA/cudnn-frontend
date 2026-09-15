@@ -12,8 +12,11 @@ head's group of ``r = HO // H`` consecutive output heads:
 Flat 1-D grid over output words: each thread owns one 4-byte word (a packed
 f16x2/bf16x2 pair, or one fp32 element), gathers it from all ``r`` group
 heads (coalesced, strided by ``inner_words``), accumulates in fp32, and
-stores one word back.  Serves the f16/bf16 ``[total, HO, D]`` tensor grads
-(dQ/dK for GVA, dK/dV for GQA) and the fp32 ``[total, HO]`` Gate/Beta grads.
+stores one word back.  Head count and group size are runtime values; the
+group loop runs over all ``r`` heads with a select on the first so the
+compiler's runtime unroll (8/4/2/1 blocks) issues a group's loads together.
+Serves the f16/bf16 ``[total, HO, D]`` tensor grads (dQ/dK for GVA, dK/dV for
+GQA) and the fp32 ``[total, HO]`` Gate/Beta grads.
 """
 
 import cutlass
@@ -58,18 +61,20 @@ def frost_head_reduce(
         if cutlass.const_expr(io_dtype == cutlass.Float32):
             in_p = cute.recast_ptr(mIn.iterator, dtype=cutlass.Float32)
             out_p = cute.recast_ptr(mOut.iterator, dtype=cutlass.Float32)
-            acc = (in_p + base).load()
-            for i in cutlass.range(r - 1):
-                acc = acc + (in_p + (base + cutlass.Int64(i + 1) * cutlass.Int64(inner_words))).load()
+            acc = cutlass.Float32(0.0)
+            for i in cutlass.range(r):
+                v = (in_p + (base + cutlass.Int64(i) * cutlass.Int64(inner_words))).load()
+                acc = v if i == 0 else acc + v
             (out_p + out_off).store(acc)
         else:
             in_p = cute.recast_ptr(mIn.iterator, dtype=cutlass.Int32)
             out_p = cute.recast_ptr(mOut.iterator, dtype=cutlass.Int32)
-            acc_lo, acc_hi = f16x2_to_f32((in_p + base).load(), dtype=io_dtype)
-            for i in cutlass.range(r - 1):
-                lo, hi = f16x2_to_f32((in_p + (base + cutlass.Int64(i + 1) * cutlass.Int64(inner_words))).load(), dtype=io_dtype)
-                acc_lo = acc_lo + lo
-                acc_hi = acc_hi + hi
+            acc_lo = cutlass.Float32(0.0)
+            acc_hi = cutlass.Float32(0.0)
+            for i in cutlass.range(r):
+                lo, hi = f16x2_to_f32((in_p + (base + cutlass.Int64(i) * cutlass.Int64(inner_words))).load(), dtype=io_dtype)
+                acc_lo = lo if i == 0 else acc_lo + lo
+                acc_hi = hi if i == 0 else acc_hi + hi
             (out_p + out_off).store(fp32_to_fp16(acc_lo, acc_hi, dtype=io_dtype))
     if cutlass.const_expr(USE_PDL):
         launch_dependent_grids()
