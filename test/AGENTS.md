@@ -92,3 +92,18 @@ loads kernel templates by absolute path via `spec_from_file_location`, so the
 template that serves a config may come from elsewhere too. To find out which
 template a test actually compiles, log `path` at the top of `load_template` —
 do not infer it from `_pick_flavor` by reading the source.
+
+
+### Persistent MoE scheduler validation
+
+When changing the scheduler ring or cluster broadcasts, use a workload that
+reuses ring slots over multiple persistent waves, with ragged and empty groups.
+Numerical success is insufficient: run Compute Sanitizer racecheck and memcheck
+on 1-CTA and 2-CTA variants. The focused cases are
+`gemm/frost/test_moe_counter_reset.py` and
+`gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py -k scheduler_ring_reuse`.
+A one-wave test can miss shared-memory reads that occur after the elected lane
+releases a slot, and a CTA can exit while a peer still accesses its DSM storage.
+If filtering sanitizer kernels, `--kernel-name kns=frost_sm100_moe` uses the
+sanitizer key/value syntax; verify the filter with a known failing kernel first.
+Keep that negative control's nonzero exit and the unfiltered baseline evidence.

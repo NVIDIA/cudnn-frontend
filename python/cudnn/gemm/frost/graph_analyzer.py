@@ -126,6 +126,7 @@ class _RecordedOp:
     quant_axis: int | None = None
     quant_transpose: bool = False
     moe_mode: str | None = None  # moe_grouped_matmul mode; None otherwise
+    moe_weight_layout: str | None = None
     op_attrs: tuple = ()  # pointwise scalar attrs (negative_slope/clips/swish_beta/axis)
     reduction_mode: str | None = None  # "add"/"amax"/"max"/"min"; None otherwise
     # Optional groupOffset input for grouped reductions / grouped col quant
@@ -368,6 +369,7 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
             out,
             compute_dtype=compute,
             moe_mode=_MOE_MODE_FROM_CUDNN.get(mode, "none"),
+            moe_weight_layout=node.params.get("weight_layout"),
         )
     if node_type == "REDUCTION":
         inp = node.inputs["input"]
@@ -595,6 +597,8 @@ def build_gemm_plan(graph: cudnn.pygraph, knobs=None):
     config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), knobs=knobs)
     if knobs is not None:
         probe_chain(chain, config)
+    if knobs is not None and knobs.moe_sched_policy:
+        return jit_from_cudnn_graph(graph, config=config, moe_sched_policy=knobs.moe_sched_policy)
     return jit_from_cudnn_graph(graph, config=config)
 
 
@@ -893,6 +897,12 @@ def _build_multi_moe_chain(
                 f"MoE grouped matmul mode {moe.moe_mode!r} is out of POC scope; " "only mode=NONE is supported (gather / scatter rejected)"
             )
 
+    weight_layout = moe_ops[0].moe_weight_layout
+    if weight_layout not in (None, "blocked_128x128_v1"):
+        raise NotImplementedError(f"unsupported MoE weight_layout {weight_layout!r}")
+    if any(op.moe_weight_layout != weight_layout for op in moe_ops):
+        raise NotImplementedError("parallel MoE matmuls must share the same weight_layout")
+
     # All GEMMs must share the SAME first_token_offset (identical routed-group layout).
     fto_id = moe_ops[0].inputs[2]
     for moe in moe_ops[1:]:
@@ -958,10 +968,27 @@ def _build_multi_moe_chain(
     def _moe_geometry(token_id: int, weight_id: int):
         token_meta = meta[token_id]
         weight_meta = meta[weight_id]
-        if len(token_meta.dim) != 3 or len(weight_meta.dim) != 3:
-            raise ValueError(f"moe operands must be 3D; got token={token_meta.dim} " f"weight={weight_meta.dim}")
+        if len(token_meta.dim) != 3:
+            raise ValueError(f"moe token must be 3D; got {token_meta.dim}")
         _bt, M, Ka = token_meta.dim  # token [1, T, H]
-        E, Kb, N = weight_meta.dim  # weight [E, H, N]
+        if weight_layout is None:
+            if len(weight_meta.dim) != 3:
+                raise ValueError(f"ordinary MoE weight must be rank-3; got {weight_meta.dim}")
+            E, Kb, N = weight_meta.dim
+            b_major = _infer_b_major(weight_meta.dim, weight_meta.stride)
+        else:
+            if is_block_scale or token_meta.dtype != "fp8_e4m3" or weight_meta.dtype != "fp8_e4m3":
+                raise NotImplementedError("blocked_128x128_v1 requires unscaled E4M3 token and weight operands")
+            if len(weight_meta.dim) != 5 or tuple(weight_meta.dim[-2:]) != (128, 128) or min(weight_meta.dim) <= 0:
+                raise ValueError("blocked_128x128_v1 weight must be [E,N/128,K/128,128,128] with positive dimensions")
+            E, nb, kb, _, _ = weight_meta.dim
+            N, Kb = int(nb) * 128, int(kb) * 128
+            strides = tuple(weight_meta.stride)
+            if len(strides) != 5 or strides[1:] != (Kb * 128, 128 * 128, 128, 1) or strides[0] < N * Kb or strides[0] % 16:
+                raise NotImplementedError(
+                    f"blocked_128x128_v1 requires contiguous expert blocks and a nonoverlapping 16-byte aligned expert stride; got {weight_meta.stride}"
+                )
+            b_major = "k"
         if Ka != Kb:
             raise ValueError(f"moe K mismatch: token K={Ka} vs weight K={Kb}")
         return (
@@ -970,7 +997,7 @@ def _build_multi_moe_chain(
             int(Ka),
             int(E),
             _infer_a_major(token_meta.dim, token_meta.stride),
-            _infer_b_major(weight_meta.dim, weight_meta.stride),
+            b_major,
             token_meta.dtype,
             weight_meta.dtype,
         )
@@ -1371,6 +1398,7 @@ def _build_multi_moe_chain(
             offset_dtype=offset_dtype,
             num_groups=num_groups,
             offset_multiple=offset_multiple,
+            weight_layout=weight_layout,
         ),
         block_scale=block_scale_spec,
         reductions=reductions,

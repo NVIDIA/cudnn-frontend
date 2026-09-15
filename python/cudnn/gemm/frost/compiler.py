@@ -897,9 +897,12 @@ def _render_tile_constants_sm100(
     a_smem_m_step_bytes = (cta_smem_m // cfg.mma_size_m) * cfg.cta_tile_k_bytes
     a_mcast_slices, b_mcast_slices, ab_empty_full_mask = _mcast_slice_plan(chain, cfg)
 
+    mma_inst_shape = cfg.mma_tile_mnk(elem_bytes)
+    if _moe_can_use_wide_mma(chain, cfg):
+        mma_inst_shape = (mma_inst_shape[0], 2 * mma_inst_shape[1], mma_inst_shape[2])
     lines = [
         f"# Tile config: {cfg.name}",
-        f"mma_inst_shape_mnk = {cfg.mma_tile_mnk(elem_bytes)}",
+        f"mma_inst_shape_mnk = {mma_inst_shape}",
         f"mma_k_dim = {int(cfg.mma_tile_k_bytes == 64)}",
         f"cta_group = {ctas_per_mma}",
         f"cgrp_tile_mnk = {cfg.cga_tile_mnk(elem_bytes)}",
@@ -2348,10 +2351,49 @@ def _replace_marker_lines(src: str, replacements: dict[str, str], *, template_ki
     return rendered
 
 
+def _moe_can_use_absolute_a(chain: FusionChain) -> bool:
+    """D/store predicates clip pure pointwise outputs at the expert boundary.
+
+    A full-tensor descriptor may read rows after that boundary. Such rows must
+    not participate in reductions, scale calculation or mainloop transforms.
+    Keep those fusion paths on their existing group-clipped A descriptors.
+    This is a semantic eligibility gate, not a shape-based tuning heuristic.
+    """
+    return bool(chain.has_moe and not chain.has_block_scale and not chain.has_mainloop_fusion and not chain.reductions and not chain.quants)
+
+
+def _moe_can_use_wide_mma(chain: FusionChain, config: TileConfig) -> bool:
+    """A shared-A pair occupies adjacent TMEM columns in this geometry.
+
+    Interleave the two K-major B tiles inside each pipeline stage so one
+    doubled-N instruction produces both logical GEMMs. Keep split-M, 2-CTA,
+    other operand layouts and cross-row fusion paths on their existing code.
+    This changes instruction packing, never the public logical TileConfig.
+    """
+    return bool(
+        _moe_can_use_absolute_a(chain)
+        and config.pipeline in ("sm100", "sm103")
+        and config.ctas_per_mma == 1
+        and config.mma_size_m == 1
+        and config.mma_size_n == 1
+        and config.cta_tile_n == config.mma_tile_n
+        and 2 * config.mma_tile_n <= 256
+        and chain.num_gemms == 2
+        and chain.num_a_operands == 1
+        and chain.num_b_operands == 2
+        and chain.gemm_operands == [(0, 0), (0, 1)]
+        and chain.matmul.b_major == "k"
+        and chain.matmul.a_dtype in ("bf16", "fp16", "fp8_e4m3")
+        and chain.matmul.b_dtype == chain.matmul.a_dtype
+    )
+
+
 def _render_template(
     chain: FusionChain,
     snippets: EpilogueSnippets,
     config: TileConfig,
+    *,
+    moe_sched_policy: int = 0,
 ) -> str:
     # Template selected by the kernel registry from the pure-geometry config +
     # execution strategy (cta_group); mainloop/graph_type from chain.
@@ -2422,6 +2464,11 @@ def _render_template(
     )
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
     tile_constants = _render_tile_constants(config, chain, tmpl)
+    if chain.has_moe:
+        tile_constants += f"\nmoe_static_sched = {moe_sched_policy == 1}"
+        tile_constants += f"\nmoe_absolute_a = {_moe_can_use_absolute_a(chain)}"
+        tile_constants += f"\nmoe_wide_mma = {_moe_can_use_wide_mma(chain, config)}"
+        tile_constants += f"\nmoe_blocked_b = {chain.moe.weight_layout == 'blocked_128x128_v1'}"
     if plumb.tap_constants:
         tile_constants += "\n" + "\n".join(plumb.tap_constants)
     # Multi-output tap plumbing. Empty lists → markers expand to nothing (kernel
@@ -2527,6 +2574,14 @@ def _render_template(
     # Tag the kernel fn name with template + geometry so nsys gives each
     # (template, config) a distinct GPU kernel symbol.
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
+    if moe_sched_policy:
+        tag += "_sched_static"
+    if _moe_can_use_absolute_a(chain):
+        tag += "_absolute_a"
+    if _moe_can_use_wide_mma(chain, config):
+        tag += "_wide_mma"
+    if chain.has_moe and chain.moe.weight_layout == "blocked_128x128_v1":
+        tag += "_packed_b_128x128_v1"
     src = re.sub(r"\b_kernel(?=\(|\.set_name_prefix\b)", f"frost_{tag}", src)
 
     return src
@@ -4132,6 +4187,13 @@ def _graph_dynamic_shapes(graph) -> bool:
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
+def _check_moe_sched_policy(chain: FusionChain, policy: int) -> None:
+    if policy not in (0, 1):
+        raise NotImplementedError("frost_gemm: SCHED_POLICY must be 0 (dynamic) or 1 (static)")
+    if policy and (chain is None or not chain.has_moe or chain.has_block_scale):
+        raise NotImplementedError("frost_gemm: static SCHED_POLICY currently requires ordinary MoE grouped GEMM")
+
+
 def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
     """Choose the tile strategy for one analyzed fusion chain.
 
@@ -4141,6 +4203,7 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None)
     config is a decline (NotImplementedError), never a silent snap to a
     neighbour. Without knobs this is the automatic strategy."""
     if knobs is not None:
+        _check_moe_sched_policy(chain, knobs.moe_sched_policy)
         try:
             config = knobs.to_config()
         except (KeyError, ValueError, NotImplementedError) as exc:
@@ -4152,7 +4215,14 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None)
             raise NotImplementedError("frost_gemm: split-K plans do not support dynamic shapes")
         return config
     from .kernel_registry import preferred_strategy
-    from .tile_config import select_config
+    from .tile_config import by_name, select_config
+
+    if chain.has_moe and chain.moe.weight_layout is not None:
+        # The generic engine probe must test an eligible layout configuration,
+        # including when the caller supplied an exact tactic. This is a valid
+        # starting plan within the initial support domain, not a tuned winner.
+        n = 64 if chain.num_gemms > 1 else 128
+        return by_name(f"CONFIG_sm100_64x{n}x128_64x{n}x32_cluster1x4_1ctamma")
 
     tile_m = chain.matmul.M
     if chain.moe is not None:
@@ -4212,6 +4282,24 @@ def _precheck_moe(
 ) -> None:
     from .kernel_registry import GraphType, mma_arch_reject, select_template
 
+    if chain.moe.weight_layout is not None:
+        if not (
+            chain.moe.weight_layout == "blocked_128x128_v1"
+            and _current_arch() == 100
+            and config.pipeline == "sm100"
+            and chain.matmul.a_dtype == chain.matmul.b_dtype == "fp8_e4m3"
+            and chain.matmul.b_major == "k"
+            and chain.matmul.N % 128 == chain.matmul.K % 128 == 0
+            and config.cta_tile_n in (64, 128)
+            and config.cta_tile_k_bytes == 128
+            and config.ctas_per_mma == 1
+            and config.cga_size_m in (1, 2, 4, 8, 16)
+            and config.cga_size_n in (1, 2, 4, 8, 16)
+            and config.cga_size_m * config.cga_size_n <= 16
+        ):
+            raise NotImplementedError(
+                "blocked_128x128_v1 requires SM100 E4M3, N/K multiples of 128, tile N64/128 K128, 1-CTA MMA and power-of-two cluster M/N with at most 16 CTAs"
+            )
     reason = mma_arch_reject(chain, GraphType.MOE, config.pipeline)
     if reason is not None:
         raise NotImplementedError(reason)
@@ -4396,6 +4484,8 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
     config: TileConfig = DEFAULT_CONFIG,
+    *,
+    moe_sched_policy: int = 0,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel.
 
@@ -4415,6 +4505,7 @@ def jit_from_cudnn_graph(
     Everywhere else the launch is the plain fixed cluster it always was.
     """
     chain, binding = analyze_with_binding(graph)
+    _check_moe_sched_policy(chain, moe_sched_policy)
     if config.swap_ab:
         from .fusion_ir import swap_ab
 
@@ -4436,7 +4527,7 @@ def jit_from_cudnn_graph(
     # MoE grouped matmul: own template (grouped persistent scheduler + per-group
     # A TMA descriptor replacement).
     if chain.has_moe:
-        return _jit_moe(chain, config, binding=binding)
+        return _jit_moe(chain, config, binding=binding, moe_sched_policy=moe_sched_policy)
     # Multi-GEMM is only in the 1ctamma CLC template. select_template skips
     # capability gates, so reject unsupported strategy here with a clear message
     # rather than fault deep in cute on a missing vec_f32_<g> binding.
@@ -4540,6 +4631,32 @@ def _kernel_order(buf, t, memo: "dict | None" = None):
     return buf
 
 
+def _blocked_moe_weight_view(buf):
+    shape = tuple(buf.shape)
+    if len(shape) != 5 or shape[-2:] != (128, 128) or min(shape) <= 0:
+        raise ValueError("blocked_128x128_v1 requires rank-5 [E,N/128,K/128,128,128] weight storage")
+    e, nb, kb, _, _ = shape
+    n, k = nb * 128, kb * 128
+    strides = tuple(buf.stride())
+    if len(strides) != 5 or strides[1:] != (k * 128, 16384, 128, 1) or strides[0] < n * k or strides[0] % 16:
+        raise ValueError("blocked_128x128_v1 requires contiguous expert blocks and a nonoverlapping 16-byte aligned expert stride")
+    if strides[0] == n * k:
+        return buf.view(e, n, k)
+    # The checked inner modes collapse without changing any address. Native
+    # variant-pack operands deliberately restrict reshape() to dense tensors;
+    # use their existing metadata API to preserve the expert pitch explicitly.
+    from cudnn import _pybind_module
+
+    if isinstance(buf, _pybind_module.OperandBuffer):
+        pack = _pybind_module.VariantPackNative(1)
+        if not pack.read_operand(0, buf):
+            raise TypeError("blocked MoE operand does not expose its native DLPack metadata")
+        pack.override_operand(0, [e, n, k], [strides[0], k, 1])
+        return pack.operand(0, buf.__dlpack_device__()[1])
+    # Framework view() either lends the same storage or raises; it cannot copy.
+    return buf.view(e, n, k)
+
+
 def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     """Resolve a MoE variant-pack dict into the positional-call buffers,
     inferring (S, N, K) from shapes. Returns ``(a_bufs, b_bufs, out_bufs,
@@ -4563,7 +4680,13 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         return resolved[id(t)]
 
     a_bufs = [pull(t, "token") for t in b.a_operands]
-    b_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
+    if compiled.chain.moe.weight_layout is None:
+        b_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
+    else:
+        # This checked flatten only lends an address to the existing launch ABI.
+        # The rank-5 TMA descriptor interprets the physical blocks natively.
+        # It cannot copy or repack, and no CUDA work runs here.
+        b_bufs = [_blocked_moe_weight_view(pull(t, "weight")) for t in b.b_operands]
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
     fto = pull(b.first_token_offset, "first_token_offset")
@@ -4614,19 +4737,6 @@ def _register_legacy_device_view_adapter() -> None:
         # 128-byte tensormap slot the MoE workspace fake declares.
         ptr = view.data_ptr()
         return from_dlpack(view, assumed_align=min(ptr & -ptr, _MOE_DESC_SLOT_BYTES))
-
-
-def _moe_reset_sched_counter(workspace, desc_slots: int, stream) -> None:
-    """Zero the dynamic tile scheduler's global counter, stream-ordered.
-
-    It lives in the slot past the per-CTA descriptor scratch, so it rides the
-    same buffer and the same stable pointer that makes the plan graph-safe.
-    A 4-byte D32 memset, not a kernel."""
-    buffers.memset_zero_async(
-        workspace.data_ptr() + desc_slots * _MOE_DESC_SLOT_BYTES,
-        4,
-        _as_custream(stream),
-    )
 
 
 def _moe_carve_workspace(caller, n_slots: int, plan: str):
@@ -4770,7 +4880,6 @@ class CompiledMoeGemm:
         ]
         # Tensormap workspace: one 128-byte slot per CTA per patched descriptor.
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
-        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -4899,7 +5008,6 @@ class CompiledMoeGemm:
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
         # Workspace: one 128-B tensormap slot per patched descriptor per CTA.
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
-        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -4928,6 +5036,7 @@ def _jit_moe(
     config: TileConfig,
     *,
     binding: "GemmBinding | None" = None,
+    moe_sched_policy: int = 0,
 ) -> CompiledMoeGemm:
     """JIT path for a MoE grouped matmul forward pass (mode=NONE)."""
     _precheck_moe(chain, config)
@@ -4940,7 +5049,7 @@ def _jit_moe(
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
     )
-    src = _render_template(chain, snippets, config)
+    src = _render_template(chain, snippets, config, moe_sched_policy=moe_sched_policy)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cga_size_m, config.cga_size_n
@@ -5163,7 +5272,6 @@ class CompiledMoeBlockScaleGemm:
         if sfb is not None:
             sf_args.append(_maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX))
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
-        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -5327,7 +5435,6 @@ class CompiledMoeBlockScaleGemm:
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
-        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,

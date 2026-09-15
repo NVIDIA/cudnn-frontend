@@ -55,6 +55,40 @@ def epi_subtile_spans(cols, epi_n=32):
 TENSOR_MAP_QWORDS = 16
 
 
+@cute.jit
+def moe_load_sched_word(ptr):
+    """Read a scheduler word in the lane that later releases its ring slot.
+
+    Call with a converged full warp. Broadcasting the register value keeps
+    other lanes from issuing shared loads after the elected lane has released
+    the slot for reuse. Consumers must converge before their release arrival.
+    """
+    value = cutlass.Int32(0)
+    if cute.arch.lane_idx() == 0:
+        value = ptr.load()
+    return nvvm.shfl_sync(0xFFFFFFFF, value, 0, 0x1F, nvvm.Shfl.IDX)
+
+
+@cute.kernel
+def reset_moe_sched_counter(workspace: cute.Tensor, counter_qword: cutlass.Int32):
+    """One stream-ordered compute launch initializes the dynamic scheduler.
+
+    The counter occupies the first four bytes of its reserved 128-byte slot.
+    Keeping this launch in the compiled host function makes it part of the
+    plan and its persistent artifact, with no execute-time compilation or
+    framework dependency. A compute launch avoids the DMA-memset transition
+    between the MoE compute stages.
+    """
+    counter = cute.make_tensor(
+        cute.recast_ptr(workspace.iterator + counter_qword, dtype=cutlass.Int32),
+        cute.make_layout(1),
+    )
+    counter[0] = cutlass.Int32(0)
+
+
+reset_moe_sched_counter.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 def moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
     """Group-local linear tile index -> (m, n) under an N-super-block walk.
     ``swizzle_w == nt_n`` reproduces the plain n-fast split; ``1`` gives m-fast.

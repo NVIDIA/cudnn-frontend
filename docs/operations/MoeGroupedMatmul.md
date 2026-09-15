@@ -199,6 +199,34 @@ graph.build_plans()
 
 ---
 
+### Frost forward scheduling
+
+The experimental open-source Frost GEMM engine exposes a separate performance
+choice for ordinary (non-block-scaled) grouped forward plans using `mode=NONE`:
+
+- Omitted `cudnn.knob_type.SCHED_POLICY`, or value `0`: dynamically claimed
+  cluster tickets, the unchanged default.
+- Value `1`: static strided cluster tickets. Each cluster derives its next
+  tile without a global scheduler counter or its reset launch.
+
+Enable the Frost engine before constructing the graph, for example with
+`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`. Starting from a supported Frost plan's
+complete tile record, create a separate plan for the alternate policy:
+
+```python
+engine_id, tile_knobs = graph.get_engine_and_knobs_at_index(frost_plan_index)
+static_knobs = dict(tile_knobs)
+static_knobs[cudnn.knob_type.SCHED_POLICY] = 1
+graph.create_execution_plan(engine_id, static_knobs)
+```
+
+Run the normal support/build steps before execution, and benchmark both policies
+on the caller's shapes and routing distributions. The policy does not change tile
+geometry or numerical semantics, and the default proposal does not automatically
+select static scheduling. The public engine/knob record replays the chosen
+policy. Static policy requests for non-MoE or block-scaled graphs are declined;
+this policy is not passed to closed-source cuDNN engines.
+
 ## MoE Grouped Matmul Backward
 
 The backward operation computes the weight gradient $d\text{Weight}$ given the upstream gradient $d\text{Output}$ and the forward token activations:
@@ -303,3 +331,21 @@ graph.create_execution_plans([cudnn.heur_mode.A])
 graph.check_support()
 graph.build_plans()
 ```
+
+
+## Frost packed FP8 weights (draft)
+
+The optional `weight_layout="blocked_128x128_v1"` attribute declares physical
+`[E,N/128,K/128,128,128]` E4M3 weights. The inner strides are
+`[K*128,16384,128,1]`; each expert pitch is at least `N*K` bytes and 16-byte
+aligned. Omitting the attribute preserves the ordinary rank-3 weight contract.
+Packing happens during preparation, and TMA addresses the declared layout and
+expert pitch directly during execution.
+
+This layout requires SM100, N/K divisible by 128, eligible one-CTA N64/128 K128
+tactics, and power-of-two cluster M/N with product at most 16. Unsupported
+declarations decline. The layout belongs to the graph; it is not a performance
+knob. Replaying `(engine, knobs)` requires reconstructing the same graph layout.
+Classic backend graph key/serialization rejects this Python-only declaration.
+See [the integration handoff](../../FROST_MOE_HANDOFF.md) for validation boundaries
+and the matching FlashInfer draft.

@@ -224,3 +224,28 @@ def test_analyzer_declines_a_graph_without_a_gemm():
     y = g.relu(input=x, name="r")
     y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
     assert analyze_facts(g) is None
+
+
+def test_moe_scheduler_policy_is_separate_from_geometry():
+    from dataclasses import replace
+
+    dynamic = GemmKnobs.from_config(DEFAULT_CONFIG)
+    static = replace(dynamic, moe_sched_policy=1)
+    assert dynamic.to_config() == static.to_config()
+    assert cudnn.knob_type.SCHED_POLICY not in dynamic.to_public()
+    assert static.to_public()[cudnn.knob_type.SCHED_POLICY] == 1
+    assert GemmKnobs.from_public(static.to_public()) == static
+    with pytest.raises(ValueError, match="SCHED_POLICY"):
+        GemmKnobs.from_public({**dynamic.to_public(), cudnn.knob_type.SCHED_POLICY: 2})
+
+
+@requires_sm100
+def test_static_moe_scheduler_declines_ordinary_dense_graph():
+    g, _ = _build_matmul_bias_relu()
+    knobs = GemmKnobs.from_config(DEFAULT_CONFIG).to_public()
+    knobs[cudnn.knob_type.SCHED_POLICY] = 1
+    g.create_execution_plan(20400, knobs)
+    g.select_plan(g.get_execution_plan_count() - 1)
+    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError, RuntimeError), match="static SCHED_POLICY"):
+        g.check_support()
+        g.build_plans()

@@ -2008,7 +2008,9 @@ class pygraph:
         # what a bare address gets -- so an engine reading the pack answers the
         # way the backend does. A buffer with the declared extents but its own
         # strides, a strided view, or one too small for the declaration keeps
-        # its own description; the engine decides. The rule runs natively, one
+        # its own description; the engine decides. Reordered scale blobs also
+        # retain their physical extents, which can exceed the logical geometry
+        # because every routed group needs its own padding. The rule runs natively, one
         # crossing per pack: this is on every execute's critical path.
         from_graph.extend(native.describe_from(self._declared_layout(order), from_graph))
         if override_uids:
@@ -2073,6 +2075,7 @@ class pygraph:
                     storage_slot_bytes(declared.data_type) or 0,
                     *_dlpack_code_bits(declared.data_type),
                     _dlpack_lanes(declared.data_type),
+                    declared.get_reordering_type() == _pybind_module.tensor_reordering.F8_128x4,
                 )
             self._declared_layout_native = layout
         return layout
@@ -2435,7 +2438,7 @@ class pygraph:
                     if n:
                         kw[lp] = [tensor_map[node.inputs[f"{lp}_{i}"].uid] for i in range(n)]
                 for ak in spec.get("attrs", ()):
-                    if ak in node.params:
+                    if ak in node.params and ak not in spec.get("python_only_attrs", ()):
                         kw[ak] = node.params[ak]
                 result = getattr(graph, method)(**kw)
                 cpp_outs = list(result) if isinstance(result, (list, tuple)) else [result]
@@ -2799,9 +2802,16 @@ _STRUCTURED_OPS = {
     "moe_grouped_matmul": dict(
         node_type=NodeType.MOE_GROUPED_MATMUL,
         inputs=("token", "weight", "first_token_offset", "token_index", "token_ks"),
-        attrs=("mode", "top_k"),
+        attrs=("mode", "top_k", "weight_layout"),
+        python_only_attrs=("weight_layout",),
         outputs=("OUT_0",),
-        infer={"OUT_0": lambda n: [1, n.inputs["token"].dim[-2], n.inputs["weight"].dim[-1]]},
+        infer={
+            "OUT_0": lambda n: [
+                1,
+                n.inputs["token"].dim[-2],
+                n.inputs["weight"].dim[1] * 128 if n.params.get("weight_layout") == "blocked_128x128_v1" else n.inputs["weight"].dim[-1],
+            ]
+        },
     ),
     "moe_grouped_matmul_bwd": dict(
         node_type=NodeType.MOE_GROUPED_MATMUL_BWD,

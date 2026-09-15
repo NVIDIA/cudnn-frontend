@@ -518,7 +518,10 @@ def _run_e2e(
         b = offsets_list[gi]
         e = offsets_list[gi + 1] if gi + 1 < num_groups else S
         sfa_parts.append(_to_blocked(sfa_log[b:e]))
-    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
+    # E8M0 cat lacks the general CUDA path needed by ragged/empty parts in
+    # some torch versions. Concatenate the exact scale bytes without casting.
+    sfa_live = torch.cat([part.view(torch.uint8) for part in sfa_parts]).view(sfa_log.dtype)
+    sfa_blk = _with_static_segmented_capacity(sfa_live, S, num_groups, sf_k)
     sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=offset_torch_dt, device=dev)
     if quant:
@@ -696,6 +699,30 @@ def test_e2e_split_m_tile(cfg_name, cta_group) -> None:
         offsets_list=[0, 256, 384, 512],
         combo="nvfp4",
         config_name=cfg_name,
+        cta_group=cta_group,
+    )
+
+
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "config_name,cta_group",
+    [
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x2_1ctamma", 1),
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma", 2),
+    ],
+)
+@requires_sm100
+def test_e2e_scheduler_ring_reuse(combo, config_name, cta_group) -> None:
+    # Cross many persistent waves so ring-slot reuse and final DSM lifetime are
+    # covered by racecheck. Ragged and empty groups also exercise SF indexing.
+    _run_e2e(
+        E=8,
+        S=32769,
+        N=256,
+        K=256,
+        offsets_list=[0, 0, 1, 1, 4097, 8192, 16387, 32769],
+        combo=combo,
+        config_name=config_name,
         cta_group=cta_group,
     )
 

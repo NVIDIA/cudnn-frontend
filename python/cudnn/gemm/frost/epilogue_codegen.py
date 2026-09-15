@@ -447,6 +447,22 @@ def _emit_op(
         return _emit_binary_ext(op, lhs, rhs, idx, new)
 
     if op.op == "tanh":
+        if op.compute_dtype == "fp32":
+            # Native tanh preserves small arguments that 1 - 2/(exp(2*x)+1)
+            # loses to cancellation. NVVM tanh.approx is scalar-only: extract
+            # each lane explicitly instead of passing a vector to the lowering.
+            prefix = f"_native_tanh_{idx}"
+            lines = [f"{prefix}_src = {prev}", f"{prefix}_out = cute.make_rmem_tensor({vsize}, cutlass.Float32)"]
+            # Retain the exp2/rcp path away from zero: native tanh.approx has
+            # higher FP32 error there. Select lane-wise without control flow.
+            lines.append(f"{prefix}_regular = {_tanh_expr(prev)}")
+            lines.extend(
+                f"{prefix}_out[{i}] = cutlass.select_(cute.math.abs({prefix}_src[{i}]) < cutlass.Float32(0.125), "
+                f"cute.math.tanh({prefix}_src[{i}], approx=True), {prefix}_regular[{i}])"
+                for i in range(vsize)
+            )
+            lines.append(f"{new} = {prefix}_out.load().to_vector()")
+            return lines, new
         return [f"{new} = {_tanh_expr(prev)}"], new
 
     if op.op == "exp":

@@ -31,11 +31,13 @@ from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.kernel_templates._tile_helpers import (
+    reset_moe_sched_counter as _reset_moe_sched_counter,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
     fence_tensormap_acquire as _fence_tensormap_acquire,
     fence_tensormap_release as _fence_tensormap_release,
     moe_swizzle_tile as _moe_swizzle_tile,
+    moe_load_sched_word as _moe_load_sched_word,
     replace_tensormap_global_address as _replace_tensormap_global_address,
     replace_tensormap_global_dim_1 as _replace_tensormap_global_dim_1,
     replace_tensormap_global_dim_2 as _replace_tensormap_global_dim_2,
@@ -459,6 +461,10 @@ def _kernel(
 
     if warp_idx == scheduler_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+        # PDL launch completion alone does not make predecessor writes visible.
+        # The scheduler consumes the reset counter and live offsets itself.
+        if cutlass.const_expr(USE_PDL):
+            nvvm.griddepcontrol("wait")
         full_warp_mask = 0xFFFFFFFF
         shfl_idx_clamp = 0x1F
         shfl_up_clamp = 0
@@ -519,7 +525,8 @@ def _kernel(
                 time_limit=10_000_000,
             ):
                 pass
-            linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
+            linear_idx = _moe_load_sched_word((sched_bcast_slot.subview(bcast_stage)))
+            nvvm.bar_warp_sync(0xFFFFFFFF)
             if lane == 0:
                 nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
             if cutlass.const_expr(cluster_size > 1):
@@ -792,13 +799,15 @@ def _kernel(
             ):
                 pass
             slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-            coord_expert = (slot.subview(0)).load()
-            tile_m = (slot.subview(1)).load()
-            tile_n = (slot.subview(2)).load()
-            is_valid = (slot.subview(3)).load()
-            group_begin = (slot.subview(4)).load()
-            group_end = (slot.subview(5)).load()
-            start_sf_block_m = (slot.subview(6)).load()
+            coord_expert = _moe_load_sched_word((slot.subview(0)))
+            tile_m = _moe_load_sched_word((slot.subview(1)))
+            tile_n = _moe_load_sched_word((slot.subview(2)))
+            is_valid = _moe_load_sched_word((slot.subview(3)))
+            group_begin = _moe_load_sched_word((slot.subview(4)))
+            group_end = _moe_load_sched_word((slot.subview(5)))
+            start_sf_block_m = _moe_load_sched_word((slot.subview(6)))
+            # Converge consumers before releasing their scheduler slot.
+            nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1
@@ -1120,7 +1129,9 @@ def _kernel(
                     time_limit=10_000_000,
                 ):
                     pass
-                is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                is_valid = _moe_load_sched_word((sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)))
+                # Converge consumers before releasing their scheduler slot.
+                nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
                     nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                 sched_stage += 1
@@ -1400,7 +1411,9 @@ def _kernel(
                         time_limit=10_000_000,
                     ):
                         pass
-                    is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                    is_valid = _moe_load_sched_word((sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)))
+                    # Converge consumers before releasing their scheduler slot.
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
                     if elect_one:
                         nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                     sched_stage += 1
@@ -1577,7 +1590,9 @@ def _kernel(
                         time_limit=10_000_000,
                     ):
                         pass
-                    is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                    is_valid = _moe_load_sched_word((sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)))
+                    # Converge consumers before releasing their scheduler slot.
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
                     if elect_one:
                         nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                     sched_stage += 1
@@ -1667,22 +1682,24 @@ def _kernel(
                 pass
             if cutlass.const_expr(cta_group == 1):
                 _slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-                tile_m = (_slot.subview(1)).load()
-                tile_n = (_slot.subview(2)).load()
-                is_valid = (_slot.subview(3)).load()
-                group_begin = (_slot.subview(4)).load()
-                group_end = (_slot.subview(5)).load()
-                start_sf_block_m = (_slot.subview(6)).load()
-                group_idx = (_slot.subview(7)).load()
+                tile_m = _moe_load_sched_word((_slot.subview(1)))
+                tile_n = _moe_load_sched_word((_slot.subview(2)))
+                is_valid = _moe_load_sched_word((_slot.subview(3)))
+                group_begin = _moe_load_sched_word((_slot.subview(4)))
+                group_end = _moe_load_sched_word((_slot.subview(5)))
+                start_sf_block_m = _moe_load_sched_word((_slot.subview(6)))
+                group_idx = _moe_load_sched_word((_slot.subview(7)))
             else:
                 slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-                tile_m = (slot.subview(1)).load()
-                tile_n = (slot.subview(2)).load()
-                is_valid = (slot.subview(3)).load()
-                group_begin = (slot.subview(4)).load()
-                group_end = (slot.subview(5)).load()
-                start_sf_block_m = (slot.subview(6)).load()
-                group_idx = (slot.subview(7)).load()
+                tile_m = _moe_load_sched_word((slot.subview(1)))
+                tile_n = _moe_load_sched_word((slot.subview(2)))
+                is_valid = _moe_load_sched_word((slot.subview(3)))
+                group_begin = _moe_load_sched_word((slot.subview(4)))
+                group_end = _moe_load_sched_word((slot.subview(5)))
+                start_sf_block_m = _moe_load_sched_word((slot.subview(6)))
+                group_idx = _moe_load_sched_word((slot.subview(7)))
+            # Converge consumers before releasing their scheduler slot.
+            nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1
@@ -1824,6 +1841,12 @@ def _kernel(
 
     if warp_idx == unused_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+
+    # DSM broadcasts can outlive one CTA's final tile. Keep every peer's
+    # shared storage alive until the whole cluster has finished its accesses.
+    if cutlass.const_expr(cluster_size > 1):
+        nvvm.barrier_cluster_arrive_relaxed()
+        nvvm.barrier_cluster_wait()
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1981,6 +2004,8 @@ def _host(
     cluster_m = cluster_shape_mnk[0]
     cluster_n = cluster_shape_mnk[1]
     grid_shape = (grid_num_clusters * cluster_m, cluster_n, 1)
+    counter_qword = grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS
+    _reset_moe_sched_counter(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],

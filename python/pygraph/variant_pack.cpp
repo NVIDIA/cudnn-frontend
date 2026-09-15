@@ -195,10 +195,11 @@ class DeclaredLayout {
     struct Slot {
         std::vector<int64_t> shape;
         std::vector<int64_t> stride;
-        int64_t slot_bytes = 0;  // 0: width unknown, never re-described from
-        int64_t span       = 0;
-        DLDataType dtype   = {0, 0, 1};  // bits == 0: no DLPack spelling, the buffer's own dtype stands
-        bool present       = false;
+        int64_t slot_bytes   = 0;  // 0: width unknown, never re-described from
+        int64_t span         = 0;
+        DLDataType dtype     = {0, 0, 1};  // bits == 0: no DLPack spelling, the buffer's own dtype stands
+        bool present         = false;
+        bool preserve_extent = false;  // reordered blobs have an independent physical capacity
     };
 
     explicit DeclaredLayout(size_t n) : slots_(n) {}
@@ -208,9 +209,10 @@ class DeclaredLayout {
         std::vector<int64_t> shape,
         std::vector<int64_t> stride,
         int64_t slot_bytes,
-        int dtype_code  = 0,
-        int dtype_bits  = 0,
-        int dtype_lanes = 1) {
+        int dtype_code       = 0,
+        int dtype_bits       = 0,
+        int dtype_lanes      = 1,
+        bool preserve_extent = false) {
         if (shape.size() != stride.size()) {
             throw py::value_error("declared shape and stride must have the same rank; got " +
                                   std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
@@ -223,7 +225,8 @@ class DeclaredLayout {
         slot.slot_bytes = slot_bytes;
         slot.dtype      = DLDataType{
             static_cast<uint8_t>(dtype_code), static_cast<uint8_t>(dtype_bits), static_cast<uint16_t>(dtype_lanes)};
-        slot.present = true;
+        slot.present         = true;
+        slot.preserve_extent = preserve_extent;
     }
 
     const std::vector<Slot> &
@@ -666,6 +669,26 @@ class VariantPackNative {
             // spell (bits == 0) never qualifies.
             const int64_t own_bytes = (static_cast<int64_t>(operand.dtype.bits) * operand.dtype.lanes + 7) / 8;
             if (own_bytes <= 0) continue;
+            // Reordered scale tensors describe logical geometry, not their
+            // physical blob capacity. Keep the caller's extent for the engine's
+            // bounds check; equal-width byte carriers still take the graph dtype.
+            if (want.preserve_extent) {
+                if (own_bytes == want.slot_bytes && want.dtype.bits > 0) operand.dtype = want.dtype;
+                // A flat opaque blob still needs the declared rank at the
+                // kernel boundary. Lift it with unit axes; never truncate its
+                // physical capacity to the logical scale shape.
+                if (want.shape.size() == 3 && operand.shape.size() != 3) {
+                    const int64_t elements = numel_of(operand.shape);
+                    const int64_t batches  = want.shape[0];
+                    if (operand_contiguous(i) && batches > 0 && elements % batches == 0) {
+                        const int64_t per_batch = elements / batches;
+                        operand.ndim            = 3;
+                        operand.shape           = {batches, per_batch, 1};
+                        operand.stride          = {per_batch, 1, 1};
+                    }
+                }
+                continue;
+            }
             if (operand.shape == want.shape) {
                 if (own_bytes == want.slot_bytes && want.dtype.bits > 0) operand.dtype = want.dtype;
                 continue;
@@ -987,9 +1010,10 @@ per graph; ``VariantPackNative.describe_from`` compares a whole pack against it.
              py::arg("shape"),
              py::arg("stride"),
              py::arg("slot_bytes"),
-             py::arg("dtype_code")  = 0,
-             py::arg("dtype_bits")  = 0,
-             py::arg("dtype_lanes") = 1)
+             py::arg("dtype_code")      = 0,
+             py::arg("dtype_bits")      = 0,
+             py::arg("dtype_lanes")     = 1,
+             py::arg("preserve_extent") = false)
         .def("__len__", &DeclaredLayout::size);
 
     py::class_<VariantPackNative>(m, "VariantPackNative", R"(
