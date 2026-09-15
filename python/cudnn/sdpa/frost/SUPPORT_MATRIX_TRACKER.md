@@ -386,9 +386,7 @@ unchanged), sentinel 0, two-launch 0. Perf node, d256 causal H32/2, LPT vs
 NATURAL launch-interleaved: +5.2/+5.9/+5.6/+2.0/+2.3 % at S = 2K..32K (control
 pair within 1.9 %). The FP8 row now carries
 `sched_policies_by_d_shape = (((256, 256), {NATURAL, LPT}), ((192, 128), {NATURAL, LPT}))`.
-Two FP8 flavors stay out: **(128, 128)** is also bit-identical under LPT, but
-its causal path reads 0.041–0.048 against the suite's 0.04 under NATURAL as
-well, so it gets its own look before it is claimed; **(512, 512)** — the cga4×1
+One FP8 flavor stays out ((128, 128) joined on 2026-09-14, below): **(512, 512)** — the cga4×1
 role-split kernel still calls `make_sdpa_helpers(CFG)` without
 `lpt_q_tiles_in_cga_units` (the #1001 argument, left on the d512 line), so under
 LPT it writes *nothing* (sentinel on 100 % of cells; the earlier "causal d512
@@ -402,14 +400,51 @@ the graph path's ranking). Pinned by
 `test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape` and the Rubin
 e2e `test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors`.
 
-Still declined, and why: d128/d512 f16, d128 FP8 (tolerance, above) and every
-MXFP8 flavor are **unvalidated** under LPT rather than known-incorrect; d512
-(f16, FP8, MXFP8) **does not produce output** under LPT until the d512 kernels get the
+**LPT_L2 joins on the flavors whose kernels thread its inputs; MXFP8 d128 and
+d192×128 claim LPT + LPT_L2 (2026-09-14).** `SCHED_LPT_L2`'s decode needs
+`qh_per_kh` and `seqlen_kv` at every call site (the shared decode raises at
+trace time without them). The d128 and d192×128 per-tensor FP8 kernels already
+threaded them through `make_split_helpers`; the two MXFP8 siblings
+(`sm107/prefill_d128_mxfp8.py`, `sm107/prefill_d192_d128_mxfp8.py`) now thread
+them into all ten `_dispatch_decode_*` sites (mirroring the FP8 form). Claims:
+FP8 `(192, 128)` adds `LPT_L2` and FP8 `(128, 128)` claims `{NATURAL, LPT, LPT_L2}`
+(bit-identical to NATURAL under both — the 0.041–0.048 its e5m2 causal path
+reads against the suite's 0.04 comes out of the same bits under every policy;
+perf node, kernel-level d128 H64/8 causal vs NATURAL: LPT_L2 +4.2/+7.6/+7.0/
++5.9/+5.4 %, LPT +5.3/+5.8/+4.2/+2.0/+1.1 % at S = 2K..32K); MXFP8 `(128, 128)`
+and `(192, 128)` claim
+`{NATURAL, LPT, LPT_L2}` — the row was NATURAL-only, and the "23 MXFP8 tests red
+under LPT" report that kept it there has the #1001 signature (dense graphs rank
+NATURAL and stayed correct; every masked graph took the LPT decode with the
+dropped `lpt_q_tiles_in_cga_units` argument and read unwritten output).
+Validation, Rubin, standalone adapter, sentinel-filled O and NaN-filled LSE: on
+each claimed flavor O and LSE under LPT and under LPT_L2 are **bit-identical**
+to NATURAL, dense and causal (multi-wave causal grid), and the MXFP8 suite —
+whose causal cases now rank a remap first — stays green. **Heuristics change,
+Rubin rows only** (`heuristics._sched_points`): with GQA the L2-budget rule
+keeps leading with LPT_L2 (Llama above); without GQA (h_q == h_kv, the DSv3
+layout) LPT_L2 has no K/V sharing to group and measured **−9.7 %** at S=2K, so
+the rule proposes plain LPT while the grid is ≤ 24 waves of 2-CTA clusters
+(+16 % at S=4K) and NATURAL beyond (LPT −6.5 / −13 / −7.9 % at S=8K/16K/32K) —
+perf node, kernel-level, d192×128 FP8 H128 causal. Every domain member stays an
+autotune runner. Pinned by
+`test_sm107_causal_ranking_picks_the_policy_by_gqa_and_wave_count`,
+`test_sm107_rows_serve_natural_scheduling_only`,
+`test_sm107_mxfp8_advertises_lpt_and_lpt_l2_per_d_shape`,
+`test_sm107_mxfp8_sched_knob_is_honored_or_ineligible_per_d_shape` and the
+Rubin e2e `test_mxfp8_sched_policies_are_bit_identical_to_natural` (plus the
+widened FP8 e2e).
+
+Still declined, and why: d128/d512 f16 are **unvalidated** under LPT rather
+than known-incorrect; d512 (f16, FP8, MXFP8)
+**does not produce output** under LPT until the d512 kernels get the
 `lpt_q_tiles_in_cga_units` argument and are re-validated (cga4×1 role-split, a
 different scheduler shape — `prefill_d512_fp8.py:2533` notes the LPT range is
-`q_clusters * CTA_MMA`). `SCHED_LPT_L2` is declined by **every** flavor —
-its decode needs `qh_per_kh` and `seqlen_kv`, which the SM107 call sites do not
-pass, so it raises rather than miscomputes. Both are follow-ups.
+`q_clusters * CTA_MMA`). `SCHED_LPT_L2` stays declined on every f16 flavor and
+on d256 / d512 of every dtype family — those kernels' decode call sites pass
+neither `qh_per_kh` nor `seqlen_kv`, so the decode raises rather than
+miscomputes. Threading them there is the same mechanical edit the MXFP8 pair
+received.
 
 **`STAGES_KV` on the d256 flavors is 2..4, not pinned to 2.** The old pin blamed
 a body that conflated the KV ring index with the 2-slot `S_acc` parity; the body
