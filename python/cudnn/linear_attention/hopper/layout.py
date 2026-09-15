@@ -30,6 +30,11 @@ So there are two guards, for the two places a layout arrives:
   q/k/v slices the op layer has always accepted working on this engine; an
   OUTPUT cannot be fixed that way (the kernel writes it in place and a copy
   back would be a second silent behaviour), so it raises.
+
+Every copy this module makes is issued ON THE EXECUTION STREAM. A torch op runs
+on torch's ambient stream, which has no dependency on the stream the kernel is
+launched on, so a repack done outside that context is a race of exactly the kind
+this module exists to prevent.
 """
 
 from __future__ import annotations
@@ -81,16 +86,18 @@ def declared_layout_reason(node, engine: str) -> Optional[str]:
     return None
 
 
-def packed_addresses(names: Sequence[str], views: Iterable, engine: str) -> Tuple[dict, List]:
+def packed_addresses(names: Sequence[str], views: Iterable, engine: str, stream: int) -> Tuple[dict, List]:
     """``({port: device address}, keepalive)`` with every address packed.
 
-    The keepalive list holds any repacked copies and MUST outlive the launch --
-    dropping it frees the buffer the kernel is about to read.
+    Any repack is issued on ``stream``, the stream the kernel will run on. The
+    keepalive list holds the copies and MUST outlive the launch -- dropping one
+    frees the buffer the kernel is about to read.
     """
     import torch
 
     addr = {}
     keepalive: List = []
+    padded = []
     for name, view in zip(names, views):
         if _packed(view.shape, view.stride()):
             addr[name] = int(view.data_ptr())
@@ -101,7 +108,12 @@ def packed_addresses(names: Sequence[str], views: Iterable, engine: str) -> Tupl
                 f"passed with shape={tuple(view.shape)} stride={tuple(view.stride())}. "
                 f"Pass a contiguous output buffer, or select another KDA engine with plan_name."
             )
-        packed = torch.from_dlpack(view).contiguous()
-        keepalive.append(packed)
-        addr[name] = int(packed.data_ptr())
+        padded.append((name, view))
+
+    if padded:
+        with torch.cuda.stream(torch.cuda.ExternalStream(int(stream))):
+            for name, view in padded:
+                packed = torch.from_dlpack(view).contiguous()
+                keepalive.append(packed)
+                addr[name] = int(packed.data_ptr())
     return addr, keepalive

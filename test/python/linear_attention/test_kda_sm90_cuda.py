@@ -210,3 +210,39 @@ def test_cuda_graph_capture_replays(shape):
 
     torch.testing.assert_close(captured_o.float(), eager_o.float(), atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(captured_fs, eager_fs, atol=2e-2, rtol=2e-2)
+
+
+@requires_hopper
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32_state", "bf16_state"])
+@pytest.mark.parametrize("cu_dtype", [torch.int32, torch.int64], ids=["int32_cu", "int64_cu"])
+@pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16], ids=["fp32_gate", "bf16_gate"])
+def test_serving_dtypes_reach_the_fused_kernel(state_dtype, cu_dtype, gate_dtype):
+    """bf16 state, int64 cu_seqlens and a bf16 gate must all reach this engine.
+
+    That combination is what FlashInfer and vLLM's Kimi path hand cuDNN. The
+    kernel itself takes an int32 chunk table and fp32 gate/beta/state, so these
+    are converted at execute; declining them instead sent the whole call to an
+    engine roughly 3.5x slower. Both halves are asserted: that the fused kernel
+    actually ran, and that converting did not change the answer.
+    """
+    q, k, v, g, beta, cu, s0 = make_case(T=512, H=4, N=2)
+
+    ref_o, ref_fs = kimi_delta_attention(q, k, v, g, beta, cu, initial_state=s0, output_final_state=True, plan_name=ENGINE)[:2]
+
+    call = lambda: kimi_delta_attention(  # noqa: E731
+        q,
+        k,
+        v,
+        g.to(gate_dtype),
+        beta,
+        cu.to(cu_dtype),
+        initial_state=s0.to(state_dtype),
+        output_final_state=True,
+        plan_name=ENGINE,
+    )
+    got_o, got_fs = call()[:2]
+    torch.cuda.synchronize()
+
+    assert any("kda_fused" in name for name in launched_kernels(call)), "converted call left the fused engine"
+    torch.testing.assert_close(got_o.float(), ref_o.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(got_fs.float(), ref_fs.float(), atol=3e-2, rtol=3e-2)

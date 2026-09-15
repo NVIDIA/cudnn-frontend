@@ -67,6 +67,7 @@ from cudnn.frost import buffers
 from cudnn.graph_types import NodeType
 
 from ..graph_analyzer import analyze
+from . import marshal
 from .layout import declared_layout_reason, packed_addresses
 
 if TYPE_CHECKING:
@@ -97,6 +98,7 @@ class KdaHopperCudaPlan(CompiledPlan):
         self._scratch_state = None
         self._zero_state = None
         self._device = None
+        self._convert = {}
 
     def get_workspace_size(self) -> int:
         # The kernel declares a workspace and never touches it, so nothing is
@@ -115,23 +117,31 @@ class KdaHopperCudaPlan(CompiledPlan):
             self.indices = list(slots.inputs.values()) + list(slots.outputs.values())
         views = variant_pack.operands(self.indices)
 
-        # The kernel takes raw device addresses, so unlike the CuTe DSL path
-        # there is no DLPack conversion at all on this route -- the OperandBuffer
-        # already knows its pointer.
-        # The kernel never sees a stride, so a padded operand would be read as if
-        # it were packed. Checked per call, because _normalize records the
-        # CALLER's geometry and never checks it against the declaration. A padded
-        # input is repacked (keepalive must outlive the launch); a padded output
-        # raises, since it is written in place.
-        addr, _keepalive = packed_addresses(self.names, views, "KdaHopperCudaEngine")
-
         if self._device is None:
             self._device = torch.from_dlpack(views[0]).device
-        # Resolved before the optional buffers, which are filled on it.
+        # Resolved first: every copy and fill below is issued on it.
         stream = ctx.stream if ctx.stream else torch.cuda.current_stream().cuda_stream
 
+        # The OperandBuffer already knows its pointer, so there is no DLPack
+        # conversion on this route. The kernel never sees a stride, though, so a
+        # padded operand would be read as if it were packed; a padded input is
+        # repacked (keepalive must outlive the launch) and a padded output
+        # raises, since it is written in place.
+        addr, _keepalive = packed_addresses(self.names, views, "KdaHopperCudaEngine", stream)
+        view_of = dict(zip(self.names, views))
+
+        # The kernel takes an int32 chunk table and an fp32 state; FlashInfer
+        # passes int64 cu_seqlens and a bf16 state pool. Both are small next to
+        # q/k/v, so they are converted rather than declined -- see marshal.py.
+        addr["cu_seqlens"] = marshal.as_input(view_of["cu_seqlens"], torch.int32, self._convert, "cu", stream)
+        for port in ("g", "beta"):
+            addr[port] = marshal.as_input(view_of[port], torch.float32, self._convert, port, stream)
+        if "initial_state" in addr:
+            addr["initial_state"] = marshal.as_input(view_of["initial_state"], torch.float32, self._convert, "is", stream)
+
+        staged_fs = caller_fs = None
         if "final_state" in addr:
-            final_state = addr["final_state"]
+            final_state, staged_fs, caller_fs = marshal.stage_output(view_of["final_state"], torch.float32, self._convert, "fs", stream)
         else:
             if self._scratch_state is None:
                 self._scratch_state = torch.empty(
@@ -181,6 +191,8 @@ class KdaHopperCudaPlan(CompiledPlan):
             n_seqs=self.n_seqs,
             n_heads=self.h,
         )
+        # A bf16 final_state was written through an fp32 staging buffer.
+        marshal.write_back(staged_fs, caller_fs, stream)
 
 
 class KdaHopperCudaBwdPlan(CompiledPlan):
@@ -205,6 +217,7 @@ class KdaHopperCudaBwdPlan(CompiledPlan):
         self._zeros = {}
         self._scratch_dis = None
         self._device = None
+        self._convert = {}
 
     def get_workspace_size(self) -> int:
         from . import cuda_bwd_host
@@ -243,18 +256,23 @@ class KdaHopperCudaBwdPlan(CompiledPlan):
             self.indices = list(slots.inputs.values()) + list(slots.outputs.values())
         views = variant_pack.operands(self.indices)
 
-        # Raw device addresses -- no DLPack conversion on this route.
-        # The kernel never sees a stride, so a padded operand would be read as if
-        # it were packed. Checked per call, because _normalize records the
-        # CALLER's geometry and never checks it against the declaration. A padded
-        # input is repacked (keepalive must outlive the launch); a padded output
-        # raises, since it is written in place.
-        addr, _keepalive = packed_addresses(self.names, views, "KdaHopperCudaEngine")
-
         if self._device is None:
             self._device = torch.from_dlpack(views[0]).device
-        # Resolved before the optional buffers, which are zero-filled on it.
+        # Resolved first: every copy and fill below is issued on it.
         stream = ctx.stream if ctx.stream else torch.cuda.current_stream().cuda_stream
+
+        # Raw device addresses -- no DLPack conversion on this route. A padded
+        # input is repacked on the execution stream; a padded output raises.
+        addr, _keepalive = packed_addresses(self.names, views, "KdaHopperCudaEngine", stream)
+        view_of = dict(zip(self.names, views))
+
+        # Same marshalling as the forward: int32 chunk table, fp32 states.
+        addr["cu_seqlens"] = marshal.as_input(view_of["cu_seqlens"], torch.int32, self._convert, "cu", stream)
+        for port in ("g", "beta"):
+            addr[port] = marshal.as_input(view_of[port], torch.float32, self._convert, port, stream)
+        for port, key in (("initial_state", "is"), ("d_final_state", "dfs")):
+            if port in addr:
+                addr[port] = marshal.as_input(view_of[port], torch.float32, self._convert, key, stream)
 
         state_shape = (self.n_seqs, self.h, self.k, self.k)
         # initial_state and d_final_state are optional; absent means "zero".
@@ -263,8 +281,9 @@ class KdaHopperCudaBwdPlan(CompiledPlan):
 
         # The kernel always writes d_initial_state; a graph that did not ask for
         # it gets a scratch buffer whose result is dropped.
+        staged_dis = caller_dis = None
         if "d_initial_state" in addr:
-            d_initial_state = addr["d_initial_state"]
+            d_initial_state, staged_dis, caller_dis = marshal.stage_output(view_of["d_initial_state"], torch.float32, self._convert, "dis", stream)
         else:
             if self._scratch_dis is None:
                 self._scratch_dis = torch.empty(*state_shape, dtype=torch.float32, device=self._device)
@@ -293,6 +312,8 @@ class KdaHopperCudaBwdPlan(CompiledPlan):
             n_heads=self.h,
             n_seqs=self.n_seqs,
         )
+        # A bf16 d_initial_state was written through an fp32 staging buffer.
+        marshal.write_back(staged_dis, caller_dis, stream)
 
 
 class KdaHopperCudaEngine(BaseEngine):
@@ -342,10 +363,11 @@ class KdaHopperCudaEngine(BaseEngine):
                 ("dV", facts.dv_dtype, cudnn.data_type.BFLOAT16),
                 ("dG", facts.dg_dtype, cudnn.data_type.FLOAT),
                 ("dBeta", facts.dbeta_dtype, cudnn.data_type.FLOAT),
-                ("d_initial_state", facts.d_initial_state_dtype, cudnn.data_type.FLOAT),
-                ("d_final_state", facts.d_final_state_dtype, cudnn.data_type.FLOAT),
+                ("d_initial_state", facts.d_initial_state_dtype, (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)),
+                ("d_final_state", facts.d_final_state_dtype, (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)),
             ):
-                if dtype not in (want, None):
+                allowed = want if isinstance(want, tuple) else (want,)
+                if dtype is not None and dtype not in allowed:
                     raise NotImplementedError(f"KdaHopperCudaEngine: '{label}' must be {want}, got {dtype}")
         if facts.checkpoint_every_n_tokens:
             raise NotImplementedError("KdaHopperCudaEngine: state_checkpoints are not produced by the Hopper kernel")
@@ -381,8 +403,9 @@ class KdaHopperCudaEngine(BaseEngine):
         # other scale would be silently ignored and produce a wrong answer.
         if facts.scale is not None and abs(facts.scale - HEAD_DIM**-0.5) > 1e-9:
             raise NotImplementedError(f"KdaHopperCudaEngine: only the default scale 1/sqrt({HEAD_DIM}) is supported, got {facts.scale}")
-        if facts.cu_dtype not in (cudnn.data_type.INT32, None):
-            raise NotImplementedError(f"KdaHopperCudaEngine: cu_seqlens must be int32, got {facts.cu_dtype}")
+        # int64 cu_seqlens is converted at execute (N + 1 elements); see marshal.py.
+        if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
+            raise NotImplementedError(f"KdaHopperCudaEngine: cu_seqlens must be int32 or int64, got {facts.cu_dtype}")
         if facts.d_qk != HEAD_DIM or facts.d_v != HEAD_DIM:
             raise NotImplementedError(f"KdaHopperCudaEngine: head dims must be {HEAD_DIM}, got K={facts.d_qk} V={facts.d_v}")
         if not (facts.h_q == facts.h_k == facts.h_v):
@@ -391,14 +414,28 @@ class KdaHopperCudaEngine(BaseEngine):
             )
         if facts.io_dtype not in (cudnn.data_type.BFLOAT16, None):
             raise NotImplementedError(f"KdaHopperCudaEngine: q/k/v must be bf16, got {facts.io_dtype}")
-        if facts.g_dtype not in (cudnn.data_type.FLOAT, None):
-            raise NotImplementedError(f"KdaHopperCudaEngine: 'g' must be fp32, got {facts.g_dtype}")
-        if facts.beta_dtype not in (cudnn.data_type.FLOAT, None):
-            raise NotImplementedError(f"KdaHopperCudaEngine: 'beta' must be fp32, got {facts.beta_dtype}")
-        if facts.final_state_dtype not in (cudnn.data_type.FLOAT, None):
-            raise NotImplementedError(f"KdaHopperCudaEngine: 'final_state' must be fp32, got {facts.final_state_dtype}")
-        if facts.state_dtype not in (cudnn.data_type.FLOAT, None):
-            raise NotImplementedError(f"KdaHopperCudaEngine: 'initial_state' must be fp32, got {facts.state_dtype}")
+        # The kernel reads the gate and beta in fp32. FlashInfer passes both at
+        # q's dtype, so on the FORWARD they are converted at execute rather than
+        # declined -- one extra pass over g against losing an engine that is 3.5x
+        # the alternative.
+        #
+        # Forward only, deliberately. A 16-bit gate on a backward node means
+        # 16-bit dG and dBeta as well, and the kernel writes those in fp32;
+        # supporting it would mean staging both gradients through fp32 buffers,
+        # which is real work for a path FlashInfer does not use (its KDA is
+        # prefill only). So the backward stays fp32-strict and such a graph goes
+        # to an engine that serves it.
+        sixteen_bit = () if facts.is_bwd else (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
+        if facts.g_dtype not in (cudnn.data_type.FLOAT, *sixteen_bit, None):
+            raise NotImplementedError(f"KdaHopperCudaEngine: 'g' must be fp32{'' if facts.is_bwd else ', bf16 or fp16'}, got {facts.g_dtype}")
+        if facts.beta_dtype not in (cudnn.data_type.FLOAT, *sixteen_bit, None):
+            raise NotImplementedError(f"KdaHopperCudaEngine: 'beta' must be fp32{'' if facts.is_bwd else ', bf16 or fp16'}, got {facts.beta_dtype}")
+        # The kernel carries the state in fp32; a bf16 state is converted at
+        # execute, which is what FlashInfer and vLLM's Kimi path hand cuDNN.
+        if facts.final_state_dtype not in (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, None):
+            raise NotImplementedError(f"KdaHopperCudaEngine: 'final_state' must be fp32 or bf16, got {facts.final_state_dtype}")
+        if facts.state_dtype not in (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, None):
+            raise NotImplementedError(f"KdaHopperCudaEngine: 'initial_state' must be fp32 or bf16, got {facts.state_dtype}")
         if not facts.thd_layout:
             raise NotImplementedError("KdaHopperCudaEngine: q/k/v must be THD [total_T, heads, dim]")
 
