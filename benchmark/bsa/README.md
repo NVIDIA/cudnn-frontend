@@ -1,5 +1,8 @@
 # SM120 native blk128 BSA benchmark
 
+Start with [the reviewer summary](SM120_REVIEW_SUMMARY.md) for the adopted
+optimizations, current paired results, limitations, and reproduction commands.
+
 See [the optimization screening log](SM120_OPTIMIZATION.md) for ongoing
 same-device comparisons against the current kernel and the additional 5% goal.
 

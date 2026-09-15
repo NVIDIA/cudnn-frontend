@@ -122,7 +122,7 @@ valid.
 
 `sparse_block_size=None` chooses blk64 on SM90/SM120 and blk128 on
 SM100/SM103. On SM120, passing `sparse_block_size=128` selects a native
-128-by-128 CTA kernel that consumes blk128 metadata directly; it does not
+KV128 kernel that consumes blk128 metadata directly; it does not
 expand the metadata or invoke the blk64 kernel. Passing `sparse_block_size=64`
 explicitly selects the SM100/SM103 blk64 CuTe DSL path, whose shape support is
 narrower. `kv_splits` is available on SM90 and the explicit Blackwell blk64
@@ -130,9 +130,15 @@ path; `use_clc` applies only to the explicit Blackwell blk64 path.
 
 For SM120 blk128 with fixed `block_sparse_num`, full physical KV blocks
 (`block_sizes=None`), and a KV sequence length divisible by 128, the dispatcher
-uses an FA4-style native specialization with a dedicated K/V load warp and
-register-resident Q. Variable per-row block counts, explicit block sizes, and
-partial final KV blocks use the general native blk128 kernel.
+uses an FA4-style native specialization with a dedicated K/V load warp,
+register-resident Q, and a four-fold-unrolled sparse loop. Most CTAs process
+128 Q rows; an underfilled final scheduling wave may use 64 Q rows per CTA
+while still loading full KV128 blocks and using the parent Q block's original
+metadata. This is Q-work scheduling, not KV128-to-KV64 lowering. Variable
+per-row block counts, explicit block sizes, and partial final KV blocks use
+the general native blk128 kernel. See the
+[SM120 optimization summary](../../benchmark/bsa/SM120_REVIEW_SUMMARY.md) for
+measured gains and limitations.
 
 `kv_splits=2..256` computes FP32 partial outputs and combines them, with
 workspace growing linearly in the split count. SM90 accepts an explicit integer
