@@ -16,7 +16,6 @@ From the repository root:
 The full directory also contains other BSA tests. Unsupported configurations
 skip; legacy-comparison cases require SM120_PR1010_SOURCE_DIR, whose preparation
 and full-workload commands are in test_sm120_three_paths_benchmark.py.
-test_sm120_blk128_pair_benchmark.py documents saved-kernel A/B measurements.
 
 For a fresh single-GPU comparison with PyTorch's cuDNN dense SDPA backend:
 
