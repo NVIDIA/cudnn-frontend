@@ -17,9 +17,14 @@ CONFIGS=("$@")
 cd "$(dirname "$0")/../.." || exit 1
 
 mkdir -p benchmark/dsa/results
+status=0
 for cfg in "${CONFIGS[@]}"; do
     echo "=== $cfg -> results/$cfg/$ARCH ==="
-    python -m benchmark.dsa.runner --config "$cfg" \
+    if ! python -m benchmark.dsa.runner --config "$cfg" \
         --output-dir "benchmark/dsa/results/$cfg/$ARCH" \
-        2>&1 | tee "benchmark/dsa/results/${cfg}_${ARCH}.log" || echo "!! $cfg failed"
+        2>&1 | tee "benchmark/dsa/results/${cfg}_${ARCH}.log"; then
+        echo "!! $cfg failed"
+        status=1
+    fi
 done
+exit "$status"

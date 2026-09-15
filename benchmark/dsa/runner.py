@@ -161,7 +161,8 @@ class DsaBenchmarkRunner:
         line = next((l for l in proc.stdout.splitlines() if l.startswith("RESULT,")), None)
         if proc.returncode != 0 or line is None:
             tail = "\n".join((proc.stderr or proc.stdout).splitlines()[-12:])
-            return BenchmarkResult(**base, **failed, error_message=tail[-1500:])
+            message = tail[-1500:].strip() or f"subprocess exited with code {proc.returncode} and produced no output"
+            return BenchmarkResult(**base, **failed, error_message=message)
 
         _, ms, tflops, peak, gpu, cudnn_version, detail = line.split(",", 6)
         return BenchmarkResult(
@@ -220,6 +221,9 @@ class DsaBenchmarkRunner:
             output_dir = Path(config.output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             output_path = output_dir / f"{config.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        else:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_path, index=False, float_format="%.3f")
         logger.info(f"Results saved to {output_path}")
         return output_path
