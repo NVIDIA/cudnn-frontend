@@ -687,6 +687,8 @@ cudnn.sdpa.bwd.SdpaBwdDslSm80.check_support
 cudnn.sdpa.bwd.SdpaBwdDslSm80.compile
 cudnn.sdpa.bwd.SdpaBwdDslSm80.execute
 cudnn.sdpa.bwd.SdpaBwdDslSm80.scratch_workspace_bytes
+cudnn.sdpa.bwd.SdpaBwdDslSm80.thd_total_kv
+cudnn.sdpa.bwd.SdpaBwdDslSm80.thd_total_q
 cudnn.sdpa.bwd.nvfp4_attention_qat_backward
 cudnn.sdpa.bwd.sdpa_bwd_wrapper_dsl_sm120
 cudnn.sdpa.bwd.sdpa_bwd_wrapper_sm80
