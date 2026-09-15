@@ -34,6 +34,8 @@ from cudnn.frost import buffers
 from cudnn.graph_types import NodeType
 
 from ..graph_analyzer import analyze
+from . import marshal
+from .layout import declared_layout_reason
 
 if TYPE_CHECKING:
     from cudnn._pygraph import pygraph
@@ -89,6 +91,19 @@ class KdaHopperPlan(CompiledPlan):
             self.names = list(slots.inputs) + list(slots.outputs)
             self.indices = list(slots.inputs.values()) + list(slots.outputs.values())
         views = variant_pack.operands(self.indices)
+        # check_support gates the layouts the GRAPH declares, which is what routes
+        # a padded graph elsewhere. This is the other half: _normalize takes each
+        # operand's geometry from the producer's own DLPack vtable and never checks
+        # it against the declaration, so declaring packed and passing padded is
+        # reachable. The kernel builds its state slabs at a fixed stride=(128, 1)
+        # and would read such an operand as if it were compact.
+        for name, view in zip(self.names, views):
+            if not marshal.packed(view.shape, view.stride()):
+                raise NotImplementedError(
+                    f"KdaHopperEngine: the sm90 CuTe DSL kernel indexes packed row-major operands, but "
+                    f"'{name}' was passed with shape={tuple(view.shape)} stride={tuple(view.stride())}. "
+                    f"Pass a contiguous tensor, or select another KDA engine with plan_name."
+                )
         # Operands arrive as cuDNN OperandBuffer views, which implement DLPack,
         # so convert them STRAIGHT to CuTe tensors. Borrowing them as torch
         # tensors first would cost two DLPack conversions per operand instead of
@@ -182,6 +197,15 @@ class KdaHopperEngine(BaseEngine):
         # Hopper path at all.
         if facts.is_bwd:
             raise NotImplementedError("KdaHopperEngine: forward only; there is no Hopper KDA backward kernel yet")
+        # The kernel builds its state slabs at a fixed stride=(128, 1) and
+        # indexes q/k/v/o as packed THD, so a padded operand is read as if it
+        # were packed. Declining here routes such a graph to an engine that
+        # honours strides. (The kernel this replaced tolerated some of these;
+        # the campaign's faster one does not, so the gate travels with it.)
+        (node,) = graph.nodes
+        reason = declared_layout_reason(node, "KdaHopperEngine")
+        if reason is not None:
+            raise NotImplementedError(reason)
         if facts.checkpoint_every_n_tokens:
             raise NotImplementedError("KdaHopperEngine: state_checkpoints are not produced by the Hopper kernel")
         if facts.safe_gate or facts.has_a_log or facts.has_dt_bias:
