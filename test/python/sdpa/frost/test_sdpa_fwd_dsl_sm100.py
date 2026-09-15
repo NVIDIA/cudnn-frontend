@@ -37,10 +37,6 @@ _skip_pack_gqa_on_rubin = pytest.mark.skipif(_SM == 107, reason="no PackGQA path
 # `_skip_thd_on_rubin` marker is RETIRED rather than left as a no-op that reads
 # like a live gate.  What the Rubin f16 row still declines is per-FEATURE --
 # split-KV and PackGQA -- and those keep their own markers.
-_skip_stats_trim_on_rubin = pytest.mark.skipif(
-    _SM == 107,
-    reason="per-batch seq_len_q O/LSE trim not carried by the Rubin f16 kernels " "(row: padded_stats=False / dense_seq_q_trim=False)",
-)
 
 
 def _ref_sdpa(q, k, v, *, is_causal, scale):
@@ -441,7 +437,6 @@ def test_dsl_sm100_padded(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_stats_trim_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_graph_api_padded_bottom_right_gqa():
@@ -476,7 +471,6 @@ def test_dsl_sm100_graph_api_padded_bottom_right_gqa():
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_stats_trim_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["llama_d128", "mla_d192_d128", "qwen_d256", "dsv4_d512"])
 @torch_fork_set_rng(seed=0)
@@ -529,6 +523,128 @@ def test_dsl_sm100_bottom_right_padded_seq_q(d_qk, d_v):
     assert o[dead].abs().max().item() == 0.0, "trimmed Q rows are not zero"
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["llama_d128", "mla_d192_d128", "qwen_d256", "dsv4_d512"])
+@pytest.mark.parametrize("with_sink", [False, True], ids=["nosink", "sink"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_bottom_right_keyless_rows(d_qk, d_v, with_sink):
+    """Bottom-right with seq_len_kv[b] < seq_len_q[b]: rows above the diagonal
+    have no live key inside a live tile. Without a sink they are exactly
+    O = 0 / LSE = -inf; with one the row's mass is the sink alone, so
+    LSE = sink_logit and O = 0. scale * log2(e) > 1 overflows a finite mask
+    sentinel, the case a softmax-sum dead-row test misses (NaN under a sink)."""
+    _require_dsl()
+    dtype = torch.float16
+    b, h_q, h_kv, s = 3, 8, 4, 256
+    scale = 0.75
+    q = _bhsd(b, h_q, s, d_qk, dtype)
+    k = _bhsd(b, h_kv, s, d_qk, dtype)
+    v = _bhsd(b, h_kv, s, d_v, dtype)
+    seq_q_lens = torch.tensor([256, 129, 0], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    seq_kv_lens = torch.tensor([200, 256, 128], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    sink = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_len_kv=seq_kv_lens,
+        seq_len_q=seq_q_lens,
+        sink=sink,
+        return_stats=True,
+    )
+    lse = lse.squeeze(-1)  # dense Stats storage is (B, H, S, 1)
+    o_ref, lse_ref = _ref_sdpa_full(
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=True,
+        bottom_right=True,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+        sinks=sink.flatten() if with_sink else None,
+        return_stats=True,
+    )
+    assert torch.isfinite(o.float()).all(), "keyless rows must not NaN the output"
+    # batch 0: diagonal 200 - 256 = -56 -> rows 0..55 keyless; batch 1 trims at 129; batch 2 is empty
+    assert (o[0, :, :56] == 0).all() and (o[1, :, 129:] == 0).all() and (o[2] == 0).all()
+    assert torch.isneginf(lse[1, :, 129:]).all() and torch.isneginf(lse[2]).all()
+    if with_sink:
+        torch.testing.assert_close(lse[0, :, :56], sink.view(h_q, 1).expand(h_q, 56), atol=1e-4, rtol=0)
+    else:
+        assert torch.isneginf(lse[0, :, :56]).all()
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse[0], lse_ref[0], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse[1, :, :129], lse_ref[1, :, :129], atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["llama_d128", "mla_d192_d128", "qwen_d256", "dsv4_d512"])
+@pytest.mark.parametrize("empty_by", ["kv_zero", "q_trim"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_empty_tiles_between_live_tiles_multiwave(d_qk, d_v, empty_by):
+    """Empty tiles (a zero-length KV batch, or a batch whose Q length collapses
+    every tile) interleaved with live tiles across more tiles than SMs, so a
+    persistent worker handles an empty tile and then another one. Every warp
+    role must keep its barrier phases in lockstep through the empty tile: the
+    SM107 d256 templates once consumed the softmax's end-of-tile stats only for
+    non-empty tiles and deadlocked on the tile after an empty one. Runs under a
+    hard timeout so a regression fails instead of hanging the session."""
+    _require_dsl()
+    import threading
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    dtype = torch.float16
+    b, h, s_q, s_kv = 16, 32, 1, 300  # 512 single-row tiles
+    q = _bhsd(b, h, s_q, d_qk, dtype)
+    k = _bhsd(b, h, s_kv, d_qk, dtype)
+    v = _bhsd(b, h, s_kv, d_v, dtype)
+    o = torch.full((b, s_q, h, d_v), _THD_SENTINEL, device="cuda", dtype=dtype).transpose(1, 2)
+    lse = torch.full((b, h, s_q), _THD_SENTINEL, dtype=torch.float32, device="cuda")
+    if empty_by == "kv_zero":
+        kv_lens = torch.tensor([s_kv, 0] * (b // 2), dtype=torch.int32, device="cuda")
+        q_lens = None
+    else:
+        kv_lens = torch.tensor([s_kv, s_kv // 2] * (b // 2), dtype=torch.int32, device="cuda")
+        q_lens = torch.tensor([1, 0] * (b // 2), dtype=torch.int32, device="cuda")
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        scale_softmax=1.0 / math.sqrt(d_qk),
+        is_causal=True,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=q_lens is not None,
+    )
+    assert api.check_support()
+    api.compile()
+    kw = dict(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, seq_kv_lens=kv_lens)
+    if q_lens is not None:
+        kw["seq_q_lens"] = q_lens
+    done = threading.Event()
+
+    def _run():
+        api.execute(**kw)
+        torch.cuda.synchronize()
+        done.set()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    assert done.wait(timeout=120), "kernel did not finish in 120 s: a persistent worker deadlocked after an empty tile"
+    dead = torch.zeros(b, dtype=torch.bool, device="cuda")
+    dead[1::2] = True
+    assert (o[dead] == 0).all() and torch.isneginf(lse[dead]).all()
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=1.0 / math.sqrt(d_qk), is_causal=True, seq_q_lens=q_lens, seq_kv_lens=kv_lens, return_stats=True)
+    torch.testing.assert_close(o[~dead], o_ref[~dead], atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse[~dead], lse_ref[~dead], atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0
@@ -629,6 +745,139 @@ def test_dsl_sm100_execute_sink_lse_contract():
     api.compile()
     with pytest.raises(ValueError, match="without an LSE output"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv, seq_kv_lens=seq_kv, lse_tensor=lse_tm)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("length_device", ["cpu", "meta"])
+def test_dsl_sm100_q_trim_rejects_non_cuda_lengths(monkeypatch, length_device):
+    """A dense Q-length buffer becomes a raw address: reject host/meta storage before launch."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 128, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, seq_q_lens_present=True, seq_kv_lens_present=True)
+    assert api.check_support()
+    launches = []
+    # Stop at the launch boundary: the unfixed adapter must fail this test
+    # without handing an invalid pointer to a real kernel and poisoning CUDA.
+    monkeypatch.setattr(api, "_compiled_kernel", lambda *args, **kwargs: launches.append(args))
+    q_lens = torch.full((b,), s, dtype=torch.int32, device=length_device)
+    kv_lens = torch.full((b,), s, dtype=torch.int32, device=q.device)
+    with pytest.raises(ValueError, match="seq_q_lens must be a CUDA tensor on the same device as q_tensor"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=q_lens, seq_kv_lens=kv_lens)
+    assert not launches
+
+
+@pytest.mark.L0
+def test_thd_padded_lse_order_is_cutes_stride_order_for_every_compact_layout():
+    """The dynamic THD plan hands the kernel a COMPACT LSE fake in the caller's
+    dim order instead of explicit strides. CuTe's ``stride_order`` is per axis
+    (the rank of its stride), the inverse of "axes sorted by stride"; the two
+    agree only on self-inverse orders such as FlashInfer's (b, s_max, h), so
+    every one of the six (b, h, s_max) storage orders is checked against the
+    strides CuTe derives. A gapped layout has no compact order."""
+    _require_dsl()
+    from itertools import permutations
+    from types import SimpleNamespace
+
+    import cutlass
+    import cutlass.cute as cute
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s = 2, 3, 5
+    shape = (b, h, s, 1)
+    for storage_order in permutations(range(3)):  # slowest axis first
+        st, acc = [0, 0, 0], 1
+        for ax in reversed(storage_order):
+            st[ax] = acc
+            acc *= shape[ax]
+        api = SimpleNamespace(_lse_stride=tuple(st), batch_size=b, h_q=h, s_q_max=s)
+        order = SdpaFwdDslSm100._thd_padded_lse_order(api)
+        assert order is not None, (storage_order, st)
+        fake = cute.runtime.make_fake_compact_tensor(cutlass.Float32, shape, stride_order=order, assumed_align=4)
+        got = tuple(fake.stride)
+        assert all(shape[i] == 1 or got[i] == st[i] for i in range(4)), f"storage order {storage_order}: declared {st}, order {order}, CuTe derived {got}"
+    gapped = SimpleNamespace(_lse_stride=(h * s * 2, s * 2, 2), batch_size=b, h_q=h, s_q_max=s)
+    assert SdpaFwdDslSm100._thd_padded_lse_order(gapped) is None
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout():
+    """A padded Stats whose (b, h, s_max) storage order is (h, s_max, b) --
+    logical strides (1, s_max*b, b). The order and its inverse differ, and the
+    wrong one pins the h axis to stride 1 in the compiled fake, so the kernel
+    (whose other strides are dynamic) binds a layout the buffer does not have.
+    Rows must equal the contiguous layout's, tails -inf."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 256, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
+
+    def run(lse):
+        api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True, thd_stats_padded=True)
+        assert api.check_support()
+        api.compile()
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse)
+        torch.cuda.synchronize()
+        return api
+
+    ref = torch.full((b, h, s), float("nan"), dtype=torch.float32, device="cuda")
+    run(ref)
+    hsb = torch.full((h, s, b), float("nan"), dtype=torch.float32, device="cuda").permute(2, 0, 1)  # (b, h, s) view, strides (1, s*b, b)
+    api = run(hsb)
+    assert tuple(hsb.stride()) == (1, s * b, b)
+    assert SdpaFwdDslSm100._thd_padded_lse_order(api) == (1, 3, 2, 0)  # the axis list sorted by stride would be (3, 0, 2, 1)
+    for i, n in enumerate(lens.tolist()):
+        torch.testing.assert_close(hsb[i, :, :n], ref[i, :, :n], atol=0, rtol=0)
+        assert torch.isneginf(hsb[i, :, n:]).all(), f"batch {i}: rows past the length are not -inf"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_padded_stats_execute_checks_the_buffer():
+    """A per-batch padded Stats buffer is bound through the DECLARED (b, h, s_max)
+    strides, so execute() first checks that the runtime buffer is exactly
+    B*H_q*s_max fp32 values: a larger or smaller storage would be silently
+    re-addressed (or fail inside as_strided) otherwise. The right-sized buffer
+    runs, and its rows past each sequence's length read -inf."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 256, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    lse = torch.full((b, h, s), float("nan"), dtype=torch.float32, device="cuda")
+    lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True, thd_stats_padded=True)
+    assert api.check_support() and api.thd_stats_padded
+    api.compile()
+    with pytest.raises(ValueError, match="padded lse_tensor must have"):
+        api.execute(
+            q_tensor=q,
+            k_tensor=k,
+            v_tensor=v,
+            o_tensor=o,
+            seq_q_lens=lens,
+            seq_kv_lens=lens,
+            lse_tensor=torch.empty(b, h, s + 1, dtype=torch.float32, device="cuda"),
+        )
+    with pytest.raises(ValueError, match="padded lse_tensor must have"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse[:, :, :-1])
+    with pytest.raises(ValueError, match="lse_tensor must be on"):  # a host pointer would reach the raw CUDA fill
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse.cpu())
+    with pytest.raises(ValueError, match="lse_tensor must be float32"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse.to(torch.bfloat16))
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse)
+    torch.cuda.synchronize()
+    for i, n in enumerate(lens.tolist()):
+        assert torch.isfinite(lse[i, :, :n]).all(), f"batch {i}: valid rows not written"
+        assert torch.isneginf(lse[i, :, n:]).all(), f"batch {i}: rows past the length are not -inf"
 
 
 @pytest.mark.L0

@@ -47,6 +47,7 @@ DSA_SPARSE_ATTENTION_BACKWARD_PARAM_MARKS = [
             # Regression for a packed-M tile crossing query boundaries. This
             # is the MLA shape that exposed catastrophic dQ/dKV corruption.
             (576, 512, 32),
+            (576, 512, 64),
         ],
     ),
     pytest.mark.parametrize("topk", [512]),

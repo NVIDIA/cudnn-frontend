@@ -246,7 +246,9 @@ THD_PERSISTENT = True
 _sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
-_bounds_for_tile = _sdpa_h.bounds_for_tile
+# qtrim variant: collapses the KV loop for CGA tiles entirely past the
+# per-batch actual Q length (SEQ_Q_LENS_PRESENT; folds to plain bounds otherwise).
+_bounds_for_tile = _sdpa_h.bounds_for_tile_qtrim
 _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 
@@ -294,19 +296,9 @@ if CFG.PACK_GQA:
 # SPLIT_KV == 1 every closure folds away and this is the classic kernel.
 
 
-@cute.jit
-def _bounds_for_tile_uniform(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, qh_per_kh: int = 1):
-    """Uniform bounds signature for make_split_helpers.
-
-    This flavor has no dead-Q-tile trim, so the seq-lens args are accepted
-    and ignored (callers pass None for them).
-    """
-    return _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, qh_per_kh)
-
-
 _split_h = make_split_helpers(
     CFG,
-    bounds_for_tile=_bounds_for_tile_uniform,
+    bounds_for_tile=_bounds_for_tile,
     dispatch_decode_initial=_dispatch_decode_initial,
     dispatch_decode_payload=_dispatch_decode_payload,
 )
@@ -428,6 +420,7 @@ def _kernel(
     n_batch: cutlass.Int32,
     qh_per_kh: cutlass.Int32,  # GQA group size = n_qh / n_kh.
     scale_softmax_log2: cutlass.Float32,
+    seq_q_lens_addr: cutlass.Int64 = 0,
     o_partial_f32: Optional[cute.Tensor] = None,
 ) -> None:
 
@@ -624,6 +617,7 @@ def _kernel(
             sched=sched,
             mb_softmax_ldtm=mb_softmax_ldtm,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_addr=seq_q_lens_addr,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
             n_batch=n_batch,
@@ -645,6 +639,7 @@ def _kernel(
             sched=sched,
             mb_softmax_ldtm=mb_softmax_ldtm,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_addr=seq_q_lens_addr,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
             n_batch=n_batch,
@@ -667,6 +662,7 @@ def _kernel(
             amax_o_tensor=amax_o_tensor,
             sinks_tensor=sinks_tensor,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_addr=seq_q_lens_addr,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
             n_batch=n_batch,
@@ -696,6 +692,7 @@ def _kernel(
                     sched=sched,
                     mb_softmax_ldtm=mb_softmax_ldtm,
                     seq_kv_lens_tensor=seq_kv_lens_tensor,
+                    seq_q_lens_addr=seq_q_lens_addr,
                     n_q_supers=n_q_supers,
                     n_qh=n_qh,
                     n_batch=n_batch,
@@ -711,6 +708,7 @@ def _kernel(
                     seqlen_q=seqlen_q,
                     seqlen_kv=seqlen_kv,
                     seq_kv_lens_tensor=seq_kv_lens_tensor,
+                    seq_q_lens_addr=seq_q_lens_addr,
                     n_q_supers=n_q_supers,
                     n_qh=n_qh,
                     n_batch=n_batch,
@@ -733,6 +731,7 @@ def _kernel(
                 sched=sched,
                 mb_softmax_ldtm=mb_softmax_ldtm,
                 seq_kv_lens_tensor=seq_kv_lens_tensor,
+                seq_q_lens_addr=seq_q_lens_addr,
                 n_q_supers=n_q_supers,
                 n_qh=n_qh,
                 n_batch=n_batch,
@@ -767,6 +766,7 @@ def _kernel(
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_addr=seq_q_lens_addr,
             o_desc_words=o_desc_words,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
@@ -790,6 +790,7 @@ def _kernel(
             n_batch=n_batch,
             cta_in_pair=cta_in_pair,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_addr=seq_q_lens_addr,
             o_desc_words=o_desc_words,
             qh_per_kh=qh_per_kh,
             seqlen_kv=seqlen_kv,
@@ -843,6 +844,7 @@ def _tmaldg_warp_group(
     seqlen_q,
     seqlen_kv,
     seq_kv_lens_tensor,
+    seq_q_lens_addr,
     o_desc_words,
     n_q_supers,
     n_qh,
@@ -925,8 +927,8 @@ def _tmaldg_warp_group(
         kv_left, kv_right = _nomask_range_split(seqlen_kv, split_idx)
     else:
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
-        bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+        bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx)
         kv_left = bounds_init.left
         kv_right = bounds_init.right
 
@@ -1125,8 +1127,8 @@ def _tmaldg_warp_group(
             kv_left, kv_right = _nomask_range_split(seqlen_kv, split_idx)
         elif cutlass.const_expr(CFG.MASK_FLAGS != 0):
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
-            bounds_next = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+            bounds_next = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx)
             kv_left = bounds_next.left
             kv_right = bounds_next.right
 
@@ -1153,6 +1155,7 @@ def _tmastg_warp_group(
     n_batch,
     cta_in_pair,
     seq_kv_lens_tensor,
+    seq_q_lens_addr,
     o_desc_words,
     seqlen_kv,
     qh_per_kh,
@@ -1247,6 +1250,7 @@ def _mma_warp_quiet(
     seqlen_q,
     seqlen_kv,
     seq_kv_lens_tensor,
+    seq_q_lens_addr,
     n_q_supers,
     n_qh,
     n_batch,
@@ -1293,6 +1297,7 @@ def _mma_warp_group(
     sched,
     mb_softmax_ldtm,
     seq_kv_lens_tensor,
+    seq_q_lens_addr,
     n_q_supers,
     n_qh,
     n_batch,
@@ -1428,8 +1433,8 @@ def _mma_warp_group(
             kv_left, kv_right = _nomask_range_split(seqlen_kv, split_idx)
         else:
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
-            bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+            bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx)
             kv_left = bounds_init.left
             kv_right = bounds_init.right
 
@@ -1736,8 +1741,8 @@ def _mma_warp_group(
                 kv_left, kv_right = _nomask_range_split(seqlen_kv, split_idx)
             else:
                 eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-                eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
-                bounds_next = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx)
+                eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+                bounds_next = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx)
                 kv_left = bounds_next.left
                 kv_right = bounds_next.right
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -1972,6 +1977,7 @@ def _softmax_warp_group(
     sched,
     mb_softmax_ldtm,
     seq_kv_lens_tensor,
+    seq_q_lens_addr,
     n_q_supers,
     n_qh,
     n_batch,
@@ -2019,8 +2025,8 @@ def _softmax_warp_group(
 
     eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
 
-    eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
-    bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx)
+    eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+    bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx)
 
     softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
     tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
@@ -2151,8 +2157,8 @@ def _softmax_warp_group(
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
-        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx)
 
 
 @cute.jit
@@ -2169,6 +2175,7 @@ def _correction_warp_group(
     amax_o_tensor: cute.Tensor,
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor,
+    seq_q_lens_addr,
     n_q_supers,
     n_qh,
     n_batch,
@@ -2218,8 +2225,8 @@ def _correction_warp_group(
 
     eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
 
-    eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
-    bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx)
+    eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+    bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -2312,7 +2319,20 @@ def _correction_warp_group(
             # (with a sink the denominator is finite but the O numerator is an
             # empty sum).  total_sum >= 2^P_CAST_LOG2_SCALE for any alive row
             # so this never fires spuriously.
+            q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
             row_dead = total_sum <= cutlass.Float32(0.0)
+            # A row with no live key inside a live tile -- bottom-right rows above the diagonal, a left band past
+            # the last key, a zero KV length -- read off the mask geometry: with the finite mask sentinel a keyless
+            # row's softmax sum is N (or NaN once the scaled sentinel overflows), so total_sum cannot tell it apart.
+            if cutlass.const_expr(CFG.MASK_FLAGS != 0):
+                _diag = (eff_seqlen_kv - eff_seqlen_q) if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+                _last_k = eff_seqlen_kv - cutlass.Int32(1)
+                if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
+                    _last_k = cute.math.min(_last_k, q_row_global + _diag + cutlass.Int32(CFG.WINDOW_RIGHT))
+                _first_k = cutlass.Int32(0)
+                if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
+                    _first_k = cute.math.max(_first_k, q_row_global + _diag - cutlass.Int32(CFG.WINDOW_LEFT))
+                row_dead = row_dead | (_first_k > _last_k)
             if cutlass.const_expr(CFG.HAS_SINK):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = sinks_arr[head_idx]
@@ -2322,6 +2342,8 @@ def _correction_warp_group(
                 # into the same units, then take the constant back out of the LSE.
                 new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True) * cutlass.Float32(2.0**P_CAST_LOG2_SCALE)
                 lse_val = new_max + cute.math.log(new_sum, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
+                # a keyless row with a sink holds the sink's mass alone; selected, since the fold above may be NaN
+                lse_val = cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(sink_logit).ir_value(), lse_val.ir_value()))
                 inv_sum = scale / new_sum
             else:
                 # total_sum carries 2^P_CAST_LOG2_SCALE — subtract the constant.
@@ -2334,7 +2356,18 @@ def _correction_warp_group(
                 inv_sum = cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
 
             # OOB-row guard: under cga2 cluster Q rows can exceed seqlen_q (else write aliases next head's LSE slot).
-            q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
+            if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
+                # Dense padded-Q trim: q rows >= seq_len_q[b] write O := 0 / LSE := -inf,
+                # applied AFTER the sink branch (a trimmed row is dead even with a sink).
+                # Folded into row_dead so the O store's select sanitizes the row even
+                # when the padded Q rows held NaN (0 * NaN is NaN).
+                _sq_arr = cute.make_tensor(cute.make_ptr(cutlass.Int32, seq_q_lens_addr, cute.AddressSpace.gmem, assumed_align=4), cute.make_layout(1 << 24))
+                _q_len_b = cutlass.Int32(_sq_arr[batch_idx])
+                row_trim = q_row_global >= _q_len_b
+                neg_inf_trim = cutlass.Float32(float("-inf"))
+                lse_val = cutlass.Float32(arith.select(row_trim.ir_value(), neg_inf_trim.ir_value(), lse_val.ir_value()))
+                inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
+                row_dead = row_dead | row_trim
             # has_lse=False: the Stats store is compiled out; the amax_o
             # atomicMax below is independent of it, gated only on _row_valid.
             if cutlass.const_expr(CFG.THD_VARLEN):
@@ -2357,8 +2390,12 @@ def _correction_warp_group(
                             lse_row = lse_arr[_cu_q_b + q_row_global, :]
                             lse_row[head_idx] = lse_val
                         else:
-                            lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                            lse_row[_cu_q_b + q_row_global] = lse_val
+                            if cutlass.const_expr(len(lse_tensor.shape) == 4):
+                                # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
+                                lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
+                            else:
+                                lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
+                                lse_row[_cu_q_b + q_row_global] = lse_val
             else:
                 _row_valid = q_row_global < seqlen_q
                 if cutlass.const_expr(lse_tensor is not None):
@@ -2463,8 +2500,8 @@ def _correction_warp_group(
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
-        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx)
 
     # mb_tmem_dealloc fan-out — all-lanes arrive + DSMEM-arrive on cross-pair peer under cga2.
     if cutlass.const_expr(CFG.CTA_MMA == 2):
@@ -2493,6 +2530,9 @@ def _host(
     problem_size: Tuple[int, int, int, int, int, int],
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
+    # Dense padded-Q trim: separate (B,)-int32 lengths. None folds the
+    # parameter and all consumers out when the specialization is disabled.
+    seq_q_lens_addr: cutlass.Int64 = 0,
     # THD device metadata build (issue #552): the CALLER's Q/KV length
     # tensors — (B,) per-batch lengths or (B+1,) cu prefix sums, per side via
     # thd_lens_form (bit 0: Q is cu, bit 1: KV is cu) — consumed only by the
@@ -2682,6 +2722,7 @@ def _host(
         cutlass.Int32(B),
         cutlass.Int32(QH // KH),
         scale_softmax_log2,
+        seq_q_lens_addr,
         o_partial_f32,
     ).launch(
         grid=grid_shape,
@@ -2701,6 +2742,9 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_head_major: bool = False,
     lse_head_stride: int = 0,
+    lse_padded_rows: int = 0,
+    lse_padded_order: tuple = (3, 2, 1, 0),
+    dynamic_bhk: bool = False,
     lse_stride: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """Compile a kernel with concrete dims; 3 SF tensors layout [B, H, num_seq_tiles, SF_SMEM_SIZE_*].
@@ -2716,10 +2760,28 @@ def compile(  # noqa: A001
     ``None`` LSE argument) — callers without a Stats output pass no LSE buffer
     at all; the amax_o atomicMax write is independent and unchanged."""
     _cache_key = _template_key(globals(), locals(), "compile")
+    _b0, _qh0, _kh0 = b, qh, kh  # the problem_size fake: runtime scalars, values immaterial
+    if dynamic_bhk:
+        # Batch and head extents compile DYNAMIC: one artifact per layout class,
+        # not per (b, qh, kh) -- serving shapes vary in all three. The kernel
+        # already reads B / QH / KH from problem_size at run time; only the fakes
+        # pinned them. A packed stride (None) derives from the dynamic extents;
+        # a declared stride stays the fixed number it is.
+        if not CFG.THD_VARLEN:
+            raise ValueError("dynamic_bhk is THD-only (dense shapes still pin the fakes)")
+        b = cute.sym_int(divisibility=1)
+        qh = cute.sym_int(divisibility=1)
+        kh = cute.sym_int(divisibility=1)
+        if lse_padded_rows:
+            lse_padded_rows = cute.sym_int(divisibility=1)
     if SPLIT_KV > 1 and not has_lse:
         # Each split's LSE is not optional under KV split — it IS the weight
         # the combine reduces with.  Without it the partials cannot be recombined.
         raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
+    if lse_padded_rows and not CFG.THD_VARLEN:
+        raise ValueError("lse_padded_rows is THD-only (a dense LSE is the compact (B, H, S_q) form)")
+    if lse_stride is not None and CFG.THD_VARLEN and not lse_padded_rows:
+        raise ValueError("THD LSE is packed (token-major (T, H) or head-major (1, QH, head_stride)); declared strides serve the padded form only")
     _fake_batch = 1 if CFG.THD_VARLEN else b
     # KV split: O and LSE are the PARTIAL workspaces, stacked split-major on
     # the batch axis (B*SPLIT_KV).  Q/K/V keep the real batch.  THD packs the
@@ -2796,7 +2858,20 @@ def compile(  # noqa: A001
         # the store is scalar f32 and the caller's Stats buffer only
         # guarantees element alignment). The epilogue store branches on the
         # STATIC rank, so the layout is fully encoded in this fake tensor.
-        if lse_head_major:
+        if lse_padded_rows:
+            # Per-batch padded Stats without ragged offsets (FlashInfer's (b, s_max, h)
+            # buffer): rank-4 (B, QH, s_max, 1) in the caller's strides -- the RANK is
+            # what selects the per-batch store, so nothing about the extents or
+            # strides has to be static. Rows past a sequence's length are the
+            # adapter's to fill (-inf), as the backend does.
+            if lse_head_major or lse_head_stride:
+                raise ValueError("lse_padded_rows excludes lse_head_major / lse_head_stride")
+            fake_lse = (
+                cute.runtime.make_fake_tensor(cutlass.Float32, (b, qh, lse_padded_rows, 1), (*lse_stride, 1), assumed_align=4)
+                if lse_stride
+                else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, lse_padded_rows, 1), stride_order=lse_padded_order, assumed_align=4)
+            )
+        elif lse_head_major:
             _lse_hs = lse_head_stride if lse_head_stride else sq
             fake_lse = cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32,
@@ -2832,6 +2907,8 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
+
+    fake_seq_q_lens = cutlass.Int64(0)  # device address of the (B,) int32 Q lengths; 0 (unread) when the flag is off
     fake_sinks = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (qh,),
@@ -2841,7 +2918,7 @@ def compile(  # noqa: A001
     # seq_kv_lens always part of the ABI; unread when CFG.SEQ_KV_LENS_PRESENT
     # == 0.  THD overloads it as [seq_kv_lens(B)|cu_q(B+1)|cu_k(B+1)|
     # batch_remap(B)|live|ctr] (len 4B+4).
-    _skv_len = (4 * b + 4) if CFG.THD_VARLEN else b
+    _skv_len = cute.sym_int(divisibility=1) if dynamic_bhk else ((4 * b + 4) if CFG.THD_VARLEN else b)
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (_skv_len,),
@@ -2852,7 +2929,7 @@ def compile(  # noqa: A001
     # dummy 1-elem when THD off (kernel never reads it).
     # +2 slots after the pad slot: the packed-total-clamped K and V runtime
     # descriptors (see the THD tma_k/tma_v closures).
-    _odesc_len = ((b + 3) * _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1
+    _odesc_len = cute.sym_int(divisibility=1) if dynamic_bhk else (((b + 3) * _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1)
     fake_o_desc = cute.runtime.make_fake_compact_tensor(
         cutlass.Int64,
         (_odesc_len,),
@@ -2888,9 +2965,10 @@ def compile(  # noqa: A001
         fake_o_desc,
         # THD: the packed totals are runtime values carried by the (dynamic)
         # tensor extents — _host reads them from the views' shapes.
-        (b, qh, kh, 0, 0, 0) if CFG.THD_VARLEN else (b, qh, kh, sq, skv, 0),
+        (_b0, _qh0, _kh0, 0, 0, 0) if CFG.THD_VARLEN else (_b0, _qh0, _kh0, sq, skv, 0),
         cutlass.Float32(0.0),
         cutlass.Int32(0),
+        fake_seq_q_lens,
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,

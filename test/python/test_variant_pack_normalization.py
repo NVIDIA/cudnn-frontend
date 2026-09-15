@@ -280,6 +280,55 @@ def test_a_narrower_buffer_covering_the_slot_count_but_not_the_bytes_is_not_re_d
 
 
 @pytest.mark.L0
+@pytest.mark.L0
+def test_a_buffer_of_the_declared_width_is_read_as_the_declared_dtype():
+    """FlashInfer binds packed fp4 as uint8 and the e4m3 scale blob as uint8:
+    the declaration names the dtype, the buffer only has to be as wide. A
+    byte blob covering a bf16 output is re-described as that output, dtype
+    included; a too-small buffer keeps its own dtype and description. Exercised
+    at the native level, where the rule lives; the FlashInfer-shaped GEMM suite
+    runs the whole graph with these bindings."""
+    from cudnn import _pybind_module as native_mod
+    from cudnn.datatypes import _dlpack_code_bits, _dlpack_lanes
+
+    fp4, bf16 = cudnn.data_type.FP4_E2M1, cudnn.data_type.BFLOAT16
+    assert (_dlpack_code_bits(fp4), _dlpack_lanes(fp4)) == ((17, 4), 2)  # spelled as torch exports float4_e2m1fn_x2
+    bf16_dl = (*_dlpack_code_bits(bf16), _dlpack_lanes(bf16))
+    layout = native_mod.DeclaredLayout(4)
+    layout.set(0, [1, M, K // 2], [M * K // 2, K // 2, 1], 1, 17, 4, 2)  # fp4 [1, M, K] declared, in storage slots
+    layout.set(1, [1, M, K // 2], [M * K // 2, K // 2, 1], 1, 17, 4, 2)
+    layout.set(2, [1, M, N], [M * N, N, 1], 2, *bf16_dl)  # bf16 [1, M, N]
+    layout.set(3, [1, M, N], [M * N, N, 1], 2, *bf16_dl)
+    a_u8 = torch.zeros(M, K // 2, device="cuda", dtype=torch.uint8)  # what FlashInfer binds: other extents, same width
+    a_u8_declared = torch.zeros(1, M, K // 2, device="cuda", dtype=torch.uint8)  # the declared storage extents already
+    c_bytes = torch.empty(1, M, N, device="cuda", dtype=torch.bfloat16).view(torch.uint8)  # a byte blob covering the output
+    c_small = torch.empty(1, M, N, device="cuda", dtype=torch.uint8)  # the declared extents at half the width: too small
+    pack = native_mod.VariantPackNative(4)
+    assert pack.read_from({1: a_u8, 2: a_u8_declared, 3: c_bytes, 4: c_small}, [1, 2, 3, 4]) == []
+    assert pack.describe_from(layout, []) == [0, 2]  # extents re-described: the 2-D fp4 buffer and the byte blob
+    assert list(pack.shape(0)) == [1, M, K // 2] and pack.dtype(0) == (17, 4)
+    assert list(pack.shape(1)) == [1, M, K // 2] and pack.dtype(1) == (17, 4)  # dtype reinterpreted even when the extents already matched
+    assert list(pack.shape(2)) == [1, M, N] and pack.dtype(2) == bf16_dl[:2]  # the blob became the declared output
+    slot = pack.operand(0, 0)  # what an engine is handed: one byte per fp4 x2 slot, spelled as torch spells it
+    assert slot.dtype == "float4_e2m1fn_x2" and slot.element_size() == 1 and slot.nbytes == M * K // 2
+    assert list(pack.shape(3)) == [1, M, N] and pack.dtype(3) == (1, 8)  # too small: its own dtype and description stand
+    x2 = getattr(torch, "float4_e2m1fn_x2", None)
+    if x2 is not None:  # torch's own spelling arrives as the same dtype and is left alone
+        pack = native_mod.VariantPackNative(4)
+        pack.read_from({1: a_u8.view(x2)}, [1])
+        assert pack.describe_from(layout, []) == [0] and pack.dtype(0) == (17, 4)
+    # override_shapes: a buffer SMALLER than the declaration (a cache-M graph run
+    # at a smaller M) is too small to re-describe, but the override names the
+    # declared tensor at this call's size -- dtype included, when as wide
+    pack = native_mod.VariantPackNative(4)
+    pack.read_from({1: torch.zeros(M // 2, K // 2, device="cuda", dtype=torch.uint8)}, [1])
+    assert pack.describe_from(layout, []) == [] and pack.dtype(0) == (1, 8)
+    pack.override_operand(0, [1, M // 2, K // 2], [M * K // 4, K // 2, 1], 17, 4, 2)
+    assert list(pack.shape(0)) == [1, M // 2, K // 2] and pack.dtype(0) == (17, 4)
+    pack.override_operand(0, [1, M // 2, K // 2], [M * K // 4, K // 2, 1], *bf16_dl)  # a wider dtype: the buffer's stands
+    assert pack.dtype(0) == (17, 4)
+
+
 def test_storage_geometry_packs_fp4_two_per_slot():
     from cudnn.graph_types import storage_geometry as _storage_geometry
 

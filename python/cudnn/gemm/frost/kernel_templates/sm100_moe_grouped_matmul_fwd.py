@@ -682,16 +682,17 @@ def _kernel(
                     if a_data_issue:
                         for _ai in cutlass.range_constexpr(num_a_operands):
                             sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    sA_stage.subview(_a_off * cta_tile_mnk[2]),
-                                    a_desc_load_list[_ai],
-                                    (coord_k, coord_m_desc + _a_off, cutlass.Int32(0)),
-                                    ab_full_mbar_ptr.subview(stage),
-                                    [],
-                                    multicast_mask=tma_mcast_mask_a,
-                                    group=_CTA_GROUP,
-                                )
+                            for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                        sA_stage.subview(_a_off * cta_tile_mnk[2] + _am * a_tma_box_m * cta_tile_mnk[2]),
+                                        a_desc_load_list[_ai],
+                                        (coord_k, coord_m_desc + _a_off + _am * a_tma_box_m, cutlass.Int32(0)),
+                                        ab_full_mbar_ptr.subview(stage),
+                                        [],
+                                        multicast_mask=tma_mcast_mask_a,
+                                        group=_CTA_GROUP,
+                                    )
                     b_issue = (not multicast_b) or (pair_m_idx == 0)
                     if cutlass.const_expr(b_mcast_slices > 1):
                         b_data_issue = True
@@ -1378,7 +1379,7 @@ def _host(
                     a_stride_m * ab_dtype.width // 128,
                     a_stride_l * ab_dtype.width // 128,
                 ],
-                box_dims=[cta_tile_mnk[2], cta_tile_mnk[0] // a_mcast_slices, 1],
+                box_dims=[cta_tile_mnk[2], a_tma_box_m, 1],
                 swizzle=ab_tma_swizzle,
             )
         )

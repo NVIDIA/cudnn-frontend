@@ -1172,6 +1172,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         lane = reducer_tidx % Int32(32)
         row_base = stats_warp * Int32(8)
         log2_e = Float32(math.log2(math.e))
+        pos_inf = Float32(float("inf"))
+        neg_inf = Float32(float("-inf"))
 
         if lane < Int32(8):
             row = row_base + lane
@@ -1180,11 +1182,18 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             sink_value = Float32(mAttnSink[head, (0, batch_idx)])
             lse_log2 = lse_value * log2_e
             sink_log2 = sink_value * log2_e
-            maximum = cute.arch.fmax(lse_log2, sink_log2)
-            denominator = Float32(cute.math.exp2(lse_log2 - maximum) + cute.math.exp2(sink_log2 - maximum))
-            neg_lse_log2 = -(maximum + cute.math.log2(denominator))
-            if lse_value == Float32(float("inf")):
-                neg_lse_log2 = Float32(float("-inf"))
+            # Guard on the rescaled values, not the inputs: an infinite sink, or
+            # a large finite sink or LSE (for example 2.4e38) that overflows to
+            # +inf in the log2(e) multiply, would otherwise make the fold below
+            # evaluate inf - inf.  A saturating denominator and a no-mass row
+            # share the same sentinel, negative LSE of -inf, which zeroes every
+            # probability downstream (same contract as the H16/H32 kernels).
+            neg_lse_log2 = neg_inf
+            if lse_log2 != pos_inf and sink_log2 != pos_inf:
+                if lse_log2 != neg_inf or sink_log2 != neg_inf:
+                    maximum = cute.arch.fmax(lse_log2, sink_log2)
+                    denominator = Float32(cute.math.exp2(lse_log2 - maximum) + cute.math.exp2(sink_log2 - maximum))
+                    neg_lse_log2 = -(maximum + cute.math.log2(denominator))
             softmax_stats[row, 0] = neg_lse_log2
 
     @staticmethod
@@ -2120,6 +2129,13 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             p_1 = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx + 1, batch_idx)])
             p_2 = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx + 2, batch_idx)])
             p_3 = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx + 3, batch_idx)])
+            # A saturating sink owns all probability mass (p = 1) and a
+            # disabled sink none (p = 0); the folded LSE is -inf in both cases,
+            # so the exp2 above would otherwise evaluate inf - inf.
+            if sink_log2 == Float32(float("inf")):
+                p_0 = p_1 = p_2 = p_3 = Float32(1.0)
+            elif sink_log2 == Float32(float("-inf")):
+                p_0 = p_1 = p_2 = p_3 = Float32(0.0)
             acc_0 += p_0 * sum_odo[head_idx, (q_idx, batch_idx)]
             acc_1 += p_1 * sum_odo[head_idx, (q_idx + 1, batch_idx)]
             acc_2 += p_2 * sum_odo[head_idx, (q_idx + 2, batch_idx)]
@@ -2127,6 +2143,10 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             q_idx += self.DSINK_UNROLL
         while q_idx < q_end:
             p_tail = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx, batch_idx)])
+            if sink_log2 == Float32(float("inf")):
+                p_tail = Float32(1.0)
+            elif sink_log2 == Float32(float("-inf")):
+                p_tail = Float32(0.0)
             acc_0 += p_tail * sum_odo[head_idx, (q_idx, batch_idx)]
             q_idx += 1
         ptr = d_sink.iterator + cute.crd2idx((head_idx, (0, batch_idx)), d_sink.layout)
@@ -2670,6 +2690,19 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         i0 = hoist_band_indices[h_group][2 * pair]
                         i1 = hoist_band_indices[h_group][2 * pair + 1]
                         v0, v1 = cute.arch.fma_packed_f32x2((r_score[i0], r_score[i1]), (softmax_scale_log2_e, softmax_scale_log2_e), (lse, lse))
+                        # Invalid slots carry zero-filled K and V, so their score
+                        # is exactly zero and this argument equals the folded
+                        # negative LSE, which exceeds 128 (exp2 overflow) when
+                        # every valid logit and the sink are far below zero.  A
+                        # valid slot's argument is log2 of a probability, never
+                        # above about log2(N_TILE), so clamping at 64 changes no
+                        # valid value while keeping P and dS finite; the zero K
+                        # and V rows then contribute exact zeros to dQ, and the
+                        # rows are never scattered to dKV.  nan=True keeps a
+                        # NaN LSE or sink propagating (PTX min.NaN), as the
+                        # generic and D576 kernels do.
+                        v0 = cute.arch.fmin(v0, Float32(64.0), nan=True)
+                        v1 = cute.arch.fmin(v1, Float32(64.0), nan=True)
                         v0 = cute.math.exp2(v0, fastmath=True)
                         v1 = cute.math.exp2(v1, fastmath=True)
                         r_score[i0] = v0

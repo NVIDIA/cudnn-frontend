@@ -135,6 +135,14 @@ address lends the declaration outright — it carries no extent, so there is
 nothing to compare against: the caller guarantees the allocation covers the
 declared bytes and meets the engine's alignment. Rules that follow:
 
+- **The declaration supplies the dtype too.** A buffer re-described from the
+  declaration takes its dtype with the extents (a byte blob covering a bf16
+  output becomes that output), and a buffer of the declared extents whose
+  slots are as wide as the declaration's is read AS the declared dtype
+  (FlashInfer binds packed fp4 data and the e4m3 scale blob as `uint8`; the
+  backend read a pointer and never knew). A buffer too small for the
+  declaration, or whose slots are not as wide as the declaration's, keeps its
+  own dtype with its own description.
 - `override_shapes` / `override_strides` speak cuDNN **element** units in the
   graph's axis order, like every declaration. They are written INTO the slot
   (in the buffer's axis order, `_in_axis_order_of`), never carried around it, so
@@ -666,6 +674,28 @@ only to decline is why `closed_under` existed.
   backend-unlowerable (`serialize()` and `key()` refuse it), and it surfaces as
   a graph fact the capability rows gate on.
 
+### One kernel per layout class, not per shape (SDPA THD)
+
+A `compile()` of an SDPA template used to pin batch, head extents and every
+stride in its fakes, so FlashInfer's serving shapes minted one 2.6 s kernel per
+`(b, qh, kh, strides)`: 126 forward kernels in FlashInfer's cuDNN attention
+tests. The kernels never needed that — `_host` reads `B / QH / KH` from
+`problem_size` at run time and the THD token totals were already `sym_int`.
+Under `compile(dynamic_bhk=True)` (THD only) the template rebinds `b`, `qh`,
+`kh` (and a padded LSE's `s_max`) to `cute.sym_int()` right after the cache
+key is taken, keeps plain ints for the `problem_size` fake, and gives the
+metadata / O-descriptor fakes fresh symbols (`SymInt` has no `__add__`); a
+packed declared stride is passed as `None` so the compact fake derives it from
+the dynamic extents, a padded LSE in a compact dim order passes that order
+(`lse_padded_order`), and anything else keeps its static key. The adapter
+canonicalizes the key (`b = qh = kh = 0`, `lse_padded_rows = 1`) when the
+module offers `dynamic_bhk`. What stays static: `d`, dtypes, masks, the GQA
+ratio (`CFG.QH_PER_KH`), paged pool strides, dense (non-THD) shapes. Two DSL
+facts shaped this: `and` is staged, so `const_expr(CFG.PACK_GQA and
+q.shape[2] != ...)` must nest its constant test outside; a `const_expr` on a
+dynamic extent or stride is an error, which is why the padded-Stats store
+selects on the fake's RANK (rank-4) and not on `shape[0] > 1`.
+
 ### Accept means run
 
 For a python plan, `check_support()` accepted ⇒ `build_plans()` and
@@ -740,8 +770,18 @@ artifact can never be reused by accident:
 - Location: `CUDNN_FRONTEND_COMPILED_CACHE`, else
   `$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`; `set_cache_dir()` for a
   caller that owns a workspace (FlashInfer); `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`
-  turns it off; `stats()` reports hits / misses / bypassed / invalid per
-  process. Bump `_SCHEMA` on any incompatible change.
+  turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned
+  per process. Bump `_SCHEMA` on any incompatible change.
+- **Dead environments are retired.** The manifest hashes the package's source,
+  so every edited checkout and every CI commit mints an environment directory
+  that will never be hit again — a few hundred MB per commit on a runner with a
+  persistent home. A process's first write runs `prune()`: whole environment
+  directories go (never single entries), dead schema roots first, then oldest
+  first, until the root is under `CUDNN_FRONTEND_COMPILED_CACHE_MAX_BYTES`
+  (4 GiB by default; 0 disables); the process's own environment is never a
+  candidate. CI should still point `CUDNN_FRONTEND_COMPILED_CACHE` at a
+  job-local directory: nothing there is ever warm across commits, and the cap
+  is a backstop, not a policy.
 
 Not yet routed: kernels compiled from real tensors at call time (the
 linear-attention `chunk_*` launchers, the SDPA adapters' `_dot_fn` /
@@ -840,8 +880,8 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
   remove `selected_engine is None` branching, lowering extracted to its own
   module, op-identity dedup (NodeType vs registry keys), longer-term a typed
   `OpSpec` as the single per-op source for builder/validation/lowering.
-- SDPA forward THD: padded LSE rows of a `(b, s_max, h)` stats buffer past a
-  sequence's length — the backend writes `-inf`, the python row leaves them
-  unwritten (`b == 1`; at `b > 1` the form is declined) — fill for parity. The
-  dense padded-Q `.item()` read in `sdpa/fwd/engines.py` runs at execute and
-  breaks CUDA-graph capture; decide it at `check_support` or drop it.
+- SDPA forward THD, padded Stats: the `-inf` seed of the `(b, s_max, h)` buffer
+  is a separate D32 memset ahead of the kernel; fold the tail-row write into the
+  kernel's persistent schedule to save the launch on that path. The dense
+  padded-Q `.item()` read in `sdpa/fwd/engines.py` runs at execute and breaks
+  CUDA-graph capture; decide it at `check_support` or drop it.

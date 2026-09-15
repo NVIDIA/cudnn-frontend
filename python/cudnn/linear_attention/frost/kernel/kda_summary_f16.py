@@ -66,10 +66,10 @@ Warp assignments (16 warps = 512 threads):
   warps 0-7     : compute group 0 - Gate prefix scan, shared operands, left key halves of both states (two ping-pong
                                     groups)
   warps 8-11    : compute group 1 - seeds, right key halves, Y / U inputs of both chains, H / M stores
-  warp  12      : super MMA warp - register-MMA KK and T_inv of the even local chunks
+  warp  12      : register-MMA warp - KK and T_inv of the even local chunks
   warp  13      : MMA warp       - every tcgen05 GEMM of both chains; TMEM lifecycle
   warp  14      : TMA load warp  - loads K, V, Gate; stages Beta
-  warp  15      : super MMA twin - register-MMA KK and T_inv of the odd local chunks
+  warp  15      : register-MMA twin - KK and T_inv of the odd local chunks
 """
 
 from dataclasses import dataclass

@@ -204,12 +204,17 @@ def test_mm_bf16_override_shape_path():
 _FP4_X2 = getattr(torch, "float4_e2m1fn_x2", None)
 
 
-def _fp4_case(M: int, N: int, K: int, *, nvfp4: bool, alpha: bool, override_cache_m: int | None = None):
+def _fp4_case(M: int, N: int, K: int, *, nvfp4: bool, alpha: bool, override_cache_m: int | None = None, as_x2: bool = False):
+    """``as_x2=False`` binds what FlashInfer binds: the packed fp4 data as
+    ``uint8`` and, for nvfp4, the e4m3 scale blob viewed as ``uint8`` too
+    (gemm_base: ``a_descale.view(torch.uint8)`` when ``a.dtype == uint8``).
+    The declaration says FP4_E2M1 / FP8_E4M3; the buffer's dtype carries no
+    information of its own. ``as_x2=True`` binds torch's ``float4_e2m1fn_x2``."""
     torch.manual_seed(0)
     block = 16 if nvfp4 else 32
     a_u8 = torch.randint(0, 256, (M, K // 2), device="cuda", dtype=torch.uint8)
     b_u8 = torch.randint(0, 256, (N, K // 2), device="cuda", dtype=torch.uint8).t()  # (K/2, N) column-major
-    a, b = a_u8.view(_FP4_X2), b_u8.view(_FP4_X2)
+    a, b = (a_u8.view(_FP4_X2), b_u8.view(_FP4_X2)) if as_x2 else (a_u8, b_u8)
     a_shape, a_stride = _fp4_shape3(a)  # [1, M, K]
     b_shape, b_stride = _fp4_shape3(b)  # [1, K, N], stride [K*N, 1, K]
     bs_m, bs_n, bs_k = _block_scale_dims(M, N, K, block)
@@ -217,6 +222,8 @@ def _fp4_case(M: int, N: int, K: int, *, nvfp4: bool, alpha: bool, override_cach
     if nvfp4:
         sfa = torch.full((bs_m * bs_k,), 1.0, device="cuda").to(torch.float8_e4m3fn)
         sfb = torch.full((bs_n * bs_k,), 1.0, device="cuda").to(torch.float8_e4m3fn)
+        if not as_x2:
+            sfa, sfb = sfa.view(torch.uint8), sfb.view(torch.uint8)
         sf_type = cudnn.data_type.FP8_E4M3
     else:
         sfa = torch.full((bs_m * bs_k,), 127, device="cuda", dtype=torch.uint8).view(torch.float8_e8m0fnu)
@@ -286,6 +293,15 @@ def test_mm_fp4_flat_scale_blobs(mnk, kind):
 def test_mm_fp4_override_shape_path(kind):
     build, pack, override = _fp4_case(200, 512, 256, nvfp4=kind == "nvfp4", alpha=False, override_cache_m=256)
     _accept_means_run(build, pack, override=override)
+
+
+@pytest.mark.skipif(_FP4_X2 is None, reason="torch has no float4_e2m1fn_x2")
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp4"])
+def test_mm_fp4_x2_view_binding(kind):
+    """The same graph with torch's own fp4 dtype bound: both spellings of the
+    same bytes must run, and the declaration decides what they mean."""
+    build, pack, _ = _fp4_case(256, 512, 256, nvfp4=kind == "nvfp4", alpha=False, as_x2=True)
+    _accept_means_run(build, pack)
 
 
 # ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ from cudnn import _pybind_module
 
 from ._device import ensure_current_context
 from ._handle import Handle, to_backend_handle
-from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
+from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _dlpack_lanes, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
 from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor, storage_geometry, storage_slot_bytes
@@ -1067,7 +1067,16 @@ class pygraph:
         node for at all (GDN/KDA/...) must NOT be lowered — the lowering loop
         silently skips such nodes and would hand C++ an incomplete graph.
         """
+        # The cuDNN backend block-scale descriptor currently accepts the
+        # matrix-style block-size vector, but not the rank-5
+        # (1, C-block, 1, 1, 1) vector used by convolution. Let the Frost
+        # convolution engine consume that public graph directly instead of
+        # failing backend lowering before engine selection. Block-scale matmul
+        # keeps its existing C++ lowering path.
+        has_convolution = any(node.node_type == NodeType.CONV_FPROP for node in self._nodes)
         for node in self._nodes:
+            if has_convolution and node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE and len(node.params.get("block_size") or ()) == 5:
+                return node
             if node.node_type in (NodeType.MATMUL, NodeType.POINTWISE):
                 continue
             spec_entry = _CAPTURED_BY_TYPE.get(node.node_type) or _STRUCTURED_BY_TYPE.get(node.node_type)
@@ -1992,7 +2001,7 @@ class pygraph:
                 # slot that borrowed one is named here.
                 from_graph.append(i)
             ptr, tensor = self._describe(data, order[i])
-            native.set_operand(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type))
+            native.set_operand(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type), _dlpack_lanes(tensor.data_type))
         if strict:
             hole = native.first_unfilled()
             if hole >= 0:
@@ -2032,7 +2041,8 @@ class pygraph:
                         f"override_shapes for tensor uid {uid}: an fp4 tensor packs two elements per storage slot, so its "
                         f"unit-stride extent must be even; got {tuple(override_shapes[j])} / {tuple(override_strides[j])}"
                     )
-                native.override_operand(i, *_in_axis_order_of(storage[0], storage[1], native.stride(i)))
+                dtype = (*_dlpack_code_bits(declared.data_type), _dlpack_lanes(declared.data_type)) if declared is not None else (0, 0, 1)
+                native.override_operand(i, *_in_axis_order_of(storage[0], storage[1], native.stride(i)), *dtype)
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
@@ -2065,7 +2075,14 @@ class pygraph:
                 storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
                 if storage is None:
                     continue
-                layout.set(i, list(storage[0]), list(storage[1]), storage_slot_bytes(declared.data_type) or 0)
+                layout.set(
+                    i,
+                    list(storage[0]),
+                    list(storage[1]),
+                    storage_slot_bytes(declared.data_type) or 0,
+                    *_dlpack_code_bits(declared.data_type),
+                    _dlpack_lanes(declared.data_type),
+                )
             self._declared_layout_native = layout
         return layout
 

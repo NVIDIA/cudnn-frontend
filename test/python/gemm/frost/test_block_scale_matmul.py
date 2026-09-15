@@ -1437,8 +1437,8 @@ def test_block_scale_sf_rule_is_on_the_instruction_tile() -> None:
 
 def test_catalog_has_sm103_geometries():
     sm103 = [c for c in CATALOG if c.pipeline == "sm103"]
-    # 2 cta_n × the shared 15-cluster enumeration × the 2 MMA modes.
-    assert len(sm103) == 60
+    # 2 cta_n × (15 single-CTA clusters + 10 even-M CTA-pair clusters).
+    assert len(sm103) == 50
     pat = re.compile(r"^CONFIG_sm103_128x(128|256)x384_128x(128|256)x48_cluster\d+x\d+_[12]ctamma$")
     for c in sm103:
         assert pat.match(c.name), c.name
@@ -1651,7 +1651,7 @@ def test_sm103_rejects_multi_mma_m():
         by_name("CONFIG_sm103_256x128x384_128x128x48_cluster1x1")
     assert by_name(_CFG_128).mma_size_m == 1
     # The other pipelines DO implement it — the bound is sm103-specific.
-    assert ConfigSm100.MMA_SIZE_M_MAX == 2
+    assert ConfigSm100.MMA_SIZE_M_MAX == 4
     assert by_name("CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma").mma_size_m == 2
 
 
@@ -2103,7 +2103,7 @@ def test_mixed_mxfp8_mxfp4_numerics(fp8_on_a, fp8_torch_dt, fp8_cudnn_dt, fp8_mn
 @requires_sm107
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
 @pytest.mark.parametrize("cta_group", [1, 2])
-@pytest.mark.parametrize("cta_m,cta_n", [(128, 256), (256, 128), (256, 256)])
+@pytest.mark.parametrize("cta_m,cta_n", [(128, 256), (256, 128), (256, 256), (512, 128)])
 def test_sm107_block_scale_matmul_multi_mma_m(combo, cta_group, cta_m, cta_n):
     """The CTA tile spanning several MMA instructions along M, on the 64-byte-K
     pipeline. This is where the two SF regions stop agreeing: at nvfp4 a scale
@@ -2116,7 +2116,7 @@ def test_sm107_block_scale_matmul_multi_mma_m(combo, cta_group, cta_m, cta_n):
     suffix = "1ctamma" if cta_group == 1 else "2ctamma"
     geometry = f"CONFIG_sm100_{cta_m}x{cta_n}x128_128x{cta_n}x64_{cluster}"
     assert by_name(geometry).mma_size_m == cta_m // 128
-    _run_bs_numeric(combo, f"{geometry}_{suffix}", 256, 256, 512)
+    _run_bs_numeric(combo, f"{geometry}_{suffix}", cta_m * cta_group if cta_m == 512 else 256, 256, 512)
 
 
 @requires_sm107

@@ -119,6 +119,28 @@ def _stride_order(dim: tuple, stride: tuple) -> tuple:
     return tuple(i for i, _ in sorted(enumerate(stride), key=lambda x: (x[1], dim[x[0]])))
 
 
+def thd_stats_packing(stride_h: int, stride_s: int, h_q: int) -> Optional[str]:
+    """Classify a ragged (packed) Stats declaration by its strides (Rule S1).
+
+    ``"token_major"``: ``(stride_h, stride_s) == (1, H_q)`` -- cuDNN's ragged
+    Stats recipe, ``(T, H)`` in memory.  ``"head_major"``: ``stride_s == 1``
+    with ``stride_h >= 1`` the declared head stride, ``(H, head_stride)`` in
+    memory -- what the FROST forwards emit, rounded up to a 64-token capacity.
+    ``None`` is a packing no FROST row reads.  The head stride must cover the
+    packed token total; that total is a device value, so callers can only
+    bound it against a plan-time capacity (see bwd/engines.py mismatch()).
+
+    One classifier for every probe and adapter site, so the two packings
+    cannot drift apart between the forward that writes Stats and the
+    backward that reads it.
+    """
+    if (int(stride_h), int(stride_s)) == (1, int(h_q)):
+        return "token_major"
+    if int(stride_s) == 1 and int(stride_h) >= 1:
+        return "head_major"
+    return None
+
+
 def bshd_layout_ok(dim: tuple, stride: tuple) -> bool:
     """Strict BSHD physical stride order for a rank-4 (B, H, S, D) tensor:
     axes sorted by ascending stride must come out D, H, S, B, with size-1

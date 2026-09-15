@@ -204,3 +204,67 @@ def test_the_manifest_carries_the_source_tree_not_a_commit(tmp_path):
     import cudnn
 
     assert cc.environment_manifest()["cudnn_source"] == cc.source_tree_digest(pathlib.Path(cudnn.__file__).resolve().parent)
+
+
+def test_prune_retires_dead_environments_oldest_first_and_keeps_the_current_one(tmp_path, monkeypatch):
+    """Every edited checkout (and every CI commit) mints an environment that is
+    never hit again; a persistent home would grow by hundreds of MB per commit.
+    Whole environment directories go, dead schemas first, then oldest first,
+    until the root fits; the current environment is never a candidate."""
+    import os
+    import time
+
+    def env(schema, name, size, age_s, manifest=None):
+        d = tmp_path / schema / (cc._digest(name) if len(name) != 24 else name)
+        d.mkdir(parents=True)
+        if manifest is None:
+            manifest = json.dumps({"schema": schema, "cudnn_frontend": "1.30.0", "cutlass_dsl": "4.7.1"})
+        if manifest:
+            (d / cc._MANIFEST).write_text(manifest)
+        e = d / "entry_x"
+        e.mkdir()
+        (e / cc._OBJECT).write_bytes(b"x" * size)
+        (e / cc._ENTRY).write_text("{}")
+        for f in d.rglob("*"):
+            os.utime(f, (time.time() - age_s, time.time() - age_s))
+        return d
+
+    old = env(cc._SCHEMA, "old", 1000, 3000)
+    mid = env(cc._SCHEMA, "mid", 1000, 2000)
+    cur = env(cc._SCHEMA, "cur", 1000, 4000)  # the oldest by mtime, but this process's own
+    dead = env("v0", "ancient", 100, 10)  # a dead schema goes first whatever its age
+    # not ours, whatever the size or age: a caller's artifacts under a shared root, a directory without
+    # our manifest, a schema-like directory with a foreign name -- never deleted, never counted
+    foreign = tmp_path / "flashinfer" / "existing_artifact"
+    foreign.mkdir(parents=True)
+    (foreign / "caller_owned.bin").write_bytes(b"z" * 100_000)
+    no_manifest = env(cc._SCHEMA, "half_written", 100_000, 9000, manifest="")
+    odd_name = env(cc._SCHEMA, "x" * 24, 100_000, 9000)  # 24 chars but not a hex digest
+    other_tool = env(cc._SCHEMA, "b" * 24, 100_000, 9000, manifest='{"producer": "another-tool"}')  # right shape, not our manifest
+    empty_manifest = env(cc._SCHEMA, "c" * 24, 100_000, 9000, manifest="{}")
+    wrong_schema = env(cc._SCHEMA, "d" * 24, 100_000, 9000, manifest=json.dumps({"schema": "v9", "cudnn_frontend": "1.30.0"}))
+    corrupt = env(cc._SCHEMA, "e" * 24, 100_000, 9000, manifest="{not json")
+    empty_version = env(cc._SCHEMA, "f" * 24, 100_000, 9000, manifest=json.dumps({"schema": cc._SCHEMA, "cudnn_frontend": ""}))
+    cc.reset_stats()
+    assert cc.prune(tmp_path, limit=0) == 0  # 0 = never prune
+    assert cc.prune(tmp_path, limit=2500, keep=cur) == 2
+    assert not dead.exists() and not old.exists() and mid.exists() and cur.exists()
+    assert (foreign / "caller_owned.bin").exists() and no_manifest.exists() and odd_name.exists()
+    assert other_tool.exists() and empty_manifest.exists() and wrong_schema.exists() and corrupt.exists() and empty_version.exists()
+    assert cc.stats()["pruned"] == 2
+    assert cc.prune(tmp_path, limit=2500, keep=cur) == 0  # under the cap: nothing to do
+    # a symlink planted in the root is neither followed nor a deletion target
+    outside = tmp_path.parent / f"{tmp_path.name}_outside"
+    outside.mkdir()
+    (outside / "victim").write_bytes(b"y" * 10_000)
+    (tmp_path / cc._SCHEMA / "link").symlink_to(outside, target_is_directory=True)
+    assert cc.prune(tmp_path, limit=1, keep=cur) == 1 and not mid.exists() and cur.exists()
+    assert (outside / "victim").exists() and (tmp_path / cc._SCHEMA / "link").is_symlink()
+    # a symlinked FILE inside an environment counts nothing: the target's size must not push a live environment out
+    before = cc._dir_bytes_and_mtime(cur)[0]
+    (cur / "entry_x" / "planted").symlink_to(outside / "victim")
+    assert cc._dir_bytes_and_mtime(cur)[0] == before
+    monkeypatch.setenv(cc._ENV_MAX_BYTES, "0")
+    assert cc.max_bytes() == 0
+    monkeypatch.setenv(cc._ENV_MAX_BYTES, "not-a-number")
+    assert cc.max_bytes() == cc._DEFAULT_MAX_BYTES

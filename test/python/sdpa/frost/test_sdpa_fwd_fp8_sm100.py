@@ -715,12 +715,117 @@ def test_fp8_d256_padding(in_key, causal):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-@pytest.mark.L1
-@_skip_d256_on_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [256], ids=["d256"])
 @torch_fork_set_rng(seed=0)
-def test_fp8_d256_dense_q_trim_stats_sink():
-    """Short dense Q rows trim O/LSE even when a sink makes softmax finite."""
-    d = 256
+def test_fp8_dense_q_trim_bottom_right_multiwave(d):
+    """More Q tiles than SMs (3 x 8 heads x 8 tiles of 128 rows), batches of
+    different lengths, bottom-right: a persistent worker crosses batches, and
+    the second tile's diagonal and keyless-row test must use ITS batch's
+    lengths (the wide templates take the next tile's bounds from the scheduler
+    payload and used to keep the previous batch's lengths)."""
+    result = _run(
+        3,
+        8,
+        8,
+        1024,
+        1024,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_lens_q=[1024, 640, 0],
+        seq_lens_kv=[800, 1024, 512],
+        d_qk=d,
+        d_v=d,
+        return_lse=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+    # batch 0: diagonal 800 - 1024 = -224 -> rows 0..223 keyless; batch 1: diagonal +384, no keyless row; batch 2 empty
+    assert (result.output[0, :, :224] == 0).all() and torch.isneginf(result.stats[0, :, :224]).all()
+    assert (result.output[1, :, 640:] == 0).all() and (result.output[2] == 0).all()
+    torch.testing.assert_close(result.stats[0, :, 224:], result.reference_stats[0, :, 224:], atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(result.stats[1, :, :640], result.reference_stats[1, :, :640], atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_dense_q_trim_bottom_right_sink(d):
+    """Keyless rows (bottom-right, S_kv < S_q) WITH a sink: the row's mass is
+    the sink alone, so LSE = sink_logit and O = 0 -- a kernel that lets the
+    masked scores through its softmax returns NaN there. scale * log2(e) > 1 makes the
+    scaled sentinel overflow, the case that trips a finite-sentinel mask."""
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    result = _run(
+        3,
+        8,
+        8,
+        256,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=0.75,  # scale * log2(e) > 1: the scaled finite sentinel overflows, the case a sum-based dead-row test misses
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        sink=sink,
+        seq_lens_q=[256, 129, 0],
+        seq_lens_kv=[200, 256, 128],
+        d_qk=d,
+        d_v=d,
+        return_lse=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+    assert (result.output[0, :, :56] == 0).all() and (result.output[1, :, 129:] == 0).all() and (result.output[2] == 0).all()
+    assert torch.isfinite(result.stats[0]).all(), "keyless rows with a sink must carry the sink logit, not NaN"
+    torch.testing.assert_close(result.stats[0, :, :56], sink.view(8, 1).expand(8, 56), atol=1e-4, rtol=0)
+    torch.testing.assert_close(result.stats[0], result.reference_stats[0], atol=5e-2, rtol=3e-2)
+    assert torch.isneginf(result.stats[1, :, 129:]).all() and torch.isneginf(result.stats[2]).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_128", "d256"])
+@pytest.mark.parametrize("band", [False, True], ids=["br", "br_band"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_dense_q_trim_bottom_right(d, d_v, band):
+    """Short per-batch Q under bottom-right causal (and with a left band): the
+    tile bounds and the per-element mask must agree on the per-batch Q length.
+    Batches: full Q, mid-tile Q (129 of 256), empty Q."""
+    kw = dict(use_causal_mask_bottom_right=True)
+    if band:
+        kw["left_bound"] = 65  # window = 64; sdpa_fp8 spells the band as left_bound
+    result = _run(
+        3,
+        8,
+        8,
+        256,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=kw,
+        seq_lens_q=[256, 129, 0],
+        seq_lens_kv=[200, 256, 128],
+        d_qk=d,
+        d_v=d_v,
+        return_lse=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+    assert (result.output[1, :, 129:] == 0).all() and (result.output[2] == 0).all()
+    # batch 0: S_kv 200 < S_q 256 under bottom-right puts rows 0..55 above the diagonal -- keyless inside a
+    # live tile, so exactly O = 0 / LSE = -inf (a finite mask sentinel would leave them a uniform average).
+    assert (result.output[0, :, :56] == 0).all() and torch.isneginf(result.stats[0, :, :56]).all()
+    assert torch.isneginf(result.stats[1, :, 129:]).all() and torch.isneginf(result.stats[2]).all()
+    torch.testing.assert_close(result.stats[0], result.reference_stats[0], atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(result.stats[1, :, :129], result.reference_stats[1, :, :129], atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_128", "d256"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_dense_q_trim_stats_sink(d, d_v):
+    """Short dense Q rows trim O/LSE even when a sink makes softmax finite --
+    on every SM100 per-tensor FP8 flavor (FlashInfer hands per-batch Q lengths
+    with every padded dense graph)."""
     sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
     result = _run(
         2,
@@ -736,7 +841,7 @@ def test_fp8_d256_dense_q_trim_stats_sink():
         seq_lens_q=[129, 0],
         seq_lens_kv=[200, 256],
         d_qk=d,
-        d_v=d,
+        d_v=d_v,
         return_lse=True,
     )
     _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
@@ -1359,7 +1464,7 @@ def test_fp8_d192_d128_thd_features():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_d128", "d256"])
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_d128", "d256", "d512"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_multi_unit_per_cta(monkeypatch, d_qk, d_v):
     """THD where a cluster claims more than one unit (issue #618).
