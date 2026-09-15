@@ -371,6 +371,21 @@ cp_wait() {
 #define KDA_FLAG_SAFE_GATE 2
 #define KDA_FLAG_BETA_SIGMOID 4
 
+// Which fusions this translation unit is compiled for. cuda_host passes it as
+// -D, so each combination is its own cubin (the cache is keyed on the compile
+// options); 0 is the plain contract and compiles all three away.
+#ifndef KDA_FUSED_FLAGS
+#define KDA_FUSED_FLAGS 0
+#endif
+
+// Whether this translation unit is compiled for grouped VALUE heads. Also a -D
+// rather than a runtime test: with it 0 the q/k address folds back to the
+// shared one and the staging loop is byte-for-byte the pre-GQA kernel, which
+// is what keeps the equal-head path (every existing caller) free.
+#ifndef KDA_FUSED_GQA
+#define KDA_FUSED_GQA 0
+#endif
+
 __device__ __forceinline__ float
 kda_safe_gate(float raw, float ea, float dtb, float lb) {
     // lower_bound * sigmoid(exp(a_log) * (g + dt_bias)), the differentiable
@@ -394,7 +409,6 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                                          const float* __restrict__ ga_log,
                                          const float* __restrict__ gdt_bias,
                                          float gate_lb,
-                                         int flags,
                                          float q_scale,
                                          int HQ) {
     extern __shared__ __align__(128) char raws[];
@@ -411,15 +425,22 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
     // their own (smaller) head count. Only their addressing differs -- each
     // value head reads the query head it is grouped under, and several CTAs
     // therefore stage the same q/k rows, which costs a re-read and no logic.
-    const int HDQ   = HQ * kDim;
-    const int qhead = (HQ == H) ? head : head / (H / HQ);
+    constexpr bool f_gqa = KDA_FUSED_GQA != 0;
+    const int HDQ        = f_gqa ? HQ * kDim : HD;
+    const int qhead      = f_gqa ? head / (H / HQ) : head;
 
-    // Fusion flags are uniform across the block, so these branches are free.
-    const bool f_l2   = (flags & KDA_FLAG_L2NORM) != 0;
-    const bool f_gate = (flags & KDA_FLAG_SAFE_GATE) != 0;
-    const bool f_beta = (flags & KDA_FLAG_BETA_SIGMOID) != 0;
-    const float g_ea  = f_gate ? __expf(ga_log[head]) : 0.0f;
-    const float* g_db = f_gate ? gdt_bias + head * kDim : nullptr;
+    // The fusion flags are fixed per graph node, so they are a COMPILE-TIME
+    // constant: cuda_host passes -DKDA_FUSED_FLAGS and the cubin cache is keyed
+    // on the compile options, giving one specialisation per combination. As
+    // runtime branches they cost the no-fusion path 2.7-7.9% even though every
+    // thread agrees on them -- uniform control flow does not guarantee unchanged
+    // code generation, and it did not here.
+    constexpr int flags   = KDA_FUSED_FLAGS;
+    constexpr bool f_l2   = (flags & KDA_FLAG_L2NORM) != 0;
+    constexpr bool f_gate = (flags & KDA_FLAG_SAFE_GATE) != 0;
+    constexpr bool f_beta = (flags & KDA_FLAG_BETA_SIGMOID) != 0;
+    const float g_ea      = f_gate ? __expf(ga_log[head]) : 0.0f;
+    const float* g_db     = f_gate ? gdt_bias + head * kDim : nullptr;
 
     const int s0 = cu[seq], s1 = cu[seq + 1];
     const int chunks = (s1 - s0 + kChunk - 1) / kChunk;
@@ -450,7 +471,7 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             const int i = (tid >> 4) + 8 * it, d = 8 * (tid & 15);
             const int tk   = tb + i;
             const long ix  = static_cast<long>(tk) * HD + head * kDim + d;
-            const long ixq = static_cast<long>(tk) * HDQ + qhead * kDim + d;
+            const long ixq = f_gqa ? (static_cast<long>(tk) * HDQ + qhead * kDim + d) : ix;
             cp16(&R.k[i * kDim + d], gk + ixq, tk < s1);
             cp16(&R.q[i * kDim + d], gq + ixq, tk < s1);
             cp16(&R.v[i * kLdA + d], gv + ix, tk < s1);

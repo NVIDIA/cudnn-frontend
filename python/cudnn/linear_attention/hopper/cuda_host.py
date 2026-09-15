@@ -50,6 +50,18 @@ DEFAULT_Q_SCALE = 0.08838834764831845
 SMEM_BYTES = 94464
 _SMEM_DEFINE = (f"-DKDA_FUSED_SMEM_BYTES={SMEM_BYTES}",)
 
+
+def _defines(flags: int, gqa: bool = False):
+    """Compile options for one fusion combination.
+
+    The flags are fixed per graph node, so they are baked in rather than
+    branched on: as runtime branches they cost the no-fusion path 2.7-7.9%.
+    compile_cubin keys its on-disk cache on the option list, so each combination
+    gets its own cubin and they cannot collide.
+    """
+    return (*_SMEM_DEFINE, f"-DKDA_FUSED_FLAGS={int(flags)}", f"-DKDA_FUSED_GQA={int(bool(gqa))}")
+
+
 # The campaign kernel targets ~264 resident CTAs; a launch splits each sequence
 # into P pieces so N*H*P lands near that without exceeding the number of chunks
 # a sequence actually has. Restated from the artifact's kda_launch.
@@ -75,12 +87,12 @@ def _arch_for_device(device: int) -> str:
     return "sm_90a"
 
 
-def _library(device: int) -> "compiler.KernelLibrary":
-    key = (KERNEL_BODY, int(device))
+def _library(device: int, flags: int = 0, gqa: bool = False) -> "compiler.KernelLibrary":
+    key = (KERNEL_BODY, int(device), int(flags), bool(gqa))
     with _LOCK:
         lib = _LIBRARIES.get(key)
         if lib is None:
-            lib = compiler.KernelLibrary(KERNEL_DIR / KERNEL_BODY, _arch_for_device(device), int(device), _SMEM_DEFINE)
+            lib = compiler.KernelLibrary(KERNEL_DIR / KERNEL_BODY, _arch_for_device(device), int(device), _defines(flags, gqa))
             _LIBRARIES[key] = lib
         return lib
 
@@ -126,7 +138,7 @@ def launch(
     otherwise.
     """
     smem = SMEM_BYTES
-    func = _library(device).function(KERNEL_NAME, dynamic_smem=smem)
+    func = _library(device, flags, (n_qk_heads or n_heads) != n_heads).function(KERNEL_NAME, dynamic_smem=smem)
     p = pieces_per_sequence(total_tokens, n_seqs, n_heads)
 
     params = compiler.Params()
@@ -137,7 +149,6 @@ def launch(
     params.ptr(a_log)
     params.ptr(dt_bias)
     params.f32(gate_lower_bound)
-    params.i32(flags)
     params.f32(q_scale)
     # q/k head count; equal to n_heads unless value heads are grouped.
     params.i32(n_qk_heads or n_heads)
