@@ -180,8 +180,8 @@ def _plot_phase(df, config, phase: str, outdir: Path) -> List[Path]:
     fig.legend(handles, labels, loc="upper right", fontsize=8, ncol=min(4, len(series)))
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.subplots_adjust(hspace=0.55)
-    path = outdir / f"{config.name}_{phase}.png"
-    fig.savefig(path, dpi=140)
+    path = outdir / f"{config.name}_{phase}.webp"
+    fig.savefig(path, dpi=140, pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
     plt.close(fig)
     return [path]
 

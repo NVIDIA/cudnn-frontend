@@ -49,7 +49,7 @@ def generate_charts(
     output_dir: Optional[Path] = None,
     peak_tflops: Optional[float] = None,
 ) -> list:
-    """Save ``<config>.png`` with fwd/bwd TFLOPS subplots; returns saved paths."""
+    """Save ``<config>.webp`` with fwd/bwd TFLOPS subplots; returns saved paths."""
     import matplotlib.pyplot as plt
     import seaborn as sns
 
@@ -108,8 +108,8 @@ def generate_charts(
             ax.bar_label(container, fmt="%.0f", fontsize=BAR_LABEL_FONT_SIZE)
 
     plt.tight_layout()
-    output_path = output_dir / f"{config.name}.png"
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    output_path = output_dir / f"{config.name}.webp"
+    plt.savefig(output_path, dpi=150, bbox_inches="tight", pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
     plt.close()
     logger.info(f"Chart saved to {output_path}")
     return [output_path]

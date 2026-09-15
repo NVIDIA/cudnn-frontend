@@ -65,8 +65,8 @@ python -m benchmark.attention_inference.runner --config llama --phase generation
 ```
 
 Results are organized per architecture as `results/<config>/<gpu>/`, each
-holding the CSV plus two charts: `<config>_context.png` (subplots stacked by
-prefill kind) and `<config>_generation.png` (subplots stacked by MTP width).
+holding the CSV plus two charts: `<config>_context.webp` (subplots stacked by
+prefill kind) and `<config>_generation.webp` (subplots stacked by MTP width).
 Every expanded case owns an x slot whether or not it ran, so coverage gaps
 are visible. Architectures are reported in isolation, never merged.
 

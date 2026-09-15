@@ -94,7 +94,7 @@ Consider a batch of images with the following dimensions:
 
 To keep the example simple, the image pixel elements are expressed as a sequence of integers, 0, 1, 2, 3, and so on.
 
-![Example with N=1, C=64, H=5, W=4](../images/ex-tensor.png)
+![Example with N=1, C=64, H=5, W=4](../images/ex-tensor.webp)
 
 In the following subsections, we'll use the above example to demonstrate the different layout formats.
 
@@ -110,7 +110,7 @@ The above 4D tensor is laid out in the memory in the NCHW format as below:
 2. Continue with second and subsequent channels until the elements of all the channels are laid out.
 3. Proceed to the next batch (if **N** is > 1).
 
-![NCHW Memory Layout](../images/nchw.png)
+![NCHW Memory Layout](../images/nchw.webp)
 
 ##### NHWC Memory Layout
 
@@ -121,13 +121,13 @@ For the NHWC memory layout, the corresponding elements in all the **C** channels
 3. Follow the row-major order of channel 0 and complete all the elements.
 4. Proceed to the next batch (if **N** is > 1).
 
-![NHWC Memory Layout](../images/nhwc.png)
+![NHWC Memory Layout](../images/nhwc.webp)
 
 ##### NC/32HW32 Memory Layout
 
 The NC/32HW32 is similar to NHWC, with a key difference. For the NC/32HW32 memory layout, the 64 channels are grouped into two groups of 32 channels each - first group consisting of channels `c0` through `c31`, and the second group consisting of channels `c32` through `c63`. Then each group is laid out using the NHWC format.
 
-![NC/32HW32 Memory Layout](../images/NC32HW32.png)
+![NC/32HW32 Memory Layout](../images/NC32HW32.webp)
 
 For the generalized NC/xHWx layout format, the following observations apply:
 

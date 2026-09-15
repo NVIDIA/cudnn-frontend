@@ -101,14 +101,14 @@ H16/H32/H64/H96/H128.
 ```
 results/<config>/<gpu>/
     <config>_<timestamp>.csv   # one row per case (see BenchmarkResult)
-    <config>.png               # fwd | bwd TFLOPS vs seqlen, one bar per model
+    <config>.webp               # fwd | bwd TFLOPS vs seqlen, one bar per model
 ```
 
 ### Results
 
 #### B200 - DeepSeek-V4
 
-![DeepSeek-V4 DSA on B200](results/deepseek_v4/b200/deepseek_v4.png)
+![DeepSeek-V4 DSA on B200](results/deepseek_v4/b200/deepseek_v4.webp)
 - `dsv4_flash: H=64, d=512, K=640 (indexer_topk=512)`; `dsv4_pro: H=128, d=512, K=1152 (indexer_topk=1024)`; bf16, sink + `topk_length`, non-deterministic backward.
 
 ## Single Scripts

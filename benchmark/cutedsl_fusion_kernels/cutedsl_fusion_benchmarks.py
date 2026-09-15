@@ -1245,7 +1245,7 @@ def format_summary(results: list, *, include_pytorch: bool) -> list[str]:
     return lines
 
 
-def write_results_png(
+def write_results_webp(
     results: list,
     *,
     include_pytorch: bool,
@@ -1396,7 +1396,7 @@ def write_results_png(
 
     ax.set_xlabel("speedup (higher is better)", color="#475569", fontsize=11)
 
-    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="white")
+    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="white", pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
     plt.close(fig)
     print(f"wrote {path}")
 
@@ -1408,7 +1408,7 @@ def write_output_files(
     results: list,
     args: argparse.Namespace,
 ) -> None:
-    """Write output_verbose.txt, output.txt, and results.png into output_dir."""
+    """Write output_verbose.txt, output.txt, and results.webp into output_dir."""
     include_pytorch = args.include_pytorch_baseline
     verbose_path = os.path.join(output_dir, "output_verbose.txt")
     with open(verbose_path, "w") as handle:
@@ -1442,12 +1442,12 @@ def write_output_files(
             shapes[activation] = f"GEMM: {args.experts} x {tokens} x {gemm_n} x {args.k}"
         # The chart header keeps device/dtype/version info; shapes move next to each bar.
         chart_info_lines = [line for line in key_lines if not line.startswith(SHAPE_PREFIXES)]
-        write_results_png(
+        write_results_webp(
             results,
             include_pytorch=include_pytorch,
             shapes=shapes,
             info_lines=chart_info_lines,
-            path=os.path.join(output_dir, "results.png"),
+            path=os.path.join(output_dir, "results.webp"),
         )
 
 
@@ -1586,7 +1586,7 @@ def main() -> None:
         default=None,
         help=(
             "if set, write output_verbose.txt (full stdout), output.txt (device/version/"
-            "dtype/shape/summary), and results.png (summary table) to this directory"
+            "dtype/shape/summary), and results.webp (summary table) to this directory"
         ),
     )
     args = parser.parse_args()
