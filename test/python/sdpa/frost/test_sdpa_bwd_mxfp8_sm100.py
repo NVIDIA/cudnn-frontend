@@ -189,7 +189,9 @@ def _plan_index(g, name=_ENGINE):
     return None
 
 
-def _run(b=1, hq=2, hkv=None, sq=256, skv=256, out_dt=torch.bfloat16, causal=False, omit_scale=False, tol_cos=_TOL_COS, seed=0, **sdpa_kwargs):
+def _run(
+    b=1, hq=2, hkv=None, sq=256, skv=256, out_dt=torch.bfloat16, causal=False, omit_scale=False, tol_cos=_TOL_COS, seed=0, repeat_outputs=0, **sdpa_kwargs
+):
     """Quantize random operands, build the graph, pin the engine, execute, and
     compare dQ/dK/dV against the MXFP8 backward reference."""
     from sdpa.mxfp8_ref import compute_ref, compute_ref_backward
@@ -275,6 +277,30 @@ def _run(b=1, hq=2, hkv=None, sq=256, skv=256, out_dt=torch.bfloat16, causal=Fal
         cos = torch.nn.functional.cosine_similarity(got.float().flatten(), ref.flatten(), dim=0).item()
         assert cos > tol_cos, f"{name}: cos={cos:.6f}"
 
+    if repeat_outputs:
+        grads = (dq, dk, dv)
+        expected = tuple(x.clone() for x in grads)
+        replay = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(replay, stream=torch.cuda.current_stream()):
+            g.execute(pack, ws)
+        for i in range(repeat_outputs):
+            # A zero-initialized output hides stores skipped for fully masked
+            # KV tiles. Exercise both non-finite and finite previous contents,
+            # and both eager and captured execution for each sentinel.
+            for x in grads:
+                x.fill_(float("nan") if i % 4 < 2 else 123.0)
+            if i % 2:
+                replay.replay()
+            else:
+                g.execute(pack, ws)
+            torch.cuda.synchronize()
+            for got, ref in zip(grads, expected):
+                torch.testing.assert_close(got.view(torch.int16), ref.view(torch.int16), rtol=0, atol=0)
+            if causal and skv > sq:
+                for got in (dk, dv):
+                    tail = got[:, :, sq:, :]
+                    torch.testing.assert_close(tail, torch.zeros_like(tail), rtol=0, atol=0)
+
 
 # --------------------------------------------------------------------------- #
 # ACCEPT -- every capability the row claims                                    #
@@ -353,6 +379,35 @@ def test_deterministic_flag():
     """Both kernels own their output tiles (no atomics), so the row honors
     use_deterministic_algorithm; the result must be bitwise stable."""
     _run(use_deterministic_algorithm=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("out", list(_OUT))
+@pytest.mark.parametrize("persistent", [False, True], ids=["nonpersistent", "persistent"])
+@pytest.mark.parametrize("b,hq,hkv,sq,skv", [(2, 32, 2, 384, 512), (4, 4, 4, 256, 384), (2, 8, 2, 96, 257), (4, 32, 16, 384, 512)])
+def test_fully_masked_kv_tiles_overwrite_outputs(monkeypatch, out, persistent, b, hq, hkv, sq, skv):
+    """Empty causal KV tiles own zero gradients, not the previous buffer data.
+
+    The graph adapter normally selects non-persistent scheduling. Force the
+    kernel constructor flag here to cover the CLC zero-trip path as well.
+    """
+    from cudnn.sdpa.bwd.kernels.bprop_dq_d256_mxfp8_sm100 import BlackwellFmhaBackwardDQ256
+    from cudnn.sdpa.bwd.kernels.bprop_dkdv_d256_mxfp8_sm100 import BlackwellFmhaBackwardDKDV256
+
+    def with_schedule(init):
+        def wrapped(self, *args, **kwargs):
+            kwargs["is_persistent"] = persistent
+            init(self, *args, **kwargs)
+
+        return wrapped
+
+    for cls in (BlackwellFmhaBackwardDQ256, BlackwellFmhaBackwardDKDV256):
+        monkeypatch.setattr(cls, "__init__", with_schedule(cls.__init__))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _run(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, out_dt=_OUT[out], causal=True, seed=142, repeat_outputs=64)
+    stream.synchronize()
 
 
 @pytest.mark.L1
