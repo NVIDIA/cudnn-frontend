@@ -772,8 +772,6 @@ def _kernel(
     # SF buffers sized in BYTES (uint8 storage).
     sQ_SF_raw = cutlass.Array(cutlass.Int8, CFG.TILES_Q * SF_SMEM_SIZE_Q, alignment=1024, space=cutlass.AddressSpace.smem)
     sK_SF_raw = cutlass.Array(cutlass.Int8, CFG.STAGES_KV * SF_SMEM_SIZE_K, alignment=1024, space=cutlass.AddressSpace.smem)
-    sP_SF_raw = cutlass.Array(cutlass.Int8, CFG.STAGES_KV * SF_SMEM_SIZE_P, alignment=1024, space=cutlass.AddressSpace.smem)
-    sV_SF_raw = cutlass.Array(cutlass.Int8, CFG.STAGES_KV * SF_SMEM_SIZE_V, alignment=1024, space=cutlass.AddressSpace.smem)
 
     sQ = SmemTile(
         base=sQ_raw,
@@ -837,22 +835,30 @@ def _kernel(
         stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
         layout=SMEM_LAYOUT_SF,
     )
-    sP_SF = SmemTile(
-        base=sP_SF_raw,
-        elems_per_stage=SF_SMEM_SIZE_P,
-        stages=CFG.STAGES_KV,
-        leading_byte_offset=SF_LEADING_BYTE_OFFSET,
-        stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
-        layout=SMEM_LAYOUT_SF,
-    )
-    sV_SF = SmemTile(
-        base=sV_SF_raw,
-        elems_per_stage=SF_SMEM_SIZE_V,
-        stages=CFG.STAGES_KV,
-        leading_byte_offset=SF_LEADING_BYTE_OFFSET,
-        stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
-        layout=SMEM_LAYOUT_SF,
-    )
+    if cutlass.const_expr(CFG.PV_BF16):
+        # BF16 BMM2 has no scale operands. Preserve the generic helper
+        # signatures by borrowing Q/K SF tiles; hybrid code never reads them.
+        sP_SF = sQ_SF
+        sV_SF = sK_SF
+    else:
+        sP_SF_raw = cutlass.Array(cutlass.Int8, CFG.STAGES_KV * SF_SMEM_SIZE_P, alignment=1024, space=cutlass.AddressSpace.smem)
+        sV_SF_raw = cutlass.Array(cutlass.Int8, CFG.STAGES_KV * SF_SMEM_SIZE_V, alignment=1024, space=cutlass.AddressSpace.smem)
+        sP_SF = SmemTile(
+            base=sP_SF_raw,
+            elems_per_stage=SF_SMEM_SIZE_P,
+            stages=CFG.STAGES_KV,
+            leading_byte_offset=SF_LEADING_BYTE_OFFSET,
+            stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
+            layout=SMEM_LAYOUT_SF,
+        )
+        sV_SF = SmemTile(
+            base=sV_SF_raw,
+            elems_per_stage=SF_SMEM_SIZE_V,
+            stages=CFG.STAGES_KV,
+            leading_byte_offset=SF_LEADING_BYTE_OFFSET,
+            stride_byte_offset=SF_STRIDE_BYTE_OFFSET,
+            layout=SMEM_LAYOUT_SF,
+        )
 
     bars = make_classic_bars(CFG)
 
@@ -957,12 +963,13 @@ def _kernel(
                     sched.initial_decoded_smem.subview(3).store(initial_split)
 
     # P_SF SMEM fill 0x7F (constant 1.0); MUST happen BEFORE cga_arrive so both peers see filled SMEM.
-    SF_TOTAL_BYTES_P = SF_SMEM_SIZE_P * CFG.STAGES_KV
-    _SF_P_ITERS = (SF_TOTAL_BYTES_P + CFG.THREADS_PER_CTA - 1) // CFG.THREADS_PER_CTA
-    for _i in cutlass.range_constexpr(_SF_P_ITERS):
-        _off = tidx + cutlass.Int32(_i * CFG.THREADS_PER_CTA)
-        if _off < cutlass.Int32(SF_TOTAL_BYTES_P):
-            sP_SF_raw.subview(_off).store(cutlass.Int8(0x7F))
+    if cutlass.const_expr(not CFG.PV_BF16):
+        SF_TOTAL_BYTES_P = SF_SMEM_SIZE_P * CFG.STAGES_KV
+        _SF_P_ITERS = (SF_TOTAL_BYTES_P + CFG.THREADS_PER_CTA - 1) // CFG.THREADS_PER_CTA
+        for _i in cutlass.range_constexpr(_SF_P_ITERS):
+            _off = tidx + cutlass.Int32(_i * CFG.THREADS_PER_CTA)
+            if _off < cutlass.Int32(SF_TOTAL_BYTES_P):
+                sP_SF_raw.subview(_off).store(cutlass.Int8(0x7F))
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
@@ -1147,7 +1154,8 @@ def _kernel(
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_q_sf_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_sf_desc.get_ptr())
-        nvvm.prefetch_tensormap(tma_v_sf_desc.get_ptr())
+        if cutlass.const_expr(not CFG.PV_BF16):
+            nvvm.prefetch_tensormap(tma_v_sf_desc.get_ptr())
         _tmaldg_warp_group(
             tma_q_desc=tma_q_desc,
             tma_k_desc=tma_k_desc,
@@ -1340,7 +1348,7 @@ def _tmaldg_warp_group(
     # SF expect_tx scales by CTA_MMA under cga2 (2× SMEM size on leader); cga1 → SF_SMEM_SIZE.
     Q_SF_EXPECT_BYTES = SF_SMEM_SIZE_Q * CFG.CTA_MMA
     K_SF_EXPECT_BYTES = SF_SMEM_SIZE_K * CFG.CTA_MMA
-    V_SF_EXPECT_BYTES = SF_SMEM_SIZE_V * CFG.CTA_MMA
+    V_SF_EXPECT_BYTES = 0 if CFG.PV_BF16 else SF_SMEM_SIZE_V * CFG.CTA_MMA
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -1452,13 +1460,14 @@ def _tmaldg_warp_group(
                 mcast_mask=tma_mcast_mask,
                 acquire=False,
             )
-            tma_load_tile(
-                sV_SF[kv_state.idx].shifted(v_sf_peer_off),
-                tma_v_sf(v_sf_peer_row, cu_sf_k_base + kv_left, kv_head_idx, tma_batch, coord_0=cutlass.Int32(0)),
-                bars.mb_v_full[kv_state.idx].smem_ptr,
-                cta_group=CFG.CTA_MMA,
-                mcast_mask=sf_mcast_mask,
-            )
+            if cutlass.const_expr(not CFG.PV_BF16):
+                tma_load_tile(
+                    sV_SF[kv_state.idx].shifted(v_sf_peer_off),
+                    tma_v_sf(v_sf_peer_row, cu_sf_k_base + kv_left, kv_head_idx, tma_batch, coord_0=cutlass.Int32(0)),
+                    bars.mb_v_full[kv_state.idx].smem_ptr,
+                    cta_group=CFG.CTA_MMA,
+                    mcast_mask=sf_mcast_mask,
+                )
             kv_state = advance(kv_state, CFG.STAGES_KV)
 
             for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=2):
@@ -1522,13 +1531,14 @@ def _tmaldg_warp_group(
                     mcast_mask=tma_mcast_mask,
                     acquire=False,
                 )
-                tma_load_tile(
-                    sV_SF[kv_state.idx].shifted(v_sf_peer_off),
-                    tma_v_sf(v_sf_peer_row, cu_sf_k_base + kv_loop, kv_head_idx, tma_batch, coord_0=cutlass.Int32(0)),
-                    bars.mb_v_full[kv_state.idx].smem_ptr,
-                    cta_group=CFG.CTA_MMA,
-                    mcast_mask=sf_mcast_mask,
-                )
+                if cutlass.const_expr(not CFG.PV_BF16):
+                    tma_load_tile(
+                        sV_SF[kv_state.idx].shifted(v_sf_peer_off),
+                        tma_v_sf(v_sf_peer_row, cu_sf_k_base + kv_loop, kv_head_idx, tma_batch, coord_0=cutlass.Int32(0)),
+                        bars.mb_v_full[kv_state.idx].smem_ptr,
+                        cta_group=CFG.CTA_MMA,
+                        mcast_mask=sf_mcast_mask,
+                    )
 
                 kv_state = advance(kv_state, CFG.STAGES_KV)
 
@@ -1921,14 +1931,17 @@ def _mma_warp_group(
     def _utccp_bmm2_sf(tmem_sf_p, tmem_sf_v, smem_desc_p, smem_desc_v):
         # SF_P is the constant P_SF; SF_V is per-kv-tile.  Both single-block (llama).
         # desc_P_SF_0 passed explicitly (DSL-value closure capture is unstaged).
-        nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_p, smem_desc_p, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
-        nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_v, smem_desc_v, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
+        if cutlass.const_expr(not CFG.PV_BF16):
+            nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_p, smem_desc_p, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
+            nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_v, smem_desc_v, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
 
     def _utccp_bmm2_p_sf(tmem_sf_p, smem_desc_p):
-        nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_p, smem_desc_p, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
+        if cutlass.const_expr(not CFG.PV_BF16):
+            nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_p, smem_desc_p, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
 
     def _utccp_bmm2_v_sf(tmem_sf_v, smem_desc_v):
-        nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_v, smem_desc_v, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
+        if cutlass.const_expr(not CFG.PV_BF16):
+            nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_v, smem_desc_v, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
 
     if cutlass.const_expr(CFG.MASK_FLAGS == 0 and SPLIT_KV == 1):
         kv_left = cutlass.Int32(0)
@@ -3162,7 +3175,7 @@ def _correction_warp_group(
 
             # The global amax is independent of the O TMA store.  Publish O
             # first so the store warp can overlap this atomic and the next qs.
-            if cutlass.const_expr(CFG.EMIT_AMAX_O):
+            if cutlass.const_expr(SPLIT_KV == 1 and CFG.EMIT_AMAX_O):
                 if cutlass.const_expr(CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS == 0):
                     _amax_o_warp_input = cutlass.Float32(0.0)
                     if _row_valid:

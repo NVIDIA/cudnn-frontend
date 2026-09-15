@@ -465,7 +465,67 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
     api_amax.compile()
     api_amax.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=amax_o)
     torch.cuda.synchronize()
-    torch.testing.assert_close(amax_o, o_ref.abs().max().reshape_as(amax_o), rtol=0.0, atol=3e-2)
+    torch.testing.assert_close(
+        amax_o,
+        o_ref.abs().max().reshape_as(amax_o),
+        rtol=0.0,
+        atol=_half_atol("e4m3", d_qk),
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=67)
+def test_mxfp8_d192_split_kv_publishes_amax_from_combined_output():
+    """D192 split-KV must leave Amax publication to the combine kernel."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h_q, h_kv, s, d_qk, d_v = 1, 4, 2, 256, 192, 128
+    dev = "cuda"
+    scale = d_qk**-0.5
+    qf = torch.randn(b, h_q, s, d_qk, device=dev) * 0.5
+    kf = torch.randn(b, h_kv, s, d_qk, device=dev) * 0.5
+    vf = torch.randn(b, h_kv, s, d_v, device=dev) * 0.5
+    q, sf_q, dq, _ = _quantize(qf, b, h_q, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    k, sf_k, dk, _ = _quantize(kf, b, h_kv, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    v, sf_v, dv, _ = _quantize(vf, b, h_kv, s, d_v, torch.float8_e4m3fn, columnwise=True)
+    o = torch.empty((b, h_q, s, d_v), device=dev, dtype=torch.bfloat16)
+    amax_o = torch.empty(1, device=dev, dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_amax_o=amax_o,
+        is_causal=True,
+        scale_softmax=scale,
+        dtype_o=torch.bfloat16,
+        split_kv=2,
+    )
+
+    assert api.check_support()
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), device=dev, dtype=torch.uint8)
+    api.execute(
+        q_tensor=q,
+        k_tensor=k,
+        v_tensor=v,
+        o_tensor=o,
+        sf_q=sf_q,
+        sf_k=sf_k,
+        sf_v=sf_v,
+        amax_o=amax_o,
+        workspace=workspace,
+    )
+    torch.cuda.synchronize()
+
+    o_ref = _ref(q.float() * dq, k.float() * dk, v.float() * dv, scale=scale, is_causal=True)
+    _check(o, o_ref, torch.bfloat16, "e4m3", d_qk=d_qk)
+    torch.testing.assert_close(
+        amax_o,
+        o_ref.abs().max().reshape_as(amax_o),
+        rtol=0.0,
+        atol=_half_atol("e4m3", d_qk),
+    )
 
 
 @pytest.mark.L0

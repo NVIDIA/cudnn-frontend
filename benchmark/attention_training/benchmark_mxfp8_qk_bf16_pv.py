@@ -55,9 +55,7 @@ def _bshd_physical_input(shape: tuple[int, int, int, int]) -> torch.Tensor:
     that view be contiguous, avoiding adapter-side Q/K/V gathers and O scatter.
     """
     batch, heads, seqlen, dim = shape
-    return torch.empty(
-        (batch, seqlen, heads, dim), device="cuda", dtype=torch.bfloat16
-    ).transpose(1, 2)
+    return torch.empty((batch, seqlen, heads, dim), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
 
 
 def _as_bshd_physical(tensor: torch.Tensor) -> torch.Tensor:
@@ -65,9 +63,7 @@ def _as_bshd_physical(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.transpose(1, 2).contiguous().transpose(1, 2)
 
 
-def _quantize_mxfp8(
-    x: torch.Tensor, *, columnwise: bool
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_mxfp8(x: torch.Tensor, *, columnwise: bool) -> tuple[torch.Tensor, torch.Tensor]:
     """Return MXFP8 data/SF without materializing a monolithic FP32 Q tensor."""
     quantizer_dir = Path(__file__).parents[2] / "test" / "python" / "sdpa"
     if str(quantizer_dir) not in sys.path:
@@ -76,9 +72,7 @@ def _quantize_mxfp8(
 
     def quantize_chunk(x_chunk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         chunk_b, h, s, d = x_chunk.shape
-        data_d, _dq_d, sf_d, data_s, _dq_s, sf_s = quantize_to_mxfp8(
-            x_chunk.float(), chunk_b, h, s, d, with_ref=False
-        )
+        data_d, _dq_d, sf_d, data_s, _dq_s, sf_s = quantize_to_mxfp8(x_chunk.float(), chunk_b, h, s, d, with_ref=False)
         data, sf = (data_s, sf_s) if columnwise else (data_d, sf_d)
         return data, sf
 
@@ -102,13 +96,9 @@ def _parse_positive_ints(value: str) -> tuple[int, ...]:
     try:
         values = tuple(int(item) for item in value.split(","))
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "expected a comma-separated list of positive integers"
-        ) from exc
+        raise argparse.ArgumentTypeError("expected a comma-separated list of positive integers") from exc
     if not values or any(item <= 0 for item in values):
-        raise argparse.ArgumentTypeError(
-            "expected a non-empty list of positive integers"
-        )
+        raise argparse.ArgumentTypeError("expected a non-empty list of positive integers")
     if len(values) != len(set(values)):
         raise argparse.ArgumentTypeError("values must not repeat")
     return values
@@ -124,9 +114,7 @@ def _parse_d_shapes(value: str) -> tuple[tuple[str, int, int], ...]:
     unknown = tuple(label for label in labels if label not in D_SHAPES)
     if unknown:
         choices = ", ".join(D_SHAPES)
-        raise argparse.ArgumentTypeError(
-            f"unknown D-shape {unknown[0]!r}; choose from {choices}"
-        )
+        raise argparse.ArgumentTypeError(f"unknown D-shape {unknown[0]!r}; choose from {choices}")
     return tuple((label, *D_SHAPES[label]) for label in labels)
 
 
@@ -153,25 +141,13 @@ def _time_cuda_events(fn: Callable[[], None], *, warmup: int, iters: int) -> flo
 
 def _frost_kernel_time_us(prof) -> float:
     """Return total device time of the compiled FROST kernels in one trace."""
-    kernels = [
-        item
-        for item in prof.key_averages()
-        if item.key.startswith(
-            ("cudnn_frost_", "kernel_cutlass", "cudnn_kernel__")
-        )
-    ]
+    kernels = [item for item in prof.key_averages() if item.key.startswith(("cudnn_frost_", "kernel_cutlass", "cudnn_kernel__"))]
     if kernels:
         return sum(item.device_time_total for item in kernels)
     if not prof.key_averages():
-        raise RuntimeError(
-            "torch.profiler recorded no CUDA events; refusing to report a "
-            "zero FROST-kernel time"
-        )
+        raise RuntimeError("torch.profiler recorded no CUDA events; refusing to report a " "zero FROST-kernel time")
     names = ", ".join(item.key for item in prof.key_averages()[:12])
-    raise RuntimeError(
-        "torch.profiler recorded CUDA events but no FROST/CuTe kernel; "
-        f"first events: {names}"
-    )
+    raise RuntimeError("torch.profiler recorded CUDA events but no FROST/CuTe kernel; " f"first events: {names}")
 
 
 def _time_frost_kernel_profiler(
@@ -208,6 +184,12 @@ def _time_frost_kernel_profiler(
 
 def _capture_cuda_graph(fn: Callable[[], None]) -> Callable[[], None]:
     """Capture one already-compiled direct API launch and return its replay."""
+    current_stream = torch.cuda.current_stream()
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(current_stream)
+    with torch.cuda.stream(warmup_stream):
+        fn()
+    current_stream.wait_stream(warmup_stream)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -237,9 +219,7 @@ def _time_variant(
 ) -> dict[str, float]:
     """Compile and time one variant with an explicit measurement boundary."""
     o = _bshd_physical_input(shape_o)
-    amax_o = (
-        torch.empty(1, device="cuda", dtype=torch.float32) if emit_amax_o else None
-    )
+    amax_o = torch.empty(1, device="cuda", dtype=torch.float32) if emit_amax_o else None
     api = api_cls(
         sample_q=q,
         sample_k=k,
@@ -276,17 +256,13 @@ def _time_variant(
         )
     else:
         if execution in ("eager", "both"):
-            timings["adapter eager"] = _time_cuda_events(
-                launch, warmup=warmup, iters=iters
-            )
+            timings["adapter eager"] = _time_cuda_events(launch, warmup=warmup, iters=iters)
         if execution in ("graph", "both"):
             try:
                 graph_replay = _capture_cuda_graph(launch)
             except RuntimeError as exc:
                 raise RuntimeError("variant is not CUDA-graph capturable") from exc
-            timings["adapter cuda graph"] = _time_cuda_events(
-                graph_replay, warmup=warmup, iters=iters
-            )
+            timings["adapter cuda graph"] = _time_cuda_events(graph_replay, warmup=warmup, iters=iters)
 
     del launch, execute_kwargs, api, amax_o, o
     torch.cuda.synchronize()
@@ -315,11 +291,7 @@ def _benchmark_shape(
     shape_k = (batch, kv_heads, seqlen, d_qk)
     shape_v = (batch, kv_heads, seqlen, d_v)
     shape_o = (batch, q_heads, seqlen, d_v)
-    l2_flush_buffer = (
-        torch.empty(l2_flush_mb * 1024 * 1024, device="cuda", dtype=torch.int8)
-        if l2_flush_mb
-        else None
-    )
+    l2_flush_buffer = torch.empty(l2_flush_mb * 1024 * 1024, device="cuda", dtype=torch.int8) if l2_flush_mb else None
 
     def bf16_input(shape: tuple[int, int, int, int]) -> torch.Tensor:
         return _bshd_physical_input(shape).normal_(0.0, 0.5)
@@ -454,14 +426,12 @@ def main() -> None:
         "--timing-mode",
         choices=("frost-profiler", "adapter-events"),
         default="frost-profiler",
-        help=(
-            "frost-profiler reports only FROST/CuTe CUDA kernels, like "
-            "benchmark_single_sdpa.py; adapter-events reports full direct "
-            "adapter latency"
-        ),
+        help=("frost-profiler reports only FROST/CuTe CUDA kernels, like " "benchmark_single_sdpa.py; adapter-events reports full direct " "adapter latency"),
     )
     parser.add_argument(
-        "--execution", choices=("both", "eager", "graph"), default="both",
+        "--execution",
+        choices=("both", "eager", "graph"),
+        default="both",
         help="adapter-events only: execution mode to measure",
     )
     parser.add_argument(
@@ -509,18 +479,12 @@ def main() -> None:
 
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
-    shapes = (
-        tuple((batch, seqlen) for batch in args.batches for seqlen in args.seqlens)
-        if args.sweep
-        else ((args.batch, args.seqlen),)
-    )
+    shapes = tuple((batch, seqlen) for batch in args.batches for seqlen in args.seqlens) if args.sweep else ((args.batch, args.seqlen),)
     torch.manual_seed(17)
 
     scope = (
         "full B x Sq sweep"
-        if args.sweep
-        and args.batches == SWEEP_BATCHES
-        and args.seqlens == SWEEP_SEQLENS
+        if args.sweep and args.batches == SWEEP_BATCHES and args.seqlens == SWEEP_SEQLENS
         else "selected B x Sq sweep" if args.sweep else "single shape"
     )
     d_labels = ",".join(label for label, _, _ in args.d_shapes)
@@ -532,11 +496,7 @@ def main() -> None:
         f"{args.timing_mode} measurements per row; L2 flush={args.l2_flush_mb} MiB; "
         f"variant={args.variant}"
     )
-    print(
-        "{:>4s} {:>7s} {:>4s} {:>4s} {:38s} {:11s} {:>14s} {:>9s}".format(
-            "B", "Sq=Sk", "Dqk", "Dv", "kernel", "execution", "avg us/launch", "vs BF16"
-        )
-    )
+    print("{:>4s} {:>7s} {:>4s} {:>4s} {:38s} {:11s} {:>14s} {:>9s}".format("B", "Sq=Sk", "Dqk", "Dv", "kernel", "execution", "avg us/launch", "vs BF16"))
 
     for _label, d_qk, d_v in args.d_shapes:
         for batch, seqlen in shapes:
@@ -558,25 +518,14 @@ def main() -> None:
                     l2_flush_mb=args.l2_flush_mb,
                 )
             except torch.OutOfMemoryError:
-                print(
-                    "{:4d} {:7d} {:4d} {:4d} {:38s} {:11s} {:>14s} {:>9s}".format(
-                        batch, seqlen, d_qk, d_v, "OOM", "-", "-", "-"
-                    )
-                )
+                print("{:4d} {:7d} {:4d} {:4d} {:38s} {:11s} {:>14s} {:>9s}".format(batch, seqlen, d_qk, d_v, "OOM", "-", "-", "-"))
             else:
                 bf16_timings = results.get(BF16_NAME, {})
                 for name in (HYBRID_NAME, MXFP8_NAME, BF16_NAME):
                     for measurement, average_us in results.get(name, {}).items():
                         bf16_us = bf16_timings.get(measurement)
-                        relative = (
-                            f"{average_us / bf16_us:.3f}x"
-                            if bf16_us is not None
-                            else "-"
-                        )
-                        print(
-                            f"{batch:4d} {seqlen:7d} {d_qk:4d} {d_v:4d} "
-                            f"{name:38s} {measurement:11s} {average_us:14.2f} {relative:>9s}"
-                        )
+                        relative = f"{average_us / bf16_us:.3f}x" if bf16_us is not None else "-"
+                        print(f"{batch:4d} {seqlen:7d} {d_qk:4d} {d_v:4d} " f"{name:38s} {measurement:11s} {average_us:14.2f} {relative:>9s}")
             finally:
                 # Drop tensors, API objects, and graph pools before the next point.
                 torch.cuda.empty_cache()

@@ -444,7 +444,6 @@ class SdpaFwdDsl(APIBase):
         sample_v: torch.Tensor | TensorDesc,
         sample_o: torch.Tensor | TensorDesc,
         sample_lse: Optional[torch.Tensor | TensorDesc] = None,
-        sample_amax_o: Optional[torch.Tensor | TensorDesc] = None,
         is_causal: bool = False,
         causal_bottom_right: bool = False,
         window_size_left: Optional[int] = None,
@@ -472,6 +471,7 @@ class SdpaFwdDsl(APIBase):
         paged_table_stride: Optional[tuple] = None,
         paged_table_v_stride: Optional[tuple] = None,
         thd_stats_padded: bool = False,
+        sample_amax_o: Optional[torch.Tensor | TensorDesc] = None,
         pv_bf16: bool = False,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
@@ -1155,6 +1155,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
+
+        if self.pv_bf16:
+            device_cc = torch.cuda.get_device_capability(self.q_desc.device)
+            self._not_implemented_error_if(
+                device_cc not in ((10, 0), (10, 3)),
+                "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
+            )
 
         # Layout gate. DENSE: the kernels always consume canonical BSHD-compact
         # buffers — execute() normalizes via _to_bshd / _to_bshd_writable
@@ -2721,10 +2728,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         sf_q_v = self._reshape_sf(sf_q, h_q, n_q_tiles, km.SF_SMEM_SIZE_Q)
         sf_k_v = self._reshape_sf(sf_k, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_K)
         # The BF16 PV specialization keeps the common FP8-family SF_V ABI, but
-        # BMM2 does not consume it.  D192 Q/K SF tiles are 1024 B while the
-        # unused V slot is 512 B, so bind a contiguous prefix copy rather than reshaping
-        # the full K tile as if it were a V tile.
-        sf_v_v = sf_k_v[..., : km.SF_SMEM_SIZE_V].contiguous() if self.pv_bf16 else self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
+        # BMM2 does not consume it. Bind a cached correctly shaped dummy rather
+        # than materializing a sliced contiguous tensor on every launch.
+        sf_v_v = (
+            self._dummy(
+                f"pv_bf16_sf_v_{b}_{h_kv}_{n_kv_tiles}_{km.SF_SMEM_SIZE_V}",
+                device,
+                lambda: torch.zeros(
+                    (b, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V),
+                    dtype=torch.int8,
+                    device=device,
+                ),
+            )
+            if self.pv_bf16
+            else self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
+        )
 
         # has_lse=False (no Stats output): the store is compiled out; bind None.
         lse = lse_tensor
@@ -3230,6 +3248,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
+
+        self._not_implemented_error_if(
+            self.pv_bf16,
+            "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
+        )
 
         self._not_implemented_error_if(self.paged, "paged KV is served by the SM100 f16/bf16 engine only")
         if self.thd:
@@ -4579,6 +4602,11 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
+
+        self._not_implemented_error_if(
+            self.pv_bf16,
+            "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
+        )
 
         from cudnn.sdpa.graph_analyzer import dense_layout_ok
 
