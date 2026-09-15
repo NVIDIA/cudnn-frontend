@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -92,7 +93,12 @@ def _validate_sparse_metadata(
 
 
 def _device_arch(tensor: torch.Tensor) -> int:
-    major, minor = torch.cuda.get_device_capability(tensor.device)
+    return _device_arch_for_index(tensor.device.index)
+
+
+@lru_cache(maxsize=None)
+def _device_arch_for_index(device_index: int) -> int:
+    major, minor = torch.cuda.get_device_capability(device_index)
     return major * 10 + minor
 
 

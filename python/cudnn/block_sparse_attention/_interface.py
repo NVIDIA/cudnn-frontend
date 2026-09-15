@@ -272,8 +272,17 @@ def _sm100_blk64_has_partial_kv_tail(
     return k.shape[2] % 64 != 0 or v.shape[2] % 64 != 0
 
 
+@lru_cache(maxsize=256)
+def _layout_compile_key_from_metadata(shape: tuple, stride: tuple):
+    # dim_order is expensive Python metadata processing. Cache its exact
+    # result without retaining tensors or device storage. Runtime extents in
+    # this bounded metadata cache do not enter the kernel compile key.
+    metadata = torch.empty_strided(shape, stride, device="meta")
+    return (tuple(metadata.dim_order()), tuple(s == 0 for s in stride))
+
+
 def _tensor_layout_compile_key(t: torch.Tensor):
-    return (tuple(t.dim_order()), tuple(s == 0 for s in t.stride()))
+    return _layout_compile_key_from_metadata(tuple(t.shape), tuple(t.stride()))
 
 
 def _tensor_static_compile_key(t: torch.Tensor):
@@ -746,7 +755,7 @@ def _bsa_attn_fwd_sm90_blk64(
         else q2k_nums_cute
     )
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
     fwd_kernel = BlockSparseAttnForwardSm90Blk64(
         gqa_ratio=gqa_ratio,
         head_dim=head_dim,
@@ -919,7 +928,7 @@ def _bsa_attn_fwd_sm120(
     q2k_nums_cute = from_dlpack(q2k_nums_t.detach())
     block_sizes_cute = from_dlpack(block_sizes_t.detach()) if has_block_sizes else q2k_nums_cute
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
     fwd_kernel = kernel_cls(
         gqa_ratio=gqa_ratio,
         head_dim=head_dim,
@@ -1139,7 +1148,7 @@ def _bsa_attn_fwd_sm120_fp8_blk64(
         )
         for index, tensor in enumerate(runtime_tensors)
     )
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
     fwd_kernel = BlockSparseAttnForwardFp8Sm120Blk64(
         gqa_ratio=1,
         head_dim=head_dim,
@@ -1246,7 +1255,7 @@ def _combine_blk64_kv_bucketed_partials(
     combine_num_threads = 128
     combine_stages = 4
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
     compile_key = _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
         _get_device_arch(),
         dtype,
@@ -1563,7 +1572,7 @@ def bsa_attn_fwd_blk64_cutedsl(
             device=q_bhsd.device,
         )
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
 
     compile_key = _dynamic_tensors_compile_key(
         "sm100_blk64_fwd",
@@ -2022,7 +2031,7 @@ def bsa_attn_fwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
 
     has_variable_block_nums = q2k_block_nums is not None
     if layout == "bhsd":
@@ -2034,15 +2043,10 @@ def bsa_attn_fwd(
             v.transpose(1, 2),
             out.transpose(1, 2),
         )
-    bsa_fwd_kernel = BlockSparseAttnForwardSm100Blk128(
-        head_dim,
-        head_dim_v,
-        qhead_per_kvhead=qhead_per_kvhead,
-        pack_gqa=pack_gqa,
-        allow_empty_block_nums=allow_empty_block_nums and has_variable_block_nums,
-        has_block_sizes=has_block_sizes,
-    )
 
+    # Normalize the auto setting without constructing a kernel on cache hits.
+    effective_pack_gqa = qhead_per_kvhead > 1 if pack_gqa is None else pack_gqa
+    effective_pack_gqa = effective_pack_gqa and BlockSparseAttnForwardSm100Blk128.tile_m % qhead_per_kvhead == 0
     compile_key = _dynamic_tensors_compile_key(
         "sm100_blk128_fwd",
         (
@@ -2051,12 +2055,12 @@ def bsa_attn_fwd(
             head_dim_v,
             qhead_per_kvhead,
             lse is None,
-            bsa_fwd_kernel.m_block_size,
-            bsa_fwd_kernel.n_block_size,
-            bsa_fwd_kernel.pack_gqa,
+            BlockSparseAttnForwardSm100Blk128.tile_m,
+            BlockSparseAttnForwardSm100Blk128.tile_n,
+            effective_pack_gqa,
             arch,
-            bsa_fwd_kernel.use_clc_scheduler,
-            bsa_fwd_kernel.is_persistent,
+            BlockSparseAttnForwardSm100Blk128.use_clc_scheduler_default,
+            BlockSparseAttnForwardSm100Blk128.is_persistent_default,
             has_variable_block_nums,
             allow_empty_block_nums and has_variable_block_nums,
             has_block_sizes,
@@ -2075,6 +2079,14 @@ def bsa_attn_fwd(
     )
 
     if compile_key not in bsa_attn_fwd.compile_cache:
+        bsa_fwd_kernel = BlockSparseAttnForwardSm100Blk128(
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead=qhead_per_kvhead,
+            pack_gqa=pack_gqa,
+            allow_empty_block_nums=allow_empty_block_nums and has_variable_block_nums,
+            has_block_sizes=has_block_sizes,
+        )
         q_tensor, k_tensor, v_tensor, o_tensor = [
             _to_cute_tensor_with_dynamic_modes(t, dynamic_modes=(0, 1, 2)) for t in (q_kernel, k_kernel, v_kernel, out_kernel)
         ]
@@ -2488,7 +2500,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             device=q.device,
         )
 
-        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
         bwd_kernel = BlockSparseAttnBackwardSm90Blk64(dtype, head_dim, head_dim)
         problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
 
@@ -2569,7 +2581,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     )
 
     problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
 
     compile_key = (
         "sm100_bucketed_k2q",

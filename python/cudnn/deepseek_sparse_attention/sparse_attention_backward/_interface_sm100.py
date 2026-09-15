@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _device_capability, resolve_stream, torch_stream_context
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic
@@ -278,7 +278,7 @@ def flash_attn_bwd_sm100(
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
     max_topk = topk_idxs.shape[1]
-    device_capability = torch.cuda.get_device_capability(q.device)
+    device_capability = _device_capability(q.device)
     backend, block_tile = _select_sm100_backend(
         num_head,
         head_dim,
