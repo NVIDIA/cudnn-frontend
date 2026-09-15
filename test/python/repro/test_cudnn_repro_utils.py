@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from cudnn_repro.utils import flatten_pass_by_value
+import pytest
+
+from cudnn.repro.utils import flatten_pass_by_value
+
+pytestmark = pytest.mark.L0
 
 
 def test_flatten_pass_by_value_valid_hex():

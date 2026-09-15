@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.L1
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -27,7 +29,7 @@ def _run(cmd, env):
 
 
 def _last_payload(log_path):
-    import cudnn_repro.log_parser as log_parser
+    import cudnn.repro.log_parser as log_parser
 
     lines = log_path.read_text().splitlines()
     entries = list(log_parser.iter_context_entries(lines))
@@ -121,8 +123,8 @@ def _assert_reproducer_json_matches_target(tmp_path, target):
             pytest.skip("target skipped before emitting cuDNN frontend log")
         raise AssertionError(f"Target did not emit cuDNN frontend log: {target}\nstdout:\n{first_proc.stdout}\nstderr:\n{first_proc.stderr}")
 
-    import cudnn_repro.operations as operations
-    import cudnn_repro.repro_command as repro_command
+    import cudnn.repro.operations as operations
+    import cudnn.repro.repro_command as repro_command
 
     raw_line, payload = _last_payload(log_a)
     operation = operations.select_operation(payload)

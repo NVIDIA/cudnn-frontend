@@ -1,10 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import cudnn_repro.repro_command as repro_command
-import cudnn_repro.sdpa_bwd as sdpa_bwd
+import pytest
+
+import cudnn.repro.repro_command as repro_command
+import cudnn.repro.sdpa_bwd as sdpa_bwd
 
 from .helpers import tensor_list
+
+pytestmark = pytest.mark.L0
 
 
 def test_build_bwd_cfg_simple_case():

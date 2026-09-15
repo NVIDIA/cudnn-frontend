@@ -6,6 +6,8 @@ from looseversion import LooseVersion
 
 from .test_cudnn_repro_closed_loop import _assert_reproducer_json_matches_target
 
+pytestmark = pytest.mark.L1
+
 
 @pytest.mark.parametrize(
     "target",

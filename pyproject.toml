@@ -59,6 +59,9 @@ dependencies = [
 "Bug Tracker" = "https://github.com/NVIDIA/cudnn-frontend/issues"
 "Release Notes" = "https://github.com/NVIDIA/cudnn-frontend/releases"
 
+[project.scripts]
+cudnn-repro = "cudnn.repro:main"
+
 [project.optional-dependencies]
 cutedsl = [
     # nvidia-cutlass-dsl and apache-tvm-ffi moved to the required [project]

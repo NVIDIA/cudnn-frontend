@@ -3,12 +3,14 @@
 
 import pytest
 
-import cudnn_repro.operations as operations
-import cudnn_repro.repro_command as repro_command
-import cudnn_repro.sdpa_fp8_bwd as sdpa_fp8_bwd
-import cudnn_repro.sdpa_fp8_fwd as sdpa_fp8_fwd
+import cudnn.repro.operations as operations
+import cudnn.repro.repro_command as repro_command
+import cudnn.repro.sdpa_fp8_bwd as sdpa_fp8_bwd
+import cudnn.repro.sdpa_fp8_fwd as sdpa_fp8_fwd
 
 from .helpers import tensor_list
+
+pytestmark = pytest.mark.L0
 
 
 def _fp8_fwd_payload(*, tag="SDPA_FP8_FWD", ragged=False, paged=False, output_dtype="HALF", mxfp8=False):
