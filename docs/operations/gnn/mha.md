@@ -1,22 +1,22 @@
 # GNN GAT and GATv2 attention
 
-`cudnn.gnn.gat` and `cudnn.gnn.gat_v2` apply multi-head graph attention to a homogeneous graph in compressed sparse column (CSC) format. They call the cuDNN `cudnnGnnMhaGat*` and `cudnnGnnMhaGatV2*` APIs and provide PyTorch autograd formulas.
+`cudnn.gnn.mha_gat` and `cudnn.gnn.mha_gat_v2` apply multi-head graph attention to homogeneous or bipartite graphs in compressed sparse column (CSC) format. They call the cuDNN `cudnnGnnMhaGat*` and `cudnnGnnMhaGatV2*` APIs and provide PyTorch autograd formulas.
 
 ## Example
 
 ```python
 import torch
-from cudnn.gnn import CscGraph, gat
+from cudnn.gnn import CscGraph, mha_gat
 
 offsets = torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32)
 indices = torch.tensor([0, 1, 1, 2], device="cuda", dtype=torch.int32)
 graph = CscGraph(offsets, indices, num_src_nodes=3)
 
-node_features = torch.randn(3, 16, device="cuda", requires_grad=True)
+src_features = torch.randn(3, 16, device="cuda", requires_grad=True)
 attn_weights = torch.randn(32, device="cuda", requires_grad=True)
-output, attention = gat(
+output, attention = mha_gat(
     graph,
-    node_features,
+    src_features,
     attn_weights,
     num_heads=2,
     return_attention_weights=True,
@@ -27,9 +27,9 @@ output.sum().backward()
 ## API
 
 ```python
-gat(
+mha_gat(
     graph,
-    node_features,
+    features,
     attn_weights,
     *,
     edge_features=None,
@@ -43,13 +43,12 @@ gat(
 )
 ```
 
-`gat_v2` has the same signature.
+`mha_gat_v2` has the same signature.
 
 Both operations require:
 
-- `node_features` with shape `(num_src_nodes, dim_node)`, where `dim_node` is divisible by `num_heads`.
+- `features` as a source tensor with shape `(num_src_nodes, dim_node)` for homogeneous graphs, or a `(src_features, dst_features)` tuple with shapes `(num_src_nodes, dim_node)` and `(num_dst_nodes, dim_node)` for bipartite graphs. `dim_node` must be divisible by `num_heads`.
 - CUDA FP32, FP16, or BF16 features and weights on the graph's device.
-- A homogeneous graph: destination node IDs index rows of `node_features`, so `num_dst_nodes` cannot exceed `num_src_nodes`.
 
 GAT uses flat `attn_weights` with layout `source | destination | edge` and length `2 * dim_node + dim_edge`. Its optional `edge_features` has shape `(num_edges, dim_edge)`, where `dim_edge` is divisible by `num_heads`.
 
@@ -69,13 +68,13 @@ Gradients from both `output` and returned `attention` are included in backward. 
 
 ## Support and determinism
 
-The bindings are compiled with cuDNN 9.27 or newer headers on non-Windows platforms and resolve backend entry points when called. The backend requires SM 8.0 or newer.
+The bindings are compiled with cuDNN 9.28 or newer headers on non-Windows platforms and resolve backend entry points when called. The backend requires SM 8.0 or newer.
 
 By default, backward uses atomic accumulation for node-feature and attention-weight gradients. For deterministic backward, construct reverse-CSC metadata and request the deterministic path explicitly:
 
 ```python
 graph = graph.with_reverse_csc()
-output = gat(graph, node_features, attn_weights, deterministic=True)
+output = mha_gat(graph, src_features, attn_weights, deterministic=True)
 ```
 
 `with_reverse_csc()` returns the original graph when reverse metadata is already present. Otherwise, it uses PyTorch operations on the current CUDA stream to create `csc_rev_offsets` with shape `(num_src_nodes + 1,)` and `map_rev_to_coo` with shape `(num_edges,)`. Applications that already own reverse-CSC tensors can pass them directly to `CscGraph`; the two tensors must be supplied together and must match the graph index dtype and device.

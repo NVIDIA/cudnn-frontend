@@ -29,7 +29,8 @@ def _validate_inputs(
     offsets: Tensor,
     indices: Tensor,
     map_csc_to_coo: Optional[Tensor],
-    node_features: Tensor,
+    src_features: Tensor,
+    dst_features: Tensor,
     edge_features: Optional[Tensor],
     attn_weights: Tensor,
     dropout_mask: Optional[Tensor],
@@ -42,8 +43,6 @@ def _validate_inputs(
     map_rev_to_coo: Optional[Tensor],
 ) -> Tuple[int, int, int, int]:
     num_dst_nodes, num_edges = validate_csc_graph(offsets, indices, map_csc_to_coo, num_src_nodes, csc_rev_offsets, map_rev_to_coo)
-    if num_dst_nodes > num_src_nodes:
-        raise ValueError(f"GAT requires num_dst_nodes <= num_src_nodes, got {num_dst_nodes} and {num_src_nodes}")
     if num_dst_nodes > 0 and num_edges == 0:
         raise ValueError("cuDNN GAT does not support a nonempty destination set with zero edges")
 
@@ -59,10 +58,10 @@ def _validate_inputs(
     if not isinstance(activation_alpha, Real):
         raise TypeError(f"activation_alpha must be a real number, got {type(activation_alpha).__name__}")
 
-    feature_tensors = [node_features, attn_weights]
+    feature_tensors = [src_features, dst_features, attn_weights]
     if edge_features is not None:
         feature_tensors.append(edge_features)
-    dtype = node_features.dtype
+    dtype = src_features.dtype
     if dtype not in TORCH_DTYPE_TO_CUDNN:
         raise TypeError(f"features and weights must have dtype float32, float16, or bfloat16, got {dtype}")
     for tensor in feature_tensors:
@@ -73,9 +72,11 @@ def _validate_inputs(
         if tensor.dtype != dtype:
             raise TypeError(f"all features and weights must have dtype {dtype}, got {tensor.dtype}")
 
-    if node_features.ndim != 2 or node_features.shape[0] != num_src_nodes:
-        raise ValueError(f"node_features must have shape ({num_src_nodes}, dim_node), got {tuple(node_features.shape)}")
-    dim_node = node_features.shape[1]
+    if src_features.ndim != 2 or src_features.shape[0] != num_src_nodes:
+        raise ValueError(f"src_features must have shape ({num_src_nodes}, dim_node), got {tuple(src_features.shape)}")
+    dim_node = src_features.shape[1]
+    if dst_features.ndim != 2 or tuple(dst_features.shape) != (num_dst_nodes, dim_node):
+        raise ValueError(f"dst_features must have shape ({num_dst_nodes}, {dim_node}), got {tuple(dst_features.shape)}")
     if dim_node == 0 or dim_node % num_heads != 0:
         raise ValueError(f"node feature dimension {dim_node} must be positive and divisible by num_heads ({num_heads})")
 
@@ -118,7 +119,8 @@ def _forward(
     offsets: Tensor,
     indices: Tensor,
     map_csc_to_coo: Optional[Tensor],
-    node_features: Tensor,
+    src_features: Tensor,
+    dst_features: Tensor,
     edge_features: Optional[Tensor],
     attn_weights: Tensor,
     dropout_mask: Optional[Tensor],
@@ -137,7 +139,8 @@ def _forward(
         offsets,
         indices,
         map_csc_to_coo,
-        node_features,
+        src_features,
+        dst_features,
         edge_features,
         attn_weights,
         dropout_mask,
@@ -158,19 +161,20 @@ def _forward(
     offsets = offsets.contiguous()
     indices = indices.contiguous()
     map_csc_to_coo = None if map_csc_to_coo is None else map_csc_to_coo.contiguous()
-    node_features = node_features.contiguous()
+    src_features = src_features.contiguous()
+    dst_features = dst_features.contiguous()
     edge_features = None if edge_features is None else edge_features.contiguous()
     attn_weights = attn_weights.contiguous()
     dropout_mask = None if dropout_mask is None else dropout_mask.contiguous()
 
     dim_head = dim_node // num_heads
     output_dim = dim_node if concat_heads else dim_head
-    output = torch.empty((num_dst_nodes, output_dim), device=offsets.device, dtype=node_features.dtype)
+    output = torch.empty((num_dst_nodes, output_dim), device=offsets.device, dtype=src_features.dtype)
     sm_scores = torch.empty((2, num_heads, num_edges), device=offsets.device, dtype=torch.float32)
     act_scores = (
-        torch.empty((num_edges, dim_node), device=offsets.device, dtype=node_features.dtype)
+        torch.empty((num_edges, dim_node), device=offsets.device, dtype=src_features.dtype)
         if variant == "gat_v2"
-        else torch.empty((0,), device=offsets.device, dtype=node_features.dtype)
+        else torch.empty((0,), device=offsets.device, dtype=src_features.dtype)
     )
     attention = torch.empty((0,), device=offsets.device, dtype=torch.float32)
 
@@ -191,7 +195,8 @@ def _forward(
         num_dst_nodes,
         num_edges,
         TORCH_INDEX_DTYPE_TO_CUDNN[offsets.dtype],
-        node_features.data_ptr(),
+        src_features.data_ptr(),
+        dst_features.data_ptr(),
         tensor_pointer(edge_features),
         attn_weights.data_ptr(),
         tensor_pointer(dropout_mask),
@@ -208,7 +213,7 @@ def _forward(
                 float(activation_alpha),
                 num_heads,
                 concat_heads,
-                TORCH_DTYPE_TO_CUDNN[node_features.dtype],
+                TORCH_DTYPE_TO_CUDNN[src_features.dtype],
             )
         else:
             cudnn.gnn_mha_gat_v2_forward(
@@ -219,7 +224,7 @@ def _forward(
                 float(activation_alpha),
                 num_heads,
                 concat_heads,
-                TORCH_DTYPE_TO_CUDNN[node_features.dtype],
+                TORCH_DTYPE_TO_CUDNN[src_features.dtype],
             )
         if return_attention_weights:
             attention = sm_scores[1].clone()
@@ -235,7 +240,8 @@ def _backward(
     offsets: Tensor,
     indices: Tensor,
     map_csc_to_coo: Optional[Tensor],
-    node_features: Tensor,
+    src_features: Tensor,
+    dst_features: Tensor,
     edge_features: Optional[Tensor],
     attn_weights: Tensor,
     sm_scores: Tensor,
@@ -249,13 +255,14 @@ def _backward(
     csc_rev_offsets: Optional[Tensor],
     map_rev_to_coo: Optional[Tensor],
     deterministic: bool,
-) -> Tuple[Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     num_dst_nodes, num_edges, dim_node, dim_edge = _validate_inputs(
         variant,
         offsets,
         indices,
         map_csc_to_coo,
-        node_features,
+        src_features,
+        dst_features,
         edge_features,
         attn_weights,
         dropout_mask,
@@ -271,9 +278,9 @@ def _backward(
         raise ValueError("deterministic backward requires graph.csc_rev_offsets and graph.map_rev_to_coo")
     output_dim = dim_node if concat_heads else dim_node // num_heads
     if grad_output is None:
-        grad_output = torch.zeros((num_dst_nodes, output_dim), device=offsets.device, dtype=node_features.dtype)
-    elif tuple(grad_output.shape) != (num_dst_nodes, output_dim) or grad_output.dtype != node_features.dtype:
-        raise ValueError(f"grad_output must have shape {(num_dst_nodes, output_dim)} and dtype {node_features.dtype}")
+        grad_output = torch.zeros((num_dst_nodes, output_dim), device=offsets.device, dtype=src_features.dtype)
+    elif tuple(grad_output.shape) != (num_dst_nodes, output_dim) or grad_output.dtype != src_features.dtype:
+        raise ValueError(f"grad_output must have shape {(num_dst_nodes, output_dim)} and dtype {src_features.dtype}")
     elif not grad_output.is_cuda or grad_output.device != offsets.device:
         raise ValueError(f"grad_output must be a CUDA tensor on {offsets.device}, got {grad_output.device}")
     if grad_attention is not None:
@@ -283,18 +290,20 @@ def _backward(
             raise ValueError(f"grad_attention must be a CUDA tensor on {offsets.device}, got {grad_attention.device}")
         grad_attention = grad_attention.contiguous()
 
-    grad_node = torch.empty_like(node_features)
-    grad_edge = torch.empty_like(edge_features) if edge_features is not None else torch.empty((0,), device=offsets.device, dtype=node_features.dtype)
+    grad_src = torch.empty_like(src_features)
+    grad_dst = torch.empty_like(dst_features)
+    grad_edge = torch.empty_like(edge_features) if edge_features is not None else torch.empty((0,), device=offsets.device, dtype=src_features.dtype)
     grad_weights = torch.empty_like(attn_weights)
     grad_sm_scores = torch.empty_like(sm_scores)
     workspace_weight_dim = 2 * dim_node + dim_edge if variant == "gat" else dim_node
-    workspace_features = torch.empty((num_edges, dim_node), device=offsets.device, dtype=node_features.dtype) if deterministic else None
+    workspace_features = torch.empty((num_edges, dim_node), device=offsets.device, dtype=src_features.dtype) if deterministic else None
     workspace_weights = torch.empty((num_dst_nodes, workspace_weight_dim), device=offsets.device, dtype=attn_weights.dtype) if deterministic else None
     if num_dst_nodes == 0:
-        grad_node.zero_()
+        grad_src.zero_()
+        grad_dst.zero_()
         grad_edge.zero_()
         grad_weights.zero_()
-        return grad_node, grad_edge, grad_weights
+        return grad_src, grad_dst, grad_edge, grad_weights
 
     _require_backend(variant)
     import cudnn
@@ -305,7 +314,8 @@ def _backward(
     csc_rev_offsets = None if csc_rev_offsets is None else csc_rev_offsets.contiguous()
     map_rev_to_coo = None if map_rev_to_coo is None else map_rev_to_coo.contiguous()
     grad_output = grad_output.contiguous()
-    node_features = node_features.contiguous()
+    src_features = src_features.contiguous()
+    dst_features = dst_features.contiguous()
     edge_features = None if edge_features is None else edge_features.contiguous()
     attn_weights = attn_weights.contiguous()
     sm_scores = sm_scores.contiguous()
@@ -321,7 +331,8 @@ def _backward(
         num_edges,
         TORCH_INDEX_DTYPE_TO_CUDNN[offsets.dtype],
         grad_output.data_ptr(),
-        node_features.data_ptr(),
+        src_features.data_ptr(),
+        dst_features.data_ptr(),
         tensor_pointer(edge_features),
         attn_weights.data_ptr(),
         sm_scores.data_ptr(),
@@ -332,7 +343,8 @@ def _backward(
                 *common_args,
                 tensor_pointer(dropout_mask),
                 tensor_pointer(grad_attention),
-                grad_node.data_ptr(),
+                grad_src.data_ptr(),
+                grad_dst.data_ptr(),
                 tensor_pointer(grad_edge if edge_features is not None else None),
                 grad_weights.data_ptr(),
                 grad_sm_scores.data_ptr(),
@@ -342,7 +354,7 @@ def _backward(
                 float(activation_alpha),
                 num_heads,
                 concat_heads,
-                TORCH_DTYPE_TO_CUDNN[node_features.dtype],
+                TORCH_DTYPE_TO_CUDNN[src_features.dtype],
                 tensor_pointer(csc_rev_offsets),
                 tensor_pointer(map_rev_to_coo),
                 tensor_pointer(workspace_features),
@@ -354,7 +366,8 @@ def _backward(
                 act_scores.data_ptr(),
                 tensor_pointer(dropout_mask),
                 tensor_pointer(grad_attention),
-                grad_node.data_ptr(),
+                grad_src.data_ptr(),
+                grad_dst.data_ptr(),
                 tensor_pointer(grad_edge if edge_features is not None else None),
                 grad_weights.data_ptr(),
                 grad_sm_scores.data_ptr(),
@@ -363,19 +376,19 @@ def _backward(
                 float(activation_alpha),
                 num_heads,
                 concat_heads,
-                TORCH_DTYPE_TO_CUDNN[node_features.dtype],
+                TORCH_DTYPE_TO_CUDNN[src_features.dtype],
                 tensor_pointer(csc_rev_offsets),
                 tensor_pointer(map_rev_to_coo),
                 tensor_pointer(workspace_features),
                 tensor_pointer(workspace_weights),
             )
-    return grad_node, grad_edge, grad_weights
+    return grad_src, grad_dst, grad_edge, grad_weights
 
 
 _lib = torch.library.Library("cudnn", "FRAGMENT")
 for _variant in ("gat", "gat_v2"):
     _lib.define(
-        f"gnn_mha_{_variant}_fwd(Tensor offsets, Tensor indices, Tensor? map_csc_to_coo, Tensor node_features, "
+        f"gnn_mha_{_variant}_fwd(Tensor offsets, Tensor indices, Tensor? map_csc_to_coo, Tensor src_features, Tensor dst_features, "
         "Tensor? edge_features, Tensor attn_weights, Tensor? dropout_mask, int num_src_nodes, int num_heads, "
         "bool concat_heads, str activation, float activation_alpha, bool return_attention_weights, "
         "Tensor? csc_rev_offsets, Tensor? map_rev_to_coo, bool deterministic) "
@@ -383,10 +396,10 @@ for _variant in ("gat", "gat_v2"):
     )
     _lib.define(
         f"gnn_mha_{_variant}_bwd(Tensor? grad_output, Tensor? grad_attention, Tensor offsets, Tensor indices, "
-        "Tensor? map_csc_to_coo, Tensor node_features, Tensor? edge_features, Tensor attn_weights, Tensor sm_scores, "
+        "Tensor? map_csc_to_coo, Tensor src_features, Tensor dst_features, Tensor? edge_features, Tensor attn_weights, Tensor sm_scores, "
         "Tensor act_scores, Tensor? dropout_mask, int num_src_nodes, int num_heads, bool concat_heads, "
         "str activation, float activation_alpha, Tensor? csc_rev_offsets, Tensor? map_rev_to_coo, "
-        "bool deterministic) -> (Tensor, Tensor, Tensor)"
+        "bool deterministic) -> (Tensor, Tensor, Tensor, Tensor)"
     )
 
 
@@ -413,17 +426,17 @@ _lib.impl("gnn_mha_gat_v2_bwd", _gat_v2_backward, "CUDA")
 
 
 def _fake_forward(variant: str, *args) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    offsets, indices, _, node_features, _, _, _, _, num_heads, concat_heads, _, _, return_attention_weights = args[:13]
+    offsets, indices, _, src_features, _, _, _, _, _, num_heads, concat_heads, _, _, return_attention_weights = args[:14]
     num_dst_nodes = offsets.numel() - 1
     num_edges = indices.numel()
-    dim_node = node_features.shape[1]
+    dim_node = src_features.shape[1]
     output_dim = dim_node if concat_heads else dim_node // num_heads
-    output = torch.empty((num_dst_nodes, output_dim), device=offsets.device, dtype=node_features.dtype)
+    output = torch.empty((num_dst_nodes, output_dim), device=offsets.device, dtype=src_features.dtype)
     attention_shape = (num_heads, num_edges) if return_attention_weights else (0,)
     attention = torch.empty(attention_shape, device=offsets.device, dtype=torch.float32)
     sm_scores = torch.empty((2, num_heads, num_edges), device=offsets.device, dtype=torch.float32)
     act_shape = (num_edges, dim_node) if variant == "gat_v2" else (0,)
-    act_scores = torch.empty(act_shape, device=offsets.device, dtype=node_features.dtype)
+    act_scores = torch.empty(act_shape, device=offsets.device, dtype=src_features.dtype)
     return output, attention, sm_scores, act_scores
 
 
@@ -437,10 +450,10 @@ def _gat_v2_fake(*args):
     return _fake_forward("gat_v2", *args)
 
 
-def _fake_backward(grad_output, grad_attention, offsets, indices, map_csc_to_coo, node_features, edge_features, attn_weights, *args):
+def _fake_backward(grad_output, grad_attention, offsets, indices, map_csc_to_coo, src_features, dst_features, edge_features, attn_weights, *args):
     del grad_output, grad_attention, offsets, indices, map_csc_to_coo, args
-    grad_edge = torch.empty_like(edge_features) if edge_features is not None else torch.empty((0,), device=node_features.device, dtype=node_features.dtype)
-    return torch.empty_like(node_features), grad_edge, torch.empty_like(attn_weights)
+    grad_edge = torch.empty_like(edge_features) if edge_features is not None else torch.empty((0,), device=src_features.device, dtype=src_features.dtype)
+    return torch.empty_like(src_features), torch.empty_like(dst_features), grad_edge, torch.empty_like(attn_weights)
 
 
 torch.library.register_fake("cudnn::gnn_mha_gat_bwd")(_fake_backward)
@@ -452,7 +465,8 @@ def _setup_context(variant: str, ctx, inputs, output) -> None:
         offsets,
         indices,
         map_csc_to_coo,
-        node_features,
+        src_features,
+        dst_features,
         edge_features,
         attn_weights,
         dropout_mask,
@@ -471,7 +485,8 @@ def _setup_context(variant: str, ctx, inputs, output) -> None:
         offsets,
         indices,
         map_csc_to_coo,
-        node_features,
+        src_features,
+        dst_features,
         edge_features,
         attn_weights,
         sm_scores,
@@ -512,7 +527,8 @@ def _autograd_backward(ctx, grad_output, grad_attention, grad_sm_scores, grad_ac
         offsets,
         indices,
         map_csc_to_coo,
-        node_features,
+        src_features,
+        dst_features,
         edge_features,
         attn_weights,
         sm_scores,
@@ -521,13 +537,14 @@ def _autograd_backward(ctx, grad_output, grad_attention, grad_sm_scores, grad_ac
         csc_rev_offsets,
         map_rev_to_coo,
     ) = ctx.saved_tensors
-    grad_node, grad_edge, grad_weights = getattr(torch.ops.cudnn, f"gnn_mha_{ctx.variant}_bwd")(
+    grad_src, grad_dst, grad_edge, grad_weights = getattr(torch.ops.cudnn, f"gnn_mha_{ctx.variant}_bwd")(
         grad_output,
         grad_attention,
         offsets,
         indices,
         map_csc_to_coo,
-        node_features,
+        src_features,
+        dst_features,
         edge_features,
         attn_weights,
         sm_scores,
@@ -546,7 +563,8 @@ def _autograd_backward(ctx, grad_output, grad_attention, grad_sm_scores, grad_ac
         None,
         None,
         None,
-        grad_node,
+        grad_src,
+        grad_dst,
         grad_edge if ctx.has_edge_features else None,
         grad_weights,
         None,
@@ -569,7 +587,7 @@ torch.library.register_autograd("cudnn::gnn_mha_gat_v2_fwd", _autograd_backward,
 def _mha(
     variant: str,
     graph: CscGraph,
-    node_features: Tensor,
+    features: Union[Tensor, Tuple[Tensor, Tensor]],
     attn_weights: Tensor,
     *,
     edge_features: Optional[Tensor] = None,
@@ -581,11 +599,20 @@ def _mha(
     return_attention_weights: bool = False,
     deterministic: bool = False,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    if isinstance(features, Tensor):
+        src_features = features
+        dst_features = features[: graph.num_dst_nodes]
+    elif isinstance(features, tuple) and len(features) == 2 and all(isinstance(feature, Tensor) for feature in features):
+        src_features, dst_features = features
+    else:
+        raise TypeError("features must be a Tensor or a (src_features, dst_features) tuple")
+
     output, attention, _, _ = getattr(torch.ops.cudnn, f"gnn_mha_{variant}_fwd")(
         graph.offsets,
         graph.indices,
         graph.map_csc_to_coo,
-        node_features,
+        src_features,
+        dst_features,
         edge_features,
         attn_weights,
         dropout_mask,
@@ -600,65 +627,3 @@ def _mha(
         deterministic,
     )
     return (output, attention) if return_attention_weights else output
-
-
-def gat(
-    graph: CscGraph,
-    node_features: Tensor,
-    attn_weights: Tensor,
-    *,
-    edge_features: Optional[Tensor] = None,
-    dropout_mask: Optional[Tensor] = None,
-    num_heads: int = 1,
-    concat_heads: bool = True,
-    activation: str = "leaky_relu",
-    activation_alpha: float = 0.2,
-    return_attention_weights: bool = False,
-    deterministic: bool = False,
-) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-    """Apply GAT multi-head attention to a homogeneous CSC graph."""
-    return _mha(
-        "gat",
-        graph,
-        node_features,
-        attn_weights,
-        edge_features=edge_features,
-        dropout_mask=dropout_mask,
-        num_heads=num_heads,
-        concat_heads=concat_heads,
-        activation=activation,
-        activation_alpha=activation_alpha,
-        return_attention_weights=return_attention_weights,
-        deterministic=deterministic,
-    )
-
-
-def gat_v2(
-    graph: CscGraph,
-    node_features: Tensor,
-    attn_weights: Tensor,
-    *,
-    edge_features: Optional[Tensor] = None,
-    dropout_mask: Optional[Tensor] = None,
-    num_heads: int = 1,
-    concat_heads: bool = True,
-    activation: str = "leaky_relu",
-    activation_alpha: float = 0.2,
-    return_attention_weights: bool = False,
-    deterministic: bool = False,
-) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-    """Apply GATv2 multi-head attention to a homogeneous CSC graph."""
-    return _mha(
-        "gat_v2",
-        graph,
-        node_features,
-        attn_weights,
-        edge_features=edge_features,
-        dropout_mask=dropout_mask,
-        num_heads=num_heads,
-        concat_heads=concat_heads,
-        activation=activation,
-        activation_alpha=activation_alpha,
-        return_attention_weights=return_attention_weights,
-        deterministic=deterministic,
-    )
