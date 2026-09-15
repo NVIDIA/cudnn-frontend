@@ -153,6 +153,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     tmem_load_max_reduction_x64,
     vec_scale_pair,
     fp32_to_fp8_pack,
+    row_reduction_pair,
     fp32_to_fp16,
     ex2_f16x2,
     f16x2x2_to_fp8_word,
@@ -628,6 +629,7 @@ def _kernel(
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
             sub_tile_id=0,
+            has_lse=lse_tensor is not None,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             scale_log2=scale_softmax_log2,
@@ -649,6 +651,7 @@ def _kernel(
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
             sub_tile_id=1,
+            has_lse=lse_tensor is not None,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             scale_log2=scale_softmax_log2,
@@ -1220,6 +1223,25 @@ def _f16_exp_chunk(chunk_S, n: cutlass.Constexpr[int] = 64):
 
 
 @cute.jit
+def _f16_exp_chunk_sum(chunk_S, n: cutlass.Constexpr[int] = 64):
+    """:func:`_f16_exp_chunk` plus the EXACT fp32 row-sum PAIR of P (has_lse only).
+
+    O keeps the f16x2 P this arm exists for; the Stats denominator is a separate fp32
+    ``exp2`` of the SAME biased arguments, so the published LSE is the exact
+    log-sum-exp on this arm too (summing the f16 P instead measured rms 3.6e-4 off it:
+    the f16 exp-argument rounding and MUFU EX2.F16x2's 2^-9.9 do not average out).
+    The extra MUFU per element makes HALF + Stats no faster than the f32 chain --
+    it is honored, not degraded; a stats-less HALF graph pays nothing.
+    """
+    elems = [chunk_S[i] for i in range(n)]
+    pairs = [fp32_to_fp16(elems[2 * i], elems[2 * i + 1]) for i in range(n // 2)]
+    p_pairs = [ex2_f16x2(w) for w in pairs]
+    words = [f16x2x2_to_fp8_word(p_pairs[2 * g], p_pairs[2 * g + 1], _FP8_TAG_P) for g in range(n // 4)]
+    p_sum = row_reduction_pair(cute.math.exp2(chunk_S, fastmath=True))
+    return cutlass.Vector.from_elements(tuple(words), cutlass.Int32), p_sum
+
+
+@cute.jit
 def _mma_warp_quiet(tmem_ptr_i32, bars):
     """Non-leader CTA's MMA-warp body under cga2: alloc + named-bar arrive +
     tmem_dealloc wait + dealloc.  Peer's TMEM stays allocated because leader
@@ -1585,6 +1607,17 @@ def _mma_warp_group(
                 kv_right = bounds_next.right
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
 
+    # P6/P15 drain: mb_stats_read is a cross-CTA arrive on the leader, and the
+    # LAST tile's arrives are still in flight when this warp leaves the
+    # persistent loop -- nothing downstream waits them, so they would land on a
+    # CTA that may already have torn its SMEM down.  stats_read_phase is flipped
+    # at the END of every tile body, so after the loop it holds the phase the
+    # NEXT tile's prologue would have waited, i.e. exactly the phase the LAST
+    # tile's correction arrives complete.  Leader only: the quiet (non-leader)
+    # MMA arm never waits this ring.
+    for _qs in cutlass.range_constexpr(CFG.TILES_Q):
+        bars.mb_stats_read[_qs].wait(stats_read_phase)
+
     bars.mb_tmem_dealloc.wait(cutlass.Int32(0))
     tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
 
@@ -1593,6 +1626,7 @@ def _mma_warp_group(
 def _softmax_kv_body(
     apply_mask: cutlass.Constexpr[bool],
     sub_tile_id: cutlass.Constexpr[int],
+    has_lse: cutlass.Constexpr[bool],
     kv_loop,
     tmem_ptr_i32,
     bars,
@@ -1605,6 +1639,10 @@ def _softmax_kv_body(
     leader_cta_id,
 ):
     """Per-kv-iter softmax body; returns updated (total_max, total_sum).
+
+    ``has_lse`` (stats requested) re-enables the fp32 register row-sum of the
+    unquantized P into ``total_sum`` -- the exact denominator of the PUBLISHED
+    LSE; O is normalized by Sigma in both specializations.
 
     Compile-time apply_mask picks the load+max strategy:
     - False: tcgen05.ld.red.f32.max fast path (fused HW row-max).
@@ -1723,7 +1761,10 @@ def _softmax_kv_body(
     # No RF row-sum on either path: the denominator accumulates in the Sigma
     # TMEM columns via the ones-MMA (P is read straight from TMEM by the pipe).
     if cutlass.const_expr(SOFTMAX_F16):
-        p_words_0 = _f16_exp_chunk(chunk_S_0)
+        if cutlass.const_expr(has_lse):
+            p_words_0, p_sum_0 = _f16_exp_chunk_sum(chunk_S_0)
+        else:
+            p_words_0 = _f16_exp_chunk(chunk_S_0)
         nvvm.tcgen05_st(
             "32x32b",
             nvvm.make_tmem_ptr(p_addr_base, cutlass.Int32),
@@ -1743,7 +1784,10 @@ def _softmax_kv_body(
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
         if cutlass.const_expr(SOFTMAX_F16):
-            p_words_1 = _f16_exp_chunk(chunk_S_1)
+            if cutlass.const_expr(has_lse):
+                p_words_1, p_sum_1 = _f16_exp_chunk_sum(chunk_S_1)
+            else:
+                p_words_1 = _f16_exp_chunk(chunk_S_1)
             nvvm.tcgen05_st(
                 "32x32b",
                 nvvm.make_tmem_ptr(
@@ -1753,7 +1797,8 @@ def _softmax_kv_body(
                 p_words_1,
             )
         else:
-            chunk_P_1_fp8 = cute.math.exp2(chunk_S_1, fastmath=True).to(STORAGE_DTYPE)
+            chunk_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+            chunk_P_1_fp8 = chunk_P_1.to(STORAGE_DTYPE)
             nvvm.tcgen05_st(
                 "32x32b",
                 nvvm.make_tmem_ptr(
@@ -1768,14 +1813,35 @@ def _softmax_kv_body(
     if sub_tile_id == 0:
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
-    # total_sum stays zeros — the final stats store's sum word is dead
-    # (correction reads the Sigma column instead).
+    if cutlass.const_expr(has_lse):
+        # Stats requested: the PUBLISHED LSE needs the EXACT fp32 denominator, so the
+        # register-file row-sum of the UNQUANTIZED P comes back for this specialization
+        # only.  Sigma (the ones-MMA over the quantized P) still normalizes O -- summing
+        # the QUANTIZED P is right for O's numerator but off by up to ~1e-2 in the LSE
+        # (3 mantissa bits; rms 3e-3, no P scale fixes it), and cuDNN's fp8 backward
+        # recomputes P = exp(S - LSE) from the published stats: test_mhas_v2
+        # fp8_bwd_ragged test31 (Rubin CI) lost one dK row to an fp8 dS rounding flip.
+        # Placed AFTER both P publishes so the reduction never delays them; the
+        # stats-less (inference) specialization traces none of this.
+        if cutlass.const_expr(SOFTMAX_F16):
+            new_p_sum_pair = p_sum_0
+            if cutlass.const_expr(N_CHUNKS == 2):
+                new_p_sum_pair = new_p_sum_pair + p_sum_1
+        else:
+            new_p_sum_pair = row_reduction_pair(chunk_P_0)
+            if cutlass.const_expr(N_CHUNKS == 2):
+                new_p_sum_pair = new_p_sum_pair + row_reduction_pair(chunk_P_1)
+        alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
+        total_sum = total_sum * alpha_pair + new_p_sum_pair
+    # Without stats total_sum stays zeros -- the final stats store's sum word is
+    # dead (the correction reads the Sigma column for O in both specializations).
     return total_max, total_sum
 
 
 @cute.jit
 def _softmax_warp_group(
     sub_tile_id: cutlass.Constexpr[int],
+    has_lse: cutlass.Constexpr[bool],
     seqlen_q,
     seqlen_kv,
     scale_log2: cutlass.Float32,
@@ -1875,6 +1941,7 @@ def _softmax_warp_group(
                 total_max, total_sum = _softmax_kv_body(
                     False,
                     sub_tile_id,
+                    has_lse,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
@@ -1895,6 +1962,7 @@ def _softmax_warp_group(
                 total_max, total_sum = _softmax_kv_body(
                     True,
                     sub_tile_id,
+                    has_lse,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
@@ -1914,6 +1982,7 @@ def _softmax_warp_group(
                 total_max, total_sum = _softmax_kv_body(
                     False,
                     sub_tile_id,
+                    has_lse,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
@@ -1933,6 +2002,7 @@ def _softmax_warp_group(
                 total_max, total_sum = _softmax_kv_body(
                     True,
                     sub_tile_id,
+                    has_lse,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
@@ -2161,6 +2231,20 @@ def _correction_warp_group(
                     _sum_vec[0].ir_value(),
                 )
             )
+            # The LSE's denominator is the EXACT fp32 row-sum the softmax warps publish in
+            # stats word 1 when stats are requested (see _softmax_kv_body has_lse); Sigma
+            # above sums the fp8-QUANTIZED P, which normalizes O but is not the LSE cuDNN's
+            # backward recomputes P from.  Word 1 is dead (zeros) without stats.  Same
+            # empty-tile select as Sigma so the -inf convention below holds on both.
+            total_sum_lse = total_sum
+            if cutlass.const_expr(lse_tensor is not None):
+                total_sum_lse = cutlass.Float32(
+                    arith.select(
+                        (total_max_scaled == _NEG_INF_EPI).ir_value(),
+                        cutlass.Float32(0.0).ir_value(),
+                        stats_vec[1].ir_value(),
+                    )
+                )
 
             bars.mb_stat_empty[qs].arrive()
             # Release MMA's NEXT-tile prologue BMM1 into this S_acc slot: the
@@ -2194,11 +2278,12 @@ def _correction_warp_group(
                 # total_sum is in 2^P_CAST_LOG2_SCALE units — lift the sink term
                 # into the same units, then take the constant back out of the LSE.
                 new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True) * cutlass.Float32(2.0**P_CAST_LOG2_SCALE)
-                lse_val = new_max + cute.math.log(new_sum, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
+                new_sum_lse = total_sum_lse * scale + cute.math.exp(sink_logit - new_max, fastmath=True) * cutlass.Float32(2.0**P_CAST_LOG2_SCALE)
+                lse_val = new_max + cute.math.log(new_sum_lse, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
                 inv_sum = (scale * o_scale_fused) / new_sum
             else:
                 # total_sum carries 2^P_CAST_LOG2_SCALE — subtract the constant.
-                lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
+                lse_val = total_max_nat + cute.math.log(total_sum_lse, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
                 # Safe inverse: avoid div by 0 on fully-masked rows.
                 inv_sum = o_scale_fused / cute.math.max(total_sum, cutlass.Float32(1e-30))
                 # Dead row without a sink: LSE := -inf on top of O := 0.
