@@ -14,6 +14,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import from_dlpack
+from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import _install_constexpr_tvm_ffi_converter
+
+_install_constexpr_tvm_ffi_converter()
 
 from cudnn.block_sparse_attention.csrc.fwd.sm100_blk128.bsa_fwd_sm100 import (
     BlockSparseAttnForwardSm100Blk128,

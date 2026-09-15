@@ -9,7 +9,6 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
-import torch
 
 
 @lru_cache(maxsize=None)
@@ -248,7 +247,7 @@ def _bucketed_k2q_csr_compile_key(
     )
 
 
-def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
+def _to_cute_tensor(tensor: "torch.Tensor") -> cute.Tensor:
     return from_dlpack(
         tensor.detach(),
         assumed_align=4,
@@ -257,14 +256,16 @@ def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
 
 
 def build_bucketed_k2q_csr_cutedsl(
-    q2k_block_index: torch.Tensor,
+    q2k_block_index: "torch.Tensor",
     block_sparse_num: int,
     num_kv_blocks: int,
     *,
     bucket_size_blocks: int,
-    q2k_block_nums: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    q2k_block_nums: Optional["torch.Tensor"] = None,
+) -> Tuple["torch.Tensor", "torch.Tensor", int, int]:
     """Build bucketed K-to-Q CSR metadata with CuTe DSL kernels."""
+    import torch
+
     assert q2k_block_index.dtype == torch.int32
     assert q2k_block_index.is_cuda
     assert q2k_block_index.ndim == 4
