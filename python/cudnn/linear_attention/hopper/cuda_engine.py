@@ -100,6 +100,24 @@ class KdaHopperCudaPlan(CompiledPlan):
         self._device = None
         self._convert = {}
 
+        # In-kernel input fusions, fixed per node: the kernel applies them to the
+        # staged tile, so nothing here re-materialises q, k or g.
+        from . import cuda_host
+
+        params = node.params
+        self.flags = 0
+        if params.get("use_qk_l2norm", False):
+            self.flags |= cuda_host.FLAG_L2NORM
+        if params.get("safe_gate", False):
+            self.flags |= cuda_host.FLAG_SAFE_GATE
+        if params.get("use_beta_sigmoid", False):
+            self.flags |= cuda_host.FLAG_BETA_SIGMOID
+        lb = params.get("gate_lower_bound", None)
+        self.gate_lower_bound = -5.0 if lb is None else float(lb)
+        # The kernel takes the query scale as an argument, so any scale is served.
+        scale = params.get("scale", None)
+        self.q_scale = cuda_host.DEFAULT_Q_SCALE if scale is None else float(scale)
+
     def get_workspace_size(self) -> int:
         # The kernel declares a workspace and never touches it, so nothing is
         # carved out of the caller's.
@@ -134,8 +152,9 @@ class KdaHopperCudaPlan(CompiledPlan):
         # passes int64 cu_seqlens and a bf16 state pool. Both are small next to
         # q/k/v, so they are converted rather than declined -- see marshal.py.
         addr["cu_seqlens"] = marshal.as_input(view_of["cu_seqlens"], torch.int32, self._convert, "cu", stream)
-        for port in ("g", "beta"):
-            addr[port] = marshal.as_input(view_of[port], torch.float32, self._convert, port, stream)
+        for port in ("g", "beta", "a_log", "dt_bias"):
+            if port in addr:
+                addr[port] = marshal.as_input(view_of[port], torch.float32, self._convert, port, stream)
         if "initial_state" in addr:
             addr["initial_state"] = marshal.as_input(view_of["initial_state"], torch.float32, self._convert, "is", stream)
 
@@ -190,6 +209,11 @@ class KdaHopperCudaPlan(CompiledPlan):
             total_tokens=self.total,
             n_seqs=self.n_seqs,
             n_heads=self.h,
+            a_log=addr.get("a_log", 0),
+            dt_bias=addr.get("dt_bias", 0),
+            gate_lower_bound=self.gate_lower_bound,
+            flags=self.flags,
+            q_scale=self.q_scale,
         )
         # A bf16 final_state was written through an fp32 staging buffer.
         marshal.write_back(staged_fs, caller_fs, stream)
@@ -383,26 +407,44 @@ class KdaHopperCudaEngine(BaseEngine):
         # strides (the IR packs them), so this only fires for a graph built on
         # the public API -- which is how FlashInfer drives cuDNN.
         (node,) = graph.nodes
-        reason = declared_layout_reason(node, "KdaHopperCudaEngine")
+        # Outputs only: a padded input is repacked at execute (see layout.py),
+        # so declining one would cost capability without buying safety.
+        reason = declared_layout_reason(node, "KdaHopperCudaEngine", inputs_too=False)
         if reason is not None:
             raise NotImplementedError(reason)
         if getattr(facts, "has_state_indices", False):
             raise NotImplementedError("KdaHopperCudaEngine: state_indices (pool-addressed state) is unsupported")
         if getattr(facts, "overwrite_initial_state", False):
             raise NotImplementedError("KdaHopperCudaEngine: overwrite_initial_state is unsupported")
-        if facts.safe_gate or facts.has_a_log or facts.has_dt_bias:
+        if facts.is_bwd and (facts.safe_gate or facts.has_a_log or facts.has_dt_bias):
             raise NotImplementedError("KdaHopperCudaEngine: the kernel takes log-space g directly; " "safe_gate/a_log/dt_bias are unsupported")
-        if facts.use_beta_sigmoid:
-            raise NotImplementedError("KdaHopperCudaEngine: beta must be post-sigmoid; use_beta_sigmoid_in_kernel is unsupported")
-        if facts.use_qk_l2norm:
-            raise NotImplementedError("KdaHopperCudaEngine: q/k must be pre-normalized; use_qk_l2norm_in_kernel is unsupported")
+        # The forward kernel applies the q/k L2 norm, the safe gate and the beta
+        # sigmoid to the staged tile in shared memory -- that is FlashInfer's
+        # default KDA contract. The backward kernel has no such path.
+        if facts.is_bwd and (facts.use_beta_sigmoid or facts.use_qk_l2norm):
+            raise NotImplementedError("KdaHopperCudaEngine: the backward kernel takes pre-normalized q/k and post-sigmoid beta")
+        # beta in (0, 2) instead of (0, 1). The kernel's seed-truncation bound
+        # assumes the delta-rule factors are non-expansive, which holds only for
+        # beta in (0, 1), so a negative eigenvalue silently invalidates it. This
+        # used to be unreachable because it requires use_beta_sigmoid, which the
+        # engine declined; accepting the sigmoid exposed it.
+        if facts.allow_neg_eigval:
+            raise NotImplementedError("KdaHopperCudaEngine: allow_neg_eigval needs beta in (0, 1); the seed-truncation bound assumes it")
+        if facts.beta_guard:
+            raise NotImplementedError("KdaHopperCudaEngine: beta_guard is not applied by the Hopper kernel")
+        if facts.safe_gate and not (facts.has_a_log and facts.has_dt_bias):
+            raise NotImplementedError("KdaHopperCudaEngine: safe_gate needs both a_log and dt_bias")
+        if (facts.has_a_log or facts.has_dt_bias) and not facts.safe_gate:
+            raise NotImplementedError("KdaHopperCudaEngine: a_log/dt_bias are only read under safe_gate")
         if getattr(facts, "gate_domain", "log") != "log":
             raise NotImplementedError("KdaHopperCudaEngine: gate_domain='linear' is unsupported")
 
-        # The kernel bakes in q * 1/sqrt(D) and takes no scale argument, so any
-        # other scale would be silently ignored and produce a wrong answer.
-        if facts.scale is not None and abs(facts.scale - HEAD_DIM**-0.5) > 1e-9:
-            raise NotImplementedError(f"KdaHopperCudaEngine: only the default scale 1/sqrt({HEAD_DIM}) is supported, got {facts.scale}")
+        # The FORWARD kernel takes the query scale as an argument, so it serves
+        # any scale. The backward still bakes in 1/sqrt(D), and a mismatched
+        # scale there is a silently wrong dq -- caught by test_bwd_scale when the
+        # forward relaxation was applied to both directions.
+        if facts.is_bwd and facts.scale is not None and abs(facts.scale - HEAD_DIM**-0.5) > 1e-9:
+            raise NotImplementedError(f"KdaHopperCudaEngine: the backward kernel bakes in the default scale 1/sqrt({HEAD_DIM}), got {facts.scale}")
         # int64 cu_seqlens is converted at execute (N + 1 elements); see marshal.py.
         if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
             raise NotImplementedError(f"KdaHopperCudaEngine: cu_seqlens must be int32 or int64, got {facts.cu_dtype}")

@@ -38,9 +38,12 @@ namespace {
 using bf16     = __nv_bfloat16;
 namespace wmma = nvcuda::wmma;
 
-constexpr int kDim      = 128;
-constexpr int kChunk    = 16;
-constexpr float kLog2E  = 1.4426950408889634f;
+constexpr int kDim     = 128;
+constexpr int kChunk   = 16;
+constexpr float kLog2E = 1.4426950408889634f;
+// Default query scale, 1/sqrt(128). Now passed in as q_scale so a caller
+// with its own scale (FlashInfer forwards one) does not have to be declined;
+// kept as the documented default and as the value the launcher falls back to.
 constexpr float kQScale = 0.08838834764831845f;
 // Seed-truncation budget.  Per chunk the incoming state is attenuated by at
 // least max_d exp(sum_t g[t][d]) on every key channel, and the delta-rule
@@ -359,6 +362,22 @@ cp_wait() {
 // whole [128 v, 128 k] state in fp32 wgmma accumulators and ALSO builds each
 // chunk's UT/WY factors itself one chunk ahead, so nothing round-trips through
 // global memory: the only traffic is q/k/v/g in and o out.
+// In-kernel input fusions, matching what FlashInfer calls
+// use_qk_l2norm_in_kernel / use_gate_in_kernel / beta_is_logit. Applied to the
+// STAGED tile in shared memory rather than on the way in, because the loads are
+// cp.async bulk copies that cannot transform; the data is already resident, so
+// the cost is arithmetic only and no extra global traffic.
+#define KDA_FLAG_L2NORM 1
+#define KDA_FLAG_SAFE_GATE 2
+#define KDA_FLAG_BETA_SIGMOID 4
+
+__device__ __forceinline__ float
+kda_safe_gate(float raw, float ea, float dtb, float lb) {
+    // lower_bound * sigmoid(exp(a_log) * (g + dt_bias)), the differentiable
+    // "safe" gate the shipped models use.
+    return lb * (1.0f / (1.0f + __expf(-(ea * (raw + dtb)))));
+}
+
 extern "C" __global__
 __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                                          const bf16* __restrict__ gk,
@@ -371,7 +390,12 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                                          float* __restrict__ gfs,
                                          int N,
                                          int H,
-                                         int P) {
+                                         int P,
+                                         const float* __restrict__ ga_log,
+                                         const float* __restrict__ gdt_bias,
+                                         float gate_lb,
+                                         int flags,
+                                         float q_scale) {
     extern __shared__ __align__(128) char raws[];
     FusedSmem& sm = *reinterpret_cast<FusedSmem*>(raws);
 
@@ -381,6 +405,13 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int lg = lane >> 2, tg = lane & 3;
     const int HD = H * kDim;
+
+    // Fusion flags are uniform across the block, so these branches are free.
+    const bool f_l2   = (flags & KDA_FLAG_L2NORM) != 0;
+    const bool f_gate = (flags & KDA_FLAG_SAFE_GATE) != 0;
+    const bool f_beta = (flags & KDA_FLAG_BETA_SIGMOID) != 0;
+    const float g_ea  = f_gate ? __expf(ga_log[head]) : 0.0f;
+    const float* g_db = f_gate ? gdt_bias + head * kDim : nullptr;
 
     const int s0 = cu[seq], s1 = cu[seq + 1];
     const int chunks = (s1 - s0 + kChunk - 1) / kChunk;
@@ -441,8 +472,15 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             __syncthreads();
             const float* gp = sm.raw[(c0 - 1) % kNR].g + tid;
             float su        = 0.0f;
+            // Read-only, so the transform is applied here rather than in place:
+            // prep() transforms this same tile later, and doing it twice would
+            // gate an already-gated value.
+            const float db_t = f_gate ? g_db[tid] : 0.0f;
 #pragma unroll
-            for (int i = 0; i < kChunk; ++i) su += gp[i * kDim];
+            for (int i = 0; i < kChunk; ++i) {
+                const float gv = gp[i * kDim];
+                su += f_gate ? kda_safe_gate(gv, g_ea, db_t, gate_lb) : gv;
+            }
 #pragma unroll
             for (int o = 16; o; o >>= 1) su = fmaxf(su, __shfl_xor_sync(0xffffffffu, su, o));
             if (lane == 0) sm.red[warp] = su;
@@ -451,10 +489,14 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             w   = 1;
         }
         while (c0 - w > 0 && acc > kLogEps) {
-            const long gb = static_cast<long>(s0 + (c0 - w - 1) * kChunk) * HD + head * kDim + tid;
-            float su      = 0.0f;
+            const long gb    = static_cast<long>(s0 + (c0 - w - 1) * kChunk) * HD + head * kDim + tid;
+            float su         = 0.0f;
+            const float db_t = f_gate ? g_db[tid] : 0.0f;
 #pragma unroll
-            for (int i = 0; i < kChunk; ++i) su += gg[gb + static_cast<long>(i) * HD];
+            for (int i = 0; i < kChunk; ++i) {
+                const float gv = gg[gb + static_cast<long>(i) * HD];
+                su += f_gate ? kda_safe_gate(gv, g_ea, db_t, gate_lb) : gv;
+            }
 #pragma unroll
             for (int o = 16; o; o >>= 1) su = fmaxf(su, __shfl_xor_sync(0xffffffffu, su, o));
             float* rd = sm.red + 4 * (w & 1);
@@ -488,9 +530,62 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
 
     // ---- raw input staging -------------------------------------------------
     // ---- per-chunk factor build (producer half of the loop) ----------------
-    auto prep = [&](int rb, int sb) {
+    auto prep = [&](int rb, int sb, int chunk) {
         Raw& R      = sm.raw[rb];
         Record& rec = sm.st[sb];
+
+        // ---- in-kernel input fusions ---------------------------------------
+        // prep() is the single consumer of each staged tile -- one call per
+        // chunk, after that chunk's cp_wait -- so transforming in place here is
+        // exactly once. (The warm-up probe reads g earlier, which is why IT
+        // transforms on read instead of in place.) load_raw overwrites the
+        // buffer before it is reused, so nothing compounds.
+        if (flags) {
+            // Rows past the end of the sequence were zero-filled by the load
+            // predicate, and the rest of the kernel relies on that: a padded
+            // gate must stay 0 and a padded beta must stay 0. Both transforms
+            // map 0 to something non-zero (the gate to lb*sigmoid(ea*dt_bias),
+            // the sigmoid to 0.5), so they are masked to the real rows. Without
+            // this only PARTIAL tail chunks are wrong, which is why equal-split
+            // varlen shapes did not catch it.
+            const int valid = min(kChunk, s1 - (s0 + chunk * kChunk));
+            if (f_gate) {
+#pragma unroll 4
+                for (int idx = tid; idx < kChunk * kDim; idx += 128)
+                    if ((idx >> 7) < valid) R.g[idx] = kda_safe_gate(R.g[idx], g_ea, g_db[idx & (kDim - 1)], gate_lb);
+            }
+            if (f_beta && tid < kChunk && tid < valid) R.beta[tid] = 1.0f / (1.0f + __expf(-R.beta[tid]));
+            if (f_l2) {
+                // One token row per 8 lanes: 16 channels each, then a 3-step
+                // shuffle reduction inside the octet. Matches F.normalize --
+                // fp32 accumulation, the norm clamped at 1e-12, so an
+                // out-of-range row (zero-filled by the load predicate) stays 0.
+                const int row = tid >> 3, part = tid & 7;
+                float sq = 0.0f, sk = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const int d    = part * 16 + j;
+                    const float qv = __bfloat162float(R.q[row * kDim + d]);
+                    const float kv = __bfloat162float(R.k[row * kDim + d]);
+                    sq += qv * qv;
+                    sk += kv * kv;
+                }
+#pragma unroll
+                for (int o = 1; o < 8; o <<= 1) {
+                    sq += __shfl_xor_sync(0xffffffffu, sq, o);
+                    sk += __shfl_xor_sync(0xffffffffu, sk, o);
+                }
+                const float rq = 1.0f / fmaxf(sqrtf(sq), 1e-12f);
+                const float rk = 1.0f / fmaxf(sqrtf(sk), 1e-12f);
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const int d         = part * 16 + j;
+                    R.q[row * kDim + d] = __float2bfloat16(__bfloat162float(R.q[row * kDim + d]) * rq);
+                    R.k[row * kDim + d] = __float2bfloat16(__bfloat162float(R.k[row * kDim + d]) * rk);
+                }
+            }
+            __syncthreads();
+        }
         // Gate prefix scan over a CHANNEL PAIR x TOKEN OCTET tile: a thread owns
         // two adjacent channels for eight tokens, so every g/k/q load and every
         // W/q'/u store moves 4-8 B instead of 2-4 B, and the serial exp2 chain is
@@ -552,7 +647,7 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             // ldmatrix-addressable tile in its own right, so the Z product reads it
             // straight from there and the second [token][channel] copy disappears.
             *reinterpret_cast<uint32_t*>(&rec.qg[(dd0 >> 3) * kQgG + t * 8 + (dd0 & 7)]) =
-                pack2(__bfloat162float(qc.x) * d0 * kQScale, __bfloat162float(qc.y) * d1 * kQScale);
+                pack2(__bfloat162float(qc.x) * d0 * q_scale, __bfloat162float(qc.y) * d1 * q_scale);
             *reinterpret_cast<uint32_t*>(&sm.u[t * kLdA + dd0]) = pack2(b * kx0 / d0, b * kx1 / d1);
         }
         if (oc) {
@@ -739,7 +834,7 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
         load_raw(cs + 1, (cs + 1) % kNR);
     }
     __syncthreads();
-    prep(cs % kNR, cs % kNS);
+    prep(cs % kNR, cs % kNS, cs);
     __syncthreads();
 
     int pend = -1;  // chunk whose output sits staged in sm.ost
@@ -857,7 +952,7 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                 cp_wait<0>();
             }
             __syncthreads();
-            prep((chunk + 1) % kNR, (chunk + 1) % kNS);
+            prep((chunk + 1) % kNR, (chunk + 1) % kNS, chunk + 1);
         } else {
             // Nothing else separates this chunk's staging store from the drain that
             // read the previous one at the top of this iteration.

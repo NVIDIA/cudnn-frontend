@@ -32,6 +32,16 @@ KERNEL_NAME = "kda_fused"
 CHUNK = 16
 BLOCK = 128
 
+# Input fusions the kernel can apply to the staged tile. Mirrors the
+# KDA_FLAG_* defines in kda_fused_sm90.cu; the body has no way to check these
+# against us, so they are named in one place and passed through untouched.
+FLAG_L2NORM = 1
+FLAG_SAFE_GATE = 2
+FLAG_BETA_SIGMOID = 4
+
+# 1/sqrt(128): the kernel's documented default query scale.
+DEFAULT_Q_SCALE = 0.08838834764831845
+
 # sizeof(FusedSmem) in the kernel body. Restated here because NVRTC internalises
 # an unreferenced __device__ variable, so the value cannot be read back out of
 # the module. The body carries a static_assert against the -D below, so if the
@@ -102,8 +112,18 @@ def launch(
     total_tokens: int,
     n_seqs: int,
     n_heads: int,
+    a_log: int = 0,
+    dt_bias: int = 0,
+    gate_lower_bound: float = -5.0,
+    flags: int = 0,
+    q_scale: float = DEFAULT_Q_SCALE,
 ) -> None:
-    """One ``kda_fused`` launch. All tensor arguments are device addresses."""
+    """One ``kda_fused`` launch. All tensor arguments are device addresses.
+
+    ``flags`` selects the in-kernel input fusions (see ``FLAG_*``); ``a_log`` and
+    ``dt_bias`` are read only when ``FLAG_SAFE_GATE`` is set and may be 0
+    otherwise.
+    """
     smem = SMEM_BYTES
     func = _library(device).function(KERNEL_NAME, dynamic_smem=smem)
     p = pieces_per_sequence(total_tokens, n_seqs, n_heads)
@@ -113,6 +133,11 @@ def launch(
         params.ptr(address)
     for scalar in (n_seqs, n_heads, p):
         params.i32(scalar)
+    params.ptr(a_log)
+    params.ptr(dt_bias)
+    params.f32(gate_lower_bound)
+    params.i32(flags)
+    params.f32(q_scale)
 
     compiler.launch(
         func,

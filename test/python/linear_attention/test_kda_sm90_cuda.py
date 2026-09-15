@@ -246,3 +246,65 @@ def test_serving_dtypes_reach_the_fused_kernel(state_dtype, cu_dtype, gate_dtype
     assert any("kda_fused" in name for name in launched_kernels(call)), "converted call left the fused engine"
     torch.testing.assert_close(got_o.float(), ref_o.float(), atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(got_fs.float(), ref_fs.float(), atol=3e-2, rtol=3e-2)
+
+
+@requires_hopper
+@pytest.mark.parametrize("seq_lens", [[65, 33], [0, 65, 0, 33], [17]], ids=["ragged", "with_empty", "single_short"])
+def test_in_kernel_gate_masks_the_partial_tail(seq_lens):
+    """The in-kernel safe gate and beta sigmoid must not touch padding rows.
+
+    RED-then-green: the load predicate zero-fills rows past the end of a
+    sequence, and the rest of the kernel relies on a padded gate being 0. Both
+    fusions map 0 to something non-zero -- the gate to lb*sigmoid(ea*dt_bias),
+    the sigmoid to 0.5 -- so an unmasked transform corrupts the chunk-cumulative
+    decay of any PARTIAL tail chunk. Equal-split varlen shapes (2048 tokens over
+    4 sequences) have no partial tail and never saw it; FlashInfer's [0, 65, 0,
+    33] case did, as a 0.41 relative error on final_state.
+    """
+    total = sum(seq_lens)
+    gen = torch.Generator(device="cuda").manual_seed(61)
+    n = len(seq_lens)
+    H = 4
+    q = torch.randn(total, H, 128, generator=gen, device="cuda", dtype=torch.float32)
+    q = (q / q.norm(dim=-1, keepdim=True)).to(torch.bfloat16)
+    k = torch.randn(total, H, 128, generator=gen, device="cuda", dtype=torch.float32)
+    k = (k / k.norm(dim=-1, keepdim=True)).to(torch.bfloat16)
+    v = torch.randn(total, H, 128, generator=gen, device="cuda", dtype=torch.bfloat16) * 0.5
+    raw = torch.randn(total, H, 128, generator=gen, device="cuda", dtype=torch.float32)
+    beta_raw = torch.randn(total, H, generator=gen, device="cuda", dtype=torch.float32)
+    a_log = 0.1 * torch.randn(H, generator=gen, device="cuda", dtype=torch.float32)
+    dt_bias = 0.1 * torch.randn(H, 128, generator=gen, device="cuda", dtype=torch.float32)
+    s0 = (torch.randn(n, H, 128, 128, generator=gen, device="cuda", dtype=torch.float32) * 0.05).contiguous()
+    bounds, acc = [0], 0
+    for length in seq_lens:
+        acc += length
+        bounds.append(acc)
+    cu = torch.tensor(bounds, device="cuda", dtype=torch.int32)
+
+    # The fused call: the kernel applies the safe gate and the beta sigmoid.
+    fused_o, fused_fs = kimi_delta_attention(
+        q,
+        k,
+        v,
+        raw.contiguous(),
+        beta_raw.contiguous(),
+        cu,
+        initial_state=s0,
+        output_final_state=True,
+        safe_gate=True,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        gate_lower_bound=-5.0,
+        use_beta_sigmoid_in_kernel=True,
+        plan_name=ENGINE,
+    )[:2]
+
+    # The same maths applied outside, then the plain contract. Any disagreement
+    # is the fusion, since everything else is identical.
+    g_pre = (-5.0 * torch.sigmoid(a_log.exp()[:, None] * (raw + dt_bias))).contiguous()
+    beta_pre = torch.sigmoid(beta_raw).contiguous()
+    ref_o, ref_fs = kimi_delta_attention(q, k, v, g_pre, beta_pre, cu, initial_state=s0, output_final_state=True, plan_name=ENGINE)[:2]
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(fused_o.float(), ref_o.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(fused_fs, ref_fs, atol=2e-2, rtol=2e-2)

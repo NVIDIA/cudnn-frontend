@@ -70,13 +70,20 @@ def _packed(dim, stride) -> bool:
     return buffers.is_contiguous(list(dim), list(stride))
 
 
-def declared_layout_reason(node, engine: str) -> Optional[str]:
+def declared_layout_reason(node, engine: str, inputs_too: bool = True) -> Optional[str]:
     """Why ``engine`` cannot serve ``node``'s declared layouts, or ``None``.
 
-    Every wired port is checked, inputs and outputs alike, so ``dO`` and the
-    optional states are covered without being named.
+    ``inputs_too=False`` checks only the outputs, for an engine that repacks a
+    padded input at execute. Declining on a padded INPUT would then be a
+    capability loss rather than a safety gate -- FlashInfer declares real strides
+    and passes fused-projection slices, and on sm90 there may be no other engine
+    left to fall through to. A padded OUTPUT is always declined: it is written in
+    place and cannot be repacked.
     """
-    for label, tensor in list(node.inputs.items()) + list(node.outputs.items()):
+    ports = list(node.outputs.items())
+    if inputs_too:
+        ports = list(node.inputs.items()) + ports
+    for label, tensor in ports:
         if tensor is None:
             continue
         dim = list(getattr(tensor, "dim", None) or [])
