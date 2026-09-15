@@ -30,24 +30,25 @@ this engine:
   1765.4 us (5.58x per-call, 4.37x pipelined).
 
 The gap between those kernel figures and what a caller sees is host dispatch,
-and it is measured rather than estimated. At 2048/12/1 one call costs ~141 us of
-HOST time to issue against a ~60 us kernel, so the path is CPU-bound -- the GPU
-finishes before Python can issue the next call. Decomposed by stubbing stages
-out:
+and it is measured rather than estimated. On H100 SXM at 2048/12/1 one call
+costs 148 us of HOST time to issue against a ~60 us kernel, so the path is
+CPU-bound -- the GPU finishes before Python can issue the next call.
+Decomposed by stubbing stages out:
 
-    op + graph + variant-pack layer     78 us   (55%)
-    variant_pack.operands()             11 us
-    the address dict (9x data_ptr)       6 us
-    the driver launch                   ~10 us
+    op + graph + variant-pack layer     84.1 us   (57%)
+    variant_pack.operands()             12.5 us
+    the address dict (9x data_ptr)       5.5 us
+    the driver launch                   11.7 us   (bare, outside the op)
 
 The dominant term is the cuDNN FE op/graph layer, which every engine pays and
-which is not specific to this one; the engine's own share is small, and the
-pieces of it that could be cached (the ctypes parameter block, 4 us) are
-per-call precisely so two threads executing one graph cannot hand each other
-the other's pointers, which is not worth trading for microseconds.
+which is not specific to this one -- kda_cutile's host cost on the same shape
+is 417 us against this engine's 148 us. The engine's own share is small, and
+the one piece of it that could be cached (the ctypes parameter block, ~4 us) is
+rebuilt per call precisely so two threads executing one graph cannot hand each
+other the other's pointers, which is not worth trading for microseconds.
 
-The effective fix is CUDA graph capture, and this path captures: measured
-host cost 143 us -> 2.8 us and wall time 181 us -> 50 us (3.6x) at 2048/12/1,
+The effective fix is CUDA graph capture, and this path captures. On H100 SXM at
+2048/12/1: host cost 151.4 us -> 3.0 us and wall 176.1 us -> 27.2 us (6.5x),
 with replay reproducing eager numerics. Capture requires the steady state to
 allocate and synchronise nothing, so
 ``test_kda_sm90_cuda.test_cuda_graph_capture_replays`` guards it.
