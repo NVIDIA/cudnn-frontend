@@ -120,25 +120,25 @@ state-checkpoint series in the forward pass and reuse it in the backward
 pass. Runs were captured on GB200 and GB300 (GB300 results shown below).
 
 ### GB300 - GDN
-![GDN on GB300](results/gdn/gb300/gdn_fixed_batch_flops.png)
+![GDN on GB300](results/gdn/gb300/gdn_fixed_batch_flops.webp)
 - `batch=4; num_q_heads=64; num_kv_heads=64; head_dim=128; seqlen 2048-32768; bf16`
-![GDN on GB300, batch 1](results/gdn/gb300/gdn_low_bh_flops.png)
+![GDN on GB300, batch 1](results/gdn/gb300/gdn_low_bh_flops.webp)
 - `batch=1; num_q_heads=16; num_kv_heads=16; head_dim=128; seqlen 2048-32768; bf16`
 
 ### GB300 - KDA
-![KDA on GB300](results/kda/gb300/kda_fixed_batch_flops.png)
+![KDA on GB300](results/kda/gb300/kda_fixed_batch_flops.webp)
 - `batch=4; num_q_heads=96; num_kv_heads=96; head_dim=128; seqlen 2048-32768; bf16`
-![KDA on GB300, batch 1](results/kda/gb300/kda_low_bh_flops.png)
+![KDA on GB300, batch 1](results/kda/gb300/kda_low_bh_flops.webp)
 - `batch=1; num_q_heads=16; num_kv_heads=16; head_dim=128; seqlen 2048-32768; bf16`
 
 ### GB300 - GDN-2
-![GDN-2 on GB300](results/gdn2/gb300/gdn2_fixed_batch_flops.png)
+![GDN-2 on GB300](results/gdn2/gb300/gdn2_fixed_batch_flops.webp)
 - `batch=4; num_q_heads=64; num_kv_heads=64; head_dim=128; seqlen 2048-32768; bf16`
-![GDN-2 on GB300, batch 1](results/gdn2/gb300/gdn2_low_bh_flops.png)
+![GDN-2 on GB300, batch 1](results/gdn2/gb300/gdn2_low_bh_flops.webp)
 - `batch=1; num_q_heads=16; num_kv_heads=16; head_dim=128; seqlen 2048-32768; bf16`
 
 ### GB300 - GDP
-![GDP on GB300](results/gdp/gb300/gdp_fixed_batch_flops.png)
+![GDP on GB300](results/gdp/gb300/gdp_fixed_batch_flops.webp)
 - `batch=4; num_q_heads=40; num_kv_heads=40; head_dim_qk=128; head_dim_vo=64; num_householder=3; seqlen 2048-32768; bf16` (FLA is the only third-party GDP backend)
-![GDP on GB300, batch 1](results/gdp/gb300/gdp_low_bh_flops.png)
+![GDP on GB300, batch 1](results/gdp/gb300/gdp_low_bh_flops.webp)
 - `batch=1; num_q_heads=16; num_kv_heads=16; head_dim_qk=128; head_dim_vo=64; num_householder=3; seqlen 2048-32768; bf16`
