@@ -9,6 +9,8 @@ k-major strided views, prob as (m, 1, 1), and the block scale factors as 6-D
 MMA-tiled (32, 4, mn//128, 4, rest_k, l) strided views of a dense buffer. The
 canonical forms are the natural buffers instead: A (sum_m, k) row-major, B (l, n, k)
 row-major, prob (sum_m,), and dense C-contiguous scale-factor buffers of any shape.
+Scale-factor bytes must already be packed in the required MMA-tiled physical order;
+flattening does not convert ordinary logical row-major scales.
 
 Canonical operands compile at their own rank and bind straight to the kernel with no
 per-call host work: the host-side APIs derive the canonical fakes from the
@@ -24,21 +26,6 @@ from __future__ import annotations
 import math
 
 import cutlass.cute as cute
-
-_cache_of_alpha_ones = {}
-
-
-def default_alpha_ones(l: int, device):
-    """Cached all-ones per-group scale for callers that don't scale per group."""
-    import torch
-
-    key = (l, str(device))
-    alpha = _cache_of_alpha_ones.get(key)
-    if alpha is None:
-        alpha = torch.ones(l, dtype=torch.float32, device=device)
-        _cache_of_alpha_ones[key] = alpha
-    return alpha
-
 
 # Host side: classify sample tensors and derive the kernel-facing views for the descriptors.
 

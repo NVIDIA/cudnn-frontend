@@ -353,7 +353,13 @@ kernel-facing forms above keep working unchanged:
   allocation — no `.view().permute()` gymnastics required. The kernel rebuilds the
   MMA-tiled SF layouts from the GEMM shapes and reads only the base pointer.
 - `prob`: `(valid_m,)`, `float32` or `bfloat16`
-- `alpha_tensor` may be omitted (defaults to cached ones)
+- `alpha_tensor` remains required; pass explicit per-group scaling factors.
+
+Flat SF buffers must already contain the packed MMA-tiled scale bytes in physical
+order. Ordinary row-major logical scales need packing before this API is called.
+
+These layouts prepare the contiguous MXFP8 path for a separate JAX bridge; these
+eager entry points still require torch tensors. Unified GLU/dGLU APIs are separate.
 
 When `A` is canonical (2-D), the wrapper returns natural-shaped outputs:
 `c (valid_m, N)`, `d`/`d_col (valid_m, N/2)` row-major, and `sfd_row`/`sfd_col` as

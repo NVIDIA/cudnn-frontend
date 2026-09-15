@@ -5,7 +5,7 @@
 call (including the TransformerEngine-style per-call view/permute gymnastics the
 legacy contract forces on the caller) vs the canonical natural-layout call.
 
-DSv3 fc1 shape from MLPerf MoE: (sum_m, n, k) = (24576, 7168, 2048), MXFP8 inputs,
+Grouped MoE fc1 shape: (sum_m, n, k) = (24576, 7168, 2048), MXFP8 inputs,
 first dim overallocated 1.5x-4x for EP routing slack.
 
 Usage: python bench_grouped_gemm_canonical_host_latency.py
@@ -70,7 +70,7 @@ def call_canonical(buf):
         sfa_tensor=buf["sfa"],
         sfb_tensor=buf["sfb"],
         padded_offsets=buf["offsets"],
-        alpha_tensor=None,
+        alpha_tensor=buf["alpha"],
         norm_const_tensor=buf["norm_const"],
         prob_tensor=buf["prob"],
         d_dtype=torch.float8_e4m3fn,
@@ -101,8 +101,13 @@ def main():
     for factor in (1.5, 2.0, 4.0):
         tensor_m = ceil_div(int(VALID_M * factor), 256) * 256
         buf = make_buffers(tensor_m)
-        legacy_p50, legacy_p90 = bench(call_legacy, buf)
-        canon_p50, canon_p90 = bench(call_canonical, buf)
+        legacy, canonical = [], []
+        for repeat in range(3):
+            calls = ((call_legacy, legacy), (call_canonical, canonical))
+            for fn, results in calls if repeat % 2 == 0 else reversed(calls):
+                results.append(bench(fn, buf))
+        legacy_p50, legacy_p90 = min(legacy)
+        canon_p50, canon_p90 = min(canonical)
         print(f"{factor:>8}x | {tensor_m:>8} | {legacy_p50:>10.1f} / {legacy_p90:>7.1f} | {canon_p50:>11.1f} / {canon_p90:>7.1f}")
 
 

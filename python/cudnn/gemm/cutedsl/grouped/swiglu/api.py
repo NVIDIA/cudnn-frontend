@@ -34,7 +34,6 @@ from ..canonical import (
     canonical_mx_fake,
     canonical_prob_fake,
     check_sf_shape,
-    default_alpha_ones,
     is_canonical_b,
     is_flat_sf,
     make_flat_sf_fake,
@@ -835,7 +834,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
     sfa_tensor: torch.Tensor,
     sfb_tensor: torch.Tensor,
     padded_offsets: torch.Tensor,
-    alpha_tensor: Optional[torch.Tensor] = None,
+    alpha_tensor: torch.Tensor,
     norm_const_tensor: Optional[torch.Tensor] = None,
     prob_tensor: Optional[torch.Tensor] = None,
     acc_dtype: Optional[torch.dtype] = None,
@@ -871,7 +870,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
         sfa_tensor: Scale factor A (MMA-tiled view, or canonical dense buffer)
         sfb_tensor: Scale factor B (MMA-tiled view, or canonical dense buffer)
         padded_offsets: End offset per expert after padding (l,)
-        alpha_tensor: Per-group scaling; None defaults to ones (cached)
+        alpha_tensor: Per-group scaling; required
         norm_const_tensor: Optional normalization constant. Required when using FP8
             input configurations (i.e., when a_tensor.dtype is FP8 and sfa_tensor.dtype is FP8).
             Should be None for FP4/BF16 input configurations.
@@ -933,7 +932,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
     canonical_outputs = a_tensor.ndim == 2
 
     if alpha_tensor is None:
-        alpha_tensor = default_alpha_ones(l, a_tensor.device)
+        raise ValueError("alpha_tensor is required for grouped_gemm_swiglu_wrapper_sm100")
 
     _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Creating output tensors c_tensor, d_tensor, d_col_tensor")
 

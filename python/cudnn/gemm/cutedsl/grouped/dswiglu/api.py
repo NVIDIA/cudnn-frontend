@@ -33,7 +33,6 @@ from ..canonical import (
     canonical_mx_fake,
     canonical_prob_fake,
     check_sf_shape,
-    default_alpha_ones,
     is_canonical_b,
     is_flat_sf,
     make_flat_sf_fake,
@@ -750,9 +749,9 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     sfa_tensor: torch.Tensor,
     sfb_tensor: torch.Tensor,
     padded_offsets: torch.Tensor,
-    alpha_tensor: Optional[torch.Tensor] = None,
-    beta_tensor: Optional[torch.Tensor] = None,
-    prob_tensor: Optional[torch.Tensor] = None,
+    alpha_tensor: torch.Tensor,
+    beta_tensor: Optional[torch.Tensor],
+    prob_tensor: torch.Tensor,
     norm_const_tensor: Optional[torch.Tensor] = None,
     acc_dtype: Optional[torch.dtype] = None,
     d_dtype: Optional[torch.dtype] = None,
@@ -790,7 +789,7 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         sfa_tensor: Scale factor A (MMA-tiled view, or canonical dense buffer)
         sfb_tensor: Scale factor B (MMA-tiled view, or canonical dense buffer)
         padded_offsets: End offset per expert after padding (l,)
-        alpha_tensor: Per-group alpha scaling; None defaults to ones (cached)
+        alpha_tensor: Per-group alpha scaling; required
         beta_tensor: Per-group beta scaling
         prob_tensor: Per-row probability tensor (required)
         norm_const_tensor: Optional normalization constant
@@ -842,7 +841,7 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     if prob_tensor is None:
         raise ValueError("prob_tensor is required for grouped_gemm_dswiglu_wrapper_sm100")
     if alpha_tensor is None:
-        alpha_tensor = default_alpha_ones(l, a_tensor.device)
+        raise ValueError("alpha_tensor is required for grouped_gemm_dswiglu_wrapper_sm100")
 
     if cd_major != "n":
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
@@ -884,6 +883,7 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         # Canonical-vs-kernel-facing input forms compile different signatures.
         prob_tensor.dtype,
         prob_tensor.ndim,
+        dprob_tensor_buf.ndim if dprob_tensor_buf is not None else (1 if canonical_outputs else 3),
         (is_flat_sf(sfa_tensor), sfa_tensor.ndim),
         (is_flat_sf(sfb_tensor), sfb_tensor.ndim),
     )

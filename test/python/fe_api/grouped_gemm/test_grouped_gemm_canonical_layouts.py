@@ -153,20 +153,6 @@ def test_grouped_gemm_swiglu_canonical_bf16_prob(request):
     assert_same("c", canonical["c_tensor"], legacy["c_tensor"])
 
 
-@pytest.mark.L0
-@torch_fork_set_rng(seed=0)
-def test_grouped_gemm_swiglu_alpha_defaults_to_ones(request):
-    try:
-        cfg, inputs = swiglu_case(request, torch.float8_e4m3fn, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu)
-        ones = torch.ones_like(inputs["alpha_tensor"])
-        explicit = run_swiglu(cfg, inputs, canonical=True, alpha=ones)
-        defaulted = run_swiglu(cfg, inputs, canonical=True, alpha=None)
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
-    assert_same("d", defaulted["d_tensor"], explicit["d_tensor"])
-    assert_same("c", defaulted["c_tensor"], explicit["c_tensor"])
-
-
 def dswiglu_case(request):
     cfg = grouped_gemm_swiglu_init(
         request=request,
@@ -205,7 +191,7 @@ def dswiglu_case(request):
     return cfg, inputs
 
 
-def run_dswiglu(cfg, inputs, canonical, flat_sf=False, prob_dtype=None, alpha=...):
+def run_dswiglu(cfg, inputs, canonical, flat_sf=False, prob_dtype=None, alpha=..., dprob_buf=None):
     from cudnn import grouped_gemm_dswiglu_wrapper_sm100
 
     prob = inputs["prob_tensor"]
@@ -235,6 +221,7 @@ def run_dswiglu(cfg, inputs, canonical, flat_sf=False, prob_dtype=None, alpha=..
         sfb_tensor=sfb,
         padded_offsets=inputs["padded_offsets_tensor"],
         alpha_tensor=alpha,
+        dprob_tensor_buf=dprob_buf,
         beta_tensor=inputs["beta_tensor"],
         prob_tensor=prob,
         norm_const_tensor=inputs.get("norm_const_tensor"),
@@ -286,13 +273,51 @@ def test_grouped_gemm_dswiglu_canonical_bf16_prob(request):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_grouped_gemm_dswiglu_alpha_defaults_to_ones(request):
-    try:
+@pytest.mark.parametrize("dynamic", ["0", "1"])
+@pytest.mark.parametrize("provided_first", [False, True])
+@pytest.mark.parametrize("canonical", [False, True])
+def test_grouped_gemm_dswiglu_dprob_rank_cache(request, monkeypatch, dynamic, provided_first, canonical):
+    import cudnn.gemm.cutedsl.grouped.dswiglu.api as api
+
+    monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", dynamic)
+    monkeypatch.setattr(api, "_cache_of_GroupedGemmDswigluSm100Objects", {})
+    cfg, inputs = dswiglu_case(request)
+    reference = run_dswiglu(cfg, inputs, canonical=canonical)
+    api._cache_of_GroupedGemmDswigluSm100Objects.clear()
+    m = inputs["tensor_m"]
+    supplied_shape = (m, 1, 1) if canonical else (m,)
+    supplied = torch.empty(supplied_shape, dtype=torch.float32, device=inputs["a_tensor"].device)
+    for use_buffer in (provided_first, not provided_first, provided_first):
+        out = run_dswiglu(cfg, inputs, canonical=canonical, dprob_buf=supplied if use_buffer else None)
+        assert out["dprob_tensor"].shape == (supplied_shape if use_buffer else reference["dprob_tensor"].shape)
+        assert_same("d_row", out["d_row_tensor"], reference["d_row_tensor"])
+        torch.testing.assert_close(out["dprob_tensor"].reshape(-1), reference["dprob_tensor"].reshape(-1), rtol=1e-4, atol=1e-4)
+    assert len(api._cache_of_GroupedGemmDswigluSm100Objects) == 2
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("backward", [False, True], ids=["swiglu", "dswiglu"])
+def test_grouped_gemm_canonical_requires_alpha(request, backward):
+    if backward:
         cfg, inputs = dswiglu_case(request)
-        ones = torch.ones_like(inputs["alpha_tensor"])
-        explicit = run_dswiglu(cfg, inputs, canonical=True, alpha=ones)
-        defaulted = run_dswiglu(cfg, inputs, canonical=True, alpha=None)
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
-    assert_same("d_row", defaulted["d_row_tensor"], explicit["d_row_tensor"])
-    torch.testing.assert_close(defaulted["dprob_tensor"], explicit["dprob_tensor"], rtol=1e-4, atol=1e-4)
+        run = run_dswiglu
+    else:
+        cfg, inputs = swiglu_case(request, torch.float8_e4m3fn, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu)
+        run = run_swiglu
+    run(cfg, inputs, canonical=True)
+    with pytest.raises(ValueError, match="alpha_tensor is required"):
+        run(cfg, inputs, canonical=True, alpha=None)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        with pytest.raises(ValueError, match="alpha_tensor is required"):
+            run(cfg, inputs, canonical=True, alpha=None)
+        captured = run(cfg, inputs, canonical=True)
+    eager = run(cfg, inputs, canonical=True)
+    graph.replay()
+    key = "d_row_tensor" if backward else "d_tensor"
+    assert_same(key, captured[key], eager[key])
+    inputs["alpha_tensor"].mul_(2)
+    graph.replay()
+    changed = run(cfg, inputs, canonical=True)
+    assert_same(key, captured[key], changed[key])
