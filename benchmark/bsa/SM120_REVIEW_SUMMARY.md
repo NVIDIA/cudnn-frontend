@@ -36,8 +36,9 @@ Two independent 102-sample runs measured 1.1188x-1.1278x versus native64 and
 and selected tokens; native64 preprocessing is excluded and the adapter's
 per-call conversion is included. These are approximately 12%-13% throughput
 gains (10.6%-11.4% lower latency), not gains against the already optimized
-`9869b9b6` baseline below. The report includes both tables, raw samples,
-accuracy checks, and reproducible commands.
+`9869b9b6` baseline below. The report includes both tables, accuracy checks,
+and reproducible commands. Raw timing samples and source hashes are archived
+locally rather than tracked in the repository.
 
 The measured optimization checkpoint is `e0602027`. The additional-speedup baseline
 is `9869b9b6`, which already includes FA4-style execution and two-fold
@@ -73,8 +74,9 @@ baseline must not be combined with the Server Edition measurements above.
 - The documentation-only review follow-up adds docstrings to touched
   functions and kernel helpers. After stripping docstrings, all eight
   modified Python files have identical ASTs to `3c6e02dd`; no executable
-  statements or numerical tolerances changed. Historical timing artifacts
-  retain their measured source hashes, not the documentation-refresh hashes.
+  statements or numerical tolerances changed. Locally archived historical
+  timing artifacts retain their measured source hashes, not the
+  documentation-refresh hashes.
 - The latest reviewer-fix refresh passed **67 tests with 19 skips** across
   the entire BSA directory, with the pinned legacy archive enabled. This
   includes the concurrent-output CLI regression, observed RED before the

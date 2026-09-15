@@ -7,8 +7,10 @@ The [same-device three-path comparison](SM120_THREE_PATHS.md) measures current
 native KV128 against the original native KV64 kernel and the archived PR #1010
 adapter, with identical selected tokens. Two independent runs measured about
 1.12x-1.13x against those paths; this is a different baseline from the additional
-1.05x goal below. The comparison includes a portable harness, raw timing samples,
-source checks, and archive-preparation instructions.
+1.05x goal below. The comparison includes summary tables, a portable harness,
+source checks, and archive-preparation instructions. Raw timing JSON is archived
+locally rather than tracked in the repository; the harness generates fresh
+reports for reproduction.
 
 See [the optimization screening log](SM120_OPTIMIZATION.md) for ongoing
 same-device comparisons against the current kernel and the additional 5% goal.

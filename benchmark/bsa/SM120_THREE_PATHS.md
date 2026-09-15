@@ -62,17 +62,17 @@ The earlier 0.8%-1.1% gain used the already optimized FA4-style native128 `9869b
 
 ## Artifacts and reproduction
 
-The JSON files retain the original measured revisions, source hashes, and
-timing samples. The subsequent review fixes add exclusive report creation,
-a concurrent-output regression, and function docstrings; they do not replace
-these results with new latency measurements. Kernel docstring additions were
-checked for AST equivalence after stripping docstrings. Current source-file
-hashes therefore differ from the historical hashes without a change to the
-kernel's executable statements.
+The original JSON reports are archived locally outside the tracked repository,
+with their measured revisions, source hashes, and timing samples unchanged.
+The tables above retain the measured summary statistics; use the harness below
+to generate a fresh JSON report. The subsequent review fixes add exclusive
+report creation, a concurrent-output regression, and function docstrings;
+they do not replace these results with new latency measurements. Kernel
+docstring additions were checked for AST equivalence after stripping
+docstrings. Current source-file hashes therefore differ from the historical
+hashes without a change to the kernel's executable statements.
 
 - [Comparison harness](benchmark_sm120_three_paths.py)
-- [Run 1 raw event samples and source hashes](results/sm120_three_paths_20260915_run1.json)
-- [Run 2 raw event samples and source hashes](results/sm120_three_paths_20260915_run2.json)
 - [Harness tests](../../test/python/fe_api/bsa/test_sm120_three_paths_benchmark.py)
 
 The portable harness requires an explicitly prepared, pinned legacy source
@@ -97,19 +97,19 @@ CUDA_VISIBLE_DEVICES=0 python -m pytest -q fe_api/bsa/test_sm120_three_paths_ben
 ```
 
 Choose a new JSON filename for each repeat; the harness refuses to overwrite
-an existing output file. The five archived-legacy GPU tests and the archive
+an existing output file. The six archived-legacy GPU tests and the archive
 integrity test skip unless `SM120_PR1010_SOURCE_DIR` is set; order, summary,
 and argument-validation tests do not require the archive. Unsupported GPU/DSL
 configurations are skipped.
 
-The tables above retain the original measurement revisions and samples.
+The tables above retain the original measurement revisions and summary statistics.
 The public harness removes local checkout assumptions, adds explicit input
 validation, and restores the temporary legacy Python package after each run;
 it retains the same mask construction, six-permutation timing, and accuracy
 checks. The legacy metadata adapter is loaded only as a benchmark baseline,
 never added to the native128 production dispatch.
 
-Only sanitized timing JSON, source hashes, and the portable harness are
-published. Legacy archives, machine-specific launch settings, and profiler
-reports remain ignored. Shared artifacts contain no machine IP, hostname,
-GPU UUID, or private absolute path.
+The tracked contribution includes the portable harness, tests, and sanitized
+summary tables. Raw JSON reports, legacy archives, machine-specific launch
+settings, and profiler reports remain local. Shared documentation contains no
+machine IP, hostname, GPU UUID, or private absolute path.
