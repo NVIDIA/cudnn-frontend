@@ -671,7 +671,8 @@ def test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors(d_qk, d_v, c
 
 @pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128)])
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
-def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal):
+@pytest.mark.parametrize("half_softmax", [False, True], ids=["f32-exp", "f16x2-exp"])
+def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
     """Rubin e2e: the PUBLISHED Stats is the fp32 log-sum-exp of the problem the
     kernel actually saw (cuDNN's definition -- its fp8 backward recomputes
     P = exp(S - Stats) from it), NOT the log of the fp8-QUANTIZED P sum that
@@ -685,12 +686,22 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal):
     (1) LSE within 1e-4 of the exact fp32 log-sum-exp (this would read >1e-3
         on most rows with the quantized sum);
     (2) O is BIT-IDENTICAL with and without Stats -- the row-sum only feeds the
-        LSE, Sigma normalizes O in both specializations."""
+        LSE, Sigma normalizes O in both specializations.
+    The softmax_precision=HALF arm (f16x2 exponent, d128 only) holds the same
+    bound: its Stats denominator is a separate fp32 exponent of the same
+    arguments (summing its f16 P measured rms 3.6e-4 off the exact value --
+    the f16 exp-argument rounding and MUFU EX2.F16x2's 2^-9.9 do not average
+    out), while O keeps the f16x2 P."""
     import torch
+    import cudnn as _c
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
+    if half_softmax and (d_qk, d_v) != (128, 128):
+        pytest.skip("the f16x2 exponent arm lives on the d128 sibling only")
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    precision = _c.data_type.HALF if half_softmax else _c.data_type.FLOAT
 
     torch.manual_seed(0)
     b, hq, hkv, s = 2, 8, 2, 1024
@@ -717,6 +728,7 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal):
             scale_softmax=d_qk**-0.5,
             is_causal=causal,
             pertensor_fp8=True,
+            softmax_precision=precision,
         )
         assert api.check_support()
         api.compile()

@@ -976,9 +976,11 @@ def test_mxfp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal):
     vf = torch.randn(b, hkv, s, d_v, device=dev) * 0.5
 
     def mx(x, h, d, columnwise):
-        data_d, ref_d, swz_d, data_s, ref_s, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, s, d, 32, torch.float8_e4m3fn, with_ref=True)
-        data, ref, swz = (data_s, ref_s, swz_s) if columnwise else (data_d, ref_d, swz_d)
-        return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), ref.float().reshape(b, h, s, d), swz.contiguous()
+        data_d, sf_d, swz_d, data_s, sf_s, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, s, d, 32, torch.float8_e4m3fn, with_ref=True)
+        data, sf, swz = (data_s, sf_s, swz_s) if columnwise else (data_d, sf_d, swz_d)
+        # sf_*_ref are the per-element fp32 DEQUANT SCALES [b, h, s, d]; the value the kernel sees is data * scale.
+        deq = data.float().reshape(b, h, s, d) * sf.float().reshape(b, h, s, d)
+        return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), deq, swz.contiguous()
 
     q8, q_deq, sfq = mx(qf, hq, d_qk, False)
     k8, k_deq, sfk = mx(kf, hkv, d_qk, False)

@@ -153,7 +153,6 @@ from cudnn.frost.tile_dsl.pointwise import (
     tmem_load_max_reduction_x64,
     vec_scale_pair,
     fp32_to_fp8_pack,
-    f16x2_to_f32,
     row_reduction_pair,
     fp32_to_fp16,
     ex2_f16x2,
@@ -1225,22 +1224,20 @@ def _f16_exp_chunk(chunk_S, n: cutlass.Constexpr[int] = 64):
 
 @cute.jit
 def _f16_exp_chunk_sum(chunk_S, n: cutlass.Constexpr[int] = 64):
-    """:func:`_f16_exp_chunk` plus the fp32 row-sum PAIR of the same f16 P values (has_lse only).
+    """:func:`_f16_exp_chunk` plus the EXACT fp32 row-sum PAIR of P (has_lse only).
 
-    The f16x2 pairs are unpacked with ``cvt.f32.f16`` and summed in fp32, so the published
-    LSE is the exact sum of the P this path actually computed (f16-rounded, 2^-11 relative,
-    an order below the fp8 cast noise the O path absorbs).
+    O keeps the f16x2 P this arm exists for; the Stats denominator is a separate fp32
+    ``exp2`` of the SAME biased arguments, so the published LSE is the exact
+    log-sum-exp on this arm too (summing the f16 P instead measured rms 3.6e-4 off it:
+    the f16 exp-argument rounding and MUFU EX2.F16x2's 2^-9.9 do not average out).
+    The extra MUFU per element makes HALF + Stats no faster than the f32 chain --
+    it is honored, not degraded; a stats-less HALF graph pays nothing.
     """
     elems = [chunk_S[i] for i in range(n)]
     pairs = [fp32_to_fp16(elems[2 * i], elems[2 * i + 1]) for i in range(n // 2)]
     p_pairs = [ex2_f16x2(w) for w in pairs]
     words = [f16x2x2_to_fp8_word(p_pairs[2 * g], p_pairs[2 * g + 1], _FP8_TAG_P) for g in range(n // 4)]
-    p_f32 = []
-    for w in p_pairs:
-        lo, hi = f16x2_to_f32(w)
-        p_f32.append(lo)
-        p_f32.append(hi)
-    p_sum = row_reduction_pair(cutlass.Vector.from_elements(tuple(p_f32), cutlass.Float32))
+    p_sum = row_reduction_pair(cute.math.exp2(chunk_S, fastmath=True))
     return cutlass.Vector.from_elements(tuple(words), cutlass.Int32), p_sum
 
 
