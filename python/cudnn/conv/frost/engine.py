@@ -52,7 +52,7 @@ def _storage_dtype_name(data_type) -> Optional[str]:
 
 def _input_channel_tile(dtype_name: str) -> int:
     """Channel elements covered by the narrowest supported mainloop K tile."""
-    return 64 // buffers.DTYPE_ITEMSIZE[dtype_name]
+    return 128 // buffers.DTYPE_ITEMSIZE[dtype_name]
 
 
 def _tuple_param(node, name: str, default: Sequence[int]) -> tuple[int, ...]:
@@ -421,7 +421,21 @@ class _Sm100FrostBlockScaleConvPlan(CompiledPlan):
                 raise ValueError(f"frost_conv: tensor uid {exc} is bound by the kernel but is not an operand of this graph") from exc
 
         operands = variant_pack.operands(self._indices)
-        for operand, (role, shape, stride, dtypes, required_bytes) in zip(operands, self._expected):
+        for i, (operand, (role, shape, stride, dtypes, required_bytes)) in enumerate(zip(operands, self._expected)):
+            # Variant-pack normalization lends dense scale carriers the graph's
+            # logical geometry. The kernel ABI still consumes physical scale
+            # layouts, including F8_128x4 padding that is absent from that
+            # geometry. Interpret the declared storage with a metadata-only
+            # view, just as the backend interprets the same pointer.
+            tensor = self._tensors[i]
+            if (
+                role in ("SFA", "SFB", "SFD")
+                and tuple(operand.shape) == tuple(tensor.dim)
+                and tuple(operand.stride()) == tuple(tensor.stride)
+                and operand.dtype in dtypes
+            ):
+                operand = buffers.DeviceView(operand.data_ptr(), shape, operand.dtype, self._device)
+                operands[i] = operand
             actual_shape = tuple(int(x) for x in operand.shape)
             actual_stride = tuple(int(x) for x in operand.stride())
             if actual_shape != shape or actual_stride != stride:

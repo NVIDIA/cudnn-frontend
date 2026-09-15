@@ -60,8 +60,6 @@ def _geometry_cases() -> tuple[ConvCase, ...]:
 
 
 _SHAPE_CASES = (
-    # A 64-byte BF16 channel row forces the automatic selector onto K64.
-    ConvCase("automatic-k64-tile", (1, 32, 1, 1, 1), (32, 32, 1, 1, 1)),
     # Smallest aligned C/K rows and a single output element exercise both M
     # and N tail handling.
     ConvCase("minimum-aligned-single-output", (1, 64, 1, 1, 1), (8, 64, 1, 1, 1)),
@@ -136,7 +134,7 @@ def test_shape_cases_obey_frost_alignment_and_geometry_contract() -> None:
     """Keep generated cases within the kernel's advertised support envelope."""
     for case in _SHAPE_CASES:
         assert case.image_shape[1] == case.weight_shape[1]
-        assert case.image_shape[1] % 32 == 0  # Narrowest BF16 mainloop channel tile (64 bytes)
+        assert case.image_shape[1] % 64 == 0  # BF16 mainloop channel tile (128 bytes)
         assert case.weight_shape[0] % 8 == 0  # 16-byte BF16 output rows
         assert all(1 <= value <= 8 for value in case.stride)
         assert all(value > 0 for value in case.dilation)
@@ -201,3 +199,20 @@ def test_frost_conv_supported_shapes_and_geometry(monkeypatch, case: ConvCase) -
 
     epsilon = float(torch.finfo(torch.bfloat16).eps)
     torch.testing.assert_close(output_gpu.float(), expected, atol=2 * epsilon, rtol=2 * epsilon)
+
+
+def test_frost_conv_rejects_narrow_channel_rows() -> None:
+    from cudnn.conv.frost.engine import FrostConvEngine
+
+    graph = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    image = graph.tensor(dim=(1, 32, 1, 1, 1), stride=(32, 1, 32, 32, 32), data_type=cudnn.data_type.BFLOAT16)
+    weight = graph.tensor(dim=(32, 32, 1, 1, 1), stride=(32, 1, 32, 32, 32), data_type=cudnn.data_type.BFLOAT16)
+    output = graph.conv_fprop(image, weight, pre_padding=(0, 0, 0), post_padding=(0, 0, 0), stride=(1, 1, 1), dilation=(1, 1, 1))
+    output.set_output(True).set_dim((1, 32, 1, 1, 1)).set_stride((32, 1, 32, 32, 32))
+    graph.validate()
+    with pytest.raises(NotImplementedError, match="64-element mainloop tile"):
+        FrostConvEngine().check_support(graph)

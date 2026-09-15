@@ -85,14 +85,14 @@ def test_dense_predicate_selects_cta_group_from_implicit_m() -> None:
 
 @pytest.mark.L0
 @requires_dense_cutedsl
-def test_dense_predicate_scores_n_and_selects_widest_legal_k_tile() -> None:
+def test_dense_predicate_scores_n_and_rejects_narrow_channel_rows() -> None:
     full_k = _get_dense_config(4096, 512, 4096, channel_bytes=128)
-    narrow_k = _get_dense_config(4096, 512, 4096, channel_bytes=64)
+    with pytest.raises(ValueError, match="no compatible convolution tile configurations"):
+        _get_dense_config(4096, 512, 4096, channel_bytes=64)
 
-    assert full_k.cta_tile_n == narrow_k.cta_tile_n == 128
+    assert full_k.cta_tile_n == 128
     assert full_k.cta_tile_k_bytes == 128
-    assert narrow_k.cta_tile_k_bytes == 64
-    assert full_k in CATALOG and narrow_k in CATALOG
+    assert full_k in CATALOG
 
 
 @pytest.mark.L0
@@ -161,7 +161,7 @@ def test_block_scale_k_width_names_are_complete_catalog_entries(cta_k_bytes) -> 
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("cta_k_bytes", (32, 96))
+@pytest.mark.parametrize("cta_k_bytes", (32, 64, 96))
 @requires_dense_cutedsl
 def test_dense_compile_rejects_block_scale_only_k_widths_before_cute_compile(monkeypatch, cta_k_bytes) -> None:
     from cudnn.conv.frost.templates import sm100_conv
@@ -170,7 +170,7 @@ def test_dense_compile_rejects_block_scale_only_k_widths_before_cute_compile(mon
         pytest.fail("cute.compile must not be called for an invalid dense tile config")
 
     monkeypatch.setattr(sm100_conv.cute, "compile", unexpected_compile)
-    with pytest.raises(ValueError, match=rf"{cta_k_bytes}.*CTA K must be 64 or 128|CTA K must be 64 or 128.*{cta_k_bytes}"):
+    with pytest.raises(ValueError, match=rf"{cta_k_bytes}.*CTA K must be 128|CTA K must be 128.*{cta_k_bytes}"):
         sm100_conv.compile(
             ncdhw=(1, 128, 1, 1, 1),
             ktrs=(128, 1, 1, 1),
@@ -187,10 +187,10 @@ def test_dense_compile_rejects_catalog_geometry_incompatible_with_dense_epilogue
         pytest.fail("cute.compile must not be called for an invalid dense tile config")
 
     monkeypatch.setattr(sm100_conv.cute, "compile", unexpected_compile)
-    config = ConvTileConfig(64, 32, 64, 2)
+    config = ConvTileConfig(64, 32, 128, 2)
     with pytest.raises(ValueError, match=rf"{config.name}.*M=64 2-CTA requires CTA N divisible by 64"):
         sm100_conv.compile(
-            ncdhw=(1, 32, 1, 1, 1),
+            ncdhw=(1, 64, 1, 1, 1),
             ktrs=(128, 1, 1, 1),
             tile_config=config,
         )
@@ -453,18 +453,18 @@ def test_block_scale_kernel_derives_geometry_from_tile_config() -> None:
 
 
 _REPRESENTATIVE_CONFIGS = (
-    ConvTileConfig(64, 32, 64, 1),
+    ConvTileConfig(64, 32, 128, 1),
     ConvTileConfig(64, 256, 128, 1),
-    ConvTileConfig(64, 64, 64, 2),
+    ConvTileConfig(64, 64, 128, 2),
     ConvTileConfig(64, 128, 128, 2),
-    ConvTileConfig(128, 32, 64, 1),
+    ConvTileConfig(128, 32, 128, 1),
     ConvTileConfig(128, 256, 128, 1),
-    ConvTileConfig(128, 64, 64, 2),
+    ConvTileConfig(128, 64, 128, 2),
     ConvTileConfig(128, 128, 128, 2),
 )
 
 _DENSE_CATALOG = tuple(
-    config for config in CATALOG if config.cta_tile_k_bytes in (64, 128) and not (config.cta_tile_m == 64 and config.cta_group == 2 and config.cta_tile_n % 64)
+    config for config in CATALOG if config.cta_tile_k_bytes == 128 and not (config.cta_tile_m == 64 and config.cta_group == 2 and config.cta_tile_n % 64)
 )
 
 
