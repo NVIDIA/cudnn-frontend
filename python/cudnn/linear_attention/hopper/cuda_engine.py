@@ -29,13 +29,28 @@ this engine:
 * backward: 316.2 us geomean over six shapes against the cuTile backward's
   1765.4 us (5.58x per-call, 4.37x pipelined).
 
-The gap between those and the engine matters here and is not yet closed. The
-cuDNN FE op/graph layer costs a fixed ~115 us per call, measured on this path
-as engine-minus-direct-launch across four shapes. The forward kernel is fast
-enough (47-63 us) that this DOMINATES per-call latency, so the 8.12x does not
-survive to the caller per-call; pipelined, the overhead overlaps with GPU work
-and falls to ~0 at the larger shapes. Engine-level timing against FlashKDA on
-SXM has NOT been measured yet, so no engine-level speedup is claimed.
+The gap between those kernel figures and what a caller sees is host dispatch,
+and it is measured rather than estimated. At 2048/12/1 one call costs ~141 us of
+HOST time to issue against a ~60 us kernel, so the path is CPU-bound -- the GPU
+finishes before Python can issue the next call. Decomposed by stubbing stages
+out:
+
+    op + graph + variant-pack layer     78 us   (55%)
+    variant_pack.operands()             11 us
+    the address dict (9x data_ptr)       6 us
+    the driver launch                   ~10 us
+
+The dominant term is the cuDNN FE op/graph layer, which every engine pays and
+which is not specific to this one; the engine's own share is small, and the
+pieces of it that could be cached (the ctypes parameter block, 4 us) are
+per-call precisely so two threads executing one graph cannot hand each other
+the other's pointers, which is not worth trading for microseconds.
+
+The effective fix is CUDA graph capture, and this path captures: measured
+host cost 143 us -> 2.8 us and wall time 181 us -> 50 us (3.6x) at 2048/12/1,
+with replay reproducing eager numerics. Capture requires the steady state to
+allocate and synchronise nothing, so
+``test_kda_sm90_cuda.test_cuda_graph_capture_replays`` guards it.
 
 Correctness IS established for both directions on H100 at the production gate
 (``gate_lower_bound = -5``) with a non-zero ``initial_state``: forward 6/6
