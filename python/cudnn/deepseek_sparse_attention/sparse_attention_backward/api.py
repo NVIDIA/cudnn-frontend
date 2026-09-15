@@ -15,6 +15,8 @@ from typing import Optional, Tuple
 import torch
 import cuda.bindings.driver as cuda
 
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
+
 from cudnn.api_base import APIBase, TupleDict
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 
@@ -201,7 +203,7 @@ class SparseAttentionBackward(APIBase):
     def scratch_workspace_bytes(self) -> int:
         """Return reusable per-execution scratch for the selected backend."""
         self._ensure_support_checked()
-        major, _ = torch.cuda.get_device_capability(self.q_desc.device)
+        major, _ = device_capability(self.q_desc.device)
         if major == 9:
             return 0
         total_s_q, num_heads, head_dim = self.q_desc.shape
@@ -278,7 +280,7 @@ class SparseAttentionBackward(APIBase):
             raise ValueError("a caller-provided d_sink is supported only by the H128 D576 two-CTA backend")
         # Resolve the architecture from Q's device rather than the ambient current
         # device, and launch under that device context, matching check_support().
-        major, _ = torch.cuda.get_device_capability(q.device)
+        major, _ = device_capability(q.device)
         with torch.cuda.device(q.device):
             if major == 9:
                 from . import _interface_sm90 as _iface_sm90
