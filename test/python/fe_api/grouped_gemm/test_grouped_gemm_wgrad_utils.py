@@ -13,8 +13,9 @@ from fe_api.test_fe_api_utils import ceil_div
 def _skip_unless_e5m3_supported():
     """E5M3 scales need Rubin plus an internal cutlass-dsl build.
 
-    Shared by the glu, dglu, quant and wgrad e5m3 guard tests -- those are the
-    only four APIs that expose ``sf_fp8_dtype_override``.
+    Shared by the glu, dglu, quant, wgrad, unfused_subchannel_scaled,
+    wgrad_subchannel_scaled and dswiglu_subchannel_scaled e5m3 tests -- the APIs
+    that expose ``sf_fp8_dtype_override``.
     """
     try:
         import cutlass
