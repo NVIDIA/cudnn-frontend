@@ -340,6 +340,12 @@ class KernelTemplate:
         )
 
     @property
+    def family(self) -> str:
+        """The arch tree (``cudnn/gemm/frost/<family>/``) whose compiler renders
+        this template (:data:`PIPELINE_FAMILY`); every other tree declines it."""
+        return PIPELINE_FAMILY[self.pipeline]
+
+    @property
     def path(self) -> Path:
         """The template source on disk (:func:`template_path`)."""
         return template_path(self.file)
@@ -603,12 +609,17 @@ _AUTO_PIPELINE_ORDER: tuple[str, ...] = ("sm100", "sm120")
 
 def preferred_pipeline(chain: FusionChain) -> str:
     """Pipeline family the auto path should build ``chain`` with: the first
-    :data:`_AUTO_PIPELINE_ORDER` entry that has a template for this graph type
-    and whose SM range covers the active GPU. A graph type the newer family
-    does not implement (plain matmul, MoE) falls through to sm100 by itself."""
+    :data:`_AUTO_PIPELINE_ORDER` entry that has a template for this graph type,
+    whose SM range covers the active GPU, and whose arch tree is the one a
+    process on that GPU runs (:func:`arch_family.serving_family` -- each tree's
+    compiler renders only its own family). A graph type the newer family does
+    not implement (plain matmul, MoE) falls through to sm100 by itself."""
+    from . import compiler as C
+
     gt = classify_graph_type(chain)
+    family = arch_family.serving_family(C._current_arch())
     for pipeline in _AUTO_PIPELINE_ORDER:
-        if any(t.pipeline == pipeline and t.graph_type is gt and t.arch_active_reject() is None for t in TEMPLATES):
+        if any(t.pipeline == pipeline and t.graph_type is gt and t.family == family and t.arch_active_reject() is None for t in TEMPLATES):
             return pipeline
     return _AUTO_PIPELINE_ORDER[-1]
 

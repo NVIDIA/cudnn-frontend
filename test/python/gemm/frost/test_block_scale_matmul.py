@@ -39,6 +39,10 @@ from gemm_test_utils import (
 )
 
 from cudnn.gemm.frost import compiler as C
+
+# The two arch trees by name: their tile-constant renderers exist only in their own tree.
+from cudnn.gemm.frost.sm100 import compiler as C100
+from cudnn.gemm.frost.sm120 import compiler as C120
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding
@@ -2671,7 +2675,7 @@ def test_sm120_block_scale_registry_wiring():
     assert _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32) not in cases
     assert not any(k[1] == "fp8_e5m3" for k in cases)
     # The renderer's instruction table mirrors the support table exactly.
-    assert set(C._SM120_BLOCK_SCALE_MMA) == {(k[0] == "fp4_e2m1", k[2][1], k[1]) for k in cases}
+    assert set(C120._SM120_BLOCK_SCALE_MMA) == {(k[0] == "fp4_e2m1", k[2][1], k[1]) for k in cases}
     # The family's range starts at SM 10.0 for its dense template, but the
     # block-scaled warp MMA is SM 12.x silicon: every block-scale combo is pinned
     # to [120, 130) the way int8 is pinned on sm100.
@@ -2789,9 +2793,10 @@ def test_sm120_block_scale_tile_constants_render(combo, kind, vec, fmt, ptx):
         nb_m = -(-cfg.cta_tile_m // 128)
         nb_n = -(-cfg.cta_tile_n // 128)
         tmpl = select_template(chain, cfg)
-        src = C._render_block_scale_tile_constants(cfg, chain, tmpl)
-        # The dispatcher hands an sm120 template to the sm120 renderer, verbatim.
-        assert src == C._render_block_scale_tile_constants_sm120(cfg, chain, tmpl)
+        src = C120._render_block_scale_tile_constants(cfg, chain, tmpl)
+        # The sm100 tree has no sm120 renderer: it declines the template outright.
+        with pytest.raises(NotImplementedError, match="served by the sm120 arch tree"):
+            C100._render_block_scale_tile_constants(cfg, chain, tmpl)
         assigned = dict(re.findall(r"^(\w+) = (.*)$", src, re.M))
         assert assigned["mma_block_scale_kind"] == repr(kind)
         assert assigned["mma_scale_vec_size"] == repr(vec)

@@ -41,8 +41,8 @@ pytestmark = [pytest.mark.L0, requires_matmul_gpu]
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
 from cudnn.gemm.frost.compiler import force_stg_epi as _force_stg_epi, _current_arch, _epi_chunk_elems, _epi_vec_bytes
-from cudnn.gemm.frost.arch_family import template_dir, template_files
-from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES
+from cudnn.gemm.frost.arch_family import active_family, template_dir, template_files
+from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES, PIPELINE_FAMILY
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import CATALOG, ConfigSm120, by_name
 
@@ -289,6 +289,10 @@ def _compatible(
         return False, (f"B N-major per-MMA SMEM N={mma_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
     if not any(lo <= _current_arch() < hi for lo, hi in PIPELINE_ARCH_RANGES[cfg.pipeline]):
         return False, f"the {cfg.pipeline} pipeline does not run on sm_{_current_arch()}"
+    if PIPELINE_FAMILY[cfg.pipeline] != active_family():
+        # Each arch tree's compiler renders its own pipelines only; the process
+        # picked its tree from the GPU (or CUDNN_FRONTEND_GEMM_ARCH_FAMILY).
+        return False, f"the {cfg.pipeline} pipeline is served by the {PIPELINE_FAMILY[cfg.pipeline]} arch tree; this process runs the {active_family()} tree"
     if cfg.pipeline == "sm120":
         # MN-major operands ride a transposing ldmatrix: b16 for 16-bit dtypes,
         # the SM 12x byte-granule m16n16.trans.b8 form for 8-bit ones. Sub-byte
@@ -3491,11 +3495,12 @@ def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
 
 def test_sm120_render_smoke() -> None:
     """Render the sm120 template end-to-end (real tile constants + epilogue
-    snippets) on whatever GPU is active — no cute.compile, so this covers the
-    sm100 CI too. The source must be marker-free, parseable, and carry the
-    STG-only sm120 contract constants."""
-    from cudnn.gemm.frost.compiler import _render_template
-    from cudnn.gemm.frost.epilogue_codegen import generate
+    snippets) on whatever GPU is active — no cute.compile, and through the
+    sm120 tree's compiler by name (the facade is the active GPU's tree), so this
+    covers the sm100 CI too. The source must be marker-free, parseable, and
+    carry the STG-only sm120 contract constants."""
+    from cudnn.gemm.frost.sm120.compiler import _render_template
+    from cudnn.gemm.frost.sm120.epilogue_codegen import generate
 
     cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     for a_major in ("k", "m"):

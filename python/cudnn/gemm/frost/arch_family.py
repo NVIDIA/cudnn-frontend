@@ -79,6 +79,16 @@ def select_family(forced: str | None, arch: int | None) -> str:
     return family_for_arch(arch)
 
 
+def serving_family(arch: int | None) -> str:
+    """The family a process on a GPU of SM ``arch`` runs: the
+    ``CUDNN_FRONTEND_GEMM_ARCH_FAMILY`` override when set, else
+    :func:`family_for_arch`. :func:`active_family` is this, evaluated once for
+    the real GPU; the registry evaluates it live against the compiler's arch
+    probe so a test that pins ``_current_arch`` reasons about the family that
+    GPU would be served by."""
+    return select_family(os.environ.get(FAMILY_ENV), arch)
+
+
 @functools.lru_cache(maxsize=None)
 def active_family() -> str:
     """The family this process compiles with -- decided once, on first call.
@@ -87,7 +97,7 @@ def active_family() -> str:
     at that moment (a ``build_device`` scope included) picks. Cached because the
     facades turn the answer into module identity: ``cudnn.gemm.frost.compiler``
     cannot change family after it has been imported."""
-    return select_family(os.environ.get(FAMILY_ENV), current_arch())
+    return serving_family(current_arch())
 
 
 def family_dir(family: str) -> Path:

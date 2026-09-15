@@ -134,3 +134,81 @@ def test_env_override_pins_the_facades_in_a_fresh_process(family):
     if res.returncode != 0 or lines[:1] != [AF.__file__]:
         pytest.skip(f"a fresh interpreter does not import THIS checkout's cudnn.gemm.frost: {res.stderr.strip()[-300:]}")
     assert lines[1:] == [f"cudnn.gemm.frost.{family}.compiler", f"cudnn.gemm.frost.{family}.epilogue_codegen"]
+
+
+def _plain_bf16_chain():
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = g.tensor(name="A", dim=[1, 256, 256], stride=[256 * 256, 256, 1])
+    b = g.tensor(name="B", dim=[1, 256, 256], stride=[256 * 256, 1, 256])
+    g.matmul(A=a, B=b, name="mm").set_output(True)
+    return analyze(g)
+
+
+def test_each_tree_renders_only_its_own_family():
+    """After the split, a tree carries ITS tile-constant renderers under the
+    generic names and none of the other family's; ``_check_own_family`` is the
+    gate that keeps a foreign template out."""
+    from cudnn.gemm.frost.kernel_registry import TEMPLATES
+
+    for fam in AF.FAMILIES:
+        (other,) = [f for f in AF.FAMILIES if f != fam]
+        mod = importlib.import_module(f"cudnn.gemm.frost.{fam}.compiler")
+        assert mod._FAMILY == fam
+        for name in ("_render_tile_constants", "_render_block_scale_tile_constants"):
+            assert callable(getattr(mod, name)), (fam, name)
+            assert not hasattr(mod, f"{name}_{fam}") and not hasattr(mod, f"{name}_{other}"), (fam, name)
+        own = [t for t in TEMPLATES if t.family == fam]
+        foreign = [t for t in TEMPLATES if t.family == other]
+        assert own and foreign
+        for t in own:
+            mod._check_own_family(t)  # no raise
+        for t in foreign:
+            with pytest.raises(NotImplementedError, match=f"is served by the {other} arch tree, but this process runs the {fam} tree"):
+                mod._check_own_family(t)
+    # the sm120-only instruction tables went with the sm120 renderer
+    assert hasattr(importlib.import_module("cudnn.gemm.frost.sm120.compiler"), "_SM120_BLOCK_SCALE_MMA")
+    assert not hasattr(importlib.import_module("cudnn.gemm.frost.sm100.compiler"), "_SM120_BLOCK_SCALE_MMA")
+
+
+def test_renderer_declines_the_other_family_template_before_rendering():
+    """A direct render call with a foreign template fails on the family gate,
+    never on the wrong constants (render-only: no GPU, no compile)."""
+    from cudnn.gemm.frost.kernel_registry import select_template
+    from cudnn.gemm.frost.tile_config import by_name
+
+    chain = _plain_bf16_chain()
+    sm100 = importlib.import_module("cudnn.gemm.frost.sm100.compiler")
+    sm120 = importlib.import_module("cudnn.gemm.frost.sm120.compiler")
+    cfg100 = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1")
+    cfg120 = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    t100, t120 = select_template(chain, cfg100), select_template(chain, cfg120)
+    assert (t100.family, t120.family) == ("sm100", "sm120")
+    with pytest.raises(NotImplementedError, match="served by the sm120 arch tree, but this process runs the sm100 tree"):
+        sm100._render_tile_constants(cfg120, chain, t120)
+    with pytest.raises(NotImplementedError, match="served by the sm100 arch tree, but this process runs the sm120 tree"):
+        sm120._render_tile_constants(cfg100, chain, t100)
+    # ... and each tree renders its own (the sm120 tree needs no GPU to render)
+    assert "cta_tile_mnk" in sm120._render_tile_constants(cfg120, chain, t120)
+
+
+def test_preferred_pipeline_follows_the_family_the_gpu_is_served_by(monkeypatch):
+    """The auto path never targets a family the process cannot render: it
+    follows the arch probe (so a pinned ``_current_arch`` reasons about that
+    GPU) and honours the family override live."""
+    import cudnn.gemm.frost.compiler as C
+    from cudnn.gemm.frost.kernel_registry import preferred_pipeline
+
+    chain = _plain_bf16_chain()
+    monkeypatch.delenv(AF.FAMILY_ENV, raising=False)
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    assert preferred_pipeline(chain) == "sm100"
+    monkeypatch.setattr(C, "_current_arch", lambda: 120)
+    assert preferred_pipeline(chain) == "sm120"
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    monkeypatch.setenv(AF.FAMILY_ENV, "sm120")  # the sm120 tree pinned onto an SM 10.x part
+    assert preferred_pipeline(chain) == "sm120"
+    monkeypatch.setattr(C, "_current_arch", lambda: None)  # render-only host, sm100 tree by default
+    monkeypatch.delenv(AF.FAMILY_ENV)
+    assert preferred_pipeline(chain) == "sm100"
