@@ -266,14 +266,13 @@ qualification is required. It is not a scheduling difference in this control.
 **The 10–20 us CPU target remains unmet.** Torch eager overhead is still high.
 Totals include synchronization; total-minus-raw is not pure CPU overhead.
 These results cover one configuration and do not establish performance across
-the support matrix. The reproduction command below runs the current shared
-program; the control used the previous engine's `build_plan` method.
+the support matrix. The control used the previous engine's `build_plan` method.
 
 ### Historical measurements before sharing the launch program
 
 These measurements predate the shared launch program and automatic piece-chain
-support. They are historical. The current benchmark uses the same Frost
-scheduling decision for JAX and torch; it must be rerun to qualify current latency.
+support. They are historical; the shared-program measurements above use the
+same Frost scheduling decision for JAX and torch.
 
 Measured on SM100 (148 SMs), Python 3.14, JAX 0.11.1, CuTeDSL 4.7.1,
 torch 2.14.0+cu130, driver 580.159.03. BF16 THD inputs, H=4, K=V=128,
@@ -338,18 +337,7 @@ compiled = jax.jit(attend, compiler_options={
 These are application compiler options; the library does not change global XLA
 settings. Capture was confirmed in Nsight, including replay after pointer changes.
 
-Reproduce warm forward and explicit-backward measurements on an otherwise idle GPU:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
-  python benchmark/linear_attention/benchmark_kda.py --command-buffer --repetitions 200 \
-  --output /tmp/kda-benchmark.json
-```
-
-Remove `--command-buffer` for default XLA settings. `--tokens`, `--heads`, and
-`--dim` control the shape. The benchmark intentionally imports both frameworks;
-it checks JAX and raw replay against torch for the output and all five input
-gradients, including after repeated batched replay.
+Measurement methodology:
 
 - **Host dispatch:** CPU interval around the warm API call, with prior GPU work
   drained. Compilation and input creation are excluded.
@@ -370,15 +358,6 @@ one-call graph replay also reports host and blocking latency as a control. This
 is a stateless BF16 microbenchmark with fixed inputs, checkpoint interval zero,
 precomputed explicit-backward residuals, and no optional gate parameters. It does
 not measure compilation, a complete training step, or all supported features.
-
-To inspect individual kernels and graph updates, wrap a shorter run with:
-
-```bash
-nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
-  --capture-range=cudaProfilerApi --capture-range-end=stop --cuda-graph-trace=node \
-  -o /tmp/kda-profile python benchmark/linear_attention/benchmark_kda.py \
-  --command-buffer --repetitions 10 --warmup 2 --raw-batch-size 4
-```
 
 Use unprofiled runs for host latency. Concurrent GPU profiling produced roughly
 2 ms synchronization latency even for a trivial graph on this machine; that run
