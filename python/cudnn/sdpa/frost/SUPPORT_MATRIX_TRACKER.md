@@ -180,7 +180,8 @@ pinned `test_sdpa_paged_decode_sink_sliding_window_frost_L0` /
 `test_sdpa_paged_decode_sink_keyless_rows_frost_L0` — per flavor: d128 at `S_q` in
 {1, 2, 4} (dense and paged, f16/bf16, PackGQA on and off); d64 on the d128 envelope
 at `S_q` in {1, 4} paged (bf16, 64/8 heads, sink + left window 128) and `S_q = 1`
-dense; d256 at `S_q` in {1, 2} paged (f16). Across them: HND and NHD pools, dense
+dense; d256 at `S_q` in {1, 2, 4} paged (f16; bf16 for the `S_q` 4 keyless-row sink
+case); d192x128 and d512 at `S_q` 4 dense (keyless rows, sink −120). Across them: HND and NHD pools, dense
 unpadded / dense padded / paged, sink + `diagonal_band_left_bound` + bottom-right
 causal (`right_bound = 0`); the `test_mhas_v2` sweeps add their own geometry at
 `S_q = 1` (d in 1..128 incl. mixed dims, GQA up to 32 heads, dense / padded /

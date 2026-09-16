@@ -104,8 +104,13 @@ implementation_names   = ['cudnn.attention_implementation.AUTO', 'cudnn.attentio
 # the rng identically and a config differs between them in the sink flag alone (CPython's
 # randint rejection-samples 32-bit words, so the total weight, not the number of options,
 # fixes the consumption; checked identical over 20000 seeds).
+def _frost_engines_enabled():
+    # The frontend's own reading of CUDNN_FRONTEND_ENABLE_FROST_ENGINES ("1"/"true"/"yes"/"on").
+    from cudnn.engines.manifest import opt_in_engines_enabled
+    return opt_in_engines_enabled()
+
 def _sq1_sink_token():
-    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") == "1":
+    if _frost_engines_enabled():
         return RandomChoice({True : 1, False : 3})
     return RandomChoice({False : 4})
 
@@ -420,7 +425,7 @@ def _frost_sm100_or_skip():
     major, minor = torch.cuda.get_device_capability()
     if not (100 <= major * 10 + minor <= 106):
         pytest.skip("FROST sdpa_fwd_prefill_sm100 serves cc 10.0-10.6 only")
-    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
+    if not _frost_engines_enabled():
         pytest.skip("CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required (FROST engines are opt-in)")
     from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
     installed, version = cutedsl_state()
