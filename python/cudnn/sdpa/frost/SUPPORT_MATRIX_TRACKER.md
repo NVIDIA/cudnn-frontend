@@ -172,23 +172,38 @@ Served natively by this row: the sink is a per-Q-row epilogue fold (`max(m, sink
 lifts the running max, `exp(sink − max)` joins the denominator, `LSE = max + log(sum)`)
 that is independent of `S_q`, of the mask and of the paged loader. Hardware-validated
 on B200 (SM100) — `test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py`,
-`test_sdpa_fwd_dsl_sm100.py`, `test/python/test_mhas_v2.py::test_sdpa_random_sq1_sink_frost_L0`
-and the pinned `test_sdpa_paged_decode_sink_sliding_window_frost_L0` — per flavor:
-d128 at `S_q` in {1, 2, 4} (dense and paged, f16/bf16, PackGQA on and off); d64 on
-the d128 envelope at `S_q` in {1, 4} paged (bf16, 64/8 heads, sink + left window
-128) and `S_q = 1` dense; d256 at `S_q` in {1, 2} paged (f16). Across them: HND and
-NHD pools, dense unpadded / dense padded / paged, sink + `diagonal_band_left_bound` +
-bottom-right causal (`right_bound = 0`); the `test_mhas_v2` fuzz adds d in 8..256
-at `S_q = 1` with the whole causal / window / band family under both alignments;
-keyless rows (`seq_len_kv[b] == 0`, or above the bottom-right diagonal) write
-`O = 0`, `LSE = sink`. What changed: the python-native validator (`cudnn/_sdpa_validate.py`)
-no longer rejects `sink_token` at `s_q == 1` — that was the backend engines'
-support-surface rule, which the C++ surface keeps for the backend-only path — and
-the row's `paged KV with an attention sink is not validated` decline is gone. The
-validator lift also lets every other forward row that declares `sink=True` with the
-default `decode=True` accept the combination — SM107 f16/bf16, SM100 / SM107 MXFP8,
-SM100 / SM107 per-tensor FP8, SM120 f16/bf16 and FP8 — but sink at `S_q == 1` is ❔
-on those rows (same epilogue fold, not run here). Sink + split-KV stays declined on
+`test_sdpa_fwd_dsl_sm100.py`, the `test/python/test_mhas_v2.py` `S_q = 1` sweeps
+(`test_sdpa_random_sq1_L0`, `test_sdpa_random_sq1_unified_L1`,
+`test_sdpa_random_lean_attn_L0`, `test_sdpa_random_lean_attn_unified_L1` draw
+`with_sink_token` 1:3 when FROST engines are enabled, sink-free otherwise) and the
+pinned `test_sdpa_paged_decode_sink_sliding_window_frost_L0` /
+`test_sdpa_paged_decode_sink_keyless_rows_frost_L0` — per flavor: d128 at `S_q` in
+{1, 2, 4} (dense and paged, f16/bf16, PackGQA on and off); d64 on the d128 envelope
+at `S_q` in {1, 4} paged (bf16, 64/8 heads, sink + left window 128) and `S_q = 1`
+dense; d256 at `S_q` in {1, 2} paged (f16). Across them: HND and NHD pools, dense
+unpadded / dense padded / paged, sink + `diagonal_band_left_bound` + bottom-right
+causal (`right_bound = 0`); the `test_mhas_v2` sweeps add their own geometry at
+`S_q = 1` (d in 1..128 incl. mixed dims, GQA up to 32 heads, dense / padded /
+packed-THD, both alignments, `S_kv` up to 8192). A keyless row (`seq_len_kv[b] == 0`,
+or above the bottom-right diagonal) holds the sink's mass alone and writes `O = 0`,
+`LSE = sink` whatever the sink's magnitude: the four sm100 f16 kernels (d128,
+d192×128, d256, d512) select the fold's operands for such a row instead of computing
+them (`exp(sink − max)` underflows in fp32 for sink ≤ −104, which used to give
+`O = NaN`, `LSE = −inf`; `test_paged_graph_keyless_rows_sink_magnitude` at −120 / −5 /
++3 and `test_dsl_sm100_keyless_rows_very_negative_sink` on every flavor pin it). What
+changed: the python-native validator (`cudnn/_sdpa_validate.py`) no longer rejects
+`sink_token` at `s_q == 1` — that was the backend engines' support-surface rule,
+which the C++ surface keeps for the backend-only path — and the row's `paged KV with
+an attention sink is not validated` decline is gone. Scope of the lift: the removed
+rule sat in the validator's `NodeType.SDPA` branch, so it only ever gated f16/bf16
+`sdpa()` graphs — this row (SM100 f16/bf16, dense and paged, hardware-validated
+above) and, unvalidated, the other f16/bf16 forward rows that declare `sink=True`
+with the default `decode=True` (SM107 f16/bf16, SM120 f16/bf16: sink at `S_q == 1`
+is ❔ there — same epilogue fold, not run here). The quantized rows are untouched by
+it: `sdpa_fp8()` / `sdpa_mxfp8()` build `SDPA_FP8` / `SDPA_MXFP8` nodes that never
+passed through that branch, so the sink-at-decode status of SM100 / SM107 per-tensor
+FP8, SM100 / SM107 MXFP8 and SM120 FP8 (❔) is pre-existing and unchanged, not newly
+exposed. Sink + split-KV stays declined on
 every row (`split_kv > 1 serves dense, unpadded, sink-free graphs only`): a sink
 decode graph runs unsplit, one cluster per (batch, KV head), until a sink-aware
 `split_combine` lands.
@@ -808,7 +823,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16, per-tensor FP8 and MXFP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table) |
 | PackGQA of a group sharing no factor with the 128-row tile (G = 3, 5, 7, …), and partial packing outside the SM100/SM103 f16/bf16 d128 / d256 kernels | every arch — such groups run unpacked (see ᵐ); the d192×d128 / d512 f16 and the fp8 / mxfp8 kernels pack the whole group only |
 | Attention sink + split-KV (sink-aware `split_combine`) | every arch — a sink graph runs unsplit; at `S_q == 1` over a long KV that is one cluster per (batch, KV head) (see ˢ) |
-| Attention sink at `S_q == 1` validated | every row except SM100/SM103 f16/bf16 (see ˢ): SM107 f16, MXFP8, FP8 and SM120 accept it since the validator lift but are ❔ |
+| Attention sink at `S_q == 1` validated | every row except SM100/SM103 f16/bf16 (see ˢ): SM107 f16/bf16 and SM120 f16/bf16 accept it since the validator lift (f16/bf16 `sdpa()` graphs only) but are ❔; the FP8 / MXFP8 rows were never gated by that rule and stay ❔ as before |
 
 ᵏ **THD / ragged forward layout.** Q/K/V/O must be BSHD-ordered over **(H, S, D)**
 only — head dim innermost, then heads, then tokens (`graph_analyzer.packed_layout_ok`).

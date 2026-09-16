@@ -778,6 +778,58 @@ def test_dsl_sm100_decode_sink(d, s_q, pack_gqa):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "d_qk,d_v,stats_use_log2",
+    [(128, 128, False), (128, 128, True), (192, 128, False), (256, 256, False), (512, 512, False)],
+    ids=["d128_ln", "d128_log2", "d192_d128_ln", "d256_ln", "d512_ln"],
+)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_keyless_rows_very_negative_sink(d_qk, d_v, stats_use_log2):
+    """Dense padded multi-token decode (S_q = 4, bottom-right causal) with a
+    zero-length KV batch, a one-key batch and a sink of -120 on every head, on all
+    four SM100 f16 flavors.  A keyless row (the empty batch's four rows, the one-key
+    batch's three rows above the diagonal) holds the sink's mass alone: O := 0,
+    LSE := sink (times log2(e) under stats_use_log2).  Review regression (PR #1095):
+    the softmax publishes total_sum = 0 and a 0-substituted max for such a row, and a
+    fold that computes exp(sink - 0) underflows to 0 in fp32 -> O = 0 * inf = NaN,
+    LSE = log(0) = -inf.  test_dsl_sm100_decode_sink draws its sinks from randn (|sink|
+    < 4) and cannot see this."""
+    _require_dsl()
+    dtype = torch.bfloat16
+    b, h_q, h_kv, s_q, s_kv = 3, 8, 2, 4, 512
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h_q, s_q, d_qk, dtype)
+    k = _bhsd(b, h_kv, s_kv, d_qk, dtype)
+    v = _bhsd(b, h_kv, s_kv, d_v, dtype)
+    seq_kv_lens = torch.tensor([300, 0, 1], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    sink = torch.full((1, h_q, 1, 1), -120.0, dtype=torch.float32, device="cuda")
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True, stats_use_log2=stats_use_log2),
+        seq_len_kv=seq_kv_lens,
+        sink=sink,
+        return_stats=True,
+    )
+    lse = lse.squeeze(-1)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, seq_kv_lens=seq_kv_lens, sinks=sink.flatten(), return_stats=True)
+    if stats_use_log2:
+        lse_ref = lse_ref * math.log2(math.e)
+    rows = torch.arange(s_q, device="cuda").view(1, s_q)
+    keyless = (seq_kv_lens.view(b, 1) - s_q + rows < 0).view(b, 1, s_q).expand(b, h_q, s_q)
+    assert keyless.sum().item() == h_q * (s_q + s_q - 1), "batch 1 is keyless on every row, batch 2 on all but its last"
+    assert torch.isfinite(o.float()).all(), "keyless rows must not NaN the output"
+    assert (o[keyless] == 0).all(), "a keyless row writes O := 0 even with a sink"
+    want = -120.0 * (math.log2(math.e) if stats_use_log2 else 1.0)
+    torch.testing.assert_close(lse[keyless], torch.full_like(lse[keyless], want), atol=1e-4, rtol=0)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse[~keyless], lse_ref[~keyless], atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_execute_sink_lse_contract():
     """execute() rejects sinks inconsistent with the compiled specialization.

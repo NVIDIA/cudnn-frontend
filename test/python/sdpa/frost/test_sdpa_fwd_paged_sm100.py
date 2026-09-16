@@ -125,11 +125,13 @@ def _run_graph(
 ):
     """Build, pin the FROST engine, execute, compare every Q row against ``_ref_rows``.
 
-    ``sink`` binds a (1, H, 1, 1) fp32 ``sink_token``; ``causal_br`` spells the
-    bottom-right causal diagonal (``diagonal_band_right_bound=0``, BOTTOM_RIGHT) and
-    ``window_left`` adds ``diagonal_band_left_bound`` to it -- the decode spelling
-    FlashInfer uses (a left window alone with BOTTOM_RIGHT has no right bound and
-    the row declines it). ``pack_gqa`` pins the packed / unpacked plan."""
+    ``sink`` binds a (1, H, 1, 1) fp32 ``sink_token``: ``True`` draws one logit per head
+    from randn, a number pins every head to that logit (the underflow regression needs
+    -120, far below anything randn draws). ``causal_br`` spells the bottom-right causal
+    diagonal (``diagonal_band_right_bound=0``, BOTTOM_RIGHT) and ``window_left`` adds
+    ``diagonal_band_left_bound`` to it -- the decode spelling FlashInfer uses (a left
+    window alone with BOTTOM_RIGHT has no right bound and the row declines it).
+    ``pack_gqa`` pins the packed / unpacked plan."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
@@ -142,7 +144,12 @@ def _run_graph(
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     slk = seq_lens.view(B, 1, 1, 1)
     slq = torch.full((B, 1, 1, 1), s_q, dtype=torch.int32, device=dev)
-    sink_gpu = torch.randn(1, H, 1, 1, device=dev, dtype=torch.float32) if sink else None
+    if sink is True:
+        sink_gpu = torch.randn(1, H, 1, 1, device=dev, dtype=torch.float32)
+    elif sink is False or sink is None:
+        sink_gpu = None
+    else:
+        sink_gpu = torch.full((1, H, 1, 1), float(sink), device=dev, dtype=torch.float32)
 
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -209,19 +216,26 @@ def _run_graph(
     out = o_gpu.float()
     assert not torch.isnan(out).any(), "NaN in O"
     torch.testing.assert_close(out, ref_o, atol=2e-2 if dtype == torch.float16 else 1e-1, rtol=0)
-    live = seq_lens > 0
-    if (~live).any():
-        assert out[~live].abs().max().item() == 0.0, "empty sequence must write O := 0"
+    # A keyless row -- every row of an empty sequence, or a row above the bottom-right
+    # diagonal (its diagonal key ``L - S_q + r`` is negative; a left window never empties
+    # a row whose diagonal key exists) -- has no KV mass: O := 0 exactly, and LSE := -inf
+    # without a sink, := sink with one (the sink is then the row's whole mass, whatever
+    # its magnitude -- exp(sink - max) underflowing in fp32 must not turn the row into
+    # O = NaN / LSE = -inf).
+    rows = torch.arange(s_q, device=dev).view(1, s_q)
+    keyless = (seq_lens.view(B, 1) - s_q + rows < 0) if causal_br else (seq_lens.view(B, 1) == 0).expand(B, s_q)
+    keyless = keyless.view(B, 1, s_q).expand(B, H, s_q)
+    if keyless.any():
+        assert out[keyless].abs().max().item() == 0.0, "a keyless row must write O := 0"
     if stats:
         got_lse = stats_gpu.view(B, H, s_q)
-        torch.testing.assert_close(got_lse[live], ref_lse[live], atol=5e-3, rtol=0)
-        if (~live).any():
+        torch.testing.assert_close(got_lse[~keyless], ref_lse[~keyless], atol=5e-3, rtol=0)
+        if keyless.any():
             if sink_gpu is not None:
-                # Keyless row with a sink: the sink is the row's whole mass.
                 want = sink_gpu.view(1, H, 1).expand(B, H, s_q)
-                torch.testing.assert_close(got_lse[~live], want[~live], atol=1e-4, rtol=0)
+                torch.testing.assert_close(got_lse[keyless], want[keyless], atol=1e-4, rtol=0)
             else:
-                assert torch.isinf(got_lse[~live]).all() and (got_lse[~live] < 0).all(), "empty sequence must write LSE := -inf"
+                assert torch.isneginf(got_lse[keyless]).all(), "a keyless row must write LSE := -inf"
     return plan
 
 
@@ -413,6 +427,23 @@ def test_paged_graph_d64_gqa8_sink_sliding_window(s_q):
     sink + left window 128 + bottom-right causal: the decode graph FlashInfer
     builds for a GPT-OSS-class model, at S_q = 1 and as multi-token decode."""
     _run_graph(4, 64, 8, 64, 16, 128, [2048, 1337, 129, 16], hnd=True, s_q=s_q, dtype=torch.bfloat16, sink=True, window_left=128, causal_br=True, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sink", [-120.0, -5.0, 3.0], ids=["sink_m120", "sink_m5", "sink_p3"])
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+def test_paged_graph_keyless_rows_sink_magnitude(d, sink):
+    """Review regression (PR #1095): bf16, B = 1, 4/1 heads, paged page 16 HND, a
+    128-key cache with ONE live key, S_q = 4 under the bottom-right causal diagonal,
+    Stats on, the sink pinned per head.  Three of the four rows have no key, so the
+    sink is their whole mass: O := 0, LSE := sink.  The softmax publishes a
+    0-substituted row max with total_sum = 0 for such a row; a sink fold that
+    COMPUTES the denominator from it gets exp(-120 - 0) = 0 in fp32, i.e. a zero
+    denominator -> O = 0 * inf = NaN and LSE = 0 + log(0) = -inf.  -5 does not
+    underflow (the fold happens to be right), +3 sits above the substituted max
+    (the sink dominates; also right) -- the three pin the row's contract, not one
+    arithmetic accident."""
+    _run_graph(1, 4, 1, d, 16, 8, [1], hnd=True, dtype=torch.bfloat16, s_q=4, sink=sink, causal_br=True, stats=True)
 
 
 @pytest.mark.L0

@@ -54,8 +54,8 @@ def decode():
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"padded": 1, "full": 1}),
-        # dropout not supported with s_q == 1; sink_token at s_q == 1 is drawn by
-        # test_mhas_v2.py::test_sdpa_random_sq1_sink_frost_L0 (FROST-served; the
+        # dropout not supported with s_q == 1; sink_token at s_q == 1 is drawn by the
+        # test_mhas_v2.py s_q == 1 sweeps when FROST is on (_sq1_sink_token; the
         # backend engines decline it), so this backend-agnostic suite stays sink-free
     )
 
