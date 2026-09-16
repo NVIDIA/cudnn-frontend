@@ -758,10 +758,10 @@ def test_bwd_varlen(backend, variant, seq_lens):
 def test_bwd_under_nonreentrant_activation_checkpoint(backend, variant):
     """Saved-tensor hooks may be unpacked only once during checkpoint replay."""
     case = make_case(variant, torch.bfloat16, T=128, H=1)
-    leaves = [value.detach().clone().requires_grad_(True) for value in op_args(case)[:-1]]
+    leaves = [value.detach().clone().requires_grad_(True) for value in thd_tensors(case)]
 
     def forward(*values):
-        output, _ = pinned_op(backend, variant)(*values, case.cu)
+        output, _ = pinned_op(backend, variant)(*values, *op_tail(case))
         return output
 
     with waive_unsupported(backend, variant):
