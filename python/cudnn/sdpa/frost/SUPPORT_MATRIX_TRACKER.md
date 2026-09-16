@@ -135,7 +135,9 @@ the backend's plan) (64, 64) 32/8 measured **203 vs 46 µs**, 32/32 658 vs 129 �
 (GPT-OSS) 183 vs 46 µs and (96, 96) 32/8 205 vs 63 µs, while the native (256, 256) led
 (32/32 778 vs 830 µs, 32/8 201 vs 267 µs). d=64 / d=96 on the d128 envelope and
 d=192/192 on the d256 one are therefore backend-first at decode (the FROST plan is
-offered behind the backend's; `select_engine` / `deselect_engines` reach it —
+offered behind the backend's; the public `select_plan(i)` on its index in
+`graph.plans`, or `deselect_engines` on the backend's plan names, reach it —
+`select_engine` in the tests is a helper wrapping the former:
 `test_paged_decode_envelope_shapes_yield_to_the_backend`). A measured envelope shape
 claims the lead by naming its exact pair.
 
