@@ -135,11 +135,13 @@ def test_scheduler_ring_reuse_live_capture(kind, config_name):
     kernel_names = []
     for node in nodes:
         (node_type,) = checked(cuda_driver.cuGraphNodeGetType(node))
+        assert node_type != cuda_driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMSET, "MoE reset must remain in the compiled compute launch"
         if node_type == cuda_driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
             (params,) = checked(cuda_driver.cuGraphKernelNodeGetParams(node))
             (name,) = checked(cuda_driver.cuFuncGetName(params.func))
             kernel_names.append(name.decode())
     assert sum("cudnn_kernel_frost_sm120_moe" in name for name in kernel_names) == 1, kernel_names
+    assert sum("reset_moe_sched_counter" in name for name in kernel_names) == 1, kernel_names
     for index in [1, 0, 1]:
         x.copy_(encode(x_values if index == 0 else -x_values))
         offsets.copy_(torch.tensor(bounds_cases[index][:-1], dtype=torch.int32, device="cuda"))

@@ -72,6 +72,7 @@ from cutlass._mlir.dialects.nvvm import ScaleVecSize as _ScaleVecSize
 from cuda.bindings import driver as _cuda
 
 from cudnn.gemm.frost.kernel_templates.moe_scheduler import moe_load_sched_word as _moe_load_sched_word
+from cudnn.gemm.frost.kernel_templates.moe_scheduler import reset_moe_sched_counter as _reset_moe_sched_counter
 
 # @@INJECT_TILE_CONSTANTS@@
 
@@ -81,7 +82,7 @@ if a_is_m_major:
 # A TMA tensormap is 128 bytes = 16 int64 qwords. The workspace is laid out as
 # grid_ctas * moe_desc_slots tensormap slots followed by the scheduler counter;
 # this kernel patches no descriptor, so its slot count is zero and the counter
-# sits at the start of the buffer (the compiler carves and zeroes it the same way).
+# sits at the start of the buffer (the compiled host resets it before the GEMM).
 TENSOR_MAP_QWORDS = 16
 moe_desc_slots = 0
 
@@ -1157,6 +1158,8 @@ def _host(
     # tiles off the global counter until the group space is exhausted. No
     # cluster launch on sm120 (CC 12.x has no thread-block clusters).
     grid_shape = (grid_num_clusters, 1, 1)
+    counter_qword = grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS
+    _reset_moe_sched_counter(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],
