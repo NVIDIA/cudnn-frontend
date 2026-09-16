@@ -112,7 +112,8 @@ def call(
         (e.g. :func:`zeros_init`), which is appended as a trailing input and donated to
         that output via ``input_output_aliases``. An adapter restores output order
         because the bridge retains aliased inputs and omits aliased outputs.
-        Initializers require flat positional inputs and a flat output sequence.
+        Initializers require flat positional inputs and a single output descriptor
+        or flat output sequence.
     """
     invoke = partial(
         cutlass_call,
@@ -124,8 +125,13 @@ def call(
     if not initialized_outputs:
         return invoke(fn, output_shape_dtype=output_shape_dtype, input_spec=input_spec, output_spec=output_spec, input_output_aliases=input_output_aliases)
 
+    single_output = hasattr(output_shape_dtype, "shape") and hasattr(output_shape_dtype, "dtype")
+    if single_output:
+        output_shape_dtype = (output_shape_dtype,)
+        if isinstance(output_spec, TensorSpec):
+            output_spec = (output_spec,)
     if not isinstance(output_shape_dtype, (tuple, list)) or any(not hasattr(x, "shape") for x in output_shape_dtype):
-        raise ValueError("initialized_outputs requires a flat output sequence")
+        raise ValueError("initialized_outputs requires a single output descriptor or flat output sequence")
     if any(i < 0 or i >= len(output_shape_dtype) for i in initialized_outputs):
         raise ValueError("initialized output index out of range")
     input_output_aliases = dict(input_output_aliases or {})
@@ -144,21 +150,27 @@ def call(
     output_positions = tuple(buffer_positions[i] for i in range(len(order)) if i not in aliased_indices)
     specs = tuple(output_spec) if output_spec is not None else (None,) * len(order)
 
-    def wrapper(*arrays: Any) -> Any:
-        if any(not hasattr(a, "shape") for a in arrays):
-            raise ValueError("initialized_outputs requires flat array inputs")
-        inits = [init(output_shape_dtype[i]) for i, init in initializers]
+    @lru_cache(maxsize=128)
+    def initialized_call(num_inputs):
         aliases = dict(input_output_aliases)
-        aliases.update({len(arrays) + offset: i for offset, i in enumerate(initialized_indices)})
-        full_input_spec = (tuple(input_spec) if input_spec is not None else (None,) * len(arrays)) + tuple(specs[i] for i in initialized_indices)
-        result = invoke(
-            initialized_output_adapter(fn, len(arrays), output_positions),
+        aliases.update({num_inputs + offset: i for offset, i in enumerate(initialized_indices)})
+        full_input_spec = (tuple(input_spec) if input_spec is not None else (None,) * num_inputs) + tuple(specs[i] for i in initialized_indices)
+        return invoke(
+            initialized_output_adapter(fn, num_inputs, output_positions),
             output_shape_dtype=tuple(output_shape_dtype[i] for i in order),
             input_spec=full_input_spec,
             output_spec=tuple(specs[i] for i in order),
             input_output_aliases={i: result_positions[o] for i, o in aliases.items()},
-        )(*arrays, *inits)
+        )
+
+    def wrapper(*arrays: Any) -> Any:
+        if any(not hasattr(a, "shape") for a in arrays):
+            raise ValueError("initialized_outputs requires flat array inputs")
+        inits = [init(output_shape_dtype[i]) for i, init in initializers]
+        result = initialized_call(len(arrays))(*arrays, *inits)
         restored = [result[i] for i in result_positions]
+        if single_output:
+            return restored[0]
         return tuple(restored) if isinstance(output_shape_dtype, tuple) else restored
 
     return wrapper

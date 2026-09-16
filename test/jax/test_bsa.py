@@ -75,6 +75,24 @@ def test_numerics_and_grad(layout, d, variable, bucket):
         np.testing.assert_allclose(actual.astype(jnp.float32), desired.astype(jnp.float32), atol=3e-2, rtol=3e-2)
 
 
+def test_eager_backward_reuses_compilation():
+    q, k, v, indices, _ = inputs("bshd")
+    o, lse = forward(q, k, v, indices, 2, layout="bshd")
+    do = jnp.ones_like(q)
+    doubled_do = jnp.full_like(q, 2)
+
+    def run(do):
+        return backward(do, q, k, v, o, lse, indices, 2, layout="bshd", bucket_size_blocks=1)
+
+    expected = jax.block_until_ready(run(do))
+    with jax.no_tracing(True):
+        results = [run(gradient) for gradient in (do, doubled_do, do)]
+        jax.block_until_ready(results)
+    for factor, result in zip((1, 2, 1), results):
+        for actual, original in zip(result, expected):
+            np.testing.assert_allclose(np.asarray(actual, dtype=np.float32), np.asarray(original, dtype=np.float32) * factor, atol=3e-2, rtol=3e-2)
+
+
 def test_import_isolation():
     script = """
 import sys

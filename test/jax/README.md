@@ -68,6 +68,3 @@ python -m pytest -s -q \
   fe_api/gemm/test_gemm_amax_jax.py \
   fe_api/gemm/test_gemm_srelu_dsrelu_jax.py
 ```
-
-For JAX/torch/GPU timing comparisons and known overhead findings, see the
-[BSA benchmark](../../benchmark/bsa/README.md). Run it separately: it imports torch.
