@@ -584,3 +584,250 @@ def gated_attention_block_fp8_reference(
     og32 = dequant_e4m3(quant_e4m3(og, scale_o), 1.0 / scale_o).reshape(t, hq * d)  # o was transposed: reshape copies
     wo32 = dequant_e4m3(inp["w_o"], descale_w_o)
     return (og32 @ wo32.t()).to(torch.bfloat16).view(b, s, dm)
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 (E4M3 codes + per-32-block E8M0 scales, cuDNN F8_128x4) -- the shared fake-quant reference
+# ---------------------------------------------------------------------------
+#
+# ONE copy of the MXFP8 recipe the MXFP8 block test, block_perf_table and
+# block_fusion_table all need: the caller-side quantization of ``h`` / ``W_qkvg``
+# into e4m3 codes + PADDED F8_128x4 E8M0 blobs (exactly the contract
+# ``GatedAttentionBlockFwd(quant=MxQuantSpec, sample_h_sf=, sample_w_qkvg_sf=)``
+# takes -- ``kernels.proj_gemm.sf_blob_bytes`` bytes), a per-tensor amax scale
+# for ``W_o`` (PR-B D1), and the fp32 oracle with the block's own quantization
+# points: block-dequant of h / W, Q / K block-quantized ROWWISE along D, V
+# COLUMNWISE along S per (b, h) on the S-padded tensor, per-tensor O and W_o.
+# The block scales are TE / cuDNN semantics via ``test/python/sdpa/mxfp8_quant.py``
+# (E8M0 exponent rounded UP, exact power-of-two dequant) -- the same module the
+# FROST MXFP8 SDPA suites quantize with, so the oracle and the kernels agree on
+# every scale byte.  Neither oracle replicates the MXFP8 SDPA's unit-scale e4m3
+# P, which is why the block tests gate on a cosine (0.99 floor).
+
+MX_BLOCK = 32
+MX_ATOM_ROWS = 128  # rows of one F8_128x4 atom (== the SDPA's Q / KV tile height)
+MX_ATOM_COLS = 4  # 32-element blocks per atom row
+
+
+def _mxfp8_quant():
+    """``test/python/sdpa/mxfp8_quant.py`` -- as ``sdpa.mxfp8_quant`` when ``test/python`` is
+    importable (pytest from there; the SDPA suites' spelling), else loaded BY PATH so a
+    standalone driver (``frost_dev/block_*_table.py``) gets it without touching ``sys.path``."""
+    try:
+        from sdpa import mxfp8_quant as mq
+
+        return mq
+    except ImportError:
+        import importlib.util
+        import os
+
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sdpa", "mxfp8_quant.py")
+        spec = importlib.util.spec_from_file_location("_gated_block_mxfp8_quant", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+
+def mx_sf_padded_dims(rows: int, k: int) -> Tuple[int, int]:
+    """``(rows_pad, blocks_pad)`` of one F8_128x4 scale matrix over ``rows x K``: whole
+    128-row x 4-block atoms.  A deliberately INDEPENDENT mirror of
+    ``kernels.proj_gemm.sf_padded_dims`` (the reference must not import the thing it checks)."""
+    if k % MX_BLOCK:
+        raise ValueError(f"K={k} must be a multiple of the {MX_BLOCK}-element MX block")
+    return -(-rows // MX_ATOM_ROWS) * MX_ATOM_ROWS, -(-(k // MX_BLOCK) // MX_ATOM_COLS) * MX_ATOM_COLS
+
+
+def mx_quantize_rowwise_2d(x2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``[rows, K]`` -> (e4m3 codes ``[rows, K]``, logical E8M0 bytes ``[rows, K/32]``): one scale per
+    32-element block along K (TE ``quantize_blocks`` semantics)."""
+    mq = _mxfp8_quant()
+    rows, k = x2d.shape
+    if k % MX_BLOCK:
+        raise ValueError(f"K={k} must be a multiple of {MX_BLOCK}")
+    codes, e = mq.quantize_blocks(x2d.float().reshape(rows, k // MX_BLOCK, MX_BLOCK), FP8_E4M3)
+    return codes.reshape(rows, k), e.contiguous()
+
+
+def mx_swizzle_sf_rowwise_padded(e: torch.Tensor) -> torch.Tensor:
+    """Logical ``[rows, K/32]`` E8M0 bytes -> the PADDED F8_128x4 blob (flat uint8) the block's
+    ``sample_h_sf`` / ``sample_w_qkvg_sf`` contract takes: rows padded to 128, blocks to 4, pad
+    ``0x00``, then cuDNN's F8_128x4 reorder (``swizzle_sf_rowwise`` == the FROST GEMM suite's
+    ``to_blocked``).  ``numel == kernels.proj_gemm.sf_blob_bytes(rows, K)``."""
+    mq = _mxfp8_quant()
+    rows, cols = e.shape
+    rows_pad, cols_pad = mx_sf_padded_dims(rows, cols * MX_BLOCK)
+    pad = torch.zeros(rows_pad, cols_pad, dtype=torch.uint8, device=e.device)
+    pad[:rows, :cols] = e.to(torch.uint8)
+    return mq.swizzle_sf_rowwise(pad).contiguous().flatten()
+
+
+def mx_unswizzle_sf_rowwise(blob: torch.Tensor, rows: int, k: int) -> torch.Tensor:
+    """The inverse of :func:`mx_swizzle_sf_rowwise_padded`: a PADDED F8_128x4 blob -> the logical
+    ``[rows, K/32]`` E8M0 bytes (pad rows / blocks dropped).
+
+    ``_swizzle_128x4`` views ``[R, C]`` as ``(rt, rg, rr, ct, cc)`` = ``(R/128, 4, 32, C/4, 4)`` and
+    stores it as ``(rt, ct, rr, rg, cc)``; reading the blob back in that order and permuting
+    ``(0, 3, 2, 1, 4)`` restores the logical matrix.  The oracle dequantizes ``h`` / ``W_qkvg``
+    THROUGH this, so it reads exactly the bytes the kernel reads (a wrong caller blob is a
+    wrong oracle too, never a silent agreement)."""
+    rows_pad, cols_pad = mx_sf_padded_dims(rows, k)
+    if blob.numel() != rows_pad * cols_pad:
+        raise ValueError(f"blob has {blob.numel()} bytes, the padded F8_128x4 matrix over {rows} x K={k} is {rows_pad}x{cols_pad}")
+    v = blob.reshape(rows_pad // MX_ATOM_ROWS, cols_pad // MX_ATOM_COLS, 32, 4, MX_ATOM_COLS)  # (rt, ct, rr, rg, cc)
+    e = v.permute(0, 3, 2, 1, 4).reshape(rows_pad, cols_pad)  # (rt, rg, rr, ct, cc)
+    return e[:rows, : k // MX_BLOCK].contiguous()
+
+
+def mx_dequant_rowwise_2d(codes: torch.Tensor, blob: torch.Tensor) -> torch.Tensor:
+    """e4m3 codes ``[rows, K]`` x their PADDED F8_128x4 blob -> fp32 ``[rows, K]`` (exact 2^e scales)."""
+    mq = _mxfp8_quant()
+    rows, k = codes.shape
+    e = mx_unswizzle_sf_rowwise(blob.to(torch.uint8), rows, k)
+    scale = mq.e8m0_to_float(e).repeat_interleave(MX_BLOCK, dim=-1)  # [rows, K]
+    return codes.float() * scale
+
+
+def quantize_block_inputs_mxfp8(inp: dict) -> Tuple[dict, dict]:
+    """``make_inputs`` output -> the same dict with ``h`` / ``w_qkvg`` as e4m3 MXFP8 CODES plus
+    their PADDED F8_128x4 blobs ``h_sf`` / ``w_qkvg_sf`` (the block's ``sample_h_sf`` /
+    ``sample_w_qkvg_sf`` and execute ``h_sf=`` / ``w_qkvg_sf=``), ``w_o`` per-tensor e4m3 (D1),
+    and ``{descale_w_o}`` -- the ``MxQuantSpec`` constructor kwargs (``scale_o`` is the caller's).
+
+    Norm weights, cos/sin stay bf16 (the block's activation dtype).  Built from an EXISTING
+    input dict so a harness can hand the bf16, FP8 and MXFP8 arms the same data."""
+    h = inp["h"]
+    b, s, dm = h.shape
+    h_codes, h_e = mx_quantize_rowwise_2d(h.reshape(b * s, dm))
+    w_codes, w_e = mx_quantize_rowwise_2d(inp["w_qkvg"])
+    s_wo = amax_scale(inp["w_o"])
+    mx = dict(inp)
+    mx["h"] = h_codes.reshape(b, s, dm).contiguous()
+    mx["h_sf"] = mx_swizzle_sf_rowwise_padded(h_e)
+    mx["w_qkvg"] = w_codes.contiguous()
+    mx["w_qkvg_sf"] = mx_swizzle_sf_rowwise_padded(w_e)
+    mx["w_o"] = quant_e4m3(inp["w_o"], s_wo)
+    return mx, dict(descale_w_o=1.0 / s_wo)
+
+
+def make_mxfp8_inputs(geom: RefGeometry, batch: int, seq_len: int, *, device: torch.device | str = "cuda", seed: int = 0) -> Tuple[dict, dict]:
+    """bf16 inputs from :func:`make_inputs`, then :func:`quantize_block_inputs_mxfp8`."""
+    return quantize_block_inputs_mxfp8(make_inputs(geom, batch=batch, seq_len=seq_len, device=device, dtype=torch.bfloat16, seed=seed))
+
+
+def mx_fake_quant_rowwise(x: torch.Tensor) -> torch.Tensor:
+    """Block-quantize ``x[..., D]`` along its LAST dim in 32-element blocks and dequantize (fp32):
+    what the block's rowwise ``quantize_mxfp8`` (Q / K) does to the SDPA's operands."""
+    mq = _mxfp8_quant()
+    *lead, d = x.shape
+    if d % MX_BLOCK:
+        raise ValueError(f"last dim {d} must be a multiple of {MX_BLOCK}")
+    codes, e = mq.quantize_blocks(x.float().reshape(*lead, d // MX_BLOCK, MX_BLOCK), FP8_E4M3)
+    return (codes.float() * mq.e8m0_to_float(e).unsqueeze(-1)).reshape(*lead, d)
+
+
+def mx_fake_quant_v_columnwise(v: torch.Tensor) -> torch.Tensor:
+    """V ``[B, S, H, D]`` block-quantized along S (32-token blocks per (b, h, d), on the tensor
+    S-padded to whole 128-row tiles as the kernel and ``quantize_to_mxfp8`` see it) and
+    dequantized -- the COLUMNWISE quantization the BMM2 operand takes.  Pad rows are zero and
+    never change a block's amax, so the un-padded result is the kernel's exactly."""
+    mq = _mxfp8_quant()
+    b, s, h, d = v.shape
+    s_pad = -(-s // MX_ATOM_ROWS) * MX_ATOM_ROWS
+    x = v.float().permute(0, 2, 3, 1)  # [b, h, d, s]
+    if s_pad != s:
+        x = F.pad(x, (0, s_pad - s))
+    codes, e = mq.quantize_blocks(x.reshape(b, h, d, s_pad // MX_BLOCK, MX_BLOCK), FP8_E4M3)
+    deq = (codes.float() * mq.e8m0_to_float(e).unsqueeze(-1)).reshape(b, h, d, s_pad)[..., :s]
+    return deq.permute(0, 3, 1, 2).contiguous()  # [b, s, h, d]
+
+
+def _mxfp8_gated_o(inp_mx: dict, geom: RefGeometry, *, seq_lens: Optional[torch.Tensor], fused: bool) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
+    """Stages (1)..(5) of the MXFP8 chain in fp32 with the block's rounding points -> the gated O
+    (fp32 under ``fused``, bf16 otherwise -- the value the per-tensor O quantization sees)."""
+    b, s, dm = inp_mx["h"].shape
+    t = b * s
+    hq, hkv, d, r = geom.h_q, geom.h_kv, geom.d_head, geom.rope_dim
+    # (1) block-dequantized codes (E8M0 exact) x block-dequantized weights, fp32 accumulate.
+    h32 = mx_dequant_rowwise_2d(inp_mx["h"].reshape(t, dm), inp_mx["h_sf"])
+    w32 = mx_dequant_rowwise_2d(inp_mx["w_qkvg"], inp_mx["w_qkvg_sf"])
+    proj = h32 @ w32.t()
+    if not fused:
+        proj = proj.to(torch.bfloat16)  # the block-scale GEMM writes a bf16 slab
+    o_q, o_g, o_k, o_v = geom.offsets
+    q = proj[:, o_q : o_q + hq * d].reshape(b, s, hq, d)
+    gate = proj[:, o_g : o_g + hq * d].reshape(b, s, hq, d)
+    if fused:
+        gate = gate.to(torch.bfloat16)  # gate16: the fork's bf16 GATE buffer
+    k = proj[:, o_k : o_k + hkv * d].reshape(b, s, hkv, d)
+    v = proj[:, o_v : o_v + hkv * d].reshape(b, s, hkv, d)
+    # (2)+(3) norm (optional) + RoPE on Q / K -- fp32, one rounding to the slab dtype
+    # (bf16 unfused; the fused fork quantizes straight off fp32, so no rounding there).
+    qn, _ = qk_norm_rope_reference(q, inp_mx["w_q_norm"], inp_mx["cos"], inp_mx["sin"], r, geom.qk_norm_eps, qk_norm=geom.qk_norm)
+    kn, _ = qk_norm_rope_reference(k, inp_mx["w_k_norm"], inp_mx["cos"], inp_mx["sin"], r, geom.qk_norm_eps, qk_norm=geom.qk_norm)
+    # (3q) Q / K rowwise along D, V columnwise along S -- block-quantized then dequantized.
+    q32 = mx_fake_quant_rowwise(qn)
+    k32 = mx_fake_quant_rowwise(kn)
+    v32 = mx_fake_quant_v_columnwise(v)
+    # (4) fp32 SDPA with GQA broadcast on the dequantized MXFP8 operands.
+    rep = hq // hkv
+    qb = q32.transpose(1, 2)  # [b, hq, s, d]
+    kb = k32.transpose(1, 2).repeat_interleave(rep, 1)
+    vb = v32.transpose(1, 2).repeat_interleave(rep, 1)
+    logits = torch.einsum("bhqd,bhkd->bhqk", qb, kb) * geom.scale
+    mask = torch.ones(s, s, dtype=torch.bool, device=logits.device)
+    if geom.is_causal:
+        mask = torch.tril(mask)
+    allowed = mask[None, None]
+    if seq_lens is not None:
+        kv_ok = torch.arange(s, device=logits.device)[None, :] < seq_lens.to(logits.device)[:, None]  # [b, s]
+        allowed = allowed & kv_ok[:, None, None, :]
+    logits = logits.masked_fill(~allowed, float("-inf"))
+    p = torch.softmax(logits, dim=-1)
+    p = torch.nan_to_num(p, nan=0.0)  # fully-masked rows -> O = 0, as the kernel substitutes (SELECT)
+    o = torch.einsum("bhqk,bhkd->bhqd", p, vb).transpose(1, 2)  # [b, s, hq, d]
+    # (5) gate AFTER the dead-row substitution.
+    if fused:
+        og = o.float() * torch.sigmoid(gate.float())  # fp32 O * sigmoid(gate16); ONE e4m3 cast in the caller
+    else:
+        o = o.to(torch.bfloat16)  # the SDPA writes bf16 O
+        og = (o.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)  # the gate kernel writes bf16 O_gated
+    return og, (b, s, dm)
+
+
+def mxfp8_calibrated_scale_o(inp_mx: dict, geom: RefGeometry, *, seq_lens: Optional[torch.Tensor] = None) -> float:
+    """A static per-tensor ``scale_o`` for the UNFUSED MXFP8 block, calibrated on this data through
+    the oracle's own gated O (offline-calibration stand-in; the FULLY FUSED path is pinned to 1.0
+    by PR-B D8 and needs no calibration)."""
+    og, _ = _mxfp8_gated_o(inp_mx, geom, seq_lens=seq_lens, fused=False)
+    return amax_scale(og)
+
+
+def gated_attention_block_mxfp8_reference(
+    inp_mx: dict,
+    geom: RefGeometry,
+    *,
+    descale_w_o: float,
+    scale_o: float,
+    seq_lens: Optional[torch.Tensor] = None,
+    fused: bool = False,
+) -> torch.Tensor:
+    """fp32 chain with the MXFP8 block's exact quantization points -> bf16 ``[B, S, d_model]``.
+
+    ``inp_mx`` is :func:`quantize_block_inputs_mxfp8`'s dict (codes + PADDED F8_128x4 blobs; the
+    oracle dequantizes THROUGH the blobs, so it reads what the kernels read).
+
+    ``fused=False`` mirrors the UNFUSED pipeline: the block-scale GEMM rounds its (already
+    dequantized) accumulator to the bf16 slab, Q / K are normed + rotated from bf16 and
+    block-quantized rowwise, V columnwise, the SDPA writes bf16 O, the gate kernel bf16
+    O_gated, and ``quantize_o`` casts it per-tensor with ``scale_o``.
+
+    ``fused=True`` mirrors the FULLY FUSED pipeline (one rounding per output): the fork norms /
+    rotates the fp32 accumulator and block-quantizes ONCE (GATE rounded to bf16 -- ``gate16`` IS
+    a bf16 buffer), the gated MXFP8 SDPA multiplies its fp32 O by ``sigmoid(gate16)`` and casts
+    to e4m3 ONCE, UNSCALED -- pass ``scale_o=1.0`` (D8).  Neither variant replicates the MXFP8
+    SDPA's unit-scale e4m3 P, which is why the block tests gate on a cosine."""
+    og, (b, s, dm) = _mxfp8_gated_o(inp_mx, geom, seq_lens=seq_lens, fused=fused)
+    hq, d = geom.h_q, geom.d_head
+    og32 = dequant_e4m3(quant_e4m3(og, scale_o), 1.0 / scale_o).reshape(b * s, hq * d)  # o was transposed: reshape copies
+    wo32 = dequant_e4m3(inp_mx["w_o"], descale_w_o)
+    return (og32 @ wo32.t()).to(torch.bfloat16).view(b, s, dm)

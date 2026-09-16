@@ -89,6 +89,13 @@ import torch
 _FROST_GEMM_PLAN = "frost_gemm"
 
 
+class _NoFrostPlan(RuntimeError):
+    """``frost_gemm`` is not in the graph's ranked plan list (opt-in flag unset, arch outside
+    the template family, or the engine declined the shape).  A ``RuntimeError`` so a dense
+    caller sees it as before; a DISTINCT type so the block-scale fallback can catch exactly
+    this and the typed backend decline, and let a genuine backend failure propagate."""
+
+
 def _frost_plan_index(names) -> Optional[int]:
     """Index of the top-ranked FROST GEMM plan in ``names``, or None.
 
@@ -581,6 +588,24 @@ class ProjGemmPlan:
     alpha: Any = None
     tile_config_name: Optional[str] = None  # the JIT config that actually runs, or "heuristic (graph engine)"
     mma_tile_k_bytes: Optional[int] = None  # 32 = the K=32 MMA form (half the Rubin 2xFP8 rate); 64 = K=64
+    # Block-scale (MXFP8) additions (append-only). `sfa` / `sfb` are the graph's
+    # F8_128x4 scale-factor tensors when the plan was built with `block_scale=True`,
+    # else None; `route` records which path serves the launch:
+    #   "graph+jit"  the backend admitted the graph, `frost_gemm` is pinned in its
+    #                ranked list (workspace / plan-name honesty) AND the JIT at the
+    #                resolved tile config is what `run_proj_gemm` launches;
+    #   "jit-only"   the backend declined the graph (a typed cudnnGraphNotSupportedError,
+    #                or no `frost_gemm` in its ranked list -- `_NoFrostPlan`); the JIT
+    #                never touches the backend, so the kernel still runs.  Any OTHER
+    #                backend error propagates (it is a bug: e.g. the unpadded F8_128x4
+    #                declaration this driver used to make, which read as "declined" until
+    #                the catch was narrowed);
+    #   "graph"      dense, no forced tile: the graph engine's own plan runs.
+    block_scale: bool = False
+    sfa: Any = None
+    sfb: Any = None
+    sf_dtype: Any = None  # cudnn.data_type of the scale factors (FP8_E8M0)
+    route: Optional[str] = None
 
     @property
     def has_alpha(self) -> bool:
@@ -588,6 +613,9 @@ class ProjGemmPlan:
 
     @property
     def workspace_bytes(self) -> int:
+        if self.route == "jit-only":
+            # No backend plan exists to ask; the JIT artifact knows its own (split-K only).
+            return max(int(getattr(self.jit, "workspace_bytes", 0) or 0), 1)
         return max(int(self.graph.get_workspace_size()), 1)
 
     def flops(self) -> int:
@@ -638,6 +666,9 @@ def build_proj_gemm(
     tile_config: Optional[str] = "auto",
     out_dtype: Optional[torch.dtype] = None,
     alpha: bool = False,
+    block_scale: bool = False,
+    sf_dtype: Any = None,
+    mma_tile_k_bytes: Optional[int] = None,
 ) -> ProjGemmPlan:
     """Compile one projection GEMM and pin the FROST plan.
 
@@ -660,8 +691,52 @@ def build_proj_gemm(
     the ``preferred_mma_tile_k_bytes`` default for non-block-scale graphs) --
     half the Rubin 2xFP8 rate -- which is why the plan records the resolved tile
     config and its ``mma_tile_k_bytes`` for the perf table to state.
+
+    **Block-scale (MXFP8) inputs.** ``block_scale=True`` (e4m3 ``dtype`` required,
+    ``alpha`` must be False -- the E8M0 dequant is exact and happens IN the MMA,
+    so there is nothing to descale -- and ``K % 32 == 0``) declares two
+    per-32-block E8M0 scale-factor tensors in cuDNN's ``F8_128x4`` order --
+    declared at the PADDED atom extents ``(1, ceil(rows/128)*128, ceil(K/32/4)*4)``
+    (:func:`sf_padded_dims`), which the backend requires for that reorder -- and
+    routes A / B through ``block_scale_dequantize`` before the matmul, as
+    ``test/python/gemm/frost/test_block_scale_matmul.py`` builds it.  The
+    caller binds the same PADDED blobs at execute (``run_proj_gemm(..., sf_a=, sf_w=)``).
+    ``sf_dtype`` defaults to ``cudnn.data_type.FP8_E8M0`` (spelled ``None`` here so
+    ``cudnn`` stays a lazy import).  The graph goes to the backend under
+    ``[heur_mode.A, heur_mode.FALLBACK]``; if the backend declines it (a typed
+    ``cudnnGraphNotSupportedError``, or no ``frost_gemm`` in the ranked list) the
+    plan takes the JIT-ONLY route -- ``jit_from_cudnn_graph`` never touches the
+    backend -- and says so in ``plan.route``.  Under ``pin_frost`` the block-scale
+    kernel is ALWAYS the JIT at the resolved tile config (the forced 256-wide
+    tile when 256 divides N, else the auto pick), so ``plan.tile_config_name`` /
+    ``plan.mma_tile_k_bytes`` name what runs.
+
+    ``mma_tile_k_bytes`` (block-scale only; 32 or 64) re-targets the resolved
+    config's MMA-instruction K width through ``tile_config.as_mma_tile_k`` --
+    PR-B decision D15: the width is A/B'd, never assumed.  ``None`` keeps the
+    config's own width (the named 256-wide config is the K=32 form).
     """
     import cudnn
+
+    if block_scale:
+        if not _is_fp8(dtype):
+            raise ValueError(f"{label}: block_scale=True needs e4m3 codes (dtype=torch.float8_e4m3fn), got {dtype}")
+        if alpha:
+            raise ValueError(f"{label}: block_scale=True carries its descale in the per-block E8M0 scale factors; alpha must be False")
+        if k % 32:
+            raise ValueError(f"{label}: block_scale=True needs K % 32 == 0 (one E8M0 scale per 32-element block), got K={k}")
+        if mma_tile_k_bytes not in (None, 32, 64):
+            raise ValueError(f"{label}: mma_tile_k_bytes must be None, 32 or 64 (the tcgen05 MMA K widths), got {mma_tile_k_bytes!r}")
+    elif mma_tile_k_bytes is not None:
+        raise ValueError(f"{label}: mma_tile_k_bytes is a block-scale knob (D15); the dense path keeps the engine's preferred width")
+    if sf_dtype is None:
+        sf_dtype = cudnn.data_type.FP8_E8M0
+    if block_scale and sf_dtype != cudnn.data_type.FP8_E8M0:
+        raise ValueError(f"{label}: the MXFP8 projection takes E8M0 scale factors (sf_dtype=cudnn.data_type.FP8_E8M0), got {sf_dtype}")
+    # The op-recording hook the JIT-only route reads the graph through is installed by this
+    # import; the graph engine imports it too, but a backend that declines the graph early
+    # would otherwise leave the JIT nothing to analyze.
+    import cudnn.gemm.frost  # noqa: F401
 
     for lbl, v in (("m", m), ("k", k), ("n", n)):
         if v <= 0:
@@ -684,7 +759,29 @@ def build_proj_gemm(
     # B is the weight as a checkpoint stores it -- [N, K] row-major -- declared
     # transposed. stride[1] == 1 is what makes it the K-contiguous operand.
     b = g.tensor(name="B", dim=[1, k, n], stride=[k * n, 1, k])
-    mm = g.matmul(A=a, B=b, name=label)
+    sfa_t = sfb_t = None
+    if block_scale:
+        # One E8M0 scale per 32-element K block, in cuDNN's F8_128x4 (128 rows x 4 blocks
+        # = 512 B atoms, row-major) order: SFA over A's rows, SFB over B's N (the weight's
+        # rows).  Declared at the PADDED atom extents -- rows to 128, K-blocks to 4 -- which
+        # is (i) what the backend's block_scale_dequantize finalize REQUIRES for F8_128x4
+        # ("the scale tensor ... must be (1, 1024, 128) but found (1, 1000, 128)",
+        # CUDNN_STATUS_BAD_PARAM_SHAPE_MISMATCH -- a bare RuntimeError, not a typed decline;
+        # measured 2026-09-15 on the dev node at M=1000, K=544 (sf_k 17 -> 20) and N=392), and
+        # (ii) exactly the padded blob `run_proj_gemm` binds (`sf_blob_bytes`).  The FROST JIT
+        # never reads these dims (the analyzer takes the SF dtype / reorder; the lowering
+        # derives ceil(K/32/4) x ceil(rows/128) from A / B), so the declaration is inert there.
+        # test_block_scale_matmul.py:81-112 declares the UNPADDED [1, M, K/32] -- fine for its
+        # JIT-only path, rejected by the backend the moment M % 128 != 0.
+        m_pad, sf_k = sf_padded_dims(m, k)
+        n_pad, _ = sf_padded_dims(n, k)
+        sfa_t = g.tensor(name="SFA", dim=[1, m_pad, sf_k], stride=[m_pad * sf_k, sf_k, 1], data_type=sf_dtype, reordering_type=cudnn.tensor_reordering.F8_128x4)
+        sfb_t = g.tensor(name="SFB", dim=[1, sf_k, n_pad], stride=[sf_k * n_pad, 1, sf_k], data_type=sf_dtype, reordering_type=cudnn.tensor_reordering.F8_128x4)
+        ad = g.block_scale_dequantize(input=a, descale=sfa_t, block_size=[1, 32])
+        bd = g.block_scale_dequantize(input=b, descale=sfb_t, block_size=[32, 1])
+        mm = g.matmul(A=ad, B=bd, name=label)
+    else:
+        mm = g.matmul(A=a, B=b, name=label)
     alpha_t = None
     if alpha:
         # dim [1,1,1] == graph_analyzer "scalar" broadcast mode -> fused epilogue multiply.
@@ -700,49 +797,92 @@ def build_proj_gemm(
         c = mm
     c.set_output(True).set_data_type(out_dt)
 
-    g.validate()
-    g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    if pin_frost:
-        # Plan names carry the plan's knobs since the shared knob vocabulary
-        # landed ("frost_gemm[CTA_GROUP=2, MMA_TILE_K=32, ...]"), so the pin
-        # matches the engine NAME (exact, or followed by its knob bracket) and
-        # takes the top-ranked FROST configuration; deselect_engines already
-        # matches by substring (the engine name is the user-visible API).
-        frost_idx = _frost_plan_index(names)
-        if frost_idx is None:
-            raise RuntimeError(f"{label}: the {_FROST_GEMM_PLAN!r} plan is not in the ranked list {names}. {_why_no_frost_plan()}")
-        g.select_plan(frost_idx)
-    else:
-        g.deselect_engines([_FROST_GEMM_PLAN])
-    g.check_support()
-    g.build_plans()
-    plan = ProjGemmPlan(graph=g, a=a, b=b, c=c, m=m, k=k, n=n, label=label, dtype=dtype, out_dtype=out_dtype, alpha=alpha_t)
+    plan = ProjGemmPlan(
+        graph=g, a=a, b=b, c=c, m=m, k=k, n=n, label=label, dtype=dtype, out_dtype=out_dtype, alpha=alpha_t, block_scale=block_scale, sfa=sfa_t, sfb=sfb_t
+    )
+    plan.sf_dtype = sf_dtype if block_scale else None
     plan.tile_config_name = "heuristic (graph engine)"
+    plan.route = "graph"
+
+    def _backend_pin() -> None:
+        """validate -> build -> rank -> pin (or deselect) -> check_support -> build_plans on the backend."""
+        g.validate()
+        g.build_operation_graph()
+        # The block-scale graph is ranked under [A, FALLBACK] (as the FROST GEMM suite's own
+        # `_pin_frost` does); the dense graph keeps the A-only list it always had.
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK] if block_scale else [cudnn.heur_mode.A])
+        names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+        if pin_frost:
+            # Plan names carry the plan's knobs since the shared knob vocabulary
+            # landed ("frost_gemm[CTA_GROUP=2, MMA_TILE_K=32, ...]"), so the pin
+            # matches the engine NAME (exact, or followed by its knob bracket) and
+            # takes the top-ranked FROST configuration; deselect_engines already
+            # matches by substring (the engine name is the user-visible API).
+            frost_idx = _frost_plan_index(names)
+            if frost_idx is None:
+                raise _NoFrostPlan(f"{label}: the {_FROST_GEMM_PLAN!r} plan is not in the ranked list {names}. {_why_no_frost_plan()}")
+            g.select_plan(frost_idx)
+        else:
+            g.deselect_engines([_FROST_GEMM_PLAN])
+        g.check_support()
+        g.build_plans()
+
+    if block_scale and pin_frost:
+        # A backend that does not admit the e4m3 + E8M0 two-dequant graph is a typed decline
+        # (cudnnGraphNotSupportedError), and "no frost_gemm in the list" is the `_NoFrostPlan`
+        # above; both leave the JIT-only route, which never asks the backend.  Anything else --
+        # a backend failure inside check_support / build_plans, a bare RuntimeError -- is a
+        # bug and PROPAGATES (engine contract rule 2); the catch is deliberately this narrow.
+        # WARNING, not INFO: on this route the plan-name pin is absent and `workspace_bytes`
+        # is the JIT artifact's, which a caller reading the perf table should see without -v.
+        try:
+            _backend_pin()
+        except (cudnn.cudnnGraphNotSupportedError, _NoFrostPlan) as exc:
+            plan.route = "jit-only"
+            _LOG.warning("%s: backend declined the block-scale graph (%s: %s); taking the JIT-only route", label, type(exc).__name__, str(exc)[:200])
+    else:
+        _backend_pin()
 
     # Forced tile: JIT the SAME graph at a named config. The graph engine picks
     # its config internally with no override hook (graph_analyzer.py:571-574),
     # so taking a specific tile means going through the JIT entry point. The
     # graph is still built above -- it is what gets analyzed, and it keeps
-    # `workspace_bytes` and the plan-name pin honest.
+    # `workspace_bytes` and the plan-name pin honest.  A block-scale plan under
+    # `pin_frost` ALWAYS takes the JIT (forced name, else the auto pick) so one
+    # binding path (`bd.sfa_operands` / `bd.sfb_operands`) serves every shape.
     name = _forced_tile_config(n) if tile_config == "auto" else tile_config
-    if name and pin_frost:
+    if pin_frost and (name or block_scale):
         from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
-        from cudnn.gemm.frost.tile_config import by_name
+        from cudnn.gemm.frost.tile_config import as_mma_tile_k, by_name
 
+        cfg = by_name(name) if name else _auto_tile_config(g)
+        if mma_tile_k_bytes is not None:
+            cfg = as_mma_tile_k(cfg, mma_tile_k_bytes)
+            if cfg.mma_tile_k_bytes != mma_tile_k_bytes:
+                raise ValueError(f"{label}: config {cfg.name!r} cannot issue mma_tile_k_bytes={mma_tile_k_bytes} (it stays at {cfg.mma_tile_k_bytes})")
         try:
-            compiled = jit_from_cudnn_graph(g, config=by_name(name))
+            compiled = jit_from_cudnn_graph(g, config=cfg)
         except Exception as exc:  # a config this shape cannot take is a FALLBACK, not a failure
-            if tile_config != "auto":
-                raise
+            if tile_config != "auto" or block_scale or mma_tile_k_bytes is not None:
+                raise  # explicit requests (and the block-scale path, which has no graph fallback) surface their reason
             compiled = None
             _LOG.debug("%s: forced tile %s rejected (%s); falling back to the heuristic", label, name, type(exc).__name__)
         if compiled is not None:
             plan.jit, plan.jit_binding = compiled, compiled.binding
             plan.tile_config_name = getattr(compiled.config, "name", name)
             plan.mma_tile_k_bytes = getattr(compiled.config, "mma_tile_k_bytes", None)
+            if plan.route == "graph":
+                plan.route = "graph+jit"
     return plan
+
+
+def _auto_tile_config(g):
+    """The tile config the FROST graph engine's automatic strategy would pick for ``g``
+    (``select_config`` + ``preferred_strategy``), for a JIT with no forced name."""
+    from cudnn.gemm.frost.compiler import _graph_dynamic_shapes, plan_config
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    return plan_config(analyze(g), dynamic_shapes=_graph_dynamic_shapes(g))
 
 
 def run_proj_gemm(
@@ -753,6 +893,8 @@ def run_proj_gemm(
     workspace: torch.Tensor,
     handle: Optional[Any] = None,
     alpha: Optional[torch.Tensor] = None,
+    sf_a: Optional[torch.Tensor] = None,
+    sf_w: Optional[torch.Tensor] = None,
     *,
     stream=None,
 ) -> None:
@@ -779,7 +921,25 @@ def run_proj_gemm(
     agree -- a handle bound to another stream would run this GEMM off the stream
     the caller ordered its other work on, which is the race this guards, so it
     is a ``ValueError`` rather than a silent pick.
+
+    ``sf_a`` / ``sf_w`` (block-scale plans only, both required): the F8_128x4
+    E8M0 scale-factor blobs of ``a`` (over its M rows) and ``w`` (over its N
+    rows), uint8 or ``float8_e8m0fnu``, contiguous, PADDED to whole atoms --
+    ``ceil(rows/128)*128 * ceil(K/32/4)*4`` bytes, exactly what
+    ``swizzle_sf_rowwise`` / ``to_blocked`` of the padded logical ``[rows, K/32]``
+    scale matrix produces.  They are bound as rank-3 ``(1, rows_pad, 4*k4)``
+    VIEWS (a uint8 blob is re-viewed as e8m0, no copy) -- the kernel reads a base
+    pointer and rebuilds the layout from the problem size.
+
+    Both routes take the SAME variant pack keyed by the plan's graph tensors
+    (``plan.a`` / ``plan.b`` / ``plan.c`` / ``plan.sfa`` / ``plan.sfb`` / ``plan.alpha``):
+    the JIT resolves by tensor identity as the graph does, and graph tensors are
+    invariant under a ``swap_ab`` tile config (which swaps the binding's LISTS).
     """
+    if plan.block_scale:
+        sf_a3, sf_w3 = _sf_view(plan, sf_a, "sf_a", plan.m), _sf_view(plan, sf_w, "sf_w", plan.n)
+    elif sf_a is not None or sf_w is not None:
+        raise ValueError(f"{plan.label}: this plan has no block-scale dequant (built with block_scale=False); refusing to drop the scale factors silently")
     # `alpha`: the per-tensor descale for an fp8 plan built with alpha=True --
     # a 1-element fp32 CUDA tensor, bound as the [1,1,1] scalar aux (a VIEW).
     if plan.has_alpha:
@@ -804,24 +964,81 @@ def run_proj_gemm(
     elif stream is None:
         stream = torch.cuda.current_stream(out.device).cuda_stream
     stream = int(stream)
-    if plan.jit is not None:
-        bd = plan.jit_binding
-        vp = {bd.a_operands[0]: _rank3(a, "a"), bd.b_operands[0]: _rank3(w, "w"), bd.outputs[0]: _rank3(out, "out")}
-        if plan.has_alpha:
-            # GemmBinding.aux is in FusionChain.aux_tensors order; alpha is the only aux here.
-            if len(bd.aux) != 1:
-                raise RuntimeError(f"{plan.label}: expected exactly one aux operand (alpha) in the JIT binding, found {len(bd.aux)}")
-            vp[bd.aux[0]] = alpha3
-        plan.jit(vp, stream=stream)
-        return
+    # ONE variant pack, keyed by the GRAPH tensors, for both routes.  The JIT resolves keys
+    # by tensor identity too (`resolve_variant_pack`), and the graph tensors are the
+    # swap-INVARIANT spelling: `jit_from_cudnn_graph` applies `swap_ab_binding` under a
+    # `swap_ab` tile config, which trades the binding's a/b (and sfa/sfb) LISTS while
+    # keeping the tensor objects -- so keying by `binding.a_operands[0]` would hand A's
+    # buffer to B under any `_swapAB` config a caller passes as `tile_config=`.
     vp = {plan.a: _rank3(a, "a"), plan.b: _rank3(w, "w"), plan.c: _rank3(out, "out")}
+    if plan.block_scale:
+        vp[plan.sfa] = sf_a3
+        vp[plan.sfb] = sf_w3
     if plan.has_alpha:
         vp[plan.alpha] = alpha3
+    if plan.jit is not None:
+        plan.jit(vp, stream=stream)
+        return
+    if plan.route == "jit-only":
+        raise RuntimeError(f"{plan.label}: the backend declined this graph (route=jit-only) and no JIT artifact was built -- nothing can launch it")
     # The graph route names its stream through the handle: the plan's engine
     # reads `ExecutionContext.stream` off it (`_pygraph.execute` -> `cudnn.get_stream`).
     if handle is None:
         handle = handle_for_stream(out.device, stream)
     plan.graph.execute(vp, workspace, handle)
+
+
+_E8M0 = getattr(torch, "float8_e8m0fnu", None)
+
+
+def sf_padded_dims(rows: int, k: int) -> tuple[int, int]:
+    """``(rows_pad, sf_k_pad)`` of one F8_128x4 scale-factor tensor over ``rows`` rows and ``k``
+    contraction elements at block 32: whole 128-row x 4-block (512 B) atoms, i.e.
+    ``(ceil(rows/128)*128, ceil(k/32/4)*4)``.  ONE source for the graph declaration
+    (``build_proj_gemm``), the blob size (``sf_blob_bytes``) and the bound view (``_sf_view``):
+    the backend rejects an unpadded F8_128x4 declaration outright (``CUDNN_STATUS_BAD_PARAM_SHAPE_MISMATCH``),
+    and the JIT refuses a smaller blob (``compiler._lower``: ``count >= 512 * k4 * ceil(rows/128)``)."""
+    if rows <= 0:
+        raise ValueError(f"rows must be > 0, got {rows}")
+    if k <= 0 or k % 32:
+        raise ValueError(f"K={k} is not a positive multiple of the 32-element block")
+    return -(-rows // 128) * 128, -(-(k // 32) // 4) * 4
+
+
+def sf_blob_bytes(rows: int, k: int) -> int:
+    """Bytes of one F8_128x4 scale-factor blob = ``rows_pad * sf_k_pad`` of :func:`sf_padded_dims`
+    (one E8M0 byte per scale, pad rows / pad blocks ``0x00``)."""
+    rows_pad, sf_k_pad = sf_padded_dims(rows, k)
+    return rows_pad * sf_k_pad
+
+
+def _sf_view(plan: ProjGemmPlan, sf: Optional[torch.Tensor], name: str, rows: int) -> torch.Tensor:
+    """The padded F8_128x4 blob as the rank-3 e8m0 view the kernel binds -- checked, never copied."""
+    if sf is None:
+        raise ValueError(
+            f"{plan.label}: this plan was built with block_scale=True; pass {name}= (the F8_128x4 E8M0 scale-factor blob). No silent 1.0 (Rule 1)."
+        )
+    return _sf_view_of(sf, name, rows, plan.k, plan.label)
+
+
+def _sf_view_of(sf: torch.Tensor, name: str, rows: int, k: int, label: str) -> torch.Tensor:
+    """``_sf_view`` without the plan: the same checks and the same ``(1, rows_pad, 4*k4)`` e8m0 view,
+    shared by the unfused block-scale driver and the fused MXFP8 runner."""
+    if sf is None:
+        raise ValueError(f"{label}: pass {name}= (the F8_128x4 E8M0 scale-factor blob of the operand). No silent 1.0 (Rule 1).")
+    if sf.dtype not in (torch.uint8, _E8M0):
+        raise ValueError(f"{label}: {name} must be uint8 or float8_e8m0fnu (E8M0 bytes), got {sf.dtype}")
+    if not sf.is_cuda or not sf.is_contiguous() or sf.data_ptr() % 16:
+        raise ValueError(f"{label}: {name} must be a contiguous, 16-B-aligned CUDA tensor (TMA-fed)")
+    need = sf_blob_bytes(rows, k)
+    if sf.numel() != need:
+        raise ValueError(
+            f"{label}: {name} has {sf.numel()} bytes; the F8_128x4 blob over {rows} rows x K={k} is "
+            f"{need} = ceil({rows}/128)*128 * ceil({k // 32}/4)*4 (whole 512-B atoms, pad rows/blocks 0x00)"
+        )
+    rows_pad, sf_k_pad = sf_padded_dims(rows, k)
+    v = sf.view(_E8M0) if (sf.dtype == torch.uint8 and _E8M0 is not None) else sf  # a re-view, no copy
+    return v.view(1, rows_pad, sf_k_pad)  # == the graph's declared SFA / SFB dims
 
 
 def _rank3(t: torch.Tensor, name: str) -> torch.Tensor:
