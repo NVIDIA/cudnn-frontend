@@ -34,7 +34,7 @@ from cudnn.gated_attention_block.kernels.qk_norm_rope import (
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from reference import qk_norm_rope_reference  # noqa: E402
+from gated_block_reference import qk_norm_rope_reference  # noqa: E402
 
 pytestmark = pytest.mark.L0
 

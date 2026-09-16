@@ -42,7 +42,7 @@ from cudnn.gated_attention_block.api import QuantSpec  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from reference import (  # noqa: E402
+from gated_block_reference import (  # noqa: E402
     RefGeometry,
     amax_scale,
     dequant_e4m3,

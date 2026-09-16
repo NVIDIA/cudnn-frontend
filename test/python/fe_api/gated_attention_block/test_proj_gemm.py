@@ -190,7 +190,7 @@ import sys  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from reference import apply_partial_rope, build_rope_tables, qk_norm_rope_reference  # noqa: E402
+from gated_block_reference import apply_partial_rope, build_rope_tables, qk_norm_rope_reference  # noqa: E402
 
 _SM107 = (10, 7)
 requires_rubin = pytest.mark.skipif(
