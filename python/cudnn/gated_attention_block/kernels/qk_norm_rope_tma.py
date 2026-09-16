@@ -901,7 +901,6 @@ def compile_qk_norm_rope_tma(
         int(refill_pos),
         bool(fused_store_wait),
         current_device(),
-        int(stages_o),
         bool(apply_norm),
     )
     if key not in compiled_cache:
