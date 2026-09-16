@@ -66,10 +66,10 @@ Warp assignments (16 warps = 512 threads):
   warps 0-7     : compute group 0 - Gate prefix scan, shared operands, left key halves of both states (two ping-pong
                                     groups)
   warps 8-11    : compute group 1 - seeds, right key halves, Y / U inputs of both chains, H / M stores
-  warp  12      : register-MMA warp - KK and T_inv of the even local chunks
+  warp  12      : register-MMA warp - KK and T_inv of the even cumulative chunks
   warp  13      : MMA warp       - every tcgen05 GEMM of both chains; TMEM lifecycle
   warp  14      : TMA load warp  - loads K, V, Gate; stages Beta
-  warp  15      : register-MMA twin - KK and T_inv of the odd local chunks
+  warp  15      : register-MMA twin - KK and T_inv of the odd cumulative chunks
 """
 
 from dataclasses import dataclass
@@ -291,7 +291,9 @@ def super_mma_warp(
             cfg, tile_idx, mWorkItems
         )
         num_chunks_tile = write_end - compute_start
-        for local_chunk_idx in cutlass.range(chunk_parity, num_chunks_tile, 2, unroll=1):
+        # Keep the same ring parity across tasks; an odd task must not skip a barrier generation.
+        first_chunk = chunk_parity ^ (cum_chunk_base % 2)
+        for local_chunk_idx in cutlass.range(first_chunk, num_chunks_tile, 2, unroll=1):
             cum_chunk = cum_chunk_base + local_chunk_idx
             chunk_count = cutlass.Uint32(cum_chunk)
             decay_stage = cutlass.Int32(chunk_count % cfg.smem_decay_stages)
