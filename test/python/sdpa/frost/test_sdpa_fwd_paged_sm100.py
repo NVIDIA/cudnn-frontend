@@ -1086,9 +1086,11 @@ def _gather_pages_fp8(pool, block_table, lens, hnd, P, s_max):
     return out.to(pool.dtype)
 
 
-def _ref_fp8(q8, k_pool, v_pool, block_table, seq_lens, hnd, scale, dq, dk, dv, in_key, s_q, s_max):
+def _ref_fp8(q8, k_pool, v_pool, block_table, seq_lens, hnd, scale, dq, dk, dv, in_key, s_q, s_max, *, diag_align=None, left_bound=None, right_bound=None):
     """q8 [B, s_q, H, D] fp8 (BSHD); pools in storage layout.  Returns (O [B, H, s_q, D_v]
-    fp32, LSE [B, H, s_q] natural log) from sdpa.fp8_ref.compute_ref in fp64."""
+    fp32, LSE [B, H, s_q] natural log) from sdpa.fp8_ref.compute_ref in fp64.  The band
+    (``left_bound`` / ``right_bound``) and ``diag_align`` are the graph's own spelling;
+    bottom-right anchors each batch's diagonal at its ``seq_lens`` entry."""
     from sdpa.fp8_ref import compute_ref
 
     B = q8.shape[0]
@@ -1110,6 +1112,9 @@ def _ref_fp8(q8, k_pool, v_pool, block_table, seq_lens, hnd, scale, dq, dk, dv, 
         torch_itype=_FP8[in_key],
         torch_otype=torch.float16,
         padding=(torch.full((B,), s_q, dtype=torch.int32, device=q8.device), seq_lens),
+        left_bound=left_bound,
+        right_bound=right_bound,
+        diag_align=diag_align,
         rescale_threshold=_FP8_RESCALE_THRESHOLD_LOG2,
         dtype=torch.float64,
         quantize_o=False,
@@ -1130,7 +1135,28 @@ def _check_fp8_o(out, o_ref, out_dt, in_key):
     assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f} ({in_key} -> {out_dt})"
 
 
-def _run_graph_fp8(B, H, KH, d, P, max_pages, lens, hnd, *, in_key="e4m3", out_dt=torch.float16, stats=True, s_q=1, max_seq_len=None, want_split=None):
+def _run_graph_fp8(
+    B,
+    H,
+    KH,
+    d,
+    P,
+    max_pages,
+    lens,
+    hnd,
+    *,
+    in_key="e4m3",
+    out_dt=torch.float16,
+    stats=True,
+    s_q=1,
+    max_seq_len=None,
+    want_split=None,
+    causal=None,
+    window_left=None,
+):
+    """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
+    with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
+    Both are the sdpa_fp8 band spelling FlashInfer's MTP / SWA decode would use."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
@@ -1138,6 +1164,13 @@ def _run_graph_fp8(B, H, KH, d, P, max_pages, lens, hnd, *, in_key="e4m3", out_d
     dev = "cuda"
     scale = 1.0 / math.sqrt(d)
     k_pool, v_pool, k_c, v_c, bt, dk, dv = _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens)
+    mask_kw = {}
+    right_bound = 0 if causal is not None else None
+    diag_align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal == "bottom_right" else cudnn.diagonal_alignment.TOP_LEFT
+    if causal is not None:
+        mask_kw.update(right_bound=right_bound, diagonal_alignment=diag_align)
+    if window_left is not None:
+        mask_kw.update(left_bound=window_left)
     q8, dq = _fp8_quant(torch.randn(B, s_q, H, d, device=dev) * 0.5, in_key)
     q_gpu = q8.transpose(1, 2)  # BSHD storage, BHSD logical
     o_gpu = torch.empty(B, s_q, H, d, device=dev, dtype=out_dt).transpose(1, 2)
@@ -1176,6 +1209,7 @@ def _run_graph_fp8(B, H, KH, d, P, max_pages, lens, hnd, *, in_key="e4m3", out_d
         paged_attention_k_table=tk,
         paged_attention_v_table=tv,
         paged_attention_max_seq_len_kv=max_seq_len if max_seq_len is not None else s_max,
+        **mask_kw,
     )
     o.set_output(True).set_dim(list(o_gpu.shape)).set_stride(list(o_gpu.stride())).set_data_type(_fp8_cudnn_dtype(out_dt))
     lse = None
@@ -1225,13 +1259,36 @@ def _run_graph_fp8(B, H, KH, d, P, max_pages, lens, hnd, *, in_key="e4m3", out_d
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
 
-    ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt.view(B, max_pages), seq_lens, hnd, scale, dq, dk, dv, in_key, s_q, s_max)
+    ref_o, ref_lse = _ref_fp8(
+        q8,
+        k_pool,
+        v_pool,
+        bt.view(B, max_pages),
+        seq_lens,
+        hnd,
+        scale,
+        dq,
+        dk,
+        dv,
+        in_key,
+        s_q,
+        s_max,
+        diag_align=diag_align,
+        left_bound=window_left,
+        right_bound=right_bound,
+    )
     out = o_gpu.float()
     assert not torch.isnan(out).any(), "NaN in O (a dead page was dereferenced, or a padded row was not masked)"
     _check_fp8_o(out, ref_o, out_dt, in_key)
     live = seq_lens > 0
     if (~live).any():
         assert out[~live].abs().max().item() == 0.0, "empty sequence must write O := 0"
+    # A live sequence whose band leaves a q row without any key (bottom-right with
+    # seq_len_kv < s_q, or a window past the sequence start) is the reference's -inf
+    # row: the kernel must write O := 0 there, not the unmasked row.
+    keyless = torch.isinf(ref_lse) & live.view(B, 1, 1)
+    if keyless.any():
+        assert out[keyless].abs().max().item() == 0.0, "a q row with no unmasked key must write O := 0"
     # Amax_O is produced in-kernel (atomicMax over the pre-cast fp32 values; the
     # recombined O's under a split), so it matches the fp32 reference for every O dtype.
     assert abs(amax_o.item() - ref_o.abs().max().item()) <= 0.03, f"amax_o {amax_o.item():.4f} vs ref {ref_o.abs().max().item():.4f}"
@@ -1285,13 +1342,40 @@ def test_paged_graph_fp8_prefill_shaped_s_q():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("align", ["top_left", "bottom_right"])
+def test_paged_graph_fp8_causal_s_q(align):
+    """MTP-shaped S_q=4 over FP8 pools under a causal upper bound.  Bottom-right anchors
+    each batch's diagonal at its own KV length (the speculative-decode spelling): the
+    sequences shorter than S_q (0, 1) leave whole q rows without a key (O := 0,
+    LSE := -inf), 17 and 130 end mid-page / one row into a tile, 4065 fills the last
+    page of the table.  Top-left is the paged-prefill spelling (row i sees keys <= i).
+    GQA 16:2 (PackGQA), HND pools, page 32, Stats out."""
+    _run_graph_fp8(6, 16, 2, D, 32, 128, [0, 1, 17, 130, 1000, 4065], hnd=True, s_q=4, causal=align, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [1, 8], ids=["decode", "mtp"])
+def test_paged_graph_fp8_sliding_window(s_q):
+    """Left sliding window (W=200) with bottom-right causal over FP8 pools -- the
+    SWA-decode spelling.  The window's start crosses page (16) and 128-row tile
+    boundaries at every length; 77 is shorter than the window (every key visible),
+    0 has no key at all.  NHD pools, GQA 8:2, e5m2 with an FP8 O at S_q=8."""
+    out_dt = torch.float8_e4m3fn if s_q == 8 else torch.float16
+    in_key = "e5m2" if s_q == 8 else "e4m3"
+    _run_graph_fp8(
+        5, 8, 2, D, 16, 256, [300, 77, 0, 1024, 4096], hnd=False, s_q=s_q, causal="bottom_right", window_left=200, in_key=in_key, out_dt=out_dt, stats=True
+    )
+
+
+@pytest.mark.L0
 def test_paged_graph_fp8_declared_max_seq_len_below_table_reach():
     _run_graph_fp8(2, 8, 2, D, 16, 20, [300, 77], hnd=False, max_seq_len=300)
 
 
-def _build_fp8_paged_graph(P, *, d=D, H=8, KH=2, hnd=False, thd=False):
+def _build_fp8_paged_graph(P, *, d=D, H=8, KH=2, hnd=False, thd=False, mask_kw=None):
     """An sdpa_fp8 paged graph up to create_execution_plans; None when rejected upstream
-    of any engine.  ``thd``: ragged Q/O (ragged offsets) over the same pools."""
+    of any engine.  ``thd``: ragged Q/O (ragged offsets) over the same pools; ``mask_kw``:
+    extra sdpa_fp8 band / alignment kwargs."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
 
@@ -1336,6 +1420,7 @@ def _build_fp8_paged_graph(P, *, d=D, H=8, KH=2, hnd=False, thd=False):
         paged_attention_k_table=tk,
         paged_attention_v_table=tv,
         paged_attention_max_seq_len_kv=max_pages * P,
+        **(mask_kw or {}),
     )
     o.set_output(True).set_dim(list(o_shape)).set_stride(list(o_stride)).set_data_type(cudnn.data_type.HALF)
     if thd:
@@ -1367,6 +1452,20 @@ def test_paged_graph_fp8_declines_off_contract():
     assert not _offers(_build_fp8_paged_graph(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
     assert not _offers(_build_fp8_paged_graph(16, d=256)), "paged KV for per-tensor FP8 is wired on the d128 flavor only"
     assert not _offers(_build_fp8_paged_graph(16, thd=True)), "THD queries over FP8 pools are not wired (the FP8 THD path clamps runtime K/V descriptors)"
+    # Masks ride the same row: a causal bound (either alignment) and a left window are
+    # offered.  Bottom-right alignment is a property of the band's diagonal: with no band
+    # at all it is inert (the analyzer records an unmasked graph, which is offered); with a
+    # left window but no causal upper bound there is no diagonal to anchor, and the row
+    # declines ("bottom-right alignment requires a causal upper bound").
+    import cudnn
+
+    br = cudnn.diagonal_alignment.BOTTOM_RIGHT
+    assert _offers(_build_fp8_paged_graph(16, mask_kw=dict(right_bound=0, diagonal_alignment=br)))
+    assert _offers(_build_fp8_paged_graph(16, mask_kw=dict(right_bound=0, left_bound=64, diagonal_alignment=br)))
+    assert _offers(_build_fp8_paged_graph(16, mask_kw=dict(right_bound=0, left_bound=64)))
+    assert _offers(_build_fp8_paged_graph(16, mask_kw=dict(diagonal_alignment=br)))
+    g_br_window_only = _build_fp8_paged_graph(16, mask_kw=dict(left_bound=64, diagonal_alignment=br))
+    assert g_br_window_only is not None and not offers_engine(g_br_window_only, engine_name(fp8=True)), "bottom-right alignment requires a causal upper bound"
     # The f16/bf16 engine never sees an sdpa_fp8 graph: its row is a different quantization family.
     assert not offers_engine(_build_fp8_paged_graph(16), engine_name())
 
