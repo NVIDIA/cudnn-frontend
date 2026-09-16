@@ -139,7 +139,15 @@ def rank(graph, engines: List[BaseEngine], backend_plans: List[PlanConfig], mode
         # express it. Nothing to recommend on; the backend serves it.
         return [_strip(c) for c in backend_plans]
 
-    offered = {e.name: e.engine_id for e in engines}
+    # Engines that can serve THIS graph, which is what a family hook means by
+    # "offered" -- the hookless path (_unranked) has always filtered this way.
+    # It has to happen here and not in the families: _build_plan_at() builds a
+    # ranked entry WITHOUT re-affirming check_support, so whatever reaches the
+    # list is taken as eligible. A family that ranks an engine it cannot filter
+    # would otherwise launch a kernel on a graph that engine rejects -- caught
+    # as an illegal memory access when the KDA hook first ranked its 128-only
+    # sm90 engines ahead of a head-dim-64 graph.
+    offered = {e.name: e.engine_id for e in engines if accepts(e, graph)}
     plans = _assemble(modes, lambda kind: list(recommend(kind, facts, offered)), backend_plans)
     own = set(offered.values())
     for cfg in plans:
