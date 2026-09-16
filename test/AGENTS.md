@@ -96,3 +96,54 @@ loads kernel templates by absolute path via `spec_from_file_location`, so the
 template that serves a config may come from elsewhere too. To find out which
 template a test actually compiles, log `path` at the top of `load_template` —
 do not infer it from `_pick_flavor` by reading the source.
+
+
+### Persistent MoE scheduler validation
+
+When changing the scheduler ring or cluster broadcasts, use a workload that
+reuses ring slots over multiple persistent waves, with ragged and empty groups.
+Numerical success is insufficient: run Compute Sanitizer racecheck and memcheck
+on 1-CTA and 2-CTA variants. The focused cases are
+`gemm/frost/test_moe_counter_reset.py` and
+`gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py -k scheduler_ring_reuse`.
+A one-wave test can miss shared-memory reads that occur after the elected lane
+releases a slot, and a CTA can exit while a peer still accesses its DSM storage.
+If filtering sanitizer kernels, `--kernel-name kns=frost_sm100_moe` uses the
+sanitizer key/value syntax; verify the filter with a known failing kernel first.
+Keep that negative control's nonzero exit and the unfiltered baseline evidence.
+
+SM120 uses one CTA per cluster and needs its own ring-reuse coverage:
+`gemm/frost/test_moe_scheduler_sm120.py` checks BF16, NVFP4 and MXFP8 over more
+than four compiled-grid waves, with live offset/scale changes during graph
+replay. Run with `-m L1` under unfiltered racecheck and memcheck. A numerical
+pass does not override a nonzero sanitizer exit: the original SM120 small tile
+passed its numerical checks while reporting scheduler/TMA/compute shared-ring
+WAR hazards. Read ring words in one lane and broadcast before releasing the
+slot; retain the full-warp convergence before the release arrival.
+
+Direct Frost `Plan`/JIT calls are framework-neutral and default to the null
+stream. A `torch.cuda.stream(side)` or graph context alone does not redirect
+them: pass `stream=side.cuda_stream` explicitly to both warmup and capture.
+Assert that the captured graph contains the expected Frost kernel, then poison
+outputs and replay with changed inputs. An empty graph warning is a test failure,
+not evidence that the kernel is capture-safe.
+
+Static MoE scheduling needs the same multiwave and changed-offset checks as
+dynamic scheduling. Include live experts beyond the 32-lane prefix-scan window,
+then inspect captured kernel names: static has no counter-reset kernel, dynamic
+has exactly one per grouped GEMM. A reset-free launch alone does not prove
+that cyclic tile ownership covers every group or refreshes routing metadata.
+
+SM120 shared-A pairs also need `gemm/frost/test_moe_shared_a_sm120.py` under
+unfiltered memcheck and racecheck. It checks both FP32 GEMM products, since a
+gated final result can hide errors in either product. The weights share storage
+with an expert pitch aligned to16bytes but not32bytes; this exercises the
+compiled fake-tensor stride contract independently of the output vector width.
+The epilogue reuses one warp-private transpose buffer for both results: all
+lanes must finish their loads before the next result overwrites that buffer.
+
+For a multi-GEMM graph with a fused epilogue, export diagnostic products via
+`graph.identity(product).set_output(True)` and verify that every requested
+output appears in the compiled binding. Direct per-GEMM output taps are not
+part of the current multi-GEMM analyzer contract; successful compilation
+alone can therefore miss a broken diagnostic variant pack.

@@ -23,12 +23,14 @@ from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
+    reset_moe_sched_counter as _reset_moe_sched_counter,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
     fence_tensormap_acquire as _fence_tensormap_acquire,
     fence_tensormap_release as _fence_tensormap_release,
     moe_group_at as _moe_group_at,
     moe_swizzle_tile as _moe_swizzle_tile,
+    moe_load_sched_word as _moe_load_sched_word,
     replace_tensormap_global_address as _replace_tensormap_global_address,
     replace_tensormap_global_dim_0 as _replace_tensormap_global_dim_0,
     replace_tensormap_global_dim_1 as _replace_tensormap_global_dim_1,
@@ -46,11 +48,18 @@ from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as _cuda
 
 # A TMA tensormap is 128 bytes = 16 int64 qwords.
+moe_static_sched = False  # Public SCHED_POLICY: 0 dynamic (default), 1 static.
+moe_absolute_a = False  # Set before injection so the rendered eligibility gate wins.
+moe_wide_mma = False  # Shared-A pair packed into one doubled-N instruction.
+
 # @@INJECT_TILE_CONSTANTS@@
 
 # Tensormap workspace slots per CTA: the A operands, plus the output descriptor
 # when the TMA-store epilogue re-dimensions it per routed group.
 moe_desc_slots = num_a_operands + n_tma_outputs
+# Wide MMA places both B operands together inside each pipeline stage.
+b_stage_multiplier = num_b_operands if moe_wide_mma else 1
+mma_issue_gemms = 1 if moe_wide_mma else num_gemms
 _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
 
 
@@ -95,7 +104,7 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
 
 
 def _a_collector_op(g):
-    if cutlass.const_expr(num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
+    if cutlass.const_expr(moe_wide_mma or num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
         return None
     if cutlass.const_expr(g == 0):
         return nvvm.Tcgen05MMACollectorOp.FILL
@@ -246,9 +255,10 @@ def _kernel(
     )
     sched_full_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
     sched_empty_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
-    sched_bcast_slot = cutlass.Array(cutlass.Int32, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=16)
-    sched_bcast_full_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
-    sched_bcast_empty_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
+    if cutlass.const_expr(not moe_static_sched):
+        sched_bcast_slot = cutlass.Array(cutlass.Int32, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=16)
+        sched_bcast_full_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
+        sched_bcast_empty_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
 
     sA_elems = cta_tile_mnk[0] * cta_tile_mnk[2]
     sB_elems = cta_tile_mnk[1] * cta_tile_mnk[2]
@@ -261,25 +271,37 @@ def _kernel(
         )
         for _ in range(num_a_operands)
     ]
-    smem_b_list = [
-        cutlass.Array(
+    smem_b_list = []
+    if cutlass.const_expr(moe_wide_mma):
+        smem_b_all = cutlass.Array(
             ab_dtype,
-            sB_elems * ab_stages,
+            sB_elems * num_b_operands * ab_stages,
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
-        for _ in range(num_b_operands)
-    ]
+        smem_b_list = [smem_b_all.subview(sB_elems * j) for j in range(num_b_operands)]
+    else:
+        smem_b_list = [
+            cutlass.Array(
+                ab_dtype,
+                sB_elems * ab_stages,
+                space=cutlass.AddressSpace.smem,
+                alignment=1024,
+            )
+            for _ in range(num_b_operands)
+        ]
 
-    tma_a_desc_smem_list = [
-        cutlass.Array(
-            cutlass.Int64,
-            TENSOR_MAP_QWORDS,
-            space=cutlass.AddressSpace.smem,
-            alignment=128,
-        )
-        for _ in range(num_a_operands)
-    ]
+    tma_a_desc_smem_list = []
+    if cutlass.const_expr(not (moe_aligned_offsets or moe_absolute_a)):
+        tma_a_desc_smem_list = [
+            cutlass.Array(
+                cutlass.Int64,
+                TENSOR_MAP_QWORDS,
+                space=cutlass.AddressSpace.smem,
+                alignment=128,
+            )
+            for _ in range(num_a_operands)
+        ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
     # One epilogue subtile = one MMA-M block x 32 cols; the M blocks reuse it.
@@ -329,11 +351,12 @@ def _kernel(
                 nvvm.mbarrier_init(sched_full_mbar_ptr.subview(i), 1)
             if elect_one:
                 nvvm.mbarrier_init(sched_empty_mbar_ptr.subview(i), sched_empty_count)
-        for i in range(SCHED_BCAST_STAGES):
-            if elect_one:
-                nvvm.mbarrier_init(sched_bcast_full_mbar_ptr.subview(i), 1)
-            if elect_one:
-                nvvm.mbarrier_init(sched_bcast_empty_mbar_ptr.subview(i), cluster_size)
+        if cutlass.const_expr(not moe_static_sched):
+            for i in range(SCHED_BCAST_STAGES):
+                if elect_one:
+                    nvvm.mbarrier_init(sched_bcast_full_mbar_ptr.subview(i), 1)
+                if elect_one:
+                    nvvm.mbarrier_init(sched_bcast_empty_mbar_ptr.subview(i), cluster_size)
     nvvm.fence_mbarrier_init()
     if cutlass.const_expr(cta_group == 1):
         if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
@@ -400,6 +423,10 @@ def _kernel(
 
     if warp_idx == scheduler_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+        # PDL launch completion alone does not make predecessor writes visible.
+        # The scheduler consumes the reset counter and live offsets itself.
+        if cutlass.const_expr(USE_PDL):
+            nvvm.griddepcontrol("wait")
         full_warp_mask = 0xFFFFFFFF
         shfl_idx_clamp = 0x1F
         shfl_up_clamp = 0
@@ -413,6 +440,8 @@ def _kernel(
         last_bcast_stage = cutlass.Int32(0)
         last_bcast_empty_done_phase = cutlass.Int32(0)
         linear_idx = cutlass.Int32(0)
+        if cutlass.const_expr(moe_static_sched):
+            linear_idx = cutlass.Int32(bidx // cluster_m)
         start_linear_idx = cutlass.Int32(0)
         total_tiles = cutlass.Int32(0)
         scan_base = cutlass.Int32(0)
@@ -422,50 +451,52 @@ def _kernel(
         is_tile_valid = cutlass.Int32(1)
 
         while is_tile_valid != 0:
-            # Dynamic tile assignment: the cluster leader claims the next GLOBAL
-            # tile index and broadcasts it, so the clusters live at any instant
-            # sit in one contiguous window of tile space and share L2. Static
-            # striding lets them drift apart and share nothing.
-            if cta_rank_in_cluster == 0:
+            if cutlass.const_expr(not moe_static_sched):
+                # Dynamic tile assignment: the cluster leader claims the next GLOBAL
+                # tile index and broadcasts it, so the clusters live at any instant
+                # sit in one contiguous window of tile space and share L2. Static
+                # striding lets them drift apart and share nothing.
+                if cta_rank_in_cluster == 0:
+                    while not nvvm.mbarrier_try_wait_parity(
+                        sched_bcast_empty_mbar_ptr.subview(bcast_stage),
+                        bcast_empty_phase,
+                        time_limit=10_000_000,
+                    ):
+                        pass
+                    claimed = cutlass.Int32(0)
+                    if lane == 0:
+                        claimed = nvvm.atomicrmw(
+                            "add",
+                            sched_counter_ptr,
+                            cutlass.Int32(1),
+                            mem_order="relaxed",
+                            syncscope="gpu",
+                        )
+                    claimed = nvvm.shfl_sync(full_warp_mask, claimed, 0, shfl_idx_clamp, nvvm.Shfl.IDX)
+                    if lane < cluster_size:
+                        (nvvm.mapa(sched_bcast_slot.subview(bcast_stage), lane)).store(claimed)
+                        nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_full_mbar_ptr.subview(bcast_stage), lane))
                 while not nvvm.mbarrier_try_wait_parity(
-                    sched_bcast_empty_mbar_ptr.subview(bcast_stage),
-                    bcast_empty_phase,
+                    sched_bcast_full_mbar_ptr.subview(bcast_stage),
+                    bcast_full_phase,
                     time_limit=10_000_000,
                 ):
                     pass
-                claimed = cutlass.Int32(0)
+                linear_idx = _moe_load_sched_word((sched_bcast_slot.subview(bcast_stage)))
+                nvvm.bar_warp_sync(0xFFFFFFFF)
                 if lane == 0:
-                    claimed = nvvm.atomicrmw(
-                        "add",
-                        sched_counter_ptr,
-                        cutlass.Int32(1),
-                        mem_order="relaxed",
-                        syncscope="gpu",
-                    )
-                claimed = nvvm.shfl_sync(full_warp_mask, claimed, 0, shfl_idx_clamp, nvvm.Shfl.IDX)
-                if lane < cluster_size:
-                    (nvvm.mapa(sched_bcast_slot.subview(bcast_stage), lane)).store(claimed)
-                    nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_full_mbar_ptr.subview(bcast_stage), lane))
-            while not nvvm.mbarrier_try_wait_parity(
-                sched_bcast_full_mbar_ptr.subview(bcast_stage),
-                bcast_full_phase,
-                time_limit=10_000_000,
-            ):
-                pass
-            linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
-            if lane == 0:
-                nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
-            if cutlass.const_expr(cluster_size > 1):
-                # The final invalid broadcast has no next reuse of this stage to
-                # wait for its cluster-wide acknowledgements, so retain its exact
-                # stage and completion parity for the scheduler-warp drain below.
-                last_bcast_stage = bcast_stage
-                last_bcast_empty_done_phase = bcast_empty_phase ^ 1
-            bcast_stage += 1
-            if bcast_stage == SCHED_BCAST_STAGES:
-                bcast_stage = cutlass.Int32(0)
-                bcast_full_phase = bcast_full_phase ^ 1
-                bcast_empty_phase = bcast_empty_phase ^ 1
+                    nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
+                if cutlass.const_expr(cluster_size > 1):
+                    # The final invalid broadcast has no next reuse of this stage to
+                    # wait for its cluster-wide acknowledgements, so retain its exact
+                    # stage and completion parity for the scheduler-warp drain below.
+                    last_bcast_stage = bcast_stage
+                    last_bcast_empty_done_phase = bcast_empty_phase ^ 1
+                bcast_stage += 1
+                if bcast_stage == SCHED_BCAST_STAGES:
+                    bcast_stage = cutlass.Int32(0)
+                    bcast_full_phase = bcast_full_phase ^ 1
+                    bcast_empty_phase = bcast_empty_phase ^ 1
             if linear_idx >= start_linear_idx + total_tiles:
                 is_search_live = cutlass.Int32(1)
                 while is_search_live != 0:
@@ -552,6 +583,8 @@ def _kernel(
                 (slot.subview(7)).store(group_idx)
                 nvvm.mbarrier_arrive(sched_full_mbar_ptr.subview(sched_stage))
 
+            if cutlass.const_expr(moe_static_sched):
+                linear_idx += grid_num_clusters
             sched_stage += 1
             if sched_stage == SCHED_STAGES:
                 sched_stage = cutlass.Int32(0)
@@ -561,7 +594,7 @@ def _kernel(
         # leaving the loop. Keep the leader CTA's DSM alive until every
         # scheduler warp has consumed that final broadcast and acknowledged the
         # leader slot. A singleton cluster has no remote DSM lifetime to drain.
-        if cutlass.const_expr(cluster_size > 1):
+        if cutlass.const_expr(not moe_static_sched and cluster_size > 1):
             if cta_rank_in_cluster == 0:
                 # Each acknowledgement flips the saved pre-wrap empty phase, so
                 # pre-wrap ``bcast_empty_phase ^ 1`` is the completed parity.
@@ -596,13 +629,14 @@ def _kernel(
             for _ai in range(num_a_operands)
         ]
         previous_group_begin = cutlass.Int32(-1)
-        if cutlass.const_expr(moe_aligned_offsets):
+        if cutlass.const_expr(moe_aligned_offsets or moe_absolute_a):
             a_desc_load_list = [tma_a_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
         else:
             a_desc_load_list = a_desc_tma_ptr_list
-        if elect_one and cutlass.const_expr(not moe_aligned_offsets):
-            for _ai in cutlass.range_constexpr(num_a_operands):
-                _copy_tensormap_to_workspace(tma_a_descs[_ai].get_ptr(), tma_a_desc_smem_list[_ai])
+        if cutlass.const_expr(not (moe_aligned_offsets or moe_absolute_a)):
+            if elect_one:
+                for _ai in cutlass.range_constexpr(num_a_operands):
+                    _copy_tensormap_to_workspace(tma_a_descs[_ai].get_ptr(), tma_a_desc_smem_list[_ai])
         nvvm.bar_warp_sync(0xFFFFFFFF)
 
         while is_valid != 0:
@@ -613,12 +647,14 @@ def _kernel(
             ):
                 pass
             slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-            coord_expert = (slot.subview(0)).load()
-            tile_m = (slot.subview(1)).load()
-            tile_n = (slot.subview(2)).load()
-            is_valid = (slot.subview(3)).load()
-            group_begin = (slot.subview(4)).load()
-            group_end = (slot.subview(5)).load()
+            coord_expert = _moe_load_sched_word((slot.subview(0)))
+            tile_m = _moe_load_sched_word((slot.subview(1)))
+            tile_n = _moe_load_sched_word((slot.subview(2)))
+            is_valid = _moe_load_sched_word((slot.subview(3)))
+            group_begin = _moe_load_sched_word((slot.subview(4)))
+            group_end = _moe_load_sched_word((slot.subview(5)))
+            # Converge consumers before releasing their scheduler slot.
+            nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1
@@ -628,7 +664,7 @@ def _kernel(
 
             if is_valid != 0:
                 coord_m_group = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
-                if cutlass.const_expr(moe_aligned_offsets):
+                if cutlass.const_expr(moe_aligned_offsets or moe_absolute_a):
                     coord_m_desc = group_begin + coord_m_group
                 else:
                     coord_m_desc = coord_m_group
@@ -637,20 +673,21 @@ def _kernel(
                 else:
                     coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
 
-                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets):
-                    previous_group_begin = group_begin
-                    for _ai in cutlass.range_constexpr(num_a_operands):
-                        _fence_tensormap_acquire(a_desc_tma_ptr_list[_ai])
-                    for _ai in cutlass.range_constexpr(num_a_operands):
-                        if elect_one:
-                            row_base = mA_list[_ai].iterator.raw_ptr() + group_begin * a_stride_m_list[_ai]
-                            _replace_tensormap_global_address(tma_a_desc_smem_list[_ai], row_base.toint())
-                            _replace_tensormap_global_dim_1(tma_a_desc_smem_list[_ai], group_end - group_begin)
-                        nvvm.bar_warp_sync(0xFFFFFFFF)
-                        if lane < TENSOR_MAP_QWORDS:
-                            (cta_desc_base_list[_ai] + lane).store((tma_a_desc_smem_list[_ai].subview(lane)).load())
-                        nvvm.bar_warp_sync(0xFFFFFFFF)
-                        _fence_tensormap_release()
+                if cutlass.const_expr(not (moe_aligned_offsets or moe_absolute_a)):
+                    if group_begin != previous_group_begin:
+                        previous_group_begin = group_begin
+                        for _ai in cutlass.range_constexpr(num_a_operands):
+                            _fence_tensormap_acquire(a_desc_tma_ptr_list[_ai])
+                        for _ai in cutlass.range_constexpr(num_a_operands):
+                            if elect_one:
+                                row_base = mA_list[_ai].iterator.raw_ptr() + group_begin * a_stride_m_list[_ai]
+                                _replace_tensormap_global_address(tma_a_desc_smem_list[_ai], row_base.toint())
+                                _replace_tensormap_global_dim_1(tma_a_desc_smem_list[_ai], group_end - group_begin)
+                            nvvm.bar_warp_sync(0xFFFFFFFF)
+                            if lane < TENSOR_MAP_QWORDS:
+                                (cta_desc_base_list[_ai] + lane).store((tma_a_desc_smem_list[_ai].subview(lane)).load())
+                            nvvm.bar_warp_sync(0xFFFFFFFF)
+                            _fence_tensormap_release()
 
                 for k_tile_idx in range(num_k_tiles):
                     stage = ab_iter % ab_stages
@@ -703,7 +740,7 @@ def _kernel(
                         _b_off = 0
                     if b_data_issue:
                         for _bj in cutlass.range_constexpr(num_b_operands):
-                            sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
+                            sB_stage = smem_b_list[_bj].subview(sB_elems * stage * b_stage_multiplier)
                             if cutlass.const_expr(b_is_n_major):
                                 for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
                                     if elect_one:
@@ -725,7 +762,17 @@ def _kernel(
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage.subview(_b_off * cta_tile_mnk[2]),
                                         tma_b_descs[_bj].get_ptr(),
-                                        (coord_k, coord_n_per_cta + _b_off, coord_expert),
+                                        (
+                                            (
+                                                cutlass.Int32(0),
+                                                (coord_n_per_cta + _b_off) % 128,
+                                                coord_k // 128,
+                                                (coord_n_per_cta + _b_off) // 128,
+                                                coord_expert,
+                                            )
+                                            if cutlass.const_expr(moe_blocked_b)
+                                            else (coord_k, coord_n_per_cta + _b_off, coord_expert)
+                                        ),
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
                                         multicast_mask=tma_mcast_mask_b,
@@ -810,7 +857,9 @@ def _kernel(
                     time_limit=10_000_000,
                 ):
                     pass
-                is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                is_valid = _moe_load_sched_word((sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)))
+                # Converge consumers before releasing their scheduler slot.
+                nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
                     nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                 sched_stage += 1
@@ -859,9 +908,11 @@ def _kernel(
                             pass
 
                         for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
-                            for g in cutlass.range_constexpr(num_gemms):
+                            for g in cutlass.range_constexpr(mma_issue_gemms):
                                 desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
-                                desc_b_k = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
+                                desc_b_k = desc_b_roots[gemm_b_idx[g]].advance_start_address(
+                                    sB_bytes * stage * b_stage_multiplier + b_smem_k_step_bytes * k_block_idx
+                                )
                                 for mi in cutlass.range_constexpr(mma_size_m):
                                     # The M sub-block offset is a whole SMEM swizzle atom,
                                     # so the descriptor's swizzle phase is preserved.
@@ -961,7 +1012,9 @@ def _kernel(
                         time_limit=10_000_000,
                     ):
                         pass
-                    is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                    is_valid = _moe_load_sched_word((sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)))
+                    # Converge consumers before releasing their scheduler slot.
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
                     if elect_one:
                         nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                     sched_stage += 1
@@ -1010,9 +1063,11 @@ def _kernel(
                                 pass
 
                             for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
-                                for g in cutlass.range_constexpr(num_gemms):
+                                for g in cutlass.range_constexpr(mma_issue_gemms):
                                     desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
-                                    desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
+                                    desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(
+                                        sB_bytes * stage * b_stage_multiplier + b_smem_k_step_bytes * k_block_idx
+                                    )
                                     for mi in cutlass.range_constexpr(mma_size_m):
                                         # The M sub-block offset is a whole SMEM swizzle atom, so the
                                         # descriptor's swizzle phase is preserved. B is shared.
@@ -1089,7 +1144,9 @@ def _kernel(
                         time_limit=10_000_000,
                     ):
                         pass
-                    is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                    is_valid = _moe_load_sched_word((sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)))
+                    # Converge consumers before releasing their scheduler slot.
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
                     if elect_one:
                         nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                     sched_stage += 1
@@ -1167,12 +1224,14 @@ def _kernel(
         while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
             pass
         _slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-        tile_m = (_slot.subview(1)).load()
-        tile_n = (_slot.subview(2)).load()
-        is_valid = (_slot.subview(3)).load()
-        group_begin = (_slot.subview(4)).load()
-        group_end = (_slot.subview(5)).load()
-        group_idx = (_slot.subview(7)).load()
+        tile_m = _moe_load_sched_word((_slot.subview(1)))
+        tile_n = _moe_load_sched_word((_slot.subview(2)))
+        is_valid = _moe_load_sched_word((_slot.subview(3)))
+        group_begin = _moe_load_sched_word((_slot.subview(4)))
+        group_end = _moe_load_sched_word((_slot.subview(5)))
+        group_idx = _moe_load_sched_word((_slot.subview(7)))
+        # Converge consumers before releasing their scheduler slot.
+        nvvm.bar_warp_sync(0xFFFFFFFF)
         if elect_one:
             nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
         sched_stage += 1
@@ -1302,12 +1361,14 @@ def _kernel(
             ):
                 pass
             _slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-            tile_m = (_slot.subview(1)).load()
-            tile_n = (_slot.subview(2)).load()
-            is_valid = (_slot.subview(3)).load()
-            group_begin = (_slot.subview(4)).load()
-            group_end = (_slot.subview(5)).load()
-            group_idx = (_slot.subview(7)).load()
+            tile_m = _moe_load_sched_word((_slot.subview(1)))
+            tile_n = _moe_load_sched_word((_slot.subview(2)))
+            is_valid = _moe_load_sched_word((_slot.subview(3)))
+            group_begin = _moe_load_sched_word((_slot.subview(4)))
+            group_end = _moe_load_sched_word((_slot.subview(5)))
+            group_idx = _moe_load_sched_word((_slot.subview(7)))
+            # Converge consumers before releasing their scheduler slot.
+            nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1
@@ -1317,6 +1378,12 @@ def _kernel(
 
     if warp_idx == unused_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+
+    # DSM broadcasts can outlive one CTA's final tile. Keep every peer's
+    # shared storage alive until the whole cluster has finished its accesses.
+    if cutlass.const_expr(cluster_size > 1):
+        nvvm.barrier_cluster_arrive_relaxed()
+        nvvm.barrier_cluster_wait()
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1409,12 +1476,17 @@ def _host(
                 _tma.create_tensor_map_tiled(
                     global_address=_b_op.iterator.toint(),
                     dtype=ab_tma_dtype,
-                    global_dims=[k_sym, n, num_experts],
-                    global_strides=[
-                        b_stride_n * ab_dtype.width // 128,
-                        b_stride_l * ab_dtype.width // 128,
-                    ],
-                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1],
+                    global_dims=([128, 128, k_sym // 128, n // 128, num_experts] if cutlass.const_expr(moe_blocked_b) else [k_sym, n, num_experts]),
+                    global_strides=(
+                        [128 * ab_dtype.width // 128, 16384 * ab_dtype.width // 128, k_sym * 128 * ab_dtype.width // 128, b_stride_l * ab_dtype.width // 128]
+                        if cutlass.const_expr(moe_blocked_b)
+                        else [b_stride_n * ab_dtype.width // 128, b_stride_l * ab_dtype.width // 128]
+                    ),
+                    box_dims=(
+                        [128, cta_tile_mnk[1] // b_mcast_slices, 1, 1, 1]
+                        if cutlass.const_expr(moe_blocked_b)
+                        else [cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1]
+                    ),
                     swizzle=ab_tma_swizzle,
                 )
             )
@@ -1422,6 +1494,9 @@ def _host(
     cluster_m = cluster_shape_mnk[0]
     cluster_n = cluster_shape_mnk[1]
     grid_shape = (grid_num_clusters * cluster_m, cluster_n, 1)
+    if cutlass.const_expr(not moe_static_sched):
+        counter_qword = grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS
+        _reset_moe_sched_counter(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],
@@ -1469,6 +1544,16 @@ def compile() -> Callable:
         )
 
     def _make_fake_b():
+        if moe_blocked_b:
+            # Each expert's packed block is contiguous; expert pitch is an
+            # independent 16-byte-aligned TMA stride. Compact fake strides
+            # inherit output-vector divisibility and overconstrain that pitch.
+            return cute.runtime.make_fake_tensor(
+                mma_b_dtype,
+                (sym_n, sym_k, sym_e),
+                stride=(sym_k, 1, cute.sym_int64(divisibility=ab_stride_elems)),
+                assumed_align=16,
+            )
         return make_fake_compact_tensor(
             mma_b_dtype,
             (sym_n, sym_k, sym_e),

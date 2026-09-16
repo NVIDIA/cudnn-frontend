@@ -18,6 +18,9 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass._mlir.dialects import llvm
 
+from cudnn.gemm.frost.kernel_templates.moe_scheduler import moe_load_sched_word as moe_load_sched_word
+from cudnn.gemm.frost.kernel_templates.moe_scheduler import reset_moe_sched_counter as reset_moe_sched_counter
+
 
 @cute.jit
 def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=False):

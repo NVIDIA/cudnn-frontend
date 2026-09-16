@@ -12,6 +12,12 @@ matches, and the frontend-only ``PIPELINE_ARCH`` / ``MMA_TILE_M`` / ``MMA_TILE_N
 backend has no word for. K extents are BYTES, as in TileConfig, so one record
 serves every dtype.
 
+``SCHED_POLICY`` is independent of tile geometry: omitted/0 means dynamic
+cluster tickets (the unchanged default), 1 means static strided tickets for
+MoE grouped GEMM. SM100 supports ordinary grouped GEMM; SM120 also supports
+block-scaled grouped GEMM. Static scheduling is an explicit tuning choice,
+never selected by a shape-based policy. Non-MoE graphs decline it.
+
 ``GemmKnobs`` travels natively inside ``PlanConfig.knobs``; the engine converts
 at the public boundary (``FrostGemmEngine.knobs_to_public`` /
 ``knobs_from_public``). A replayed record is honored exactly or declined
@@ -44,6 +50,13 @@ class GemmKnobs:
     warps_n: Optional[int] = None
     split_k_slices: int = 1
     swap_ab: bool = False
+    # Execution policy is independent of TileConfig geometry. Omitted/0 keeps
+    # dynamic cluster tickets; 1 selects static strided tickets for supported MoE plans.
+    moe_sched_policy: int = 0
+
+    def __post_init__(self):
+        if self.moe_sched_policy not in (0, 1):
+            raise ValueError("SCHED_POLICY must be 0 (dynamic) or 1 (static)")
 
     # (field, cudnn.knob_type member, required)
     _PUBLIC_KNOBS = (
@@ -61,6 +74,7 @@ class GemmKnobs:
         ("warps_n", "WARPS_N", False),
         ("split_k_slices", "SPLIT_K_SLC", False),
         ("swap_ab", "SWAP_AB", False),
+        ("moe_sched_policy", "SCHED_POLICY", False),
     )
 
     # ---- TileConfig <-> knobs ---------------------------------------------
@@ -128,7 +142,8 @@ class GemmKnobs:
         out = {}
         for field, member, _required in self._PUBLIC_KNOBS:
             value = getattr(self, field)
-            if value is None:
+            if value is None or (field == "moe_sched_policy" and value == 0):
+                # Preserve the canonical spelling of previously cached records.
                 continue
             if field == "split_k_slices" and value == 1:
                 out[getattr(kt, member)] = 1  # spelled explicitly: 1 = one slice, a real value

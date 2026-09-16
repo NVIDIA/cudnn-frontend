@@ -493,6 +493,28 @@ class Sm120KernelTemplate(KernelTemplate):
         from .dtypes import DTYPE_BITS, DTYPE_BYTES
 
         mm = chain.matmul
+        if chain.is_multi_gemm:
+            if not (
+                self.graph_type == GraphType.MOE
+                and chain.num_gemms == 2
+                and chain.num_a_operands == 1
+                and chain.num_b_operands == 2
+                and chain.gemm_operands == [(0, 0), (0, 1)]
+                and mm.a_major == mm.b_major == "k"
+                and mm.a_dtype in ("bf16", "fp16")
+                and mm.b_dtype == mm.a_dtype
+                and not chain.has_block_scale
+                and not chain.has_mainloop_fusion
+                and not chain.reductions
+                and not chain.quants
+            ):
+                return f"{self.file} supports a shared-A BF16/FP16 pair with K-major operands and pointwise epilogue only"
+            from .tile_config import _sm120_shared_a_pair_stages
+
+            try:
+                _sm120_shared_a_pair_stages(config, smem_fixed_reserve=self.smem_fixed_reserve)
+            except (ValueError, NotImplementedError) as exc:
+                return str(exc)
         if mm.a_major == "m" and DTYPE_BITS[mm.a_dtype] not in (16, 8):
             return f"{self.file} loads MN-major operands with ldmatrix.trans (b16) / " f"ldmatrix.m16n16.trans.b8; {mm.a_dtype} A must be K-major"
         if mm.b_major == "n" and DTYPE_BITS[mm.b_dtype] not in (16, 8):
@@ -601,7 +623,7 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         # coordinate on one global descriptor (no tensormap scratch to reserve).
         "sm120_moe_grouped_matmul_fwd.py",
         graph_type=GraphType.MOE,
-        supports_multi_gemm=False,
+        supports_multi_gemm=True,
         template_cls=Sm120KernelTemplate,
     ),
     _mm(

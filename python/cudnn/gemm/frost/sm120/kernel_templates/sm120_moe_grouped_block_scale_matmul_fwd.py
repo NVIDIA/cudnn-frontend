@@ -71,6 +71,11 @@ from cutlass._mlir.dialects.nvvm import MMATypes as _MMATypes
 from cutlass._mlir.dialects.nvvm import ScaleVecSize as _ScaleVecSize
 from cuda.bindings import driver as _cuda
 
+from cudnn.gemm.frost.kernel_templates.moe_scheduler import moe_load_sched_word as _moe_load_sched_word
+from cudnn.gemm.frost.kernel_templates.moe_scheduler import reset_moe_sched_counter as _reset_moe_sched_counter
+
+moe_static_sched = False  # Public SCHED_POLICY: 0 dynamic (default), 1 static.
+
 # @@INJECT_TILE_CONSTANTS@@
 
 if a_is_m_major:
@@ -79,7 +84,7 @@ if a_is_m_major:
 # A TMA tensormap is 128 bytes = 16 int64 qwords. The workspace is laid out as
 # grid_ctas * moe_desc_slots tensormap slots followed by the scheduler counter;
 # this kernel patches no descriptor, so its slot count is zero and the counter
-# sits at the start of the buffer (the compiler carves and zeroes it the same way).
+# sits at the start of the buffer (the compiled host resets it before the GEMM).
 TENSOR_MAP_QWORDS = 16
 moe_desc_slots = 0
 
@@ -439,7 +444,8 @@ def _kernel(
     first_token_arr = cutlass.make_array_view(first_token_offset)
 
     # -- Grouped scheduler warp ------------------------------------------------
-    # Claim the next GLOBAL linear tile index off the counter, locate the group
+    # Claim the next GLOBAL tile dynamically, or stride it by the static grid;
+    # locate the group
     # it falls in (a warp-parallel prefix scan over the group sizes in INDEX
     # order -- the segmented SFA blob is laid out in that order -- carrying the
     # SF-block prefix alongside the tile prefix, resumed from the last hit),
@@ -457,6 +463,8 @@ def _kernel(
         sched_stage = cutlass.Int32(0)
         sched_empty_phase = cutlass.Int32(1)
         linear_idx = cutlass.Int32(0)
+        if cutlass.const_expr(moe_static_sched):
+            linear_idx = cutlass.Int32(cute.arch.block_idx()[0])
         start_linear_idx = cutlass.Int32(0)
         total_tiles = cutlass.Int32(0)
         start_sf_block_m = cutlass.Int32(0)
@@ -467,19 +475,20 @@ def _kernel(
         is_tile_valid = cutlass.Int32(1)
 
         while is_tile_valid != 0:
-            # Dynamic tile assignment: the CTAs live at any instant sit in one
-            # contiguous window of tile space and share L2. No cluster, so the
-            # claimed index is broadcast within the warp only.
-            claimed = cutlass.Int32(0)
-            if lane == 0:
-                claimed = nvvm.atomicrmw(
-                    "add",
-                    sched_counter_ptr,
-                    cutlass.Int32(1),
-                    mem_order="relaxed",
-                    syncscope="gpu",
-                )
-            linear_idx = nvvm.shfl_sync(full_warp_mask, claimed, 0, shfl_idx_clamp, nvvm.Shfl.IDX)
+            if cutlass.const_expr(not moe_static_sched):
+                # Dynamic tile assignment: the CTAs live at any instant sit in one
+                # contiguous window of tile space and share L2. No cluster, so the
+                # claimed index is broadcast within the warp only.
+                claimed = cutlass.Int32(0)
+                if lane == 0:
+                    claimed = nvvm.atomicrmw(
+                        "add",
+                        sched_counter_ptr,
+                        cutlass.Int32(1),
+                        mem_order="relaxed",
+                        syncscope="gpu",
+                    )
+                linear_idx = nvvm.shfl_sync(full_warp_mask, claimed, 0, shfl_idx_clamp, nvvm.Shfl.IDX)
             if linear_idx >= start_linear_idx + total_tiles:
                 is_search_live = cutlass.Int32(1)
                 while is_search_live != 0:
@@ -586,6 +595,9 @@ def _kernel(
                 (slot.subview(7)).store(group_idx)
                 nvvm.mbarrier_arrive(sched_full_mbar_ptr.subview(sched_stage))
 
+            if cutlass.const_expr(moe_static_sched):
+                linear_idx += grid_num_clusters
+
             sched_stage += 1
             if sched_stage == SCHED_STAGES:
                 sched_stage = cutlass.Int32(0)
@@ -609,12 +621,12 @@ def _kernel(
             ):
                 pass
             slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-            coord_expert = (slot.subview(0)).load()
-            tile_m = (slot.subview(1)).load()
-            tile_n = (slot.subview(2)).load()
-            is_valid = (slot.subview(3)).load()
-            group_begin = (slot.subview(4)).load()
-            start_sf_block_m = (slot.subview(6)).load()
+            coord_expert = _moe_load_sched_word(slot.subview(0))
+            tile_m = _moe_load_sched_word(slot.subview(1))
+            tile_n = _moe_load_sched_word(slot.subview(2))
+            is_valid = _moe_load_sched_word(slot.subview(3))
+            group_begin = _moe_load_sched_word(slot.subview(4))
+            start_sf_block_m = _moe_load_sched_word(slot.subview(6))
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
@@ -743,13 +755,13 @@ def _kernel(
         while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
             pass
         _slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-        tile_m = (_slot.subview(1)).load()
-        tile_n = (_slot.subview(2)).load()
-        is_valid = (_slot.subview(3)).load()
-        group_begin = (_slot.subview(4)).load()
-        group_end = (_slot.subview(5)).load()
-        start_sf_block_m = (_slot.subview(6)).load()
-        group_idx = (_slot.subview(7)).load()
+        tile_m = _moe_load_sched_word(_slot.subview(1))
+        tile_n = _moe_load_sched_word(_slot.subview(2))
+        is_valid = _moe_load_sched_word(_slot.subview(3))
+        group_begin = _moe_load_sched_word(_slot.subview(4))
+        group_end = _moe_load_sched_word(_slot.subview(5))
+        start_sf_block_m = _moe_load_sched_word(_slot.subview(6))
+        group_idx = _moe_load_sched_word(_slot.subview(7))
         nvvm.bar_warp_sync(0xFFFFFFFF)
         if elect_one:
             nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
@@ -905,8 +917,10 @@ def _kernel(
                                 nf % 4,
                             )
 
-                # Stage fully consumed by this warp (ldmatrix / ld.shared are synchronous).
+                # Order this warp's shared-memory reads before the producer's
+                # async TMA overwrite after the final consumer releases the stage.
                 nvvm.bar_warp_sync(0xFFFFFFFF)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 if elect_one:
                     nvvm.mbarrier_arrive(ab_empty_mbar_ptr.subview(stage))
                 ab_iter += 1
@@ -966,13 +980,13 @@ def _kernel(
             while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
                 pass
             _slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-            tile_m = (_slot.subview(1)).load()
-            tile_n = (_slot.subview(2)).load()
-            is_valid = (_slot.subview(3)).load()
-            group_begin = (_slot.subview(4)).load()
-            group_end = (_slot.subview(5)).load()
-            start_sf_block_m = (_slot.subview(6)).load()
-            group_idx = (_slot.subview(7)).load()
+            tile_m = _moe_load_sched_word(_slot.subview(1))
+            tile_n = _moe_load_sched_word(_slot.subview(2))
+            is_valid = _moe_load_sched_word(_slot.subview(3))
+            group_begin = _moe_load_sched_word(_slot.subview(4))
+            group_end = _moe_load_sched_word(_slot.subview(5))
+            start_sf_block_m = _moe_load_sched_word(_slot.subview(6))
+            group_idx = _moe_load_sched_word(_slot.subview(7))
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
@@ -1155,6 +1169,9 @@ def _host(
     # tiles off the global counter until the group space is exhausted. No
     # cluster launch on sm120 (CC 12.x has no thread-block clusters).
     grid_shape = (grid_num_clusters, 1, 1)
+    counter_qword = grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS
+    if cutlass.const_expr(not moe_static_sched):
+        _reset_moe_sched_counter(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],

@@ -1172,3 +1172,16 @@ def validate_block_scale_config(cfg: TileConfig, block_size: int, cta_tile_k_ele
     if cfg.pipeline == "sm120":
         return validate_block_scale_config_sm120(cfg, block_size, cta_tile_k_elems)
     return validate_block_scale_config_sm100(cfg, block_size, cta_tile_k_elems)
+
+
+def _sm120_shared_a_pair_stages(config: TileConfig, *, smem_fixed_reserve: int) -> int:
+    """Budget one A, two B tiles and one reused warp-private STG staging area."""
+    per_stage = (config.cta_tile_m + 2 * config.cta_smem_tile_n) * config.cta_tile_k_bytes + 16
+    compute_warps = (config.cta_tile_m // config.warp_tile_m) * (config.cta_smem_tile_n // config.warp_tile_n)
+    staging_bytes = 4 * _SM120_STG_STAGE_ELEMS * compute_warps
+    stages = smem_ab_stages(per_stage, smem_fixed_reserve=smem_fixed_reserve, extra_smem_bytes=staging_bytes)
+    if stages < 1:
+        raise NotImplementedError(
+            f"shared-A pair {config.name!r}: one {per_stage}-byte A/B stage plus " f"{staging_bytes}-byte epilogue staging exceeds shared memory"
+        )
+    return stages
