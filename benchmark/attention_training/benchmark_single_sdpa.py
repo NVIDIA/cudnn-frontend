@@ -705,7 +705,9 @@ else:
             output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
         elif o_block_scale == 16:
             # FP4 O: the packed byte container (two E2M1 per byte).
-            output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo // 2, dtype=torch.uint8, device=device).view(torch.float4_e2m1fn_x2).transpose(1, 2)
+            output = (
+                torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo // 2, dtype=torch.uint8, device=device).view(torch.float4_e2m1fn_x2).transpose(1, 2)
+            )
         else:
             output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=target_dtype, device=device).transpose(1, 2)
         sf_o_gpu = None
