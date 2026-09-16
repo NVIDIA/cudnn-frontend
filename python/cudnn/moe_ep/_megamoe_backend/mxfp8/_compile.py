@@ -11,12 +11,12 @@ from typing import Any
 
 import torch
 
-from ..._contracts import ForwardConfig
+from ..._config import ResolvedMoeEpConfig
 from .._plan import PreparedResources
 from .._workspace import WorkspaceRequirements
 from ._adapter import Mxfp8LaunchInputs
 from ._compile_common import _compile_kernel, _prepare_rubin_environment
-from ._config import Mxfp8KernelConfig
+from ._config import MXFP8_CLUSTER_SHAPE_MNK, Mxfp8KernelConfig
 from ._fingerprint import build_kernel_fingerprint
 from ._launch import build_runtime_kwargs, layout_signature
 
@@ -57,6 +57,21 @@ _TOKEN_SRC_METADATA_REGION = "nvlink.token_comm.token_src_metadata"
 _COL_QUANT_SIZES_REGION = "rubin.glu_mxfp8.mega.col_quant_expert_token_sizes"
 _PRE_REDUCED_ACTIVATION_REGION = "nvlink.token_comm.pre_reduced_activation"
 _PRE_REDUCED_ACTIVATION_SF_REGION = "nvlink.token_comm.pre_reduced_activation_sf"
+
+
+def prepare_environment(
+    device: torch.device,
+) -> tuple[tuple[int, int], int]:
+    """Query the Rubin environment before constructing a final config."""
+
+    cluster_size = (
+        MXFP8_CLUSTER_SHAPE_MNK[0] * MXFP8_CLUSTER_SHAPE_MNK[1]
+    )
+    return _prepare_rubin_environment(
+        device,
+        cluster_size=cluster_size,
+        context="forward",
+    )
 
 
 def _pre_reduced_workspace_metadata(
@@ -117,17 +132,14 @@ def _pre_reduced_sf_workspace_metadata(
 
 
 def prepare_kernel(
-    forward_config: ForwardConfig,
+    resolved_config: ResolvedMoeEpConfig,
     config: Mxfp8KernelConfig,
     device: torch.device,
+    *,
+    architecture: tuple[int, int],
 ) -> PreparedMxfp8Kernel:
     """Instantiate the kernel and derive exact allocation requirements."""
 
-    architecture, launch_cluster_count = _prepare_rubin_environment(
-        device,
-        config,
-        context="forward",
-    )
     import cutlass
 
     from ..cutedsl_src.kernel_src.rubin.training.mega.fwd_glu.glu_mxfp8_mega_moe_kernel import (
@@ -135,12 +147,11 @@ def prepare_kernel(
     )
     from ..cutedsl_src.quant_def import CombineFormat
 
-    group_hint = launch_cluster_count if config.group_hint is None else config.group_hint
     kernel_kwargs = dict(
         mma_tiler_mnk=config.mma_tiler_mnk,
         cluster_shape_mnk=config.cluster_shape_mnk,
         use_2cta_instrs=config.use_2cta_instrs,
-        group_hint=group_hint,
+        group_hint=config.group_hint,
         token_padding_block=config.token_padding_block,
         sf_padding_block=config.sf_padding_block,
         load_balance_mode=config.load_balance_mode,
@@ -163,8 +174,8 @@ def prepare_kernel(
         max_tokens_per_rank=config.max_tokens_per_rank,
         max_recv_size_per_rank=config.max_recv_size_per_rank,
         hidden=config.hidden,
-        launch_cluster_count=launch_cluster_count,
-        drop_on_overflow=config.drop_on_overflow,
+        launch_cluster_count=config.launch_cluster_count,
+        drop_on_overflow=config.kernel_drop_on_overflow,
         fc2_in_kernel_topk_reduce=config.fc2_in_kernel_topk_reduce,
         token_back_mode=config.token_back_mode,
         epi_flag_batch=config.epi_flag_batch,
@@ -220,7 +231,7 @@ def prepare_kernel(
         col_quant_sizes_offset = None
         col_quant_sizes_bytes = 0
     requirements = WorkspaceRequirements.for_mxfp8(
-        forward_config,
+        resolved_config,
         kernel_local_workspace_bytes=local_bytes,
         kernel_shared_workspace_bytes=shared_bytes,
         col_quant_data_bytes=col_quant_data_rows * config.hidden,
@@ -247,7 +258,7 @@ def prepare_kernel(
         device=torch.device(device),
         architecture=architecture,
         kernel=kernel,
-        launch_cluster_count=launch_cluster_count,
+        launch_cluster_count=config.launch_cluster_count,
         workspace_requirements=requirements,
         pool_token_capacity=pool_token_capacity,
         col_quant_data_rows=col_quant_data_rows,
@@ -275,7 +286,6 @@ def compile_or_get(
         *prepared.config.compile_key(
             prepared.device,
             prepared.architecture,
-            prepared.launch_cluster_count,
             signature,
         ),
     )
@@ -307,5 +317,6 @@ __all__ = [
     "CompiledMxfp8Kernel",
     "PreparedMxfp8Kernel",
     "compile_or_get",
+    "prepare_environment",
     "prepare_kernel",
 ]

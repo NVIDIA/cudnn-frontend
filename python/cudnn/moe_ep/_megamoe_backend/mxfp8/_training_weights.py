@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ..._contracts import Fc1WeightLayout
+from ..._config import MoeEpFc1WeightLayout
 from ..._math import round_up
 from ..._types import (
     BlockScaledTensor,
@@ -250,12 +250,18 @@ def materialize_forward(
     weights: MoeEpForwardWeights,
     *,
     out: MoeEpForwardWeightStaging,
-    fc1_weight_layout: Fc1WeightLayout,
+    fc1_weight_layout: MoeEpFc1WeightLayout,
 ) -> MoeEpNativeForwardWeights:
     """Materialize source forward weights into caller-owned native storage."""
 
-    if fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
-        raise ValueError("native training materialization requires weight_interleave_size=32")
+    if (
+        fc1_weight_layout
+        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+    ):
+        raise ValueError(
+            "native training materialization requires "
+            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
+        )
     if not isinstance(weights, MoeEpForwardWeights):
         raise TypeError("weights must be a MoeEpForwardWeights")
     if not isinstance(out, MoeEpForwardWeightStaging):
@@ -352,12 +358,18 @@ def materialize_backward(
     weights: MoeEpBackwardWeights,
     *,
     out: MoeEpBackwardWeightStaging,
-    fc1_weight_layout: Fc1WeightLayout,
+    fc1_weight_layout: MoeEpFc1WeightLayout,
 ) -> MoeEpNativeBackwardWeights:
     """Materialize source backward weights into caller-owned native storage."""
 
-    if fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
-        raise ValueError("native training materialization requires weight_interleave_size=32")
+    if (
+        fc1_weight_layout
+        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+    ):
+        raise ValueError(
+            "native training materialization requires "
+            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
+        )
     if not isinstance(weights, MoeEpBackwardWeights):
         raise TypeError("weights must be a MoeEpBackwardWeights")
     if not isinstance(out, MoeEpBackwardWeightStaging):

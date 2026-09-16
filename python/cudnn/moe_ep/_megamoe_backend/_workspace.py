@@ -12,7 +12,7 @@ from typing import Mapping, Optional, Protocol, Sequence
 
 import torch
 
-from .._contracts import ForwardConfig
+from .._config import ResolvedMoeEpConfig
 from .._math import round_up
 from ._comm import (
     PeerMapping,
@@ -120,7 +120,7 @@ class WorkspaceRequirements:
     @classmethod
     def for_mxfp8(
         cls,
-        config: ForwardConfig,
+        config: ResolvedMoeEpConfig,
         *,
         kernel_local_workspace_bytes: int,
         kernel_shared_workspace_bytes: int,
@@ -130,7 +130,8 @@ class WorkspaceRequirements:
         backward_aux_data_bytes: int = 0,
         backward_aux_scale_bytes: int = 0,
     ) -> "WorkspaceRequirements":
-        if config.max_tokens_per_rank is None:
+        public = config.public_config
+        if public.parallel.max_tokens_per_rank is None:
             raise ValueError("MXFP8 workspace requires max_tokens_per_rank")
         for name, value in (
             ("kernel_local_workspace_bytes", kernel_local_workspace_bytes),
@@ -153,9 +154,9 @@ class WorkspaceRequirements:
         if any(backward_sizes) and not all(backward_sizes):
             raise ValueError("backward dprob, data, and scale workspace must be enabled together")
 
-        tokens = config.max_tokens_per_rank
-        hidden = config.hidden_size
-        top_k = config.top_k
+        tokens = public.parallel.max_tokens_per_rank
+        hidden = public.model.hidden_size
+        top_k = public.model.top_k
         kernel_sf_columns = padded_mxfp8_scale_columns(hidden)
 
         backward_symmetric_regions = (BufferRegion("backward_dprob", backward_dprob_bytes),) if backward_dprob_bytes else ()

@@ -1,6 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from ._config import (
+    MoeEpConfig,
+    MoeEpDataPathConfig,
+    MoeEpFc1WeightLayout,
+    MoeEpModelConfig,
+    MoeEpParallelConfig,
+)
 from ._tuning import (
     MoeEpAutotuneCandidateResult,
     MoeEpAutotuneResult,
@@ -31,6 +38,11 @@ from .api import MoeEp, pack_backward_weights, pack_forward_weights
 __all__ = [
     "BlockScaledTensor",
     "MoeEp",
+    "MoeEpConfig",
+    "MoeEpDataPathConfig",
+    "MoeEpFc1WeightLayout",
+    "MoeEpModelConfig",
+    "MoeEpParallelConfig",
     "MoeEpAutotuneCandidateResult",
     "MoeEpAutotuneResult",
     "MoeEpBackwardWeightStaging",

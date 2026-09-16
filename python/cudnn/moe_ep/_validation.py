@@ -9,7 +9,11 @@ from typing import Mapping, Tuple
 
 import torch
 
-from ._contracts import Fc1WeightLayout, ForwardConfig, ValidatedForwardRequest
+from ._config import (
+    MoeEpFc1WeightLayout,
+    ResolvedMoeEpConfig,
+)
+from ._contracts import _ForwardCall
 from ._math import round_up
 from ._types import (
     BlockScaledTensor,
@@ -117,20 +121,23 @@ def _validate_tensor_representation(
 
 
 def _validate_expert_ids(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     topk_idx: torch.Tensor,
 ) -> None:
     expert_ids = topk_idx.reshape(-1)
-    if expert_ids.numel() > 0 and bool(((expert_ids < 0) | (expert_ids >= config.num_experts)).any().item()):
+    num_experts = config.public_config.model.num_experts
+    if expert_ids.numel() > 0 and bool(
+        ((expert_ids < 0) | (expert_ids >= num_experts)).any().item()
+    ):
         raise ValueError(
             "topk_idx must contain a valid global expert id in "
-            f"[0, {config.num_experts}) for every route; negative and "
+            f"[0, {num_experts}) for every route; negative and "
             "dropped-route sentinel values are not supported"
         )
 
 
 def _validate_routes(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     token_count: int,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -143,7 +150,7 @@ def _validate_routes(
         raise ValueError("topk_weights must be a torch.Tensor, " f"got {type(topk_weights).__name__}")
     _validate_strided("topk_idx", topk_idx)
     _validate_strided("topk_weights", topk_weights)
-    route_shape = (token_count, config.top_k)
+    route_shape = (token_count, config.public_config.model.top_k)
     if tuple(topk_idx.shape) != route_shape:
         raise ValueError(f"topk_idx shape must be {route_shape}, got {tuple(topk_idx.shape)}")
     if tuple(topk_weights.shape) != route_shape:
@@ -152,14 +159,18 @@ def _validate_routes(
         raise ValueError("topk_idx must have dtype torch.int32 or torch.int64, " f"got {topk_idx.dtype}")
     if not topk_weights.is_floating_point():
         raise ValueError(f"topk_weights must be floating point, got {topk_weights.dtype}")
-    if config.max_tokens_per_rank is not None and token_count > config.max_tokens_per_rank:
-        raise ValueError(f"token count {token_count} exceeds " f"max_tokens_per_rank={config.max_tokens_per_rank}")
+    max_tokens_per_rank = config.public_config.parallel.max_tokens_per_rank
+    if max_tokens_per_rank is not None and token_count > max_tokens_per_rank:
+        raise ValueError(
+            f"token count {token_count} exceeds "
+            f"max_tokens_per_rank={max_tokens_per_rank}"
+        )
     if validate_expert_ids:
         _validate_expert_ids(config, topk_idx)
 
 
 def validate_forward(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     activation: MoeTensor,
     fc1_weight: MoeTensor,
     fc2_weight: MoeTensor,
@@ -167,36 +178,44 @@ def validate_forward(
     topk_weights: torch.Tensor,
     *,
     validate_expert_ids: bool = True,
-) -> ValidatedForwardRequest:
+) -> _ForwardCall:
     """Validate inference-forward semantics without importing a device backend."""
 
     activation_shape = _logical_shape(activation)
-    if len(activation_shape) != 2 or activation_shape[1] != config.hidden_size:
-        raise ValueError(f"activation logical shape must be (T, {config.hidden_size}), " f"got {activation_shape}")
+    model = config.public_config.model
+    layout = config.public_config.data_path.fc1_weight_layout
+    if len(activation_shape) != 2 or activation_shape[1] != model.hidden_size:
+        raise ValueError(
+            f"activation logical shape must be (T, {model.hidden_size}), "
+            f"got {activation_shape}"
+        )
     token_count = activation_shape[0]
     _validate_tensor_representation("activation", activation, activation_shape)
     _validate_tensor_representation(
         "fc1_weight",
         fc1_weight,
         (
-            config.experts_per_rank,
-            config.hidden_size,
-            2 * config.intermediate_size,
+            config.topology.experts_per_rank,
+            model.hidden_size,
+            2 * model.intermediate_size,
         ),
     )
     _validate_tensor_representation(
         "fc2_weight",
         fc2_weight,
         (
-            config.experts_per_rank,
-            config.intermediate_size,
-            config.hidden_size,
+            config.topology.experts_per_rank,
+            model.intermediate_size,
+            model.hidden_size,
         ),
     )
-    if config.fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32 and (
+    if layout is MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32 and (
         not isinstance(fc1_weight, BlockScaledTensor) or fc1_weight.format is not MoeFormat.MXFP8
     ):
-        raise ValueError("weight_interleave_size=32 requires an MXFP8 BlockScaledTensor " "for fc1_weight")
+        raise ValueError(
+            "fc1_weight_layout=GATE_UP_INTERLEAVED_32 requires an MXFP8 "
+            "BlockScaledTensor for fc1_weight"
+        )
     _validate_routes(
         config,
         token_count,
@@ -221,8 +240,7 @@ def validate_forward(
         capturing = False
     if validate_expert_ids and not capturing:
         _validate_expert_ids(config, topk_idx)
-    return ValidatedForwardRequest(
-        config=config,
+    return _ForwardCall(
         activation=activation,
         fc1_weight=fc1_weight,
         fc2_weight=fc2_weight,
@@ -260,31 +278,35 @@ def _validate_source_weight_pair(
 
 
 def validate_forward_source_weights(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     weights: MoeEpForwardWeights,
 ) -> torch.device:
     """Validate source weights used by allocation-free forward packing."""
 
     if not isinstance(weights, MoeEpForwardWeights):
         raise TypeError("weights must be a MoeEpForwardWeights, " f"got {type(weights).__name__}")
+    model = config.public_config.model
+    experts = config.topology.experts_per_rank
     expected = (
-        ("weights.fc1", weights.fc1, (config.experts_per_rank, config.hidden_size, 2 * config.intermediate_size)),
-        ("weights.fc2", weights.fc2, (config.experts_per_rank, config.intermediate_size, config.hidden_size)),
+        ("weights.fc1", weights.fc1, (experts, model.hidden_size, 2 * model.intermediate_size)),
+        ("weights.fc2", weights.fc2, (experts, model.intermediate_size, model.hidden_size)),
     )
     return _validate_source_weight_pair(expected)
 
 
 def validate_backward_source_weights(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     weights: MoeEpBackwardWeights,
 ) -> torch.device:
     """Validate source weights used by allocation-free backward packing."""
 
     if not isinstance(weights, MoeEpBackwardWeights):
         raise TypeError("weights must be a MoeEpBackwardWeights, " f"got {type(weights).__name__}")
+    model = config.public_config.model
+    experts = config.topology.experts_per_rank
     expected = (
-        ("weights.w2_transpose", weights.w2_transpose, (config.experts_per_rank, config.hidden_size, config.intermediate_size)),
-        ("weights.w1_transpose", weights.w1_transpose, (config.experts_per_rank, 2 * config.intermediate_size, config.hidden_size)),
+        ("weights.w2_transpose", weights.w2_transpose, (experts, model.hidden_size, model.intermediate_size)),
+        ("weights.w1_transpose", weights.w1_transpose, (experts, 2 * model.intermediate_size, model.hidden_size)),
     )
     return _validate_source_weight_pair(expected)
 
@@ -358,18 +380,24 @@ def _validate_native_weight_pair(
 
 
 def validate_native_forward_weights(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     weights: MoeEpNativeForwardWeights,
     *,
     device: torch.device | None = None,
 ) -> torch.device:
     if not isinstance(weights, MoeEpNativeForwardWeights):
         raise TypeError("weights must be a MoeEpNativeForwardWeights, " f"got {type(weights).__name__}")
-    if config.fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
-        raise ValueError("native training weights require weight_interleave_size=32")
-    experts = config.experts_per_rank
-    hidden = config.hidden_size
-    intermediate = config.intermediate_size
+    if (
+        config.public_config.data_path.fc1_weight_layout
+        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+    ):
+        raise ValueError(
+            "native training weights require "
+            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
+        )
+    experts = config.topology.experts_per_rank
+    hidden = config.public_config.model.hidden_size
+    intermediate = config.public_config.model.intermediate_size
     sf_dtype = _require_torch_dtype("float8_e8m0fnu")
     expected = (
         (
@@ -397,18 +425,24 @@ def validate_native_forward_weights(
 
 
 def validate_native_backward_weights(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     weights: MoeEpNativeBackwardWeights,
     *,
     device: torch.device | None = None,
 ) -> torch.device:
     if not isinstance(weights, MoeEpNativeBackwardWeights):
         raise TypeError("weights must be a MoeEpNativeBackwardWeights, " f"got {type(weights).__name__}")
-    if config.fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
-        raise ValueError("native training weights require weight_interleave_size=32")
-    experts = config.experts_per_rank
-    hidden = config.hidden_size
-    intermediate = config.intermediate_size
+    if (
+        config.public_config.data_path.fc1_weight_layout
+        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+    ):
+        raise ValueError(
+            "native training weights require "
+            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
+        )
+    experts = config.topology.experts_per_rank
+    hidden = config.public_config.model.hidden_size
+    intermediate = config.public_config.model.intermediate_size
     sf_dtype = _require_torch_dtype("float8_e8m0fnu")
     expected = (
         (
@@ -495,7 +529,7 @@ def _validate_discrete_weight(
 
 
 def validate_native_discrete_forward_weights(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     weights: MoeEpNativeDiscreteForwardWeights,
     *,
     device: torch.device | None = None,
@@ -508,13 +542,19 @@ def validate_native_discrete_forward_weights(
             "weights must be a MoeEpNativeDiscreteForwardWeights, "
             f"got {type(weights).__name__}"
         )
-    if config.fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
-        raise ValueError("native training weights require weight_interleave_size=32")
+    if (
+        config.public_config.data_path.fc1_weight_layout
+        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+    ):
+        raise ValueError(
+            "native training weights require "
+            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
+        )
     resolved = _validate_discrete_weight(
         "weights.fc1",
         weights.fc1,
         layout_id=MoeEpNativeWeightLayout.FORWARD_FC1_GATE_UP_INTERLEAVED_32_V1,
-        experts=config.experts_per_rank,
+        experts=config.topology.experts_per_rank,
         device=device,
         validate_pointees=validate_pointees,
     )
@@ -522,14 +562,14 @@ def validate_native_discrete_forward_weights(
         "weights.fc2",
         weights.fc2,
         layout_id=MoeEpNativeWeightLayout.FORWARD_FC2_K_MAJOR_V1,
-        experts=config.experts_per_rank,
+        experts=config.topology.experts_per_rank,
         device=resolved,
         validate_pointees=validate_pointees,
     )
 
 
 def validate_native_discrete_backward_weights(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     weights: MoeEpNativeDiscreteBackwardWeights,
     *,
     device: torch.device | None = None,
@@ -542,13 +582,19 @@ def validate_native_discrete_backward_weights(
             "weights must be a MoeEpNativeDiscreteBackwardWeights, "
             f"got {type(weights).__name__}"
         )
-    if config.fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
-        raise ValueError("native training weights require weight_interleave_size=32")
+    if (
+        config.public_config.data_path.fc1_weight_layout
+        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+    ):
+        raise ValueError(
+            "native training weights require "
+            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
+        )
     resolved = _validate_discrete_weight(
         "weights.w2_transpose",
         weights.w2_transpose,
         layout_id=MoeEpNativeWeightLayout.BACKWARD_W2_DGRAD_NK_ROW_MAJOR_V1,
-        experts=config.experts_per_rank,
+        experts=config.topology.experts_per_rank,
         device=device,
         validate_pointees=validate_pointees,
     )
@@ -558,14 +604,14 @@ def validate_native_discrete_backward_weights(
         layout_id=(
             MoeEpNativeWeightLayout.BACKWARD_W1_DGRAD_GATE_UP_INTERLEAVED_32_NK_ROW_MAJOR_V1
         ),
-        experts=config.experts_per_rank,
+        experts=config.topology.experts_per_rank,
         device=resolved,
         validate_pointees=validate_pointees,
     )
 
 
 def validate_training_input(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     name: str,
     value: MoeTensor,
     topk_idx: torch.Tensor,
@@ -575,8 +621,12 @@ def validate_training_input(
     validate_expert_ids: bool = True,
 ) -> int:
     logical_shape = _logical_shape(value)
-    if len(logical_shape) != 2 or logical_shape[1] != config.hidden_size:
-        raise ValueError(f"{name} logical shape must be (T, {config.hidden_size}), " f"got {logical_shape}")
+    hidden_size = config.public_config.model.hidden_size
+    if len(logical_shape) != 2 or logical_shape[1] != hidden_size:
+        raise ValueError(
+            f"{name} logical shape must be (T, {hidden_size}), "
+            f"got {logical_shape}"
+        )
     _validate_tensor_representation(name, value, logical_shape)
     if isinstance(value, BlockScaledTensor):
         if value.format is not MoeFormat.MXFP8:

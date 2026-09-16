@@ -11,18 +11,21 @@ module.
 from __future__ import annotations
 
 import contextlib
-import math
 import threading
 import warnings
 import weakref
-from dataclasses import replace
-from numbers import Real
-from typing import Literal, Mapping, Optional, Sequence, Union
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Literal, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
 
-from ._contracts import Fc1WeightLayout, ForwardConfig, normalize_fc1_weight_layout
+from ._config import (
+    MoeEpConfig,
+    MoeEpFc1WeightLayout,
+    ResolvedMoeEpConfig,
+    resolve_moe_ep_config,
+)
 from ._tuning import (
     MoeEpAutotuneCandidateResult,
     MoeEpAutotuneResult,
@@ -45,8 +48,6 @@ from ._types import (
     MoeEpTrainingWgradOperands,
     MoeFormat,
     MoeTensor,
-    parse_native_weight_storage_mode,
-    parse_format as _parse_format,
 )
 from ._validation import (
     validate_backward_source_weights,
@@ -63,40 +64,41 @@ from ._validation import (
     validate_training_non_aliasing,
 )
 
-
-def _resolve_ep_topology(
-    ep_group: Optional[dist.ProcessGroup],
-) -> tuple[int, int, tuple[int, ...]]:
-    """Return dense EP rank/size plus its ordered global-rank membership."""
-
-    if ep_group is None:
-        return 1, 0, ()
-    if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError("ep_group requires an initialized torch.distributed process group")
-
-    ep_size = dist.get_world_size(ep_group)
-    ep_rank = dist.get_rank(ep_group)
-    if ep_size <= 0 or ep_rank < 0 or ep_rank >= ep_size:
-        raise ValueError("the current process must be a member of ep_group")
-
-    ep_global_ranks = tuple(dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size))
-    if len(set(ep_global_ranks)) != ep_size:
-        raise RuntimeError("ep_group returned duplicate global ranks")
-    if ep_global_ranks[ep_rank] != dist.get_rank():
-        raise RuntimeError("ep_group rank mapping is inconsistent with the current global rank")
-    return ep_size, ep_rank, ep_global_ranks
+if TYPE_CHECKING:
+    from ._backend import MoeEpBackend
 
 
-def _validate_training_assert_capability(config: ForwardConfig) -> None:
+@dataclass(frozen=True)
+class _MoeEpExecutionState:
+    resolved_config: ResolvedMoeEpConfig
+    backend: "MoeEpBackend | None"
+
+    def __post_init__(self) -> None:
+        if self.backend is None:
+            return
+        if self.backend.resolved_config is not self.resolved_config:
+            raise ValueError(
+                "backend must own the exact resolved config generation"
+            )
+        if self.backend.device.type != "cuda" or self.backend.device.index is None:
+            raise ValueError(
+                "backend must expose a CUDA device with a concrete ordinal"
+            )
+
+
+def _validate_training_assert_capability(
+    config: ResolvedMoeEpConfig,
+) -> None:
     """Fail before allocation when graph error-mode primitives are unavailable."""
 
-    if config.drop_on_overflow:
+    parallel = config.public_config.parallel
+    if parallel.drop_on_overflow:
         return
     if not callable(getattr(torch, "_assert_async", None)):
         raise RuntimeError("drop_on_overflow=False training requires callable " "torch._assert_async before CUDA Graph capture")
-    if config.ep_size <= 1:
+    if config.topology.ep_size <= 1:
         return
-    backend = dist.get_backend(config.ep_group)
+    backend = dist.get_backend(parallel.ep_group)
     if backend != dist.Backend.NCCL and str(backend).lower() != "nccl":
         raise NotImplementedError("drop_on_overflow=False EP2+ training requires an NCCL " "process group for the captured scalar global overflow OR")
 
@@ -147,7 +149,7 @@ def pack_forward_weights(
     return materialize_forward(
         weights,
         out=out,
-        fc1_weight_layout=Fc1WeightLayout.GATE_UP_INTERLEAVED_32,
+        fc1_weight_layout=MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32,
     )
 
 
@@ -163,7 +165,7 @@ def pack_backward_weights(
     return materialize_backward(
         weights,
         out=out,
-        fc1_weight_layout=Fc1WeightLayout.GATE_UP_INTERLEAVED_32,
+        fc1_weight_layout=MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32,
     )
 
 
@@ -173,6 +175,11 @@ class MoeEp:
     Global expert ``e`` belongs to group-relative EP rank
     ``e // experts_per_rank``.  The constructor captures static configuration;
     calling the instance accepts runtime tensors for this rank.
+
+    Construction is config-only: pass one frozen :class:`MoeEpConfig`.
+    Nested model, parallel, data-path, and phase-specific tuning values are
+    exposed through read-only properties. There is no scalar-kwargs
+    constructor or post-construction general reconfiguration surface.
 
     The Rubin training-Mega backend accepts plain BF16/FP32 operands
     (staged to MXFP8 E4M3) or MXFP8 ``BlockScaledTensor`` operands. Final
@@ -208,154 +215,13 @@ class MoeEp:
     shrinking the requested backing pool.
     """
 
-    def __init__(
-        self,
-        *,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size: int,
-        top_k: int,
-        ep_group: Optional[dist.ProcessGroup] = None,
-        max_tokens_per_rank: Optional[int] = None,
-        max_recv_size_per_rank: Optional[int] = None,
-        drop_on_overflow: bool = False,
-        output_format: Union[MoeFormat, str] = MoeFormat.BF16,
-        combine_format: Union[MoeFormat, str] = MoeFormat.BF16,
-        apply_topk_in_fc1: bool = True,
-        weight_interleave_size: Optional[int] = None,
-        gate_up_clamp: Optional[float] = None,
-        token_padding_size: int = 128,
-        sf_padding_size: int = 128,
-        tuning: Optional[MoeEpTuningConfig] = None,
-        forward_tuning: Optional[MoeEpTuningConfig] = None,
-        backward_tuning: Optional[MoeEpTuningConfig] = None,
-        validation_mode: Literal["strict", "trusted"] = "strict",
-    ) -> None:
+    def __init__(self, config: MoeEpConfig) -> None:
         self._lifecycle_lock = threading.RLock()
-        for name, value in (
-            ("num_experts", num_experts),
-            ("hidden_size", hidden_size),
-            ("intermediate_size", intermediate_size),
-            ("top_k", top_k),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer, got {value!r}")
-        if top_k > num_experts:
-            raise ValueError(f"top_k ({top_k}) cannot exceed num_experts ({num_experts})")
-        if max_tokens_per_rank is not None and (isinstance(max_tokens_per_rank, bool) or not isinstance(max_tokens_per_rank, int) or max_tokens_per_rank < 0):
-            raise ValueError("max_tokens_per_rank must be a non-negative integer or None")
-        if max_recv_size_per_rank is not None and (
-            isinstance(max_recv_size_per_rank, bool) or not isinstance(max_recv_size_per_rank, int) or max_recv_size_per_rank <= 0
-        ):
-            raise ValueError("max_recv_size_per_rank must be a positive integer or None")
-        if max_recv_size_per_rank is not None and max_recv_size_per_rank % 128:
-            raise ValueError("max_recv_size_per_rank must satisfy P % 128 == 0, " f"got P={max_recv_size_per_rank}")
-        if not isinstance(drop_on_overflow, bool):
-            raise ValueError("drop_on_overflow must be a bool")
-        if not isinstance(apply_topk_in_fc1, bool):
-            raise ValueError("apply_topk_in_fc1 must be a bool")
-        fc1_weight_layout = normalize_fc1_weight_layout(weight_interleave_size)
-        for name, value in (
-            ("token_padding_size", token_padding_size),
-            ("sf_padding_size", sf_padding_size),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer, got {value!r}")
-        if sf_padding_size % 128:
-            raise ValueError("sf_padding_size must be a positive multiple of 128, " f"got {sf_padding_size}")
-        for name, value in (
-            ("tuning", tuning),
-            ("forward_tuning", forward_tuning),
-            ("backward_tuning", backward_tuning),
-        ):
-            if value is not None and not isinstance(value, MoeEpTuningConfig):
-                raise TypeError(f"{name} must be a MoeEpTuningConfig or None, " f"got {type(value).__name__}")
-        if tuning is not None and forward_tuning is not None:
-            raise ValueError("tuning and forward_tuning are aliases; pass only one")
-        if validation_mode not in ("strict", "trusted"):
-            raise ValueError("validation_mode must be 'strict' or 'trusted', " f"got {validation_mode!r}")
-        if gate_up_clamp is not None:
-            if isinstance(gate_up_clamp, bool) or not isinstance(gate_up_clamp, Real):
-                raise ValueError("gate_up_clamp must be a finite real number or None")
-            gate_up_clamp = float(gate_up_clamp)
-            if not math.isfinite(gate_up_clamp):
-                raise ValueError("gate_up_clamp must be a finite real number or None")
-
-        if ep_group is not None and not isinstance(ep_group, dist.ProcessGroup):
-            raise ValueError(f"ep_group must be a torch.distributed.ProcessGroup or None, " f"got {type(ep_group).__name__}")
-        ep_size, ep_rank, ep_global_ranks = _resolve_ep_topology(ep_group)
-        if num_experts % ep_size != 0:
-            raise ValueError(f"num_experts ({num_experts}) must be divisible by EP size ({ep_size})")
-
-        self.num_experts = num_experts
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.top_k = top_k
-        self.ep_group = ep_group
-        self.ep_size = ep_size
-        self.ep_rank = ep_rank
-        self.ep_global_ranks = ep_global_ranks
-        self.experts_per_rank = num_experts // ep_size
-        self.max_tokens_per_rank = max_tokens_per_rank
-        self.max_recv_size_per_rank = max_recv_size_per_rank
-        self.drop_on_overflow = drop_on_overflow
-        self.output_format = _parse_format(output_format)
-        self.combine_format = _parse_format(combine_format)
-        self.apply_topk_in_fc1 = apply_topk_in_fc1
-        self.weight_interleave_size = weight_interleave_size
-        self._fc1_weight_layout = fc1_weight_layout
-        self.gate_up_clamp = None if gate_up_clamp is None else abs(gate_up_clamp)
-        self.token_padding_size = token_padding_size
-        self.sf_padding_size = sf_padding_size
-        self.forward_tuning = forward_tuning if forward_tuning is not None else MoeEpTuningConfig() if tuning is None else tuning
-        self.backward_tuning = backward_tuning if backward_tuning is not None else MoeEpTuningConfig()
-        # Backward-compatible alias for inference and forward-only autotuning.
-        self.tuning = self.forward_tuning
-        self._validation_mode = validation_mode
-        if self.forward_tuning.reduce_topk_in_kernel and (
-            self.combine_format is not MoeFormat.BF16 or self.output_format is not MoeFormat.BF16 or not self.apply_topk_in_fc1
-        ):
-            raise ValueError("reduce_topk_in_kernel requires BF16 combine/output and " "apply_topk_in_fc1=True")
-        if self.backward_tuning.token_back_mode != "epi_warps":
-            raise ValueError("backward_tuning requires token_back_mode='epi_warps'")
-        if self.backward_tuning.reduce_topk_in_kernel:
-            raise ValueError("backward_tuning does not support reduce_topk_in_kernel=True")
-
-        for name, fmt in (
-            ("output_format", self.output_format),
-            ("combine_format", self.combine_format),
-        ):
-            required_multiple = 32 if fmt is MoeFormat.MXFP8 else 16 if fmt is MoeFormat.NVFP4 else 1
-            if hidden_size % required_multiple != 0:
-                raise ValueError(f"hidden_size ({hidden_size}) must be divisible by " f"{required_multiple} for {name}={fmt.value}")
-
-        self._forward_config = ForwardConfig(
-            num_experts=self.num_experts,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            top_k=self.top_k,
-            experts_per_rank=self.experts_per_rank,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
-            ep_group=self.ep_group,
-            ep_global_ranks=self.ep_global_ranks,
-            max_tokens_per_rank=self.max_tokens_per_rank,
-            max_recv_size_per_rank=self.max_recv_size_per_rank,
-            drop_on_overflow=self.drop_on_overflow,
-            output_format=self.output_format.value,
-            combine_format=self.combine_format.value,
-            apply_topk_in_fc1=self.apply_topk_in_fc1,
-            fc1_weight_layout=self._fc1_weight_layout,
-            gate_up_clamp=self.gate_up_clamp,
-            generate_c=False,
-            token_padding_size=self.token_padding_size,
-            sf_padding_size=self.sf_padding_size,
-            tuning=self.forward_tuning,
-            backward_tuning=self.backward_tuning,
-            backward_wgrad_mode="none",
+        resolved = resolve_moe_ep_config(config)
+        self._execution_state = _MoeEpExecutionState(
+            resolved_config=resolved,
+            backend=None,
         )
-        self._forward_backend = None
-        self._forward_backend_device = None
         self._validated_topk_idx = None
         self._validated_topk_version = None
         self._training_state = None
@@ -366,9 +232,6 @@ class MoeEp:
             ]
             | None
         ) = None
-        self._autotuned_training_weight_storage_mode: (
-            MoeEpNativeWeightStorageMode | None
-        ) = None
         self._validated_discrete_pointer_tables: dict[
             int,
             tuple[weakref.ReferenceType[torch.Tensor], int, int],
@@ -377,10 +240,106 @@ class MoeEp:
         self._closed = False
 
     @property
+    def config(self) -> MoeEpConfig:
+        return self._execution_state.resolved_config.public_config
+
+    @property
+    def num_experts(self) -> int:
+        return self.config.model.num_experts
+
+    @property
+    def hidden_size(self) -> int:
+        return self.config.model.hidden_size
+
+    @property
+    def intermediate_size(self) -> int:
+        return self.config.model.intermediate_size
+
+    @property
+    def top_k(self) -> int:
+        return self.config.model.top_k
+
+    @property
+    def ep_group(self) -> dist.ProcessGroup | None:
+        return self.config.parallel.ep_group
+
+    @property
+    def ep_size(self) -> int:
+        return self._execution_state.resolved_config.topology.ep_size
+
+    @property
+    def ep_rank(self) -> int:
+        return self._execution_state.resolved_config.topology.ep_rank
+
+    @property
+    def ep_global_ranks(self) -> tuple[int, ...]:
+        return self._execution_state.resolved_config.topology.ep_global_ranks
+
+    @property
+    def experts_per_rank(self) -> int:
+        return self._execution_state.resolved_config.topology.experts_per_rank
+
+    @property
+    def max_tokens_per_rank(self) -> int | None:
+        return self.config.parallel.max_tokens_per_rank
+
+    @property
+    def max_recv_size_per_rank(self) -> int | None:
+        return self.config.parallel.max_recv_size_per_rank
+
+    @property
+    def drop_on_overflow(self) -> bool:
+        return self.config.parallel.drop_on_overflow
+
+    @property
+    def token_padding_size(self) -> int:
+        return self.config.parallel.token_padding_size
+
+    @property
+    def sf_padding_size(self) -> int:
+        return self.config.parallel.sf_padding_size
+
+    @property
+    def output_format(self) -> MoeFormat:
+        return self.config.data_path.output_format
+
+    @property
+    def combine_format(self) -> MoeFormat:
+        return self.config.data_path.combine_format
+
+    @property
+    def apply_topk_in_fc1(self) -> bool:
+        return self.config.data_path.apply_topk_in_fc1
+
+    @property
+    def fc1_weight_layout(self) -> MoeEpFc1WeightLayout:
+        return self.config.data_path.fc1_weight_layout
+
+    @property
+    def gate_up_clamp(self) -> float | None:
+        return self.config.data_path.gate_up_clamp
+
+    @property
+    def inference_tuning(self) -> MoeEpTuningConfig:
+        return self.config.inference_tuning
+
+    @property
+    def training_forward_tuning(self) -> MoeEpTuningConfig:
+        return self.config.training_forward_tuning
+
+    @property
+    def training_backward_tuning(self) -> MoeEpTuningConfig:
+        return self.config.training_backward_tuning
+
+    @property
+    def training_weight_storage_mode(self) -> MoeEpNativeWeightStorageMode:
+        return self.config.training_weight_storage_mode
+
+    @property
     def validation_mode(self) -> Literal["strict", "trusted"]:
         """Return the immutable expert-ID validation policy."""
 
-        return self._validation_mode
+        return self.config.validation_mode
 
     @staticmethod
     def _tensor_version(tensor: torch.Tensor) -> int | None:
@@ -469,7 +428,7 @@ class MoeEp:
             and any(not is_validated(table) for table in tables)
         )
         validate(
-            self._forward_config,
+            self._execution_state.resolved_config,
             weights,
             device=device,
             validate_pointees=validate_pointees,
@@ -533,19 +492,25 @@ class MoeEp:
                 raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             from . import _backend
 
-            if self._forward_backend is not None and request.device != self._forward_backend_device:
-                raise ValueError(f"MoeEp backend is bound to {self._forward_backend_device}; " f"create a separate MoeEp instance for {request.device}")
+            state = self._execution_state
+            resolved = state.resolved_config
+            backend = state.backend
+            if backend is not None and request.device != backend.device:
+                raise ValueError(
+                    f"MoeEp backend is bound to {backend.device}; "
+                    f"create a separate MoeEp instance for {request.device}"
+                )
 
-            _backend.validate_config(self._forward_config)
-            _backend.validate_request(request)
+            _backend.validate_config(resolved)
+            _backend.validate_request(resolved, request)
 
-            if self._forward_backend is None:
-                self._forward_backend = _backend.create_backend(
-                    self._forward_config,
+            if backend is None:
+                backend = _backend.create_backend(
+                    resolved,
                     request.device,
                 )
-                self._forward_backend_device = request.device
-            return self._forward_backend
+                self._execution_state = replace(state, backend=backend)
+            return backend
 
     def __call__(
         self,
@@ -575,8 +540,9 @@ class MoeEp:
             validate_expert_ids = strict_validation and not (
                 self._validated_topk_idx is topk_idx and topk_version is not None and topk_version == self._validated_topk_version
             )
+            resolved = self._execution_state.resolved_config
             request = validate_forward(
-                self._forward_config,
+                resolved,
                 activation,
                 fc1_weight,
                 fc2_weight,
@@ -593,7 +559,7 @@ class MoeEp:
                 self._validated_topk_version = None
             return self._get_backend(request).forward(request)
 
-    def autotune(
+    def autotune_inference(
         self,
         activation: MoeTensor,
         fc1_weight: MoeTensor,
@@ -630,31 +596,52 @@ class MoeEp:
             if self._poisoned:
                 raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             if self._training_state is not None:
-                raise RuntimeError("autotune must be called before prepare_training()")
+                raise RuntimeError(
+                    "autotune_inference must be called before "
+                    "prepare_training()"
+                )
 
+            state = self._execution_state
+            # Keep the active backend alive until a winner passes final
+            # validation. Candidate failure must not invalidate its warmed
+            # workspace or any CUDA Graph that still references it.
+            group = state.resolved_config.public_config.parallel.ep_group
             normalized = normalize_candidates(
-                self.tuning,
+                state.resolved_config.public_config.inference_tuning,
                 candidates,
                 warmup_iters=warmup_iters,
                 timed_iters=timed_iters,
                 max_candidates=max_candidates,
             )
-            verify_candidates_across_ranks(normalized, self._forward_config.ep_group)
+            verify_candidates_across_ranks(normalized, group)
             verify_state_across_ranks(
                 (
-                    self._forward_backend is not None,
+                    state.backend is not None,
                     self._training_state is not None,
-                    (None if self._forward_backend_device is None else str(self._forward_backend_device)),
+                    (
+                        None
+                        if state.backend is None
+                        else str(state.backend.device)
+                    ),
                 ),
-                self._forward_config.ep_group,
+                group,
             )
 
-            candidate_requests = []
+            candidate_requests: list[
+                tuple[ResolvedMoeEpConfig, object]
+            ] = []
             preflight_error: BaseException | None = None
             try:
                 for index, tuning in enumerate(normalized):
                     try:
-                        config = replace(self._forward_config, tuning=tuning)
+                        public_config = replace(
+                            state.resolved_config.public_config,
+                            inference_tuning=tuning,
+                        )
+                        config = ResolvedMoeEpConfig(
+                            public_config=public_config,
+                            topology=state.resolved_config.topology,
+                        )
                         request = validate_forward(
                             config,
                             activation,
@@ -666,12 +653,21 @@ class MoeEp:
                         )
                         if request.device.type != "cuda":
                             raise ValueError(f"autotune requires CUDA inputs, got {request.device}")
+                        if (
+                            state.backend is not None
+                            and state.backend.device != request.device
+                        ):
+                            raise ValueError(
+                                "MoeEp backend is bound to "
+                                f"{state.backend.device}; cannot autotune on "
+                                f"{request.device}"
+                            )
                         with torch.cuda.device(request.device):
                             if torch.cuda.is_current_stream_capturing():
                                 raise RuntimeError("autotune cannot run during CUDA Graph capture")
                         _backend.validate_config(config)
-                        _backend.validate_request(request)
-                        candidate_requests.append(request)
+                        _backend.validate_request(config, request)
+                        candidate_requests.append((config, request))
                     except BaseException as exc:
                         raise RuntimeError(f"MoeEp autotune candidate {index} {tuning!r} " f"failed during preflight: {exc}") from exc
             except BaseException as exc:
@@ -679,32 +675,24 @@ class MoeEp:
             raise_preflight_errors(
                 preflight_error,
                 phase="inference preflight",
-                group=self._forward_config.ep_group,
+                group=group,
             )
             assert candidate_requests
-            device = candidate_requests[0].device
-
-            if self._forward_backend is not None:
-                try:
-                    synchronize_candidate(device, self._forward_config.ep_group)
-                    self._forward_backend.close()
-                    self._forward_backend = None
-                    self._forward_backend_device = None
-                    if self._forward_config.ep_group is not None:
-                        dist.barrier(group=self._forward_config.ep_group)
-                except BaseException as exc:
-                    self._poisoned = True
-                    raise RuntimeError(f"MoeEp autotune failed during active backend teardown: {exc}") from exc
+            device = candidate_requests[0][1].device
 
             results: list[MoeEpAutotuneCandidateResult] = []
-            for index, (tuning, request) in enumerate(zip(normalized, candidate_requests)):
+            for index, (tuning, candidate) in enumerate(
+                zip(normalized, candidate_requests)
+            ):
+                candidate_config, request = candidate
                 backend = None
-                runtime_entered = False
                 phase = "backend creation"
                 try:
-                    backend = _backend.create_backend(request.config, device)
+                    backend = _backend.create_backend(
+                        candidate_config,
+                        device,
+                    )
                     phase = "compile/prime"
-                    runtime_entered = True
                     with torch.cuda.device(device):
                         output = backend.forward(request)
                         del output
@@ -713,16 +701,16 @@ class MoeEp:
                             output = backend.forward(request)
                             del output
                         phase = "pre-timing synchronize"
-                        synchronize_candidate(device, self._forward_config.ep_group)
+                        synchronize_candidate(device, group)
                         phase = "timing"
                         latency_ms, samples_ms = benchmark_candidate(
                             lambda: backend.forward(request),
                             device=device,
-                            group=self._forward_config.ep_group,
+                            group=group,
                             timed_iters=timed_iters,
                         )
                         phase = "post-timing synchronize"
-                        synchronize_candidate(device, self._forward_config.ep_group)
+                        synchronize_candidate(device, group)
                     results.append(
                         MoeEpAutotuneCandidateResult(
                             tuning=tuning,
@@ -733,53 +721,66 @@ class MoeEp:
                     phase = "teardown"
                     backend.close()
                     backend = None
-                    if self._forward_config.ep_group is not None:
-                        dist.barrier(group=self._forward_config.ep_group)
+                    if group is not None:
+                        dist.barrier(group=group)
                 except BaseException as exc:
-                    if backend is not None and self._forward_config.ep_size == 1:
+                    if backend is not None:
                         with contextlib.suppress(Exception):
                             backend.close()
-                    if runtime_entered:
-                        self._poisoned = True
                     raise RuntimeError(f"MoeEp autotune candidate {index} {tuning!r} failed during {phase}: {exc}") from exc
 
             winner = select_winner(results)
-            winner_request = candidate_requests[normalized.index(winner.tuning)]
+            winner_config, winner_request = candidate_requests[
+                normalized.index(winner.tuning)
+            ]
             winner_backend = None
             try:
                 winner_backend = _backend.create_backend(
-                    winner_request.config,
+                    winner_config,
                     device,
                 )
                 with torch.cuda.device(device):
                     output = winner_backend.forward(winner_request)
                     del output
-                    synchronize_candidate(device, self._forward_config.ep_group)
+                    synchronize_candidate(device, group)
             except BaseException as exc:
-                if winner_backend is not None and self._forward_config.ep_size == 1:
+                if winner_backend is not None:
                     with contextlib.suppress(Exception):
                         winner_backend.close()
-                self._poisoned = True
                 raise RuntimeError(f"MoeEp autotune winner {winner.tuning!r} failed final validation: {exc}") from exc
 
-            self.forward_tuning = winner.tuning
-            self.tuning = self.forward_tuning
-            self._forward_config = winner_request.config
-            self._forward_backend = winner_backend
-            self._forward_backend_device = device
+            old_backend = state.backend
+            if old_backend is not None:
+                try:
+                    synchronize_candidate(device, group)
+                    old_backend.close()
+                    if group is not None:
+                        dist.barrier(group=group)
+                except BaseException as exc:
+                    with contextlib.suppress(Exception):
+                        winner_backend.close()
+                    self._poisoned = True
+                    raise RuntimeError(
+                        "MoeEp autotune_inference failed during active "
+                        f"backend replacement: {exc}"
+                    ) from exc
+            self._execution_state = _MoeEpExecutionState(
+                resolved_config=winner_config,
+                backend=winner_backend,
+            )
             self._validated_topk_idx = None
             self._validated_topk_version = None
-            self._autotuned_training_weight_storage_mode = None
             return MoeEpAutotuneResult(
                 mode="inference",
                 winner=winner.tuning,
                 candidates=tuple(results),
             )
 
-    def autotune_training(
+    def _autotune_training_phase(
         self,
+        phase_name: Literal["training_forward", "training_backward"],
         activation: MoeTensor,
-        grad_output: MoeTensor,
+        grad_output: MoeTensor | None,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         *,
@@ -787,22 +788,16 @@ class MoeEp:
             MoeEpNativeForwardWeights | MoeEpNativeDiscreteForwardWeights
         ),
         backward_weights: (
-            MoeEpNativeBackwardWeights | MoeEpNativeDiscreteBackwardWeights
+            MoeEpNativeBackwardWeights
+            | MoeEpNativeDiscreteBackwardWeights
+            | None
         ),
         candidates: Sequence[MoeEpTuningConfig],
-        native_weight_storage_mode: (
-            MoeEpNativeWeightStorageMode | str
-        ) = MoeEpNativeWeightStorageMode.CONTIGUOUS,
         warmup_iters: int = 3,
         timed_iters: int = 10,
         max_candidates: int = 32,
     ) -> MoeEpAutotuneResult:
-        """Sweep complete training forward+backward latency and apply the winner.
-
-        This collective API uses private single-instance temporary resources. It must
-        run before :meth:`prepare_training` and accepts kernel-native weights
-        so packing allocation and source-layout conversion are not timed.
-        """
+        """Sweep one training phase and atomically apply its winner."""
 
         from . import _backend
         from ._autotune import (
@@ -826,43 +821,96 @@ class MoeEp:
             if self._poisoned:
                 raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             if self._training_state is not None:
-                raise RuntimeError("autotune_training must be called before prepare_training()")
-            weight_storage_mode = parse_native_weight_storage_mode(
-                native_weight_storage_mode
+                raise RuntimeError(
+                    f"autotune_{phase_name} must be called before "
+                    "prepare_training()"
+                )
+            execution_state = self._execution_state
+            weight_storage_mode = (
+                execution_state.resolved_config.public_config.training_weight_storage_mode
             )
+            # Training candidates coexist with the active inference backend;
+            # only a successful winner commit retires that backend.
+            group = (
+                execution_state.resolved_config.public_config.parallel.ep_group
+            )
+            if phase_name == "training_backward":
+                if grad_output is None or backward_weights is None:
+                    raise TypeError(
+                        "training backward autotune requires grad_output and "
+                        "backward_weights"
+                    )
 
+            baseline_tuning = (
+                execution_state.resolved_config.public_config.training_forward_tuning
+                if phase_name == "training_forward"
+                else execution_state.resolved_config.public_config.training_backward_tuning
+            )
             normalized = normalize_candidates(
-                self.tuning,
+                baseline_tuning,
                 candidates,
                 warmup_iters=warmup_iters,
                 timed_iters=timed_iters,
                 max_candidates=max_candidates,
             )
-            verify_candidates_across_ranks(normalized, self._forward_config.ep_group)
+            verify_candidates_across_ranks(normalized, group)
             verify_state_across_ranks(
                 (
-                    self._forward_backend is not None,
+                    execution_state.backend is not None,
                     self._training_state is not None,
-                    (None if self._forward_backend_device is None else str(self._forward_backend_device)),
+                    (
+                        None
+                        if execution_state.backend is None
+                        else str(execution_state.backend.device)
+                    ),
                     weight_storage_mode.value,
                 ),
-                self._forward_config.ep_group,
+                group,
             )
 
             device: torch.device | None = None
             preflight_error: BaseException | None = None
-            candidate_configs: list[ForwardConfig] = []
+            candidate_configs: list[ResolvedMoeEpConfig] = []
             token_count = -1
             try:
                 device = torch.device(activation.device)
                 if device.type != "cuda":
-                    raise ValueError(f"autotune_training requires CUDA inputs, got {device}")
+                    raise ValueError(
+                        f"autotune_{phase_name} requires CUDA inputs, "
+                        f"got {device}"
+                    )
+                if (
+                    execution_state.backend is not None
+                    and execution_state.backend.device != device
+                ):
+                    raise ValueError(
+                        "MoeEp backend is bound to "
+                        f"{execution_state.backend.device}; cannot autotune "
+                        f"on {device}"
+                    )
                 with torch.cuda.device(device):
                     if torch.cuda.is_current_stream_capturing():
-                        raise RuntimeError("autotune_training cannot run during CUDA Graph capture")
+                        raise RuntimeError(
+                            f"autotune_{phase_name} cannot run during "
+                            "CUDA Graph capture"
+                        )
                 for index, tuning in enumerate(normalized):
                     try:
-                        config = replace(self._forward_config, tuning=tuning)
+                        public_config = execution_state.resolved_config.public_config
+                        if phase_name == "training_forward":
+                            public_config = replace(
+                                public_config,
+                                training_forward_tuning=tuning,
+                            )
+                        else:
+                            public_config = replace(
+                                public_config,
+                                training_backward_tuning=tuning,
+                            )
+                        config = ResolvedMoeEpConfig(
+                            public_config=public_config,
+                            topology=execution_state.resolved_config.topology,
+                        )
                         _validate_training_assert_capability(config)
                         _backend.validate_config(config)
                         activation_tokens = validate_training_input(
@@ -874,79 +922,82 @@ class MoeEp:
                             device=device,
                             validate_expert_ids=self.validation_mode == "strict",
                         )
-                        grad_tokens = validate_training_input(
-                            config,
-                            "grad_output",
-                            grad_output,
-                            topk_idx,
-                            topk_weights,
-                            device=device,
-                            validate_expert_ids=self.validation_mode == "strict",
-                        )
-                        if activation_tokens != grad_tokens:
-                            raise ValueError("activation and grad_output must have the same token " f"count, got {activation_tokens} and {grad_tokens}")
+                        if phase_name == "training_backward":
+                            assert grad_output is not None
+                            grad_tokens = validate_training_input(
+                                config,
+                                "grad_output",
+                                grad_output,
+                                topk_idx,
+                                topk_weights,
+                                device=device,
+                                validate_expert_ids=(
+                                    self.validation_mode == "strict"
+                                ),
+                            )
+                            if activation_tokens != grad_tokens:
+                                raise ValueError(
+                                    "activation and grad_output must have the "
+                                    "same token count, got "
+                                    f"{activation_tokens} and {grad_tokens}"
+                                )
                         if weight_storage_mode is MoeEpNativeWeightStorageMode.DISCRETE:
                             self._validate_discrete_pointer_lifetime(
                                 forward_weights,
                                 validate=validate_native_discrete_forward_weights,
                                 device=device,
                             )
-                            self._validate_discrete_pointer_lifetime(
-                                backward_weights,
-                                validate=validate_native_discrete_backward_weights,
-                                device=device,
-                            )
+                            if phase_name == "training_backward":
+                                assert backward_weights is not None
+                                self._validate_discrete_pointer_lifetime(
+                                    backward_weights,
+                                    validate=(
+                                        validate_native_discrete_backward_weights
+                                    ),
+                                    device=device,
+                                )
                         else:
                             validate_native_forward_weights(
                                 config,
                                 forward_weights,
                                 device=device,
                             )
-                            validate_native_backward_weights(
-                                config,
-                                backward_weights,
-                                device=device,
-                            )
+                            if phase_name == "training_backward":
+                                assert backward_weights is not None
+                                validate_native_backward_weights(
+                                    config,
+                                    backward_weights,
+                                    device=device,
+                                )
                         token_count = activation_tokens
                         candidate_configs.append(config)
                     except BaseException as exc:
-                        raise RuntimeError(f"MoeEp autotune_training candidate {index} {tuning!r} " f"failed during preflight: {exc}") from exc
+                        raise RuntimeError(
+                            f"MoeEp autotune_{phase_name} candidate {index} "
+                            f"{tuning!r} failed during preflight: {exc}"
+                        ) from exc
             except BaseException as exc:
                 preflight_error = exc
             raise_preflight_errors(
                 preflight_error,
-                phase="training preflight",
-                group=self._forward_config.ep_group,
+                phase=f"{phase_name} preflight",
+                group=group,
             )
             assert device is not None and candidate_configs and token_count >= 0
-
-            if self._forward_backend is not None:
-                try:
-                    synchronize_candidate(device, self._forward_config.ep_group)
-                    self._forward_backend.close()
-                    self._forward_backend = None
-                    self._forward_backend_device = None
-                    if self._forward_config.ep_group is not None:
-                        dist.barrier(group=self._forward_config.ep_group)
-                except BaseException as exc:
-                    self._poisoned = True
-                    raise RuntimeError("MoeEp autotune_training failed during active backend " f"teardown: {exc}") from exc
 
             results: list[MoeEpAutotuneCandidateResult] = []
             for index, (tuning, config) in enumerate(zip(normalized, candidate_configs)):
                 backend = None
-                runtime_entered = False
                 phase = "backend creation"
                 try:
                     backend = _backend.create_backend(config, device)
-                    runtime_entered = True
                     phase = "training preparation"
                     with torch.cuda.device(device):
-                        state = backend.prepare_training(
-                            native_weight_storage_mode=weight_storage_mode.value,
+                        training_state = backend.prepare_training()
+                        requirements = training_state.public_requirements()
+                        symmetric_buffers = (
+                            training_state.public_symmetric_buffers()
                         )
-                        requirements = state.public_requirements()
-                        symmetric_buffers = state.public_symmetric_buffers()
                         forward_out, backward_out = allocate_training_outputs(
                             requirements,
                             device,
@@ -998,11 +1049,13 @@ class MoeEp:
                             },
                             device=device,
                         )
-                        execution = state.views(token_count=token_count)
+                        execution = training_state.views(
+                            token_count=token_count
+                        )
 
-                        def run_training_pair():
-                            launch_training_forward(
-                                state,
+                        def run_forward():
+                            return launch_training_forward(
+                                training_state,
                                 execution,
                                 activation,
                                 topk_idx,
@@ -1010,8 +1063,12 @@ class MoeEp:
                                 weights=forward_weights,
                                 out=forward_out,
                             )
+
+                        def run_backward():
+                            assert grad_output is not None
+                            assert backward_weights is not None
                             return launch_training_backward(
-                                state,
+                                training_state,
                                 execution,
                                 grad_output,
                                 topk_idx,
@@ -1025,22 +1082,30 @@ class MoeEp:
                                 out=backward_out,
                             )
 
+                        if phase_name == "training_forward":
+                            timed_call = run_forward
+                        else:
+                            # Backward treats forward-produced saved tensors as
+                            # immutable inputs. Generate them outside timing;
+                            # backward overwrites only its explicit outputs.
+                            run_forward()
+                            timed_call = run_backward
                         phase = "compile/prime"
-                        run_training_pair()
+                        timed_call()
                         phase = "warmup"
                         for _ in range(warmup_iters):
-                            run_training_pair()
+                            timed_call()
                         phase = "pre-timing synchronize"
-                        synchronize_candidate(device, self._forward_config.ep_group)
+                        synchronize_candidate(device, group)
                         phase = "timing"
                         latency_ms, samples_ms = benchmark_candidate(
-                            run_training_pair,
+                            timed_call,
                             device=device,
-                            group=self._forward_config.ep_group,
+                            group=group,
                             timed_iters=timed_iters,
                         )
                         phase = "post-timing synchronize"
-                        synchronize_candidate(device, self._forward_config.ep_group)
+                        synchronize_candidate(device, group)
                     results.append(
                         MoeEpAutotuneCandidateResult(
                             tuning=tuning,
@@ -1051,31 +1116,110 @@ class MoeEp:
                     phase = "teardown"
                     backend.close()
                     backend = None
-                    if self._forward_config.ep_group is not None:
-                        dist.barrier(group=self._forward_config.ep_group)
+                    if group is not None:
+                        dist.barrier(group=group)
                 except BaseException as exc:
-                    if backend is not None and self._forward_config.ep_size == 1:
+                    if backend is not None:
                         with contextlib.suppress(Exception):
                             backend.close()
-                    if runtime_entered:
-                        self._poisoned = True
-                    raise RuntimeError(f"MoeEp autotune_training candidate {index} {tuning!r} " f"failed during {phase}: {exc}") from exc
+                    raise RuntimeError(
+                        f"MoeEp autotune_{phase_name} candidate {index} "
+                        f"{tuning!r} failed during {phase}: {exc}"
+                    ) from exc
 
             winner = select_winner(results)
             winner_config = candidate_configs[normalized.index(winner.tuning)]
-            self.forward_tuning = winner.tuning
-            self.tuning = self.forward_tuning
-            self._forward_config = winner_config
-            self._forward_backend = None
-            self._forward_backend_device = None
+            old_backend = execution_state.backend
+            if old_backend is not None:
+                try:
+                    synchronize_candidate(device, group)
+                    old_backend.close()
+                    if group is not None:
+                        dist.barrier(group=group)
+                except BaseException as exc:
+                    self._poisoned = True
+                    raise RuntimeError(
+                        f"MoeEp autotune_{phase_name} failed during active "
+                        f"backend teardown: {exc}"
+                    ) from exc
+            self._execution_state = _MoeEpExecutionState(
+                resolved_config=winner_config,
+                backend=None,
+            )
             self._validated_topk_idx = None
             self._validated_topk_version = None
-            self._autotuned_training_weight_storage_mode = weight_storage_mode
             return MoeEpAutotuneResult(
-                mode="training",
+                mode=phase_name,
                 winner=winner.tuning,
                 candidates=tuple(results),
             )
+
+    def autotune_training_forward(
+        self,
+        activation: MoeTensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        forward_weights: (
+            MoeEpNativeForwardWeights
+            | MoeEpNativeDiscreteForwardWeights
+        ),
+        candidates: Sequence[MoeEpTuningConfig],
+        warmup_iters: int = 3,
+        timed_iters: int = 10,
+        max_candidates: int = 32,
+    ) -> MoeEpAutotuneResult:
+        """Tune only the training-forward phase and apply its winner."""
+
+        return self._autotune_training_phase(
+            "training_forward",
+            activation,
+            None,
+            topk_idx,
+            topk_weights,
+            forward_weights=forward_weights,
+            backward_weights=None,
+            candidates=candidates,
+            warmup_iters=warmup_iters,
+            timed_iters=timed_iters,
+            max_candidates=max_candidates,
+        )
+
+    def autotune_training_backward(
+        self,
+        activation: MoeTensor,
+        grad_output: MoeTensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        forward_weights: (
+            MoeEpNativeForwardWeights
+            | MoeEpNativeDiscreteForwardWeights
+        ),
+        backward_weights: (
+            MoeEpNativeBackwardWeights
+            | MoeEpNativeDiscreteBackwardWeights
+        ),
+        candidates: Sequence[MoeEpTuningConfig],
+        warmup_iters: int = 3,
+        timed_iters: int = 10,
+        max_candidates: int = 32,
+    ) -> MoeEpAutotuneResult:
+        """Tune only training backward and apply its winner."""
+
+        return self._autotune_training_phase(
+            "training_backward",
+            activation,
+            grad_output,
+            topk_idx,
+            topk_weights,
+            forward_weights=forward_weights,
+            backward_weights=backward_weights,
+            candidates=candidates,
+            warmup_iters=warmup_iters,
+            timed_iters=timed_iters,
+            max_candidates=max_candidates,
+        )
 
     def warmup(
         self,
@@ -1131,9 +1275,6 @@ class MoeEp:
         self,
         *,
         device: torch.device | str | int | None = None,
-        native_weight_storage_mode: (
-            MoeEpNativeWeightStorageMode | str
-        ) = MoeEpNativeWeightStorageMode.CONTIGUOUS,
     ) -> Mapping[
         str,
         tuple[tuple[int, ...], tuple[int, ...], torch.dtype, int],
@@ -1155,54 +1296,60 @@ class MoeEp:
                 raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             if self._training_state is not None:
                 raise RuntimeError("MoeEp training is already prepared")
-            if self._fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
-                raise ValueError("prepare_training requires weight_interleave_size=32")
-            weight_storage_mode = parse_native_weight_storage_mode(
-                native_weight_storage_mode
-            )
             if (
-                self._autotuned_training_weight_storage_mode is not None
-                and weight_storage_mode
-                is not self._autotuned_training_weight_storage_mode
+                self.fc1_weight_layout
+                is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
             ):
                 raise ValueError(
-                    "prepare_training native_weight_storage_mode must match the "
-                    "autotune_training mode: "
-                    f"{weight_storage_mode.value!r} != "
-                    f"{self._autotuned_training_weight_storage_mode.value!r}"
+                    "prepare_training requires "
+                    "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
                 )
+            execution_state = self._execution_state
+            weight_storage_mode = (
+                execution_state.resolved_config.public_config.training_weight_storage_mode
+            )
             resolved_device = _resolve_training_device(device)
-            if self._forward_config.ep_group is not None:
-                modes: list[str | None] = [None] * self._forward_config.ep_size
+            resolved = execution_state.resolved_config
+            group = resolved.public_config.parallel.ep_group
+            if group is not None:
+                modes: list[str | None] = [None] * resolved.topology.ep_size
                 with torch.cuda.device(resolved_device):
                     dist.all_gather_object(
                         modes,
                         weight_storage_mode.value,
-                        group=self._forward_config.ep_group,
+                        group=group,
                     )
                 if any(mode != modes[0] for mode in modes[1:]):
                     raise RuntimeError(
-                        "native_weight_storage_mode must match on every "
-                        f"expert-parallel rank; modes by rank: {modes}"
+                        "MoeEpConfig.training_weight_storage_mode must match "
+                        "on every expert-parallel rank; modes by rank: "
+                        f"{modes}"
                     )
-            _validate_training_assert_capability(self._forward_config)
+            _validate_training_assert_capability(resolved)
             from . import _backend
 
-            _backend.validate_config(self._forward_config)
-            if self._forward_backend is not None and resolved_device != self._forward_backend_device:
-                raise ValueError(f"MoeEp backend is bound to {self._forward_backend_device}; " f"got {resolved_device}")
-            if self._forward_backend is None:
-                self._forward_backend = _backend.create_backend(
-                    self._forward_config,
+            _backend.validate_config(resolved)
+            backend = execution_state.backend
+            if backend is not None and resolved_device != backend.device:
+                raise ValueError(
+                    f"MoeEp backend is bound to {backend.device}; "
+                    f"got {resolved_device}"
+                )
+            if backend is None:
+                backend = _backend.create_backend(
+                    resolved,
                     resolved_device,
                 )
-                self._forward_backend_device = resolved_device
-            with torch.cuda.device(resolved_device):
-                state = self._forward_backend.prepare_training(
-                    native_weight_storage_mode=weight_storage_mode.value,
+                self._execution_state = replace(
+                    execution_state,
+                    backend=backend,
                 )
-            self._training_state = state
-            self._training_requirements = state.public_requirements()
+            with torch.cuda.device(resolved_device):
+                training_state = backend.prepare_training()
+            self._training_state = training_state
+            self._training_requirements = (
+                training_state.public_requirements()
+            )
             return self._training_requirements
 
     def _require_training_prepared(self) -> None:
@@ -1228,13 +1375,14 @@ class MoeEp:
     ) -> MoeEpNativeForwardWeights:
         """Materialize source weights into caller-owned native storage."""
 
-        validate_forward_source_weights(self._forward_config, weights)
+        resolved = self._execution_state.resolved_config
+        validate_forward_source_weights(resolved, weights)
         from ._megamoe_backend.mxfp8._training_weights import materialize_forward
 
         return materialize_forward(
             weights,
             out=out,
-            fc1_weight_layout=self._forward_config.fc1_weight_layout,
+            fc1_weight_layout=resolved.public_config.data_path.fc1_weight_layout,
         )
 
     def pack_backward_weights(
@@ -1245,13 +1393,14 @@ class MoeEp:
     ) -> MoeEpNativeBackwardWeights:
         """Materialize source transpose weights into caller-owned storage."""
 
-        validate_backward_source_weights(self._forward_config, weights)
+        resolved = self._execution_state.resolved_config
+        validate_backward_source_weights(resolved, weights)
         from ._megamoe_backend.mxfp8._training_weights import materialize_backward
 
         return materialize_backward(
             weights,
             out=out,
-            fc1_weight_layout=self._forward_config.fc1_weight_layout,
+            fc1_weight_layout=resolved.public_config.data_path.fc1_weight_layout,
         )
 
     def training_forward(
@@ -1269,27 +1418,29 @@ class MoeEp:
             self._require_training_prepared()
             assert self._training_state is not None
             assert self._training_requirements is not None
-            assert self._forward_backend_device is not None
+            execution_state = self._execution_state
+            assert execution_state.backend is not None
+            device = execution_state.backend.device
             token_count = validate_training_input(
-                self._forward_config,
+                execution_state.resolved_config,
                 "activation",
                 activation,
                 topk_idx,
                 topk_weights,
-                device=self._forward_backend_device,
+                device=device,
                 validate_expert_ids=self.validation_mode == "strict",
             )
             if self._training_state.weight_storage_mode == "discrete":
                 self._validate_discrete_pointer_lifetime(
                     weights,
                     validate=validate_native_discrete_forward_weights,
-                    device=self._forward_backend_device,
+                    device=device,
                 )
             else:
                 validate_native_forward_weights(
-                    self._forward_config,
+                    execution_state.resolved_config,
                     weights,
-                    device=self._forward_backend_device,
+                    device=device,
                 )
             validate_training_forward_outputs(
                 out,
@@ -1303,7 +1454,7 @@ class MoeEp:
                         "expert_offsets",
                     )
                 ),
-                device=self._forward_backend_device,
+                device=device,
             )
             validate_training_non_aliasing(
                 {
@@ -1323,7 +1474,7 @@ class MoeEp:
                 launch_training_forward,
             )
 
-            with torch.cuda.device(self._forward_backend_device):
+            with torch.cuda.device(device):
                 execution = self._training_state.views(
                     token_count=token_count,
                 )
@@ -1360,29 +1511,31 @@ class MoeEp:
         with self._lifecycle_lock:
             self._require_training_prepared()
             assert self._training_state is not None
-            assert self._forward_backend_device is not None
+            execution_state = self._execution_state
+            assert execution_state.backend is not None
+            device = execution_state.backend.device
             if out is None:
                 raise TypeError("out must be a MoeEpTrainingBackwardOutputs")
             token_count = validate_training_input(
-                self._forward_config,
+                execution_state.resolved_config,
                 "grad_output",
                 grad_output,
                 topk_idx,
                 topk_weights,
-                device=self._forward_backend_device,
+                device=device,
                 validate_expert_ids=self.validation_mode == "strict",
             )
             if self._training_state.weight_storage_mode == "discrete":
                 self._validate_discrete_pointer_lifetime(
                     weights,
                     validate=validate_native_discrete_backward_weights,
-                    device=self._forward_backend_device,
+                    device=device,
                 )
             else:
                 validate_native_backward_weights(
-                    self._forward_config,
+                    execution_state.resolved_config,
                     weights,
-                    device=self._forward_backend_device,
+                    device=device,
                 )
             if fc1_preact is None:
                 raise ValueError("fc1_preact from the matching forward is required")
@@ -1401,7 +1554,7 @@ class MoeEp:
                         "fc2_sfb",
                     )
                 ),
-                device=self._forward_backend_device,
+                device=device,
             )
             validate_training_forward_state(
                 fc1_preact=fc1_preact,
@@ -1418,7 +1571,7 @@ class MoeEp:
                         "expert_offsets",
                     )
                 ),
-                device=self._forward_backend_device,
+                device=device,
             )
             validate_training_non_aliasing(
                 {
@@ -1445,7 +1598,7 @@ class MoeEp:
                 launch_training_backward,
             )
 
-            with torch.cuda.device(self._forward_backend_device):
+            with torch.cuda.device(device):
                 execution = self._training_state.views(
                     token_count=token_count,
                 )
@@ -1470,12 +1623,12 @@ class MoeEp:
         with self._lifecycle_lock:
             if self._closed:
                 return
-            if self._forward_backend is not None:
-                close_backend = getattr(self._forward_backend, "close", None)
+            state = self._execution_state
+            if state.backend is not None:
+                close_backend = getattr(state.backend, "close", None)
                 if close_backend is not None:
                     close_backend()
-                self._forward_backend = None
-                self._forward_backend_device = None
+                self._execution_state = replace(state, backend=None)
             self._validated_topk_idx = None
             self._validated_topk_version = None
             self._validated_discrete_pointer_tables.clear()

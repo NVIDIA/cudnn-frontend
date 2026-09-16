@@ -14,14 +14,23 @@ from typing import Protocol
 
 import torch
 
-from ._contracts import ForwardConfig, ValidatedForwardRequest
+from ._config import ResolvedMoeEpConfig
+from ._contracts import _ForwardCall
 from ._types import MoeTensor
 
 
 class MoeEpBackend(Protocol):
     """Instance-local backend created lazily for one static ``MoeEp`` config."""
 
-    def forward(self, request: ValidatedForwardRequest) -> MoeTensor:
+    @property
+    def resolved_config(self) -> ResolvedMoeEpConfig:
+        """Return the exact resolved config generation owned by this backend."""
+
+    @property
+    def device(self) -> torch.device:
+        """Return the concrete CUDA device owned by this backend."""
+
+    def forward(self, request: _ForwardCall) -> MoeTensor:
         """Execute one already-validated forward request."""
 
     def close(self) -> None:
@@ -32,7 +41,7 @@ class BackendUnavailableError(RuntimeError):
     """The requested supported path has no executable runtime backend yet."""
 
 
-def validate_config(config: ForwardConfig) -> None:
+def validate_config(config: ResolvedMoeEpConfig) -> None:
     """Run the selected backend's static capability gate lazily."""
 
     from ._megamoe_backend._capability import validate_config as validate
@@ -40,16 +49,19 @@ def validate_config(config: ForwardConfig) -> None:
     validate(config)
 
 
-def validate_request(request: ValidatedForwardRequest) -> None:
+def validate_request(
+    config: ResolvedMoeEpConfig,
+    request: _ForwardCall,
+) -> None:
     """Run the selected backend's per-request capability gate lazily."""
 
     from ._megamoe_backend._capability import validate_request as validate
 
-    validate(request)
+    validate(config, request)
 
 
 def create_backend(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     device: torch.device,
 ) -> MoeEpBackend:
     """Create the default backend without an allocation-only fallback."""

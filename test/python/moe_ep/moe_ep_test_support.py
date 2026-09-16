@@ -35,6 +35,7 @@ __all__ = [
     "_allocate_training_weight_staging",
     "_make_discrete_training_weights",
     "_forward_config",
+    "_moe_ep_config",
     "_grad_output",
     "_make_forward_case",
     "_naive_reference",
@@ -215,36 +216,41 @@ def quantize_mxfp8(tensor: torch.Tensor, *, axis: int = -1):
 
 
 def _training_config(**overrides):
-    from cudnn.moe_ep._contracts import ForwardConfig, normalize_fc1_weight_layout
-    from cudnn.moe_ep._tuning import MoeEpTuningConfig
+    from cudnn import MoeEpFc1WeightLayout
+    from cudnn.moe_ep._config import (
+        ResolvedMoeEpConfig,
+        _ResolvedMoeEpTopology,
+    )
 
-    weight_interleave_size = overrides.pop("weight_interleave_size", None)
+    ep_size = overrides.pop("ep_size", 1)
+    ep_rank = overrides.pop("ep_rank", 0)
+    ep_global_ranks = overrides.pop("ep_global_ranks", ())
+    experts_per_rank = overrides.pop("experts_per_rank", None)
     values = {
         "num_experts": 2,
         "hidden_size": 128,
         "intermediate_size": 256,
         "top_k": 2,
-        "experts_per_rank": 2,
-        "ep_size": 1,
-        "ep_rank": 0,
-        "ep_group": None,
-        "ep_global_ranks": (),
         "max_tokens_per_rank": 4,
         "max_recv_size_per_rank": 128,
         "drop_on_overflow": True,
-        "output_format": "bf16",
-        "combine_format": "bf16",
-        "apply_topk_in_fc1": True,
-        "gate_up_clamp": None,
-        "generate_c": True,
-        "token_padding_size": 128,
-        "sf_padding_size": 128,
-        "tuning": MoeEpTuningConfig(),
-        "backward_wgrad_mode": "operands",
-        "fc1_weight_layout": normalize_fc1_weight_layout(weight_interleave_size),
+        "fc1_weight_layout": (
+            MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+        ),
+        **overrides,
     }
-    values.update(overrides)
-    return ForwardConfig(**values)
+    config = _moe_ep_config(**values)
+    if experts_per_rank is None:
+        experts_per_rank = config.model.num_experts // ep_size
+    return ResolvedMoeEpConfig(
+        public_config=config,
+        topology=_ResolvedMoeEpTopology(
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            ep_global_ranks=ep_global_ranks,
+            experts_per_rank=experts_per_rank,
+        ),
+    )
 
 
 def _training_prepared_pair(config, pool_rows: int = 512):
@@ -266,7 +272,21 @@ def _training_prepared_pair(config, pool_rows: int = 512):
     }
     forward = SimpleNamespace(
         pool_token_capacity=pool_rows,
-        config=SimpleNamespace(weight_storage_mode="contiguous"),
+        config=SimpleNamespace(
+            generate_c=True,
+            token_padding_block=128,
+            sf_padding_block=128,
+            kernel_drop_on_overflow=True,
+            enable_col_quant=True,
+            dfc2_recompute=False,
+            dfc2_col_output=False,
+            enable_grad_y2_col_quant=False,
+            max_tokens_per_rank=(
+                config.public_config.parallel.max_tokens_per_rank
+            ),
+            top_k=config.public_config.model.top_k,
+            weight_storage_mode="contiguous",
+        ),
         workspace_requirements=WorkspaceRequirements.for_mxfp8(
             config,
             kernel_local_workspace_bytes=1024,
@@ -281,7 +301,18 @@ def _training_prepared_pair(config, pool_rows: int = 512):
     backward = SimpleNamespace(
         pool_token_capacity=pool_rows,
         config=SimpleNamespace(
+            generate_c=True,
+            token_padding_block=128,
             sf_padding_block=128,
+            kernel_drop_on_overflow=True,
+            enable_col_quant=True,
+            dfc2_recompute=True,
+            dfc2_col_output=True,
+            enable_grad_y2_col_quant=True,
+            max_tokens_per_rank=(
+                config.public_config.parallel.max_tokens_per_rank
+            ),
+            top_k=config.public_config.model.top_k,
             weight_storage_mode="contiguous",
         ),
         workspace_requirements=WorkspaceRequirements.for_mxfp8(
@@ -320,11 +351,11 @@ def _training_abi_prepared(
         max_recv_size_per_rank=max_recv_size,
         physical_recv_pool_size=max_recv_size,
         weight_storage_mode=weight_storage_mode,
-        effective_config=lambda cluster_count: {
+        effective_config=lambda: {
             "name": name,
             "max_recv_size_per_rank": max_recv_size,
             "weight_storage_mode": weight_storage_mode,
-            "launch_cluster_count": cluster_count,
+            "launch_cluster_count": 16,
         },
     )
     return SimpleNamespace(
@@ -360,6 +391,99 @@ _REFERENCE_CLOSE_KWARGS = {"rtol": 0.05, "atol": 0.0625}
 
 def _forward_config(**overrides):
     return {**_DEFAULT_FORWARD_CONFIG, **overrides}
+
+
+def _moe_ep_config(**values):
+    """Build the public nested config used by API-facing tests."""
+
+    from cudnn import (
+        MoeEpConfig,
+        MoeEpDataPathConfig,
+        MoeEpFc1WeightLayout,
+        MoeEpModelConfig,
+        MoeEpNativeWeightStorageMode,
+        MoeEpParallelConfig,
+        MoeEpTuningConfig,
+    )
+    from cudnn import MoeFormat as PublicMoeFormat
+
+    values = dict(values)
+    model = MoeEpModelConfig(
+        num_experts=values.pop("num_experts"),
+        hidden_size=values.pop("hidden_size"),
+        intermediate_size=values.pop("intermediate_size"),
+        top_k=values.pop("top_k"),
+    )
+    parallel_names = (
+        "ep_group",
+        "max_tokens_per_rank",
+        "max_recv_size_per_rank",
+        "drop_on_overflow",
+        "token_padding_size",
+        "sf_padding_size",
+    )
+    parallel_values = {
+        name: values.pop(name)
+        for name in parallel_names
+        if name in values
+    }
+    for name in ("output_format", "combine_format"):
+        if name in values and not isinstance(values[name], PublicMoeFormat):
+            values[name] = PublicMoeFormat(values[name])
+    if "fc1_weight_layout" in values and not isinstance(
+        values["fc1_weight_layout"], MoeEpFc1WeightLayout
+    ):
+        raise TypeError(
+            "test configs must use MoeEpFc1WeightLayout directly"
+        )
+    data_path_names = (
+        "output_format",
+        "combine_format",
+        "apply_topk_in_fc1",
+        "fc1_weight_layout",
+        "gate_up_clamp",
+    )
+    data_path_values = {
+        name: values.pop(name)
+        for name in data_path_names
+        if name in values
+    }
+    tuning_values = {}
+    for name in (
+        "inference_tuning",
+        "training_forward_tuning",
+        "training_backward_tuning",
+    ):
+        if name in values:
+            tuning = values.pop(name)
+            if not isinstance(tuning, MoeEpTuningConfig):
+                raise TypeError(f"{name} must be a MoeEpTuningConfig")
+            tuning_values[name] = tuning
+    validation_mode = values.pop("validation_mode", "strict")
+    training_weight_storage_mode = values.pop(
+        "training_weight_storage_mode",
+        MoeEpNativeWeightStorageMode.CONTIGUOUS,
+    )
+    if not isinstance(
+        training_weight_storage_mode,
+        MoeEpNativeWeightStorageMode,
+    ):
+        raise TypeError(
+            "training_weight_storage_mode must be a "
+            "MoeEpNativeWeightStorageMode"
+        )
+    if values:
+        raise TypeError(
+            f"unsupported nested MoeEp test config fields: {sorted(values)}"
+        )
+    return MoeEpConfig(
+        model=model,
+        parallel=MoeEpParallelConfig(**parallel_values),
+        data_path=MoeEpDataPathConfig(**data_path_values),
+        training_weight_storage_mode=training_weight_storage_mode,
+        validation_mode=validation_mode,
+        **tuning_values,
+    )
 
 
 def _output_as_float(output):
@@ -549,10 +673,10 @@ def _stress_backend_reuse(
     *,
     check_weight_refresh,
 ):
-    backend = op._forward_backend
+    backend = op._execution_state.backend
     assert backend is not None
     compiled = backend._compiled
-    plan_workspace = backend._plan._workspace
+    inference_workspace = backend._inference_resources._workspace
     weight_refresh_count = backend._adapter.weight_refresh_count if check_weight_refresh else None
     alternate_stream = torch.cuda.Stream(device=device)
 
@@ -567,7 +691,10 @@ def _stress_backend_reuse(
         stream.synchronize()
         assert torch.isfinite(_output_as_float(stressed)).all()
         assert backend._compiled is compiled
-        assert backend._plan._workspace is plan_workspace
+        assert (
+            backend._inference_resources._workspace
+            is inference_workspace
+        )
         if weight_refresh_count is not None:
             assert backend._adapter.weight_refresh_count == weight_refresh_count
 

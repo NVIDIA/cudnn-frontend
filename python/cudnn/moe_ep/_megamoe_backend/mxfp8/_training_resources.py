@@ -16,7 +16,7 @@ from typing import Any, Mapping, Optional
 import torch
 import torch.distributed as dist
 
-from ..._contracts import ForwardConfig
+from ..._config import ResolvedMoeEpConfig
 from ..._math import round_up
 from ..._types import MoeEpNativeWeightLayout
 from .._comm import SymmetricMemoryProvider
@@ -99,14 +99,39 @@ def _add_phase_regions(
 
 
 def build_training_workspace_requirements(
-    config: ForwardConfig,
     forward: PreparedMxfp8Kernel,
     backward: PreparedMxfp8BackwardKernel,
 ) -> WorkspaceRequirements:
     """Build one deterministic root layout for private instance resources."""
 
-    if not config.generate_c:
-        raise ValueError("training preparation requires generate_c=True")
+    forward_config = forward.config
+    backward_config = backward.config
+    for name, config in (
+        ("forward", forward_config),
+        ("backward", backward_config),
+    ):
+        if not config.generate_c:
+            raise ValueError(
+                f"training {name} preparation requires generate_c=True"
+            )
+        if config.token_padding_block != 128 or config.sf_padding_block != 128:
+            raise ValueError(
+                f"training {name} preparation requires token/SF padding 128"
+            )
+        if not config.kernel_drop_on_overflow:
+            raise ValueError(
+                f"training {name} kernel requires drop_on_overflow=True"
+            )
+    if not forward_config.enable_col_quant:
+        raise ValueError("training forward preparation requires column quantization")
+    if not (
+        backward_config.dfc2_recompute
+        and backward_config.dfc2_col_output
+        and backward_config.enable_grad_y2_col_quant
+    ):
+        raise ValueError(
+            "training backward preparation requires operands specialization"
+        )
     if forward.pool_token_capacity != backward.pool_token_capacity:
         raise ValueError("forward/backward pool capacities must match, got " f"{forward.pool_token_capacity} and " f"{backward.pool_token_capacity}")
 
@@ -207,7 +232,9 @@ def build_training_workspace_requirements(
     local_regions.append(
         BufferRegion(
             _resource_name("routing", "local", "routing_topk_idx"),
-            int(config.max_tokens_per_rank) * config.top_k * torch.int32.itemsize,
+            forward_config.max_tokens_per_rank
+            * forward_config.top_k
+            * torch.int32.itemsize,
             alignment=16,
         )
     )
@@ -218,12 +245,14 @@ def build_training_workspace_requirements(
                 "symmetric",
                 "routing_topk_weights",
             ),
-            int(config.max_tokens_per_rank) * config.top_k * torch.float32.itemsize,
+            forward_config.max_tokens_per_rank
+            * forward_config.top_k
+            * torch.float32.itemsize,
             alignment=16,
         )
     )
     return WorkspaceRequirements(
-        max_tokens_per_rank=int(config.max_tokens_per_rank),
+        max_tokens_per_rank=forward_config.max_tokens_per_rank,
         symmetric_regions=tuple(symmetric_regions),
         local_regions=tuple(local_regions),
     )
@@ -335,7 +364,7 @@ def _prepared_kernel_abi(prepared) -> dict[str, object]:
     return {
         "name": str(kernel.name()),
         "architecture": list(prepared.architecture),
-        "effective_config": prepared.config.effective_config(prepared.launch_cluster_count),
+        "effective_config": prepared.config.effective_config(),
         "launch": {
             "cluster_count": int(prepared.launch_cluster_count),
             "threads_per_cta": int(kernel.threads_per_cta),
@@ -348,7 +377,7 @@ def _prepared_kernel_abi(prepared) -> dict[str, object]:
 
 
 def _build_training_abi_facts(
-    config: ForwardConfig,
+    config: ResolvedMoeEpConfig,
     forward: PreparedMxfp8Kernel,
     backward: PreparedMxfp8BackwardKernel,
     requirements: WorkspaceRequirements,
@@ -360,30 +389,32 @@ def _build_training_abi_facts(
     if source_tree_digest is None:
         source_root = Path(__file__).resolve().parents[1] / "cutedsl_src"
         source_tree_digest = source_tree_sha256(source_root)
+    public = config.public_config
+    topology = config.topology
     return {
         "schema_version": 3,
         "source_tree_sha256": source_tree_digest,
         "ep": {
-            "size": int(config.ep_size),
-            "global_ranks": list(config.ep_global_ranks),
+            "size": topology.ep_size,
+            "global_ranks": list(topology.ep_global_ranks),
         },
         "geometry": {
-            "num_experts": int(config.num_experts),
-            "experts_per_rank": int(config.experts_per_rank),
-            "hidden": int(config.hidden_size),
-            "intermediate": int(config.intermediate_size),
-            "top_k": int(config.top_k),
-            "max_tokens_per_rank": int(config.max_tokens_per_rank),
+            "num_experts": public.model.num_experts,
+            "experts_per_rank": topology.experts_per_rank,
+            "hidden": public.model.hidden_size,
+            "intermediate": public.model.intermediate_size,
+            "top_k": public.model.top_k,
+            "max_tokens_per_rank": public.parallel.max_tokens_per_rank,
             "max_recv_size_per_rank": int(forward.config.physical_recv_pool_size),
         },
         "policy": {
-            "drop_on_overflow": bool(config.drop_on_overflow),
-            "combine_format": config.combine_format,
-            "output_format": config.output_format,
-            "apply_topk_in_fc1": bool(config.apply_topk_in_fc1),
-            "fc1_weight_layout": config.fc1_weight_layout.value,
+            "drop_on_overflow": public.parallel.drop_on_overflow,
+            "combine_format": public.data_path.combine_format.value,
+            "output_format": public.data_path.output_format.value,
+            "apply_topk_in_fc1": public.data_path.apply_topk_in_fc1,
+            "fc1_weight_layout": public.data_path.fc1_weight_layout.value,
             "native_weight_storage_mode": forward.config.weight_storage_mode,
-            "gate_up_clamp": config.gate_up_clamp,
+            "gate_up_clamp": public.data_path.gate_up_clamp,
         },
         "resources": {
             "workspace": _workspace_abi(requirements),
@@ -442,12 +473,12 @@ class Mxfp8TrainingExecutionViews:
     forward_expert_size_snapshot: torch.Tensor
 
 
-class Mxfp8TrainingState:
+class _Mxfp8TrainingState:
     """Own private runtime and one set of instance training resources."""
 
     def __init__(
         self,
-        config: ForwardConfig,
+        config: ResolvedMoeEpConfig,
         device: torch.device,
         forward: PreparedMxfp8Kernel,
         backward: PreparedMxfp8BackwardKernel,
@@ -456,7 +487,7 @@ class Mxfp8TrainingState:
         symmetric_provider: Optional[SymmetricMemoryProvider] = None,
         local_provider: Optional[LocalMemoryProvider] = None,
     ) -> None:
-        self.config = config
+        self.resolved_config = config
         self.device = torch.device(device)
         self.forward_prepared = forward
         self.backward_prepared = backward
@@ -467,14 +498,17 @@ class Mxfp8TrainingState:
                 f"{backward.config.weight_storage_mode!r}"
             )
         self.weight_storage_mode = forward.config.weight_storage_mode
-        self.stager = Mxfp8TrainingStager(config.hidden_size, config.top_k)
+        model = config.public_config.model
+        self.stager = Mxfp8TrainingStager(
+            model.hidden_size,
+            model.top_k,
+        )
         self.beta = torch.ones(
-            (config.experts_per_rank,),
+            (config.topology.experts_per_rank,),
             dtype=torch.float32,
             device=self.device,
         )
         self.requirements = build_training_workspace_requirements(
-            config,
             forward,
             backward,
         )
@@ -500,7 +534,10 @@ class Mxfp8TrainingState:
                 symmetric_bytes=sum(region.nbytes for region in self.requirements.symmetric_regions),
             )
             _runtime_debug("training-state.runtime-acquire.begin")
-            runtime = self._runtime_manager.acquire(self.config, self.device)
+            runtime = self._runtime_manager.acquire(
+                self.resolved_config,
+                self.device,
+            )
             _runtime_debug(
                 "training-state.runtime-acquire.end",
                 runtime_ref_count=self._runtime_manager.ref_count,
@@ -525,7 +562,7 @@ class Mxfp8TrainingState:
                     _runtime_debug("training-state.abi-handshake.begin")
                     try:
                         abi_facts = _build_training_abi_facts(
-                            self.config,
+                            self.resolved_config,
                             self.forward_prepared,
                             self.backward_prepared,
                             self.requirements,
@@ -628,8 +665,8 @@ class Mxfp8TrainingState:
         self,
         flat: WorkspaceViews,
     ) -> Mxfp8TrainingScratch:
-        config = self.config
-        capacity = int(config.max_tokens_per_rank)
+        public = self.resolved_config.public_config
+        capacity = int(public.parallel.max_tokens_per_rank)
         bwd_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in self.backward_prepared.kernel.get_aux_output_shapes().items()}
 
         def local_bytes(name: str) -> torch.Tensor:
@@ -639,7 +676,7 @@ class Mxfp8TrainingState:
             routing_topk_idx=_typed_view(
                 local_bytes("routing_topk_idx"),
                 torch.int32,
-                (capacity, config.top_k),
+                (capacity, public.model.top_k),
             ),
             routing_topk_weights=_typed_view(
                 flat.symmetric[
@@ -650,7 +687,7 @@ class Mxfp8TrainingState:
                     )
                 ],
                 torch.float32,
-                (capacity, config.top_k),
+                (capacity, public.model.top_k),
             ),
             forward_output=_typed_view(
                 flat.symmetric[
@@ -661,7 +698,7 @@ class Mxfp8TrainingState:
                     )
                 ],
                 torch.bfloat16,
-                (capacity, config.hidden_size),
+                (capacity, public.model.hidden_size),
             ),
             backward_output=_typed_view(
                 flat.symmetric[
@@ -672,7 +709,7 @@ class Mxfp8TrainingState:
                     )
                 ],
                 torch.bfloat16,
-                (capacity, config.hidden_size),
+                (capacity, public.model.hidden_size),
             ),
             dprob=_typed_view(
                 flat.symmetric[
@@ -714,8 +751,9 @@ class Mxfp8TrainingState:
     ) -> Mapping[str, torch.Tensor]:
         """Return caller-visible views over the instance's symmetric I/O buffers."""
 
-        capacity = int(self.config.max_tokens_per_rank)
-        hidden = int(self.config.hidden_size)
+        public = self.resolved_config.public_config
+        capacity = int(public.parallel.max_tokens_per_rank)
+        hidden = public.model.hidden_size
         execution = self.views(token_count=capacity)
 
         def activation_views(
@@ -756,23 +794,24 @@ class Mxfp8TrainingState:
     ]:
         """Return exact caller-owned output contracts without buffer objects."""
 
-        config = self.config
-        capacity = int(config.max_tokens_per_rank)
+        public = self.resolved_config.public_config
+        model = public.model
+        capacity = int(public.parallel.max_tokens_per_rank)
         pool_rows = int(self.forward_prepared.pool_token_capacity)
         forward_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in self.forward_prepared.kernel.get_aux_output_shapes().items()}
         backward_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in self.backward_prepared.kernel.get_aux_output_shapes().items()}
-        fc1_sfa_rows = round_up(config.hidden_size, 128)
+        fc1_sfa_rows = round_up(model.hidden_size, 128)
         fc1_sfa_elements = math.prod(forward_shapes["col_quant_sf"])
         if fc1_sfa_elements % fc1_sfa_rows:
             raise ValueError("forward fc1_sfa producer size is not atom aligned")
-        fc2_sfb_rows = round_up(config.hidden_size, 128)
+        fc2_sfb_rows = round_up(model.hidden_size, 128)
         fc2_sfb_elements = math.prod(backward_shapes["grad_y2_sf"])
         if fc2_sfb_elements % fc2_sfb_rows:
             raise ValueError("backward fc2_sfb producer size is not atom aligned")
         requirements = {
             "output": (
-                (capacity, config.hidden_size),
-                (config.hidden_size, 1),
+                (capacity, model.hidden_size),
+                (model.hidden_size, 1),
                 torch.bfloat16,
                 16,
             ),
@@ -783,8 +822,8 @@ class Mxfp8TrainingState:
                 128,
             ),
             "fc1_a": (
-                (pool_rows, config.hidden_size),
-                (config.hidden_size, 1),
+                (pool_rows, model.hidden_size),
+                (model.hidden_size, 1),
                 _DATA_DTYPE,
                 128,
             ),
@@ -795,20 +834,20 @@ class Mxfp8TrainingState:
                 128,
             ),
             "valid_route_counts": (
-                (config.experts_per_rank,),
+                (self.resolved_config.topology.experts_per_rank,),
                 (1,),
                 torch.int32,
                 16,
             ),
             "expert_offsets": (
-                (config.experts_per_rank,),
+                (self.resolved_config.topology.experts_per_rank,),
                 (1,),
                 torch.int32,
                 16,
             ),
             "grad_activation": (
-                (capacity, config.hidden_size),
-                (config.hidden_size, 1),
+                (capacity, model.hidden_size),
+                (model.hidden_size, 1),
                 torch.bfloat16,
                 16,
             ),
@@ -820,7 +859,7 @@ class Mxfp8TrainingState:
             ),
             "fc1_b": (
                 backward_shapes["fc1_col_output"],
-                (2 * config.intermediate_size, 1),
+                (2 * model.intermediate_size, 1),
                 _DATA_DTYPE,
                 128,
             ),
@@ -885,7 +924,7 @@ class Mxfp8TrainingState:
             snapshot = _typed_view(
                 snapshot_bytes,
                 torch.int32,
-                (self.config.experts_per_rank,),
+                (self.resolved_config.topology.experts_per_rank,),
             )
             assert self._runtime is not None
             return Mxfp8TrainingExecutionViews(
@@ -957,7 +996,7 @@ class Mxfp8TrainingState:
                 group=self._runtime.group,
             )
             _runtime_debug("training-overflow.all-reduce.end", phase=phase)
-        if not self.config.drop_on_overflow:
+        if not self.resolved_config.public_config.parallel.drop_on_overflow:
             assert_async = getattr(torch, "_assert_async", None)
             if assert_async is None:
                 raise RuntimeError("drop_on_overflow=False training requires torch._assert_async")
@@ -983,5 +1022,4 @@ class Mxfp8TrainingState:
 
 __all__ = [
     "Mxfp8TrainingExecutionViews",
-    "Mxfp8TrainingState",
 ]

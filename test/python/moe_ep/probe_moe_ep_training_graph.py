@@ -15,13 +15,14 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-from cudnn import BlockScaledTensor, MoeEp
+from cudnn import BlockScaledTensor, MoeEp, MoeEpFc1WeightLayout
 from cudnn.moe_ep._megamoe_backend._runtime import _runtime_debug
 from moe_ep.moe_ep_test_support import (
     _allocate_stateless_training_outputs,
     _allocate_training_weight_staging,
     _fixed_training_weights,
     _grad_output,
+    _moe_ep_config,
     make_distributed_forward_inputs,
 )
 
@@ -136,18 +137,22 @@ def _prepare_case(
     )
     _runtime_debug("probe.operator.construct.begin")
     op = MoeEp(
-        num_experts=2 * world_size,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        ep_group=dist.group.WORLD,
-        # This is a collective ABI capacity, not the rank-local token count.
-        # make_distributed_forward_inputs intentionally varies local shapes.
-        max_tokens_per_rank=8,
-        max_recv_size_per_rank=max_recv_size_per_rank,
-        drop_on_overflow=drop_on_overflow,
-        combine_format="bf16",
-        weight_interleave_size=32,
+        _moe_ep_config(
+            num_experts=2 * world_size,
+            hidden_size=128,
+            intermediate_size=256,
+            top_k=2,
+            ep_group=dist.group.WORLD,
+            # This is a collective ABI capacity, not the rank-local token count.
+            # make_distributed_forward_inputs intentionally varies local shapes.
+            max_tokens_per_rank=8,
+            max_recv_size_per_rank=max_recv_size_per_rank,
+            drop_on_overflow=drop_on_overflow,
+            combine_format="bf16",
+            fc1_weight_layout=(
+                MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+            ),
+        )
     )
     _runtime_debug("probe.operator.construct.end")
     _runtime_debug("probe.prepare_training.begin")

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Lazy runtime/workspace owner for a compiled MegaMoE execution plan."""
+"""Lazy runtime/workspace owner for one inference execution path."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from typing import Optional
 
 import torch
 
-from .._contracts import ForwardConfig, ValidatedForwardRequest
+from .._config import ResolvedMoeEpConfig
+from .._contracts import _ForwardCall
 from ._comm import SymmetricMemoryProvider
 from ._runtime import RuntimeHandle, RuntimeManager, get_runtime_manager
 from ._workspace import (
@@ -30,12 +31,12 @@ class PreparedResources:
     workspace: WorkspaceViews
 
 
-class ExecutionPlanOwner:
-    """Own runtime and stable workspace without compiling or launching a kernel."""
+class _InferenceRuntimeWorkspaceOwner:
+    """Own inference runtime/workspace without compiling or launching."""
 
     def __init__(
         self,
-        config: ForwardConfig,
+        config: ResolvedMoeEpConfig,
         device: torch.device,
         requirements: WorkspaceRequirements,
         *,
@@ -43,8 +44,12 @@ class ExecutionPlanOwner:
         symmetric_provider: Optional[SymmetricMemoryProvider] = None,
         local_provider: Optional[LocalMemoryProvider] = None,
     ) -> None:
-        if config.max_tokens_per_rank != requirements.max_tokens_per_rank:
-            raise ValueError("workspace capacity must match ForwardConfig.max_tokens_per_rank")
+        max_tokens_per_rank = config.public_config.parallel.max_tokens_per_rank
+        if max_tokens_per_rank != requirements.max_tokens_per_rank:
+            raise ValueError(
+                "workspace capacity must match "
+                "MoeEpParallelConfig.max_tokens_per_rank"
+            )
         self.config = config
         self.device = torch.device(device)
         self.requirements = requirements
@@ -71,15 +76,13 @@ class ExecutionPlanOwner:
 
     def prepare(
         self,
-        request: ValidatedForwardRequest,
+        request: _ForwardCall,
     ) -> PreparedResources:
         with self._lock:
             if self._closed:
                 raise RuntimeError("MegaMoE execution plan is closed")
             if self._cleanup_required:
                 raise RuntimeError("MegaMoE execution plan requires cleanup before prepare")
-            if request.config is not self.config:
-                raise ValueError("request does not belong to this static plan")
             if torch.device(request.device) != self.device:
                 raise ValueError(f"execution plan is bound to {self.device}, got {request.device}")
             if request.token_count > self.requirements.max_tokens_per_rank:
@@ -142,7 +145,7 @@ class ExecutionPlanOwner:
             self._cleanup_required = False
             self._closed = True
 
-    def __enter__(self) -> "ExecutionPlanOwner":
+    def __enter__(self) -> "_InferenceRuntimeWorkspaceOwner":
         with self._lock:
             if self._closed:
                 raise RuntimeError("MegaMoE execution plan is closed")
@@ -154,4 +157,4 @@ class ExecutionPlanOwner:
         return False
 
 
-__all__ = ["ExecutionPlanOwner", "PreparedResources"]
+__all__ = ["PreparedResources"]

@@ -8,7 +8,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-AutotuneMode = Literal["inference", "training"]
+AutotuneMode = Literal[
+    "inference",
+    "training_forward",
+    "training_backward",
+]
 
 TokenBackMode = Literal[
     "epi_warps",

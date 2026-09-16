@@ -9,7 +9,8 @@ from dataclasses import dataclass
 
 import torch
 
-from ..._contracts import Fc1WeightLayout, ValidatedForwardRequest
+from ..._config import MoeEpFc1WeightLayout
+from ..._contracts import _ForwardCall
 from ..._types import BlockScaledTensor, MoeFormat
 from .._plan import PreparedResources
 from .._workspace import padded_mxfp8_scale_columns
@@ -304,7 +305,12 @@ class Mxfp8LaunchInputs:
 class Mxfp8InputAdapter:
     """Stateful staging adapter with mutation-aware weight transforms."""
 
-    def __init__(self) -> None:
+    def __init__(self, fc1_weight_layout: MoeEpFc1WeightLayout) -> None:
+        if not isinstance(fc1_weight_layout, MoeEpFc1WeightLayout):
+            raise TypeError(
+                "fc1_weight_layout must be a MoeEpFc1WeightLayout"
+            )
+        self._fc1_weight_layout = fc1_weight_layout
         self._weight_key: tuple | None = None
         self._weights: Mxfp8Weights | None = None
         self._weight_sources: tuple[torch.Tensor, ...] | None = None
@@ -315,19 +321,19 @@ class Mxfp8InputAdapter:
     def weight_refresh_count(self) -> int:
         return self._weight_refresh_count
 
-    def has_cached_weights(self, request: ValidatedForwardRequest) -> bool:
+    def has_cached_weights(self, request: _ForwardCall) -> bool:
         key = self._request_weight_key(request)
         return key is not None and key == self._weight_key and self._weights is not None
 
     def weights_have_version_counters(
         self,
-        request: ValidatedForwardRequest,
+        request: _ForwardCall,
     ) -> bool:
         return self._request_weight_key(request) is not None
 
     @staticmethod
     def _request_weight_key(
-        request: ValidatedForwardRequest,
+        request: _ForwardCall,
     ) -> tuple | None:
         fc1 = _block_scaled_fingerprint(request.fc1_weight) if isinstance(request.fc1_weight, BlockScaledTensor) else _tensor_fingerprint(request.fc1_weight)
         fc2 = _block_scaled_fingerprint(request.fc2_weight) if isinstance(request.fc2_weight, BlockScaledTensor) else _tensor_fingerprint(request.fc2_weight)
@@ -337,7 +343,7 @@ class Mxfp8InputAdapter:
 
     def _prepare_weights(
         self,
-        request: ValidatedForwardRequest,
+        request: _ForwardCall,
         config: Mxfp8KernelConfig,
     ) -> Mxfp8Weights:
         key = self._request_weight_key(request)
@@ -349,7 +355,10 @@ class Mxfp8InputAdapter:
         fc1_weight, fc1_weight_sf = _prepare_fc1(
             fc1_source,
             config.intermediate,
-            already_interleaved=(config.fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32),
+            already_interleaved=(
+                self._fc1_weight_layout
+                is MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+            ),
         )
         fc2_weight, fc2_weight_sf = _prepare_fc2(fc2_source)
         weights = Mxfp8Weights(
@@ -371,7 +380,7 @@ class Mxfp8InputAdapter:
 
     def stage(
         self,
-        request: ValidatedForwardRequest,
+        request: _ForwardCall,
         resources: PreparedResources,
         config: Mxfp8KernelConfig,
         *,

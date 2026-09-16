@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ from moe_ep.moe_ep_test_support import (
     _forward_config,
     _grad_output,
     _make_discrete_training_weights,
+    _moe_ep_config,
     _reference_forward,
     _replay_cuda_graph,
     _sm107_device,
@@ -42,7 +44,11 @@ def _patch_common_inference_dependencies(
 ) -> None:
     patch.setattr(api_module, "validate_forward", _validated_request)
     patch.setattr(backend_module, "validate_config", lambda config: None)
-    patch.setattr(backend_module, "validate_request", lambda request: None)
+    patch.setattr(
+        backend_module,
+        "validate_request",
+        lambda config, request: None,
+    )
     patch.setattr(backend_module, "create_backend", create_backend)
     patch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
     patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -191,11 +197,18 @@ def test_autotune_api_transactions(monkeypatch):
     candidate = MoeEpTuningConfig(token_in_flag_batch=2)
 
     # Validation failures happen before teardown and preserve active state.
-    op = MoeEp(**_forward_config())
-    active_backend = object()
-    op._forward_backend = active_backend
+    op = MoeEp(_moe_ep_config(**_forward_config()))
+    state = op._execution_state
+    active_backend = SimpleNamespace(
+        resolved_config=state.resolved_config,
+        device=torch.device("cuda", 0),
+    )
+    op._execution_state = type(state)(
+        resolved_config=state.resolved_config,
+        backend=active_backend,
+    )
     with pytest.raises(ValueError, match="does not sweep reduce_topk_in_kernel"):
-        op.autotune(
+        op.autotune_inference(
             None,
             None,
             None,
@@ -205,18 +218,28 @@ def test_autotune_api_transactions(monkeypatch):
             warmup_iters=0,
             timed_iters=1,
         )
-    assert op.tuning == baseline
-    assert op._forward_backend is active_backend
-    op._forward_backend = None
+    assert op.inference_tuning == baseline
+    assert op._execution_state.backend is active_backend
+    op._execution_state = type(state)(
+        resolved_config=state.resolved_config,
+        backend=None,
+    )
     op.close()
 
-    # A runtime failure is fail-fast and permanently poisons the instance.
+    # Candidate failure is fail-fast but leaves the active execution state
+    # usable and unchanged.
     with monkeypatch.context() as patch:
         calls = []
 
         class FailingBackend:
+            def __init__(self, config):
+                self.resolved_config = config
+                self.device = torch.device("cuda", 0)
+
             def forward(self, request):
-                calls.append(request.config.tuning)
+                calls.append(
+                    request.config.public_config.inference_tuning
+                )
                 raise RuntimeError("launch failed")
 
             def close(self):
@@ -226,16 +249,17 @@ def test_autotune_api_transactions(monkeypatch):
             patch,
             api_module=api_module,
             backend_module=backend_module,
-            create_backend=lambda config, device: FailingBackend(),
+            create_backend=lambda config, device: FailingBackend(config),
         )
         patch.setattr(
             autotune_module,
             "verify_state_across_ranks",
             lambda state, group: None,
         )
-        op = MoeEp(**_forward_config())
+        op = MoeEp(_moe_ep_config(**_forward_config()))
+        original_state = op._execution_state
         with pytest.raises(RuntimeError, match="candidate 0.*compile/prime"):
-            op.autotune(
+            op.autotune_inference(
                 None,
                 None,
                 None,
@@ -246,8 +270,10 @@ def test_autotune_api_transactions(monkeypatch):
                 timed_iters=1,
             )
         assert calls == [baseline]
-        with pytest.raises(RuntimeError, match="unusable"):
-            op.autotune(
+        assert op._execution_state is original_state
+        assert not op._poisoned
+        with pytest.raises(RuntimeError, match="candidate 0.*compile/prime"):
+            op.autotune_inference(
                 None,
                 None,
                 None,
@@ -257,7 +283,8 @@ def test_autotune_api_transactions(monkeypatch):
                 warmup_iters=0,
                 timed_iters=1,
             )
-        op._forward_backend = None
+        assert calls == [baseline, baseline]
+        assert op._execution_state is original_state
         op.close()
 
     # Inference commits only the measured winner and retains its rebuilt backend.
@@ -266,11 +293,12 @@ def test_autotune_api_transactions(monkeypatch):
 
         class InferenceBackend:
             def __init__(self, config):
-                self.config = config
+                self.resolved_config = config
+                self.device = torch.device("cuda", 0)
                 self.closed = False
 
             def forward(self, request):
-                assert request.config == self.config
+                assert request.config == self.resolved_config
                 return object()
 
             def close(self):
@@ -283,8 +311,12 @@ def test_autotune_api_transactions(monkeypatch):
 
         def benchmark_inference(run, *, device, group, timed_iters):
             del device, group, timed_iters
+            assert not original_backend.closed
             run()
-            tuning = active_backends[-1].config.tuning
+            tuning = (
+                active_backends[-1]
+                .resolved_config.public_config.inference_tuning
+            )
             latency = 1.0 if tuning == candidate else 2.0
             return latency, (latency,)
 
@@ -304,8 +336,14 @@ def test_autotune_api_transactions(monkeypatch):
             "synchronize_candidate",
             lambda device, group: None,
         )
-        op = MoeEp(**_forward_config())
-        result = op.autotune(
+        op = MoeEp(_moe_ep_config(**_forward_config()))
+        original_state = op._execution_state
+        original_backend = InferenceBackend(original_state.resolved_config)
+        op._execution_state = type(original_state)(
+            resolved_config=original_state.resolved_config,
+            backend=original_backend,
+        )
+        result = op.autotune_inference(
             None,
             None,
             None,
@@ -317,9 +355,11 @@ def test_autotune_api_transactions(monkeypatch):
         )
         assert result.winner == candidate
         assert result.evaluated_candidates == 2
-        assert op.tuning == op._forward_config.tuning == candidate
-        assert op._forward_backend is active_backends[-1]
+        assert op.inference_tuning == candidate
+        assert op.config.inference_tuning == candidate
+        assert op._execution_state.backend is active_backends[-1]
         assert not active_backends[-1].closed
+        assert original_backend.closed
         op.close()
 
     # Training times forward/backward pairs and leaves preparation to the caller.
@@ -360,14 +400,16 @@ def test_autotune_api_transactions(monkeypatch):
 
         class TrainingBackend:
             def __init__(self, config):
-                self.config = config
+                self.resolved_config = config
+                self.device = torch.device("cuda", 0)
 
-            def prepare_training(
-                self,
-                *,
-                native_weight_storage_mode="contiguous",
-            ):
-                assert native_weight_storage_mode == "contiguous"
+            def prepare_training(self):
+                from cudnn import MoeEpNativeWeightStorageMode
+
+                assert (
+                    self.resolved_config.public_config.training_weight_storage_mode
+                    is MoeEpNativeWeightStorageMode.CONTIGUOUS
+                )
                 return TrainingState()
 
             def close(self):
@@ -429,7 +471,12 @@ def test_autotune_api_transactions(monkeypatch):
         def benchmark_training(run, *, device, group, timed_iters):
             del device, group, timed_iters
             run()
-            tuning = active_backends[-1].config.tuning
+            public = active_backends[-1].resolved_config.public_config
+            tuning = (
+                public.training_backward_tuning
+                if launches[-1] == "backward"
+                else public.training_forward_tuning
+            )
             latency = 1.0 if tuning == candidate else 2.0
             return latency, (latency,)
 
@@ -455,9 +502,27 @@ def test_autotune_api_transactions(monkeypatch):
             lambda *args, **kwargs: launches.append("backward"),
         )
 
-        op = MoeEp(**_forward_config(), weight_interleave_size=32)
+        from cudnn import MoeEpFc1WeightLayout
+
+        op = MoeEp(
+            _moe_ep_config(
+                **_forward_config(),
+                fc1_weight_layout=(
+                    MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+                ),
+            )
+        )
         value = SimpleNamespace(device=torch.device("cuda", 0))
-        result = op.autotune_training(
+        forward_result = op.autotune_training_forward(
+            value,
+            None,
+            None,
+            forward_weights=object(),
+            candidates=[candidate],
+            warmup_iters=0,
+            timed_iters=1,
+        )
+        backward_result = op.autotune_training_backward(
             value,
             value,
             None,
@@ -468,16 +533,22 @@ def test_autotune_api_transactions(monkeypatch):
             warmup_iters=0,
             timed_iters=1,
         )
-        assert result.mode == "training"
-        assert result.winner == candidate
-        assert launches == ["forward", "backward"] * 4
+        assert forward_result.mode == "training_forward"
+        assert backward_result.mode == "training_backward"
+        assert forward_result.winner == backward_result.winner == candidate
+        assert launches.count("forward") == 6
+        assert launches.count("backward") == 4
         assert op._training_state is None
-        assert op._forward_backend is None
-        with pytest.raises(
-            ValueError,
-            match="must match the autotune_training mode",
+        assert op._execution_state.backend is None
+        for method in (
+            op.autotune_training_forward,
+            op.autotune_training_backward,
+            op.prepare_training,
         ):
-            op.prepare_training(native_weight_storage_mode="discrete")
+            assert (
+                "native_weight_storage_mode"
+                not in inspect.signature(method).parameters
+            )
         op.close()
 
 
@@ -494,7 +565,7 @@ def _print_candidate_timings(label, result) -> None:
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 def test_autotune_sm107_inference_training_and_graph():
-    from cudnn import MoeEp, MoeEpTuningConfig
+    from cudnn import MoeEp, MoeEpFc1WeightLayout, MoeEpTuningConfig
 
     device = _sm107_device()
     candidates = [
@@ -512,8 +583,8 @@ def test_autotune_sm107_inference_training_and_graph():
     alternate_expected = _reference_forward(
         (*inference_args[:3], alternate_topk_idx, inference_args[4]),
     )
-    with MoeEp(**_forward_config()) as op:
-        result = op.autotune(
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
+        result = op.autotune_inference(
             *inference_args,
             candidates=candidates,
             warmup_iters=1,
@@ -524,8 +595,8 @@ def test_autotune_sm107_inference_training_and_graph():
         torch.cuda.synchronize(device)
         assert result.evaluated_candidates == len(candidates) == 5
         assert result.winner in candidates
-        assert op.tuning == result.winner
-        assert op._forward_backend is not None
+        assert op.inference_tuning == result.winner
+        assert op._execution_state.backend is not None
         _assert_matches_reference(actual, inference_expected)
         _replay_cuda_graph(
             op,
@@ -558,15 +629,19 @@ def test_autotune_sm107_inference_training_and_graph():
     )
     source_weights = _fixed_training_weights(training_args)
     with MoeEp(
-        num_experts=2,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        max_tokens_per_rank=training_args[0].shape[0],
-        max_recv_size_per_rank=2 * 128,
-        drop_on_overflow=True,
-        combine_format="bf16",
-        weight_interleave_size=32,
+        _moe_ep_config(
+            num_experts=2,
+            hidden_size=128,
+            intermediate_size=256,
+            top_k=2,
+            max_tokens_per_rank=training_args[0].shape[0],
+            max_recv_size_per_rank=2 * 128,
+            drop_on_overflow=True,
+            combine_format="bf16",
+            fc1_weight_layout=(
+                MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+            ),
+        )
     ) as op:
         forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         native_forward = op.pack_forward_weights(
@@ -577,18 +652,33 @@ def test_autotune_sm107_inference_training_and_graph():
             source_weights[1],
             out=backward_staging,
         )
-        result = op.autotune_training(
+        forward_result = op.autotune_training_forward(
+            training_args[0],
+            training_args[3],
+            training_args[4],
+            forward_weights=native_forward,
+            candidates=candidates,
+            warmup_iters=1,
+            timed_iters=2,
+        )
+        backward_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.token_back_mode == "epi_warps"
+        ]
+        backward_result = op.autotune_training_backward(
             training_args[0],
             grad_output,
             training_args[3],
             training_args[4],
             forward_weights=native_forward,
             backward_weights=native_backward,
-            candidates=candidates,
+            candidates=backward_candidates,
             warmup_iters=1,
             timed_iters=2,
         )
-        _print_candidate_timings("training", result)
+        _print_candidate_timings("training forward", forward_result)
+        _print_candidate_timings("training backward", backward_result)
         requirements = op.prepare_training(device=device)
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
@@ -615,9 +705,14 @@ def test_autotune_sm107_inference_training_and_graph():
             out=backward_out,
         )
         torch.cuda.synchronize(device)
-        assert result.evaluated_candidates == len(candidates) == 5
-        assert result.winner in candidates
-        assert op.tuning == result.winner
+        assert forward_result.evaluated_candidates == len(candidates) == 5
+        assert forward_result.winner in candidates
+        assert backward_result.evaluated_candidates == len(
+            backward_candidates
+        )
+        assert backward_result.winner in backward_candidates
+        assert op.training_forward_tuning == forward_result.winner
+        assert op.training_backward_tuning == backward_result.winner
         _assert_matches_reference(actual_y, training_expected[0])
         _assert_backward_matches(
             (actual_dx, actual_dprob),
@@ -628,8 +723,13 @@ def test_autotune_sm107_inference_training_and_graph():
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-def test_autotune_training_discrete_mode_binds_prepare_specialization():
-    from cudnn import MoeEp, MoeEpTuningConfig
+def test_autotune_training_discrete_config_binds_prepare_specialization():
+    from cudnn import (
+        MoeEp,
+        MoeEpFc1WeightLayout,
+        MoeEpNativeWeightStorageMode,
+        MoeEpTuningConfig,
+    )
 
     device = _sm107_device()
     base_args = make_forward_inputs(device)
@@ -647,15 +747,22 @@ def test_autotune_training_discrete_mode_binds_prepare_specialization():
     )
     source_weights = _fixed_training_weights(training_args)
     with MoeEp(
-        num_experts=2,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        max_tokens_per_rank=training_args[0].shape[0],
-        max_recv_size_per_rank=256,
-        drop_on_overflow=True,
-        combine_format="bf16",
-        weight_interleave_size=32,
+        _moe_ep_config(
+            num_experts=2,
+            hidden_size=128,
+            intermediate_size=256,
+            top_k=2,
+            max_tokens_per_rank=training_args[0].shape[0],
+            max_recv_size_per_rank=256,
+            drop_on_overflow=True,
+            combine_format="bf16",
+            fc1_weight_layout=(
+                MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+            ),
+            training_weight_storage_mode=(
+                MoeEpNativeWeightStorageMode.DISCRETE
+            ),
+        )
     ) as op:
         forward_staging, backward_staging = _allocate_training_weight_staging(
             source_weights
@@ -673,21 +780,15 @@ def test_autotune_training_discrete_mode_binds_prepare_specialization():
             packed_backward,
         )
         assert owners
-        result = op.autotune_training(
+        result = op.autotune_training_forward(
             training_args[0],
-            grad_output,
             training_args[3],
             training_args[4],
             forward_weights=native_forward,
-            backward_weights=native_backward,
             candidates=[MoeEpTuningConfig(token_in_flag_batch=2)],
-            native_weight_storage_mode="discrete",
             warmup_iters=0,
             timed_iters=1,
         )
-        assert result.mode == "training"
-        op.prepare_training(
-            device=device,
-            native_weight_storage_mode="discrete",
-        )
+        assert result.mode == "training_forward"
+        op.prepare_training(device=device)
         assert op._training_state.weight_storage_mode == "discrete"

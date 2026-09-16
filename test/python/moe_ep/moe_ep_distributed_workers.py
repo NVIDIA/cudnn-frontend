@@ -24,6 +24,7 @@ from moe_ep.moe_ep_test_support import (
     _grad_output,
     _interleave_fc1_wgrad,
     _make_discrete_training_weights,
+    _moe_ep_config,
     _output_as_float,
     _poison_training_outputs_for_test,
     _reference_forward,
@@ -69,9 +70,9 @@ def _distributed_autotune_worker(
         )
         expected = _reference_forward(args, **config)
         candidate = MoeEpTuningConfig(token_in_flag_batch=2)
-        op = MoeEp(**config)
+        op = MoeEp(_moe_ep_config(**config))
         try:
-            result = op.autotune(
+            result = op.autotune_inference(
                 *args,
                 candidates=[candidate],
                 warmup_iters=1,
@@ -82,7 +83,7 @@ def _distributed_autotune_worker(
             winners = [None] * world_size
             dist.all_gather_object(winners, result.winner)
             assert all(winner == result.winner for winner in winners)
-            assert op.tuning == result.winner
+            assert op.inference_tuning == result.winner
             _assert_matches_reference(actual, expected)
             dist.barrier()
             op.close()
@@ -120,7 +121,7 @@ def _run_forward_output_case(
     alternate_topk_idx = args[3].flip(1).contiguous()
     alternate_args = (*args[:3], alternate_topk_idx, args[4])
     alternate_expected = _reference_forward(alternate_args, **config)
-    op = MoeEp(**config)
+    op = MoeEp(_moe_ep_config(**config))
     try:
         actual = op(*args)
         actual_snapshot = _output_as_float(actual).clone()
@@ -302,7 +303,11 @@ def _run_backward_reference_case(
 ) -> None:
     """Run stateless training after the independent distributed oracle."""
 
-    from cudnn import MoeEp
+    from cudnn import (
+        MoeEp,
+        MoeEpFc1WeightLayout,
+        MoeEpNativeWeightStorageMode,
+    )
 
     args, grad_output = _make_distributed_backward_inputs(
         ep_rank,
@@ -333,23 +338,27 @@ def _run_backward_reference_case(
     weights = _fixed_training_weights(args)
 
     op = MoeEp(
-        num_experts=num_experts,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        ep_group=ep_group,
-        max_tokens_per_rank=args[0].shape[0],
-        max_recv_size_per_rank=max_recv_size_per_rank,
-        drop_on_overflow=True,
-        combine_format=combine_format,
-        gate_up_clamp=gate_up_clamp,
-        weight_interleave_size=32,
+        _moe_ep_config(
+            num_experts=num_experts,
+            hidden_size=128,
+            intermediate_size=256,
+            top_k=2,
+            ep_group=ep_group,
+            max_tokens_per_rank=args[0].shape[0],
+            max_recv_size_per_rank=max_recv_size_per_rank,
+            drop_on_overflow=True,
+            combine_format=combine_format,
+            gate_up_clamp=gate_up_clamp,
+            fc1_weight_layout=(
+                MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+            ),
+            training_weight_storage_mode=MoeEpNativeWeightStorageMode(
+                native_weight_storage_mode
+            ),
+        )
     )
     try:
-        requirements = op.prepare_training(
-            device=device,
-            native_weight_storage_mode=native_weight_storage_mode,
-        )
+        requirements = op.prepare_training(device=device)
         forward_staging, backward_staging = _allocate_training_weight_staging(weights)
         native_forward = op.pack_forward_weights(
             weights[0],

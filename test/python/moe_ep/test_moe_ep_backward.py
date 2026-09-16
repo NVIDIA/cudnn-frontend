@@ -36,7 +36,7 @@ from cudnn.moe_ep import (
     pack_forward_weights,
 )
 from cudnn.moe_ep._megamoe_backend.mxfp8._training_resources import (
-    Mxfp8TrainingState,
+    _Mxfp8TrainingState,
     _build_training_abi_facts,
     _harmonize_symmetric_regions,
 )
@@ -84,6 +84,7 @@ from moe_ep.moe_ep_test_support import (
     _grad_output,
     _interleave_fc1_wgrad,
     _make_discrete_training_weights,
+    _moe_ep_config,
     _poison_pre_reduced_for_test,
     _poison_training_outputs_for_test,
     _require_distributed_sm107,
@@ -94,6 +95,10 @@ from moe_ep.moe_ep_test_support import (
     make_forward_inputs,
     quantize_mxfp8,
 )
+
+
+def _training_public_config(**overrides):
+    return _training_config(**overrides).public_config
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -109,9 +114,9 @@ def _native_forward(
     *,
     device: torch.device = torch.device("cpu"),
 ) -> MoeEpNativeForwardWeights:
-    e = config.experts_per_rank
-    h = config.hidden_size
-    i = config.intermediate_size
+    e = config.topology.experts_per_rank
+    h = config.public_config.model.hidden_size
+    i = config.public_config.model.intermediate_size
     fc1 = torch.empty_strided(
         (e, h, 2 * i),
         (h * 2 * i, 1, h),
@@ -151,9 +156,9 @@ def _native_backward(
     *,
     device: torch.device = torch.device("cpu"),
 ) -> MoeEpNativeBackwardWeights:
-    e = config.experts_per_rank
-    h = config.hidden_size
-    i = config.intermediate_size
+    e = config.topology.experts_per_rank
+    h = config.public_config.model.hidden_size
+    i = config.public_config.model.intermediate_size
     return MoeEpNativeBackwardWeights(
         w2_transpose=MoeEpNativeWeight(
             torch.empty(
@@ -203,7 +208,7 @@ def _discrete_weight(experts, layout, *, offset):
 
 
 def _discrete_forward(config):
-    experts = config.experts_per_rank
+    experts = config.topology.experts_per_rank
     return MoeEpNativeDiscreteForwardWeights(
         fc1=_discrete_weight(
             experts,
@@ -219,7 +224,7 @@ def _discrete_forward(config):
 
 
 def _discrete_backward(config):
-    experts = config.experts_per_rank
+    experts = config.topology.experts_per_rank
     return MoeEpNativeDiscreteBackwardWeights(
         w2_transpose=_discrete_weight(
             experts,
@@ -235,9 +240,9 @@ def _discrete_backward(config):
 
 
 def _source_weights(config):
-    e = config.experts_per_rank
-    h = config.hidden_size
-    i = config.intermediate_size
+    e = config.topology.experts_per_rank
+    h = config.public_config.model.hidden_size
+    i = config.public_config.model.intermediate_size
 
     def block_scaled(shape):
         scale_shape = list(shape)
@@ -299,8 +304,9 @@ def test_training_device_prefers_explicit_then_current(monkeypatch):
 
 @pytest.mark.L0
 def test_training_input_rejects_noncontiguous_plain_tensor():
-    config = _training_config(weight_interleave_size=32)
-    activation = torch.empty((config.hidden_size, 2), dtype=torch.bfloat16).t()
+    config = _training_config()
+    hidden_size = config.public_config.model.hidden_size
+    activation = torch.empty((hidden_size, 2), dtype=torch.bfloat16).t()
     topk_idx = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
     topk_weights = torch.ones((2, 2), dtype=torch.float32)
 
@@ -318,11 +324,11 @@ def test_training_input_rejects_noncontiguous_plain_tensor():
 @pytest.mark.L0
 def test_training_input_accepts_logical_view_of_padded_instance_scale():
     config = _training_config(
-        weight_interleave_size=32,
         max_tokens_per_rank=5,
     )
     token_count = 5
-    logical_scale_columns = config.hidden_size // 32
+    model = config.public_config.model
+    logical_scale_columns = model.hidden_size // 32
     instance_scale = torch.empty(
         (128, 16),
         dtype=torch.float8_e8m0fnu,
@@ -330,16 +336,16 @@ def test_training_input_accepts_logical_view_of_padded_instance_scale():
     scale = instance_scale[:token_count, :logical_scale_columns]
     activation = BlockScaledTensor(
         data=torch.empty(
-            (token_count, config.hidden_size),
+            (token_count, model.hidden_size),
             dtype=torch.float8_e4m3fn,
         ),
         scale=scale,
         format="mxfp8",
-        logical_shape=(token_count, config.hidden_size),
+        logical_shape=(token_count, model.hidden_size),
         axis=1,
     )
-    topk_idx = torch.zeros((token_count, config.top_k), dtype=torch.int32)
-    topk_weights = torch.ones((token_count, config.top_k), dtype=torch.float32)
+    topk_idx = torch.zeros((token_count, model.top_k), dtype=torch.int32)
+    topk_weights = torch.ones((token_count, model.top_k), dtype=torch.float32)
 
     assert scale.shape == (5, 4)
     assert scale.stride() == (16, 1)
@@ -360,13 +366,14 @@ def test_training_input_accepts_logical_view_of_padded_instance_scale():
 
 @pytest.mark.L0
 def test_training_input_strict_requires_dense_routes_and_trusted_skips_value_checks():
-    config = _training_config(weight_interleave_size=32)
-    activation = torch.empty((2, config.hidden_size), dtype=torch.bfloat16)
-    topk_weights = torch.ones((2, config.top_k), dtype=torch.float32)
+    config = _training_config()
+    model = config.public_config.model
+    activation = torch.empty((2, model.hidden_size), dtype=torch.bfloat16)
+    topk_weights = torch.ones((2, model.top_k), dtype=torch.float32)
 
     for topk_idx in (
         torch.tensor([[0, 1], [-1, 0]], dtype=torch.int32),
-        torch.tensor([[0, config.num_experts], [1, 0]], dtype=torch.int32),
+        torch.tensor([[0, model.num_experts], [1, 0]], dtype=torch.int32),
     ):
         with pytest.raises(ValueError, match="valid global expert id"):
             validate_training_input(
@@ -395,10 +402,11 @@ def test_training_input_strict_requires_dense_routes_and_trusted_skips_value_che
 
 @pytest.mark.L0
 def test_training_input_strict_accepts_dense_routes():
-    config = _training_config(weight_interleave_size=32)
-    activation = torch.empty((2, config.hidden_size), dtype=torch.bfloat16)
+    config = _training_config()
+    model = config.public_config.model
+    activation = torch.empty((2, model.hidden_size), dtype=torch.bfloat16)
     topk_idx = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
-    topk_weights = torch.ones((2, config.top_k), dtype=torch.float32)
+    topk_weights = torch.ones((2, model.top_k), dtype=torch.float32)
 
     assert (
         validate_training_input(
@@ -425,16 +433,15 @@ def test_training_forward_propagates_trusted_validation_mode(monkeypatch):
         assert kwargs["validate_expert_ids"] is False
         raise ValidationObserved
 
-    op = MoeEp(
-        num_experts=2,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        validation_mode="trusted",
-    )
+    op = MoeEp(_training_public_config(validation_mode="trusted"))
     op._training_state = object()
     op._training_requirements = {}
-    op._forward_backend_device = torch.device("cpu")
+    state = op._execution_state
+    backend = SimpleNamespace(
+        resolved_config=state.resolved_config,
+        device=torch.device("cuda", 0),
+    )
+    op._execution_state = replace(state, backend=backend)
     monkeypatch.setattr(api_module, "validate_training_input", observe_validation)
 
     with pytest.raises(ValidationObserved):
@@ -479,7 +486,7 @@ def test_training_bundle_fields_match_public_contracts():
 
 @pytest.mark.L0
 def test_native_weight_validation_and_kernel_views_are_zero_copy():
-    config = _training_config(weight_interleave_size=32)
+    config = _training_config()
     forward = _native_forward(config)
     backward = _native_backward(config)
 
@@ -497,7 +504,7 @@ def test_native_weight_validation_and_kernel_views_are_zero_copy():
 
 @pytest.mark.L0
 def test_discrete_native_weight_types_and_kernel_views_are_zero_copy():
-    config = _training_config(weight_interleave_size=32)
+    config = _training_config()
     forward = _discrete_forward(config)
     backward = _discrete_backward(config)
 
@@ -519,7 +526,7 @@ def test_discrete_native_weight_types_and_kernel_views_are_zero_copy():
 
 @pytest.mark.L0
 def test_discrete_native_weight_validation_rejects_host_pointer_tables():
-    config = _training_config(weight_interleave_size=32)
+    config = _training_config()
     with pytest.raises(ValueError, match="must be a CUDA tensor"):
         validate_native_discrete_forward_weights(config, _discrete_forward(config))
     with pytest.raises(ValueError, match="must be a CUDA tensor"):
@@ -540,7 +547,7 @@ def test_discrete_native_weight_validation_rejects_host_pointer_tables():
 
 @pytest.mark.L0
 def test_discrete_native_weight_validation_checks_table_shape_and_dtype():
-    config = _training_config(weight_interleave_size=32)
+    config = _training_config()
     forward = _discrete_forward(config)
     wrong_shape = MoeEpNativeDiscreteForwardWeights(
         fc1=MoeEpNativeDiscreteWeight(
@@ -570,15 +577,14 @@ def test_strict_discrete_pointer_tables_must_be_warmed_before_capture(
     monkeypatch,
 ):
     op = MoeEp(
-        num_experts=2,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        max_tokens_per_rank=4,
-        max_recv_size_per_rank=256,
-        weight_interleave_size=32,
+        _training_public_config(
+            max_recv_size_per_rank=256,
+            training_weight_storage_mode=(
+                MoeEpNativeWeightStorageMode.DISCRETE
+            ),
+        )
     )
-    weights = _discrete_forward(op._forward_config)
+    weights = _discrete_forward(op._execution_state.resolved_config)
     capturing = False
     validations = []
     monkeypatch.setattr(
@@ -630,7 +636,9 @@ def test_strict_discrete_pointer_tables_must_be_warmed_before_capture(
 
     capturing = False
     with torch.inference_mode():
-        versionless = _discrete_forward(op._forward_config)
+        versionless = _discrete_forward(
+            op._execution_state.resolved_config
+        )
     op._validate_discrete_pointer_lifetime(
         versionless,
         validate=validate,
@@ -653,19 +661,41 @@ def test_prepare_training_rejects_cross_rank_storage_mode_mismatch(
     import cudnn.moe_ep.api as api_module
 
     op = MoeEp(
-        num_experts=2,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        max_tokens_per_rank=4,
-        max_recv_size_per_rank=256,
-        weight_interleave_size=32,
+        _training_public_config(
+            max_recv_size_per_rank=256,
+            training_weight_storage_mode=(
+                MoeEpNativeWeightStorageMode.DISCRETE
+            ),
+        )
     )
-    op._forward_config = replace(
-        op._forward_config,
-        ep_size=2,
-        ep_group=object(),
-        ep_global_ranks=(0, 1),
+    group = object()
+    parallel = object.__new__(type(op.config.parallel))
+    for name in (
+        "max_tokens_per_rank",
+        "max_recv_size_per_rank",
+        "drop_on_overflow",
+        "token_padding_size",
+        "sf_padding_size",
+    ):
+        object.__setattr__(
+            parallel,
+            name,
+            getattr(op.config.parallel, name),
+        )
+    object.__setattr__(parallel, "ep_group", group)
+    resolved = replace(
+        op._execution_state.resolved_config,
+        public_config=replace(op.config, parallel=parallel),
+        topology=replace(
+            op._execution_state.resolved_config.topology,
+            ep_size=2,
+            ep_global_ranks=(0, 1),
+            experts_per_rank=1,
+        ),
+    )
+    op._execution_state = replace(
+        op._execution_state,
+        resolved_config=resolved,
     )
     monkeypatch.setattr(
         api_module,
@@ -680,47 +710,88 @@ def test_prepare_training_rejects_cross_rank_storage_mode_mismatch(
 
     def gather(output, value, *, group):
         assert value == "discrete"
-        assert group is op._forward_config.ep_group
+        assert group is op.config.parallel.ep_group
         output[:] = ["discrete", "contiguous"]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     with pytest.raises(RuntimeError, match="must match on every"):
-        op.prepare_training(native_weight_storage_mode="discrete")
+        op.prepare_training()
     op.close()
 
 
-@pytest.mark.L0
-def test_native_weight_storage_mode_separates_kernel_config_and_cache_key():
-    config = _training_config(weight_interleave_size=32)
-    contiguous = Mxfp8KernelConfig.from_operator_config(
-        config,
-        weight_storage_mode="contiguous",
+@pytest.mark.L2
+@pytest.mark.parametrize(
+    "factory",
+    (
+        Mxfp8KernelConfig.for_training_forward,
+        Mxfp8KernelConfig.for_training_backward,
+    ),
+)
+def test_native_weight_storage_mode_separates_kernel_config_and_cache_key(
+    factory,
+):
+    contiguous = factory(
+        _training_config(),
+        launch_cluster_count=16,
     )
-    discrete = Mxfp8KernelConfig.from_operator_config(
-        config,
-        weight_storage_mode="discrete",
+    discrete = factory(
+        _training_config(
+            training_weight_storage_mode=(
+                MoeEpNativeWeightStorageMode.DISCRETE
+            )
+        ),
+        launch_cluster_count=16,
     )
     assert contiguous != discrete
-    assert (
-        discrete.effective_config(16)["weight_storage_mode"]
-        == "discrete"
-    )
+    assert discrete.effective_config()["weight_storage_mode"] == "discrete"
     assert contiguous.compile_key(
         torch.device("cuda", 0),
         (10, 7),
-        16,
         (),
     ) != discrete.compile_key(
         torch.device("cuda", 0),
         (10, 7),
-        16,
         (),
     )
 
 
+@pytest.mark.L2
+@pytest.mark.parametrize(
+    ("factory", "expected_flags"),
+    (
+        (
+            Mxfp8KernelConfig.for_inference,
+            (False, False),
+        ),
+        (
+            Mxfp8KernelConfig.for_training_forward,
+            (True, False),
+        ),
+        (
+            Mxfp8KernelConfig.for_training_backward,
+            (True, True),
+        ),
+    ),
+)
+def test_phase_kernel_config_factories_bind_launch_count_and_phase(
+    factory,
+    expected_flags,
+):
+    kernel_config = factory(
+        _training_config(),
+        launch_cluster_count=16,
+    )
+
+    assert kernel_config.launch_cluster_count == 16
+    assert (
+        kernel_config.generate_c,
+        kernel_config.dfc2_recompute,
+    ) == expected_flags
+
+
 @pytest.mark.L0
 def test_standalone_weight_packers_write_only_caller_staging():
-    config = _training_config(weight_interleave_size=32)
+    config = _training_config()
     source = _source_weights(config)
     forward_out, backward_out = _allocate_training_weight_staging(source)
 
@@ -737,7 +808,7 @@ def test_standalone_weight_packers_write_only_caller_staging():
 
 @pytest.mark.L0
 def test_weight_packing_rejects_source_staging_alias():
-    config = _training_config(weight_interleave_size=32)
+    config = _training_config()
     source = _source_weights(config)
     _, backward_out = _allocate_training_weight_staging(source)
     aliased_out = MoeEpBackwardWeightStaging(
@@ -877,13 +948,19 @@ def test_mxfp8_training_input_already_in_symmetric_staging_is_not_copied():
 
 @pytest.mark.L0
 def test_native_execution_rejects_compact_or_wrong_layout_scales():
-    config = _training_config(weight_interleave_size=32)
+    config = _training_config()
+    model = config.public_config.model
+    experts_per_rank = config.topology.experts_per_rank
     native = _native_forward(config)
     bad = MoeEpNativeForwardWeights(
         fc1=MoeEpNativeWeight(
             native.fc1.payload,
             torch.empty(
-                (config.experts_per_rank, config.hidden_size // 32, 2 * config.intermediate_size),
+                (
+                    experts_per_rank,
+                    model.hidden_size // 32,
+                    2 * model.intermediate_size,
+                ),
                 dtype=torch.float8_e8m0fnu,
             ),
             native.fc1.layout_id,
@@ -973,18 +1050,15 @@ def test_training_forward_state_validation_uses_output_contract_names():
 
 @pytest.mark.L0
 def test_training_backward_rejects_missing_output_bundle_after_prepare():
-    op = MoeEp(
-        num_experts=2,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        max_tokens_per_rank=4,
-        max_recv_size_per_rank=128,
-        weight_interleave_size=32,
-    )
+    op = MoeEp(_training_public_config())
     op._training_state = object()
     op._training_requirements = {}
-    op._forward_backend_device = torch.device("cpu")
+    state = op._execution_state
+    backend = SimpleNamespace(
+        resolved_config=state.resolved_config,
+        device=torch.device("cuda", 0),
+    )
+    op._execution_state = replace(state, backend=backend)
     with pytest.raises(TypeError, match="out must be a MoeEpTrainingBackwardOutputs"):
         op.training_backward(
             torch.empty((0, 128), dtype=torch.bfloat16),
@@ -1035,9 +1109,9 @@ def test_wgrad_assembly_returns_only_caller_owned_views():
 
 @pytest.mark.L0
 def test_private_training_state_has_no_bound_weights_or_wgrad_exporter():
-    config = _training_config(weight_interleave_size=32)
+    config = _training_config()
     forward, backward = _training_prepared_pair(config)
-    state = Mxfp8TrainingState(
+    state = _Mxfp8TrainingState(
         config,
         torch.device("cpu"),
         forward,
@@ -1056,16 +1130,17 @@ def test_private_training_state_has_no_bound_weights_or_wgrad_exporter():
     )
 
     requirements = state.public_requirements()
+    model = config.public_config.model
     assert requirements["fc1_a"] == (
-        (forward.pool_token_capacity, config.hidden_size),
-        (config.hidden_size, 1),
+        (forward.pool_token_capacity, model.hidden_size),
+        (model.hidden_size, 1),
         torch.float8_e4m3fn,
         128,
     )
-    assert requirements["fc1_b"][1] == (2 * config.intermediate_size, 1)
+    assert requirements["fc1_b"][1] == (2 * model.intermediate_size, 1)
     assert requirements["fc2_a"][:2] == (
-        (forward.pool_token_capacity, config.intermediate_size),
-        (config.intermediate_size, 1),
+        (forward.pool_token_capacity, model.intermediate_size),
+        (model.intermediate_size, 1),
     )
     assert requirements["fc2_b"][1] == (1, forward.pool_token_capacity)
     assert requirements["grad_activation"][2] is torch.bfloat16
@@ -1073,9 +1148,9 @@ def test_private_training_state_has_no_bound_weights_or_wgrad_exporter():
 
 @pytest.mark.L0
 def test_private_training_workspace_keeps_only_live_instance_scratch():
-    config = _training_config(weight_interleave_size=32)
+    config = _training_config()
     forward, backward = _training_prepared_pair(config)
-    state = Mxfp8TrainingState(
+    state = _Mxfp8TrainingState(
         config,
         torch.device("cpu"),
         forward,
@@ -1134,10 +1209,10 @@ def test_private_training_workspace_keeps_only_live_instance_scratch():
 
 @pytest.mark.L0
 def test_training_views_require_col_quant_snapshot():
-    config = _training_config(weight_interleave_size=32)
+    config = _training_config()
     forward, backward = _training_prepared_pair(config)
     forward.col_quant_sizes_offset = None
-    state = Mxfp8TrainingState(
+    state = _Mxfp8TrainingState(
         config,
         torch.device("cpu"),
         forward,
@@ -1152,7 +1227,6 @@ def test_training_abi_fingerprint_covers_workspace_and_native_layouts():
     config = _training_config(
         ep_size=2,
         ep_global_ranks=(0, 1),
-        weight_interleave_size=32,
     )
     forward = _training_abi_prepared("forward")
     backward = _training_abi_prepared("backward")
@@ -1258,15 +1332,7 @@ def test_training_contract_rejects_cross_bundle_aliases():
 
 @pytest.mark.L0
 def test_training_methods_require_prepare_and_do_not_expose_cleanup():
-    op = MoeEp(
-        num_experts=2,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        max_tokens_per_rank=4,
-        max_recv_size_per_rank=128,
-        weight_interleave_size=32,
-    )
+    op = MoeEp(_training_public_config())
     assert hasattr(op, "prepare_training")
     assert hasattr(op, "training_forward")
     assert hasattr(op, "training_backward")
@@ -1279,21 +1345,26 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
             torch.empty((0, 128), dtype=torch.bfloat16),
             torch.empty((0, 2), dtype=torch.int32),
             torch.empty((0, 2), dtype=torch.float32),
-            weights=_native_forward(_training_config(weight_interleave_size=32)),
+            weights=_native_forward(_training_config()),
             out=MoeEpTrainingForwardOutputs(
                 fc1_preact=torch.empty((0, 512), dtype=torch.bfloat16),
             ),
         )
 
     conventional = MoeEp(
-        num_experts=2,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        max_tokens_per_rank=4,
-        max_recv_size_per_rank=128,
+        _moe_ep_config(
+            num_experts=2,
+            hidden_size=128,
+            intermediate_size=256,
+            top_k=2,
+            max_tokens_per_rank=4,
+            max_recv_size_per_rank=128,
+        )
     )
-    with pytest.raises(ValueError, match="weight_interleave_size=32"):
+    with pytest.raises(
+        ValueError,
+        match="fc1_weight_layout=GATE_UP_INTERLEAVED_32",
+    ):
         conventional.prepare_training()
 
 
@@ -1316,20 +1387,17 @@ def test_discrete_training_forward_backward_and_graph_match_reference():
     source_weights = _fixed_training_weights(args)
 
     with MoeEp(
-        num_experts=2,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=args[3].shape[1],
-        max_tokens_per_rank=max_tokens,
-        max_recv_size_per_rank=256,
-        drop_on_overflow=True,
-        combine_format="bf16",
-        weight_interleave_size=32,
-    ) as op:
-        requirements = op.prepare_training(
-            device=device,
-            native_weight_storage_mode="discrete",
+        _training_public_config(
+            top_k=args[3].shape[1],
+            max_tokens_per_rank=max_tokens,
+            max_recv_size_per_rank=256,
+            combine_format="bf16",
+            training_weight_storage_mode=(
+                MoeEpNativeWeightStorageMode.DISCRETE
+            ),
         )
+    ) as op:
+        requirements = op.prepare_training(device=device)
         forward_staging, backward_staging = _allocate_training_weight_staging(
             source_weights
         )
@@ -1547,15 +1615,12 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
     assert capacity % 128 != 0
 
     with MoeEp(
-        num_experts=2,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=args[3].shape[1],
-        max_tokens_per_rank=capacity,
-        max_recv_size_per_rank=max_recv_size_per_rank,
-        drop_on_overflow=True,
-        combine_format=combine_format,
-        weight_interleave_size=32,
+        _training_public_config(
+            top_k=args[3].shape[1],
+            max_tokens_per_rank=capacity,
+            max_recv_size_per_rank=max_recv_size_per_rank,
+            combine_format=combine_format,
+        )
     ) as op:
         requirements = op.prepare_training(device=device)
         forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
@@ -1782,15 +1847,15 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
     )
 
     with MoeEp(
-        num_experts=1,
-        hidden_size=hidden,
-        intermediate_size=intermediate,
-        top_k=1,
-        max_tokens_per_rank=129,
-        max_recv_size_per_rank=_round_up(129, 128),
-        drop_on_overflow=True,
-        combine_format="bf16",
-        weight_interleave_size=32,
+        _training_public_config(
+            num_experts=1,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            top_k=1,
+            max_tokens_per_rank=129,
+            max_recv_size_per_rank=_round_up(129, 128),
+            combine_format="bf16",
+        )
     ) as op:
         requirements = op.prepare_training(device=device)
         forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
@@ -1884,16 +1949,12 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
     )
 
     op = MoeEp(
-        num_experts=2,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        max_tokens_per_rank=capacity,
-        max_recv_size_per_rank=max_recv_size_per_rank,
-        drop_on_overflow=True,
-        output_format="bf16",
-        combine_format="bf16",
-        weight_interleave_size=32,
+        _training_public_config(
+            max_tokens_per_rank=capacity,
+            max_recv_size_per_rank=max_recv_size_per_rank,
+            output_format="bf16",
+            combine_format="bf16",
+        )
     )
     try:
         requirements = op.prepare_training(device=device)

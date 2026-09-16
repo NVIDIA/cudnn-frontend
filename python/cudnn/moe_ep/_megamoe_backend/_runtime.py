@@ -25,7 +25,7 @@ from typing import Callable, Optional, Protocol
 import torch
 import torch.distributed as dist
 
-from .._contracts import ForwardConfig
+from .._config import ResolvedMoeEpConfig
 
 _logger = logging.getLogger(__name__)
 
@@ -167,25 +167,35 @@ class NvshmemRuntimeProvider(Protocol):
     def finalize(self) -> None: ...
 
 
-def _resolve_world(config: ForwardConfig) -> RuntimeWorld:
-    if config.ep_group is None:
-        if config.ep_size != 1 or config.ep_rank != 0 or config.ep_global_ranks:
+def _resolve_world(config: ResolvedMoeEpConfig) -> RuntimeWorld:
+    group = config.public_config.parallel.ep_group
+    topology = config.topology
+    if group is None:
+        if (
+            topology.ep_size != 1
+            or topology.ep_rank != 0
+            or topology.ep_global_ranks
+        ):
             raise ValueError("ep_group=None requires ep_size=1, ep_rank=0, and no " "distributed rank membership")
         return RuntimeWorld(rank=0, size=1, group=None, global_ranks=())
 
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("distributed MegaMoE runtime requires torch.distributed to be initialized")
 
-    group = config.ep_group
     rank = dist.get_rank(group)
     size = dist.get_world_size(group)
     global_ranks = tuple(dist.get_global_rank(group, group_rank) for group_rank in range(size))
-    if (rank, size) != (config.ep_rank, config.ep_size):
+    if (rank, size) != (topology.ep_rank, topology.ep_size):
         raise RuntimeError(
-            "ForwardConfig EP geometry does not match its process group: " f"config=({config.ep_rank}, {config.ep_size}), " f"runtime=({rank}, {size})"
+            "ResolvedMoeEpConfig EP geometry does not match its process group: "
+            f"config=({topology.ep_rank}, {topology.ep_size}), "
+            f"runtime=({rank}, {size})"
         )
-    if global_ranks != config.ep_global_ranks:
-        raise RuntimeError("ForwardConfig EP membership does not match its process group: " f"config={config.ep_global_ranks}, runtime={global_ranks}")
+    if global_ranks != topology.ep_global_ranks:
+        raise RuntimeError(
+            "ResolvedMoeEpConfig EP membership does not match its process "
+            f"group: config={topology.ep_global_ranks}, runtime={global_ranks}"
+        )
     return RuntimeWorld(
         rank=rank,
         size=size,
@@ -463,7 +473,9 @@ class RuntimeManager:
         self,
         *,
         provider_factory: Callable[[], NvshmemRuntimeProvider] = (_DefaultNvshmemRuntimeProvider),
-        world_resolver: Callable[[ForwardConfig], RuntimeWorld] = _resolve_world,
+        world_resolver: Callable[
+            [ResolvedMoeEpConfig], RuntimeWorld
+        ] = _resolve_world,
         keep_alive: bool = False,
     ) -> None:
         self._provider_factory = provider_factory
@@ -484,7 +496,7 @@ class RuntimeManager:
 
     def acquire(
         self,
-        config: ForwardConfig,
+        config: ResolvedMoeEpConfig,
         device: torch.device,
     ) -> RuntimeHandle:
         device = _canonical_cuda_device(device)

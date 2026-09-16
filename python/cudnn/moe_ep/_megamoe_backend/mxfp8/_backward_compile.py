@@ -12,16 +12,15 @@ from typing import Any
 
 import torch
 
-from ..._contracts import ForwardConfig
+from ..._config import ResolvedMoeEpConfig
 from .._plan import PreparedResources
 from .._workspace import WorkspaceRequirements
 from ._compile import (
     _pre_reduced_sf_workspace_metadata,
     _pre_reduced_workspace_metadata,
 )
-from ._compile_common import _compile_kernel, _prepare_rubin_environment
+from ._compile_common import _compile_kernel
 from ._config import Mxfp8KernelConfig
-from ._formats import combine_wire_format
 from ._launch import _to_cute, _to_cute_ptr, _to_discrete_ptr_table
 
 
@@ -82,17 +81,14 @@ _COMPILE_CACHE: dict[tuple, CompiledMxfp8BackwardKernel] = {}
 
 
 def prepare_backward_kernel(
-    forward_config: ForwardConfig,
+    resolved_config: ResolvedMoeEpConfig,
     config: Mxfp8KernelConfig,
     device: torch.device,
+    *,
+    architecture: tuple[int, int],
 ) -> PreparedMxfp8BackwardKernel:
     """Instantiate the fixed Rubin dGLU specialization."""
 
-    architecture, launch_cluster_count = _prepare_rubin_environment(
-        device,
-        config,
-        context="backward",
-    )
     import cutlass
 
     from ..cutedsl_src.kernel_src.rubin.training.mega.bwd_dglu.dglu_mxfp8_mega_moe_kernel import (
@@ -100,16 +96,11 @@ def prepare_backward_kernel(
     )
     from ..cutedsl_src.quant_def import CombineFormat
 
-    group_hint = launch_cluster_count if config.group_hint is None else config.group_hint
-    operands_mode = forward_config.backward_wgrad_mode == "operands"
-    dfc2_recompute = operands_mode
-    dfc2_col_output = operands_mode
-    enable_grad_y2_col_quant = operands_mode
     kernel = Sm107MegaMoEMxfp8DgluKernel.from_kwargs(
         mma_tiler_mnk=config.mma_tiler_mnk,
         cluster_shape_mnk=config.cluster_shape_mnk,
         use_2cta_instrs=config.use_2cta_instrs,
-        group_hint=group_hint,
+        group_hint=config.group_hint,
         token_padding_block=config.token_padding_block,
         sf_padding_block=config.sf_padding_block,
         load_balance_mode=config.load_balance_mode,
@@ -129,18 +120,18 @@ def prepare_backward_kernel(
         max_tokens_per_rank=config.max_tokens_per_rank,
         max_recv_size_per_rank=config.max_recv_size_per_rank,
         hidden=config.hidden,
-        launch_cluster_count=launch_cluster_count,
-        drop_on_overflow=config.drop_on_overflow,
+        launch_cluster_count=config.launch_cluster_count,
+        drop_on_overflow=config.kernel_drop_on_overflow,
         fc2_in_kernel_topk_reduce=config.fc2_in_kernel_topk_reduce,
         token_back_mode=config.token_back_mode,
         epi_flag_batch=config.epi_flag_batch,
         flag_batch=config.flag_batch,
-        combine_format=CombineFormat.parse(combine_wire_format(forward_config.combine_format)),
+        combine_format=CombineFormat.parse(config.combine_format),
         act_func=config.act_func,
         gate_up_clamp=config.gate_up_clamp,
-        dfc2_recompute=dfc2_recompute,
-        dfc2_col_output=dfc2_col_output,
-        enable_grad_y2_col_quant=enable_grad_y2_col_quant,
+        dfc2_recompute=config.dfc2_recompute,
+        dfc2_col_output=config.dfc2_col_output,
+        enable_grad_y2_col_quant=config.enable_grad_y2_col_quant,
         num_ctas_grad_y2_col_quant=config.col_quant_num_ctas,
         weight_storage_mode=config.weight_storage_mode,
     )
@@ -178,7 +169,7 @@ def prepare_backward_kernel(
         * torch.float8_e8m0fnu.itemsize
     )
     requirements = WorkspaceRequirements.for_mxfp8(
-        forward_config,
+        resolved_config,
         kernel_local_workspace_bytes=local_bytes,
         kernel_shared_workspace_bytes=shared_bytes,
         backward_dprob_bytes=dprob_bytes,
@@ -202,7 +193,7 @@ def prepare_backward_kernel(
         device=torch.device(device),
         architecture=architecture,
         kernel=kernel,
-        launch_cluster_count=launch_cluster_count,
+        launch_cluster_count=config.launch_cluster_count,
         workspace_requirements=requirements,
         pool_token_capacity=pool_capacity,
         pre_reduced_activation_offset=pre_reduced_offset,
@@ -211,9 +202,9 @@ def prepare_backward_kernel(
         pre_reduced_activation_sf_bytes_per_token=(pre_reduced_sf_bytes_per_token),
         local_workspace_zero_bytes=int(local_zero),
         shared_workspace_zero_bytes=int(shared_zero),
-        dfc2_recompute=dfc2_recompute,
-        dfc2_col_output=dfc2_col_output,
-        enable_grad_y2_col_quant=enable_grad_y2_col_quant,
+        dfc2_recompute=config.dfc2_recompute,
+        dfc2_col_output=config.dfc2_col_output,
+        enable_grad_y2_col_quant=config.enable_grad_y2_col_quant,
     )
 
 
@@ -304,14 +295,9 @@ def compile_backward_or_get(
     resources: PreparedResources,
 ) -> CompiledMxfp8BackwardKernel:
     signature = _layout_signature(inputs)
-    key = (
-        prepared.config,
-        prepared.device.index,
+    key = prepared.config.compile_key(
+        prepared.device,
         prepared.architecture,
-        prepared.launch_cluster_count,
-        prepared.dfc2_recompute,
-        prepared.dfc2_col_output,
-        prepared.enable_grad_y2_col_quant,
         signature,
     )
     with _COMPILE_LOCK:

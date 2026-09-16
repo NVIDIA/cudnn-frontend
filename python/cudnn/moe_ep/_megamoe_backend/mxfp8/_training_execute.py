@@ -34,7 +34,7 @@ from ._compile import compile_or_get
 from ._launch import build_runtime_kwargs
 from ._training_resources import (
     Mxfp8TrainingExecutionViews,
-    Mxfp8TrainingState,
+    _Mxfp8TrainingState,
 )
 from ._training_weights import (
     backward_discrete_native_to_kernel,
@@ -68,7 +68,7 @@ def _activation_views(
 
 
 def _stage_input(
-    state: Mxfp8TrainingState,
+    state: _Mxfp8TrainingState,
     value: MoeTensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -122,7 +122,7 @@ def _write_expert_offsets(
 
 
 def launch_training_forward(
-    state: Mxfp8TrainingState,
+    state: _Mxfp8TrainingState,
     execution: Mxfp8TrainingExecutionViews,
     activation: MoeTensor,
     topk_idx: torch.Tensor,
@@ -235,7 +235,7 @@ def launch_training_forward(
 
 
 def launch_training_backward(
-    state: Mxfp8TrainingState,
+    state: _Mxfp8TrainingState,
     execution: Mxfp8TrainingExecutionViews,
     grad_output: MoeTensor,
     topk_idx: torch.Tensor,

@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-FINGERPRINT_SCHEMA_VERSION = 1
+FINGERPRINT_SCHEMA_VERSION = 2
 _KERNEL_IDENTITY_FIELDS = (
     "kernel_name",
     "kernel_source",
@@ -99,7 +99,7 @@ def build_kernel_fingerprint(
 
     kernel = prepared.kernel
     source_root = Path(__file__).resolve().parents[1] / "cutedsl_src"
-    effective_config = prepared.config.effective_config(prepared.launch_cluster_count)
+    effective_config = prepared.config.effective_config()
     launch_geometry = {
         "grid": [
             prepared.config.cluster_shape_mnk[0],

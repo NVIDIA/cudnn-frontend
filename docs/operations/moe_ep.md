@@ -76,50 +76,85 @@ $$
 
 ### Constructing the operator
 
-The operation is exposed by the frontend-only `cudnn.MoeEp` object API. Static
-model, parallelism, capacity, and format choices are set in the constructor:
+The operation is exposed by the frontend-only `cudnn.MoeEp` object API. It
+accepts one immutable, nested configuration:
 
 ```python
-from cudnn import MoeEp
-
-op = MoeEp(
-    num_experts=E,
-    hidden_size=H,
-    intermediate_size=I,
-    top_k=K,
-    ep_group=ep_group,                 # None for EP1
-    max_tokens_per_rank=max_tokens,
-    max_recv_size_per_rank=None,       # Physical pool size; see below for the default
-    drop_on_overflow=False,
-    output_format="bf16",
-    combine_format="bf16",             # "bf16" or "mxfp8"
-    apply_topk_in_fc1=True,
-    weight_interleave_size=None,       # Or 32 for pre-interleaved MXFP8 W1
-    gate_up_clamp=None,
-    token_padding_size=128,            # Must be 128 for training WGrad operands
-    sf_padding_size=128,               # Positive multiple of 128
-    forward_tuning=None,               # Or an explicit MoeEpTuningConfig
-    backward_tuning=None,              # Independent; epi_warps only
-    validation_mode="strict",          # Or "trusted"
+from cudnn import (
+    MoeEp,
+    MoeEpConfig,
+    MoeEpDataPathConfig,
+    MoeEpFc1WeightLayout,
+    MoeEpModelConfig,
+    MoeEpNativeWeightStorageMode,
+    MoeEpParallelConfig,
+    MoeEpTuningConfig,
+    MoeFormat,
 )
+
+config = MoeEpConfig(
+    model=MoeEpModelConfig(
+        num_experts=E,
+        hidden_size=H,
+        intermediate_size=I,
+        top_k=K,
+    ),
+    parallel=MoeEpParallelConfig(
+        ep_group=ep_group,
+        max_tokens_per_rank=max_tokens,
+        max_recv_size_per_rank=None,
+        drop_on_overflow=False,
+        token_padding_size=128,
+        sf_padding_size=128,
+    ),
+    data_path=MoeEpDataPathConfig(
+        output_format=MoeFormat.BF16,
+        combine_format=MoeFormat.BF16,
+        apply_topk_in_fc1=True,
+        fc1_weight_layout=MoeEpFc1WeightLayout.GATE_THEN_UP,
+        gate_up_clamp=None,
+    ),
+    inference_tuning=MoeEpTuningConfig(),
+    training_forward_tuning=MoeEpTuningConfig(),
+    training_backward_tuning=MoeEpTuningConfig(),
+    training_weight_storage_mode=MoeEpNativeWeightStorageMode.CONTIGUOUS,
+    validation_mode="strict",
+)
+op = MoeEp(config)
 ```
 
-Every argument is keyword-only. `token_padding_size` and `sf_padding_size`
-select the routed-token and scale-factor padding blocks; the training path
-that exports WGrad operands requires both to be exactly 128 and rejects any
-other value.
+The component configs and tuning configs are frozen. Corresponding `MoeEp`
+properties are read-only; construct a new config/operator for manual
+reconfiguration. There is no scalar-kwargs constructor, `from_config`,
+property setter, or general `reconfigure` method. `dataclasses.replace` can
+build a modified config value before constructing a new operator.
 
-Forward and backward carry independent tuning. `forward_tuning` also governs
-inference; `tuning` is a backward-compatible alias for it, and passing both
-raises. `backward_tuning` defaults to a fresh `MoeEpTuningConfig` rather than
-inheriting the forward one, and it accepts only `token_back_mode="epi_warps"`
-with `reduce_topk_in_kernel=False`.
+For migration from the experimental scalar constructor:
 
-`weight_interleave_size=32` declares that MXFP8 FC1 values already use
-alternating 32-element gate/up strips. The default `None` uses conventional
-gate-then-up order. Plain BF16/FP16/FP32 weights remain conventional and reject
-the interleaved contract because they must be quantized and staged internally.
-Native training requires `weight_interleave_size=32`.
+- model geometry moves to `MoeEpModelConfig`;
+- `ep_group`, capacity, overflow policy, and padding move to
+  `MoeEpParallelConfig`;
+- output/combine formats, top-k placement, FC1 layout, and clamp move to
+  `MoeEpDataPathConfig`;
+- the old `forward_tuning` is split into `inference_tuning` and
+  `training_forward_tuning`, while `backward_tuning` becomes
+  `training_backward_tuning`;
+- `weight_interleave_size=None` maps to `GATE_THEN_UP`, and
+  `weight_interleave_size=32` maps to `GATE_UP_INTERLEAVED_32`.
+
+The old constructor accepted negative `gate_up_clamp` values and used their
+absolute magnitude. The config-only API rejects negatives; callers must pass
+the intended non-negative magnitude explicitly.
+
+The three tuning fields are independent. Training backward accepts only
+`token_back_mode="epi_warps"` with
+`reduce_topk_in_kernel=False`.
+
+`MoeEpFc1WeightLayout.GATE_THEN_UP` denotes conventional source ordering.
+`GATE_UP_INTERLEAVED_32` denotes alternating 32-row gate/up strips. Inference
+supports both layouts and normalizes them to the same kernel-native layout.
+Training preparation, instance packing, native weights, and standalone pack
+functions support only `GATE_UP_INTERLEAVED_32`.
 
 ### Routing contract
 
@@ -162,7 +197,7 @@ Explicit sweep autotuning is available before capture:
 ```python
 from cudnn import MoeEpTuningConfig
 
-result = op.autotune(
+result = op.autotune_inference(
     activation, fc1_weight, fc2_weight, topk_idx, topk_weights,
     candidates=[
         MoeEpTuningConfig(token_in_flag_batch=2),
@@ -171,25 +206,28 @@ result = op.autotune(
 )
 ```
 
-`MoeEp.autotune` measures inference forward. `MoeEp.autotune_training`
-measures one training forward immediately followed by its matching backward:
+Training forward and backward are tuned independently:
 
 ```python
-training_result = op.autotune_training(
+forward_result = op.autotune_training_forward(
+    activation, topk_idx, topk_weights,
+    forward_weights=native_fw,
+    candidates=candidates,
+)
+backward_result = op.autotune_training_backward(
     activation, grad_output, topk_idx, topk_weights,
     forward_weights=native_fw,
     backward_weights=native_bw,
     candidates=candidates,
-    warmup_iters=3,
-    timed_iters=10,
 )
 ```
 
-Both calls are collective over `ep_group`, must use the same ordered candidate
-list on every rank, and must run outside CUDA Graph capture.
-`autotune_training` must run before `prepare_training`. It accepts only native
-weights; source packing and allocation are intentionally outside its measured
-region.
+All three methods are collective over `ep_group`, require the same ordered
+candidate list on every rank, and run outside CUDA Graph capture. Training
+autotune must run before `prepare_training` and accepts only native weights.
+Forward autotune times only training forward. Backward autotune runs the
+matching forward outside timing to create saved tensors, then times only
+backward.
 
 The current `MoeEpTuningConfig` is prepended as a baseline, duplicate values
 are removed, and the normalized list is limited to 32 candidates. Autotuning
@@ -201,22 +239,24 @@ the earlier candidate. `MoeEpAutotuneResult` reports `winner`, per-candidate
 `evaluated_candidates`.
 
 The sweep is fail-fast. Any validation, allocation, compile, launch, timing,
-synchronization, or teardown error ends the whole sweep. An error after
-runtime/collective entry poisons the operator, and later execution is
-rejected; close it and create a new instance. Compiled candidate kernels
-remain in the process JIT cache. The production sweep does not compare
-candidate outputs at runtime; supported candidates are covered by the separate
-correctness suite.
+synchronization, or teardown error ends the whole sweep. An existing active
+backend remains live while temporary candidates are searched, so candidate or
+winner-validation failure leaves the operator's config/backend state
+unchanged. This can temporarily require memory for the active backend and one
+candidate backend. Failure while replacing/closing the active backend after a
+winner has passed final validation is unrecoverable and poisons the operator.
+Compiled candidate kernels remain in the process JIT cache. The production
+sweep does not compare candidate outputs at runtime; supported candidates are
+covered by the separate correctness suite.
 
-Autotuning commits one active winner per instance, applied only to this
-operator instance. A later inference or training sweep replaces it. Existing
-CUDA Graph executables are invalid after the winner changes. Use these
-sequences:
-
-- inference: `autotune` → eager winner launch (performed by `autotune`) →
-  capture;
-- training: `autotune_training` → `prepare_training` → allocate outputs →
-  eager forward/backward → rank synchronization → capture.
+Each method applies its own winner before returning and leaves the other two
+tuning fields unchanged. Inference retains its warmed winner backend. Training
+autotune closes candidate backends and leaves normal training preparation to
+the caller. The compilation cache can avoid recompilation of the winner, but
+does not remove prepare, workspace allocation, first launch, or warmup costs.
+Both training methods and `prepare_training` use the immutable
+`config.training_weight_storage_mode`; they do not accept a per-call storage
+mode. Existing CUDA Graph executables are invalid after any winner change.
 
 ### Stateless training preparation
 
@@ -226,7 +266,6 @@ Preparation allocates one set of private instance resources. It is collective ov
 ```python
 requirements = op.prepare_training(
     device=None,  # current CUDA device; pass an explicit device for multi-GPU hosts
-    native_weight_storage_mode="contiguous",  # Or "discrete"
 )
 symmetric = op.training_symmetric_buffers()
 ```
@@ -319,12 +358,12 @@ from cudnn import (
     MoeEpNativeDiscreteBackwardWeights,
     MoeEpNativeDiscreteForwardWeights,
     MoeEpNativeDiscreteWeight,
+    MoeEpNativeWeightStorageMode,
 )
 
-requirements = op.prepare_training(
-    device=device,
-    native_weight_storage_mode="discrete",
-)
+# Construct this op with
+# training_weight_storage_mode=MoeEpNativeWeightStorageMode.DISCRETE.
+requirements = op.prepare_training(device=device)
 
 native_fw = MoeEpNativeDiscreteForwardWeights(
     fc1=MoeEpNativeDiscreteWeight(
@@ -378,10 +417,9 @@ destroyed. In-place optimizer updates are allowed. Any weight reallocation
 requires updating the table outside capture and warming up/capturing again;
 do not modify a table concurrently with a launch on another stream.
 
-`autotune_training` accepts the same `native_weight_storage_mode` argument.
-Its mode is part of the winning specialization; the subsequent
-`prepare_training` call must use the same mode. Every EP rank must select the
-same mode.
+Set `MoeEpConfig.training_weight_storage_mode` before constructing the
+operator. Both training autotune methods and `prepare_training` consume that
+single value, and every EP rank must configure the same mode.
 
 ### Forward
 

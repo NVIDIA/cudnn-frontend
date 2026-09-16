@@ -17,7 +17,10 @@ from moe_ep.moe_ep_distributed_workers import (
     _run_backward_reference_case,
     _run_forward_output_case,
 )
-from moe_ep.moe_ep_test_support import make_distributed_forward_inputs
+from moe_ep.moe_ep_test_support import (
+    _moe_ep_config,
+    make_distributed_forward_inputs,
+)
 
 pytestmark = [
     pytest.mark.L1,
@@ -290,7 +293,7 @@ def test_training_prepare_multinode_rejects_rank_schema_mismatch(
             f"LOCAL_WORLD_SIZE={world.local_world_size}"
         )
 
-    from cudnn import MoeEp
+    from cudnn import MoeEp, MoeEpFc1WeightLayout
     from cudnn.moe_ep._megamoe_backend.mxfp8 import (
         _training_resources as training_resources,
     )
@@ -313,16 +316,20 @@ def test_training_prepare_multinode_rejects_rank_schema_mismatch(
     )
 
     op = MoeEp(
-        num_experts=16,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        ep_group=dist.group.WORLD,
-        max_tokens_per_rank=8,
-        max_recv_size_per_rank=128,
-        drop_on_overflow=True,
-        combine_format="bf16",
-        weight_interleave_size=32,
+        _moe_ep_config(
+            num_experts=16,
+            hidden_size=128,
+            intermediate_size=256,
+            top_k=2,
+            ep_group=dist.group.WORLD,
+            max_tokens_per_rank=8,
+            max_recv_size_per_rank=128,
+            drop_on_overflow=True,
+            combine_format="bf16",
+            fc1_weight_layout=(
+                MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+            ),
+        )
     )
     caught_error = None
     try:

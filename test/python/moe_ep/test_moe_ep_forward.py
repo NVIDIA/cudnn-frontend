@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 import os
+import inspect
 import sys
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -24,6 +25,7 @@ from moe_ep.moe_ep_test_support import (
     _assert_matches_reference,
     _forward_config,
     _make_forward_case,
+    _moe_ep_config,
     _naive_reference,
     _poison_pre_reduced_for_test,
     _reference_forward,
@@ -59,14 +61,22 @@ def test_reverse_capacity_preserves_the_prescribed_physical_pool(
     )
 
     with MoeEp(
-        **_forward_config(
+        _moe_ep_config(
             num_experts=2,
+            hidden_size=128,
+            intermediate_size=256,
             top_k=2,
             max_tokens_per_rank=256,
+            apply_topk_in_fc1=True,
+            combine_format="bf16",
+            output_format="bf16",
+            max_recv_size_per_rank=physical_capacity,
         ),
-        max_recv_size_per_rank=physical_capacity,
     ) as op:
-        config = Mxfp8KernelConfig.from_operator_config(op._forward_config)
+        config = Mxfp8KernelConfig.for_inference(
+            op._execution_state.resolved_config,
+            launch_cluster_count=16,
+        )
 
     assert config.physical_recv_pool_size == physical_capacity
     assert config.max_recv_size_per_rank == logical_limit
@@ -80,10 +90,15 @@ def test_reverse_capacity_preserves_overprovisioned_physical_pool():
     )
 
     with MoeEp(
-        **_forward_config(),
-        max_recv_size_per_rank=384,
+        _moe_ep_config(
+            **_forward_config(),
+            max_recv_size_per_rank=384,
+        ),
     ) as op:
-        config = Mxfp8KernelConfig.from_operator_config(op._forward_config)
+        config = Mxfp8KernelConfig.for_inference(
+            op._execution_state.resolved_config,
+            launch_cluster_count=16,
+        )
 
     assert config.physical_recv_pool_size == 384
     assert config.max_recv_size_per_rank == 257
@@ -91,13 +106,15 @@ def test_reverse_capacity_preserves_overprovisioned_physical_pool():
 
 @pytest.mark.L0
 @pytest.mark.parametrize("physical_capacity", (127, 129))
-def test_reverse_capacity_rejects_unrepresentable_physical_pool(physical_capacity):
+def test_reverse_capacity_rejects_misaligned_physical_pool(physical_capacity):
     from cudnn import MoeEp
 
     with pytest.raises(ValueError, match=r"P % 128 == 0"):
         MoeEp(
-            **_forward_config(),
-            max_recv_size_per_rank=physical_capacity,
+            _moe_ep_config(
+                **_forward_config(),
+                max_recv_size_per_rank=physical_capacity,
+            ),
         )
 
 
@@ -126,10 +143,7 @@ def test_upstream_receive_capacity_applies_per_expert_padding():
 def test_moe_ep_accepts_validation_modes(validation_mode):
     from cudnn import MoeEp
 
-    with MoeEp(
-        **_forward_config(),
-        validation_mode=validation_mode,
-    ) as op:
+    with MoeEp(_moe_ep_config(**_forward_config(), validation_mode=validation_mode)) as op:
         assert op.validation_mode == validation_mode
 
 
@@ -138,15 +152,18 @@ def test_strict_expert_id_validation_requires_dense_routes():
     from cudnn import MoeEp
     from cudnn.moe_ep._validation import _validate_expert_ids
 
-    with MoeEp(**_forward_config()) as op:
-        config = op._forward_config
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
+        config = op._execution_state.resolved_config
         _validate_expert_ids(config, torch.tensor([[0, 1]], dtype=torch.int32))
         with pytest.raises(ValueError, match="dropped-route sentinel"):
             _validate_expert_ids(config, torch.tensor([[0, -1]], dtype=torch.int32))
         with pytest.raises(ValueError, match="valid global expert id"):
             _validate_expert_ids(
                 config,
-                torch.tensor([[0, config.num_experts]], dtype=torch.int32),
+                torch.tensor(
+                    [[0, config.public_config.model.num_experts]],
+                    dtype=torch.int32,
+                ),
             )
 
 
@@ -157,36 +174,110 @@ def test_moe_ep_rejects_invalid_validation_mode(validation_mode):
 
     with pytest.raises(ValueError, match="validation_mode"):
         MoeEp(
-            **_forward_config(),
-            validation_mode=validation_mode,
+            _moe_ep_config(
+                **_forward_config(),
+                validation_mode=validation_mode,
+            )
         )
 
 
 @pytest.mark.L0
-def test_moe_ep_rejects_conflicting_forward_tuning_aliases():
-    from cudnn import MoeEp, MoeEpTuningConfig
+def test_moe_ep_constructor_is_config_only():
+    from cudnn import MoeEp, MoeEpDataPathConfig
 
-    with pytest.raises(ValueError, match="aliases"):
-        MoeEp(
-            **_forward_config(),
-            tuning=MoeEpTuningConfig(),
-            forward_tuning=MoeEpTuningConfig(),
-        )
+    assert tuple(inspect.signature(MoeEp).parameters) == ("config",)
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        MoeEp(num_experts=2)
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        MoeEpDataPathConfig(weight_interleave_size=32)
+    with pytest.raises(TypeError, match="MoeEpFc1WeightLayout"):
+        MoeEpDataPathConfig(fc1_weight_layout="gate_then_up")
 
 
 @pytest.mark.L0
-def test_moe_ep_backward_tuning_default_is_independent():
-    from cudnn import MoeEp, MoeEpTuningConfig
+def test_moe_ep_config_defaults_are_frozen_and_phase_independent():
+    from cudnn import (
+        MoeEp,
+        MoeEpDataPathConfig,
+        MoeEpFc1WeightLayout,
+        MoeEpNativeWeightStorageMode,
+        MoeEpParallelConfig,
+        MoeEpTuningConfig,
+        MoeFormat,
+    )
 
-    forward_tuning = MoeEpTuningConfig(
+    inference_tuning = MoeEpTuningConfig(
         token_back_mode="standalone_warps",
         epi_flag_batch=(4, 2),
         token_in_flag_batch=8,
         group_hint=768,
     )
-    with MoeEp(**_forward_config(), forward_tuning=forward_tuning) as op:
-        assert op.forward_tuning is forward_tuning
-        assert op.backward_tuning == MoeEpTuningConfig()
+    config = _moe_ep_config(
+        **_forward_config(),
+        inference_tuning=inference_tuning,
+    )
+    independent = _moe_ep_config(**_forward_config())
+    assert config.parallel is not independent.parallel
+    assert config.data_path is not independent.data_path
+    assert config.training_forward_tuning is not independent.training_forward_tuning
+    assert config.training_backward_tuning is not independent.training_backward_tuning
+    assert independent.inference_tuning is not independent.training_forward_tuning
+    assert independent.inference_tuning is not independent.training_backward_tuning
+    assert (
+        independent.training_forward_tuning
+        is not independent.training_backward_tuning
+    )
+    with MoeEp(config) as op:
+        assert op.config is config
+        assert op.inference_tuning is inference_tuning
+        assert op.training_forward_tuning == MoeEpTuningConfig()
+        assert op.training_backward_tuning == MoeEpTuningConfig()
+        assert (
+            config.training_weight_storage_mode
+            is MoeEpNativeWeightStorageMode.CONTIGUOUS
+        )
+        assert (
+            op.training_weight_storage_mode
+            is MoeEpNativeWeightStorageMode.CONTIGUOUS
+        )
+        assert config.parallel == MoeEpParallelConfig(max_tokens_per_rank=5)
+        assert config.data_path == MoeEpDataPathConfig(
+            output_format=MoeFormat.BF16,
+            combine_format=MoeFormat.BF16,
+            apply_topk_in_fc1=True,
+            fc1_weight_layout=MoeEpFc1WeightLayout.GATE_THEN_UP,
+        )
+        with pytest.raises(FrozenInstanceError):
+            config.validation_mode = "trusted"
+        with pytest.raises(FrozenInstanceError):
+            config.data_path.gate_up_clamp = 1.0
+        with pytest.raises(TypeError, match="training_weight_storage_mode"):
+            replace(
+                config,
+                training_weight_storage_mode="discrete",
+            )
+        with pytest.raises(AttributeError):
+            op.config = config
+        for legacy_name in (
+            "tuning",
+            "forward_tuning",
+            "backward_tuning",
+        ):
+            assert not hasattr(op, legacy_name)
+
+
+@pytest.mark.L0
+def test_gate_up_clamp_is_canonicalized_in_public_config():
+    import math
+
+    from cudnn import MoeEpDataPathConfig
+
+    assert MoeEpDataPathConfig(gate_up_clamp=3).gate_up_clamp == 3.0
+    clamp = MoeEpDataPathConfig(gate_up_clamp=-0.0).gate_up_clamp
+    assert clamp == 0.0
+    assert math.copysign(1.0, clamp) == 1.0
+    with pytest.raises(ValueError, match="finite non-negative"):
+        MoeEpDataPathConfig(gate_up_clamp=-1.0)
 
 
 # Single-rank and distributed forward numerical parity.
@@ -205,7 +296,7 @@ def test_bf16_forward_matches_reference_and_returns_fresh_outputs():
     assert fc1_weight.logical_shape == (2, 128, 512)
     assert fc2_weight.logical_shape == (2, 256, 128)
 
-    with MoeEp(**_forward_config()) as op:
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
         first = op(*args)
         snapshot = first.clone()
         second = op(*args)
@@ -235,7 +326,7 @@ def test_mxfp8_combine_matches_direct_fp32_training_reference():
     )
     expected = _reference_forward(args, **config)
 
-    with MoeEp(**config) as op:
+    with MoeEp(_moe_ep_config(**config)) as op:
         actual = op(*args)
         torch.cuda.synchronize(device)
 
@@ -278,7 +369,7 @@ def test_plain_and_mixed_inputs_match_staged_reference(
     args = tuple(args)
     expected = _reference_forward(args)
 
-    with MoeEp(**_forward_config()) as op:
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
         actual = op(*args)
         torch.cuda.synchronize(device)
 
@@ -301,22 +392,22 @@ def test_one_operator_switches_mxfp8_and_plain_weight_families():
     expected_quantized = _reference_forward(quantized_args)
     expected_plain = _reference_forward(plain_args)
 
-    with MoeEp(**_forward_config()) as op:
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
         quantized = op(*quantized_args)
-        backend = op._forward_backend
+        backend = op._execution_state.backend
         refresh_before = backend._adapter.weight_refresh_count
         plain = op(*plain_args)
         refresh_after = backend._adapter.weight_refresh_count
         torch.cuda.synchronize(device)
 
-    assert op._forward_backend is None
+    assert op._execution_state.backend is None
     assert refresh_after == refresh_before + 1
     _assert_matches_reference(quantized, expected_quantized)
     _assert_matches_reference(plain, expected_plain)
 
 
 @pytest.mark.L0
-def test_nondefault_moe_ep_tuning_matches_reference_and_reuses_plan():
+def test_nondefault_inference_tuning_reuses_runtime_workspace():
     from cudnn import MoeEp, MoeEpTuningConfig
 
     device = _sm107_device()
@@ -329,18 +420,32 @@ def test_nondefault_moe_ep_tuning_matches_reference_and_reuses_plan():
         group_hint=64,
     )
 
-    with MoeEp(**_forward_config(), tuning=tuning) as op:
+    with MoeEp(
+        _moe_ep_config(
+            **_forward_config(),
+            inference_tuning=tuning,
+        )
+    ) as op:
         first = op(*args)
-        backend = op._forward_backend
+        backend = op._execution_state.backend
         assert backend is not None
+        prepared = backend._prepared_kernel
+        assert prepared is not None
         compiled = backend._compiled
-        workspace = backend._plan._workspace
+        workspace = backend._inference_resources._workspace
         second = op(*args)
         torch.cuda.synchronize(device)
 
+        assert backend._prepared_kernel is prepared
         assert backend._compiled is compiled
-        assert backend._plan._workspace is workspace
-        assert backend.kernel_config.tuning_signature(backend._prepared_kernel.launch_cluster_count) == ("standalone_warps", (4, 2), 4, 64, False)
+        assert backend._inference_resources._workspace is workspace
+        assert prepared.config.tuning_signature() == (
+            "standalone_warps",
+            (4, 2),
+            4,
+            64,
+            False,
+        )
 
     _assert_matches_reference(first, expected)
     _assert_matches_reference(second, expected)
@@ -356,7 +461,7 @@ def test_gate_up_clamp_matches_moe_ep_reference():
     expected = _reference_forward(args, gate_up_clamp=clamp)
     unclamped = _reference_forward(args)
 
-    with MoeEp(**_forward_config(gate_up_clamp=clamp)) as op:
+    with MoeEp(_moe_ep_config(**_forward_config(gate_up_clamp=clamp))) as op:
         actual = op(*args)
         torch.cuda.synchronize(device)
 
@@ -450,7 +555,7 @@ def test_supported_topk_shape_and_routing_format_matrix(
     )
     expected = _reference_forward(args, **config)
 
-    with MoeEp(**config) as op:
+    with MoeEp(_moe_ep_config(**config)) as op:
         actual = op(*args)
         torch.cuda.synchronize(device)
 
@@ -479,7 +584,7 @@ def test_single_gpu_stress_and_cuda_graph_replay(combine_format, capacity):
     alternate_args = (*args[:3], alternate_topk_idx, args[4])
     alternate_expected = _reference_forward(alternate_args, **config)
 
-    with MoeEp(**config) as op:
+    with MoeEp(_moe_ep_config(**config)) as op:
         op.warmup(*args)
         _stress_backend_reuse(
             op,
@@ -492,14 +597,16 @@ def test_single_gpu_stress_and_cuda_graph_replay(combine_format, capacity):
 
         args[3].copy_(original_topk_idx)
         args[4].copy_(original_topk_weights)
-        backend = op._forward_backend
+        backend = op._execution_state.backend
         assert backend is not None
         assert backend._prepared_kernel is not None
-        assert backend._plan is not None
-        assert backend._plan._workspace is not None
+        assert backend._inference_resources is not None
+        assert backend._inference_resources._workspace is not None
 
         def poison_pre_reduced():
-            workspace = backend._plan._workspace.views(args[0].logical_shape[0])
+            workspace = backend._inference_resources._workspace.views(
+                args[0].logical_shape[0]
+            )
             _poison_pre_reduced_for_test(
                 backend._prepared_kernel,
                 workspace.symmetric["kernel_shared_workspace"],
@@ -634,9 +741,9 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
     assert padded_mxfp8_scale_columns(512) == 16
     assert padded_mxfp8_scale_columns(640) == 32
 
-    with MoeEp(**_forward_config()) as op:
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
         requirements = WorkspaceRequirements.for_mxfp8(
-            op._forward_config,
+            op._execution_state.resolved_config,
             kernel_local_workspace_bytes=128,
             kernel_shared_workspace_bytes=128,
         )
@@ -681,7 +788,11 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
         workspace=SimpleNamespace(symmetric=symmetric, local=local),
     )
     weights = Mxfp8Weights(*(torch.empty(0) for _ in range(4)))
-    adapter = Mxfp8InputAdapter()
+    from cudnn import MoeEpFc1WeightLayout
+
+    adapter = Mxfp8InputAdapter(
+        MoeEpFc1WeightLayout.GATE_THEN_UP
+    )
     monkeypatch.setattr(adapter_module, "_as_mxfp8", lambda _: staged_activation)
     monkeypatch.setattr(adapter, "_prepare_weights", lambda *_: weights)
 
@@ -708,14 +819,14 @@ def test_column_requant_workspace_is_allocated_only_when_enabled():
     from cudnn import MoeEp
     from cudnn.moe_ep._megamoe_backend._workspace import WorkspaceRequirements
 
-    with MoeEp(**_forward_config()) as op:
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
         disabled = WorkspaceRequirements.for_mxfp8(
-            op._forward_config,
+            op._execution_state.resolved_config,
             kernel_local_workspace_bytes=128,
             kernel_shared_workspace_bytes=128,
         )
         enabled = WorkspaceRequirements.for_mxfp8(
-            op._forward_config,
+            op._execution_state.resolved_config,
             kernel_local_workspace_bytes=128,
             kernel_shared_workspace_bytes=128,
             col_quant_data_bytes=640,
@@ -731,7 +842,7 @@ def test_column_requant_workspace_is_allocated_only_when_enabled():
 
     with pytest.raises(ValueError, match="must be enabled together"):
         WorkspaceRequirements.for_mxfp8(
-            op._forward_config,
+            op._execution_state.resolved_config,
             kernel_local_workspace_bytes=128,
             kernel_shared_workspace_bytes=128,
             col_quant_data_bytes=640,
@@ -795,21 +906,30 @@ def test_megamoe_capability_and_kernel_config_accept_ep_above_16():
         Mxfp8KernelConfig,
     )
 
-    with MoeEp(**_forward_config()) as op:
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
         config = replace(
-            op._forward_config,
-            num_experts=32,
-            experts_per_rank=1,
-            ep_size=32,
-            ep_rank=31,
-            ep_group=object(),
-            ep_global_ranks=tuple(range(32)),
+            op._execution_state.resolved_config,
+            public_config=replace(
+                op.config,
+                model=replace(op.config.model, num_experts=32),
+            ),
+            topology=replace(
+                op._execution_state.resolved_config.topology,
+                experts_per_rank=1,
+                ep_size=32,
+                ep_rank=31,
+                ep_global_ranks=tuple(range(32)),
+            ),
         )
 
     validate_config(config)
-    kernel_config = Mxfp8KernelConfig.from_operator_config(config)
+    kernel_config = Mxfp8KernelConfig.for_inference(
+        config,
+        launch_cluster_count=16,
+    )
     assert kernel_config.world_size == 32
-    assert kernel_config.local_rank == 31
+    assert kernel_config.num_experts == 1
+    assert config.topology.ep_rank == 31
 
 
 @pytest.mark.L0
