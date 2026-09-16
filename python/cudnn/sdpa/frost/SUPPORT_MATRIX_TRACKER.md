@@ -251,17 +251,39 @@ rows on N, one cta_group::1 CTA per (KV-head group, batch, split), softmax reduc
 over TMEM lanes (4 warps per 16 Q columns), P^T through a swizzled SMEM tile, O^T in
 TMEM. Dense padded and paged caches, every mask the d256 row serves (padding /
 top-left and bottom-right causal / SWA / right band, dense padded-Q trim), sink
-(dense), Stats natural or base-2, KV split partials for `split_combine_sm100` (the
-heuristics propose the largest power-of-two split whose CTAs fill one wave). THD,
+(dense), Stats natural or base-2, KV split partials for `split_combine_sm100`. THD,
 fp8/mxfp8 and `S_q * G > 32` stay on the prefill tile; `TILE_CGA_M` / `SCHED_POLICY`
-knobs are accepted and unused there. B200 (SM100, 148 SMs), CUDA-graph replay of
-`graph.execute`, bf16, b=32, 32/2 heads, d256, page 16, s_kv=4096: 63.6 -> 51.3 us
-(S_q = 1, full lengths; the prefill tile measured 67 us with the host overhead of
-back-to-back `execute` calls), 57.8 -> 45.1 us (mixed lengths), 65.7 -> 58.3 us
-(S_q = 2 bottom-right causal); b=128: 250.1 -> 175.6 us; s_kv=16384: 244.1 ->
-165.7 us; Qwen3-Next 16/2 b=64 s_kv=8192 mixed: 210.7 -> 139.4 us. The main kernel
-alone reaches trtllm-gen's 46 us at split 2; the shared combine pass (~6 us) is the
-remaining gap. Not a Capabilities change (the row's claims are unchanged; this
+knobs are accepted and unused there.
+
+Split policy (`heuristics.choose_decode_tile_split_kv`): the tile has its own cost
+model -- per-CTA streaming until the concurrent K/V streams saturate HBM, plus the
+combine pass -- and the LEADING plan charges the split path's second host launch
+(a second CuTe-DSL launch plus slab carving: ~30 us more per eager `graph.execute`
+on the Python launch path, 62 -> 92 us), so it splits only where the GPU saving
+also covers that; the captured caller's optimum, when different, is the runner-up
+plan (`select_plan`). On the 16-column tile (`S_q * G <= 16`) the b=32 x 2 KV-head
+x 4096-key serving shape runs unsplit, b=8 splits 8 ways, b=128 stays unsplit,
+s_kv=16384 splits 2 ways. The 32-column tile (`S_q * G` in (16, 32], e.g. the
+S_q=2 MTP step) is issue-bound per CTA (1.6x the per-tile cost of the 16-column
+tile: 90.2 vs 57.1 us unsplit) and splits 2 ways at the serving shape.
+
+Measured on B200 (SM100, 148 SMs), bf16, 32/2 heads, d256, page 16, prefill tile
+-> decode tile as the heuristics lead, two numbers per cell: eager back-to-back
+`graph.execute` (host time included: what an UNCAPTURED caller sees) / CUDA-graph
+replay (GPU only). b=32, s_kv=4096, S_q=1, full lengths: 64.6 / 63.7 -> 57.2 / 56.4
+us (the split-2 runner-up replays at 51.5 us, 1.24x, but runs 95-102 us eager);
+mixed lengths: 60.7 / 58.4 -> 56.8 / 55.3 us (runner-up replay 45.0 us); b=8: 99.3
+/ 26.7 (the prefill model splits 4 ways there) -> 93.7 / 22.6 us (split 8); b=128:
+251.7 / 333.6 -> 161.4 / 166.9 us; s_kv=16384: 245.1 / 265.2 -> 181.0 / 166.9 us
+(split 2); Qwen3-Next 16/2 b=32: 63.7 / 63.5 -> 59.3 / 55.7 us; Qwen3-Next 16/2
+b=64 s_kv=8192 mixed: 209.6 / 240.2 -> 159.2 / 143.5 us; page 64: 62.7 / 62.2 ->
+57.7 / 53.4 us. S_q=2 bottom-right (32-column tile, split 2 leads): 66.2 / 65.7 ->
+102.9 / 58.5 us -- a replay win and an EAGER REGRESSION: that tile streams at
+2.8 us per KV tile per CTA (90.2 us unsplit in either regime), so an uncaptured
+MTP caller pays for the split's second launch either way; the 32-column softmax's
+per-CTA issue rate is the open kernel item. The main kernel alone reaches
+trtllm-gen's 46 us at split 2; the shared combine pass (~6 us) is the remaining
+captured-path gap. Not a Capabilities change (the row's claims are unchanged; this
 documents the lowering), Rule S2.
 
 ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**

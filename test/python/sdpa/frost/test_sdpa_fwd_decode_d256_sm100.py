@@ -16,9 +16,11 @@ Coverage: paged (page 16/32/64/128, NHD/HND) and dense padded caches, mixed
 lengths incl. 0 and 1, PackGQA 8:1 / 16:1 / 32:2 and MHA, MTP bottom-right
 causal at S_q 2 and 4 with per-batch Q lengths (dense padded-Q trim), sliding
 window, right band, sink, Stats natural and base-2, fp16 and bf16, the
-heuristic split that fills the machine plus forced splits with empty ranges,
+decode split policy (the serving shape leads unsplit with the split as the
+runner-up plan; a small batch splits) plus forced splits with empty ranges,
 CUDA-graph replay under ``set_sync_debug_mode("error")`` (Rule 3), and the
-routing boundary: larger S_q x G, THD and d128 stay on the prefill tiles.
+routing boundary: larger S_q x G, THD queries and d128 stay on the prefill
+tiles.
 """
 
 import math
@@ -26,7 +28,7 @@ import math
 import pytest
 import torch
 
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
+from frost_test_utils import _is_plan_for, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
 pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
@@ -138,11 +140,14 @@ def _run_graph(
     q_lens=None,
     expect=DECODE,
     seed=0,
+    split_kv=None,
 ):
     """Build cuDNN's paged (``page`` > 0) or dense padded SDPA graph, pin the
-    FROST engine (its first entry: the heuristics' own choice, split included),
-    assert the serving template, execute under the D2H detector and compare
-    O / Stats against :func:`_ref`.  Returns the pinned plan."""
+    FROST engine (its first entry: the heuristics' own choice, split included --
+    or, with ``split_kv``, its ranked entry carrying that split, a runner-up
+    when the heuristics lead elsewhere), assert the serving template, execute
+    under the D2H detector and compare O / Stats against :func:`_ref`.
+    Returns the pinned plan."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
     from cudnn.sdpa.fwd.engines import engine_name
@@ -197,6 +202,12 @@ def _run_graph(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     plan = select_engine(g, engine_name())
+    if split_kv is not None:
+        names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+        idx = next((i for i, n in enumerate(names) if _is_plan_for(n, engine_name()) and g.plans[i].knobs.split_kv == split_kv), None)
+        assert idx is not None, f"no {engine_name()} entry with split_kv={split_kv}; plans={names}"
+        g.select_plan(idx)
+        plan = g.plans[idx]
     idx = g._plan_index
     g.check_support()
     g.build_plans()
@@ -302,16 +313,46 @@ def test_decode_graph_dense_padded_no_stats():
 
 
 @pytest.mark.L0
-def test_decode_graph_heuristic_split_fills_the_machine():
-    """b=32 x 2 KV heads is 64 units: the decode heuristic proposes the largest
-    power-of-two split whose CTAs fit one wave (2 on a 148-SM part) and the
-    recombined O / LSE match."""
+def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
+    """b=32 x 2 KV heads over 4096 keys (Qwen3.5 serving) at S_q=1: the LEADING
+    plan does not split -- split 2 saves ~6 us of GPU time but costs an eager
+    caller ~30 us of host time per execute -- and the captured caller's split-2
+    plan is the runner-up, reachable by select_plan.  Both run and match the
+    reference.
+    The literal splits are the 148-SM fit (test_split_kv_heuristic pins the
+    policy); on another part the plans must still agree with the model."""
+    from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
+
     sm = torch.cuda.get_device_properties(0).multi_processor_count
-    units, kv_tiles, split = 32 * 2, 4096 // 128, 1
-    while units * split * 2 <= sm and kv_tiles // (split * 2) >= 2:
-        split *= 2
-    plan = _run_graph(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16)
-    assert plan.knobs.split_kv == split, plan.knobs
+    shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16)
+    lead = _run_graph(**shape)
+    assert lead.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm), lead.knobs
+    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0)
+    runner = _run_graph(**shape, split_kv=captured)
+    assert runner.knobs.split_kv == captured, runner.knobs
+    if sm == 148:
+        assert (lead.knobs.split_kv, runner.knobs.split_kv) == (1, 2), (lead.knobs, runner.knobs)
+    # The MTP step (S_q=2 bottom-right: 32 packed rows on the 32-column tile,
+    # 90 us unsplit vs 58 us split on B200) leads WITH the split.
+    mtp = _run_graph(B=32, H=32, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
+    assert mtp.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, q_tile=32), mtp.knobs
+    if sm == 148:
+        assert mtp.knobs.split_kv == 2, mtp.knobs
+
+
+@pytest.mark.L0
+def test_decode_graph_small_batch_splits_and_recombines():
+    """b=8 x 2 KV heads is 16 units: unsplit they would stream 32 tiles each on
+    16 of the SMs, so the decode model splits (8 ways on a 148-SM part: 128
+    CTAs, and the GPU saving covers the second launch) and the recombined
+    O / LSE over mixed lengths match."""
+    from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
+
+    sm = torch.cuda.get_device_properties(0).multi_processor_count
+    plan = _run_graph(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=torch.bfloat16)
+    assert plan.knobs.split_kv == choose_decode_tile_split_kv(units=16, kv_tiles=32, sm_count=sm), plan.knobs
+    if sm == 148:
+        assert plan.knobs.split_kv == 8, plan.knobs
 
 
 @pytest.mark.L0
@@ -344,10 +385,81 @@ def test_decode_q_tile_rule():
 
 @pytest.mark.L0
 def test_decode_routing_boundary():
-    """S_q x G past the tile stays on the prefill d256 tile; d128 stays on its own."""
+    """S_q x G past the tile stays on the prefill d256 tile; d128 stays on its
+    own (THD queries: test_decode_routing_boundary_thd_queries)."""
     _run_graph(B=2, H=32, KH=2, s_q=3, lens=[700, 130], page=16, expect=PREFILL)  # 48 packed rows
     _run_graph(B=2, H=8, KH=2, s_q=1, lens=[700, 130], d=128, page=16, expect="prefill_d128_f16")
     _run_graph(B=2, H=64, KH=1, s_q=1, lens=[300, 130], page=16, expect=PREFILL)  # 64 packed rows
+
+
+@pytest.mark.L0
+def test_decode_routing_boundary_thd_queries():
+    """Ragged (THD) queries -- packed [T, H, d] Q/O storage with ragged offsets,
+    here one token per sequence -- over a paged cache stay on the prefill d256
+    tile (the decode tile has no THD scheduler); the graph still runs under the
+    D2H detector and matches the reference."""
+    import cudnn
+    import cudnn.sdpa  # noqa: F401
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    dev, dtype = "cuda", torch.float16
+    B, H, KH, P = 3, 32, 2, 16
+    lens = [700, 130, 5]
+    S = max(lens)
+    scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(3)
+    k_dense = torch.randn(B, S, KH, D, device=dev, dtype=dtype)
+    v_dense = torch.randn(B, S, KH, D, device=dev, dtype=dtype)
+    k_c, v_c, bt = _pools(k_dense, v_dense, P, True, seed=3)
+    q_pk = torch.randn(B, H, D, device=dev, dtype=dtype)  # T = B tokens, one per sequence
+    stride = (H * D, D, H * D, 1)  # (B, H, S_max=1, d) over the packed [T, H, d] storage
+    q_gpu = q_pk.view(-1).as_strided((B, H, 1, D), stride)
+    o_stor = torch.zeros(B * H * D, device=dev, dtype=dtype)
+    o_gpu = o_stor.as_strided((B, H, 1, D), stride)
+    slq = torch.ones(B, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+    slk = torch.tensor(lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+    ro = (torch.arange(B + 1, dtype=torch.int64, device=dev) * H * D).view(B + 1, 1, 1, 1)
+
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tq = g.tensor(dim=[B, H, 1, D], stride=list(stride), data_type=cudnn.data_type.HALF, name="q")
+    k, v = g.tensor_like(k_c), g.tensor_like(v_c)
+    tk, tv = g.tensor_like(bt), g.tensor_like(bt)
+    sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
+    qro, oro = g.tensor_like(ro), g.tensor_like(ro)
+    tq.set_ragged_offset(qro)
+    o, _ = g.sdpa(
+        name="sdpa",
+        q=tq,
+        k=k,
+        v=v,
+        generate_stats=False,
+        attn_scale=scale,
+        use_padding_mask=True,
+        seq_len_q=sq_t,
+        seq_len_kv=sk_t,
+        paged_attention_k_table=tk,
+        paged_attention_v_table=tv,
+        paged_attention_max_seq_len_kv=S,
+    )
+    o.set_output(True).set_dim([B, H, 1, D]).set_stride(list(stride))
+    o.set_ragged_offset(oro)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    select_engine(g, engine_name())
+    idx = g._plan_index
+    g.check_support()
+    g.build_plans()
+    assert _served_by(g, idx) == PREFILL, f"plan {g.get_plan_name_at_index(idx)} served by {_served_by(g, idx)}, expected {PREFILL}"
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        g.execute({tq: q_gpu, k: k_c, v: v_c, tk: bt, tv: bt, sq_t: slq, sk_t: slk, qro: ro, oro: ro, o: o_gpu}, ws)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    ref_o, _ = _ref(q_pk.view(B, 1, H, D), k_dense, v_dense, lens, None, scale)
+    torch.testing.assert_close(o_stor.view(B, 1, H, D).float(), ref_o, atol=2e-2, rtol=0)
 
 
 @pytest.mark.L0

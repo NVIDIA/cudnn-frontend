@@ -281,6 +281,102 @@ def choose_split_kv(
     return best_split
 
 
+# --- KV split on the d256 decode tile (see choose_decode_tile_split_kv) ------
+# sm100/decode_d256_f16.py is not the machine choose_split_kv was fitted on: one
+# cta_group::1 CTA per (KV-head group, batch, split) unit streams 128-key K/V
+# tiles (128 KiB each at d256 half) with about one tile of fixed cost, and the
+# kernel is HBM-bound rather than MMA-bound. Its costs, in units of one KV tile
+# streamed by a lone CTA (1.75 us on B200):
+#
+# The share of the device's SMs whose concurrent K/V streams saturate HBM. Past
+# it every CTA slows in proportion to the stream count (the bandwidth is
+# shared), which for an HBM-bound kernel is the same statement as "waves".
+# Fitted on B200 (148 SMs): 64 CTAs x 32 tiles ran 56.9 us (1.78 us/tile,
+# per-CTA-bound), 128 CTAs x 16 tiles 45 us (1.57x per tile), 256 CTAs x 32
+# tiles 184 us (3.2x per tile) -- all consistent with ~81 CTAs.
+_DECODE_TILE_SATURATION_FRACTION = 0.55
+# What a CTA costs beyond its KV loop (Q^T load, prologue, a 16/32-row epilogue).
+_DECODE_TILE_CTA_COST = 1.0
+# A KV tile's cost to a lone CTA on the 32-column tile (S_q x G in (16, 32]:
+# two softmax column groups over the same 128 TMEM lanes, issue-bound where
+# the 16-column tile is bandwidth-bound): 64 CTAs x 32 tiles ran 90.2 us
+# against the 16-column tile's 57.1 us. HBM saturates at the same byte rate,
+# so a slower stream also needs proportionally more CTAs to reach it.
+_DECODE_TILE_WIDE_Q_TILE_COST = 1.6
+# The shared sm100/split_combine pass over a decode-shaped grid: one combine
+# wave, ~6 us measured at b=32 x 32 heads.
+_DECODE_TILE_COMBINE_COST = 3.5
+# What the two-launch split path costs an EAGER caller on the host per
+# graph.execute beyond the one-launch path: a second CuTe-DSL launch plus the
+# partial-slab carving. Measured 62 -> 92 us on the b=32 x 2 KV heads x 4096
+# keys serving shape (Python launch path, B200 host), against a 6 us GPU
+# saving. A CUDA-graph replay pays none of it, but a plan cannot know whether
+# it will be captured, so the default CHARGES it -- a split leads only where
+# its GPU saving also covers the eager caller's extra host time -- and the
+# captured caller's optimum (this term at 0) is listed as the runner-up plan.
+_DECODE_TILE_SPLIT_LAUNCH_COST = 17.0
+
+
+def _decode_tile_cost(split: int, *, units: int, kv_tiles: int, sm_count: int, tile_cost: float, launch_cost: float) -> float:
+    streams = units * split
+    per_tile = max(tile_cost, streams / (_DECODE_TILE_SATURATION_FRACTION * sm_count))
+    cost = (_ceil_div(kv_tiles, split) + _DECODE_TILE_CTA_COST) * per_tile
+    if split > 1:
+        cost += _DECODE_TILE_COMBINE_COST + launch_cost
+    return cost
+
+
+def choose_decode_tile_split_kv(
+    *,
+    units: int,
+    kv_tiles: int,
+    sm_count: int,
+    q_tile: int = 16,
+    launch_cost: float = _DECODE_TILE_SPLIT_LAUNCH_COST,
+) -> int:
+    """How many KV chunks the d256 decode tile cuts each unit into; 1 = do not split.
+
+    ``units`` is the launch's CTA count before splitting -- batch x KV-head
+    groups (a packed group is one unit, an unpacked head one each);
+    ``kv_tiles`` the 128-key tiles of the declared S_kv; ``q_tile`` the tile's
+    N extent (16 or 32 packed Q rows, :func:`config_sm100.decode_d256_q_tile`).
+
+        streams(s)  = units * s                                   # concurrent K/V streams
+        per_tile(s) = max(TILE_COST(q_tile), streams(s) / (SATURATION * sm_count))
+        cost(s)     = (ceil(kv_tiles / s) + CTA_COST) * per_tile(s)
+                    + [s > 1] * (COMBINE_COST + launch_cost)
+
+    A lone CTA streams a KV tile at TILE_COST (1 on the 16-column tile, 1.6 on
+    the issue-bound 32-column one); once the streams saturate HBM every CTA
+    slows with their count instead.  What falls out: an under-full launch
+    splits until its streams saturate HBM; a launch already past it never
+    splits (the bytes are the same, only the fixed costs grow); in between,
+    the split must SAVE more than it ADDS.  With the default ``launch_cost``
+    the added part includes the eager caller's second host launch, so on the
+    16-column tile the b=32 x 2 KV heads x 4096-key serving shape (6 us of GPU
+    saving for 30 us of host time) stays unsplit while a small batch or a
+    long KV (b=8; s_kv=16384 at b=32) still splits, and the 32-column tile --
+    whose lone CTA is slow enough that the same shape saves ~32 us -- splits.
+    ``launch_cost=0`` is the optimum of a caller replaying a captured CUDA
+    graph.
+
+    Candidates come from :func:`split_kv_candidates`; ties go to the smaller
+    split. Returns 1 for degenerate inputs.
+    """
+    if min(units, kv_tiles, sm_count) <= 0:
+        return 1
+    tile_cost = _DECODE_TILE_WIDE_Q_TILE_COST if q_tile > 16 else 1.0
+    kw = dict(units=units, kv_tiles=kv_tiles, sm_count=sm_count, tile_cost=tile_cost, launch_cost=launch_cost)
+    best, best_cost = 1, _decode_tile_cost(1, **kw)
+    for split in split_kv_candidates(sm_count=sm_count, kv_tiles=kv_tiles):
+        if split <= 1:
+            continue
+        cost = _decode_tile_cost(split, **kw)
+        if cost < best_cost:
+            best, best_cost = split, cost
+    return best
+
+
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     """(tile_m, tile_n) for the SM120 SDPA-forward prefill cell.
 
@@ -813,19 +909,28 @@ def _split_points(
     if sm_count <= 0:
         return [no_split]
     if _d256_decode_tile_selected(caps, facts, pack_g):
-        # The decode tile runs ONE cta_group::1 CTA per (KV-head group, batch,
-        # split) unit and is HBM-bound, so the lever is filling the machine:
-        # the largest power-of-two split whose CTA count still fits one wave,
-        # with at least two KV tiles per split.  (The prefill cost model below
-        # assumes cga2 clusters and a 21-tile per-CTA fixed cost: fitted on the
-        # prefill tile, wrong for this one -- b=32 x H_kv=2 measured 56 us unsplit
-        # vs 52 us at split 2 on a 148-SM B200.)
-        units = facts.b * (facts.h_q // pack_g)
-        kv_tiles = _ceil_div(facts.s_kv, tile_n or 128)
-        split = 1
-        while units * split * 2 <= sm_count and kv_tiles // (split * 2) >= _SPLIT_KV_MIN_TILES:
-            split *= 2
-        return [split, no_split] if split > 1 else [no_split]
+        # The decode tile is a different machine from the one the prefill model
+        # below was fitted on (one cta_group::1 CTA per (KV-head group, batch,
+        # split) unit, HBM-bound, ~1 tile of fixed cost -- not cga2 clusters
+        # with a 21-tile cost), so it has its own model.  The LEADING entry is
+        # the choice that also pays for the split path's second host launch
+        # (charged as if serialized with the GPU work -- SUPPORT_MATRIX_TRACKER.md
+        # footnote d has the measured eager and replay numbers); the captured
+        # caller's optimum, when it differs, is the runner-up; no-split closes
+        # the list as usual.
+        geometry = dict(
+            units=facts.b * (facts.h_q // pack_g),
+            kv_tiles=_ceil_div(facts.s_kv, tile_n or 128),
+            sm_count=sm_count,
+            q_tile=decode_d256_q_tile(facts.s_q, pack_g),
+        )
+        eager = choose_decode_tile_split_kv(**geometry)
+        captured = choose_decode_tile_split_kv(**geometry, launch_cost=0.0)
+        points = [eager]
+        for split in (captured, no_split):
+            if split not in points:
+                points.append(split)
+        return points
     rows_per_tile = _pack_gqa_tile_q(caps, facts, tile_m, cga)
     split_launch = _SplitKvLaunch(
         q_tiles=_ceil_div(facts.s_q * pack_g, rows_per_tile),

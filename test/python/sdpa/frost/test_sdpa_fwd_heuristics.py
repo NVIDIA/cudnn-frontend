@@ -638,3 +638,57 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph():
     assert all((p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
     # ...and a gated graph on a flavor that does not carry the gate proposes nothing at all.
     assert not recommend("A", _facts(**dict(gated, d_qk=128, d_v=128)), _RUBIN_OFFERED)
+
+
+def _decode_d256_facts(**over):
+    """Qwen3.5 decode as served: 32/2 heads (packed 16:1), d=256, S_q=1, paged
+    (page 16) over a 4096-key table, on a 148-SM SM100 part."""
+    base = dict(
+        b=32,
+        h_q=32,
+        h_kv=2,
+        s_q=1,
+        s_kv=4096,
+        d_qk=256,
+        d_v=256,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=False,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        device_cc=(10, 0),
+        device_sm_count=148,
+    )
+    base.update(over)
+    return SdpaGraphFacts(**base)
+
+
+@pytest.mark.L0
+def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
+    """A d256 graph the decode tile serves gets the decode split model
+    (choose_decode_tile_split_kv), not the prefill fit: the LEADING set is the
+    choice that also pays for the split path's second host launch, the captured
+    caller's optimum follows as a runner-up (select_plan / autotune reach it),
+    and no-split closes the list. The same graph one token longer (S_q=3: 48
+    packed rows) is the prefill tile's launch and keeps the prefill model."""
+
+    def sets(**over):
+        return [p.knobs for p in recommend("A", _decode_d256_facts(**over), _OFFERED) if p.engine_id == 20500]
+
+    serving = sets()
+    assert serving[0].split_kv == 1 and serving[0].pack_gqa is True, serving[0]
+    assert [k.split_kv for k in serving if k.split_kv > 1] == [2], serving
+    small = sets(b=8)
+    assert small[0].split_kv == 8, small[0]
+    assert any(k.split_kv == 1 for k in small[1:]), small
+    saturated = sets(b=128)
+    assert all(k.split_kv == 1 for k in saturated), saturated
+    long_kv = sets(s_kv=16384)
+    assert long_kv[0].split_kv == 2, long_kv[0]
+    # The MTP step (S_q=2 bottom-right: 32 packed rows, the 32-column tile) is
+    # slow enough per CTA unsplit that the split pays for its launch.
+    mtp = sets(s_q=2, causal=True, bottom_right=True)
+    assert mtp[0].split_kv == 2 and mtp[0].pack_gqa is True, mtp[0]
+    assert any(k.split_kv == 1 for k in mtp[1:]), mtp
+    prefill = sets(s_q=3)
+    assert prefill[0].split_kv == 1 and all(k.split_kv == 1 for k in prefill), prefill
