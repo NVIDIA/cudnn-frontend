@@ -4569,6 +4569,47 @@ def test_state_indices_rejects_unsupported(backend):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("shape", ["varlen_zero_length", "chain"])
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_summary_graph_mixed_state_dtypes(backend, variant, shape):
+    """A summary graph may bind ``final_state`` and ``transition`` in different dtypes: every store converts the fp32 state to
+    its own output's dtype, so each output equals the fp32 op's output rounded to that dtype, bitwise.  The varlen case
+    carries a zero-length sequence (the identity fill of an empty item) on the uncut table; the dense case chains."""
+    if shape == "chain":
+        case = soften(make_case(variant, torch.bfloat16, T=1024, lo=0.99))
+    else:
+        case = make_case(variant, torch.bfloat16, seq_lens=[100, 0, 156], lo=0.99)
+    h_op, m_op = run_summary(case)
+    args = op_args(case)[1:]
+    if variant == "gdn2":
+        k, v, g, beta, w, cu = args
+        inputs = dict(k=k, v=v, g=g, beta=beta, w=w, cu_seqlens=cu)
+    else:
+        k, v, g, beta, cu = args[:5]
+        inputs = dict(k=k, v=v, g=g, beta=beta, cu_seqlens=cu)
+    for fs_dtype, transition_dtype in ((torch.float32, torch.bfloat16), (torch.bfloat16, torch.float32)):
+        graph = cudnn.pygraph()
+        ports = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
+        attrs = dict(output_transition=True)
+        if variant in HOUSEHOLDER_VARIANTS:
+            attrs["num_householder"] = case.n
+        fs_t, transition_t = getattr(graph, f"{variant}_summary")(**ports, **attrs, name="summary")
+        fs_t.set_output(True).set_data_type(CUDNN_DTYPE[fs_dtype])
+        transition_t.set_output(True).set_data_type(CUDNN_DTYPE[transition_dtype])
+        build_and_pin(graph, f"{variant}_summary_frost")
+        final_state = torch.empty(h_op.shape, dtype=fs_dtype, device="cuda")
+        transition = torch.empty(m_op.shape, dtype=transition_dtype, device="cuda")
+        pack = {ports[name]: tensor for name, tensor in inputs.items()}
+        pack[fs_t] = final_state
+        pack[transition_t] = transition
+        graph.execute(pack, torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda"))
+        torch.cuda.synchronize()
+        assert torch.equal(final_state, h_op.to(fs_dtype)), f"final_state in {fs_dtype} differs from the fp32 op rounded"
+        assert torch.equal(transition, m_op.to(transition_dtype)), f"transition in {transition_dtype} differs from the fp32 op rounded"
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_state_indices_graph_declines_wrong_table_shape(backend):
     """A hand-built graph whose ``state_indices`` tensor is not ``[num_seqs]`` is declined before any plan builds: the
