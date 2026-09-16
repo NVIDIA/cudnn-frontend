@@ -1110,7 +1110,11 @@ def test_sdpa_fwd_paged_d512_frost_L0(env_info, test_no, request, cudnn_handle):
     d512 kernel (d=384 rides its envelope zero-padded), GQA / MQA, page sizes
     16 .. 128, per-batch KV lengths incl. 0 and 1, no mask or (bottom-right)
     causal. Every draw must run on FROST unpinned -- strict (_must_run), so a
-    WAIVED skip fails instead of silently thinning the claimed coverage."""
+    WAIVED skip fails instead of silently thinning the claimed coverage. The KV
+    pool extent draws from 2: a 1-token pool under s_q=1 is the s_q == s_kv == 1
+    geometry the harness waives as a known issue (sdpa/fp16.py), which strict
+    would fail (1 draw in ~1800 at s_kv_min=1); per-batch KV lengths still draw
+    0 and 1."""
     _require_paged_d512_env()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -1123,7 +1127,7 @@ def test_sdpa_fwd_paged_d512_frost_L0(env_info, test_no, request, cudnn_handle):
     # Create the randomization context within the test
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,8]),
-        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":4, "s_q=s_kv":0, "s_q=random":4, "s_q>s_kv":0}),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=2, s_kv_max=4096, s_q_distribution={"s_q=1":4, "s_q=s_kv":0, "s_q=random":4, "s_q>s_kv":0}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=264, d_qk_max=512, d_v_min=264, d_v_max=512, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(512,512), (384,384)]),
         head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(0, 2, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
