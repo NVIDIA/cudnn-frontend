@@ -237,6 +237,9 @@ def test_qk_norm_knob_is_appended_and_validated():
     ``qk_norm=False`` there is no rstd to emit and no weight load to delete (``const_w`` has
     no meaning; ``const_cs`` == ``const``); ``off`` and the FP8 fork stay legal."""
     assert NormRopeFusionParams() == NormRopeFusionParams(qk_norm=True)
+    assert NormRopeFusionParams() == NormRopeFusionParams(qk_norm=True, quant_mxfp8=False)
+    names = [f.name for f in dataclasses.fields(NormRopeFusionParams)]
+    assert names[-3:] == ["quant_fp8", "qk_norm", "quant_mxfp8"], names  # the FROZEN order (PR-B section 1.5)
     with pytest.raises(ValueError, match="want_rstd"):
         validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, want_rstd=True))
     with pytest.raises(ValueError, match="const_w"):
@@ -245,6 +248,27 @@ def test_qk_norm_knob_is_appended_and_validated():
     validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, norm_source="off"))  # bf16 control: legal
     validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, quant_fp8=True))
     validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, norm_source="const"))
+
+
+def test_quant_mxfp8_key_loads_the_twin_and_stays_exclusive():
+    """The MXFP8 twin (kernels/proj_gemm_norm_rope_mxfp8.py) is selected by ``quant_mxfp8`` and by
+    nothing else: its geometry rules hold, the two quant flags are exclusive, and an MXFP8 key
+    loads the TWIN's template -- never the bf16 rendering.  Import-time only (no cute compile):
+    the launch-level proofs live in test_proj_gemm_mxfp8.py."""
+    from cudnn.frost.template_loader import load_template
+    from cudnn.gated_attention_block.kernels import proj_gemm as _pg
+
+    with pytest.raises(ValueError, match="at most one"):
+        validate_norm_rope_params(NormRopeFusionParams(quant_fp8=True, quant_mxfp8=True))
+    with pytest.raises(ValueError, match="want_rstd"):
+        validate_norm_rope_params(NormRopeFusionParams(quant_mxfp8=True, want_rstd=True))
+    with pytest.raises(ValueError, match="off"):
+        validate_norm_rope_params(NormRopeFusionParams(quant_mxfp8=True, norm_source="off"))
+    validate_norm_rope_params(NormRopeFusionParams(quant_mxfp8=True))
+    validate_norm_rope_params(NormRopeFusionParams(quant_mxfp8=True, qk_norm=False))
+    assert os.path.basename(_pg._FUSED_TEMPLATE_MXFP8) == "proj_gemm_norm_rope_mxfp8.py" and os.path.exists(_pg._FUSED_TEMPLATE_MXFP8)
+    mod = load_template(_pg._FUSED_TEMPLATE_MXFP8, NormRopeFusionParams(quant_mxfp8=True), tag="proj_gemm_norm_rope_mxfp8_keycheck")
+    assert mod.PARAMS.quant_mxfp8 is True and mod.PARAMS.quant_fp8 is False
 
 
 def test_fused_runners_check_the_weights_against_the_artifact_before_launch():

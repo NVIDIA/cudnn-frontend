@@ -78,6 +78,14 @@ def _cc():
 requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the block targets SM107 only; found {_cc()}")
 
 
+def _mxfp8_fork_missing():
+    """The reason the fully fused MXFP8 block declines on this checkout, or None once S6 has landed."""
+    from cudnn.gated_attention_block.api import _FusedQkvProjection
+
+    st = _FusedQkvProjection.__new__(_FusedQkvProjection)
+    return st._mxfp8_fork_available()
+
+
 def _ref_geom(geom: GatedAttentionBlockGeometry) -> RefGeometry:
     return RefGeometry(
         d_model=geom.d_model,
@@ -383,6 +391,37 @@ def test_mxfp8_stage_list_and_workspace():
     assert impl._pertensor is False and impl.dtype_o == torch.bfloat16 and impl.has_amax_o is False and impl.gate_desc is None
 
 
+def test_mxfp8_fused_stage_list_and_workspace():
+    """FULLY FUSED (declaration only): three stages, the FP8-fused five slots + the three SF slots; the SDPA is the
+    gated production adapter on the block-scale kernel with an e4m3 UNSCALED O and a compact bf16 gate."""
+    from cudnn.gated_attention_block.api import _align_up, _sf_slot_bytes
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    blk = _decl_block(**_FUSED)
+    assert blk.mxfp8_fused and blk.quant_fused and not blk.fp8_fused
+    assert [s.name for s in blk._stages] == ["qkv_gate_proj_norm_rope", "sdpa", "out_proj"]
+    assert blk._proj.mxfp8 and not blk._proj.fp8 and blk._quant_q is None and blk._quant_o is None and blk._gate is None
+    assert "quant_mxfp8" in str(blk._proj.params())
+    lay = blk._layout()
+    g, b, s = blk.geom, blk.batch, blk.seq_len
+    for nm in ("q8", "k8", "v8", "gate16", "o8", "sf_q", "sf_k", "sf_v"):
+        assert getattr(lay, nm) >= 0, nm
+    assert lay.proj == -1 and lay.o == -1
+    geom, args, _, _ = _decl_tensors()
+    fp8 = GatedAttentionBlockFwd(*args, geom, quant=_PT_SPEC, **_FUSED)._layout()
+    assert (lay.q8, lay.k8, lay.v8, lay.gate16, lay.o8) == (fp8.q8, fp8.k8, fp8.v8, fp8.gate16, fp8.o8)
+    q_sf, kv_sf = _sf_slot_bytes(b, g.h_q, s, g.d_head), _sf_slot_bytes(b, g.h_kv, s, g.d_head)
+    assert lay.sf_q == fp8.total_bytes and lay.total_bytes == fp8.total_bytes + _align_up(q_sf) + 2 * _align_up(kv_sf)
+    st = blk._sdpa
+    assert st.mxfp8 and st.fuse_gate and st.o_dtype == E4M3 and st.gate_dtype == torch.bfloat16 and st.gate_token_stride == g.h_q * g.d_head
+    impl = st._build_impl()
+    assert isinstance(impl, SdpaFwdDslSm100)
+    assert impl._pertensor is False and impl.dtype_o == E4M3 and impl.has_amax_o is False
+    assert impl.gate_desc is not None and impl.gate_desc.dtype == torch.bfloat16
+    hd = g.h_q * g.d_head
+    assert tuple(impl.gate_desc.shape) == (b, g.h_q, s, g.d_head) and tuple(impl.gate_desc.stride) == (s * hd, g.d_head, hd, 1)
+
+
 def _dispatch_trace(blk, monkeypatch):
     """Run ``blk.execute`` with every stage's launch replaced by a recorder; return the stage names in call order.
 
@@ -428,6 +467,34 @@ def test_mxfp8_fused_execute_dispatches_the_three_stages_through_the_mx_runner(m
     blk = _decl_block(**_FUSED)
     calls = _dispatch_trace(blk, monkeypatch)
     assert calls == [("qkv_gate_proj_norm_rope", "execute_mxfp8"), ("sdpa", "execute"), ("out_proj", "execute")]
+
+
+@pytest.mark.parametrize("what", ["runner", "fork_file"])
+def test_mxfp8_fused_declines_typed_when_the_fork_twin_is_missing(monkeypatch, what):
+    """The fully fused MXFP8 block feature-detects the GEMM fork twin (the runner ``run_fused_proj_gemm_mxfp8``
+    with the frozen SF-output ABI, and the fork file) and declines at check_support with a NotImplementedError
+    naming what is missing.  On a checkout WITH the twin this branch is dead unless the detection is
+    monkeypatched -- so it is, deterministically, for each of the two probes; a skip-until-landed pin
+    would never run again once S6 landed (which it has)."""
+    from cudnn.gated_attention_block.api import _FusedQkvProjection
+
+    if what == "runner":
+        monkeypatch.setattr(_FusedQkvProjection, "_MXFP8_RUNNER", "run_fused_proj_gemm_mxfp8_NOT_HERE")
+    else:
+        monkeypatch.setattr(_FusedQkvProjection, "_FORK_PATH_MXFP8", _FusedQkvProjection._FORK_PATH_MXFP8 + ".not_here")
+    blk = _decl_block(**_FUSED)
+    reason = _mxfp8_fork_missing()
+    assert reason is not None
+    with pytest.raises(NotImplementedError, match="fork twin") as ei:
+        blk.check_support()
+    msg = str(ei.value)
+    assert reason in msg
+    assert ("run_fused_proj_gemm_mxfp8" in msg) if what == "runner" else ("proj_gemm_norm_rope_mxfp8" in msg)
+    # the same block ACCEPTS once the detection is restored (declaration is not the gate; check_support is)
+    monkeypatch.undo()
+    assert _mxfp8_fork_missing() is None, "the twin is expected in this checkout"
+    if _cc() == _SM107:
+        blk._proj.check_support()  # the fork's own cc gate follows the twin check, so only Rubin reaches the accept
 
 
 def test_mxfp8_gated_sdpa_declines_typed_without_the_adapters_sample_gate(monkeypatch):
@@ -547,6 +614,31 @@ def test_mxfp8_sf_order_s_sweep_does_not_degrade_with_s():
 
 
 @requires_rubin
+@pytest.mark.parametrize("kw", [{}, _FUSED], ids=["unfused", "fused"])
+def test_mxfp8_dead_padded_entry_is_exactly_zero(kw):
+    """sdpa-invariants S1/S2 through the MXFP8 block, UNFUSED and FULLY FUSED: batch entry 1 has NO valid KV
+    column (``seq_lens=[s, 0]``), so the MXFP8 SDPA runs zero KV iterations and must SELECT ``O := 0``; the gate
+    (stage (5), or the gated kernel's epilogue AFTER the select on the fused path) multiplies an exact zero,
+    quantize_o / out_proj (or the e4m3 O straight into out_proj) propagate it, and ``out[1]`` is EXACTLY zero.
+    On the fused path this also drives the fork twin's per-(b, s_tile) SF stores for a fully-masked entry at
+    B=2 and the block's ``seq_lens`` hand-off into the gated MXFP8 adapter.  Asserted on the OUTPUT (a diff
+    against a reference that is itself NaN on the dead rows proves nothing).  The live entry stays on the
+    oracle.  Fresh-process intermittency counts: ``frost_dev/sweep_block_dead_entry.py``."""
+    if kw and _mxfp8_fork_missing() is not None:
+        pytest.skip(f"fully fused MXFP8 needs the GEMM fork twin (PR-B S6): {_mxfp8_fork_missing()}")
+    s = 512
+    seq_lens = torch.tensor([s, 0], device="cuda", dtype=torch.int32)
+    out, ref, blk, _, _ = _run_mx_block({**_GEOM, "is_causal": False}, batch=2, seq_len=s, seq_lens=seq_lens, sentinel=True, **kw)
+    assert blk._sdpa.seq_lens_present and blk.mxfp8_fused == bool(kw)
+    assert not (out == _SENTINEL).any()
+    assert torch.isfinite(out.float()).all(), "dead rows leaked a non-finite value into the output"
+    assert (out[1] == 0).all(), f"the dead entry must be EXACTLY zero (select, not residue * sigmoid); max|out[1]| = {out[1].abs().max().item()}"
+    c = _cos(out[0], ref[0])
+    print(f"\nmxfp8 {'fused' if kw else 'unfused'} block dead entry S={s}: live cos={c:.6f}")
+    assert c > 0.99, f"live entry cos {c}"
+
+
+@requires_rubin
 def test_mxfp8_ragged_padded_entries_match_the_oracle():
     """Plan D6's distinguishing MXFP8 padding case, through the BLOCK's ``quantize_mxfp8 -> SDPA`` chain (the SDPA-level
     probe covers it alone): dense S=1000 (S % 128 != 0, admitted because a padding mask is present) with
@@ -617,6 +709,34 @@ def test_mxfp8_unfused_launch_count():
     assert len(kernels) == len(_MX_STAGES) == 9, (len(kernels), kernels)
     assert not memcpys, f"a hidden copy on the execute path: {memcpys}"
     assert len(memsets) == 0, f"unexpected memset(s) on the execute path (amax is folded out under has_amax_o=False): {memsets}"
+
+
+@requires_rubin
+@pytest.mark.parametrize("seq_len, causal", [(1000, True), (1024, False)])
+def test_mxfp8_fused_block_matches_the_fake_quant_oracle(seq_len, causal):
+    """The FULLY FUSED MXFP8 block (3 launches) against the fused-numerics oracle (one rounding per output, e4m3 O
+    UNSCALED -- scale_o 1.0, D8), same cosine floor.  Typed SKIP on a checkout without the MXFP8 GEMM fork twin
+    (feature-detected); the decline itself is pinned deterministically by
+    ``test_mxfp8_fused_declines_typed_when_the_fork_twin_is_missing``.  B=1 at S=1000: the fused path declines
+    ``S % 128 != 0 and B > 1``."""
+    missing = _mxfp8_fork_missing()
+    if missing is not None:
+        pytest.skip(f"fully fused MXFP8 needs the GEMM fork twin (PR-B S6): {missing}")
+    b = 1 if seq_len % 128 else 2
+    out, ref, blk, mx, spec = _run_mx_block({**_GEOM, "is_causal": causal}, batch=b, seq_len=seq_len, sentinel=True, **_FUSED)
+    assert blk.mxfp8_fused and len(blk._stages) == 3 and spec.scale_o == 1.0
+    assert blk._sdpa._impl.template_params().epilogue_gate is True and blk._sdpa._impl._pertensor is False
+    assert not (out == _SENTINEL).any(), f"{(out == _SENTINEL).sum().item()} output cells were never written"
+    assert torch.isfinite(out.float()).all()
+    c = _cos(out, ref)
+    rel = ((out.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-30)).item()
+    print(f"\nmxfp8 FUSED block B={b} S={seq_len} causal={causal}: cos={c:.6f} max_rel={rel:.3e}")
+    assert c > 0.99, f"fused mxfp8 block cos {c}"
+    out2 = torch.full_like(out, _SENTINEL)
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    _execute(blk, mx, out2, ws)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out2, out, rtol=0, atol=0)
 
 
 def test_mxfp8_fused_declines_ragged_s_at_b_gt_1():

@@ -132,6 +132,20 @@ def _frost_plan_index(names) -> Optional[int]:
 # (``run_fused_proj_gemm_fp8``): four outputs and a ``[4]`` fp32 scale vector
 # (``[alpha, scale_q, scale_k, scale_v]``, read IN-KERNEL) replace the bf16
 # runner's single slab, and the bf16 runner refuses an FP8 plan.
+#
+# ``kernels/proj_gemm_norm_rope_mxfp8.py`` is the SAME fusion on the MXFP8 pipeline
+# (``NormRopeFusionParams(quant_mxfp8=True)``): the rendered BLOCK-SCALE GEMM (e4m3
+# codes + one E8M0 scale per 32-element K block on both operands, dequantized IN the
+# MMA -- no alpha) whose epilogue [norms +] rotates Q/K and BLOCK-quantizes Q/K
+# rowwise and V columnwise, writing the compact e4m3 ``q8 / k8 / v8`` + bf16
+# ``gate16`` AND the three F8_128x4 E8M0 scale-factor blobs ``sf_q / sf_k / sf_v``
+# exactly as ``kernels/quantize_mxfp8.py`` lays them down for
+# ``sm107/prefill_d256_mxfp8.py``.  Runner ``run_fused_proj_gemm_mxfp8`` (PR-B
+# section 3.1 ABI): it takes the block-scale GEMM's own SF blobs (``sf_a`` /
+# ``sf_w``, PADDED F8_128x4 -- ``sf_padded_dims``) and ``batch`` / ``seq_len`` (the
+# kernel decodes ``(b, s_tile)`` per 128-row tile), and DECLINES (typed
+# ``NotImplementedError``) ``seq_len % 128 != 0 and batch > 1`` -- a GEMM tile would
+# straddle two sequences; the unfused path serves that shape.
 
 
 @dataclass(frozen=True)
@@ -182,6 +196,15 @@ class NormRopeFusionParams:
     differs).  ``want_rstd`` must be False (nothing to emit) and ``norm_source``
     ``"const_w"`` has no meaning (there are no weight loads to delete;
     ``"const_cs"`` == ``"const"`` there).
+
+    ``quant_mxfp8`` (appended after ``qk_norm``) selects the MXFP8 GEMM fork twin
+    ``proj_gemm_norm_rope_mxfp8.py``: the BLOCK-SCALE rendering (e4m3 codes + F8_128x4
+    E8M0 scale factors on both operands, no alpha), norm optional + RoPE + ROWWISE
+    (Q/K) / COLUMNWISE (V) block quantization with the F8_128x4 E8M0 scale factors
+    written in the epilogue; outputs the compact e4m3 ``q8 / k8 / v8``, the bf16
+    ``gate16`` and the three ``sf_q / sf_k / sf_v`` blobs.  Inference only
+    (``want_rstd`` False), no ``"off"`` arm, exclusive with ``quant_fp8``; launched
+    with :func:`run_fused_proj_gemm_mxfp8`.
     """
 
     d_head: int = 256
@@ -193,6 +216,7 @@ class NormRopeFusionParams:
     norm_source: str = "ldg_early"
     quant_fp8: bool = False  # the FP8 fork (e4m3 in, e4m3 Q/K/V + bf16 GATE out); appended, bf16 keys unchanged
     qk_norm: bool = True  # False: RoPE-only epilogue (no pass A / rsqrt / weight loads / rstd); appended, keys unchanged
+    quant_mxfp8: bool = False  # the MXFP8 fork twin (block-scale rendering, PR-B section 3.1); appended, keys unchanged
 
     @property
     def offsets(self) -> tuple[int, int, int, int]:
@@ -245,8 +269,10 @@ def validate_norm_rope_params(p: NormRopeFusionParams) -> None:
         raise ValueError(f"eps must be > 0, got {p.eps}")
     if p.norm_source not in ("ldg", "ldg_early", "const", "const_w", "const_cs", "off"):
         raise ValueError(f"norm_source must be 'ldg', 'ldg_early', 'const', 'const_w', 'const_cs' or 'off', got {p.norm_source!r}")
-    if p.norm_source in ("const_w", "const_cs") and not p.quant_fp8:
-        raise ValueError(f"norm_source={p.norm_source!r} is a diagnostic arm of the FP8 fork only (quant_fp8=True); the bf16 fork has 'const'")
+    if p.norm_source in ("const_w", "const_cs") and not (p.quant_fp8 or p.quant_mxfp8):
+        raise ValueError(
+            f"norm_source={p.norm_source!r} is a diagnostic arm of the quantizing forks only (quant_fp8=True or quant_mxfp8=True); the bf16 fork has 'const'"
+        )
     if p.quant_fp8:
         if p.want_rstd:
             raise ValueError("quant_fp8: the FP8 fused projection is inference-only and emits no rstd; want_rstd must be False")
@@ -259,10 +285,20 @@ def validate_norm_rope_params(p: NormRopeFusionParams) -> None:
             raise ValueError("qk_norm=False emits no rstd; want_rstd must be False")
         if p.norm_source == "const_w":
             raise ValueError("qk_norm=False has no weight loads: const_w == ldg_early; use 'const_cs' (== 'const') for the floor")
+    if p.quant_mxfp8:
+        if p.quant_fp8:
+            raise ValueError("quant_fp8 and quant_mxfp8 name two different forks; set at most one")
+        if p.want_rstd:
+            raise ValueError("quant_mxfp8: the MXFP8 fused projection is inference-only and emits no rstd; want_rstd must be False")
+        if p.norm_source == "off":
+            raise ValueError(
+                "quant_mxfp8: norm_source='off' has no meaning on the MXFP8 fork (no single bf16 slab to degenerate to); use 'const' for the floor"
+            )
 
 
 _FUSED_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proj_gemm_norm_rope.py")
 _FUSED_TEMPLATE_FP8 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proj_gemm_norm_rope_fp8.py")
+_FUSED_TEMPLATE_MXFP8 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proj_gemm_norm_rope_mxfp8.py")
 
 
 @dataclass
@@ -273,6 +309,7 @@ class FusedProjGemmPlan:
     module: Any
     launch: Any  # the cute-compiled ``_host``
     fp8: bool = False  # True: the FP8 fork; launch with ``run_fused_proj_gemm_fp8`` (q8/k8/v8/gate16 + qscal)
+    mxfp8: bool = False  # True: the MXFP8 fork twin; launch with ``run_fused_proj_gemm_mxfp8`` (q8/k8/v8/gate16 + sf_q/sf_k/sf_v)
 
     @property
     def workspace_bytes(self) -> int:
@@ -290,6 +327,9 @@ def build_fused_proj_gemm(params: NormRopeFusionParams) -> FusedProjGemmPlan:
     from cudnn.frost.template_loader import load_template
 
     validate_norm_rope_params(params)
+    if params.quant_mxfp8:
+        mod = load_template(_FUSED_TEMPLATE_MXFP8, params, tag="proj_gemm_norm_rope_mxfp8")
+        return FusedProjGemmPlan(params=params, module=mod, launch=mod.compile(), mxfp8=True)
     if params.quant_fp8:
         mod = load_template(_FUSED_TEMPLATE_FP8, params, tag="proj_gemm_norm_rope_fp8")
         return FusedProjGemmPlan(params=params, module=mod, launch=mod.compile(), fp8=True)
@@ -357,6 +397,8 @@ def run_fused_proj_gemm(
 
     if plan.fp8:
         raise ValueError("this plan is the FP8 fork (q8/k8/v8/gate16 outputs + qscal); launch it with run_fused_proj_gemm_fp8")
+    if plan.mxfp8:
+        raise ValueError("this plan is the MXFP8 fork (q8/k8/v8/gate16 + sf_q/sf_k/sf_v outputs); launch it with run_fused_proj_gemm_mxfp8")
     p = plan.params
     a3, w3, o3 = _rank3(a, "a"), _rank3(w, "w"), _rank3(out, "out")
     m, k = int(a3.shape[1]), int(a3.shape[2])
@@ -425,6 +467,8 @@ def run_fused_proj_gemm_fp8(
     """
     from cuda.bindings import driver as cuda
 
+    if plan.mxfp8:
+        raise ValueError("this plan is the MXFP8 fork (q8/k8/v8/gate16 + sf_q/sf_k/sf_v outputs); launch it with run_fused_proj_gemm_mxfp8")
     if not plan.fp8:
         raise ValueError("this plan is the bf16 fork (one bf16 slab); launch it with run_fused_proj_gemm")
     p = plan.params
@@ -476,6 +520,148 @@ def run_fused_proj_gemm_fp8(
         qscal,
         cuda.CUstream(int(stream)),
     )
+
+
+def _check_fused_outputs(m: int, outs) -> None:
+    """Every fused output is a TMA-store target: contiguous, 16-B aligned, its OWN width and dtype."""
+    for name, t3, t_, width, dt, dt_name in outs:
+        if tuple(t3.shape) != (1, m, width) or t3.dtype != dt or not t3.is_contiguous() or t3.data_ptr() % 16:
+            raise ValueError(f"{name} must be a contiguous, 16-B-aligned {dt_name} [M={m}, {width}] tensor, got {tuple(t_.shape)} {t_.dtype}")
+
+
+def _check_sf_out(name: str, sf: torch.Tensor, need: int, *, batch: int, heads: int, seq_len: int, d: int) -> torch.Tensor:
+    """One F8_128x4 E8M0 scale-factor OUTPUT blob of the MXFP8 fork: uint8, contiguous, 16-B aligned, CUDA,
+    ``B*H*ceil(S/128)*4*D`` bytes (the SDPA adapter's ``_reshape_sf`` count) -- returned flat."""
+    if sf.dtype != torch.uint8:
+        raise ValueError(f"{name} must be torch.uint8 (E8M0 bytes in F8_128x4 order), got {sf.dtype}")
+    if not sf.is_cuda or not sf.is_contiguous() or sf.data_ptr() % 16:
+        raise ValueError(f"{name} must be a contiguous, 16-B-aligned CUDA tensor")
+    if sf.numel() != need:
+        raise ValueError(f"{name} must hold B*H*ceil(S/128)*{4 * d} = {need} bytes for batch={batch} H={heads} S={seq_len} D={d}, got {sf.numel()}")
+    return sf.view(-1)
+
+
+def run_fused_proj_gemm_mxfp8(
+    plan: FusedProjGemmPlan,
+    a8: torch.Tensor,  # [M, K]        e4m3 codes (rank-2, or a rank-3 [1, M, K] view), M == batch * seq_len
+    sf_a: torch.Tensor,  # F8_128x4 E8M0 blob of a8 over its M rows: sf_blob_bytes(M, K) bytes, uint8 / float8_e8m0fnu
+    w8: torch.Tensor,  # [N_qkvg, K]   e4m3 codes (checkpoint layout, read transposed)
+    sf_w: torch.Tensor,  # F8_128x4 E8M0 blob of w8 over its N rows: sf_blob_bytes(N, K) bytes
+    out_q8: torch.Tensor,  # [M, h_q*d]   e4m3 contiguous (== compact BSHD [B, S, h_q, d])
+    out_k8: torch.Tensor,  # [M, h_kv*d]  e4m3 contiguous
+    out_v8: torch.Tensor,  # [M, h_kv*d]  e4m3 contiguous
+    out_gate16: torch.Tensor,  # [M, h_q*d] bf16 contiguous
+    out_sf_q: torch.Tensor,  # uint8, B*h_q*ceil(S/128)*4*d bytes: the SDPA's rowwise Q scale factors
+    out_sf_k: torch.Tensor,  # uint8, B*h_kv*ceil(S/128)*4*d bytes: rowwise K
+    out_sf_v: torch.Tensor,  # uint8, B*h_kv*ceil(S/128)*4*d bytes: COLUMNWISE V (D-plane-major)
+    w_q_norm: Optional[torch.Tensor],  # [D] bf16; None iff params.qk_norm is False
+    w_k_norm: Optional[torch.Tensor],  # [D] bf16
+    cos: torch.Tensor,  # [M, ROPE_DIM] bf16 (or [B, S, ROPE_DIM] contiguous)
+    sin: torch.Tensor,
+    *,
+    batch: int,
+    seq_len: int,
+    stream,
+) -> None:
+    """Launch the MXFP8 fork.  No allocation, no conversion; every check is cheap host arithmetic.
+
+    Problem tuple: the block-scale rendering's ``(m, n, k, batch, a strides (m, k, l), b strides
+    (n, k, l), q8 strides (m, n, l))`` plus the k8 / v8 / gate16 stride triples, in ELEMENTS,
+    from rank-3 ``[1, M, K]``-shaped views.  ``sf_a`` / ``sf_w`` are the block-scale GEMM's OWN
+    operand scale factors (what ``run_proj_gemm(..., sf_a=, sf_w=)`` binds): PADDED F8_128x4
+    blobs (``sf_blob_bytes``), bound as the ``(1, rows_pad, 4*k4)`` e8m0 view -- the kernel
+    reads a base pointer and rebuilds the layout from the problem size.  The three SF OUTPUTS
+    are the SDPA's: ``B*H*ceil(S/128)*4*D`` bytes each, written in full (pad rows -> 0x00).
+
+    **Typed decline**: ``seq_len % 128 != 0 and batch > 1`` raises ``NotImplementedError`` -- a
+    128-row GEMM tile would straddle two sequences and the kernel's once-per-tile
+    ``(b, s_tile)`` decode would be wrong for part of it.  The unfused block-scale path
+    (``build_proj_gemm(block_scale=True)`` + ``quantize_mxfp8``) serves that shape.
+    """
+    from cuda.bindings import driver as cuda
+
+    from .quantize_mxfp8 import n_sf_tiles, sf_bytes
+
+    if not plan.mxfp8:
+        raise ValueError("this plan is not the MXFP8 fork; launch the bf16 fork with run_fused_proj_gemm and the FP8 fork with run_fused_proj_gemm_fp8")
+    p = plan.params
+    if batch <= 0 or seq_len <= 0:
+        raise ValueError(f"batch and seq_len must be positive, got batch={batch} seq_len={seq_len}")
+    if seq_len % 128 and batch > 1:
+        raise NotImplementedError(
+            f"the fused MXFP8 projection decodes (b, s_tile) once per 128-row GEMM tile, so at batch={batch} > 1 the sequence length must be a "
+            f"multiple of 128 (got {seq_len}: a tile would straddle two sequences); use the unfused block-scale path for this shape"
+        )
+    a3, w3 = _rank3(a8, "a8"), _rank3(w8, "w8")
+    q3, k3, v3, g3 = _rank3(out_q8, "out_q8"), _rank3(out_k8, "out_k8"), _rank3(out_v8, "out_v8"), _rank3(out_gate16, "out_gate16")
+    m, k = int(a3.shape[1]), int(a3.shape[2])
+    n = int(w3.shape[1])
+    if _FP8_E4M3 is None or a8.dtype != _FP8_E4M3 or w8.dtype != _FP8_E4M3:
+        raise ValueError(f"the MXFP8 fused projection takes e4m3 codes, got a8 {a8.dtype}, w8 {w8.dtype}")
+    if m != batch * seq_len:
+        raise ValueError(f"M must equal batch*seq_len: a8 has M={m}, batch*seq_len={batch * seq_len}")
+    if n != p.n_qkvg:
+        raise ValueError(f"the fused projection classifies tiles for N={p.n_qkvg} (Q|GATE|K|V at {p.offsets}); the weight has N={n}")
+    if int(w3.shape[2]) != k:
+        raise ValueError(f"shape mismatch: a8 {tuple(a3.shape)}, w8 {tuple(w3.shape)}")
+    if k % 32:
+        raise ValueError(f"the block-scale GEMM needs K % 32 == 0 (one E8M0 scale per 32-element block), got K={k}")
+    _check_fused_outputs(
+        m,
+        (
+            ("out_q8", q3, out_q8, p.n_q, _FP8_E4M3, "e4m3"),
+            ("out_k8", k3, out_k8, p.n_kv, _FP8_E4M3, "e4m3"),
+            ("out_v8", v3, out_v8, p.n_kv, _FP8_E4M3, "e4m3"),
+            ("out_gate16", g3, out_gate16, p.n_gate, torch.bfloat16, "bf16"),
+        ),
+    )
+    cos2 = _rope_table_2d(cos, "cos", m, p.rope_dim, torch.bfloat16, "bf16")
+    sin2 = _rope_table_2d(sin, "sin", m, p.rope_dim, torch.bfloat16, "bf16")
+    _check_norm_weights(p, w_q_norm, w_k_norm, torch.bfloat16, "bf16")
+    # The GEMM's own operand scale factors: the same padded F8_128x4 blobs / e8m0 views the unfused driver binds.
+    sfa3 = _sf_view_of(sf_a, "sf_a", m, k, "fused_mxfp8")
+    sfw3 = _sf_view_of(sf_w, "sf_w", n, k, "fused_mxfp8")
+    n_tiles = n_sf_tiles(seq_len)
+    sfq = _check_sf_out("out_sf_q", out_sf_q, sf_bytes(batch, p.h_q, seq_len, p.d_head), batch=batch, heads=p.h_q, seq_len=seq_len, d=p.d_head)
+    sfk = _check_sf_out("out_sf_k", out_sf_k, sf_bytes(batch, p.h_kv, seq_len, p.d_head), batch=batch, heads=p.h_kv, seq_len=seq_len, d=p.d_head)
+    sfv = _check_sf_out("out_sf_v", out_sf_v, sf_bytes(batch, p.h_kv, seq_len, p.d_head), batch=batch, heads=p.h_kv, seq_len=seq_len, d=p.d_head)
+
+    def _st(t3):
+        st = t3.stride()
+        return (st[1], st[2], st[0])
+
+    problem = (m, n, k, 1, *_st(a3), *_st(w3), *_st(q3), *_st(k3), *_st(v3), *_st(g3))
+    # The artifact's fakes are (M|N, K, L) / (M, N, L): the same axis relabel the
+    # shipped lowering applies (`compiler._lower`: `v.permute(1, 2, 0)`).  The SF
+    # operands reach the kernel as base pointers only (fully symbolic fakes).
+    plan.launch(
+        problem,
+        a3.permute(1, 2, 0),
+        w3.permute(1, 2, 0),
+        sfa3,
+        sfw3,
+        q3.permute(1, 2, 0),
+        k3.permute(1, 2, 0),
+        v3.permute(1, 2, 0),
+        g3.permute(1, 2, 0),
+        w_q_norm,
+        w_k_norm,
+        cos2,
+        sin2,
+        sfq,
+        sfk,
+        sfv,
+        _cutlass_int32(seq_len),
+        _cutlass_int32(batch * p.h_kv * n_tiles),
+        cuda.CUstream(int(stream)),
+    )
+
+
+def _cutlass_int32(v: int):
+    """A ``cutlass.Int32`` runtime scalar for the fused-kernel ABI (imported lazily: ``cutlass`` is a DSL import)."""
+    import cutlass
+
+    return cutlass.Int32(int(v))
 
 
 def _why_no_frost_plan() -> str:
