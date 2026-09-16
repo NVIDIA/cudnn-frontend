@@ -387,6 +387,13 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # and spend autotune slots on it. Same exclusion the adapters apply to
         # their standalone-wrapper derivation.
         return [SCHED_NATURAL]
+    if SCHED_NATURAL in domain and _d128_f16_flavor(caps, facts) and _q_clusters_per_unit(caps, facts, None) == 1:
+        # One Q cluster per (batch, packed head) unit -- the d128 decode / MTP
+        # launch: every unit carries the same static tile weight, so the causal
+        # remaps have nothing to balance and only cost the remap (measurements
+        # at select_d128_auto_cga). No runners either: an autotune slot on a
+        # remap of identical units is a slot wasted.
+        return [SCHED_NATURAL]
     causal_ish = facts.causal or facts.right_band_widening
     if caps.sm_hi == 80:
         # SM80's measured choices (see the adapter's flavor table): causal
@@ -564,6 +571,81 @@ def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
     return params.sched_policy, 1
 
 
+# --- d128 decode-shaped launches (SM100-line f16/bf16) ----------------------
+#
+# The d128 f16 kernel serves two cluster widths: cga2, the prefill default, and
+# cga1, which aliases Q and O in SMEM to fit (config_sm100.make_cfg_d128). One
+# CTA holds TILES_Q * TILE_M = 256 Q rows; a cga2 cluster holds 512. When every
+# live row of a (batch, packed head) unit fits ONE CTA -- S_q * G <= 256, the
+# paged GQA decode and MTP shapes a serving framework issues -- the cga2 peer
+# holds dead rows only and still issues every BMM1/BMM2 per KV tile, so cga1
+# halves the CTA count at the same per-CTA work and the launch fits in fewer
+# waves. Graph path, paged bf16 d128, S_kv=4096 full-length, page 16, B200
+# (148 SMs), GPU kernel time per execute (torch.profiler, best of 3 x 20), the
+# pre-change plan pinned by knobs against the heuristic plan in the same run:
+#     b=32 h=64/4 S_q=1        cga2 117.4 us  ->  cga1  66.0 us
+#     b=32 h=64/8 S_q=1        cga2 232.2 us  ->  cga1 135.1 us
+#     b=32 h=64/4 S_q=4 MTP    cga2 LPT_L2 125.0 us  ->  cga1 NATURAL 66.9 us
+#     b=32 h=96/8 S_q=4 MTP    cga2 unpacked 2624.8 us  ->  cga1 1273.3 us
+#     b=8  h=64/4 S_q=1        cga2  59.6 us  ->  cga1 + SPLIT_KV=4  26.6 us
+# (at b=8 the wave-cost model, fed ctas_per_tile=1, now splits the 32-unit
+# launch across the machine; at b=32 the 128 units fill one wave unsplit.)
+# On square prefill shapes cga1 and cga2 measure within noise (the kernel's
+# docstring), so the rule stops at one CTA's rows and prefill keeps cga2:
+# dense causal / mask-free 4k prefill, b=1 h=32/8, unchanged at 1.00x.
+#
+# One Q cluster per unit also gives every unit the same static tile weight, so
+# the causal LPT / LPT_L2 remaps have nothing to balance and only cost the remap.
+# Pinned scheduler, bottom-right causal, b=32, S_kv=4096 paged, B200, kernel
+# time (LPT_L2 / LPT / NATURAL):
+#     d128 64/4  S_q=4 packed    cga2  125.1 /  123.5 /  119.4    cga1   70.9 /   69.7 /   68.9 us
+#     d128 64/4  S_q=8 packed    cga2  125.5 /  123.8 /  121.0    cga1   72.0 /   71.7 /   72.2 us
+#     d128 96/8  S_q=4 unpacked  cga2 2486.9 / 2407.1 / 2379.0    cga1 1304.4 / 1316.2 / 1292.8 us
+#     d128 32/32 S_q=4 MHA       cga2  871.2 /  856.0 /  847.9    cga1  528.7 /  528.2 /  526.4 us
+# (d256 32/2 packed, cga2: S_q=4 65.9 / 63.3 / 62.1, S_q=8 64.8 / 65.0 / 66.6
+# -- the sign flips with S_q there, so the d256 flavor keeps its rule until it
+# is measured on its own.)
+_D128_SHAPE = (128, 128)
+
+
+def _d128_f16_flavor(caps: Capabilities, facts) -> bool:
+    """The d128 flavor of a half-precision row that declares a per-shape cga
+    domain for it -- the SM100-line f16 row; the fp8 / mxfp8 rows and the Rubin
+    f16 row leave d128 on the row-wide cga2."""
+    return (
+        _selected_d_shape(caps, facts) == _D128_SHAPE
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and any(shape == _D128_SHAPE for shape, _ in caps.cgas_by_d_shape)
+    )
+
+
+def _sm100_pack_g(caps: Capabilities, facts) -> int:
+    """The heads a packed set folds into one Q tile row-group -- the kernel's
+    ``Cfg.PACK_G`` (:func:`_pack_gqa_group`: the whole ratio G when it divides
+    the tile, its largest divisor that does under partial PackGQA, 96/8 -> 4);
+    1 when the row cannot pack this graph (MHA, THD, an epilogue gate, or a
+    ratio with no factor in common with the tile). A (batch, packed head) unit
+    holds ``S_q * PACK_G`` live rows, so this -- not the raw ratio -- is what
+    the one-CTA and one-cluster rules below measure the unit by."""
+    return _pack_gqa_group(caps, facts, 128, _pack_gqa_eligible(caps, facts, 128))
+
+
+def _q_clusters_per_unit(caps: Capabilities, facts, cga: Optional[int]) -> int:
+    """Q clusters one (batch, packed head) unit launches at cluster width ``cga``
+    (``None`` = the flavor's default width)."""
+    return _ceil_div(facts.s_q * _sm100_pack_g(caps, facts), _pack_gqa_tile_q(caps, facts, 128, cga))
+
+
+def select_d128_auto_cga(*, s_q: int, pack_g: int, thd: bool) -> int:
+    """Measured d128 f16 cluster width: cga1 when one CTA's Q rows cover every
+    live row of a (batch, packed head) unit -- ``S_q * G <= TILES_Q * TILE_M``
+    -- and cga2 otherwise. THD keeps cga2: its persistent scheduler sizes the
+    grid in clusters and the cga1 grid is unmeasured there."""
+    if thd:
+        return 2
+    return 1 if _ceil_div(s_q * pack_g, cga_tile_m(128, 1)) == 1 else 2
+
+
 def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm100TemplateParams:
     dtype_codes = {
         cudnn.data_type.FP8_E4M3: DTYPE_E4M3,
@@ -644,6 +726,11 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         if selected_cga not in domain:
             raise ValueError(f"D512 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
         return selected_sched, selected_cga
+    if _d128_f16_flavor(caps, facts):
+        selected_cga = select_d128_auto_cga(s_q=facts.s_q, pack_g=_sm100_pack_g(caps, facts), thd=facts.thd)
+        if selected_cga not in domain:
+            raise ValueError(f"D128 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
+        return sched_policy, selected_cga
     if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
         return sched_policy, _sole(domain)
     params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
@@ -846,11 +933,19 @@ def _split_points(
 # ---------------------------------------------------------------------------
 
 
+def _cga_runners(caps: Capabilities, facts, lead: SdpaFwdKnobs) -> Tuple[int, ...]:
+    """The cluster widths behind a decode-shaped d128 lead: the domain's other
+    widths (cga2) on the lead's split leg. Empty for every other lead."""
+    if lead.cga != 1 or not _d128_f16_flavor(caps, facts):
+        return ()
+    return tuple(sorted(cga for cga in effective_cgas(caps, facts, lead.split_kv) if cga != lead.cga))
+
+
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
     The baseline takes the best value on every axis; runners-up deviate on ONE
-    axis at a time in impact order (tiles, sched, pack_gqa, split) with the
+    axis at a time in impact order (tiles, sched, cga, pack_gqa, split) with the
     other axes held at their best, capped at ``_MAX_SETS_PER_ENGINE``. Two
     axes carry a structural coupling: a packed set rides the largest tile
     that admits the ratio, and a split set rides the plain scheduler. Axis
@@ -931,6 +1026,11 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     sched_host = unsplit_leg
     for policy in scheds[1:]:
         out.append(replace(sched_host, sched_policy=policy))
+    # The cluster width the d128 rule did not pick stays reachable behind a
+    # decode-shaped cga1 lead, so select_plan / autotune can time cga2 on the
+    # same unsplit leg. A prefill lead adds nothing: its list is what it was.
+    for cga in _cga_runners(caps, facts, unsplit_leg):
+        out.append(replace(unsplit_leg, cga=cga))
     # The opposite pack_gqa leg, riding its own tile (packed: the largest
     # admitting tile; unpacked: the tile rule's best) and its own CGA width:
     # on the d128 f16 SM100 flavor a packed leg that overflows one 128-row

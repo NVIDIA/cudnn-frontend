@@ -467,6 +467,130 @@ def test_fallback_kind_is_least_demanding():
 
 
 # ---------------------------------------------------------------------------
+# d128 decode-shaped launches (FlashInfer paged GQA decode, MTP S_q in [2, 8])
+# ---------------------------------------------------------------------------
+#
+# A d128 f16 cluster at cga2 spans TILES_Q * TILE_M * CTA_MMA = 512 Q rows; one
+# CTA spans 256. When every live row of a (batch, packed head) unit fits in one
+# CTA the cga2 peer holds dead rows only, yet still issues every BMM1/BMM2 per
+# KV tile -- so cga1 halves the CTA count at the same per-CTA work. And with one
+# Q cluster per unit every unit carries the same static tile weight, so the
+# causal LPT remaps have nothing to balance. The measured B200 numbers live in
+# the heuristics module next to the rules.
+
+
+def _decode_facts(**over):
+    """FlashInfer's paged GQA decode graph: b=32, 64/4 heads, d128 bf16, 4k KV."""
+    base = dict(b=32, h_q=64, h_kv=4, s_q=1, s_kv=4096, dtype=cudnn.data_type.BFLOAT16, causal=False, padded=True, has_paged_kv=True, page_size=16)
+    base.update(over)
+    return _facts(**base)
+
+
+def _f16_plans(facts):
+    plans = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
+    assert plans, "the f16 row must serve this graph"
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    return plans
+
+
+_DENSE = dict(has_paged_kv=False, padded=False, page_size=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(),  # S_q=1, G=16 packed: 16 live rows
+        dict(h_kv=8),  # G=8
+        dict(h_q=8, h_kv=8),  # MHA, nothing to pack: 1 live row
+        dict(h_q=96, h_kv=8),  # G=12 does not divide the tile -> unpacked, 1 live row per head
+        dict(s_q=4, causal=True, bottom_right=True),  # MTP
+        dict(s_q=16),  # 16 * 16 = 256 rows: exactly one CTA
+        dict(**_DENSE),  # dense decode
+        dict(s_q=8, causal=True, bottom_right=True, window_left=255, has_paged_kv=False, padded=True, page_size=0),  # dense padded MTP + SWA
+    ],
+    ids=["fi_64_4", "fi_64_8", "mha", "unpacked_96_8", "mtp4_br", "one_cta_exactly", "dense_decode", "dense_mtp_swa"],
+)
+def test_d128_decode_shaped_launch_leads_with_cga1(over):
+    """S_q * G <= 256: the lead plan is cga1 on the plain scheduler, and no set
+    proposes an LPT remap. cga2 stays reachable behind it for select_plan /
+    autotune -- a knob is honored, never silently swapped."""
+    plans = _f16_plans(_decode_facts(**over))
+    lead = plans[0].knobs
+    assert lead.cga == 1, lead
+    assert lead.sched_policy == 0, lead  # SCHED_NATURAL, even under a causal band
+    assert all(p.knobs.sched_policy == 0 for p in plans), [p.knobs for p in plans]
+    assert any(p.knobs.cga == 2 and p.knobs.split_kv == 1 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(s_q=17),  # 17 * 16 = 272 rows: past one CTA
+        dict(s_q=300, h_q=8, h_kv=8),  # paged prefill, MHA
+        dict(s_q=4096, s_kv=4096, b=1, h_q=32, h_kv=8, causal=True, **_DENSE),  # prefill
+    ],
+    ids=["past_one_cta", "paged_prefill", "prefill_4k"],
+)
+def test_d128_prefill_shaped_launch_keeps_cga2(over):
+    """Above one CTA's rows the plan list is what it was: cga2 throughout. On
+    square shapes cga1 measures within noise of cga2 (kernel docstring), so
+    it is a small-S_q lever, not a prefill one."""
+    plans = _f16_plans(_decode_facts(**over))
+    assert all(p.knobs.cga == 2 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_d128_causal_scheduler_rule_stops_at_one_q_cluster():
+    """The one-cluster NATURAL rule ends exactly where the LPT remaps gain rows
+    to balance: at S_q * G <= 512 (one cga2 cluster) every set is NATURAL and
+    no scheduler runner is spent; one row more restores LPT_L2 as the causal
+    primary with its runners, and a 4k causal prefill is untouched."""
+    one = _f16_plans(_decode_facts(s_q=32, causal=True, bottom_right=True))  # 32 * 16 = 512 rows
+    assert {p.knobs.sched_policy for p in one} == {0}, [p.knobs for p in one]
+    assert all(p.knobs.cga == 2 for p in one), "512 rows are two CTAs' worth"
+    two = _f16_plans(_decode_facts(s_q=33, causal=True, bottom_right=True))  # 528 rows: two clusters
+    assert two[0].knobs.sched_policy == SCHED_LPT_L2, two[0].knobs
+    assert {SCHED_LPT, 0} <= {p.knobs.sched_policy for p in two}, [p.knobs for p in two]
+    prefill = _f16_plans(_decode_facts(s_q=4096, s_kv=4096, b=1, h_q=32, h_kv=8, causal=True, **_DENSE))
+    assert (prefill[0].knobs.sched_policy, prefill[0].knobs.cga) == (SCHED_LPT_L2, 2), prefill[0].knobs
+
+
+@pytest.mark.L0
+def test_d128_cga_request_domain():
+    """The f16 row admits cga1 AND cga2 on d128, split or not (the kernel's cga1
+    QO-alias configuration is validated with splits); a width the flavor has no
+    configuration for is declined, as is cga1 on the f16 d256 flavor, whose
+    kernel mandates CTA2. The fp8 d128 row keeps cga2 only
+    (test_quantized_cga_follows_selected_native_flavor pins that side)."""
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    for facts in (_decode_facts(), _decode_facts(s_q=4096, s_kv=4096, b=1, h_q=32, h_kv=8, causal=True, **_DENSE)):
+        for cga in (1, 2):
+            assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=cga)) is None
+            assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=cga, split_kv=2)) is None
+        assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=4))
+    d256 = _decode_facts(d_qk=256, d_v=256)
+    assert engines.mismatch(spec.capabilities, d256, engines.SdpaFwdKnobs(cga=2)) is None
+    assert "outside this engine's domain" in engines.mismatch(spec.capabilities, d256, engines.SdpaFwdKnobs(cga=1))
+
+
+@pytest.mark.L0
+def test_d128_standalone_adapter_cga_domain_matches_the_row():
+    """api_dsl.supported_cgas_for is the adapter twin of the row's cga domain
+    ("keep the three in lockstep"): d128 f16 on the SM100 line takes both widths;
+    the fp8 d128 lowering and the Rubin f16 row stay on cga2."""
+    from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
+
+    assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 0)) == (1, 2)
+    assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 3)) == (1, 2)
+    assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (2,)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0)) == (2,)
+    assert supported_cgas_for((256, 256), fp8=False, device_cc=(10, 0)) == (2,)
+
+
+# ---------------------------------------------------------------------------
 # Executable tier — SM100 graph path
 # ---------------------------------------------------------------------------
 

@@ -30,18 +30,17 @@ pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 D = 128
 
 
-def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, causal_br=False):
-    """q [B, H, S_q, D] (every query row); pools in their storage layout; returns
-    (O [B, H, S_q, D_v], LSE [B, H, S_q]) fp32.  ``causal_br``: bottom-right
-    causal anchored at the per-batch KV length -- row r of a batch with L live
-    keys sees keys <= L - S_q + r.  A row with no visible key (L == 0, or
-    L < S_q - r under the mask) is dead: O := 0, LSE := -inf."""
-    B, H, S_q, d = q.shape
+def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, *, causal_br=False, window=None):
+    """q [B, H, S_q, D], every row live (seq_len_q == S_q); returns (O [B, H, S_q, D_v],
+    LSE [B, H, S_q]) fp32. Bottom-right causal anchors row r of batch b at key
+    L_b - S_q + r; ``window`` is cuDNN's ``sliding_window_length``: the ``window``
+    keys ending at the diagonal. A row without a live key is O := 0 / LSE := -inf."""
+    B, H, S, d = q.shape
     KH = k_pool.shape[1] if hnd else k_pool.shape[2]
     P = k_pool.shape[2] if hnd else k_pool.shape[1]
     Dv = v_pool.shape[-1]
-    out = torch.zeros(B, H, S_q, Dv, device=q.device, dtype=torch.float32)
-    lse = torch.full((B, H, S_q), float("-inf"), device=q.device, dtype=torch.float32)
+    out = torch.zeros(B, H, S, Dv, device=q.device, dtype=torch.float32)
+    lse = torch.full((B, H, S), float("-inf"), device=q.device, dtype=torch.float32)
     for b, L in enumerate(seq_lens.tolist()):
         if L == 0:
             continue
@@ -52,13 +51,17 @@ def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, causal_br=Fa
         k = k.reshape(-1, KH, d)[:L].repeat_interleave(H // KH, dim=1).float()
         v = v.reshape(-1, KH, Dv)[:L].repeat_interleave(H // KH, dim=1).float()
         s = torch.einsum("hrd,lhd->hrl", q[b].float(), k) * scale
+        rows = torch.arange(S, device=q.device).view(S, 1)
+        cols = torch.arange(L, device=q.device).view(1, L)
+        diag = rows + (L - S)
+        masked = torch.zeros(S, L, dtype=torch.bool, device=q.device)
         if causal_br:
-            r = torch.arange(S_q, device=q.device).view(1, S_q, 1)
-            j = torch.arange(L, device=q.device).view(1, 1, L)
-            s = s.masked_fill(j > L - S_q + r, float("-inf"))
-        # A fully-masked row softmaxes to NaN: it is dead, O := 0 (LSE is -inf already).
+            masked |= cols > diag
+        if window is not None:
+            masked |= cols < diag - (window - 1)
+        s = s.masked_fill(masked.view(1, S, L), float("-inf"))
         out[b] = torch.einsum("hrl,lhd->hrd", torch.softmax(s, -1).nan_to_num(0.0), v)
-        lse[b] = torch.logsumexp(s, -1)
+        lse[b] = torch.logsumexp(s, -1)  # keyless rows -> -inf
     return out, lse
 
 
@@ -87,10 +90,31 @@ def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0):
     return k_pool, v_pool, k_c, v_c, bt
 
 
-def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, stats=False, s_q=1, max_seq_len=None, want_split=None, causal_br=False):
-    """Build + run the paged graph on the FROST engine's own best plan (or the
-    ``want_split`` leg), check O (+ Stats) against ``_ref_rows`` and return the
-    plan.  ``causal_br`` adds the bottom-right causal mask (MTP at S_q > 1)."""
+def _run_graph(
+    B,
+    H,
+    KH,
+    d,
+    P,
+    max_pages,
+    lens,
+    hnd,
+    *,
+    dtype=torch.float16,
+    stats=False,
+    s_q=1,
+    max_seq_len=None,
+    want_split=None,
+    causal_br=False,
+    window=None,
+    want_cga=None,
+    pack_gqa=None,
+):
+    """Build, pin the FROST engine (``pack_gqa`` pins that leg), run under the
+    sync-debug guard and check every Q row against the fp32 gather reference.
+    ``causal_br`` / ``window`` add the bottom-right causal band and cuDNN's
+    ``sliding_window_length``; ``want_cga`` asserts the cluster width the
+    heuristics led with. Returns the pinned plan."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
@@ -109,7 +133,12 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
     q, k, v = g.tensor_like(q_gpu), g.tensor_like(k_c), g.tensor_like(v_c)
     tk, tv = g.tensor_like(bt), g.tensor_like(bt)
     sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
-    kw = dict(
+    mask_kw = {}
+    if causal_br:
+        mask_kw["use_causal_mask_bottom_right"] = True
+    if window is not None:
+        mask_kw["sliding_window_length"] = window
+    o, st = g.sdpa(
         name="sdpa",
         q=q,
         k=k,
@@ -122,10 +151,8 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
         paged_attention_k_table=tk,
         paged_attention_v_table=tv,
         paged_attention_max_seq_len_kv=max_seq_len if max_seq_len is not None else max_pages * P,
+        **mask_kw,
     )
-    if causal_br:
-        kw["use_causal_mask_bottom_right"] = True
-    o, st = g.sdpa(**kw)
     o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
     stats_gpu = None
     if stats:
@@ -134,13 +161,15 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name())
+    plan = select_engine(g, engine_name(), pack_gqa=pack_gqa)
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
         idx = next((i for i, n in enumerate(names) if n.startswith(engine_name()) and g.plans[i].knobs.split_kv == want_split), None)
         assert idx is not None, f"no {engine_name()} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
         plan = g.plans[idx]
+    if want_cga is not None:
+        assert plan.knobs.cga == want_cga, f"expected the heuristics to lead with cga={want_cga}; got {plan.knobs}"
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -156,20 +185,20 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
 
-    ref_o, ref_lse = _ref_rows(q_gpu, k_pool, v_pool, bt.view(B, max_pages), seq_lens, hnd, scale, causal_br)
+    ref_o, ref_lse = _ref_rows(q_gpu, k_pool, v_pool, bt.view(B, max_pages), seq_lens, hnd, scale, causal_br=causal_br, window=window)
     out = o_gpu.float()
     assert not torch.isnan(out).any(), "NaN in O"
     torch.testing.assert_close(out, ref_o, atol=2e-2 if dtype == torch.float16 else 1e-1, rtol=0)
-    # Dead rows: an empty sequence, or (bottom-right causal) a row that sits
-    # before the batch's first visible key.
-    dead = ~torch.isfinite(ref_lse)
-    if dead.any():
-        assert out[dead].abs().max().item() == 0.0, "a row with no visible key must write O := 0"
+    # Rows without a live key (empty sequence, or a bottom-right row whose whole
+    # band falls before key 0): O := 0 / LSE := -inf.
+    live = ~torch.isinf(ref_lse)
+    if (~live).any():
+        assert out[~live].abs().max().item() == 0.0, "a keyless row must write O := 0"
     if stats:
         got_lse = stats_gpu.view(B, H, s_q)
-        torch.testing.assert_close(got_lse[~dead], ref_lse[~dead], atol=5e-3, rtol=0)
-        if dead.any():
-            assert torch.isinf(got_lse[dead]).all() and (got_lse[dead] < 0).all(), "a row with no visible key must write LSE := -inf"
+        torch.testing.assert_close(got_lse[live], ref_lse[live], atol=5e-3, rtol=0)
+        if (~live).any():
+            assert torch.isinf(got_lse[~live]).all() and (got_lse[~live] < 0).all(), "a keyless row must write LSE := -inf"
     return plan
 
 
@@ -351,6 +380,53 @@ def test_paged_graph_declines_off_contract():
     assert not _offers(_build(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
     assert not _offers(_build(16, d=512)), "paged KV is wired on the d128 / d256 flavors only"
     assert not _offers(_build(16, padding=False)), "paged KV requires the padding mask"
+
+
+# --- decode-shaped launches: cga1 on the graph path ---------------------------
+#
+# S_q * G <= 256 live Q rows per (batch, packed head) unit: the heuristics lead
+# with cga1 -- one CTA per unit, the kernel's QO-alias configuration -- on the
+# plain scheduler (heuristics._auto_sched_cga / _sched_points).  These are the
+# graph-path runs of d128 cga1 under paged loads, PackGQA and the bottom-right /
+# sliding-window masks; the kernel-level tests below drove cga1 with splits only.
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+def test_paged_graph_decode_shaped_leads_with_cga1(hnd, page_size):
+    """FlashInfer-shaped decode (GQA 32:2, S_q=1, mixed lengths incl. 0 / 1 / a
+    page boundary / a tile boundary + 1): the lead plan is cga1 + PackGQA on the
+    plain scheduler, Stats out."""
+    plan = _run_graph(8, 32, 2, D, page_size, -(-4096 // page_size), [4096, 77, 0, 1, 1024, 2000, 4095, 129], hnd, stats=True, want_cga=1)
+    assert plan.knobs.pack_gqa is True and plan.knobs.sched_policy == 0, plan.knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("pack_gqa", [True, False], ids=["packed", "unpacked"])
+@pytest.mark.parametrize("s_q,window", [(2, None), (4, None), (8, 300), (8, 1)], ids=["mtp2", "mtp4", "mtp8_swa300", "mtp8_swa1"])
+def test_paged_graph_mtp_bottom_right_cga1(s_q, window, pack_gqa):
+    """MTP: S_q in [2, 8] bottom-right causal (+ sliding window) over the paged
+    cache, GQA 32:4, lengths below S_q included (keyless rows are O := 0 /
+    LSE := -inf). Both PackGQA legs run at cga1 on the plain scheduler."""
+    plan = _run_graph(
+        6, 32, 4, D, 16, 256, [4096, 3, 0, 1, 1000, 4095], hnd=False, stats=True, s_q=s_q, causal_br=True, window=window, want_cga=1, pack_gqa=pack_gqa
+    )
+    assert plan.knobs.pack_gqa is pack_gqa and plan.knobs.sched_policy == 0, plan.knobs
+
+
+@pytest.mark.L0
+def test_paged_graph_group_not_dividing_tile_runs_unpacked_cga1():
+    """H/H_kv = 12 (a 96/8-style group) cannot pack a 128-row tile: each head is
+    its own one-live-row unit -- still one CTA's worth, so cga1 leads unpacked."""
+    plan = _run_graph(4, 24, 2, D, 16, 64, [1000, 1, 0, 1024], hnd=True, dtype=torch.bfloat16, stats=True, want_cga=1)
+    assert plan.knobs.pack_gqa is False, plan.knobs
+
+
+@pytest.mark.L0
+def test_paged_graph_prefill_shaped_keeps_cga2():
+    """Past one CTA's 256 rows (S_q=300, MHA) the paged prefill stays on cga2."""
+    _run_graph(2, 4, 4, D, 16, 32, [500, 128], hnd=False, s_q=300, want_cga=2)
 
 
 # --- kernel template, direct -----------------------------------------------

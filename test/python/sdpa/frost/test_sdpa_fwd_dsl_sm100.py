@@ -268,8 +268,10 @@ def _run_dsl_graph(
     pack_gqa=None,
     return_stats=False,
     stats_layout="contiguous",
+    want_cga=None,
 ):
-    """Build the graph, opt into the matching FROST DSL engine, execute, return O (BHSD)."""
+    """Build the graph, opt into the matching FROST DSL engine, execute, return O (BHSD).
+    ``want_cga`` asserts the cluster width the heuristics led with for this graph."""
     import cudnn
 
     b, h_q, s_q, _ = q_gpu.shape
@@ -309,7 +311,9 @@ def _run_dsl_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
+    plan = _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
+    if want_cga is not None:
+        assert plan.knobs.cga == want_cga, f"expected the heuristics to lead with cga={want_cga}; got {plan.knobs}"
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
@@ -730,6 +734,56 @@ def test_dsl_sm100_sink(dtype, d):
     o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), sink=sink)
     o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, sinks=sink.flatten())
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(_SM == 107, reason="the Rubin f16 row keeps d128 on cga2 (no measured cga1 configuration there)")
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_d128_decode_shaped_cga1_sink_swa(dtype):
+    """Decode-shaped d128 (MTP S_q=4, GQA 64:8 packed, b=8): the heuristics lead
+    with cga1 -- the kernel's QO-alias configuration -- and here it runs under
+    bottom-right causal + sliding window + attention sink + per-batch KV lengths
+    (incl. lengths below S_q, whose keyless rows hold the sink's mass alone):
+    the epilogue and mask features the paged suite cannot combine, since paged
+    KV declines the sink."""
+    _require_dsl()
+    b, h_q, h_kv, s_q, s_kv, d, W = 8, 64, 8, 4, 2048, 128, 300
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    sink = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda")
+    seq_len_q = torch.full((b, 1, 1, 1), s_q, dtype=torch.int32, device="cuda")
+    seq_len_kv = torch.tensor([2048, 1, 3, 5, 700, 2047, 129, 1024], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True, sliding_window_length=W + 1),
+        seq_len_kv=seq_len_kv,
+        seq_len_q=seq_len_q,
+        sink=sink,
+        want_cga=1,
+        return_stats=True,
+    )
+    o_ref, lse_ref = _ref_sdpa_full(
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=True,
+        bottom_right=True,
+        swa_window=W,
+        seq_q_lens=seq_len_q,
+        seq_kv_lens=seq_len_kv,
+        sinks=sink.flatten(),
+        return_stats=True,
+    )
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.view(b, h_q, s_q), lse_ref, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0

@@ -837,6 +837,101 @@ def test_sdpa_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
     exec_sdpa(test.cfg, request, cudnn_handle)
 
 
+# # ==================================
+# # L0 paged decode / MTP tests on the FROST SM100 engine (FlashInfer paged GQA decode)
+# # (gate + routing assertion: _require_frost_sm100 / _exec_sdpa_on_frost above)
+# # ==================================
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=2003), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_fwd_paged_decode_mtp_frost_L0(env_info, test_no, request, cudnn_handle):
+    """Paged GQA decode (S_q=1) and MTP (S_q in [2, 8]) on the FROST SM100 d128
+    flavor: bottom-right causal weighted, head groups up to 16:1 (incl. a group
+    that does not divide the tile), page sizes 16..128, padded per-batch lengths.
+    Every draw is inside the FROST paged contract, so the engine must serve it."""
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    # Create the randomization context within the test
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=64, with_high_probability=[8,32]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=8, s_kv_max=8192, s_q_distribution={"s_q=1":6, "s_q=random":4}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=8, d_qk_max=128, d_v_min=8, d_v_max=128, head_dim_distribution={"d_qk=d_v":3, "d_qk=random":1}, with_high_probability=[(128,128), (64,64)]),
+        head_count=RandomChoice({(64, 4, 4) : 3, (64, 8, 8) : 2, (16, 4, 4) : 1, (24, 2, 2) : 1, (8, 1, 1) : 1, (32, 32, 32) : 1}),  # (h_q, h_k, h_v): 16:1, 8:1, 4:1, 12:1 (unpacked), MQA, MHA
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=4, right_window_only=1, band_around_diag=1, no_mask=6),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 3}),
+        is_ragged_or_padded_or_full=RandomChoice({"padded" : 1}),
+        block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16,32,64,128]),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = True
+    test.showConfig(test_no, request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
+# FlashInfer's cudnn paged decode graph (Qwen3-235B-style 64/4 heads, d128, page 16) and its MTP sibling.
+FI_PAGED_DECODE_CASES = [
+    # (s_q, diag_align, right_bound)
+    (1, cudnn.diagonal_alignment.TOP_LEFT,     None),  # S_q=1, no mask: the wrapper's spelling today
+    (4, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0),     # MTP S_q=4, bottom-right causal
+]
+
+
+@pytest.mark.parametrize("s_q,diag_align,right_bound", FI_PAGED_DECODE_CASES, ids=["decode_sq1", "mtp_sq4_brcm"])
+@pytest.mark.L0
+def test_sdpa_fwd_paged_decode_fi_shapes_frost_L0(env_info, s_q, diag_align, right_bound, request, cudnn_handle):
+    """FlashInfer's paged decode graph pinned: b=32, 64/4 heads, d128 bf16, page 16,
+    per-batch KV lengths mixed up to 4096 (page and tile boundaries, 1, and for the
+    MTP case a length below S_q), served by the FROST SM100 engine."""
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    seq_len_kv = [4096, 4095, 4080, 3000, 2048, 2047, 1024, 129, 128, 127, 100, 17, 16, 15, 8, 1] * 2
+    seq_len_kv[-1] = 3  # below S_q for MTP: keyless bottom-right rows
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=2003,
+        rng_geom_seed=2003,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=32,
+        d_qk=128,
+        d_v=128,
+        s_q=s_q,
+        s_kv=4096,
+        h_q=64,
+        h_k=4,
+        h_v=4,
+        block_size=16,
+        diag_align=diag_align,
+        left_bound=None,
+        right_bound=right_bound,
+        seq_len_q=[s_q] * 32,
+        seq_len_kv=seq_len_kv,
+        implementation=cudnn.attention_implementation.AUTO,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, len(FI_PAGED_DECODE_CASES)), request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_fwd_paged_unified_L0(env_info, test_no, request, cudnn_handle):

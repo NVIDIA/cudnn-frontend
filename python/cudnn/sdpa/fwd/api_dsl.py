@@ -398,10 +398,19 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
     that clears eligibility and dies in the lowering (contract rule 8b').  This
     is the wrapper twin of the engine rows leaving (192, 128) on their default
     ``cgas={2}``.  Keep the three in lockstep.
+
+    d128 f16/bf16 on the SM100 line (cc 10.0-10.6) accepts both widths as well:
+    cga1 is ``make_cfg_d128``'s Q/O-aliased SMEM configuration, the width the
+    graph heuristics lead with on decode-shaped launches
+    (``heuristics.select_d128_auto_cga``) -- the twin of the sm100 f16 row's
+    ``cgas_by_d_shape`` entry.  The Rubin f16 row and the fp8 / mxfp8 d128
+    lowerings stay on cga2.
     """
     if device_cc == (10, 7) and fp8 and flavor == (192, 128):
         return (2,)
     if flavor == (192, 128):
+        return (1, 2)
+    if not fp8 and device_cc != (10, 7) and flavor == (128, 128):
         return (1, 2)
     if fp8 and flavor == (256, 256):
         return (1,)
