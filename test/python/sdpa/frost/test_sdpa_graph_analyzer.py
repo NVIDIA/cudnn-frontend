@@ -670,9 +670,24 @@ def test_knob_request_pack_gqa_on_mha_is_identity():
 
 
 def test_knob_request_pack_gqa_no_pow2_group_rejects_engine():
-    # GQA ratio 3 does not divide tile_m (128) so pack_gqa_supported is False.
+    # GQA ratios 3 and 5 share no factor with tile_m (128): nothing can be
+    # packed, so an explicit pack_gqa=True is not honorable (never degraded).
     g = _mk_gqa_graph(6, 2)
     assert not _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+    assert not _eligible(_mk_gqa_graph(10, 2), engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_knob_request_pack_gqa_partial_group_on_wired_flavors_only():
+    # Partial PackGQA (Capabilities.pack_gqa_partial_d_shapes): a ratio that
+    # shares a factor with tile_m but does not divide it packs that factor on
+    # the d128 and d256 f16 flavors (G=12 -> 4 heads per row group, G=6 -> 2) ...
+    for h_q, h_kv in ((24, 2), (12, 2)):
+        assert engines.engine_name() in _eligible(_mk_gqa_graph(h_q, h_kv), engines.SdpaFwdKnobs(pack_gqa=True))
+        assert engines.engine_name() in _eligible(_mk_gqa_graph(h_q, h_kv, d=256), engines.SdpaFwdKnobs(pack_gqa=True))
+    # ... while the d512 flavor keeps the full-ratio contract (its kernel packs
+    # HEADS_PER_TILE = G), so the same request is declined there.
+    assert not _eligible(_mk_gqa_graph(24, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert engines.engine_name() in _eligible(_mk_gqa_graph(32, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
 
 
 def test_knob_request_pack_gqa_false_always_eligible():

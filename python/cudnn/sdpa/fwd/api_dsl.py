@@ -86,6 +86,10 @@ _SM100_FLAVORS = (
     (256, 256),
     (512, 512),
 )  # ordered smallest-first: (max D_QK, max D_V) envelope
+# Flavors whose f16/bf16 kernel packs a proper divisor of a GQA group that does
+# not divide the 128-row tile (partial PackGQA, Cfg.PACK_G); the others pack the
+# whole group only.  Mirror of Capabilities.pack_gqa_partial_d_shapes.
+_SM100_PARTIAL_PACK_GQA_FLAVORS = ((128, 128), (256, 256))
 _SM100_KERNEL_FILES = {
     (512, 512): "sm100/prefill_d512_f16.py",
     (256, 256): "sm100/prefill_d256_f16.py",
@@ -1429,10 +1433,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.thd,
                 "PackGQA is dense-only (THD/ragged runs unpacked)",
             )
-            self._value_error_if(
-                not pack_gqa_supported(int(h_qo), int(h_kv)),
-                f"PackGQA requires h_q/h_kv to divide the kernel tile_m; got h_q/h_kv = {int(h_qo)}/{int(h_kv)}",
-            )
+            # The group-vs-tile rule is checked once the flavor is known (below):
+            # the d128 / d256 f16 kernels pack a proper divisor of the group.
 
         # Q/K/V dtype: half (BF16/FP16, DTYPE_O == input) or FP8 (E4M3/E5M2 → MXFP8,
         # d128 only, DTYPE_O independent — typically BF16/FP16).
@@ -1583,6 +1585,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         else:
             _flavor_pool = None
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
+        if self.pack_gqa:
+            # Partial PackGQA (the largest divisor of the group that divides the
+            # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every
+            # other flavor / quantization keeps the full-ratio contract.
+            _partial = not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS
+            self._value_error_if(
+                not pack_gqa_supported(int(h_qo), int(h_kv), partial=_partial),
+                f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} the kernel tile_m; got h_q/h_kv = {int(h_qo)}/{int(h_kv)}",
+            )
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
             f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",

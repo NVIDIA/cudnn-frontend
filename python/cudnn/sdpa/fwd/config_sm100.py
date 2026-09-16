@@ -20,6 +20,7 @@ those support checks have a gap.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
@@ -102,7 +103,9 @@ class TemplateParams:
     thd_varlen: bool = False
     # PackGQA: pack Q rows from the G query heads sharing one KV head into a
     # single TILE_M tile, token-major (row r ↔ token r // G, head r % G), so
-    # tiles stay full for GQA/MQA.
+    # tiles stay full for GQA/MQA.  When G does not divide TILE_M the d128 and
+    # d256 f16 kernels pack its largest divisor that does (Cfg.PACK_G, from
+    # pack_gqa_group_size); ``qh_per_kh`` is always the graph's GQA ratio.
     pack_gqa: bool = False
     qh_per_kh: int = 1
     # KV split: each Q tile's KV loop range is cut into ``split_kv`` contiguous
@@ -376,8 +379,50 @@ def rescale_threshold(dtype_qkv: int) -> float:
     return 4.0 if dtype_qkv <= 1 else 8.0
 
 
-def pack_gqa_supported(h_q: int, h_kv: int, tile_m: int = 128) -> bool:
-    return h_q > 0 and h_kv > 0 and h_q % h_kv == 0 and tile_m % (h_q // h_kv) == 0
+def pack_gqa_group_size(qh_per_kh: int, tile_m: int = 128, *, partial: bool = False) -> int:
+    """Heads packed into one Q tile row-group for the GQA ratio ``G = qh_per_kh``.
+
+    Full contract (``partial=False``): ``G`` when it divides ``tile_m``, else 0
+    (nothing can be packed).  Partial contract (``partial=True``, the d128 and
+    d256 f16 kernels): the largest divisor of ``G`` that divides ``tile_m`` --
+    ``gcd(G, tile_m)`` -- so a 12-head group packs 4 heads per token row-group
+    (three packed heads per KV head), a 6-head group packs 2, and a group with
+    no factor in common with the tile (3, 5, ...) yields 1 = unpacked.  MHA
+    (``G == 1``) is the identity, 1.
+    """
+    if qh_per_kh <= 0:
+        return 0
+    if tile_m % qh_per_kh == 0:
+        return qh_per_kh
+    return math.gcd(qh_per_kh, tile_m) if partial else 0
+
+
+def pack_gqa_supported(h_q: int, h_kv: int, tile_m: int = 128, *, partial: bool = False) -> bool:
+    """Whether a PACK_GQA=1 plan is HONORABLE for this head count: the group
+    divides the tile (full packing) or -- ``partial`` -- shares a factor > 1
+    with it.  MHA (G == 1) is the bit-exact unpacked fold, so it is honorable
+    too; a group that cannot pack at all (G=3 at tile_m=128) is declined rather
+    than silently run unpacked (frost/README.md rule 5)."""
+    if h_q <= 0 or h_kv <= 0 or h_q % h_kv != 0:
+        return False
+    g = h_q // h_kv
+    p = pack_gqa_group_size(g, tile_m, partial=partial)
+    return p == g or p > 1
+
+
+def _pack_g(params: TemplateParams, tile_m: int, *, partial: bool) -> int:
+    """``Cfg.PACK_G`` for a flavor: the packed group size, validated the way
+    ``engines.mismatch`` admits it (full contract, or partial where the kernel
+    carries it), so a knob that passed the gate can never reach a kernel that
+    would silently run it unpacked."""
+    if not params.pack_gqa:
+        return 1
+    g = int(params.qh_per_kh)
+    p = pack_gqa_group_size(g, tile_m, partial=partial)
+    if p == 0 or (p == 1 and g != 1):
+        how = "share a factor with" if partial else "divide"
+        raise ValueError(f"qh_per_kh ({g}) must {how} TILE_M ({tile_m}) when PACK_GQA is enabled")
+    return p
 
 
 def cga_tile_m(d_qk: int, cta_mma: Optional[int] = None) -> int:
@@ -516,7 +561,16 @@ class CfgD256:
 
     PACK_GQA: int = 0
 
+    # The graph's GQA ratio H_q / H_kv -- the bottom-right diagonal and the
+    # LPT_L2 head grouping are derived from it.
     QH_PER_KH: int = 1
+    # Heads packed into one Q tile row-group under PACK_GQA (the kernel's
+    # HEADS_PER_TILE): QH_PER_KH when the group divides TILE_M, else -- the
+    # d128 / d256 f16 kernels only -- its largest divisor that does
+    # (pack_gqa_group_size); QH_PER_KH // PACK_G packed heads then share one KV
+    # head.  1 when unpacked.  Distinct from QH_PER_KH on purpose: conflating
+    # the pack size with the GQA ratio would mis-mask MTP rows.
+    PACK_G: int = 1
 
     # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
     PAGED_KV: int = 0
@@ -726,12 +780,13 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        # Partial PackGQA is wired in the f16/bf16 d256 kernel; the fp8 / mxfp8
+        # siblings pack HEADS_PER_TILE = QH_PER_KH and keep the full-ratio contract.
+        PACK_G=_pack_g(params, CfgD256.TILE_M, partial=not fp8),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d256(cfg)
-    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
-        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 
@@ -838,7 +893,16 @@ class CfgD512:
 
     PACK_GQA: int = 0
 
+    # The graph's GQA ratio H_q / H_kv -- the bottom-right diagonal and the
+    # LPT_L2 head grouping are derived from it.
     QH_PER_KH: int = 1
+    # Heads packed into one Q tile row-group under PACK_GQA (the kernel's
+    # HEADS_PER_TILE): QH_PER_KH when the group divides TILE_M, else -- the
+    # d128 / d256 f16 kernels only -- its largest divisor that does
+    # (pack_gqa_group_size); QH_PER_KH // PACK_G packed heads then share one KV
+    # head.  1 when unpacked.  Distinct from QH_PER_KH on purpose: conflating
+    # the pack size with the GQA ratio would mis-mask MTP rows.
+    PACK_G: int = 1
 
 
 def _validate_cfg_d512(cfg: CfgD512) -> None:
@@ -927,10 +991,9 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        PACK_G=_pack_g(params, CfgD512.TILE_M, partial=False),
     )
     _validate_cfg_d512(cfg)
-    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
-        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 
@@ -1053,7 +1116,16 @@ class CfgD128:
 
     PACK_GQA: int = 0
 
+    # The graph's GQA ratio H_q / H_kv -- the bottom-right diagonal and the
+    # LPT_L2 head grouping are derived from it.
     QH_PER_KH: int = 1
+    # Heads packed into one Q tile row-group under PACK_GQA (the kernel's
+    # HEADS_PER_TILE): QH_PER_KH when the group divides TILE_M, else -- the
+    # d128 / d256 f16 kernels only -- its largest divisor that does
+    # (pack_gqa_group_size); QH_PER_KH // PACK_G packed heads then share one KV
+    # head.  1 when unpacked.  Distinct from QH_PER_KH on purpose: conflating
+    # the pack size with the GQA ratio would mis-mask MTP rows.
+    PACK_G: int = 1
 
     # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
     PAGED_KV: int = 0
@@ -1183,12 +1255,13 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        # Partial PackGQA is wired in the f16/bf16 d128 kernel; the fp8 / mxfp8
+        # siblings pack HEADS_PER_TILE = QH_PER_KH and keep the full-ratio contract.
+        PACK_G=_pack_g(params, CfgD128.TILE_M, partial=not fp8),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d128(cfg)
-    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
-        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 
@@ -1408,10 +1481,9 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         THD_VARLEN=int(params.thd_varlen),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        PACK_G=_pack_g(params, CfgD192.TILE_M, partial=False),
     )
     _validate_cfg_d192(cfg)
-    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
-        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 

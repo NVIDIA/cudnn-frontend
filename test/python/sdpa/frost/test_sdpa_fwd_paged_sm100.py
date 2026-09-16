@@ -30,14 +30,18 @@ pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 D = 128
 
 
-def _ref(q, k_pool, v_pool, block_table, seq_lens, hnd, scale):
-    """q [B, H, D]; pools in their storage layout; returns (O [B, H, D_v], LSE [B, H]) fp32."""
-    B, H, d = q.shape
+def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, causal_br=False):
+    """q [B, H, S_q, D] (every query row); pools in their storage layout; returns
+    (O [B, H, S_q, D_v], LSE [B, H, S_q]) fp32.  ``causal_br``: bottom-right
+    causal anchored at the per-batch KV length -- row r of a batch with L live
+    keys sees keys <= L - S_q + r.  A row with no visible key (L == 0, or
+    L < S_q - r under the mask) is dead: O := 0, LSE := -inf."""
+    B, H, S_q, d = q.shape
     KH = k_pool.shape[1] if hnd else k_pool.shape[2]
     P = k_pool.shape[2] if hnd else k_pool.shape[1]
     Dv = v_pool.shape[-1]
-    out = torch.zeros(B, H, Dv, device=q.device, dtype=torch.float32)
-    lse = torch.full((B, H), float("-inf"), device=q.device, dtype=torch.float32)
+    out = torch.zeros(B, H, S_q, Dv, device=q.device, dtype=torch.float32)
+    lse = torch.full((B, H, S_q), float("-inf"), device=q.device, dtype=torch.float32)
     for b, L in enumerate(seq_lens.tolist()):
         if L == 0:
             continue
@@ -47,10 +51,21 @@ def _ref(q, k_pool, v_pool, block_table, seq_lens, hnd, scale):
             k, v = k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
         k = k.reshape(-1, KH, d)[:L].repeat_interleave(H // KH, dim=1).float()
         v = v.reshape(-1, KH, Dv)[:L].repeat_interleave(H // KH, dim=1).float()
-        s = torch.einsum("hd,lhd->hl", q[b].float(), k) * scale
-        out[b] = torch.einsum("hl,lhd->hd", torch.softmax(s, -1), v)
+        s = torch.einsum("hrd,lhd->hrl", q[b].float(), k) * scale
+        if causal_br:
+            r = torch.arange(S_q, device=q.device).view(1, S_q, 1)
+            j = torch.arange(L, device=q.device).view(1, 1, L)
+            s = s.masked_fill(j > L - S_q + r, float("-inf"))
+        # A fully-masked row softmaxes to NaN: it is dead, O := 0 (LSE is -inf already).
+        out[b] = torch.einsum("hrl,lhd->hrd", torch.softmax(s, -1).nan_to_num(0.0), v)
         lse[b] = torch.logsumexp(s, -1)
     return out, lse
+
+
+def _ref(q, k_pool, v_pool, block_table, seq_lens, hnd, scale):
+    """q [B, H, D] (one query row); returns (O [B, H, D_v], LSE [B, H]) fp32."""
+    out, lse = _ref_rows(q.unsqueeze(2), k_pool, v_pool, block_table, seq_lens, hnd, scale)
+    return out[:, :, 0], lse[:, :, 0]
 
 
 def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0):
@@ -72,7 +87,10 @@ def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0):
     return k_pool, v_pool, k_c, v_c, bt
 
 
-def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, stats=False, s_q=1, max_seq_len=None, want_split=None):
+def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, stats=False, s_q=1, max_seq_len=None, want_split=None, causal_br=False):
+    """Build + run the paged graph on the FROST engine's own best plan (or the
+    ``want_split`` leg), check O (+ Stats) against ``_ref_rows`` and return the
+    plan.  ``causal_br`` adds the bottom-right causal mask (MTP at S_q > 1)."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
@@ -91,7 +109,7 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
     q, k, v = g.tensor_like(q_gpu), g.tensor_like(k_c), g.tensor_like(v_c)
     tk, tv = g.tensor_like(bt), g.tensor_like(bt)
     sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
-    o, st = g.sdpa(
+    kw = dict(
         name="sdpa",
         q=q,
         k=k,
@@ -105,6 +123,9 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
         paged_attention_v_table=tv,
         paged_attention_max_seq_len_kv=max_seq_len if max_seq_len is not None else max_pages * P,
     )
+    if causal_br:
+        kw["use_causal_mask_bottom_right"] = True
+    o, st = g.sdpa(**kw)
     o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
     stats_gpu = None
     if stats:
@@ -135,18 +156,20 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
 
-    ref_o, ref_lse = _ref(q_gpu[:, :, 0, :], k_pool, v_pool, bt.view(B, max_pages), seq_lens, hnd, scale)
-    out = o_gpu[:, :, 0, :].float()
+    ref_o, ref_lse = _ref_rows(q_gpu, k_pool, v_pool, bt.view(B, max_pages), seq_lens, hnd, scale, causal_br)
+    out = o_gpu.float()
     assert not torch.isnan(out).any(), "NaN in O"
     torch.testing.assert_close(out, ref_o, atol=2e-2 if dtype == torch.float16 else 1e-1, rtol=0)
-    live = seq_lens > 0
-    if (~live).any():
-        assert out[~live].abs().max().item() == 0.0, "empty sequence must write O := 0"
+    # Dead rows: an empty sequence, or (bottom-right causal) a row that sits
+    # before the batch's first visible key.
+    dead = ~torch.isfinite(ref_lse)
+    if dead.any():
+        assert out[dead].abs().max().item() == 0.0, "a row with no visible key must write O := 0"
     if stats:
-        got_lse = stats_gpu.view(B, H)
-        torch.testing.assert_close(got_lse[live], ref_lse[live], atol=5e-3, rtol=0)
-        if (~live).any():
-            assert torch.isinf(got_lse[~live]).all() and (got_lse[~live] < 0).all(), "empty sequence must write LSE := -inf"
+        got_lse = stats_gpu.view(B, H, s_q)
+        torch.testing.assert_close(got_lse[~dead], ref_lse[~dead], atol=5e-3, rtol=0)
+        if dead.any():
+            assert torch.isinf(got_lse[dead]).all() and (got_lse[dead] < 0).all(), "a row with no visible key must write LSE := -inf"
     return plan
 
 
@@ -196,6 +219,24 @@ def test_paged_graph_d64_envelope_large_batch():
 def test_paged_graph_d256(hnd):
     """d=256 selects the d256 f16 flavor; same graph contract, Stats out."""
     _run_graph(3, 8, 2, 256, 32, 40, [1000, 1, 1279], hnd, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("h,kh", [(96, 8), (48, 8)], ids=["g12_packs4", "g6_packs2"])
+@pytest.mark.parametrize("s_q", [1, 2, 4, 8])
+def test_paged_graph_partial_pack_gqa(hnd, h, kh, s_q):
+    """Partial PackGQA: a GQA group that does not divide the 128-row Q tile packs
+    its largest divisor that does (G=12 -> 4 heads per token row-group, three
+    packed heads per KV head; G=6 -> 2), and the heuristics rank that packed plan
+    first on these decode / MTP shapes -- the 96/8 d128 paged decode that ran
+    unpacked before (one live row per 512-row cluster, 12x KV re-read).  Bottom-
+    right causal at S_q > 1 with Stats out: the packed epilogue scatters LSE
+    over the p head rows, the mask predicate is per token, and the KV head is
+    packed head // (G / p); a slip in any of the three shows up here.  Lengths
+    include a 1-token sequence, so at S_q = 8 seven of its rows are dead."""
+    plan = _run_graph(4, h, kh, D, 16, -(-1100 // 16), [300, 77, 1, 1100], hnd, s_q=s_q, causal_br=s_q > 1, stats=True)
+    assert plan.knobs.pack_gqa is True, plan.knobs
 
 
 @pytest.mark.L0
@@ -305,18 +346,20 @@ def test_paged_graph_declines_off_contract():
 # and page sizes on both sides of the tile.  Mirrors test_sdpa_fwd_split_kv_sm100.
 
 
-def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=torch.float16, d=128):
+def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=torch.float16, d=128, expect_pack_g=None):
     import cutlass
     import cuda.bindings.driver as cuda_driver
 
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
-    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.config_sm100 import MAKE_CFG, TemplateParams, pack_gqa_group_size
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     dev = "cuda"
     G = H // KH
-    pack = G > 1 and 128 % G == 0
+    # The d128 / d256 f16 kernels pack the largest divisor of G that divides the
+    # 128-row tile (partial PackGQA); 1 means nothing packs and the unpacked path serves.
+    pack = pack_gqa_group_size(G, 128, partial=True) > 1
     scale = 1.0 / math.sqrt(d)
     k_pool, v_pool, k_c, v_c, bt4 = _pools(B, KH, d, P, max_pages, hnd, dtype)
     bt = bt4.view(B, max_pages)
@@ -336,6 +379,9 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
         pack_gqa=pack,
         qh_per_kh=G if pack else 1,
     )
+    if expect_pack_g is not None:
+        cfg, _ = MAKE_CFG[d](params)
+        assert cfg.PACK_G == expect_pack_g, f"PACK_G={cfg.PACK_G} for G={G}, expected {expect_pack_g}"
     mod = load_template(path, params, tag=f"paged_p{P}_s{splits}_c{cta_mma}_g{G if pack else 1}_{dtype}")
     # The pools' strides in the kernel's [num_pages, page_size, H_kv, d] order carry the layout (HND vs NHD).
     fn = mod.compile(b=B, qh=H, kh=KH, sq=1, skv=0, d_qk=d, d_v=d, has_lse=True, k_stride=tuple(k_view.stride()), v_stride=tuple(v_view.stride()))
@@ -406,9 +452,17 @@ def test_paged_kernel_d256(page_size):
 
 
 @pytest.mark.L0
-def test_paged_kernel_gqa_group_not_dividing_tile():
-    """H/H_kv = 3 cannot pack a 128-row tile; the unpacked path serves it."""
-    _run_kernel(2, 6, 2, 16, 8, [50, 128], hnd=False, splits=1, cta_mma=2)
+@pytest.mark.parametrize(
+    "h,kh,pack_g,d",
+    [(6, 2, 1, 128), (10, 2, 1, 128), (24, 2, 4, 128), (12, 2, 2, 128), (24, 2, 4, 256)],
+    ids=["g3_unpacked", "g5_unpacked", "g12_packs4", "g6_packs2", "g12_packs4_d256"],
+)
+def test_paged_kernel_gqa_group_not_dividing_tile(h, kh, pack_g, d):
+    """A GQA group with no factor in common with the 128-row tile (G=3, G=5) runs
+    unpacked (PACK_G = 1); one that shares a factor packs its largest divisor of
+    the tile (G=12 -> 4 heads per token row-group, G=6 -> 2) on the d128 and d256
+    f16 flavors -- partial PackGQA, ``CfgD128.PACK_G`` / ``CfgD256.PACK_G``."""
+    _run_kernel(2, h, kh, 16, 8, [50, 128], hnd=False, splits=1, cta_mma=2, d=d, expect_pack_g=pack_g)
 
 
 @pytest.mark.L0

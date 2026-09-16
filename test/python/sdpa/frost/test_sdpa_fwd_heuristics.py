@@ -79,6 +79,19 @@ def test_recommend_primary_reproduces_the_derived_scheduler():
 
 
 @pytest.mark.L0
+def test_recommend_packs_partial_gqa_group_on_decode_shapes():
+    # 96 query heads over 8 KV heads (G=12) at S_q=1: 12 does not divide the
+    # 128-row tile, but 4 does -- the d128 f16 flavor packs 4 heads per token
+    # row-group (partial PackGQA), and the packed set leads like any other
+    # decode-shaped GQA graph, unpacked as the runner-up.
+    f16 = [p for p in recommend("A", _facts(h_q=96, h_kv=8, s_q=1, causal=False), _OFFERED) if p.engine_id == 20500]
+    assert f16[0].knobs.pack_gqa is True and False in {p.knobs.pack_gqa for p in f16}, [p.knobs for p in f16]
+    # G=3 shares no factor with the tile: no packed set is proposed.
+    f16 = [p for p in recommend("A", _facts(h_q=24, h_kv=8, s_q=1, causal=False), _OFFERED) if p.engine_id == 20500]
+    assert f16 and all(p.knobs.pack_gqa is False for p in f16), [p.knobs for p in f16]
+
+
+@pytest.mark.L0
 def test_split_and_scheduler_stay_coupled_whichever_leads():
     """A split set rides the plain scheduler — structural, so it must bind the
     PRIMARY too, not just the runner-ups. config_sm120 raises outright on

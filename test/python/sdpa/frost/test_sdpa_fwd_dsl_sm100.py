@@ -1204,10 +1204,41 @@ def test_dsl_sm100_pack_gqa_qtrim():
 
 @_skip_pack_gqa_on_rubin
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@pytest.mark.parametrize("h_q,h_kv", [(24, 2), (12, 2)], ids=["g12_packs4", "g6_packs2"])
+@pytest.mark.parametrize("s_q", [1, 2, 4, 8])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_partial_group(d, h_q, h_kv, s_q):
+    """Partial PackGQA on the dense path: a GQA group that does not divide the
+    128-row tile packs its largest divisor that does (G=12 -> 4 heads per token
+    row-group, three packed heads per KV head; G=6 -> 2).  Decode / MTP shape
+    with per-batch KV lengths and bottom-right causal at S_q > 1, Stats checked:
+    the packed epilogue scatters LSE over p head rows, the mask predicate is per
+    token and the KV head is packed head // (G / p).  The causal shapes ride the
+    LPT_L2 primary, whose L2 groups are the G / p packed heads of one KV head."""
+    _require_dsl()
+    b, s_kv = 2, 300
+    dtype = torch.bfloat16 if d == 256 else torch.float16
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    seq_len_kv = torch.tensor([300, 129], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    kw = dict(use_causal_mask_bottom_right=True) if s_q > 1 else dict()
+    o, lse = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=kw, seq_len_kv=seq_len_kv, pack_gqa=True, return_stats=True)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=s_q > 1, bottom_right=s_q > 1, seq_kv_lens=seq_len_kv.flatten(), return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
+
+
+@_skip_pack_gqa_on_rubin
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_pack_gqa_knob_contract():
     """pack_gqa is honored-or-ineligible: no packed plan exists for MHA or a
-    ratio that does not divide tile_m, and an unpacked plan always does."""
+    ratio that shares no factor with tile_m, a ratio that shares one but does
+    not divide it packs that factor (partial PackGQA), and an unpacked plan
+    always exists."""
     _require_dsl()
     import cudnn
 
@@ -1233,11 +1264,18 @@ def test_dsl_sm100_pack_gqa_knob_contract():
     # MHA: only unpacked plans.
     pg = _plans_for(8, 8, 64)
     assert pg and True not in pg, f"MHA graph must not rank a packed plan; got {pg}"
-    # ratios that do not divide tile_m (full-ratio contract): only unpacked plans.
+    # ratios with no factor in common with tile_m (G=3, G=5): only unpacked plans.
     pg = _plans_for(6, 2, 64)
     assert pg and True not in pg, f"ratio-3 graph must not rank a packed plan; got {pg}"
+    pg = _plans_for(10, 2, 64)
+    assert pg and True not in pg, f"ratio-5 graph must not rank a packed plan; got {pg}"
+    # INVERTED (partial PackGQA): a ratio that shares a factor with tile_m but
+    # does not divide it packs that factor (G=6 -> 2 heads per row group,
+    # G=12 -> 4) and ranks packed first at small s_q like any other GQA group.
     pg = _plans_for(12, 2, 64)
-    assert pg and True not in pg, f"ratio-6 graph must not rank a packed plan; got {pg}"
+    assert pg[0] is True and False in pg, f"ratio-6 graph should rank packed first with unpacked runner-up; got {pg}"
+    pg = _plans_for(24, 2, 64)
+    assert pg[0] is True and False in pg, f"ratio-12 graph should rank packed first with unpacked runner-up; got {pg}"
     # GQA small s_q (s_q < the CGA tile): both variants ranked, packed
     # first — the rule is shape-only, so no batch/SM-count staging needed.
     pg = _plans_for(64, 8, 64)

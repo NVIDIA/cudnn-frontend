@@ -73,6 +73,7 @@ from cudnn.sdpa.fwd.engines import (
     effective_cgas,
     effective_sched_policies,
     mismatch,
+    pack_gqa_partial,
 )
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
@@ -647,13 +648,14 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     the batch is dense, the graph carries no fused epilogue gate (its per-head
     gate tile cannot address a packed tile's interleaved rows -- mismatch()
     declines the same pair), there is a group to pack and the ratio divides
-    the tile."""
+    the tile -- or, on a flavor with partial PackGQA, shares a factor with it
+    (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked)."""
     return (
         True in caps.pack_gqas
         and not facts.thd
         and not facts.has_epilogue_gate
         and facts.h_q != facts.h_kv
-        and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m)
+        and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts))
     )
 
 
