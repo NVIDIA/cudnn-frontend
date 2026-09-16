@@ -952,20 +952,20 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                 for (int i = 0; i < 4; ++i) ra[rh][i] = pack2(r[rh][2 * i], r[rh][2 * i + 1]);
             }
         }
-        const uint64_t dz = gdesc16(R.z), dkg = gdesc64(R.kg);
+        const uint64_t dz = gdesc16(R.z), d_kg = gdesc64(R.kg);
         wg_fence();
         if (zero_start) {
 #pragma unroll
             for (int rh = 0; rh < 2; ++rh) {
-                wg64_zero(st[2 * rh + 0], ra[rh], dkg);
-                wg64_zero(st[2 * rh + 1], ra[rh], dkg + 128);
+                wg64_zero(st[2 * rh + 0], ra[rh], d_kg);
+                wg64_zero(st[2 * rh + 1], ra[rh], d_kg + 128);
             }
         } else {
 #pragma unroll
             for (int rh = 0; rh < 2; ++rh) {
                 wg16_add(out[rh], ra[rh], dz);
-                wg64_add(st[2 * rh + 0], ra[rh], dkg);
-                wg64_add(st[2 * rh + 1], ra[rh], dkg + 128);
+                wg64_add(st[2 * rh + 0], ra[rh], d_kg);
+                wg64_add(st[2 * rh + 1], ra[rh], d_kg + 128);
             }
         }
         wg_commit();
