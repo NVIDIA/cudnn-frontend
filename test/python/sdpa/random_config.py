@@ -104,6 +104,12 @@ class ExecConfig:
     is_alibi: bool = None
     is_infer: bool = True
     is_paged: bool = False
+    # Paged only: NaN-fill every K/V pool page no per-batch seq_len_kv reaches (a dead
+    # block-table slot), so an engine that dereferences it poisons O. Opt-in because it
+    # is a FROST-kernel promise (TMA-OOB page -1 past the live pages), not the paged
+    # contract: the backend engine loads and masks whole tile-rounded page ranges and
+    # needs finite data there. Set by tests pinned to a FROST paged engine.
+    paged_nan_dead_pages: bool = False
     is_bias: bool = None
     is_block_mask: bool = None
     is_padding: bool = None
@@ -619,10 +625,14 @@ class RandomHiddenDimSize:
         d_v_max: int,
         head_dim_distribution: dict[Any, int],
         with_high_probability: Optional[List[tuple[int, int]]] = None,
+        multiple_of: int = 8,
     ):
 
-        self.d_qk_gen = RandomIntValue(min=d_qk_min, max=d_qk_max, multiple_of=8)
-        self.d_v_gen = RandomIntValue(min=d_v_min, max=d_v_max, multiple_of=8)
+        # multiple_of: the head-dim granularity of the random draw (8, the default, keeps
+        # every existing seed's sequence; the fp8 graphs need 16, so their sweeps pass 16
+        # rather than skipping the draws the harness would reject).
+        self.d_qk_gen = RandomIntValue(min=d_qk_min, max=d_qk_max, multiple_of=multiple_of)
+        self.d_v_gen = RandomIntValue(min=d_v_min, max=d_v_max, multiple_of=multiple_of)
         self.distribution = RandomChoice(head_dim_distribution)
         self.with_high_probability = with_high_probability
 
