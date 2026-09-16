@@ -51,7 +51,15 @@ quantized gated O carries no ``scale_o`` -- the adapter documents the same.
 ``Amax_O`` is a compile-time fact: ``compile(has_amax=False)`` None-specializes
 ``amax_o_tensor`` and folds the per-element |o| fold and the atomicMax out (a
 graph that does not request ``Amax_O`` pays nothing for it).  When present, the
-amax is of the GATED, SELECTED pre-cast value.
+amax is of the UNGATED, dead-row-SELECTED fp32 pre-cast O in the O's OWN units
+(this kernel has no per-tensor ``scale_o`` -- the block scales dequantize
+in-MMA -- so it is the amax of the UNSCALED normalised O, the same units the
+ungated MXFP8 row has always published) -- the sdpa NODE's output, which on the
+graph precedes the ``sigmoid``/``mul`` tail, so requesting ``Amax_O`` and
+changing G cannot move it (one contract for the graph path and the standalone
+``sample_gate`` adapter, and the same contract the per-tensor FP8 sibling
+carries).  Gated, the epilogue folds |h| with h = o*(inv_sum/2) -- EXACTLY half
+the ungated value -- and doubles the running max once per tile (corr_release).
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -2126,8 +2134,9 @@ def _correction_warp_group(
     scale) -- so a gated e4m3 O is UNSCALED (PR-B D8).  P14 catch-up flip on
     bmm2_done_phase_pair at end-of-tile is REQUIRED for multi-wave n_kv=1.
     Epilogue gate: O := O * sigmoid(G) folded into the o*inv_sum scale, before
-    the dead-row select and the output cast; amax (when requested) is of the
-    gated, selected value.
+    the dead-row select and the output cast; Amax_O (when requested) is of the
+    UNGATED, selected value -- the sdpa node's O, pre-gate and pre-quant, in
+    the O's own units (no per-tensor scale_o on this path).
     """
     nvvm.barrier_cta_sync(barrier_id=2, thread_count=32 * (CFG.CORRECTION_WARPS + 1))
 
@@ -2405,19 +2414,41 @@ def _correction_warp_group(
                 # can be a NaN bit pattern and NaN * 0 = NaN, so the gate must
                 # never be folded into the scale as a multiply-by-zero
                 # (sdpa-invariants.md S2).  The select also keeps the NaN out of
-                # the amax fold, which would otherwise poison the graph's Amax_O
-                # for every other row.  Order per element: gate -> SELECT ->
-                # [amax fold iff requested] -> output cast (`.to(...)`, for e4m3
-                # cvt.rn.satfinite -- never fp32_to_fp8_pack + store_swizzled,
-                # which VALUE-casts the packed words).  Statement-level loop:
-                # range_constexpr is not preprocessed inside a comprehension.
+                # the ungated amax fold, which would otherwise poison the graph's
+                # Amax_O for every other row.  Order per element on the UNGATED
+                # arm: SELECT -> [amax fold iff requested] -> output cast
+                # (`.to(...)`, for e4m3 cvt.rn.satfinite -- never
+                # fp32_to_fp8_pack + store_swizzled, which VALUE-casts the packed
+                # words); the gated arm folds |h| BEFORE the select and selects
+                # the finished accumulator once per tile at corr_release (below).
+                #
+                # Amax_O is the amax of the UNGATED normalised O -- the sdpa
+                # NODE's output, which on the graph PRECEDES the sigmoid/mul
+                # tail, so changing G must not move it (it is a statistic of
+                # the upstream node; the quantized O is still the gated value).
+                # Units: this kernel has no per-tensor scale_o (the block scales
+                # dequantize in-MMA), so the amax is of the UNSCALED normalised O
+                # -- the O's own units, exactly what the ungated MXFP8 row has
+                # always published (the per-tensor FP8 sibling's is in scale_o
+                # units; the contract is otherwise the same, PR #1102 round 1).
+                # Ungated arm: fold the selected `_e`, unchanged.  Gated arm:
+                # `_e` is h*tanh(g/2) + h, so fold |h| = |o_scaled[i]| instead.
+                # Exact: h = o * (inv_sum * 0.5) rounds to 0.5 * RN(o * inv_sum)
+                # because a power-of-two scale commutes with fp32 rounding (no
+                # subnormals at these magnitudes: 1/S_kv <= inv_sum <= 1 since
+                # 1 <= sum <= S_kv), and max is positively homogeneous, so
+                # 2 * max|h| == max|u| bit-exactly.  The x2 and the dead-row
+                # select land ONCE per tile at corr_release (h is the
+                # UN-selected value, whose residue can be NaN on a dead row) --
+                # zero extra per-element ops versus the gated-value fold.
+                # Statement-level loop: range_constexpr is not preprocessed
+                # inside a comprehension.
                 _o_elems = []
                 for _i in cutlass.range_constexpr(O_CHUNK):
                     _e = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), _vals[_i].ir_value()))
                     if cutlass.const_expr(amax_o_tensor is not None):
-                        # The amax of the GATED, SELECTED value (output units):
-                        # the quantized O is the gated value, so its amax must match.
-                        _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                        _a = o_scaled[_i] if cutlass.const_expr(CFG.EPILOGUE_GATE) else _e
+                        _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_a, -_a))
                     _o_elems.append(_e)
                 o_out = cutlass.Vector.from_elements(tuple(_o_elems), cutlass.Float32).to(OUT_STORAGE_DTYPE)
 
@@ -2451,6 +2482,20 @@ def _correction_warp_group(
             bars.mb_gate_empty.arrive()
 
         if cutlass.const_expr(amax_o_tensor is not None):
+            if cutlass.const_expr(CFG.EPILOGUE_GATE):
+                # Gated: the per-chunk fold consumed |h| (corr_chunk), so the
+                # tile's ungated amax is 2 * max|h| -- exact (h == u/2 in fp32,
+                # x2 is exact).  The dead-row / empty-KV select the ungated arm
+                # applies per element is applied HERE once per tile instead:
+                # `_kv_empty` is per lane (= per q row) and includes the
+                # padded-Q trim, whose rows pass `q_row_global < q_row_limit`
+                # under the dense `seqlen_q` yet must contribute 0 (their h is
+                # inv_sum=0 times a residue that can be NaN), exactly as their
+                # selected `_e` does on the ungated arm.  Folds out at
+                # EPILOGUE_GATE=0.
+                _amax_o_local = cutlass.Float32(
+                    arith.select(_kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), (_amax_o_local * cutlass.Float32(2.0)).ir_value())
+                )
             if q_row_global < q_row_limit:
                 nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 

@@ -215,8 +215,12 @@ def _run(
 
     Append-only knobs (PR-B): ``gate`` (a bf16 BHSD-logical tensor of O's shape)
     adds the epilogue-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul`` and
-    folds sigmoid(G) into the reference; ``amax=False`` leaves ``Amax_O`` a
-    virtual (unrequested) port, which the engine folds out (has_amax_o=False).
+    folds sigmoid(G) into the returned ``reference`` (what O must match); the
+    returned ``amax`` is the graph's ``Amax_O``, an output of the sdpa NODE that
+    precedes the tail, so its reference is the UNGATED O's amax -- take it from
+    a no-gate run's ``reference`` on the same problem.  ``amax=False`` leaves
+    ``Amax_O`` a virtual (unrequested) port, which the engine folds out
+    (has_amax_o=False).
 
     Returns ``_RunResult`` or, when ``return_lse`` is set,
     ``_RunWithStatsResult``.
@@ -599,23 +603,46 @@ def test_mxfp8_gate_tail_graph_api(out_key):
     """Rubin graph-path e2e for the MXFP8 row's gate claim (PR-B): the 3-node tail
     on ``sdpa_mxfp8`` with a bf16 G (the only gate dtype the row lists), bf16 and
     e4m3 O -- the e4m3 O is UNSCALED (the block-scale kernel has no per-tensor
-    scale_o).  ``Amax_O`` is the amax of the GATED value and a COMPILE-TIME fact:
-    a graph that does not request it (``amax=False`` -> has_amax_o=False, the
-    atomic folded out) produces a BITWISE identical O."""
+    scale_o).  ``Amax_O`` is an output of the sdpa NODE, which precedes the
+    sigmoid/mul tail, so it is the amax of the UNGATED normalised O (pre-gate,
+    pre-quant, in the O's own units): identical for G = +1e4 (sigmoid 1) and
+    G = -1e4 (sigmoid 0, the returned O ~0), and identical to the no-gate
+    graph's -- the fused kernel folds |h| = |u/2| and doubles once per tile,
+    bit-exact in fp32.  It is also a COMPILE-TIME fact: a graph that does not
+    request it (``amax=False`` -> has_amax_o=False, the atomic folded out)
+    produces a BITWISE identical O."""
     scale = 1.0 / math.sqrt(256)
     gate = (torch.randn(1, 512, 8, 256, device="cuda") * 2.0).to(torch.bfloat16).transpose(1, 2)
-    runs = {}
-    for amax in (True, False):
-        torch.manual_seed(0)  # _run draws Q/K/V from the global RNG: both specializations must see the same problem
-        runs[amax] = _run(1, 8, 8, 512, "e4m3", _OUT[out_key], scale=scale, sdpa_kwargs=dict(use_causal_mask=True), d_qk=256, d_v=256, gate=gate, amax=amax)
+
+    def _graph(gate_t, amax):
+        torch.manual_seed(0)  # _run draws Q/K/V from the global RNG: every specialization must see the same problem
+        return _run(1, 8, 8, 512, "e4m3", _OUT[out_key], scale=scale, sdpa_kwargs=dict(use_causal_mask=True), d_qk=256, d_v=256, gate=gate_t, amax=amax)
+
+    runs = {amax: _graph(gate, amax) for amax in (True, False)}
     out, o_ref, a_o = runs[True]
     assert torch.isfinite(out.float()).all(), "unwritten / non-finite O cells"
-    _check(out, o_ref, _OUT[out_key], "e4m3", d_qk=256)  # the reference carries sigmoid(G)
-    assert a_o.item() > 0.0
-    if _OUT[out_key] is torch.bfloat16:
-        torch.testing.assert_close(a_o.item(), out.float().abs().max().item(), atol=0.0, rtol=1e-2)  # the amax of the GATED O
+    _check(out, o_ref, _OUT[out_key], "e4m3", d_qk=256)  # the reference O carries sigmoid(G); the reference amax is the UNGATED O's (below)
     assert torch.equal(runs[True].output, runs[False].output), "has_amax_o=False must fold only the Amax_O write out"
     assert runs[False].amax.item() == 0.0, "the unrequested Amax_O buffer was never bound, so never written"
+    # Amax_O belongs to the sdpa node, so G must not move it: sigmoid(-1e4) == 0 zeroes the O the graph
+    # returns while its Amax_O stays the ungated amax; sigmoid(+1e4) == 1 returns the ungated O; both -- and
+    # the random-G run above -- equal the no-gate graph's Amax_O bit-for-bit (2 * max|u/2| == max|u| in
+    # fp32), not merely within the 0.03 bound.  The no-gate run's ``reference`` IS the ungated O, so its
+    # amax is the reference for every gated run (same seed, same problem).
+    no_gate = _graph(None, True)
+    pos = _graph(torch.full_like(gate, 1e4), True)
+    neg = _graph(torch.full_like(gate, -1e4), True)
+    ungated_ref_amax = no_gate.reference.abs().max().item()
+    assert neg.output.float().abs().max().item() <= 1e-3, "sigmoid(G) == 0 must zero the O the graph returns"
+    assert ungated_ref_amax > 0.06, f"the probe's ungated amax {ungated_ref_amax:.4f} is too small to tell from zero -- reshape it"
+    assert abs(no_gate.amax.item() - ungated_ref_amax) <= 0.03, f"no-gate Amax_O {no_gate.amax.item():.4f} vs ref {ungated_ref_amax:.4f}"
+    assert (
+        abs(a_o.item() - ungated_ref_amax) <= 0.03
+    ), f"gated Amax_O {a_o.item():.4f} vs the UNGATED reference {ungated_ref_amax:.4f}: the kernel reduced the GATED O"
+    assert pos.amax.item() == neg.amax.item() == a_o.item() == no_gate.amax.item(), (
+        f"Amax_O must be G-independent and equal the no-gate graph's: +1e4 {pos.amax.item():.6f}, -1e4 {neg.amax.item():.6f}, "
+        f"random {a_o.item():.6f}, none {no_gate.amax.item():.6f}"
+    )
 
 
 @pytest.mark.L0

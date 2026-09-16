@@ -398,7 +398,15 @@ it). The MXFP8 kernel has no per-tensor `scale_o`, so a gated **e4m3 O is writte
 UNSCALED** — the same unscaled e4m3 O the ungated MXFP8 row writes; a scaled
 quantized gated O needs a bf16 O and a downstream quantize. Numerics as on FP8:
 gate on the fp32 accumulator, dead-row select after the gate fma, LSE bit-independent
-of the gate. Validated on the standalone adapter on EVERY dtype member the row claims
+of the gate, and `Amax_O`, when requested, is the amax of the UNGATED normalised O —
+the sdpa node's output, pre-gate and pre-quant, independent of G (the kernel folds
+|h| = |u/2| and doubles once per tile, bit-exact; the PR #1102 review-round-1
+contract) — in the O's OWN units, since this path has no `scale_o` (the same units
+the ungated MXFP8 row publishes; on FP8 they are `scale_o` units). Pinned by
+`test_sm107_mxfp8_gate_amax_is_a_compile_time_fact` (standalone adapter: G = ±1e4, a
+random G and the ungated specialization agree bit-for-bit) and
+`test_mxfp8_gate_tail_graph_api` (graph path: Amax_O(G=+1e4) == Amax_O(G=−1e4) ==
+Amax_O(no gate)). Validated on the standalone adapter on EVERY dtype member the row claims
 with the gate -- inputs {e4m3, e5m2} x outputs {fp16, bf16, e4m3, e5m2}, one Rubin
 launch each against the dequantized oracle (`test_sm107_mxfp8_gate_matches_the_dequant_oracle`,
 e4m3-in also dense 512 + causal 1000 at bf16 and e4m3 O; e5m2-in at the suite's 8e-2

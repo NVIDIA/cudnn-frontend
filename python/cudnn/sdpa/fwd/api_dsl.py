@@ -498,15 +498,17 @@ class SdpaFwdDsl(APIBase):
         attention block's gate branch). Compile-time: it selects a distinct
         kernel specialization (``TemplateParams.epilogue_gate``), so an
         ``execute()`` must then pass ``gate=`` and one built without it must
-        not. Served by the Rubin (SM107) d256 f16/bf16 and per-tensor FP8
-        kernels only; every other adapter / flavor declines it with
-        :class:`NotImplementedError` from ``check_support``. The gate is Q's
-        dtype on the half kernels and ``bfloat16`` on the FP8 one. On the FP8
-        kernel the O quantization applies to the GATED value, while ``Amax_O``
-        (when requested) is the amax of the UNGATED normalised O -- the sdpa
-        node's own output, which precedes the ``sigmoid``/``mul`` tail on the
-        graph -- so it is independent of ``gate``; the graph path and this
-        adapter share that one contract.
+        not. Served by the Rubin (SM107) d256 f16/bf16, per-tensor FP8 and
+        block-scale MXFP8 kernels only; every other adapter / flavor declines
+        it with :class:`NotImplementedError` from ``check_support``. The gate
+        is Q's dtype on the half kernels and ``bfloat16`` on the quantized
+        (FP8 / MXFP8) ones. On the quantized kernels the O quantization applies
+        to the GATED value, while ``Amax_O`` (when requested) is the amax of
+        the UNGATED normalised O -- the sdpa node's own output, which precedes
+        the ``sigmoid``/``mul`` tail on the graph -- so it is independent of
+        ``gate``; the graph path and this adapter share that one contract (in
+        ``scale_o`` units on FP8; in the O's own units on MXFP8, which has no
+        per-tensor ``scale_o``).
 
         ``has_amax_o``: quantized (FP8) path only. ``True`` (default) keeps the
         legacy contract -- ``amax_o`` at ``execute()`` is optional and an
@@ -1771,6 +1773,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # `scale_o` handed to execute() is not applied on the MXFP8 path (as
             # today, gate or no gate).  Callers that need a scaled quantized O
             # keep a bf16 O and quantize downstream (gated-attention block D8).
+            # Amax_O (when requested) follows the FP8 path's contract: the amax of
+            # the UNGATED normalised O -- the sdpa node's output, independent of G
+            # -- in the O's own units here (there is no scale_o to divide by).
             self._not_implemented_error_if(self.thd, "epilogue gate fusion is dense-only (no THD gate descriptor)")
             self._not_implemented_error_if(self.paged, "epilogue gate fusion with paged KV is not wired")
             self._not_implemented_error_if(
@@ -3061,7 +3066,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         SF tensors come from cuDNN in F8_128x4 layout and are reshaped into the
         kernel's per-tile view; ``Amax_O`` (if requested) is produced in-kernel
-        (atomicMax over the pre-cast fp32 output rows) -- unless the
+        (atomicMax over the pre-cast fp32 output rows; with an epilogue gate it
+        is STILL the amax of the UNGATED, dead-row-selected O -- the sdpa node's
+        output, independent of ``gate``: the kernel folds |h| = |u/2| and
+        doubles once per tile -- in the O's own units, this path having no
+        per-tensor scale_o) -- unless the
         specialization folded it out (``has_amax_o=False`` on a kernel that
         carries ``has_amax``, the Rubin d256 one), in which case the amax slot
         binds None and nothing is reset. THD/varlen rides the
