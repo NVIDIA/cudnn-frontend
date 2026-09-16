@@ -1704,6 +1704,9 @@ def _correction_warp_group(
             lse_val = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
             inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
             _kv_empty = _kv_empty | row_trim
+        # Convert only the final Stats; -inf padding stays -inf.
+        if cutlass.const_expr(CFG.STATS_LOG2):
+            lse_val = lse_val * cutlass.Float32(1.4426950408889634)
         if cutlass.const_expr(CFG.THD_VARLEN):
             # THD: sequence-local row; LSE packed [1,QH,T] → [0, head, cu_q[b]+local].
             _cu = cutlass.make_array_view(seq_kv_lens_tensor)

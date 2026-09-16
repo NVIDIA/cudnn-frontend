@@ -224,7 +224,7 @@ class Capabilities:
     score_sum_exp: bool = False  # per-row/tile sum-of-exp side output
     dynamic_scale: bool = False
     unfuse_fma: bool = False
-    # Stats written as max + log2(sum_exp) (sdpa(stats_use_log2=True)): the
+    # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)): the
     # kernel epilogue (or the split-KV combine) scales the LSE by log2(e).
     stats_log2: bool = False
     seq_q_trim: bool = False
@@ -789,6 +789,7 @@ def _sm107_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             # The LSE store is const_expr'd out on a None lse_tensor, and
             # compile(has_lse=False) binds no dummy buffer at any level -- so a
             # stats-less graph reports get_workspace_size() == 0.
@@ -1169,6 +1170,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             padded_stats=True,
             # See the f16 SM107 row: has_lse=False is a real specialization on
             # every Rubin kernel, not an accepted-and-ignored flag.
@@ -1360,7 +1362,7 @@ def lower_dsl_prefill(
     ``api_type``; descriptor conversion, adapter lifecycle, variant-pack binding,
     and launch construction remain shared here.
     """
-    from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, ws_align
+    from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 
     # KV-tail via synthesized padding (see Capabilities.skv_tail_via_padding):
     # a ragged S_kv with no mask covering the tail is served through the
@@ -1598,15 +1600,9 @@ def lower_dsl_prefill(
         return None
 
     def _execute(variant_pack, workspace=None, stream=None):
-        # The kernels launch on the handle's stream; the adapters' torch-side
-        # glue (O staging copy-back, dummy / carved-scratch fills) must ride the
-        # same stream or the copy-back can read O_scratch before the kernel
-        # wrote it (garbage O under a non-default handle stream).
-        if stream is None:
-            return _execute_on_stream(variant_pack, workspace, stream)
-        import torch
-
-        with torch.cuda.stream(torch.cuda.ExternalStream(int(stream))):
+        # Adapter copies, scratch initialization and allocator lifetime must
+        # follow the same stream as the kernels launched through the handle.
+        with _torch_stream_context(stream, api.q_desc.device):
             return _execute_on_stream(variant_pack, workspace, stream)
 
     # Executor contract (engine._FrostSdpaFwdPlan): a non-zero workspace_bytes

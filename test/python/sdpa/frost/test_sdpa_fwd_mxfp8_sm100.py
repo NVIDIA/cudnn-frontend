@@ -1857,3 +1857,39 @@ def test_mxfp8_thd_nonfinite_v_sf_padding(d_qk, in_key, monkeypatch):
     )
     assert torch.isfinite(out).all()
     _check(out, ref, torch.float16, in_key, d_qk=d_qk)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)])
+@torch_fork_set_rng(seed=931)
+def test_mxfp8_stats_log2_every_flavor(d_qk, d_v):
+    """Both bases agree with analytic constant logits on every kernel flavor.
+
+    Nonzero logits catch scaling only log(sum_exp) and forgetting the maximum.
+    The same inputs exercise both cache specializations and leave O unchanged.
+    """
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s = 1, 2, 256
+    qf = torch.full((b, h, s, d_qk), 0.125, device="cuda")
+    kf = torch.full_like(qf, 0.25)
+    vf = torch.full((b, h, s, d_v), 0.5, device="cuda")
+    q, sfq, dq, _ = _quantize(qf, b, h, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    k, sfk, dk, _ = _quantize(kf, b, h, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    v, sfv, dv, _ = _quantize(vf, b, h, s, d_v, torch.float8_e4m3fn, columnwise=True)
+    expected = (q.float() * dq)[0, 0, 0].double().dot((k.float() * dk)[0, 0, 0].double()) * d_qk**-0.5 + math.log(s)
+    q, k, v = [x.transpose(1, 2).contiguous().transpose(1, 2) for x in (q, k, v)]
+    outputs = []
+    for log2 in (False, True):
+        o = torch.empty(b, s, h, d_v, device="cuda", dtype=torch.float16).transpose(1, 2)
+        lse = torch.full((b, h, s), float("nan"), device="cuda")
+        api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, scale_softmax=d_qk**-0.5, stats_log2=log2, split_kv=1)
+        assert api.check_support()
+        api.compile()
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        torch.cuda.synchronize()
+        want = expected * (math.log2(math.e) if log2 else 1.0)
+        torch.testing.assert_close(lse, torch.full_like(lse, want.item()), atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(o, torch.full_like(o, 0.5), atol=1e-2, rtol=1e-2)
+        outputs.append(o)
+    torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)

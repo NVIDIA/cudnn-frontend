@@ -454,7 +454,6 @@ class SdpaFwdDsl(APIBase):
         cu_seq_q_lens: bool = False,
         cu_seq_kv_lens: bool = False,
         has_sink: bool = False,
-        stats_log2: bool = False,
         thd: bool = False,
         max_total_seq_len_q: Optional[int] = None,
         max_total_seq_len_kv: Optional[int] = None,
@@ -474,6 +473,7 @@ class SdpaFwdDsl(APIBase):
         thd_stats_padded: bool = False,
         sample_amax_o: Optional[torch.Tensor | TensorDesc] = None,
         pv_bf16: bool = False,
+        stats_log2: bool = False,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -3677,6 +3677,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 # so the combine owns the amax of the RECOMBINED O.
                 has_amax=self._fp8,
                 lse_stride=self._lse_stride,
+                stats_log2=self.stats_log2,
             )
         self._logger.debug("compile completed")
 

@@ -293,6 +293,7 @@ red (2026-09-08).
 | Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Base-2 stats (`stats_use_log2`) | ❔ | ❔ | ❔ | ❔ | ❔ | — |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ | ❌ |
 | Split-KV | fp8 only | fp8 only | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ |
@@ -476,6 +477,9 @@ field that declines it, so the skip inverts when the feature lands.
 
 ---
 
+Base-2 stats are wired across the Rubin dtype families, including the separate
+Rubin config factories. Target-SM107 numerical validation is still required.
+
 ## SM120 / SM121 (Blackwell GeForce, cc 12.0–12.9)
 
 Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
@@ -510,12 +514,16 @@ FP8 FPROP and BPROP remain limited to 256.
 | Sliding window (left) | ✅ | ✅ | ✅ |
 | Padding mask (+ stats, + padded-Q trim) | ✅ | ✅ | ✅ |
 | Attention sink / dSink | ✅ | ✅ | ✅ / ✅ |
-| Base-2 stats (`stats_use_log2`) | ✅ | ✅ | — |
+| Base-2 stats (`stats_use_log2`) | ❔ | ❔ | — |
 | Bias / dBias | ❌ | ❌ | ✅ / ✅ |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ |
 | Deterministic (`use_deterministic_algorithm`) | — | — | ✅ |
 | Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ |
+
+Base-2 stats are wired into all three f16 templates and the FP8 template,
+including the final Split-KV combine. Target-SM120 numerical validation remains
+required; local SM80/SM100 results do not validate these kernels.
 
 ᵃ **Head TILE granule and head-DIM alignment are different numbers — the column
 headers quote the head-dim rule.** `GENERAL_HEAD_TILES` steps by 16 (f16), and

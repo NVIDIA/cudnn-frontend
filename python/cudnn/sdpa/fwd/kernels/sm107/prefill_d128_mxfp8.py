@@ -2468,6 +2468,9 @@ def _correction_warp_group(
                 lse_val = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
                 inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
                 _kv_empty = _kv_empty | row_trim
+            # Convert only the final Stats; -inf padding stays -inf.
+            if cutlass.const_expr(CFG.STATS_LOG2):
+                lse_val = lse_val * cutlass.Float32(1.4426950408889634)
             # ONE row bound for BOTH the LSE write and the amax atomic below.
             # They must stay tied: amax is an atomicMax, which only GROWS, so a
             # single padded row folded in permanently inflates the graph's

@@ -193,7 +193,6 @@ class SM120FusedMultiHeadAttentionForward:
         seq_q_lens_present: bool = False,
         seq_kv_lens_present: bool = False,
         has_sink: bool = False,
-        stats_log2: bool = False,
         thd_varlen: bool = False,
         split_kv: int = 1,
         thd_lse_head_major: bool = False,
@@ -205,6 +204,7 @@ class SM120FusedMultiHeadAttentionForward:
         q_tile: int = SEQ_Q_TILES[0],
         pack_gqa: bool = False,
         qh_per_kh: int = 1,
+        stats_log2: bool = False,
     ):
         """Initialize the FMHA prefill kernel configuration.
 

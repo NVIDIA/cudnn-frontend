@@ -78,7 +78,7 @@ class TemplateParams:
     window_right: Optional[int] = None
     bottom_right: bool = False
     has_sink: bool = False
-    # Stats written as max + log2(sum_exp) (sdpa(stats_use_log2=True)): the
+    # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)): the
     # epilogue scales the natural-log LSE by log2(e) right before the store.
     stats_log2: bool = False
     seq_kv_lens_present: bool = False

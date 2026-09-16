@@ -258,8 +258,6 @@ def _run_dsl_graph(
 
 def _check_dsl_sm100_strided_stats(d_qk, d_v, stats_use_log2=False):
     _require_dsl()
-    if torch.cuda.get_device_capability() == (10, 7):
-        pytest.skip("SM107 serves only the per-tensor FP8 d128 forward path")
     b, h, s = 2, 4, 128
     dtype = torch.float16
     scale = 1.0 / math.sqrt(d_qk)
@@ -288,10 +286,11 @@ def test_dsl_sm100_strided_stats(stats_use_log2):
 
 @pytest.mark.L1
 @pytest.mark.parametrize(("d_qk", "d_v"), [(192, 128), (256, 256), (512, 512)], ids=["d192_d128", "d256", "d512"])
+@pytest.mark.parametrize("stats_use_log2", [False, True], ids=["ln", "log2"])
 @torch_fork_set_rng(seed=59)
-def test_dsl_sm100_strided_stats_other_flavors(d_qk, d_v):
+def test_dsl_sm100_strided_stats_other_flavors(d_qk, d_v, stats_use_log2):
     """The remaining SM100 half flavors preserve dense Stats strides."""
-    _check_dsl_sm100_strided_stats(d_qk, d_v)
+    _check_dsl_sm100_strided_stats(d_qk, d_v, stats_use_log2=stats_use_log2)
 
 
 @pytest.mark.L0

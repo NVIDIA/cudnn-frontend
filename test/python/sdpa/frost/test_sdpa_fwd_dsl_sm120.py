@@ -1915,3 +1915,11 @@ def test_dsl_sm120_thd_padded_stats_execute_checks_the_buffer():
     for i, n in enumerate(lens.tolist()):
         assert torch.isfinite(lse[i, :, :n]).all(), f"batch {i}: valid rows not written"
         assert torch.isneginf(lse[i, :, n:]).all(), f"batch {i}: rows past the length are not -inf"
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("head_dim", [256, 512])
+@pytest.mark.parametrize("stats_use_log2", [False, True], ids=["ln", "log2"])
+@torch_fork_set_rng(seed=13)
+def test_dsl_sm120_wide_stats(head_dim, stats_use_log2):
+    _run_case(batch=2, h_q=4, h_kv=2, s_q=256, s_kv=256, head_dim=head_dim, check_stats=True, stats_use_log2=stats_use_log2, is_causal=True)

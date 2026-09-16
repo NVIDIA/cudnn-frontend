@@ -128,7 +128,7 @@ class TemplateParams:
     seq_q_lens_present: bool = False
     seq_kv_lens_present: bool = False
     has_sink: bool = False
-    # Stats written as max + log2(sum_exp) (sdpa(stats_use_log2=True)).
+    # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)).
     stats_log2: bool = False
     thd_varlen: bool = False
     sched_policy: int = SCHED_NATURAL

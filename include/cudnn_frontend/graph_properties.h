@@ -2110,7 +2110,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     }
 
     /// Convert the "Stats" (LSE) output from cuDNN's natural-log convention to base-2
-    /// (max + log2(sum_exp)), matching flash-attention-style kernels (fa2/fa3/trtllm-gen)
+    /// ((max + ln(sum_exp)) * log2(e)), matching flash-attention-style kernels (fa2/fa3/trtllm-gen)
     /// that fold log2(e) into their softmax scale. Only affects Stats; Max and Sum_exp (if
     /// requested instead) remain in their natural units.
     SDPA_attributes&

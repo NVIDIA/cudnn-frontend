@@ -266,7 +266,7 @@ class SdpaGraphFacts:
     page_size: int = 0
     has_alibi: bool = False
     has_unfuse_fma: bool = False
-    # sdpa(stats_use_log2=True): Stats requested as max + log2(sum_exp) instead of
+    # sdpa(stats_use_log2=True): Stats requested as (max + ln(sum_exp)) * log2(e) instead of
     # the natural-log form. A convention on the Stats output, not a math change;
     # an engine that writes natural-log stats must decline, not ignore it.
     has_stats_log2: bool = False
