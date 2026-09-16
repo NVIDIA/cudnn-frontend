@@ -244,16 +244,26 @@ decode graph runs unsplit, one cluster per (batch, KV head), until a sink-aware
 
 ᵈ **d256 decode tile (`sm100/decode_d256_f16.py`, 2026-09-16).** Same engine row,
 same graph contract, a second template: f16/bf16 d256 graphs (d_qk = d_v in
-(128, 256], the d256 envelope) whose packed Q rows fit 32 -- `S_q * G <= 32` with
-`G` the PackGQA group (16:1 at S_q <= 2, 8:1 at S_q <= 4, MHA at S_q <= 32) -- lower
-onto a swap-AB tile: KV tokens on the MMA M axis (128 keys per tile), the 16 or 32 Q
-rows on N, one cta_group::1 CTA per (KV-head group, batch, split), softmax reducing
-over TMEM lanes (4 warps per 16 Q columns), P^T through a swizzled SMEM tile, O^T in
-TMEM. Dense padded and paged caches, every mask the d256 row serves (padding /
-top-left and bottom-right causal / SWA / right band, dense padded-Q trim), sink
-(dense), Stats natural or base-2, KV split partials for `split_combine_sm100`. THD,
-fp8/mxfp8 and `S_q * G > 32` stay on the prefill tile; `TILE_CGA_M` / `SCHED_POLICY`
-knobs are accepted and unused there.
+(128, 256], the d256 envelope) whose packed Q rows fit 16 -- `S_q * G <= 16` with
+`G` the PackGQA group (16:1 at S_q = 1, 8:1 at S_q <= 2, 4:1 at S_q <= 4, MHA at
+S_q <= 16; `config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS`) -- lower onto a swap-AB
+tile: KV tokens on the MMA M axis (128 keys per tile), the 16 Q rows on N, one
+cta_group::1 CTA per (KV-head group, batch, split), softmax reducing over TMEM
+lanes (4 warps per 16 Q columns), P^T through a swizzled SMEM tile, O^T in TMEM.
+Dense padded, dense unpadded (synthesized KV tail) and paged caches, every mask
+the d256 row serves (padding / top-left and bottom-right causal / SWA / right
+band, dense padded-Q trim), sink (dense), Stats natural or base-2, KV split
+partials for `split_combine_sm100`. THD, fp8/mxfp8 and `S_q * G > 16` stay on the
+prefill tile; `TILE_CGA_M` / `SCHED_POLICY` knobs are accepted and unused there.
+The template also compiles a **32-column tile** (`N_Q = 32`: two softmax column
+groups, 8 softmax warps over the same 128 TMEM lanes) that is driven and checked
+at the template level but **not routed**: it is issue-bound per CTA -- 2.8 us per
+KV tile against the 16-column tile's 1.75 us, 90 us unsplit at the b=32 x 2
+KV-head x 4096-key S_q=2 MTP step where the prefill tile takes 66 us -- and its
+split-2 plan (58 us of GPU time) costs an eager caller 96-103 us per execute, so
+routing it would regress uncaptured MTP callers; `S_q * G` in (16, 32] stays on
+the prefill tile (pinned by the routing-boundary tests) until its per-CTA issue
+rate is fixed.
 
 Split policy (`heuristics.choose_decode_tile_split_kv`): the tile has its own cost
 model -- per-CTA streaming until the concurrent K/V streams saturate HBM, plus the
@@ -261,30 +271,39 @@ combine pass -- and the LEADING plan charges the split path's second host launch
 (a second CuTe-DSL launch plus slab carving: ~30 us more per eager `graph.execute`
 on the Python launch path, 62 -> 92 us), so it splits only where the GPU saving
 also covers that; the captured caller's optimum, when different, is the runner-up
-plan (`select_plan`). On the 16-column tile (`S_q * G <= 16`) the b=32 x 2 KV-head
-x 4096-key serving shape runs unsplit, b=8 splits 8 ways, b=128 stays unsplit,
-s_kv=16384 splits 2 ways. The 32-column tile (`S_q * G` in (16, 32], e.g. the
-S_q=2 MTP step) is issue-bound per CTA (1.6x the per-tile cost of the 16-column
-tile: 90.2 vs 57.1 us unsplit) and splits 2 ways at the serving shape.
+plan (`select_plan`). On the 16-column tile the b=32 x 2 KV-head x 4096-key
+serving shape runs unsplit, b=8 splits 8 ways, b=128 stays unsplit, s_kv=16384
+splits 2 ways. The unrouted 32-column tile's fit (1.6x the per-tile cost) stays in
+the model for when it is routed.
 
 Measured on B200 (SM100, 148 SMs), bf16, 32/2 heads, d256, page 16, prefill tile
 -> decode tile as the heuristics lead, two numbers per cell: eager back-to-back
 `graph.execute` (host time included: what an UNCAPTURED caller sees) / CUDA-graph
-replay (GPU only). b=32, s_kv=4096, S_q=1, full lengths: 64.6 / 63.7 -> 57.2 / 56.4
-us (the split-2 runner-up replays at 51.5 us, 1.24x, but runs 95-102 us eager);
-mixed lengths: 60.7 / 58.4 -> 56.8 / 55.3 us (runner-up replay 45.0 us); b=8: 99.3
-/ 26.7 (the prefill model splits 4 ways there) -> 93.7 / 22.6 us (split 8); b=128:
-251.7 / 333.6 -> 161.4 / 166.9 us; s_kv=16384: 245.1 / 265.2 -> 181.0 / 166.9 us
-(split 2); Qwen3-Next 16/2 b=32: 63.7 / 63.5 -> 59.3 / 55.7 us; Qwen3-Next 16/2
-b=64 s_kv=8192 mixed: 209.6 / 240.2 -> 159.2 / 143.5 us; page 64: 62.7 / 62.2 ->
-57.7 / 53.4 us. S_q=2 bottom-right (32-column tile, split 2 leads): 66.2 / 65.7 ->
-102.9 / 58.5 us -- a replay win and an EAGER REGRESSION: that tile streams at
-2.8 us per KV tile per CTA (90.2 us unsplit in either regime), so an uncaptured
-MTP caller pays for the split's second launch either way; the 32-column softmax's
-per-CTA issue rate is the open kernel item. The main kernel alone reaches
-trtllm-gen's 46 us at split 2; the shared combine pass (~6 us) is the remaining
-captured-path gap. Not a Capabilities change (the row's claims are unchanged; this
-documents the lowering), Rule S2.
+replay (GPU only). The eager readings are from an otherwise idle GPU: that number
+is Python-host-bound and inflates 2-6x when other processes share the device (a
+551 us reading of the s_kv=16384 case in a contended window re-measured at 164 us);
+the replay numbers are stable across windows to about 1 us. b=32, s_kv=4096, S_q=1,
+full lengths: 64.3-64.6 / 63.7 -> 57.2-59.2 / 56.2-56.9 us (the split-2 runner-up
+replays at 51.3 us, 1.24x, but runs 95-107 us eager); mixed lengths: 57.0-60.7 /
+57.5-58.4 -> 55.8-58.0 / 55.4 us (runner-up replay 44.9 us); b=8: 99.3-99.8 /
+26.7-27.1 (the prefill model splits 4 ways there) -> 93.7-99.4 / 22.6 us (split 8;
+the unsplit runner-up 57.6 / 55.3); b=128: 250.4-251.7 / 286.7-333.6 -> 161.4-164.7
+/ 161.8-166.9 us; s_kv=16384: 245.1-252.4 / 265.2-343.7 -> 163.8-181.0 / 163.9-166.9
+us (split 2, host 96 us per execute; unsplit 199.7 / 199.9); Qwen3-Next 16/2 b=32:
+63.7-69.7 / 63.5-69.5 -> 56.8-60.0 / 55.6-56.0 us; Qwen3-Next 16/2 b=64 s_kv=8192
+mixed: 209.6-222.7 / 218.9-240.2 -> 137.0-159.2 / 138.6-143.5 us; page 64:
+62.7-64.4 / 62.1-70.0 -> 54.3-59.1 / 53.3 us. S_q=2 bottom-right at 32/2 (32
+packed rows) stays on the prefill tile: 66.1-67.0 / 65.9-66.1 us before and after
+(on the unrouted 32-column decode tile it measured 90.2 / 90.2 unsplit and 96-103 /
+58.5 split 2). Dense 16-row graphs the rule newly takes, replay, prefill -> decode:
+MHA 8/8 b=8 S_q=16 s_kv=2048 32.9 -> 29.6; MHA 32/32 b=1 S_q=16 s_kv=32768 243.5 ->
+179.6 (split 4), causal 16.5 -> 12.5; GQA 32/2 b=4 S_q=1 s_kv=32768 68.0 -> 60.6;
+GQA 32/2 b=32 S_q=1 s_kv=4096 61.8 -> 51.2; padded GQA 16/2 b=32 S_q=2 bottom-right
+52.8 -> 51.2 and 32/4 b=16 52.8 -> 49.2; MHA 64/64 b=1 S_q=16 s_kv=4096 62.4 ->
+51.4; synthesized KV tail S=300 14.4 -> 12.3, S=1000 20.5 -> 20.5. The main kernel
+alone reaches trtllm-gen's 46 us at split 2; the shared combine pass (~6 us) is the
+remaining captured-path gap. Not a Capabilities change (the row's claims are
+unchanged; this documents the lowering), Rule S2.
 
 ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**
 (`Capabilities.pack_gqa_partial_d_shapes = {(128, 128), (256, 256)}`, `Cfg.PACK_G`).

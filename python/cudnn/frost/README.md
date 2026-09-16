@@ -318,7 +318,7 @@ python/cudnn/
                                 an arch package is owned by that arch alone
         sm100/prefill_d256_f16.py     naming: <phase>_d<dim>_<dtype-family>.py
         sm100/decode_d256_f16.py      decode-shaped alternate of the d256 flavor
-                                      (S_q x packed heads <= 32 rows; swap-AB tile)
+                                      (S_q x packed heads <= 16 rows; swap-AB tile)
         sm100/prefill_d512_f16.py
         sm100/split_combine.py        the split-KV reduction pass
         sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)

@@ -452,7 +452,10 @@ def test_decode_tile_wide_q_tile_splits_the_serving_shape():
     """The same 64 units on the 32-column tile (S_q=2 x 16:1, the MTP step):
     a lone CTA there streams a tile 1.6x slower (90.2 vs 57.1 us unsplit), so
     split 2 saves ~32 us of GPU time -- enough to pay for the launch -- and
-    leads in both regimes; a saturated launch still does not split."""
+    leads in both regimes; a saturated launch still does not split.  The
+    adapter does not route that tile today (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS
+    keeps (16, 32] rows on the prefill tile: even split, 96-103 us eager against
+    the prefill tile's 66 us); its fit stays pinned for when it is routed."""
     assert _decode_tile(64, 4096, q_tile=32) == 2
     assert _decode_tile(64, 4096, q_tile=32, launch_cost=0.0) == 2
     assert _decode_tile(16, 4096, q_tile=32) == 8

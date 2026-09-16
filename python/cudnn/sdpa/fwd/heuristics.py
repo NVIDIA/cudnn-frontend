@@ -301,7 +301,10 @@ _DECODE_TILE_CTA_COST = 1.0
 # two softmax column groups over the same 128 TMEM lanes, issue-bound where
 # the 16-column tile is bandwidth-bound): 64 CTAs x 32 tiles ran 90.2 us
 # against the 16-column tile's 57.1 us. HBM saturates at the same byte rate,
-# so a slower stream also needs proportionally more CTAs to reach it.
+# so a slower stream also needs proportionally more CTAs to reach it. That
+# tile is compiled but not routed today (the adapter keeps S_q x G in (16, 32]
+# on the prefill tile, config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS); its fit
+# stays here so routing it is a one-constant change.
 _DECODE_TILE_WIDE_Q_TILE_COST = 1.6
 # The shared sm100/split_combine pass over a decode-shaped grid: one combine
 # wave, ~6 us measured at b=32 x 32 heads.
@@ -356,7 +359,8 @@ def choose_decode_tile_split_kv(
     16-column tile the b=32 x 2 KV heads x 4096-key serving shape (6 us of GPU
     saving for 30 us of host time) stays unsplit while a small batch or a
     long KV (b=8; s_kv=16384 at b=32) still splits, and the 32-column tile --
-    whose lone CTA is slow enough that the same shape saves ~32 us -- splits.
+    whose lone CTA is slow enough that the same shape saves ~32 us -- would
+    split (it is not routed today; see _DECODE_TILE_WIDE_Q_TILE_COST).
     ``launch_cost=0`` is the optimum of a caller replaying a captured CUDA
     graph.
 

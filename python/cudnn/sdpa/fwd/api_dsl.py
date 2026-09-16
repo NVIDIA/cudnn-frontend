@@ -1922,8 +1922,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         graph contract as prefill_d256_f16 (paged / dense, padding, causal
         bottom-right, SWA, right band, sink, Stats natural or base-2, dense
         padded-Q trim, split-KV partials) for f16/bf16 d256-flavor graphs whose
-        S_q x packed-heads rows fit its 16- or 32-wide N tile; everything else
-        (THD, quantized, Rubin, larger S_q) stays on the prefill tile.  The
+        S_q x packed-heads rows fit the routed 16-wide N tile
+        (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS: the 32-wide tile compiles
+        but is issue-bound per CTA and stays unrouted); everything else (THD,
+        quantized, Rubin, larger S_q) stays on the prefill tile.  The
         TILE_CGA_M / SCHED_POLICY knobs describe the prefill pipeline and are
         no-ops here (one cta_group::1 CTA per unit, nothing to schedule).
         """

@@ -669,8 +669,10 @@ def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
     (choose_decode_tile_split_kv), not the prefill fit: the LEADING set is the
     choice that also pays for the split path's second host launch, the captured
     caller's optimum follows as a runner-up (select_plan / autotune reach it),
-    and no-split closes the list. The same graph one token longer (S_q=3: 48
-    packed rows) is the prefill tile's launch and keeps the prefill model."""
+    and no-split closes the list. The same graph one token wider (S_q=2: 32
+    packed rows, the compiled-but-unrouted 32-column tile) or longer (S_q=3: 48
+    rows) is the prefill tile's launch and keeps the prefill model, which does
+    not split either shape at b=32."""
 
     def sets(**over):
         return [p.knobs for p in recommend("A", _decode_d256_facts(**over), _OFFERED) if p.engine_id == 20500]
@@ -685,10 +687,14 @@ def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
     assert all(k.split_kv == 1 for k in saturated), saturated
     long_kv = sets(s_kv=16384)
     assert long_kv[0].split_kv == 2, long_kv[0]
-    # The MTP step (S_q=2 bottom-right: 32 packed rows, the 32-column tile) is
-    # slow enough per CTA unsplit that the split pays for its launch.
-    mtp = sets(s_q=2, causal=True, bottom_right=True)
-    assert mtp[0].split_kv == 2 and mtp[0].pack_gqa is True, mtp[0]
-    assert any(k.split_kv == 1 for k in mtp[1:]), mtp
+    # The 16-row MTP step (Qwen3-Next 16/2 at S_q=2 bottom-right: 8:1 packing)
+    # is decode-shaped and follows the serving shape's policy.
+    mtp16 = sets(h_q=16, s_q=2, causal=True, bottom_right=True)
+    assert mtp16[0].split_kv == 1 and mtp16[0].pack_gqa is True, mtp16[0]
+    assert [k.split_kv for k in mtp16 if k.split_kv > 1] == [2], mtp16
+    # The 32-row MTP step (32/2 at S_q=2) is NOT routed onto the decode tile
+    # (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS): the prefill model, unsplit.
+    mtp32 = sets(s_q=2, causal=True, bottom_right=True)
+    assert mtp32[0].split_kv == 1 and mtp32[0].pack_gqa is True and all(k.split_kv == 1 for k in mtp32), mtp32
     prefill = sets(s_q=3)
     assert prefill[0].split_kv == 1 and all(k.split_kv == 1 for k in prefill), prefill

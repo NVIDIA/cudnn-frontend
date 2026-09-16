@@ -3,24 +3,27 @@
 
 """The d256 DECODE tile of the FROST SM100 f16/bf16 engine (sm100/decode_d256_f16.py).
 
-Decode-shaped d256 graphs (S_q x packed heads <= 32 rows) lower onto the
-swap-AB tile -- KV tokens on the MMA M axis, the packed Q rows on N -- instead
-of the 256-row prefill tile.  Same graph contract, same engine row
-(``sdpa_fwd_prefill_sm100``): every test here pins the engine with
-``select_engine`` and additionally asserts WHICH template served the plan
-through the executor's ``kernel_template`` (a decline or a fallback to the
-prefill tile fails instead of passing on the wrong kernel).  The reference is
-an fp32 torch softmax over the dense K/V the pools were built from.
+Decode-shaped d256 graphs (S_q x packed heads <= 16 rows,
+``config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS``) lower onto the swap-AB tile --
+KV tokens on the MMA M axis, the packed Q rows on N -- instead of the 256-row
+prefill tile.  Same graph contract, same engine row (``sdpa_fwd_prefill_sm100``):
+every test here pins the engine with ``select_engine`` and additionally asserts
+WHICH template served the plan through the executor's ``kernel_template`` (a
+decline or a fallback to the prefill tile fails instead of passing on the wrong
+kernel).  The reference is an fp32 torch softmax over the dense K/V the pools
+were built from.
 
 Coverage: paged (page 16/32/64/128, NHD/HND) and dense padded caches, mixed
 lengths incl. 0 and 1, PackGQA 8:1 / 16:1 / 32:2 and MHA, MTP bottom-right
-causal at S_q 2 and 4 with per-batch Q lengths (dense padded-Q trim), sliding
-window, right band, sink, Stats natural and base-2, fp16 and bf16, the
-decode split policy (the serving shape leads unsplit with the split as the
-runner-up plan; a small batch splits) plus forced splits with empty ranges,
-CUDA-graph replay under ``set_sync_debug_mode("error")`` (Rule 3), and the
-routing boundary: larger S_q x G, THD queries and d128 stay on the prefill
-tiles.
+causal at S_q 2 (8:1) and 4 (4:1) with per-batch Q lengths (dense padded-Q
+trim), sliding window, right band, sink, Stats natural and base-2, fp16 and
+bf16, the decode split policy (the serving shape leads unsplit with the split
+as the runner-up plan; a small batch splits) plus forced splits with empty
+ranges, CUDA-graph replay under ``set_sync_debug_mode("error")`` (Rule 3), the
+32-column tile (N_Q = 32: compiled and driven at the template level, NOT routed
+-- see the routing-boundary tests, which pin S_q x G in (16, 32] on the prefill
+tile), and the routing boundary: larger S_q x G, THD queries and d128 stay on
+the prefill tiles.
 """
 
 import math
@@ -269,14 +272,14 @@ def test_decode_graph_head_groups(H, KH):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("s_q", [2, 4])
-def test_decode_graph_mtp_bottom_right(s_q):
-    """MTP: S_q in {2, 4} bottom-right causal over a paged cache (8:1 packing
-    -> 16 and 32 rows: one and two column groups, with two tokens per group at
-    S_q = 4), with per-batch Q lengths below S_q (dense padded-Q trim: O := 0 /
-    LSE := -inf past them, and the diagonal anchored at seq_len_kv[b] -
-    seq_len_q[b])."""
-    _run_graph(B=3, H=16, KH=2, s_q=s_q, lens=[700, 130, 5], q_lens=[s_q, max(1, s_q - 1), 0], page=16, causal_br=True)
+@pytest.mark.parametrize(("s_q", "H"), [(2, 16), (4, 8)], ids=["sq2_8to1", "sq4_4to1"])
+def test_decode_graph_mtp_bottom_right(s_q, H):
+    """MTP: S_q in {2, 4} bottom-right causal over a paged cache, packed 8:1 and
+    4:1 (16 rows either way: two and four tokens per 16-row tile), with
+    per-batch Q lengths below S_q (dense padded-Q trim: O := 0 / LSE := -inf
+    past them, and the diagonal anchored at seq_len_kv[b] - seq_len_q[b]).
+    S_q = 4 at 8:1 (32 rows) is a routing-boundary case below."""
+    _run_graph(B=3, H=H, KH=2, s_q=s_q, lens=[700, 130, 5], q_lens=[s_q, max(1, s_q - 1), 0], page=16, causal_br=True)
 
 
 @pytest.mark.L0
@@ -295,9 +298,9 @@ def test_decode_graph_right_band_dense():
 def test_decode_graph_sink_dense():
     """Attention sink folded once per Q row (dense cache: the engine row keeps
     paged + sink declined, see engines.mismatch; S_q = 2 because cuDNN's
-    validator rejects a sink at S_q == 1); a keyless batch keeps the sink's
-    finite LSE and O := 0."""
-    _run_graph(B=3, H=32, KH=2, s_q=2, lens=[700, 0, 300], page=0, sink=True)
+    validator rejects a sink at S_q == 1, so 8:1 packing keeps the 16 rows); a
+    keyless batch keeps the sink's finite LSE and O := 0."""
+    _run_graph(B=3, H=16, KH=2, s_q=2, lens=[700, 0, 300], page=0, sink=True)
 
 
 @pytest.mark.L0
@@ -332,12 +335,17 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     assert runner.knobs.split_kv == captured, runner.knobs
     if sm == 148:
         assert (lead.knobs.split_kv, runner.knobs.split_kv) == (1, 2), (lead.knobs, runner.knobs)
-    # The MTP step (S_q=2 bottom-right: 32 packed rows on the 32-column tile,
-    # 90 us unsplit vs 58 us split on B200) leads WITH the split.
-    mtp = _run_graph(B=32, H=32, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
-    assert mtp.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, q_tile=32), mtp.knobs
+    # The same shape one token wider (S_q=2 bottom-right: 32 packed rows) is
+    # the 32-column tile's, which is NOT routed: on B200 it ran 90 us unsplit
+    # and 96-103 us eager / 58 us replay split 2 against the prefill tile's
+    # 66 / 66 us, so the prefill tile and its own (unsplit) model serve it.
+    mtp = _run_graph(B=32, H=32, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True, expect=PREFILL)
     if sm == 148:
-        assert mtp.knobs.split_kv == 2, mtp.knobs
+        assert mtp.knobs.split_kv == 1, mtp.knobs
+    # Its 16-row sibling (Qwen3-Next 16/2: 8:1 packing at S_q=2) is decode-shaped
+    # and follows the serving shape's policy: unsplit lead, split-2 runner-up.
+    mtp16 = _run_graph(B=32, H=16, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
+    assert mtp16.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm), mtp16.knobs
 
 
 @pytest.mark.L0
@@ -370,26 +378,112 @@ def test_decode_graph_deep_split_empty_ranges():
 
 @pytest.mark.L0
 def test_decode_q_tile_rule():
-    from cudnn.sdpa.fwd.config_sm100 import D256_DECODE_MAX_Q_ROWS, decode_d256_q_tile
+    """The routing rule: 16 rows ride the decode tile; the 32-column tile is a
+    valid config (D256_DECODE_MAX_Q_ROWS) the adapter does not select."""
+    from cudnn.sdpa.fwd.config_sm100 import D256_DECODE_MAX_Q_ROWS, D256_DECODE_ROUTED_MAX_Q_ROWS, decode_d256_q_tile
 
-    assert D256_DECODE_MAX_Q_ROWS == 32
+    assert (D256_DECODE_ROUTED_MAX_Q_ROWS, D256_DECODE_MAX_Q_ROWS) == (16, 32)
     assert decode_d256_q_tile(1, 16) == 16
     assert decode_d256_q_tile(1, 12) == 16  # a group that does not divide the tile still fits it
-    assert decode_d256_q_tile(2, 16) == 32
-    assert decode_d256_q_tile(1, 32) == 32
-    assert decode_d256_q_tile(32, 1) == 32
+    assert decode_d256_q_tile(2, 8) == 16
+    assert decode_d256_q_tile(16, 1) == 16
+    # (16, 32] rows: the unrouted 32-column tile -- the prefill tile serves these.
+    assert decode_d256_q_tile(2, 16) == 0
+    assert decode_d256_q_tile(1, 32) == 0
+    assert decode_d256_q_tile(17, 1) == 0
+    assert decode_d256_q_tile(32, 1) == 0
     assert decode_d256_q_tile(3, 16) == 0
     assert decode_d256_q_tile(33, 1) == 0
     assert decode_d256_q_tile(1, 64) == 0
+    assert decode_d256_q_tile(0, 16) == 0
 
 
 @pytest.mark.L0
 def test_decode_routing_boundary():
-    """S_q x G past the tile stays on the prefill d256 tile; d128 stays on its
-    own (THD queries: test_decode_routing_boundary_thd_queries)."""
+    """S_q x G past the routed tile stays on the prefill d256 tile -- including
+    the (16, 32] rows the compiled 32-column tile could take (an eager
+    regression: 90 us unsplit / 96-103 us split against the prefill tile's 66 us
+    at the b=32 serving shape on B200) -- and d128 stays on its own (THD
+    queries: test_decode_routing_boundary_thd_queries)."""
+    _run_graph(B=2, H=32, KH=2, s_q=2, lens=[700, 130], page=16, causal_br=True, expect=PREFILL)  # 32 packed rows: the S_q=2 MTP step at 16:1
+    _run_graph(B=2, H=32, KH=1, s_q=1, lens=[700, 130], page=16, expect=PREFILL)  # 32 packed rows at S_q=1
+    _run_graph(B=2, H=16, KH=2, s_q=4, lens=[700, 130], page=16, causal_br=True, expect=PREFILL)  # 32 packed rows at 8:1
+    _run_graph(B=2, H=4, KH=4, s_q=17, lens=[700, 130], page=16, expect=PREFILL)  # 17 MHA rows
     _run_graph(B=2, H=32, KH=2, s_q=3, lens=[700, 130], page=16, expect=PREFILL)  # 48 packed rows
     _run_graph(B=2, H=8, KH=2, s_q=1, lens=[700, 130], d=128, page=16, expect="prefill_d128_f16")
     _run_graph(B=2, H=64, KH=1, s_q=1, lens=[300, 130], page=16, expect=PREFILL)  # 64 packed rows
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("splits", [1, 2])
+def test_decode_kernel_two_column_groups(splits):
+    """The 32-column tile (N_Q = 32: two softmax column groups, 8 softmax warps
+    over the same 128 TMEM lanes) compiles and computes correctly but is not
+    routed (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS; the graph tests above
+    pin those shapes on the prefill tile).  This drives the template directly
+    through the adapter's module loader -- S_q = 2 x 16:1 packing = 32 rows over
+    a paged cache, unsplit and split 2 with the partials recombined -- so the
+    path stays tested until its per-CTA issue rate is fixed and it is routed."""
+    import cutlass
+    import cuda.bindings.driver as cuda_driver
+
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+    from test_sdpa_fwd_split_kv_sm100 import _partial_kwargs, _partial_o_dtype, _partial_tag
+
+    B, H, KH, P, s_q = 3, 32, 2, 16, 2
+    lens = [700, 130, 5]
+    dev, dtype = "cuda", torch.float16
+    scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(5)
+    S = max(lens)
+    q = torch.randn(B, s_q, H, D, device=dev, dtype=dtype)  # compact BSHD, the template's Q contract
+    k_dense = torch.randn(B, S, KH, D, device=dev, dtype=dtype)
+    v_dense = torch.randn(B, S, KH, D, device=dev, dtype=dtype)
+    k_c, v_c, bt4 = _pools(k_dense, v_dense, P, True, seed=5)
+    bt = bt4.view(B, -1)
+    k_view, v_view = k_c.permute(0, 2, 1, 3), v_c.permute(0, 2, 1, 3)  # [num_pages, page_size, H_kv, d]
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
+
+    params = TemplateParams(
+        dtype_qkv=3, seq_kv_lens_present=True, paged_kv=True, page_size=P, split_kv=splits, pack_gqa=True, qh_per_kh=H // KH, decode_q_tile=32
+    )
+    mod = _load_sm100_kernel_module((D, D), params)
+    assert (mod.CFG.N_Q, mod.CFG.SOFTMAX_WARPS, mod.COL_GROUPS) == (32, 8, 2)
+    fn = mod.compile(b=B, qh=H, kh=KH, sq=s_q, skv=0, d_qk=D, d_v=D, has_lse=True, k_stride=tuple(k_view.stride()), v_stride=tuple(v_view.stride()))
+    o_p = torch.zeros(splits * B, s_q, H, D, device=dev, dtype=_partial_o_dtype(splits, dtype))
+    lse_p = torch.zeros(splits * B, H, s_q, device=dev, dtype=torch.float32)
+    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn(
+        q,
+        k_view,
+        v_view,
+        o_p,
+        lse_p,
+        torch.zeros(H, dtype=torch.float32, device=dev),
+        seq_lens,
+        torch.zeros(1, dtype=torch.int64, device=dev),
+        (B, H, KH, s_q, 0, 0),
+        cutlass.Float32(scale * math.log2(math.e)),
+        cutlass.Int32(0),
+        0,  # seq_q_lens_addr: no per-batch Q lengths
+        **_partial_kwargs(splits, o_p),
+        block_table_tensor=bt,
+        block_table_v_tensor=bt,
+        stream=stream,
+    )
+    if splits == 1:
+        o_out, lse_out = o_p, lse_p
+    else:
+        o_out = torch.zeros(B, s_q, H, D, device=dev, dtype=dtype)
+        lse_out = torch.zeros(B, H, s_q, device=dev, dtype=torch.float32)
+        cfn = comb.compile(b=B, h=H, sq=s_q, d_v=D, splits=splits, dtype_o="f16", has_lse=True, dtype_partial=_partial_tag(splits, dtype))
+        cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, s_q, D), cutlass.Int32(splits), stream=stream)
+    torch.cuda.synchronize()
+    ref_o, ref_lse = _ref(q, k_dense, v_dense, lens, None, scale)
+    torch.testing.assert_close(o_out.float(), ref_o, atol=2e-2, rtol=0)
+    torch.testing.assert_close(lse_out, ref_lse, atol=5e-3, rtol=0)
 
 
 @pytest.mark.L0
@@ -478,6 +572,9 @@ def test_decode_prefill_backstop_rejects_decode_record():
         make_cfg_d256_decode(TemplateParams(decode_q_tile=16, pack_gqa=True, qh_per_kh=32))
     cfg, _ = make_cfg_d256_decode(params)
     assert cfg.N_Q == 16 and cfg.TILE_N == 128 and cfg.STAGES_KV == 3
+    # The 32-column tile is a valid record (compiled, template-tested), only unrouted.
+    wide, _ = make_cfg_d256_decode(TemplateParams(decode_q_tile=32, seq_kv_lens_present=True))
+    assert (wide.N_Q, wide.SOFTMAX_WARPS, wide.TOTAL_WARPS, wide.P_SWZ_BYTES) == (32, 8, 10, 64)
 
 
 @pytest.mark.L0

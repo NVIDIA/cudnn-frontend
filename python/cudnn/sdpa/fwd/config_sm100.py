@@ -163,12 +163,13 @@ class TemplateParams:
     # Being a TemplateParams field it is part of the module-cache key: gate on/off are two coexisting
     # specializations of one template, and an ungated module traces byte-identically to before the field existed.
     epilogue_gate: bool = False
-    # Decode-shaped d256 f16/bf16 graphs (S_q * pack_g <= D256_DECODE_MAX_Q_ROWS)
+    # Decode-shaped d256 f16/bf16 graphs (S_q * pack_g <= D256_DECODE_ROUTED_MAX_Q_ROWS)
     # lower onto sm100/decode_d256_f16.py, the swap-AB tile: the KV tokens ride
     # the MMA M axis and the packed Q rows ride N, so the MMA and exp work
     # scale with the LIVE rows instead of a 128-row Q tile.  The value is the
-    # N extent the kernel is compiled for (16 or 32, from decode_d256_q_tile);
-    # 0 = the prefill tile.  Plan-time only (S_q is a declared shape).
+    # N extent the kernel is compiled for (16, or 32 at the template level, from
+    # decode_d256_q_tile); 0 = the prefill tile.  Plan-time only (S_q is a
+    # declared shape).
     decode_q_tile: int = 0
 
 
@@ -828,18 +829,30 @@ def make_cfg_d256_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
 # S^T = K Q^T and BMM2 is O^T = V^T P^T, and the softmax reduces over lanes.
 # One CTA per (KV-head group, batch, split) unit, cta_group::1, no cluster.
 
-# Largest packed Q-row count the decode tile serves (N = 32 keeps the 3-slot
-# 64 KiB K/V ring, the Q tile and the two P^T buffers inside 227 KiB).
+# Largest packed Q-row count the decode tile COMPILES for (N = 32 keeps the
+# 3-slot 64 KiB K/V ring, the Q tile and the two P^T buffers inside 227 KiB).
 D256_DECODE_MAX_Q_ROWS = 32
 _D256_DECODE_Q_TILES = (16, 32)
+# Largest packed Q-row count the adapter ROUTES onto the decode tile.  The
+# 32-column tile (two softmax column groups over the same 128 TMEM lanes) is
+# compiled and tested at the template level but issue-bound per CTA: at b=32
+# x 2 KV heads x 4096 keys (B200) it streams a KV tile in 2.8 us against the
+# 16-column tile's 1.75 us -- 90 us unsplit where the prefill tile takes 66
+# us -- and its split-2 plan (58 us of GPU time) costs an eager caller 96-103
+# us per execute for the second launch.  Until its per-CTA issue rate is
+# fixed, S_q x G in (16, 32] stays on the prefill tile, which serves those
+# shapes at its previous numbers in both regimes (eager and CUDA-graph
+# replay).  Raising this to D256_DECODE_MAX_Q_ROWS routes the wide tile.
+D256_DECODE_ROUTED_MAX_Q_ROWS = 16
 
 
 def decode_d256_q_tile(s_q: int, pack_g: int) -> int:
     """The decode tile's N extent for ``s_q`` tokens packed ``pack_g`` heads per
-    token (1 = unpacked), or 0 when the graph is not decode-shaped and the
-    prefill tile serves it."""
+    token (1 = unpacked), or 0 when the prefill tile serves the graph: no rows,
+    or more than D256_DECODE_ROUTED_MAX_Q_ROWS of them (the 32-column tile is a
+    valid ``make_cfg_d256_decode`` record but is not routed)."""
     rows = int(s_q) * int(pack_g)
-    if rows <= 0 or rows > D256_DECODE_MAX_Q_ROWS:
+    if rows <= 0 or rows > D256_DECODE_ROUTED_MAX_Q_ROWS:
         return 0
     return next(n for n in _D256_DECODE_Q_TILES if rows <= n)
 

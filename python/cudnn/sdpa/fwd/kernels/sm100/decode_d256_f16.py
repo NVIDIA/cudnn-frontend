@@ -29,7 +29,12 @@ and a 4-way exchange through shared memory across a 4-warp group, once per KV
 tile.  A group owns 16 columns; N_Q = 32 runs two groups (8 softmax warps)
 over the same 128 TMEM lanes, so the per-thread exp / shuffle / register load
 is the same at either tile width (one 4-warp group over 32 columns was
-issue-bound and lost to the prefill tile on the S_q = 2 MTP shape).
+issue-bound and lost to the prefill tile on the S_q = 2 MTP shape).  Even so
+the 32-column tile streams a KV tile 1.6x slower per CTA than the 16-column
+one (2.8 vs 1.75 us; 90 us unsplit at b=32 x 2 KV heads x 4096 keys where the
+prefill tile takes 66 us), so it compiles and is tested at the template level
+but the adapter does not route it (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS);
+its per-CTA issue rate is the open kernel item.
 P^T is stored to a small swizzled SMEM tile (the B operand of BMM2 is
 MN-major: the N_Q values of one key are contiguous), V is consumed in place
 as an MN-major A operand (d_v contiguous), and O^T accumulates in TMEM with
@@ -56,7 +61,8 @@ Nothing reaches the host (python/cudnn/AGENTS.md Rule 3): lengths, page
 tables and the split chunking are all resolved on device.
 
 Not served here (the adapter keeps these on the prefill tile): THD queries,
-S_q * pack_g > 32 rows, FP8/MXFP8.
+S_q * pack_g > 16 rows (N_Q = 32 compiles but is not routed, see above),
+FP8/MXFP8.
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key

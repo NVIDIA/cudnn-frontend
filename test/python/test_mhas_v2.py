@@ -2157,6 +2157,10 @@ def test_sdpa_thd_batch_stride_int32_overflow_L0(env_info, request, cudnn_handle
 
 FROST_ENGINE_TALLY = "frost:sdpa_fwd_prefill_sm100"
 FROST_D256_DECODE_TALLY = FROST_ENGINE_TALLY + ":decode_d256_f16"
+FROST_D256_PREFILL_TALLY = FROST_ENGINE_TALLY + ":prefill_d256_f16"
+# Packed Q rows (S_q x GQA group) the adapter routes onto the decode tile
+# (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS); the prefill d256 tile serves the rest.
+FROST_D256_DECODE_MAX_ROWS = 16
 
 
 def _frost_decode_d256_gate():
@@ -2186,9 +2190,10 @@ def test_sdpa_fwd_paged_decode_d256_frost_L0(env_info, test_no, request, cudnn_h
     sliding-window / band masks, mixed per-batch lengths (zeros included); inference
     graphs (the harness runs a backward otherwise, and paged KV is forward-only).
     The FROST engine row must serve every config -- the decode tile
-    (sm100/decode_d256_f16.py) while S_q x group <= 32 rows, the prefill d256 tile
+    (sm100/decode_d256_f16.py) while S_q x group <= 16 rows, the prefill d256 tile
     above that -- so the routing tally is asserted: a decline would fall back to
-    the backend silently and pass on the wrong kernel.
+    the backend silently and pass on the wrong kernel, and a decode-shaped draw
+    quietly served by the prefill tile would pass on the slower one.
     """
     _frost_decode_d256_gate()
     import frost_routing
@@ -2217,24 +2222,36 @@ def test_sdpa_fwd_paged_decode_d256_frost_L0(env_info, test_no, request, cudnn_h
     test.cfg.is_paged = True
     test.showConfig(test_no, request)
 
-    before = frost_routing.COUNTS.get(FROST_ENGINE_TALLY, 0)
+    # A packed group (8 or 16 divides the tile) rides the decode tile while its
+    # S_q x group rows fit; past that the prefill d256 tile serves the graph.
+    decode_shaped = test.cfg.s_q * (test.cfg.h_q // test.cfg.h_k) <= FROST_D256_DECODE_MAX_ROWS
+    before        = frost_routing.COUNTS.get(FROST_ENGINE_TALLY, 0)
+    before_decode = frost_routing.COUNTS.get(FROST_D256_DECODE_TALLY, 0)
     exec_sdpa(test.cfg, request, cudnn_handle)
     assert frost_routing.COUNTS.get(FROST_ENGINE_TALLY, 0) == before + 1, f"the FROST engine row did not serve this graph: {frost_routing.snapshot()}"
+    if decode_shaped:
+        assert frost_routing.COUNTS.get(FROST_D256_DECODE_TALLY, 0) == before_decode + 1, f"the decode tile did not serve this decode-shaped graph: {frost_routing.snapshot()}"
 
 
-QWEN35_DECODE_CASES = [
-    (1, cudnn.diagonal_alignment.TOP_LEFT, None),
-    (2, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0),
+# (model heads, s_q, diagonal alignment, right bound, the template that must serve it)
+D256_DECODE_PINNED_CASES = [
+    (32, 1, cudnn.diagonal_alignment.TOP_LEFT,     None, FROST_D256_DECODE_TALLY),   # Qwen3.5 32/2: 16 packed rows
+    (32, 2, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0,    FROST_D256_PREFILL_TALLY),  # Qwen3.5 MTP: 32 rows, the unrouted wide tile
+    (16, 2, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0,    FROST_D256_DECODE_TALLY),   # Qwen3-Next 16/2 MTP: 16 packed rows
 ]
 
 
-@pytest.mark.parametrize("s_q,diag_align,right_bound", QWEN35_DECODE_CASES, ids=["sq1", "sq2_brcm"])
+@pytest.mark.parametrize("h_q,s_q,diag_align,right_bound,expect_tally", D256_DECODE_PINNED_CASES, ids=["qwen35_sq1", "qwen35_sq2_brcm", "qwen3next_sq2_brcm"])
 @pytest.mark.L0
-def test_sdpa_fwd_paged_decode_d256_qwen35_frost_L0(env_info, s_q, diag_align, right_bound, request, cudnn_handle):
-    """Qwen3.5 decode as served: b=32, 32/2 heads, d=256, page 16, mixed KV lengths
-    up to 4096 -- the S_q = 1 step and the S_q = 2 MTP step (bottom-right causal).
-    Pins that the decode tile (`decode_d256_f16`) serves the shape it was built for
-    rather than the prefill tile.
+def test_sdpa_fwd_paged_decode_d256_qwen35_frost_L0(env_info, h_q, s_q, diag_align, right_bound, expect_tally, request, cudnn_handle):
+    """Qwen3.5 / Qwen3-Next decode as served: b=32, 32/2 or 16/2 heads, d=256, page
+    16, mixed KV lengths up to 4096 -- the S_q = 1 step and the S_q = 2 MTP step
+    (bottom-right causal).  Pins WHICH template serves each: the decode tile
+    (`decode_d256_f16`) for the 16-row shapes it was built for, and the prefill
+    d256 tile for the 32-row Qwen3.5 MTP step -- the 32-column decode tile is
+    compiled but not routed (an eager regression: 90 us unsplit / 96-103 us split
+    against the prefill tile's 66 us on B200), so a change that routes it must
+    come with the numbers and flip this pin.
     """
     _frost_decode_d256_gate()
     import frost_routing
@@ -2262,7 +2279,7 @@ def test_sdpa_fwd_paged_decode_d256_qwen35_frost_L0(env_info, s_q, diag_align, r
         d_v=256,
         s_q=s_q,
         s_kv=4096,
-        h_q=32,
+        h_q=h_q,
         h_k=2,
         h_v=2,
         diag_align=diag_align,
@@ -2273,11 +2290,13 @@ def test_sdpa_fwd_paged_decode_d256_qwen35_frost_L0(env_info, s_q, diag_align, r
         block_size=16,
     )
     test.cfg.fill_derived_fields()
-    test.showConfig((request.node.name, len(QWEN35_DECODE_CASES)), request)
+    test.showConfig((request.node.name, len(D256_DECODE_PINNED_CASES)), request)
 
-    before = frost_routing.COUNTS.get(FROST_D256_DECODE_TALLY, 0)
+    before        = frost_routing.COUNTS.get(FROST_ENGINE_TALLY, 0)
+    before_tmpl   = frost_routing.COUNTS.get(expect_tally, 0)
     exec_sdpa(test.cfg, request, cudnn_handle)
-    assert frost_routing.COUNTS.get(FROST_D256_DECODE_TALLY, 0) == before + 1, f"the decode tile did not serve this graph: {frost_routing.snapshot()}"
+    assert frost_routing.COUNTS.get(FROST_ENGINE_TALLY, 0) == before + 1, f"the FROST engine row did not serve this graph: {frost_routing.snapshot()}"
+    assert frost_routing.COUNTS.get(expect_tally, 0) == before_tmpl + 1, f"{expect_tally} did not serve this graph: {frost_routing.snapshot()}"
 
 
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
