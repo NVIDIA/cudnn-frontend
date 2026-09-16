@@ -1946,3 +1946,24 @@ def test_fp8_stats_log2_every_flavor(d_qk, d_v):
         outputs.append(o)
     torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
     torch.testing.assert_close(stats[1], stats[0] * math.log2(math.e), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@torch_fork_set_rng(seed=931)
+def test_fp8_graph_stats_use_log2(mask):
+    """The public FP8 wrapper forwards the log base and preserves its default."""
+    results = []
+    for log2 in (None, False, True):
+        torch.manual_seed(931)
+        kw = dict(_MASKS[mask])
+        if log2 is not None:
+            kw["stats_use_log2"] = log2
+        result = _run(1, 2, 2, 128, 256, "e4m3", torch.bfloat16, scale=128**-0.5, sdpa_kwargs=kw, return_lse=True)
+        factor = math.log2(math.e) if log2 else 1.0
+        torch.testing.assert_close(result.stats, result.reference_stats * factor, atol=1e-4, rtol=1e-4)
+        _check(result.output, result.reference, torch.bfloat16, "e4m3", result.amax, result.reference_amax)
+        results.append(result)
+    torch.testing.assert_close(results[0].stats, results[1].stats, atol=0, rtol=0)
+    torch.testing.assert_close(results[2].stats, results[1].stats * math.log2(math.e), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(results[2].output, results[1].output, atol=0, rtol=0)

@@ -1204,8 +1204,8 @@ class SM120FusedMultiHeadAttentionForward:
                         lse_q_idx = q_seq_idx + (_lse_row_in_cta if cutlass.const_expr(not self.pack_gqa) else _lse_row_in_cta // self.qh_per_kh)
                         _lse_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + _lse_row_in_cta % self.qh_per_kh
                         lse_out = cutlass.Float32(row_lse[row_half])
-                        # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
-                        if cutlass.const_expr(self.stats_log2):
+                        # Split partials stay natural-log; the combine owns final base conversion.
+                        if cutlass.const_expr(self.stats_log2 and self.split_kv == 1):
                             lse_out = lse_out * cutlass.Float32(1.4426950408889634)
                         if cutlass.const_expr(self.thd_varlen):
                             # Packed ragged-Stats LSE, written directly in the
