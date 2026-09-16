@@ -2261,9 +2261,34 @@ class CompositeSDPABackwardNode : public SDPABackwardNodeBase<CompositeSDPABackw
 // sequence lengths, sink token, packed token totals, forward score-modifier subgraph) so that widening
 // the support surface later does not require touching this node.
 class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardNode> {
+   private:
+    // ALiBi slopes live in the frontend workspace (uploaded at execute time), like the other SDPA nodes.
+    std::shared_ptr<Tensor_attributes> alibi_slopes;
+    int64_t alibi_slopes_size = 0;
+
    public:
     UnifiedSDPABackwardNode(SDPA_backward_attributes&& attributes_, detail::Context const& context)
         : SDPABackwardNodeBase(std::move(attributes_), context) {}
+
+    virtual int64_t
+    get_fe_workspace_size_node() const override final {
+        return ((alibi_slopes_size + 15) / 16 * 16);  // align alibi slopes memory to 16 bytes
+    }
+
+    virtual error_t
+    collect_tensors_in_workspace_node(
+        std::unordered_map<Tensor_attributes::uid_t, std::tuple<int64_t, int64_t, std::vector<float>>>&
+            workspace_modifications,
+        int64_t& offset) const override final {
+        if (attributes.alibi_mask) {
+            CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(Q, input_names::Q);
+            int64_t const h_q     = Q->second->get_dim()[1];
+            auto alibi_slopes_vec = detail::get_alibi_slope(h_q);
+            workspace_modifications.emplace(alibi_slopes->get_uid(), std::make_tuple(0, offset, alibi_slopes_vec));
+            offset += ((alibi_slopes_size + 15) / 16 * 16);
+        }
+        return {error_code_t::OK, ""};
+    }
 
     Type
     getType() override final {
@@ -2295,6 +2320,14 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
             if (!subgraph) init_subgraph();
             subgraph_output =
                 attn::score_modifiers::bias(subgraph, subgraph_output, attributes.inputs[input_names::Bias]);
+        }
+
+        // Optional alibi mask (the slopes tensor is filled from the frontend workspace)
+        if (attributes.alibi_mask) {
+            if (!subgraph) init_subgraph();
+            auto h_q = attributes.inputs[input_names::Q]->get_dim()[1];
+            subgraph_output =
+                attn::score_modifiers::alibi_mask(subgraph, subgraph_output, alibi_slopes, h_q, alibi_slopes_size);
         }
 
         // Optional diagonal-band (causal / sliding-window) masking

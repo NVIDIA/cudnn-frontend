@@ -877,9 +877,13 @@ SDPA_backward_attributes::validate_sdpa_backward_support_surface(const detail::C
                                     error_code_t::GRAPH_NOT_SUPPORTED,
                                     "Deterministic algorithm is not supported for bprop thd on SM8X and SM12X GPUs");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && inputs.at(input_names::Stats)->get_ragged_offset(),
-                                    error_code_t::GRAPH_NOT_SUPPORTED,
-                                    "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
+        // The composite (legacy) SM8X/SM12X kernels need a dense Stats tensor for THD; the unified backward
+        // engine requires the packed one, so this rule only applies when the composite path is selected.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(implementation != AttentionImplementation_t::UNIFIED && is_ragged &&
+                                           (8 == prop_major || 12 == prop_major) &&
+                                           inputs.at(input_names::Stats)->get_ragged_offset(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
     }
 
     // Non-ragged layouts other than BHSD are not correctly supported prior to 9.26.0.
@@ -1016,7 +1020,8 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
             // from the dev line that follows 9.28.0 (the SM80/SM90 generic emitters are wired in a later MR).
             // TODO(nvbugs/5102117): bump the floor to the release these land in.
             int32_t const unified_sm_major = context.get_sm_version() / 10;
-            bool const unified_layouts_ok  = effective_cudnn_ver >= 92800 && unified_sm_major == 10;
+            bool const unified_layouts_ok  = effective_cudnn_ver >= 92800 &&
+                                            (unified_sm_major == 10 || unified_sm_major == 9 || unified_sm_major == 8);
             std::unordered_set<SDPA_backward_attributes::input_names> allowed_input_names{input_names::Q,
                                                                                           input_names::K,
                                                                                           input_names::V,
@@ -1024,37 +1029,69 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
                                                                                           input_names::dO,
                                                                                           input_names::Stats,
                                                                                           input_names::Attn_scale};
+            // Attention sink (and its gradient) share the same dev-line floor as the layouts above.
+            bool const unified_sink_ok = effective_cudnn_ver >= 92800;
             if (unified_layouts_ok) {
                 allowed_input_names.insert(input_names::SEQ_LEN_Q);
                 allowed_input_names.insert(input_names::SEQ_LEN_KV);
                 allowed_input_names.insert(input_names::CU_SEQ_LEN_Q);
                 allowed_input_names.insert(input_names::CU_SEQ_LEN_KV);
             }
+            if (unified_sink_ok) {
+                allowed_input_names.insert(input_names::SINK_TOKEN);
+            }
+            // Additive bias is applied to the recomputed scores in the kernel; its gradient (dBias) has no
+            // backend counterpart yet, so graphs that request dBias keep routing to the composite path.
+            bool const unified_bias_ok = effective_cudnn_ver >= 92800;
+            if (unified_bias_ok) {
+                allowed_input_names.insert(input_names::Bias);
+            }
             for (const auto& [key, value] : inputs) {
                 if (allowed_input_names.find(key) == allowed_input_names.end() && value != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
                             "Unified SDPA backward node doesn't yet support inputs other than Q, K, V, O, dO, Stats, "
-                            "Attn_scale (and the sequence lengths on SM100/SM107)"};
+                            "Attn_scale, the sequence lengths and the sink token"};
                 }
             }
 
-            std::unordered_set<SDPA_backward_attributes::output_names> const allowed_output_names{
+            std::unordered_set<SDPA_backward_attributes::output_names> allowed_output_names{
                 output_names::dQ, output_names::dK, output_names::dV};
+            if (unified_sink_ok) {
+                allowed_output_names.insert(output_names::DSINK_TOKEN);
+            }
             for (const auto& [key, value] : outputs) {
                 if (allowed_output_names.find(key) == allowed_output_names.end() && value != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
-                            "Unified SDPA backward node doesn't yet support outputs other than dQ, dK, dV"};
+                            "Unified SDPA backward node doesn't yet support outputs other than dQ, dK, dV, dSink"};
                 }
             }
 
-            if (alibi_mask || (padding_mask && !unified_layouts_ok) || left_bound.has_value() ||
-                right_bound.has_value()) {
+            // Alibi is lowered as a score-modifier subgraph (gen_index / slope chain) on the recomputed scores; it
+            // needs the same dev-line floor as the layouts above.
+            if (alibi_mask && effective_cudnn_ver < 92800) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA backward node doesn't yet support alibi, padding or diagonal-band masks"};
+                        "Unified SDPA backward node doesn't yet support alibi before cuDNN 9.28"};
             }
-            if (attention_score_modifier != nullptr || attention_score_modifier_bprop != nullptr) {
+            if (padding_mask && !unified_layouts_ok) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA backward node doesn't yet support attention score modifiers"};
+                        "Unified SDPA backward node doesn't yet support padding masks on this device / cuDNN version"};
+            }
+            // Diagonal-band masks (causal, bottom-right causal, sliding window) are lowered as a score-modifier
+            // subgraph on the recomputed scores; they need the same dev-line floor as the layouts above.
+            if ((left_bound.has_value() || right_bound.has_value()) && effective_cudnn_ver < 92800) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Unified SDPA backward node doesn't yet support diagonal-band masks before cuDNN 9.28"};
+            }
+            // The forward score modifier is replayed on the recomputed scores inside the backend kernel; a
+            // user-provided backward modifier (score_mod_bprop) has no backend counterpart yet.
+            if (attention_score_modifier != nullptr && effective_cudnn_ver < 92800) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Unified SDPA backward node doesn't yet support attention score modifiers before cuDNN 9.28"};
+            }
+            if (attention_score_modifier_bprop != nullptr) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Unified SDPA backward node doesn't yet support attention_score_modifier_bprop "
+                        "(score_mod_bprop); use the composite implementation"};
             }
             if (dropout_probability.has_value()) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA backward node doesn't yet support dropout"};
