@@ -454,14 +454,17 @@ def test_paged_kernel_d256(page_size):
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "h,kh,pack_g,d",
-    [(6, 2, 1, 128), (10, 2, 1, 128), (24, 2, 4, 128), (12, 2, 2, 128), (24, 2, 4, 256)],
-    ids=["g3_unpacked", "g5_unpacked", "g12_packs4", "g6_packs2", "g12_packs4_d256"],
+    [(6, 2, 1, 128), (10, 2, 1, 128), (24, 2, 4, 128), (12, 2, 2, 128), (24, 2, 4, 256), (256, 1, 128, 128)],
+    ids=["g3_unpacked", "g5_unpacked", "g12_packs4", "g6_packs2", "g12_packs4_d256", "g256_packs128"],
 )
 def test_paged_kernel_gqa_group_not_dividing_tile(h, kh, pack_g, d):
     """A GQA group with no factor in common with the 128-row tile (G=3, G=5) runs
     unpacked (PACK_G = 1); one that shares a factor packs its largest divisor of
     the tile (G=12 -> 4 heads per token row-group, G=6 -> 2) on the d128 and d256
-    f16 flavors -- partial PackGQA, ``CfgD128.PACK_G`` / ``CfgD256.PACK_G``."""
+    f16 flavors -- partial PackGQA, ``CfgD128.PACK_G`` / ``CfgD256.PACK_G``.  A
+    group LARGER than the tile (256/1 MQA) packs the whole tile, 128 heads of one
+    token, two packed heads per KV head -- the G=128 geometry plus the
+    PACKED_HEADS_PER_KV division; declined before partial packing."""
     _run_kernel(2, h, kh, 16, 8, [50, 128], hnd=False, splits=1, cta_mma=2, d=d, expect_pack_g=pack_g)
 
 

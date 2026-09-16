@@ -60,6 +60,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     cga_tile_m,
     d192_square_br_as_tl,
     d256_square_br_as_tl,
+    pack_gqa_group_size,
     pack_gqa_supported,
 )
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
@@ -659,6 +660,19 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     )
 
 
+def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Optional[bool]) -> int:
+    """The heads one packed Q tile row-group holds for a ``pack_gqa=packed``
+    set: 1 unpacked, else ``Cfg.PACK_G`` -- the whole ratio G when it divides
+    the tile, its largest divisor that does on a partial-PackGQA flavor (96/8
+    -> 4).  The launch geometry the wave-cost model must see is the PACKED
+    one: ``h_q // p`` packed heads of ``s_q * p`` rows each -- feeding it G
+    where the kernel packs p (96/8: 8 heads instead of 24) shrinks the
+    apparent grid 3x and over-proposes the split at mid batch sizes."""
+    if not packed:
+        return 1
+    return pack_gqa_group_size(facts.h_q // facts.h_kv, tile_m or 128, partial=pack_gqa_partial(caps, facts))
+
+
 def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] = None) -> Tuple[bool, ...]:
     """The pack_gqa axis, best first: ``(True, False)`` when packing wins,
     ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
@@ -681,10 +695,12 @@ def _split_points(
 ) -> List[Optional[int]]:
     """Ordered split-KV candidates for the chosen tile geometry.
 
-    ``pack_g`` is the pack_gqa group of the set the split rides (1 =
-    unpacked): packing multiplies each head-group's Q rows by G and divides
-    the head count by it, so the wave-cost model must see the PACKED launch
-    — the packed grid is smaller, which is exactly when splitting pays.
+    ``pack_g`` is the packed group of the set the split rides (1 = unpacked;
+    :func:`_pack_gqa_group` -- the kernel's ``Cfg.PACK_G``, which is the GQA
+    ratio G when it divides the tile and a proper divisor of it under partial
+    PackGQA): packing multiplies each packed head's Q rows by ``pack_g`` and
+    divides the head count by it, so the wave-cost model must see the PACKED
+    launch — the packed grid is smaller, which is exactly when splitting pays.
 
     The value comes from :func:`choose_split_kv`'s wave-cost model, fed the
     EXACT launch geometry via :func:`_pack_gqa_tile_q` — the Q rows one grid
@@ -730,7 +746,7 @@ def _split_points(
     )
     unsplit_launch = None
     if unsplit_knobs is not None:
-        unsplit_pack_g = (facts.h_q // facts.h_kv) if unsplit_knobs.pack_gqa else 1
+        unsplit_pack_g = _pack_gqa_group(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.pack_gqa)
         unsplit_launch = _SplitKvLaunch(
             q_tiles=_ceil_div(
                 facts.s_q * unsplit_pack_g,
@@ -827,7 +843,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
 
     unsplit_leg = _leg(1)
     split_leg = _leg(2)
-    split_pack_g = (facts.h_q // facts.h_kv) if split_leg.pack_gqa else 1
+    split_pack_g = _pack_gqa_group(caps, facts, split_leg.tile_m, split_leg.pack_gqa)
     splits = _split_points(
         caps,
         facts,

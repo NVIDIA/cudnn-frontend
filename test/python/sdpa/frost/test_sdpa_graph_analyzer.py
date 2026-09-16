@@ -688,6 +688,26 @@ def test_knob_request_pack_gqa_partial_group_on_wired_flavors_only():
     # HEADS_PER_TILE = G), so the same request is declined there.
     assert not _eligible(_mk_gqa_graph(24, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
     assert engines.engine_name() in _eligible(_mk_gqa_graph(32, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+    # A group larger than the tile (256/1 MQA) packs the whole tile (p = 128,
+    # two packed heads per KV head) on the partial flavors; declined on d512.
+    assert engines.engine_name() in _eligible(_mk_gqa_graph(256, 1), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert not _eligible(_mk_gqa_graph(256, 1, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
+    # The standalone adapter (api_dsl.SdpaFwdDslSm100.check_support) mirrors
+    # Capabilities.pack_gqa_partial_d_shapes as a module tuple because the
+    # adapter has no engine row in hand when it validates a knob request.  Pin
+    # the two together so the gate cannot drift: the f16 SM100 row declares
+    # exactly the adapter's flavors, and no other row (fp8 / mxfp8, the cc 10.7
+    # line, SM120) declares partial packing -- the adapter excludes those too.
+    from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
+
+    by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
+    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256)})
+    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name != engines.engine_name()}
+    assert all(v is None for v in others.values()), others
 
 
 def test_knob_request_pack_gqa_false_always_eligible():

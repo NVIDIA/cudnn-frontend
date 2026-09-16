@@ -92,6 +92,40 @@ def test_recommend_packs_partial_gqa_group_on_decode_shapes():
 
 
 @pytest.mark.L0
+def test_split_model_sees_the_partial_pack_group_not_the_gqa_ratio(monkeypatch):
+    """The split-KV wave-cost model is fed the PACKED launch.  Under partial
+    PackGQA the kernel launches ``h_q // p`` packed heads (96/8, p=4: 24 packed
+    heads of s_q*4 rows), not ``h_q // G`` (8): fed G, the model saw a 3x
+    smaller grid and over-proposed the split on the GLM decode shape (b=1:
+    split 8 instead of 2; b=2..4: a split where the packed grid already fills
+    the machine).  Both launches the model compares -- the split leg and the
+    unsplit runner-up -- must carry p."""
+    import cudnn.sdpa.fwd.heuristics as heur
+
+    seen = []
+    real = heur.choose_split_kv
+
+    def recording(**kw):
+        seen.append(kw)
+        return real(**kw)
+
+    monkeypatch.setattr(heur, "choose_split_kv", recording)
+    for b, want in ((1, 2), (2, 1), (4, 1)):
+        seen.clear()
+        facts = _facts(b=b, h_q=96, h_kv=8, s_q=1, s_kv=4096, causal=False, dtype=cudnn.data_type.BFLOAT16)
+        f16 = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
+        assert seen, "the split leg never consulted the wave-cost model"
+        for kw in seen:
+            assert (kw["q_tiles"], kw["heads_q"]) == (1, 24), f"split launch fed the GQA ratio, not the packed group: {kw}"
+            assert kw["unsplit_launch"] is not None and kw["unsplit_launch"].heads_q == 24, kw["unsplit_launch"]
+            # The combine still reduces the graph's own (S_q, H, B) rows.
+            assert kw["combine_rows"] == 1 * 96 * b
+        assert f16[0].knobs.pack_gqa is True and f16[0].knobs.split_kv == want, (b, f16[0].knobs)
+        # Exactly the split the model gives the 24-packed-head geometry.
+        assert f16[0].knobs.split_kv == real(q_tiles=1, heads_q=24, batch=b, kv_tiles=32, sm_count=148, combine_rows=96 * b, ctas_per_tile=2)
+
+
+@pytest.mark.L0
 def test_split_and_scheduler_stay_coupled_whichever_leads():
     """A split set rides the plain scheduler — structural, so it must bind the
     PRIMARY too, not just the runner-ups. config_sm120 raises outright on
