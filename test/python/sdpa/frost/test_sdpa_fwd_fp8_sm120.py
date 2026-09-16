@@ -51,6 +51,20 @@ class _RunResult(NamedTuple):
     reference_stats: torch.Tensor
 
 
+# Block-scaled O (sdpa_fp8 + sf_o): "nvfp4" = FP4_E2M1 O + E4M3 scale per 16 d,
+# "mxfp8" = FP8_E4M3 O + UE8M0 scale per 32 d (see test_sdpa_fwd_fp8_sm100.py).
+_BLOCK_SCALED_O = {"nvfp4": 16, "mxfp8": 32}
+
+
+class _BlockScaledRunResult(NamedTuple):
+    output: torch.Tensor  # dequantized O (B, H, S, d), fp32, in Scale_O units
+    reference: torch.Tensor  # fp32 reference O * Scale_O
+    amax: float
+    reference_amax: float
+    sf_pad_ok: bool
+    scale_o: float
+
+
 def _quant(x, dtype=torch.float8_e4m3fn):
     fmax = _FP8_MAX[dtype]
     dq = (x.abs().amax().clamp_min(1e-8) / fmax).item()
@@ -120,6 +134,8 @@ def _run(
     stats_layout="contiguous",
     with_stats=True,
     poison_kv_pad=False,
+    block_scaled_o=None,
+    sf_o_layout="planes",
 ):
     import cudnn
 
@@ -154,6 +170,11 @@ def _run(
         Ob = torch.zeros(B, H_q, S_q + 24, D_v, device=dev, dtype=o_dtype)[:, :, :S_q, :]
     else:
         raise ValueError(f"unknown layout {layout!r}")
+    blk = _BLOCK_SCALED_O.get(block_scaled_o, 0)
+    if blk == 16:
+        # FP4 O: the byte container (two E2M1 per byte) in torch's packed dtype, BSHD-physical.
+        assert layout == "bshd", "the block-scaled O tests run the BSHD layout"
+        Ob = torch.full((B, S_q, H_q, D_v // 2), 0x7F, device=dev, dtype=torch.uint8).view(torch.float4_e2m1fn_x2).transpose(1, 2)
     if poison_kv_pad:
         # Uninitialized dense padding: fp8 NaN bit patterns in the K/V rows past
         # each batch's KV length. The reference reads the clean K8/V8; the kernel
@@ -207,14 +228,37 @@ def _run(
         kw["sink_token"] = sink_t
         vp[sink_t] = sinks
     kw.update(sdpa_kwargs)
+    sf_o_buf = None
+    if blk:
+        from sdpa.block_scale_o_ref import round_up
+
+        C = max(4, round_up(D_v // blk, 4))
+        if sf_o_layout == "planes":
+            R = round_up(S_q, 128)
+            sf_o_buf = torch.full((B, H_q, R, C), 0xAA, device=dev, dtype=torch.uint8)
+            sf_o_stride = [H_q * R * C, R * C, C, 1]
+        else:
+            # token-major: one [B*S_q (padded to 128), H_q*C] matrix, declared BSHC;
+            # the rows past B*S_q are caller-owned (pre-zeroed here).
+            R = S_q
+            sf_o_buf = torch.full((round_up(B * S_q, 128), H_q * C), 0xAA, device=dev, dtype=torch.uint8)
+            sf_o_buf[B * S_q :] = 0
+            sf_o_stride = [R * H_q * C, C, H_q * C, 1]
+        sf_dtype = cudnn.data_type.FP8_E4M3 if blk == 16 else cudnn.data_type.FP8_E8M0
+        sf_o_t = g.tensor(dim=[B, H_q, R, C], stride=sf_o_stride, data_type=sf_dtype)
+        kw["sf_o"] = sf_o_t
     o, stats, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested (FROST does not produce it)
-    o_cudnn = {
-        torch.float16: cudnn.data_type.HALF,
-        torch.bfloat16: cudnn.data_type.BFLOAT16,
-        torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
-        torch.float8_e5m2: cudnn.data_type.FP8_E5M2,
-    }[o_dtype]
-    o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(o_cudnn)
+    if blk == 16:
+        # The FP4 O is declared with its LOGICAL element extent; the binding is the byte container.
+        o.set_output(True).set_dim([B, H_q, S_q, D_v]).set_stride([S_q * H_q * D_v, D_v, H_q * D_v, 1]).set_data_type(cudnn.data_type.FP4_E2M1)
+    else:
+        o_cudnn = {
+            torch.float16: cudnn.data_type.HALF,
+            torch.bfloat16: cudnn.data_type.BFLOAT16,
+            torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
+            torch.float8_e5m2: cudnn.data_type.FP8_E5M2,
+        }[o_dtype]
+        o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(o_cudnn)
     if with_stats:
         stats.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
@@ -228,6 +272,8 @@ def _run(
     vp.update({o: Ob, amx_o: amax_o})
     if with_stats:
         vp[stats] = lse
+    if blk:
+        vp[sf_o_t] = sf_o_buf
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     if sync_debug:
         # Rule 3 pin: execute must not read the scale tensors (or anything
@@ -243,6 +289,13 @@ def _run(
 
     ref_kw = _ref_kwargs(sdpa_kwargs)
     o_ref, lse_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, seq_lens_q=seq_lens_q, sinks=sinks, **ref_kw)
+    if blk:
+        # Dequantize O from (bytes, sf_o) in the declared layout; the reference is
+        # the fp32 O times Scale_O (what the kernel quantizes).
+        from sdpa.block_scale_o_ref import dequant_block_scaled_o
+
+        o_deq, sf_pad_ok = dequant_block_scaled_o(Ob, sf_o_buf, blk, sf_o_layout, B, H_q, S_q, D_v, C)
+        return _BlockScaledRunResult(o_deq, o_ref * so_val, amax_o.item(), o_ref.abs().max().item(), sf_pad_ok, so_val)
     # O carries Scale_O; Amax_O is the pre-scale amax (the kernel divides it
     # back out), so both compare against the unscaled reference.
     return _RunResult(
@@ -1422,6 +1475,63 @@ def test_fp8_sm120_thd_all_kv_zero():
 def test_fp8_sm120_thd_right_band():
     """THD + TOP_LEFT right band: per-sequence diagonals each widened by R."""
     _run_thd_fp8(seq_q_lens=[130, 70], seq_kv_lens=[130, 70], is_causal=False, window_size_right=24)
+
+
+# --- Block-scaled O (sf_o): NVFP4 / MXFP8 output ---------------------------
+def _check_block_scaled(res: _BlockScaledRunResult, blk: int):
+    """Kernel dequant vs fp32 reference: within the fp8 pipeline tolerance plus
+    three times the pure block-quantization floor of the reference itself."""
+    from sdpa.block_scale_o_ref import quantize_o_mxfp8, quantize_o_nvfp4
+
+    ref = res.reference
+    _, _, ref_q = (quantize_o_nvfp4 if blk == 16 else quantize_o_mxfp8)(ref)
+    floor = (ref_q - ref).abs().max().item()
+    diff = (res.output - ref).abs().max().item()
+    atol = max(5e-2 * res.scale_o, 3.0 * floor)
+    assert not torch.isnan(res.output).any(), "NaN in dequantized O"
+    assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f} (quantization floor {floor:.4f})"
+    assert res.sf_pad_ok, "sf_o pad rows past S_q must be zero"
+    assert abs(res.amax - res.reference_amax) <= 0.03, f"amax_o {res.amax:.4f} vs ref {res.reference_amax:.4f}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sf_o_layout", ["planes", "token_major"])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("mode", list(_BLOCK_SCALED_O))
+@torch_fork_set_rng(seed=71)
+def test_fp8_sm120_block_scaled_output(mode, mask, sf_o_layout):
+    """Block-scaled O epilogue (sf_o) on the SM120 per-tensor FP8 kernel: FP4 O +
+    E4M3/16 scales, or E4M3 O + UE8M0/32 scales. S_q = 300 exercises a partially
+    valid tail tile (per-plane pad rows must come back zero), B > 1 the plane /
+    token-major row bookkeeping, GQA the head -> plane mapping. The FP4 case also
+    pins the O dtype domain: an FP4 O must be ADMITTED by check_support, not
+    declined into "no engine"."""
+    blk = _BLOCK_SCALED_O[mode]
+    res = _run(
+        2,
+        4,
+        2,
+        300,
+        256,
+        scale=1.0 / math.sqrt(128),
+        sdpa_kwargs=_MASKS[mask],
+        o_dtype=torch.float8_e4m3fn,
+        so_val=3.0 if mode == "nvfp4" else 1.0,
+        block_scaled_o=mode,
+        sf_o_layout=sf_o_layout,
+    )
+    _check_block_scaled(res, blk)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=73)
+def test_fp8_sm120_block_scaled_output_offered():
+    """The SM120 FP8 engine row must OFFER the block-scaled graph (FP4 O + E4M3
+    sf_o, and E4M3 O + UE8M0 sf_o) -- the row advertises FP4_E2M1 / o_block_scales
+    {16, 32}, and the lowering's O dtype domain has to agree with the row."""
+    for mode in _BLOCK_SCALED_O:
+        res = _run(1, 2, 2, 128, 128, scale=1.0 / math.sqrt(128), sdpa_kwargs={}, o_dtype=torch.float8_e4m3fn, block_scaled_o=mode)
+        assert isinstance(res, _BlockScaledRunResult), mode
 
 
 # --- THD declared strides: slices of fused records, and what TMA cannot express ---------------

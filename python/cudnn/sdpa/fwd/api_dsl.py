@@ -4131,7 +4131,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             if self._fp8 and desc is self.o_desc:
                 # SDPA_FP8's O dtype is independent of QKV: fp16/bf16 ride the
                 # staging epilogue, fp8 the direct quantizing store.
-                self._check_dtype(desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="O")
+                self._check_dtype(desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES, torch.float4_e2m1fn_x2], name="O")
             else:
                 self._check_dtype(
                     desc,

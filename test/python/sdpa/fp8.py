@@ -732,11 +732,15 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     s_qo, s_kv = cfg.s_q, cfg.s_kv
     d_qk, d_vo = cfg.d_qk, cfg.d_v
     block_size = cfg.block_size if cfg.is_paged else 0
-    # Block-scaled O (sf_o): the FROST d128 epilogue serves dense, unpaged,
-    # non-ragged d_qk = d_v = 128 forward graphs; fold the knob to 0 elsewhere so
-    # the drawn config still runs as a plain fp8 forward.
+    # Block-scaled O (sf_o): the FROST d128 epilogue (SM100 and newer) serves
+    # dense, unpaged, non-ragged d_qk = d_v = 128 forward graphs; fold the knob
+    # to 0 elsewhere so the drawn config still runs as a plain fp8 forward
+    # instead of skipping on "unsupported forward graph".
     o_block_scale = int(getattr(cfg, 'o_block_scale', 0) or 0)
-    if o_block_scale and not (cfg.is_infer and not cfg.is_paged and not getattr(cfg, 'is_ragged', False) and d_qk == 128 and d_vo == 128):
+    block_scaled_o_arch = torch.cuda.get_device_capability()[0] >= 10
+    if o_block_scale and not (
+        block_scaled_o_arch and cfg.is_infer and not cfg.is_paged and not getattr(cfg, 'is_ragged', False) and d_qk == 128 and d_vo == 128
+    ):
         o_block_scale = 0
     if o_block_scale:
         # The quantized O container is E4M3 (mxfp8) or the E2M1 byte container (nvfp4);

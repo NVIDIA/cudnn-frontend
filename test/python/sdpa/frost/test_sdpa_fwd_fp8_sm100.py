@@ -85,31 +85,6 @@ class _BlockScaledRunResult(NamedTuple):
     scale_o: float
 
 
-def _dequant_block_scaled_o(Ob, sf_o_buf, blk, layout, B, H, S, d_v, C):
-    """(O bytes, sf_o bytes) -> fp32 O (B, H, S, d_v); also whether every pad
-    row of a per-(b,h) plane came back zero (token-major has no kernel-owned pad)."""
-    from sdpa.block_scale_o_ref import dequantize_e2m1, unpack_e2m1, unswizzle_128x4
-
-    c_used = d_v // blk
-    if layout == "planes":
-        logical = unswizzle_128x4(sf_o_buf)  # (B, H, R, C)
-        sf_log = logical[:, :, :S, :c_used]
-        pad_ok = bool((logical[:, :, S:, :] == 0).all().item())
-    else:
-        logical = unswizzle_128x4(sf_o_buf)  # (B*S padded, H*C)
-        sf_log = logical[: B * S].reshape(B, S, H, C)[..., :c_used].permute(0, 2, 1, 3)
-        pad_ok = True
-    if blk == 16:
-        codes = unpack_e2m1(Ob.transpose(1, 2).contiguous().view(torch.uint8)).reshape(B, S, H, d_v).permute(0, 2, 1, 3)
-        sf = sf_log.view(torch.float8_e4m3fn).float()
-        vals = dequantize_e2m1(codes)
-    else:
-        sf = torch.pow(2.0, sf_log.float() - 127.0)
-        vals = Ob.float()
-    o = (vals.reshape(B, H, S, c_used, blk) * sf[..., None]).reshape(B, H, S, d_v)
-    return o, pad_ok
-
-
 def _check_block_scaled(res: _BlockScaledRunResult, blk: int, in_key: str):
     """Kernel dequant vs fp32 reference: within the fp8 pipeline tolerance plus
     three times the pure block-quantization floor of the reference itself."""
@@ -385,7 +360,9 @@ def _run(
         # Dequantize O from (bytes, sf_o) in the declared layout; the reference is
         # the fp32 O times scale_o (what the kernel quantizes).
         o_ref = _ref(Q8, K8, V8, dq, dk, dv, in_key, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kw)
-        o_deq, sf_pad_ok = _dequant_block_scaled_o(Ob, sf_o_buf, blk, sf_o_layout, B, H_q, S_q, d_v, C)
+        from sdpa.block_scale_o_ref import dequant_block_scaled_o
+
+        o_deq, sf_pad_ok = dequant_block_scaled_o(Ob, sf_o_buf, blk, sf_o_layout, B, H_q, S_q, d_v, C)
         return _BlockScaledRunResult(o_deq, o_ref * scale_o, amax_o.item(), o_ref.abs().max().item(), sf_pad_ok, scale_o)
 
     def _gated(o_ref):
@@ -523,7 +500,6 @@ def test_fp8_output_dtypes(in_key, out_key):
     _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
 
 
-@_skip_on_rubin
 @pytest.mark.parametrize("sf_o_layout", ["planes", "token_major"])
 @pytest.mark.parametrize("mask", ["none", "causal"])
 @pytest.mark.parametrize("mode", list(_BLOCK_SCALED_O))
@@ -533,7 +509,8 @@ def test_fp8_block_scaled_output(mode, mask, sf_o_layout):
     """Block-scaled O epilogue (sf_o): FP4 O + E4M3/16 scales, or E4M3 O + UE8M0/32
     scales, on the d128 flavor. S_q = 300 exercises a partially valid tail tile
     (per-plane pad rows must come back zero), B > 1 the plane / token-major row
-    bookkeeping, GQA the head -> plane mapping."""
+    bookkeeping, GQA the head -> plane mapping. Runs on the whole SM100 line: the
+    Rubin d128 per-tensor FP8 kernel carries the same epilogue (_D128_ARCH picks it)."""
     blk = _BLOCK_SCALED_O[mode]
     res = _run(
         2,
