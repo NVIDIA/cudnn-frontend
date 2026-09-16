@@ -13,10 +13,6 @@ import cuda.bindings.driver as cuda
 
 @lru_cache(maxsize=None)
 def _device_capability(device_index: int):
-    # Imported lazily, like every other torch use in this module: jax_kernels.py
-    # pulls BucketedK2QCsrUniversal from here and must not drag torch in.
-    import torch
-
     return torch.cuda.get_device_capability(device_index)
 
 
