@@ -3,6 +3,8 @@
 
 import numpy as np
 import pytest
+import subprocess
+import sys
 import torch
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
@@ -30,8 +32,40 @@ def test_bsa_jax_torch_parity(layout):
     index = np.broadcast_to(np.array([0, 3], np.int32), (1, 2, 2, 2)).copy()
     ti, ji = torch.tensor(index, device="cuda"), jnp.asarray(index)
     tf = BSA.block_sparse_attention_forward(tq, tk, tv, ti, 2, sparse_block_size=128, layout=layout)
-    jf = jax.jit(lambda q, k, v, i: BSA.block_sparse_attention_forward_jax(q, k, v, i, 2, layout=layout))(jq, jk, jv, ji)
+    jf = jax.jit(lambda q, k, v, i: BSA.block_sparse_attention_forward(q, k, v, i, 2, layout=layout))(jq, jk, jv, ji)
     tb = BSA.block_sparse_attention_backward(torch.ones_like(tq), tq, tk, tv, tf[0], tf[1], ti, 2, sparse_block_size=128, layout=layout)
-    jb = BSA.block_sparse_attention_backward_jax(jnp.ones_like(jq), jq, jk, jv, jf[0], jf[1], ji, 2, layout=layout, bucket_size_blocks=1)
+    jb = BSA.block_sparse_attention_backward(jnp.ones_like(jq), jq, jk, jv, jf[0], jf[1], ji, 2, layout=layout, bucket_size_blocks=1)
     for jt, tt in zip((*jf, *jb), (*tf, *tb)):
         np.testing.assert_allclose(np.asarray(jt.astype(jnp.float32)), tt.float().cpu().numpy(), atol=3e-2, rtol=3e-2)
+
+    for q, k, v, index in ((tq, jk, tv, ti), (jq, tk, jv, ji), (jq, jk, jv, ti)):
+        with pytest.raises(TypeError, match="same framework"):
+            BSA.block_sparse_attention_forward(q, k, v, index, 2, layout=layout)
+    with pytest.raises(TypeError, match="same framework"):
+        BSA.block_sparse_attention_backward(tq, jq, jk, jv, jf[0], jf[1], ji, 2, layout=layout)
+
+
+def test_torch_runtime_without_jax():
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("This isolation case uses SM100 blk128")
+    script = """
+import sys
+class NoJax:
+    def find_spec(self, fullname, *args):
+        if fullname == "jax" or fullname.startswith("jax."):
+            raise ModuleNotFoundError("JAX is unavailable", name=fullname)
+sys.meta_path.insert(0, NoJax())
+import torch
+from cudnn import BSA
+q = torch.ones((1, 1, 256, 64), device="cuda", dtype=torch.bfloat16)
+i = torch.arange(2, device="cuda", dtype=torch.int32).expand(1, 1, 2, 2).contiguous()
+o, lse = BSA.block_sparse_attention_forward(q, q, q, i, 2)
+dq, dk, dv = BSA.block_sparse_attention_backward(q, q, q, q, o, lse, i, 2)
+torch.testing.assert_close(o, q)
+torch.testing.assert_close(dq, torch.zeros_like(q), atol=1e-3, rtol=0)
+torch.testing.assert_close(dk, torch.zeros_like(q), atol=1e-3, rtol=0)
+torch.testing.assert_close(dv, q)
+assert "jax" not in sys.modules
+assert "cudnn.block_sparse_attention.jax_api" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=120)

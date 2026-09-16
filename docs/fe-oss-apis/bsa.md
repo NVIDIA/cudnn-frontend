@@ -290,11 +290,26 @@ We would like to express our gratitude to [huangyitong.hyt@alibaba-inc.com](mail
 throughout the deployment process, which has continuously advanced the BSA kernel
 toward Speed of Light.
 
-## Experimental JAX API
+## Experimental JAX support
 
-The JAX draft reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
+`block_sparse_attention_forward` and `block_sparse_attention_backward` accept
+PyTorch tensors or JAX arrays, including tracers under `jax.jit`. All tensor
+arguments must use the same framework. The implementation is selected lazily;
+JAX execution requires no PyTorch, and PyTorch execution requires no JAX.
+
+The JAX-only gradient helper is `BSA.block_sparse_attention`, also available as
+`cudnn.block_sparse_attention.block_sparse_attention`. The top-level
+`cudnn.block_sparse_attention` remains the module. The newly introduced `_jax`
+function names have been removed without compatibility aliases.
+
+The JAX implementation reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
 backward, and gradient conversion kernels. Install `jax[cuda13]` alongside the
 frontend (CuTeDSL >=4.7, JAX >=0.9.1). The runtime imports no PyTorch; torch parity tests are separate.
+
+JAX forward requires `pack_gqa=None` or `False`, `kv_splits=1`, and `use_clc=None`.
+JAX backward allocates fresh gradient arrays and rejects `dq_tensor`, `dk_tensor`,
+and `dv_tensor` output buffers. `allow_empty_block_nums` on backward is supported
+only for JAX. Other support limits below remain unchanged.
 
 ### Initial contract
 
@@ -306,7 +321,7 @@ frontend (CuTeDSL >=4.7, JAX >=0.9.1). The runtime imports no PyTorch; torch par
 | Layout | Compact BHSD or BSHD, independently specialized |
 | Sparsity | 128-token blocks, int32 indices `[B,H,Sq/128,C]`, no `block_sizes` |
 | Counts | Fixed even `block_sparse_num` in `[2,C]`, or runtime int32 `q2k_block_nums[B,H,Sq/128]` |
-| Differentiation | First-order reverse-mode Q/K/V gradients through `block_sparse_attention_jax` |
+| Differentiation | First-order reverse-mode Q/K/V gradients through `block_sparse_attention` |
 
 Variable counts must be in `[1,C]`, or `[0,C]` with
 `allow_empty_block_nums=True`. Only each row's active prefix is read. Active
@@ -328,10 +343,10 @@ runtime operands. Do not mutate saved forward inputs or metadata before backward
 import jax
 import jax.numpy as jnp
 from functools import partial
-from cudnn import (
-    block_sparse_attention_forward_jax as forward,
-    block_sparse_attention_backward_jax as backward,
-    block_sparse_attention_jax as attention,
+from cudnn.block_sparse_attention import (
+    block_sparse_attention_forward as forward,
+    block_sparse_attention_backward as backward,
+    block_sparse_attention as attention,
 )
 
 q = jnp.ones((1, 2, 256, 64), dtype=jnp.bfloat16)
