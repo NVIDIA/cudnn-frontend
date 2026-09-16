@@ -448,6 +448,20 @@ def test_paged_graph_small_batch_chunk_splits_only_where_the_combine_is_cheap(s_
     assert plan.knobs.pack_gqa is True and plan.knobs.sched_policy == 0, plan.knobs
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("H,KH,s_kv,lead_split", [(16, 2, 32768, 32), (64, 4, 4096, 8)], ids=["b1_16_2_32k_split32", "b1_64_4_4k_split8"])
+def test_paged_graph_few_unit_long_kv_splits_to_the_latency_floor(H, KH, s_kv, lead_split):
+    """b=1 decode with two or four KV heads: the whole launch is a handful of
+    cga1 CTAs, so the wave model splits the KV loop across the idle SMs -- and
+    stops where a finer split's partials cost the lone combine block more than
+    the loop saves (choose_split_kv's COMBINE_FLOOR): 32 splits over the 32k
+    cache (B200 39.7 us; 64 measured 50.8) and 8 over the 4k one (20.3 us; 16
+    measured 22.3). Runs the split lead under the sync-debug guard and checks
+    O and Stats against the fp32 gather reference."""
+    plan = _run_graph(1, H, KH, D, 16, s_kv // 16, [s_kv], hnd=False, dtype=torch.bfloat16, stats=True, want_cga=1, lead_split=lead_split)
+    assert plan.knobs.pack_gqa is True and plan.knobs.sched_policy == 0, plan.knobs
+
+
 # --- kernel template, direct -----------------------------------------------
 #
 # What the graph path's heuristic would not choose on its own: forced split

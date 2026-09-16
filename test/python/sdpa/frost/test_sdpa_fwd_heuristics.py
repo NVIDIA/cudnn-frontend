@@ -585,6 +585,53 @@ def test_d128_one_cta_units_split_only_where_the_combine_is_cheap():
 
 
 @pytest.mark.L0
+def test_d128_few_unit_long_kv_splits_to_the_combine_latency_floor():
+    """b=1 with a handful of KV heads: the whole launch is a few cga1 CTAs, so
+    the split leg fills the wave with partials -- and once each split is a few
+    KV tiles, the combine's serial walk over them costs more than the loop
+    saves. The wave model prices that walk at a lone block's latency
+    (choose_split_kv's COMBINE_FLOOR), so the lead stops one power of two short
+    of the full wave where that is what measures (B200, paged bf16, kernel
+    time, heuristic lead against the split one step finer): h=16/2 S_kv=32k
+    32 splits at 39.7 us (64: 50.8); h=64/4 S_kv=4k 8 at 20.3 us (16: 22.3),
+    the same at S_q=4 MTP (25.4 vs 28.3) and for h=32/8 (20.3 vs 23.6). Where
+    the wave boundary already stops the split the lead is what it was:
+    h=64/4 S_kv=32k 32 splits (43.0 us; the base cga2 split 16: 48.5), b=4
+    h=64/4 S_kv=4k 8 (21.5 vs base 26.9) and b=8 4 (26.6 vs base 38.9)."""
+
+    def lead(**over):
+        knobs = _f16_plans(_decode_facts(**{"b": 1, **over}))[0].knobs
+        assert knobs.cga == 1 and knobs.pack_gqa is True and knobs.sched_policy == 0, knobs
+        return knobs.split_kv
+
+    assert lead(h_q=16, h_kv=2, s_kv=32768) == 32
+    assert lead(h_q=64, h_kv=4, s_kv=4096) == 8
+    assert lead(h_q=64, h_kv=4, s_kv=4096, s_q=4, causal=True, bottom_right=True) == 8
+    assert lead(h_q=32, h_kv=8, s_kv=4096) == 8
+    assert lead(h_q=64, h_kv=4, s_kv=32768) == 32
+    assert lead(b=4, h_q=64, h_kv=4, s_kv=4096) == 8
+    assert lead(b=8, h_q=64, h_kv=4, s_kv=4096) == 4
+
+
+@pytest.mark.L0
+def test_unsplit_leg_accounting_moves_the_wide_head_flavors_too():
+    """The unsplit leg paying no combine (choose_split_kv) is shared by every
+    flavor's split leg, so the d192x128 and d256 f16 leads it moves belong to
+    this change: few-unit 2k-KV chunks with thousands of output rows, whose
+    split 2 the phantom combine wave-set used to buy. Measured B200 bf16 dense
+    (heuristic lead against the old split 2 pinned): d256 b=1 h=64/4 S_q=128
+    mask-free 51.7 vs 75.3 us; d192 b=1 h=32/8 S_q=256 causal 35.3 vs 60.9 us.
+    Both stay on cga2 -- the cga1 rule is d128's alone -- and neither list
+    proposes a split any more."""
+    wide = dict(b=1, s_kv=2048, **_DENSE)
+    d256 = _f16_plans(_decode_facts(d_qk=256, d_v=256, h_q=64, h_kv=4, s_q=128, **wide))
+    d192 = _f16_plans(_decode_facts(d_qk=192, d_v=128, h_q=32, h_kv=8, s_q=256, causal=True, **wide))
+    for plans in (d256, d192):
+        assert (plans[0].knobs.cga, plans[0].knobs.split_kv) == (2, 1), plans[0].knobs
+        assert all(p.knobs.split_kv == 1 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
 def test_d128_cga_request_domain():
     """The f16 row admits cga1 AND cga2 on d128, split or not (the kernel's cga1
     QO-alias configuration is validated with splits); a width the flavor has no
