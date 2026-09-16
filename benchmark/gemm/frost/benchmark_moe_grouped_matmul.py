@@ -76,9 +76,9 @@ def _build_spec_map():
         moe=_MoeS(num_experts=8),
     )
     m = {}
-    for t, cfg in _candidates(chain):
+    for t, cfg in _candidates(chain, sweep_swap_ab=True):
         label = cfg.name
-        m[label] = (cfg, cfg.cta_group)
+        m[label] = (cfg, getattr(cfg, "cta_group", 1))
     return m
 
 

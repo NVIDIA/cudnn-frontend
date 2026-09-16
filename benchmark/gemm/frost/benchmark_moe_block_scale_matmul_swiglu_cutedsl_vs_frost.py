@@ -278,7 +278,7 @@ def _frost_spec_map(combo, output_mode, alignment=1):
 
     chain = analyze(_frost_graph(1024, 256, 512, 2, combo, output_mode, alignment)[0])
     m = {}
-    for _template, cfg in registry_candidates(chain):
+    for _template, cfg in registry_candidates(chain, sweep_swap_ab=True):
         if cfg.pipeline != "sm100" or cfg.mma_tile_m != 128:
             continue
         m[cfg.name] = (cfg, cfg.cta_group)
