@@ -13,4 +13,4 @@ WORKDIR /opt/cudnn-frontend
 COPY . .
 RUN python -m pip install --no-cache-dir .
 
-CMD ["python", "-m", "pytest", "test/jax", "-q", "--require-sm100"]
+CMD ["python", "-m", "pytest", "test/python/fe_api/jax", "--confcutdir=test/python/fe_api/jax", "-q", "--require-sm100"]
