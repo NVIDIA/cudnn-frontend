@@ -184,6 +184,10 @@ class KdaHopperEngine(BaseEngine):
             raise NotImplementedError("KdaHopperEngine: forward only; there is no Hopper KDA backward kernel yet")
         if facts.checkpoint_every_n_tokens:
             raise NotImplementedError("KdaHopperEngine: state_checkpoints are not produced by the Hopper kernel")
+        if facts.has_state_indices:
+            raise NotImplementedError("KdaHopperEngine: state_indices (pool-addressed state) is unsupported")
+        if facts.overwrite_initial_state:
+            raise NotImplementedError("KdaHopperEngine: overwrite_initial_state is unsupported")
         if facts.safe_gate or facts.has_a_log or facts.has_dt_bias:
             raise NotImplementedError("KdaHopperEngine: the kernel takes log-space g directly; safe_gate/a_log/dt_bias are unsupported")
         if facts.use_beta_sigmoid:

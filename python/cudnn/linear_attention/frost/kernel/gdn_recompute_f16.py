@@ -245,7 +245,6 @@ def tmastg_warp(
         )
         checkpoint_store_cnt = cutlass.Int32(0)
         checkpoint_chunks = checkpoint_every_n_tokens // cutlass.Int32(cfg.b_t)
-    heads_out = cutlass.Int32(cfg.n_heads_out)
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
 
     while tile_idx < total_tiles:
@@ -620,6 +619,8 @@ def tmaldg_warp(
     mScheduler,
     sScheduler,
     bars,
+    k_ratio,
+    v_ratio,
 ):
     """TMA-LDG warp role: persistent scheduler loop + per-chunk K/V G->S TMA
     loads, plus the chunk-factor tile TMA loads."""
@@ -671,14 +672,13 @@ def tmaldg_warp(
         tma_subtile_stride_elems=bt * granule,
     )
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
-
     while tile_idx < total_tiles:
         batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
             cfg, tile_idx, mWorkItems
         )
 
-        head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
-        head_v = head_idx if cfg.v_ratio == 1 else head_idx // cutlass.Int32(cfg.v_ratio)
+        head_k = head_idx // k_ratio
+        head_v = head_idx // v_ratio
         slot = batch_idx * desc_qwords
         desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
         desc_v_slot = (desc_v_base + slot).tospace(cutlass.AddressSpace.generic)
@@ -868,10 +868,14 @@ def compute1_warp_group(
                     seed_row = seed_row + (seed_len + seed_every_n_tokens - cutlass.Int32(1)) // seed_every_n_tokens
                     seed_b = seed_b + cutlass.Int32(1)
                 gSeed = mSeedCheckpoints[None, None, head_idx, seed_row]
+                checkpoint_vw = 16 // (mSeedCheckpoints.element_type.width // 8)
+                checkpoint_src = (gSeed.iterator + gSeed.layout((state_gmem_row, 0))).raw_ptr()
                 for i in cutlass.range_constexpr(num_ldtms):
                     seed_words = []
-                    for seed_kk in cutlass.range_constexpr(32):
-                        seed_words.append(gSeed[state_gmem_row, i * ldtm_width + seed_kk].to(cfg.acc_dtype))
+                    for checkpoint_group in cutlass.range_constexpr(ldtm_width // checkpoint_vw):
+                        checkpoint_chunk = (checkpoint_src + i * ldtm_width + checkpoint_group * checkpoint_vw).load(count=checkpoint_vw, alignment=16)
+                        for checkpoint_elem in cutlass.range_constexpr(checkpoint_vw):
+                            seed_words.append(checkpoint_chunk[checkpoint_elem].to(cfg.acc_dtype))
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
@@ -881,18 +885,20 @@ def compute1_warp_group(
             if cutlass.const_expr(cfg.use_initial_state or cfg.seed_identity):
                 if cutlass.const_expr(cfg.use_initial_state):
                     gState_init = mState_init[None, None, head_idx, batch_idx]
+                    seed_vw = 16 // (mState_init.element_type.width // 8)
+                    seed_src = (gState_init.iterator + gState_init.layout((state_gmem_row, 0))).raw_ptr()
                 seed_state = compute_start == 0
                 if seed_state:
                     for i in cutlass.range_constexpr(num_ldtms):
                         words = []
-                        for k in cutlass.range_constexpr(32):
-                            if cutlass.const_expr(cfg.seed_identity):
-                                v = cutlass.Float32(1.0) if state_gmem_row == i * ldtm_width + k else cutlass.Float32(0.0)
-                            else:
-                                v = gState_init[state_gmem_row, i * ldtm_width + k]
-                                if cutlass.const_expr(cfg.state_dtype != cfg.acc_dtype):
-                                    v = v.to(cfg.acc_dtype)
-                            words.append(v)
+                        if cutlass.const_expr(cfg.seed_identity):
+                            for k in cutlass.range_constexpr(32):
+                                words.append(cutlass.Float32(1.0) if state_gmem_row == i * ldtm_width + k else cutlass.Float32(0.0))
+                        else:
+                            for g in cutlass.range_constexpr(ldtm_width // seed_vw):
+                                seed_chunk = (seed_src + i * ldtm_width + g * seed_vw).load(count=seed_vw, alignment=16)
+                                for t in cutlass.range_constexpr(seed_vw):
+                                    words.append(seed_chunk[t].to(cfg.acc_dtype))
                         nvvm.tcgen05_st(
                             "32x32b",
                             nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
@@ -1102,14 +1108,18 @@ def compute1_warp_group(
             if cutlass.const_expr(cfg.store_final_state):
                 if write_end == batch_num_chunks:
                     gState_out = mState_out[None, None, head_idx, batch_idx]
+                    state_vw = 16 // (mState_out.element_type.width // 8)
+                    state_dst = (gState_out.iterator + gState_out.layout((state_gmem_row, 0))).raw_ptr()
                     for i in cutlass.range_constexpr(num_ldtms):
                         state_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32), num=32)
-                        for k in cutlass.range_constexpr(32):
-                            val = state_vec[k]
-                            if cutlass.const_expr(cfg.state_dtype != cfg.acc_dtype):
-                                val = val.to(cfg.state_dtype)
-                            if state_row_valid:
-                                gState_out[state_gmem_row, i * ldtm_width + k] = val
+                        if state_row_valid:
+                            for g in cutlass.range_constexpr(ldtm_width // state_vw):
+                                (state_dst + i * ldtm_width + g * state_vw).store(
+                                    cutlass.Vector.from_elements(
+                                        tuple(state_vec[g * state_vw + t].to(mState_out.element_type) for t in range(state_vw)), mState_out.element_type
+                                    ),
+                                    alignment=16,
+                                )
         else:
             if cutlass.const_expr(cfg.store_final_state):
                 write_passthrough = write_end == batch_num_chunks
@@ -1409,91 +1419,38 @@ def host(
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
 ):
-    h_k = cfg.h_k
-    h_v = cfg.h_v
     batch_size = cu_seqlens.shape[0] - 1
-    heads_out = cfg.n_heads_out
+    heads_out = cutlass.Int32(gate.shape[1])
+    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
+    v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[1]))
+    if cutlass.const_expr(cfg.v_is_zero):
+        v_ratio = cute.FastDivmodDivisorV2(cutlass.Int32(1))
 
-    # ---- GQA reshapes: fold the head group into the Q head axis ----------------------
-    if cutlass.const_expr(cfg.is_GQA):
-        h_ratio = heads_out // h_v
-        h_native = h_v
-        k = cute.make_tensor(
-            k.iterator,
-            cute.make_layout(
-                (k.shape[0], k.shape[2], (h_ratio, h_v)),
-                stride=(k.stride[0], k.stride[2], (0, k.stride[1])),
-            ),
-        )
-        v = cute.make_tensor(
-            v.iterator,
-            cute.make_layout(
-                (v.shape[2], v.shape[0], (h_ratio, h_v)),
-                stride=(v.stride[2], v.stride[0], (0, v.stride[1])),
-            ),
-        )
-    else:
-        h_ratio = h_v // h_k
-        h_native = h_k
-        k = cute.make_tensor(
-            k.iterator,
-            cute.make_layout(
-                (k.shape[0], k.shape[2], (h_ratio, h_k)),
-                stride=(k.stride[0], k.stride[2], (0, k.stride[1])),
-            ),
-        )
-        v = cute.make_tensor(
-            v.iterator,
-            cute.make_layout(
-                (v.shape[2], v.shape[0], (h_ratio, h_k)),
-                stride=(v.stride[2], v.stride[0], (v.stride[1], h_ratio * v.stride[1])),
-            ),
-        )
-
-    gate = cute.make_tensor(
-        gate.iterator,
-        cute.make_layout(
-            (gate.shape[0], (h_ratio, h_native)),
-            stride=(gate.stride[0], (gate.stride[1], h_ratio * gate.stride[1])),
-        ),
-    )
+    # ---- head-major views: (tokens, dim, heads) k / q, (dim, tokens, heads) v / o, (V, K, heads, seqs) states ----
+    k = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[2], k.shape[1]), stride=(k.stride[0], k.stride[2], k.stride[1])))
+    v = cute.make_tensor(v.iterator, cute.make_layout((v.shape[2], v.shape[0], v.shape[1]), stride=(v.stride[2], v.stride[0], v.stride[1])))
     if cutlass.const_expr(state_in is not None):
         state_in = cute.make_tensor(
             state_in.iterator,
             cute.make_layout(
-                (state_in.shape[2], state_in.shape[3], (h_ratio, h_native), state_in.shape[0]),
-                stride=(
-                    state_in.stride[2],
-                    state_in.stride[3],
-                    (state_in.stride[1], h_ratio * state_in.stride[1]),
-                    state_in.stride[0],
-                ),
+                (state_in.shape[2], state_in.shape[3], state_in.shape[1], state_in.shape[0]),
+                stride=(state_in.stride[2], state_in.stride[3], state_in.stride[1], state_in.stride[0]),
             ),
         )
     if cutlass.const_expr(state_out is not None):
         state_out = cute.make_tensor(
             state_out.iterator,
             cute.make_layout(
-                (state_out.shape[2], state_out.shape[3], (h_ratio, h_native), state_out.shape[0]),
-                stride=(
-                    state_out.stride[2],
-                    state_out.stride[3],
-                    (state_out.stride[1], h_ratio * state_out.stride[1]),
-                    state_out.stride[0],
-                ),
+                (state_out.shape[2], state_out.shape[3], state_out.shape[1], state_out.shape[0]),
+                stride=(state_out.stride[2], state_out.stride[3], state_out.stride[1], state_out.stride[0]),
             ),
         )
     if cutlass.const_expr(seed_state_checkpoints is not None):
         seed_state_checkpoints = cute.make_tensor(
             seed_state_checkpoints.iterator,
             cute.make_layout(
-                (seed_state_checkpoints.shape[2], seed_state_checkpoints.shape[3], (h_ratio, h_native), seed_state_checkpoints.shape[0]),
-                stride=(
-                    seed_state_checkpoints.stride[2],
-                    seed_state_checkpoints.stride[3],
-                    (seed_state_checkpoints.stride[1], h_ratio * seed_state_checkpoints.stride[1]),
-                    seed_state_checkpoints.stride[0],
-                ),
+                (seed_state_checkpoints.shape[2], seed_state_checkpoints.shape[3], seed_state_checkpoints.shape[1], seed_state_checkpoints.shape[0]),
+                stride=(seed_state_checkpoints.stride[2], seed_state_checkpoints.stride[3], seed_state_checkpoints.stride[1], seed_state_checkpoints.stride[0]),
             ),
         )
 
@@ -1513,9 +1470,6 @@ def host(
     cfg.tma_v_bytes = v_tile_elements * bpe
     cfg.tma_tinv_bytes = tinv_tile_elements * bpe
 
-    cfg.n_heads_out = heads_out
-    cfg.k_ratio = heads_out // h_k
-    cfg.v_ratio = heads_out // h_v
     num_descs = batch_size
 
     # ---- launch ----------------------------------------------------------------------
@@ -1523,6 +1477,8 @@ def host(
 
     frost_gdn_recompute(
         cfg,
+        k_ratio,
+        v_ratio,
         gate,
         a_log,
         dt_bias,
@@ -1554,6 +1510,8 @@ def host(
 @cute.kernel
 def frost_gdn_recompute(
     cfg: cutlass.Constexpr,
+    k_ratio: cute.FastDivmodDivisorV2,
+    v_ratio: cute.FastDivmodDivisorV2,
     mGate: cute.Tensor,
     mA_log: Optional[cute.Tensor],
     mDt_bias: Optional[cute.Tensor],
@@ -1780,6 +1738,8 @@ def frost_gdn_recompute(
             mScheduler=mScheduler,
             sScheduler=sScheduler,
             bars=bars,
+            k_ratio=k_ratio,
+            v_ratio=v_ratio,
         )
 
     if warp_idx == cfg.epilogue_warp_id:
@@ -1814,7 +1774,6 @@ class GdnRecomputeCfg:
     acc_dtype: Type[cutlass.Numeric]
     state_dtype: Type[cutlass.Numeric]
     max_active_clusters: int
-    is_GQA: bool
     use_initial_state: bool
     store_final_state: bool
     enable_checkpoints: bool
@@ -1868,9 +1827,6 @@ class GdnRecomputeCfg:
     tma_kq_bytes: int = 0
     tma_v_bytes: int = 0
     tma_tinv_bytes: int = 0
-    n_heads_out: int = 0
-    k_ratio: int = 1
-    v_ratio: int = 1
 
 
 def build_cfg(
@@ -1878,7 +1834,6 @@ def build_cfg(
     state_dtype: Type[cutlass.Numeric],
     *,
     max_active_clusters: int,
-    is_GQA: bool,
     use_initial_state: bool,
     store_final_state: bool = True,
     enable_checkpoints: bool = False,
@@ -1898,7 +1853,6 @@ def build_cfg(
         acc_dtype=cutlass.Float32,
         state_dtype=state_dtype,
         max_active_clusters=max_active_clusters,
-        is_GQA=is_GQA,
         use_initial_state=use_initial_state,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
@@ -1943,13 +1897,9 @@ def get_compiled_cache(
     dt_bias_dtype_str: str,
     device: int,
     num_sm: int,
-    HK: int,
-    HV: int,
-    HO: int,
     DK: int,
     DV: int,
     expand_num: int,
-    is_GQA: bool,
     use_initial_state: bool,
     store_final_state: bool,
     enable_checkpoints: bool,
@@ -1968,7 +1918,6 @@ def get_compiled_cache(
 def compile(
     io_dtype,
     state_dtype,
-    is_GQA: bool,
     use_initial_state: bool,
     store_final_state: bool,
     enable_checkpoints: bool,
@@ -1979,9 +1928,6 @@ def compile(
     v_is_zero: bool = False,
     *,
     num_sm: int,
-    h_k: int,
-    h_v: int,
-    n_heads_out: int,
     d_k: int,
     d_v: int,
     expand_num: int = 1,
@@ -2008,7 +1954,6 @@ def compile(
         io_dtype,
         state_dtype,
         max_active_clusters=num_sm,
-        is_GQA=is_GQA,
         use_initial_state=use_initial_state,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
@@ -2021,9 +1966,6 @@ def compile(
         d_v=d_v,
         expand_num=expand_num,
     )
-    cfg.h_k = h_k
-    cfg.h_v = h_v
-    cfg.n_heads_out = n_heads_out
 
     return cute.compile(
         host,
@@ -2045,7 +1987,7 @@ def compile(
         seed_every_n_tokens,
         workspace_cute,
         stream,
-        options="--enable-tvm-ffi --opt-level 3",
+        options="--enable-tvm-ffi --opt-level 2",
     )
 
 
@@ -2154,7 +2096,6 @@ def chunk_gdn_recompute_sm100(
         if checkpoint_every_n_tokens > 0 or seed_state_checkpoints is not None:
             raise ValueError("seed_identity does not support checkpoint staging")
     B = cu_seqlens.shape[0] - 1
-    is_GQA = HK >= HV
     use_initial_state = initial_state is not None
     store_final_state = output_state is not None
     enable_checkpoints = checkpoint_every_n_tokens > 0
@@ -2197,13 +2138,9 @@ def chunk_gdn_recompute_sm100(
         str(dt_bias.dtype) if dt_bias is not None else "none",
         device,
         num_sm,
-        HK,
-        HV,
-        HO,
         DK,
         DV,
         expand_num,
-        is_GQA,
         use_initial_state,
         store_final_state,
         enable_checkpoints,
@@ -2220,19 +2157,17 @@ def chunk_gdn_recompute_sm100(
         k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         gate_cute = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        a_log_cute = from_dlpack(a_log, assumed_align=4) if a_log is not None else None
-        dt_bias_cute = from_dlpack(dt_bias, assumed_align=4) if dt_bias is not None else None
+        a_log_cute = from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None
+        dt_bias_cute = from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
         cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
 
         state_in_cute = None
         if use_initial_state:
-            state_in_cute = from_dlpack(initial_state, assumed_align=16)
-            state_in_cute.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
+            state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
         state_out_cute = None
         if store_final_state:
-            state_out_cute = from_dlpack(output_state, assumed_align=16)
-            state_out_cute.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
+            state_out_cute = from_dlpack(output_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
         seed_checkpoints_cute = None
         if seed_checkpoints:
@@ -2251,7 +2186,6 @@ def chunk_gdn_recompute_sm100(
         cache["compiled"] = compile(
             io_dtype,
             state_dtype,
-            is_GQA,
             use_initial_state,
             store_final_state,
             enable_checkpoints,
@@ -2261,9 +2195,6 @@ def chunk_gdn_recompute_sm100(
             seed_identity,
             v_is_zero,
             num_sm=num_sm,
-            h_k=HK,
-            h_v=HV,
-            n_heads_out=HO,
             d_k=DK,
             d_v=DV,
             expand_num=expand_num,
@@ -2330,7 +2261,7 @@ def chunk_gdn_recompute_sm100(
             tinv_placeholder,
             workspace_placeholder,
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
         cache["prologue"](

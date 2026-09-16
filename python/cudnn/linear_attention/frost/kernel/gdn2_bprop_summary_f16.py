@@ -812,6 +812,8 @@ def tmaldg_warp(
     desc_do_base,
     desc_beta_base,
     bars,
+    q_ratio,
+    k_ratio,
 ) -> None:
     """TMA-LDG warp role (warp 14): every G->S operand load."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
@@ -889,8 +891,8 @@ def tmaldg_warp(
             cfg, bars, sScheduler, mScheduler, scheduler_state, tile_idx, num_ctas, tail_base, tail_row, elect_one
         )
         head_o = head_idx
-        head_q = head_idx if cfg.q_ratio == 1 else head_idx // cutlass.Int32(cfg.q_ratio)
-        head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
+        head_q = head_idx // q_ratio
+        head_k = head_idx // k_ratio
         slot = batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
         desc_q_slot = (desc_q_base + slot).tospace(cutlass.AddressSpace.generic)
         desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
@@ -1750,6 +1752,8 @@ def prologue(
 @cute.jit
 def host(
     cfg: cutlass.Constexpr,
+    q_ratio: cutlass.Int32,
+    k_ratio: cutlass.Int32,
     a_log: cute.Tensor | None,
     dt_bias: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
@@ -1762,6 +1766,8 @@ def host(
     scale: cutlass.Float32,
     stream,
 ) -> None:
+    q_ratio = cute.FastDivmodDivisorV2(q_ratio)
+    k_ratio = cute.FastDivmodDivisorV2(k_ratio)
     num_sequences = cu_seqlens.shape[0] - 1
 
     # ---- launch ----------------------------------------------------------------------
@@ -1769,6 +1775,8 @@ def host(
     grid_shape = (cfg.max_active_clusters, 1, 1)
     frost_gdn2_bprop_summary(
         cfg,
+        q_ratio,
+        k_ratio,
         tensormap_workspace,
         n_desc,
         cu_seqlens,
@@ -1792,6 +1800,8 @@ def host(
 @cute.kernel
 def frost_gdn2_bprop_summary(
     cfg: cutlass.Constexpr,
+    q_ratio: cute.FastDivmodDivisorV2,
+    k_ratio: cute.FastDivmodDivisorV2,
     tensormap_workspace: cute.Tensor,
     n_desc: cutlass.Int32,
     cu_seqlens: cute.Tensor,
@@ -1969,6 +1979,8 @@ def frost_gdn2_bprop_summary(
             desc_do_base,
             desc_beta_base,
             bars,
+            q_ratio=q_ratio,
+            k_ratio=k_ratio,
         )
     elif warp_idx == cfg.super_mma_warp_id:
         super_mma_warp(
@@ -2075,10 +2087,6 @@ class Gdn2BpropSummaryCfg:
     beta_sigmoid: bool
     allow_neg_eigval: bool
     beta_guard: bool
-    q_ratio: int
-    k_ratio: int
-    v_ratio: int
-    n_heads_out: int
     max_active_clusters: int
     d_k: int
     d_v: int
@@ -2141,10 +2149,6 @@ def build_cfg(
     beta_sigmoid: bool,
     allow_neg_eigval: bool,
     beta_guard: bool = False,
-    q_ratio: int,
-    k_ratio: int,
-    v_ratio: int,
-    n_heads_out: int,
     max_active_clusters: int,
     d_k: int,
     d_v: int,
@@ -2162,10 +2166,6 @@ def build_cfg(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         beta_guard=beta_guard,
-        q_ratio=q_ratio,
-        k_ratio=k_ratio,
-        v_ratio=v_ratio,
-        n_heads_out=n_heads_out,
         max_active_clusters=max_active_clusters,
         d_k=d_k,
         d_v=d_v,
@@ -2212,9 +2212,6 @@ def get_compiled_cache(
     cu_dtype_str: str,
     device: int,
     num_sm: int,
-    HQ: int,
-    HK: int,
-    HV: int,
     DK: int,
     DV: int,
     use_dstate_in: bool,
@@ -2246,8 +2243,6 @@ def compile(
     beta_guard: bool,
     q_ratio: int,
     k_ratio: int,
-    v_ratio: int,
-    n_heads_out: int,
     *,
     d_k: int,
     d_v: int,
@@ -2277,10 +2272,6 @@ def compile(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         beta_guard=beta_guard,
-        q_ratio=q_ratio,
-        k_ratio=k_ratio,
-        v_ratio=v_ratio,
-        n_heads_out=n_heads_out,
         max_active_clusters=num_sm,
         d_k=d_k,
         d_v=d_v,
@@ -2289,6 +2280,8 @@ def compile(
     return cute.compile(
         host,
         cfg,
+        cutlass.Int32(q_ratio),
+        cutlass.Int32(k_ratio),
         a_log_cute,
         dt_bias_cute,
         cu_seqlens_cute,
@@ -2378,9 +2371,6 @@ def chunk_gdn2_bwd_summary_sm100(
         str(cu_seqlens.dtype),
         device,
         num_sm,
-        HQ,
-        HK,
-        HV,
         DK,
         DV,
         use_dstate_in,
@@ -2413,9 +2403,9 @@ def chunk_gdn2_bwd_summary_sm100(
 
         tensormap_workspace_cute = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
 
-        a_log_cute = from_dlpack(a_log, assumed_align=4) if a_log is not None else None
-        dt_bias_cute = from_dlpack(dt_bias, assumed_align=16) if dt_bias is not None else None
-        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        a_log_cute = from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None
+        dt_bias_cute = from_dlpack(dt_bias, assumed_align=16).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
+        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
         cache["compiled"] = compile(
             io_dtype,
             gate_dtype,
@@ -2430,8 +2420,6 @@ def chunk_gdn2_bwd_summary_sm100(
             beta_guard=beta_guard,
             q_ratio=HO // HQ,
             k_ratio=HO // HK,
-            v_ratio=HO // HV,
-            n_heads_out=HO,
             d_k=DK,
             d_v=DV,
             num_sm=num_sm,
@@ -2455,7 +2443,7 @@ def chunk_gdn2_bwd_summary_sm100(
         gate_placeholder = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         do_placeholder = from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         beta_placeholder = from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
         workspace_placeholder = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
         staging_placeholder = None
         if not order_gen:
@@ -2486,7 +2474,7 @@ def chunk_gdn2_bwd_summary_sm100(
             scheduler_all_placeholder,
             workspace_placeholder,
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
         cache["prologue"](
@@ -2504,6 +2492,8 @@ def chunk_gdn2_bwd_summary_sm100(
             cu_stream,
         )
     cache["compiled"](
+        cutlass.Int32(HO // HQ),
+        cutlass.Int32(HO // HK),
         a_log,
         dt_bias,
         cu_seqlens,
@@ -2560,6 +2550,8 @@ def run_bwd_summary(
             cu_stream,
         )
     cache["compiled"](
+        cutlass.Int32(gate.shape[1] // q.shape[1]),
+        cutlass.Int32(gate.shape[1] // k.shape[1]),
         a_log,
         dt_bias,
         cu_seqlens,

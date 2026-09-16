@@ -711,6 +711,8 @@ def tmaldg_warp(
     desc_beta_base,
     desc_w_base,
     bars,
+    k_ratio,
+    v_ratio,
 ) -> None:
     """TMA-LDG warp role (warp 14). Persistent scheduler loop issuing the
     per-chunk K/V/Beta/W/Gate G->S loads."""
@@ -783,8 +785,8 @@ def tmaldg_warp(
             cfg, tile_idx, mWorkItems
         )
         head_o = head_idx
-        head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
-        head_v = head_idx if cfg.v_ratio == 1 else head_idx // cutlass.Int32(cfg.v_ratio)
+        head_k = head_idx // k_ratio
+        head_v = head_idx // v_ratio
         slot = batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
         desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
         desc_v_slot = (desc_v_base + slot).tospace(cutlass.AddressSpace.generic)
@@ -2308,12 +2310,19 @@ def host(
     seed_every_n_tokens: cutlass.Int32,
     stream,
 ) -> None:
+    heads_out = cutlass.Int32(raw_gate.shape[1])
+    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
+    v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[1]))
+    if cutlass.const_expr(cfg.v_is_zero):
+        v_ratio = cute.FastDivmodDivisorV2(cutlass.Int32(1))
     num_sequences = cu_seqlens.shape[0] - 1
 
     # ---- launch ----------------------------------------------------------------------
     grid_shape = (cfg.max_active_clusters, 1, 1)
     frost_gdn2_recompute(
         cfg,
+        k_ratio,
+        v_ratio,
         tensormap_workspace,
         cutlass.Int32(num_sequences),
         k,
@@ -2344,6 +2353,8 @@ def host(
 @cute.kernel
 def frost_gdn2_recompute(
     cfg: cutlass.Constexpr,
+    k_ratio: cute.FastDivmodDivisorV2,
+    v_ratio: cute.FastDivmodDivisorV2,
     tensormap_workspace: cute.Tensor,
     n_desc: cutlass.Int32,
     mK: cute.Tensor,
@@ -2510,6 +2521,8 @@ def frost_gdn2_recompute(
             desc_beta_base,
             desc_w_base,
             bars,
+            k_ratio=k_ratio,
+            v_ratio=v_ratio,
         )
     elif warp_idx == cfg.super_mma_warp_id:
         super_mma_warp(
@@ -2625,9 +2638,6 @@ class Gdn2RecomputeCfg:
     beta_sigmoid: bool
     allow_neg_eigval: bool
     beta_guard: bool
-    k_ratio: int
-    v_ratio: int
-    n_heads_out: int
     max_active_clusters: int
     d_k: int
     d_v: int
@@ -2710,9 +2720,6 @@ def build_cfg(
     beta_sigmoid: bool,
     allow_neg_eigval: bool,
     beta_guard: bool = False,
-    k_ratio: int,
-    v_ratio: int,
-    n_heads_out: int,
     max_active_clusters: int,
     seed_identity: bool = False,
     v_is_zero: bool = False,
@@ -2737,9 +2744,6 @@ def build_cfg(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         beta_guard=beta_guard,
-        k_ratio=k_ratio,
-        v_ratio=v_ratio,
-        n_heads_out=n_heads_out,
         max_active_clusters=max_active_clusters,
         seed_identity=seed_identity,
         v_is_zero=v_is_zero,
@@ -2803,9 +2807,6 @@ def get_compiled_cache(
     cu_dtype_str: str,
     device: int,
     num_sm: int,
-    HO: int,
-    HK: int,
-    HV: int,
     DK: int,
     DV: int,
     use_initial_state: bool,
@@ -2842,9 +2843,6 @@ def compile(
     beta_sigmoid: bool,
     allow_neg_eigval: bool,
     beta_guard: bool,
-    k_ratio: int,
-    v_ratio: int,
-    n_heads_out: int,
     seed_identity: bool = False,
     v_is_zero: bool = False,
     *,
@@ -2887,9 +2885,6 @@ def compile(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         beta_guard=beta_guard,
-        k_ratio=k_ratio,
-        v_ratio=v_ratio,
-        n_heads_out=n_heads_out,
         max_active_clusters=num_sm,
         seed_identity=seed_identity,
         v_is_zero=v_is_zero,
@@ -3052,8 +3047,6 @@ def chunk_gdn2_recompute_sm100(
     else:
         state_dtype_src = "float32"
 
-    k_ratio = HO // HK
-    v_ratio = HO // HV
     gate_scale_log2 = gate_lower_bound * LOG2_E
 
     if not safe_gate:
@@ -3070,9 +3063,6 @@ def chunk_gdn2_recompute_sm100(
         str(cu_seqlens.dtype),
         device,
         num_sm,
-        HO,
-        HK,
-        HV,
         DK,
         DV,
         use_initial_state,
@@ -3099,11 +3089,11 @@ def chunk_gdn2_recompute_sm100(
         k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         gate_cute = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        a_log_cute = from_dlpack(a_log, assumed_align=4) if a_log is not None else None
-        dt_bias_cute = from_dlpack(dt_bias, assumed_align=16) if dt_bias is not None else None
+        a_log_cute = from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None
+        dt_bias_cute = from_dlpack(dt_bias, assumed_align=16).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
         beta_cute = from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=2)
         w_cute = from_dlpack(w, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
 
         state_in_cute = None
         if use_initial_state:
@@ -3139,9 +3129,6 @@ def chunk_gdn2_recompute_sm100(
             use_beta_sigmoid,
             allow_neg_eigval,
             beta_guard,
-            k_ratio,
-            v_ratio,
-            HO,
             seed_identity,
             v_is_zero,
             d_k=DK,
@@ -3176,7 +3163,7 @@ def chunk_gdn2_recompute_sm100(
         gate_placeholder = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         beta_placeholder = from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         w_placeholder = from_dlpack(w, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
         workspace_placeholder = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
         state_checkpoints_placeholder = None
         if state_checkpoints_for_descs is not None:
@@ -3214,7 +3201,7 @@ def chunk_gdn2_recompute_sm100(
             cutlass.Int32(checkpoint_every_n_tokens),
             cutlass.Int32((seed_span_tokens or seed_every_n_tokens) // CFG.B_T),
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
         cache["prologue"](

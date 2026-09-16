@@ -1492,6 +1492,9 @@ def tmaldg_warp(
     desc_do_base,
     desc_checkpoint_base,
     bars,
+    q_ratio,
+    k_ratio,
+    v_ratio,
 ) -> None:
     """TMA-LDG warp role (warp 14): persistent tile-scheduler loop issuing
     every G->S TMA load."""
@@ -1584,9 +1587,9 @@ def tmaldg_warp(
             cfg, bars, sScheduler, mScheduler, scheduler_state, tile_idx, num_ctas, tail_base, tail_row, elect_one
         )
         head_o = head_idx
-        head_q = head_idx if cfg.q_ratio == 1 else head_idx // cutlass.Int32(cfg.q_ratio)
-        head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
-        head_v = head_idx if cfg.v_ratio == 1 else head_idx // cutlass.Int32(cfg.v_ratio)
+        head_q = head_idx // q_ratio
+        head_k = head_idx // k_ratio
+        head_v = head_idx // v_ratio
         slot = batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
         desc_q_slot = (desc_q_base + slot).tospace(cutlass.AddressSpace.generic)
         desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
@@ -3462,6 +3465,9 @@ def prologue(
 @cute.jit
 def host(
     cfg: cutlass.Constexpr,
+    q_ratio: cutlass.Int32,
+    k_ratio: cutlass.Int32,
+    v_ratio: cutlass.Int32,
     a_log: cute.Tensor | None,
     dt_bias: cute.Tensor | None,
     beta: cute.Tensor,
@@ -3479,6 +3485,9 @@ def host(
     scale: cutlass.Float32,
     stream,
 ) -> None:
+    q_ratio = cute.FastDivmodDivisorV2(q_ratio)
+    k_ratio = cute.FastDivmodDivisorV2(k_ratio)
+    v_ratio = cute.FastDivmodDivisorV2(v_ratio)
     num_sequences = cu_seqlens.shape[0] - 1
 
     # ---- launch ----------------------------------------------------------------------
@@ -3486,6 +3495,9 @@ def host(
     grid_shape = (cfg.max_active_clusters, 1, 1)
     frost_kda_bprop(
         cfg,
+        q_ratio,
+        k_ratio,
+        v_ratio,
         tensormap_workspace,
         n_desc,
         a_log,
@@ -3513,6 +3525,9 @@ def host(
 @cute.kernel
 def frost_kda_bprop(
     cfg: cutlass.Constexpr,
+    q_ratio: cute.FastDivmodDivisorV2,
+    k_ratio: cute.FastDivmodDivisorV2,
+    v_ratio: cute.FastDivmodDivisorV2,
     tensormap_workspace: cute.Tensor,
     n_desc: cutlass.Int32,
     mA_log: cute.Tensor | None,
@@ -3816,6 +3831,9 @@ def frost_kda_bprop(
             desc_do_base,
             desc_checkpoint_base,
             bars,
+            q_ratio=q_ratio,
+            k_ratio=k_ratio,
+            v_ratio=v_ratio,
         )
     elif warp_idx == cfg.super_mma_warp_id:
         super_mma_warp(
@@ -3986,10 +4004,6 @@ class KdaBpropCfg:
     beta_sigmoid: bool
     allow_neg_eigval: bool
     use_initial_state: bool
-    q_ratio: int
-    k_ratio: int
-    v_ratio: int
-    n_heads_out: int
     max_active_clusters: int
     d_k: int
     d_v: int
@@ -4088,10 +4102,6 @@ def build_cfg(
     beta_sigmoid: bool,
     allow_neg_eigval: bool,
     use_initial_state: bool,
-    q_ratio: int,
-    k_ratio: int,
-    v_ratio: int,
-    n_heads_out: int,
     max_active_clusters: int,
     d_k: int,
     d_v: int,
@@ -4108,10 +4118,6 @@ def build_cfg(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         use_initial_state=use_initial_state,
-        q_ratio=q_ratio,
-        k_ratio=k_ratio,
-        v_ratio=v_ratio,
-        n_heads_out=n_heads_out,
         max_active_clusters=max_active_clusters,
         d_k=d_k,
         d_v=d_v,
@@ -4181,9 +4187,6 @@ def get_compiled_cache(
     beta_dtype_str: str,
     device: int,
     num_sm: int,
-    HQ: int,
-    HK: int,
-    HV: int,
     DK: int,
     DV: int,
     use_dstate_in: bool,
@@ -4216,7 +4219,6 @@ def compile(
     q_ratio: int,
     k_ratio: int,
     v_ratio: int,
-    n_heads_out: int,
     *,
     d_k: int,
     d_v: int,
@@ -4251,10 +4253,6 @@ def compile(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         use_initial_state=use_initial_state,
-        q_ratio=q_ratio,
-        k_ratio=k_ratio,
-        v_ratio=v_ratio,
-        n_heads_out=n_heads_out,
         max_active_clusters=num_sm,
         d_k=d_k,
         d_v=d_v,
@@ -4263,6 +4261,9 @@ def compile(
     return cute.compile(
         host,
         cfg,
+        cutlass.Int32(q_ratio),
+        cutlass.Int32(k_ratio),
+        cutlass.Int32(v_ratio),
         a_log_cute,
         dt_bias_cute,
         beta_cute,
@@ -4407,9 +4408,6 @@ def chunk_kda_bwd_sm100(
         str(beta.dtype),
         device,
         num_sm,
-        HQ,
-        HK,
-        HV,
         DK,
         DV,
         use_dstate_in,
@@ -4442,8 +4440,8 @@ def chunk_kda_bwd_sm100(
 
         tensormap_workspace_cute = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
 
-        a_log_cute = from_dlpack(a_log, assumed_align=4) if a_log is not None else None
-        dt_bias_cute = from_dlpack(dt_bias, assumed_align=16) if dt_bias is not None else None
+        a_log_cute = from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None
+        dt_bias_cute = from_dlpack(dt_bias, assumed_align=16).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
         beta_cute = from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=len(beta.shape) - 1)
         gate_main_cute = None
         if not log_gate and not safe_gate:
@@ -4451,7 +4449,7 @@ def chunk_kda_bwd_sm100(
         state_checkpoints_cute = from_dlpack(state_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=len(state_checkpoints.shape) - 1)
         dgate_cute = from_dlpack(dgate, assumed_align=16).mark_layout_dynamic(leading_dim=len(dgate.shape) - 1)
         dbeta_cute = from_dlpack(dbeta, assumed_align=4).mark_layout_dynamic(leading_dim=len(dbeta.shape) - 1)
-        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
         cache["compiled"] = compile(
             io_dtype,
             gate_dtype,
@@ -4467,7 +4465,6 @@ def chunk_kda_bwd_sm100(
             q_ratio=HO // HQ,
             k_ratio=HO // HK,
             v_ratio=HO // HV,
-            n_heads_out=HO,
             d_k=DK,
             d_v=DV,
             num_sm=num_sm,
@@ -4501,7 +4498,7 @@ def chunk_kda_bwd_sm100(
         dv_placeholder = from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         dgate_placeholder = from_dlpack(dgate, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         state_checkpoints_placeholder = from_dlpack(state_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
         workspace_placeholder = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
         staging_placeholder = None
         if run_order and not order_gen:
@@ -4537,7 +4534,7 @@ def chunk_kda_bwd_sm100(
             scheduler_placeholder,
             workspace_placeholder,
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
         cache["prologue"](
@@ -4561,6 +4558,9 @@ def chunk_kda_bwd_sm100(
         )
     cache["gate_main"] = not log_gate and not safe_gate
     cache["compiled"](
+        cutlass.Int32(HO // HQ),
+        cutlass.Int32(HO // HK),
+        cutlass.Int32(HO // HV),
         a_log,
         dt_bias,
         beta,
@@ -4635,6 +4635,9 @@ def run_bwd(
             cu_stream,
         )
     cache["compiled"](
+        cutlass.Int32(gate.shape[1] // q.shape[1]),
+        cutlass.Int32(gate.shape[1] // k.shape[1]),
+        cutlass.Int32(gate.shape[1] // v.shape[1]),
         a_log,
         dt_bias,
         beta,

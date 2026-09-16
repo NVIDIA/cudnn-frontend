@@ -62,6 +62,8 @@ def make_fprop_cache_key(
     checkpoint,
     device,
     plan_name,
+    overwrite_initial_state,
+    state_pool_rows=None,
 ):
     return (
         "gdp_fprop",
@@ -93,6 +95,8 @@ def make_fprop_cache_key(
         checkpoint,
         device,
         plan_name,
+        bool(overwrite_initial_state),
+        state_pool_rows,
     )
 
 
@@ -200,6 +204,9 @@ def build_fprop_graph(
     gate_domain="log",
     a_log_dtype=None,
     dt_bias_dtype=None,
+    overwrite_initial_state=False,
+    state_indices_dtype=None,
+    state_pool_rows=None,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -212,7 +219,12 @@ def build_fprop_graph(
     cu_t = graph.tensor([N + 1], data_type=cu_dtype, name="cu_seqlens")
     state0_t = None
     if state_dtype is not None:
-        state0_t = graph.tensor([N, HO, V, K], data_type=state_dtype, name="initial_state")
+        state_rows = N if state_pool_rows is None else state_pool_rows
+        state0_t = graph.tensor([state_rows, HO, V, K], data_type=state_dtype, name="initial_state")
+    state_indices_t = None
+    if state_indices_dtype is not None:
+        state_indices_t = graph.tensor([N], data_type=state_indices_dtype, name="state_indices")
+    pool_ports = {"state_indices": state_indices_t} if state_indices_t is not None else {}
     a_log_t = dt_bias_t = None
     if a_log_dtype is not None:
         a_log_t = graph.tensor([HO], data_type=a_log_dtype, name="a_log")
@@ -226,6 +238,7 @@ def build_fprop_graph(
         beta=beta_t,
         cu_seqlens=cu_t,
         initial_state=state0_t,
+        **pool_ports,
         a_log=a_log_t,
         dt_bias=dt_bias_t,
         num_householder=num_householder,
@@ -237,6 +250,7 @@ def build_fprop_graph(
         allow_neg_eigval=allow_neg_eigval or None,
         safe_gate=safe_gate or None,
         gate_domain=None if gate_domain == "log" else gate_domain,
+        overwrite_initial_state=overwrite_initial_state or None,
         checkpoint_every_n_tokens=checkpoint,
         name="gdp",
     )
@@ -248,6 +262,7 @@ def build_fprop_graph(
         beta=beta_t,
         cu=cu_t,
         state0=state0_t,
+        state_indices=state_indices_t,
         a_log=a_log_t,
         dt_bias=dt_bias_t,
         O=O_t,
@@ -261,8 +276,7 @@ def build_fprop_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_product_fwd", mutates_args=())
-def gdp_fwd(
+def run_gdp_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -283,12 +297,17 @@ def gdp_fwd(
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     plan_name: Optional[str] = None,
+    final_state_out: Optional[torch.Tensor] = None,
+    state_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDP forward over a cached single-node GDP pygraph in THD layout.
 
     Returns ``(o, final_state, state_checkpoints)``; ``final_state`` /
     ``state_checkpoints`` are zero-size tensors when ``output_final_state``
     is ``False`` / ``checkpoint_every_n_tokens`` is ``0``.
+    ``final_state_out`` binds the final_state output to a caller buffer (the in-place op passes ``initial_state``);
+    ``state_indices`` (int32 ``[N]``) makes ``initial_state`` a pool whose row ``state_indices[i]`` seeds sequence ``i``
+    and receives its final state.
     """
     total, H, K = q.shape
     n = int(num_householder)
@@ -318,9 +337,25 @@ def gdp_fwd(
     cu = cu_seqlens
     check_dtype("g", g, (torch.float32, torch.bfloat16, torch.float16))
     check_dtype("beta", beta, (torch.float32, q.dtype))
+    state_pool_rows = None
+    if state_indices is not None:
+        if initial_state is None:
+            raise ValueError("gated_delta_product: state_indices selects rows of the initial_state pool, so initial_state is required")
+        check_dtype("state_indices", state_indices, torch.int32)
+        if state_indices.dim() != 1 or state_indices.shape[0] != N:
+            raise ValueError(f"gated_delta_product: state_indices must be [N] = [{N}]; got {tuple(state_indices.shape)}")
+        if int(checkpoint_every_n_tokens):
+            raise ValueError("gated_delta_product: state_indices cannot be combined with checkpoint_every_n_tokens")
+        if (
+            tuple(initial_state.stride()[1:]) != (V * K, K, 1)
+            or initial_state.stride(0) < max(H, HV) * V * K
+            or initial_state.stride(0) % (16 // initial_state.element_size())
+        ):
+            raise ValueError("gated_delta_product: state_indices requires a pool whose rows are dense [HO, V, K] blocks on a 16-byte aligned slot stride")
+        state_pool_rows = int(initial_state.shape[0])
     if initial_state is not None:
         check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16))
-        if initial_state.shape[0] != N:
+        if state_indices is None and initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     for tensor_name, tensor in (
         ("k", k),
@@ -329,6 +364,7 @@ def gdp_fwd(
         ("beta", beta),
         ("cu_seqlens", cu_seqlens),
         ("initial_state", initial_state),
+        ("state_indices", state_indices),
         ("a_log", a_log),
         ("dt_bias", dt_bias),
     ):
@@ -367,6 +403,8 @@ def gdp_fwd(
         checkpoint,
         device,
         plan_name,
+        final_state_out is not None,
+        state_pool_rows,
     )
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(
@@ -394,6 +432,9 @@ def gdp_fwd(
             gate_domain=str(gate_domain),
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
+            overwrite_initial_state=final_state_out is not None,
+            state_indices_dtype=torch_dtype_to_cudnn(state_indices.dtype) if state_indices is not None else None,
+            state_pool_rows=state_pool_rows,
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -412,12 +453,17 @@ def gdp_fwd(
     }
     if state0 is not None:
         variant_pack[t["state0"]] = state0
+    if state_indices is not None:
+        variant_pack[t["state_indices"]] = state_indices
     if a_log is not None:
         variant_pack[t["a_log"]] = a_log
     if dt_bias is not None:
         variant_pack[t["dt_bias"]] = dt_bias
     final_state = torch.empty(0, dtype=state_out_dtype, device=device)
-    if output_final_state:
+    if final_state_out is not None:
+        final_state = final_state_out
+        variant_pack[t["fs"]] = final_state
+    elif output_final_state:
         final_state = torch.empty(N, HO, V, K, dtype=state_out_dtype, device=device)
         variant_pack[t["fs"]] = final_state
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
@@ -427,6 +473,109 @@ def gdp_fwd(
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
     return o, final_state, state_checkpoints
+
+
+@torch.library.custom_op("cudnn::gated_delta_product_fwd", mutates_args=())
+def gdp_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_householder: int,
+    scale: float,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    batch_invariant: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    allow_neg_eigval: bool = False,
+    safe_gate: bool = False,
+    gate_domain: str = "log",
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    checkpoint_every_n_tokens: int = 0,
+    plan_name: Optional[str] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Functional GDP forward: :func:`run_gdp_fwd` with fresh outputs; the autograd formula registers below."""
+    return run_gdp_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        num_householder=num_householder,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        batch_invariant=batch_invariant,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        safe_gate=safe_gate,
+        gate_domain=gate_domain,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        plan_name=plan_name,
+    )
+
+
+@torch.library.custom_op("cudnn::gated_delta_product_fwd_overwrite_state", mutates_args=("initial_state",))
+def gdp_fwd_overwrite_state(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_householder: int,
+    scale: float,
+    initial_state: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool = False,
+    batch_invariant: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    allow_neg_eigval: bool = False,
+    safe_gate: bool = False,
+    gate_domain: str = "log",
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    checkpoint_every_n_tokens: int = 0,
+    plan_name: Optional[str] = None,
+    state_indices: Optional[torch.Tensor] = None,
+    output_final_state: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """GDP forward whose final state overwrites ``initial_state``, the rows ``state_indices`` names when that int32 ``[N]``
+    table addresses a state pool.  The engine runs the chain or the uncut schedule and
+    never the split-K cut, so the state a sequence reads at its first chunk is the one it writes at its last.  Inference
+    only: a mutating op registers no autograd formula.  Returns ``(o, state_checkpoints)``."""
+    o, _, state_checkpoints = run_gdp_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        num_householder=num_householder,
+        scale=scale,
+        initial_state=initial_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        batch_invariant=batch_invariant,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        safe_gate=safe_gate,
+        gate_domain=gate_domain,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        plan_name=plan_name,
+        output_final_state=bool(output_final_state),
+        final_state_out=initial_state if output_final_state else None,
+        state_indices=state_indices,
+    )
+    return o, state_checkpoints
 
 
 @gdp_fwd.register_fake
@@ -478,6 +627,55 @@ def gdp_fwd_fake(
     else:
         state_checkpoints = q.new_empty(0)
     return o, final, state_checkpoints
+
+
+@gdp_fwd_overwrite_state.register_fake
+def gdp_fwd_overwrite_state_fake(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    cu_seqlens,
+    num_householder,
+    scale,
+    initial_state,
+    use_qk_l2norm_in_kernel=False,
+    batch_invariant=False,
+    use_beta_sigmoid_in_kernel=False,
+    allow_neg_eigval=False,
+    safe_gate=False,
+    gate_domain="log",
+    a_log=None,
+    dt_bias=None,
+    checkpoint_every_n_tokens=0,
+    plan_name=None,
+    state_indices=None,
+    output_final_state=True,
+):
+    o, _, state_checkpoints = gdp_fwd_fake(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        num_householder=num_householder,
+        scale=scale,
+        initial_state=initial_state if state_indices is None else None,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        batch_invariant=batch_invariant,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        safe_gate=safe_gate,
+        gate_domain=gate_domain,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        plan_name=plan_name,
+        output_final_state=bool(output_final_state),
+    )
+    return o, state_checkpoints
 
 
 # ---------------------------------------------------------------------------
@@ -985,6 +1183,8 @@ def gated_delta_product(
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     plan_name: Optional[str] = None,
+    overwrite_initial_state: bool = False,
+    state_indices: Optional[torch.Tensor] = None,
 ):
     """Gated DeltaProduct (GDP) linear attention.
 
@@ -1041,7 +1241,20 @@ def gated_delta_product(
             positive multiple of the kernel chunk size, 64. ``64`` lets the
             backward reuse the series; a multiple of ``lcm(64, n)`` puts every
             checkpoint on a real-token boundary.
+        overwrite_initial_state: if ``True``, ``final_state`` is written
+            into the ``initial_state`` buffer, which is required and
+            returned as the final state; the engine runs the chain or the
+            uncut schedule and never the split-K cut, so the aliasing is
+            race-free.  Inference only: the in-place op has no autograd
+            formula.
         plan_name: optionally pin one execution plan by name (``gdp_frost``).
+        state_indices: optional ``[N]`` int32 table making ``initial_state`` a
+            pool ``[N_pool, HO, V, K]``: sequence ``i`` reads row
+            ``state_indices[i]`` and, under ``output_final_state``, writes its
+            final state back to that row in place, so a serving stack keeps
+            its paged state pool without a gather and scatter around the
+            call.  Implies ``overwrite_initial_state``.  Forward only; cannot
+            combine with ``checkpoint_every_n_tokens``.
 
     Other arguments and returns match :func:`gated_delta_net`.
     """
@@ -1049,28 +1262,58 @@ def gated_delta_product(
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    o, final_state, state_checkpoints = torch.ops.cudnn.gated_delta_product_fwd(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        cu_seqlens,
-        int(num_householder),
-        float(scale),
-        initial_state=initial_state,
-        output_final_state=bool(output_final_state),
-        use_qk_l2norm_in_kernel=bool(use_qk_l2norm_in_kernel),
-        batch_invariant=bool(batch_invariant),
-        use_beta_sigmoid_in_kernel=bool(use_beta_sigmoid_in_kernel),
-        allow_neg_eigval=bool(allow_neg_eigval),
-        safe_gate=bool(safe_gate),
-        gate_domain=str(gate_domain),
-        a_log=a_log,
-        dt_bias=dt_bias,
-        checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
-        plan_name=plan_name,
-    )
+    if state_indices is not None and initial_state is None:
+        raise ValueError("gated_delta_product: state_indices selects rows of the initial_state pool, so initial_state is required")
+    if overwrite_initial_state or state_indices is not None:
+        if initial_state is None:
+            raise ValueError("gated_delta_product: overwrite_initial_state requires initial_state")
+        o, state_checkpoints = torch.ops.cudnn.gated_delta_product_fwd_overwrite_state(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens,
+            int(num_householder),
+            float(scale),
+            initial_state=initial_state,
+            use_qk_l2norm_in_kernel=bool(use_qk_l2norm_in_kernel),
+            batch_invariant=bool(batch_invariant),
+            use_beta_sigmoid_in_kernel=bool(use_beta_sigmoid_in_kernel),
+            allow_neg_eigval=bool(allow_neg_eigval),
+            safe_gate=bool(safe_gate),
+            gate_domain=str(gate_domain),
+            a_log=a_log,
+            dt_bias=dt_bias,
+            checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            plan_name=plan_name,
+            state_indices=state_indices,
+            output_final_state=bool(output_final_state) or bool(overwrite_initial_state),
+        )
+        final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
+    else:
+        o, final_state, state_checkpoints = torch.ops.cudnn.gated_delta_product_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens,
+            int(num_householder),
+            float(scale),
+            initial_state=initial_state,
+            output_final_state=bool(output_final_state),
+            use_qk_l2norm_in_kernel=bool(use_qk_l2norm_in_kernel),
+            batch_invariant=bool(batch_invariant),
+            use_beta_sigmoid_in_kernel=bool(use_beta_sigmoid_in_kernel),
+            allow_neg_eigval=bool(allow_neg_eigval),
+            safe_gate=bool(safe_gate),
+            gate_domain=str(gate_domain),
+            a_log=a_log,
+            dt_bias=dt_bias,
+            checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            plan_name=plan_name,
+        )
     if checkpoint_every_n_tokens > 0:
         return o, final_state, state_checkpoints
     return o, final_state

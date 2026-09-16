@@ -47,12 +47,12 @@ USE_PDL = True
 
 @cute.kernel
 def frost_gdn_chain_prologue(
-    pieces: cutlass.Constexpr[int],
+    pieces: cutlass.Int32,
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
-    heads_out: cutlass.Constexpr[int],
+    heads_out: cutlass.Int32,
     compact_qdo: cutlass.Constexpr[bool],
     summary_q_step: cutlass.Constexpr[int],
     base_q: cutlass.GridConstant[tma.TensorMap],
@@ -154,7 +154,7 @@ def frost_gdn_chain_prologue(
             sIdx,
             sSpread,
             expand_num=expand_num,
-            pieces=pieces,
+            chain=True,
             mRowBase=main_rows,
         )
         if cutlass.const_expr(work_items_summary is not None):
@@ -176,7 +176,7 @@ def frost_gdn_chain_prologue(
                 sIdx,
                 sSpread,
                 expand_num=expand_num,
-                pieces=pieces,
+                chain=True,
                 mRowBase=summary_rows,
                 mSlotRows=main_rows,
             )
@@ -347,12 +347,12 @@ def frost_gdn_chain_prologue(
 
 @cute.jit
 def chain_prologue(
-    pieces: cutlass.Constexpr[int],
+    pieces: cutlass.Int32,
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
-    heads_out: cutlass.Constexpr[int],
+    heads_out: cutlass.Int32,
     compact_qdo: cutlass.Constexpr[bool],
     summary_q_step: cutlass.Constexpr[int],
     series_span_chunks: cutlass.Int32,
@@ -607,12 +607,12 @@ def run_chain_prologue(
             series_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         cache["compiled"] = cute.compile(
             chain_prologue,
-            int(pieces),
+            cutlass.Int32(int(pieces)),
             int(unit_chunks),
             int(b_t),
             int(expand_num),
             bool(length_rule),
-            int(heads_out),
+            cutlass.Int32(int(heads_out)),
             bool(compact_qdo),
             int(summary_q_step),
             cutlass.Int32(series_span_chunks),
@@ -651,9 +651,11 @@ def run_chain_prologue(
             from_dlpack(summary_do, assumed_align=16).mark_layout_dynamic(leading_dim=2) if summary_do is not None else None,
             from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3) if tinv is not None else None,
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     cache["compiled"](
+        int(pieces),
+        int(heads_out),
         series_span_chunks,
         checkpoint_every_n_tokens,
         cu_seqlens,

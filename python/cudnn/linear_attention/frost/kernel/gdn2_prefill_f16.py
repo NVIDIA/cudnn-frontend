@@ -910,6 +910,9 @@ def tmaldg_warp(
     desc_beta_base,
     desc_w_base,
     bars,
+    q_ratio,
+    k_ratio,
+    v_ratio,
 ) -> None:
     """TMA-LDG warp role (warp 14). Persistent scheduler loop issuing the
     per-chunk Q/K/V/Beta/W/Gate G->S loads."""
@@ -993,9 +996,9 @@ def tmaldg_warp(
             cfg, tile_idx, mWorkItems
         )
         head_o = head_idx
-        head_q = head_idx if cfg.q_ratio == 1 else head_idx // cutlass.Int32(cfg.q_ratio)
-        head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
-        head_v = head_idx if cfg.v_ratio == 1 else head_idx // cutlass.Int32(cfg.v_ratio)
+        head_q = head_idx // q_ratio
+        head_k = head_idx // k_ratio
+        head_v = head_idx // v_ratio
         slot = batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
         desc_q_slot = (desc_q_base + slot).tospace(cutlass.AddressSpace.generic)
         desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
@@ -1551,6 +1554,8 @@ def compute1_warp_group(
     warp_idx,
     mState_out,
     mState_init,
+    mSeedIndices,
+    mFinalIndices,
     mO,
     sO_raw,
     sV_raw,
@@ -1629,8 +1634,11 @@ def compute1_warp_group(
             # ---- state seed: initial state GMEM -> packed b16 TMEM + fp32 state TMEM ----
             if cutlass.const_expr(mState_init is not None):
                 if seed_from_initial_state:
+                    seed_row = batch_idx
+                    if cutlass.const_expr(mSeedIndices is not None):
+                        seed_row = cutlass.Int32(mSeedIndices[batch_idx])
                     seed_vw = 16 // (mState_init.element_type.width // 8)
-                    seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, state_gmem_row, 0))).raw_ptr()
+                    seed_src = (mState_init.iterator + mState_init.layout((seed_row, head_o, state_gmem_row, 0))).raw_ptr()
                     bars.mb_gate_exchange_ready[raw_index.idx].wait(raw_index.phase)
                     seed_exchange_ptr = sGate_exchange_raw.data_ptr() + (global_chunk_base % cfg.gate_exchange_stages) * (cfg.d_k * cfg.b_t)
                     if cutlass.const_expr(cfg.enable_checkpoints):
@@ -2200,8 +2208,11 @@ def compute1_warp_group(
         if cutlass.const_expr(mState_out is not None):
             if batch_seqlen > 0:
                 if final_dst >= 0:
+                    final_row = final_dst
+                    if cutlass.const_expr(mFinalIndices is not None):
+                        final_row = cutlass.Int32(mFinalIndices[final_dst])
                     state_vw = 16 // (mState_out.element_type.width // 8)
-                    state_dst = (mState_out.iterator + mState_out.layout((final_dst, head_o, state_gmem_row, 0))).raw_ptr()
+                    state_dst = (mState_out.iterator + mState_out.layout((final_row, head_o, state_gmem_row, 0))).raw_ptr()
                     for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
                         loaded = nvvm.tcgen05_ld(
                             "32x32b",
@@ -2219,16 +2230,22 @@ def compute1_warp_group(
                                     alignment=16,
                                 )
             else:
-                for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
-                    for col in cutlass.range_constexpr(32):
-                        key_dim = key_block_start + col
-                        if state_row_valid and final_dst >= 0:
+                if state_row_valid and final_dst >= 0:
+                    final_row = final_dst
+                    if cutlass.const_expr(mFinalIndices is not None):
+                        final_row = cutlass.Int32(mFinalIndices[final_dst])
+                    seed_row = batch_idx
+                    if cutlass.const_expr(mSeedIndices is not None):
+                        seed_row = cutlass.Int32(mSeedIndices[batch_idx])
+                    for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
+                        for col in cutlass.range_constexpr(32):
+                            key_dim = key_block_start + col
                             if cutlass.const_expr(mState_init is not None):
-                                mState_out[final_dst, head_o, state_gmem_row, key_dim] = mState_init[batch_idx, head_o, state_gmem_row, key_dim].to(
+                                mState_out[final_row, head_o, state_gmem_row, key_dim] = mState_init[seed_row, head_o, state_gmem_row, key_dim].to(
                                     mState_out.element_type
                                 )
                             else:
-                                mState_out[final_dst, head_o, state_gmem_row, key_dim] = cutlass.Float32(0.0).to(mState_out.element_type)
+                                mState_out[final_row, head_o, state_gmem_row, key_dim] = cutlass.Float32(0.0).to(mState_out.element_type)
         global_chunk_base += num_tile_chunks
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
@@ -2516,6 +2533,8 @@ def host(
     initial_state: cute.Tensor | None,
     out: cute.Tensor,
     final_state: cute.Tensor | None,
+    seed_indices: cute.Tensor | None,
+    final_indices: cute.Tensor | None,
     work_items: cute.Tensor | None,
     work_count: cute.Tensor | None,
     scheduler_counter: cute.Tensor,
@@ -2524,12 +2543,19 @@ def host(
     scale: cutlass.Float32,
     stream,
 ) -> None:
+    heads_out = cutlass.Int32(raw_gate.shape[1])
+    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
+    q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
+    v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[1]))
     num_sequences = cu_seqlens.shape[0] - 1
 
     # ---- launch ----------------------------------------------------------------------
     grid_shape = (cfg.max_active_clusters, 1, 1)
     frost_gdn2_prefill(
         cfg,
+        q_ratio,
+        k_ratio,
+        v_ratio,
         tensormap_workspace,
         cutlass.Int32(num_sequences),
         q,
@@ -2544,6 +2570,8 @@ def host(
         initial_state,
         out,
         final_state,
+        seed_indices,
+        final_indices,
         work_items,
         work_count,
         scheduler_counter,
@@ -2561,6 +2589,9 @@ def host(
 @cute.kernel
 def frost_gdn2_prefill(
     cfg: cutlass.Constexpr,
+    q_ratio: cute.FastDivmodDivisorV2,
+    k_ratio: cute.FastDivmodDivisorV2,
+    v_ratio: cute.FastDivmodDivisorV2,
     tensormap_workspace: cute.Tensor,
     n_desc: cutlass.Int32,
     mQ: cute.Tensor,
@@ -2575,6 +2606,8 @@ def frost_gdn2_prefill(
     mState_init: cute.Tensor | None,
     mO: cute.Tensor,
     mState_out: cute.Tensor | None,
+    mSeedIndices: cute.Tensor | None,
+    mFinalIndices: cute.Tensor | None,
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
     mScheduler: cute.Tensor,
@@ -2761,6 +2794,9 @@ def frost_gdn2_prefill(
             desc_beta_base,
             desc_w_base,
             bars,
+            q_ratio=q_ratio,
+            k_ratio=k_ratio,
+            v_ratio=v_ratio,
         )
     elif warp_idx == cfg.super_mma_warp_id:
         super_mma_warp(
@@ -2856,6 +2892,8 @@ def frost_gdn2_prefill(
             warp_idx,
             mState_out,
             mState_init,
+            mSeedIndices,
+            mFinalIndices,
             mO,
             sO_raw,
             sV_raw,
@@ -2887,10 +2925,6 @@ class Gdn2PrefillCfg:
     beta_sigmoid: bool
     allow_neg_eigval: bool
     beta_guard: bool
-    q_ratio: int
-    k_ratio: int
-    v_ratio: int
-    n_heads_out: int
     max_active_clusters: int
     d_k: int
     d_v: int
@@ -2977,10 +3011,6 @@ def build_cfg(
     beta_sigmoid: bool,
     allow_neg_eigval: bool,
     beta_guard: bool = False,
-    q_ratio: int,
-    k_ratio: int,
-    v_ratio: int,
-    n_heads_out: int,
     max_active_clusters: int,
     d_k: int,
     d_v: int,
@@ -3002,10 +3032,6 @@ def build_cfg(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         beta_guard=beta_guard,
-        q_ratio=q_ratio,
-        k_ratio=k_ratio,
-        v_ratio=v_ratio,
-        n_heads_out=n_heads_out,
         max_active_clusters=max_active_clusters,
         d_k=d_k,
         d_v=d_v,
@@ -3073,9 +3099,6 @@ def get_compiled_cache(
     cu_dtype_str: str,
     device: int,
     num_sm: int,
-    HQ: int,
-    HK: int,
-    HV: int,
     DK: int,
     DV: int,
     use_initial_state: bool,
@@ -3089,6 +3112,8 @@ def get_compiled_cache(
     beta_guard: bool,
     order_gen: bool,
     log_gate: bool = True,
+    use_seed_indices: bool = False,
+    use_final_indices: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -3107,10 +3132,6 @@ def compile(
     beta_sigmoid: bool,
     allow_neg_eigval: bool,
     beta_guard: bool,
-    q_ratio: int,
-    k_ratio: int,
-    v_ratio: int,
-    n_heads_out: int,
     *,
     d_k: int,
     d_v: int,
@@ -3127,6 +3148,8 @@ def compile(
     state_in_cute,
     o_cute,
     state_out_cute,
+    seed_indices_cute=None,
+    final_indices_cute=None,
     work_items_cute=None,
     work_count_cute=None,
     scheduler_counter_cute=None,
@@ -3151,10 +3174,6 @@ def compile(
         beta_sigmoid=beta_sigmoid,
         allow_neg_eigval=allow_neg_eigval,
         beta_guard=beta_guard,
-        q_ratio=q_ratio,
-        k_ratio=k_ratio,
-        v_ratio=v_ratio,
-        n_heads_out=n_heads_out,
         max_active_clusters=num_sm,
         d_k=d_k,
         d_v=d_v,
@@ -3175,6 +3194,8 @@ def compile(
         state_in_cute,
         o_cute,
         state_out_cute,
+        seed_indices_cute,
+        final_indices_cute,
         work_items_cute,
         work_count_cute,
         scheduler_counter_cute,
@@ -3219,6 +3240,8 @@ def chunk_gdn2_sm100(
     num_sm: int,
     stream,
     own_prologue: bool = True,
+    seed_indices=None,
+    final_indices=None,
 ) -> None:
     """Execute the Blackwell BT=16 chunked GDN-2 prefill kernel.
 
@@ -3281,9 +3304,6 @@ def chunk_gdn2_sm100(
     else:
         state_dtype_src = "float32"
 
-    q_ratio = HO // HQ
-    k_ratio = HO // HK
-    v_ratio = HO // HV
     gate_scale_log2 = gate_lower_bound * LOG2_E
 
     if not safe_gate:
@@ -3301,9 +3321,6 @@ def chunk_gdn2_sm100(
         str(cu_seqlens.dtype),
         device,
         num_sm,
-        HQ,
-        HK,
-        HV,
         DK,
         DV,
         use_initial_state,
@@ -3317,6 +3334,8 @@ def chunk_gdn2_sm100(
         beta_guard,
         order_gen,
         log_gate=log_gate,
+        use_seed_indices=seed_indices is not None,
+        use_final_indices=final_indices is not None,
     )
 
     if "compiled" not in cache:
@@ -3327,12 +3346,12 @@ def chunk_gdn2_sm100(
         k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         gate_cute = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        a_log_cute = from_dlpack(a_log, assumed_align=4) if a_log is not None else None
-        dt_bias_cute = from_dlpack(dt_bias, assumed_align=16) if dt_bias is not None else None
+        a_log_cute = from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None
+        dt_bias_cute = from_dlpack(dt_bias, assumed_align=16).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
         beta_cute = from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=2)
         w_cute = from_dlpack(w, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         o_cute = from_dlpack(output, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
 
         state_in_cute = None
         if use_initial_state:
@@ -3341,6 +3360,8 @@ def chunk_gdn2_sm100(
         state_out_cute = None
         if store_final_state:
             state_out_cute = from_dlpack(output_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        seed_indices_cute = from_dlpack(seed_indices, assumed_align=4).mark_layout_dynamic() if seed_indices is not None else None
+        final_indices_cute = from_dlpack(final_indices, assumed_align=4).mark_layout_dynamic() if final_indices is not None else None
 
         work_items_cute = from_dlpack(work_items, assumed_align=16)
         work_items_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
@@ -3363,10 +3384,6 @@ def chunk_gdn2_sm100(
             use_beta_sigmoid,
             allow_neg_eigval,
             beta_guard,
-            q_ratio,
-            k_ratio,
-            v_ratio,
-            HO,
             d_k=DK,
             d_v=DV,
             num_sm=num_sm,
@@ -3382,6 +3399,8 @@ def chunk_gdn2_sm100(
             state_in_cute=state_in_cute,
             o_cute=o_cute,
             state_out_cute=state_out_cute,
+            seed_indices_cute=seed_indices_cute,
+            final_indices_cute=final_indices_cute,
             work_items_cute=work_items_cute,
             work_count_cute=work_count_cute,
             scheduler_counter_cute=scheduler_counter_cute,
@@ -3402,7 +3421,7 @@ def chunk_gdn2_sm100(
         beta_placeholder = from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         w_placeholder = from_dlpack(w, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         o_placeholder = from_dlpack(output, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
         workspace_placeholder = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
         state_checkpoints_placeholder = None
         if state_checkpoints_for_descs is not None:
@@ -3436,7 +3455,7 @@ def chunk_gdn2_sm100(
             workspace_placeholder,
             cutlass.Int32(checkpoint_every_n_tokens),
             cu_stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
         cache["prologue"](
@@ -3470,6 +3489,8 @@ def chunk_gdn2_sm100(
         initial_state if use_initial_state else None,
         output,
         output_state if store_final_state else None,
+        seed_indices,
+        final_indices,
         work_items,
         work_count,
         scheduler_counter,
@@ -3505,6 +3526,8 @@ def run_prefill(
     scale,
     stream,
     own_prologue=True,
+    seed_indices=None,
+    final_indices=None,
 ) -> None:
     """Replay the compiled plan, the prologue launch and then the main launch.
     The caller owns the contract, which the plan validated at build, so
@@ -3542,6 +3565,8 @@ def run_prefill(
         initial_state,
         output,
         output_state,
+        seed_indices,
+        final_indices,
         work_items,
         work_count,
         scheduler_counter,
