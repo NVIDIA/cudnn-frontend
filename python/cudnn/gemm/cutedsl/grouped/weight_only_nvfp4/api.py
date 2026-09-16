@@ -16,6 +16,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.tensor_adapter import detect_framework, get_data_ptr, get_device
+from ..backend_utils import _torch_stream_context
 
 from . import _kernel_sm100
 
@@ -287,7 +288,10 @@ def grouped_gemm_weight_only_nvfp4(
     e, n = int(packed_weight.shape[0]), int(packed_weight.shape[1])
     s, k = int(routed_tokens.shape[1]), int(routed_tokens.shape[2])
     _projection(epilogue, k, n)
-    output = torch.empty((1, s, n), dtype=torch.bfloat16, device=routed_tokens.device)
+    # Tag the allocation with the launch stream so an asynchronously used
+    # output cannot be recycled on the ambient stream when it is dropped.
+    with _torch_stream_context(current_stream, routed_tokens.device):
+        output = torch.empty((1, s, n), dtype=torch.bfloat16, device=routed_tokens.device)
 
     device = get_device(routed_tokens)
     key = (_device_index(device), e, epilogue)

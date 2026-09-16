@@ -163,3 +163,33 @@ def test_class_api_writes_caller_output_on_nondefault_stream():
 
     assert tensors["output"].data_ptr() == output_ptr
     torch.testing.assert_close(tensors["output"], reference, atol=0, rtol=0)
+
+
+@pytest.mark.L1
+def test_wrapper_output_lifetime_on_explicit_stream():
+    """Dropping a pending output must not let it overwrite a new tensor."""
+    _, wrapper = _imports()
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("the kernel requires an SM100 or SM103 GPU")
+    tensors, _ = _runtime_inputs("linear")
+    args = [tensors[name] for name in ("routed_tokens", "packed_weight", "weight_scale", "first_token_offset", "factor")]
+    stream = torch.cuda.Stream()
+    # Compile and warm both the producer and the victim fill before delaying
+    # the side stream; first-use setup can otherwise hide premature reuse.
+    warm = wrapper(*args, epilogue="linear")
+    warm["output"].fill_(77)
+    torch.cuda._sleep(1)
+    torch.cuda.synchronize()
+    del warm
+
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(100_000_000)
+    result = wrapper(*args, epilogue="linear", current_stream=cuda.CUstream(stream.cuda_stream))
+    assert not stream.query(), "producer must remain pending during the lifetime check"
+    del result
+    victim = torch.empty_like(tensors["output"])
+    victim.fill_(77)
+    torch.cuda.current_stream().synchronize()
+    assert not stream.query(), "victim must be initialized before the producer completes"
+    stream.synchronize()
+    torch.testing.assert_close(victim, torch.full_like(victim, 77), atol=0, rtol=0)
