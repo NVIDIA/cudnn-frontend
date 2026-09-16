@@ -224,6 +224,9 @@ sys.meta_path.insert(0, NoTorch())
 import jax
 import jax.numpy as jnp
 from cudnn import block_sparse_attention_jax as attention
+from cudnn.tensor_adapter import get_compute_capability
+assert get_compute_capability() == (10, 0)
+assert get_compute_capability(0) == (10, 0)
 q = jnp.ones((1, 1, 256, 64), jnp.bfloat16)
 i = jnp.broadcast_to(jnp.arange(2, dtype=jnp.int32), (1, 1, 2, 2))
 grad = jax.jit(jax.grad(lambda q: attention(q, q, q, i, 2).astype(jnp.float32).sum()))(q)
