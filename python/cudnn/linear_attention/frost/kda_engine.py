@@ -252,7 +252,6 @@ class CompiledKda(KdaProgram):
         return self.workspace_size
 
 
-
 class CompiledKdaBwd(KdaProgram):
     """Compiled FROST KDA backward plan: one recompute pass regenerates the checkpoint series into workspace when the
     graph carries none; GVA/GQA gradients land in HO-head scratch and reduce to the native head counts.  ``chain`` runs
@@ -424,6 +423,7 @@ class CompiledKdaBwd(KdaProgram):
 
     def workspace_bytes(self) -> int:
         return self.workspace_size
+
 
 def build_kda_summary(graph):
     """Import the summary kernel module (recompute for the forward summary,
