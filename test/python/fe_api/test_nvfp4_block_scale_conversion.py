@@ -51,8 +51,9 @@ def test_nvfp4_plan_rejects_non_materializable_contracts():
 
 
 @requires_sm100_or_newer
-@pytest.mark.L1
-@pytest.mark.parametrize("m,k", [(128, 2048), (256, 5376), (128, 8192)])
+@pytest.mark.parametrize(
+    "m,k", [pytest.param(128, 2048, marks=pytest.mark.L0), pytest.param(256, 5376, marks=pytest.mark.L1), pytest.param(128, 8192, marks=pytest.mark.L1)]
+)
 def test_nvfp4_quantize_dequantize_round_trip_on_representable_values(m, k):
     levels = torch.tensor(
         (-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
