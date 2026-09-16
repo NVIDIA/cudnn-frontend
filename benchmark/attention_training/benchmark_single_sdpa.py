@@ -1811,6 +1811,8 @@ else:
                         scale_o_fwd: scale_o_gpu,
                         amax_o_fwd: amax_o_gpu,
                     }
+                    if o_block_scale:
+                        variant_pack_fwd[sf_o_fwd] = sf_o_gpu
                 elif args.data_type == "mxfp8":
                     variant_pack_fwd = {
                         q_fwd: query,
