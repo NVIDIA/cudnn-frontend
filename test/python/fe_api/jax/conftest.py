@@ -30,7 +30,9 @@ def pytest_configure(config):
 def cuda_device(request):
     if request.node.name == "test_import_isolation":
         return
-    if request.module.__name__.endswith("test_kda"):
+    if request.module.__name__.endswith("test_kda_jax"):
+        import jax
+
         devices = jax.local_devices()
         if len(devices) != 1 or devices[0].platform != "gpu" or str(getattr(devices[0], "compute_capability", "")) not in ("10.0", "10.3"):
             pytest.skip("KDA requires one visible SM100/SM103 GPU")

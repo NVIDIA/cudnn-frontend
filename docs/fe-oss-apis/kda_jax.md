@@ -190,7 +190,8 @@ Run coverage with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
-  python -m pytest test/jax/test_call.py test/jax/test_kda.py
+  python -m pytest test/python/fe_api/jax/test_call_jax.py test/python/fe_api/jax/test_kda_jax.py \
+  --confcutdir=test/python/fe_api/jax
 ```
 
 ## Container tests
@@ -210,14 +211,15 @@ git archive HEAD | docker run --rm -i --gpus device=0 --shm-size=8g \
     tar -xf -
     python -m pip install ".[cutedsl]" "nvidia-cutlass-dsl[cu13]==4.7.1" pytest
     python -c "import importlib.util; assert importlib.util.find_spec(\"torch\") is None"
-    python -m pytest -s -q test/jax
+    python -m pytest -s -q test/python/fe_api/jax --confcutdir=test/python/fe_api/jax
   '
 ```
 
 The archive contains committed files only. The container builds its own frontend
-extension; no host virtualenv or compiled extension is mounted. GPU CI must
-invoke the pytest command explicitly: an import-only check does not run KDA
-forward/backward kernels.
+extension; no host virtualenv or compiled extension is mounted. The KDA tests are also collected by the normal `test/python/fe_api` CI sweep.
+They skip before kernel imports when JAX or a supported CuTeDSL is unavailable.
+The standalone command uses `--confcutdir` to exclude the torch-based parent
+fixtures; an import-only check does not run KDA forward/backward kernels.
 
 After rebasing onto `fd409b43d`, all 26 KDA JAX tests passed locally in 236.99
 seconds and in the source-built, torch-free container above in 272.08 seconds,

@@ -76,7 +76,6 @@ def test_repeated_input():
 
 
 @cute.kernel
-test/python/fe_api/jax/test_call_jax.py
 def accumulate_kernel(x, y):
     i = cute.arch.thread_idx()[0]
     y[i] = y[i] + x[i]
