@@ -308,8 +308,8 @@ def generate_charts_by_mask(
                 ax_bwd.bar_label(container, fmt="%.0f", fontsize=BAR_LABEL_FONT_SIZE)
 
         plt.tight_layout()
-        output_path = output_dir / f"{config.name}_{mask}.png"
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        output_path = output_dir / f"{config.name}_{mask}.webp"
+        plt.savefig(output_path, dpi=150, bbox_inches="tight", pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
         plt.close()
         saved_paths.append(output_path)
         logger.info(f"Chart saved to {output_path}")
@@ -423,8 +423,8 @@ def generate_det_overhead_charts(
             ax.bar_label(container, fmt="%.0f", fontsize=BAR_LABEL_FONT_SIZE)
 
         plt.tight_layout()
-        out = output_dir / f"{config.name}_{mask}_det_overhead.png"
-        plt.savefig(out, dpi=150, bbox_inches="tight")
+        out = output_dir / f"{config.name}_{mask}_det_overhead.webp"
+        plt.savefig(out, dpi=150, bbox_inches="tight", pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
         plt.close()
         saved.append(out)
         logger.info(f"Det chart saved to {out}")

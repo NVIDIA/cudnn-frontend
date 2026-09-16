@@ -25,7 +25,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
+from . import arch_family
 from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain
 from .tile_config import CATALOG, TileConfig, as_mma_tile_k, as_pipeline, config_class_for_pipeline
 
@@ -47,6 +49,25 @@ PIPELINE_ARCH_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
     "sm103": ((103, 110),),
     "sm120": ((100, 130),),
 }
+
+# The per-arch SOURCE TREE (``cudnn/gemm/frost/<family>/``, see ``arch_family``)
+# a pipeline family's templates ship in. sm103 is a tcgen05 pipeline and rides
+# the sm100 tree. A new pipeline needs an entry here AND in PIPELINE_ARCH_RANGES.
+PIPELINE_FAMILY: dict[str, str] = {
+    "sm100": "sm100",
+    "sm103": "sm100",
+    "sm120": "sm120",
+}
+
+
+def template_path(template_file: str) -> Path:
+    """Where ``template_file`` ships: the ``kernel_templates/`` of the arch tree
+    its pipeline prefix names (:data:`PIPELINE_FAMILY`). Resolved off the
+    TEMPLATE, not off whichever compiler copy is running, because one family may
+    render another's template where both run (an sm120 config on an SM 10.x
+    part, or a render-only host with no GPU at all)."""
+    return arch_family.template_dir(PIPELINE_FAMILY[_pipeline_from_file(template_file)]) / template_file
+
 
 # SM ranges whose dense FP8 / block-scale MMA issues a 64-byte K (half the
 # instruction count of sm100's 32). SILICON, not a pipeline -- an sm100-pipeline
@@ -294,7 +315,7 @@ class KernelTemplate:
     it is a TileConfig axis, and which modes a pipeline issues is a fact of the
     config family (``_CTA_GROUPS_BY_PIPELINE``), not of the template."""
 
-    file: str  # template filename under kernel_templates/
+    file: str  # template filename; ships under <family>/kernel_templates/ (see template_path)
     pipeline: str  # pipeline family from the filename; pairs with config_<pipeline>
     graph_type: GraphType  # the single graph type this template supports
     # ``None`` = take the config's. The warp count is a config axis; a template
@@ -317,6 +338,17 @@ class KernelTemplate:
             GraphType.BLOCK_SCALE_MATMUL,
             GraphType.MOE_BLOCK_SCALE,
         )
+
+    @property
+    def family(self) -> str:
+        """The arch tree (``cudnn/gemm/frost/<family>/``) whose compiler renders
+        this template (:data:`PIPELINE_FAMILY`); every other tree declines it."""
+        return PIPELINE_FAMILY[self.pipeline]
+
+    @property
+    def path(self) -> Path:
+        """The template source on disk (:func:`template_path`)."""
+        return template_path(self.file)
 
     # stage 0: active-GPU SM ranges (from the template's pipeline-family prefix)
 
@@ -513,6 +545,10 @@ def _mm(
         raise KeyError(
             f"template {file!r}: pipeline family {pipeline!r} has no SM-range entry in " f"PIPELINE_ARCH_RANGES — add one when introducing a new family"
         )
+    if pipeline not in PIPELINE_FAMILY:
+        raise KeyError(
+            f"template {file!r}: pipeline family {pipeline!r} has no arch-tree entry in " f"PIPELINE_FAMILY — say which cudnn/gemm/frost/<family>/ it ships in"
+        )
     cls = template_cls or (MainloopKernelTemplate if supports_mainloop_fusion else KernelTemplate)
     return cls(
         file=file,
@@ -560,6 +596,22 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         supports_multi_gemm=False,
         template_cls=Sm120KernelTemplate,
     ),
+    _mm(
+        # The warp-MMA MoE kernel: grouped persistent scheduler, A addressed by
+        # coordinate on one global descriptor (no tensormap scratch to reserve).
+        "sm120_moe_grouped_matmul_fwd.py",
+        graph_type=GraphType.MOE,
+        supports_multi_gemm=False,
+        template_cls=Sm120KernelTemplate,
+    ),
+    _mm(
+        # Its block-scale sibling: the same scheduler carrying each group's first
+        # SFA block; A and SFA both addressed by coordinate.
+        "sm120_moe_grouped_block_scale_matmul_fwd.py",
+        graph_type=GraphType.MOE_BLOCK_SCALE,
+        supports_multi_gemm=False,
+        template_cls=Sm120KernelTemplate,
+    ),
 )
 
 
@@ -573,12 +625,17 @@ _AUTO_PIPELINE_ORDER: tuple[str, ...] = ("sm100", "sm120")
 
 def preferred_pipeline(chain: FusionChain) -> str:
     """Pipeline family the auto path should build ``chain`` with: the first
-    :data:`_AUTO_PIPELINE_ORDER` entry that has a template for this graph type
-    and whose SM range covers the active GPU. A graph type the newer family
-    does not implement (plain matmul, MoE) falls through to sm100 by itself."""
+    :data:`_AUTO_PIPELINE_ORDER` entry that has a template for this graph type,
+    whose SM range covers the active GPU, and whose arch tree is the one a
+    process on that GPU runs (:func:`arch_family.serving_family` -- each tree's
+    compiler renders only its own family). A graph type the newer family does
+    not implement (plain matmul, MoE) falls through to sm100 by itself."""
+    from . import compiler as C
+
     gt = classify_graph_type(chain)
+    family = arch_family.serving_family(C._current_arch())
     for pipeline in _AUTO_PIPELINE_ORDER:
-        if any(t.pipeline == pipeline and t.graph_type is gt and t.arch_active_reject() is None for t in TEMPLATES):
+        if any(t.pipeline == pipeline and t.graph_type is gt and t.family == family and t.arch_active_reject() is None for t in TEMPLATES):
             return pipeline
     return _AUTO_PIPELINE_ORDER[-1]
 

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import cutlass
@@ -9,6 +10,11 @@ from cutlass import Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 import torch
+
+
+@lru_cache(maxsize=None)
+def _device_capability(device_index: int):
+    return torch.cuda.get_device_capability(device_index)
 
 
 class BucketedK2QCsrUniversal:
@@ -309,7 +315,7 @@ def build_bucketed_k2q_csr_cutedsl(
         device=device,
     )
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream(q2k_block_index.device).cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream(q2k_block_index.device.index).cuda_stream)
     tensors = (
         counts,
         local_offsets,
@@ -320,7 +326,7 @@ def build_bucketed_k2q_csr_cutedsl(
         q2k_block_index,
         q2k_block_nums,
     )
-    device_capability = torch.cuda.get_device_capability(q2k_block_index.device)
+    device_capability = _device_capability(q2k_block_index.device.index)
     compile_key = _bucketed_k2q_csr_compile_key(
         device_capability,
         block_sparse_num,

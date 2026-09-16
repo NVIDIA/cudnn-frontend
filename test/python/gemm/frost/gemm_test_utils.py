@@ -61,12 +61,15 @@ def skip_unless_pipeline_active(cfg) -> None:
     of the one it asserts. (A test that merely fails with that message is turned
     into a skip by the frost conftest; one that catches it inside pytest.raises
     needs this gate.)"""
+    from cudnn.gemm.frost.arch_family import active_family
     from cudnn.gemm.frost.compiler import _current_arch
-    from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES
+    from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES, PIPELINE_FAMILY
 
     arch = _current_arch()
     if arch is not None and not any(lo <= arch < hi for lo, hi in PIPELINE_ARCH_RANGES[cfg.pipeline]):
         pytest.skip(f"the {cfg.pipeline} pipeline does not run on sm_{arch}")
+    if PIPELINE_FAMILY[cfg.pipeline] != active_family():
+        pytest.skip(f"the {cfg.pipeline} pipeline is served by the {PIPELINE_FAMILY[cfg.pipeline]} arch tree; this process runs the {active_family()} tree")
 
 
 # The sm120 (consumer Blackwell, warp-scoped MMA) family's own e2e tests: its

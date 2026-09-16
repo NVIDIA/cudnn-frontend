@@ -36,14 +36,18 @@ def _frost_opt_in(monkeypatch):
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
 
 
-# A template family that does not run on the active GPU is a capability gap, not
-# a defect. Every frost jit path declines it with the one message
-# kernel_registry.KernelTemplate.arch_active_reject spells, so a test that pins
-# a config of another family (an sm100 config on a consumer SM 12.x part, or the
-# reverse) reports that message and nothing else. Report it as skipped, the way
-# the arch markers do for the families a test knows to gate on, so a run on a
-# part the config was never meant for reads as what it is.
-_ARCH_DECLINE = re.compile(r"runs only on \d+ <= SM < \d+.* but the active GPU is sm_\d+")
+# A template family that does not run on the active GPU -- or that this
+# process's arch tree does not render -- is a capability gap, not a defect.
+# Every frost jit path declines it with one of two messages:
+# kernel_registry.KernelTemplate.arch_active_reject (the SM range) and the
+# compiler's _check_own_family (an sm120 config on a process running the sm100
+# tree, or the reverse), so a test that pins a config of another family reports
+# that message and nothing else. Report it as skipped, the way the arch markers
+# do for the families a test knows to gate on, so a run on a part the config
+# was never meant for reads as what it is.
+_ARCH_DECLINE = re.compile(
+    r"runs only on \d+ <= SM < \d+.* but the active GPU is sm_\d+" r"|is served by the sm\d+ arch tree, but this process runs the sm\d+ tree"
+)
 
 
 @pytest.hookimpl(hookwrapper=True)

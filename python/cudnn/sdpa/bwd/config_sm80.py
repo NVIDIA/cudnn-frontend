@@ -100,7 +100,9 @@ class TemplateParams:
     # SCHED_NATURAL; the semaphore is caller scratch — carved on the dense
     # engine path, sized from max_s_q on the THD wrapper path).
     deterministic: bool = False
-    # Packed varlen (wrapper-only today; the engine row declares thd=False).
+    # Packed varlen: the standalone wrapper's cu_seqlens path and the
+    # sdpa_bwd_sm80 engine row's ragged graphs (per-batch lengths turned into
+    # cu_seqlens on device) share this specialization.
     thd_varlen: bool = False
     # Tile-scheduler policy in the SHARED frost vocabulary
     # (tile_dsl.constants.SCHED_*): NATURAL is the plain 3-D grid, LPT the

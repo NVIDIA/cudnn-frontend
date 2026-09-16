@@ -154,18 +154,21 @@ def test_sdpa_bwd_sm80_wrapper(dtype, d_qk, d_v, mask, gqa):
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    "is_causal,deterministic,expected", [(True, False, "lpt_l2"), (True, True, "natural"), (False, False, "natural")], ids=["causal", "causal-det", "dense"]
+    "is_causal,deterministic,thd,expected",
+    [(True, False, False, "lpt_l2"), (True, True, False, "natural"), (False, False, False, "natural"), (True, False, True, "natural")],
+    ids=["causal", "causal-det", "dense", "causal-thd"],
 )
-def test_sm80_bwd_sched_policy_resolution(is_causal, deterministic, expected):
-    """Causal takes the L2-grouped kv-major order; the deterministic relay and
-    non-causal work keep the plain 3-D grid (host-only: no compile)."""
+def test_sm80_bwd_sched_policy_resolution(is_causal, deterministic, thd, expected):
+    """Causal takes the L2-grouped kv-major order; the deterministic relay,
+    non-causal work and the packed (THD) grid keep the plain 3-D decode
+    (host-only: no compile)."""
     try:
         from cudnn.sdpa.bwd import api_dsl as api_sm80
         from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2, SCHED_NATURAL
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
     want = {"lpt_l2": SCHED_LPT_L2, "natural": SCHED_NATURAL}[expected]
-    assert api_sm80._sm80_bwd_sched_policy(is_causal=is_causal, deterministic=deterministic) == want
+    assert api_sm80._sm80_bwd_sched_policy(is_causal=is_causal, deterministic=deterministic, thd=thd) == want
 
 
 @pytest.mark.L1

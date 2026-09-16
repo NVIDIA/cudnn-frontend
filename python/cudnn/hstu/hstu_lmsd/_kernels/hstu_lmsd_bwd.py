@@ -264,8 +264,8 @@ class HSTULMSDBackward:
             for j in cutlass.range_constexpr(num_column_tiles):
                 vector_index = j * self.threads_per_row + thread_in_row
                 if const_expr(self.hidden_size % (self.threads_per_row * self.vector_size) == 0) or vector_index < self.hidden_size // self.vector_size:
-                    row_tile_coord = ((None, None), (0, j))
-                    tXgDX = thread_copy.partition_D(gDX_row[row_tile_coord])
+                    dx_tile_coord = ((None, None), (0, j))
+                    tXgDX = thread_copy.partition_D(gDX_row[dx_tile_coord])
                     rDX = cute.make_fragment_like(tXgDX)
                     for e in cutlass.range_constexpr(self.vector_size):
                         rDX[e] = (rDirectDX_tiles[j][e] + (rWdy_tiles[j][e] - (rXhat_tiles[j][e] * sum_xhat_wdy + sum_wdy)) * rstd).to(gX.element_type)

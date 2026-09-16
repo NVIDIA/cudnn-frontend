@@ -22,7 +22,7 @@ The endpoint representation supports a range of sparse attention patterns.
 Rows in the following figure are queries, columns are keys, blue cells are
 visible, and light-gray cells are masked:
 
-![Supported static attention mask shapes](assets/static_mask_shapes.png)
+![Supported static attention mask shapes](assets/static_mask_shapes.webp)
 
 `create_mask_plan` compiles these endpoints into architecture-native packed
 forward and, when requested, backward metadata. The resulting `MaskPlan` can
@@ -246,11 +246,11 @@ Here, "ours" refers to the original implementation migrated into
 cuDNN Frontend wrappers have not been remeasured for these figures. The benchmark
 linked above measures the current Flex Attention implementation only.
 
-![Static-mask attention performance on NVIDIA GB300, Dqk=Dv=128](assets/static_mask_benchmark.png)
+![Static-mask attention performance on NVIDIA GB300, Dqk=Dv=128](assets/static_mask_benchmark.webp)
 
-![Static-mask attention performance on NVIDIA GB300, Dqk=192 and Dv=128](assets/static_mask_benchmark_d192.png)
+![Static-mask attention performance on NVIDIA GB300, Dqk=192 and Dv=128](assets/static_mask_benchmark_d192.webp)
 
-![Static-mask attention performance on NVIDIA GB300, Dqk=Dv=256](assets/static_mask_benchmark_d256.png)
+![Static-mask attention performance on NVIDIA GB300, Dqk=Dv=256](assets/static_mask_benchmark_d256.webp)
 
 ## Design documentation
 

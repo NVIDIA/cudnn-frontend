@@ -16,6 +16,8 @@ import textwrap
 import pytest
 
 import cudnn.gemm.frost
+from cudnn.gemm.frost.arch_family import template_dir, template_files
+from cudnn.gemm.frost.kernel_registry import template_path
 
 pytestmark = pytest.mark.L0
 
@@ -57,8 +59,15 @@ _MOE_BS_2 = [
 # is transposed-STG only. It shares no epilogue region with the tcgen05
 # families, so it is its own family here rather than a member of one. The
 # block-scale template is the same kernel with scale words riding the AB stage
-# and a block-scaled warp MMA; its epilogue is the dense one verbatim.
-_SM120 = [("sm120_matmul.py", 1), ("sm120_block_scale_matmul.py", 1)]
+# and a block-scaled warp MMA; its epilogue is the dense one verbatim. The MoE
+# templates are the dense kernels under the grouped persistent scheduler, their
+# store masked at group_end instead of M.
+_SM120 = [
+    ("sm120_matmul.py", 1),
+    ("sm120_block_scale_matmul.py", 1),
+    ("sm120_moe_grouped_matmul_fwd.py", 1),
+    ("sm120_moe_grouped_block_scale_matmul_fwd.py", 1),
+]
 
 # SETUP (LDTM shape + row base + span list) depends on the DRAIN LAYOUT, which
 # the compiler hands down as `epi_packed_lanes` / `epi_dp22` -- not on the MMA
@@ -91,14 +100,9 @@ _DRAIN_GROUPS = {
 _BLOCK_SCALE = {f for f, _ in _BS_1 + _BS_2 + _MOE_BS_1 + _MOE_BS_2}
 
 
-def _template_dir():
-    # kernel_templates has no __init__.py (it is exec'd per render), so go
-    # through the package that does.
-    return pathlib.Path(cudnn.gemm.frost.__file__).parent / "kernel_templates"
-
-
 def _templates():
-    return sorted(p for p in _template_dir().glob("sm*.py"))
+    # Every template that ships, across both arch trees (sm100/ and sm120/).
+    return template_files()
 
 
 _IMPLIED_GROUP = re.compile(r"_([12])ctamma\.py$")
@@ -168,12 +172,11 @@ def test_the_region_is_identical_within_its_group(region, group):
     names = (_SETUP_GROUPS if region == "SETUP" else _DRAIN_GROUPS)[group]
     if {n for n, _ in names} <= _STANDALONE:
         pytest.skip(f"{group} is a family of one -- it shares no region to compare")
-    d = _template_dir()
     ref_name, ref_group = names[0]
-    ref = _region(d / ref_name, region, ref_group)
+    ref = _region(template_path(ref_name), region, ref_group)
     assert ref.strip(), f"{ref_name}: empty {region} region"
     for name, cta_group in names[1:]:
-        got = _region(d / name, region, cta_group)
+        got = _region(template_path(name), region, cta_group)
         assert got == ref, (
             f"{region} region of {name} (cta_group={cta_group}) has drifted from its group '{group}'.\n"
             f"A new epilogue feature lands in EVERY template of the group, in the same shape.\n" + _diff(ref_name, ref, name, got)
@@ -277,7 +280,7 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
     """A pinned width of one is the identity raster.  Keep the general
     divide/modulo mapping out of every hot path in that specialization."""
 
-    helper_tree = ast.parse((_template_dir() / "_tile_helpers.py").read_text())
+    helper_tree = ast.parse((template_dir("sm100") / "_tile_helpers.py").read_text())
     helper = next(node for node in helper_tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "l2_swizzle_tile")
     assert helper.args.args[-1].arg == "identity"
     assert len(helper.args.defaults) >= 1 and isinstance(helper.args.defaults[-1], ast.Constant) and helper.args.defaults[-1].value is False

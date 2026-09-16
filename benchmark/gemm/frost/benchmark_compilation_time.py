@@ -184,7 +184,18 @@ def _parse_timing(
 
 
 def _measure(case: str, batch: int, m: int, n: int, k: int, count: int, *, verbose: bool) -> list[CompilationTiming]:
-    from cudnn.gemm.frost import compiler
+    import sys
+
+    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+
+    # Hook the module whose globals the JIT actually calls -- the active arch
+    # family's compiler (cudnn.gemm.frost.<family>.compiler). The top-level
+    # cudnn.gemm.frost.compiler name is a facade that resolves to that module,
+    # but naming it through the function keeps the hooks on the real one even
+    # if the facade mechanism ever changes; patching any other module object
+    # would leave generate/_render_template/_import_kernel unwrapped and the
+    # per-iteration stage check below failing.
+    compiler = sys.modules[jit_from_cudnn_graph.__module__]
 
     stage_times: dict[str, float] = {}
     stage_starts: dict[str, int] = {}

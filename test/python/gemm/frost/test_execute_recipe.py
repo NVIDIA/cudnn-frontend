@@ -755,6 +755,14 @@ def test_a_degenerate_extent_is_refused_or_matches_the_backend(monkeypatch, batc
     that argument implies rather than the argument: every degenerate shape is
     either refused or agrees with the backend.
     """
+    # cuDNN backend 9.24.0 SEGFAULTS (not raises) inside
+    # libcudnn_engines_tensor_ir.so while heur_mode.A finalizes a BLAS_MATMUL
+    # engine config for a K == 1 contraction at full M == N == 128 -- a hard
+    # crash Python cannot catch, so it must be skipped before the backend is
+    # reached. The frontend/FROST path handles K == 1 correctly; this is a
+    # backend defect (see gdb bt: SIGSEGV in libcudnn_engines_tensor_ir.so.9.24.0).
+    if k == 1 and m == 128 and n == 128 and cudnn.backend_version() < 92500:
+        pytest.skip(f"cuDNN backend {cudnn.backend_version()} segfaults on K==1 M==N==128 matmul under heur_mode.A")
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     torch.manual_seed(0)
     a = torch.randn(batch, m, k, dtype=torch.bfloat16, device="cuda")

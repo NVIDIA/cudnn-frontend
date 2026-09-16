@@ -65,10 +65,6 @@ _skip_thd_mxfp8_on_rubin = pytest.mark.skipif(
     _SM == 107,
     reason="THD/varlen not ported to the Rubin MXFP8 kernels (row sets thd=False)",
 )
-_skip_dense_q_trim_on_rubin = pytest.mark.skipif(
-    _SM == 107,
-    reason="dense padded-Q O/LSE trim not carried by the Rubin kernels (row sets dense_seq_q_trim=False / padded_stats=False)",
-)
 pytestmark = [requires_blackwell, requires_dsl]
 
 
@@ -146,11 +142,18 @@ def _ref(
     i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
     j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
     masked = torch.zeros(1, 1, s_q, s_kv, dtype=torch.bool, device=dev)
+    # Bottom-right anchors the diagonal at each batch's corner (seq_len_q[b], seq_len_kv[b]),
+    # not at the padded (S_q, S_kv): a shorter Q keeps its rows aligned with the END of its KV.
+    diag = 0
+    if bottom_right:
+        slq_d = torch.as_tensor(seq_lens_q if seq_lens_q is not None else [s_q] * b, device=dev, dtype=torch.long).view(b, 1, 1, 1)
+        slk_d = torch.as_tensor(seq_lens_kv if seq_lens_kv is not None else [s_kv] * b, device=dev, dtype=torch.long).view(b, 1, 1, 1)
+        diag = slk_d - slq_d
     if is_causal:
-        lim = i + (s_kv - s_q) if bottom_right else i
+        lim = i + diag
         masked = masked | (j > lim + right_bound)
     if swa_window is not None:
-        swa_base = i + (s_kv - s_q) if bottom_right else i
+        swa_base = i + diag
         masked = masked | (j < swa_base - swa_window)
     if seq_lens_kv is not None:
         # Per-batch KV padding: columns j >= seq_len_kv[b] are padding -> masked.
@@ -399,6 +402,133 @@ def _check_mxfp8_strided_stats(d_qk, d_v, in_key):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("h_q,h_kv", [(4, 4), (4, 2)], ids=["mha", "gqa"])
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128)], ids=["d128", "d192_d128"])
+@torch_fork_set_rng(seed=61)
+def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
+    """Validate the direct-only hybrid BF16-output contract.
+
+    This deliberately exercises the direct-only adapter switch rather than a
+    graph route: graph capability selection remains unchanged until benchmark
+    evidence establishes that this tradeoff is worth exposing publicly.
+    """
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("SM107 serves per-tensor FP8 d128, not block-scaled MXFP8")
+
+    b, s = 1, 256
+    dev = "cuda"
+    scale = d_qk**-0.5
+    qf = torch.randn(b, h_q, s, d_qk, device=dev) * 0.5
+    kf = torch.randn(b, h_kv, s, d_qk, device=dev) * 0.5
+    v = (torch.randn(b, h_kv, s, d_v, device=dev) * 0.5).to(torch.bfloat16)
+    q, sf_q, dq, _ = _quantize(qf, b, h_q, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    k, sf_k, dk, _ = _quantize(kf, b, h_kv, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    o = torch.empty(b, h_q, s, d_v, device=dev, dtype=torch.bfloat16)
+
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        is_causal=True,
+        scale_softmax=scale,
+        dtype_o=torch.bfloat16,
+        split_kv=1,
+        pv_bf16=True,
+    )
+    assert api.check_support()
+    api.compile()
+    with pytest.raises(ValueError, match="without Amax_O"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=torch.empty(1, device=dev, dtype=torch.float32))
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k)
+    torch.cuda.synchronize()
+
+    o_ref = _ref(q.float() * dq, k.float() * dk, v.float(), scale=scale, is_causal=True)
+    _check(o, o_ref, torch.bfloat16, "e4m3", d_qk=d_qk)
+
+    amax_o = torch.empty(1, device=dev, dtype=torch.float32)
+    api_amax = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_amax_o=amax_o,
+        is_causal=True,
+        scale_softmax=scale,
+        dtype_o=torch.bfloat16,
+        split_kv=1,
+        pv_bf16=True,
+    )
+    assert api_amax.check_support()
+    api_amax.compile()
+    api_amax.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=amax_o)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        amax_o,
+        o_ref.abs().max().reshape_as(amax_o),
+        rtol=0.0,
+        atol=_half_atol("e4m3", d_qk),
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=67)
+def test_mxfp8_d192_split_kv_publishes_amax_from_combined_output():
+    """D192 split-KV must leave Amax publication to the combine kernel."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h_q, h_kv, s, d_qk, d_v = 1, 4, 2, 256, 192, 128
+    dev = "cuda"
+    scale = d_qk**-0.5
+    qf = torch.randn(b, h_q, s, d_qk, device=dev) * 0.5
+    kf = torch.randn(b, h_kv, s, d_qk, device=dev) * 0.5
+    vf = torch.randn(b, h_kv, s, d_v, device=dev) * 0.5
+    q, sf_q, dq, _ = _quantize(qf, b, h_q, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    k, sf_k, dk, _ = _quantize(kf, b, h_kv, s, d_qk, torch.float8_e4m3fn, columnwise=False)
+    v, sf_v, dv, _ = _quantize(vf, b, h_kv, s, d_v, torch.float8_e4m3fn, columnwise=True)
+    o = torch.empty((b, h_q, s, d_v), device=dev, dtype=torch.bfloat16)
+    amax_o = torch.empty(1, device=dev, dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_amax_o=amax_o,
+        is_causal=True,
+        scale_softmax=scale,
+        dtype_o=torch.bfloat16,
+        split_kv=2,
+    )
+
+    assert api.check_support()
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), device=dev, dtype=torch.uint8)
+    api.execute(
+        q_tensor=q,
+        k_tensor=k,
+        v_tensor=v,
+        o_tensor=o,
+        sf_q=sf_q,
+        sf_k=sf_k,
+        sf_v=sf_v,
+        amax_o=amax_o,
+        workspace=workspace,
+    )
+    torch.cuda.synchronize()
+
+    o_ref = _ref(q.float() * dq, k.float() * dk, v.float() * dv, scale=scale, is_causal=True)
+    _check(o, o_ref, torch.bfloat16, "e4m3", d_qk=d_qk)
+    torch.testing.assert_close(
+        amax_o,
+        o_ref.abs().max().reshape_as(amax_o),
+        rtol=0.0,
+        atol=_half_atol("e4m3", d_qk),
+    )
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=59)
 def test_mxfp8_strided_stats():
     """The block-scaled FP8 L0 flavor preserves dense Stats strides."""
@@ -559,12 +689,118 @@ def test_mxfp8_wide_dense_padding(d, in_key, causal):
     assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
 
 
-@_skip_dense_q_trim_on_rubin
-@pytest.mark.L1
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [256, 512], ids=["d256", "d512"])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_wide_dense_q_trim_stats_sink(d):
-    """Short dense Q rows trim O/LSE even when a sink makes softmax finite."""
+def test_mxfp8_dense_q_trim_bottom_right_multiwave(d):
+    """More Q tiles than SMs (3 x 8 heads x 8 tiles of 128 rows), batches of
+    different lengths, bottom-right: a persistent worker crosses batches, and
+    the second tile's diagonal and keyless-row test must use ITS batch's
+    lengths (the wide templates take the next tile's bounds from the scheduler
+    payload and used to keep the previous batch's lengths)."""
+    result = _run(
+        3,
+        8,
+        8,
+        1024,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_lens_q=[1024, 640, 0],
+        seq_lens_kv=[800, 1024, 512],
+        d_qk=d,
+        d_v=d,
+        return_lse=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", d_qk=d)
+    # batch 0: diagonal 800 - 1024 = -224 -> rows 0..223 keyless; batch 1: diagonal +384, no keyless row; batch 2 empty
+    assert (result.output[0, :, :224] == 0).all() and torch.isneginf(result.stats[0, :, :224]).all()
+    assert (result.output[1, :, 640:] == 0).all() and (result.output[2] == 0).all()
+    torch.testing.assert_close(result.stats[0, :, 224:], result.reference_stats[0, :, 224:], atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(result.stats[1, :, :640], result.reference_stats[1, :, :640], atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_dense_q_trim_bottom_right_sink(d):
+    """Keyless rows (bottom-right, S_kv < S_q) WITH a sink: the row's mass is
+    the sink alone, so LSE = sink_logit and O = 0 -- a kernel that lets the
+    masked scores through its softmax returns NaN there. scale * log2(e) > 1 makes the
+    scaled sentinel overflow, the case that trips a finite-sentinel mask."""
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    result = _run(
+        3,
+        8,
+        8,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=0.75,  # scale * log2(e) > 1: the scaled finite sentinel overflows, the case a sum-based dead-row test misses
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        sink=sink,
+        seq_lens_q=[256, 129, 0],
+        seq_lens_kv=[200, 256, 128],
+        d_qk=d,
+        d_v=d,
+        return_lse=True,
+    )
+    # scale 0.75 sharpens the softmax (scores ~12x the 1/sqrt(d) norm), which widens the e4m3 P-quantization
+    # noise on the WIDE flavor: develop measures the same 0.06 on d256 with this graph, so it gets 0.08 here.
+    diff = (result.output.float() - result.reference).abs().max().item()
+    assert diff <= (0.05 if d == 128 else 0.08), f"max|O-ref|={diff:.4f}"
+    assert (result.output[0, :, :56] == 0).all() and (result.output[1, :, 129:] == 0).all() and (result.output[2] == 0).all()
+    assert torch.isfinite(result.stats[0]).all(), "keyless rows with a sink must carry the sink logit, not NaN"
+    torch.testing.assert_close(result.stats[0, :, :56], sink.view(8, 1).expand(8, 56), atol=1e-4, rtol=0)
+    torch.testing.assert_close(result.stats[0], result.reference_stats[0], atol=5e-2, rtol=3e-2)
+    assert torch.isneginf(result.stats[1, :, 129:]).all() and torch.isneginf(result.stats[2]).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_128", "d256", "d512"])
+@pytest.mark.parametrize("band", [False, True], ids=["br", "br_band"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_dense_q_trim_bottom_right(d, d_v, band):
+    """Short per-batch Q under bottom-right causal (and with a left band): the
+    diagonal anchors at (seq_len_q[b], seq_len_kv[b]) for the VALID rows, so the
+    tile bounds and the per-element mask must use the same per-batch Q length
+    -- a mask still anchored at the padded S_q drops keys the valid rows must
+    see. Batches: full Q, mid-tile Q (129 of 256), empty Q."""
+    kw = dict(use_causal_mask_bottom_right=True)
+    if band:
+        kw["diagonal_band_left_bound"] = 65  # window = 64
+    result = _run(
+        3,
+        8,
+        8,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=kw,
+        seq_lens_q=[256, 129, 0],
+        seq_lens_kv=[200, 256, 128],
+        d_qk=d,
+        d_v=d_v,
+        return_lse=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", d_qk=d)
+    assert (result.output[1, :, 129:] == 0).all() and (result.output[2] == 0).all()
+    # batch 0: S_kv 200 < S_q 256 under bottom-right puts rows 0..55 above the diagonal -- keyless inside a
+    # live tile, so exactly O = 0 / LSE = -inf (a finite mask sentinel would leave them a uniform average).
+    assert (result.output[0, :, :56] == 0).all() and torch.isneginf(result.stats[0, :, :56]).all()
+    assert torch.isneginf(result.stats[1, :, 129:]).all() and torch.isneginf(result.stats[2]).all()
+    torch.testing.assert_close(result.stats[0], result.reference_stats[0], atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(result.stats[1, :, :129], result.reference_stats[1, :, :129], atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_128", "d256", "d512"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_dense_q_trim_stats_sink(d, d_v):
+    """Short dense Q rows trim O/LSE even when a sink makes softmax finite --
+    on every SM100 MXFP8 flavor."""
     sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
     result = _run(
         2,
@@ -579,7 +815,7 @@ def test_mxfp8_wide_dense_q_trim_stats_sink(d):
         seq_lens_q=[129, 0],
         seq_lens_kv=[200, 256],
         d_qk=d,
-        d_v=d,
+        d_v=d_v,
         return_lse=True,
     )
     _check(result.output, result.reference, torch.float16, "e4m3", d_qk=d)

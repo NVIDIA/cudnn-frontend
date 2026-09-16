@@ -15,6 +15,8 @@ from typing import Optional
 
 import torch
 
+from cudnn.deepseek_sparse_attention.indexer_top_k.local_to_global_dsl import _local_to_global_inplace
+
 import cutlass
 import cutlass.cute as cute
 
@@ -142,10 +144,7 @@ def _compress_local_to_global_bshd_(idx: torch.Tensor, seqlen_k: int) -> torch.T
     a caller-provided output buffer is converted in place (no realloc).  -1 padding
     is preserved; global ids fit int32 by design (int64 intermediate keeps
     ``b * seqlen_k`` exact)."""
-    bs = idx.shape[0]
-    offsets = torch.arange(bs, device=idx.device, dtype=torch.int64).view(bs, 1, 1) * seqlen_k
-    idx.add_(torch.where(idx >= 0, offsets, offsets.new_zeros(())).to(torch.int32))
-    return idx
+    return _local_to_global_inplace(idx, seqlen_k)
 
 
 def _select_microbatch_rows(seqlen_q: int, bs: int, ratio: int) -> int:
@@ -1525,12 +1524,7 @@ def _indexer_fwd_compress_topk_thd(
     if topk_indices_global:
         # global = cu_seqlens_k[b] + local, per query token's batch b (GPU-only),
         # applied IN PLACE so a caller-provided out_indices stays the same tensor.
-        if sq_b is None:  # capture path skipped the eager per-batch compute above
-            sq_b = (cu_q32[1:] - cu_q32[:-1]).to(torch.int64)
-        cu_k64 = cu_seqlens_k.to(torch.int64)
-        batch_ids = torch.repeat_interleave(torch.arange(bs, device=device), sq_b, output_size=total_q)
-        koff = cu_k64[batch_ids].view(total_q, 1)
-        idx_out.add_(torch.where(idx_out >= 0, koff, koff.new_zeros(())).to(torch.int32))
+        _local_to_global_inplace(idx_out, 0, cu_q32, cu_k32, current_stream)
     result = (idx_out, val_out)
     if want_softmax:
         result += (sm_out,)

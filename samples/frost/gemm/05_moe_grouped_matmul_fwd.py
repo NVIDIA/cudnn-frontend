@@ -22,6 +22,7 @@ import cudnn
 import torch
 
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
 from cudnn.gemm.frost.tile_config import CATALOG
 
 # E2M1 (FP4) 4-bit code -> value lookup (low nibble first within a byte).
@@ -185,7 +186,12 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
         b = offsets_list[gi]
         e = offsets_list[gi + 1] if gi + 1 < num_groups else S
         sfa_parts.append(_to_blocked(sfa_log[b:e]))
-    sfa_blk = torch.cat(sfa_parts).view(1, -1, 1)
+    sfa_live = torch.cat(sfa_parts)
+    # Reserve for any partition with this S and group count. Keep the live
+    # group blocks packed at the front; only the unused tail adds capacity.
+    sfa_rows = segmented_row_scale_capacity_rows(S, num_groups)
+    sfa_blk = torch.ones((1, sfa_rows, _ceil_div(sf_k, 4) * 4), dtype=sfa_live.dtype, device=dev)
+    sfa_blk.view(-1)[: sfa_live.numel()].copy_(sfa_live)
     sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
     output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)

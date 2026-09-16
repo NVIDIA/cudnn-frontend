@@ -801,25 +801,35 @@ class pygraph:
         usage, and auto-marking it would make its uid required in the variant
         pack.
         """
-        for node in self._nodes:
-            node.infer_properties(self._context)
-            # Table-driven shape inference, topologically: builder-time infer
-            # only sees graph-input dims; chained ops (e.g. conv on a virtual
-            # relu output) get their output dims here, once inputs are known.
-            spec_entry = _STRUCTURED_BY_TYPE.get(node.node_type) or _CAPTURED_BY_TYPE.get(node.node_type)
-            if spec_entry:
-                _, spec = spec_entry
-                infer = spec.get("infer", {})
-                for oport, out_t in node.outputs.items():
-                    if out_t is not None and not out_t.dim:
-                        try:
-                            d = infer.get(oport, lambda n: None)(node)
-                        except Exception:  # noqa: BLE001 — best-effort
-                            d = None
-                        if d:
-                            out_t.dim = list(d)
-                            out_t.stride = _row_major_stride(out_t.dim)
-            node.validate()
+        try:
+            for node in self._nodes:
+                node.infer_properties(self._context)
+                # Table-driven shape inference, topologically: builder-time infer
+                # only sees graph-input dims; chained ops (e.g. conv on a virtual
+                # relu output) get their output dims here, once inputs are known.
+                spec_entry = _STRUCTURED_BY_TYPE.get(node.node_type) or _CAPTURED_BY_TYPE.get(node.node_type)
+                if spec_entry:
+                    _, spec = spec_entry
+                    infer = spec.get("infer", {})
+                    for oport, out_t in node.outputs.items():
+                        if out_t is not None and not out_t.dim:
+                            try:
+                                d = infer.get(oport, lambda n: None)(node)
+                            except Exception:  # noqa: BLE001 — best-effort
+                                d = None
+                            if d:
+                                out_t.dim = list(d)
+                                out_t.stride = _row_major_stride(out_t.dim)
+                node.validate()
+        except ValueError:
+            # Inference can reject shapes before the family validator runs
+            # (e.g. matmul batch broadcasting). Let it report its typed semantic
+            # error; if it declines or accepts, preserve the original rejection.
+            if self._backend_lowerable() and self._lowered_graph is None:
+                validator = self._python_native_validator()
+                if validator is not None:
+                    validator(self)
+            raise
         for t in self._tensors.values():
             if t.dim and not t.stride:  # classic: stride optional, row-major inferred
                 t.stride = _row_major_stride(t.dim)
@@ -1067,7 +1077,16 @@ class pygraph:
         node for at all (GDN/KDA/...) must NOT be lowered — the lowering loop
         silently skips such nodes and would hand C++ an incomplete graph.
         """
+        # The cuDNN backend block-scale descriptor currently accepts the
+        # matrix-style block-size vector, but not the rank-5
+        # (1, C-block, 1, 1, 1) vector used by convolution. Let the Frost
+        # convolution engine consume that public graph directly instead of
+        # failing backend lowering before engine selection. Block-scale matmul
+        # keeps its existing C++ lowering path.
+        has_convolution = any(node.node_type == NodeType.CONV_FPROP for node in self._nodes)
         for node in self._nodes:
+            if has_convolution and node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE and len(node.params.get("block_size") or ()) == 5:
+                return node
             if node.node_type in (NodeType.MATMUL, NodeType.POINTWISE):
                 continue
             spec_entry = _CAPTURED_BY_TYPE.get(node.node_type) or _STRUCTURED_BY_TYPE.get(node.node_type)

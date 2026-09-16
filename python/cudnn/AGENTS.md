@@ -136,18 +136,13 @@ neither names the thing that breaks it most directly: a device-to-host read.
 Known violations, all pre-existing and each needing a kernel-side change, so
 none is precedent:
 
-- The FP8/MXFP8 `seq_len_q` guard in `sdpa/fwd/engines.py`. This one cannot be
-  lifted to `check_support()`: `use_padding_mask=True` requires a `seq_len_q`
-  tensor even when only KV is padded, so no static rule separates "declares
-  per-batch Q lengths" from "the lengths are actually short" — declining the
-  declaration would drop the KV-only-padding population these kernels serve
-  correctly. It goes away when the FP8 kernels get the epilogue trim; until
-  then the read is what keeps a short length from being silently ignored.
-- `cu_seqlens_{q,k}.to(dtype=..., device="cpu")` in the SM80 packed-THD backward
-  (`sdpa/bwd/kernels/bprop_f16_sm80.py`). Reachable only through the standalone
-  wrapper: the registered `sdpa_bwd_sm80` spec declares `thd=False`, so
-  `graph.execute()` does not route here. Still a violation, and it is the one to
-  fix first if that spec ever gains THD.
+- `cu_k.to(dtype=..., device="cpu")` in the SM80 packed-THD WRAPPER path
+  (`_sm80_thd_backward` in `sdpa/bwd/api_dsl.py`), taken only when the caller
+  passes no `max_s_kv` hint. Reachable only through the standalone wrapper: the
+  `sdpa_bwd_sm80` engine path bounds its kv-tile grid and relay counter from
+  the graph's envelope `S_max` and turns the per-batch lengths into
+  `cu_seqlens` on device, so `graph.execute()` never reads a length. Still a
+  violation on the wrapper surface (a caller contract, documented there).
 
 When auditing this list, grep for the ARGUMENT, not the call shape:
 `device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
@@ -182,10 +177,12 @@ not become a compile key.
   execute path's cached call must be a guaranteed hit. Guard it with a
   cache-miss regression test (see
   `test_dsl_sm100_thd_compile_key_plan_time_only`), not by inspection.
-- **Known open cleanup (issue #604)**: the SM80 engines' `_compile_cached`
-  (#493) still keys `SQ`/`SKV` under `THD_VARLEN` — migrate it to dynamic
-  token extents like the SM100/SM120 THD compiles rather than copying its
-  pattern.
+- **Issue #604 is closed**: the SM80 THD compiles (forward and backward) take
+  the packed token extents as `cute.sym_int` and key on `b = 1, sq = skv = 0`
+  plus the plan-time sequence count; the regression tests are
+  `test_sm80_bwd_thd_compile_key_plan_time_only` (wrapper) and
+  `test_graph_thd_compile_key_is_plan_time_only` (graph path). Copy that
+  pattern, not a shape-keyed one.
 - **Key on exactly the contract-relevant set — no more, no less.** Both
   failure modes shipped on PR #553 and were caught in review: *under-keying*
   (the cache keyed only `x.shape`/`w.shape` while `check_support()`
@@ -306,6 +303,10 @@ python/cudnn/gemm/
 │   ├── grouped/<fusion>/            # dglu, dsrelu, dswiglu, glu, glu_hadamard,
 │   │                                #   quant, srelu, swiglu, unfused, wgrad
 │   └── discrete_grouped/<fusion>/   # dswiglu, swiglu (per-expert weight pointers)
+├── frost/                           # the FROST GEMM engine (JIT fused matmul chains from cuDNN graphs)
+│   ├── sm100/, sm120/               #   one tree per arch family: compiler.py + epilogue_codegen.py + kernel_templates/
+│   ├── compiler.py, epilogue_codegen.py  # facades: become the active family's module (arch_family.py)
+│   └── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
 ├── ops/                             # backend-independent torch custom-op contracts
 └── reference/                       # pure-PyTorch MATMUL/POINTWISE correctness engine
 ```

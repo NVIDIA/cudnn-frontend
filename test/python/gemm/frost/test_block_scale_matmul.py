@@ -39,6 +39,10 @@ from gemm_test_utils import (
 )
 
 from cudnn.gemm.frost import compiler as C
+
+# The two arch trees by name: their tile-constant renderers exist only in their own tree.
+from cudnn.gemm.frost.sm100 import compiler as C100
+from cudnn.gemm.frost.sm120 import compiler as C120
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding
@@ -639,6 +643,83 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force
 
 
 _SPLITK_BS_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+
+
+@pytest.mark.parametrize(
+    "moe,force_stg,budget,stages",
+    [
+        (False, True, 27648, 0),
+        (False, True, 28160, 1),
+        (False, True, 334848, 12),
+        (False, True, 335359, 12),
+        (False, True, 335360, 13),
+        (False, False, 351248, 12),
+        (False, False, 352272, 13),
+        (True, True, 336896, 12),
+        (True, True, 337408, 13),
+        (True, False, 353296, 12),
+        (True, False, 353808, 13),
+    ],
+)
+def test_block_scale_sf_ring_budget(moe, force_stg, budget, stages, monkeypatch):
+    from cudnn.gemm.frost import tile_config
+    from cudnn.gemm.frost.fusion_ir import MoeSpec
+
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: budget)
+    chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E8M0, a_dt=_DT_E4M3))
+    if moe:
+        chain = dataclasses.replace(chain, moe=MoeSpec(num_experts=1, num_groups=3))
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma")
+    # The dense template puts D after the SF rings; MoE puts it before them.
+    # At an exact STG fit, the last SF ring needs no trailing alignment pad.
+    with C.force_stg_epi(force_stg):
+        if stages == 0:
+            with pytest.raises(NotImplementedError, match="no AB stage fits"):
+                C._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
+            return
+        src = C._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
+    assigned = dict(re.findall(r"^(\w+) = (.*)$", src, re.M))
+    assert assigned["ab_stages"] == str(stages)
+
+
+@pytest.mark.parametrize("fake_a", (True, False))
+def test_block_scale_sf_ring_budget_omits_fake_scales(fake_a, monkeypatch):
+    from cudnn.gemm.frost import tile_config
+
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: 328192)
+    g, *_ = _build_one_sided_block_scale_graph(fake_a=fake_a, raw_dt=_DT_E4M3, scaled_dt=_DT_E4M3, sf_dt=_DT_E8M0, block_size=32)
+    chain = analyze(g)
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma")
+    with C.force_stg_epi(True):
+        src = C._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
+    assert "ab_stages = 13\n" in src  # a single SF ring fits without any padding
+
+
+@pytest.mark.parametrize(
+    "na,nb,budget,stages", [(1, 2, 310784, 8), (1, 2, 311808, 9), (2, 1, 299520, 6), (2, 1, 300544, 7), (2, 2, 258048, 4), (2, 2, 259584, 5)]
+)
+def test_block_scale_sf_ring_budget_distinct_operands(na, nb, budget, stages, monkeypatch):
+    from cudnn.gemm.frost import tile_config
+
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: budget)
+    chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E8M0, a_dt=_DT_E4M3))
+    chain = dataclasses.replace(chain, num_a_operands=na, num_b_operands=nb, gemm_operands=[(i % na, i % nb) for i in range(2)])
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma")
+    with C.force_stg_epi(True):
+        src = C._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
+    assert f"ab_stages = {stages}\n" in src
+
+
+@requires_sm100
+@pytest.mark.parametrize("K", (128, 2048))
+def test_block_scale_stg_sf_ring_alignment(K):
+    # On sm107 the old payload-only budget selects 13 stages, leaving two
+    # 6656-byte SF rings. Their 1024-byte alignment adds an unbudgeted 512 B
+    # and launch fails at 335360 B > 334848 B. The larger K wraps the ring.
+    _run_bs_numeric("mxfp8", "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma", 257, 132, K, force_stg=True)
 
 
 @requires_sm100
@@ -1437,8 +1518,8 @@ def test_block_scale_sf_rule_is_on_the_instruction_tile() -> None:
 
 def test_catalog_has_sm103_geometries():
     sm103 = [c for c in CATALOG if c.pipeline == "sm103"]
-    # 2 cta_n × the shared 15-cluster enumeration × the 2 MMA modes.
-    assert len(sm103) == 60
+    # 2 cta_n × (15 single-CTA clusters + 10 even-M CTA-pair clusters).
+    assert len(sm103) == 50
     pat = re.compile(r"^CONFIG_sm103_128x(128|256)x384_128x(128|256)x48_cluster\d+x\d+_[12]ctamma$")
     for c in sm103:
         assert pat.match(c.name), c.name
@@ -1651,7 +1732,7 @@ def test_sm103_rejects_multi_mma_m():
         by_name("CONFIG_sm103_256x128x384_128x128x48_cluster1x1")
     assert by_name(_CFG_128).mma_size_m == 1
     # The other pipelines DO implement it — the bound is sm103-specific.
-    assert ConfigSm100.MMA_SIZE_M_MAX == 2
+    assert ConfigSm100.MMA_SIZE_M_MAX == 4
     assert by_name("CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma").mma_size_m == 2
 
 
@@ -2103,7 +2184,7 @@ def test_mixed_mxfp8_mxfp4_numerics(fp8_on_a, fp8_torch_dt, fp8_cudnn_dt, fp8_mn
 @requires_sm107
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
 @pytest.mark.parametrize("cta_group", [1, 2])
-@pytest.mark.parametrize("cta_m,cta_n", [(128, 256), (256, 128), (256, 256)])
+@pytest.mark.parametrize("cta_m,cta_n", [(128, 256), (256, 128), (256, 256), (512, 128)])
 def test_sm107_block_scale_matmul_multi_mma_m(combo, cta_group, cta_m, cta_n):
     """The CTA tile spanning several MMA instructions along M, on the 64-byte-K
     pipeline. This is where the two SF regions stop agreeing: at nvfp4 a scale
@@ -2116,7 +2197,7 @@ def test_sm107_block_scale_matmul_multi_mma_m(combo, cta_group, cta_m, cta_n):
     suffix = "1ctamma" if cta_group == 1 else "2ctamma"
     geometry = f"CONFIG_sm100_{cta_m}x{cta_n}x128_128x{cta_n}x64_{cluster}"
     assert by_name(geometry).mma_size_m == cta_m // 128
-    _run_bs_numeric(combo, f"{geometry}_{suffix}", 256, 256, 512)
+    _run_bs_numeric(combo, f"{geometry}_{suffix}", cta_m * cta_group if cta_m == 512 else 256, 256, 512)
 
 
 @requires_sm107
@@ -2671,7 +2752,7 @@ def test_sm120_block_scale_registry_wiring():
     assert _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32) not in cases
     assert not any(k[1] == "fp8_e5m3" for k in cases)
     # The renderer's instruction table mirrors the support table exactly.
-    assert set(C._SM120_BLOCK_SCALE_MMA) == {(k[0] == "fp4_e2m1", k[2][1], k[1]) for k in cases}
+    assert set(C120._SM120_BLOCK_SCALE_MMA) == {(k[0] == "fp4_e2m1", k[2][1], k[1]) for k in cases}
     # The family's range starts at SM 10.0 for its dense template, but the
     # block-scaled warp MMA is SM 12.x silicon: every block-scale combo is pinned
     # to [120, 130) the way int8 is pinned on sm100.
@@ -2789,9 +2870,10 @@ def test_sm120_block_scale_tile_constants_render(combo, kind, vec, fmt, ptx):
         nb_m = -(-cfg.cta_tile_m // 128)
         nb_n = -(-cfg.cta_tile_n // 128)
         tmpl = select_template(chain, cfg)
-        src = C._render_block_scale_tile_constants(cfg, chain, tmpl)
-        # The dispatcher hands an sm120 template to the sm120 renderer, verbatim.
-        assert src == C._render_block_scale_tile_constants_sm120(cfg, chain, tmpl)
+        src = C120._render_block_scale_tile_constants(cfg, chain, tmpl)
+        # The sm100 tree has no sm120 renderer: it declines the template outright.
+        with pytest.raises(NotImplementedError, match="served by the sm120 arch tree"):
+            C100._render_block_scale_tile_constants(cfg, chain, tmpl)
         assigned = dict(re.findall(r"^(\w+) = (.*)$", src, re.M))
         assert assigned["mma_block_scale_kind"] == repr(kind)
         assert assigned["mma_scale_vec_size"] == repr(vec)

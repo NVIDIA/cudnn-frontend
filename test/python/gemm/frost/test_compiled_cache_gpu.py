@@ -20,6 +20,7 @@ pytestmark = [pytest.mark.L0, requires_sm100]
 
 _CHILD = r"""
 import hashlib, json, sys, torch, cudnn
+from pathlib import Path
 from cudnn.frost import compiled_cache as cc
 M, N, K = 256, 512, 256
 torch.manual_seed(0)
@@ -36,16 +37,21 @@ c = torch.empty(1, M, N, device="cuda", dtype=torch.bfloat16)
 ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
 g.execute({A: a, B: b, C: c}, ws, handle=handle); torch.cuda.synchronize()
 launch = g._compiled_plans[idx]._compiled._launchable
-print(json.dumps({"stats": cc.stats(), "digest": hashlib.sha256(c.view(torch.int16).cpu().numpy().tobytes()).hexdigest(), "reloaded": hasattr(launch, "_compiled_cache_entry"), "root": str(cc.get_cache_dir())}))
+Path(sys.argv[1]).write_text(json.dumps({"stats": cc.stats(), "digest": hashlib.sha256(c.view(torch.int16).cpu().numpy().tobytes()).hexdigest(), "reloaded": hasattr(launch, "_compiled_cache_entry"), "root": str(cc.get_cache_dir())}))
+# Exercise trailing diagnostics even with a backend build that produces no logs.
+print("cache child finished")
 """
 
 
 def _run(cache_dir):
     env = dict(os.environ, CUDNN_FRONTEND_ENABLE_FROST_ENGINES="1", CUDNN_FRONTEND_COMPILED_CACHE=str(cache_dir))
     env.pop("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", None)
-    out = subprocess.run([sys.executable, "-c", _CHILD], env=env, capture_output=True, text=True, timeout=600)
-    assert out.returncode == 0, out.stderr[-2000:]
-    return json.loads(out.stdout.strip().splitlines()[-1])
+    # Backend diagnostics may arrive after the result, including at shutdown.
+    result_path = cache_dir / "child_result.json"
+    result_path.unlink(missing_ok=True)
+    out = subprocess.run([sys.executable, "-c", _CHILD, str(result_path)], env=env, capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, (out.stdout[-2000:], out.stderr[-2000:])
+    return json.loads(result_path.read_text())
 
 
 def test_second_process_reloads_the_exported_kernel(tmp_path):

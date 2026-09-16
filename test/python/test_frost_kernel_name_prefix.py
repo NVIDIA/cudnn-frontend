@@ -1,5 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 import ast
 from pathlib import Path
@@ -8,6 +8,7 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _KERNEL_ROOTS = (
+    _REPO_ROOT / "python" / "cudnn" / "conv",
     _REPO_ROOT / "python" / "cudnn" / "gemm",
     _REPO_ROOT / "python" / "cudnn" / "sdpa",
 )
@@ -57,7 +58,7 @@ def _missing_prefixes(node: ast.AST, scope: tuple[str, ...] = ()) -> list[str]:
 
 
 @pytest.mark.L0
-def test_gemm_and_sdpa_kernels_have_cudnn_name_prefix():
+def test_frost_kernels_have_cudnn_name_prefix():
     missing = []
     counts = {}
     for root in _KERNEL_ROOTS:
