@@ -72,9 +72,6 @@ def make_program(plan, names):
         gate_scale_log2=gate_scale,
         beta_sigmoid=plan.use_beta_sigmoid,
         allow_neg_eigval=plan.allow_neg_eigval,
-        k_ratio=ho // hk,
-        v_ratio=ho // hv,
-        n_heads_out=ho,
         max_active_clusters=num_sm,
         d_k=dk,
         d_v=dv,
@@ -86,7 +83,6 @@ def make_program(plan, names):
             use_dstate_in=chain or "d_final_state" in node.inputs,
             use_dstate0="d_initial_state" in node.outputs,
             use_initial_state=chain or state is not None,
-            q_ratio=ho // hq,
             **common,
         )
         if needs_recompute:
@@ -105,8 +101,7 @@ def make_program(plan, names):
                 io_dtype,
                 gate_dtype,
                 use_dstate_in=False,
-                q_ratio=ho // hq,
-                **{key: value for key, value in common.items() if key != "v_ratio"},
+                **common,
             )
             if saved_checkpoints:
                 transition_cfg = recompute.build_cfg(
@@ -118,7 +113,7 @@ def make_program(plan, names):
                     enable_checkpoints=False,
                     seed_identity=True,
                     v_is_zero=True,
-                    **dict(common, d_v=dk, v_ratio=ho // hk),
+                    **dict(common, d_v=dk),
                 )
     else:
         cfg = fwd.build_cfg(
@@ -128,7 +123,6 @@ def make_program(plan, names):
             use_initial_state=chain or state is not None,
             store_final_state=plan.has_final_state,
             enable_checkpoints=saved_checkpoints,
-            q_ratio=ho // hq,
             **common,
         )
     if chain and (not is_bwd or not saved_checkpoints):
@@ -140,6 +134,7 @@ def make_program(plan, names):
         w = workspace_views(buffers[-1], regions)
         q, k, v, g, beta, cu = (ports[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens"))
         state0 = ports.get("initial_state")
+        state_indices = ports.get("state_indices")
         a, dt = (ports.get("a_log"), ports.get("dt_bias")) if safe_gate else (None, None)
         items, count = w["work_items"], w["main_count" if chain else "work_count"]
         sched = w["scheduler_all"] if chain or is_bwd else w["scheduler"]
@@ -153,11 +148,11 @@ def make_program(plan, names):
             dvalue = w["dv_ho"] if hv != ho else ports["dV"]
         if chain:
             chain_prologue(
-                pieces,
+                ct.Int32(pieces),
                 unit_chunks,
                 16,
                 length_rule,
-                ho,
+                ct.Int32(ho),
                 ct.Int32(recompute_span // 16),
                 ct.Int32(16 if is_bwd else checkpoint),
                 cu,
@@ -212,11 +207,11 @@ def make_program(plan, names):
                     stream,
                 )
                 piece_chain.launch_state_chain(
-                    ho,
+                    ct.Int32(ho),
                     dv,
                     dk,
                     rows,
-                    pieces,
+                    ct.Int32(pieces),
                     False,
                     state0 is not None,
                     False,
@@ -229,6 +224,7 @@ def make_program(plan, names):
                     None,
                     None,
                     w["main_rows"],
+                    state_indices,
                     stream,
                 )
                 state0 = w["state_x"]
@@ -256,6 +252,8 @@ def make_program(plan, names):
             if is_bwd:
                 bwd_summary.host(
                     summary_grad_cfg,
+                    ct.Int32(ho // hq),
+                    ct.Int32(ho // hk),
                     a,
                     dt,
                     beta,
@@ -270,11 +268,11 @@ def make_program(plan, names):
                     stream,
                 )
                 piece_chain.launch_state_chain(
-                    ho,
+                    ct.Int32(ho),
                     dv,
                     dk,
                     rows,
-                    pieces,
+                    ct.Int32(pieces),
                     True,
                     ports.get("d_final_state") is not None,
                     False,
@@ -287,6 +285,7 @@ def make_program(plan, names):
                     None,
                     None,
                     w["main_rows"],
+                    state_indices,
                     stream,
                 )
         elif split:
@@ -301,7 +300,7 @@ def make_program(plan, names):
                 expand_num=1,
                 warmup_cap=split_k.warmup_cap_chunks(dk, 1),
                 full_scan=False,
-                n_heads_out=ho,
+                n_heads_out=ct.Int32(ho),
                 num_sms=num_sm,
                 n_tiles=ct.Int32(batch * ho),
                 ideal_chunks=ct.Int32(ideal),
@@ -357,6 +356,8 @@ def make_program(plan, names):
                 state0,
                 ports["O"],
                 ports.get("final_state"),
+                None if chain else state_indices,
+                state_indices,
                 items,
                 count,
                 w["scheduler_prefill"] if chain else sched,
@@ -437,6 +438,9 @@ def make_program(plan, names):
                 )
             bwd.host(
                 cfg,
+                ct.Int32(ho // hq),
+                ct.Int32(ho // hk),
+                ct.Int32(ho // hv),
                 a,
                 dt,
                 beta,
@@ -481,8 +485,8 @@ def make_program(plan, names):
                         ct.Int64(h * dim // 2),
                         ct.Int64(dim // 2),
                         ct.Int32(-(-words // head_reduce.BLOCK)),
-                        h,
-                        ho // h,
+                        ct.Int32(h),
+                        ct.Int32(ho // h),
                         dim // 2,
                         io_dtype,
                         stream,
