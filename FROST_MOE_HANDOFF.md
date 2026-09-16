@@ -5,6 +5,34 @@ Yanqin can adjust the design, choose which changes to keep, and decide whether t
 split it later. The companion repository carries the other half of the same work;
 the individual optimization experiments are not separate PRs.
 
+## SM120 scheduler repair
+
+The SM120 plain and block-scale MoE schedulers now read each shared ring word
+in one lane and broadcast it before releasing the slot. This prevents late
+consumer reads from racing the next scheduler write. Both templates reuse the
+existing SM100 helper through a common module; the SM100 helper body is unchanged.
+
+On a full RTX PRO 6000 Blackwell Server Edition (188 SMs, 600 W, driver
+595.58.03), six focused cases pass normal execution, unfiltered memcheck and
+unfiltered racecheck, with zero sanitizer errors/hazards. Coverage is BF16,
+NVFP4 and MXFP8, two tile geometries, 65,537 rows, ragged/empty experts and more
+than four compiled-grid waves. Exact FP32 references, poisoned outputs/counters,
+changed offsets/inputs/scales and three captured replays per case are checked.
+The graph is inspected for the actual Frost kernel. Old BF16 and NVFP4 small
+tiles pass numerics but fail racecheck with exit 86, establishing the regression.
+
+Run from `test/python` on SM120:
+
+```bash
+pytest -m L1 -s gemm/frost/test_moe_scheduler_sm120.py
+compute-sanitizer --tool memcheck --target-processes all --error-exitcode 86 python -m pytest -m L1 -s gemm/frost/test_moe_scheduler_sm120.py
+compute-sanitizer --tool racecheck --target-processes all --error-exitcode 86 python -m pytest -m L1 -s gemm/frost/test_moe_scheduler_sm120.py
+```
+
+This is a scheduler correctness result. The companion FI public SM120 candidate
+and complete-MoE performance confirmation are being validated separately. The
+earlier B200 reference/racecheck failure remains open; this does not clear it.
+
 ## Code and validation baseline
 
 The measured implementation uses OSS Frost/CuTeDSL engine **20400** for both GEMMs.
