@@ -1435,9 +1435,13 @@ class SM120FusedMultiHeadAttentionForward:
                     row_valid = row_q < seqlen_q
                     a = cutlass.Float32(0.0) if not row_valid else a
                     # quad butterfly: lanes {4k..4k+3} hold the block's 16 (or 32) columns
-                    a1 = prims.shfl_sync(thread_mask=0xFFFFFFFF, val=a.bitcast(cutlass.Int32), offset=1, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY).bitcast(cutlass.Float32)
+                    a1 = prims.shfl_sync(thread_mask=0xFFFFFFFF, val=a.bitcast(cutlass.Int32), offset=1, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY).bitcast(
+                        cutlass.Float32
+                    )
                     a = cute.arch.fmax(a, a1)
-                    a2 = prims.shfl_sync(thread_mask=0xFFFFFFFF, val=a.bitcast(cutlass.Int32), offset=2, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY).bitcast(cutlass.Float32)
+                    a2 = prims.shfl_sync(thread_mask=0xFFFFFFFF, val=a.bitcast(cutlass.Int32), offset=2, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY).bitcast(
+                        cutlass.Float32
+                    )
                     a = cute.arch.fmax(a, a2)
                     lane_amax_half[row_half * 2] = cute.arch.fmax(lane_amax_half[row_half * 2], a)
                     if cutlass.const_expr(self.o_block_scale == 16):
@@ -1466,7 +1470,12 @@ class SM120FusedMultiHeadAttentionForward:
                             r = row_q + batch_idx * sfo_row_off_b
                             plane = (batch_idx * cutlass.Int32(num_heads_q) + q_head_base) * sfo_plane_stride
                             off = plane + (r >> cutlass.Int32(7)) * (sfo_cols << cutlass.Int32(7)) + (c >> cutlass.Int32(2)) * cutlass.Int32(512)
-                            off = off + (r & cutlass.Int32(31)) * cutlass.Int32(16) + ((r >> cutlass.Int32(5)) & cutlass.Int32(3)) * cutlass.Int32(4) + (c & cutlass.Int32(3))
+                            off = (
+                                off
+                                + (r & cutlass.Int32(31)) * cutlass.Int32(16)
+                                + ((r >> cutlass.Int32(5)) & cutlass.Int32(3)) * cutlass.Int32(4)
+                                + (c & cutlass.Int32(3))
+                            )
                             sf_ptr = sf_o.iterator.raw_ptr() + off
                             if row_valid:
                                 sf_ptr.store(cutlass.Vector.from_elements((cutlass.Int8(sf_byte),), cutlass.Int8), alignment=1)

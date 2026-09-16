@@ -1532,10 +1532,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self._check_dtype(self.sf_o_desc, torch.float8_e4m3fn, name="sf_o")
                 self.o_block_scale, self._dtype_o_code = 16, DTYPE_O_NVFP4
             else:
-                self._value_error_if(self.dtype_o != torch.float8_e4m3fn, "sf_o with a non-FP4 O requires an FP8 E4M3 O (MXFP8 output: one UE8M0 scale per 32 d elements)")
+                self._value_error_if(
+                    self.dtype_o != torch.float8_e4m3fn, "sf_o with a non-FP4 O requires an FP8 E4M3 O (MXFP8 output: one UE8M0 scale per 32 d elements)"
+                )
                 self._check_dtype(self.sf_o_desc, [torch.uint8, torch.float8_e8m0fnu], name="sf_o")
                 self.o_block_scale, self._dtype_o_code = 32, DTYPE_O_MXFP8
-            self._not_implemented_error_if(self.flavor != (128, 128), f"block-scaled O is served by the d128 flavor only; got head dims {(int(d_qk), int(d_v))}")
+            self._not_implemented_error_if(
+                self.flavor != (128, 128), f"block-scaled O is served by the d128 flavor only; got head dims {(int(d_qk), int(d_v))}"
+            )
             self._not_implemented_error_if(int(d_v) != 128, "block-scaled O needs d_v == 128 (no head-dim envelope)")
             self._not_implemented_error_if(
                 self.thd or self.seq_q_lens_present or self.pack_gqa or self.split_kv > 1,
@@ -3084,7 +3088,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # FP4 O arrives as its byte container ((B, H, S, d/2) in
             # float4_e2m1fn_x2 / uint8 / fp8 spelling); the kernel binds it as
             # FP8-typed bytes and writes two E2M1 per byte.
-            self._value_error_if(o_tensor.shape[-1] * 2 != self.head_dim_v, f"FP4 O must carry d_v/2 = {self.head_dim_v // 2} bytes per row; got {tuple(o_tensor.shape)}")
+            self._value_error_if(
+                o_tensor.shape[-1] * 2 != self.head_dim_v, f"FP4 O must carry d_v/2 = {self.head_dim_v // 2} bytes per row; got {tuple(o_tensor.shape)}"
+            )
             o_tensor = o_tensor.view(torch.float8_e4m3fn) if o_tensor.dtype != torch.float8_e4m3fn else o_tensor
         O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
         O = O_scratch if o_needs_copy_back else O_view
@@ -3533,7 +3539,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 self._check_dtype(self.sf_o_desc, torch.float8_e4m3fn, name="sf_o")
                 self.o_block_scale, self._dtype_o_code = 16, DTYPE_O_NVFP4
             else:
-                self._value_error_if(self.o_desc.dtype != torch.float8_e4m3fn, "sf_o with a non-FP4 O requires an FP8 E4M3 O (MXFP8 output: one UE8M0 scale per 32 d elements)")
+                self._value_error_if(
+                    self.o_desc.dtype != torch.float8_e4m3fn, "sf_o with a non-FP4 O requires an FP8 E4M3 O (MXFP8 output: one UE8M0 scale per 32 d elements)"
+                )
                 self._check_dtype(self.sf_o_desc, [torch.uint8, torch.float8_e8m0fnu], name="sf_o")
                 self.o_block_scale, self._dtype_o_code = 32, DTYPE_O_MXFP8
             self._not_implemented_error_if(int(d_v) != 128 or int(d_q) != 128, f"block-scaled O needs d_qk = d_v = 128; got {(int(d_q), int(d_v))}")
@@ -4097,7 +4105,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             if self.o_block_scale == 16:
                 # FP4 O arrives as its byte container ((B, H, S, d/2)); the kernel
                 # binds it as E4M3-typed bytes and writes two E2M1 per byte.
-                self._value_error_if(o_tensor.shape[-1] * 2 != self.head_dim_v, f"FP4 O must carry d_v/2 = {self.head_dim_v // 2} bytes per row; got {tuple(o_tensor.shape)}")
+                self._value_error_if(
+                    o_tensor.shape[-1] * 2 != self.head_dim_v, f"FP4 O must carry d_v/2 = {self.head_dim_v // 2} bytes per row; got {tuple(o_tensor.shape)}"
+                )
                 o_tensor = o_tensor.view(torch.float8_e4m3fn) if o_tensor.dtype != torch.float8_e4m3fn else o_tensor
             o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
             o = o_scratch if o_needs_copy_back else o_view

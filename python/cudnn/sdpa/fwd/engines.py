@@ -1011,7 +1011,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # stays expressible without reintroducing a boolean that cannot say it.
             thd_d_shapes=SM107_FP8_THD_SHAPES if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}),
+            out_dtypes=frozenset(
+                {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+            ),
             # Block-scaled O epilogues (FP4_E2M1 + E4M3/16, FP8_E4M3 + UE8M0/32):
             # the d128 flavor on both arch lines; the adapter declines the
             # wider flavors (config_sm100 backstop).
@@ -1721,7 +1723,9 @@ def _sm120_fp8_spec() -> EngineSpec:
             d_shapes=frozenset((tq, tv) for tq in SUPPORTED_HEAD_TILES_FP8 for tv in SUPPORTED_HEAD_TILES_FP8),
             d_pad_multiple=16,  # TMA 16-byte global-stride rule at 1 byte/elem
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}),
+            out_dtypes=frozenset(
+                {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+            ),
             # Block-scaled O epilogues (d_v = 128; the adapter declines other head dims).
             o_block_scales=frozenset({0, 16, 32}),
             is_fp8=True,
