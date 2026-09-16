@@ -244,9 +244,6 @@ def test_sdpa_random_bwd_unified_L0(env_info, test_no, request, cudnn_handle):
         test.cfg.dropout_prob = 0.1
         test.cfg.bwd_implementation = test.cfg.implementation
         test.cfg.implementation = cudnn.attention_implementation.AUTO
-        # Sink token + dropout mismatches the reference (dSink, and o/stats on SM100) on the composite engine as
-        # well; keep the two apart here until that is resolved.
-        test.cfg.with_sink_token = False
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)

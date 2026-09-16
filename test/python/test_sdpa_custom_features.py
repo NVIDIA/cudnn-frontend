@@ -29,6 +29,7 @@ def make_config(
     implementation=cudnn.attention_implementation.AUTO,
     s_q=512,
     s_kv=512,
+    with_sink_token=False,
 ):
     cfg = ExecConfig(
         data_type=data_type,
@@ -59,6 +60,7 @@ def make_config(
         right_bound=right_bound,
         dropout_prob=dropout_prob,
         implementation=implementation,
+        with_sink_token=with_sink_token,
     )
     cfg.fill_derived_fields()
     return cfg
@@ -111,4 +113,25 @@ def test_sdpa_dropout_bwd_unified(data_type, right_bound, s_q_s_kv, request, cud
     # The unified forward does not generate Stats with dropout, so the forward runs on AUTO (composite) and only
     # the backward is pinned to the unified node.
     cfg.bwd_implementation = cudnn.attention_implementation.UNIFIED
+    exec_sdpa(cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("bwd_implementation", [None, cudnn.attention_implementation.UNIFIED], ids=["auto", "unified_bwd"])
+@pytest.mark.parametrize("s_q_s_kv", [(300, 1000), (92, 92)], ids=["s300x1000", "s92"])
+def test_sdpa_dropout_with_sink_token(bwd_implementation, s_q_s_kv, request, cudnn_handle):
+    """Dropout together with a learnable sink token (fwd + bwd). Previously untested: the sink gradient was scaled
+    by the keep probability, and the SM100 forward weighted the sink by the keep probability in the row sum."""
+    cfg = make_config(
+        data_type=torch.bfloat16,
+        is_infer=False,
+        is_dropout=True,
+        dropout_prob=0.1,
+        right_bound=0,
+        with_sink_token=True,
+        s_q=s_q_s_kv[0],
+        s_kv=s_q_s_kv[1],
+    )
+    if bwd_implementation is not None:
+        cfg.bwd_implementation = bwd_implementation
     exec_sdpa(cfg, request, cudnn_handle)
