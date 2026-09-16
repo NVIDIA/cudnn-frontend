@@ -9,6 +9,11 @@ This directory contains test scripts to test the coverage of cuDNN Graph API on 
     <th>Description</th>
 </tr>
 <tr>
+    <td><a href="dsa_flashmla_training_bridge.py">dsa_flashmla_training_bridge.py</a></td>
+    <td>DeepSeek Sparse Attention</td>
+    <td>Optional B200 training bridge: dynamically calls the separately installed official FlashMLA sparse forward, safety-normalizes its wider invalid-index contract, then uses cuDNN Frontend DSA backward and attention-score recompute. No FlashMLA implementation is vendored.</td>
+</tr>
+<tr>
     <td><a href="test_gqa_b+h+s+d.py">test_gqa_b+h+s+d.py</a></td>
     <td>GQA</td>
     <td>Group Query Attention with bfloat16/float16/float32 inputs and outputs. Input tensor is in BHSD dimension. Compute is in float32 data type. Forward and backward pass are tested.<br/><b>cuDNN Graph API is not supported for float32 I/O data type.</b></td>
