@@ -3442,6 +3442,40 @@ def test_piece_chain_bwd_batch_invariant_length_rule_bitwise(backend, variant, s
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
+def test_piece_chain_odd_piece_boundary_bitwise(backend, variant):
+    """A summary CTA that finishes an odd-chunk piece and continues with another work item keeps every ping-pong warp
+    on its ring parity: o, final_state and every gradient are bitwise the same alone and packed (the T=16224 hang)."""
+    seq_lens = [16224, 16224]
+    piece_chunks = [-(-(-(-length // CHUNK[variant])) // 2) for length in seq_lens]
+    assert all(PIECE_TOKENS < length < 2 * PIECE_TOKENS for length in seq_lens) and all(chunks % 2 == 1 for chunks in piece_chunks)
+    case = chain_case(variant, seq_lens, H=128)
+    if 2 * case.HO <= torch.cuda.get_device_properties(0).multi_processor_count:
+        pytest.skip("needs more summary work items than SMs")
+    state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
+    o, fs, grads, dO, _ = chain_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final)
+    assert torch.isfinite(o).all() and torch.isfinite(fs).all()
+    for n in range(case.N):
+        s, e = int(case.cu[n]), int(case.cu[n + 1])
+        alone = window(case, s, e)
+        clear_caches()
+        o_alone, fs_alone, grads_alone, _, _ = chain_grads(
+            backend,
+            alone,
+            batch_invariant=True,
+            initial_state=state0[n : n + 1].clone(),
+            d_final_state=d_final[n : n + 1].clone(),
+            dO=dO[s:e].clone(),
+        )
+        assert_bitwise(f"seq {n} o", o[s:e], o_alone)
+        assert_bitwise(f"seq {n} final_state", fs[n], fs_alone[0])
+        for name in LEAF_NAMES[variant]:
+            scale = case.n if name in EXPANDED_LEAVES else 1
+            assert_bitwise(f"seq {n} d{name}", grads[name][s * scale : e * scale], grads_alone[name])
+        assert_bitwise(f"seq {n} d_initial_state", grads["initial_state"][n], grads_alone["initial_state"][0])
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_piece_chain_int64_cu_seqlens(backend, variant):
     """int64 cu_seqlens is bitwise the int32 run: forward, checkpoint series and every gradient."""
     case = chain_case(variant, CHAIN_RAGGED, H=2, K=64, V=64)
