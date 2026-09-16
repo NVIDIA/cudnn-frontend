@@ -1741,10 +1741,15 @@ def test_sdpa_fp8_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
 #
 # FlashInfer-shaped fp8 KV-cache decode / MTP: sdpa_fp8 over E4M3/E5M2 page pools,
 # s_q in [1, 8] ("s_q=1" weighted), GQA, page sizes {16, 32, 64, 128}, per-batch KV
-# lengths (partial last pages, zero-length sequences). Every draw is inside the fp8
-# row's paged envelope (d <= 128 at the fp8 graphs' 16-granularity, dense Q, contract
-# page sizes), so each config ASSERTS that sdpa_fwd_prefill_sm100_fp8 served it: a
-# WAIVED skip or a silent fall-through to the backend would otherwise hide a decline.
+# lengths (partial last pages, zero-length sequences), and the masks a decode step
+# spells: none (plain decode), a causal upper bound top-left or bottom-right (MTP,
+# each batch's diagonal anchored at its own KV length) and a left sliding window.
+# Every request has >= 1 query token (the harness zeroes a dead Q row on BOTH sides
+# of the compare, so a draw of all-zero Q lengths would pass vacuously). Every draw
+# is inside the fp8 row's paged envelope (d <= 128 at the fp8 graphs' 16-granularity,
+# dense Q, contract page sizes, bottom-right only under a causal bound), so each config
+# ASSERTS that sdpa_fwd_prefill_sm100_fp8 served it: a WAIVED skip or a silent
+# fall-through to the backend would otherwise hide a decline.
 # Because the engine is pinned, both functions opt in to the harness's dead-page NaN
 # poison (cfg.paged_nan_dead_pages): the FROST kernel promises a TMA-OOB page -1 for
 # every table slot past a sequence's live pages, so a dereferenced dead slot fails the
@@ -1792,8 +1797,8 @@ def test_sdpa_fp8_fwd_paged_decode_frost_L0(env_info, test_no, request, cudnn_ha
         head_count=RandomHeadGenerator(min=4, max=32, head_group_options=(1, 6, 1)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
-        with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
-        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1}),
+        with_sliding_mask=SlidingWindowMaskGenerator(no_mask=5, causal=3, left_window_only=2),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1, cudnn.diagonal_alignment.BOTTOM_RIGHT: 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 1, "full": 0}),
         block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 64, 128]),
     ) as randomization_ctx:
@@ -1801,6 +1806,13 @@ def test_sdpa_fp8_fwd_paged_decode_frost_L0(env_info, test_no, request, cudnn_ha
 
     test.cfg.is_paged = True
     test.cfg.paged_nan_dead_pages = True
+    # A decode / MTP step has at least one query token per request; the KV lengths stay
+    # free (0 and partial-page sequences are the point of the paged draw).
+    test.cfg.seq_len_q = [max(1, n) for n in test.cfg.seq_len_q]
+    # Bottom-right alignment needs a causal upper bound (right_bound == 0 on the causal and
+    # sliding-window draws); a no-mask draw is plain decode and stays top-left.
+    if test.cfg.right_bound is None:
+        test.cfg.diag_align = cudnn.diagonal_alignment.TOP_LEFT
     # The FROST FP8 kernels bake a 4-binade lazy-rescale threshold (config_sm100.rescale_threshold);
     # the reference mirrors the value it is handed, so pin it rather than draw it.
     test.cfg.rescale_threshold = 4.0
