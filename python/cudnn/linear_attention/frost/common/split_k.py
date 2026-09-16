@@ -1400,6 +1400,19 @@ class SplitTableFacts(NamedTuple):
     gate_elem_bytes: int
 
 
+def scan_geometry(total_tokens: int, batch_size: int, b_t: int, n_heads_out: int, gate_channels: int, num_sms: int):
+    """Shared scan launch geometry for Python execution and exported host programs."""
+    need_rows = chunk_scratch_rows(total_tokens, batch_size, b_t)
+    grid_y = n_heads_out if gate_channels > 0 else -(-n_heads_out // WARP_SIZE)
+    scan_rows = scan_rows_per_warp(need_rows, grid_y, num_sms)
+    n_scan_blocks = -(-need_rows // (SCAN_WARPS * scan_rows))
+    n_scan_ctas = min(
+        n_scan_blocks,
+        max(max(1, SCAN_CTA_CAP * num_sms // grid_y), -(-n_scan_blocks // SCAN_BLOCK_LOOP_MAX)),
+    )
+    return scan_rows, n_scan_blocks, n_scan_ctas
+
+
 def split_table_facts(
     gate, cu_seqlens, *, split, n_tiles, ideal_chunks, num_sms, b_t, log2_threshold, log_gate, safe_gate, gate_lower_bound, expand_num
 ) -> SplitTableFacts:
@@ -1409,14 +1422,7 @@ def split_table_facts(
     gate_scale_log2 = float(gate_lower_bound) * RCP_LN2 if safe_gate and gate_channels > 0 else 0.0
     n_heads_out = gate.shape[1]
     batch_size = cu_seqlens.shape[0] - 1
-    need_rows = chunk_scratch_rows(gate.shape[0] * int(expand_num), batch_size, b_t)
-    grid_y = n_heads_out if gate_channels > 0 else -(-n_heads_out // WARP_SIZE)
-    scan_rows = scan_rows_per_warp(need_rows, grid_y, num_sms)
-    n_scan_blocks = -(-need_rows // (SCAN_WARPS * scan_rows))
-    n_scan_ctas = min(
-        n_scan_blocks,
-        max(max(1, SCAN_CTA_CAP * num_sms // grid_y), -(-n_scan_blocks // SCAN_BLOCK_LOOP_MAX)),
-    )
+    scan_rows, n_scan_blocks, n_scan_ctas = scan_geometry(gate.shape[0] * int(expand_num), batch_size, b_t, n_heads_out, gate_channels, num_sms)
     return SplitTableFacts(
         bool(split),
         int(b_t),
