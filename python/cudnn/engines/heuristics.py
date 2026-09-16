@@ -15,12 +15,17 @@ Two layers, deliberately separated:
   best first. It never sees the backend, modes, or another family.
 
 - PLACEMENT lives HERE (:func:`_assemble`), once for every family: python
-  proposals lead the backend's entries inside each mode block. That is a
-  standing assumption, not a measurement — an OSS engine that loses to the
-  backend gets fixed or pulled, not demoted; and an autotune (build ALL) pass
-  measures every entry regardless of order, so the order only decides the
-  default winner. The delegating entry, dedup, and the mode strip are all
-  placement bookkeeping and stay out of the families.
+  proposals lead the backend's entries inside each mode block, unless the
+  family marks one ``yield_to_backend`` — admissible, but measured slower than
+  the backend's plan for that graph — in which case it closes the block
+  instead. Leading is the standing assumption, not a measurement: an OSS
+  engine that loses to the backend gets fixed or pulled, not demoted, and a
+  yield is the one-shape exception a family states as data while the fix is
+  pending (a paged decode on a prefill tile geometry, say). An autotune
+  (build ALL) pass measures every entry regardless of order, so the order
+  only decides the default winner. The delegating entry, dedup, and the
+  mode / yield strip are all placement bookkeeping and stay out of the
+  families.
 
 An engine answers two questions only: can I serve this graph
 (``check_support``) and compile me this config (``build_plan``).
@@ -64,16 +69,22 @@ def _unranked(graph, engines: List[BaseEngine], backend_plans: List[PlanConfig])
 
 
 def _strip(cfg: PlanConfig) -> PlanConfig:
-    """A final-list entry: (engine_id, knobs[, cpp_index]) — the mode tag is
-    assembly bookkeeping and never reaches ``graph.plans``."""
-    if cfg.mode is None and cfg.cpp_index is None:
+    """A final-list entry: (engine_id, knobs[, cpp_index]) — the mode tag and
+    the yield mark are assembly bookkeeping and never reach ``graph.plans``."""
+    if cfg.mode is None and cfg.cpp_index is None and not cfg.yield_to_backend:
         return cfg
     return PlanConfig(cfg.engine_id, cfg.knobs, cpp_index=cfg.cpp_index)
 
 
+def _split_yielding(proposals: List[PlanConfig]) -> "tuple[List[PlanConfig], List[PlanConfig]]":
+    """One family batch as (leading, yielding), each half in the family's order."""
+    return [c for c in proposals if not c.yield_to_backend], [c for c in proposals if c.yield_to_backend]
+
+
 def _assemble(modes: List[Any], recommend: Callable[[str], List[PlanConfig]], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
     """The final ranked list: mode block by mode block in the caller's order,
-    python proposals leading the backend's entries inside each block.
+    python proposals leading the backend's entries inside each block — except
+    the proposals the family marked ``yield_to_backend``, which close it.
 
     ``recommend(kind)`` is the family's hook already bound to (facts, offered):
     ``kind`` is ``"A"`` (candidates worth timing, best first — also the answer
@@ -88,11 +99,27 @@ def _assemble(modes: List[Any], recommend: Callable[[str], List[PlanConfig]], ba
     ours: ahead of our OPENSOURCE block it would answer an OSS-coverage
     question with a native kernel.
 
+    A block is therefore ``[leading proposals] + delegating + [the backend's
+    entries of that mode] + [yielding proposals]``. Yielding is relative to
+    what the backend offered: with no backend entries in the block (the
+    backend declined the graph) the yielding proposal is simply next, so the
+    graph stays served. The same holds when a backend entry ahead of it fails
+    to BUILD — ``build_plan_at_index`` reports a finalize failure as
+    GRAPH_EXECUTION_PLAN_CREATION_FAILED, which the binding raises as
+    ``cudnnGraphNotSupportedError``, a decline that advances
+    ``pygraph.build_plans``' walk to the next entry. OPENSOURCE is the one
+    block that ignores the mark: it asks which graphs the OSS engines cover,
+    not which side is faster, so a demotion there would answer with a native
+    kernel. Nothing yielding — the placement before the mark existed.
+
     Asking for ``[A, FALLBACK]`` puts every tuned candidate — both sides' —
     ahead of every fallback. A plan repeated across blocks keeps its first
     position. Identity is (engine, knobs): cpp_index is only WHERE one backend
     query put a plan, so keying on it would let one config both modes return
-    through as two entries — and an autotuner would build and time it twice.
+    through as two entries — and an autotuner would build and time it twice;
+    the yield mark is likewise not identity, so a config a family emits
+    leading in one block and yielding in another is one plan at its first
+    position.
     """
     import cudnn
 
@@ -102,9 +129,11 @@ def _assemble(modes: List[Any], recommend: Callable[[str], List[PlanConfig]], ba
         if mode == cudnn.heur_mode.OPENSOURCE:
             out += recommend("A") + delegating
         elif mode in (cudnn.heur_mode.A, cudnn.heur_mode.B):
-            out += recommend("A") + delegating + [c for c in backend_plans if c.mode == mode]
+            lead, trail = _split_yielding(recommend("A"))
+            out += lead + delegating + [c for c in backend_plans if c.mode == mode] + trail
         elif mode == cudnn.heur_mode.FALLBACK:
-            out += recommend("FALLBACK") + delegating + [c for c in backend_plans if c.mode == mode]
+            lead, trail = _split_yielding(recommend("FALLBACK"))
+            out += lead + delegating + [c for c in backend_plans if c.mode == mode] + trail
     # A delegate with no mode asked for it (the backend has engines but exposed
     # no plans) would otherwise be dropped.
     out += delegating

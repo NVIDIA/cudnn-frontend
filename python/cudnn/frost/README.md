@@ -615,14 +615,15 @@ The engine-to-kernel mapping is many-to-many by design:
 ## Heuristics are per operation
 
 `cudnn/engines/heuristics.py` is the single entry point, and it decides
-nothing:
+nothing about which configs a family should try:
 
 ```python
 def rank(graph, engines, backend_plans, modes=None) -> List[PlanConfig]:
     family = manifest.family_for(graph)
     recommend = manifest.resolve_heuristics(family)   # the family's own rules
     facts = graph._facts_for(manifest.resolve_analyzer(family))
-    return recommend(modes, facts, {e.name: e.engine_id for e in engines}, backend_plans)
+    offered = {e.name: e.engine_id for e in engines if accepts(e, graph)}
+    return _assemble(modes, lambda kind: recommend(kind, facts, offered), backend_plans)
 ```
 
 Ranking knowledge is op-specific -- what makes one SDPA engine beat another
@@ -635,13 +636,28 @@ the backend's.
 The family is the smallest scope that can rank, and that is the whole reason
 this seam exists rather than an engine-side `propose_plans`:
 
-- **`recommend(modes, facts, offered, backend_plans) -> [PlanConfig]` returns
-  `graph.plans`, position for position.** Nothing downstream reorders it.
-- **It places BOTH sides.** The backend's entries arrive tagged with the
-  `heur_mode` that produced them, so the family says, per mode, whether its own
-  configs lead or follow. That is a measurement, not a preference: whether a
-  FROST cell beats the backend's kernel on a given arch is a number someone
-  timed.
+- **`recommend(kind, facts, offered) -> [PlanConfig]` is pure and
+  backend-blind**: which of the family's engines serve these facts, with which
+  complete knob assignments, best first. `kind` is `"A"` or `"FALLBACK"`; the
+  hook never sees modes, the backend's entries, or another family.
+- **Placement is shared (`_assemble`), and the family steers it with ONE
+  bit.** Inside each mode block the family's proposals lead the backend's
+  entries by standing assumption (an OSS engine measured behind the backend
+  gets fixed or pulled, not demoted). A proposal the family marks
+  `PlanConfig(..., yield_to_backend=True)` -- admissible, but measured slower
+  than the backend's plan for that graph -- closes its block instead: after
+  the delegating entry and the backend's entries of that mode, before the
+  next block. With no backend entries in the block (the backend declined the
+  graph) the yielding proposal is simply next, and a backend entry ahead of
+  it that fails to build is a `cudnnGraphNotSupportedError` decline the walk
+  steps over -- either way the graph stays served. The mark is stripped
+  before `graph.plans` and is not part of a plan's identity; `select_plan`, a
+  `deselect_engines` on the backend's names, or an autotune reach the
+  proposal regardless. That is a measurement, not a preference: whether a
+  FROST cell beats the backend's kernel on a given shape is a number someone
+  timed. The SDPA forward family uses it for paged, decode-shaped graphs
+  (`S_q <= 8`) on flavors without a `paged_decode_lead_d_shapes` claim on
+  their `EngineSpec` row (`sdpa/fwd/heuristics._yields_to_backend`).
 - **Each mode contributes a block, and the blocks concatenate** in the caller's
   order. `[A, FALLBACK]` therefore puts every tuned candidate -- both sides' --
   ahead of every fallback.
@@ -652,7 +668,8 @@ this seam exists rather than an engine-side `propose_plans`:
   - **OPENSOURCE**: mode A without the backend's recommendation -- these cells
     ARE the open-source implementation. Combine it (`[OPENSOURCE, A, FALLBACK]`)
     to measure coverage: a graph that ends up on a backend plan is one FROST
-    does not cover.
+    does not cover. The yield mark is ignored here: coverage is not a speed
+    question, and a demotion would answer it with a native kernel.
   - **B**: answered as A until a family has a wider search to give.
 - Knob precedence: **user request > heuristic proposal > engine default** --
   same rule at every level: a proposal outside the engine's `Capabilities`

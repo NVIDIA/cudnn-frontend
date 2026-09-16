@@ -23,7 +23,13 @@ the delegating entry, dedup, the mode strip — is PLACEMENT, and placement is
 not a family opinion: it lives once in ``engines/heuristics._assemble``,
 under the standing assumption that these proposals lead the backend's entries
 (an OSS engine measured behind the backend gets fixed or pulled, not
-demoted).
+demoted). The family states ONE exception, as data rather than as a decline:
+a paged, decode-shaped graph (:func:`decode_shaped`) on a flavor whose paged
+decode is not claimed to lead the backend
+(``EngineSpec.paged_decode_lead_d_shapes``) is proposed ``yield_to_backend``
+— still admissible and selectable, ranked after the backend's plan of its
+block until a decode-shaped kernel, or a measurement, earns the lead
+(:func:`_yields_to_backend`).
 
 Cross-ENGINE order within a proposal batch is ``ENGINE_SPECS`` declaration
 order. Today that is unambiguous in practice — co-eligible cells are the
@@ -917,6 +923,42 @@ def _eligible(facts, offered: Dict[str, int]) -> Iterator[Tuple[int, EngineSpec]
 
 
 # ---------------------------------------------------------------------------
+# placement mark — the one thing this family says about the backend's entries
+# ---------------------------------------------------------------------------
+
+# The decode window: every Q row of a request fits one tile-row group, so a
+# prefill tile geometry (TILE_M = 128 rows per CTA) runs mostly empty over it.
+# Covers single-token decode and speculative / MTP verification (S_q in
+# [2, 8]); S_q = 9 and up is treated as (short) prefill.
+DECODE_MAX_S_Q = 8
+
+
+def decode_shaped(facts) -> bool:
+    """Whether the Q extent is decode-shaped: ``1 <= s_q <= DECODE_MAX_S_Q``."""
+    return 1 <= facts.s_q <= DECODE_MAX_S_Q
+
+
+def _yields_to_backend(spec: EngineSpec, facts) -> bool:
+    """Whether this cell's proposals for ``facts`` carry ``yield_to_backend``.
+
+    The rule: a PAGED, DECODE-SHAPED graph on a flavor that does not claim the
+    paged-decode lead (``EngineSpec.paged_decode_lead_d_shapes``, keyed by the
+    flavor ``_selected_d_shape`` picks, so an envelope graph rides its
+    flavor's claim). A prefill tile over one to eight query rows leaves the
+    backend's purpose-built decode engine ahead: on B200 paged decode the
+    pending d512 and d192x128 paged ports and the fp8 d128 row each measured
+    behind it when the FROST plan led (40 -> 87 us, +65%, 68 -> 1664 us),
+    while the wired d256 flavor leads it (61-67 vs 76 us). Placement only:
+    ``mismatch`` still admits the graph, so an autotune, a pin, or a barred
+    backend reaches the proposal; and with no backend plan the walk lands on
+    it anyway (see ``engines/heuristics._assemble``).
+    """
+    if not (facts.has_paged_kv and decode_shaped(facts)):
+        return False
+    return _selected_d_shape(spec.capabilities, facts) not in spec.paged_decode_lead_d_shapes
+
+
+# ---------------------------------------------------------------------------
 # recommend — the pure, backend-blind core (also the standalone entry point)
 # ---------------------------------------------------------------------------
 
@@ -930,18 +972,25 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     — honored-or-never-listed — and NO mode. Standalone callers (wrappers,
     autotuners) use this directly: build a ``SdpaGraphFacts``, pass the
     family's ``offered_ids()``, run or time the sets in order.
+
+    ``yield_to_backend`` is set on every set of a cell for which
+    :func:`_yields_to_backend` holds — a placement mark the shared layer
+    reads; a standalone caller timing the sets may ignore it.
     """
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities
         sets = _knob_sets(spec, facts) if kind == "A" else [_fallback_knobs(spec, facts)]
+        yields = _yields_to_backend(spec, facts)
         for knobs in sets:
             if mismatch(caps, facts, knobs) is None:
-                out.append(PlanConfig(engine_id, knobs))
+                out.append(PlanConfig(engine_id, knobs, yield_to_backend=yields))
     return out
 
 
 # Placement — mode blocks, the backend's entries, the delegating entry, dedup,
-# the mode strip — is NOT this family's business: it happens once for every
-# family in ``engines/heuristics._assemble``, with these proposals leading the
-# backend's entries inside each block by standing assumption.
+# the mode / yield strip — is NOT this family's business: it happens once for
+# every family in ``engines/heuristics._assemble``, with these proposals
+# leading the backend's entries inside each block by standing assumption and
+# the ``yield_to_backend`` mark (``_yields_to_backend``) as the one stated
+# exception.

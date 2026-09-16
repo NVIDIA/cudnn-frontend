@@ -799,6 +799,18 @@ class EngineSpec:
     # kernels (e.g. decode vs prefill by S_q) or chain several launches under
     # one name.
     lower: "Callable[[EngineSpec, ga.SdpaGraphFacts, Optional[SdpaFwdKnobs]], Any]"
+    # PLACEMENT, not eligibility -- deliberately not a Capabilities field, so
+    # outside Rule S2's scope: the native flavor shapes whose PAGED,
+    # DECODE-SHAPED proposal (fwd/heuristics.decode_shaped, S_q <= 8) ranks
+    # ahead of the backend's own plan. Any other paged flavor this row serves
+    # is proposed ``yield_to_backend`` at decode -- still eligible and
+    # selectable, ranked after the backend's entries of its block -- because a
+    # prefill tile geometry over a handful of query rows loses to the
+    # backend's decode engine until a decode-shaped kernel (or a measurement)
+    # earns the lead. Keyed by the flavor ``_selected_d_shape`` picks, so an
+    # envelope graph rides its flavor's claim. Empty by default: a freshly
+    # wired paged flavor yields until its decode is measured.
+    paged_decode_lead_d_shapes: frozenset = frozenset()
 
 
 def _sm100_spec() -> EngineSpec:
@@ -862,6 +874,11 @@ def _sm100_spec() -> EngineSpec:
             pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256)}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
+        # Paged decode (S_q <= 8) leads the backend's plan on d256 (B200,
+        # S_kv 2-4k: 61-67 us vs 76 us) and on d128, the flavor the paged
+        # decode tests pin to FROST while its decode-shaped tile is pending.
+        # A flavor wired into paged_kv without a claim here yields at decode.
+        paged_decode_lead_d_shapes=frozenset({(128, 128), (256, 256)}),
     )
 
 

@@ -87,10 +87,40 @@ def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0):
     return k_pool, v_pool, k_c, v_c, bt
 
 
-def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, stats=False, s_q=1, max_seq_len=None, want_split=None, causal_br=False):
-    """Build + run the paged graph on the FROST engine's own best plan (or the
-    ``want_split`` leg), check O (+ Stats) against ``_ref_rows`` and return the
-    plan.  ``causal_br`` adds the bottom-right causal mask (MTP at S_q > 1)."""
+_PIN_FROST = object()  # _run_graph's default ``select``: pin the FROST engine's best plan
+
+
+def _run_graph(
+    B,
+    H,
+    KH,
+    d,
+    P,
+    max_pages,
+    lens,
+    hnd,
+    *,
+    dtype=torch.float16,
+    stats=False,
+    s_q=1,
+    max_seq_len=None,
+    want_split=None,
+    causal_br=False,
+    select=_PIN_FROST,
+    prepare=None,
+    return_graph=False,
+):
+    """Build, plan, run and check one paged graph against ``_ref_rows`` (O, and
+    Stats when requested); returns the plan that ran.
+
+    ``causal_br`` adds the bottom-right causal mask (MTP at S_q > 1).
+    ``select`` says which entry runs: the default pins the FROST engine's first
+    plan (``select_engine``), ``None`` leaves the heuristics' own ranking to the
+    build walk (what a caller who never pins gets), a callable is handed the
+    planned graph to select or deselect as it likes. ``prepare(g)`` runs on the
+    validated graph before planning (a hook for scripting the backend).
+    ``return_graph`` adds the graph to the return value for placement probes.
+    """
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
@@ -133,16 +163,21 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
         st.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
+    if prepare is not None:
+        prepare(g)
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name())
+    if select is _PIN_FROST:
+        select_engine(g, engine_name())
+    elif select is not None:
+        select(g)
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
         idx = next((i for i, n in enumerate(names) if n.startswith(engine_name()) and g.plans[i].knobs.split_kv == want_split), None)
         assert idx is not None, f"no {engine_name()} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
-        plan = g.plans[idx]
     g.check_support()
     g.build_plans()
+    plan = g.plans[g._plan_index]  # the entry that built: the pin, or the walk's first success
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     vp = {q: q_gpu, k: k_c, v: v_c, tk: bt, tv: bt, sq_t: slq, sk_t: slk, o: o_gpu}
     if stats:
@@ -170,7 +205,7 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
         torch.testing.assert_close(got_lse[~dead], ref_lse[~dead], atol=5e-3, rtol=0)
         if dead.any():
             assert torch.isinf(got_lse[dead]).all() and (got_lse[dead] < 0).all(), "a row with no visible key must write LSE := -inf"
-    return plan
+    return (plan, g) if return_graph else plan
 
 
 # --- graph API ---------------------------------------------------------------
@@ -351,6 +386,109 @@ def test_paged_graph_declines_off_contract():
     assert not _offers(_build(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
     assert not _offers(_build(16, d=512)), "paged KV is wired on the d128 / d256 flavors only"
     assert not _offers(_build(16, padding=False)), "paged KV requires the padding mask"
+
+
+# --- placement: where the FROST proposal ranks against the backend at decode ---
+#
+# The heuristics mark a paged, decode-shaped proposal ``yield_to_backend`` on a
+# flavor whose paged decode is not claimed to lead the backend's own plan
+# (EngineSpec.paged_decode_lead_d_shapes); engines/heuristics._assemble then
+# ranks it after the backend's entries of its block. Today both wired flavors
+# claim the lead, so these tests synthesize a non-claiming row.
+
+
+def _is_frost(g, index) -> bool:
+    from cudnn.sdpa.fwd.engines import engine_name
+    from frost_test_utils import _is_plan_for
+
+    return _is_plan_for(g.get_plan_name_at_index(index), engine_name())
+
+
+def _yield_paged_decode(monkeypatch):
+    """The sm100 row with NO paged-decode lead claim: what a freshly wired
+    paged flavor looks like before its decode is measured against the backend."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd import heuristics as fwd_heuristics
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    specs = tuple(replace(s, paged_decode_lead_d_shapes=frozenset()) if s.name == engine_name() else s for s in engines.ENGINE_SPECS)
+    monkeypatch.setattr(fwd_heuristics, "ENGINE_SPECS", specs)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+def test_paged_decode_shipped_flavors_lead_the_backend(d):
+    """Unpinned: the heuristics' own ranking puts the FROST proposal first on the
+    two wired flavors, and the build walk runs it. (The placement rule ships
+    inert for d128 / d256; this pins that.)"""
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    _, g = _run_graph(2, 8, 2, d, 16, 8, [100, 77], hnd=False, stats=True, select=None, return_graph=True)
+    assert _is_frost(g, 0), [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+    assert g.selected_engine is not None and g.selected_engine.name == engine_name()
+
+
+@pytest.mark.L0
+def test_paged_decode_yielding_flavor_ranks_behind_the_backend(monkeypatch):
+    """On a flavor with no lead claim the backend's plan is first and the
+    unpinned walk runs it (selected_engine is None: the backend served, and the
+    output matched the reference). The FROST plan is still in graph.plans."""
+    from frost_test_utils import offers_engine
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    _yield_paged_decode(monkeypatch)
+    _, g = _run_graph(2, 8, 2, D, 16, 8, [100, 77], hnd=False, stats=True, select=None, return_graph=True)
+    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+    assert not _is_frost(g, 0), names
+    assert g.selected_engine is None, names
+    assert offers_engine(g, engine_name()), names
+    frost_at = next(i for i in range(len(g.plans)) if _is_frost(g, i))
+    assert all(not _is_frost(g, i) for i in range(frost_at)), f"every backend entry of the block precedes the FROST plan: {names}"
+
+
+@pytest.mark.L0
+def test_paged_decode_yielding_flavor_stays_selectable(monkeypatch):
+    """Placement decides the DEFAULT only. select_plan (through select_engine)
+    pins the yielding FROST plan; deselect_engines on every backend name makes
+    the walk land on it -- both run and match the reference."""
+    from cudnn.engines.engine_ids import is_python_engine
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    _yield_paged_decode(monkeypatch)
+    plan, g = _run_graph(2, 8, 2, D, 16, 8, [100, 77], hnd=False, stats=True, return_graph=True)
+    assert g.selected_engine is not None and g.selected_engine.name == engine_name(), plan
+
+    def bar_the_backend(g):
+        g.deselect_engines([g.get_plan_name_at_index(i) for i, p in enumerate(g.plans) if not is_python_engine(p.engine_id)])
+
+    _, g = _run_graph(2, 8, 2, D, 16, 8, [100, 77], hnd=False, stats=True, select=bar_the_backend, return_graph=True)
+    assert not _is_frost(g, 0), "the backend still ranks first ..."
+    assert g.selected_engine is not None and g.selected_engine.name == engine_name(), "... but barred, the walk lands on the FROST plan"
+
+
+@pytest.mark.L0
+def test_paged_decode_yielding_flavor_serves_when_the_backend_declines(monkeypatch):
+    """A backend that cannot lower the graph leaves no entries to yield to: the
+    yielding FROST proposal is the only plan, the walk builds it, the graph is
+    served (the decline is recorded, not raised)."""
+    import cudnn
+    from cudnn.engines.engine_ids import is_python_engine
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    _yield_paged_decode(monkeypatch)
+
+    def backend_declines(g):
+        def declines():
+            raise cudnn.cudnnGraphNotSupportedError("no backend lowering for this graph (scripted)")
+
+        g._lower_backend_graph = declines
+
+    _, g = _run_graph(2, 8, 2, D, 16, 8, [100, 77], hnd=False, stats=True, select=None, prepare=backend_declines, return_graph=True)
+    assert g.plans and all(is_python_engine(p.engine_id) for p in g.plans), [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+    assert g.selected_engine is not None and g.selected_engine.name == engine_name()
+    assert g._backend_declined is not None
 
 
 # --- kernel template, direct -----------------------------------------------

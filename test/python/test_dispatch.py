@@ -1492,3 +1492,48 @@ def test_create_execution_plan_appends_a_python_plan(monkeypatch):
     g.select_plan(last)
     g.build_plans()
     g.execute({C: torch.empty(2, 2)})
+
+
+@pytest.mark.parametrize("backend_builds", [True, False], ids=["backend_builds", "backend_fails_to_build"])
+def test_a_yielding_python_entry_trails_the_backend_and_catches_its_build_failure(monkeypatch, backend_builds):
+    """A family proposal marked ``yield_to_backend`` lands AFTER the backend's
+    entry of its block, so the default walk runs the backend (selected_engine is
+    None). When that backend plan fails to build -- cudnnFinalize failing maps to
+    GRAPH_EXECUTION_PLAN_CREATION_FAILED, which the binding raises as
+    cudnnGraphNotSupportedError, a decline -- the walk advances to the yielding
+    python entry, so the graph is still served. The pinned path stays available
+    too: select_plan on the python entry runs it whatever the backend did."""
+    import cudnn
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import _assemble, default_modes
+
+    _ranking(
+        monkeypatch,
+        lambda graph, engines, backend_plans, modes=None: _assemble(
+            default_modes(), lambda kind: [PlanConfig(e.engine_id, None, yield_to_backend=True) for e in engines], backend_plans
+        ),
+    )
+    stub = _offer(monkeypatch, StubEngine())
+    g = pygraph()
+    C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g._lowered_graph = _FakeBackend(build=None if backend_builds else cudnn.cudnnGraphNotSupportedError("cudnnFinalize failed for this plan"))
+    g._cpp_plans_created = g._cpp_bog_done = True
+    g._backend_mode_spans = [(cudnn.heur_mode.A, 0, 1)]  # the fake's one plan is a mode-A entry, not the delegate
+    g.create_execution_plans()
+
+    assert [(is_python_engine(p.engine_id), p.cpp_index) for p in g.plans] == [(False, 0), (True, None)], _plan_names(g)
+    assert all(p.yield_to_backend is False for p in g.plans), "the flag never reaches graph.plans"
+    g.build()
+    out = torch.zeros(2, 2)
+    if backend_builds:
+        assert g.selected_engine is None, "the backend's entry leads and built: the backend serves"
+    else:
+        assert g.selected_engine is stub, _plan_names(g)
+        g.execute({C: out})
+        assert _marked(out)
+    # Explicit selection ignores placement: the yielding entry is still a plan.
+    g.select_plan(1)
+    g.build_plans()
+    assert g.selected_engine is stub
+    g.execute({C: out})
+    assert _marked(out)

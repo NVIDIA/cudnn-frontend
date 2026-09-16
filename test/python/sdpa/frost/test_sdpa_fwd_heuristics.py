@@ -392,6 +392,128 @@ def test_assemble_strips_mode_dedups_and_our_proposals_lead():
     assert [p.engine_id for p in oss] == [20500, 20500, -1]
 
 
+# The three backend entries every placement test below shares: the delegating
+# one (mode None) and one per mode block.
+_BACKEND = [
+    PlanConfig(-1, None),
+    PlanConfig(7, {"k": 1}, cpp_index=0, mode=cudnn.heur_mode.A),
+    PlanConfig(8, {"k": 2}, cpp_index=1, mode=cudnn.heur_mode.FALLBACK),
+]
+
+
+@pytest.mark.L0
+def test_assemble_a_yielding_proposal_trails_the_backend_inside_its_block():
+    """A proposal marked ``yield_to_backend`` is admissible but expected slower
+    than the backend's own plan for this graph: it ranks AFTER the delegating
+    entry and the backend's entries of its mode block, and before the next
+    block. Leading proposals of the same batch keep leading. The flag is
+    assembly bookkeeping like ``mode`` -- stripped from every final entry --
+    and identity stays (engine, knobs), so a config the family emits leading
+    in one block and yielding in another keeps its first position."""
+    lead, trail = PlanConfig(20500, "lead"), PlanConfig(20500, "trail", yield_to_backend=True)
+    fb_trail = PlanConfig(20500, "fb", yield_to_backend=True)
+
+    def ours(kind):
+        return [lead, trail] if kind == "A" else [fb_trail, PlanConfig(20500, "trail", yield_to_backend=True)]
+
+    final = _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], ours, _BACKEND)
+    assert [(p.engine_id, p.knobs) for p in final] == [
+        (20500, "lead"),  # leading proposal: ahead of everything in the A block
+        (-1, None),  # delegating
+        (7, {"k": 1}),  # the backend's mode-A entry
+        (20500, "trail"),  # yielding proposal closes the A block
+        (8, {"k": 2}),  # FALLBACK block: the backend's fallback ...
+        (20500, "fb"),  # ... then the yielding fallback proposal; "trail" repeated here dedups away
+    ], [(p.engine_id, p.knobs) for p in final]
+    assert all(p.mode is None and p.yield_to_backend is False for p in final), "mode and yield are assembly bookkeeping only"
+    # Nothing yields: byte-for-byte the pre-existing placement.
+    plain = _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], lambda kind: [lead] if kind == "A" else [], _BACKEND)
+    assert [(p.engine_id, p.knobs) for p in plain] == [(20500, "lead"), (-1, None), (7, {"k": 1}), (8, {"k": 2})]
+
+
+@pytest.mark.L0
+def test_assemble_a_yielding_proposal_leads_when_the_backend_has_nothing():
+    """Yielding is relative to the backend's entries of the block: when the
+    backend declined the graph (no entries at all) the yielding proposal is
+    simply the first entry, so the walk builds it -- the graph stays served."""
+    trail = PlanConfig(20500, "trail", yield_to_backend=True)
+    final = _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], lambda kind: [trail], [])
+    assert [(p.engine_id, p.knobs, p.yield_to_backend) for p in final] == [(20500, "trail", False)]
+    # Backend entries only in the OTHER block: the A block is ours alone and
+    # its yielding proposal still precedes the backend's fallback.
+    fb_only = [c for c in _BACKEND if c.mode == cudnn.heur_mode.FALLBACK]
+    final = _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], lambda kind: [trail] if kind == "A" else [], fb_only)
+    assert [p.engine_id for p in final] == [20500, 8]
+
+
+@pytest.mark.L0
+def test_assemble_opensource_block_ignores_yield():
+    """OPENSOURCE asks a coverage question ("what do the OSS engines serve?"),
+    not a speed one: a yielding proposal still leads the delegating entry there,
+    or the OSS-coverage answer would be a native kernel."""
+    trail = PlanConfig(20500, "trail", yield_to_backend=True)
+    oss = _assemble([cudnn.heur_mode.OPENSOURCE], lambda kind: [trail], _BACKEND)
+    assert [p.engine_id for p in oss] == [20500, -1]
+    # Combined with A: the A block adds the backend's entries after the OSS block.
+    both = _assemble([cudnn.heur_mode.OPENSOURCE, cudnn.heur_mode.A], lambda kind: [trail], _BACKEND)
+    assert [p.engine_id for p in both] == [20500, -1, 7]
+
+
+def _paged_decode_facts(**over):
+    base = dict(s_q=1, s_kv=4096, causal=False, has_paged_kv=True, page_size=16, padded=True)
+    base.update(over)
+    return _facts(**base)
+
+
+def _with_lead_shapes(monkeypatch, shapes):
+    """The sm100 f16 row with its paged-decode lead set replaced -- the data
+    hook a flavor PR populates once its paged decode is measured against the
+    backend. ``frozenset()`` is the synthetic 'no flavor leads' row."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.fwd import heuristics as fwd_heuristics
+
+    specs = tuple(replace(s, paged_decode_lead_d_shapes=frozenset(shapes)) if s.name == _F16 else s for s in engines.ENGINE_SPECS)
+    monkeypatch.setattr(fwd_heuristics, "ENGINE_SPECS", specs)
+
+
+@pytest.mark.L0
+def test_recommend_marks_paged_decode_yielding_on_flavors_without_a_lead_claim(monkeypatch):
+    """The ONE placement rule the family states: a paged, decode-shaped graph
+    on a flavor whose paged decode is not claimed to lead the backend yields --
+    every set, both kinds. Dense decode, paged prefill-shaped Q, and anything
+    past the decode window keep leading."""
+    from cudnn.sdpa.fwd.heuristics import DECODE_MAX_S_Q, decode_shaped
+
+    _with_lead_shapes(monkeypatch, ())
+    for kind in ("A", "FALLBACK"):
+        plans = recommend(kind, _paged_decode_facts(), _OFFERED)
+        assert plans and all(p.yield_to_backend for p in plans), (kind, plans)
+        assert all(p.yield_to_backend for p in recommend(kind, _paged_decode_facts(d_qk=256, d_v=256), _OFFERED))
+        assert all(p.yield_to_backend for p in recommend(kind, _paged_decode_facts(s_q=DECODE_MAX_S_Q), _OFFERED)), "the MTP window is decode-shaped"
+        assert not any(p.yield_to_backend for p in recommend(kind, _paged_decode_facts(s_q=DECODE_MAX_S_Q + 1), _OFFERED))
+        assert not any(p.yield_to_backend for p in recommend(kind, _paged_decode_facts(s_q=128), _OFFERED)), "paged prefill leads"
+        dense = recommend(kind, _facts(s_q=1, causal=False), _OFFERED)
+        assert dense and not any(p.yield_to_backend for p in dense), "the rule is paged-only"
+    assert decode_shaped(_paged_decode_facts()) and decode_shaped(_facts(s_q=DECODE_MAX_S_Q))
+    assert not decode_shaped(_facts(s_q=DECODE_MAX_S_Q + 1))
+
+
+@pytest.mark.L0
+def test_recommend_shipped_paged_decode_flavors_lead(monkeypatch):
+    """The rule ships inert: the two wired paged flavors, d128 (with its d64
+    envelope) and d256, keep leading the backend at decode -- d256 is measured
+    ahead of the backend's plan and d128 is what the paged decode tests pin.
+    A shape the row does not claim (synthetic: d128 dropped) yields."""
+    for d in (64, 128, 256):
+        plans = recommend("A", _paged_decode_facts(d_qk=d, d_v=d), _OFFERED)
+        assert plans and not any(p.yield_to_backend for p in plans), (d, plans)
+    _with_lead_shapes(monkeypatch, {(256, 256)})
+    assert all(p.yield_to_backend for p in recommend("A", _paged_decode_facts(), _OFFERED))
+    assert all(p.yield_to_backend for p in recommend("A", _paged_decode_facts(d_qk=64, d_v=64), _OFFERED)), "the envelope rides its flavor's claim"
+    assert not any(p.yield_to_backend for p in recommend("A", _paged_decode_facts(d_qk=256, d_v=256), _OFFERED))
+
+
 @pytest.mark.L0
 def test_fallback_kind_is_least_demanding():
     for p in recommend("FALLBACK", _facts(), _OFFERED):

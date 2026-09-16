@@ -89,12 +89,23 @@ class PlanConfig:
     ``mode`` is the heuristic mode that produced the entry. Ranking needs it:
     "the backend's mode-A entries ahead of ours, its fallbacks behind" cannot
     be said about a list whose entries do not remember where they came from.
+
+    ``yield_to_backend`` is set by a family hook on a python proposal that is
+    admissible but expected SLOWER than the backend's own plan for this graph
+    (a measured loss on a shape the engine has no purpose-built kernel for).
+    ``engines.heuristics._assemble`` then ranks it after the backend's entries
+    of its mode block instead of ahead of them, so the default walk runs the
+    backend while the proposal stays a plan: ``select_plan``,
+    ``deselect_engines`` on the backend's names, and an autotune (build ALL)
+    reach it regardless. Like ``mode`` it is assembly bookkeeping — stripped
+    from every final entry, and not part of a plan's identity (engine_id, knobs).
     """
 
     engine_id: int
     knobs: Any = None
     cpp_index: Any = None
     mode: Any = None
+    yield_to_backend: bool = False
 
 
 class ExecutionContext(NamedTuple):

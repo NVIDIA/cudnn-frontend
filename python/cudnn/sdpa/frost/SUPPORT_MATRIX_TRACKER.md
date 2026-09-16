@@ -123,7 +123,10 @@ does not withhold the split, unlike a mask-free dense `S_kv`, which rides synthe
 KV-tail padding the split cannot. Not yet: sink, fp8/mxfp8 pools,
 packed (ragged-offset) block tables. Served by `prefill_d128_f16_sm100.py`'s `PAGED_KV`
 specialization (block-table indirection on the K/V TMA loads; boxes past a
-sequence's live pages are TMA-OOB zero-filled).
+sequence's live pages are TMA-OOB zero-filled). Placement, not eligibility: at
+decode shapes (`S_q <= 8`) a paged flavor without a `paged_decode_lead_d_shapes`
+claim on its engine row ranks its FROST plan *after* the backend's (backend-first
+default; the FROST plan stays selectable) — d128 and d256 claim the lead today.
 
 ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**
 (`Capabilities.pack_gqa_partial_d_shapes = {(128, 128), (256, 256)}`, `Cfg.PACK_G`).
