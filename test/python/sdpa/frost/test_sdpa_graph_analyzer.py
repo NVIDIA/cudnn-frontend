@@ -1604,6 +1604,28 @@ def test_paged_split_kv_is_proposed_on_a_decode_launch(monkeypatch):
     assert any(k.split_kv and k.split_kv > 1 for k in knob_sets), knob_sets
 
 
+@pytest.mark.parametrize("max_seq_len", [4000, 4001, 16641])
+def test_paged_split_kv_is_proposed_with_a_ragged_declared_max(monkeypatch, max_seq_len):
+    """A declared ``paged_attention_max_seq_len_kv`` that is NOT a multiple of
+    the 128-row KV tile (FlashInfer passes its true max verbatim, e.g. 4000)
+    must not cost the paged decode launch its split: the per-batch lengths
+    bound the walk on device, so a paged graph never rides the synthesized
+    KV-tail padding that excludes the split on a mask-free dense graph. The
+    heuristic must still propose a split on the same B=2, H_kv=2 launch (tables
+    padded past the declared max, as frameworks do), and a pinned split must
+    still pass the knob probe."""
+    monkeypatch.setattr(ga, "_device_sm_count", lambda: 148)
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    g = _mk_paged_graph(page_size=16, max_pages=-(-max_seq_len // 16) + 6, max_seq_len=max_seq_len)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    facts = _facts(g)
+    assert facts.s_kv == max_seq_len and facts.s_kv % 128 != 0 and facts.padded and facts.has_paged_kv
+    knob_sets = _knob_sets(spec, facts)
+    assert any(k.split_kv and k.split_kv > 1 for k in knob_sets), knob_sets
+    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(split_kv=2))
+
+
 def test_packed_layout_ignores_the_batch_stride_a_ragged_tensor_never_reads():
     """FlashInfer declares its packed THD Q/O with the batch stride equal to the
     token stride (h * d): not BSHD-physical over all four axes, but every

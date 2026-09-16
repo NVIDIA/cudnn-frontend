@@ -200,6 +200,20 @@ def test_paged_graph_long_kv_heuristic_splits():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("page_size", [16, 128])
+def test_paged_graph_ragged_declared_max_heuristic_splits(page_size):
+    """FlashInfer's decode spelling: no mask, ``paged_attention_max_seq_len_kv``
+    = the caller's TRUE max (4000, not a multiple of the 128-row KV tile),
+    tables padded past it. B=2, H_kv=1 is a 4-CTA launch — the split heuristic
+    must engage exactly as it does for a 128-multiple max (a paged graph never
+    rides the synthesized KV-tail padding that excludes the split on a dense
+    mask-free graph), and the recombined O / LSE must match the reference."""
+    max_pages = -(-4096 // page_size)
+    plan = _run_graph(2, 8, 1, D, page_size, max_pages, [4000, 3000], hnd=True, stats=True, max_seq_len=4000)
+    assert plan.knobs.split_kv > 1, plan.knobs
+
+
+@pytest.mark.L0
 def test_paged_graph_declared_max_seq_len_below_table_reach():
     """paged_attention_max_seq_len_kv smaller than max_pages * page_size is the
     common framework case (tables padded to the model's max length)."""

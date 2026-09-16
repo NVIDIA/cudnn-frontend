@@ -69,8 +69,8 @@ from cudnn.sdpa.fwd.engines import (
     Capabilities,
     EngineSpec,
     SdpaFwdKnobs,
-    _band_covers_kv_tail,
     _selected_d_shape,
+    _synth_kv_padding,
     effective_cgas,
     effective_sched_policies,
     mismatch,
@@ -728,9 +728,12 @@ def _split_points(
         # combine would write the un-gated O (mismatch declines the same pair,
         # so this is hygiene: never PROPOSE a knob the row cannot honour).
         return [no_split]
-    if caps.skv_tail_via_padding and facts.s_kv % (caps.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
+    if _synth_kv_padding(caps, facts):
         # This S_kv would be served through the synthesized KV-tail padding,
-        # which the split cannot ride (mismatch declines the same combination).
+        # which the split cannot ride (mismatch declines the same combination,
+        # through the same predicate the lowering uses). A paged graph never
+        # takes that path — its per-batch lengths bound the walk on device —
+        # so a declared max that is not a tile multiple keeps its split.
         return [no_split]
     # A quantized O is a legal split target: the partials stay WIDER than the
     # O dtype whatever it is, and the combine performs the only cast down to it.

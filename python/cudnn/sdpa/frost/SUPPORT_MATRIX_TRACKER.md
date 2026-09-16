@@ -113,9 +113,14 @@ page_size`). `page_size` is a multiple of 8 that divides the 128-row KV tile or 
 multiple of it. Any `S_q` (decode or paged prefill), GQA (PackGQAᵐ — the whole
 group, or its largest divisor of the tile), Stats out, and **THD queries**: ragged Q/O (ragged offsets +
 `seq_len_q`) over the same pools — chunked prefill — with the THD scheduler walking
-the Q units (no KV split there). KV split is proposed on dense-Q paged graphs (they
-are padded by construction, and `B * H_kv` is far below the SM count at serving batch
-sizes) and recombined by `split_combine_sm100`. Not yet: sink, fp8/mxfp8 pools,
+the Q units (no KV split there). KV split is proposed on dense-Q paged graphs by the
+same wave-cost model as on dense graphs (they are padded by construction: the per-batch
+lengths bound the walk on device and the split composes with them; it pays when
+`B * H_kv` leaves SMs idle) and recombined by `split_combine_sm100`. The declared
+`paged_attention_max_seq_len_kv` only sizes that cost model — a maximum that is not a
+multiple of the 128-row KV tile (FlashInfer passes its true max verbatim, e.g. 4000)
+does not withhold the split, unlike a mask-free dense `S_kv`, which rides synthesized
+KV-tail padding the split cannot. Not yet: sink, fp8/mxfp8 pools,
 packed (ragged-offset) block tables. Served by `prefill_d128_f16_sm100.py`'s `PAGED_KV`
 specialization (block-table indirection on the K/V TMA loads; boxes past a
 sequence's live pages are TMA-OOB zero-filled).

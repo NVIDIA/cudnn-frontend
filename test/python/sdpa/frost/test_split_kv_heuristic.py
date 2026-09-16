@@ -276,6 +276,40 @@ def test_split_declines_when_the_kv_tail_needs_synthesized_padding():
     assert "split_kv" not in why
 
 
+def test_split_kv_tail_rule_exempts_paged_but_not_dense_padded():
+    """The synthesized-padding exclusion is about the DENSE mask-free path. A
+    paged graph is padded by construction (per-batch KV lengths are mandatory
+    and bound the walk on device), so a declared ``paged_attention_max_seq_len_kv``
+    that is not a 128-multiple — FlashInfer passes its true max, e.g. 4000 —
+    must not block the split. The neighbouring dense cases keep their verdicts:
+    a dense padded graph still declines the split (its padded path yields no
+    per-split partials) and a dense mask-free ragged S_kv still declines."""
+    from cudnn.sdpa import graph_analyzer as ga
+
+    caps = Capabilities(
+        sm_lo=100,
+        sm_hi=100,
+        phase="prefill",
+        d_shapes=frozenset({(128, 128)}),
+        skv_tail_via_padding=True,
+        split_kv_supported=True,
+        paged_kv=True,
+        padded=True,
+    )
+    paged = ga.SdpaGraphFacts(s_q=1, s_kv=4000, padded=True, has_paged_kv=True, page_size=16)
+    why = mismatch(caps, paged, SdpaFwdKnobs(split_kv=2)) or ""
+    assert "split_kv" not in why, why
+    # Unchanged: a dense padded graph never splits, whatever its S_kv.
+    for s_kv in (4000, 4096):
+        dense_padded = ga.SdpaGraphFacts(s_q=1, s_kv=s_kv, padded=True)
+        why = mismatch(caps, dense_padded, SdpaFwdKnobs(split_kv=2))
+        assert why is not None and "split_kv" in why, (s_kv, why)
+    # Unchanged: a dense mask-free ragged S_kv rides the synthesized padding.
+    dense_ragged = ga.SdpaGraphFacts(s_q=1, s_kv=4000)
+    why = mismatch(caps, dense_ragged, SdpaFwdKnobs(split_kv=2))
+    assert why is not None and "split_kv" in why, why
+
+
 def test_split_domains_match_the_wired_lowerings():
     """Guards the pairing: a row sets split_kv_supported exactly when its
     adapter forwards the knob into TemplateParams and launches the combine.
