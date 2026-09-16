@@ -290,6 +290,39 @@ def _make_distributed_backward_inputs(
     ), grad_output
 
 
+def _make_distributed_uneven_backward_inputs(
+    ep_rank: int,
+    ep_size: int,
+    device: torch.device,
+):
+    """Build training inputs with rank-dependent local token counts."""
+
+    base_args = make_distributed_forward_inputs(ep_rank, ep_size, device)
+    token_count = ep_rank + 1
+    base_token_count = int(base_args[0].shape[0])
+    repeats = (token_count + base_token_count - 1) // base_token_count
+    activation = quantize_mxfp8(
+        base_args[0].dequantize(torch.float32).repeat((repeats, 1))[:token_count].contiguous(),
+        axis=1,
+    )
+    args = (
+        activation,
+        base_args[1],
+        base_args[2],
+        base_args[3].repeat((repeats, 1))[:token_count].contiguous(),
+        base_args[4].float().repeat((repeats, 1))[:token_count].contiguous(),
+    )
+    grad_output = quantize_mxfp8(
+        _grad_output(
+            device,
+            args[0].shape[0],
+            seed=20261001 + ep_rank,
+        ),
+        axis=1,
+    )
+    return args, grad_output
+
+
 def _run_backward_reference_case(
     *,
     device: torch.device,
@@ -300,6 +333,7 @@ def _run_backward_reference_case(
     gate_up_clamp: float | None = None,
     expected_global_ranks: tuple[int, ...] | None = None,
     native_weight_storage_mode: str = "contiguous",
+    uneven_token_input: bool = False,
 ) -> None:
     """Run stateless training after the independent distributed oracle."""
 
@@ -309,23 +343,48 @@ def _run_backward_reference_case(
         MoeEpNativeWeightStorageMode,
     )
 
-    args, grad_output = _make_distributed_backward_inputs(
-        ep_rank,
-        ep_size,
-        device,
-    )
+    if uneven_token_input:
+        args, grad_output = _make_distributed_uneven_backward_inputs(
+            ep_rank,
+            ep_size,
+            device,
+        )
+        max_tokens_per_rank = ep_size
+        max_recv_size_per_rank = 256
+        local_token_count = torch.tensor(
+            [args[0].shape[0]],
+            dtype=torch.int64,
+            device=device,
+        )
+        gathered_token_counts = [torch.empty_like(local_token_count) for _ in range(ep_size)]
+        dist.all_gather(
+            gathered_token_counts,
+            local_token_count,
+            group=ep_group,
+        )
+        token_counts = tuple(int(count.item()) for count in gathered_token_counts)
+    else:
+        args, grad_output = _make_distributed_backward_inputs(
+            ep_rank,
+            ep_size,
+            device,
+        )
+        max_tokens_per_rank = int(args[0].shape[0])
+        max_recv_size_per_rank = 128
+        token_counts = None
     num_experts = 2 * ep_size
-    max_recv_size_per_rank = 128
 
     # Finish all collective reference work, including dense local dW, before
     # constructing or launching the production operator.
+    reference_grad_output = grad_output if isinstance(grad_output, torch.Tensor) else grad_output.dequantize(torch.float32)
     expected = _fixed_training_reference(
         args,
-        grad_output,
+        reference_grad_output,
         combine_format=combine_format,
         gate_up_clamp=gate_up_clamp,
         ep_group=ep_group,
         num_experts=num_experts,
+        max_tokens_per_rank=max_tokens_per_rank,
         max_recv_size_per_rank=max_recv_size_per_rank,
         drop_on_overflow=True,
     )
@@ -344,7 +403,7 @@ def _run_backward_reference_case(
             intermediate_size=256,
             top_k=2,
             ep_group=ep_group,
-            max_tokens_per_rank=args[0].shape[0],
+            max_tokens_per_rank=max_tokens_per_rank,
             max_recv_size_per_rank=max_recv_size_per_rank,
             drop_on_overflow=True,
             combine_format=combine_format,
@@ -415,8 +474,12 @@ def _run_backward_reference_case(
                 assert op.ep_global_ranks == expected_global_ranks
             assert args[3][0, 0] // 2 == ep_rank
             assert args[3][0, 1] // 2 == (ep_rank + 1) % ep_size
-            assert expected_wgrads.valid_route_counts[1].eq(0)
-            assert actual_wgrads.valid_route_counts[1].eq(0)
+            if uneven_token_input:
+                assert token_counts == tuple(range(1, ep_size + 1))
+                assert len(set(token_counts)) == ep_size
+            else:
+                assert expected_wgrads.valid_route_counts[1].eq(0)
+                assert actual_wgrads.valid_route_counts[1].eq(0)
             _assert_matches_reference(actual_y, expected_y)
             _assert_backward_matches(
                 (actual_dx, actual_dprob),

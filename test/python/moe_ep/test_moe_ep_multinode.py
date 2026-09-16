@@ -270,6 +270,23 @@ def test_stateless_training_multinode_matches_independent_reference(
     )
 
 
+def test_stateless_training_ep32_uneven_tokens_forward_backward_matches_reference(
+    torchrun_world,
+):
+    world = torchrun_world
+    if world.world_size != 32:
+        pytest.skip("EP32 uneven-token training requires torchrun WORLD_SIZE=32; " f"got WORLD_SIZE={world.world_size}")
+
+    _run_backward_reference_case(
+        device=world.device,
+        ep_group=dist.group.WORLD,
+        ep_rank=world.rank,
+        ep_size=32,
+        combine_format="bf16",
+        uneven_token_input=True,
+    )
+
+
 @pytest.mark.parametrize(
     "rank_zero_schema_delta",
     [
