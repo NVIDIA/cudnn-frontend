@@ -501,17 +501,46 @@ def test_recommend_marks_paged_decode_yielding_on_flavors_without_a_lead_claim(m
 
 @pytest.mark.L0
 def test_recommend_shipped_paged_decode_flavors_lead(monkeypatch):
-    """The rule ships inert: the two wired paged flavors, d128 (with its d64
-    envelope) and d256, keep leading the backend at decode -- d256 is measured
-    ahead of the backend's plan and d128 is what the paged decode tests pin.
-    A shape the row does not claim (synthetic: d128 dropped) yields."""
-    for d in (64, 128, 256):
+    """The claimed NATIVE shapes, (128, 128) and (256, 256), keep leading the backend
+    at decode -- d256 is measured ahead of the backend's plan and d128 is what the
+    paged decode tests pin. The claim is per exact (d_qk, d_v) shape: d64, which
+    rides the d128 flavor's envelope, does NOT inherit that claim and yields
+    (INVERTED from 'the envelope rides its flavor's claim' -- B200, b=32, page 16,
+    bf16, s_q=1, FROST leading vs the backend's plan: 32/8 GQA 203 vs 46 us, 32/32
+    MHA 658 vs 129 us, 64/8 183 vs 46 us). A native shape the row does not claim
+    (synthetic: d128 dropped) yields too."""
+    for d in (128, 256):
         plans = recommend("A", _paged_decode_facts(d_qk=d, d_v=d), _OFFERED)
         assert plans and not any(p.yield_to_backend for p in plans), (d, plans)
+    d64 = recommend("A", _paged_decode_facts(d_qk=64, d_v=64), _OFFERED)
+    assert d64 and all(p.yield_to_backend for p in d64), "an envelope shape does not inherit its flavor's claim"
     _with_lead_shapes(monkeypatch, {(256, 256)})
     assert all(p.yield_to_backend for p in recommend("A", _paged_decode_facts(), _OFFERED))
-    assert all(p.yield_to_backend for p in recommend("A", _paged_decode_facts(d_qk=64, d_v=64), _OFFERED)), "the envelope rides its flavor's claim"
+    assert all(p.yield_to_backend for p in recommend("A", _paged_decode_facts(d_qk=64, d_v=64), _OFFERED))
     assert not any(p.yield_to_backend for p in recommend("A", _paged_decode_facts(d_qk=256, d_v=256), _OFFERED))
+
+
+@pytest.mark.L0
+def test_recommend_paged_decode_envelope_shapes_yield_until_claimed_exactly(monkeypatch):
+    """The lead claim is keyed on the exact (d_qk, d_v) pair, not on the flavor the
+    lowering selects: an envelope graph pads FROST's operands to the flavor's width
+    while the backend runs the graph at its own, so the flavor's measurement does not
+    transfer. By the row's own data every envelope shape this row admits yields --
+    (64, 64) and (96, 96) on the claimed d128 flavor, (192, 192) on the claimed d256
+    flavor -- both kinds, while the native (128, 128) and (256, 256) lead (B200, b=32,
+    page 16, bf16, s_q=1, FROST leading vs the backend's plan: (64, 64) 32/8 203 vs 46
+    us, (96, 96) 32/8 205 vs 63 us; native (256, 256) 32/32 778 vs 830, 32/8 201 vs
+    267 us). A measured envelope shape claims the lead by naming its exact pair, and
+    its envelope siblings do not ride along."""
+    for d_qk, d_v in ((64, 64), (96, 96), (192, 192)):
+        for kind in ("A", "FALLBACK"):
+            plans = recommend(kind, _paged_decode_facts(d_qk=d_qk, d_v=d_v), _OFFERED)
+            assert plans and all(p.yield_to_backend for p in plans), (kind, d_qk, d_v, plans)
+    for d in (128, 256):
+        assert not any(p.yield_to_backend for p in recommend("A", _paged_decode_facts(d_qk=d, d_v=d), _OFFERED))
+    _with_lead_shapes(monkeypatch, {(128, 128), (256, 256), (96, 96)})
+    assert not any(p.yield_to_backend for p in recommend("A", _paged_decode_facts(d_qk=96, d_v=96), _OFFERED)), "the exact pair claims the lead"
+    assert all(p.yield_to_backend for p in recommend("A", _paged_decode_facts(d_qk=64, d_v=64), _OFFERED)), "its envelope siblings do not ride along"
 
 
 @pytest.mark.L0

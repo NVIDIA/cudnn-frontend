@@ -800,16 +800,20 @@ class EngineSpec:
     # one name.
     lower: "Callable[[EngineSpec, ga.SdpaGraphFacts, Optional[SdpaFwdKnobs]], Any]"
     # PLACEMENT, not eligibility -- deliberately not a Capabilities field, so
-    # outside Rule S2's scope: the native flavor shapes whose PAGED,
+    # outside Rule S2's scope: the exact (d_qk, d_v) shapes whose PAGED,
     # DECODE-SHAPED proposal (fwd/heuristics.decode_shaped, S_q <= 8) ranks
-    # ahead of the backend's own plan. Any other paged flavor this row serves
+    # ahead of the backend's own plan. Any other paged shape this row serves
     # is proposed ``yield_to_backend`` at decode -- still eligible and
     # selectable, ranked after the backend's entries of its block -- because a
     # prefill tile geometry over a handful of query rows loses to the
     # backend's decode engine until a decode-shaped kernel (or a measurement)
-    # earns the lead. Keyed by the flavor ``_selected_d_shape`` picks, so an
-    # envelope graph rides its flavor's claim. Empty by default: a freshly
-    # wired paged flavor yields until its decode is measured.
+    # earns the lead. Keyed on the exact pair, NOT on the flavor
+    # ``_selected_d_shape`` picks: an envelope graph pads FROST's operands to
+    # the flavor's width while the backend runs it at its own, so a flavor's
+    # measurement does not transfer to the shapes riding its envelope (each
+    # one measured behind the backend on B200 while its flavor led; see
+    # fwd/heuristics._yields_to_backend). Empty by default: a freshly wired
+    # paged flavor yields until its decode is measured, shape by shape.
     paged_decode_lead_d_shapes: frozenset = frozenset()
 
 
@@ -874,10 +878,17 @@ def _sm100_spec() -> EngineSpec:
             pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256)}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
-        # Paged decode (S_q <= 8) leads the backend's plan on d256 (B200,
-        # S_kv 2-4k: 61-67 us vs 76 us) and on d128, the flavor the paged
-        # decode tests pin to FROST while its decode-shaped tile is pending.
-        # A flavor wired into paged_kv without a claim here yields at decode.
+        # Paged decode (S_q <= 8) leads the backend's plan on the native
+        # (256, 256) shape (B200, S_kv 2-4k: 61-67 us vs 76 us; b=32, page 16,
+        # bf16, S_q=1: 32/32 MHA 778 vs 830 us, 32/8 201 vs 267 us) and on the
+        # native (128, 128), the shape the paged decode tests pin to FROST
+        # while its decode-shaped tile is pending. Exact pairs: the shapes
+        # served zero-padded on these flavors' envelopes do NOT inherit the
+        # claim -- each measured behind the backend at decode ((64, 64) 32/8
+        # 203 vs 46 us, (96, 96) 205 vs 63 us on the d128 envelope; (256, 128)
+        # 32/32 644 vs 491 us and (64, 192) 32/8 164-178 vs 127-135 us on the
+        # d256 envelope once #1096 admits them) -- and a flavor wired into
+        # paged_kv without a claim here yields at decode.
         paged_decode_lead_d_shapes=frozenset({(128, 128), (256, 256)}),
     )
 

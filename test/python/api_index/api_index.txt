@@ -291,6 +291,7 @@ cudnn.engines.PlanConfig
 cudnn.engines.PlanConfig.cpp_index
 cudnn.engines.PlanConfig.knobs
 cudnn.engines.PlanConfig.mode
+cudnn.engines.PlanConfig.yield_to_backend
 cudnn.engines.decline_types
 cudnn.engines.is_backend_engine
 cudnn.engines.is_python_engine

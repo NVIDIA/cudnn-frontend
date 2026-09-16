@@ -24,11 +24,12 @@ not a family opinion: it lives once in ``engines/heuristics._assemble``,
 under the standing assumption that these proposals lead the backend's entries
 (an OSS engine measured behind the backend gets fixed or pulled, not
 demoted). The family states ONE exception, as data rather than as a decline:
-a paged, decode-shaped graph (:func:`decode_shaped`) on a flavor whose paged
-decode is not claimed to lead the backend
-(``EngineSpec.paged_decode_lead_d_shapes``) is proposed ``yield_to_backend``
-— still admissible and selectable, ranked after the backend's plan of its
-block until a decode-shaped kernel, or a measurement, earns the lead
+a paged, decode-shaped graph (:func:`decode_shaped`) whose exact (D_QK, D_V)
+shape is not claimed to lead the backend's paged decode
+(``EngineSpec.paged_decode_lead_d_shapes``; an envelope shape does not
+inherit its flavor's claim) is proposed ``yield_to_backend`` — still
+admissible and selectable, ranked after the backend's plan of its block
+until a decode-shaped kernel, or a measurement, earns the lead
 (:func:`_yields_to_backend`).
 
 Cross-ENGINE order within a proposal batch is ``ENGINE_SPECS`` declaration
@@ -941,21 +942,29 @@ def decode_shaped(facts) -> bool:
 def _yields_to_backend(spec: EngineSpec, facts) -> bool:
     """Whether this cell's proposals for ``facts`` carry ``yield_to_backend``.
 
-    The rule: a PAGED, DECODE-SHAPED graph on a flavor that does not claim the
-    paged-decode lead (``EngineSpec.paged_decode_lead_d_shapes``, keyed by the
-    flavor ``_selected_d_shape`` picks, so an envelope graph rides its
-    flavor's claim). A prefill tile over one to eight query rows leaves the
-    backend's purpose-built decode engine ahead: on B200 paged decode the
-    pending d512 and d192x128 paged ports and the fp8 d128 row each measured
-    behind it when the FROST plan led (40 -> 87 us, +65%, 68 -> 1664 us),
-    while the wired d256 flavor leads it (61-67 vs 76 us). Placement only:
-    ``mismatch`` still admits the graph, so an autotune, a pin, or a barred
-    backend reaches the proposal; and with no backend plan the walk lands on
-    it anyway (see ``engines/heuristics._assemble``).
+    The rule: a PAGED, DECODE-SHAPED graph whose exact ``(d_qk, d_v)`` shape
+    does not claim the paged-decode lead (``EngineSpec.paged_decode_lead_d_shapes``).
+    A prefill tile over one to eight query rows leaves the backend's
+    purpose-built decode engine ahead: on B200 paged decode the pending d512
+    and d192x128 paged ports and the fp8 d128 row each measured behind it when
+    the FROST plan led (40 -> 87 us, +65%, 68 -> 1664 us), while the native
+    d256 shape leads it (61-67 vs 76 us). The claim is keyed on the exact pair,
+    NOT on the flavor ``_selected_d_shape`` picks: an envelope graph pads
+    FROST's operands to the flavor's width while the backend runs it at its
+    own, so the flavor's measurement does not transfer -- on B200 (b=32, page
+    16, bf16, S_q=1) every envelope shape measured behind the backend while
+    its flavor led: (64, 64) on d128 32/8 203 vs 46 us, 32/32 658 vs 129 us,
+    64/8 (GPT-OSS) 183 vs 46 us, (96, 96) 32/8 205 vs 63 us, and the mixed
+    dims #1096 admits onto the d256 envelope, (256, 128) 32/32 644 vs 491 us
+    and (64, 192) 32/8 164-178 vs 127-135 us. A measured envelope shape claims
+    the lead by naming its pair. Placement only: ``mismatch`` still admits the
+    graph, so an autotune, a pin, or a barred backend reaches the proposal;
+    and with no backend plan the walk lands on it anyway (see
+    ``engines/heuristics._assemble``).
     """
     if not (facts.has_paged_kv and decode_shaped(facts)):
         return False
-    return _selected_d_shape(spec.capabilities, facts) not in spec.paged_decode_lead_d_shapes
+    return (facts.d_qk, facts.d_v) not in spec.paged_decode_lead_d_shapes
 
 
 # ---------------------------------------------------------------------------

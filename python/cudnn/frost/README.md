@@ -656,8 +656,11 @@ this seam exists rather than an engine-side `propose_plans`:
   proposal regardless. That is a measurement, not a preference: whether a
   FROST cell beats the backend's kernel on a given shape is a number someone
   timed. The SDPA forward family uses it for paged, decode-shaped graphs
-  (`S_q <= 8`) on flavors without a `paged_decode_lead_d_shapes` claim on
-  their `EngineSpec` row (`sdpa/fwd/heuristics._yields_to_backend`).
+  (`S_q <= 8`) whose exact `(d_qk, d_v)` shape carries no
+  `paged_decode_lead_d_shapes` claim on their `EngineSpec` row -- a shape
+  served zero-padded on a claimed flavor's envelope does not inherit the
+  claim, since the measurement was of the native shape
+  (`sdpa/fwd/heuristics._yields_to_backend`).
 - **Each mode contributes a block, and the blocks concatenate** in the caller's
   order. `[A, FALLBACK]` therefore puts every tuned candidate -- both sides' --
   ahead of every fallback.

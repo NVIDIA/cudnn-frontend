@@ -390,11 +390,12 @@ def test_paged_graph_declines_off_contract():
 
 # --- placement: where the FROST proposal ranks against the backend at decode ---
 #
-# The heuristics mark a paged, decode-shaped proposal ``yield_to_backend`` on a
-# flavor whose paged decode is not claimed to lead the backend's own plan
-# (EngineSpec.paged_decode_lead_d_shapes); engines/heuristics._assemble then
-# ranks it after the backend's entries of its block. Today both wired flavors
-# claim the lead, so these tests synthesize a non-claiming row.
+# The heuristics mark a paged, decode-shaped proposal ``yield_to_backend`` on an
+# exact (d_qk, d_v) shape whose paged decode is not claimed to lead the backend's
+# own plan (EngineSpec.paged_decode_lead_d_shapes; an envelope shape does not
+# inherit its flavor's claim); engines/heuristics._assemble then ranks it after
+# the backend's entries of its block. The native d128 and d256 shapes claim the
+# lead, so the yielding-row tests synthesize a non-claiming row.
 
 
 def _is_frost(g, index) -> bool:
@@ -421,13 +422,36 @@ def _yield_paged_decode(monkeypatch):
 @pytest.mark.parametrize("d", [128, 256])
 def test_paged_decode_shipped_flavors_lead_the_backend(d):
     """Unpinned: the heuristics' own ranking puts the FROST proposal first on the
-    two wired flavors, and the build walk runs it. (The placement rule ships
-    inert for d128 / d256; this pins that.)"""
+    two claimed native shapes, and the build walk runs it. (The placement rule
+    ships inert for native d128 / d256; this pins that.)"""
     from cudnn.sdpa.fwd.engines import engine_name
 
     _, g = _run_graph(2, 8, 2, d, 16, 8, [100, 77], hnd=False, stats=True, select=None, return_graph=True)
     assert _is_frost(g, 0), [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     assert g.selected_engine is not None and g.selected_engine.name == engine_name()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [64, 96, 192], ids=["d128_envelope_64", "d128_envelope_96", "d256_envelope_192"])
+def test_paged_decode_envelope_shapes_yield_to_the_backend(d):
+    """An envelope shape does not inherit its flavor's lead claim: UNPINNED at s_q = 1
+    the backend's plan ranks first and the walk runs it (selected_engine is None; the
+    output matched the reference), every backend entry of the block precedes the FROST
+    plan, and the FROST plan is still offered. d=64 and d=96 ride the CLAIMED d128
+    flavor and d=192 the claimed d256 flavor, yet FROST pads their operands to the
+    flavor's width while the backend runs them at their own -- B200, b=32, page 16,
+    bf16, FROST leading vs the backend's plan: (64, 64) 32/8 203 vs 46 us, 32/32 658
+    vs 129 us, (96, 96) 32/8 205 vs 63 us; the native (128, 128) and (256, 256) lead
+    (the test above). INVERTED from the flavor keying, under which these shapes led."""
+    from frost_test_utils import offers_engine
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    _, g = _run_graph(2, 8, 2, d, 16, 8, [100, 77], hnd=False, stats=True, select=None, return_graph=True)
+    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+    assert not _is_frost(g, 0) and g.selected_engine is None, names
+    assert offers_engine(g, engine_name()), names
+    frost_at = next(i for i in range(len(g.plans)) if _is_frost(g, i))
+    assert all(not _is_frost(g, i) for i in range(frost_at)), f"every backend entry of the block precedes the FROST plan: {names}"
 
 
 @pytest.mark.L0
