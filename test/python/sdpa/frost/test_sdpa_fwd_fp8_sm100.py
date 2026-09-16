@@ -48,6 +48,12 @@ _OUT = {"fp16": torch.float16, "bf16": torch.bfloat16, "e4m3": torch.float8_e4m3
 _CUDNN_ITYPE = {"e4m3": "FP8_E4M3", "e5m2": "FP8_E5M2"}
 _CUDNN_OTYPE = {torch.float16: "HALF", torch.bfloat16: "BFLOAT16", torch.float8_e4m3fn: "FP8_E4M3", torch.float8_e5m2: "FP8_E5M2"}
 
+# Block-scaled O (sdpa_fp8 + sf_o): "nvfp4" = FP4_E2M1 O + E4M3 scale per 16 d,
+# "mxfp8" = FP8_E4M3 O + UE8M0 scale per 32 d. sf_o is declared either as
+# per-(b,h) planes or as the token-major matrix a GEMM consumes (see
+# api_dsl.SdpaFwdDsl._sf_o_geometry).
+_BLOCK_SCALED_O = {"nvfp4": 16, "mxfp8": 32}
+
 
 class _ReferenceWithStats(NamedTuple):
     output: torch.Tensor
@@ -68,6 +74,56 @@ class _RunWithStatsResult(NamedTuple):
     reference_amax: float
     stats: torch.Tensor
     reference_stats: torch.Tensor
+
+
+class _BlockScaledRunResult(NamedTuple):
+    output: torch.Tensor  # dequantized O (B, H, S, d), fp32, in scale_o units
+    reference: torch.Tensor  # fp32 reference O * scale_o
+    amax: float
+    reference_amax: float
+    sf_pad_ok: bool
+    scale_o: float
+
+
+def _dequant_block_scaled_o(Ob, sf_o_buf, blk, layout, B, H, S, d_v, C):
+    """(O bytes, sf_o bytes) -> fp32 O (B, H, S, d_v); also whether every pad
+    row of a per-(b,h) plane came back zero (token-major has no kernel-owned pad)."""
+    from sdpa.block_scale_o_ref import dequantize_e2m1, unpack_e2m1, unswizzle_128x4
+
+    c_used = d_v // blk
+    if layout == "planes":
+        logical = unswizzle_128x4(sf_o_buf)  # (B, H, R, C)
+        sf_log = logical[:, :, :S, :c_used]
+        pad_ok = bool((logical[:, :, S:, :] == 0).all().item())
+    else:
+        logical = unswizzle_128x4(sf_o_buf)  # (B*S padded, H*C)
+        sf_log = logical[: B * S].reshape(B, S, H, C)[..., :c_used].permute(0, 2, 1, 3)
+        pad_ok = True
+    if blk == 16:
+        codes = unpack_e2m1(Ob.transpose(1, 2).contiguous().view(torch.uint8)).reshape(B, S, H, d_v).permute(0, 2, 1, 3)
+        sf = sf_log.view(torch.float8_e4m3fn).float()
+        vals = dequantize_e2m1(codes)
+    else:
+        sf = torch.pow(2.0, sf_log.float() - 127.0)
+        vals = Ob.float()
+    o = (vals.reshape(B, H, S, c_used, blk) * sf[..., None]).reshape(B, H, S, d_v)
+    return o, pad_ok
+
+
+def _check_block_scaled(res: _BlockScaledRunResult, blk: int, in_key: str):
+    """Kernel dequant vs fp32 reference: within the fp8 pipeline tolerance plus
+    three times the pure block-quantization floor of the reference itself."""
+    from sdpa.block_scale_o_ref import quantize_o_mxfp8, quantize_o_nvfp4
+
+    ref = res.reference
+    _, _, ref_q = (quantize_o_nvfp4 if blk == 16 else quantize_o_mxfp8)(ref)
+    floor = (ref_q - ref).abs().max().item()
+    diff = (res.output - ref).abs().max().item()
+    atol = max(_half_atol(in_key) * res.scale_o, 3.0 * floor)
+    assert not torch.isnan(res.output).any(), "NaN in dequantized O"
+    assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f} (quantization floor {floor:.4f})"
+    assert res.sf_pad_ok, "sf_o pad rows past S_q must be zero"
+    assert abs(res.amax - res.reference_amax) <= 0.03, f"amax_o {res.amax:.4f} vs ref {res.reference_amax:.4f}"
 
 
 def _quant(x, in_key):
@@ -175,6 +231,9 @@ def _run(
     poison_tmem_before_execute: bool = False,
     gate: Optional[torch.Tensor] = None,
     amax: bool = True,
+    block_scaled_o=None,
+    sf_o_layout="planes",
+    scale_o=1.0,
 ):
     """Append-only knobs (PR-A): ``gate`` (a bf16 BHSD-logical tensor of O's shape)
     adds the epilogue-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul`` and
@@ -196,7 +255,12 @@ def _run(
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
-    Ob = torch.empty(B, S_q, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
+    blk = _BLOCK_SCALED_O.get(block_scaled_o, 0)
+    if blk == 16:
+        # FP4 O: the byte container (two E2M1 per byte) in torch's packed dtype.
+        Ob = torch.full((B, S_q, H_q, d_v // 2), 0x7F, device=dev, dtype=torch.uint8).view(torch.float4_e2m1fn_x2).transpose(1, 2)
+    else:
+        Ob = torch.empty(B, S_q, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
     lse = make_dense_stats(B, H_q, S_q, stats_layout)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
@@ -205,7 +269,7 @@ def _run(
 
     # Reciprocal S scales: this kernel casts P unscaled, which is exact for any
     # reciprocal pair. s_descale_gain breaks the reciprocity to test the guard.
-    dqt, dkt, dvt, dst, sst, sot = sc(dq), sc(dk), sc(dv), sc(s_descale_gain / s_scale), sc(s_scale), sc(1.0)
+    dqt, dkt, dvt, dst, sst, sot = sc(dq), sc(dk), sc(dv), sc(s_descale_gain / s_scale), sc(s_scale), sc(scale_o)
 
     g = cudnn.pygraph(
         io_data_type=getattr(cudnn.data_type, _CUDNN_ITYPE[in_key]), intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT
@@ -233,14 +297,42 @@ def _run(
         vp[sq_h] = slq
         vp[skv_h] = slk
     kw.update(sdpa_kwargs)
+    sf_o_buf = None
+    if blk:
+        from sdpa.block_scale_o_ref import round_up
+
+        C = max(4, round_up(d_v // blk, 4))
+        if sf_o_layout == "planes":
+            R = round_up(S_q, 128)
+            sf_o_buf = torch.full((B, H_q, R, C), 0xAA, device=dev, dtype=torch.uint8)
+        else:
+            # token-major: one [B*S_q (padded to 128), H_q*C] matrix, declared BSHC;
+            # the rows past B*S_q are caller-owned (pre-zeroed here).
+            R = S_q
+            sf_o_buf = torch.full((round_up(B * S_q, 128), H_q * C), 0xAA, device=dev, dtype=torch.uint8)
+            sf_o_buf[B * S_q :] = 0
+        sf_dtype = cudnn.data_type.FP8_E4M3 if blk == 16 else cudnn.data_type.FP8_E8M0
+        if sf_o_layout == "planes":
+            sf_o_t = g.tensor(dim=[B, H_q, R, C], stride=[H_q * R * C, R * C, C, 1], data_type=sf_dtype)
+        else:
+            sf_o_t = g.tensor(dim=[B, H_q, R, C], stride=[R * H_q * C, C, H_q * C, 1], data_type=sf_dtype)
+        kw["sf_o"] = sf_o_t
     o, stats_t, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested (engines decline graphs that declare it)
+    if blk == 16:
+        o_cudnn_dtype = cudnn.data_type.FP4_E2M1
+        o_dim = [B, H_q, S_q, d_v]
+        o_stride = [S_q * H_q * d_v, d_v, H_q * d_v, 1]
+    else:
+        o_cudnn_dtype = getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt])
+        o_dim, o_stride = list(Ob.shape), list(Ob.stride())
     if gate is not None:
         # Epilogue-gate tail: O_v stays VIRTUAL but DECLARED (dim + stride), the mul output is the real O.
-        o.set_dim(list(Ob.shape)).set_stride(list(Ob.stride()))
+        assert not blk, "the epilogue gate and a block-scaled O are separate flavors"
+        o.set_dim(o_dim).set_stride(o_stride)
         gate_t = g.tensor_like(gate)
         vp[gate_t] = gate
         o = g.mul(a=o, b=g.sigmoid(input=gate_t, name="sig"), name="gated")
-    o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt]))
+    o.set_output(True).set_dim(o_dim).set_stride(o_stride).set_data_type(o_cudnn_dtype)
     if stats:
         stats_t.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     if amax:
@@ -261,6 +353,8 @@ def _run(
     vp[o] = Ob
     if amax:
         vp[amx_o] = amax_o
+    if blk:
+        vp[sf_o_t] = sf_o_buf
     if stats:
         vp[stats_t] = lse
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -287,6 +381,12 @@ def _run(
     ref_kw = _ref_kwargs(sdpa_kwargs)
     if sink is not None:
         ref_kw["sinks"] = sink.flatten()
+    if blk:
+        # Dequantize O from (bytes, sf_o) in the declared layout; the reference is
+        # the fp32 O times scale_o (what the kernel quantizes).
+        o_ref = _ref(Q8, K8, V8, dq, dk, dv, in_key, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kw)
+        o_deq, sf_pad_ok = _dequant_block_scaled_o(Ob, sf_o_buf, blk, sf_o_layout, B, H_q, S_q, d_v, C)
+        return _BlockScaledRunResult(o_deq, o_ref * scale_o, amax_o.item(), o_ref.abs().max().item(), sf_pad_ok, scale_o)
 
     def _gated(o_ref):
         return o_ref * torch.sigmoid(gate.float()).to(o_ref.dtype) if gate is not None else o_ref
@@ -424,6 +524,44 @@ def test_fp8_output_dtypes(in_key, out_key):
 
 
 @_skip_on_rubin
+@pytest.mark.parametrize("sf_o_layout", ["planes", "token_major"])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("mode", list(_BLOCK_SCALED_O))
+@pytest.mark.L0
+@torch_fork_set_rng(seed=71)
+def test_fp8_block_scaled_output(mode, mask, sf_o_layout):
+    """Block-scaled O epilogue (sf_o): FP4 O + E4M3/16 scales, or E4M3 O + UE8M0/32
+    scales, on the d128 flavor. S_q = 300 exercises a partially valid tail tile
+    (per-plane pad rows must come back zero), B > 1 the plane / token-major row
+    bookkeeping, GQA the head -> plane mapping."""
+    blk = _BLOCK_SCALED_O[mode]
+    res = _run(
+        2,
+        4,
+        2,
+        300,
+        256,
+        "e4m3",
+        torch.float8_e4m3fn,
+        scale=1.0 / math.sqrt(128),
+        sdpa_kwargs=_MASKS[mask],
+        block_scaled_o=mode,
+        sf_o_layout=sf_o_layout,
+        scale_o=3.0 if mode == "nvfp4" else 1.0,
+    )
+    _check_block_scaled(res, blk, "e4m3")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=72)
+def test_fp8_block_scaled_output_declines_wide_flavor():
+    """sf_o is a d128-only epilogue: a d256 graph requesting it has no engine."""
+    import cudnn
+
+    with pytest.raises((cudnn.cudnnGraphNotSupportedError, RuntimeError, ValueError)):
+        _run(1, 2, 2, 256, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / 16, sdpa_kwargs={}, d_qk=256, d_v=256, block_scaled_o="nvfp4")
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
 @pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])

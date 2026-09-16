@@ -40,6 +40,10 @@ _TORCH_FROM_CUDNN = {
     cudnn.data_type.FP8_E5M2: "float8_e5m2",
     cudnn.data_type.FLOAT: "float32",
     cudnn.data_type.INT32: "int32",
+    # Block-scaled O of the per-tensor FP8 forward: two E2M1 per byte, and the
+    # UE8M0 scale factors of its MXFP8 output.
+    cudnn.data_type.FP4_E2M1: "float4_e2m1fn_x2",
+    cudnn.data_type.FP8_E8M0: "float8_e8m0fnu",
 }
 _KNOWN_DTYPES = frozenset(_TORCH_FROM_CUDNN)
 
@@ -294,6 +298,9 @@ class SdpaGraphFacts:
     is_mxfp8: bool = False  # block-scale MXFP8 (FP8 Q/K/V + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 (FP8 Q/K/V + scalar descales)
     dtype_o: Optional[Any] = None  # O dtype as cudnn.data_type
+    # Block-scaled O (sdpa_fp8 with an ``sf_o`` output): scale-factor block
+    # along d_v — 16 = E2M1 O + E4M3 SF, 32 = E4M3 O + UE8M0 SF, 0 = plain O.
+    o_block_scale: int = 0
 
     # masks (resolved cuDNN semantics)
     causal: bool = False  # effective causal upper bound (right band == 0)
@@ -404,6 +411,8 @@ class SdpaGraphFacts:
     sf_k_t: Any = None
     sf_v_t: Any = None
     amax_o_t: Any = None
+    # Block-scaled O scale-factor output (sdpa_fp8 ``sf_o``; see o_block_scale).
+    sf_o_t: Any = None
     # Per-tensor FP8 scalar descale tensors + Amax_S output.
     descale_q_t: Any = None
     descale_k_t: Any = None
@@ -532,7 +541,7 @@ def _record_from_node(node: Any, tail: Optional[GateTail] = None) -> dict:
     # node.outputs): fold each one in so engines see every requested output.
     # Missing one here lets an engine that never writes it pass the probe and
     # silently leave that output buffer as garbage (see score_max/score_sum_exp).
-    for out_kwarg in ("rng_dump", "score_max", "score_sum_exp"):
+    for out_kwarg in ("rng_dump", "score_max", "score_sum_exp", "sf_o"):
         if rec.get(out_kwarg) is None:
             rec[out_kwarg] = node.outputs.get(out_kwarg)
     # MXFP8 / per-tensor FP8: descale_q/k/v (+ scale_o, etc. for FP8) arrive via
@@ -721,6 +730,22 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     else:
         _uniform_ports = [k, v, o] + ([rec["dO"], rec["dQ"], rec["dK"], rec["dV"]] if is_backward else [])
         uniform = all(t.get_data_type() == q_dtype for t in _uniform_ports)
+    # Block-scaled O (per-tensor FP8 forward only): FP4 O needs the sf_o
+    # output (E4M3 scale per 16 d); an E4M3 O with sf_o is the MXFP8 output
+    # (UE8M0 scale per 32 d). Any other pairing is not a graph any engine serves.
+    sf_o = rec.get("sf_o") if is_fp8 else None
+    o_block_scale = 0
+    if is_fp8:
+        if o.get_data_type() == cudnn.data_type.FP4_E2M1:
+            if sf_o is None:
+                return _invalid("sdpa_fp8: an FP4_E2M1 O requires the sf_o output (E4M3 scale factors, one per 16 d elements)")
+            o_block_scale = 16
+        elif sf_o is not None:
+            if o.get_data_type() != cudnn.data_type.FP8_E4M3:
+                return _invalid("sdpa_fp8: sf_o with a non-FP4 O requires an FP8_E4M3 O (MXFP8 output, UE8M0 scale per 32 d elements)")
+            o_block_scale = 32
+    elif rec.get("sf_o") is not None:
+        return _invalid("sf_o is an output of sdpa_fp8 only")
     _layout_ports = [(q_dim, q_stride), (k_dim, k_stride), (v_dim, v_stride), (o_dim, o_stride)]
     if is_backward:
         _layout_ports += [(dims[name], strides[name]) for name in ("dO", "dQ", "dK", "dV")]
@@ -873,6 +898,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         is_mxfp8=is_mxfp8,
         is_fp8=is_fp8,
         dtype_o=(o_dtype if _fp8_family else q_dtype),
+        o_block_scale=o_block_scale,
         causal=causal,
         bottom_right=bool(align_is_br),
         window_left=window_left,
@@ -948,6 +974,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         # virtual one used to enter SdpaBinding and make the plan demand a buffer
         # for it (engine._FrostSdpaFwdPlan: "missing buffers").
         amax_o_t=_real_output(rec.get("amax_o")),
+        sf_o_t=sf_o,
         descale_q_t=(dsc_q if is_fp8 else None),
         descale_k_t=(dsc_k if is_fp8 else None),
         descale_v_t=(dsc_v if is_fp8 else None),
@@ -1022,6 +1049,8 @@ class SdpaBinding:
     sf_k: Any = None
     sf_v: Any = None
     amax_o: Any = None
+    # Block-scaled O scale-factor output (sdpa_fp8 sf_o).
+    sf_o: Any = None
     # Per-tensor FP8 scalar descales + Amax_S output.
     descale_q: Any = None
     descale_k: Any = None
@@ -1088,6 +1117,7 @@ class SdpaBinding:
                 self.sf_k,
                 self.sf_v,
                 self.amax_o,
+                self.sf_o,
                 self.descale_q,
                 self.descale_k,
                 self.descale_v,
