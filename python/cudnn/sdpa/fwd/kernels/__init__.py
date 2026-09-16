@@ -16,6 +16,10 @@ dims: ``sm120/prefill_f16.py`` and ``sm120/prefill_fp8.py`` do, while
 ``sm120/prefill_d256_f16.py`` is the d256 flavor (head dims that tile at 256 on
 both sides). ``sm120/prefill_d512_f16.py`` serves both head dims in (256, 512]
 at multiples of eight, with two warps per Q slab splitting the head dimension.
+A ``decode_`` phase is a second template for the SAME flavor and contract,
+selected by the adapter when the graph is decode-shaped:
+``sm100/decode_d256_f16.py`` takes the f16/bf16 d256 graphs whose S_q x packed
+heads fit 32 rows (``TemplateParams.decode_q_tile``), the prefill template the rest.
 
 Modules shared across arch lines stay at THIS level rather than inside one
 arch's package, so the directory a file lives in always names its only owner:

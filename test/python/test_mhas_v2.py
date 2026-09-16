@@ -2151,6 +2151,135 @@ def test_sdpa_thd_batch_stride_int32_overflow_L0(env_info, request, cudnn_handle
     exec_sdpa(test.cfg, request, cudnn_handle)
 
 
+# # ==================================
+# # L0 paged decode d256 (FROST decode tile) tests
+# # ==================================
+
+FROST_ENGINE_TALLY = "frost:sdpa_fwd_prefill_sm100"
+FROST_D256_DECODE_TALLY = FROST_ENGINE_TALLY + ":decode_d256_f16"
+
+
+def _frost_decode_d256_gate():
+    """The d256 decode tile is an SM100-106 FROST kernel behind the opt-in env;
+    anywhere else another path serves the graph and the routing assertions
+    below have nothing to say."""
+    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "0").strip() != "1":
+        pytest.skip("FROST engines are opt-in (CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1)")
+    major, minor = torch.cuda.get_device_capability()
+    if not 100 <= major * 10 + minor <= 106:
+        pytest.skip("the d256 decode tile is an SM100-106 kernel")
+
+
+def _decode_d256_heads(rng):
+    """Head groups the decode tile packs whole: 8:1 (two tokens per 16-row tile at
+    S_q = 1) and 16:1 (one), over 1, 2 or 4 KV heads (Qwen3-Next 16/2, Qwen3.5 32/2)."""
+    group = rng.choice([8, 16])
+    h_k = rng.choice([1, 2, 4])
+    return group * h_k, h_k, h_k
+
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=2009), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_fwd_paged_decode_d256_frost_L0(env_info, test_no, request, cudnn_handle):
+    """Decode-shaped paged d256 (Qwen3-Next / Qwen3.5 class): S_q in [1, 8] over 8:1
+    and 16:1 groups, page sizes 16..128, both diagonal alignments with causal /
+    sliding-window / band masks, mixed per-batch lengths (zeros included); inference
+    graphs (the harness runs a backward otherwise, and paged KV is forward-only).
+    The FROST engine row must serve every config -- the decode tile
+    (sm100/decode_d256_f16.py) while S_q x group <= 32 rows, the prefill d256 tile
+    above that -- so the routing tally is asserted: a decline would fall back to
+    the backend silently and pass on the wrong kernel.
+    """
+    _frost_decode_d256_gate()
+    import frost_routing
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=8, with_high_probability=[4, 8]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=1, s_kv_max=8192, s_q_distribution={"s_q=1":6, "s_q=random":4}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=256, d_qk_max=256, d_v_min=256, d_v_max=256, head_dim_distribution={"d_qk=d_v":1}),
+        head_count=_decode_d256_heads,
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, band_around_diag=5, no_mask=10),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 2}),
+        is_ragged_or_padded_or_full=RandomChoice({"padded" : 1}),
+        block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16,32,64,128]),
+        with_sink_token=RandomChoice({False : 1}),  # paged + sink stays declined by the engine row
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = True
+    test.showConfig(test_no, request)
+
+    before = frost_routing.COUNTS.get(FROST_ENGINE_TALLY, 0)
+    exec_sdpa(test.cfg, request, cudnn_handle)
+    assert frost_routing.COUNTS.get(FROST_ENGINE_TALLY, 0) == before + 1, f"the FROST engine row did not serve this graph: {frost_routing.snapshot()}"
+
+
+QWEN35_DECODE_CASES = [
+    (1, cudnn.diagonal_alignment.TOP_LEFT, None),
+    (2, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0),
+]
+
+
+@pytest.mark.parametrize("s_q,diag_align,right_bound", QWEN35_DECODE_CASES, ids=["sq1", "sq2_brcm"])
+@pytest.mark.L0
+def test_sdpa_fwd_paged_decode_d256_qwen35_frost_L0(env_info, s_q, diag_align, right_bound, request, cudnn_handle):
+    """Qwen3.5 decode as served: b=32, 32/2 heads, d=256, page 16, mixed KV lengths
+    up to 4096 -- the S_q = 1 step and the S_q = 2 MTP step (bottom-right causal).
+    Pins that the decode tile (`decode_d256_f16`) serves the shape it was built for
+    rather than the prefill tile.
+    """
+    _frost_decode_d256_gate()
+    import frost_routing
+
+    rng = random.Random(2009)
+    seq_len_kv = [rng.randint(s_q, 4096) for _ in range(32)]
+    seq_len_kv[0] = 4096
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=2009,
+        rng_geom_seed=2009,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_cu_seq_len=False,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=32,
+        d_qk=256,
+        d_v=256,
+        s_q=s_q,
+        s_kv=4096,
+        h_q=32,
+        h_k=2,
+        h_v=2,
+        diag_align=diag_align,
+        left_bound=None,
+        right_bound=right_bound,
+        seq_len_q=[s_q] * 32,
+        seq_len_kv=seq_len_kv,
+        block_size=16,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, len(QWEN35_DECODE_CASES)), request)
+
+    before = frost_routing.COUNTS.get(FROST_D256_DECODE_TALLY, 0)
+    exec_sdpa(test.cfg, request, cudnn_handle)
+    assert frost_routing.COUNTS.get(FROST_D256_DECODE_TALLY, 0) == before + 1, f"the decode tile did not serve this graph: {frost_routing.snapshot()}"
+
+
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
 @pytest.mark.L0
 @pytest.mark.L1

@@ -60,6 +60,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     cga_tile_m,
     d192_square_br_as_tl,
     d256_square_br_as_tl,
+    decode_d256_q_tile,
     pack_gqa_group_size,
     pack_gqa_supported,
 )
@@ -699,6 +700,22 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
     return caps.sm_lo >= 120 and caps.sm_hi < 130 and facts.window_left is not None and pick_flavor(facts.d_qk, facts.d_v, fp8=facts.is_fp8) == D512_FLAVOR
 
 
+def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int) -> bool:
+    """Whether the SM100 f16/bf16 row lowers this graph onto the d256 decode tile
+    (sm100/decode_d256_f16.py) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``:
+    the (256, 256) flavor, half inputs, dense (not THD), S_q x packed heads
+    within the tile's N extent.  Rubin has its own row (no decode tile)."""
+    return (
+        caps.sm_lo == 100
+        and caps.sm_hi < 107
+        and not facts.is_fp8
+        and not facts.is_mxfp8
+        and not facts.thd
+        and _selected_d_shape(caps, facts) == (256, 256)
+        and decode_d256_q_tile(facts.s_q, pack_g) > 0
+    )
+
+
 def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     """Whether a packed set can be built at ``tile_m``: the row offers packing,
     the batch is dense, the graph carries no fused epilogue gate (its per-head
@@ -795,6 +812,20 @@ def _split_points(
     sm_count = facts.device_sm_count or 0
     if sm_count <= 0:
         return [no_split]
+    if _d256_decode_tile_selected(caps, facts, pack_g):
+        # The decode tile runs ONE cta_group::1 CTA per (KV-head group, batch,
+        # split) unit and is HBM-bound, so the lever is filling the machine:
+        # the largest power-of-two split whose CTA count still fits one wave,
+        # with at least two KV tiles per split.  (The prefill cost model below
+        # assumes cga2 clusters and a 21-tile per-CTA fixed cost: fitted on the
+        # prefill tile, wrong for this one -- b=32 x H_kv=2 measured 56 us unsplit
+        # vs 52 us at split 2 on a 148-SM B200.)
+        units = facts.b * (facts.h_q // pack_g)
+        kv_tiles = _ceil_div(facts.s_kv, tile_n or 128)
+        split = 1
+        while units * split * 2 <= sm_count and kv_tiles // (split * 2) >= _SPLIT_KV_MIN_TILES:
+            split *= 2
+        return [split, no_split] if split > 1 else [no_split]
     rows_per_tile = _pack_gqa_tile_q(caps, facts, tile_m, cga)
     split_launch = _SplitKvLaunch(
         q_tiles=_ceil_div(facts.s_q * pack_g, rows_per_tile),

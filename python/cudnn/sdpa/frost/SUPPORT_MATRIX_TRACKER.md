@@ -98,9 +98,9 @@ MMA as d=512.
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
-| Decode-shaped (`S_q == 1`; with sink / sliding window: ˢ) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ᵇ · ✅ᵍ |
-| **Decode tile** (`S_q · PACK_G ≤ 128`, decode + MTP; f16/bf16, dense or paged)ᵈᵗ | ✅ᵈᵗ (d128 envelope) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ❌ (prefill tile) | ❌ (prefill tile) | — |
-| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ (d128 envelope) | ✅ᵖ | ✅ᵖ (native (192, 128)) | ✅ᵖ | ❌ | ❌ |
+| Decode-shaped (`S_q == 1`; with sink / sliding window: ˢ) | ✅ | ✅ | ✅ | ✅ᵈ (decode tile) | ✅ | ❌ᵇ · ✅ᵍ |
+| **Decode tile** (decode + MTP; f16/bf16, dense or paged: d128 `S_q · PACK_G ≤ 128`ᵈᵗ, d256 `S_q · G` within the routed rowsᵈ) | ✅ᵈᵗ (d128 envelope) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ✅ᵈ (d256 decode tile, swap-AB) | ❌ (prefill tile) | — |
+| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ (d128 envelope) | ✅ᵖ | ✅ᵖ (native (192, 128)) | ✅ᵖ ᵈ | ❌ | ❌ |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ᵈᵗ **d128 decode tile (`sm100/decode_d128_f16.py`, f16/bf16).** The (128, 128) flavor of
@@ -131,9 +131,9 @@ packing (ᵐ: `HEADS_PER_TILE = PACK_G`, `G / PACK_G` packed heads per KV head),
 + combine, NATURAL
 / LPT / LPT_L2. **Not on the decode tile: THD** (a ragged graph keeps `TILE_CGA_M=2`; a
 pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
-`cgas={2}`, their other flavors their own width), and the other f16 flavors (d192x128 /
-d256 / d512 have no decode tile yet — their decode graphs run the prefill kernel as
-before). d64 rides it through the d128 envelope. Measured on B200 (graph path,
+`cgas={2}`, their other flavors their own width), and the d192x128 / d512 f16 flavors
+(no decode tile yet — their decode graphs run the prefill kernel as before; the d256
+f16/bf16 flavor has its own swap-AB decode tile, ᵈ). d64 rides it through the d128 envelope. Measured on B200 (graph path,
 CUDA-graph replay, b=32, d=128, S_kv=4096, page 16, bf16): 64/4 S_q=1 119.2 us on the
 prefill tile → 48.9 us on the decode tile (the cuDNN backend's decode engine: 44 us);
 64/4 MTP S_q=4 127.5 → 50.6 us; 64/8 S_q=1 234.6 → 96.4 us; 96/8 S_q=1 (G=12 packs 4,
@@ -175,8 +175,9 @@ specialization of `sm100/prefill_d128_f16.py`, `sm100/prefill_d192_d128_f16.py` 
 `sm100/prefill_d256_f16.py` (block-table indirection on the K/V TMA loads; boxes past
 a sequence's live pages are TMA-OOB zero-filled; under paged KV the d192×d128 kernel
 takes the plain scheduler decode — its predecoded THD+SWA segment path folds off).
-For decode / MTP shapes on the d128 flavor (`S_q * PACK_G <= 128`) the d128 decode tile
-`sm100/decode_d128_f16.py` (ᵈᵗ) serves the same paged contract. The d192×d128 flavor
+For decode / MTP shapes the decode tiles serve the same paged contract: on the d128
+flavor (`S_q * PACK_G <= 128`) the d128 decode tile `sm100/decode_d128_f16.py` (ᵈᵗ), on
+d256 the d256 decode tileᵈ when the graph is decode-shaped (`S_q * G <= 32`). The d192×d128 flavor
 has no decode tile yet: at decode shapes its paged graphs run the prefill geometry (one
 live row per 128-row Q tile), measured behind the backend's paged decode plan (B200,
 `b = 32`, `S_q = 1`, page 16, bf16, default plan: 32/32 MHA 788.7 µs vs 476.9 µs, 32/8
@@ -202,9 +203,11 @@ on B200 (SM100) — `test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py`,
 pinned `test_sdpa_paged_decode_sink_sliding_window_frost_L0` /
 `test_sdpa_paged_decode_sink_keyless_rows_frost_L0` (both ride the d128 decode tileᵈᵗ
 since #1094 — `TILE_CGA_M=1` asserted — whose fold carries the same keyless-row
-select) and their d256 twin on the prefill kernels,
-`test_sdpa_paged_decode_sink_d256_prefill_tile_frost_L0` (the (256, 256) shape has
-no decode tile; `TILE_CGA_M=2` asserted) — per flavor: d128 at `S_q` in
+select) and their d256 twin
+`test_sdpa_paged_decode_sink_d256_frost_L0` (since the d256 decode tileᵈ its two
+decode-shaped cases ride that tile — `decode_d256_f16` asserted — and a third case with
+more packed Q rows than the tile routes, `S_q · G > 32`, keeps the d256 prefill kernel's
+fold covered — `prefill_d256_f16` asserted) — per flavor: d128 at `S_q` in
 {1, 2, 4} (dense and paged, f16/bf16, PackGQA on and off, and partialᵐ -- 96/8 and 48/8,
 `sinks[row_head_idx]` stays the Q head under `PACK_G < G`); d64 on the d128 envelope
 at `S_q` in {1, 4} paged (bf16, 64/8 heads, sink + left window 128) and `S_q = 1`
@@ -238,6 +241,28 @@ exposed. Sink + split-KV stays declined on
 every row (`split_kv > 1 serves dense, unpadded, sink-free graphs only`): a sink
 decode graph runs unsplit, one cluster per (batch, KV head), until a sink-aware
 `split_combine` lands.
+
+ᵈ **d256 decode tile (`sm100/decode_d256_f16.py`, 2026-09-16).** Same engine row,
+same graph contract, a second template: f16/bf16 d256 graphs (d_qk = d_v in
+(128, 256], the d256 envelope) whose packed Q rows fit 32 -- `S_q * G <= 32` with
+`G` the PackGQA group (16:1 at S_q <= 2, 8:1 at S_q <= 4, MHA at S_q <= 32) -- lower
+onto a swap-AB tile: KV tokens on the MMA M axis (128 keys per tile), the 16 or 32 Q
+rows on N, one cta_group::1 CTA per (KV-head group, batch, split), softmax reducing
+over TMEM lanes (4 warps per 16 Q columns), P^T through a swizzled SMEM tile, O^T in
+TMEM. Dense padded and paged caches, every mask the d256 row serves (padding /
+top-left and bottom-right causal / SWA / right band, dense padded-Q trim), sink
+(dense), Stats natural or base-2, KV split partials for `split_combine_sm100` (the
+heuristics propose the largest power-of-two split whose CTAs fill one wave). THD,
+fp8/mxfp8 and `S_q * G > 32` stay on the prefill tile; `TILE_CGA_M` / `SCHED_POLICY`
+knobs are accepted and unused there. B200 (SM100, 148 SMs), CUDA-graph replay of
+`graph.execute`, bf16, b=32, 32/2 heads, d256, page 16, s_kv=4096: 63.6 -> 51.3 us
+(S_q = 1, full lengths; the prefill tile measured 67 us with the host overhead of
+back-to-back `execute` calls), 57.8 -> 45.1 us (mixed lengths), 65.7 -> 58.3 us
+(S_q = 2 bottom-right causal); b=128: 250.1 -> 175.6 us; s_kv=16384: 244.1 ->
+165.7 us; Qwen3-Next 16/2 b=64 s_kv=8192 mixed: 210.7 -> 139.4 us. The main kernel
+alone reaches trtllm-gen's 46 us at split 2; the shared combine pass (~6 us) is the
+remaining gap. Not a Capabilities change (the row's claims are unchanged; this
+documents the lowering), Rule S2.
 
 ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**
 (`Capabilities.pack_gqa_partial_d_shapes = {(128, 128), (256, 256)}`, `Cfg.PACK_G`).
@@ -846,7 +871,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | THD / ragged backward | SM120, and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ; SM80 — see ᵏ) |
 | THD forward | SM80 |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM100, SM107** — served via the d128 envelope at ~2× MMA cost (decode shapes ride the d128 decode tile, ᵈᵗ) |
-| Decode tile outside the d128 f16/bf16 flavor | SM100, SM103 — d192×128 / d256 / d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d256 / d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ) |
+| Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — d192×128 / d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
 | d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |
 | Bias forward | SM100, SM107, SM120 |
