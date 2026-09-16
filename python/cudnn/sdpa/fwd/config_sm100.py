@@ -1279,8 +1279,9 @@ class CfgD128Decode(CfgD128):
     """The d128 f16/bf16 DECODE tile (``sm100/decode_d128_f16.py``).
 
     Same head geometry, masks, paged loader and split/epilogue contract as
-    :class:`CfgD128`, but shaped for graphs whose Q rows (times the PackGQA
-    group) fit ONE 128-row tile per KV head -- S_q = 1 decode and MTP S_q in
+    :class:`CfgD128` (incl. partial PackGQA: ``PACK_G`` heads per token
+    row-group), but shaped for graphs whose Q rows (times the packed group)
+    fit ONE 128-row tile per packed head -- S_q = 1 decode and MTP S_q in
     [2, 8]. The prefill pipeline computes 512 Q rows per cga2 cluster
     (TILES_Q=2 x TILE_M=128 x CTA_MMA=2) and, with 1..G of them live, spends
     its time on dead-row MMA and softmax; this tile computes 128 rows per
@@ -1300,7 +1301,8 @@ class CfgD128Decode(CfgD128):
     Selected by the adapter for the (128, 128) f16/bf16 flavor whenever the
     plan's ``TILE_CGA_M`` knob is 1 (``api_dsl._load_sm100_kernel_module``); the
     heuristics propose cga=1 exactly when ``S_q * pack_g <= 128`` (``pack_g`` =
-    the candidate's own packing: G packed, 1 unpacked).
+    the candidate's own packing: ``PACK_G`` packed -- the whole group G, or its
+    largest divisor of 128 under partial PackGQA -- 1 unpacked).
     """
 
     CGA_M: int = 1
@@ -1416,12 +1418,14 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        # Partial PackGQA, as on the d128 prefill tile: the kernel packs the
+        # largest divisor of the group that divides the 128-row tile
+        # (HEADS_PER_TILE = PACK_G; a group sharing no factor with it raises here).
+        PACK_G=_pack_g(params, CfgD128Decode.TILE_M, partial=True),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d128_decode(cfg)
-    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
-        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 

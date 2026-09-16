@@ -99,7 +99,11 @@ def test_split_model_sees_the_partial_pack_group_not_the_gqa_ratio(monkeypatch):
     smaller grid and over-proposed the split on the GLM decode shape (b=1:
     split 8 instead of 2; b=2..4: a split where the packed grid already fills
     the machine).  Both launches the model compares -- the split leg and the
-    unsplit runner-up -- must carry p."""
+    unsplit runner-up -- must carry p.  The packed leg rides the d128 DECODE
+    tile (S_q * p = 4 <= 128 rows: TILE_CGA_M=1, one CTA per tile), so the
+    model is fed ctas_per_tile=1 and levels the 24 x b grid over 148 SMs with
+    split 4 / 2 / 1 at b = 1 / 2 / 4 (2 / 1 / 1 while the leg rode the cga2
+    prefill tile)."""
     import cudnn.sdpa.fwd.heuristics as heur
 
     seen = []
@@ -110,7 +114,7 @@ def test_split_model_sees_the_partial_pack_group_not_the_gqa_ratio(monkeypatch):
         return real(**kw)
 
     monkeypatch.setattr(heur, "choose_split_kv", recording)
-    for b, want in ((1, 2), (2, 1), (4, 1)):
+    for b, want in ((1, 4), (2, 2), (4, 1)):
         seen.clear()
         facts = _facts(b=b, h_q=96, h_kv=8, s_q=1, s_kv=4096, causal=False, dtype=cudnn.data_type.BFLOAT16)
         f16 = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
@@ -120,9 +124,9 @@ def test_split_model_sees_the_partial_pack_group_not_the_gqa_ratio(monkeypatch):
             assert kw["unsplit_launch"] is not None and kw["unsplit_launch"].heads_q == 24, kw["unsplit_launch"]
             # The combine still reduces the graph's own (S_q, H, B) rows.
             assert kw["combine_rows"] == 1 * 96 * b
-        assert f16[0].knobs.pack_gqa is True and f16[0].knobs.split_kv == want, (b, f16[0].knobs)
-        # Exactly the split the model gives the 24-packed-head geometry.
-        assert f16[0].knobs.split_kv == real(q_tiles=1, heads_q=24, batch=b, kv_tiles=32, sm_count=148, combine_rows=96 * b, ctas_per_tile=2)
+        assert f16[0].knobs.pack_gqa is True and f16[0].knobs.cga == 1 and f16[0].knobs.split_kv == want, (b, f16[0].knobs)
+        # Exactly the split the model gives the 24-packed-head geometry on the decode tile.
+        assert f16[0].knobs.split_kv == real(q_tiles=1, heads_q=24, batch=b, kv_tiles=32, sm_count=148, combine_rows=96 * b, ctas_per_tile=1)
 
 
 @pytest.mark.L0

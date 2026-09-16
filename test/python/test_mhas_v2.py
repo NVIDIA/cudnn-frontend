@@ -462,20 +462,30 @@ def test_sdpa_random_lean_attn_unified_L1(env_info, test_no, request, cudnn_hand
 def _require_frost_sm100(engine="sdpa_fwd_prefill_sm100"):
     """The functions below ASSERT that a FROST engine served the graph, so they
     run only where that engine is offered: a pre-Rubin Blackwell (cc 10.0-10.6)
-    with the FROST engines opted in.  Elsewhere they skip instead of failing."""
+    with the FROST engines opted in and a CuTe DSL at the FROST floor (the row
+    declines an older or absent DSL and the native backend then serves the
+    graph correctly -- a legitimate fallback the routing assertion must not
+    report as a failure of FROST).  Elsewhere they skip instead of failing."""
     major, minor = torch.cuda.get_device_capability()
     if not (100 <= major * 10 + minor <= 106):
         pytest.skip(f"{engine} serves cc 10.0-10.6 only; device is cc {major}.{minor}")
     if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
         pytest.skip("CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required: this test asserts FROST routing")
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip("needs the cutedsl extra (nvidia-cutlass-dsl) at the FROST floor")
 
 
-def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100"):
+def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100", cga=None):
     """exec_sdpa, then assert the FROST engine served the graph: the harness
     tallies the serving engine in frost_routing after build_plans, and a FROST
     decline silently falls through to the native backend, so a green run alone
     proves nothing about routing.  (A WAIVED skip inside exec_sdpa skips before
-    the assertion.)"""
+    the assertion.)  ``cga`` additionally pins the selected plan's TILE_CGA_M
+    knob (frost_routing.LAST_PLAN): on sdpa_fwd_prefill_sm100's d128 flavor 1
+    IS the decode tile and 2 the prefill pipeline, so a test that means the
+    decode tile asserts the tile, not just the engine."""
     import frost_routing
 
     key    = f"frost:{engine}"
@@ -483,6 +493,9 @@ def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm1
     exec_sdpa(cfg, request, cudnn_handle)
     after  = frost_routing.snapshot().get(key, 0)
     assert after == before + 1, f"expected {engine!r} to serve this graph; routing tally: {frost_routing.snapshot()}"
+    if cga is not None:
+        served, knobs = frost_routing.LAST_PLAN
+        assert served == engine and knobs is not None and knobs.cga == cga, f"expected TILE_CGA_M={cga} on {engine!r}, got {served} {knobs}"
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=2004), ids=lambda p: f"test{p[0]}")
@@ -1526,45 +1539,23 @@ def test_sdpa_mixed_seq_len_forms_L0(env_info, cu_sides, diag_align, right_bound
 # # L0 paged decode / MTP tests on the FROST d128 decode tile (SM100, opt-in)
 # # ==================================
 
-def _frost_decode_tile_gate():
-    """These tests assert that FROST's d128 DECODE tile serves the graph, which only
-    exists on the SM100 line (cc 10.0-10.6) with the FROST engines opted in and a
-    CuTe DSL at the FROST floor (the row declines an older or absent DSL and the
-    native backend then serves the graph correctly -- a legitimate fallback the
-    routing assertion must not report as a failure of FROST)."""
-    major, minor = torch.cuda.get_device_capability()
-    if not (100 <= major * 10 + minor <= 106):
-        pytest.skip("FROST d128 decode tile is an SM100-line (cc 10.0-10.6) kernel")
-    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
-        pytest.skip("FROST engines are opt-in: set CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1")
-    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
-    installed, version = cutedsl_state()
-    if not installed or cutedsl_too_old(version):
-        pytest.skip("needs the cutedsl extra (nvidia-cutlass-dsl) at the FROST floor")
-
-
-def _assert_frost_decode_tile_served(counts_before):
-    """FROST served the graph (the routing tally grew) with the d128 decode tile
-    (the selected plan's TILE_CGA_M knob is 1 -- the flavor behind that knob value
-    on sdpa_fwd_prefill_sm100). A WAIVED config skips before reaching here."""
-    import frost_routing
-    key = "frost:sdpa_fwd_prefill_sm100"
-    assert frost_routing.COUNTS.get(key, 0) > counts_before.get(key, 0), f"FROST did not serve this graph: {frost_routing.COUNTS}"
-    engine, knobs = frost_routing.LAST_PLAN
-    assert engine == "sdpa_fwd_prefill_sm100" and knobs is not None and knobs.cga == 1, f"expected the d128 decode tile (TILE_CGA_M=1), got {engine} {knobs}"
+# The routing gate and the served-engine assertion are the shared
+# _require_frost_sm100() / _exec_sdpa_on_frost(..., cga=1) above: cga=1 pins the
+# d128 DECODE tile behind sdpa_fwd_prefill_sm100's TILE_CGA_M knob.
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=2008), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_fwd_paged_decode_tile_frost_L0(env_info, test_no, request, cudnn_handle):
     """Paged decode / MTP shapes the FROST d128 decode tile serves: s_q in [1, 8]
-    (mostly 1), GQA groups that divide the 128-row tile (4/8/16) and MQA, d in
+    (mostly 1), GQA groups that divide the 128-row tile (4/8/16), one that does
+    not (96/8: G=12 packs 4 -- partial PackGQA -- with three packed heads per KV
+    head) and MQA, d in
     {64, 128} (d64 rides the d128 envelope), page sizes 16..128, no mask /
     bottom-right causal / sliding window. No sink: paged + sink is declined by the
     FROST row today (a separate change). Asserts the decode tile served the graph.
     """
-    _frost_decode_tile_gate()
-    import frost_routing
+    _require_frost_sm100()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -1577,7 +1568,7 @@ def test_sdpa_fwd_paged_decode_tile_frost_L0(env_info, test_no, request, cudnn_h
         batches=RandomBatchSize(min=1, max=32, with_high_probability=[1,8,32]),
         s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=16, s_kv_max=4096, s_q_distribution={"s_q=1":6, "s_q=random":4}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=128, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v":1}, with_high_probability=[(64,64), (128,128)]),
-        head_count=RandomChoice({(64, 4, 4) : 3, (64, 8, 8) : 3, (32, 2, 2) : 2, (16, 1, 1) : 1, (8, 8, 8) : 1}),
+        head_count=RandomChoice({(64, 4, 4) : 3, (64, 8, 8) : 3, (32, 2, 2) : 2, (16, 1, 1) : 1, (8, 8, 8) : 1, (96, 8, 8) : 2}),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=4, left_window_only=2, no_mask=6),
         diag_align=RandomChoice({cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
@@ -1588,17 +1579,15 @@ def test_sdpa_fwd_paged_decode_tile_frost_L0(env_info, test_no, request, cudnn_h
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     # (head_count is a RandomChoice of (h_q, h_k, h_v) triples, not a
-    # RandomHeadGenerator: the decode tile packs a GQA group only when it
-    # divides the 128-row tile, so the groups are 4 / 8 / 16 / MQA / MHA.)
+    # RandomHeadGenerator: every group here rides the decode tile -- 4 / 8 / 16
+    # / MQA / MHA pack whole, 96/8 packs 4 of its 12 heads (s_q * 4 <= 32 rows).)
     test.cfg.is_paged = True
     # Decode / MTP: every batch carries all its s_q query tokens (FlashInfer's contract).
     test.cfg.seq_len_q = [test.cfg.s_q] * test.cfg.batches
     test.cfg.fill_derived_fields()
     test.showConfig(test_no, request)
 
-    before = frost_routing.snapshot()
-    exec_sdpa(test.cfg, request, cudnn_handle)
-    _assert_frost_decode_tile_served(before)
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, cga=1)
 
 
 @pytest.mark.L0
@@ -1609,8 +1598,7 @@ def test_sdpa_fwd_paged_decode_tile_flashinfer_pinned_L0(env_info, request, cudn
     the decode tile was measured on (B200: 117.9 us prefill tile -> decode tile, see
     sm100/decode_d128_f16.py); a git bisect of that number lands here.
     """
-    _frost_decode_tile_gate()
-    import frost_routing
+    _require_frost_sm100()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = ExecConfig(
@@ -1645,9 +1633,7 @@ def test_sdpa_fwd_paged_decode_tile_flashinfer_pinned_L0(env_info, request, cudn
     test.cfg.fill_derived_fields()
     test.showConfig((request.node.name, 1), request)
 
-    before = frost_routing.snapshot()
-    exec_sdpa(test.cfg, request, cudnn_handle)
-    _assert_frost_decode_tile_served(before)
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, cga=1)
 
 
 @pytest.mark.L0
@@ -1665,8 +1651,7 @@ def test_sdpa_fwd_dense_mtp_decode_tile_sink_keyless_rows_frost_L0(env_info, req
     The backend can serve an s_q=4 sink graph too; the routing assertion keeps
     the decode tile the kernel under test.
     """
-    _frost_decode_tile_gate()
-    import frost_routing
+    _require_frost_sm100()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = ExecConfig(
@@ -1701,9 +1686,7 @@ def test_sdpa_fwd_dense_mtp_decode_tile_sink_keyless_rows_frost_L0(env_info, req
     test.cfg.fill_derived_fields()
     test.showConfig((request.node.name, 1), request)
 
-    before = frost_routing.snapshot()
-    exec_sdpa(test.cfg, request, cudnn_handle)
-    _assert_frost_decode_tile_served(before)
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, cga=1)
 
 
 @pytest.mark.L0

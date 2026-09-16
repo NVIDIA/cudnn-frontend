@@ -99,7 +99,7 @@ MMA as d=512.
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ᵇ · ✅ᵍ |
-| **Decode tile** (`S_q · G ≤ 128`, decode + MTP; f16/bf16, dense or paged)ᵈᵗ | ✅ᵈᵗ (d128 envelope) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ❌ (prefill tile) | ❌ (prefill tile) | — |
+| **Decode tile** (`S_q · PACK_G ≤ 128`, decode + MTP; f16/bf16, dense or paged)ᵈᵗ | ✅ᵈᵗ (d128 envelope) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ❌ (prefill tile) | ❌ (prefill tile) | — |
 | Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ (d128 envelope) | ✅ᵖ | ❌ | ✅ᵖ | ❌ | ❌ |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
@@ -109,10 +109,12 @@ pipeline (TILES_Q=2 x TILE_M=128 x CTA_MMA=2 = 512 Q rows per cga2 cluster) and 
 decode tile — TILES_Q=1, one independent CTA per 128-row Q tile, one softmax warpgroup
 (12 warps), the Q/O SMEM slab aliased so the K/V ring is three stages deep, two S/P
 TMEM slots alternating per KV tile so BMM1(i+1) overlaps softmax(i). The heuristics
-propose `TILE_CGA_M=1` exactly when one 128-row tile covers a KV head's live Q rows —
-`S_q * pack_g <= 128` with `pack_g` the candidate's own packing: the group G on the
-packed leg (S_q = 1 decode, MTP S_q in [2, 8]), 1 on the unpacked leg, so where the
-packed leg overflows one tile (`S_q * G > 128 >= S_q`) it keeps the prefill tile while
+propose `TILE_CGA_M=1` exactly when one 128-row tile covers a packed head's live Q rows —
+`S_q * pack_g <= 128` with `pack_g` the candidate's own packing: the packed group
+`p = Cfg.PACK_G` on the packed leg (the whole group G when it divides 128, else its
+largest divisor that does — partial PackGQAᵐ, 96/8 packs 4; S_q = 1 decode, MTP S_q in
+[2, 8]), 1 on the unpacked leg, so where the
+packed leg overflows one tile (`S_q * p > 128 >= S_q`) it keeps the prefill tile while
 the unpacked runner-up rides the decode tile — and keep the prefill tile otherwise; a
 pinned `TILE_CGA_M` is honored either
 way (a pinned 1 on any dense S_q runs the decode tile). Bottom-right causal decode
@@ -124,8 +126,9 @@ by ᵖ) — a keyless row with a sink (above the bottom-right diagonal, or `seq_
 selected for such a row, as the prefill kernels do since PR #1095 (`exp(sink − max)`
 underflows in fp32 for sink ≤ −104, which used to give `O = NaN`, `LSE = −inf`;
 `test_decode_kernel_keyless_rows_sink_magnitude` at −120 / −5 / +3, Stats on / base-2 /
-off, and its graph-path twin pin it) — Stats incl. base-2, PackGQA when the group
-divides 128, KV split + combine, NATURAL
+off, and its graph-path twin pin it) — Stats incl. base-2, PackGQA incl. partial
+packing (ᵐ: `HEADS_PER_TILE = PACK_G`, `G / PACK_G` packed heads per KV head), KV split
++ combine, NATURAL
 / LPT / LPT_L2. **Not on the decode tile: THD** (a ragged graph keeps `TILE_CGA_M=2`; a
 pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
 `cgas={2}`, their other flavors their own width), and the other f16 flavors (d192x128 /
@@ -133,8 +136,9 @@ d256 / d512 have no decode tile yet — their decode graphs run the prefill kern
 before). d64 rides it through the d128 envelope. Measured on B200 (graph path,
 CUDA-graph replay, b=32, d=128, S_kv=4096, page 16, bf16): 64/4 S_q=1 119.2 us on the
 prefill tile → 48.9 us on the decode tile (the cuDNN backend's decode engine: 44 us);
-64/4 MTP S_q=4 127.5 → 50.6 us; 64/8 S_q=1 234.6 → 96.4 us; 96/8 S_q=1 (G=12, unpacked)
-2632 → 767 us; d64 64/8 230.5 → 80.2 us. The kernel docstring carries the full table.
+64/4 MTP S_q=4 127.5 → 50.6 us; 64/8 S_q=1 234.6 → 96.4 us; 96/8 S_q=1 (G=12 packs 4,
+partial PackGQAᵐ on both tiles) 615 → 225 us (the same shape unpacked on the decode tile:
+875 us); d64 64/8 230.5 → 80.2 us. The kernel docstring carries the full table.
 
 ᵖ **Paged KV (issue #920), f16/bf16 only, d128 and d256 flavors** (`d_qk, d_v <= 256`;
 d=64 rides the d128 envelope, d=192/192 the d256 one; mixed dims that would select
@@ -158,7 +162,7 @@ KV-tail padding the split cannot. Not yet: sink, fp8/mxfp8 pools,
 packed (ragged-offset) block tables. Served by the `PAGED_KV` specialization of
 `sm100/prefill_d128_f16.py` / `sm100/prefill_d256_f16.py` (block-table indirection on
 the K/V TMA loads; boxes past a sequence's live pages are TMA-OOB zero-filled) and, for
-decode / MTP shapes on the d128 flavor (`S_q * G <= 128`), of the d128 decode tile
+decode / MTP shapes on the d128 flavor (`S_q * PACK_G <= 128`), of the d128 decode tile
 `sm100/decode_d128_f16.py` (ᵈᵗ).
 
 ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**

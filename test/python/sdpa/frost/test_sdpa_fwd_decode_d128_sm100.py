@@ -7,9 +7,10 @@
 one knob: ``TILE_CGA_M=2`` is the prefill pipeline (512 Q rows per cga2
 cluster) and ``TILE_CGA_M=1`` the decode tile (128 rows per independent CTA,
 one softmax warpgroup, three KV stages).  The heuristics propose cga=1 exactly
-when one 128-row tile covers a KV head's Q rows -- ``S_q * pack_g <= 128`` with
-``pack_g`` the CANDIDATE's own packing (G on the packed leg, 1 on the unpacked
-one): S_q = 1 decode and MTP -- and cga=2 otherwise.
+when one 128-row tile covers a packed head's Q rows -- ``S_q * pack_g <= 128``
+with ``pack_g`` the CANDIDATE's own packing (the packed group ``Cfg.PACK_G`` on
+the packed leg: G, or its largest divisor of 128 under partial PackGQA; 1 on
+the unpacked one): S_q = 1 decode and MTP -- and cga=2 otherwise.
 
 Three tiers:
 
@@ -17,11 +18,14 @@ Three tiers:
   the heuristics' cga and scheduler rules, and the ``mismatch`` gates (a THD
   graph never gets the decode tile).
 - Kernel template, direct: paged pools at every page geometry, mixed lengths
-  incl. 0 and 1, PackGQA on / off / non-dividing group, forced splits with
+  incl. 0 and 1, PackGQA on / off / partial (a group that does not divide the
+  tile packs its largest divisor that does; one sharing no factor with it runs
+  unpacked), forced splits with
   empty ranges, bottom-right causal MTP with per-batch Q lengths (the trim),
   sliding window, sink, base-2 stats, the d64 envelope, the LPT schedulers, and
   the keyless-row sink contract (O := 0, LSE := sink at any sink magnitude).
-- Graph API: decode / MTP shapes select the decode tile, a prefill shape keeps
+- Graph API: decode / MTP shapes select the decode tile (partially packed GQA
+  groups included), a prefill shape keeps
   the prefill tile, a pinned cga=2 on a decode shape is honored, THD declines
   cga=1, dense (non-paged) padded decode, a dense MTP graph whose keyless rows
   carry a sink, a small-batch split, and CUDA-graph replay under
@@ -123,7 +127,11 @@ def _tol(dtype):
 def test_decode_cfg_accepts_the_decode_geometry_and_rejects_the_rest():
     """The config backstop: the tile is cga1 / TILES_Q=1 / one softmax warpgroup /
     three KV stages / 12 warps and fits SMEM; it refuses cga2, THD, fp8 and the
-    MXFP8 experiment axes (each a constraint the engine gates uphold upstream)."""
+    MXFP8 experiment axes (each a constraint the engine gates uphold upstream).
+    PackGQA follows the d128 prefill tile's partial contract: a group that does
+    not divide the tile packs its largest divisor that does (``PACK_G``); one
+    sharing no factor with it is declined (inverted from the whole-group-only
+    pin this tile carried before partial PackGQA landed)."""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
     from cudnn.sdpa.fwd.config_sm100 import CfgD128Decode, TemplateParams, _SM100_MAX_DYN_SMEM, _d128_smem_bytes, cga_tile_m, make_cfg_d128_decode
 
@@ -133,7 +141,7 @@ def test_decode_cfg_accepts_the_decode_geometry_and_rejects_the_rest():
         )
         assert isinstance(cfg, CfgD128Decode)
         assert (cfg.CTA_MMA, cfg.CGA_M, cfg.TILES_Q, cfg.STAGES_KV, cfg.SOFTMAX_WARPGROUPS, cfg.TOTAL_WARPS, cfg.QO_ALIAS) == (1, 1, 1, 3, 1, 12, 1)
-        assert cfg.READ_TILE_ARRIVERS == 11 and cfg.PAGED_KV == 1 and cfg.PAGE_SIZE == 16 and cfg.PACK_GQA == 1
+        assert cfg.READ_TILE_ARRIVERS == 11 and cfg.PAGED_KV == 1 and cfg.PAGE_SIZE == 16 and cfg.PACK_GQA == 1 and cfg.PACK_G == 16
         assert _d128_smem_bytes(cfg) == 224 * 1024 <= _SM100_MAX_DYN_SMEM
         assert (tma.QK_ITERS, tma.VO_ITERS) == (2, 2)
     # cga1 on the d128 flavor IS the decode tile: 128 Q rows per CTA, not the prefill's 512 per cluster.
@@ -144,8 +152,14 @@ def test_decode_cfg_accepts_the_decode_geometry_and_rejects_the_rest():
         make_cfg_d128_decode(TemplateParams(cta_mma=1, thd_varlen=True, seq_kv_lens_present=True))
     with pytest.raises(ValueError, match="f16/bf16"):
         make_cfg_d128_decode(TemplateParams(cta_mma=1, dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_BF16))
-    with pytest.raises(ValueError, match="PackGQA|divide"):
-        make_cfg_d128_decode(TemplateParams(cta_mma=1, pack_gqa=True, qh_per_kh=12))
+    # Partial PackGQA: 96/8 (G=12) packs 4 heads per token row-group, 48/8 (G=6)
+    # packs 2, MQA 256/1 packs a whole 128-row tile; G=3 shares no factor and is declined.
+    for g, pack_g in ((12, 4), (6, 2), (256, 128), (16, 16), (1, 1)):
+        cfg, _ = make_cfg_d128_decode(TemplateParams(cta_mma=1, pack_gqa=True, qh_per_kh=g))
+        assert (cfg.PACK_GQA, cfg.QH_PER_KH, cfg.PACK_G) == (1, g, pack_g), (g, cfg.PACK_G)
+    assert make_cfg_d128_decode(TemplateParams(cta_mma=1, pack_gqa=False, qh_per_kh=12))[0].PACK_G == 1
+    with pytest.raises(ValueError, match="PackGQA|share a factor"):
+        make_cfg_d128_decode(TemplateParams(cta_mma=1, pack_gqa=True, qh_per_kh=3))
 
 
 @pytest.mark.L0
@@ -204,9 +218,20 @@ def test_heuristics_propose_the_decode_tile_for_decode_and_mtp_shapes():
     assert all(p.knobs.cga == 1 for p in mtp)
     assert (mtp[0].knobs.pack_gqa, mtp[0].knobs.sched_policy) == (True, SCHED_NATURAL)
     assert [p.knobs.sched_policy for p in mtp if p.knobs.pack_gqa] == [SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2]
-    # 96/8: G=12 does not divide the tile, so the group runs unpacked -- S_q=8 rows still fit one tile.
+    # 96/8: G=12 does not divide the tile, so the packed leg carries PACK_G=4 heads
+    # per token (partial PackGQA) -- 8 * 4 = 32 rows fit one tile and the packed leg
+    # leads; the unpacked runner-up (8 rows) fits too.  (Before partial PackGQA the
+    # group ran unpacked on the decode tile; inverted, not deleted.)
     glm = _plans(_facts(s_q=8, h_q=96, h_kv=8, causal=True, bottom_right=True))
-    assert all((p.knobs.cga, p.knobs.pack_gqa) == (1, False) for p in glm)
+    assert (glm[0].knobs.cga, glm[0].knobs.pack_gqa) == (1, True), glm[0].knobs
+    assert all(p.knobs.cga == 1 for p in glm) and False in {p.knobs.pack_gqa for p in glm}, [p.knobs for p in glm]
+    # The fit is judged on PACK_G, not G: 96/8 at S_q=33 overflows the packed tile
+    # (33 * 4 = 132 > 128) while 33 unpacked rows fit; at S_q=32 both legs fit.
+    glm33 = _plans(_facts(s_q=33, h_q=96, h_kv=8))
+    assert all(p.knobs.cga == (2 if p.knobs.pack_gqa else 1) for p in glm33), [p.knobs for p in glm33]
+    assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=32, h_q=96, h_kv=8)))
+    # 24/8: G=3 shares no factor with the tile -- unpacked only, decode tile.
+    assert all((p.knobs.cga, p.knobs.pack_gqa) == (1, False) for p in _plans(_facts(h_q=24, h_kv=8)))
     # d64 rides the d128 envelope, decode tile included.
     assert all(p.knobs.cga == 1 for p in _plans(_facts(h_kv=8, d_qk=64, d_v=64)))
     # MHA decode (no group to pack).
@@ -287,8 +312,13 @@ def test_mismatch_admits_cga1_on_dense_d128_and_declines_it_for_thd():
     assert engines.mismatch(caps, _facts(thd=True), engines.SdpaFwdKnobs(cga=2)) is None
     d256 = engines.mismatch(caps, _facts(h_q=32, h_kv=2, d_qk=256, d_v=256), engines.SdpaFwdKnobs(cga=1))
     assert d256 is not None and "outside this engine's domain" in d256
+    # Partial PackGQA rides the decode tile: a pinned cga=1 + PACK_GQA=1 on 96/8
+    # (G=12 packs 4) is honored; on 24/8 (G=3, no common factor) it is declined.
+    assert engines.mismatch(caps, _facts(h_q=96, h_kv=8), engines.SdpaFwdKnobs(cga=1, pack_gqa=True)) is None
+    g3 = engines.mismatch(caps, _facts(h_q=24, h_kv=8), engines.SdpaFwdKnobs(cga=1, pack_gqa=True))
+    assert g3 is not None and "share a factor" in g3, g3
     # Every proposed set re-validates (honored or never listed).
-    for f in (_facts(), _facts(s_q=4, causal=True, bottom_right=True), _facts(thd=True), _facts(s_q=9)):
+    for f in (_facts(), _facts(s_q=4, causal=True, bottom_right=True), _facts(thd=True), _facts(s_q=9), _facts(s_q=8, h_q=96, h_kv=8)):
         for p in _plans(f):
             assert engines.mismatch(caps, f, p.knobs) is None
 
@@ -327,6 +357,7 @@ def _run_kernel(
     d=128,
     paged=True,
     seed=0,
+    expect_pack_g=None,
 ):
     """Drive sm100/decode_d128_f16.py directly (the split-KV suite's idiom).
 
@@ -336,18 +367,21 @@ def _run_kernel(
     is ``True`` for one randn logit per head or a number that pins every head to
     that logit (the underflow regression needs -120, far below anything randn
     draws).  ``has_lse=False`` compiles the Stats store out (unsplit only).
+    ``pack=None`` packs whenever the group shares a factor with the 128-row
+    tile (the partial-PackGQA contract the kernel carries); ``expect_pack_g``
+    pins the config's packed group.
     """
     import cutlass
     import cuda.bindings.driver as cuda_driver
 
     from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
-    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128_decode, pack_gqa_group_size
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     dev = "cuda"
     G = H // KH
     if pack is None:
-        pack = G > 1 and 128 % G == 0
+        pack = pack_gqa_group_size(G, 128, partial=True) > 1
     scale = 1.0 / math.sqrt(d)
     gen = torch.Generator(device=dev).manual_seed(seed + 1)
     q = torch.randn(B, s_q, H, d, device=dev, dtype=torch.float32, generator=gen).to(dtype)
@@ -396,6 +430,9 @@ def _run_kernel(
         qh_per_kh=G if pack else 1,
         **paged_kw,
     )
+    if expect_pack_g is not None:
+        cfg, _ = make_cfg_d128_decode(params)
+        assert cfg.PACK_G == expect_pack_g, f"PACK_G={cfg.PACK_G} for G={G}, expected {expect_pack_g}"
     mod = _load_decode(
         params,
         tag=f"decode_test_{'p' + str(P) if paged else 'dense'}_s{splits}_g{G if pack else 1}_{dtype}_br{int(causal_br)}_w{window_left}_sk{int(has_sink)}_l2{int(stats_log2)}_q{int(q_lens is not None)}_sc{sched}_lse{int(has_lse)}",
@@ -481,11 +518,35 @@ def test_decode_kernel_pack_gqa_groups(group):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "h,kh,pack_g,s_q,splits",
+    [(24, 2, 4, 1, 1), (24, 2, 4, 4, 1), (24, 2, 4, 2, 2), (12, 2, 2, 1, 1), (6, 2, 1, 1, 1), (10, 2, 1, 1, 1), (256, 1, 128, 1, 1)],
+    ids=["g12_packs4", "g12_packs4_mtp4_br", "g12_packs4_mtp2_split2", "g6_packs2", "g3_unpacked", "g5_unpacked", "g256_packs128"],
+)
+def test_decode_kernel_partial_pack_gqa_groups(h, kh, pack_g, s_q, splits):
+    """Partial PackGQA on the decode tile (``CfgD128Decode.PACK_G``, the d128
+    prefill tile's contract): a group that does not divide the 128-row tile packs
+    its largest divisor that does -- G=12 (the GLM 96/8 shape) packs 4 heads per
+    token row-group with three packed heads per KV head, G=6 packs 2 -- while a
+    group sharing no factor with the tile (G=3, G=5) runs unpacked (PACK_G=1), and
+    a group LARGER than the tile (256/1 MQA) packs a whole tile of 128 heads with
+    two packed heads per KV head.  Bottom-right causal MTP keeps the diagonal on
+    QH_PER_KH (the GQA ratio) while the bounds and the KV-head index run on
+    PACK_G; a forced split chunks the PACKED token-span bounds.  Lengths include a
+    1-token sequence.  (Before partial PackGQA this tile ran G=12 unpacked.)"""
+    _run_kernel(
+        2, h, kh, 16, 20, [100, 1] if s_q == 1 else [300, 1], hnd=True, splits=splits, s_q=s_q, causal_br=s_q > 1, expect_pack_g=pack_g, dtype=torch.bfloat16
+    )
+
+
+@pytest.mark.L0
 def test_decode_kernel_unpacked_paths():
-    """PackGQA off on a packable group (the heuristics' runner-up) and a group
-    that does not divide the tile (H/H_kv = 12: the GLM 96/8 shape, served unpacked)."""
+    """PackGQA off on a packable group (the heuristics' runner-up), and off on a
+    partially packable one (H/H_kv = 12: the GLM 96/8 shape, whose packed leg now
+    packs 4 -- see test_decode_kernel_partial_pack_gqa_groups -- and whose
+    unpacked runner-up is this)."""
     _run_kernel(2, 8, 2, 16, 8, [50, 128], hnd=False, splits=1, pack=False)
-    _run_kernel(2, 24, 2, 32, 8, [100, 256], hnd=True, splits=1)  # G=12 -> unpacked by the pack rule
+    _run_kernel(2, 24, 2, 32, 8, [100, 256], hnd=True, splits=1, pack=False, expect_pack_g=1)  # G=12 unpacked runner-up
     # G=16 at S_q=16 unpacked: 16 rows per head in one tile -- the runner-up the
     # heuristics emit for a packed leg that overflows the tile (256 rows).
     _run_kernel(2, 16, 1, 16, 20, [17, 300], hnd=True, splits=1, s_q=16, pack=False, causal_br=True, dtype=torch.bfloat16)
@@ -587,8 +648,11 @@ def test_decode_kernel_d64_envelope():
 @pytest.mark.parametrize("sched", [1, 2], ids=["LPT", "LPT_L2"])
 def test_decode_kernel_lpt_schedulers(sched):
     """The flattened LPT grids decode correctly at cga1 (the heuristics offer
-    them as autotune runners for causal MTP)."""
+    them as autotune runners for causal MTP) -- for a whole-group packing (16/4)
+    and a partial one (24/2: G=12 packs 4, so LPT_L2 groups the three packed
+    heads that read one KV head, a grouping the whole-group case never has)."""
     _run_kernel(3, 16, 4, 16, 30, [400, 77, 129], hnd=True, splits=1, s_q=4, causal_br=True, sched=sched)
+    _run_kernel(3, 24, 2, 16, 30, [400, 77, 129], hnd=True, splits=1, s_q=4, causal_br=True, sched=sched, expect_pack_g=4)
 
 
 @pytest.mark.L0
@@ -697,9 +761,14 @@ def _paged_graph(B, H, KH, d, P, max_pages, lens, hnd, *, s_q=1, causal_br=False
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
 def test_graph_decode_selects_the_decode_tile(hnd):
     """S_q=1 GQA 8:2 over a paged cache: the heuristics' first plan is the
-    decode tile (TILE_CGA_M=1, packed), Stats out, lengths incl. 0 and 1."""
+    decode tile (TILE_CGA_M=1, packed), Stats out, lengths incl. 0 and 1.  The
+    split follows the wave-cost model: b=5 x 2 KV heads underfills the SMs and
+    the declared KV max (70 pages x 16 = 1120, not a 128-multiple) no longer
+    withholds the split since #1092, so the decode tile runs split + combine
+    here (Stats recombined too)."""
     plan = _paged_graph(5, 8, 2, D, 16, 70, [300, 77, 0, 1, 1024], hnd, stats=True)
-    assert (plan.knobs.cga, plan.knobs.pack_gqa, plan.knobs.split_kv) == (1, True, 1), plan.knobs
+    assert (plan.knobs.cga, plan.knobs.pack_gqa) == (1, True), plan.knobs
+    assert plan.knobs.split_kv > 1, plan.knobs
 
 
 @pytest.mark.L0
@@ -709,6 +778,21 @@ def test_graph_mtp_bottom_right_selects_the_decode_tile_natural():
 
     plan = _paged_graph(4, 64, 4, D, 16, 40, [600, 4, 129, 640], hnd=True, s_q=4, causal_br=True, stats=True, dtype=torch.bfloat16)
     assert (plan.knobs.cga, plan.knobs.pack_gqa, plan.knobs.sched_policy) == (1, True, SCHED_NATURAL), plan.knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h,kh,packed", [(96, 8, True), (48, 8, True), (24, 8, False)], ids=["g12_packs4", "g6_packs2", "g3_unpacked"])
+@pytest.mark.parametrize("s_q", [1, 4])
+def test_graph_partial_pack_gqa_selects_the_decode_tile(h, kh, packed, s_q):
+    """GQA groups that do not divide the 128-row tile over a paged cache (the GLM
+    96/8 decode shape): the heuristics' first plan is the decode tile
+    (TILE_CGA_M=1) with partial PackGQA (G=12 packs 4, G=6 packs 2; S_q * PACK_G
+    <= 128 at S_q = 1 and MTP S_q = 4 bottom-right), Stats out; a group sharing
+    no factor with the tile (24/8, G=3) rides the decode tile unpacked.  The
+    reference is per Q head, so a slip in the packed KV-head index
+    (packed head // (G / PACK_G)) or the LSE scatter shows up here."""
+    plan = _paged_graph(4, h, kh, D, 16, -(-1100 // 16), [300, 77, 1, 1100], hnd=True, s_q=s_q, causal_br=s_q > 1, stats=True, dtype=torch.bfloat16)
+    assert (plan.knobs.cga, plan.knobs.pack_gqa) == (1, packed), plan.knobs
 
 
 @pytest.mark.L0

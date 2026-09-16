@@ -425,10 +425,11 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         and 1 in effective_cgas(caps, facts)
         and _d128_decode_tile_fits(caps, facts)
     ):
-        # The d128 decode tile (bottom-right causal MTP, S_q * G <= 128): one
-        # Q tile per (KV head, batch), so every unit walks the same per-batch
-        # KV range and LPT has nothing to balance; LPT_L2's head grouping
-        # groups nothing when the packed head IS the KV head.  Measured on
+        # The d128 decode tile (bottom-right causal MTP, S_q * PACK_G <= 128):
+        # one Q tile per (packed head, batch), so every unit walks the same
+        # per-batch KV range and LPT has nothing to balance; LPT_L2's head
+        # grouping groups nothing when the packed head IS the KV head (only
+        # the G / PACK_G packed heads of a partially packed group).  Measured on
         # B200 (b=32, H=64/4, S_q=4, S_kv=4096, page 16): NATURAL 120.0 us vs
         # LPT_L2 125.4 us on the prefill tile; the decode tile keeps the order.
         primary = SCHED_NATURAL
@@ -595,12 +596,14 @@ def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] =
     """Whether one d128 decode tile covers a KV head's live Q rows.
 
     ``S_q * pack_g <= 128`` with ``pack_g`` the CANDIDATE's own packing:
-    ``pack_gqa=True`` is the packed leg (one unit carries the whole GQA group,
-    ``G`` rows per token), ``False`` the unpacked one (one head, ``S_q`` rows),
+    ``pack_gqa=True`` is the packed leg (one unit carries the packed group
+    ``p = Cfg.PACK_G`` -- the whole GQA group ``G`` when it divides the tile,
+    else its largest divisor that does (partial PackGQA: 96/8 packs 4) --
+    ``p`` rows per token), ``False`` the unpacked one (one head, ``S_q`` rows),
     and ``None`` -- the graph-level question -- reads as the packed leg when
     the row can pack this graph, which is the leg a decode-shaped graph
     proposes first.  The fit is a property of the candidate, not the graph:
-    at ``S_q * G > 128 >= S_q`` the packed leg keeps the prefill tile while
+    at ``S_q * p > 128 >= S_q`` the packed leg keeps the prefill tile while
     the unpacked runner-up rides the decode tile.  Dense only: the decode tile
     has no THD leg.  Measured on B200 (b=32, H=64/4, d128, S_kv=4096, page 16,
     bf16): the prefill tile at cga2 119 us, the decode tile 49 us -- see the
@@ -612,7 +615,9 @@ def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] =
         return False
     if pack_gqa is None:
         pack_gqa = _pack_gqa_eligible(caps, facts, _D128_DECODE_TILE_ROWS)
-    pack_g = (facts.h_q // facts.h_kv) if pack_gqa else 1
+    # The kernel's HEADS_PER_TILE for this leg (1 unpacked): the launch the
+    # split model sees, and the rows one unit really carries.
+    pack_g = _pack_gqa_group(caps, facts, _D128_DECODE_TILE_ROWS, pack_gqa)
     return facts.s_q * pack_g <= _D128_DECODE_TILE_ROWS
 
 

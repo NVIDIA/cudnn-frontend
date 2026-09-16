@@ -17,7 +17,8 @@ This tile, same shapes, graph path, CUDA-graph replay (B200, SM100, 148 SMs):
     64/4  S_q=1, mixed lengths  117.9 us -> 46.6 us
     64/4  S_q=4 MTP bottom-right causal, NATURAL  127.5 us -> 50.6 us
     64/8  S_q=1                 234.6 us -> 96.4 us
-    96/8  S_q=1 (G=12: unpacked, the group does not divide the tile)  2632 us -> 767 us
+    96/8  S_q=1 (G=12 packs 4: partial PackGQA)  615 us -> 225 us  (unpacked on this tile: 875 us)
+    96/8  S_q=4 MTP bottom-right causal (G=12 packs 4)  652 us -> 228 us
     d64 64/8 S_q=1 (d128 envelope)  230.5 us -> 80.2 us
     b=4 64/4 S_q=1 (split-KV 8 by the existing wave model)  61.6 us -> 18.6 us
 
@@ -55,17 +56,22 @@ indirection on the K/V TMA loads, HND and NHD pools, per-batch lengths read on
 device, boxes past the live pages TMA-OOB zero-filled), the padded / causal /
 bottom-right / SWA band masks, the dense padded-Q trim (``SEQ_Q_LENS_PRESENT``),
 the attention sink fold, Stats (natural or base-2), PackGQA (row r <-> token
-r // G, head r % G), KV split with fp32 partials for ``sm100/split_combine.py``,
+r // PACK_G, head r % PACK_G -- the whole group when it divides 128, else its
+largest divisor that does: partial PackGQA, 96/8 packs 4 of its 12 heads and
+three packed heads read one KV head), KV split with fp32 partials for
+``sm100/split_combine.py``,
 and the CLC try_cancel persistent scheduler (NATURAL / LPT / LPT_L2).  THD is
 NOT wired: the decode tile is dense-only (``make_cfg_d128_decode`` rejects it and
 the engine row declines cga=1 for THD graphs).
 
 Selection: the (128, 128) f16/bf16 flavor at ``TILE_CGA_M=1`` IS this tile
 (``api_dsl._load_sm100_kernel_module``); the heuristics propose cga=1 exactly
-when ``S_q * pack_g <= 128`` (``pack_g`` = G for a PackGQA plan, 1 for an
-unpacked one), i.e. when one 128-row tile covers a KV head's live Q rows.  The
-kernel is correct for any S_q -- larger S_q simply launches
-``ceil(S_q * G / 128)`` independent CTAs per head, each walking the KV range.
+when ``S_q * pack_g <= 128`` (``pack_g`` = the packed group ``CFG.PACK_G`` for
+a PackGQA plan -- G, or ``gcd(G, 128)`` under partial PackGQA -- 1 for an
+unpacked one), i.e. when one 128-row tile covers a packed head's live Q rows.
+The kernel is correct for any S_q -- larger S_q simply launches
+``ceil(S_q * PACK_G / 128)`` independent CTAs per packed head, each walking the
+KV range.
 The per-shape ``compile()`` ABI is the prefill kernel's (minus the THD-only
 arguments), so the adapter's dense execute path binds both templates alike.
 """
@@ -185,8 +191,18 @@ _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
 _dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
 
 # === PackGQA ===
-HEADS_PER_TILE = CFG.QH_PER_KH if CFG.PACK_GQA else 1
+#
+# HEADS_PER_TILE = CFG.PACK_G heads share one token row-group of the Q tile
+# (row r <-> token r // PACK_G, head r % PACK_G): the whole GQA group when it
+# divides TILE_M, else its largest divisor that does (partial PackGQA -- 96/8
+# packs 4 of its 12 heads, so the grid's head axis holds QH / 4 packed heads
+# and PACKED_HEADS_PER_KV = 3 of them read the same KV head).  CFG.QH_PER_KH
+# stays the graph's GQA ratio (it drives the bottom-right diagonal).  The
+# bounds helpers take HEADS_PER_TILE (the packed group), never QH_PER_KH --
+# the same mapping as sm100/prefill_d128_f16.py.
+HEADS_PER_TILE = CFG.PACK_G if CFG.PACK_GQA else 1
 TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
+PACKED_HEADS_PER_KV = CFG.QH_PER_KH // HEADS_PER_TILE if CFG.PACK_GQA else 1
 
 # === KV split === (shared mechanics; see prefill_d128_f16.py and _common_blackwell)
 _split_h = make_split_helpers(
@@ -604,9 +620,15 @@ def _tmaldg_warp_group(
         seqlen_kv,
     )
     # GQA: K/V are indexed by kv-head; with PackGQA the decoded head_idx is the
-    # PACKED head (Q head base = head_idx * G) and q_row_base is in TOKEN units.
+    # PACKED head (Q head base = head_idx * PACK_G), the KV head is packed head
+    # // PACKED_HEADS_PER_KV (== head_idx when the whole group packs) and
+    # q_row_base is in TOKEN units (rows // PACK_G).
     q_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE)
-    kv_head_idx = cute.arch.make_warp_uniform(head_idx if cutlass.const_expr(CFG.PACK_GQA) else head_idx // qh_per_kh)
+    kv_head_idx = cute.arch.make_warp_uniform(
+        (head_idx if cutlass.const_expr(PACKED_HEADS_PER_KV == 1) else head_idx // cutlass.Int32(PACKED_HEADS_PER_KV))
+        if cutlass.const_expr(CFG.PACK_GQA)
+        else head_idx // qh_per_kh
+    )
     q_row_base = cute.arch.make_warp_uniform(q_super_idx * cutlass.Int32(TOKENS_PER_TILE))
 
     if cutlass.const_expr(CFG.MASK_FLAGS == 0 and SPLIT_KV == 1):
@@ -617,7 +639,7 @@ def _tmaldg_warp_group(
     else:
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
         eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
-        bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
+        bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, HEADS_PER_TILE)
         kv_left = bounds_init.left
         kv_right = bounds_init.right
 
@@ -724,7 +746,11 @@ def _tmaldg_warp_group(
             seqlen_kv,
         )
         q_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE)
-        kv_head_idx = cute.arch.make_warp_uniform(head_idx if cutlass.const_expr(CFG.PACK_GQA) else head_idx // qh_per_kh)
+        kv_head_idx = cute.arch.make_warp_uniform(
+            (head_idx if cutlass.const_expr(PACKED_HEADS_PER_KV == 1) else head_idx // cutlass.Int32(PACKED_HEADS_PER_KV))
+            if cutlass.const_expr(CFG.PACK_GQA)
+            else head_idx // qh_per_kh
+        )
         q_row_base = cute.arch.make_warp_uniform(q_super_idx * cutlass.Int32(TOKENS_PER_TILE))
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -733,7 +759,7 @@ def _tmaldg_warp_group(
         elif cutlass.const_expr(CFG.MASK_FLAGS != 0):
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
             eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
-            bounds_next = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
+            bounds_next = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, HEADS_PER_TILE)
             kv_left = bounds_next.left
             kv_right = bounds_next.right
             if cutlass.const_expr(PAGED_KV):
@@ -986,7 +1012,7 @@ def _mma_warp_group(
         else:
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
             eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
-            bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
+            bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, HEADS_PER_TILE)
             kv_left = bounds_init.left
             kv_right = bounds_init.right
 
@@ -1100,7 +1126,7 @@ def _mma_warp_group(
                 eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
                 eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
                 bounds_next = _bounds_for_tile_split(
-                    q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH
+                    q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, HEADS_PER_TILE
                 )
                 kv_left = bounds_next.left
                 kv_right = bounds_next.right
@@ -1327,7 +1353,7 @@ def _softmax_warp_group(
 
     eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
     eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
-    bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
+    bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, HEADS_PER_TILE)
 
     tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(CFG.SOFTMAX_WG0_BASE * 32)
 
@@ -1454,7 +1480,7 @@ def _softmax_warp_group(
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
         eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
-        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
+        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, HEADS_PER_TILE)
 
 
 @cute.jit
@@ -1520,7 +1546,7 @@ def _correction_warp_group(
 
     eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
     eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
-    bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
+    bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, HEADS_PER_TILE)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -1737,7 +1763,7 @@ def _correction_warp_group(
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
         eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
-        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
+        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, HEADS_PER_TILE)
 
     bars.mb_tmem_dealloc.arrive()
 
@@ -1839,7 +1865,7 @@ def _host(
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
 
-    # One CTA covers TILE_M Q rows (SQ*G packed rows per packed head, QH/G packed heads).
+    # One CTA covers TILE_M Q rows (SQ*PACK_G packed rows per packed head, QH/PACK_G packed heads).
     rows_per_cluster = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
     q_supers = (SQ * HEADS_PER_TILE + rows_per_cluster - 1) // rows_per_cluster
     # KV split rides the BATCH axis: z = batch + split*B (decoded as b % B, b // B).

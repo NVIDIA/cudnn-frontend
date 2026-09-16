@@ -863,8 +863,10 @@ def _sm100_spec() -> EngineSpec:
             # three KV stages; config_sm100.CfgD128Decode), which the lowering
             # selects for that knob value on dense graphs (THD keeps cga2, see
             # mismatch).  The heuristics propose it when one 128-row tile
-            # covers a KV head's Q rows (S_q * pack_g <= 128, pack_g the
-            # candidate's own packing: G packed, 1 unpacked): decode and MTP.
+            # covers a packed head's Q rows (S_q * pack_g <= 128, pack_g the
+            # candidate's own packing: the packed group Cfg.PACK_G -- G, or its
+            # largest divisor of 128 under partial PackGQA -- 1 unpacked):
+            # decode and MTP.
             # A split rides either width (no split_cgas entry).
             cgas_by_d_shape=(((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2}))),
             split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
