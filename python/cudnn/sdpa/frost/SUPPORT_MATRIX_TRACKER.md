@@ -228,8 +228,9 @@ FlashInfer-style wrapper produces today — stays on the backend engine; the pag
 capability is reachable only by omitting it. Masks validated over FP8 pools: a causal
 upper bound top-left or bottom-right (MTP `S_q <= 8`, each batch's diagonal anchored
 at its own KV length, rows left without a key write O := 0 / LSE := -inf) and a left
-sliding window (`test_sdpa_fwd_paged_sm100.py` fp8 causal / sliding-window tests and
-the `test_sdpa_fp8_fwd_paged_decode_frost_L0` fuzz). Not yet: MXFP8 pools (the F8_128x4
+sliding window (`test_sdpa_fwd_paged_sm100.py` fp8 causal / sliding-window tests, pinned
+on the FROST plan, and the `test_mhas_v2.py` fp8 paged decode fuzz, which draws the same
+masks over the default walk and asserts the row served every draw). Not yet: MXFP8 pools (the F8_128x4
 block-scale atoms bundle 128 rows of one head and cannot be assembled from sub-tile
 pages), packed (ragged-offset) block tables, the d512 flavor, the SM107 (Rubin)
 siblings, sink + KV split (a sink graph runs unsplit — see ˢ), sink and block-scaled O
@@ -255,20 +256,29 @@ splits, sink at `S_q` 1 / 4 with the bottom-right causal diagonal;
 `test_sdpa_fwd_paged_mla_frost_L0` (decode- and prefill-shaped fuzz, FROST serves every
 draw) and the pinned `test_sdpa_fwd_paged_d192x128_decode_frost_L0` /
 `test_sdpa_fwd_paged_d192x128_prefill_frost_L0` /
-`test_sdpa_fwd_paged_envelope_decode_frost_L0`). **Decode-shaped paged FP8 is served and measured behind the backend's decode
-engine (B200 / SM100, cuDNN 9.26, B=32, S_q=1, S_kv=4096 mixed per-batch lengths, page
-16, e4m3 pools, bf16 O):** under the opt-in the FROST row leads for every graph it
-accepts, and the d128 paged FP8 kernel is a prefill tile (one 128-row Q tile per batch
-and KV head; there is no quantized decode tile), so decode-shaped graphs pay for it. Both
-numbers below come from a probe that omits `Amax_S` (with it declared, FROST declines and
-the 64/4 graph still fails to build on the backend). FP8 64/4 heads (PackGQA, 16 live rows
-per tile) is a capability win: the backend engine fails to build that graph (runtime
-kernel compilation failure) and FROST serves it at 120-170 us (run-to-run spread on a
-shared GPU). FP8 96/8 heads (group 12 does not divide the tile, PackGQA off, one live row
-per tile) runs 1660-2070 us on FROST against 68 us on the backend engine. The gap is closed by a
-kernel — an fp8 d128 decode tile, the quantized twin of ᵈᵗ (see the gaps table) — not by
-an ordering rule; a caller that needs the backend plan for such a shape today deselects
-the FROST row by engine name (`graph.deselect_engines([...])`).
+`test_sdpa_fwd_paged_envelope_decode_frost_L0`). **Decode-shaped paged FP8 is served — FROST-first under the opt-in — and measured
+behind the backend's decode engine (B200 / SM100, cuDNN 9.26, B=32, S_q=1, S_kv=4096
+mixed per-batch lengths, page 16, e4m3 pools, bf16 O; probe omitting `Amax_S` — with it
+declared FROST declines and the 64/4 graph still fails to build on the backend):** the
+FROST row leads for every graph it accepts, and the d128 paged FP8 kernel is a prefill
+tile (one 128-row Q tile per batch and KV head; there is no quantized decode tile), so
+decode-shaped graphs pay for it. FP8 64/4 heads (PackGQA, 16 live rows per tile) is a
+capability win: the backend engine accepts that graph at plan time and fails to build it
+(`cudnnFinalize`: runtime kernel compilation failure — at B=32 with no Stats output; a
+batch of 2 or a Stats output builds), and FROST serves it at 137-161 us. FP8 96/8 heads
+(group 12 does not divide the tile, PackGQA off, one live row per tile) runs 807 us on
+FROST against 54.9 us on the backend engine. A prefill-shaped paged FP8 graph can pay
+too: B=4, 16/4 heads, d128, S_q=64, page 16, max KV 2048, e4m3 Q/K/V, bf16 O defaults to
+the FROST `PACK_GQA=1` / `SPLIT_KV=2` plan at 50.0 us GPU (186-189 us CPU enqueue) against
+the backend engine's 28.7 us (15-16 us) — 148-SM SM100, cuDNN 9.25.1, CuTe DSL 4.8,
+independent review measurement; on B200 / cuDNN 9.26 (this lane's probe, same kernel
+bytes) the same chunked-prefill graph measured 204.7 us on FROST vs 30.4 us on the
+backend engine at `S_q=64`, 200.5 vs 30.7 us at `S_q=128`, 135.6 vs 31.9 us at
+`S_q=512`, and 96/8 `S_q=9` 808 vs 369 us. Both gaps are closed by kernels — an fp8 d128 decode tile,
+the quantized twin of ᵈᵗ, and the prefill tile's own short-`S_q` tuning — not by a
+backend-relative ordering rule, which encodes a performance snapshot that goes stale
+(gaps table); a caller that needs the backend plan for such a shape today deselects the
+FROST row by engine name (`graph.deselect_engines([...])`).
 
 ˢ **Attention sink at `S_q == 1` (decode), incl. paged KV and sliding window.**
 Served natively by this row: the sink is a per-Q-row epilogue fold (`max(m, sink)`
@@ -1009,7 +1019,8 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | PackGQA of a group sharing no factor with the 128-row tile (G = 3, 5, 7, …), and partial packing outside the SM100/SM103 f16/bf16 d128 / d256 kernels | every arch — such groups run unpacked (see ᵐ); the d192×d128 / d512 f16 and the fp8 / mxfp8 kernels pack the whole group only |
 | Attention sink + split-KV (sink-aware `split_combine`) | every arch — a sink graph runs unsplit; at `S_q == 1` over a long KV that is one cluster per (batch, KV head) (see ˢ) |
 | Attention sink at `S_q == 1` validated | every row except SM100/SM103 f16/bf16 (see ˢ): SM107 f16/bf16 and SM120 f16/bf16 accept it since the validator lift (f16/bf16 `sdpa()` graphs only) but are ❔; the FP8 / MXFP8 rows were never gated by that rule and stay ❔ as before |
-| Paged FP8 decode on a decode tile: the d128 paged FP8 kernel is a prefill tile (one 128-row Q tile per batch and KV head), so a decode-shaped (`S_q <= 8`) paged FP8 graph whose GQA group does not divide the tile runs one live row per tile — 96/8 heads 1660-2070 us on FROST vs 68 us on the backend engine (B200, measured under ᵖ) — while the FROST row leads under the opt-in; follow-up: an fp8 d128 decode tile (the quantized twin of ᵈᵗ) | SM100, SM103 — per-tensor FP8 paged d128 |
+| Paged FP8 decode tile: the d128 paged FP8 kernel is a prefill tile (one 128-row Q tile per batch and KV head), so a decode-shaped (`S_q <= 8`) paged FP8 graph runs it FROST-first under the opt-in — fp8 d128 paged decode, S_q=1, B=32, 96/8 heads (group 12 does not divide the tile, PackGQA off, one live row per tile), B200: prefill tile 807 us vs the backend engine 54.9 us (ᵖ); follow-up: an fp8 d128 decode tile (the quantized twin of ᵈᵗ) | SM100, SM103 — per-tensor FP8 paged d128 |
+| Paged FP8 short-`S_q` prefill: an S_q=64 fp8 paged prefill graph (B=4, 16/4 heads, d128, page 16, max KV 2048, e4m3, bf16 O) defaults to the FROST `PACK_GQA=1` / `SPLIT_KV=2` plan at 50.0 us GPU / 186-189 us CPU enqueue against the backend engine's 28.7 us / 15-16 us (148-SM SM100, cuDNN 9.25.1, independent review measurement; B200 / cuDNN 9.26: 204.7 vs 30.4 us at S_q=64, 135.6 vs 31.9 us at S_q=512, ᵖ); follow-up: the prefill tile's tile / split heuristics for short-`S_q` paged fp8 and the fp8 d128 decode tile's MTP reach | SM100, SM103 — per-tensor FP8 paged d128 |
 
 ᵏ **THD / ragged forward layout.** Q/K/V/O must be BSHD-ordered over **(H, S, D)**
 only — head dim innermost, then heads, then tokens (`graph_analyzer.packed_layout_ok`).

@@ -877,7 +877,10 @@ def _tmaldg_warp_group(
     kv_state = PipelineState.start(phase=1)
 
     tma_q = GmemTileTma(tma_q_desc)
-    if cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
+    # Unlike the f16 kernels, THD here implies dense K/V: PAGED_KV with
+    # THD_VARLEN is refused at module scope (the FP8 THD leg clamps runtime
+    # K/V descriptors to a packed total), so no ``and not PAGED_KV`` is needed.
+    if cutlass.const_expr(CFG.THD_VARLEN):
         # THD: K/V ride the setup kernel's RUNTIME descriptors (o_desc_words
         # slots n_batch+1 / n_batch+2), whose seq extent is clamped to the
         # packed KV total cu_k[B]. The last sequence's tile steps past that

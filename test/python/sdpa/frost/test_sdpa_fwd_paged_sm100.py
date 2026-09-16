@@ -1048,7 +1048,8 @@ def _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, seed=0):
     (k_pool, v_pool, k_container, v_container, block_table[B, 1, max_pages, 1], dk, dv);
     the pools keep their storage layout, the containers are the graph's
     [num_pages, H_kv, page_size, D]-dim views.  Every pool page outside the live
-    ranges of ``lens`` is NaN-filled (see the section note)."""
+    ranges of ``lens`` is NaN-filled (see the section note): the FROST kernel promises
+    a TMA-OOB page -1 for every dead table slot, so a dereferenced dead slot poisons O."""
     torch.manual_seed(seed)
     dev = "cuda"
     num_pages = B * max_pages + 5
@@ -1153,10 +1154,15 @@ def _run_graph_fp8(
     want_split=None,
     causal=None,
     window_left=None,
+    pin=True,
+    return_graph=False,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
-    Both are the sdpa_fp8 band spelling FlashInfer's MTP / SWA decode would use."""
+    Both are the sdpa_fp8 band spelling FlashInfer's MTP / SWA decode would use.
+    ``pin``: the default pins the FROST fp8 engine's first plan (select_engine); ``False``
+    leaves the heuristics' own ranking to the build walk (the default-walk tests below
+    assert the row ranked first and served). ``return_graph`` adds the graph to the return value."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
@@ -1221,15 +1227,16 @@ def _run_graph_fp8(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name(fp8=True))
+    if pin:
+        select_engine(g, engine_name(fp8=True))
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
         idx = next((i for i, n in enumerate(names) if n.startswith(engine_name(fp8=True)) and g.plans[i].knobs.split_kv == want_split), None)
         assert idx is not None, f"no {engine_name(fp8=True)} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
-        plan = g.plans[idx]
     g.check_support()
     g.build_plans()
+    plan = g.plans[g._plan_index]  # the entry that built: the pin, or the walk's first success
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     vp = {
         q: q_gpu,
@@ -1297,7 +1304,7 @@ def _run_graph_fp8(
         torch.testing.assert_close(got_lse[live], ref_lse[live], atol=5e-3, rtol=0)
         if (~live).any():
             assert torch.isinf(got_lse[~live]).all() and (got_lse[~live] < 0).all(), "empty sequence must write LSE := -inf"
-    return plan
+    return (plan, g) if return_graph else plan
 
 
 @pytest.mark.L0
@@ -1370,6 +1377,59 @@ def test_paged_graph_fp8_sliding_window(s_q):
 @pytest.mark.L0
 def test_paged_graph_fp8_declared_max_seq_len_below_table_reach():
     _run_graph_fp8(2, 8, 2, D, 16, 20, [300, 77], hnd=False, max_seq_len=300)
+
+
+# --- the default walk: FROST-first on every paged fp8 graph the row accepts --------
+#
+# FROST engines are opt-in; under the opt-in a row's proposal leads the plan list for
+# every graph it serves and the walk builds it -- decode-shaped or prefill-shaped.
+# Every other fp8 test in this file pins the plan (select_engine); these leave the
+# ranking to the heuristics and assert the row ranked first and served the graph: the
+# routing a FlashInfer-shaped caller gets.  The measured gap to the backend's decode
+# engine at decode shapes is a kernel follow-up (SUPPORT_MATRIX_TRACKER.md gaps table:
+# fp8 d128 decode tile), not an ordering rule.
+
+
+def _plan_names(g):
+    return [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+
+
+def _is_frost_fp8(g, index) -> bool:
+    from cudnn.sdpa.fwd.engines import engine_name
+    from frost_test_utils import _is_plan_for
+
+    return _is_plan_for(g.get_plan_name_at_index(index), engine_name(fp8=True))
+
+
+def _assert_frost_fp8_led_and_served(g):
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    names = _plan_names(g)
+    assert _is_frost_fp8(g, 0), names
+    assert g.selected_engine is not None and g.selected_engine.name == engine_name(fp8=True), names
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [1, 8, 9, 128], ids=["decode", "mtp", "past_mtp", "chunked_prefill"])
+def test_paged_graph_fp8_default_walk_lands_on_frost(s_q):
+    """Unpinned: the fp8 row's proposal ranks first and the walk builds it at every
+    S_q -- decode, MTP and prefill-shaped alike -- and O / LSE / Amax_O match the fp8
+    reference over NaN-filled dead pages (so the row, not the backend, served it)."""
+    _, g = _run_graph_fp8(2, 8, 2, D, 16, 8, [128, 77], hnd=False, s_q=s_q, pin=False, return_graph=True)
+    _assert_frost_fp8_led_and_served(g)
+
+
+@pytest.mark.L0
+def test_paged_graph_fp8_flashinfer_shaped_decode_default_walk():
+    """The FlashInfer-shaped fp8 decode graph with real data over the default walk: B=32,
+    64/4 heads (PackGQA), d128, S_q=1, e4m3 pools, bf16 O, NO Stats, empty and one-token
+    sequences included -- FROST ranks first and serves it.  This is the row's capability
+    win: cuDNN 9.26's backend engine accepts the graph at plan time and fails to build it
+    (cudnnFinalize: runtime kernel compilation failure at B=32 without a Stats output;
+    B=2 or a Stats output builds), so before this row the graph had no engine at all."""
+    lens = [128, 1, 0, 17, 16, 15, 100, 127, 64, 33, 7, 8, 9, 77, 2, 3, 128, 120, 65, 63, 31, 32, 48, 96, 5, 1, 0, 128, 99, 50, 111, 4]
+    _, g = _run_graph_fp8(32, 64, 4, D, 16, 8, lens, hnd=False, out_dt=torch.bfloat16, stats=False, pin=False, return_graph=True)
+    _assert_frost_fp8_led_and_served(g)
 
 
 def _build_fp8_paged_graph(P, *, d=D, H=8, KH=2, hnd=False, thd=False, mask_kw=None):
