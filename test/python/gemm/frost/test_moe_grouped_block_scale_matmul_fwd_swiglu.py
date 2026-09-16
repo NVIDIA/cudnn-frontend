@@ -39,7 +39,9 @@ def _vp_moe_bs_mg(compiled, gemm_pairs, fto, outs, *aux):
     """MoE block-scale multi-GEMM variant-pack dict. Each pair is
     ((token, sfa), (weight, sfb)); dedup by packed-data identity into distinct
     A/B slots, + first_token_offset + outputs + aux."""
-    bd = compiled.binding
+    from gemm_test_utils import graph_binding
+
+    bd = graph_binding(compiled)
     a_seen, b_seen, sfa_seen, sfb_seen = [], [], [], []
     for (ag, sfag), (bg, sfbg) in gemm_pairs:
         if not any(ag is x for x in a_seen):

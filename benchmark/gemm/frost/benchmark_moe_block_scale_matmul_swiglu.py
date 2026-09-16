@@ -238,7 +238,7 @@ def _build_spec_map():
     block-scale strategies. Dual TMEM fits two accs + SF only at cta_tile_n<=128."""
     chain = analyze(_graph_swiglu(1024, 256, 512, 2, "nvfp4")[0])
     m = {}
-    for t, cfg in _registry_candidates(chain):
+    for t, cfg in _registry_candidates(chain, sweep_swap_ab=True):
         if cfg.pipeline != "sm100" or cfg.cta_tile_n > 128 or cfg.mma_tile_m != 128:
             continue
         label = cfg.name

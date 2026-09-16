@@ -11,6 +11,8 @@ import pathlib
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import cutlass
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -34,7 +36,9 @@ pytestmark = pytest.mark.L0
 
 def _vp_moe(compiled, token, weight, fto, output):
     """MoE single-GEMM variant-pack dict from the binding."""
-    bd = compiled.binding
+    from gemm_test_utils import graph_binding
+
+    bd = graph_binding(compiled)
     outs = list(output) if isinstance(output, (list, tuple)) else [output]
     vp = {
         bd.a_operands[0]: token,
@@ -376,8 +380,10 @@ def _group_reduction_ref(
     group_count, _, n = out_dims
     starts = offsets.tolist()
     out = torch.empty(out_dims, dtype=out_dtype, device=x.device)
-    if mode in (cudnn.reduction_mode.ADD, cudnn.reduction_mode.AMAX):
+    if mode in (cudnn.reduction_mode.ADD, cudnn.reduction_mode.AMAX, cudnn.reduction_mode.NORM1, cudnn.reduction_mode.AVG):
         out.fill_(0)
+    elif mode in (cudnn.reduction_mode.MUL, cudnn.reduction_mode.MUL_NO_ZEROS):
+        out.fill_(1)
     elif mode == cudnn.reduction_mode.MAX:
         out.fill_(-(2**31) if out_dtype == torch.int32 else -float("inf"))
     elif mode == cudnn.reduction_mode.MIN:
@@ -395,6 +401,8 @@ def _group_reduction_ref(
             out[g, 0, 0] = _reduction_ref(src, mode, reduce_dims)
         elif out_dims[1:] == (1, x.shape[1]):
             out[g, 0, :n] = _reduction_ref(src, mode, (0,)).view(-1)
+        elif out_dims[1:] == (x.shape[0], 1):
+            out[g, begin:end, 0] = _reduction_ref(src, mode, (1,)).view(-1)
         else:
             raise AssertionError(f"unsupported group reduction dims {out_dims}")
     return out
@@ -895,8 +903,8 @@ def _run_moe_reduction(
     torch.testing.assert_close(
         red,
         red_ref,
-        atol=1e-1 if red_torch_dt == torch.float32 else 0,
-        rtol=1e-2 if red_torch_dt == torch.float32 else 0,
+        atol=1e-4 if mode == cudnn.reduction_mode.AVG else 1e-1 if red_torch_dt == torch.float32 else 0,
+        rtol=1e-5 if mode == cudnn.reduction_mode.AVG else 1e-2 if red_torch_dt == torch.float32 else 0,
     )
 
 
@@ -1102,7 +1110,9 @@ def test_moe_int8(cta_group):
     b = torch.randint(-8, 8, (E, N, K), dtype=torch.int8, device="cuda")
     fto_t = torch.tensor([0, 128, 200, 384], dtype=torch.int32, device="cuda")
     outb = torch.zeros(1, S, N, dtype=torch.bfloat16, device="cuda")
-    bd = compiled.binding
+    from gemm_test_utils import graph_binding
+
+    bd = graph_binding(compiled)
     compiled({bd.a_operands[0]: a, bd.b_operands[0]: b, bd.first_token_offset: fto_t, bd.outputs[0]: outb})
     torch.cuda.synchronize()
 
@@ -1353,7 +1363,7 @@ def test_moe_grouped_matmul_fwd_nonpacked_tensors_sm120(mode) -> None:
 
 
 @requires_sm120
-@pytest.mark.parametrize("mode", [cudnn.reduction_mode.ADD, cudnn.reduction_mode.AMAX], ids=["add", "amax"])
+@pytest.mark.parametrize("mode", [cudnn.reduction_mode.ADD, cudnn.reduction_mode.AMAX, cudnn.reduction_mode.AVG], ids=["add", "amax", "avg"])
 def test_moe_grouped_matmul_fwd_reduction_scalar_fp32_sm120(mode) -> None:
     """The fused reduction epilogue is the shared codegen; on sm120 it rides the STG drain."""
     _run_moe_reduction(_SM120_CFG, None, mode, [1, 1, 1])
@@ -1417,7 +1427,9 @@ def test_moe_int8_sm120():
     b = torch.randint(-8, 8, (E, N, K), dtype=torch.int8, device="cuda")
     fto_t = torch.tensor([0, 128, 200, 384], dtype=torch.int32, device="cuda")
     outb = torch.zeros(1, S, N, dtype=torch.bfloat16, device="cuda")
-    bd = compiled.binding
+    from gemm_test_utils import graph_binding
+
+    bd = graph_binding(compiled)
     compiled({bd.a_operands[0]: a, bd.b_operands[0]: b, bd.first_token_offset: fto_t, bd.outputs[0]: outb})
     torch.cuda.synchronize()
 
@@ -1428,3 +1440,745 @@ def test_moe_int8_sm120():
         if hi > lo:
             ref[0, lo:hi] = a[0, lo:hi].float() @ b[gi].float().t()
     torch.testing.assert_close(outb, ref.to(torch.bfloat16), atol=0.0, rtol=0.0)
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "cta_group,cta_n,mma_m,cta_m,cluster",
+    [
+        (1, 32, 128, 128, "1x1"),
+        (2, 32, 128, 128, "2x1"),
+        (1, 64, 64, 64, "1x1"),
+        (2, 64, 64, 64, "2x1"),
+        (1, 40, 128, 128, "2x2"),
+        (2, 96, 128, 256, "4x2"),
+    ],
+)
+@pytest.mark.parametrize("major,aligned,force_stg", [("n", False, False), ("m", False, False), ("m", True, False), ("n", False, True)])
+def test_moe_swap_ab_plain(cta_group, cta_n, mma_m, cta_m, cluster, major, aligned, force_stg):
+    from dataclasses import replace
+    from contextlib import nullcontext
+    from cudnn.gemm.frost import fusion_ir
+    from cudnn.gemm.frost.sm100 import compiler as C
+
+    torch.manual_seed(17)
+    E, S, N, K = 2, (264 if aligned else 263), 272, 136
+    starts = [0, 8, 8, 32, 128] if aligned else [0, 3, 3, 35, 129]
+    g = _build_graph(E, S, N, K, num_groups=len(starts), weight_major="n", offset_dt=cudnn.data_type.INT64)
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+
+    _, binding = analyze_with_binding(g)
+    out = binding.outputs[0]
+    fto = binding.first_token_offset
+    fto.set_alignment_value(8 if aligned else 1)
+    ld = ((S if major == "m" else N) + 7) // 8 * 8
+    out.set_dim([1, S, N]).set_stride([N * ld, 1, ld] if major == "m" else [S * ld, ld, 1])
+    before = analyze(g)
+    cfg = replace(by_name(f"CONFIG_sm100_{cta_m}x{cta_n}x128_{mma_m}x{cta_n}x32_cluster{cluster}"), cta_group=cta_group)
+
+    with C.force_stg_epi() if force_stg else nullcontext():
+        compiled = C.jit_from_cudnn_graph(g, config=replace(cfg, swap_ab=True))
+    assert compiled.chain == fusion_ir.swap_ab(before)
+    assert analyze(g) == before
+    assert "sm100_moe_grouped_matmul_fwd_swap_ab" in compiled.generated_path.read_text()
+    assert compiled.store_modes == (("stg",) if force_stg or (major == "m" and not aligned) else ("tma",))
+    token = torch.randn(1, S, K, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(E, K, N, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    offsets = torch.tensor(starts, device="cuda", dtype=torch.int64)
+    size = ld * (N if major == "m" else S)
+    raw = torch.full((size + 2048,), -123, device="cuda", dtype=torch.bfloat16)
+    output = raw[:size].view(1, N, ld).transpose(1, 2)[:, :S] if major == "m" else raw[:size].view(1, S, ld)[:, :, :N]
+    for _ in range(2):
+        compiled(_vp_moe(compiled, token, weight, offsets, output))
+    torch.cuda.synchronize()
+    ref = _ref_f32(token, weight, offsets, S, N, E)
+    torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=0.125, rtol=0.01)
+    assert (raw[size:] == -123).all()
+    if major == "m":
+        assert (raw[:size].view(N, ld)[:, S:] == -123).all()
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "a_dt,b_dt,cta_group,cta_n,mma_k,S,N,starts,alignment,major,global_desc",
+    [
+        ("HALF", "HALF", 1, 32, 32, 1, 1, [0, 0], 1, "n", False),
+        ("BFLOAT16", "BFLOAT16", 2, 64, 32, 256, 256, [0, 64, 64, 128], 64, "m", True),
+        ("BFLOAT16", "BFLOAT16", 2, 64, 32, 248, 256, [0, 64, 64, 128], 64, "m", False),
+        ("FP8_E4M3", "FP8_E5M2", 1, 40, 32, 173, 19, [0, 3, 3, 99], 1, "n", False),
+        ("FP8_E5M2", "FP8_E4M3", 2, 32, 32, 173, 256, [0, 3, 3, 99], 1, "m", False),
+        ("FP8_E4M3", "FP8_E5M2", 2, 64, 64, 256, 256, [0, 64, 64, 128], 64, "m", True),
+    ],
+)
+def test_moe_swap_ab_plain_dtypes(a_dt, b_dt, cta_group, cta_n, mma_k, S, N, starts, alignment, major, global_desc):
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.sm100 import compiler as C
+
+    if mma_k == 64 and not 107 <= C._current_arch() < 110:
+        pytest.skip("plain FP8 K64 requires SM10.7–10.9")
+    E, K = 2, 144
+    g = _build_graph(E, S, N, K, num_groups=len(starts), output_dt=cudnn.data_type.FLOAT)
+    _, binding = analyze_with_binding(g)
+    binding.a_operands[0].set_data_type(getattr(cudnn.data_type, a_dt))
+    binding.b_operands[0].set_data_type(getattr(cudnn.data_type, b_dt))
+    binding.first_token_offset.set_alignment_value(alignment)
+    ld = ((S if major == "m" else N) + 3) // 4 * 4
+    binding.outputs[0].set_stride([N * ld, 1, ld] if major == "m" else [S * ld, ld, 1])
+    cfg = by_name(f"CONFIG_sm100_128x{cta_n}x128_128x{cta_n}x{mma_k}_cluster{cta_group}x1_{cta_group}ctamma")
+    compiled = C.jit_from_cudnn_graph(g, config=replace(cfg, swap_ab=True))
+    from cudnn.gemm.frost.sm100.compiler import _moe_aligned_offsets as aligned_offsets
+
+    assert aligned_offsets(compiled.chain, cfg) is global_desc
+    types = {"HALF": torch.float16, "BFLOAT16": torch.bfloat16, "FP8_E4M3": torch.float8_e4m3fn, "FP8_E5M2": torch.float8_e5m2}
+    token = torch.randint(-3, 4, (1, S, K), device="cuda").to(types[a_dt])
+    weight = torch.randint(-3, 4, (E, N, K), device="cuda").to(types[b_dt])
+    output = torch.empty_strided((1, S, N), (N * ld, 1, ld) if major == "m" else (S * ld, ld, 1), device="cuda", dtype=torch.float32)
+    offsets = torch.tensor(starts, device="cuda", dtype=torch.int32)
+    compiled(_vp_moe(compiled, token, weight, offsets, output))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output[0], _ref_f32(token, weight, offsets, S, N, E), atol=0, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize("cta_group", [1, 2])
+def test_moe_swap_ab_plain_swiglu(cta_group, monkeypatch):
+    from functools import partial
+    import test_moe_grouped_matmul_fwd_swiglu as cases
+
+    monkeypatch.setattr(cases, "_plan", partial(_plan, swap_ab=True))
+    from test_moe_grouped_matmul_fwd_swiglu import test_dual_moe_grouped_matmul_fwd_swiglu_exact_case
+
+    cfg = f"CONFIG_sm100_128x32x128_128x32x32_cluster{cta_group}x1_{cta_group}ctamma"
+    test_dual_moe_grouped_matmul_fwd_swiglu_exact_case(cfg, cta_group)
+
+
+@requires_sm100
+@pytest.mark.parametrize("aligned", (False, True))
+def test_moe_swap_ab_plain_graph_coordinates_and_public_replay(aligned):
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.gemm.frost.knobs import GemmKnobs
+
+    S, N, K, G, E = (256 if aligned else 173), (256 if aligned else 136), 128, 4, 2
+    bounds = [0, 8, 8, 80]
+    graph = _build_graph(E, S, N, K, num_groups=G, output_dt=cudnn.data_type.FLOAT)
+    _, binding = analyze_with_binding(graph)
+    binding.first_token_offset.set_alignment_value(8 if aligned else 1)
+    binding.outputs[0].set_output(False)
+    base = graph.identity(input=binding.outputs[0], name="materialized")
+    base.set_data_type(cudnn.data_type.FLOAT)
+    bias = graph.tensor(name="group_bias", dim=[G, 1, N], stride=[N, N, 1], data_type=cudnn.data_type.FLOAT)
+    value = graph.add(a=base, b=bias, name="biased")
+    for axis in (1, 2):
+        value = graph.add(a=value, b=graph.gen_index(input=base, axis=axis), name=f"index_{axis}")
+    base.set_output(True)
+    ldm = _ceil_div(S, 8) * 8
+    value.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_stride([ldm * N, 1, ldm])
+    cfg = by_name("CONFIG_sm100_128x32x128_128x32x32_cluster2x2_2ctamma")
+    plan = _plan(graph, config=cfg, swap_ab=True)
+    assert plan._compiled.store_modes == ("tma", "tma" if aligned else "stg")
+    tok = torch.ones((1, S, K), dtype=torch.bfloat16, device="cuda")
+    weight = torch.ones((E, N, K), dtype=torch.bfloat16, device="cuda")
+    offsets = torch.tensor(bounds, dtype=torch.int32, device="cuda")
+    bias_buf = torch.arange(G * N, dtype=torch.float32, device="cuda").view(G, 1, N)
+    raw = torch.full((4 * S * N + 4096,), 0xAB, dtype=torch.uint8, device="cuda")
+    base_buf = raw[: 4 * S * N].view(torch.float32).view(1, S, N)
+    raw_m = torch.full((2 * ldm * N + 4096,), 0xAB, dtype=torch.uint8, device="cuda")
+    value_buf = raw_m[: 2 * ldm * N].view(torch.bfloat16).view(1, N, ldm).transpose(1, 2)[:, :S, :]
+    vp = _vp_moe(plan, tok, weight, offsets, [base_buf, value_buf])
+    vp[bias] = bias_buf
+    if aligned:
+        engine_id = next(row.engine_id for row in MANIFEST if row.name == "frost_gemm")
+        graph.validate()
+        graph.build_operation_graph()
+        public = GemmKnobs.from_config(replace(cfg, swap_ab=True)).to_public()
+        assert public[cudnn.knob_type.SWAP_AB] == 1
+        graph.create_execution_plan(engine_id, public)
+        graph.check_support()
+        graph.build_plans()
+        assert graph.get_engine_and_knobs_at_index(0) == (engine_id, public)
+        assert graph.selected_engine.name == "frost_gemm"
+        workspace = torch.empty(max(graph.get_workspace_size(), plan.workspace_bytes), dtype=torch.uint8, device="cuda")
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        handle = cudnn.create_handle()
+        cudnn.set_stream(handle, stream.cuda_stream)
+        try:
+            with torch.cuda.stream(stream):
+                graph.execute(vp, workspace, handle=handle)
+                base_expected = torch.full_like(base_buf, K)
+                torch.testing.assert_close(base_buf, base_expected, atol=0, rtol=0)
+                base_buf.fill_(float("nan"))
+                value_buf.fill_(float("nan"))
+                plan._compiled(vp, workspace=workspace, stream=stream.cuda_stream)
+            stream.synchronize()
+        finally:
+            cudnn.destroy_handle(handle)
+    else:
+        plan(vp)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(base_buf, torch.full_like(base_buf, K), atol=0, rtol=0)
+    ref = torch.empty(S, N, device="cuda")
+    for group, begin in enumerate(bounds):
+        end = bounds[group + 1] if group + 1 < G else S
+        ref[begin:end] = K + bias_buf[group] + torch.arange(begin, end, device="cuda")[:, None] + torch.arange(N, device="cuda")[None, :]
+    torch.testing.assert_close(value_buf[0], ref.to(torch.bfloat16), atol=0, rtol=0)
+    assert (raw[4 * S * N :] == 0xAB).all()
+    assert (raw_m[2 * ldm * N :] == 0xAB).all()
+    assert (raw_m[: 2 * ldm * N].view(N, 2 * ldm)[:, 2 * S :] == 0xAB).all()
+
+
+@requires_sm100
+@pytest.mark.parametrize("block_scale", [False, True])
+def test_moe_templates_follow_internal_operation(block_scale, monkeypatch):
+    from cudnn.gemm.frost import fusion_ir, kernel_registry as R
+    from cudnn.gemm.frost.sm100 import compiler as C
+    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+
+    graph = (build_bs if block_scale else _build_graph)(2, 176, 256, 256, num_groups=4)
+    chain = analyze(graph)
+    swapped = fusion_ir.swap_ab(chain)
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma")
+    monkeypatch.setattr(R, "CATALOG", (cfg,))
+    matches = R.candidates(chain, sweep_swap_ab=True)
+    assert len(matches) == 2
+    assert {candidate.swap_ab for _, candidate in matches} == {False, True}
+    for template, candidate in matches:
+        lowered = swapped if candidate.swap_ab else chain
+        other = chain if candidate.swap_ab else swapped
+        assert R.select_template(lowered, candidate) is template
+        assert template.accepts(lowered, candidate) is None
+        assert "graph_type" in template.accepts(other, candidate)
+        C.probe_chain(chain, candidate)
+    assert analyze(graph) == chain
+    assert fusion_ir.swap_ab(swapped) == chain
+
+
+@requires_sm100
+def test_moe_swap_ab_config_executes_the_same_public_graph():
+    from cudnn.gemm.frost.fusion_ir import swap_ab
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.sm100 import compiler as C
+
+    E, S, N, K = 2, 173, 256, 128
+    graph = _build_graph(E, S, N, K, num_groups=4)
+    chain, binding = analyze_with_binding(graph)
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma")
+    offsets = torch.tensor([0, 7, 7, 80], dtype=torch.int32, device="cuda")
+    token = torch.randint(-2, 3, (1, S, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-2, 3, (E, N, K), device="cuda").to(torch.bfloat16)
+    output = torch.empty((1, S, N), dtype=torch.bfloat16, device="cuda")
+    vp = {binding.a_operands[0]: token, binding.b_operands[0]: weight, binding.first_token_offset: offsets, binding.outputs[0]: output}
+    reference = _ref_f32(token, weight, offsets, S, N, E).to(torch.bfloat16)
+    for flag in (False, True):
+        config = replace(cfg, swap_ab=flag)
+        compiled = C.jit_from_cudnn_graph(graph, config=config)
+        assert compiled.chain == (swap_ab(chain) if flag else chain)
+        assert compiled.config == config
+        output.fill_(float("nan"))
+        compiled(vp)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output[0], reference, atol=0, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize("stg", [False, True])
+@pytest.mark.parametrize("aux_major", ["n", "m"])
+def test_moe_swap_ab_transposes_strided_aux(stg, aux_major):
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.sm100 import compiler as C
+
+    E, S, N, K = 2, 173, 136, 128
+    graph = _build_graph(E, S, N, K, num_groups=4, output_dt=cudnn.data_type.FLOAT)
+    _, binding = analyze_with_binding(graph)
+    base = binding.outputs[0].set_output(False)
+    stride = (S * N, N, 1) if aux_major == "n" else (S * N, 1, S)
+    elem = graph.tensor(name="elem", dim=[1, S, N], stride=list(stride), data_type=cudnn.data_type.FLOAT)
+    row = graph.tensor(name="token_bias", dim=[1, S, 1], stride=[2 * S, 2, 1], data_type=cudnn.data_type.FLOAT)
+    value = graph.add(a=graph.add(a=base, b=elem), b=row).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    config = replace(by_name("CONFIG_sm100_128x32x128_128x32x32_cluster2x1_2ctamma"), swap_ab=True)
+    with C.force_stg_epi(stg):
+        compiled = C.jit_from_cudnn_graph(graph, config=config)
+    assert compiled.store_modes == ("stg" if stg else "tma",)
+    token = torch.ones(1, S, K, device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones(E, N, K, device="cuda", dtype=torch.bfloat16)
+    offsets = torch.tensor([0, 3, 3, 99], device="cuda", dtype=torch.int32)
+    elem_buf = torch.empty_strided((1, S, N), stride, device="cuda", dtype=torch.float32)
+    elem_buf.copy_(torch.arange(S * N, device="cuda").view(1, S, N))
+    row_buf = torch.arange(2 * S, device="cuda", dtype=torch.float32)[::2].view(1, S, 1)
+    output = torch.full((1, S, N), float("nan"), device="cuda", dtype=torch.float32)
+    compiled({binding.a_operands[0]: token, binding.b_operands[0]: weight, binding.first_token_offset: offsets, elem: elem_buf, row: row_buf, value: output})
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, K + elem_buf + row_buf, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("block_scale", [False, True])
+def test_sm120_declines_moe_swap_ab_operation(block_scale, monkeypatch):
+    from cudnn.gemm.frost import compiler as active_compiler
+    from cudnn.gemm.frost.sm120 import compiler as C
+    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+
+    chain = analyze((build_bs if block_scale else _build_graph)(2, 256, 256, 256, num_groups=2))
+    config = replace(by_name(_SM120_CFG), swap_ab=True)
+    monkeypatch.setattr(active_compiler, "_current_arch", lambda: 120)
+    monkeypatch.setattr(C, "_current_arch", lambda: 120)
+    with pytest.raises(ValueError, match="no kernel template.*moe_grouped.*swap_ab"):
+        C.probe_chain(chain, config)
+
+
+@requires_sm100
+def test_moe_swap_ab_sweep_includes_geometry_rejected_by_original_graph(monkeypatch):
+    from cudnn.gemm.frost import kernel_registry as R
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.sm100 import compiler as C
+
+    graph = _build_graph(2, 173, 256, 256, num_groups=4, weight_major="n")
+    _, binding = analyze_with_binding(graph)
+    for tensor in binding.a_operands + binding.b_operands:
+        tensor.set_data_type(cudnn.data_type.FP8_E4M3)
+    chain = analyze(graph)
+    cfg = by_name("CONFIG_sm100_128x40x128_128x40x32_cluster1x1_1ctamma")
+    monkeypatch.setattr(R, "CATALOG", (cfg,))
+    assert R.candidates(chain) == []
+    [(template, swapped)] = R.candidates(chain, sweep_swap_ab=True)
+    assert swapped == replace(cfg, swap_ab=True)
+    assert template.graph_type is R.GraphType.MOE_SWAP_AB
+    C.probe_chain(chain, swapped)
+
+
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize("block_scale", [False, True])
+@pytest.mark.parametrize("swap", [False, True])
+def test_moe_norm2_is_refused_at_probe_and_jit(family, block_scale, swap):
+    from importlib import import_module
+    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+
+    compiler = import_module(f"cudnn.gemm.frost.{family}.compiler")
+    graph = (build_bs if block_scale else _build_graph)(
+        2,
+        256,
+        256,
+        256,
+        num_groups=4,
+        reduction_mode=cudnn.reduction_mode.NORM2,
+        reduction_dims=(1, 1, 256),
+    )
+    config = replace(by_name(_SM120_CFG if family == "sm120" else "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"), swap_ab=swap)
+    chain = analyze(graph)
+    with pytest.raises(NotImplementedError, match="norm2.*square root"):
+        compiler.probe_chain(chain, config)
+    with pytest.raises(NotImplementedError, match="norm2.*square root"):
+        compiler.jit_from_cudnn_graph(graph, config=config)
+
+
+def _run_moe_swap_ab_quant(case, *, block_scale=False):
+    from contextlib import nullcontext
+    from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.sm100 import compiler as C
+    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+
+    col = case in ("col", "col_grouped", "multi")
+    grouped = case in ("row_grouped", "col_grouped")
+    reorder = case not in ("row", "row_stg", "multi")
+    bs = 16 if case == "packed" else 32
+    S = (512 if grouped else 320) if col else 173
+    starts = ([0, 128, 128, 256, 384] if grouped else [0, 32, 32, 192, 256]) if col else [0, 3, 3, 99, 151]
+    E, N, K, G = 2, 160, 256, len(starts)
+    graph = (build_bs if block_scale else _build_graph)(E, S, N, K, num_groups=G, output_dt=cudnn.data_type.FLOAT)
+    _, binding = analyze_with_binding(graph)
+    base = binding.outputs[0]
+    base.set_output(False)
+    binding.first_token_offset.set_alignment_value((128 if grouped else 32) if col else 1)
+    bias = graph.tensor(name="quant_bias", dim=[1, S, 1], stride=[S, 1, 1], data_type=cudnn.data_type.FLOAT)
+    source = graph.add(a=base, b=bias, name="quant_source")
+    quant_outputs = []
+    for axis in ([1, 2] if case == "multi" else [1 if col else 2]):
+        kwargs = {"group_offset": binding.first_token_offset} if grouped else {}
+        q, sf = graph.block_scale_quantize(input=source, block_size=bs, axis=axis, name=f"quant_{axis}", **kwargs)
+        q_dtype = torch.float8_e5m2 if case == "col" else torch.float8_e4m3fn
+        q.set_data_type(cudnn.data_type.FP8_E5M2 if case == "col" else cudnn.data_type.FP8_E4M3).set_output(True)
+        q.set_dim([1, S, N]).set_stride([S * N, 1, S] if col or case == "row_mmajor" else [S * N, N, 1])
+        sf_dtype = torch.float8_e4m3fn if case == "row_reorder" else torch.float8_e8m0fnu
+        sf.set_data_type(cudnn.data_type.FP8_E4M3 if case == "row_reorder" else cudnn.data_type.FP8_E8M0).set_output(True)
+        if reorder:
+            rows = N if axis == 1 else (segmented_row_scale_capacity_rows(S, G) if grouped else S)
+            cols = (S if axis == 1 else N) // bs
+            dims = (1, _ceil_div(rows, 128) * 128, _ceil_div(cols, 4) * 4)
+            sf.set_dim(dims).set_stride([dims[1] * dims[2], dims[2], 1]).set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+        else:
+            dims = (1, S // bs, N) if axis == 1 else (1, S, N // bs)
+            sf.set_dim(dims).set_stride([dims[1] * dims[2] * 2, dims[2] * 2, 2])
+        quant_outputs.append((axis, q, sf, q_dtype, sf_dtype, dims))
+    red = graph.reduction(input=source, mode=cudnn.reduction_mode.ADD, name="sum")
+    red.set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_data_type(cudnn.data_type.FLOAT).set_output(True)
+    pair = 2 if case in ("row_reorder", "col_grouped", "multi") else 1
+    mma_m = 64 if case == "packed" and not block_scale else 128
+    cta_n = 128 if block_scale else 64
+    cfg = replace(by_name(f"CONFIG_sm100_{mma_m}x{cta_n}x128_{mma_m}x{cta_n}x32_cluster{pair}x1_{pair}ctamma"), swap_ab=True)
+    with C.force_stg_epi() if case in ("row_stg", "packed") else nullcontext():
+        compiled = C.jit_from_cudnn_graph(graph, config=cfg)
+    assert compiled.chain.quants[0].axis == (2 if col else 1)
+    assert compiled.store_modes[0] == ("stg" if case in ("row_stg", "row_mmajor", "packed") else "tma")
+    tok_values = torch.arange(S, device="cuda") % 3 + 1
+    w_values = (torch.arange(N, device="cuda") % 3 + 1)[None, :].expand(E, N)
+    signs = torch.where((torch.arange(N, device="cuda")[None, :] + torch.arange(E, device="cuda")[:, None]) % 2 == 0, 1, -1)
+    token = torch.zeros((1, S, K), device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros((E, N, K), device="cuda", dtype=torch.bfloat16)
+    token[0, :, 0] = tok_values
+    weight[:, :, 0] = w_values * signs
+    if block_scale:
+        codes = torch.tensor([2, 4, 5], device="cuda", dtype=torch.uint8)
+        token = torch.zeros((1, S, K // 2), device="cuda", dtype=torch.uint8)
+        weight = torch.zeros((E, N, K // 2), device="cuda", dtype=torch.uint8)
+        token[0, :, 0] = codes[tok_values - 1]
+        weight[:, :, 0] = codes[w_values - 1] + (signs < 0).to(torch.uint8) * 8
+        token = token.view(torch.float4_e2m1fn_x2)
+        weight = weight.view(torch.float4_e2m1fn_x2)
+    offsets = torch.tensor(starts, device="cuda", dtype=torch.int32)
+    bias_buf = (torch.arange(S, device="cuda") % 5 - 2).float().view(1, S, 1)
+    vp = {binding.a_operands[0]: token, binding.b_operands[0]: weight, binding.first_token_offset: offsets, bias: bias_buf}
+    if block_scale:
+        sf_rows = segmented_row_scale_capacity_rows(S, G)
+        vp[binding.sfa_operands[0]] = torch.ones((1, sf_rows, K // 16), device="cuda", dtype=torch.float8_e4m3fn)
+        vp[binding.sfb_operands[0]] = torch.ones((E, 256, K // 16), device="cuda", dtype=torch.float8_e4m3fn)
+    ref = torch.empty((S, N), device="cuda")
+    for group, (begin, end) in enumerate(zip(starts, starts[1:] + [S])):
+        ref[begin:end] = tok_values[begin:end, None] * (w_values * signs)[group % E] + bias_buf[0, begin:end]
+    guards = []
+    for axis, q, sf, q_dtype, sf_dtype, dims in quant_outputs:
+        for tensor, shape, dtype in ((q, (1, S, N), q_dtype), (sf, dims, sf_dtype)):
+            stride = tuple(tensor.get_stride())
+            size = 1 + sum((d - 1) * st for d, st in zip(shape, stride))
+            raw = torch.full((size + 32,), 0xA5, device="cuda", dtype=torch.uint8)
+            vp[tensor] = raw[:size].view(dtype).as_strided(shape, stride)
+            untouched = torch.ones_like(raw, dtype=torch.bool)
+            untouched.as_strided(shape, stride).fill_(False)
+            guards.append((raw, untouched))
+    vp[red] = torch.empty((1, 1, 1), device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    if case == "row":
+        bad = dict(vp)
+        bad[binding.a_operands[0]] = torch.empty((1, S + 1, token.shape[2]), device="cuda", dtype=token.dtype)
+        with pytest.raises(ValueError, match="scale_dim"):
+            compiled(bad, workspace=workspace, stream=stream.cuda_stream)
+    if reorder:
+        scale = quant_outputs[0][2]
+        valid = vp[scale]
+        vp[scale] = torch.empty_strided(valid.shape, (valid.numel() * 2, valid.shape[2] * 2, 2), device="cuda", dtype=valid.dtype)
+        with pytest.raises(ValueError, match="dense byte run"):
+            compiled(vp, workspace=workspace, stream=stream.cuda_stream)
+        vp[scale] = valid
+    for _ in range(2):
+        compiled(vp, workspace=workspace, stream=stream.cuda_stream)
+        stream.synchronize()
+        torch.testing.assert_close(vp[red], ref.sum().reshape(1, 1, 1), atol=0, rtol=0)
+        for axis, q, sf, q_dtype, sf_dtype, dims in quant_outputs:
+            data = ref.T.contiguous() if axis == 1 else ref
+            q_ref, scale_ref = _block_quant_ref(data, bs, q_dtype, sf_dtype)
+            if axis == 1:
+                q_ref = q_ref.transpose(1, 2)
+            torch.testing.assert_close(vp[q].float(), q_ref.float(), atol=_block_quant_q_atol(sf_dtype), rtol=0)
+            if reorder:
+                expected = torch.full(dims, 0xA5, device="cuda", dtype=torch.uint8).flatten()
+                cursor = 0
+                for begin, end in (list(zip(starts, starts[1:] + [S])) if grouped else [(0, S)]):
+                    part = scale_ref[0, :, begin // bs : end // bs] if axis == 1 else scale_ref[0, begin:end]
+                    if part.numel() == 0:
+                        continue
+                    padded = torch.full((_ceil_div(part.shape[0], 128) * 128, _ceil_div(part.shape[1], 4) * 4), 0xA5, device="cuda", dtype=torch.uint8)
+                    padded[: part.shape[0], : part.shape[1]] = part.view(torch.uint8)
+                    packed = _to_blocked(padded).flatten()
+                    expected[cursor : cursor + packed.numel()] = packed
+                    cursor += packed.numel()
+                torch.testing.assert_close(vp[sf].view(torch.uint8).flatten(), expected, atol=0, rtol=0)
+            else:
+                expected = scale_ref.transpose(1, 2) if axis == 1 else scale_ref
+                torch.testing.assert_close(vp[sf].float(), expected.float(), atol=0, rtol=0)
+        for raw, untouched in guards:
+            assert (raw[untouched] == 0xA5).all()
+
+
+@requires_sm100
+@pytest.mark.parametrize("case", ["row", "row_stg", "row_mmajor", "row_reorder", "col", "col_grouped", "multi", "packed"])
+def test_moe_swap_ab_quant(case):
+    _run_moe_swap_ab_quant(case)
+
+
+@pytest.mark.parametrize("block_scale", [False, True])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_moe_swap_ab_token_quant_requires_aligned_groups(block_scale, grouped):
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.sm100 import compiler as C
+    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+
+    graph = (build_bs if block_scale else _build_graph)(2, 256, 128, 256, num_groups=4)
+    _, binding = analyze_with_binding(graph)
+    base = binding.outputs[0].set_output(False)
+    kwargs = {"group_offset": binding.first_token_offset} if grouped else {}
+    q, sf = graph.block_scale_quantize(input=base, block_size=32, axis=1, **kwargs)
+    q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
+    sf.set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
+    if grouped:
+        sf.set_dim([1, 128, 8]).set_stride([1024, 8, 1]).set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    cfg = replace(by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"), swap_ab=True)
+    with pytest.raises(NotImplementedError, match="first_token_offset value alignment"):
+        C.probe_chain(analyze(graph), cfg)
+    binding.first_token_offset.set_alignment_value(128 if grouped else 32)
+    C.probe_chain(analyze(graph), cfg)
+
+
+def test_moe_swap_ab_segmented_feature_quant_requires_scale_prefix():
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.sm100 import compiler as C
+
+    graph = _build_graph(2, 173, 128, 256, num_groups=4)
+    _, binding = analyze_with_binding(graph)
+    base = binding.outputs[0].set_output(False)
+    q, sf = graph.block_scale_quantize(input=base, block_size=32, group_offset=binding.first_token_offset)
+    q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
+    sf.set_data_type(cudnn.data_type.FP8_E8M0).set_dim([1, 640, 4]).set_stride([2560, 4, 1])
+    sf.set_reordering_type(cudnn.tensor_reordering.F8_128x4).set_output(True)
+    cfg = replace(by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"), swap_ab=True)
+    with pytest.raises(NotImplementedError, match="requires a block-scaled MoE"):
+        C.probe_chain(analyze(graph), cfg)
+
+
+def _run_moe_swap_ab_reductions(axis, *, block_scale=False, reduction_kind="basic", swap=True):
+    from contextlib import nullcontext
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.sm100 import compiler as C
+    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+
+    avg = reduction_kind == "avg"
+    products = reduction_kind == "products"
+    red_dt = cudnn.data_type.INT32 if reduction_kind == "int32" else cudnn.data_type.FLOAT
+    red_torch_dt = torch.int32 if reduction_kind == "int32" else torch.float32
+    E, N, K = 2, (136 if swap else 128), 256
+    aligned = axis == "group_feature"
+    S = 176 if aligned else 173
+    starts = [0, 8, 8, 80, 152] if aligned else [0, 3, 3, 99, 151]
+    G = len(starts)
+    graph = (build_bs if block_scale else _build_graph)(E, S, N, K, num_groups=G, output_dt=cudnn.data_type.FLOAT)
+    _, binding = analyze_with_binding(graph)
+    base = binding.outputs[0]
+    if axis == "feature":
+        base.set_output(False)
+        base = graph.identity(input=base, name="materialized").set_data_type(cudnn.data_type.FLOAT)
+    base.set_dim([1, S, N]).set_stride([S * N, N, 1])
+    binding.first_token_offset.set_alignment_value(8 if aligned else 1)
+    if aligned:
+        base.set_stride([S * N, 1, S])
+    source = graph.add(a=base, b=base, name="twice") if axis == "feature" and not products else base
+    reduction_only = axis == "group"
+    base.set_output(not reduction_only)
+    dims = {
+        "scalar": (1, 1, 1),
+        "feature": (1, 1, N),
+        "token": (1, S, 1),
+        "group": (G, 1, 1),
+        "group_feature": (G, 1, N),
+        "group_token": (G, S, 1),
+    }[axis.removesuffix("_tma")]
+    strides = (dims[1] * dims[2] * 2 + 8, dims[2] * 2, 2)
+    modes = [cudnn.reduction_mode.AMAX, cudnn.reduction_mode.ADD, cudnn.reduction_mode.MAX, cudnn.reduction_mode.MIN, cudnn.reduction_mode.NORM1]
+    if avg:
+        modes = [cudnn.reduction_mode.AVG]
+    if products:
+        modes = [cudnn.reduction_mode.MUL, cudnn.reduction_mode.MUL_NO_ZEROS]
+    reductions = []
+    for i, mode in enumerate(modes):
+        kwargs = {"group_offset": binding.first_token_offset} if axis.startswith("group") else {}
+        red = graph.reduction(input=source, mode=mode, name=f"red_{i}", compute_data_type=red_dt, **kwargs)
+        red.set_dim(list(dims)).set_stride(list(strides)).set_data_type(red_dt).set_output(True)
+        reductions.append(red)
+    pair = 2 if axis in ("token", "token_tma", "group", "group_feature") else 1
+    mma_m = 64 if axis == "scalar" and not block_scale else 128
+    cta_n = 128 if block_scale else 64
+    cfg = by_name(f"CONFIG_sm100_{mma_m}x{cta_n}x128_{mma_m}x{cta_n}x32_cluster{pair}x1_{pair}ctamma")
+    with C.force_stg_epi() if axis == "token" else nullcontext():
+        compiled = C.jit_from_cudnn_graph(graph, config=replace(cfg, swap_ab=swap))
+    dense_modes = () if reduction_only else ("stg" if axis == "token" else "tma",)
+    assert compiled.store_modes == dense_modes + ("stg",) * len(modes)
+
+    # Exact, nonzero integer products: negative feature columns catch accidental
+    # zero contributions to MAX; positive columns do the same for MIN.
+    token_ref = (torch.arange(S, device="cuda") % 3 + 1).view(1, S, 1).expand(1, S, K).to(torch.bfloat16).contiguous()
+    signs = torch.where(torch.arange(N, device="cuda") % (3 if avg else 2) == 0, 1, -1)
+    weight_ref = (torch.arange(1, E + 1, device="cuda")[:, None, None] * signs[None, :, None]).expand(E, N, K).to(torch.bfloat16).contiguous()
+    if products:
+        token_ref.zero_()
+        token_ref[0, :, 0] = torch.where(torch.arange(S, device="cuda") % 3 == 0, -1, 1)
+        weight_ref.zero_()
+        weight_ref[:, :, 0] = signs
+    token, weight = token_ref, weight_ref
+    if block_scale:
+        codes = torch.tensor([2, 4, 5], device="cuda", dtype=torch.uint8)
+        tok_codes = codes[torch.arange(S, device="cuda") % 3]
+        token = (tok_codes * 17).view(1, S, 1).expand(1, S, K // 2).contiguous().view(torch.float4_e2m1fn_x2)
+        w_codes = 2 * torch.arange(1, E + 1, device="cuda")[:, None] + (signs < 0)[None, :] * 8
+        weight = (w_codes * 17).to(torch.uint8)[:, :, None].expand(E, N, K // 2).contiguous().view(torch.float4_e2m1fn_x2)
+        if products:
+            token.view(torch.uint8).zero_()
+            weight.view(torch.uint8).zero_()
+            token.view(torch.uint8)[0, :, 0] = (token_ref[0, :, 0] < 0).to(torch.uint8) * 8 + 2
+            weight.view(torch.uint8)[:, :, 0] = (weight_ref[:, :, 0] < 0).to(torch.uint8) * 8 + 2
+    offsets = torch.tensor(starts, device="cuda", dtype=torch.int32)
+    vp = {binding.a_operands[0]: token, binding.b_operands[0]: weight, binding.first_token_offset: offsets}
+    if block_scale:
+        sf_rows = (min(S, G) + (S - min(S, G)) // 128) * 128
+        vp[binding.sfa_operands[0]] = torch.ones((1, sf_rows, K // 16), device="cuda", dtype=torch.float8_e4m3fn)
+        vp[binding.sfb_operands[0]] = torch.ones((E, 256, K // 16), device="cuda", dtype=torch.float8_e4m3fn)
+    if not reduction_only:
+        vp[base] = torch.empty_strided((1, S, N), tuple(base.get_stride()), device="cuda", dtype=torch.float32)
+    guards = []
+    for red in reductions:
+        size = sum((d - 1) * s for d, s in zip(dims, strides)) + 1
+        raw = torch.full((size + 32,), -12345, dtype=red_torch_dt, device="cuda")
+        vp[red] = raw.as_strided(dims, strides)
+        untouched = torch.ones_like(raw, dtype=torch.bool)
+        untouched.as_strided(dims, strides).fill_(False)
+        guards.append((raw, untouched))
+    ref = _ref_f32(token_ref, weight_ref, offsets, S, N, E)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    if axis == "feature":
+        valid = vp[reductions[-1]]
+        for bad, message in (
+            (valid.as_strided(dims, (0, 0, 0)), "cannot write an element twice"),
+            (torch.empty_strided(dims, strides, device="cuda", dtype=torch.float16), "4-byte elements"),
+        ):
+            vp[reductions[-1]] = bad
+            with pytest.raises(ValueError, match=message):
+                compiled(vp, stream=stream.cuda_stream, workspace=workspace)
+            stream.synchronize()
+            assert all((raw == -12345).all() for raw, _ in guards)
+        vp[reductions[-1]] = valid
+    # Repeat with explicit stream/workspace: every call must reseed each output,
+    # including the empty group's identity, without touching stride padding.
+    for iteration in range(2):
+        if products and iteration == 1:
+            token_ref[0, [1, 100], 0] = 0
+            if block_scale:
+                token.view(torch.uint8)[0, [1, 100], 0] = 0
+            ref = _ref_f32(token_ref, weight_ref, offsets, S, N, E)
+            stream.wait_stream(torch.cuda.current_stream())
+        compiled(vp, stream=stream.cuda_stream, workspace=workspace)
+        stream.synchronize()
+        if not reduction_only:
+            torch.testing.assert_close(vp[base][0], ref, atol=0, rtol=0)
+        for red, mode in zip(reductions, modes):
+            red_ref = (ref * 2 if axis == "feature" and not products else ref).to(red_torch_dt)
+            if axis.startswith("group"):
+                expected = _group_reduction_ref(red_ref, offsets, mode, dims, red_torch_dt)
+            else:
+                expected = _reduction_ref(red_ref[None], mode, _reduction_dims(dims, (1, S, N)))
+            approximate = avg
+            torch.testing.assert_close(
+                vp[red], expected.to(red_torch_dt), atol=1e-4 if approximate else 0, rtol=1e-4 if approximate else 0, msg=lambda message: f"{mode}: {message}"
+            )
+        for raw, untouched in guards:
+            assert (raw[untouched] == -12345).all()
+
+
+@requires_sm100
+@pytest.mark.parametrize("axis", ["scalar", "feature", "token", "token_tma", "group", "group_feature"])
+def test_moe_swap_ab_reductions_fp32(axis):
+    _run_moe_swap_ab_reductions(axis)
+
+
+@requires_sm100
+@pytest.mark.parametrize("axis", ["scalar", "feature", "token", "token_tma", "group", "group_feature", "group_token"])
+def test_moe_swap_ab_avg_fp32(axis):
+    _run_moe_swap_ab_reductions(axis, reduction_kind="avg")
+
+
+@requires_sm100
+@pytest.mark.parametrize("axis", ["scalar", "feature", "token", "token_tma", "group", "group_feature", "group_token"])
+@pytest.mark.parametrize("kind", ["products", "int32"])
+def test_moe_swap_ab_remaining_reductions(axis, kind):
+    _run_moe_swap_ab_reductions(axis, reduction_kind=kind)
+
+
+@requires_sm100
+@pytest.mark.parametrize("block_scale", [False, True])
+def test_moe_product_reductions_fp32(block_scale):
+    _run_moe_swap_ab_reductions("feature", block_scale=block_scale, reduction_kind="products", swap=False)
+
+
+@requires_sm100
+@pytest.mark.parametrize("mode", [cudnn.reduction_mode.ADD, cudnn.reduction_mode.AVG], ids=["add", "avg"])
+def test_moe_swap_ab_reduction_runtime_token_tail(mode):
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.sm100 import compiler as C
+
+    E, S, N, K = 2, 192, 136, 128
+    graph = _build_graph(E, S, N, K, num_groups=4, output_dt=cudnn.data_type.FLOAT, reduction_mode=mode, reduction_dims=(1, 1, 1))
+    _, binding = analyze_with_binding(graph)
+    binding.outputs[0].set_stride([S * N, 1, S])
+    binding.first_token_offset.set_alignment_value(32)
+    cfg = replace(by_name("CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma"), swap_ab=True)
+    compiled = C.jit_from_cudnn_graph(graph, config=cfg)
+    assert compiled.store_modes == ("tma", "stg")
+    weight = torch.ones((E, N, K), device="cuda", dtype=torch.bfloat16)
+    offsets = torch.tensor([0, 32, 32, 96], device="cuda", dtype=torch.int32)
+    red = torch.empty((1, 1, 1), device="cuda")
+    # The declared S divides the 32-column TMA chunk; a legal runtime S need
+    # only divide the compiled 8-column STG/alignment contract.
+    for runtime_s in (192, 200):
+        token = torch.ones((1, runtime_s, K), device="cuda", dtype=torch.bfloat16)
+        out = torch.empty((1, N, runtime_s), device="cuda").transpose(1, 2)
+        compiled(_vp_moe(compiled, token, weight, offsets, [out, red]))
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, torch.full_like(out, K), atol=0, rtol=0)
+        expected = K if mode == cudnn.reduction_mode.AVG else runtime_s * N * K
+        torch.testing.assert_close(red, torch.full_like(red, expected), atol=1e-4, rtol=1e-5)
+
+
+@requires_sm100
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("axis", ["scalar", "feature", "token"])
+def test_moe_avg_fp32(grouped, axis):
+    _run_moe_reduction(
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        1,
+        cudnn.reduction_mode.AVG,
+        [5 if grouped else 1, 173 if axis == "token" else 1, 136 if axis == "feature" else 1],
+        E=2,
+        N=136,
+        group_sizes=[3, 0, 96, 52, 22],
+        group_reduction=grouped,
+        integer_inputs=True,
+    )
+
+
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+def test_moe_reduction_initialization_validates_all_outputs_before_writing(family):
+    import importlib
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+
+    compiler = importlib.import_module(f"cudnn.gemm.frost.{family}.compiler")
+    graph = _build_graph(2, 128, 128, 128, reduction_mode=cudnn.reduction_mode.ADD, reduction_dims=(1, 1, 128))
+    _, binding = analyze_with_binding(graph)
+    source = binding.outputs[0].set_output(False)
+    last = graph.reduction(input=source, mode=cudnn.reduction_mode.MAX)
+    last.set_dim([1, 1, 128]).set_stride([256, 256, 2]).set_data_type(cudnn.data_type.FLOAT).set_output(True)
+    chain = analyze(graph)
+    first = torch.full((1, 1, 128), -12345.0, device="cuda")
+    last_raw = torch.full((256,), -12345.0, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    for bad in (last_raw.as_strided((1, 1, 128), (0, 0, 0)), torch.empty((1, 1, 128), device="cuda", dtype=torch.float16)):
+        with pytest.raises(ValueError, match="cannot write an element twice|4-byte elements"):
+            compiler._initialize_reduction_outputs(chain, [first, bad], stream.cuda_stream)
+        stream.synchronize()
+        assert (first == -12345).all()
+        assert (last_raw == -12345).all()
+    compiler._initialize_reduction_outputs(chain, [first, last_raw.as_strided((1, 1, 128), (256, 256, 2))], stream.cuda_stream)
+    stream.synchronize()
+    assert (first == 0).all()
+    assert torch.isneginf(last_raw[::2]).all()
+    assert (last_raw[1::2] == -12345).all()
