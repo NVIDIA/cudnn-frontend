@@ -430,7 +430,7 @@ def _check_mxfp8_strided_stats(d_qk, d_v, in_key):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("h_q,h_kv", [(4, 4), (4, 2)], ids=["mha", "gqa"])
-@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128)], ids=["d128", "d192_d128"])
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_d128", "d256"])
 @torch_fork_set_rng(seed=61)
 def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
     """Validate the direct-only hybrid BF16-output contract.
@@ -473,6 +473,19 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
     torch.cuda.synchronize()
 
     o_ref = _ref(q.float() * dq, k.float() * dk, v.float(), scale=scale, is_causal=True)
+
+    # A future V row must not affect an earlier causal prefix. This is the
+    # structural leakage detector: ordinary block-scaled BMM2 may derive a
+    # shared scale from masked and unmasked rows, so numerical closeness to a
+    # reference alone does not prove that future tokens are absent from the
+    # prediction computation.
+    prefix = 17
+    v_future = v.clone()
+    v_future[:, :, prefix:] *= 4
+    o_future = torch.empty_like(o)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v_future, o_tensor=o_future, sf_q=sf_q, sf_k=sf_k)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(o_future[:, :, :prefix], o[:, :, :prefix], rtol=0, atol=0)
     _check(o, o_ref, torch.bfloat16, "e4m3", d_qk=d_qk)
 
     amax_o = torch.empty(1, device=dev, dtype=torch.float32)
