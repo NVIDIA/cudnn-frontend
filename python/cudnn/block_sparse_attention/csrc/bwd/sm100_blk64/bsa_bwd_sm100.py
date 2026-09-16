@@ -1043,6 +1043,8 @@ class BlockSparseAttnBackwardSm100Blk64:
                     k2q_begin = bucketed_k2q_offsets[kv_block_idx, 0, (h_idx, b_idx)]
                     k2q_end = bucketed_k2q_offsets[kv_block_idx + 1, 0, (h_idx, b_idx)]
                     if k2q_begin == k2q_end:
+                        # Empty tasks skip the bwd kernel and its TMEM
+                        # epilogue, so initialize their caller outputs here.
                         zeros = cute.make_rmem_tensor(self.convert_elem_per_load, self.element_dtype)
                         zeros.fill(0)
                         for idx_d in cutlass.range(
@@ -2159,6 +2161,8 @@ class BlockSparseAttnBackwardSm100Blk64:
         if cutlass.const_expr(self.dKV_postprocess):
             self.store_add_fp32(tTR_gdV, tTR_rdV, tTR_cdV, (D, K))
         else:
+            # dV = P.T @ dO; P already contains the scaled softmax, so dV
+            # does not receive the additional softmax scale used by dQ/dK.
             cute.autovec_copy(self.quantize(tTR_rdV, 4), tTR_gdV)
 
         cute.arch.fence_view_async_tmem_load()
@@ -2173,6 +2177,7 @@ class BlockSparseAttnBackwardSm100Blk64:
         if cutlass.const_expr(self.dKV_postprocess):
             self.store_add_fp32(tTR_gdK, tTR_rdK, tTR_cdK, (D, K))
         else:
+            # dK = softmax_scale * dS.T @ Q.
             for i in cutlass.range(0, cute.size(tTR_rdK), 2, unroll_full=True):
                 tTR_rdK[i], tTR_rdK[i + 1] = cute.arch.mul_packed_f32x2(
                     (tTR_rdK[i], tTR_rdK[i + 1]),

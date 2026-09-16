@@ -107,8 +107,11 @@ def test_bsa_attention_backward_fixed_blocks():
 @pytest.mark.parametrize(
     ("bucket_size_blocks", "seqlen_k", "softmax_scale"),
     [
+        # Two Q blocks fit in the default 1088-block bucket: direct dK/dV.
         (None, 4 * 64, 0.17),
+        # One Q block per bucket forces two groups: FP32 atomic fallback.
         (1, 4 * 64, 0.17),
+        # A physical K tail keeps the existing predicated fallback.
         (None, 4 * 64 - 13, None),
     ],
 )
@@ -145,6 +148,7 @@ def test_bsa_attention_backward_sm100_blk64(
     v = torch.randn_like(k)
     do = torch.randn_like(q)
     q2k, block_sparse_num, block_sizes = make_fixed_metadata(batch, heads, seqlen_q, seqlen_k, block_size)
+    # Metadata selects KV blocks 0 and 2, leaving 1 and 3 empty.
     block_sizes[2] = block_size // 2
     mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
     _, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(
