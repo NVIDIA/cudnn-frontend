@@ -104,7 +104,20 @@ def test_bsa_attention_backward_fixed_blocks():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=5)
-def test_bsa_attention_backward_sm100_blk64():
+@pytest.mark.parametrize(
+    ("bucket_size_blocks", "seqlen_k", "softmax_scale"),
+    [
+        (None, 4 * 64, 0.17),
+        (1, 4 * 64, 0.17),
+        (None, 4 * 64 - 13, None),
+    ],
+)
+def test_bsa_attention_backward_sm100_blk64(
+    bucket_size_blocks,
+    seqlen_k,
+    softmax_scale,
+    monkeypatch,
+):
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
@@ -112,15 +125,40 @@ def test_bsa_attention_backward_sm100_blk64():
         pytest.skip("blk64 backward test is specific to SM100/SM110")
 
     BSA = _import_bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    workspace_modes = []
+    allocate_workspace = interface._empty_bwd_workspace_with_zeroed_accum
+
+    def track_workspace_mode(**kwargs):
+        workspace_modes.append(kwargs.get("include_dkv_accum", True))
+        return allocate_workspace(**kwargs)
+
+    monkeypatch.setattr(
+        interface,
+        "_empty_bwd_workspace_with_zeroed_accum",
+        track_workspace_mode,
+    )
     block_size = 64
-    batch, heads, seqlen_q, seqlen_k, dim = 1, 2, 2 * block_size, 4 * block_size, 128
+    batch, heads, seqlen_q, dim = 1, 2, 2 * block_size, 128
     q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     do = torch.randn_like(q)
     q2k, block_sparse_num, block_sizes = make_fixed_metadata(batch, heads, seqlen_q, seqlen_k, block_size)
+    block_sizes[2] = block_size // 2
     mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
-    _, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
+    _, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(
+        q,
+        k,
+        v,
+        do,
+        mask,
+        softmax_scale,
+    )
+
+    dq = torch.full_like(q, torch.nan)
+    dk = torch.full_like(k, torch.nan)
+    dv = torch.full_like(v, torch.nan)
 
     forward = BSA.block_sparse_attention_forward(
         q,
@@ -130,6 +168,7 @@ def test_bsa_attention_backward_sm100_blk64():
         block_sparse_num,
         block_sizes,
         sparse_block_size=64,
+        softmax_scale=softmax_scale,
         use_clc=False,
     )
     backward = BSA.block_sparse_attention_backward(
@@ -142,8 +181,18 @@ def test_bsa_attention_backward_sm100_blk64():
         q2k,
         block_sparse_num,
         block_sizes,
+        dq_tensor=dq,
+        dk_tensor=dk,
+        dv_tensor=dv,
+        bucket_size_blocks=bucket_size_blocks,
         sparse_block_size=64,
+        softmax_scale=softmax_scale,
     )
+    assert backward["dq_tensor"].data_ptr() == dq.data_ptr()
+    assert backward["dk_tensor"].data_ptr() == dk.data_ptr()
+    assert backward["dv_tensor"].data_ptr() == dv.data_ptr()
+    expect_dkv_workspace = bucket_size_blocks == 1 or seqlen_k % block_size != 0
+    assert workspace_modes == [expect_dkv_workspace]
     torch.testing.assert_close(backward["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(backward["dk_tensor"].float(), dk_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(backward["dv_tensor"].float(), dv_ref, atol=3e-2, rtol=3e-2)
