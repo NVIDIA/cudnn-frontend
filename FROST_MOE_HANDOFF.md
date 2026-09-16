@@ -29,9 +29,46 @@ compute-sanitizer --tool memcheck --target-processes all --error-exitcode 86 pyt
 compute-sanitizer --tool racecheck --target-processes all --error-exitcode 86 python -m pytest -m L1 -s gemm/frost/test_moe_scheduler_sm120.py
 ```
 
-This is a scheduler correctness result. The companion FI public SM120 candidate
-and complete-MoE performance confirmation are being validated separately. The
-earlier B200 reference/racecheck failure remains open; this does not clear it.
+This is a scheduler correctness result. The companion FI public SM120 BF16
+path is validated below; complete-MoE performance confirmation remains open.
+The earlier B200 reference/racecheck failure remains open; this does not clear it.
+
+## Validated public SM120 BF16 path
+
+The explicit FlashInfer `CudnnMoeConfig` backend now accepts SM120 BF16 MoE;
+native MoE helper JIT compilation includes SM12 targets. Use the matching
+Frontend branch containing the scheduler-ring repair, CuTe DSL 4.7 or newer,
+`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`, and `enable_pdl=False`. This is opt-in
+OSS Frost engine 20400. SM121 and FP8 architecture support are not extended.
+SM120 retains the ordinary weight layout and dynamic scheduler. FC1 computes
+the concatenated gate/up projection in FP32 and applies activation separately
+when shared-input GEMM fusion is unavailable.
+
+On full RTX PRO 6000 Blackwell Server Edition (188 SMs, 600 W, driver 595.58.03),
+all 40 public-path cases pass ordinary execution, unfiltered memcheck and
+unfiltered racecheck, with zero errors/hazards and no skips. The tests use real
+architecture checks and native JIT flags, without process-local overrides.
+Sixteen cases cover packed/unpacked routing, native/non-native routing, tiles
+32x64 and 128x128, and (T,E,H,I)=(17,8,256,256)/(257,16,2048,1024).
+Twenty-four cases cover twelve typed gated-activation parameter sets with both
+routing implementations. Each case checks engine/config identity, an eager
+result and four captured replays after changing inputs, IDs and scales,
+poisoning five intermediate/output buffers. Independent references retain
+rtol/atol 0.02 and relative-L2 < 0.01. CPU registration/JIT tests passed 12 cases
+after demonstrating the two expected failures on the previous source.
+
+Run from the FlashInfer repository root on SM120 with both branches installed:
+
+```bash
+pytest -q tests/jit/test_moe_utils_arch.py tests/moe/test_moe_cudnn_sm120.py
+compute-sanitizer --tool memcheck --target-processes all --error-exitcode 86 python -m pytest -q tests/moe/test_moe_cudnn_sm120.py
+compute-sanitizer --tool racecheck --target-processes all --error-exitcode 86 python -m pytest -q tests/moe/test_moe_cudnn_sm120.py
+```
+
+This establishes public interface and correctness coverage on the tested GPU.
+It does not claim a SM120 speedup or superiority over other backends. Broader
+shape/tactic sweeps and fresh complete-MoE comparisons remain in progress.
+The separate B200 reference/racecheck issue below remains open.
 
 ## Code and validation baseline
 
@@ -71,8 +108,8 @@ Historical timings below predate this port. Their initial bases were Frontend
 
 Packed support is scoped to SM100 E4M3, N/K multiples of 128, one-CTA MMA,
 eligible N64/128 K128 tiles, and power-of-two cluster M/N whose product is at most
-16. These results establish neither SM120 MoE support nor an architecture-wide
-advantage. Layout is an operation attribute, not a freely selectable tactic knob.
+16. SM120 BF16 support is validated separately above; these packed-weight
+results do not establish an architecture-wide advantage. Layout is an operation attribute, not a freely selectable tactic knob.
 Classic backend serialization cannot encode the Python-only layout; replay must
 reconstruct the graph contract before selecting the engine and knobs.
 
@@ -123,7 +160,7 @@ four typed-activation fallback cases and two capability-contract tests (8 tests,
 no skips). Capture replay changes inputs and poisons intermediate/output buffers.
 This is an interface/correctness fix; no speedup is claimed for it.
 
-**Racecheck is unresolved; this is not an all-tests-passing or merge-ready claim.**
+**B200 racecheck is unresolved; this is not an all-tests-passing or merge-ready claim.**
 The full selected racecheck suite failed, first in the 8193-token paired expert
 stride case. Focused reruns fail in the independent reference's `cublasSgemm`,
 including runs with zero reported race hazards. The separately reported PyTorch
@@ -182,24 +219,10 @@ Recommended continuation order:
    retain the original failing public regression and its artifacts.
 2. Confirm complete-MoE performance on the port with identical tactics and
    strict gates; finish the T1025/T2048/T3072 finalizer-range comparison.
-3. Finish SM120 interface validation before changing public support. A separate
-   full RTX PRO 6000 Blackwell Server Edition experiment (188 SMs, 600 W) passed
-   BF16 numerics, live-input capture and actual Frost routes for two tile
-   configurations and both routing implementations. It required process-local
-   fixes for the native utility JIT architecture whitelist and the dedicated
-   `cudnnGraphNotSupportedError` fallback. The fallback fix is now included in
-   this draft; the native utility JIT whitelist and public SM120 support remain
-   unchanged. The same two configurations and T17/T257 cases now also pass
-   unfiltered memcheck and racecheck for both routing paths on a full 188-SM,
-   600-W RTX PRO 6000 Blackwell Server Edition (112 numerical checks and 64
-   stale-output negative controls across four instrumented processes; zero
-   errors/hazards). Broader normal validation now passes H2048/I1024/top2 at
-   T64/E8 uniform, T257/E16 skewed, T1025/E32 uniform, and T4096/E32 skewed:
-   112 numerical checks, 64 stale-output negative controls, and 16 captured
-   routes, each containing two Frost SM120 GEMMs. This uses the actual published
-   fallback fix. Large-shape sanitizer coverage, full tactic sweeps and confirmed
-   full-MoE backend comparisons remain open. These checks do not establish
-   public support or a performance advantage.
+3. Finish SM120 exhaustive per-stage tuning and fresh complete-MoE backend
+   comparisons, plus broader shape/tactic sanitizer coverage. The public BF16
+   path above is validated; no performance advantage is claimed yet. The
+   earlier process-local experiments are superseded for public-path proof.
 4. Continue kernel and tuning work only when candidates survive correctness,
    changed-input capture, actual routes and complete-MoE confirmation.
 
