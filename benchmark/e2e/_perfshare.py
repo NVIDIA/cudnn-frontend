@@ -20,7 +20,24 @@ import torch
 # "cutile" belong in backend() below, not here -- FROST serves the MLP dgrad too, so
 # bucketing it as linear-attention would miscount the headline category shares.
 _CATEGORIES = (
-    ("linear_attn", ("gdn", "delta", "chunk_gated", "wy_fast", "solve", "cumsum", "l2norm", "kda")),
+    ("short_conv", ("causal_conv1d", "conv1d")),
+    (
+        "linear_attn",
+        (
+            "gdn",
+            "delta",
+            "chunk_gated",
+            "chunk_fwd_kernel",
+            "chunk_bwd_kernel",
+            "prepare_wy_repr",
+            "recompute_w_u",
+            "wy_fast",
+            "solve",
+            "cumsum",
+            "l2norm",
+            "kda",
+        ),
+    ),
     ("full_attn", ("flash", "fmha", "sdpa", "scaled_dot", "mha", "_attention")),
     ("gemm", ("gemm", "cutlass", "ampere", "sm100_tst", "nvjet", "cublas", "matmul", "wgrad", "dgrad", "tensorop")),
     ("norm", ("rmsnorm", "layernorm", "layer_norm", "rms_norm", "norm")),
@@ -116,11 +133,15 @@ def profile_and_report(model, ids, *, step=_default_step, warmup=3, iters=10, ex
             torch.cuda.synchronize(device)
 
     cat, be, total = collections.defaultdict(float), collections.defaultdict(float), 0.0
+    uncategorized = collections.defaultdict(float)
     for ev in prof.key_averages():
         t = ev.self_device_time_total
         if t <= 0:
             continue
-        cat[categorize(ev.key)] += t
+        c = categorize(ev.key)
+        cat[c] += t
+        if c == "other":
+            uncategorized[ev.key] += t
         be[backend(ev.key)] += t
         total += t
 
@@ -133,9 +154,15 @@ def profile_and_report(model, ids, *, step=_default_step, warmup=3, iters=10, ex
 
     print(f"\n{'category':12} {'ms':>9} {'share':>7}")
     print("-" * 30)
-    for c in ("linear_attn", "full_attn", "gemm", "norm", "misc", "other"):
+    for c in ("linear_attn", "short_conv", "full_attn", "gemm", "norm", "misc", "other"):
         if cat[c] > 0:
             print(f"{c:12} {cat[c] / 1e3:9.3f} {100 * cat[c] / total:6.1f}%")
+    # A kernel that drifts out of _CATEGORIES lands in "other" and silently deflates the
+    # component it belongs to, so name what is in there rather than reporting only a total.
+    if uncategorized:
+        print(f"\n  \"other\" is {100 * cat['other'] / total:.1f}% -- add any of these to _CATEGORIES if they belong to a component:")
+        for name, t in sorted(uncategorized.items(), key=lambda kv: -kv[1])[:10]:
+            print(f"    {t / 1e3:9.3f} ms {100 * t / total:5.1f}%  {name[:88]}")
     print(f"\n{'backend':12} {'ms':>9} {'share':>7}")
     print("-" * 30)
     for b in ("cuDNN", "cuBLAS", "torch"):
