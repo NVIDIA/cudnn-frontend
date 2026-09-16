@@ -109,12 +109,14 @@ def _run_graph(
     window=None,
     want_cga=None,
     pack_gqa=None,
+    lead_split=None,
 ):
     """Build, pin the FROST engine (``pack_gqa`` pins that leg), run under the
     sync-debug guard and check every Q row against the fp32 gather reference.
     ``causal_br`` / ``window`` add the bottom-right causal band and cuDNN's
-    ``sliding_window_length``; ``want_cga`` asserts the cluster width the
-    heuristics led with. Returns the pinned plan."""
+    ``sliding_window_length``; ``want_cga`` asserts the cluster width of the
+    plan run and ``lead_split`` the KV split the heuristics LED with (checked
+    before any ``want_split`` re-selection). Returns the pinned plan."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
@@ -162,6 +164,8 @@ def _run_graph(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     plan = select_engine(g, engine_name(), pack_gqa=pack_gqa)
+    if lead_split is not None:
+        assert plan.knobs.split_kv == lead_split, f"expected the heuristics to lead with split_kv={lead_split}; got {plan.knobs}"
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
         idx = next((i for i, n in enumerate(names) if n.startswith(engine_name()) and g.plans[i].knobs.split_kv == want_split), None)
@@ -427,6 +431,21 @@ def test_paged_graph_group_not_dividing_tile_runs_unpacked_cga1():
 def test_paged_graph_prefill_shaped_keeps_cga2():
     """Past one CTA's 256 rows (S_q=300, MHA) the paged prefill stays on cga2."""
     _run_graph(2, 4, 4, D, 16, 32, [500, 128], hnd=False, s_q=300, want_cga=2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q,lead_split", [(64, 1), (16, 2)], ids=["chunk64_unsplit", "chunk16_split2"])
+def test_paged_graph_small_batch_chunk_splits_only_where_the_combine_is_cheap(s_q, lead_split):
+    """b=8, GQA 32:8, bottom-right causal over a 4k paged cache: one CTA's rows
+    per unit at cga1 and a launch that leaves half the machine idle. The wave
+    model splits the S_q=16 chunk (4096 combine rows; B200 63.8 -> 49.4 us
+    against the pre-change cga2 plan) and leaves the S_q=64 chunk unsplit
+    (16384 combine rows; its split 2 measured 75.0 us against 67.6 us). Both
+    run under the sync-debug guard and check every row, keyless ones included."""
+    plan = _run_graph(
+        8, 32, 8, D, 16, 256, [4096, 3000, 77, 0, 1, 4095, 129, 2048], hnd=False, stats=True, s_q=s_q, causal_br=True, want_cga=1, lead_split=lead_split
+    )
+    assert plan.knobs.pack_gqa is True and plan.knobs.sched_policy == 0, plan.knobs
 
 
 # --- kernel template, direct -----------------------------------------------

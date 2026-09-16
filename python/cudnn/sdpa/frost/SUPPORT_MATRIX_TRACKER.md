@@ -159,9 +159,12 @@ lengths bound the walk on device and the split composes with them; it pays when
 multiple of the 128-row KV tile (FlashInfer passes its true max verbatim, e.g. 4000)
 does not withhold the split, unlike a mask-free dense `S_kv`, which rides synthesized
 KV-tail padding the split cannot. Decode-shaped d128 units
-(`S_q * G <= 256`, one CTA's Q rows) launch at cga1 — one CTA per `(batch, KV head)`
-unit on the plain scheduler — so a serving batch such as `B=32, H_kv=4` fills one wave
-and runs unsplit. Not yet: sink, fp8/mxfp8 pools,
+(`S_q * G <= 256`, one CTA's Q rows) launch at cga1 — one CTA per `(batch, packed head)`
+unit on the plain scheduler; the packed head holds `PACK_G` Q heads — the KV head's
+whole group when it divides the tile, its largest divisor that doesᵐ, a single Q head
+when nothing packs — so a serving batch such as `B=32, H_kv=4` fills one wave and runs
+unsplit, while a small batch splits the KV loop across the idle SMs (`B=8, H_kv=4,
+S_q=1`: `SPLIT_KV=4`). Not yet: sink, fp8/mxfp8 pools,
 packed (ragged-offset) block tables. Served by the `PAGED_KV` specialization of
 `sm100/prefill_d128_f16.py` / `sm100/prefill_d256_f16.py` (block-table indirection on
 the K/V TMA loads; boxes past a sequence's live pages are TMA-OOB zero-filled) and, for

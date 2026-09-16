@@ -218,7 +218,8 @@ def choose_split_kv(
 
         waves(s)      = ceil(base_ctas * s / sm_count)      # main grid
         combine_waves = ceil(combine_rows / sm_count)       # combine grid, NO s
-        cost(s)       = waves(s)      * (ceil(kv_tiles / s) + CTA_COST)
+        cost(1)       = waves(1)      * (kv_tiles + CTA_COST)        # one kernel
+        cost(s > 1)   = waves(s)      * (ceil(kv_tiles / s) + CTA_COST)
                       + combine_waves * (s * COMBINE_COST)
 
     CTA_COST is what a tile re-pays whatever its loop length, so it sits INSIDE
@@ -227,6 +228,17 @@ def choose_split_kv(
     (sm100/split_combine), one block per output row and independent of ``s`` --
     only the per-block work grows with ``s``, since each block reduces ``s``
     partials.  Hence ``combine_rows`` (= S_q * H_q * B) and not ``base_ctas``.
+    The unsplit leg runs the classic single-pass kernel and NO combine, so it
+    carries no combine term at all.  It used to be charged one (``s = 1`` in
+    the formula above), which under-priced the combine a split adds by exactly
+    one combine wave-set -- invisible on the fitted shapes (512 KV tiles, where
+    that is < 3% of the loop term), decisive on a 4k KV with many output rows:
+    b=8 h=32/8 S_q=64 S_kv=4096 paged, 16384 combine rows, split 2 modelled
+    8% cheaper than unsplit and measured 11% slower (B200, 75.0 vs 67.6 us);
+    dense b=4 h=32/8 S_q=128 S_kv=4096 causal, split 2 measured 155.5 us
+    against 120.2 us unsplit.  Where the combine is one wave (decode: b=8
+    h=64/4 S_q=1, 512 rows) the term is 0.1 tile and nothing moves: cga1 with
+    SPLIT_KV=4 stays at 27.5 us against 63.6 us unsplit.
 
     Why the combine term matters: ``s`` reaches the first term ONLY through
     ``waves(s)``, a step function.  Between wave boundaries a larger split is
@@ -274,7 +286,9 @@ def choose_split_kv(
         launch = unsplit_launch if split == 1 else split_launch
         base_ctas = launch.q_tiles * launch.heads_q * batch * launch.ctas_per_tile
         waves = _ceil_div(base_ctas * split, sm_count)
-        cost = waves * (_ceil_div(launch.kv_tiles, split) + _SPLIT_KV_CTA_COST) + combine_waves * split * _SPLIT_KV_COMBINE_COST
+        # No combine runs unsplit: the single-pass kernel writes O itself.
+        combine = combine_waves * split * _SPLIT_KV_COMBINE_COST if split > 1 else 0.0
+        cost = waves * (_ceil_div(launch.kv_tiles, split) + _SPLIT_KV_CTA_COST) + combine
         if best_cost is None or cost < best_cost:
             best_split, best_cost = split, cost
     return best_split
@@ -587,12 +601,38 @@ def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
 #     b=32 h=64/8 S_q=1        cga2 232.2 us  ->  cga1 135.1 us
 #     b=32 h=64/4 S_q=4 MTP    cga2 LPT_L2 125.0 us  ->  cga1 NATURAL 66.9 us
 #     b=32 h=96/8 S_q=4 MTP    cga2 unpacked 2624.8 us  ->  cga1 1273.3 us
-#     b=8  h=64/4 S_q=1        cga2  59.6 us  ->  cga1 + SPLIT_KV=4  26.6 us
-# (at b=8 the wave-cost model, fed ctas_per_tile=1, now splits the 32-unit
-# launch across the machine; at b=32 the 128 units fill one wave unsplit.)
+#     b=8  h=64/4 S_q=1        cga2 + SPLIT_KV=2  39.1 us  ->  cga1 + SPLIT_KV=4  27.5 us
+# (the b=8 "before" is the pre-change heuristic's own plan -- the wave-cost
+# model already split that 32-unit launch at cga2; fed ctas_per_tile=1 it
+# splits twice as fine and every split still fits one wave. At b=32 the 128
+# units fill one wave unsplit. Kernel time is what moved: an eager, non-graph
+# execute of either plan is host-bound at this size, ~130-190 us of wall per
+# call, so a caller must replay under a CUDA graph to see the win end to end.)
 # On square prefill shapes cga1 and cga2 measure within noise (the kernel's
 # docstring), so the rule stops at one CTA's rows and prefill keeps cga2:
-# dense causal / mask-free 4k prefill, b=1 h=32/8, unchanged at 1.00x.
+# dense causal / mask-free 4k prefill, b=1 h=32/8, unchanged at 1.00x. At the
+# rule's edge -- units of exactly one CTA's rows whose cga2 launch already fit
+# one wave, e.g. b=8 h=32/8 S_q=64 S_kv=4096 paged -- cga1 costs the K
+# multicast and measures 4% behind (67.6 vs 65.1 us); the split model, not the
+# width, decides that band (see the b=8 rows at S_q 16 / 64 / 128 below).
+#
+# What the plan lists lose and gain. Past one cga2 cluster per unit
+# (S_q * G > 512) every list is byte-identical to before. At or below it the
+# LPT / LPT_L2 scheduler runners are gone (the one-cluster NATURAL rule); at or
+# below 256 rows the lead moves to cga1 and cga2 stays behind it as a runner.
+# The split leg at cga1 sees the true CTA count (ctas_per_tile=1) -- the wave
+# model's constants are per CTA and a cga1 CTA does the work of a cga2 CTA --
+# so small-batch launches split finer than they did at cga2. That is right
+# where the combine is cheap and was wrong where it is not, which turned out to
+# be the model's unsplit leg paying for a combine it never runs
+# (choose_split_kv docstring). Paged bf16 d128 h=32/8 b=8 S_kv=4096 page 16,
+# bottom-right causal, B200 kernel time, pre-change plan -> heuristic plan:
+#     S_q=16  (64 rows)   cga2 LPT_L2 63.8 us  ->  cga1 + SPLIT_KV=2  49.4 us
+#     S_q=64  (256 rows)  cga2 LPT_L2 65.1 us  ->  cga1 unsplit       67.6 us
+#     S_q=128 (512 rows)  cga2 LPT_L2 65.3 us  ->  cga2 NATURAL       62.9 us
+# (at S_q=64 the split the model briefly proposed measured 75.0 us; the same
+# accounting fix moves the dense b=4 h=32/8 S_q=128 causal lead, a cga2
+# launch, from split 2 at 155.5 us to unsplit at 120.2 us.)
 #
 # One Q cluster per unit also gives every unit the same static tile weight, so
 # the causal LPT / LPT_L2 remaps have nothing to balance and only cost the remap.

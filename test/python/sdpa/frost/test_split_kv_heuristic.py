@@ -418,6 +418,28 @@ def test_decode_rows_barely_pay_for_the_combine():
     assert decode >= prefill
 
 
+def test_unsplit_leg_pays_no_combine():
+    """The unsplit leg runs ONE kernel -- no combine is launched -- so the model
+    charges it none. Charging it one combine wave-set (``s = 1`` in the combine
+    term) under-priced the reduction a split adds by exactly that much, which
+    flipped small-KV launches with many output rows to a split that measures
+    slower (B200, d128 bf16, S_kv=4096 = 32 KV tiles, kernel time):
+
+        b=8 h=32/8 S_q=64 paged, cga1, 16384 rows:  unsplit 67.6 us, split 2 75.0 us
+        b=4 h=32/8 S_q=128 dense causal, cga2:      unsplit 120.2 us, split 2 155.5 us
+
+    while a cheap combine still lets the model split where that pays:
+
+        b=8 h=32/8 S_q=16 paged, cga1, 4096 rows:   split 2 49.4 us, unsplit 65.3 us
+        b=8 h=64/4 S_q=1 paged, cga1, 512 rows:     split 4 27.5 us, unsplit 63.6 us
+    """
+    common = dict(q_tiles=1, kv_tiles=32, sm_count=B200_SMS)
+    assert choose_split_kv(heads_q=8, batch=8, ctas_per_tile=1, combine_rows=64 * 32 * 8, **common) == 1
+    assert choose_split_kv(heads_q=8, batch=4, ctas_per_tile=2, combine_rows=128 * 32 * 4, **common) == 1
+    assert choose_split_kv(heads_q=8, batch=8, ctas_per_tile=1, combine_rows=16 * 32 * 8, **common) == 2
+    assert choose_split_kv(heads_q=4, batch=8, ctas_per_tile=1, combine_rows=1 * 64 * 8, **common) == 4
+
+
 # --- a quantized O is a legal split target ---------------------------------
 #
 # The split kernels write HALF partials whatever the O dtype and the combine

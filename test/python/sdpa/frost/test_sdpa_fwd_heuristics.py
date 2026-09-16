@@ -559,6 +559,32 @@ def test_d128_causal_scheduler_rule_stops_at_one_q_cluster():
 
 
 @pytest.mark.L0
+def test_d128_one_cta_units_split_only_where_the_combine_is_cheap():
+    """At cga1 the wave model sees the true CTA count, so a small batch splits
+    finer than it did at cga2 -- right where the combine is one wave, wrong
+    where the output rows make it many: the unsplit leg runs no combine and
+    must not be charged one. Pinned to the B200 kernel times in the heuristics
+    module: b=8 h=32/8 S_q=64 paged bottom-right (256 rows, 16384 combine rows)
+    and its dense causal twin lead UNSPLIT at cga1 (their split 2 measured 11%
+    slower); S_q=16 at the same batch (4096 combine rows) leads with the split
+    that pays, no-split reachable behind it; the b=8 h=64/4 decode keeps its
+    four splits; and the dense b=4 h=32/8 S_q=128 causal launch -- a cga2
+    unit -- stops proposing the split 2 that measured 29% slower than unsplit."""
+    chunk = dict(b=8, h_q=32, h_kv=8, s_q=64, causal=True)
+    for facts in (_decode_facts(bottom_right=True, **chunk), _decode_facts(**chunk, **_DENSE)):
+        lead = _f16_plans(facts)[0].knobs
+        assert (lead.cga, lead.split_kv, lead.pack_gqa) == (1, 1, True), lead
+    short = _f16_plans(_decode_facts(bottom_right=True, **{**chunk, "s_q": 16}))
+    assert (short[0].knobs.cga, short[0].knobs.split_kv) == (1, 2), short[0].knobs
+    assert any(p.knobs.cga == 1 and p.knobs.split_kv == 1 for p in short), [p.knobs for p in short]
+    decode = _f16_plans(_decode_facts(b=8))[0].knobs
+    assert (decode.cga, decode.split_kv) == (1, 4), decode
+    two_ctas = _f16_plans(_decode_facts(b=4, h_q=32, h_kv=8, s_q=128, causal=True, **_DENSE))
+    assert two_ctas[0].knobs.cga == 2, two_ctas[0].knobs
+    assert all(p.knobs.split_kv == 1 for p in two_ctas), [p.knobs for p in two_ctas]
+
+
+@pytest.mark.L0
 def test_d128_cga_request_domain():
     """The f16 row admits cga1 AND cga2 on d128, split or not (the kernel's cga1
     QO-alias configuration is validated with splits); a width the flavor has no
