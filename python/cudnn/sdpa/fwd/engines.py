@@ -211,6 +211,9 @@ class Capabilities:
     # O dtype domain, declared only by the quantized rows: elsewhere O must
     # equal Q, which facts.uniform_dtype already enforces.
     out_dtypes: frozenset = frozenset()
+    # Block-scaled O domain (facts.o_block_scale): 0 = plain O; 16 = FP4_E2M1 O
+    # + E4M3 scale per 16 d in ``sf_o``; 32 = FP8_E4M3 O + UE8M0 scale per 32.
+    o_block_scales: frozenset = frozenset({0})
 
     # optional features a graph may request
     bias: bool = False
@@ -522,6 +525,18 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return f"this engine serves only {quant} graphs"
     if (capabilities.is_fp8 or capabilities.is_mxfp8) and facts.dtype_o not in capabilities.out_dtypes:
         return f"O dtype {facts.dtype_o} not in {sorted(str(d) for d in capabilities.out_dtypes)}"
+    if facts.o_block_scale not in capabilities.o_block_scales:
+        return f"block-scaled O (scale block {facts.o_block_scale} along d) is not served by this engine (domain {sorted(capabilities.o_block_scales)})"
+    if facts.o_block_scale:
+        # The block-scaled epilogue writes SF_O per dense Q row of one
+        # sequence; THD / per-batch Q trim / a KV split (fp32 partials) / a
+        # packed GQA tile all break that row <-> scale-factor mapping.
+        if facts.thd or facts.seq_q_trim:
+            return "block-scaled O (sf_o) serves dense, untrimmed Q rows only"
+        if knobs is not None and knobs.split_kv is not None and knobs.split_kv > 1:
+            return "block-scaled O (sf_o) cannot be combined with split_kv > 1"
+        if knobs is not None and knobs.pack_gqa:
+            return "block-scaled O (sf_o) cannot be combined with pack_gqa"
     if not facts.uniform_dtype:
         return "K/V dtypes must match Q" if (facts.is_mxfp8 or facts.is_fp8) else "K/V/O dtypes must match Q"
     if facts.thd:
@@ -996,7 +1011,11 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # stays expressible without reintroducing a boolean that cannot say it.
             thd_d_shapes=SM107_FP8_THD_SHAPES if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}),
+            # Block-scaled O epilogues (FP4_E2M1 + E4M3/16, FP8_E4M3 + UE8M0/32):
+            # the d128 flavor on both arch lines; the adapter declines the
+            # wider flavors (config_sm100 backstop).
+            o_block_scales=frozenset({0, 16, 32}),
             is_fp8=True,
             causal=True,
             bottom_right=True,
@@ -1424,6 +1443,10 @@ def lower_dsl_prefill(
         paged_table_v_stride=_table_stride(facts.paged_v_table_t) if facts.has_paged_kv else None,
         dtype_o=facts.dtype_o if (facts.is_mxfp8 or facts.is_fp8) else None,
         pertensor_fp8=facts.is_fp8,
+        # Block-scaled O: the sf_o output's declared geometry selects the
+        # per-(b,h)-plane or token-major scale-factor layout (see
+        # SdpaFwdDsl._sf_o_geometry).
+        sample_sf_o=ga.tensor_desc_from_ir(facts.sf_o_t, name="sf_o") if facts.sf_o_t is not None else None,
         sched_policy=knobs.sched_policy if knobs is not None else None,
         tile_m=knobs.tile_m if knobs is not None else None,
         tile_n=knobs.tile_n if knobs is not None else None,
@@ -1486,6 +1509,7 @@ def lower_dsl_prefill(
         sf_k=facts.sf_k_t,
         sf_v=facts.sf_v_t,
         amax_o=facts.amax_o_t,
+        sf_o=facts.sf_o_t,
         descale_q=facts.descale_q_t,
         descale_k=facts.descale_k_t,
         descale_v=facts.descale_v_t,
@@ -1506,6 +1530,22 @@ def lower_dsl_prefill(
         implies), so the caller's view is kept as-is there.
         """
         dim, stride = tuple(ir_t.get_dim()), tuple(ir_t.get_stride())
+        if ir_t.get_data_type() == cudnn.data_type.FP4_E2M1:
+            # Two E2M1 per byte: the buffer is the byte container of the
+            # logical geometry (unit-stride extent and every other stride
+            # halved), bound as an FP8-typed view the kernel treats as bytes.
+            from cudnn.graph_types import storage_geometry
+
+            geom = storage_geometry(dim, stride, ir_t.get_data_type())
+            if geom is None:
+                raise ValueError(f"FP4 O geometry dim={dim} stride={stride} has no byte-container spelling")
+            sdim, sstride = geom
+            import torch
+
+            byte_buf = buf.view(torch.float8_e4m3fn) if buf.dtype != torch.float8_e4m3fn else buf
+            if tuple(byte_buf.shape) == sdim and tuple(byte_buf.stride()) == sstride:
+                return byte_buf
+            return byte_buf.as_strided(sdim, sstride)
         if tuple(buf.shape) == dim and tuple(buf.stride()) == stride:
             return buf
         return buf.as_strided(dim, stride)
@@ -1549,6 +1589,7 @@ def lower_dsl_prefill(
         sf_k_buf = resolved.get(id(binding.sf_k)) if binding.sf_k is not None else None
         sf_v_buf = resolved.get(id(binding.sf_v)) if binding.sf_v is not None else None
         amax_o_buf = resolved.get(id(binding.amax_o)) if binding.amax_o is not None else None
+        sf_o_buf = resolved.get(id(binding.sf_o)) if binding.sf_o is not None else None
         dq_buf = resolved.get(id(binding.descale_q)) if binding.descale_q is not None else None
         dk_buf = resolved.get(id(binding.descale_k)) if binding.descale_k is not None else None
         dv_buf = resolved.get(id(binding.descale_v)) if binding.descale_v is not None else None
@@ -1590,6 +1631,10 @@ def lower_dsl_prefill(
                 descale_v=dv_buf,
                 scale_o=so_buf,
             )
+            if facts.o_block_scale:
+                if sf_o_buf is None:
+                    raise ValueError("cudnn.sdpa_fp8: the graph requests the sf_o output but no buffer was provided for it")
+                execute_kwargs["sf_o"] = sf_o_buf
         if _extra_exec_keys:
             # SM80 feature operand (mismatch admitted it for this row).
             if feature_ops.bias is not None and "bias_tensor" in _extra_exec_keys:
@@ -1676,7 +1721,9 @@ def _sm120_fp8_spec() -> EngineSpec:
             d_shapes=frozenset((tq, tv) for tq in SUPPORTED_HEAD_TILES_FP8 for tv in SUPPORTED_HEAD_TILES_FP8),
             d_pad_multiple=16,  # TMA 16-byte global-stride rule at 1 byte/elem
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}),
+            # Block-scaled O epilogues (d_v = 128; the adapter declines other head dims).
+            o_block_scales=frozenset({0, 16, 32}),
             is_fp8=True,
             causal=True,
             bottom_right=True,

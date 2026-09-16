@@ -1096,6 +1096,8 @@ class pygraph:
                 return node  # declared python-only: lowering raises by design
             if any(node.params.get(attr) is not None for attr in spec_entry[1].get("python_only_attrs", ())):
                 return node  # an op attribute the backend has no field for is SET: python engines only
+            if any(node.outputs.get(port) is not None for port in spec_entry[1].get("python_only_out_kwargs", ())):
+                return node  # an output the backend cannot produce (sf_o) is requested: python engines only
         return None
 
     def _backend_lowerable(self) -> bool:
@@ -2405,8 +2407,9 @@ class pygraph:
                 for port, t in node.inputs.items():
                     if not port.startswith("dropout_"):
                         kw[port] = tensor_map[t.uid]
+                python_only_outs = spec.get("python_only_out_kwargs", ())
                 for port in spec.get("out_kwargs", ()):
-                    if port in node.outputs:  # classic passes these descriptors as args
+                    if port in node.outputs and port not in python_only_outs:  # classic passes these descriptors as args
                         kw[port] = lower_tensor(node.outputs[port])
                 n_drop = node.params.get("_dropout_n")
                 if n_drop:
@@ -3453,7 +3456,13 @@ _CAPTURED_OPS = {
         node_type=NodeType.SDPA_FP8,
         pos=("q", "k", "v", "descale_q", "descale_k", "descale_v", "descale_s", "scale_s", "scale_o"),
         outputs=("O", "Stats", "Amax_S", "Amax_O"),
-        out_kwargs=("rng_dump", "score_max", "score_sum_exp"),
+        # ``sf_o``: block-scaled O scale factors (O declared FP4_E2M1 -> one
+        # E4M3 scale per 16 d elements; O FP8_E4M3 + sf_o -> one UE8M0 scale
+        # per 32). The caller passes its descriptor like rng_dump; the cuDNN
+        # backend has no field for it, so a graph that sets it is served by
+        # python engines only (see python_only_out_kwargs / _unlowerable_node).
+        out_kwargs=("rng_dump", "score_max", "score_sum_exp", "sf_o"),
+        python_only_out_kwargs=("sf_o",),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_S": _AMAX, "Amax_O": _AMAX},
         python_only_attrs=("softmax_precision",),  # see "sdpa"

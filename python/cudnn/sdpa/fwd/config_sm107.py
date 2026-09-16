@@ -111,6 +111,10 @@ _SMEM_FIXED_OVERHEAD = 2 * 1024  # barriers + scheduler + tmem-ptr slack
 TMEM_TOTAL_COLS = 576
 
 _DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16 = 0, 1, 2, 3
+# Output-only block-scaled codes (per-tensor FP8 d128 epilogue; see config_sm100):
+# 4 = E2M1 data + E4M3 scale per 16 d, 5 = E4M3 data + UE8M0 scale per 32 d.
+_DTYPE_O_NVFP4, _DTYPE_O_MXFP8 = 4, 5
+_O_BLOCK_SCALE_BY_DTYPE = {_DTYPE_O_NVFP4: 16, _DTYPE_O_MXFP8: 32}
 
 # Head-dim shapes whose Rubin PER-TENSOR FP8 kernel carries the THD/varlen leg.
 #
@@ -155,8 +159,14 @@ SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)
 
 
 def bpe(dtype: int) -> int:
-    """Bytes per element. FP8/MXFP8 = 1, BF16/FP16 = 2."""
-    return 1 if dtype <= _DTYPE_E5M2 else 2
+    """Bytes per STORAGE element. FP8/MXFP8 = 1 (the block-scaled O codes are
+    byte containers too), BF16/FP16 = 2."""
+    return 1 if (dtype <= _DTYPE_E5M2 or dtype in (_DTYPE_O_NVFP4, _DTYPE_O_MXFP8)) else 2
+
+
+def o_pack_div(dtype_o: int) -> int:
+    """Logical O elements per storage byte: 2 for E2M1, else 1."""
+    return 2 if dtype_o == _DTYPE_O_NVFP4 else 1
 
 
 def resolve_dtype_o(params: TemplateParams) -> int:
@@ -199,8 +209,8 @@ def v_swz_bytes(tile_o: int, cta_mma: int, bpe_val: int) -> int:
     raise ValueError(f"V inner bytes {inner} is not a multiple of 32/64/128")
 
 
-def o_swz_bytes(tile_o: int, bpe_o: int) -> int:
-    return 128 if (tile_o * bpe_o) % 128 == 0 else 64
+def o_swz_bytes(tile_o: int, bpe_o: int, pack_div: int = 1) -> int:
+    return 128 if (tile_o * bpe_o // pack_div) % 128 == 0 else 64
 
 
 def rescale_threshold(dtype_qkv: int) -> float:
@@ -286,8 +296,15 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     if k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16):
         raise ValueError(f"{flavor}: dtype_qkv must be 0=E4M3/1=E5M2/2=BF16/3=FP16 (got {k.dtype_qkv}); Rubin has no TF32 prefill kernel")
     dtype_o = resolve_dtype_o(k)
-    if dtype_o not in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16):
-        raise ValueError(f"{flavor}: dtype_o must be 0..3 (got {k.dtype_o})")
+    if dtype_o not in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16, _DTYPE_O_NVFP4, _DTYPE_O_MXFP8):
+        raise ValueError(f"{flavor}: dtype_o must be 0..5 (got {k.dtype_o})")
+    if dtype_o in (_DTYPE_O_NVFP4, _DTYPE_O_MXFP8):
+        if k.dtype_qkv > _DTYPE_E5M2:
+            raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) requires FP8 inputs")
+        if "d128" not in flavor:
+            raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) is only supported on d128")
+        if k.thd_varlen or k.seq_q_lens_present or (k.split_kv or 1) > 1 or k.pack_gqa:
+            raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) serves dense, unsplit, unpacked graphs only")
     if k.dtype_qkv > _DTYPE_E5M2 and dtype_o != k.dtype_qkv:
         raise ValueError(f"{flavor}: half input (BF16/FP16) requires dtype_o == dtype_qkv; got dtype_o={dtype_o}")
     if k.sched_policy not in (None, SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
@@ -355,6 +372,10 @@ class _CfgSm107:
     DTYPE_O: int = _DTYPE_FP16
     BPE: int = 2
     BPE_O: int = 2
+    # Block-scaled O (per-tensor FP8 d128 only): scale block along d (0 = plain
+    # O) and logical O elements per storage byte (2 for E2M1).
+    O_BLOCK_SCALE: int = 0
+    O_PACK_DIV: int = 1
 
     # --- cluster
     CGA_M: int = 2
@@ -632,6 +653,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
+    o_div = o_pack_div(dtype_o)
     tile_n = 128
     stages_kv = _stages_kv_d128(params.dtype_qkv, cta_mma, mxfp8=mxfp8, tile_k=tile_k)
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
@@ -654,7 +676,9 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         Q_SWZ_BYTES=q_swz_bytes(tile_k, b),
         K_SWZ_BYTES=q_swz_bytes(tile_k, b),
         V_SWZ_BYTES=v_swz_bytes(tile_o, cta_mma, b),
-        O_SWZ_BYTES=o_swz_bytes(tile_o, b_o),
+        O_SWZ_BYTES=o_swz_bytes(tile_o, b_o, o_div),
+        O_BLOCK_SCALE=_O_BLOCK_SCALE_BY_DTYPE.get(dtype_o, 0),
+        O_PACK_DIV=o_div,
         TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
         TILES_Q=2,
