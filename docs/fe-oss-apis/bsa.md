@@ -381,5 +381,7 @@ backward. `bucket_size_blocks` optionally controls backward query buckets;
 the default reuses the torch path's heuristic. Multi-device placement and cache
 portability across architectures require further qualification.
 
-The isolated tests live in `test/jax` so the torch-importing
-`test/python/conftest.py` cannot contaminate runtime import checks.
+The JAX tests live in `test/python/fe_api/jax` and are collected by the OSS
+suite. Torch-free import and gradient checks run in fresh subprocesses. To run
+the suite in a torch-free container, pass `--confcutdir=test/python/fe_api/jax`
+so pytest does not load the torch-based parent conftest.

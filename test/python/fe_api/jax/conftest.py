@@ -5,7 +5,6 @@ import os
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-import jax
 import pytest
 
 
@@ -14,6 +13,8 @@ def pytest_addoption(parser):
 
 
 def sm100_available():
+    import jax
+
     devices = jax.local_devices()
     return len(devices) == 1 and devices[0].platform == "gpu" and str(getattr(devices[0], "compute_capability", "")) == "10.0"
 
@@ -21,7 +22,7 @@ def sm100_available():
 def pytest_configure(config):
     for marker in ("L0: smoke tests", "gpu_exclusive: requires exclusive GPU access"):
         config.addinivalue_line("markers", marker)
-    if config.getoption("--require-sm100") and not sm100_available():
+    if config.getoption("--require-sm100", default=False) and not sm100_available():
         raise pytest.UsageError("BSA JAX qualification requires one visible SM100 GPU")
 
 

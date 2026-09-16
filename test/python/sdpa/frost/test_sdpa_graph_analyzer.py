@@ -670,9 +670,82 @@ def test_knob_request_pack_gqa_on_mha_is_identity():
 
 
 def test_knob_request_pack_gqa_no_pow2_group_rejects_engine():
-    # GQA ratio 3 does not divide tile_m (128) so pack_gqa_supported is False.
+    # GQA ratios 3 and 5 share no factor with tile_m (128): nothing can be
+    # packed, so an explicit pack_gqa=True is not honorable (never degraded).
     g = _mk_gqa_graph(6, 2)
     assert not _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+    assert not _eligible(_mk_gqa_graph(10, 2), engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_knob_request_pack_gqa_partial_group_on_wired_flavors_only():
+    # Partial PackGQA (Capabilities.pack_gqa_partial_d_shapes): a ratio that
+    # shares a factor with tile_m but does not divide it packs that factor on
+    # the d128 and d256 f16 flavors (G=12 -> 4 heads per row group, G=6 -> 2) ...
+    for h_q, h_kv in ((24, 2), (12, 2)):
+        assert engines.engine_name() in _eligible(_mk_gqa_graph(h_q, h_kv), engines.SdpaFwdKnobs(pack_gqa=True))
+        assert engines.engine_name() in _eligible(_mk_gqa_graph(h_q, h_kv, d=256), engines.SdpaFwdKnobs(pack_gqa=True))
+    # ... while the d512 flavor keeps the full-ratio contract (its kernel packs
+    # HEADS_PER_TILE = G), so the same request is declined there.
+    assert not _eligible(_mk_gqa_graph(24, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert engines.engine_name() in _eligible(_mk_gqa_graph(32, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+    # A group larger than the tile (256/1 MQA) packs the whole tile (p = 128,
+    # two packed heads per KV head) on the partial flavors; declined on d512.
+    assert engines.engine_name() in _eligible(_mk_gqa_graph(256, 1), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert not _eligible(_mk_gqa_graph(256, 1, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
+    # The standalone adapter (api_dsl.SdpaFwdDslSm100.check_support) mirrors
+    # Capabilities.pack_gqa_partial_d_shapes as a module tuple because the
+    # adapter has no engine row in hand when it validates a knob request.  Pin
+    # the two together so the gate cannot drift: the f16 SM100 row declares
+    # exactly the adapter's flavors, and no other row (fp8 / mxfp8, the cc 10.7
+    # line, SM120) declares partial packing -- the adapter excludes those too.
+    from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
+
+    by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
+    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256)})
+    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name != engines.engine_name()}
+    assert all(v is None for v in others.values()), others
+
+
+def test_capabilities_positional_prefix_is_append_only():
+    # Capabilities evolves APPEND-ONLY (the contract stated above
+    # pack_gqa_d_shapes): a positional construction written against an older
+    # field order must keep binding the same fields.  Prove it the way it
+    # breaks -- construct positionally in the pre-partial-PackGQA order with
+    # thd_padded_stats=True and check nothing rebinds (inserted mid-class, the
+    # True landed on pack_gqa_partial_d_shapes, thd_padded_stats fell back to
+    # False and the flavor membership test raised TypeError on a bool) -- then
+    # pin the legacy tail and the new field's place after it.
+    import dataclasses
+
+    fields = {f.name: f for f in dataclasses.fields(engines.Capabilities)}
+    names = list(fields)
+    required = {"sm_lo": 100, "sm_hi": 100, "phase": "prefill", "d_shapes": frozenset({(128, 128)})}
+
+    def legacy_value(name):
+        f = fields[name]
+        if name == "thd_padded_stats":
+            return True
+        if f.default is not dataclasses.MISSING:
+            return f.default
+        if f.default_factory is not dataclasses.MISSING:
+            return f.default_factory()
+        return required[name]
+
+    legacy_order = [n for n in names if n != "pack_gqa_partial_d_shapes"]
+    caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
+    assert caps.thd_padded_stats is True
+    assert caps.pack_gqa_partial_d_shapes is None
+    assert caps.epilogue_gate is False
+    assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
+
+    legacy_tail = ["pack_gqa_d_shapes", "thd_padded_stats", "epilogue_gate", "epilogue_gate_d_shapes", "epilogue_gate_dtypes"]
+    start = names.index("pack_gqa_d_shapes")
+    assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
+    assert names[-1] == "pack_gqa_partial_d_shapes", names[-3:]
 
 
 def test_knob_request_pack_gqa_false_always_eligible():
@@ -1546,3 +1619,275 @@ def test_packed_layout_ignores_the_batch_stride_a_ragged_tensor_never_reads():
     bhsd = ((b, h, s, d), (h * s * d, s * d, d, 1))  # heads outside tokens: not the packed order
     assert not packed_layout_ok(*bhsd)
     assert packed_layout_ok((1, h, s, d), (h * d, d, h * d, 1))  # b == 1 wildcards as before
+
+
+# ---------------------------------------------------------------------------
+# Epilogue-gate tail: sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)  (PR-A)
+#
+# The analyzer recognises EXACTLY this three-node shape (cudnn._sdpa_tail),
+# records it as FACTS (has_epilogue_gate, the G ref, its dtype, shape-ok, the
+# virtual O_v's dtype and declaration state) and rebinds ``o_t`` to the mul
+# output.  The rows judge: only the Rubin d256 rows claim it, at exact dims.
+# ---------------------------------------------------------------------------
+
+_D256 = 256
+
+
+def _mk_gated_graph(
+    *,
+    d=_D256,
+    dtype=DTYPE,
+    intermediate=cudnn.data_type.FLOAT,
+    mul_order="o_first",
+    declare_o_v=True,
+    o_v_dtype=None,
+    gate_dims=None,
+    sdpa_kwargs=None,
+    gate_strides=None,
+):
+    """(graph, tensors) for the gate tail; ``o`` (the mul output) is the REAL output.
+    ``gate_strides`` overrides G's BSHD layout (None = compact BSHD for ``gate_dims``)."""
+    g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=intermediate, compute_data_type=cudnn.data_type.FLOAT)
+    dims = (B, H, S, d)
+    strides = (S * H * d, d, H * d, 1)
+    q = g.tensor(dim=dims, stride=strides, data_type=dtype, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=dtype, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=dtype, name="v")
+    gdims = tuple(gate_dims) if gate_dims is not None else dims
+    gstrides = tuple(gate_strides) if gate_strides is not None else _bshd_strides(*gdims[1:])  # default: G rides O's BSHD layout
+    gate = g.tensor(dim=gdims, stride=gstrides, data_type=dtype, name="gate")
+    o_v, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True, **(sdpa_kwargs or {}))
+    if declare_o_v:
+        o_v.set_dim(dims).set_stride(strides)
+    if o_v_dtype is not None:
+        o_v.set_data_type(o_v_dtype)
+    s = g.sigmoid(input=gate, name="sig")
+    o = g.mul(a=o_v, b=s, name="gated") if mul_order == "o_first" else g.mul(a=s, b=o_v, name="gated")
+    _finish_output(o, dims, strides, dtype=dtype)
+    return g, dict(q=q, k=k, v=v, gate=gate, o_v=o_v, s=s, o=o)
+
+
+def _rubin(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (10, 7))
+
+
+@pytest.mark.parametrize("mul_order", ["o_first", "s_first"])
+@pytest.mark.parametrize("intermediate", [cudnn.data_type.FLOAT, None], ids=["intermediate-FLOAT", "intermediate-inherits-io"])
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16], ids=["fp16", "bf16"])
+def test_gate_tail_is_recognised(monkeypatch, mul_order, intermediate, dtype):
+    """The three-node tail is ONE sdpa graph to the analyzer: ``has_epilogue_gate``,
+    ``epilogue_gate_t`` IS the graph's G, ``o_t`` IS the mul output (the kernel
+    writes the real O; O_v / s are never bound), in either mul operand order and
+    with or without an explicit FLOAT intermediate dtype (plan S7 Q7: O_v may be
+    FLOAT or Q's dtype -- the kernel gates the fp32 pre-cast accumulator either
+    way).  Only the Rubin f16 row is eligible at d=256 on cc10.7; at d=128 no
+    row is, and the reason names the gate."""
+    _rubin(monkeypatch)
+    g, ts = _mk_gated_graph(mul_order=mul_order, intermediate=intermediate, dtype=dtype)
+    facts = _facts(g)
+    assert facts.has_epilogue_gate is True
+    assert facts.epilogue_gate_t is ts["gate"]
+    assert facts.epilogue_gate_dtype == dtype
+    assert facts.epilogue_gate_shape_ok is True
+    assert facts.epilogue_gate_layout_ok is True, "a compact BSHD G is TMA-loadable zero-copy"
+    assert facts.o_t is ts["o"], "the REAL O is the mul output"
+    assert facts.o_t is not ts["o_v"]
+    assert facts.sdpa_o_virtual_declared is True
+    assert facts.sdpa_o_virtual_dtype in (None, cudnn.data_type.FLOAT, dtype)
+    assert facts.q_t is ts["q"] and facts.d_qk == facts.d_v == _D256 and facts.causal is True
+    assert ga._single_sdpa_node(g) is not None, "the sdpa node is still reachable through the single-node accessor"
+    assert _eligible(g) == {"sdpa_fwd_prefill_sm107"}
+    # The 4-node SdpaBinding must demand G and never O_v / s.
+    assert "gate" in ga.SdpaBinding.__dataclass_fields__
+
+    g128, _ = _mk_gated_graph(d=128, mul_order=mul_order, intermediate=intermediate, dtype=dtype)
+    assert _facts(g128).has_epilogue_gate is True
+    assert not _eligible(g128)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    _, why = engines.analyze_for(spec, g128)
+    assert why is not None and "epilogue gate" in why, why
+    # The same tail on the SM100 line (the autouse cc) is declined by every row.
+    monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    g100, _ = _mk_gated_graph(mul_order=mul_order, intermediate=intermediate, dtype=dtype)
+    assert not _eligible(g100)
+
+
+def test_gate_tail_o_v_dtype_decision(monkeypatch):
+    """O_v carries whatever dtype the IR gives a virtual (the intermediate dtype
+    at validate(); None before): FLOAT and Q's dtype are ACCEPTED, anything else
+    is declined by message -- the kernel gates the fp32 pre-cast accumulator and
+    never materialises O_v, so only those two describe the math it does."""
+    _rubin(monkeypatch)
+    for ok in (None, cudnn.data_type.FLOAT, cudnn.data_type.HALF):
+        g, _ = _mk_gated_graph(o_v_dtype=ok)
+        assert _facts(g).sdpa_o_virtual_dtype == ok
+        assert _eligible(g) == {"sdpa_fwd_prefill_sm107"}, ok
+    g, _ = _mk_gated_graph(o_v_dtype=cudnn.data_type.BFLOAT16)
+    assert not _eligible(g)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    assert "virtual O" in engines.analyze_for(spec, g)[1]
+
+
+def _malformed_cases():
+    """(id, builder) -> a graph the tail matcher must NOT fuse, or fuse-then-decline."""
+
+    def non_virtual_o_v():
+        g, ts = _mk_gated_graph()
+        ts["o_v"].set_output(True)  # a REAL O_v: two outputs, nothing to fuse
+        return g
+
+    def sigmoid_of_o_v_times_g():
+        g = _mk_graph()
+        q, k, v, dims, strides = _mk_qkv(g, d=_D256)
+        gate = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="gate")
+        o_v, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+        o_v.set_dim(dims).set_stride(strides)
+        o = g.mul(a=g.sigmoid(input=o_v), b=gate)
+        _finish_output(o, dims, strides)
+        return g
+
+    def g_produced_by_a_node():
+        # G = the sdpa node's own Stats: three nodes, but G is not a graph INPUT.
+        g = _mk_graph()
+        q, k, v, dims, strides = _mk_qkv(g, d=_D256)
+        o_v, stats = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, generate_stats=True)
+        o_v.set_dim(dims).set_stride(strides)
+        o = g.mul(a=o_v, b=g.sigmoid(input=stats))
+        _finish_output(o, dims, strides)
+        return g
+
+    def sigmoid_output_is_an_output():
+        g, ts = _mk_gated_graph()
+        ts["s"].set_output(True).set_dim((B, H, S, _D256)).set_stride((S * H * _D256, _D256, H * _D256, 1))
+        return g
+
+    def second_sdpa():
+        g, ts = _mk_gated_graph()
+        o2, _ = g.sdpa(name="s2", q=ts["q"], k=ts["k"], v=ts["v"], attn_scale=0.1, is_inference=True)
+        _finish_output(o2, (B, H, S, _D256), (S * H * _D256, _D256, H * _D256, 1))
+        return g
+
+    def relu_tail():
+        g, ts = _mk_gated_graph()
+        r = g.relu(input=ts["o"], name="r")
+        r.set_output(True).set_dim((B, H, S, _D256)).set_stride((S * H * _D256, _D256, H * _D256, 1))
+        return g
+
+    def mul_by_g_without_sigmoid():
+        g = _mk_graph()
+        q, k, v, dims, strides = _mk_qkv(g, d=_D256)
+        gate = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="gate")
+        o_v, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+        o_v.set_dim(dims).set_stride(strides)
+        _finish_output(g.mul(a=o_v, b=gate), dims, strides)
+        return g
+
+    return [
+        ("non-virtual-o_v", non_virtual_o_v),
+        ("sigmoid(o_v)*g", sigmoid_of_o_v_times_g),
+        ("g-produced-by-a-node", g_produced_by_a_node),
+        ("s-marked-output", sigmoid_output_is_an_output),
+        ("second-sdpa", second_sdpa),
+        ("relu-tail", relu_tail),
+        ("mul-without-sigmoid", mul_by_g_without_sigmoid),
+    ]
+
+
+@pytest.mark.parametrize("case", [pytest.param(b, id=i) for i, b in _malformed_cases()])
+def test_gate_tail_rejects_malformed_shapes(monkeypatch, case):
+    """Anything that is not EXACTLY the tail is "not ours": analyze() returns
+    None (the graph is not a single sdpa forward), so no FROST row is eligible
+    and the classic path serves it."""
+    _rubin(monkeypatch)
+    g = case()
+    assert ga.analyze(g) is None
+    assert not _eligible(g)
+
+
+def test_gate_tail_declines_a_broadcast_g_and_an_undeclared_o_v(monkeypatch):
+    """Two LEGAL graphs (a broadcasting pointwise mul; a virtual O_v the user did
+    not declare) that the tail matcher DOES recognise and every row then
+    declines BY MESSAGE -- never facts.invalid, so the backend still serves them."""
+    _rubin(monkeypatch)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    g, ts = _mk_gated_graph(gate_dims=(B, 1, S, _D256))
+    facts = _facts(g)
+    assert facts.has_epilogue_gate is True and facts.epilogue_gate_shape_ok is False
+    assert not _eligible(g)
+    assert "shape" in engines.analyze_for(spec, g)[1]
+    g, ts = _mk_gated_graph(declare_o_v=False)
+    facts = _facts(g)
+    assert facts.has_epilogue_gate is True and facts.sdpa_o_virtual_declared is False
+    assert not _eligible(g)
+    assert "set_dim" in engines.analyze_for(spec, g)[1]
+
+
+@pytest.mark.parametrize(
+    "gate_strides",
+    [(H * S * _D256, S * _D256, _D256, 1), (S * H * 260, 260, H * 260, 1)],
+    ids=["head-major", "unaligned-head-stride"],
+)
+def test_gate_tail_declines_a_g_the_kernel_cannot_tma_load(monkeypatch, gate_strides):
+    """G is TMA-loaded ZERO-COPY by the fused kernel (Q/K/V/O have a normalisation
+    copy in the lowering; G has none), so a rank-4, O-SHAPED G whose strides TMA
+    cannot express -- head-major (the seq stride does not cover the heads), or a
+    head stride that is not a 16-byte multiple -- is a legal graph that the tail
+    matcher recognises, ``epilogue_gate_layout_ok`` records as False, and the
+    row declines naming the zero-copy rule.  This is the analyzer half of the
+    adapter's ``TMA-expressible`` ValueError (rule 8b): without it the row
+    would admit a G ``check_support`` then rejects."""
+    _rubin(monkeypatch)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    g, ts = _mk_gated_graph(gate_strides=gate_strides)
+    facts = _facts(g)
+    assert facts.has_epilogue_gate is True and facts.epilogue_gate_t is ts["gate"]
+    assert facts.epilogue_gate_shape_ok is True, "the shape is O's -- only the LAYOUT is at fault"
+    assert facts.epilogue_gate_layout_ok is False
+    assert not _eligible(g)
+    assert "zero-copy" in engines.analyze_for(spec, g)[1]
+    # The same G declared BSHD-compact is served: the layout fact is the only difference.
+    assert _eligible(_mk_gated_graph()[0]) == {"sdpa_fwd_prefill_sm107"}
+
+
+def test_virtual_amax_o_is_not_a_fact():
+    """``sdpa_fp8`` RETURNS its Amax_O port unconditionally; only a real
+    (set_output(True), non-virtual) tensor is a requested output.  A virtual one
+    used to enter SdpaBinding and make the plan demand a buffer nobody has
+    ("missing buffers" at execute) -- and it is what has_amax_o=False folds out."""
+    import math
+
+    dims, strides = (B, H, S, 128), (S * H * 128, 128, H * 128, 1)
+
+    def build(request_amax_o):
+        gg = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        qq = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="q")
+        kk = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="k")
+        vv = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="v")
+        ss = [gg.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT) for _ in range(6)]
+        o, _stats, _amx_s, amx_o = gg.sdpa_fp8(
+            q=qq,
+            k=kk,
+            v=vv,
+            descale_q=ss[0],
+            descale_k=ss[1],
+            descale_v=ss[2],
+            descale_s=ss[3],
+            scale_s=ss[4],
+            scale_o=ss[5],
+            attn_scale=1.0 / math.sqrt(128),
+            generate_stats=False,
+            use_causal_mask=True,
+        )
+        _finish_output(o, dims, strides, dtype=cudnn.data_type.HALF)
+        if request_amax_o:
+            amx_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+        return gg, amx_o
+
+    g, amx_o = build(request_amax_o=False)
+    assert amx_o.is_virtual
+    facts = _facts(g)
+    assert facts.amax_o_t is None, "a virtual Amax_O is not a requested output"
+    assert engines.engine_name(fp8=True) in _eligible(g), "and its absence declines nothing"
+    g, amx_o = build(request_amax_o=True)
+    assert _facts(g).amax_o_t is amx_o
+    assert engines.engine_name(fp8=True) in _eligible(g)

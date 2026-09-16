@@ -234,3 +234,124 @@ def test_bwd_sq1_skv1_rejected(frost_candidate):
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="s_q = s_kv = 1"):
         g.validate()
     assert g._lowered_graph is None
+
+
+# ---------------------------------------------------------------------------
+# Epilogue-gate tail (PR-A): sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)
+#
+# The three-node graph is validated python-natively (cudnn._sdpa_tail.match_gate_tail
+# + the sdpa node's own rules + G/O dim-stride checks), so pygraph.validate()
+# does not fall back to the eager C++ lowering -- whose pre_validate_node
+# needs a rank-4 dim + stride on the sdpa node's O, which the frontend pushes
+# only when USER-assigned.  An undeclared O_v is therefore a typed
+# not-supported here (plan S7 Q8: a user contract, not a _pygraph change).
+# ---------------------------------------------------------------------------
+
+
+def _gated_sdpa_graph(b=1, h=2, s=64, d=256, *, declare_o_v=True, gate_dim=None, **sdpa_kwargs):
+    """(graph, tensors-by-name) for the gate tail; ``o`` (the mul output) is the output."""
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.HALF,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    dims, strides = [b, h, s, d], [h * s * d, s * d, d, 1]
+    q = g.tensor(name="q", dim=dims, stride=strides)
+    k = g.tensor(name="k", dim=dims, stride=strides)
+    v = g.tensor(name="v", dim=dims, stride=strides)
+    gdim = list(gate_dim) if gate_dim is not None else dims
+    gstride = []
+    run = 1
+    for n in reversed(gdim):
+        gstride.append(run)
+        run *= n
+    gate = g.tensor(name="gate", dim=gdim, stride=list(reversed(gstride)))
+    o_v, _ = g.sdpa(q, k, v, generate_stats=False, **sdpa_kwargs)
+    if declare_o_v:
+        o_v.set_dim(dims).set_stride(strides)
+    sig = g.sigmoid(input=gate)
+    o = g.mul(a=o_v, b=sig)
+    o.set_output(True).set_dim(dims).set_stride(strides)
+    return g, dict(q=q, k=k, v=v, gate=gate, o_v=o_v, s=sig, o=o)
+
+
+def test_gate_tail_validates_natively(frost_candidate):
+    """With a python candidate the WELL-FORMED tail validates without lowering
+    to C++ (the pointwise nodes are covered through the tail matcher, not
+    COVERED_NODE_TYPES), while the semantic checks still fire with the classic
+    error types: a wrong-rank G is rejected, and an UNDECLARED virtual O_v is
+    the typed not-supported the graph contract requires (a bare ValueError
+    would otherwise escape create_execution_plans from the C++ pre-validation).
+    The all-covered single-node fast path and the classic fallback for an
+    uncovered node (test_mixed_graph_still_lowers) are unchanged."""
+    g, _ = _gated_sdpa_graph(use_causal_mask=True)
+    g.validate()
+    assert g._lowered_graph is None, "the gate tail must validate python-natively when a python engine is a candidate"
+    assert g._is_validated is True
+
+    # G must be rank-4 with a unit head-dim stride, like every SDPA operand.
+    g, _ = _gated_sdpa_graph(gate_dim=(1, 2, 64), use_causal_mask=True)
+    with pytest.raises((ValueError, cudnn.cudnnGraphNotSupportedError)):
+        g.validate()
+    assert g._is_validated is False
+
+    # A broadcast G is a legal pointwise graph but NOT the fusable tail: typed not-supported.
+    g, _ = _gated_sdpa_graph(gate_dim=(1, 1, 64, 256), use_causal_mask=True)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+        g.validate()
+    assert g._is_validated is False
+
+    # The sdpa node's own rules still apply through the tail (h_q=3 over h_kv=2 trips the GQA rule).
+    gg = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    q = gg.tensor(name="q", dim=[1, 3, 64, 256], stride=[3 * 64 * 256, 64 * 256, 256, 1])
+    k = gg.tensor(name="k", dim=[1, 2, 64, 256], stride=[2 * 64 * 256, 64 * 256, 256, 1])
+    v = gg.tensor(name="v", dim=[1, 2, 64, 256], stride=[2 * 64 * 256, 64 * 256, 256, 1])
+    gate = gg.tensor(name="gate", dim=[1, 3, 64, 256], stride=[3 * 64 * 256, 64 * 256, 256, 1])
+    o_v, _ = gg.sdpa(q, k, v, generate_stats=False, use_causal_mask=True)
+    o_v.set_dim([1, 3, 64, 256]).set_stride([3 * 64 * 256, 64 * 256, 256, 1])
+    o = gg.mul(a=o_v, b=gg.sigmoid(input=gate))
+    o.set_output(True).set_dim([1, 3, 64, 256]).set_stride([3 * 64 * 256, 64 * 256, 256, 1])
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="group-query attention"):
+        gg.validate()
+    assert gg._lowered_graph is None
+
+
+def test_gate_tail_requires_a_declared_virtual_o_v(frost_candidate):
+    """An undeclared O_v (no set_dim / set_stride on the sdpa node's virtual
+    output) is rejected at validate() with the classic not-supported type and
+    an actionable message -- BEFORE planning, where the C++ lowering would
+    otherwise raise a bare ValueError (ATTRIBUTE_NOT_SET) out of
+    create_execution_plans."""
+    g, _ = _gated_sdpa_graph(declare_o_v=False, use_causal_mask=True)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="set_dim"):
+        g.validate()
+    assert g._is_validated is False and g._lowered_graph is None
+    # The declared twin passes.
+    g, _ = _gated_sdpa_graph(declare_o_v=True, use_causal_mask=True)
+    g.validate()
+    assert g._lowered_graph is None
+
+
+def test_gate_tail_match_is_structural():
+    """The matcher the analyzer and the validator share: identity on the
+    tensors, mode on the pointwise nodes, virtual-ness on O_v / s -- and nothing
+    else (head dims, dtype, arch are the rows' business).  Import-light: it must
+    not pull cudnn.sdpa (torch / cutlass) in."""
+    import sys
+
+    from cudnn._sdpa_tail import GateTail, match_gate_tail
+
+    assert "cudnn._sdpa_tail" in sys.modules
+    g, ts = _gated_sdpa_graph(use_causal_mask=True)
+    tail = match_gate_tail(g.nodes)
+    assert isinstance(tail, GateTail)
+    assert tail.gate is ts["gate"] and tail.o_virtual is ts["o_v"] and tail.sig_out is ts["s"] and tail.o_final is ts["o"]
+    assert tail.sdpa is g.nodes[0]
+    # Order-insensitive on the mul operands; a fourth node or a real O_v is not the tail.
+    g2, ts2 = _gated_sdpa_graph(use_causal_mask=True)
+    ts2["o_v"].set_output(True)
+    assert match_gate_tail(g2.nodes) is None
+    g3, ts3 = _gated_sdpa_graph(use_causal_mask=True)
+    g3.relu(input=ts3["o"]).set_output(True)
+    assert match_gate_tail(g3.nodes) is None
+    assert match_gate_tail(_sdpa_graph(use_causal_mask=True)[0].nodes) is None, "a single sdpa node is not a tail"

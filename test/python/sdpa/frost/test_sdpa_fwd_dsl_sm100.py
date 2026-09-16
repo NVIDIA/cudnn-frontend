@@ -115,6 +115,72 @@ def test_sdpa_fwd_dsl_sm100_graph_api(dtype, is_causal, d):
     torch.testing.assert_close(o_gpu, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@pytest.mark.L0
+@pytest.mark.skipif(_SM != 107, reason="the fused epilogue gate (O * sigmoid(G)) is served by the Rubin (sm107) d256 rows only")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("is_causal", [False, True], ids=["dense", "causal"])
+@torch_fork_set_rng(seed=0)
+def test_sdpa_fwd_gate_tail_graph_api(dtype, is_causal):
+    """Rubin graph-path e2e for the fused epilogue gate (PR-A): the 3-node tail
+    ``sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)`` -- O_v, G and the final O
+    all DECLARED (dim + stride) BSHD -- is recognised by the analyzer, claimed by
+    ``sdpa_fwd_prefill_sm107`` at d=256, validated python-natively, and lowered
+    onto the gated d256 kernel: the plan is the pinned Rubin f16 engine, the
+    workspace stays 0 (no Stats, no scratch), and O matches the fp32 reference
+    times sigmoid(G) at the shared tolerance."""
+    import cudnn
+    import cudnn.sdpa  # noqa: F401 — registers the FROST DSL engines
+    from sdpa.helpers import note_frost_routing
+
+    if not _dsl_installed():
+        pytest.skip("cutlass/dsl not installed")
+
+    b, h, s, d = 2, 8, 512, 256
+    device = "cuda"
+    scale = 1.0 / math.sqrt(d)
+    q_gpu = torch.randn(b, s, h, d, device=device, dtype=dtype).transpose(1, 2)
+    k_gpu = torch.randn(b, s, h, d, device=device, dtype=dtype).transpose(1, 2)
+    v_gpu = torch.randn(b, s, h, d, device=device, dtype=dtype).transpose(1, 2)
+    g_gpu = (torch.randn(b, s, h, d, device=device) * 2.0).to(dtype).transpose(1, 2)
+    # Sentinel: an unclaimed / unwritten tile stays visible -- compared against the CAST value (inf in fp16;
+    # bf16 rounds 1.5e30 to 1.4954e30, so the fp32 literal would never match and the check would be a no-op).
+    o_gpu = torch.full((b, s, h, d), 1.5e30, device=device, dtype=torch.float32).to(dtype).transpose(1, 2)
+    sentinel = o_gpu[0, 0, 0, 0].item()
+
+    io_dtype = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    graph = cudnn.pygraph(io_data_type=io_dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    q, k, v, gate = (graph.tensor_like(t) for t in (q_gpu, k_gpu, v_gpu, g_gpu))
+    o_v, _ = graph.sdpa(name="sdpa", q=q, k=k, v=v, generate_stats=False, attn_scale=scale, use_causal_mask=is_causal)
+    # The virtual O_v must be DECLARED (the user contract behind the classic pre-validation); it is never bound.
+    o_v.set_dim(q_gpu.shape).set_stride(q_gpu.stride())
+    sig = graph.sigmoid(input=gate, name="sig")
+    o = graph.mul(a=o_v, b=sig, name="gated")
+    o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
+
+    graph.validate()
+    assert graph._lowered_graph is None, "the tail must validate python-natively"
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A])
+    _select_engine(graph, engine_name(arch=_ARCH))
+    graph.check_support()
+    graph.build_plans()
+    assert graph.selected_engine is not None and graph.selected_engine.name == engine_name(arch=_ARCH)
+    note_frost_routing(graph, label="sdpa-gate-tail")
+    assert graph.get_workspace_size() == 0
+
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), device=device, dtype=torch.uint8)
+    graph.execute({q: q_gpu, k: k_gpu, v: v_gpu, gate: g_gpu, o: o_gpu}, workspace)
+    torch.cuda.synchronize()
+    first = o_gpu.clone()
+    graph.execute({q: q_gpu, k: k_gpu, v: v_gpu, gate: g_gpu, o: o_gpu}, workspace)  # two-launch trick
+    torch.cuda.synchronize()
+    assert torch.equal(o_gpu, first), "two-launch delta: a first-launch race"
+    assert torch.isfinite(o_gpu.float()).all() and not (o_gpu == sentinel).any(), "unwritten (sentinel) or non-finite O cells"
+
+    o_ref = _ref_sdpa(q_gpu, k_gpu, v_gpu, is_causal=is_causal, scale=scale).float() * torch.sigmoid(g_gpu.float())
+    torch.testing.assert_close(o_gpu.float(), o_ref, atol=5e-2, rtol=3e-2)
+
+
 # Feature coverage — mask / sink / GQA. _ref_sdpa_full below encodes the kernel's
 # exact mask + sink semantics (masks OR-ed; sink = one extra softmax column, V=0).
 _FLAVORS = [512, 256, 128]
@@ -1138,10 +1204,41 @@ def test_dsl_sm100_pack_gqa_qtrim():
 
 @_skip_pack_gqa_on_rubin
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@pytest.mark.parametrize("h_q,h_kv", [(24, 2), (12, 2)], ids=["g12_packs4", "g6_packs2"])
+@pytest.mark.parametrize("s_q", [1, 2, 4, 8])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_partial_group(d, h_q, h_kv, s_q):
+    """Partial PackGQA on the dense path: a GQA group that does not divide the
+    128-row tile packs its largest divisor that does (G=12 -> 4 heads per token
+    row-group, three packed heads per KV head; G=6 -> 2).  Decode / MTP shape
+    with per-batch KV lengths and bottom-right causal at S_q > 1, Stats checked:
+    the packed epilogue scatters LSE over p head rows, the mask predicate is per
+    token and the KV head is packed head // (G / p).  The causal shapes ride the
+    LPT_L2 primary, whose L2 groups are the G / p packed heads of one KV head."""
+    _require_dsl()
+    b, s_kv = 2, 300
+    dtype = torch.bfloat16 if d == 256 else torch.float16
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    seq_len_kv = torch.tensor([300, 129], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    kw = dict(use_causal_mask_bottom_right=True) if s_q > 1 else dict()
+    o, lse = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=kw, seq_len_kv=seq_len_kv, pack_gqa=True, return_stats=True)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=s_q > 1, bottom_right=s_q > 1, seq_kv_lens=seq_len_kv.flatten(), return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
+
+
+@_skip_pack_gqa_on_rubin
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_pack_gqa_knob_contract():
     """pack_gqa is honored-or-ineligible: no packed plan exists for MHA or a
-    ratio that does not divide tile_m, and an unpacked plan always does."""
+    ratio that shares no factor with tile_m, a ratio that shares one but does
+    not divide it packs that factor (partial PackGQA), and an unpacked plan
+    always exists."""
     _require_dsl()
     import cudnn
 
@@ -1167,11 +1264,18 @@ def test_dsl_sm100_pack_gqa_knob_contract():
     # MHA: only unpacked plans.
     pg = _plans_for(8, 8, 64)
     assert pg and True not in pg, f"MHA graph must not rank a packed plan; got {pg}"
-    # ratios that do not divide tile_m (full-ratio contract): only unpacked plans.
+    # ratios with no factor in common with tile_m (G=3, G=5): only unpacked plans.
     pg = _plans_for(6, 2, 64)
     assert pg and True not in pg, f"ratio-3 graph must not rank a packed plan; got {pg}"
+    pg = _plans_for(10, 2, 64)
+    assert pg and True not in pg, f"ratio-5 graph must not rank a packed plan; got {pg}"
+    # INVERTED (partial PackGQA): a ratio that shares a factor with tile_m but
+    # does not divide it packs that factor (G=6 -> 2 heads per row group,
+    # G=12 -> 4) and ranks packed first at small s_q like any other GQA group.
     pg = _plans_for(12, 2, 64)
-    assert pg and True not in pg, f"ratio-6 graph must not rank a packed plan; got {pg}"
+    assert pg[0] is True and False in pg, f"ratio-6 graph should rank packed first with unpacked runner-up; got {pg}"
+    pg = _plans_for(24, 2, 64)
+    assert pg[0] is True and False in pg, f"ratio-12 graph should rank packed first with unpacked runner-up; got {pg}"
     # GQA small s_q (s_q < the CGA tile): both variants ranked, packed
     # first — the rule is shape-only, so no batch/SM-count staging needed.
     pg = _plans_for(64, 8, 64)

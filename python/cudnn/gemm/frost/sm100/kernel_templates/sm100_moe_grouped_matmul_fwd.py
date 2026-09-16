@@ -1173,6 +1173,8 @@ def _kernel(
         group_begin = (_slot.subview(4)).load()
         group_end = (_slot.subview(5)).load()
         group_idx = (_slot.subview(7)).load()
+        nvvm.bar_warp_sync(0xFFFFFFFF)
+        sched_stage = cute.arch.make_warp_uniform(sched_stage)
         if elect_one:
             nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
         sched_stage += 1
@@ -1308,6 +1310,8 @@ def _kernel(
             group_begin = (_slot.subview(4)).load()
             group_end = (_slot.subview(5)).load()
             group_idx = (_slot.subview(7)).load()
+            nvvm.bar_warp_sync(0xFFFFFFFF)
+            sched_stage = cute.arch.make_warp_uniform(sched_stage)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1

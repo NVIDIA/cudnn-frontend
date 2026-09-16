@@ -6,10 +6,17 @@ import subprocess
 import sys
 from functools import partial
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
+
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("JAX BSA tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
+jax = pytest.importorskip("jax", minversion="0.9.1")
+import jax.numpy as jnp
 
 from cudnn import block_sparse_attention_forward_jax as forward
 from cudnn import block_sparse_attention_backward_jax as backward
@@ -73,6 +80,24 @@ def test_numerics_and_grad(layout, d, variable, bucket):
     )
     for actual, desired in zip(grad_fn(q, k, v), reference_grads):
         np.testing.assert_allclose(actual.astype(jnp.float32), desired.astype(jnp.float32), atol=3e-2, rtol=3e-2)
+
+
+def test_eager_backward_reuses_compilation():
+    q, k, v, indices, _ = inputs("bshd")
+    o, lse = forward(q, k, v, indices, 2, layout="bshd")
+    do = jnp.ones_like(q)
+    doubled_do = jnp.full_like(q, 2)
+
+    def run(do):
+        return backward(do, q, k, v, o, lse, indices, 2, layout="bshd", bucket_size_blocks=1)
+
+    expected = jax.block_until_ready(run(do))
+    with jax.no_tracing(True):
+        results = [run(gradient) for gradient in (do, doubled_do, do)]
+        jax.block_until_ready(results)
+    for factor, result in zip((1, 2, 1), results):
+        for actual, original in zip(result, expected):
+            np.testing.assert_allclose(np.asarray(actual, dtype=np.float32), np.asarray(original, dtype=np.float32) * factor, atol=3e-2, rtol=3e-2)
 
 
 def test_import_isolation():
@@ -199,6 +224,9 @@ sys.meta_path.insert(0, NoTorch())
 import jax
 import jax.numpy as jnp
 from cudnn import block_sparse_attention_jax as attention
+from cudnn.tensor_adapter import get_compute_capability
+assert get_compute_capability() == (10, 0)
+assert get_compute_capability(0) == (10, 0)
 q = jnp.ones((1, 1, 256, 64), jnp.bfloat16)
 i = jnp.broadcast_to(jnp.arange(2, dtype=jnp.int32), (1, 1, 2, 2))
 grad = jax.jit(jax.grad(lambda q: attention(q, q, q, i, 2).astype(jnp.float32).sum()))(q)

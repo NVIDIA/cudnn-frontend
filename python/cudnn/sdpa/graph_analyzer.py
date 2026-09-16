@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 import cudnn
+from cudnn._sdpa_tail import GateTail, match_gate_tail
 
 _LOG = logging.getLogger(__name__)
 
@@ -198,6 +199,53 @@ def dense_layout_ok(dim: tuple, stride: tuple) -> bool:
         if st < span:  # st == 0 (broadcast) or overlapping / sub-dense
             return False
         span = st * sz
+    return True
+
+
+# Element widths of the facts vocabulary, for the 16-byte TMA stride rule below.
+# An unmapped dtype gets the STRICTEST width (1 B -> strides must be multiples
+# of 16 elements); the row's dtype check declines such a G before layout anyway.
+_ELEM_BYTES = {
+    cudnn.data_type.FLOAT: 4,
+    cudnn.data_type.INT32: 4,
+    cudnn.data_type.HALF: 2,
+    cudnn.data_type.BFLOAT16: 2,
+    cudnn.data_type.FP8_E4M3: 1,
+    cudnn.data_type.FP8_E5M2: 1,
+}
+
+
+def gate_layout_ok(dim: tuple, stride: tuple, elem_bytes: int) -> bool:
+    """Whether a rank-4 logical (B, H, S, D) tensor is one the fused-gate kernels
+    can TMA-load ZERO-COPY: BSHD-compact, or a declared BSHD layout TMA can
+    express.  The exact twin of ``api_dsl._bshd_zero_copy_stride`` (None ==
+    compact or inexpressible; the adapter tells the two apart and RAISES on the
+    second), restated on IR dim/stride so the row declines what the adapter
+    would reject:
+
+      * head dim innermost-contiguous (stride 1);
+      * seq and head strides 16-byte multiples (they are TMA global strides);
+      * the declaration COVERS the tensor (head >= d, seq >= h*head,
+        batch >= s*seq) -- an overlapping declaration aliases distinct rows.
+
+    Stricter than ``bshd_layout_ok`` + ``dense_layout_ok`` on purpose: size-1
+    dims are NOT wildcarded, because the adapter's TensorDesc keeps the IR's
+    unit-dim strides verbatim and its cover check reads them.  Unlike Q/K/V/O,
+    G has no normalisation-copy fallback in the lowering.
+    """
+    if len(dim) != 4 or len(stride) != 4:
+        return False
+    b, h, s, d = (int(x) for x in dim)
+    bs, hs, ss, es = (int(x) for x in stride)  # BHSD-logical strides
+    if (bs, ss, hs, es) == (s * h * d, h * d, d, 1):
+        return True  # BSHD-compact
+    if es != 1:
+        return False
+    per16 = 16 // max(1, int(elem_bytes))
+    if ss % per16 or hs % per16:
+        return False
+    if hs < d or ss < h * hs or bs < s * ss:
+        return False
     return True
 
 
@@ -383,34 +431,87 @@ class SdpaGraphFacts:
     # capability row does not list the requested precision decline.
     softmax_precision: Optional[Any] = None
 
+    # Epilogue gate: the three-node tail ``sdpa(virtual O_v) -> sigmoid(G) ->
+    # mul(O_v, s)`` (cudnn._sdpa_tail.match_gate_tail).  A FACT, not a verdict:
+    # the Rubin d256 kernels fuse it into their epilogue (TemplateParams.
+    # epilogue_gate) and their rows claim it through Capabilities.epilogue_gate*;
+    # every other row declines in mismatch().  When set, ``o_t`` is the MUL
+    # output (the graph's real O the fused kernel writes) and the virtual O_v /
+    # s are never bound.
+    has_epilogue_gate: bool = False
+    epilogue_gate_t: Any = None  # G: a graph INPUT, dims == O's (B, H_q, S_q, D_v)
+    epilogue_gate_dtype: Optional[Any] = None  # cudnn.data_type of G
+    # dims(G) == dims(O).  A broadcast G (pointwise mul broadcasts) is a LEGAL
+    # graph the fused kernels do not serve -- recorded, so the row declines it
+    # with a message, never _invalid.
+    epilogue_gate_shape_ok: bool = True
+    # dtype the IR gave the virtual O_v: the graph's intermediate dtype, which
+    # defaults to the IO dtype (_pygraph.py: ``intermediate_data_type or
+    # io_data_type``).  The fused kernel never materialises O_v -- it gates the
+    # fp32 pre-cast accumulator -- so a row accepts FLOAT or Q's dtype only.
+    sdpa_o_virtual_dtype: Optional[Any] = None
+    # O_v.dim_assigned and O_v.stride_assigned (graph_types.Tensor): the classic
+    # C++ pre-validation needs a rank-4 dim + stride on the sdpa node's O, and
+    # only USER-assigned values are pushed at lowering, so an undeclared O_v
+    # would fail planning with a bare ValueError instead of a typed decline.
+    sdpa_o_virtual_declared: bool = True
+    # G's layout is one the fused kernel TMA-loads ZERO-COPY: BSHD-compact, or
+    # a declared BSHD layout TMA can express (D innermost-contiguous, seq/head
+    # strides 16-byte multiples, non-overlapping).  G has NO normalisation-copy
+    # fallback (Q/K/V/O do), so the standalone adapter's check_support raises on
+    # anything else -- this fact lets the row DECLINE the same G by message
+    # instead of admitting a plan that dies in the lowering (rule 8b).  Mirrors
+    # api_dsl._bshd_zero_copy_stride exactly (gate_layout_ok below).
+    epilogue_gate_layout_ok: bool = True
+
+
+_SDPA_NODE_TYPES = (
+    cudnn.NodeType.SDPA,
+    cudnn.NodeType.SDPA_BWD,
+    cudnn.NodeType.SDPA_MXFP8,
+    cudnn.NodeType.SDPA_FP8,
+    cudnn.NodeType.SDPA_MXFP8_BWD,
+)
+
+
+def _sdpa_node_and_tail(graph: "cudnn.pygraph") -> tuple:
+    """``(node, tail)``: the graph's SDPA node and, when the graph is the
+    three-node epilogue-gate tail, its :class:`GateTail`; ``(None, None)`` when
+    the graph is anything else.
+
+    Two shapes are recognised and nothing in between: a SINGLE SDPA node of any
+    flavor (forward, backward, FP8, MXFP8), or exactly ``sdpa -> sigmoid(G) ->
+    mul`` as :func:`cudnn._sdpa_tail.match_gate_tail` defines it.  A second op
+    of any other kind still makes the graph "not ours".
+    """
+    try:
+        nodes = list(graph.nodes)
+    except Exception:  # noqa: BLE001 — non-IR graph objects
+        return None, None
+    if len(nodes) == 1:
+        node = nodes[0]
+        return (node, None) if node.node_type in _SDPA_NODE_TYPES else (None, None)
+    tail = match_gate_tail(nodes)
+    return (tail.sdpa, tail) if tail is not None else (None, None)
+
 
 def _single_sdpa_node(graph: "cudnn.pygraph") -> Optional[Any]:
-    """The graph's sole SDPA node (forward, backward, or an FP8/MXFP8 flavor),
-    or None if the graph is anything else."""
-    try:
-        nodes = graph.nodes
-    except Exception:  # noqa: BLE001 — non-IR graph objects
-        return None
-    if len(nodes) != 1:
-        return None
-    node = nodes[0]
-    if node.node_type not in (
-        cudnn.NodeType.SDPA,
-        cudnn.NodeType.SDPA_BWD,
-        cudnn.NodeType.SDPA_MXFP8,
-        cudnn.NodeType.SDPA_FP8,
-        cudnn.NodeType.SDPA_MXFP8_BWD,
-    ):
-        return None
-    return node
+    """The graph's SDPA node (forward, backward, or an FP8/MXFP8 flavor) --
+    alone on the graph or heading the epilogue-gate tail -- or None if the
+    graph is anything else.  See :func:`_sdpa_node_and_tail`."""
+    return _sdpa_node_and_tail(graph)[0]
 
 
-def _record_from_node(node: Any) -> dict:
+def _record_from_node(node: Any, tail: Optional[GateTail] = None) -> dict:
     """Flatten an SDPA node into one kwargs-style dict.
 
     ``node.params`` holds the scalar sdpa() kwargs verbatim; tensor kwargs are
     named ports in ``node.inputs`` (port name == kwarg name); O / Stats (and
     the output-style kwargs like rng_dump) live in ``node.outputs``.
+
+    With an epilogue-gate ``tail`` the record's ``o`` is the MUL output (the
+    real O the fused kernel writes), ``_o_virtual`` the sdpa node's own virtual
+    O and ``gate`` the graph input G.
     """
     rec: dict = dict(node.params)
     for port, t in node.inputs.items():
@@ -451,6 +552,10 @@ def _record_from_node(node: Any) -> dict:
     rec["amax_s"] = node.outputs.get("Amax_S")
     if node.params.get("_dropout_n"):
         rec["dropout"] = True  # any dropout spec (tensors or probability) is requested
+    if tail is not None:
+        rec["o"] = tail.o_final
+        rec["_o_virtual"] = tail.o_virtual
+        rec["gate"] = tail.gate
     return rec
 
 
@@ -585,6 +690,25 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid("B/H/S/D must all be > 0")
     if h_q % h_kv != 0:
         return _invalid("H_q must be divisible by H_kv (GQA / MQA)")
+
+    # Epilogue gate (the sdpa -> sigmoid(G) -> mul tail).  G is described, never
+    # judged: its shape / dtype / layout become facts the gate-claiming rows
+    # match in mismatch(); a G that is not rank-4 or not O-shaped is a legal
+    # (broadcasting) pointwise graph every FROST row declines by message.
+    gate = rec.get("gate")
+    has_gate = gate is not None
+    gate_dim = tuple(gate.get_dim()) if has_gate else ()
+    gate_stride = tuple(gate.get_stride()) if has_gate else ()
+    gate_shape_ok = (not has_gate) or (len(gate_dim) == 4 and gate_dim == o_dim and len(gate_stride) == 4)
+    gate_dtype = gate.get_data_type() if has_gate else None
+    # G is judged by ITS OWN layout fact (the zero-copy TMA rule the adapter
+    # enforces), not folded into the Q/K/V/O layout lists below: the kernel
+    # has no normalisation copy for G, and a G-only failure must name G rather
+    # than fire the generic "Q/K/V/O must be BSHD-physical" decline.
+    gate_layout_ok_fact = (not has_gate) or gate_layout_ok(gate_dim, gate_stride, _ELEM_BYTES.get(gate_dtype, 1))
+    o_virtual = rec.get("_o_virtual")
+    o_virtual_dtype = o_virtual.get_data_type() if o_virtual is not None else None
+    o_virtual_declared = bool(getattr(o_virtual, "dim_assigned", True) and getattr(o_virtual, "stride_assigned", True)) if o_virtual is not None else True
 
     is_mxfp8 = bool(rec.get("_is_mxfp8"))
     is_fp8 = bool(rec.get("_is_fp8"))
@@ -844,7 +968,11 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         sf_q_t=(dsc_q if is_mxfp8 else None),
         sf_k_t=(dsc_k if is_mxfp8 else None),
         sf_v_t=(dsc_v if is_mxfp8 else None),
-        amax_o_t=rec.get("amax_o"),
+        # Amax_O: like Amax_S, the op RETURNS the port unconditionally; only a
+        # real (non-virtual, set_output(True)) tensor is a requested output.  A
+        # virtual one used to enter SdpaBinding and make the plan demand a buffer
+        # for it (engine._FrostSdpaFwdPlan: "missing buffers").
+        amax_o_t=_real_output(rec.get("amax_o")),
         sf_o_t=sf_o,
         descale_q_t=(dsc_q if is_fp8 else None),
         descale_k_t=(dsc_k if is_fp8 else None),
@@ -855,21 +983,29 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         # Amax_S: the op RETURNS the port unconditionally; only a real
         # (non-virtual, set_output(True)) tensor is a requested output.
         amax_s_t=(rec.get("amax_s") if (is_fp8 and rec.get("amax_s") is not None and not getattr(rec.get("amax_s"), "is_virtual", True)) else None),
+        has_epilogue_gate=has_gate,
+        epilogue_gate_t=gate,
+        epilogue_gate_dtype=gate_dtype,
+        epilogue_gate_shape_ok=gate_shape_ok,
+        sdpa_o_virtual_dtype=o_virtual_dtype,
+        sdpa_o_virtual_declared=o_virtual_declared,
+        epilogue_gate_layout_ok=gate_layout_ok_fact,
     )
 
 
 def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
-    """Facts for a single-SDPA graph, or None if the graph is anything else.
+    """Facts for a single-SDPA graph -- optionally followed by the epilogue-gate
+    tail ``O * sigmoid(G)`` -- or None if the graph is anything else.
 
     Pure: attaching and caching is the graph's job (validate() ->
     _attach_facts), so the ranking and the engine share one record instead of
     each holding a private one. This is the callable the manifest names in the
     SDPA family's ``analyzer``.
     """
-    node = _single_sdpa_node(graph)
+    node, tail = _sdpa_node_and_tail(graph)
     if node is None:
         return None
-    facts = _extract_facts(_record_from_node(node))
+    facts = _extract_facts(_record_from_node(node, tail))
     if facts.invalid is not None:
         return facts
     # sdpa(..., softmax_precision=...) is a python-only op attribute (see
@@ -939,6 +1075,9 @@ class SdpaBinding:
     sf_k_T: Any = None
     sf_dO: Any = None
     sf_dO_T: Any = None
+    # Epilogue gate G (the sdpa -> sigmoid(G) -> mul tail): a REQUIRED bound
+    # operand of the fused kernel.  The tail's virtual O_v / s are never bound.
+    gate: Any = None
 
     # Built once on first use and reused. Rebuilding it per execute cost ~1.3 us
     # per bound operand: three passes over the bound list and five dict
@@ -1000,6 +1139,7 @@ class SdpaBinding:
                 self.sf_k_T,
                 self.sf_dO,
                 self.sf_dO_T,
+                self.gate,
             )
             if t is not None
         ]
@@ -1119,6 +1259,7 @@ class FeatureOperands:
     seq_len_q: Any = None
     block_mask: Any = None
     alibi: bool = False
+    gate: Any = None  # epilogue gate G (facts.has_epilogue_gate)
 
 
 def resolve_feature_operands(facts: "SdpaGraphFacts", resolved: dict) -> FeatureOperands:
@@ -1155,6 +1296,8 @@ def resolve_feature_operands(facts: "SdpaGraphFacts", resolved: dict) -> Feature
         ops.sinks = _need(facts.sink_t, "sink_token")
     if facts.has_block_mask:
         ops.block_mask = _need(facts.block_mask_t, "block_mask")
+    if facts.has_epilogue_gate:
+        ops.gate = _need(facts.epilogue_gate_t, "epilogue gate G")
     return ops
 
 
@@ -1177,6 +1320,8 @@ def adapter_feature_buffers(facts: "SdpaGraphFacts", resolved: dict) -> dict:
         out["block_mask"] = ops.block_mask
     if ops.alibi:
         out["alibi"] = True
+    if ops.gate is not None:
+        out["gate"] = ops.gate
     return out
 
 

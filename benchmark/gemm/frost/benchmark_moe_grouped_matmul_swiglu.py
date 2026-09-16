@@ -187,7 +187,7 @@ def _build_spec_map():
     cta_tile_m=128."""
     chain = analyze(_graph_swiglu(2048, 256, 256, 9)[0])
     m = {}
-    for t, cfg in _registry_candidates(chain):
+    for t, cfg in _registry_candidates(chain, sweep_swap_ab=True):
         if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.mma_tile_m != 128:
             continue
         label = cfg.name

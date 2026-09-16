@@ -453,6 +453,125 @@ def test_sdpa_random_lean_attn_unified_L1(env_info, test_no, request, cudnn_hand
 
     exec_sdpa(test.cfg, request, cudnn_handle)
 
+# # =====================================================================
+# # L0 paged decode / MTP, GQA groups that do not divide the 128-row tile
+# # (FROST partial PackGQA: G=12 packs 4, G=6 packs 2, G=3 / G=5 unpacked)
+# # =====================================================================
+
+def _require_frost_sm100(engine="sdpa_fwd_prefill_sm100"):
+    """The functions below ASSERT that a FROST engine served the graph, so they
+    run only where that engine is offered: a pre-Rubin Blackwell (cc 10.0-10.6)
+    with the FROST engines opted in.  Elsewhere they skip instead of failing."""
+    major, minor = torch.cuda.get_device_capability()
+    if not (100 <= major * 10 + minor <= 106):
+        pytest.skip(f"{engine} serves cc 10.0-10.6 only; device is cc {major}.{minor}")
+    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
+        pytest.skip("CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required: this test asserts FROST routing")
+
+
+def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100"):
+    """exec_sdpa, then assert the FROST engine served the graph: the harness
+    tallies the serving engine in frost_routing after build_plans, and a FROST
+    decline silently falls through to the native backend, so a green run alone
+    proves nothing about routing.  (A WAIVED skip inside exec_sdpa skips before
+    the assertion.)"""
+    import frost_routing
+
+    key    = f"frost:{engine}"
+    before = frost_routing.snapshot().get(key, 0)
+    exec_sdpa(cfg, request, cudnn_handle)
+    after  = frost_routing.snapshot().get(key, 0)
+    assert after == before + 1, f"expected {engine!r} to serve this graph; routing tally: {frost_routing.snapshot()}"
+
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=2004), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_fwd_paged_gqa_partial_pack_frost_L0(env_info, test_no, request, cudnn_handle):
+
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    # Create the randomization context within the test
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=32, with_high_probability=[4, 32]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=8, s_kv_max=4096, s_q_distribution={"s_q=1":2, "s_q=s_kv":0, "s_q=random":3}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=128, d_qk_max=128, d_v_min=128, d_v_max=128, head_dim_distribution={"d_qk=d_v":1}),
+        # GQA groups over 8 KV heads that do not divide the 128-row Q tile: 96/8 (G=12, packs 4),
+        # 48/8 (G=6, packs 2), 24/8 (G=3, unpacked), 40/8 (G=5, unpacked).
+        head_count=RandomChoice({(96, 8, 8) : 3, (48, 8, 8) : 2, (24, 8, 8) : 1, (40, 8, 8) : 1}),
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(causal=3, no_mask=1),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"padded" : 1}),
+        # page sizes the FROST paged contract serves (a multiple of 8 dividing the 128-row KV tile)
+        block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 128]),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = True
+    test.showConfig(test_no, request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
+PARTIAL_PACK_PINNED_S_Q = [1, 2]
+
+
+@pytest.mark.parametrize("s_q", PARTIAL_PACK_PINNED_S_Q, ids=["decode", "mtp2_bottom_right"])
+@pytest.mark.L0
+def test_sdpa_fwd_paged_gqa_partial_pack_pinned_frost_L0(env_info, s_q, request, cudnn_handle):
+    """96 query heads over 8 KV heads (GQA ratio 12) at d128 over a 16-token page
+    pool, b=32, mixed KV lengths <= 4096 -- the paged decode shape FlashInfer's
+    cuDNN backend sends; bottom-right causal at s_q=2 (MTP).  Pinned so a
+    bisect lands on one config.  FROST must serve it: the d128 f16 kernel packs
+    4 of the 12 heads per token row-group (partial PackGQA) instead of running
+    one live row per 512-row cluster."""
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=2004,
+        rng_geom_seed=2004,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_cu_seq_len=False,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=32,
+        d_qk=128,
+        d_v=128,
+        s_q=s_q,
+        s_kv=4096,
+        h_q=96,
+        h_k=8,
+        h_v=8,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
+        left_bound=None,
+        right_bound=0 if s_q > 1 else None,
+        seq_len_q=[s_q] * 32,
+        # tile / page boundaries, a partial last page, 1-token and 0-token sequences
+        seq_len_kv=[4096, 4095, 4000, 3073, 3072, 2048, 2047, 1536, 1025, 1024, 1000, 777, 513, 512, 511, 300,
+                    257, 256, 255, 200, 129, 128, 127, 100, 65, 64, 33, 17, 16, 15, 1, 0],
+        implementation=cudnn.attention_implementation.AUTO,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, len(PARTIAL_PACK_PINNED_S_Q)), request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
 # # ==================================
 # # L0 ragged tests
 # # ==================================
