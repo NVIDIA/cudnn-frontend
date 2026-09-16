@@ -22,6 +22,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any, Callable, ClassVar
 
 import cudnn
@@ -1418,6 +1419,52 @@ def _mixed_cga_constants(cfg: TileConfig, fallback_cluster: tuple[int, int, int]
     ]
 
 
+# `Tcgen05SmemDesc.build()` lowers through the NON-versioned `_tcgen05_mma_smem_desc`
+# intrinsic (cutlass-dsl experimental/primitives/descriptors.py:513-522), which keeps
+# 14 bits of `addr >> 4`: a start address at or above 256 KiB wraps to the bottom of
+# SMEM with no error (the SF UTCCP then copies A-operand bytes into the SF TMEM
+# columns -> NaN/inf on every output, even at a single K-tile).  Only the ring ROOTS
+# go through build(); per-stage / per-k-step offsets ride `advance_start_address`
+# (:413-425), an unmasked encoded add that is correct past the line.  Reachable on
+# sm107 alone -- its 327 KiB carveout puts rings past 256 KiB; sm100 / sm103 cap at
+# 227 KiB.  The block-scale templates therefore declare their SMALL scale-factor
+# rings before the big A/B rings; the renderer trims `ab_stages` until every root
+# clears the line and refuses a layout a single stage still cannot fit (a typed
+# failure instead of silent NaN).
+_TCGEN05_DESC_BUILD_ADDR_LIMIT = 262144
+_SMEM_RING_ALIGN = 1024
+# Templates that declare the TMA-store staging buffer AHEAD of the A/B/SF rings, so
+# its bytes push every ring root up (the plain block-scale template puts it after).
+_SMEM_D_BEFORE_RINGS_TEMPLATES = frozenset({"sm100_moe_grouped_block_scale_matmul_fwd.py"})
+
+
+def _block_scale_smem_desc_roots(*, header_bytes: int, rings: Sequence[tuple[str, int]]) -> dict[str, int]:
+    """Byte offset of every ring ROOT: the 1024-aligned `cutlass.Array` rings laid out
+    in DECLARATION order behind ``header_bytes``.  The template's fixed reserve bounds
+    everything declared before the rings, so the modelled roots are >= the real ones
+    (conservative: a root this says is safe is safe)."""
+    off = header_bytes
+    roots: dict[str, int] = {}
+    for name, nbytes in rings:
+        off = -(-off // _SMEM_RING_ALIGN) * _SMEM_RING_ALIGN
+        roots[name] = off
+        off += nbytes
+    return roots
+
+
+def _check_block_scale_desc_roots(cfg: TileConfig, ab_stages: int, roots: dict[str, int]) -> None:
+    """Refuse a SMEM layout whose `Tcgen05SmemDesc.build()` root would wrap the 14-bit field."""
+    bad = {name: off for name, off in roots.items() if off >= _TCGEN05_DESC_BUILD_ADDR_LIMIT}
+    if bad:
+        where = ", ".join(f"{name} at {off} B" for name, off in bad.items())
+        raise ValueError(
+            f"block-scale {cfg.name!r}: SMEM ring root(s) {where} sit at or above {_TCGEN05_DESC_BUILD_ADDR_LIMIT} B "
+            f"with ab_stages={ab_stages}. `Tcgen05SmemDesc.build()` keeps 14 bits of the start address, so such a root "
+            f"wraps to the bottom of SMEM and the MMA / UTCCP reads the wrong buffer (NaN/inf output, no fault). "
+            f"Reduce the stage count, or build that root with a version-1 descriptor (`_tcgen05_mma_smem_desc_v2`)."
+        )
+
+
 def _render_block_scale_tile_constants(
     cfg: TileConfig,
     chain: FusionChain,
@@ -1703,10 +1750,14 @@ def _render_block_scale_tile_constants(
             raise NotImplementedError(
                 f"block-scale {cfg.name!r}: only {ab_stages} 128-B AB chunk " f"stages fit in SMEM — the sm103 pipeline needs >= 3 (one " f"K-tile in flight)"
             )
+        desc_roots = None  # 227 KiB part: no ring root can reach _TCGEN05_DESC_BUILD_ADDR_LIMIT
+        budget_stages = ab_stages
     else:
         # Each DISTINCT operand has its own 1024-aligned ring, in template
-        # allocation order. Only real dequant operands allocate an SF ring.
-        ring_stage_bytes = [cta_m * a_cta_k_bytes] * na + [(cta_n // cta_group) * b_cta_k_bytes] * nb + [sfa_smem_bytes] * real_na + [sfb_smem_bytes] * real_nb
+        # allocation order -- the SF rings FIRST, then A, then B (the order the
+        # Tcgen05SmemDesc.build() root guard below relies on). Only real dequant
+        # operands allocate an SF ring.
+        ring_stage_bytes = [sfa_smem_bytes] * real_na + [sfb_smem_bytes] * real_nb + [cta_m * a_cta_k_bytes] * na + [(cta_n // cta_group) * b_cta_k_bytes] * nb
         ab_stages = smem_ab_stages(sum(ring_stage_bytes), smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=ab_reserved)
         smem_budget = smem_ab_budget_bytes(tmpl.smem_fixed_reserve)
         while ab_stages:
@@ -1725,6 +1776,41 @@ def _render_block_scale_tile_constants(
             ab_stages -= 1
         if ab_stages < 1:
             raise NotImplementedError(f"block-scale {cfg.name!r}: no AB stage fits in SMEM including buffer alignment padding")
+
+        # Every ring ROOT is a `Tcgen05SmemDesc.build()` operand (the template advances
+        # per stage / per k-step from it) and build() keeps 14 bits of the address --
+        # _TCGEN05_DESC_BUILD_ADDR_LIMIT.  Mirror the template's declaration order
+        # (SF rings, then A, then B; MoE stages its TMA-store buffer ahead of them),
+        # trim the depth until every root clears the line -- the dense template never
+        # needs it at any catalog geometry; the MoE template does on sm107 at 512x128
+        # nvfp4 (3 -> 2: a 192 KiB A ring behind its 32 KiB staging buffer) and 256x128
+        # 2-CTA mxfp8 (7 -> 6) -- then refuse anything a single stage still cannot fit.
+        def _desc_roots(stages: int) -> dict[str, int]:
+            return _block_scale_smem_desc_roots(
+                header_bytes=tmpl.smem_fixed_reserve + (ab_reserved if tmpl.file in _SMEM_D_BEFORE_RINGS_TEMPLATES else 0),
+                rings=[
+                    *((f"SFA[{i}]", sfa_smem_bytes * stages) for i in range(real_na)),
+                    *((f"SFB[{j}]", sfb_smem_bytes * stages) for j in range(real_nb)),
+                    *((f"A[{i}]", cta_m * a_cta_k_bytes * stages) for i in range(na)),
+                    *((f"B[{j}]", (cta_n // cta_group) * b_cta_k_bytes * stages) for j in range(nb)),
+                ],
+            )
+
+        budget_stages = ab_stages
+        desc_roots = _desc_roots(ab_stages)
+        while ab_stages > 1 and max(desc_roots.values()) >= _TCGEN05_DESC_BUILD_ADDR_LIMIT:
+            ab_stages -= 1
+            desc_roots = _desc_roots(ab_stages)
+        if ab_stages != budget_stages:
+            _LOG.debug(
+                "block-scale %r: ab_stages %d -> %d so every Tcgen05SmemDesc.build() root stays below %d B (roots %s)",
+                cfg.name,
+                budget_stages,
+                ab_stages,
+                _TCGEN05_DESC_BUILD_ADDR_LIMIT,
+                desc_roots,
+            )
+        _check_block_scale_desc_roots(cfg, ab_stages, desc_roots)
 
     out_dt = chain.output_dtype
     epi_store_dt = _epi_store_dtype(chain, cfg)
@@ -1783,6 +1869,21 @@ def _render_block_scale_tile_constants(
         f"matmul_a_batch = {chain.matmul.a_batch}",
         f"matmul_b_batch = {chain.matmul.b_batch}",
         f"ab_stages = {ab_stages}",
+        *(
+            [
+                f"# tcgen05 SMEM descriptor roots (bytes, declaration order; Tcgen05SmemDesc.build() keeps 14 bits of addr>>4, "
+                f"so each must stay < {_TCGEN05_DESC_BUILD_ADDR_LIMIT}): " + " ".join(f"{name}={off}" for name, off in desc_roots.items())
+            ]
+            if desc_roots is not None
+            else []
+        ),
+        *(
+            [
+                f"# ab_stages trimmed from {budget_stages} to {ab_stages}: the deeper ring put a Tcgen05SmemDesc.build() root at or above {_TCGEN05_DESC_BUILD_ADDR_LIMIT} B"
+            ]
+            if ab_stages != budget_stages
+            else []
+        ),
         f"acc_stages = {acc_stages}",
         f"use_acc_overlap = {use_acc_overlap}",
         f"acc_stage_stride = {acc_stage_stride}",

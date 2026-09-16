@@ -154,11 +154,23 @@ class TemplateParams:
     # experiment enables it only when its plan declares an Amax_O buffer.
     # This is plan-time state: it must never be inferred from execute() args.
     emit_amax_o: bool = True
+    # Epilogue gate: O := O * sigmoid(GATE). GATE is TMA-staged by the load warp after the KV loop into a
+    # 64 KiB SMEM tile and consumed in the correction epilogue. Compile-time: sizes the tile + 2 mbarriers.
+    # Served by the SM107 d256 f16/bf16 and per-tensor FP8 kernels only (config_sm107._EPILOGUE_GATE_FLAVORS).
+    # Being a TemplateParams field it is part of the module-cache key: gate on/off are two coexisting
+    # specializations of one template, and an ungated module traces byte-identically to before the field existed.
+    epilogue_gate: bool = False
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
 # other flavor must reject it rather than silently reading K/V as dense.
 _PAGED_KV_FLAVORS = frozenset({"d128", "d256"})
+
+# The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature: no
+# SM100 kernel body reads CFG.EPILOGUE_GATE, so a module loaded with the flag on
+# this line would silently produce the UN-gated O. Empty on purpose; the Rubin
+# flavors that serve it are config_sm107._EPILOGUE_GATE_FLAVORS.
+_EPILOGUE_GATE_FLAVORS = frozenset()
 
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
 # a flavor only honours them once its make_cfg_* threads them into a Cfg AND its
@@ -256,6 +268,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: page_size must divide the 128-row KV tile or be a multiple of it; got {p}")
     elif k.page_size:
         raise ValueError(f"{flavor}: page_size requires paged_kv=True")
+    if k.epilogue_gate and flavor not in _EPILOGUE_GATE_FLAVORS:
+        raise ValueError(f"{flavor}: epilogue_gate is not wired on the SM100 line (served by the SM107 d256 kernels only)")
 
 
 def _mask_flags_from(params: TemplateParams) -> int:
@@ -306,6 +320,56 @@ def v_swz_bytes(tile_o: int, cta_mma: int, bpe_val: int) -> int:
 
 def o_swz_bytes(tile_o: int, bpe_o: int) -> int:
     return 128 if (tile_o * bpe_o) % 128 == 0 else 64
+
+
+def bshd_compact(shape_bhsd: tuple, stride_bhsd: tuple) -> bool:
+    """True when a logical BHSD ``(b, h, s, d)`` operand already IS the kernels'
+    canonical BSHD-compact layout (batch, then tokens, then heads, then a
+    contiguous head dim): nothing to declare, the artifact binds it as a view."""
+    b, h, s, d = (int(x) for x in shape_bhsd)
+    bs, hs, ss, es = (int(x) for x in stride_bhsd)
+    return (bs, ss, hs, es) == (s * h * d, h * d, d, 1)
+
+
+def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -> Optional[tuple]:
+    """The BSHD ``(b, s, h, d)`` stride tuple a dense prefill kernel is COMPILED
+    at for a logical BHSD operand, or None.
+
+    None means EITHER "compact, nothing to declare" (``bshd_compact``) OR "a
+    layout the kernels cannot bind zero-copy"; a caller that must tell the two
+    apart tests ``bshd_compact`` first (the epilogue gate does -- it has no
+    copy fallback).  The rules are the kernels' own (``_fake_bshd`` in every
+    f16 / per-tensor-FP8 prefill kernel), restated here so the decision is made
+    BEFORE a compile rather than as a raise inside one -- and so the engine rows
+    (``engines.mismatch`` via ``config_sm107.epilogue_gate_layout_declarable``)
+    and the standalone adapter (``api_dsl.SdpaFwdDsl._bshd_zero_copy_stride``)
+    judge a layout with ONE function (rule 8b lockstep):
+
+      * the head dim is innermost-contiguous (stride 1);
+      * the seq and head strides are 16-byte multiples (TMA global-stride rule);
+      * the declaration is TOKEN-MAJOR and COVERING: head >= d, seq >= h*head,
+        batch >= s*seq.  A head-major nest (a torch-contiguous ``[B, H, S, D]``:
+        seq stride d < h*head) returns None because the kernels' TMA
+        descriptors are built in BSHD order and no other nesting has been
+        validated zero-copy; an overlapping declaration returns None because
+        it would alias distinct rows onto one address (a write race on O).
+
+    ``graph_analyzer.dense_layout_ok`` is deliberately WIDER (any B/H/S stride
+    order, any alignment): that is the contract of the copy-normalising Q/K/V/O
+    path, not of a zero-copy binding.
+    """
+    b, h, s, d = (int(x) for x in shape_bhsd)
+    bs, hs, ss, es = (int(x) for x in stride_bhsd)
+    if (bs, ss, hs, es) == (s * h * d, h * d, d, 1):
+        return None  # compact: nothing to declare
+    if es != 1:
+        return None
+    per16 = 16 // elem_bytes
+    if ss % per16 or hs % per16:
+        return None
+    if hs < d or ss < h * hs or bs < s * ss:
+        return None
+    return (bs, ss, hs, es)
 
 
 def rescale_threshold(dtype_qkv: int) -> float:

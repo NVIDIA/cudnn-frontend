@@ -19,6 +19,7 @@ import pytest
 import torch
 
 import cudnn
+from cudnn.engines import manifest
 from cudnn.engines.base import PlanConfig
 from cudnn.sdpa.fwd import engines
 from cudnn.engines.heuristics import _assemble
@@ -474,3 +475,52 @@ def test_runner_up_sched_plan_builds_and_matches_the_winner():
     j = torch.arange(SKV, device="cuda").view(1, SKV)
     s = s.masked_fill(j > i, float("-inf"))
     torch.testing.assert_close(o_gpu, torch.einsum("bhqk,bhkd->bhqd", torch.softmax(s, dim=-1), v_gpu.float()).half(), atol=5e-2, rtol=3e-2)
+
+
+# --- Epilogue gate (PR-A): a FACT the heuristics must never trade against ------
+
+# The REAL Rubin ids, derived from the manifest (recommend() only keys on ``offered.get(spec.name)``, so any
+# labels would pass -- but a reader takes literals here for engine ids, and the file's older ``_OFFERED`` labels
+# already predate the slot re-cut).  20515 = base + slot 15 (f16), 20514 = base + slot 14 (fp8) today.
+_SDPA_FWD_FAMILY = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
+_RUBIN_F16, _RUBIN_FP8 = "sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm107_fp8"
+_RUBIN_OFFERED = {name: _SDPA_FWD_FAMILY.engine_id + _SDPA_FWD_FAMILY.slots[name].slot for name in (_RUBIN_F16, _RUBIN_FP8)}
+
+
+@pytest.mark.L0
+def test_heuristics_never_propose_split_or_pack_for_a_gated_graph():
+    """The fused O * sigmoid(G) epilogue lives in the UNSPLIT, UNPACKED kernel:
+    a split's combine would write the un-gated O and a packed tile interleaves
+    (token, head) rows the gate's TMA box cannot address.  mismatch() declines
+    both pairs, and -- rule 4, never PROPOSE a knob the row cannot honour -- the
+    proposal helpers must not emit them either, so no plan is ever listed only
+    to be filtered.  Pinned on the proposal helpers with a synthetic row that
+    WOULD split / pack an ungated graph, then on the real Rubin rows."""
+    import dataclasses
+
+    from cudnn.sdpa.fwd.heuristics import _pack_gqa_eligible, _split_points
+
+    gated = dict(has_epilogue_gate=True, epilogue_gate_dtype=cudnn.data_type.HALF, d_qk=256, d_v=256, device_cc=(10, 7))
+    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    permissive = dataclasses.replace(row, split_kv_supported=True, split_d_shapes=None, pack_gqas=frozenset({False, True}), pack_gqa_d_shapes=None)
+    # Ungated: the underfilled causal grid (s_q=128, s_kv=8192, 148 SMs) asks for a split; gated: never.
+    assert any(p > 1 for p in _split_points(permissive, _facts(d_qk=256, d_v=256, device_cc=(10, 7)), 128, 128, 2)), "the control must split"
+    assert _split_points(permissive, _facts(**gated), 128, 128, 2) == [1]
+    assert _pack_gqa_eligible(permissive, _facts(h_q=8, h_kv=2, d_qk=256, d_v=256, device_cc=(10, 7)), 128) is True, "the control must pack"
+    assert _pack_gqa_eligible(permissive, _facts(h_q=8, h_kv=2, **gated), 128) is False
+
+    # The real rows: every emitted set is unsplit and unpacked, and admissible.
+    for facts in (_facts(**gated), _facts(h_q=8, h_kv=2, **gated), _facts(causal=False, **gated)):
+        plans = recommend("A", facts, _RUBIN_OFFERED)
+        assert plans, "the Rubin f16 row serves the gated d256 graph"
+        assert {p.engine_id for p in plans} == {_RUBIN_OFFERED[_RUBIN_F16]}
+        for p in plans:
+            assert (p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa, p.knobs
+            spec = next(s for s in engines.ENGINE_SPECS if _RUBIN_OFFERED.get(s.name) == p.engine_id)
+            assert engines.mismatch(spec.capabilities, facts, p.knobs) is None
+    fp8 = dict(gated, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True, epilogue_gate_dtype=cudnn.data_type.BFLOAT16)
+    plans = recommend("A", _facts(h_q=8, h_kv=2, **fp8), _RUBIN_OFFERED)
+    assert plans and {p.engine_id for p in plans} == {_RUBIN_OFFERED[_RUBIN_FP8]}
+    assert all((p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
+    # ...and a gated graph on a flavor that does not carry the gate proposes nothing at all.
+    assert not recommend("A", _facts(**dict(gated, d_qk=128, d_v=128)), _RUBIN_OFFERED)

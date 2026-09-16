@@ -115,6 +115,72 @@ def test_sdpa_fwd_dsl_sm100_graph_api(dtype, is_causal, d):
     torch.testing.assert_close(o_gpu, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@pytest.mark.L0
+@pytest.mark.skipif(_SM != 107, reason="the fused epilogue gate (O * sigmoid(G)) is served by the Rubin (sm107) d256 rows only")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("is_causal", [False, True], ids=["dense", "causal"])
+@torch_fork_set_rng(seed=0)
+def test_sdpa_fwd_gate_tail_graph_api(dtype, is_causal):
+    """Rubin graph-path e2e for the fused epilogue gate (PR-A): the 3-node tail
+    ``sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)`` -- O_v, G and the final O
+    all DECLARED (dim + stride) BSHD -- is recognised by the analyzer, claimed by
+    ``sdpa_fwd_prefill_sm107`` at d=256, validated python-natively, and lowered
+    onto the gated d256 kernel: the plan is the pinned Rubin f16 engine, the
+    workspace stays 0 (no Stats, no scratch), and O matches the fp32 reference
+    times sigmoid(G) at the shared tolerance."""
+    import cudnn
+    import cudnn.sdpa  # noqa: F401 — registers the FROST DSL engines
+    from sdpa.helpers import note_frost_routing
+
+    if not _dsl_installed():
+        pytest.skip("cutlass/dsl not installed")
+
+    b, h, s, d = 2, 8, 512, 256
+    device = "cuda"
+    scale = 1.0 / math.sqrt(d)
+    q_gpu = torch.randn(b, s, h, d, device=device, dtype=dtype).transpose(1, 2)
+    k_gpu = torch.randn(b, s, h, d, device=device, dtype=dtype).transpose(1, 2)
+    v_gpu = torch.randn(b, s, h, d, device=device, dtype=dtype).transpose(1, 2)
+    g_gpu = (torch.randn(b, s, h, d, device=device) * 2.0).to(dtype).transpose(1, 2)
+    # Sentinel: an unclaimed / unwritten tile stays visible -- compared against the CAST value (inf in fp16;
+    # bf16 rounds 1.5e30 to 1.4954e30, so the fp32 literal would never match and the check would be a no-op).
+    o_gpu = torch.full((b, s, h, d), 1.5e30, device=device, dtype=torch.float32).to(dtype).transpose(1, 2)
+    sentinel = o_gpu[0, 0, 0, 0].item()
+
+    io_dtype = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    graph = cudnn.pygraph(io_data_type=io_dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    q, k, v, gate = (graph.tensor_like(t) for t in (q_gpu, k_gpu, v_gpu, g_gpu))
+    o_v, _ = graph.sdpa(name="sdpa", q=q, k=k, v=v, generate_stats=False, attn_scale=scale, use_causal_mask=is_causal)
+    # The virtual O_v must be DECLARED (the user contract behind the classic pre-validation); it is never bound.
+    o_v.set_dim(q_gpu.shape).set_stride(q_gpu.stride())
+    sig = graph.sigmoid(input=gate, name="sig")
+    o = graph.mul(a=o_v, b=sig, name="gated")
+    o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
+
+    graph.validate()
+    assert graph._lowered_graph is None, "the tail must validate python-natively"
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A])
+    _select_engine(graph, engine_name(arch=_ARCH))
+    graph.check_support()
+    graph.build_plans()
+    assert graph.selected_engine is not None and graph.selected_engine.name == engine_name(arch=_ARCH)
+    note_frost_routing(graph, label="sdpa-gate-tail")
+    assert graph.get_workspace_size() == 0
+
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), device=device, dtype=torch.uint8)
+    graph.execute({q: q_gpu, k: k_gpu, v: v_gpu, gate: g_gpu, o: o_gpu}, workspace)
+    torch.cuda.synchronize()
+    first = o_gpu.clone()
+    graph.execute({q: q_gpu, k: k_gpu, v: v_gpu, gate: g_gpu, o: o_gpu}, workspace)  # two-launch trick
+    torch.cuda.synchronize()
+    assert torch.equal(o_gpu, first), "two-launch delta: a first-launch race"
+    assert torch.isfinite(o_gpu.float()).all() and not (o_gpu == sentinel).any(), "unwritten (sentinel) or non-finite O cells"
+
+    o_ref = _ref_sdpa(q_gpu, k_gpu, v_gpu, is_causal=is_causal, scale=scale).float() * torch.sigmoid(g_gpu.float())
+    torch.testing.assert_close(o_gpu.float(), o_ref, atol=5e-2, rtol=3e-2)
+
+
 # Feature coverage — mask / sink / GQA. _ref_sdpa_full below encodes the kernel's
 # exact mask + sink semantics (masks OR-ed; sink = one extra softmax column, V=0).
 _FLAVORS = [512, 256, 128]

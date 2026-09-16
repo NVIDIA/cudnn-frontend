@@ -649,16 +649,16 @@ _SPLITK_BS_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
     "moe,force_stg,budget,stages",
     [
         (False, True, 27648, 0),
-        (False, True, 28160, 1),
+        (False, True, 28672, 1),
         (False, True, 334848, 12),
         (False, True, 335359, 12),
-        (False, True, 335360, 13),
+        (False, True, 335872, 13),
         (False, False, 351248, 12),
         (False, False, 352272, 13),
         (True, True, 336896, 12),
-        (True, True, 337408, 13),
+        (True, True, 337920, 13),
         (True, False, 353296, 12),
-        (True, False, 353808, 13),
+        (True, False, 354320, 13),
     ],
 )
 def test_block_scale_sf_ring_budget(moe, force_stg, budget, stages, monkeypatch):
@@ -671,8 +671,12 @@ def test_block_scale_sf_ring_budget(moe, force_stg, budget, stages, monkeypatch)
     if moe:
         chain = dataclasses.replace(chain, moe=MoeSpec(num_experts=1, num_groups=3))
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma")
-    # The dense template puts D after the SF rings; MoE puts it before them.
-    # At an exact STG fit, the last SF ring needs no trailing alignment pad.
+    # Both templates declare the SF rings FIRST (their Tcgen05SmemDesc.build()
+    # roots must stay below 256 KiB on sm107), then A, then B; the dense template
+    # puts D after the rings, MoE before them.  So EVERY SF ring is followed by
+    # another ring and pads to 1024 B: at an odd depth the two 512 B-per-stage SF
+    # rings cost 2 x 512 B of padding, at an even depth none -- which is why the
+    # odd-depth exact-fit budgets below sit 1024 B above the payload sum.
     with C.force_stg_epi(force_stg):
         if stages == 0:
             with pytest.raises(NotImplementedError, match="no AB stage fits"):
@@ -688,17 +692,17 @@ def test_block_scale_sf_ring_budget_omits_fake_scales(fake_a, monkeypatch):
     from cudnn.gemm.frost import tile_config
 
     monkeypatch.setattr(C, "_current_arch", lambda: 100)
-    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: 328192)
+    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: 328704)
     g, *_ = _build_one_sided_block_scale_graph(fake_a=fake_a, raw_dt=_DT_E4M3, scaled_dt=_DT_E4M3, sf_dt=_DT_E8M0, block_size=32)
     chain = analyze(g)
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma")
     with C.force_stg_epi(True):
         src = C._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
-    assert "ab_stages = 13\n" in src  # a single SF ring fits without any padding
+    assert "ab_stages = 13\n" in src  # a single SF ring, padded to 1024 B ahead of the A ring (13 x 512 -> 6656 + 512)
 
 
 @pytest.mark.parametrize(
-    "na,nb,budget,stages", [(1, 2, 310784, 8), (1, 2, 311808, 9), (2, 1, 299520, 6), (2, 1, 300544, 7), (2, 2, 258048, 4), (2, 2, 259584, 5)]
+    "na,nb,budget,stages", [(1, 2, 310784, 8), (1, 2, 312320, 9), (2, 1, 299520, 6), (2, 1, 301056, 7), (2, 2, 258048, 4), (2, 2, 260096, 5)]
 )
 def test_block_scale_sf_ring_budget_distinct_operands(na, nb, budget, stages, monkeypatch):
     from cudnn.gemm.frost import tile_config

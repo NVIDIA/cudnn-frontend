@@ -99,6 +99,7 @@ MMA as d=512.
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ᵇ · ✅ᵍ |
 | Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ (d128 envelope) | ✅ᵖ | ❌ | ✅ᵖ | ❌ | ❌ |
+| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ᵖ **Paged KV (issue #920), f16/bf16 only, d128 and d256 flavors** (`d_qk, d_v <= 256`;
 d=64 rides the d128 envelope, d=192/192 the d256 one; mixed dims that would select
@@ -297,6 +298,7 @@ red (2026-09-08).
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ | ❌ |
 | Split-KV | fp8 only | fp8 only | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ |
+| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ❌ | ❌ | ❌ |
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ❌ |
@@ -322,6 +324,49 @@ revision. THD used to be unported on the f16 line (7-arg setup call against a
 per-tensor FP8 flavor now carries the contract and serves it.
 ᵛⁱ Every Rubin template carries the per-batch `seq_len_q` trim (bounds collapse for tiles past the length, O:=0 / LSE:=−inf on the rows past it; #1037), so the rows claim `padded_stats`.
 ᵛⁱⁱ The f16 Rubin kernels wire no SplitHelpers.
+ᵛⁱⁱⁱ **Fused epilogue gate `O := O * sigmoid(G)`** — a production feature of the
+d256 f16/bf16 and per-tensor FP8 Rubin kernels (`TemplateParams.epilogue_gate`;
+rows `sdpa_fwd_prefill_sm107` and `sdpa_fwd_prefill_sm107_fp8`,
+`Capabilities.epilogue_gate_d_shapes = config_sm107.SM107_EPILOGUE_GATE_SHAPES`, the
+same constant the standalone adapter's `check_support` twin reads). On the graph it
+is the three-node tail `sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)`
+(`cudnn._sdpa_tail.match_gate_tail`; either mul operand order), validated
+python-natively and lowered with the mul output bound as the kernel's O — the
+virtual `O_v` / `s` are never bound or materialised. Served **exactly** at
+(256, 256) (not through the head-dim envelope), dense only (no THD), unsplit,
+non-PackGQA, non-paged; the padding mask (`seq_len_kv`) composes. `O_v`, `G` and
+the final O must be DECLARED (dim + stride, BSHD) — the classic C++
+`pre_validate_node` needs both on the sdpa output and only user-assigned values
+are pushed at lowering, so an undeclared `O_v` is a typed not-supported from
+`validate()` rather than a bare `ValueError` out of planning. `G` is Q's dtype on
+the f16/bf16 row and BF16 on the FP8 row (the kernel stages it in bf16), and must
+be **BSHD-physical with 16-byte-aligned, non-overlapping seq/head strides**: G is
+TMA-loaded zero-copy (no normalisation copy, unlike Q/K/V/O), so the row declines
+by message exactly the G the standalone adapter's `check_support` rejects
+(`facts.epilogue_gate_layout_ok`, the twin of `_bshd_zero_copy_stride`). `O_v`
+(the sdpa node's virtual output) must carry AT LEAST O's precision — FLOAT or Q's
+dtype on the f16/bf16 row; FLOAT, a half dtype, or O's own dtype on the FP8 row
+(never Q's fp8 dtype when O is half: that would spell "quantize, THEN gate", a
+rounding the kernel does not do) — because the kernel gates the fp32 pre-cast
+accumulator and casts once, so the intermediate dtype is descriptive. With
+FROST engines enabled the tail is validated **python-natively on every arch**
+that offers a python SDPA engine (the family validator does not look at the
+rows); the backend's own verdict on it is deferred to planning, as for every
+python-validated graph. Numerics: the gate multiplies the fp32
+accumulator AFTER the dead-row / empty-KV select (a dead row stays exactly 0,
+LSE −inf, and LSE is bit-independent of the gate); on FP8 the O quantization
+applies to the GATED value, while `Amax_O`, when requested, is the amax of the
+UNGATED normalised O (pre-gate, pre-quant, in `scale_o` units) — it is an output
+of the sdpa node, which precedes the sigmoid/mul tail, so it is independent of
+G; the standalone adapter's `sample_gate` path shares that one contract.
+**Amax_O binding changed for every quantized forward
+row:** only a `set_output(True)` `Amax_O` is a fact (`facts.amax_o_t =
+_real_output(...)`) — an unrequested (virtual) `Amax_O` is no longer bound or
+written, so a quantized graph that leaves `Amax_O` virtual now EXECUTES where it
+used to raise "the variant pack is missing buffers"; on the Rubin FP8 d256 kernel
+the graph path passes `has_amax_o=False` so the amax atomic folds out, while the
+SM100 fp8 / every mxfp8 kernel (no `has_amax` compile knob) keeps its legacy dummy
+amax slot. MXFP8 gate: PR-B.
 
 ᶻ **f16/bf16 THD is served on EVERY flavor** as of 2026-09-09 (d128, d192×d128,
 d256, d512), and per-tensor FP8 THD at d128 and d192×d128. The f16 bodies were
@@ -626,6 +671,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | Bias forward | SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
 | Paged KV cache | every arch except SM100/SM103 f16/bf16 d128 forward (see ᵖ); fp8/mxfp8 pools, sink, THD, packed block tables everywhere |
+| Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16 and per-tensor FP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table); MXFP8 is PR-B |
 
 ᵏ **THD / ragged forward layout.** Q/K/V/O must be BSHD-ordered over **(H, S, D)**
 only — head dim innermost, then heads, then tokens (`graph_analyzer.packed_layout_ok`).

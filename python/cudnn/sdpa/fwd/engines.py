@@ -37,7 +37,7 @@ from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURA
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
-from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -344,6 +344,24 @@ class Capabilities:
     # fills the tail rows with -inf. Rows whose kernels lack the per-batch THD
     # store keep False and decline the form (the backend serves it).
     thd_padded_stats: bool = False
+    # Fused epilogue gate: the graph tail ``sdpa(virtual O_v) -> sigmoid(G) ->
+    # mul(O_v, s)`` (facts.has_epilogue_gate, cudnn._sdpa_tail) lowered as the
+    # kernel's ``O := O * sigmoid(G)`` epilogue (TemplateParams.epilogue_gate;
+    # the Rubin d256 f16/bf16 and per-tensor FP8 kernels).  A FEATURE, not a
+    # knob -- the graph asks for it, so it follows the thd_d_shapes /
+    # split_d_shapes / pack_gqa_d_shapes idiom: ``epilogue_gate_d_shapes`` is
+    # the set of NATIVE shapes whose kernel carries the gate, matched on the
+    # graph's EXACT (d_qk, d_v) -- never through the zero-padding envelope
+    # (the gate tile is TILE_O wide and the padded columns would gate garbage).
+    # None = every shape in d_shapes (no row says that today).  The standalone
+    # adapter's check_support carries the twin of this claim (rule 8b) through
+    # the same constant (config_sm107.SM107_EPILOGUE_GATE_SHAPES, rule 8b').
+    epilogue_gate: bool = False
+    epilogue_gate_d_shapes: Optional[frozenset] = None
+    # dtype domain of G.  None = G must equal Q's dtype (the half kernels stage
+    # the gate in Q's storage dtype); the quantized rows name the half dtype
+    # their kernel stages it in (bf16 on the Rubin FP8 d256 kernel).
+    epilogue_gate_dtypes: Optional[frozenset] = None
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -444,6 +462,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if knobs.split_kv is not None and knobs.split_kv > 1:
             if not capabilities.split_kv_supported:
                 return "split_kv > 1 is not wired in this engine's lowering"
+            if facts.has_epilogue_gate:
+                # The combine pass writes the recombined O from un-gated
+                # partials; the gate lives in the unsplit kernel's epilogue only.
+                return "split_kv > 1 cannot ride the fused epilogue gate (the combine would write the un-gated O)"
             # Facts x knobs: the split path is structurally dense-only (the
             # per-split LSE is the combine weight; the THD/sink/padded paths
             # do not produce per-split partials). Declined HERE so a split
@@ -475,6 +497,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if knobs.pack_gqa:
             if facts.thd:
                 return "PackGQA is currently not supported for THD/ragged graphs"
+            if facts.has_epilogue_gate:
+                # The gate tile is one TMA box per (head, Q tile); a packed
+                # tile interleaves (token, head) rows the box cannot address.
+                return "PackGQA cannot ride the fused epilogue gate"
             _pg_tile_m = knobs.tile_m if knobs.tile_m is not None else max(capabilities.tile_ms)
             if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m):
                 return f"PackGQA requires h_q/h_kv to divide tile_m: h_q/h_kv = {facts.h_q}/{facts.h_kv} does not tile at tile_m={_pg_tile_m}"
@@ -564,6 +590,58 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     ):
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
+
+    if facts.has_epilogue_gate:
+        # The sdpa -> sigmoid(G) -> mul tail.  Every condition below is a
+        # DECLINE with a reason, never facts.invalid: the graph is legal for the
+        # backend (three ordinary nodes); only the fused lowering is particular.
+        if not capabilities.epilogue_gate:
+            return "graph fuses O * sigmoid(G) into the sdpa epilogue, which this engine does not support"
+        if capabilities.epilogue_gate_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.epilogue_gate_d_shapes:
+            # EXACT dims: a d=200 graph rides the (256, 256) envelope for plain
+            # attention, but the gate tile would multiply the zero-padded
+            # columns too -- the padded flavor is not claimed (plan §7 Q6).
+            return (
+                f"the fused epilogue gate is wired only at head dims {sorted(capabilities.epilogue_gate_d_shapes)}; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+            )
+        if facts.thd:
+            return "the fused epilogue gate is dense-only (no THD gate descriptor)"
+        if facts.has_paged_kv:
+            return "the fused epilogue gate is not wired on the paged-KV flavor"
+        if not facts.epilogue_gate_shape_ok:
+            return "the gate G must have exactly O's shape (B, H_q, S_q, D_v); a broadcast G is not fused"
+        dom = capabilities.epilogue_gate_dtypes if capabilities.epilogue_gate_dtypes is not None else frozenset({facts.dtype})
+        if facts.epilogue_gate_dtype not in dom:
+            return f"gate dtype {facts.epilogue_gate_dtype} not in {sorted(str(d) for d in dom)}"
+        if not facts.epilogue_gate_layout_ok:
+            # G is TMA-loaded zero-copy -- there is no normalisation copy for it
+            # (Q/K/V/O have one).  The standalone adapter's check_support raises
+            # on the same G; declining here keeps the row honest (rule 8b).
+            return (
+                "the gate G must be BSHD-physical (D innermost-contiguous, then H, then S, then B) with 16-byte-aligned, "
+                "non-overlapping seq/head strides -- the fused kernel TMA-loads G zero-copy"
+            )
+        # The kernel never materialises O_v: it gates the fp32 pre-cast
+        # accumulator and casts ONCE to O's dtype, so an O_v of AT LEAST O's
+        # precision describes that math (the intermediate rounding it implies
+        # is finer than or equal to the final one).  Half rows: FLOAT or Q's
+        # dtype (== O's).  Quantized rows: FLOAT, a half dtype, or O's own
+        # dtype -- never Q's FP8 dtype when O is half, which would spell
+        # "quantize to fp8, THEN gate", a rounding the kernel does not do.
+        if capabilities.is_fp8 or capabilities.is_mxfp8:
+            _o_v_dom = (None, cudnn.data_type.FLOAT, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, facts.dtype_o)
+            _o_v_msg = (
+                "the sdpa node's virtual O must be FLOAT, a half dtype, or O's dtype (the fused kernel gates the fp32 pre-cast accumulator and quantizes once)"
+            )
+        else:
+            _o_v_dom = (None, cudnn.data_type.FLOAT, facts.dtype)
+            _o_v_msg = "the sdpa node's virtual O must be FLOAT or Q's dtype (the fused kernel gates the fp32 pre-cast accumulator)"
+        if facts.sdpa_o_virtual_dtype not in _o_v_dom:
+            return _o_v_msg
+        if not facts.sdpa_o_virtual_declared:
+            # Only user-assigned dim/stride are pushed to the C++ lowering, whose
+            # pre-validation needs rank-4 dim + stride on the sdpa node's O.
+            return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
         # Served by the d128 f16/bf16 kernel's PAGED_KV specialization
@@ -844,6 +922,12 @@ def _sm107_spec() -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            # Fused epilogue gate (O := O * sigmoid(G)) on the d256 kernel,
+            # f16 AND bf16 (G in Q's dtype).  EXACT (256, 256) only -- the
+            # gate tile does not ride the head-dim envelope.  The standalone
+            # adapter's twin reads the same constant (rule 8b').
+            epilogue_gate=True,
+            epilogue_gate_d_shapes=SM107_EPILOGUE_GATE_SHAPES,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -1124,6 +1208,15 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # ported d256/d512 kernels do not wire it at all, as they do not
             # wire split-KV.
             pack_gqa_d_shapes=(frozenset({(128, 128)}) if rubin_row else None),
+            # Fused epilogue gate on the Rubin d256 FP8 kernel (E4M3 / E5M2 in,
+            # any out dtype): G is staged in BF16 (kernel GATE_STORAGE_DTYPE), so
+            # the row names that one dtype rather than inheriting Q's.  The FP8
+            # O quantizes the GATED value; Amax_O, when requested, is the amax of
+            # the UNGATED normalised O (the sdpa node's output precedes the
+            # sigmoid/mul tail, so G cannot move it).  Not on the SM100 line.
+            epilogue_gate=rubin_row,
+            epilogue_gate_d_shapes=(SM107_EPILOGUE_GATE_SHAPES if rubin_row else None),
+            epilogue_gate_dtypes=(frozenset({cudnn.data_type.BFLOAT16}) if rubin_row else None),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -1323,7 +1416,7 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     # with whatever ranked these plans before this engine was imported.
     facts = graph._facts_for(ga.analyze)
     if facts is None:
-        return None, "graph is not a single sdpa() forward node"
+        return None, "graph is not a single sdpa() forward node (optionally followed by O * sigmoid(G))"
     return facts, mismatch(spec.capabilities, facts, knobs)
 
 
@@ -1346,6 +1439,40 @@ def _table_view(buf, ir_t, b: int):
     """The kernel's ``(B, max_pages)`` view of a bound ``(B, 1, max_pages, 1)`` table — a
     view of the declared layout (size-1 axes dropped), never a copy."""
     return buf.as_strided((b, int(ir_t.get_dim()[2])), _table_stride(ir_t), buf.storage_offset())
+
+
+def _epilogue_gate_ctor_kwargs(facts: "ga.SdpaGraphFacts", ctor_params: frozenset, exec_params: frozenset, engine_name: str) -> dict:
+    """The standalone adapter's gate / Amax_O constructor kwargs for these facts.
+
+    Contract (frozen, PR-A): ``SdpaFwdDsl.__init__(..., sample_gate=None,
+    has_amax_o=True)`` and ``execute(..., gate=None)``.  All are
+    FEATURE-DETECTED on the adapter class so a row whose adapter predates them
+    keeps lowering unchanged:
+
+    * ``sample_gate`` -- only when the graph carries the gate tail.  An adapter
+      without the constructor keyword, or whose ``execute()`` cannot take the
+      ``gate=`` buffer (never run the gated specialization without handing it
+      G: that would silently write the un-gated O), cannot serve the tail, so
+      that is a typed decline (``NotImplementedError`` advances the build walk)
+      rather than a ``TypeError`` out of the constructor -- raised HERE, before
+      the constructor and the kernel JIT.  Normally unreachable: mismatch()
+      admitted the gate only on rows whose adapter carries both.
+    * ``has_amax_o`` -- quantized graphs only: ``False`` when the graph did not
+      request ``Amax_O`` (facts.amax_o_t is a REAL set_output(True) tensor or
+      None), which lets the kernel fold its amax atomic out instead of writing
+      a buffer nobody reads.  Half graphs never pass it (the legacy ``True``
+      default is exactly their semantics).
+    """
+    out: dict = {}
+    if facts.has_epilogue_gate:
+        if "sample_gate" not in ctor_params:
+            raise NotImplementedError(f"{engine_name}: this adapter does not carry the epilogue gate (no sample_gate)")
+        if "gate" not in exec_params:
+            raise NotImplementedError(f"{engine_name}: the adapter's execute() does not accept the epilogue gate (gate=)")
+        out["sample_gate"] = ga.tensor_desc_from_ir(facts.epilogue_gate_t, name="gate")
+    if (facts.is_fp8 or facts.is_mxfp8) and "has_amax_o" in ctor_params:
+        out["has_amax_o"] = facts.amax_o_t is not None
+    return out
 
 
 def lower_dsl_prefill(
@@ -1379,7 +1506,10 @@ def lower_dsl_prefill(
     # specialization (every kernel has one), and execute forwards the buffer
     # (THD sources cu_seqlens from it instead).
     seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None
-    api = _adapter(api_type)(
+    api_cls = _adapter(api_type)
+    _ctor_params = frozenset(inspect.signature(api_cls.__init__).parameters)
+    _exec_params = frozenset(inspect.signature(api_cls.execute).parameters)
+    api = api_cls(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
         sample_v=ga.tensor_desc_from_ir(facts.v_t, name="v"),
@@ -1431,6 +1561,9 @@ def lower_dsl_prefill(
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
         softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
+        # Epilogue gate (sample_gate=) and the Amax_O fold-out (has_amax_o=):
+        # feature-detected on the adapter's constructor, see the helper.
+        **_epilogue_gate_ctor_kwargs(facts, _ctor_params, _exec_params, spec.name),
         # SM80-only PLAN-TIME axes (bias presence/dtype are compile-time
         # specializations of that template): forwarded only to adapters whose
         # constructor declares them — every other row's mismatch gated the
@@ -1440,7 +1573,7 @@ def lower_dsl_prefill(
                 "bias_present": facts.bias_t is not None,
                 "bias_fp32": facts.bias_t is not None and facts.bias_t.get_data_type() == cudnn.data_type.FLOAT,
             }
-            if "bias_present" in inspect.signature(_adapter(api_type).__init__).parameters
+            if "bias_present" in _ctor_params
             else {}
         ),
     )
@@ -1466,7 +1599,9 @@ def lower_dsl_prefill(
     # forwarded below only when both hold. ALiBi / block_mask / score-stats
     # graphs never reach a FROST row (every capability row declines them, so
     # the backend serves them).
-    _extra_exec_keys = {"bias_tensor"} & set(inspect.signature(type(api).execute).parameters)
+    # (A gated graph on an adapter whose execute() lacks ``gate=`` was declined
+    # by _epilogue_gate_ctor_kwargs BEFORE the constructor and the JIT above.)
+    _extra_exec_keys = {"bias_tensor", "gate"} & _exec_params
 
     binding = ga.SdpaBinding(
         q=facts.q_t,
@@ -1490,6 +1625,9 @@ def lower_dsl_prefill(
         descale_k=facts.descale_k_t,
         descale_v=facts.descale_v_t,
         scale_o=facts.scale_o_t,
+        # The gate tail's G is a REQUIRED bound operand; its virtual O_v and s
+        # never are (facts.o_t already points at the mul output).
+        gate=facts.epilogue_gate_t,
     )
 
     def _ir_view(buf, ir_t):
@@ -1594,6 +1732,9 @@ def lower_dsl_prefill(
             # SM80 feature operand (mismatch admitted it for this row).
             if feature_ops.bias is not None and "bias_tensor" in _extra_exec_keys:
                 execute_kwargs["bias_tensor"] = feature_ops.bias
+            # Epilogue gate G, reinterpreted through its IR dim/stride like Q/K/V/O.
+            if feature_ops.gate is not None and "gate" in _extra_exec_keys:
+                execute_kwargs["gate"] = _ir_view(feature_ops.gate, binding.gate)
         if api_scratch_bytes:
             execute_kwargs["workspace"] = carver.remaining()
         api.execute(**execute_kwargs)

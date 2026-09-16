@@ -62,7 +62,7 @@ from cudnn.frost.tile_dsl.constants import (
 
 # The engine-contract record is deliberately SHARED: one lowering builds it, and
 # an arch-specific copy would let the two drift in ways the loader cannot see.
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams, bshd_compact, bshd_zero_copy_stride
 
 __all__ = [
     "TemplateParams",
@@ -83,6 +83,8 @@ __all__ = [
     "SMEM_CAP_BYTES",
     "SM107_FP8_THD_SHAPES",
     "SM107_F16_THD_SHAPES",
+    "SM107_EPILOGUE_GATE_SHAPES",
+    "epilogue_gate_layout_declarable",
 ]
 
 
@@ -147,6 +149,45 @@ _F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm
 # (engine row + standalone adapter gate; contract rule 8b').  Must stay in step
 # with _F16_THD_FLAVORS, which is the same fact keyed by config-flavor name.
 SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+
+# Head-dim shapes whose Rubin kernels carry the FUSED EPILOGUE GATE
+# (O := O * sigmoid(G), TemplateParams.epilogue_gate).  ONE named constant with
+# three consumers -- the engine rows' ``epilogue_gate_d_shapes``, the standalone
+# adapter's rule-8b twin in ``api_dsl.SdpaFwdDslSm100.check_support`` and the
+# gated-attention block's geometry pin -- so the three cannot drift (rule 8b').
+# EXACT dims: the envelope flavor that pads d=200 up to (256, 256) is NOT
+# claimed (the gate tile is TMA'd at the kernel's TILE_O, and nothing has
+# validated a padded G).  Membership rule: the flavor's f16/bf16 AND per-tensor
+# FP8 bodies both carry the gate seams (sGate SmemTile, mb_gate_full/empty,
+# the TMA-LDG issue after the KV loop, the packed tanh epilogue).  MXFP8 is a
+# separate kernel and a separate PR; its row keeps epilogue_gate=False.
+SM107_EPILOGUE_GATE_SHAPES = frozenset({(256, 256)})
+
+# The same fact keyed by the config-flavor string `_validate_params` receives
+# (`make_cfg_d256`; the mxfp8 sibling is "sm107 d256 mxfp8" and is NOT listed).
+# Must stay in step with SM107_EPILOGUE_GATE_SHAPES.
+_EPILOGUE_GATE_FLAVORS = frozenset({"sm107 d256"})
+
+
+def epilogue_gate_layout_declarable(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int = 2) -> bool:
+    """Whether a logical BHSD gate ``G`` binds ZERO-COPY on the Rubin d256 gated
+    kernels: BSHD-compact, or a token-major declaration TMA can express
+    (``config_sm100.bshd_zero_copy_stride``: D innermost-contiguous, then heads,
+    then tokens; seq/head strides 16-byte multiples; covering).
+
+    The gate has NO normalisation-copy fallback (a hidden per-execute repack is
+    what the engine contract forbids), so this predicate is STRICTER than
+    ``graph_analyzer.dense_layout_ok`` -- which admits any B/H/S stride order
+    and any 16-byte-unaligned stride because the Q/K/V/O path copies those.  It
+    is the ONE rule both sides of rule 8b consume: ``engines.mismatch`` applies
+    it to G before admitting a gated graph, and
+    ``api_dsl.SdpaFwdDslSm100.check_support`` raises on exactly the layouts it
+    rejects, so a plan that entered the ranked list can never die on G's layout
+    in the lowering.  ``elem_bytes`` defaults to the 2 B every Rubin gate kernel
+    stores (``_CfgSm107.GATE_BPE``: Q-dtype on the half kernels, bf16 on the
+    quantized one).
+    """
+    return bshd_compact(shape_bhsd, stride_bhsd) or bshd_zero_copy_stride(shape_bhsd, stride_bhsd, elem_bytes) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -220,17 +261,23 @@ def sdpa_smem_bytes(
     bpe_qkv: int,
     bpe_o: int,
     qo_alias: bool = False,
+    gate_bpe: int = 0,
 ) -> int:
-    """Q/K/V/O SMEM footprint for the classic prefill pipeline.
+    """Q/K/V/O (+ GATE) SMEM footprint for the classic prefill pipeline.
 
     K (seq rows) and V (d_v cols) shrink by CTA_MMA; Q/O are per-CTA full.
     ``qo_alias`` = O reuses Q's slab in the epilogue (max instead of sum).
+    ``gate_bpe`` = bytes per element of the fused epilogue gate's staging tile
+    (0 = no gate).  The gate tile is one O-shaped slab per CTA -- full TILE_O
+    width and NOT divided by CTA_MMA, because under cga2 each CTA of the pair
+    owns a distinct 128-row Q block and gates its own full-width O rows.
     """
     s_q = tiles_q * (tile_m * tile_k) * bpe_qkv
     s_o = tiles_q * (tile_m * tile_o) * bpe_o
     s_k = stages_kv * (tile_n * tile_k // cta_mma) * bpe_qkv
     s_v = stages_kv * (tile_o * tile_n // cta_mma) * bpe_qkv
-    return (max(s_q, s_o) if qo_alias else s_q + s_o) + s_k + s_v
+    s_gate = tiles_q * (tile_m * tile_o) * gate_bpe
+    return (max(s_q, s_o) if qo_alias else s_q + s_o) + s_k + s_v + s_gate
 
 
 @dataclass(frozen=True)
@@ -283,6 +330,21 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     the engine row, which advertises split_d_shapes={(128, 128)} — so a long-KV
     Rubin graph could be handed an automatically proposed split plan and then
     fail here at compile."""
+    # Fused epilogue gate FIRST, so an interaction decline names the feature the
+    # caller asked for (`TemplateParams(epilogue_gate=True, split_kv=2)` reads
+    # "epilogue_gate is dense, unsplit ...", not the generic Rubin split
+    # message below).  Only the flavors whose BODIES carry the gate seams may
+    # load with it -- an unlisted flavor would trace an ungated epilogue and
+    # silently return O instead of O * sigmoid(G).  The feature interactions
+    # are declined here as well as in the rows/adapter twin: THD has no gate
+    # descriptor, a KV split would gate the partials the combine then
+    # re-normalizes, paged KV and PackGQA are simply not wired through the gate
+    # TMA coordinates.
+    if k.epilogue_gate:
+        if flavor not in _EPILOGUE_GATE_FLAVORS:
+            raise ValueError(f"{flavor}: epilogue_gate is wired on {sorted(_EPILOGUE_GATE_FLAVORS)} only")
+        if k.thd_varlen or (k.split_kv or 1) > 1 or k.pack_gqa or k.paged_kv:
+            raise ValueError(f"{flavor}: epilogue_gate is dense, unsplit, unpaged, non-PackGQA only")
     if k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16):
         raise ValueError(f"{flavor}: dtype_qkv must be 0=E4M3/1=E5M2/2=BF16/3=FP16 (got {k.dtype_qkv}); Rubin has no TF32 prefill kernel")
     dtype_o = resolve_dtype_o(k)
@@ -433,6 +495,18 @@ class _CfgSm107:
     SOFTMAX_PLUS_CORR: int = 256
     READ_TILE_ARRIVERS: int = 15
 
+    # --- fused epilogue gate (O := O * sigmoid(G)); every seam in the kernel
+    # bodies folds on cutlass.const_expr(CFG.EPILOGUE_GATE), so 0 traces the
+    # pre-gate instruction stream byte-for-byte.  Only the d256 factory ever
+    # sets it (config_sm107._EPILOGUE_GATE_FLAVORS); d128/d192/d512 inherit 0.
+    EPILOGUE_GATE: int = 0
+    # Bytes per gate element: the gate is Q-dtype on the half kernels and bf16
+    # on the quantized one -- both 2 B.  Every gate constant in a kernel (TMA
+    # box, swizzle, subtile walk) derives from THIS, never from BPE_O: with an
+    # e4m3 O the two geometries differ, and a gate walk borrowed from O's
+    # passes every bf16-O test and fails only e4m3-O.
+    GATE_BPE: int = 2
+
 
 @dataclass(frozen=True)
 class CfgD128(_CfgSm107):
@@ -536,14 +610,20 @@ def _validate_dtype_k_step(cfg, flavor: str) -> None:
 
 
 def _validate_smem(cfg, flavor: str, *, qo_alias: bool) -> None:
+    gate_bpe = cfg.GATE_BPE if cfg.EPILOGUE_GATE else 0
+    gate_kib = (cfg.TILES_Q * cfg.TILE_M * cfg.TILE_O * gate_bpe) // 1024
     used = (
-        sdpa_smem_bytes(cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.TILE_O, cfg.TILES_Q, cfg.STAGES_KV, cfg.CTA_MMA, cfg.BPE, cfg.BPE_O, qo_alias=qo_alias)
+        sdpa_smem_bytes(
+            cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.TILE_O, cfg.TILES_Q, cfg.STAGES_KV, cfg.CTA_MMA, cfg.BPE, cfg.BPE_O, qo_alias=qo_alias, gate_bpe=gate_bpe
+        )
         + _SMEM_FIXED_OVERHEAD
     )
     if used > SMEM_USABLE_BYTES:
+        gate_term = f" + {gate_kib} KiB GATE staging tile" if gate_bpe else ""
         raise ValueError(
-            f"{flavor}: SMEM {used // 1024} KiB (Q/K/V/O + {_SMEM_FIXED_OVERHEAD // 1024} KiB fixed) exceeds the "
-            f"{SMEM_USABLE_BYTES // 1024} KiB usable Rubin carveout at STAGES_KV={cfg.STAGES_KV}, CTA_MMA={cfg.CTA_MMA}. "
+            f"{flavor}: SMEM {used // 1024} KiB (Q/K/V/O + {_SMEM_FIXED_OVERHEAD // 1024} KiB fixed{gate_term}) exceeds the "
+            f"{SMEM_USABLE_BYTES // 1024} KiB usable Rubin carveout at STAGES_KV={cfg.STAGES_KV}, CTA_MMA={cfg.CTA_MMA}"
+            f"{', EPILOGUE_GATE=1' if gate_bpe else ''}. "
             f"Overflowing it does NOT fail the launch -- it clobbers the last buffer allocated (measured: O came back "
             f"50 % zeros with an exact LSE), so this must raise here"
         )
@@ -786,6 +866,10 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     #   depth 3, desc v0:  1.0000 / 1.0000 / 1.0000 / 1.0000   (stays under)
     # `prefill_d256_f16.DESC_VERSION` is now DERIVED from the layout, so any
     # depth that fits SMEM is correct by construction. Do not re-literal it.
+    # (The per-tensor FP8 sibling `prefill_d256_fp8.py` carried a literal 0
+    # until the epilogue-gate PR ported the same `_needs_desc_v1` derivation;
+    # at e4m3-O depth 4 its last V stage starts at exactly 262144, so the
+    # literal was one depth away from the same wrap.)
     # `is not None`, NOT a truth test: a truthiness check maps an explicit
     # stages_kv=0 onto the default 2, which is a knob SUBSTITUTION -- the one
     # thing the engine contract forbids (honored or ineligible). Out-of-domain
@@ -848,6 +932,10 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         TMASTG_WARP_ID=10,
         SCHED_WARP_ID=11,
         READ_TILE_ARRIVERS=arrivers,
+        # Fused epilogue gate (validated per flavor in _validate_params). The gate
+        # is 2 B/elem on BOTH the half kernel (Q dtype) and the FP8 kernel (bf16).
+        EPILOGUE_GATE=int(params.epilogue_gate),
+        GATE_BPE=2,
     )
 
     _validate_regs(cfg, flavor)
@@ -867,7 +955,11 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
             ),
         ]
     )
-    # d256 always Q-union-O aliases.
+    # d256 always Q-union-O aliases.  With the epilogue gate on, the 64 KiB
+    # staging tile is added here: depth 2 fits at both CTA_MMA widths (258 KiB
+    # f16 cga2 / 226 KiB fp8 e4m3-O / 258 KiB fp8 bf16-O), depth 3 does not
+    # (322 KiB) -- the raise names the gate term so the reader sees why a depth
+    # that fits ungated no longer does.
     _validate_smem(cfg, flavor, qo_alias=True)
     return cfg, _tma_iters(cfg)
 
