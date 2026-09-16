@@ -678,12 +678,16 @@ def create_paged_container_and_block_table(tensor, block_size, seq_lens=None):
     """Page a dense [B, H, S, D] tensor: container [B*blocks, H, block_size, D] (page p of
     batch b at pool index p*B + b) + a row-major (B, 1, blocks, 1) int32 table.
 
-    ``seq_lens`` (per-batch lengths, the padding-mask values bound alongside): every
-    page at or past ``ceil(seq_lens[b] / block_size)`` -- a page no length reaches -- is
-    NaN-filled, so an engine that dereferences a dead table slot (instead of treating it
-    as out of range) poisons its O through 0 * NaN and fails the compare. Rows INSIDE the
-    last live page but past the length keep their finite data: the paged-attention
-    contract lets a kernel load and mask them."""
+    ``seq_lens`` (per-batch lengths, the padding-mask values bound alongside) is OPT-IN
+    poison: when given, every page at or past ``ceil(seq_lens[b] / block_size)`` -- a page
+    no length reaches -- is NaN-filled, so an engine that dereferences a dead table slot
+    poisons its O through 0 * NaN and fails the compare. Only engines that promise to
+    skip dead slots may be tested this way: the FROST paged kernels issue a TMA-OOB page
+    -1 there, while the backend engine loads whole tile-rounded page ranges through the
+    table and masks the scores, so it needs finite data in every table slot (its default
+    ``exec_sdpa_fp8`` path passes ``seq_lens=None``; see ``ExecConfig.paged_nan_dead_pages``).
+    Rows INSIDE the last live page but past the length keep their finite data either way:
+    the paged-attention contract lets a kernel load and mask them."""
     B, H, S, D = tensor.shape
     blocks_per_batch = math.ceil(S / block_size)
 
@@ -908,8 +912,12 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_paged:
         k_gpu_bhsd = torch.einsum('bshd->bhsd', k_fp8).contiguous()
         v_gpu_bhsd = torch.einsum('bshd->bhsd', v_fp8).contiguous()
-        container_k_gpu, k_block_table_gpu = create_paged_container_and_block_table(k_gpu_bhsd, block_size, seq_lens=paged_seq_len_kv)
-        container_v_gpu, v_block_table_gpu = create_paged_container_and_block_table(v_gpu_bhsd, block_size, seq_lens=paged_seq_len_kv)
+        # Dead-page NaN poison is opt-in (cfg.paged_nan_dead_pages): the FROST-pinned
+        # paged tests set it; the default path serves the backend engine, whose
+        # contract lets it read (and mask) every page the table names.
+        poison_lens = paged_seq_len_kv if getattr(cfg, "paged_nan_dead_pages", False) else None
+        container_k_gpu, k_block_table_gpu = create_paged_container_and_block_table(k_gpu_bhsd, block_size, seq_lens=poison_lens)
+        container_v_gpu, v_block_table_gpu = create_paged_container_and_block_table(v_gpu_bhsd, block_size, seq_lens=poison_lens)
 
     # Allocate forward output tensors
     if is_ragged:

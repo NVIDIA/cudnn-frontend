@@ -1371,27 +1371,84 @@ def test_paged_graph_fp8_declines_off_contract():
     assert not offers_engine(_build_fp8_paged_graph(16), engine_name())
 
 
+# Every d128 / d256 kernel file WITHOUT the PAGED_KV specialization, with the dtype code
+# its family takes (0 = E4M3 for the quantized files, 2 = BF16 for f16/bf16) and the
+# CTA-MMA topology its config accepts before the module body runs (the quantized d256
+# kernels are cga1-only); the guard under test is the module's own.
+_PAGED_UNWIRED_KERNELS = [
+    ("sm100/prefill_d128_mxfp8.py", 0, 2),
+    ("sm100/prefill_d256_fp8.py", 0, 1),
+    ("sm100/prefill_d256_mxfp8.py", 0, 1),
+    ("sm107/prefill_d128_f16.py", 2, 2),
+    ("sm107/prefill_d128_fp8.py", 0, 2),
+    ("sm107/prefill_d128_mxfp8.py", 0, 2),
+    ("sm107/prefill_d256_f16.py", 2, 2),
+    ("sm107/prefill_d256_fp8.py", 0, 1),
+    ("sm107/prefill_d256_mxfp8.py", 0, 1),
+]
+
+
 @pytest.mark.L0
-@pytest.mark.parametrize(
-    "rel",
-    ["sm100/prefill_d128_mxfp8.py", "sm100/prefill_d256_fp8.py", "sm100/prefill_d256_mxfp8.py"],
-)
-def test_paged_unwired_kernels_refuse_paged_params(rel):
+@pytest.mark.parametrize("rel, dtype_qkv, cta_mma", _PAGED_UNWIRED_KERNELS, ids=[k[0].replace("/", "_") for k in _PAGED_UNWIRED_KERNELS])
+def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
     """config_sm100._validate_params no longer keys the paged backstop off the dtype
     family (per-tensor FP8 d128 is wired now, MXFP8 shares its dtype codes), so each
-    d128/d256 kernel file WITHOUT the PAGED_KV specialization must refuse a paged
-    TemplateParams itself, at module scope -- never load its dense K/V descriptors
-    over a page pool."""
+    d128/d256 kernel file WITHOUT the PAGED_KV specialization -- the SM100 MXFP8 and
+    d256 FP8 flavors and all six SM107 siblings -- must refuse a paged TemplateParams
+    itself, at module scope -- never load its dense K/V descriptors over a page pool."""
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
     path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", *rel.split("/"))
-    # cta_mma=1 on d256: the quantized d256 kernels are cga1-only (config_sm100._validate_params)
-    # and that check runs before the module body; the guard under test is the module's.
-    params = TemplateParams(dtype_qkv=0, dtype_o=2, seq_kv_lens_present=True, paged_kv=True, page_size=16, cta_mma=1 if "d256" in rel else 2)
+    params = TemplateParams(dtype_qkv=dtype_qkv, dtype_o=2, seq_kv_lens_present=True, paged_kv=True, page_size=16, cta_mma=cta_mma)
     with pytest.raises(ValueError, match="paged_kv is not wired"):
         load_template(path, params, tag=f"paged_unwired_probe_{rel.replace('/', '_')}")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("fp8", [False, True], ids=["f16", "fp8"])
+def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
+    """check_support declines paged KV on a cc10.7 device -- no SM107 sibling kernel has
+    the PAGED_KV specialization -- with NotImplementedError, before compile() could
+    reach a sibling's module-scope guard (test_paged_unwired_kernels_refuse_paged_params
+    keeps that guard as the backstop).  The device is faked through
+    torch.cuda.get_device_capability, which is what check_support reads; the same
+    adapter on the real SM100 device accepts the graph (the accept half of the pair)."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, H, KH, P, max_pages = 2, 8, 2, 16, 8
+    dev = "cuda"
+    if fp8:
+        _, _, k_c, v_c, _, _, _ = _pools_fp8(B, KH, D, P, max_pages, False, "e4m3", [10] * B)
+        q_gpu = torch.zeros(B, 1, H, D, device=dev, dtype=torch.float8_e4m3fn).transpose(1, 2)
+        o_gpu = torch.empty(B, 1, H, D, device=dev, dtype=torch.float16).transpose(1, 2)
+        extra = dict(pertensor_fp8=True, dtype_o=torch.float16)
+    else:
+        _, _, k_c, v_c, _ = _pools(B, KH, D, P, max_pages, False, torch.float16)
+        q_gpu = torch.zeros(B, 1, H, D, device=dev, dtype=torch.float16).transpose(1, 2)
+        o_gpu = torch.empty_like(q_gpu)
+        extra = {}
+    lse = torch.empty(B, H, 1, device=dev, dtype=torch.float32)
+
+    def _api():
+        return SdpaFwdDslSm100(
+            sample_q=q_gpu,
+            sample_k=k_c,
+            sample_v=v_c,
+            sample_o=o_gpu,
+            sample_lse=lse,
+            seq_kv_lens_present=True,
+            seq_q_lens_present=True,
+            paged_page_size=P,
+            paged_max_seq_len_kv=max_pages * P,
+            **extra,
+        )
+
+    _api().check_support()  # the real SM100 device: accepted
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
+    with pytest.raises(NotImplementedError, match="SM107 sibling"):
+        _api().check_support()
 
 
 @pytest.mark.L0

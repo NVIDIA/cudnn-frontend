@@ -1741,10 +1741,14 @@ def test_sdpa_fp8_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
 #
 # FlashInfer-shaped fp8 KV-cache decode / MTP: sdpa_fp8 over E4M3/E5M2 page pools,
 # s_q in [1, 8] ("s_q=1" weighted), GQA, page sizes {16, 32, 64, 128}, per-batch KV
-# lengths (partial last pages, zero-length sequences, NaN-filled dead pages). Every
-# draw is inside the fp8 row's paged envelope (d <= 128, dense Q, contract page
-# sizes), so each config ASSERTS that sdpa_fwd_prefill_sm100_fp8 served it: a WAIVED
-# skip or a silent fall-through to the backend would otherwise hide a decline.
+# lengths (partial last pages, zero-length sequences). Every draw is inside the fp8
+# row's paged envelope (d <= 128 at the fp8 graphs' 16-granularity, dense Q, contract
+# page sizes), so each config ASSERTS that sdpa_fwd_prefill_sm100_fp8 served it: a
+# WAIVED skip or a silent fall-through to the backend would otherwise hide a decline.
+# Because the engine is pinned, both functions opt in to the harness's dead-page NaN
+# poison (cfg.paged_nan_dead_pages): the FROST kernel promises a TMA-OOB page -1 for
+# every table slot past a sequence's live pages, so a dereferenced dead slot fails the
+# compare instead of passing silently.
 
 FROST_FP8_ENGINE_KEY = "frost:sdpa_fwd_prefill_sm100_fp8"
 
@@ -1784,7 +1788,7 @@ def test_sdpa_fp8_fwd_paged_decode_frost_L0(env_info, test_no, request, cudnn_ha
     with RandomizationContext(
         batches=RandomBatchSize(min=1, max=16, with_high_probability=[8, 16]),
         s_q_s_kv=RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1": 6, "s_q=s_kv": 0, "s_q=random": 4}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=128, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(64, 64), (128, 128)]),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=128, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(64, 64), (128, 128)], multiple_of=16),
         head_count=RandomHeadGenerator(min=4, max=32, head_group_options=(1, 6, 1)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
@@ -1796,6 +1800,7 @@ def test_sdpa_fp8_fwd_paged_decode_frost_L0(env_info, test_no, request, cudnn_ha
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     test.cfg.is_paged = True
+    test.cfg.paged_nan_dead_pages = True
     # The FROST FP8 kernels bake a 4-binade lazy-rescale threshold (config_sm100.rescale_threshold);
     # the reference mirrors the value it is handed, so pin it rather than draw it.
     test.cfg.rescale_threshold = 4.0
@@ -1828,6 +1833,7 @@ def test_sdpa_fp8_fwd_paged_decode_frost_pinned_L0(env_info, request, cudnn_hand
         is_alibi=False,
         is_infer=True,
         is_paged=True,
+        paged_nan_dead_pages=True,
         is_bias=False,
         is_block_mask=False,
         is_padding=True,
