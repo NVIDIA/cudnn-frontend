@@ -1682,7 +1682,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 f"paged KV is wired on the d128 and d256 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._value_error_if(not self.seq_kv_lens_present, "paged KV requires per-batch KV lengths (seq_kv_lens_present)")
-            self._not_implemented_error_if(self.has_sink, "paged KV with an attention sink is not validated")
+            # has_sink composes with paged KV (epilogue fold vs. loader); the
+            # split x sink exclusion below is the only sink gate on this path.
             p = self.paged_page_size
             self._value_error_if(
                 p % 8 != 0 or (p < _SM100_TILE_N and _SM100_TILE_N % p != 0) or (p > _SM100_TILE_N and p % _SM100_TILE_N != 0),

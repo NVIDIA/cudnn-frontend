@@ -226,7 +226,7 @@ def test_sdpa_random_sq1_L0(env_info, test_no, request, cudnn_handle):
         # ragged = packed-THD decode (the serving shape); was never drawn here,
         # which is how the d=192 THD-decode view overflow (GitHub #980) hid.
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 1, "full" : 1}),
-        # sink_token not supported with s_q==1
+        # sink_token at s_q==1: drawn by test_sdpa_random_sq1_sink_frost_L0 (FROST-served; the backend engines decline it)
         # dropout not supported with s_q==1
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -257,7 +257,7 @@ def test_sdpa_random_sq1_unified_L1(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
-        # sink_token not supported with s_q==1
+        # sink_token at s_q==1: drawn by test_sdpa_random_sq1_sink_frost_L0 (FROST-served; the backend engines decline it)
         # dropout not supported with s_q==1
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -387,6 +387,134 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
 
 # fmt: off
 
+# # ==================================================================
+# # L0 fprop tests with s_q=1 and an attention sink (FROST-served)
+# # ==================================================================
+#
+# sink_token at s_q==1 is served by the FROST SM100 f16/bf16 engine
+# (sdpa_fwd_prefill_sm100), dense and paged; the cuDNN backend engines still
+# decline it (C++ support surface), so exec_sdpa's WAIVED skip cannot tell a
+# still-rejecting validator from a working feature. These functions therefore
+# ASSERT that FROST served every graph that ran.
+
+def _frost_sm100_or_skip():
+    """Gate for the FROST-asserting functions below: pre-Rubin Blackwell (the row
+    serves cc 10.0-10.6), FROST engines opted in, and a usable CuTe DSL (the row
+    declines without one and the native backend would then serve the sink-free
+    draws, which the routing assertion must not count as a failure of FROST)."""
+    major, minor = torch.cuda.get_device_capability()
+    if not (100 <= major * 10 + minor <= 106):
+        pytest.skip("FROST sdpa_fwd_prefill_sm100 serves cc 10.0-10.6 only")
+    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
+        pytest.skip("CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required (FROST engines are opt-in)")
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip("needs the cutedsl extra (nvidia-cutlass-dsl) at the FROST floor")
+
+
+def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100"):
+    """exec_sdpa, then assert the FROST engine served the graph. A decline of every
+    engine is a WAIVED pytest.skip inside exec_sdpa (never reaches the assert); a
+    native-backend serve leaves the frost tally unchanged and fails here."""
+    import frost_routing
+    key    = f"frost:{engine}"
+    before = frost_routing.snapshot().get(key, 0)
+    exec_sdpa(cfg, request, cudnn_handle)
+    after  = frost_routing.snapshot().get(key, 0)
+    assert after > before, f"expected {engine} to serve this graph; FROST routing tally: {frost_routing.snapshot()}"
+
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=256, rng_seed=2002), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_random_sq1_sink_frost_L0(env_info, test_no, request, cudnn_handle):
+    """s_q=1 decode with an attention sink (1:1 with sink-free draws), dense and
+    paged 50/50, causal / left-window / band masks under both alignments, GQA up
+    to 64 heads, d <= 256 -- the decode surface the sq1 sweeps above leave out.
+    Every draw stays inside the FROST SM100 row's envelope (page sizes 16..128,
+    d_qk == d_v, paged always padded), so a native serve is a routing regression
+    and not a legitimate decline."""
+    _frost_sm100_or_skip()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    # Dense vs paged is decided up front: paged KV requires the padding mask
+    # (per-batch KV lengths), dense also draws the unpadded form.
+    is_paged = rng.randint(0, 1) == 1
+
+    # Create the randomization context within the test
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,4]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=1, s_kv_max=8192, s_q_distribution={"s_q=1":1}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=8, d_qk_max=256, d_v_min=8, d_v_max=256, head_dim_distribution={"d_qk=d_v":1}, with_high_probability=[(64,64), (128,128), (256,256)]),
+        head_count=RandomHeadGenerator(min=1, max=64, head_group_options=(1, 4, 1)),
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(causal=3, left_window_only=5, band_around_diag=2, no_mask=5),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 2}),
+        is_ragged_or_padded_or_full=RandomChoice({"padded" : 1} if is_paged else {"padded" : 1, "full" : 1}),
+        block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 128]),
+        with_sink_token=RandomChoice({True : 1, False : 1}),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = is_paged
+    test.showConfig(test_no, request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+def test_sdpa_paged_decode_sink_sliding_window_frost_L0(env_info, request, cudnn_handle):
+    """Deterministic decode graph as FlashInfer hands it to cuDNN for a d=64,
+    64/8-head model with an attention sink and a 128-token left window (the
+    GPT-OSS decode shape): bf16, paged KV (page 16), s_q=1, s_kv=2048 with mixed
+    per-batch lengths (a full cache, a page-unaligned one, 129 = one KV tile plus
+    a token, 16 = one page), sink_token, diagonal_band_left_bound=128 under
+    BOTTOM_RIGHT alignment with right_bound=0. Served by FROST (d128 envelope,
+    PackGQA group 8); the backend engines decline sink at s_q==1."""
+    _frost_sm100_or_skip()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=2002,
+        rng_geom_seed=2002,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=4,
+        d_qk=64,
+        d_v=64,
+        s_q=1,
+        s_kv=2048,
+        h_q=64,
+        h_k=8,
+        h_v=8,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
+        left_bound=128,
+        right_bound=0,
+        seq_len_q=[1, 1, 1, 1],
+        seq_len_kv=[2048, 1337, 129, 16],
+        with_sink_token=True,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, 1), request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
 # # =====================================================
 # # L0 lean attention, s_kv=513..4096
 # # =====================================================
@@ -413,7 +541,7 @@ def test_sdpa_random_lean_attn_L0(env_info, test_no, request, cudnn_handle):
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         # ragged = packed-THD decode against a long KV (GitHub #980 coverage).
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 1, "full" : 1}),
-        # sink_token not supported with s_q==1
+        # sink_token at s_q==1: drawn by test_sdpa_random_sq1_sink_frost_L0 (FROST-served; the backend engines decline it)
         # dropout not supported with s_q==1
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -444,7 +572,7 @@ def test_sdpa_random_lean_attn_unified_L1(env_info, test_no, request, cudnn_hand
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
-        # sink_token not supported with s_q==1
+        # sink_token at s_q==1: drawn by test_sdpa_random_sq1_sink_frost_L0 (FROST-served; the backend engines decline it)
         # dropout not supported with s_q==1
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)

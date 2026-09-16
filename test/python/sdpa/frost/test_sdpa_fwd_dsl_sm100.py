@@ -732,6 +732,51 @@ def test_dsl_sm100_sink(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+@_skip_pack_gqa_on_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d,s_q,pack_gqa",
+    [(128, 1, False), (128, 1, True), (128, 2, True), (128, 4, True), (64, 1, True)],
+    ids=["d128_sq1_unpacked", "d128_sq1_packed", "d128_sq2_packed", "d128_sq4_packed", "d64_sq1_packed"],
+)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_decode_sink(d, s_q, pack_gqa):
+    """Decode-shaped dense graphs (S_q in {1, 2, 4}) with an attention sink over
+    bottom-right causal, padded KV lengths incl. a zero-length batch: a keyless row
+    is O = 0 / LSE = sink, live rows match the sink-as-extra-column reference.
+    sink_token at s_q == 1 used to be rejected by the python validator as a
+    graph-validity error; it is the backend engines' support-surface rule, and
+    this row serves the combination (the sink fold is independent of S_q)."""
+    _require_dsl()
+    dtype = torch.float16
+    b, h_q, h_kv, s_kv = 3, 8, 2, 1024
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    seq_kv_lens = torch.tensor([1000, 0, 129], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    sink = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda")
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_len_kv=seq_kv_lens,
+        sink=sink,
+        pack_gqa=pack_gqa,
+        return_stats=True,
+    )
+    lse = lse.squeeze(-1)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, seq_kv_lens=seq_kv_lens, sinks=sink.flatten(), return_stats=True)
+    assert torch.isfinite(o.float()).all(), "keyless rows must not NaN the output"
+    assert (o[1] == 0).all(), "a zero-length KV batch writes O := 0 even with a sink"
+    torch.testing.assert_close(lse[1], sink.view(h_q, 1).expand(h_q, s_q), atol=1e-4, rtol=0)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_execute_sink_lse_contract():

@@ -91,14 +91,14 @@ MMA as d=512.
 | THD + causal family (top-left / bottom-right / SWA / band) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ʰ · ❌ᵍ |
 | Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Attention sink (incl. `S_q == 1` decode)ˢ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Base-2 stats (`stats_use_log2`) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ ʰ |
 | PackGQA (`PACK_GQA` knob: the GQA group packed into the Q tile)ᵐ | ✅ᵐ partial (d128 envelope) | ✅ᵐ partial | whole group onlyᵐ | ✅ᵐ partial | whole group onlyᵐ | — |
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
-| Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ᵇ · ✅ᵍ |
+| Decode-shaped (`S_q == 1`; with sink / sliding window: ˢ) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ᵇ · ✅ᵍ |
 | **Decode tile** (`S_q · PACK_G ≤ 128`, decode + MTP; f16/bf16, dense or paged)ᵈᵗ | ✅ᵈᵗ (d128 envelope) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ❌ (prefill tile) | ❌ (prefill tile) | — |
 | Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ (d128 envelope) | ✅ᵖ | ❌ | ✅ᵖ | ❌ | ❌ |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -120,8 +120,8 @@ pinned `TILE_CGA_M` is honored either
 way (a pinned 1 on any dense S_q runs the decode tile). Bottom-right causal decode
 shapes walk `SCHED_NATURAL` first (every unit has the same work). Same contract as the
 prefill tile on dense and paged graphs: padding mask + per-batch lengths, causal /
-bottom-right / SWA band, dense padded-Q trim, sink (dense; paged + sink stays declined
-by ᵖ) — a keyless row with a sink (above the bottom-right diagonal, or `seq_len_kv[b] ==
+bottom-right / SWA band, dense padded-Q trim, sink (dense and paged, incl. `S_q == 1`
+— ˢ) — a keyless row with a sink (above the bottom-right diagonal, or `seq_len_kv[b] ==
 0`) writes `O = 0`, `LSE = sink` whatever the sink's magnitude: the fold's operands are
 selected for such a row, as the prefill kernels do since PR #1095 (`exp(sink − max)`
 underflows in fp32 for sink ≤ −104, which used to give `O = NaN`, `LSE = −inf`;
@@ -158,12 +158,37 @@ lengths bound the walk on device and the split composes with them; it pays when
 `paged_attention_max_seq_len_kv` only sizes that cost model — a maximum that is not a
 multiple of the 128-row KV tile (FlashInfer passes its true max verbatim, e.g. 4000)
 does not withhold the split, unlike a mask-free dense `S_kv`, which rides synthesized
-KV-tail padding the split cannot. Not yet: sink, fp8/mxfp8 pools,
-packed (ragged-offset) block tables. Served by the `PAGED_KV` specialization of
+KV-tail padding the split cannot. The attention sink (incl. `S_q == 1`) and a left
+sliding window under the bottom-right causal diagonal ride the same paged graph on
+both flavorsˢ. Not yet: fp8/mxfp8 pools, packed (ragged-offset) block tables, sink +
+KV split (a sink graph runs unsplit — see ˢ). Served by the `PAGED_KV` specialization of
 `sm100/prefill_d128_f16.py` / `sm100/prefill_d256_f16.py` (block-table indirection on
 the K/V TMA loads; boxes past a sequence's live pages are TMA-OOB zero-filled) and, for
 decode / MTP shapes on the d128 flavor (`S_q * PACK_G <= 128`), of the d128 decode tile
 `sm100/decode_d128_f16.py` (ᵈᵗ).
+
+ˢ **Attention sink at `S_q == 1` (decode), incl. paged KV and sliding window.**
+Served natively by this row: the sink is a per-Q-row epilogue fold (`max(m, sink)`
+lifts the running max, `exp(sink − max)` joins the denominator, `LSE = max + log(sum)`)
+that is independent of `S_q`, of the mask and of the paged loader. Hardware-validated
+on B200 (SM100) — `test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py`,
+`test_sdpa_fwd_dsl_sm100.py`, `test/python/test_mhas_v2.py::test_sdpa_random_sq1_sink_frost_L0`
+and the pinned `test_sdpa_paged_decode_sink_sliding_window_frost_L0` — for the d64
+(d128 envelope), d128 and d256 flavors, f16/bf16, `S_q` in {1, 2, 4}, PackGQA on and
+off, HND and NHD pools, dense unpadded / dense padded / paged, sink +
+`diagonal_band_left_bound` + bottom-right causal (`right_bound = 0`); keyless rows
+(`seq_len_kv[b] == 0`, or above the bottom-right diagonal) write `O = 0`,
+`LSE = sink`. What changed: the python-native validator (`cudnn/_sdpa_validate.py`)
+no longer rejects `sink_token` at `s_q == 1` — that was the backend engines'
+support-surface rule, which the C++ surface keeps for the backend-only path — and
+the row's `paged KV with an attention sink is not validated` decline is gone. The
+validator lift also lets every other forward row that declares `sink=True` with the
+default `decode=True` accept the combination — SM107 f16/bf16, SM100 / SM107 MXFP8,
+SM100 / SM107 per-tensor FP8, SM120 f16/bf16 and FP8 — but sink at `S_q == 1` is ❔
+on those rows (same epilogue fold, not run here). Sink + split-KV stays declined on
+every row (`split_kv > 1 serves dense, unpadded, sink-free graphs only`): a sink
+decode graph runs unsplit, one cluster per (batch, KV head), until a sink-aware
+`split_combine` lands.
 
 ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**
 (`Capabilities.pack_gqa_partial_d_shapes = {(128, 128), (256, 256)}`, `Cfg.PACK_G`).
@@ -358,7 +383,7 @@ red (2026-09-08).
 | Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Attention sink (at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Base-2 stats (`stats_use_log2`) | ❔ | ❔ | ❔ | ❔ | ❔ | — |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ | ❌ |
@@ -662,7 +687,7 @@ FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
 | Causal right-band widening | ✅ | ✅ | ✅ |
 | Sliding window (left) | ✅ | ✅ | ✅ |
 | Padding mask (+ stats, + padded-Q trim) | ✅ | ✅ | ✅ |
-| Attention sink / dSink | ✅ | ✅ | ✅ / ✅ |
+| Attention sink / dSink (forward at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ / ✅ |
 | Base-2 stats (`stats_use_log2`) | ❔ | ❔ | — |
 | Bias / dBias | ❌ | ❌ | ✅ / ✅ |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ |
@@ -776,9 +801,11 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |
 | Bias forward | SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
-| Paged KV cache | every arch except SM100/SM103 f16/bf16 d128 / d256 forward (see ᵖ); fp8/mxfp8 pools, sink, THD, packed block tables everywhere |
+| Paged KV cache | every arch except SM100/SM103 f16/bf16 d128 / d256 forward (see ᵖ); fp8/mxfp8 pools, THD, packed block tables everywhere |
 | Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16, per-tensor FP8 and MXFP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table) |
 | PackGQA of a group sharing no factor with the 128-row tile (G = 3, 5, 7, …), and partial packing outside the SM100/SM103 f16/bf16 d128 / d256 kernels | every arch — such groups run unpacked (see ᵐ); the d192×d128 / d512 f16 and the fp8 / mxfp8 kernels pack the whole group only |
+| Attention sink + split-KV (sink-aware `split_combine`) | every arch — a sink graph runs unsplit; at `S_q == 1` over a long KV that is one cluster per (batch, KV head) (see ˢ) |
+| Attention sink at `S_q == 1` validated | every row except SM100/SM103 f16/bf16 (see ˢ): SM107 f16, MXFP8, FP8 and SM120 accept it since the validator lift but are ❔ |
 
 ᵏ **THD / ragged forward layout.** Q/K/V/O must be BSHD-ordered over **(H, S, D)**
 only — head dim innermost, then heads, then tokens (`graph_analyzer.packed_layout_ok`).
