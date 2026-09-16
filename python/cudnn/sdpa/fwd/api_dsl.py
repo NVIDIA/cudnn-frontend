@@ -510,12 +510,12 @@ class SdpaFwdDsl(APIBase):
         ``scale_o`` units on FP8; in the O's own units on MXFP8, which has no
         per-tensor ``scale_o``).
 
-        ``has_amax_o``: quantized (FP8) path only. ``True`` (default) keeps the
+        ``has_amax_o``: quantized (FP8 / MXFP8) path only. ``True`` (default) keeps the
         legacy contract -- ``amax_o`` at ``execute()`` is optional and an
         unrequested amax lands in a cached dummy slot. ``False`` records that
         the graph has NO ``Amax_O`` output: a kernel that carries the
         ``has_amax`` compile knob folds the atomicMax out entirely (the d256
-        Rubin FP8 kernel), and ``execute(amax_o=...)`` is then a
+        Rubin FP8 and MXFP8 kernels), and ``execute(amax_o=...)`` is then a
         :class:`ValueError`. Kernels without the knob keep the legacy dummy
         slot, so the flag is honoured where it can be and harmless elsewhere.
         Distinct from ``sample_amax_o`` / ``pv_bf16`` (#983): those select the
@@ -1820,7 +1820,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._gate_declared = self._bshd_zero_copy_stride(self.gate_desc, self.gate_desc.dtype.itemsize)
         self._value_error_if(
             not self.has_amax_o and not self._fp8,
-            "has_amax_o=False is meaningful on the quantized (FP8) path only (the half kernels produce no Amax_O)",
+            "has_amax_o=False is meaningful on the quantized (FP8 / MXFP8) path only (the half kernels produce no Amax_O)",
         )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).

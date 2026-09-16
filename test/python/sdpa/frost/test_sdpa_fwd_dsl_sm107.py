@@ -2414,7 +2414,7 @@ def test_sm107_mxfp8_gate_amax_is_a_compile_time_fact(out_key):
     ungated_ref, _ = _gate_reference(q_deq, k_deq, v_deq, None, causal=False, scale=d**-0.5)
     ungated_amax = ungated_ref.abs().max().item()
     assert ungated_amax > 2 * _MX_AMAX_ATOL, f"un-gated amax {ungated_amax:.4f} too small to be told from zero -- reshape the probe"
-    amax = torch.zeros(1, device="cuda", dtype=torch.float32)
+    amax = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
     api_a, out_a, lse_a = _run_gated_mxfp8(ops, gate, causal=False, out_dtype=dt, has_amax_o=True, amax=amax)
     assert getattr(api_a, "_amax_folded_out", None) is False and amax.item() > 0.0
     assert abs(amax.item() - ungated_amax) <= _MX_AMAX_ATOL, f"Amax_O {amax.item():.4f} vs the UN-gated reference {ungated_amax:.4f}"
@@ -2426,19 +2426,19 @@ def test_sm107_mxfp8_gate_amax_is_a_compile_time_fact(out_key):
         api_n.execute(*ops[:3], out_n, lse_tensor=lse_n, sf_q=ops[3], sf_k=ops[4], sf_v=ops[5], gate=gate, amax_o=amax)
     # Structural amax discrimination.  sigmoid(G) == 0: every gated O cell is 0, yet Amax_O is the
     # UN-gated amax (a gated-value reduction would report exactly 0).
-    amax_neg = torch.zeros(1, device="cuda", dtype=torch.float32)
+    amax_neg = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
     _, out_neg, _ = _run_gated_mxfp8(ops, torch.full_like(gate, -1e4), causal=False, out_dtype=dt, has_amax_o=True, amax=amax_neg)
     assert (out_neg.float() == 0).all(), "O itself must be the gated (zero) value"
     assert (
         abs(amax_neg.item() - ungated_amax) <= _MX_AMAX_ATOL
     ), f"Amax_O {amax_neg.item():.4f} with sigmoid(G) == 0 vs un-gated ref {ungated_amax:.4f}: the kernel reduced the GATED O"
     # sigmoid(G) == 1: the gated value IS the un-gated one, and so is Amax_O.
-    amax_pos = torch.zeros(1, device="cuda", dtype=torch.float32)
+    amax_pos = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
     _, out_pos, _ = _run_gated_mxfp8(ops, torch.full_like(gate, 1e4), causal=False, out_dtype=dt, has_amax_o=True, amax=amax_pos)
     assert abs(amax_pos.item() - ungated_amax) <= _MX_AMAX_ATOL, f"Amax_O {amax_pos.item():.4f} with sigmoid(G) == 1 vs un-gated ref {ungated_amax:.4f}"
     _mx_check_o(out_pos, ungated_ref)
     # G-independence and agreement with the UNGATED specialization are bit-exact, not tolerance-bound.
-    amax_off = torch.zeros(1, device="cuda", dtype=torch.float32)
+    amax_off = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
     _, out_off, _ = _run_gated_mxfp8(ops, gate, causal=False, out_dtype=dt, gate_on=False, has_amax_o=True, amax=amax_off)
     _mx_check_o(out_off, ungated_ref)
     assert amax_neg.item() == amax_pos.item() == amax.item() == amax_off.item(), (
@@ -2468,7 +2468,7 @@ def test_sm107_mxfp8_gate_dead_padded_entry_is_exactly_zero(out_key):
     sign = torch.where(torch.arange(s * h * d, device="cuda") % 2 == 0, 1.0, -1.0).view(s, h, d)
     gate.transpose(1, 2)[1] = (sign * 1e4).to(torch.bfloat16)
     lens = torch.tensor([s, 0], dtype=torch.int32, device="cuda")
-    amax = torch.zeros(1, device="cuda", dtype=torch.float32)
+    amax = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
     _, out, lse = _run_gated_mxfp8(ops, gate, causal=False, out_dtype=dt, seq_kv_lens=lens, amax=amax)
     assert (out[1].float() == 0).all(), "the dead entry must be EXACTLY zero (select, not residue * 0)"
     assert torch.isneginf(lse[1]).all(), "an empty row's LSE is -inf (no floor may leak: -69.08 = log 1e-30)"

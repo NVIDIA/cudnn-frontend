@@ -412,7 +412,7 @@ launch each against the dequantized oracle (`test_sm107_mxfp8_gate_matches_the_d
 e4m3-in also dense 512 + causal 1000 at bf16 and e4m3 O; e5m2-in at the suite's 8e-2
 half-O bound), plus the padded dead entry (bf16 / e4m3 O), and on the graph path
 (`test_mxfp8_gate_tail_graph_api`, e4m3 in, bf16 / e4m3 O). **One-time
-gate-off == shipped proof (2026-09-15, Rubin dev node):** the working-tree kernel with
+gate-off == shipped proof (2026-09-15, re-run 2026-09-16 on the pre-gate-`Amax_O` kernel; Rubin dev node):** the working-tree kernel with
 `epilogue_gate=False, has_amax=True` produced O, LSE and `Amax_O` BITWISE equal to the
 pre-gate develop kernel (`18091c19`, #1059) at B=2 H=8 H_kv=2 S=1000 causal, e4m3 in /
 bf16 O, through the same adapter marshalling
