@@ -26,6 +26,9 @@ def make_config(
     with_score_max=False,
     with_score_sum_exp=False,
     right_bound=None,
+    implementation=cudnn.attention_implementation.AUTO,
+    s_q=512,
+    s_kv=512,
 ):
     cfg = ExecConfig(
         data_type=data_type,
@@ -46,8 +49,8 @@ def make_config(
         batches=2,
         d_qk=64,
         d_v=64,
-        s_q=512,
-        s_kv=512,
+        s_q=s_q,
+        s_kv=s_kv,
         h_q=4,
         h_k=4,
         h_v=4,
@@ -55,7 +58,7 @@ def make_config(
         left_bound=None,
         right_bound=right_bound,
         dropout_prob=dropout_prob,
-        implementation=cudnn.attention_implementation.AUTO,
+        implementation=implementation,
     )
     cfg.fill_derived_fields()
     return cfg
@@ -86,4 +89,26 @@ def test_sdpa_dropout(is_infer, request, cudnn_handle):
         dropout_prob=0.1,
         right_bound=0,
     )
+    exec_sdpa(cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("right_bound", [None, 0], ids=["no_mask", "causal"])
+@pytest.mark.parametrize("s_q_s_kv", [(512, 512), (300, 1000)], ids=["s512", "s300x1000"])
+def test_sdpa_dropout_bwd_unified(data_type, right_bound, s_q_s_kv, request, cudnn_handle):
+    """Backward dropout on the unified SDPA backward node: the kernel regenerates the forward's Philox mask
+    (the test compares the gradients against a reference built from the forward's RNG dump)."""
+    cfg = make_config(
+        data_type=data_type,
+        is_infer=False,
+        is_dropout=True,
+        dropout_prob=0.1,
+        right_bound=right_bound,
+        s_q=s_q_s_kv[0],
+        s_kv=s_q_s_kv[1],
+    )
+    # The unified forward does not generate Stats with dropout, so the forward runs on AUTO (composite) and only
+    # the backward is pinned to the unified node.
+    cfg.bwd_implementation = cudnn.attention_implementation.UNIFIED
     exec_sdpa(cfg, request, cudnn_handle)
