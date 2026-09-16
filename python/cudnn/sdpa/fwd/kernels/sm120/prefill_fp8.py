@@ -936,11 +936,14 @@ class SM120FusedMultiHeadAttentionForward:
         q_tile_idx,
         batch_idx,
         head_idx,
-        sf_o=None,
-        sfo_plane_stride=0,
-        sfo_row_off_b=0,
-        sfo_col_off_h=0,
-        sfo_cols=0,
+        # Block-scaled O buffer + geometry (None / 0 when o_block_scale == 0);
+        # both call sites -- the dense launch and the persistent THD loop --
+        # pass them explicitly.
+        sf_o,
+        sfo_plane_stride,
+        sfo_row_off_b,
+        sfo_col_off_h,
+        sfo_cols,
     ) -> cutlass.Int32:
         """One unit of work: the (Q tile, sequence, head) triple named by the
         ``q_tile_idx`` / ``batch_idx`` / ``head_idx`` arguments.
@@ -1412,6 +1415,14 @@ class SM120FusedMultiHeadAttentionForward:
             for i in cutlass.range_constexpr(4):
                 lane_amax_half[i] = 0.0
 
+            # SF_O base pointer, hoisted out of the closure below like o_ptr: the
+            # DSL's region rewrite rebinds a free variable it sees the closure's
+            # nested dynamic ifs touch (sf_o.iterator ...) after the region, which
+            # turns `sf_o` into an unbound closure-local (seen as None at trace time).
+            sfo_base_ptr = None
+            if cutlass.const_expr(self.o_block_scale > 0):
+                sfo_base_ptr = sf_o.iterator.raw_ptr()
+
             def _block_scaled_group(p0: int):
                 """Block-scaled O for the d-columns [p0*16, p0*16 + o_block_scale).
 
@@ -1476,7 +1487,7 @@ class SM120FusedMultiHeadAttentionForward:
                                 + ((r >> cutlass.Int32(5)) & cutlass.Int32(3)) * cutlass.Int32(4)
                                 + (c & cutlass.Int32(3))
                             )
-                            sf_ptr = sf_o.iterator.raw_ptr() + off
+                            sf_ptr = sfo_base_ptr + off
                             if row_valid:
                                 sf_ptr.store(cutlass.Vector.from_elements((cutlass.Int8(sf_byte),), cutlass.Int8), alignment=1)
                             else:
@@ -1744,6 +1755,11 @@ class SM120FusedMultiHeadAttentionForward:
                     _qt,
                     _b,
                     _h,
+                    sf_o,
+                    sfo_plane_stride,
+                    sfo_row_off_b,
+                    sfo_col_off_h,
+                    sfo_cols,
                 )
                 _uid = thd_claim_next(seq_kv_lens, cutlass.Int32(4 * _nb + 3), _slot, cutlass.Int32(tidx))
         else:
