@@ -928,8 +928,8 @@ def _validate_cfg_d256_decode(cfg: CfgD256Decode) -> None:
         (not cfg.SPLIT_KV > 1 or not cfg.HAS_SINK, "d256 decode: split_kv > 1 with a sink is not supported (the sink would be counted once per split)"),
         (not cfg.PAGED_KV or cfg.SEQ_KV_LENS_PRESENT == 1, "d256 decode: paged KV requires per-batch KV lengths"),
         (
-            not cfg.PAGED_KV or (cfg.PAGE_SIZE % 8 == 0 and (128 % cfg.PAGE_SIZE == 0 or cfg.PAGE_SIZE % 128 == 0)),
-            "d256 decode: page_size must divide the 128-row tile or be a multiple of it",
+            not cfg.PAGED_KV or (cfg.PAGE_SIZE >= 8 and cfg.PAGE_SIZE % 8 == 0 and (128 % cfg.PAGE_SIZE == 0 or cfg.PAGE_SIZE % 128 == 0)),
+            "d256 decode: page_size must be a positive multiple of 8 that divides the 128-row tile or is a multiple of it",
         ),
     )
     for ok, msg in checks:

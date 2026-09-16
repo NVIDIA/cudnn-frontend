@@ -804,7 +804,8 @@ def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int) -> bool:
     """Whether the SM100 f16/bf16 row lowers this graph onto the d256 decode tile
     (sm100/decode_d256_f16.py) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``:
     the (256, 256) flavor, half inputs, dense (not THD), S_q x packed heads
-    within the tile's N extent.  Rubin has its own row (no decode tile)."""
+    within the tile's N extent, ``pack_g`` being the DECODE tile's group
+    (:func:`_decode_tile_pack_g`).  Rubin has its own row (no decode tile)."""
     return (
         caps.sm_lo == 100
         and caps.sm_hi < 107
@@ -814,6 +815,19 @@ def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int) -> bool:
         and _selected_d_shape(caps, facts) == (256, 256)
         and decode_d256_q_tile(facts.s_q, pack_g) > 0
     )
+
+
+def _decode_tile_pack_g(facts, pack_g: int) -> int:
+    """The heads the DECODE tile packs per token for a set whose prefill-tile
+    group is ``pack_g`` (:func:`_pack_gqa_group`; 1 = unpacked): the whole GQA
+    ratio.  sm100/decode_d256_f16.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
+    one unit per (KV head, batch) with every head of the group in its 16-column
+    tile (96/8: 12 live rows, four zero-filled) -- and has no partial form, so
+    the prefill tile's ``gcd(G, 128)`` (4 for 96/8, partial PackGQA) is not
+    this launch's geometry: fed that, S_q = 2 x 96/8 (24 packed rows, the
+    prefill tile's graph -- the adapter counts S_q x G) would read as an
+    8-row decode launch and be costed with the decode model."""
+    return (facts.h_q // facts.h_kv) if pack_g > 1 else 1
 
 
 def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
@@ -912,7 +926,8 @@ def _split_points(
     sm_count = facts.device_sm_count or 0
     if sm_count <= 0:
         return [no_split]
-    if _d256_decode_tile_selected(caps, facts, pack_g):
+    decode_pack_g = _decode_tile_pack_g(facts, pack_g)
+    if _d256_decode_tile_selected(caps, facts, decode_pack_g):
         # The decode tile is a different machine from the one the prefill model
         # below was fitted on (one cta_group::1 CTA per (KV-head group, batch,
         # split) unit, HBM-bound, ~1 tile of fixed cost -- not cga2 clusters
@@ -923,10 +938,10 @@ def _split_points(
         # caller's optimum, when it differs, is the runner-up; no-split closes
         # the list as usual.
         geometry = dict(
-            units=facts.b * (facts.h_q // pack_g),
+            units=facts.b * (facts.h_q // decode_pack_g),
             kv_tiles=_ceil_div(facts.s_kv, tile_n or 128),
             sm_count=sm_count,
-            q_tile=decode_d256_q_tile(facts.s_q, pack_g),
+            q_tile=decode_d256_q_tile(facts.s_q, decode_pack_g),
         )
         eager = choose_decode_tile_split_kv(**geometry)
         captured = choose_decode_tile_split_kv(**geometry, launch_cost=0.0)

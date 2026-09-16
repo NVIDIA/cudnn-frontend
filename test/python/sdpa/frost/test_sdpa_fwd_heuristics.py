@@ -698,3 +698,24 @@ def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
     assert mtp32[0].split_kv == 1 and mtp32[0].pack_gqa is True and all(k.split_kv == 1 for k in mtp32), mtp32
     prefill = sets(s_q=3)
     assert prefill[0].split_kv == 1 and all(k.split_kv == 1 for k in prefill), prefill
+
+
+@pytest.mark.L0
+def test_decode_tile_model_counts_the_whole_packed_group():
+    """96/8 (G = 12) at d256: the prefill tile packs gcd(12, 128) = 4 heads per
+    row-group (partial PackGQA), the decode tile packs all 12 (HEADS_PER_TILE =
+    QH_PER_KH, no partial form), so its routing test and its split model count
+    S_q x 12 like the adapter does: S_q = 1 is a 12-row decode launch of b x 8
+    units, S_q = 2 (24 rows) is the prefill tile's graph.  Fed the partial group
+    the model would call S_q = 2 an 8-row decode launch and cost it with the
+    decode model while the adapter lowers it onto the prefill tile."""
+    from cudnn.sdpa.fwd.heuristics import _d256_decode_tile_selected, _decode_tile_pack_g, _pack_gqa_group
+
+    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
+    one, two = _decode_d256_facts(h_q=96, h_kv=8, s_q=1), _decode_d256_facts(h_q=96, h_kv=8, s_q=2)
+    partial = _pack_gqa_group(row, one, 128, True)
+    assert partial == 4, partial
+    assert _decode_tile_pack_g(one, partial) == 12 and _decode_tile_pack_g(one, 1) == 1
+    assert _d256_decode_tile_selected(row, one, _decode_tile_pack_g(one, partial))
+    assert _d256_decode_tile_selected(row, two, partial), "the control: the partial group would admit the 24-row graph"
+    assert not _d256_decode_tile_selected(row, two, _decode_tile_pack_g(two, partial))

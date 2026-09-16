@@ -165,7 +165,8 @@ def _run_graph(
     o_gpu = torch.empty(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)
     seq_kv = torch.tensor(lens, dtype=torch.int32, device=dev)
     seq_q = torch.tensor(q_lens if q_lens is not None else [s_q] * B, dtype=torch.int32, device=dev)
-    sinks = (torch.randn(H, device=dev) * 2.0) if sink else None
+    # ``sink``: False = no sink, True = random logits, a number = that logit on every head.
+    sinks = None if sink is False else (torch.randn(H, device=dev) * 2.0 if sink is True else torch.full((H,), float(sink), device=dev))
 
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -191,7 +192,7 @@ def _run_graph(
     if window_left is not None:
         kw["sliding_window_length"] = window_left + 1
     sink_t = None
-    if sink:
+    if sinks is not None:
         sink_gpu = sinks.view(1, H, 1, 1).contiguous()
         sink_t = g.tensor_like(sink_gpu)
         kw["sink_token"] = sink_t
@@ -221,7 +222,7 @@ def _run_graph(
         vp.update({tk: bt, tv: bt})
     if stats:
         vp[st] = stats_gpu
-    if sink:
+    if sinks is not None:
         vp[sink_t] = sink_gpu
     # Rule 3: the execute path reads the per-batch lengths and page tables on
     # device; any blocking D2H here is a bug, not a slow path.
@@ -301,6 +302,19 @@ def test_decode_graph_sink_dense():
     validator rejects a sink at S_q == 1, so 8:1 packing keeps the 16 rows); a
     keyless batch keeps the sink's finite LSE and O := 0."""
     _run_graph(B=3, H=16, KH=2, s_q=2, lens=[700, 0, 300], page=0, sink=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sink_logit", [-100.0, -1000.0, -2.0], ids=["sink_-100", "sink_-1000", "sink_-2_control"])
+def test_decode_graph_sink_keyless_rows_keep_the_sink_logit(sink_logit):
+    """A row with no live key and a sink has exactly one softmax column, so its
+    LSE is the sink logit itself and O := 0 -- for the empty batch (KV length 0)
+    and for the bottom-right row a one-key batch masks entirely alike.  Pinned
+    with finite sinks far below zero (the #1109 review's repro): folding the
+    sink against the exp2 0-substitute (a keyless row's max is -inf) charged a
+    phantom logit 0 and exp(sink) underflowed to LSE = -inf at -100; -2 is the
+    control that passed either way."""
+    _run_graph(B=3, H=16, KH=2, s_q=2, lens=[0, 1, 128], page=0, sink=sink_logit, causal_br=True)
 
 
 @pytest.mark.L0
@@ -570,6 +584,11 @@ def test_decode_prefill_backstop_rejects_decode_record():
         make_cfg_d256_decode(TemplateParams(decode_q_tile=16, thd_varlen=True, seq_kv_lens_present=True))
     with pytest.raises(ValueError, match="fit the Q tile"):
         make_cfg_d256_decode(TemplateParams(decode_q_tile=16, pack_gqa=True, qh_per_kh=32))
+    # A paged record with a degenerate page size is a ValueError like every other
+    # rejected record, not a ZeroDivisionError out of the divisibility test.
+    for page in (0, 4, 48):
+        with pytest.raises(ValueError, match="page_size must be a positive multiple of 8"):
+            make_cfg_d256_decode(TemplateParams(decode_q_tile=16, paged_kv=True, page_size=page, seq_kv_lens_present=True))
     cfg, _ = make_cfg_d256_decode(params)
     assert cfg.N_Q == 16 and cfg.TILE_N == 128 and cfg.STAGES_KV == 3
     # The 32-column tile is a valid record (compiled, template-tested), only unrouted.

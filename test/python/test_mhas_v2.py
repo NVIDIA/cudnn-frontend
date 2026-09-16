@@ -510,20 +510,24 @@ def _require_frost_sm100(engine="sdpa_fwd_prefill_sm100"):
         pytest.skip(f"{reason}: this test asserts FROST routing")
 
 
-def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100", cga=None):
+def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100", cga=None, template=None):
     """exec_sdpa, then assert the FROST engine served the graph: the harness
     tallies the serving engine in frost_routing after build_plans, and a FROST
     decline silently falls through to the native backend, so a green run alone
     proves nothing about routing.  (A WAIVED skip inside exec_sdpa skips before
-    the assertion.)  ``cga`` additionally pins the selected plan's TILE_CGA_M
-    knob (frost_routing.LAST_PLAN): on sdpa_fwd_prefill_sm100's d128 flavor 1
-    IS the decode tile and 2 the prefill pipeline, so a test that means the
-    decode tile asserts the tile, not just the engine."""
-    key    = f"frost:{engine}"
-    before = frost_routing.snapshot().get(key, 0)
+    the assertion.)  Two optional pins name WHICH plan of that engine served it:
+    ``cga`` pins the selected plan's TILE_CGA_M knob (frost_routing.LAST_PLAN):
+    on sdpa_fwd_prefill_sm100's d128 flavor 1 IS the decode tile and 2 the
+    prefill pipeline, so a test that means the d128 decode tile asserts the
+    tile, not just the engine; ``template`` pins the kernel template the plan
+    lowered onto -- the SM100 d256 flavor lowers onto decode_d256_f16 or
+    prefill_d256_f16, tallied as "frost:<engine>:<template>"."""
+    keys   = [f"frost:{engine}"] + ([f"frost:{engine}:{template}"] if template else [])
+    before = [frost_routing.snapshot().get(k, 0) for k in keys]
     exec_sdpa(cfg, request, cudnn_handle)
-    after  = frost_routing.snapshot().get(key, 0)
-    assert after == before + 1, f"expected {engine!r} to serve this graph; routing tally: {frost_routing.snapshot()}"
+    after  = [frost_routing.snapshot().get(k, 0) for k in keys]
+    for key, b, a in zip(keys, before, after):
+        assert a == b + 1, f"expected {key!r} to serve this graph; routing tally: {frost_routing.snapshot()}"
     if cga is not None:
         served, knobs = frost_routing.LAST_PLAN
         assert served == engine and knobs is not None and knobs.cga == cga, f"expected TILE_CGA_M={cga} on {engine!r}, got {served} {knobs}"
@@ -2155,23 +2159,14 @@ def test_sdpa_thd_batch_stride_int32_overflow_L0(env_info, request, cudnn_handle
 # # L0 paged decode d256 (FROST decode tile) tests
 # # ==================================
 
-FROST_ENGINE_TALLY = "frost:sdpa_fwd_prefill_sm100"
-FROST_D256_DECODE_TALLY = FROST_ENGINE_TALLY + ":decode_d256_f16"
-FROST_D256_PREFILL_TALLY = FROST_ENGINE_TALLY + ":prefill_d256_f16"
+# The two templates the SM100 d256 row lowers onto (frost_routing tallies
+# "frost:<engine>:<template>", sdpa/helpers.note_frost_routing); the gate and the
+# routing assertion are the shared _require_frost_sm100 / _exec_sdpa_on_frost.
+FROST_D256_DECODE_TEMPLATE = "decode_d256_f16"
+FROST_D256_PREFILL_TEMPLATE = "prefill_d256_f16"
 # Packed Q rows (S_q x GQA group) the adapter routes onto the decode tile
 # (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS); the prefill d256 tile serves the rest.
 FROST_D256_DECODE_MAX_ROWS = 16
-
-
-def _frost_decode_d256_gate():
-    """The d256 decode tile is an SM100-106 FROST kernel behind the opt-in env;
-    anywhere else another path serves the graph and the routing assertions
-    below have nothing to say."""
-    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "0").strip() != "1":
-        pytest.skip("FROST engines are opt-in (CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1)")
-    major, minor = torch.cuda.get_device_capability()
-    if not 100 <= major * 10 + minor <= 106:
-        pytest.skip("the d256 decode tile is an SM100-106 kernel")
 
 
 def _decode_d256_heads(rng):
@@ -2195,8 +2190,7 @@ def test_sdpa_fwd_paged_decode_d256_frost_L0(env_info, test_no, request, cudnn_h
     the backend silently and pass on the wrong kernel, and a decode-shaped draw
     quietly served by the prefill tile would pass on the slower one.
     """
-    _frost_decode_d256_gate()
-    import frost_routing
+    _require_frost_sm100()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -2225,25 +2219,20 @@ def test_sdpa_fwd_paged_decode_d256_frost_L0(env_info, test_no, request, cudnn_h
     # A packed group (8 or 16 divides the tile) rides the decode tile while its
     # S_q x group rows fit; past that the prefill d256 tile serves the graph.
     decode_shaped = test.cfg.s_q * (test.cfg.h_q // test.cfg.h_k) <= FROST_D256_DECODE_MAX_ROWS
-    before        = frost_routing.COUNTS.get(FROST_ENGINE_TALLY, 0)
-    before_decode = frost_routing.COUNTS.get(FROST_D256_DECODE_TALLY, 0)
-    exec_sdpa(test.cfg, request, cudnn_handle)
-    assert frost_routing.COUNTS.get(FROST_ENGINE_TALLY, 0) == before + 1, f"the FROST engine row did not serve this graph: {frost_routing.snapshot()}"
-    if decode_shaped:
-        assert frost_routing.COUNTS.get(FROST_D256_DECODE_TALLY, 0) == before_decode + 1, f"the decode tile did not serve this decode-shaped graph: {frost_routing.snapshot()}"
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, template=FROST_D256_DECODE_TEMPLATE if decode_shaped else None)
 
 
 # (model heads, s_q, diagonal alignment, right bound, the template that must serve it)
 D256_DECODE_PINNED_CASES = [
-    (32, 1, cudnn.diagonal_alignment.TOP_LEFT,     None, FROST_D256_DECODE_TALLY),   # Qwen3.5 32/2: 16 packed rows
-    (32, 2, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0,    FROST_D256_PREFILL_TALLY),  # Qwen3.5 MTP: 32 rows, the unrouted wide tile
-    (16, 2, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0,    FROST_D256_DECODE_TALLY),   # Qwen3-Next 16/2 MTP: 16 packed rows
+    (32, 1, cudnn.diagonal_alignment.TOP_LEFT,     None, FROST_D256_DECODE_TEMPLATE),   # Qwen3.5 32/2: 16 packed rows
+    (32, 2, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0,    FROST_D256_PREFILL_TEMPLATE),  # Qwen3.5 MTP: 32 rows, the unrouted wide tile
+    (16, 2, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0,    FROST_D256_DECODE_TEMPLATE),   # Qwen3-Next 16/2 MTP: 16 packed rows
 ]
 
 
-@pytest.mark.parametrize("h_q,s_q,diag_align,right_bound,expect_tally", D256_DECODE_PINNED_CASES, ids=["qwen35_sq1", "qwen35_sq2_brcm", "qwen3next_sq2_brcm"])
+@pytest.mark.parametrize("h_q,s_q,diag_align,right_bound,expect_template", D256_DECODE_PINNED_CASES, ids=["qwen35_sq1", "qwen35_sq2_brcm", "qwen3next_sq2_brcm"])
 @pytest.mark.L0
-def test_sdpa_fwd_paged_decode_d256_qwen35_frost_L0(env_info, h_q, s_q, diag_align, right_bound, expect_tally, request, cudnn_handle):
+def test_sdpa_fwd_paged_decode_d256_qwen35_frost_L0(env_info, h_q, s_q, diag_align, right_bound, expect_template, request, cudnn_handle):
     """Qwen3.5 / Qwen3-Next decode as served: b=32, 32/2 or 16/2 heads, d=256, page
     16, mixed KV lengths up to 4096 -- the S_q = 1 step and the S_q = 2 MTP step
     (bottom-right causal).  Pins WHICH template serves each: the decode tile
@@ -2253,8 +2242,7 @@ def test_sdpa_fwd_paged_decode_d256_qwen35_frost_L0(env_info, h_q, s_q, diag_ali
     against the prefill tile's 66 us on B200), so a change that routes it must
     come with the numbers and flip this pin.
     """
-    _frost_decode_d256_gate()
-    import frost_routing
+    _require_frost_sm100()
 
     rng = random.Random(2009)
     seq_len_kv = [rng.randint(s_q, 4096) for _ in range(32)]
@@ -2292,11 +2280,7 @@ def test_sdpa_fwd_paged_decode_d256_qwen35_frost_L0(env_info, h_q, s_q, diag_ali
     test.cfg.fill_derived_fields()
     test.showConfig((request.node.name, len(D256_DECODE_PINNED_CASES)), request)
 
-    before        = frost_routing.COUNTS.get(FROST_ENGINE_TALLY, 0)
-    before_tmpl   = frost_routing.COUNTS.get(expect_tally, 0)
-    exec_sdpa(test.cfg, request, cudnn_handle)
-    assert frost_routing.COUNTS.get(FROST_ENGINE_TALLY, 0) == before + 1, f"the FROST engine row did not serve this graph: {frost_routing.snapshot()}"
-    assert frost_routing.COUNTS.get(expect_tally, 0) == before_tmpl + 1, f"{expect_tally} did not serve this graph: {frost_routing.snapshot()}"
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, template=expect_template)
 
 
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")

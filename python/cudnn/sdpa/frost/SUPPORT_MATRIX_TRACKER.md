@@ -265,6 +265,13 @@ routing it would regress uncaptured MTP callers; `S_q * G` in (16, 32] stays on
 the prefill tile (pinned by the routing-boundary tests) until its per-CTA issue
 rate is fixed.
 
+PackGQA on the decode tile is **whole-group**: `HEADS_PER_TILE = QH_PER_KH` (96/8
+puts its 12 heads in the 16-column tile, four tail rows zero-filled), not the
+prefill tile's partial `gcd(G, 128)`ᵐ, so the routing test and the split model
+count `S_q * G` (adapter `_decode_q_tile`, heuristics `_decode_tile_pack_g`): 96/8
+at S_q = 1 is a 12-row decode launch of `B * 8` units, at S_q = 2 (24 rows) the
+prefill tile's graph.
+
 Split policy (`heuristics.choose_decode_tile_split_kv`): the tile has its own cost
 model -- per-CTA streaming until the concurrent K/V streams saturate HBM, plus the
 combine pass -- and the LEADING plan charges the split path's second host launch

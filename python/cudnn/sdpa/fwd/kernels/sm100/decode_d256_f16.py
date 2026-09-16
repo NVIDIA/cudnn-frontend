@@ -56,7 +56,8 @@ columns.  The KV loop, per-batch lengths, masks (padding / bottom-right causal
 / SWA / right band), sink, Stats (natural or base-2), dense padded-Q trim and
 split-KV partials follow the prefill tile's contract exactly: a split writes
 fp32 O / natural-log LSE partials into the split-major workspace that
-sm100/split_combine.py reduces, and an empty range yields O := 0 / LSE := -inf.
+sm100/split_combine.py reduces, and an empty range yields O := 0 / LSE := -inf
+(with a sink, LSE := the sink logit: the row's one live column).
 Nothing reaches the host (python/cudnn/AGENTS.md Rule 3): lengths, page
 tables and the split chunking are all resolved on device.
 
@@ -744,17 +745,24 @@ def _softmax_warp_group(
         l_tot = ZERO
         for w in cutlass.range_constexpr(4):
             l_tot = l_tot + cutlass.Float32((red_ptr + (red_epi_read + cutlass.Int32(w * COLS + j))).load())
-        m_nat = row_max_for_exp2(cutlass.Float32(m_vec[j])) * LN2_F
+        m_raw = cutlass.Float32(m_vec[j])  # -inf while the row has no live key
+        m_nat = row_max_for_exp2(m_raw) * LN2_F
         row_dead = l_tot <= ZERO
         if cutlass.const_expr(CFG.HAS_SINK):
+            # The sink folds against the row's ACTUAL max (what the prefill tile
+            # does with its published max), -inf on a keyless row: new_max is
+            # then the sink logit itself, scale = exp(-inf) = 0 and new_sum = 1,
+            # so LSE is the sink logit exactly and O := 0 through inv = 0.  The
+            # 0-substitute above is for exp2 arguments only: anchoring the fold
+            # on it charged a phantom logit 0 against the sink, and a finite sink
+            # far below it (-100) underflowed exp() to 0 -> LSE = -inf.
+            m_fold = m_raw * LN2_F
             sink_logit = cutlass.Float32(sinks_arr[head_j])
-            new_max = cute.math.max(m_nat, sink_logit)
-            scale = cute.math.exp(m_nat - new_max, fastmath=True)
+            new_max = cute.math.max(m_fold, sink_logit)
+            scale = cute.math.exp(m_fold - new_max, fastmath=True)
             new_sum = l_tot * scale + cute.math.exp(sink_logit - new_max, fastmath=True)
             lse_j = new_max + cute.math.log(new_sum, fastmath=True)
             inv_j = scale / new_sum
-            # A keyless row keeps a finite LSE (the sink is its only column) and
-            # O := 0; the select below only has to keep NaN out of 0 * garbage.
         else:
             lse_j = m_nat + cute.math.log(cute.math.max(l_tot, TINY), fastmath=True)
             inv_j = ONE / cute.math.max(l_tot, TINY)
