@@ -269,16 +269,25 @@ def test_sdpa_random_bwd_unified_L0(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "ragged_mult" : 1, "cu_ragged" : 1, "cu_ragged_mult" : 1, "padded" : 1, "cu_padded" : 1, "full" : 2}),  # ragged/padded/cu_seq_len reach the unified engine on SM80/SM90/SM100/SM107
-        is_deterministic=RandomChoice({True : 0, False : 1}),
+        is_deterministic=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
         is_alibi=RandomChoice({True : 1, False : 4}),
         is_bias=RandomChoice({True : 1, False : 4}),
+        is_dropout=RandomChoice({True : 1, False : 4}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     test.cfg.is_infer = False
     test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.cfg.with_dbias = False  # bias input only: dBias has no unified backend counterpart yet
+    if test.cfg.is_dropout:
+        # The unified forward does not generate Stats with dropout: run the forward on AUTO, pin only the backward.
+        test.cfg.dropout_prob = 0.1
+        test.cfg.bwd_implementation = test.cfg.implementation
+        test.cfg.implementation = cudnn.attention_implementation.AUTO
+        # Sink token + dropout mismatches the reference (dSink, and o/stats on SM100) on the composite engine as
+        # well; keep the two apart here until that is resolved.
+        test.cfg.with_sink_token = False
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)

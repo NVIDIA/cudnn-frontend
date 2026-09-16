@@ -445,6 +445,14 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
     except cudnn.cudnnGraphNotSupportedError as e:
         print(f"@@@@ Overall result: WAIVED, not supported forward graph. {e}")
         pytest.skip("not supported forward graph")
+    except RuntimeError as e:
+        # AUTO found no forward implementation for this attribute set on this device (e.g. dropout with the
+        # packed layouts only the unified backward serves): nothing to test here.
+        if "No suitable implementation" not in str(e):
+            print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during forward graph build. {e}")
+            pytest.fail("unexpected exception during forward graph build", pytrace=False)
+        print(f"@@@@ Overall result: WAIVED, no SDPA forward implementation supports this graph. {e}")
+        pytest.skip("no SDPA forward implementation supports this graph")
     except Exception as e:
         print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during forward graph build. {e}")
         pytest.fail("unexpected exception during forward graph build", pytrace=False)
@@ -560,7 +568,7 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         use_deterministic_algorithm=cfg.is_determin,
         sink_token=sink_token,
         dSink_token=dSink_token,
-        implementation=cfg.implementation,
+        implementation=getattr(cfg, "bwd_implementation", None) or cfg.implementation,
     )
 
     dQ.set_uid(int(dq_uid_out)).set_output(True).set_dim(cfg.shape_q).set_stride(cfg.stride_q)

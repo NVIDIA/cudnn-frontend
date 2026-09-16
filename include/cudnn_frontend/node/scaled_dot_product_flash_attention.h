@@ -2279,6 +2279,45 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
         return Type::SDPA_BWD;
     }
 
+    // Deterministic dQ on the unified backward engine is selected through the engine's STAGES knob (the
+    // heuristics never emit it): 2 kernels (dK/dV, then dQ) on SM10x and the kv-ordered dQ workspace reduction
+    // (STAGES = 4) on SM90. Pins the arch's unified backward engine with its
+    // default {128,128} (SM10x) / {64,64} (SM90) bprop tiles.
+    std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+    override_heuristics_query() const override final {
+        if (!attributes.is_deterministic_algorithm) {
+            return {-1, {}};
+        }
+        int32_t const sm_version = context.get_sm_version();
+        int32_t const sm_major   = sm_version / 10;
+        auto const& Q            = attributes.inputs.find(input_names::Q);
+        int64_t const d_qk       = (Q != attributes.inputs.end() && Q->second) ? Q->second->get_dim()[3] : 0;
+        if (sm_major == 10) {
+            // d > 128 needs the 2-CTA split kernels, which the unified engine does not have yet: no pin, so the
+            // heuristics (and, under AUTO, the composite node) take over.
+            if (d_qk > 128) {
+                return {-1, {}};
+            }
+            int64_t const engine_id = (sm_version >= 107) ? 19 : 14;
+            return {engine_id,
+                    {{KnobType_t::TILE_M, 3},
+                     {KnobType_t::TILE_N, 2},
+                     {KnobType_t::KERNEL_CFG, 2},
+                     {KnobType_t::STREAM_K, 0},
+                     {KnobType_t::TILE_CGA_M, 0},
+                     {KnobType_t::STAGES, 2}}};
+        } else if (sm_major == 9) {
+            return {13,
+                    {{KnobType_t::TILE_M, 2},
+                     {KnobType_t::TILE_N, 1},
+                     {KnobType_t::KERNEL_CFG, 2},
+                     {KnobType_t::STREAM_K, 0},
+                     {KnobType_t::TILE_CGA_M, 0},
+                     {KnobType_t::STAGES, 4}}};
+        }
+        return {-1, {}};
+    }
+
     error_t
     expand_node() override final {
         CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for UnifiedSDPABackwardNode " << attributes.name);
@@ -2420,6 +2459,28 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
                 attributes.inputs, input_names::CU_SEQ_LEN_Q, CUDNN_ATTR_OPERATION_SDPA_BWD_CU_SEQ_LEN_QDESC));
             CHECK_CUDNN_FRONTEND_ERROR(set_tensor_desc(
                 attributes.inputs, input_names::CU_SEQ_LEN_KV, CUDNN_ATTR_OPERATION_SDPA_BWD_CU_SEQ_LEN_KVDESC));
+#else
+            return v928_error;
+#endif
+        }
+
+        // Dropout: the backward regenerates the forward's Philox mask from the same seed / offset (cuDNN 9.28.0).
+        // TODO(nvbugs/5102117): bump the floor to the release this lands in.
+        if (attributes.dropout_probability.has_value() && attributes.dropout_probability.value() != 0.0f) {
+            auto v928_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                      "Dropout in the unified SDPA backward node requires cuDNN 9.28.0"};
+#if (CUDNN_VERSION >= 92800)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92800, v928_error);
+            float dropout_prob = attributes.dropout_probability.value();
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_bwd_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_BWD_DROPOUT_PROBABILITY,
+                                                           CUDNN_TYPE_FLOAT,
+                                                           1,
+                                                           &dropout_prob));
+            CHECK_CUDNN_FRONTEND_ERROR(
+                set_tensor_desc(attributes.inputs, input_names::Seed, CUDNN_ATTR_OPERATION_SDPA_BWD_DROPOUT_SEED_DESC));
+            CHECK_CUDNN_FRONTEND_ERROR(set_tensor_desc(
+                attributes.inputs, input_names::Offset, CUDNN_ATTR_OPERATION_SDPA_BWD_DROPOUT_OFFSET_DESC));
 #else
             return v928_error;
 #endif

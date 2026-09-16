@@ -1062,6 +1062,10 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
             if (unified_bias_ok) {
                 allowed_input_names.insert(input_names::Bias);
             }
+            if (effective_cudnn_ver >= 92800) {
+                allowed_input_names.insert(input_names::Seed);
+                allowed_input_names.insert(input_names::Offset);
+            }
             for (const auto& [key, value] : inputs) {
                 if (allowed_input_names.find(key) == allowed_input_names.end() && value != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
@@ -1109,12 +1113,30 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
                         "Unified SDPA backward node doesn't yet support attention_score_modifier_bprop "
                         "(score_mod_bprop); use the composite implementation"};
             }
-            if (dropout_probability.has_value()) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA backward node doesn't yet support dropout"};
-            }
-            if (is_deterministic_algorithm) {
+            // Dropout: the backward regenerates the forward's Philox mask from the seed / offset (cuDNN 9.28 dev line).
+            if (dropout_probability.has_value() && dropout_probability.value() != 0.0f && effective_cudnn_ver < 92800) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA backward node doesn't yet support the deterministic algorithm"};
+                        "Unified SDPA backward node doesn't yet support dropout before cuDNN 9.28"};
+            }
+            // Deterministic dQ: kv-ordered workspace reduction on SM90, split dK/dV and dQ kernels on SM10x (both
+            // via the engine's STAGES knob pinned by the node). Not available on SM8x / SM12x.
+            if (is_deterministic_algorithm &&
+                !(effective_cudnn_ver >= 92800 && (unified_sm_major == 10 || unified_sm_major == 9))) {
+                return {
+                    error_code_t::GRAPH_NOT_SUPPORTED,
+                    "Unified SDPA backward node supports the deterministic algorithm only on SM9x/SM10x (cuDNN 9.28)"};
+            }
+            // The SM10x split-kernel deterministic plan does not stage the bias tile.
+            if (is_deterministic_algorithm && unified_sm_major == 10 && has_input(input_names::Bias)) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Unified SDPA backward node doesn't support the deterministic algorithm with a bias on SM10x"};
+            }
+            // The SM10x split-kernel deterministic plan has no 2-CTA (d > 128) variant yet.
+            auto const q_it            = inputs.find(input_names::Q);
+            int64_t const unified_d_qk = (q_it != inputs.end() && q_it->second) ? q_it->second->get_dim()[3] : 0;
+            if (is_deterministic_algorithm && unified_sm_major == 10 && unified_d_qk > 128) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Unified SDPA backward node doesn't support the deterministic algorithm for d > 128 on SM10x"};
             }
             if (!unified_layouts_ok && (max_total_seq_len_q.has_value() || max_total_seq_len_kv.has_value())) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
