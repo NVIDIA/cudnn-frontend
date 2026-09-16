@@ -144,8 +144,7 @@ def build_call(metadata, config, device):
     with build_device(device):
         graph.validate()
         KdaFrostEngine().check_support(graph)
-        plan = build_kda(graph, enable_piece_chain=False)
-    from .frost.kda_launch import make_launcher
+        plan = build_kda(graph)
 
     input_names, output_names = tuple(node.inputs), tuple(node.outputs)
     reverse_dtype = {v: k for k, v in data_types.items()}
@@ -157,7 +156,7 @@ def build_call(metadata, config, device):
         return tuple(TensorSpec(layout=tuple(reversed(range(len(s))))) for s in shapes)
 
     invoke = call(
-        make_launcher(plan, input_names, output_names),
+        plan.make_launcher(input_names + output_names),
         output_shape_dtype=shapes + (workspace,),
         input_spec=specs([t.dim for t in node.inputs.values()]),
         output_spec=specs([s.shape for s in shapes + (workspace,)]),
