@@ -9,6 +9,7 @@ from pathlib import Path
 import cudnn
 import pytest
 import torch
+from cuda.bindings import driver as cuda_driver
 
 from cudnn.frost.buffers import cutedsl_requirement_error
 
@@ -111,13 +112,34 @@ def test_scheduler_ring_reuse_live_capture(kind, config_name):
     with torch.cuda.stream(side):
         workspace.fill_(0x7F)
         output.fill_(float("nan"))
-        plan(pack, workspace=workspace)
+        plan(pack, workspace=workspace, stream=side.cuda_stream)
     torch.cuda.current_stream().wait_stream(side)
     torch.testing.assert_close(output, references[0], rtol=0, atol=0)
-    capture = torch.cuda.CUDAGraph()
+    capture = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(capture, stream=side):
-        plan(pack, workspace=workspace)
+        plan(pack, workspace=workspace, stream=side.cuda_stream)
     torch.cuda.current_stream().wait_stream(side)
+
+    # Direct JIT plans are framework-neutral: the torch context alone does
+    # not select their launch stream. Prove that this graph contains Frost.
+    def checked(result):
+        error, *values = result
+        assert int(error) == 0, result
+        return values
+
+    graph_handle = cuda_driver.CUgraph(capture.raw_cuda_graph())
+    _, count = checked(cuda_driver.cuGraphGetNodes(graph_handle, 0))
+    assert count > 0, "Frost must execute inside the captured graph"
+    nodes, actual_count = checked(cuda_driver.cuGraphGetNodes(graph_handle, count))
+    assert actual_count == count
+    kernel_names = []
+    for node in nodes:
+        (node_type,) = checked(cuda_driver.cuGraphNodeGetType(node))
+        if node_type == cuda_driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            (params,) = checked(cuda_driver.cuGraphKernelNodeGetParams(node))
+            (name,) = checked(cuda_driver.cuFuncGetName(params.func))
+            kernel_names.append(name.decode())
+    assert sum("cudnn_kernel_frost_sm120_moe" in name for name in kernel_names) == 1, kernel_names
     for index in [1, 0, 1]:
         x.copy_(encode(x_values if index == 0 else -x_values))
         offsets.copy_(torch.tensor(bounds_cases[index][:-1], dtype=torch.int32, device="cuda"))

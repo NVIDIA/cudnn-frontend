@@ -116,3 +116,10 @@ pass does not override a nonzero sanitizer exit: the original SM120 small tile
 passed its numerical checks while reporting scheduler/TMA/compute shared-ring
 WAR hazards. Read ring words in one lane and broadcast before releasing the
 slot; retain the full-warp convergence before the release arrival.
+
+Direct Frost `Plan`/JIT calls are framework-neutral and default to the null
+stream. A `torch.cuda.stream(side)` or graph context alone does not redirect
+them: pass `stream=side.cuda_stream` explicitly to both warmup and capture.
+Assert that the captured graph contains the expected Frost kernel, then poison
+outputs and replay with changed inputs. An empty graph warning is a test failure,
+not evidence that the kernel is capture-safe.
