@@ -777,6 +777,52 @@ def test_dsl_sm100_decode_sink(d, s_q, pack_gqa):
     torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
 
 
+@_skip_pack_gqa_on_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q,h_kv", [(24, 2), (12, 2)], ids=["g12_packs4", "g6_packs2"])
+@pytest.mark.parametrize("s_q", [1, 4])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_decode_sink_partial_pack_gqa(h_q, h_kv, s_q):
+    """Sink + partial PackGQA (#1104) on the dense path: G = 12 packs 4 heads per
+    token row-group (three packed heads per KV head), G = 6 packs 2.  The sink fold
+    indexes ``sinks[row_head_idx]`` (``packed_head * PACK_G + row % PACK_G``, the Q
+    head) and every head draws its own logit, so the live rows' LSE and the keyless
+    rows' LSE (= sink; the zero-length batch, and the rows above the bottom-right
+    diagonal of the 1-key batch at S_q = 4) both pin the head mapping."""
+    _require_dsl()
+    d, dtype = 128, torch.float16
+    b, s_kv = 3, 1024
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    seq_kv_lens = torch.tensor([1000, 0, 1], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    sink = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda")
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_len_kv=seq_kv_lens,
+        sink=sink,
+        pack_gqa=True,
+        return_stats=True,
+    )
+    lse = lse.squeeze(-1)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, seq_kv_lens=seq_kv_lens, sinks=sink.flatten(), return_stats=True)
+    assert torch.isfinite(o.float()).all(), "keyless rows must not NaN the output"
+    assert (o[1] == 0).all(), "a zero-length KV batch writes O := 0 even with a sink"
+    torch.testing.assert_close(lse[1], sink.view(h_q, 1).expand(h_q, s_q), atol=1e-4, rtol=0)
+    if s_q > 1:
+        # The 1-key batch: rows 0..S_q-2 sit above the bottom-right diagonal -> keyless.
+        torch.testing.assert_close(lse[2, :, : s_q - 1], sink.view(h_q, 1).expand(h_q, s_q - 1), atol=1e-4, rtol=0)
+        assert (o[2, :, : s_q - 1] == 0).all(), "rows above the bottom-right diagonal write O := 0 even with a sink"
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "d_qk,d_v,stats_use_log2",

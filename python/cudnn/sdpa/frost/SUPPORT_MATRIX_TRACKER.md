@@ -178,7 +178,8 @@ on B200 (SM100) — `test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py`,
 `with_sink_token` 1:3 when FROST engines are enabled, sink-free otherwise) and the
 pinned `test_sdpa_paged_decode_sink_sliding_window_frost_L0` /
 `test_sdpa_paged_decode_sink_keyless_rows_frost_L0` — per flavor: d128 at `S_q` in
-{1, 2, 4} (dense and paged, f16/bf16, PackGQA on and off); d64 on the d128 envelope
+{1, 2, 4} (dense and paged, f16/bf16, PackGQA on and off, and partialᵐ -- 96/8 and 48/8,
+`sinks[row_head_idx]` stays the Q head under `PACK_G < G`); d64 on the d128 envelope
 at `S_q` in {1, 4} paged (bf16, 64/8 heads, sink + left window 128) and `S_q = 1`
 dense; d256 at `S_q` in {1, 2, 4} paged (f16; bf16 for the `S_q` 4 keyless-row sink
 case); d192x128 and d512 at `S_q` 4 dense (keyless rows, sink −120). Across them: HND and NHD pools, dense

@@ -405,141 +405,6 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
 
 # fmt: off
 
-# # ==================================================================
-# # L0 pinned decode graphs with an attention sink (FROST-served)
-# # ==================================================================
-#
-# sink_token at s_q==1 is served by the FROST SM100 f16/bf16 engine
-# (sdpa_fwd_prefill_sm100), dense and paged; the cuDNN backend engines still
-# decline it (C++ support surface), so exec_sdpa's WAIVED skip cannot tell a
-# still-rejecting validator from a working feature. The s_q == 1 sweeps draw the
-# sink natively when FROST is on (_sq1_sink_token); the pinned graphs here
-# ASSERT that FROST served them.
-
-def _frost_sm100_or_skip():
-    """Gate for the FROST-asserting functions below: Blackwell at cc 10.0-10.6
-    (SM100 / SM103, the row's arch domain), FROST engines opted in, and a usable
-    CuTe DSL (the row declines without one and the native backend could then
-    serve the graph, which the routing assertion must not count as a failure
-    of FROST)."""
-    major, minor = torch.cuda.get_device_capability()
-    if not (100 <= major * 10 + minor <= 106):
-        pytest.skip("FROST sdpa_fwd_prefill_sm100 serves cc 10.0-10.6 only")
-    if not _frost_engines_enabled():
-        pytest.skip("CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required (FROST engines are opt-in)")
-    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
-    installed, version = cutedsl_state()
-    if not installed or cutedsl_too_old(version):
-        pytest.skip("needs the cutedsl extra (nvidia-cutlass-dsl) at the FROST floor")
-
-
-def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100"):
-    """exec_sdpa, then assert the FROST engine served the graph. A decline of every
-    engine is a WAIVED pytest.skip inside exec_sdpa (never reaches the assert); a
-    native-backend serve leaves the frost tally unchanged and fails here."""
-    import frost_routing
-    key    = f"frost:{engine}"
-    before = frost_routing.snapshot().get(key, 0)
-    exec_sdpa(cfg, request, cudnn_handle)
-    after  = frost_routing.snapshot().get(key, 0)
-    assert after > before, f"expected {engine} to serve this graph; FROST routing tally: {frost_routing.snapshot()}"
-
-
-@pytest.mark.L0
-def test_sdpa_paged_decode_sink_sliding_window_frost_L0(env_info, request, cudnn_handle):
-    """Deterministic decode graph as FlashInfer hands it to cuDNN for a d=64,
-    64/8-head model with an attention sink and a 128-token left window (the
-    GPT-OSS decode shape): bf16, paged KV (page 16), s_q=1, s_kv=2048 with mixed
-    per-batch lengths (a full cache, a page-unaligned one, 129 = one KV tile plus
-    a token, 16 = one page), sink_token, diagonal_band_left_bound=128 under
-    BOTTOM_RIGHT alignment with right_bound=0. Served by FROST (d128 envelope,
-    PackGQA group 8); the backend engines decline sink at s_q==1."""
-    _frost_sm100_or_skip()
-
-    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
-    test.cfg = ExecConfig(
-        data_type=torch.bfloat16,
-        rng_data_seed=2002,
-        rng_geom_seed=2002,
-        is_alibi=False,
-        is_infer=True,
-        is_paged=True,
-        is_bias=False,
-        is_block_mask=False,
-        is_padding=True,
-        is_ragged=False,
-        is_dropout=False,
-        is_determin=False,
-        batches=4,
-        d_qk=64,
-        d_v=64,
-        s_q=1,
-        s_kv=2048,
-        h_q=64,
-        h_k=8,
-        h_v=8,
-        block_size=16,
-        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
-        left_bound=128,
-        right_bound=0,
-        seq_len_q=[1, 1, 1, 1],
-        seq_len_kv=[2048, 1337, 129, 16],
-        with_sink_token=True,
-    )
-    test.cfg.fill_derived_fields()
-    test.showConfig((request.node.name, 1), request)
-
-    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
-
-
-@pytest.mark.L0
-def test_sdpa_paged_decode_sink_keyless_rows_frost_L0(env_info, request, cudnn_handle):
-    """Multi-token decode geometry from the review of PR #1095: bf16, paged KV
-    (page 16), d=128, 4/1 heads, s_q=4 under BOTTOM_RIGHT alignment with
-    right_bound=0, one batch holding a single live key -- three of its four rows
-    have no key at all, so the sink is their whole mass and O must be 0 -- and one
-    with a full 128-key cache, sink_token. The harness draws the sink from
-    N(0, 0.5); the -120 sink that underflowed the FROST fold on exactly this
-    geometry is pinned in test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py
-    (test_paged_graph_keyless_rows_sink_magnitude). The backend can serve an
-    s_q=4 sink graph too; the routing assertion keeps FROST the engine under test."""
-    _frost_sm100_or_skip()
-
-    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
-    test.cfg = ExecConfig(
-        data_type=torch.bfloat16,
-        rng_data_seed=1095,
-        rng_geom_seed=1095,
-        is_alibi=False,
-        is_infer=True,
-        is_paged=True,
-        is_bias=False,
-        is_block_mask=False,
-        is_padding=True,
-        is_ragged=False,
-        is_dropout=False,
-        is_determin=False,
-        batches=2,
-        d_qk=128,
-        d_v=128,
-        s_q=4,
-        s_kv=128,
-        h_q=4,
-        h_k=1,
-        h_v=1,
-        block_size=16,
-        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
-        right_bound=0,
-        seq_len_q=[4, 4],
-        seq_len_kv=[1, 128],
-        with_sink_token=True,
-    )
-    test.cfg.fill_derived_fields()
-    test.showConfig((request.node.name, 1), request)
-
-    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
-
-
 # # =====================================================
 # # L0 lean attention, s_kv=513..4096
 # # =====================================================
@@ -615,14 +480,15 @@ def test_sdpa_random_lean_attn_unified_L1(env_info, test_no, request, cudnn_hand
 def _require_frost_sm100(engine="sdpa_fwd_prefill_sm100"):
     """The functions below ASSERT that a FROST engine served the graph, so they
     run only where that engine is offered: a pre-Rubin Blackwell (cc 10.0-10.6)
-    with the FROST engines opted in and a CuTe DSL at the FROST floor (the row
-    declines an older or absent DSL and the native backend then serves the
-    graph correctly -- a legitimate fallback the routing assertion must not
-    report as a failure of FROST).  Elsewhere they skip instead of failing."""
+    with the FROST engines opted in (read the frontend's way, as the s_q == 1
+    sweeps' sink draw does -- _frost_engines_enabled) and a usable CuTe DSL (the
+    row declines without one and the native backend could then serve the graph,
+    which the routing assertion must not count as a failure of FROST).
+    Elsewhere they skip instead of failing."""
     major, minor = torch.cuda.get_device_capability()
     if not (100 <= major * 10 + minor <= 106):
         pytest.skip(f"{engine} serves cc 10.0-10.6 only; device is cc {major}.{minor}")
-    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
+    if not _frost_engines_enabled():
         pytest.skip("CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required: this test asserts FROST routing")
     from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
     installed, version = cutedsl_state()
@@ -736,6 +602,111 @@ def test_sdpa_fwd_paged_gqa_partial_pack_pinned_frost_L0(env_info, s_q, request,
     )
     test.cfg.fill_derived_fields()
     test.showConfig((request.node.name, len(PARTIAL_PACK_PINNED_S_Q)), request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+# # ==================================================================
+# # L0 pinned decode graphs with an attention sink (FROST-served)
+# # ==================================================================
+#
+# sink_token at s_q==1 is served by the FROST SM100 f16/bf16 engine
+# (sdpa_fwd_prefill_sm100), dense and paged; the cuDNN backend engines still
+# decline it (C++ support surface), so exec_sdpa's WAIVED skip cannot tell a
+# still-rejecting validator from a working feature. The s_q == 1 sweeps draw the
+# sink natively when FROST is on (_sq1_sink_token); the pinned graphs here
+# ASSERT that FROST served them (_require_frost_sm100 / _exec_sdpa_on_frost above).
+
+@pytest.mark.L0
+def test_sdpa_paged_decode_sink_sliding_window_frost_L0(env_info, request, cudnn_handle):
+    """Deterministic decode graph as FlashInfer hands it to cuDNN for a d=64,
+    64/8-head model with an attention sink and a 128-token left window (the
+    GPT-OSS decode shape): bf16, paged KV (page 16), s_q=1, s_kv=2048 with mixed
+    per-batch lengths (a full cache, a page-unaligned one, 129 = one KV tile plus
+    a token, 16 = one page), sink_token, diagonal_band_left_bound=128 under
+    BOTTOM_RIGHT alignment with right_bound=0. Served by FROST (d128 envelope,
+    PackGQA group 8); the backend engines decline sink at s_q==1."""
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=2002,
+        rng_geom_seed=2002,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=4,
+        d_qk=64,
+        d_v=64,
+        s_q=1,
+        s_kv=2048,
+        h_q=64,
+        h_k=8,
+        h_v=8,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
+        left_bound=128,
+        right_bound=0,
+        seq_len_q=[1, 1, 1, 1],
+        seq_len_kv=[2048, 1337, 129, 16],
+        with_sink_token=True,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, 1), request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+def test_sdpa_paged_decode_sink_keyless_rows_frost_L0(env_info, request, cudnn_handle):
+    """Multi-token decode geometry from the review of PR #1095: bf16, paged KV
+    (page 16), d=128, 4/1 heads, s_q=4 under BOTTOM_RIGHT alignment with
+    right_bound=0, one batch holding a single live key -- three of its four rows
+    have no key at all, so the sink is their whole mass and O must be 0 -- and one
+    with a full 128-key cache, sink_token. The harness draws the sink from
+    N(0, 0.5); the -120 sink that underflowed the FROST fold on exactly this
+    geometry is pinned in test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py
+    (test_paged_graph_keyless_rows_sink_magnitude). The backend can serve an
+    s_q=4 sink graph too; the routing assertion keeps FROST the engine under test."""
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=1095,
+        rng_geom_seed=1095,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=2,
+        d_qk=128,
+        d_v=128,
+        s_q=4,
+        s_kv=128,
+        h_q=4,
+        h_k=1,
+        h_v=1,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
+        right_bound=0,
+        seq_len_q=[4, 4],
+        seq_len_kv=[1, 128],
+        with_sink_token=True,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, 1), request)
 
     _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
 

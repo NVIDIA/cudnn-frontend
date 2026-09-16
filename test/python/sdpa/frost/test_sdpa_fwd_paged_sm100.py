@@ -394,6 +394,39 @@ def test_paged_graph_sink_pack_gqa(pack_gqa):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("h,kh", [(96, 8), (48, 8)], ids=["g12_packs4", "g6_packs2"])
+@pytest.mark.parametrize("s_q", [1, 4])
+def test_paged_graph_sink_partial_pack_gqa(h, kh, s_q):
+    """Sink + partial PackGQA (#1104): a GQA group that does not divide the 128-row
+    tile packs its largest divisor that does (96/8: 4 of the 12 heads per token
+    row-group, three packed heads per KV head; 48/8: 2 of 6).  The sink fold reads
+    ``sinks[row_head_idx]`` with ``row_head_idx = packed_head * PACK_G + row % PACK_G``
+    -- the Q head, not the KV head or the packed head -- and every head draws its own
+    logit from randn, so a slip in that mapping moves the live rows' LSE and the
+    keyless rows' LSE (= sink) alike.  bf16, page 16, left window 128 under the
+    bottom-right diagonal at S_q = 4 (the 1-token sequence leaves three keyless
+    rows), the packed plan pinned."""
+    plan = _run_graph(
+        4,
+        h,
+        kh,
+        D,
+        16,
+        -(-1100 // 16),
+        [300, 77, 1, 1100],
+        hnd=True,
+        dtype=torch.bfloat16,
+        s_q=s_q,
+        sink=True,
+        window_left=128 if s_q > 1 else None,
+        causal_br=s_q > 1,
+        stats=True,
+        pack_gqa=True,
+    )
+    assert plan.knobs.pack_gqa is True, plan.knobs
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
 @pytest.mark.parametrize("s_q", [1, 2])
 def test_paged_graph_d256_sink(hnd, s_q):
