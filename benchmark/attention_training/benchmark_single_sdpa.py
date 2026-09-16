@@ -101,8 +101,10 @@ _FLOPS_PER_CLOCK_PER_SM = {
     # (No fp8/mxfp8 entries: Ampere has neither datapath.)
     8: {"bfloat16": 2048, "float16": 2048},
     9: {"bfloat16": 4096, "float16": 4096, "fp8": 8192},
-    10: {"bfloat16": 8192, "float16": 8192, "fp8": 16384, "mxfp8": 16384},
-    12: {"bfloat16": 1024, "float16": 1024, "fp8": 2048, "mxfp8": 2048},
+    # fp8_nvfp4 / fp8_mxfp8: fp8 inputs with a block-scaled O epilogue -- the
+    # MMAs are the fp8 ones, so the peak is the fp8 peak.
+    10: {"bfloat16": 8192, "float16": 8192, "fp8": 16384, "mxfp8": 16384, "fp8_nvfp4": 16384, "fp8_mxfp8": 16384},
+    12: {"bfloat16": 1024, "float16": 1024, "fp8": 2048, "mxfp8": 2048, "fp8_nvfp4": 2048, "fp8_mxfp8": 2048},
 }
 
 
@@ -271,8 +273,12 @@ def parse_args():
     parser.add_argument(
         "--data_type",
         default="bfloat16",
-        choices=["bfloat16", "float16", "float", "fp8", "mxfp8"],
-        help="Data type. Can be bfloat16, float16, fp8, or mxfp8",
+        choices=["bfloat16", "float16", "float", "fp8", "mxfp8", "fp8_nvfp4", "fp8_mxfp8"],
+        help=(
+            "Data type: bfloat16, float16, float, fp8, mxfp8, or the fp8-input block-scaled-output modes "
+            "fp8_nvfp4 (FP4 O + E4M3 scale per 16 d) and fp8_mxfp8 (E4M3 O + UE8M0 scale per 32 d); "
+            "those two are forward-only and served by the cudnn_oss backend"
+        ),
     )
     parser.add_argument(
         "--num_iterations",
@@ -573,6 +579,15 @@ else:
         print(f"UNSUPPORTED_CONFIG: {reason}")
         sys.exit(UNSUPPORTED_CONFIG_RETURN_CODE)
 
+    # Block-scaled O modes ride the fp8 graph (fp8 Q/K/V, sdpa_fp8) with an
+    # extra sf_o output: 16 = FP4 O + E4M3 scale per 16 d, 32 = E4M3 O + UE8M0
+    # scale per 32 d. Forward-only, cudnn_oss only.
+    o_block_scale = {"fp8_nvfp4": 16, "fp8_mxfp8": 32}.get(args.data_type, 0)
+    if o_block_scale:
+        if args.sdpa_backend != "cudnn_oss":
+            exit_unsupported(f"{args.data_type} (block-scaled O) is served by the cudnn_oss backend only")
+        args.data_type = "fp8"
+
     if args.data_type == "bfloat16":
         target_dtype = torch.bfloat16
     elif args.data_type == "float16":
@@ -617,6 +632,10 @@ else:
     else:
         run_fwd = True
         run_bwd = False
+    if o_block_scale and run_bwd:
+        exit_unsupported("block-scaled O (fp8_nvfp4 / fp8_mxfp8) is a forward-only inference epilogue")
+    if o_block_scale and (head_dim_qk != 128 or head_dim_vo != 128):
+        exit_unsupported("block-scaled O is served by the d128 fp8 kernel flavor only")
     enable_gqa = num_q_heads != num_kv_heads
     if args.data_type == "mxfp8":
         if not is_cudnn_fe:
@@ -675,8 +694,19 @@ else:
         value = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
         if args.data_type == "mxfp8":
             output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
+        elif o_block_scale == 16:
+            # FP4 O: the packed byte container (two E2M1 per byte).
+            output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo // 2, dtype=torch.uint8, device=device).view(torch.float4_e2m1fn_x2).transpose(1, 2)
         else:
             output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=target_dtype, device=device).transpose(1, 2)
+        sf_o_gpu = None
+        if o_block_scale:
+            # Per-(b,h) planes of block scales in the F8_128x4 atom order:
+            # [B, H, S rounded to 128, d/block rounded to 4]; zero-initialized
+            # (the epilogue owns the rows it writes, the caller the rest).
+            sf_rows = -(-q_seqlen // 128) * 128
+            sf_cols = max(4, -(-(head_dim_vo // o_block_scale) // 4) * 4)
+            sf_o_gpu = torch.zeros(batch_size, num_q_heads, sf_rows, sf_cols, dtype=torch.uint8, device=device)
 
         # FP8-specific descale/scale/amax tensors
         if args.data_type == "fp8":
@@ -777,6 +807,9 @@ else:
             scale_s_fwd = graph_fwd.tensor_like(scale_s_gpu)
             scale_o_fwd = graph_fwd.tensor_like(scale_o_gpu)
 
+            sf_o_fwd = None
+            if o_block_scale:
+                sf_o_fwd = graph_fwd.tensor_like(sf_o_gpu).set_data_type(cudnn.data_type.FP8_E4M3 if o_block_scale == 16 else cudnn.data_type.FP8_E8M0)
             # Amax_S is returned unconditionally but never requested: it only becomes a
             # real graph output if set_output(True) is called on it, and nothing here
             # consumes it. Leaving it virtual also keeps the graph servable by engines
@@ -798,6 +831,7 @@ else:
                 left_bound=left_bound,
                 right_bound=right_bound,
                 # dropout=dropout_tuple if is_dropout else None,
+                **({"sf_o": sf_o_fwd} if o_block_scale else {}),
             )
         elif args.data_type == "mxfp8":
             q_fwd = graph_fwd.tensor_like(query)
@@ -870,7 +904,16 @@ else:
             # unmarked tensor, which the FROST engines' variant-pack binding
             # does not do). The stats buffer is already in every variant pack.
             if args.data_type == "fp8":
-                o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride()).set_data_type(cudnn.data_type.FP8_E4M3)
+                if o_block_scale == 16:
+                    # FP4 O: logical (B, H, S, d) dims over the packed byte container.
+                    o_dims = list(output.size())
+                    o_dims[-1] *= 2
+                    o_strides = [s * 2 if s != 1 else 1 for s in output.stride()]
+                    o_fwd.set_output(True).set_dim(o_dims).set_stride(o_strides).set_data_type(cudnn.data_type.FP4_E2M1)
+                else:
+                    o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride()).set_data_type(cudnn.data_type.FP8_E4M3)
+                if o_block_scale:
+                    sf_o_fwd.set_output(True)
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
             elif args.data_type == "mxfp8":
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride()).set_data_type(convert_to_cudnn_type(output_dtype))
@@ -1318,6 +1361,8 @@ else:
                     scale_o_fwd: scale_o_gpu,
                     amax_o_fwd: amax_o_gpu,
                 }
+                if o_block_scale:
+                    variant_pack_fwd[sf_o_fwd] = sf_o_gpu
                 workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
             elif args.data_type == "mxfp8":
                 variant_pack_fwd = {
