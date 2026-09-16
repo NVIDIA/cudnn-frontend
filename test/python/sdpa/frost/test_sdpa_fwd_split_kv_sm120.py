@@ -51,7 +51,7 @@ def _expected_split(api):
     )
 
 
-def _sm120_case(h_q, h_kv, s_q, s_kv, *, d=128, with_lse=False, workspace=True, causal=False, lse_layout="contiguous", split_kv=None):
+def _sm120_case(h_q, h_kv, s_q, s_kv, *, d=128, with_lse=False, workspace=True, causal=False, lse_layout="contiguous", split_kv=None, stats_log2=False):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
     if torch.cuda.get_device_capability()[0] != 12:
@@ -73,7 +73,7 @@ def _sm120_case(h_q, h_kv, s_q, s_kv, *, d=128, with_lse=False, workspace=True, 
     else:
         raise ValueError(f"unknown LSE layout {lse_layout!r}")
 
-    kw = dict(is_causal=True) if causal else {}
+    kw = dict(is_causal=causal, stats_log2=stats_log2)
     # Probe pass: the chooser reads the adapter's own tile geometry.
     probe = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, **kw)
     assert probe.check_support()
@@ -103,7 +103,7 @@ def _sm120_case(h_q, h_kv, s_q, s_kv, *, d=128, with_lse=False, workspace=True, 
         scores = scores.masked_fill(j > i, float("-inf"))
     p = torch.softmax(scores, dim=-1)
     if lse is not None:
-        torch.testing.assert_close(lse, torch.logsumexp(scores, dim=-1), rtol=3e-2, atol=5e-2)
+        torch.testing.assert_close(lse, torch.logsumexp(scores, dim=-1) * (math.log2(math.e) if stats_log2 else 1.0), rtol=3e-2, atol=5e-2)
     if lse_storage is not None:
         gaps = torch.ones_like(lse_storage, dtype=torch.bool)
         gaps[:s_q, :h_q, :] = False
@@ -314,3 +314,11 @@ def test_sm120_split_keeps_half_partials():
     assert api.check_support()
     assert not api._fp32_partial_split()
     assert api._partial_dtype_tag() == "f16"
+
+
+@pytest.mark.parametrize("stats_log2", [False, True], ids=["ln", "log2"])
+@pytest.mark.parametrize("d", [128, 256, 512])
+def test_sm120_split_stats_base(d, stats_log2):
+    result = _sm120_case(4, 2, 128, 1024, d=d, with_lse=True, lse_layout="strided", split_kv=4, stats_log2=stats_log2)
+    assert result.split == 4
+    torch.testing.assert_close(result.output, result.reference, atol=3e-2, rtol=3e-2)

@@ -216,6 +216,20 @@ def test_probe_rejects_alibi():
     assert not _eligible(g)
 
 
+@pytest.mark.parametrize("stats_use_log2", [False, True])
+def test_probe_stats_log2_keeps_eligibility(stats_use_log2):
+    """A base-2 Stats request (stats_use_log2) is a plan-time epilogue specialization
+    of every FROST forward kernel, so the fact is recorded and the graph stays eligible
+    in both bases."""
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    o, stats = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, generate_stats=True, stats_use_log2=stats_use_log2)
+    _finish_output(o, dims, strides)
+    _finish_output(stats, (B, H, S, 1), (H * S, S, 1, 1), cudnn.data_type.FLOAT)
+    assert _facts(g).has_stats_log2 is stats_use_log2
+    assert _eligible(g)
+
+
 def test_probe_rejects_second_op_on_graph():
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)

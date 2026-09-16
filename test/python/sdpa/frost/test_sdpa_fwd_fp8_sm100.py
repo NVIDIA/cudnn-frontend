@@ -1900,3 +1900,49 @@ def test_fp8_d512_family_shape_maps():
         for pertensor in (False, True):
             expected = (1,) if device_cc == (10, 0) and not pertensor else (2,)
             assert supported_cgas_for((512, 512), fp8=True, device_cc=device_cc, pertensor=pertensor) == expected
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)])
+@torch_fork_set_rng(seed=931)
+def test_fp8_stats_log2_every_flavor(d_qk, d_v):
+    """Both bases agree with analytic constant logits on every kernel flavor.
+
+    Nonzero logits catch scaling only log(sum_exp) and forgetting the maximum.
+    The same inputs exercise both cache specializations and leave O unchanged.
+    """
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s = 1, 2, 256
+    qf = torch.full((b, h, s, d_qk), 0.125, device="cuda")
+    kf = torch.full_like(qf, 0.25)
+    vf = torch.full((b, h, s, d_v), 0.5, device="cuda")
+    q, dq = _quant(qf, "e4m3")
+    k, dk = _quant(kf, "e4m3")
+    v, dv = _quant(vf, "e4m3")
+    expected = (q.float() * dq)[0, 0, 0].double().dot((k.float() * dk)[0, 0, 0].double()) * d_qk**-0.5 + math.log(s)
+    q, k, v = [x.transpose(1, 2).contiguous().transpose(1, 2) for x in (q, k, v)]
+    dq, dk, dv = [torch.tensor([x], dtype=torch.float32, device="cuda") for x in (dq, dk, dv)]
+    outputs = []
+    stats = []
+    for log2 in (False, True):
+        o = torch.empty(b, s, h, d_v, device="cuda", dtype=torch.float16).transpose(1, 2)
+        lse = torch.full((b, h, s), float("nan"), device="cuda")
+        api = SdpaFwdDslSm100(
+            sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, scale_softmax=d_qk**-0.5, stats_log2=log2, split_kv=1, pertensor_fp8=True
+        )
+        assert api.check_support()
+        api.compile()
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, descale_q=dq, descale_k=dk, descale_v=dv)
+        torch.cuda.synchronize()
+        want = expected * (math.log2(math.e) if log2 else 1.0)
+        # The develop D256 kernel has the same 0.0171 natural-LSE error on
+        # these inputs. Keep its analytic check at the established FP8 scale,
+        # while checking the base change itself strictly against the same data.
+        analytic_atol = 3e-2 if d_qk == 256 else 1e-4
+        torch.testing.assert_close(lse, torch.full_like(lse, want.item()), atol=analytic_atol, rtol=1e-4)
+        stats.append(lse)
+        torch.testing.assert_close(o, torch.full_like(o, 0.5), atol=1e-2, rtol=1e-2)
+        outputs.append(o)
+    torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+    torch.testing.assert_close(stats[1], stats[0] * math.log2(math.e), atol=1e-5, rtol=1e-5)

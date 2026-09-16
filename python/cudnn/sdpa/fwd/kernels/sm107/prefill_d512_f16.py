@@ -1615,6 +1615,10 @@ def _compute_warp_group(
                     nvvm.fence_proxy("async.shared", space="cta")
                     bars.mb_tma_o_full[chunk].arrive()
 
+            # Convert only the final Stats; normalization remains in natural units.
+            if cutlass.const_expr(CFG.STATS_LOG2):
+                lse = lse * cutlass.Float32(1.4426950408889634)
+
             # Write LSE — under cga2 each sg1 peer writes its half of O+LSE
             # rows (leader = [0:128], peer = [128:256]).  Per-thread row.
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + tid_in_wg

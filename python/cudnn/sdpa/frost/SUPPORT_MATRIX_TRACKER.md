@@ -11,6 +11,16 @@ cell here is ✅ only when that row admits it. Anything not listed as a row
 `score_max`/`score_sum_exp`, tensor `attn_scale`, `unfuse_fma`, `Amax_S`) is
 **declined by every FROST SDPA engine on every arch**.
 
+**Base-2 stats (`stats_use_log2`)** are served natively by every FROST forward
+engine: the request is a plan-time epilogue specialization (natural-log LSE
+scaled by log2(e) right before the store; -inf rows stay -inf). It is a
+convention gate rather than a kernel feature — serving a base-2 request with
+natural-log values would be correct O plus silently wrong Stats, so the
+capability row must stay in step with the kernels. Under split-KV the per-split
+partial LSEs stay natural (the combine merges them in that base) and only the
+combine kernel's final LSE converts. Backward engines consume natural-log Stats
+only (the graph attribute is forward-only).
+
 All FROST engines are `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`
 before `import cudnn` or the graph silently runs a cuDNN backend plan.
 
@@ -82,6 +92,7 @@ MMA as d=512.
 | Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Base-2 stats (`stats_use_log2`) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ ʰ |
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
@@ -282,6 +293,7 @@ red (2026-09-08).
 | Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Base-2 stats (`stats_use_log2`) | ❔ | ❔ | ❔ | ❔ | ❔ | — |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ | ❌ |
 | Split-KV | fp8 only | fp8 only | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ |
@@ -465,6 +477,9 @@ field that declines it, so the skip inverts when the feature lands.
 
 ---
 
+Base-2 stats are wired across the Rubin dtype families, including the separate
+Rubin config factories. Target-SM107 numerical validation is still required.
+
 ## SM120 / SM121 (Blackwell GeForce, cc 12.0–12.9)
 
 Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
@@ -499,11 +514,16 @@ FP8 FPROP and BPROP remain limited to 256.
 | Sliding window (left) | ✅ | ✅ | ✅ |
 | Padding mask (+ stats, + padded-Q trim) | ✅ | ✅ | ✅ |
 | Attention sink / dSink | ✅ | ✅ | ✅ / ✅ |
+| Base-2 stats (`stats_use_log2`) | ❔ | ❔ | — |
 | Bias / dBias | ❌ | ❌ | ✅ / ✅ |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ |
 | Deterministic (`use_deterministic_algorithm`) | — | — | ✅ |
 | Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ |
+
+Base-2 stats are wired into all three f16 templates and the FP8 template,
+including the final Split-KV combine. Target-SM120 numerical validation remains
+required; local SM80/SM100 results do not validate these kernels.
 
 ᵃ **Head TILE granule and head-DIM alignment are different numbers — the column
 headers quote the head-dim rule.** `GENERAL_HEAD_TILES` steps by 16 (f16), and
@@ -541,6 +561,7 @@ does not yet.
 | Sliding window (left) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Padding mask (+ stats, + padded-Q trim) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Attention sink / dSink | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+| Base-2 stats (`stats_use_log2`) | ✅ / — | ✅ / — | ✅ / — | ✅ / — |
 | Bias / dBias | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | GQA / MQA | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Deterministic | — / ✅ | — / ✅ | — / ✅ | — / ✅ |

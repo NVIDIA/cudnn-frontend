@@ -396,6 +396,7 @@ class _CfgSm107:
     WINDOW_RIGHT: int = 0
     BOTTOM_RIGHT: int = 0
     HAS_SINK: int = 0
+    STATS_LOG2: int = 0
     PACK_GQA: int = 0
     QH_PER_KH: int = 1
     SPLIT_KV: int = 1
@@ -669,6 +670,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         WINDOW_RIGHT=win_r,
         BOTTOM_RIGHT=bottom_right,
         HAS_SINK=has_sink,
+        STATS_LOG2=int(params.stats_log2),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=params.qh_per_kh,
         SPLIT_KV=params.split_kv or 1,
@@ -826,6 +828,7 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         WINDOW_RIGHT=win_r,
         BOTTOM_RIGHT=bottom_right,
         HAS_SINK=has_sink,
+        STATS_LOG2=int(params.stats_log2),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=params.qh_per_kh,
         SPLIT_KV=params.split_kv or 1,
@@ -950,6 +953,7 @@ def _make_cfg_d512_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         WINDOW_RIGHT=win_r,
         BOTTOM_RIGHT=bottom_right,
         HAS_SINK=has_sink,
+        STATS_LOG2=int(params.stats_log2),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=params.qh_per_kh,
         SPLIT_KV=params.split_kv or 1,

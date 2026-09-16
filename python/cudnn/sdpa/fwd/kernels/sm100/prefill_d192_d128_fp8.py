@@ -2540,6 +2540,10 @@ def _correction_warp_group(
                 beta = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
                 row_dead = row_dead | row_trim
 
+            # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
+            if cutlass.const_expr(CFG.STATS_LOG2):
+                lse_val = lse_val * cutlass.Float32(1.4426950408889634)
+
             # cga2 OOB-row guard: cluster Q rows can exceed the live sequence.
             if cutlass.const_expr(CFG.THD_VARLEN):
                 # THD rows are sequence-local. Metadata carries cu_q, so both

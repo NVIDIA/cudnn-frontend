@@ -224,6 +224,9 @@ class Capabilities:
     score_sum_exp: bool = False  # per-row/tile sum-of-exp side output
     dynamic_scale: bool = False
     unfuse_fma: bool = False
+    # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)): the
+    # kernel epilogue (or the split-KV combine) scales the LSE by log2(e).
+    stats_log2: bool = False
     seq_q_trim: bool = False
     right_band_widening: bool = False
 
@@ -549,6 +552,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         (facts.has_score_sum_exp, capabilities.score_sum_exp, "score_sum_exp output"),
         (facts.dynamic_scale, capabilities.dynamic_scale, "tensor attn_scale"),
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
+        (facts.has_stats_log2, capabilities.stats_log2, "stats_use_log2 (base-2 stats)"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
         (facts.right_band_widening, capabilities.right_band_widening, "causal right-band widening"),
         (facts.causal, capabilities.causal, "causal mask"),
@@ -697,6 +701,7 @@ def _sm100_spec() -> EngineSpec:
             paged_kv=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             lse_optional=True,
             thd=True,
             thd_padded_stats=True,
@@ -784,6 +789,7 @@ def _sm107_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             # The LSE store is const_expr'd out on a None lse_tensor, and
             # compile(has_lse=False) binds no dummy buffer at any level -- so a
             # stats-less graph reports get_workspace_size() == 0.
@@ -876,6 +882,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             lse_optional=True,
             thd=True,
             thd_padded_stats=True,
@@ -998,6 +1005,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             lse_optional=True,
             thd=True,
             thd_padded_stats=True,
@@ -1162,6 +1170,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             padded_stats=True,
             # See the f16 SM107 row: has_lse=False is a real specialization on
             # every Rubin kernel, not an accepted-and-ignored flag.
@@ -1233,6 +1242,7 @@ def _sm80_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             padded_stats=True,
             decode=False,
             # The kernels implement the dense padded-Q trim natively
@@ -1272,6 +1282,7 @@ def _sm120_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             lse_optional=True,
             padded_stats=True,
             thd=True,
@@ -1351,7 +1362,7 @@ def lower_dsl_prefill(
     ``api_type``; descriptor conversion, adapter lifecycle, variant-pack binding,
     and launch construction remain shared here.
     """
-    from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, ws_align
+    from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 
     # KV-tail via synthesized padding (see Capabilities.skv_tail_via_padding):
     # a ragged S_kv with no mask covering the tail is served through the
@@ -1392,6 +1403,7 @@ def lower_dsl_prefill(
         cu_seq_q_lens=facts.cu_seq_q_t is not None,
         cu_seq_kv_lens=facts.cu_seq_kv_t is not None,
         has_sink=facts.has_sink,
+        stats_log2=facts.has_stats_log2,
         thd=facts.thd,
         # THD Stats without ragged offsets = FlashInfer's per-batch padded (b, s_max, h) buffer
         thd_stats_padded=(facts.thd and facts.stats_t is not None and getattr(facts.stats_t, "ragged_offset", None) is None),
@@ -1498,7 +1510,7 @@ def lower_dsl_prefill(
             return buf
         return buf.as_strided(dim, stride)
 
-    def _execute(variant_pack, workspace=None, stream=None):
+    def _execute_on_stream(variant_pack, workspace=None, stream=None):
         resolved = ga.resolve_variant_pack(variant_pack, binding)
         q_buf = resolved[id(binding.q)]
         k_buf = resolved[id(binding.k)]
@@ -1587,6 +1599,12 @@ def lower_dsl_prefill(
         api.execute(**execute_kwargs)
         return None
 
+    def _execute(variant_pack, workspace=None, stream=None):
+        # Adapter copies, scratch initialization and allocator lifetime must
+        # follow the same stream as the kernels launched through the handle.
+        with _torch_stream_context(stream, api.q_desc.device):
+            return _execute_on_stream(variant_pack, workspace, stream)
+
     # Executor contract (engine._FrostSdpaFwdPlan): a non-zero workspace_bytes
     # means the plan calls _execute(variant_pack, workspace) with the caller's
     # buffer; 0 means _execute(variant_pack) and the buffer is never touched.
@@ -1667,6 +1685,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            stats_log2=True,
             lse_optional=True,
             thd=True,
             padded_stats=True,

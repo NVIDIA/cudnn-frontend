@@ -1016,3 +1016,13 @@ def test_mxfp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal):
     assert (
         err.max().item() <= 1e-4
     ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (quantized-sum LSE reads ~1e-3..1e-2)"
+
+
+@pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_sm107_stats_log2_specializes_every_dtype_and_flavor(flavor, kind, load_kw):
+    natural = _load(flavor, rubin=True, stats_log2=False, **load_kw)
+    log2 = _load(flavor, rubin=True, stats_log2=True, **load_kw)
+    assert natural is not log2
+    assert natural.CFG.STATS_LOG2 == 0
+    assert log2.CFG.STATS_LOG2 == 1
