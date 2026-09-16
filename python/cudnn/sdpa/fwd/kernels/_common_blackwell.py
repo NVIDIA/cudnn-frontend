@@ -1028,7 +1028,13 @@ def gate_epilogue_pairs(o_scaled, g_vals: list, half_opaque, o_chunk: int) -> li
     constant float reaching ``inline_ptx`` ICEs libNVVM (frost-tile-dsl S7).
 
     The caller applies the dead-row SELECT per element AFTER these values
-    (never a multiply-by-zero: the TMEM residue behind ``h`` can be NaN)."""
+    (never a multiply-by-zero: the TMEM residue behind ``h`` can be NaN).
+
+    A caller that also reports ``Amax_O`` folds it on ``o_scaled`` (= h, the
+    UNGATED value halved -- exactly, see ``gate_inv_sum``) and doubles the
+    running max once per tile: Amax_O is a statistic of the sdpa node, which
+    precedes the gate, so it must not depend on G
+    (``sm107/prefill_d256_fp8.py`` corr_chunk / corr_release)."""
     out = []
     for p in range(o_chunk // 2):
         a, b = g_vals[2 * p], g_vals[2 * p + 1]
@@ -1043,7 +1049,14 @@ def gate_epilogue_pairs(o_scaled, g_vals: list, half_opaque, o_chunk: int) -> li
 
 
 def gate_inv_sum(inv_sum):
-    """``inv_sum / 2`` -- folds sigmoid's 1/2 into the scale the epilogue applies anyway."""
+    """``inv_sum / 2`` -- folds sigmoid's 1/2 into the scale the epilogue applies anyway.
+
+    Exact for the amax fold: ``o * (inv_sum * 0.5)`` is ``0.5 * RN(o * inv_sum)``
+    bit-for-bit whenever the product is a normal fp32 (a power-of-two scale
+    commutes with RN), and ``scale_o * descale_v / S_kv <= inv_sum <= scale_o *
+    descale_v`` (``1 <= sum <= S_kv``) keeps the tile's max element far from the
+    subnormal range -- which is what lets the FP8 kernel's Amax_O fold consume
+    ``h`` and double once per tile."""
     return inv_sum * cutlass.Float32(0.5)
 
 

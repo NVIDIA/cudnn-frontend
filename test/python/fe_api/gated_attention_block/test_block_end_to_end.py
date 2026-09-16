@@ -70,16 +70,39 @@ def _run_block(geom_kw, batch, seq_len, dtype=torch.bfloat16, seq_lens=None, **b
     return out, ref, blk
 
 
-def test_workspace_size_is_reported_before_any_launch():
-    """``get_workspace_size()`` must be answerable from the declaration alone —
-    a caller sizes its buffer before it has data (contract § 10). No GPU needed
-    for the arithmetic, so assert the composition rather than a magic number."""
+def test_workspace_layout_is_the_declared_composition():
+    """The intermediates are a DECLARATION-time fact (``_plan_workspace``), so the
+    carve is asserted against its composition on any device: the in-place default
+    reserves PROJ and O only, each padded to the 256 B carve alignment, with the
+    sub-engines' scratch appended AFTER them.  ``get_workspace_size()`` is a
+    POST-compile query by contract (the scratch it adds exists only once the plans
+    do -- ``_Projection.workspace_bytes`` raises before ``compile()``), so that
+    half runs where the block compiles (Rubin): the carve must be its prefix, the
+    remainder at least what every sub-engine asked for, the whole a multiple of
+    the alignment (contract § 10: honest, never exceeded)."""
+    from cudnn.gated_attention_block.api import _WS_ALIGN, _align_up, _itemsize
+
+    b, s = 4, 128
     g = GatedAttentionBlockGeometry(**_COMMON)
-    t = 4 * 128
-    e = 2
-    intermediates = t * (g.n_qkvg + g.h_q * g.d_head + 2 * g.h_kv * g.d_head + g.h_q * g.d_head) * e
-    # proj + q + k + v + o, each padded to the 256 B carve alignment.
-    assert intermediates > 0
+    inp = make_inputs(RefGeometry(**_COMMON), batch=b, seq_len=s, dtype=torch.bfloat16)
+    out = torch.empty(b, s, g.d_model, device="cuda", dtype=torch.bfloat16)
+    blk = GatedAttentionBlockFwd(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, g)
+    assert blk.inplace_qkv, "the inference default is in-place: PROJ + O only"
+    t, e = b * s, _itemsize(torch.bfloat16)
+    proj_bytes = _align_up(t * g.n_qkvg * e)
+    o_bytes = _align_up(t * g.h_q * g.d_head * e)
+    lay = blk._layout()
+    assert (lay.proj, lay.o) == (0, proj_bytes), (lay.proj, lay.o, proj_bytes)
+    assert lay.q == lay.k == lay.v == -1, "in-place reserves no compact Q/K/V slot"
+    assert lay.engine_scratch == lay.total_bytes == proj_bytes + o_bytes
+    assert lay.total_bytes % _WS_ALIGN == 0
+    if _cc() == _SM107:
+        blk.check_support()
+        blk.compile()
+        ws = blk.get_workspace_size()
+        asked = max(blk._proj.workspace_bytes(), blk._out_proj.workspace_bytes(), blk._sdpa.scratch_workspace_bytes(), 1)
+        assert ws >= lay.total_bytes + asked, f"workspace {ws} does not cover the carve {lay.total_bytes} plus the engines' scratch {asked}"
+        assert (ws - lay.total_bytes) % _WS_ALIGN == 0 and ws % _WS_ALIGN == 0, "the engine region and the total must keep the carve alignment"
 
 
 @requires_rubin
@@ -131,31 +154,92 @@ def test_a_second_execute_reuses_the_plan_and_agrees():
     torch.testing.assert_close(out1, out2, rtol=0, atol=0)
 
 
+def _park_the_default_stream(seconds: float = 0.5) -> None:
+    """Enqueue a long spin on torch's CURRENT (default) stream so that anything a
+    stage wrongly launches there runs LATE -- after a side stream is long done."""
+    if hasattr(torch.cuda, "_sleep"):
+        torch.cuda._sleep(int(seconds * 2.0e9))  # cycles at ~2 GHz
+        return
+    x = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+    for _ in range(16):
+        x = x @ x
+
+
 @requires_rubin
-def test_a_caller_stream_is_refused_rather_than_raced():
-    """The GEMM stages bind their stream to a cuDNN handle, not to an execute
-    argument. Until a per-(device, stream) handle is threaded, a caller stream
-    would run the GEMMs on a DIFFERENT stream than the CuTe-DSL stages and race
-    silently (Rule 5). Refusing is the contract; this test is what inverts when
-    the handle lands."""
+@pytest.mark.parametrize("how", ["ambient", "explicit"])
+def test_a_caller_stream_orders_every_stage(how):
+    """Every stage -- the CuTe-DSL kernels AND the two FROST GEMMs -- launches on
+    ONE stream, the caller's: ambient (``with torch.cuda.stream(s):``) or explicit
+    (``current_stream=``).  The GEMMs take it through ``run_proj_gemm(stream=)``
+    (the JIT plan's own ``stream=``; a cached per-(device, stream) cuDNN handle on
+    the graph route).  Before that they launched on the DEFAULT stream regardless,
+    so under a caller stream the SDPA consumed a slab the projection had not
+    written yet -- all-zero output, reproduced on SM107 (Rule 5).  This is the
+    inverse of the refusal the v1 block shipped.
+
+    The probe makes the race DETERMINISTIC rather than lucky.  The workspace is
+    zero-filled and the default stream is parked behind a long spin, so a stage
+    enqueued there runs late: a late PRODUCER leaves its consumers reading zeros,
+    and a late CONSUMER (out_proj) reads the zeros the side stream writes over the
+    workspace right after the block.  Correct threading gives an output
+    BIT-IDENTICAL to the default-stream run (the block is deterministic --
+    ``test_a_second_execute_reuses_the_plan_and_agrees``)."""
     import cuda.bindings.driver as cuda_drv
 
-    out, _, blk = _run_block(_COMMON, batch=1, seq_len=256)
+    out_ref, _, blk = _run_block(_COMMON, batch=1, seq_len=256)  # default stream, synchronized
+    assert out_ref.abs().max().item() > 0
     inp = make_inputs(RefGeometry(**_COMMON), batch=1, seq_len=256, dtype=torch.bfloat16)
-    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
-    with pytest.raises(NotImplementedError, match="handle"):
-        blk.execute(
-            inp["h"],
-            inp["w_qkvg"],
-            inp["w_q_norm"],
-            inp["w_k_norm"],
-            inp["cos"],
-            inp["sin"],
-            inp["w_o"],
-            out,
-            ws,
-            current_stream=cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream),
-        )
+    ws = torch.zeros(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    out = torch.zeros_like(out_ref)
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    args = (inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, ws)
+    _park_the_default_stream()
+    if how == "ambient":
+        with torch.cuda.stream(side):
+            blk.execute(*args)
+    else:
+        blk.execute(*args, current_stream=cuda_drv.CUstream(side.cuda_stream))
+    with torch.cuda.stream(side):
+        ws.zero_()  # ordered AFTER the block on the side stream; a consumer parked on the default stream would read this instead
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref), (
+        f"a stage ran off the caller's stream ({how}): max|diff| = {(out.float() - out_ref.float()).abs().max().item()}, "
+        f"zeros = {(out == 0).float().mean().item():.0%}"
+    )
+
+
+def test_run_proj_gemm_refuses_a_handle_bound_to_another_stream():
+    """Given BOTH a handle and a stream, they must agree: a handle bound elsewhere
+    would run the GEMM off the launch stream the caller ordered everything else on
+    -- the race the stream threading closes -- so it is a typed ``ValueError``
+    before any route is taken (no graph, no JIT, no launch).  Runs on any device:
+    the check needs only a cuDNN handle."""
+    import cudnn
+    from cudnn.gated_attention_block.kernels.proj_gemm import ProjGemmPlan, run_proj_gemm
+
+    side = torch.cuda.Stream()
+    h = cudnn.create_handle()
+    cudnn.set_stream(handle=h, stream=side.cuda_stream)
+    plan = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=1, k=1, n=1, label="probe")  # never launched: the check precedes every route
+    with pytest.raises(ValueError, match="bound to stream"):
+        run_proj_gemm(plan, None, None, None, None, h, stream=torch.cuda.default_stream().cuda_stream)
+
+
+def test_graph_route_handles_are_cached_per_device_and_stream():
+    """The graph route's cuDNN handle is created ONCE per (device, stream) and
+    stays bound to that stream -- never re-``set_stream``ed, so two streams driving
+    a block concurrently never share one; and never created per execute (Rule 1)."""
+    import cudnn
+    from cudnn.gated_attention_block.kernels.proj_gemm import handle_for_stream
+
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    h1 = handle_for_stream(torch.device("cuda"), s1.cuda_stream)
+    assert handle_for_stream(torch.device("cuda", torch.cuda.current_device()), s1.cuda_stream) is h1, "same (device, stream) must hit the cache"
+    assert cudnn.get_stream(h1) == s1.cuda_stream
+    h2 = handle_for_stream(torch.device("cuda"), s2.cuda_stream)
+    assert h2 is not h1 and cudnn.get_stream(h2) == s2.cuda_stream
+    assert cudnn.get_stream(h1) == s1.cuda_stream, "creating a second handle must not rebind the first"
 
 
 # ---------------------------------------------------------------------------

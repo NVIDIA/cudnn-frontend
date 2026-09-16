@@ -212,6 +212,11 @@ class ElementwiseRecipe(NamedTuple):
     d: int
     rows_per_cta: int
     has_gate: bool
+    # The torch dtype the artifact was traced for (it is in the compile-cache
+    # key). `run_elementwise_gate` refuses an operand of any other dtype, the
+    # way `run_quantize` guards `dtype_in`. Appended with a default so the
+    # record grows append-only; `None` (a hand-built recipe) skips that check.
+    dtype: object = None
 
 
 def compile_elementwise_gate(
@@ -266,6 +271,7 @@ def compile_elementwise_gate(
         d=d,
         rows_per_cta=(threads_per_cta // lanes_per_row(d)) * rows_per_group,
         has_gate=bool(has_gate),
+        dtype=dtype,
     )
 
 
@@ -276,6 +282,13 @@ def run_elementwise_gate(r: ElementwiseRecipe, src, gate, dst, *, stream) -> Non
     if not r.has_gate and gate is not None:
         raise ValueError("this artifact was compiled WITHOUT a gate operand; passing one would silently ignore it (Rule 1)")
     for name, ten in (("src", src), ("gate", gate), ("dst", dst)):
+        if ten is not None and r.dtype is not None and ten.dtype != r.dtype:
+            # The tvm-ffi boundary also rejects this on cutlass-dsl >= 4.8
+            # ("Mismatched Tensor on argument #N ... expected dtype=bfloat16"),
+            # but that check is the DSL's, indexed by argument position, and
+            # FROST's DSL floor (CUTEDSL_MIN_VERSION, 4.7.0) predates it. Name the operand here, the way
+            # `run_quantize` does for its `dtype_in`.
+            raise ValueError(f"{name} is {ten.dtype} but this artifact was compiled for {r.dtype}; dtype is fixed per artifact")
         if ten is not None and int(ten.shape[1]) != r.h:
             # Pre-existing hole, not one `const_head_count` introduced: `n_rows`
             # below has ALWAYS been derived from `r.h`, so a mismatched H

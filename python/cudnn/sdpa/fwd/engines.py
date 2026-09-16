@@ -1211,8 +1211,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # Fused epilogue gate on the Rubin d256 FP8 kernel (E4M3 / E5M2 in,
             # any out dtype): G is staged in BF16 (kernel GATE_STORAGE_DTYPE), so
             # the row names that one dtype rather than inheriting Q's.  The FP8
-            # O quantizes the GATED value and Amax_O, when requested, is the
-            # gated pre-quant amax.  Not on the SM100 line (no gate there).
+            # O quantizes the GATED value; Amax_O, when requested, is the amax of
+            # the UNGATED normalised O (the sdpa node's output precedes the
+            # sigmoid/mul tail, so G cannot move it).  Not on the SM100 line.
             epilogue_gate=rubin_row,
             epilogue_gate_d_shapes=(SM107_EPILOGUE_GATE_SHAPES if rubin_row else None),
             epilogue_gate_dtypes=(frozenset({cudnn.data_type.BFLOAT16}) if rubin_row else None),

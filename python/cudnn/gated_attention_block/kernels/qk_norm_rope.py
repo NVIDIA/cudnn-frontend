@@ -465,11 +465,23 @@ def frost_qk_norm_rope(
     # rows_per_group=2 on an A100. A group's R rows ARE consecutive in the same
     # rstd tensor unless it straddles the Q/K seam or the ragged tail, so check
     # that at run time and vectorize the common case.
+    #
+    # Contiguous is NECESSARY, not sufficient: a v2/v4 store also needs its
+    # address R*4-byte ALIGNED. ``row0`` is a multiple of R, so the Q side
+    # (``mRstdQ + row0*4``) always is -- but the K side lands at
+    # ``mRstdK + (row0 - n_q_rows)*4``, which is aligned only when ``n_q_rows =
+    # T*h_q`` is itself a multiple of R. It is not at T=3, h_q=3, R=2 (n_q_rows=9:
+    # the group at rows 10..11 is whole-K and its K offset is 4 B), and the
+    # vector store then faults with ``cudaErrorMisalignedAddress`` (found by
+    # review on PR #1102). So a whole-K group additionally requires the aligned
+    # K offset; every other group takes the scalar path below, which never
+    # needed more than 4-byte alignment.
     if cutlass.const_expr(want_rstd):
         if lane == cutlass.Int32(0):
             if cutlass.const_expr(rows_per_group in (2, 4)):
                 whole_q = row0 + cutlass.Int32(rows_per_group - 1) < n_q_rows
-                whole_k = row0 >= n_q_rows
+                k_aligned = (row0 - n_q_rows) % cutlass.Int32(rows_per_group) == cutlass.Int32(0)
+                whole_k = (row0 >= n_q_rows) and k_aligned
                 if (whole_q or whole_k) and (row0 + cutlass.Int32(rows_per_group) <= n_rows):
                     if cutlass.const_expr(rows_per_group == 2):
                         st_global_v2(rstds[0], rstd_vals, cutlass.Float32)

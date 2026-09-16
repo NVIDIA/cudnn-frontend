@@ -497,7 +497,12 @@ class SdpaFwdDsl(APIBase):
         not. Served by the Rubin (SM107) d256 f16/bf16 and per-tensor FP8
         kernels only; every other adapter / flavor declines it with
         :class:`NotImplementedError` from ``check_support``. The gate is Q's
-        dtype on the half kernels and ``bfloat16`` on the FP8 one.
+        dtype on the half kernels and ``bfloat16`` on the FP8 one. On the FP8
+        kernel the O quantization applies to the GATED value, while ``Amax_O``
+        (when requested) is the amax of the UNGATED normalised O -- the sdpa
+        node's own output, which precedes the ``sigmoid``/``mul`` tail on the
+        graph -- so it is independent of ``gate``; the graph path and this
+        adapter share that one contract.
 
         ``has_amax_o``: quantized (FP8) path only. ``True`` (default) keeps the
         legacy contract -- ``amax_o`` at ``execute()`` is optional and an
@@ -3347,8 +3352,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         # amax_o: the kernel atomicMax'es into this buffer, so it MUST start
         # at 0. It accumulates max|o_scaled| (pre-cast, exact even for FP8 O;
-        # with an epilogue gate it is the amax of the GATED, dead-row-selected
-        # value); dividing by scale_o below yields the pre-quant output amax.
+        # with an epilogue gate it is STILL the amax of the UNGATED, dead-row-
+        # selected value -- the sdpa node's O, independent of G: the kernel
+        # folds |h| = |u/2| and doubles once per tile); dividing by scale_o
+        # below yields the pre-quant output amax.
         # Folded out (has_amax_o=False + a kernel with the knob): bind None.
         amax_o_buf = None if _amax_folded else self._amax_slot(amax_o, "amax_o", device)
         # Same-stream ordering as MXFP8: the reset must precede the kernel's

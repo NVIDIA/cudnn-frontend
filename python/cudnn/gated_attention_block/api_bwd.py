@@ -17,7 +17,7 @@ The op graph, in pipeline order::
 
     dY [B, S, d_model]
      |
-     +-- (B1) out_proj wgrad    dW_o = O_gated^T @ dY          K = B*S
+     +-- (B1) out_proj wgrad    dW_o = dY^T @ O_gated          K = B*S
      |        INDEPENDENT of everything below -- see "the filler" note
      |
      +-- (B2) out_proj dgrad    dO_gated = dY @ W_o
@@ -34,10 +34,17 @@ The op graph, in pipeline order::
               |
               |  concat(dQ_pre | dG | dK_pre | dV) = dQKVG   (qkvg_offsets order)
               |
-     +-- (B7) qkv+gate wgrad    dW_qkvg = h^T @ dQKVG         K = B*S
+     +-- (B7) qkv+gate wgrad    dW_qkvg = dQKVG^T @ h         K = B*S
      +-- (B8) qkv+gate dgrad    dh      = dQKVG @ W_qkvg
               v
              dh [B, S, d_model]
+
+Orientation follows the forward's ``nn.Linear`` TN form (``api.py``):
+``QKVG = h @ W_qkvg^T`` with ``W_qkvg [N, d_model]`` and
+``Y = O_gated @ W_o^T`` with ``W_o [d_model, H_q*D]``. For ``Y = X @ W^T`` the
+gradients are ``dW = dY^T @ X`` and ``dX = dY @ W`` -- so both wgrads above
+land directly in their weight's own ``[out, in]`` layout, and both dgrads
+read the weight un-transposed.
 
 **Six GEMMs and two attention kernels under one API.** That is roughly three
 times the forward, and it is the reason the forward's saved-tensor contract was
@@ -52,7 +59,8 @@ backward's is different, and one of the two obvious candidates is a trap:
 * **``dW_o`` (B1) is unambiguous independent filler.** It needs only
   ``O_gated`` (recomputable elementwise from saved ``o`` and ``gate``) and
   ``dY`` (available at entry). It depends on no part of the SDPA backward and
-  can run concurrently with all of it. Large, too: ``M=8192, N=4096, K=B*S``.
+  can run concurrently with all of it. Large, too: ``dW_o`` is
+  ``[d_model, H_q*D]`` = ``4096 x 8192`` at 397B, contracting over ``K = B*S``.
   This is the backward's analogue of the forward's gate GEMM.
 * **The ``o_proj`` DGRAD (B2) is per-head independent** — it contracts over
   ``d_model``, not over heads — so structurally it is the OPPOSITE of the
@@ -108,19 +116,48 @@ class RecomputePolicy(Enum):
     to do about the ones that do not. Both halves of the trade are real at
     scale, which is the whole argument for owning them at the block level.
 
+    Which ``SavedForBackward`` fields each policy READS, and what it REBUILDS
+    (the schema is ``api.py``'s; it is append-only and is not widened here):
+
     ``SAVE_ALL``
-        Nothing recomputed. ``q_pre`` / ``k_pre`` came out of the forward
-        (+17 GiB at 1M tokens). Fastest backward, largest footprint.
+        Reads ``q_pre`` / ``k_pre`` from the save set -- both must be
+        non-``None`` (+17 GiB at 1M tokens). No stage-(1) recompute except the
+        V slice (below). Fastest backward, largest footprint.
 
     ``RECOMPUTE_QK_PRE``
-        Re-run the Q and K column slices of the forward's stage-(1) GEMM from
-        the saved ``h`` to rebuild the pre-norm operands. Costs a partial GEMM;
-        saves the 17 GiB. **Expected default.**
+        ``q_pre`` / ``k_pre`` may be ``None``: re-run the Q, K (and V) column
+        slices of the forward's stage-(1) GEMM from the saved ``h`` to rebuild
+        the pre-norm operands. Costs a partial GEMM; saves the 17 GiB.
+        **Expected default.**
 
     ``RECOMPUTE_GATE``
-        Additionally drop ``gate`` from the save set and re-run its slice too
-        (another 16 GiB saved). Only sensible together with the above, since it
-        is the same GEMM — at which point it is a full stage-(1) recompute.
+        RESERVED -- not servable against the current schema. It would
+        additionally drop ``gate`` from the save set and re-run its slice too
+        (another 16 GiB saved; the same GEMM, so at that point it is a full
+        stage-(1) recompute). But ``SavedForBackward.gate`` is a MANDATORY field
+        and the stage-(1) GEMM always produces the GATE columns, so today there
+        is nothing to drop. It
+        becomes real when that field is widened to ``Optional`` (a type
+        widening, append-only compatible) and the forward learns to skip the
+        GATE columns; until then :meth:`GatedAttentionBlockBwd.check_support`
+        declines it rather than recomputing a tensor that is present.
+
+    Two operands the schema does NOT hold, under every policy:
+
+    * **Post-norm, post-RoPE Q and K are never saved.** The SDPA backward (B4)
+      consumes them, and they are rebuilt from ``q_pre`` / ``k_pre`` (saved or
+      recomputed) by re-running the forward's stages (2)-(3) elementwise -- the
+      saved ``rstd_q`` / ``rstd_k`` skip the reduction, so it is one bandwidth
+      pass, no GEMM. B6 needs the same pre-norm operands anyway, so the
+      stage-(1) recompute runs once and no extra tensor is materialised.
+    * **V is a column slice of stage (1) and has no field of its own** (the
+      forward reads it straight out of the ``proj`` workspace slab). Every
+      policy re-runs the V slice of the projection from ``h`` -- ``h_kv * D`` =
+      512 of 17408 columns at 397B, ~3 % of the GEMM. Under
+      ``RECOMPUTE_QK_PRE`` it rides in the same launch as the Q and K slices;
+      under ``SAVE_ALL`` it is the one partial GEMM the policy still pays. An
+      appended ``Optional`` ``v`` slot on ``SavedForBackward`` would remove it
+      for ``SAVE_ALL``; that is a schema change and is not made here.
 
     Whatever is recomputed must be recomputed BIT-IDENTICALLY to the forward, or
     gradients acquire a noise floor that looks like a kernel bug. Same tile
@@ -153,7 +190,7 @@ class _BwdIntermediates:
     dqkvg: int  # [B, S, N]         holds dQ | dG | dK | dV, then dQ_pre | dG | dK_pre | dV
     o_gated: int  # [B, S, H_q,  D]   recomputed for B1, or -1 if B1 reads it fused
     sdpa_bwd_ws: int  # whatever the reused SDPA backward asks for (it has its own carver)
-    recompute: int  # staging for RecomputePolicy re-runs, or -1
+    recompute: int  # staging for the rebuilt Q / K / V (RecomputePolicy); V is always rebuilt, so never -1
 
     total_bytes: int
     base_align: int
@@ -178,7 +215,11 @@ def _plan_bwd_workspace(geom: GatedAttentionBlockGeometry, b: int, s: int, dtype
 
 
 class _OutProjWgrad(_Stage):
-    """(B1) ``dW_o = O_gated^T @ dY``. Contracts over TOKENS: ``K = B*S``.
+    """(B1) ``dW_o = dY^T @ O_gated``. Contracts over TOKENS: ``K = B*S``.
+
+    ``W_o`` is ``[d_model, H_q*D]`` and the forward computes ``O_gated @ W_o^T``,
+    so the weight gradient is ``dY^T @ O_gated`` and lands in ``W_o``'s own
+    layout -- no transpose on the way out.
 
     ``O_gated`` is not saved — recompute it elementwise as
     ``o * sigmoid(gate)`` from tensors the backward already holds, either in a
@@ -186,8 +227,8 @@ class _OutProjWgrad(_Stage):
 
     **Fusion status: this is the backward's filler.** It depends on nothing
     below it, so it is the work to overlap the SDPA backward with. Getting that
-    overlap is a scheduling question (stream order, or a persistent kernel that
-    owns both), not a kernel-fusion one.
+    overlap is a scheduling question (a second stream, or a persistent kernel
+    that owns both), not a kernel-fusion one.
 
     Split-K over tokens, reduced in fixed order (see module docstring).
 
@@ -275,10 +316,13 @@ class _SdpaBwd(_Stage):
     pattern; it does not invent it.
 
     Consumes ``Q`` and ``K`` **post-norm, post-RoPE** — the same tensors the
-    forward's SDPA saw, not the pre-norm ones. Under
-    ``RecomputePolicy.SAVE_ALL`` they are separate saved tensors from
-    ``q_pre`` / ``k_pre``; under a recompute policy they are rebuilt by re-running
-    stages (1)-(3), which is why the recompute must be bit-identical.
+    forward's SDPA saw, not the pre-norm ones -- and ``V``. None of the three
+    is in ``SavedForBackward``: under EVERY :class:`RecomputePolicy` Q and K
+    are rebuilt from ``q_pre`` / ``k_pre`` (saved, or recomputed through the
+    stage-(1) GEMM) by re-running stages (2)-(3) elementwise with the saved
+    ``rstd``, and V is recomputed through the V column slice of stage (1) from
+    ``h``. That is why the recompute must be bit-identical -- these are the
+    operands the gradient is taken against.
 
     ``LSE`` is mandatory here. That is the whole reason
     ``save_for_backward`` implies ``return_lse`` in the forward.
@@ -365,10 +409,12 @@ class _QkRmsNormBwd(_Stage):
 
 
 class _QkvGateWgrad(_Stage):
-    """(B7) ``dW_qkvg = h^T @ dQKVG``. Contracts over TOKENS: ``K = B*S``.
+    """(B7) ``dW_qkvg = dQKVG^T @ h``. Contracts over TOKENS: ``K = B*S``.
 
-    Emits the weight gradient in the exact ``qkvg_offsets`` layout the forward
-    consumes, so a caller never re-slices. At 397B: ``17408 x 4096``.
+    ``W_qkvg`` is ``[N, d_model]`` and the forward computes ``h @ W_qkvg^T``, so
+    the weight gradient is ``dQKVG^T @ h``: ``[N, d_model]``, the exact
+    ``qkvg_offsets`` row layout the forward consumes, so a caller never
+    re-slices. At 397B: ``17408 x 4096``.
 
     Split-K over tokens, fixed-order reduction. Same tiling family as B1 and
     nothing else in the block.
@@ -456,7 +502,9 @@ class GatedAttentionBlockBwd(APIBase):
         every enabled stage.
 
         Declines that belong here: a ``SavedForBackward`` missing a tensor the
-        chosen :class:`RecomputePolicy` does not rebuild; ``lse`` absent (the
+        chosen :class:`RecomputePolicy` does not rebuild (``SAVE_ALL`` with a
+        ``None`` ``q_pre`` / ``k_pre``); ``RecomputePolicy.RECOMPUTE_GATE``
+        (reserved -- ``gate`` is a mandatory field today); ``lse`` absent (the
         forward ran inference-only); a ``need_*`` combination that leaves no
         work; a dtype outside the precision roadmap.
         """
@@ -498,16 +546,19 @@ class GatedAttentionBlockBwd(APIBase):
         seq_lens: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
-        """Launch the enabled stages onto one stream.
+        """Launch the enabled stages, in this order, onto the ONE launch stream.
 
-        Order, with B1 deliberately first so it is in flight across everything
-        that follows (module docstring, "the filler")::
+        Everything is stream-ordered, so nothing in this list overlaps anything
+        else. B1 is issued first only because it depends on nothing below it --
+        that independence is what makes it the candidate filler (module
+        docstring, "the filler"); realising the overlap is a later scheduling
+        change (a second stream or a persistent kernel), not this method::
 
             (B1) out_proj_wgrad    saved.o, saved.gate, dy   -> dw_o
             (B2) out_proj_dgrad    dy, w_o                   -> ws.do_gated
             (B3) sigmoid_gate_bwd  ws.do_gated, saved.o,
                                    saved.gate                -> ws.do, ws.dqkvg[GATE]
-            (B4) sdpa_bwd          ws.do, Q, K, V,
+            (B4) sdpa_bwd          ws.do, ws.recompute (Q, K, V),
                                    saved.o, saved.lse        -> ws.dqkvg[Q,K,V]
             (B5) rope_bwd          ws.dqkvg[Q,K]             -> in place
             (B6) qk_norm_bwd       ws.dqkvg[Q,K], rstd,

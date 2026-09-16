@@ -529,7 +529,20 @@ def frost_qk_norm_rope_tma(
 
         for u in cutlass.range_constexpr(rows_per_warp):
             r = warp_id + cutlass.Int32(u * warps)
-            tok = tok_q if is_q else (tok0_k + r // cutlass.Int32(h_kv_ct))
+            # K's LAST tile may overshoot T (a K tile is `toks_per_ktile` whole
+            # tokens; Q never does -- tile_rows divides h_q). TMA clips the
+            # overshooting rows on both the load (zero-fill) and the store, and
+            # the rstd write below is predicated on `tok < n_tokens` -- but the
+            # cos/sin TABLE loads are ordinary `ld.global`, so an unclamped
+            # token here reads 16 B per rope lane past the end of a `[T, ROPE]`
+            # table (T=3, h_kv=2, tile_rows=8: rows 6..7 are token 3; memcheck
+            # on PR #1102). Clamp the padded rows to the last real token: the
+            # table row is valid, the result is discarded by the TMA clip, and
+            # the warp collectives (lane_group_sum, the RoPE shfl.bfly) stay
+            # unconditional -- a `select`, not a branch.
+            tok_k = tok0_k + r // cutlass.Int32(h_kv_ct)
+            tok_k = tok_k if tok_k < n_tokens else n_tokens - cutlass.Int32(1)
+            tok = tok_q if is_q else tok_k
             # subtile-major: TMA laid the tile down as [subtile][row][GRANU].
             # The lane offset is shared, but the STAGE is not -- the input ring
             # and the output ring have independent depths, so a single `off`
@@ -837,6 +850,10 @@ def compile_qk_norm_rope_tma(
         raise ValueError(f"fused_store_wait=True needs stages_o >= 2 (the drain protects the next tile's output stage), got stages_o={stages_o}")
     if dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"qk_norm_rope_tma serves bf16/f16 only, got {dtype}")
+    # Every Constexpr handed to cute.compile below is in the key. `stages_o`
+    # was missing (PR #1102 review): it sizes sOut_raw and bounds the store
+    # drain, so the second depth requested in a process was served the FIRST
+    # one's artifact under a recipe that reported the second.
     key = (
         str(dtype),
         h_q,
@@ -845,6 +862,7 @@ def compile_qk_norm_rope_tma(
         int(rope_dim),
         int(tile_rows),
         int(stages),
+        int(stages_o),
         int(threads_per_cta),
         bool(want_rstd),
         int(refill_pos),

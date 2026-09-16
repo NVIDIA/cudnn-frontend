@@ -139,7 +139,7 @@ def test_gate_operand_presence_is_enforced_both_ways():
         run_elementwise_gate(without, x, x, x, stream=_stream())
 
 
-@pytest.mark.L0
+@requires_cuda
 @pytest.mark.parametrize("h", [1, 2, 3, 8, 32])
 def test_const_head_count_matches_the_runtime_arm_bit_for_bit(h):
     """`const_head_count` bakes H into the address math. It must not narrow what
@@ -172,7 +172,7 @@ def test_const_head_count_matches_the_runtime_arm_bit_for_bit(h):
     assert (out[True].float() - ref).abs().max().item() < 3e-2
 
 
-@pytest.mark.L0
+@requires_cuda
 def test_an_artifact_refuses_a_tensor_whose_head_count_it_was_not_built_for():
     """H is baked per artifact, so a mismatched bind must RAISE.
 
@@ -192,3 +192,25 @@ def test_an_artifact_refuses_a_tensor_whose_head_count_it_was_not_built_for():
     dst = torch.empty_like(src)
     with pytest.raises(ValueError, match="H is fixed per artifact"):
         run_elementwise_gate(r, src, gate, dst, stream=torch.cuda.current_stream(dev).cuda_stream)
+
+
+@requires_cuda
+def test_an_artifact_refuses_a_tensor_whose_dtype_it_was_not_built_for():
+    """The dtype is baked per artifact too (it is in the compile-cache key), so a
+    mismatched bind must RAISE with the OPERAND named -- for src, gate and dst
+    alike, not just src.
+
+    The tvm-ffi boundary also rejects this on cutlass-dsl >= 4.8 (``Mismatched
+    Tensor on argument #N, expected dtype=bfloat16``), but that is the DSL's
+    check, indexed by argument position and tied to the DSL version; this one is
+    ours, mirrors ``run_quantize``'s ``dtype_in`` guard, and the match below is
+    on OUR message, so it proves the host guard fired first.
+    """
+    t, h, d = 8, 2, 256
+    r = compile_elementwise_gate(dtype=torch.bfloat16, h=h, d=d, has_gate=True)
+    assert r.dtype is torch.bfloat16
+    bf = torch.randn(t, h, d, device="cuda", dtype=torch.bfloat16)
+    f16 = bf.to(torch.float16)
+    for name, args in (("src", (f16, bf, bf.clone())), ("gate", (bf, f16, bf.clone())), ("dst", (bf, bf, f16.clone()))):
+        with pytest.raises(ValueError, match=f"{name} is torch.float16 but this artifact was compiled for torch.bfloat16"):
+            run_elementwise_gate(r, *args, stream=_stream())

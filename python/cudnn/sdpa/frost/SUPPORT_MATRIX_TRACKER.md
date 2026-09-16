@@ -355,8 +355,11 @@ rows); the backend's own verdict on it is deferred to planning, as for every
 python-validated graph. Numerics: the gate multiplies the fp32
 accumulator AFTER the dead-row / empty-KV select (a dead row stays exactly 0,
 LSE −inf, and LSE is bit-independent of the gate); on FP8 the O quantization
-applies to the GATED value and `Amax_O`, when requested, is the gated pre-quant
-amax in `scale_o` units. **Amax_O binding changed for every quantized forward
+applies to the GATED value, while `Amax_O`, when requested, is the amax of the
+UNGATED normalised O (pre-gate, pre-quant, in `scale_o` units) — it is an output
+of the sdpa node, which precedes the sigmoid/mul tail, so it is independent of
+G; the standalone adapter's `sample_gate` path shares that one contract.
+**Amax_O binding changed for every quantized forward
 row:** only a `set_output(True)` `Amax_O` is a fact (`facts.amax_o_t =
 _real_output(...)`) — an unrequested (virtual) `Amax_O` is no longer bound or
 written, so a quantized graph that leaves `Amax_O` virtual now EXECUTES where it

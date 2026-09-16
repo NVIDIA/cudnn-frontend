@@ -759,7 +759,10 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
 # ``sm107/prefill_d256_fp8.py`` carries O := O * sigmoid(G) behind
 # ``TemplateParams.epilogue_gate`` with a bf16 G (``GATE_STORAGE_DTYPE``), and
 # ``Amax_O`` became a COMPILE-TIME fact (``compile(has_amax=False)`` folds the
-# |o| tree and the atomic out).  The row-level claims are pinned in
+# |o| tree and the atomic out) and, when requested, is the amax of the UNGATED
+# normalised O -- the sdpa node's output, which precedes the gate, so G cannot
+# move it (the kernel folds |h| = |u/2| and doubles once per tile, exact).  The
+# quantized O itself is the gated value.  The row-level claims are pinned in
 # test_sdpa_fwd_dsl_sm107.py; this file carries the FP8-specific adapter
 # declines (CPU) and the Rubin e2e behind them.
 # ============================================================================
@@ -771,9 +774,9 @@ _D256 = (256, 256)
 _D256_O_ATOL = 7.5e-2
 # Amax_O is an in-kernel atomicMax over the fp32 pre-cast values (same bound as _check).
 _AMAX_ATOL = 0.03
-# "Amax_O is zero" bound for a G that drives sigmoid(G) to exactly 0: the kernel's
-# h*tanh(g/2) + h saturates to 0 (tanh.approx returns -1 for |x| >> 9), so anything
-# above this is the PRE-gate amax leaking through (~0.09 on the probe's data).
+# "O is zero" bound for a G that drives sigmoid(G) to exactly 0: the kernel's
+# h*tanh(g/2) + h saturates to 0 (tanh.approx returns -1 for |x| >> 9).  Amax_O is
+# NOT bounded by it -- it is the UNGATED O's amax (~0.09 on the probe's data).
 _AMAX_ZERO = 1e-3
 
 
@@ -901,6 +904,7 @@ def _fp8_gate_problem(b, hq, hkv, s, d, *, seed=0):
 
 
 def _fp8_gate_reference(deq, gate, *, causal, scale):
+    """softmax(QK^T)V on the dequantized operands, times sigmoid(gate) when a gate is given (None = ungated)."""
     import torch
 
     qf, kf, vf = deq
@@ -909,7 +913,8 @@ def _fp8_gate_reference(deq, gate, *, causal, scale):
     if causal:
         s = qf.shape[2]
         logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=qf.device)), float("-inf"))
-    return (torch.softmax(logits, dim=-1) @ vf.repeat_interleave(rep, 1)) * torch.sigmoid(gate.float())
+    o = torch.softmax(logits, dim=-1) @ vf.repeat_interleave(rep, 1)
+    return o * torch.sigmoid(gate.float()) if gate is not None else o
 
 
 def _run_fp8_gated(q8, k8, v8, descales, gate, *, dtype_o, causal, sched_policy=None, has_amax_o=True, amax_o=None, gate_on=True):
@@ -1008,41 +1013,49 @@ def test_fp8_d256_has_amax_false_is_bitwise_and_writes_nothing():
     assert "has_amax" in inspect.signature(api_off._k_mod.compile).parameters
 
 
-def test_fp8_d256_amax_is_the_gated_value():
-    """Plan S7 Q17: the quantized O is the GATED value, so ``Amax_O`` must be
-    the amax of the gated, dead-row-selected fp32 value in scale_o units
-    (scale_o = 1 here), NOT the pre-gate amax.  A random G cannot tell the two
-    apart: the top |O| cells carry sigmoid(G) ~ 1, so on this data the gated and
-    un-gated amax differ by ~0.005 -- well inside the 0.03 bound.  The
-    discrimination is therefore STRUCTURAL: G = -1e4 (sigmoid == 0) must drive
-    Amax_O to ~0 while the pre-gate amax stays ~0.09, and G = +1e4 (sigmoid == 1)
-    must reproduce the un-gated amax.  The random-G run then pins the ordinary
-    value against the gated reference."""
+def test_fp8_d256_amax_is_the_pre_gate_value():
+    """``Amax_O`` is an output of the sdpa NODE, which on the graph PRECEDES the
+    sigmoid/mul tail: it must be the amax of the UNGATED, dead-row-selected fp32
+    O in scale_o units (scale_o = 1 here) and independent of G, while the
+    quantized O itself IS the gated value.  A random G cannot tell the two
+    apart (the top |O| cells carry sigmoid(G) ~ 1, so the gated and un-gated
+    amax differ by ~0.005 -- inside the 0.03 bound), so the discrimination is
+    STRUCTURAL: G = -1e4 (sigmoid == 0) zeroes O yet must leave Amax_O at the
+    un-gated ~0.09 (a gated-value reduction reports ~0); G = +1e4 (sigmoid == 1)
+    reproduces it; and all three gated runs equal the UNGATED specialization's
+    Amax_O bit-for-bit (the kernel folds |h| = |u/2| and doubles once per tile,
+    exact in fp32).  The random-G run also pins O against the gated reference."""
     import torch
 
     _rubin_only()
     b, hq, hkv, s, d = 2, 8, 2, 512, 256
     q8, k8, v8, descales, gate, deq = _fp8_gate_problem(b, hq, hkv, s, d)
-    # sigmoid(+1e4) == 1.0 exactly in fp32, so this IS the un-gated reference.
-    ungated_amax = _fp8_gate_reference(deq, torch.full_like(gate, 1e4), causal=False, scale=d**-0.5).abs().max().item()
+    ungated_ref = _fp8_gate_reference(deq, None, causal=False, scale=d**-0.5)
+    ungated_amax = ungated_ref.abs().max().item()
     assert ungated_amax > 2 * _AMAX_ATOL, f"un-gated amax {ungated_amax:.4f} too small to be told from zero -- reshape the probe"
 
-    def _amax(g):
+    def _amax(g, *, gate_on=True):
         slot = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)  # -1 so "written" is visible even when the amax is 0
-        _, out = _run_fp8_gated(q8, k8, v8, descales, g, dtype_o=torch.bfloat16, causal=False, amax_o=slot)
+        _, out = _run_fp8_gated(q8, k8, v8, descales, g, dtype_o=torch.bfloat16, causal=False, amax_o=slot, gate_on=gate_on)
         return slot.item(), out
 
-    # sigmoid(G) == 0: every gated cell is 0, so the amax over the GATED value is ~0 (a pre-gate reduction reports ~0.09).
+    # sigmoid(G) == 0: every gated O cell is 0, yet Amax_O is the UN-gated amax (a gated-value reduction would report ~0).
     amax_neg, out_neg = _amax(torch.full_like(gate, -1e4))
-    assert 0.0 <= amax_neg <= _AMAX_ZERO, f"Amax_O {amax_neg:.4f} with sigmoid(G) == 0: the kernel reduced the PRE-gate O (~{ungated_amax:.4f})"
     assert out_neg.float().abs().max().item() <= _AMAX_ZERO, "O itself must be the gated (zero) value"
-    # sigmoid(G) == 1: the gated value IS the un-gated one.
-    amax_pos, _ = _amax(torch.full_like(gate, 1e4))
+    assert (
+        abs(amax_neg - ungated_amax) <= _AMAX_ATOL
+    ), f"Amax_O {amax_neg:.4f} with sigmoid(G) == 0 vs un-gated ref {ungated_amax:.4f}: the kernel reduced the GATED O"
+    # sigmoid(G) == 1: the gated value IS the un-gated one, and so is Amax_O.
+    amax_pos, out_pos = _amax(torch.full_like(gate, 1e4))
     assert abs(amax_pos - ungated_amax) <= _AMAX_ATOL, f"Amax_O {amax_pos:.4f} with sigmoid(G) == 1 vs un-gated ref {ungated_amax:.4f}"
-    assert amax_pos - amax_neg > _AMAX_ATOL, "the two structural runs must be distinguishable by more than the bound"
-    # An ordinary G: within the shared bound of the gated reference, and O is the gated value.
+    assert (out_pos.float() - ungated_ref).abs().max().item() <= _D256_O_ATOL
+    # An ordinary G: O is the gated value within the shared bound; Amax_O is unchanged.
     amax_rand, out = _amax(gate)
-    ref = _fp8_gate_reference(deq, gate, causal=False, scale=d**-0.5)
-    gated_amax = ref.abs().max().item()
-    assert abs(amax_rand - gated_amax) <= _AMAX_ATOL, f"amax_o {amax_rand:.4f} vs gated ref {gated_amax:.4f}"
-    assert (out.float() - ref).abs().max().item() <= _D256_O_ATOL
+    assert (out.float() - _fp8_gate_reference(deq, gate, causal=False, scale=d**-0.5)).abs().max().item() <= _D256_O_ATOL
+    # G-independence and agreement with the UNGATED specialization are bit-exact, not tolerance-bound.
+    amax_ungated_kernel, out_ungated = _amax(gate, gate_on=False)
+    assert (out_ungated.float() - ungated_ref).abs().max().item() <= _D256_O_ATOL
+    assert amax_neg == amax_pos == amax_rand == amax_ungated_kernel, (
+        f"Amax_O must be G-independent and equal the ungated kernel's: -1e4 {amax_neg:.6f}, +1e4 {amax_pos:.6f}, "
+        f"random {amax_rand:.6f}, ungated {amax_ungated_kernel:.6f}"
+    )

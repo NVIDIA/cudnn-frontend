@@ -481,6 +481,42 @@ def _cudnn_dtype(dtype: torch.dtype):
 _LOG = logging.getLogger(__name__)
 
 
+# cuDNN handles for the GRAPH route of :func:`run_proj_gemm`, one per
+# (device, stream).  The graph API binds a plan's launch stream to a HANDLE
+# (``cudnn.set_stream``), not to an execute argument, so threading a stream
+# through ``graph.execute`` means owning a handle bound to it.  Created on first
+# use and kept for the process -- ``cudnnCreate`` is not free and Rule 1 bans
+# per-execute resource creation (same shape as ``sdpa/fwd/torch_op.py``'s
+# per-device cache).  Keyed by stream too, and ``set_stream`` is never re-issued
+# on a cached handle, so two streams driving a block concurrently never share
+# one (the ``cudnn.set_stream`` docstring's "own handle per stream" caveat).
+# Bounded by the number of distinct launch streams a caller uses.
+_GRAPH_HANDLES: dict = {}
+
+
+def handle_for_stream(device, stream) -> Any:
+    """The cached ``cudnn.Handle`` bound to ``stream`` on ``device`` (created on first use).
+
+    ``stream`` is a raw ``CUstream`` int (``torch.cuda.current_stream(dev).cuda_stream``;
+    0 = the legacy default stream).  Only the graph route of :func:`run_proj_gemm`
+    needs this -- the JIT route takes ``stream=`` directly.
+    """
+    import cudnn
+
+    dev = torch.device(device)
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    key = (idx, int(stream))
+    h = _GRAPH_HANDLES.get(key)
+    if h is None:
+        # create_handle() binds to the CURRENT device -- pin it so a tensor on
+        # cuda:1 never gets a handle created against cuda:0.
+        with torch.cuda.device(idx):
+            h = cudnn.create_handle()
+        cudnn.set_stream(handle=h, stream=int(stream))
+        _GRAPH_HANDLES[key] = h
+    return h
+
+
 @dataclass
 class ProjGemmPlan:
     """One compiled projection. Built at plan time, called per execute."""
@@ -674,6 +710,8 @@ def run_proj_gemm(
     workspace: torch.Tensor,
     handle: Optional[Any] = None,
     alpha: Optional[torch.Tensor] = None,
+    *,
+    stream=None,
 ) -> None:
     """Launch. No allocation, no conversion — the caller owns every buffer.
 
@@ -681,11 +719,23 @@ def run_proj_gemm(
     ``[M, N]``; any leading batch dim of 1 is accepted since the graph carries
     the layout and only the pointer is bound.
 
-    ``handle`` is how the launch stream is threaded (the graph API binds a
-    stream to a handle). Passing ``None`` runs on the handle's default stream,
-    which is correct for a standalone call and NOT correct once the block
-    chains its stages — that assembly step must create one handle per
-    (device, stream) and pass it here (Rule 5).
+    **The launch stream (Rule 5).** ``stream`` is a raw ``CUstream`` int (or a
+    ``cuda.CUstream``) -- the same value the block's CuTe-DSL stages take.  It
+    reaches BOTH routes: the forced-tile JIT plan's own ``stream=``, and, on the
+    graph route, a cached per-(device, stream) cuDNN handle bound to it
+    (:func:`handle_for_stream`; the graph API carries a stream on a HANDLE, not
+    on an execute argument).  ``None`` means torch's current stream on
+    ``out.device`` -- so a standalone call under ``with torch.cuda.stream(s):``
+    stays ordered with the caller's torch work, exactly as every other stage of
+    the block does.  Before this the two GEMMs launched on the default stream
+    regardless, and a block run on a side stream had its SDPA read a slab the
+    projection had not written yet (all-zero output on SM107).
+
+    ``handle`` remains the graph API's classic way of naming the stream: given
+    alone, its stream is the launch stream; given WITH ``stream``, the two must
+    agree -- a handle bound to another stream would run this GEMM off the stream
+    the caller ordered its other work on, which is the race this guards, so it
+    is a ``ValueError`` rather than a silent pick.
     """
     # `alpha`: the per-tensor descale for an fp8 plan built with alpha=True --
     # a 1-element fp32 CUDA tensor, bound as the [1,1,1] scalar aux (a VIEW).
@@ -697,6 +747,20 @@ def run_proj_gemm(
         alpha3 = alpha.reshape(1, 1, 1)  # a view: 1 element is always contiguous
     elif alpha is not None:
         raise ValueError(f"{plan.label}: this plan has no alpha epilogue (built with alpha=False); refusing to drop the value silently")
+    # Resolve the launch stream FIRST (Rule 5), before any route is taken.
+    if handle is not None:
+        import cudnn
+
+        handle_stream = int(cudnn.get_stream(handle) or 0)
+        if stream is not None and int(stream) != handle_stream:
+            raise ValueError(
+                f"{plan.label}: handle is bound to stream {handle_stream:#x} but stream={int(stream):#x} was requested; "
+                "a GEMM off the launch stream races the block's other stages (Rule 5). Pass one or make them agree (cudnn.set_stream)."
+            )
+        stream = handle_stream
+    elif stream is None:
+        stream = torch.cuda.current_stream(out.device).cuda_stream
+    stream = int(stream)
     if plan.jit is not None:
         bd = plan.jit_binding
         vp = {bd.a_operands[0]: _rank3(a, "a"), bd.b_operands[0]: _rank3(w, "w"), bd.outputs[0]: _rank3(out, "out")}
@@ -705,11 +769,15 @@ def run_proj_gemm(
             if len(bd.aux) != 1:
                 raise RuntimeError(f"{plan.label}: expected exactly one aux operand (alpha) in the JIT binding, found {len(bd.aux)}")
             vp[bd.aux[0]] = alpha3
-        plan.jit(vp)
+        plan.jit(vp, stream=stream)
         return
     vp = {plan.a: _rank3(a, "a"), plan.b: _rank3(w, "w"), plan.c: _rank3(out, "out")}
     if plan.has_alpha:
         vp[plan.alpha] = alpha3
+    # The graph route names its stream through the handle: the plan's engine
+    # reads `ExecutionContext.stream` off it (`_pygraph.execute` -> `cudnn.get_stream`).
+    if handle is None:
+        handle = handle_for_stream(out.device, stream)
     plan.graph.execute(vp, workspace, handle)
 
 

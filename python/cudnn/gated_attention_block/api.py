@@ -995,12 +995,16 @@ class _Projection(_Stage):
         """``2*M*N*K`` — the denominator for an MMA SOL number."""
         return 2 * self.m * self.n * self.k
 
-    def execute(self, a: torch.Tensor, w: torch.Tensor, out: torch.Tensor, workspace: torch.Tensor, handle=None, alpha: Optional[torch.Tensor] = None) -> None:
+    def execute(
+        self, a: torch.Tensor, w: torch.Tensor, out: torch.Tensor, workspace: torch.Tensor, handle=None, alpha: Optional[torch.Tensor] = None, *, stream=None
+    ) -> None:
+        """``stream`` is the block's launch stream (a raw ``CUstream`` int); the
+        runner carries it onto both GEMM routes -- see ``run_proj_gemm`` (Rule 5)."""
         from .kernels.proj_gemm import run_proj_gemm
 
         if self._plan is None:
             raise RuntimeError("call compile() before execute()")
-        run_proj_gemm(self._plan, a, w, out, workspace, handle, alpha=alpha)
+        run_proj_gemm(self._plan, a, w, out, workspace, handle, alpha=alpha, stream=stream)
 
 
 def _qkv_gate_projection(
@@ -2346,19 +2350,19 @@ class GatedAttentionBlockFwd(APIBase):
         """
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
-        if current_stream is not None:
-            # The two GEMM stages go through the graph API, which binds its
-            # stream to a HANDLE, not to an execute argument. Threading one
-            # handle per (device, stream) is the assembly step this v1 has not
-            # done -- and running the GEMMs on a different stream than the
-            # CuTe-DSL stages would race silently (Rule 5). Refuse rather than
-            # race.
-            raise NotImplementedError(
-                "a caller-supplied stream needs a per-(device, stream) cuDNN handle threaded into the two GEMM stages; " "v1 runs on the current stream only"
-            )
         g = self.geom
         t = self.batch * self.seq_len
-        stream = torch.cuda.current_stream(h.device).cuda_stream
+        # THE launch stream (Rule 5): the caller's ``current_stream``, else torch's
+        # current stream on h's device -- resolved once, here, and handed to EVERY
+        # stage.  The CuTe-DSL kernels take the raw CUstream int directly; the two
+        # FROST GEMMs take it through ``run_proj_gemm(stream=)`` (the JIT plan's
+        # own ``stream=``, or a cached per-(device, stream) cuDNN handle bound to
+        # it on the graph route); the SDPA adapter takes it as ``current_stream``.
+        # No stage derives its own stream from torch's current one, so a block
+        # run under ``with torch.cuda.stream(s):`` -- or with an explicit stream --
+        # cannot split across two streams (the GEMMs used to launch on the
+        # default stream regardless, and the SDPA read an unwritten slab).
+        stream = int(current_stream) if current_stream is not None else torch.cuda.current_stream(h.device).cuda_stream
         ws = self._ws
         req = self.get_workspace_size()
         if workspace.numel() < req:
@@ -2420,7 +2424,7 @@ class GatedAttentionBlockFwd(APIBase):
             )
         else:
             # (1) [FP8: e4m3 x e4m3, epilogue * alpha_qkvg, bf16 slab]
-            self._proj.execute(h.view(t, g.d_model), w_qkvg, proj, engine_ws, alpha=qd["alpha_qkvg"] if fp8 else None)
+            self._proj.execute(h.view(t, g.d_model), w_qkvg, proj, engine_ws, alpha=qd["alpha_qkvg"] if fp8 else None, stream=stream)
             # (2)+(3). q_out/k_out=None means IN PLACE, which is the stage's own
             # default and is safe by construction: every lane holds its whole [D]
             # row in registers before it stores, and no lane touches another's.
@@ -2452,6 +2456,7 @@ class GatedAttentionBlockFwd(APIBase):
             lse=lse,
             seq_lens=seq_lens,
             workspace=engine_ws,
+            current_stream=cuda.CUstream(stream),
             gate=gate_src.view(self.batch, self.seq_len, g.h_q, g.d_head) if self.fuse_gate else None,
             descale_q=qd["descale_q"] if fp8 else None,
             descale_k=qd["descale_k"] if fp8 else None,
@@ -2465,10 +2470,10 @@ class GatedAttentionBlockFwd(APIBase):
             # (5q) bf16 gated O -> e4m3 for the FP8 out projection; (6) folds
             # descale_o * descale_w_o into its epilogue.
             self._quant_o.execute(o, o8, qd["scale_o"], current_stream=stream)
-            self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"])
+            self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
         else:
             # (6)
-            self._out_proj.execute(o.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws)
+            self._out_proj.execute(o.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, stream=stream)
 
     def _execute_fp8_fused(self, h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream) -> None:
         """The FULLY FUSED FP8 pipeline: three launches, three workspace buffers.
@@ -2523,6 +2528,7 @@ class GatedAttentionBlockFwd(APIBase):
             lse=lse,
             seq_lens=seq_lens,
             workspace=engine_ws,
+            current_stream=cuda.CUstream(stream),
             gate=gate16.view(b, s, g.h_q, g.d_head),
             descale_q=qd["descale_q"],
             descale_k=qd["descale_k"],
@@ -2530,7 +2536,7 @@ class GatedAttentionBlockFwd(APIBase):
             scale_o=qd["scale_o"],
         )
         # (6): e4m3 O_gated @ W_o^T with (1/scale_o) * descale_w_o in the epilogue.
-        self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"])
+        self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
 
 
 # ---------------------------------------------------------------------------

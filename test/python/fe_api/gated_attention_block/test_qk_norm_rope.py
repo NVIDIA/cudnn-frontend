@@ -346,3 +346,131 @@ def test_tma_refuses_the_fused_drain_at_one_output_stage():
     assert DEFAULT_FUSED_STORE_WAIT is False, "the racy fused drain must not be the default"
     with pytest.raises(ValueError, match="stages_o >= 2"):
         compile_qk_norm_rope_tma(dtype=torch.bfloat16, h_q=32, h_kv=2, d=256, rope_dim=64, eps=1e-6, want_rstd=False, stages_o=1, fused_store_wait=True)
+
+
+# --- the three PR #1102 review findings, each pinned ------------------------
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "t, h_q, h_kv, rows_per_group",
+    [
+        (3, 3, 1, 2),  # n_q_rows=9: rows 10..11 are whole-K at K offset 1 -> 4 B, misaligned for st.global.v2
+        (5, 3, 1, 4),  # n_q_rows=15: rows 16..19 are whole-K at K offset 1 -> 4 B, misaligned for st.global.v4
+        (1, 3, 1, 2),  # n_q_rows=3: the odd group straddles the Q/K seam -> the scalar path regardless
+    ],
+)
+def test_rstd_vector_store_needs_an_aligned_k_offset(t, h_q, h_kv, rows_per_group):
+    """The vectorized rstd store was gated on the group being CONTIGUOUS in one tensor
+    (whole-Q or whole-K, not the ragged tail) and nothing else. Contiguous is not
+    aligned: ``row0`` is a multiple of R so the Q side is, but the K side lands at
+    ``mRstdK + (row0 - n_q_rows) * 4``, which is R*4-aligned only when ``n_q_rows =
+    T*h_q`` is a multiple of R. At T=3, h_q=3, R=2 it is 9 and the ``st.global.v2``
+    faulted with ``cudaErrorMisalignedAddress`` (CodeRabbit + Codex on PR #1102,
+    reproduced on an A100). Such groups must take the scalar path, and the rows they
+    cover must still be right."""
+    d, rope_dim, dtype = 256, 0, torch.bfloat16
+    q, k, w_q, w_k, cos, sin = _make(t, h_q, h_kv, d, rope_dim, dtype, seed=11)
+    q_out, k_out = torch.empty_like(q), torch.empty_like(k)
+    rstd_q = torch.full((t, h_q), -1.0, device="cuda", dtype=torch.float32)
+    rstd_k = torch.full((t, h_kv), -1.0, device="cuda", dtype=torch.float32)
+    build_qk_norm_rope(
+        q,
+        k,
+        q_out,
+        k_out,
+        w_q,
+        w_k,
+        cos,
+        sin,
+        rstd_q,
+        rstd_k,
+        rope_dim=rope_dim,
+        eps=_EPS,
+        rows_per_group=rows_per_group,
+        stream=torch.cuda.current_stream().cuda_stream,
+    )
+    torch.cuda.synchronize()
+    want_q, want_rq = _ref(q, w_q, cos, sin, rope_dim)
+    want_k, want_rk = _ref(k, w_k, cos, sin, rope_dim)
+    _check(q_out, want_q, dtype)
+    _check(k_out, want_k, dtype)
+    torch.testing.assert_close(rstd_q, want_rq, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(rstd_k, want_rk, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_tma_k_tail_tile_reads_no_rope_table_row_past_t():
+    """T=3, h_kv=2, tile_rows=8: the single K tile is ``tile_rows // h_kv = 4`` whole
+    tokens, so rows 6..7 belong to token 3, which does not exist. TMA clips that
+    token's load (zero-fill) and store, and the rstd write is predicated on
+    ``tok < n_tokens`` -- but the cos/sin TABLE loads are plain ``ld.global``, and
+    unclamped they read 16 B per rope lane past the end of a ``[T, ROPE]`` table
+    (compute-sanitizer memcheck on SM100, Codex on PR #1102). The kernel now clamps
+    the padded rows' token to ``T-1``.
+
+    The tables are allocated EXACTLY ``[T, ROPE]`` -- no slack row -- so the read is
+    addressable by memcheck (``PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer
+    --tool memcheck --padding 32``), and the real rows must be BITWISE the LDG
+    kernel's, whose tail rows clamp to the last valid row by construction."""
+    from cudnn.gated_attention_block.kernels.qk_norm_rope_tma import compile_qk_norm_rope_tma, run_qk_norm_rope_tma, tile_counts
+
+    t, h_q, h_kv, d, rope_dim, tile_rows, dtype = 3, 8, 2, 256, 64, 8, torch.bfloat16
+    if _stage("auto", h_q=h_q, h_kv=h_kv, d=d, rope=rope_dim, s=t)[0].resolve_impl() != "tma":
+        pytest.skip("this device has no TMA path; nothing to cross-check")
+    n_q_tiles, n_tiles = tile_counts(t, h_q, h_kv, tile_rows)
+    assert (n_q_tiles, n_tiles) == (3, 4), "the shape must leave ONE K tile that overshoots T"
+    q, k, w_q, w_k, cos, sin = _make(t, h_q, h_kv, d, rope_dim, dtype, seed=13)
+    assert tuple(cos.shape) == (t, rope_dim) and cos.is_contiguous() and sin.is_contiguous(), "the tables must carry no slack row"
+    stream = torch.cuda.current_stream().cuda_stream
+    outs = {}
+    for impl in ("ldg", "tma"):
+        q_out, k_out = torch.full_like(q, 1.5e3), torch.full_like(k, 1.5e3)
+        rstd_q = torch.full((t, h_q), -1.0, device="cuda", dtype=torch.float32)
+        rstd_k = torch.full((t, h_kv), -1.0, device="cuda", dtype=torch.float32)
+        if impl == "ldg":
+            build_qk_norm_rope(q, k, q_out, k_out, w_q, w_k, cos, sin, rstd_q, rstd_k, rope_dim=rope_dim, eps=_EPS, stream=stream)
+        else:
+            r = compile_qk_norm_rope_tma(dtype=dtype, h_q=h_q, h_kv=h_kv, d=d, rope_dim=rope_dim, eps=_EPS, want_rstd=True, tile_rows=tile_rows)
+            assert r.tile_rows == tile_rows
+            run_qk_norm_rope_tma(r, q, k, q_out, k_out, w_q, w_k, cos, sin, rstd_q, rstd_k, stream=stream)
+        torch.cuda.synchronize()
+        outs[impl] = (q_out, k_out, rstd_q, rstd_k)
+    want_k, want_rk = _ref(k, w_k, cos, sin, rope_dim)
+    _check(outs["tma"][1], want_k, dtype)
+    torch.testing.assert_close(outs["tma"][3], want_rk, rtol=1e-5, atol=1e-6)
+    for name, a, b in zip(("q", "k", "rstd_q", "rstd_k"), outs["ldg"], outs["tma"]):
+        assert torch.equal(a, b), f"{name}: ldg and tma disagree at the overshooting K tile, max|diff| = {(a.float() - b.float()).abs().max().item():g}"
+
+
+@pytest.mark.L0
+def test_tma_compile_cache_keys_on_the_output_ring_depth(monkeypatch):
+    """``stages_o`` is a Constexpr of the artifact -- it sizes ``sOut_raw`` and bounds
+    the store drain -- and it was missing from the compile cache key, so the SECOND
+    depth requested in a process was served the FIRST one's artifact under a recipe
+    that reported the second (CodeRabbit on PR #1102). CPU-only: ``cute.compile`` is
+    stubbed so the key logic is tested on its own, and the stub binds the launch
+    signature by NAME to read back the ``stages_o`` that actually reached it."""
+    import inspect
+
+    from cudnn.gated_attention_block.kernels import qk_norm_rope_tma as kern_tma
+
+    compiled_stages_o = []
+
+    def fake_compile(fn, *args, **kwargs):
+        bound = inspect.signature(fn).bind(*args)
+        compiled_stages_o.append(bound.arguments["stages_o"])
+        return object()  # a fresh, distinct artifact per compile
+
+    monkeypatch.setattr(kern_tma, "compiled_cache", {})
+    monkeypatch.setattr(kern_tma, "current_device", lambda: 0)
+    monkeypatch.setattr(kern_tma.cute, "compile", fake_compile)
+    common = dict(dtype=torch.bfloat16, h_q=32, h_kv=2, d=256, rope_dim=64, eps=1e-6, want_rstd=False, fused_store_wait=False)
+    r1 = kern_tma.compile_qk_norm_rope_tma(stages_o=1, **common)
+    r2 = kern_tma.compile_qk_norm_rope_tma(stages_o=2, **common)
+    assert (r1.stages_o, r2.stages_o) == (1, 2)
+    assert r1.compiled is not r2.compiled, "stages_o=2 was served the stages_o=1 artifact"
+    assert compiled_stages_o == [1, 2], "the recipe must report the depth that was COMPILED"
+    r1_again = kern_tma.compile_qk_norm_rope_tma(stages_o=1, **common)
+    assert r1_again.compiled is r1.compiled and len(compiled_stages_o) == 2, "a repeat request is a cache hit, not a recompile"
