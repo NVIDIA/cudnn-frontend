@@ -55,6 +55,8 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as _cuda
 
+from cudnn.gemm.frost.kernel_templates.moe_scheduler import moe_load_sched_word as _moe_load_sched_word
+
 # @@INJECT_TILE_CONSTANTS@@
 
 if a_is_m_major:
@@ -501,11 +503,11 @@ def _kernel(
             ):
                 pass
             slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-            coord_expert = (slot.subview(0)).load()
-            tile_m = (slot.subview(1)).load()
-            tile_n = (slot.subview(2)).load()
-            is_valid = (slot.subview(3)).load()
-            group_begin = (slot.subview(4)).load()
+            coord_expert = _moe_load_sched_word(slot.subview(0))
+            tile_m = _moe_load_sched_word(slot.subview(1))
+            tile_n = _moe_load_sched_word(slot.subview(2))
+            is_valid = _moe_load_sched_word(slot.subview(3))
+            group_begin = _moe_load_sched_word(slot.subview(4))
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
@@ -609,12 +611,12 @@ def _kernel(
         while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
             pass
         _slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-        tile_m = (_slot.subview(1)).load()
-        tile_n = (_slot.subview(2)).load()
-        is_valid = (_slot.subview(3)).load()
-        group_begin = (_slot.subview(4)).load()
-        group_end = (_slot.subview(5)).load()
-        group_idx = (_slot.subview(7)).load()
+        tile_m = _moe_load_sched_word(_slot.subview(1))
+        tile_n = _moe_load_sched_word(_slot.subview(2))
+        is_valid = _moe_load_sched_word(_slot.subview(3))
+        group_begin = _moe_load_sched_word(_slot.subview(4))
+        group_end = _moe_load_sched_word(_slot.subview(5))
+        group_idx = _moe_load_sched_word(_slot.subview(7))
         nvvm.bar_warp_sync(0xFFFFFFFF)
         if elect_one:
             nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
@@ -802,12 +804,12 @@ def _kernel(
             while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
                 pass
             _slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-            tile_m = (_slot.subview(1)).load()
-            tile_n = (_slot.subview(2)).load()
-            is_valid = (_slot.subview(3)).load()
-            group_begin = (_slot.subview(4)).load()
-            group_end = (_slot.subview(5)).load()
-            group_idx = (_slot.subview(7)).load()
+            tile_m = _moe_load_sched_word(_slot.subview(1))
+            tile_n = _moe_load_sched_word(_slot.subview(2))
+            is_valid = _moe_load_sched_word(_slot.subview(3))
+            group_begin = _moe_load_sched_word(_slot.subview(4))
+            group_end = _moe_load_sched_word(_slot.subview(5))
+            group_idx = _moe_load_sched_word(_slot.subview(7))
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))

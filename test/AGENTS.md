@@ -107,3 +107,12 @@ releases a slot, and a CTA can exit while a peer still accesses its DSM storage.
 If filtering sanitizer kernels, `--kernel-name kns=frost_sm100_moe` uses the
 sanitizer key/value syntax; verify the filter with a known failing kernel first.
 Keep that negative control's nonzero exit and the unfiltered baseline evidence.
+
+SM120 uses one CTA per cluster and needs its own ring-reuse coverage:
+`gemm/frost/test_moe_scheduler_sm120.py` checks BF16, NVFP4 and MXFP8 over more
+than four compiled-grid waves, with live offset/scale changes during graph
+replay. Run with `-m L1` under unfiltered racecheck and memcheck. A numerical
+pass does not override a nonzero sanitizer exit: the original SM120 small tile
+passed its numerical checks while reporting scheduler/TMA/compute shared-ring
+WAR hazards. Read ring words in one lane and broadcast before releasing the
+slot; retain the full-warp convergence before the release arrival.

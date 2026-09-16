@@ -18,6 +18,8 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass._mlir.dialects import llvm
 
+from cudnn.gemm.frost.kernel_templates.moe_scheduler import moe_load_sched_word as moe_load_sched_word
+
 
 @cute.jit
 def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=False):
@@ -54,20 +56,6 @@ def epi_subtile_spans(cols, epi_n=32):
 
 
 TENSOR_MAP_QWORDS = 16
-
-
-@cute.jit
-def moe_load_sched_word(ptr):
-    """Read a scheduler word in the lane that later releases its ring slot.
-
-    Call with a converged full warp. Broadcasting the register value keeps
-    other lanes from issuing shared loads after the elected lane has released
-    the slot for reuse. Consumers must converge before their release arrival.
-    """
-    value = cutlass.Int32(0)
-    if cute.arch.lane_idx() == 0:
-        value = ptr.load()
-    return nvvm.shfl_sync(0xFFFFFFFF, value, 0, 0x1F, nvvm.Shfl.IDX)
 
 
 @cute.kernel
