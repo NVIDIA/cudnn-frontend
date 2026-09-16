@@ -1671,6 +1671,134 @@ def test_sdpa_fp8_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
 
 
 # # ==================================
+# # L0 FP8 paged decode on the FROST SM100 per-tensor FP8 engine
+# # ==================================
+#
+# FlashInfer-shaped fp8 KV-cache decode / MTP: sdpa_fp8 over E4M3/E5M2 page pools,
+# s_q in [1, 8] ("s_q=1" weighted), GQA, page sizes {16, 32, 64, 128}, per-batch KV
+# lengths (partial last pages, zero-length sequences, NaN-filled dead pages). Every
+# draw is inside the fp8 row's paged envelope (d <= 128, dense Q, contract page
+# sizes), so each config ASSERTS that sdpa_fwd_prefill_sm100_fp8 served it: a WAIVED
+# skip or a silent fall-through to the backend would otherwise hide a decline.
+
+FROST_FP8_ENGINE_KEY = "frost:sdpa_fwd_prefill_sm100_fp8"
+
+def _require_frost_sm100_fp8_paged():
+    cc = torch.cuda.get_device_capability()
+    if not (100 <= cc[0] * 10 + cc[1] <= 106):
+        pytest.skip("paged per-tensor FP8 on FROST is wired for the SM100 line (100 <= SM <= 106) only")
+    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
+        pytest.skip("FROST engines are opt-in: set CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 before importing cudnn")
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip("the FROST engines need the cutedsl extra (nvidia-cutlass-dsl) at or above CUTEDSL_MIN_VERSION")
+
+def _exec_sdpa_fp8_expect_frost(cfg, request, cudnn_handle):
+    """exec_sdpa_fp8, then assert the FROST FP8 engine served the graph (the harness
+    only tallies which engine ran; a decline falls through to the backend silently)."""
+    import frost_routing
+    before = frost_routing.snapshot().get(FROST_FP8_ENGINE_KEY, 0)
+    exec_sdpa_fp8(cfg, request, cudnn_handle)
+    after = frost_routing.snapshot().get(FROST_FP8_ENGINE_KEY, 0)
+    assert after == before + 1, f"expected {FROST_FP8_ENGINE_KEY} to serve this graph; routing tally: {frost_routing.snapshot()}"
+
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=2005), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_fp8_fwd_paged_decode_frost_L0(env_info, test_no, request, cudnn_handle):
+    _require_frost_sm100_fp8_paged()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=16, with_high_probability=[8, 16]),
+        s_q_s_kv=RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1": 6, "s_q=s_kv": 0, "s_q=random": 4}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=128, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(64, 64), (128, 128)]),
+        head_count=RandomHeadGenerator(min=4, max=32, head_group_options=(1, 6, 1)),
+        data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
+        output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 1, "full": 0}),
+        block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 64, 128]),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = True
+    # The FROST FP8 kernels bake a 4-binade lazy-rescale threshold (config_sm100.rescale_threshold);
+    # the reference mirrors the value it is handed, so pin it rather than draw it.
+    test.cfg.rescale_threshold = 4.0
+    os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+    test.showConfig(test_no, request)
+
+    if request.node.name in test.blocked_tests:
+        pytest.skip(f"blocked test: {request.node.name}")
+    try:
+        _exec_sdpa_fp8_expect_frost(test.cfg, request, cudnn_handle)
+    finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
+
+
+@pytest.mark.L0
+def test_sdpa_fp8_fwd_paged_decode_frost_pinned_L0(env_info, request, cudnn_handle):
+    """FlashInfer-shaped fp8 KV-cache decode, pinned: B=32, 64/4 heads (PackGQA), d128,
+    S_q=1, page 16, mixed per-batch KV lengths up to 4096 (partial last pages, a
+    zero-length and a one-token sequence, page and tile boundaries); e4m3 pools, f16 O.
+    Must be served by the FROST FP8 engine (what a `git bisect` of this path needs)."""
+    _require_frost_sm100_fp8_paged()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.float8_e4m3fn,
+        output_type=torch.float16,
+        rng_data_seed=2005,
+        rng_geom_seed=2005,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=32,
+        d_qk=128,
+        d_v=128,
+        s_q=1,
+        s_kv=4096,
+        h_q=64,
+        h_k=4,
+        h_v=4,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        left_bound=None,
+        right_bound=None,
+        seq_len_q=[1] * 32,
+        seq_len_kv=[4096, 1, 0, 17, 16, 15, 128, 129, 127, 2048, 3000, 4095, 33, 1000, 1279, 512,
+                    4096, 7, 8, 9, 640, 1023, 1024, 1025, 2047, 300, 77, 2500, 3999, 100, 200, 4000],
+        rescale_threshold=4.0,
+        implementation=cudnn.attention_implementation.AUTO,
+    )
+    test.cfg.fill_derived_fields()
+    os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+    test.showConfig((request.node.name, 1), request)
+
+    try:
+        _exec_sdpa_fp8_expect_frost(test.cfg, request, cudnn_handle)
+    finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
+
+
+# # ==================================
 # # L0 FP8 THD (ragged) fprop tests
 # # ==================================
 
