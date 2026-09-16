@@ -339,13 +339,6 @@ class Capabilities:
     # APPENDED at the end deliberately: Capabilities evolves append-only, so a
     # positional construction of an older field never silently rebinds.
     pack_gqa_d_shapes: Optional[frozenset] = None
-    # Flavors whose kernel packs a PROPER DIVISOR of the GQA group when the
-    # group does not divide tile_m (partial PackGQA: 96/8 packs 4 of its 12
-    # heads per token row-group, 48/8 packs 2; config_sm100.pack_gqa_group_size).
-    # None = every flavor keeps the full-ratio contract (the group must divide
-    # tile_m, or PACK_GQA=1 is declined).  Native on the SM100 d128 / d256 f16
-    # kernels; the d192x128 / d512 kernels pack HEADS_PER_TILE = G.
-    pack_gqa_partial_d_shapes: Optional[frozenset] = None
     # THD graphs whose Stats has NO ragged offsets (per-batch padded (b, s_max, h)
     # rows, FlashInfer's form): the kernel stores per batch and the adapter
     # fills the tail rows with -inf. Rows whose kernels lack the per-batch THD
@@ -369,6 +362,15 @@ class Capabilities:
     # the gate in Q's storage dtype); the quantized rows name the half dtype
     # their kernel stages it in (bf16 on the Rubin FP8 d256 kernel).
     epilogue_gate_dtypes: Optional[frozenset] = None
+    # Flavors whose kernel packs a PROPER DIVISOR of the GQA group when the
+    # group does not divide tile_m (partial PackGQA: 96/8 packs 4 of its 12
+    # heads per token row-group, 48/8 packs 2; config_sm100.pack_gqa_group_size).
+    # None = every flavor keeps the full-ratio contract (the group must divide
+    # tile_m, or PACK_GQA=1 is declined).  Native on the SM100 d128 / d256 f16
+    # kernels; the d192x128 / d512 kernels pack HEADS_PER_TILE = G.
+    # APPENDED after the epilogue-gate fields (append-only contract above):
+    # test_capabilities_positional_prefix_is_append_only pins the tail.
+    pack_gqa_partial_d_shapes: Optional[frozenset] = None
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:

@@ -710,6 +710,44 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     assert all(v is None for v in others.values()), others
 
 
+def test_capabilities_positional_prefix_is_append_only():
+    # Capabilities evolves APPEND-ONLY (the contract stated above
+    # pack_gqa_d_shapes): a positional construction written against an older
+    # field order must keep binding the same fields.  Prove it the way it
+    # breaks -- construct positionally in the pre-partial-PackGQA order with
+    # thd_padded_stats=True and check nothing rebinds (inserted mid-class, the
+    # True landed on pack_gqa_partial_d_shapes, thd_padded_stats fell back to
+    # False and the flavor membership test raised TypeError on a bool) -- then
+    # pin the legacy tail and the new field's place after it.
+    import dataclasses
+
+    fields = {f.name: f for f in dataclasses.fields(engines.Capabilities)}
+    names = list(fields)
+    required = {"sm_lo": 100, "sm_hi": 100, "phase": "prefill", "d_shapes": frozenset({(128, 128)})}
+
+    def legacy_value(name):
+        f = fields[name]
+        if name == "thd_padded_stats":
+            return True
+        if f.default is not dataclasses.MISSING:
+            return f.default
+        if f.default_factory is not dataclasses.MISSING:
+            return f.default_factory()
+        return required[name]
+
+    legacy_order = [n for n in names if n != "pack_gqa_partial_d_shapes"]
+    caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
+    assert caps.thd_padded_stats is True
+    assert caps.pack_gqa_partial_d_shapes is None
+    assert caps.epilogue_gate is False
+    assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
+
+    legacy_tail = ["pack_gqa_d_shapes", "thd_padded_stats", "epilogue_gate", "epilogue_gate_d_shapes", "epilogue_gate_dtypes"]
+    start = names.index("pack_gqa_d_shapes")
+    assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
+    assert names[-1] == "pack_gqa_partial_d_shapes", names[-3:]
+
+
 def test_knob_request_pack_gqa_false_always_eligible():
     # Running unpacked is trivially honorable — on MHA graphs too.
     assert engines.engine_name() in _eligible(_mk_eligible_graph(), engines.SdpaFwdKnobs(pack_gqa=False))
