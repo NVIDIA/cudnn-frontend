@@ -933,6 +933,13 @@ def test_accept_thd_features():
     assert _thd_mismatch(d=96) is None
 
 
+@pytest.mark.parametrize("field", ["max_total_seq_len_q", "max_total_seq_len_kv"])
+def test_reject_thd_zero_declared_capacity(field):
+    """SM100's empty-storage support must not widen the SM80 contract."""
+    reason = _thd_mismatch(**{field: 0})
+    assert reason is not None and "max_total_seq_len" in reason and ">= 1" in reason
+
+
 def test_reject_thd_without_declared_totals():
     reason = _thd_mismatch(declare_totals=False)
     assert reason is not None and "max_total_seq_len" in reason
