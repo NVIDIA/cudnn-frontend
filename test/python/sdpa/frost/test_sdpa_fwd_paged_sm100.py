@@ -381,9 +381,12 @@ def test_paged_graph_sink_pack_gqa(pack_gqa):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
-def test_paged_graph_d256_sink(hnd):
-    """The d256 flavor's PAGED_KV specialization with the sink fold."""
-    _run_graph(3, 8, 2, 256, 32, 40, [1000, 1, 1279], hnd, sink=True, stats=True)
+@pytest.mark.parametrize("s_q", [1, 2])
+def test_paged_graph_d256_sink(hnd, s_q):
+    """The d256 flavor's PAGED_KV specialization with the sink fold, at S_q = 1 and
+    as two-token decode under the bottom-right causal diagonal (a batch with one
+    key leaves its first row keyless: LSE = sink)."""
+    _run_graph(3, 8, 2, 256, 32, 40, [1000, 1, 1279], hnd, s_q=s_q, sink=True, causal_br=s_q > 1, stats=True)
 
 
 @pytest.mark.L0

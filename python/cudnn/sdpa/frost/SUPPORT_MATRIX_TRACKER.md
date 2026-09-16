@@ -173,12 +173,15 @@ lifts the running max, `exp(sink − max)` joins the denominator, `LSE = max + l
 that is independent of `S_q`, of the mask and of the paged loader. Hardware-validated
 on B200 (SM100) — `test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py`,
 `test_sdpa_fwd_dsl_sm100.py`, `test/python/test_mhas_v2.py::test_sdpa_random_sq1_sink_frost_L0`
-and the pinned `test_sdpa_paged_decode_sink_sliding_window_frost_L0` — for the d64
-(d128 envelope), d128 and d256 flavors, f16/bf16, `S_q` in {1, 2, 4}, PackGQA on and
-off, HND and NHD pools, dense unpadded / dense padded / paged, sink +
-`diagonal_band_left_bound` + bottom-right causal (`right_bound = 0`); keyless rows
-(`seq_len_kv[b] == 0`, or above the bottom-right diagonal) write `O = 0`,
-`LSE = sink`. What changed: the python-native validator (`cudnn/_sdpa_validate.py`)
+and the pinned `test_sdpa_paged_decode_sink_sliding_window_frost_L0` — per flavor:
+d128 at `S_q` in {1, 2, 4} (dense and paged, f16/bf16, PackGQA on and off); d64 on
+the d128 envelope at `S_q` in {1, 4} paged (bf16, 64/8 heads, sink + left window
+128) and `S_q = 1` dense; d256 at `S_q` in {1, 2} paged (f16). Across them: HND and
+NHD pools, dense unpadded / dense padded / paged, sink + `diagonal_band_left_bound` +
+bottom-right causal (`right_bound = 0`); the `test_mhas_v2` fuzz adds d in 8..256
+at `S_q = 1` with the whole causal / window / band family under both alignments;
+keyless rows (`seq_len_kv[b] == 0`, or above the bottom-right diagonal) write
+`O = 0`, `LSE = sink`. What changed: the python-native validator (`cudnn/_sdpa_validate.py`)
 no longer rejects `sink_token` at `s_q == 1` — that was the backend engines'
 support-surface rule, which the C++ surface keeps for the backend-only path — and
 the row's `paged KV with an attention sink is not validated` decline is gone. The

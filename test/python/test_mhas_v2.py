@@ -398,10 +398,11 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
 # ASSERT that FROST served every graph that ran.
 
 def _frost_sm100_or_skip():
-    """Gate for the FROST-asserting functions below: pre-Rubin Blackwell (the row
-    serves cc 10.0-10.6), FROST engines opted in, and a usable CuTe DSL (the row
-    declines without one and the native backend would then serve the sink-free
-    draws, which the routing assertion must not count as a failure of FROST)."""
+    """Gate for the FROST-asserting functions below: Blackwell at cc 10.0-10.6
+    (SM100 / SM103, the row's arch domain), FROST engines opted in, and a usable
+    CuTe DSL (the row declines without one and the native backend would then serve
+    the sink-free draws, which the routing assertion must not count as a failure
+    of FROST)."""
     major, minor = torch.cuda.get_device_capability()
     if not (100 <= major * 10 + minor <= 106):
         pytest.skip("FROST sdpa_fwd_prefill_sm100 serves cc 10.0-10.6 only")
