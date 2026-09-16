@@ -342,7 +342,7 @@ Reproduce warm forward and explicit-backward measurements on an otherwise idle G
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
-  python test/jax/benchmark_kda.py --command-buffer --repetitions 200 \
+  python benchmark/linear_attention/benchmark_kda.py --command-buffer --repetitions 200 \
   --output /tmp/kda-benchmark.json
 ```
 
@@ -376,7 +376,7 @@ To inspect individual kernels and graph updates, wrap a shorter run with:
 ```bash
 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
   --capture-range=cudaProfilerApi --capture-range-end=stop --cuda-graph-trace=node \
-  -o /tmp/kda-profile python test/jax/benchmark_kda.py \
+  -o /tmp/kda-profile python benchmark/linear_attention/benchmark_kda.py \
   --command-buffer --repetitions 10 --warmup 2 --raw-batch-size 4
 ```
 
