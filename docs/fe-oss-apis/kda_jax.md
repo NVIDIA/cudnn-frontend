@@ -218,10 +218,13 @@ invoke the pytest command explicitly: an import-only check does not run KDA
 forward/backward kernels.
 
 Validated the shared program on SM100 on 2026-09-15: the frontend source build
-in `nvcr.io/nvidia/jax:26.07-py3` succeeded and **29 tests passed, zero skipped**
-in 272.91 seconds, with CuTeDSL 4.7.1 and no PyTorch installation. This includes
+in `nvcr.io/nvidia/jax:26.07-py3` succeeded and **57 tests passed, zero skipped**
+in 347.66 seconds, with CuTeDSL 4.7.1 and no PyTorch installation. This includes
 the subprocess that rejects torch imports while compiling and executing a
-jitted KDA gradient. The host JAX run also passed all 29 tests.
+jitted KDA gradient. The host JAX run also passed all 57 tests in 311.06 seconds.
+After rebasing onto `473d35b87`, the suite covers 26 KDA, 25 BSA and six shared
+bridge cases. The upstream `cudnn.jax.call` implementation is unchanged. All 57
+cases are collected with the L0 filter; KDA uses the GPU-exclusive markers.
 
 Torch validation passed 62 existing regression cases covering piece chains,
 coarse checkpoints, linear/safe gates, BF16 state gradients, grouped heads,
@@ -241,14 +244,14 @@ warm calls after 20 warmups; GPU time uses a graph of 32 full calls:
 | Path | Forward total us | Backward total us | Forward minus raw us | Backward minus raw us |
 |---|---:|---:|---:|---:|
 | Raw Frost GPU sequence | 65.0 | 143.2 | — | — |
-| JAX jit + command buffers | 146.7 | 230.5 | 81.7 | 87.3 |
-| torch eager | 143.2 | 230.6 | 78.3 | 87.4 |
-| Fixed-buffer CUDA-graph replay | 73.5 | 151.9 | 8.5 | 8.7 |
+| JAX jit + command buffers | 148.3 | 232.5 | 83.3 | 89.3 |
+| torch eager | 142.4 | 230.1 | 77.4 | 86.9 |
+| Fixed-buffer CUDA-graph replay | 73.4 | 151.8 | 8.4 | 8.6 |
 
-Host dispatch was 44.1 / 62.7 us for JAX, 89.5 / 111.9 us for torch, and
-2.3 / 2.3 us for graph replay. A repeat measured raw GPU 65.0 / 143.2 us,
+Host dispatch was 47.2 / 66.0 us for JAX, 88.9 / 111.3 us for torch, and
+2.3 / 2.3 us for graph replay. A pre-rebase repeat measured raw GPU 65.0 / 143.2 us,
 JAX totals 150.2 / 233.9 us and torch totals 141.8 / 228.4 us. Outputs and
-all five explicit-backward gradients matched torch exactly in both runs,
+all five explicit-backward gradients matched torch exactly in all three runs,
 including captured replay. Stack: Python 3.14, JAX 0.11.1, torch 2.14.0+cu130,
 CuTeDSL 4.7.1, cuDNN 9.28.0.
 
