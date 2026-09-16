@@ -118,3 +118,6 @@ ordered after that read.**
 - Check both O and Stats against an independent reference with nonzero logits.
   O-only checks miss a wrong Stats base; zero logits miss an unscaled row maximum.
   See `test_fp8_graph_stats_use_log2` and the split-KV Stats tests.
+  `test_sm120_direct_template_stats_base` bypasses the adapter: the adapter
+  clears the partial-log2 flag itself, so adapter-only tests cannot detect
+  a missing guard in a directly called template.

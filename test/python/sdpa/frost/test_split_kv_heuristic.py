@@ -469,8 +469,17 @@ def test_every_combine_call_site_matches_the_compiled_arity():
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine
 
-    # _host's parameters, minus the trailing `stream` keyword.
-    params = [p for p in inspect.signature(split_combine._host).parameters if p != "stream"]
+    from typing import get_origin
+
+    import cutlass
+
+    # Constexpr values specialize the compiled callable; they are absent from
+    # its runtime ABI. Call sites pass the stream separately by keyword.
+    params = [
+        name
+        for name, param in inspect.signature(split_combine._host).parameters.items()
+        if name != "stream" and param.annotation is not cutlass.Constexpr and get_origin(param.annotation) is not cutlass.Constexpr
+    ]
     expected = len(params)
 
     tree = ast.parse(inspect.getsource(api_dsl))

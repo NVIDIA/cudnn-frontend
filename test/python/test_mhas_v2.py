@@ -375,7 +375,7 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
         stats_refs.append(scores.logsumexp(-1).float().unsqueeze(-1))
         kv_start += kv_len
 
-    # Known broken on older backends (NVBug 6783545). Register only AFTER all O
+    # Known issue on older backends (NVBug 6783545). Register only AFTER all O
     # checks, so an unrelated plan/build/output failure is never an expected failure.
     # Do not waive 9.28+ development builds: they must carry the backend fix.
     # A backport to an older version is an XPASS that asks us to retire this marker.

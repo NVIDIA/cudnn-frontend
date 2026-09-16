@@ -17,7 +17,7 @@ from typing import NamedTuple, Optional
 import pytest
 import torch
 
-from frost_test_utils import requires_dsl
+from frost_test_utils import requires_blackwell_geforce, requires_dsl
 
 pytestmark = [requires_dsl, pytest.mark.L0]
 
@@ -322,3 +322,77 @@ def test_sm120_split_stats_base(d, stats_log2):
     result = _sm120_case(4, 2, 128, 1024, d=d, with_lse=True, lse_layout="strided", split_kv=4, stats_log2=stats_log2)
     assert result.split == 4
     torch.testing.assert_close(result.output, result.reference, atol=3e-2, rtol=3e-2)
+
+
+@requires_blackwell_geforce
+@pytest.mark.parametrize("fp8", [False, True], ids=["f16", "fp8"])
+@pytest.mark.parametrize("splits", [1, 4], ids=["unsplit", "split4"])
+@pytest.mark.parametrize("stats_log2", [False, True], ids=["ln", "log2"])
+def test_sm120_direct_template_stats_base(fp8, splits, stats_log2):
+    """Direct callers may enable log2 even on a partial-producing template.
+
+    The adapter clears that flag before compiling partials, so going through
+    it cannot detect a missing kernel-entry guard. Check the actual partial
+    LSE units here, then feed them to the real natural-log combiner.
+    """
+    import cutlass
+    import cuda.bindings.driver as cuda
+
+    from cudnn.sdpa.fwd.api_dsl import _load_sm120_kernel_module
+    from cudnn.sdpa.fwd.config_sm120 import DTYPE_E4M3, DTYPE_FP16, TemplateParams
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+
+    b, h, sq, skv, d = 1, 2, 64, 512, 128
+    dtype = torch.float8_e4m3fn if fp8 else torch.float16
+    q = torch.full((b, sq, h, d), 0.5, device="cuda", dtype=dtype)
+    # Different nonzero maxima per 128-key chunk make both a wrong log base
+    # and a second conversion observable in the partials and the final O.
+    chunk = torch.arange(skv, device="cuda") // 128 + 1
+    k = (chunk.view(1, skv, 1, 1) * 0.5).expand(b, skv, 1, d).to(dtype).contiguous()
+    v = (chunk.view(1, skv, 1, 1) * 0.125).expand(b, skv, 1, d).to(dtype).contiguous()
+    partial_o = torch.full((splits * b, sq, h, d), float("nan"), device="cuda", dtype=torch.float16)
+    partial_lse = torch.full((splits * b, h, sq), float("nan"), device="cuda")
+    seq_q = torch.full((b,), sq, device="cuda", dtype=torch.int32)
+    seq_kv = torch.full((b,), skv, device="cuda", dtype=torch.int32)
+    params = TemplateParams(
+        dtype_qkv=DTYPE_E4M3 if fp8 else DTYPE_FP16,
+        dtype_o=DTYPE_FP16,
+        q_tile=64,
+        kv_tile=128,
+        split_kv=splits,
+        stats_log2=stats_log2,
+    )
+    module = _load_sm120_kernel_module(None, params, fp8=fp8)
+    kernel = module.compile(torch.cuda.get_device_capability(), b=b, qh=h, kh=1, sq=sq, skv=skv, d_qk=d, d_v=d)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    args = [q, k, v, partial_o, partial_lse, None, seq_q, seq_kv]
+    scale = cutlass.Float32(math.log2(math.e) / math.sqrt(d))
+    if fp8:
+        amax = torch.zeros(1, device="cuda", dtype=torch.int32)
+        unit_scale = torch.ones(1, device="cuda")
+        args += [amax, scale, cutlass.Float32(1.0), unit_scale, unit_scale, unit_scale, unit_scale]
+    else:
+        args += [scale]
+    kernel(*args, cutlass.Int32(0), None, None, None, cutlass.Int32(0), stream)
+    torch.cuda.synchronize()
+
+    scores = torch.einsum("bqhd,bknd->bhqk", q.double(), k.double()) / math.sqrt(d)
+    values = v.double().transpose(1, 2).expand(b, h, skv, d)
+    for split in range(splits):
+        lo, hi = split * (skv // splits), (split + 1) * (skv // splits)
+        split_scores = scores[..., lo:hi]
+        expected_lse = split_scores.logsumexp(-1)
+        if stats_log2 and splits == 1:
+            expected_lse *= math.log2(math.e)
+        torch.testing.assert_close(partial_lse[split * b : (split + 1) * b].double(), expected_lse, atol=2e-4, rtol=2e-5)
+        expected_o = (split_scores.softmax(-1) @ values[..., lo:hi, :]).transpose(1, 2)
+        torch.testing.assert_close(partial_o[split * b : (split + 1) * b].double(), expected_o, atol=3e-3, rtol=3e-3)
+
+    if splits > 1:
+        output = torch.full((b, sq, h, d), float("nan"), device="cuda", dtype=torch.float16)
+        lse = torch.full((b, h, sq), float("nan"), device="cuda")
+        combine = split_combine.compile(b, h, sq, d, splits, has_lse=True, stats_log2=stats_log2)
+        combine(partial_o, partial_lse, output, lse, None, None, (b, h, sq, d), cutlass.Int32(splits), stream=stream)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output.double(), (scores.softmax(-1) @ values).transpose(1, 2), atol=3e-3, rtol=3e-3)
+        torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * (math.log2(math.e) if stats_log2 else 1.0), atol=2e-4, rtol=2e-5)
