@@ -14,6 +14,7 @@ norm weights and writes no rstd, and the two are the SAME assembly with one
 kernel traced differently -- so both must pass the same oracle bar.
 """
 
+import re
 import os
 
 import pytest
@@ -434,7 +435,7 @@ def test_bwd_declaration_contracts_fire_before_the_stub_decline():
         (geom_off, None, None, {}, False),
     ):
         obj = GatedAttentionBlockBwd.__new__(GatedAttentionBlockBwd)
-        with pytest.raises(NotImplementedError, match="GatedAttentionBlockBwd.__init__"):
+        with pytest.raises(NotImplementedError, match=re.escape("GatedAttentionBlockBwd.__init__")):
             obj.__init__(z, saved(rstd), z, wq, wq, z, z, z, geom, **kw)
         assert obj.need_dw_norms is want
 

@@ -14,15 +14,17 @@ Three tiers:
 * shape algebra + the two section-2.3 byte-address formulas pinned against the oracle's
   ``_swizzle_128x4`` / ``swizzle_sf_columnwise`` on random probes -- no GPU;
 * an sm_107a trace-compile of both arms with an ``nvdisasm`` spill count -- any box whose
-  cutlass-dsl knows ``sm_107a`` (>= 4.8.0.dev0) AND has an nvdisasm that decodes it (the
-  internal toolkit; the A100 dev box compiles Rubin cubins in a second).  Anything less is
-  a SKIP, never a failure: the verdict must not depend on which toolkit ``CUDA_PATH`` names;
+  cutlass-dsl knows ``sm_107a`` (>= 4.8.0.dev0) AND whose ``$CUDA_PATH/bin`` or ``$PATH``
+  carries an nvdisasm that decodes it (an A100 box compiles Rubin cubins in a second).
+  Anything less is a SKIP, never a failure: the verdict must not depend on which toolkit
+  ``CUDA_PATH`` names;
 * numerics on a cc 10.x device (``cvt.rp.satfinite.ue8m0x2.f32`` is sm_100+); the block
   targets Rubin, so these run on the SM107 dev node.
 """
 
 import glob
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -67,19 +69,20 @@ from cudnn.gated_attention_block.kernels.quantize_mxfp8 import (  # noqa: E402
 D = 256
 N_QKVG = 17408  # the 397B slab width: Q [0, 4*256), K [1024, 1536), V [1536, 2048) at h_q=4 / h_kv=2
 ROLES = {"q": (AXIS_ROW, 4, 0), "k": (AXIS_ROW, 2, 1024), "v": (AXIS_COL, 2, 1536)}  # role -> (axis, heads, slab column offset)
-_INTERNAL_TOOLKIT = "/home/scratch.svc_compute_arch/release/cuda_toolkit/internal"
 
 
 def _nvdisasm_candidates():
     """Executables to TRY, most likely to decode sm_107a first; the probe verifies each and skips if none does.
 
-    A public CUDA 13.x ``nvdisasm`` reports ``Cannot decode architecture 'SM107a'`` (frost-gotchas, SASS), so
-    ``$CUDA_PATH`` is a hint, not an authority."""
-    cands = [os.path.join(_INTERNAL_TOOLKIT, "latest", "bin", "nvdisasm")]
-    cands += sorted(glob.glob(os.path.join(_INTERNAL_TOOLKIT, "cuda-*", "bin", "nvdisasm")))[::-1]
+    A public CUDA 13.x ``nvdisasm`` reports ``Cannot decode architecture 'SM107a'``, so the toolkit
+    ``$CUDA_PATH`` names is tried first and the one on ``$PATH`` second -- both are hints, not authorities."""
+    cands = []
     if os.environ.get("CUDA_PATH"):
         cands.append(os.path.join(os.environ["CUDA_PATH"], "bin", "nvdisasm"))
-    return [c for c in cands if os.path.isfile(c) and os.access(c, os.X_OK)]
+    on_path = shutil.which("nvdisasm")
+    if on_path:
+        cands.append(on_path)
+    return [c for c in dict.fromkeys(cands) if os.path.isfile(c) and os.access(c, os.X_OK)]
 
 
 def _sm107a_known_to_the_dsl() -> bool:
@@ -360,7 +363,7 @@ def test_sm107_trace_compile_has_no_spills(axis, e8m0_cvts, tmp_path):
         pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
     cands = _nvdisasm_candidates()
     if not cands:
-        pytest.skip("no nvdisasm executable to try (internal toolkit absent, CUDA_PATH unset)")
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
     dump = tmp_path / f"quantize_mxfp8_{axis}"
     dump.mkdir()
     proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, axis, str(dump), *cands], capture_output=True, text=True, timeout=600)
