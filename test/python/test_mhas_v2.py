@@ -519,8 +519,6 @@ def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm1
     knob (frost_routing.LAST_PLAN): on sdpa_fwd_prefill_sm100's d128 flavor 1
     IS the decode tile and 2 the prefill pipeline, so a test that means the
     decode tile asserts the tile, not just the engine."""
-    import frost_routing
-
     key    = f"frost:{engine}"
     before = frost_routing.snapshot().get(key, 0)
     exec_sdpa(cfg, request, cudnn_handle)
@@ -1010,34 +1008,6 @@ def test_sdpa_fwd_paged_unified_L0(env_info, test_no, request, cudnn_handle):
 # # L0 paged decode on the FROST SM100 row (split-KV, ragged max)
 # # ==========================================================
 
-FROST_SM100_ROUTING_KEY = "frost:sdpa_fwd_prefill_sm100"
-
-def _skip_unless_frost_sm100_serves():
-    """The FROST SM100 f16/bf16 row serves paged decode on pre-Rubin Blackwell
-    (cc 10.0-10.6) when the engines are opted in and the CuTe DSL is usable;
-    anywhere else the graph would land on the native backend and the routing
-    assertion below would be testing the wrong engine."""
-    major, minor = torch.cuda.get_device_capability()
-    if not (100 <= major * 10 + minor <= 106):
-        pytest.skip("FROST paged decode is served by the SM100 row (cc 10.0-10.6) only")
-    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
-        pytest.skip("requires CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 before import cudnn")
-    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
-    installed, version = cutedsl_state()
-    if not installed or cutedsl_too_old(version):
-        pytest.skip("requires the cutedsl extra (nvidia-cutlass-dsl) at the supported version")
-
-def _exec_sdpa_served_by_frost_sm100(cfg, request, cudnn_handle):
-    """exec_sdpa, then assert the FROST SM100 row served the graph. A graph the
-    validator waives skips inside exec_sdpa before the tally moves; a graph
-    FROST declines is served by the native backend and FAILS here instead of
-    passing silently (the tally alone asserts nothing)."""
-    before = frost_routing.snapshot().get(FROST_SM100_ROUTING_KEY, 0)
-    exec_sdpa(cfg, request, cudnn_handle)
-    after = frost_routing.snapshot().get(FROST_SM100_ROUTING_KEY, 0)
-    assert after == before + 1, f"expected {FROST_SM100_ROUTING_KEY} to serve this graph; routing tally = {frost_routing.snapshot()}"
-
-
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=2001), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_fwd_paged_decode_split_frost_L0(env_info, test_no, request, cudnn_handle):
@@ -1045,11 +1015,12 @@ def test_sdpa_fwd_paged_decode_split_frost_L0(env_info, test_no, request, cudnn_
     never a multiple of the 128-row KV tile, the FlashInfer spelling -- at a
     small batch, where the heuristic proposes a KV split. Every draw stays
     inside the SM100 row's paged contract (d_qk == d_v <= 256, page size a
-    multiple of 8 dividing 128 or a multiple of it, padded, no sink) and must
-    be served by FROST; the reference check covers the split + combine path.
+    multiple of 8 dividing 128 or a multiple of it, padded, sink-free so the
+    KV split is proposed) and must be served by FROST; the reference check
+    covers the split + combine path.
     Own seed and function: widening test_sdpa_fwd_paged_L0 would reshuffle
     every downstream draw of that sweep."""
-    _skip_unless_frost_sm100_serves()
+    _require_frost_sm100()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -1075,7 +1046,7 @@ def test_sdpa_fwd_paged_decode_split_frost_L0(env_info, test_no, request, cudnn_
     test.cfg.is_paged = True
     test.showConfig(test_no, request)
 
-    _exec_sdpa_served_by_frost_sm100(test.cfg, request, cudnn_handle)
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
 
 
 PAGED_DECODE_SPLIT_FROST_CASES = [
@@ -1094,7 +1065,7 @@ def test_sdpa_fwd_paged_decode_split_frost_pinned_L0(env_info, case_id, diag_ali
     bisect lands on it: b=2, GQA 8:1, d=128, page 16, s_q=1, declared KV max
     4000 (not a multiple of the 128-row KV tile), per-batch lengths [4000, 3000].
     FROST must serve it; its leading plan is the KV split."""
-    _skip_unless_frost_sm100_serves()
+    _require_frost_sm100()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = ExecConfig(
@@ -1130,7 +1101,7 @@ def test_sdpa_fwd_paged_decode_split_frost_pinned_L0(env_info, case_id, diag_ali
     test.cfg.fill_derived_fields()
     test.showConfig((request.node.name, len(PAGED_DECODE_SPLIT_FROST_CASES)), request)
 
-    _exec_sdpa_served_by_frost_sm100(test.cfg, request, cudnn_handle)
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
 
 # # ==================================
 # # L0 fprop block mask tests
