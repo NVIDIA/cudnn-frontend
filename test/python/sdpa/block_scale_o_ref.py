@@ -130,3 +130,32 @@ def unswizzle_128x4(m: torch.Tensor) -> torch.Tensor:
     out = flat.permute(*range(len(lead)), len(lead) + 0, len(lead) + 3, len(lead) + 2, len(lead) + 1, len(lead) + 4)
     # (rb, r4, r32, cb, c4) -> r = rb*128 + r4*32 + r32
     return out.reshape(*lead, R, C)
+
+
+def dequant_block_scaled_o(o_bytes: torch.Tensor, sf_o_buf: torch.Tensor, blk: int, layout: str, b: int, h: int, s: int, d_v: int, c: int):
+    """(O container, sf_o bytes) -> fp32 O [B, H, S, d_v] in ``scale_o`` units, plus whether
+    every kernel-owned pad row of a per-(b,h) plane came back zero (token-major has none).
+
+    ``o_bytes`` is the BSHD-physical O as the graph sees it ([B, H, S, d_v // pack] view):
+    the packed E2M1 container for ``blk == 16``, E4M3 for ``blk == 32``. ``sf_o_buf`` is
+    the swizzled uint8 SF_O in the declared ``layout`` ("planes": [B, H, R, C]; "token_major":
+    [round_up(B*S, 128), H*C]); ``c`` is the padded scale-column count (``d_v // blk`` rounded to 4).
+    """
+    c_used = d_v // blk
+    if layout == "planes":
+        logical = unswizzle_128x4(sf_o_buf)  # (B, H, R, C)
+        sf_log = logical[:, :, :s, :c_used]
+        pad_ok = bool((logical[:, :, s:, :] == 0).all().item())
+    else:
+        logical = unswizzle_128x4(sf_o_buf)  # (B*S padded, H*C)
+        sf_log = logical[: b * s].reshape(b, s, h, c)[..., :c_used].permute(0, 2, 1, 3)
+        pad_ok = True
+    if blk == 16:
+        codes = unpack_e2m1(o_bytes.transpose(1, 2).contiguous().view(torch.uint8)).reshape(b, s, h, d_v).permute(0, 2, 1, 3)
+        sf = sf_log.view(torch.float8_e4m3fn).float()
+        vals = dequantize_e2m1(codes)
+    else:
+        sf = torch.pow(2.0, sf_log.float() - 127.0)
+        vals = o_bytes.float()
+    o = (vals.reshape(b, h, s, c_used, blk) * sf[..., None]).reshape(b, h, s, d_v)
+    return o, pad_ok
