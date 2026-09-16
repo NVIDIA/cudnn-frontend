@@ -1674,12 +1674,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "softmax_precision=HALF is served for per-tensor FP8 d128 on cc10.7 only (FLOAT is the default everywhere)",
         )
         if self.paged:
-            # Paged KV rides the d128 f16/bf16 kernel's PAGED_KV specialization
-            # (config_sm100._validate_params is the backstop for the same set).
+            # Paged KV rides the d128 / d256 / d512 f16/bf16 kernels' PAGED_KV
+            # specialization (config_sm100._validate_params is the backstop
+            # for the same set).
             self._not_implemented_error_if(self._fp8, "paged KV is served by the f16/bf16 kernel only")
             self._not_implemented_error_if(
-                self.flavor not in ((128, 128), (256, 256)),
-                f"paged KV is wired on the d128 and d256 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+                self.flavor not in ((128, 128), (256, 256), (512, 512)),
+                f"paged KV is wired on the d128, d256 and d512 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._value_error_if(not self.seq_kv_lens_present, "paged KV requires per-batch KV lengths (seq_kv_lens_present)")
             self._not_implemented_error_if(self.has_sink, "paged KV with an attention sink is not validated")

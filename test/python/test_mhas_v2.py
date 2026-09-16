@@ -1062,6 +1062,126 @@ def test_sdpa_random_fwd_bias_L0(env_info, test_no, request, cudnn_handle):
     exec_sdpa(test.cfg, request, cudnn_handle)
 
 # # ==================================
+# # L0 paged d512 (DSv4-class) decode tests on the FROST SM100 engine
+# # ==================================
+
+def _skip_unless_frost_sm100():
+    """The FROST SM100 f16/bf16 row serves cc 10.0 .. 10.6 and is opt-in
+    (CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 before `import cudnn`); anywhere
+    else these configs would run on the backend and prove nothing about FROST."""
+    major, minor = torch.cuda.get_device_capability()
+    if not (100 <= major * 10 + minor <= 106):
+        pytest.skip("FROST paged d512 is served by the SM100 f16/bf16 engine (cc 10.0 .. 10.6) only")
+    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
+        pytest.skip("FROST engines are opt-in: set CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1")
+
+
+def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100", strict=False):
+    """exec_sdpa, then ASSERT the FROST engine served the forward graph.
+
+    The harness only tallies routing (a FROST decline silently falls through to
+    the backend and a validator rejection turns into a WAIVED skip), so a green
+    run alone does not cover the FROST path. `strict` turns the harness's skips
+    into failures too — for the pinned configs, which must run here."""
+    import frost_routing
+
+    key    = f"frost:{engine}"
+    before = frost_routing.snapshot().get(key, 0)
+    try:
+        exec_sdpa(cfg, request, cudnn_handle)
+    except pytest.skip.Exception as e:
+        if strict and not request.config.option.dryrun:
+            pytest.fail(f"pinned FROST config must run, not skip: {e}", pytrace=False)
+        raise
+    after = frost_routing.snapshot().get(key, 0)
+    assert after > before, f"the forward graph was not served by FROST engine {engine!r} (routing tally: {frost_routing.snapshot()})"
+
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=2007), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_fwd_paged_d512_frost_L0(env_info, test_no, request, cudnn_handle):
+    """Paged KV decode / speculative-decode (s_q in [1, 8]) on the d512 (DSv4-class)
+    f16/bf16 flavor of the FROST SM100 engine: head dims in (256, 512] select the
+    d512 kernel (d=384 rides its envelope zero-padded), GQA / MQA, page sizes
+    16 .. 128, per-batch KV lengths incl. 0 and 1, no mask or (bottom-right)
+    causal. Every draw must be served by FROST, asserted through the routing tally."""
+    _skip_unless_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    # Create the randomization context within the test
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,8]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":4, "s_q=s_kv":0, "s_q=random":4, "s_q>s_kv":0}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=264, d_qk_max=512, d_v_min=264, d_v_max=512, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":1}, with_high_probability=[(512,512), (384,384)]),
+        head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(0, 2, 1)),
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(causal=1, no_mask=2),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 2}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 0}),
+        block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16,32,64,128]),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = True
+    test.showConfig(test_no, request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
+PAGED_D512_PINNED_KV_HEADS = [1, 8]
+
+
+@pytest.mark.parametrize("h_kv", PAGED_D512_PINNED_KV_HEADS, ids=["mqa_64_1", "gqa_64_8"])
+@pytest.mark.L0
+def test_sdpa_fwd_paged_d512_frost_pinned_L0(env_info, h_kv, request, cudnn_handle):
+    """DSv4-class d512 paged decode, pinned: b=8, 64 q heads over 1 (MQA) or 8
+    (GQA) KV heads, d_qk = d_v = 512, s_q=1, mixed KV lengths up to 4096 incl. 0
+    and 1, page 16, bf16 — the FlashInfer decode-wrapper shape. Must run and be
+    served by the FROST SM100 engine (a fallback or a WAIVED skip fails here)."""
+    _skip_unless_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=2007,
+        rng_geom_seed=2007,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=8,
+        d_qk=512,
+        d_v=512,
+        s_q=1,
+        s_kv=4096,
+        h_q=64,
+        h_k=h_kv,
+        h_v=h_kv,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        left_bound=None,
+        right_bound=None,
+        seq_len_q=[1] * 8,
+        seq_len_kv=[4096, 1, 0, 300, 1024, 2048, 77, 129],
+        implementation=cudnn.attention_implementation.AUTO,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, len(PAGED_D512_PINNED_KV_HEADS)), request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, strict=True)
+
+# # ==================================
 # # L0 bprop bias tests
 # # ==================================
 

@@ -693,14 +693,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
-        # Served by the d128 f16/bf16 kernel's PAGED_KV specialization
-        # (config_sm100._validate_params mirrors these as its backstop).
+        # Served by the d128 / d256 / d512 f16/bf16 kernels' PAGED_KV
+        # specialization (config_sm100._validate_params mirrors these as its
+        # backstop). The (256, 512] envelope rides the d512 flavor zero-padded.
         if facts.is_fp8 or facts.is_mxfp8:
             return "paged KV is served by the f16/bf16 kernel only"
         if not facts.padded:
             return "paged KV requires use_padding_mask with seq_len_kv (the per-batch KV length bounds the block-table walk)"
-        if facts.d_qk > 256 or facts.d_v > 256:
-            return f"paged KV is wired on the d128 / d256 flavors only (d_qk, d_v <= 256); got ({facts.d_qk}, {facts.d_v})"
+        if facts.d_qk > 512 or facts.d_v > 512:
+            return f"paged KV is wired on the d128 / d256 / d512 flavors only (d_qk, d_v <= 512); got ({facts.d_qk}, {facts.d_v})"
         if (facts.d_qk > 128 or facts.d_v > 128) and not (facts.d_qk > 128 and facts.d_v > 128):
             return f"paged KV with mixed head dims ({facts.d_qk}, {facts.d_v}) would select the d192x128 flavor, which is not wired"
         if facts.has_sink:

@@ -254,6 +254,33 @@ def test_paged_graph_partial_pack_gqa(hnd, h, kh, s_q):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+def test_paged_graph_d512(hnd, page_size):
+    """d=512 selects the d512 (DSv4-class) f16 flavor, whose TMA-LDG warp is
+    role-split across the cga4 cluster: the sub-group 0 CTAs stream the K
+    boxes, the sub-group 1 CTAs the V boxes, each through its own block table.
+    MQA 8:1 (PackGQA) decode, mixed lengths incl. 0 and 1, a tile-unaligned
+    tail and a length ending on a page/tile boundary; Stats requested."""
+    _run_graph(5, 8, 1, 512, page_size, -(-1100 // page_size), [300, 77, 0, 1, 1024], hnd, stats=True)
+
+
+@pytest.mark.L0
+def test_paged_graph_d512_envelope_d384():
+    """d=384 rides the d512 flavor zero-padded (the (256, 512] envelope); bf16, GQA 8:2."""
+    _run_graph(3, 8, 2, 384, 32, 40, [1000, 1, 1279], hnd=False, dtype=torch.bfloat16, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [2, 4])
+def test_paged_graph_d512_s_q_up_to_4(s_q):
+    """Speculative-decode-shaped S_q in [2, 4] over a d512 paged cache (no
+    causal band: every q row attends the whole live KV); GQA 16:2 PackGQA, HND,
+    a batch of one live token and one ending past a tile boundary."""
+    _run_graph(3, 16, 2, 512, 16, 70, [1000, 1, 1100], hnd=True, s_q=s_q, stats=True)
+
+
+@pytest.mark.L0
 def test_paged_graph_prefill_shaped_s_q():
     """The same engine serves S_q > 1 over a paged cache (paged prefill / chunked
     prefill); all q rows attend the whole live KV (no causal mask)."""
@@ -349,7 +376,12 @@ def test_paged_graph_declines_off_contract():
 
     assert _offers(_build(16))
     assert not _offers(_build(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
-    assert not _offers(_build(16, d=512)), "paged KV is wired on the d128 / d256 flavors only"
+    # Inverted when the d512 flavor was wired (kept, not deleted: a regression
+    # to the old decline must fail here). d=576 (absorbed-MLA d_qk) has no
+    # flavor envelope at all, so it stays declined.
+    assert _offers(_build(16, d=512)), "paged KV is wired on the d512 flavor"
+    assert _offers(_build(16, d=384)), "d=384 rides the d512 flavor envelope"
+    assert not _offers(_build(16, d=576)), "no kernel-flavor envelope covers d_qk=576"
     assert not _offers(_build(16, padding=False)), "paged KV requires the padding mask"
 
 
@@ -466,6 +498,16 @@ def test_paged_kernel_d256(page_size):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("page_size", [16, 64, 128])
+def test_paged_kernel_d512(page_size):
+    """The d512 (DSv4) f16 flavor carries the same PAGED_KV specialization on its
+    role-split loader: cga4x1 (K box = 64 rows per sub-group-0 CTA, V box = the
+    128-row tile over each sub-group-1 CTA's 256 d_v columns), forced 4 splits
+    with one empty range."""
+    _run_kernel(2, 8, 2, page_size, -(-1100 // page_size), [1000, 77], hnd=page_size == 16, splits=4, cta_mma=2, d=512)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "h,kh,pack_g,d",
     [(6, 2, 1, 128), (10, 2, 1, 128), (24, 2, 4, 128), (12, 2, 2, 128), (24, 2, 4, 256), (256, 1, 128, 128)],
@@ -545,19 +587,21 @@ def test_paged_adapter_cuda_graph_replay_no_host_sync():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 512], ids=["d128", "d512"])
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
-def test_paged_graph_thd_queries(hnd):
+def test_paged_graph_thd_queries(hnd, d):
     """Ragged Q/O (packed [T, H, D] storage + ragged offsets, per-sequence
     ``seq_len_q``) attending K/V page pools through block tables: each sequence's
     q tokens see its own live KV pages. Only Q/O are ragged — the pools are
     ordinary dense tensors — and the THD scheduler walks the Q units while the
-    KV side comes from ``seq_len_kv`` + the tables."""
+    KV side comes from ``seq_len_kv`` + the tables. d=512 runs the role-split
+    flavor's THD path over pools (no packed-total K/V descriptor clamp there)."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
     from cudnn.sdpa.fwd.engines import engine_name
 
     dev, dtype = "cuda", torch.float16
-    H, KH, d, P, max_pages = 8, 2, D, 16, 20
+    H, KH, P, max_pages = 8, 2, 16, 20
     q_lens = [37, 130, 5]
     kv_lens = [300, 77, 129]
     B, T, S_max = len(q_lens), sum(q_lens), max(q_lens)
