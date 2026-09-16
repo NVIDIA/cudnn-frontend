@@ -13,6 +13,8 @@ import cuda.bindings.driver as cuda
 
 @lru_cache(maxsize=None)
 def _device_capability(device_index: int):
+    import torch
+
     return torch.cuda.get_device_capability(device_index)
 
 
