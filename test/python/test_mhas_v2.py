@@ -32,6 +32,7 @@ from sdpa.fp8 import exec_sdpa_fp8
 from sdpa.mxfp8 import exec_sdpa_mxfp8
 from sdpa.blocked import fetch_blocked_tests
 from sdpa.helpers import print_section_begin, print_section_end
+import frost_routing
 
 # fmt: off
 
@@ -853,6 +854,132 @@ def test_sdpa_fwd_paged_unified_L0(env_info, test_no, request, cudnn_handle):
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
+
+# # ==========================================================
+# # L0 paged decode on the FROST SM100 row (split-KV, ragged max)
+# # ==========================================================
+
+FROST_SM100_ROUTING_KEY = "frost:sdpa_fwd_prefill_sm100"
+
+def _skip_unless_frost_sm100_serves():
+    """The FROST SM100 f16/bf16 row serves paged decode on pre-Rubin Blackwell
+    (cc 10.0-10.6) when the engines are opted in and the CuTe DSL is usable;
+    anywhere else the graph would land on the native backend and the routing
+    assertion below would be testing the wrong engine."""
+    major, minor = torch.cuda.get_device_capability()
+    if not (100 <= major * 10 + minor <= 106):
+        pytest.skip("FROST paged decode is served by the SM100 row (cc 10.0-10.6) only")
+    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
+        pytest.skip("requires CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 before import cudnn")
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip("requires the cutedsl extra (nvidia-cutlass-dsl) at the supported version")
+
+def _exec_sdpa_served_by_frost_sm100(cfg, request, cudnn_handle):
+    """exec_sdpa, then assert the FROST SM100 row served the graph. A graph the
+    validator waives skips inside exec_sdpa before the tally moves; a graph
+    FROST declines is served by the native backend and FAILS here instead of
+    passing silently (the tally alone asserts nothing)."""
+    before = frost_routing.snapshot().get(FROST_SM100_ROUTING_KEY, 0)
+    exec_sdpa(cfg, request, cudnn_handle)
+    after = frost_routing.snapshot().get(FROST_SM100_ROUTING_KEY, 0)
+    assert after == before + 1, f"expected {FROST_SM100_ROUTING_KEY} to serve this graph; routing tally = {frost_routing.snapshot()}"
+
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=2001), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_fwd_paged_decode_split_frost_L0(env_info, test_no, request, cudnn_handle):
+    """Paged decode (s_q=1) with the declared KV maximum drawn freely -- almost
+    never a multiple of the 128-row KV tile, the FlashInfer spelling -- at a
+    small batch, where the heuristic proposes a KV split. Every draw stays
+    inside the SM100 row's paged contract (d_qk == d_v <= 256, page size a
+    multiple of 8 dividing 128 or a multiple of it, padded, no sink) and must
+    be served by FROST; the reference check covers the split + combine path.
+    Own seed and function: widening test_sdpa_fwd_paged_L0 would reshuffle
+    every downstream draw of that sweep."""
+    _skip_unless_frost_sm100_serves()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    # Create the randomization context within the test
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=4, with_high_probability=[1,2]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=129, s_kv_max=16384, s_q_distribution={"s_q=1":1}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=32, d_qk_max=256, d_v_min=32, d_v_max=256, head_dim_distribution={"d_qk=d_v":1}, with_high_probability=[(64,64), (128,128), (256,256)]),
+        head_count=RandomHeadGenerator(min=1, max=16, head_group_options=(1, 4, 2)),
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(causal=2, no_mask=10),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"padded" : 1}),
+        block_size=RandomBlockSize(min=8, max=1024, with_high_probability=[16,32,64,128]),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = True
+    test.showConfig(test_no, request)
+
+    _exec_sdpa_served_by_frost_sm100(test.cfg, request, cudnn_handle)
+
+
+PAGED_DECODE_SPLIT_FROST_CASES = [
+    # (id, diag_align, right_bound): bottom-right causal is FlashInfer's MTP
+    # spelling; no mask is its plain decode spelling (the one the split gate
+    # over-declined: with no band covering the KV tail, a declared max that is
+    # not a 128-multiple was mistaken for synthesized KV-tail padding).
+    ("brcm",    cudnn.diagonal_alignment.BOTTOM_RIGHT, 0),
+    ("no_mask", cudnn.diagonal_alignment.TOP_LEFT,     None),
+]
+
+@pytest.mark.parametrize("case_id,diag_align,right_bound", PAGED_DECODE_SPLIT_FROST_CASES, ids=[c[0] for c in PAGED_DECODE_SPLIT_FROST_CASES])
+@pytest.mark.L0
+def test_sdpa_fwd_paged_decode_split_frost_pinned_L0(env_info, case_id, diag_align, right_bound, request, cudnn_handle):
+    """The FlashInfer paged-decode shape the split over-decline hit, pinned so a
+    bisect lands on it: b=2, GQA 8:1, d=128, page 16, s_q=1, declared KV max
+    4000 (not a multiple of the 128-row KV tile), per-batch lengths [4000, 3000].
+    FROST must serve it; its leading plan is the KV split."""
+    _skip_unless_frost_sm100_serves()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=2001,
+        rng_geom_seed=2001,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_cu_seq_len=False,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=2,
+        d_qk=128,
+        d_v=128,
+        s_q=1,
+        s_kv=4000,
+        h_q=8,
+        h_k=1,
+        h_v=1,
+        block_size=16,
+        diag_align=diag_align,
+        left_bound=None,
+        right_bound=right_bound,
+        seq_len_q=[1, 1],
+        seq_len_kv=[4000, 3000],
+        implementation=cudnn.attention_implementation.AUTO,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, len(PAGED_DECODE_SPLIT_FROST_CASES)), request)
+
+    _exec_sdpa_served_by_frost_sm100(test.cfg, request, cudnn_handle)
 
 # # ==================================
 # # L0 fprop block mask tests

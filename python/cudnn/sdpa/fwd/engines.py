@@ -387,6 +387,33 @@ def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
     return facts.s_q + r <= facts.s_kv
 
 
+def _synth_kv_padding(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+    """True when ``lower_dsl_prefill`` serves this graph's ragged S_kv through
+    the kernel's padded path with SYNTHESIZED per-batch KV lengths (pinned to
+    the full S_kv) — the one path split-KV cannot ride.
+
+    Only a DENSE, mask-free graph whose S_kv is not a multiple of the KV tile
+    takes it. A padded graph already carries real per-batch lengths; a paged
+    graph is padded by construction (per-batch ``seq_len_kv`` is mandatory and
+    bounds the walk on device), so a declared ``paged_attention_max_seq_len_kv``
+    that is not a tile multiple — FlashInfer passes its true max verbatim,
+    e.g. 4000 — never selects this path and must not cost the launch its
+    split; THD carries its lengths via cu_seqlens. The split gates in
+    :func:`mismatch` and ``heuristics._split_points`` share this predicate with
+    the lowering so the three cannot drift apart again (they did: the gates
+    lacked the padded/paged terms and declined every paged decode graph whose
+    declared max was not a 128-multiple).
+    """
+    return (
+        capabilities.skv_tail_via_padding
+        and not facts.padded
+        and not facts.has_paged_kv
+        and not facts.thd
+        and facts.s_kv % (capabilities.skv_tile or 128) != 0
+        and not _band_covers_kv_tail(facts)
+    )
+
+
 def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> Optional[tuple[int, int]]:
     """Smallest native flavor whose envelope covers this graph -- honouring the
     per-shape envelope floors, so the knob domains (cga, split) describe the
@@ -490,11 +517,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # the SM count), so it is exempt from the padded exclusion.
             if facts.thd or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
                 return "split_kv > 1 serves dense, unpadded, sink-free graphs only"
-            if capabilities.skv_tail_via_padding and facts.s_kv % (capabilities.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
+            if _synth_kv_padding(capabilities, facts):
                 # The lowering would serve this ragged S_kv through the padded
                 # kernel path (synthesized per-batch KV lengths) — the same
-                # path the split cannot ride. Mirror lower_dsl_prefill's
-                # synth_kv_padding predicate so the plan is never listed.
+                # path the split cannot ride. The SAME predicate as
+                # lower_dsl_prefill's so the plan is never listed; a paged
+                # graph never takes that path (its declared max only sizes
+                # the cost model), so it keeps its split.
                 return "split_kv > 1 cannot ride the synthesized KV-tail padding this S_kv needs"
             # No gate on the O dtype: the partials are never narrower than it,
             # and the combine performs the only cast down to it.
@@ -1518,10 +1547,8 @@ def lower_dsl_prefill(
     # KV-tail via synthesized padding (see Capabilities.skv_tail_via_padding):
     # a ragged S_kv with no mask covering the tail is served through the
     # kernel's padded path with per-batch lengths pinned to the full S_kv.
-    skv_tile = spec.capabilities.skv_tile or 128
-    synth_kv_padding = (
-        spec.capabilities.skv_tail_via_padding and not facts.padded and not facts.thd and facts.s_kv % skv_tile != 0 and not _band_covers_kv_tail(facts)
-    )
+    # The predicate is shared with the split gates (mismatch / _split_points).
+    synth_kv_padding = _synth_kv_padding(spec.capabilities, facts)
 
     seq_q_t = facts.seq_q_t if facts.padded else None
     seq_kv_t = facts.seq_kv_t if facts.padded else None
