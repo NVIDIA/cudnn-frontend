@@ -18,7 +18,7 @@ ordering in the shared bridge. Compiled forward HLO checks apply to compact
 standalone inputs; they do not promise arbitrary surrounding JAX graphs avoid
 layout conversions.
 
-The normal `test/python/fe_api` sweep collects this directory. The GitLab SM100
+The normal `test/python/fe_api` sweep collects this directory. The CI SM100
 CuTeDSL 4.7 jobs can run these tests; the regular CuTeDSL 4.6.2 jobs skip them.
 Missing JAX or an older CuTeDSL skips the modules before kernel imports.
 Torch-free checks use fresh subprocesses even in the normal torch-based suite.
