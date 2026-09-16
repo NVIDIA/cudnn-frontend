@@ -158,11 +158,11 @@ def print_tensor_stats(tensor, tag=None):
     numel = t.numel()
 
     # Compute hash using torch.hash_tensor (fast GPU operation)
-    # FP8 types not supported by hash_tensor, view as int8
-    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        hash_value = torch.hash_tensor(t.view(torch.int8))
-    else:
-        hash_value = torch.hash_tensor(t)
+    # FP8 / packed FP4 / UE8M0 byte types are not supported by hash_tensor (nor
+    # by the statistics below): hash and count them as raw bytes.
+    if t.element_size() == 1 and t.dtype not in (torch.int8, torch.uint8, torch.bool):
+        t = t.view(torch.int8)
+    hash_value = torch.hash_tensor(t)
 
     # Compute statistics (all GPU operations)
     num_zeros = numel - torch.count_nonzero(t).item()
