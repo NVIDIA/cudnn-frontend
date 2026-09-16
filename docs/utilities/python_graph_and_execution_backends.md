@@ -726,6 +726,42 @@ q.shape[2] != ...)` must nest its constant test outside; a `const_expr` on a
 dynamic extent or stride is an error, which is why the padded-Stats store
 selects on the fake's RANK (rank-4) and not on `shape[0] > 1`.
 
+### Per-port token origins from the bound ragged offsets (SDPA THD backward, SM80)
+
+A ragged graph binds one ragged-offset tensor per port, and a padded THD layout
+(TE's `cu_seqlens_padded`) puts a sequence's rows somewhere other than
+`prefix(lengths)`. The FROST THD lowerings used to derive every sequence base as
+`prefix(lengths) × token stride` and never read the offset values, so such a
+graph was accepted and mis-addressed (issue #737). The SM80 backward now reads
+them: the setup launch (`thd_helpers.build_thd_sm80_bwd_meta_kernel`) writes,
+after the shared `[seq_kv | cu_q | cu_k | …]` metadata, one **token origin per
+port and sequence**, `org_p[b] = ro_p[b] × M_p / ts_p` — `M_p` the port's
+`ragged_offset_multiplier` and `ts_p` its token stride, both plan-time
+constexprs; `ro_p` the bound device tensor. A port bound without an offset
+copies its side's `cu`, so the direct adapter and the standalone wrapper are
+unchanged. The block is an append-only extension of `tile_dsl.thd`'s layout
+(`THD_ORG_OFF`, `THD_ORG_META_WORDS`) that the other rows can adopt.
+
+Two kinds of row origin then coexist in the kernels. The **internal** packed
+buffers — the fp32 dQ accumulator, `do_dot`, the GQA dK/dV partials — stay at
+`prefix(lengths)` (`cu_q` / `cu_k`), so their sizing from the declared totals
+does not change and the lengths keep feeding the masks and loop bounds. The
+**caller's** ports are addressed through `ORG`: the Q/dO loads and the Stats
+read on the Q side, the K/V loads and the direct-bound dK/dV stores on the KV
+side, and the bounded dQ cast and dK/dV fold, which iterate `(sequence, row)`
+over the envelope `S_max` and write `org_p[b] + row` for `row < len[b]` only.
+The rows in the gaps between sequences are never read or written.
+
+Contract: **offsets are whole tokens.** The setup kernel checks the remainder;
+a violation cannot be declined at plan time (the values are device data), so
+the sequence is marked **dead** on every port (`THD_ORG_DEAD`): the kernels see
+length 0, its rows stay untouched (there is no correct address to write to),
+and the metadata flag word is set for a test to assert on. The declared
+`max_total_seq_len_q/kv` must cover the padded span of each side, which is
+what a padded-THD producer declares. `Capabilities.thd_ragged_offsets` names
+the rows that read the offsets; it gates only the rules that assumed
+`prefix(lengths)` addressing (the head-major Stats head-stride bound).
+
 ### Accept means run
 
 For a python plan, `check_support()` accepted ⇒ `build_plans()` and
