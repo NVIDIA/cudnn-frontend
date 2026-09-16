@@ -281,8 +281,10 @@ def test_paged_graph_partial_pack_gqa(hnd, h, kh, s_q):
     right causal at S_q > 1 with Stats out: the packed epilogue scatters LSE
     over the p head rows, the mask predicate is per token, and the KV head is
     packed head // (G / p); a slip in any of the three shows up here.  Lengths
-    include a 1-token sequence, so at S_q = 8 seven of its rows are dead."""
-    plan = _run_graph(4, h, kh, D, 16, -(-1100 // 16), [300, 77, 1, 1100], hnd, s_q=s_q, causal_br=s_q > 1, stats=True)
+    include a 1-token sequence, so at S_q = 8 seven of its rows are dead.  A
+    packed head holds S_q * p <= 32 live rows -- one CTA's worth -- so the
+    decode-shaped rule leads with cga1 here too."""
+    plan = _run_graph(4, h, kh, D, 16, -(-1100 // 16), [300, 77, 1, 1100], hnd, s_q=s_q, causal_br=s_q > 1, stats=True, want_cga=1)
     assert plan.knobs.pack_gqa is True, plan.knobs
 
 
@@ -421,9 +423,11 @@ def test_paged_graph_mtp_bottom_right_cga1(s_q, window, pack_gqa):
 
 @pytest.mark.L0
 def test_paged_graph_group_not_dividing_tile_runs_unpacked_cga1():
-    """H/H_kv = 12 (a 96/8-style group) cannot pack a 128-row tile: each head is
-    its own one-live-row unit -- still one CTA's worth, so cga1 leads unpacked."""
-    plan = _run_graph(4, 24, 2, D, 16, 64, [1000, 1, 0, 1024], hnd=True, dtype=torch.bfloat16, stats=True, want_cga=1)
+    """H/H_kv = 3 shares no factor with the 128-row tile, so nothing packs (a
+    group with a common factor packs its largest divisor -- partial PackGQA,
+    test_paged_graph_partial_pack_gqa): each head is its own one-live-row
+    unit -- still one CTA's worth, so cga1 leads unpacked."""
+    plan = _run_graph(4, 24, 8, D, 16, 64, [1000, 1, 0, 1024], hnd=True, dtype=torch.bfloat16, stats=True, want_cga=1)
     assert plan.knobs.pack_gqa is False, plan.knobs
 
 

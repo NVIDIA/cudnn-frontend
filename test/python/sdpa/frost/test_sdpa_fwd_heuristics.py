@@ -504,13 +504,13 @@ _DENSE = dict(has_paged_kv=False, padded=False, page_size=0)
         dict(),  # S_q=1, G=16 packed: 16 live rows
         dict(h_kv=8),  # G=8
         dict(h_q=8, h_kv=8),  # MHA, nothing to pack: 1 live row
-        dict(h_q=96, h_kv=8),  # G=12 does not divide the tile -> unpacked, 1 live row per head
+        dict(h_q=96, h_kv=8),  # G=12 does not divide the tile -> packs 4 of 12 (partial PackGQA): 4 live rows per packed head
         dict(s_q=4, causal=True, bottom_right=True),  # MTP
         dict(s_q=16),  # 16 * 16 = 256 rows: exactly one CTA
         dict(**_DENSE),  # dense decode
         dict(s_q=8, causal=True, bottom_right=True, window_left=255, has_paged_kv=False, padded=True, page_size=0),  # dense padded MTP + SWA
     ],
-    ids=["fi_64_4", "fi_64_8", "mha", "unpacked_96_8", "mtp4_br", "one_cta_exactly", "dense_decode", "dense_mtp_swa"],
+    ids=["fi_64_4", "fi_64_8", "mha", "partial_pack_96_8", "mtp4_br", "one_cta_exactly", "dense_decode", "dense_mtp_swa"],
 )
 def test_d128_decode_shaped_launch_leads_with_cga1(over):
     """S_q * G <= 256: the lead plan is cga1 on the plain scheduler, and no set

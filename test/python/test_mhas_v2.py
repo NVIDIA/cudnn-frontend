@@ -866,7 +866,7 @@ def test_sdpa_fwd_paged_decode_mtp_frost_L0(env_info, test_no, request, cudnn_ha
         batches=RandomBatchSize(min=1, max=64, with_high_probability=[8,32]),
         s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=8, s_kv_max=8192, s_q_distribution={"s_q=1":6, "s_q=random":4}),
         d_qk_d_v=RandomHiddenDimSize(d_qk_min=8, d_qk_max=128, d_v_min=8, d_v_max=128, head_dim_distribution={"d_qk=d_v":3, "d_qk=random":1}, with_high_probability=[(128,128), (64,64)]),
-        head_count=RandomChoice({(64, 4, 4) : 3, (64, 8, 8) : 2, (16, 4, 4) : 1, (24, 2, 2) : 1, (8, 1, 1) : 1, (32, 32, 32) : 1}),  # (h_q, h_k, h_v): 16:1, 8:1, 4:1, 12:1 (unpacked), MQA, MHA
+        head_count=RandomChoice({(64, 4, 4) : 3, (64, 8, 8) : 2, (16, 4, 4) : 1, (24, 2, 2) : 1, (8, 1, 1) : 1, (32, 32, 32) : 1}),  # (h_q, h_k, h_v): 16:1, 8:1, 4:1, 12:1 (partial PackGQA: packs 4 of 12), MQA, MHA
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=4, right_window_only=1, band_around_diag=1, no_mask=6),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 3}),
