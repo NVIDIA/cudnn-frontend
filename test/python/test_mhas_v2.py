@@ -109,8 +109,27 @@ def _frost_engines_enabled():
     from cudnn.engines.manifest import opt_in_engines_enabled
     return opt_in_engines_enabled()
 
+def _frost_sm100_unavailable_reason(engine="sdpa_fwd_prefill_sm100"):
+    """Why the FROST SM100 f16/bf16 row would NOT serve a graph here, or None when it
+    would: the engines must be opted in, the device a pre-Rubin Blackwell (cc 10.0-10.6,
+    the row's arch domain) and a CuTe DSL at the FROST floor importable (the row declines
+    without one and the native backend then serves the graph)."""
+    if not _frost_engines_enabled():
+        return "CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required (FROST engines are opt-in)"
+    major, minor = torch.cuda.get_device_capability()
+    if not (100 <= major * 10 + minor <= 106):
+        return f"{engine} serves cc 10.0-10.6 only; device is cc {major}.{minor}"
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        return "needs the cutedsl extra (nvidia-cutlass-dsl) at the FROST floor"
+    return None
+
 def _sq1_sink_token():
-    if _frost_engines_enabled():
+    # Draw the sink only where the FROST SM100 row can serve it (opt-in AND arch AND DSL,
+    # not the opt-in alone): elsewhere a sink at s_q == 1 is declined by every engine and
+    # exec_sdpa could only report it as a WAIVED skip, silently losing the draw.
+    if _frost_sm100_unavailable_reason() is None:
         return RandomChoice({True : 1, False : 3})
     return RandomChoice({False : 4})
 
@@ -484,16 +503,11 @@ def _require_frost_sm100(engine="sdpa_fwd_prefill_sm100"):
     sweeps' sink draw does -- _frost_engines_enabled) and a usable CuTe DSL (the
     row declines without one and the native backend could then serve the graph,
     which the routing assertion must not count as a failure of FROST).
-    Elsewhere they skip instead of failing."""
-    major, minor = torch.cuda.get_device_capability()
-    if not (100 <= major * 10 + minor <= 106):
-        pytest.skip(f"{engine} serves cc 10.0-10.6 only; device is cc {major}.{minor}")
-    if not _frost_engines_enabled():
-        pytest.skip("CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required: this test asserts FROST routing")
-    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
-    installed, version = cutedsl_state()
-    if not installed or cutedsl_too_old(version):
-        pytest.skip("needs the cutedsl extra (nvidia-cutlass-dsl) at the FROST floor")
+    Elsewhere they skip instead of failing. Same prerequisites as the s_q == 1
+    sweeps' sink draw (_frost_sm100_unavailable_reason)."""
+    reason = _frost_sm100_unavailable_reason(engine)
+    if reason is not None:
+        pytest.skip(f"{reason}: this test asserts FROST routing")
 
 
 def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100", cga=None):

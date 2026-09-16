@@ -732,7 +732,6 @@ def test_dsl_sm100_sink(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_pack_gqa_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "d,s_q,pack_gqa",
@@ -748,6 +747,10 @@ def test_dsl_sm100_decode_sink(d, s_q, pack_gqa):
     graph-validity error; it is the backend engines' support-surface rule, and
     this row serves the combination (the sink fold is independent of S_q)."""
     _require_dsl()
+    if _SM == 107 and pack_gqa:
+        # Only the packed cases lack a path on the ported Rubin f16 kernels
+        # (row: pack_gqas={False}); the unpacked S_q == 1 sink case must still run there.
+        pytest.skip("no PackGQA path in the ported Rubin f16 kernels")
     dtype = torch.float16
     b, h_q, h_kv, s_kv = 3, 8, 2, 1024
     scale = 1.0 / math.sqrt(d)
