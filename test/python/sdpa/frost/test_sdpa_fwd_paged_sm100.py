@@ -433,15 +433,68 @@ def test_paged_graph_prefill_shaped_keeps_cga2():
     _run_graph(2, 4, 4, D, 16, 32, [500, 128], hnd=False, s_q=300, want_cga=2)
 
 
+def _sm_count():
+    """SM count of the current device, from the owner the heuristics GPU test
+    reads too (test_sdpa_fwd_heuristics's split_kv-by-name case)."""
+    from cudnn._device import device_info
+
+    return device_info(torch.cuda.current_device()).sm_count
+
+
+_B200_SMS = 148  # the part the split choices below were measured on
+
+
+def _device_lead_split(B, H, KH, s_kv, *, s_q=1, causal_br=False, dtype=torch.float16, page_size=16):
+    """The KV split the heuristics lead with for this paged graph ON THIS DEVICE:
+    ``recommend`` fed the graph's facts and the device's SM count. A split is a
+    wave-count decision -- the 64-CTA launch that idles half of a 148-SM part
+    and splits in two fills a 68-SM part and stays unsplit -- so the graph
+    tests below assert the lead against the model rather than against one
+    part's number (the fixed 148-SM choices stay pinned in
+    test_sdpa_fwd_heuristics) and run whatever the device leads with."""
+    import cudnn
+    from cudnn.sdpa.fwd.engines import engine_name
+    from cudnn.sdpa.fwd.heuristics import recommend
+    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+
+    facts = SdpaGraphFacts(
+        b=B,
+        h_q=H,
+        h_kv=KH,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=D,
+        d_v=D,
+        dtype=cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16,
+        causal=causal_br,
+        bottom_right=causal_br,
+        padded=True,
+        has_paged_kv=True,
+        page_size=page_size,
+        wants_stats=True,
+        device_cc=torch.cuda.get_device_capability(),
+        device_sm_count=_sm_count(),
+    )
+    plans = recommend("A", facts, {engine_name(): 0})
+    assert plans, "the f16 row must serve this graph"
+    return plans[0].knobs.split_kv
+
+
 @pytest.mark.L0
-@pytest.mark.parametrize("s_q,lead_split", [(64, 1), (16, 2)], ids=["chunk64_unsplit", "chunk16_split2"])
-def test_paged_graph_small_batch_chunk_splits_only_where_the_combine_is_cheap(s_q, lead_split):
+@pytest.mark.parametrize("s_q,b200_split", [(64, 1), (16, 2)], ids=["chunk64_unsplit", "chunk16_split2"])
+def test_paged_graph_small_batch_chunk_splits_only_where_the_combine_is_cheap(s_q, b200_split):
     """b=8, GQA 32:8, bottom-right causal over a 4k paged cache: one CTA's rows
-    per unit at cga1 and a launch that leaves half the machine idle. The wave
-    model splits the S_q=16 chunk (4096 combine rows; B200 63.8 -> 49.4 us
+    per unit at cga1 and a launch that leaves half of a B200 idle. There the
+    wave model splits the S_q=16 chunk (4096 combine rows; 63.8 -> 49.4 us
     against the pre-change cga2 plan) and leaves the S_q=64 chunk unsplit
-    (16384 combine rows; its split 2 measured 75.0 us against 67.6 us). Both
-    run under the sync-debug guard and check every row, keyless ones included."""
+    (16384 combine rows; its split 2 measured 75.0 us against 67.6 us) -- the
+    ids name those 148-SM choices, pinned when the device is that part. On
+    any other part the lead is the model's own for its SM count (a 68-SM part
+    fills with the 64 CTAs and leaves both chunks unsplit). Both run under the
+    sync-debug guard and check every row, keyless ones included."""
+    lead_split = _device_lead_split(8, 32, 8, 4096, s_q=s_q, causal_br=True)
+    if _sm_count() == _B200_SMS:
+        assert lead_split == b200_split, f"the measured 148-SM choice moved: split_kv={lead_split}"
     plan = _run_graph(
         8, 32, 8, D, 16, 256, [4096, 3000, 77, 0, 1, 4095, 129, 2048], hnd=False, stats=True, s_q=s_q, causal_br=True, want_cga=1, lead_split=lead_split
     )
@@ -449,15 +502,20 @@ def test_paged_graph_small_batch_chunk_splits_only_where_the_combine_is_cheap(s_
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("H,KH,s_kv,lead_split", [(16, 2, 32768, 32), (64, 4, 4096, 8)], ids=["b1_16_2_32k_split32", "b1_64_4_4k_split8"])
-def test_paged_graph_few_unit_long_kv_splits_to_the_latency_floor(H, KH, s_kv, lead_split):
+@pytest.mark.parametrize("H,KH,s_kv,b200_split", [(16, 2, 32768, 32), (64, 4, 4096, 8)], ids=["b1_16_2_32k_split32", "b1_64_4_4k_split8"])
+def test_paged_graph_few_unit_long_kv_splits_to_the_latency_floor(H, KH, s_kv, b200_split):
     """b=1 decode with two or four KV heads: the whole launch is a handful of
     cga1 CTAs, so the wave model splits the KV loop across the idle SMs -- and
     stops where a finer split's partials cost the lone combine block more than
-    the loop saves (choose_split_kv's COMBINE_FLOOR): 32 splits over the 32k
-    cache (B200 39.7 us; 64 measured 50.8) and 8 over the 4k one (20.3 us; 16
-    measured 22.3). Runs the split lead under the sync-debug guard and checks
-    O and Stats against the fp32 gather reference."""
+    the loop saves (choose_split_kv's COMBINE_FLOOR): on a B200, 32 splits over
+    the 32k cache (39.7 us; 64 measured 50.8) and 8 over the 4k one (20.3 us;
+    16 measured 22.3) -- the ids name those 148-SM choices, pinned when the
+    device is that part; on any other part the lead is the model's own for its
+    SM count. Runs the lead under the sync-debug guard and checks O and Stats
+    against the fp32 gather reference."""
+    lead_split = _device_lead_split(1, H, KH, s_kv, dtype=torch.bfloat16)
+    if _sm_count() == _B200_SMS:
+        assert lead_split == b200_split, f"the measured 148-SM choice moved: split_kv={lead_split}"
     plan = _run_graph(1, H, KH, D, 16, s_kv // 16, [s_kv], hnd=False, dtype=torch.bfloat16, stats=True, want_cga=1, lead_split=lead_split)
     assert plan.knobs.pack_gqa is True and plan.knobs.sched_policy == 0, plan.knobs
 

@@ -462,19 +462,22 @@ def test_sdpa_random_lean_attn_unified_L1(env_info, test_no, request, cudnn_hand
 def _require_frost_sm100(engine="sdpa_fwd_prefill_sm100"):
     """The functions below ASSERT that a FROST engine served the graph, so they
     run only where that engine is offered: a pre-Rubin Blackwell (cc 10.0-10.6)
-    with the FROST engines opted in and a CuTe DSL at the FROST floor (the row
-    declines an older or absent DSL and the native backend then serves the
-    graph correctly -- a legitimate fallback the routing assertion must not
-    report as a failure of FROST).  Elsewhere they skip instead of failing."""
+    with the FROST engines opted in and the cutedsl extra at the engines' floor
+    (the engine declines a missing or too-old DSL and the native backend then
+    serves the graph correctly, so the routing assertion is a claim only where
+    the DSL is usable; the check is the strict frost suites' own,
+    frost_test_utils.requires_dsl, not a third copy).  Elsewhere they skip
+    instead of failing."""
+    from sdpa.frost.frost_test_utils import _dsl_usable
+
     major, minor = torch.cuda.get_device_capability()
     if not (100 <= major * 10 + minor <= 106):
         pytest.skip(f"{engine} serves cc 10.0-10.6 only; device is cc {major}.{minor}")
     if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
         pytest.skip("CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required: this test asserts FROST routing")
-    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
-    installed, version = cutedsl_state()
-    if not installed or cutedsl_too_old(version):
-        pytest.skip("needs the cutedsl extra (nvidia-cutlass-dsl) at the FROST floor")
+    dsl_ok, why_not = _dsl_usable()
+    if not dsl_ok:
+        pytest.skip(f"{engine} cannot be offered: {why_not}")
 
 
 def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100", cga=None):
