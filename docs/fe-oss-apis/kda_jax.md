@@ -35,6 +35,8 @@ boundaries. Empty individual sequences preserve their initial state (or zero).
 
 The state is V-major. It is a differentiable array, not a mutable cache. Pass the
 returned state explicitly to the next call, including inside `jax.lax.scan`.
+The native engine's paged-state and in-place state options remain supported for
+torch; this JAX API does not expose `state_indices` or `overwrite_initial_state`.
 
 ## Usage
 
@@ -217,6 +219,13 @@ extension; no host virtualenv or compiled extension is mounted. GPU CI must
 invoke the pytest command explicitly: an import-only check does not run KDA
 forward/backward kernels.
 
+After rebasing onto `fd409b43d`, all 26 KDA JAX tests passed locally in 236.99
+seconds and in the source-built, torch-free container above in 272.08 seconds,
+with zero skips. The targeted native suite passed 27 cases in 317.31 seconds, covering
+paged states with dense/padded pool strides, in-place forward/backward state
+updates, coarse checkpoints, strided inputs, separate streams, gate options and
+CUDA-graph replay. One GDN2-only beta-guard case was skipped for KDA.
+
 Validated the shared program on SM100 on 2026-09-15: the frontend source build
 in `nvcr.io/nvidia/jax:26.07-py3` succeeded and **57 tests passed, zero skipped**
 in 347.66 seconds, with CuTeDSL 4.7.1 and no PyTorch installation. This includes
@@ -234,6 +243,9 @@ was skipped for KDA. The new JAX scheduling regression failed against the old
 piece-chain override before passing with automatic engine selection.
 
 ## Measurements and remaining blocker
+
+These measurements predate the rebase onto `fd409b43d`, which changed upstream
+kernel interfaces and launch code. Performance has not been remeasured after that rebase.
 
 Shared-program measurements (2026-09-15), SM100, BF16 THD T=1024, H=4,
 K=V=128, one sequence, no recurrent state or optional gate parameters,

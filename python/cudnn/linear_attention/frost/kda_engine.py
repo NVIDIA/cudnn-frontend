@@ -20,8 +20,8 @@ from .engine import FrostLaPlan, frost_la_gate, summary_support_gates
 
 def build_kda(graph):
     """Import the kernel module (pulls in the Cutlass primitives) and wrap the
-    single node; cute.compile is cached inside the kernel per static config and
-    runs on first execute, when the real buffers are known."""
+    single node; the shared program compiles once per plan on first native
+    execute, when the real buffers are known, or during JAX lowering."""
     nodes = list(graph.nodes)
     if len(nodes) != 1 or getattr(nodes[0].node_type, "name", None) not in ("KDA", "KDA_BWD"):
         raise ValueError("build_kda: graph does not contain exactly one KDA/KDA_BWD node")
