@@ -1263,6 +1263,13 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     trim is carried since #1037).  Optional stats IS served (``lse_optional=True`` below -- has_lse=False
     is a real specialization on every Rubin kernel, not an accepted-and-ignored
     flag).  See _sm107_spec for the same list on f16.
+
+    Fused epilogue gate (PR-B, 2026-09-15): the d256 MXFP8 body carries the same
+    ``O := O * sigmoid(G)`` hook as the f16 / per-tensor FP8 d256 kernels, so
+    this row claims it at EXACTLY (256, 256) through the shared constant, with a
+    bf16 G (the kernel's GATE_STORAGE_DTYPE).  A gated e4m3 O is written
+    UNSCALED -- the MXFP8 kernel has no per-tensor scale_o (block scales
+    dequantize in-MMA), which is the same O the ungated row writes.
     """
     return EngineSpec(
         name="sdpa_fwd_prefill_sm107_mxfp8",
@@ -1329,6 +1336,12 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             # heuristics.py:492 enforces it, so the row cannot declare otherwise).
             cgas_by_d_shape=((((256, 256), frozenset({1})),)),
             pack_gqas=frozenset({False}),
+            # Fused epilogue gate: the d256 MXFP8 body carries the seams; ONE
+            # constant with the f16 / FP8 rows and the adapter twin (rule 8b').
+            # G is bf16 (the kernel stages a bf16 gate tile, never an e4m3 one).
+            epilogue_gate=True,
+            epilogue_gate_d_shapes=SM107_EPILOGUE_GATE_SHAPES,
+            epilogue_gate_dtypes=frozenset({cudnn.data_type.BFLOAT16}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )

@@ -26,7 +26,7 @@ Skips cleanly otherwise.
 """
 
 import math
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import pytest
 import torch
@@ -203,6 +203,8 @@ def _run(
     return_lse=False,
     poison_tmem_before_execute: bool = False,
     k_tile_growth: float = 1.0,
+    gate: Optional[torch.Tensor] = None,
+    amax: bool = True,
 ):
     """Quantize, build the sdpa_mxfp8 graph, route to the frost engine, execute.
 
@@ -210,6 +212,11 @@ def _run(
     tile raises the row max past the kernel's RESCALE_THRESHOLD and the
     correction path rescales O on every iteration (see
     ``test_mxfp8_d256_causal_rescale_every_tile``).
+
+    Append-only knobs (PR-B): ``gate`` (a bf16 BHSD-logical tensor of O's shape)
+    adds the epilogue-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul`` and
+    folds sigmoid(G) into the reference; ``amax=False`` leaves ``Amax_O`` a
+    virtual (unrequested) port, which the engine folds out (has_amax_o=False).
 
     Returns ``_RunResult`` or, when ``return_lse`` is set,
     ``_RunWithStatsResult``.
@@ -233,7 +240,7 @@ def _run(
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
     Ob = torch.empty(B, S, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
     lse = make_dense_stats(B, H_q, S, stats_layout)
-    amax = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
+    amax_buf = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
     sfq_g = sfq.view(torch.uint8).reshape(B, H_q, sqp, dsc)
     sfk_g = sfk.view(torch.uint8).reshape(B, H_kv, skp, dsc)
     sfv_g = sfv.view(torch.uint8).reshape(B, H_kv, ssc, dvp)
@@ -272,10 +279,20 @@ def _run(
         vp[skv_h] = slk
     kw.update(sdpa_kwargs)
     o, stats_t, amax_o = g.sdpa_mxfp8(**kw)
+    if gate is not None:
+        # Epilogue-gate tail: O_v stays VIRTUAL but DECLARED (dim + stride), the mul output is the real O.
+        o.set_dim(list(Ob.shape)).set_stride(list(Ob.stride()))
+        gate_t = g.tensor_like(gate)
+        vp[gate_t] = gate
+        o = g.mul(a=o, b=g.sigmoid(input=gate_t, name="sig"), name="gated")
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(otype)
     if stats:
         stats_t.set_output(True).set_dim([B, H_q, S, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
-    amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    if amax:
+        amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    # amax=False: Amax_O is UNREQUESTED and left exactly as the block leaves it -- virtual, undeclared,
+    # never bound.  sdpa_mxfp8 infers its [1, 1, 1, 1] dims the way sdpa_fp8 does, and a virtual
+    # Amax_O is what makes the engine fold the atomic out (has_amax_o=False).
 
     g.validate()
     g.build_operation_graph()
@@ -287,7 +304,9 @@ def _run(
         # No Stats output: the kernel compiles the LSE store out (has_lse=False)
         # — no dummy buffer exists at any level, so the dense workspace is 0.
         assert g.get_workspace_size() == 0
-    vp.update({o: Ob, amax_o: amax})
+    vp[o] = Ob
+    if amax:
+        vp[amax_o] = amax_buf
     if stats:
         vp[stats_t] = lse
     workspace = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -298,13 +317,17 @@ def _run(
         poison_vp[skv_h] = torch.full_like(slk, S)
         g.execute(poison_vp, workspace)
         torch.cuda.synchronize()
-        amax.zero_()
+        amax_buf.zero_()
     g.execute(vp, workspace)
     torch.cuda.synchronize()
 
     ref_kwargs = {k2: v2 for k2, v2 in _ref_from_sdpa(sdpa_kwargs).items()}
     if sink is not None:
         ref_kwargs["sinks"] = sink.flatten()
+
+    def _gated(o_ref):
+        return o_ref * torch.sigmoid(gate.float()).to(o_ref.dtype) if gate is not None else o_ref
+
     if return_lse:
         assert stats, "return_lse requires stats=True"
         o_ref, lse_ref = _ref(
@@ -317,9 +340,9 @@ def _run(
             return_stats=True,
             **ref_kwargs,
         )
-        return _RunWithStatsResult(Ob, o_ref, amax, lse.squeeze(-1), lse_ref)
-    o_ref = _ref(Q8.float() * dqq, K8.float() * dqk, V8.float() * dqv, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kwargs)
-    return _RunResult(Ob, o_ref, amax)
+        return _RunWithStatsResult(Ob, _gated(o_ref), amax_buf, lse.squeeze(-1), lse_ref)
+    o_ref = _gated(_ref(Q8.float() * dqq, K8.float() * dqk, V8.float() * dqv, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kwargs))
+    return _RunResult(Ob, o_ref, amax_buf)
 
 
 def _ref_from_sdpa(sdpa_kwargs):
@@ -566,6 +589,33 @@ def test_mxfp8_d256_masks(in_key, mask):
     )
     _check(O, O_ref, torch.float16, in_key, d_qk=256)
     assert amax.item() > 0.0
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(_SM != 107, reason="the fused epilogue gate (O * sigmoid(G)) is served by the Rubin (sm107) d256 rows only")
+@pytest.mark.parametrize("out_key", ["bf16", "e4m3"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_gate_tail_graph_api(out_key):
+    """Rubin graph-path e2e for the MXFP8 row's gate claim (PR-B): the 3-node tail
+    on ``sdpa_mxfp8`` with a bf16 G (the only gate dtype the row lists), bf16 and
+    e4m3 O -- the e4m3 O is UNSCALED (the block-scale kernel has no per-tensor
+    scale_o).  ``Amax_O`` is the amax of the GATED value and a COMPILE-TIME fact:
+    a graph that does not request it (``amax=False`` -> has_amax_o=False, the
+    atomic folded out) produces a BITWISE identical O."""
+    scale = 1.0 / math.sqrt(256)
+    gate = (torch.randn(1, 512, 8, 256, device="cuda") * 2.0).to(torch.bfloat16).transpose(1, 2)
+    runs = {}
+    for amax in (True, False):
+        torch.manual_seed(0)  # _run draws Q/K/V from the global RNG: both specializations must see the same problem
+        runs[amax] = _run(1, 8, 8, 512, "e4m3", _OUT[out_key], scale=scale, sdpa_kwargs=dict(use_causal_mask=True), d_qk=256, d_v=256, gate=gate, amax=amax)
+    out, o_ref, a_o = runs[True]
+    assert torch.isfinite(out.float()).all(), "unwritten / non-finite O cells"
+    _check(out, o_ref, _OUT[out_key], "e4m3", d_qk=256)  # the reference carries sigmoid(G)
+    assert a_o.item() > 0.0
+    if _OUT[out_key] is torch.bfloat16:
+        torch.testing.assert_close(a_o.item(), out.float().abs().max().item(), atol=0.0, rtol=1e-2)  # the amax of the GATED O
+    assert torch.equal(runs[True].output, runs[False].output), "has_amax_o=False must fold only the Amax_O write out"
+    assert runs[False].amax.item() == 0.0, "the unrequested Amax_O buffer was never bound, so never written"
 
 
 @pytest.mark.L0

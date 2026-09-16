@@ -318,7 +318,7 @@ red (2026-09-08).
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ | ❌ |
 | Split-KV | fp8 only | fp8 only | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ |
-| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ❌ | ❌ | ❌ |
+| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | ❌ |
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ❌ |
@@ -345,8 +345,9 @@ per-tensor FP8 flavor now carries the contract and serves it.
 ᵛⁱ Every Rubin template carries the per-batch `seq_len_q` trim (bounds collapse for tiles past the length, O:=0 / LSE:=−inf on the rows past it; #1037), so the rows claim `padded_stats`.
 ᵛⁱⁱ The f16 Rubin kernels wire no SplitHelpers.
 ᵛⁱⁱⁱ **Fused epilogue gate `O := O * sigmoid(G)`** — a production feature of the
-d256 f16/bf16 and per-tensor FP8 Rubin kernels (`TemplateParams.epilogue_gate`;
-rows `sdpa_fwd_prefill_sm107` and `sdpa_fwd_prefill_sm107_fp8`,
+d256 f16/bf16, per-tensor FP8 and block-scale MXFP8 Rubin kernels
+(`TemplateParams.epilogue_gate`; rows `sdpa_fwd_prefill_sm107`,
+`sdpa_fwd_prefill_sm107_fp8` and `sdpa_fwd_prefill_sm107_mxfp8`,
 `Capabilities.epilogue_gate_d_shapes = config_sm107.SM107_EPILOGUE_GATE_SHAPES`, the
 same constant the standalone adapter's `check_support` twin reads). On the graph it
 is the three-node tail `sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)`
@@ -359,7 +360,7 @@ the final O must be DECLARED (dim + stride, BSHD) — the classic C++
 `pre_validate_node` needs both on the sdpa output and only user-assigned values
 are pushed at lowering, so an undeclared `O_v` is a typed not-supported from
 `validate()` rather than a bare `ValueError` out of planning. `G` is Q's dtype on
-the f16/bf16 row and BF16 on the FP8 row (the kernel stages it in bf16), and must
+the f16/bf16 row and BF16 on the FP8 and MXFP8 rows (the kernels stage it in bf16), and must
 be **BSHD-physical with 16-byte-aligned, non-overlapping seq/head strides**: G is
 TMA-loaded zero-copy (no normalisation copy, unlike Q/K/V/O), so the row declines
 by message exactly the G the standalone adapter's `check_support` rejects
@@ -383,10 +384,38 @@ G; the standalone adapter's `sample_gate` path shares that one contract.
 row:** only a `set_output(True)` `Amax_O` is a fact (`facts.amax_o_t =
 _real_output(...)`) — an unrequested (virtual) `Amax_O` is no longer bound or
 written, so a quantized graph that leaves `Amax_O` virtual now EXECUTES where it
-used to raise "the variant pack is missing buffers"; on the Rubin FP8 d256 kernel
-the graph path passes `has_amax_o=False` so the amax atomic folds out, while the
-SM100 fp8 / every mxfp8 kernel (no `has_amax` compile knob) keeps its legacy dummy
-amax slot. MXFP8 gate: PR-B.
+used to raise "the variant pack is missing buffers"; on the Rubin FP8 and MXFP8 d256
+kernels the graph path passes `has_amax_o=False` so the amax atomic folds out, while
+the SM100 fp8 and the other mxfp8 kernels (no `has_amax` compile knob) keep their
+legacy dummy amax slot. **MXFP8 gate (PR-B, 2026-09-15):** the d256 block-scale
+kernel carries the same 16 seams through the shared `_common_blackwell` hook; the
+gate `SmemTile` is declared AFTER the four scale-factor slabs (with a bf16 O at
+`STAGES_KV=2` a gate declared before them would put `sQ_SF` at exactly 262144, past
+the version-0 tcgen05 descriptor window the kernel pins, and the UTCCP would copy Q
+data as scale factors — `config_sm107.d256_mxfp8_last_sf_tile_start` plus the
+kernel's own `_LAST_SF_TILE_START` guard raise on any depth / O dtype that crosses
+it). The MXFP8 kernel has no per-tensor `scale_o`, so a gated **e4m3 O is written
+UNSCALED** — the same unscaled e4m3 O the ungated MXFP8 row writes; a scaled
+quantized gated O needs a bf16 O and a downstream quantize. Numerics as on FP8:
+gate on the fp32 accumulator, dead-row select after the gate fma, LSE bit-independent
+of the gate. Validated on the standalone adapter on EVERY dtype member the row claims
+with the gate -- inputs {e4m3, e5m2} x outputs {fp16, bf16, e4m3, e5m2}, one Rubin
+launch each against the dequantized oracle (`test_sm107_mxfp8_gate_matches_the_dequant_oracle`,
+e4m3-in also dense 512 + causal 1000 at bf16 and e4m3 O; e5m2-in at the suite's 8e-2
+half-O bound), plus the padded dead entry (bf16 / e4m3 O), and on the graph path
+(`test_mxfp8_gate_tail_graph_api`, e4m3 in, bf16 / e4m3 O). **One-time
+gate-off == shipped proof (2026-09-15, Rubin dev node):** the working-tree kernel with
+`epilogue_gate=False, has_amax=True` produced O, LSE and `Amax_O` BITWISE equal to the
+pre-gate develop kernel (`18091c19`, #1059) at B=2 H=8 H_kv=2 S=1000 causal, e4m3 in /
+bf16 O, through the same adapter marshalling
+(`test_sm107_mxfp8_gate_off_is_bitwise_the_shipped_kernel`; the test SKIPS once develop
+itself carries the gate, so this footnote is where the evidence lives). The ungated
+sm_107a SASS is byte-identical to develop's apart from the param-space offsets of the
+unread gate descriptor (STL/LDL 6 = 6); the GATED MXFP8 module carries 25 STL/LDL (an
+L1-resident refill in the 40-register TMA-LDG / TMA-STG / scheduler warps around the
+`setmaxnreg` boundary, 0 in the gate math; the f16 and per-tensor FP8 gated bodies stay
+at 6) whose cost is UNMEASURED until a perf-node A/B/A -- a correctness claim, not yet a
+perf one.
 
 ᶻ **f16/bf16 THD is served on EVERY flavor** as of 2026-09-09 (d128, d192×d128,
 d256, d512), and per-tensor FP8 THD at d128 and d192×d128. The f16 bodies were
@@ -691,7 +720,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | Bias forward | SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
 | Paged KV cache | every arch except SM100/SM103 f16/bf16 d128 forward (see ᵖ); fp8/mxfp8 pools, sink, THD, packed block tables everywhere |
-| Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16 and per-tensor FP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table); MXFP8 is PR-B |
+| Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16, per-tensor FP8 and MXFP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table) |
 | PackGQA of a group sharing no factor with the 128-row tile (G = 3, 5, 7, …), and partial packing outside the SM100/SM103 f16/bf16 d128 / d256 kernels | every arch — such groups run unpacked (see ᵐ); the d192×d128 / d512 f16 and the fp8 / mxfp8 kernels pack the whole group only |
 
 ᵏ **THD / ragged forward layout.** Q/K/V/O must be BSHD-ordered over **(H, S, D)**
