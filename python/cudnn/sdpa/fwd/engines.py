@@ -362,6 +362,15 @@ class Capabilities:
     # the gate in Q's storage dtype); the quantized rows name the half dtype
     # their kernel stages it in (bf16 on the Rubin FP8 d256 kernel).
     epilogue_gate_dtypes: Optional[frozenset] = None
+    # Flavors whose kernel packs a PROPER DIVISOR of the GQA group when the
+    # group does not divide tile_m (partial PackGQA: 96/8 packs 4 of its 12
+    # heads per token row-group, 48/8 packs 2; config_sm100.pack_gqa_group_size).
+    # None = every flavor keeps the full-ratio contract (the group must divide
+    # tile_m, or PACK_GQA=1 is declined).  Native on the SM100 d128 / d256 f16
+    # kernels; the d192x128 / d512 kernels pack HEADS_PER_TILE = G.
+    # APPENDED after the epilogue-gate fields (append-only contract above):
+    # test_capabilities_positional_prefix_is_append_only pins the tail.
+    pack_gqa_partial_d_shapes: Optional[frozenset] = None
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -391,6 +400,12 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") ->
         if facts.d_qk <= shape[0] and facts.d_v <= shape[1] and ((facts.d_qk, facts.d_v) == shape or min(facts.d_qk, facts.d_v) > floors.get(shape, 0))
     ]
     return min(covering, key=lambda shape: (shape[0], shape[1])) if covering else None
+
+
+def pack_gqa_partial(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+    """Whether the flavor this graph lowers onto packs a proper divisor of a
+    GQA group that does not divide tile_m (``pack_gqa_partial_d_shapes``)."""
+    return capabilities.pack_gqa_partial_d_shapes is not None and _selected_d_shape(capabilities, facts) in capabilities.pack_gqa_partial_d_shapes
 
 
 def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> frozenset[int]:
@@ -502,8 +517,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 # tile interleaves (token, head) rows the box cannot address.
                 return "PackGQA cannot ride the fused epilogue gate"
             _pg_tile_m = knobs.tile_m if knobs.tile_m is not None else max(capabilities.tile_ms)
-            if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m):
-                return f"PackGQA requires h_q/h_kv to divide tile_m: h_q/h_kv = {facts.h_q}/{facts.h_kv} does not tile at tile_m={_pg_tile_m}"
+            _partial = pack_gqa_partial(capabilities, facts)
+            if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m, partial=_partial):
+                return (
+                    f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} tile_m: "
+                    f"h_q/h_kv = {facts.h_q}/{facts.h_kv} does not pack at tile_m={_pg_tile_m}"
+                )
     cc = facts.device_cc
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
@@ -807,6 +826,11 @@ def _sm100_spec() -> EngineSpec:
             # split_kv > 1 (dense f16 only; see mismatch's facts x knobs gate).
             split_kv_supported=True,
             pack_gqas=frozenset({False, True}),
+            # The d128 / d256 f16 kernels pack a GQA group that does not divide
+            # the 128-row tile by its largest divisor that does (Cfg.PACK_G:
+            # 96/8 -> 4 heads per token row-group); d192x128 / d512 pack the
+            # whole group only.
+            pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256)}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )

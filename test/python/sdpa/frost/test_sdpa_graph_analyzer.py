@@ -670,9 +670,82 @@ def test_knob_request_pack_gqa_on_mha_is_identity():
 
 
 def test_knob_request_pack_gqa_no_pow2_group_rejects_engine():
-    # GQA ratio 3 does not divide tile_m (128) so pack_gqa_supported is False.
+    # GQA ratios 3 and 5 share no factor with tile_m (128): nothing can be
+    # packed, so an explicit pack_gqa=True is not honorable (never degraded).
     g = _mk_gqa_graph(6, 2)
     assert not _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+    assert not _eligible(_mk_gqa_graph(10, 2), engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_knob_request_pack_gqa_partial_group_on_wired_flavors_only():
+    # Partial PackGQA (Capabilities.pack_gqa_partial_d_shapes): a ratio that
+    # shares a factor with tile_m but does not divide it packs that factor on
+    # the d128 and d256 f16 flavors (G=12 -> 4 heads per row group, G=6 -> 2) ...
+    for h_q, h_kv in ((24, 2), (12, 2)):
+        assert engines.engine_name() in _eligible(_mk_gqa_graph(h_q, h_kv), engines.SdpaFwdKnobs(pack_gqa=True))
+        assert engines.engine_name() in _eligible(_mk_gqa_graph(h_q, h_kv, d=256), engines.SdpaFwdKnobs(pack_gqa=True))
+    # ... while the d512 flavor keeps the full-ratio contract (its kernel packs
+    # HEADS_PER_TILE = G), so the same request is declined there.
+    assert not _eligible(_mk_gqa_graph(24, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert engines.engine_name() in _eligible(_mk_gqa_graph(32, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+    # A group larger than the tile (256/1 MQA) packs the whole tile (p = 128,
+    # two packed heads per KV head) on the partial flavors; declined on d512.
+    assert engines.engine_name() in _eligible(_mk_gqa_graph(256, 1), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert not _eligible(_mk_gqa_graph(256, 1, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
+    # The standalone adapter (api_dsl.SdpaFwdDslSm100.check_support) mirrors
+    # Capabilities.pack_gqa_partial_d_shapes as a module tuple because the
+    # adapter has no engine row in hand when it validates a knob request.  Pin
+    # the two together so the gate cannot drift: the f16 SM100 row declares
+    # exactly the adapter's flavors, and no other row (fp8 / mxfp8, the cc 10.7
+    # line, SM120) declares partial packing -- the adapter excludes those too.
+    from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
+
+    by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
+    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256)})
+    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name != engines.engine_name()}
+    assert all(v is None for v in others.values()), others
+
+
+def test_capabilities_positional_prefix_is_append_only():
+    # Capabilities evolves APPEND-ONLY (the contract stated above
+    # pack_gqa_d_shapes): a positional construction written against an older
+    # field order must keep binding the same fields.  Prove it the way it
+    # breaks -- construct positionally in the pre-partial-PackGQA order with
+    # thd_padded_stats=True and check nothing rebinds (inserted mid-class, the
+    # True landed on pack_gqa_partial_d_shapes, thd_padded_stats fell back to
+    # False and the flavor membership test raised TypeError on a bool) -- then
+    # pin the legacy tail and the new field's place after it.
+    import dataclasses
+
+    fields = {f.name: f for f in dataclasses.fields(engines.Capabilities)}
+    names = list(fields)
+    required = {"sm_lo": 100, "sm_hi": 100, "phase": "prefill", "d_shapes": frozenset({(128, 128)})}
+
+    def legacy_value(name):
+        f = fields[name]
+        if name == "thd_padded_stats":
+            return True
+        if f.default is not dataclasses.MISSING:
+            return f.default
+        if f.default_factory is not dataclasses.MISSING:
+            return f.default_factory()
+        return required[name]
+
+    legacy_order = [n for n in names if n != "pack_gqa_partial_d_shapes"]
+    caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
+    assert caps.thd_padded_stats is True
+    assert caps.pack_gqa_partial_d_shapes is None
+    assert caps.epilogue_gate is False
+    assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
+
+    legacy_tail = ["pack_gqa_d_shapes", "thd_padded_stats", "epilogue_gate", "epilogue_gate_d_shapes", "epilogue_gate_dtypes"]
+    start = names.index("pack_gqa_d_shapes")
+    assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
+    assert names[-1] == "pack_gqa_partial_d_shapes", names[-3:]
 
 
 def test_knob_request_pack_gqa_false_always_eligible():

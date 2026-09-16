@@ -379,11 +379,12 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
     ``(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_addr,
     batch_idx, qh_per_kh)`` — flavors differ in whether they apply the
     dead-Q-tile trim, so the split narrowing composes on top of whatever they
-    already do.  ``qh_per_kh`` (trailing, default 1) is the graph's GQA
-    ratio; with CFG.PACK_GQA it is the packing group
-    size: the split chunks the tile's PACKED token-span bounds, so packing
-    and KV split compose; without CFG.PACK_GQA the bounds fold to the classic
-    single-head-per-tile form.
+    already do.  ``qh_per_kh`` (trailing, default 1) is the PACKING GROUP
+    size -- the kernel's HEADS_PER_TILE (``CFG.PACK_G``), which under partial
+    PackGQA is a proper divisor of the graph's GQA ratio -- so the split
+    chunks the tile's PACKED token-span bounds and packing and KV split
+    compose; without CFG.PACK_GQA the bounds fold to the classic
+    single-head-per-tile form and the argument is ignored.
     At SPLIT_KV == 1 every closure below folds away and the traced code is the
     classic single-pass kernel.
     """
@@ -598,6 +599,12 @@ def make_sdpa_helpers(
 
     _cga_m = getattr(CFG, "CGA_M", 1)
     _cta_mma = getattr(CFG, "CTA_MMA", 1)
+    # PackGQA head grouping for the LPT_L2 decode: the grid's head axis is in
+    # PACKED heads (QH / PACK_G) and QH_PER_KH // PACK_G of them read one KV
+    # head -- 1 under full packing, G / p under partial packing (d128 / d256
+    # f16).  A Cfg without PACK_G packs the whole group.
+    _pack_g = int(getattr(CFG, "PACK_G", 0)) or int(getattr(CFG, "QH_PER_KH", 1))
+    _packed_heads_per_kv = max(1, int(getattr(CFG, "QH_PER_KH", 1)) // _pack_g) if CFG.PACK_GQA else 1
 
     @cute.jit
     def _lpt_linear(block_id):
@@ -707,7 +714,8 @@ def make_sdpa_helpers(
     @cute.jit
     def _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, qh_per_kh: int = 1):
         # Token capacity of one CGA super-tile: TILES_Q * TILE_M rows hold
-        # rows/G tokens when packing (CFG.PACK_GQA), else one token per row.
+        # rows / p tokens when packing (CFG.PACK_GQA; ``qh_per_kh`` is the
+        # caller's packed group p = HEADS_PER_TILE), else one token per row.
         tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
         cga_base_super = q_super_idx - cta_in_pair
         q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
@@ -839,7 +847,7 @@ def make_sdpa_helpers(
         if cutlass.const_expr(_thd_on):
             return _thd_decode(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         if cutlass.const_expr(CFG.PACK_GQA):
-            qh_per_kh = cutlass.Int32(1)
+            qh_per_kh = cutlass.Int32(_packed_heads_per_kv)
         return _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
 
     @cute.jit
@@ -847,7 +855,7 @@ def make_sdpa_helpers(
         if cutlass.const_expr(_thd_on):
             return _thd_decode(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         if cutlass.const_expr(CFG.PACK_GQA):
-            qh_per_kh = cutlass.Int32(1)
+            qh_per_kh = cutlass.Int32(_packed_heads_per_kv)
         return _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
 
     @cute.jit

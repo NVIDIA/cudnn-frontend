@@ -94,6 +94,7 @@ MMA as d=512.
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Base-2 stats (`stats_use_log2`) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ ʰ |
+| PackGQA (`PACK_GQA` knob: the GQA group packed into the Q tile)ᵐ | ✅ᵐ partial (d128 envelope) | ✅ᵐ partial | whole group onlyᵐ | ✅ᵐ partial | whole group onlyᵐ | — |
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
@@ -109,8 +110,8 @@ H_kv, D]` storage) declared through the strides — plus `(B, 1, max_pages, 1)` 
 block tables and `use_padding_mask` with `seq_len_q` / `seq_len_kv` (the per-batch KV
 length is read on device; `paged_attention_max_seq_len_kv` defaults to `max_pages *
 page_size`). `page_size` is a multiple of 8 that divides the 128-row KV tile or is a
-multiple of it. Any `S_q` (decode or paged prefill), GQA (PackGQA when the group
-divides the tile), Stats out, and **THD queries**: ragged Q/O (ragged offsets +
+multiple of it. Any `S_q` (decode or paged prefill), GQA (PackGQAᵐ — the whole
+group, or its largest divisor of the tile), Stats out, and **THD queries**: ragged Q/O (ragged offsets +
 `seq_len_q`) over the same pools — chunked prefill — with the THD scheduler walking
 the Q units (no KV split there). KV split is proposed on dense-Q paged graphs (they
 are padded by construction, and `B * H_kv` is far below the SM count at serving batch
@@ -118,6 +119,25 @@ sizes) and recombined by `split_combine_sm100`. Not yet: sink, fp8/mxfp8 pools,
 packed (ragged-offset) block tables. Served by `prefill_d128_f16_sm100.py`'s `PAGED_KV`
 specialization (block-table indirection on the K/V TMA loads; boxes past a
 sequence's live pages are TMA-OOB zero-filled).
+
+ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**
+(`Capabilities.pack_gqa_partial_d_shapes = {(128, 128), (256, 256)}`, `Cfg.PACK_G`).
+A GQA group `G = H_q / H_kv` that divides the 128-row Q tile packs whole (64/4:
+16 heads per token row-group); one that does not packs its largest divisor that
+does, `gcd(G, 128)`: 96/8 (G = 12) packs 4 heads per token row-group with 3
+packed heads per KV head, 48/8 (G = 6) packs 2. A group sharing no factor with
+the tile (G = 3, 5, 7, …) cannot pack — a pinned `PACK_GQA=1` is **declined**
+rather than silently run unpacked, and the heuristics propose only unpacked
+plans; MHA (G = 1) is the identity. **Native** in the d128 and d256 f16 kernels
+(`HEADS_PER_TILE = CFG.PACK_G`; `CFG.QH_PER_KH` stays the GQA ratio for the
+bottom-right diagonal and the LPT_L2 head grouping, whose groups become the
+`G / PACK_G` packed heads of one KV head); d64 rides the d128 envelope. The
+d192×d128 and d512 f16 kernels and every fp8 / mxfp8 kernel pack
+`HEADS_PER_TILE = G` and keep the **whole-group** contract (a non-divisor
+group is declined there). Validated on B200: `test_sdpa_fwd_paged_sm100.py`
+(graph + kernel, G = 12 / 6 / 5 / 3, S_q 1–8 bottom-right causal, HND / NHD),
+`test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_pack_gqa_partial_group` (dense,
+d128 / d256, Stats), and the `test_mhas_v2.py` paged partial-pack sweeps.
 
 ¹ **Reads as: on a quantized (fp8/mxfp8) graph in this column, O may be FP16,
 BF16, E4M3 or E5M2.** It does NOT mean an f16/bf16 graph may convert O — the f16
@@ -672,6 +692,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
 | Paged KV cache | every arch except SM100/SM103 f16/bf16 d128 forward (see ᵖ); fp8/mxfp8 pools, sink, THD, packed block tables everywhere |
 | Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16 and per-tensor FP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table); MXFP8 is PR-B |
+| PackGQA of a group sharing no factor with the 128-row tile (G = 3, 5, 7, …), and partial packing outside the SM100/SM103 f16/bf16 d128 / d256 kernels | every arch — such groups run unpacked (see ᵐ); the d192×d128 / d512 f16 and the fp8 / mxfp8 kernels pack the whole group only |
 
 ᵏ **THD / ragged forward layout.** Q/K/V/O must be BSHD-ordered over **(H, S, D)**
 only — head dim innermost, then heads, then tokens (`graph_analyzer.packed_layout_ok`).
