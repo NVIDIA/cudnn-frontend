@@ -141,11 +141,26 @@ between, so the refill can go out while the math runs. That holds every row's
 operands in registers across the barrier (4 rows x 8 fp32 at the default tile),
 i.e. it spends the exact resource the LDG kernel had to stop spending. Untested;
 worth trying only on a part where this kernel is not already at the ceiling."""
-DEFAULT_FUSED_STORE_WAIT = True
-"""Two loop-ordering choices, both bit-identical and both measured.
+DEFAULT_FUSED_STORE_WAIT = False
+"""Two loop-ordering choices, both measured; the FUSED drain is legal only at ``stages_o >= 2``.
 
 ``fused_store_wait`` moves the store drain onto the barrier the epilogue already
-runs, deleting a whole CTA barrier from the per-tile critical path.
+runs, deleting a whole CTA barrier from the per-tile critical path.  It shipped
+as the default at ``stages_o=1`` and that combination is a WRITE-AFTER-READ RACE
+on ``sOut`` (found 2026-09-15): the fused ``tma_store_wait(stages_o - 1)`` runs
+AFTER tile i's lanes have written ``sOut[s]``, so with one output stage the lanes
+of tile i+1 overwrite ``sOut[0]`` while tile i's bulk store may still be reading
+it -- tile i's GMEM rows then carry tile i+1's normed rows.  Reachable only when a
+CTA processes >= 2 tiles (> SMs x 8 tiles per launch: h_q=32 at S >= 1024 on
+Rubin; the unit test's 640-tile shape never reached it), and it shows up as
+non-deterministic Q rows equal to the reference row of token ``tok + n_ctas /
+q_tiles_per_token`` -- ~0.1 % of rows at S=16K, which moved a downstream causal
+attention's cosine vs a second run to 0.998 and read as a "long-S SDPA bug".
+The fused form needs ``tma_store_wait(stages_o - 2)`` (tile i+1's writer must
+find tile i+1-stages_o's store retired) and therefore ``stages_o >= 2``;
+``compile_qk_norm_rope_tma`` refuses the racy pair.  Its measured gain over the
+unfused drain was +0.5 %, inside the control noise, so the default is the
+unfused drain.
 ``refill_pos=REFILL_AFTER_COMPUTE`` issues the next tile's TMA before the store
 issue and the rstd write rather than after them, so the load overlaps this
 tile's epilogue too.
@@ -494,10 +509,13 @@ def frost_qk_norm_rope_tma(
         #
         # `fused_store_wait` moves that pair onto the barrier the epilogue
         # ALREADY runs, which deletes a whole CTA barrier from the per-tile
-        # critical path. It is correct because the drain runs one iteration
-        # ahead: waiting to `stages_o - 1` outstanding groups just before the
-        # post-compute barrier of tile i retires the store issued at tile
-        # i - stages + 1, and the next writer of this stage is tile i + 1.
+        # critical path. Its drain runs one iteration ahead: the wait sits AFTER
+        # tile i's lanes wrote sOut[s], so the buffer it must protect is the one
+        # tile i+1 writes next, last read by the store of tile i+1-stages_o.
+        # At that point the outstanding groups are tiles <= i-1 (tile i's store
+        # is issued after the barrier), so `tma_store_wait(stages_o - 2)` is the
+        # bound -- which needs stages_o >= 2.  `stages_o - 1` at stages_o=1 was
+        # the WAR race described at DEFAULT_FUSED_STORE_WAIT.
         if cutlass.const_expr(not fused_store_wait):
             if warp_id == 0:
                 if nvvm.elect_sync():
@@ -565,9 +583,12 @@ def frost_qk_norm_rope_tma(
 
         nvvm.fence_proxy("async.shared", space="cta")  # lane writes -> TMA (async proxy)
         if cutlass.const_expr(fused_store_wait):
+            # stages_o >= 2 here (compile_qk_norm_rope_tma refuses the pair otherwise):
+            # tile i+1 rewrites sOut[(i+1) % stages_o], last read by tile i+1-stages_o's
+            # store; with tiles <= i-1 outstanding that leaves stages_o - 2 groups in flight.
             if warp_id == 0:
                 if nvvm.elect_sync():
-                    tma_store_wait(stages_o - 1)
+                    tma_store_wait(stages_o - 2)
         nvvm.barrier_cta_sync()  # publishes BOTH the lane writes and the drain
 
         # This stage's sIn is provably free the moment that barrier passes, so
@@ -808,6 +829,12 @@ def compile_qk_norm_rope_tma(
     stages_o = int(DEFAULT_STAGES_O if stages_o is None else stages_o)
     if stages_o < 1:
         raise ValueError(f"stages_o must be >= 1, got {stages_o}")
+    if fused_store_wait and stages_o < 2:
+        # The fused drain waits AFTER this tile's lanes wrote sOut, so it can only
+        # protect the NEXT tile's buffer when there is a second one: at stages_o=1
+        # the lanes of tile i+1 overwrite sOut[0] under tile i's in-flight bulk
+        # store (see DEFAULT_FUSED_STORE_WAIT) -- silent wrong Q/K rows, no error.
+        raise ValueError(f"fused_store_wait=True needs stages_o >= 2 (the drain protects the next tile's output stage), got stages_o={stages_o}")
     if dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"qk_norm_rope_tma serves bf16/f16 only, got {dtype}")
     key = (

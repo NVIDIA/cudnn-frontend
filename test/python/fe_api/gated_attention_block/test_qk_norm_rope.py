@@ -291,3 +291,58 @@ def test_ldg_and_tma_are_bit_identical():
         outs[impl] = (qo, ko, rq, rk)
     for name, a, b in zip(("q", "k", "rstd_q", "rstd_k"), outs["ldg"], outs["tma"]):
         assert torch.equal(a, b), f"{name}: ldg and tma disagree, max|diff| = {(a.float() - b.float()).abs().max().item():g}"
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_tma_is_deterministic_and_bitwise_ldg_when_ctas_reuse_the_output_stage():
+    """The race the 640-tile shape above can never reach: a CTA that processes >= 2
+    tiles rewrites its ``sOut`` stage, and the shipped ``fused_store_wait=True`` at
+    ``stages_o=1`` let tile i+1's lanes overwrite it under tile i's in-flight bulk
+    store -- ~0.1 % of Q rows carried the reference row of token ``tok +
+    n_ctas / q_tiles_per_token``, run-to-run non-deterministic (found 2026-09-15 as a
+    "long-S SDPA cosine drop" in the gated attention block).  h_q=32 at S=4096 is
+    8192 Q tiles against SMs x 8 CTAs (1664 on Rubin), so every CTA reuses the
+    stage several times: two TMA runs must be bit-identical to each other AND to
+    the LDG kernel."""
+    tma_stage, g = _stage("auto", h_q=32, h_kv=2, s=4096)
+    if tma_stage.resolve_impl() != "tma":
+        pytest.skip("this device has no TMA path; nothing to cross-check")
+    t = tma_stage.seq_len
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(7)
+    q = torch.randn(1, t, g.h_q, g.d_head, dtype=torch.bfloat16, device=dev, generator=gen)
+    k = torch.randn(1, t, g.h_kv, g.d_head, dtype=torch.bfloat16, device=dev, generator=gen)
+    wq = torch.randn(g.d_head, dtype=torch.bfloat16, device=dev, generator=gen)
+    wk = torch.randn(g.d_head, dtype=torch.bfloat16, device=dev, generator=gen)
+    cos = torch.randn(1, t, g.rope_dim, dtype=torch.bfloat16, device=dev, generator=gen)
+    sin = torch.randn(1, t, g.rope_dim, dtype=torch.bfloat16, device=dev, generator=gen)
+    outs = []
+    for impl in ("tma", "tma", "ldg"):
+        st, _ = _stage(impl, h_q=32, h_kv=2, s=4096)
+        st.check_support()
+        st.compile()
+        qo, ko = torch.zeros_like(q), torch.zeros_like(k)
+        rq = torch.zeros(1, t, g.h_q, dtype=torch.float32, device=dev)
+        rk = torch.zeros(1, t, g.h_kv, dtype=torch.float32, device=dev)
+        st.execute(q, k, wq, wk, cos, sin, q_out=qo, k_out=ko, rstd_q=rq, rstd_k=rk)
+        torch.cuda.synchronize()
+        outs.append((qo, ko, rq, rk))
+    for name, a, b in zip(("q", "k", "rstd_q", "rstd_k"), outs[0], outs[1]):
+        bad = (a != b).any(dim=-1).sum().item() if a.dim() == 4 else (a != b).sum().item()
+        assert torch.equal(a, b), f"{name}: two TMA runs differ in {bad} rows -- the sOut write-after-read race"
+    for name, a, b in zip(("q", "k", "rstd_q", "rstd_k"), outs[0], outs[2]):
+        assert torch.equal(a, b), f"{name}: tma and ldg disagree at the multi-tile grid, max|diff| = {(a.float() - b.float()).abs().max().item():g}"
+
+
+@pytest.mark.L0
+def test_tma_refuses_the_fused_drain_at_one_output_stage():
+    """``fused_store_wait=True`` drains AFTER the lanes wrote ``sOut``, so it can only
+    protect the NEXT tile's stage when there is a second one: at ``stages_o=1`` the
+    pair is the write-after-read race above and must be a typed refusal, before any
+    kernel is compiled (CPU-only)."""
+    from cudnn.gated_attention_block.kernels.qk_norm_rope_tma import DEFAULT_FUSED_STORE_WAIT, compile_qk_norm_rope_tma
+
+    assert DEFAULT_FUSED_STORE_WAIT is False, "the racy fused drain must not be the default"
+    with pytest.raises(ValueError, match="stages_o >= 2"):
+        compile_qk_norm_rope_tma(dtype=torch.bfloat16, h_q=32, h_kv=2, d=256, rope_dim=64, eps=1e-6, want_rstd=False, stages_o=1, fused_store_wait=True)
