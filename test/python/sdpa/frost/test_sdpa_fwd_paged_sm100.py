@@ -779,25 +779,40 @@ def test_paged_adapter_cuda_graph_replay_no_host_sync():
 # --- THD (ragged) queries over a paged cache: chunked prefill -----------------
 
 
-@pytest.mark.L0
-@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
-@pytest.mark.parametrize("dims", [(128, 128), (192, 128)], ids=["d128", "d192x128"])
-def test_paged_graph_thd_queries(dims, hnd):
+def _ref_thd_sequence(q_seq, k_pool, v_pool, pages, L, hnd, scale, causal_window=None):
+    """One packed sequence's rows against its own pages: ``q_seq`` [S_q, H, d],
+    ``pages`` that sequence's block-table row, ``L`` its live KV length.  Full
+    attention over the L keys, or (``causal_window`` = W) top-left causal with a
+    left window -- row r sees keys r - W <= j <= r.  Returns O [S_q, H, D_v] fp32."""
+    S_q, H, d = q_seq.shape
+    KH = k_pool.shape[1] if hnd else k_pool.shape[2]
+    P = k_pool.shape[2] if hnd else k_pool.shape[1]
+    D_v = v_pool.shape[-1]
+    idx = pages[: (L + P - 1) // P].long()
+    k, v = k_pool[idx], v_pool[idx]
+    if hnd:
+        k, v = k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
+    k = k.reshape(-1, KH, d)[:L].repeat_interleave(H // KH, dim=1).float()
+    v = v.reshape(-1, KH, D_v)[:L].repeat_interleave(H // KH, dim=1).float()
+    s = torch.einsum("qhd,lhd->hql", q_seq.float(), k) * scale
+    if causal_window is not None:
+        r = torch.arange(S_q, device=s.device).view(-1, 1)
+        j = torch.arange(L, device=s.device).view(1, -1)
+        s = s.masked_fill((j > r) | (j < r - causal_window), float("-inf"))
+    return torch.einsum("hql,lhd->qhd", torch.softmax(s, -1), v)
+
+
+def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20, causal_window=None):
     """Ragged Q/O (packed [T, H, D] storage + ragged offsets, per-sequence
-    ``seq_len_q``) attending K/V page pools through block tables: each sequence's
-    q tokens see its own live KV pages. Only Q/O are ragged — the pools are
-    ordinary dense tensors — and the THD scheduler walks the Q units while the
-    KV side comes from ``seq_len_kv`` + the tables. On d192x128 the THD setup
-    kernel skips the packed-total K/V descriptor clamp (pool-shaped descriptors)."""
+    ``seq_len_q``) attending K/V page pools through block tables, optionally under
+    top-left causal + a left window of ``causal_window`` keys.  Checks every packed
+    row against the fp32 reference; returns the pinned plan."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
     from cudnn.sdpa.fwd.engines import engine_name
 
     dev, dtype = "cuda", torch.float16
     d, d_v = dims
-    H, KH, P, max_pages = 8, 2, 16, 20
-    q_lens = [37, 130, 5]
-    kv_lens = [300, 77, 129]
     B, T, S_max = len(q_lens), sum(q_lens), max(q_lens)
     cu = [0]
     for s in q_lens:
@@ -825,6 +840,8 @@ def test_paged_graph_thd_queries(dims, hnd):
     sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
     qro, oro = g.tensor_like(ro), g.tensor_like(o_ro)
     tq.set_ragged_offset(qro)
+    # cuDNN's sliding_window_length counts the diagonal: offset W == length W + 1.
+    band = {} if causal_window is None else dict(use_causal_mask=True, sliding_window_length=causal_window + 1)
     o, _ = g.sdpa(
         name="sdpa",
         q=tq,
@@ -838,13 +855,14 @@ def test_paged_graph_thd_queries(dims, hnd):
         paged_attention_k_table=tk,
         paged_attention_v_table=tv,
         paged_attention_max_seq_len_kv=max_pages * P,
+        **band,
     )
     o.set_output(True).set_dim([B, H, S_max, d_v]).set_stride(list(o_stride))
     o.set_ragged_offset(oro)
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, engine_name())
+    plan = select_engine(g, engine_name())
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -856,12 +874,69 @@ def test_paged_graph_thd_queries(dims, hnd):
     torch.cuda.synchronize()
 
     o_out = o_stor[: T * H * d_v].reshape(T, H, d_v).float()
-    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device=dev)
+    assert not torch.isnan(o_out).any(), "NaN in O"
     for b in range(B):
-        for r in range(q_lens[b]):
-            q_row = q_pk[cu[b] + r].unsqueeze(0)  # [1, H, d] -> batch of one
-            ref_o, _ = _ref(q_row, k_pool, v_pool, bt.view(B, max_pages)[b : b + 1], kv_lens_t[b : b + 1], hnd, scale)
-            torch.testing.assert_close(o_out[cu[b] + r], ref_o[0], atol=2e-2, rtol=0)
+        ref_o = _ref_thd_sequence(q_pk[cu[b] : cu[b + 1]], k_pool, v_pool, bt.view(B, max_pages)[b], kv_lens[b], hnd, scale, causal_window)
+        torch.testing.assert_close(o_out[cu[b] : cu[b + 1]], ref_o, atol=2e-2, rtol=0)
+    return plan
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("dims", [(128, 128), (192, 128)], ids=["d128", "d192x128"])
+def test_paged_graph_thd_queries(dims, hnd):
+    """Ragged Q/O (packed [T, H, D] storage + ragged offsets, per-sequence
+    ``seq_len_q``) attending K/V page pools through block tables: each sequence's
+    q tokens see its own live KV pages. Only Q/O are ragged — the pools are
+    ordinary dense tensors — and the THD scheduler walks the Q units while the
+    KV side comes from ``seq_len_kv`` + the tables. On d192x128 the THD setup
+    kernel skips the packed-total K/V descriptor clamp (pool-shaped descriptors)."""
+    _run_thd_graph(dims, hnd, q_lens=[37, 130, 5], kv_lens=[300, 77, 129])
+
+
+# Left-window offset W for the THD + causal cases below.  Wide enough that the
+# d192 kernel's one-sided band geometry holds at both cgas (_SWA_ONE_SIDED_GEOMETRY:
+# W >= TILES_Q * TOKENS_PER_TILE * CTA_MMA + TILE_N - 2 = 2 * 128 * 2 + 126 = 638 at
+# cga2; THD-varlen never packs GQA, so TOKENS_PER_TILE is the full tile), i.e. the
+# DENSE THD twin of each case would take the predecoded scheduler.
+_THD_SWA_W = 640
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("heads", [(8, 2), (8, 8)], ids=["gqa", "mha"])
+def test_paged_graph_thd_queries_causal_left_window(heads):
+    """THD queries over d192x128 pools under top-left causal + a wide left window.
+    Dense THD with this band takes the d192 kernel's predecoded scheduler
+    (_PREDECODE_THD_SWA_SEGMENTS: the TMA-LDG warp's next-tile KV bounds come from
+    decoded SMEM, no eff_seqlen_kv re-resolve on the back-edge); PAGED_KV folds
+    it off because the paged loader needs the live page count for every tile, so
+    this band walks the plain decode path the d128 / d256 flavors use.  The window
+    bites (one sequence longer than W), one sequence has more Q rows than keys,
+    and every row keeps at least one key (no dead rows).  GQA rides unpacked:
+    the config offers no PackGQA under THD-varlen."""
+    H, KH = heads
+    _run_thd_graph((192, 128), True, H=H, KH=KH, max_pages=57, q_lens=[900, 130, 45], kv_lens=[850, 200, 45], causal_window=_THD_SWA_W)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("cta_mma", [2, 1], ids=["cga2", "cga1"])
+def test_paged_kernel_d192_thd_swa_predecode_folds_off(cta_mma):
+    """The d192 template's THD + causal + wide-left-window scheduler
+    (_PREDECODE_THD_SWA_SEGMENTS) is compiled in for the dense THD flavor and
+    folded off under PAGED_KV at the same band -- pinned on the module constants
+    so an edit cannot re-enable the predecoded back-edge over pools (d192-only
+    interplay: the d128 / d256 flavors have no predecoded THD + SWA path)."""
+    from cudnn.frost.template_loader import load_template
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100", _KERNEL_FILES[192])
+    common = dict(dtype_qkv=3, seq_kv_lens_present=True, thd_varlen=True, window_right=0, window_left=_THD_SWA_W, cta_mma=cta_mma)
+    dense = load_template(path, TemplateParams(**common), tag=f"thd_swa_dense_c{cta_mma}")
+    paged = load_template(path, TemplateParams(paged_kv=True, page_size=16, **common), tag=f"thd_swa_paged_c{cta_mma}")
+    assert dense._SWA_ONE_SIDED_GEOMETRY and paged._SWA_ONE_SIDED_GEOMETRY, "the band must be one-sided at this width, or nothing is pinned"
+    assert dense._PREDECODE_THD_SWA_SEGMENTS, "dense THD at this band takes the predecoded scheduler"
+    assert not paged._PREDECODE_THD_SWA_SEGMENTS, "PAGED_KV must fold the predecoded scheduler off (its back-edge never re-resolves eff_seqlen_kv)"
 
 
 @pytest.mark.L0

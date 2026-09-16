@@ -158,7 +158,9 @@ a multiple of 8 that divides the 128-row KV tile or is a multiple of it. Any `S_
 (decode or paged prefill), GQA (PackGQAᵐ — the whole group, or its largest divisor of
 the tile), Stats out, and **THD queries**: ragged Q/O (ragged offsets + `seq_len_q`)
 over the same pools — chunked prefill — with the THD scheduler walking the Q units (no
-KV split there). KV split is proposed on dense-Q paged graphs by the same wave-cost
+KV split there), including top-left causal + a left window (on d192x128 that band takes
+the plain decode path: the predecoded THD+SWA scheduler is folded off under `PAGED_KV`).
+KV split is proposed on dense-Q paged graphs by the same wave-cost
 model as on dense graphs (they are padded by construction: the per-batch lengths bound
 the walk on device and the split composes with them; it pays when `B * H_kv` leaves
 SMs idle) and recombined by `split_combine_sm100`. The declared
