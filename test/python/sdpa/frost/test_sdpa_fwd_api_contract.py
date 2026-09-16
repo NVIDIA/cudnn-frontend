@@ -68,3 +68,20 @@ def test_hybrid_execute_uses_cached_v_scale_factor_dummy():
 
     assert "sf_k_v[..., : km.SF_SMEM_SIZE_V].contiguous()" not in source
     assert 'f"pv_bf16_sf_v_{b}_{h_kv}_{n_kv_tiles}_{km.SF_SMEM_SIZE_V}"' in source
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("api_cls", [SdpaFwdDslSm100, SdpaFwdDslSm120], ids=["sm100", "sm120"])
+def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cls):
+    """The lowering hands ``sf_o`` to ``execute()`` for every graph whose engine
+    row advertises a block-scaled O (the SM100-line and SM120-line FP8 rows).
+    A class that lowers such a graph but whose ``execute()`` lacks the keyword
+    passes check_support and compile, then fails every block-scaled draw at
+    execute time with ``TypeError: unexpected keyword argument 'sf_o'`` -- the
+    SM120 CI lane caught exactly that, invisible from an SM100 box."""
+    for fn in (api_cls.execute, api_cls._execute_fp8):
+        params = inspect.signature(fn).parameters
+        assert "sf_o" in params, f"{api_cls.__name__}.{fn.__name__} does not accept sf_o"
+        assert params["sf_o"].default is None
+    # Append-only public signature: sf_o is the last execute() parameter.
+    assert list(inspect.signature(api_cls.execute).parameters)[-1] == "sf_o"

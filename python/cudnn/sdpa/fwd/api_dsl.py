@@ -4383,11 +4383,24 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         sf_q: Optional[torch.Tensor] = None,
         sf_k: Optional[torch.Tensor] = None,
         sf_v: Optional[torch.Tensor] = None,
+        sf_o: Optional[torch.Tensor] = None,
     ) -> None:
-        """Execute tensors matching the compiled specialization."""
+        """Execute tensors matching the compiled specialization.
+
+        ``sf_o``: the block-scaled O scale-factor buffer (per-tensor FP8 with
+        ``sample_sf_o``); its bytes are laid out per the declared geometry.
+        """
 
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm120 kernel is not compiled")
+        self._value_error_if(
+            self.o_block_scale > 0 and sf_o is None,
+            "sf_o is required by this compiled specialization (block-scaled O)",
+        )
+        self._value_error_if(
+            self.o_block_scale == 0 and sf_o is not None,
+            "this specialization was compiled without a block-scaled O; construct the API with sample_sf_o",
+        )
         self._value_error_if(
             self.has_sink and sinks is None,
             "sinks is required by this compiled specialization",
@@ -4429,6 +4442,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                     seq_q_lens=seq_q_lens,
                     workspace=workspace,
                     current_stream=current_stream,
+                    sf_o=sf_o,
                 )
             return
         scale_softmax_log2 = scale_val * math.log2(math.e)
