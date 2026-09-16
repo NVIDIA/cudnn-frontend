@@ -107,7 +107,7 @@ def _causal_sparse_reference(
     return out.view_as(q), row_sum.view(_SEQLEN, _Q_HEADS, 1), row_max.view(_SEQLEN, _Q_HEADS, 1)
 
 
-def _run_targeted_causal_case(*, future_first: bool):
+def _run_targeted_causal_case(*, future_first: bool, scale: float = 1.0 / math.sqrt(_TARGETED_HEAD_DIM)):
     """Run one small causal case and check its analytically exact uniform-score result."""
     if not torch.cuda.is_available():
         pytest.skip("Selection-attention causal regression requires CUDA")
@@ -165,7 +165,7 @@ def _run_targeted_causal_case(*, future_first: bool):
         max_s_k=_TARGETED_SEQLEN,
         block_size=_TARGETED_BLOCK_SIZE,
         is_causal=True,
-        scale_softmax=1.0 / math.sqrt(_TARGETED_HEAD_DIM),
+        scale_softmax=scale,
     )
     assert operation.check_support()
     operation.compile()
@@ -266,13 +266,15 @@ def test_minimax_m3_selection_attention_block128_causal_probe():
     torch.testing.assert_close(row_max, row_max_ref, atol=3e-2, rtol=3e-2)
 
 
-@pytest.mark.L4
-def test_selection_attention_is_causal_on_existing_geometry():
+@pytest.mark.L0
+@pytest.mark.parametrize("scale", [1.0 / math.sqrt(_TARGETED_HEAD_DIM), 0.0, -1.0])
+def test_selection_attention_is_causal_on_existing_geometry(scale):
     """Causal masking works without relying on the new block-128/GQA-16 geometry."""
-    _run_targeted_causal_case(future_first=False)
+    _run_targeted_causal_case(future_first=False, scale=scale)
 
 
-@pytest.mark.L4
-def test_selection_attention_causal_future_first_block_recovers_without_nan():
+@pytest.mark.L0
+@pytest.mark.parametrize("scale", [1.0 / math.sqrt(_TARGETED_HEAD_DIM), 0.0, -1.0])
+def test_selection_attention_causal_future_first_block_recovers_without_nan(scale):
     """A future-only first tile contributes zero and a later valid tile recovers."""
-    _run_targeted_causal_case(future_first=True)
+    _run_targeted_causal_case(future_first=True, scale=scale)

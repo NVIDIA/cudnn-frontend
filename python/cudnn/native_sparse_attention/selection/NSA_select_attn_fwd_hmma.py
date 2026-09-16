@@ -910,11 +910,14 @@ class HopperSelectAttentionFwd:
                     current_block = sIDX[K_tile_cnt - 1 - K_tile]
                 for r in cutlass.range_constexpr(cute.size(gL_thr.shape[0][1])):
                     if cute.elem_less(cLM_thr[(0, r), 0, 0][0], self.GQA_group_size):
+                        # Mask scaled logits: scaling -inf by zero or a
+                        # negative value would create NaN or +inf.
+                        acc_QK_mn[r, None] = acc_QK_mn[r, None].load() * softmax_scale
                         if cutlass.const_expr(self.causal_within_selected_blocks):
                             for c in cutlass.range_constexpr(cute.size(acc_QK_mn, mode=[1])):
                                 if current_block * self.block_size + cQK_mn[r, c][1] > t:
                                     acc_QK_mn[r, c] = -cutlass.Float32.inf
-                        acc_QK_row = acc_QK_mn[r, None].load() * softmax_scale
+                        acc_QK_row = acc_QK_mn[r, None].load()
                         row_max_cur_row = acc_QK_row.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
                         row_max_cur_row = self._threadquad_reduce_max(row_max_cur_row, mask=(1 << self.GQA_group_size) - 1)
 
