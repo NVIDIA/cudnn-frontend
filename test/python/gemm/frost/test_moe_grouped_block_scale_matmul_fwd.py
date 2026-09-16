@@ -760,6 +760,30 @@ def test_e2e_split_m_tile(cfg_name, cta_group) -> None:
     )
 
 
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "config_name,cta_group",
+    [
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x2_1ctamma", 1),
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma", 2),
+    ],
+)
+@requires_sm100
+def test_e2e_scheduler_ring_reuse(combo, config_name, cta_group) -> None:
+    # Cross many persistent waves so ring-slot reuse and final DSM lifetime are
+    # covered by racecheck. Ragged and empty groups also exercise SF indexing.
+    _run_e2e(
+        E=8,
+        S=32769,
+        N=256,
+        K=256,
+        offsets_list=[0, 0, 1, 1, 4097, 8192, 16387, 32769],
+        combo=combo,
+        config_name=config_name,
+        cta_group=cta_group,
+    )
+
+
 @pytest.mark.parametrize("combo", ["mxfp4", "mxfp8"])
 @requires_sm100
 def test_e2e_mx_combos(combo) -> None:

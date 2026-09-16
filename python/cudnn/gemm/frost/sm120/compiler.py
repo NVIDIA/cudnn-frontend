@@ -3325,7 +3325,11 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None)
     bypasses the automatic pick; a request that does not spell a canonical
     config is a decline (NotImplementedError), never a silent snap to a
     neighbour. Without knobs this is the automatic strategy."""
+    if chain is not None and chain.has_moe and chain.moe.weight_layout is not None:
+        raise NotImplementedError("frost_gemm: packed MoE weight_layout is supported only by SM100 grouped GEMM")
     if knobs is not None:
+        if knobs.moe_sched_policy:
+            raise NotImplementedError("frost_gemm: nonzero SCHED_POLICY is supported only by SM100 MoE grouped GEMM")
         try:
             config = knobs.to_config()
         except (KeyError, ValueError, NotImplementedError) as exc:
@@ -3398,6 +3402,8 @@ def _precheck_moe(
 ) -> None:
     from ..kernel_registry import GraphType, mma_arch_reject, select_template
 
+    if chain.moe.weight_layout is not None:
+        raise NotImplementedError("frost_gemm: packed MoE weight_layout is supported only by SM100 grouped GEMM")
     reason = mma_arch_reject(chain, GraphType.MOE, config.pipeline)
     if reason is not None:
         raise NotImplementedError(reason)

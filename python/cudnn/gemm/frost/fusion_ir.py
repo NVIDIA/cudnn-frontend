@@ -632,8 +632,13 @@ class MoeSpec:
     offset_dtype: Dtype = "int32"
     num_groups: int = 0
     offset_multiple: int = 1
+    # Physical B storage, an op attribute rather than a performance knob.
+    # None: ordinary rank-3 [E,K,N]. Blocked: contiguous [E,N/128,K/128,128,128].
+    weight_layout: str | None = None
 
     def __post_init__(self) -> None:
+        if self.weight_layout not in (None, "blocked_128x128_v1"):
+            raise ValueError(f"unsupported MoE weight_layout {self.weight_layout!r}")
         if self.num_experts < 1:
             raise ValueError(f"num_experts must be positive; got {self.num_experts}")
         if self.num_groups < 1:

@@ -73,6 +73,18 @@ unsupported input runnable.
   descriptors) — acceptance is a promise about the execute path, not about
   what the adapter can patch up.
 
+Packed views need agreement between graph eligibility, native variant-pack
+metadata, and the compiled fake tensor. `OperandBuffer.reshape()` accepts
+only globally dense storage; testing a framework tensor's `reshape()` alone
+does not establish the graph execute contract. Also, a compact fake tensor
+can inherit divisibility from an unrelated output-vector extent and reject a
+valid expert pitch. Test `graph.execute()` with an expert stride that is
+16-byte aligned but not 32-byte aligned, and with shared up/gate storage.
+Verify the DLPack view retains its pointer, stride and metadata lifetime after
+temporary native wrappers are destroyed. The FlashInfer tests
+`test_moe_cudnn_fp8_expert_stride.py` and
+`test_moe_cudnn_native_weight_view.py` exercise these failures.
+
 **Rule 3 — `execute()` never reads device memory to the host.**
 
 Rules 1 and 2 both cite CUDA-graph capture as the reason for what they ban, but
