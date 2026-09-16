@@ -170,31 +170,64 @@ def test_forward_and_jitted_gradients(dims, heads, dtype, checkpoint, gates, inv
 
 
 @pytest.mark.parametrize("checkpoint", [0, 16])
-def test_long_sequence_forward_and_gradients(checkpoint):
-    bounds = (0, 256)
-    args, cu = inputs(bounds=bounds)
-    options = dict(checkpoint_every_n_tokens=checkpoint)
+@pytest.mark.parametrize(
+    "dims,heads,bounds,gates,state_dtype,with_state",
+    [
+        ((64, 64), (1, 1, 1), (0, 256), False, jnp.float32, True),
+        ((64, 128), (2, 1, 1), (0, 0, 129, 768), True, jnp.bfloat16, True),
+        ((128, 64), (1, 2, 2), (0, 129, 129, 768), False, jnp.float32, False),
+    ],
+)
+def test_long_sequence_forward_and_gradients(checkpoint, dims, heads, bounds, gates, state_dtype, with_state, monkeypatch):
+    from cudnn.linear_attention import jax_api
+    from cudnn.linear_attention.frost import kda_engine
+
+    build = kda_engine.build_kda
+    schedules = []
+
+    def checked_build(graph, **kwargs):
+        plan = build(graph, **kwargs)
+        assert plan.chain, "JAX must preserve Frost's automatic piece-chain selection"
+        schedules.append(plan.node.node_type.name)
+        return plan
+
+    jax_api.build_call.cache_clear()
+    monkeypatch.setattr(kda_engine, "build_kda", checked_build)
+    args, cu = inputs(*dims, *heads, bounds=bounds, gates=gates, state_dtype=state_dtype)
+    if not with_state:
+        args = (*args[:5], None, *args[6:])
+    if not gates:
+        args = (*args[:3], jnp.full_like(args[3], -1e-4), *args[4:])
+    options = dict(
+        checkpoint_every_n_tokens=checkpoint,
+        safe_gate=gates,
+        gate_lower_bound=-0.01 if gates else None,
+        use_beta_sigmoid_in_kernel=gates,
+        use_qk_l2norm_in_kernel=gates,
+    )
     actual = jax.jit(partial(run, **options))(args, cu)
-    expected = reference(args, bounds)
+    expected = reference(args, bounds, **options)
     for got, want in zip(actual, expected):
         assert_close(got, want, 0.02)
 
     def loss(args, reference_mode=False):
-        o, state = reference(args, bounds) if reference_mode else run(args, cu, **options)
-        return o.astype(jnp.float32).sum() + state.sum()
+        o, state = reference(args, bounds, **options) if reference_mode else run(args, cu, **options)
+        return o.astype(jnp.float32).sum() + state.astype(jnp.float32).sum()
 
     actual_grads = jax.jit(jax.grad(loss))(args)
     expected_grads = jax.jit(jax.grad(partial(loss, reference_mode=True)))(args)
     for got, want in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
         assert_close(got, want, 0.06)
+    assert "KDA" in schedules and "KDA_BWD" in schedules
 
 
-def test_repeated_calls_and_dynamic_boundaries():
-    args, cu = inputs(bounds=(0, 16, 35))
-    invoke = jax.jit(run)
+@pytest.mark.parametrize("total", [35, 768])
+def test_repeated_calls_and_dynamic_boundaries(total):
+    args, cu = inputs(bounds=(0, 16, total))
+    invoke = jax.jit(lambda args, cu: run(args, cu))
     first = invoke(args, cu)
     changed = tuple(x * 0.7 if x is not None else None for x in args)
-    bounds = (0, 9, 35)
+    bounds = (0, 9, total)
     second = invoke(changed, jnp.asarray(bounds, jnp.int32))
     for got, want in zip(second, reference(changed, bounds)):
         assert_close(got, want, 0.02)
@@ -317,10 +350,11 @@ def test_recurrent_scan_gradients():
         assert_close(a, b, 0.06)
 
 
-def test_command_buffer_replay_and_concurrent_dispatch():
+@pytest.mark.parametrize("total", [35, 768])
+def test_command_buffer_replay_and_concurrent_dispatch(total):
     from concurrent.futures import ThreadPoolExecutor
 
-    args, cu = inputs(bounds=(0, 35))
+    args, cu = inputs(bounds=(0, total))
     invoke = jax.jit(
         partial(run, checkpoint_every_n_tokens=16),
         compiler_options={"xla_gpu_enable_command_buffer": "CUSTOM_CALL", "xla_gpu_graph_min_graph_size": 1},
@@ -330,7 +364,7 @@ def test_command_buffer_replay_and_concurrent_dispatch():
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(invoke, a, cu) for a in variants]
         for a, future in zip(variants, futures):
-            for got, want in zip(future.result(), reference(a, (0, 35))):
+            for got, want in zip(future.result(), reference(a, (0, total))):
                 assert_close(got, want, 0.02)
 
 

@@ -127,7 +127,7 @@ forward-mode differentiation are unsupported.
 | Safe gate | `lower_bound * sigmoid(exp(a_log) * (g + dt_bias))`; default bound -5, allowed [-5, 0); omitted parameters mean 0 |
 | Beta | Direct write strength, or sigmoid of logits; `allow_neg_eigval=True` multiplies sigmoid by 2 and requires sigmoid enabled |
 | Q/K normalization | Optional in-kernel L2 normalization |
-| Scheduling | Frost decay-warmup split schedule; `batch_invariant=True` disables splitting |
+| Scheduling | Frost automatic piece-chain / decay-warmup / uncut selection, shared with torch; `batch_invariant=True` uses Frost's batch-independent length rule |
 | Checkpoints | Cadence 0 (backward recomputes) or 16 (saved for backward) |
 | Transformations | Eager, jit, first-order grad/vjp, recurrent scan |
 
@@ -146,20 +146,22 @@ may require materialization.
 ## Execution and review notes
 
 `linear_attention/jax_api.py` owns metadata, argument binding and autodiff.
-`linear_attention/frost/kda_launch.py` composes the native launch sequence.
-The existing engine owns workspace layout; the split scheduler owns launch
-geometry, shared by torch and JAX.
+`linear_attention/frost/kda_engine.py` owns scheduling and workspace layout.
+`linear_attention/frost/kda_program.py` contains the shared forward/backward
+launch sequence. The native engine compiles this program through CuTeDSL/TVM FFI;
+JAX exports the same program through CuTeDSL/XLA FFI. There is no separate JAX
+scheduler or engine execution path.
 
-JAX explicitly disables the newer Frost piece-chain optimization. Its composite
-launcher retains decay-warmup splitting (or unsplit execution with
-`batch_invariant=True`); torch retains the upstream automatic piece-chain
-selection. Both use the current Frost kernels and workspace layouts. Piece-chain
-launch composition and context-parallel summary APIs are outside this JAX scope.
+Both consumers use Frost's automatic piece-chain selection, including fused
+summaries, forward/reverse state propagation and checkpoint recomputation.
+The shared program also preserves torch's coarse checkpoints and linear gate
+domain; those options remain outside the bounded JAX API. Context-parallel
+summary APIs remain separate.
 
 Graph tensors come directly from JAX shape/dtype metadata; the existing
 `graph.kda` / `graph.kda_bwd` methods infer output shapes and validate the graph.
-Frost workspace layouts are reused. The JAX launcher composes existing CuTe host
-functions into one native XLA FFI call per forward/backward. That call receives XLA's stream and launches the complete
+Frost workspace layouts are reused. The shared program composes existing CuTe
+host functions into one native XLA FFI call per JAX forward/backward. That call receives XLA's stream and launches the complete
 sequence, including runtime TMA descriptors and PDL dependencies. No Python
 callback, torch tensor, DLPack handoff, or KDA math implementation is introduced.
 
@@ -215,19 +217,60 @@ extension; no host virtualenv or compiled extension is mounted. GPU CI must
 invoke the pytest command explicitly: an import-only check does not run KDA
 forward/backward kernels.
 
-Before the rebase, validated on SM100 with `nvcr.io/nvidia/jax:26.07-py3`: the frontend source build
-succeeded and all **21 tests passed, zero skipped**. The container used Python
-3.12.3, JAX `0.10.2.dev20260630+3757395a28`, CUDA 13.3, cuDNN 9.24.0 and
-CuTeDSL 4.7.1, with no PyTorch installation. This includes the subprocess that
-rejects torch imports while compiling and executing a jitted KDA gradient.
+Validated the shared program on SM100 on 2026-09-15: the frontend source build
+in `nvcr.io/nvidia/jax:26.07-py3` succeeded and **29 tests passed, zero skipped**
+in 272.91 seconds, with CuTeDSL 4.7.1 and no PyTorch installation. This includes
+the subprocess that rejects torch imports while compiling and executing a
+jitted KDA gradient. The host JAX run also passed all 29 tests.
+
+Torch validation passed 62 existing regression cases covering piece chains,
+coarse checkpoints, linear/safe gates, BF16 state gradients, grouped heads,
+batch invariance, CUDA-graph replay, non-contiguous inputs, independent streams
+and repeated execution with different buffers. One GDN2-only beta-guard case
+was skipped for KDA. The new JAX scheduling regression failed against the old
+piece-chain override before passing with automatic engine selection.
 
 ## Measurements and remaining blocker
 
-These measurements predate the upstream Frost piece-chain optimization and the
-rebase onto `a02378752`. They are historical, not performance qualification of the
-rebased kernels. The benchmark now compares JAX splitting against torch automatic
-scheduling; when torch selects a piece chain, total-minus-raw also includes that
-scheduling difference. Rerun qualification before drawing current overhead conclusions.
+Shared-program measurements (2026-09-15), SM100, BF16 THD T=1024, H=4,
+K=V=128, one sequence, no recurrent state or optional gate parameters,
+checkpoint cadence 0. Both frameworks use automatic piece chains; backward
+includes checkpoint recomputation. JAX command buffers enabled. Medians of 200
+warm calls after 20 warmups; GPU time uses a graph of 32 full calls:
+
+| Path | Forward total us | Backward total us | Forward minus raw us | Backward minus raw us |
+|---|---:|---:|---:|---:|
+| Raw Frost GPU sequence | 65.0 | 143.2 | — | — |
+| JAX jit + command buffers | 146.7 | 230.5 | 81.7 | 87.3 |
+| torch eager | 143.2 | 230.6 | 78.3 | 87.4 |
+| Fixed-buffer CUDA-graph replay | 73.5 | 151.9 | 8.5 | 8.7 |
+
+Host dispatch was 44.1 / 62.7 us for JAX, 89.5 / 111.9 us for torch, and
+2.3 / 2.3 us for graph replay. A repeat measured raw GPU 65.0 / 143.2 us,
+JAX totals 150.2 / 233.9 us and torch totals 141.8 / 228.4 us. Outputs and
+all five explicit-backward gradients matched torch exactly in both runs,
+including captured replay. Stack: Python 3.14, JAX 0.11.1, torch 2.14.0+cu130,
+CuTeDSL 4.7.1, cuDNN 9.28.0.
+
+A same-stack control restored only the native engine from `84c8feb7d`, retaining
+its automatic piece-chain selection and the current JAX implementation. Original
+torch host dispatch was 113.1 / 155.3 us, total 152.8 / 241.6 us, and raw GPU
+63.9 / 136.6 us. Sharing the program reduces host dispatch, but this case shows
+about **5% higher backward GPU time** (forward about 2%). That code-generation
+or launch-composition difference has not been isolated; more performance
+qualification is required. It is not a scheduling difference in this control.
+
+**The 10–20 us CPU target remains unmet.** Torch eager overhead is still high.
+Totals include synchronization; total-minus-raw is not pure CPU overhead.
+These results cover one configuration and do not establish performance across
+the support matrix. The reproduction command below runs the current shared
+program; the control used the previous engine's `build_plan` method.
+
+### Historical measurements before sharing the launch program
+
+These measurements predate the shared launch program and automatic piece-chain
+support. They are historical. The current benchmark uses the same Frost
+scheduling decision for JAX and torch; it must be rerun to qualify current latency.
 
 Measured on SM100 (148 SMs), Python 3.14, JAX 0.11.1, CuTeDSL 4.7.1,
 torch 2.14.0+cu130, driver 580.159.03. BF16 THD inputs, H=4, K=V=128,

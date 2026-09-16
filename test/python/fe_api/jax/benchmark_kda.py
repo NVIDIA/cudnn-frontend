@@ -4,9 +4,8 @@
 """Compare warm JAX/torch calls with the full Frost GPU launch sequence.
 
 Run with one visible GPU and XLA_PYTHON_CLIENT_PREALLOCATE=false. Both backends
-use Frost and checkpoint recomputation in backward. JAX uses decay-warmup splits;
-torch uses automatic scheduling, including piece chains. When schedules differ,
-blocking-minus-raw includes that difference, not just framework overhead.
+use the shared Frost program, automatic scheduling (including piece chains),
+and checkpoint recomputation in backward.
 Raw GPU time uses CUDA events around batched, fixed-buffer CUDA-graph replay.
 Blocking minus raw includes host dispatch, allocation, launch gaps and device
 synchronization; host dispatch alone must not be subtracted from GPU time.
@@ -160,13 +159,13 @@ def main():
         dtype="bfloat16",
         checkpoint=0,
         batch_invariant=False,
-        jax_schedule="decay-warmup split",
-        torch_schedule="automatic (may use piece chains)",
+        jax_schedule="Frost automatic (shared program)",
+        torch_schedule="Frost automatic (shared program)",
         command_buffer=options.command_buffer,
         repetitions=options.repetitions,
         warmup=options.warmup,
         raw_batch_size=options.raw_batch_size,
-        versions=dict(jax=jax.__version__, torch=torch.__version__, cutedsl=cutlass.__version__),
+        versions=dict(jax=jax.__version__, torch=torch.__version__, cutedsl=cutlass.__version__, cudnn=cudnn.backend_version()),
         cudnn_path=cudnn.__file__,
         gpu=torch.cuda.get_device_name(),
         capability=torch.cuda.get_device_capability(),
