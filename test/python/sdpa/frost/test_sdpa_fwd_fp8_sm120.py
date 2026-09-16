@@ -1534,6 +1534,30 @@ def test_fp8_sm120_block_scaled_output_offered():
         assert isinstance(res, _BlockScaledRunResult), mode
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("mode", list(_BLOCK_SCALED_O))
+@torch_fork_set_rng(seed=74)
+def test_fp8_sm120_block_scaled_output_tile64(mode):
+    """64-row Q tile with per-(b,h) SF_O planes: the rows between round_up(S_q, 64)
+    and round_up(S_q, 128) belong to no Q tile, so the last tile must zero them
+    (S_q = 300: tiles end at 320, the plane atom at 384)."""
+    res = _run(
+        2,
+        4,
+        2,
+        300,
+        256,
+        scale=1.0 / math.sqrt(128),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        tiles=(64, 128),
+        o_dtype=torch.float8_e4m3fn,
+        so_val=3.0 if mode == "nvfp4" else 1.0,
+        block_scaled_o=mode,
+        sf_o_layout="planes",
+    )
+    _check_block_scaled(res, _BLOCK_SCALED_O[mode])
+
+
 # --- THD declared strides: slices of fused records, and what TMA cannot express ---------------
 @pytest.mark.L0
 @torch_fork_set_rng(seed=131)
