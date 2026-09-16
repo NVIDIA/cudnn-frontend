@@ -52,7 +52,7 @@ from cudnn.gated_attention_block.kernels.proj_gemm import sf_blob_bytes  # noqa:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from reference import (  # noqa: E402
+from gated_block_reference import (  # noqa: E402
     RefGeometry,
     gated_attention_block_mxfp8_reference,
     make_inputs,

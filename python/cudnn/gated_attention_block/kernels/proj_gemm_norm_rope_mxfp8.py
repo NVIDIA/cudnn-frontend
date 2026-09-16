@@ -134,7 +134,6 @@ from typing import Callable, Optional
 from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.pointwise import abs_max_tree, e8m0_from_amax, e8m0_pair, f16x2_to_f32, fp32_to_fp8_pack, opaque_f32_zero
-from cudnn.frost.tile_dsl.sass import keep_sass_options
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global
 from cudnn.gated_attention_block.kernels.proj_gemm import NormRopeFusionParams, validate_norm_rope_params
 
@@ -2635,5 +2634,5 @@ def compile() -> Callable:
         cutlass.Int32(0),  # seq_len     ) runtime; the zeros pin the TYPE only
         cutlass.Int32(0),  # v_sf_groups )
         stream=_fake_stream,
-        options=keep_sass_options(frost_compile_options, PARAMS.keep_sass),
+        options=frost_compile_options,
     )

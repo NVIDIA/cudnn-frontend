@@ -533,7 +533,7 @@ from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
     validate_norm_rope_params,
 )
 from cudnn.gated_attention_block.kernels.quantize_mxfp8 import n_sf_tiles, sf_bytes  # noqa: E402
-from reference import apply_partial_rope, build_rope_tables, qk_norm_rope_reference  # noqa: E402
+from gated_block_reference import apply_partial_rope, build_rope_tables, qk_norm_rope_reference  # noqa: E402
 
 _E4M3_NAN_BYTE = 0x7F  # e4m3fn NaN; `cvt.rn.satfinite` never produces it, so a surviving byte is a never-written cell
 _E8M0_NAN_BYTE = 0xFF  # E8M0 NaN; a finite block amax never yields it, so a surviving byte is a never-written scale
