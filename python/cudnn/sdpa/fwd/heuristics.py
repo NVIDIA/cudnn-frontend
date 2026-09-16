@@ -591,13 +591,18 @@ def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm10
 _D128_DECODE_TILE_ROWS = 128
 
 
-def _d128_decode_tile_fits(caps: Capabilities, facts) -> bool:
+def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] = None) -> bool:
     """Whether one d128 decode tile covers a KV head's live Q rows.
 
-    ``S_q * pack_g <= 128`` with ``pack_g`` the GQA group when the row packs
-    it (the packed leg is what decode-shaped graphs propose first; the
-    unpacked runner-up has fewer rows still).  Dense only: the decode tile has
-    no THD leg.  Measured on B200 (b=32, H=64/4, d128, S_kv=4096, page 16,
+    ``S_q * pack_g <= 128`` with ``pack_g`` the CANDIDATE's own packing:
+    ``pack_gqa=True`` is the packed leg (one unit carries the whole GQA group,
+    ``G`` rows per token), ``False`` the unpacked one (one head, ``S_q`` rows),
+    and ``None`` -- the graph-level question -- reads as the packed leg when
+    the row can pack this graph, which is the leg a decode-shaped graph
+    proposes first.  The fit is a property of the candidate, not the graph:
+    at ``S_q * G > 128 >= S_q`` the packed leg keeps the prefill tile while
+    the unpacked runner-up rides the decode tile.  Dense only: the decode tile
+    has no THD leg.  Measured on B200 (b=32, H=64/4, d128, S_kv=4096, page 16,
     bf16): the prefill tile at cga2 119 us, the decode tile 49 us -- see the
     kernel docstring; at S_q * G > 128 the prefill tile's second sub-tile is
     live and cga2's collective MMA halves per-CTA K/V traffic, so the rule
@@ -605,18 +610,23 @@ def _d128_decode_tile_fits(caps: Capabilities, facts) -> bool:
     """
     if facts.thd:
         return False
-    pack_g = (facts.h_q // facts.h_kv) if _pack_gqa_eligible(caps, facts, _D128_DECODE_TILE_ROWS) else 1
+    if pack_gqa is None:
+        pack_gqa = _pack_gqa_eligible(caps, facts, _D128_DECODE_TILE_ROWS)
+    pack_g = (facts.h_q // facts.h_kv) if pack_gqa else 1
     return facts.s_q * pack_g <= _D128_DECODE_TILE_ROWS
 
 
-def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int) -> tuple[int, Optional[int]]:
+def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int, pack_gqa: Optional[bool] = None) -> tuple[int, Optional[int]]:
+    """``pack_gqa`` is the candidate's packing where the width depends on it
+    (the d128 f16 SM100 flavor, :func:`_d128_decode_tile_fits`); ``None`` asks
+    the graph-level question.  The other flavors' rules ignore it."""
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
     selected_shape = _selected_d_shape(caps, facts)
     if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # The f16 SM100 row: cga1 = the decode tile when one of its 128-row
         # tiles covers the head's Q rows, else the cga2 prefill pipeline.
-        return sched_policy, (1 if _d128_decode_tile_fits(caps, facts) else 2)
+        return sched_policy, (1 if _d128_decode_tile_fits(caps, facts, pack_gqa) else 2)
     if selected_shape == (256, 256) and any(shape == selected_shape for shape, _ in caps.cgas_by_d_shape):
         params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
         selected_sched, selected_cga = select_d256_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
@@ -872,19 +882,25 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         return (pack_tile if packed_first else tiles[0]), packed_first, pack_tile
 
     def _leg(split_value: int) -> SdpaFwdKnobs:
-        sched_policy, cga = _auto_sched_cga(
-            spec,
-            facts,
-            split_kv=split_value,
-            sched_policy=plain_sched if split_value > 1 else scheds[0],
-        )
+        seed_sched = plain_sched if split_value > 1 else scheds[0]
+        sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=split_value, sched_policy=seed_sched)
         base_tile, packed_first, _ = _pack_choice(cga)
+        pack_gqa = True if packed_first else unpacked_pack
+        if pack_gqa is not True:
+            # The width above was judged on the packed leg's rows (the graph-
+            # level question); a leg that runs unpacked is re-judged on one
+            # head's S_q rows -- the d128 decode-tile fit belongs to the
+            # candidate, not the graph.  _pack_choice does not move under the
+            # new width: it depends on cga only through _pack_gqa_wins, which
+            # is settled the same way at either width for any S_q this can
+            # change (an eligible group that does not win has S_q >= 512).
+            sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=split_value, sched_policy=seed_sched, pack_gqa=False)
         return SdpaFwdKnobs(
             sched_policy=sched_policy,
             tile_m=base_tile[0],
             tile_n=base_tile[1],
             cga=cga,
-            pack_gqa=True if packed_first else unpacked_pack,
+            pack_gqa=pack_gqa,
             split_kv=split_value,
         )
 
@@ -915,13 +931,19 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     for policy in scheds[1:]:
         out.append(replace(sched_host, sched_policy=policy))
     # The opposite pack_gqa leg, riding its own tile (packed: the largest
-    # admitting tile; unpacked: the tile rule's best).
+    # admitting tile; unpacked: the tile rule's best) and its own CGA width:
+    # on the d128 f16 SM100 flavor a packed leg that overflows one 128-row
+    # tile (S_q * G > 128 >= S_q) keeps the prefill tile while its unpacked
+    # runner-up fits the decode tile.  The other flavors' width rules do not
+    # read the packing, so this returns base.cga there.
     _, _, pack_tile = _pack_choice(base.cga)
     if pack_tile is not None:
         if base.pack_gqa is True:
-            out.append(replace(base, pack_gqa=unpacked_pack, tile_m=tiles[0][0], tile_n=tiles[0][1]))
+            _, unpacked_cga = _auto_sched_cga(spec, facts, split_kv=base.split_kv, sched_policy=base.sched_policy, pack_gqa=False)
+            out.append(replace(base, pack_gqa=unpacked_pack, tile_m=tiles[0][0], tile_n=tiles[0][1], cga=unpacked_cga))
         else:
-            out.append(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1]))
+            _, packed_cga = _auto_sched_cga(spec, facts, split_kv=base.split_kv, sched_policy=base.sched_policy, pack_gqa=True)
+            out.append(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1], cga=packed_cga))
     for split in splits[1:]:
         out.append(_leg(split))
     seen, unique = set(), []
@@ -941,13 +963,17 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
     """
     caps = spec.capabilities
     sched_policy = SCHED_NATURAL if SCHED_NATURAL in caps.sched_policies else _sole(caps.sched_policies)
-    sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=sched_policy)
+    pack_gqa = False if False in caps.pack_gqas else _sole(caps.pack_gqas)
+    # An unpacked fallback is judged on one head's rows (the d128 decode tile
+    # is also the least-demanding width: one CTA, no cluster); a row that only
+    # packs leaves the graph-level question to the rule.
+    sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=sched_policy, pack_gqa=False if pack_gqa is False else None)
     return SdpaFwdKnobs(
         sched_policy=sched_policy,
         tile_m=min(caps.tile_ms, default=None),
         tile_n=min(caps.tile_ns, default=None),
         cga=cga,
-        pack_gqa=False if False in caps.pack_gqas else _sole(caps.pack_gqas),
+        pack_gqa=pack_gqa,
         split_kv=1,  # the fallback never splits: least-demanding means one kernel, no partial workspace
     )
 

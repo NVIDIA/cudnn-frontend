@@ -62,8 +62,9 @@ the engine row declines cga=1 for THD graphs).
 
 Selection: the (128, 128) f16/bf16 flavor at ``TILE_CGA_M=1`` IS this tile
 (``api_dsl._load_sm100_kernel_module``); the heuristics propose cga=1 exactly
-when ``S_q * pack_g <= 128``, i.e. when one 128-row tile covers a KV head's
-live Q rows.  The kernel is correct for any S_q -- larger S_q simply launches
+when ``S_q * pack_g <= 128`` (``pack_g`` = G for a PackGQA plan, 1 for an
+unpacked one), i.e. when one 128-row tile covers a KV head's live Q rows.  The
+kernel is correct for any S_q -- larger S_q simply launches
 ``ceil(S_q * G / 128)`` independent CTAs per head, each walking the KV range.
 The per-shape ``compile()`` ABI is the prefill kernel's (minus the THD-only
 arguments), so the adapter's dense execute path binds both templates alike.
@@ -1605,9 +1606,28 @@ def _correction_warp_group(
         total_max_nat = total_max_scaled * LN2
         if cutlass.const_expr(CFG.HAS_SINK):
             sinks_arr = cutlass.make_array_view(sinks_tensor)
-            sink_logit = sinks_arr[row_head_idx]
-            new_max = cute.math.max(total_max_nat, sink_logit)
-            scale = cute.math.exp(total_max_nat - new_max, fastmath=True)
+            sink_logit = cutlass.Float32(sinks_arr[row_head_idx])
+            # A keyless row -- no live key at all: an empty sequence, a row above the
+            # bottom-right diagonal, a window past the last key -- holds the sink's
+            # mass alone: O := 0, LSE := sink.  The softmax masks with -inf, so such a
+            # row publishes total_sum == 0 (an alive row has total_sum >= 1) and the
+            # 0-substituted max (row_max_for_exp2).  Computing the fold from those
+            # breaks at the sink's far end: new_max = max(0, sink) = 0 and
+            # exp(sink - 0) underflows to 0 in fp32 for sink <= -104, so new_sum = 0,
+            # inv_sum = 1/0 = inf, O = 0 * inf = NaN, LSE = 0 + log(0) = -inf.  So the
+            # two operands are SELECTED for a keyless row: new_max := sink (its exp
+            # term is then exactly 1) and scale := 0 (exp(0 - sink) can overflow to
+            # inf for a very negative sink, and 0 * inf is NaN); new_sum = 1, lse =
+            # sink and inv_sum = 0 follow.  A row with keys takes the fold unchanged.
+            # The padded-Q trim below still turns a trimmed row into O = 0 / LSE =
+            # -inf, sink or not; row_dead stays False here -- it is the fp32-partial
+            # store's flag, and sink + split-KV is declined, so it is never read with
+            # a sink.  Same select as the four SM100 f16 prefill tiles (PR #1095).
+            kv_empty = total_sum <= cutlass.Float32(0.0)
+            new_max = cutlass.Float32(arith.select(kv_empty.ir_value(), sink_logit.ir_value(), cute.math.max(total_max_nat, sink_logit).ir_value()))
+            scale = cutlass.Float32(
+                arith.select(kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), cute.math.exp(total_max_nat - new_max, fastmath=True).ir_value())
+            )
             new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True)
             lse_val = new_max + cute.math.log(new_sum, fastmath=True)
             inv_sum = scale / new_sum

@@ -1528,12 +1528,19 @@ def test_sdpa_mixed_seq_len_forms_L0(env_info, cu_sides, diag_align, right_bound
 
 def _frost_decode_tile_gate():
     """These tests assert that FROST's d128 DECODE tile serves the graph, which only
-    exists on the SM100 line (cc 10.0-10.6) with the FROST engines opted in."""
+    exists on the SM100 line (cc 10.0-10.6) with the FROST engines opted in and a
+    CuTe DSL at the FROST floor (the row declines an older or absent DSL and the
+    native backend then serves the graph correctly -- a legitimate fallback the
+    routing assertion must not report as a failure of FROST)."""
     major, minor = torch.cuda.get_device_capability()
     if not (100 <= major * 10 + minor <= 106):
         pytest.skip("FROST d128 decode tile is an SM100-line (cc 10.0-10.6) kernel")
     if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES") != "1":
         pytest.skip("FROST engines are opt-in: set CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1")
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip("needs the cutedsl extra (nvidia-cutlass-dsl) at the FROST floor")
 
 
 def _assert_frost_decode_tile_served(counts_before):
@@ -1634,6 +1641,62 @@ def test_sdpa_fwd_paged_decode_tile_flashinfer_pinned_L0(env_info, request, cudn
         right_bound=None,
         seq_len_q=[1] * 32,
         seq_len_kv=[4096, 1, 129, 4000, 2048, 17, 4096, 3333] * 4,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, 1), request)
+
+    before = frost_routing.snapshot()
+    exec_sdpa(test.cfg, request, cudnn_handle)
+    _assert_frost_decode_tile_served(before)
+
+
+@pytest.mark.L0
+def test_sdpa_fwd_dense_mtp_decode_tile_sink_keyless_rows_frost_L0(env_info, request, cudnn_handle):
+    """Multi-token decode geometry from the review of PR #1094: bf16, dense padded
+    KV (declared s_kv=128), d=128, 4/1 heads, s_q=4 under BOTTOM_RIGHT alignment
+    with right_bound=0, one batch holding a single live key -- three of its four
+    rows have no key at all, so the sink is their whole mass and O must be 0 --
+    and one with all 128 keys, sink_token, on the d128 decode tile. Dense because
+    the FROST row declines paged + sink today. The harness draws the sink from
+    N(0, 0.5); the -120 sink that underflowed the decode tile's fold on exactly
+    this geometry (O = NaN, LSE = -inf) is pinned in
+    test/python/sdpa/frost/test_sdpa_fwd_decode_d128_sm100.py
+    (test_decode_kernel_keyless_rows_sink_magnitude and its graph-path twin).
+    The backend can serve an s_q=4 sink graph too; the routing assertion keeps
+    the decode tile the kernel under test.
+    """
+    _frost_decode_tile_gate()
+    import frost_routing
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=1094,
+        rng_geom_seed=1094,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=False,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_cu_seq_len=False,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=2,
+        d_qk=128,
+        d_v=128,
+        s_q=4,
+        s_kv=128,
+        h_q=4,
+        h_k=1,
+        h_v=1,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
+        left_bound=None,
+        right_bound=0,
+        seq_len_q=[4, 4],
+        seq_len_kv=[1, 128],
+        with_sink_token=True,
     )
     test.cfg.fill_derived_fields()
     test.showConfig((request.node.name, 1), request)

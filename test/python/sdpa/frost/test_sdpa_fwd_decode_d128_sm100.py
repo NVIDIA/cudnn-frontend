@@ -7,8 +7,9 @@
 one knob: ``TILE_CGA_M=2`` is the prefill pipeline (512 Q rows per cga2
 cluster) and ``TILE_CGA_M=1`` the decode tile (128 rows per independent CTA,
 one softmax warpgroup, three KV stages).  The heuristics propose cga=1 exactly
-when one 128-row tile covers a KV head's Q rows -- ``S_q * pack_g <= 128``:
-S_q = 1 decode and MTP -- and cga=2 otherwise.
+when one 128-row tile covers a KV head's Q rows -- ``S_q * pack_g <= 128`` with
+``pack_g`` the CANDIDATE's own packing (G on the packed leg, 1 on the unpacked
+one): S_q = 1 decode and MTP -- and cga=2 otherwise.
 
 Three tiers:
 
@@ -18,11 +19,13 @@ Three tiers:
 - Kernel template, direct: paged pools at every page geometry, mixed lengths
   incl. 0 and 1, PackGQA on / off / non-dividing group, forced splits with
   empty ranges, bottom-right causal MTP with per-batch Q lengths (the trim),
-  sliding window, sink, base-2 stats, the d64 envelope, the LPT schedulers.
+  sliding window, sink, base-2 stats, the d64 envelope, the LPT schedulers, and
+  the keyless-row sink contract (O := 0, LSE := sink at any sink magnitude).
 - Graph API: decode / MTP shapes select the decode tile, a prefill shape keeps
   the prefill tile, a pinned cga=2 on a decode shape is honored, THD declines
-  cga=1, dense (non-paged) padded decode, a small-batch split, and CUDA-graph
-  replay under ``set_sync_debug_mode("error")`` (Rule 3).
+  cga=1, dense (non-paged) padded decode, a dense MTP graph whose keyless rows
+  carry a sink, a small-batch split, and CUDA-graph replay under
+  ``set_sync_debug_mode("error")`` (Rule 3).
 """
 
 import math
@@ -189,9 +192,10 @@ def _plans(facts):
 
 @pytest.mark.L0
 def test_heuristics_propose_the_decode_tile_for_decode_and_mtp_shapes():
-    """cga=1 leads (and is the only width) when S_q * pack_g <= 128; the packed
-    leg leads; a bottom-right causal MTP graph walks NATURAL first (every unit
-    has the same work), with the LPT variants behind for autotune."""
+    """cga=1 leads (and is the only width) when S_q * pack_g <= 128 on every
+    leg; the packed leg leads; a bottom-right causal MTP graph walks NATURAL
+    first (every unit has the same work), with the LPT variants behind for
+    autotune."""
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 
     decode = _plans(_facts())
@@ -211,8 +215,13 @@ def test_heuristics_propose_the_decode_tile_for_decode_and_mtp_shapes():
 
 @pytest.mark.L0
 def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
-    """S_q * G > 128, prefill shapes, THD and the other flavors stay on cga2."""
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=9)))  # 9 * 16 = 144 rows
+    """S_q * G > 128 on the packed leg, prefill shapes, THD and the other
+    flavors stay on cga2.  The unpacked runner-up of an overflowing packed leg
+    is judged on ITS rows (S_q per head): see
+    test_heuristics_decode_geometry_follows_the_selected_packing."""
+    nine = _plans(_facts(s_q=9))  # 9 * 16 = 144 packed rows; 9 unpacked
+    assert all(p.knobs.cga == 2 for p in nine if p.knobs.pack_gqa), "the packed legs overflow one tile"
+    assert all(p.knobs.cga == 1 for p in nine if not p.knobs.pack_gqa), "the unpacked runner-up fits one tile"
     assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=512, h_q=8, h_kv=8, s_kv=512, padded=False)))
     assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=2048, causal=True, padded=False)))
     assert all(p.knobs.cga == 2 for p in _plans(_facts(thd=True)))
@@ -221,6 +230,34 @@ def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
     from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
 
     assert _plans(_facts(s_q=2048, causal=True, padded=False))[0].knobs.sched_policy == SCHED_LPT_L2
+
+
+@pytest.mark.L0
+def test_heuristics_decode_geometry_follows_the_selected_packing():
+    """Review (PR #1094): the decode-tile fit is decided per CANDIDATE from its
+    own packing, not once per graph from PackGQA eligibility.  G=16, S_q=16:
+    the packed leg carries 256 rows (prefill tile, and it still leads), the
+    unpacked runner-up 16 rows per head (decode tile) -- before the fix both
+    rode cga2 because the fit was computed as if every candidate were packed.
+    At S_q > 128 no leg fits; the heur_mode B fallback (unpacked, unsplit)
+    follows its own rows too; every emitted set re-validates."""
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.heuristics import recommend
+
+    plans = _plans(_facts(s_q=16))
+    legs = [(p.knobs.pack_gqa, p.knobs.cga) for p in plans]
+    assert legs[0] == (True, 2), legs
+    assert (False, 1) in legs and (False, 2) not in legs and (True, 1) not in legs, legs
+    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=129))), "129 rows overflow one tile unpacked too"
+    fallback = recommend("B", _facts(s_q=16), {ENGINE: _SM100_ID})
+    assert [(p.knobs.pack_gqa, p.knobs.cga) for p in fallback] == [(False, 1)], fallback
+    # MHA has no group: one rule for the only leg.
+    assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=64, h_q=8, h_kv=8)))
+    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=129, h_q=8, h_kv=8)))
+    caps = next(spec for spec in engines.ENGINE_SPECS if spec.name == ENGINE).capabilities
+    for f in (_facts(s_q=16), _facts(s_q=9, causal=True, bottom_right=True)):
+        for p in _plans(f):
+            assert engines.mismatch(caps, f, p.knobs) is None, p.knobs
 
 
 @pytest.mark.L0
@@ -283,6 +320,7 @@ def _run_kernel(
     window_left=None,
     sink=False,
     stats_log2=False,
+    has_lse=True,
     pack=None,
     sched=0,
     dtype=torch.float16,
@@ -294,7 +332,10 @@ def _run_kernel(
 
     ``paged=False`` binds dense [B, S_kv, KH, d] K/V with per-batch KV lengths
     (the padded path) instead of pools + tables.  ``q_lens`` (per batch, <= s_q)
-    compiles the dense padded-Q trim; None binds s_q for every batch.
+    compiles the dense padded-Q trim; None binds s_q for every batch.  ``sink``
+    is ``True`` for one randn logit per head or a number that pins every head to
+    that logit (the underflow regression needs -120, far below anything randn
+    draws).  ``has_lse=False`` compiles the Stats store out (unsplit only).
     """
     import cutlass
     import cuda.bindings.driver as cuda_driver
@@ -313,7 +354,14 @@ def _run_kernel(
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     q_len_list = [s_q] * B if q_lens is None else list(q_lens)
     seq_q = torch.tensor(q_len_list, dtype=torch.int32, device=dev)
-    sinks = torch.randn(H, device=dev, dtype=torch.float32, generator=gen) if sink else torch.zeros(H, dtype=torch.float32, device=dev)
+    if sink is True:
+        sinks = torch.randn(H, device=dev, dtype=torch.float32, generator=gen)
+    elif sink is False or sink is None:
+        sinks = torch.zeros(H, dtype=torch.float32, device=dev)
+    else:
+        sinks = torch.full((H,), float(sink), dtype=torch.float32, device=dev)
+    has_sink = sink is not False and sink is not None
+    assert has_lse or (splits == 1 and not stats_log2), "the Stats store can only be compiled out of an unsplit, natural-base run"
     if paged:
         k_pool, v_pool, bt = _pools(B, KH, d, P, max_pages, hnd, dtype, seed)
         # kernel view: [num_pages, page_size, KH, d] (a permutation of the container)
@@ -337,7 +385,7 @@ def _run_kernel(
         window_left=window_left,
         window_right=0 if causal_br else None,
         bottom_right=causal_br,
-        has_sink=sink,
+        has_sink=has_sink,
         stats_log2=stats_log2 and splits == 1,
         seq_kv_lens_present=True,
         seq_q_lens_present=q_lens is not None,
@@ -350,10 +398,10 @@ def _run_kernel(
     )
     mod = _load_decode(
         params,
-        tag=f"decode_test_{'p' + str(P) if paged else 'dense'}_s{splits}_g{G if pack else 1}_{dtype}_br{int(causal_br)}_w{window_left}_sk{int(sink)}_l2{int(stats_log2)}_q{int(q_lens is not None)}_sc{sched}",
+        tag=f"decode_test_{'p' + str(P) if paged else 'dense'}_s{splits}_g{G if pack else 1}_{dtype}_br{int(causal_br)}_w{window_left}_sk{int(has_sink)}_l2{int(stats_log2)}_q{int(q_lens is not None)}_sc{sched}_lse{int(has_lse)}",
     )
     assert mod.CGA_TILE_M == 128 and mod.CFG.STAGES_KV == 3 and mod.CFG.TOTAL_WARPS == 12
-    fn = mod.compile(b=B, qh=H, kh=KH, sq=s_q, skv=skv, d_qk=d, d_v=d, has_lse=True, **compile_kw)
+    fn = mod.compile(b=B, qh=H, kh=KH, sq=s_q, skv=skv, d_qk=d, d_v=d, has_lse=has_lse, **compile_kw)
     o_p = torch.zeros(splits * B, s_q, H, d, device=dev, dtype=torch.float32 if splits > 1 else dtype)
     lse_p = torch.zeros(splits * B, H, s_q, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -367,7 +415,7 @@ def _run_kernel(
         k_view,
         v_view,
         o_p,
-        lse_p,
+        lse_p if has_lse else None,
         sinks,
         seq_lens,
         torch.zeros(1, dtype=torch.int64, device=dev),
@@ -398,10 +446,12 @@ def _run_kernel(
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in O"
     for b in range(B):
-        ref_o, ref_lse = _ref(q[b], k_rows[b], v_rows[b], q_len_list[b], scale, causal_br=causal_br, window_left=window_left, sink=sinks if sink else None)
+        ref_o, ref_lse = _ref(q[b], k_rows[b], v_rows[b], q_len_list[b], scale, causal_br=causal_br, window_left=window_left, sink=sinks if has_sink else None)
         if stats_log2:
             ref_lse = ref_lse * math.log2(math.e)
         torch.testing.assert_close(o_out[b].float(), ref_o, atol=_tol(dtype), rtol=0, msg=f"O mismatch in batch {b} (L={lens[b]}, q_len={q_len_list[b]})")
+        if not has_lse:
+            continue
         got = lse_out[b]
         live = ~torch.isinf(ref_lse)
         torch.testing.assert_close(got[live], ref_lse[live], atol=5e-3, rtol=0, msg=f"LSE mismatch in batch {b}")
@@ -436,6 +486,9 @@ def test_decode_kernel_unpacked_paths():
     that does not divide the tile (H/H_kv = 12: the GLM 96/8 shape, served unpacked)."""
     _run_kernel(2, 8, 2, 16, 8, [50, 128], hnd=False, splits=1, pack=False)
     _run_kernel(2, 24, 2, 32, 8, [100, 256], hnd=True, splits=1)  # G=12 -> unpacked by the pack rule
+    # G=16 at S_q=16 unpacked: 16 rows per head in one tile -- the runner-up the
+    # heuristics emit for a packed leg that overflows the tile (256 rows).
+    _run_kernel(2, 16, 1, 16, 20, [17, 300], hnd=True, splits=1, s_q=16, pack=False, causal_br=True, dtype=torch.bfloat16)
 
 
 @pytest.mark.L0
@@ -479,6 +532,49 @@ def test_decode_kernel_dense_padded_sink_and_base2_stats():
     _run_kernel(3, 8, 2, 128, 4, [300, 77, 0], hnd=False, splits=1, paged=False, sink=True)
     _run_kernel(3, 8, 2, 128, 4, [300, 77, 512], hnd=False, splits=1, paged=False, stats_log2=True)
     _run_kernel(2, 8, 2, 16, 20, [300, 77], hnd=True, splits=1, stats_log2=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stats", ["stats", "stats_log2", "no_stats"])
+@pytest.mark.parametrize("sink", [-120.0, -5.0, 3.0], ids=["sink_m120", "sink_m5", "sink_p3"])
+def test_decode_kernel_keyless_rows_sink_magnitude(sink, stats):
+    """Review regression (PR #1094, inherited from the prefill tile and fixed
+    there by PR #1095): bf16, B = 1, 4/1 heads packed, paged page 16 HND, a
+    128-key cache with ONE live key, S_q = 4 under the bottom-right causal
+    diagonal, the sink pinned per head.  Three of the four rows have no key, so
+    the sink is their whole mass: O := 0, LSE := sink (times log2(e) in base 2).
+    The softmax publishes a 0-substituted row max with total_sum = 0 for such a
+    row; a fold that COMPUTES the denominator from it gets exp(-120 - 0) = 0 in
+    fp32 -> O = 0 * inf = NaN, LSE = 0 + log(0) = -inf.  -5 does not underflow
+    (the fold happens to be right), +3 sits above the substituted max (the sink
+    dominates; also right) -- the three pin the row's contract, not one
+    arithmetic accident.  Stats on, in base 2, and compiled out (O alone)."""
+    _run_kernel(
+        1,
+        4,
+        1,
+        16,
+        8,
+        [1],
+        hnd=True,
+        splits=1,
+        s_q=4,
+        causal_br=True,
+        sink=sink,
+        stats_log2=stats == "stats_log2",
+        has_lse=stats != "no_stats",
+        dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("paged", [True, False], ids=["paged", "dense"])
+def test_decode_kernel_keyless_rows_very_negative_sink_with_empty_sequence(paged):
+    """The other keyless shape: seq_len_kv = 0 (every row keyless, the tile's
+    empty-range arm) next to the one-key and a full batch, sink -120, GQA 8:2
+    packed, paged NHD and dense padded -- the empty batch is keyless on all four
+    rows, the one-key batch on three, the full one on none."""
+    _run_kernel(3, 8, 2, 16, 8, [1, 0, 128], hnd=False, splits=1, s_q=4, causal_br=True, sink=-120.0, paged=paged, dtype=torch.bfloat16)
 
 
 @pytest.mark.L0
@@ -751,6 +847,85 @@ def test_graph_dense_padded_decode_bf16():
     for b in range(B):
         ref_o, _ = _ref(q_gpu[b].transpose(0, 1), k_gpu[b].transpose(0, 1)[: lens[b]], v_gpu[b].transpose(0, 1)[: lens[b]], 1, 1.0 / math.sqrt(D))
         torch.testing.assert_close(o_gpu[b].transpose(0, 1).float(), ref_o, atol=_tol(dtype), rtol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sink", [-120.0, -5.0, 3.0], ids=["sink_m120", "sink_m5", "sink_p3"])
+def test_graph_dense_mtp_keyless_rows_sink_magnitude(sink):
+    """Through the graph API on the decode tile: bf16 dense padded MTP (S_q = 4,
+    bottom-right causal), 4/1 heads, a one-key batch and a full 128-key batch,
+    sink_token pinned per head, Stats out.  The one-key batch's three keyless
+    rows write O := 0 / LSE := sink at every magnitude (the -120 case used to
+    be O = NaN / LSE = -inf).  Dense because the row declines paged + sink
+    today (a separate change lifts that; its module carries the paged twin)."""
+    import cudnn
+    import cudnn.sdpa  # noqa: F401
+
+    dev, dtype = "cuda", torch.bfloat16
+    B, H, KH, S_q, S_kv = 2, 4, 1, 4, 128
+    lens = [1, 128]
+    scale = 1.0 / math.sqrt(D)
+    gen = torch.Generator(device=dev).manual_seed(1095)
+    q_gpu = torch.randn(B, S_q, H, D, device=dev, dtype=torch.float32, generator=gen).to(dtype).transpose(1, 2)
+    k_gpu = torch.randn(B, S_kv, KH, D, device=dev, dtype=torch.float32, generator=gen).to(dtype).transpose(1, 2)
+    v_gpu = torch.randn(B, S_kv, KH, D, device=dev, dtype=torch.float32, generator=gen).to(dtype).transpose(1, 2)
+    o_gpu = torch.empty(B, S_q, H, D, device=dev, dtype=dtype).transpose(1, 2)
+    stats_gpu = torch.empty(B, H, S_q, 1, device=dev, dtype=torch.float32)
+    sink_gpu = torch.full((1, H, 1, 1), sink, device=dev, dtype=torch.float32)
+    slk = torch.tensor(lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+    slq = torch.full((B, 1, 1, 1), S_q, dtype=torch.int32, device=dev)
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    q, k, v = g.tensor_like(q_gpu), g.tensor_like(k_gpu), g.tensor_like(v_gpu)
+    sq_t, sk_t, sink_t = g.tensor_like(slq), g.tensor_like(slk), g.tensor_like(sink_gpu)
+    o, st = g.sdpa(
+        name="sdpa",
+        q=q,
+        k=k,
+        v=v,
+        generate_stats=True,
+        attn_scale=scale,
+        use_padding_mask=True,
+        seq_len_q=sq_t,
+        seq_len_kv=sk_t,
+        use_causal_mask_bottom_right=True,
+        sink_token=sink_t,
+    )
+    o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
+    st.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    plan = select_engine(g, ENGINE)
+    assert (plan.knobs.cga, plan.knobs.pack_gqa, plan.knobs.split_kv) == (1, True, 1), plan.knobs
+    g.check_support()
+    g.build_plans()
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        g.execute({q: q_gpu, k: k_gpu, v: v_gpu, sq_t: slq, sk_t: slk, sink_t: sink_gpu, o: o_gpu, st: stats_gpu}, ws)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    out = o_gpu.transpose(1, 2).float()  # [B, S_q, H, D]
+    assert torch.isfinite(out).all(), "keyless rows must not NaN the output"
+    rows = torch.arange(S_q, device=dev).view(1, S_q)
+    keyless = (torch.tensor(lens, device=dev).view(B, 1) - S_q + rows < 0).view(B, S_q, 1).expand(B, S_q, H)
+    assert keyless.sum().item() == 3 * H, "the one-key batch is keyless on its three rows above the diagonal"
+    assert (out[keyless] == 0).all(), "a keyless row writes O := 0 even with a sink"
+    got_lse = stats_gpu[:, :, :, 0].transpose(1, 2)  # [B, S_q, H]
+    torch.testing.assert_close(got_lse[keyless], torch.full_like(got_lse[keyless], sink), atol=1e-4, rtol=0)
+    for b in range(B):
+        ref_o, ref_lse = _ref(
+            q_gpu[b].transpose(0, 1),
+            k_gpu[b].transpose(0, 1)[: lens[b]],
+            v_gpu[b].transpose(0, 1)[: lens[b]],
+            S_q,
+            scale,
+            causal_br=True,
+            sink=sink_gpu.flatten(),
+        )
+        torch.testing.assert_close(out[b], ref_o, atol=_tol(dtype), rtol=0, msg=f"batch {b}")
+        torch.testing.assert_close(stats_gpu[b, :, :, 0], ref_lse, atol=5e-3, rtol=0, msg=f"LSE batch {b}")
 
 
 @pytest.mark.L0

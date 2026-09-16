@@ -1299,7 +1299,8 @@ class CfgD128Decode(CfgD128):
 
     Selected by the adapter for the (128, 128) f16/bf16 flavor whenever the
     plan's ``TILE_CGA_M`` knob is 1 (``api_dsl._load_sm100_kernel_module``); the
-    heuristics propose cga=1 exactly when ``S_q * pack_g <= 128``.
+    heuristics propose cga=1 exactly when ``S_q * pack_g <= 128`` (``pack_g`` =
+    the candidate's own packing: G packed, 1 unpacked).
     """
 
     CGA_M: int = 1
