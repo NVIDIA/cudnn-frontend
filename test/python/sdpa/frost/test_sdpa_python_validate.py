@@ -14,6 +14,8 @@ Device-free: candidates are stubbed via ``manifest.engines_for``; nothing here
 builds plans or executes.
 """
 
+import math
+
 import pytest
 
 import cudnn
@@ -355,3 +357,57 @@ def test_gate_tail_match_is_structural():
     g3.relu(input=ts3["o"]).set_output(True)
     assert match_gate_tail(g3.nodes) is None
     assert match_gate_tail(_sdpa_graph(use_causal_mask=True)[0].nodes) is None, "a single sdpa node is not a tail"
+
+
+def test_mxfp8_unrequested_amax_o_validates_natively(frost_candidate):
+    """``sdpa_mxfp8`` RETURNS its Amax_O port unconditionally.  A caller that does
+    not request it (no set_output / set_dim / set_stride -- the block's
+    has_amax_o=False path) must still pass validate() on the python-native
+    route: the op spec now infers the ``[1, 1, 1, 1]`` scalar the way
+    ``sdpa_fp8`` does, so the IR-level "Tensor 'sdpa_mxfp8.0::Amax_O' dims not
+    set" is gone and the graph is NOT lowered to C++.  The declared twin (the
+    harness's ``amax=True`` form) validates the same way and keeps its dims."""
+    b, h, s, d = 1, 2, 128, 128
+    dims, stride = [b, h, s, d], [h * s * d, s * d, d, 1]
+
+    def build(*, request_amax_o):
+        g = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        q = g.tensor(name="q", dim=dims, stride=stride)
+        k = g.tensor(name="k", dim=dims, stride=stride)
+        v = g.tensor(name="v", dim=dims, stride=stride)
+
+        def sf(sd):  # F8_128x4 scale factors: Q/K rowwise [b,h,s,d/32], V columnwise [b,h,s/32,d]
+            return g.tensor(
+                dim=sd,
+                stride=[sd[1] * sd[2] * sd[3], sd[2] * sd[3], sd[3], 1],
+                data_type=cudnn.data_type.FP8_E8M0,
+                reordering_type=cudnn.tensor_reordering.F8_128x4,
+            )
+
+        o, stats, amax_o = g.sdpa_mxfp8(
+            q,
+            k,
+            v,
+            sf([b, h, s, d // 32]),
+            sf([b, h, s, d // 32]),
+            sf([b, h, s // 32, d]),
+            attn_scale=1.0 / math.sqrt(d),
+            generate_stats=False,
+            use_causal_mask=True,
+        )
+        assert stats is None  # inference-mode: no Stats port
+        o.set_output(True).set_dim(dims).set_stride(stride).set_data_type(cudnn.data_type.HALF)
+        if request_amax_o:
+            amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+        return g, amax_o
+
+    g, amax_o = build(request_amax_o=False)
+    assert amax_o.is_virtual and not amax_o.dim_assigned
+    g.validate()
+    assert g._is_validated and g._lowered_graph is None, "validate() must not lower to C++ when a python engine is a candidate"
+    assert amax_o.is_virtual and list(amax_o.dim) == [1, 1, 1, 1] and list(amax_o.stride) == [1, 1, 1, 1]
+
+    g, amax_o = build(request_amax_o=True)
+    g.validate()
+    assert g._is_validated and g._lowered_graph is None
+    assert not amax_o.is_virtual and amax_o.dim_assigned and list(amax_o.dim) == [1, 1, 1, 1]
