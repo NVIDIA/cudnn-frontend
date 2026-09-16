@@ -22,7 +22,9 @@ def test_new_constructor_parameters_follow_the_legacy_positional_prefix():
         "thd_stats_padded",
     ]
     assert params[params.index("paged_table_stride") : params.index("thd_stats_padded") + 1] == legacy_tail
-    assert params[-2:] == ["sample_amax_o", "pv_bf16"]
+    extension_start = params.index("sample_amax_o")
+    assert params[extension_start : extension_start + 3] == ["sample_amax_o", "pv_bf16", "stats_log2"]
+    assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
 
 
 @pytest.mark.L0

@@ -108,3 +108,16 @@ ordered after that read.**
   is `ref == 0, gpu != 0` elements on masked configs with `key mod TILE_N`
   in the aliased range — recover the leaked keys by matching
   `O_gpu - O_ref` against `V` rows.
+
+
+**Rule S4 — Split-K partial Stats keep the combiner's log base.**
+
+- `stats_use_log2` changes final Stats only. Partial LSE consumed by a
+  natural-log combine stays natural-log, including direct kernel entry points;
+  apply `log2(e)` exactly once at the final store.
+- Check both O and Stats against an independent reference with nonzero logits.
+  O-only checks miss a wrong Stats base; zero logits miss an unscaled row maximum.
+  See `test_fp8_graph_stats_use_log2` and the split-KV Stats tests.
+  `test_sm120_direct_template_stats_base` bypasses the adapter: the adapter
+  clears the partial-log2 flag itself, so adapter-only tests cannot detect
+  a missing guard in a directly called template.

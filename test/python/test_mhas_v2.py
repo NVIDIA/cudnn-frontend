@@ -267,6 +267,125 @@ def test_sdpa_random_sq1_unified_L1(env_info, test_no, request, cudnn_handle):
     exec_sdpa(test.cfg, request, cudnn_handle)
 
 
+# fmt: on
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(cudnn.backend_version() < 92400, reason="ragged offset multiplier requires cuDNN >= 9.24")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("offset_dtype,use_multiplier", [(torch.int32, True), (torch.int64, False)], ids=["int32_tokens", "int64_elements"])
+@pytest.mark.parametrize(
+    "s_q,h_q,ragged_stats",
+    [(1, 8, True), (1, 8, False), (1, 2, True), (2, 8, True)],
+    ids=["decode_gqa_ragged", "decode_gqa_padded_stats", "decode_mha_ragged", "prefill_gqa_ragged"],
+)
+def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, use_multiplier, s_q, h_q, ragged_stats):
+    """Single-token GQA must write every head's LSE, even when O is correct."""
+    from cudnn.engines.engine_ids import is_backend_engine
+
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("unified SDPA requires SM80 or newer")
+
+    b, h_kv, d = 3, 2, 128
+    kv_lengths = [128, 256, 128]
+    rng = torch.Generator(device="cuda").manual_seed(6783545)
+    q_gpu = torch.randn(b * s_q, h_q, d, device="cuda", dtype=dtype, generator=rng)
+    k_gpu = torch.randn(sum(kv_lengths), h_kv, d, device="cuda", dtype=dtype, generator=rng)
+    v_gpu = torch.randn(k_gpu.shape, device="cuda", dtype=dtype, generator=rng)
+    o_gpu = torch.full_like(q_gpu, float("nan"))
+    stats_gpu = torch.full((b, s_q, h_q, 1), float("nan"), device="cuda").transpose(1, 2)
+    cu_q_gpu = torch.arange(b + 1, dtype=torch.int32, device="cuda") * s_q
+    cu_kv_gpu = torch.tensor([0, 128, 384, 512], dtype=torch.int32, device="cuda")
+
+    graph = cudnn.pygraph(
+        io_data_type=cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        handle=cudnn_handle,
+    )
+    pack = {}
+
+    def offset(cu, token_stride):
+        data = cu.to(offset_dtype) * (1 if use_multiplier else token_stride)
+        desc = graph.tensor_like(data)
+        pack[desc] = data
+        return desc
+
+    def packed_tensor(data, heads, max_seq, cu):
+        desc = graph.tensor(dim=[b, heads, max_seq, d], stride=[max_seq * heads * d, d, heads * d, 1])
+        desc.set_ragged_offset(offset(cu, heads * d))
+        if use_multiplier:
+            desc.set_ragged_offset_multiplier(heads * d)
+        pack[desc] = data
+        return desc
+
+    q = packed_tensor(q_gpu, h_q, s_q, cu_q_gpu)
+    k = packed_tensor(k_gpu, h_kv, max(kv_lengths), cu_kv_gpu)
+    v = packed_tensor(v_gpu, h_kv, max(kv_lengths), cu_kv_gpu)
+    cu_q, cu_kv = graph.tensor_like(cu_q_gpu), graph.tensor_like(cu_kv_gpu)
+    pack.update({cu_q: cu_q_gpu, cu_kv: cu_kv_gpu})
+    o, stats = graph.sdpa(
+        q=q,
+        k=k,
+        v=v,
+        generate_stats=True,
+        attn_scale=d**-0.5,
+        use_padding_mask=True,
+        cu_seq_len_q=cu_q,
+        cu_seq_len_kv=cu_kv,
+        implementation=cudnn.attention_implementation.UNIFIED,
+    )
+    o.set_output(True).set_dim([b, h_q, s_q, d]).set_stride([s_q * h_q * d, d, h_q * d, 1])
+    o.set_ragged_offset(offset(cu_q_gpu, h_q * d))
+    if use_multiplier:
+        o.set_ragged_offset_multiplier(h_q * d)
+    stats.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride())
+    if ragged_stats:
+        stats.set_ragged_offset(offset(cu_q_gpu, h_q))
+        if use_multiplier:
+            stats.set_ragged_offset_multiplier(h_q)
+    pack.update({o: o_gpu, stats: stats_gpu})
+
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A])
+    # Pin a backend plan: a FROST pass cannot prove this native codegen regression.
+    backend_plans = [i for i in range(graph.get_execution_plan_count()) if is_backend_engine(graph.get_engine_and_knobs_at_index(i)[0])]
+    if not backend_plans:
+        pytest.skip("no unified backend plan on this device")
+    graph.select_plan(backend_plans[0])
+    graph.check_support()
+    graph.build_plans()
+    print("Ragged Stats backend plan:", graph.get_plan_name_at_index(backend_plans[0]))
+    workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    torch.cuda.synchronize()  # Inputs were created on the torch stream; the fixture handle owns another stream.
+    graph.execute(pack, workspace, handle=cudnn_handle)
+    torch.cuda.synchronize()
+
+    # Independent fp64 reference; check O as well as every q head's Stats.
+    kv_start = 0
+    stats_refs = []
+    for batch, kv_len in enumerate(kv_lengths):
+        q_ref = q_gpu[batch * s_q : (batch + 1) * s_q].double().transpose(0, 1)
+        k_ref = k_gpu[kv_start : kv_start + kv_len].double().transpose(0, 1).repeat_interleave(h_q // h_kv, dim=0)
+        v_ref = v_gpu[kv_start : kv_start + kv_len].double().transpose(0, 1).repeat_interleave(h_q // h_kv, dim=0)
+        scores = (q_ref @ k_ref.transpose(-1, -2)) * d**-0.5
+        o_ref = (scores.softmax(-1) @ v_ref).transpose(0, 1).to(dtype)
+        torch.testing.assert_close(o_gpu[batch * s_q : (batch + 1) * s_q], o_ref, atol=5e-3, rtol=1e-2)
+        stats_refs.append(scores.logsumexp(-1).float().unsqueeze(-1))
+        kv_start += kv_len
+
+    # Known issue on older backends (NVBug 6783545). Register only AFTER all O
+    # checks, so an unrelated plan/build/output failure is never an expected failure.
+    # Do not waive 9.28+ development builds: they must carry the backend fix.
+    # A backport to an older version is an XPASS that asks us to retire this marker.
+    if cudnn.backend_version() < 92800 and s_q == 1 and h_q > h_kv and ragged_stats:
+        request.node.add_marker(pytest.mark.xfail(strict=True, raises=AssertionError, reason="cuDNN < 9.28: ragged decode GQA Stats (NVBug 6783545)"))
+    torch.testing.assert_close(stats_gpu, torch.stack(stats_refs), atol=1e-4, rtol=1e-4)
+
+
+# fmt: off
+
 # # =====================================================
 # # L0 lean attention, s_kv=513..4096
 # # =====================================================

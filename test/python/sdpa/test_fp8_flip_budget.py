@@ -421,7 +421,9 @@ def test_the_intermediates_reconstruct_the_reference_outputs(itype):
     assert inter["p_scaled"][~inter["valid"]].abs().max().item() == 0.0, "masked P = 0 by construction"
     codes = inter["p_scaled"].to(itype).float()
     v_of_hq = prob.v.permute(0, 2, 1, 3).repeat_interleave(G, 1)  # [b, hq, j, d] = V[b, j, gqa_kv_head(hq)]
-    o_rec = torch.einsum("bhij,bhjd->bhid", codes * inter["gain"] * prob.s_descale, v_of_hq).permute(0, 2, 1, 3)
+    # The gain-scaled codes are no longer exactly representable in TF32. Keep
+    # this tight reconstruction check independent of the CI matmul precision.
+    o_rec = torch.einsum("bhij,bhjd->bhid", (codes * inter["gain"] * prob.s_descale).double(), v_of_hq.double()).permute(0, 2, 1, 3)
     assert (o_rec - o_unquant).abs().max().item() < 1e-5 * max(1.0, o_unquant.abs().max().item())
 
     dQ, dK, dV, _, dP_amax, dQ_amax, dK_amax, dV_amax, bi = prob.backward(stats, return_intermediates=True)

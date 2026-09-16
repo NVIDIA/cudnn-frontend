@@ -570,7 +570,8 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   bool const unfuse_fma,
                   cudnn_frontend::AttentionImplementation_t const& implementation,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
-                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv) {
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
+                  bool const stats_use_log2) {
     cudnn_frontend::DataType_t mma_core_mode                             = cudnn_frontend::DataType_t::FP8_E4M3;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> block_mask = nullptr;
 
@@ -660,7 +661,8 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          scale_s,
                                          scale_o,
                                          implementation,
-                                         unfuse_fma);
+                                         unfuse_fma,
+                                         stats_use_log2);
 
     // Return all 4 outputs as array for backward compatibility
     return {internal_result.O, internal_result.Stats, internal_result.Amax_S, internal_result.Amax_O};
@@ -1342,6 +1344,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("implementation", cudnn_frontend::AttentionImplementation_t::AUTO),
           py::arg_v("cu_seq_len_q", nullptr),
           py::arg_v("cu_seq_len_kv", nullptr),
+          py::arg_v("stats_use_log2", false),
           R"pbdoc(
                 Perform scaled dot product attention with fp8 datatype inputs and outputs.
 
@@ -1381,6 +1384,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     implementation (Optional[cudnn.attention_implementation]): Which underlying implementation to use in the cuDNN backend. Default is AUTO (recommended).
                     cu_seq_len_q (Optional[cudnn_tensor]): Cumulative sequence length of the query, shape (b+1, 1, 1, 1) or 1-D (b+1,) (promoted automatically), int32 or int64. Mutually exclusive with seq_len_q; pair with a KV-side tensor (seq_len_kv or cu_seq_len_kv) and set use_padding_mask=True. The two sides may use different forms. Requires cuDNN 9.25+ and UNIFIED.
                     cu_seq_len_kv (Optional[cudnn_tensor]): Cumulative sequence length of the key, shape (b+1, 1, 1, 1) or 1-D (b+1,) (promoted automatically), int32 or int64. Mutually exclusive with seq_len_kv; pair with a Q-side tensor (seq_len_q or cu_seq_len_q) and set use_padding_mask=True. The two sides may use different forms. Requires cuDNN 9.25+ and UNIFIED.
+                    stats_use_log2 (Optional[bool]): Return Stats as natural-log LSE multiplied by log2(e). Only Stats changes; SDPA backward expects natural-log Stats. Requires a FROST engine or UNIFIED on cuDNN 9.28.0+. Default is False.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and right_bound=0. Default is TOP_LEFT.
                     left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
