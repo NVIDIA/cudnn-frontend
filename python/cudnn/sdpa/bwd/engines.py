@@ -204,6 +204,9 @@ class Capabilities:
     # the row's workspace is sized from the packed token totals at BUILD time,
     # before any buffer exists.
     thd_declared_totals: bool = False
+    # Minimum declared packed capacity: SM100 binds a never-read dummy for
+    # empty storage; SM80 still requires a positive allocation bound.
+    thd_min_total: int = 1
     # s_q == 1 (decode-shaped) graphs; rows whose kernels are prefill-only gate
     # them off.
     decode: bool = True
@@ -332,9 +335,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             return f"graph uses {label}, which this engine does not support"
 
     if facts.thd and capabilities.thd:
-        if capabilities.thd_declared_totals and any(t is None or int(t) <= 0 for t in (facts.max_total_seq_len_q, facts.max_total_seq_len_kv)):
+        if capabilities.thd_declared_totals and any(
+            t is None or int(t) < capabilities.thd_min_total for t in (facts.max_total_seq_len_q, facts.max_total_seq_len_kv)
+        ):
             return (
-                "THD requires positive sdpa_backward(max_total_seq_len_q=..., max_total_seq_len_kv=...): "
+                f"THD requires sdpa_backward(max_total_seq_len_q=..., max_total_seq_len_kv=...) >= {capabilities.thd_min_total}: "
                 "the packed workspace is sized from the declared token totals at build time"
             )
         # The packed path binds the caller's buffers straight to kernels whose
@@ -885,6 +890,7 @@ def _sm100_spec() -> EngineSpec:
             gqa=True,  # per-Q-head dK/dV partials + the shared dkv_reduce group fold
             thd=True,
             thd_declared_totals=True,  # the blocked workspace is sized at build time
+            thd_min_total=0,  # empty packs use workspace dummies and kernel-side zero reductions
             # Any dense layout: the adapter uses a BSHD-physical tensor in place
             # (a permuted view, zero copy) and stages a non-conforming one
             # through the workspace. That is not hypothetical -- a caller that

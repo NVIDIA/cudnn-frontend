@@ -181,6 +181,10 @@ A sequence that is empty on ONE side only (`S_q[b] == 0` with `S_kv[b] > 0`, or
 the reverse) is served and returns exactly zero for that sequence: its GEMM's
 reduction axis is empty, so no MMA initialises the accumulator, and the epilogue
 stores zeros rather than TMEM residue.
+The SM100/SM103 row also accepts zero declared packed capacity on either or
+both sides (`thd_min_total=0`): never-read workspace dummies keep tensor-map
+extents legal and the kernels write exact zero gradients for empty reductions.
+SM80 retains its positive-capacity requirement (`thd_min_total=1`).
 **GQA / MQA is served** as well: the stage-3 dK/dV GEMMs write one partial per Q
 head over the PACKED kv axis and the shared reduce folds the group onto the KV
 heads, so the packed path now matches the dense one feature for feature. With
