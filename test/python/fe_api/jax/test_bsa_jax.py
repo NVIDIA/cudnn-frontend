@@ -6,10 +6,17 @@ import subprocess
 import sys
 from functools import partial
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
+
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("JAX BSA tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
+jax = pytest.importorskip("jax", minversion="0.9.1")
+import jax.numpy as jnp
 
 from cudnn import block_sparse_attention_forward_jax as forward
 from cudnn import block_sparse_attention_backward_jax as backward

@@ -1,10 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
+
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("JAX bridge tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
+jax = pytest.importorskip("jax", minversion="0.9.1")
+import jax.numpy as jnp
+
 import cutlass.cute as cute
 from cutlass.jax import TensorSpec
 from cudnn.jax import call, zeros_init
