@@ -18,6 +18,8 @@ from cudnn.jax import (
     kimi_delta_attention_bwd as bwd,
 )
 
+pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
+
 
 def inputs(
     dk=64,
