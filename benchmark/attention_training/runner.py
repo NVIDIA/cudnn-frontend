@@ -9,14 +9,14 @@ from configuration files, and a CLI entry point.
 
 Usage:
     # Run from command line
-    python -m benchmark.attention_training.runner --config mlperf
-    python -m benchmark.attention_training.runner --config mlperf --dry-run
+    python -m benchmark.attention_training.runner --config llama
+    python -m benchmark.attention_training.runner --config llama --dry-run
 
     # Import and use programmatically
     from benchmark.attention_training.runner import BenchmarkRunner
     from benchmark.attention_training.configs import load_config
 
-    config = load_config("mlperf")
+    config = load_config("llama")
     runner = BenchmarkRunner()
     results = runner.run_config(config)
     runner.save_csv(results, config)
@@ -80,7 +80,7 @@ class BenchmarkRunner:
 
     Example:
         runner = BenchmarkRunner(verbose=True)
-        config = load_config("mlperf")
+        config = load_config("llama")
 
         # Dry run to see what would be executed
         for case in runner.expand_config(config):
@@ -415,27 +415,27 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Run all benchmarks from mlperf config
-    python -m benchmark.attention_training.runner --config mlperf
+    # Run all benchmarks from the llama config
+    python -m benchmark.attention_training.runner --config llama
 
     # Dry run (show what would be executed)
-    python -m benchmark.attention_training.runner --config mlperf --dry-run
+    python -m benchmark.attention_training.runner --config llama --dry-run
 
     # Filter by model name
-    python -m benchmark.attention_training.runner --config mlperf --filter llama3.1
+    python -m benchmark.attention_training.runner --config llama --filter llama3.1
 
     # Filter by backend
-    python -m benchmark.attention_training.runner --config mlperf --backend cudnn
+    python -m benchmark.attention_training.runner --config llama --backend cudnn
 
     # Skip chart generation
-    python -m benchmark.attention_training.runner --config mlperf --no-chart
+    python -m benchmark.attention_training.runner --config llama --no-chart
         """,
     )
 
     parser.add_argument(
         "--config",
         required=True,
-        help="Config name (e.g., 'mlperf'). Must be a Python file in configs/",
+        help="Config name (e.g., 'llama'). Must be a Python file in configs/",
     )
     parser.add_argument(
         "--dry-run",

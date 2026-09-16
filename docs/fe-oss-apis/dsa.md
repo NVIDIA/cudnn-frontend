@@ -103,6 +103,8 @@ DSA.compress_topk_cand_buffer_size_thd
 
 DSA.IndexerTopK
 DSA.indexer_top_k_wrapper
+DSA.local_to_global_wrapper
+DSA.compactify_wrapper
 
 DSA.SparseIndexerScoreRecompute
 DSA.sparse_indexer_score_recompute_wrapper
@@ -274,23 +276,38 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward wrapper's
   - `lse`: `(total_S_q, H)` FP32
   - `attn_sink`: `(H,)` FP32
   - `topk_idxs`: `(total_S_q, topk_max)` INT32 (global)
-  - `topk_length` (optional): `(total_S_q,)` INT32 — per-query valid count
+  - `topk_length` (optional): `(total_S_q,)` INT32 — per-query valid count.
+    The H128 two-CTA backends (D512 and D576) clamp it to `[0, topk_max]`
+    and ignore every slot after that prefix, including valid indices pointing
+    to nonfinite KV rows; the other backends expect `topk_length <= topk_max`.
+    Omitting this tensor uses all `topk_max` slots.
 
 On Blackwell SM100/SM103, the public backward entry point automatically selects
 the tuned kernel from the device, dtype, and tensor shape. On SM100 (10, 0) and
 SM103 (10, 3) devices, BF16 H128 with `head_dim = head_dim_v = 512` and
-`topk_max ∈ {128, 512, 1024, 1152, 2048}` uses the two-CTA specialization. H16 with
+`topk_max ∈ {128, 512, 1024, 1152, 2048}` uses the two-CTA specialization.
+Contiguous BF16 H128 with `head_dim = 576`, `head_dim_v = 512`, and the same
+`topk_max` set uses the H128/D576 two-CTA specialization. H16 with
 `head_dim=576` uses the dedicated M128 sparse-row pipeline. FP16, other head
-counts and dimensions, and every other `topk_max` retain the existing
-generic/H16 selection. Other compute capabilities, including SM107, do not
-select the two-CTA path. No backend or tile-size argument is required. SM90
-continues to use its Hopper-specific implementation.
+counts and dimensions, every other `topk_max`, and noncontiguous H128/D576
+inputs retain the existing generic/H16/H32 selection. Other compute
+capabilities, including SM107, do not select the two-CTA paths. No backend or
+tile-size argument is required. SM90 continues to use its Hopper-specific
+implementation.
 
 The H128 specialization keeps the five tensor-core products in one
 two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to the
 caller-provided scratch workspace, converts the FP32 dKV workspace to the public BF16
 output, and completes dSink with a separate FP32 reduction kernel. The helper
 launches do not change the two-CTA topology of the core computation.
+
+The H128/D576 specialization applies the same two-CTA topology to the MLA
+layout (`head_dim = 576`, `head_dim_v = 512`). Its compiled sequence
+initializes the FP32 dKV workspace and the dSink output on the launch stream,
+accumulates dKV in that workspace, and converts it to the public BF16 output
+with a helper kernel. Short query batches split each query's top-k range
+across otherwise idle two-SM clusters; the split count is fixed when the plan
+is compiled.
 
 On SM100 with H16/H32/H64/H96/H128, `deterministic=True` selects a bounded-wave
 M64 implementation. Queries run in same-stream waves of 128 CTAs; CTA lane
@@ -304,15 +321,22 @@ head reduces `d_sink`. The additional dKV workspace is
 `128 * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)` bytes. Use
 `scratch_workspace_bytes()` as the authoritative full scratch size.
 `deterministic=True` takes precedence over the two-CTA selection: the BF16
-H128/D512 envelope also runs the bounded-wave M64 kernel when determinism is
-requested, because the two-CTA path accumulates dKV with FP32 atomics.
+H128/D512 and H128/D576 envelopes also run the bounded-wave M64 kernel when
+determinism is requested, because the two-CTA paths accumulate dKV with FP32
+atomics.
+Treat this as a reproducibility requirement rather than a performance-tuning
+knob: keep the default `False` when bitwise run-to-run stability is not needed.
 
 `SparseAttentionBackward.scratch_workspace_bytes()` reports the full SM100
 scratch requirement. Pass a contiguous CUDA `uint8` tensor of at least this
 size to `execute(..., workspace=workspace)` and reuse it across calls; the
 compiled kernel initializes the dKV accumulator on every execution. The
 high-level wrapper accepts the same optional `workspace=` argument and only
-allocates convenience scratch when it is omitted.
+allocates convenience scratch when it is omitted. The H128/D576 two-CTA plan
+compiles its kernel in `compile()`, and its `execute()` additionally requires
+caller-provided `dq`, `dkv`, and `d_sink` buffers: it never allocates or
+compiles during execution. The wrapper allocates those outputs when they are
+omitted. Other backends do not accept a caller-provided `d_sink`.
 
 - **Outputs** — tuple `(dq, dkv, d_sink)`
 - **Constraints** — SM90 or Blackwell SM100/SM103; SM90 supports flat MQA tensors with `head_dim ∈ {512, 576}`
@@ -411,6 +435,22 @@ prefix are clamped to `seqlen_k_b`. THD MXFP8 uses the same caller-guaranteed
 device-side scale-prefix contract described in §3; the interface does not
 validate prefix values with a device-to-host copy.
 
+Leave `microbatch_rows=-1` to use the BSHD long-sequence memory policy; it
+enables windowing only for compatible BF16 shapes. Pass `0` to force one
+launch, or a positive value only when deliberately controlling the scratch
+footprint, and pass the same value to `compress_topk_cand_buffer_size`.
+
+Global versus local ids is primarily an interoperability and allocation
+choice, not an Indexer Backward tuning choice. Keep the default global ids
+when a downstream consumer requires flat KV ids. If every consumer accepts
+local ids, prefer `topk_indices_global=False`. Avoiding the local-to-global
+conversion can slightly improve wrapper performance, particularly for short
+sequences. Local ids also avoid conversion temporaries and enable a
+strictly zero-extra-allocation captured path when all documented buffers are
+supplied. The global-id conversion is CUDA-graph-safe; during capture, its
+temporaries are recorded in the graph's private pool. Include any downstream
+conversion when comparing end-to-end performance.
+
 ```python
 cand_floats = DSA.compress_topk_cand_buffer_size(
     B, S_q, S_k, ratio=4, return_lse=True,
@@ -437,7 +477,8 @@ with variable per-row effective length.
   - `input_values`: `(n_rows, num_cols)` FP32/FP16/BF16
   - `seq_lens`: `(batch_size,)` INT32 (per-batch effective column count)
 - **Outputs** — tuple `(indices, values)` (values is `None` when
-  `return_val=False`)
+  `return_val=False`). Use `return_val=False` when only the indices are
+  consumed, so no values output buffer is allocated or written.
 - **Constraints** — SM90+, `top_k ≤ 2048`
 
 ```python
@@ -447,6 +488,50 @@ result = DSA.indexer_top_k_wrapper(
 )
 indices, values = result["indices"], result["values"]
 ```
+
+#### Compact vs. non-compact sparse indices
+
+Providing `topk_length` declares a compact input layout for Sparse Attention
+Backward and the sparse score-recompute kernels: in each row, the first
+`topk_length[row]` slots must contain valid ids and every later slot must be
+filled with `-1`. The padding value is required even when `topk_length` is
+provided, because the SM100 attention score-recompute wrapper may select a
+non-compact kernel that identifies invalid slots by their index values. Use
+`compactify_wrapper` first when invalid entries are interspersed. A 3-D input
+is returned flattened as `(B * S_q, topk)` with a `(B * S_q,)` length tensor;
+reshape both when a BSHD score-recompute wrapper expects batched shapes. The
+operation preserves the input id convention; it does not convert local ids to
+global ids.
+
+There is no universal faster representation. Compact execution can skip
+sparse tiles when valid prefixes are substantially shorter than the physical
+top-k width, while non-compact execution can benefit from static loop bounds
+when rows are nearly full. The SM100 sparse attention score-recompute wrapper
+uses separately tuned tile policies and can internally select its non-compact
+path when that has better code generation. If conversion is required solely
+for performance, benchmark the entire `compactify_wrapper` + consumer sequence
+for the target length distribution. Indexer Backward has no `topk_length`
+argument and always processes its fixed slot width; its score tensors and ids
+must remain aligned slot-for-slot.
+
+For BF16 workloads with causal sparse indices, the following are useful
+starting points; the best choice still depends on the shape and valid-length
+distribution:
+
+- On SM100, prefer trying the non-compact path for Sparse Attention Score
+  Recompute when optimizing this consumer in isolation; it can be slightly
+  faster. For Sparse Indexer Score Recompute, preserve the producer's
+  representation, since the performance difference is generally small.
+- On SM90, prefer compact inputs for both sparse score-recompute kernels when
+  the valid-prefix length is already available; compact execution can be
+  slightly faster.
+- For Sparse Attention Backward on either architecture, prefer compact inputs
+  when the valid-prefix length is already available. The benefit may be small
+  when most rows are full.
+
+Retain local ids when the producer and every downstream consumer accept them.
+If `compactify_wrapper` or an id conversion must be added, time that operation
+together with the consumer before choosing a representation.
 
 ### 6. Sparse Indexer Score Recompute
 
@@ -527,6 +612,17 @@ the singleton K head and add a batch dimension) together with global Top-K
 indices. FP8 and MXFP8 indexer backward are not currently supported because
 the backward wrapper requires BF16 Q/K/W inputs.
 
+For the default SM100 backend, `topk_indices_global` describes the input
+encoding; it is not a performance-tuning switch. When Gather4 is available,
+local ids are range-checked and converted to flat ids in registers before the
+same optimized gather path. Do not add a separate `local_to_global_wrapper`
+launch only for Indexer Backward; preserve the producer's id convention and
+set `topk_indices_global` to match it.
+
+On SM90, also prefer preserving the producer's id convention. The performance
+difference between local and global ids is generally small, so a separate
+conversion solely for Indexer Backward is unlikely to help.
+
 #### SM100 sparse backward v2 (opt-in)
 
 `backend="sm100_v2"` on `IndexerBackward` / `indexer_backward_wrapper`
@@ -536,6 +632,11 @@ unknown value raises `ValueError`). The semantics are
 **request-or-fail**: outside the envelope below the wrapper raises
 `ValueError` (or `RuntimeError` off SM100) and never silently falls back to
 the default backend.
+
+Start with the default backend when throughput is the goal. Select `sm100_v2` for
+its two-term gradient representation, deterministic `d_weights`, or FP32
+output contract, not as an automatic performance-tuned alternative; benchmark
+the complete wrapper on the target shape when those properties are required.
 
 - **What it computes differently** — weights are upcast to fp32 in-register
   (exact) and the fp32 per-slot gradient matrix is split into a two-term BF16

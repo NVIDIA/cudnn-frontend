@@ -26,9 +26,10 @@ head-major, never dense-padded.**
   `_thd_lse_view`'s docstring), not something the adapter verifies:
   `as_strided` bounds-checks storage capacity, never overlap. Do not "fix"
   this with a host-side length read; an in-kernel assert is the only
-  legal detector. See the THD classification sites in `fwd/api_dsl.py`
-  (duplicated at the two THD compile-key call sites — extract rather than
-  re-copy if you touch it, per Rule 3's "suspect duplicated logic first").
+  legal detector. Classify with `graph_analyzer.thd_stats_packing(stride_h,
+  stride_s, h_q)` — the one classifier the fwd adapters, the bwd probe and the
+  bwd lowering share; never re-implement the stride test inline (Rule 3's
+  "suspect duplicated logic first").
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
@@ -44,7 +45,7 @@ head-major, never dense-padded.**
   `out_dtypes`, `d_shapes` / `d_pad_multiple` / `d_envelope_floors` /
   `thd_d_shapes`, the mask and feature booleans (`causal`, `bottom_right`,
   `right_band_widening`, `swa`, `padded`, `padded_stats`,
-  `dense_seq_q_trim`, `sink`, `thd`, `cu_seq_len`, `bias`, `decode`,
+  `sink`, `thd`, `cu_seq_len`, `bias`, `decode`,
   `layouts`, ...), and adding or retiring an `EngineSpec` row. A change
   confined to knob domains (`tile_ms`, `sched_policies`, ...) does not
   need a matrix edit — the matrix deliberately does not track knobs.
@@ -57,3 +58,53 @@ head-major, never dense-padded.**
 - Reviewing: if the diff touches `fwd/engines.py`, `bwd/engines.py` or
   `cudnn/engines/manifest.py` and `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` is
   untouched, ask why before approving.
+
+**Rule S3 — When P is aliased into a score slot's TMEM tail, the warpgroup
+that stores into columns another warpgroup still has to read must be
+ordered after that read.**
+
+- Some kernels have no spare TMEM and pack P into the tail of the S slot it
+  was computed from (`P_EVEN_OFF`/`P_ODD_OFF` inside the `S_ACC_*` column
+  range — e.g. `sm100/prefill_d256_fp8.py`, `P_EVEN_OFF = 96` in a 128-col
+  slot). With a single softmax owner that is safe: all of S is in registers
+  before any P store. It is a race the moment a row's keys are split across
+  two softmax warpgroups: the half storing into the aliased columns
+  overwrites the *other* half's unread S whenever that half lags a tile.
+  GitHub #981 was exactly this — garbage weights on keys 96–111, masked
+  paths only, sporadic and data-dependent (the no-mask fast path is
+  single-owner).
+- The fix is an explicit release: the reading half arrives an mbarrier
+  after its `tcgen05.ld` has landed (`tcgen05.wait::ld` first — the
+  softmax paths otherwise never wait on loads explicitly), and the storing
+  half waits on it right before the aliased store (`mb_softmax_hi_loaded`
+  in `sm100/prefill_d256_fp8.py`, mirroring `mb_softmax_max`). Do NOT try
+  to fix it by swapping which half owns which keys: the alpha/stats value
+  is aliased too (`STATS_*_OFF == S_ACC_*_OFF`, i.e. S column 0), so the
+  half that stores alpha must also be the one that owns key 0 — the
+  original ownership is forced, only the ordering was missing.
+- The same kernel family can hide the split behind a different role name.
+  `sm100/prefill_d256_mxfp8.py` has no `mb_softmax_max`: its
+  `FUSED_CORR_SPLIT_P` schedule (mxfp8 + strict top-left causal) gives
+  keys 64–127 to the *correction* warpgroup (`_fused_p1_step`), and half 0
+  stored P into cols 96–111 with nothing ordering it after that
+  warpgroup's S-hi load. There the release already existed —
+  `mb_stat_empty` is arrived right after that load — so the fix is to wait
+  on it *before* the aliased store instead of at the end of the iteration.
+  The dense split-P schedule of the same kernel is safe only because both
+  halves meet at a 256-thread named barrier (`barrier_id=8`) after their
+  loads; if that barrier ever moves below the P store, this comes back.
+- Detector: every kernel with `P_EVEN_OFF: int = ` inside the `S_ACC_*`
+  range (`grep -l "P_EVEN_OFF: int = " python/cudnn/sdpa/fwd/kernels/*/*.py`,
+  today the six d256 kernels) whose config can select
+  `SOFTMAX_WARPGROUPS == 2` (`grep -n "SOFTMAX_WARPGROUPS=2\|split_p\|fused_corr_split_p" python/cudnn/sdpa/fwd/config_*.py`)
+  — regardless of which role runs the second half. For each P store, name
+  the warpgroup that still reads the target columns and the barrier that
+  orders the store after that read; if there is none, it is a bug. Random
+  data can hide it: the lagging half usually lags only when it rescales O
+  (alpha ≠ 1), which `RESCALE_THRESHOLD` makes rare — force it with K
+  scaled by `growth ** (key // 128)` (`k_tile_growth` in
+  `test/python/sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py`; the pre-fix mxfp8
+  kernel then fails every run with inf/NaN O). The symptom in a fuzz suite
+  is `ref == 0, gpu != 0` elements on masked configs with `key mod TILE_N`
+  in the aliased range — recover the leaked keys by matching
+  `O_gpu - O_ref` against `V` rows.

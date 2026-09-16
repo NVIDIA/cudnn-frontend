@@ -7,6 +7,7 @@ Unnecessary once the engine ships in the built frontend package."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -33,3 +34,29 @@ def _frost_opt_in(monkeypatch):
     the same pytest process, quietly turning a default-path run into an opt-in
     one."""
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+
+
+# A template family that does not run on the active GPU -- or that this
+# process's arch tree does not render -- is a capability gap, not a defect.
+# Every frost jit path declines it with one of two messages:
+# kernel_registry.KernelTemplate.arch_active_reject (the SM range) and the
+# compiler's _check_own_family (an sm120 config on a process running the sm100
+# tree, or the reverse), so a test that pins a config of another family reports
+# that message and nothing else. Report it as skipped, the way the arch markers
+# do for the families a test knows to gate on, so a run on a part the config
+# was never meant for reads as what it is.
+_ARCH_DECLINE = re.compile(
+    r"runs only on \d+ <= SM < \d+.* but the active GPU is sm_\d+" r"|is served by the sm\d+ arch tree, but this process runs the sm\d+ tree"
+)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    rep = outcome.get_result()
+    if rep.when != "call" or not rep.failed or call.excinfo is None:
+        return
+    exc = call.excinfo.value
+    if isinstance(exc, NotImplementedError) and _ARCH_DECLINE.search(str(exc)):
+        rep.outcome = "skipped"
+        rep.longrepr = (str(item.path), item.location[1], f"SKIPPED: {exc}")

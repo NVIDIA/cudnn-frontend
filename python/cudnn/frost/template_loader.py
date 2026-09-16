@@ -16,7 +16,7 @@ lets a module exist once. Both halves of that sentence are load-bearing:
   functions are *defined* — passing them as runtime kernel arguments would
   turn compile-time specialization into runtime branching (and dtype cannot
   be a runtime branch at all: the MMA instructions differ).
-- ``import prefill_d512_f16_sm100`` executes the body once and caches it in
+- ``import sm100/prefill_d512_f16`` executes the body once and caches it in
   ``sys.modules``; one module name = one parameter set. But one process
   legitimately needs several specializations of the same file alive at once
   (a causal-fp16 graph and a dense-bf16 graph in the same session).
@@ -47,7 +47,9 @@ Roads not taken
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import pathlib
 import threading
 from typing import Any, Hashable
 
@@ -55,6 +57,7 @@ _MODULES: dict = {}
 _LOCK = threading.Lock()
 
 PARAMS_GLOBAL = "FROST_TEMPLATE_PARAMS"
+DIGEST_GLOBAL = "FROST_SOURCE_DIGEST"
 
 
 def load_template(path: str, params: Hashable, tag: str = "template") -> Any:
@@ -73,6 +76,10 @@ def load_template(path: str, params: Hashable, tag: str = "template") -> Any:
         spec = importlib.util.spec_from_file_location(name, path)
         mod = importlib.util.module_from_spec(spec)
         setattr(mod, PARAMS_GLOBAL, params)
+        # What the module's kernels are compiled FROM: this file, specialized by
+        # these params. compiled_cache.template_key joins it with a compile()
+        # call's arguments to name a persistent object.
+        setattr(mod, DIGEST_GLOBAL, hashlib.sha256(pathlib.Path(path).read_bytes() + repr(params).encode("utf-8")).hexdigest()[:16])
         spec.loader.exec_module(mod)
         _MODULES[key] = mod
         return mod

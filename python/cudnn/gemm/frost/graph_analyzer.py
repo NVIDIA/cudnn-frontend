@@ -195,6 +195,21 @@ class GemmBinding:
         return [t for t in ts if t is not None]
 
 
+def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
+    """Trade A/B runtime roles while preserving the original tensor objects."""
+    if binding is None:
+        return None
+    return GemmBinding(
+        a_operands=list(binding.b_operands),
+        b_operands=list(binding.a_operands),
+        outputs=list(binding.outputs),
+        aux=list(binding.aux),
+        sfa_operands=list(binding.sfb_operands),
+        sfb_operands=list(binding.sfa_operands),
+        first_token_offset=binding.first_token_offset,
+    )
+
+
 def _make_multi_binding(
     meta: dict,
     a_ids,
@@ -213,7 +228,10 @@ def _make_multi_binding(
         objs = []
         for i in ids:
             sid = caps[i].get("sf_id")
-            objs.append(meta[sid].tensor if sid is not None else None)
+            # A fake-dequant side has complete logical SF metadata (so the
+            # ordinary registry key decides support) but no runtime SF tensor.
+            if sid is not None:
+                objs.append(meta[sid].tensor)
         return objs
 
     return GemmBinding(
@@ -558,16 +576,25 @@ def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
     return True
 
 
-def build_gemm_plan(graph: cudnn.pygraph):
+def build_gemm_plan(graph: cudnn.pygraph, knobs=None):
     """Analyze + JIT the graph into a compiled GEMM plan.
+
+    ``knobs`` (:class:`~cudnn.gemm.frost.knobs.GemmKnobs`) pins the tile config
+    a recorded plan ran with; the explicit config is re-gated through
+    :func:`~cudnn.gemm.frost.compiler.probe_chain` so a stale or foreign record
+    declines instead of compiling something the gates never admitted. Without
+    knobs the automatic strategy is used, as before.
 
     Returns a callable :class:`CompiledFusedGemm`; raises ``NotImplementedError`` /
     ``ValueError`` (type + message preserved) on rejection."""
     if not _graph_has_gemm(graph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
-    from .compiler import _graph_dynamic_shapes, jit_from_cudnn_graph, plan_config
+    from .compiler import _graph_dynamic_shapes, jit_from_cudnn_graph, plan_config, probe_chain
 
-    config = plan_config(analyze(graph), dynamic_shapes=_graph_dynamic_shapes(graph))
+    chain = analyze(graph)
+    config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), knobs=knobs)
+    if knobs is not None:
+        probe_chain(chain, config)
     return jit_from_cudnn_graph(graph, config=config)
 
 
@@ -800,6 +827,43 @@ def _dedup_operand(pid: int, cap: dict, ids: list[int], caps: dict[int, dict], s
     return ids.index(pid)
 
 
+def _normalize_one_sided_block_scale(
+    operand_pairs: "list[tuple[int, int]]",
+    a_ids: "list[int]",
+    b_ids: "list[int]",
+    a_caps: "dict[int, dict]",
+    b_caps: "dict[int, dict]",
+) -> None:
+    """Give a raw-FP8 peer logical scale metadata copied from one real dequant.
+
+    This is shared by dense and MoE analysis.  The fake mark is intentionally
+    codegen-only; registry support continues to be decided from the normalized
+    ordinary block-scale MMA key.
+    """
+    raw_fp8_dtypes = {"fp8_e4m3", "fp8_e5m2"}
+
+    def _fake_from(peer: dict, *, is_a: bool) -> dict:
+        # A block shape is [non-K,K], B is [K,non-K].
+        kblock = int(peer["block_size_2d"][0 if is_a else -1])
+        return dict(
+            block_size_2d=(1, kblock) if is_a else (kblock, 1),
+            sf_dtype=peer["sf_dtype"],
+            sf_reorder=peer["sf_reorder"],
+            deq_compute=peer["deq_compute"],
+            deq_out=peer["deq_out"],
+            sf_id=None,
+            fake_dequant=True,
+        )
+
+    for ai, bi in operand_pairs:
+        ac = a_caps[a_ids[ai]]
+        bc = b_caps[b_ids[bi]]
+        if ac["sf_dtype"] is None and bc["sf_dtype"] is not None and not bc["fake_dequant"] and ac["data_dtype"] in raw_fp8_dtypes:
+            ac.update(_fake_from(bc, is_a=True))
+        elif bc["sf_dtype"] is None and ac["sf_dtype"] is not None and not ac["fake_dequant"] and bc["data_dtype"] in raw_fp8_dtypes:
+            bc.update(_fake_from(ac, is_a=False))
+
+
 def _build_multi_moe_chain(
     moe_ops: list[_RecordedOp],
     ops: list[_RecordedOp],
@@ -855,6 +919,7 @@ def _build_multi_moe_chain(
                 deq_compute=None,
                 deq_out=None,
                 sf_id=None,
+                fake_dequant=False,
             )
         data_id, sf_id = deq.inputs
         sf_meta = meta[sf_id]
@@ -869,6 +934,7 @@ def _build_multi_moe_chain(
             deq_compute=deq_compute,
             deq_out=deq_out,
             sf_id=sf_id,
+            fake_dequant=False,
         )
 
     a_ids: list[int] = []  # distinct PACKED token (A) data ids
@@ -886,6 +952,7 @@ def _build_multi_moe_chain(
             )
         )
 
+    _normalize_one_sided_block_scale(gemm_operands, a_ids, b_ids, a_caps, b_caps)
     is_block_scale = any(c["sf_dtype"] is not None for c in (*a_caps.values(), *b_caps.values()))
 
     def _moe_geometry(token_id: int, weight_id: int):
@@ -929,6 +996,7 @@ def _build_multi_moe_chain(
                 cap["sf_reorder"],
                 cap["deq_compute"],
                 cap["deq_out"],
+                cap["fake_dequant"],
             )
 
         for cap in a_caps.values():
@@ -950,6 +1018,8 @@ def _build_multi_moe_chain(
             dequant_compute_b=b0["deq_compute"],
             dequant_out_a=a0["deq_out"],
             dequant_out_b=b0["deq_out"],
+            fake_dequant_a=a0["fake_dequant"],
+            fake_dequant_b=b0["fake_dequant"],
         )
     mm_compute = moe_ops[0].compute_dtype if moe_ops[0].compute_dtype is not None else compute_dtype
 
@@ -1447,6 +1517,7 @@ def _build_multi_gemm_chain(
                 deq_compute=None,
                 deq_out=None,
                 sf_id=None,
+                fake_dequant=False,
             )
         data_id, sf_id = deq.inputs
         sf_meta = meta[sf_id]
@@ -1461,6 +1532,7 @@ def _build_multi_gemm_chain(
             deq_compute=deq_compute,
             deq_out=deq_out,
             sf_id=sf_id,
+            fake_dequant=False,
         )
 
     aux_tensors: list[TensorRef] = []
@@ -1511,6 +1583,7 @@ def _build_multi_gemm_chain(
             )
         )
 
+    _normalize_one_sided_block_scale(gemm_operands, a_ids, b_ids, a_caps, b_caps)
     is_block_scale = any(c["sf_dtype"] is not None for c in (*a_caps.values(), *b_caps.values()))
 
     # Validate every GEMM shares shape / layout / dtype.
@@ -1561,6 +1634,7 @@ def _build_multi_gemm_chain(
                 cap["sf_reorder"],
                 cap["deq_compute"],
                 cap["deq_out"],
+                cap["fake_dequant"],
             )
 
         for cap in a_caps.values():
@@ -1582,6 +1656,8 @@ def _build_multi_gemm_chain(
             dequant_compute_b=b0["deq_compute"],
             dequant_out_a=a0["deq_out"],
             dequant_out_b=b0["deq_out"],
+            fake_dequant_a=a0["fake_dequant"],
+            fake_dequant_b=b0["fake_dequant"],
         )
     mm_compute = matmuls[0].compute_dtype if matmuls[0].compute_dtype is not None else compute_dtype
     matmul_out_dim = (batch, M, N)

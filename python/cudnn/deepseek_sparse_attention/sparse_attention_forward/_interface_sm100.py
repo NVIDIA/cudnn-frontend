@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -13,7 +15,6 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
 _compile_cache: dict = {}
@@ -37,6 +38,48 @@ def _gpu_arch_flag(device: torch.device) -> str:
 
 def _compile_options(device: torch.device) -> str:
     return f"--enable-tvm-ffi --gpu-arch {_gpu_arch_flag(device)} --opt-level 2"
+
+
+@lru_cache(maxsize=None)
+def _validated_device_capability(device_index: int) -> Tuple[int, int]:
+    """Cache immutable architecture facts by explicit device, never current device."""
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability[0] != 10:
+        raise RuntimeError(f"SparseAttentionForward requires an SM100-family GPU, found SM{capability[0]}{capability[1]}")
+    if capability not in _ARCH_FLAGS:
+        raise RuntimeError(f"SparseAttentionForward does not map compute capability {capability} to a CuTe compiler target")
+    return capability
+
+
+@contextmanager
+def _launch_context(device: torch.device, stream):
+    """Resolve one launch stream and order all torch work on it.
+
+    Resolve the current stream on every call, including graph capture. Reuse
+    its torch object for allocator lifetime tracking instead of repeatedly
+    wrapping the same raw handle as an external stream.
+    """
+    # A tensor's CUDA device always has a concrete index. Passing the integer
+    # also avoids torch's generic device-object resolution on the hot path.
+    with torch.cuda.device(device.index):
+        consumer = torch.cuda.current_stream(device.index)
+        context = nullcontext()
+        if stream is None:
+            stream = cuda.CUstream(consumer.cuda_stream)
+        else:
+            # Even an explicit handle equal to the current stream must retain
+            # the public stream/device validation contract. Do not cache raw
+            # handles: external streams can be destroyed and their IDs reused.
+            status, stream_device = cuda.cuStreamGetDevice(stream)
+            if status != cuda.CUresult.CUDA_SUCCESS:
+                raise ValueError(f"Unable to resolve the CUDA device for stream {stream}: {status}")
+            if int(stream_device) != device.index:
+                raise ValueError(f"stream belongs to cuda:{int(stream_device)}, but Q is on {device}")
+            if int(stream) != consumer.cuda_stream:
+                consumer = torch.cuda.get_stream_from_external(int(stream), device.index)
+                context = torch.cuda.stream(consumer)
+        with context:
+            yield stream, consumer
 
 
 def _kernel_variant(num_heads: int, head_dim: int) -> str:
@@ -125,7 +168,7 @@ def _contiguous_aligned(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     """Materialize a contiguous, aligned tensor when either property is absent."""
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
-    else:
+    elif 1 in tensor.shape or 0 in tensor.shape:
         # PyTorch ignores singleton dimensions when deciding contiguity, so a
         # broadcast view such as shape (1, K), stride (0, 1) is contiguous but
         # has a different DLPack layout signature. Canonicalize only the
@@ -146,9 +189,8 @@ def _contiguous_aligned(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     return tensor
 
 
-def _record_stream(tensors, stream, device: torch.device) -> None:
-    """Tell PyTorch's allocator that raw kernel pointers live on ``stream``."""
-    consumer = torch.cuda.get_stream_from_external(int(stream), device)
+def _record_stream(tensors, consumer: torch.cuda.Stream) -> None:
+    """Tell PyTorch's allocator that raw kernel pointers live on ``consumer``."""
     for tensor in tensors:
         if tensor is not None:
             tensor.record_stream(consumer)
@@ -161,8 +203,9 @@ def _normalize_and_validate(
     attn_sink: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
     indexer_topk: int,
-    stream,
+    consumer: torch.cuda.Stream,
 ):
+    """Validate and normalize with the caller's launch context already active."""
     if q.ndim != 3:
         raise ValueError(f"Q must be 3-D (total_S_q, H, D_qk), got {tuple(q.shape)}")
     if kv.ndim != 2:
@@ -207,22 +250,21 @@ def _normalize_and_validate(
     # Record their original sources before replacing local references with
     # aligned/contiguous tensors so the caching allocator cannot recycle the
     # source storage while a copy is still pending.
-    _record_stream(inputs, stream, device)
-    with torch_stream_context(stream):
-        q = _contiguous_aligned(q, 16)
-        kv = _contiguous_aligned(kv, 16)
-        topk_idxs = topk_idxs if topk_idxs.is_contiguous() else topk_idxs.contiguous()
-        attn_sink = None if attn_sink is None else _contiguous_aligned(attn_sink, 4)
-        topk_length = None if topk_length is None else _contiguous_aligned(topk_length, 4)
+    _record_stream(inputs, consumer)
+    q = _contiguous_aligned(q, 16)
+    kv = _contiguous_aligned(kv, 16)
+    topk_idxs = topk_idxs if topk_idxs.is_contiguous() else topk_idxs.contiguous()
+    attn_sink = None if attn_sink is None else _contiguous_aligned(attn_sink, 4)
+    topk_length = None if topk_length is None else _contiguous_aligned(topk_length, 4)
 
-        padded_topk = ((logical_topk + 63) // 64) * 64
-        if padded_topk != logical_topk:
-            padding = torch.full((total_s_q, padded_topk - logical_topk), -1, dtype=torch.int32, device=device)
-            topk_idxs = torch.cat((topk_idxs, padding), dim=1)
+    padded_topk = ((logical_topk + 63) // 64) * 64
+    if padded_topk != logical_topk:
+        padding = torch.full((total_s_q, padded_topk - logical_topk), -1, dtype=torch.int32, device=device)
+        topk_idxs = torch.cat((topk_idxs, padding), dim=1)
 
-        # Head128 issues one 256-bit load per eight indices.  Normalize after
-        # padding so both the base and every 64-INT32 row remain 32B-aligned.
-        topk_idxs = _contiguous_aligned(topk_idxs, 32)
+    # Head128 issues one 256-bit load per eight indices.  Normalize after
+    # padding so both the base and every 64-INT32 row remain 32B-aligned.
+    topk_idxs = _contiguous_aligned(topk_idxs, 32)
 
     return q, kv, topk_idxs, attn_sink, topk_length, variant, logical_topk
 
@@ -246,19 +288,10 @@ def sparse_attention_forward_sm100(
     if q.device.type != "cuda":
         raise ValueError(f"Q must live on CUDA, got {q.device}")
     device = q.device
-    with torch.cuda.device(device):
-        capability = torch.cuda.get_device_capability(device)
-        if capability[0] != 10:
-            raise RuntimeError(f"SparseAttentionForward requires an SM100-family GPU, found SM{capability[0]}{capability[1]}")
-        # Validate the exact architecture even for a zero-size problem that
-        # returns before cute.compile.
-        _gpu_arch_flag(device)
-        current_stream = resolve_stream(current_stream)
-        stream_status, stream_device = cuda.cuStreamGetDevice(current_stream)
-        if stream_status != cuda.CUresult.CUDA_SUCCESS:
-            raise ValueError(f"Unable to resolve the CUDA device for stream {current_stream}: {stream_status}")
-        if int(stream_device) != device.index:
-            raise ValueError(f"stream belongs to cuda:{int(stream_device)}, but Q is on {device}")
+    # Architecture is immutable for a concrete device ordinal, including for
+    # zero-size calls which must still reject unsupported devices.
+    capability = _validated_device_capability(device.index)
+    with _launch_context(device, current_stream) as (current_stream, consumer):
         q, kv, topk_idxs, attn_sink, topk_length, variant, logical_topk = _normalize_and_validate(
             q,
             kv,
@@ -266,7 +299,7 @@ def sparse_attention_forward_sm100(
             attn_sink,
             topk_length,
             int(indexer_topk),
-            current_stream,
+            consumer,
         )
         total_s_q, num_heads, head_dim = q.shape
         head_dim_v = 512
@@ -279,30 +312,28 @@ def sparse_attention_forward_sm100(
             raise ValueError("lse_indexer must be None when indexer_topk == 0")
         _check_output(lse_indexer, name="lse_indexer", shape=(total_s_q, num_heads), dtype=torch.float32, device=device)
 
-        with torch_stream_context(current_stream):
-            if out is None:
-                out = torch.empty((total_s_q, num_heads, head_dim_v), dtype=q.dtype, device=device)
-            if max_logits is None:
-                max_logits = torch.empty((total_s_q, num_heads), dtype=torch.float32, device=device)
-            if lse is None:
-                lse = torch.empty((total_s_q, num_heads), dtype=torch.float32, device=device)
-            if indexer_topk and lse_indexer is None:
-                lse_indexer = torch.empty((total_s_q, num_heads), dtype=torch.float32, device=device)
+        if out is None:
+            out = torch.empty((total_s_q, num_heads, head_dim_v), dtype=q.dtype, device=device)
+        if max_logits is None:
+            max_logits = torch.empty((total_s_q, num_heads), dtype=torch.float32, device=device)
+        if lse is None:
+            lse = torch.empty((total_s_q, num_heads), dtype=torch.float32, device=device)
+        if indexer_topk and lse_indexer is None:
+            lse_indexer = torch.empty((total_s_q, num_heads), dtype=torch.float32, device=device)
 
-            # Zero-size problems are a stream-ordered host-side epilogue.  No
-            # gather pointer is formed and no CuTe kernel is launched.
-            if total_s_q == 0 or logical_topk == 0 or kv.shape[0] == 0:
-                out.zero_()
-                max_logits.fill_(float("-inf"))
-                lse.fill_(float("inf"))
-                if lse_indexer is not None:
-                    lse_indexer.fill_(float("inf"))
-                _record_stream(
-                    (q, kv, topk_idxs, out, max_logits, lse, lse_indexer, attn_sink, topk_length),
-                    current_stream,
-                    device,
-                )
-                return out, max_logits, lse, lse_indexer
+        # Zero-size problems are a stream-ordered host-side epilogue.  No
+        # gather pointer is formed and no CuTe kernel is launched.
+        if total_s_q == 0 or logical_topk == 0 or kv.shape[0] == 0:
+            out.zero_()
+            max_logits.fill_(float("-inf"))
+            lse.fill_(float("inf"))
+            if lse_indexer is not None:
+                lse_indexer.fill_(float("inf"))
+            _record_stream(
+                (q, kv, topk_idxs, out, max_logits, lse, lse_indexer, attn_sink, topk_length),
+                consumer,
+            )
+            return out, max_logits, lse, lse_indexer
 
         # ``cutlass.Float32(scale)`` is a TVM-FFI runtime scalar argument, as
         # in the existing DSA indexer-forward interface; it intentionally does
@@ -360,7 +391,6 @@ def sparse_attention_forward_sm100(
             )
         _record_stream(
             (q, kv, topk_idxs, out, max_logits, lse, lse_indexer, attn_sink, topk_length),
-            current_stream,
-            device,
+            consumer,
         )
         return out, max_logits, lse, lse_indexer

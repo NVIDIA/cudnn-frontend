@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._ir import NodeType
+from .graph_types import NodeType
 
 _MOE_FWD_INPUTS = ("token", "weight", "first_token_offset")
 _MOE_BWD_INPUTS = ("doutput", "token", "first_token_offset")

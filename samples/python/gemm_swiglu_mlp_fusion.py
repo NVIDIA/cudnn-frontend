@@ -21,7 +21,7 @@ Measured on B200 at the Qwen3.5-27B MLP shape (H5120 I17408), vs torch+cuBLAS:
 So the remaining levers are (a) a memoized matmul hot path to erase the per-call wrapper cost
 (cf. the grouped-GEMM/cuTeDSL fast paths), and (b) a cuBLAS-class fused GEMM+epilogue for the
 backward. The dSwiGLU itself already fuses well, so it is not the gap. See
-docs/framework_integration_performance.md.
+docs/utilities/framework_integration_performance.md.
 
 Numerically matches torch to bf16 noise (fwd + all four gradients). Verified on B200.
 """

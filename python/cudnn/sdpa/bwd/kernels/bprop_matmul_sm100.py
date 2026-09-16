@@ -8,7 +8,7 @@ bf16 GEMMs; at bf16 there is no descale epilogue, so nothing is fused here.
 
 WHY THIS EXISTS -- the one thing the generic GEMM cannot express
 ---------------------------------------------------------------
-``gemm/frost/kernel_templates/sm100_matmul.py`` carries a single batch axis
+``gemm/frost/sm100/kernel_templates/sm100_matmul.py`` carries a single batch axis
 ``l`` with ONE uniform stride.  The SDPA operands are BSHD ``[B, S, H, D]``, so
 the batch element is the PAIR ``(b, h)`` at offset ``b*(S*H*D) + h*D`` -- a
 two-level stride that no single uniform stride can express.  Flattening it
@@ -21,8 +21,8 @@ become **4-D** ``[k, m, h, b]`` (``cuTensorMapEncodeTiled`` allows 5), with
 single flat ``l`` -- ``_decode_bh`` splits it only where a TMA coordinate is
 formed, which is the whole change.
 
-KEEP IN SYNC WITH ``gemm/frost/kernel_templates/sm100_matmul.py``
------------------------------------------------------------------
+KEEP IN SYNC WITH ``gemm/frost/sm100/kernel_templates/sm100_matmul.py``
+-----------------------------------------------------------------------
 This file is a FORK of that template, taken from its rendered dense-bf16
 expansion (config ``sm100_128x256x128_128x256x32_cluster2x1_2ctamma``, no
 epilogue fusion, TMA-store epilogue).  The mainloop, the CLC scheduler, the
@@ -43,11 +43,12 @@ without making the same change upstream.
 
 from __future__ import annotations
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
-from cudnn.gemm.frost.kernel_templates._tile_helpers import (
+from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
@@ -1889,6 +1890,9 @@ _CODEGEN_TARGET_SMS = frozenset({100, 103, 107, 110})
 def compile(device) -> Callable:
     major, minor = compute_capability(resolve_device(device))
     sm = major * 10 + minor
+    # The device reaches the kernel only as its architecture (--gpu-arch below),
+    # so that is the key; the device object itself would make the call uncacheable.
+    _cache_key = _template_key(globals(), {"sm": sm}, "compile")
     # This is the source-level CODEGEN domain, not the engine's advertised
     # support contract.  The complete three-stage engine remains qualified only
     # on SM100/SM103; SM107/SM110 targets are kept available for isolated
@@ -1995,7 +1999,7 @@ def compile(device) -> Callable:
     # serves every sequence count either way.
     fake_meta = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int64(),), stride_order=(0,), assumed_align=16)
     fake_desc = make_fake_compact_tensor(cutlass.Int64, (cute.sym_int64(),), stride_order=(0,), assumed_align=16)
-    return cute.compile(
+    return _compile_cached(
         _host,
         problem_size,
         fake_a_0,
@@ -2005,6 +2009,8 @@ def compile(device) -> Callable:
         fake_desc,
         stream=_fake_stream,
         options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_bwd",
     )
 
 

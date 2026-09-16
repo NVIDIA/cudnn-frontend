@@ -29,11 +29,14 @@ def main():
     attn_sink = torch.randn(heads, dtype=torch.float32, device=device, requires_grad=True)
     indices = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = torch.tensor([65, 64, 33, 1], dtype=torch.int32, device=device)
+    inactive = torch.arange(topk, device=device)[None, :] >= topk_length[:, None]
+    indices.masked_fill_(inactive, -1)
 
     # H32 is padded to the official FlashMLA H64 launch, K65 to K128.  The
     # returned tensors and all cuDNN gradients retain the original H32/K65 ABI.
-    # This sample constructs a bounded active prefix, so it can explicitly
-    # skip the safe-default metadata scan and compactification.
+    # Trusted metadata requires a bounded active prefix AND an invalid
+    # (-1) inactive suffix, constructed above. This lets the adapter skip
+    # the safe-default metadata scan and compactification.
     result = DSA.sparse_attention(
         q,
         kv,

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import cutlass
@@ -8,7 +9,11 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
-import torch
+
+
+@lru_cache(maxsize=None)
+def _device_capability(device_index: int):
+    return torch.cuda.get_device_capability(device_index)
 
 
 class BucketedK2QCsrUniversal:
@@ -242,7 +247,7 @@ def _bucketed_k2q_csr_compile_key(
     )
 
 
-def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
+def _to_cute_tensor(tensor: "torch.Tensor") -> cute.Tensor:
     return from_dlpack(
         tensor.detach(),
         assumed_align=4,
@@ -251,14 +256,16 @@ def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
 
 
 def build_bucketed_k2q_csr_cutedsl(
-    q2k_block_index: torch.Tensor,
+    q2k_block_index: "torch.Tensor",
     block_sparse_num: int,
     num_kv_blocks: int,
     *,
     bucket_size_blocks: int,
-    q2k_block_nums: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    q2k_block_nums: Optional["torch.Tensor"] = None,
+) -> Tuple["torch.Tensor", "torch.Tensor", int, int]:
     """Build bucketed K-to-Q CSR metadata with CuTe DSL kernels."""
+    import torch
+
     assert q2k_block_index.dtype == torch.int32
     assert q2k_block_index.is_cuda
     assert q2k_block_index.ndim == 4
@@ -309,7 +316,7 @@ def build_bucketed_k2q_csr_cutedsl(
         device=device,
     )
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream(q2k_block_index.device).cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream(q2k_block_index.device.index).cuda_stream)
     tensors = (
         counts,
         local_offsets,
@@ -320,7 +327,7 @@ def build_bucketed_k2q_csr_cutedsl(
         q2k_block_index,
         q2k_block_nums,
     )
-    device_capability = torch.cuda.get_device_capability(q2k_block_index.device)
+    device_capability = _device_capability(q2k_block_index.device.index)
     compile_key = _bucketed_k2q_csr_compile_key(
         device_capability,
         block_sparse_num,

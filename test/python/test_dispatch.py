@@ -1470,8 +1470,11 @@ def test_at_index_queries_answer_from_the_unified_list(monkeypatch):
     g.create_execution_plans()
     idx = _index_of(g, "stub")
     eid, knobs = g.get_engine_and_knobs_at_index(idx)
-    assert eid == StubEngine.engine_id
-    assert (eid, knobs) == (g.plans[idx].engine_id, g.plans[idx].knobs)
+    assert eid == StubEngine.engine_id == g.plans[idx].engine_id
+    # The public record speaks the shared vocabulary: a plan without tuning
+    # axes (native knobs None) reports {}, never None, like a backend plan.
+    assert g.plans[idx].knobs is None
+    assert knobs == {} and isinstance(knobs, dict)
     assert g.get_behavior_notes_for_plan_at_index(idx) == []  # engine declares none
 
 

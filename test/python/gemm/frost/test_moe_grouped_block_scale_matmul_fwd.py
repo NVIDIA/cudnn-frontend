@@ -7,6 +7,8 @@ dequant + group-loop reference. Covers the BxE > E case."""
 
 from __future__ import annotations
 
+import pathlib
+
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
@@ -15,6 +17,7 @@ import torch
 from gemm_test_utils import (
     requires_sm100,
     requires_sm107,
+    requires_sm120,
     Plan as _plan,
     vp_bs as _vp_bs,
     E2M1 as _E2M1,
@@ -30,9 +33,10 @@ from gemm_test_utils import (
 )
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
+from cudnn.gemm.frost import compiler as C
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
-from cudnn.gemm.frost.graph_analyzer import analyze
+from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding
 from cudnn.gemm.frost.tile_config import by_name
 from test_matmul import _f8_row_scale_addr
 
@@ -175,8 +179,17 @@ def _build_graph(
     quant_axis=None,
     quant_group_offset=False,
     weight_major="k",
+    a_dt_override=None,
+    b_dt_override=None,
+    dequant_a=True,
+    dequant_b=True,
+    epilogue_relu=False,
+    output_major="n",
+    offset_multiple=1,
 ):
-    block_size, a_dt, sf_dt = _COMBOS[combo]
+    block_size, default_dt, sf_dt = _COMBOS[combo]
+    a_dt = default_dt if a_dt_override is None else a_dt_override
+    b_dt = default_dt if b_dt_override is None else b_dt_override
     sf_k = K // block_size
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -184,7 +197,7 @@ def _build_graph(
         compute_data_type=cudnn.data_type.FLOAT,
     )
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=a_dt)
-    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K] if weight_major == "k" else [K * N, N, 1], data_type=a_dt)
+    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K] if weight_major == "k" else [K * N, N, 1], data_type=b_dt)
     SFA = g.tensor(
         name="SFA",
         dim=[1, S, sf_k],
@@ -205,8 +218,9 @@ def _build_graph(
         stride=[1, 1, 1],
         data_type=offset_dt,
     )
-    tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size])
-    w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1])
+    fto.set_alignment_value(offset_multiple)
+    tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size]) if dequant_a else tok
+    w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1]) if dequant_b else w
     out = g.moe_grouped_matmul(
         tok_d,
         w_d,
@@ -215,6 +229,8 @@ def _build_graph(
         compute_data_type=cudnn.data_type.FLOAT,
         name="moe",
     )
+    if epilogue_relu:
+        out = g.relu(input=out, name="relu")
     if reduction_mode is not None:
         red_kwargs = {}
         if reduction_compute_dt is not None:
@@ -245,6 +261,9 @@ def _build_graph(
             q_scale.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
         return g
     out.set_data_type(output_dt).set_output(True)
+    if output_major == "m":
+        ldm = _ceil_div(S, 8) * 8  # Align BF16 column strides independently of S.
+        out.set_stride([ldm * N, 1, ldm])
     return g
 
 
@@ -264,6 +283,55 @@ def test_analyzer_detects_moe_grouped_block_scale_matmul_fwd() -> None:
     assert chain.matmul.b_dtype == "fp4_e2m1"
     assert (chain.matmul.M, chain.matmul.N, chain.matmul.K) == (S, N, K)
     assert chain.output_dtype == "bf16"
+
+
+def test_build_graph_keeps_one_sided_dtype_overrides_independent() -> None:
+    """An override on one MMA operand must not change the other's combo default."""
+    shape = dict(E=2, S=256, N=128, K=256, num_groups=2, combo="mxfp4")
+    fp8 = cudnn.data_type.FP8_E4M3
+
+    a_mixed = analyze(_build_graph(**shape, a_dt_override=fp8))
+    assert (a_mixed.matmul.a_dtype, a_mixed.matmul.b_dtype) == ("fp8_e4m3", "fp4_e2m1")
+
+    b_mixed = analyze(_build_graph(**shape, b_dt_override=fp8))
+    assert (b_mixed.matmul.a_dtype, b_mixed.matmul.b_dtype) == ("fp4_e2m1", "fp8_e4m3")
+
+
+@pytest.mark.parametrize("fake_a", [True, False], ids=["raw_fp8_token", "raw_fp8_weight"])
+def test_analyzer_normalizes_one_sided_moe_dequant(fake_a) -> None:
+    kwargs = dict(E=2, S=256, N=128, K=256, num_groups=2, combo="mxfp4")
+    fp8 = cudnn.data_type.FP8_E4M3
+    if fake_a:
+        kwargs.update(a_dt_override=fp8, dequant_a=False)
+    else:
+        kwargs.update(b_dt_override=fp8, dequant_b=False)
+    chain, binding = analyze_with_binding(_build_graph(**kwargs))
+    bs = chain.block_scale
+    assert chain.has_moe and bs is not None
+    assert (bs.fake_dequant_a, bs.fake_dequant_b) == ((True, False) if fake_a else (False, True))
+    assert (bs.block_size_a, bs.block_size_b) == ((1, 32), (32, 1))
+    assert (bs.sf_dtype_a, bs.sf_dtype_b) == ("fp8_e8m0", "fp8_e8m0")
+    assert len(binding.sfa_operands) == (0 if fake_a else 1)
+    assert len(binding.sfb_operands) == (1 if fake_a else 0)
+    C._check_block_scale_supported(chain, "sm100")
+
+
+def test_one_sided_moe_dequant_does_not_expand_registry_cases() -> None:
+    chain = analyze(
+        _build_graph(
+            E=2,
+            S=256,
+            N=128,
+            K=256,
+            num_groups=2,
+            combo="nvfp4",
+            a_dt_override=cudnn.data_type.FP8_E4M3,
+            dequant_a=False,
+        )
+    )
+    assert chain.block_scale.fake_dequant_a
+    with pytest.raises(NotImplementedError, match="does not support this configuration"):
+        C._check_block_scale_supported(chain, "sm100")
 
 
 def test_analyzer_offset_dtype_int64() -> None:
@@ -391,6 +459,8 @@ def _run_e2e(
     quant_scale_torch_dt=torch.float8_e8m0fnu,
     quant_scale_reorder=False,
     weight_major="k",
+    output_major="n",
+    offset_multiple=1,
 ):
     dev = "cuda"
     torch.manual_seed(0)
@@ -444,6 +514,8 @@ def _run_e2e(
             quant_scale_reorder=quant_scale_reorder,
             quant_scale_dim=quant_scale_shape if quant_scale_reorder else None,
             weight_major=weight_major,
+            output_major=output_major,
+            offset_multiple=offset_multiple,
         ),
         config=cfg,
         cta_group=cta_group,
@@ -459,7 +531,10 @@ def _run_e2e(
         b = offsets_list[gi]
         e = offsets_list[gi + 1] if gi + 1 < num_groups else S
         sfa_parts.append(_to_blocked(sfa_log[b:e]))
-    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
+    # Byte views also support empty E8M0 segments, which torch.cat's generic
+    # CUDA path does not implement for that dtype.
+    sfa_live = torch.cat([part.view(torch.uint8) for part in sfa_parts]).view(sfa_log.dtype)
+    sfa_blk = _with_static_segmented_capacity(sfa_live, S, num_groups, sf_k)
     sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=offset_torch_dt, device=dev)
     if quant:
@@ -482,7 +557,14 @@ def _run_e2e(
             )
         output = [term, red]
     else:
-        output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
+        if output_major == "m":
+            ldm = _ceil_div(S, 8) * 8
+            raw = torch.full((2 * ldm * N + 4096,), 0xAB, device=dev, dtype=torch.uint8)
+            storage = raw[: 2 * ldm * N].view(1, N, 2 * ldm)
+            output = storage.view(torch.bfloat16).transpose(1, 2)[:, :S, :]
+            output.fill_(float("nan"))
+        else:
+            output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
 
     compiled(_vp_bs(compiled, tok_rt, w_rt, output, sfa_blk, sfb_blk, fto=offsets))
     torch.cuda.synchronize()
@@ -520,6 +602,43 @@ def _run_e2e(
         )
     else:
         torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=tol[0], rtol=tol[1])
+        if output_major == "m":
+            assert (raw[2 * ldm * N :] == 0xAB).all(), "the store ran past the output"
+            assert (storage[:, :, 2 * S :] == 0xAB).all(), "the store overwrote column padding"
+    return compiled
+
+
+@requires_sm100
+@pytest.mark.parametrize("combo", ("nvfp4", "mxfp4", "mxfp8"))
+@pytest.mark.parametrize("cta_group", (1, 2))
+@pytest.mark.parametrize(
+    "offset_multiple,bounds,S,store_mode,global_descriptors",
+    [
+        (8, [0, 104, 104, 304], 512, "tma", False),
+        (256, [0, 256, 256, 512], 512, "tma", True),
+        (256, [0, 256, 256], 510, "stg", False),
+        (256, [0, 256, 256], 504, "tma", False),
+    ],
+)
+def test_moe_block_scale_m_major_output(combo, cta_group, offset_multiple, bounds, S, store_mode, global_descriptors):
+    from cudnn.gemm.frost.compiler import _moe_aligned_offsets, _store_modes
+
+    compiled = _run_e2e(
+        E=3,
+        S=S,
+        N=256,
+        K=256,
+        offsets_list=bounds,
+        combo=combo,
+        config_name="CONFIG_sm100_128x256x128_128x256x32_cluster1x1" if cta_group == 1 else _CFG,
+        cta_group=cta_group,
+        output_major="m",
+        offset_multiple=offset_multiple,
+    )
+    assert compiled.chain.moe.offset_multiple == offset_multiple
+    assert _store_modes(compiled.chain, compiled._compiled.config) == (store_mode,)
+    assert _moe_aligned_offsets(compiled.chain, compiled._compiled.config) is global_descriptors
+    assert f"moe_aligned_offsets = {global_descriptors}\n" in pathlib.Path(compiled.generated_path).read_text()
 
 
 def _run_nonpacked_e2e(combo, config_name, cta_group, mode):
@@ -646,6 +765,168 @@ def test_e2e_split_m_tile(cfg_name, cta_group) -> None:
 def test_e2e_mx_combos(combo) -> None:
     # mxfp4 (FP4 + E8M0, block32) / mxfp8 (FP8 E4M3 + E8M0, block32), K-major.
     _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=[0, 256, 384, 512], combo=combo)
+
+
+@requires_sm100
+@pytest.mark.parametrize("fp8_on_a", [True, False], ids=["mxfp8_x_mxfp4", "mxfp4_x_mxfp8"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        pytest.param("CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma", marks=requires_sm107),
+    ],
+)
+def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
+    """Grouped K32 padded and Rubin K64 native-packed mixed block-scale MMA."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    E, S, N, K = 2, 256, 128, 256
+    offsets_list = [0, 128]
+    bs, sf_k = 32, K // 32
+    fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    a_dt, b_dt = (fp8, fp4) if fp8_on_a else (fp4, fp8)
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+
+    tok_fp8 = (torch.randn(1, S, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    w_fp8 = (torch.randn(E, N, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    tok_u8 = torch.randint(0, 256, (1, S, K // 2), dtype=torch.uint8, device=dev)
+    w_u8 = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=dev)
+    if fp8_on_a:
+        tok_rt, tok_ref = tok_fp8, tok_fp8.float().view(S, K)
+        w_rt, w_ref = w_u8.view(torch.float4_e2m1fn_x2), _unpack_fp4(w_u8, lut).view(E, N, K)
+    else:
+        tok_rt, tok_ref = tok_u8.view(torch.float4_e2m1fn_x2), _unpack_fp4(tok_u8, lut).view(S, K)
+        w_rt, w_ref = w_fp8, w_fp8.float().view(E, N, K)
+
+    sfa_log = _rand_e8m0((S, sf_k), dev)
+    sfb_log = _rand_e8m0((E, N, sf_k), dev)
+    g = _build_graph(
+        E,
+        S,
+        N,
+        K,
+        len(offsets_list),
+        combo="mxfp8",
+        a_dt_override=a_dt,
+        b_dt_override=b_dt,
+    )
+    compiled = _plan(g, config=by_name(config_name))
+    assert compiled.chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
+
+    sfa_blk = torch.cat([_to_blocked(sfa_log[b : offsets_list[i + 1] if i + 1 < len(offsets_list) else S]) for i, b in enumerate(offsets_list)])
+    sfa_blk = _with_static_segmented_capacity(sfa_blk, S, len(offsets_list), sf_k)
+    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
+    output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
+    compiled(_vp_bs(compiled, tok_rt, w_rt, output, sfa_blk, sfb_blk, fto=offsets))
+    torch.cuda.synchronize()
+
+    tok_deq = tok_ref * sfa_log.float().repeat_interleave(bs, 1)
+    w_deq = w_ref * sfb_log.float().repeat_interleave(bs, 2)
+    ref = torch.zeros(S, N, dtype=torch.float32, device=dev)
+    for i, begin in enumerate(offsets_list):
+        end = offsets_list[i + 1] if i + 1 < len(offsets_list) else S
+        ref[begin:end] = tok_deq[begin:end] @ w_deq[i % E].T
+    torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=2e-1, rtol=2e-2)
+
+
+@requires_sm100
+@pytest.mark.parametrize("fake_a", [True, False], ids=["raw_fp8_token", "raw_fp8_weight"])
+@pytest.mark.parametrize("scaled_kind", ["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("epilogue_relu", [False, True], ids=["direct", "relu"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
+        pytest.param(
+            "CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma",
+            marks=requires_sm107,
+        ),
+        pytest.param(
+            "CONFIG_sm100_128x128x128_128x128x64_cluster2x1_2ctamma",
+            marks=requires_sm107,
+        ),
+    ],
+)
+def test_e2e_one_sided_dequant(fake_a, scaled_kind, epilogue_relu, config_name) -> None:
+    """MoE fake SF has no runtime tensor or dynamic descriptor workspace."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    E, S, N, K = 2, 256, 128, 256
+    offsets_list = [0, 128]
+    sf_k = K // 32
+    raw_dt = cudnn.data_type.FP8_E4M3
+    scaled_dt = cudnn.data_type.FP8_E5M2 if scaled_kind == "mxfp8" else cudnn.data_type.FP4_E2M1
+
+    raw_tok = (torch.randn(1, S, K, device=dev) * 0.25).to(torch.float8_e4m3fn)
+    raw_w = (torch.randn(E, N, K, device=dev) * 0.25).to(torch.float8_e4m3fn)
+    if scaled_kind == "mxfp8":
+        scaled_tok = (torch.randn(1, S, K, device=dev) * 0.25).to(torch.float8_e5m2)
+        scaled_w = (torch.randn(E, N, K, device=dev) * 0.25).to(torch.float8_e5m2)
+        scaled_tok_ref = scaled_tok.float().view(S, K)
+        scaled_w_ref = scaled_w.float().view(E, N, K)
+    else:
+        lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+        tok_u8 = torch.randint(0, 256, (1, S, K // 2), dtype=torch.uint8, device=dev)
+        w_u8 = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=dev)
+        scaled_tok = tok_u8.view(torch.float4_e2m1fn_x2)
+        scaled_w = w_u8.view(torch.float4_e2m1fn_x2)
+        scaled_tok_ref = _unpack_fp4(tok_u8, lut).view(S, K)
+        scaled_w_ref = _unpack_fp4(w_u8, lut).view(E, N, K)
+
+    tok_rt, w_rt = (raw_tok, scaled_w) if fake_a else (scaled_tok, raw_w)
+    tok_ref = raw_tok.float().view(S, K) if fake_a else scaled_tok_ref
+    w_ref = scaled_w_ref if fake_a else raw_w.float().view(E, N, K)
+    g = _build_graph(
+        E,
+        S,
+        N,
+        K,
+        len(offsets_list),
+        combo="mxfp4",
+        a_dt_override=raw_dt if fake_a else scaled_dt,
+        b_dt_override=scaled_dt if fake_a else raw_dt,
+        dequant_a=not fake_a,
+        dequant_b=fake_a,
+        epilogue_relu=epilogue_relu,
+    )
+    compiled = _plan(g, config=by_name(config_name))
+    bs = compiled.chain.block_scale
+    assert (bs.fake_dequant_a, bs.fake_dequant_b) == (fake_a, not fake_a)
+    assert compiled._compiled._desc_slots_per_cta == (compiled.chain.num_a_operands + len(compiled.binding.sfa_operands) + len(compiled._compiled.tma_slots))
+
+    sf_log = _rand_e8m0(((E, N, sf_k) if fake_a else (S, sf_k)), dev)
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
+    output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
+    bd = compiled.binding
+    variant_pack = {
+        bd.a_operands[0]: tok_rt,
+        bd.b_operands[0]: w_rt,
+        bd.first_token_offset: offsets,
+        bd.outputs[0]: output,
+    }
+    if fake_a:
+        sfb_blk = torch.cat([_to_blocked(sf_log[e]) for e in range(E)]).view(E, sf_k, N)
+        variant_pack[bd.sfb_operands[0]] = sfb_blk
+    else:
+        sfa_parts = [_to_blocked(sf_log[b : offsets_list[i + 1] if i + 1 < len(offsets_list) else S]) for i, b in enumerate(offsets_list)]
+        sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, len(offsets_list), sf_k)
+        variant_pack[bd.sfa_operands[0]] = sfa_blk
+    compiled(variant_pack)
+    torch.cuda.synchronize()
+
+    if fake_a:
+        w_ref = w_ref * sf_log.float().repeat_interleave(32, 2)
+    else:
+        tok_ref = tok_ref * sf_log.float().repeat_interleave(32, 1)
+    ref = torch.zeros(S, N, dtype=torch.float32, device=dev)
+    for i, begin in enumerate(offsets_list):
+        end = offsets_list[i + 1] if i + 1 < len(offsets_list) else S
+        ref[begin:end] = tok_ref[begin:end] @ w_ref[i % E].T
+    if epilogue_relu:
+        ref = torch.relu(ref)
+    torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=2e-1, rtol=2e-2)
 
 
 @pytest.mark.parametrize("cfg_name,cta_group", [(_CFG, 2), (_CFG_1CTA, 1)])
@@ -1106,7 +1387,7 @@ def test_e2e_sm107(combo, cfg_name, cta_group) -> None:
 
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("cta_group", [1, 2])
-@pytest.mark.parametrize("cta_m,cta_n", [(128, 256), (256, 128), (256, 256)])
+@pytest.mark.parametrize("cta_m,cta_n", [(128, 256), (256, 128), (256, 256), (512, 128)])
 @requires_sm107
 def test_e2e_sm107_multi_mma_m(combo, cta_group, cta_m, cta_n) -> None:
     # The grouped pipeline with the CTA tile split along M. The per-group-padded
@@ -1115,7 +1396,8 @@ def test_e2e_sm107_multi_mma_m(combo, cta_group, cta_m, cta_n) -> None:
     # count exceeds one, i.e. at cta_m/cta_n = 256).
     cluster = "cluster1x1" if cta_group == 1 else "cluster2x1"
     name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_128x{cta_n}x64_{cluster}"
-    _run_e2e(E=4, S=512, N=256, K=256, offsets_list=[0, 128, 256, 384], combo=combo, config_name=name, cta_group=cta_group)
+    group_m = cta_m * cta_group if cta_m == 512 else 128
+    _run_e2e(E=4, S=4 * group_m, N=256, K=256, offsets_list=[i * group_m for i in range(4)], combo=combo, config_name=name, cta_group=cta_group)
 
 
 @pytest.mark.parametrize("cfg_name,cta_group", [(_SM107_CFG, 2), (_SM107_CFG_1CTA, 1)])
@@ -1124,3 +1406,192 @@ def test_e2e_sm107_unaligned_groups(cfg_name, cta_group) -> None:
     # Group offsets that are not 128-aligned — the per-group-padded SF blob
     # layout is the sm100 one, so the 64-byte-K MMA must not disturb it.
     _run_e2e(E=2, S=512, N=256, K=512, offsets_list=[0, 100, 300], config_name=cfg_name, cta_group=cta_group)
+
+
+# --- sm120 (consumer Blackwell, warp-scoped block-scaled MMA) --------------------
+#
+# The sm120 MoE block-scale template is the dense sm120 block-scale kernel's
+# mainloop + STG epilogue under the grouped persistent scheduler, which walks
+# the groups in index order and carries each group's first SFA 128-row block
+# (the segmented blob restarts at a block boundary per group). A and SFA are
+# addressed by coordinate on one global descriptor each -- no per-group
+# tensormap replacement -- so the ragged-tail rows past group_end are masked
+# at the store. These tests mirror the sm100 e2e coverage above.
+
+_SM120_BS_CFGS = [
+    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4",
+]
+_SM120_BS_CFG = _SM120_BS_CFGS[0]
+
+
+def test_sm120_moe_block_scale_template_is_registered_in_the_sm120_tree() -> None:
+    """Registry wiring: one MoE block-scale template of the sm120 family, rendered
+    by the sm120 tree only, and the auto path targets it on an SM 12.x part."""
+    import cudnn.gemm.frost.compiler as C
+    from cudnn.gemm.frost.kernel_registry import GraphType, TEMPLATES, Sm120KernelTemplate, preferred_pipeline, select_template
+    from cudnn.gemm.frost.sm100 import compiler as C100
+
+    (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120" and t.graph_type is GraphType.MOE_BLOCK_SCALE]
+    assert tmpl.file == "sm120_moe_grouped_block_scale_matmul_fwd.py" and tmpl.family == "sm120"
+    assert isinstance(tmpl, Sm120KernelTemplate) and not tmpl.supports_multi_gemm
+    assert tmpl.path.is_file()
+
+    chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4))
+    cfg = by_name(_SM120_BS_CFG)
+    assert select_template(chain, cfg) is tmpl
+    with pytest.MonkeyPatch.context() as mp:
+        mp.delenv("CUDNN_FRONTEND_GEMM_ARCH_FAMILY", raising=False)
+        mp.setattr(C, "_current_arch", lambda: 120)
+        assert preferred_pipeline(chain) == "sm120"
+        mp.setattr(C, "_current_arch", lambda: 100)
+        assert preferred_pipeline(chain) == "sm100"
+    with pytest.raises(NotImplementedError, match="served by the sm120 arch tree"):
+        C100._render_block_scale_tile_constants(cfg, chain, tmpl)
+
+
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+def test_sm120_moe_block_scale_render_smoke(combo: str) -> None:
+    """Render the template (tile constants + epilogue snippets, no cute.compile)
+    through the sm120 tree by name: marker-free, parseable, the grouped-scheduler
+    constants present, no descriptor patching."""
+    import ast
+    import re
+
+    from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+    from cudnn.gemm.frost.sm120 import compiler as C120
+    from cudnn.gemm.frost.sm120.epilogue_codegen import generate
+
+    chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4, combo=combo))
+    cfg = by_name(_SM120_BS_CFG)
+    snippets = generate(
+        chain,
+        vec_bytes_epi=C120._epi_chunk_bytes(chain, cfg, False),
+        output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
+        tma_slots=frozenset(),
+        packed_lanes=C120._epi_packed_lanes(cfg),
+    )
+    src = C120._render_block_scale_template(chain, snippets, cfg)
+    assert "@@" not in "\n".join(line for line in src.splitlines() if not line.lstrip().startswith(("#", '"""')) and "marker" not in line)
+    ast.parse(src)
+    assert "frost_sm120_moe_grouped_block_scale_matmul_fwd_" in src
+    assert re.search(r"^grid_num_clusters = \d+$", src, re.M) and re.search(r"^offset_cutlass_dtype = cutlass\.Int32$", src, re.M)
+    assert "moe_desc_slots = 0" in src and "tensormap_replace" not in src and "fallback_cluster_shape_mnk" not in src
+    assert "if row < group_end:" in src
+    m = re.search(r"^def _host\(\n(.*?)^\) -> None:", src, re.S | re.M)
+    params = [ln.strip().split(":")[0] for ln in m.group(1).splitlines() if ln.strip()]
+    assert params == ["problem_size", "first_token_offset", "a_tma_workspace", "a_0", "b_0", "sfa_0", "sfb_0", "c_tap_0", "stream"], params
+
+
+@pytest.mark.parametrize("cfg_name", _SM120_BS_CFGS, ids=lambda n: n.removeprefix("CONFIG_sm120_"))
+@pytest.mark.parametrize(
+    "offsets_list",
+    [
+        [0, 512],  # 1 group / 1 expert, full S
+        [0, 512, 768, 896],  # 4 groups over E=2 (BxE > E)
+        [0, 256, 384, 512],  # 4 groups, last extends to S
+        [0, 130, 130, 517],  # ragged tails + an empty group: every SFA segment restarts at a block boundary
+    ],
+)
+@requires_sm120
+def test_e2e_nvfp4_groups_sm120(offsets_list, cfg_name) -> None:
+    _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=offsets_list, config_name=cfg_name, cta_group=None)
+
+
+@pytest.mark.parametrize("combo", ["mxfp4", "mxfp8"])
+@requires_sm120
+def test_e2e_mx_combos_sm120(combo) -> None:
+    _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=[0, 256, 384, 512], combo=combo, config_name=_SM120_BS_CFG, cta_group=None)
+
+
+@requires_sm120
+def test_e2e_mxfp8_n_major_weight_sm120() -> None:
+    # mxfp8 is the only combo that allows an N-major weight (the b8 transposing ldmatrix).
+    _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=[0, 256, 384, 512], combo="mxfp8", config_name=_SM120_BS_CFG, cta_group=None, weight_major="n")
+
+
+@requires_sm120
+def test_e2e_fp4_rejects_n_major_weight_sm120() -> None:
+    g = _build_graph(2, 512, 256, 512, num_groups=2, combo="nvfp4", weight_major="n")
+    with pytest.raises(ValueError, match="must be K-major"):
+        _plan(g, config=by_name(_SM120_BS_CFG))
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "offset_cudnn_dt,offset_torch_dt", [(cudnn.data_type.INT32, torch.int32), (cudnn.data_type.INT64, torch.int64)], ids=["int32", "int64"]
+)
+def test_e2e_offset_dtypes_sm120(offset_cudnn_dt, offset_torch_dt) -> None:
+    _run_e2e(
+        E=3,
+        S=768,
+        N=128,
+        K=256,
+        offsets_list=[0, 300, 301],
+        config_name=_SM120_BS_CFG,
+        cta_group=None,
+        offset_dt=offset_cudnn_dt,
+        offset_torch_dt=offset_torch_dt,
+    )
+
+
+@pytest.mark.parametrize("combo,mode", [("nvfp4", "padded"), ("mxfp8", "zero_stride")])
+@requires_sm120
+def test_e2e_nonpacked_sm120(combo, mode) -> None:
+    _run_nonpacked_e2e(combo, _SM120_BS_CFG, None, mode)
+
+
+@requires_sm120
+def test_e2e_reduction_amax_scalar_sm120() -> None:
+    """The fused reduction epilogue is the shared codegen; on sm120 it rides the STG drain."""
+    _run_e2e(
+        E=2,
+        S=1024,
+        N=256,
+        K=512,
+        offsets_list=[0, 256, 384, 512],
+        config_name=_SM120_BS_CFG,
+        cta_group=None,
+        reduction_mode=cudnn.reduction_mode.AMAX,
+        reduction_dims=(1, 1, 1),
+    )
+
+
+@requires_sm120
+def test_e2e_auto_config_sm120() -> None:
+    """The engine's auto path on an SM 12.x part: preferred_pipeline lands on the
+    sm120 MoE block-scale template and select_config hands it a legal geometry."""
+    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan
+
+    dev = "cuda"
+    torch.manual_seed(0)
+    E, S, N, K = 2, 1024, 256, 512
+    offsets_list = [0, 256, 384, 512]
+    block_size = _COMBOS["nvfp4"][0]
+    sf_k = K // block_size
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    tok_u8 = torch.randint(0, 256, (1, S, K // 2), dtype=torch.uint8, device=dev)
+    w_u8 = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=dev)
+    sfa_log = torch.randint(1, 4, (S, sf_k), device=dev).to(torch.float8_e4m3fn)
+    sfb_log = torch.randint(1, 4, (E, N, sf_k), device=dev).to(torch.float8_e4m3fn)
+
+    compiled = build_gemm_plan(_build_graph(E, S, N, K, num_groups=len(offsets_list)))
+    assert compiled.config.pipeline == "sm120", compiled.config.name
+
+    sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : (offsets_list[gi + 1] if gi + 1 < len(offsets_list) else S)]) for gi in range(len(offsets_list))]
+    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, len(offsets_list), sf_k)
+    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
+    output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
+    compiled(_vp_bs(compiled, tok_u8.view(torch.float4_e2m1fn_x2), w_u8.view(torch.float4_e2m1fn_x2), output, sfa_blk, sfb_blk, fto=offsets))
+    torch.cuda.synchronize()
+
+    tok_s = _unpack_fp4(tok_u8, lut).view(S, K) * sfa_log.float().repeat_interleave(block_size, 1)
+    w_s = _unpack_fp4(w_u8, lut).view(E, N, K) * sfb_log.float().repeat_interleave(block_size, 2)
+    ref = torch.zeros((S, N), dtype=torch.float32, device=dev)
+    for gi in range(len(offsets_list)):
+        b = offsets_list[gi]
+        e = offsets_list[gi + 1] if gi + 1 < len(offsets_list) else S
+        if b != e:
+            ref[b:e] = tok_s[b:e] @ w_s[gi % E].T
+    torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)

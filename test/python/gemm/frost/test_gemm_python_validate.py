@@ -12,6 +12,8 @@ import pytest
 import cudnn
 from cudnn.engines import manifest
 
+pytestmark = pytest.mark.L0
+
 
 @pytest.fixture
 def frost_candidate(monkeypatch):
@@ -78,21 +80,41 @@ def test_mixed_graph_still_lowers(frost_candidate):
     assert g._lowered_graph is not None
 
 
-def test_contraction_mismatch_rejected(frost_candidate):
-    """K disagreement between A and B is a GRAPH_NOT_SUPPORTED-class rejection from validate()."""
+@pytest.mark.parametrize("candidate", ["frost_candidate", "no_candidates"])
+def test_contraction_mismatch_rejected(candidate, request):
+    """The native validator reports K mismatch; classic node validation keeps its error type."""
+    request.getfixturevalue(candidate)
     g, _ = _matmul_graph(a_dim=(2, 64, 32), b_dim=(2, 40, 48))
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="contraction mismatch"):
+    error, message = (
+        (cudnn.cudnnGraphNotSupportedError, "contraction mismatch") if candidate == "frost_candidate" else (ValueError, "Inner dimensions must match")
+    )
+    with pytest.raises(error, match=message):
         g.validate()
     assert g._lowered_graph is None and g._is_validated is False
 
 
-def test_batch_broadcast_rules(frost_candidate):
+@pytest.mark.parametrize("candidate", ["frost_candidate", "no_candidates"])
+def test_batch_broadcast_rules(candidate, request):
     """Batch extents must be equal or 1 (broadcast)."""
+    request.getfixturevalue(candidate)
     g, _ = _matmul_graph(a_dim=(1, 64, 32), b_dim=(4, 32, 48))
     g.validate()  # broadcast OK
     g, _ = _matmul_graph(a_dim=(3, 64, 32), b_dim=(4, 32, 48))
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="not broadcastable"):
+    error = cudnn.cudnnGraphNotSupportedError if candidate == "frost_candidate" else ValueError
+    with pytest.raises(error, match="not broadcastable"):
         g.validate()
+    assert g._lowered_graph is None and g._is_validated is False
+
+
+@pytest.mark.parametrize("family_result", [True, False, None])
+def test_node_error_survives_family_validation(frost_candidate, monkeypatch, family_result):
+    """A family accepting, declining or being unavailable cannot erase a node error."""
+    validator = None if family_result is None else lambda graph: family_result
+    monkeypatch.setattr(manifest, "resolve_validator", lambda family: validator)
+    g, _ = _matmul_graph(a_dim=(2, 64, 32), b_dim=(2, 40, 48))
+    with pytest.raises(ValueError, match="Inner dimensions must match"):
+        g.validate()
+    assert g._lowered_graph is None and g._is_validated is False
 
 
 def test_declared_output_dims_checked(frost_candidate):

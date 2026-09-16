@@ -2608,9 +2608,10 @@ def test_smem_d_reserve_matches_what_the_templates_stage(cfg_name: str, cta_grou
 
     from cudnn.gemm.frost.compiler import _TMA_STORE_EPI_PIPELINES
 
-    tmpl = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
+    from cudnn.gemm.frost.arch_family import template_files
+
     formulas = set()
-    for f in sorted(tmpl.glob("sm*.py")):
+    for f in template_files():
         got = [line.strip() for line in f.read_text().split("\n") if line.strip().startswith("epi_subtile_elems = ")]
         # Only the TMA-store families stage an epilogue ring; sm120 stores STG
         # straight from registers and has no slot to size.

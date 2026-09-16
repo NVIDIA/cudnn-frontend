@@ -1,6 +1,119 @@
 # DSA Sparse Attention Benchmarks
 
-## Sparse Attention Forward
+Benchmarks for the cuDNN Frontend DeepSeek Sparse Attention (DSA) kernels
+(`cudnn.DSA.SparseAttentionForward` / `SparseAttentionBackward`). Two ways to
+run them:
+
+- **Configuration-based suite** (`runner.py` + `configs/`) — sweeps model
+  presets over sequence lengths and passes, writes a CSV and a fwd/bwd chart
+  per run. Arranged like [`../attention_training`](../attention_training/README.md)
+  and [`../attention_inference`](../attention_inference/README.md).
+- **Single scripts** (`benchmark_dsa_sparse_attention_forward.py`,
+  `benchmark_dsa_sparse_attention_backward.py`) — ad-hoc shapes, execute-vs-
+  wrapper split, `profile` mode for nsys/ncu.
+
+## Contents
+
+- `configs/` - Benchmark configuration files
+  - `deepseek_v4.py` - DeepSeek-V4 Flash (H64, K=640) and Pro (H128, K=1152), 2k..32k
+- `runner.py` - Configuration-based benchmark runner (one subprocess per case)
+- `benchmark_single_dsa.py` - Single-case worker the runner calls; prints a `RESULT,` line
+- `config_types.py` - `ModelPreset`, `DsaBenchmarkConfig`, `BenchmarkResult`
+- `charts.py` - Chart generation
+- `run_all.sh` - Runs configs and lands results in `results/<config>/<gpu>/`
+- `results/` - Benchmark outputs (CSV and charts)
+
+## Configuration-Based Suite
+
+```bash
+# from the repository root
+python -m benchmark.dsa.runner --list-configs
+python -m benchmark.dsa.runner --config deepseek_v4
+python -m benchmark.dsa.runner --config deepseek_v4 --dry-run
+python -m benchmark.dsa.runner --config deepseek_v4 --filter flash --pass fwd
+python -m benchmark.dsa.runner --config deepseek_v4 --output-dir benchmark/dsa/results/deepseek_v4/b200
+
+# all configs for one architecture label (optionally pinning a GPU)
+benchmark/dsa/run_all.sh b200 GPU-<uuid>
+```
+
+Requires an SM100-family GPU for the forward pass, SM90 or SM100 for the
+backward pass, PyTorch with CUDA, `pip install nvidia-cudnn-frontend[cutedsl]`
+(or a development install of this repository's `python/` package), and
+`pandas`/`matplotlib`/`seaborn` for CSV and charts. `pynvml` is optional; with
+it each row records the dense-MMA peak at the sampled SM clock
+(`peak_mma_tflops`) and the chart draws it as a dashed line.
+
+### What a case measures
+
+A case is one `(model, (s_q, s_kv), backend, dtype, pass)` tuple. Inputs are
+flat MQA tensors — `q (s_q, H, d_qk)`, one shared `kv (s_kv, d_qk)` record
+read as both K and V, and `topk_idxs (s_q, topk)` holding unique random rows of
+the KV pool for every query, plus per-head sink logits and a full-length
+`topk_length` (production passes it; it selects a different compiled variant).
+
+- **fwd** times `SparseAttentionForward.execute` with preallocated outputs
+  (`out`, `max_logits`, `lse`, and `lse_indexer` when `indexer_topk > 0`).
+- **bwd** times `SparseAttentionBackward.execute` with preallocated `dq`/`dkv`
+  and a reusable workspace; the `out`/`lse` it consumes come from a chunked
+  PyTorch reference so no forward launch is in the timed region. Gradient
+  zeroing the kernel performs itself is included, as a training step pays it.
+
+Timing is CUDA events around each call after a 256 MiB L2 flush, median of
+`num_iterations` after warmup (kernel compilation happens in warmup). Each
+case runs in its own subprocess: a clean CUDA context and CuTe DSL compile
+state, and one failure cannot take down the sweep. Shapes the kernels'
+`check_support` rejects are recorded as `skipped=True` rows, distinct from
+failures.
+
+TFLOPS count only the gathered rows:
+
+```
+fwd FLOPs = 2 * s_q * H * topk * (d_qk + d_v)
+bwd FLOPs = 2 * s_q * H * topk * (3 * d_qk + 2 * d_v)
+```
+
+so they are independent of `s_kv` and directly comparable to the dense
+suites' numbers.
+
+### Model presets
+
+`deepseek_v4` (`configs/deepseek_v4.py`): V4's sparse core is flat MQA over a
+shared K=V record of `d=512`. The lightning indexer selects 512 (Flash) /
+1024 (Pro) entries per query and the softmax runs over their union with the
+last 128 tokens and a per-head sink; folding the window into the index list
+gives logical `K = 640` / `1152` with `indexer_topk = 512` / `1024` (the
+indexer-selected prefix whose LSE the forward kernel also emits). Heads: 64
+(Flash) / 128 (Pro). Sequence lengths 2k, 4k, 8k, 16k, 32k with `s_q == s_kv`;
+every query gathers the full top-k, i.e. the per-token upper bound.
+
+To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
+(`num_q_heads`, `head_dim_qk` in `{512, 576}`, `topk`, `indexer_topk`,
+`has_sink`) and the `DsaBenchmarkConfig` (`seqlens`, `profile_pass`,
+`deterministic_bwd`, iteration counts), and run `--config <name>`. Supported
+forward variants are `(H, d_qk)` in `{(64, 512), (64, 576), (128, 512)}` with
+`indexer_topk` in `{0, 512, 1024}` (`2048` for H64 too); backward accepts any
+head count with `d_qk` in `{512, 576}` and a deterministic mode on SM100 for
+H16/H32/H64/H96/H128.
+
+### Output
+
+```
+results/<config>/<gpu>/
+    <config>_<timestamp>.csv   # one row per case (see BenchmarkResult)
+    <config>.webp               # fwd | bwd TFLOPS vs seqlen, one bar per model
+```
+
+### Results
+
+#### B200 - DeepSeek-V4
+
+![DeepSeek-V4 DSA on B200](results/deepseek_v4/b200/deepseek_v4.webp)
+- `dsv4_flash: H=64, d=512, K=640 (indexer_topk=512)`; `dsv4_pro: H=128, d=512, K=1152 (indexer_topk=1024)`; bf16, sink + `topk_length`, non-deterministic backward.
+
+## Single Scripts
+
+### Sparse Attention Forward
 
 `benchmark_dsa_sparse_attention_forward.py` benchmarks the public SM100
 `cudnn.DSA.sparse_attention_forward_wrapper` API for H64/D512 or D576 and the
@@ -37,7 +150,7 @@ Common options are `--seqlen-q`, `--seqlen-kv`, `--heads`, `--head-dim`,
 requires an SM100-family GPU, BF16 inputs, PyTorch with CUDA support, and the
 cuDNN Frontend `[cutedsl]` dependencies.
 
-## Sparse Attention Backward
+### Sparse Attention Backward
 
 Microbenchmark for the DeepSeek Sparse Attention (DSA) backward kernel in the
 cuDNN Frontend CuTe DSL package, driven through the public
@@ -45,7 +158,7 @@ cuDNN Frontend CuTe DSL package, driven through the public
 the Hopper (SM90) or Blackwell (SM100) implementation based on the active
 CUDA device.
 
-### What is measured
+#### What is measured
 
 Inputs are flat MQA tensors: `q (S_q, H, d_qk)`, a shared
 `kv (S_kv, d_qk)` buffer (K = V), and per-query global top-k indices
@@ -66,7 +179,7 @@ dP, dQ, dK):
 FLOPs = 2 * S_q * H * topk * (3 * d_qk + 2 * d_v)
 ```
 
-### Requirements
+#### Requirements
 
 - Hopper (SM90) or Blackwell (SM100) GPU
 - PyTorch with CUDA support
@@ -74,7 +187,7 @@ FLOPs = 2 * S_q * H * topk * (3 * d_qk + 2 * d_v)
   this repository's `python/` package) -- the CuTe DSL dependencies are
   required dependencies and come with either installation method
 
-### How to run
+#### How to run
 
 Default sweep (`seqlens 4096,8192 x topks 128,512,1024,2048`, bf16,
 `d_qk = d_v = 512`, 64 heads):
@@ -89,8 +202,14 @@ Custom shapes and CSV output:
 python benchmark_dsa_sparse_attention_backward.py --seqlens 4096,8192,16384 --topks 512,2048 --csv results.csv
 python benchmark_dsa_sparse_attention_backward.py --head-dim 576   # 512 value dims + 64 RoPE dims
 python benchmark_dsa_sparse_attention_backward.py --nheads 16 --head-dim 576  # SM100 H16/D576 M128 backend
-python benchmark_dsa_sparse_attention_backward.py --nheads 128  # SM100 (10, 0) BF16 H128/D512 two-CTA backend
+python benchmark_dsa_sparse_attention_backward.py --nheads 128  # SM100/SM103 BF16 H128/D512 two-CTA backend
+python benchmark_dsa_sparse_attention_backward.py --nheads 128 --head-dim 576 --csv d576_2cta.csv  # SM100/SM103 BF16 H128/D576 two-CTA backend
 ```
+
+The H128/D576 two-CTA route uses the same public-wrapper measurement, including
+workspace allocation and initialization. Add `--no-topk-length` to cover the
+variant without a lengths tensor; the default passes a full-length tensor.
+The existing benchmark arguments and CSV format apply to both variants.
 
 Options:
 
@@ -109,9 +228,9 @@ Options:
   first warmup iteration also triggers kernel compilation).
 - `--csv` — write results to a CSV file.
 
-### Results
+#### Results
 
-#### B200
+##### B200
 
 Generated on an NVIDIA B200 with the default
 sweep settings (`nheads=64`, `d_qk = d_v = 512`, bf16, attention sink and
@@ -132,7 +251,7 @@ supported DSL.
 |     8192 |      8192 | 1024 |  4.538 |     605.76 |
 |     8192 |      8192 | 2048 |  8.562 |     642.06 |
 
-### Profiling
+#### Profiling
 
 `profile` mode runs a single warmed-up backward call (using the first value
 of `--seqlens` and the last value of `--topks`) wrapped in

@@ -16,7 +16,7 @@
 # limitations under the License.
 
 """Gated DeltaNet (GDN) Cutlass-primitives bprop kernel config (fixed compile-time
-constants; the per-compile attributes live on ``GdnBwdCfg`` in the kernel
+constants; the per-compile attributes live on ``GdnBpropCfg`` in the kernel
 file).
 
 Target arch: Blackwell SM100 (GB200) / SM103 (GB300).
@@ -29,16 +29,12 @@ from typing import Tuple
 @dataclass(frozen=True)
 class Cfg:
     # --- tile shape ---
-    B_T: int = 64  # chunk size / token tile (the mma N or K of every GEMM)
-    D_K: int = 128  # query/key head dim
-    D_V: int = 128  # value head dim
-
-    # --- TMA descriptor pool ---
+    B_T: int = 64
 
     # --- warp assignments (16 warps total) ---
-    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # T-pairwise / kk_epi / qk_epi / inverse / parts
-    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # dstate prep / dV-dK-dQ epilogues / dq dot
-    COMPUTE_GROUP_2_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)  # dK inter rescale / attn read / dGate K parts / dK fold
+    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)
+    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)
+    COMPUTE_GROUP_2_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)
     TCGEN05_MMA_WARP_ID: int = 12
     TMA_QKV_WARP_ID: int = 13
     LOAD_GATE_BETA_WARP_ID: int = 14
@@ -59,8 +55,15 @@ class Cfg:
     SMEM_Q_STAGES: int = 1
     SMEM_K_STAGES: int = 2
     SMEM_V_STAGES: int = 1
+    SMEM_DO_STAGES: int = 1
+    SMEM_STATE_STAGES: int = 1
     SMEM_T_INV_STAGES: int = 1
     SMEM_A_STAGES: int = 1
+    SMEM_DQ_STAGES: int = 1
+    SMEM_DK_STAGES: int = 1
+    SMEM_DV_STAGES: int = 1
+    SMEM_GATE_STAGES: int = 2
+    SMEM_BETA_STAGES: int = 2
 
     # --- TMEM stage counts ---
     TMEM_DH_ACC_STAGES: int = 1
