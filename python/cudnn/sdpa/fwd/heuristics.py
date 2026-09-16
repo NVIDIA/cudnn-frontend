@@ -417,6 +417,21 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # are Rubin's cluster count and CGA rows, unmeasured on GeForce Blackwell).
         waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / _SM107_CLUSTERS
         primary = SCHED_LPT if waves <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
+    elif (
+        causal_ish
+        and caps.sm_lo == 100
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and _selected_d_shape(caps, facts) == (128, 128)
+        and 1 in effective_cgas(caps, facts)
+        and _d128_decode_tile_fits(caps, facts)
+    ):
+        # The d128 decode tile (bottom-right causal MTP, S_q * G <= 128): one
+        # Q tile per (KV head, batch), so every unit walks the same per-batch
+        # KV range and LPT has nothing to balance; LPT_L2's head grouping
+        # groups nothing when the packed head IS the KV head.  Measured on
+        # B200 (b=32, H=64/4, S_q=4, S_kv=4096, page 16): NATURAL 120.0 us vs
+        # LPT_L2 125.4 us on the prefill tile; the decode tile keeps the order.
+        primary = SCHED_NATURAL
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
         # whether one head's K+V working set fits the L2 budget.
@@ -569,10 +584,39 @@ def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm10
     )
 
 
+# The d128 decode tile's Q rows per CTA (config_sm100.CfgD128Decode: TILES_Q=1 x
+# TILE_M=128 x CTA_MMA=1).  The SM100 f16 row's (128, 128) flavor has two
+# tiles behind TILE_CGA_M: cga2 is the prefill pipeline (512 rows per
+# cluster), cga1 the decode tile (sm100/decode_d128_f16.py).
+_D128_DECODE_TILE_ROWS = 128
+
+
+def _d128_decode_tile_fits(caps: Capabilities, facts) -> bool:
+    """Whether one d128 decode tile covers a KV head's live Q rows.
+
+    ``S_q * pack_g <= 128`` with ``pack_g`` the GQA group when the row packs
+    it (the packed leg is what decode-shaped graphs propose first; the
+    unpacked runner-up has fewer rows still).  Dense only: the decode tile has
+    no THD leg.  Measured on B200 (b=32, H=64/4, d128, S_kv=4096, page 16,
+    bf16): the prefill tile at cga2 119 us, the decode tile 49 us -- see the
+    kernel docstring; at S_q * G > 128 the prefill tile's second sub-tile is
+    live and cga2's collective MMA halves per-CTA K/V traffic, so the rule
+    stops there rather than at a measured crossover.
+    """
+    if facts.thd:
+        return False
+    pack_g = (facts.h_q // facts.h_kv) if _pack_gqa_eligible(caps, facts, _D128_DECODE_TILE_ROWS) else 1
+    return facts.s_q * pack_g <= _D128_DECODE_TILE_ROWS
+
+
 def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int) -> tuple[int, Optional[int]]:
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
     selected_shape = _selected_d_shape(caps, facts)
+    if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
+        # The f16 SM100 row: cga1 = the decode tile when one of its 128-row
+        # tiles covers the head's Q rows, else the cga2 prefill pipeline.
+        return sched_policy, (1 if _d128_decode_tile_fits(caps, facts) else 2)
     if selected_shape == (256, 256) and any(shape == selected_shape for shape, _ in caps.cgas_by_d_shape):
         params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
         selected_sched, selected_cga = select_d256_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)

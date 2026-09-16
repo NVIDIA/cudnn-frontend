@@ -99,8 +99,32 @@ MMA as d=512.
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ᵇ · ✅ᵍ |
+| **Decode tile** (`S_q · G ≤ 128`, decode + MTP; f16/bf16, dense or paged)ᵈᵗ | ✅ᵈᵗ (d128 envelope) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ❌ (prefill tile) | ❌ (prefill tile) | — |
 | Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ (d128 envelope) | ✅ᵖ | ❌ | ✅ᵖ | ❌ | ❌ |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+ᵈᵗ **d128 decode tile (`sm100/decode_d128_f16.py`, f16/bf16).** The (128, 128) flavor of
+`sdpa_fwd_prefill_sm100` has two tiles behind the `TILE_CGA_M` knob: `2` is the prefill
+pipeline (TILES_Q=2 x TILE_M=128 x CTA_MMA=2 = 512 Q rows per cga2 cluster) and `1` the
+decode tile — TILES_Q=1, one independent CTA per 128-row Q tile, one softmax warpgroup
+(12 warps), the Q/O SMEM slab aliased so the K/V ring is three stages deep, two S/P
+TMEM slots alternating per KV tile so BMM1(i+1) overlaps softmax(i). The heuristics
+propose `TILE_CGA_M=1` exactly when one 128-row tile covers a KV head's live Q rows —
+`S_q * pack_g <= 128` with `pack_g` the PackGQA group (S_q = 1 decode, MTP S_q in
+[2, 8]) — and keep the prefill tile otherwise; a pinned `TILE_CGA_M` is honored either
+way (a pinned 1 on any dense S_q runs the decode tile). Bottom-right causal decode
+shapes walk `SCHED_NATURAL` first (every unit has the same work). Same contract as the
+prefill tile on dense and paged graphs: padding mask + per-batch lengths, causal /
+bottom-right / SWA band, dense padded-Q trim, sink (dense; paged + sink stays declined
+by ᵖ), Stats incl. base-2, PackGQA when the group divides 128, KV split + combine, NATURAL
+/ LPT / LPT_L2. **Not on the decode tile: THD** (a ragged graph keeps `TILE_CGA_M=2`; a
+pinned 1 declines), fp8 / mxfp8 (their rows keep `cgas={2}`), and the other flavors
+(d192x128 / d256 / d512 have no decode tile yet — their decode graphs run the prefill
+tile as before). d64 rides it through the d128 envelope. Measured on B200 (graph path,
+CUDA-graph replay, b=32, d=128, S_kv=4096, page 16, bf16): 64/4 S_q=1 119.2 us on the
+prefill tile → 48.9 us on the decode tile (the cuDNN backend's decode engine: 44 us);
+64/4 MTP S_q=4 127.5 → 50.6 us; 64/8 S_q=1 234.6 → 96.4 us; 96/8 S_q=1 (G=12, unpacked)
+2632 → 767 us; d64 64/8 230.5 → 80.2 us. The kernel docstring carries the full table.
 
 ᵖ **Paged KV (issue #920), f16/bf16 only, d128 and d256 flavors** (`d_qk, d_v <= 256`;
 d=64 rides the d128 envelope, d=192/192 the d256 one; mixed dims that would select
@@ -121,9 +145,11 @@ lengths bound the walk on device and the split composes with them; it pays when
 multiple of the 128-row KV tile (FlashInfer passes its true max verbatim, e.g. 4000)
 does not withhold the split, unlike a mask-free dense `S_kv`, which rides synthesized
 KV-tail padding the split cannot. Not yet: sink, fp8/mxfp8 pools,
-packed (ragged-offset) block tables. Served by `prefill_d128_f16_sm100.py`'s `PAGED_KV`
-specialization (block-table indirection on the K/V TMA loads; boxes past a
-sequence's live pages are TMA-OOB zero-filled).
+packed (ragged-offset) block tables. Served by the `PAGED_KV` specialization of
+`sm100/prefill_d128_f16.py` / `sm100/prefill_d256_f16.py` (block-table indirection on
+the K/V TMA loads; boxes past a sequence's live pages are TMA-OOB zero-filled) and, for
+decode / MTP shapes on the d128 flavor (`S_q * G <= 128`), of the d128 decode tile
+`sm100/decode_d128_f16.py` (ᵈᵗ).
 
 ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**
 (`Capabilities.pack_gqa_partial_d_shapes = {(128, 128), (256, 256)}`, `Cfg.PACK_G`).
@@ -728,7 +754,8 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | MXFP8 backward outside SM100/SM103 d = 256 | every arch |
 | THD / ragged backward | SM120, and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ; SM80 — see ᵏ) |
 | THD forward | SM80 |
-| **Native d=64 (GPT-OSS) forward kernel** | **SM100, SM107** — served via the d128 envelope at ~2× MMA cost |
+| **Native d=64 (GPT-OSS) forward kernel** | **SM100, SM107** — served via the d128 envelope at ~2× MMA cost (decode shapes ride the d128 decode tile, ᵈᵗ) |
+| Decode tile outside the d128 f16/bf16 flavor | SM100, SM103 — d192×128 / d256 / d512 decode and every fp8 / mxfp8 decode run the prefill tile (`TILE_CGA_M=2`); THD queries too (ᵈᵗ) |
 | d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |
 | Bias forward | SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |

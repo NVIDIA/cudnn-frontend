@@ -96,6 +96,13 @@ _SM100_KERNEL_FILES = {
     (192, 128): "sm100/prefill_d192_d128_f16.py",
     (128, 128): "sm100/prefill_d128_f16.py",
 }
+# The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
+# KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
+# TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
+# tile; the TILES_Q=2 prefill body at cga1 stays reachable only by loading its
+# template directly (its cga1 arm is kept for that).
+_SM100_DECODE_KERNEL_FILE = "sm100/decode_d128_f16.py"
+_SM100_DECODE_FLAVOR = (128, 128)
 # DTYPE_* codes: E4M3=0, E5M2=1, BF16=2, FP16=3. FP8 inputs (0/1) route to the
 # FP8 kernel families; the output dtype is encoded the same way.
 _SM100_DTYPE_QKV_CODE = {
@@ -400,6 +407,11 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
         return (1,)
     if device_cc != (10, 7) and fp8 and not pertensor and flavor == (512, 512):
         return (1,)
+    if device_cc != (10, 7) and not fp8 and flavor == _SM100_DECODE_FLAVOR:
+        # cga1 on the d128 f16/bf16 flavor selects the DECODE tile
+        # (sm100/decode_d128_f16.py); dense graphs only -- check_support
+        # declines it for THD, mirroring engines.mismatch.
+        return (1, 2)
     return (2,)
 
 
@@ -428,6 +440,12 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     elif fp8:
         filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
+    elif flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and not params.thd_varlen:
+        # TILE_CGA_M=1 on the d128 f16/bf16 flavor IS the decode tile (see
+        # config_sm100.CfgD128Decode).  Dense only: THD at cga1 is declined
+        # upstream (engines.mismatch / check_support), never routed here.
+        filename = _SM100_DECODE_KERNEL_FILE
+        tag = f"sdpa_fwd_sm100_{tag}_decode"
     else:
         filename = _SM100_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{tag}"
@@ -1621,6 +1639,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._value_error_if(
             self.flavor == (192, 128) and self.split_kv > 1 and self.cga == 1,
             "D192 split_kv > 1 is validated only with cga=2",
+        )
+        # cga=1 on the d128 f16/bf16 flavor is the DECODE tile
+        # (sm100/decode_d128_f16.py), which carries no THD leg.  Mirrors the
+        # engine row's mismatch line; keep the two in lockstep.
+        self._not_implemented_error_if(
+            self.flavor == _SM100_DECODE_FLAVOR and self.cga == 1 and not self._fp8 and self.thd,
+            "cga=1 on the d128 flavor selects the dense decode tile; THD (ragged) graphs run the cga2 prefill tile",
         )
         self._not_implemented_error_if(
             self.pv_bf16 and (self.flavor not in ((128, 128), (192, 128)) or self.thd or self.split_kv != 1),

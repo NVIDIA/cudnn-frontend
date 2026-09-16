@@ -499,6 +499,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
+        if knobs.cga == 1 and facts.thd and capabilities.sm_lo == 100 and _selected_d_shape(capabilities, facts) == (128, 128):
+            # cga1 on the SM100 line's d128 f16/bf16 flavor IS the decode tile
+            # (sm100/decode_d128_f16.py, TILES_Q=1), which carries no THD leg.
+            # A ragged graph keeps the cga2 prefill tile; api_dsl.check_support
+            # mirrors this line (keep the two in lockstep).
+            return "cga=1 on the d128 flavor selects the dense decode tile; THD (ragged) graphs run the cga2 prefill tile"
         if knobs.split_kv is not None and knobs.split_kv < 1:
             return f"requested split_kv={knobs.split_kv} is not a split count (1 = off)"
         if knobs.split_kv is not None and knobs.split_kv > 1:
@@ -805,8 +811,12 @@ def _sm100_spec() -> EngineSpec:
     """f16/bf16 SM100-family engine: ONE row; the adapter picks the smallest
     kernel flavor (d128 / d192xd128 / d256 / d512) covering the graph's head
     dims (api_dsl._pick_flavor), and every flavor serves its envelope via TMA
-    zero-padding. sm_hi=106: no f16 lowering exists on the Rubin line — when
-    one lands it gets its own row (the per-arch-line row doctrine)."""
+    zero-padding. The d128 flavor has two tiles behind one knob: TILE_CGA_M=2
+    is the prefill pipeline (512 Q rows per cluster), TILE_CGA_M=1 the decode
+    tile (128 rows per CTA, sm100/decode_d128_f16.py) -- the "decode vs prefill
+    by S_q" kernel choice EngineSpec.lower anticipates, driven by the
+    heuristics' cga rule. sm_hi=106: no f16 lowering exists on the Rubin line —
+    when one lands it gets its own row (the per-arch-line row doctrine)."""
     return EngineSpec(
         name="sdpa_fwd_prefill_sm100",
         capabilities=Capabilities(
@@ -848,7 +858,14 @@ def _sm100_spec() -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
-            cgas_by_d_shape=(((192, 128), frozenset({1, 2})),),
+            # (128, 128): TILE_CGA_M=1 IS the d128 DECODE tile
+            # (sm100/decode_d128_f16.py -- TILES_Q=1, one softmax warpgroup,
+            # three KV stages; config_sm100.CfgD128Decode), which the lowering
+            # selects for that knob value on dense graphs (THD keeps cga2, see
+            # mismatch).  The heuristics propose it when one 128-row tile
+            # covers a KV head's Q rows (S_q * pack_g <= 128): decode and MTP.
+            # A split rides either width (no split_cgas entry).
+            cgas_by_d_shape=(((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2}))),
             split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
             # All four f16 flavor kernels wire SplitHelpers, and the adapter
             # carves the partial slabs + launches sm100/split_combine when

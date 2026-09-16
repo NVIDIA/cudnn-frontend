@@ -387,6 +387,7 @@ graph.sdpa(
     - Pass `page_table_v` tensor with block offsets into the V container (optional if V is not paged)
     - Pass sequence length tensors (`seq_len_q`, `seq_len_kv`) for padding mask
     - Optionally pass `paged_attention_max_seq_len_kv` for the maximum KV sequence length (recommended)
+  - **FROST engines** (opt-in, SM100 line, f16/bf16): paged decode and MTP graphs (`S_q * H_q/H_kv <= 128` on the d128 flavor) run a dedicated decode tile (`TILE_CGA_M=1`); other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
   - **Offset calculation**:
     - $K_{cache}[b,h,s,d] = K_{container}[page\_table\_k[b,1,s / bs_k, 1], h, s \mod bs_k, d]$
     - $V_{cache}[b,h,s,d] = V_{container}[page\_table\_v[b,1,s / bs_v, 1], h, s \mod bs_v, d]$
