@@ -123,3 +123,23 @@ them: pass `stream=side.cuda_stream` explicitly to both warmup and capture.
 Assert that the captured graph contains the expected Frost kernel, then poison
 outputs and replay with changed inputs. An empty graph warning is a test failure,
 not evidence that the kernel is capture-safe.
+
+Static MoE scheduling needs the same multiwave and changed-offset checks as
+dynamic scheduling. Include live experts beyond the 32-lane prefix-scan window,
+then inspect captured kernel names: static has no counter-reset kernel, dynamic
+has exactly one per grouped GEMM. A reset-free launch alone does not prove
+that cyclic tile ownership covers every group or refreshes routing metadata.
+
+SM120 shared-A pairs also need `gemm/frost/test_moe_shared_a_sm120.py` under
+unfiltered memcheck and racecheck. It checks both FP32 GEMM products, since a
+gated final result can hide errors in either product. The weights share storage
+with an expert pitch aligned to16bytes but not32bytes; this exercises the
+compiled fake-tensor stride contract independently of the output vector width.
+The epilogue reuses one warp-private transpose buffer for both results: all
+lanes must finish their loads before the next result overwrites that buffer.
+
+For a multi-GEMM graph with a fused epilogue, export diagnostic products via
+`graph.identity(product).set_output(True)` and verify that every requested
+output appears in the compiled binding. Direct per-GEMM output taps are not
+part of the current multi-GEMM analyzer contract; successful compilation
+alone can therefore miss a broken diagnostic variant pack.

@@ -848,8 +848,12 @@ def _render_tile_constants(
     ``moe_aligned_offsets``.
     """
     _check_own_family(tmpl)
-    if chain.is_multi_gemm or chain.has_mainloop_fusion or chain.has_block_scale:
-        raise NotImplementedError(f"{tmpl.file} renders plain single-GEMM matmul chains only")
+    if chain.has_mainloop_fusion or chain.has_block_scale:
+        raise NotImplementedError(f"{tmpl.file} renders plain matmul chains only")
+    if chain.is_multi_gemm:
+        reason = tmpl._extra_reject(chain, cfg)
+        if reason is not None:
+            raise NotImplementedError(reason)
     if chain.has_moe and chain.matmul.a_major != "k":
         raise NotImplementedError(f"{tmpl.file} loads the MoE token through a K-major TMA box; got a {chain.matmul.a_major}-major token")
     # warps_per_cta is a fact of the TEMPLATE (8 compute + TMA + CLC + 2 donors).
@@ -890,6 +894,12 @@ def _render_tile_constants(
     # The template always stores STG straight from registers: no TMA-store ring,
     # so the chunk is the outputs' own store vector width.
     vec_bytes_epi = _epi_vec_bytes(chain, cfg)
+    if chain.is_multi_gemm:
+        from ..tile_config import _sm120_shared_a_pair_stages
+
+        ab_stages = _sm120_shared_a_pair_stages(cfg, smem_fixed_reserve=tmpl.smem_fixed_reserve)
+    else:
+        ab_stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)
     lines = [
         f"# Tile config: {cfg.name}",
         f"mma_inst_shape_mnk = {cfg.mma_tile_mnk(elem_bytes)}",
@@ -903,7 +913,7 @@ def _render_tile_constants(
         f"b_is_n_major = {chain.matmul.b_major == 'n'}",
         # The AB pipeline depth; the template then funds its transposed-STG
         # epilogue staging out of it.
-        f"ab_stages = {cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)}",
+        f"ab_stages = {ab_stages}",
         f"a_tma_group_elems = {a_tma_group_elems}",
         f"b_tma_group_elems = {b_tma_group_elems}",
         # Warp-MMA pairs per warp tile per axis -- the compute-warp grid falls
@@ -927,6 +937,7 @@ def _render_tile_constants(
         f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}",
         f"num_a_operands = {chain.num_a_operands}",
         f"num_b_operands = {chain.num_b_operands}",
+        f"num_gemms = {chain.num_gemms}",
         f"vec_bytes_epi = {vec_bytes_epi}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store=False)}",
         f"split_k_slices = {cfg.split_k_slices}",
@@ -1521,6 +1532,7 @@ def _render_template(
     chain: FusionChain,
     snippets: EpilogueSnippets,
     config: TileConfig,
+    moe_sched_policy: int = 0,
 ) -> str:
     # Template selected by the kernel registry from the pure-geometry config +
     # execution strategy (cta_group); mainloop/graph_type from chain.
@@ -1568,6 +1580,8 @@ def _render_template(
     # Per-GEMM register-vector bindings in the STG inner loop: GEMM 0 is bound by
     # the template (vec_f32); the rest (vec_f32_1, ...) are injected here.
     stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}][j * vsize : (j + 1) * vsize]" for g in range(1, chain.num_gemms)) or "pass"
+    if chain.has_moe and chain.is_multi_gemm and not chain.has_block_scale:
+        stg_vec_bindings = "vec_f32_1 = _rows[1][sv * _STG_V : _STG_V]"
     # MoE multi-GEMM: the kernel also takes the raw A (token) tensor per distinct
     # A operand (for the per-group patched base address) — same tensors the host
     # uses to build the A descriptors.
@@ -1591,6 +1605,8 @@ def _render_template(
     )
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
     tile_constants = _render_tile_constants(config, chain, tmpl)
+    if chain.has_moe:
+        tile_constants += f"\nmoe_static_sched = {moe_sched_policy == 1}"
     if plumb.tap_constants:
         tile_constants += "\n" + "\n".join(plumb.tap_constants)
     # Multi-output tap plumbing. Empty lists → markers expand to nothing (kernel
@@ -1696,6 +1712,8 @@ def _render_template(
     # Tag the kernel fn name with template + geometry so nsys gives each
     # (template, config) a distinct GPU kernel symbol.
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
+    if chain.has_moe and moe_sched_policy == 1:
+        tag += "_static_sched"
     src = re.sub(r"\b_kernel(?=\(|\.set_name_prefix\b)", f"frost_{tag}", src)
 
     return src
@@ -1705,6 +1723,7 @@ def _render_block_scale_template(
     chain: FusionChain,
     snippets: EpilogueSnippets,
     config: TileConfig,
+    moe_sched_policy: int = 0,
 ) -> str:
     """Render the block-scale matmul template. Picks TMA-store when
     _use_tma_store_epi allows, else STG; SF TMA descriptors are hardcoded in the
@@ -1733,6 +1752,8 @@ def _render_block_scale_template(
     compile_aux_fakes = _aux_fake_block(aux_tensors, dynamic_strides=True, align_reqs=_aux_align_reqs(chain, vec_bytes=_out_vec_bytes(chain, config, use_tma)))
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
     tile_constants = _render_block_scale_tile_constants(config, chain, tmpl)
+    if chain.has_moe:
+        tile_constants += f"\nmoe_static_sched = {moe_sched_policy == 1}"
     if plumb.tap_constants:
         tile_constants += "\n" + "\n".join(plumb.tap_constants)
 
@@ -1907,6 +1928,8 @@ def _render_block_scale_template(
     src = _replace_marker_lines(src, replacements, template_kind="block-scale template")
 
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
+    if chain.has_moe and moe_sched_policy == 1:
+        tag += "_static_sched"
     src = re.sub(r"\b_kernel(?=\(|\.set_name_prefix\b)", f"frost_{tag}", src)
     return src
 
@@ -3317,6 +3340,13 @@ def _graph_dynamic_shapes(graph) -> bool:
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
+def _check_moe_sched_policy(chain: FusionChain, policy: int) -> None:
+    if policy not in (0, 1):
+        raise NotImplementedError("frost_gemm: SCHED_POLICY must be 0 (dynamic) or 1 (static)")
+    if policy and (chain is None or not chain.has_moe):
+        raise NotImplementedError("frost_gemm: static SCHED_POLICY requires MoE grouped GEMM")
+
+
 def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
     """Choose the tile strategy for one analyzed fusion chain.
 
@@ -3328,8 +3358,7 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None)
     if chain is not None and chain.has_moe and chain.moe.weight_layout is not None:
         raise NotImplementedError("frost_gemm: packed MoE weight_layout is supported only by SM100 grouped GEMM")
     if knobs is not None:
-        if knobs.moe_sched_policy:
-            raise NotImplementedError("frost_gemm: nonzero SCHED_POLICY is supported only by SM100 MoE grouped GEMM")
+        _check_moe_sched_policy(chain, knobs.moe_sched_policy)
         try:
             config = knobs.to_config()
         except (KeyError, ValueError, NotImplementedError) as exc:
@@ -3413,7 +3442,7 @@ def _precheck_moe(
             "is a K-major TMA box offset to the routed group's first row "
             f"(got token {chain.matmul.a_major}-major)"
         )
-    _arch_reason = select_template(chain, config).active_reject(config)
+    _arch_reason = select_template(chain, config).active_reject(config, chain)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config)
@@ -3591,6 +3620,7 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
     config: TileConfig = DEFAULT_CONFIG,
+    moe_sched_policy: int = 0,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel.
 
@@ -3610,6 +3640,7 @@ def jit_from_cudnn_graph(
     Everywhere else the launch is the plain fixed cluster it always was.
     """
     chain, binding = analyze_with_binding(graph)
+    _check_moe_sched_policy(chain, moe_sched_policy)
     if config.swap_ab:
         from ..fusion_ir import swap_ab
 
@@ -3624,14 +3655,14 @@ def jit_from_cudnn_graph(
     # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
     # check BEFORE the single-feature gates.
     if chain.has_moe and chain.has_block_scale:
-        return _jit_moe_block_scale(chain, config, binding=binding)
+        return _jit_moe_block_scale(chain, config, binding=binding, moe_sched_policy=moe_sched_policy)
     # Block-scale is gated independently (own per-side case table).
     if chain.has_block_scale:
         return _jit_block_scale(chain, config, binding=binding)
     # MoE grouped matmul: own template (grouped persistent scheduler + per-group
     # A TMA descriptor replacement).
     if chain.has_moe:
-        return _jit_moe(chain, config, binding=binding)
+        return _jit_moe(chain, config, binding=binding, moe_sched_policy=moe_sched_policy)
     # Multi-GEMM is only in the 1ctamma CLC template. select_template skips
     # capability gates, so reject unsupported strategy here with a clear message
     # rather than fault deep in cute on a missing vec_f32_<g> binding.
@@ -4108,6 +4139,7 @@ def _jit_moe(
     config: TileConfig,
     *,
     binding: "GemmBinding | None" = None,
+    moe_sched_policy: int = 0,
 ) -> CompiledMoeGemm:
     """JIT path for a MoE grouped matmul forward pass (mode=NONE)."""
     _precheck_moe(chain, config)
@@ -4120,7 +4152,7 @@ def _jit_moe(
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
     )
-    src = _render_template(chain, snippets, config)
+    src = _render_template(chain, snippets, config, moe_sched_policy=moe_sched_policy)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cga_size_m, config.cga_size_n
@@ -4527,6 +4559,7 @@ def _jit_moe_block_scale(
     config: TileConfig,
     *,
     binding: "GemmBinding | None" = None,
+    moe_sched_policy: int = 0,
 ) -> CompiledMoeBlockScaleGemm:
     """JIT path for a MoE grouped block-scale matmul (dequant + moe_grouped).
 
@@ -4549,7 +4582,7 @@ def _jit_moe_block_scale(
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
     )
-    src = _render_block_scale_template(chain, snippets, config)
+    src = _render_block_scale_template(chain, snippets, config, moe_sched_policy=moe_sched_policy)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cga_size_m, config.cga_size_n

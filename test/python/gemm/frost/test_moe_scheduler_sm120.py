@@ -17,33 +17,49 @@ if (dsl_error := cutedsl_requirement_error("Frost MoE scheduler tests")) is not 
     pytest.skip(dsl_error, allow_module_level=True)
 
 from cudnn.gemm.frost.tile_config import by_name
-from gemm_test_utils import Plan, requires_sm120, to_blocked, with_static_segmented_capacity
+from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+from gemm_test_utils import requires_sm120, to_blocked, with_static_segmented_capacity
 from test_moe_grouped_matmul_fwd import _build_graph as _plain_graph, _vp_moe
 from test_moe_grouped_block_scale_matmul_fwd import _build_graph as _scaled_graph, _vp_bs
 
 pytestmark = [pytest.mark.L1, requires_sm120]
 
 
-@pytest.mark.parametrize("kind", ["bf16", "nvfp4", "mxfp8"])
+@pytest.mark.parametrize("sched_policy", [0, 1])
 @pytest.mark.parametrize(
-    "config_name",
+    "config_name,kind,experts",
     [
-        "CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4",
-        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
-    ],
+        (name, kind, 8)
+        for kind in ("bf16", "fp16", "nvfp4", "mxfp8")
+        for name in (
+            "CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4",
+            "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+            # Block-scale TMA boxes require 128-byte K rows. Keep the large
+            # accumulator geometry while respecting that layout contract.
+            "CONFIG_sm120_256x256x128_16x16x32_cluster1x1_warps2x4" if kind in ("nvfp4", "mxfp8") else "CONFIG_sm120_256x256x64_16x16x32_cluster1x1_warps2x4",
+        )
+    ]
+    + [("CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4", kind, 40) for kind in ("bf16", "nvfp4", "mxfp8")],
 )
-def test_scheduler_ring_reuse_live_capture(kind, config_name):
+def test_scheduler_ring_reuse_live_capture(kind, config_name, sched_policy, experts):
     # Small tiles expose the original WAR hazard; the second geometry varies
     # the compute-warp arrangement. SM120 does not support CTA clusters.
-    experts, tokens, width = 8, 65537, 256
+    # The large accumulator tile stresses the last shared-memory reads before
+    # a consumer releases its A/B stage for the next async TMA load.
+    width = 256
+    cfg = by_name(config_name)
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    n_tiles = (width + cfg.cta_tile_n - 1) // cfg.cta_tile_n
+    tokens = max(65537, (5 * sm_count * cfg.cta_tile_m + n_tiles - 1) // n_tiles + 1)
     bounds_cases = [
         [0, 0, 1, 1, 4097, 8192, 16387, tokens, tokens],
         [0, 2, 2, 31, 127, 4099, tokens - 1, tokens, tokens],
     ]
+    # Empty groups span the 32-lane prefix-scan boundary, with live work after it.
+    bounds_cases = [b[:4] + [b[3]] * (experts - 8) + b[4:] for b in bounds_cases]
     generator = torch.Generator().manual_seed(1719)
     x_values = torch.randint(-2, 3, (1, tokens, width), generator=generator).float().cuda()
     w_values = torch.randint(-2, 3, (experts, width, width), generator=generator).float().cuda()
-    cfg = by_name(config_name)
 
     def pack_fp4(value):
         codes = (value.abs() * 2 + (value < 0) * 8).to(torch.uint8)
@@ -52,14 +68,15 @@ def test_scheduler_ring_reuse_live_capture(kind, config_name):
     def encode(value):
         if kind == "nvfp4":
             return pack_fp4(value)
-        return value.to(torch.bfloat16 if kind == "bf16" else torch.float8_e4m3fn)
+        return value.to({"bf16": torch.bfloat16, "fp16": torch.float16, "mxfp8": torch.float8_e4m3fn}[kind])
 
     x, weight = encode(x_values), encode(w_values)
-    if kind == "bf16":
-        graph = _plain_graph(experts, tokens, width, width, output_dt=cudnn.data_type.FLOAT)
+    if kind in ("bf16", "fp16"):
+        input_dt = cudnn.data_type.BFLOAT16 if kind == "bf16" else cudnn.data_type.HALF
+        graph = _plain_graph(experts, tokens, width, width, output_dt=cudnn.data_type.FLOAT, input_dt=input_dt)
     else:
         graph = _scaled_graph(experts, tokens, width, width, experts, combo=kind, output_dt=cudnn.data_type.FLOAT)
-    plan = Plan(graph, config=cfg)
+    plan = jit_from_cudnn_graph(graph, config=cfg, moe_sched_policy=sched_policy)
     assert plan.workspace_bytes == 128
     generated = Path(plan.generated_path).read_text()
     grid = int(re.search(r"^grid_num_clusters = (\d+)$", generated, re.M).group(1))
@@ -73,7 +90,7 @@ def test_scheduler_ring_reuse_live_capture(kind, config_name):
     offsets = torch.tensor(bounds_cases[0][:-1], dtype=torch.int32, device="cuda")
     output = torch.empty((1, tokens, width), dtype=torch.float32, device="cuda")
     workspace = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device="cuda")
-    if kind == "bf16":
+    if kind in ("bf16", "fp16"):
         pack = _vp_moe(plan, x, weight, offsets, output)
         scaled_x, scaled_w = x_values[0], w_values
         a_scales = None
@@ -141,7 +158,8 @@ def test_scheduler_ring_reuse_live_capture(kind, config_name):
             (name,) = checked(cuda_driver.cuFuncGetName(params.func))
             kernel_names.append(name.decode())
     assert sum("cudnn_kernel_frost_sm120_moe" in name for name in kernel_names) == 1, kernel_names
-    assert sum("reset_moe_sched_counter" in name for name in kernel_names) == 1, kernel_names
+    assert sum("reset_moe_sched_counter" in name for name in kernel_names) == (1 - sched_policy), kernel_names
+    assert len(kernel_names) == (2 - sched_policy), kernel_names
     for index in [1, 0, 1]:
         x.copy_(encode(x_values if index == 0 else -x_values))
         offsets.copy_(torch.tensor(bounds_cases[index][:-1], dtype=torch.int32, device="cuda"))

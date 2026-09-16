@@ -202,7 +202,8 @@ graph.build_plans()
 ### Frost forward scheduling
 
 The experimental open-source Frost GEMM engine exposes a separate performance
-choice for ordinary (non-block-scaled) grouped forward plans using `mode=NONE`:
+choice for grouped forward plans using `mode=NONE`. SM100 supports ordinary
+(non-block-scaled) plans; SM120 supports ordinary and block-scaled plans:
 
 - Omitted `cudnn.knob_type.SCHED_POLICY`, or value `0`: dynamically claimed
   cluster tickets, the unchanged default.
@@ -224,8 +225,25 @@ Run the normal support/build steps before execution, and benchmark both policies
 on the caller's shapes and routing distributions. The policy does not change tile
 geometry or numerical semantics, and the default proposal does not automatically
 select static scheduling. The public engine/knob record replays the chosen
-policy. Static policy requests for non-MoE or block-scaled graphs are declined;
-this policy is not passed to closed-source cuDNN engines.
+policy. Static policy requests for non-MoE graphs, or SM100 block-scaled graphs,
+are declined. SM120 uses one CTA per cluster. This policy is not passed to
+closed-source cuDNN engines.
+
+### Frost SM120 shared-input fusion
+
+For ordinary forward grouped matmul, the experimental Frost SM120 engine can
+fuse a pair of BF16 or FP16 GEMMs that share the token tensor and use separate
+K-major weights, followed by a pointwise epilogue such as gated activation.
+The pair uses one token load per tile, separate FP32 accumulators, and the
+graph's existing epilogue expression. Both scheduler policies above apply.
+
+The weights may be views into one packed allocation with a larger expert
+stride; execution uses the declared strides without repacking. All input
+pointer and TMA stride alignment requirements still apply. The selected tile
+must fit both weight tiles and epilogue staging in shared memory. Graphs with
+more GEMMs, separate token operands, block scales or cross-row reductions and
+quantization are declined by this fusion path. Supported single-GEMM paths
+retain their existing contracts.
 
 ## MoE Grouped Matmul Backward
 

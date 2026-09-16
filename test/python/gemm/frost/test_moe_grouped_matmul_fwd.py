@@ -141,9 +141,10 @@ def _build_graph(
     quant_scale_reorder: bool = False,
     quant_scale_dim: tuple[int, int, int] | None = None,
     weight_major: str = "k",
+    input_dt=cudnn.data_type.BFLOAT16,
 ):
     g = cudnn.pygraph(
-        io_data_type=cudnn.data_type.BFLOAT16,
+        io_data_type=input_dt,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
@@ -151,13 +152,13 @@ def _build_graph(
         name="token",
         dim=[1, S, K],
         stride=[S * K, K, 1],
-        data_type=cudnn.data_type.BFLOAT16,
+        data_type=input_dt,
     )
     w = g.tensor(
         name="weight",
         dim=[E, K, N],
         stride=[K * N, 1, K] if weight_major == "k" else [K * N, N, 1],
-        data_type=cudnn.data_type.BFLOAT16,
+        data_type=input_dt,
     )
     fto_groups = E if num_groups is None else num_groups
     fto = g.tensor(
