@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <optional>
 #include <unordered_set>
 
 #include "../../cudnn_frontend_Heuristics.h"
@@ -23,6 +24,25 @@
 #include "paged_cache_load.h"
 #include "block_scale_dequantize.h"
 #include "sdpa_support_surface.h"
+
+namespace cudnn_frontend::detail {
+
+// Development headers may advertise a newer version before this attribute lands.
+// Make the enum lookup dependent so those headers still compile without guessing its ABI value.
+template <typename AttributeName>
+constexpr auto
+get_sdpa_stats_log2_attribute(int)
+    -> decltype(std::optional<AttributeName>{AttributeName::CUDNN_ATTR_OPERATION_SDPA_FWD_STATS_LOG2}) {
+    return AttributeName::CUDNN_ATTR_OPERATION_SDPA_FWD_STATS_LOG2;
+}
+
+template <typename AttributeName>
+constexpr std::optional<AttributeName>
+get_sdpa_stats_log2_attribute(long) {
+    return std::nullopt;
+}
+
+}  // namespace cudnn_frontend::detail
 
 namespace cudnn_frontend::graph {
 
@@ -2823,22 +2843,23 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
 #endif
         }
 
-        // Base-2 stats (max + log2(sum_exp)) are an epilogue property of the fused kernel.
+        // Base-2 Stats scales the entire natural-log LSE by log2(e).
         auto stats_log2_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
         if (attributes.stats_use_log2 && stats_log2_it != attributes.outputs.end() && stats_log2_it->second) {
+            constexpr auto stats_log2_attr = detail::get_sdpa_stats_log2_attribute<cudnnBackendAttributeName_t>(0);
+            if (!stats_log2_attr.has_value()) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "stats_use_log2 requires cuDNN headers with the SDPA Stats log-base attribute"};
+            }
             auto stats_log2_cudnn_ver_error =
                 error_t{error_code_t::GRAPH_NOT_SUPPORTED, "stats_use_log2 in unified SDPA node requires cuDNN 9.28.0"};
-#if CUDNN_VERSION >= 92800
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92800, stats_log2_cudnn_ver_error);
             bool stats_log2_value = true;
             _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
-                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_STATS_LOG2,
+                                                           *stats_log2_attr,
                                                            CUDNN_TYPE_BOOLEAN,
                                                            1,
                                                            &stats_log2_value));
-#else
-            return stats_log2_cudnn_ver_error;
-#endif
         }
 
         // Dropout attributes
