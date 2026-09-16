@@ -8,7 +8,13 @@ from functools import partial
 
 import pytest
 
-jax = pytest.importorskip("jax")
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("JAX KDA tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
+jax = pytest.importorskip("jax", minversion="0.9.1")
 import jax.numpy as jnp
 import numpy as np
 
