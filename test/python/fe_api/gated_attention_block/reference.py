@@ -60,6 +60,10 @@ class RefGeometry:
     attn_scale: Optional[float] = None
     is_causal: bool = True
     rope_base: float = 1_000_000.0
+    # Appended LAST (this is not a field-for-field mirror of the block's
+    # Geometry). False: RoPE-only Q/K -- no RMSNorm, ``make_inputs`` yields
+    # ``None`` norm weights, the oracles skip the norm and return no rstd.
+    qk_norm: bool = True
 
     @property
     def scale(self) -> float:
@@ -129,18 +133,24 @@ def make_inputs(
     seed: int = 0,
 ) -> dict:
     """Random inputs in the block's declared layouts. Weights are ``nn.Linear``
-    shaped (``[out, in]``), so the block's GEMMs read them transposed."""
+    shaped (``[out, in]``), so the block's GEMMs read them transposed.
+
+    ``geom.qk_norm=False`` yields ``None`` for both norm weights -- the block
+    (and every oracle here) takes ``None`` in those slots for RoPE-only Q/K.
+    The random draws are identical either way (the weights are constants, not
+    draws), so norm-on and norm-off tests see the same ``h`` / ``w_qkvg`` / ``w_o``."""
     g = torch.Generator(device=device).manual_seed(seed)
 
     def randn(*shape, std=0.02):
         return (torch.randn(*shape, generator=g, device=device, dtype=torch.float32) * std).to(dtype)
 
     cos, sin = build_rope_tables(seq_len, geom.rope_dim, base=geom.rope_base, batch=batch, device=device, dtype=dtype)
+    norm_w = (lambda: torch.ones(geom.d_head, device=device, dtype=dtype)) if geom.qk_norm else (lambda: None)
     return {
         "h": randn(batch, seq_len, geom.d_model, std=1.0),
         "w_qkvg": randn(geom.n_qkvg, geom.d_model),
-        "w_q_norm": torch.ones(geom.d_head, device=device, dtype=dtype),
-        "w_k_norm": torch.ones(geom.d_head, device=device, dtype=dtype),
+        "w_q_norm": norm_w(),
+        "w_k_norm": norm_w(),
         "cos": cos,
         "sin": sin,
         "w_o": randn(geom.d_model, geom.h_q * geom.d_head),
@@ -176,12 +186,14 @@ def apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, ro
 
 def qk_norm_rope_reference(
     x: torch.Tensor,
-    w: torch.Tensor,
+    w: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
     rope_dim: int,
     eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    *,
+    qk_norm: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Stages (2)+(3) fused, the way the FROST kernel computes them.
 
     FP32 norm, FP32 rotation, **one** cast at the end. That last part is not a
@@ -192,17 +204,29 @@ def qk_norm_rope_reference(
 
     Returns ``(y, rstd)`` with ``y`` in ``x``'s dtype and ``rstd`` fp32 — the
     reciprocal RMS the backward needs, which is why the kernel emits it.
+
+    ``qk_norm=False`` (the block's ``geometry.qk_norm=False``): no norm, ``w`` is
+    ignored (pass ``None``), ``rstd`` is ``None``, and ``y`` is the fp32 partial
+    RoPE of ``x`` cast once -- the passthrough dims ``[rope_dim, D)`` are then
+    bit-identical to ``x``'s (widen + narrow of the same value), which is what
+    the kernels are held to.
     """
     x32 = x.float()
-    rstd = torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
-    y = x32 * rstd * w.float()
+    if qk_norm:
+        if w is None:
+            raise ValueError("qk_norm=True needs a [D] norm weight; pass qk_norm=False for RoPE-only Q/K")
+        rstd = torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
+        y = x32 * rstd * w.float()
+    else:
+        rstd = None
+        y = x32
     if rope_dim:
         c = cos[:, :, None, :rope_dim].float()
         s = sin[:, :, None, :rope_dim].float()
         rot, passthrough = y[..., :rope_dim], y[..., rope_dim:]
         rot = rot * c + _rotate_half(rot) * s
         y = torch.cat((rot, passthrough), dim=-1) if passthrough.shape[-1] else rot
-    return y.to(x.dtype), rstd.squeeze(-1).float()
+    return y.to(x.dtype), (None if rstd is None else rstd.squeeze(-1).float())
 
 
 def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -266,8 +290,8 @@ class RefOutputs:
     v: torch.Tensor  # [B, S, H_kv, D]
     q: torch.Tensor  # [B, S, H_q, D]   post-norm, post-RoPE
     k: torch.Tensor  # [B, S, H_kv, D]
-    rstd_q: torch.Tensor  # [B, S, H_q]  fp32
-    rstd_k: torch.Tensor  # [B, S, H_kv] fp32
+    rstd_q: Optional[torch.Tensor]  # [B, S, H_q]  fp32; None under geom.qk_norm=False
+    rstd_k: Optional[torch.Tensor]  # [B, S, H_kv] fp32; idem
     o: torch.Tensor  # [B, S, H_q, D]   SDPA output, PRE-gate
     o_gated: torch.Tensor  # [B, S, H_q, D]
     lse: torch.Tensor  # [B, H_q, S]  fp32, natural log
@@ -276,8 +300,8 @@ class RefOutputs:
 def gated_attention_block_reference(
     h: torch.Tensor,
     w_qkvg: torch.Tensor,
-    w_q_norm: torch.Tensor,
-    w_k_norm: torch.Tensor,
+    w_q_norm: Optional[torch.Tensor],
+    w_k_norm: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
     w_o: torch.Tensor,
@@ -293,6 +317,9 @@ def gated_attention_block_reference(
     the kernel gets wrong: a row with NO allowed column must produce ``O = 0``
     and ``LSE = -inf`` exactly, never a floored denominator's ``-69.08`` and
     never accumulator residue scaled by a sigmoid.
+
+    ``geom.qk_norm=False``: the norm weights are ``None``, stage (2) is skipped
+    (RoPE only) and ``rstd_q`` / ``rstd_k`` come back ``None``.
     """
     b, s, d_model = h.shape
     if d_model != geom.d_model:
@@ -312,9 +339,10 @@ def gated_attention_block_reference(
     q_pre, gate, k_pre, v = split_qkvg(proj, geom)
 
     # (2)+(3) QK-RMSNorm then partial RoPE -- V is NOT normed. One fp32 pass
-    # with a single final rounding, matching the fused kernel.
-    q, rstd_q = qk_norm_rope_reference(q_pre, w_q_norm, cos, sin, geom.rope_dim, geom.qk_norm_eps)
-    k, rstd_k = qk_norm_rope_reference(k_pre, w_k_norm, cos, sin, geom.rope_dim, geom.qk_norm_eps)
+    # with a single final rounding, matching the fused kernel. qk_norm=False:
+    # RoPE only, rstd None.
+    q, rstd_q = qk_norm_rope_reference(q_pre, w_q_norm, cos, sin, geom.rope_dim, geom.qk_norm_eps, qk_norm=geom.qk_norm)
+    k, rstd_k = qk_norm_rope_reference(k_pre, w_k_norm, cos, sin, geom.rope_dim, geom.qk_norm_eps, qk_norm=geom.qk_norm)
 
     # (4) SDPA, chunked over q tiles, fp32.
     o = torch.zeros(b, s, geom.h_q, d, device=dev, dtype=torch.float32)
@@ -383,8 +411,8 @@ def gated_attention_block_reference(
 def gated_attention_block_baseline(
     h: torch.Tensor,
     w_qkvg: torch.Tensor,
-    w_q_norm: torch.Tensor,
-    w_k_norm: torch.Tensor,
+    w_q_norm: Optional[torch.Tensor],
+    w_k_norm: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
     w_o: torch.Tensor,
@@ -416,8 +444,9 @@ def gated_attention_block_baseline(
     proj = F.linear(h, w_qkvg)
     q, gate, k, v = split_qkvg(proj, geom)
 
-    q, _ = rms_norm(q, w_q_norm, geom.qk_norm_eps)
-    k, _ = rms_norm(k, w_k_norm, geom.qk_norm_eps)
+    if geom.qk_norm:  # RoPE-only blocks have no norm and no norm weights
+        q, _ = rms_norm(q, w_q_norm, geom.qk_norm_eps)
+        k, _ = rms_norm(k, w_k_norm, geom.qk_norm_eps)
     q = apply_partial_rope(q, cos, sin, geom.rope_dim)
     k = apply_partial_rope(k, cos, sin, geom.rope_dim)
 
@@ -525,8 +554,8 @@ def gated_attention_block_fp8_reference(
         gate = gate.to(torch.bfloat16)  # gate16: the fork's bf16 GATE buffer
     k = proj[:, o_k : o_k + hkv * d].reshape(b, s, hkv, d)
     v = proj[:, o_v : o_v + hkv * d].reshape(b, s, hkv, d)
-    qn, _ = qk_norm_rope_reference(q, inp["w_q_norm"], inp["cos"], inp["sin"], r, geom.qk_norm_eps)
-    kn, _ = qk_norm_rope_reference(k, inp["w_k_norm"], inp["cos"], inp["sin"], r, geom.qk_norm_eps)
+    qn, _ = qk_norm_rope_reference(q, inp["w_q_norm"], inp["cos"], inp["sin"], r, geom.qk_norm_eps, qk_norm=geom.qk_norm)
+    kn, _ = qk_norm_rope_reference(k, inp["w_k_norm"], inp["cos"], inp["sin"], r, geom.qk_norm_eps, qk_norm=geom.qk_norm)
     q32 = dequant_e4m3(quant_e4m3(qn, scale_q), 1.0 / scale_q)
     k32 = dequant_e4m3(quant_e4m3(kn, scale_k), 1.0 / scale_k)
     v32 = dequant_e4m3(quant_e4m3(v, scale_v), 1.0 / scale_v)

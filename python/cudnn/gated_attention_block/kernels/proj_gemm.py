@@ -164,6 +164,17 @@ class NormRopeFusionParams:
     Inference only: ``want_rstd`` must be False, and
     ``norm_source="off"`` does not exist there (there is no single bf16 slab to
     degenerate to; the loads-deleted floor is ``"const"``).
+
+    ``qk_norm`` (appended after ``quant_fp8``; default True so every existing key
+    is spelled identically) selects the RoPE-ONLY epilogue when False: no pass A
+    (sum of squares), no ``rsqrt``, no norm-weight loads, no ``rstd`` -- the Q/K
+    tiles are rotated on the fp32 accumulator (FP8 fork: descaled + scaled, then
+    quantized) and stored.  The kernel switch is ``_QK_NORM`` (``const_expr``) on
+    both forks, and the weights are ``None`` at the ABI (the artifact's fakes are
+    None too, so a norm-on artifact can never be handed None weights: the key
+    differs).  ``want_rstd`` must be False (nothing to emit) and ``norm_source``
+    ``"const_w"`` has no meaning (there are no weight loads to delete;
+    ``"const_cs"`` == ``"const"`` there).
     """
 
     d_head: int = 256
@@ -174,6 +185,7 @@ class NormRopeFusionParams:
     want_rstd: bool = False
     norm_source: str = "ldg_early"
     quant_fp8: bool = False  # the FP8 fork (e4m3 in, e4m3 Q/K/V + bf16 GATE out); appended, bf16 keys unchanged
+    qk_norm: bool = True  # False: RoPE-only epilogue (no pass A / rsqrt / weight loads / rstd); appended, keys unchanged
 
     @property
     def offsets(self) -> tuple[int, int, int, int]:
@@ -235,6 +247,11 @@ def validate_norm_rope_params(p: NormRopeFusionParams) -> None:
             raise ValueError(
                 "quant_fp8: norm_source='off' has no meaning on the FP8 fork (no single bf16 slab to degenerate to); use 'const' for the loads-deleted floor"
             )
+    if not p.qk_norm:
+        if p.want_rstd:
+            raise ValueError("qk_norm=False emits no rstd; want_rstd must be False")
+        if p.norm_source == "const_w":
+            raise ValueError("qk_norm=False has no weight loads: const_w == ldg_early; use 'const_cs' (== 'const') for the floor")
 
 
 _FUSED_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proj_gemm_norm_rope.py")
@@ -273,13 +290,49 @@ def build_fused_proj_gemm(params: NormRopeFusionParams) -> FusedProjGemmPlan:
     return FusedProjGemmPlan(params=params, module=mod, launch=mod.compile())
 
 
+def _check_norm_weights(p: NormRopeFusionParams, w_q_norm, w_k_norm, dtype, dtype_name: str) -> None:
+    """Norm weights present iff ``params.qk_norm`` -- BOTH directions, before any tensor is touched.
+
+    The artifact was compiled with the weights as ``None`` under ``qk_norm=False``
+    (and as ``[D]`` fakes otherwise), so a mismatch here would be a tvm-ffi ABI
+    error at launch rather than a typed decline; check it on the host first."""
+    if p.qk_norm:
+        for name, t_ in (("w_q_norm", w_q_norm), ("w_k_norm", w_k_norm)):
+            if t_ is None:
+                raise ValueError(f"this artifact was compiled with qk_norm=True; {name} must be a [{p.d_head}] {dtype_name} tensor, got None")
+            if tuple(t_.shape) != (p.d_head,) or t_.dtype != dtype:
+                raise ValueError(f"{name} must be [{p.d_head}] {dtype_name}, got {tuple(t_.shape)} {t_.dtype}")
+    elif w_q_norm is not None or w_k_norm is not None:
+        raise ValueError("this artifact was compiled with qk_norm=False (RoPE only, no weight loads); w_q_norm / w_k_norm must both be None")
+
+
+def _rope_table_2d(t: torch.Tensor, name: str, m: int, rope_dim: int, dtype: torch.dtype, dtype_name: str) -> torch.Tensor:
+    """The kernel's ``[M, ROPE_DIM]`` view of a RoPE table -- a VIEW, never a copy.
+
+    A ``[B, S, R]`` table is flattened with ``.view``: ``reshape`` would silently COPY a non-viewable table
+    and the contiguity check below would then pass on the copy -- a hidden per-execute allocation (engine
+    contract rule 10).  The result must be a contiguous ``[M, R]`` ``dtype`` table (the same contract the
+    unfused stage applies with ``cos.view(t, rope_dim)``)."""
+    if t.ndim == 3:
+        try:
+            t = t.view(-1, rope_dim)
+        except RuntimeError as e:
+            raise ValueError(
+                f"{name} must be a contiguous [M={m}, {rope_dim}] {dtype_name} table; a [B, S, R] table is flattened as a VIEW (never copied) "
+                f"and {tuple(t.shape)} with strides {tuple(t.stride())} is not viewable"
+            ) from e
+    if tuple(t.shape) != (m, rope_dim) or not t.is_contiguous() or t.dtype != dtype:
+        raise ValueError(f"{name} must be a contiguous [M={m}, {rope_dim}] {dtype_name} table, got {tuple(t.shape)} {t.dtype}")
+    return t
+
+
 def run_fused_proj_gemm(
     plan: FusedProjGemmPlan,
     a: torch.Tensor,  # [M, K]   bf16
     w: torch.Tensor,  # [N, K]   bf16 (checkpoint layout, read transposed)
-    out: torch.Tensor,  # [M, N]   bf16 -- Q/K columns land normed + rotated
-    w_q_norm: torch.Tensor,  # [D]
-    w_k_norm: torch.Tensor,  # [D]
+    out: torch.Tensor,  # [M, N]   bf16 -- Q/K columns land normed + rotated (qk_norm=False: rotated only)
+    w_q_norm: Optional[torch.Tensor],  # [D]; None iff params.qk_norm is False
+    w_k_norm: Optional[torch.Tensor],  # [D]
     cos: torch.Tensor,  # [M, ROPE_DIM] (or [B, S, ROPE_DIM] contiguous)
     sin: torch.Tensor,
     rstd_q: Optional[torch.Tensor] = None,  # [M, H_q]  fp32, required iff params.want_rstd
@@ -305,14 +358,9 @@ def run_fused_proj_gemm(
         raise ValueError(f"the fused projection classifies tiles for N={p.n_qkvg} (Q|GATE|K|V at {p.offsets}); the weight has N={n}")
     if tuple(o3.shape) != (1, m, n) or int(w3.shape[2]) != k:
         raise ValueError(f"shape mismatch: a {tuple(a3.shape)}, w {tuple(w3.shape)}, out {tuple(o3.shape)}")
-    cos2 = cos.reshape(-1, p.rope_dim) if cos.ndim == 3 else cos
-    sin2 = sin.reshape(-1, p.rope_dim) if sin.ndim == 3 else sin
-    for name, t_ in (("cos", cos2), ("sin", sin2)):
-        if tuple(t_.shape) != (m, p.rope_dim) or not t_.is_contiguous() or t_.dtype != a.dtype:
-            raise ValueError(f"{name} must be a contiguous [M={m}, {p.rope_dim}] {a.dtype} table, got {tuple(t_.shape)} {t_.dtype}")
-    for name, t_ in (("w_q_norm", w_q_norm), ("w_k_norm", w_k_norm)):
-        if tuple(t_.shape) != (p.d_head,) or t_.dtype != a.dtype:
-            raise ValueError(f"{name} must be [{p.d_head}] {a.dtype}, got {tuple(t_.shape)} {t_.dtype}")
+    cos2 = _rope_table_2d(cos, "cos", m, p.rope_dim, a.dtype, str(a.dtype))
+    sin2 = _rope_table_2d(sin, "sin", m, p.rope_dim, a.dtype, str(a.dtype))
+    _check_norm_weights(p, w_q_norm, w_k_norm, a.dtype, str(a.dtype).removeprefix("torch."))
     if p.want_rstd:
         if rstd_q is None or rstd_k is None:
             raise ValueError("this artifact was compiled with rstd outputs; both must be bound (Rule 1: no silent fallback)")
@@ -351,8 +399,8 @@ def run_fused_proj_gemm_fp8(
     out_k8: torch.Tensor,  # [M, h_kv*d]  e4m3 contiguous
     out_v8: torch.Tensor,  # [M, h_kv*d]  e4m3 contiguous
     out_gate16: torch.Tensor,  # [M, h_q*d] bf16 contiguous
-    w_q_norm: torch.Tensor,  # [D] bf16
-    w_k_norm: torch.Tensor,  # [D] bf16
+    w_q_norm: Optional[torch.Tensor],  # [D] bf16; None iff params.qk_norm is False
+    w_k_norm: Optional[torch.Tensor],  # [D] bf16
     cos: torch.Tensor,  # [M, ROPE_DIM] bf16 (or [B, S, ROPE_DIM] contiguous)
     sin: torch.Tensor,
     qscal: torch.Tensor,  # [4] fp32 CUDA: [alpha, scale_q, scale_k, scale_v], read in-kernel
@@ -391,14 +439,9 @@ def run_fused_proj_gemm_fp8(
     ):
         if tuple(t3.shape) != (1, m, width) or t3.dtype != dt or not t3.is_contiguous() or t3.data_ptr() % 16:
             raise ValueError(f"{name} must be a contiguous, 16-B-aligned {dt_name} [M={m}, {width}] tensor, got {tuple(t_.shape)} {t_.dtype}")
-    cos2 = cos.reshape(-1, p.rope_dim) if cos.ndim == 3 else cos
-    sin2 = sin.reshape(-1, p.rope_dim) if sin.ndim == 3 else sin
-    for name, t_ in (("cos", cos2), ("sin", sin2)):
-        if tuple(t_.shape) != (m, p.rope_dim) or not t_.is_contiguous() or t_.dtype != torch.bfloat16:
-            raise ValueError(f"{name} must be a contiguous [M={m}, {p.rope_dim}] bf16 table, got {tuple(t_.shape)} {t_.dtype}")
-    for name, t_ in (("w_q_norm", w_q_norm), ("w_k_norm", w_k_norm)):
-        if tuple(t_.shape) != (p.d_head,) or t_.dtype != torch.bfloat16:
-            raise ValueError(f"{name} must be [{p.d_head}] bf16, got {tuple(t_.shape)} {t_.dtype}")
+    cos2 = _rope_table_2d(cos, "cos", m, p.rope_dim, torch.bfloat16, "bf16")
+    sin2 = _rope_table_2d(sin, "sin", m, p.rope_dim, torch.bfloat16, "bf16")
+    _check_norm_weights(p, w_q_norm, w_k_norm, torch.bfloat16, "bf16")
     if tuple(qscal.shape) != (4,) or qscal.dtype != torch.float32 or not qscal.is_cuda or not qscal.is_contiguous() or qscal.data_ptr() % 16:
         raise ValueError(
             f"qscal must be a contiguous, 16-B-aligned fp32 CUDA tensor [4] = [alpha, scale_q, scale_k, scale_v], got {tuple(qscal.shape)} {qscal.dtype}"

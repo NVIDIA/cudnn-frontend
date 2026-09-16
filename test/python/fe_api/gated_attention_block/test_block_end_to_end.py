@@ -7,6 +7,11 @@ This is the test the other five files exist to make possible: every stage is
 individually correct, so what is under test here is the ASSEMBLY — the workspace
 carve, the strided column slices of the fused projection, the stage order, and
 in particular that the gate is applied AFTER the SDPA's dead-row substitution.
+
+The oracle tests run in two arms, ``norm`` and ``rope_only``
+(``GatedAttentionBlockGeometry.qk_norm``): RoPE-only Q/K takes ``None`` for both
+norm weights and writes no rstd, and the two are the SAME assembly with one
+kernel traced differently -- so both must pass the same oracle bar.
 """
 
 import os
@@ -19,7 +24,8 @@ pytestmark = pytest.mark.L0
 
 import sys  # noqa: E402
 
-from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry  # noqa: E402
+from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, SavedForBackward  # noqa: E402
+from cudnn.gated_attention_block.api import _FusedQkvProjection  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -35,6 +41,15 @@ def _cc():
 requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the block targets SM107 only; found {_cc()}")
 
 _COMMON = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
+_QK_NORM = pytest.mark.parametrize("qk_norm", [True, False], ids=["norm", "rope_only"])
+
+
+def _fork_supports_qk_norm() -> bool:
+    """True once the GEMM forks carry ``NormRopeFusionParams.qk_norm`` (PR-B slice
+    S2). Until then ``qk_norm=False + fuse_norm_rope=True`` is a typed decline;
+    the tests below INVERT on that fact rather than skipping, so either landing
+    order is green."""
+    return _FusedQkvProjection._fork_supports_qk_norm()
 
 
 def _cos(a, b):
@@ -106,12 +121,45 @@ def test_workspace_layout_is_the_declared_composition():
 
 
 @requires_rubin
+@_QK_NORM
 @pytest.mark.parametrize("seq_len", [256, 512])
-def test_matches_the_fp32_oracle(seq_len):
-    out, ref, blk = _run_block(_COMMON, batch=2, seq_len=seq_len)
+def test_matches_the_fp32_oracle(seq_len, qk_norm):
+    out, ref, blk = _run_block({**_COMMON, "qk_norm": qk_norm}, batch=2, seq_len=seq_len)
     assert torch.isfinite(out.float()).all()
     c = _cos(out, ref.out)
     assert c > 0.999, f"block output cos {c}"
+    assert blk._norm_rope.want_rstd is False and blk._norm_rope._recipe.apply_norm is qk_norm
+    assert (ref.rstd_q is None) is (not qk_norm)
+
+
+@requires_rubin
+def test_rope_only_passthrough_dims_are_bit_exact_through_the_block():
+    """Out-of-place (``inplace_qkv=False``) keeps the pre-RoPE slab AND the compact
+    rotated Q/K in the workspace, so the block-level proof of the RoPE-only
+    contract is direct: the dims ``[rope_dim, D)`` of compact Q/K equal the slab's
+    columns bit for bit (no fp32 op touched them), and the rope band differs."""
+    from cudnn.gated_attention_block.api import _cols, _view
+
+    geom_kw = {**_COMMON, "qk_norm": False}
+    block_geom = GatedAttentionBlockGeometry(**geom_kw)
+    inp = make_inputs(RefGeometry(**geom_kw), batch=1, seq_len=256, dtype=torch.bfloat16)
+    assert inp["w_q_norm"] is None and inp["w_k_norm"] is None
+    out = torch.empty(1, 256, block_geom.d_model, device="cuda", dtype=torch.bfloat16)
+    blk = GatedAttentionBlockFwd(inp["h"], inp["w_qkvg"], None, None, inp["cos"], inp["sin"], inp["w_o"], out, block_geom, inplace_qkv=False)
+    blk.check_support()
+    blk.compile()
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    blk.execute(inp["h"], inp["w_qkvg"], None, None, inp["cos"], inp["sin"], inp["w_o"], out, ws)
+    torch.cuda.synchronize()
+    g, lay, t, r = block_geom, blk._ws, 256, block_geom.rope_dim
+    proj = _view(ws, lay.proj, (t, g.n_qkvg), torch.bfloat16)
+    o_q, _, o_k, _ = g.qkvg_offsets
+    q_pre, k_pre = _cols(proj, o_q, g.h_q, g.d_head), _cols(proj, o_k, g.h_kv, g.d_head)
+    q_c = _view(ws, lay.q, (t, g.h_q, g.d_head), torch.bfloat16)
+    k_c = _view(ws, lay.k, (t, g.h_kv, g.d_head), torch.bfloat16)
+    assert torch.equal(q_c[..., r:], q_pre[..., r:]) and torch.equal(k_c[..., r:], k_pre[..., r:]), "RoPE-only passthrough dims are not a bit-exact copy"
+    assert not torch.equal(q_c[..., :r], q_pre[..., :r]), "the rope band did not rotate"
+    assert torch.isfinite(out.float()).all()
 
 
 @requires_rubin
@@ -249,14 +297,146 @@ def test_graph_route_handles_are_cached_per_device_and_stream():
 _GEOM_KW = dict(d_model=512, h_q=8, h_kv=2, d_head=64, rope_dim=32)
 
 
-def _make_block(batch=1, seq_len=256, dtype=torch.bfloat16, **kw):
-    """A declared (not yet compiled) block plus the inputs it was declared for."""
-    block_geom = GatedAttentionBlockGeometry(**_GEOM_KW)
-    ref_geom = RefGeometry(**_GEOM_KW)
+def _make_block(batch=1, seq_len=256, dtype=torch.bfloat16, geom_kw=None, **kw):
+    """A declared (not yet compiled) block plus the inputs it was declared for.
+    ``geom_kw`` overrides ``_GEOM_KW`` (e.g. ``qk_norm=False`` -> None norm weights)."""
+    geom_kw = _GEOM_KW if geom_kw is None else geom_kw
+    block_geom = GatedAttentionBlockGeometry(**geom_kw)
+    ref_geom = RefGeometry(**geom_kw)
     inp = make_inputs(ref_geom, batch=batch, seq_len=seq_len, dtype=dtype)
     out = torch.empty(batch, seq_len, block_geom.d_model, device="cuda", dtype=dtype)
     blk = GatedAttentionBlockFwd(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, block_geom, **kw)
     return blk, inp, out
+
+
+# ---------------------------------------------------------------------------
+# qk_norm=False (RoPE-only Q/K): the knob and its weight / rstd contract
+# ---------------------------------------------------------------------------
+
+
+def test_qk_norm_is_on_by_default_and_declares_no_rstd_when_off():
+    assert GatedAttentionBlockGeometry(**_GEOM_KW).qk_norm is True
+    on, _, _ = _make_block(save_for_backward=True)
+    off, inp, _ = _make_block(save_for_backward=True, geom_kw={**_GEOM_KW, "qk_norm": False})
+    assert inp["w_q_norm"] is None and inp["w_k_norm"] is None
+    # Same stage list, same launch count: the norm is folded out of ONE kernel, not a stage removed.
+    assert [s.name for s in on._stages] == [s.name for s in off._stages]
+    assert on._norm_rope.want_rstd is True and off._norm_rope.want_rstd is False
+    assert off._descs["w_q_norm"] is None and off._descs["w_k_norm"] is None
+    # SavedForBackward carries None rstd for a RoPE-only forward (positional slots kept).
+    z = torch.empty(0)
+    assert SavedForBackward(h=z, gate=z, o=z, lse=z, rstd_q=None, rstd_k=None).rstd_q is None
+
+
+def test_qk_norm_flag_and_weights_must_agree():
+    """Both directions, typed, naming ``geometry.qk_norm`` -- at DECLARATION.
+
+    Load-bearing: ``_make_tensor_desc(None)`` returns None silently, so without
+    this check a norm-on block declared with None weights would only die in
+    ``check_support``'s dtype loop with an untyped AttributeError."""
+    geom_on = GatedAttentionBlockGeometry(**_GEOM_KW)
+    geom_off = GatedAttentionBlockGeometry(**{**_GEOM_KW, "qk_norm": False})
+    inp = make_inputs(RefGeometry(**_GEOM_KW), batch=1, seq_len=256, dtype=torch.bfloat16)
+    out = torch.empty(1, 256, geom_on.d_model, device="cuda", dtype=torch.bfloat16)
+    w = inp["w_q_norm"]
+    decl = lambda geom, wq, wk: GatedAttentionBlockFwd(inp["h"], inp["w_qkvg"], wq, wk, inp["cos"], inp["sin"], inp["w_o"], out, geom)  # noqa: E731
+    with pytest.raises(ValueError, match="qk_norm=True") as ei:
+        decl(geom_on, None, None)  # norm ON, no weights
+    assert "qk_norm=False" in str(ei.value), "the message must name the knob to flip"
+    with pytest.raises(ValueError, match="qk_norm=False"):
+        decl(geom_off, w, w)  # norm OFF, weights given
+    for wq, wk in ((w, None), (None, w)):  # mixed, either geometry
+        with pytest.raises(ValueError, match="together"):
+            decl(geom_on, wq, wk)
+        with pytest.raises(ValueError, match="together"):
+            decl(geom_off, wq, wk)
+    # The consistent pairs declare fine.
+    decl(geom_on, w, w)
+    decl(geom_off, None, None)
+
+
+def test_qk_norm_off_with_rope_dim_zero_is_refused_at_the_geometry():
+    """No norm and no RoPE would make stage (2)+(3) an identity copy: refuse, do not launch."""
+    with pytest.raises(ValueError, match="identity copy"):
+        GatedAttentionBlockGeometry(**{**_GEOM_KW, "rope_dim": 0, "qk_norm": False}).validate()
+    # qk_norm_eps stays validated regardless of the knob (D10: the fused fork re-checks it after eligibility).
+    with pytest.raises(ValueError, match="qk_norm_eps"):
+        GatedAttentionBlockGeometry(**{**_GEOM_KW, "qk_norm": False, "qk_norm_eps": 0.0}).validate()
+
+
+def test_rope_only_with_fuse_norm_rope_is_a_typed_decline_until_the_fork_knows_the_knob():
+    """``qk_norm=False + fuse_norm_rope=True`` needs the GEMM forks' RoPE-only
+    epilogue (``NormRopeFusionParams.qk_norm``, PR-B slice S2). Before it lands
+    the stage declines with a NotImplementedError naming the knob -- never a
+    silently norm-ON artifact; once it lands, ``params()`` carries the field."""
+    blk, _, _ = _make_block(fuse_norm_rope=True, geom_kw={**_COMMON, "qk_norm": False})
+    assert isinstance(blk._proj, _FusedQkvProjection)
+    if _fork_supports_qk_norm():
+        assert blk._proj.params().qk_norm is False
+    else:
+        with pytest.raises(NotImplementedError, match="qk_norm"):
+            blk._proj.check_support()
+        with pytest.raises(NotImplementedError, match="qk_norm"):
+            blk._proj.params()
+    # The unfused chain never needs the fork: qk_norm=False is served there on any checkout.
+    unfused, _, _ = _make_block(geom_kw={**_COMMON, "qk_norm": False})
+    assert unfused._norm_rope is not None and unfused._norm_rope.want_rstd is False
+
+
+@requires_rubin
+def test_qk_norm_execute_checks_weights_against_the_geometry_both_ways():
+    """The same contract at EXECUTE, on a compiled block, before any launch."""
+    for qk_norm in (True, False):
+        blk, inp, out = _make_block(geom_kw={**_GEOM_KW, "qk_norm": qk_norm})
+        blk.check_support()
+        blk.compile()
+        ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+        w = torch.ones(blk.geom.d_head, device="cuda", dtype=torch.bfloat16)
+        wrong = (None, None) if qk_norm else (w, w)
+        with pytest.raises(ValueError, match=f"qk_norm={qk_norm}"):
+            blk.execute(inp["h"], inp["w_qkvg"], *wrong, inp["cos"], inp["sin"], inp["w_o"], out, ws)
+        with pytest.raises(ValueError, match="together"):
+            blk.execute(inp["h"], inp["w_qkvg"], w, None, inp["cos"], inp["sin"], inp["w_o"], out, ws)
+
+
+def test_bwd_declaration_contracts_fire_before_the_stub_decline():
+    """The (still stubbed) backward's four declaration-time contracts are typed
+    ValueErrors that must fire BEFORE the ``NotImplementedError`` stub at the end
+    of ``__init__`` -- pinned so a later edit that hoists the stub cannot silently
+    drop them. Nothing here touches a GPU: the checks read None-ness and the
+    geometry only, so placeholders stand in for every tensor."""
+    from cudnn.gated_attention_block import GatedAttentionBlockBwd
+
+    z = torch.empty(0)
+    w = torch.ones(_GEOM_KW["d_head"])
+    geom_on = GatedAttentionBlockGeometry(**_GEOM_KW)
+    geom_off = GatedAttentionBlockGeometry(**{**_GEOM_KW, "qk_norm": False})
+    saved = lambda rstd: SavedForBackward(h=z, gate=z, o=z, lse=z, rstd_q=rstd, rstd_k=rstd)  # noqa: E731
+    decl = lambda geom, wq, wk, rstd, **kw: GatedAttentionBlockBwd(z, saved(rstd), z, wq, wk, z, z, z, geom, **kw)  # noqa: E731
+    # 1. sample weights agree with geometry.qk_norm, both ways -- the forward's helper, same messages.
+    with pytest.raises(ValueError, match="qk_norm=True"):
+        decl(geom_on, None, None, z)
+    with pytest.raises(ValueError, match="qk_norm=False"):
+        decl(geom_off, w, w, None)
+    with pytest.raises(ValueError, match="together"):
+        decl(geom_on, w, None, z)
+    # 2. an explicit need_dw_norms=True under norm-off is a typed decline, never a silent False.
+    with pytest.raises(ValueError, match="need_dw_norms=True"):
+        decl(geom_off, None, None, None, need_dw_norms=True)
+    # 3. the saved rstd must be None under norm-off (the forward wrote none).
+    with pytest.raises(ValueError, match="rstd_q / rstd_k must be None"):
+        decl(geom_off, None, None, z)
+    # 4. consistent calls pass every contract and reach the stub; need_dw_norms=None resolves
+    #    to the knob. __init__ raises before returning, so build the instance by hand to read it.
+    for geom, wq, rstd, kw, want in (
+        (geom_on, w, z, {}, True),
+        (geom_on, w, z, {"need_dw_norms": False}, False),
+        (geom_off, None, None, {}, False),
+    ):
+        obj = GatedAttentionBlockBwd.__new__(GatedAttentionBlockBwd)
+        with pytest.raises(NotImplementedError, match="GatedAttentionBlockBwd.__init__"):
+            obj.__init__(z, saved(rstd), z, wq, wq, z, z, z, geom, **kw)
+        assert obj.need_dw_norms is want
 
 
 @pytest.mark.L0
@@ -340,17 +520,25 @@ def test_inplace_qkv_matches_out_of_place_bit_for_bit():
 
 
 @requires_rubin
+@_QK_NORM
 @pytest.mark.parametrize("seq_len", [256, 1000])  # 1000: tail tile + rows past M in the fused epilogue
-def test_fuse_norm_rope_matches_the_fp32_oracle(seq_len):
+def test_fuse_norm_rope_matches_the_fp32_oracle(seq_len, qk_norm):
     """Same block, same oracle, one launch fewer.  Not bit-identical to the
     unfused chain BY DESIGN (the fork norms the fp32 accumulator; the chain
-    norms bf16-rounded values), so both are scored against the fp32 reference."""
-    out_f, ref, blk = _run_block(_COMMON, batch=2, seq_len=seq_len, fuse_norm_rope=True)
+    norms bf16-rounded values), so both are scored against the fp32 reference.
+    ``rope_only`` INVERTS while the fork lacks the knob: a typed decline, not a
+    silently norm-ON artifact (see ``_fork_supports_qk_norm``)."""
+    geom_kw = {**_COMMON, "qk_norm": qk_norm}
+    if not qk_norm and not _fork_supports_qk_norm():
+        with pytest.raises(NotImplementedError, match="qk_norm"):
+            _run_block(geom_kw, batch=2, seq_len=seq_len, fuse_norm_rope=True)
+        return
+    out_f, ref, blk = _run_block(geom_kw, batch=2, seq_len=seq_len, fuse_norm_rope=True)
     assert blk.fuse_norm_rope and blk._norm_rope is None and len(blk._stages) == 4
     assert torch.isfinite(out_f.float()).all()
     c = _cos(out_f, ref.out)
     assert c > 0.999, f"fused block output cos {c}"
-    out_u, _, _ = _run_block(_COMMON, batch=2, seq_len=seq_len, fuse_norm_rope=False)
+    out_u, _, _ = _run_block(geom_kw, batch=2, seq_len=seq_len, fuse_norm_rope=False)
     assert _cos(out_f, out_u) > 0.999
 
 
@@ -373,16 +561,18 @@ def test_fuse_norm_rope_is_off_by_default():
 
 
 @requires_rubin
+@_QK_NORM
 @pytest.mark.parametrize("seq_len", [256, 1000])  # 1000: tail tile + rows past S
-def test_fuse_gate_matches_the_fp32_oracle_causal(seq_len):
+def test_fuse_gate_matches_the_fp32_oracle_causal(seq_len, qk_norm):
     """The block default is CAUSAL and the kernel's mask arms are const_expr-folded,
     so this exercises the arm a dense pass proves nothing about."""
-    out_f, ref, blk = _run_block(_COMMON, batch=2, seq_len=seq_len, fuse_gate=True)
+    geom_kw = {**_COMMON, "qk_norm": qk_norm}
+    out_f, ref, blk = _run_block(geom_kw, batch=2, seq_len=seq_len, fuse_gate=True)
     assert blk.fuse_gate and blk._gate is None and len(blk._stages) == 4
     assert torch.isfinite(out_f.float()).all()
     c = _cos(out_f, ref.out)
     assert c > 0.999, f"fused-gate block output cos {c}"
-    out_u, _, _ = _run_block(_COMMON, batch=2, seq_len=seq_len, fuse_gate=False)
+    out_u, _, _ = _run_block(geom_kw, batch=2, seq_len=seq_len, fuse_gate=False)
     assert _cos(out_f, out_u) > 0.999
 
 

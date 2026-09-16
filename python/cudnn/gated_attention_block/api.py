@@ -32,6 +32,8 @@ The op graph this file implements, in pipeline order::
      |  (2)+(3) ONE kernel: QK-RMSNorm per head over D, then partial mRoPE on
      |          the first ROPE_DIM. Q and K only -- V is NOT normed. Dims
      |          [ROPE_DIM, D) pass through. fp32 throughout, ONE rounding.
+     |          ``geometry.qk_norm=False`` drops the RMSNorm: RoPE-only Q/K, no
+     |          norm weights (pass None), no rstd; [ROPE_DIM, D) copied bit-exactly.
      |
      |  (4) SDPA        O = softmax(QK^T * scale + mask) V        GQA H_q/H_kv
      |
@@ -95,11 +97,12 @@ softmax).  **FP8 (2026-09-11): an E4M3 pipeline with static per-tensor scales
 is wired in TWO configurations** -- pass an e4m3 ``h``/weights and a
 :class:`QuantSpec`:
 
-* **UNFUSED** (both fusion knobs off, 7 launches): FP8 projections with the
-  descale folded into a scalar-multiply epilogue (bf16 out), bf16 norm+RoPE in
-  place, two quantize passes (Q/K/V, then gated O) feeding the Rubin per-tensor
-  FP8 SDPA and the FP8 out projection.  The quantize passes are the visible
-  price of "unfused".
+* **UNFUSED** (both fusion knobs off; 7 stages = 9 kernel launches, the Q/K/V
+  quantize stage being three launches): FP8 projections with the descale
+  folded into a scalar-multiply epilogue (bf16 out), bf16 norm+RoPE in place,
+  two quantize passes (Q/K/V, then gated O) feeding the Rubin per-tensor FP8
+  SDPA and the FP8 out projection.  The quantize passes are the visible price
+  of "unfused".
 * **FULLY FUSED** (``fuse_norm_rope=True, fuse_gate=True``, 3 launches): the
   projection fork ``kernels/proj_gemm_norm_rope_fp8.py`` descales, norms,
   rotates AND quantizes in its epilogue -- e4m3 Q / K / V into COMPACT
@@ -118,8 +121,10 @@ is wired in TWO configurations** -- pass an e4m3 ``h``/weights and a
   are NOT bit-identical (the unfused path rounds to bf16 twice); both are
   scored against the fake-quant fp32 oracle.
 * Anything in between (one knob) is a typed decline naming both knobs; FP8 is
-  inference-only, and FP8 + ``seq_lens_present`` is declined while the FP8
-  d256 SDPA kernel hangs on an empty KV entry (see ``__init__``).
+  inference-only.  FP8 + ``seq_lens_present`` (a dense padding mask, incl. an
+  EMPTY entry) is SERVED since 2026-09-15: the Rubin FP8 d256 SDPA's
+  empty-KV-entry hang is gone (8/8 fresh processes at S=1000 / 512), and the
+  block's dead-entry oracle test pins ``out[dead] == 0`` exactly.
 
 MXFP8 follows the same route -- the quantization rides in the PROJECTION
 EPILOGUE rather than as separate passes, because stage (1) already owns the only
@@ -344,6 +349,16 @@ class GatedAttentionBlockGeometry:
     window_left: int = -1
     window_right: int = -1
 
+    # QK-RMSNorm on/off. False: RoPE-only Q/K -- no per-head RMSNorm, so no
+    # norm weights (the block takes None in their slots, both directions
+    # checked) and no rstd (SavedForBackward.rstd_q/rstd_k are None). The
+    # kernels fold the norm out at trace time (presence of the weight tensors,
+    # like want_rstd); the dims [rope_dim, d_head) are then a bit-exact copy.
+    # ``qk_norm_eps`` stays validated > 0 regardless (D10): the fused fork's
+    # own validator re-checks it after eligibility, and relaxing it here would
+    # leak a post-eligibility ValueError.
+    qk_norm: bool = True
+
     # -- derived scalars ----------------------------------------------------
 
     @property
@@ -457,6 +472,8 @@ class GatedAttentionBlockGeometry:
 
         if not self.qk_norm_eps > 0.0:
             raise ValueError(f"qk_norm_eps must be > 0, got {self.qk_norm_eps}")
+        if not self.qk_norm and self.rope_dim == 0:
+            raise ValueError("qk_norm=False with rope_dim=0 leaves stage (2)+(3) an identity copy; drop the stage instead")
         if self.attn_scale is not None and not self.attn_scale > 0.0:
             raise ValueError(f"attn_scale must be > 0 when given, got {self.attn_scale}")
 
@@ -799,6 +816,7 @@ class SavedForBackward:
                                                  needs O too
     ``lse``       [B,H_q,S] fp32    134 MiB      SDPA bwd cannot run without it
     ``rstd_q``    [B,S,H_q] fp32    134 MiB      RMSNorm bwd; tiny, always save
+                                                 (None iff geometry.qk_norm is False)
     ``rstd_k``    [B,S,H_kv] fp32   8 MiB        idem
     ``q_pre``     [B,S,H_q,D]       16 GiB       pre-norm Q -- SAVE or RECOMPUTE
     ``k_pre``     [B,S,H_kv,D]      1 GiB        idem
@@ -822,17 +840,50 @@ class SavedForBackward:
     already holds rather than storing a third 16 GiB copy.
 
     A field left ``None`` means "recompute me", and the backward decides how
-    from :class:`~cudnn.gated_attention_block.api_bwd.RecomputePolicy`.
+    from :class:`~cudnn.gated_attention_block.api_bwd.RecomputePolicy` --
+    EXCEPT ``rstd_q`` / ``rstd_k``, which are ``None`` iff
+    ``geometry.qk_norm`` is False: there is no RMSNorm, stage (B6) does not
+    exist, and nothing could recompute them. The forward REQUIRES them to be
+    ``None`` in that case (and tensors otherwise), both directions typed.
     """
 
     h: torch.Tensor
     gate: torch.Tensor
     o: torch.Tensor
     lse: torch.Tensor
-    rstd_q: torch.Tensor
-    rstd_k: torch.Tensor
+    rstd_q: Optional[torch.Tensor]  # None iff geometry.qk_norm is False (positional slot kept: append-only)
+    rstd_k: Optional[torch.Tensor]  # idem
     q_pre: Optional[torch.Tensor] = None
     k_pre: Optional[torch.Tensor] = None
+
+
+def _check_norm_weights_agree(qk_norm: bool, w_q_norm, w_k_norm, *, prefix: str = "") -> None:
+    """``geometry.qk_norm`` and the two norm-weight slots must agree, BOTH ways.
+
+    Typed ``ValueError`` naming the knob. Load-bearing rather than cosmetic:
+    ``APIBase._make_tensor_desc(None)`` and ``_check_tensor_shape(None)`` both
+    return ``None`` SILENTLY, so a norm-on block declared with ``None`` weights
+    would sail through declaration and die in ``check_support``'s dtype loop with
+    an untyped ``AttributeError`` -- or, worse, hand the kernel a null weight
+    pointer. Called at declaration (``sample_*``) and again at every ``execute``.
+    """
+    have_q, have_k = w_q_norm is not None, w_k_norm is not None
+    q_nm, k_nm = f"{prefix}w_q_norm", f"{prefix}w_k_norm"
+    if have_q != have_k:
+        raise ValueError(
+            f"{q_nm} and {k_nm} must be given together or both be None (geometry.qk_norm={qk_norm}); "
+            f"got {q_nm}={'tensor' if have_q else 'None'}, {k_nm}={'tensor' if have_k else 'None'}"
+        )
+    if qk_norm and not have_q:
+        raise ValueError(
+            f"geometry.qk_norm=True (QK-RMSNorm on) requires both [D] norm weights, but {q_nm} / {k_nm} are None. "
+            "Pass them, or declare GatedAttentionBlockGeometry(qk_norm=False) for RoPE-only Q/K."
+        )
+    if not qk_norm and have_q:
+        raise ValueError(
+            f"geometry.qk_norm=False (RoPE-only Q/K, no RMSNorm) takes no norm weights, but {q_nm} / {k_nm} were given. "
+            "Pass None for both, or declare GatedAttentionBlockGeometry(qk_norm=True)."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1158,8 +1209,34 @@ class _FusedQkvProjection(_Stage):
             # Only the FP8 arm names the field, so the bf16 compile key (and the
             # bf16 rendering's cache) is byte-identical to before the FP8 fork.
             kw["quant_fp8"] = True
+        if not g.qk_norm:
+            # Same only-when-set idiom: norm-on keys are spelled identically to
+            # today.  The field lands with the fork edits (PR-B slice S2); until
+            # then a RoPE-only fused projection is a typed decline, never a
+            # silently norm-ON artifact.
+            if not self._fork_supports_qk_norm():
+                raise NotImplementedError(self._qk_norm_off_unsupported_msg())
+            kw["qk_norm"] = False
         return NormRopeFusionParams(
             d_head=g.d_head, rope_dim=g.rope_dim, h_q=g.h_q, h_kv=g.h_kv, eps=g.qk_norm_eps, want_rstd=self.want_rstd, norm_source=self.norm_source, **kw
+        )
+
+    @staticmethod
+    def _fork_supports_qk_norm() -> bool:
+        """True once ``NormRopeFusionParams`` carries ``qk_norm`` (the GEMM forks'
+        RoPE-only epilogue, PR-B slice S2). Feature-detected so either landing
+        order works: this slice can ship before or after the fork edits."""
+        import dataclasses
+
+        from .kernels import proj_gemm
+
+        return "qk_norm" in {f.name for f in dataclasses.fields(proj_gemm.NormRopeFusionParams)}
+
+    def _qk_norm_off_unsupported_msg(self) -> str:
+        return (
+            f"{self.name}: geometry.qk_norm=False (RoPE-only Q/K) with fuse_norm_rope=True needs the GEMM forks' RoPE-only "
+            "epilogue (NormRopeFusionParams.qk_norm), which has not landed in this checkout. Use the unfused chain "
+            "(fuse_norm_rope=False) for qk_norm=False."
         )
 
     def _fp8_fork_available(self) -> Optional[str]:
@@ -1207,6 +1284,13 @@ class _FusedQkvProjection(_Stage):
                 f"{self.name}: rope_dim must be a positive multiple of {2 * self._SUBTILE_N} and < d_head so each rotate_half pair "
                 f"spans whole epilogue subtiles; got rope_dim={g.rope_dim}"
             )
+        if not g.qk_norm:
+            # RoPE-only epilogue: no RMSNorm, so no rstd can be wanted, and the
+            # fork must know the knob (typed decline until slice S2 lands it).
+            if self.want_rstd:
+                raise ValueError(f"{self.name}: geometry.qk_norm=False computes no RMSNorm and emits no rstd; want_rstd must be False")
+            if not self._fork_supports_qk_norm():
+                raise NotImplementedError(self._qk_norm_off_unsupported_msg())
         if self.fp8:
             if self.dtype != torch.float8_e4m3fn:
                 raise NotImplementedError(f"{self.name}: the FP8 fork is rendered for e4m3 h / W_qkvg, got {self.dtype}")
@@ -1229,6 +1313,9 @@ class _FusedQkvProjection(_Stage):
     def compile(self) -> None:
         from .kernels.proj_gemm import build_fused_proj_gemm
 
+        # params() itself declines qk_norm=False on a fork without the knob, so
+        # a compile() reached without check_support() cannot build a norm-ON
+        # artifact for a norm-OFF geometry.
         self._plan = build_fused_proj_gemm(self.params())
         if self.fp8:
             # Plan-time constant (contract § 10): the fork reads these four once
@@ -1245,13 +1332,17 @@ class _FusedQkvProjection(_Stage):
         return 2 * self.m * self.n * self.k
 
     def execute(self, a, w, out, w_q_norm, w_k_norm, cos, sin, rstd_q=None, rstd_k=None, *, stream) -> None:
-        """bf16 arm: ONE ``[M, N]`` slab out (Q/K columns normed + rotated)."""
+        """bf16 arm: ONE ``[M, N]`` slab out (Q/K columns normed + rotated).
+
+        ``w_q_norm`` / ``w_k_norm`` are ``None`` (both) under ``geometry.qk_norm=False``
+        and tensors otherwise -- checked here, both directions, before the runner."""
         from .kernels.proj_gemm import run_fused_proj_gemm
 
         if self._plan is None:
             raise RuntimeError("call compile() before execute()")
         if self.fp8:
             raise ValueError(f"{self.name}: this stage was declared FP8; use execute_fp8(...)")
+        _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
         run_fused_proj_gemm(self._plan, a, w, out, w_q_norm, w_k_norm, cos, sin, rstd_q, rstd_k, stream=stream)
 
     def execute_fp8(self, a, w, out_q8, out_k8, out_v8, out_gate16, w_q_norm, w_k_norm, cos, sin, *, stream) -> None:
@@ -1273,6 +1364,7 @@ class _FusedQkvProjection(_Stage):
             raise RuntimeError("call compile() before execute_fp8()")
         if not self.fp8:
             raise ValueError(f"{self.name}: this stage was declared bf16; use execute(...)")
+        _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
         if not self._runner_writes_compact_qkv():
             # Never hand the round-1 slab runner three compact buffers positionally.
             raise NotImplementedError(f"{self.name}: {self._fp8_fork_available()}")
@@ -1312,6 +1404,14 @@ class _QkNormRope(_Stage):
     Q/K may be updated IN PLACE (``q_out is q``): every lane reads its whole row
     before any lane stores, and the RoPE partner shuffle stays inside the row's
     own lane group.
+
+    **``geometry.qk_norm=False`` -- RoPE only.** Both kernels fold the RMSNorm
+    out at trace time (``compile_qk_norm_rope[_tma](apply_norm=False)``: the
+    weight slots are traced as ``None``, exactly the presence switch ``want_rstd``
+    uses), so there is no sum-of-squares pass, no rsqrt, no weight load and no
+    rstd; the dims ``[rope_dim, d_head)`` come out BIT-EXACT. The stage name and
+    position do not change (``"qk_norm_rope"`` stays in ``_stages``); ``execute``
+    takes ``None`` for both weights and refuses tensors, both directions typed.
 
     Kernel: ``kernels/qk_norm_rope.py`` — at ``kernels/`` level, not under an
     arch package, because it is plain vectorized LDG/STG with no tcgen05 and no
@@ -1433,6 +1533,14 @@ class _QkNormRope(_Stage):
     def check_support(self) -> None:
         if self.dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError(f"qk_norm_rope serves bf16/f16 only, got {self.dtype}")
+        g = self.geom
+        if not g.qk_norm:
+            # RoPE-only: nothing to norm, so nothing to emit an rstd from, and
+            # with no RoPE either the stage would be an identity copy.
+            if self.want_rstd:
+                raise ValueError(f"{self.name}: geometry.qk_norm=False computes no RMSNorm and emits no rstd; want_rstd must be False")
+            if g.rope_dim == 0:
+                raise ValueError(f"{self.name}: geometry.qk_norm=False with rope_dim=0 is an identity copy of Q/K; drop the stage instead")
         if self.resolve_impl() == "tma":
             from .kernels.qk_norm_rope_tma import validate_shape as _tma_validate
 
@@ -1460,6 +1568,7 @@ class _QkNormRope(_Stage):
                 tile_rows=self.resolve_tile_rows(),
                 stages=self.stages,
                 threads_per_cta=self.threads_per_cta,
+                apply_norm=g.qk_norm,
             )
             return
         from .kernels.qk_norm_rope import compile_qk_norm_rope
@@ -1478,6 +1587,7 @@ class _QkNormRope(_Stage):
             const_head_counts=self.const_head_counts,
             use_pdl=self.use_pdl,
             dynamic_token_stride=self.dynamic_token_stride,
+            apply_norm=g.qk_norm,
         )
 
     def moved_bytes(self) -> int:
@@ -1491,8 +1601,8 @@ class _QkNormRope(_Stage):
         self,
         q: torch.Tensor,  # [B, S, H_q,  D]
         k: torch.Tensor,  # [B, S, H_kv, D]
-        w_q_norm: torch.Tensor,  # [D]
-        w_k_norm: torch.Tensor,  # [D]
+        w_q_norm: Optional[torch.Tensor],  # [D]; None (both) iff geometry.qk_norm is False
+        w_k_norm: Optional[torch.Tensor],  # [D]
         cos: torch.Tensor,  # [B, S, ROPE_DIM]
         sin: torch.Tensor,  # [B, S, ROPE_DIM]
         q_out: Optional[torch.Tensor] = None,  # defaults to in place
@@ -1507,6 +1617,9 @@ class _QkNormRope(_Stage):
         ``.view()`` only — never ``reshape``: these buffers are compact by
         construction (§ 1), so a view is exact and a copy would be a silent
         extra kernel (Rule 1).
+
+        The norm weights must agree with ``geometry.qk_norm`` in both directions
+        (typed ``ValueError`` naming the knob) -- checked here, before the recipe.
         """
         from .kernels.qk_norm_rope import run_qk_norm_rope
         from .kernels.qk_norm_rope_tma import run_qk_norm_rope_tma
@@ -1514,6 +1627,7 @@ class _QkNormRope(_Stage):
         if self._recipe is None:
             raise RuntimeError("call compile() before execute()")
         g = self.geom
+        _check_norm_weights_agree(g.qk_norm, w_q_norm, w_k_norm)
         t = self.batch * self.seq_len
         stream = current_stream if current_stream is not None else torch.cuda.current_stream(q.device).cuda_stream
 
@@ -2028,6 +2142,7 @@ class GatedAttentionBlockFwd(APIBase):
 
         (1) proj         h            -> PROJ [T, N]            FROST GEMM        | fuse_norm_rope: (1)+(2)+(3) in ONE
         (2+3) norm+rope  PROJ[Q],[K]  -> in place  (+rstd)      this block's kernel| launch (the GEMM fork's epilogue)
+                         geometry.qk_norm=False: RoPE only -- same stage, same launch, no norm weights (None), no rstd
         (3b) compact     PROJ[V]      -> V_c                    only when inplace_qkv=False
         (4) sdpa         PROJ[Q,K,V]  -> O  (+LSE)              FROST SDPA        | fuse_gate: (4)+(5) in ONE launch
         (5) gate         O, PROJ[G]   -> O in place             this block's kernel| (the SDPA's epilogue_gate)
@@ -2052,8 +2167,8 @@ class GatedAttentionBlockFwd(APIBase):
         self,
         sample_h: torch.Tensor,  # [B, S, d_model]
         sample_w_qkvg: torch.Tensor,  # [N, d_model], N = (2*H_q + 2*H_kv) * D
-        sample_w_q_norm: torch.Tensor,  # [D]
-        sample_w_k_norm: torch.Tensor,  # [D]
+        sample_w_q_norm: Optional[torch.Tensor],  # [D]; None (both) iff geometry.qk_norm is False -- same positions
+        sample_w_k_norm: Optional[torch.Tensor],  # [D]
         sample_cos: torch.Tensor,  # [B, S, ROPE_DIM] -- see "RoPE table contract"
         sample_sin: torch.Tensor,  # [B, S, ROPE_DIM]
         sample_w_o: torch.Tensor,  # [d_model, H_q * D]
@@ -2084,6 +2199,11 @@ class GatedAttentionBlockFwd(APIBase):
             )
         if quant is not None:
             quant.validate()
+        # geometry.qk_norm vs the two weight slots, BOTH directions, at
+        # declaration (again at every execute).  A None sample would otherwise
+        # be swallowed by _make_tensor_desc and surface as an untyped
+        # AttributeError in check_support's dtype loop.
+        _check_norm_weights_agree(geometry.qk_norm, sample_w_q_norm, sample_w_k_norm, prefix="sample_")
         self.act_dtype = torch.bfloat16 if quant is not None else self.dtype
         if sample_h.ndim != 3:
             raise ValueError(f"sample_h must be [B, S, d_model], got {tuple(sample_h.shape)}")
@@ -2100,11 +2220,21 @@ class GatedAttentionBlockFwd(APIBase):
         # k_pre. Explicit True with save_for_backward RAISES rather than
         # silently costing the caller a tensor the backward cannot rebuild.
         self.inplace_qkv = (not self.save_for_backward) if inplace_qkv is None else bool(inplace_qkv)
+        # The two training guards are KEPT under qk_norm=False (D11): the
+        # SavedForBackward contract still writes q_pre/k_pre out of place and
+        # no block-level save_for_backward=True execute has validated a
+        # relaxation (PR-B plan § 6 Q10).  Only the REASON differs, so the
+        # message must not claim an RMSNorm backward that does not exist.
+        _why_pre = (
+            "norming in place destroys q_pre/k_pre, which the RMSNorm backward needs and cannot reconstruct (dividing out "
+            "the norm weight is undefined at a zero weight and hostile at a small one -- see SavedForBackward)"
+            if geometry.qk_norm
+            else "rotating in place overwrites q_pre/k_pre, which the SavedForBackward contract still hands the backward "
+            "out of place under qk_norm=False (RoPE-only; relaxing this needs a block-level training validation first)"
+        )
         if self.inplace_qkv and self.save_for_backward:
             raise ValueError(
-                "inplace_qkv=True is incompatible with save_for_backward=True: norming in place destroys q_pre/k_pre, "
-                "which the RMSNorm backward needs and cannot reconstruct (dividing out the norm weight is undefined at "
-                "a zero weight and hostile at a small one -- see SavedForBackward). Pass inplace_qkv=False, or recompute "
+                f"inplace_qkv=True is incompatible with save_for_backward=True: {_why_pre}. Pass inplace_qkv=False, or recompute "
                 "q_pre/k_pre from h by re-running the Q and K slices of the projection."
             )
 
@@ -2116,9 +2246,9 @@ class GatedAttentionBlockFwd(APIBase):
         self.fuse_norm_rope = bool(fuse_norm_rope)
         if self.fuse_norm_rope and not self.inplace_qkv:
             raise ValueError(
-                "fuse_norm_rope=True writes normed Q/K straight into the projection slab (the in-place layout) and never "
-                "materialises q_pre/k_pre, so it requires inplace_qkv=True and is incompatible with save_for_backward=True. "
-                "Pass fuse_norm_rope=False for training."
+                f"fuse_norm_rope=True writes {'normed' if geometry.qk_norm else 'rotated'} Q/K straight into the projection slab "
+                "(the in-place layout) and never materialises q_pre/k_pre, so it requires inplace_qkv=True and is incompatible "
+                "with save_for_backward=True. Pass fuse_norm_rope=False for training."
             )
 
         # FUSED GATE: the production d256 SDPA's epilogue_gate specialization
@@ -2139,18 +2269,13 @@ class GatedAttentionBlockFwd(APIBase):
             )
         if quant is not None and self.save_for_backward:
             raise NotImplementedError("the FP8 pipeline is inference-only for now (no q_pre/k_pre/pre-gate O contract under quantization)")
-        if quant is not None and self.seq_lens_present:
-            # KERNEL BUG, not a design choice: the Rubin per-tensor FP8 d256 SDPA
-            # (`sdpa/fwd/kernels/sm107/prefill_d256_fp8.py`) HANGS (exit 124) on a
-            # batch entry with seq_kv_lens == 0 -- first launch at S=1000, second
-            # launch at S=512; non-empty padding is fine; the bf16 sibling handles
-            # the identical case.  Repro: `frost_dev/probe_sdpa_fp8_d256.py
-            # --lsepad-dead`.  Declined here until the kernel's empty-mainloop path
-            # is fixed, because a hang is worse than a decline.
-            raise NotImplementedError(
-                "FP8 + seq_lens_present is declined: the Rubin FP8 d256 SDPA kernel hangs on an empty (seq_kv_lens == 0) batch entry "
-                "(frost_dev/probe_sdpa_fp8_d256.py --lsepad-dead). Use bf16 for padded batches until that kernel is fixed."
-            )
+        # seq_lens_present (a dense padding mask, incl. an EMPTY entry) is SERVED
+        # under FP8 and MXFP8 since 2026-09-15.  The decline that used to sit here
+        # ("the Rubin FP8 d256 SDPA hangs on seq_kv_lens == 0") is retired: the
+        # rebased kernels pass 8/8 fresh processes at S=1000 and S=512 with a dead
+        # entry, and the MXFP8 d256 leading-zero-length-KV L0 test passes on Rubin.
+        # The block's own dead-entry oracle tests (test_block_fp8.py /
+        # test_block_mxfp8.py: seq_lens=[s, 0] -> out[1] == 0 EXACTLY) pin it.
         if self.fuse_gate and self.save_for_backward:
             raise ValueError(
                 "fuse_gate=True writes O_gated in place of O and never materialises the pre-gate O, which the backward's "
@@ -2174,17 +2299,21 @@ class GatedAttentionBlockFwd(APIBase):
         self.fp8_fused = fp8 and self.fuse_gate and self.fuse_norm_rope
         act = self.act_dtype
         self._quant_dev = None  # the QuantSpec as device scalars, materialised in compile()
+        # rstd exists only where a norm exists: under qk_norm=False a training
+        # block saves lse / q_pre / k_pre but no rstd (SavedForBackward.rstd_*
+        # are None -- required, both directions, at execute).
+        want_rstd = self.save_for_backward and geometry.qk_norm
         if self.fuse_norm_rope:
             # bf16: writes the [T, N] slab.  FP8: the second rendering writes the
             # compact e4m3 q8/k8/v8 + the bf16 gate16 buffer, quantizing in its epilogue.
             self._proj = _FusedQkvProjection(
-                geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, want_rstd=self.save_for_backward, quant=quant, device=self.device
+                geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, want_rstd=want_rstd, quant=quant, device=self.device
             )
             self._norm_rope = None  # lives in the fused epilogue
         else:
             # FP8: e4m3 x e4m3 -> fp32 -> * (descale_h * descale_w_qkvg) -> bf16 slab.
             self._proj = _qkv_gate_projection(geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, out_dtype=act, alpha=fp8)
-            self._norm_rope = _QkNormRope(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, want_rstd=self.save_for_backward)
+            self._norm_rope = _QkNormRope(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, want_rstd=want_rstd)
         # Stage (3b) exists ONLY to give the SDPA a compact V. In-place needs no
         # such thing, so the stage is not built at all rather than built and
         # skipped -- a stage that is never run should not be in `_stages`,
@@ -2251,7 +2380,12 @@ class GatedAttentionBlockFwd(APIBase):
         g = self.geom
         self._check_tensor_shape(self._descs["w_qkvg"], (g.n_qkvg, g.d_model), "w_qkvg")
         self._check_tensor_shape(self._descs["w_o"], (g.d_model, g.h_q * g.d_head), "w_o")
-        for nm in ("w_q_norm", "w_k_norm"):
+        # Under qk_norm=False the two norm-weight descriptors are None (the
+        # constructor checked both directions), so they are skipped here: the
+        # shape check would pass silently and the dtype loop would raise an
+        # untyped AttributeError.
+        norm_names = ("w_q_norm", "w_k_norm") if g.qk_norm else ()
+        for nm in norm_names:
             self._check_tensor_shape(self._descs[nm], (g.d_head,), nm)
         for nm in ("cos", "sin"):
             self._check_tensor_shape(self._descs[nm], (self.batch, self.seq_len, g.rope_dim), nm)
@@ -2261,7 +2395,7 @@ class GatedAttentionBlockFwd(APIBase):
         for nm in ("w_qkvg", "w_o"):
             if self._descs[nm].dtype != self.dtype:
                 raise ValueError(f"{nm} must have h's dtype {self.dtype}, got {self._descs[nm].dtype}")
-        for nm in ("w_q_norm", "w_k_norm", "cos", "sin", "out"):
+        for nm in norm_names + ("cos", "sin", "out"):
             if self._descs[nm].dtype != self.act_dtype:
                 raise ValueError(f"{nm} must be the activation dtype {self.act_dtype}, got {self._descs[nm].dtype}")
         for st in self._stages:
@@ -2331,8 +2465,8 @@ class GatedAttentionBlockFwd(APIBase):
         self,
         h: torch.Tensor,
         w_qkvg: torch.Tensor,
-        w_q_norm: torch.Tensor,
-        w_k_norm: torch.Tensor,
+        w_q_norm: Optional[torch.Tensor],  # [D]; None (both) iff geometry.qk_norm is False
+        w_k_norm: Optional[torch.Tensor],
         cos: torch.Tensor,
         sin: torch.Tensor,
         w_o: torch.Tensor,
@@ -2347,9 +2481,14 @@ class GatedAttentionBlockFwd(APIBase):
 
         No allocation, no D2H read, no implicit conversion: every intermediate is
         a strided VIEW of the caller's workspace.
+
+        ``w_q_norm`` / ``w_k_norm`` must agree with ``geometry.qk_norm`` in both
+        directions (typed ``ValueError``), and so must ``saved.rstd_q`` /
+        ``saved.rstd_k`` under ``save_for_backward`` (tensors iff qk_norm).
         """
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
+        _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
         g = self.geom
         t = self.batch * self.seq_len
         # THE launch stream (Rule 5): the caller's ``current_stream``, else torch's
@@ -2404,6 +2543,14 @@ class GatedAttentionBlockFwd(APIBase):
         if self.save_for_backward:
             if saved is None:
                 raise ValueError("save_for_backward=True requires a SavedForBackward to write through")
+            if g.qk_norm:
+                if saved.rstd_q is None or saved.rstd_k is None:
+                    raise ValueError("save_for_backward=True with geometry.qk_norm=True needs SavedForBackward.rstd_q and rstd_k tensors to write through")
+            elif saved.rstd_q is not None or saved.rstd_k is not None:
+                raise ValueError(
+                    "geometry.qk_norm=False (RoPE-only) computes no RMSNorm and writes no rstd: SavedForBackward.rstd_q and rstd_k must be None "
+                    "(stage B6 does not exist)"
+                )
             rstd_q, rstd_k = saved.rstd_q, saved.rstd_k
 
         if self.fuse_norm_rope:
@@ -2490,6 +2637,9 @@ class GatedAttentionBlockFwd(APIBase):
         the 2-D ``[T, h*d]`` views go to the GEMM runner, the ``[B, S, H, d]``
         views of the same bytes to the gated FP8 SDPA; nothing is strided,
         nothing is repacked (Rule 2).
+
+        ``w_q_norm`` / ``w_k_norm`` are ``None`` (both) under ``geometry.qk_norm=False``
+        -- already checked by ``execute``; the fork's runner receives them as-is.
         """
         g = self.geom
         b, s = self.batch, self.seq_len
@@ -2547,8 +2697,8 @@ class GatedAttentionBlockFwd(APIBase):
 def gated_attention_block_forward(
     h: torch.Tensor,
     w_qkvg: torch.Tensor,
-    w_q_norm: torch.Tensor,
-    w_k_norm: torch.Tensor,
+    w_q_norm: Optional[torch.Tensor],  # None (both) iff geometry.qk_norm is False
+    w_k_norm: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
     w_o: torch.Tensor,
