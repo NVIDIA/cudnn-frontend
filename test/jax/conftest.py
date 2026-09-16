@@ -26,8 +26,13 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
-def sm100_device(request):
+def cuda_device(request):
     if request.node.name == "test_import_isolation":
+        return
+    if request.module.__name__.endswith("test_kda"):
+        devices = jax.local_devices()
+        if len(devices) != 1 or devices[0].platform != "gpu" or str(getattr(devices[0], "compute_capability", "")) not in ("10.0", "10.3"):
+            pytest.skip("KDA requires one visible SM100/SM103 GPU")
         return
     if not sm100_available():
         pytest.skip("BSA JAX tests require one visible SM100 GPU")
