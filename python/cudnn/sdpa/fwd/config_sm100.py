@@ -1725,10 +1725,13 @@ def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
-        # Keep d128's validated f16 depth. The halved slabs leave room for more,
-        # but KV depth is a separate change from the head-dim geometry and has
-        # to be earned against a correct baseline, not assumed.
-        STAGES_KV=2,
+        # Deeper KV pipeline than d128's 2. The halved d64 slabs pay for it
+        # (cga1: 32 KiB Q u O + 64 K + 64 V = 160 KiB against the 227 KiB cap;
+        # cga2: 128 KiB), and ncu says this is where the room is worth spending:
+        # `long_scoreboard` -- warps blocked on a memory dependency -- is by far
+        # the dominant stall for this kernel (56.6% at SWA=128, 58.4% at full
+        # causal), against ~2% for barrier stalls.
+        STAGES_KV=4,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
