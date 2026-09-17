@@ -602,6 +602,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return f"O dtype {facts.dtype_o} not in {sorted(str(d) for d in capabilities.out_dtypes)}"
     if facts.o_block_scale not in capabilities.o_block_scales:
         return f"block-scaled O (scale block {facts.o_block_scale} along d) is not served by this engine (domain {sorted(capabilities.o_block_scales)})"
+    if facts.dtype_o == cudnn.data_type.FP4_E2M1 and facts.o_block_scale != 16:
+        # FP4_E2M1 sits in out_dtypes for the block-scaled epilogue only (the
+        # analyzer derives o_block_scale = 16 from sf_o); a bare FP4 O has no store.
+        return "an FP4_E2M1 O is served only as a block-scaled O (sf_o with 16-element scale blocks)"
     if facts.o_block_scale:
         # The block-scaled epilogue writes SF_O per dense Q row of one
         # sequence; THD / per-batch Q trim / a KV split (fp32 partials) / a
@@ -612,6 +616,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "block-scaled O (sf_o) cannot be combined with split_kv > 1"
         if knobs is not None and knobs.pack_gqa:
             return "block-scaled O (sf_o) cannot be combined with pack_gqa"
+        if facts.has_epilogue_gate:
+            # Two different epilogues own the O store (quantize + SF_O vs. O *= sigmoid(G)).
+            return "block-scaled O (sf_o) cannot be combined with the fused epilogue gate"
     if not facts.uniform_dtype:
         return "K/V dtypes must match Q" if (facts.is_mxfp8 or facts.is_fp8) else "K/V/O dtypes must match Q"
     if facts.thd:
