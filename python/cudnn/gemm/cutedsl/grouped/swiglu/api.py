@@ -852,6 +852,10 @@ def grouped_gemm_swiglu_wrapper_sm100(
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM SwiGLU forward operation.
 
+    Canonical MXFP8 JAX arrays and tracers dispatch to the cudnn.jax API,
+    including under jax.jit. Set sf_vec_size=32 and an explicit FP8 d_dtype;
+    wrapper defaults stay unchanged. Unsupported JAX options raise ValueError.
+
     This function creates the API, compiles, and executes in one call.
     Compiled kernels are cached for reuse when called with the same configuration.
 
@@ -913,7 +917,32 @@ def grouped_gemm_swiglu_wrapper_sm100(
     """
     framework = detect_framework(a_tensor)
     if framework == "jax":
-        raise ValueError(f"grouped_gemm_swiglu_wrapper_sm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
+        from cudnn.jax import grouped_gemm_swiglu
+        from ..canonical_jax import check_jax_wrapper_options
+
+        check_jax_wrapper_options(
+            acc_dtype=acc_dtype,
+            cd_major=cd_major,
+            sf_vec_size=sf_vec_size,
+            vector_f32=vector_f32,
+            m_aligned=m_aligned,
+            discrete_col_sfd=discrete_col_sfd,
+            current_stream=current_stream,
+        )
+        return grouped_gemm_swiglu(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            prob_tensor=prob_tensor,
+            norm_const_tensor=norm_const_tensor,
+            c_dtype=c_dtype if c_dtype is not None else cutlass.BFloat16,
+            d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+        )
     if framework != "torch":
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_swiglu_wrapper_sm100; pass torch tensors")
     import torch

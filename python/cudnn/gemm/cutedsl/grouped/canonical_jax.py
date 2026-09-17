@@ -132,3 +132,33 @@ def grouped_call(adapter, kernel, mac, input_types, output_types):
         kernel=kernel,
         mac=mac,
     )
+
+
+def check_jax_wrapper_options(
+    *,
+    acc_dtype,
+    cd_major,
+    sf_vec_size,
+    vector_f32,
+    m_aligned,
+    discrete_col_sfd,
+    current_stream,
+    epilogue_op=None,
+    dprob_tensor_buf=None,
+    amax_tensor_buf=None,
+):
+    options = {
+        "acc_dtype": acc_dtype is None or _convert_to_cutlass_data_type(acc_dtype) is cutlass.Float32,
+        "cd_major": cd_major == "n",
+        "sf_vec_size": sf_vec_size == 32,
+        "vector_f32": not vector_f32,
+        "m_aligned": m_aligned == 256,
+        "discrete_col_sfd": not discrete_col_sfd,
+        "current_stream": current_stream is None,
+        "epilogue_op": epilogue_op in (None, "none", "identity"),
+        "dprob_tensor_buf": dprob_tensor_buf is None,
+        "amax_tensor_buf": amax_tensor_buf is None,
+    }
+    for name, supported in options.items():
+        if not supported:
+            raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")

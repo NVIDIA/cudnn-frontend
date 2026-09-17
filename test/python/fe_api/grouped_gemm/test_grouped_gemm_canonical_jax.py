@@ -82,7 +82,8 @@ def assert_outputs(result, reference):
 @pytest.mark.parametrize("backward", [False, True], ids=["swiglu", "dswiglu"])
 @pytest.mark.parametrize("experts", [1, 4])
 @pytest.mark.parametrize("flat_sf,bf16_prob", [(False, False), (True, True)])
-def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, monkeypatch):
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["namespace", "wrapper"])
+def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, shared_wrapper, monkeypatch):
     skip_unless_sm100()
     import cudnn
 
@@ -96,7 +97,7 @@ def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, monkeypatch
 
     eager = getattr(cudnn_torch, f"grouped_gemm_{name}")
     assert eager is getattr(cudnn, f"grouped_gemm_{name}_wrapper_sm100")
-    bridge = getattr(cudnn_jax, f"grouped_gemm_{name}")
+    bridge = partial(eager, d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32) if shared_wrapper else getattr(cudnn_jax, f"grouped_gemm_{name}")
     reference = eager(**torch_inputs(arrays), d_dtype=torch.float8_e4m3fn, sf_vec_size=32)
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
     assert_outputs(bridge(**inputs), reference)
@@ -151,7 +152,8 @@ def test_canonical_jax_forward_backward_chain(monkeypatch):
         assert_outputs(bwd_result, backward_ref)
 
 
-def test_canonical_jax_without_torch():
+@pytest.mark.parametrize("shared_wrapper", [False, True])
+def test_canonical_jax_without_torch(shared_wrapper):
     skip_unless_sm100()
     import os
     import subprocess
@@ -186,6 +188,13 @@ def test_canonical_jax_without_torch():
         assert np.isfinite(np.asarray(out['dprob_tensor'])).all()
         assert sys.modules['torch'] is None
     """)
+    if shared_wrapper:
+        script = script.replace(
+            "from cudnn.jax import grouped_gemm_swiglu, grouped_gemm_dswiglu",
+            "from cudnn import grouped_gemm_swiglu_wrapper_sm100, grouped_gemm_dswiglu_wrapper_sm100\n"
+            "grouped_gemm_swiglu = partial(grouped_gemm_swiglu_wrapper_sm100, sf_vec_size=32)\n"
+            "grouped_gemm_dswiglu = partial(grouped_gemm_dswiglu_wrapper_sm100, sf_vec_size=32, d_dtype=ml_dtypes.float8_e4m3fn)",
+        )
     result = subprocess.run(
         [sys.executable, "-c", script], env={**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, capture_output=True, text=True, timeout=180
     )
@@ -230,26 +239,35 @@ def test_canonical_jax_runtime_offsets_and_padding(backward, monkeypatch):
         ("discrete_col_sfd", True),
     ],
 )
-def test_jax_namespace_rejects_torch_options(backward, option, value):
+@pytest.mark.parametrize("shared_wrapper", [False, True])
+def test_jax_rejects_unsupported_options(backward, option, value, shared_wrapper):
     skip_unless_sm100()
     import cudnn
 
     inputs = {name: jnp.asarray(array) for name, array in problem(backward, 1, True, False).items()}
     wrapper = getattr(cudnn_jax, f"grouped_gemm_{'dswiglu' if backward else 'swiglu'}")
     options = {}
+    if shared_wrapper:
+        wrapper = getattr(cudnn, f"grouped_gemm_{'dswiglu' if backward else 'swiglu'}_wrapper_sm100")
+        options.update(d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
     options[option] = value
-    with pytest.raises(TypeError, match=option):
+    with pytest.raises(ValueError if shared_wrapper else TypeError, match=option):
         jax.jit(partial(wrapper, **options))(**inputs)
 
 
 @pytest.mark.parametrize("option", ["dprob_tensor_buf", "amax_tensor_buf", "epilogue_op"])
-def test_jax_backward_rejects_output_buffers_and_epilogues(option):
+@pytest.mark.parametrize("shared_wrapper", [False, True])
+def test_jax_backward_rejects_output_buffers_and_epilogues(option, shared_wrapper):
     skip_unless_sm100()
     from cudnn.jax import grouped_gemm_dswiglu
 
     inputs = {name: jnp.asarray(array) for name, array in problem(True, 1, True, False).items()}
     options = {option: "relu" if option == "epilogue_op" else jnp.empty((256,))}
-    with pytest.raises(TypeError, match=option):
+    if shared_wrapper:
+        from cudnn import grouped_gemm_dswiglu_wrapper_sm100
+
+        grouped_gemm_dswiglu = partial(grouped_gemm_dswiglu_wrapper_sm100, d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
+    with pytest.raises(ValueError if shared_wrapper else TypeError, match=option):
         grouped_gemm_dswiglu(**inputs, **options)
 
 
@@ -306,3 +324,16 @@ assert sys.modules['jax'] is None
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("backward", [False, True])
+def test_shared_wrapper_keeps_existing_defaults(backward):
+    skip_unless_sm100()
+    import cudnn
+
+    wrapper = getattr(cudnn, f"grouped_gemm_{'dswiglu' if backward else 'swiglu'}_wrapper_sm100")
+    inputs = {name: jnp.asarray(array) for name, array in problem(backward, 1, True, False).items()}
+    with pytest.raises(ValueError, match="sf_vec_size"):
+        wrapper(**inputs)
+    with pytest.raises(ValueError, match="FP8 output dtype"):
+        wrapper(**inputs, sf_vec_size=32)

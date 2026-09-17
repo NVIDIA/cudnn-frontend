@@ -6,11 +6,16 @@
 
 ## JAX support
 
-`cudnn.jax.grouped_gemm_dswiglu` accepts canonical MXFP8 JAX arrays or tracers,
-eagerly or under `jax.jit`. XLA owns its buffers and stream ordering. The existing
-`cudnn.grouped_gemm_dswiglu_wrapper_sm100` remains Torch-only;
-`cudnn.torch.grouped_gemm_dswiglu` is an alias to that same function, with
-identical arguments, defaults, and behavior. See the JAX execution contract below.
+`cudnn.grouped_gemm_dswiglu_wrapper_sm100` accepts Torch tensors and canonical
+MXFP8 JAX arrays or tracers. Torch execution is unchanged; JAX dispatches to
+`cudnn.jax.grouped_gemm_dswiglu`, eagerly or under `jax.jit`, with XLA-owned
+buffers and stream ordering. `cudnn.torch.grouped_gemm_dswiglu` remains an
+alias to the same wrapper and inherits its dispatch. Direct API-class construction
+with JAX samples remains unsupported.
+
+Wrapper signatures and defaults are unchanged. JAX wrapper calls must set
+`sf_vec_size=32` and an explicit FP8 `d_dtype`. The direct `cudnn.jax` API retains
+its MXFP8 defaults. See the JAX execution contract below.
 
 ## Overview
 
@@ -427,6 +432,26 @@ from cudnn.jax import grouped_gemm_dswiglu
 compiled = jax.jit(grouped_gemm_dswiglu)
 result = compiled(**jax_inputs)
 ```
+
+The existing wrapper also works under `jax.jit`:
+
+```python
+from functools import partial
+import cudnn
+import ml_dtypes
+
+compiled = jax.jit(partial(
+    cudnn.grouped_gemm_dswiglu_wrapper_sm100,
+    sf_vec_size=32,
+    d_dtype=ml_dtypes.float8_e4m3fn,
+))
+result = compiled(**jax_inputs)
+```
+
+On the wrapper's JAX path, unsupported options raise `ValueError`: non-FP32
+accumulation, non-`n` output layout, scale-vector size other than 32,
+`vector_f32=True`, non-default `m_aligned`, `discrete_col_sfd=True`, and caller
+streams, plus caller output buffers and non-identity backward epilogues.
 
 The Torch alias preserves the existing wrapper signature, including its dtype and
 scale-vector defaults. For example, select MXFP8 explicitly:
