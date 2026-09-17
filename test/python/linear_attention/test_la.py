@@ -396,7 +396,9 @@ def assert_rms_close(name, out, want, tol):
     assert r < tol, f"{name} rms ratio {r:.4g} >= {tol}"
 
 
-def assert_fwd_parity(backend, case, *, scale=None, use_initial_state=False, state_dtype=torch.float32, l2norm=False, beta_guard=False, seed=SEED + 1, tol_scale=1.0):
+def assert_fwd_parity(
+    backend, case, *, scale=None, use_initial_state=False, state_dtype=torch.float32, l2norm=False, beta_guard=False, seed=SEED + 1, tol_scale=1.0
+):
     set_seed(seed)
     state0 = None
     if use_initial_state:

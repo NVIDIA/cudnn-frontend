@@ -142,7 +142,7 @@ class KdaSummaryBars(NamedTuple):
     mb_qk_scale_ready: MBarrier
     mb_k_decay_inv_cg0_ready: MBarrier
     mb_decay_tcgen05_done: MBarrier
-    mb_decay_super_done: MBarrier
+    mb_decay_register_mma_done: MBarrier
     mb_k_restore_done: MBarrier
 
     mb_tmem_done: MBarrier
@@ -197,7 +197,7 @@ def make_bars(cfg) -> KdaSummaryBars:
         ),
         mb_k_decay_inv_cg0_ready=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=CG0_GROUP_WARPS, producer=Producer.THREAD),
         mb_decay_tcgen05_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
-        mb_decay_super_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=1, producer=Producer.THREAD),
+        mb_decay_register_mma_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=1, producer=Producer.THREAD),
         mb_k_restore_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
         mb_tmem_done=MBarrier(alloc(1), stages=1, init_count=CG1_WARPS, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
@@ -246,7 +246,7 @@ def scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one):
 
 
 @cute.jit
-def super_mma_warp(
+def register_mma_warp(
     cfg,
     total_tiles,
     bidx,
@@ -366,7 +366,7 @@ def super_mma_warp(
             nvvm.fence_proxy("async.shared", space="cta")
             if nvvm.elect_sync():
                 bars.mb_t_inv_ready[intermediate_stage].arrive()
-                bars.mb_decay_super_done[decay_stage].arrive()
+                bars.mb_decay_register_mma_done[decay_stage].arrive()
         cum_chunk_base += num_chunks_tile
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
@@ -1040,7 +1040,7 @@ def compute0_warp_group(
                     cutlass.Int32,
                 ).bitcast(cfg.io_dtype)
                 if cutlass.const_expr(dim_half == 0):
-                    bars.mb_decay_super_done[decay_stage].wait(decay_free_parity)
+                    bars.mb_decay_register_mma_done[decay_stage].wait(decay_free_parity)
                     bars.mb_decay_tcgen05_done[decay_stage].wait(decay_free_parity)
                 f16_segment = dim_base // 64
                 f16_segment_dim = dim_base - f16_segment * 64
@@ -2199,10 +2199,10 @@ def frost_kda_summary(
                 bars.mb_state_acc_m_cg1_done[stage].init()
             for stage in cutlass.range_constexpr(cfg.smem_decay_stages):
                 bars.mb_decay_tcgen05_done[stage].init()
-                bars.mb_decay_super_done[stage].init()
+                bars.mb_decay_register_mma_done[stage].init()
                 bars.mb_k_restore_done[stage].init()
             bars.mb_tmem_done[0].init()
-    elif warp_idx == cfg.super_mma_warp_id:
+    elif warp_idx == cfg.register_mma_warp_id:
         if elect_one:
             for stage in cutlass.range_constexpr(cfg.smem_intermediate_stages):
                 bars.mb_t_inv_ready[stage].init()
@@ -2211,7 +2211,7 @@ def frost_kda_summary(
                 bars.mb_qk_scale_ready[stage].init()
             for stage in cutlass.range_constexpr(cfg.smem_decay_stages):
                 bars.mb_k_decay_inv_cg0_ready[stage].init()
-    elif warp_idx == cfg.super_mma_twin_warp_id:
+    elif warp_idx == cfg.register_mma_twin_warp_id:
         if elect_one:
             for stage in cutlass.range_constexpr(cfg.scheduler_stages):
                 bars.mb_scheduler_ready[stage].init()
@@ -2241,8 +2241,8 @@ def frost_kda_summary(
             k_ratio=k_ratio,
             v_ratio=v_ratio,
         )
-    elif warp_idx == cfg.super_mma_warp_id:
-        super_mma_warp(
+    elif warp_idx == cfg.register_mma_warp_id:
+        register_mma_warp(
             cfg,
             total_tiles,
             bidx,
@@ -2273,8 +2273,8 @@ def frost_kda_summary(
             sK_restore_trans,
             bars,
         )
-    elif warp_idx == cfg.super_mma_twin_warp_id:
-        super_mma_warp(
+    elif warp_idx == cfg.register_mma_twin_warp_id:
+        register_mma_warp(
             cfg,
             total_tiles,
             bidx,
@@ -2357,10 +2357,10 @@ class KdaSummaryCfg:
 
     compute_group_0_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
     compute_group_1_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_1_WARP_IDS
-    super_mma_warp_id: int = CFG.SUPER_MMA_WARP_ID
+    register_mma_warp_id: int = CFG.REGISTER_MMA_WARP_ID
     tcgen05_mma_warp_id: int = CFG.TCGEN05_MMA_WARP_ID
     tma_warp_id: int = CFG.TMA_WARP_ID
-    super_mma_twin_warp_id: int = CFG.SUPER_MMA_TWIN_WARP_ID
+    register_mma_twin_warp_id: int = CFG.REGISTER_MMA_TWIN_WARP_ID
     b_t: int = CFG.B_T
     threads_per_warp: int = CFG.THREADS_PER_WARP
     buffer_align_bytes: int = CFG.BUFFER_ALIGN_BYTES

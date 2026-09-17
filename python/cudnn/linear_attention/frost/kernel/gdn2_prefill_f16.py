@@ -160,7 +160,7 @@ class Gdn2PrefillBars(NamedTuple):
     mb_a_ready: MBarrier
     mb_k_decay_inv_cg0_ready: MBarrier
     mb_decay_tcgen05_done: MBarrier
-    mb_decay_super_done: MBarrier
+    mb_decay_register_mma_done: MBarrier
     mb_qk_scale_ready: MBarrier
     mb_k_restore_acc_done: MBarrier
     mb_state_acc_cg0_done: MBarrier
@@ -213,7 +213,7 @@ def make_bars(cfg) -> Gdn2PrefillBars:
         mb_a_ready=MBarrier(alloc(cfg.smem_intermediate_stages), stages=cfg.smem_intermediate_stages, init_count=1, producer=Producer.THREAD),
         mb_k_decay_inv_cg0_ready=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=CG0_GROUP_WARPS, producer=Producer.THREAD),
         mb_decay_tcgen05_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
-        mb_decay_super_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=2, producer=Producer.THREAD),
+        mb_decay_register_mma_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=2, producer=Producer.THREAD),
         mb_qk_scale_ready=MBarrier(
             alloc(cfg.qk_scale_ready_stages),
             stages=cfg.qk_scale_ready_stages,
@@ -410,7 +410,7 @@ def epilogue_warp(
             nvvm.fence_proxy("async.shared", space="cta")
             if nvvm.elect_sync():
                 bars.mb_a_ready[intermediate_stage].arrive()
-                bars.mb_decay_super_done[decay_stage].arrive()
+                bars.mb_decay_register_mma_done[decay_stage].arrive()
 
             # ---- checkpoint + O store: checkpoint first ------------------------------
             if local_chunk > 0:
@@ -484,7 +484,7 @@ def epilogue_warp(
 
 
 @cute.jit
-def super_mma_warp(
+def register_mma_warp(
     cfg,
     total_tiles,
     bidx,
@@ -498,7 +498,7 @@ def super_mma_warp(
     sK_decay_raw,
     bars,
 ) -> None:
-    """Super-MMA warp role (warp 12). Persistent scheduler loop computing the
+    """Register-MMA warp role (warp 12). Persistent scheduler loop computing the
     blockwise T_inv by register MMA."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
     elect_one = nvvm.elect_sync()
@@ -589,7 +589,7 @@ def super_mma_warp(
             nvvm.fence_proxy("async.shared", space="cta")
             if nvvm.elect_sync():
                 bars.mb_t_inv_ready[intermediate_stage].arrive()
-                bars.mb_decay_super_done[decay_stage].arrive()
+                bars.mb_decay_register_mma_done[decay_stage].arrive()
         global_chunk_base += num_tile_chunks
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
@@ -1327,7 +1327,7 @@ def compute0_warp_group(
                     cutlass.Int32,
                 ).bitcast(cfg.io_dtype)
                 if cutlass.const_expr(dim_half == 0):
-                    bars.mb_decay_super_done[decay_stage].wait(decay_free_parity)
+                    bars.mb_decay_register_mma_done[decay_stage].wait(decay_free_parity)
                     bars.mb_decay_tcgen05_done[decay_stage].wait(decay_free_parity)
                 f16_segment = dim_base // 64
                 f16_segment_dim = dim_base - f16_segment * 64
@@ -2682,13 +2682,13 @@ def frost_gdn2_prefill(
             bars.mb_state_input_cg0_ready.init()
             for stage in cutlass.range_constexpr(cfg.smem_decay_stages):
                 bars.mb_decay_tcgen05_done[stage].init()
-                bars.mb_decay_super_done[stage].init()
+                bars.mb_decay_register_mma_done[stage].init()
                 bars.mb_k_restore_acc_done[stage].init()
                 bars.mb_state_acc_cg0_done[stage].init()
             bars.mb_y_input_ready.init()
             bars.mb_u_input_ready.init()
             bars.mb_tmem_done[0].init()
-    elif warp_idx == cfg.super_mma_warp_id:
+    elif warp_idx == cfg.register_mma_warp_id:
         if elect_one:
             for stage in cutlass.range_constexpr(cfg.smem_intermediate_stages):
                 bars.mb_t_inv_ready[stage].init()
@@ -2742,8 +2742,8 @@ def frost_gdn2_prefill(
             k_ratio=k_ratio,
             v_ratio=v_ratio,
         )
-    elif warp_idx == cfg.super_mma_warp_id:
-        super_mma_warp(
+    elif warp_idx == cfg.register_mma_warp_id:
+        register_mma_warp(
             cfg,
             total_tiles,
             bidx,
@@ -2877,7 +2877,7 @@ class Gdn2PrefillCfg:
 
     compute_group_0_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
     compute_group_1_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_1_WARP_IDS
-    super_mma_warp_id: int = CFG.SUPER_MMA_WARP_ID
+    register_mma_warp_id: int = CFG.REGISTER_MMA_WARP_ID
     tcgen05_mma_warp_id: int = CFG.TCGEN05_MMA_WARP_ID
     tma_warp_id: int = CFG.TMA_WARP_ID
     epilogue_warp_id: int = CFG.EPILOGUE_WARP_ID

@@ -195,7 +195,7 @@ def make_bars(cfg) -> Gdn2BpropSummaryBars:
         mb_dstate0_acc_stored=MBarrier(alloc(1), stages=1, init_count=CG1, producer=Producer.THREAD),
         mb_tmem_done=MBarrier(alloc(1), stages=1, init_count=CG1, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
-        # scheduler consumers: CG0 x4 + CG1 x4 + super + tcgen05 + epilogue
+        # scheduler consumers: CG0 x4 + CG1 x4 + register MMA + tcgen05 + epilogue
         mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), stages=cfg.scheduler_stages, init_count=11, producer=Producer.THREAD),
     )
 
@@ -338,7 +338,7 @@ def epilogue_warp(
 
 
 @cute.jit
-def super_mma_warp(
+def register_mma_warp(
     cfg,
     total_tiles,
     bidx,
@@ -352,7 +352,7 @@ def super_mma_warp(
     sIntermediate_raw,
     bars,
 ) -> None:
-    """Super-MMA warp role (warp 12): the blockwise T_inv staging tile, in chunk order."""
+    """Register-MMA warp role (warp 12): the blockwise T_inv staging tile, in chunk order."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
     elect_one = nvvm.elect_sync()
 
@@ -1879,7 +1879,7 @@ def frost_gdn2_bprop_summary(
             bars.mb_dstate_input_done.init()
             bars.mb_dstate0_acc_stored.init()
             bars.mb_tmem_done[0].init()
-    elif warp_idx == cfg.super_mma_warp_id:
+    elif warp_idx == cfg.register_mma_warp_id:
         if elect_one:
             for stage in cutlass.range_constexpr(cfg.smem_decay_stages):
                 bars.mb_k_decay_inv_ready[stage].init()
@@ -1929,8 +1929,8 @@ def frost_gdn2_bprop_summary(
             q_ratio=q_ratio,
             k_ratio=k_ratio,
         )
-    elif warp_idx == cfg.super_mma_warp_id:
-        super_mma_warp(
+    elif warp_idx == cfg.register_mma_warp_id:
+        register_mma_warp(
             cfg,
             total_tiles,
             bidx,
@@ -2043,7 +2043,7 @@ class Gdn2BpropSummaryCfg:
     # ---- fixed constants stamped from CFG at build time ------------------------------
     compute_group_0_warp_ids: tuple = CFG.COMPUTE_GROUP_0_WARP_IDS
     compute_group_1_warp_ids: tuple = CFG.COMPUTE_GROUP_1_WARP_IDS
-    super_mma_warp_id: int = CFG.SUPER_MMA_WARP_ID
+    register_mma_warp_id: int = CFG.REGISTER_MMA_WARP_ID
     tcgen05_mma_warp_id: int = CFG.TCGEN05_MMA_WARP_ID
     tma_warp_id: int = CFG.TMA_WARP_ID
     epilogue_warp_id: int = CFG.EPILOGUE_WARP_ID

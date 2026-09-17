@@ -332,7 +332,7 @@ def epilogue_warp(
 
 
 @cute.jit
-def super_mma_warp(
+def register_mma_warp(
     cfg,
     total_tiles,
     bidx,
@@ -347,7 +347,7 @@ def super_mma_warp(
     sBeta_raw,
     bars,
 ) -> None:
-    """Super-MMA warp role (warp 12): the blockwise T_inv register MMAs in
+    """Register-MMA warp role (warp 12): the blockwise T_inv register MMAs in
     chunk order."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
     elect_one = nvvm.elect_sync()
@@ -1859,7 +1859,7 @@ def frost_kda_bprop_summary(
             bars.mb_dstate_input_ready.init()
             bars.mb_dstate0_acc_stored.init()
             bars.mb_tmem_done[0].init()
-    elif warp_idx == cfg.super_mma_warp_id:
+    elif warp_idx == cfg.register_mma_warp_id:
         if elect_one:
             for stage in cutlass.range_constexpr(cfg.smem_decay_stages):
                 bars.mb_k_decay_inv_ready[stage].init()
@@ -1903,8 +1903,8 @@ def frost_kda_bprop_summary(
             q_ratio=q_ratio,
             k_ratio=k_ratio,
         )
-    elif warp_idx == cfg.super_mma_warp_id:
-        super_mma_warp(
+    elif warp_idx == cfg.register_mma_warp_id:
+        register_mma_warp(
             cfg,
             total_tiles,
             bidx,
@@ -2022,7 +2022,7 @@ class KdaBpropSummaryCfg:
     # ---- fixed constants stamped from CFG at build time ------------------------------
     compute_group_0_warp_ids: tuple = CFG.COMPUTE_GROUP_0_WARP_IDS
     compute_group_1_warp_ids: tuple = CFG.COMPUTE_GROUP_1_WARP_IDS
-    super_mma_warp_id: int = CFG.SUPER_MMA_WARP_ID
+    register_mma_warp_id: int = CFG.REGISTER_MMA_WARP_ID
     tcgen05_mma_warp_id: int = CFG.TCGEN05_MMA_WARP_ID
     tma_warp_id: int = CFG.TMA_WARP_ID
     epilogue_warp_id: int = CFG.EPILOGUE_WARP_ID
