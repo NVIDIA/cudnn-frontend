@@ -187,6 +187,18 @@ def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:
 # the padded/causal mask paths are active (see check_support).
 _SM100_TILE_N = 128
 
+# Paged compile key: the paged kernels IGNORE compile-time ``skv`` (the KV
+# maximum is ``block_table.shape[1] * page_size``, a dynamic extent the host
+# entry point reads off the bound table), yet the argument keys BOTH the
+# kernel module's compile() lru_cache and the persistent template key.  The
+# adapter hands the paged fp8 branch this one value instead of the plan's
+# logical ``paged_attention_max_seq_len_kv``, so otherwise identical plans
+# declaring different maxima (96, 128, ...) share one compiled artifact (Rule 4
+# across plans).  Dense keys keep the real S_kv: their K/V TMA extents are
+# compiled from it.  execute() still passes the plan's real maximum in the
+# runtime problem_size tuple, where the kernel overrides it for paged KV.
+_PAGED_COMPILE_SKV = 0
+
 # Keyed by kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template. The fp8
 # family has a dedicated d512 flavor above the general template's head range.
 _SM120_KERNEL_FILES = {
@@ -2274,8 +2286,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     # Paged KV (d128 flavor): the pools are bound as declared —
                     # their strides in the kernel's [num_pages, page_size, H_kv,
                     # D] order (the container's head/row axes swapped); num_pages
-                    # / max_pages are dynamic extents of the artifact (Rule 4).
-                    fp8_kwargs.update(self._paged_compile_kwargs())
+                    # / max_pages are dynamic extents of the artifact (Rule 4),
+                    # and the logical KV maximum leaves the key (_PAGED_COMPILE_SKV).
+                    fp8_kwargs.update(self._paged_compile_kwargs(), skv=_PAGED_COMPILE_SKV)
             # Declared zero-copy strides (Rubin d256 only, see above), the
             # epilogue gate's declared strides and the amax fold-out -- each
             # only when the selected kernel's compile() carries the keyword.
