@@ -415,10 +415,9 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
 
     # Known issue on older backends (NVBug 6783545). Register only AFTER all O
     # checks, so an unrelated plan/build/output failure is never an expected failure.
-    # Do not waive 9.28+ development builds: they must carry the backend fix.
     # A backport to an older version is an XPASS that asks us to retire this marker.
-    if cudnn.backend_version() < 92800 and s_q == 1 and h_q > h_kv and ragged_stats:
-        request.node.add_marker(pytest.mark.xfail(strict=True, raises=AssertionError, reason="cuDNN < 9.28: ragged decode GQA Stats (NVBug 6783545)"))
+    if cudnn.backend_version() < 92700 and s_q == 1 and h_q > h_kv and ragged_stats:
+        request.node.add_marker(pytest.mark.xfail(strict=True, raises=AssertionError, reason="cuDNN < 9.27: ragged decode GQA Stats (NVBug 6783545)"))
     torch.testing.assert_close(stats_gpu, torch.stack(stats_refs), atol=1e-4, rtol=1e-4)
 
 
