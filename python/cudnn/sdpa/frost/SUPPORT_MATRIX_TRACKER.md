@@ -168,7 +168,7 @@ TMA-OOB zero-filled) and, for decode / MTP shapes on the d128 flavor (`S_q * PAC
 128`), of the d128 decode tile `sm100/decode_d128_f16.py` (ᵈᵗ). On the d512 flavor the
 loader is role-split across the cga4 cluster: the sub-group 0 CTAs issue the K boxes and
 the sub-group 1 CTAs the V boxes, each pair walking its own block table; decode-shaped
-launches (`S_q` in [1, 8], MQA / GQA) and paged prefill (`S_q` up to 4 validated) both
+launches (`S_q` in [1, 8], MQA / GQA) and paged prefill (`S_q` up to 128 validated) both
 run, with KV split as on d128.
 
 ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**
