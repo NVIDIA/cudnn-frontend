@@ -50,11 +50,47 @@ class _FrostSdpaFwdPlan(CompiledPlan):
         # here rather than re-walking the list on every execute.
         self._uids = [t.get_uid() for t in self._tensors]
         self._workspace_bytes = int(getattr(compiled, "workspace_bytes", 0) or 0)
+        # Prepared launch (plan-time argument template, positional tvm-ffi call): binds the graph's
+        # normalized VariantPack; without one the plan is handed the raw uid map as before.
+        self._prepared = getattr(compiled, "prepared", None)
+        self._default_stream = getattr(compiled, "default_stream", None)  # the caller's current stream when the handle carries none
+        self.takes_variant_pack = self._prepared is not None
+        self._stream_handles: dict = {}
 
     def get_workspace_size(self) -> int:
         return self._workspace_bytes
 
     def execute(self, graph: "pygraph", uid_to_data, ctx: ExecutionContext) -> None:
+        if self._prepared is not None:
+            pack = uid_to_data  # a VariantPack (takes_variant_pack)
+            if pack is None:
+                raise ValueError(f"{self._name}: the graph could not normalize the variant pack for this plan")
+            ws_ptr = 0
+            if self._workspace_bytes:
+                ws_ptr, nbytes = pack.workspace, pack.workspace_bytes
+                if not ws_ptr:
+                    raise ValueError(
+                        f"{self._name} requires a {self._workspace_bytes}-byte workspace but execute() received none; allocate graph.get_workspace_size() bytes"
+                    )
+                if nbytes and nbytes < self._workspace_bytes:  # 0: a bare address, size unknown
+                    raise ValueError(
+                        f"{self._name}: needs a {self._workspace_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())"
+                    )
+            raw_stream = ctx.stream
+            if raw_stream is None:
+                # No handle stream: the caller's current stream, as the tensor path's _get_default_stream does
+                # (a legacy-stream launch would run eagerly inside a CUDA-graph capture and leave the graph empty).
+                cu_stream = self._default_stream() if self._default_stream is not None else None
+                stream_int = int(cu_stream) if cu_stream is not None else 0
+            else:
+                cu_stream = self._stream_handles.get(raw_stream)
+                if cu_stream is None:
+                    from cuda.bindings import driver as _drv
+
+                    cu_stream = self._stream_handles[raw_stream] = _drv.CUstream(raw_stream)
+                stream_int = int(raw_stream)
+            self._prepared.execute(pack, ws_ptr, cu_stream, stream_int)
+            return
         # The executor's operands out of the graph-wide variant pack, keyed by
         # IR tensor identity (the binding's own key).
         resolved = {}

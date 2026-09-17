@@ -49,6 +49,38 @@ def _is_dense(dim, stride) -> bool:
     return True
 
 
+def _observed_span(data) -> Optional[int]:
+    """Element span of a caller's buffer as the CALLER describes it (``1 + sum((size-1)*stride)``,
+    numel when compact); None for a bare address or a producer without shape/stride."""
+    if data is None or type(data) is int:
+        return None
+    try:
+        shape, strides = tuple(data.shape), tuple(data.stride())
+    except (AttributeError, TypeError):
+        try:
+            return int(data.numel())
+        except (AttributeError, TypeError):
+            return None
+    n = 1
+    for extent in shape:
+        n *= int(extent)
+    if n == 0:
+        return 0
+    return 1 + sum((int(size) - 1) * int(stride) for size, stride in zip(shape, strides))
+
+
+def _producer_itemsize(data, declared_data_type) -> int:
+    """Bytes per element of the caller's buffer as the caller types it; the declaration's slot width when the producer does not say."""
+    es = getattr(data, "element_size", None)
+    if callable(es):
+        try:
+            return int(es())
+        except TypeError:
+            pass
+    slot = storage_slot_bytes(declared_data_type)
+    return int(slot) if slot else 1
+
+
 def _in_axis_order_of(shape, stride, reference_stride):
     """``(shape, stride)`` re-expressed in the axis order ``reference_stride`` uses.
 
@@ -2011,7 +2043,24 @@ class pygraph:
                 # slot that borrowed one is named here.
                 from_graph.append(i)
             ptr, tensor = self._describe(data, order[i])
-            native.set_operand(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type), _dlpack_lanes(tensor.data_type))
+            span = _observed_span(data)
+            if span is not None:  # bytes, in the PRODUCER's element width (the description below may re-type the slot)
+                span = span * _producer_itemsize(data, tensor.data_type)
+            dev = getattr(data, "device", None)
+            dev_type, dev_id = (-1, -1)
+            if dev is not None and getattr(dev, "type", None) is not None:  # a torch-like device: CUDA (2) or CPU (1); unknown stays -1
+                dev_type, dev_id = (2, int(dev.index or 0)) if dev.type == "cuda" else (1, 0)
+            native.set_operand(
+                i,
+                ptr,
+                tuple(tensor.dim),
+                tuple(tensor.stride),
+                *_dlpack_code_bits(tensor.data_type),
+                _dlpack_lanes(tensor.data_type),
+                -1 if span is None else span,
+                dev_type,
+                dev_id,
+            )
         if strict:
             hole = native.first_unfilled()
             if hole >= 0:

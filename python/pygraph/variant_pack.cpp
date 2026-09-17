@@ -160,6 +160,12 @@ struct Operand {
     std::vector<int64_t> shape;
     std::vector<int64_t> stride;  // empty means compact row-major
     bool filled = false;
+    // What the PRODUCER said about its buffer, kept apart from the effective (graph-described /
+    // overridden) geometry above: the element span it guarantees addressable (-1: unknown, a bare
+    // address) and its DLPack device (-1: unknown). An engine deriving a capacity reads these.
+    int64_t observed_bytes       = -1;  // producer's guaranteed span, in BYTES (its own element width)
+    int32_t observed_device_type = -1;
+    int32_t observed_device_id   = -1;
 };
 
 // Slots from the base to one past the last addressed slot.
@@ -544,8 +550,18 @@ class VariantPackNative {
         } else {
             operand.stride.clear();
         }
-        operand.filled   = true;
-        pointers_[index] = operand.data;
+        operand.filled = true;
+        {
+            // A zero-element producer spans nothing: the affine formula assumes a nonempty index domain.
+            const int64_t elems    = numel_of(operand.shape) == 0 ? 0
+                                     : operand.stride.empty()     ? numel_of(operand.shape)
+                                                                  : span_of(operand.shape, operand.stride);
+            const int64_t bytes    = (static_cast<int64_t>(t.dtype.bits) * t.dtype.lanes + 7) / 8;
+            operand.observed_bytes = elems * bytes;
+        }
+        operand.observed_device_type = static_cast<int32_t>(t.device.device_type);
+        operand.observed_device_id   = t.device.device_id;
+        pointers_[index]             = operand.data;
         return true;
     }
 
@@ -588,11 +604,17 @@ class VariantPackNative {
                 std::vector<int64_t> stride,
                 int dtype_code,
                 int dtype_bits,
-                int dtype_lanes = 1) {
-        Operand &operand = operands_.at(index);
-        operand.data     = reinterpret_cast<void *>(ptr);
-        operand.ndim     = static_cast<int32_t>(shape.size());
-        operand.dtype    = DLDataType{
+                int dtype_lanes          = 1,
+                int64_t observed_bytes   = -1,
+                int observed_device_type = -1,
+                int observed_device_id   = -1) {
+        Operand &operand             = operands_.at(index);
+        operand.observed_bytes       = observed_bytes;
+        operand.observed_device_type = observed_device_type;
+        operand.observed_device_id   = observed_device_id;
+        operand.data                 = reinterpret_cast<void *>(ptr);
+        operand.ndim                 = static_cast<int32_t>(shape.size());
+        operand.dtype                = DLDataType{
             static_cast<uint8_t>(dtype_code), static_cast<uint8_t>(dtype_bits), static_cast<uint16_t>(dtype_lanes)};
         operand.shape    = std::move(shape);
         operand.stride   = std::move(stride);
@@ -754,6 +776,37 @@ class VariantPackNative {
     int64_t
     pointer(size_t index) const {
         return reinterpret_cast<int64_t>(pointers_.at(index));
+    }
+
+    // The producer's guaranteed span in BYTES (-1 unknown) and DLPack (device_type, device_id) (-1, -1 unknown).
+    int64_t
+    observed_bytes(size_t index) const {
+        return operands_.at(index).observed_bytes;
+    }
+
+    // Every fact an engine binds from, for several operands, in ONE crossing:
+    // (pointer, dtype_code, dtype_bits, device_type, device_id, observed_bytes, shape, stride) per index.
+    py::list
+    facts(const std::vector<size_t> &indices) const {
+        py::list out;
+        for (size_t index : indices) {
+            const Operand &operand = operands_.at(index);
+            out.append(py::make_tuple(reinterpret_cast<int64_t>(pointers_.at(index)),
+                                      static_cast<int>(operand.dtype.code),
+                                      static_cast<int>(operand.dtype.bits),
+                                      operand.observed_device_type,
+                                      operand.observed_device_id,
+                                      operand.observed_bytes,
+                                      operand.shape,
+                                      stride(index)));
+        }
+        return out;
+    }
+
+    std::pair<int32_t, int32_t>
+    observed_device(size_t index) const {
+        const Operand &operand = operands_.at(index);
+        return {operand.observed_device_type, operand.observed_device_id};
     }
 
     std::vector<int64_t>
@@ -1030,7 +1083,10 @@ its parts.
              py::arg("stride"),
              py::arg("dtype_code"),
              py::arg("dtype_bits"),
-             py::arg("dtype_lanes") = 1)
+             py::arg("dtype_lanes")          = 1,
+             py::arg("observed_bytes")       = -1,
+             py::arg("observed_device_type") = -1,
+             py::arg("observed_device_id")   = -1)
         .def("override_operand",
              &VariantPackNative::override_operand,
              py::arg("index"),
@@ -1044,6 +1100,9 @@ its parts.
         .def("operand_contiguous", &VariantPackNative::operand_contiguous)
         .def("is_filled", &VariantPackNative::is_filled)
         .def("pointer", &VariantPackNative::pointer)
+        .def("observed_bytes", &VariantPackNative::observed_bytes)
+        .def("facts", &VariantPackNative::facts)
+        .def("observed_device", &VariantPackNative::observed_device)
         .def("shape", &VariantPackNative::shape)
         .def("stride", &VariantPackNative::stride)
         .def("dtype", &VariantPackNative::dtype)

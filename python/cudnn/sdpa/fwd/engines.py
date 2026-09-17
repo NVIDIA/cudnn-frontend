@@ -1908,6 +1908,19 @@ def lower_dsl_prefill(
     _execute.binding = binding
     _execute.kernel_template = kernel_template
     _execute.execute_resolved = _execute_by_tensor
+    _execute.prepared = None
+    if (
+        facts.thd
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and not synth_kv_padding
+        and bias_src is None
+        and gate_src is None
+        and getattr(api, "_thd_spec", None) is not None
+    ):
+        from cudnn.sdpa.fwd.prepared import PreparedThdLaunch
+
+        _execute.prepared = PreparedThdLaunch(api._thd_spec, binding)
+        _execute.default_stream = lambda: api._get_default_stream(None)
     return _execute
 
 
