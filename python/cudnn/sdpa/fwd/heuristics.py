@@ -952,12 +952,15 @@ def _yields_to_backend(spec: EngineSpec, facts) -> bool:
     NOT on the flavor ``_selected_d_shape`` picks: an envelope graph pads
     FROST's operands to the flavor's width while the backend runs it at its
     own, so the flavor's measurement does not transfer -- on B200 (b=32, page
-    16, bf16, S_q=1) every envelope shape measured behind the backend while
-    its flavor led: (64, 64) on d128 32/8 203 vs 46 us, 32/32 658 vs 129 us,
-    64/8 (GPT-OSS) 183 vs 46 us, (96, 96) 32/8 205 vs 63 us, and the mixed
+    16, bf16, S_q=1) the d128 envelope shapes measured behind the backend
+    while their flavor led: (64, 64) 32/8 203 vs 46 us, 32/32 658 vs 129 us,
+    64/8 (GPT-OSS) 183 vs 46 us, (96, 96) 32/8 205 vs 63 us; so did the mixed
     dims #1096 admits onto the d256 envelope, (256, 128) 32/32 644 vs 491 us
     and (64, 192) 32/8 164-178 vs 127-135 us. A measured envelope shape claims
-    the lead by naming its pair. Placement only: ``mismatch`` still admits the
+    the lead by naming its pair: (192, 192) on the d256 envelope measured
+    ahead of the backend (32/32 686 vs 863 us, 32/8 178 vs 259 us, 64/8 183
+    vs 251 us; b=8 32/8 71 vs 76 us -- the backend runs d192 at its d256 cost
+    too) and is claimed on the sm100 row. Placement only: ``mismatch`` still admits the
     graph, so an autotune, a pin, or a barred backend reaches the proposal;
     and with no backend plan the walk lands on it anyway (see
     ``engines/heuristics._assemble``).

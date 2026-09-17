@@ -810,8 +810,10 @@ class EngineSpec:
     # earns the lead. Keyed on the exact pair, NOT on the flavor
     # ``_selected_d_shape`` picks: an envelope graph pads FROST's operands to
     # the flavor's width while the backend runs it at its own, so a flavor's
-    # measurement does not transfer to the shapes riding its envelope (each
-    # one measured behind the backend on B200 while its flavor led; see
+    # measurement does not transfer to the shapes riding its envelope -- in
+    # either direction: on B200 the d128 envelope shapes measured behind the
+    # backend while their flavor led, and (192, 192) on the d256 envelope
+    # measured ahead of it and claims its own pair (see
     # fwd/heuristics._yields_to_backend). Empty by default: a freshly wired
     # paged flavor yields until its decode is measured, shape by shape.
     paged_decode_lead_d_shapes: frozenset = frozenset()
@@ -880,16 +882,22 @@ def _sm100_spec() -> EngineSpec:
         lower=partial(lower_dsl_prefill, api_type=_SM100),
         # Paged decode (S_q <= 8) leads the backend's plan on the native
         # (256, 256) shape (B200, S_kv 2-4k: 61-67 us vs 76 us; b=32, page 16,
-        # bf16, S_q=1: 32/32 MHA 778 vs 830 us, 32/8 201 vs 267 us) and on the
+        # bf16, S_q=1: 32/32 MHA 778 vs 830 us, 32/8 201 vs 267 us), on the
         # native (128, 128), the shape the paged decode tests pin to FROST
-        # while its decode-shaped tile is pending. Exact pairs: the shapes
-        # served zero-padded on these flavors' envelopes do NOT inherit the
-        # claim -- each measured behind the backend at decode ((64, 64) 32/8
-        # 203 vs 46 us, (96, 96) 205 vs 63 us on the d128 envelope; (256, 128)
-        # 32/32 644 vs 491 us and (64, 192) 32/8 164-178 vs 127-135 us on the
-        # d256 envelope once #1096 admits them) -- and a flavor wired into
-        # paged_kv without a claim here yields at decode.
-        paged_decode_lead_d_shapes=frozenset({(128, 128), (256, 256)}),
+        # while its decode-shaped tile is pending, and on (192, 192), the one
+        # envelope shape measured so far that leads: the backend runs d192 at
+        # its d256 cost too, so the zero-padding costs FROST nothing extra
+        # (B200, b=32, page 16, bf16, S_q=1, FROST vs the backend's plan:
+        # 32/32 MHA 686 vs 863 us, 32/8 178 vs 259 us, 64/8 183 vs 251 us,
+        # 32/8 page 128 176 vs 245 us; b=8 32/8 71 vs 76 us). Exact pairs:
+        # the other shapes served zero-padded on these flavors' envelopes do
+        # NOT inherit a claim -- each of the measured ones ran behind the
+        # backend at decode ((64, 64) 32/8 203 vs 46 us, (96, 96) 205 vs 63
+        # us on the d128 envelope; (256, 128) 32/32 644 vs 491 us and
+        # (64, 192) 32/8 164-178 vs 127-135 us on the d256 envelope once #1096
+        # admits them) -- and a flavor wired into paged_kv without a claim
+        # here yields at decode.
+        paged_decode_lead_d_shapes=frozenset({(128, 128), (192, 192), (256, 256)}),
     )
 
 

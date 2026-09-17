@@ -525,19 +525,24 @@ def test_recommend_paged_decode_envelope_shapes_yield_until_claimed_exactly(monk
     """The lead claim is keyed on the exact (d_qk, d_v) pair, not on the flavor the
     lowering selects: an envelope graph pads FROST's operands to the flavor's width
     while the backend runs the graph at its own, so the flavor's measurement does not
-    transfer. By the row's own data every envelope shape this row admits yields --
-    (64, 64) and (96, 96) on the claimed d128 flavor, (192, 192) on the claimed d256
-    flavor -- both kinds, while the native (128, 128) and (256, 256) lead (B200, b=32,
-    page 16, bf16, s_q=1, FROST leading vs the backend's plan: (64, 64) 32/8 203 vs 46
-    us, (96, 96) 32/8 205 vs 63 us; native (256, 256) 32/32 778 vs 830, 32/8 201 vs
-    267 us). A measured envelope shape claims the lead by naming its exact pair, and
-    its envelope siblings do not ride along."""
-    for d_qk, d_v in ((64, 64), (96, 96), (192, 192)):
+    transfer. By the row's own data an unclaimed envelope shape yields -- (64, 64) and
+    (96, 96) on the claimed d128 flavor, (184, 184) on the claimed d256 flavor -- both
+    kinds, while the native (128, 128) and (256, 256) lead (B200, b=32, page 16, bf16,
+    s_q=1, FROST leading vs the backend's plan: (64, 64) 32/8 203 vs 46 us, (96, 96)
+    32/8 205 vs 63 us; native (256, 256) 32/32 778 vs 830, 32/8 201 vs 267 us). A
+    measured envelope shape claims the lead by naming its exact pair, and its envelope
+    siblings do not ride along: (192, 192) on the d256 envelope measured AHEAD of the
+    backend (32/32 686 vs 863 us, 32/8 178 vs 259 us, 64/8 183 vs 251 us; b=8 32/8 71
+    vs 76 us) and is claimed -- INVERTED from yielding -- while (184, 184), riding the
+    same flavor, still yields."""
+    for d_qk, d_v in ((64, 64), (96, 96), (184, 184)):
         for kind in ("A", "FALLBACK"):
             plans = recommend(kind, _paged_decode_facts(d_qk=d_qk, d_v=d_v), _OFFERED)
             assert plans and all(p.yield_to_backend for p in plans), (kind, d_qk, d_v, plans)
-    for d in (128, 256):
-        assert not any(p.yield_to_backend for p in recommend("A", _paged_decode_facts(d_qk=d, d_v=d), _OFFERED))
+    for d in (128, 192, 256):
+        for kind in ("A", "FALLBACK"):
+            plans = recommend(kind, _paged_decode_facts(d_qk=d, d_v=d), _OFFERED)
+            assert plans and not any(p.yield_to_backend for p in plans), (kind, d, plans)
     _with_lead_shapes(monkeypatch, {(128, 128), (256, 256), (96, 96)})
     assert not any(p.yield_to_backend for p in recommend("A", _paged_decode_facts(d_qk=96, d_v=96), _OFFERED)), "the exact pair claims the lead"
     assert all(p.yield_to_backend for p in recommend("A", _paged_decode_facts(d_qk=64, d_v=64), _OFFERED)), "its envelope siblings do not ride along"

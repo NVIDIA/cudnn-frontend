@@ -99,7 +99,7 @@ MMA as d=512.
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ᵇ · ✅ᵍ |
-| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ (d128 envelope; backend-first at `S_q ≤ 8`) | ✅ᵖ | ❌ | ✅ᵖ (native (256, 256) leads; envelope shapes backend-first at `S_q ≤ 8`) | ❌ | ❌ |
+| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ (d128 envelope; backend-first at `S_q ≤ 8`) | ✅ᵖ | ❌ | ✅ᵖ ((256, 256) and the measured (192, 192) lead; other envelope shapes backend-first at `S_q ≤ 8`) | ❌ | ❌ |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ᵖ **Paged KV (issue #920), f16/bf16 only, d128 and d256 flavors** (`d_qk, d_v <= 256`;
@@ -127,19 +127,25 @@ sequence's live pages are TMA-OOB zero-filled). Placement, not eligibility: at
 decode shapes (`S_q <= 8`) a paged graph whose exact (D_QK, D_V) shape carries no
 `paged_decode_lead_d_shapes` claim on its engine row ranks its FROST plan *after* the
 backend's (backend-first default; the FROST plan stays selectable) — the native
-(128, 128) and (256, 256) shapes claim the lead today. **The claim is per exact
+(128, 128) and (256, 256) shapes and the measured (192, 192) claim the lead today. **The claim is per exact
 shape, not per flavor**: an envelope graph pads FROST's operands to the flavor's
 width while the backend runs it at its own, so the flavor's measurement does not
 transfer — on B200 (cuDNN 9.26, `b = 32`, page 16, bf16, `S_q = 1`, FROST leading vs
 the backend's plan) (64, 64) 32/8 measured **203 vs 46 µs**, 32/32 658 vs 129 µs, 64/8
 (GPT-OSS) 183 vs 46 µs and (96, 96) 32/8 205 vs 63 µs, while the native (256, 256) led
-(32/32 778 vs 830 µs, 32/8 201 vs 267 µs). d=64 / d=96 on the d128 envelope and
-d=192/192 on the d256 one are therefore backend-first at decode (the FROST plan is
-offered behind the backend's; the public `select_plan(i)` on its index in
-`graph.plans`, or `deselect_engines` on the backend's plan names, reach it —
+(32/32 778 vs 830 µs, 32/8 201 vs 267 µs). d=64 / d=96 on the d128 envelope, and
+every envelope shape not yet measured, are therefore backend-first at decode (the
+FROST plan is offered behind the backend's; the public `select_plan(i)` on its index
+in `graph.plans`, or `deselect_engines` on the backend's plan names, reach it —
 `select_engine` in the tests is a helper wrapping the former:
 `test_paged_decode_envelope_shapes_yield_to_the_backend`). A measured envelope shape
-claims the lead by naming its exact pair.
+claims the lead by naming its exact pair: (192, 192) on the d256 envelope is the
+first — the backend runs d192 at its d256 cost too, so FROST's zero-padding costs
+nothing extra, and it measured ahead (same setup, FROST vs the backend's plan: 32/32
+**686 vs 863 µs**, 32/8 178 vs 259 µs, 64/8 183 vs 251 µs, 32/8 page 128 176 vs 245
+µs; `b = 8` 32/8 71 vs 76 µs — `test_paged_decode_shipped_flavors_lead_the_backend[d256_envelope_192]`);
+its d256-envelope siblings (d=184, ...) do not ride along
+(`test_paged_decode_envelope_shapes_yield_to_the_backend[d256_envelope_184]`).
 
 ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**
 (`Capabilities.pack_gqa_partial_d_shapes = {(128, 128), (256, 256)}`, `Cfg.PACK_G`).

@@ -419,11 +419,16 @@ def _yield_paged_decode(monkeypatch):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", [128, 192, 256], ids=["native_128", "d256_envelope_192", "native_256"])
 def test_paged_decode_shipped_flavors_lead_the_backend(d):
     """Unpinned: the heuristics' own ranking puts the FROST proposal first on the
-    two claimed native shapes, and the build walk runs it. (The placement rule
-    ships inert for native d128 / d256; this pins that.)"""
+    claimed shapes, and the build walk runs it: the two native shapes (the placement
+    rule ships inert for native d128 / d256; this pins that) and (192, 192), the one
+    envelope shape measured ahead of the backend (B200, b=32, page 16, bf16, S_q=1,
+    FROST vs the backend's plan: 32/32 686 vs 863 us, 32/8 178 vs 259 us, 64/8 183
+    vs 251 us; b=8 32/8 71 vs 76 us -- the backend runs d192 at its d256 cost too),
+    INVERTED from the envelope-yield test below, where d=184 now stands for the
+    unclaimed d256 envelope."""
     from cudnn.sdpa.fwd.engines import engine_name
 
     _, g = _run_graph(2, 8, 2, d, 16, 8, [100, 77], hnd=False, stats=True, select=None, return_graph=True)
@@ -432,17 +437,19 @@ def test_paged_decode_shipped_flavors_lead_the_backend(d):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [64, 96, 192], ids=["d128_envelope_64", "d128_envelope_96", "d256_envelope_192"])
+@pytest.mark.parametrize("d", [64, 96, 184], ids=["d128_envelope_64", "d128_envelope_96", "d256_envelope_184"])
 def test_paged_decode_envelope_shapes_yield_to_the_backend(d):
     """An envelope shape does not inherit its flavor's lead claim: UNPINNED at s_q = 1
     the backend's plan ranks first and the walk runs it (selected_engine is None; the
     output matched the reference), every backend entry of the block precedes the FROST
     plan, and the FROST plan is still offered. d=64 and d=96 ride the CLAIMED d128
-    flavor and d=192 the claimed d256 flavor, yet FROST pads their operands to the
+    flavor and d=184 the claimed d256 flavor, yet FROST pads their operands to the
     flavor's width while the backend runs them at their own -- B200, b=32, page 16,
     bf16, FROST leading vs the backend's plan: (64, 64) 32/8 203 vs 46 us, 32/32 658
-    vs 129 us, (96, 96) 32/8 205 vs 63 us; the native (128, 128) and (256, 256) lead
-    (the test above). INVERTED from the flavor keying, under which these shapes led."""
+    vs 129 us, (96, 96) 32/8 205 vs 63 us; the native (128, 128) and (256, 256) lead,
+    and so does (192, 192), the d256 envelope shape that measured ahead and claims its
+    exact pair (the test above) -- its unclaimed sibling d=184 does not ride along.
+    INVERTED from the flavor keying, under which these shapes led."""
     from frost_test_utils import offers_engine
     from cudnn.sdpa.fwd.engines import engine_name
 
