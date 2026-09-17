@@ -999,6 +999,8 @@ def build_proj_gemm(
     tile when 256 divides N, else the auto pick), so ``plan.tile_config_name`` /
     ``plan.mma_tile_k_bytes`` name what runs.
 
+    Without ``mma_tile_k_bytes`` a FORCED block-scale tile follows the engine's
+    ``preferred_mma_tile_k_bytes`` (64 on SM 10.7, else the named config's 32).
     ``mma_tile_k_bytes`` (block-scale only; 32 or 64) re-targets the resolved
     config's MMA-instruction K width through ``tile_config.as_mma_tile_k`` --
     PR-B decision D15: the width is A/B'd, never assumed.  ``None`` keeps the
@@ -1207,6 +1209,18 @@ def build_proj_gemm(
             cfg = as_mma_tile_k(cfg, mma_tile_k_bytes)
             if cfg.mma_tile_k_bytes != mma_tile_k_bytes:
                 raise ValueError(f"{label}: config {cfg.name!r} cannot issue mma_tile_k_bytes={mma_tile_k_bytes} (it stays at {cfg.mma_tile_k_bytes})")
+        elif block_scale and name:
+            # A FORCED name carries the catalog's K=32 spelling, which would silently pin the block-scale GEMM to the
+            # narrow MMA form the engine's own auto path abandons on Rubin (`preferred_mma_tile_k_bytes`: 64 wherever the
+            # active GPU issues the 64-byte block-scale MMA, 32 elsewhere -- so SM100 is unchanged).  Measured on the
+            # 397B geometry, perf node c09 @2376 MHz, S=16K: MXFP8 qkv+gate proj 0.344 -> 0.298 ms (82 -> 95 % of the fp8
+            # MMA peak), the mixed fp8 x fp4 row 0.332 -> 0.268 ms, the fp4 x fp4 out proj 0.114 -> 0.107 (NVFP4) /
+            # 0.113 -> 0.102 ms (MXFP4); every S in {4K, 16K, 32K} and every mode moved the same way, so the forced tile
+            # follows the engine's preference and an explicit `mma_tile_k_bytes` stays the override.
+            from cudnn.gemm.frost.graph_analyzer import analyze
+            from cudnn.gemm.frost.kernel_registry import preferred_mma_tile_k_bytes
+
+            cfg = as_mma_tile_k(cfg, preferred_mma_tile_k_bytes(analyze(g)))
         try:
             compiled = jit_from_cudnn_graph(g, config=cfg)
         except Exception as exc:  # a config this shape cannot take is a FALLBACK, not a failure

@@ -73,6 +73,21 @@ _E8M0 = getattr(torch, "float8_e8m0fnu", None)
 _FP4 = getattr(torch, "float4_e2m1fn_x2", None)
 _SENTINEL = 1.5e30
 _FORCED_K32 = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+
+
+def _default_forced_tile():
+    """The tile the block's forced 256-wide config resolves to WITHOUT an explicit ``mma_tile_k_bytes``: the catalog's
+    K=32 name re-targeted to the engine's preferred MMA K width (``kernel_registry.preferred_mma_tile_k_bytes`` -- 64 on
+    SM 10.7, where the 64-byte block-scale MMA is silicon, else 32).  Returns ``(tile_config_name, mma_tile_k_bytes)``."""
+    from cudnn.gemm.frost.kernel_registry import MMA_INST_K64_ARCH_RANGES
+    from cudnn.gemm.frost.sm100.compiler import _current_arch
+
+    arch = _current_arch()
+    if arch is not None and any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES):
+        return _FORCED_K32.replace("x32_", "x64_"), 64
+    return _FORCED_K32, 32
+
+
 # The 397B geometry: stage (1) is M x K=d_model x N=n_qkvg; stage (6) is M x K=h_q*d_head x N=d_model.
 _D_MODEL, _N_QKVG, _HQ_D = 4096, 17408, 32 * 256
 # FP4 E2M1 value table, indexed by the 4-bit code; LOW nibble = even k (gemm_test_utils.unpack_fp4).
@@ -597,7 +612,7 @@ def test_graph_declares_logical_dims_fp4_dtypes_and_block_sized_scales(fmt, monk
     m, k, n = 256, 512, 512
     a_word, w_word, sf_name, block = _PAIRS[fmt]
     plan = build_pair(m, k, n, fmt)
-    assert seen["config"].name == _FORCED_K32, describe(plan)
+    assert seen["config"].name == _default_forced_tile()[0], describe(plan)
     assert (plan.dtype, plan.w_dtype, plan.block_size, plan.sf_dtype) == (_torch_dt(a_word), _torch_dt(w_word), block, _cudnn_sf(sf_name)), describe(plan)
     assert plan.block_scale and plan.route in ("graph+jit", "jit-only"), describe(plan)
     assert plan.a.get_dim() == [1, m, k] and plan.a.get_stride() == [m * k, k, 1], (plan.a.get_dim(), plan.a.get_stride())
@@ -652,8 +667,8 @@ def test_fp4_pairs_match_fake_quant_at_the_blocks_shapes(fmt, m, k, n, mma_tile_
     case = fp4_case(m, k, n, fmt)
     plan = build_pair(m, k, n, fmt, mma_tile_k_bytes=mma_tile_k_bytes)
     assert plan.jit is not None and plan.route in ("graph+jit", "jit-only"), describe(plan)
-    want_cfg = _FORCED_K32 if mma_tile_k_bytes is None else _FORCED_K32.replace("x32_", "x64_")
-    assert plan.tile_config_name == want_cfg and plan.mma_tile_k_bytes == (32 if mma_tile_k_bytes is None else 64), describe(plan)
+    want = _default_forced_tile() if mma_tile_k_bytes is None else (_FORCED_K32.replace("x32_", "x64_"), 64)
+    assert (plan.tile_config_name, plan.mma_tile_k_bytes) == want, describe(plan)
     out = launch(plan, case)
     stats = check_bf16_of_fp32(out, case["ref32"], f"{fmt} {m}x{k}x{n}")
     print(f"\n[{fmt} {m}x{k}x{n}] {describe(plan)} | {stats}")
