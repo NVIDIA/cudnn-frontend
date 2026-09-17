@@ -346,10 +346,10 @@ class TensorRef:
         if self.grouped_by_moe:
             if len(self.dim) != 3:
                 raise ValueError(f"per-group aux {self.name!r} must be rank-3; got dim {self.dim}")
-            if self.dim[1] != 1:
-                raise ValueError(f"per-group aux {self.name!r} must broadcast the M axis (dim[1] == 1); got dim {self.dim}")
-            if self.bcast_mode not in ("scalar", "per_col"):
-                raise ValueError(f"per-group aux {self.name!r} supports scalar or per_col broadcast; " f"got {self.bcast_mode!r}")
+            if self.dim[1] != 1 and self.dim[2] != 1:
+                raise ValueError(f"per-group aux {self.name!r} must broadcast an M/N axis; got dim {self.dim}")
+            if self.bcast_mode not in ("scalar", "per_col", "per_row"):
+                raise ValueError(f"per-group aux {self.name!r} supports scalar, per_col or per_row broadcast; " f"got {self.bcast_mode!r}")
 
 
 # Producing-operation references — "where does this op's input come from?".
@@ -651,6 +651,11 @@ class MoeSpec:
             raise ValueError(f"first_token_offset alignment_value must be >= 1; " f"got {self.offset_multiple}")
 
 
+@dataclass(frozen=True)
+class MoeSwapAbSpec(MoeSpec):
+    """Internal weight-by-token grouped matmul, with groups partitioning N."""
+
+
 def _walk_dtype_fields(obj: object, found: "set[Dtype]", *, in_dtype_field: bool = False) -> None:
     """Recursive half of :meth:`FusionChain.dtypes_used`. A field counts when its
     declared type mentions ``Dtype``; containers inherit that from their field."""
@@ -735,6 +740,10 @@ class FusionChain:
         for g, (ai, bi) in enumerate(self.gemm_operands):
             if not (0 <= ai < self.num_a_operands) or not (0 <= bi < self.num_b_operands):
                 raise ValueError(f"gemm_operands[{g}]=({ai},{bi}) out of range for " f"{self.num_a_operands} A / {self.num_b_operands} B operands")
+        token_axis = 2 if isinstance(self.moe, MoeSwapAbSpec) else 1
+        for aux in self.aux_tensors:
+            if aux.grouped_by_moe and (self.moe is None or aux.dim[token_axis] != 1):
+                raise ValueError(f"per-group aux {aux.name!r} must broadcast the MoE token axis {token_axis}; got dim {aux.dim}")
         names = {t.name for t in self.aux_tensors}
         if len(names) != len(self.aux_tensors):
             raise ValueError("aux_tensors contain duplicate names")
@@ -958,11 +967,8 @@ def swap_ab(chain: FusionChain) -> FusionChain:
 
     Quantization axes and scale metadata follow the transpose; the ordinary
     quantization support checks decide whether the resulting layout can run.
-    MoE still requires a scheduler that routes ranges along N instead of M.
+    MoE lowers to a distinct internal operation whose groups partition N.
     """
-
-    if chain.has_moe:
-        raise NotImplementedError("swap_ab is not supported for MoE: routed groups partition M, not N")
 
     def _mn(values):
         if values is None or len(values) < 2:
@@ -1060,4 +1066,5 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         mainloop_a_load_dtype=chain.mainloop_b_load_dtype,
         mainloop_b_load_dtype=chain.mainloop_a_load_dtype,
         block_scale=block_scale,
+        moe=(MoeSpec if isinstance(chain.moe, MoeSwapAbSpec) else MoeSwapAbSpec)(**dataclasses.asdict(chain.moe)) if chain.has_moe else None,
     )

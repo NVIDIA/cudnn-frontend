@@ -15,7 +15,7 @@ from ..fusion_ir import (
     Dtype,
     FusionChain,
     FusionOp,
-    MatmulSpec,
+    MoeSwapAbSpec,
     ReductionSpec,
     TensorRef,
     gemm_index,
@@ -764,7 +764,7 @@ def _emit_reduction_atomic(
     red_idx: int,
     red: ReductionSpec,
     source_var: str,
-    matmul: "MatmulSpec",
+    chain: FusionChain,
     vsize: int,
     row_pred: str | None = None,
 ) -> list[str]:
@@ -775,7 +775,7 @@ def _emit_reduction_atomic(
     reduction is present, which is what makes the chunk-level column test exact:
     a chunk is wholly inside N or wholly past it, so the fold over it never mixes
     real columns with OOB ones."""
-    body = _emit_reduction_atomic_body(tap_idx, red_idx, red, source_var, matmul, vsize)
+    body = _emit_reduction_atomic_body(tap_idx, red_idx, red, source_var, chain, vsize)
     if row_pred is None:
         return body
     return [f"if ({row_pred}) & (col_j + {vsize} <= N):"] + [f"    {ln}" for ln in body]
@@ -786,22 +786,22 @@ def _emit_reduction_atomic_body(
     red_idx: int,
     red: ReductionSpec,
     source_var: str,
-    matmul: "MatmulSpec",
+    chain: FusionChain,
     vsize: int,
 ) -> list[str]:
     src = f"_red_{red_idx}_src"
     lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
     if red.mode == "avg":
-        n_factor = matmul.N if red.dim[2] == 1 else 1
-        if red.grouped_by_moe:
-            if red.dim[1] == 1:
-                lines.append(
-                    f"_red_{red_idx}_inv = cutlass.Float32(1.0) / (cutlass.Float32({n_factor}) * cutlass.Float32(cutlass.Int32(group_end) - cutlass.Int32(group_begin)))"
-                )
-            else:
-                lines.append(f"_red_{red_idx}_inv = cutlass.Float32({1.0 / n_factor})")
+        if chain.has_moe:
+            extents = ["M", "N"]
+            if red.grouped_by_moe:
+                extents[1 if isinstance(chain.moe, MoeSwapAbSpec) else 0] = "cutlass.Int32(group_end) - cutlass.Int32(group_begin)"
+            count = " * ".join(f"cutlass.Float32({extent})" for dim, extent in zip(red.dim[1:], extents) if dim == 1)
+            count = count or "cutlass.Float32(1.0)"
+            lines.append(f"_red_{red_idx}_inv = cutlass.Float32(1.0) / ({count})")
         else:
-            count = n_factor * (matmul.M if red.dim[1] == 1 else 1) * (matmul.batch if red.dim[0] == 1 else 1)
+            matmul = chain.matmul
+            count = (matmul.N if red.dim[2] == 1 else 1) * (matmul.M if red.dim[1] == 1 else 1) * (matmul.batch if red.dim[0] == 1 else 1)
             lines.append(f"_red_{red_idx}_inv = cutlass.Float32({1.0 / count})")
     if red.dim[2] == 1:
         combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
@@ -1543,7 +1543,7 @@ def generate(
 
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)
-        body_lines.extend(_emit_reduction_atomic(_tap_of[len(specs) + red_idx], red_idx, red, red_source, chain.matmul, vsize, store_row_pred))
+        body_lines.extend(_emit_reduction_atomic(_tap_of[len(specs) + red_idx], red_idx, red, red_source, chain, vsize, store_row_pred))
 
     # Split-K partial store handling
     if split_k_slices > 1:

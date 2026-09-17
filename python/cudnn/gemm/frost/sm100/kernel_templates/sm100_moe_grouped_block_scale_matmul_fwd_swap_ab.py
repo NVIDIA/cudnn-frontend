@@ -1,28 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""sm100 MoE grouped block-scale matmul fwd (nvfp4 / mxfp4 / mxfp8,
-including mixed MXFP8/MXFP4 on baseline SM100 K32 and Rubin K64).
-
-A one-sided-dequant graph keeps the ordinary block-scale MMA.  Its raw FP8
-side has no runtime SF/SMEM/TMA path; four epilogue warps seed the fake side's
-32-row TMEM image across the four warp partitions before MMA starts.
-
-Serves both MMA modes; ``cta_group`` is an injected tile constant.
-
-  cta_group=1  single-CTA MMA — every CTA runs its own MMA on its own
-               SMEM/TMEM, no leader-follower pair.
-  cta_group=2  2-CTA MMA cluster pair — the leader CTA issues the MMA while the
-               follower consumes the scheduler ring only. SFB is loaded FULL per
-               CTA, so the pair's accumulator region spans the full tile N.
-
-``mma_inst_k_bytes`` selects the MMA-inst K width (64 is SM 10.7+ silicon, gated
-by validate_block_scale_config); at 32 every SF word is one utccp atom.
-
-Blocks that genuinely differ between the two MMA modes are expressed with
-``cutlass.const_expr(cta_group == N)`` or, where an arm is not statement-shaped,
-with ``@@CTA{1,2}_ONLY@@`` marker regions that the renderer strips.
-"""
+"""SM100 grouped block-scale weight-by-token forward."""
 
 from __future__ import annotations
 
@@ -31,13 +10,11 @@ from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
-    reset_moe_sched_counter as _reset_moe_sched_counter,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
     fence_tensormap_acquire as _fence_tensormap_acquire,
     fence_tensormap_release as _fence_tensormap_release,
     moe_swizzle_tile as _moe_swizzle_tile,
-    moe_load_sched_word as _moe_load_sched_word,
     replace_tensormap_global_address as _replace_tensormap_global_address,
     replace_tensormap_global_dim_0 as _replace_tensormap_global_dim_0,
     replace_tensormap_global_dim_1 as _replace_tensormap_global_dim_1,
@@ -46,6 +23,7 @@ from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
     tcgen05_dealloc as _tcgen05_dealloc,
     tcgen05_mma_block_scale as _tcgen05_mma_block_scale,
     TENSOR_MAP_QWORDS,
+    reset_moe_sched_counter as _reset_moe_sched_counter,
 )
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass
@@ -55,14 +33,9 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as _cuda
 
-# A TMA tensormap is 128 bytes = 16 int64 qwords. The per-group A descriptor
-# replacement keeps a per-CTA SMEM copy, patches base/M-dim there, then publishes
-# it to the per-CTA GMEM workspace the TMA reads.
 # @@INJECT_TILE_CONSTANTS@@
 
-# Tensormap workspace slots per CTA: every A operand, each real SFA, plus the
-# output descriptors that are re-dimensioned per routed group.
-moe_desc_slots = num_a_operands + num_sfa_operands + n_tma_outputs
+moe_desc_slots = num_b_operands + num_sfb_operands + n_tma_outputs
 _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
 
 if use_acc_overlap and any(_w != epi_n for _, _w in _epi_subtile_spans(epi_cols_per_mma_m, epi_n)):
@@ -82,21 +55,16 @@ TMEM_SCALE_ONE_BARRIER_ID = 3
 
 
 @cute.jit
-def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
-    """N-super-block width for one routed group, resolved per group.
-
-    Same rule as the dense path, but the "M side" is THIS group's token slice, not the
-    whole token tensor: block along the shorter of (group tokens, expert weight), capped
-    by what L2 can hold onto. A group spanning one m-tile makes both orders identical.
-    """
+def _moe_auto_swizzle_w(m, group_tokens, k, nt_n):
+    """N-super-block width for one routed group."""
     if cutlass.const_expr(tile_swizzle_n > 0):
         return tile_swizzle_n
     budget = cutlass.Int64(swizzle_l2_budget_bytes)
     row_bytes = (cutlass.Int64(ab_max_data_bits) * k) // 8
     cap = cutlass.max(budget // (row_bytes * cgrp_tile_mnk[1]), cutlass.Int64(1))
     w = cutlass.min(cutlass.Int64(nt_n), cap)
-    rows = cutlass.Int64(group_rows)
-    if cutlass.min(rows, n) * row_bytes <= budget and rows <= n:
+    rows = cutlass.Int64(m)
+    if cutlass.min(rows, group_tokens) * row_bytes <= budget and rows <= group_tokens:
         w = cutlass.Int64(1)
     return cutlass.Int32(w)
 
@@ -143,7 +111,7 @@ def _kernel(
     num_experts: cutlass.Int32,
     num_groups: cutlass.Int32,
     first_token_offset: cute.Tensor,
-    a_tma_workspace: cute.Tensor,
+    tma_workspace: cute.Tensor,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
     # @@INJECT_MOE_KERNEL_MA_PARAMS@@
     # @@INJECT_MOE_KERNEL_MSFA_PARAMS@@
@@ -200,7 +168,7 @@ def _kernel(
     if cutlass.const_expr(cta_group == 2):
         sched_counter_ptr = cute.make_ptr(
             cutlass.Int32,
-            (a_tma_workspace.iterator.raw_ptr() + grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS).toint(),
+            (tma_workspace.iterator.raw_ptr() + grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS).toint(),
             mem_space=cute.AddressSpace.generic,
         )
 
@@ -222,7 +190,7 @@ def _kernel(
     if cutlass.const_expr(cta_group == 1):
         sched_counter_ptr = cute.make_ptr(
             cutlass.Int32,
-            (a_tma_workspace.iterator.raw_ptr() + grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS).toint(),
+            (tma_workspace.iterator.raw_ptr() + grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS).toint(),
             mem_space=cute.AddressSpace.generic,
         )
 
@@ -286,23 +254,23 @@ def _kernel(
     sched_bcast_slot = cutlass.Array(cutlass.Int32, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=16)
     sched_bcast_full_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
     sched_bcast_empty_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
-    tma_a_desc_smem_list = [
+    tma_b_desc_smem_list = [
         cutlass.Array(
             cutlass.Int64,
             TENSOR_MAP_QWORDS,
             space=cutlass.AddressSpace.smem,
             alignment=128,
         )
-        for _ in range(num_a_operands)
+        for _ in range(num_b_operands)
     ]
-    tma_sfa_desc_smem_list = [
+    tma_sfb_desc_smem_list = [
         cutlass.Array(
             cutlass.Int64,
             TENSOR_MAP_QWORDS,
             space=cutlass.AddressSpace.smem,
             alignment=128,
         )
-        for _ in range(num_sfa_operands)
+        for _ in range(num_sfb_operands)
     ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
@@ -456,21 +424,17 @@ def _kernel(
 
     M = m
     N = n
-    clusters_along_n = cute.ceil_div(cutlass.Int32(N), cgrp_tile_mnk[1])
+    clusters_along_m = cute.ceil_div(cutlass.Int32(M), cgrp_tile_mnk[0])
     num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
     first_token_arr = cutlass.make_array_view(first_token_offset)
 
     if warp_idx == scheduler_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
-        # PDL launch completion alone does not make predecessor writes visible.
-        # The scheduler consumes the reset counter and live offsets itself.
-        if cutlass.const_expr(USE_PDL):
-            nvvm.griddepcontrol("wait")
         full_warp_mask = 0xFFFFFFFF
         shfl_idx_clamp = 0x1F
         shfl_up_clamp = 0
         lane = cute.arch.lane_idx()
-        gemm_s = cutlass.Int32(M)
+        gemm_s = cutlass.Int32(N)
         sched_stage = cutlass.Int32(0)
         sched_empty_phase = cutlass.Int32(1)
         bcast_stage = cutlass.Int32(0)
@@ -481,8 +445,8 @@ def _kernel(
         linear_idx = cutlass.Int32(0)
         start_linear_idx = cutlass.Int32(0)
         total_tiles = cutlass.Int32(0)
-        start_sf_block_m = cutlass.Int32(0)
-        total_sf_blocks_m = cutlass.Int32(0)
+        start_sf_block_n = cutlass.Int32(0)
+        total_sf_blocks_n = cutlass.Int32(0)
         group_idx = cutlass.Int32(0)
         is_tile_valid = cutlass.Int32(1)
         cached_next_end = cutlass.Int32(0)
@@ -526,8 +490,7 @@ def _kernel(
                 time_limit=10_000_000,
             ):
                 pass
-            linear_idx = _moe_load_sched_word((sched_bcast_slot.subview(bcast_stage)))
-            nvvm.bar_warp_sync(0xFFFFFFFF)
+            linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
             if lane == 0:
                 nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
             if cutlass.const_expr(cluster_size > 1):
@@ -575,11 +538,11 @@ def _kernel(
                     else:
                         cached_next_begin = tile_start_idx
 
-                    group_m = cached_group_end - cached_group_begin
-                    total_tiles = cute.ceil_div(group_m, cgrp_tile_mnk[0]) * clusters_along_n
-                    total_sf_blocks_m = cute.ceil_div(group_m, 128)
+                    group_tokens = cached_group_end - cached_group_begin
+                    total_tiles = cute.ceil_div(group_tokens, cgrp_tile_mnk[1]) * clusters_along_m
+                    total_sf_blocks_n = cute.ceil_div(group_tokens, 128)
                     prefix_tiles = total_tiles
-                    prefix_sf = total_sf_blocks_m
+                    prefix_sf = total_sf_blocks_n
                     for delta in (1, 2, 4, 8, 16):
                         prefix_delta = nvvm.shfl_sync(
                             full_warp_mask,
@@ -599,7 +562,7 @@ def _kernel(
                             prefix_tiles += prefix_delta
                             prefix_sf += prefix_sf_delta
                     start_linear_idx += prefix_tiles - total_tiles
-                    start_sf_block_m += prefix_sf - total_sf_blocks_m
+                    start_sf_block_n += prefix_sf - total_sf_blocks_n
                     thread_succeed = nvvm.vote_sync(
                         full_warp_mask,
                         linear_idx < start_linear_idx + total_tiles,
@@ -628,9 +591,9 @@ def _kernel(
                             shfl_idx_clamp,
                             nvvm.Shfl.IDX,
                         )
-                        start_sf_block_m = nvvm.shfl_sync(
+                        start_sf_block_n = nvvm.shfl_sync(
                             full_warp_mask,
-                            start_sf_block_m,
+                            start_sf_block_n,
                             winning_lane,
                             shfl_idx_clamp,
                             nvvm.Shfl.IDX,
@@ -682,8 +645,8 @@ def _kernel(
                                 shfl_idx_clamp,
                                 nvvm.Shfl.IDX,
                             )
-                            next_start_sf = start_sf_block_m + total_sf_blocks_m
-                            start_sf_block_m = nvvm.shfl_sync(
+                            next_start_sf = start_sf_block_n + total_sf_blocks_n
+                            start_sf_block_n = nvvm.shfl_sync(
                                 full_warp_mask,
                                 next_start_sf,
                                 31,
@@ -696,12 +659,12 @@ def _kernel(
             coord_n = cutlass.Int32(0)
             if is_tile_valid != 0:
                 local_linear_idx = linear_idx - start_linear_idx
-                group_nt_m = total_tiles // clusters_along_n
+                group_nt_n = total_tiles // clusters_along_m
                 cluster_tile_m, coord_n = _moe_swizzle_tile(
                     local_linear_idx,
-                    group_nt_m,
-                    clusters_along_n,
-                    _moe_auto_swizzle_w(group_nt_m * cgrp_tile_mnk[0], N, k, clusters_along_n),
+                    clusters_along_m,
+                    group_nt_n,
+                    _moe_auto_swizzle_w(M, group_nt_n * cgrp_tile_mnk[1], k, group_nt_n),
                 )
                 coord_expert = group_idx % num_experts
 
@@ -719,7 +682,7 @@ def _kernel(
                 (slot.subview(3)).store(is_tile_valid)
                 (slot.subview(4)).store(group_begin)
                 (slot.subview(5)).store(group_end)
-                (slot.subview(6)).store(start_sf_block_m)
+                (slot.subview(6)).store(start_sf_block_n)
                 (slot.subview(7)).store(group_idx)
                 nvvm.mbarrier_arrive(sched_full_mbar_ptr.subview(sched_stage))
 
@@ -757,39 +720,39 @@ def _kernel(
 
         lane = tidx % 32
         block_linear = bidx + bidy * gridx
-        cta_desc_base_list = [a_tma_workspace.iterator.raw_ptr() + (block_linear * moe_desc_slots + _ai) * TENSOR_MAP_QWORDS for _ai in range(num_a_operands)]
-        a_desc_tma_ptr_list = [
+        cta_desc_base_list = [tma_workspace.iterator.raw_ptr() + (block_linear * moe_desc_slots + _ai) * TENSOR_MAP_QWORDS for _ai in range(num_b_operands)]
+        b_desc_tma_ptr_list = [
             cute.make_ptr(
                 cutlass.Int64,
                 cta_desc_base_list[_ai].toint(),
                 mem_space=cute.AddressSpace.generic,
             )
-            for _ai in range(num_a_operands)
+            for _ai in range(num_b_operands)
         ]
-        sfa_desc_base_list = [
-            a_tma_workspace.iterator.raw_ptr() + (block_linear * moe_desc_slots + num_a_operands + _ai) * TENSOR_MAP_QWORDS for _ai in range(num_sfa_operands)
+        sfb_desc_base_list = [
+            tma_workspace.iterator.raw_ptr() + (block_linear * moe_desc_slots + num_b_operands + _ai) * TENSOR_MAP_QWORDS for _ai in range(num_sfb_operands)
         ]
-        sfa_desc_tma_ptr_list = [
+        sfb_desc_tma_ptr_list = [
             cute.make_ptr(
                 cutlass.Int64,
-                sfa_desc_base_list[_ai].toint(),
+                sfb_desc_base_list[_ai].toint(),
                 mem_space=cute.AddressSpace.generic,
             )
-            for _ai in range(num_sfa_operands)
+            for _ai in range(num_sfb_operands)
         ]
-        sfa_block_bytes = 512 * (((k // block_size) + 3) // 4)
+        sfb_block_bytes = 512 * (((k // block_size) + 3) // 4)
         previous_group_begin = cutlass.Int32(-1)
         if cutlass.const_expr(moe_aligned_offsets):
-            a_desc_load_list = [tma_a_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
-            sfa_desc_load_list = [tma_sfa_descs[_ai].get_ptr() for _ai in range(num_sfa_operands)]
+            b_desc_load_list = [tma_b_descs[_ai].get_ptr() for _ai in range(num_b_operands)]
+            sfb_desc_load_list = [tma_sfb_descs[_ai].get_ptr() for _ai in range(num_sfb_operands)]
         else:
-            a_desc_load_list = a_desc_tma_ptr_list
-            sfa_desc_load_list = sfa_desc_tma_ptr_list
+            b_desc_load_list = b_desc_tma_ptr_list
+            sfb_desc_load_list = sfb_desc_tma_ptr_list
         if elect_one and cutlass.const_expr(not moe_aligned_offsets):
-            for _ai in cutlass.range_constexpr(num_a_operands):
-                _copy_tensormap_to_workspace(tma_a_descs[_ai].get_ptr(), tma_a_desc_smem_list[_ai])
-            for _ai in cutlass.range_constexpr(num_sfa_operands):
-                _copy_tensormap_to_workspace(tma_sfa_descs[_ai].get_ptr(), tma_sfa_desc_smem_list[_ai])
+            for _ai in cutlass.range_constexpr(num_b_operands):
+                _copy_tensormap_to_workspace(tma_b_descs[_ai].get_ptr(), tma_b_desc_smem_list[_ai])
+            for _ai in cutlass.range_constexpr(num_sfb_operands):
+                _copy_tensormap_to_workspace(tma_sfb_descs[_ai].get_ptr(), tma_sfb_desc_smem_list[_ai])
         nvvm.bar_warp_sync(0xFFFFFFFF)
 
         while is_valid != 0:
@@ -800,15 +763,13 @@ def _kernel(
             ):
                 pass
             slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-            coord_expert = _moe_load_sched_word((slot.subview(0)))
-            tile_m = _moe_load_sched_word((slot.subview(1)))
-            tile_n = _moe_load_sched_word((slot.subview(2)))
-            is_valid = _moe_load_sched_word((slot.subview(3)))
-            group_begin = _moe_load_sched_word((slot.subview(4)))
-            group_end = _moe_load_sched_word((slot.subview(5)))
-            start_sf_block_m = _moe_load_sched_word((slot.subview(6)))
-            # Converge consumers before releasing their scheduler slot.
-            nvvm.bar_warp_sync(0xFFFFFFFF)
+            coord_expert = (slot.subview(0)).load()
+            tile_m = (slot.subview(1)).load()
+            tile_n = (slot.subview(2)).load()
+            is_valid = (slot.subview(3)).load()
+            group_begin = (slot.subview(4)).load()
+            group_end = (slot.subview(5)).load()
+            start_sf_block_n = (slot.subview(6)).load()
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1
@@ -817,46 +778,40 @@ def _kernel(
                 sched_full_phase = sched_full_phase ^ 1
 
             if is_valid != 0:
-                coord_m_group = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
-                if cutlass.const_expr(cta_group == 1):
-                    coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * cta_tile_mnk[1]
-                else:
-                    coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
-                    coord_n_pair = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n
+                coord_m_weight = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
+                coord_n_group = tile_n * cgrp_tile_mnk[1] + n_rank * (cta_tile_mnk[1] * cta_group)
                 if cutlass.const_expr(moe_aligned_offsets):
-                    coord_m_desc = group_begin + coord_m_group
+                    coord_n_desc = group_begin + coord_n_group
                 else:
-                    coord_m_desc = coord_m_group
-                sfa_m_block = coord_m_desc // 128
-                if cutlass.const_expr(cta_group == 1):
-                    sfb_n_block = coord_n_per_cta // 128
-                else:
-                    sfb_n_block = coord_n_pair // 128
+                    coord_n_desc = coord_n_group
+                coord_n_per_cta = coord_n_desc + pair_member * cta_tile_mnk[1]
+                sfa_m_block = coord_m_weight // 128
+                sfb_n_block = coord_n_desc // 128
 
                 if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets):
                     previous_group_begin = group_begin
-                    for _ai in cutlass.range_constexpr(num_a_operands):
-                        _fence_tensormap_acquire(a_desc_tma_ptr_list[_ai])
-                    for _ai in cutlass.range_constexpr(num_a_operands):
+                    for _ai in cutlass.range_constexpr(num_b_operands):
+                        _fence_tensormap_acquire(b_desc_tma_ptr_list[_ai])
+                    for _ai in cutlass.range_constexpr(num_b_operands):
                         if elect_one:
-                            row_base = mA_list[_ai].iterator.raw_ptr().toint() + ((group_begin * a_stride_m_list[_ai] * a_dtype.width) >> 3)
-                            _replace_tensormap_global_address(tma_a_desc_smem_list[_ai], row_base)
-                            _replace_tensormap_global_dim_1(tma_a_desc_smem_list[_ai], group_end - group_begin)
+                            row_base = mB_list[_ai].iterator.raw_ptr().toint() + ((group_begin * b_stride_n_list[_ai] * b_dtype.width) >> 3)
+                            _replace_tensormap_global_address(tma_b_desc_smem_list[_ai], row_base)
+                            _replace_tensormap_global_dim_1(tma_b_desc_smem_list[_ai], group_end - group_begin)
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         if lane < TENSOR_MAP_QWORDS:
-                            (cta_desc_base_list[_ai] + lane).store((tma_a_desc_smem_list[_ai].subview(lane)).load())
+                            (cta_desc_base_list[_ai] + lane).store((tma_b_desc_smem_list[_ai].subview(lane)).load())
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         _fence_tensormap_release()
-                    for _ai in cutlass.range_constexpr(num_sfa_operands):
-                        _fence_tensormap_acquire(sfa_desc_tma_ptr_list[_ai])
-                    for _ai in cutlass.range_constexpr(num_sfa_operands):
+                    for _ai in cutlass.range_constexpr(num_sfb_operands):
+                        _fence_tensormap_acquire(sfb_desc_tma_ptr_list[_ai])
+                    for _ai in cutlass.range_constexpr(num_sfb_operands):
                         if elect_one:
-                            sfa_base = mSFA_list[_ai].iterator.raw_ptr().toint() + start_sf_block_m * sfa_block_bytes
-                            _replace_tensormap_global_address(tma_sfa_desc_smem_list[_ai], sfa_base)
-                            _replace_tensormap_global_dim_2(tma_sfa_desc_smem_list[_ai], cute.ceil_div(group_end - group_begin, 128))
+                            sfb_base = mSFB_list[_ai].iterator.raw_ptr().toint() + start_sf_block_n * sfb_block_bytes
+                            _replace_tensormap_global_address(tma_sfb_desc_smem_list[_ai], sfb_base)
+                            _replace_tensormap_global_dim_2(tma_sfb_desc_smem_list[_ai], cute.ceil_div(group_end - group_begin, 128))
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         if lane < TENSOR_MAP_QWORDS:
-                            (sfa_desc_base_list[_ai] + lane).store((tma_sfa_desc_smem_list[_ai].subview(lane)).load())
+                            (sfb_desc_base_list[_ai] + lane).store((tma_sfb_desc_smem_list[_ai].subview(lane)).load())
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         _fence_tensormap_release()
 
@@ -905,8 +860,8 @@ def _kernel(
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     smem_sfa_list[_ai].subview(sfa_smem_bytes * stage),
-                                    sfa_desc_load_list[_ai],
-                                    (0, coord_sf_k, sfa_m_block, cutlass.Int32(0)),
+                                    tma_sfa_descs[_ai].get_ptr(),
+                                    (0, coord_sf_k, sfa_m_block, coord_expert),
                                     sf_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_a,
@@ -917,8 +872,8 @@ def _kernel(
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     smem_sfb_list[_bj].subview(sfb_smem_bytes * stage),
-                                    tma_sfb_descs[_bj].get_ptr(),
-                                    (0, coord_sf_k, sfb_n_block, coord_expert),
+                                    sfb_desc_load_list[_bj],
+                                    (0, coord_sf_k, sfb_n_block, cutlass.Int32(0)),
                                     sf_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_b,
@@ -927,47 +882,43 @@ def _kernel(
 
                     if a_data_issue:
                         for _ai in cutlass.range_constexpr(num_a_operands):
-                            for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
-                                if elect_one:
-                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        smem_a_list[_ai].subview(sA_elems * stage + _a_off * a_packed_per_row + _am * a_tma_box_m * a_packed_per_row),
-                                        a_desc_load_list[_ai],
-                                        (coord_k, coord_m_desc + _a_off + _am * a_tma_box_m, cutlass.Int32(0)),
-                                        ab_full_mbar_ptr.subview(stage),
-                                        [],
-                                        multicast_mask=tma_mcast_mask_a,
-                                        group=_CTA_GROUP,
-                                    )
-                    if b_data_issue:
-                        for _bj in cutlass.range_constexpr(num_b_operands):
-                            sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
-                            if cutlass.const_expr(b_is_n_major):
-                                for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                            sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
+                            if cutlass.const_expr(a_is_m_major):
+                                for m_group in cutlass.range_constexpr(cta_tile_mnk[0] // a_tma_group_elems):
                                     if elect_one:
                                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                            sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),
-                                            tma_b_descs[_bj].get_ptr(),
-                                            (
-                                                coord_n_per_cta + n_group * b_tma_group_elems,
-                                                coord_k,
-                                                coord_expert,
-                                            ),
+                                            sA_stage.subview(m_group * a_tma_group_elems * cta_tile_mnk[2]),
+                                            tma_a_descs[_ai].get_ptr(),
+                                            (coord_m_weight + m_group * a_tma_group_elems, coord_k, coord_expert),
                                             ab_full_mbar_ptr.subview(stage),
                                             [],
-                                            multicast_mask=tma_mcast_mask_b,
+                                            multicast_mask=tma_mcast_mask_a,
                                             group=_CTA_GROUP,
                                         )
                             else:
-                                if elect_one:
-                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sB_stage.subview(_b_off * b_packed_per_row),
-                                        tma_b_descs[_bj].get_ptr(),
-                                        (coord_k, coord_n_per_cta + _b_off, coord_expert),
-                                        ab_full_mbar_ptr.subview(stage),
-                                        [],
-                                        multicast_mask=tma_mcast_mask_b,
-                                        group=_CTA_GROUP,
-                                    )
+                                for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                            sA_stage.subview(_a_off * a_packed_per_row + _am * a_tma_box_m * a_packed_per_row),
+                                            tma_a_descs[_ai].get_ptr(),
+                                            (coord_k, coord_m_weight + _a_off + _am * a_tma_box_m, coord_expert),
+                                            ab_full_mbar_ptr.subview(stage),
+                                            [],
+                                            multicast_mask=tma_mcast_mask_a,
+                                            group=_CTA_GROUP,
+                                        )
+                    if b_data_issue:
+                        for _bj in cutlass.range_constexpr(num_b_operands):
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                    smem_b_list[_bj].subview(sB_elems * stage + _b_off * b_packed_per_row),
+                                    b_desc_load_list[_bj],
+                                    (coord_k, coord_n_per_cta + _b_off, cutlass.Int32(0)),
+                                    ab_full_mbar_ptr.subview(stage),
+                                    [],
+                                    multicast_mask=tma_mcast_mask_b,
+                                    group=_CTA_GROUP,
+                                )
                     ab_iter += 1
 
         tail_stage = ab_iter % ab_stages
@@ -1131,9 +1082,7 @@ def _kernel(
                     time_limit=10_000_000,
                 ):
                     pass
-                is_valid = _moe_load_sched_word((sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)))
-                # Converge consumers before releasing their scheduler slot.
-                nvvm.bar_warp_sync(0xFFFFFFFF)
+                is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
                 if elect_one:
                     nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                 sched_stage += 1
@@ -1413,9 +1362,7 @@ def _kernel(
                         time_limit=10_000_000,
                     ):
                         pass
-                    is_valid = _moe_load_sched_word((sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)))
-                    # Converge consumers before releasing their scheduler slot.
-                    nvvm.bar_warp_sync(0xFFFFFFFF)
+                    is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
                     if elect_one:
                         nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                     sched_stage += 1
@@ -1592,9 +1539,7 @@ def _kernel(
                         time_limit=10_000_000,
                     ):
                         pass
-                    is_valid = _moe_load_sched_word((sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)))
-                    # Converge consumers before releasing their scheduler slot.
-                    nvvm.bar_warp_sync(0xFFFFFFFF)
+                    is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
                     if elect_one:
                         nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                     sched_stage += 1
@@ -1659,11 +1604,10 @@ def _kernel(
 
         # @@TMA_STORE_ONLY:BEGIN@@
         epi_stage_idx = cutlass.Int32(EPI_SMEM_STAGES - 1)
-        # The routed output is one flat (S, N) TMA surface.
         tile_l = cutlass.Int32(0)
         epi_block_linear = bidx + bidy * gridx
         d_desc_base_list = [
-            a_tma_workspace.iterator.raw_ptr() + (epi_block_linear * moe_desc_slots + num_a_operands + num_sfa_operands + _di) * TENSOR_MAP_QWORDS
+            tma_workspace.iterator.raw_ptr() + (epi_block_linear * moe_desc_slots + num_b_operands + num_sfb_operands + _di) * TENSOR_MAP_QWORDS
             for _di in range(n_tma_outputs)
         ]
         d_desc_ptr_list = [cute.make_ptr(cutlass.Int64, _b.toint(), mem_space=cute.AddressSpace.generic) for _b in d_desc_base_list]
@@ -1684,23 +1628,22 @@ def _kernel(
                 pass
             if cutlass.const_expr(cta_group == 1):
                 _slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-                tile_m = _moe_load_sched_word((_slot.subview(1)))
-                tile_n = _moe_load_sched_word((_slot.subview(2)))
-                is_valid = _moe_load_sched_word((_slot.subview(3)))
-                group_begin = _moe_load_sched_word((_slot.subview(4)))
-                group_end = _moe_load_sched_word((_slot.subview(5)))
-                start_sf_block_m = _moe_load_sched_word((_slot.subview(6)))
-                group_idx = _moe_load_sched_word((_slot.subview(7)))
+                tile_m = (_slot.subview(1)).load()
+                tile_n = (_slot.subview(2)).load()
+                is_valid = (_slot.subview(3)).load()
+                group_begin = (_slot.subview(4)).load()
+                group_end = (_slot.subview(5)).load()
+                start_sf_block_n = (_slot.subview(6)).load()
+                group_idx = (_slot.subview(7)).load()
             else:
                 slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-                tile_m = _moe_load_sched_word((slot.subview(1)))
-                tile_n = _moe_load_sched_word((slot.subview(2)))
-                is_valid = _moe_load_sched_word((slot.subview(3)))
-                group_begin = _moe_load_sched_word((slot.subview(4)))
-                group_end = _moe_load_sched_word((slot.subview(5)))
-                start_sf_block_m = _moe_load_sched_word((slot.subview(6)))
-                group_idx = _moe_load_sched_word((slot.subview(7)))
-            # Converge consumers before releasing their scheduler slot.
+                tile_m = (slot.subview(1)).load()
+                tile_n = (slot.subview(2)).load()
+                is_valid = (slot.subview(3)).load()
+                group_begin = (slot.subview(4)).load()
+                group_end = (slot.subview(5)).load()
+                start_sf_block_n = (slot.subview(6)).load()
+                group_idx = (slot.subview(7)).load()
             nvvm.bar_warp_sync(0xFFFFFFFF)
             sched_stage = cute.arch.make_warp_uniform(sched_stage)
             if elect_one:
@@ -1711,12 +1654,10 @@ def _kernel(
                 sched_full_phase = sched_full_phase ^ 1
 
             if is_valid != 0:
-                coord_m_tile = group_begin + tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
+                coord_m_tile = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
                 # @@TMA_STORE_ONLY:BEGIN@@
-                # Re-dimension D to this group's last row so the hardware clips the
                 # ragged tail; the base stays put, so the store coords are global.
                 # Under `moe_aligned_offsets` no tile crosses `group_end` in the
-                # first place -- `cgrp_tile_m` divides every group -- so the clip
                 # has nothing to clip and the original descriptor serves.
                 if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets):
                     if group_end != previous_group_end:
@@ -1729,9 +1670,9 @@ def _kernel(
                             _fence_tensormap_acquire(d_desc_ptr_list[_di])
                             if elect_one:
                                 if cutlass.const_expr(tma_c_m_major[_di]):
-                                    _replace_tensormap_global_dim_0(_scratch, group_end)
-                                else:
                                     _replace_tensormap_global_dim_1(_scratch, group_end)
+                                else:
+                                    _replace_tensormap_global_dim_0(_scratch, group_end)
                             nvvm.bar_warp_sync(0xFFFFFFFF)
                             if lane < TENSOR_MAP_QWORDS:
                                 (d_desc_base_list[_di] + lane).store((_scratch.subview(lane)).load())
@@ -1739,7 +1680,7 @@ def _kernel(
                         _fence_tensormap_release()
                 # @@TMA_STORE_ONLY:END@@
                 # @@EPILOGUE_DRAIN:BEGIN@@
-                coord_n_c = tile_n * cgrp_tile_mnk[1] + n_rank * (cta_tile_mnk[1] * cta_group)
+                coord_n_c = group_begin + tile_n * cgrp_tile_mnk[1] + n_rank * (cta_tile_mnk[1] * cta_group)
 
                 acc_stage = tile_iter % acc_stages
                 if acc_stage == 0 and tile_iter != 0:
@@ -1824,10 +1765,10 @@ def _kernel(
                         # @@TMA_STORE_ONLY:END@@
 
                         # @@STG_ONLY:BEGIN@@
-                        if row_active and row < group_end:
+                        if row_active and row < M:
                             for j in cutlass.range_constexpr(subtile_w // vsize):
                                 col_j = col + j * vsize
-                                if col_j + vsize <= N:
+                                if col_j < group_end:
                                     vec_f32 = c_rmem_vec[j * vsize : (j + 1) * vsize]
 
                                     # @@INJECT_STG_VEC_BINDINGS@@
@@ -1848,12 +1789,6 @@ def _kernel(
     if warp_idx == unused_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
 
-    # DSM broadcasts can outlive one CTA's final tile. Keep every peer's
-    # shared storage alive until the whole cluster has finished its accesses.
-    if cutlass.const_expr(cluster_size > 1):
-        nvvm.barrier_cluster_arrive_relaxed()
-        nvvm.barrier_cluster_wait()
-
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
@@ -1862,7 +1797,7 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 def _host(
     problem_size: tuple,
     first_token_offset: cute.Tensor,
-    a_tma_workspace: cute.Tensor,
+    tma_workspace: cute.Tensor,
     # @@INJECT_HOST_AB_PARAMS@@
     # @@INJECT_HOST_TAP_PARAMS@@
     # @@INJECT_HOST_AUX_PARAMS@@
@@ -1910,62 +1845,53 @@ def _host(
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
         a_stride_m, a_stride_k, a_stride_l = _a_stride_sets[_a_idx]
-        tma_a_desc_list.append(
-            _tma.create_tensor_map_tiled(
-                global_address=_a_op.iterator.toint(),
-                dtype=a_tma_desc_dtype,
-                global_dims=[k_sym, m, 1],
-                global_strides=[
-                    a_stride_m * a_dtype.width // 128,
-                    a_stride_l * a_dtype.width // 128,
-                ],
-                box_dims=[cta_tile_mnk[2], a_tma_box_m, 1],
-                swizzle=a_tma_swizzle,
-                tma_format=a_tma_format,
-            )
-        )
-    tma_b_desc_list = []
-    for _b_idx, _b_op in enumerate(_b_operands):
-        b_stride_n, b_stride_k, b_stride_l = _b_stride_sets[_b_idx]
-        if cutlass.const_expr(b_is_n_major):
-            tma_b_desc_list.append(
+        if cutlass.const_expr(a_is_m_major):
+            tma_a_desc_list.append(
                 _tma.create_tensor_map_tiled(
-                    global_address=_b_op.iterator.toint(),
-                    dtype=b_tma_desc_dtype,
-                    global_dims=[n, k_sym, num_experts],
-                    global_strides=[
-                        b_stride_k * b_dtype.width // 128,
-                        b_stride_l * b_dtype.width // 128,
-                    ],
-                    box_dims=[b_tma_group_elems, cta_tile_mnk[2], 1],
-                    swizzle=b_tma_swizzle,
-                    tma_format=b_tma_format,
+                    global_address=_a_op.iterator.toint(),
+                    dtype=a_tma_desc_dtype,
+                    global_dims=[m, k_sym, num_experts],
+                    global_strides=[a_stride_k * a_dtype.width // 128, a_stride_l * a_dtype.width // 128],
+                    box_dims=[a_tma_group_elems, cta_tile_mnk[2], 1],
+                    swizzle=a_tma_swizzle,
+                    tma_format=a_tma_format,
                 )
             )
         else:
-            tma_b_desc_list.append(
+            tma_a_desc_list.append(
                 _tma.create_tensor_map_tiled(
-                    global_address=_b_op.iterator.toint(),
-                    dtype=b_tma_desc_dtype,
-                    global_dims=[k_sym, n, num_experts],
-                    global_strides=[
-                        b_stride_n * b_dtype.width // 128,
-                        b_stride_l * b_dtype.width // 128,
-                    ],
-                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1],
-                    swizzle=b_tma_swizzle,
-                    tma_format=b_tma_format,
+                    global_address=_a_op.iterator.toint(),
+                    dtype=a_tma_desc_dtype,
+                    global_dims=[k_sym, m, num_experts],
+                    global_strides=[a_stride_m * a_dtype.width // 128, a_stride_l * a_dtype.width // 128],
+                    box_dims=[cta_tile_mnk[2], a_tma_box_m, 1],
+                    swizzle=a_tma_swizzle,
+                    tma_format=a_tma_format,
                 )
             )
+    tma_b_desc_list = []
+    for _b_idx, _b_op in enumerate(_b_operands):
+        b_stride_n, b_stride_k, b_stride_l = _b_stride_sets[_b_idx]
+        tma_b_desc_list.append(
+            _tma.create_tensor_map_tiled(
+                global_address=_b_op.iterator.toint(),
+                dtype=b_tma_desc_dtype,
+                global_dims=[k_sym, n, 1],
+                global_strides=[b_stride_n * b_dtype.width // 128, b_stride_l * b_dtype.width // 128],
+                box_dims=[cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1],
+                swizzle=b_tma_swizzle,
+                tma_format=b_tma_format,
+            )
+        )
     rest_k = ((k_sym // block_size) + 3) // 4
-    rest_m = (m + 127) // 128 + num_groups
-    rest_n = (n + 127) // 128
+    rest_m = (m + 127) // 128
+    rest_n = (n + 127) // 128 + num_groups
     tma_sfa_desc_list = []
     for _sfa_op in _sfa_operands:
         sfa_fp16_tensor = cute.make_tensor(
             cute.recast_ptr(_sfa_op.iterator, dtype=cutlass.Float16),
             cute.make_layout(
-                (256, rest_k, rest_m, 1),
+                (256, rest_k, rest_m, num_experts),
                 stride=(
                     1,
                     256,
@@ -1988,7 +1914,7 @@ def _host(
         sfb_fp16_tensor = cute.make_tensor(
             cute.recast_ptr(_sfb_op.iterator, dtype=cutlass.Float16),
             cute.make_layout(
-                (256, rest_k, rest_n, num_experts),
+                (256, rest_k, rest_n, 1),
                 stride=(
                     1,
                     256,
@@ -2011,7 +1937,7 @@ def _host(
     cluster_n = cluster_shape_mnk[1]
     grid_shape = (grid_num_clusters * cluster_m, cluster_n, 1)
     counter_qword = grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS
-    _reset_moe_sched_counter(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    _reset_moe_sched_counter(tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],
@@ -2019,7 +1945,7 @@ def _host(
         cutlass.Int32(num_experts),
         cutlass.Int32(num_groups),
         first_token_offset,
-        a_tma_workspace,
+        tma_workspace,
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
         # @@INJECT_MOE_HOST_MA_PASS@@
         # @@INJECT_MOE_HOST_MSFA_PASS@@
@@ -2044,7 +1970,7 @@ def compile() -> Callable:
     a_stride_elems = 16 // (a_dtype.width // 8)
     b_stride_elems = 16 // (b_dtype.width // 8)
     sym_m = cute.sym_int64()
-    sym_n = cute.sym_int64(divisibility=out_vec_elems)
+    sym_n = cute.sym_int64(divisibility=min(out_vec_elems, moe_token_alignment))
     # K tails are supported: the K loop is ceil_div and the TMA descriptor's global K
     # extent makes a partial box HW zero-filled. The only real K rule is the 16-byte
     # TMA contiguous-extent one, already gated by _tma_alignment_reject.
@@ -2058,26 +1984,25 @@ def compile() -> Callable:
     def _make_fake_a():
         return make_fake_compact_tensor(
             a_fake_dtype,
-            (sym_m, sym_akp, 1),
-            stride_order=(1, 0, 2),
+            (sym_m, sym_akp, sym_e),
+            stride_order=(0, 1, 2) if a_is_m_major else (1, 0, 2),
             assumed_align=16,
         )
 
     def _make_fake_b():
         return make_fake_compact_tensor(
             b_fake_dtype,
-            (sym_n, sym_bkp, sym_e),
+            (sym_n, sym_bkp, 1),
             stride_order=(0, 1, 2) if b_is_n_major else (1, 0, 2),
             assumed_align=16,
         )
 
     # SF reaches the kernel as a base pointer only; the host rebuilds the
     # F8_128x4 view from problem_size. Modes 0/1 and all strides carry no
-    # contract; mode 2 keeps its literal plane count (1 for sfa, sym_e for sfb).
     def _make_fake_sfa():
         return cute.runtime.make_fake_tensor(
             sf_cutlass_dtype,
-            (cute.sym_int64(), cute.sym_int64(), 1),
+            (cute.sym_int64(), cute.sym_int64(), sym_e),
             stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
             assumed_align=16,
         )
@@ -2085,7 +2010,7 @@ def compile() -> Callable:
     def _make_fake_sfb():
         return cute.runtime.make_fake_tensor(
             sf_cutlass_dtype,
-            (cute.sym_int64(), cute.sym_int64(), sym_e),
+            (cute.sym_int64(), cute.sym_int64(), 1),
             stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
             assumed_align=16,
         )
@@ -2099,7 +2024,7 @@ def compile() -> Callable:
     cluster_m = cluster_shape_mnk[0]
     cluster_n = cluster_shape_mnk[1]
     grid_ctas = grid_num_clusters * cluster_m * cluster_n
-    fake_a_tma_workspace = make_fake_compact_tensor(
+    fake_tma_workspace = make_fake_compact_tensor(
         cutlass.Int64,
         (grid_ctas * moe_desc_slots * 16 + 16,),
         stride_order=(0,),
@@ -2154,7 +2079,7 @@ def compile() -> Callable:
         _host,
         problem_size,
         fake_first_token_offset,
-        fake_a_tma_workspace,
+        fake_tma_workspace,
         # @@INJECT_COMPILE_AB_PASS@@
         # @@INJECT_COMPILE_TAP_PASS@@
         # @@INJECT_COMPILE_AUX_PASS@@

@@ -2157,6 +2157,7 @@ def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> N
     ``tensor.fill_()`` works only while the caller happened to pass a torch
     tensor, and the variant pack exists so that it does not have to.
     """
+    fills = []
     for spec, tensor in zip(chain.outputs, outputs):
         if not spec.is_reduction:
             continue
@@ -2170,16 +2171,15 @@ def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> N
         # its range.
         shape, strides = tuple(tensor.shape), tuple(tensor.stride())
         word = buffers.init_word(red.compute_dtype, value)
-        if buffers.is_contiguous(shape, strides):
-            buffers.fill_word_async(tensor.data_ptr(), int(tensor.numel()), word, stream)
-        else:
-            buffers.fill_word_strided_async(tensor.data_ptr(), shape, strides, tensor.element_size(), word, stream)
-
-
-def _finalize_reductions(chain, out_bufs) -> None:
-    for k, o in enumerate(chain.outputs):
-        if o.source.startswith("reduction_") and chain.reductions[int(o.source.rsplit("_", 1)[1])].mode == "norm2":
-            out_bufs[k].sqrt_()
+        if tensor.element_size() != 4:
+            raise ValueError("MoE reduction outputs require 4-byte elements")
+        plan = buffers.strided_fill_plan(shape, strides)
+        if plan is None:
+            raise ValueError(f"MoE reduction output cannot write an element twice (shape {shape} stride {strides})")
+        fills.append((tensor.data_ptr(), plan, word))
+    # Validate every output before the first write, including contiguous ones.
+    for ptr, plan, word in fills:
+        buffers.apply_fill_plan(ptr, plan, word, stream)
 
 
 @dataclass
@@ -3270,6 +3270,8 @@ def _check_executable(chain: FusionChain) -> None:
     MoE is the exception and stays on its own launchers: it is >= 2 launches
     with a workspace, and has no recipe to lower from.
     """
+    if any(red.mode == "norm2" for red in chain.reductions):
+        raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
     if chain.has_moe:
         return
     if not _TVM_FFI_OK:
@@ -3277,8 +3279,6 @@ def _check_executable(chain: FusionChain) -> None:
         # same `cutedsl` extra as the DSL these kernels are written in, so a
         # build without it has no DSL either and was already declining.
         raise NotImplementedError("the tvm-ffi front door is not installed, and the launch path this engine has needs it (pip install apache-tvm-ffi)")
-    if any(red.mode == "norm2" for red in chain.reductions):
-        raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
 
 
 def _cta_k_elems(chain: FusionChain, config: TileConfig) -> int:
@@ -3431,6 +3431,7 @@ def _precheck_moe(
 ) -> None:
     from ..kernel_registry import GraphType, mma_arch_reject, select_template
 
+    _check_executable(chain)
     if chain.moe.weight_layout is not None:
         raise NotImplementedError("frost_gemm: packed MoE weight_layout is supported only by SM100 grouped GEMM")
     reason = mma_arch_reject(chain, GraphType.MOE, config.pipeline)
@@ -3486,6 +3487,7 @@ def _precheck_moe_block_scale(
 ) -> None:
     from ..kernel_registry import GraphType, mma_arch_reject, select_template
 
+    _check_executable(chain)
     reason = mma_arch_reject(chain, GraphType.MOE_BLOCK_SCALE, config.pipeline)
     if reason is not None:
         raise NotImplementedError(reason)
@@ -4009,9 +4011,7 @@ class CompiledMoeGemm:
         out = out_bufs if len(out_bufs) > 1 else out_bufs[0]
         if self.chain.is_multi_gemm or self.chain.ops:
             pairs = [(a_bufs[ai], b_bufs[bi]) for ai, bi in self.chain.gemm_operands]
-            r = self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream)
-            _finalize_reductions(self.chain, out_bufs)
-            return r
+            return self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream)
         return self._launch_single(a_bufs[0], b_bufs[0], fto, out, snk, workspace=workspace, stream=stream)
 
     def _call_multi_gemm(self, gemm_pairs, first_token_offset, output, snke, *aux, workspace=None, stream=None):
@@ -4425,9 +4425,7 @@ class CompiledMoeBlockScaleGemm:
                 )
                 for ai, bi in self.chain.gemm_operands
             ]
-            r = self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream)
-            _finalize_reductions(self.chain, out_bufs)
-            return r
+            return self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream)
         return self._launch_single(
             a_bufs[0],
             b_bufs[0],

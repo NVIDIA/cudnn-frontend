@@ -164,6 +164,38 @@ _ANALYZE_LOCK = threading.RLock()
 # Variant-pack binding — maps each graph role to its cuDNN tensor
 
 
+@dataclass(frozen=True)
+class _OperandSlice:
+    """A graph-declared, zero-copy BF16 weight view over one external operand."""
+
+    tensor: Any
+    parent: Any
+    parent_dim: tuple[int, ...]
+    parent_stride: tuple[int, ...]
+    dim: tuple[int, ...]
+    stride: tuple[int, ...]
+    byte_offset: int
+
+    def bind(self, buffer):
+        # Native variant-pack operands carry graph geometry. Direct callers
+        # must also bind the parent in its declared [E,K,N] axis order.
+        if (tuple(buffer.shape), tuple(buffer.stride())) != (self.parent_dim, self.parent_stride):
+            raise ValueError("MoE slice parent must match its declared dimensions and strides")
+        from cudnn import _pybind_module
+        from cudnn.frost.buffers import dtype_name
+
+        if dtype_name(buffer) != "bfloat16":
+            raise ValueError("MoE slice parent must be BF16")
+        device_type, device_id = buffer.__dlpack_device__()
+        if int(device_type) != 2:
+            raise ValueError("MoE slice parent must reside on a CUDA device")
+        # This is host metadata only. The view borrows the caller's allocation;
+        # it launches no conversion and allocates no device memory.
+        native = _pybind_module.VariantPackNative(1)
+        native.set_operand(0, int(buffer.data_ptr()) + self.byte_offset, list(self.dim), list(self.stride), 4, 16)
+        return native.operand(0, int(device_id))
+
+
 @dataclass
 class GemmBinding:
     """Maps each graph role to its cuDNN tensor so a compiled kernel takes a
@@ -181,6 +213,7 @@ class GemmBinding:
     sfa_operands: list[Any] = field(default_factory=list)
     sfb_operands: list[Any] = field(default_factory=list)
     first_token_offset: Any = None
+    operand_slices: list[_OperandSlice] = field(default_factory=list)
 
     def bound_tensors(self) -> list[Any]:
         ts = [
@@ -193,7 +226,15 @@ class GemmBinding:
         ]
         if self.first_token_offset is not None:
             ts.append(self.first_token_offset)
-        return [t for t in ts if t is not None]
+        ts = [t for t in ts if t is not None]
+        if not self.operand_slices:
+            return ts
+        parents = {id(view.tensor): view.parent for view in self.operand_slices}
+        external = {}
+        for tensor in ts:
+            parent = parents.get(id(tensor), tensor)
+            external.setdefault(id(parent), parent)
+        return list(external.values())
 
 
 def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
@@ -208,6 +249,7 @@ def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
         sfa_operands=list(binding.sfb_operands),
         sfb_operands=list(binding.sfa_operands),
         first_token_offset=binding.first_token_offset,
+        operand_slices=list(binding.operand_slices),
     )
 
 
@@ -303,6 +345,10 @@ def resolve_variant_pack(variant_pack: dict, binding: GemmBinding) -> dict[int, 
                 "or its name)"
             )
         resolved[id(t)] = buf
+    for view in binding.operand_slices:
+        if id(view.parent) not in resolved:
+            raise KeyError(f"variant pack is missing slice parent {view.parent.get_name()!r}")
+        resolved[id(view.tensor)] = view.bind(resolved[id(view.parent)])
     return resolved
 
 
@@ -351,6 +397,9 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
     node_type = node.node_type.name
     name = node.name
     compute = _map_dtype(node.compute_data_type)
+    if node_type == "SLICE":
+        inp, out = node.inputs["input"], node.outputs["OUT_0"]
+        return _RecordedOp("slice", name, [id(inp)], id(out), out, op_attrs=(("slices", tuple(node.params.get("slices") or ())),))
     if node_type == "MATMUL":
         A, B = node.inputs["A"], node.inputs["B"]
         out = node.outputs["C"]
@@ -2086,6 +2135,46 @@ def _build_multi_gemm_chain(
     return chain, binding
 
 
+def _lower_moe_weight_slices(ops, meta):
+    """Fold only explicit input-weight slices; reject every other slice use.
+
+    This preserves two logical GEMM operands while binding their declared
+    parent once. In particular, matching strides on independent inputs never
+    imply aliasing. General slice materialization is outside this lowering.
+    """
+    views = []
+    for op in ops:
+        if op.cudnn_name != "slice":
+            continue
+        parent, output = meta[op.inputs[0]], meta[op.output]
+        consumers = [other for other in ops if op.output in other.inputs]
+        if not parent.is_input or not consumers or any(other.cudnn_name != "moe_grouped_matmul" or other.inputs[1] != op.output for other in consumers):
+            raise NotImplementedError("Frost slice lowering supports only a direct graph-input MoE weight slice")
+        if _TENSOR_OUTPUT_FLAG.get(op.output, False):
+            raise NotImplementedError("Frost cannot materialize a MoE weight slice")
+        slices = dict(op.op_attrs)["slices"]
+        if len(parent.dim) != 3 or len(slices) != 3 or parent.dtype != "bf16" or output.dtype != "bf16":
+            raise NotImplementedError("Frost MoE weight slices require rank-3 BF16 weights")
+        if any(not isinstance(s, slice) or s.step not in (None, 1) for s in slices):
+            raise NotImplementedError("Frost MoE weight slices require unit positive steps")
+        bounds = [s.indices(int(size)) for s, size in zip(slices, parent.dim)]
+        if any((begin, end) != (0, size) for (begin, end, _), size in zip(bounds[:2], parent.dim[:2])):
+            raise NotImplementedError("Frost MoE weight slices may select only the output-feature axis")
+        dims = tuple(end - begin for begin, end, _ in bounds)
+        if min(dims) <= 0 or output.dim != dims or output.stride != parent.stride:
+            raise NotImplementedError("Frost MoE weight slices must retain the parent strides and inferred dimensions")
+        if len(parent.stride) != 3 or min(parent.stride) <= 0:
+            raise NotImplementedError("Frost MoE weight slices require positive parent strides")
+        e, k, n = parent.dim
+        se, sk, sn = parent.stride
+        if sk != 1 or sn < k or se < (n - 1) * sn + k:
+            raise NotImplementedError("Frost MoE weight slices require nonoverlapping K-major parent storage")
+        if parent.reordering is not None or output.reordering is not None:
+            raise NotImplementedError("Frost MoE weight slices do not support reordered storage")
+        views.append(_OperandSlice(output.tensor, parent.tensor, parent.dim, parent.stride, dims, parent.stride, bounds[2][0] * sn * 2))
+    return [op for op in ops if op.cudnn_name != "slice"], views
+
+
 def _build_chain(
     ops: list[_RecordedOp],
     meta: dict[int, _TensorMeta],
@@ -2097,7 +2186,13 @@ def _build_chain(
     # fto + one epilogue DAG (K == 1 with or without epilogue degenerates).
     moe_ops = [op for op in ops if op.cudnn_name == "moe_grouped_matmul"]
     if moe_ops:
-        return _build_multi_moe_chain(moe_ops, ops, meta, io_dtype, intermediate_dtype, compute_dtype)
+        ops, views = _lower_moe_weight_slices(ops, meta)
+        chain, binding = _build_multi_moe_chain(moe_ops, ops, meta, io_dtype, intermediate_dtype, compute_dtype)
+        binding.operand_slices = views
+        return chain, binding
+
+    if any(op.cudnn_name == "slice" for op in ops):
+        raise NotImplementedError("Frost slice lowering requires MoE weight operands")
 
     matmuls = [op for op in ops if op.cudnn_name == "matmul"]
     if len(matmuls) == 0:

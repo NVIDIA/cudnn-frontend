@@ -229,6 +229,42 @@ policy. Static policy requests for non-MoE graphs, or SM100 block-scaled graphs,
 are declined. SM120 uses one CTA per cluster. This policy is not passed to
 closed-source cuDNN engines.
 
+### Frost paired SwiGLU for small SM100 groups
+
+The experimental `frost_moe_swiglu_pair` engine (20401) serves two grouped
+BF16 projections followed by FP32 SwiGLU and a BF16 output. Declare the
+weights as two `graph.slice` views of one `[E, K, 2*N]` parent, with the gate
+half first and the up half second. The parent is the external variant-pack
+input; the slices are virtual graph values. No weight repack is performed
+by plan execution.
+
+This specialization supports SM100, 1 through 8 total routed rows, and
+positive `N` and `K` divisible by 64. Tokens and output must be compact;
+weight row/expert strides must be positive and 16-byte aligned. Expert starts
+are contiguous INT32 metadata with the existing monotone in-range MoE contract.
+Only standard unit-beta SwiGLU is supported: no auxiliary outputs, reductions,
+quantization, dynamic shapes, or additional pointwise operations.
+
+The engine exposes the existing public GEMM knob vocabulary. Its implemented
+record has `TILE_M=128`, `TILE_N=8`, `TILEK=128` bytes,
+`MMA_TILE_M=128`, `MMA_TILE_N=8`, `MMA_TILE_K=32` bytes,
+one CTA, `SWAP_AB=1` and `SCHED_POLICY=1`. The physical M tile includes both
+projections and produces 64 output features. Other knob combinations decline.
+The ordinary Frost engine (20400) remains available. Heuristic enumeration
+is not a performance ranking; tune the eligible complete MoE configurations.
+
+Build the execution plan before capture and provide its queried workspace.
+Execution binds the current parent pointer and caller stream without GPU
+allocation, synchronization, device reads, or compilation. Retained CUDA
+Graphs may bind distinct parent allocations to the same compiled plan.
+
+The implementation incorporates Kernel Factory's small-token candidate and
+an independently validated early-PDL change. It builds on Yanqin Zhai's
+[SM100 swap-AB implementation](https://github.com/NVIDIA/cudnn-frontend/pull/1090),
+NVIDIA CUTLASS example 113 layout concepts, and canonical rank-5 weight pairing.
+TRT-LLM gated-row interleaving informed the exploration; no TRT-LLM kernel body
+is copied. The larger-token KF candidate is not included.
+
 ### Frost SM120 shared-input fusion
 
 For ordinary forward grouped matmul, the experimental Frost SM120 engine can

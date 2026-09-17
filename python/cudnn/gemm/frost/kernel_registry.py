@@ -23,12 +23,12 @@ template-file selection."""
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
 from . import arch_family
-from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain
+from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain, MoeSwapAbSpec, swap_ab as swap_ab_graph
 from .tile_config import CATALOG, TileConfig, as_mma_tile_k, as_pipeline, config_class_for_pipeline
 
 
@@ -89,12 +89,16 @@ class GraphType(Enum):
     MATMUL = "matmul"
     BLOCK_SCALE_MATMUL = "block_scale_matmul"
     MOE = "moe"
-    MOE_BLOCK_SCALE = "moe_block_scale"  # MoE grouped matmul, block-scaled inputs
+    MOE_SWAP_AB = "moe_grouped_matmul_swap_ab"
+    MOE_BLOCK_SCALE = "moe_block_scale"
+    MOE_BLOCK_SCALE_SWAP_AB = "moe_grouped_block_scale_matmul_swap_ab"
     CONVOLUTION = "convolution"  # placeholder — no template yet
 
 
 def classify_graph_type(chain: FusionChain) -> GraphType:
     """Stage-1 classifier: which graph type this chain is."""
+    if isinstance(chain.moe, MoeSwapAbSpec):
+        return GraphType.MOE_BLOCK_SCALE_SWAP_AB if chain.has_block_scale else GraphType.MOE_SWAP_AB
     if chain.has_moe and chain.has_block_scale:
         return GraphType.MOE_BLOCK_SCALE
     if chain.has_block_scale:
@@ -194,7 +198,9 @@ _MATMUL_CASES = frozenset(
 # lookups fold to the base graph type, so MMA_TYPE_SUPPORT never carries MoE rows.
 _MMA_BASE_GRAPH_TYPE: dict[GraphType, GraphType] = {
     GraphType.MOE: GraphType.MATMUL,
+    GraphType.MOE_SWAP_AB: GraphType.MATMUL,
     GraphType.MOE_BLOCK_SCALE: GraphType.BLOCK_SCALE_MATMUL,
+    GraphType.MOE_BLOCK_SCALE_SWAP_AB: GraphType.BLOCK_SCALE_MATMUL,
 }
 
 # Per-graph-type mma-type key extractors (key SHAPES differ per graph type, so
@@ -337,6 +343,7 @@ class KernelTemplate:
         return self.graph_type in (
             GraphType.BLOCK_SCALE_MATMUL,
             GraphType.MOE_BLOCK_SCALE,
+            GraphType.MOE_BLOCK_SCALE_SWAP_AB,
         )
 
     @property
@@ -603,6 +610,16 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         graph_type=GraphType.MOE_BLOCK_SCALE,
     ),
     _mm(
+        "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        smem_fixed_reserve=4096,
+        graph_type=GraphType.MOE_SWAP_AB,
+    ),
+    _mm(
+        "sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
+        smem_fixed_reserve=4096,
+        graph_type=GraphType.MOE_BLOCK_SCALE_SWAP_AB,
+    ),
+    _mm(
         "sm103_block_scale_matmul.py",
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
         supports_multi_gemm=False,
@@ -667,7 +684,7 @@ def preferred_mma_tile_k_bytes(chain: FusionChain) -> int:
     block-scale MMA halves the instruction count at a wide tile, so take it
     whenever the ACTIVE GPU issues it — it is silicon, not a pipeline, so this
     asks the arch and not the config family. Everything else stays at 32."""
-    if classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE):
+    if classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE, GraphType.MOE_BLOCK_SCALE_SWAP_AB):
         return 32
     from . import compiler as C
 
@@ -714,10 +731,17 @@ def select_template(
     raise ValueError(f"ambiguous template match (registry bug): {[t.file for t in matches]}")
 
 
-def candidates(chain: FusionChain) -> list[tuple[KernelTemplate, TileConfig]]:
+def candidates(chain: FusionChain, *, sweep_swap_ab: bool = False) -> list[tuple[KernelTemplate, TileConfig]]:
     """Traversal-mode candidate set for ``chain`` via the funnel. Each accepted
     (template, geometry) is a JIT-able point; one geometry expands across the
     templates that accept it ({1,2}ctamma, etc.)."""
+    if sweep_swap_ab:
+        out = candidates(chain)
+        try:
+            swapped = swap_ab_graph(chain)
+        except (ValueError, NotImplementedError):
+            return out
+        return out + [(template, replace(config, swap_ab=True)) for template, config in candidates(swapped)]
     gt = classify_graph_type(chain)
     tmpls = [t for t in TEMPLATES if t.graph_type is gt]  # stage 1
     if not tmpls:

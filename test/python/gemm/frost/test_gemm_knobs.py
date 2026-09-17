@@ -239,16 +239,19 @@ def test_moe_scheduler_policy_is_separate_from_geometry():
         GemmKnobs.from_public({**dynamic.to_public(), cudnn.knob_type.SCHED_POLICY: 2})
 
 
-def test_sm120_declines_static_moe_scheduler_before_build():
+def test_sm120_static_scheduler_requires_moe_before_build():
     from dataclasses import replace
 
     from cudnn.gemm.frost.sm120.compiler import plan_config
+    from cudnn.gemm.frost.fusion_ir import FusionChain, MatmulSpec, MoeSpec
 
     config = next(config for config in CATALOG if config.pipeline == "sm120")
     dynamic = GemmKnobs.from_config(config)
     assert plan_config(None, knobs=dynamic) == config
-    with pytest.raises(NotImplementedError, match="SCHED_POLICY.*SM100"):
+    with pytest.raises(NotImplementedError, match="static SCHED_POLICY requires MoE"):
         plan_config(None, knobs=replace(dynamic, moe_sched_policy=1))
+    chain = FusionChain(MatmulSpec(M=128, N=128, K=128), moe=MoeSpec(num_experts=8))
+    assert plan_config(chain, knobs=replace(dynamic, moe_sched_policy=1)) == config
 
 
 def test_sm120_declines_packed_moe_weights_before_build():

@@ -9,10 +9,9 @@ turns the graph into facts once, ``recommend`` proposes complete
 listed plan carries the exact tile config the engine will build -- so a recorded
 ``(engine_id, knobs)`` replays the same kernel after the automatic pick changes.
 
-The proposal set is deliberately ONE entry today: the automatic strategy the
-engine picked before this module existed, now spelled out. Widening it
-(neighbouring tiles, cluster shapes, split-K) is a change confined to
-:func:`recommend`; the engine, the analyzer and the vocabulary stay as they are.
+The ordinary automatic strategy remains first. An explicit common-parent
+BF16 SwiGLU graph can also propose the paired SM100 specialization. These are
+candidates for measurement; their order does not claim a universal ranking.
 """
 
 from __future__ import annotations
@@ -36,6 +35,7 @@ class GemmFacts:
 
     chain: Any  # fusion_ir.FusionChain
     dynamic_shapes: bool  # the graph declared dynamic shapes (split-K is skipped)
+    pair: Any = None  # explicit common-parent SwiGLU facts, when supported
 
 
 def analyze_facts(graph) -> Optional[GemmFacts]:
@@ -51,28 +51,42 @@ def analyze_facts(graph) -> Optional[GemmFacts]:
     except (NotImplementedError, ValueError, KeyError) as exc:
         _LOG.debug("frost_gemm analyzer declined the graph: %s", exc)
         return None
-    return GemmFacts(chain=chain, dynamic_shapes=_graph_dynamic_shapes(graph))
+    dynamic = _graph_dynamic_shapes(graph)
+    from .moe_pair import analyze_pair
+
+    try:
+        pair = analyze_pair(graph, dynamic_shapes=dynamic)
+    except (NotImplementedError, ValueError, KeyError):
+        pair = None
+    return GemmFacts(chain=chain, dynamic_shapes=dynamic, pair=pair)
 
 
 def recommend(kind: str, facts: GemmFacts, offered: Dict[str, int]) -> List[PlanConfig]:
     """Ordered candidate plans for ``facts`` (``kind`` is ``"A"`` or ``"FALLBACK"``).
 
-    One candidate: the automatic tile strategy, gated exactly as
-    ``check_support`` gates it (cutedsl floor + the chain-level probes), so a
-    plan is listed only when the engine will build it. Its knobs are the
-    config's canonical name in the shared vocabulary.
+    Each candidate uses its engine's support gate and shared public knobs.
+    Keep the existing automatic strategy first; add the paired specialization
+    only for graphs declaring its supported parent relationship.
     """
-    engine_id = offered.get(ENGINE)
-    if engine_id is None:
-        return []
     from .compiler import plan_config, probe_chain, probe_cutedsl
 
-    try:
-        probe_cutedsl()
-        config = plan_config(facts.chain, dynamic_shapes=facts.dynamic_shapes)
-        probe_chain(facts.chain, config)
-        knobs = GemmKnobs.from_config(config)
-    except (NotImplementedError, ValueError, KeyError) as exc:
-        _LOG.debug("frost_gemm proposes nothing (%s): %s", kind, exc)
-        return []
-    return [PlanConfig(engine_id, knobs)]
+    proposals = []
+    engine_id = offered.get(ENGINE)
+    if engine_id is not None:
+        try:
+            probe_cutedsl()
+            config = plan_config(facts.chain, dynamic_shapes=facts.dynamic_shapes)
+            probe_chain(facts.chain, config)
+            proposals.append(PlanConfig(engine_id, GemmKnobs.from_config(config)))
+        except (NotImplementedError, ValueError, KeyError) as exc:
+            _LOG.debug("frost_gemm proposes nothing (%s): %s", kind, exc)
+    paired_id = offered.get("frost_moe_swiglu_pair")
+    if paired_id is not None and facts.pair is not None:
+        from .moe_pair import device_params, pair_knobs
+
+        try:
+            device_params()
+            proposals.append(PlanConfig(paired_id, pair_knobs()))
+        except (NotImplementedError, ValueError, KeyError) as exc:
+            _LOG.debug("paired MoE proposes nothing (%s): %s", kind, exc)
+    return proposals

@@ -8,14 +8,15 @@ string replacement at the `# FUSION_HOOK:*` markers."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import gcd
 
-from ..dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _output_align_reqs, allowed_store_vsize, dense_output_layout, tensor_alignment
+from ..dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _allowed_vsize, _aux_align_reqs, _compute_output_vec_bytes, _output_align_reqs, dense_output_layout
 from ..fusion_ir import (
     BlockQuantizeSpec,
     Dtype,
     FusionChain,
     FusionOp,
-    MatmulSpec,
+    MoeSwapAbSpec,
     ReductionSpec,
     TensorRef,
     gemm_index,
@@ -119,7 +120,7 @@ def _aux_reads_row(aux: TensorRef) -> bool:
     return len(aux.dim) >= 2 and aux.dim[-2] != 1
 
 
-def _bounded_aux_prelude(chain: FusionChain) -> list[str]:
+def _bounded_aux_prelude(chain: FusionChain, row_bound: str, col_bound: str, on_tma_arm: bool) -> list[str]:
     """The TMA arm hands the snippet a SUBTILE base with neither an N nor an M
     bound -- the store is clipped by the descriptor's global extent, so nothing
     downstream needs one, but a `per_col` / `per_elem` LDG at `col_j + k` is a
@@ -131,24 +132,24 @@ def _bounded_aux_prelude(chain: FusionChain) -> list[str]:
     past the extent land on the last valid element, whose value is never stored."""
     lines: list[str] = []
     for aux in chain.aux_tensors:
-        if aux.bcast_mode not in ("per_col", "per_elem"):
+        if aux.bcast_mode not in ("per_col", "per_elem") or (not on_tma_arm and aux.stride[-1] == 1):
             continue
         n, ptr = aux.name, _aux_ptr_var(aux.name)
         lines.append(f"_auxt_{n} = cute.make_rmem_tensor(vsize, {DTYPE_TO_CUTLASS[aux.dtype]})")
         lines.append(f"_auxv_{n} = _auxt_{n}.load().to_vector()")
-        cond = ["col_j + vsize <= N"]
+        cond = [f"col_j + vsize <= {col_bound}", str(aux.stride[-1] == 1)]
         if _aux_reads_row(aux):
-            cond.append("row < M")
+            cond.append(f"row < {row_bound}")
         lines.append(f"if {' & '.join(f'({c})' for c in cond)}:")
         lines.append(f"    _auxv_{n} = ({ptr} + {_aux_index_expr(aux)}).load(count=vsize, alignment=ALIGN_AUX_{n})")
         lines.append("else:")
         row_var = f"_auxr_{n}"
         if _aux_reads_row(aux):
-            lines.append(f"    {row_var} = cute.math.min(cutlass.Int32(row), cutlass.Int32(M) - 1)")
+            lines.append(f"    {row_var} = cute.math.min(cutlass.Int32(row), cutlass.Int32({row_bound}) - 1)")
         else:
             row_var = "row"
         lines.append("    for _auxk in cutlass.range_constexpr(vsize):")
-        lines.append(f"        _auxc_{n} = cute.math.min(cutlass.Int32(col_j) + _auxk, cutlass.Int32(N) - 1)")
+        lines.append(f"        _auxc_{n} = cute.math.min(cutlass.Int32(col_j) + _auxk, cutlass.Int32({col_bound}) - 1)")
         idx = _aux_index_expr(aux, row_var=row_var, col_var=f"_auxc_{n}")
         lines.append(f"        _auxt_{n}[_auxk] = ({ptr} + {idx}).load()")
         lines.append(f"    _auxv_{n} = _auxt_{n}.load().to_vector()")
@@ -620,7 +621,16 @@ def _dense_store_offset(i: int, is_fp4: bool, batch: int) -> str:
 
 
 def _emit_mmajor_scatter(
-    tap_idx: int, i: int, source_var: str, dtype: Dtype, batch: int, vsize: int, *, row_pred: str | None = None, converted: bool = False
+    tap_idx: int,
+    i: int,
+    source_var: str,
+    dtype: Dtype,
+    batch: int,
+    vsize: int,
+    *,
+    row_pred: str | None = None,
+    converted: bool = False,
+    col_bound: str = "N",
 ) -> list[str]:
     """Per-element scatter for an M-major (or arbitrarily strided) dense
     output: vsize scalar stores through the output's own runtime strides."""
@@ -634,7 +644,7 @@ def _emit_mmajor_scatter(
             f"alignment={DTYPE_BYTES[dtype]})"
         )
         if row_pred is not None:
-            lines.append(f"if ({row_pred}) & (col_j + {e} < N):")
+            lines.append(f"if ({row_pred}) & (col_j + {e} < {col_bound}):")
             lines.append(f"    {store}")
         else:
             lines.append(store)
@@ -649,7 +659,7 @@ def _tap_store_elems(chain: FusionChain, dtype: Dtype, dim, stride, vsize: int) 
     if dtype == "fp4_e2m1":
         return vsize  # packed 2/byte → the whole-chunk store is already <= 16B
     dim, stride = dense_output_layout(chain, dtype, dim, stride)
-    return min(vsize, allowed_store_vsize(dim, stride, dtype))
+    return min(vsize, _allowed_vsize(chain, dtype, dim, stride))
 
 
 def _tap_vec_bytes(chain: FusionChain, dtype: Dtype, dim, stride, vsize: int) -> int:
@@ -671,6 +681,7 @@ def _emit_tap_store(
     *,
     row_pred: str | None = None,
     converted: bool = False,
+    col_bound: str = "N",
 ) -> list[str]:
     """Store one N-major tap vector: ``offset_expr`` in ``_tap_store_elems``-wide
     chunks (a wide dtype co-materialized with a block-quant splits into <=32B
@@ -688,7 +699,7 @@ def _emit_tap_store(
         width = vsize if _s is None else store_elems
         store = f"(gC_tap_{tap_idx}_ptr + {off}).store({span}, alignment=VEC_BYTES_TAP_{tap_idx})"
         if row_pred is not None:
-            lines.append(f"if ({row_pred}) & (col_j + {(_s or 0) + width} <= N):")
+            lines.append(f"if ({row_pred}) & (col_j + {(_s or 0) + width} <= {col_bound}):")
             lines.append(f"    {store}")
         else:
             lines.append(store)
@@ -764,21 +775,35 @@ def _emit_reduction_atomic(
     red_idx: int,
     red: ReductionSpec,
     source_var: str,
-    matmul: "MatmulSpec",
+    chain: FusionChain,
     vsize: int,
     row_pred: str | None = None,
+    *,
+    col_bound: str = "N",
+    chunk_elems: int | None = None,
 ) -> list[str]:
     """A reduction is an atomic RMW, so an out-of-extent element cannot be
     clamped onto a valid one -- it has to be SKIPPED. The STG arm inherits
     `row < M` / `col_j + vsize <= N` from the drain; the TMA arm has neither, so
-    it re-applies them here. `_output_store_mode` forces N % chunk == 0 whenever a
-    reduction is present, which is what makes the chunk-level column test exact:
-    a chunk is wholly inside N or wholly past it, so the fold over it never mixes
-    real columns with OOB ones."""
-    body = _emit_reduction_atomic_body(tap_idx, red_idx, red, source_var, matmul, vsize)
+    it re-applies them here. Each subchunk divides the column boundary alignment,
+    so its local fold never mixes real columns with OOB ones. N-grouped MoE
+    uses both the offset-value promise and S, the implicit final endpoint."""
+    body = _emit_reduction_atomic_body(tap_idx, red_idx, red, source_var, chain, vsize)
     if row_pred is None:
         return body
-    return [f"if ({row_pred}) & (col_j + {vsize} <= N):"] + [f"    {ln}" for ln in body]
+    width = chunk_elems or vsize
+    lines = [f"if ({row_pred}) & (col_j + {vsize} <= {col_bound}):"] + [f"    {ln}" for ln in body]
+    if width == vsize:
+        return lines
+    # Keep the vector fold (one atomic when reducing N) for every full chunk.
+    # Only the boundary chunk needs narrower contributions.
+    lines.append(f"elif {row_pred}:")
+    for start in range(0, vsize, width):
+        src = f"{source_var}[{start}:{start + width}]"
+        body = _emit_reduction_atomic_body(tap_idx, red_idx, red, src, chain, width, col_offset=start)
+        lines.append(f"    if col_j + {start + width} <= {col_bound}:")
+        lines.extend(f"        {ln}" for ln in body)
+    return lines
 
 
 def _emit_reduction_atomic_body(
@@ -786,22 +811,24 @@ def _emit_reduction_atomic_body(
     red_idx: int,
     red: ReductionSpec,
     source_var: str,
-    matmul: "MatmulSpec",
+    chain: FusionChain,
     vsize: int,
+    *,
+    col_offset: int = 0,
 ) -> list[str]:
     src = f"_red_{red_idx}_src"
     lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
     if red.mode == "avg":
-        n_factor = matmul.N if red.dim[2] == 1 else 1
-        if red.grouped_by_moe:
-            if red.dim[1] == 1:
-                lines.append(
-                    f"_red_{red_idx}_inv = cutlass.Float32(1.0) / (cutlass.Float32({n_factor}) * cutlass.Float32(cutlass.Int32(group_end) - cutlass.Int32(group_begin)))"
-                )
-            else:
-                lines.append(f"_red_{red_idx}_inv = cutlass.Float32({1.0 / n_factor})")
+        if chain.has_moe:
+            extents = ["M", "N"]
+            if red.grouped_by_moe:
+                extents[1 if isinstance(chain.moe, MoeSwapAbSpec) else 0] = "cutlass.Int32(group_end) - cutlass.Int32(group_begin)"
+            count = " * ".join(f"cutlass.Float32({extent})" for dim, extent in zip(red.dim[1:], extents) if dim == 1)
+            count = count or "cutlass.Float32(1.0)"
+            lines.append(f"_red_{red_idx}_inv = cutlass.Float32(1.0) / ({count})")
         else:
-            count = n_factor * (matmul.M if red.dim[1] == 1 else 1) * (matmul.batch if red.dim[0] == 1 else 1)
+            matmul = chain.matmul
+            count = (matmul.N if red.dim[2] == 1 else 1) * (matmul.M if red.dim[1] == 1 else 1) * (matmul.batch if red.dim[0] == 1 else 1)
             lines.append(f"_red_{red_idx}_inv = cutlass.Float32({1.0 / count})")
     if red.dim[2] == 1:
         combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
@@ -849,7 +876,7 @@ def _emit_reduction_atomic_body(
         return lines
     for i in range(vsize):
         val = f"{src}[{i}]"
-        offset = _reduction_output_offset_expr(red_idx, red, str(i))
+        offset = _reduction_output_offset_expr(red_idx, red, str(col_offset + i))
         ptr = f"gC_tap_{tap_idx}_ptr + {offset}"
         if red.compute_dtype == "int32":
             if red.mode == "amax":
@@ -1007,8 +1034,8 @@ def _emit_block_quant_col(
     output_dtype: Dtype,
     out_var: str,
     scale_tap_idx: int,
+    chain: FusionChain,
     batch_index_expr: str,
-    matmul_m: int,
     vsize: int,
     row_pred: str | None = None,
 ) -> list[str]:
@@ -1018,6 +1045,8 @@ def _emit_block_quant_col(
     stores the scale byte(s) of column(s) ``col_j + k*G + l % G``. The
     compiler gates the row guards to be reduction-uniform."""
     p = f"_q{quant_idx}"
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    col_bound = "group_end" if swapped else "N"
     scale_dtype = _scale_store_dtype(quant.scale_dtype)
     G = 16 if quant.block_size == 16 else 32
     if vsize % G != 0:
@@ -1114,7 +1143,15 @@ def _emit_block_quant_col(
             ),
         ]
     )
-    if quant.grouped_by_moe:
+    if quant.grouped_by_moe and swapped:
+        lines.extend(
+            [
+                f"{p}_mb = row // {quant.block_size}",
+                f"{p}_mcb = ((M // {quant.block_size}) + 3) // 4",
+                f"{p}_base = start_sf_block_n * {p}_mcb * 512",
+            ]
+        )
+    elif quant.grouped_by_moe:
         lines.extend(
             [
                 f"{p}_mb = (row - group_begin) // {quant.block_size}",
@@ -1127,12 +1164,13 @@ def _emit_block_quant_col(
     for k in range(n_groups):
         lines.append(f"{p}_n{k} = col_j + {k * G} + ({p}_lane % {G})")
         if quant.scale_reorder == "F8_128x4":
-            mcb = f"{p}_mcb" if quant.grouped_by_moe else str((matmul_m // quant.block_size + 3) // 4)
+            mcb = f"{p}_mcb" if quant.grouped_by_moe else str((chain.matmul.M // quant.block_size + 3) // 4)
             base = f"{p}_base + " if quant.grouped_by_moe else ""
+            token = f"({p}_n{k} - group_begin)" if quant.grouped_by_moe and swapped else f"{p}_n{k}"
             lines.append(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + {base}"
-                f"(({p}_n{k} // 128) * {mcb} + ({p}_mb // 4)) * 512 + "
-                f"({p}_n{k} % 32) * 16 + (({p}_n{k} % 128) // 32) * 4 + ({p}_mb % 4)"
+                f"(({token} // 128) * {mcb} + ({p}_mb // 4)) * 512 + "
+                f"({token} % 32) * 16 + (({token} % 128) // 32) * 4 + ({p}_mb % 4)"
             )
         else:
             lines.append(
@@ -1147,7 +1185,8 @@ def _emit_block_quant_col(
         else:
             # `_output_store_mode` forces N % chunk == 0, so a chunk is wholly
             # inside N or wholly past it -- the chunk-level column test is exact.
-            lines.append(f"if ({row_pred}) & (col_j + {vsize} <= N):")
+            col_pred = f"{p}_n{k} < {col_bound}" if swapped else f"col_j + {vsize} <= N"
+            lines.append(f"if ({row_pred}) & ({col_pred}):")
             lines.append(f"    {_st}")
     return lines
 
@@ -1159,8 +1198,8 @@ def _emit_block_quant(
     output_dtype: Dtype,
     out_var: str,
     scale_tap_idx: int,
+    chain: FusionChain,
     batch_index_expr: str = "tile_l",
-    matmul_m: int = 0,
     vsize: int = 32,
     row_pred: str | None = None,
 ) -> list[str]:
@@ -1178,12 +1217,14 @@ def _emit_block_quant(
             output_dtype,
             out_var,
             scale_tap_idx,
+            chain,
             batch_index_expr,
-            matmul_m,
             vsize,
             row_pred,
         )
     p = f"_q{quant_idx}"
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    col_bound = "group_end" if swapped else "N"
     bs = quant.block_size
     if vsize % bs != 0:
         raise NotImplementedError(f"row block-quantize: store vector {vsize} must be a multiple of block_size {bs}")
@@ -1219,7 +1260,15 @@ def _emit_block_quant(
             ),
         ]
     )
-    if quant.grouped_by_moe:
+    if quant.grouped_by_moe and swapped:
+        lines.extend(
+            [
+                f"{p}_local_row = row",
+                f"{p}_ncb = (((group_end - group_begin) // {bs}) + 3) // 4",
+                f"{p}_base = (group_begin // {4 * bs}) * ((M + 127) // 128) * 512",
+            ]
+        )
+    elif quant.grouped_by_moe:
         # Slot 6 is the block-scaled MoE scheduler's prefix sum of preceding
         # groups' ceil(group_rows/128) scale atoms. Restart the row address at
         # the group-local row and that atom base.
@@ -1231,7 +1280,8 @@ def _emit_block_quant(
             ]
         )
     for k in range(n_sub):
-        lines.append(f"{p}_scol{k} = col_j // {bs} + {k}")
+        col = "(col_j - group_begin)" if quant.grouped_by_moe and swapped else "col_j"
+        lines.append(f"{p}_scol{k} = {col} // {bs} + {k}")
         if quant.scale_reorder == "F8_128x4":
             if quant.grouped_by_moe:
                 sidx = _f8_128x4_row_scale_index_expr(f"{p}_local_row", f"{p}_scol{k}", f"{p}_ncb", atom_base=f"{p}_base")
@@ -1260,7 +1310,8 @@ def _emit_block_quant(
         else:
             # `_output_store_mode` forces N % chunk == 0, so a chunk is wholly
             # inside N or wholly past it -- the chunk-level column test is exact.
-            lines.append(f"if ({row_pred}) & (col_j + {vsize} <= N):")
+            width = (k + 1) * bs if swapped else vsize
+            lines.append(f"if ({row_pred}) & (col_j + {width} <= {col_bound}):")
             lines.append(f"    {_st}")
     return lines
 
@@ -1380,6 +1431,8 @@ def generate(
     compiler) fix the inner-loop chunk size: each tap stores
     ``vsize = vec_bytes_epi // output_elem_bytes`` elements per chunk."""
     vsize = vec_bytes_epi // output_elem_bytes
+    row_bound = "group_end" if chain.has_moe and not isinstance(chain.moe, MoeSwapAbSpec) else "M"
+    col_bound = "group_end" if isinstance(chain.moe, MoeSwapAbSpec) else "N"
     # aux_views snippet. `row` is defined by the template just before this hook
     # (M-aware: differs for MMA_M=64 vs MMA_M>=128) — we just consume it.
     aux_lines: list[str] = []
@@ -1388,7 +1441,10 @@ def generate(
         if aux.bcast_mode == "scalar":
             aux_lines.append(f"{_aux_prefetch_var(aux.name)} = " f"({_aux_ptr_var(aux.name)} + {_aux_index_expr(aux)}).load()")
         elif aux.bcast_mode == "per_row":
-            aux_lines.append(f"{_aux_prefetch_var(aux.name)} = " f"({_aux_ptr_var(aux.name)} + {_aux_index_expr(aux)}).load()")
+            aux_lines.append(
+                f"{_aux_prefetch_var(aux.name)} = "
+                f"({_aux_ptr_var(aux.name)} + {_aux_index_expr(aux, row_var=f'cute.math.min(cutlass.Int32(row), cutlass.Int32({row_bound}) - 1)')}).load()"
+            )
         # per_col / per_elem load inside the inner loop.
 
     aux_views = "\n".join(aux_lines) if aux_lines else "pass"
@@ -1411,11 +1467,12 @@ def generate(
     # Under the packed `lane < 16` layout half the lanes hold nothing, and a
     # reduction's atomic RMW cannot be clipped after the fact.
     store_row_pred = None
-    if on_tma_arm:
-        store_row_pred = f"row < {'group_end' if chain.has_moe else 'M'}"
+    bounded = on_tma_arm or (isinstance(chain.moe, MoeSwapAbSpec) and bool(chain.quants))
+    if bounded:
+        store_row_pred = f"row < {row_bound}"
         if packed_lanes:
             store_row_pred = f"row_active & ({store_row_pred})"
-    _aux_pre = _bounded_aux_prelude(chain) if on_tma_arm else []
+    _aux_pre = _bounded_aux_prelude(chain, row_bound, col_bound, bounded)
     body_lines: list[str] = tma_vec_bindings + _aux_pre
 
     # Per-op result var name lookup (handles `identity` pass-throughs).
@@ -1441,7 +1498,7 @@ def generate(
     for i, op in enumerate(chain.ops):
         if op.op == "aux_load":
             aux_ref = chain.aux_by_name(op.aux)
-            body_lines.append(f"_op_{i} = {_aux_load_expr(aux_ref, op.compute_dtype, 'vec_f32', bounded=on_tma_arm)}")
+            body_lines.append(f"_op_{i} = {_aux_load_expr(aux_ref, op.compute_dtype, 'vec_f32', bounded=bounded or aux_ref.stride[-1] != 1)}")
             round_lines, cur = _emit_round(f"_op_{i}", op.out_dtype, str(i))
             body_lines.extend(round_lines)
             result_var[i] = cur
@@ -1450,7 +1507,7 @@ def generate(
         parent_raw = _parent_value(parent)
         cast_lines, parent_var = _compute_cast(parent_raw, op.compute_dtype, f"{i}_a")
         body_lines.extend(cast_lines)
-        aux_loads = {aux.name: _aux_load_expr(aux, op.compute_dtype, parent_var, bounded=on_tma_arm) for aux in chain.aux_tensors}
+        aux_loads = {aux.name: _aux_load_expr(aux, op.compute_dtype, parent_var, bounded=bounded or aux.stride[-1] != 1) for aux in chain.aux_tensors}
         other_in_chain = _parent_value(op.parent_idx_b) if op.parent_idx_b is not None else None
         if other_in_chain is not None:
             cast_lines, other_in_chain = _compute_cast(other_in_chain, op.compute_dtype, f"{i}_b")
@@ -1517,8 +1574,8 @@ def generate(
                     spec.dtype,
                     qv,
                     _scale_tap_idx(spec.quant_idx),
+                    chain,
                     quant_batch_expr,
-                    chain.matmul.M,
                     vsize,
                     store_row_pred,
                 )
@@ -1534,16 +1591,32 @@ def generate(
             continue
         tap_idx = _tap_of[si]
         if spec.major == "m":
-            body_lines.extend(_emit_mmajor_scatter(tap_idx, si, src, spec.dtype, chain.matmul.batch, vsize, row_pred=store_row_pred, converted=converted))
+            body_lines.extend(
+                _emit_mmajor_scatter(tap_idx, si, src, spec.dtype, chain.matmul.batch, vsize, row_pred=store_row_pred, converted=converted, col_bound=col_bound)
+            )
             continue
         offset_expr = _dense_store_offset(si, spec.dtype == "fp4_e2m1", chain.matmul.batch)
         body_lines.extend(
-            _emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, row_pred=store_row_pred, converted=converted)
+            _emit_tap_store(
+                tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, row_pred=store_row_pred, converted=converted, col_bound=col_bound
+            )
         )
 
+    # The STG chunk divides every group boundary, including S. Its width is
+    # also checked on runtime shape reuse, even when a dense output uses TMA.
+    red_chunk = gcd(vsize, _compute_output_vec_bytes(chain) // DTYPE_BYTES[chain.output_dtype]) if isinstance(chain.moe, MoeSwapAbSpec) else vsize
+    if isinstance(chain.moe, MoeSwapAbSpec) and chain.quants:
+        red_chunk = gcd(red_chunk, chain.moe.offset_multiple, chain.matmul.N)
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)
-        body_lines.extend(_emit_reduction_atomic(_tap_of[len(specs) + red_idx], red_idx, red, red_source, chain.matmul, vsize, store_row_pred))
+        body_lines.extend(
+            _emit_reduction_atomic(
+                _tap_of[len(specs) + red_idx], red_idx, red, red_source, chain, vsize, store_row_pred, col_bound=col_bound, chunk_elems=red_chunk
+            )
+        )
+
+    if tma_slots and any(red.mode in ("mul", "mul_no_zeros") for red in chain.reductions):
+        body_lines.append("nvvm.bar_warp_sync(0xFFFFFFFF)")
 
     # Split-K partial store handling
     if split_k_slices > 1:
@@ -1610,8 +1683,7 @@ def generate(
     # VEC_BYTES): min(the aux tensor's alignment, the chunk it reads = vsize elems).
     for aux in chain.aux_tensors:
         if aux.bcast_mode in ("per_col", "per_elem"):
-            _aeb = DTYPE_BYTES[aux.dtype]
-            _aalign = min(tensor_alignment(aux.dim, aux.stride, _aeb), vsize * _aeb)
+            _aalign = _aux_align_reqs(chain, vec_bytes=vec_bytes_epi)[aux.name]
             tap_constants.append(f"ALIGN_AUX_{aux.name} = {_aalign}")
 
     mainloop_transform_a = generate_mainloop(chain, "a")

@@ -1,7 +1,18 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""sm100 MoE grouped matmul fwd: grouped persistent scheduler + per-group A TMA
+"""Paired canonical-weight SwiGLU kernel, integrated from KF624 plus early PDL.
+
+Credit: NVIDIA Frost; Kernel Factory optimizer; Yanqin Zhai's
+NVIDIA/cudnn-frontend PR1090 weight-M/token-N orientation; NVIDIA CUTLASS
+example113 layout; canonical rank5 pairing guidance and TRT-LLM gated-row
+interleaving motivation. No TRT-LLM kernel body is reused.
+
+The gate enforces R<=8, N divisible by64 and canonical [gate,up] parent
+storage. The retained generated scaffold is intentionally not refactored while
+establishing graph/API parity with the independently audited kernel.
+
+Original template: sm100 MoE grouped matmul fwd: grouped persistent scheduler + per-group A TMA
 descriptor replacement.
 
 Serves both MMA modes; ``cta_group`` is an injected tile constant.
@@ -52,13 +63,95 @@ moe_static_sched = False  # Public SCHED_POLICY: 0 dynamic (default), 1 static.
 moe_absolute_a = False  # Set before injection so the rendered eligibility gate wins.
 moe_wide_mma = False  # Shared-A pair packed into one doubled-N instruction.
 
-# @@INJECT_TILE_CONSTANTS@@
+# Tile config: CONFIG_sm100_64x64x128_64x64x32_cluster1x1_1ctamma
+mma_inst_shape_mnk = (128, 8, 16)
+mma_k_dim = 0
+cta_group = 1
+cgrp_tile_mnk = (8, 64, 64)
+cta_tile_mnk = (8, 64, 64)
+epi_tile_mn = (8, 64)
+threads_per_cta = 256
+cluster_shape_mnk = (1, 1, 1)
+matmul_a_batch = 1
+matmul_b_batch = 1
+a_is_m_major = False
+b_is_n_major = False
+mma_a_major = 0
+mma_b_major = 0
+ab_stages = 13
+b_collector_ok = False
+multicast_a = False
+multicast_b = False
+a_mcast_slices = 1
+a_tma_box_m = 8
+b_mcast_slices = 1
+ab_empty_full_mask = False
+ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.SWIZZLE_128B
+a_smem_desc_leading_byte_offset = 16
+a_smem_desc_stride_byte_offset = 1024
+a_smem_k_step_bytes = 32
+a_smem_m_step_bytes = 8192
+a_tma_group_elems = 1
+b_smem_desc_leading_byte_offset = 16
+b_smem_desc_stride_byte_offset = 1024
+b_smem_k_step_bytes = 32
+b_tma_group_elems = 1
+mma_size_m = 1
+mma_size_n = 1
+mma_size_k = 4
+ab_tma_swizzle = _tma.TensorMapSwizzle.s128b
+
+# Dtype family: A=bf16->MMAbf16, B=bf16->MMAbf16, out=bf16 (K_BYTES=128)
+ab_dtype = cutlass.BFloat16
+cd_dtype = cutlass.BFloat16
+epi_store_dtype = cutlass.BFloat16
+mma_a_dtype = cutlass.BFloat16
+mma_b_dtype = cutlass.BFloat16
+mma_c_dtype = cutlass.Float32
+acc_widen_to_fp32 = False
+ab_tma_dtype = cutlass.BFloat16
+mma_kind = nvvm.Tcgen05MMAKind.F16
+epi_n = 8
+epi_row_elems = 64
+tile_swizzle_n = 0
+swizzle_l2_budget_bytes = FROST_TEMPLATE_PARAMS.l2_budget_bytes
+num_gemms = 1
+num_a_operands = 1
+num_b_operands = 1
+gemm_a_idx = (0,)
+gemm_b_idx = (0,)
+num_tmem_alloc_cols = 512
+tmem_alloc_exclusive = False
+acc_stages = 2  # two independent M128xN8 accumulator tiles
+grid_num_clusters = FROST_TEMPLATE_PARAMS.grid_ctas
+offset_cutlass_dtype = cutlass.Int32
+vec_bytes_epi = 32
+split_k_slices = 1
+frost_compile_options = "--enable-tvm-ffi --gpu-arch sm_100a"
+n_tma_outputs = 1
+moe_aligned_offsets = False
+moe_token_alignment = 1
+epi_slot_widen = 1
+epi_packed_lanes = True
+epi_dp22 = False
+epi_stage_rows = 8
+epi_chunk_elems = 8
+ab_stages = 12  # 12 * (M128xK64 weights + N8xK64 tokens) = 208,896B
+fallback_cluster_shape_mnk = None
+mixed_a_pattern_pref = 1
+mixed_b_pattern_pref = 1
+mixed_a_pattern_fb = 1
+mixed_b_pattern_fb = 1
+moe_static_sched = True
+moe_absolute_a = True
+moe_wide_mma = True
+moe_blocked_b = False
 
 # Tensormap workspace slots per CTA: the A operands, plus the output descriptor
 # when the TMA-store epilogue re-dimensions it per routed group.
 moe_desc_slots = num_a_operands + n_tma_outputs
-# Wide MMA places both B operands together inside each pipeline stage.
-b_stage_multiplier = num_b_operands if moe_wide_mma else 1
+# The rank-5 weight TMA assembles gate and up into one physical MMA-M operand.
+b_stage_multiplier = 1
 mma_issue_gemms = 1 if moe_wide_mma else num_gemms
 _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
 
@@ -74,7 +167,8 @@ SCHED_SLOT_WORDS = 8
 USE_PDL = True
 
 # Double-buffer for the TMA-store epilogue path.
-EPI_SMEM_STAGES = 2
+# Four-deep TMA-store ring keeps up to three completed subtiles in flight.
+EPI_SMEM_STAGES = 4
 
 # Named barrier id for the 4-warp epilogue handoff around the TMA store.
 EPI_SYNC_BAR_ID = 1
@@ -124,7 +218,7 @@ def _b_collector_op(mi):
 
 
 @cute.kernel
-def _kernel(
+def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl(
     m: cutlass.Int64,
     n: cutlass.Int64,
     k: cutlass.Int64,
@@ -132,20 +226,23 @@ def _kernel(
     num_groups: cutlass.Int32,
     first_token_offset: cute.Tensor,
     a_tma_workspace: cute.Tensor,
-    # @@INJECT_KERNEL_AB_DESC_PARAMS@@
-    # @@INJECT_MOE_KERNEL_MA_PARAMS@@
-    # @@INJECT_KERNEL_TAP_PARAMS@@
-    # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
-    # @@INJECT_KERNEL_AUX_PARAMS@@
-    # @@TMA_STORE_ONLY:BEGIN@@
-    # @@INJECT_KERNEL_TMA_C_PARAMS@@
-    # @@TMA_STORE_ONLY:END@@
+    tma_a_desc_0: cutlass.GridConstant[_tma.TensorMap],
+    tma_b_desc_0: cutlass.GridConstant[_tma.TensorMap],
+    tma_b_desc_1: cutlass.GridConstant[_tma.TensorMap],
+    mA_0: cute.Tensor,
+    mC_0: cute.Tensor,
+    a_stride_m_0: cutlass.Int64,
+    out_stride_m_0: cutlass.Int64,
+    out_stride_n_0: cutlass.Int64,
+    out_stride_l_0: cutlass.Int64,
+    tma_c_desc_0: cutlass.GridConstant[_tma.TensorMap],
 ) -> None:
-    # @@INJECT_AB_DESC_LISTS@@
-    # @@INJECT_MOE_MA_LIST@@
-    # @@TMA_STORE_ONLY:BEGIN@@
-    # @@INJECT_TMA_C_LISTS@@
-    # @@TMA_STORE_ONLY:END@@
+    tma_a_descs = [tma_a_desc_0]
+    tma_b_descs = [tma_b_desc_0]
+    mA_list = [mA_0]
+    a_stride_m_list = [a_stride_m_0]
+    tma_c_descs = [tma_c_desc_0]
+    tma_c_m_major = (False,)
 
     mma_warp_id = 4
     tma_warp_id = 5
@@ -160,6 +257,13 @@ def _kernel(
     elect_one = nvvm.elect_sync()
 
     tidx = cute.arch.thread_idx()[0]
+    # Allow the dependent FC2 prologue to occupy otherwise idle SMs early.
+    # This does not release data dependencies: FC2 retains griddepcontrol.wait,
+    # which waits for this complete grid and its global-memory operations.
+    # NVIDIA PTX ISA, griddepcontrol: repeated triggers in a CTA are harmless.
+    if cutlass.const_expr(USE_PDL):
+        if tidx == 0:
+            nvvm.griddepcontrol("launch_dependents")
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
     gridx = cute.arch.grid_dim()[0]
@@ -193,11 +297,6 @@ def _kernel(
             nvvm.prefetch_tensormap(tma_a_descs[_i].get_ptr())
         for _j in cutlass.range_constexpr(num_b_operands):
             nvvm.prefetch_tensormap(tma_b_descs[_j].get_ptr())
-
-        # @@TMA_STORE_ONLY:BEGIN@@
-        for _ci in cutlass.range_constexpr(n_tma_outputs):
-            nvvm.prefetch_tensormap(tma_c_descs[_ci].get_ptr())
-        # @@TMA_STORE_ONLY:END@@
 
     a_pattern = 0
     for n_idx in cutlass.range_constexpr(cluster_n):
@@ -260,8 +359,10 @@ def _kernel(
         sched_bcast_full_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
         sched_bcast_empty_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
 
-    sA_elems = cta_tile_mnk[0] * cta_tile_mnk[2]
-    sB_elems = cta_tile_mnk[1] * cta_tile_mnk[2]
+    # Physical MMA operands are transposed relative to the logical output:
+    # A is 128 gate/up weight rows, B is 8 routed token rows.
+    sA_elems = mma_inst_shape_mnk[0] * cta_tile_mnk[2]
+    sB_elems = mma_inst_shape_mnk[1] * cta_tile_mnk[2]
     smem_a_list = [
         cutlass.Array(
             ab_dtype,
@@ -302,25 +403,6 @@ def _kernel(
             )
             for _ in range(num_a_operands)
         ]
-
-    # @@TMA_STORE_ONLY:BEGIN@@
-    # One epilogue subtile = one MMA-M block x 32 cols; the M blocks reuse it.
-    # The ring slot is indexed by `tidx`, so its row count is the EPILOGUE THREAD
-    # count -- which is epi_tile_mn[0] only when the MMA M block is 128.
-    epi_subtile_elems = epi_stage_rows * epi_row_elems * epi_slot_widen
-    smem_d_ptr = cutlass.Array(
-        cd_dtype,
-        epi_subtile_elems * EPI_SMEM_STAGES,
-        space=cutlass.AddressSpace.smem,
-        alignment=1024,
-    )
-    tma_c_desc_smem = cutlass.Array(
-        cutlass.Int64,
-        TENSOR_MAP_QWORDS * n_tma_outputs,
-        space=cutlass.AddressSpace.smem,
-        alignment=128,
-    )
-    # @@TMA_STORE_ONLY:END@@
 
     # One block per MMA mode, every count defined in both: the 2-CTA pair
     # releases per PAIR (so ab_empty counts pairs and acc_empty counts both
@@ -389,11 +471,11 @@ def _kernel(
         # TMEM accumulator layout, per acc stage: gemm g, M block mi, N block ni
         # -> columns [g*cols_per_acc_stage + mi*epi_cols_per_mma_m + ni*mma_inst_n, +N),
         # all at TMEM lane base 0.
-        epi_cols_per_mma_m = cta_tile_mnk[1]
+        epi_cols_per_mma_m = mma_inst_shape_mnk[1]
     else:
         pair_n_size = cgrp_tile_mnk[1] // cluster_n
         # Per-CTA output rows one MMA-M block covers (the pair splits M).
-        epi_rows_per_mma_m = cta_tile_mnk[0] // mma_size_m
+        epi_rows_per_mma_m = mma_inst_shape_mnk[0] // mma_size_m
         if cutlass.const_expr(epi_rows_per_mma_m == 64):
             # cluster-MMA m=128: the pair also splits N, so each CTA drains N/2.
             epi_cols_per_mma_m = pair_n_size // 2
@@ -410,7 +492,7 @@ def _kernel(
         nvvm.barrier_cluster_wait()
         nvvm.barrier_cta_sync(0)
 
-    # @@INJECT_TAP_PTRS@@
+    pass
 
     vsize = epi_chunk_elems
 
@@ -719,7 +801,7 @@ def _kernel(
                         _a_off = 0
                     if a_data_issue:
                         for _ai in cutlass.range_constexpr(num_a_operands):
-                            sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
+                            sA_stage = smem_b_list[_ai].subview(sB_elems * stage)
                             for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
@@ -740,7 +822,7 @@ def _kernel(
                         _b_off = 0
                     if b_data_issue:
                         for _bj in cutlass.range_constexpr(num_b_operands):
-                            sB_stage = smem_b_list[_bj].subview(sB_elems * stage * b_stage_multiplier)
+                            sB_stage = smem_a_list[_bj].subview(sA_elems * stage)
                             if cutlass.const_expr(b_is_n_major):
                                 for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
                                     if elect_one:
@@ -763,15 +845,11 @@ def _kernel(
                                         sB_stage.subview(_b_off * cta_tile_mnk[2]),
                                         tma_b_descs[_bj].get_ptr(),
                                         (
-                                            (
-                                                cutlass.Int32(0),
-                                                (coord_n_per_cta + _b_off) % 128,
-                                                coord_k // 128,
-                                                (coord_n_per_cta + _b_off) // 128,
-                                                coord_expert,
-                                            )
-                                            if cutlass.const_expr(moe_blocked_b)
-                                            else (coord_k, coord_n_per_cta + _b_off, coord_expert)
+                                            coord_k,
+                                            cutlass.Int32(0),
+                                            cutlass.Int32(0),
+                                            (coord_n_per_cta + _b_off) // 8,
+                                            coord_expert,
                                         ),
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
@@ -1184,42 +1262,15 @@ def _kernel(
         sched_stage = cutlass.Int32(0)
         sched_full_phase = cutlass.Int32(0)
 
-        # The drain layout follows the MMA INSTRUCTION's M: at hardware M=64 the
-        # accumulator occupies data paths 0-15 of each sub-partition, so the
-        # 32-data-path LDTM layout cannot be used to read it.
+        # M128 occupies all 32 data paths in each TMEM subpartition.  Each
+        # epilogue warp drains one 32-row band; gate/up partners are lane^8.
         # @@EPILOGUE_SETUP:BEGIN@@
-        if cutlass.const_expr(epi_packed_lanes):
-            row_id_with_warp_offset = base_row_id
-        else:
-            row_id_with_warp_offset = base_row_id + warp_idx * 32
-
-        epi_spans = _epi_subtile_spans(epi_cols_per_mma_m, epi_n)
-        subtile_cnt = len(epi_spans)
-        if cutlass.const_expr(epi_packed_lanes):
-            shape = nvvm.Tcgen05LdStShape.SHAPE_16X32BX2
-            ld_half_off = 0
-        else:
-            shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
-            ld_half_off = None
+        row_id_with_warp_offset = base_row_id + warp_idx * 32
+        shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
         lane = tidx % 32
         # @@EPILOGUE_SETUP:END@@
 
-        # @@TMA_STORE_ONLY:BEGIN@@
-        epi_stage_idx = cutlass.Int32(EPI_SMEM_STAGES - 1)
-        # The routed output is one flat (S, N) TMA surface.
         tile_l = cutlass.Int32(0)
-        epi_block_linear = bidx + bidy * gridx
-        d_desc_base_list = [
-            a_tma_workspace.iterator.raw_ptr() + (epi_block_linear * moe_desc_slots + num_a_operands + _di) * TENSOR_MAP_QWORDS for _di in range(n_tma_outputs)
-        ]
-        d_desc_ptr_list = [cute.make_ptr(cutlass.Int64, _b.toint(), mem_space=cute.AddressSpace.generic) for _b in d_desc_base_list]
-        previous_group_end = cutlass.Int32(-1)
-        if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets):
-            for _di in cutlass.range_constexpr(n_tma_outputs):
-                if elect_one:
-                    _copy_tensormap_to_workspace(tma_c_descs[_di].get_ptr(), tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS))
-            nvvm.bar_warp_sync(0xFFFFFFFF)
-        # @@TMA_STORE_ONLY:END@@
 
         while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
             pass
@@ -1242,116 +1293,43 @@ def _kernel(
 
         while is_valid != 0:
             coord_m_tile = group_begin + tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
-            # @@TMA_STORE_ONLY:BEGIN@@
-            # Re-dimension D to this group's last row so the hardware clips the
-            # ragged tail; the base stays put, so the store coords are global.
-            # Under `moe_aligned_offsets` no tile crosses `group_end` in the
-            # first place -- `cgrp_tile_m` divides every group -- so the clip
-            # has nothing to clip and the original descriptor serves.
-            if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets):
-                if group_end != previous_group_end:
-                    previous_group_end = group_end
-                    # One drain retires the in-flight stores of EVERY descriptor,
-                    # so it does not repeat per output.
-                    nvvm.cp_async_bulk_wait_group(0, read=True)
-                    for _di in cutlass.range_constexpr(n_tma_outputs):
-                        _scratch = tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS)
-                        _fence_tensormap_acquire(d_desc_ptr_list[_di])
-                        if elect_one:
-                            if cutlass.const_expr(tma_c_m_major[_di]):
-                                _replace_tensormap_global_dim_0(_scratch, group_end)
-                            else:
-                                _replace_tensormap_global_dim_1(_scratch, group_end)
-                        nvvm.bar_warp_sync(0xFFFFFFFF)
-                        if lane < TENSOR_MAP_QWORDS:
-                            (d_desc_base_list[_di] + lane).store((_scratch.subview(lane)).load())
-                        nvvm.bar_warp_sync(0xFFFFFFFF)
-                    _fence_tensormap_release()
-            # @@TMA_STORE_ONLY:END@@
             # @@EPILOGUE_DRAIN:BEGIN@@
             coord_n_c = tile_n * cgrp_tile_mnk[1] + n_rank * (cta_tile_mnk[1] * cta_group)
-            if cutlass.const_expr(epi_dp22):
-                coord_n_c = coord_n_c + (warp_idx // 2) * epi_cols_per_mma_m
-
             acc_stage = tile_iter % acc_stages
             if acc_stage == 0 and tile_iter != 0:
                 acc_full_phase_bit = acc_full_phase_bit ^ 1
-
             while not nvvm.mbarrier_try_wait_parity(acc_full_mbar_ptr.subview(acc_stage), acc_full_phase_bit, time_limit=10_000_000):
                 pass
-
             acc_base_col = base_col_id_root + acc_stage * acc_region_cols
+            tmem = cutlass.inttoptr((row_id_with_warp_offset << 16) | acc_base_col, 6, mma_c_dtype)
+            acc_vec = nvvm.tcgen05_ld(shape, tmem, num=8)
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+            nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+            if elect_one:
+                nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
 
-            for mi in cutlass.range_constexpr(mma_size_m):
-                coord_m = coord_m_tile + mi * epi_rows_per_mma_m
-                mi_col_base = acc_base_col + mi * epi_cols_per_mma_m
-                tmem_col_addr_gemms = [(row_id_with_warp_offset << 16) | (mi_col_base + g * cols_per_acc_stage) for g in range(num_gemms)]
+            # Rank-5 row order is gate[8],up[8] for each group of eight
+            # neurons.  All lanes shuffle before the gate lanes branch.
+            channel = coord_n_c + warp_idx * 16 + (lane & 7) + (lane // 16) * 8
+            gate_lane = (lane & 8) == 0
+            for token_idx in cutlass.range_constexpr(8):
+                gate = acc_vec[token_idx].to(cutlass.Float32)
+                up = nvvm.shfl_sync(0xFFFFFFFF, gate, 8, 0x1F, nvvm.Shfl.BFLY)
+                silu = gate * cute.math.rcp(
+                    cutlass.Float32(1.0)
+                    + cute.math.exp2(
+                        -gate * cutlass.Float32(1.4426950408889634),
+                        fastmath=True,
+                    ),
+                    approx=True,
+                    ftz=True,
+                )
+                value = (up * silu).to(cutlass.BFloat16)
+                row = coord_m_tile + token_idx
+                linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + channel * out_stride_n_0
+                if gate_lane & (row < group_end):
+                    (mC_0.iterator.raw_ptr() + linear_idx).store(value, alignment=2)
 
-                if cutlass.const_expr(epi_packed_lanes):
-                    row = coord_m + warp_idx * 16 + lane
-                    row_active = lane < 16
-                elif cutlass.const_expr(epi_dp22):
-                    row = coord_m + (warp_idx % 2) * 32 + lane
-                    row_active = True
-                else:
-                    row = coord_m + tidx
-                    row_active = True
-
-                # @@INJECT_AUX_VIEWS@@
-
-                for subtile_idx in cutlass.range_constexpr(subtile_cnt):
-                    subtile_col_offset, subtile_w = epi_spans[subtile_idx]
-                    c_rmem_vecs = []
-                    for g in cutlass.range_constexpr(num_gemms):
-                        subtile_tmem_addr = tmem_col_addr_gemms[g] + subtile_col_offset
-                        tmem = cutlass.inttoptr(subtile_tmem_addr, 6, mma_c_dtype)
-                        _cv = nvvm.tcgen05_ld(shape, tmem, num=subtile_w, offset=ld_half_off)
-                        # INT8 int32 accumulate → widen to fp32 (skipped for int32 output).
-                        if cutlass.const_expr(acc_widen_to_fp32):
-                            _accf = _cv.to(cutlass.Float32)
-                            # `+ 0.0` forces a fresh fp32 register so int32->fp32 isn't folded into an invalid int32->fp8 cast.
-                            _cv = _accf + cutlass.full_like(_accf, 0.0)
-                        c_rmem_vecs.append(_cv)
-                    c_rmem_vec = c_rmem_vecs[0]
-
-                    if mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1:
-                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                        nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                        if elect_one:
-                            if cutlass.const_expr(cta_group == 2):
-                                nvvm.mbarrier_arrive(
-                                    nvvm.mapa(acc_empty_mbar_ptr.subview(acc_stage), pair_leader_rank),
-                                    scope=nvvm.MemScope.CLUSTER,
-                                    relaxed=True,
-                                )
-                            else:
-                                nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
-
-                    col = coord_n_c + subtile_col_offset
-
-                    # @@TMA_STORE_ONLY:BEGIN@@
-                    vec_f32 = c_rmem_vec
-                    col_j = col
-                    linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
-
-                    # @@INJECT_EPILOGUE@@
-
-                    # @@INJECT_TMA_STORE_SEQUENCE@@
-                    # @@TMA_STORE_ONLY:END@@
-
-                    # @@STG_ONLY:BEGIN@@
-                    if row_active and row < group_end:
-                        for j in cutlass.range_constexpr(subtile_w // vsize):
-                            col_j = col + j * vsize
-                            if col_j + vsize <= N:
-                                vec_f32 = c_rmem_vec[j * vsize : (j + 1) * vsize]
-
-                                # @@INJECT_STG_VEC_BINDINGS@@
-
-                                # @@INJECT_EPILOGUE@@
-                    # @@STG_ONLY:END@@
-
-            # The M-major TMA path loads its accumulator inside the store loop, so its release cannot move up.
             # @@EPILOGUE_DRAIN:END@@
             tile_iter += 1
 
@@ -1388,7 +1366,7 @@ def _kernel(
         nvvm.barrier_cluster_wait()
 
 
-_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
@@ -1396,15 +1374,14 @@ def _host(
     problem_size: tuple,
     first_token_offset: cute.Tensor,
     a_tma_workspace: cute.Tensor,
-    # @@INJECT_HOST_AB_PARAMS@@
-    # @@INJECT_HOST_TAP_PARAMS@@
-    # @@INJECT_HOST_AUX_PARAMS@@
-    # @@TMA_STORE_ONLY:BEGIN@@
-    # @@INJECT_HOST_TMA_C_PARAMS@@
-    # @@TMA_STORE_ONLY:END@@
+    a_0: cute.Tensor,
+    b_0: cute.Tensor,
+    b_1: cute.Tensor,
+    c_0: cute.Tensor,
     stream: _cuda.CUstream,
 ) -> None:
-    # @@INJECT_HOST_AB_LISTS@@
+    _a_operands = [a_0]
+    _b_operands = [b_0]
 
     m = problem_size[0]
     n = problem_size[1]
@@ -1433,12 +1410,24 @@ def _host(
         )
         _stride_idx += 3
 
-    # @@INJECT_HOST_REDUCTION_STRIDES@@
+    out_stride_m_0 = problem_size[_stride_idx]
+    out_stride_n_0 = problem_size[_stride_idx + 1]
+    out_stride_l_0 = problem_size[_stride_idx + 2]
+    _stride_idx += 3
 
-    # @@TMA_STORE_ONLY:BEGIN@@
-    # @@INJECT_HOST_TMA_C_LISTS@@
-    # @@INJECT_HOST_TMA_C_DESCS@@
-    # @@TMA_STORE_ONLY:END@@
+    _tma_c_outputs = [c_0]
+    _c0 = _tma_c_outputs[0]
+    tma_c_desc_0 = _tma.create_tensor_map_tiled(
+        global_address=_c0.iterator.toint(),
+        dtype=cutlass.BFloat16,
+        global_dims=[n, m],
+        global_strides=[
+            out_stride_m_0 * 16 // 128,
+        ],
+        box_dims=[32, epi_tile_mn[0]],
+        swizzle=_tma.TensorMapSwizzle.s64b,
+    )
+    tma_c_desc_list = [tma_c_desc_0]
 
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
@@ -1478,17 +1467,17 @@ def _host(
                 _tma.create_tensor_map_tiled(
                     global_address=_b_op.iterator.toint(),
                     dtype=ab_tma_dtype,
-                    global_dims=([128, 128, k_sym // 128, n // 128, num_experts] if cutlass.const_expr(moe_blocked_b) else [k_sym, n, num_experts]),
-                    global_strides=(
-                        [128 * ab_dtype.width // 128, 16384 * ab_dtype.width // 128, k_sym * 128 * ab_dtype.width // 128, b_stride_l * ab_dtype.width // 128]
-                        if cutlass.const_expr(moe_blocked_b)
-                        else [b_stride_n * ab_dtype.width // 128, b_stride_l * ab_dtype.width // 128]
-                    ),
-                    box_dims=(
-                        [128, cta_tile_mnk[1] // b_mcast_slices, 1, 1, 1]
-                        if cutlass.const_expr(moe_blocked_b)
-                        else [cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1]
-                    ),
+                    # Canonical [gate,up] rows are exposed as
+                    # (K, i8, projection, q=N/8, expert).  One box gathers
+                    # 64 output channels from both projections into M=128.
+                    global_dims=[k_sym, 8, 2, n // 8, num_experts],
+                    global_strides=[
+                        b_stride_n * ab_dtype.width // 128,
+                        n * b_stride_n * ab_dtype.width // 128,
+                        8 * b_stride_n * ab_dtype.width // 128,
+                        b_stride_l * ab_dtype.width // 128,
+                    ],
+                    box_dims=[cta_tile_mnk[2], 8, 2, cta_tile_mnk[1] // 8, 1],
                     swizzle=ab_tma_swizzle,
                 )
             )
@@ -1499,7 +1488,7 @@ def _host(
     if cutlass.const_expr(not moe_static_sched):
         counter_qword = grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS
         _reset_moe_sched_counter(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
-    _kernel(
+    frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl(
         problem_size[0],
         problem_size[1],
         problem_size[2],
@@ -1507,14 +1496,16 @@ def _host(
         cutlass.Int32(num_groups),
         first_token_offset,
         a_tma_workspace,
-        # @@INJECT_HOST_KERNEL_DESC_PASS@@
-        # @@INJECT_MOE_HOST_MA_PASS@@
-        # @@INJECT_HOST_TAP_PASS@@
-        # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
-        # @@INJECT_HOST_AUX_PASS@@
-        # @@TMA_STORE_ONLY:BEGIN@@
-        # @@INJECT_HOST_TMA_C_PASS@@
-        # @@TMA_STORE_ONLY:END@@
+        tma_a_desc_list[0],
+        tma_b_desc_list[0],
+        tma_b_desc_list[0],
+        a_0,
+        c_0,
+        _a_stride_sets[0][0],
+        out_stride_m_0,
+        out_stride_n_0,
+        out_stride_l_0,
+        tma_c_desc_list[0],
     ).launch(
         grid=grid_shape,
         block=(threads_per_cta, 1, 1),
@@ -1546,25 +1537,10 @@ def compile() -> Callable:
         )
 
     def _make_fake_b():
-        if moe_blocked_b:
-            # Each expert's packed block is contiguous; expert pitch is an
-            # independent 16-byte-aligned TMA stride. Compact fake strides
-            # inherit output-vector divisibility and overconstrain that pitch.
-            return cute.runtime.make_fake_tensor(
-                mma_b_dtype,
-                (sym_n, sym_k, sym_e),
-                stride=(sym_k, 1, cute.sym_int64(divisibility=ab_stride_elems)),
-                assumed_align=16,
-            )
-        # Ordinary weights can be slices of a wider parent or have padding.
-        # TMA consumes their explicit strides; do not derive expert pitch from
-        # sym_n, whose output-vector divisibility is unrelated to weight storage.
-        b_outer = cute.sym_int64(divisibility=ab_stride_elems)
-        b_expert = cute.sym_int64(divisibility=ab_stride_elems)
         return cute.runtime.make_fake_tensor(
             mma_b_dtype,
-            (sym_n, sym_k, sym_e),
-            stride=(1, b_outer, b_expert) if b_is_n_major else (b_outer, 1, b_expert),
+            (sym_n * 2, sym_k, sym_e),
+            stride=(cute.sym_int64(divisibility=ab_stride_elems), 1, cute.sym_int64(divisibility=ab_stride_elems)),
             assumed_align=16,
         )
 
@@ -1595,11 +1571,13 @@ def compile() -> Callable:
     sym_b_strides = []
     for _ in range(num_b_operands):
         sym_b_strides.extend(_sym_operand_strides(b_is_n_major))
-    # @@INJECT_COMPILE_REDUCTION_STRIDE_DECLS@@
-    # @@INJECT_COMPILE_AB_FAKES@@
-    # @@INJECT_COMPILE_TAP_FAKES@@
+    sym_out_stride_m_0 = cute.sym_int64()
+    sym_out_stride_n_0 = cute.sym_int64()
+    sym_out_stride_l_0 = cute.sym_int64()
+    fake_a_0 = _make_fake_a()
+    fake_b_0 = _make_fake_b()
+    fake_b_1 = _make_fake_b()
 
-    # @@TMA_STORE_ONLY:BEGIN@@
     def _make_fake_c(_dt, _div, _mm):
         return make_fake_compact_tensor(
             _dt,
@@ -1608,8 +1586,7 @@ def compile() -> Callable:
             assumed_align=16,
         )
 
-    # @@INJECT_COMPILE_TMA_C_FAKES@@
-    # @@TMA_STORE_ONLY:END@@
+    fake_c_0 = _make_fake_c(cutlass.BFloat16, 1, False)
     problem_size = (
         sym_m,
         sym_n,
@@ -1618,21 +1595,21 @@ def compile() -> Callable:
         sym_g,
         *sym_a_strides,
         *sym_b_strides,
-        # @@INJECT_COMPILE_REDUCTION_STRIDE_SYMBOLS@@
+        sym_out_stride_m_0,
+        sym_out_stride_n_0,
+        sym_out_stride_l_0,
     )
-    # @@INJECT_COMPILE_AUX_FAKES@@
+    pass
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
     return _compile_cached(
         _host,
         problem_size,
         fake_first_token_offset,
         fake_a_tma_workspace,
-        # @@INJECT_COMPILE_AB_PASS@@
-        # @@INJECT_COMPILE_TAP_PASS@@
-        # @@INJECT_COMPILE_AUX_PASS@@
-        # @@TMA_STORE_ONLY:BEGIN@@
-        # @@INJECT_COMPILE_TMA_C_PASS@@
-        # @@TMA_STORE_ONLY:END@@
+        fake_a_0,
+        fake_b_0,
+        fake_b_1,
+        fake_c_0,
         stream=_fake_stream,
         options=frost_compile_options,
         # persistent object across processes (cudnn.frost.compiled_cache); the digest of THIS source is the key
