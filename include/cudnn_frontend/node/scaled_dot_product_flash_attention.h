@@ -2298,22 +2298,20 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
     // Deterministic dQ on the unified backward engine is selected through the engine's STAGES knob (the
     // heuristics never emit it): 2 kernels (dK/dV, then dQ) on SM10x and the kv-ordered dQ workspace reduction
     // (STAGES = 4) on SM90. Pins the arch's unified backward engine with its
-    // default {128,128} (SM10x) / {64,64} (SM90) bprop tiles.
+    // default {128,128} (SM10x) / {64,64} (SM90) bprop tiles. d = 256 on SM10x is only served by the 2-CTA
+    // split kernels (three stages), so it is pinned whether or not determinism was requested (as the composite
+    // node does).
     std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const override final {
-        if (!attributes.is_deterministic_algorithm) {
-            return {-1, {}};
-        }
         int32_t const sm_version = context.get_sm_version();
         int32_t const sm_major   = sm_version / 10;
         auto const& Q            = attributes.inputs.find(input_names::Q);
         int64_t const d_qk       = (Q != attributes.inputs.end() && Q->second) ? Q->second->get_dim()[3] : 0;
+        if (!attributes.is_deterministic_algorithm && !(sm_major == 10 && d_qk == 256)) {
+            return {-1, {}};
+        }
         if (sm_major == 10) {
-            // d > 128 needs the 2-CTA split kernels, which the unified engine does not have yet: no pin, so the
-            // heuristics (and, under AUTO, the composite node) take over.
-            if (d_qk > 128) {
-                return {-1, {}};
-            }
+            // d = 256 runs the 2-CTA split kernels: dK, dV and dQ kernels (three stages).
             int64_t const engine_id = (sm_version >= 107) ? 19 : 14;
             return {engine_id,
                     {{KnobType_t::TILE_M, 3},
@@ -2321,7 +2319,7 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
                      {KnobType_t::KERNEL_CFG, 2},
                      {KnobType_t::STREAM_K, 0},
                      {KnobType_t::TILE_CGA_M, 0},
-                     {KnobType_t::STAGES, 2}}};
+                     {KnobType_t::STAGES, d_qk == 256 ? 3 : 2}}};
         } else if (sm_major == 9) {
             return {13,
                     {{KnobType_t::TILE_M, 2},
