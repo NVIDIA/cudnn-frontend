@@ -297,11 +297,21 @@ def test_decode_graph_right_band_dense():
 
 @pytest.mark.L0
 def test_decode_graph_sink_dense():
-    """Attention sink folded once per Q row (dense cache: the engine row keeps
-    paged + sink declined, see engines.mismatch; S_q = 2 because cuDNN's
-    validator rejects a sink at S_q == 1, so 8:1 packing keeps the 16 rows); a
-    keyless batch keeps the sink's finite LSE and O := 0."""
+    """Attention sink folded once per Q row over a dense padded cache (S_q = 2,
+    8:1 packing: the 16-row tile); a keyless batch keeps the sink's finite LSE
+    and O := 0."""
     _run_graph(B=3, H=16, KH=2, s_q=2, lens=[700, 0, 300], page=0, sink=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [1, 2])
+def test_decode_graph_sink_paged(s_q):
+    """The sink fold over a paged cache (page 16), at S_q = 1 -- served since
+    #1095 lifted the validator's sink-at-decode rule and the row's paged + sink
+    decline -- and S_q = 2; the block-table loader and the epilogue fold had not
+    been compiled together on this tile before.  A keyless batch keeps the
+    sink's finite LSE and O := 0."""
+    _run_graph(B=3, H=16, KH=2, s_q=s_q, lens=[700, 0, 300], page=16, sink=True)
 
 
 @pytest.mark.L0

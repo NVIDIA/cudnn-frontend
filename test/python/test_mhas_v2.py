@@ -740,26 +740,31 @@ def test_sdpa_paged_decode_sink_keyless_rows_frost_L0(env_info, request, cudnn_h
 
 
 PAGED_DECODE_SINK_D256_CASES = [
-    # case_id, s_q, batches, h_q, h_kv, s_kv, left_bound, seq_len_kv
-    ("gpt_oss_shaped_sq1", 1, 4, 64, 8, 2048, 128, [2048, 1337, 129, 16]),
-    ("keyless_rows_sq4", 4, 2, 4, 1, 128, None, [1, 128]),
+    # case_id, s_q, batches, h_q, h_kv, s_kv, left_bound, seq_len_kv, template
+    # S_q * G <= 16 packed Q rows lower onto the d256 decode tile (decode_d256_f16);
+    # more rows stay on the prefill kernel (prefill_d256_f16) -- config_sm100.decode_d256_q_tile.
+    ("gpt_oss_shaped_sq1", 1, 4, 64, 8, 2048, 128, [2048, 1337, 129, 16], "decode_d256_f16"),
+    ("keyless_rows_sq4", 4, 2, 4, 1, 128, None, [1, 128], "decode_d256_f16"),
+    ("keyless_rows_sq32_prefill_tile", 32, 2, 4, 1, 128, None, [1, 128], "prefill_d256_f16"),
 ]
 
-@pytest.mark.parametrize("case_id,s_q,batches,h_q,h_kv,s_kv,left_bound,seq_len_kv", PAGED_DECODE_SINK_D256_CASES, ids=[c[0] for c in PAGED_DECODE_SINK_D256_CASES])
+@pytest.mark.parametrize("case_id,s_q,batches,h_q,h_kv,s_kv,left_bound,seq_len_kv,template", PAGED_DECODE_SINK_D256_CASES, ids=[c[0] for c in PAGED_DECODE_SINK_D256_CASES])
 @pytest.mark.L0
-def test_sdpa_paged_decode_sink_d256_prefill_tile_frost_L0(env_info, case_id, s_q, batches, h_q, h_kv, s_kv, left_bound, seq_len_kv, request, cudnn_handle):
-    """The two pinned sink graphs above at d=256. The (256, 256) flavor has no
-    decode tile (engines.py: the f16 row's cgas_by_d_shape lists (128, 128) and
-    (192, 128) only), so a decode graph on it runs prefill_d256_f16.py's PAGED_KV
-    specialization with the sink fold -- the prefill kernels' fold, whose
-    keyless-row select this PR adds (kv_empty: O := 0, LSE := sink) and which the
-    d128-envelope graphs above no longer reach since #1094 moved them to the
-    decode tile. gpt_oss_shaped_sq1: bf16, paged (page 16), s_q=1, 64/8 heads,
-    sink + left window 128 under BOTTOM_RIGHT with right_bound=0, the d64 graph's
-    mixed lengths. keyless_rows_sq4: bf16, paged, 4/1 heads, s_q=4, one batch with
-    a single live key (three keyless rows) and one with a full 128-key cache --
-    test_paged_graph_keyless_rows_sink_magnitude[d256]'s geometry with the
-    harness's N(0, 0.5) sink. TILE_CGA_M=2 asserted: the prefill pipeline."""
+def test_sdpa_paged_decode_sink_d256_frost_L0(env_info, case_id, s_q, batches, h_q, h_kv, s_kv, left_bound, seq_len_kv, template, request, cudnn_handle):
+    """The two pinned sink graphs above at d=256, plus a prefill-tile case. The
+    (256, 256) flavor lowers a decode-shaped graph (S_q * G <= 16 packed Q rows)
+    onto the d256 decode tile, decode_d256_f16.py, whose sink fold keeps the sink
+    logit on keyless rows (O := 0, LSE := sink) like the prefill kernels' select
+    from #1095; more rows run prefill_d256_f16.py's PAGED_KV specialization with
+    the prefill fold. ``template`` pins which one served (frost_routing tally).
+    gpt_oss_shaped_sq1: bf16, paged (page 16), s_q=1, 64/8 heads (8 rows), sink +
+    left window 128 under BOTTOM_RIGHT with right_bound=0, the d64 graph's mixed
+    lengths. keyless_rows_sq4: bf16, paged, 4/1 heads, s_q=4 (16 rows), one batch
+    with a single live key (three keyless rows) and one with a full 128-key cache
+    -- test_paged_graph_keyless_rows_sink_magnitude[d256]'s geometry with the
+    harness's N(0, 0.5) sink. keyless_rows_sq32_prefill_tile: the same at s_q=32
+    (128 rows: above the routed maximum, so the prefill kernel serves it; 31
+    keyless rows in the one-key batch)."""
     _require_frost_sm100()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -795,7 +800,7 @@ def test_sdpa_paged_decode_sink_d256_prefill_tile_frost_L0(env_info, case_id, s_
     test.cfg.fill_derived_fields()
     test.showConfig((request.node.name, len(PAGED_DECODE_SINK_D256_CASES)), request)
 
-    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, cga=2)
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, template=template)
 
 # # ==================================
 # # L0 ragged tests
