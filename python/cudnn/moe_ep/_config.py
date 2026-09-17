@@ -209,6 +209,12 @@ class MoeEpConfig:
             ("inference_tuning", self.inference_tuning),
             ("training_forward_tuning", self.training_forward_tuning),
         ):
+            if tuning.dgrad_optimization != "baseline":
+                raise ValueError(
+                    f"{name}.dgrad_optimization must be 'baseline'; "
+                    "dgrad optimization profiles are supported only by "
+                    "training_backward_tuning"
+                )
             if tuning.reduce_topk_in_kernel and (
                 data_path.combine_format is not MoeFormat.BF16
                 or data_path.output_format is not MoeFormat.BF16

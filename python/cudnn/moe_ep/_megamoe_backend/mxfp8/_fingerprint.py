@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-FINGERPRINT_SCHEMA_VERSION = 2
+FINGERPRINT_SCHEMA_VERSION = 3
 _KERNEL_IDENTITY_FIELDS = (
     "kernel_name",
     "kernel_source",

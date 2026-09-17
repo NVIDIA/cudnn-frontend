@@ -118,6 +118,11 @@ class Mxfp8KernelConfig:
     act_func: str = "swiglu"
     fc2_use_bulk: bool = False
     fc2_tma_stages: int | None = None
+    dgrad_optimization: Literal[
+        "baseline",
+        "rolling",
+        "ds3_ep4_v1",
+    ] = "baseline"
 
     def __post_init__(self) -> None:
         if self.physical_recv_pool_size <= 0:
@@ -130,8 +135,34 @@ class Mxfp8KernelConfig:
             raise ValueError("group_hint must be positive")
         if self.launch_cluster_count <= 0:
             raise ValueError("launch_cluster_count must be positive")
-        if self.col_quant_num_ctas <= 0:
+        if self.dgrad_optimization not in (
+            "baseline",
+            "rolling",
+            "ds3_ep4_v1",
+        ):
+            raise ValueError(
+                "dgrad_optimization must be 'baseline', 'rolling', or "
+                f"'ds3_ep4_v1', got {self.dgrad_optimization!r}"
+            )
+        if self.col_quant_num_ctas == -1:
+            if (
+                self.dgrad_optimization != "ds3_ep4_v1"
+                or not self.enable_grad_y2_col_quant
+            ):
+                raise ValueError(
+                    "col_quant_num_ctas=-1 requires ds3_ep4_v1 backward "
+                    "grad-y2 column quantization"
+                )
+        elif self.col_quant_num_ctas <= 0:
             raise ValueError("col_quant_num_ctas must be positive")
+        if (
+            self.dgrad_optimization == "ds3_ep4_v1"
+            and self.col_quant_num_ctas != -1
+        ):
+            raise ValueError(
+                "dgrad_optimization='ds3_ep4_v1' requires "
+                "col_quant_num_ctas=-1"
+            )
         if self.weight_storage_mode not in ("contiguous", "discrete"):
             raise ValueError(
                 "weight_storage_mode must be 'contiguous' or 'discrete', "
@@ -174,6 +205,10 @@ class Mxfp8KernelConfig:
             tuning = public.training_forward_tuning
         else:
             tuning = public.training_backward_tuning
+        backward = phase == "training_backward"
+        dgrad_optimization = (
+            tuning.dgrad_optimization if backward else "baseline"
+        )
         token_padding_block = (
             128 if training else parallel.token_padding_size
         )
@@ -188,19 +223,35 @@ class Mxfp8KernelConfig:
             experts_per_rank=topology.experts_per_rank,
             padding_block=token_padding_block,
         )
-        pool_capacity_upper_bound = (
-            worst_case_padded_recv_size
-            if parallel.max_recv_size_per_rank is None
-            else parallel.max_recv_size_per_rank
-        )
-        logical_route_limit = _logical_route_limit_for_physical_pool(
-            pool_capacity_upper_bound,
-            raw_route_count=raw_route_count,
-            experts_per_rank=topology.experts_per_rank,
-            padding_block=token_padding_block,
-        )
-        physical_recv_pool_size = pool_capacity_upper_bound
-        backward = phase == "training_backward"
+        if dgrad_optimization == "ds3_ep4_v1":
+            physical_recv_pool_size = worst_case_padded_recv_size
+            requested_physical_size = parallel.max_recv_size_per_rank
+            if (
+                requested_physical_size is not None
+                and requested_physical_size != physical_recv_pool_size
+            ):
+                raise ValueError(
+                    "dgrad_optimization='ds3_ep4_v1' requires public "
+                    "max_recv_size_per_rank to be the exact physical padded "
+                    f"receive pool ({physical_recv_pool_size}), not the "
+                    f"backward kernel logical route limit; got "
+                    f"{requested_physical_size}"
+                )
+            logical_route_limit = raw_route_count
+        else:
+            pool_capacity_upper_bound = (
+                worst_case_padded_recv_size
+                if parallel.max_recv_size_per_rank is None
+                else parallel.max_recv_size_per_rank
+            )
+            logical_route_limit = _logical_route_limit_for_physical_pool(
+                pool_capacity_upper_bound,
+                raw_route_count=raw_route_count,
+                experts_per_rank=topology.experts_per_rank,
+                padding_block=token_padding_block,
+            )
+            physical_recv_pool_size = pool_capacity_upper_bound
+        ds3 = dgrad_optimization == "ds3_ep4_v1"
         return cls(
             num_experts=topology.experts_per_rank,
             world_size=topology.ep_size,
@@ -229,11 +280,19 @@ class Mxfp8KernelConfig:
                 else tuning.group_hint
             ),
             token_back_mode=tuning.token_back_mode,
-            epi_flag_batch=tuning.epi_flag_batch,
+            epi_flag_batch=((4, 2) if ds3 else tuning.epi_flag_batch),
             flag_batch=tuning.token_in_flag_batch,
             fc2_in_kernel_topk_reduce=tuning.reduce_topk_in_kernel,
             weight_storage_mode=weight_storage_mode,
             launch_cluster_count=launch_cluster_count,
+            col_quant_num_ctas=(-1 if ds3 else 2368),
+            load_balance_mode=(
+                "atomic_counter"
+                if dgrad_optimization in ("rolling", "ds3_ep4_v1")
+                else "static"
+            ),
+            num_sched_stages=(2 if ds3 else None),
+            dgrad_optimization=dgrad_optimization,
         )
 
     @classmethod

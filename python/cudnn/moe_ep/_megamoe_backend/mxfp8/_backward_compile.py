@@ -80,6 +80,53 @@ _COMPILE_LOCK = threading.RLock()
 _COMPILE_CACHE: dict[tuple, CompiledMxfp8BackwardKernel] = {}
 
 
+def _dgrad_selector_kwargs(
+    config: Mxfp8KernelConfig,
+) -> dict[str, object]:
+    """Map the public MoeEP profile to upstream selector flags."""
+
+    return {
+        "enable_dgrad_optimizations": (
+            config.dgrad_optimization == "ds3_ep4_v1"
+        ),
+        "dgrad_schedule": (
+            "optimized"
+            if config.dgrad_optimization == "rolling"
+            else None
+        ),
+    }
+
+
+def _validate_resolved_dgrad_profile(
+    config: Mxfp8KernelConfig,
+    kernel: Any,
+) -> None:
+    """Reject drift between the MoeEP profile and upstream resolution."""
+
+    resolved_dgrad = kernel.resolved_dgrad_config
+    expected_upstream_profile = {
+        "baseline": "explicit",
+        "rolling": "optimized",
+        "ds3_ep4_v1": "ds3_ep4_v1",
+    }[config.dgrad_optimization]
+    actual_upstream_profile = resolved_dgrad["dgrad_optimization_profile"]
+    if actual_upstream_profile != expected_upstream_profile:
+        raise RuntimeError(
+            "Rubin dgrad profile resolution drifted from the MoeEP "
+            f"integration contract: requested {config.dgrad_optimization!r}, "
+            f"resolved {actual_upstream_profile!r}, expected "
+            f"{expected_upstream_profile!r}"
+        )
+    if (
+        config.dgrad_optimization == "ds3_ep4_v1"
+        and resolved_dgrad["dgrad_optimization_overrides"]
+    ):
+        raise RuntimeError(
+            "Rubin ds3_ep4_v1 resolved with unexpected downstream "
+            f"overrides: {resolved_dgrad['dgrad_optimization_overrides']!r}"
+        )
+
+
 def prepare_backward_kernel(
     resolved_config: ResolvedMoeEpConfig,
     config: Mxfp8KernelConfig,
@@ -134,7 +181,9 @@ def prepare_backward_kernel(
         enable_grad_y2_col_quant=config.enable_grad_y2_col_quant,
         num_ctas_grad_y2_col_quant=config.col_quant_num_ctas,
         weight_storage_mode=config.weight_storage_mode,
+        **_dgrad_selector_kwargs(config),
     )
+    _validate_resolved_dgrad_profile(config, kernel)
     local_bytes, shared_bytes = kernel.get_workspace_sizes()
     local_zero, shared_zero = kernel.require_zero_workspace_leading_bytes
     device_workspace = kernel._mega_device_workspace

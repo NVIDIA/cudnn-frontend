@@ -41,6 +41,13 @@ _EPI_FLAG_BATCHES = frozenset(
 )
 _TOKEN_IN_FLAG_BATCHES = frozenset({1, 2, 4, 8, 16})
 _GROUP_HINTS = frozenset({64, 128, 256, 512, 768, 1024})
+_DGRAD_OPTIMIZATIONS = frozenset(
+    {
+        "baseline",
+        "rolling",
+        "ds3_ep4_v1",
+    }
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -53,6 +60,12 @@ class MoeEpTuningConfig:
 
     ``group_hint=None`` preserves the default behavior: the backend uses the
     number of hardware-resident CTA clusters.
+
+    ``dgrad_optimization`` applies only to training backward. ``baseline``
+    preserves the default grouped schedule, ``rolling`` selects the upstream
+    rolling schedule, and ``ds3_ep4_v1`` selects the strictly qualified
+    upstream preset. The DS3 profile owns its preset fields and canonicalizes
+    ``epi_flag_batch`` to ``(4, 2)``.
     """
 
     token_back_mode: TokenBackMode = "epi_warps"
@@ -60,6 +73,11 @@ class MoeEpTuningConfig:
     token_in_flag_batch: int = 1
     group_hint: int | None = None
     reduce_topk_in_kernel: bool = False
+    dgrad_optimization: Literal[
+        "baseline",
+        "rolling",
+        "ds3_ep4_v1",
+    ] = "baseline"
 
     def __post_init__(self) -> None:
         if not isinstance(self.token_back_mode, str) or self.token_back_mode not in _TOKEN_BACK_MODES:
@@ -72,8 +90,44 @@ class MoeEpTuningConfig:
             raise ValueError("group_hint must be None or one of " f"{tuple(sorted(_GROUP_HINTS))}, got {self.group_hint!r}")
         if not isinstance(self.reduce_topk_in_kernel, bool):
             raise ValueError("reduce_topk_in_kernel must be a bool, got " f"{self.reduce_topk_in_kernel!r}")
+        if (
+            not isinstance(self.dgrad_optimization, str)
+            or self.dgrad_optimization not in _DGRAD_OPTIMIZATIONS
+        ):
+            raise ValueError(
+                "dgrad_optimization must be one of "
+                f"{tuple(sorted(_DGRAD_OPTIMIZATIONS))}, got "
+                f"{self.dgrad_optimization!r}"
+            )
         if self.reduce_topk_in_kernel and self.token_back_mode != "epi_warps":
             raise ValueError("reduce_topk_in_kernel requires " "token_back_mode='epi_warps'")
+        if self.dgrad_optimization != "ds3_ep4_v1":
+            return
+        if self.token_back_mode != "epi_warps":
+            raise ValueError(
+                "dgrad_optimization='ds3_ep4_v1' requires "
+                "token_back_mode='epi_warps'"
+            )
+        if self.epi_flag_batch not in ((1, 1), (4, 2)):
+            raise ValueError(
+                "dgrad_optimization='ds3_ep4_v1' requires "
+                "epi_flag_batch=(1, 1) or (4, 2)"
+            )
+        if self.token_in_flag_batch != 1:
+            raise ValueError(
+                "dgrad_optimization='ds3_ep4_v1' requires "
+                "token_in_flag_batch=1"
+            )
+        if self.group_hint is not None:
+            raise ValueError(
+                "dgrad_optimization='ds3_ep4_v1' requires group_hint=None"
+            )
+        if self.reduce_topk_in_kernel:
+            raise ValueError(
+                "dgrad_optimization='ds3_ep4_v1' requires "
+                "reduce_topk_in_kernel=False"
+            )
+        object.__setattr__(self, "epi_flag_batch", (4, 2))
 
 
 @dataclass(frozen=True)

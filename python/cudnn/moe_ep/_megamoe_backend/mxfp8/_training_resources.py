@@ -392,7 +392,7 @@ def _build_training_abi_facts(
     public = config.public_config
     topology = config.topology
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "source_tree_sha256": source_tree_digest,
         "ep": {
             "size": topology.ep_size,
