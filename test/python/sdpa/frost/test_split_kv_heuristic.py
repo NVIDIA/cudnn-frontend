@@ -418,6 +418,82 @@ def test_decode_rows_barely_pay_for_the_combine():
     assert decode >= prefill
 
 
+def test_unsplit_leg_pays_no_combine():
+    """The unsplit leg runs ONE kernel -- no combine is launched -- so the model
+    charges it none. Charging it one combine wave-set (``s = 1`` in the combine
+    term) under-priced the reduction a split adds by exactly that much, which
+    flipped small-KV launches with many output rows to a split that measures
+    slower (B200, d128 bf16, S_kv=4096 = 32 KV tiles, kernel time):
+
+        b=8 h=32/8 S_q=64 paged, cga1, 16384 rows:  unsplit 67.6 us, split 2 75.0 us
+        b=4 h=32/8 S_q=128 dense causal, cga2:      unsplit 120.2 us, split 2 155.5 us
+
+    while a cheap combine still lets the model split where that pays:
+
+        b=8 h=32/8 S_q=16 paged, cga1, 4096 rows:   split 2 49.4 us, unsplit 65.3 us
+        b=8 h=64/4 S_q=1 paged, cga1, 512 rows:     split 4 27.5 us, unsplit 63.6 us
+    """
+    common = dict(q_tiles=1, kv_tiles=32, sm_count=B200_SMS)
+    assert choose_split_kv(heads_q=8, batch=8, ctas_per_tile=1, combine_rows=64 * 32 * 8, **common) == 1
+    assert choose_split_kv(heads_q=8, batch=4, ctas_per_tile=2, combine_rows=128 * 32 * 4, **common) == 1
+    assert choose_split_kv(heads_q=8, batch=8, ctas_per_tile=1, combine_rows=16 * 32 * 8, **common) == 2
+    assert choose_split_kv(heads_q=4, batch=8, ctas_per_tile=1, combine_rows=1 * 64 * 8, **common) == 4
+
+
+def test_unsplit_leg_accounting_reaches_the_wide_head_flavors():
+    """The unsplit leg carrying no combine term is not a d128 rule: every
+    flavor's split leg runs the same arithmetic. On the d192x128 and d256 f16
+    flavors (cga2 clusters, 128-row KV tiles) the launches it moves are
+    few-unit 2k-KV chunks with thousands of output rows, where the phantom
+    combine wave-set used to outweigh halving a 16-tile loop. Measured on B200
+    (bf16 dense, kernel time, heuristic lead against the split 2 the old
+    accounting led with, pinned by knobs):
+
+        d256 b=1 h=64/4 S_q=128 S_kv=2048 mask-free:  unsplit 51.7 us, split 2 75.3 us
+        d192 b=1 h=32/8 S_q=256 S_kv=2048 causal:     unsplit 35.3 us, split 2 60.9 us
+    """
+    wide = dict(batch=1, kv_tiles=16, sm_count=B200_SMS, ctas_per_tile=2, combine_rows=8192)
+    # d256: a 256-row cga2 cluster, packed G=16 -> 2048 rows per unit -> 8 Q tiles x 4 KV heads.
+    assert choose_split_kv(q_tiles=8, heads_q=4, **wide) == 1
+    # d192: a 512-row cga2 cluster, packed G=4 -> 1024 rows per unit -> 2 Q tiles x 8 KV heads.
+    assert choose_split_kv(q_tiles=2, heads_q=8, **wide) == 1
+
+
+def test_lone_combine_blocks_pay_the_latency_floor():
+    """A combine block walks its ``s`` partials serially; with fewer output rows
+    than the machine holds at once nothing hides that chain, so a partial costs
+    the lone-block price (_SPLIT_KV_COMBINE_FLOOR) however few combine waves
+    the rows make. Fed the per-wave price alone, a few-unit launch read the
+    combine as nearly free and split until the wave was full -- one power of
+    two past the measured optimum (B200, d128 bf16 paged, kernel time, the
+    grid inside one wave throughout):
+
+        b=1 h=16/2 S_q=1 S_kv=32k, cga1 (2 units, 16 rows):  split 64 50.8 us, split 32 39.7 us
+        b=1 h=64/4 S_q=1 S_kv=4k,  cga1 (4 units, 64 rows):  split 16 22.3 us, split 8  20.3 us
+        b=1 h=32/8 S_q=1 S_kv=4k,  cga1 (8 units, 32 rows):  split 16 23.6 us, split 8  20.3 us
+
+    while a ladder the wave boundary already stops keeps its choice:
+
+        b=1 h=64/4 S_q=1 S_kv=32k, cga1:  split 32 43.0 us (split 16 47.2 us)
+        b=4 h=64/4 S_q=1 S_kv=4k,  cga1:  split 8  21.5 us (split 4  25.4 us)
+        b=8 h=64/4 S_q=1 S_kv=4k,  cga1 (512 rows: four combine waves, above the floor):  split 4 26.6 us
+    """
+    lone = dict(q_tiles=1, batch=1, sm_count=B200_SMS, ctas_per_tile=1)
+    assert choose_split_kv(heads_q=2, kv_tiles=256, combine_rows=16, **lone) == 32
+    assert choose_split_kv(heads_q=4, kv_tiles=32, combine_rows=64, **lone) == 8
+    assert choose_split_kv(heads_q=8, kv_tiles=32, combine_rows=32, **lone) == 8
+    assert choose_split_kv(heads_q=4, kv_tiles=256, combine_rows=64, **lone) == 32
+    assert choose_split_kv(q_tiles=1, heads_q=4, batch=4, kv_tiles=32, combine_rows=256, sm_count=B200_SMS, ctas_per_tile=1) == 8
+    assert choose_split_kv(q_tiles=1, heads_q=4, batch=8, kv_tiles=32, combine_rows=512, sm_count=B200_SMS, ctas_per_tile=1) == 4
+    # The floor is a lone block's price and nothing more: it must sit below the
+    # per-wave price of the smallest launch _B300_FIT pins (2048 rows), or a
+    # future retune of either constant would move the fitted choices. (Imported
+    # here so the behaviour asserts above collect on a tree without the floor.)
+    from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_COMBINE_COST, _SPLIT_KV_COMBINE_FLOOR
+
+    assert _SPLIT_KV_COMBINE_FLOOR <= -(-(_FIT_S_Q * 4) // B200_SMS) * _SPLIT_KV_COMBINE_COST
+
+
 # --- a quantized O is a legal split target ---------------------------------
 #
 # The split kernels write HALF partials whatever the O dtype and the combine

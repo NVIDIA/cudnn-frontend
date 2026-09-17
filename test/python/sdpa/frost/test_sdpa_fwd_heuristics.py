@@ -467,6 +467,229 @@ def test_fallback_kind_is_least_demanding():
 
 
 # ---------------------------------------------------------------------------
+# d128 decode-shaped launches (FlashInfer paged GQA decode, MTP S_q in [2, 8])
+# ---------------------------------------------------------------------------
+#
+# The SM100 f16 row's d128 flavor: cga1 is the decode tile (one 128-row CTA per
+# (batch, packed head) unit, PR #1094), cga2 the prefill pipeline (512 rows per
+# cluster). The rules under test read the unit's live rows S_q * PACK_G: the
+# width (one decode tile), the causal scheduler (NATURAL first while one cga2
+# cluster covers the unit) and the split model's true CTA count plus its two
+# combine corrections. The measured B200 numbers live in the heuristics module
+# next to the rules; test_sdpa_fwd_decode_d128_sm100.py pins the decode tile's
+# own selection and kernel.
+
+
+def _decode_facts(**over):
+    """FlashInfer's paged GQA decode graph: b=32, 64/4 heads, d128 bf16, 4k KV."""
+    base = dict(b=32, h_q=64, h_kv=4, s_q=1, s_kv=4096, dtype=cudnn.data_type.BFLOAT16, causal=False, padded=True, has_paged_kv=True, page_size=16)
+    base.update(over)
+    return _facts(**base)
+
+
+def _f16_plans(facts):
+    plans = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
+    assert plans, "the f16 row must serve this graph"
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    return plans
+
+
+_DENSE = dict(has_paged_kv=False, padded=False, page_size=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(),  # S_q=1, G=16 packed: 16 live rows
+        dict(h_kv=8),  # G=8
+        dict(h_q=8, h_kv=8),  # MHA, nothing to pack: 1 live row
+        dict(h_q=96, h_kv=8),  # G=12 does not divide the tile -> packs 4 of 12 (partial PackGQA): 4 live rows per packed head
+        dict(s_q=4, causal=True, bottom_right=True),  # MTP
+        dict(s_q=8),  # 8 * 16 = 128 rows: exactly one decode tile
+        dict(**_DENSE),  # dense decode
+        dict(s_q=8, causal=True, bottom_right=True, window_left=255, has_paged_kv=False, padded=True, page_size=0),  # dense padded MTP + SWA
+    ],
+    ids=["fi_64_4", "fi_64_8", "mha", "partial_pack_96_8", "mtp4_br", "one_tile_exactly", "dense_decode", "dense_mtp_swa"],
+)
+def test_d128_decode_shaped_launch_leads_with_cga1(over):
+    """S_q * PACK_G <= 128: every set rides the decode tile (cga1 -- the only
+    width in this band, as test_sdpa_fwd_decode_d128_sm100 pins) and the lead
+    walks the plain scheduler even under a causal band (the one-cluster rule;
+    the LPT variants stay behind it as runners for autotune, as on every
+    causal graph). A pinned cga2 is still honored (test_d128_cga_request_domain)."""
+    plans = _f16_plans(_decode_facts(**over))
+    lead = plans[0].knobs
+    assert lead.cga == 1, lead
+    assert lead.sched_policy == 0, lead  # SCHED_NATURAL, even under a causal band
+    assert all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(s_q=129),  # 129 rows overflow one decode tile unpacked too (16 * 129 packed)
+        dict(s_q=300, h_q=8, h_kv=8),  # paged prefill, MHA
+        dict(s_q=4096, s_kv=4096, b=1, h_q=32, h_kv=8, causal=True, **_DENSE),  # prefill
+    ],
+    ids=["past_one_tile", "paged_prefill", "prefill_4k"],
+)
+def test_d128_prefill_shaped_launch_keeps_cga2(over):
+    """Above one decode tile's rows on every leg the plan list is what it was:
+    cga2 throughout. (A packed leg that overflows while its unpacked runner-up
+    fits is test_sdpa_fwd_decode_d128_sm100's per-candidate case.)"""
+    plans = _f16_plans(_decode_facts(**over))
+    assert all(p.knobs.cga == 2 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_d128_causal_scheduler_rule_stops_at_one_q_cluster():
+    """The one-cluster NATURAL rule ends exactly where the LPT remaps gain rows
+    to balance: at S_q * PACK_G <= 512 (one cga2 cluster) NATURAL leads with
+    the LPT variants behind it as runners -- on the prefill tile here, past
+    the decode tile's 128 rows -- and one row more restores LPT_L2 as the
+    causal primary with its runners; a 4k causal prefill is untouched."""
+    one = _f16_plans(_decode_facts(s_q=32, causal=True, bottom_right=True))  # 32 * 16 = 512 rows
+    assert one[0].knobs.sched_policy == 0, one[0].knobs
+    assert {SCHED_LPT, SCHED_LPT_L2} <= {p.knobs.sched_policy for p in one}, [p.knobs for p in one]
+    assert one[0].knobs.cga == 2, "512 packed rows are four decode tiles' worth: the prefill tile leads"
+    two = _f16_plans(_decode_facts(s_q=33, causal=True, bottom_right=True))  # 528 rows: two clusters
+    assert two[0].knobs.sched_policy == SCHED_LPT_L2, two[0].knobs
+    assert {SCHED_LPT, 0} <= {p.knobs.sched_policy for p in two}, [p.knobs for p in two]
+    prefill = _f16_plans(_decode_facts(s_q=4096, s_kv=4096, b=1, h_q=32, h_kv=8, causal=True, **_DENSE))
+    assert (prefill[0].knobs.sched_policy, prefill[0].knobs.cga) == (SCHED_LPT_L2, 2), prefill[0].knobs
+
+
+@pytest.mark.L0
+def test_d128_small_batch_units_split_only_where_the_combine_is_cheap():
+    """On the decode tile the wave model sees the true CTA count, so a small
+    batch splits finer than it did at cga2 -- right where the combine is one
+    wave, wrong where the output rows make it many: the unsplit leg runs no
+    combine and must not be charged one. Pinned to the B200 kernel times in
+    the heuristics module: b=8 h=32/8 S_q=64 paged bottom-right (256 rows per
+    unit -- one cga2 cluster, the prefill tile -- 16384 combine rows) and its
+    dense causal twin lead UNSPLIT on the plain scheduler (their split 2
+    measured 11% slower); S_q=16 at the same batch (64 rows: the decode tile,
+    4096 combine rows) leads with the split that pays, no-split reachable
+    behind it; the b=8 h=64/4 decode keeps its four splits; and the dense b=4
+    h=32/8 S_q=128 causal launch -- a cga2 unit -- stops proposing the split 2
+    that measured 29% slower than unsplit."""
+    chunk = dict(b=8, h_q=32, h_kv=8, s_q=64, causal=True)
+    for facts in (_decode_facts(bottom_right=True, **chunk), _decode_facts(**chunk, **_DENSE)):
+        lead = _f16_plans(facts)[0].knobs
+        assert (lead.cga, lead.split_kv, lead.pack_gqa, lead.sched_policy) == (2, 1, True, 0), lead
+    short = _f16_plans(_decode_facts(bottom_right=True, **{**chunk, "s_q": 16}))
+    assert (short[0].knobs.cga, short[0].knobs.split_kv) == (1, 2), short[0].knobs
+    assert any(p.knobs.cga == 1 and p.knobs.split_kv == 1 for p in short), [p.knobs for p in short]
+    decode = _f16_plans(_decode_facts(b=8))[0].knobs
+    assert (decode.cga, decode.split_kv) == (1, 4), decode
+    two_ctas = _f16_plans(_decode_facts(b=4, h_q=32, h_kv=8, s_q=128, causal=True, **_DENSE))
+    assert two_ctas[0].knobs.cga == 2, two_ctas[0].knobs
+    assert all(p.knobs.split_kv == 1 for p in two_ctas), [p.knobs for p in two_ctas]
+
+
+@pytest.mark.L0
+def test_d128_few_unit_long_kv_splits_to_the_combine_latency_floor():
+    """b=1 with a handful of KV heads: the whole launch is a few decode-tile
+    CTAs, so the split leg fills the wave with partials -- and once each split is a few
+    KV tiles, the combine's serial walk over them costs more than the loop
+    saves. The wave model prices that walk at a lone block's latency
+    (choose_split_kv's COMBINE_FLOOR), so the lead stops one power of two short
+    of the full wave where that is what measures (B200, paged bf16, kernel
+    time, heuristic lead against the split one step finer): h=16/2 S_kv=32k
+    32 splits at 39.7 us (64: 50.8); h=64/4 S_kv=4k 8 at 20.3 us (16: 22.3),
+    the same at S_q=4 MTP (25.4 vs 28.3) and for h=32/8 (20.3 vs 23.6). Where
+    the wave boundary already stops the split the lead is what it was:
+    h=64/4 S_kv=32k 32 splits (43.0 us; the base cga2 split 16: 48.5), b=4
+    h=64/4 S_kv=4k 8 (21.5 vs base 26.9) and b=8 4 (26.6 vs base 38.9)."""
+
+    def lead(**over):
+        knobs = _f16_plans(_decode_facts(**{"b": 1, **over}))[0].knobs
+        assert knobs.cga == 1 and knobs.pack_gqa is True and knobs.sched_policy == 0, knobs
+        return knobs.split_kv
+
+    assert lead(h_q=16, h_kv=2, s_kv=32768) == 32
+    assert lead(h_q=64, h_kv=4, s_kv=4096) == 8
+    assert lead(h_q=64, h_kv=4, s_kv=4096, s_q=4, causal=True, bottom_right=True) == 8
+    assert lead(h_q=32, h_kv=8, s_kv=4096) == 8
+    assert lead(h_q=64, h_kv=4, s_kv=32768) == 32
+    assert lead(b=4, h_q=64, h_kv=4, s_kv=4096) == 8
+    assert lead(b=8, h_q=64, h_kv=4, s_kv=4096) == 4
+
+
+@pytest.mark.L0
+def test_unsplit_leg_accounting_moves_the_wide_head_flavors_too():
+    """The unsplit leg paying no combine (choose_split_kv) is shared by every
+    flavor's split leg, so the d192x128 and d256 f16 leads it moves belong to
+    this change: few-unit 2k-KV chunks with thousands of output rows, whose
+    split 2 the phantom combine wave-set used to buy. Measured B200 bf16 dense
+    (heuristic lead against the old split 2 pinned): d256 b=1 h=64/4 S_q=128
+    mask-free 51.7 vs 75.3 us; d192 b=1 h=32/8 S_q=256 causal 35.3 vs 60.9 us.
+    Both stay on cga2 -- the cga1 rule is d128's alone -- and neither list
+    proposes a split any more."""
+    wide = dict(b=1, s_kv=2048, **_DENSE)
+    d256 = _f16_plans(_decode_facts(d_qk=256, d_v=256, h_q=64, h_kv=4, s_q=128, **wide))
+    d192 = _f16_plans(_decode_facts(d_qk=192, d_v=128, h_q=32, h_kv=8, s_q=256, causal=True, **wide))
+    for plans in (d256, d192):
+        assert (plans[0].knobs.cga, plans[0].knobs.split_kv) == (2, 1), plans[0].knobs
+        assert all(p.knobs.split_kv == 1 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_d128_cga_request_domain():
+    """The f16 row admits cga1 AND cga2 on d128, split or not (cga1 is the
+    decode tile, validated split and unsplit); a width the flavor has no
+    configuration for is declined, as is cga1 on the f16 d256 flavor, whose
+    kernel mandates CTA2. The fp8 d128 row keeps cga2 only
+    (test_quantized_cga_follows_selected_native_flavor pins that side)."""
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    for facts in (_decode_facts(), _decode_facts(s_q=4096, s_kv=4096, b=1, h_q=32, h_kv=8, causal=True, **_DENSE)):
+        for cga in (1, 2):
+            assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=cga)) is None
+            assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=cga, split_kv=2)) is None
+        assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=4))
+    d256 = _decode_facts(d_qk=256, d_v=256)
+    assert engines.mismatch(spec.capabilities, d256, engines.SdpaFwdKnobs(cga=2)) is None
+    assert "outside this engine's domain" in engines.mismatch(spec.capabilities, d256, engines.SdpaFwdKnobs(cga=1))
+
+
+@pytest.mark.L0
+def test_d128_width_rule_is_one_rule_for_graph_and_adapter():
+    """select_d128_auto_cga is the rule behind both the graph path
+    (_d128_decode_tile_fits derives pack_g from the candidate's packing) and
+    the standalone adapter's default width (api_dsl.SdpaFwdDslSm100, which
+    derives it from its pack_gqa request through pack_gqa_group_size): one
+    decode tile's rows decide (cga_tile_m(128, 1) == _D128_DECODE_TILE_ROWS),
+    THD keeps cga2.  (The adapter's cga DOMAIN is #1094's
+    test_standalone_cga_domain_admits_cga1_on_d128_f16_only.)"""
+    from cudnn.sdpa.fwd.config_sm100 import cga_tile_m, pack_gqa_group_size
+    from cudnn.sdpa.fwd.heuristics import _D128_DECODE_TILE_ROWS, _d128_decode_tile_fits, select_d128_auto_cga
+
+    assert cga_tile_m(128, 1) == _D128_DECODE_TILE_ROWS == 128
+    assert cga_tile_m(128, 2) == 512
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _F16).capabilities
+    cases = (
+        (1, 64, 4, True),
+        (8, 64, 4, True),
+        (9, 64, 4, True),
+        (9, 64, 4, False),
+        (32, 96, 8, True),
+        (33, 96, 8, True),
+        (128, 8, 8, False),
+        (129, 8, 8, False),
+    )
+    for s_q, h_q, h_kv, packed in cases:
+        facts = _decode_facts(s_q=s_q, h_q=h_q, h_kv=h_kv)
+        pack_g = pack_gqa_group_size(h_q // h_kv, 128, partial=True) if packed else 1
+        want = 1 if _d128_decode_tile_fits(caps, facts, packed) else 2
+        assert select_d128_auto_cga(s_q=s_q, pack_g=pack_g, thd=False) == want, (s_q, h_q, h_kv, packed, want)
+        assert want == (1 if s_q * pack_g <= 128 else 2), (s_q, h_q, h_kv, packed, want)
+    assert select_d128_auto_cga(s_q=1, pack_g=1, thd=True) == 2
+
+
+# ---------------------------------------------------------------------------
 # Executable tier — SM100 graph path
 # ---------------------------------------------------------------------------
 

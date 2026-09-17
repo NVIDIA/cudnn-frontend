@@ -30,18 +30,17 @@ pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 D = 128
 
 
-def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, causal_br=False):
-    """q [B, H, S_q, D] (every query row); pools in their storage layout; returns
-    (O [B, H, S_q, D_v], LSE [B, H, S_q]) fp32.  ``causal_br``: bottom-right
-    causal anchored at the per-batch KV length -- row r of a batch with L live
-    keys sees keys <= L - S_q + r.  A row with no visible key (L == 0, or
-    L < S_q - r under the mask) is dead: O := 0, LSE := -inf."""
-    B, H, S_q, d = q.shape
+def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, *, causal_br=False, window=None):
+    """q [B, H, S_q, D], every row live (seq_len_q == S_q); returns (O [B, H, S_q, D_v],
+    LSE [B, H, S_q]) fp32. Bottom-right causal anchors row r of batch b at key
+    L_b - S_q + r; ``window`` is cuDNN's ``sliding_window_length``: the ``window``
+    keys ending at the diagonal. A row without a live key is O := 0 / LSE := -inf."""
+    B, H, S, d = q.shape
     KH = k_pool.shape[1] if hnd else k_pool.shape[2]
     P = k_pool.shape[2] if hnd else k_pool.shape[1]
     Dv = v_pool.shape[-1]
-    out = torch.zeros(B, H, S_q, Dv, device=q.device, dtype=torch.float32)
-    lse = torch.full((B, H, S_q), float("-inf"), device=q.device, dtype=torch.float32)
+    out = torch.zeros(B, H, S, Dv, device=q.device, dtype=torch.float32)
+    lse = torch.full((B, H, S), float("-inf"), device=q.device, dtype=torch.float32)
     for b, L in enumerate(seq_lens.tolist()):
         if L == 0:
             continue
@@ -52,13 +51,17 @@ def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, causal_br=Fa
         k = k.reshape(-1, KH, d)[:L].repeat_interleave(H // KH, dim=1).float()
         v = v.reshape(-1, KH, Dv)[:L].repeat_interleave(H // KH, dim=1).float()
         s = torch.einsum("hrd,lhd->hrl", q[b].float(), k) * scale
+        rows = torch.arange(S, device=q.device).view(S, 1)
+        cols = torch.arange(L, device=q.device).view(1, L)
+        diag = rows + (L - S)
+        masked = torch.zeros(S, L, dtype=torch.bool, device=q.device)
         if causal_br:
-            r = torch.arange(S_q, device=q.device).view(1, S_q, 1)
-            j = torch.arange(L, device=q.device).view(1, 1, L)
-            s = s.masked_fill(j > L - S_q + r, float("-inf"))
-        # A fully-masked row softmaxes to NaN: it is dead, O := 0 (LSE is -inf already).
+            masked |= cols > diag
+        if window is not None:
+            masked |= cols < diag - (window - 1)
+        s = s.masked_fill(masked.view(1, S, L), float("-inf"))
         out[b] = torch.einsum("hrl,lhd->hrd", torch.softmax(s, -1).nan_to_num(0.0), v)
-        lse[b] = torch.logsumexp(s, -1)
+        lse[b] = torch.logsumexp(s, -1)  # keyless rows -> -inf
     return out, lse
 
 
@@ -87,10 +90,33 @@ def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0):
     return k_pool, v_pool, k_c, v_c, bt
 
 
-def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, stats=False, s_q=1, max_seq_len=None, want_split=None, causal_br=False):
-    """Build + run the paged graph on the FROST engine's own best plan (or the
-    ``want_split`` leg), check O (+ Stats) against ``_ref_rows`` and return the
-    plan.  ``causal_br`` adds the bottom-right causal mask (MTP at S_q > 1)."""
+def _run_graph(
+    B,
+    H,
+    KH,
+    d,
+    P,
+    max_pages,
+    lens,
+    hnd,
+    *,
+    dtype=torch.float16,
+    stats=False,
+    s_q=1,
+    max_seq_len=None,
+    want_split=None,
+    causal_br=False,
+    window=None,
+    want_cga=None,
+    pack_gqa=None,
+    lead_split=None,
+):
+    """Build, pin the FROST engine (``pack_gqa`` pins that leg), run under the
+    sync-debug guard and check every Q row against the fp32 gather reference.
+    ``causal_br`` / ``window`` add the bottom-right causal band and cuDNN's
+    ``sliding_window_length``; ``want_cga`` asserts the cluster width of the
+    plan run and ``lead_split`` the KV split the heuristics LED with (checked
+    before any ``want_split`` re-selection). Returns the pinned plan."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
@@ -109,7 +135,12 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
     q, k, v = g.tensor_like(q_gpu), g.tensor_like(k_c), g.tensor_like(v_c)
     tk, tv = g.tensor_like(bt), g.tensor_like(bt)
     sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
-    kw = dict(
+    mask_kw = {}
+    if causal_br:
+        mask_kw["use_causal_mask_bottom_right"] = True
+    if window is not None:
+        mask_kw["sliding_window_length"] = window
+    o, st = g.sdpa(
         name="sdpa",
         q=q,
         k=k,
@@ -122,10 +153,8 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
         paged_attention_k_table=tk,
         paged_attention_v_table=tv,
         paged_attention_max_seq_len_kv=max_seq_len if max_seq_len is not None else max_pages * P,
+        **mask_kw,
     )
-    if causal_br:
-        kw["use_causal_mask_bottom_right"] = True
-    o, st = g.sdpa(**kw)
     o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
     stats_gpu = None
     if stats:
@@ -134,13 +163,17 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name())
+    plan = select_engine(g, engine_name(), pack_gqa=pack_gqa)
+    if lead_split is not None:
+        assert plan.knobs.split_kv == lead_split, f"expected the heuristics to lead with split_kv={lead_split}; got {plan.knobs}"
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
         idx = next((i for i, n in enumerate(names) if n.startswith(engine_name()) and g.plans[i].knobs.split_kv == want_split), None)
         assert idx is not None, f"no {engine_name()} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
         plan = g.plans[idx]
+    if want_cga is not None:
+        assert plan.knobs.cga == want_cga, f"expected the heuristics to lead with cga={want_cga}; got {plan.knobs}"
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -156,20 +189,20 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
 
-    ref_o, ref_lse = _ref_rows(q_gpu, k_pool, v_pool, bt.view(B, max_pages), seq_lens, hnd, scale, causal_br)
+    ref_o, ref_lse = _ref_rows(q_gpu, k_pool, v_pool, bt.view(B, max_pages), seq_lens, hnd, scale, causal_br=causal_br, window=window)
     out = o_gpu.float()
     assert not torch.isnan(out).any(), "NaN in O"
     torch.testing.assert_close(out, ref_o, atol=2e-2 if dtype == torch.float16 else 1e-1, rtol=0)
-    # Dead rows: an empty sequence, or (bottom-right causal) a row that sits
-    # before the batch's first visible key.
-    dead = ~torch.isfinite(ref_lse)
-    if dead.any():
-        assert out[dead].abs().max().item() == 0.0, "a row with no visible key must write O := 0"
+    # Rows without a live key (empty sequence, or a bottom-right row whose whole
+    # band falls before key 0): O := 0 / LSE := -inf.
+    live = ~torch.isinf(ref_lse)
+    if (~live).any():
+        assert out[~live].abs().max().item() == 0.0, "a keyless row must write O := 0"
     if stats:
         got_lse = stats_gpu.view(B, H, s_q)
-        torch.testing.assert_close(got_lse[~dead], ref_lse[~dead], atol=5e-3, rtol=0)
-        if dead.any():
-            assert torch.isinf(got_lse[dead]).all() and (got_lse[dead] < 0).all(), "a row with no visible key must write LSE := -inf"
+        torch.testing.assert_close(got_lse[live], ref_lse[live], atol=5e-3, rtol=0)
+        if (~live).any():
+            assert torch.isinf(got_lse[~live]).all() and (got_lse[~live] < 0).all(), "a keyless row must write LSE := -inf"
     return plan
 
 
@@ -248,8 +281,10 @@ def test_paged_graph_partial_pack_gqa(hnd, h, kh, s_q):
     right causal at S_q > 1 with Stats out: the packed epilogue scatters LSE
     over the p head rows, the mask predicate is per token, and the KV head is
     packed head // (G / p); a slip in any of the three shows up here.  Lengths
-    include a 1-token sequence, so at S_q = 8 seven of its rows are dead."""
-    plan = _run_graph(4, h, kh, D, 16, -(-1100 // 16), [300, 77, 1, 1100], hnd, s_q=s_q, causal_br=s_q > 1, stats=True)
+    include a 1-token sequence, so at S_q = 8 seven of its rows are dead.  A
+    packed head holds S_q * p <= 32 live rows -- one decode tile's worth -- so
+    the lead is the decode tile (cga1) here too."""
+    plan = _run_graph(4, h, kh, D, 16, -(-1100 // 16), [300, 77, 1, 1100], hnd, s_q=s_q, causal_br=s_q > 1, stats=True, want_cga=1)
     assert plan.knobs.pack_gqa is True, plan.knobs
 
 
@@ -351,6 +386,148 @@ def test_paged_graph_declines_off_contract():
     assert not _offers(_build(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
     assert not _offers(_build(16, d=512)), "paged KV is wired on the d128 / d256 flavors only"
     assert not _offers(_build(16, padding=False)), "paged KV requires the padding mask"
+
+
+# --- decode-shaped launches on the graph path ---------------------------------
+#
+# S_q * PACK_G <= 128 live Q rows per (batch, packed head) unit: the heuristics
+# lead with cga1 -- the d128 decode tile, one CTA per unit (PR #1094) -- on the
+# plain scheduler (heuristics._auto_sched_cga / _sched_points); past that, up
+# to one cga2 cluster (512 rows), the prefill tile leads on the plain scheduler
+# too. These are graph-path runs under paged loads, PackGQA, the bottom-right /
+# sliding-window masks and the split model's small-batch choices on either tile;
+# test_sdpa_fwd_decode_d128_sm100.py pins the decode tile's own selection.
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+def test_paged_graph_decode_shaped_leads_with_cga1(hnd, page_size):
+    """FlashInfer-shaped decode (GQA 32:2, S_q=1, mixed lengths incl. 0 / 1 / a
+    page boundary / a tile boundary + 1): the lead plan is the decode tile (cga1)
+    + PackGQA on the plain scheduler, Stats out, at every page size."""
+    plan = _run_graph(8, 32, 2, D, page_size, -(-4096 // page_size), [4096, 77, 0, 1, 1024, 2000, 4095, 129], hnd, stats=True, want_cga=1)
+    assert plan.knobs.pack_gqa is True and plan.knobs.sched_policy == 0, plan.knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("pack_gqa", [True, False], ids=["packed", "unpacked"])
+@pytest.mark.parametrize("s_q,window", [(2, None), (4, None), (8, 300), (8, 1)], ids=["mtp2", "mtp4", "mtp8_swa300", "mtp8_swa1"])
+def test_paged_graph_mtp_bottom_right_cga1(s_q, window, pack_gqa):
+    """MTP: S_q in [2, 8] bottom-right causal (+ sliding window) over the paged
+    cache, GQA 32:4, lengths below S_q included (keyless rows are O := 0 /
+    LSE := -inf). Both PackGQA legs fit one decode tile (64 packed / 8 unpacked
+    rows per unit) and run at cga1 on the plain scheduler."""
+    plan = _run_graph(
+        6, 32, 4, D, 16, 256, [4096, 3, 0, 1, 1000, 4095], hnd=False, stats=True, s_q=s_q, causal_br=True, window=window, want_cga=1, pack_gqa=pack_gqa
+    )
+    assert plan.knobs.pack_gqa is pack_gqa and plan.knobs.sched_policy == 0, plan.knobs
+
+
+@pytest.mark.L0
+def test_paged_graph_group_not_dividing_tile_runs_unpacked_cga1():
+    """H/H_kv = 3 shares no factor with the 128-row tile, so nothing packs (a
+    group with a common factor packs its largest divisor -- partial PackGQA,
+    test_paged_graph_partial_pack_gqa): each head is its own one-live-row
+    unit -- one decode tile's worth, so cga1 leads unpacked."""
+    plan = _run_graph(4, 24, 8, D, 16, 64, [1000, 1, 0, 1024], hnd=True, dtype=torch.bfloat16, stats=True, want_cga=1)
+    assert plan.knobs.pack_gqa is False, plan.knobs
+
+
+@pytest.mark.L0
+def test_paged_graph_prefill_shaped_keeps_cga2():
+    """Past one decode tile's 128 rows (S_q=300, MHA) the paged prefill stays on
+    the cga2 prefill tile."""
+    _run_graph(2, 4, 4, D, 16, 32, [500, 128], hnd=False, s_q=300, want_cga=2)
+
+
+def _sm_count():
+    """SM count of the current device, from the owner the heuristics GPU test
+    reads too (test_sdpa_fwd_heuristics's split_kv-by-name case)."""
+    from cudnn._device import device_info
+
+    return device_info(torch.cuda.current_device()).sm_count
+
+
+_B200_SMS = 148  # the part the split choices below were measured on
+
+
+def _device_lead_split(B, H, KH, s_kv, *, s_q=1, causal_br=False, dtype=torch.float16, page_size=16):
+    """The KV split the heuristics lead with for this paged graph ON THIS DEVICE:
+    ``recommend`` fed the graph's facts and the device's SM count. A split is a
+    wave-count decision -- the 64-CTA launch that idles half of a 148-SM part
+    and splits in two fills a 68-SM part and stays unsplit -- so the graph
+    tests below assert the lead against the model rather than against one
+    part's number (the fixed 148-SM choices stay pinned in
+    test_sdpa_fwd_heuristics) and run whatever the device leads with."""
+    import cudnn
+    from cudnn.sdpa.fwd.engines import engine_name
+    from cudnn.sdpa.fwd.heuristics import recommend
+    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+
+    facts = SdpaGraphFacts(
+        b=B,
+        h_q=H,
+        h_kv=KH,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=D,
+        d_v=D,
+        dtype=cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16,
+        causal=causal_br,
+        bottom_right=causal_br,
+        padded=True,
+        has_paged_kv=True,
+        page_size=page_size,
+        wants_stats=True,
+        device_cc=torch.cuda.get_device_capability(),
+        device_sm_count=_sm_count(),
+    )
+    plans = recommend("A", facts, {engine_name(): 0})
+    assert plans, "the f16 row must serve this graph"
+    return plans[0].knobs.split_kv
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q,b200_split,cga", [(64, 1, 2), (16, 2, 1)], ids=["chunk64_unsplit_prefill_tile", "chunk16_split2_decode_tile"])
+def test_paged_graph_small_batch_chunk_splits_only_where_the_combine_is_cheap(s_q, b200_split, cga):
+    """b=8, GQA 32:8 (PACK_G=4), bottom-right causal over a 4k paged cache: a
+    launch that leaves half of a B200 idle. The S_q=16 chunk (64 rows per
+    unit) rides the decode tile and the wave model splits it in two (4096
+    combine rows); the S_q=64 chunk (256 rows, one cga2 cluster) rides the
+    prefill tile on the plain scheduler -- the one-cluster rule -- and stays
+    unsplit: the unsplit leg pays no combine (16384 combine rows; see
+    heuristics.choose_split_kv for the B200 measurements). The ids name those
+    148-SM choices, pinned when the device is that part; on any other part
+    the lead is the model's own for its SM count (a 68-SM part fills with the
+    64 CTAs and leaves both chunks unsplit). Both run under the sync-debug
+    guard and check every row, keyless ones included."""
+    lead_split = _device_lead_split(8, 32, 8, 4096, s_q=s_q, causal_br=True)
+    if _sm_count() == _B200_SMS:
+        assert lead_split == b200_split, f"the measured 148-SM choice moved: split_kv={lead_split}"
+    plan = _run_graph(
+        8, 32, 8, D, 16, 256, [4096, 3000, 77, 0, 1, 4095, 129, 2048], hnd=False, stats=True, s_q=s_q, causal_br=True, want_cga=cga, lead_split=lead_split
+    )
+    assert plan.knobs.pack_gqa is True and plan.knobs.sched_policy == 0, plan.knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("H,KH,s_kv,b200_split", [(16, 2, 32768, 32), (64, 4, 4096, 8)], ids=["b1_16_2_32k_split32", "b1_64_4_4k_split8"])
+def test_paged_graph_few_unit_long_kv_splits_to_the_latency_floor(H, KH, s_kv, b200_split):
+    """b=1 decode with two or four KV heads: the whole launch is a handful of
+    decode-tile CTAs (cga1), so the wave model splits the KV loop across the idle SMs -- and
+    stops where a finer split's partials cost the lone combine block more than
+    the loop saves (choose_split_kv's COMBINE_FLOOR): on a B200, 32 splits over
+    the 32k cache (39.7 us; 64 measured 50.8) and 8 over the 4k one (20.3 us;
+    16 measured 22.3) -- the ids name those 148-SM choices, pinned when the
+    device is that part; on any other part the lead is the model's own for its
+    SM count. Runs the lead under the sync-debug guard and checks O and Stats
+    against the fp32 gather reference."""
+    lead_split = _device_lead_split(1, H, KH, s_kv, dtype=torch.bfloat16)
+    if _sm_count() == _B200_SMS:
+        assert lead_split == b200_split, f"the measured 148-SM choice moved: split_kv={lead_split}"
+    plan = _run_graph(1, H, KH, D, 16, s_kv // 16, [s_kv], hnd=False, dtype=torch.bfloat16, stats=True, want_cga=1, lead_split=lead_split)
+    assert plan.knobs.pack_gqa is True and plan.knobs.sched_policy == 0, plan.knobs
 
 
 # --- kernel template, direct -----------------------------------------------
@@ -480,6 +657,49 @@ def test_paged_kernel_gqa_group_not_dividing_tile(h, kh, pack_g, d):
     token, two packed heads per KV head -- the G=128 geometry plus the
     PACKED_HEADS_PER_KV division; declined before partial packing."""
     _run_kernel(2, h, kh, 16, 8, [50, 128], hnd=False, splits=1, cta_mma=2, d=d, expect_pack_g=pack_g)
+
+
+@pytest.mark.L0
+def test_paged_adapter_default_width_follows_the_graph_rule():
+    """The standalone adapter with no ``cga`` requested defaults to the graph
+    heuristics' width (heuristics.select_d128_auto_cga, fed the PACK_G its
+    pack_gqa request implies): the decode tile (TILE_CGA_M=1) for a unit of
+    S_q * PACK_G <= 128 rows, the cga2 prefill pipeline past it; a requested
+    width is honored verbatim. Keeps the adapter and the row's plan lists in
+    lockstep (test_paged_adapter_cuda_graph_replay_no_host_sync below then
+    runs that default -- the decode tile with a 4-way split -- end to end)."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, KH, P, max_pages = 2, 4, 16, 32
+    dev, dtype = "cuda", torch.float16
+    _, _, k_c, v_c, _ = _pools(B, KH, D, P, max_pages, False, dtype, seed=2)
+
+    def cta_mma(s_q, h, **kw):
+        q = torch.empty(B, s_q, h, D, device=dev, dtype=dtype).transpose(1, 2)
+        o = torch.empty(B, s_q, h, D, device=dev, dtype=dtype).transpose(1, 2)
+        lse = torch.empty(B, h, s_q, device=dev, dtype=torch.float32)
+        api = SdpaFwdDslSm100(
+            sample_q=q,
+            sample_k=k_c,
+            sample_v=v_c,
+            sample_o=o,
+            sample_lse=lse,
+            seq_kv_lens_present=True,
+            seq_q_lens_present=True,
+            paged_page_size=P,
+            paged_max_seq_len_kv=max_pages * P,
+            **kw,
+        )
+        api.check_support()
+        return api.template_params().cta_mma
+
+    assert cta_mma(1, 16, pack_gqa=True) == 1, "S_q=1, G=4 packed: 4 rows -- the decode tile"
+    assert cta_mma(1, 16) == 1, "unpacked: one row per head -- the decode tile"
+    assert cta_mma(32, 16, pack_gqa=True) == 1, "32 * 4 = 128 rows: exactly one decode tile"
+    assert cta_mma(33, 16, pack_gqa=True) == 2, "33 * 4 = 132 rows overflow it: the prefill pipeline"
+    assert cta_mma(33, 16) == 1, "... while 33 unpacked rows per head still fit one decode tile"
+    assert cta_mma(300, 4) == 2, "S_q=300 MHA: the prefill pipeline"
+    assert cta_mma(1, 16, pack_gqa=True, cga=2) == 2, "a requested width is honored verbatim"
 
 
 @pytest.mark.L0
