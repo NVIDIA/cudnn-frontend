@@ -68,38 +68,42 @@ def _ref(q, k_pool, v_pool, block_table, seq_lens, hnd, scale):
     return out[:, :, 0], lse[:, :, 0]
 
 
-def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0):
+def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0, d_v=None):
     """Page pools + a scattered block table.  Returns (k_pool, v_pool, k_container,
     v_container, block_table[B, 1, max_pages, 1]) — the containers are the
-    [num_pages, H_kv, page_size, D]-dim views the graph declares."""
+    [num_pages, H_kv, page_size, D]-dim views the graph declares.  ``d_v`` (default
+    ``d``) sizes the V pool's head dim separately (mixed head dims)."""
+    d_v = d if d_v is None else d_v
     torch.manual_seed(seed)
     dev = "cuda"
     num_pages = B * max_pages + 5
     if hnd:
         k_pool = torch.randn(num_pages, KH, P, d, device=dev, dtype=dtype)
-        v_pool = torch.randn(num_pages, KH, P, d, device=dev, dtype=dtype)
+        v_pool = torch.randn(num_pages, KH, P, d_v, device=dev, dtype=dtype)
         k_c, v_c = k_pool, v_pool
     else:
         k_pool = torch.randn(num_pages, P, KH, d, device=dev, dtype=dtype)
-        v_pool = torch.randn(num_pages, P, KH, d, device=dev, dtype=dtype)
+        v_pool = torch.randn(num_pages, P, KH, d_v, device=dev, dtype=dtype)
         k_c, v_c = k_pool.permute(0, 2, 1, 3), v_pool.permute(0, 2, 1, 3)
     bt = torch.randperm(num_pages, device=dev)[: B * max_pages].to(torch.int32).view(B, 1, max_pages, 1).contiguous()
     return k_pool, v_pool, k_c, v_c, bt
 
 
-def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, stats=False, s_q=1, max_seq_len=None, want_split=None, causal_br=False):
+def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, stats=False, s_q=1, max_seq_len=None, want_split=None, causal_br=False, d_v=None):
     """Build + run the paged graph on the FROST engine's own best plan (or the
     ``want_split`` leg), check O (+ Stats) against ``_ref_rows`` and return the
-    plan.  ``causal_br`` adds the bottom-right causal mask (MTP at S_q > 1)."""
+    plan.  ``causal_br`` adds the bottom-right causal mask (MTP at S_q > 1);
+    ``d_v`` (default ``d``) gives V / O their own head dim (mixed head dims)."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
 
     dev = "cuda"
+    d_v = d if d_v is None else d_v
     scale = 1.0 / math.sqrt(d)
-    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype)
+    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype, d_v=d_v)
     q_gpu = torch.randn(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)
-    o_gpu = torch.empty(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)
+    o_gpu = torch.empty(B, s_q, H, d_v, device=dev, dtype=dtype).transpose(1, 2)
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     slk = seq_lens.view(B, 1, 1, 1)
     slq = torch.full((B, 1, 1, 1), s_q, dtype=torch.int32, device=dev)
@@ -126,7 +130,7 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
     if causal_br:
         kw["use_causal_mask_bottom_right"] = True
     o, st = g.sdpa(**kw)
-    o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
+    o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
     stats_gpu = None
     if stats:
         stats_gpu = torch.empty(B, H, s_q, 1, device=dev, dtype=torch.float32)
@@ -269,6 +273,20 @@ def test_paged_graph_d512(hnd, page_size):
 def test_paged_graph_d512_envelope_d384():
     """d=384 rides the d512 flavor zero-padded (the (256, 512] envelope); bf16, GQA 8:2."""
     _run_graph(3, 8, 2, 384, 32, 40, [1000, 1, 1279], hnd=False, dtype=torch.bfloat16, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk, d_v", [(256, 512), (512, 256)], ids=["dqk256_dv512", "dqk512_dv256"])
+def test_paged_graph_d512_cross_envelope(d_qk, d_v):
+    """One head dim at the d256 flavor's own width, the other in (256, 512]: the
+    paged gate admits the pair (both > 128, both <= 512 -- the mixed-dims clause
+    declines only a pair that would select d192x128) and the lowering picks the
+    d512 flavor, the smallest envelope covering BOTH dims, zero-padding the
+    256-wide operand (K boxes past d_qk read TMA-OOB zeros; the second V CTA's
+    box past d_v reads zeros and its O columns are store-clipped). Evidence that
+    the cross-envelope acceptance is correct, not just admitted (review). bf16,
+    GQA 8:2, HND, page 32, lengths incl. 0 and a tile-unaligned tail, Stats on."""
+    _run_graph(3, 8, 2, d_qk, 32, 40, [1000, 0, 1279], hnd=True, dtype=torch.bfloat16, stats=True, d_v=d_v)
 
 
 @pytest.mark.L0

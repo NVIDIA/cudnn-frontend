@@ -702,6 +702,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "paged KV requires use_padding_mask with seq_len_kv (the per-batch KV length bounds the block-table walk)"
         if facts.d_qk > 512 or facts.d_v > 512:
             return f"paged KV is wired on the d128 / d256 / d512 flavors only (d_qk, d_v <= 512); got ({facts.d_qk}, {facts.d_v})"
+        # Mixed head dims: only a pair that would select d192x128 (one dim <= 128,
+        # the other above it) declines. A pair straddling the d256 / d512 envelopes
+        # -- (256, 512), (512, 256) -- selects the d512 flavor (the smallest envelope
+        # covering BOTH dims, _selected_d_shape / api_dsl._pick_flavor agree) and
+        # runs zero-padded on the 256-wide side, exactly like 384/384; validated
+        # against the reference in test_paged_graph_d512_cross_envelope.
         if (facts.d_qk > 128 or facts.d_v > 128) and not (facts.d_qk > 128 and facts.d_v > 128):
             return f"paged KV with mixed head dims ({facts.d_qk}, {facts.d_v}) would select the d192x128 flavor, which is not wired"
         if facts.has_sink:
