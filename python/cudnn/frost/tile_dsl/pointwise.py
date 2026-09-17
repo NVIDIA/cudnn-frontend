@@ -153,6 +153,94 @@ def fp32_to_fp8_pack(values, *, dtype: Type[cutlass.Numeric]):
     return cutlass.Vector.from_elements((u0, u1, u2, u3), cutlass.Int32)
 
 
+def fp32_to_e2m1_pack(values):
+    """Pack 16 fp32 into 8 E2M1 bytes (two Int32 words), element i in nibble i.
+
+    ``cvt.rn.satfinite.e2m1x2.f32 d, a, b`` puts ``a`` in the upper nibble, so
+    the pair (values[2j+1], values[2j]) lands as byte j.
+    """
+    assert len(values) == 16, f"fp32_to_e2m1_pack: expected 16 input values, got {len(values)}"
+    w0, w1 = inline_ptx(
+        "{ .reg .b8 b0, b1, b2, b3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, $3,  $2;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, $5,  $4;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, $7,  $6;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, $9,  $8;\n"
+        "mov.b32 $0, {b0, b1, b2, b3};\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, $11, $10;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, $13, $12;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, $15, $14;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, $17, $16;\n"
+        "mov.b32 $1, {b0, b1, b2, b3}; }",
+        write_only_types=[cutlass.Int32, cutlass.Int32],
+        read_only_args=list(values),
+    )
+    return cutlass.Vector.from_elements((w0, w1), cutlass.Int32)
+
+
+@cute.jit
+def fp32_to_e2m1x2(lo: cutlass.Float32, hi: cutlass.Float32) -> cutlass.Int32:
+    """Two fp32 -> one E2M1 pair byte (lo in the low nibble), returned zero-extended in an Int32."""
+    return inline_ptx(
+        "{ .reg .b8 b; cvt.rn.satfinite.e2m1x2.f32 b, $2, $1; cvt.u32.u8 $0, b; }",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[lo, hi],
+    )
+
+
+@cute.jit
+def e4m3_scale_rcp(sf: cutlass.Float32):
+    """Round a positive fp32 scale to E4M3 and return ``(byte, 1/decoded)``.
+
+    The reciprocal is of the DECODED (rounded) scale so quantized data and the
+    stored scale stay self-consistent; a zero scale (all-zero block) yields 0.
+    """
+    byte_i32, dec = inline_ptx(
+        "{ .reg .b16 s16, h2lo; .reg .b32 h2;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 s16, $2, $2;\n"
+        "cvt.u32.u16 $0, s16;\n"
+        "and.b32 $0, $0, 0xFF;\n"
+        "cvt.rn.f16x2.e4m3x2 h2, s16;\n"
+        "mov.b32 {h2lo, s16}, h2;\n"
+        "cvt.f32.f16 $1, h2lo; }",
+        write_only_types=[cutlass.Int32, cutlass.Float32],
+        read_only_args=[sf],
+    )
+    inv = cutlass.Float32(1.0) / dec
+    if dec == cutlass.Float32(0.0):
+        inv = cutlass.Float32(0.0)
+    return byte_i32, inv
+
+
+@cute.jit
+def amax_to_ue8m0_rp(amax: cutlass.Float32):
+    """Encode ``amax / 448`` as a UE8M0 exponent byte (round up) and return ``(byte, 2^(127-e))``.
+
+    Same arithmetic as the MXFP8 bprop kernels' ``cvt_amax_to_e8m0_rp``: 448 is
+    ``1.75 * 2**8``, so the rounded-up scale exponent is the amax exponent minus
+    eight plus one when the significand exceeds 1.75. Byte 0 (amax == 0) maps to
+    an inverse of 0 so an all-zero block quantizes to zeros.
+    """
+    amax_bits = amax.bitcast(cutlass.Uint32)
+    exponent = (amax_bits >> 23) & cutlass.Uint32(0xFF)
+    mantissa = amax_bits & cutlass.Uint32(0x7FFFFF)
+    scale_exp = cutlass.Int32(exponent) - cutlass.Int32(8)
+    if mantissa > cutlass.Uint32(0x600000):
+        scale_exp = scale_exp + cutlass.Int32(1)
+    if exponent == cutlass.Uint32(0xFF):
+        scale_exp = cutlass.Int32(254)
+    if scale_exp < cutlass.Int32(0):
+        scale_exp = cutlass.Int32(0)
+    if scale_exp > cutlass.Int32(254):
+        scale_exp = cutlass.Int32(254)
+    inv = ((cutlass.Uint32(254) - cutlass.Uint32(scale_exp)) << 23).bitcast(cutlass.Float32)
+    if scale_exp == cutlass.Int32(0):
+        inv = cutlass.Float32(0.0)
+    if scale_exp == cutlass.Int32(254):
+        inv = cutlass.Uint32(1 << 22).bitcast(cutlass.Float32)
+    return scale_exp, inv
+
+
 @cute.jit
 def fp32_to_fp8x2(lo: cutlass.Float32, hi: cutlass.Float32, *, dtype: cutlass.Constexpr[Type[cutlass.Numeric]] = cutlass.Float8E4M3FN) -> cutlass.Uint16:
     """Pack two fp32 into fp8 bytes: low byte = fp8(lo), byte 1 = fp8(hi)."""

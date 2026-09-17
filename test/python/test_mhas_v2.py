@@ -1528,6 +1528,11 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         head_count=RandomHeadGenerator(min=1, max=16, head_group_options=(1, 5, 2)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
+        # Block-scaled O epilogue (FROST d128 per-tensor FP8 only): FP4 O + E4M3
+        # scales per 16 d (16) or E4M3 O + UE8M0 scales per 32 d (32), with the
+        # sf_o output. exec_sdpa_fp8 folds it to 0 on configs the epilogue does
+        # not serve (paged / ragged / d != 128), so the draw stays a plain fp8 run there.
+        o_block_scale=RandomChoice({0: 6, 16: 1, 32: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         # KNOWN GAP: a dense "padded" draw currently runs as full — exec_sdpa_fp8
