@@ -462,6 +462,18 @@ def test_paged_graph_d256_sink(hnd, s_q):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("s_q", [1, 4])
+def test_paged_graph_d192x128_sink(hnd, s_q):
+    """The d192x128 flavor's PAGED_KV specialization with the sink fold: a 192-wide K
+    pool and a 128-wide V pool, at S_q = 1 and as a four-token chunk under the
+    bottom-right causal diagonal (the one-key batch leaves its first rows keyless:
+    LSE = sink).  The sink fold (#1095) and the paged loader (this PR) landed
+    separately on this kernel; this is the first graph that compiles them together."""
+    _run_graph(3, 8, 2, 192, 32, 40, [1000, 1, 1279], hnd, s_q=s_q, sink=True, causal_br=s_q > 1, stats=True, d_v=128)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_q", [2, 4])
 def test_paged_graph_sink_multi_token_causal_br(s_q):
     """S_q in {2, 4} (speculative / multi-token decode) with the bottom-right causal
