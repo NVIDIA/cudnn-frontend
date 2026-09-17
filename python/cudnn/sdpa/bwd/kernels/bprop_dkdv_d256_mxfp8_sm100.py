@@ -2894,7 +2894,7 @@ class BlackwellFmhaBackwardDKDV256:
                     cute.gemm(
                         PdO_tiled_mma,
                         tDVtDV[None, None, None, 0],
-                        tDVrP[None, None, k_block, compute_mma_dS_consumer_state.index],
+                        tDVrP[None, None, k_block, compute_mma_P_consumer_state.index],
                         tDVrDOT[None, None, k_block, load_mma_VDO_release_state.index],
                         tDVtDV[None, None, None, 0],
                     )
@@ -3049,7 +3049,7 @@ class BlackwellFmhaBackwardDKDV256:
                     cute.gemm(
                         PdO_tiled_mma,
                         tDVtDV[None, None, None, 0],
-                        tDVrP[None, None, k_block, compute_mma_dS_consumer_state.index],
+                        tDVrP[None, None, k_block, compute_mma_P_consumer_state.index],
                         tDVrDOT[None, None, k_block, load_mma_VDO_release_state.index],
                         tDVtDV[None, None, None, 0],
                     )
