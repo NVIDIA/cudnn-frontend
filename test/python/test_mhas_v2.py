@@ -627,6 +627,15 @@ def test_sdpa_fwd_paged_gqa_partial_pack_pinned_frost_L0(env_info, s_q, request,
 # still-rejecting validator from a working feature. The s_q == 1 sweeps draw the
 # sink natively when FROST is on (_sq1_sink_token); the pinned graphs here
 # ASSERT that FROST served them (_require_frost_sm100 / _exec_sdpa_on_frost above).
+#
+# Two tiles can serve them since #1094: on the d128 flavor a decode / MTP shape
+# (s_q * PACK_G <= 128) rides the d128 decode tile (sm100/decode_d128_f16.py,
+# TILE_CGA_M=1), whose sink fold carries the same keyless-row select as the
+# prefill kernels'; every other flavor's decode graph runs its prefill kernel.
+# The routing tally names the engine only, so each pinned graph asserts its
+# tile (cga=): the two d128-envelope graphs the decode tile, the d256 pair the
+# prefill kernel (prefill_d256_f16.py -- (256, 256) has no decode tile,
+# engines.py cgas_by_d_shape lists (128, 128) and (192, 128) only).
 
 @pytest.mark.L0
 def test_sdpa_paged_decode_sink_sliding_window_frost_L0(env_info, request, cudnn_handle):
@@ -635,8 +644,9 @@ def test_sdpa_paged_decode_sink_sliding_window_frost_L0(env_info, request, cudnn
     GPT-OSS decode shape): bf16, paged KV (page 16), s_q=1, s_kv=2048 with mixed
     per-batch lengths (a full cache, a page-unaligned one, 129 = one KV tile plus
     a token, 16 = one page), sink_token, diagonal_band_left_bound=128 under
-    BOTTOM_RIGHT alignment with right_bound=0. Served by FROST (d128 envelope,
-    PackGQA group 8); the backend engines decline sink at s_q==1."""
+    BOTTOM_RIGHT alignment with right_bound=0. Served by FROST on the d128 decode
+    tile (d128 envelope, PackGQA group 8: 1 * 8 <= 128 rows; TILE_CGA_M=1
+    asserted); the backend engines decline sink at s_q==1."""
     _require_frost_sm100()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -672,7 +682,7 @@ def test_sdpa_paged_decode_sink_sliding_window_frost_L0(env_info, request, cudnn
     test.cfg.fill_derived_fields()
     test.showConfig((request.node.name, 1), request)
 
-    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, cga=1)
 
 
 @pytest.mark.L0
@@ -685,7 +695,9 @@ def test_sdpa_paged_decode_sink_keyless_rows_frost_L0(env_info, request, cudnn_h
     N(0, 0.5); the -120 sink that underflowed the FROST fold on exactly this
     geometry is pinned in test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py
     (test_paged_graph_keyless_rows_sink_magnitude). The backend can serve an
-    s_q=4 sink graph too; the routing assertion keeps FROST the engine under test."""
+    s_q=4 sink graph too; the routing assertion keeps FROST the engine under test,
+    on the d128 decode tile (4 * 4 <= 128 rows; TILE_CGA_M=1 asserted). The d256
+    twin below runs the same geometry on the prefill kernel."""
     _require_frost_sm100()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -720,7 +732,66 @@ def test_sdpa_paged_decode_sink_keyless_rows_frost_L0(env_info, request, cudnn_h
     test.cfg.fill_derived_fields()
     test.showConfig((request.node.name, 1), request)
 
-    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, cga=1)
+
+
+PAGED_DECODE_SINK_D256_CASES = [
+    # case_id, s_q, batches, h_q, h_kv, s_kv, left_bound, seq_len_kv
+    ("gpt_oss_shaped_sq1", 1, 4, 64, 8, 2048, 128, [2048, 1337, 129, 16]),
+    ("keyless_rows_sq4", 4, 2, 4, 1, 128, None, [1, 128]),
+]
+
+@pytest.mark.parametrize("case_id,s_q,batches,h_q,h_kv,s_kv,left_bound,seq_len_kv", PAGED_DECODE_SINK_D256_CASES, ids=[c[0] for c in PAGED_DECODE_SINK_D256_CASES])
+@pytest.mark.L0
+def test_sdpa_paged_decode_sink_d256_prefill_tile_frost_L0(env_info, case_id, s_q, batches, h_q, h_kv, s_kv, left_bound, seq_len_kv, request, cudnn_handle):
+    """The two pinned sink graphs above at d=256. The (256, 256) flavor has no
+    decode tile (engines.py: the f16 row's cgas_by_d_shape lists (128, 128) and
+    (192, 128) only), so a decode graph on it runs prefill_d256_f16.py's PAGED_KV
+    specialization with the sink fold -- the prefill kernels' fold, whose
+    keyless-row select this PR adds (kv_empty: O := 0, LSE := sink) and which the
+    d128-envelope graphs above no longer reach since #1094 moved them to the
+    decode tile. gpt_oss_shaped_sq1: bf16, paged (page 16), s_q=1, 64/8 heads,
+    sink + left window 128 under BOTTOM_RIGHT with right_bound=0, the d64 graph's
+    mixed lengths. keyless_rows_sq4: bf16, paged, 4/1 heads, s_q=4, one batch with
+    a single live key (three keyless rows) and one with a full 128-key cache --
+    test_paged_graph_keyless_rows_sink_magnitude[d256]'s geometry with the
+    harness's N(0, 0.5) sink. TILE_CGA_M=2 asserted: the prefill pipeline."""
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=1256,
+        rng_geom_seed=1256,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=batches,
+        d_qk=256,
+        d_v=256,
+        s_q=s_q,
+        s_kv=s_kv,
+        h_q=h_q,
+        h_k=h_kv,
+        h_v=h_kv,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
+        left_bound=left_bound,
+        right_bound=0,
+        seq_len_q=[s_q] * batches,
+        seq_len_kv=seq_len_kv,
+        with_sink_token=True,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, len(PAGED_DECODE_SINK_D256_CASES)), request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, cga=2)
 
 # # ==================================
 # # L0 ragged tests

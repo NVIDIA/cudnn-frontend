@@ -177,19 +177,25 @@ on B200 (SM100) — `test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py`,
 `test_sdpa_random_lean_attn_L0`, `test_sdpa_random_lean_attn_unified_L1` draw
 `with_sink_token` 1:3 when FROST engines are enabled, sink-free otherwise) and the
 pinned `test_sdpa_paged_decode_sink_sliding_window_frost_L0` /
-`test_sdpa_paged_decode_sink_keyless_rows_frost_L0` — per flavor: d128 at `S_q` in
+`test_sdpa_paged_decode_sink_keyless_rows_frost_L0` (both ride the d128 decode tileᵈᵗ
+since #1094 — `TILE_CGA_M=1` asserted — whose fold carries the same keyless-row
+select) and their d256 twin on the prefill kernels,
+`test_sdpa_paged_decode_sink_d256_prefill_tile_frost_L0` (the (256, 256) shape has
+no decode tile; `TILE_CGA_M=2` asserted) — per flavor: d128 at `S_q` in
 {1, 2, 4} (dense and paged, f16/bf16, PackGQA on and off, and partialᵐ -- 96/8 and 48/8,
 `sinks[row_head_idx]` stays the Q head under `PACK_G < G`); d64 on the d128 envelope
 at `S_q` in {1, 4} paged (bf16, 64/8 heads, sink + left window 128) and `S_q = 1`
-dense; d256 at `S_q` in {1, 2, 4} paged (f16; bf16 for the `S_q` 4 keyless-row sink
-case); d192x128 and d512 at `S_q` 4 dense (keyless rows, sink −120). Across them: HND and NHD pools, dense
+dense; d256 at `S_q` in {1, 2, 4} paged (f16, and bf16 at `S_q` 1 and 4: the
+keyless-row sink case and the pinned `test_mhas_v2` twin); d192x128 and d512 at
+`S_q` 4 dense (keyless rows, sink −120). Across them: HND and NHD pools, dense
 unpadded / dense padded / paged, sink + `diagonal_band_left_bound` + bottom-right
 causal (`right_bound = 0`); the `test_mhas_v2` sweeps add their own geometry at
 `S_q = 1` (d in 1..128 incl. mixed dims, GQA up to 32 heads, dense / padded /
 packed-THD, both alignments, `S_kv` up to 8192). A keyless row (`seq_len_kv[b] == 0`,
 or above the bottom-right diagonal) holds the sink's mass alone and writes `O = 0`,
-`LSE = sink` whatever the sink's magnitude: the four sm100 f16 kernels (d128,
-d192×128, d256, d512) select the fold's operands for such a row instead of computing
+`LSE = sink` whatever the sink's magnitude: the four sm100 f16 prefill kernels (d128,
+d192×128, d256, d512) — and the d128 decode tileᵈᵗ, which #1094 gave the same
+select — select the fold's operands for such a row instead of computing
 them (`exp(sink − max)` underflows in fp32 for sink ≤ −104, which used to give
 `O = NaN`, `LSE = −inf`; `test_paged_graph_keyless_rows_sink_magnitude` at −120 / −5 /
 +3 and `test_dsl_sm100_keyless_rows_very_negative_sink` on every flavor pin it). What
