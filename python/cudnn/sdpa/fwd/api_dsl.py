@@ -107,6 +107,24 @@ _SM100_DTYPE_QKV_CODE = {
     torch.float16: DTYPE_FP16,
 }
 _SM100_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _torch_fp4():
+    """``torch.float4_e2m1fn_x2`` when this torch build has it, else ``None``.
+
+    The packed FP4 dtype arrived in torch 2.8 and the torch dependency group is
+    unversioned, so every ORDINARY path resolves it lazily: a missing symbol
+    never matches a dtype comparison and never enters a dtype list. Only a
+    caller that actually hands over an FP4 O needs it (and cannot without it)."""
+    return getattr(torch, "float4_e2m1fn_x2", None)
+
+
+def _with_fp4(dtypes):
+    """``dtypes`` plus the packed FP4 dtype when the torch build exposes it."""
+    fp4 = _torch_fp4()
+    return [*dtypes, fp4] if fp4 is not None else list(dtypes)
+
+
 # FP8 kernels use E4M3/E5M2 inputs and BF16/FP16/FP8 outputs. Block-scale
 # Per-tensor and block-scale FP8 select independently from their native maps.
 _SM100_MXFP8_KERNEL_FILES = {
@@ -1531,7 +1549,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self._fp8:
             # FP8 input: O may be BF16/FP16 (half), FP8, or (per-tensor FP8 with
             # sample_sf_o) the packed FP4 container -- decoupled from the input dtype.
-            self.dtype_o = self._check_dtype(self.o_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES, torch.float4_e2m1fn_x2], name="O")
+            self.dtype_o = self._check_dtype(self.o_desc, _with_fp4([torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES]), name="O")
         else:
             self._check_dtype(
                 self.o_desc,
@@ -1669,9 +1687,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
         # Block-scaled O (sf_o): per-tensor FP8, d128 flavor, dense/unsplit/unpacked.
         self._dtype_o_code = _SM100_DTYPE_QKV_CODE.get(self.dtype_o)
-        if self.sf_o_desc is not None or self.dtype_o == torch.float4_e2m1fn_x2:
+        if self.sf_o_desc is not None or self.dtype_o == _torch_fp4():
             self._not_implemented_error_if(not (self._fp8 and self._pertensor), "a block-scaled O (sf_o / FP4 O) is served by the per-tensor FP8 path only")
-            if self.dtype_o == torch.float4_e2m1fn_x2:
+            if self.dtype_o == _torch_fp4():
                 self._value_error_if(self.sf_o_desc is None, "an FP4 (float4_e2m1fn_x2) O requires sample_sf_o (E4M3 scale factors, one per 16 d elements)")
                 self._check_dtype(self.sf_o_desc, torch.float8_e4m3fn, name="sf_o")
                 self.o_block_scale, self._dtype_o_code = 16, DTYPE_O_NVFP4
@@ -3917,9 +3935,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self.flavor = _sm120_pick_flavor(int(d_q), int(d_v), self._fp8)
         # Block-scaled O (sf_o): per-tensor FP8, d_v = 128, dense/unsplit/unpacked.
         self._dtype_o_code = _SM120_DTYPE_QKV_CODE.get(self.o_desc.dtype)
-        if self.sf_o_desc is not None or self.o_desc.dtype == torch.float4_e2m1fn_x2:
+        if self.sf_o_desc is not None or self.o_desc.dtype == _torch_fp4():
             self._not_implemented_error_if(not (self._fp8 and self._pertensor), "a block-scaled O (sf_o / FP4 O) is served by the per-tensor FP8 path only")
-            if self.o_desc.dtype == torch.float4_e2m1fn_x2:
+            if self.o_desc.dtype == _torch_fp4():
                 self._value_error_if(self.sf_o_desc is None, "an FP4 (float4_e2m1fn_x2) O requires sample_sf_o (E4M3 scale factors, one per 16 d elements)")
                 self._check_dtype(self.sf_o_desc, torch.float8_e4m3fn, name="sf_o")
                 self.o_block_scale, self._dtype_o_code = 16, DTYPE_O_NVFP4
@@ -3974,7 +3992,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             if self._fp8 and desc is self.o_desc:
                 # SDPA_FP8's O dtype is independent of QKV: fp16/bf16 ride the
                 # staging epilogue, fp8 the direct quantizing store.
-                self._check_dtype(desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES, torch.float4_e2m1fn_x2], name="O")
+                self._check_dtype(desc, _with_fp4([torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES]), name="O")
             else:
                 self._check_dtype(
                     desc,
@@ -5211,7 +5229,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
         )
         self._not_implemented_error_if(
-            self.sf_o_desc is not None or self.o_desc.dtype == torch.float4_e2m1fn_x2,
+            self.sf_o_desc is not None or self.o_desc.dtype == _torch_fp4(),
             "block-scaled O (sf_o / FP4 O) is served by the SM100-family per-tensor FP8 engines only",
         )
 
