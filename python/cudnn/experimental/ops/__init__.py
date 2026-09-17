@@ -21,7 +21,12 @@ def __getattr__(name: str) -> Any:
         target = _LAZY_ALIASES[name]
     except KeyError:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
-    module = importlib.import_module(target)
+    try:
+        module = importlib.import_module(target)
+    except ImportError as error:
+        from cudnn import _optional_dependency_message
+
+        raise ImportError(_optional_dependency_message(name, error)) from error
     sys.modules[f"{__name__}.{name}"] = module
     value = getattr(module, name)
     globals()[name] = value

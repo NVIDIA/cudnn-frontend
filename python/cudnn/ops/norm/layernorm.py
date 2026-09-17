@@ -351,9 +351,13 @@ def layer_norm(
             raise ValueError(f"{name} must match normalized_shape and be on the input device")
         if parameter.dtype not in allowed_parameter_dtypes:
             raise TypeError(f"{name} dtype must be one of {allowed_parameter_dtypes}, got {parameter.dtype}")
+    if weight is not None and bias is not None and weight.dtype != bias.dtype:
+        raise TypeError(f"weight and bias must have the same dtype, got {weight.dtype} and {bias.dtype}")
 
     original_shape = input.shape
     rows = input.numel() // hidden_size
+    if rows == 0:
+        raise ValueError("input must contain at least one normalization row")
     x_4d = input.reshape(rows, hidden_size, 1, 1).contiguous()
     scale_4d = (
         weight.float().reshape(1, hidden_size, 1, 1).contiguous()

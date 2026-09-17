@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Benchmark the experimental cuDNN PyTorch normalization ops."""
 
 import argparse
@@ -6,7 +9,6 @@ import statistics
 import torch
 
 from cudnn.experimental.ops import layer_norm, rms_norm
-
 
 MODELS = {
     "llama3-8b": 4096,

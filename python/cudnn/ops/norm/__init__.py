@@ -22,7 +22,12 @@ def __getattr__(name: str) -> Any:
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module_name, attr_name = target
-    value = getattr(importlib.import_module(module_name, __name__), attr_name)
+    try:
+        value = getattr(importlib.import_module(module_name, __name__), attr_name)
+    except ImportError as error:
+        from cudnn import _optional_dependency_message
+
+        raise ImportError(_optional_dependency_message(name, error)) from error
     globals()[name] = value
     return value
 

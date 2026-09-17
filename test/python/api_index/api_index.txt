@@ -296,7 +296,9 @@ cudnn.engines.is_backend_engine
 cudnn.engines.is_python_engine
 cudnn.engines.public_knobs_repr
 cudnn.experimental.ops
+cudnn.experimental.ops.layer_norm
 cudnn.experimental.ops.moe_grouped_matmul
+cudnn.experimental.ops.rms_norm
 cudnn.experimental.ops.swiglu_mlp
 cudnn.fla
 cudnn.fla.accelerate_fla

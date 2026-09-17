@@ -317,6 +317,8 @@ def rms_norm(
 
     original_shape = input.shape
     rows = input.numel() // hidden_size
+    if rows == 0:
+        raise ValueError("input must contain at least one normalization row")
     x_4d = input.reshape(rows, hidden_size, 1, 1).contiguous()
     scale_4d = weight.reshape(1, hidden_size, 1, 1).contiguous()
     bias_4d = bias.reshape(1, hidden_size, 1, 1).contiguous() if bias is not None else None
