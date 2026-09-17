@@ -710,6 +710,7 @@ cudnn.sdpa.fwd.SdpaFwdDslSm100.compile
 cudnn.sdpa.fwd.SdpaFwdDslSm100.execute
 cudnn.sdpa.fwd.SdpaFwdDslSm100.paged
 cudnn.sdpa.fwd.SdpaFwdDslSm100.scratch_workspace_bytes
+cudnn.sdpa.fwd.SdpaFwdDslSm100.template_params
 cudnn.sdpa.fwd.SdpaFwdDslSm120
 cudnn.sdpa.fwd.SdpaFwdDslSm120.check_support
 cudnn.sdpa.fwd.SdpaFwdDslSm120.compile
