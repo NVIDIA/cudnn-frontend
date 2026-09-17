@@ -1138,10 +1138,11 @@ class GdnSummaryFrostEngine(BaseEngine):
 
 
 class CompiledGdnSummary:
-    """Compiled summary plan over the state-only recompute kernel: the final-state call (initial_state honored) and, when
-    ``transition`` is bound, the identity-seeded zero-value call whose buffer holds ``M_buf = M^T`` (``X_final = X_init @
-    M_buf + X_H``).  ``chain`` summarizes every filled piece (H, M) and composes them with one fp32 state chain whose tail
-    is ``final_state`` and whose running product is ``transition``.  The chunk factor T comes from the T pass."""
+    """Compiled summary plan.  With ``transition`` bound the fused H + M summary kernel writes ``final_state`` (initial_state
+    honored) and ``M_buf = M^T`` (``X_final = X_init @ M_buf + X_H``), each in its own dtype, in one pass over K: on the uncut or
+    split table, or in ``chain`` plans per filled piece, composed by one fp32 state chain whose tail is ``final_state`` and
+    whose running product is ``transition``.  Without ``transition`` the state-only recompute kernel writes ``final_state``
+    alone.  The chunk factor T comes from the T pass."""
 
     def __init__(self, node, recompute_module):
         from .common.host import tensormap_workspace_bytes
@@ -1161,7 +1162,6 @@ class CompiledGdnSummary:
         self.run_l2norm_qk = run_l2norm_qk
         self.table = None
         self.final_cache = None
-        self.transition_cache = None
         self.l2norm = None
         self.tinv_cache = None
         self.run_chain_prologue = run_chain_prologue
@@ -1210,6 +1210,10 @@ class CompiledGdnSummary:
         self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
+        from .kernel import gdn_summary_f16 as summary_module
+
+        self.fused_summary = summary_module
+        self.fused_direct = self.has_transition and not self.chain
 
         layout = WorkspaceLayout()
         regions = []
@@ -1233,9 +1237,6 @@ class CompiledGdnSummary:
                 ("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)),
                 ("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
             ]
-            from .kernel import gdn_summary_f16 as summary_module
-
-            self.fused_summary = summary_module
             words = tensormap_workspace_bytes(summary_module, self.num_pieces) // 8
             regions.append(("fused_tensormaps", layout.add(words * 8, align=128), "int64", (words,)))
             from .kernel import gdn_tinv_f16 as tinv_module
@@ -1247,12 +1248,11 @@ class CompiledGdnSummary:
             regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
             regions.append(("tinv_row_count", layout.add(4), "int32", (1,)))
         else:
-            off_scheduler = layout.add(16)
-            tensormap_words = tensormap_workspace_bytes(recompute_module, B) // 8
+            off_scheduler = layout.add(8)
+            tensormap_words = max(tensormap_workspace_bytes(recompute_module, B), tensormap_workspace_bytes(summary_module, B)) // 8
             regions += [
                 ("scheduler_final", off_scheduler, "int32", (2,)),
-                ("scheduler_transition", off_scheduler + 8, "int32", (2,)),
-                ("scheduler_all", off_scheduler, "int32", (4,)),
+                ("scheduler_all", off_scheduler, "int32", (2,)),
                 ("tensormaps", layout.add(tensormap_words * 8), "int64", (tensormap_words,)),
             ]
             from .kernel import gdn_tinv_f16 as tinv_module
@@ -1276,9 +1276,7 @@ class CompiledGdnSummary:
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
         if self.use_qk_l2norm:
-            regions.append(("q_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
             regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
-            regions.append(("inv_q", layout.add(total * HK * 4), "float32", (total, HK)))
             regions.append(("inv_k", layout.add(total * HK * 4), "float32", (total, HK)))
         self.needs_table = self.split
         self.workspace_size = layout.size
@@ -1316,12 +1314,12 @@ class CompiledGdnSummary:
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         if self.use_qk_l2norm:
-            # the recompute takes no q; the k rows ride the q slots of the fused pass
+            k_n, inv_k = region["k_n"], region["inv_k"]
             if self.l2norm is None:
-                self.l2norm = self.build_l2norm_qk(k, k, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream=stream)
+                self.l2norm = self.build_l2norm_qk(k, k, k_n, k_n, inv_k, inv_k, skip_q=True, stream=stream)
             else:
-                self.run_l2norm_qk(self.l2norm, k, k, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream)
-            k = region["k_n"]
+                self.run_l2norm_qk(self.l2norm, k, k, k_n, k_n, inv_k, inv_k, stream)
+            k = k_n
         if self.chain:
             self.run_chain(k, v, g, beta, cu, state0, final_state, transition, a_log, dt_bias, region, stream)
             return
@@ -1350,7 +1348,8 @@ class CompiledGdnSummary:
         work_count = region["work_count"]
         item_scratch = region.get("item_scratch")
 
-        if self.final_cache is not None and (self.table is not None or not self.needs_table):
+        state_cache = self.fused_cache if self.fused_direct else self.final_cache
+        if state_cache is not None and (self.table is not None or not self.needs_table):
             if self.needs_table:
                 self.run_table(
                     self.table,
@@ -1366,6 +1365,28 @@ class CompiledGdnSummary:
                     stream,
                     expand_num=self.num_householder,
                 )
+            if self.fused_direct:
+                self.fused_summary.run_summary(
+                    self.fused_cache,
+                    k,
+                    v,
+                    g,
+                    cu,
+                    tinv,
+                    state0,
+                    final_state,
+                    transition,
+                    work_items,
+                    work_count,
+                    region["scheduler_final"],
+                    region["scheduler_all"],
+                    item_scratch,
+                    region["tensormaps"],
+                    stream,
+                    a_log=a_log if self.safe_gate else None,
+                    dt_bias=dt_bias if self.safe_gate else None,
+                )
+                return
             self.recompute.run_recompute(
                 self.final_cache,
                 k,
@@ -1387,28 +1408,6 @@ class CompiledGdnSummary:
                 dt_bias=dt_bias if self.safe_gate else None,
                 tinv=tinv,
             )
-            if self.has_transition:
-                self.recompute.run_recompute(
-                    self.transition_cache,
-                    k,
-                    k,
-                    g,
-                    cu,
-                    None,
-                    transition,
-                    None,
-                    work_items,
-                    work_count,
-                    region["scheduler_transition"],
-                    region["scheduler_all"],
-                    item_scratch,
-                    region["tensormaps"],
-                    0,
-                    stream,
-                    a_log=a_log if self.safe_gate else None,
-                    dt_bias=dt_bias if self.safe_gate else None,
-                    tinv=tinv,
-                )
             return
 
         if not self.needs_table:
@@ -1436,6 +1435,33 @@ class CompiledGdnSummary:
                 stream=stream,
             )
 
+        if self.fused_direct:
+            self.fused_cache = self.fused_summary.chunk_gdn_summary_sm100(
+                k,
+                v,
+                g,
+                cu,
+                tinv,
+                state0,
+                final_state,
+                transition,
+                work_items=work_items,
+                work_count=work_count,
+                scheduler_counter=region["scheduler_final"],
+                scheduler_all=region["scheduler_all"],
+                work_item_scratch=item_scratch,
+                order_in_prologue=True,
+                log_gate=self.log_gate,
+                safe_gate=self.safe_gate,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                expand_num=self.num_householder,
+                workspace=region["tensormaps"],
+                device=self.device,
+                num_sm=self.num_sm,
+                stream=stream,
+            )
+            return
         self.final_cache = self.recompute.chunk_gdn_recompute_sm100(
             k,
             v,
@@ -1460,33 +1486,6 @@ class CompiledGdnSummary:
             stream=stream,
             tinv=tinv,
         )
-        if self.has_transition:
-            self.transition_cache = self.recompute.chunk_gdn_recompute_sm100(
-                k,
-                k,
-                g,
-                cu,
-                None,
-                transition,
-                safe_gate=self.safe_gate,
-                a_log=a_log,
-                dt_bias=dt_bias,
-                seed_identity=True,
-                v_is_zero=True,
-                work_items=work_items,
-                work_count=work_count,
-                scheduler_counter=region["scheduler_transition"],
-                scheduler_all=region["scheduler_all"],
-                work_item_scratch=item_scratch,
-                order_in_prologue=True,
-                log_gate=self.log_gate,
-                expand_num=self.num_householder,
-                workspace=region["tensormaps"],
-                device=self.device,
-                num_sm=self.num_sm,
-                stream=stream,
-                tinv=tinv,
-            )
         return None
 
     def run_chain(self, k, v, g, beta, cu, state0, final_state, transition, a_log, dt_bias, region, stream) -> None:
