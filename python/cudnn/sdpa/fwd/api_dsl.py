@@ -400,20 +400,10 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
     that clears eligibility and dies in the lowering (contract rule 8b').  This
     is the wrapper twin of the engine rows leaving (192, 128) on their default
     ``cgas={2}``.  Keep the three in lockstep.
-
-    d128 f16/bf16 on the SM100 line (cc 10.0-10.6) accepts both widths as well:
-    cga1 is ``make_cfg_d128``'s Q/O-aliased SMEM configuration, the width the
-    graph heuristics lead with on decode-shaped launches
-    (``heuristics.select_d128_auto_cga``, also this adapter's default when no
-    ``cga`` is requested -- see ``compile()``) -- the twin of the sm100 f16
-    row's ``cgas_by_d_shape`` entry.  The Rubin f16 row and the fp8 / mxfp8
-    d128 lowerings stay on cga2.
     """
     if device_cc == (10, 7) and fp8 and flavor == (192, 128):
         return (2,)
     if flavor == (192, 128):
-        return (1, 2)
-    if not fp8 and device_cc != (10, 7) and flavor == (128, 128):
         return (1, 2)
     if fp8 and flavor == (256, 256):
         return (1,)
@@ -2063,8 +2053,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             from cudnn.sdpa.fwd.heuristics import select_d128_auto_cga
 
             # The standalone tier's default width is the graph heuristics' own
-            # (select_d128_auto_cga): cga1 when one CTA's rows cover every live
-            # row of a (batch, packed head) unit, cga2 otherwise. The f16 row's
+            # (select_d128_auto_cga): cga1 -- the DECODE tile, which
+            # _load_sm100_kernel_module selects for TILE_CGA_M=1 -- when one
+            # 128-row tile covers every live row of a (batch, packed head)
+            # unit, cga2 -- the prefill pipeline -- otherwise. The f16 row's
             # cgas_by_d_shape, supported_cgas_for above and this default stay
             # in lockstep; a requested cga was honored verbatim in the params.
             params = replace(

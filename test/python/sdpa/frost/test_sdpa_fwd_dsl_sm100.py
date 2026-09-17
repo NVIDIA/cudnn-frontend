@@ -5,7 +5,6 @@
 
 import math
 import os
-from dataclasses import replace
 
 import pytest
 import torch
@@ -742,8 +741,8 @@ def test_dsl_sm100_sink(dtype, d):
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_d128_decode_shaped_cga1_sink_swa(dtype):
-    """Decode-shaped d128 (MTP S_q=4, GQA 64:8 packed, b=8): the heuristics lead
-    with cga1 -- the kernel's QO-alias configuration -- and here it runs under
+    """Decode-shaped d128 (MTP S_q=4, GQA 64:8 packed, b=8: 32 rows per unit):
+    the heuristics lead with cga1 -- the d128 decode tile -- and here it runs under
     bottom-right causal + sliding window + attention sink + per-batch KV lengths
     (incl. lengths below S_q, whose keyless rows hold the sink's mass alone):
     the epilogue and mask features the paged suite cannot combine, since paged
@@ -1340,12 +1339,16 @@ def test_dsl_sm100_pack_gqa_knob_contract():
     assert pg[0] is False and True in pg, f"full-prefill GQA should rank unpacked first with packed runner-up; got {pg}"
 
 
-def _run_thd_causal(dtype, d, *, requested_cga=None):
-    """THD/varlen self-attention, per-sequence causal; two packed sequences of
-    unequal length. The heuristics' lead runs unless ``requested_cga`` pins that
-    cluster width through ``create_execution_plan`` -- the autotune-replay
-    entry, so the knob is honored verbatim or the engine declines (never
-    silently swapped). Checks O against the fp32 reference; returns the plan run."""
+# THD/varlen: packed [T,H,D] + per-operand ragged_offset (exclusive-prefix-sum of
+# seq_len) + seq_len_q/kv + use_padding_mask. Each sequence attends only within
+# itself (no cross-sequence attention).
+@pytest.mark.L0
+@pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd(dtype, d):
+    """THD/varlen self-attention, per-sequence causal; two packed sequences of unequal length."""
+    _require_dsl()
     import cudnn
 
     dev = "cuda"
@@ -1407,11 +1410,7 @@ def _run_thd_causal(dtype, d, *, requested_cga=None):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = _select_engine(g, engine_name(arch=_ARCH))
-    if requested_cga is not None:
-        g.create_execution_plan(plan.engine_id, replace(plan.knobs, cga=requested_cga))
-        g.select_plan(len(g.plans) - 1)
-        plan = g.plans[-1]
+    _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro, kro: ro, vro: ro, oro: ro}
@@ -1429,37 +1428,6 @@ def _run_thd_causal(dtype, d, *, requested_cga=None):
 
     o_out = o_stor[: T * H * d].reshape(T, H, d)
     torch.testing.assert_close(o_out, o_ref, atol=5e-2, rtol=3e-2)
-    return plan
-
-
-# THD/varlen: packed [T,H,D] + per-operand ragged_offset (exclusive-prefix-sum of
-# seq_len) + seq_len_q/kv + use_padding_mask. Each sequence attends only within
-# itself (no cross-sequence attention).
-@pytest.mark.L0
-@pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-@torch_fork_set_rng(seed=0)
-def test_dsl_sm100_thd(dtype, d):
-    """THD/varlen self-attention, per-sequence causal; two packed sequences of unequal length."""
-    _require_dsl()
-    _run_thd_causal(dtype, d)
-
-
-@pytest.mark.L0
-@pytest.mark.skipif(_SM == 107, reason="the Rubin f16 row keeps d128 on cga2 (no measured cga1 configuration there)")
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
-@torch_fork_set_rng(seed=0)
-def test_dsl_sm100_thd_d128_requested_cga1(dtype):
-    """Accept side of the d128 cga domain on a THD graph: the heuristics never
-    PROPOSE cga1 there (the persistent scheduler sizes its grid in clusters and
-    the cga1 grid is unmeasured on ragged batches -- the lead stays cga2), but a
-    caller who REQUESTS it through the replay entry is honored: the plan builds
-    at cga1 and runs the ragged batch correctly."""
-    _require_dsl()
-    lead = _run_thd_causal(dtype, 128)
-    assert lead.knobs.cga == 2, lead.knobs
-    pinned = _run_thd_causal(dtype, 128, requested_cga=1)
-    assert pinned.knobs.cga == 1, pinned.knobs
 
 
 # Issue #624: a THD caller binds K/V at BUFFER CAPACITY, not at the packed

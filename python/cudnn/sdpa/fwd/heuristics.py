@@ -433,13 +433,6 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # and spend autotune slots on it. Same exclusion the adapters apply to
         # their standalone-wrapper derivation.
         return [SCHED_NATURAL]
-    if SCHED_NATURAL in domain and _d128_f16_flavor(caps, facts) and _q_clusters_per_unit(caps, facts, None) == 1:
-        # One Q cluster per (batch, packed head) unit -- the d128 decode / MTP
-        # launch: every unit carries the same static tile weight, so the causal
-        # remaps have nothing to balance and only cost the remap (measurements
-        # at select_d128_auto_cga). No runners either: an autotune slot on a
-        # remap of identical units is a slot wasted.
-        return [SCHED_NATURAL]
     causal_ish = facts.causal or facts.right_band_widening
     if caps.sm_hi == 80:
         # SM80's measured choices (see the adapter's flavor table): causal
@@ -470,21 +463,25 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # are Rubin's cluster count and CGA rows, unmeasured on GeForce Blackwell).
         waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / _SM107_CLUSTERS
         primary = SCHED_LPT if waves <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
-    elif (
-        causal_ish
-        and caps.sm_lo == 100
-        and not (facts.is_fp8 or facts.is_mxfp8)
-        and _selected_d_shape(caps, facts) == (128, 128)
-        and 1 in effective_cgas(caps, facts)
-        and _d128_decode_tile_fits(caps, facts)
-    ):
-        # The d128 decode tile (bottom-right causal MTP, S_q * PACK_G <= 128):
-        # one Q tile per (packed head, batch), so every unit walks the same
-        # per-batch KV range and LPT has nothing to balance; LPT_L2's head
-        # grouping groups nothing when the packed head IS the KV head (only
-        # the G / PACK_G packed heads of a partially packed group).  Measured on
-        # B200 (b=32, H=64/4, S_q=4, S_kv=4096, page 16): NATURAL 120.0 us vs
-        # LPT_L2 125.4 us on the prefill tile; the decode tile keeps the order.
+    elif causal_ish and _d128_f16_flavor(caps, facts) and _q_clusters_per_unit(caps, facts, None) == 1:
+        # One Q cluster per (batch, packed head) unit on the SM100 f16 row's
+        # d128 flavor -- S_q * PACK_G <= 512: the decode tile's band
+        # (S_q * PACK_G <= 128, one 128-row tile per unit -- decode and MTP)
+        # and the one-cga2-cluster band above it (a chunk or speculative burst
+        # of up to 512 / PACK_G tokens on the prefill tile).  Every unit walks
+        # the same per-batch KV range with the same static tile weight, so LPT
+        # has nothing to balance; LPT_L2's head grouping groups nothing when
+        # the packed head IS the KV head (only the G / PACK_G packed heads of a
+        # partially packed group).  Measured on B200 (S_kv=4096 paged, bf16,
+        # bottom-right causal, kernel time): b=32 H=64/4 S_q=4 on the prefill
+        # tile NATURAL 120.0 us vs LPT_L2 125.4 us (the decode tile keeps the
+        # order); b=8 H=32/8 S_q=128 (512 rows, one cga2 cluster) NATURAL 62.9
+        # us vs LPT_L2 65.3 us.  One row more restores the L2-budget rule
+        # below.  The LPT variants stay behind as runners for autotune, as on
+        # every causal graph.  (d256 32/2 packed at cga2 flips sign between
+        # S_q=4 and 8 -- LPT_L2 / LPT / NATURAL 65.9 / 63.3 / 62.1 vs 64.8 /
+        # 65.0 / 66.6 us -- so that flavor keeps the rule below until it is
+        # measured on its own.)
         primary = SCHED_NATURAL
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
@@ -619,76 +616,44 @@ def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
 
 # --- d128 decode-shaped launches (SM100-line f16/bf16) ----------------------
 #
-# The d128 f16 kernel serves two cluster widths: cga2, the prefill default, and
-# cga1, which aliases Q and O in SMEM to fit (config_sm100.make_cfg_d128). One
-# CTA holds TILES_Q * TILE_M = 256 Q rows; a cga2 cluster holds 512. When every
-# live row of a (batch, packed head) unit fits ONE CTA -- S_q * G <= 256, the
-# paged GQA decode and MTP shapes a serving framework issues -- the cga2 peer
-# holds dead rows only and still issues every BMM1/BMM2 per KV tile, so cga1
-# halves the CTA count at the same per-CTA work and the launch fits in fewer
-# waves. Graph path, paged bf16 d128, S_kv=4096 full-length, page 16, B200
-# (148 SMs), GPU kernel time per execute (torch.profiler, best of 3 x 20), the
-# pre-change plan pinned by knobs against the heuristic plan in the same run:
-#     b=32 h=64/4 S_q=1        cga2 117.4 us  ->  cga1  66.0 us
-#     b=32 h=64/8 S_q=1        cga2 232.2 us  ->  cga1 135.1 us
-#     b=32 h=64/4 S_q=4 MTP    cga2 LPT_L2 125.0 us  ->  cga1 NATURAL 66.9 us
-#     b=32 h=96/8 S_q=4 MTP    cga2 unpacked 2624.8 us  ->  cga1 1273.3 us
-#     b=8  h=64/4 S_q=1        cga2 + SPLIT_KV=2  39.1 us  ->  cga1 + SPLIT_KV=4  27.5 us
-# (the b=8 "before" is the pre-change heuristic's own plan -- the wave-cost
-# model already split that 32-unit launch at cga2; fed ctas_per_tile=1 it
-# splits twice as fine and every split still fits one wave. At b=32 the 128
-# units fill one wave unsplit. Kernel time is what moved: an eager, non-graph
-# execute of either plan is host-bound at this size, ~130-190 us of wall per
-# call, so a caller must replay under a CUDA graph to see the win end to end.)
-# On square prefill shapes cga1 and cga2 measure within noise (the kernel's
-# docstring), so the rule stops at one CTA's rows and prefill keeps cga2:
-# dense causal / mask-free 4k prefill, b=1 h=32/8, unchanged at 1.00x. At the
-# rule's edge -- units of exactly one CTA's rows whose cga2 launch already fit
-# one wave, e.g. b=8 h=32/8 S_q=64 S_kv=4096 paged -- cga1 costs the K
-# multicast and measures 4% behind (67.6 vs 65.1 us); the split model, not the
-# width, decides that band (see the b=8 rows at S_q 16 / 64 / 128 below).
+# The SM100 f16 row's (128, 128) flavor has two tiles behind TILE_CGA_M
+# (_d128_decode_tile_fits below): cga1 IS the decode tile -- one independent
+# 128-row CTA per (batch, packed head) unit, sm100/decode_d128_f16.py -- and
+# cga2 the prefill pipeline, 512 rows per cluster.  The rules here measure a
+# unit by its live rows, S_q * PACK_G -- the kernel's packed subgroup (the
+# whole GQA group when it divides the tile, its largest divisor that does
+# under partial PackGQA, 96/8 -> 4; 1 unpacked), not the raw ratio G:
 #
-# What the plan lists lose and gain. Past one cga2 cluster per unit
-# (S_q * G > 512) every list is byte-identical to before. At or below it the
-# LPT / LPT_L2 scheduler runners are gone (the one-cluster NATURAL rule); at or
-# below 256 rows the lead moves to cga1 and cga2 stays behind it as a runner.
-# The split leg at cga1 sees the true CTA count (ctas_per_tile=1) -- the wave
-# model's constants are per CTA and a cga1 CTA does the work of a cga2 CTA --
-# so a small-batch launch splits finer than it did at cga2. That pays while
-# each split stays thick and the combine stays cheap; at both edges of that
-# band the model turned out to be mis-pricing the combine, and choose_split_kv
-# now carries the two corrections: the unsplit leg used to pay for a combine it
-# never runs (so a many-row chunk split when it should not), and a lone
-# combine block's serial walk over its partials was priced as if other blocks
-# hid it (so a few-unit b=1 launch split one power of two past the optimum).
-# Paged bf16 d128 S_kv=4096 page 16, B200 kernel time, pre-change plan ->
-# heuristic plan. h=32/8 b=8 bottom-right causal (the many-row edge):
-#     S_q=16  (64 rows)   cga2 LPT_L2 63.8 us  ->  cga1 + SPLIT_KV=2  49.4 us
-#     S_q=64  (256 rows)  cga2 LPT_L2 65.1 us  ->  cga1 unsplit       67.6 us
-#     S_q=128 (512 rows)  cga2 LPT_L2 65.3 us  ->  cga2 NATURAL       62.9 us
-# b=1 S_q=1 mask-free (the few-unit edge; pre-change plan, then the split one
-# step finer that the cga1 leg led with before the floor, then the lead):
-#     h=64/4 S_kv=4096    cga2 SPLIT_KV=16 24.0 us  ->  cga1 SPLIT_KV=16 22.3  ->  cga1 SPLIT_KV=8  20.3 us
-#     h=32/8 S_kv=4096    cga2 SPLIT_KV=16 30.0 us  ->  cga1 SPLIT_KV=16 23.6  ->  cga1 SPLIT_KV=8  20.3 us
-#     h=16/2 S_kv=32768   cga2 SPLIT_KV=32 42.0 us  ->  cga1 SPLIT_KV=64 50.8  ->  cga1 SPLIT_KV=32 39.7 us
-#     h=64/4 S_kv=32768   cga2 SPLIT_KV=16 48.5 us  ->  cga1 SPLIT_KV=32 43.0 us  (the wave boundary already stopped it)
-# (at b=8 S_q=64 the split the model briefly proposed measured 75.0 us; the
-# unsplit-leg fix also moves the dense b=4 h=32/8 S_q=128 causal lead, a cga2
-# launch, from split 2 at 155.5 us to unsplit at 120.2 us, and the floor moves
-# the d256 paged b=1 h=64/4 S_q=1 S_kv=4096 lead, also cga2, from split 16 at
-# 29.8 us to split 8 at 24.5 us -- neither correction is d128's alone.)
+#   * width: cga1 while one decode tile covers the unit (select_d128_auto_cga,
+#     the one rule behind _d128_decode_tile_fits on the graph path and the
+#     standalone adapter's default in api_dsl.SdpaFwdDslSm100.template_params);
+#   * scheduler: NATURAL first while one cga2 cluster covers the unit -- the
+#     decode tile's band and the band above it up to 512 rows (_sched_points);
+#   * split: the wave-cost model sees the true CTA count (ctas_per_tile=1 at
+#     cga1), so a small-batch decode splits finer than the cga2 plan did --
+#     b=8 h=64/4 S_q=1 S_kv=4096 paged bf16, B200 kernel time: SPLIT_KV=4 at
+#     27.5 us where the cga2 plan split in two at 39.1 us -- and choose_split_kv
+#     carries two corrections that band exposed at its edges.  The unsplit leg
+#     pays no combine, so a many-row chunk no longer splits (b=8 h=32/8 S_q=64
+#     paged bottom-right, 16384 combine rows: split 2 measured 75.0 us against
+#     67.6 us unsplit; dense b=4 h=32/8 S_q=128 causal at cga2: 155.5 vs 120.2
+#     us), and a lone combine block's serial walk over its partials is priced
+#     at its latency floor, so a few-unit b=1 launch stops one power of two
+#     short of the full wave (h=16/2 S_kv=32768: split 32 at 39.7 us where 64
+#     measured 50.8; h=64/4 S_kv=4096: split 8 at 20.3 us where 16 measured
+#     22.3).  Neither correction is d128's alone: the floor moves the d256
+#     paged b=1 h=64/4 S_q=1 S_kv=4096 lead from split 16 (29.8 us) to 8
+#     (24.5 us), and the unsplit-leg accounting the d256 / d192x128 2k-KV chunk
+#     leads (choose_split_kv's docstring).
 #
-# One Q cluster per unit also gives every unit the same static tile weight, so
-# the causal LPT / LPT_L2 remaps have nothing to balance and only cost the remap.
-# Pinned scheduler, bottom-right causal, b=32, S_kv=4096 paged, B200, kernel
-# time (LPT_L2 / LPT / NATURAL):
-#     d128 64/4  S_q=4 packed    cga2  125.1 /  123.5 /  119.4    cga1   70.9 /   69.7 /   68.9 us
-#     d128 64/4  S_q=8 packed    cga2  125.5 /  123.8 /  121.0    cga1   72.0 /   71.7 /   72.2 us
-#     d128 96/8  S_q=4 unpacked  cga2 2486.9 / 2407.1 / 2379.0    cga1 1304.4 / 1316.2 / 1292.8 us
-#     d128 32/32 S_q=4 MHA       cga2  871.2 /  856.0 /  847.9    cga1  528.7 /  528.2 /  526.4 us
-# (d256 32/2 packed, cga2: S_q=4 65.9 / 63.3 / 62.1, S_q=8 64.8 / 65.0 / 66.6
-# -- the sign flips with S_q there, so the d256 flavor keeps its rule until it
-# is measured on its own.)
+# Provenance: the split-model numbers above were measured on the d128 prefill
+# kernel's cga1 configuration (one 256-row Q/O-aliased CTA per unit), the
+# width the graph path led with before the decode tile took over TILE_CGA_M=1
+# (PR #1094).  The model's inputs are unchanged on the decode tile (one CTA
+# per unit, 128-row KV tiles, the shared sm100/split_combine), so the choices
+# carry over; the floor is expressed in KV tiles of MAIN-kernel time, and a
+# decode-tile KV tile may run faster than the prefill kernel's, so a
+# re-measurement on the decode tile could only raise it.
 _D128_SHAPE = (128, 128)
 
 
@@ -710,24 +675,28 @@ def _sm100_pack_g(caps: Capabilities, facts) -> int:
     1 when the row cannot pack this graph (MHA, THD, an epilogue gate, or a
     ratio with no factor in common with the tile). A (batch, packed head) unit
     holds ``S_q * PACK_G`` live rows, so this -- not the raw ratio -- is what
-    the one-CTA and one-cluster rules below measure the unit by."""
+    the one-cluster scheduler rule measures the unit by."""
     return _pack_gqa_group(caps, facts, 128, _pack_gqa_eligible(caps, facts, 128))
 
 
 def _q_clusters_per_unit(caps: Capabilities, facts, cga: Optional[int]) -> int:
     """Q clusters one (batch, packed head) unit launches at cluster width ``cga``
-    (``None`` = the flavor's default width)."""
+    (``None`` = the flavor's default width, the cga2 prefill cluster)."""
     return _ceil_div(facts.s_q * _sm100_pack_g(caps, facts), _pack_gqa_tile_q(caps, facts, 128, cga))
 
 
 def select_d128_auto_cga(*, s_q: int, pack_g: int, thd: bool) -> int:
-    """Measured d128 f16 cluster width: cga1 when one CTA's Q rows cover every
-    live row of a (batch, packed head) unit -- ``S_q * G <= TILES_Q * TILE_M``
-    -- and cga2 otherwise. THD keeps cga2: its persistent scheduler sizes the
-    grid in clusters and the cga1 grid is unmeasured there."""
+    """The d128 f16 cluster width for a unit of ``S_q * pack_g`` live rows:
+    cga1 -- the decode tile -- when one of its 128-row tiles covers them
+    (``cga_tile_m(128, 1)``, config_sm100.CfgD128Decode), cga2 -- the prefill
+    pipeline -- otherwise.  THD keeps cga2: the decode tile has no ragged leg
+    (engines.mismatch and api_dsl.check_support decline a pinned cga1 there).
+    The one rule behind the graph path (:func:`_d128_decode_tile_fits`, which
+    derives ``pack_g`` from the candidate's packing) and the standalone
+    adapter's default width (api_dsl.SdpaFwdDslSm100.template_params)."""
     if thd:
         return 2
-    return 1 if _ceil_div(s_q * pack_g, cga_tile_m(128, 1)) == 1 else 2
+    return 1 if s_q * pack_g <= cga_tile_m(128, 1) else 2
 
 
 def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm100TemplateParams:
@@ -784,7 +753,7 @@ def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] =
     # The kernel's HEADS_PER_TILE for this leg (1 unpacked): the launch the
     # split model sees, and the rows one unit really carries.
     pack_g = _pack_gqa_group(caps, facts, _D128_DECODE_TILE_ROWS, pack_gqa)
-    return facts.s_q * pack_g <= _D128_DECODE_TILE_ROWS
+    return select_d128_auto_cga(s_q=facts.s_q, pack_g=pack_g, thd=facts.thd) == 1
 
 
 def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int, pack_gqa: Optional[bool] = None) -> tuple[int, Optional[int]]:
@@ -810,11 +779,6 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         if selected_cga not in domain:
             raise ValueError(f"D512 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
         return selected_sched, selected_cga
-    if _d128_f16_flavor(caps, facts):
-        selected_cga = select_d128_auto_cga(s_q=facts.s_q, pack_g=_sm100_pack_g(caps, facts), thd=facts.thd)
-        if selected_cga not in domain:
-            raise ValueError(f"D128 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
-        return sched_policy, selected_cga
     if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
         return sched_policy, _sole(domain)
     params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
@@ -1017,19 +981,11 @@ def _split_points(
 # ---------------------------------------------------------------------------
 
 
-def _cga_runners(caps: Capabilities, facts, lead: SdpaFwdKnobs) -> Tuple[int, ...]:
-    """The cluster widths behind a decode-shaped d128 lead: the domain's other
-    widths (cga2) on the lead's split leg. Empty for every other lead."""
-    if lead.cga != 1 or not _d128_f16_flavor(caps, facts):
-        return ()
-    return tuple(sorted(cga for cga in effective_cgas(caps, facts, lead.split_kv) if cga != lead.cga))
-
-
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
     The baseline takes the best value on every axis; runners-up deviate on ONE
-    axis at a time in impact order (tiles, sched, cga, pack_gqa, split) with the
+    axis at a time in impact order (tiles, sched, pack_gqa, split) with the
     other axes held at their best, capped at ``_MAX_SETS_PER_ENGINE``. Two
     axes carry a structural coupling: a packed set rides the largest tile
     that admits the ratio, and a split set rides the plain scheduler. Axis
@@ -1110,11 +1066,6 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     sched_host = unsplit_leg
     for policy in scheds[1:]:
         out.append(replace(sched_host, sched_policy=policy))
-    # The cluster width the d128 rule did not pick stays reachable behind a
-    # decode-shaped cga1 lead, so select_plan / autotune can time cga2 on the
-    # same unsplit leg. A prefill lead adds nothing: its list is what it was.
-    for cga in _cga_runners(caps, facts, unsplit_leg):
-        out.append(replace(unsplit_leg, cga=cga))
     # The opposite pack_gqa leg, riding its own tile (packed: the largest
     # admitting tile; unpacked: the tile rule's best) and its own CGA width:
     # on the d128 f16 SM100 flavor a packed leg that overflows one 128-row

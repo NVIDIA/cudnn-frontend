@@ -851,7 +851,11 @@ def test_sdpa_fwd_paged_decode_mtp_frost_L0(env_info, test_no, request, cudnn_ha
     """Paged GQA decode (S_q=1) and MTP (S_q in [2, 8]) on the FROST SM100 d128
     flavor: bottom-right causal weighted, head groups up to 16:1 (incl. a group
     that does not divide the tile), page sizes 16..128, padded per-batch lengths.
-    Every draw is inside the FROST paged contract, so the engine must serve it."""
+    Every draw is inside the FROST paged contract and every unit fits one decode
+    tile (S_q * PACK_G <= 128), so the d128 decode tile (TILE_CGA_M=1) must serve
+    it -- a wider fuzz of that tile than test_sdpa_fwd_paged_decode_tile_frost_L0:
+    top-left alignment, right-window and band masks, any d_qk / d_v <= 128,
+    batches to 64, KV to 8192."""
     _require_frost_sm100()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -878,23 +882,28 @@ def test_sdpa_fwd_paged_decode_mtp_frost_L0(env_info, test_no, request, cudnn_ha
     test.cfg.is_paged = True
     test.showConfig(test_no, request)
 
-    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, cga=1)
 
 
 # FlashInfer's cudnn paged decode graph (Qwen3-235B-style 64/4 heads, d128, page 16) and its MTP sibling.
 FI_PAGED_DECODE_CASES = [
-    # (s_q, diag_align, right_bound)
-    (1, cudnn.diagonal_alignment.TOP_LEFT,     None),  # S_q=1, no mask: the wrapper's spelling today
-    (4, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0),     # MTP S_q=4, bottom-right causal
+    # (s_q, diag_align, right_bound, cga): cga pins the tile behind sdpa_fwd_prefill_sm100's
+    # TILE_CGA_M knob -- 1 the d128 decode tile (S_q * PACK_G <= 128), 2 the prefill pipeline.
+    (1,  cudnn.diagonal_alignment.TOP_LEFT,     None, 1),  # S_q=1, no mask: the wrapper's spelling today
+    (4,  cudnn.diagonal_alignment.BOTTOM_RIGHT, 0,    1),  # MTP S_q=4, bottom-right causal: 64 packed rows
+    (16, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0,    2),  # 16 speculative tokens: 256 packed rows, one cga2 cluster
 ]
 
 
-@pytest.mark.parametrize("s_q,diag_align,right_bound", FI_PAGED_DECODE_CASES, ids=["decode_sq1", "mtp_sq4_brcm"])
+@pytest.mark.parametrize("s_q,diag_align,right_bound,cga", FI_PAGED_DECODE_CASES, ids=["decode_sq1", "mtp_sq4_brcm", "chunk_sq16_brcm_prefill_tile"])
 @pytest.mark.L0
-def test_sdpa_fwd_paged_decode_fi_shapes_frost_L0(env_info, s_q, diag_align, right_bound, request, cudnn_handle):
+def test_sdpa_fwd_paged_decode_fi_shapes_frost_L0(env_info, s_q, diag_align, right_bound, cga, request, cudnn_handle):
     """FlashInfer's paged decode graph pinned: b=32, 64/4 heads, d128 bf16, page 16,
     per-batch KV lengths mixed up to 4096 (page and tile boundaries, 1, and for the
-    MTP case a length below S_q), served by the FROST SM100 engine."""
+    causal cases a length below S_q), served by the FROST SM100 engine on the tile
+    the heuristics select for the unit's rows: the decode tile for decode and MTP,
+    the cga2 prefill tile (on the plain scheduler -- the one-cluster rule) for a
+    16-token speculative chunk whose 256 packed rows overflow one decode tile."""
     _require_frost_sm100()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -932,7 +941,7 @@ def test_sdpa_fwd_paged_decode_fi_shapes_frost_L0(env_info, s_q, diag_align, rig
     test.cfg.fill_derived_fields()
     test.showConfig((request.node.name, len(FI_PAGED_DECODE_CASES)), request)
 
-    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, cga=cga)
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
