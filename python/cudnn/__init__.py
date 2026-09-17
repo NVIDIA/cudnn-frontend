@@ -316,6 +316,8 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
 }
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "TailRoPEForward": (".rope", "TailRoPEForward"),
+    "tail_rope": (".rope", "tail_rope"),
     "RopeQDQInplace": (".rope", "RopeQDQInplace"),
     "rope_qdq_inplace": (".rope", "rope_qdq_inplace"),
     "gnn": (".gnn", None),

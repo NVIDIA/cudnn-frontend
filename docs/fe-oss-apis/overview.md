@@ -15,6 +15,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)
 - [Gated Attention Block (SM107)](gated_attention_block.md) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8)
 - [Tail RoPE + Microscaled QDQ](rope_qdq.md)
+- [Prepared BF16 Tail RoPE](rope_tail.md)
 - [GEMM + SwiGLU](gemm_fusions/gemm_swiglu.md)
 - [GEMM + sReLU](gemm_fusions/gemm_srelu.md)
 - [GEMM + dsReLU](gemm_fusions/gemm_dsrelu.md)
