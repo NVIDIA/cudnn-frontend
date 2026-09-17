@@ -759,6 +759,9 @@ cudnn.tensor_reordering.NONE
 cudnn.tensor_reordering.name
 cudnn.tensor_reordering.value
 cudnn.torch
+cudnn.torch.block_sparse_attention_backward
+cudnn.torch.block_sparse_attention_forward
+cudnn.torch.block_sparse_attention_fp8_forward
 cudnn.torch.calls
 cudnn.torch.install
 cudnn.torch.served_plan_names

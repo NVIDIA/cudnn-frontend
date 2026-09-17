@@ -57,11 +57,16 @@ class NoJax:
             raise ModuleNotFoundError("JAX is unavailable", name=fullname)
 sys.meta_path.insert(0, NoJax())
 import torch
-from cudnn import BSA
+import cudnn
+import cudnn.torch as ct
+assert "cudnn.block_sparse_attention.api" not in sys.modules
+for name in ("block_sparse_attention_forward", "block_sparse_attention_backward", "block_sparse_attention_fp8_forward"):
+    assert name in ct.__all__
+    assert getattr(ct, name) is getattr(cudnn, name) is getattr(cudnn.BSA, name)
 q = torch.ones((1, 1, 256, 64), device="cuda", dtype=torch.bfloat16)
 i = torch.arange(2, device="cuda", dtype=torch.int32).expand(1, 1, 2, 2).contiguous()
-o, lse = BSA.block_sparse_attention_forward(q, q, q, i, 2)
-dq, dk, dv = BSA.block_sparse_attention_backward(q, q, q, q, o, lse, i, 2)
+o, lse = ct.block_sparse_attention_forward(q, q, q, i, 2)
+dq, dk, dv = ct.block_sparse_attention_backward(q, q, q, q, o, lse, i, 2)
 torch.testing.assert_close(o, q)
 torch.testing.assert_close(dq, torch.zeros_like(q), atol=1e-3, rtol=0)
 torch.testing.assert_close(dk, torch.zeros_like(q), atol=1e-3, rtol=0)

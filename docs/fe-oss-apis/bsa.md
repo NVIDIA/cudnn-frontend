@@ -40,9 +40,16 @@ environments that force an older DSL.
 
 ## Forward
 
+The `cudnn.torch` BSA functions are lazy aliases of the existing `cudnn` and
+`cudnn.BSA` functions, with identical signatures, outputs, and supported configurations.
+
 ```python
 import torch
-from cudnn import BSA
+from cudnn.torch import (
+    block_sparse_attention_forward,
+    block_sparse_attention_backward,
+    block_sparse_attention_fp8_forward,
+)
 
 q = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(1, 8, 2048, 128, device="cuda", dtype=torch.bfloat16)
@@ -54,7 +61,7 @@ q2k_block_index = torch.arange(4, device="cuda", dtype=torch.int32)
 q2k_block_index = q2k_block_index.view(1, 1, 1, 4).expand(1, 8, 16, 4).contiguous()
 block_sizes = torch.full((32,), 64, device="cuda", dtype=torch.int32)
 
-result = BSA.block_sparse_attention_forward(
+result = block_sparse_attention_forward(
     q,
     k,
     v,
@@ -160,7 +167,7 @@ BF16 Q, K, and V tensors in `BHSD` layout and performs FP8 quantization
 internally:
 
 ```python
-fp8_result = BSA.block_sparse_attention_fp8_forward(
+fp8_result = block_sparse_attention_fp8_forward(
     q,
     k,
     v,
@@ -203,7 +210,7 @@ operation. It recomputes probabilities from the forward output and LSE:
 
 ```python
 dout = torch.randn_like(o)
-grads = BSA.block_sparse_attention_backward(
+grads = block_sparse_attention_backward(
     dout,
     q,
     k,
@@ -276,8 +283,8 @@ BSHD layout, including split-KV execution; FP8 output is contiguous BF16 BHSD.
 Compilation is lazy. The first call for a new static configuration JIT-compiles
 the relevant kernel; subsequent calls reuse an in-process cache.
 
-The current public surface consists of allocating function wrappers under
-`cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
+The Torch public surface consists of allocating function wrappers under
+`cudnn.torch`, also available under `cudnn` and `cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
 lifecycle for BSA.
 
 Correctness tests and FP32 references are under
