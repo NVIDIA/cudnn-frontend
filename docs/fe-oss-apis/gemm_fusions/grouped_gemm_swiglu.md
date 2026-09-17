@@ -340,6 +340,31 @@ Returns a `TupleDict` - a dictionary-like object that also supports tuple unpack
 - `C`, `D`, and `D_col` must be **N-major** (contiguous along N dimension)
 - All tensors must be **16-byte aligned** along the contiguous dimension
 
+### Canonical layouts (additive)
+
+Each input is also accepted in its natural row-major form. Canonical inputs compile at
+their own rank and bind directly, with no per-call host-side views; the pre-permuted
+kernel-facing forms above keep working unchanged:
+
+- `A`: `(valid_m, K)` row-major
+- `B`: `(L, N, K)` C-contiguous
+- `SFA`/`SFB`: any dense C-contiguous buffer with the MMA-tiled element count,
+  e.g. flat 1-D or the physical `(L, ceil(mn/128), ceil(ceil(K/sf_vec_size)/4), 32, 4, 4)`
+  allocation — no `.view().permute()` gymnastics required. The kernel rebuilds the
+  MMA-tiled SF layouts from the GEMM shapes and reads only the base pointer.
+- `prob`: `(valid_m,)`, `float32` or `bfloat16`
+- `alpha_tensor` remains required; pass explicit per-group scaling factors.
+
+Flat SF buffers must already contain the packed MMA-tiled scale bytes in physical
+order. Ordinary row-major logical scales need packing before this API is called.
+
+These layouts prepare the contiguous MXFP8 path for a separate JAX bridge; these
+eager entry points still require torch tensors. Unified GLU/dGLU APIs are separate.
+
+When `A` is canonical (2-D), the wrapper returns natural-shaped outputs:
+`c (valid_m, N)`, `d`/`d_col (valid_m, N/2)` row-major, and `sfd_row`/`sfd_col` as
+C-contiguous physical `(1, ceil(mn/128), rest, 32, 4, 4)` buffers.
+
 ### Data Types
 
 #### Input/Weight Types (ab_dtype)
