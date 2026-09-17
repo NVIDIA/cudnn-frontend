@@ -860,9 +860,10 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     appended ``sample_amax_o``, ``pv_bf16`` and ``stats_log2``; the fused
     epilogue gate then appended ``sample_gate`` and ``has_amax_o`` after those,
     and the SM100 adapter's ``execute`` gained a trailing ``gate`` after
-    ``block_table_v``.  The pin moves with the tail: every addition must sit
-    after the prefix in landing order, so a positional caller of any earlier
-    signature still binds where it always did."""
+    ``block_table_v``; the block-scaled O then appended ``sample_sf_o`` to the
+    constructor and ``sf_o`` to ``execute``.  The pin moves with the tail: every
+    addition must sit after the prefix in landing order, so a positional caller
+    of any earlier signature still binds where it always did."""
     import inspect
 
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100
@@ -876,15 +877,16 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     assert params[params.index("paged_table_stride") : params.index("thd_stats_padded") + 1] == legacy_tail
     extension_start = params.index("sample_amax_o")
     assert extension_start == params.index("thd_stats_padded") + 1, params[extension_start - 1 : extension_start + 1]
-    assert params[extension_start:] == ["sample_amax_o", "pv_bf16", "stats_log2", "sample_gate", "has_amax_o"], params[extension_start:]
+    assert params[extension_start:] == ["sample_amax_o", "pv_bf16", "stats_log2", "sample_gate", "has_amax_o", "sample_sf_o"], params[extension_start:]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert params.index("thd") + 1 == params.index("max_total_seq_len_q")
     # Both gate parameters default OFF, so every pre-gate call site is untouched.
     sig = inspect.signature(SdpaFwdDsl.__init__).parameters
     assert sig["sample_gate"].default is None and sig["has_amax_o"].default is True
     exec_params = list(inspect.signature(SdpaFwdDslSm100.execute).parameters)
-    assert exec_params[-2:] == ["block_table_v", "gate"], exec_params[-3:]
+    assert exec_params[-3:] == ["block_table_v", "gate", "sf_o"], exec_params[-4:]
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["gate"].default is None
+    assert inspect.signature(SdpaFwdDslSm100.execute).parameters["sf_o"].default is None
 
 
 # --- MXFP8 scheduler-policy claims (2026-09-14) -------------------------------
@@ -1291,12 +1293,21 @@ def test_sm107_gate_accepts_every_dtype_member():
     fp8 = _caps(_GATE_ROWS[1])
     assert fp8.epilogue_gate_dtypes == frozenset({cudnn.data_type.BFLOAT16})
     assert fp8.dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
-    assert fp8.out_dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
+    assert fp8.out_dtypes == frozenset(
+        {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+    )
+    # FP4_E2M1 is listed for the block-scaled O epilogue (sf_o), which is its own
+    # O store: it is never gated, so the gate matrix runs over the other members.
     for dt in sorted(fp8.dtypes, key=int):
-        for dto in sorted(fp8.out_dtypes, key=int):
+        for dto in sorted(fp8.out_dtypes - {cudnn.data_type.FP4_E2M1}, key=int):
             assert engines.mismatch(fp8, _fp8_gate_facts(dtype=dt, dtype_o=dto)) is None, (dt, dto)
     why = engines.mismatch(fp8, _fp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.HALF))
     assert why is not None and "gate dtype" in why, why
+    # ...and the two epilogues decline each other, each naming the block-scaled O.
+    why = engines.mismatch(fp8, _fp8_gate_facts(dtype_o=cudnn.data_type.FP4_E2M1))
+    assert why is not None and "block-scaled" in why, why
+    why = engines.mismatch(fp8, _fp8_gate_facts(dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
+    assert why is not None and "epilogue gate" in why, why
 
     # The MXFP8 row (PR-B): the same per-member claims -- every input dtype x
     # every O dtype with the bf16 G its kernel stages (GATE_STORAGE_DTYPE); a
