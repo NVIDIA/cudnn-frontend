@@ -14,6 +14,8 @@ _SYMBOLS = {
     "CSACompressorBackward": (".compressor", "CSACompressorBackward"),
     "csa_compressor_forward_wrapper": (".compressor", "csa_compressor_forward_wrapper"),
     "csa_compressor_backward_wrapper": (".compressor", "csa_compressor_backward_wrapper"),
+    "csa_compressor_forward_jax_sm100": (".compressor", "csa_compressor_forward_jax_sm100"),
+    "csa_compressor_backward_jax_sm100": (".compressor", "csa_compressor_backward_jax_sm100"),
 }
 
 
@@ -53,4 +55,6 @@ __all__ = [
     "CSACompressorForward",
     "csa_compressor_backward_wrapper",
     "csa_compressor_forward_wrapper",
+    "csa_compressor_forward_jax_sm100",
+    "csa_compressor_backward_jax_sm100",
 ]

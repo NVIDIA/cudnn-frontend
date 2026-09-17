@@ -78,6 +78,24 @@ pip install nvidia-cudnn-frontend
 
 ## API Usage
 
+### JAX custom calls (SM100 DSv4)
+
+```python
+from cudnn import indexer_forward_jax_sm100, sparse_attention_forward_jax_sm100
+
+dense_scores = indexer_forward_jax_sm100(q, compressed_k, weights, ratio=4)
+topk_values, topk_indices = jax.lax.top_k(dense_scores, 512)
+out, _, lse, _ = sparse_attention_forward_jax_sm100(
+    q_main, kv, global_indices, topk_lengths, attention_sinks,
+    indexer_topk=512, softmax_scale=1.0,
+)
+```
+
+The indexer and sparse-attention entry points expose raw CuTeDSL kernels; Top-K
+remains in JAX. Inputs use flat global index lists; physical Top-K width must be
+a multiple of 64. Transformer Engine's `dsa_indexer` and `dsa_sparse_attention`
+provide the differentiable JAX APIs and own their VJPs.
+
 ### DSA Namespace
 
 ```python
