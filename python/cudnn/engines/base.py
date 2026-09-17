@@ -134,8 +134,9 @@ class VariantPack:
 
     A slot describes the buffer as the GRAPH declares it whenever the caller's
     own geometry disagrees but covers the declared bytes (``graph_described``
-    names those slots, bare addresses included); only a buffer smaller than its
-    declaration keeps its own description. A described slot carries the
+    names those slots, bare addresses included). Strided views and buffers smaller
+    than their declarations keep their own descriptions. Reordered scale blobs
+    retain their physical extents for capacity checks. A described slot carries the
     DECLARED dtype, as does one of the declared extents whose slots are as wide
     (FlashInfer binds packed fp4 and e4m3 scale blocks as uint8). Overrides are
     written into the slot too. An engine reads the IR port for the shape the plan was built for and
