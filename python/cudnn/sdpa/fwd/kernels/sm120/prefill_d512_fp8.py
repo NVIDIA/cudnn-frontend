@@ -137,17 +137,24 @@ class SM120FusedMultiHeadAttentionForward:
     def is_layout_supported(
         shape: tuple[int, ...],
         stride: tuple[int, ...],
+        elem_bytes: int = 1,
     ) -> bool:
-        """Return whether a BSHD tensor uses compact storage."""
+        """Return whether a BSHD tensor uses storage the kernel can address.
+
+        The head dim must be innermost-contiguous, and the head/seq strides
+        must be 16-byte multiples (``16 // elem_bytes`` elements: 16 at 1 byte,
+        8 for a 2-byte O) covering the dims below them (compact or padded).
+        """
 
         if len(shape) != 4 or len(stride) != 4:
             return False
         batch, sequence, heads, head_dim = shape
+        quantum = 16 // elem_bytes
         if stride[3] != 1:
             return False
-        if stride[2] % 16 != 0 or stride[2] < head_dim:
+        if stride[2] % quantum != 0 or stride[2] < head_dim:
             return False
-        if stride[1] % 16 != 0 or stride[1] < heads * stride[2]:
+        if stride[1] % quantum != 0 or stride[1] < heads * stride[2]:
             return False
         if batch != 1 and stride[0] < sequence * stride[1]:
             return False
@@ -962,7 +969,7 @@ class SM120FusedMultiHeadAttentionForward:
             is_first_kv_tile,
         )
 
-        if cutlass.const_expr(self.thd_varlen and in_mask_steps and is_first_kv_tile):
+        if cutlass.const_expr((self.thd_varlen or self.seq_kv_lens_present) and in_mask_steps and is_first_kv_tile):
             sanitize_v_tail(
                 mma_params.sV,
                 basic_params.lane,
@@ -1929,11 +1936,11 @@ class SM120FusedMultiHeadAttentionForward:
             or (isinstance(q.shape[2], int) and isinstance(k.shape[2], int) and q.shape[2] != k.shape[2] * self.qh_per_kh)
         ):
             raise ValueError("runtime Q/K/V/O batch, sequence, or head geometry mismatch")
-        for name, tensor in (("Q", q), ("K", k), ("V", v), ("O", o)):
-            if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride)):
+        for name, tensor, dtype in (("Q", q, self.in_dtype), ("K", k, self.in_dtype), ("V", v, self.in_dtype), ("O", o, self.out_dtype)):
+            if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride, dtype.width // 8)):
                 raise ValueError(
                     f"{name} layout is not supported: BSHD with the head dim innermost-contiguous "
-                    f"and non-overlapping seq/head strides that are multiples of 16 elements "
+                    f"and non-overlapping seq/head strides that are multiples of 16 bytes "
                     f"(compact or padded); got shape {tuple(tensor.shape)} stride {tuple(tensor.stride)}"
                 )
         if cutlass.const_expr(lse is not None):

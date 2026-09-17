@@ -119,6 +119,7 @@ def _run(
     sinks=None,
     stats_layout="contiguous",
     with_stats=True,
+    poison_kv_pad=False,
 ):
     import cudnn
 
@@ -153,6 +154,16 @@ def _run(
         Ob = torch.zeros(B, H_q, S_q + 24, D_v, device=dev, dtype=o_dtype)[:, :, :S_q, :]
     else:
         raise ValueError(f"unknown layout {layout!r}")
+    if poison_kv_pad:
+        # Uninitialized dense padding: fp8 NaN bit patterns in the K/V rows past
+        # each batch's KV length. The reference reads the clean K8/V8; the kernel
+        # must keep the pad rows out of both S and P @ V.
+        assert seq_lens_kv is not None and layout == "bshd"
+        Kb, Vb = Kb.clone(), Vb.clone()
+        nan8 = torch.tensor(float("nan")).to(io_dtype)
+        for b, n in enumerate(seq_lens_kv):
+            Kb[b, :, n:, :] = nan8
+            Vb[b, :, n:, :] = nan8
     lse = make_dense_stats(B, H_q, S_q, stats_layout) if with_stats else None
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
@@ -950,24 +961,26 @@ def test_fp8_sm120_device_scales_execute_reads_no_device_memory():
 _THD_SENTINEL = 2048.0
 
 
-def _pack_thd(seqs, s_max, dtype):
+def _pack_thd(seqs, s_max, dtype, token_pad=0):
     """Pack per-sequence ``(1, H, L_i, D)`` tensors into THD storage.
 
     Returns ``(dense_view, storage, ragged_offset)``: the ``(B, H, S_max, D)``
     packed-stride view over dense-sized storage whose first ``T*H*D`` elements
     hold the packed tokens, the raw storage, and the ``(B+1, 1, 1, 1)`` int64
-    element-unit offsets (``cu_tokens * H * D``).
+    element-unit offsets (``cu_tokens * token_stride``). ``token_pad`` widens the
+    token stride past ``H * D`` by that many elements (a padded per-token record).
     """
     b, h, d = len(seqs), seqs[0].shape[1], seqs[0].shape[3]
     cu = [0]
     for s in seqs:
         cu.append(cu[-1] + s.shape[2])
-    storage = torch.zeros(b * s_max * h * d, dtype=dtype, device="cuda")
-    packed = storage[: max(cu[-1], 1) * h * d].view(max(cu[-1], 1), h, d)
+    ts = h * d + token_pad
+    storage = torch.zeros(b * s_max * ts, dtype=dtype, device="cuda")
+    packed = storage.view(b * s_max, ts)[: max(cu[-1], 1), : h * d].unflatten(1, (h, d))
     for i, s in enumerate(seqs):
         packed[cu[i] : cu[i + 1]].copy_(s[0].permute(1, 0, 2))
-    view = storage.as_strided((b, h, s_max, d), (s_max * h * d, d, h * d, 1))
-    ro = (torch.tensor(cu, dtype=torch.int64, device="cuda") * h * d).view(b + 1, 1, 1, 1)
+    view = storage.as_strided((b, h, s_max, d), (s_max * ts, d, ts, 1))
+    ro = (torch.tensor(cu, dtype=torch.int64, device="cuda") * ts).view(b + 1, 1, 1, 1)
     return view, storage, ro
 
 
@@ -1016,6 +1029,7 @@ def _run_thd_fp8(
     poison_pad=False,
     attn_scale=None,
     interleaved=False,
+    o_token_pad=0,
 ):
     """Run a ragged FP8 graph on the SM120 engine vs per-sequence references.
 
@@ -1048,6 +1062,7 @@ def _run_thd_fp8(
 
     o_zero = [torch.zeros(1, h_q, max(n, 1), D, dtype=o_dtype, device=dev)[:, :, :n] for n in seq_q_lens]
     assert not (interleaved and raw_bind), "fused-record slices are declared-rank views"
+    assert not (o_token_pad and (interleaved or raw_bind)), "a padded O token stride is a declared-rank view of its own"
     if interleaved:
         (k_view, v_view), k_storage, k_ro = _pack_thd_record([k_8, v_8], s_kv_max, torch.float8_e4m3fn)
         v_storage, v_ro = k_storage, k_ro
@@ -1057,7 +1072,7 @@ def _run_thd_fp8(
         q_view, q_storage, q_ro = _pack_thd(q_8, s_q_max, torch.float8_e4m3fn)
         k_view, k_storage, k_ro = _pack_thd(k_8, s_kv_max, torch.float8_e4m3fn)
         v_view, v_storage, v_ro = _pack_thd(v_8, s_kv_max, torch.float8_e4m3fn)
-        o_view, o_storage, o_ro = _pack_thd(o_zero, s_q_max, o_dtype)
+        o_view, o_storage, o_ro = _pack_thd(o_zero, s_q_max, o_dtype, token_pad=o_token_pad)
     if poison_pad:
         # Model uninitialized capacity: fp8 NaN bit patterns past the packed
         # KV tokens (real binders hand rounded-up allocations). The kernel
@@ -1208,7 +1223,8 @@ def _run_thd_fp8(
         o_record = o_storage.view(-1, 2, h_q, D)
         packed_o = o_record[: max(cu[-1], 1), 1]
     else:
-        packed_o = o_storage[: max(cu[-1], 1) * h_q * D].view(max(cu[-1], 1), h_q, D)
+        o_record = o_storage.view(-1, h_q * D + o_token_pad)
+        packed_o = o_record[: max(cu[-1], 1), : h_q * D].unflatten(1, (h_q, D))
     for i, (nq, nkv) in enumerate(zip(seq_q_lens, seq_kv_lens)):
         if nq == 0:
             continue
@@ -1246,7 +1262,8 @@ def _run_thd_fp8(
         assert (o_record[:, 0] == sentinel).all(), "O stores landed in the neighbouring record slot"
         assert (o_record[cu[-1] :, 1] == sentinel).all(), "wrote past the packed O tokens"
     else:
-        assert (o_storage[cu[-1] * h_q * D :] == sentinel).all(), "wrote past the packed O tokens"
+        assert (o_record[cu[-1] :] == sentinel).all(), "wrote past the packed O tokens"
+        assert (o_record[:, h_q * D :] == sentinel).all(), "O stores landed in the token pad"
 
 
 @pytest.mark.L0
@@ -1421,6 +1438,16 @@ def test_fp8_sm120_thd_fused_record_slices():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("D", [128, 512])
+@torch_fork_set_rng(seed=133)
+def test_fp8_sm120_thd_padded_output_token_stride(D):
+    """A 2-byte THD O whose token stride is a 16-byte but not a 16-element multiple
+    (H*D + 8 elements) is admitted at check_support and addressed natively by the
+    general and d512 flavors alike; the pad columns stay untouched."""
+    _run_thd_fp8(seq_q_lens=[40, 25], seq_kv_lens=[40, 25], h_q=2, h_kv=2, D=D, is_causal=True, o_dtype=torch.bfloat16, o_token_pad=8)
+
+
+@pytest.mark.L0
 def test_fp8_sm120_thd_declines_strides_tma_cannot_express():
     """A THD token stride that is not a 16-byte multiple is declined at check_support
     with the TMA rule rather than adapted; the quantum is dtype-aware, so the same
@@ -1504,6 +1531,16 @@ def test_fp8_sm120_d512_padding_sink():
         sinks=sinks,
         o_dtype=torch.bfloat16,
     )
+    _check(*res)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("D", [128, 512])
+@torch_fork_set_rng(seed=85)
+def test_fp8_sm120_padded_kv_poisoned_tail(D):
+    """Dense per-batch KV padding whose pad rows hold NaN bit patterns: the masked
+    columns and the P @ V tail stay clean on the general and d512 flavors alike."""
+    res = _run(1, 4, 2, 33, 80, D=D, scale=1.0 / math.sqrt(D), sdpa_kwargs=dict(), seq_lens_kv=[17], poison_kv_pad=True, o_dtype=torch.bfloat16)
     _check(*res)
 
 
