@@ -88,6 +88,9 @@ class DgluMxfp8Epilogue:
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         dfc2_recompute: bool = False,
         dfc2_col_output: bool = False,
+        dfc2_subtile_publish: bool = False,
+        dfc2_acc_early_release: bool = False,
+        use_scaled_cvt: bool = False,
         fc2_in_kernel_topk_reduce: bool = False,
         combine_format: Optional[CombineFormat] = None,
         combine_hidden: Optional[int] = None,
@@ -154,6 +157,18 @@ class DgluMxfp8Epilogue:
             + (2 if dfc2_col_output else 0)
             + (1 if dfc2_recompute else 0)
         )
+        self._dfc2_subtile_publish = dfc2_subtile_publish
+        self._dfc2_acc_early_release = dfc2_acc_early_release
+        if not isinstance(use_scaled_cvt, bool):
+            raise TypeError("use_scaled_cvt must be a bool")
+        if use_scaled_cvt and self.sf_dtype is not cutlass.Float8E8M0FNU:
+            raise ValueError("use_scaled_cvt requires UE8M0 scale factors")
+        if use_scaled_cvt and self.fc1_output_dtype not in (
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E5M2,
+        ):
+            raise ValueError("use_scaled_cvt requires an FP8 output type")
+        self._use_scaled_cvt = use_scaled_cvt
 
         # combine_format determines the dfc1 (final grad_x) combine encoding.
         if combine_format is None:
@@ -372,14 +387,6 @@ class DgluMxfp8Epilogue:
         rmem_sf = cute.make_rmem_tensor(
             cute.make_layout(2 * (self._cta_tile_n // EpilogueTileN)).shape, self.acc_dtype,
         )
-        # fc1_recompute SF accumulator: ONE SF per subtile (recompute N = half of dfc2).
-        rmem_sf_recompute = cute.make_rmem_tensor(
-            cute.make_layout(self._cta_tile_n // EpilogueTileN).shape, self.acc_dtype,
-        )
-        # fc1_col_output SF accumulator
-        rmem_sf_col_output = cute.make_rmem_tensor(
-            cute.make_layout(2 * (self._cta_tile_n // EpilogueTileN)).shape, self.acc_dtype,
-        )
         thread_in_warp = tidx % WarpThreadCount
         token_row_in_cta = cutlass.Int32(warp_idx * WarpThreadCount) + thread_in_warp
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
@@ -458,9 +465,9 @@ class DgluMxfp8Epilogue:
                 tidx=tidx,
                 norm_const=norm_const,
                 rmem_sf=rmem_sf,
-                rmem_sf_recompute=rmem_sf_recompute,
+                real_fc1_recompute_sf=real_fc1_recompute_sf,
                 real_fc1_recompute=real_fc1_recompute,
-                rmem_sf_col_output=rmem_sf_col_output,
+                real_fc1_col_output_sf=real_fc1_col_output_sf,
                 real_fc1_col_output=real_fc1_col_output,
                 beta=beta_val,
                 prob=rmem_prob[0],
@@ -538,25 +545,16 @@ class DgluMxfp8Epilogue:
                     d_slot,
                 )
 
-        self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, True)
+        if cutlass.const_expr(not self._dfc2_acc_early_release):
+            self._acc_pipeline_consumer_release(
+                acc_pipeline, acc_consumer_state, True
+            )
 
         valid_inter = real_fc1_output.shape[1]
-        self._stg_sf_dfc2(rmem_sf, real_fc1_output_sf, work_tile_info, tidx, valid_inter)
+        self._stg_sf_dfc2(
+            rmem_sf, real_fc1_output_sf, work_tile_info, tidx, valid_inter
+        )
     
-        # fc1_recompute SFs
-        if cutlass.const_expr(self._dfc2_recompute):
-            valid_inter_recompute = real_fc1_recompute.shape[1]
-            self._stg_sf_recompute(
-                rmem_sf_recompute, real_fc1_recompute_sf,
-                work_tile_info, tidx, valid_inter_recompute, valid_tokens,
-            )
-        # fc1_col_output SFs
-        if cutlass.const_expr(self._dfc2_col_output):
-            valid_inter_col_output = real_fc1_col_output.shape[1]
-            self._stg_sf_col_output(
-                rmem_sf_col_output, real_fc1_col_output_sf,
-                work_tile_info, tidx, valid_inter_col_output, valid_tokens,
-            )
         # MegaMoE maps the receiver-pool row back to the source rank's combine slot.
         if cutlass.const_expr(token_comm_args is not None):
             if token_row_in_cta < valid_tokens:
@@ -641,9 +639,9 @@ class DgluMxfp8Epilogue:
         tidx,
         norm_const,
         rmem_sf: cute.Tensor,
-        rmem_sf_recompute: cute.Tensor,
+        real_fc1_recompute_sf: cute.Tensor,
         real_fc1_recompute: cute.Tensor,
-        rmem_sf_col_output: cute.Tensor,
+        real_fc1_col_output_sf: cute.Tensor,
         real_fc1_col_output: cute.Tensor,
         beta: cutlass.Float32,
         prob: cutlass.Float32,
@@ -660,6 +658,14 @@ class DgluMxfp8Epilogue:
         )
         r_acc = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
         cute.copy(atom_t2r, t_subtile, r_acc)
+        if cutlass.const_expr(self._dfc2_acc_early_release):
+            if subtile_idx == cutlass.Int32(self._cta_tile_n // EpilogueTileN - 1):
+                # This is the final N32 TMEM read for the stage.  The view
+                # fence keeps the loaded register fragment valid before the
+                # producer is allowed to recycle the accumulator stage.
+                self._acc_pipeline_consumer_release(
+                    acc_pipeline, acc_consumer_state, True
+                )
 
         thread_in_warp = tidx % WarpThreadCount
         token_row_in_cta = cutlass.Int32(warp_idx * WarpThreadCount) + thread_in_warp
@@ -707,6 +713,32 @@ class DgluMxfp8Epilogue:
                 d_gate, d_up, r_acc, r_gate, r_up, beta, prob, self._gate_up_clamp
             )
 
+        # dSwiGLU backward has consumed r_acc. Reuse that fragment for the
+        # independent forward recompute now so r_gate/r_up die before the two
+        # dgrad quantization paths instead of remaining live across them.
+        if cutlass.const_expr(self._dfc2_recompute):
+            if cutlass.const_expr(self._act_func == "swiglu"):
+                swiglu_act(
+                    r_acc,
+                    r_up,
+                    r_gate,
+                    prob,
+                    self._gate_up_clamp,
+                )
+            qc = quant_sfd_col(
+                r_acc, c_recompute, norm_const,
+                self._sf_vec_size, self.sf_dtype, self.fc1_output_dtype,
+                use_scaled_cvt=self._use_scaled_cvt,
+            )
+            self._stg_sf_recompute_subtile(
+                qc,
+                real_fc1_recompute_sf,
+                work_tile_info,
+                tidx,
+                subtile_idx,
+                real_fc1_recompute.shape[1],
+            )
+
         if cutlass.const_expr(self._dfc2_col_output):
             # Snapshot d_gate / d_up BEFORE quant_sfd_row mutates them in place; the col
             # path col-quants these copies (quant_sfd_col mutates its input).
@@ -720,22 +752,31 @@ class DgluMxfp8Epilogue:
             qg_col = quant_sfd_col(
                 d_gate_col, c_gate_col, norm_const,
                 self._sf_vec_size, self.sf_dtype, self.fc1_output_dtype,
+                use_scaled_cvt=self._use_scaled_cvt,
             )
             qu_col = quant_sfd_col(
                 d_up_col, c_up_col, norm_const,
                 self._sf_vec_size, self.sf_dtype, self.fc1_output_dtype,
+                use_scaled_cvt=self._use_scaled_cvt,
             )
-            for _k in cutlass.range_constexpr(self._cta_tile_n // EN):
-                if subtile_idx == cutlass.Int32(_k):
-                    rmem_sf_col_output[2 * _k]     = qg_col
-                    rmem_sf_col_output[2 * _k + 1] = qu_col
+            self._stg_sf_col_output_subtile(
+                qg_col,
+                qu_col,
+                real_fc1_col_output_sf,
+                work_tile_info,
+                tidx,
+                subtile_idx,
+                real_fc1_col_output.shape[1],
+            )
 
         # quantize each half to MXFP8 + E8M0 row SF (per-thread, no warp reduction) ----
         qg = quant_sfd_row(
             d_gate, c_gate, norm_const, self._sf_vec_size, self.sf_dtype, self.fc1_output_dtype,
+            use_scaled_cvt=self._use_scaled_cvt,
         )
         qu = quant_sfd_row(
             d_up, c_up, norm_const, self._sf_vec_size, self.sf_dtype, self.fc1_output_dtype,
+            use_scaled_cvt=self._use_scaled_cvt,
         )
 
         # accumulate the 2 E8M0 row SFs into rmem
@@ -743,25 +784,6 @@ class DgluMxfp8Epilogue:
             if subtile_idx == cutlass.Int32(_k):
                 rmem_sf[2 * _k] = qg
                 rmem_sf[2 * _k + 1] = qu
-
-        # dfc2_recompute: forward swiglu + column quantization
-        if cutlass.const_expr(self._dfc2_recompute):
-            c_recompute_f32 = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
-            if cutlass.const_expr(self._act_func == "swiglu"):
-                swiglu_act(
-                    c_recompute_f32,
-                    r_up,
-                    r_gate,
-                    prob,
-                    self._gate_up_clamp,
-                )
-            qc = quant_sfd_col(
-                c_recompute_f32, c_recompute, norm_const,
-                self._sf_vec_size, self.sf_dtype, self.fc1_output_dtype,
-            )
-            for _k in cutlass.range_constexpr(self._cta_tile_n // EN):
-                if subtile_idx == cutlass.Int32(_k):
-                    rmem_sf_recompute[_k] = qc
 
         # BARRIER: drain PREVIOUS subtile's TMA BEFORE R2S.
         if warp_idx == self._epilogue_warp_ids[0]:
@@ -859,16 +881,16 @@ class DgluMxfp8Epilogue:
             real_sf[feature_atom, token_atom, atom_byte] = sf_value.to(self.sf_dtype)
 
     @cute.jit
-    def _stg_sf_recompute(
+    def _stg_sf_recompute_subtile(
         self,
-        rmem_sf_f32: cute.Tensor,
+        qc,
         real_fc1_recompute_sf: cute.Tensor,
         work_tile_info,
         tidx,
+        subtile_idx,
         valid_inter,
-        valid_tokens,
     ) -> None:
-        """Store fc1_recompute SFs in MN-major 128×4 atoms."""
+        """Store one dFC2 subtile's recompute SF in MN-major 128×4 atoms."""
         EN = EpilogueTileN  # 32
         sf_vec_size = self._sf_vec_size
         warp_lane_idx = tidx % cutlass.Int32(32)
@@ -884,28 +906,28 @@ class DgluMxfp8Epilogue:
         col_base = (
             work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
         )
-        for s in cutlass.range_constexpr(self._cta_tile_n // EN):
-            col = col_base + cutlass.Int32(s * EN) + warp_lane_idx
-            if col < valid_inter:
-                self._stg_col_sf_atom_value(
-                    real_fc1_recompute_sf,
-                    row_block,
-                    col,
-                    hidden_atoms,
-                    rmem_sf_f32[s],
-                )
+        col = col_base + subtile_idx * cutlass.Int32(EN) + warp_lane_idx
+        if col < valid_inter:
+            self._stg_col_sf_atom_value(
+                real_fc1_recompute_sf,
+                row_block,
+                col,
+                hidden_atoms,
+                qc,
+            )
 
     @cute.jit
-    def _stg_sf_col_output(
+    def _stg_sf_col_output_subtile(
         self,
-        rmem_sf_f32: cute.Tensor,
+        qg_col,
+        qu_col,
         real_fc1_col_output_sf: cute.Tensor,
         work_tile_info,
         tidx,
+        subtile_idx,
         valid_inter,
-        valid_tokens,
     ) -> None:
-        """Store fc1_col_output SFs in MN-major 128×4 atoms."""
+        """Store one dFC2 subtile's column SFs in MN-major 128×4 atoms."""
         EN = EpilogueTileN  # 32
         sf_vec_size = self._sf_vec_size
         warp_lane_idx = tidx % cutlass.Int32(32)
@@ -921,17 +943,28 @@ class DgluMxfp8Epilogue:
         col_base = (
             work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n * 2)
         )
-        for s in cutlass.range_constexpr(self._cta_tile_n // EN):
-            for gu in cutlass.range_constexpr(2):
-                col = col_base + cutlass.Int32((2 * s + gu) * EN) + warp_lane_idx
-                if col < valid_inter:
-                    self._stg_col_sf_atom_value(
-                        real_fc1_col_output_sf,
-                        row_block,
-                        col,
-                        hidden_atoms,
-                        rmem_sf_f32[2 * s + gu],
-                    )
+        gate_col = (
+            col_base
+            + subtile_idx * cutlass.Int32(2 * EN)
+            + warp_lane_idx
+        )
+        if gate_col < valid_inter:
+            self._stg_col_sf_atom_value(
+                real_fc1_col_output_sf,
+                row_block,
+                gate_col,
+                hidden_atoms,
+                qg_col,
+            )
+        up_col = gate_col + cutlass.Int32(EN)
+        if up_col < valid_inter:
+            self._stg_col_sf_atom_value(
+                real_fc1_col_output_sf,
+                row_block,
+                up_col,
+                hidden_atoms,
+                qu_col,
+            )
 
     @cute.jit
     def _tma_store_tile(
@@ -1062,6 +1095,7 @@ class DgluMxfp8Epilogue:
         tidx,
         acc_pipeline,
         acc_consumer_state,
+        peer_dest_row_addr,
         token_comm_args=None,
         rmem_sf_dfc1=None,
         *,
@@ -1101,28 +1135,15 @@ class DgluMxfp8Epilogue:
             qpvscale = quant_sfd_row(
                 r_acc, r_fp8, 1.0, EpilogueTileN,
                 cutlass.Float8E8M0FNU, fp8_dtype,
+                use_scaled_cvt=self._use_scaled_cvt,
             )
-            pool_token_global = (
-                work_tile_info.cumulative_data_physical_row
-                + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
-                + token_row_in_cta
-            )
-            metadata_u32 = cute.recast_tensor(
-                token_comm_args.token_src_metadata, cutlass.Uint32,
-            )
-            fc2_output_dest = Fc2OutputDest(
-                tensor=token_comm_args.combine_output,
-                metadata=metadata_u32,
-                peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
-            )
-            dest_row = fc2_output_dest.resolve_token_row(pool_token_global)
             r_fp8_flat = cute.make_tensor(r_fp8.iterator, cute.make_layout(32))
             stg_fp8_atom = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), fp8_dtype, num_bits_per_copy=256,
             )
             dest_fp8_ptr = cute.make_ptr(
                 fp8_dtype,
-                dest_row.iterator.toint() + Int64(hidden_col_start),
+                peer_dest_row_addr + Int64(hidden_col_start),
                 cute.AddressSpace.gmem,
                 assumed_align=32,
             )
@@ -1145,6 +1166,7 @@ class DgluMxfp8Epilogue:
             qpvscale = quant_sfd_row(
                 r_acc, r_fp8, 1.0, EpilogueTileN,
                 cutlass.Float8E8M0FNU, fp8_dtype,
+                use_scaled_cvt=self._use_scaled_cvt,
             )
             fp8_byte_addr = (
                 token_comm_args.fc2_output_workspace.iterator.toint()
@@ -1327,6 +1349,36 @@ class DgluMxfp8Epilogue:
         real_fc2_output, _ = sched_ext.get_gmem_tensor(
             "d", gmem_fc2_output, work_tile_info,
         )
+
+        peer_dest_row_addr = Int64(0)
+        if cutlass.const_expr(
+            token_comm_args is not None
+            and not self._token_back_by_dispatch
+            and self._combine_mxfp8
+        ):
+            thread_in_warp = tidx % WarpThreadCount
+            token_row_in_cta = (
+                cutlass.Int32(warp_idx * WarpThreadCount) + thread_in_warp
+            )
+            pool_token_global = (
+                work_tile_info.cumulative_data_physical_row
+                + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
+                + token_row_in_cta
+            )
+            metadata_u32 = cute.recast_tensor(
+                token_comm_args.token_src_metadata, cutlass.Uint32,
+            )
+            fc2_output_dest = Fc2OutputDest(
+                tensor=token_comm_args.combine_output,
+                metadata=metadata_u32,
+                peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
+            )
+            peer_dest_row_addr = (
+                fc2_output_dest.resolve_token_row(
+                    pool_token_global
+                ).iterator.toint()
+            )
+
         acc_pipeline.consumer_wait(acc_consumer_state)
         iket.range_push("mxfp8_dfc1_epi_tile")
 
@@ -1359,6 +1411,7 @@ class DgluMxfp8Epilogue:
                 tidx=tidx,
                 acc_pipeline=acc_pipeline,
                 acc_consumer_state=acc_consumer_state,
+                peer_dest_row_addr=peer_dest_row_addr,
                 token_comm_args=token_comm_args,
                 rmem_sf_dfc1=rmem_sf_dfc1,
             )
@@ -1497,6 +1550,7 @@ class DgluMxfp8Epilogue:
                 work_tile_info.cumulative_token_block_count
                 + work_tile_info.tile_m_idx // cutlass.Int32(self._atom_thr_size)
             )
+            cur_dfc2_tile_n_idx = work_tile_info.tile_n_idx
             cur_fc2_expert_idx = work_tile_info.expert_idx
 
             work_tile_info = sched_consumer.consume_work()
@@ -1510,11 +1564,44 @@ class DgluMxfp8Epilogue:
             task_tile_boundary_bar.arrive_and_wait()
 
             if cur_was_linear1:
-                flag_tracker = flag_tracker.accumulate(
-                    work_tile_info.phase,
-                    self._epi_fc1_batch,
-                    (gmem_fc1_done_counter.iterator + cur_fc1_counter_slot).toint(),
-                )
+                if cutlass.const_expr(self._dfc2_subtile_publish):
+                    # One dFC2 N256 task makes one dFC1 K512 chunk visible.
+                    # Both CTAs publish independent bits after all task stores
+                    # have drained and the task-boundary fence/barrier above.
+                    mma_pair_cta = bidx % cutlass.Int32(self._atom_thr_size)
+                    ready_bit_idx = (
+                        cur_dfc2_tile_n_idx
+                        * cutlass.Int32(self._atom_thr_size)
+                        + mma_pair_cta
+                    )
+                    ready_bit = cutlass.Int32(1) << ready_bit_idx
+                    if tidx == cutlass.Int32(0):
+                        ready_mask_ptr = (
+                            gmem_fc1_done_counter.iterator + cur_fc1_counter_slot
+                        )
+                        cute.arch.red(
+                            ready_mask_ptr.llvm_ptr,
+                            ready_bit,
+                            op="or",
+                            dtype="b32",
+                            sem="release",
+                            scope="gpu",
+                        )
+
+                    # Suppress the legacy completion ADD but still advance the
+                    # batched flag tracker's phase/flush state.
+                    flag_tracker = flag_tracker.accumulate(
+                        work_tile_info.phase,
+                        self._epi_fc1_batch,
+                        (gmem_fc1_done_counter.iterator + cur_fc1_counter_slot).toint(),
+                        True,
+                    )
+                else:
+                    flag_tracker = flag_tracker.accumulate(
+                        work_tile_info.phase,
+                        self._epi_fc1_batch,
+                        (gmem_fc1_done_counter.iterator + cur_fc1_counter_slot).toint(),
+                    )
             else:
                 if cutlass.const_expr(
                     self._token_back_by_dispatch or self._combine_mxfp8

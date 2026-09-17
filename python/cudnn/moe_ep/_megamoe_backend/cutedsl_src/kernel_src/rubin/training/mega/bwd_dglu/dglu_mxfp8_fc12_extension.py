@@ -65,6 +65,7 @@ class DgluMxFp8Fc12SchedExtension(GluMxFp8Fc12SchedExtension):
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=fc1_ready_counter_pointer,
             cluster_m=self.cluster_m,
+            fc2_ready_is_mask=self.fc2_ready_is_mask,
             weight_storage_mode=self.weight_storage_mode,
             weight_descriptor_workspace=weight_descriptor_workspace,
             expert_token_sizes=expert_token_sizes,
@@ -77,6 +78,46 @@ class DgluMxFp8Fc12SchedExtension(GluMxFp8Fc12SchedExtension):
         expert_idx = work_tile_info.expert_idx
         valid_tokens = Int32(self.expert_token_sizes[expert_idx])
         return ((valid_tokens + Int32(padding_block - 1)) // Int32(padding_block)) * Int32(padding_block)
+
+    @cute.jit
+    def fc1_input_readiness_counter_slot(
+        self, work_tile_info: NonSwapAbFc12WorkTileInfo
+    ) -> Int32:
+        """Return the Token-in readiness slot for one Linear1/dFC2 tile."""
+        return self._counter_slot(work_tile_info)
+
+    @cute.jit
+    def fc1_input_readiness_counter_pointer(
+        self, work_tile_info: NonSwapAbFc12WorkTileInfo
+    ) -> Pointer:
+        """Return the Token-in readiness counter for one Linear1/dFC2 tile."""
+        if cutlass.const_expr(self.fc1_ready_counter_pointer is None):
+            raise ValueError("Linear1 input readiness requires a Token-in counter.")
+        return (
+            self.fc1_ready_counter_pointer
+            + self.fc1_input_readiness_counter_slot(work_tile_info)
+        )
+
+    @cute.jit
+    def fc2_readiness_counter_slot(
+        self, work_tile_info: NonSwapAbFc12WorkTileInfo
+    ) -> Int32:
+        """Return the dense token-cell slot used by the dFC2 ready mask."""
+        return self._counter_slot(work_tile_info)
+
+    @cute.jit
+    def fc2_readiness_counter_pointer_for_slot(self, counter_slot: Int32) -> Pointer:
+        """Return the dFC2 ready-mask pointer for one dense token-cell slot."""
+        return self.fc1_done_counter_pointer + counter_slot
+
+    @cute.jit
+    def fc2_readiness_counter_pointer(
+        self, work_tile_info: NonSwapAbFc12WorkTileInfo
+    ) -> Pointer:
+        """Return the dFC2-to-dFC1 readiness counter for one consumer cell."""
+        return self.fc2_readiness_counter_pointer_for_slot(
+            self.fc2_readiness_counter_slot(work_tile_info)
+        )
 
     @cute.jit
     def _aux_data_tensor(

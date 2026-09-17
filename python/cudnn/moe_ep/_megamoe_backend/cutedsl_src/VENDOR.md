@@ -9,10 +9,10 @@ documented in the parent backend `README.md`.
 - **Project**: `cutedsl_megamoe` (NVIDIA-internal repository; URL omitted).
 - **Source tree**: `cutedsl_megamoe/next/sources`.
 - **Current synchronized commit**:
-  `aa173b4af2dc859e86de61e51d34a69c7f8cafe6`.
+  `1667b47a3c911ecade464ab524baf192a0bf5962`.
 - **Discrete-weight implementation**:
   `7cc8d2eb2fb2fc9643ccd6244d6c810ed9f4341b`.
-- **Last synced**: 2026-09-11.
+- **Last synced**: 2026-09-17.
 - **Vendored subset**: the exact export closure produced for
   `RubinTrainingFwdGluMegaMoE` and `RubinTrainingBwdDgluMegaMoE`, including
   materialized source-copy modules.
@@ -46,6 +46,11 @@ The synchronized Python sources use BSD-3-Clause SPDX identifiers.
   row-major WGrad operand ABI: fake stride `(1, 0)`, `dst_k_major=False`, and
   row-major fixed-matrix validation. This preserves `fc1_a` as
   `(pool_rows, hidden)` with stride `(hidden, 1)`.
+- MoeEP reverse-maps its prescribed physical receive-pool size to the
+  upstream logical route-limit field. The deterministic communication
+  component and the forward/backward MegaMoE entry points preserve that
+  logical limit instead of clamping it to the raw route count, so workspace
+  shapes reproduce the caller-owned physical pool exactly.
 - The materialized Rubin training TMEM helper replaces two unused Blackwell
   swap-AB extension annotations with `Any`; the extension and its now-empty
   local `kernel_src/blackwell` package tree are omitted from the vendored

@@ -132,6 +132,7 @@ class GluMxFp8Fc12SchedExtension:
     fc2_spin_threshold: Int32
     fc1_ready_counter_pointer: Optional[Pointer] = None
     cluster_m: int = 1
+    fc2_ready_is_mask: bool = False
     weight_storage_mode: WeightStorageMode = "contiguous"
     weight_descriptor_workspace: Optional[Pointer] = None
 
@@ -194,6 +195,7 @@ class GluMxFp8Fc12SchedExtension:
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=fc1_ready_counter_pointer,
             cluster_m=self.cluster_m,
+            fc2_ready_is_mask=self.fc2_ready_is_mask,
             weight_storage_mode=self.weight_storage_mode,
             weight_descriptor_workspace=weight_descriptor_workspace,
         )
@@ -224,7 +226,18 @@ class GluMxFp8Fc12SchedExtension:
             if is_fc2:
                 counter_pointer = self.fc1_done_counter_pointer + counter_slot
                 peek_flag = Int32(0)
-                if spin_peek(counter_pointer, lambda value: value >= self.fc2_spin_threshold):
+                if cutlass.const_expr(self.fc2_ready_is_mask):
+                    ready = spin_peek(
+                        counter_pointer,
+                        lambda value: (value & self.fc2_spin_threshold)
+                        == self.fc2_spin_threshold,
+                    )
+                else:
+                    ready = spin_peek(
+                        counter_pointer,
+                        lambda value: value >= self.fc2_spin_threshold,
+                    )
+                if ready:
                     peek_flag = Int32(peek_ready_bit)
                 phase_and_flags = work_tile.phase_and_flags | peek_flag
 

@@ -10,7 +10,13 @@ from cutlass._mlir.dialects import math as _math
 from cutlass.cutlass_dsl import Float32, T, dsl_user_op
 
 from ......helpers.constants import Fp32Max, Fp8E4M3RcpLimit, Fp8E5M2RcpLimit, Log2E
-from ......helpers.ptx_helpers import cvt_f32_to_fp8_to_f32, cvt_f32x4_to_f8x4_pack_i32
+from ......helpers.ptx_helpers import (
+    cvt_f32_to_fp8_to_f32,
+    cvt_f32_to_ue8m0_raw_i32,
+    cvt_f32x4_to_f8x4_pack_i32,
+    cvt_f32x4_to_f8x4_scaled4_pack_i32,
+    cvt_f32x4_to_f8x4_scaled_pack_i32,
+)
 
 
 @dsl_user_op
@@ -104,6 +110,7 @@ def quant_sfd_row(
     sf_vec_size,
     sf_dtype,
     d_dtype,
+    use_scaled_cvt: bool = False,
 ):
     """Quantize the ``sf_vec_size`` values in ``src`` to ``d_dtype`` with one block scale."""
     rcp_limit = Fp8E4M3RcpLimit if d_dtype == cutlass.Float8E4M3FN else Fp8E5M2RcpLimit
@@ -113,6 +120,39 @@ def quant_sfd_row(
     # Fuse the two loop-invariant constants into one multiply
     rcp_limit_norm = rcp_limit * norm_const
     avg_fp32 = abs_acc_frg.reduce(cute.ReductionOp.MAX, Float32(0.0), 0) * rcp_limit_norm
+
+    if cutlass.const_expr(use_scaled_cvt):
+        if cutlass.const_expr(sf_dtype is not cutlass.Float8E8M0FNU):
+            raise ValueError("Scaled FP8 conversion requires UE8M0 scale factors.")
+
+        qpvscale_raw = cvt_f32_to_ue8m0_raw_i32(avg_fp32)
+
+        # Preserve the general St contract. Production MXFP8 passes 1.0, so
+        # this multiply constant-folds away in the intended path.
+        for ei in cutlass.range_constexpr(0, sf_vec_size, 2):
+            src[ei], src[ei + 1] = cute.arch.mul_packed_f32x2(
+                (src[ei], src[ei + 1]),
+                (norm_const, norm_const),
+                rnd="rn",
+                ftz=False,
+            )
+
+        dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
+        acc_vec = src.load()
+        for ei in cutlass.range_constexpr(0, sf_vec_size, 4):
+            fp32x4 = cute.make_rmem_tensor(4, Float32)
+            fp32x4[0] = acc_vec[ei + 0]
+            fp32x4[1] = acc_vec[ei + 1]
+            fp32x4[2] = acc_vec[ei + 2]
+            fp32x4[3] = acc_vec[ei + 3]
+            dst_i32[ei // 4] = cvt_f32x4_to_f8x4_scaled_pack_i32(
+                fp32x4, d_dtype, qpvscale_raw
+            )
+
+        # The caller stores this to E8M0; the pre-round value produces the
+        # same byte without a UE8M0 -> FP32 round trip.
+        return avg_fp32
+
     qpvscale_up = cvt_f32_to_fp8_to_f32(avg_fp32, sf_dtype)
     acc_scale = norm_const * cute.arch.rcp_approx(qpvscale_up)
     acc_scale = cute.arch.fmin(acc_scale, Fp32Max, nan=True)
@@ -248,23 +288,38 @@ def quant_sfd_col(
     sf_vec_size,
     sf_dtype,
     d_dtype,
+    use_scaled_cvt: bool = False,
 ):
     """Column (cross-thread) block-scale quantize: the amax is a warp reduction."""
     rcp_limit = Fp8E4M3RcpLimit if d_dtype == cutlass.Float8E4M3FN else Fp8E5M2RcpLimit
     acc_frg = src.load()
-    abs_acc_frg_ir = _math.absf(acc_frg.ir_value())
-    acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
+    if cutlass.const_expr(not use_scaled_cvt):
+        abs_acc_frg_ir = _math.absf(acc_frg.ir_value())
+        acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
 
     qpvscale_up = Float32(0.0)
     tidx, _, _ = cute.arch.thread_idx()
     scale = rcp_limit * norm_const
+    sf_packed = None
+    if cutlass.const_expr(use_scaled_cvt):
+        if cutlass.const_expr(sf_dtype is not cutlass.Float8E8M0FNU):
+            raise ValueError("Scaled FP8 conversion requires UE8M0 scale factors.")
+        sf_packed = cute.make_rmem_tensor((sf_vec_size // 4,), cutlass.Int32)
 
     for vi in cutlass.range_constexpr(0, sf_vec_size, 4):
         # Warp-wide MAX across the 32 rows for each of the 4 lanes.
-        max_value0 = Float32(cute.arch.warp_redux_sync(acc_frg[vi], "fmax", nan=True))
-        max_value1 = Float32(cute.arch.warp_redux_sync(acc_frg[vi + 1], "fmax", nan=True))
-        max_value2 = Float32(cute.arch.warp_redux_sync(acc_frg[vi + 2], "fmax", nan=True))
-        max_value3 = Float32(cute.arch.warp_redux_sync(acc_frg[vi + 3], "fmax", nan=True))
+        max_value0 = Float32(
+            cute.arch.warp_redux_sync(acc_frg[vi], "fmax", abs=use_scaled_cvt, nan=True)
+        )
+        max_value1 = Float32(
+            cute.arch.warp_redux_sync(acc_frg[vi + 1], "fmax", abs=use_scaled_cvt, nan=True)
+        )
+        max_value2 = Float32(
+            cute.arch.warp_redux_sync(acc_frg[vi + 2], "fmax", abs=use_scaled_cvt, nan=True)
+        )
+        max_value3 = Float32(
+            cute.arch.warp_redux_sync(acc_frg[vi + 3], "fmax", abs=use_scaled_cvt, nan=True)
+        )
 
         (max_value0, max_value1) = cute.arch.mul_packed_f32x2(
             (max_value0, max_value1), (scale, scale), rnd="rn", ftz=False,
@@ -273,48 +328,87 @@ def quant_sfd_col(
             (max_value2, max_value3), (scale, scale), rnd="rn", ftz=False,
         )
 
-        max_value0 = cvt_f32_to_fp8_to_f32(max_value0, sf_dtype)
-        max_value1 = cvt_f32_to_fp8_to_f32(max_value1, sf_dtype)
-        max_value2 = cvt_f32_to_fp8_to_f32(max_value2, sf_dtype)
-        max_value3 = cvt_f32_to_fp8_to_f32(max_value3, sf_dtype)
+        if cutlass.const_expr(use_scaled_cvt):
+            scale_vec = cute.make_rmem_tensor(4, Float32)
+            scale_vec[0] = max_value0
+            scale_vec[1] = max_value1
+            scale_vec[2] = max_value2
+            scale_vec[3] = max_value3
+            sf_packed[vi // 4] = cvt_f32x4_to_f8x4_pack_i32(scale_vec, sf_dtype)
 
-        # Each thread keeps its assigned column's pre-round-trip scale.
-        if tidx % 32 == vi:
-            qpvscale_up = max_value0
-        if tidx % 32 == vi + 1:
-            qpvscale_up = max_value1
-        if tidx % 32 == vi + 2:
-            qpvscale_up = max_value2
-        if tidx % 32 == vi + 3:
-            qpvscale_up = max_value3
+            # Each lane eventually stores its own E8M0 scale; retaining the
+            # pre-round value is sufficient because that store rounds it.
+            if tidx % 32 == vi:
+                qpvscale_up = max_value0
+            if tidx % 32 == vi + 1:
+                qpvscale_up = max_value1
+            if tidx % 32 == vi + 2:
+                qpvscale_up = max_value2
+            if tidx % 32 == vi + 3:
+                qpvscale_up = max_value3
+        else:
+            max_value0 = cvt_f32_to_fp8_to_f32(max_value0, sf_dtype)
+            max_value1 = cvt_f32_to_fp8_to_f32(max_value1, sf_dtype)
+            max_value2 = cvt_f32_to_fp8_to_f32(max_value2, sf_dtype)
+            max_value3 = cvt_f32_to_fp8_to_f32(max_value3, sf_dtype)
 
-        max_value_rcp0 = cute.arch.fmin(cute.arch.rcp_approx(max_value0), Fp32Max, nan=True)
-        max_value_rcp1 = cute.arch.fmin(cute.arch.rcp_approx(max_value1), Fp32Max, nan=True)
-        max_value_rcp2 = cute.arch.fmin(cute.arch.rcp_approx(max_value2), Fp32Max, nan=True)
-        max_value_rcp3 = cute.arch.fmin(cute.arch.rcp_approx(max_value3), Fp32Max, nan=True)
+            if tidx % 32 == vi:
+                qpvscale_up = max_value0
+            if tidx % 32 == vi + 1:
+                qpvscale_up = max_value1
+            if tidx % 32 == vi + 2:
+                qpvscale_up = max_value2
+            if tidx % 32 == vi + 3:
+                qpvscale_up = max_value3
 
-        (acc_scale_col0, acc_scale_col1) = cute.arch.mul_packed_f32x2(
-            (norm_const, norm_const), (max_value_rcp0, max_value_rcp1), rnd="rn", ftz=False,
-        )
-        (acc_scale_col2, acc_scale_col3) = cute.arch.mul_packed_f32x2(
-            (norm_const, norm_const), (max_value_rcp2, max_value_rcp3), rnd="rn", ftz=False,
-        )
+            max_value_rcp0 = cute.arch.fmin(cute.arch.rcp_approx(max_value0), Fp32Max, nan=True)
+            max_value_rcp1 = cute.arch.fmin(cute.arch.rcp_approx(max_value1), Fp32Max, nan=True)
+            max_value_rcp2 = cute.arch.fmin(cute.arch.rcp_approx(max_value2), Fp32Max, nan=True)
+            max_value_rcp3 = cute.arch.fmin(cute.arch.rcp_approx(max_value3), Fp32Max, nan=True)
 
-        (src[vi], src[vi + 1]) = cute.arch.mul_packed_f32x2(
-            (src[vi], src[vi + 1]), (acc_scale_col0, acc_scale_col1), rnd="rn", ftz=False,
-        )
-        (src[vi + 2], src[vi + 3]) = cute.arch.mul_packed_f32x2(
-            (src[vi + 2], src[vi + 3]), (acc_scale_col2, acc_scale_col3), rnd="rn", ftz=False,
-        )
+            (acc_scale_col0, acc_scale_col1) = cute.arch.mul_packed_f32x2(
+                (norm_const, norm_const), (max_value_rcp0, max_value_rcp1), rnd="rn", ftz=False,
+            )
+            (acc_scale_col2, acc_scale_col3) = cute.arch.mul_packed_f32x2(
+                (norm_const, norm_const), (max_value_rcp2, max_value_rcp3), rnd="rn", ftz=False,
+            )
+
+            (src[vi], src[vi + 1]) = cute.arch.mul_packed_f32x2(
+                (src[vi], src[vi + 1]), (acc_scale_col0, acc_scale_col1), rnd="rn", ftz=False,
+            )
+            (src[vi + 2], src[vi + 3]) = cute.arch.mul_packed_f32x2(
+                (src[vi + 2], src[vi + 3]), (acc_scale_col2, acc_scale_col3), rnd="rn", ftz=False,
+            )
 
     dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
     for ei in cutlass.range_constexpr(0, sf_vec_size, 4):
         fp32x4 = cute.make_rmem_tensor(4, Float32)
-        fp32x4[0] = src[ei + 0]
-        fp32x4[1] = src[ei + 1]
-        fp32x4[2] = src[ei + 2]
-        fp32x4[3] = src[ei + 3]
-        fp8x4_i32 = cvt_f32x4_to_f8x4_pack_i32(fp32x4, d_dtype)
+        if cutlass.const_expr(use_scaled_cvt):
+            scaled01 = cute.arch.mul_packed_f32x2(
+                (src[ei + 0], src[ei + 1]),
+                (norm_const, norm_const),
+                rnd="rn",
+                ftz=False,
+            )
+            scaled23 = cute.arch.mul_packed_f32x2(
+                (src[ei + 2], src[ei + 3]),
+                (norm_const, norm_const),
+                rnd="rn",
+                ftz=False,
+            )
+            fp32x4[0] = scaled01[0]
+            fp32x4[1] = scaled01[1]
+            fp32x4[2] = scaled23[0]
+            fp32x4[3] = scaled23[1]
+            fp8x4_i32 = cvt_f32x4_to_f8x4_scaled4_pack_i32(
+                fp32x4, d_dtype, sf_packed[ei // 4]
+            )
+        else:
+            fp32x4[0] = src[ei + 0]
+            fp32x4[1] = src[ei + 1]
+            fp32x4[2] = src[ei + 2]
+            fp32x4[3] = src[ei + 3]
+            fp8x4_i32 = cvt_f32x4_to_f8x4_pack_i32(fp32x4, d_dtype)
         dst_i32[ei // 4] = cutlass.Int32(fp8x4_i32)
     return qpvscale_up
 

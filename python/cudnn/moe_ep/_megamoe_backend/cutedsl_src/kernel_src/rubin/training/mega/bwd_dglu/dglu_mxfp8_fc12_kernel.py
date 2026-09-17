@@ -25,15 +25,14 @@ from ..tmem_transpose import _TmemTranspose16x32Core
 from .dglu_mxfp8_fc12_epilogue import DgluMxfp8Epilogue
 from .....schedulers.fc12_mapping import BlockPhase
 from .....schedulers.base import WorkIdAcquisitionMode
-from .....schedulers.fc12_scheduler import BlackwellFusedFc12Scheduler
+from .dglu_mxfp8_schedule import build_dgrad_scheduler
 from .dglu_mxfp8_fc12_extension import DgluMxFp8Fc12SchedExtension
 from ..fwd_glu.glu_mxfp8_fc12_extension import WeightStorageMode, raw_discrete_weight_descriptor_pointer
-from ......api import ImplDesc, KernelClass, ProblemDesc, StaticOrRuntimeIntegerType
+from ......api import KernelClass, StaticOrRuntimeIntegerType
 from ..helpers.constants import SupportedMmaTileM, SupportedMmaTileN
 from ......helpers.iket_compat import iket
-from ......helpers.device_workspace import DeviceWorkspace
-from ......helpers.smem_workspace import SmemWorkspace
 from ......helpers.dsl_helpers import spin_wait
+from ......helpers.ptx_helpers import nanosleep
 from ......quant_def import CombineFormat, QuantKind
 from ......communication.nvlink_domain.token_comm import TokenCommArgs
 
@@ -69,8 +68,12 @@ def _int64_pointer_array_tensor(pointer_array: cute.Pointer, element_count: int)
 
 class Sm107Mxfp8DgluDfc21Kernel:
 
-    # SMEM budget for buffers like mbarriers, sched, work-tile buffer, TMEM allocator state
-    _SmemMiscBudget = 1024
+    # SMEM budget for pipeline/TMEM state plus the separately allocated FC12
+    # scheduler workspace.  The scheduler storage is 1 KiB-aligned, so a
+    # 1 KiB budget undercounts the compiled kernel by another 1 KiB.  That
+    # made the tight GR100 shape select nine AB stages (335,360 B) even though
+    # the architectural launch limit is 334,848 B.
+    _SmemMiscBudget = 2048
 
     # Supported (ab_dtype, sf_vec_size) pairings.
     # MXFP8 → Float8E4M3FN / Float8E5M2 + sf_vec_size=32  (FP8-E8M0 scales, MmaMXF8Op)
@@ -100,11 +103,33 @@ class Sm107Mxfp8DgluDfc21Kernel:
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         dfc2_recompute: bool = False,
         dfc2_col_output: bool = False,
+        dfc2_subtile_publish: bool = False,
         fc2_in_kernel_topk_reduce: bool = False,
         act_func: str = "swiglu",
         gate_up_clamp: Optional[float] = None,
+        dfc2_c_pipe_stages: int = 1,
+        dfc2_d_pipe_stages: int = 1,
+        dfc2_acc_early_release: bool = False,
+        schedule_mode: Literal["grouped", "phase_interleave"] = "grouped",
+        phase_interleave_prologue_tiles: Optional[int] = None,
+        phase_interleave_defer_consumers_until_full: bool = False,
+        phase_interleave_fuse_ready_probe_and_producer_claim: bool = False,
+        phase_interleave_defer_linear1_until_input_ready: bool = False,
+        prefetch_tma_descriptors: bool = False,
+        dfc1_weight_l2_prefetch_depth: int = 0,
+        use_scaled_cvt: bool = False,
         weight_storage_mode: WeightStorageMode = "contiguous",
     ) -> None:
+        if (type(phase_interleave_defer_linear1_until_input_ready) is not bool
+                or type(prefetch_tma_descriptors) is not bool
+                or type(dfc1_weight_l2_prefetch_depth) is not int):
+            raise TypeError("Archived tuning controls require bool/bool/int values.")
+        if (phase_interleave_defer_linear1_until_input_ready
+                or prefetch_tma_descriptors or dfc1_weight_l2_prefetch_depth != 0):
+            raise NotImplementedError(
+                "External-ready admission and TMA/weight prefetch experiments "
+                "are archived; keep their constructor controls disabled."
+            )
         if not force_static_sched:
             raise NotImplementedError(
                 "v1 only implements force_static_sched=True (lean 7-warp). "
@@ -132,6 +157,84 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 f"load_balance_mode must be 'static' or 'atomic_counter'; "
                 f"got {load_balance_mode!r}."
             )
+        if schedule_mode not in ("grouped", "phase_interleave"):
+            raise ValueError(
+                "schedule_mode must be 'grouped' or 'phase_interleave'; "
+                f"got {schedule_mode!r}."
+            )
+        if schedule_mode == "phase_interleave":
+            if load_balance_mode != "atomic_counter":
+                raise ValueError(
+                    "phase_interleave requires load_balance_mode="
+                    "'atomic_counter'."
+                )
+            if static_expert_shape is None:
+                raise ValueError(
+                    "phase_interleave currently requires static_expert_shape."
+                )
+        else:
+            if phase_interleave_prologue_tiles is not None:
+                raise ValueError(
+                    "phase_interleave_prologue_tiles is only valid when "
+                    "schedule_mode='phase_interleave'."
+                )
+            if phase_interleave_defer_consumers_until_full:
+                raise ValueError(
+                    "phase_interleave_defer_consumers_until_full "
+                    "requires schedule_mode='phase_interleave'."
+                )
+            if phase_interleave_fuse_ready_probe_and_producer_claim:
+                raise ValueError(
+                    "phase_interleave_fuse_ready_probe_and_producer_claim "
+                    "requires schedule_mode='phase_interleave'."
+                )
+        if not isinstance(
+            phase_interleave_defer_consumers_until_full, bool
+        ):
+            raise TypeError(
+                "phase_interleave_defer_consumers_until_full must be a bool."
+            )
+        if not isinstance(
+            phase_interleave_fuse_ready_probe_and_producer_claim, bool
+        ):
+            raise TypeError(
+                "phase_interleave_fuse_ready_probe_and_producer_claim must "
+                "be a bool."
+            )
+        if (
+            phase_interleave_prologue_tiles is not None
+            and (
+                isinstance(phase_interleave_prologue_tiles, bool)
+                or not isinstance(phase_interleave_prologue_tiles, int)
+                or phase_interleave_prologue_tiles < 0
+            )
+        ):
+            raise ValueError(
+                "phase_interleave_prologue_tiles must be a non-negative int "
+                "when provided."
+            )
+        if phase_interleave_prologue_tiles == 0 and not phase_interleave_defer_consumers_until_full:
+            raise ValueError(
+                "phase_interleave_prologue_tiles=0 requires full-ready consumer admission."
+            )
+        if not isinstance(use_scaled_cvt, bool):
+            raise TypeError("use_scaled_cvt must be a bool.")
+        if use_scaled_cvt:
+            # scaled::n1::ue8m0 is accepted by ptxas only for the
+            # architecture-specific Rubin target, not sm_107/sm_107f.
+            from cutlass.cutlass_dsl import CuTeDSL
+
+            target = CuTeDSL._get_dsl().get_arch_enum()
+            target_tuple = (
+                int(target.major),
+                int(target.minor),
+                getattr(target, "suffix", "") or "",
+            )
+            if target_tuple != (10, 7, "a"):
+                raise ValueError(
+                    "use_scaled_cvt requires compilation for sm_107a; "
+                    f"got sm_{target_tuple[0]}{target_tuple[1]}{target_tuple[2]}"
+                )
         if weight_storage_mode not in ("contiguous", "discrete"):
             raise ValueError(
                 "weight_storage_mode must be 'contiguous' or 'discrete'; "
@@ -151,7 +254,35 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 f"act_func={act_func!r} is not yet implemented; only "
                 "'swiglu' is currently supported (geglu support is planned)."
             )
-
+        if dfc2_c_pipe_stages not in (1, 2):
+            raise ValueError(
+                "dfc2_c_pipe_stages must be 1 (baseline) or 2 "
+                f"(double-buffered preactivation load); got {dfc2_c_pipe_stages}."
+            )
+        if (
+            isinstance(dfc2_d_pipe_stages, bool)
+            or not isinstance(dfc2_d_pipe_stages, int)
+            or dfc2_d_pipe_stages not in (1, 2)
+        ):
+            raise ValueError(
+                "dfc2_d_pipe_stages must be 1 (baseline) or 2 "
+                f"(double-buffered TMA-store); got {dfc2_d_pipe_stages}."
+            )
+        if (
+            phase_interleave_defer_consumers_until_full
+            and not dfc2_subtile_publish
+        ):
+            raise ValueError(
+                "phase_interleave_defer_consumers_until_full requires "
+                "dfc2_subtile_publish so the scheduler can test the packed "
+                "full-readiness mask."
+            )
+        if phase_interleave_fuse_ready_probe_and_producer_claim:
+            if not phase_interleave_defer_consumers_until_full:
+                raise ValueError(
+                    "phase_interleave_fuse_ready_probe_and_producer_claim "
+                    "requires phase_interleave_defer_consumers_until_full=True."
+                )
         # Store ab_dtype so workspace-size helpers can use it without tensors.
         self.ab_dtype = ab_dtype
         self.act_func = act_func
@@ -171,18 +302,77 @@ class Sm107Mxfp8DgluDfc21Kernel:
         self.token_padding_block = token_padding_block
         self.sf_padding_block = sf_padding_block
         self.load_balance_mode = load_balance_mode
+        self.schedule_mode = schedule_mode
+        self.phase_interleave_prologue_tiles = phase_interleave_prologue_tiles
+        self.resolved_phase_interleave_prologue_tiles = None
+        self.phase_interleave_defer_consumers_until_full = (
+            phase_interleave_defer_consumers_until_full
+        )
+        self.phase_interleave_fuse_ready_probe_and_producer_claim = (
+            phase_interleave_fuse_ready_probe_and_producer_claim
+        )
+        self.phase_interleave_defer_linear1_until_input_ready = (
+            phase_interleave_defer_linear1_until_input_ready
+        )
+        self.prefetch_tma_descriptors = prefetch_tma_descriptors
+        self.dfc1_weight_l2_prefetch_depth = dfc1_weight_l2_prefetch_depth
 
         self.sf_vec_size = sf_vec_size
         self.arch = "sm_107"
         self.epi_flag_batch = epi_flag_batch
         self.dfc2_recompute = dfc2_recompute
         self.dfc2_col_output = dfc2_col_output
+        self.dfc2_subtile_publish = dfc2_subtile_publish
+        self.dfc2_c_pipe_stages = dfc2_c_pipe_stages
+        self.dfc2_d_pipe_stages = dfc2_d_pipe_stages
+        self.dfc2_acc_early_release = dfc2_acc_early_release
+        self.use_scaled_cvt = use_scaled_cvt
         self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self.weight_storage_mode = weight_storage_mode
         self.gate_up_clamp = abs(gate_up_clamp) if gate_up_clamp is not None else None
 
         self._validate_mma_tiler_and_cluster_shape()
         self.mma_tiler = mma_tiler_mnk
+
+        # Experimental dFC2 -> dFC1 streaming handoff.  One dFC2 N256 task
+        # produces gate256+up256, i.e. one contiguous K512 chunk for dFC1.
+        # Each CTA in the MMA pair publishes one bit into a packed Int32 mask;
+        # keeping the sign bit unused makes all host/DSL Int32 constants exact.
+        self.dfc2_ready_chunk_k = 2 * mma_tiler_mnk[1]
+        self.dfc2_ready_k_tiles_per_chunk = (
+            self.dfc2_ready_chunk_k // mma_tiler_mnk[2]
+        )
+        self.dfc2_ready_chunk_count = 0
+        self.dfc2_ready_full_mask = 0
+        if self.dfc2_subtile_publish:
+            if static_expert_shape is None:
+                raise ValueError(
+                    "dfc2_subtile_publish requires static_expert_shape so the "
+                    "packed ready mask can be specialized at compile time."
+                )
+            if self.dfc2_ready_chunk_k != 512 or mma_tiler_mnk[2] != 128:
+                raise ValueError(
+                    "dfc2_subtile_publish currently requires one K512 chunk "
+                    "per dFC2 task and K128 MMA tiles; got "
+                    f"chunk_k={self.dfc2_ready_chunk_k}, mma_k={mma_tiler_mnk[2]}."
+                )
+            dfc2_n_extent = static_expert_shape[1]
+            if dfc2_n_extent <= 0 or dfc2_n_extent % mma_tiler_mnk[1] != 0:
+                raise ValueError(
+                    "dfc2_subtile_publish requires the dFC2 N extent to be a "
+                    f"positive multiple of {mma_tiler_mnk[1]}; got {dfc2_n_extent}."
+                )
+            self.dfc2_ready_chunk_count = dfc2_n_extent // mma_tiler_mnk[1]
+            ready_bit_count = self.dfc2_ready_chunk_count * (
+                2 if use_2cta_instrs else 1
+            )
+            if ready_bit_count > 30:
+                raise ValueError(
+                    "dfc2_subtile_publish supports at most 30 ready bits in "
+                    f"one positive Int32 mask; got {ready_bit_count}."
+                )
+            self.dfc2_ready_full_mask = (1 << ready_bit_count) - 1
+
 
         self.cta_group = (
             tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -225,7 +415,11 @@ class Sm107Mxfp8DgluDfc21Kernel:
 
         # Token-comm (MegaMoE)
         self.enable_token_comm: bool = False
-        self.dispatch_warp_id: Optional[Tuple[int, int, int, int]] = None
+        # The lean base cannot assume that a token-comm wrapper allocates and
+        # tail-resets the packed dFC2-ready counters.  MegaMoE opts in after it
+        # wires that workspace protocol.
+        self.token_comm_supports_dfc2_subtile_publish: bool = False
+        self.dispatch_warp_id: Optional[Tuple[int, ...]] = None
         self.token_back_by_dispatch: bool = False
         self.token_back_standalone: bool = False
         self.token_back_warp_id: Optional[Tuple[int, int, int, int]] = None
@@ -278,6 +472,16 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 f"cluster_shape M ({cm}) must be even when use_2cta_instrs=True"
             )
 
+        mma_atom_ctas = 2 if self.use_2cta_instrs else 1
+        if (
+            self.phase_interleave_defer_consumers_until_full
+            and cm != mma_atom_ctas
+        ):
+            raise NotImplementedError(
+                "deferred consumer admission requires exactly one MMA CTA "
+                "atom per physical cluster"
+            )
+
         is_pow2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if cm * cn > 16 or not is_pow2(cm) or not is_pow2(cn) or cm > 4 or cn > 4:
             raise ValueError(
@@ -320,43 +524,10 @@ class Sm107Mxfp8DgluDfc21Kernel:
     def _build_scheduler(
         self, *, expert_cnt, intermediate_gateup, hidden_dim, launch_cluster_count
     ) -> None:
-        """Construct FC12 scheduler and its SMEM/device workspaces."""
-        work_id_mode = "grid_stride" if self.load_balance_mode == "static" else "atomic_counter"
-        num_scheduler_consumer_threads = 32 * (len(self.epilogue_warp_id) + 4)
-        if self.static_expert_shape is not None:
-            expert_cnt, intermediate_gateup, hidden_dim = self.static_expert_shape
-        problem_desc = ProblemDesc(
-            {
-                "expert_count": expert_cnt,
-                "intermediate_gateup_size": intermediate_gateup,
-                "hidden_size": hidden_dim,
-            }
+        build_dgrad_scheduler(
+            self, expert_cnt=expert_cnt, intermediate_gateup=intermediate_gateup,
+            hidden_dim=hidden_dim, launch_cluster_count=launch_cluster_count,
         )
-        impl_desc = ImplDesc(
-            {
-                "num_scheduler_consumer_threads": num_scheduler_consumer_threads,
-                "mma_tiler_mnk": self.mma_tiler,
-                "cluster_shape_mn": self.cluster_shape_mn,
-                "use_2cta_instrs": self.use_2cta_instrs,
-                "hint": self.group_hint,
-                "token_padding_block": self.token_padding_block,
-                "sf_padding_block": self.sf_padding_block,
-                "work_id_mode": work_id_mode,
-                "is_swap_ab": False,
-                "launch_cluster_count": launch_cluster_count,
-            }
-        )
-        self.scheduler = BlackwellFusedFc12Scheduler(problem_desc, impl_desc)
-
-        sched_smem_ws = SmemWorkspace()
-        self.scheduler.register_smem_regions(sched_smem_ws)
-        sched_smem_ws.finalize(max_bytes=self.smem_capacity)
-        self.sched_smem_ws = sched_smem_ws
-
-        sched_device_ws = DeviceWorkspace()
-        self.scheduler.register_device_workspace(sched_device_ws)
-        sched_device_ws.finalize()
-        self.sched_device_ws = sched_device_ws
 
     def _setup_attributes(self) -> None:
         """Set up MMA / cluster / tile shapes, SMEM layouts, stage counts.
@@ -426,6 +597,9 @@ class Sm107Mxfp8DgluDfc21Kernel:
             token_back_by_dispatch=self.token_back_by_dispatch,
             dfc2_recompute=self.dfc2_recompute,
             dfc2_col_output=self.dfc2_col_output,
+            dfc2_subtile_publish=self.dfc2_subtile_publish,
+            dfc2_acc_early_release=self.dfc2_acc_early_release,
+            use_scaled_cvt=self.use_scaled_cvt,
             fc2_in_kernel_topk_reduce=self.fc2_in_kernel_topk_reduce,
             combine_format=getattr(self, "combine_format", None),
             combine_hidden=getattr(self, "hidden", None),
@@ -437,12 +611,28 @@ class Sm107Mxfp8DgluDfc21Kernel:
         if self.num_sched_stages is None:
             self.num_sched_stages = 2
 
-        # Reserve SMEM for the preact (dswiglu C) pipeline staging buffer
-        self.num_c_stage = 2
+        # Each logical preactivation-C pipeline stage owns a gate/up pair of
+        # physical SMEM slots.  Keep one logical stage as the production
+        # default; two overlaps preactivation loads with the epilogue.
+        self.num_c_pipe_stage = self.dfc2_c_pipe_stages
+        self.num_c_stage = 2 * self.num_c_pipe_stage
         assert self.num_c_stage % 2 == 0, f"num_c_stage must be even, got {self.num_c_stage}"
-        self.num_c_pipe_stage = self.num_c_stage // 2
-        # One PipelineTmaStore stage contains every dFC2 data output tile.
-        self.num_d_stage = self.epilogue.d_output_slots
+        # One logical PipelineTmaStore stage contains every enabled dFC2 data
+        # output tile.  Two logical stages let the epilogue fill the next SMEM
+        # slot while the previous stage drains to GMEM.
+        self.num_d_stage = (
+            self.epilogue.d_output_slots * self.dfc2_d_pipe_stages
+        )
+        assert self.num_d_stage % self.epilogue.d_output_slots == 0
+        dfc2_epilogue_subtiles = (
+            self.epilogue.cta_tile_n // self.epilogue.epi_tile[0]
+        )
+        if dfc2_epilogue_subtiles % self.dfc2_d_pipe_stages != 0:
+            raise ValueError(
+                "dFC2 epilogue subtile count must be divisible by the D-store "
+                f"pipeline depth; got {dfc2_epilogue_subtiles} subtiles and "
+                f"depth {self.dfc2_d_pipe_stages}."
+            )
         c_bytes_total = self.num_c_stage * self.epilogue.preact_bytes_per_stage
         d_bytes_total = self.num_d_stage * self.epilogue.d_bytes_per_stage
         self.c_bytes_total = c_bytes_total
@@ -467,31 +657,33 @@ class Sm107Mxfp8DgluDfc21Kernel:
             self._smem_misc_budget_bytes() - self._SmemMiscBudget,
         )
 
+        self.num_a_stage = self.num_ab_stage
+        self.num_b_stage = self.num_ab_stage
+
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
             self.mma_tiler,
             self.a_dtype,
-            self.num_ab_stage,
+            self.num_a_stage,
         )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             tiled_mma,
             self.mma_tiler,
             self.b_dtype,
-            self.num_ab_stage,
+            self.num_b_stage,
         )
         self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
             tiled_mma,
             self.mma_tiler,
             self.sf_vec_size,
-            self.num_ab_stage,
+            self.num_a_stage,
         )
         self.sfb_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
             tiled_mma,
             self.mma_tiler,
             self.sf_vec_size,
-            self.num_ab_stage,
+            self.num_b_stage,
         )
-
         # Read epilogue's accumulator and scale-factor sizing decisions.
         self.num_acc_pipeline_stages = self.epilogue.num_acc_pipeline_stages
         self.num_acc_stage = self.epilogue.num_acc_stage
@@ -514,30 +706,47 @@ class Sm107Mxfp8DgluDfc21Kernel:
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
+        self.num_tma_load_a_bytes = (
+            a_copy_size + sfa_copy_size
+        ) * atom_thr_size
+        self.num_tma_load_b_bytes = (
+            b_copy_size + sfb_copy_size
+        ) * atom_thr_size
         self.num_tma_load_bytes = (
             a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
         ) * atom_thr_size
 
         # SMEM usage report (all sizes are per-CTA)
-        _ab_per_stage = a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
+        _a_per_stage = a_copy_size + sfa_copy_size
+        _b_per_stage = b_copy_size + sfb_copy_size
+        _ab_per_stage = _a_per_stage + _b_per_stage
+        _ab_bytes_total = (
+            self.num_a_stage * _a_per_stage
+            + self.num_b_stage * _b_per_stage
+        )
         _misc_total = self._smem_misc_budget_bytes()
         _fixed = _misc_total + self.c_bytes_total + self.d_bytes_total
-        _total_used = _fixed + self.num_ab_stage * _ab_per_stage
+        _total_used = _fixed + _ab_bytes_total
         _per_cta_budget = self.smem_capacity // self.occupancy
         _free = _per_cta_budget - _total_used
         _extra_misc = _misc_total - self._SmemMiscBudget
+        _ab_stage_report = (
+            f"  AB stages: {self.num_ab_stage} × {_ab_per_stage}B"
+            f" ({_ab_per_stage/1024:.1f}KB)"
+            f" = {self.num_ab_stage * _ab_per_stage}B"
+        )
         print(
             f"[smem] capacity={self.smem_capacity}B ({self.smem_capacity//1024}KB)"
             f"  occupancy={self.occupancy}"
             f"  per-CTA budget={_per_cta_budget}B ({_per_cta_budget//1024}KB)\n"
-            f"  AB stages: {self.num_ab_stage} × {_ab_per_stage}B ({_ab_per_stage/1024:.1f}KB)"
-            f" = {self.num_ab_stage * _ab_per_stage}B"
+            f"{_ab_stage_report}"
             f"  [A={a_copy_size}B B={b_copy_size}B"
             f" SFA={sfa_copy_size}B SFB={sfb_copy_size}B]\n"
             f"  fixed: misc={_misc_total}B (base={self._SmemMiscBudget}B"
             f" + subclass_extra={_extra_misc}B)"
             f"  preact(C)={self.num_c_stage}×{self.epilogue.preact_bytes_per_stage}B"
             f"  sD(D)={self.num_d_stage}×{self.epilogue.d_bytes_per_stage}B"
+            f" (logical_pipe={self.dfc2_d_pipe_stages})"
             f"  used={_total_used}B ({_total_used/1024:.1f}KB)"
             f"  free={_free}B ({_free/1024:.1f}KB)\n"
         )
@@ -633,17 +842,20 @@ class Sm107Mxfp8DgluDfc21Kernel:
         fc1_col_output_bytes = fc1_output_bytes
         fc1_col_output_sf_bytes = fc1_recompute_row_blocks_upper * intermediate_out
 
-        # fc1_done_counter: one Int32 per CTA-level token block (each cluster block
-        # has atom_thr_size CTAs, each with its own per-CTA counter slot).
+        # One Int32 per CTA-level token block.  The baseline stores a completion
+        # count; the experimental K512 path packs one ready bit per dFC2 CTA.
         counter_slots_upper = (
             (data_total_rows + mma_tiler_n - 1) // mma_tiler_n
             + experts
         )
         fc1_done_counter_bytes = counter_slots_upper * 4
 
-        # load_balance_counter: Int32 scalar.
+        # The scheduler counter workspace is provided through the explicit
+        # ``load_balance_counter`` launch argument.  Keep it outside this
+        # opaque data workspace so the caller can reset it before the timed
+        # event without touching the much larger intermediate allocation.
         if self.load_balance_mode == "atomic_counter":
-            load_balance_counter_bytes = 4
+            load_balance_counter_bytes = 0
         else:
             load_balance_counter_bytes = 0
 
@@ -692,9 +904,9 @@ class Sm107Mxfp8DgluDfc21Kernel:
     #
     # Mirrors the hook interface in ``moe_mxfp8_glu.kernel_mxfp8_glu_fc12``
     # so that ``Sm107MegaMoEMxfp8DgluKernel`` can override exactly the same
-    # methods.  The mega wrapper realigns dispatch onto warps 8-11 (128-aligned
-    # for next token_comm) and relocates ``c_load_warp_id`` above the transfer
-    # block (warp 12 or 16); the lean base keeps c_load at warp 8.
+    # methods.  The mega wrapper places dispatch in a contiguous block beginning
+    # at warp 8 and relocates ``c_load_warp_id`` above the transfer block; the
+    # lean base keeps c_load at warp 8.
     # =========================================================================
 
     def _smem_misc_budget_bytes(self) -> int:
@@ -722,6 +934,9 @@ class Sm107Mxfp8DgluDfc21Kernel:
         """Return the scale factor for the fc1 ready-counter slot formula."""
         return 1
 
+
+
+
     @cute.jit
     def token_comm_hook_sched_warp_pre_init_wait(self, token_comm_args):
         """Sched warp: wait for dispatch barrier before reading sizes.  No-op base."""
@@ -736,7 +951,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
     def token_comm_hook_dispatch_warp_body(
         self, token_comm_args, token_comm_storage, *, warp_idx, lane_idx, tidx,
     ):
-        """Body for dispatch warps 8-11 (MegaMoE-only).  No-op base."""
+        """Body for the configured dispatch warps (MegaMoE-only).  No-op base."""
         pass
 
     @cute.jit
@@ -922,7 +1137,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
         topk_scores: cute.Tensor,           # (token_sum_padded,) Float32
         beta: cute.Tensor,                  # (experts,) Float32
         dprob: cute.Tensor,                 # (token_sum_padded,) Float32
-        fc1_done_counter: cute.Tensor,      # (fc1_ready_slot_count,) Int32
+        fc1_done_counter: cute.Tensor,      # full count, or packed K512-ready mask
         offs: Optional[cute.Tensor] = None,  # unsupported for dGLU; use expert_token_sizes
         max_active_clusters: cutlass.Constexpr = None,
         stream: cuda.CUstream = None,
@@ -944,6 +1159,16 @@ class Sm107Mxfp8DgluDfc21Kernel:
         weight_descriptor_workspace: Optional[cute.Pointer] = None,
     ) -> None:
         """Launch the fused dfc2+dfc1 dGLU MXFP8 (backward) kernel."""
+        if cutlass.const_expr(
+            self.dfc2_subtile_publish
+            and (self.enable_token_comm or token_comm_args is not None)
+            and not self.token_comm_supports_dfc2_subtile_publish
+        ):
+            raise NotImplementedError(
+                "dfc2_subtile_publish is currently a lean-kernel profiling "
+                "experiment; MegaMoE token-communication workspace/reset "
+                "integration is not implemented."
+            )
         if cutlass.const_expr(
             self.weight_storage_mode == "discrete"
             and weight_descriptor_workspace is None
@@ -1465,9 +1690,6 @@ class Sm107Mxfp8DgluDfc21Kernel:
                     "load_balance_counter must be provided when "
                     "load_balance_mode == 'atomic_counter'"
                 )
-            load_balance_counter_ptr = load_balance_counter.iterator
-        else:
-            load_balance_counter_ptr = None
 
         # dGLU auxiliary layouts require per-expert token counts; cumulative offsets
         # alone are insufficient.
@@ -1539,6 +1761,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
             beta,
             dprob,
             overflow_flag,
+            load_balance_counter,
             fc1_done_counter,
             # Scheduling
             offs,
@@ -1623,6 +1846,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
         beta: cute.Tensor,
         dprob: cute.Tensor,
         overflow_flag: cute.Tensor,
+        load_balance_counter: Optional[cute.Tensor],
         fc1_done_counter: cute.Tensor,
         # Scheduling
         offs: Optional[cute.Tensor],
@@ -1659,10 +1883,14 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 mega_local_workspace, mega_shared_workspace
             )
 
-        # fc2 waits for all fc1 intermediate N-tiles in the same token block.
-        ext_fc2_spin_threshold = (
-            fc1_weight_gemm.shape[0] + self.cta_tile_shape_mnk[1] - 1
-        ) // self.cta_tile_shape_mnk[1] * self.epilogue._atom_thr_size
+        # dFC1 waits for all dFC2 N-tiles in the same token block.  Baseline
+        # uses a completion count; streaming mode uses the full packed mask.
+        if cutlass.const_expr(self.dfc2_subtile_publish):
+            ext_fc2_spin_threshold = cutlass.Int32(self.dfc2_ready_full_mask)
+        else:
+            ext_fc2_spin_threshold = (
+                fc1_weight_gemm.shape[0] + self.cta_tile_shape_mnk[1] - 1
+            ) // self.cta_tile_shape_mnk[1] * self.epilogue._atom_thr_size
 
         if cutlass.const_expr(self.enable_token_comm):
             _aux_expert_sizes = self.token_comm.local_expert_sizes(
@@ -1682,6 +1910,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
             ),
             # Fold the 2 CTAs of a cluster onto one fc1_ready slot
             cluster_m=self.epilogue._atom_thr_size,
+            fc2_ready_is_mask=self.dfc2_subtile_publish,
             weight_storage_mode=self.weight_storage_mode,
             weight_descriptor_workspace=weight_descriptor_workspace,
             expert_token_sizes=_aux_expert_sizes,
@@ -1735,7 +1964,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
         # SharedStorage (mainloop + epilogue SMEM). next's scheduler owns its own
         # SMEM workspace, allocated separately below.
         @cute.struct
-        class SharedStorage:
+        class CombinedAbSharedStorage:
             ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_full_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.num_acc_pipeline_stages * 2
@@ -1759,8 +1988,9 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 1024,
             ]
 
+
         smem = utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
+        storage = smem.allocate(CombinedAbSharedStorage)
 
         # next scheduler SMEM: a self-contained workspace carved from the same
         # allocator; its transport regions resolve against ``sched_smem_base``.
@@ -1775,16 +2005,17 @@ class Sm107Mxfp8DgluDfc21Kernel:
         else:
             token_comm_storage = None
 
-        # ── Pipelines: two TMA producer warps share the AB pipeline. ──
-
+        # The default path retains the original combined AB pipeline exactly.
         ab_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, 2
         )
-        num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
+        num_tma_producer = (
+            self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
+        )
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_tma_producer
         )
-        ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
+        a_producer, a_consumer = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
             num_stages=self.num_ab_stage,
             producer_group=ab_pipeline_producer_group,
@@ -1793,6 +2024,9 @@ class Sm107Mxfp8DgluDfc21Kernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         ).make_participants()
+        # TMA-A and TMA-B execute in distinct warps, so these aliases keep
+        # independent participant state while preserving the old barrier.
+        b_producer = a_producer
 
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_acc_consumer_threads = (
@@ -1869,6 +2103,10 @@ class Sm107Mxfp8DgluDfc21Kernel:
         else:
             _sched_expert_sizes = expert_token_sizes
             _sched_prefix_sum = offs
+            if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
+                self.sched_device_ws.assign_device_members(
+                    load_balance_counter.iterator
+                )
         scheduler.assign_device_members(
             expert_token_sizes=_sched_expert_sizes,
             expert_token_prefix_sum=_sched_prefix_sum,
@@ -1934,11 +2172,14 @@ class Sm107Mxfp8DgluDfc21Kernel:
         mma_tiler_k = self.mma_tiler[2]
         k_tile_cnt_fc1 = (fc1_weight_gemm.shape[1] + mma_tiler_k - 1) // mma_tiler_k
         k_tile_cnt_fc2 = (fc2_weight_gemm.shape[1] + mma_tiler_k - 1) // mma_tiler_k
-        # fc2 spin threshold: number of N-tiles per CTA (per-CTA counter now).
-        fc2_spin_threshold = (
-            (fc1_weight_gemm.shape[0] + self.cta_tile_shape_mnk[1] - 1)
-            // self.cta_tile_shape_mnk[1]
-        ) * self.epilogue._atom_thr_size
+        if cutlass.const_expr(self.dfc2_subtile_publish):
+            fc2_spin_threshold = cutlass.Int32(self.dfc2_ready_full_mask)
+        else:
+            # Baseline completion count: one arrival per dFC2 CTA task.
+            fc2_spin_threshold = (
+                (fc1_weight_gemm.shape[0] + self.cta_tile_shape_mnk[1] - 1)
+                // self.cta_tile_shape_mnk[1]
+            ) * self.epilogue._atom_thr_size
 
         # ════════════════════════════════════════════════════════════════════
         # Scheduler warp (warp 7) — lean path
@@ -1948,8 +2189,109 @@ class Sm107Mxfp8DgluDfc21Kernel:
             # MegaMoE: block until the Router has published this rank's per-expert sizes
             self.token_comm_hook_sched_warp_pre_init_wait(token_comm_args)
             work_tile = scheduler.gen_next_work()
+
+            # With external admission enabled, the loop above drains both work
+            # streams and leaves an invalid tile, so this established path is
+            # naturally skipped.  With it disabled, behavior is unchanged.
             while work_tile.is_valid_tile:
-                scheduler.publish_work(ext.prepare_work_tile(work_tile))
+                consumer_was_published = cutlass.Boolean(False)
+                if cutlass.const_expr(
+                    self.phase_interleave_defer_consumers_until_full
+                ):
+                    if work_tile.phase == cutlass.Int32(BlockPhase.Linear2):
+                        # Hold the whole logical consumer claim outside the
+                        # execution FIFO until its producer cell is complete.
+                        # For bundle=2 the scheduler retains the adjacent tail;
+                        # both tiles map to the same cell, so the head's full
+                        # readiness also covers the tail returned next.
+                        consumer_counter_slot = (
+                            ext.fc2_readiness_counter_slot(work_tile)
+                        )
+                        consumer_counter_pointer = (
+                            ext.fc2_readiness_counter_pointer_for_slot(
+                                consumer_counter_slot
+                            )
+                        )
+                        if cutlass.const_expr(
+                            self.phase_interleave_fuse_ready_probe_and_producer_claim
+                        ):
+                            # The first fused loop iteration performs this
+                            # probe and, on a miss, claims one dependency-free
+                            # producer in the same cluster transaction.
+                            consumer_ready = cutlass.Boolean(False)
+                        else:
+                            consumer_ready = (
+                                scheduler.cluster_uniform_counter_ready(
+                                    consumer_counter_pointer,
+                                    ext.fc2_spin_threshold,
+                                    ready_is_mask=True,
+                                )
+                            )
+
+                        while (not consumer_ready) and (
+                            not consumer_was_published
+                        ):
+
+                            if (not consumer_ready) and (
+                                not consumer_was_published
+                            ):
+                                # The held consumer remains outside the FIFO;
+                                # publish another producer ahead of it.  The
+                                # fused path performs the readiness probe and
+                                # conditional producer claim with one cluster
+                                # broadcast instead of two serialized rounds.
+                                if cutlass.const_expr(
+                                    self.phase_interleave_fuse_ready_probe_and_producer_claim
+                                ):
+                                    consumer_ready, producer_tile = (
+                                        scheduler.gen_next_linear1_work_unless_counter_ready(
+                                            consumer_counter_pointer,
+                                            ext.fc2_spin_threshold,
+                                            ready_is_mask=True,
+                                        )
+                                    )
+                                else:
+                                    producer_tile = (
+                                        scheduler.gen_next_linear1_work()
+                                    )
+                                if not consumer_ready:
+                                    if producer_tile.is_valid_tile:
+                                        scheduler.publish_work(
+                                            ext.prepare_work_tile(producer_tile)
+                                        )
+                                        if cutlass.const_expr(
+                                            self.phase_interleave_fuse_ready_probe_and_producer_claim
+                                        ):
+                                            # Match the two-stage scheduler FIFO with one
+                                            # additional dependency-producing descriptor.
+                                            # Keep this a bounded burst so the held Linear2
+                                            # consumer is probed again after at most two claims.
+                                            producer_tile = (
+                                                scheduler.gen_next_linear1_work()
+                                            )
+                                            if producer_tile.is_valid_tile:
+                                                scheduler.publish_work(
+                                                    ext.prepare_work_tile(
+                                                        producer_tile
+                                                    )
+                                                )
+                                    else:
+                                        # All Linear1 descriptors are already
+                                        # in execution FIFOs.  Yield while
+                                        # they drain.
+                                        nanosleep(500)
+                                if cutlass.const_expr(
+                                    not self.phase_interleave_fuse_ready_probe_and_producer_claim
+                                ):
+                                    consumer_ready = (
+                                        scheduler.cluster_uniform_counter_ready(
+                                            consumer_counter_pointer,
+                                            ext.fc2_spin_threshold,
+                                            ready_is_mask=True,
+                                        )
+                                    )
+                if not consumer_was_published:
+                    scheduler.publish_work(ext.prepare_work_tile(work_tile))
                 work_tile = scheduler.gen_next_work()
             # Sentinel publish (the tile is already invalid here).
             scheduler.publish_work(work_tile)
@@ -2000,7 +2342,9 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 if is_phase_linear1:
                     iket.range_push("tma_weight_fc1")
                     # MegaMoE: spin until the dispatch (token_in) warps have pulled
+                    iket.range_push("tma_dfc2_wait_token_ready")
                     ext.wait_for_input(work_tile_info)
+                    iket.range_pop()
                     self.token_comm_hook_fc1_tma_b_predispatch_spin(
                         token_comm_args, work_tile_info,
                     )
@@ -2049,16 +2393,16 @@ class Sm107Mxfp8DgluDfc21Kernel:
                     tAgA_slice = tAgA[(None, mma_tile_m, None, 0)]
                     tAgSFA_slice = tAgSFA[(None, mma_tile_m, None, 0)]
 
-                    ab_producer.reset()
-                    peek_ab_empty_status = ab_producer.try_acquire()
+                    a_producer.reset()
+                    peek_ab_empty_status = a_producer.try_acquire()
 
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                        handle = ab_producer.acquire_and_advance(
+                        handle = a_producer.acquire_and_advance(
                             peek_ab_empty_status
                         )
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
-                            peek_ab_empty_status = ab_producer.try_acquire()
+                            peek_ab_empty_status = a_producer.try_acquire()
                         cute.copy(
                             tma_atom_fc1_activation_1,
                             tAgA_slice[(None, handle.count)],
@@ -2085,13 +2429,32 @@ class Sm107Mxfp8DgluDfc21Kernel:
                         + work_tile_info.tile_m_idx // cutlass.Int32(self.epilogue._atom_thr_size)
                     )
                     counter_ptr = fc1_done_counter.iterator + counter_slot
-                    iket.range_push("tma_token_fc2_a_wait")
-                    spin_wait(
-                        counter_ptr,
-                        lambda v: v >= fc2_spin_threshold,
-                        sleep_cycles=20,
-                    )
-                    iket.range_pop()
+                    if cutlass.const_expr(self.dfc2_subtile_publish):
+                        # The scheduler's peek is advisory and happens in a
+                        # different warp.  TMA-A must perform its own acquire
+                        # before issuing an async read of producer-written data.
+                        ready_mask = cute.arch.load(
+                            counter_ptr,
+                            cutlass.Int32,
+                            sem="acquire",
+                            scope="gpu",
+                        )
+                        ready_mask = cutlass.Int32(
+                            cute.arch.shuffle_sync(ready_mask, cutlass.Int32(0))
+                        )
+                        full_ready = (
+                            ready_mask & fc2_spin_threshold
+                        ) == fc2_spin_threshold
+                        cute.arch.fence_proxy("async")
+                        cute.arch.fence_proxy("async.global")
+                    else:
+                        iket.range_push("tma_token_fc2_a_wait")
+                        spin_wait(
+                            counter_ptr,
+                            lambda v: v >= fc2_spin_threshold,
+                            sleep_cycles=20,
+                        )
+                        iket.range_pop()
                     k_tile_cnt = k_tile_cnt_fc2
                     real_a, desc_ptr_a = ext.get_gmem_tensor(
                         "fc2_activation", tma_tensor_fc2_activation, work_tile_info,
@@ -2136,37 +2499,135 @@ class Sm107Mxfp8DgluDfc21Kernel:
                     tAgA_slice = tAgA[(None, mma_tile_m, None, 0)]
                     tAgSFA_slice = tAgSFA[(None, mma_tile_m, None, 0)]
 
-                    ab_producer.reset()
-                    peek_ab_empty_status = ab_producer.try_acquire()
+                    a_producer.reset()
+                    peek_ab_empty_status = a_producer.try_acquire()
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                        handle = ab_producer.acquire_and_advance(
-                            peek_ab_empty_status
-                        )
-                        peek_ab_empty_status = cutlass.Boolean(1)
-                        if handle.count + 1 < k_tile_cnt:
-                            peek_ab_empty_status = ab_producer.try_acquire()
-                        cute.copy(
-                            tma_atom_fc2_activation,
-                            tAgA_slice[(None, handle.count)],
-                            tAsA[(None, handle.index)],
-                            tma_bar_ptr=handle.barrier,
-                            tma_desc_ptr=desc_ptr_a,
-                            mcast_mask=a_full_mcast_mask,
-                        )
-                        cute.copy(
-                            tma_atom_fc2_activation_sf,
-                            tAgSFA_slice[(None, handle.count)],
-                            tAsSFA[(None, handle.index)],
-                            tma_bar_ptr=handle.barrier,
-                            tma_desc_ptr=desc_ptr_sfa,
-                            mcast_mask=sfa_full_mcast_mask,
-                        )
+                    if cutlass.const_expr(self.dfc2_subtile_publish):
+                        if full_ready:
+                            # Baseline fast path: once the whole mask is
+                            # ready, the original K128 loop contains no
+                            # readiness work.
+                            for k_tile in cutlass.range(
+                                0, k_tile_cnt, 1, unroll=1
+                            ):
+                                handle = a_producer.acquire_and_advance(
+                                    peek_ab_empty_status
+                                )
+                                peek_ab_empty_status = cutlass.Boolean(1)
+                                if handle.count + 1 < k_tile_cnt:
+                                    peek_ab_empty_status = a_producer.try_acquire()
+                                cute.copy(
+                                    tma_atom_fc2_activation,
+                                    tAgA_slice[(None, handle.count)],
+                                    tAsA[(None, handle.index)],
+                                    tma_bar_ptr=handle.barrier,
+                                    tma_desc_ptr=desc_ptr_a,
+                                    mcast_mask=a_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atom_fc2_activation_sf,
+                                    tAgSFA_slice[(None, handle.count)],
+                                    tAsSFA[(None, handle.index)],
+                                    tma_bar_ptr=handle.barrier,
+                                    tma_desc_ptr=desc_ptr_sfa,
+                                    mcast_mask=sfa_full_mcast_mask,
+                                )
+                        else:
+                            # Single-tile frontier path: wait once per K512
+                            # producer task, then enqueue four K128 stages.
+                            ready_pair_bits = (
+                                1 << self.epilogue._atom_thr_size
+                            ) - 1
+                            for ready_chunk in cutlass.range(
+                                0, self.dfc2_ready_chunk_count, 1, unroll=1
+                            ):
+                                chunk_mask = cutlass.Int32(
+                                    ready_pair_bits
+                                ) << (
+                                    ready_chunk
+                                    * cutlass.Int32(
+                                        self.epilogue._atom_thr_size
+                                    )
+                                )
+                                iket.range_push(
+                                    "tma_token_fc2_k512_ready_wait"
+                                )
+                                reloaded_frontier = cutlass.Boolean(False)
+                                while (ready_mask & chunk_mask) != chunk_mask:
+                                    nanosleep(20)
+                                    ready_mask = cute.arch.load(
+                                        counter_ptr,
+                                        cutlass.Int32,
+                                        sem="acquire",
+                                        scope="gpu",
+                                    )
+                                    ready_mask = cutlass.Int32(
+                                        cute.arch.shuffle_sync(
+                                            ready_mask, cutlass.Int32(0)
+                                        )
+                                    )
+                                    reloaded_frontier = cutlass.Boolean(True)
+                                iket.range_pop()
+                                if reloaded_frontier:
+                                    cute.arch.fence_proxy("async")
+                                    cute.arch.fence_proxy("async.global")
+
+                                for _ in cutlass.range_constexpr(
+                                    self.dfc2_ready_k_tiles_per_chunk
+                                ):
+                                    handle = a_producer.acquire_and_advance(
+                                        peek_ab_empty_status
+                                    )
+                                    peek_ab_empty_status = cutlass.Boolean(1)
+                                    if handle.count + 1 < k_tile_cnt:
+                                        peek_ab_empty_status = (
+                                            a_producer.try_acquire()
+                                        )
+                                    cute.copy(
+                                        tma_atom_fc2_activation,
+                                        tAgA_slice[(None, handle.count)],
+                                        tAsA[(None, handle.index)],
+                                        tma_bar_ptr=handle.barrier,
+                                        tma_desc_ptr=desc_ptr_a,
+                                        mcast_mask=a_full_mcast_mask,
+                                    )
+                                    cute.copy(
+                                        tma_atom_fc2_activation_sf,
+                                        tAgSFA_slice[(None, handle.count)],
+                                        tAsSFA[(None, handle.index)],
+                                        tma_bar_ptr=handle.barrier,
+                                        tma_desc_ptr=desc_ptr_sfa,
+                                        mcast_mask=sfa_full_mcast_mask,
+                                    )
+                    else:
+                        for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                            handle = a_producer.acquire_and_advance(
+                                peek_ab_empty_status
+                            )
+                            peek_ab_empty_status = cutlass.Boolean(1)
+                            if handle.count + 1 < k_tile_cnt:
+                                peek_ab_empty_status = a_producer.try_acquire()
+                            cute.copy(
+                                tma_atom_fc2_activation,
+                                tAgA_slice[(None, handle.count)],
+                                tAsA[(None, handle.index)],
+                                tma_bar_ptr=handle.barrier,
+                                tma_desc_ptr=desc_ptr_a,
+                                mcast_mask=a_full_mcast_mask,
+                            )
+                            cute.copy(
+                                tma_atom_fc2_activation_sf,
+                                tAgSFA_slice[(None, handle.count)],
+                                tAsSFA[(None, handle.index)],
+                                tma_bar_ptr=handle.barrier,
+                                tma_desc_ptr=desc_ptr_sfa,
+                                mcast_mask=sfa_full_mcast_mask,
+                            )
 
                     iket.range_pop()
                 work_tile_info = sched_consumer.consume_work()
 
-            ab_producer.tail()
+            a_producer.tail()
 
         # ── TMA-B warp (warp 6) ─────────────────────────────────────────────
         if warp_idx == self.tma_b_warp_id:
@@ -2255,16 +2716,16 @@ class Sm107Mxfp8DgluDfc21Kernel:
                     tBgB_slice = tBgB[(None, work_tile_info.tile_n_idx, None, 0)]
                     tBgSFB_slice = tBgSFB[(None, work_tile_info.tile_n_idx, None, 0)]
 
-                    ab_producer.reset()
-                    peek_ab_empty_status = ab_producer.try_acquire()
+                    b_producer.reset()
+                    peek_ab_empty_status = b_producer.try_acquire()
 
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                        handle = ab_producer.acquire_and_advance(
+                        handle = b_producer.acquire_and_advance(
                             peek_ab_empty_status
                         )
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
-                            peek_ab_empty_status = ab_producer.try_acquire()
+                            peek_ab_empty_status = b_producer.try_acquire()
                         cute.copy(
                             tma_atom_weight,
                             tBgB_slice[(None, handle.count)],
@@ -2328,16 +2789,16 @@ class Sm107Mxfp8DgluDfc21Kernel:
                     tBgB_slice = tBgB[(None, fc2_b_hidden_tile, None, 0)]
                     tBgSFB_slice = tBgSFB[(None, fc2_b_hidden_tile, None, 0)]
 
-                    ab_producer.reset()
-                    peek_ab_empty_status = ab_producer.try_acquire()
+                    b_producer.reset()
+                    peek_ab_empty_status = b_producer.try_acquire()
 
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                        handle = ab_producer.acquire_and_advance(
+                        handle = b_producer.acquire_and_advance(
                             peek_ab_empty_status
                         )
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
-                            peek_ab_empty_status = ab_producer.try_acquire()
+                            peek_ab_empty_status = b_producer.try_acquire()
                         cute.copy(
                             tma_atom_fc2_weight,
                             tBgB_slice[(None, handle.count)],
@@ -2357,7 +2818,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
                     iket.range_pop()
                 work_tile_info = sched_consumer.consume_work()
 
-            ab_producer.tail()
+            b_producer.tail()
 
         # ════════════════════════════════════════════════════════════════════
         # MMA warp (warp 4)
@@ -2429,49 +2890,79 @@ class Sm107Mxfp8DgluDfc21Kernel:
                     k_tile_cnt = k_tile_cnt_fc2
                     iket.range_push("mma_dfc1")
 
+
                 acc_stage_index = acc_producer_state.index
 
                 if is_leader_cta:
                     tCtAcc = acc_base[(None, None, None, acc_stage_index)]
 
-                    ab_consumer.reset()
-                    peek_ab_full_status = cutlass.Boolean(1)
+                    a_consumer.reset()
+                    peek_a_full_status = cutlass.Boolean(1)
                     if k_tile_cnt > 0:
-                        peek_ab_full_status = ab_consumer.try_wait()
+                        peek_a_full_status = a_consumer.try_wait()
                         acc_pipeline.producer_acquire(acc_producer_state)
 
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for k_tile in cutlass.range(
+                        0, k_tile_cnt, 1, unroll=1
+                    ):
                         iket.range_push("mma_ab_wait")
-                        handle = ab_consumer.wait_and_advance(peek_ab_full_status)
-                        peek_ab_full_status = cutlass.Boolean(1)
-                        if handle.count + 1 < k_tile_cnt:
-                            peek_ab_full_status = ab_consumer.try_wait()
+                        handle_a = a_consumer.wait_and_advance(
+                            peek_a_full_status
+                        )
+                        peek_a_full_status = cutlass.Boolean(1)
+                        if handle_a.count + 1 < k_tile_cnt:
+                            peek_a_full_status = a_consumer.try_wait()
+                        handle_b = handle_a
                         iket.range_pop()
 
-                        s2t_stage_coord = (None, None, None, None, handle.index)
+                        s2t_a_stage_coord = (
+                            None,
+                            None,
+                            None,
+                            None,
+                            handle_a.index,
+                        )
+                        s2t_b_stage_coord = (
+                            None,
+                            None,
+                            None,
+                            None,
+                            handle_b.index,
+                        )
                         cute.copy(
                             tiled_copy_s2t_sfa,
-                            tCsSFA_compact_s2t[s2t_stage_coord],
+                            tCsSFA_compact_s2t[s2t_a_stage_coord],
                             tCtSFA_compact_s2t,
                         )
                         cute.copy(
                             tiled_copy_s2t_sfb,
-                            tCsSFB_compact_s2t[s2t_stage_coord],
+                            tCsSFB_compact_s2t[s2t_b_stage_coord],
                             tCtSFB_compact_s2t,
                         )
 
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
-                        tile_crd = (None, None, None, handle.index)
+                        tiled_mma.set(
+                            tcgen05.Field.ACCUMULATE, k_tile != 0
+                        )
                         cute.gemm(
                             tiled_mma,
                             tCtAcc,
-                            [tCrA[tile_crd], tCtSFA],
-                            [tCrB[tile_crd], tCtSFB],
+                            [
+                                tCrA[
+                                    (None, None, None, handle_a.index)
+                                ],
+                                tCtSFA,
+                            ],
+                            [
+                                tCrB[
+                                    (None, None, None, handle_b.index)
+                                ],
+                                tCtSFB,
+                            ],
                             tCtAcc,
                         )
-                        handle.release()
+                        handle_a.release()
 
                     if k_tile_cnt > 0:
                         acc_pipeline.producer_commit(acc_producer_state)
@@ -2547,6 +3038,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
                             tma_bar_ptr=c_bar,
                         )
                         c_producer_state.advance()
+
 
                 work_tile_info = sched_consumer.consume_work()
 
@@ -2630,12 +3122,12 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 cute.arch.fence_acq_rel_sys()
 
         # ════════════════════════════════════════════════════════════════════
-        # Dispatch / token_back warps hook (warps 8-11 [+ 12-15]; MegaMoE-only)
+        # Dispatch / token_back warp hooks (MegaMoE-only)
         # ════════════════════════════════════════════════════════════════════
         #
         # ``enable_token_comm=False`` → these warps don't exist (lean base has 9
         # warps), so the guard is const_expr-eliminated in the lean path.
-        # NOTE: c_load now lives ABOVE the transfer block (warp 12 or 16), so the
+        # NOTE: c_load lives immediately ABOVE the configured transfer block, so the
         # gate must be UPPER-bounded at the last transfer warp — otherwise the
         # c_load warp (already run above) would re-enter the dispatch body.
         if cutlass.const_expr(self.enable_token_comm):

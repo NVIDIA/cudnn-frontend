@@ -626,6 +626,7 @@ class Mxfp8ColRequant:
         dst_sf_u8: cute.Tensor,
         cuda_stream: cuda.CUstream,
         token_padding_block: cutlass.Constexpr = None,
+        previous_expert_token_sizes: cute.Tensor = None,
     ) -> None:
         TOKPAD = cutlass.const_expr(
             self.token_padding_block if token_padding_block is None else token_padding_block
@@ -642,6 +643,12 @@ class Mxfp8ColRequant:
             raise TypeError(f"src_data must use {self.quant_dtype}, got {src_data.element_type}.")
         if cutlass.const_expr(dst_data.element_type is not self.quant_dtype):
             raise TypeError(f"dst_data must use {self.quant_dtype}, got {dst_data.element_type}.")
+
+        if cutlass.const_expr(previous_expert_token_sizes is not None):
+            if cutlass.const_expr(not self.dst_k_major):
+                raise ValueError("Retired-row clearing currently requires K-major output")
+            if cutlass.const_expr(previous_expert_token_sizes.shape[0] != self.num_experts):
+                raise ValueError("Previous expert counts must match the current expert count")
 
         HID_U32 = cutlass.const_expr(self.hidden // 4)
         BOX_H = cutlass.const_expr(self.TmaBoxHidU32)
@@ -686,6 +693,7 @@ class Mxfp8ColRequant:
         k = self.ws_kernel(
             src_data, src_sf_u8, expert_token_sizes, dst_data, dst_sf_u8,
             tma_atom, tma_tensor, tma_atom_st, tma_tensor_st, TOKPAD,
+            previous_expert_token_sizes,
         )
         # Validated in __init__, not here: __call__ is DSL-preprocessed and a
         # plain if/raise in a traced body is rejected at trace time.
@@ -772,6 +780,46 @@ class Mxfp8ColRequant:
                     lo = probe
         return lo
 
+    @cute.jit
+    def _clear_retired_data_rows(
+        self, dst_data, current_rows, previous_rows, tidx, bidx, grid_dim_x,
+    ):
+        """Clear only the retired rectangle in the K-major DATA carrier.
+
+        Current and previous counts are immutable for this export launch. The
+        preceding main launch snapshots both, so no export CTA publishes state
+        that another export CTA still needs to read. Current requantization
+        writes [0, current_rows); these stores own [current_rows, previous_rows).
+        The carrier starts zeroed, and unchanged/growing extents do no work.
+        """
+        if previous_rows > current_rows:
+            row_vectors = (previous_rows - current_rows) // Int32(16)
+            total_vectors = Int64(row_vectors) * Int64(self.hidden)
+            vector_index = Int64(bidx) * Int64(self.ThreadsPerCta) + Int64(tidx)
+            vector_stride = Int64(grid_dim_x) * Int64(self.ThreadsPerCta)
+            zero = cute.make_rmem_tensor((4,), Int32)
+            for element in cutlass.range_constexpr(4):
+                zero[element] = Int32(0)
+            store_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), Int32, num_bits_per_copy=128
+            )
+            while vector_index < total_vectors:
+                column = vector_index // Int64(row_vectors)
+                row_vector = vector_index - column * Int64(row_vectors)
+                byte_offset = (
+                    column * Int64(dst_data.shape[0]) + Int64(current_rows)
+                    + row_vector * Int64(16)
+                )
+                destination = cute.make_tensor(
+                    cute.make_ptr(
+                        Int32, dst_data.iterator.toint() + byte_offset,
+                        AddressSpace.gmem, assumed_align=16,
+                    ),
+                    cute.make_layout((4,)),
+                )
+                cute.copy(store_atom, zero, destination)
+                vector_index = vector_index + vector_stride
+
     # ---------------------------------------------------------------- kernel
     @cute.kernel
     def ws_kernel(
@@ -786,6 +834,7 @@ class Mxfp8ColRequant:
         tma_atom_st=None,
         tma_tensor_st=None,
         token_padding_block: cutlass.Constexpr = None,
+        previous_expert_token_sizes: cute.Tensor = None,
     ) -> None:
         # Compile-time constant, folded before a single instruction is emitted.
         TOKPAD = cutlass.const_expr(
@@ -811,6 +860,11 @@ class Mxfp8ColRequant:
         tbl_vend = smem.allocate_tensor(cutlass.Int32, cute.make_layout((table_len,)), 16)
         tbl_data = smem.allocate_tensor(cutlass.Int32, cute.make_layout((table_len,)), 16)
         tbl_sf = smem.allocate_tensor(cutlass.Int32, cute.make_layout((table_len,)), 16)
+        previous_data_rows = None
+        if cutlass.const_expr(previous_expert_token_sizes is not None):
+            previous_data_rows = smem.allocate_tensor(
+                cutlass.Int32, cute.make_layout((1,)), 16
+            )
         smem_sf_in = smem.allocate_array(self.sf_dtype, S * SFB, byte_alignment=128)
         smem_sf_out = smem.allocate_array(
             self.sf_dtype, cutlass.const_expr(self.smem_sf_out_bytes), byte_alignment=128
@@ -834,7 +888,21 @@ class Mxfp8ColRequant:
             self.build_prefix_tables(
                 expert_token_sizes, tbl_vend, tbl_data, tbl_sf, lane_idx, TOKPAD
             )
+            if cutlass.const_expr(previous_expert_token_sizes is not None):
+                if lane_idx == Int32(0):
+                    old_rows = Int32(0)
+                    for expert in cutlass.range_constexpr(self.num_experts):
+                        old_rows = old_rows + self._pad_up(
+                            Int32(previous_expert_token_sizes[expert]), TOKPAD
+                        )
+                    previous_data_rows[0] = old_rows
         cute.arch.sync_threads()
+
+        if cutlass.const_expr(previous_expert_token_sizes is not None):
+            self._clear_retired_data_rows(
+                dst_data, Int32(tbl_data[self.num_experts]),
+                Int32(previous_data_rows[0]), tidx, bidx, grid_dim_x,
+            )
 
         total_tiles = Int32(tbl_data[self.num_experts]) // Int32(TOK)
 

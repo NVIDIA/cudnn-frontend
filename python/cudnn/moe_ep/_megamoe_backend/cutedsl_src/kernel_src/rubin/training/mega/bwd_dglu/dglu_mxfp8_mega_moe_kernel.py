@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Full MegaMoE (multi-rank) mxfp8 dGLU training-backward kernel."""
 
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Literal, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
@@ -13,6 +13,7 @@ from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int32, Int64
 
 from ......api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
+from ......dgrad_config import DGRAD_UNSPECIFIED, resolve_dgrad_config
 from ......helpers.device_workspace import DeviceWorkspace
 from ......helpers.smem_workspace import SmemWorkspace
 from ......helpers.utils import ceil_div, round_up
@@ -50,6 +51,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
     token_src_metadata_local_region = "rubin.dglu_mxfp8.mega.token_src_metadata_local"
     fc1_preact_region = "rubin.dglu_mxfp8.mega.fc1_preact"
     grad_y2_sizes_region = "rubin.dglu_mxfp8.mega.grad_y2_expert_token_sizes"
+    grad_y2_previous_sizes_region = "rubin.dglu_mxfp8.mega.grad_y2_previous_expert_token_sizes"
     weight_descriptor_region = "rubin.dglu_mxfp8.mega.weight_descriptors"
 
     # Reserved on top of the exact token_comm/sched SMEM to cover smem.allocate
@@ -93,12 +95,29 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             "token_back_mode": str,
             "epi_flag_batch": tuple,
             "flag_batch": int,
+            "token_in_async_flags": OptionalRequirement(bool),
+            "token_in_transfer_warp_count": OptionalRequirement(int),
             "act_func": str,
             "dfc2_recompute": bool,
             "dfc2_col_output": bool,
+            # Optional scheduler fields keep old hand-built ImplDesc objects
+            # source-compatible while exposing the validated dgrad schedule.
+            "schedule_mode": OptionalRequirement(str),
+            "dfc2_subtile_publish": OptionalRequirement(bool),
+            "dfc2_c_pipe_stages": OptionalRequirement(int),
+            "dfc2_d_pipe_stages": OptionalRequirement(int),
+            "dfc2_acc_early_release": OptionalRequirement(bool),
+            "phase_interleave_prologue_tiles": OptionalRequirement(Optional[int]),
+            "phase_interleave_defer_consumers_until_full": OptionalRequirement(bool),
+            "phase_interleave_fuse_ready_probe_and_producer_claim": OptionalRequirement(bool),
+            # Optional keeps old hand-built ImplDesc objects source-compatible.
+            "use_scaled_cvt": OptionalRequirement(bool),
             "enable_grad_y2_col_quant": bool,
             "num_ctas_grad_y2_col_quant": int,
             "weight_storage_mode": OptionalRequirement(str),
+            "enable_dgrad_optimizations": OptionalRequirement(bool),
+            "input_dedup_mode": OptionalRequirement(str),
+            "dfc1_m_group": OptionalRequirement(int),
         }
 
     def name(self) -> str:
@@ -109,11 +128,28 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             f"clamp{self.gate_up_clamp}_"
             f"tokenback{self.token_back_mode}_hint{self.group_hint}_"
             f"epi{self.epi_flag_batch[0]}x{self.epi_flag_batch[1]}_tif{self.flag_batch}_"
+            f"tiw{self.token_in_transfer_warp_count}_"
+            f"{'' if self.token_in_async_flags else 'syncflag_'}"
             f"deterministic_mtpr{self.max_tokens_per_rank}_mrpr{self.max_recv_size_per_rank}_"
             f"drop{int(self.drop_on_overflow)}_lc{self.launch_cluster_count}_"
             f"recompute{int(self.dfc2_recompute)}x{int(self.dfc2_col_output)}_"
+            f"sched{self.schedule_mode}_lb{self.load_balance_mode}_"
+            f"sub{int(self.dfc2_subtile_publish)}_"
+            f"cpipe{self.dfc2_c_pipe_stages}_dpipe{self.dfc2_d_pipe_stages}_"
+            f"early{int(self.dfc2_acc_early_release)}_"
+            f"pro{self.phase_interleave_prologue_tiles}_"
+            f"defer{int(self.phase_interleave_defer_consumers_until_full)}_"
+            f"fuse{int(self.phase_interleave_fuse_ready_probe_and_producer_claim)}_"
+            f"extadm{int(self.phase_interleave_defer_linear1_until_input_ready)}_"
+            f"tmapf{int(self.prefetch_tma_descriptors)}_"
+            f"l2pf{self.dfc1_weight_l2_prefetch_depth}_"
+            f"scaledcvt{int(self.use_scaled_cvt)}_"
             f"redtopk{int(self.reduce_topk_in_kernel)}_preactarg1_"
             f"weight{self.weight_storage_mode}"
+            + ("_cleary2tail1" if self.clear_grad_y2_stale_tail else "")
+            + (f"_y2ctas{self.num_ctas_grad_y2_col_quant}" if self.num_ctas_grad_y2_col_quant != 2368 else "")
+            + (f"_dfc1mg{self.dfc1_m_group}" if self.dfc1_m_group != 1 else "")
+            + ("_inputdedup_rank_batched_expert" if self.token_comm.input_dedup_mode != "off" else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -245,11 +281,11 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         group_hint: int,
         token_padding_block: int,
         sf_padding_block: int,
-        load_balance_mode: str = "static",
+        load_balance_mode: str = DGRAD_UNSPECIFIED,
         static_expert_shape: Optional[Tuple[int, int, int]] = None,
         force_static_sched: bool = True,
         clc_bundle_size: Optional[int] = None,
-        num_sched_stages: Optional[int] = None,
+        num_sched_stages: Optional[int] = DGRAD_UNSPECIFIED,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         ab_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
         sf_vec_size: int = 32,
@@ -264,16 +300,34 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         drop_on_overflow: bool,
         fc2_in_kernel_topk_reduce: bool = False,
         token_back_mode: Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"] = "epi_warps",
-        epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
+        epi_flag_batch: Optional[Tuple[int, int]] = DGRAD_UNSPECIFIED,
         flag_batch: int = 1,
+        token_in_transfer_warp_count: int = 4,
         combine_format: Optional[CombineFormat] = None,
         act_func: str = "swiglu",
         gate_up_clamp: Optional[float] = None,
         dfc2_recompute: bool = False,
         dfc2_col_output: bool = False,
         enable_grad_y2_col_quant: bool = False,
-        num_ctas_grad_y2_col_quant: int = 2368,
+        num_ctas_grad_y2_col_quant: int = DGRAD_UNSPECIFIED,
+        use_scaled_cvt: bool = DGRAD_UNSPECIFIED,
+        schedule_mode: Literal["grouped", "phase_interleave"] = DGRAD_UNSPECIFIED,
+        dfc2_subtile_publish: bool = DGRAD_UNSPECIFIED,
+        dfc2_c_pipe_stages: int = DGRAD_UNSPECIFIED,
+        dfc2_d_pipe_stages: int = 1,
+        dfc2_acc_early_release: bool = DGRAD_UNSPECIFIED,
+        phase_interleave_prologue_tiles: Optional[int] = DGRAD_UNSPECIFIED,
+        phase_interleave_defer_consumers_until_full: bool = DGRAD_UNSPECIFIED,
+        phase_interleave_fuse_ready_probe_and_producer_claim: bool = DGRAD_UNSPECIFIED,
+        phase_interleave_defer_linear1_until_input_ready: bool = False,
+        prefetch_tma_descriptors: bool = False,
+        dfc1_weight_l2_prefetch_depth: int = 0,
         weight_storage_mode: WeightStorageMode = "contiguous",
+        enable_dgrad_optimizations: bool = False,
+        input_dedup_mode: str = DGRAD_UNSPECIFIED,
+        dfc1_m_group: int = DGRAD_UNSPECIFIED,
+        dgrad_schedule: Optional[str] = None,
+        token_in_async_flags: bool = DGRAD_UNSPECIFIED,
     ) -> "Sm107MegaMoEMxfp8DgluKernel":
         """Build the ``(ProblemDesc, ImplDesc)`` pair from the legacy flat signature."""
         if static_expert_shape is None:
@@ -317,19 +371,46 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 "drop_on_overflow": drop_on_overflow,
                 "fc2_in_kernel_topk_reduce": fc2_in_kernel_topk_reduce,
                 "token_back_mode": token_back_mode,
-                "epi_flag_batch": tuple(epi_flag_batch) if epi_flag_batch is not None else (1, 1),
+                "epi_flag_batch": epi_flag_batch,
                 "flag_batch": flag_batch,
+                "token_in_async_flags": token_in_async_flags,
+                "token_in_transfer_warp_count": token_in_transfer_warp_count,
                 "act_func": act_func,
                 "dfc2_recompute": dfc2_recompute,
                 "dfc2_col_output": dfc2_col_output,
+                "schedule_mode": schedule_mode,
+                "dfc2_subtile_publish": dfc2_subtile_publish,
+                "dfc2_c_pipe_stages": dfc2_c_pipe_stages,
+                "dfc2_d_pipe_stages": dfc2_d_pipe_stages,
+                "dfc2_acc_early_release": dfc2_acc_early_release,
+                "phase_interleave_prologue_tiles": phase_interleave_prologue_tiles,
+                "phase_interleave_defer_consumers_until_full": phase_interleave_defer_consumers_until_full,
+                "phase_interleave_fuse_ready_probe_and_producer_claim": (
+                    phase_interleave_fuse_ready_probe_and_producer_claim
+                ),
+                "phase_interleave_defer_linear1_until_input_ready": (
+                    phase_interleave_defer_linear1_until_input_ready
+                ),
+                "prefetch_tma_descriptors": prefetch_tma_descriptors,
+                "dfc1_weight_l2_prefetch_depth": dfc1_weight_l2_prefetch_depth,
+                "use_scaled_cvt": use_scaled_cvt,
                 "enable_grad_y2_col_quant": enable_grad_y2_col_quant,
                 "num_ctas_grad_y2_col_quant": num_ctas_grad_y2_col_quant,
                 "weight_storage_mode": weight_storage_mode,
+                "enable_dgrad_optimizations": enable_dgrad_optimizations,
+                "input_dedup_mode": input_dedup_mode,
+                "dfc1_m_group": dfc1_m_group,
+                "dgrad_schedule": dgrad_schedule,
             }
         )
         return cls(problem_desc, impl_desc)
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
+        resolved = resolve_dgrad_config(problem_desc, impl_desc)
+        self.resolved_dgrad_config = MappingProxyType(resolved)
+        self.enable_dgrad_optimizations = resolved["enable_dgrad_optimizations"]
+        self.input_dedup_mode = resolved["input_dedup_mode"]
+        impl_desc = ImplDesc(resolved)
         self._validate_desc_inputs(problem_desc, impl_desc)
 
         # -- Extract descriptors into locals matching the legacy param names. --
@@ -367,10 +448,22 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         token_back_mode = impl_desc["token_back_mode"]
         epi_flag_batch = impl_desc["epi_flag_batch"]
         flag_batch = impl_desc["flag_batch"]
+        token_in_transfer_warp_count = impl_desc["token_in_transfer_warp_count"]
         act_func = impl_desc["act_func"]
         dfc2_recompute = impl_desc["dfc2_recompute"]
         dfc2_col_output = impl_desc["dfc2_col_output"]
+        schedule_mode = impl_desc["schedule_mode"]
+        dfc2_subtile_publish = impl_desc["dfc2_subtile_publish"]
+        dfc2_c_pipe_stages = impl_desc["dfc2_c_pipe_stages"]
+        dfc2_d_pipe_stages = impl_desc["dfc2_d_pipe_stages"]
+        dfc2_acc_early_release = impl_desc["dfc2_acc_early_release"]
+        phase_interleave_prologue_tiles = impl_desc["phase_interleave_prologue_tiles"]
+        phase_interleave_defer_consumers_until_full = impl_desc["phase_interleave_defer_consumers_until_full"]
+        phase_interleave_fuse_ready_probe_and_producer_claim = impl_desc["phase_interleave_fuse_ready_probe_and_producer_claim"]
+        use_scaled_cvt = impl_desc["use_scaled_cvt"]
         self.enable_grad_y2_col_quant = impl_desc["enable_grad_y2_col_quant"]
+        # Retired rows must be cleared when a captured graph receives fewer tokens.
+        self.clear_grad_y2_stale_tail = self.enable_grad_y2_col_quant
         self.num_ctas_grad_y2_col_quant = impl_desc["num_ctas_grad_y2_col_quant"]
         weight_storage_mode = impl_desc.get("weight_storage_mode") or "contiguous"
 
@@ -386,6 +479,13 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             raise ValueError("fc2_in_kernel_topk_reduce requires a non-quantized (bf16) combine.")
         if token_back_mode not in ("epi_warps", "standalone_warps", "reuse_dispatch_warps"):
             raise ValueError(f"unsupported token_back_mode={token_back_mode!r}.")
+        if type(token_in_transfer_warp_count) is not int or token_in_transfer_warp_count != 4:
+            raise ValueError("token_in_transfer_warp_count must be 4; five-warp experiments are archived.")
+        if schedule_mode == "phase_interleave" and token_back_mode != "epi_warps":
+            raise ValueError(
+                "MegaMoE phase_interleave is validated only with "
+                "token_back_mode='epi_warps'."
+            )
         if ab_dtype not in _AB_DTYPE_TO_QUANT_KIND:
             raise ValueError(f"ab_dtype {ab_dtype} has no mxfp8 QuantKind.")
 
@@ -407,6 +507,19 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             epi_flag_batch=epi_flag_batch,
             dfc2_recompute=dfc2_recompute,
             dfc2_col_output=dfc2_col_output,
+            schedule_mode=schedule_mode,
+            dfc2_subtile_publish=dfc2_subtile_publish,
+            dfc2_c_pipe_stages=dfc2_c_pipe_stages,
+            dfc2_d_pipe_stages=dfc2_d_pipe_stages,
+            dfc2_acc_early_release=dfc2_acc_early_release,
+            phase_interleave_prologue_tiles=phase_interleave_prologue_tiles,
+            phase_interleave_defer_consumers_until_full=(
+                phase_interleave_defer_consumers_until_full
+            ),
+            phase_interleave_fuse_ready_probe_and_producer_claim=(
+                phase_interleave_fuse_ready_probe_and_producer_claim
+            ),
+            use_scaled_cvt=use_scaled_cvt,
             fc2_in_kernel_topk_reduce=fc2_in_kernel_topk_reduce,
             act_func=act_func,
             gate_up_clamp=gate_up_clamp,
@@ -414,16 +527,18 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         )
 
         # --- Warp topology (realigned for next's TokenCommDeterministic). ---
-        # next derives each transfer warp's transfer index as ``thread_idx % 128``
-        # (token_comm.py:1421-1424 / 1911), which HARD-REQUIRES the dispatch warps --
-        # and, standalone, the token_back warps -- to begin on a 4-warp / 128-thread
-        # boundary.  So dispatch sits at warps 8-11 (thread 256 -> 256%128=0) and
-        # standalone token_back at 12-15 (thread 384 -> 384%128=0), mirroring the
-        # forward GLU.  The dGLU c_load warp does NOT use the transfer index, so it
-        # moves ABOVE the transfer block (warp 16 iff standalone else 12), overriding
-        # the base kernel's default (warp 8, now occupied by dispatch).
+        # Dispatch owns a contiguous block beginning at warp 8.  TokenComm derives
+        # the local transfer index with ``thread_idx % transfer_thread_count``;
+        # even when five warps start at thread 256 this is a permutation of [0, 5),
+        # so all per-warp stages and barrier participants remain one-to-one.  The
+        # dGLU c_load warp does not use that index and lives immediately above the
+        # transfer block (warp 12 for the default four-warps, 13 for five-warps).
         self.enable_token_comm = True
-        self.dispatch_warp_id = (8, 9, 10, 11)
+        self.token_comm_supports_dfc2_subtile_publish = True
+        self.token_in_transfer_warp_count = token_in_transfer_warp_count
+        self.dispatch_warp_id = tuple(
+            range(8, 8 + self.token_in_transfer_warp_count)
+        )
         self.token_back_mode = token_back_mode
         # Thread token_back_by_dispatch to the FC12 base (it hardcodes False) so the
         # epilogue, built later in _setup_attributes(), fires the fc2_done counter for
@@ -433,13 +548,28 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         # unaffected (it peer-writes grad_x directly and never reads fc2_done).
         self.token_back_by_dispatch = token_back_by_dispatch
         self.token_back_standalone = token_back_by_dispatch and token_back_mode == "standalone_warps"
-        self.token_back_warp_id = (12, 13, 14, 15) if self.token_back_standalone else None
+        self.token_back_warp_id = (
+            tuple(
+                range(
+                    self.dispatch_warp_id[-1] + 1,
+                    self.dispatch_warp_id[-1]
+                    + 1
+                    + self.token_in_transfer_warp_count,
+                )
+            )
+            if self.token_back_standalone
+            else None
+        )
         num_token_back_warps = len(self.token_back_warp_id) if self.token_back_standalone else 0
-        self.c_load_warp_id = 16 if self.token_back_standalone else 12
+        self.c_load_warp_id = (
+            self.token_back_warp_id[-1] + 1
+            if self.token_back_standalone
+            else self.dispatch_warp_id[-1] + 1
+        )
 
         # Register re-balance for the mega warp layout.  The base kernel sizes
-        # ``epi_reg_cnt`` (256) for the lean 9-warp dGLU; mega adds the 4 dispatch
-        # warps (+4 token-back if standalone) and the dedicated c_load warp, so the
+        # ``epi_reg_cnt`` (256) for the lean 9-warp dGLU; mega adds the configured
+        # dispatch warps (+4 token-back if standalone) and the dedicated c_load warp, so the
         # per-CTA register file can no longer grant 256 regs to all 4 epilogue warps
         # -- the epilogue warpgroup then stalls forever inside
         # ``warpgroup_reg_alloc`` and the mma/tmem barrier deadlocks.  Mirror the
@@ -451,9 +581,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             + 1  # tma_a    (warp 5)
             + 1  # tma_b    (warp 6)
             + 1  # sched    (warp 7)
-            + len(self.dispatch_warp_id)  # 4  (warps 8-11)
-            + num_token_back_warps  # 4 iff standalone_warps (warps 12-15)
-            + 1  # c_load (warp 12 or 16, dGLU-specific)
+            + len(self.dispatch_warp_id)  # 4 or 5 (begins at warp 8)
+            + num_token_back_warps  # 4 iff standalone_warps in the supported topology
+            + 1  # c_load immediately above the communication warps
         )
 
         # --- MegaMoE constants. ---
@@ -505,14 +635,22 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 "tokens_per_fc1_ready_slot": tokens_per_fc1_ready_slot,
                 "fc2_done_signals_per_token_tile": fc2_done_signals_per_token_tile,
                 "promised_launchable_sm_count": promised_launchable_sm_count,
+                "token_in_transfer_warp_count": self.token_in_transfer_warp_count,
                 "drop_on_overflow": drop_on_overflow,
                 "token_in_flag_batch": flag_batch,
+                "token_in_async_flags": impl_desc["token_in_async_flags"],
+                "input_dedup_mode": self.input_dedup_mode,
                 "token_back_mode": token_back_mode,
                 "token_back_schedule_mode": self.token_back_schedule_mode,
                 "reduce_topk_in_kernel": fc2_in_kernel_topk_reduce,
             }
         )
         self.token_comm = TokenCommDeterministic(tc_problem_desc, tc_impl_desc)
+        self.dfc1_m_group = impl_desc["dfc1_m_group"]
+        if self.dfc1_m_group not in (1, 16):
+            raise ValueError("dfc1_m_group must be 1 or 16")
+        if self.dfc1_m_group != 1 and self.schedule_mode != "phase_interleave":
+            raise ValueError("M16 traversal requires the opt-in phase-interleave schedule")
         self.pool_token_capacity = self.token_comm.worst_case_token_count
 
         # --- SMEM sub-buffer for the token_comm transport. ---
@@ -529,6 +667,13 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             expert_cnt=_ec, intermediate_gateup=_ig, hidden_dim=_hd, launch_cluster_count=launch_cluster_count
         )
         self._sched_smem_bytes = self.sched_smem_ws.total_bytes
+        sched_local_bytes, sched_shared_bytes = self.sched_device_ws.local_and_shared_bytes
+        if sched_local_bytes > 16 or sched_shared_bytes != 0:
+            raise ValueError(
+                "MegaMoE reserves 16 local bytes and no shared bytes for the "
+                "dgrad scheduler workspace; got "
+                f"local={sched_local_bytes}, shared={sched_shared_bytes}."
+            )
 
         # --- Post-kernel top-k reduction (skipped under in-kernel reduce). ---
         self._topk_reduce = None if fc2_in_kernel_topk_reduce else TopkReduce(hidden, num_topk, combine_format)
@@ -556,9 +701,11 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self.epi_flag_batch = tuple(epi_flag_batch)
         self.flag_batch = flag_batch
+        self.token_in_async_flags = impl_desc["token_in_async_flags"]
         self.act_func = act_func
         self.dfc2_recompute = dfc2_recompute
         self.dfc2_col_output = dfc2_col_output
+        self.use_scaled_cvt = use_scaled_cvt
         self.use_2cta_instrs = use_2cta_instrs
 
         # Optional post-kernel token-axis MXFP8 requantization of the routed
@@ -696,7 +843,14 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 (self.num_experts_per_rank,),
                 buffer_space="local",
                 byte_alignment=16,
+                reset="zero_on_first_allocate" if self.clear_grad_y2_stale_tail else "data",
             )
+            if self.clear_grad_y2_stale_tail:
+                dw.register(
+                    self.grad_y2_previous_sizes_region, cutlass.Int32,
+                    (self.num_experts_per_rank,), buffer_space="local",
+                    byte_alignment=16, reset="zero_on_first_allocate",
+                )
         if self.weight_storage_mode == "discrete":
             dw.register(
                 self.weight_descriptor_region,
@@ -773,7 +927,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
 
     @cute.jit
     def token_comm_hook_dispatch_warp_body(self, token_comm_args, token_comm_storage, *, warp_idx, lane_idx, tidx):
-        """Transfer warps (8-11): pull grad_out from peers into the local FC1 pool."""
+        """Configured transfer warps pull grad_out from peers into the local FC1 pool."""
         self.token_comm.token_in(self.tc_smem_ws, token_comm_storage.buffer.data_ptr())
         if cutlass.const_expr(self.token_comm.token_back_enabled and not self.token_back_standalone):
             self.token_comm.token_back(self.tc_smem_ws, token_comm_storage.buffer.data_ptr())
@@ -800,9 +954,13 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         if self.token_comm._linear_cta_idx == Int32(0):
             sizes = self.token_comm.local_expert_sizes(dw, self.token_comm._local_rank)
             snapshot = dw.tensor(self.grad_y2_sizes_region)
+            if cutlass.const_expr(self.clear_grad_y2_stale_tail):
+                previous = dw.tensor(self.grad_y2_previous_sizes_region)
             block_dim_x, _, _ = cute.arch.block_dim()
             expert_idx = tidx
             while expert_idx < Int32(self.num_experts_per_rank):
+                if cutlass.const_expr(self.clear_grad_y2_stale_tail):
+                    previous[expert_idx] = Int32(snapshot[expert_idx])
                 snapshot[expert_idx] = Int32(sizes[expert_idx])
                 expert_idx = expert_idx + block_dim_x
 
@@ -1012,6 +1170,12 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 cute.make_ptr(cutlass.Int32, lw.toint() + Int64(sizes_offset), AddressSpace.gmem, assumed_align=16),
                 cute.make_layout((self.num_experts_per_rank,)),
             )
+            previous_expert_sizes = None
+            if cutlass.const_expr(self.clear_grad_y2_stale_tail):
+                previous_expert_sizes = cute.make_tensor(
+                    cute.make_ptr(cutlass.Int32, lw.toint() + Int64(dw.offset(self.grad_y2_previous_sizes_region)), AddressSpace.gmem, assumed_align=16),
+                    cute.make_layout((self.num_experts_per_rank,)),
+                )
             self.grad_y2_col_quant(
                 src_data,
                 src_sf_u8,
@@ -1019,4 +1183,5 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 grad_y2,
                 grad_y2_sf,
                 stream,
+                previous_expert_token_sizes=previous_expert_sizes,
             )
