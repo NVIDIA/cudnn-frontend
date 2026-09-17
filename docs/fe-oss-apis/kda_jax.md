@@ -149,23 +149,24 @@ may require materialization.
 
 `linear_attention/jax_api.py` owns metadata, argument binding and autodiff.
 `linear_attention/frost/kda_engine.py` owns scheduling and workspace layout.
-`linear_attention/frost/kda_program.py` contains the shared forward/backward
-launch sequence. The native engine compiles this program through CuTeDSL/TVM FFI;
-JAX exports the same program through CuTeDSL/XLA FFI. There is no separate JAX
-scheduler or engine execution path.
+`linear_attention/frost/kda_jax.py` binds XLA buffers and the engine's workspace
+regions to the existing `kda_{chain,warmup}_{forward,backward}_f16.py` host
+functions. Those functions own the multi-kernel sequence for both frameworks.
+The adapter adds the existing gate-gradient and grouped-head reductions after
+backward; it does not implement KDA kernels or choose a different schedule.
 
-Both consumers use Frost's automatic piece-chain selection, including fused
-summaries, forward/reverse state propagation and checkpoint recomputation.
-The shared program also preserves torch's coarse checkpoints and linear gate
-domain; those options remain outside the bounded JAX API. Context-parallel
-summary APIs remain separate.
+The native executor retains its compiled-artifact caches, dynamic tensor
+annotations, output strides and execution path. JAX tracing specializes buffer
+bindings to static shapes; it does not replace or populate the native caches.
+Frost's automatic piece-chain selection applies to both paths. Coarse
+checkpoints, linear gate inputs and state-pool indexing remain outside the
+bounded JAX API; their native support is unchanged.
 
 Graph tensors come directly from JAX shape/dtype metadata; the existing
 `graph.kda` / `graph.kda_bwd` methods infer output shapes and validate the graph.
-Frost workspace layouts are reused. The shared program composes existing CuTe
-host functions into one native XLA FFI call per JAX forward/backward. That call receives XLA's stream and launches the complete
-sequence, including runtime TMA descriptors and PDL dependencies. No Python
-callback, torch tensor, DLPack handoff, or KDA math implementation is introduced.
+The CuTeDSL bridge exports one XLA FFI call per JAX forward/backward. It receives
+XLA's stream and runs the existing hosts, including runtime TMA descriptors and
+PDL dependencies. No Python callback or torch tensor is used at runtime.
 
 XLA allocates outputs and per-invocation byte workspace. Backward carves the
 same scheduler, descriptor, recompute, gate-reduction and head-reduction regions
@@ -192,6 +193,12 @@ Run coverage with:
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
   python -m pytest test/python/fe_api/jax/test_call_jax.py test/python/fe_api/jax/test_kda_jax.py \
   --confcutdir=test/python/fe_api/jax
+```
+
+Native executor regressions (from `test/python`):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m pytest -s -q linear_attention/test_kda_execution.py
 ```
 
 ## Container tests
@@ -221,165 +228,15 @@ They skip before kernel imports when JAX or a supported CuTeDSL is unavailable.
 The standalone command uses `--confcutdir` to exclude the torch-based parent
 fixtures; an import-only check does not run KDA forward/backward kernels.
 
-After rebasing onto `fd409b43d`, all 26 KDA JAX tests passed locally in 236.99
-seconds and in the source-built, torch-free container above in 272.08 seconds,
-with zero skips. The targeted native suite passed 27 cases in 317.31 seconds, covering
-paged states with dense/padded pool strides, in-place forward/backward state
-updates, coarse checkpoints, strided inputs, separate streams, gate options and
-CUDA-graph replay. One GDN2-only beta-guard case was skipped for KDA.
+The SM100 suite covers eager and jitted forward/backward parity, state and gate
+gradients, repeated calls, changing packed boundaries, recurrent scans,
+command-buffer replay, concurrent dispatch and torch-free import/execution.
+Native regressions additionally check compiled-host reuse across token/head
+counts and strided gradient destinations, including untouched output padding.
 
-Validated the shared program on SM100 on 2026-09-15: the frontend source build
-in `nvcr.io/nvidia/jax:26.07-py3` succeeded and **57 tests passed, zero skipped**
-in 347.66 seconds, with CuTeDSL 4.7.1 and no PyTorch installation. This includes
-the subprocess that rejects torch imports while compiling and executing a
-jitted KDA gradient. The host JAX run also passed all 57 tests in 311.06 seconds.
-After rebasing onto `473d35b87`, the suite covers 26 KDA, 25 BSA and six shared
-bridge cases. The upstream `cudnn.jax.call` implementation is unchanged. All 57
-cases are collected with the L0 filter; KDA uses the GPU-exclusive markers.
+## Performance qualification
 
-Torch validation passed 62 existing regression cases covering piece chains,
-coarse checkpoints, linear/safe gates, BF16 state gradients, grouped heads,
-batch invariance, CUDA-graph replay, non-contiguous inputs, independent streams
-and repeated execution with different buffers. One GDN2-only beta-guard case
-was skipped for KDA. The new JAX scheduling regression failed against the old
-piece-chain override before passing with automatic engine selection.
-
-## Measurements and remaining blocker
-
-These measurements predate the rebase onto `fd409b43d`, which changed upstream
-kernel interfaces and launch code. Performance has not been remeasured after that rebase.
-
-Shared-program measurements (2026-09-15), SM100, BF16 THD T=1024, H=4,
-K=V=128, one sequence, no recurrent state or optional gate parameters,
-checkpoint cadence 0. Both frameworks use automatic piece chains; backward
-includes checkpoint recomputation. JAX command buffers enabled. Medians of 200
-warm calls after 20 warmups; GPU time uses a graph of 32 full calls:
-
-| Path | Forward total us | Backward total us | Forward minus raw us | Backward minus raw us |
-|---|---:|---:|---:|---:|
-| Raw Frost GPU sequence | 65.0 | 143.2 | — | — |
-| JAX jit + command buffers | 148.3 | 232.5 | 83.3 | 89.3 |
-| torch eager | 142.4 | 230.1 | 77.4 | 86.9 |
-| Fixed-buffer CUDA-graph replay | 73.4 | 151.8 | 8.4 | 8.6 |
-
-Host dispatch was 47.2 / 66.0 us for JAX, 88.9 / 111.3 us for torch, and
-2.3 / 2.3 us for graph replay. A pre-rebase repeat measured raw GPU 65.0 / 143.2 us,
-JAX totals 150.2 / 233.9 us and torch totals 141.8 / 228.4 us. Outputs and
-all five explicit-backward gradients matched torch exactly in all three runs,
-including captured replay. Stack: Python 3.14, JAX 0.11.1, torch 2.14.0+cu130,
-CuTeDSL 4.7.1, cuDNN 9.28.0.
-
-A same-stack control restored only the native engine from `84c8feb7d`, retaining
-its automatic piece-chain selection and the current JAX implementation. Original
-torch host dispatch was 113.1 / 155.3 us, total 152.8 / 241.6 us, and raw GPU
-63.9 / 136.6 us. Sharing the program reduces host dispatch, but this case shows
-about **5% higher backward GPU time** (forward about 2%). That code-generation
-or launch-composition difference has not been isolated; more performance
-qualification is required. It is not a scheduling difference in this control.
-
-**The 10–20 us CPU target remains unmet.** Torch eager overhead is still high.
-Totals include synchronization; total-minus-raw is not pure CPU overhead.
-These results cover one configuration and do not establish performance across
-the support matrix. The control used the previous engine's `build_plan` method.
-
-### Historical measurements before sharing the launch program
-
-These measurements predate the shared launch program and automatic piece-chain
-support. They are historical; the shared-program measurements above use the
-same Frost scheduling decision for JAX and torch.
-
-Measured on SM100 (148 SMs), Python 3.14, JAX 0.11.1, CuTeDSL 4.7.1,
-torch 2.14.0+cu130, driver 580.159.03. BF16 THD inputs, H=4, K=V=128,
-one sequence, split scheduling, no recurrent state or optional gate parameters,
-checkpoint interval zero. Backward includes checkpoint recomputation. All
-forward outputs and five explicit-backward gradients matched torch exactly at
-T=128, 1024 and 4096; captured and repeatedly replayed outputs also matched.
-
-At **T=1024**, raw full-sequence GPU time was **45.1 us forward / 128.8 us
-backward**. Unprofiled medians of 200 calls after 20 warmups:
-
-| Path | Forward blocking us | Backward blocking us | Forward minus raw us | Backward minus raw us |
-|---|---:|---:|---:|---:|
-| JAX jit + command buffers | 126.4 | 223.9 | 81.3 | 95.1 |
-| torch eager custom ops | 118.9 | 218.0 | 73.8 | 89.2 |
-| Fixed-buffer graph replay | 52.8 | 136.1 | 7.8 | 7.3 |
-
-Host dispatch was **45.0 / 63.4 us for JAX**, **95.0 / 129.4 us for torch**,
-and **2.3 / 2.3 us for fixed-buffer graph replay** (forward/backward).
-**Neither framework meets the 10–20 us CPU target. Torch eager overhead is
-also high:** its total-minus-raw gap is 74 / 89 us, whereas fixed-buffer replay
-adds only about 8 / 7 us. The eager path performs custom-op dispatch, validation,
-output allocation, graph binding and multiple host launches each call. Replay
-bypasses that path; this comparison does not isolate each component's cost.
-Torch workspace is cached; JAX owns per-invocation workspace and outputs.
-
-With default XLA settings, JAX at T=1024 measured 51.4 / 74.7 us host dispatch
-and 113.1 / 216.3 us blocking latency. Command buffers reduced host dispatch but
-did not reduce blocking latency in these runs. Nsight shows graph-child updates
-when output/workspace addresses change; resolving this overhead remains a
-production release blocker. These measurements do not establish a universal
-winner or qualify every shape.
-
-Additional command-buffer cases (us; totals include synchronization):
-
-| T | Direction | Raw GPU | JAX total | torch total | JAX minus raw | torch minus raw |
-|---:|---|---:|---:|---:|---:|---:|
-| 128 | fwd | 24.9 | 94.6 | 105.0 | 69.7 | 80.1 |
-| 128 | bwd | 56.6 | 137.0 | 142.6 | 80.4 | 86.0 |
-| 4096 | fwd | 64.0 | 140.3 | 140.3 | 76.2 | 76.3 |
-| 4096 | bwd | 162.2 | 255.8 | 252.2 | 93.6 | 90.1 |
-
-A separate Nsight trace confirmed five forward and seven backward kernels per
-call. Over ten measured T=1024 calls, median GPU time from the first kernel's
-start to the last kernel's end was **45.3 / 132.3 us for JAX**, **52.8 / 133.2 us
-for torch eager**, and **45.3 / 128.3 us for fixed-buffer replay**. This includes
-inter-kernel gaps and preserves overlap. JAX's device sequence is close to the
-captured Frost baseline; its large end-to-end gap remains outside that interval.
-Graph-child parameter updates were visible on every measured JAX call. These
-profiled GPU spans are separate from the unprofiled latency measurements above.
-
-For a standalone composite call, XLA may otherwise decline capture because it
-counts only one custom-call operation. The validated capture configuration is:
-
-```python
-compiled = jax.jit(attend, compiler_options={
-    "xla_gpu_enable_command_buffer": "CUSTOM_CALL",
-    "xla_gpu_graph_min_graph_size": 1,
-})
-```
-
-These are application compiler options; the library does not change global XLA
-settings. Capture was confirmed in Nsight, including replay after pointer changes.
-
-Measurement methodology:
-
-- **Host dispatch:** CPU interval around the warm API call, with prior GPU work
-  drained. Compilation and input creation are excluded.
-- **Blocking latency:** the same call followed by device-wide synchronization,
-  using the same synchronization primitive for JAX and torch.
-- **Raw GPU sequence:** CUDA-event elapsed time for a graph containing 32 complete
-  Frost calls, divided by 32. Capture fixes outputs and workspace; replay bypasses
-  Python/custom-op dispatch and allocation. This includes scheduling, prologues,
-  main kernels, inter-kernel dependencies and backward checkpoint recomputation.
-  It amortizes graph submission/event overhead and preserves PDL overlap; it is
-  not a sum of individual kernel durations or a main-kernel-only measurement.
-- **Blocking minus raw:** a diagnostic of host/launch/allocation/synchronization
-  overhead and GPU scheduling gaps. It is not pure CPU time. Host dispatch and GPU
-  execution overlap, so subtracting raw GPU time from host dispatch is invalid.
-
-Each path has 20 warmup calls; reported latencies are medians. The fixed-buffer,
-one-call graph replay also reports host and blocking latency as a control. This
-is a stateless BF16 microbenchmark with fixed inputs, checkpoint interval zero,
-precomputed explicit-backward residuals, and no optional gate parameters. It does
-not measure compilation, a complete training step, or all supported features.
-
-Use unprofiled runs for host latency. Concurrent GPU profiling produced roughly
-2 ms synchronization latency even for a trivial graph on this machine; that run
-was discarded and measurements repeated after the other process exited.
-
-Memory-only Compute Sanitizer coverage passed five forward/backward and concurrent
-replay cases with zero errors using `--tool memcheck --report-api-errors no`.
-API reporting was disabled for that run because cuda-python probes API versions
-newer than the local driver's 13.0 interface; the unfiltered run reported 68 such
-probe errors, without invalid device-buffer accesses. Upgrade the driver before
-claiming an unfiltered clean sanitizer run on the customer stack.
+The previous launch implementation's measurements do not qualify this adapter.
+The 10–20 us CPU dispatch target and JAX/native kernel-performance parity still
+need qualification on the intended deployment stack. Numerical tests alone do
+not establish either target.
