@@ -5,16 +5,14 @@ import importlib
 import sys
 from typing import Any
 
-# moe_grouped_matmul / swiglu_mlp live with the rest of the GEMM family in
-# cudnn.gemm.ops (their modules import torch). Expose them here lazily so that
-# importing this package does not eagerly pull in those kernel modules; the
-# submodule aliases (``cudnn.experimental.ops.<name>``) are registered on first
-# access, so ``from cudnn.experimental.ops import <name>`` keeps resolving.
+# Implementations live with their owning operation families. Expose them here
+# lazily so importing this experimental compatibility package does not pull in
+# PyTorch until a specific operation is requested.
 _LAZY_ALIASES = {
     "moe_grouped_matmul": "cudnn.gemm.ops.moe_grouped_matmul",
     "swiglu_mlp": "cudnn.gemm.ops.swiglu_mlp",
-    "rms_norm": "cudnn.experimental.ops.rmsnorm",
-    "layer_norm": "cudnn.experimental.ops.layernorm",
+    "rms_norm": "cudnn.ops.norm.rmsnorm",
+    "layer_norm": "cudnn.ops.norm.layernorm",
 }
 
 

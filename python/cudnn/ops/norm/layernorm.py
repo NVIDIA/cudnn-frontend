@@ -1,23 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """PyTorch custom operator for cuDNN layer normalization."""
 
-import logging
 from enum import IntEnum
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import cudnn
 import torch
 
-_logger = logging.getLogger(__name__)
+from ._common import (
+    GraphCache,
+    TORCH_DTYPE_TO_CUDNN,
+    epsilon_tensor,
+    get_handle,
+    require_canonical_4d,
+    require_cuda,
+    require_dtype,
+    require_same_device,
+)
 
-_cudnn_handles = {}
-_fprop_cache: Dict[tuple, tuple] = {}
-_bprop_cache: Dict[tuple, tuple] = {}
-
-_TORCH_DTYPE_TO_CUDNN = {
-    torch.float16: cudnn.data_type.HALF,
-    torch.bfloat16: cudnn.data_type.BFLOAT16,
-    torch.float32: cudnn.data_type.FLOAT,
-}
+_fprop_cache = GraphCache()
+_bprop_cache = GraphCache()
 
 
 class _UIDs(IntEnum):
@@ -34,55 +38,29 @@ class _UIDs(IntEnum):
     DBIAS = 203
 
 
-def _get_handle(device: torch.device):
-    if device not in _cudnn_handles:
-        _cudnn_handles[device] = cudnn.create_handle()
-    cudnn.set_stream(handle=_cudnn_handles[device], stream=torch.cuda.current_stream(device).cuda_stream)
-    return _cudnn_handles[device]
+def _tensor_key(tensor: torch.Tensor) -> tuple:
+    return tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype
 
 
-def _get_uid_order(graph, present_uids):
-    if hasattr(graph, "_get_variant_pack_uids_sorted"):
-        return graph._get_variant_pack_uids_sorted()
-    return sorted(present_uids)
-
-
-def _execute(graph, uid_order, uid_to_tensor, workspace, handle):
-    if hasattr(graph, "_execute_with_ptrs"):
-        graph._execute_with_ptrs([uid_to_tensor[uid].data_ptr() for uid in uid_order], workspace.data_ptr(), int(handle))
-    else:
-        graph.execute(uid_to_tensor, workspace, handle=handle)
-
-
-def _make_cache_key(kind: str, rows: int, hidden_size: int, dtype: torch.dtype, device: torch.device):
-    return kind, rows, hidden_size, dtype, device
-
-
-def _build_fprop_graph(handle, rows: int, hidden_size: int, io_dtype: torch.dtype):
-    cudnn_io_dtype = _TORCH_DTYPE_TO_CUDNN[io_dtype]
+def _build_fprop_graph(handle, x: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor):
+    io_dtype = TORCH_DTYPE_TO_CUDNN[x.dtype]
     graph = cudnn.pygraph(
         handle=handle,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    x_t = graph.tensor(
-        name="X",
-        dim=[rows, hidden_size, 1, 1],
-        stride=[hidden_size, 1, hidden_size, hidden_size],
-        data_type=cudnn_io_dtype,
-        uid=_UIDs.X,
-    )
+    x_t = graph.tensor(name="X", dim=list(x.shape), stride=list(x.stride()), data_type=io_dtype, uid=_UIDs.X)
     scale_t = graph.tensor(
         name="scale",
-        dim=[1, hidden_size, 1, 1],
-        stride=[hidden_size, 1, hidden_size, hidden_size],
+        dim=list(scale.shape),
+        stride=list(scale.stride()),
         data_type=cudnn.data_type.FLOAT,
         uid=_UIDs.SCALE,
     )
     bias_t = graph.tensor(
         name="bias",
-        dim=[1, hidden_size, 1, 1],
-        stride=[hidden_size, 1, hidden_size, hidden_size],
+        dim=list(bias.shape),
+        stride=list(bias.stride()),
         data_type=cudnn.data_type.FLOAT,
         uid=_UIDs.BIAS,
     )
@@ -102,7 +80,7 @@ def _build_fprop_graph(handle, rows: int, hidden_size: int, io_dtype: torch.dtyp
         bias=bias_t,
         epsilon=epsilon_t,
     )
-    y_t.set_uid(_UIDs.Y).set_output(True).set_data_type(cudnn_io_dtype)
+    y_t.set_uid(_UIDs.Y).set_output(True).set_data_type(io_dtype)
     mean_t.set_uid(_UIDs.MEAN).set_output(True).set_data_type(cudnn.data_type.FLOAT)
     inv_var_t.set_uid(_UIDs.INV_VAR).set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
@@ -114,45 +92,40 @@ def _build_fprop_graph(handle, rows: int, hidden_size: int, io_dtype: torch.dtyp
     return graph, graph.get_workspace_size()
 
 
-def _build_bprop_graph(handle, rows: int, hidden_size: int, io_dtype: torch.dtype):
-    cudnn_io_dtype = _TORCH_DTYPE_TO_CUDNN[io_dtype]
+def _build_bprop_graph(
+    handle,
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    mean: torch.Tensor,
+    inv_var: torch.Tensor,
+):
+    io_dtype = TORCH_DTYPE_TO_CUDNN[x.dtype]
     graph = cudnn.pygraph(
         handle=handle,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    dy_t = graph.tensor(
-        name="DY",
-        dim=[rows, hidden_size, 1, 1],
-        stride=[hidden_size, 1, hidden_size, hidden_size],
-        data_type=cudnn_io_dtype,
-        uid=_UIDs.DY,
-    )
-    x_t = graph.tensor(
-        name="X",
-        dim=[rows, hidden_size, 1, 1],
-        stride=[hidden_size, 1, hidden_size, hidden_size],
-        data_type=cudnn_io_dtype,
-        uid=_UIDs.X,
-    )
+    dy_t = graph.tensor(name="DY", dim=list(dy.shape), stride=list(dy.stride()), data_type=io_dtype, uid=_UIDs.DY)
+    x_t = graph.tensor(name="X", dim=list(x.shape), stride=list(x.stride()), data_type=io_dtype, uid=_UIDs.X)
     scale_t = graph.tensor(
         name="scale",
-        dim=[1, hidden_size, 1, 1],
-        stride=[hidden_size, 1, hidden_size, hidden_size],
+        dim=list(scale.shape),
+        stride=list(scale.stride()),
         data_type=cudnn.data_type.FLOAT,
         uid=_UIDs.SCALE,
     )
     mean_t = graph.tensor(
         name="mean",
-        dim=[rows, 1, 1, 1],
-        stride=[1, 1, 1, 1],
+        dim=list(mean.shape),
+        stride=list(mean.stride()),
         data_type=cudnn.data_type.FLOAT,
         uid=_UIDs.MEAN,
     )
     inv_var_t = graph.tensor(
         name="inv_var",
-        dim=[rows, 1, 1, 1],
-        stride=[1, 1, 1, 1],
+        dim=list(inv_var.shape),
+        stride=list(inv_var.stride()),
         data_type=cudnn.data_type.FLOAT,
         uid=_UIDs.INV_VAR,
     )
@@ -164,7 +137,7 @@ def _build_bprop_graph(handle, rows: int, hidden_size: int, io_dtype: torch.dtyp
         mean=mean_t,
         inv_variance=inv_var_t,
     )
-    dx_t.set_uid(_UIDs.DX).set_output(True).set_data_type(cudnn_io_dtype)
+    dx_t.set_uid(_UIDs.DX).set_output(True).set_data_type(io_dtype)
     dscale_t.set_uid(_UIDs.DSCALE).set_output(True).set_data_type(cudnn.data_type.FLOAT)
     dbias_t.set_uid(_UIDs.DBIAS).set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
@@ -174,6 +147,41 @@ def _build_bprop_graph(handle, rows: int, hidden_size: int, io_dtype: torch.dtyp
     graph.check_support()
     graph.build_plans()
     return graph, graph.get_workspace_size()
+
+
+def _validate_fprop(x: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor) -> Tuple[int, int]:
+    require_cuda("cudnn::layernorm", x=x, scale=scale, bias=bias)
+    require_same_device("cudnn::layernorm", x, scale=scale, bias=bias)
+    if x.dtype not in TORCH_DTYPE_TO_CUDNN:
+        raise TypeError(f"cudnn::layernorm: unsupported input dtype {x.dtype}")
+    if x.ndim != 4 or x.shape[2:] != (1, 1):
+        raise ValueError(f"cudnn::layernorm: expected x with shape (rows, hidden_size, 1, 1), got {tuple(x.shape)}")
+    rows, hidden_size = x.shape[:2]
+    require_canonical_4d("x", x, rows, hidden_size)
+    require_canonical_4d("scale", scale, 1, hidden_size)
+    require_canonical_4d("bias", bias, 1, hidden_size)
+    require_dtype("scale", scale, torch.float32)
+    require_dtype("bias", bias, torch.float32)
+    return rows, hidden_size
+
+
+def _validate_bprop(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    mean: torch.Tensor,
+    inv_var: torch.Tensor,
+) -> Tuple[int, int]:
+    rows, hidden_size = _validate_fprop(x, scale, scale)
+    require_cuda("cudnn::layernorm_bwd", dy=dy, x=x, scale=scale, mean=mean, inv_var=inv_var)
+    require_same_device("cudnn::layernorm_bwd", x, dy=dy, scale=scale, mean=mean, inv_var=inv_var)
+    require_canonical_4d("dy", dy, rows, hidden_size)
+    require_dtype("dy", dy, x.dtype)
+    for name, tensor in (("mean", mean), ("inv_var", inv_var)):
+        if tuple(tensor.shape) != (rows, 1, 1, 1) or not tensor.is_contiguous():
+            raise ValueError(f"{name}: expected contiguous shape {(rows, 1, 1, 1)}, got {tuple(tensor.shape)}")
+        require_dtype(name, tensor, torch.float32)
+    return rows, hidden_size
 
 
 _lib = torch.library.Library("cudnn", "FRAGMENT")
@@ -187,33 +195,28 @@ def _layernorm_impl(
     bias: torch.Tensor,
     eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    handle = _get_handle(x.device)
-    rows, hidden_size = x.shape[:2]
-    cache_key = _make_cache_key("fprop", rows, hidden_size, x.dtype, x.device)
-    if cache_key not in _fprop_cache:
-        graph, workspace_size = _build_fprop_graph(handle, rows, hidden_size, x.dtype)
-        _fprop_cache[cache_key] = (
-            graph,
-            workspace_size,
-            _get_uid_order(graph, [_UIDs.X, _UIDs.SCALE, _UIDs.BIAS, _UIDs.EPSILON, _UIDs.Y, _UIDs.MEAN, _UIDs.INV_VAR]),
-        )
-    graph, workspace_size, uid_order = _fprop_cache[cache_key]
+    rows, _hidden_size = _validate_fprop(x, scale, bias)
+    handle = get_handle(x.device)
+    key = ("layernorm_fprop", _tensor_key(x), _tensor_key(scale), _tensor_key(bias), x.device)
+    graph, workspace_size = _fprop_cache.get_or_build(key, lambda: _build_fprop_graph(handle, x, scale, bias))
 
     y = torch.empty_like(x)
     mean = torch.empty(rows, 1, 1, 1, dtype=torch.float32, device=x.device)
     inv_var = torch.empty_like(mean)
-    epsilon = torch.tensor(eps, dtype=torch.float32).reshape(1, 1, 1, 1)
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device=x.device)
-    uid_to_tensor = {
-        int(_UIDs.X): x,
-        int(_UIDs.SCALE): scale,
-        int(_UIDs.BIAS): bias,
-        int(_UIDs.EPSILON): epsilon,
-        int(_UIDs.Y): y,
-        int(_UIDs.MEAN): mean,
-        int(_UIDs.INV_VAR): inv_var,
-    }
-    _execute(graph, uid_order, uid_to_tensor, workspace, handle)
+    graph.execute(
+        {
+            int(_UIDs.X): x,
+            int(_UIDs.SCALE): scale,
+            int(_UIDs.BIAS): bias,
+            int(_UIDs.EPSILON): epsilon_tensor(eps),
+            int(_UIDs.Y): y,
+            int(_UIDs.MEAN): mean,
+            int(_UIDs.INV_VAR): inv_var,
+        },
+        workspace,
+        handle=handle,
+    )
     return y, mean, inv_var
 
 
@@ -228,7 +231,11 @@ def _layernorm_fake(
     eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     stats_shape = (x.shape[0], 1, 1, 1)
-    return torch.empty_like(x), torch.empty(stats_shape, dtype=torch.float32, device=x.device), torch.empty(stats_shape, dtype=torch.float32, device=x.device)
+    return (
+        torch.empty_like(x),
+        torch.empty(stats_shape, dtype=torch.float32, device=x.device),
+        torch.empty(stats_shape, dtype=torch.float32, device=x.device),
+    )
 
 
 def _layernorm_bwd_impl(
@@ -238,33 +245,40 @@ def _layernorm_bwd_impl(
     mean: torch.Tensor,
     inv_var: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    handle = _get_handle(dy.device)
-    rows, hidden_size = x.shape[:2]
-    cache_key = _make_cache_key("bprop", rows, hidden_size, x.dtype, x.device)
-    if cache_key not in _bprop_cache:
-        graph, workspace_size = _build_bprop_graph(handle, rows, hidden_size, x.dtype)
-        _bprop_cache[cache_key] = (
-            graph,
-            workspace_size,
-            _get_uid_order(graph, [_UIDs.DY, _UIDs.X, _UIDs.SCALE, _UIDs.MEAN, _UIDs.INV_VAR, _UIDs.DX, _UIDs.DSCALE, _UIDs.DBIAS]),
-        )
-    graph, workspace_size, uid_order = _bprop_cache[cache_key]
+    _rows, hidden_size = _validate_bprop(dy, x, scale, mean, inv_var)
+    handle = get_handle(x.device)
+    key = (
+        "layernorm_bprop",
+        _tensor_key(dy),
+        _tensor_key(x),
+        _tensor_key(scale),
+        _tensor_key(mean),
+        _tensor_key(inv_var),
+        x.device,
+    )
+    graph, workspace_size = _bprop_cache.get_or_build(
+        key,
+        lambda: _build_bprop_graph(handle, dy, x, scale, mean, inv_var),
+    )
 
     dx = torch.empty_like(x)
     dscale = torch.empty(1, hidden_size, 1, 1, dtype=torch.float32, device=x.device)
     dbias = torch.empty_like(dscale)
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device=x.device)
-    uid_to_tensor = {
-        int(_UIDs.DY): dy,
-        int(_UIDs.X): x,
-        int(_UIDs.SCALE): scale,
-        int(_UIDs.MEAN): mean,
-        int(_UIDs.INV_VAR): inv_var,
-        int(_UIDs.DX): dx,
-        int(_UIDs.DSCALE): dscale,
-        int(_UIDs.DBIAS): dbias,
-    }
-    _execute(graph, uid_order, uid_to_tensor, workspace, handle)
+    graph.execute(
+        {
+            int(_UIDs.DY): dy,
+            int(_UIDs.X): x,
+            int(_UIDs.SCALE): scale,
+            int(_UIDs.MEAN): mean,
+            int(_UIDs.INV_VAR): inv_var,
+            int(_UIDs.DX): dx,
+            int(_UIDs.DSCALE): dscale,
+            int(_UIDs.DBIAS): dbias,
+        },
+        workspace,
+        handle=handle,
+    )
     return dx, dscale, dbias
 
 
@@ -291,6 +305,8 @@ def _layernorm_setup_context(ctx, inputs, output):
     x, scale, _bias, _eps = inputs
     _y, mean, inv_var = output
     ctx.save_for_backward(x, scale, mean, inv_var)
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(mean, inv_var)
 
 
 def _layernorm_backward(ctx, dy, _d_mean, _d_inv_var):
@@ -315,15 +331,26 @@ def layer_norm(
         raise NotImplementedError(f"only a one-dimensional normalized_shape is supported, got {normalized_shape}")
     if input.ndim == 0:
         raise ValueError("input must have at least one dimension")
-    if input.dtype not in _TORCH_DTYPE_TO_CUDNN:
+    if not input.is_cuda:
+        raise ValueError(f"input must be a CUDA tensor, got {input.device}")
+    if input.dtype not in TORCH_DTYPE_TO_CUDNN:
         raise TypeError(f"unsupported input dtype: {input.dtype}")
     hidden_size = normalized_shape[0]
+    if hidden_size <= 0:
+        raise ValueError(f"normalized_shape must contain a positive dimension, got {normalized_shape}")
     if input.shape[-1] != hidden_size:
         raise ValueError(f"input's final dimension must be {hidden_size}, got {input.shape[-1]}")
-    if weight is not None and (weight.shape != normalized_shape or weight.device != input.device):
-        raise ValueError("weight must match normalized_shape and be on the input device")
-    if bias is not None and (bias.shape != normalized_shape or bias.device != input.device):
-        raise ValueError("bias must match normalized_shape and be on the input device")
+
+    allowed_parameter_dtypes = {input.dtype}
+    if input.dtype in (torch.float16, torch.bfloat16):
+        allowed_parameter_dtypes.add(torch.float32)
+    for name, parameter in (("weight", weight), ("bias", bias)):
+        if parameter is None:
+            continue
+        if tuple(parameter.shape) != normalized_shape or parameter.device != input.device:
+            raise ValueError(f"{name} must match normalized_shape and be on the input device")
+        if parameter.dtype not in allowed_parameter_dtypes:
+            raise TypeError(f"{name} dtype must be one of {allowed_parameter_dtypes}, got {parameter.dtype}")
 
     original_shape = input.shape
     rows = input.numel() // hidden_size
@@ -340,3 +367,6 @@ def layer_norm(
     )
     y_4d, _mean, _inv_var = torch.ops.cudnn.layernorm(x_4d, scale_4d, bias_4d, eps)
     return y_4d.reshape(original_shape)
+
+
+__all__ = ["layer_norm"]

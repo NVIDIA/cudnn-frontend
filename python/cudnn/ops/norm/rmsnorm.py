@@ -1,23 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """PyTorch custom operator for cuDNN RMS normalization."""
 
-import logging
 from enum import IntEnum
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import cudnn
 import torch
 
-_logger = logging.getLogger(__name__)
+from ._common import (
+    GraphCache,
+    TORCH_DTYPE_TO_CUDNN,
+    epsilon_tensor,
+    get_handle,
+    require_canonical_4d,
+    require_cuda,
+    require_dtype,
+    require_same_device,
+)
 
-_cudnn_handles = {}
-_fprop_cache: Dict[tuple, tuple] = {}
-_bprop_cache: Dict[tuple, tuple] = {}
-
-_TORCH_DTYPE_TO_CUDNN = {
-    torch.float16: cudnn.data_type.HALF,
-    torch.bfloat16: cudnn.data_type.BFLOAT16,
-    torch.float32: cudnn.data_type.FLOAT,
-}
+_fprop_cache = GraphCache()
+_bprop_cache = GraphCache()
 
 
 class _UIDs(IntEnum):
@@ -33,42 +37,12 @@ class _UIDs(IntEnum):
     DBIAS = 203
 
 
-def _get_handle(device: torch.device):
-    if device not in _cudnn_handles:
-        _cudnn_handles[device] = cudnn.create_handle()
-    cudnn.set_stream(handle=_cudnn_handles[device], stream=torch.cuda.current_stream(device).cuda_stream)
-    return _cudnn_handles[device]
+def _tensor_key(tensor: torch.Tensor) -> tuple:
+    return tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype
 
 
-def _get_uid_order(graph, present_uids):
-    if hasattr(graph, "_get_variant_pack_uids_sorted"):
-        return graph._get_variant_pack_uids_sorted()
-    return sorted(present_uids)
-
-
-def _execute(graph, uid_order, uid_to_tensor, workspace, handle):
-    if hasattr(graph, "_execute_with_ptrs"):
-        graph._execute_with_ptrs([uid_to_tensor[uid].data_ptr() for uid in uid_order], workspace.data_ptr(), int(handle))
-    else:
-        graph.execute(uid_to_tensor, workspace, handle=handle)
-
-
-def _make_cache_key(kind: str, x: torch.Tensor, scale: torch.Tensor, has_bias: bool):
-    return (
-        kind,
-        tuple(x.shape),
-        tuple(x.stride()),
-        x.dtype,
-        tuple(scale.shape),
-        tuple(scale.stride()),
-        scale.dtype,
-        has_bias,
-        x.device,
-    )
-
-
-def _build_fprop_graph(handle, x: torch.Tensor, scale: torch.Tensor, bias: Optional[torch.Tensor], epsilon: torch.Tensor):
-    io_dtype = _TORCH_DTYPE_TO_CUDNN[x.dtype]
+def _build_fprop_graph(handle, x: torch.Tensor, scale: torch.Tensor, bias: Optional[torch.Tensor]):
+    io_dtype = TORCH_DTYPE_TO_CUDNN[x.dtype]
     graph = cudnn.pygraph(
         handle=handle,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -78,8 +52,8 @@ def _build_fprop_graph(handle, x: torch.Tensor, scale: torch.Tensor, bias: Optio
     scale_t = graph.tensor(name="scale", dim=list(scale.shape), stride=list(scale.stride()), data_type=io_dtype, uid=_UIDs.SCALE)
     epsilon_t = graph.tensor(
         name="epsilon",
-        dim=list(epsilon.shape),
-        stride=list(epsilon.stride()),
+        dim=[1, 1, 1, 1],
+        stride=[1, 1, 1, 1],
         data_type=cudnn.data_type.FLOAT,
         uid=_UIDs.EPSILON,
         is_pass_by_value=True,
@@ -89,7 +63,7 @@ def _build_fprop_graph(handle, x: torch.Tensor, scale: torch.Tensor, bias: Optio
         bias_t = graph.tensor(name="bias", dim=list(bias.shape), stride=list(bias.stride()), data_type=io_dtype, uid=_UIDs.BIAS)
 
     y_t, inv_var_t = graph.rmsnorm(
-        name="RMS",
+        name="rmsnorm",
         norm_forward_phase=cudnn.norm_forward_phase.TRAINING,
         input=x_t,
         scale=scale_t,
@@ -107,8 +81,15 @@ def _build_fprop_graph(handle, x: torch.Tensor, scale: torch.Tensor, bias: Optio
     return graph, graph.get_workspace_size()
 
 
-def _build_bprop_graph(handle, dy: torch.Tensor, x: torch.Tensor, scale: torch.Tensor, inv_var: torch.Tensor, has_dbias: bool):
-    io_dtype = _TORCH_DTYPE_TO_CUDNN[x.dtype]
+def _build_bprop_graph(
+    handle,
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    inv_var: torch.Tensor,
+    has_dbias: bool,
+):
+    io_dtype = TORCH_DTYPE_TO_CUDNN[x.dtype]
     graph = cudnn.pygraph(
         handle=handle,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -125,7 +106,7 @@ def _build_bprop_graph(handle, dy: torch.Tensor, x: torch.Tensor, scale: torch.T
         uid=_UIDs.INV_VAR,
     )
     dx_t, dscale_t, dbias_t = graph.rmsnorm_backward(
-        name="DRMS",
+        name="rmsnorm_bwd",
         grad=dy_t,
         input=x_t,
         scale=scale_t,
@@ -145,41 +126,82 @@ def _build_bprop_graph(handle, dy: torch.Tensor, x: torch.Tensor, scale: torch.T
     return graph, graph.get_workspace_size()
 
 
+def _validate_fprop(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> Tuple[int, int]:
+    tensors = {"x": x, "scale": scale}
+    if bias is not None:
+        tensors["bias"] = bias
+    require_cuda("cudnn::rmsnorm", **tensors)
+    require_same_device("cudnn::rmsnorm", x, **{name: tensor for name, tensor in tensors.items() if name != "x"})
+    if x.dtype not in TORCH_DTYPE_TO_CUDNN:
+        raise TypeError(f"cudnn::rmsnorm: unsupported input dtype {x.dtype}")
+    if x.ndim != 4 or x.shape[2:] != (1, 1):
+        raise ValueError(f"cudnn::rmsnorm: expected x with shape (rows, hidden_size, 1, 1), got {tuple(x.shape)}")
+    rows, hidden_size = x.shape[:2]
+    require_canonical_4d("x", x, rows, hidden_size)
+    require_canonical_4d("scale", scale, 1, hidden_size)
+    require_dtype("scale", scale, x.dtype)
+    if bias is not None:
+        require_canonical_4d("bias", bias, 1, hidden_size)
+        require_dtype("bias", bias, x.dtype)
+    return rows, hidden_size
+
+
+def _validate_bprop(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    inv_var: torch.Tensor,
+) -> Tuple[int, int]:
+    rows, hidden_size = _validate_fprop(x, scale, None)
+    require_cuda("cudnn::rmsnorm_bwd", dy=dy, x=x, scale=scale, inv_var=inv_var)
+    require_same_device("cudnn::rmsnorm_bwd", x, dy=dy, scale=scale, inv_var=inv_var)
+    require_canonical_4d("dy", dy, rows, hidden_size)
+    require_dtype("dy", dy, x.dtype)
+    if tuple(inv_var.shape) != (rows, 1, 1, 1) or not inv_var.is_contiguous():
+        raise ValueError(f"inv_var: expected contiguous shape {(rows, 1, 1, 1)}, got {tuple(inv_var.shape)}")
+    require_dtype("inv_var", inv_var, torch.float32)
+    return rows, hidden_size
+
+
 _lib = torch.library.Library("cudnn", "FRAGMENT")
-_lib.define("rmsnorm(Tensor x, Tensor scale, Tensor epsilon, Tensor? bias=None) -> (Tensor, Tensor)")
+_lib.define("rmsnorm(Tensor x, Tensor scale, float eps, Tensor? bias=None) -> (Tensor, Tensor)")
 _lib.define("rmsnorm_bwd(Tensor dy, Tensor x, Tensor scale, Tensor inv_var, bool has_dbias=False) -> (Tensor, Tensor, Tensor)")
 
 
 def _rmsnorm_impl(
     x: torch.Tensor,
     scale: torch.Tensor,
-    epsilon: torch.Tensor,
+    eps: float,
     bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    handle = _get_handle(x.device)
-    has_bias = bias is not None
-    cache_key = _make_cache_key("fprop", x, scale, has_bias)
-    if cache_key not in _fprop_cache:
-        graph, workspace_size = _build_fprop_graph(handle, x, scale, bias, epsilon)
-        present_uids = [_UIDs.X, _UIDs.SCALE, _UIDs.EPSILON, _UIDs.Y, _UIDs.INV_VAR]
-        if has_bias:
-            present_uids.append(_UIDs.BIAS)
-        _fprop_cache[cache_key] = (graph, workspace_size, _get_uid_order(graph, present_uids))
-    graph, workspace_size, uid_order = _fprop_cache[cache_key]
+    rows, _hidden_size = _validate_fprop(x, scale, bias)
+    handle = get_handle(x.device)
+    key = (
+        "rmsnorm_fprop",
+        _tensor_key(x),
+        _tensor_key(scale),
+        _tensor_key(bias) if bias is not None else None,
+        x.device,
+    )
+    graph, workspace_size = _fprop_cache.get_or_build(key, lambda: _build_fprop_graph(handle, x, scale, bias))
 
     y = torch.empty_like(x)
-    inv_var = torch.empty(x.shape[0], 1, 1, 1, dtype=torch.float32, device=x.device)
+    inv_var = torch.empty(rows, 1, 1, 1, dtype=torch.float32, device=x.device)
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device=x.device)
-    uid_to_tensor = {
+    variant = {
         int(_UIDs.X): x,
         int(_UIDs.SCALE): scale,
-        int(_UIDs.EPSILON): epsilon,
+        int(_UIDs.EPSILON): epsilon_tensor(eps),
         int(_UIDs.Y): y,
         int(_UIDs.INV_VAR): inv_var,
     }
     if bias is not None:
-        uid_to_tensor[int(_UIDs.BIAS)] = bias
-    _execute(graph, uid_order, uid_to_tensor, workspace, handle)
+        variant[int(_UIDs.BIAS)] = bias
+    graph.execute(variant, workspace, handle=handle)
     return y, inv_var
 
 
@@ -190,7 +212,7 @@ _lib.impl("rmsnorm", _rmsnorm_impl, "CUDA")
 def _rmsnorm_fake(
     x: torch.Tensor,
     scale: torch.Tensor,
-    epsilon: torch.Tensor,
+    eps: float,
     bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(x), torch.empty(x.shape[0], 1, 1, 1, dtype=torch.float32, device=x.device)
@@ -203,21 +225,27 @@ def _rmsnorm_bwd_impl(
     inv_var: torch.Tensor,
     has_dbias: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    handle = _get_handle(dy.device)
-    cache_key = _make_cache_key("bprop", x, scale, has_dbias)
-    if cache_key not in _bprop_cache:
-        graph, workspace_size = _build_bprop_graph(handle, dy, x, scale, inv_var, has_dbias)
-        present_uids = [_UIDs.DY, _UIDs.X, _UIDs.SCALE, _UIDs.INV_VAR, _UIDs.DX, _UIDs.DSCALE]
-        if has_dbias:
-            present_uids.append(_UIDs.DBIAS)
-        _bprop_cache[cache_key] = (graph, workspace_size, _get_uid_order(graph, present_uids))
-    graph, workspace_size, uid_order = _bprop_cache[cache_key]
+    _validate_bprop(dy, x, scale, inv_var)
+    handle = get_handle(x.device)
+    key = (
+        "rmsnorm_bprop",
+        _tensor_key(dy),
+        _tensor_key(x),
+        _tensor_key(scale),
+        _tensor_key(inv_var),
+        has_dbias,
+        x.device,
+    )
+    graph, workspace_size = _bprop_cache.get_or_build(
+        key,
+        lambda: _build_bprop_graph(handle, dy, x, scale, inv_var, has_dbias),
+    )
 
     dx = torch.empty_like(x)
     dscale = torch.empty_like(scale)
     dbias = torch.empty_like(scale) if has_dbias else torch.empty(0, dtype=scale.dtype, device=x.device)
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device=x.device)
-    uid_to_tensor = {
+    variant = {
         int(_UIDs.DY): dy,
         int(_UIDs.X): x,
         int(_UIDs.SCALE): scale,
@@ -226,8 +254,8 @@ def _rmsnorm_bwd_impl(
         int(_UIDs.DSCALE): dscale,
     }
     if has_dbias:
-        uid_to_tensor[int(_UIDs.DBIAS)] = dbias
-    _execute(graph, uid_order, uid_to_tensor, workspace, handle)
+        variant[int(_UIDs.DBIAS)] = dbias
+    graph.execute(variant, workspace, handle=handle)
     return dx, dscale, dbias
 
 
@@ -247,10 +275,12 @@ def _rmsnorm_bwd_fake(
 
 
 def _rmsnorm_setup_context(ctx, inputs, output):
-    x, scale, _epsilon, bias = inputs
+    x, scale, _eps, bias = inputs
     _y, inv_var = output
     ctx.save_for_backward(x, scale, inv_var)
     ctx.has_bias = bias is not None
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(inv_var)
 
 
 def _rmsnorm_backward(ctx, dy, _d_inv_var):
@@ -268,13 +298,17 @@ def rms_norm(
     bias: Optional[torch.Tensor] = None,
     eps: float = 1e-5,
 ) -> torch.Tensor:
-    """Apply cuDNN-accelerated RMSNorm over the final input dimension."""
+    """Apply experimental cuDNN RMSNorm with an optional additive bias."""
     if input.ndim == 0:
         raise ValueError("input must have at least one dimension")
-    if input.dtype not in _TORCH_DTYPE_TO_CUDNN:
+    if not input.is_cuda:
+        raise ValueError(f"input must be a CUDA tensor, got {input.device}")
+    if input.dtype not in TORCH_DTYPE_TO_CUDNN:
         raise TypeError(f"unsupported input dtype: {input.dtype}")
     hidden_size = input.shape[-1]
-    if weight.shape != (hidden_size,):
+    if hidden_size <= 0:
+        raise ValueError(f"input's final dimension must be positive, got {hidden_size}")
+    if tuple(weight.shape) != (hidden_size,):
         raise ValueError(f"weight must have shape ({hidden_size},), got {tuple(weight.shape)}")
     if weight.device != input.device or weight.dtype != input.dtype:
         raise ValueError("weight must have the same device and dtype as input")
@@ -286,6 +320,8 @@ def rms_norm(
     x_4d = input.reshape(rows, hidden_size, 1, 1).contiguous()
     scale_4d = weight.reshape(1, hidden_size, 1, 1).contiguous()
     bias_4d = bias.reshape(1, hidden_size, 1, 1).contiguous() if bias is not None else None
-    epsilon = torch.tensor(eps, dtype=torch.float32).reshape(1, 1, 1, 1)
-    y_4d, _inv_var = torch.ops.cudnn.rmsnorm(x_4d, scale_4d, epsilon, bias_4d)
+    y_4d, _inv_var = torch.ops.cudnn.rmsnorm(x_4d, scale_4d, eps, bias_4d)
     return y_4d.reshape(original_shape)
+
+
+__all__ = ["rms_norm"]
