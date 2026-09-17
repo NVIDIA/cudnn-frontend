@@ -146,9 +146,49 @@ The old constructor accepted negative `gate_up_clamp` values and used their
 absolute magnitude. The config-only API rejects negatives; callers must pass
 the intended non-negative magnitude explicitly.
 
-The three tuning fields are independent. Training backward accepts only
+The three phase tuning fields are independent. Training backward accepts only
 `token_back_mode="epi_warps"` with
-`reduce_topk_in_kernel=False`.
+`reduce_topk_in_kernel=False`. `dgrad_optimization` is a backward-only tuning
+choice; inference and training forward require its default value,
+`"baseline"`.
+
+### Dgrad optimization profiles
+
+`training_backward_tuning.dgrad_optimization` selects one of three upstream
+dgrad configurations:
+
+- `"baseline"` preserves the grouped schedule and all existing defaults;
+- `"rolling"` selects the upstream rolling/phase-interleaved schedule;
+- `"ds3_ep4_v1"` selects the complete, strictly qualified DS3 preset.
+
+For example:
+
+```python
+from dataclasses import replace
+
+from cudnn import MoeEpTuningConfig
+
+config = replace(
+    config,
+    training_backward_tuning=MoeEpTuningConfig(
+        dgrad_optimization="rolling",
+    ),
+)
+```
+
+The DS3 preset currently requires EP4, 32 total experts, T4096 per-rank
+capacity, H7168, I2048, K8, MXFP8 combine, unclamped SwiGLU, and the training
+backward auxiliary outputs. Both contiguous and discrete native backward
+weights are supported. The upstream resolver rejects an unqualified workload
+during backend/kernel construction; MoeEP does not duplicate that complete
+qualification table in its public config validator.
+
+DS3 owns its scheduling and transport preset fields. It requires
+`token_back_mode="epi_warps"`, `token_in_flag_batch=1`, `group_hint=None`, and
+`reduce_topk_in_kernel=False`. The default `epi_flag_batch=(1, 1)` is treated
+as handing that field to the preset and is canonicalized to `(4, 2)`;
+explicit `(4, 2)` is equivalent. Other values are rejected instead of
+creating a custom DS3 variant.
 
 `MoeEpFc1WeightLayout.GATE_THEN_UP` denotes conventional source ordering.
 `GATE_UP_INTERLEAVED_32` denotes alternating 32-row gate/up strips. Inference
@@ -237,6 +277,13 @@ candidate score is the median of those slow-rank samples. Equal scores select
 the earlier candidate. `MoeEpAutotuneResult` reports `winner`, per-candidate
 `latency_ms` and `samples_ms` as `MoeEpAutotuneCandidateResult` entries, and
 `evaluated_candidates`.
+
+Backward candidates may select different dgrad profiles. Candidate failure
+remains fail-fast: including `ds3_ep4_v1` in an unqualified workload aborts
+the sweep instead of silently skipping that candidate. Only include DS3 when
+the workload satisfies the qualification above. The reported winner contains
+the canonical public tuning; `group_hint=None` still resolves to the resident
+cluster count of the runtime device.
 
 The sweep is fail-fast. Any validation, allocation, compile, launch, timing,
 synchronization, or teardown error ends the whole sweep. An existing active
@@ -742,3 +789,21 @@ in fact fit in `P` can still be refused; this early overflow is what keeps any
 distribution the kernel accepts from exceeding the prescribed pool. On
 overflow the launch may raise or drop work according to `drop_on_overflow`,
 and its numerical outputs are not guaranteed usable.
+
+For the qualified DS3 workload, the backward kernel requires the exact
+logical route limit
+
+```text
+logical = ep_size * max_tokens_per_rank * top_k
+        = 4 * 4096 * 8
+        = 131072
+```
+
+Per-expert padding expands that limit to a physical receive pool of `131968`
+rows. Therefore public `max_recv_size_per_rank` must be omitted (automatic) or
+set to `131968`; `131072` is the kernel's logical limit and is not a valid
+public physical-pool spelling for DS3. Smaller capacities and additional
+overprovision are rejected. Training forward keeps the generic reverse-map
+and obtains logical `131079` from the same physical `131968` pool. Its extra
+seven logical slots exceed the topology's maximum raw route count and are
+unreachable, so forward/backward overflow behavior remains consistent.
