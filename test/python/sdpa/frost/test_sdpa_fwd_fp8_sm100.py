@@ -231,6 +231,8 @@ def _run(
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
     blk = _BLOCK_SCALED_O.get(block_scaled_o, 0)
+    if blk == 16 and not hasattr(torch, "float4_e2m1fn_x2"):
+        pytest.skip("the packed FP4 dtype (torch.float4_e2m1fn_x2) needs torch >= 2.8")
     if blk == 16:
         # FP4 O: the byte container (two E2M1 per byte) in torch's packed dtype.
         Ob = torch.full((B, S_q, H_q, d_v // 2), 0x7F, device=dev, dtype=torch.uint8).view(torch.float4_e2m1fn_x2).transpose(1, 2)

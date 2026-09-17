@@ -742,6 +742,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         block_scaled_o_arch and cfg.is_infer and not cfg.is_paged and not getattr(cfg, 'is_ragged', False) and d_qk == 128 and d_vo == 128
     ):
         o_block_scale = 0
+    if o_block_scale == 16 and not hasattr(torch, "float4_e2m1fn_x2"):
+        o_block_scale = 0  # the packed FP4 dtype arrived in torch 2.8; older builds run the draw as plain fp8
     if o_block_scale:
         # The quantized O container is E4M3 (mxfp8) or the E2M1 byte container (nvfp4);
         # the reference stays fp32 and is compared after dequantization.

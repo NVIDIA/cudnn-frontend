@@ -66,7 +66,13 @@ def to_torch_dtype(dt):
 
     if dt not in _TORCH_FROM_CUDNN:
         raise NotImplementedError(f"cudnn.sdpa: no lowering for data type {dt}")
-    return getattr(torch, _TORCH_FROM_CUDNN[dt])
+    name = _TORCH_FROM_CUDNN[dt]
+    dtype = getattr(torch, name, None)
+    if dtype is None:
+        # The packed FP4 dtype arrived in torch 2.8: on an older build a graph
+        # that declares it is DECLINED, like any type without a lowering.
+        raise NotImplementedError(f"cudnn.sdpa: this torch build has no torch.{name} for data type {dt}")
+    return dtype
 
 
 # BHSD logical / BSHD physical, size-1 dims wildcarded.
