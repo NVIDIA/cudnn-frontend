@@ -126,25 +126,39 @@ def _validate_execution_options(
         raise ValueError("deterministic backward requires graph.csc_rev_offsets and graph.map_rev_to_coo")
 
 
-def _resolve_gradient_dtype(name: str, grad_dtype: Optional[torch.dtype], input_dtype: torch.dtype) -> torch.dtype:
-    if grad_dtype is None:
-        return input_dtype
+def _validate_gradient_dtype(name: str, grad_dtype: torch.dtype, input_dtype: torch.dtype) -> torch.dtype:
     if not isinstance(grad_dtype, torch.dtype):
-        raise TypeError(f"{name} must be a torch.dtype or None, got {type(grad_dtype).__name__}")
+        raise TypeError(f"{name} must be a torch.dtype, got {type(grad_dtype).__name__}")
     if grad_dtype not in (input_dtype, torch.float32):
         raise ValueError(f"{name} must be {input_dtype} or torch.float32, got {grad_dtype}")
     return grad_dtype
 
 
-def _resolve_gradient_dtypes(
+def _validate_gradient_dtypes(
     input_dtype: torch.dtype,
-    feature_grad_dtype: Optional[torch.dtype],
-    weight_grad_dtype: Optional[torch.dtype],
+    feature_grad_dtype: torch.dtype,
+    weight_grad_dtype: torch.dtype,
 ) -> Tuple[torch.dtype, torch.dtype]:
-    feature_grad_dtype = _resolve_gradient_dtype("feature_grad_dtype", feature_grad_dtype, input_dtype)
-    weight_grad_dtype = _resolve_gradient_dtype("weight_grad_dtype", weight_grad_dtype, input_dtype)
+    feature_grad_dtype = _validate_gradient_dtype("feature_grad_dtype", feature_grad_dtype, input_dtype)
+    weight_grad_dtype = _validate_gradient_dtype("weight_grad_dtype", weight_grad_dtype, input_dtype)
     if feature_grad_dtype == torch.float32 and weight_grad_dtype != torch.float32:
         raise ValueError("feature_grad_dtype=torch.float32 requires weight_grad_dtype=torch.float32")
+    return feature_grad_dtype, weight_grad_dtype
+
+
+def _resolve_gradient_dtypes(
+    input_dtype: torch.dtype,
+    high_precision_dgrad: bool,
+    high_precision_wgrad: bool,
+) -> Tuple[torch.dtype, torch.dtype]:
+    if not isinstance(high_precision_dgrad, bool):
+        raise TypeError(f"high_precision_dgrad must be a bool, got {type(high_precision_dgrad).__name__}")
+    if not isinstance(high_precision_wgrad, bool):
+        raise TypeError(f"high_precision_wgrad must be a bool, got {type(high_precision_wgrad).__name__}")
+    if high_precision_dgrad and not high_precision_wgrad:
+        raise ValueError("high_precision_dgrad=True requires high_precision_wgrad=True")
+    feature_grad_dtype = torch.float32 if high_precision_dgrad else input_dtype
+    weight_grad_dtype = torch.float32 if high_precision_wgrad else input_dtype
     return feature_grad_dtype, weight_grad_dtype
 
 
@@ -319,7 +333,7 @@ def _forward(
         map_rev_to_coo,
     )
     _validate_execution_options(return_attention_weights, deterministic, csc_rev_offsets)
-    _resolve_gradient_dtypes(src_features.dtype, feature_grad_dtype, weight_grad_dtype)
+    _validate_gradient_dtypes(src_features.dtype, feature_grad_dtype, weight_grad_dtype)
 
     offsets = offsets.contiguous()
     indices = indices.contiguous()
@@ -428,7 +442,7 @@ def _backward(
         num_heads,
         concat_heads,
     )
-    feature_grad_dtype, weight_grad_dtype = _resolve_gradient_dtypes(src_features.dtype, feature_grad_dtype, weight_grad_dtype)
+    feature_grad_dtype, weight_grad_dtype = _validate_gradient_dtypes(src_features.dtype, feature_grad_dtype, weight_grad_dtype)
 
     grad_src = torch.empty_like(src_features, dtype=feature_grad_dtype)
     grad_dst = torch.empty_like(dst_features, dtype=feature_grad_dtype)
@@ -693,12 +707,12 @@ def mha_gat(
     activation_alpha: float = 0.2,
     return_attention_weights: bool = False,
     deterministic: bool = False,
-    feature_grad_dtype: Optional[torch.dtype] = None,
-    weight_grad_dtype: Optional[torch.dtype] = None,
+    high_precision_dgrad: bool = False,
+    high_precision_wgrad: bool = False,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Apply GAT multi-head attention to a homogeneous or bipartite CSC graph."""
     src_features, dst_features = _normalize_features(graph, features)
-    feature_grad_dtype, weight_grad_dtype = _resolve_gradient_dtypes(src_features.dtype, feature_grad_dtype, weight_grad_dtype)
+    feature_grad_dtype, weight_grad_dtype = _resolve_gradient_dtypes(src_features.dtype, high_precision_dgrad, high_precision_wgrad)
     output, attention, _ = torch.ops.cudnn.gnn_mha_gat_fwd(
         graph.offsets,
         graph.indices,

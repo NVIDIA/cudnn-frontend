@@ -40,8 +40,8 @@ mha_gat(
     activation_alpha=0.2,
     return_attention_weights=False,
     deterministic=False,
-    feature_grad_dtype=None,
-    weight_grad_dtype=None,
+    high_precision_dgrad=False,
+    high_precision_wgrad=False,
 )
 ```
 
@@ -61,7 +61,7 @@ mha_gat_v2(
     activation_alpha=0.2,
     return_attention_weights=False,
     deterministic=False,
-    grad_dtype=None,
+    high_precision_grad=False,
 )
 ```
 
@@ -88,13 +88,13 @@ Gradients from both `output` and returned `attention` are included in backward. 
 
 ## Gradient precision
 
-By default, gradient tensors use the input feature dtype. For FP16 or BF16 GAT inputs, `feature_grad_dtype` controls the source, destination, and edge feature gradients, while `weight_grad_dtype` controls the attention-weight gradient. The supported combinations are:
+By default, gradients are computed in the input feature dtype. For FP16 or BF16 GAT inputs, `high_precision_dgrad=True` computes source, destination, and edge-feature gradients in FP32, while `high_precision_wgrad=True` computes the attention-weight gradient in FP32. The supported combinations are:
 
-- input dtype for both gradient groups;
-- input dtype for feature gradients and FP32 for the weight gradient;
-- FP32 for both gradient groups.
+- both options disabled;
+- only `high_precision_wgrad=True`;
+- both options enabled.
 
-GAT does not support FP32 feature gradients with a low-precision weight gradient. For GATv2, `grad_dtype` selects one shared dtype for all feature and weight gradients. Each option accepts the input dtype or `torch.float32`; FP32 inputs support only FP32 gradients.
+The backend does not support high-precision feature gradients with a low-precision weight gradient, so `high_precision_dgrad=True` requires `high_precision_wgrad=True`. For GATv2, `high_precision_grad=True` selects FP32 for all feature and weight gradients because its backend API uses one shared gradient dtype. These options are no-ops for FP32 inputs.
 
 PyTorch separately controls the dtype in which a leaf tensor accumulates its gradient. To retain an FP32 gradient on an FP16 or BF16 leaf, set the leaf's `grad_dtype` to FP32 as well:
 
@@ -105,8 +105,8 @@ output = mha_gat(
     graph,
     src_features,
     attn_weights,
-    feature_grad_dtype=torch.float32,
-    weight_grad_dtype=torch.float32,
+    high_precision_dgrad=True,
+    high_precision_wgrad=True,
 )
 ```
 

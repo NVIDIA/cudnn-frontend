@@ -125,14 +125,18 @@ def _validate_execution_options(
         raise ValueError("deterministic backward requires graph.csc_rev_offsets and graph.map_rev_to_coo")
 
 
-def _resolve_gradient_dtype(grad_dtype: Optional[torch.dtype], input_dtype: torch.dtype) -> torch.dtype:
-    if grad_dtype is None:
-        return input_dtype
+def _validate_gradient_dtype(grad_dtype: torch.dtype, input_dtype: torch.dtype) -> torch.dtype:
     if not isinstance(grad_dtype, torch.dtype):
-        raise TypeError(f"grad_dtype must be a torch.dtype or None, got {type(grad_dtype).__name__}")
+        raise TypeError(f"grad_dtype must be a torch.dtype, got {type(grad_dtype).__name__}")
     if grad_dtype not in (input_dtype, torch.float32):
         raise ValueError(f"grad_dtype must be {input_dtype} or torch.float32, got {grad_dtype}")
     return grad_dtype
+
+
+def _resolve_gradient_dtype(input_dtype: torch.dtype, high_precision_grad: bool) -> torch.dtype:
+    if not isinstance(high_precision_grad, bool):
+        raise TypeError(f"high_precision_grad must be a bool, got {type(high_precision_grad).__name__}")
+    return torch.float32 if high_precision_grad else input_dtype
 
 
 def _validate_backward_gradients(
@@ -301,7 +305,7 @@ def _forward(
         map_rev_to_coo,
     )
     _validate_execution_options(return_attention_weights, deterministic, csc_rev_offsets)
-    _resolve_gradient_dtype(grad_dtype, src_features.dtype)
+    _validate_gradient_dtype(grad_dtype, src_features.dtype)
 
     offsets = offsets.contiguous()
     indices = indices.contiguous()
@@ -411,7 +415,7 @@ def _backward(
         num_heads,
         concat_heads,
     )
-    grad_dtype = _resolve_gradient_dtype(grad_dtype, src_features.dtype)
+    grad_dtype = _validate_gradient_dtype(grad_dtype, src_features.dtype)
 
     grad_src = torch.empty_like(src_features, dtype=grad_dtype)
     grad_dst = torch.empty_like(dst_features, dtype=grad_dtype)
@@ -679,11 +683,11 @@ def mha_gat_v2(
     activation_alpha: float = 0.2,
     return_attention_weights: bool = False,
     deterministic: bool = False,
-    grad_dtype: Optional[torch.dtype] = None,
+    high_precision_grad: bool = False,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Apply GATv2 multi-head attention to a homogeneous or bipartite CSC graph."""
     src_features, dst_features = _normalize_features(graph, features)
-    grad_dtype = _resolve_gradient_dtype(grad_dtype, src_features.dtype)
+    grad_dtype = _resolve_gradient_dtype(src_features.dtype, high_precision_grad)
     output, attention, _, _ = torch.ops.cudnn.gnn_mha_gat_v2_fwd(
         graph.offsets,
         graph.indices,
