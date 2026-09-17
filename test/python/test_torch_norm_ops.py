@@ -98,12 +98,25 @@ def test_layer_norm_supports_fp32_parameters_with_low_precision_input():
     input = torch.randn(4, 64, device="cuda", dtype=torch.float16, requires_grad=True)
     weight = torch.randn(64, device="cuda", dtype=torch.float32, requires_grad=True)
     bias = torch.randn(64, device="cuda", dtype=torch.float32, requires_grad=True)
+
     actual = layer_norm(input, (64,), weight, bias)
-    expected = torch.nn.functional.layer_norm(input, (64,), weight, bias)
+    reference_input = input.detach().clone().requires_grad_(True)
+    reference_weight = weight.detach().clone().requires_grad_(True)
+    reference_bias = bias.detach().clone().requires_grad_(True)
+    expected = torch.nn.functional.layer_norm(
+        reference_input.float(),
+        (64,),
+        reference_weight,
+        reference_bias,
+    ).to(input.dtype)
     torch.testing.assert_close(actual, expected, atol=0.015625, rtol=0.015625)
-    actual.sum().backward()
-    assert weight.grad is not None and weight.grad.dtype == torch.float32
-    assert bias.grad is not None and bias.grad.dtype == torch.float32
+
+    grad = torch.randn_like(actual)
+    actual.backward(grad)
+    expected.backward(grad)
+    torch.testing.assert_close(input.grad, reference_input.grad, atol=0.015625, rtol=0.015625)
+    torch.testing.assert_close(weight.grad, reference_weight.grad, atol=0.015625, rtol=0.015625)
+    torch.testing.assert_close(bias.grad, reference_bias.grad, atol=0.015625, rtol=0.015625)
 
 
 @pytest.mark.L0
