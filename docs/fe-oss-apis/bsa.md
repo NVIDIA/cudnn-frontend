@@ -292,24 +292,19 @@ toward Speed of Light.
 
 ## Experimental JAX support
 
-`block_sparse_attention_forward` and `block_sparse_attention_backward` accept
-PyTorch tensors or JAX arrays, including tracers under `jax.jit`. All tensor
-arguments must use the same framework. The implementation is selected lazily;
-JAX execution requires no PyTorch, and PyTorch execution requires no JAX.
-
-The JAX-only gradient helper is `BSA.block_sparse_attention`, also available as
-`cudnn.block_sparse_attention.block_sparse_attention`. The top-level
-`cudnn.block_sparse_attention` remains the module. The newly introduced `_jax`
-function names have been removed without compatibility aliases.
+`cudnn.jax.block_sparse_attention_forward` and
+`cudnn.jax.block_sparse_attention_backward` provide explicit forward/backward;
+`cudnn.jax.block_sparse_attention` adds first-order reverse-mode differentiation.
+All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
+The existing `cudnn` and `BSA` Torch APIs are unchanged. The former `_jax`
+exports have been removed without compatibility aliases.
 
 The JAX implementation reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
 backward, and gradient conversion kernels. Install `jax[cuda13]` alongside the
 frontend (CuTeDSL >=4.7, JAX >=0.9.1). The runtime imports no PyTorch; torch parity tests are separate.
 
-JAX forward requires `pack_gqa=None` or `False`, `kv_splits=1`, and `use_clc=None`.
-JAX backward allocates fresh gradient arrays and rejects `dq_tensor`, `dk_tensor`,
-and `dv_tensor` output buffers. `allow_empty_block_nums` on backward is supported
-only for JAX. Other support limits below remain unchanged.
+The JAX signatures omit Torch-specific launch options and caller-provided
+output buffers. XLA owns the outputs and workspaces.
 
 ### Initial contract
 
@@ -343,7 +338,7 @@ runtime operands. Do not mutate saved forward inputs or metadata before backward
 import jax
 import jax.numpy as jnp
 from functools import partial
-from cudnn.block_sparse_attention import (
+from cudnn.jax import (
     block_sparse_attention_forward as forward,
     block_sparse_attention_backward as backward,
     block_sparse_attention as attention,

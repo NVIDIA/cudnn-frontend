@@ -130,7 +130,6 @@ cudnn.behavior_note.name
 cudnn.behavior_note.value
 cudnn.block_sparse_attention
 cudnn.block_sparse_attention.BSA
-cudnn.block_sparse_attention.block_sparse_attention
 cudnn.block_sparse_attention.block_sparse_attention_backward
 cudnn.block_sparse_attention.block_sparse_attention_forward
 cudnn.block_sparse_attention.block_sparse_attention_fp8_forward
@@ -371,6 +370,9 @@ cudnn.hstu.hstu_lmsd.hstu_lmsd_forward
 cudnn.is_frontend_knob_type
 cudnn.jax
 cudnn.jax.TensorSpec
+cudnn.jax.block_sparse_attention
+cudnn.jax.block_sparse_attention_backward
+cudnn.jax.block_sparse_attention_forward
 cudnn.jax.call
 cudnn.jax.gemm_operand_spec
 cudnn.jax.neg_inf_init
