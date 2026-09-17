@@ -32,6 +32,8 @@ The op graph this file implements, in pipeline order::
      |  (2)+(3) ONE kernel: QK-RMSNorm per head over D, then partial mRoPE on
      |          the first ROPE_DIM. Q and K only -- V is NOT normed. Dims
      |          [ROPE_DIM, D) pass through. fp32 throughout, ONE rounding.
+     |          ``geometry.qk_norm=False`` drops the RMSNorm: RoPE-only Q/K, no
+     |          norm weights (pass None), no rstd; [ROPE_DIM, D) copied bit-exactly.
      |
      |  (4) SDPA        O = softmax(QK^T * scale + mask) V        GQA H_q/H_kv
      |
@@ -95,11 +97,12 @@ softmax).  **FP8 (2026-09-11): an E4M3 pipeline with static per-tensor scales
 is wired in TWO configurations** -- pass an e4m3 ``h``/weights and a
 :class:`QuantSpec`:
 
-* **UNFUSED** (both fusion knobs off, 7 launches): FP8 projections with the
-  descale folded into a scalar-multiply epilogue (bf16 out), bf16 norm+RoPE in
-  place, two quantize passes (Q/K/V, then gated O) feeding the Rubin per-tensor
-  FP8 SDPA and the FP8 out projection.  The quantize passes are the visible
-  price of "unfused".
+* **UNFUSED** (both fusion knobs off; 7 stages = 9 kernel launches, the Q/K/V
+  quantize stage being three launches): FP8 projections with the descale
+  folded into a scalar-multiply epilogue (bf16 out), bf16 norm+RoPE in place,
+  two quantize passes (Q/K/V, then gated O) feeding the Rubin per-tensor FP8
+  SDPA and the FP8 out projection.  The quantize passes are the visible price
+  of "unfused".
 * **FULLY FUSED** (``fuse_norm_rope=True, fuse_gate=True``, 3 launches): the
   projection fork ``kernels/proj_gemm_norm_rope_fp8.py`` descales, norms,
   rotates AND quantizes in its epilogue -- e4m3 Q / K / V into COMPACT
@@ -118,21 +121,48 @@ is wired in TWO configurations** -- pass an e4m3 ``h``/weights and a
   are NOT bit-identical (the unfused path rounds to bf16 twice); both are
   scored against the fake-quant fp32 oracle.
 * Anything in between (one knob) is a typed decline naming both knobs; FP8 is
-  inference-only, and FP8 + ``seq_lens_present`` is declined while the FP8
-  d256 SDPA kernel hangs on an empty KV entry (see ``__init__``).
+  inference-only.  FP8 + ``seq_lens_present`` (a dense padding mask, incl. an
+  EMPTY entry) is SERVED since 2026-09-15: the Rubin FP8 d256 SDPA's
+  empty-KV-entry hang is gone (8/8 fresh processes at S=1000 / 512), and the
+  block's dead-entry oracle test pins ``out[dead] == 0`` exactly.
 
-MXFP8 follows the same route -- the quantization rides in the PROJECTION
-EPILOGUE rather than as separate passes, because stage (1) already owns the only
-full pass over Q/GATE/K/V (emitting them pre-quantized costs one epilogue and
-saves a 34 GiB round trip at 1M tokens).  Three things that decision reaches
-into, listed so the current code does not foreclose them:
+**MXFP8 (2026-09-15, PR-B): an E4M3 + per-32-block E8M0 pipeline is wired in
+the same TWO configurations** -- pass e4m3 ``h`` / ``W_qkvg`` codes, their
+F8_128x4 scale-factor blobs (``sample_h_sf`` / ``sample_w_qkvg_sf`` at
+declaration, ``h_sf`` / ``w_qkvg_sf`` at execute) and an :class:`MxQuantSpec`:
 
-* stage (1)'s epilogue must be able to emit **two layouts of scale factors** for
-  the operands that are consumed transposed. V is quantized COLUMNWISE for the
-  BMM2, and its MXFP8 scale factors are D-PLANE-MAJOR in GMEM while Q/K's are
-  per-tile contiguous — reusing one SF descriptor builder for all three is a
-  silent wrong answer that only shows up at ``d > 128`` and ``S > TILE_N``
-  (``mma-tma-matrix.md`` § 7).
+* **UNFUSED** (9 stages = 9 kernel launches -- the same launch count as
+  unfused FP8, whose 7 stages also issue 9): the block-scale FROST GEMM (``block_scale=True``,
+  the E8M0 dequant is exact and happens IN the MMA, so there is no ``alpha``)
+  writes the bf16 slab; norm+RoPE in place; THREE ``quantize_mxfp8`` launches
+  (Q / K ROWWISE along D, V COLUMNWISE along S -- ``kernels/quantize_mxfp8.py``)
+  write compact e4m3 ``q8`` / ``k8`` / ``v8`` + the SDPA's own F8_128x4 SF
+  blobs (``sf_q`` / ``sf_k`` / ``sf_v``, one 1 KiB tile per ``(b, h, 128-row
+  tile)``; V's is D-PLANE-MAJOR, ``mma-tma-matrix.md`` § 7); the production
+  ``sm107/prefill_d256_mxfp8.py`` (``SdpaFwdDslSm100(pertensor_fp8=False)``,
+  NATURAL at (256, 256), cga1) writes bf16 O; the bf16 gate; a PER-TENSOR
+  ``quantize_o`` (``MxQuantSpec.scale_o``; D1 -- never the rowwise recipe) and
+  the per-tensor FP8 ``out_proj`` with ``alpha_o = descale_w_o / scale_o``.
+* **FULLY FUSED** (``fuse_norm_rope=True, fuse_gate=True``, 3 launches): the
+  MXFP8 GEMM fork twin (``kernels/proj_gemm_norm_rope_mxfp8.py`` via
+  ``run_fused_proj_gemm_mxfp8``) norms / rotates / BLOCK-quantizes in its
+  epilogue and writes ``q8`` / ``k8`` / ``v8`` + ``sf_q`` / ``sf_k`` / ``sf_v``
+  + bf16 ``gate16``; the gated production MXFP8 SDPA writes e4m3 O UNSCALED
+  (the kernel has no per-tensor ``scale_o`` -- D8: ``MxQuantSpec.scale_o``
+  must be 1.0 on this path, typed decline otherwise); FP8 ``out_proj``.  A
+  typed ``NotImplementedError`` while the twin has not landed (feature-detected
+  on the runner name), never a silently un-quantized path.
+* Same envelope as FP8: inference-only, both knobs or neither, e4m3 only
+  (E5M2 is a typed decline), ``d_model % 128 == 0`` (whole SF atoms along K),
+  padding (``seq_lens_present``) served with the same dead-entry contract.
+
+Three facts the MXFP8 design rests on, kept here because a port will drop them:
+
+* V is quantized COLUMNWISE for the BMM2, and its MXFP8 scale factors are
+  D-PLANE-MAJOR in GMEM while Q/K's are per-tile contiguous -- reusing one SF
+  layout for all three is a silent wrong answer that only shows up at
+  ``d > 128`` and ``S > TILE_N`` (``mma-tma-matrix.md`` § 7).  The SF-order
+  S-sweep in ``test_block_mxfp8.py`` is the detector.
 * ``TILE_K_HW`` / idesc ``k_dim`` are **arch-opposite** for FP8: Blackwell wants
   ``k_dim=0`` at ``TILE_K_HW=32``, Rubin ``k_dim=1`` at 64. Read
   ``mma-tma-matrix.md`` § 1 before picking either.
@@ -151,7 +181,7 @@ PyTorch oracle and perf baseline:
 ``test/python/fe_api/gated_attention_block/reference.py``.
 
 Not in scope for v1, in the order they are likely to land: THD / varlen packing;
-MXFP8 (above; per-tensor FP8 is wired); the graph-API engine row. This is a frontend-only OSS API
+MXFP8 O / MXFP8 ``out_proj`` (D1: per-tensor); the graph-API engine row. This is a frontend-only OSS API
 first; a manifest family + ``Capabilities`` comes when the stages exist to be
 honest about.
 """
@@ -163,7 +193,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from cuda.bindings import driver as cuda
@@ -287,6 +317,7 @@ _QK_NORM_ROPE_ROWS_PER_GROUP = 2
 _QK_NORM_ROPE_DEFER_SECONDARY_LOADS = True  # keep in step with kernels/qk_norm_rope.py DEFAULT_DEFER_SECONDARY_LOADS
 _QK_NORM_ROPE_TILE_ROWS = 16  # keep in step with kernels/qk_norm_rope_tma.py DEFAULT_TILE_ROWS
 _QK_NORM_ROPE_STAGES = 2  # keep in step with kernels/qk_norm_rope_tma.py DEFAULT_STAGES
+_QUANTIZE_MXFP8_THREADS = 256  # keep in step with kernels/quantize_mxfp8.py DEFAULT_THREADS_PER_CTA (>= the 64 burst lanes of a 1 KiB SF tile)
 """Smallest GEMM ``TILE_N`` the block intends to support.
 
 Every ``qkvg`` block boundary must be a multiple of this so no output tile
@@ -343,6 +374,16 @@ class GatedAttentionBlockGeometry:
     causal_bottom_right: bool = False
     window_left: int = -1
     window_right: int = -1
+
+    # QK-RMSNorm on/off. False: RoPE-only Q/K -- no per-head RMSNorm, so no
+    # norm weights (the block takes None in their slots, both directions
+    # checked) and no rstd (SavedForBackward.rstd_q/rstd_k are None). The
+    # kernels fold the norm out at trace time (presence of the weight tensors,
+    # like want_rstd); the dims [rope_dim, d_head) are then a bit-exact copy.
+    # ``qk_norm_eps`` stays validated > 0 regardless (D10): the fused fork's
+    # own validator re-checks it after eligibility, and relaxing it here would
+    # leak a post-eligibility ValueError.
+    qk_norm: bool = True
 
     # -- derived scalars ----------------------------------------------------
 
@@ -457,6 +498,8 @@ class GatedAttentionBlockGeometry:
 
         if not self.qk_norm_eps > 0.0:
             raise ValueError(f"qk_norm_eps must be > 0, got {self.qk_norm_eps}")
+        if not self.qk_norm and self.rope_dim == 0:
+            raise ValueError("qk_norm=False with rope_dim=0 leaves stage (2)+(3) an identity copy; drop the stage instead")
         if self.attn_scale is not None and not self.attn_scale > 0.0:
             raise ValueError(f"attn_scale must be > 0 when given, got {self.attn_scale}")
 
@@ -657,6 +700,34 @@ class _Intermediates:
     o8: int = -1  # [T, H_q * D]
     # FULLY FUSED FP8 only (-1 otherwise): the fused projection's bf16 GATE.
     gate16: int = -1  # [T, H_q, D]  bf16, compact GATE
+    # MXFP8 pipelines only (-1 otherwise): the SDPA's F8_128x4 E8M0 scale-factor
+    # blobs for Q / K / V -- ``b * h * ceil(s/128) * (128 * d/32)`` bytes each
+    # (the adapter's ``_reshape_sf`` count; 1 KiB per (b, h, 128-row tile) at
+    # d=256).  Written by the quantize_mxfp8 stages (unfused) or by the MXFP8
+    # projection fork's epilogue (fully fused).
+    sf_q: int = -1
+    sf_k: int = -1
+    sf_v: int = -1
+
+
+_SF_TILE_ROWS = 128  # rows of one F8_128x4 scale-factor atom == the SDPA's Q / KV tile height (keep in step with kernels/quantize_mxfp8.py SF_TILE_ROWS)
+_SF_BLOCK = 32  # elements per E8M0 scale (MXFP8 block size)
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def _sf_slot_bytes(b: int, h: int, s: int, d: int) -> int:
+    """Bytes of ONE of the SDPA's F8_128x4 scale-factor blobs (Q, K or V) over ``[B, H, S, D]``.
+
+    ``B * H * ceil(S/128) * (128 * D/32)`` -- exactly the adapter's ``_reshape_sf``
+    count (``b*h*n_tiles*SF_SMEM_SIZE``, 1 KiB per tile at d=256) and the
+    ``kernels/quantize_mxfp8.py`` ``sf_bytes`` contract the quantize stages
+    write; Q/K (rowwise) and V (columnwise, D-plane-major) have the SAME byte
+    count, only the byte ORDER differs.  Derived, never a literal.
+    """
+    return b * h * _ceil_div(s, _SF_TILE_ROWS) * (_SF_TILE_ROWS * d // _SF_BLOCK)
 
 
 def _plan_workspace(
@@ -669,8 +740,13 @@ def _plan_workspace(
     inplace_qkv: bool = False,
     fp8: bool = False,
     fp8_fused: bool = False,
+    mxfp8: bool = False,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
+
+    ``mxfp8`` (appended) adds the three SDPA scale-factor blobs ``sf_q`` /
+    ``sf_k`` / ``sf_v`` (:func:`_sf_slot_bytes`) at the END of either layout, so
+    every FP8 offset is byte-identical to before MXFP8 existed.
 
     Reserved in the order the stages write them, so a future fusion that deletes
     one leaves a contiguous prefix rather than a hole — forking stage (1) to
@@ -702,6 +778,8 @@ def _plan_workspace(
             ("gate16", t * geom.h_q * geom.d_head * e),
             ("o8", t * geom.h_q * geom.d_head),
         ]
+        if mxfp8:
+            slots += _sf_slots(geom, b, s)
         for name, nbytes in slots:
             offsets[name] = off
             off += _align_up(nbytes)
@@ -721,6 +799,9 @@ def _plan_workspace(
             v8=offsets["v8"],
             o8=offsets["o8"],
             gate16=offsets["gate16"],
+            sf_q=offsets.get("sf_q", -1),
+            sf_k=offsets.get("sf_k", -1),
+            sf_v=offsets.get("sf_v", -1),
         )
     # IN-PLACE: Q and K are normed back over their own columns of `proj`, and V
     # is never moved, so the SDPA reads all three straight out of the slab at
@@ -753,6 +834,9 @@ def _plan_workspace(
     slots += [("o", t * geom.h_q * geom.d_head * e)]
     if fp8:
         slots += [("o8", t * geom.h_q * geom.d_head)]
+    if mxfp8:
+        # MXFP8: the SDPA's F8_128x4 SF blobs, written by the three quantize_mxfp8 stages.
+        slots += _sf_slots(geom, b, s)
     for name, nbytes in slots:
         offsets[name] = off
         off += _align_up(nbytes)
@@ -772,7 +856,19 @@ def _plan_workspace(
         k8=offsets.get("k8", -1),
         v8=offsets.get("v8", -1),
         o8=offsets.get("o8", -1),
+        sf_q=offsets.get("sf_q", -1),
+        sf_k=offsets.get("sf_k", -1),
+        sf_v=offsets.get("sf_v", -1),
     )
+
+
+def _sf_slots(geom: GatedAttentionBlockGeometry, b: int, s: int) -> list:
+    """The three MXFP8 SDPA scale-factor slots, in (Q, K, V) order."""
+    return [
+        ("sf_q", _sf_slot_bytes(b, geom.h_q, s, geom.d_head)),
+        ("sf_k", _sf_slot_bytes(b, geom.h_kv, s, geom.d_head)),
+        ("sf_v", _sf_slot_bytes(b, geom.h_kv, s, geom.d_head)),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +895,7 @@ class SavedForBackward:
                                                  needs O too
     ``lse``       [B,H_q,S] fp32    134 MiB      SDPA bwd cannot run without it
     ``rstd_q``    [B,S,H_q] fp32    134 MiB      RMSNorm bwd; tiny, always save
+                                                 (None iff geometry.qk_norm is False)
     ``rstd_k``    [B,S,H_kv] fp32   8 MiB        idem
     ``q_pre``     [B,S,H_q,D]       16 GiB       pre-norm Q -- SAVE or RECOMPUTE
     ``k_pre``     [B,S,H_kv,D]      1 GiB        idem
@@ -822,17 +919,50 @@ class SavedForBackward:
     already holds rather than storing a third 16 GiB copy.
 
     A field left ``None`` means "recompute me", and the backward decides how
-    from :class:`~cudnn.gated_attention_block.api_bwd.RecomputePolicy`.
+    from :class:`~cudnn.gated_attention_block.api_bwd.RecomputePolicy` --
+    EXCEPT ``rstd_q`` / ``rstd_k``, which are ``None`` iff
+    ``geometry.qk_norm`` is False: there is no RMSNorm, stage (B6) does not
+    exist, and nothing could recompute them. The forward REQUIRES them to be
+    ``None`` in that case (and tensors otherwise), both directions typed.
     """
 
     h: torch.Tensor
     gate: torch.Tensor
     o: torch.Tensor
     lse: torch.Tensor
-    rstd_q: torch.Tensor
-    rstd_k: torch.Tensor
+    rstd_q: Optional[torch.Tensor]  # None iff geometry.qk_norm is False (positional slot kept: append-only)
+    rstd_k: Optional[torch.Tensor]  # idem
     q_pre: Optional[torch.Tensor] = None
     k_pre: Optional[torch.Tensor] = None
+
+
+def _check_norm_weights_agree(qk_norm: bool, w_q_norm, w_k_norm, *, prefix: str = "") -> None:
+    """``geometry.qk_norm`` and the two norm-weight slots must agree, BOTH ways.
+
+    Typed ``ValueError`` naming the knob. Load-bearing rather than cosmetic:
+    ``APIBase._make_tensor_desc(None)`` and ``_check_tensor_shape(None)`` both
+    return ``None`` SILENTLY, so a norm-on block declared with ``None`` weights
+    would sail through declaration and die in ``check_support``'s dtype loop with
+    an untyped ``AttributeError`` -- or, worse, hand the kernel a null weight
+    pointer. Called at declaration (``sample_*``) and again at every ``execute``.
+    """
+    have_q, have_k = w_q_norm is not None, w_k_norm is not None
+    q_nm, k_nm = f"{prefix}w_q_norm", f"{prefix}w_k_norm"
+    if have_q != have_k:
+        raise ValueError(
+            f"{q_nm} and {k_nm} must be given together or both be None (geometry.qk_norm={qk_norm}); "
+            f"got {q_nm}={'tensor' if have_q else 'None'}, {k_nm}={'tensor' if have_k else 'None'}"
+        )
+    if qk_norm and not have_q:
+        raise ValueError(
+            f"geometry.qk_norm=True (QK-RMSNorm on) requires both [D] norm weights, but {q_nm} / {k_nm} are None. "
+            "Pass them, or declare GatedAttentionBlockGeometry(qk_norm=False) for RoPE-only Q/K."
+        )
+    if not qk_norm and have_q:
+        raise ValueError(
+            f"geometry.qk_norm=False (RoPE-only Q/K, no RMSNorm) takes no norm weights, but {q_nm} / {k_nm} were given. "
+            "Pass None for both, or declare GatedAttentionBlockGeometry(qk_norm=True)."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -903,6 +1033,93 @@ class QuantSpec:
 
 
 # ---------------------------------------------------------------------------
+# 4c. MXFP8 (E4M3 codes + per-32-block E8M0 scales, F8_128x4) — the MxQuantSpec contract
+# ---------------------------------------------------------------------------
+
+
+MXFP8_BLOCK_SIZE = 32
+_E8M0 = getattr(torch, "float8_e8m0fnu", None)
+_SF_DTYPES = tuple(t for t in (torch.uint8, _E8M0) if t is not None)
+
+
+@dataclass(frozen=True)
+class MxQuantSpec:
+    """MXFP8 pipeline: ``h`` / ``W_qkvg`` / Q / K / V carry per-32-block E8M0 scales
+    (cuDNN's F8_128x4 order), so only ``out_proj``'s per-tensor pair survives.
+
+    A SIBLING of :class:`QuantSpec`, not a flag on it (PR-B D3): five of
+    ``QuantSpec``'s seven floats are meaningless under block scales, and a
+    separate dataclass makes the illegal combinations unrepresentable while
+    leaving every FP8 caller byte-identical.  Passing an ``MxQuantSpec`` (with
+    e4m3 ``h`` / weights AND the two scale-factor blobs ``sample_h_sf`` /
+    ``sample_w_qkvg_sf``) selects the MXFP8 pipeline.
+
+    ============== ============================================================
+    ``descale_w_o``  dequant multiplier of the per-tensor FP8 ``W_o`` (D1: the
+                     out projection stays per-tensor FP8)
+    ``scale_o``      quant scale applied to the bf16 gated O before ``out_proj``
+                     (UNFUSED path).  On the FULLY FUSED path the production
+                     MXFP8 SDPA writes e4m3 O UNSCALED (its ABI has no
+                     ``scale_o``), so it MUST be 1.0 there -- D8, typed decline.
+    ``dtype``        the code dtype; only E4M3 is served (E5M2 declines typed)
+    ``block_size``   32 -- the MX block; anything else is a ``ValueError``
+    ============== ============================================================
+
+    ``h`` / ``W_qkvg`` arrive PRE-quantized by the caller (D2: static, offline,
+    like the weights' own scales -- the block runs no amax pass): e4m3 codes plus
+    ONE F8_128x4 E8M0 blob each, PADDED to whole 128-row x 4-block atoms --
+    ``kernels.proj_gemm.sf_blob_bytes(rows, d_model)`` bytes over ``rows = B*S``
+    (``h``) / ``n_qkvg`` (``W_qkvg``), pad rows / blocks ``0x00``.
+    ``descale_w_o * (1/scale_o)`` is ``alpha_o``, the out projection's epilogue.
+    """
+
+    descale_w_o: float
+    scale_o: float = 1.0
+    dtype: torch.dtype = torch.float8_e4m3fn
+    block_size: int = MXFP8_BLOCK_SIZE
+
+    def validate(self, *, fused: bool = False) -> None:
+        """Typed declines; ``fused=True`` adds the D8 unit-``scale_o`` rule of the fully fused path."""
+        if self.dtype != torch.float8_e4m3fn:
+            raise NotImplementedError(f"MxQuantSpec: only torch.float8_e4m3fn codes are served (E5M2 is a knob away), got {self.dtype}")
+        if int(self.block_size) != MXFP8_BLOCK_SIZE:
+            raise ValueError(f"MxQuantSpec.block_size must be {MXFP8_BLOCK_SIZE} (one E8M0 scale per 32-element MX block), got {self.block_size}")
+        for name in ("descale_w_o", "scale_o"):
+            v = float(getattr(self, name))
+            if not (v > 0.0) or v != v or v in (float("inf"),):
+                raise ValueError(f"MxQuantSpec.{name} must be a finite positive float, got {v}")
+        if fused and float(self.scale_o) != 1.0:
+            raise NotImplementedError(
+                f"MxQuantSpec.scale_o must be 1.0 on the FULLY FUSED MXFP8 path (got {self.scale_o}): the production MXFP8 SDPA writes "
+                "e4m3 O UNSCALED (its ABI has no per-tensor scale_o -- PR-B D8). Use scale_o=1.0, or the unfused pipeline."
+            )
+
+    @property
+    def alpha_o(self) -> float:
+        return (1.0 / self.scale_o) * self.descale_w_o
+
+
+def _check_sf_blob(sf: torch.Tensor, name: str, rows: int, k: int) -> None:
+    """A caller-supplied F8_128x4 E8M0 scale-factor blob: dtype, PADDED byte count
+    (``proj_gemm.sf_blob_bytes``), contiguity, 16-B alignment -- typed, before any kernel."""
+    from .kernels.proj_gemm import sf_blob_bytes, sf_padded_dims
+
+    if sf.dtype not in _SF_DTYPES:
+        raise ValueError(f"{name} must be uint8 or torch.float8_e8m0fnu (E8M0 bytes in F8_128x4 order), got {sf.dtype}")
+    need = sf_blob_bytes(rows, k)
+    if sf.numel() != need:
+        rows_pad, k4 = sf_padded_dims(rows, k)
+        raise ValueError(
+            f"{name} has {sf.numel()} bytes; the F8_128x4 blob over {rows} rows x K={k} is {need} = {rows_pad} (rows padded to 128) x {k4} "
+            f"(K/32 blocks padded to 4) -- whole 512-B atoms, pad rows / blocks 0x00 (kernels.proj_gemm.sf_blob_bytes)"
+        )
+    if not sf.is_contiguous():
+        raise ValueError(f"{name} must be contiguous (an opaque F8_128x4 byte blob bound by storage order)")
+    if sf.data_ptr() % 16:
+        raise ValueError(f"{name} must be 16-byte aligned (TMA-fed)")
+
+
+# ---------------------------------------------------------------------------
 # 5. Stages — one FROST kernel each, in pipeline order
 # ---------------------------------------------------------------------------
 
@@ -959,7 +1176,18 @@ class _Projection(_Stage):
     Stage (6) can never fuse into the SDPA: it contracts over all heads.
     """
 
-    def __init__(self, *, m: int, k: int, n: int, dtype: torch.dtype, name: str, out_dtype: Optional[torch.dtype] = None, alpha: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        m: int,
+        k: int,
+        n: int,
+        dtype: torch.dtype,
+        name: str,
+        out_dtype: Optional[torch.dtype] = None,
+        alpha: bool = False,
+        block_scale: bool = False,
+    ) -> None:
         self.name = name
         self.m = int(m)
         self.k = int(k)
@@ -969,6 +1197,10 @@ class _Projection(_Stage):
         # = descale_a * descale_w folded into the GEMM's scalar-multiply epilogue.
         self.out_dtype = out_dtype if out_dtype is not None else dtype
         self.alpha = bool(alpha)
+        # MXFP8: e4m3 codes + per-32-block E8M0 scale factors for A (over M) and W
+        # (over N), dequantized IN the MMA (`block_scale_dequantize`) -- no alpha.
+        # The caller hands the two F8_128x4 blobs to execute(sf_a=, sf_w=).
+        self.block_scale = bool(block_scale)
         self._plan = None
 
     def check_support(self) -> None:
@@ -978,11 +1210,20 @@ class _Projection(_Stage):
             raise NotImplementedError(f"{self.name}: FP8 needs K % 16 == 0 (TMA 16-byte rule at 1 B/elem), got K={self.k}")
         if self.out_dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError(f"{self.name}: output dtype must be bf16/f16, got {self.out_dtype}")
+        if self.block_scale:
+            if self.dtype != torch.float8_e4m3fn:
+                raise NotImplementedError(f"{self.name}: block_scale=True (MXFP8) needs e4m3 codes, got {self.dtype}")
+            if self.alpha:
+                raise ValueError(f"{self.name}: block_scale=True carries its descale in the E8M0 scale factors; alpha must be False")
+            if self.k % MXFP8_BLOCK_SIZE:
+                raise NotImplementedError(f"{self.name}: block_scale=True needs K % {MXFP8_BLOCK_SIZE} == 0 (one E8M0 scale per block), got K={self.k}")
 
     def compile(self) -> None:
         from .kernels.proj_gemm import build_proj_gemm
 
-        self._plan = build_proj_gemm(m=self.m, k=self.k, n=self.n, dtype=self.dtype, label=self.name, out_dtype=self.out_dtype, alpha=self.alpha)
+        self._plan = build_proj_gemm(
+            m=self.m, k=self.k, n=self.n, dtype=self.dtype, label=self.name, out_dtype=self.out_dtype, alpha=self.alpha, block_scale=self.block_scale
+        )
 
     def workspace_bytes(self) -> int:
         """Bytes the FROST GEMM needs. Its own, separate from the block's
@@ -996,22 +1237,47 @@ class _Projection(_Stage):
         return 2 * self.m * self.n * self.k
 
     def execute(
-        self, a: torch.Tensor, w: torch.Tensor, out: torch.Tensor, workspace: torch.Tensor, handle=None, alpha: Optional[torch.Tensor] = None, *, stream=None
+        self,
+        a: torch.Tensor,
+        w: torch.Tensor,
+        out: torch.Tensor,
+        workspace: torch.Tensor,
+        handle=None,
+        alpha: Optional[torch.Tensor] = None,
+        sf_a: Optional[torch.Tensor] = None,
+        sf_w: Optional[torch.Tensor] = None,
+        *,
+        stream=None,
     ) -> None:
-        """``stream`` is the block's launch stream (a raw ``CUstream`` int); the
+        """``sf_a`` / ``sf_w`` (block-scale plans only, both required): the PADDED
+        F8_128x4 E8M0 blobs of ``a`` (over its M rows) and ``w`` (over its N rows).
+        ``stream`` is the block's launch stream (a raw ``CUstream`` int); the
         runner carries it onto both GEMM routes -- see ``run_proj_gemm`` (Rule 5)."""
         from .kernels.proj_gemm import run_proj_gemm
 
         if self._plan is None:
             raise RuntimeError("call compile() before execute()")
-        run_proj_gemm(self._plan, a, w, out, workspace, handle, alpha=alpha, stream=stream)
+        if self.block_scale and (sf_a is None or sf_w is None):
+            raise ValueError(f"{self.name}: block_scale=True needs both scale-factor blobs (sf_a=, sf_w=); no silent unit scale (Rule 1)")
+        if not self.block_scale and (sf_a is not None or sf_w is not None):
+            raise ValueError(f"{self.name}: this projection has no block-scale dequant; refusing to drop sf_a / sf_w silently")
+        run_proj_gemm(self._plan, a, w, out, workspace, handle, alpha=alpha, sf_a=sf_a, sf_w=sf_w, stream=stream)
 
 
 def _qkv_gate_projection(
-    geom: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, out_dtype: Optional[torch.dtype] = None, alpha: bool = False
+    geom: GatedAttentionBlockGeometry,
+    *,
+    batch: int,
+    seq_len: int,
+    dtype: torch.dtype,
+    out_dtype: Optional[torch.dtype] = None,
+    alpha: bool = False,
+    block_scale: bool = False,
 ) -> _Projection:
     """Stage (1). At the 397B full-attention layer: ``M x 17408 x 4096``."""
-    return _Projection(m=batch * seq_len, k=geom.d_model, n=geom.n_qkvg, dtype=dtype, name="qkv_gate_proj", out_dtype=out_dtype, alpha=alpha)
+    return _Projection(
+        m=batch * seq_len, k=geom.d_model, n=geom.n_qkvg, dtype=dtype, name="qkv_gate_proj", out_dtype=out_dtype, alpha=alpha, block_scale=block_scale
+    )
 
 
 def _out_projection(
@@ -1069,6 +1335,70 @@ class _Quantize(_Stage):
         run_quantize(self._recipe, src, dst, scale, stream=stream)
 
 
+class _QuantizeMxfp8(_Stage):
+    """(3q, MXFP8) block quantize: bf16 ``[T, H, D]`` -> compact e4m3 ``[T, H, D]`` + an F8_128x4 E8M0 SF blob.
+
+    Kernel: ``kernels/quantize_mxfp8.py``.  ONE stage class, TWO arms selected by
+    ``axis`` -- ``"row"`` (Q / K: 32-element blocks along D, the BMM1 contraction;
+    SF tile ``(b, h, s_tile)`` = 1024 contiguous bytes) and ``"col"`` (V: blocks
+    along S, the BMM2 contraction; SF D-PLANE-MAJOR, plane stride
+    ``B*H*n_tiles*512``) -- the exact byte layouts the production MXFP8 SDPA's
+    ``_build_sf_desc`` reads (``mma-tma-matrix.md`` § 7).  The kernel writes EVERY
+    SF byte of every 128-row tile (pad rows -> ``0x00``), so a KV tail is served
+    exactly like the torch oracle pads it (D6).  The source may be a strided slab
+    column slice; the destination is compact, so for Q/K/V this stage IS the
+    compaction.  The fully fused MXFP8 pipeline folds all three into the
+    projection fork's epilogue and builds none of them.
+    """
+
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype_in: torch.dtype, heads: int, axis: str, name: str) -> None:
+        self.name = name
+        self.geom = geometry
+        self.batch = int(batch)
+        self.seq_len = int(seq_len)
+        self.dtype_in = dtype_in
+        self.heads = int(heads)
+        self.axis = str(axis)
+        self._recipe = None
+
+    def check_support(self) -> None:
+        from .kernels.quantize_mxfp8 import AXES, validate_shape
+
+        if self.axis not in AXES:
+            raise ValueError(f"{self.name}: axis must be one of {AXES} ('row' for Q/K, 'col' for V), got {self.axis!r}")
+        if self.dtype_in not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(f"{self.name}: the quantize source must be bf16/f16, got {self.dtype_in}")
+        validate_shape(self.geom.d_head, _QUANTIZE_MXFP8_THREADS, self.axis)
+
+    def compile(self) -> None:
+        from .kernels.quantize_mxfp8 import compile_quantize_mxfp8
+
+        self._recipe = compile_quantize_mxfp8(dtype_in=self.dtype_in, h=self.heads, d=self.geom.d_head, axis=self.axis, threads_per_cta=_QUANTIZE_MXFP8_THREADS)
+
+    def sf_bytes(self) -> int:
+        """Bytes of the SF blob this stage writes (== the SDPA adapter's ``_reshape_sf`` count)."""
+        return _sf_slot_bytes(self.batch, self.heads, self.seq_len, self.geom.d_head)
+
+    def moved_bytes(self) -> int:
+        """HBM traffic of one launch: 2 B in, 1 B code + 1/32 B SF out per element."""
+        from .kernels.quantize_mxfp8 import moved_bytes
+
+        return moved_bytes(self.batch * self.seq_len, self.heads, self.geom.d_head, src_elem_bytes=_itemsize(self.dtype_in))
+
+    def execute(
+        self, src: torch.Tensor, dst: torch.Tensor, sf: torch.Tensor, *, batch: Optional[int] = None, seq_len: Optional[int] = None, current_stream=None
+    ) -> None:
+        """``src`` ``[T, H, D]`` (strided ok), ``dst`` compact e4m3 ``[T, H, D]``, ``sf`` uint8 flat (``sf_bytes()`` bytes)."""
+        from .kernels.quantize_mxfp8 import run_quantize_mxfp8
+
+        if self._recipe is None:
+            raise RuntimeError("call compile() before execute()")
+        b = self.batch if batch is None else int(batch)
+        s = self.seq_len if seq_len is None else int(seq_len)
+        stream = current_stream if current_stream is not None else torch.cuda.current_stream(src.device).cuda_stream
+        run_quantize_mxfp8(self._recipe, src, dst, sf, batch=b, seq_len=s, stream=stream)
+
+
 class _FusedQkvProjection(_Stage):
     """(1)+(2)+(3) in ONE kernel: the QKV+GATE projection with per-head RMSNorm
     and partial RoPE applied to the Q and K tiles INSIDE the GEMM epilogue.
@@ -1112,12 +1442,29 @@ class _FusedQkvProjection(_Stage):
     materialised in :meth:`compile`, read in-kernel -- never module-param floats.
     Inference only (``want_rstd`` must be False).  Launched through
     ``run_fused_proj_gemm_fp8`` (the bf16 runner is not overloaded).
+
+    **MXFP8 arm (``quant`` is an :class:`MxQuantSpec`, e4m3 codes + F8_128x4 SF
+    blobs for ``h`` / ``W_qkvg``):** the THIRD rendering, the block-scale twin
+    ``kernels/proj_gemm_norm_rope_mxfp8.py`` (``NormRopeFusionParams.quant_mxfp8``;
+    PR-B section 3.1), whose epilogue norms / rotates the DEQUANTIZED fp32
+    accumulator (the E8M0 dequant happens in the MMA -- no alpha, no qscal) and
+    BLOCK-quantizes: Q / K rowwise along D, V columnwise along S, e4m3 codes into
+    compact ``q8`` / ``k8`` / ``v8`` and E8M0 scale factors into the SDPA's own
+    F8_128x4 blobs ``sf_q`` / ``sf_k`` / ``sf_v`` (Q/K per-tile contiguous, V
+    D-plane-major); GATE as bf16 ``gate16``.  Launched through
+    ``run_fused_proj_gemm_mxfp8`` (frozen ABI, plan 3.1).  Feature-detected on
+    the runner name + the fork file: until slice S6 lands the twin this arm is a
+    typed ``NotImplementedError`` at ``check_support``, never a silently
+    un-quantized path.  Declines ``S % 128 != 0 and B > 1`` (GEMM M-tiles
+    straddle sequences; the unfused path serves it).
     """
 
     name = "qkv_gate_proj_norm_rope"
     _TILE_N = 256  # the rendering's per-CTA output width; one head per tile needs d_head == this
     _SUBTILE_N = 32  # epilogue subtile; rope_dim must be a whole number of subtile PAIRS
     _FORK_PATH_FP8 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "proj_gemm_norm_rope_fp8.py")
+    _FORK_PATH_MXFP8 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "proj_gemm_norm_rope_mxfp8.py")
+    _MXFP8_RUNNER = "run_fused_proj_gemm_mxfp8"
 
     def __init__(
         self,
@@ -1128,10 +1475,12 @@ class _FusedQkvProjection(_Stage):
         dtype: torch.dtype,
         want_rstd: bool,
         norm_source: str = "ldg_early",
-        quant: Optional[QuantSpec] = None,
+        quant: Optional[Union[QuantSpec, MxQuantSpec]] = None,
         device=None,
     ) -> None:
         self.geom = geometry
+        self.batch = int(batch)
+        self.seq_len = int(seq_len)
         self.m = int(batch * seq_len)
         self.k = int(geometry.d_model)
         self.n = int(geometry.n_qkvg)
@@ -1140,6 +1489,9 @@ class _FusedQkvProjection(_Stage):
         self.norm_source = str(norm_source)
         # FP8: the QuantSpec whose alpha_qkvg / scale_q / scale_k / scale_v the
         # fork's epilogue applies; `device` is where `qscal` is materialised.
+        # MXFP8: an MxQuantSpec selects the block-scale twin (no scalars ride in).
+        if quant is not None and not isinstance(quant, (QuantSpec, MxQuantSpec)):
+            raise TypeError(f"{self.name}: quant must be a QuantSpec or an MxQuantSpec, got {type(quant).__name__}")
         self.quant = quant
         self.device = device
         self._plan = None
@@ -1147,7 +1499,13 @@ class _FusedQkvProjection(_Stage):
 
     @property
     def fp8(self) -> bool:
-        return self.quant is not None
+        """The per-tensor FP8 fork (a ``QuantSpec``)."""
+        return isinstance(self.quant, QuantSpec)
+
+    @property
+    def mxfp8(self) -> bool:
+        """The block-scale MXFP8 fork twin (an ``MxQuantSpec``)."""
+        return isinstance(self.quant, MxQuantSpec)
 
     def params(self):
         from .kernels.proj_gemm import NormRopeFusionParams
@@ -1158,8 +1516,40 @@ class _FusedQkvProjection(_Stage):
             # Only the FP8 arm names the field, so the bf16 compile key (and the
             # bf16 rendering's cache) is byte-identical to before the FP8 fork.
             kw["quant_fp8"] = True
+        if self.mxfp8:
+            # Same only-when-set idiom for the block-scale twin; a fork without
+            # the field is a typed decline, never a norm-only bf16 artifact.
+            if not self._fork_supports_field("quant_mxfp8"):
+                raise NotImplementedError(f"{self.name}: {self._mxfp8_fork_available()}")
+            kw["quant_mxfp8"] = True
+        if not g.qk_norm:
+            # Same only-when-set idiom: norm-on keys are spelled identically to
+            # today.  The field lands with the fork edits (PR-B slice S2); until
+            # then a RoPE-only fused projection is a typed decline, never a
+            # silently norm-ON artifact.
+            if not self._fork_supports_qk_norm():
+                raise NotImplementedError(self._qk_norm_off_unsupported_msg())
+            kw["qk_norm"] = False
         return NormRopeFusionParams(
             d_head=g.d_head, rope_dim=g.rope_dim, h_q=g.h_q, h_kv=g.h_kv, eps=g.qk_norm_eps, want_rstd=self.want_rstd, norm_source=self.norm_source, **kw
+        )
+
+    @staticmethod
+    def _fork_supports_qk_norm() -> bool:
+        """True once ``NormRopeFusionParams`` carries ``qk_norm`` (the GEMM forks'
+        RoPE-only epilogue, PR-B slice S2). Feature-detected so either landing
+        order works: this slice can ship before or after the fork edits."""
+        import dataclasses
+
+        from .kernels import proj_gemm
+
+        return "qk_norm" in {f.name for f in dataclasses.fields(proj_gemm.NormRopeFusionParams)}
+
+    def _qk_norm_off_unsupported_msg(self) -> str:
+        return (
+            f"{self.name}: geometry.qk_norm=False (RoPE-only Q/K) with fuse_norm_rope=True needs the GEMM forks' RoPE-only "
+            "epilogue (NormRopeFusionParams.qk_norm), which has not landed in this checkout. Use the unfused chain "
+            "(fuse_norm_rope=False) for qk_norm=False."
         )
 
     def _fp8_fork_available(self) -> Optional[str]:
@@ -1176,6 +1566,37 @@ class _FusedQkvProjection(_Stage):
             return "`run_fused_proj_gemm_fp8` still has the round-1 slab ABI (no `out_k8`): the compact q8/k8/v8 GEMM fork has not landed"
         if not os.path.exists(self._FORK_PATH_FP8):
             return f"{os.path.basename(self._FORK_PATH_FP8)} is not in kernels/"
+        return None
+
+    @staticmethod
+    def _fork_supports_field(field: str) -> bool:
+        import dataclasses
+
+        from .kernels import proj_gemm
+
+        return field in {f.name for f in dataclasses.fields(proj_gemm.NormRopeFusionParams)}
+
+    def _mxfp8_fork_available(self) -> Optional[str]:
+        """None when the MXFP8 fork twin + its runner ABI (plan 3.1) are present; else the reason they are not.
+
+        Feature-detected (the ``_fp8_fork_available`` idiom) so the block ships
+        before the twin: ``NormRopeFusionParams.quant_mxfp8``, the runner
+        ``run_fused_proj_gemm_mxfp8`` carrying the frozen SF-output ABI
+        (``out_sf_q`` / ``out_sf_k`` / ``out_sf_v``), and the fork file."""
+        import inspect
+
+        from .kernels import proj_gemm
+
+        if not self._fork_supports_field("quant_mxfp8"):
+            return "NormRopeFusionParams has no `quant_mxfp8` field"
+        fn = getattr(proj_gemm, self._MXFP8_RUNNER, None)
+        if fn is None:
+            return f"kernels/proj_gemm.py has no `{self._MXFP8_RUNNER}` (the MXFP8 GEMM fork twin, PR-B slice S6, has not landed)"
+        params = inspect.signature(fn).parameters
+        if not {"out_sf_q", "out_sf_k", "out_sf_v", "sf_a", "sf_w"} <= set(params):
+            return f"`{self._MXFP8_RUNNER}` does not carry the frozen PR-B 3.1 ABI (sf_a, sf_w, out_sf_q/k/v)"
+        if not os.path.exists(self._FORK_PATH_MXFP8):
+            return f"{os.path.basename(self._FORK_PATH_MXFP8)} is not in kernels/"
         return None
 
     @staticmethod
@@ -1207,6 +1628,13 @@ class _FusedQkvProjection(_Stage):
                 f"{self.name}: rope_dim must be a positive multiple of {2 * self._SUBTILE_N} and < d_head so each rotate_half pair "
                 f"spans whole epilogue subtiles; got rope_dim={g.rope_dim}"
             )
+        if not g.qk_norm:
+            # RoPE-only epilogue: no RMSNorm, so no rstd can be wanted, and the
+            # fork must know the knob (typed decline until slice S2 lands it).
+            if self.want_rstd:
+                raise ValueError(f"{self.name}: geometry.qk_norm=False computes no RMSNorm and emits no rstd; want_rstd must be False")
+            if not self._fork_supports_qk_norm():
+                raise NotImplementedError(self._qk_norm_off_unsupported_msg())
         if self.fp8:
             if self.dtype != torch.float8_e4m3fn:
                 raise NotImplementedError(f"{self.name}: the FP8 fork is rendered for e4m3 h / W_qkvg, got {self.dtype}")
@@ -1218,8 +1646,26 @@ class _FusedQkvProjection(_Stage):
             missing = self._fp8_fork_available()
             if missing is not None:
                 raise NotImplementedError(f"{self.name}: the FP8 fused projection fork has not landed in this checkout ({missing})")
+        elif self.mxfp8:
+            if self.dtype != torch.float8_e4m3fn:
+                raise NotImplementedError(f"{self.name}: the MXFP8 fork twin is rendered for e4m3 codes, got {self.dtype}")
+            if self.k % MXFP8_BLOCK_SIZE:
+                raise NotImplementedError(f"{self.name}: MXFP8 needs K % {MXFP8_BLOCK_SIZE} == 0 (one E8M0 scale per block), got K={self.k}")
+            if self.want_rstd:
+                raise NotImplementedError(f"{self.name}: the MXFP8 fork twin is inference-only (no rstd output)")
+            if self.seq_len % _SF_TILE_ROWS and self.batch > 1:
+                # The fork's SF stores are decoded from the flat GEMM row; a 128-row
+                # M-tile straddling two sequences would have to scatter its SF
+                # atom across two (b, s_tile) units.  v1 declines (plan 3.1 / Q9).
+                raise NotImplementedError(
+                    f"{self.name}: the fully fused MXFP8 pipeline needs S % {_SF_TILE_ROWS} == 0 when B > 1 (a GEMM M-tile must not straddle two "
+                    f"sequences' scale-factor tiles); got B={self.batch}, S={self.seq_len}. Use the unfused MXFP8 pipeline."
+                )
+            missing = self._mxfp8_fork_available()
+            if missing is not None:
+                raise NotImplementedError(f"{self.name}: the MXFP8 fused projection fork twin has not landed in this checkout ({missing})")
         elif self.dtype != torch.bfloat16:
-            raise NotImplementedError(f"{self.name}: the fork is rendered for bf16 only (e4m3 needs a QuantSpec), got {self.dtype}")
+            raise NotImplementedError(f"{self.name}: the fork is rendered for bf16 only (e4m3 needs a QuantSpec / MxQuantSpec), got {self.dtype}")
         validate_norm_rope_params(self.params())
         if torch.cuda.is_available():
             cc = tuple(torch.cuda.get_device_capability())
@@ -1229,6 +1675,9 @@ class _FusedQkvProjection(_Stage):
     def compile(self) -> None:
         from .kernels.proj_gemm import build_fused_proj_gemm
 
+        # params() itself declines qk_norm=False on a fork without the knob, so
+        # a compile() reached without check_support() cannot build a norm-ON
+        # artifact for a norm-OFF geometry.
         self._plan = build_fused_proj_gemm(self.params())
         if self.fp8:
             # Plan-time constant (contract § 10): the fork reads these four once
@@ -1245,13 +1694,19 @@ class _FusedQkvProjection(_Stage):
         return 2 * self.m * self.n * self.k
 
     def execute(self, a, w, out, w_q_norm, w_k_norm, cos, sin, rstd_q=None, rstd_k=None, *, stream) -> None:
-        """bf16 arm: ONE ``[M, N]`` slab out (Q/K columns normed + rotated)."""
+        """bf16 arm: ONE ``[M, N]`` slab out (Q/K columns normed + rotated).
+
+        ``w_q_norm`` / ``w_k_norm`` are ``None`` (both) under ``geometry.qk_norm=False``
+        and tensors otherwise -- checked here, both directions, before the runner."""
         from .kernels.proj_gemm import run_fused_proj_gemm
 
         if self._plan is None:
             raise RuntimeError("call compile() before execute()")
         if self.fp8:
             raise ValueError(f"{self.name}: this stage was declared FP8; use execute_fp8(...)")
+        if self.mxfp8:
+            raise ValueError(f"{self.name}: this stage was declared MXFP8; use execute_mxfp8(...)")
+        _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
         run_fused_proj_gemm(self._plan, a, w, out, w_q_norm, w_k_norm, cos, sin, rstd_q, rstd_k, stream=stream)
 
     def execute_fp8(self, a, w, out_q8, out_k8, out_v8, out_gate16, w_q_norm, w_k_norm, cos, sin, *, stream) -> None:
@@ -1273,10 +1728,51 @@ class _FusedQkvProjection(_Stage):
             raise RuntimeError("call compile() before execute_fp8()")
         if not self.fp8:
             raise ValueError(f"{self.name}: this stage was declared bf16; use execute(...)")
+        _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
         if not self._runner_writes_compact_qkv():
             # Never hand the round-1 slab runner three compact buffers positionally.
             raise NotImplementedError(f"{self.name}: {self._fp8_fork_available()}")
         run_fused_proj_gemm_fp8(self._plan, a, w, out_q8, out_k8, out_v8, out_gate16, w_q_norm, w_k_norm, cos, sin, self._qscal, stream=stream)
+
+    def execute_mxfp8(
+        self, a, sf_a, w, sf_w, out_q8, out_k8, out_v8, out_gate16, out_sf_q, out_sf_k, out_sf_v, w_q_norm, w_k_norm, cos, sin, *, stream
+    ) -> None:
+        """MXFP8 arm (frozen runner ABI, PR-B plan 3.1): e4m3 codes ``a [M, K]`` + its
+        F8_128x4 blob ``sf_a``, ``w [N_qkvg, K]`` + ``sf_w``; COMPACT e4m3 ``q8`` / ``k8`` /
+        ``v8`` + their SDPA F8_128x4 blobs ``sf_q`` / ``sf_k`` / ``sf_v`` (Q/K rowwise
+        per-(b, h, s_tile) 1024-B tiles; V columnwise D-plane-major) + bf16 ``gate16`` out.
+        ``batch`` / ``seq_len`` ride as keywords: the SF tiles are decoded per sequence."""
+        from .kernels import proj_gemm
+
+        if self._plan is None:
+            raise RuntimeError("call compile() before execute_mxfp8()")
+        if not self.mxfp8:
+            raise ValueError(f"{self.name}: this stage was not declared MXFP8; use execute(...) / execute_fp8(...)")
+        _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
+        missing = self._mxfp8_fork_available()
+        if missing is not None:
+            raise NotImplementedError(f"{self.name}: {missing}")
+        getattr(proj_gemm, self._MXFP8_RUNNER)(
+            self._plan,
+            a,
+            sf_a,
+            w,
+            sf_w,
+            out_q8,
+            out_k8,
+            out_v8,
+            out_gate16,
+            out_sf_q,
+            out_sf_k,
+            out_sf_v,
+            w_q_norm,
+            w_k_norm,
+            cos,
+            sin,
+            batch=self.batch,
+            seq_len=self.seq_len,
+            stream=stream,
+        )
 
 
 class _QkNormRope(_Stage):
@@ -1312,6 +1808,14 @@ class _QkNormRope(_Stage):
     Q/K may be updated IN PLACE (``q_out is q``): every lane reads its whole row
     before any lane stores, and the RoPE partner shuffle stays inside the row's
     own lane group.
+
+    **``geometry.qk_norm=False`` -- RoPE only.** Both kernels fold the RMSNorm
+    out at trace time (``compile_qk_norm_rope[_tma](apply_norm=False)``: the
+    weight slots are traced as ``None``, exactly the presence switch ``want_rstd``
+    uses), so there is no sum-of-squares pass, no rsqrt, no weight load and no
+    rstd; the dims ``[rope_dim, d_head)`` come out BIT-EXACT. The stage name and
+    position do not change (``"qk_norm_rope"`` stays in ``_stages``); ``execute``
+    takes ``None`` for both weights and refuses tensors, both directions typed.
 
     Kernel: ``kernels/qk_norm_rope.py`` — at ``kernels/`` level, not under an
     arch package, because it is plain vectorized LDG/STG with no tcgen05 and no
@@ -1433,6 +1937,14 @@ class _QkNormRope(_Stage):
     def check_support(self) -> None:
         if self.dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError(f"qk_norm_rope serves bf16/f16 only, got {self.dtype}")
+        g = self.geom
+        if not g.qk_norm:
+            # RoPE-only: nothing to norm, so nothing to emit an rstd from, and
+            # with no RoPE either the stage would be an identity copy.
+            if self.want_rstd:
+                raise ValueError(f"{self.name}: geometry.qk_norm=False computes no RMSNorm and emits no rstd; want_rstd must be False")
+            if g.rope_dim == 0:
+                raise ValueError(f"{self.name}: geometry.qk_norm=False with rope_dim=0 is an identity copy of Q/K; drop the stage instead")
         if self.resolve_impl() == "tma":
             from .kernels.qk_norm_rope_tma import validate_shape as _tma_validate
 
@@ -1460,6 +1972,7 @@ class _QkNormRope(_Stage):
                 tile_rows=self.resolve_tile_rows(),
                 stages=self.stages,
                 threads_per_cta=self.threads_per_cta,
+                apply_norm=g.qk_norm,
             )
             return
         from .kernels.qk_norm_rope import compile_qk_norm_rope
@@ -1478,6 +1991,7 @@ class _QkNormRope(_Stage):
             const_head_counts=self.const_head_counts,
             use_pdl=self.use_pdl,
             dynamic_token_stride=self.dynamic_token_stride,
+            apply_norm=g.qk_norm,
         )
 
     def moved_bytes(self) -> int:
@@ -1491,8 +2005,8 @@ class _QkNormRope(_Stage):
         self,
         q: torch.Tensor,  # [B, S, H_q,  D]
         k: torch.Tensor,  # [B, S, H_kv, D]
-        w_q_norm: torch.Tensor,  # [D]
-        w_k_norm: torch.Tensor,  # [D]
+        w_q_norm: Optional[torch.Tensor],  # [D]; None (both) iff geometry.qk_norm is False
+        w_k_norm: Optional[torch.Tensor],  # [D]
         cos: torch.Tensor,  # [B, S, ROPE_DIM]
         sin: torch.Tensor,  # [B, S, ROPE_DIM]
         q_out: Optional[torch.Tensor] = None,  # defaults to in place
@@ -1507,6 +2021,9 @@ class _QkNormRope(_Stage):
         ``.view()`` only — never ``reshape``: these buffers are compact by
         construction (§ 1), so a view is exact and a copy would be a silent
         extra kernel (Rule 1).
+
+        The norm weights must agree with ``geometry.qk_norm`` in both directions
+        (typed ``ValueError`` naming the knob) -- checked here, before the recipe.
         """
         from .kernels.qk_norm_rope import run_qk_norm_rope
         from .kernels.qk_norm_rope_tma import run_qk_norm_rope_tma
@@ -1514,6 +2031,7 @@ class _QkNormRope(_Stage):
         if self._recipe is None:
             raise RuntimeError("call compile() before execute()")
         g = self.geom
+        _check_norm_weights_agree(g.qk_norm, w_q_norm, w_k_norm)
         t = self.batch * self.seq_len
         stream = current_stream if current_stream is not None else torch.cuda.current_stream(q.device).cuda_stream
 
@@ -1612,6 +2130,18 @@ class _Sdpa(_Stage):
     TMA descriptor at the declared stride exactly as it does Q/K/V, so no copy
     happens anywhere -- and stage (5) disappears.
 
+    **MXFP8** (``mxfp8=True``, e4m3 codes + F8_128x4 E8M0 scale factors): the
+    SAME adapter with ``pertensor_fp8=False`` -> ``sm107/prefill_d256_mxfp8.py``
+    (the production block-scale kernel; the per-tensor fork machinery is gone,
+    so nothing can route block-scaled data into the per-tensor kernel).  The
+    three SF blobs ride ``execute(sf_q=, sf_k=, sf_v=)`` and are REQUIRED;
+    ``descale_q/k/v`` / ``scale_o`` are REFUSED (the adapter would silently
+    ignore them -- the E8M0 dequant is in-MMA and a gated e4m3 O is UNSCALED,
+    D8).  ``sched_policy`` is read off the MXFP8 row
+    (``engine_name(arch, mxfp8=True)``: NATURAL at (256, 256) -- the per-tensor
+    row's LPT claim does NOT transfer, D5) and ``cta_mma`` is left to the
+    adapter (1 for the quantized d256 flavor).  ``has_amax_o=False`` as under FP8.
+
     **FP8** (``dtype == e4m3``): ``pertensor_fp8=True``, ``dtype_o`` (bf16 on the
     unfused pipeline, e4m3 on the fully fused one) and ``has_amax_o=False`` --
     the block runs static per-tensor scales and never reads ``Amax_O``, so the
@@ -1662,6 +2192,7 @@ class _Sdpa(_Stage):
         gate_token_stride: int = 0,
         o_dtype: Optional[torch.dtype] = None,
         gate_dtype: Optional[torch.dtype] = None,
+        mxfp8: bool = False,
     ) -> None:
         # token_stride != 0 => Q/K/V are column slices of the fused projection
         # and are read in place at that stride (the adapter compiles its TMA
@@ -1669,9 +2200,13 @@ class _Sdpa(_Stage):
         self.token_stride = int(token_stride)
         # FP8 (dtype == e4m3): per-tensor descales (and scale_o) ride execute();
         # O comes out in `o_dtype` -- bf16 on the unfused pipeline, e4m3 on the
-        # fully fused one.
+        # fully fused one.  `fp8` = the fp8-CLASS dtype; `mxfp8` selects the
+        # block-scale kernel (pertensor_fp8=False), `pertensor` the scalar one.
         self.o_dtype = o_dtype if o_dtype is not None else dtype
         self.fp8 = dtype == torch.float8_e4m3fn
+        self.mxfp8 = bool(mxfp8)
+        if self.mxfp8 and not self.fp8:
+            raise ValueError(f"{self.name}: mxfp8=True needs e4m3 Q/K/V codes, got dtype={dtype}")
         # fuse_gate => the kernel's epilogue_gate specialization reads GATE (a
         # slab column slice at gate_token_stride; 0 = compact like O) in
         # `gate_dtype` -- the block's activation dtype; None = Q's dtype -- and
@@ -1697,7 +2232,9 @@ class _Sdpa(_Stage):
         ts = self.token_stride
         # has_amax_o=False: static scales, no Amax_O consumer -> the FP8 kernel
         # compiles the atomicMax out (and execute() refuses an amax_o tensor).
-        kw = dict(pertensor_fp8=True, dtype_o=self.o_dtype, has_amax_o=False) if self.fp8 else {}
+        # pertensor_fp8 picks the kernel FAMILY: True -> prefill_d256_fp8.py
+        # (scalar descales), False -> prefill_d256_mxfp8.py (block scales).
+        kw = dict(pertensor_fp8=self.pertensor, dtype_o=self.o_dtype, has_amax_o=False) if self.fp8 else {}
         if self.fuse_gate:
             # The gate descriptor selects the epilogue_gate specialization
             # (template_params().epilogue_gate); its stride is compiled in like
@@ -1719,9 +2256,23 @@ class _Sdpa(_Stage):
             **kw,
         )
 
+    @property
+    def pertensor(self) -> bool:
+        """The per-tensor FP8 kernel family (scalar descales); False for bf16 and for MXFP8."""
+        return self.fp8 and not self.mxfp8
+
+    @property
+    def _family(self) -> str:
+        return "MXFP8" if self.mxfp8 else "FP8" if self.fp8 else "f16/bf16"
+
     @classmethod
-    def _row_capabilities(cls, arch: str, fp8: bool):
+    def _row_capabilities(cls, arch: str, fp8: bool, mxfp8: bool = False):
         """The ``Capabilities`` of the SDPA-forward engine row for ``(arch, dtype family)``.
+
+        ``fp8`` names the per-tensor FP8 row, ``mxfp8`` the block-scale one
+        (``engine_name(arch, fp8=..., mxfp8=...)``); a caller passing the fp8-class
+        flag with ``mxfp8=True`` gets the MXFP8 row -- the two rows make DIFFERENT
+        claims (LPT, gate dtypes), so the family must never be conflated.
 
         A missing / renamed row is a typed decline, not a bare ``StopIteration``
         escaping ``check_support`` (engine-contract § 2): this sits on the decline
@@ -1729,7 +2280,7 @@ class _Sdpa(_Stage):
         """
         from cudnn.sdpa.fwd import engines
 
-        row = engines.engine_name(arch=arch, fp8=fp8)
+        row = engines.engine_name(arch=arch, fp8=bool(fp8) and not mxfp8, mxfp8=bool(mxfp8))
         caps = next((spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == row), None)
         if caps is None:
             raise NotImplementedError(f"{cls.name}: no SDPA forward engine row {row!r} in cudnn.sdpa.fwd.engines.ENGINE_SPECS")
@@ -1760,7 +2311,10 @@ class _Sdpa(_Stage):
 
         d = self.geom.d_head
         arch = "sm107" if compute_capability(ambient_device()) == (10, 7) else "sm100"
-        caps = self._row_capabilities(arch, self.fp8)
+        # MXFP8 reads the MXFP8 row (D5): at (256, 256) it claims NATURAL only --
+        # the per-tensor row's LPT does not transfer, and `sched_policy=None`
+        # would let the adapter's auto knobs pick LPT for a masked fp8-class d256.
+        caps = self._row_capabilities(arch, self.fp8, self.mxfp8)
         domain = dict(caps.sched_policies_by_d_shape).get((d, d), caps.sched_policies)
         return SCHED_LPT if SCHED_LPT in domain else SCHED_NATURAL
 
@@ -1782,10 +2336,10 @@ class _Sdpa(_Stage):
         with no ``epilogue_gate_dtypes`` reads GATE in Q's dtype.
         """
         g = self.geom
-        caps = self._row_capabilities("sm107", self.fp8)
+        caps = self._row_capabilities("sm107", self.fp8, self.mxfp8)
         if not caps.epilogue_gate:
             raise NotImplementedError(
-                f"{self.name}: fuse_gate=True is not served by the {'FP8' if self.fp8 else 'f16/bf16'} SM107 SDPA engine row. "
+                f"{self.name}: fuse_gate=True is not served by the {self._family} SM107 SDPA engine row. "
                 "Use fuse_gate=False (stage (5) runs as its own launch)"
             )
         shapes = caps.epilogue_gate_d_shapes
@@ -1811,7 +2365,7 @@ class _Sdpa(_Stage):
         if gate_dtype not in served:
             raise NotImplementedError(
                 f"{self.name}: fuse_gate=True reads GATE in {' / '.join(str(t) for t in served)} on the "
-                f"{'FP8' if self.fp8 else 'f16/bf16'} SM107 SDPA engine row; got gate_dtype={gate_dtype}. "
+                f"{self._family} SM107 SDPA engine row; got gate_dtype={gate_dtype}. "
                 "Pass gate_dtype= (the block's activation dtype) or use fuse_gate=False"
             )
 
@@ -1820,6 +2374,20 @@ class _Sdpa(_Stage):
         # block's own stages ahead of this one are cc-independent too).
         if self.fuse_gate:
             self._check_gate_geometry()
+        if self.mxfp8 and self.fuse_gate:
+            # The block-scale kernel is reached ONLY through the production
+            # adapter's `sample_gate` (PR-A / S7).  An adapter without it has no
+            # gated MXFP8 path at all -- decline rather than reach for any
+            # per-tensor fork, which cannot take block scales.
+            import inspect
+
+            from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+            if "sample_gate" not in inspect.signature(SdpaFwdDslSm100.__init__).parameters:
+                raise NotImplementedError(
+                    f"{self.name}: MXFP8 + fuse_gate needs the production adapter's `sample_gate` (the shared epilogue_gate hook); "
+                    "this checkout's SdpaFwdDslSm100 has none. Use fuse_gate=False."
+                )
         cc = torch.cuda.get_device_capability(self.device)
         if tuple(cc) != _SM107_CC:
             raise NotImplementedError(f"gated_attention_block targets Rubin (SM{_SM107_CC[0]}{_SM107_CC[1]}) only for now; found SM{cc[0]}{cc[1]}")
@@ -1861,6 +2429,9 @@ class _Sdpa(_Stage):
         descale_k: Optional[torch.Tensor] = None,
         descale_v: Optional[torch.Tensor] = None,
         scale_o: Optional[torch.Tensor] = None,  # FP8 with e4m3 O only: 1-element fp32 device tensor
+        sf_q: Optional[torch.Tensor] = None,  # MXFP8 only (all three REQUIRED): F8_128x4 E8M0 blobs, uint8, the adapter's _reshape_sf byte count
+        sf_k: Optional[torch.Tensor] = None,
+        sf_v: Optional[torch.Tensor] = None,
     ) -> None:
         """Hand the BSHD buffers over as BHSD views. No copy — see :func:`_bhsd_desc`.
 
@@ -1868,10 +2439,26 @@ class _Sdpa(_Stage):
         the gate ride as keyword arguments the adapter validates against the
         specialization it compiled (``gate`` <-> ``sample_gate``, ``amax_o``
         refused under ``has_amax_o=False``).
+
+        MXFP8 (``mxfp8=True``): ``sf_q`` / ``sf_k`` / ``sf_v`` are REQUIRED and
+        ``descale_q/k/v`` / ``scale_o`` are REFUSED -- the adapter's MXFP8 path
+        accepts and silently ignores the scalars (``_execute_mxfp8`` never reads
+        them), and a silently-ignored scale is a wrong answer nobody reports.
+        A non-MXFP8 stage refuses the SF blobs for the mirror-image reason.
         """
         if self._impl is None:
             raise RuntimeError("call compile() before execute()")
-        if self.fp8:
+        if self.mxfp8:
+            if sf_q is None or sf_k is None or sf_v is None:
+                raise ValueError(f"{self.name}: the MXFP8 SDPA needs sf_q/sf_k/sf_v (F8_128x4 E8M0 scale-factor blobs, uint8)")
+            if descale_q is not None or descale_k is not None or descale_v is not None or scale_o is not None:
+                raise ValueError(
+                    f"{self.name}: descale_q/k/v and scale_o are per-tensor FP8 scalars; the MXFP8 kernel dequantizes with its block "
+                    "scale factors in the MMA and writes an e4m3 O UNSCALED (the adapter would silently ignore them -- refused instead)"
+                )
+        elif sf_q is not None or sf_k is not None or sf_v is not None:
+            raise ValueError(f"{self.name}: sf_q/sf_k/sf_v are the MXFP8 scale-factor blobs; this stage was declared {self._family}")
+        if self.pertensor:
             if descale_q is None or descale_k is None or descale_v is None:
                 raise ValueError(f"{self.name}: the FP8 SDPA needs descale_q/k/v (1-element fp32 device tensors)")
             # The kernel folds scale_o into inv_sum REGARDLESS of O's dtype, so
@@ -1885,15 +2472,17 @@ class _Sdpa(_Stage):
             if scale_o is None and self.o_dtype == torch.float8_e4m3fn:
                 # A caller bug, not a case to paper over with a per-execute fill (Rule 1).
                 raise ValueError(f"{self.name}: an e4m3 O needs scale_o (1-element fp32 device tensor)")
-        elif descale_q is not None or descale_k is not None or descale_v is not None or scale_o is not None:
+        elif not self.mxfp8 and (descale_q is not None or descale_k is not None or descale_v is not None or scale_o is not None):
             raise ValueError(f"{self.name}: descales / scale_o are only consumed by the FP8 pipeline")
         if self.fuse_gate and gate is None:
             raise ValueError(f"{self.name}: fuse_gate=True requires the GATE tensor at execute")
         if not self.fuse_gate and gate is not None:
             raise ValueError(f"{self.name}: gate is only consumed under fuse_gate=True (the SDPA's epilogue gate); this stage was declared without it")
         kw = {}
-        if self.fp8:
+        if self.pertensor:
             kw.update(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o)
+        if self.mxfp8:
+            kw.update(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v)
         if self.fuse_gate:
             kw["gate"] = gate.transpose(1, 2)
         self._impl.execute(
@@ -2028,6 +2617,7 @@ class GatedAttentionBlockFwd(APIBase):
 
         (1) proj         h            -> PROJ [T, N]            FROST GEMM        | fuse_norm_rope: (1)+(2)+(3) in ONE
         (2+3) norm+rope  PROJ[Q],[K]  -> in place  (+rstd)      this block's kernel| launch (the GEMM fork's epilogue)
+                         geometry.qk_norm=False: RoPE only -- same stage, same launch, no norm weights (None), no rstd
         (3b) compact     PROJ[V]      -> V_c                    only when inplace_qkv=False
         (4) sdpa         PROJ[Q,K,V]  -> O  (+LSE)              FROST SDPA        | fuse_gate: (4)+(5) in ONE launch
         (5) gate         O, PROJ[G]   -> O in place             this block's kernel| (the SDPA's epilogue_gate)
@@ -2035,6 +2625,23 @@ class GatedAttentionBlockFwd(APIBase):
 
     Both fusions are inference-only: each overwrites a tensor the backward needs
     (``q_pre``/``k_pre``, pre-gate ``O``) and is declined with ``save_for_backward``.
+
+    **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
+    ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
+
+        (1)  proj          h8+sf_h, W8+sf_w -> PROJ [T, N] bf16   block-scale FROST GEMM (E8M0 dequant in-MMA, no alpha)
+        (2+3) norm+rope    in place                                this block's kernel
+        (3q) quantize x3   PROJ[Q]/[K] rowwise, PROJ[V] columnwise -> q8/k8/v8 + sf_q/sf_k/sf_v   kernels/quantize_mxfp8.py
+        (4)  sdpa          q8,k8,v8 + SF -> O bf16                 production prefill_d256_mxfp8.py (NATURAL, cga1)
+        (5)  gate          O, PROJ[G] -> O in place                this block's kernel
+        (5q) quantize_o    O -> o8 (PER-TENSOR scale_o, D1)        kernels/quantize.py
+        (6)  out_proj      o8 -> out (alpha_o = descale_w_o / scale_o)   per-tensor FP8 FROST GEMM
+
+    and FULLY FUSED (``fuse_norm_rope=True, fuse_gate=True``, 3 launches):
+    ``proj(+norm+rope+block-quant -> q8/k8/v8 + sf_q/k/v + gate16) -> sdpa(+gate, e4m3 O UNSCALED;
+    scale_o must be 1.0, D8) -> out_proj`` -- a typed decline while the MXFP8 GEMM fork twin
+    (``run_fused_proj_gemm_mxfp8``) has not landed.  Padding (``seq_lens_present``) is served under
+    FP8 and MXFP8 like bf16: a dead entry (``seq_lens[b] == 0``) yields ``out[b] == 0`` exactly.
 
     Stage (3b) exists only because stage (1) is the UNFORKED FROST GEMM, which
     writes one fused ``[T, N]``. Q and K are de-interleaved for FREE by (2+3),
@@ -2052,8 +2659,8 @@ class GatedAttentionBlockFwd(APIBase):
         self,
         sample_h: torch.Tensor,  # [B, S, d_model]
         sample_w_qkvg: torch.Tensor,  # [N, d_model], N = (2*H_q + 2*H_kv) * D
-        sample_w_q_norm: torch.Tensor,  # [D]
-        sample_w_k_norm: torch.Tensor,  # [D]
+        sample_w_q_norm: Optional[torch.Tensor],  # [D]; None (both) iff geometry.qk_norm is False -- same positions
+        sample_w_k_norm: Optional[torch.Tensor],  # [D]
         sample_cos: torch.Tensor,  # [B, S, ROPE_DIM] -- see "RoPE table contract"
         sample_sin: torch.Tensor,  # [B, S, ROPE_DIM]
         sample_w_o: torch.Tensor,  # [d_model, H_q * D]
@@ -2066,7 +2673,9 @@ class GatedAttentionBlockFwd(APIBase):
         inplace_qkv: Optional[bool] = None,  # None -> not save_for_backward
         fuse_norm_rope: bool = False,  # stages (2)+(3) inside stage (1)'s epilogue; needs inplace_qkv
         fuse_gate: bool = False,  # stage (5) inside stage (4)'s epilogue; inference only (no pre-gate O)
-        quant: Optional[QuantSpec] = None,  # FP8 (E4M3) pipeline with static per-tensor scales; None = bf16/f16
+        quant: Optional[Union[QuantSpec, MxQuantSpec]] = None,  # FP8 (E4M3) per-tensor static scales, or MXFP8 (MxQuantSpec); None = bf16/f16
+        sample_h_sf: Optional[torch.Tensor] = None,  # MXFP8 only: F8_128x4 E8M0 blob of h, proj_gemm.sf_blob_bytes(B*S, d_model) bytes (uint8 / e8m0)
+        sample_w_qkvg_sf: Optional[torch.Tensor] = None,  # MXFP8 only: F8_128x4 E8M0 blob of W_qkvg, sf_blob_bytes(n_qkvg, d_model) bytes
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -2076,14 +2685,34 @@ class GatedAttentionBlockFwd(APIBase):
         # FP8: `h` and both weights arrive as e4m3 with a QuantSpec; every
         # activation the block's own kernels touch (slab, O, out, cos/sin, norm
         # weights) is bf16 -- the "activation dtype".  bf16/f16: the two coincide.
+        # MXFP8: an MxQuantSpec instead, plus the two scale-factor blobs.
+        if quant is not None and not isinstance(quant, (QuantSpec, MxQuantSpec)):
+            raise TypeError(f"quant must be a QuantSpec (per-tensor FP8) or an MxQuantSpec (MXFP8), got {type(quant).__name__}")
         self.quant = quant
+        self.mxfp8 = isinstance(quant, MxQuantSpec)
         if (self.dtype == torch.float8_e4m3fn) != (quant is not None):
             raise ValueError(
-                "FP8 needs both halves: an e4m3 `h` AND a QuantSpec (static scales). "
+                "FP8 needs both halves: an e4m3 `h` AND a QuantSpec / MxQuantSpec (static scales). "
                 f"Got h.dtype={self.dtype}, quant={'set' if quant is not None else 'None'}."
             )
-        if quant is not None:
+        have_sf = sample_h_sf is not None or sample_w_qkvg_sf is not None
+        if self.mxfp8 != have_sf or (self.mxfp8 and (sample_h_sf is None or sample_w_qkvg_sf is None)):
+            raise ValueError(
+                "MXFP8 needs all three halves: e4m3 `h` / `W_qkvg` codes, an MxQuantSpec AND both F8_128x4 E8M0 scale-factor blobs "
+                f"(sample_h_sf, sample_w_qkvg_sf). Got quant={type(quant).__name__ if quant is not None else 'None'}, "
+                f"sample_h_sf={'tensor' if sample_h_sf is not None else 'None'}, sample_w_qkvg_sf={'tensor' if sample_w_qkvg_sf is not None else 'None'}."
+            )
+        if self.mxfp8:
+            # D8 rides the declaration: a fully fused MXFP8 block writes e4m3 O
+            # UNSCALED, so scale_o != 1.0 is refused HERE (typed), not silently dropped.
+            quant.validate(fused=bool(fuse_gate) and bool(fuse_norm_rope))
+        elif quant is not None:
             quant.validate()
+        # geometry.qk_norm vs the two weight slots, BOTH directions, at
+        # declaration (again at every execute).  A None sample would otherwise
+        # be swallowed by _make_tensor_desc and surface as an untyped
+        # AttributeError in check_support's dtype loop.
+        _check_norm_weights_agree(geometry.qk_norm, sample_w_q_norm, sample_w_k_norm, prefix="sample_")
         self.act_dtype = torch.bfloat16 if quant is not None else self.dtype
         if sample_h.ndim != 3:
             raise ValueError(f"sample_h must be [B, S, d_model], got {tuple(sample_h.shape)}")
@@ -2100,11 +2729,21 @@ class GatedAttentionBlockFwd(APIBase):
         # k_pre. Explicit True with save_for_backward RAISES rather than
         # silently costing the caller a tensor the backward cannot rebuild.
         self.inplace_qkv = (not self.save_for_backward) if inplace_qkv is None else bool(inplace_qkv)
+        # The two training guards are KEPT under qk_norm=False (D11): the
+        # SavedForBackward contract still writes q_pre/k_pre out of place and
+        # no block-level save_for_backward=True execute has validated a
+        # relaxation (PR-B plan § 6 Q10).  Only the REASON differs, so the
+        # message must not claim an RMSNorm backward that does not exist.
+        _why_pre = (
+            "norming in place destroys q_pre/k_pre, which the RMSNorm backward needs and cannot reconstruct (dividing out "
+            "the norm weight is undefined at a zero weight and hostile at a small one -- see SavedForBackward)"
+            if geometry.qk_norm
+            else "rotating in place overwrites q_pre/k_pre, which the SavedForBackward contract still hands the backward "
+            "out of place under qk_norm=False (RoPE-only; relaxing this needs a block-level training validation first)"
+        )
         if self.inplace_qkv and self.save_for_backward:
             raise ValueError(
-                "inplace_qkv=True is incompatible with save_for_backward=True: norming in place destroys q_pre/k_pre, "
-                "which the RMSNorm backward needs and cannot reconstruct (dividing out the norm weight is undefined at "
-                "a zero weight and hostile at a small one -- see SavedForBackward). Pass inplace_qkv=False, or recompute "
+                f"inplace_qkv=True is incompatible with save_for_backward=True: {_why_pre}. Pass inplace_qkv=False, or recompute "
                 "q_pre/k_pre from h by re-running the Q and K slices of the projection."
             )
 
@@ -2116,9 +2755,9 @@ class GatedAttentionBlockFwd(APIBase):
         self.fuse_norm_rope = bool(fuse_norm_rope)
         if self.fuse_norm_rope and not self.inplace_qkv:
             raise ValueError(
-                "fuse_norm_rope=True writes normed Q/K straight into the projection slab (the in-place layout) and never "
-                "materialises q_pre/k_pre, so it requires inplace_qkv=True and is incompatible with save_for_backward=True. "
-                "Pass fuse_norm_rope=False for training."
+                f"fuse_norm_rope=True writes {'normed' if geometry.qk_norm else 'rotated'} Q/K straight into the projection slab "
+                "(the in-place layout) and never materialises q_pre/k_pre, so it requires inplace_qkv=True and is incompatible "
+                "with save_for_backward=True. Pass fuse_norm_rope=False for training."
             )
 
         # FUSED GATE: the production d256 SDPA's epilogue_gate specialization
@@ -2127,30 +2766,29 @@ class GatedAttentionBlockFwd(APIBase):
         # O -- SavedForBackward), so training declines it here, the same way
         # inplace_qkv / fuse_norm_rope do.
         self.fuse_gate = bool(fuse_gate)
-        # FP8 serves exactly TWO configurations: UNFUSED (7 launches) and FULLY
-        # FUSED (3 launches: proj(+norm+rope+quant) -> sdpa(+gate, e4m3 O) ->
-        # out_proj).  Each half-fused combination would be its own
-        # specialization (bf16 O + a quantize pass, or a gate read from the
-        # bf16 slab) that nobody has validated -- declined, typed, naming both knobs.
+        # FP8 / MXFP8 serve exactly TWO configurations: UNFUSED (7 FP8 stages or
+        # 9 MXFP8 stages -- 9 kernel launches either way, the FP8 Q/K/V quantize
+        # stage being three launches) and FULLY FUSED (3 launches:
+        # proj(+norm+rope+quant) -> sdpa(+gate, e4m3 O) -> out_proj).  Each
+        # half-fused combination would be its own specialization (bf16 O + a
+        # quantize pass, or a gate read from the bf16 slab) that nobody has
+        # validated -- declined, typed, naming both knobs.
+        _family = "MXFP8" if self.mxfp8 else "FP8"
         if quant is not None and self.fuse_gate != self.fuse_norm_rope:
             raise NotImplementedError(
-                "the FP8 pipeline is either fully fused or unfused: fuse_norm_rope and fuse_gate must BOTH be True "
-                f"(3 launches) or BOTH be False (7 launches); got fuse_norm_rope={self.fuse_norm_rope}, fuse_gate={self.fuse_gate}"
+                f"the {_family} pipeline is either fully fused or unfused: fuse_norm_rope and fuse_gate must BOTH be True "
+                f"(3 launches) or BOTH be False ({'9' if self.mxfp8 else '7'} stages, 9 kernel launches); "
+                f"got fuse_norm_rope={self.fuse_norm_rope}, fuse_gate={self.fuse_gate}"
             )
         if quant is not None and self.save_for_backward:
-            raise NotImplementedError("the FP8 pipeline is inference-only for now (no q_pre/k_pre/pre-gate O contract under quantization)")
-        if quant is not None and self.seq_lens_present:
-            # KERNEL BUG, not a design choice: the Rubin per-tensor FP8 d256 SDPA
-            # (`sdpa/fwd/kernels/sm107/prefill_d256_fp8.py`) HANGS (exit 124) on a
-            # batch entry with seq_kv_lens == 0 -- first launch at S=1000, second
-            # launch at S=512; non-empty padding is fine; the bf16 sibling handles
-            # the identical case.  Repro: `frost_dev/probe_sdpa_fp8_d256.py
-            # --lsepad-dead`.  Declined here until the kernel's empty-mainloop path
-            # is fixed, because a hang is worse than a decline.
-            raise NotImplementedError(
-                "FP8 + seq_lens_present is declined: the Rubin FP8 d256 SDPA kernel hangs on an empty (seq_kv_lens == 0) batch entry "
-                "(frost_dev/probe_sdpa_fp8_d256.py --lsepad-dead). Use bf16 for padded batches until that kernel is fixed."
-            )
+            raise NotImplementedError(f"the {_family} pipeline is inference-only for now (no q_pre/k_pre/pre-gate O contract under quantization)")
+        # seq_lens_present (a dense padding mask, incl. an EMPTY entry) is SERVED
+        # under FP8 and MXFP8 since 2026-09-15.  The decline that used to sit here
+        # ("the Rubin FP8 d256 SDPA hangs on seq_kv_lens == 0") is retired: the
+        # rebased kernels pass 8/8 fresh processes at S=1000 and S=512 with a dead
+        # entry, and the MXFP8 d256 leading-zero-length-KV L0 test passes on Rubin.
+        # The block's own dead-entry oracle tests (test_block_fp8.py /
+        # test_block_mxfp8.py: seq_lens=[s, 0] -> out[1] == 0 EXACTLY) pin it.
         if self.fuse_gate and self.save_for_backward:
             raise ValueError(
                 "fuse_gate=True writes O_gated in place of O and never materialises the pre-gate O, which the backward's "
@@ -2166,48 +2804,76 @@ class GatedAttentionBlockFwd(APIBase):
             "sin": self._make_tensor_desc(sample_sin, name="sin"),
             "w_o": self._make_tensor_desc(sample_w_o, name="w_o"),
             "out": self._make_tensor_desc(sample_out, name="out"),
+            # MXFP8 only (None otherwise): the caller's F8_128x4 blobs, validated in check_support.
+            "h_sf": self._make_tensor_desc(sample_h_sf, name="h_sf"),
+            "w_qkvg_sf": self._make_tensor_desc(sample_w_qkvg_sf, name="w_qkvg_sf"),
         }
 
-        fp8 = quant is not None
-        # FULLY FUSED FP8: both knobs under a QuantSpec (the both-or-neither
-        # decline above makes `fp8 and fuse_gate` == `fp8 and fuse_norm_rope`).
-        self.fp8_fused = fp8 and self.fuse_gate and self.fuse_norm_rope
+        fp8 = quant is not None  # fp8-CLASS pipeline (per-tensor FP8 or MXFP8): e4m3 h / weights, bf16 activations
+        mxfp8 = self.mxfp8
+        # FULLY FUSED: both knobs under a quant spec (the both-or-neither decline
+        # above makes `fp8 and fuse_gate` == `fp8 and fuse_norm_rope`).
+        # `fp8_fused` names the per-tensor pipeline (test-visible, unchanged);
+        # `mxfp8_fused` the block-scale one; `quant_fused` either.
+        self.fp8_fused = fp8 and not mxfp8 and self.fuse_gate and self.fuse_norm_rope
+        self.mxfp8_fused = mxfp8 and self.fuse_gate and self.fuse_norm_rope
+        self.quant_fused = self.fp8_fused or self.mxfp8_fused
         act = self.act_dtype
-        self._quant_dev = None  # the QuantSpec as device scalars, materialised in compile()
+        self._quant_dev = None  # the QuantSpec / MxQuantSpec as device scalars, materialised in compile()
+        # rstd exists only where a norm exists: under qk_norm=False a training
+        # block saves lse / q_pre / k_pre but no rstd (SavedForBackward.rstd_*
+        # are None -- required, both directions, at execute).
+        want_rstd = self.save_for_backward and geometry.qk_norm
         if self.fuse_norm_rope:
             # bf16: writes the [T, N] slab.  FP8: the second rendering writes the
-            # compact e4m3 q8/k8/v8 + the bf16 gate16 buffer, quantizing in its epilogue.
+            # compact e4m3 q8/k8/v8 + the bf16 gate16 buffer, quantizing in its
+            # epilogue.  MXFP8: the block-scale twin (typed decline until S6 lands).
             self._proj = _FusedQkvProjection(
-                geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, want_rstd=self.save_for_backward, quant=quant, device=self.device
+                geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, want_rstd=want_rstd, quant=quant, device=self.device
             )
             self._norm_rope = None  # lives in the fused epilogue
         else:
             # FP8: e4m3 x e4m3 -> fp32 -> * (descale_h * descale_w_qkvg) -> bf16 slab.
-            self._proj = _qkv_gate_projection(geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, out_dtype=act, alpha=fp8)
-            self._norm_rope = _QkNormRope(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, want_rstd=self.save_for_backward)
+            # MXFP8: e4m3 x e4m3 with the E8M0 block scales dequantized IN the MMA -> bf16 slab (no alpha).
+            self._proj = _qkv_gate_projection(
+                geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, out_dtype=act, alpha=fp8 and not mxfp8, block_scale=mxfp8
+            )
+            self._norm_rope = _QkNormRope(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, want_rstd=want_rstd)
         # Stage (3b) exists ONLY to give the SDPA a compact V. In-place needs no
         # such thing, so the stage is not built at all rather than built and
         # skipped -- a stage that is never run should not be in `_stages`,
         # where it would still be compiled and still report support.  Under
-        # FP8 the quantize stages compact V (and Q, K) on the way to e4m3.
+        # FP8 / MXFP8 the quantize stages compact V (and Q, K) on the way to e4m3.
         self._compact_v = None if (self.inplace_qkv or fp8) else _VCompaction(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
         # (3q) UNFUSED FP8 only: bf16 slab slices -> compact e4m3 Q/K/V.  Two
         # recipes (h_q and h_kv); K and V share the h_kv one.  Fully fused FP8
         # quantizes in the projection fork's epilogue and builds none of them.
-        quantize = fp8 and not self.fp8_fused
-        self._quant_q = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, name="quantize_q") if quantize else None
-        self._quant_kv = (
-            _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_kv, name="quantize_kv") if quantize else None
-        )
-        if self.fp8_fused:
+        # (3q) UNFUSED MXFP8: THREE block-quantize stages -- Q and K ROWWISE
+        # (two recipes, h_q / h_kv), V COLUMNWISE (its own recipe: a different
+        # kernel arm AND a different SF byte order) -- each writing compact e4m3
+        # + the SDPA's F8_128x4 SF blob.
+        quantize = fp8 and not self.quant_fused
+        self._quant_q = self._quant_kv = self._quant_k = self._quant_v = None
+        if quantize and not mxfp8:
+            self._quant_q = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, name="quantize_q")
+            self._quant_kv = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_kv, name="quantize_kv")
+        elif quantize:
+            _mxq = lambda heads, axis, name: _QuantizeMxfp8(
+                geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=heads, axis=axis, name=name
+            )  # noqa: E731
+            self._quant_q = _mxq(geometry.h_q, "row", "quantize_mxfp8_q")
+            self._quant_k = _mxq(geometry.h_kv, "row", "quantize_mxfp8_k")
+            self._quant_v = _mxq(geometry.h_kv, "col", "quantize_mxfp8_v")
+        if self.quant_fused:
             # Q/K/V are the COMPACT e4m3 q8/k8/v8 the projection fork writes
-            # (token_stride 0 -- what the unfused FP8 SDPA reads too), the GATE
-            # is the compact bf16 gate16, O comes out e4m3 (o8).  The gated FP8
-            # SDPA specialization (epilogue_gate) is compiled at compact strides.
+            # (token_stride 0 -- what the unfused quantized SDPA reads too), the
+            # GATE is the compact bf16 gate16, O comes out e4m3 (o8).  The gated
+            # FP8 / MXFP8 SDPA specialization (epilogue_gate) is compiled at
+            # compact strides.
             sdpa_token_stride, sdpa_gate_token_stride, sdpa_o_dtype = 0, geometry.h_q * geometry.d_head, torch.float8_e4m3fn
         else:
-            # bf16: in-place reads the slab at its padded stride; FP8 unfused
-            # reads the compact e4m3 buffers.  GATE is always a slab column slice.
+            # bf16: in-place reads the slab at its padded stride; FP8 / MXFP8
+            # unfused read the compact e4m3 buffers.  GATE is always a slab column slice.
             sdpa_token_stride, sdpa_gate_token_stride, sdpa_o_dtype = (geometry.n_qkvg if self.inplace_qkv else 0) if not fp8 else 0, geometry.n_qkvg, act
         self._sdpa = _Sdpa(
             geometry,
@@ -2221,17 +2887,39 @@ class GatedAttentionBlockFwd(APIBase):
             fuse_gate=self.fuse_gate,
             gate_token_stride=sdpa_gate_token_stride,
             o_dtype=sdpa_o_dtype,
-            gate_dtype=act,  # gate16 / the slab's GATE columns are the activation dtype (bf16 under FP8)
+            gate_dtype=act,  # gate16 / the slab's GATE columns are the activation dtype (bf16 under FP8 / MXFP8)
+            mxfp8=mxfp8,  # pertensor_fp8=False -> the production block-scale kernel; NATURAL read off the MXFP8 row (D5)
         )
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
         self._gate = None if self.fuse_gate else _SigmoidGate(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
         # (5q) UNFUSED FP8 only: bf16 gated O -> compact e4m3 for the out
         # projection (same [T, H_q, D] shape as Q, so the Q recipe serves it).
-        self._quant_o = self._quant_q
+        # UNFUSED MXFP8: an EXPLICIT per-tensor recipe (D1) -- never the rowwise
+        # MX recipe, whose SF blob nothing downstream would read.
+        if quantize and mxfp8:
+            self._quant_o = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, name="quantize_o")
+        else:
+            self._quant_o = self._quant_q
         self._out_proj = _out_projection(geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, out_dtype=act, alpha=fp8)
+        # Stage order == pipeline order.  `_quant_o` is listed only where it is a
+        # DISTINCT stage (MXFP8); under FP8 it aliases `_quant_q`, listed once.
         self._stages = tuple(
-            st for st in (self._proj, self._norm_rope, self._compact_v, self._quant_q, self._quant_kv, self._sdpa, self._gate, self._out_proj) if st is not None
+            st
+            for st in (
+                self._proj,
+                self._norm_rope,
+                self._compact_v,
+                self._quant_q,
+                self._quant_kv,
+                self._quant_k,
+                self._quant_v,
+                self._sdpa,
+                self._gate,
+                self._quant_o if (quantize and mxfp8) else None,
+                self._out_proj,
+            )
+            if st is not None
         )
         self._ws = None
 
@@ -2251,7 +2939,12 @@ class GatedAttentionBlockFwd(APIBase):
         g = self.geom
         self._check_tensor_shape(self._descs["w_qkvg"], (g.n_qkvg, g.d_model), "w_qkvg")
         self._check_tensor_shape(self._descs["w_o"], (g.d_model, g.h_q * g.d_head), "w_o")
-        for nm in ("w_q_norm", "w_k_norm"):
+        # Under qk_norm=False the two norm-weight descriptors are None (the
+        # constructor checked both directions), so they are skipped here: the
+        # shape check would pass silently and the dtype loop would raise an
+        # untyped AttributeError.
+        norm_names = ("w_q_norm", "w_k_norm") if g.qk_norm else ()
+        for nm in norm_names:
             self._check_tensor_shape(self._descs[nm], (g.d_head,), nm)
         for nm in ("cos", "sin"):
             self._check_tensor_shape(self._descs[nm], (self.batch, self.seq_len, g.rope_dim), nm)
@@ -2261,13 +2954,55 @@ class GatedAttentionBlockFwd(APIBase):
         for nm in ("w_qkvg", "w_o"):
             if self._descs[nm].dtype != self.dtype:
                 raise ValueError(f"{nm} must have h's dtype {self.dtype}, got {self._descs[nm].dtype}")
-        for nm in ("w_q_norm", "w_k_norm", "cos", "sin", "out"):
+        for nm in norm_names + ("cos", "sin", "out"):
             if self._descs[nm].dtype != self.act_dtype:
                 raise ValueError(f"{nm} must be the activation dtype {self.act_dtype}, got {self._descs[nm].dtype}")
+        if self.mxfp8:
+            self._check_mxfp8_declaration()
         for st in self._stages:
             st.check_support()
         self._is_supported = True
         return True
+
+    def _check_mxfp8_declaration(self) -> None:
+        """The MXFP8 caller contract, typed, before any stage: whole SF atoms along
+        K (``d_model % 128``), and the two F8_128x4 blobs' dtype / PADDED byte count
+        / contiguity (``proj_gemm.sf_blob_bytes``).  16-B alignment needs a data
+        pointer, so it is checked on the real tensors at ``execute``."""
+        from .kernels.proj_gemm import sf_blob_bytes
+
+        g = self.geom
+        if g.d_model % _SF_TILE_ROWS:
+            # v1 contract: K = d_model in whole 128-element F8_128x4 atoms (4 blocks of
+            # 32), so `h_sf` / `w_qkvg_sf` carry no partially-used 4-block words and
+            # the quantizer / GEMM / oracle agree on every byte.  Rows (T, n_qkvg) ARE
+            # padded (sf_padded_dims); only the K axis is pinned.
+            raise NotImplementedError(
+                f"MXFP8 needs geometry.d_model % {_SF_TILE_ROWS} == 0 (whole F8_128x4 scale-factor atoms along the contraction: 4 blocks of "
+                f"{MXFP8_BLOCK_SIZE}); got d_model={g.d_model}. Use the per-tensor FP8 or bf16 pipeline for this width."
+            )
+        t = self.batch * self.seq_len
+        for nm, rows in (("h_sf", t), ("w_qkvg_sf", g.n_qkvg)):
+            d = self._descs[nm]
+            if d.dtype not in _SF_DTYPES:
+                raise ValueError(f"sample_{nm} must be uint8 or torch.float8_e8m0fnu (E8M0 bytes in F8_128x4 order), got {d.dtype}")
+            numel = 1
+            for x in d.shape:
+                numel *= int(x)
+            need = sf_blob_bytes(rows, g.d_model)
+            if numel != need:
+                raise ValueError(
+                    f"sample_{nm} has {numel} bytes; the PADDED F8_128x4 blob over {rows} rows x K={g.d_model} is {need} "
+                    f"(ceil(rows/128)*128 x ceil(K/32/4)*4 -- kernels.proj_gemm.sf_blob_bytes; pad rows / blocks 0x00)"
+                )
+            # Contiguity from the descriptor strides (an opaque blob bound by storage order).
+            expect, ok = 1, True
+            for size, stride in zip(reversed(d.shape), reversed(d.stride)):
+                if int(size) != 1 and int(stride) != expect:
+                    ok = False
+                expect *= int(size)
+            if not ok:
+                raise ValueError(f"sample_{nm} must be contiguous, got shape {tuple(d.shape)} strides {tuple(d.stride)}")
 
     # -- workspace ----------------------------------------------------------
 
@@ -2281,7 +3016,8 @@ class GatedAttentionBlockFwd(APIBase):
             self.save_for_backward,
             self.inplace_qkv,
             fp8=self.quant is not None,
-            fp8_fused=self.fp8_fused,
+            fp8_fused=self.quant_fused,
+            mxfp8=self.mxfp8,
         )
 
     def get_workspace_size(self) -> int:
@@ -2305,7 +3041,15 @@ class GatedAttentionBlockFwd(APIBase):
         for st in self._stages:
             st.compile()
         self._ws = self._layout()
-        if self.quant is not None:
+        if self.mxfp8:
+            # MXFP8: only the out projection's per-tensor pair survives (D1) --
+            # `alpha_o` for the GEMM epilogue, `scale_o` for the unfused quantize_o.
+            q = self.quant
+            self._quant_dev = dict(
+                alpha_o=torch.full((1,), float(q.alpha_o), dtype=torch.float32, device=self.device),
+                scale_o=torch.full((1,), float(q.scale_o), dtype=torch.float32, device=self.device),
+            )
+        elif self.quant is not None:
             # Plan-time constants (contract § 10 allows compile-time buffers; the
             # execute path never allocates): one fp32 device scalar per scale.
             q = self.quant
@@ -2331,8 +3075,8 @@ class GatedAttentionBlockFwd(APIBase):
         self,
         h: torch.Tensor,
         w_qkvg: torch.Tensor,
-        w_q_norm: torch.Tensor,
-        w_k_norm: torch.Tensor,
+        w_q_norm: Optional[torch.Tensor],  # [D]; None (both) iff geometry.qk_norm is False
+        w_k_norm: Optional[torch.Tensor],
         cos: torch.Tensor,
         sin: torch.Tensor,
         w_o: torch.Tensor,
@@ -2342,14 +3086,35 @@ class GatedAttentionBlockFwd(APIBase):
         lse: Optional[torch.Tensor] = None,
         saved: Optional[SavedForBackward] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        h_sf: Optional[torch.Tensor] = None,  # MXFP8 only (both REQUIRED): the F8_128x4 E8M0 blobs of h and W_qkvg (sample_* byte counts)
+        w_qkvg_sf: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the five stages in pipeline order.
 
         No allocation, no D2H read, no implicit conversion: every intermediate is
         a strided VIEW of the caller's workspace.
+
+        ``w_q_norm`` / ``w_k_norm`` must agree with ``geometry.qk_norm`` in both
+        directions (typed ``ValueError``), and so must ``saved.rstd_q`` /
+        ``saved.rstd_k`` under ``save_for_backward`` (tensors iff qk_norm).
+
+        ``h_sf`` / ``w_qkvg_sf`` (appended): REQUIRED under MXFP8 (both, checked
+        for dtype / byte count / contiguity / 16-B alignment, typed), REFUSED
+        otherwise.
         """
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
+        _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
+        if self.mxfp8:
+            if h_sf is None or w_qkvg_sf is None:
+                raise ValueError("MXFP8 execute needs both scale-factor blobs: h_sf (over B*S rows) and w_qkvg_sf (over n_qkvg rows); no silent unit scale")
+            _check_sf_blob(h_sf, "h_sf", self.batch * self.seq_len, self.geom.d_model)
+            _check_sf_blob(w_qkvg_sf, "w_qkvg_sf", self.geom.n_qkvg, self.geom.d_model)
+            for nm, sf in (("h_sf", h_sf), ("w_qkvg_sf", w_qkvg_sf)):
+                if sf.device != h.device:
+                    raise ValueError(f"{nm} must live on h's device {h.device}, got {sf.device}")
+        elif h_sf is not None or w_qkvg_sf is not None:
+            raise ValueError("h_sf / w_qkvg_sf are the MXFP8 scale-factor blobs; this block was declared without an MxQuantSpec")
         g = self.geom
         t = self.batch * self.seq_len
         # THE launch stream (Rule 5): the caller's ``current_stream``, else torch's
@@ -2369,9 +3134,13 @@ class GatedAttentionBlockFwd(APIBase):
             raise ValueError(f"workspace is {workspace.numel()} bytes, need {req}")
 
         fp8 = self.quant is not None
+        mxfp8 = self.mxfp8
         act = self.act_dtype
         if self.fp8_fused:
             self._execute_fp8_fused(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream)
+            return
+        if self.mxfp8_fused:
+            self._execute_mxfp8_fused(h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream)
             return
         proj = _view(workspace, ws.proj, (t, g.n_qkvg), act)
         # In-place: there ARE no compact Q/K/V buffers -- the SDPA reads the
@@ -2384,6 +3153,7 @@ class GatedAttentionBlockFwd(APIBase):
             v_c = _view(workspace, ws.v, (t, g.h_kv, g.d_head), act)
         o = _view(workspace, ws.o, (t, g.h_q, g.d_head), act)
         engine_ws = workspace[ws.engine_scratch :]
+        sfq = sfk = sfv = None
         if fp8:
             e4 = torch.float8_e4m3fn
             q8 = _view(workspace, ws.q8, (t, g.h_q, g.d_head), e4)
@@ -2391,6 +3161,11 @@ class GatedAttentionBlockFwd(APIBase):
             v8 = _view(workspace, ws.v8, (t, g.h_kv, g.d_head), e4)
             o8 = _view(workspace, ws.o8, (t, g.h_q, g.d_head), e4)
             qd = self._quant_dev
+        if mxfp8:
+            # The SDPA's own F8_128x4 SF blobs (flat uint8), written by the three quantize stages.
+            sfq = _view(workspace, ws.sf_q, (_sf_slot_bytes(self.batch, g.h_q, self.seq_len, g.d_head),), torch.uint8)
+            sfk = _view(workspace, ws.sf_k, (_sf_slot_bytes(self.batch, g.h_kv, self.seq_len, g.d_head),), torch.uint8)
+            sfv = _view(workspace, ws.sf_v, (_sf_slot_bytes(self.batch, g.h_kv, self.seq_len, g.d_head),), torch.uint8)
 
         o_q, o_g, o_k, o_v = g.qkvg_offsets
         # Column slices of the fused projection, as strided views. Every consumer
@@ -2404,6 +3179,14 @@ class GatedAttentionBlockFwd(APIBase):
         if self.save_for_backward:
             if saved is None:
                 raise ValueError("save_for_backward=True requires a SavedForBackward to write through")
+            if g.qk_norm:
+                if saved.rstd_q is None or saved.rstd_k is None:
+                    raise ValueError("save_for_backward=True with geometry.qk_norm=True needs SavedForBackward.rstd_q and rstd_k tensors to write through")
+            elif saved.rstd_q is not None or saved.rstd_k is not None:
+                raise ValueError(
+                    "geometry.qk_norm=False (RoPE-only) computes no RMSNorm and writes no rstd: SavedForBackward.rstd_q and rstd_k must be None "
+                    "(stage B6 does not exist)"
+                )
             rstd_q, rstd_k = saved.rstd_q, saved.rstd_k
 
         if self.fuse_norm_rope:
@@ -2423,15 +3206,31 @@ class GatedAttentionBlockFwd(APIBase):
                 stream=stream,
             )
         else:
-            # (1) [FP8: e4m3 x e4m3, epilogue * alpha_qkvg, bf16 slab]
-            self._proj.execute(h.view(t, g.d_model), w_qkvg, proj, engine_ws, alpha=qd["alpha_qkvg"] if fp8 else None, stream=stream)
-            # (2)+(3). q_out/k_out=None means IN PLACE, which is the stage's own
+            if mxfp8:
+                # (1) [MXFP8: e4m3 codes x e4m3 codes with the E8M0 block scales
+                # dequantized IN the MMA (block_scale_dequantize) -> bf16 slab; no alpha]
+                self._proj.execute(h.view(t, g.d_model), w_qkvg, proj, engine_ws, sf_a=h_sf, sf_w=w_qkvg_sf, stream=stream)
+            else:
+                # (1) [FP8: e4m3 x e4m3, epilogue * alpha_qkvg, bf16 slab]
+                self._proj.execute(h.view(t, g.d_model), w_qkvg, proj, engine_ws, alpha=qd["alpha_qkvg"] if fp8 else None, stream=stream)
+            # (2)+(3) -- on EVERY unfused pipeline (bf16 / FP8 / MXFP8; the S5 bring-up
+            # bisect caught an MXFP8 arm that skipped this call: GEMM exact, SDPA
+            # exact, end-to-end cos 0.73 -- the normed-Q/K comparison is the tell).
+            # q_out/k_out=None means IN PLACE, which is the stage's own
             # default and is safe by construction: every lane holds its whole [D]
             # row in registers before it stores, and no lane touches another's.
             self._norm_rope.execute(
                 q_src, k_src, w_q_norm, w_k_norm, cos, sin, q_out=q_c, k_out=k_c, rstd_q=rstd_q, rstd_k=rstd_k, current_stream=stream, flat=True
             )
-        if fp8:
+        if mxfp8:
+            # (3q) bf16 slab slices -> compact e4m3 + the SDPA's F8_128x4 SF blobs:
+            # Q / K ROWWISE (blocks along D), V COLUMNWISE (blocks along S,
+            # D-plane-major SF).  This IS the compaction the MXFP8 SDPA needs.
+            self._quant_q.execute(q_src, q8, sfq, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
+            self._quant_k.execute(k_src, k8, sfk, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
+            self._quant_v.execute(v_src, v8, sfv, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
+            q_c, k_c, v_c = q8, k8, v8
+        elif fp8:
             # (3q) bf16 slab slices -> compact e4m3.  This IS the compaction the
             # FP8 SDPA needs (its adapter path takes no declared slab strides).
             self._quant_q.execute(q_src, q8, qd["scale_q"], current_stream=stream)
@@ -2458,17 +3257,22 @@ class GatedAttentionBlockFwd(APIBase):
             workspace=engine_ws,
             current_stream=cuda.CUstream(stream),
             gate=gate_src.view(self.batch, self.seq_len, g.h_q, g.d_head) if self.fuse_gate else None,
-            descale_q=qd["descale_q"] if fp8 else None,
-            descale_k=qd["descale_k"] if fp8 else None,
-            descale_v=qd["descale_v"] if fp8 else None,
+            # per-tensor FP8: scalar descales; MXFP8: the three SF blobs (and NO scalars -- _Sdpa refuses them)
+            descale_q=qd["descale_q"] if (fp8 and not mxfp8) else None,
+            descale_k=qd["descale_k"] if (fp8 and not mxfp8) else None,
+            descale_v=qd["descale_v"] if (fp8 and not mxfp8) else None,
+            sf_q=sfq,
+            sf_k=sfk,
+            sf_v=sfv,
         )
         if not self.fuse_gate:
             # (5) -- gates the SUBSTITUTED O: the SDPA epilogue already selected
             # O := 0 on dead rows, so no residue reaches the sigmoid.
             self._gate.execute(o, gate_src, o, current_stream=stream)
         if fp8:
-            # (5q) bf16 gated O -> e4m3 for the FP8 out projection; (6) folds
-            # descale_o * descale_w_o into its epilogue.
+            # (5q) bf16 gated O -> e4m3 for the FP8 out projection (PER-TENSOR
+            # scale_o under both families, D1); (6) folds (1/scale_o) *
+            # descale_w_o into its epilogue.
             self._quant_o.execute(o, o8, qd["scale_o"], current_stream=stream)
             self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
         else:
@@ -2490,6 +3294,9 @@ class GatedAttentionBlockFwd(APIBase):
         the 2-D ``[T, h*d]`` views go to the GEMM runner, the ``[B, S, H, d]``
         views of the same bytes to the gated FP8 SDPA; nothing is strided,
         nothing is repacked (Rule 2).
+
+        ``w_q_norm`` / ``w_k_norm`` are ``None`` (both) under ``geometry.qk_norm=False``
+        -- already checked by ``execute``; the fork's runner receives them as-is.
         """
         g = self.geom
         b, s = self.batch, self.seq_len
@@ -2538,6 +3345,75 @@ class GatedAttentionBlockFwd(APIBase):
         # (6): e4m3 O_gated @ W_o^T with (1/scale_o) * descale_w_o in the epilogue.
         self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
 
+    def _execute_mxfp8_fused(self, h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream) -> None:
+        """The FULLY FUSED MXFP8 pipeline: three launches, eight workspace slots.
+
+        ::
+
+            (1'') proj+norm+rope+block-quant  h8+sf_h, W8+sf_w      -> q8 / k8 / v8 e4m3 (COMPACT) + sf_q / sf_k / sf_v (F8_128x4) + gate16 bf16
+            (4'') sdpa+gate                   q8, k8, v8, SF, gate16 -> o8 e4m3 UNSCALED (block scales dequant in-MMA; gate after the select)
+            (6)   out_proj                    o8                    -> out   (alpha_o = descale_w_o / 1.0)
+
+        Mirrors :meth:`_execute_fp8_fused` with the three SF slots added: the
+        fork's runner (``run_fused_proj_gemm_mxfp8``, frozen ABI) writes the
+        SDPA's own SF layouts (Q/K per-(b, h, s_tile) 1024-B tiles, V
+        D-plane-major), so the gated production MXFP8 SDPA reads exactly what
+        the unfused pipeline's quantize stages would have written.  No scalar
+        rides into the SDPA (``_Sdpa`` refuses ``descale_*`` / ``scale_o`` under
+        MXFP8); ``MxQuantSpec.scale_o == 1.0`` was pinned at declaration (D8).
+        """
+        g = self.geom
+        b, s = self.batch, self.seq_len
+        t = b * s
+        ws = self._ws
+        qd = self._quant_dev
+        e4 = torch.float8_e4m3fn
+        q8 = _view(workspace, ws.q8, (t, g.h_q, g.d_head), e4)
+        k8 = _view(workspace, ws.k8, (t, g.h_kv, g.d_head), e4)
+        v8 = _view(workspace, ws.v8, (t, g.h_kv, g.d_head), e4)
+        gate16 = _view(workspace, ws.gate16, (t, g.h_q, g.d_head), self.act_dtype)
+        o8 = _view(workspace, ws.o8, (t, g.h_q, g.d_head), e4)
+        sfq = _view(workspace, ws.sf_q, (_sf_slot_bytes(b, g.h_q, s, g.d_head),), torch.uint8)
+        sfk = _view(workspace, ws.sf_k, (_sf_slot_bytes(b, g.h_kv, s, g.d_head),), torch.uint8)
+        sfv = _view(workspace, ws.sf_v, (_sf_slot_bytes(b, g.h_kv, s, g.d_head),), torch.uint8)
+        engine_ws = workspace[ws.engine_scratch :]
+        # (1''): the runner takes the four data outputs 2-D ([T, h*d]) + the three SF blobs flat.
+        self._proj.execute_mxfp8(
+            h.view(t, g.d_model),
+            h_sf,
+            w_qkvg,
+            w_qkvg_sf,
+            q8.view(t, g.h_q * g.d_head),
+            k8.view(t, g.h_kv * g.d_head),
+            v8.view(t, g.h_kv * g.d_head),
+            gate16.view(t, g.h_q * g.d_head),
+            sfq,
+            sfk,
+            sfv,
+            w_q_norm,
+            w_k_norm,
+            cos,
+            sin,
+            stream=stream,
+        )
+        # (4''): e4m3 in (+ block scales), e4m3 out UNSCALED; the SDPA gates the
+        # SUBSTITUTED O (after the dead-row select, per element) and casts once.
+        self._sdpa.execute(
+            q8.view(b, s, g.h_q, g.d_head),
+            k8.view(b, s, g.h_kv, g.d_head),
+            v8.view(b, s, g.h_kv, g.d_head),
+            o8.view(b, s, g.h_q, g.d_head),
+            lse=lse,
+            seq_lens=seq_lens,
+            workspace=engine_ws,
+            gate=gate16.view(b, s, g.h_q, g.d_head),
+            sf_q=sfq,
+            sf_k=sfk,
+            sf_v=sfv,
+        )
+        # (6): e4m3 O_gated @ W_o^T with descale_w_o (scale_o == 1.0) in the epilogue.
+        self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
+
 
 # ---------------------------------------------------------------------------
 # 7. Convenience wrapper — allocates, then delegates
@@ -2547,8 +3423,8 @@ class GatedAttentionBlockFwd(APIBase):
 def gated_attention_block_forward(
     h: torch.Tensor,
     w_qkvg: torch.Tensor,
-    w_q_norm: torch.Tensor,
-    w_k_norm: torch.Tensor,
+    w_q_norm: Optional[torch.Tensor],  # None (both) iff geometry.qk_norm is False
+    w_k_norm: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
     w_o: torch.Tensor,

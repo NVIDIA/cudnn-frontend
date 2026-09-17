@@ -2063,7 +2063,10 @@ def _correction_warp_group(
                 # Exact: h = o * (inv_sum * 0.5) rounds to 0.5 * RN(o * inv_sum)
                 # because a power-of-two scale commutes with fp32 rounding (no
                 # subnormals at these magnitudes: inv_sum <= scale_o*descale_v
-                # since sum >= 1), and max is positively homogeneous, so
+                # since sum >= 1 -- an upper bound only; under HAS_SINK the sink
+                # can shrink inv_sum without limit, and the argument needs just
+                # the tile's max element to be a normal fp32), and max is
+                # positively homogeneous, so
                 # 2 * max|h| == max|u| bit-exactly.  The x2 and the dead-row
                 # select land ONCE per tile at corr_release (h is the
                 # UN-selected value, whose residue can be NaN on a dead row) --
@@ -2118,7 +2121,11 @@ def _correction_warp_group(
                 # padded-Q trim, whose rows are `_row_valid` under the dense
                 # `seqlen_q` yet must contribute 0 (their h is inv_sum=0 times
                 # a residue that can be NaN), exactly as their selected `_e`
-                # does on the ungated arm.  Folds out at EPILOGUE_GATE=0.
+                # does on the ungated arm.  cute.math.max lowers to maxnumf
+                # (NaN-ignoring), so a NaN h is dropped by the fold anyway; the
+                # select is what keeps the 1e-30 floor's residue*1e30 (finite
+                # or inf) of a bounds-empty lane out of the atomic.  Folds out
+                # at EPILOGUE_GATE=0.
                 _amax_o_local = cutlass.Float32(
                     arith.select(_kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), (_amax_o_local * cutlass.Float32(2.0)).ir_value())
                 )

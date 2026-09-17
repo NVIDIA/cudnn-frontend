@@ -13,6 +13,7 @@ these skip — and the skip is deliberate rather than a silent pass: a projectio
 measured on a backend plan would not be measuring FROST at all.
 """
 
+import dataclasses
 import os
 
 import pytest
@@ -26,7 +27,16 @@ pytestmark = pytest.mark.L0
 
 from cudnn.gated_attention_block import GatedAttentionBlockGeometry  # noqa: E402
 from cudnn.gated_attention_block.api import _FusedQkvProjection, _out_projection, _qkv_gate_projection  # noqa: E402
-from cudnn.gated_attention_block.kernels.proj_gemm import NormRopeFusionParams, build_proj_gemm, run_proj_gemm, validate_norm_rope_params  # noqa: E402
+from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
+    FusedProjGemmPlan,
+    NormRopeFusionParams,
+    build_fused_proj_gemm,
+    build_proj_gemm,
+    run_fused_proj_gemm,
+    run_fused_proj_gemm_fp8,
+    run_proj_gemm,
+    validate_norm_rope_params,
+)
 
 
 def _frost_gemm_unavailable() -> str | None:
@@ -180,7 +190,7 @@ import sys  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from reference import build_rope_tables, qk_norm_rope_reference  # noqa: E402
+from gated_block_reference import apply_partial_rope, build_rope_tables, qk_norm_rope_reference  # noqa: E402
 
 _SM107 = (10, 7)
 requires_rubin = pytest.mark.skipif(
@@ -221,25 +231,125 @@ def test_fusion_params_offsets_follow_the_layout_contract():
         validate_norm_rope_params(NormRopeFusionParams(norm_source="tma"))
 
 
+def test_qk_norm_knob_is_appended_and_validated():
+    """``qk_norm`` (then ``quant_mxfp8``) are APPENDED with defaults that spell every existing
+    key identically -- a norm-on render's template-loader cache key is unchanged.  Under
+    ``qk_norm=False`` there is no rstd to emit and no weight load to delete (``const_w`` has
+    no meaning; ``const_cs`` == ``const``); ``off`` and the FP8 fork stay legal."""
+    assert NormRopeFusionParams() == NormRopeFusionParams(qk_norm=True)
+    assert NormRopeFusionParams() == NormRopeFusionParams(qk_norm=True, quant_mxfp8=False)
+    names = [f.name for f in dataclasses.fields(NormRopeFusionParams)]
+    assert names[-3:] == ["quant_fp8", "qk_norm", "quant_mxfp8"], names  # the FROZEN order (PR-B section 1.5)
+    with pytest.raises(ValueError, match="want_rstd"):
+        validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, want_rstd=True))
+    with pytest.raises(ValueError, match="const_w"):
+        validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, norm_source="const_w", quant_fp8=True))
+    validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, norm_source="const_cs", quant_fp8=True))  # == const under norm-off
+    validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, norm_source="off"))  # bf16 control: legal
+    validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, quant_fp8=True))
+    validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, norm_source="const"))
+
+
+def test_quant_mxfp8_key_loads_the_twin_and_stays_exclusive():
+    """The MXFP8 twin (kernels/proj_gemm_norm_rope_mxfp8.py) is selected by ``quant_mxfp8`` and by
+    nothing else: its geometry rules hold, the two quant flags are exclusive, and an MXFP8 key
+    loads the TWIN's template -- never the bf16 rendering.  Import-time only (no cute compile):
+    the launch-level proofs live in test_proj_gemm_mxfp8.py."""
+    from cudnn.frost.template_loader import load_template
+    from cudnn.gated_attention_block.kernels import proj_gemm as _pg
+
+    with pytest.raises(ValueError, match="at most one"):
+        validate_norm_rope_params(NormRopeFusionParams(quant_fp8=True, quant_mxfp8=True))
+    with pytest.raises(ValueError, match="want_rstd"):
+        validate_norm_rope_params(NormRopeFusionParams(quant_mxfp8=True, want_rstd=True))
+    with pytest.raises(ValueError, match="off"):
+        validate_norm_rope_params(NormRopeFusionParams(quant_mxfp8=True, norm_source="off"))
+    validate_norm_rope_params(NormRopeFusionParams(quant_mxfp8=True))
+    validate_norm_rope_params(NormRopeFusionParams(quant_mxfp8=True, qk_norm=False))
+    assert os.path.basename(_pg._FUSED_TEMPLATE_MXFP8) == "proj_gemm_norm_rope_mxfp8.py" and os.path.exists(_pg._FUSED_TEMPLATE_MXFP8)
+    mod = load_template(_pg._FUSED_TEMPLATE_MXFP8, NormRopeFusionParams(quant_mxfp8=True), tag="proj_gemm_norm_rope_mxfp8_keycheck")
+    assert mod.PARAMS.quant_mxfp8 is True and mod.PARAMS.quant_fp8 is False
+
+
+def test_fused_runners_check_the_weights_against_the_artifact_before_launch():
+    """Norm weights present iff the params say ``qk_norm`` -- both directions, on the host, before
+    the (None) launch handle is touched: a mismatch would otherwise be a tvm-ffi ABI error."""
+    m, k, dt = 64, 128, torch.bfloat16
+    p_on = NormRopeFusionParams(d_head=256, rope_dim=64, h_q=4, h_kv=2)
+    p_off = NormRopeFusionParams(d_head=256, rope_dim=64, h_q=4, h_kv=2, qk_norm=False)
+    a, w, out = torch.zeros(m, k, dtype=dt), torch.zeros(p_on.n_qkvg, k, dtype=dt), torch.zeros(m, p_on.n_qkvg, dtype=dt)
+    cs = torch.zeros(m, 64, dtype=dt)
+    wd = torch.ones(256, dtype=dt)
+    plan_on = FusedProjGemmPlan(params=p_on, module=None, launch=None)
+    plan_off = FusedProjGemmPlan(params=p_off, module=None, launch=None)
+    with pytest.raises(ValueError, match="qk_norm=True"):
+        run_fused_proj_gemm(plan_on, a, w, out, None, None, cs, cs, stream=0)
+    with pytest.raises(ValueError, match="qk_norm=False"):
+        run_fused_proj_gemm(plan_off, a, w, out, wd, wd, cs, cs, stream=0)
+    with pytest.raises(ValueError, match="qk_norm=False"):
+        run_fused_proj_gemm(plan_off, a, w, out, None, wd, cs, cs, stream=0)  # one of the two: still a mismatch
+    # the FP8 runner shares the check (its tables are bf16 regardless of the e4m3 operands)
+    if _FP8 is not None:
+        p8_off = NormRopeFusionParams(**{**p_off.__dict__, "quant_fp8": True})
+        plan8 = FusedProjGemmPlan(params=p8_off, module=None, launch=None, fp8=True)
+        a8, w8 = torch.zeros(m, k, dtype=_FP8), torch.zeros(p_on.n_qkvg, k, dtype=_FP8)
+        outs = (
+            torch.zeros(m, p_on.n_q, dtype=_FP8),
+            torch.zeros(m, p_on.n_kv, dtype=_FP8),
+            torch.zeros(m, p_on.n_kv, dtype=_FP8),
+            torch.zeros(m, p_on.n_gate, dtype=dt),
+        )
+        with pytest.raises(ValueError, match="qk_norm=False"):
+            run_fused_proj_gemm_fp8(plan8, a8, w8, *outs, wd, wd, cs, cs, torch.zeros(4), stream=0)
+
+
+def _bf16_fork_params(geom=_FUSED_GEOM, **kw) -> NormRopeFusionParams:
+    return NormRopeFusionParams(d_head=geom.d_head, rope_dim=geom.rope_dim, h_q=geom.h_q, h_kv=geom.h_kv, eps=geom.qk_norm_eps, **kw)
+
+
 @requires_rubin
+@pytest.mark.parametrize("mode", ["norm", "rope_only", "rope_only_stage"])
 @pytest.mark.parametrize("m", [1000, 256])  # 1000: a tail tile (not a multiple of 256) + rows past M
-def test_fused_stage_matches_the_fp32_oracle(m):
-    """Q/K normed + rotated on the fp32 ACCUMULATOR with one rounding; GATE/V untouched; rstd exact."""
-    g = _FUSED_GEOM
+def test_fused_stage_matches_the_fp32_oracle(m, mode):
+    """Q/K normed + rotated on the fp32 ACCUMULATOR with one rounding; GATE/V untouched; rstd exact.
+
+    ``rope_only`` (``qk_norm=False``): the Q/K tiles are rotated only -- no pass A, no rsqrt,
+    no weight loads, no rstd; the weights are None at the ABI.  Its oracle is the fp32 GEMM +
+    partial RoPE with one rounding; its PROVABLE bitwise control is the same params at
+    ``norm_source='off'`` (the plain rendered GEMM): the passthrough dims ``[rope_dim, d)`` of
+    every Q/K head and every GATE / V cell are the raw accumulator rounded once in both, so
+    they must be ``torch.equal`` (NOT vs ``proj32.to(bf16)``: TF32 + another accumulation order).
+
+    ``rope_only`` drives the fork DIRECTLY (``build_fused_proj_gemm`` / ``run_fused_proj_gemm``:
+    the bitwise claim is about the kernel); ``rope_only_stage`` drives the SAME artifact through
+    the block's stage object on a ``qk_norm=False`` geometry -- ``_FusedQkvProjection.params()``
+    spelling ``qk_norm=False``, ``check_support`` admitting it, ``execute`` taking ``None``
+    weights -- i.e. the plumbing the block itself uses under ``fuse_norm_rope=True``.
+    """
+    qk_norm = mode == "norm"
+    g = _FUSED_GEOM if qk_norm else dataclasses.replace(_FUSED_GEOM, qk_norm=False)
     torch.manual_seed(0)
     dt = torch.bfloat16
-    st = _fused_stage(m=m)
-    st.check_support()
-    st.compile()
+    stream = torch.cuda.current_stream().cuda_stream
+    if mode != "rope_only":
+        st = _FusedQkvProjection(g, batch=1, seq_len=m, dtype=dt, want_rstd=qk_norm)
+        st.check_support()
+        st.compile()
+        launch = lambda out, rq, rk, wq, wk: st.execute(
+            h, w, out, wq, wk, cos, sin, rq if qk_norm else None, rk if qk_norm else None, stream=stream
+        )  # noqa: E731
+    else:
+        plan = build_fused_proj_gemm(_bf16_fork_params(g, qk_norm=False, want_rstd=False))
+        launch = lambda out, rq, rk, wq, wk: run_fused_proj_gemm(plan, h, w, out, wq, wk, cos, sin, None, None, stream=stream)  # noqa: E731
     h = (torch.randn(m, g.d_model, device="cuda") * 0.5).to(dt)
     w = (torch.randn(g.n_qkvg, g.d_model, device="cuda") * 0.02).to(dt)
-    wq = (1.0 + 0.1 * torch.randn(g.d_head, device="cuda")).to(dt)
-    wk = (1.0 + 0.1 * torch.randn(g.d_head, device="cuda")).to(dt)
+    wq = (1.0 + 0.1 * torch.randn(g.d_head, device="cuda")).to(dt) if qk_norm else None
+    wk = (1.0 + 0.1 * torch.randn(g.d_head, device="cuda")).to(dt) if qk_norm else None
     cos, sin = build_rope_tables(m, g.rope_dim, batch=1, device="cuda", dtype=dt)
     out = torch.full((m, g.n_qkvg), 1.5e30, device="cuda", dtype=dt)  # sentinel: a survivor is a never-written cell
     rq = torch.full((m, g.h_q), -1.0, device="cuda")
     rk = torch.full((m, g.h_kv), -1.0, device="cuda")
-    st.execute(h, w, out, wq, wk, cos, sin, rq, rk, stream=torch.cuda.current_stream().cuda_stream)
+    launch(out, rq, rk, wq, wk)
     torch.cuda.synchronize()
     assert not (out.float() == 1.5e30).any()
 
@@ -248,21 +358,39 @@ def test_fused_stage_matches_the_fp32_oracle(m):
     o_q, o_g, o_k, o_v = g.qkvg_offsets
     refr = {}
     for off, hh, wn in ((o_q, g.h_q, wq), (o_k, g.h_kv, wk)):
-        y, r = qk_norm_rope_reference(proj32[:, off : off + hh * g.d_head].view(1, m, hh, g.d_head), wn, cos, sin, g.rope_dim, g.qk_norm_eps)
+        x4 = proj32[:, off : off + hh * g.d_head].view(1, m, hh, g.d_head)
+        if qk_norm:
+            y, r = qk_norm_rope_reference(x4, wn, cos, sin, g.rope_dim, g.qk_norm_eps)
+            refr[off] = r.view(m, hh)
+        else:
+            y = apply_partial_rope(x4.float(), cos, sin, g.rope_dim).to(dt)
         ref[:, off : off + hh * g.d_head] = y.view(m, hh * g.d_head)
-        refr[off] = r.view(m, hh)
     for off, hh in ((o_q, g.h_q), (o_g, g.h_q), (o_k, g.h_kv), (o_v, g.h_kv)):
         got, exp = out[:, off : off + hh * g.d_head].float(), ref[:, off : off + hh * g.d_head].float()
         cos_sim = torch.nn.functional.cosine_similarity(got.flatten(), exp.flatten(), dim=0).item()
         assert cos_sim > 0.9999, f"block at col {off}: cos {cos_sim}"
         assert torch.isfinite(got).all()
-    torch.testing.assert_close(rq, refr[o_q], rtol=1e-4, atol=1e-5)
-    torch.testing.assert_close(rk, refr[o_k], rtol=1e-4, atol=1e-5)
+    if qk_norm:
+        torch.testing.assert_close(rq, refr[o_q], rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(rk, refr[o_k], rtol=1e-4, atol=1e-5)
     # two-launch trick: a first-launch race would show here
     out2 = torch.empty_like(out)
-    st.execute(h, w, out2, wq, wk, cos, sin, rq, rk, stream=torch.cuda.current_stream().cuda_stream)
+    launch(out2, rq, rk, wq, wk)
     torch.cuda.synchronize()
     torch.testing.assert_close(out2, out, rtol=0, atol=0)
+    if not qk_norm:
+        # the bitwise control: the plain rendered GEMM (norm_source='off') at the same params
+        ctrl = build_fused_proj_gemm(_bf16_fork_params(g, qk_norm=False, want_rstd=False, norm_source="off"))
+        out_off = torch.empty_like(out)
+        run_fused_proj_gemm(ctrl, h, w, out_off, None, None, cos, sin, None, None, stream=stream)
+        torch.cuda.synchronize()
+        assert torch.equal(out[:, o_g:o_k], out_off[:, o_g:o_k]), "GATE block differs from the plain GEMM under rope_only"
+        assert torch.equal(out[:, o_v:], out_off[:, o_v:]), "V block differs from the plain GEMM under rope_only"
+        for off, hh in ((o_q, g.h_q), (o_k, g.h_kv)):
+            got4 = out[:, off : off + hh * g.d_head].view(m, hh, g.d_head)
+            ctl4 = out_off[:, off : off + hh * g.d_head].view(m, hh, g.d_head)
+            assert torch.equal(got4[..., g.rope_dim :], ctl4[..., g.rope_dim :]), f"Q/K passthrough dims at col {off} differ from the plain GEMM"
+            assert not torch.equal(got4[..., : g.rope_dim], ctl4[..., : g.rope_dim]), "the rotated dims must NOT equal the un-rotated GEMM"
 
 
 # ---------------------------------------------------------------------------
@@ -378,8 +506,6 @@ def test_unsupported_dtype_message_names_fp8():
 # contract, quantized ONCE with torch's saturating e4m3 cast.
 # ---------------------------------------------------------------------------
 
-from cudnn.gated_attention_block.kernels.proj_gemm import FusedProjGemmPlan, build_fused_proj_gemm, run_fused_proj_gemm, run_fused_proj_gemm_fp8  # noqa: E402
-
 _E4M3_NAN_BYTE = 0x7F  # e4m3fn NaN; `cvt.rn.satfinite` never produces it, so a surviving byte is a never-written cell
 
 
@@ -418,6 +544,7 @@ def fp8_fused_oracle(a8, w8, wq, wk, cos, sin, p: NormRopeFusionParams, alpha: f
     ``rsqrt(mean(y^2) + eps)`` (== ``rsqrt(sum(acc^2) * alpha^2 / d + eps)``, the
     form the kernel folds), ``* w``, RoPE, ``e4m3_satfinite(x * scale)``; V:
     ``e4m3_satfinite(y * scale_v)``; GATE: ``y`` in fp32 (the test rounds to bf16).
+    ``p.qk_norm=False``: Q/K skip the norm (``rsqrt`` / ``w``) and are rotated only.
     Returns the e4m3 references in the fork's OUTPUT layout -- the COMPACT
     per-tensor ``q8 [m, h_q*d]`` / ``k8 [m, h_kv*d]`` / ``v8 [m, h_kv*d]`` (round 2:
     there is no ``[m, n_qkv]`` slab) -- plus the fp32 chain per class.
@@ -427,8 +554,12 @@ def fp8_fused_oracle(a8, w8, wq, wk, cos, sin, p: NormRopeFusionParams, alpha: f
     o_q, o_g, o_k, o_v = p.offsets
     y = torch.nn.functional.linear(a8.float(), w8.float()) * alpha
     cos3, sin3 = cos.reshape(1, m, r), sin.reshape(1, m, r)
-    qn, _ = qk_norm_rope_reference(y[:, o_q : o_q + p.h_q * d].view(1, m, p.h_q, d), wq, cos3, sin3, r, p.eps)
-    kn, _ = qk_norm_rope_reference(y[:, o_k : o_k + p.h_kv * d].view(1, m, p.h_kv, d), wk, cos3, sin3, r, p.eps)
+    q4, k4 = y[:, o_q : o_q + p.h_q * d].view(1, m, p.h_q, d), y[:, o_k : o_k + p.h_kv * d].view(1, m, p.h_kv, d)
+    if p.qk_norm:
+        qn, _ = qk_norm_rope_reference(q4, wq, cos3, sin3, r, p.eps)
+        kn, _ = qk_norm_rope_reference(k4, wk, cos3, sin3, r, p.eps)
+    else:  # RoPE only: the descaled accumulator rotated, no norm, no weights
+        qn, kn = apply_partial_rope(q4, cos3, sin3, r), apply_partial_rope(k4, cos3, sin3, r)
     qn, kn = qn.view(m, p.h_q * d), kn.view(m, p.h_kv * d)
     v32 = y[:, o_v : o_v + p.h_kv * d]
     q8 = (qn * scale_q).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8)
@@ -448,8 +579,9 @@ def fp8_fused_inputs(m: int, k: int, p: NormRopeFusionParams, seed: int = 0) -> 
     a8, dqa = _quant_e4m3(a32)
     w8, dqw = _quant_e4m3(w32)
     alpha = dqa * dqw
-    wq = (1.0 + 0.1 * torch.randn(p.d_head, device="cuda")).to(dt)
-    wk = (1.0 + 0.1 * torch.randn(p.d_head, device="cuda")).to(dt)
+    # qk_norm=False: no norm weights exist (the runner requires both None)
+    wq = (1.0 + 0.1 * torch.randn(p.d_head, device="cuda")).to(dt) if p.qk_norm else None
+    wk = (1.0 + 0.1 * torch.randn(p.d_head, device="cuda")).to(dt) if p.qk_norm else None
     cos, sin = build_rope_tables(m, p.rope_dim, batch=1, device="cuda", dtype=dt)
     cos2, sin2 = cos.reshape(m, p.rope_dim).contiguous(), sin.reshape(m, p.rope_dim).contiguous()
     pre = fp8_fused_oracle(a8, w8, wq, wk, cos2, sin2, p, alpha, 1.0, 1.0, 1.0)
@@ -519,8 +651,9 @@ def test_fused_runners_refuse_the_other_fork_before_touching_a_tensor():
 
 @requires_rubin
 @requires_fp8
+@pytest.mark.parametrize("qk_norm", [True, False], ids=["norm", "rope_only"])
 @pytest.mark.parametrize("m", [1000, 256])  # 1000: a tail tile (not a multiple of 256) + rows past M, clipped by TMA on all FOUR outputs
-def test_fused_fp8_stage_matches_the_e4m3_oracle(m):
+def test_fused_fp8_stage_matches_the_e4m3_oracle(m, qk_norm):
     """Q/K normed + rotated on the fp32 accumulator and quantized ONCE; V descaled +
     quantized; GATE bf16(alpha * acc) -- each against the contract's fp32 chain,
     each landing in its OWN compact tensor (q8 / k8 / v8 / gate16, round 2).
@@ -529,9 +662,12 @@ def test_fused_fp8_stage_matches_the_e4m3_oracle(m):
     bit-equal, the rest within ONE e4m3 ulp (fp32 reassociation flips midpoints).
     The NaN-byte sentinel proves every cell of all four outputs was written --
     which is also the check that each descriptor's own-width OOB clip is right.
+
+    ``rope_only`` (``qk_norm=False``): the Q/K per-row multiplier is ``alpha * scale``
+    (the V arm's form), no pass A / rsqrt / weight loads; the weights are None.
     """
     g = _FUSED_GEOM
-    p = _fused_fp8_params(g)
+    p = _fused_fp8_params(g, qk_norm=qk_norm)
     plan = build_fused_proj_gemm(p)
     assert plan.fp8
     inp = fp8_fused_inputs(m, g.d_model, p)

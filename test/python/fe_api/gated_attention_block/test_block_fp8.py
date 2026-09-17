@@ -11,8 +11,9 @@ rounds once per output) and the FP8 SDPA's fp8 cast of P (not replicated --
 that is why the gate is a cosine, as in the FROST FP8 SDPA suite's d256
 tolerance).
 
-Two FP8 configurations exist and both are covered here: UNFUSED (7 launches)
-and FULLY FUSED (``fuse_norm_rope=True, fuse_gate=True``, 3 launches: the
+Two FP8 configurations exist and both are covered here: UNFUSED (7 stages = 9
+kernel launches; the Q/K/V quantize stage is three launches) and FULLY FUSED
+(``fuse_norm_rope=True, fuse_gate=True``, 3 launches: the
 projection fork quantizes Q/K/V in its epilogue into COMPACT per-tensor
 ``q8`` / ``k8`` / ``v8`` -- round 2; round 1's single strided slab is gone --
 the production FP8 d256 SDPA reads them compact, gates in its ``epilogue_gate``
@@ -20,6 +21,10 @@ and writes e4m3 O).  They are NOT bit-identical by design; each is scored
 against its own oracle variant, never against the other bitwise.  The fully
 fused tests SKIP (with the reason) while the FP8 projection fork -- or the
 round-2 runner ABI (``out_k8``) -- has not landed.
+
+Padding (``seq_lens_present``) is SERVED under FP8 since 2026-09-15 (the Rubin FP8
+d256 SDPA's empty-KV-entry hang is gone); the dead-entry test asserts ``out[dead]``
+is EXACTLY zero on both pipelines, the same contract the bf16 block is held to.
 """
 
 import os
@@ -37,7 +42,7 @@ from cudnn.gated_attention_block.api import QuantSpec  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from reference import (  # noqa: E402
+from gated_block_reference import (  # noqa: E402
     RefGeometry,
     amax_scale,
     dequant_e4m3,
@@ -52,6 +57,17 @@ _SM107 = (10, 7)
 E4M3 = torch.float8_e4m3fn
 FMAX = 448.0
 _SENTINEL = 1.5e30  # a finite magnitude no correct output cell can hold; survivors localize an unwritten region
+# qk_norm arms: RoPE-only Q/K (None norm weights, no rstd) rides the SAME FP8 pipelines.
+_QK_NORM = pytest.mark.parametrize("qk_norm", [True, False], ids=["norm", "rope_only"])
+
+
+def _fork_supports_qk_norm() -> bool:
+    """True once ``NormRopeFusionParams.qk_norm`` exists (PR-B slice S2); until then the
+    fully fused block declines ``qk_norm=False`` with a typed NotImplementedError."""
+    from cudnn.gated_attention_block.api import _FusedQkvProjection
+
+    return _FusedQkvProjection._fork_supports_qk_norm()
+
 
 # The FP8 projection fork + the runner ABI the fully fused block needs.  Its
 # absence is a SKIP with the reason, not an error: this file lands with the
@@ -119,6 +135,7 @@ def _ref_geom(geom: GatedAttentionBlockGeometry) -> RefGeometry:
         qk_norm_eps=geom.qk_norm_eps,
         attn_scale=geom.attn_scale,
         is_causal=geom.is_causal,
+        qk_norm=geom.qk_norm,
     )
 
 
@@ -155,8 +172,8 @@ def _calibrated_spec(inp, desc, geom: GatedAttentionBlockGeometry, batch, seq_le
     q = proj[:, o_q : o_q + geom.h_q * geom.d_head].reshape(batch, seq_len, geom.h_q, geom.d_head)
     k = proj[:, o_k : o_k + geom.h_kv * geom.d_head].reshape(batch, seq_len, geom.h_kv, geom.d_head)
     v = proj[:, o_v : o_v + geom.h_kv * geom.d_head]
-    qn, _ = qk_norm_rope_reference(q, inp["w_q_norm"], inp["cos"], inp["sin"], geom.rope_dim, geom.qk_norm_eps)
-    kn, _ = qk_norm_rope_reference(k, inp["w_k_norm"], inp["cos"], inp["sin"], geom.rope_dim, geom.qk_norm_eps)
+    qn, _ = qk_norm_rope_reference(q, inp["w_q_norm"], inp["cos"], inp["sin"], geom.rope_dim, geom.qk_norm_eps, qk_norm=geom.qk_norm)
+    kn, _ = qk_norm_rope_reference(k, inp["w_k_norm"], inp["cos"], inp["sin"], geom.rope_dim, geom.qk_norm_eps, qk_norm=geom.qk_norm)
     return QuantSpec(**desc, scale_q=_amax_scale(qn), scale_k=_amax_scale(kn), scale_v=_amax_scale(v), scale_o=_amax_scale(v) * 0.5)
 
 
@@ -258,6 +275,22 @@ def test_quantspec_validation():
     assert _SPEC.alpha_qkvg == pytest.approx(0.01 * 0.02) and _SPEC.alpha_o == pytest.approx(0.25 * 0.03)
 
 
+def test_fp8_rope_only_declares_the_same_stage_list_with_no_norm_weights():
+    """``qk_norm=False`` under FP8: the norm is folded out of the qk_norm_rope
+    kernel, not a stage removed -- same 7-launch list, None weights, no rstd."""
+    geom = GatedAttentionBlockGeometry(**{**_GEOM, "qk_norm": False})
+    dev = "cuda"
+    bf = lambda *s: torch.zeros(*s, dtype=torch.bfloat16, device=dev)  # noqa: E731
+    h8 = torch.zeros(1, 256, geom.d_model, dtype=E4M3, device=dev)
+    w8 = torch.zeros(geom.n_qkvg, geom.d_model, dtype=E4M3, device=dev)
+    wo8 = torch.zeros(geom.d_model, geom.h_q * geom.d_head, dtype=E4M3, device=dev)
+    blk = GatedAttentionBlockFwd(h8, w8, None, None, bf(1, 256, 64), bf(1, 256, 64), wo8, bf(1, 256, geom.d_model), geom, quant=_SPEC)
+    assert [s.name for s in blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "quantize_q", "quantize_kv", "sdpa", "sigmoid_gate", "out_proj"]
+    assert blk._norm_rope.want_rstd is False and blk._descs["w_q_norm"] is None
+    with pytest.raises(ValueError, match="qk_norm=False"):
+        GatedAttentionBlockFwd(h8, w8, bf(256), bf(256), bf(1, 256, 64), bf(1, 256, 64), wo8, bf(1, 256, geom.d_model), geom, quant=_SPEC)
+
+
 def test_fp8_stage_list_and_workspace():
     blk = _decl_block(quant=_SPEC)
     assert [s.name for s in blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "quantize_q", "quantize_kv", "sdpa", "sigmoid_gate", "out_proj"]
@@ -336,28 +369,38 @@ def test_fp8_fused_sdpa_is_the_production_adapter_gated_and_without_amax():
 
 
 @requires_rubin
+@_QK_NORM
 @pytest.mark.parametrize("seq_len, causal", [(256, True), (1000, True), (256, False), (1024, False)])
-def test_fp8_block_matches_the_fake_quant_oracle(seq_len, causal):
-    """Causal covers a KV tail (S=1000); the dense FP8 kernel needs S % 128 == 0 (see the decline test)."""
-    out, ref, blk = _run_fp8_block({**_GEOM, "is_causal": causal}, batch=2, seq_len=seq_len)
+def test_fp8_block_matches_the_fake_quant_oracle(seq_len, causal, qk_norm):
+    """Causal covers a KV tail (S=1000); the dense FP8 kernel needs S % 128 == 0 (see the decline test).
+    ``rope_only``: None norm weights, the oracle skips the norm, same cosine bar."""
+    out, ref, blk = _run_fp8_block({**_GEOM, "is_causal": causal, "qk_norm": qk_norm}, batch=2, seq_len=seq_len)
+    assert blk._norm_rope._recipe.apply_norm is qk_norm
     assert torch.isfinite(out.float()).all()
     c = _cos(out, ref)
     rel = ((out.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-30)).item()
-    print(f"\nfp8 block S={seq_len} causal={causal}: cos={c:.6f} max_rel={rel:.3e}")
+    print(f"\nfp8 block S={seq_len} causal={causal} qk_norm={qk_norm}: cos={c:.6f} max_rel={rel:.3e}")
     assert c > 0.99, f"fp8 block cos {c}"
 
 
 @requires_rubin
+@_QK_NORM
 @pytest.mark.parametrize("seq_len, causal", [(1000, True), (1024, False)])  # 1000: tail tile + rows past S in both forks' epilogues
-def test_fp8_fused_block_matches_the_fake_quant_oracle(seq_len, causal):
+def test_fp8_fused_block_matches_the_fake_quant_oracle(seq_len, causal, qk_norm):
     """The FULLY FUSED FP8 block (3 launches) against the fused-numerics oracle
     (one rounding per output), at the SAME cosine floor as the unfused test.
     Causal AND dense: the projection fork's and the gated SDPA's mask arms are
     const_expr-folded, so a dense PASS proves nothing about the causal arm and
     vice versa.  Also: sentinel survivors (an unwritten region of `out`), and a
-    second execute bitwise (no per-execute compile/allocation; a cold-cache race probe)."""
+    second execute bitwise (no per-execute compile/allocation; a cold-cache race probe).
+    ``rope_only`` INVERTS while the FP8 fork lacks ``NormRopeFusionParams.qk_norm``
+    (PR-B slice S2): a typed decline naming the knob, never a norm-ON artifact."""
     _require_fp8_forks()
-    geom_kw = {**_GEOM, "is_causal": causal}
+    geom_kw = {**_GEOM, "is_causal": causal, "qk_norm": qk_norm}
+    if not qk_norm and not _fork_supports_qk_norm():
+        with pytest.raises(NotImplementedError, match="qk_norm"):
+            _run_fp8_block(geom_kw, batch=2, seq_len=seq_len, sentinel=True, **_FUSED)
+        return
     out, ref_fused, blk = _run_fp8_block(geom_kw, batch=2, seq_len=seq_len, sentinel=True, **_FUSED)
     assert blk.fp8_fused and len(blk._stages) == 3
     # The SDPA ran the production kernel's gated, amax-free specialization.
@@ -408,15 +451,40 @@ def test_fp8_dense_kv_tail_is_declined_not_computed_wrong(kw):
 
 
 @pytest.mark.parametrize("kw", [{}, _FUSED], ids=["unfused", "fused"])
-def test_fp8_padding_mask_is_declined_because_the_kernel_hangs_on_an_empty_entry(kw):
-    """The Rubin FP8 d256 SDPA hangs on seq_kv_lens == 0 (probe_sdpa_fp8_d256.py --lsepad-dead: S=1000 first
-    launch, S=512 second launch).  A hang is worse than a decline, so the block refuses padding under FP8
-    at declaration -- unfused AND fully fused (the gate epilogue does not touch the kernel's
-    empty-mainloop path).  INVERT this test (assert the dead entry is exactly 0, as the bf16 test does)
-    when the kernel's empty-mainloop path is fixed; until then no FP8 dead-row test can exercise
-    gate-after-select on the gated FP8 kernel."""
-    with pytest.raises(NotImplementedError, match="hangs on an empty"):
-        _decl_block(quant=_SPEC, seq_lens_present=True, **kw)
+def test_fp8_padding_mask_is_accepted(kw):
+    """INVERTED from ``test_fp8_padding_mask_is_declined_because_the_kernel_hangs_on_an_empty_entry``
+    (2026-09-15): the Rubin FP8 d256 SDPA's empty-KV-entry hang is gone on the rebased tree (8/8 fresh
+    processes at S=1000 and S=512 with ``seq_kv_lens=[S, 0]``), so ``seq_lens_present`` is SERVED under FP8
+    -- unfused AND fully fused -- and the declaration records it on the SDPA stage.  The dead-entry
+    contract itself is ``test_fp8_dead_padded_entry_is_exactly_zero`` below."""
+    blk = _decl_block(quant=_SPEC, seq_lens_present=True, **kw)
+    assert blk.seq_lens_present and blk._sdpa.seq_lens_present
+    assert blk._sdpa._build_impl().seq_kv_lens_present is True
+
+
+@requires_rubin
+@pytest.mark.parametrize("kw", [{}, _FUSED], ids=["unfused", "fused"])
+def test_fp8_dead_padded_entry_is_exactly_zero(kw):
+    """sdpa-invariants S1/S2 through the FP8 block: batch entry 1 has NO valid KV column
+    (``seq_lens=[s, 0]``), so the FP8 SDPA runs zero KV iterations and must SELECT ``O := 0`` --
+    the gate (stage (5), or the gated kernel's epilogue AFTER the select on the fused path) then
+    multiplies an exact zero, ``quantize_o`` / the out projection propagate it, and ``out[1]`` is
+    EXACTLY zero: never accumulator residue times a sigmoid, never a floored denominator.  The
+    live entry stays on the fake-quant oracle.  Asserted on the OUTPUT directly (a diff against a
+    reference that is itself NaN on the dead rows proves nothing).  Unfused dense S=512 needs no
+    causal cover (padding carries the lengths)."""
+    if kw:
+        _require_fp8_forks()
+    s = 512
+    seq_lens = torch.tensor([s, 0], device="cuda", dtype=torch.int32)
+    out, ref, blk = _run_fp8_block({**_GEOM, "is_causal": False}, batch=2, seq_len=s, seq_lens=seq_lens, sentinel=True, **kw)
+    assert blk._sdpa.seq_lens_present
+    assert not (out == _SENTINEL).any(), f"{(out == _SENTINEL).sum().item()} output cells were never written"
+    assert torch.isfinite(out.float()).all(), "dead rows leaked a non-finite value into the output"
+    assert (out[1] == 0).all(), f"the dead entry must be EXACTLY zero (select, not residue * sigmoid); max|out[1]| = {out[1].abs().max().item()}"
+    c = _cos(out[0], ref[0])
+    print(f"\nfp8 {'fused' if kw else 'unfused'} block dead entry S={s}: live cos={c:.6f}")
+    assert c > 0.99, f"live entry cos {c}"
 
 
 @requires_rubin

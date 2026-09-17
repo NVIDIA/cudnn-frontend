@@ -244,8 +244,8 @@ def frost_qk_norm_rope(
     mK: cute.Tensor,  # [T, H_kv, D] in
     mQo: cute.Tensor,  # [T, H_q,  D] out (may alias mQ)
     mKo: cute.Tensor,  # [T, H_kv, D] out (may alias mK)
-    mWq: cute.Tensor,  # [D]
-    mWk: cute.Tensor,  # [D]
+    mWq: Optional[cute.Tensor],  # [D], or None: RoPE-only (no RMSNorm, no weight loads, no rstd)
+    mWk: Optional[cute.Tensor],  # [D], or None (both or neither -- the host checks)
     mCos: cute.Tensor,  # [T, ROPE_DIM]
     mSin: cute.Tensor,  # [T, ROPE_DIM]
     mRstdQ: Optional[cute.Tensor],  # [T, H_q]  fp32, or None
@@ -280,10 +280,18 @@ def frost_qk_norm_rope(
 
     Tail rows clamp their loads to the last valid row and skip every store, so
     the ragged final CTA costs a redundant read and never a wild write.
+
+    ``apply_norm`` is decided at TRACE time from the presence of the weight
+    tensors (the same presence switch ``want_rstd`` uses for the rstd outputs):
+    with ``mWq is None`` the sum-of-squares pass, the rsqrt, the weight loads
+    and the rstd store are not traced at all, and the kernel is partial RoPE
+    on Q/K with the dims ``[rope_dim, D)`` copied through BIT-EXACTLY (they
+    never leave the io dtype: no fp32 op touches them).
     """
     if cutlass.const_expr(use_pdl):
         wait_on_dependent_grids()
 
+    apply_norm = cutlass.const_expr(mWq is not None)
     lanes = cutlass.const_expr(lanes_per_row(d))
     chunks = cutlass.const_expr(vec_chunks(d))
     groups_per_cta = cutlass.const_expr(threads_per_cta // lanes)
@@ -361,14 +369,18 @@ def frost_qk_norm_rope(
             if cutlass.const_expr(mRstdK is not None):
                 rstd_addr = mRstdK.iterator.toint() + k_row.to(cutlass.Int64) * cutlass.Int64(4)
 
-        w_addr = mWq.iterator.toint() if is_q else mWk.iterator.toint()
+        # The weight address exists only when there IS a weight: under
+        # apply_norm=False no line below reads mWq / mWk.
+        w_addr = cutlass.Int64(0)
+        if cutlass.const_expr(apply_norm):
+            w_addr = mWq.iterator.toint() if is_q else mWk.iterator.toint()
         row_x = []
         row_w = []
         for c in cutlass.range_constexpr(chunks):
             off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
             pairs = [f16x2_to_f32(w, dtype=mQ.element_type) for w in ld_global_v4(src_addr + off, cutlass.Int32)]
             row_x.append([v for pair in pairs for v in pair])
-            if cutlass.const_expr(not defer_secondary_loads):
+            if cutlass.const_expr(apply_norm and not defer_secondary_loads):
                 w_pairs = [f16x2_to_f32(w, dtype=mWq.element_type) for w in ld_global_v4(w_addr + off, cutlass.Int32)]
                 row_w.append([v for pair in w_pairs for v in pair])
 
@@ -397,14 +409,21 @@ def frost_qk_norm_rope(
         ss.append(sin_v)
 
     # --- PASS 2: reduce, normalize, rotate, store ----------------------------
-    want_rstd = cutlass.const_expr(mRstdQ is not None or mRstdK is not None)
+    # rstd exists only where a norm exists: compile_qk_norm_rope refuses
+    # want_rstd without apply_norm, so this conjunction never folds a store out
+    # behind a caller's back -- it only keeps the kernel self-consistent.
+    want_rstd = cutlass.const_expr(apply_norm and (mRstdQ is not None or mRstdK is not None))
     rstd_vals = []
     for r in cutlass.range_constexpr(rows_per_group):
-        acc = cutlass.Float32(0.0)
-        for c in cutlass.range_constexpr(chunks):
-            for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
-                acc = acc + xs[r][c][i] * xs[r][c][i]
-        rstd = cute.math.rsqrt(lane_group_sum(acc, lanes) * cutlass.Float32(1.0 / d) + eps, fastmath=True)
+        # Pre-bound so the name exists on both trace paths; the value is read
+        # only under apply_norm, where it is replaced by the real rsqrt.
+        rstd = cutlass.Float32(1.0)
+        if cutlass.const_expr(apply_norm):
+            acc = cutlass.Float32(0.0)
+            for c in cutlass.range_constexpr(chunks):
+                for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                    acc = acc + xs[r][c][i] * xs[r][c][i]
+            rstd = cute.math.rsqrt(lane_group_sum(acc, lanes) * cutlass.Float32(1.0 / d) + eps, fastmath=True)
 
         # The norm weight and the cos/sin pair are consumed HERE, after the
         # reduction. Loading them in PASS 1 costs 24 live fp32 per row across
@@ -417,13 +436,14 @@ def frost_qk_norm_rope(
         # is [D] and shared by every row, cos/sin are shared by every head of a
         # token -- so deferring them exposes almost no latency.
         if cutlass.const_expr(defer_secondary_loads):
-            w_addr_r = mWq.iterator.toint() if is_qs[r] else mWk.iterator.toint()
-            row_w = []
-            for c in cutlass.range_constexpr(chunks):
-                off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
-                w_pairs = [f16x2_to_f32(w, dtype=mWq.element_type) for w in ld_global_v4(w_addr_r + off, cutlass.Int32)]
-                row_w.append([v for pair in w_pairs for v in pair])
-            ws[r] = row_w
+            if cutlass.const_expr(apply_norm):
+                w_addr_r = mWq.iterator.toint() if is_qs[r] else mWk.iterator.toint()
+                row_w = []
+                for c in cutlass.range_constexpr(chunks):
+                    off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
+                    w_pairs = [f16x2_to_f32(w, dtype=mWq.element_type) for w in ld_global_v4(w_addr_r + off, cutlass.Int32)]
+                    row_w.append([v for pair in w_pairs for v in pair])
+                ws[r] = row_w
             if cutlass.const_expr(rope_dim > 0):
                 if in_rope:
                     tok = tokens[r]
@@ -434,9 +454,15 @@ def frost_qk_norm_rope(
                     cs[r] = [v for pair in c_pairs for v in pair]
                     ss[r] = [v for pair in s_pairs for v in pair]
 
+        # RoPE-only: ys IS xs. The passthrough dims [rope_dim, D) then go back
+        # through fp32_to_fp16 untouched by any fp32 op, which is exactly a
+        # widen + round-to-same -> bit-exact copy (asserted by the tests).
         ys = []
         for c in cutlass.range_constexpr(chunks):
-            ys.append([xs[r][c][i] * rstd * ws[r][c][i] for i in range(ELEMS_PER_ACCESS)])
+            if cutlass.const_expr(apply_norm):
+                ys.append([xs[r][c][i] * rstd * ws[r][c][i] for i in range(ELEMS_PER_ACCESS)])
+            else:
+                ys.append(list(xs[r][c]))
 
         if cutlass.const_expr(rope_dim > 0):
             # rotate_half: element e pairs with e + rope_dim/2, the SAME
@@ -451,7 +477,8 @@ def frost_qk_norm_rope(
             for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
                 ys[0][i] = rotated[i] if in_rope else ys[0][i]
 
-        rstd_vals.append(rstd)
+        if cutlass.const_expr(apply_norm):
+            rstd_vals.append(rstd)
         if rows[r] < n_rows:
             for c in cutlass.range_constexpr(chunks):
                 off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
@@ -506,8 +533,8 @@ def qk_norm_rope_launch(
     k: cute.Tensor,
     q_out: cute.Tensor,
     k_out: cute.Tensor,
-    w_q: cute.Tensor,
-    w_k: cute.Tensor,
+    w_q: Optional[cute.Tensor],
+    w_k: Optional[cute.Tensor],
     cos: cute.Tensor,
     sin: cute.Tensor,
     rstd_q: Optional[cute.Tensor],
@@ -564,10 +591,16 @@ class QkNormRopeRecipe(NamedTuple):
     """Build-time facts of one norm+RoPE launch.
 
     Everything in it is derivable from the DECLARATION — dtypes, head counts,
-    head dim, rope dim, whether rstd is wanted — so it is a legal compile key
-    (AGENTS.md Rule 4). The token count is NOT: it enters the artifact as a
-    ``cute.sym_int`` and the row counts ride in as runtime ``Int32`` arguments,
-    so one compile serves every sequence length.
+    head dim, rope dim, whether rstd is wanted, whether the norm is applied —
+    so it is a legal compile key (AGENTS.md Rule 4). The token count is NOT: it
+    enters the artifact as a ``cute.sym_int`` and the row counts ride in as
+    runtime ``Int32`` arguments, so one compile serves every sequence length.
+
+    ``apply_norm`` (appended, default True so every existing recipe reads the
+    same) records whether the artifact traced the RMSNorm. A norm-on artifact
+    bound to ``None`` weights would dereference a null pointer, and a norm-off
+    one handed weights would silently ignore them, so ``run_qk_norm_rope``
+    checks the recipe against the weights in BOTH directions.
     """
 
     compiled: object
@@ -577,6 +610,7 @@ class QkNormRopeRecipe(NamedTuple):
     eps: float
     rows_per_cta: int
     want_rstd: bool
+    apply_norm: bool = True
 
 
 def _fake(dtype, shape, stride_order):
@@ -622,16 +656,27 @@ def compile_qk_norm_rope(
     const_head_counts: bool = DEFAULT_CONST_HEAD_COUNTS,
     use_pdl: bool = False,
     dynamic_token_stride: bool = True,
+    apply_norm: bool = True,
 ) -> QkNormRopeRecipe:
     """Build the artifact from SHAPES ALONE — no device allocation, no launch.
 
     This is the plan-time half: the block calls it from ``compile()`` so the
     execute path's dispatch is a guaranteed cache hit rather than a
     multi-second compile on the first token batch.
+
+    ``apply_norm=False`` (the block's ``GatedAttentionBlockGeometry.qk_norm=False``)
+    traces the RoPE-only artifact: the two weight slots are traced as ``None``
+    (the kernel's presence switch), no rstd can be wanted, and the flag is IN
+    the cache key -- a cached norm-on artifact must never be reused with
+    ``None`` weights.
     """
     validate_shape(d, rope_dim, threads_per_cta)
     if dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"qk_norm_rope serves bf16/f16 only, got {dtype}")
+    if not apply_norm and rope_dim == 0:
+        raise ValueError("apply_norm=False with rope_dim=0 is an identity copy of Q/K; drop the stage instead of launching it")
+    if want_rstd and not apply_norm:
+        raise ValueError("apply_norm=False (RoPE-only Q/K) computes no RMSNorm and therefore emits no rstd; want_rstd must be False")
 
     key = (
         str(dtype),
@@ -647,6 +692,7 @@ def compile_qk_norm_rope(
         bool(want_rstd),
         bool(dynamic_token_stride),
         current_device(),
+        bool(apply_norm),
     )
     if key not in compiled_cache:
         tok = cute.sym_int()
@@ -663,7 +709,9 @@ def compile_qk_norm_rope(
             (fake_rowmajor_dynamic_token_stride(dtype, tok, h, d) if dynamic_token_stride else _fake(dtype, (tok, h, d), (2, 1, 0)))
             for h in (h_q, h_kv, h_q, h_kv)
         ]
-        weights = [_fake(dtype, (d,), (0,)) for _ in range(2)]
+        # Presence switch: None weights trace the RoPE-only kernel, exactly as
+        # None rstd tensors trace the store-less one.
+        weights = [_fake(dtype, (d,), (0,)) for _ in range(2)] if apply_norm else [None, None]
         tables = [_fake(dtype, (tok, rope_dim if rope_dim else 1), (1, 0)) for _ in range(2)]
         rstd = [_fake(torch.float32, (tok, h), (1, 0)) for h in (h_q, h_kv)] if want_rstd else [None, None]
         compiled_cache[key] = cute.compile(
@@ -698,20 +746,45 @@ def compile_qk_norm_rope(
         eps=float(eps),
         rows_per_cta=(threads_per_cta // lanes_per_row(d)) * rows_per_group,
         want_rstd=bool(want_rstd),
+        apply_norm=bool(apply_norm),
     )
+
+
+def check_norm_weights_match_recipe(apply_norm: bool, w_q, w_k) -> None:
+    """The weights must agree with the artifact in BOTH directions -- typed.
+
+    A norm-on artifact bound to ``None`` weights dereferences a null pointer in
+    the kernel (a launch failure at best); a norm-off artifact handed weights
+    would silently ignore them and return RoPE-only Q/K that LOOK plausible.
+    Neither is a fallback anyone asked for (Rule 1).
+    """
+    if (w_q is None) != (w_k is None):
+        raise ValueError(
+            f"w_q_norm and w_k_norm must be given together or both be None; got w_q_norm={'None' if w_q is None else 'tensor'}, "
+            f"w_k_norm={'None' if w_k is None else 'tensor'}"
+        )
+    if apply_norm and w_q is None:
+        raise ValueError("this artifact was compiled WITH the RMSNorm (apply_norm=True); both [D] norm weights must be bound at execute")
+    if not apply_norm and w_q is not None:
+        raise ValueError("this artifact was compiled WITHOUT the RMSNorm (apply_norm=False, RoPE-only); pass w_q_norm=w_k_norm=None")
 
 
 def run_qk_norm_rope(r: QkNormRopeRecipe, q, k, q_out, k_out, w_q, w_k, cos, sin, rstd_q=None, rstd_k=None, *, stream) -> None:
     """The lowered launch: no validation, no key build, no allocation.
 
     ``q``/``k`` are ``[T, H, D]`` (``T = B*S``); ``q_out`` may alias ``q``.
+    ``w_q``/``w_k`` are both ``None`` for a RoPE-only recipe (``r.apply_norm``
+    False) and both tensors otherwise -- checked, both directions.
     """
     t = int(q.shape[0])
     n_q_rows = t * r.h_q
     n_rows = n_q_rows + t * r.h_kv
     n_blocks = (n_rows + r.rows_per_cta - 1) // r.rows_per_cta
+    check_norm_weights_match_recipe(r.apply_norm, w_q, w_k)
     if r.want_rstd and (rstd_q is None or rstd_k is None):
         raise ValueError("this artifact was compiled with rstd outputs; both must be bound at execute (Rule 1: no silent fallback)")
+    if not r.want_rstd and (rstd_q is not None or rstd_k is not None):
+        raise ValueError("this artifact was compiled WITHOUT rstd outputs (want_rstd=False); rstd_q / rstd_k would be silently ignored -- pass None")
     # The two address-math CONTRACTS are checked here and nowhere else. The
     # kernel folded these strides into constants, so a caller that violates one
     # gets a wild write, not a wrong number -- cheap host arithmetic against a
@@ -763,7 +836,9 @@ def build_qk_norm_rope(
 ):
     """Compile (cached) and run once — the convenience form for tests and
     benchmarks. Production callers split it: :func:`compile_qk_norm_rope` at
-    plan time, :func:`run_qk_norm_rope` per execute."""
+    plan time, :func:`run_qk_norm_rope` per execute.
+
+    ``w_q=w_k=None`` selects the RoPE-only artifact (``apply_norm=False``)."""
     _, h_q, d = (int(x) for x in q.shape)
     _, h_kv, d_k = (int(x) for x in k.shape)
     if d_k != d:
@@ -772,6 +847,8 @@ def build_qk_norm_rope(
         raise ValueError(f"q and k must share the token count; got {int(q.shape[0])} and {int(k.shape[0])}")
     if (rstd_q is None) != (rstd_k is None):
         raise ValueError("rstd_q and rstd_k must be given together or not at all")
+    if (w_q is None) != (w_k is None):
+        raise ValueError("w_q and w_k must be given together (RMSNorm + RoPE) or both be None (RoPE only)")
     r = compile_qk_norm_rope(
         dtype=q.dtype,
         h_q=h_q,
@@ -785,6 +862,7 @@ def build_qk_norm_rope(
         defer_secondary_loads=defer_secondary_loads,
         const_head_counts=const_head_counts,
         use_pdl=use_pdl,
+        apply_norm=w_q is not None,
     )
     run_qk_norm_rope(r, q, k, q_out, k_out, w_q, w_k, cos, sin, rstd_q, rstd_k, stream=stream)
     return r

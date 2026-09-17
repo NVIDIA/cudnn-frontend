@@ -899,11 +899,11 @@ def make_sdpa_helpers(
 
 
 # =============================================================================
-# Fused epilogue gate  --  O := O * sigmoid(G)   (Rubin d256 f16 / per-tensor FP8)
+# Fused epilogue gate  --  O := O * sigmoid(G)   (Rubin d256 f16 / per-tensor FP8 / MXFP8)
 # =============================================================================
-# Shared between the two SM107 d256 prefill kernels (``sm107/prefill_d256_f16.py``,
-# ``sm107/prefill_d256_fp8.py``); each kernel splices these under
-# ``cutlass.const_expr(CFG.EPILOGUE_GATE)`` at its sixteen ``EPILOGUE_FUSION_SEAM``
+# Shared between the three SM107 d256 prefill kernels (``sm107/prefill_d256_f16.py``,
+# ``sm107/prefill_d256_fp8.py``, ``sm107/prefill_d256_mxfp8.py``); each kernel splices these under
+# ``cutlass.const_expr(CFG.EPILOGUE_GATE)`` at its ``EPILOGUE_FUSION_SEAM``
 # tokens (one per splice; a source test counts them per kernel).  The gate ``SmemTile(`` itself is constructed INLINE in each kernel
 # (multi-line, ``desc_version=DESC_VERSION``) so the per-kernel "every SmemTile
 # takes the module DESC_VERSION" source test keeps counting truthfully; this
@@ -1042,7 +1042,8 @@ def gate_epilogue_pairs(o_scaled, g_vals: list, half_opaque, o_chunk: int) -> li
     UNGATED value halved -- exactly, see ``gate_inv_sum``) and doubles the
     running max once per tile: Amax_O is a statistic of the sdpa node, which
     precedes the gate, so it must not depend on G
-    (``sm107/prefill_d256_fp8.py`` corr_chunk / corr_release)."""
+    (``sm107/prefill_d256_fp8.py`` and ``sm107/prefill_d256_mxfp8.py``,
+    corr_chunk / corr_release)."""
     out = []
     for p in range(o_chunk // 2):
         a, b = g_vals[2 * p], g_vals[2 * p + 1]
@@ -1061,10 +1062,11 @@ def gate_inv_sum(inv_sum):
 
     Exact for the amax fold: ``o * (inv_sum * 0.5)`` is ``0.5 * RN(o * inv_sum)``
     bit-for-bit whenever the product is a normal fp32 (a power-of-two scale
-    commutes with RN), and ``scale_o * descale_v / S_kv <= inv_sum <= scale_o *
-    descale_v`` (``1 <= sum <= S_kv``) keeps the tile's max element far from the
-    subnormal range -- which is what lets the FP8 kernel's Amax_O fold consume
-    ``h`` and double once per tile."""
+    commutes with RN), and ``inv_sum <= scale_o * descale_v`` (``sum >= 1``; on
+    MXFP8, which has no per-tensor scale, ``inv_sum <= 1``) -- an upper bound
+    only, since a sink can shrink ``inv_sum`` without limit -- keeps the tile's
+    max element a normal fp32, which is what lets the FP8 / MXFP8 kernels'
+    Amax_O fold consume ``h`` and double once per tile."""
     return inv_sum * cutlass.Float32(0.5)
 
 

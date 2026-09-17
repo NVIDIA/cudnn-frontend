@@ -498,22 +498,24 @@ class SdpaFwdDsl(APIBase):
         attention block's gate branch). Compile-time: it selects a distinct
         kernel specialization (``TemplateParams.epilogue_gate``), so an
         ``execute()`` must then pass ``gate=`` and one built without it must
-        not. Served by the Rubin (SM107) d256 f16/bf16 and per-tensor FP8
-        kernels only; every other adapter / flavor declines it with
-        :class:`NotImplementedError` from ``check_support``. The gate is Q's
-        dtype on the half kernels and ``bfloat16`` on the FP8 one. On the FP8
-        kernel the O quantization applies to the GATED value, while ``Amax_O``
-        (when requested) is the amax of the UNGATED normalised O -- the sdpa
-        node's own output, which precedes the ``sigmoid``/``mul`` tail on the
-        graph -- so it is independent of ``gate``; the graph path and this
-        adapter share that one contract.
+        not. Served by the Rubin (SM107) d256 f16/bf16, per-tensor FP8 and
+        block-scale MXFP8 kernels only; every other adapter / flavor declines
+        it with :class:`NotImplementedError` from ``check_support``. The gate
+        is Q's dtype on the half kernels and ``bfloat16`` on the quantized
+        (FP8 / MXFP8) ones. On the quantized kernels the O quantization applies
+        to the GATED value, while ``Amax_O`` (when requested) is the amax of
+        the UNGATED normalised O -- the sdpa node's own output, which precedes
+        the ``sigmoid``/``mul`` tail on the graph -- so it is independent of
+        ``gate``; the graph path and this adapter share that one contract (in
+        ``scale_o`` units on FP8; in the O's own units on MXFP8, which has no
+        per-tensor ``scale_o``).
 
-        ``has_amax_o``: quantized (FP8) path only. ``True`` (default) keeps the
+        ``has_amax_o``: quantized (FP8 / MXFP8) path only. ``True`` (default) keeps the
         legacy contract -- ``amax_o`` at ``execute()`` is optional and an
         unrequested amax lands in a cached dummy slot. ``False`` records that
         the graph has NO ``Amax_O`` output: a kernel that carries the
         ``has_amax`` compile knob folds the atomicMax out entirely (the d256
-        Rubin FP8 kernel), and ``execute(amax_o=...)`` is then a
+        Rubin FP8 and MXFP8 kernels), and ``execute(amax_o=...)`` is then a
         :class:`ValueError`. Kernels without the knob keep the legacy dummy
         slot, so the flag is honoured where it can be and harmless elsewhere.
         Distinct from ``sample_amax_o`` / ``pv_bf16`` (#983): those select the
@@ -1759,7 +1761,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 (int(d_qk), int(d_v)) not in _SM107_EPILOGUE_GATE_SHAPES,
                 f"epilogue gate fusion is wired at head dims {sorted(_SM107_EPILOGUE_GATE_SHAPES)} only; got (D_QK={d_qk}, D_V={d_v})",
             )
-            self._not_implemented_error_if(self._fp8 and not self._pertensor, "epilogue gate fusion on MXFP8 is not wired (PR-B)")
+            # MXFP8 (PR-B): the Rubin d256 block-scale kernel carries the same gate
+            # seams as the f16 / per-tensor FP8 bodies, so the block-scale path is
+            # admitted on the SAME terms as FP8 above -- cc 10.7, exactly (256, 256),
+            # a bf16 G (checked below) -- and nothing narrower: the two clauses
+            # above already pin the arch and the shape, so no MXFP8-specific decline
+            # remains here (its row: engines._sm107_mxfp8_spec, epilogue_gate=True).
+            # What differs is the OUTPUT: the MXFP8 kernel has no per-tensor
+            # scale_o (block scales dequantize in-MMA), so a gated e4m3 O is written
+            # UNSCALED -- the same unscaled e4m3 O the ungated MXFP8 path writes; a
+            # `scale_o` handed to execute() is not applied on the MXFP8 path (as
+            # today, gate or no gate).  Callers that need a scaled quantized O
+            # keep a bf16 O and quantize downstream (gated-attention block D8).
+            # Amax_O (when requested) follows the FP8 path's contract: the amax of
+            # the UNGATED normalised O -- the sdpa node's output, independent of G
+            # -- in the O's own units here (there is no scale_o to divide by).
             self._not_implemented_error_if(self.thd, "epilogue gate fusion is dense-only (no THD gate descriptor)")
             self._not_implemented_error_if(self.paged, "epilogue gate fusion with paged KV is not wired")
             self._not_implemented_error_if(
@@ -1804,7 +1820,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._gate_declared = self._bshd_zero_copy_stride(self.gate_desc, self.gate_desc.dtype.itemsize)
         self._value_error_if(
             not self.has_amax_o and not self._fp8,
-            "has_amax_o=False is meaningful on the quantized (FP8) path only (the half kernels produce no Amax_O)",
+            "has_amax_o=False is meaningful on the quantized (FP8 / MXFP8) path only (the half kernels produce no Amax_O)",
         )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
@@ -2098,6 +2114,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Declared zero-copy strides (Rubin d256 only, see above), the
             # epilogue gate's declared strides and the amax fold-out -- each
             # only when the selected kernel's compile() carries the keyword.
+            # Both quantized families: the Rubin d256 per-tensor AND block-scale
+            # (MXFP8) kernels carry gate_stride / has_amax.
             fp8_kwargs.update(**_stride_kw, **_gate_kw, **_amax_kw)
             self._compiled_kernel = self._k_mod.compile(**fp8_kwargs)
         else:
@@ -2415,6 +2433,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     amax_o,
                     current_stream,
                     workspace=workspace,
+                    gate=gate,
                 )
             return
 
@@ -3041,17 +3060,28 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         amax_o,
         current_stream=None,
         workspace=None,
+        gate=None,
     ):
         """MXFP8 execute: FP8 Q/K/V + per-32-block E8M0 SF → half/FP8 O.
 
         SF tensors come from cuDNN in F8_128x4 layout and are reshaped into the
         kernel's per-tile view; ``Amax_O`` (if requested) is produced in-kernel
-        (atomicMax over the pre-cast fp32 output rows). THD/varlen rides the
+        (atomicMax over the pre-cast fp32 output rows; with an epilogue gate it
+        is STILL the amax of the UNGATED, dead-row-selected O -- the sdpa node's
+        output, independent of ``gate``: the kernel folds |h| = |u/2| and
+        doubles once per tile -- in the O's own units, this path having no
+        per-tensor scale_o) -- unless the
+        specialization folded it out (``has_amax_o=False`` on a kernel that
+        carries ``has_amax``, the Rubin d256 one), in which case the amax slot
+        binds None and nothing is reset. THD/varlen rides the
         shared packed lowering (``_thd_pack``); there the SF buffers hold the
         PACKED per-sequence-TILE-padded layout ([1, H, Σ_b ceil(S_b/128),
         SF_SMEM] tile sequences in cu_seqlens order — the same TILE base the
         kernel derives device-side from the metadata) and their packed tile
         extent is derived from the buffer size (``_reshape_sf_packed``).
+        ``gate`` is the fused epilogue gate (dense only; O's shape, bf16), bound
+        as a zero-copy BSHD view at the compiled strides; a gated e4m3 O is
+        UNSCALED (this kernel has no per-tensor scale_o).
         """
         import cutlass
 
@@ -3062,12 +3092,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         sq, skv = self.s_q_max, self.s_k_max
         device = q_tensor.device
 
+        # has_amax_o=False on a kernel that carries the knob: the atomicMax is
+        # compiled out and the slot binds None (no reset). Legacy kernels keep
+        # the dummy slot regardless of the flag.
+        _amax_folded = getattr(self, "_amax_folded_out", False)
+
         if self.thd:
             # amax_o reset first (launch-stream ordered): the degenerate
             # early-returns below leave the correct 0 (no valid row).
-            amax_o_buf = self._amax_slot(amax_o, "amax_o", device)
-            with _torch_stream_context(current_stream, device):
-                amax_o_buf.zero_()
+            amax_o_buf = None if _amax_folded else self._amax_slot(amax_o, "amax_o", device)
+            if amax_o_buf is not None:
+                with _torch_stream_context(current_stream, device):
+                    amax_o_buf.zero_()
             lse_cap = self._thd_lse_tokens_cap(lse_tensor)
             pack = self._thd_pack(
                 q_tensor,
@@ -3127,6 +3163,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         V = self._to_bshd(v_tensor)
         O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
         O = O_scratch if o_needs_copy_back else O_view
+        # Epilogue gate (bf16, O's shape): a view at the compiled strides, never a copy.
+        G = self._checked_gate_view(gate, o_tensor) if gate is not None else None
 
         n_q_tiles = self._ceil_div(sq, _SM100_TILE_N)
         n_kv_tiles = self._ceil_div(skv, _SM100_TILE_N)
@@ -3165,9 +3203,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # This unused ABI slot is compiled out of the hybrid kernel.
             amax_o_buf = self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
         else:
-            amax_o_buf = self._amax_slot(amax_o, "amax_o", device)
-            with _torch_stream_context(current_stream, device):
-                amax_o_buf.zero_()
+            # Folded out (has_amax_o=False + a kernel with the knob): bind None.
+            # Otherwise the caller's slot (or the cached dummy), which the kernel
+            # atomicMax'es into and so MUST start at 0.  The reset must be enqueued
+            # on the SAME stream as the kernel launch below, else the reset and the
+            # kernel's atomicMax are unordered (and the reset is missing from a
+            # CUDA-graph capture taken on the handle's stream).
+            amax_o_buf = None if _amax_folded else self._amax_slot(amax_o, "amax_o", device)
+            if amax_o_buf is not None:
+                with _torch_stream_context(current_stream, device):
+                    amax_o_buf.zero_()
 
         o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
         # Split-KV: the mainloop writes split-major partials (skipping its own
@@ -3196,6 +3241,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             cutlass.Int32(0),
             *dense_q_lens_args,
             **({"o_partial_f32": O_dst} if self._fp32_partial_split() else {}),
+            # The gate tensor is the LAST (keyword) parameter of the gated
+            # kernel's _host, after `stream`; absent on ungated builds.
+            **({"gate_tensor": G} if G is not None else {}),
             stream=current_stream,
         )
         if self.split_kv > 1:
