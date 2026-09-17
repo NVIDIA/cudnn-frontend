@@ -1,13 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-JAX coverage for the SM100 grouped GEMM dSwiGLU backward wrapper.
+"""Noncanonical JAX inputs and direct dswiglu API-class samples are rejected.
 
-JAX contract: this backward API only supports dense weight mode, whose
-expert-outermost strided B layout (n, k, l) has no row-major JAX equivalent,
-so JAX inputs are rejected with a clear error (and unknown frameworks with
-an "Unsupported tensor framework" error).
+Canonical MXFP8 shared-wrapper coverage is in test_grouped_gemm_canonical_jax.py.
 """
 
 import numpy as np
@@ -37,12 +33,12 @@ def _make_jax_inputs(m=256, n=128, k=128, l=2):
 
 @pytest.mark.L0
 def test_grouped_gemm_dswiglu_jax_rejected():
-    """JAX inputs are rejected: the dense-only B layout is not expressible as JAX arrays."""
+    """The JAX wrapper rejects legacy (m,k,1) operands."""
     skip_unless_sm100()
     from cudnn import grouped_gemm_dswiglu_wrapper_sm100
 
     a_j, b_j, c_j, sfa_j, sfb_j, offsets_j, alpha_j, beta_j, prob_j = _make_jax_inputs()
-    with pytest.raises(ValueError, match="not expressible as JAX arrays"):
+    with pytest.raises(ValueError, match="JAX requires canonical"):
         grouped_gemm_dswiglu_wrapper_sm100(
             a_tensor=a_j,
             b_tensor=b_j,

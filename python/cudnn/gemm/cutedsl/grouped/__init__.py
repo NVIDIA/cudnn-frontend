@@ -80,8 +80,6 @@ __all__ = [
     "GroupedGemmSm100",
     "grouped_gemm_wrapper_sm100",
     "grouped_gemm_jax_sm100",
-    "grouped_gemm_swiglu_jax_sm100",
-    "grouped_gemm_dswiglu_jax_sm100",
     "grouped_gemm_glu_jax_sm100",
     "grouped_gemm_dglu_jax_sm100",
     "grouped_gemm_dsrelu_jax_sm100",
@@ -91,8 +89,6 @@ __all__ = [
 # Lazy: the jax entry points import jax/cutlass.jax, which must not be pulled in
 # for torch-only users.
 _JAX_LAZY_EXPORTS = {
-    "grouped_gemm_swiglu_jax_sm100": ".swiglu",
-    "grouped_gemm_dswiglu_jax_sm100": ".dswiglu",
     "grouped_gemm_jax_sm100": ".unfused",
     "grouped_gemm_glu_jax_sm100": ".glu",
     "grouped_gemm_dglu_jax_sm100": ".dglu",

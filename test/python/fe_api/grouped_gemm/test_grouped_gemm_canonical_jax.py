@@ -3,6 +3,8 @@
 
 """Contiguous MXFP8 JAX parity with the established torch kernel entry points."""
 
+from functools import partial
+
 import numpy as np
 import pytest
 
@@ -53,6 +55,11 @@ def torch_inputs(arrays):
 
 
 def assert_outputs(result, reference):
+    from cudnn.api_base import TupleDict
+
+    assert isinstance(result, TupleDict)
+    assert tuple(result.keys()) == tuple(reference.keys())
+    assert all(value is result[i] for i, value in enumerate(result))
     jax.block_until_ready(result)
     for name, expected in reference.items():
         if expected is None:
@@ -79,7 +86,7 @@ def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, monkeypatch
     arrays = problem(backward, experts, flat_sf, bf16_prob)
     name = "dswiglu" if backward else "swiglu"
     eager = getattr(cudnn, f"grouped_gemm_{name}_wrapper_sm100")
-    bridge = getattr(cudnn, f"grouped_gemm_{name}_jax_sm100")
+    bridge = partial(getattr(cudnn, f"grouped_gemm_{name}_wrapper_sm100"), d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
     reference = eager(**torch_inputs(arrays), d_dtype=torch.float8_e4m3fn, sf_vec_size=32)
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
     assert_outputs(bridge(**inputs), reference)
@@ -98,7 +105,7 @@ def test_canonical_jax_rejects_invalid_sf(backward):
 
     inputs = {name: jnp.asarray(array) for name, array in problem(backward, 1, True, False).items()}
     inputs["sfa_tensor"] = inputs["sfa_tensor"][:-1]
-    bridge = getattr(cudnn, f"grouped_gemm_{'dswiglu' if backward else 'swiglu'}_jax_sm100")
+    bridge = partial(getattr(cudnn, f"grouped_gemm_{'dswiglu' if backward else 'swiglu'}_wrapper_sm100"), d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
     with pytest.raises(ValueError, match="SFA"):
         jax.jit(bridge)(**inputs)
 
@@ -120,8 +127,8 @@ def test_canonical_jax_forward_backward_chain(monkeypatch):
     backward.pop("c_tensor")
 
     def step(fwd, bwd):
-        fwd_result = cudnn.grouped_gemm_swiglu_jax_sm100(**fwd)
-        bwd_result = cudnn.grouped_gemm_dswiglu_jax_sm100(**bwd, c_tensor=fwd_result["c_tensor"])
+        fwd_result = cudnn.grouped_gemm_swiglu_wrapper_sm100(**fwd, d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
+        bwd_result = cudnn.grouped_gemm_dswiglu_wrapper_sm100(**bwd, c_tensor=fwd_result["c_tensor"], d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
         return fwd_result, bwd_result
 
     inputs = tuple({name: jnp.asarray(array) for name, array in values.items()} for values in (forward, backward))
@@ -146,7 +153,8 @@ def test_canonical_jax_without_torch():
         import jax.numpy as jnp
         import ml_dtypes
         import numpy as np
-        from cudnn import grouped_gemm_swiglu_jax_sm100, grouped_gemm_dswiglu_jax_sm100
+        from functools import partial
+        from cudnn import grouped_gemm_swiglu_wrapper_sm100, grouped_gemm_dswiglu_wrapper_sm100
         fp8 = ml_dtypes.float8_e5m2
         a = jnp.ones((256, 256), fp8)
         b = jnp.ones((1, 256, 256), fp8)
@@ -155,10 +163,12 @@ def test_canonical_jax_without_torch():
         alpha = jnp.ones((1,), jnp.float32)
         prob = jnp.ones((256,), jnp.float32)
         norm = jnp.array([0.01], jnp.float32)
-        out = jax.jit(grouped_gemm_swiglu_jax_sm100)(a, b, sf, sf, offsets, alpha, prob, norm)
+        fwd = partial(grouped_gemm_swiglu_wrapper_sm100, d_dtype=fp8, sf_vec_size=32)
+        out = jax.jit(fwd)(a, b, sf, sf, offsets, alpha, prob_tensor=prob, norm_const_tensor=norm)
         np.testing.assert_array_equal(np.asarray(out['c_tensor']).astype(np.float32), 256)
         c = jnp.ones((256, 512), jnp.bfloat16)
-        out = jax.jit(grouped_gemm_dswiglu_jax_sm100)(a, b, c, sf, sf, offsets, alpha, alpha, prob, norm)
+        bwd = partial(grouped_gemm_dswiglu_wrapper_sm100, d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
+        out = jax.jit(bwd)(a, b, c, sf, sf, offsets, alpha, alpha, prob, norm)
         assert np.isfinite(np.asarray(out['dprob_tensor'])).all()
         assert sys.modules['torch'] is None
     """)
@@ -177,7 +187,7 @@ def test_canonical_jax_runtime_offsets_and_padding(backward, monkeypatch):
     monkeypatch.setattr(eager_api, "_cache_of_GroupedGemmDswigluSm100Objects", {})
     arrays = problem(backward, 4, False, False)
     name = "dswiglu" if backward else "swiglu"
-    bridge = getattr(cudnn, f"grouped_gemm_{name}_jax_sm100")
+    bridge = partial(getattr(cudnn, f"grouped_gemm_{name}_wrapper_sm100"), d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
     compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
     jax.block_until_ready(compiled(**inputs))
@@ -191,3 +201,76 @@ def test_canonical_jax_runtime_offsets_and_padding(backward, monkeypatch):
         expected = reference[key].float().cpu().numpy()
         np.testing.assert_allclose(actual[:768], expected[:768], rtol=1e-4 if key == "dprob_tensor" else 0, atol=1e-4 if key == "dprob_tensor" else 0)
         np.testing.assert_array_equal(actual[768:], 0)
+
+
+@pytest.mark.parametrize("backward", [False, True])
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("current_stream", 0),
+        ("sf_vec_size", 16),
+        ("acc_dtype", jnp.float16),
+        ("cd_major", "m"),
+        ("vector_f32", True),
+        ("m_aligned", 128),
+        ("discrete_col_sfd", True),
+    ],
+)
+def test_shared_wrapper_rejects_unsupported_jax_options(backward, option, value):
+    skip_unless_sm100()
+    import cudnn
+
+    inputs = {name: jnp.asarray(array) for name, array in problem(backward, 1, True, False).items()}
+    wrapper = getattr(cudnn, f"grouped_gemm_{'dswiglu' if backward else 'swiglu'}_wrapper_sm100")
+    options = dict(d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
+    options[option] = value
+    with pytest.raises(ValueError, match=option):
+        jax.jit(partial(wrapper, **options))(**inputs)
+
+
+@pytest.mark.parametrize("option", ["dprob_tensor_buf", "amax_tensor_buf", "epilogue_op"])
+def test_shared_backward_rejects_jax_output_buffers_and_epilogues(option):
+    skip_unless_sm100()
+    from cudnn import grouped_gemm_dswiglu_wrapper_sm100
+
+    inputs = {name: jnp.asarray(array) for name, array in problem(True, 1, True, False).items()}
+    options = {option: "relu" if option == "epilogue_op" else jnp.empty((256,))}
+    with pytest.raises(ValueError, match=option):
+        grouped_gemm_dswiglu_wrapper_sm100(**inputs, **options, d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
+
+
+@pytest.mark.parametrize("backward", [False, True])
+def test_shared_wrapper_rejects_mixed_frameworks_and_missing_alpha(backward):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays = problem(backward, 1, True, False)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    wrapper = partial(getattr(cudnn, f"grouped_gemm_{'dswiglu' if backward else 'swiglu'}_wrapper_sm100"), d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
+    alpha = inputs["alpha_tensor"]
+    inputs["alpha_tensor"] = None
+    with pytest.raises(ValueError, match="alpha_tensor is required"):
+        wrapper(**inputs)
+    inputs["alpha_tensor"] = alpha
+    inputs["b_tensor"] = None
+    with pytest.raises(ValueError, match="b_tensor is required"):
+        wrapper(**inputs)
+    inputs["b_tensor"] = torch_inputs(arrays)["b_tensor"]
+    with pytest.raises(ValueError, match="b_tensor must be a JAX"):
+        wrapper(**inputs)
+
+
+def test_no_separate_public_jax_entry_points():
+    import cudnn
+
+    assert not hasattr(cudnn, "grouped_gemm_swiglu_jax_sm100")
+    assert not hasattr(cudnn, "grouped_gemm_dswiglu_jax_sm100")
+
+
+def test_shared_backward_rejects_e5m2_output():
+    skip_unless_sm100()
+    from cudnn import grouped_gemm_dswiglu_wrapper_sm100
+
+    inputs = {name: jnp.asarray(array) for name, array in problem(True, 1, True, False).items()}
+    with pytest.raises(ValueError, match="d_dtype must be e4m3"):
+        grouped_gemm_dswiglu_wrapper_sm100(**inputs, d_dtype=ml_dtypes.float8_e5m2, sf_vec_size=32)

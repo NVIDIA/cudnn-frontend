@@ -6,7 +6,7 @@
 
 ## JAX support
 
-JAX arrays are **not supported**: this kernel consumes its scale-factor tensors as MMA-permuted strided cute tensor arguments in every configuration, a layout with no row-major (JAX) equivalent. JAX inputs raise a clear `ValueError` at the entry points. The API is otherwise type-erased and torch-lazy.
+`grouped_gemm_swiglu_wrapper_sm100` accepts both Torch tensors and canonical MXFP8 JAX arrays or tracers. JAX calls use an XLA-managed custom call, including under `jax.jit`; there is no separate public JAX entry point. Direct API-class construction remains for Torch tensors or metadata descriptors. See the JAX execution contract below.
 
 ## Overview
 
@@ -358,18 +358,20 @@ kernel-facing forms above keep working unchanged:
 Flat SF buffers must already contain the packed MMA-tiled scale bytes in physical
 order. Ordinary row-major logical scales need packing before this API is called.
 
-These layouts are also used by the JAX entry point below. The eager wrapper
-still requires torch tensors. Unified GLU/dGLU APIs are separate.
+These layouts are also used by the JAX execution path below. The same public
+wrapper dispatches by input framework. Unified GLU/dGLU APIs are separate.
 
 When `A` is canonical (2-D), the wrapper returns natural-shaped outputs:
 `c (valid_m, N)`, `d`/`d_col (valid_m, N/2)` row-major, and `sfd_row`/`sfd_col` as
 C-contiguous physical `(1, ceil(mn/128), rest, 32, 4, 4)` buffers.
 
-### JAX entry point
+### JAX execution
 
-`cudnn.grouped_gemm_swiglu_jax_sm100` runs the contiguous-weight MXFP8 fusion
+`cudnn.grouped_gemm_swiglu_wrapper_sm100` runs the contiguous-weight MXFP8 fusion
 through `cudnn.jax.call`, eagerly or under `jax.jit`. All operands are ordinary
-JAX arrays managed by XLA. The eager torch wrapper remains a separate entry point.
+JAX arrays managed by XLA. Torch inputs use the existing eager implementation.
+Both paths return `TupleDict` with the same key order and tuple-unpacking behavior.
+The JAX path registers this output type as a JAX pytree.
 
 Use canonical `A (m,k)`, `B (experts,n,k)`, and `prob (m,)` (fp32 or bf16).
 Scale factors are E8M0 arrays, or uint8 bit patterns, containing the packed
@@ -380,6 +382,29 @@ multiple of 256. These device values are the caller's responsibility.
 
 Forward returns `c_tensor (m,n)`, `d_tensor`/`d_col_tensor (m,n/2)`, physical
 `sfd_row_tensor`/`sfd_col_tensor`, and `amax_tensor=None`.
+
+The shared signature and defaults are unchanged. Set `sf_vec_size=32` and an
+explicit FP8 `d_dtype` for JAX. JAX requires explicit probability and normalization
+arrays; mixed Torch/JAX operands are rejected. XLA manages streams and outputs,
+so `current_stream` is rejected. JAX also rejects `vector_f32=True`,
+`discrete_col_sfd=True`, non-default `m_aligned`, non-FP32 accumulation, and
+non-`n` output layout. Configuration arguments must be static under `jax.jit`,
+for example:
+
+```python
+from functools import partial
+import jax
+import ml_dtypes
+import cudnn
+
+operation = partial(
+    cudnn.grouped_gemm_swiglu_wrapper_sm100,
+    sf_vec_size=32,
+    d_dtype=ml_dtypes.float8_e4m3fn,
+)
+compiled = jax.jit(operation)
+result = compiled(**jax_inputs)
+```
 
 This initial bridge supports FP8 e4m3/e5m2 A/B and FP8 D, with E8M0 block
 scales of vector size 32. Packed FP4, BF16 D, bias, and discrete-column SF layout

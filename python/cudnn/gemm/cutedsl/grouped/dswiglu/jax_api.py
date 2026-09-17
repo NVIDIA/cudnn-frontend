@@ -6,6 +6,7 @@
 import cutlass
 import cutlass.cute as cute
 
+from cudnn.api_base import TupleDict
 from cudnn.jax import call, zeros_init
 from ..canonical_jax import grouped_plan, output_type, row_spec, sf_array, sf_shape, sf_zeros
 from .api import GroupedGemmDswigluSm100
@@ -35,7 +36,7 @@ def grouped_dswiglu_adapter(stream, a, b, c, sfa, sfb, padded_offsets, alpha, be
     )
 
 
-def grouped_gemm_dswiglu_jax_sm100(
+def dswiglu_jax(
     a_tensor,
     b_tensor,
     c_tensor,
@@ -93,4 +94,11 @@ def grouped_gemm_dswiglu_jax_sm100(
         kernel=kernel,
         mac=mac,
     )(*inputs.values())
-    return {**{f"{name}_tensor": value for name, value in zip(outputs, result)}, "amax_tensor": None}
+    return TupleDict(
+        d_row_tensor=result[0],
+        d_col_tensor=result[1],
+        dprob_tensor=result[2],
+        amax_tensor=None,
+        sfd_row_tensor=result[3],
+        sfd_col_tensor=result[4],
+    )

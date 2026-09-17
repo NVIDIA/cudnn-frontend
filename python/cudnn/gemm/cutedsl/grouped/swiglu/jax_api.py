@@ -6,6 +6,7 @@
 import cutlass
 import cutlass.cute as cute
 
+from cudnn.api_base import TupleDict
 from cudnn.jax import call, zeros_init
 from ..canonical_jax import grouped_plan, output_type, row_spec, sf_array, sf_shape, sf_zeros
 from .api import GroupedGemmSwigluSm100
@@ -33,7 +34,7 @@ def grouped_swiglu_adapter(stream, a, b, sfa, sfb, padded_offsets, alpha, prob, 
     )
 
 
-def grouped_gemm_swiglu_jax_sm100(
+def swiglu_jax(
     a_tensor,
     b_tensor,
     sfa_tensor,
@@ -56,7 +57,7 @@ def grouped_gemm_swiglu_jax_sm100(
     bit patterns also accepted). Outputs use natural 2-D shapes and physical
     6-D SF buffers. Output storage is zero-initialized for untouched padding.
     Only FP8 A/B and FP8 D are supported. No automatic differentiation rule;
-    use grouped_gemm_dswiglu_jax_sm100 for the fused backward operation.
+    use grouped_gemm_dswiglu_wrapper_sm100 for the fused backward operation.
     """
     m = a_tensor.shape[0]
     if b_tensor.ndim != 3:
@@ -89,4 +90,11 @@ def grouped_gemm_swiglu_jax_sm100(
         kernel=kernel,
         mac=mac,
     )(*inputs.values())
-    return {**{f"{name}_tensor": value for name, value in zip(outputs, result)}, "amax_tensor": None}
+    return TupleDict(
+        c_tensor=result[0],
+        d_tensor=result[1],
+        d_col_tensor=result[2],
+        amax_tensor=None,
+        sfd_row_tensor=result[3],
+        sfd_col_tensor=result[4],
+    )
