@@ -24,4 +24,14 @@ On torch < 2.13 (no registry), ``cudnn.torch.install()`` applies the
 
 from cudnn.torch.sdpa_provider import calls, install, served_plan_names  # noqa: F401
 
-__all__ = ["calls", "install", "served_plan_names"]
+__all__ = ["calls", "install", "served_plan_names", "grouped_gemm_swiglu", "grouped_gemm_dswiglu"]
+
+
+def __getattr__(name):
+    if name in ("grouped_gemm_swiglu", "grouped_gemm_dswiglu"):
+        import cudnn
+
+        value = getattr(cudnn, f"{name}_wrapper_sm100")
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
