@@ -32,7 +32,7 @@ Algorithm overview (per chunk c, tokens [cC, (c+1)C)):
     Q decay[t,d]     = Q[t,d] * exp2(+g[t,d])                    (Q*state / A tile A operand)
 
   KK (register MMA) : W_kk[BT,BT] = K decay @ K inv^T;  L = Beta * tril(W_kk, -1)
-  T_inv (register MMA) : (I + L)^-1 = I - L, then three Neumann doubling rounds (T_inv += T_inv @ Lpow, Lpow *= Lpow)
+  T_inv (register MMA) : (I + L)^-1 blockwise, 4x4 diagonal blocks then the 4 -> 8 and 8 -> 16 corrections (C <- -D^-1 C A^-1)
   A (register MMA)  : A[BT,BT] = tril(Q decay @ K inv^T)
   K*state GEMM   : KS[BT,DV] = K decay @ S_prev    (key applied to state)
   Q*state GEMM   : QS[BT,DV] = Q decay @ S_prev    (inter-chunk output)
@@ -70,7 +70,7 @@ TMEM layout (512 columns allocated):
 Warp assignments (16 warps = 512 threads):
   warps 0-7     : compute group 0 - Gate prefix scan, decay/restore operands, left state halves (two ping-pong groups)
   warps 8-11    : compute group 1 - state seed, right state halves, Y / U staging, O drain, state / checkpoint rows
-  warp  12      : register-MMA warp - KK and the Neumann T_inv
+  warp  12      : register-MMA warp - KK and the blockwise T_inv
   warp  13      : MMA warp       - every tcgen05 GEMM; TMEM lifecycle
   warp  14      : TMA load warp  - loads Q, K, V, Gate; stages Beta one chunk ahead
   warp  15      : epilogue warp  - register-MMA A tile, O and checkpoint TMA stores
@@ -90,6 +90,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_FINAL_DST, decode_work_item, order_body
 from ..common.host import get_dtype
+from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from cudnn.frost.buffers import data_ptr
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
 from .kda_prefill_config import CFG
@@ -113,7 +114,6 @@ from cudnn.frost.tile_dsl.pointwise import (
     fadd2,
     fmul2,
     ffma2,
-    movmatrix_16b,
     mul_f16x2,
     fp32_to_fp16,
     sub_f16x2,
@@ -503,7 +503,7 @@ def super_mma_warp(
     bars,
 ) -> None:
     """Super-MMA warp role (warp 12): persistent scheduler loop computing the
-    Neumann-series T_inv via register MMA."""
+    blockwise T_inv via register MMA."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
     elect_one = nvvm.elect_sync()
 
@@ -584,66 +584,10 @@ def super_mma_warp(
                 l_regs[2 * pair], l_regs[2 * pair + 1] = fmul2(l_regs[2 * pair], l_regs[2 * pair + 1], beta_scale, beta_scale)
             if nvvm.elect_sync():
                 bars.mb_beta_done[raw_bar_stage].arrive()
-            l_a0 = fp32_to_fp16(l_regs[0], l_regs[1], dtype=cfg.io_dtype)
-            l_a1 = fp32_to_fp16(l_regs[2], l_regs[3], dtype=cfg.io_dtype)
-            l_a2 = fp32_to_fp16(l_regs[4], l_regs[5], dtype=cfg.io_dtype)
-            l_a3 = fp32_to_fp16(l_regs[6], l_regs[7], dtype=cfg.io_dtype)
 
-            # ---- T^-1 = I - L, then three Neumann doubling rounds --------------------
+            # ---- T_inv = (I + L)^-1 --------------------------------------------------
             tinv_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
-            for accum_idx in cutlass.range_constexpr(8):
-                row_coord = row_lo
-                if cutlass.const_expr(accum_idx % 4 >= 2):
-                    row_coord = row_hi
-                col_coord = (accum_idx // 4) * 8 + 2 * (lane_idx % 4)
-                if cutlass.const_expr(accum_idx % 2 == 1):
-                    col_coord = col_coord + cutlass.Int32(1)
-                eye = cutlass.Float32(1.0) if row_coord == col_coord else cutlass.Float32(0.0)
-                tinv_acc[accum_idx] = eye - l_regs[accum_idx]
-
-            lpow_a0, lpow_a1, lpow_a2, lpow_a3 = l_a0, l_a1, l_a2, l_a3
-            mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3 = movmatrix_16b(l_a0), movmatrix_16b(l_a1), movmatrix_16b(l_a2), movmatrix_16b(l_a3)
-            for neumann_round in cutlass.range_constexpr(3):
-                # ---- Lpow = Lpow @ Lpow ----------------------------------------------
-                sq_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
-                for accum_idx in cutlass.range_constexpr(8):
-                    sq_acc[accum_idx] = cutlass.Float32(0.0)
-                mma_step(
-                    sq_acc,
-                    (lpow_a0, lpow_a1, lpow_a2, lpow_a3),
-                    (mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3),
-                    k_step=0,
-                    M=16,
-                    N=16,
-                    ab_dtype=cfg.io_dtype,
-                )
-                lpow_a0 = fp32_to_fp16(sq_acc[0], sq_acc[1], dtype=cfg.io_dtype)
-                lpow_a1 = fp32_to_fp16(sq_acc[2], sq_acc[3], dtype=cfg.io_dtype)
-                lpow_a2 = fp32_to_fp16(sq_acc[4], sq_acc[5], dtype=cfg.io_dtype)
-                lpow_a3 = fp32_to_fp16(sq_acc[6], sq_acc[7], dtype=cfg.io_dtype)
-                mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3 = movmatrix_16b(lpow_a0), movmatrix_16b(lpow_a1), movmatrix_16b(lpow_a2), movmatrix_16b(lpow_a3)
-
-                # ---- T^-1 += T^-1 @ Lpow ---------------------------------------------
-                upd_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
-                for accum_idx in cutlass.range_constexpr(8):
-                    upd_acc[accum_idx] = cutlass.Float32(0.0)
-                tinv_p0 = fp32_to_fp16(tinv_acc[0], tinv_acc[1], dtype=cfg.io_dtype)
-                tinv_p1 = fp32_to_fp16(tinv_acc[2], tinv_acc[3], dtype=cfg.io_dtype)
-                tinv_p2 = fp32_to_fp16(tinv_acc[4], tinv_acc[5], dtype=cfg.io_dtype)
-                tinv_p3 = fp32_to_fp16(tinv_acc[6], tinv_acc[7], dtype=cfg.io_dtype)
-                mma_step(
-                    upd_acc,
-                    (tinv_p0, tinv_p1, tinv_p2, tinv_p3),
-                    (mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3),
-                    k_step=0,
-                    M=16,
-                    N=16,
-                    ab_dtype=cfg.io_dtype,
-                )
-                tinv_acc[0], tinv_acc[1] = fadd2(tinv_acc[0], tinv_acc[1], upd_acc[0], upd_acc[1])
-                tinv_acc[2], tinv_acc[3] = fadd2(tinv_acc[2], tinv_acc[3], upd_acc[2], upd_acc[3])
-                tinv_acc[4], tinv_acc[5] = fadd2(tinv_acc[4], tinv_acc[5], upd_acc[4], upd_acc[5])
-                tinv_acc[6], tinv_acc[7] = fadd2(tinv_acc[6], tinv_acc[7], upd_acc[6], upd_acc[7])
+            invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx)
 
             bars.mb_t_inv_done[intermediate_stage].wait(intermediate_free_parity)
             nvvm.stmatrix(

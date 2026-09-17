@@ -27,7 +27,7 @@ Algorithm overview (per chunk c, iterated c = NT-1 .. 0):
   Preprocessing (compute group 0): g, K decay, K inv, Q decay as in the prefill (no K restore), the decay scale
   exp2(g[BT-1,:]), the raw Q/K rows into a TMEM ring for compute group 2, the per-row inverse norms (l2norm), the state
   entry copied SMEM -> TMEM f16.
-  Register MMA (warp 12): KK = K decay @ K inv^T; L = Beta * tril(KK, -1); T_inv by three Neumann doubling rounds;
+  Register MMA (warp 12): KK = K decay @ K inv^T; L = Beta * tril(KK, -1); T_inv by the blockwise inverse;
   dM = dY @ U^T; dM strict = Beta row . strict(dM); the dBeta M-term row sums.
   Register MMA (warp 15): A = tril(Q decay @ K inv^T, 0); dA = tril(dO @ U^T, 0); the dA diagonal for compute group 2.
 
@@ -106,6 +106,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_DSTATE_DST, decode_work_item, order_body
 from ..common.host import get_dtype
+from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from cudnn.frost.buffers import data_ptr
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
 from .kda_bprop_config import CFG
@@ -129,7 +130,6 @@ from cudnn.frost.tile_dsl.pointwise import (
     ffma2,
     fmul2,
     fp32_to_fp16,
-    movmatrix_16b,
     mul_f16x2,
     opaque_f32_zero,
     pack_u16x2,
@@ -649,7 +649,7 @@ def super_mma_warp(
     sBetaM_raw,
     bars,
 ) -> None:
-    """Super-MMA warp role (warp 12): the Neumann T_inv and dM register MMAs
+    """Super-MMA warp role (warp 12): the blockwise T_inv and dM register MMAs
     plus the dBeta M-term row sums, in chunk order."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
     elect_one = nvvm.elect_sync()
@@ -670,16 +670,14 @@ def super_mma_warp(
     row_lo = lane_idx // 4
     row_hi = row_lo + cutlass.Int32(8)
 
-    # tril bitmasks: bit i = row > col / row == col for accum index i
+    # tril bitmask: bit i = row > col for accum index i
     tril_strict_mask = cutlass.Int32(0)
-    eye_mask = cutlass.Int32(0)
     for accum_idx in cutlass.range_constexpr(8):
         row_coord = row_hi if cutlass.const_expr(accum_idx % 4 >= 2) else row_lo
         col_coord = (accum_idx // 4) * 8 + 2 * (lane_idx % 4)
         if cutlass.const_expr(accum_idx % 2 == 1):
             col_coord = col_coord + cutlass.Int32(1)
         tril_strict_mask = tril_strict_mask | (cutlass.Int32(1 << accum_idx) if row_coord > col_coord else cutlass.Int32(0))
-        eye_mask = eye_mask | (cutlass.Int32(1 << accum_idx) if row_coord == col_coord else cutlass.Int32(0))
 
     chunk_serial_base = cutlass.Int32(0)
     scheduler_state = PipelineState.start(phase=0)
@@ -743,60 +741,10 @@ def super_mma_warp(
                 beta_scale = beta_lo if accum_idx % 4 < 2 else beta_hi
                 lower = kk_acc[accum_idx] if (tril_strict_mask >> accum_idx) & 1 else cutlass.Float32(0.0)
                 l_regs[accum_idx] = lower * beta_scale
-            l_a0 = fp32_to_fp16(l_regs[0], l_regs[1], dtype=cfg.io_dtype)
-            l_a1 = fp32_to_fp16(l_regs[2], l_regs[3], dtype=cfg.io_dtype)
-            l_a2 = fp32_to_fp16(l_regs[4], l_regs[5], dtype=cfg.io_dtype)
-            l_a3 = fp32_to_fp16(l_regs[6], l_regs[7], dtype=cfg.io_dtype)
 
-            # ---- T^-1 = I - L, then three Neumann doubling rounds --------------------
+            # ---- T_inv = (I + L)^-1 --------------------------------------------------
             tinv_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
-            for accum_idx in cutlass.range_constexpr(8):
-                eye = cutlass.Float32(1.0) if (eye_mask >> accum_idx) & 1 else cutlass.Float32(0.0)
-                tinv_acc[accum_idx] = eye - l_regs[accum_idx]
-
-            lpow_a0, lpow_a1, lpow_a2, lpow_a3 = l_a0, l_a1, l_a2, l_a3
-            mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3 = movmatrix_16b(l_a0), movmatrix_16b(l_a1), movmatrix_16b(l_a2), movmatrix_16b(l_a3)
-            for neumann_round in cutlass.range(3, unroll=1):
-                # ---- Lpow = Lpow @ Lpow ----------------------------------------------
-                sq_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
-                for accum_idx in cutlass.range_constexpr(8):
-                    sq_acc[accum_idx] = cutlass.Float32(0.0)
-                mma_step(
-                    sq_acc,
-                    (lpow_a0, lpow_a1, lpow_a2, lpow_a3),
-                    (mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3),
-                    k_step=0,
-                    M=16,
-                    N=16,
-                    ab_dtype=cfg.io_dtype,
-                )
-                lpow_a0 = fp32_to_fp16(sq_acc[0], sq_acc[1], dtype=cfg.io_dtype)
-                lpow_a1 = fp32_to_fp16(sq_acc[2], sq_acc[3], dtype=cfg.io_dtype)
-                lpow_a2 = fp32_to_fp16(sq_acc[4], sq_acc[5], dtype=cfg.io_dtype)
-                lpow_a3 = fp32_to_fp16(sq_acc[6], sq_acc[7], dtype=cfg.io_dtype)
-                mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3 = movmatrix_16b(lpow_a0), movmatrix_16b(lpow_a1), movmatrix_16b(lpow_a2), movmatrix_16b(lpow_a3)
-
-                # ---- T^-1 += T^-1 @ Lpow ---------------------------------------------
-                upd_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
-                for accum_idx in cutlass.range_constexpr(8):
-                    upd_acc[accum_idx] = cutlass.Float32(0.0)
-                tinv_p0 = fp32_to_fp16(tinv_acc[0], tinv_acc[1], dtype=cfg.io_dtype)
-                tinv_p1 = fp32_to_fp16(tinv_acc[2], tinv_acc[3], dtype=cfg.io_dtype)
-                tinv_p2 = fp32_to_fp16(tinv_acc[4], tinv_acc[5], dtype=cfg.io_dtype)
-                tinv_p3 = fp32_to_fp16(tinv_acc[6], tinv_acc[7], dtype=cfg.io_dtype)
-                mma_step(
-                    upd_acc,
-                    (tinv_p0, tinv_p1, tinv_p2, tinv_p3),
-                    (mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3),
-                    k_step=0,
-                    M=16,
-                    N=16,
-                    ab_dtype=cfg.io_dtype,
-                )
-                tinv_acc[0], tinv_acc[1] = fadd2(tinv_acc[0], tinv_acc[1], upd_acc[0], upd_acc[1])
-                tinv_acc[2], tinv_acc[3] = fadd2(tinv_acc[2], tinv_acc[3], upd_acc[2], upd_acc[3])
-                tinv_acc[4], tinv_acc[5] = fadd2(tinv_acc[4], tinv_acc[5], upd_acc[4], upd_acc[5])
-                tinv_acc[6], tinv_acc[7] = fadd2(tinv_acc[6], tinv_acc[7], upd_acc[6], upd_acc[7])
+            invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx)
 
             nvvm.stmatrix(
                 sIntermediate_ptr + 1 * (cfg.b_t * cfg.b_t) + intermediate_idx,
