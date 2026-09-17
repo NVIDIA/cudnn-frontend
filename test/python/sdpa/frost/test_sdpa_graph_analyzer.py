@@ -1587,7 +1587,11 @@ def test_paged_facts_declared_max_seq_len_and_single_table():
 def test_paged_probe_declines():
     assert not _eligible(_mk_paged_graph(page_size=48)), "page_size must divide 128 or be a multiple of it"
     assert engines.engine_name() in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
-    assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d256 flavors only"
+    # Inverted when the d512 flavor was wired (kept, not deleted); d=384 rides
+    # its (256, 512] envelope, d=576 (absorbed MLA) has no envelope at all.
+    assert engines.engine_name() in _eligible(_mk_paged_graph(d=512)), "paged KV is wired on the d512 flavor"
+    assert engines.engine_name() in _eligible(_mk_paged_graph(d=384)), "d=384 rides the d512 flavor envelope"
+    assert not _eligible(_mk_paged_graph(d=576)), "no kernel-flavor envelope covers d_qk=576"
     assert not _eligible(_mk_paged_graph(padding=False)), "paged KV needs the padding mask (per-batch KV lengths)"
     facts = ga.analyze(_mk_paged_graph(max_seq_len=8 * 16 + 1))
     assert facts.invalid is not None, "a declared max S_kv beyond the block table's reach is invalid"

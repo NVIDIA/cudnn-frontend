@@ -68,38 +68,42 @@ def _ref(q, k_pool, v_pool, block_table, seq_lens, hnd, scale):
     return out[:, :, 0], lse[:, :, 0]
 
 
-def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0):
+def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0, d_v=None):
     """Page pools + a scattered block table.  Returns (k_pool, v_pool, k_container,
     v_container, block_table[B, 1, max_pages, 1]) — the containers are the
-    [num_pages, H_kv, page_size, D]-dim views the graph declares."""
+    [num_pages, H_kv, page_size, D]-dim views the graph declares.  ``d_v`` (default
+    ``d``) sizes the V pool's head dim separately (mixed head dims)."""
+    d_v = d if d_v is None else d_v
     torch.manual_seed(seed)
     dev = "cuda"
     num_pages = B * max_pages + 5
     if hnd:
         k_pool = torch.randn(num_pages, KH, P, d, device=dev, dtype=dtype)
-        v_pool = torch.randn(num_pages, KH, P, d, device=dev, dtype=dtype)
+        v_pool = torch.randn(num_pages, KH, P, d_v, device=dev, dtype=dtype)
         k_c, v_c = k_pool, v_pool
     else:
         k_pool = torch.randn(num_pages, P, KH, d, device=dev, dtype=dtype)
-        v_pool = torch.randn(num_pages, P, KH, d, device=dev, dtype=dtype)
+        v_pool = torch.randn(num_pages, P, KH, d_v, device=dev, dtype=dtype)
         k_c, v_c = k_pool.permute(0, 2, 1, 3), v_pool.permute(0, 2, 1, 3)
     bt = torch.randperm(num_pages, device=dev)[: B * max_pages].to(torch.int32).view(B, 1, max_pages, 1).contiguous()
     return k_pool, v_pool, k_c, v_c, bt
 
 
-def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, stats=False, s_q=1, max_seq_len=None, want_split=None, causal_br=False):
+def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, stats=False, s_q=1, max_seq_len=None, want_split=None, causal_br=False, d_v=None):
     """Build + run the paged graph on the FROST engine's own best plan (or the
     ``want_split`` leg), check O (+ Stats) against ``_ref_rows`` and return the
-    plan.  ``causal_br`` adds the bottom-right causal mask (MTP at S_q > 1)."""
+    plan.  ``causal_br`` adds the bottom-right causal mask (MTP at S_q > 1);
+    ``d_v`` (default ``d``) gives V / O their own head dim (mixed head dims)."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
 
     dev = "cuda"
+    d_v = d if d_v is None else d_v
     scale = 1.0 / math.sqrt(d)
-    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype)
+    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype, d_v=d_v)
     q_gpu = torch.randn(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)
-    o_gpu = torch.empty(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)
+    o_gpu = torch.empty(B, s_q, H, d_v, device=dev, dtype=dtype).transpose(1, 2)
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     slk = seq_lens.view(B, 1, 1, 1)
     slq = torch.full((B, 1, 1, 1), s_q, dtype=torch.int32, device=dev)
@@ -126,7 +130,7 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
     if causal_br:
         kw["use_causal_mask_bottom_right"] = True
     o, st = g.sdpa(**kw)
-    o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
+    o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
     stats_gpu = None
     if stats:
         stats_gpu = torch.empty(B, H, s_q, 1, device=dev, dtype=torch.float32)
@@ -254,6 +258,47 @@ def test_paged_graph_partial_pack_gqa(hnd, h, kh, s_q):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+def test_paged_graph_d512(hnd, page_size):
+    """d=512 selects the d512 (DSv4-class) f16 flavor, whose TMA-LDG warp is
+    role-split across the cga4 cluster: the sub-group 0 CTAs stream the K
+    boxes, the sub-group 1 CTAs the V boxes, each through its own block table.
+    MQA 8:1 (PackGQA) decode, mixed lengths incl. 0 and 1, a tile-unaligned
+    tail and a length ending on a page/tile boundary; Stats requested."""
+    _run_graph(5, 8, 1, 512, page_size, -(-1100 // page_size), [300, 77, 0, 1, 1024], hnd, stats=True)
+
+
+@pytest.mark.L0
+def test_paged_graph_d512_envelope_d384():
+    """d=384 rides the d512 flavor zero-padded (the (256, 512] envelope); bf16, GQA 8:2."""
+    _run_graph(3, 8, 2, 384, 32, 40, [1000, 1, 1279], hnd=False, dtype=torch.bfloat16, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk, d_v", [(256, 512), (512, 256)], ids=["dqk256_dv512", "dqk512_dv256"])
+def test_paged_graph_d512_cross_envelope(d_qk, d_v):
+    """One head dim at the d256 flavor's own width, the other in (256, 512]: the
+    paged gate admits the pair (both > 128, both <= 512 -- the mixed-dims clause
+    declines only a pair that would select d192x128) and the lowering picks the
+    d512 flavor, the smallest envelope covering BOTH dims, zero-padding the
+    256-wide operand (K boxes past d_qk read TMA-OOB zeros; the second V CTA's
+    box past d_v reads zeros and its O columns are store-clipped). Evidence that
+    the cross-envelope acceptance is correct, not just admitted (review). bf16,
+    GQA 8:2, HND, page 32, lengths incl. 0 and a tile-unaligned tail, Stats on."""
+    _run_graph(3, 8, 2, d_qk, 32, 40, [1000, 0, 1279], hnd=True, dtype=torch.bfloat16, stats=True, d_v=d_v)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [2, 4])
+def test_paged_graph_d512_s_q_up_to_4(s_q):
+    """Speculative-decode-shaped S_q in [2, 4] over a d512 paged cache (no
+    causal band: every q row attends the whole live KV); GQA 16:2 PackGQA, HND,
+    a batch of one live token and one ending past a tile boundary."""
+    _run_graph(3, 16, 2, 512, 16, 70, [1000, 1, 1100], hnd=True, s_q=s_q, stats=True)
+
+
+@pytest.mark.L0
 def test_paged_graph_prefill_shaped_s_q():
     """The same engine serves S_q > 1 over a paged cache (paged prefill / chunked
     prefill); all q rows attend the whole live KV (no causal mask)."""
@@ -349,8 +394,54 @@ def test_paged_graph_declines_off_contract():
 
     assert _offers(_build(16))
     assert not _offers(_build(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
-    assert not _offers(_build(16, d=512)), "paged KV is wired on the d128 / d256 flavors only"
+    # Inverted when the d512 flavor was wired (kept, not deleted: a regression
+    # to the old decline must fail here). d=576 (absorbed-MLA d_qk) has no
+    # flavor envelope at all, so it stays declined.
+    assert _offers(_build(16, d=512)), "paged KV is wired on the d512 flavor"
+    assert _offers(_build(16, d=384)), "d=384 rides the d512 flavor envelope"
+    assert not _offers(_build(16, d=576)), "no kernel-flavor envelope covers d_qk=576"
     assert not _offers(_build(16, padding=False)), "paged KV requires the padding mask"
+
+
+@pytest.mark.L0
+def test_paged_api_declines_on_cc107(monkeypatch):
+    """The standalone adapter's twin of the engine rows' cc10.7 gap: that line
+    routes every flavor to its sibling kernel and none carries the PAGED_KV
+    loader (their compile() takes no block-table strides), so paged KV declines
+    typed there -- d512 and the long-wired d128 alike -- before template loading,
+    while the same request is admitted on cc10.0 / cc10.3.  CPU only: the device
+    capability is monkeypatched, descriptors carry no storage."""
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def desc(shape, name):
+        b, h, s, d = shape
+        stride = (s * h * d, d, h * d, 1)
+        return TensorDesc(
+            dtype=torch.float16, shape=shape, stride=stride, stride_order=TensorDesc._compute_stride_order(shape, stride), device="cuda", name=name
+        )
+
+    def api(d):
+        return SdpaFwdDslSm100(
+            desc((2, 8, 1, d), "q"),
+            desc((16, 2, 16, d), "k"),
+            desc((16, 2, 16, d), "v"),
+            desc((2, 8, 1, d), "o"),
+            None,
+            seq_kv_lens_present=True,
+            paged_page_size=16,
+            paged_max_seq_len_kv=128,
+        )
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    for cc in ((10, 0), (10, 3)):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, cc=cc, **k: cc)
+        for d in (128, 512):
+            assert api(d).check_support(), (cc, d)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    for d in (128, 512):
+        with pytest.raises(NotImplementedError, match="cc10.7 sibling kernels carry no PAGED_KV"):
+            api(d).check_support()
 
 
 # --- kernel template, direct -----------------------------------------------
@@ -466,6 +557,16 @@ def test_paged_kernel_d256(page_size):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("page_size", [16, 64, 128])
+def test_paged_kernel_d512(page_size):
+    """The d512 (DSv4) f16 flavor carries the same PAGED_KV specialization on its
+    role-split loader: cga4x1 (K box = 64 rows per sub-group-0 CTA, V box = the
+    128-row tile over each sub-group-1 CTA's 256 d_v columns), forced 4 splits
+    with one empty range."""
+    _run_kernel(2, 8, 2, page_size, -(-1100 // page_size), [1000, 77], hnd=page_size == 16, splits=4, cta_mma=2, d=512)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "h,kh,pack_g,d",
     [(6, 2, 1, 128), (10, 2, 1, 128), (24, 2, 4, 128), (12, 2, 2, 128), (24, 2, 4, 256), (256, 1, 128, 128)],
@@ -545,19 +646,21 @@ def test_paged_adapter_cuda_graph_replay_no_host_sync():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 512], ids=["d128", "d512"])
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
-def test_paged_graph_thd_queries(hnd):
+def test_paged_graph_thd_queries(hnd, d):
     """Ragged Q/O (packed [T, H, D] storage + ragged offsets, per-sequence
     ``seq_len_q``) attending K/V page pools through block tables: each sequence's
     q tokens see its own live KV pages. Only Q/O are ragged — the pools are
     ordinary dense tensors — and the THD scheduler walks the Q units while the
-    KV side comes from ``seq_len_kv`` + the tables."""
+    KV side comes from ``seq_len_kv`` + the tables. d=512 runs the role-split
+    flavor's THD path over pools (no packed-total K/V descriptor clamp there)."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
     from cudnn.sdpa.fwd.engines import engine_name
 
     dev, dtype = "cuda", torch.float16
-    H, KH, d, P, max_pages = 8, 2, D, 16, 20
+    H, KH, P, max_pages = 8, 2, 16, 20
     q_lens = [37, 130, 5]
     kv_lens = [300, 77, 129]
     B, T, S_max = len(q_lens), sum(q_lens), max(q_lens)

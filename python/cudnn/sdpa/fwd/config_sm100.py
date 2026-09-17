@@ -167,7 +167,7 @@ class TemplateParams:
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
 # other flavor must reject it rather than silently reading K/V as dense.
-_PAGED_KV_FLAVORS = frozenset({"d128", "d256"})
+_PAGED_KV_FLAVORS = frozenset({"d128", "d256", "d512"})
 
 # The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature: no
 # SM100 kernel body reads CFG.EPILOGUE_GATE, so a module loaded with the flag on
@@ -908,6 +908,10 @@ class CfgD512:
     # the pack size with the GQA ratio would mis-mask MTP rows.
     PACK_G: int = 1
 
+    # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
+
 
 def _validate_cfg_d512(cfg: CfgD512) -> None:
     """Consistency checks on the (mostly hardcoded) d512 geometry."""
@@ -996,6 +1000,8 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
         PACK_G=_pack_g(params, CfgD512.TILE_M, partial=False),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d512(cfg)
     return cfg, _tma_iters(cfg)
