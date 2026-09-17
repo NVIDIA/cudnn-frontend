@@ -320,9 +320,11 @@ python/cudnn/
         sm100/prefill_d512_f16.py
         sm100/split_combine.py        the split-KV reduction pass
         sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
-        sm120/prefill_f16.py          general SM120 template (any head dim)
+        sm120/prefill_f16.py          general SM120 template (d <= 256)
         sm120/prefill_d256_f16.py     d256 flavor
         sm120/prefill_d512_f16.py     d512 flavor
+        sm120/prefill_fp8.py          general SM120 FP8 template (d <= 256)
+        sm120/prefill_d512_fp8.py     d512 flavor for FP8
         sm120/_common.py              SM120-only warp-level primitives
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either
