@@ -372,6 +372,17 @@ class Capabilities:
     # APPENDED after the epilogue-gate fields (append-only contract above):
     # test_capabilities_positional_prefix_is_append_only pins the tail.
     pack_gqa_partial_d_shapes: Optional[frozenset] = None
+    # Shapes whose kernel flavors wire the PAGED_KV specialization (block-table
+    # indirection on the K/V TMA loads). None = every flavor in d_shapes. A set
+    # = a paged graph is served only when the flavor the lowering SELECTS
+    # (_selected_d_shape, the smallest covering envelope) is a member — the
+    # test is on the selection, not the raw dims, so mixed head dims that ride a
+    # wired envelope ((256, 128) -> d256) are served and an unwired selection
+    # ((512, 128) -> d512) is declined. Kernel-body gates mirror it
+    # (config_sm100._PAGED_KV_FLAVORS is the backstop).  APPENDED after
+    # pack_gqa_partial_d_shapes (append-only contract above; the same test
+    # pins it).
+    paged_d_shapes: Optional[frozenset] = None
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -693,21 +704,27 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
-        # Served by the d128 / d256 f16/bf16 kernels' PAGED_KV specialization
-        # (config_sm100._validate_params mirrors these as its backstop). The
-        # attention sink composes with it: the sink is a per-row epilogue fold
-        # and PAGED_KV only changes the K/V TMA-LDG warp (validated together in
-        # test_sdpa_fwd_paged_sm100, S_q 1..4, PackGQA on/off, HND/NHD, with a
-        # left window). Sink + split-KV stays declined above (the combine is
-        # not sink-aware), so sink decode runs unsplit.
+        # Served by the f16/bf16 kernels' PAGED_KV specialization on the
+        # flavors in paged_d_shapes (config_sm100._validate_params mirrors
+        # these as its backstop). The attention sink composes with it: the
+        # sink is a per-row epilogue fold and PAGED_KV only changes the K/V
+        # TMA-LDG warp (validated together in test_sdpa_fwd_paged_sm100,
+        # S_q 1..4, PackGQA on/off, HND/NHD, with a left window, on the d128,
+        # d192x128 and d256 flavors). Sink + split-KV stays declined above
+        # (the combine is not sink-aware), so sink decode runs unsplit.
         if facts.is_fp8 or facts.is_mxfp8:
             return "paged KV is served by the f16/bf16 kernel only"
         if not facts.padded:
             return "paged KV requires use_padding_mask with seq_len_kv (the per-batch KV length bounds the block-table walk)"
-        if facts.d_qk > 256 or facts.d_v > 256:
-            return f"paged KV is wired on the d128 / d256 flavors only (d_qk, d_v <= 256); got ({facts.d_qk}, {facts.d_v})"
-        if (facts.d_qk > 128 or facts.d_v > 128) and not (facts.d_qk > 128 and facts.d_v > 128):
-            return f"paged KV with mixed head dims ({facts.d_qk}, {facts.d_v}) would select the d192x128 flavor, which is not wired"
+        if capabilities.paged_d_shapes is not None:
+            # The flavor the lowering picks (smallest covering envelope), not
+            # the raw dims: (256, 128) and (64, 192) ride the wired d256
+            # envelope, (192, 128) is the native d192x128 flavor, and a
+            # d512-envelope selection is declined until that kernel wires it.
+            selected = _selected_d_shape(capabilities, facts)
+            if selected not in capabilities.paged_d_shapes:
+                wired = ", ".join(f"d{sq}" if sq == sv else f"d{sq}x{sv}" for sq, sv in sorted(capabilities.paged_d_shapes))
+                return f"paged KV is wired on the {wired} kernel flavors only; head dims ({facts.d_qk}, {facts.d_v}) select {selected}"
         p = facts.page_size
         if p % 8 != 0 or (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
             return f"page_size {p} must be a multiple of 8 that divides the 128-row KV tile or is a multiple of it"
@@ -828,10 +845,21 @@ def _sm100_spec() -> EngineSpec:
             swa=True,
             padded=True,
             # Paged KV caches (paged_attention_k/v_table + seq_len_kv) on the
-            # d128 flavor: block-table indirection on the K/V TMA loads, HND
-            # and NHD page layouts, KV split + combine (mismatch() holds the
-            # d128 / dense / padded / page-geometry conditions).
+            # d128 / d192x128 / d256 flavors: block-table indirection on the
+            # K/V TMA loads, HND and NHD page layouts, K and V pools of
+            # different row widths (d192x128), KV split + combine (mismatch()
+            # holds the padded / page-geometry conditions; paged_d_shapes below
+            # names the wired flavors — the d512 kernel carries no PAGED_KV
+            # specialization yet). Decode shapes on the d128 flavor ride the
+            # decode tile (TILE_CGA_M=1, below); d192x128 has no decode tile
+            # yet, so its paged decode runs the prefill geometry (one live row
+            # per 128-row Q tile), measured behind the backend's paged decode
+            # plan (B200, b=32, S_q=1, page 16, bf16: 32/32 MHA 788.7 us vs
+            # 476.9 us, 32/8 GQA 275.8 vs 199.6 us -- the tracker's gaps
+            # table). A d192x128 decode tile is the follow-up, as the d128
+            # tile was: parity is a kernel's job, not an ordering rule's.
             paged_kv=True,
+            paged_d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
             sink=True,
             stats=True,
             stats_log2=True,

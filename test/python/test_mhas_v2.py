@@ -1209,6 +1209,233 @@ def test_sdpa_random_fwd_unified_block_mask_L0(env_info, test_no, request, cudnn
     exec_sdpa(test.cfg, request, cudnn_handle)
 
 # # ==================================
+# # L0 paged KV with MLA-shaped head dims (d_qk != d_v) on the FROST SM100 row
+# # ==================================
+
+# The routing gate and the served-engine assertion are the shared
+# _require_frost_sm100() / _exec_sdpa_on_frost() above.
+
+
+def _paged_mla_randomization(s_q_s_kv):
+    """The paged MLA sweep space shared by the decode and prefill-shaped fuzzes:
+    the native d192x128 flavor and mixed dims such as (256, 128) / (64, 192) that
+    ride the d256 envelope, page sizes {16, 32, 64, 128} (the FlashInfer / vLLM
+    range), MHA and GQA head groups, every mask family, both f16 dtypes."""
+    return RandomizationContext(
+        batches=RandomBatchSize(min=1, max=8, with_high_probability=[1,8]),
+        s_q_s_kv=s_q_s_kv,
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=8, d_qk_max=256, d_v_min=8, d_v_max=256, head_dim_distribution={"d_qk=d_v":1, "d_qk=random":2}, with_high_probability=[(192,128), (256,128), (64,192)]),
+        head_count=RandomHeadGenerator(min=4, max=32, head_group_options=(1, 1, 0)),
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(causal=4, left_window_only=2, right_window_only=1, band_around_diag=1, no_mask=6),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 2}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 0}),
+        block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16,32,64,128]),
+    )
+
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=2006), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_fwd_paged_mla_decode_L0(env_info, test_no, request, cudnn_handle):
+    """Paged decode / MTP (s_q in [1, 8]) over MLA-shaped head dims: the native
+    d192x128 flavor ((192, 128); envelope for e.g. (136, 72)) and mixed dims such as
+    (256, 128) / (64, 192) on the d256 envelope, next to the square draws the d128 /
+    d256 flavors already served. Every graph must run and must be served by FROST
+    (asserted through the routing tally): under the opt-in the row leads wherever it
+    is eligible. At these shapes the d192x128 and d256 flavors run their prefill tile
+    (only d128 has a decode tile; the tracker's gaps table records the measured
+    d192x128 decode gap and its follow-up); the reference check covers the paged
+    loader either way."""
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with _paged_mla_randomization(
+        RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=2, s_kv_max=8192, s_q_distribution={"s_q=1":6, "s_q=s_kv":0, "s_q=random":4, "s_q>s_kv":0}),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = True
+    test.showConfig(test_no, request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=2007), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_fwd_paged_mla_frost_L0(env_info, test_no, request, cudnn_handle):
+    """Paged PREFILL-shaped queries (s_q in [64, 256]: chunked prefill over a paged
+    cache) with MLA-shaped head dims on the FROST SM100 engine -- the d192x128 paged
+    loader under every mask, page size and head group the decode sweep draws, at a Q
+    extent where its prefill geometry is the right tile (B200 32/8, s_q=64,
+    bottom-right causal: 244 us on FROST vs 917 us on the backend's prefill engine).
+    Every graph that runs must be served by FROST (asserted through the routing
+    tally). The s_q = s_kv branch of the sequence generator is off: it does not clamp
+    to s_q_max and would draw full-square prefills up to 8192 rows."""
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with _paged_mla_randomization(
+        RandomSequenceLength(s_q_min=64, s_q_max=256, s_kv_min=64, s_kv_max=8192, s_q_distribution={"s_q=1":0, "s_q=s_kv":0, "s_q=random":10, "s_q>s_kv":0}),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = True
+    test.showConfig(test_no, request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+def test_sdpa_fwd_paged_d192x128_decode_frost_L0(env_info, request, cudnn_handle):
+    """Deterministic decode over a paged (192, 128) cache: b=8, 32/32 heads (a
+    Kimi-Linear-class MLA layer), s_q=1, page 16, bf16, mixed per-batch KV lengths
+    up to 4096 incl. a page/tile-boundary length, a one-token and a single-page
+    sequence -- FlashInfer's spelling (no mask, per-batch seq_len_q of 1). Must run
+    and must be served by sdpa_fwd_prefill_sm100 (a native decline fails here
+    instead of passing green). This is the shape the d192x128 paged loader was
+    measured on (the tracker's gaps table) and where its decode tile will land."""
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=2006,
+        rng_geom_seed=2006,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=8,
+        d_qk=192,
+        d_v=128,
+        s_q=1,
+        s_kv=4096,
+        h_q=32,
+        h_k=32,
+        h_v=32,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        left_bound=None,
+        right_bound=None,
+        seq_len_q=[1, 1, 1, 1, 1, 1, 1, 1],
+        seq_len_kv=[4096, 3000, 17, 1, 2048, 129, 4095, 512],
+        implementation=cudnn.attention_implementation.AUTO,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, 1), request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
+@pytest.mark.parametrize("d_qk, d_v, h_q, h_kv", [(256, 128, 32, 32), (64, 192, 32, 8)], ids=["d256x128_mha", "d64x192_gqa"])
+@pytest.mark.L0
+def test_sdpa_fwd_paged_envelope_decode_frost_L0(env_info, request, cudnn_handle, d_qk, d_v, h_q, h_kv):
+    """Deterministic decode over a paged cache on the mixed-dims ENVELOPE shapes this
+    row newly admits onto the d256 flavor -- (256, 128) 32/32 MHA and (64, 192) 32/8
+    GQA, head dims FROST serves zero-padded to the flavor's width. b=8, s_q=1, page
+    16, bf16, mixed per-batch KV lengths up to 4096. Must run and must be served by
+    FROST: the head-dim gate is the flavor the lowering SELECTS, and the previous
+    "exactly one dim > 128" approximation declined both (INVERTED from a decline)."""
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=2008,
+        rng_geom_seed=2008,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=8,
+        d_qk=d_qk,
+        d_v=d_v,
+        s_q=1,
+        s_kv=4096,
+        h_q=h_q,
+        h_k=h_kv,
+        h_v=h_kv,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        left_bound=None,
+        right_bound=None,
+        seq_len_q=[1, 1, 1, 1, 1, 1, 1, 1],
+        seq_len_kv=[4096, 3000, 17, 1, 2048, 129, 4095, 512],
+        implementation=cudnn.attention_implementation.AUTO,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, 1), request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+def test_sdpa_fwd_paged_d192x128_prefill_frost_L0(env_info, request, cudnn_handle):
+    """Deterministic prefill-shaped queries over a paged (192, 128) cache: b=4, 32/8
+    GQA, s_q=128 with per-batch query lengths (a full chunk, a partial chunk, one
+    token, a chunk as long as its KV), page 16, bf16, bottom-right causal, mixed KV
+    lengths up to 4096 -- chunked prefill on a Kimi-Linear-class layer. Must run and
+    must be served by FROST (a native decline fails here instead of passing green)."""
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=2007,
+        rng_geom_seed=2007,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=4,
+        d_qk=192,
+        d_v=128,
+        s_q=128,
+        s_kv=4096,
+        h_q=32,
+        h_k=8,
+        h_v=8,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
+        left_bound=None,
+        right_bound=0,
+        seq_len_q=[128, 77, 1, 128],
+        seq_len_kv=[4096, 3000, 129, 128],
+        implementation=cudnn.attention_implementation.AUTO,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, 1), request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+# # ==================================
 # # L0 fprop bias tests
 # # ==================================
 
