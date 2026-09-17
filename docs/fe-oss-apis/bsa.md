@@ -40,9 +40,16 @@ environments that force an older DSL.
 
 ## Forward
 
+The `cudnn.torch` BSA functions are lazy aliases of the existing `cudnn` and
+`cudnn.BSA` functions, with identical signatures, outputs, and supported configurations.
+
 ```python
 import torch
-from cudnn import BSA
+from cudnn.torch import (
+    block_sparse_attention_forward,
+    block_sparse_attention_backward,
+    block_sparse_attention_fp8_forward,
+)
 
 q = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(1, 8, 2048, 128, device="cuda", dtype=torch.bfloat16)
@@ -54,7 +61,7 @@ q2k_block_index = torch.arange(4, device="cuda", dtype=torch.int32)
 q2k_block_index = q2k_block_index.view(1, 1, 1, 4).expand(1, 8, 16, 4).contiguous()
 block_sizes = torch.full((32,), 64, device="cuda", dtype=torch.int32)
 
-result = BSA.block_sparse_attention_forward(
+result = block_sparse_attention_forward(
     q,
     k,
     v,
@@ -160,7 +167,7 @@ BF16 Q, K, and V tensors in `BHSD` layout and performs FP8 quantization
 internally:
 
 ```python
-fp8_result = BSA.block_sparse_attention_fp8_forward(
+fp8_result = block_sparse_attention_fp8_forward(
     q,
     k,
     v,
@@ -203,7 +210,7 @@ operation. It recomputes probabilities from the forward output and LSE:
 
 ```python
 dout = torch.randn_like(o)
-grads = BSA.block_sparse_attention_backward(
+grads = block_sparse_attention_backward(
     dout,
     q,
     k,
@@ -276,8 +283,8 @@ BSHD layout, including split-KV execution; FP8 output is contiguous BF16 BHSD.
 Compilation is lazy. The first call for a new static configuration JIT-compiles
 the relevant kernel; subsequent calls reuse an in-process cache.
 
-The current public surface consists of allocating function wrappers under
-`cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
+The Torch public surface consists of allocating function wrappers under
+`cudnn.torch`, also available under `cudnn` and `cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
 lifecycle for BSA.
 
 Correctness tests and FP32 references are under
@@ -290,11 +297,21 @@ We would like to express our gratitude to [huangyitong.hyt@alibaba-inc.com](mail
 throughout the deployment process, which has continuously advanced the BSA kernel
 toward Speed of Light.
 
-## Experimental JAX API
+## Experimental JAX support
 
-The JAX draft reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
+`cudnn.jax.block_sparse_attention_forward` and
+`cudnn.jax.block_sparse_attention_backward` provide explicit forward/backward;
+`cudnn.jax.block_sparse_attention` adds first-order reverse-mode differentiation.
+All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
+The existing `cudnn` and `BSA` Torch APIs are unchanged. The former `_jax`
+exports have been removed without compatibility aliases.
+
+The JAX implementation reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
 backward, and gradient conversion kernels. Install `jax[cuda13]` alongside the
 frontend (CuTeDSL >=4.7, JAX >=0.9.1). The runtime imports no PyTorch; torch parity tests are separate.
+
+The JAX signatures omit Torch-specific launch options and caller-provided
+output buffers. XLA owns the outputs and workspaces.
 
 ### Initial contract
 
@@ -306,7 +323,7 @@ frontend (CuTeDSL >=4.7, JAX >=0.9.1). The runtime imports no PyTorch; torch par
 | Layout | Compact BHSD or BSHD, independently specialized |
 | Sparsity | 128-token blocks, int32 indices `[B,H,Sq/128,C]`, no `block_sizes` |
 | Counts | Fixed even `block_sparse_num` in `[2,C]`, or runtime int32 `q2k_block_nums[B,H,Sq/128]` |
-| Differentiation | First-order reverse-mode Q/K/V gradients through `block_sparse_attention_jax` |
+| Differentiation | First-order reverse-mode Q/K/V gradients through `block_sparse_attention` |
 
 Variable counts must be in `[1,C]`, or `[0,C]` with
 `allow_empty_block_nums=True`. Only each row's active prefix is read. Active
@@ -328,10 +345,10 @@ runtime operands. Do not mutate saved forward inputs or metadata before backward
 import jax
 import jax.numpy as jnp
 from functools import partial
-from cudnn import (
-    block_sparse_attention_forward_jax as forward,
-    block_sparse_attention_backward_jax as backward,
-    block_sparse_attention_jax as attention,
+from cudnn.jax import (
+    block_sparse_attention_forward as forward,
+    block_sparse_attention_backward as backward,
+    block_sparse_attention as attention,
 )
 
 q = jnp.ones((1, 2, 256, 64), dtype=jnp.bfloat16)

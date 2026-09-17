@@ -55,11 +55,13 @@ from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.cuda import tensor_map as tmap
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.frost.device import current_device
+from cudnn.frost.device import current_device, multiprocessor_count
 from cudnn.frost.tile_dsl.barrier import PipelineState, advance, arrive_expect_tx, wait
 from cudnn.frost.tile_dsl.handles import GmemTileTma, SmemTile
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, lane_group_sum
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global, tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
+
+from .qk_norm_rope import check_norm_weights_match_recipe
 
 ELEMS_PER_ACCESS = 8  # bf16 elements in one 16-byte access
 WORDS_PER_ACCESS = 4  # 32-bit words in one 16-byte access
@@ -265,6 +267,7 @@ _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
 #                                                                                               4 wavefronts = ideal
 #   sOut     Int32  STAGES*TILE_ROWS*128     lanes, 16 B     TMA               16 B (contig)    NONE, same argument
 #   sRstd    Fp32   STAGES*TILE_ROWS         1 lane per row  lanes 0..R-1      4 B              n/a (R*4 <= 128 B)
+#            (only when want_rstd traces True; absent from the RoPE-only / no-rstd kernel)
 #   mb_*     Int64  STAGES each              --              --                --               n/a
 # ---------------------------------------------------------------------------
 
@@ -367,8 +370,8 @@ def _issue_tile_load(
 @cute.kernel
 def frost_qk_norm_rope_tma(
     mQ: cute.Tensor,  # [T, H_q, D] -- bound for its element_type only; Q/K data
-    mWq: cute.Tensor,  # [D]           moves entirely through the descriptors
-    mWk: cute.Tensor,  # [D]
+    mWq: Optional[cute.Tensor],  # [D]  moves entirely through the descriptors
+    mWk: Optional[cute.Tensor],  # [D]  None (both): RoPE-only -- no RMSNorm, no weight loads, no rstd
     mCos: cute.Tensor,  # [T, ROPE_DIM]
     mSin: cute.Tensor,  # [T, ROPE_DIM]
     mRstdQ: Optional[cute.Tensor],  # [T, H_q]  fp32, or None
@@ -411,12 +414,20 @@ def frost_qk_norm_rope_tma(
     half_lanes = cutlass.const_expr(rope_lanes // 2)
     tile_bytes = cutlass.const_expr(tile_rows * d * BPE)
     lanes_per_subtile = cutlass.const_expr(TMA_GRANU_ELEMS // ELEMS_PER_ACCESS)  # 16
-    want_rstd = cutlass.const_expr(mRstdQ is not None)
+    # Presence switches, decided at trace time (same idiom for both): None
+    # weights trace the RoPE-only kernel (no sum-of-squares, no rsqrt, no
+    # weight loads), None rstd traces the store-less one. The host refuses
+    # want_rstd without apply_norm, so the conjunction below never hides a
+    # requested store -- it only keeps the kernel self-consistent.
+    apply_norm = cutlass.const_expr(mWq is not None)
+    want_rstd = cutlass.const_expr(apply_norm and mRstdQ is not None)
 
     io_dtype = mQ.element_type  # a trace-time type object, NOT a const_expr candidate
     sIn_raw = cutlass.Array(io_dtype, stages * tile_elems, alignment=128, space=cutlass.AddressSpace.smem)
     sOut_raw = cutlass.Array(io_dtype, stages_o * tile_elems, alignment=128, space=cutlass.AddressSpace.smem)
-    sRstd = cutlass.Array(cutlass.Float32, stages * tile_rows, alignment=16, space=cutlass.AddressSpace.smem)
+    # Allocated only when the rstd store exists: both uses sit under
+    # const_expr(want_rstd), so the RoPE-only / no-rstd trace keeps the SMEM too.
+    sRstd = cutlass.Array(cutlass.Float32, stages * tile_rows, alignment=16, space=cutlass.AddressSpace.smem) if cutlass.const_expr(want_rstd) else None
     mb_full = cutlass.Array(cutlass.Int64, stages, alignment=16, space=cutlass.AddressSpace.smem)
 
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
@@ -554,19 +565,27 @@ def frost_qk_norm_rope_tma(
             off_out = so * cutlass.Int32(tile_elems) + lane_off
 
             xs = sIn_raw.load(off_in, vector_size=ELEMS_PER_ACCESS, alignment=16).to(cutlass.Float32).to_elements()
-            acc = cutlass.Float32(0.0)
-            for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
-                acc = acc + xs[i] * xs[i]
-            rstd = cute.math.rsqrt(lane_group_sum(acc, WARP) * cutlass.Float32(1.0 / d) + eps, fastmath=True)
+            # Pre-bound so the names exist on both trace paths; under
+            # apply_norm they are replaced by the real rsqrt / normed row, and
+            # under RoPE-only `ys IS xs`: the passthrough dims [rope_dim, D)
+            # are widened and re-narrowed with no fp32 op in between -> a
+            # bit-exact copy (asserted by the tests).
+            rstd = cutlass.Float32(1.0)
+            ys = list(xs)
+            if cutlass.const_expr(apply_norm):
+                acc = cutlass.Float32(0.0)
+                for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                    acc = acc + xs[i] * xs[i]
+                rstd = cute.math.rsqrt(lane_group_sum(acc, WARP) * cutlass.Float32(1.0 / d) + eps, fastmath=True)
 
-            # Secondary loads at their POINT OF USE, for the same reason as the
-            # LDG kernel: both are cache hits by construction, and hoisting them
-            # holds 24 live fp32 per row across the reduction.
-            w_addr = (mWq.iterator.toint() if is_q else mWk.iterator.toint()) + (
-                sub.to(cutlass.Int64) * cutlass.Int64(TMA_GRANU_ELEMS) + col.to(cutlass.Int64) * cutlass.Int64(ELEMS_PER_ACCESS)
-            ) * cutlass.Int64(BPE)
-            ws = [v for pair in [f16x2_to_f32(w, dtype=mWq.element_type) for w in ld_global_v4(w_addr, cutlass.Int32)] for v in pair]
-            ys = [xs[i] * rstd * ws[i] for i in range(ELEMS_PER_ACCESS)]
+                # Secondary loads at their POINT OF USE, for the same reason as the
+                # LDG kernel: both are cache hits by construction, and hoisting them
+                # holds 24 live fp32 per row across the reduction.
+                w_addr = (mWq.iterator.toint() if is_q else mWk.iterator.toint()) + (
+                    sub.to(cutlass.Int64) * cutlass.Int64(TMA_GRANU_ELEMS) + col.to(cutlass.Int64) * cutlass.Int64(ELEMS_PER_ACCESS)
+                ) * cutlass.Int64(BPE)
+                ws = [v for pair in [f16x2_to_f32(w, dtype=mWq.element_type) for w in ld_global_v4(w_addr, cutlass.Int32)] for v in pair]
+                ys = [xs[i] * rstd * ws[i] for i in range(ELEMS_PER_ACCESS)]
 
             if cutlass.const_expr(rope_dim > 0):
                 in_rope = lane < cutlass.Int32(rope_lanes)
@@ -685,8 +704,8 @@ def qk_norm_rope_tma_launch(
     k: cute.Tensor,
     q_out: cute.Tensor,
     k_out: cute.Tensor,
-    w_q: cute.Tensor,
-    w_k: cute.Tensor,
+    w_q: Optional[cute.Tensor],
+    w_k: Optional[cute.Tensor],
     cos: cute.Tensor,
     sin: cute.Tensor,
     rstd_q: Optional[cute.Tensor],
@@ -772,6 +791,11 @@ compiled_cache = {}
 
 
 class QkNormRopeTmaRecipe(NamedTuple):
+    """Build-time facts of one TMA norm+RoPE launch (a legal compile key, like
+    ``QkNormRopeRecipe``). ``apply_norm`` is appended with a default so every
+    existing recipe reads the same; ``run_qk_norm_rope_tma`` checks it against
+    the bound weights in both directions."""
+
     compiled: object
     h_q: int
     h_kv: int
@@ -783,6 +807,7 @@ class QkNormRopeTmaRecipe(NamedTuple):
     threads: int
     want_rstd: bool
     ctas_per_sm: int
+    apply_norm: bool = True
 
 
 def _fake(dtype, shape, stride_order):
@@ -834,7 +859,11 @@ def compile_qk_norm_rope_tma(
     refill_pos: int = DEFAULT_REFILL_POS,
     fused_store_wait: bool = DEFAULT_FUSED_STORE_WAIT,
     ctas_per_sm: int = 8,
+    apply_norm: bool = True,
 ) -> QkNormRopeTmaRecipe:
+    """Build the TMA artifact from shapes alone. ``apply_norm=False`` traces the
+    RoPE-only kernel (weights traced as ``None``, no rstd allowed) and is part
+    of the cache key so a norm-on artifact is never reused with ``None`` weights."""
     validate_shape(d, rope_dim, h_q, h_kv, tile_rows, threads_per_cta)
     # None means the DEFAULT, not "match stages" -- otherwise changing
     # DEFAULT_STAGES_O silently does nothing for every caller that omits it,
@@ -850,6 +879,10 @@ def compile_qk_norm_rope_tma(
         raise ValueError(f"fused_store_wait=True needs stages_o >= 2 (the drain protects the next tile's output stage), got stages_o={stages_o}")
     if dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"qk_norm_rope_tma serves bf16/f16 only, got {dtype}")
+    if not apply_norm and rope_dim == 0:
+        raise ValueError("apply_norm=False with rope_dim=0 is an identity copy of Q/K; drop the stage instead of launching it")
+    if want_rstd and not apply_norm:
+        raise ValueError("apply_norm=False (RoPE-only Q/K) computes no RMSNorm and therefore emits no rstd; want_rstd must be False")
     # Every Constexpr handed to cute.compile below is in the key. `stages_o`
     # was missing (PR #1102 review): it sizes sOut_raw and bounds the store
     # drain, so the second depth requested in a process was served the FIRST
@@ -868,11 +901,12 @@ def compile_qk_norm_rope_tma(
         int(refill_pos),
         bool(fused_store_wait),
         current_device(),
+        bool(apply_norm),
     )
     if key not in compiled_cache:
         tok = cute.sym_int()
         dense = [_fake_thd(dtype, tok, h, d) for h in (h_q, h_kv, h_q, h_kv)]
-        weights = [_fake(dtype, (d,), (0,)) for _ in range(2)]
+        weights = [_fake(dtype, (d,), (0,)) for _ in range(2)] if apply_norm else [None, None]
         tables = [_fake(dtype, (tok, rope_dim if rope_dim else 1), (1, 0)) for _ in range(2)]
         rstd = [_fake(torch.float32, (tok, h), (1, 0)) for h in (h_q, h_kv)] if want_rstd else [None, None]
         compiled_cache[key] = cute.compile(
@@ -911,16 +945,21 @@ def compile_qk_norm_rope_tma(
         threads=int(threads_per_cta),
         want_rstd=bool(want_rstd),
         ctas_per_sm=int(ctas_per_sm),
+        apply_norm=bool(apply_norm),
     )
 
 
 def run_qk_norm_rope_tma(r, q, k, q_out, k_out, w_q, w_k, cos, sin, rstd_q=None, rstd_k=None, *, stream) -> None:
-    from cudnn.frost.device import multiprocessor_count
-
+    """The lowered launch. ``w_q``/``w_k`` are both ``None`` for a RoPE-only
+    recipe (``r.apply_norm`` False) and both tensors otherwise -- checked, both
+    directions, exactly as the LDG runner does."""
     t = int(q.shape[0])
     n_q_tiles, n_tiles = tile_counts(t, r.h_q, r.h_kv, r.tile_rows)
+    check_norm_weights_match_recipe(r.apply_norm, w_q, w_k)
     if r.want_rstd and (rstd_q is None or rstd_k is None):
         raise ValueError("this artifact was compiled with rstd outputs; both must be bound at execute (Rule 1: no silent fallback)")
+    if not r.want_rstd and (rstd_q is not None or rstd_k is not None):
+        raise ValueError("this artifact was compiled WITHOUT rstd outputs (want_rstd=False); rstd_q / rstd_k would be silently ignored -- pass None")
     n_ctas = min(n_tiles, multiprocessor_count(current_device()) * r.ctas_per_sm)
     r.compiled(
         q,

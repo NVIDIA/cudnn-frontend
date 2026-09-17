@@ -733,6 +733,152 @@ def test_dsl_sm100_sink(dtype, d):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "d,s_q,pack_gqa",
+    [(128, 1, False), (128, 1, True), (128, 2, True), (128, 4, True), (64, 1, True)],
+    ids=["d128_sq1_unpacked", "d128_sq1_packed", "d128_sq2_packed", "d128_sq4_packed", "d64_sq1_packed"],
+)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_decode_sink(d, s_q, pack_gqa):
+    """Decode-shaped dense graphs (S_q in {1, 2, 4}) with an attention sink over
+    bottom-right causal, padded KV lengths incl. a zero-length batch: a keyless row
+    is O = 0 / LSE = sink, live rows match the sink-as-extra-column reference.
+    sink_token at s_q == 1 used to be rejected by the python validator as a
+    graph-validity error; it is the backend engines' support-surface rule, and
+    this row serves the combination (the sink fold is independent of S_q)."""
+    _require_dsl()
+    if _SM == 107 and pack_gqa:
+        # Only the packed cases lack a path on the ported Rubin f16 kernels
+        # (row: pack_gqas={False}); the unpacked S_q == 1 sink case must still run there.
+        pytest.skip("no PackGQA path in the ported Rubin f16 kernels")
+    dtype = torch.float16
+    b, h_q, h_kv, s_kv = 3, 8, 2, 1024
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    seq_kv_lens = torch.tensor([1000, 0, 129], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    sink = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda")
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_len_kv=seq_kv_lens,
+        sink=sink,
+        pack_gqa=pack_gqa,
+        return_stats=True,
+    )
+    lse = lse.squeeze(-1)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, seq_kv_lens=seq_kv_lens, sinks=sink.flatten(), return_stats=True)
+    assert torch.isfinite(o.float()).all(), "keyless rows must not NaN the output"
+    assert (o[1] == 0).all(), "a zero-length KV batch writes O := 0 even with a sink"
+    torch.testing.assert_close(lse[1], sink.view(h_q, 1).expand(h_q, s_q), atol=1e-4, rtol=0)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
+
+
+@_skip_pack_gqa_on_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q,h_kv", [(24, 2), (12, 2)], ids=["g12_packs4", "g6_packs2"])
+@pytest.mark.parametrize("s_q", [1, 4])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_decode_sink_partial_pack_gqa(h_q, h_kv, s_q):
+    """Sink + partial PackGQA (#1104) on the dense path: G = 12 packs 4 heads per
+    token row-group (three packed heads per KV head), G = 6 packs 2.  The sink fold
+    indexes ``sinks[row_head_idx]`` (``packed_head * PACK_G + row % PACK_G``, the Q
+    head) and every head draws its own logit, so the live rows' LSE and the keyless
+    rows' LSE (= sink; the zero-length batch, and the rows above the bottom-right
+    diagonal of the 1-key batch at S_q = 4) both pin the head mapping."""
+    _require_dsl()
+    d, dtype = 128, torch.float16
+    b, s_kv = 3, 1024
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    seq_kv_lens = torch.tensor([1000, 0, 1], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    sink = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda")
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_len_kv=seq_kv_lens,
+        sink=sink,
+        pack_gqa=True,
+        return_stats=True,
+    )
+    lse = lse.squeeze(-1)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, seq_kv_lens=seq_kv_lens, sinks=sink.flatten(), return_stats=True)
+    assert torch.isfinite(o.float()).all(), "keyless rows must not NaN the output"
+    assert (o[1] == 0).all(), "a zero-length KV batch writes O := 0 even with a sink"
+    torch.testing.assert_close(lse[1], sink.view(h_q, 1).expand(h_q, s_q), atol=1e-4, rtol=0)
+    if s_q > 1:
+        # The 1-key batch: rows 0..S_q-2 sit above the bottom-right diagonal -> keyless.
+        torch.testing.assert_close(lse[2, :, : s_q - 1], sink.view(h_q, 1).expand(h_q, s_q - 1), atol=1e-4, rtol=0)
+        assert (o[2, :, : s_q - 1] == 0).all(), "rows above the bottom-right diagonal write O := 0 even with a sink"
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d_qk,d_v,stats_use_log2",
+    [(128, 128, False), (128, 128, True), (192, 128, False), (256, 256, False), (512, 512, False)],
+    ids=["d128_ln", "d128_log2", "d192_d128_ln", "d256_ln", "d512_ln"],
+)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_keyless_rows_very_negative_sink(d_qk, d_v, stats_use_log2):
+    """Dense padded multi-token decode (S_q = 4, bottom-right causal) with a
+    zero-length KV batch, a one-key batch and a sink of -120 on every head, on all
+    four SM100 f16 flavors.  A keyless row (the empty batch's four rows, the one-key
+    batch's three rows above the diagonal) holds the sink's mass alone: O := 0,
+    LSE := sink (times log2(e) under stats_use_log2).  Review regression (PR #1095):
+    the softmax publishes total_sum = 0 and a 0-substituted max for such a row, and a
+    fold that computes exp(sink - 0) underflows to 0 in fp32 -> O = 0 * inf = NaN,
+    LSE = log(0) = -inf.  test_dsl_sm100_decode_sink draws its sinks from randn (|sink|
+    < 4) and cannot see this."""
+    _require_dsl()
+    dtype = torch.bfloat16
+    b, h_q, h_kv, s_q, s_kv = 3, 8, 2, 4, 512
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h_q, s_q, d_qk, dtype)
+    k = _bhsd(b, h_kv, s_kv, d_qk, dtype)
+    v = _bhsd(b, h_kv, s_kv, d_v, dtype)
+    seq_kv_lens = torch.tensor([300, 0, 1], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    sink = torch.full((1, h_q, 1, 1), -120.0, dtype=torch.float32, device="cuda")
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True, stats_use_log2=stats_use_log2),
+        seq_len_kv=seq_kv_lens,
+        sink=sink,
+        return_stats=True,
+    )
+    lse = lse.squeeze(-1)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, seq_kv_lens=seq_kv_lens, sinks=sink.flatten(), return_stats=True)
+    if stats_use_log2:
+        lse_ref = lse_ref * math.log2(math.e)
+    rows = torch.arange(s_q, device="cuda").view(1, s_q)
+    keyless = (seq_kv_lens.view(b, 1) - s_q + rows < 0).view(b, 1, s_q).expand(b, h_q, s_q)
+    assert keyless.sum().item() == h_q * (s_q + s_q - 1), "batch 1 is keyless on every row, batch 2 on all but its last"
+    assert torch.isfinite(o.float()).all(), "keyless rows must not NaN the output"
+    assert (o[keyless] == 0).all(), "a keyless row writes O := 0 even with a sink"
+    want = -120.0 * (math.log2(math.e) if stats_use_log2 else 1.0)
+    torch.testing.assert_close(lse[keyless], torch.full_like(lse[keyless], want), atol=1e-4, rtol=0)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse[~keyless], lse_ref[~keyless], atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_execute_sink_lse_contract():
     """execute() rejects sinks inconsistent with the compiled specialization.

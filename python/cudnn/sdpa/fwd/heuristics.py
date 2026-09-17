@@ -69,8 +69,8 @@ from cudnn.sdpa.fwd.engines import (
     Capabilities,
     EngineSpec,
     SdpaFwdKnobs,
-    _band_covers_kv_tail,
     _selected_d_shape,
+    _synth_kv_padding,
     effective_cgas,
     effective_sched_policies,
     mismatch,
@@ -417,6 +417,22 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # are Rubin's cluster count and CGA rows, unmeasured on GeForce Blackwell).
         waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / _SM107_CLUSTERS
         primary = SCHED_LPT if waves <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
+    elif (
+        causal_ish
+        and caps.sm_lo == 100
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and _selected_d_shape(caps, facts) == (128, 128)
+        and 1 in effective_cgas(caps, facts)
+        and _d128_decode_tile_fits(caps, facts)
+    ):
+        # The d128 decode tile (bottom-right causal MTP, S_q * PACK_G <= 128):
+        # one Q tile per (packed head, batch), so every unit walks the same
+        # per-batch KV range and LPT has nothing to balance; LPT_L2's head
+        # grouping groups nothing when the packed head IS the KV head (only
+        # the G / PACK_G packed heads of a partially packed group).  Measured on
+        # B200 (b=32, H=64/4, S_q=4, S_kv=4096, page 16): NATURAL 120.0 us vs
+        # LPT_L2 125.4 us on the prefill tile; the decode tile keeps the order.
+        primary = SCHED_NATURAL
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
         # whether one head's K+V working set fits the L2 budget.
@@ -569,10 +585,53 @@ def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm10
     )
 
 
-def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int) -> tuple[int, Optional[int]]:
+# The d128 decode tile's Q rows per CTA (config_sm100.CfgD128Decode: TILES_Q=1 x
+# TILE_M=128 x CTA_MMA=1).  The SM100 f16 row's (128, 128) flavor has two
+# tiles behind TILE_CGA_M: cga2 is the prefill pipeline (512 rows per
+# cluster), cga1 the decode tile (sm100/decode_d128_f16.py).
+_D128_DECODE_TILE_ROWS = 128
+
+
+def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] = None) -> bool:
+    """Whether one d128 decode tile covers a KV head's live Q rows.
+
+    ``S_q * pack_g <= 128`` with ``pack_g`` the CANDIDATE's own packing:
+    ``pack_gqa=True`` is the packed leg (one unit carries the packed group
+    ``p = Cfg.PACK_G`` -- the whole GQA group ``G`` when it divides the tile,
+    else its largest divisor that does (partial PackGQA: 96/8 packs 4) --
+    ``p`` rows per token), ``False`` the unpacked one (one head, ``S_q`` rows),
+    and ``None`` -- the graph-level question -- reads as the packed leg when
+    the row can pack this graph, which is the leg a decode-shaped graph
+    proposes first.  The fit is a property of the candidate, not the graph:
+    at ``S_q * p > 128 >= S_q`` the packed leg keeps the prefill tile while
+    the unpacked runner-up rides the decode tile.  Dense only: the decode tile
+    has no THD leg.  Measured on B200 (b=32, H=64/4, d128, S_kv=4096, page 16,
+    bf16): the prefill tile at cga2 119 us, the decode tile 49 us -- see the
+    kernel docstring; at S_q * G > 128 the prefill tile's second sub-tile is
+    live and cga2's collective MMA halves per-CTA K/V traffic, so the rule
+    stops there rather than at a measured crossover.
+    """
+    if facts.thd:
+        return False
+    if pack_gqa is None:
+        pack_gqa = _pack_gqa_eligible(caps, facts, _D128_DECODE_TILE_ROWS)
+    # The kernel's HEADS_PER_TILE for this leg (1 unpacked): the launch the
+    # split model sees, and the rows one unit really carries.
+    pack_g = _pack_gqa_group(caps, facts, _D128_DECODE_TILE_ROWS, pack_gqa)
+    return facts.s_q * pack_g <= _D128_DECODE_TILE_ROWS
+
+
+def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int, pack_gqa: Optional[bool] = None) -> tuple[int, Optional[int]]:
+    """``pack_gqa`` is the candidate's packing where the width depends on it
+    (the d128 f16 SM100 flavor, :func:`_d128_decode_tile_fits`); ``None`` asks
+    the graph-level question.  The other flavors' rules ignore it."""
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
     selected_shape = _selected_d_shape(caps, facts)
+    if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
+        # The f16 SM100 row: cga1 = the decode tile when one of its 128-row
+        # tiles covers the head's Q rows, else the cga2 prefill pipeline.
+        return sched_policy, (1 if _d128_decode_tile_fits(caps, facts, pack_gqa) else 2)
     if selected_shape == (256, 256) and any(shape == selected_shape for shape, _ in caps.cgas_by_d_shape):
         params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
         selected_sched, selected_cga = select_d256_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
@@ -626,22 +685,18 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
 
 
 def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
-    """An f16 sliding-window graph on the SM120 d512 flavor.
+    """A sliding-window graph on the SM120 d512 flavor.
 
     Two rules key on it. Pack the GQA group into the Q tile: a packed unit holds
     ``tile_m / G`` tokens, so its key span is that many tokens plus the window
     instead of ``tile_m`` plus the window, fewer K/V tiles through the L2->SMEM
     path and less masked-out MMA at the same DRAM bytes. And walk the units with
     plain LPT (see :func:`_sched_points`). Without a window the decode rule
-    alone decides the packing.
+    alone decides the packing. The FP8 flavor takes only the LPT walk: its
+    64-key tile covers a 64-token unit's window in as many tiles as a packed
+    one-token unit, so packing saves no MMA there (measured 8-11% slower).
     """
-    return (
-        caps.sm_lo >= 120
-        and caps.sm_hi < 130
-        and not facts.is_fp8
-        and facts.window_left is not None
-        and pick_flavor(facts.d_qk, facts.d_v, fp8=False) == D512_FLAVOR
-    )
+    return caps.sm_lo >= 120 and caps.sm_hi < 130 and facts.window_left is not None and pick_flavor(facts.d_qk, facts.d_v, fp8=facts.is_fp8) == D512_FLAVOR
 
 
 def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
@@ -678,7 +733,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
     ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
     if not _pack_gqa_eligible(caps, facts, tile_m):
         return (False,)
-    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)) or _sm120_d512_windowed(caps, facts):
+    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)) or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8):
         return (True, False)
     return (False, True)
 
@@ -728,9 +783,12 @@ def _split_points(
         # combine would write the un-gated O (mismatch declines the same pair,
         # so this is hygiene: never PROPOSE a knob the row cannot honour).
         return [no_split]
-    if caps.skv_tail_via_padding and facts.s_kv % (caps.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
+    if _synth_kv_padding(caps, facts):
         # This S_kv would be served through the synthesized KV-tail padding,
-        # which the split cannot ride (mismatch declines the same combination).
+        # which the split cannot ride (mismatch declines the same combination,
+        # through the same predicate the lowering uses). A paged graph never
+        # takes that path — its per-batch lengths bound the walk on device —
+        # so a declared max that is not a tile multiple keeps its split.
         return [no_split]
     # A quantized O is a legal split target: the partials stay WIDER than the
     # O dtype whatever it is, and the combine performs the only cast down to it.
@@ -825,19 +883,25 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         return (pack_tile if packed_first else tiles[0]), packed_first, pack_tile
 
     def _leg(split_value: int) -> SdpaFwdKnobs:
-        sched_policy, cga = _auto_sched_cga(
-            spec,
-            facts,
-            split_kv=split_value,
-            sched_policy=plain_sched if split_value > 1 else scheds[0],
-        )
+        seed_sched = plain_sched if split_value > 1 else scheds[0]
+        sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=split_value, sched_policy=seed_sched)
         base_tile, packed_first, _ = _pack_choice(cga)
+        pack_gqa = True if packed_first else unpacked_pack
+        if pack_gqa is not True:
+            # The width above was judged on the packed leg's rows (the graph-
+            # level question); a leg that runs unpacked is re-judged on one
+            # head's S_q rows -- the d128 decode-tile fit belongs to the
+            # candidate, not the graph.  _pack_choice does not move under the
+            # new width: it depends on cga only through _pack_gqa_wins, which
+            # is settled the same way at either width for any S_q this can
+            # change (an eligible group that does not win has S_q >= 512).
+            sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=split_value, sched_policy=seed_sched, pack_gqa=False)
         return SdpaFwdKnobs(
             sched_policy=sched_policy,
             tile_m=base_tile[0],
             tile_n=base_tile[1],
             cga=cga,
-            pack_gqa=True if packed_first else unpacked_pack,
+            pack_gqa=pack_gqa,
             split_kv=split_value,
         )
 
@@ -868,13 +932,19 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     for policy in scheds[1:]:
         out.append(replace(sched_host, sched_policy=policy))
     # The opposite pack_gqa leg, riding its own tile (packed: the largest
-    # admitting tile; unpacked: the tile rule's best).
+    # admitting tile; unpacked: the tile rule's best) and its own CGA width:
+    # on the d128 f16 SM100 flavor a packed leg that overflows one 128-row
+    # tile (S_q * G > 128 >= S_q) keeps the prefill tile while its unpacked
+    # runner-up fits the decode tile.  The other flavors' width rules do not
+    # read the packing, so this returns base.cga there.
     _, _, pack_tile = _pack_choice(base.cga)
     if pack_tile is not None:
         if base.pack_gqa is True:
-            out.append(replace(base, pack_gqa=unpacked_pack, tile_m=tiles[0][0], tile_n=tiles[0][1]))
+            _, unpacked_cga = _auto_sched_cga(spec, facts, split_kv=base.split_kv, sched_policy=base.sched_policy, pack_gqa=False)
+            out.append(replace(base, pack_gqa=unpacked_pack, tile_m=tiles[0][0], tile_n=tiles[0][1], cga=unpacked_cga))
         else:
-            out.append(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1]))
+            _, packed_cga = _auto_sched_cga(spec, facts, split_kv=base.split_kv, sched_policy=base.sched_policy, pack_gqa=True)
+            out.append(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1], cga=packed_cga))
     for split in splits[1:]:
         out.append(_leg(split))
     seen, unique = set(), []
@@ -894,13 +964,17 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
     """
     caps = spec.capabilities
     sched_policy = SCHED_NATURAL if SCHED_NATURAL in caps.sched_policies else _sole(caps.sched_policies)
-    sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=sched_policy)
+    pack_gqa = False if False in caps.pack_gqas else _sole(caps.pack_gqas)
+    # An unpacked fallback is judged on one head's rows (the d128 decode tile
+    # is also the least-demanding width: one CTA, no cluster); a row that only
+    # packs leaves the graph-level question to the rule.
+    sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=sched_policy, pack_gqa=False if pack_gqa is False else None)
     return SdpaFwdKnobs(
         sched_policy=sched_policy,
         tile_m=min(caps.tile_ms, default=None),
         tile_n=min(caps.tile_ns, default=None),
         cga=cga,
-        pack_gqa=False if False in caps.pack_gqas else _sole(caps.pack_gqas),
+        pack_gqa=pack_gqa,
         split_kv=1,  # the fallback never splits: least-demanding means one kernel, no partial workspace
     )
 

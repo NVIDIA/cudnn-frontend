@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import math
+
 import cudnn
 import pytest
 import torch
@@ -1539,10 +1541,11 @@ def test_bwd_dsink_fact():
 # --- paged KV caches (issue #920) -------------------------------------------
 
 
-def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False):
+def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False, sink=False):
     """cuDNN's paged-cache contract: K/V page pools [num_pages, H_kv, page_size, D]
     (HND compact, or NHD storage declared via strides) + (B, 1, max_pages, 1)
-    int32 block tables + per-batch lengths."""
+    int32 block tables + per-batch lengths. ``sink`` adds the (1, H, 1, 1) fp32
+    sink_token (a decode graph: s_q = 1)."""
     g = _mk_graph()
     b, h, kh = B, H, 2
     q = g.tensor(dim=(b, h, 1, d), stride=(h * d, d, d, 1), data_type=DTYPE, name="q")
@@ -1560,6 +1563,8 @@ def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True,
     kw = dict(paged_attention_k_table=tk, paged_attention_v_table=tv)
     if max_seq_len is not None:
         kw["paged_attention_max_seq_len_kv"] = max_seq_len
+    if sink:
+        kw["sink_token"] = g.tensor(dim=(1, h, 1, 1), stride=(h, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="sink")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_padding_mask=padding, seq_len_q=slq, seq_len_kv=slk, **kw)
     _finish_output(o, (b, h, 1, d), (h * d, d, d, 1))
     return g
@@ -1587,6 +1592,10 @@ def test_paged_probe_declines():
     assert engines.engine_name() in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
     assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d256 flavors only"
     assert not _eligible(_mk_paged_graph(padding=False)), "paged KV needs the padding mask (per-batch KV lengths)"
+    # Lifted decline: the sink is an epilogue fold, orthogonal to the paged loader.
+    facts = _facts(_mk_paged_graph(sink=True))
+    assert facts.has_paged_kv and facts.has_sink and facts.s_q == 1
+    assert engines.engine_name() in _eligible(_mk_paged_graph(sink=True)), "paged KV with an attention sink at decode is served"
     facts = ga.analyze(_mk_paged_graph(max_seq_len=8 * 16 + 1))
     assert facts.invalid is not None, "a declared max S_kv beyond the block table's reach is invalid"
 
@@ -1602,6 +1611,28 @@ def test_paged_split_kv_is_proposed_on_a_decode_launch(monkeypatch):
     facts = _facts(g)
     knob_sets = _knob_sets(spec, facts)
     assert any(k.split_kv and k.split_kv > 1 for k in knob_sets), knob_sets
+
+
+@pytest.mark.parametrize("max_seq_len", [4000, 4001, 16641])
+def test_paged_split_kv_is_proposed_with_a_ragged_declared_max(monkeypatch, max_seq_len):
+    """A declared ``paged_attention_max_seq_len_kv`` that is NOT a multiple of
+    the 128-row KV tile (FlashInfer passes its true max verbatim, e.g. 4000)
+    must not cost the paged decode launch its split: the per-batch lengths
+    bound the walk on device, so a paged graph never rides the synthesized
+    KV-tail padding that excludes the split on a mask-free dense graph. The
+    heuristic must still propose a split on the same B=2, H_kv=2 launch (tables
+    padded past the declared max, as frameworks do), and a pinned split must
+    still pass the knob probe."""
+    monkeypatch.setattr(ga, "_device_sm_count", lambda: 148)
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    g = _mk_paged_graph(page_size=16, max_pages=-(-max_seq_len // 16) + 6, max_seq_len=max_seq_len)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    facts = _facts(g)
+    assert facts.s_kv == max_seq_len and facts.s_kv % 128 != 0 and facts.padded and facts.has_paged_kv
+    knob_sets = _knob_sets(spec, facts)
+    assert any(k.split_kv and k.split_kv > 1 for k in knob_sets), knob_sets
+    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(split_kv=2))
 
 
 def test_packed_layout_ignores_the_batch_stride_a_ragged_tensor_never_reads():
@@ -1891,3 +1922,87 @@ def test_virtual_amax_o_is_not_a_fact():
     g, amx_o = build(request_amax_o=True)
     assert _facts(g).amax_o_t is amx_o
     assert engines.engine_name(fp8=True) in _eligible(g)
+
+
+def test_mxfp8_virtual_amax_o_is_inferred_and_not_a_fact():
+    """``sdpa_mxfp8`` infers O / Stats / Amax_O dims the way ``sdpa_fp8`` does
+    (PR-B S9): an UNREQUESTED Amax_O -- virtual, never ``set_dim``'d -- passes
+    validate() (it used to fail the IR-level Tensor.validate() with
+    "dims not set" unless the caller declared the port it never asked for) and
+    is not a fact (``amax_o_t is None``), which is what has_amax_o=False folds
+    out.  The inference is PROVISIONAL: a caller's explicit set_dim / set_stride
+    on every output survives validate() byte-for-byte (a non-row-major Stats
+    layout is the witness), and a requested Amax_O is still the fact.  The
+    LOWERING mechanism is pinned too, because it was mis-stated once: the
+    sdpa-family arm of ``_lower_to_cpp`` pushes whatever dim/stride the IR
+    carries, inferred or user-set (only ``push_output_attrs`` is
+    user-assigned-only), so C++ receives the virtual ``[1, 1, 1, 1]`` scalar
+    -- the state ``sdpa_fp8`` has always produced -- not an undimensioned port."""
+    d = 256
+    dims, bshd = (B, H, S, d), (S * H * d, d, H * d, 1)
+    stats_dims, stats_bsh1 = (B, H, S, 1), (S * H, 1, H, 1)  # deliberately NOT row-major
+    e8m0, f8_128x4 = cudnn.data_type.FP8_E8M0, cudnn.tensor_reordering.F8_128x4
+
+    def build(*, request_amax_o):
+        gg = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        qq = gg.tensor(dim=dims, stride=bshd, data_type=cudnn.data_type.FP8_E4M3, name="q")
+        kk = gg.tensor(dim=dims, stride=bshd, data_type=cudnn.data_type.FP8_E4M3, name="k")
+        vv = gg.tensor(dim=dims, stride=bshd, data_type=cudnn.data_type.FP8_E4M3, name="v")
+
+        def sf(sd):  # F8_128x4 scale-factor tensors: Q/K rowwise [B,H,S,d/32], V columnwise [B,H,S/32,d]
+            return gg.tensor(dim=list(sd), stride=[sd[1] * sd[2] * sd[3], sd[2] * sd[3], sd[3], 1], data_type=e8m0, reordering_type=f8_128x4)
+
+        o, stats, amx_o = gg.sdpa_mxfp8(
+            q=qq,
+            k=kk,
+            v=vv,
+            descale_q=sf((B, H, S, d // 32)),
+            descale_k=sf((B, H, S, d // 32)),
+            descale_v=sf((B, H, S // 32, d)),
+            attn_scale=1.0 / math.sqrt(d),
+            generate_stats=True,
+            use_causal_mask=True,
+        )
+        # Builder-time inference (graph-input dims are known): the three ports carry provisional dims.
+        assert list(o.dim) == list(dims) and list(stats.dim) == list(stats_dims) and list(amx_o.dim) == [1, 1, 1, 1]
+        assert amx_o.is_virtual and stats.is_virtual and o.is_virtual
+        # The caller declares what it requests -- O and Stats -- exactly as the block / harness do.
+        _finish_output(o, dims, bshd, dtype=cudnn.data_type.HALF)
+        stats.set_output(True).set_dim(stats_dims).set_stride(stats_bsh1).set_data_type(cudnn.data_type.FLOAT)
+        if request_amax_o:
+            amx_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+        return gg, o, stats, amx_o
+
+    mxfp8_name = engines.engine_name(mxfp8=True)
+
+    # (a) every output declared explicitly, Amax_O requested: validate() passes, nothing is overridden.
+    g, o, stats, amx_o = build(request_amax_o=True)
+    g.validate()
+    assert g._lowered_graph is None, "an mxfp8 graph a FROST row serves validates natively"
+    assert tuple(o.stride) == bshd and tuple(stats.stride) == stats_bsh1, "explicit set_stride must survive the inference"
+    assert tuple(o.dim) == dims and tuple(stats.dim) == stats_dims and tuple(amx_o.dim) == (1, 1, 1, 1)
+    assert not amx_o.is_virtual
+    facts = _facts(g)
+    assert facts.amax_o_t is amx_o and facts.is_mxfp8
+    assert mxfp8_name in _eligible(g)
+
+    # (b) Amax_O left virtual and UNSET: validate() passes on the inferred [1,1,1,1]; it is not a fact.
+    g, o, stats, amx_o = build(request_amax_o=False)
+    g.validate()
+    assert g._lowered_graph is None
+    assert amx_o.is_virtual and list(amx_o.dim) == [1, 1, 1, 1] and list(amx_o.stride) == [1, 1, 1, 1]
+    assert not amx_o.dim_assigned and not amx_o.stride_assigned, "inferred, not user-assigned (a set_dim/set_stride would flip these)"
+    assert tuple(o.stride) == bshd and tuple(stats.stride) == stats_bsh1
+    facts = _facts(g)
+    assert facts.amax_o_t is None, "a virtual Amax_O is not a requested output"
+    assert facts.is_mxfp8
+    assert mxfp8_name in _eligible(g), "and its absence declines nothing"
+    # (c) What the classic backend would receive (device-free: lowering builds the C++ graph, it does
+    # not validate it): the sdpa-family lowering pushes the IR's dim/stride whether inferred or
+    # user-set, so the undeclared Amax_O lands in C++ as a dimensioned VIRTUAL scalar -- the same
+    # state sdpa_fp8 has always produced -- and the user's O / Stats layout arrives byte-for-byte.
+    g._lower_to_cpp()
+    cpp_amax, cpp_o, cpp_stats = (g._cpp_tensors[t.uid] for t in (amx_o, o, stats))
+    assert cpp_amax.get_is_virtual() and list(cpp_amax.get_dim()) == [1, 1, 1, 1] and list(cpp_amax.get_stride()) == [1, 1, 1, 1]
+    assert not cpp_o.get_is_virtual() and tuple(cpp_o.get_dim()) == dims and tuple(cpp_o.get_stride()) == bshd
+    assert tuple(cpp_stats.get_dim()) == stats_dims and tuple(cpp_stats.get_stride()) == stats_bsh1

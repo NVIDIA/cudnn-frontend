@@ -1060,7 +1060,10 @@ def test_sm107_stats_log2_specializes_every_dtype_and_flavor(flavor, kind, load_
 # and end with the Rubin e2e that is the evidence behind every claim.
 # ============================================================================
 
-_GATE_ROWS = ("sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm107_fp8")
+# Three rows, one per dtype family of the d256 flavor: f16/bf16, per-tensor FP8
+# (PR-A) and block-scale MXFP8 (PR-B slice S7).  Order is load-bearing for the
+# `f16, fp8 = ...` destructurings below; the MXFP8 row is indexed explicitly.
+_GATE_ROWS = ("sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_prefill_sm107_mxfp8")
 _D256 = (256, 256)
 _GATE_SEAMS = (
     "cfg",
@@ -1085,6 +1088,9 @@ _GATE_SEAMS = (
 _RETIRED_GATE_KNOBS = ("GATE_SOURCE", "GATE_ISSUE", "GATE_MATH", "AMAX_O", "KEEP_SASS")
 # cta_mma=1 is what the adapter pins for FP8 d256 (supported_cgas_for((256, 256), fp8=True) == (1,)).
 _FP8_LOAD_KW = dict(fp8=True, pertensor=True, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
+# ...and for the block-scale MXFP8 d256 flavor (same cga1 pin; bf16 O is the unfused block's mode, e4m3 O the fused one).
+_MXFP8_LOAD_KW = dict(fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
+_QUANT_LOAD_KWS = (_FP8_LOAD_KW, _MXFP8_LOAD_KW)
 
 
 def _gate_facts(**kw):
@@ -1122,12 +1128,35 @@ def _gate_kernel_modules():
     return _load(_D256, rubin=True, epilogue_gate=True), _load(_D256, rubin=True, epilogue_gate=True, **_FP8_LOAD_KW)
 
 
+def _mxfp8_gate_kernel_module(**kw):
+    """The block-scale MXFP8 d256 Rubin module loaded with the gate ON (kw overrides the load kwargs)."""
+    return _load(_D256, rubin=True, epilogue_gate=True, **{**_MXFP8_LOAD_KW, **kw})
+
+
+def _all_gate_kernel_modules():
+    """(f16, fp8, mxfp8) -- every d256 body that carries the seams."""
+    return (*_gate_kernel_modules(), _mxfp8_gate_kernel_module())
+
+
+def _mxfp8_gate_facts(**kw):
+    """MXFP8 facts for a GATED (256, 256) graph with a bf16 G (the only gate dtype the row lists)."""
+    import cudnn
+
+    kw.setdefault("d_qk", 256)
+    kw.setdefault("d_v", 256)
+    kw.setdefault("has_epilogue_gate", True)
+    kw.setdefault("epilogue_gate_dtype", cudnn.data_type.BFLOAT16)
+    kw.setdefault("dtype", cudnn.data_type.FP8_E4M3)
+    kw.setdefault("dtype_o", cudnn.data_type.BFLOAT16)
+    return _f16_facts(is_mxfp8=True, **kw)
+
+
 # --- Rows / mismatch -----------------------------------------------------------
 
 
 def test_sm107_gate_rows_claim_exactly_d256():
-    """Both Rubin rows claim the gate at EXACTLY (256, 256) -- and nothing else
-    does.  The exact-dims rule is deliberate (plan S7 Q6): a d=200 graph rides the
+    """All three Rubin d256 rows (f16/bf16, per-tensor FP8, block-scale MXFP8)
+    claim the gate at EXACTLY (256, 256) -- and nothing else does.  The exact-dims rule is deliberate (plan S7 Q6): a d=200 graph rides the
     (256, 256) envelope for plain attention, but the gate tile would multiply the
     zero-padded columns too and nobody has validated a padded G, so the envelope
     flavor is declined with the gate's own reason rather than silently served."""
@@ -1147,9 +1176,10 @@ def test_sm107_gate_rows_claim_exactly_d256():
     # No new engine row: the gate is a FEATURE of the two existing Rubin rows.
     assert len(engines.ENGINE_SPECS) == 9
 
-    f16, fp8 = _caps(_GATE_ROWS[0]), _caps(_GATE_ROWS[1])
+    f16, fp8, mxfp8 = _caps(_GATE_ROWS[0]), _caps(_GATE_ROWS[1]), _caps(_GATE_ROWS[2])
     assert engines.mismatch(f16, _gate_facts()) is None
     assert engines.mismatch(fp8, _fp8_gate_facts()) is None
+    assert engines.mismatch(mxfp8, _mxfp8_gate_facts()) is None, "PR-B: the MXFP8 row serves the tail at (256, 256) with a bf16 G"
     # Every other flavor -- and the d=200 envelope ride -- declines by the gate's reason.
     for d_qk, d_v in ((128, 128), (192, 128), (512, 512), (200, 200)):
         why = engines.mismatch(f16, _gate_facts(d_qk=d_qk, d_v=d_v))
@@ -1157,6 +1187,10 @@ def test_sm107_gate_rows_claim_exactly_d256():
     for d_qk, d_v in ((128, 128), (192, 128), (512, 512)):
         why = engines.mismatch(fp8, _fp8_gate_facts(d_qk=d_qk, d_v=d_v))
         assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
+        why = engines.mismatch(mxfp8, _mxfp8_gate_facts(d_qk=d_qk, d_v=d_v))
+        assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
+    # The MXFP8 row's UNGATED (256, 256) graph is untouched by the new fields.
+    assert engines.mismatch(mxfp8, _mxfp8_facts(d_qk=256, d_v=256)) is None
     # An UNGATED graph is untouched by the new fields on every row.
     assert engines.mismatch(f16, _f16_facts(d_qk=256, d_v=256)) is None
     assert engines.mismatch(f16, _f16_facts(d_qk=128, d_v=128)) is None
@@ -1188,11 +1222,22 @@ def test_sm107_gate_accepts_every_dtype_member():
             assert engines.mismatch(fp8, _fp8_gate_facts(dtype=dt, dtype_o=dto)) is None, (dt, dto)
     why = engines.mismatch(fp8, _fp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.HALF))
     assert why is not None and "gate dtype" in why, why
-    # The MXFP8 row is PR-B: it must decline the tail outright.
-    why = engines.mismatch(
-        _caps("sdpa_fwd_prefill_sm107_mxfp8"), _mxfp8_facts(d_qk=256, d_v=256, has_epilogue_gate=True, epilogue_gate_dtype=cudnn.data_type.BFLOAT16)
-    )
-    assert why is not None and "epilogue" in why, why
+
+    # The MXFP8 row (PR-B): the same per-member claims -- every input dtype x
+    # every O dtype with the bf16 G its kernel stages (GATE_STORAGE_DTYPE); a
+    # HALF gate is an asserted decline naming the axis.  (INVERTED 2026-09-15:
+    # this row declined the tail outright under PR-A.)
+    mxfp8 = _caps(_GATE_ROWS[2])
+    assert mxfp8.epilogue_gate_dtypes == frozenset({cudnn.data_type.BFLOAT16})
+    assert mxfp8.dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
+    assert mxfp8.out_dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
+    for dt in sorted(mxfp8.dtypes, key=int):
+        for dto in sorted(mxfp8.out_dtypes, key=int):
+            assert engines.mismatch(mxfp8, _mxfp8_gate_facts(dtype=dt, dtype_o=dto)) is None, (dt, dto)
+    why = engines.mismatch(mxfp8, _mxfp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.HALF))
+    assert why is not None and "gate dtype" in why, why
+    why = engines.mismatch(mxfp8, _mxfp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.FP8_E4M3))
+    assert why is not None and "gate dtype" in why, why
 
 
 def test_sm107_gate_declines_the_interactions():
@@ -1282,7 +1327,7 @@ def test_sm107_gate_row_matches_the_adapter_twin():
     # The config validator is the third consumer, keyed by flavor string.
     from cudnn.sdpa.fwd import config_sm107
 
-    assert config_sm107._EPILOGUE_GATE_FLAVORS == frozenset({"sm107 d256"})
+    assert config_sm107._EPILOGUE_GATE_FLAVORS == frozenset({"sm107 d256", "sm107 d256 mxfp8"})
     assert "SM107_EPILOGUE_GATE_SHAPES" in config_sm107.__all__
 
 
@@ -1303,9 +1348,14 @@ def test_sm107_gate_template_loads_for_d256_only():
             _load(flavor, rubin=True, epilogue_gate=True)
         with pytest.raises(ValueError, match="epilogue_gate"):
             _load(flavor, rubin=True, epilogue_gate=True, **_FP8_LOAD_KW)
-    # MXFP8 d256 is PR-B: same flavor family, different flavor string, refused.
-    with pytest.raises(ValueError, match="epilogue_gate"):
-        _load(_D256, rubin=True, epilogue_gate=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16_OUT)
+    # MXFP8 d256 (PR-B): the block-scale body carries the seams too -- it loads
+    # gated, on both O dtypes; every OTHER mxfp8 flavor is refused by the config.
+    for dto in (_E4M3, _BF16_OUT):
+        mx = _mxfp8_gate_kernel_module(dtype_o=dto)
+        assert mx.CFG.EPILOGUE_GATE == 1 and mx.CFG.GATE_BPE == 2 and "mxfp8" in mx.__name__, mx.__name__
+    for flavor in ((128, 128), (192, 128), (512, 512)):
+        with pytest.raises(ValueError, match="epilogue_gate"):
+            _load(flavor, rubin=True, epilogue_gate=True, **_MXFP8_LOAD_KW)
     # The SM100 line has no gated body at all.
     with pytest.raises(ValueError, match="epilogue_gate"):
         _load(_D256, rubin=False, epilogue_gate=True)
@@ -1319,6 +1369,8 @@ def test_sm107_gate_template_loads_for_d256_only():
         # split_kv > 1 is refused by the (earlier) SplitHelpers guard on this flavor; the rest by the gate rule.
         with pytest.raises(ValueError, match="epilogue_gate|split_kv > 1 is not wired"):
             _load(_D256, rubin=True, epilogue_gate=True, **bad)
+        with pytest.raises(ValueError, match="epilogue_gate|split_kv > 1 is not wired"):
+            _load(_D256, rubin=True, epilogue_gate=True, **{**_MXFP8_LOAD_KW, **bad})
 
 
 def test_sm107_gate_off_is_the_default_module():
@@ -1326,7 +1378,7 @@ def test_sm107_gate_off_is_the_default_module():
     gate-off is the module every pre-gate caller already loads: same
     ``TemplateParams``, same module object, same source digest."""
     assert TemplateParams() == TemplateParams(epilogue_gate=False)
-    for kw in ({}, _FP8_LOAD_KW):
+    for kw in ({}, *_QUANT_LOAD_KWS):
         off = _load(_D256, rubin=True, **kw)
         assert off is _load(_D256, rubin=True, epilogue_gate=False, **kw)
         assert off.CFG.EPILOGUE_GATE == 0
@@ -1414,47 +1466,52 @@ def test_sm107_gate_desc_version_unchanged():
 
 
 def test_sm107_gate_kernel_signatures_are_append_only():
-    """Public-API signatures evolve append-only (AGENTS.md): both kernels'
-    ``compile`` gain their gate parameters at the END (fp8 also ``has_amax``),
-    both ``_host`` gain ``gate_tensor`` LAST -- after ``stream``, which every
-    caller passes by keyword.  A ``gate_stride`` handed to an UNGATED module is
+    """Public-API signatures evolve append-only (AGENTS.md): all three kernels'
+    ``compile`` gain their gate parameters at the END (the quantized ones also
+    ``has_amax``), all three ``_host`` gain ``gate_tensor`` LAST -- after
+    ``stream``, which every caller passes by keyword.  A ``gate_stride`` handed to an UNGATED module is
     a ValueError, not a silently ignored kwarg."""
     import inspect
 
-    f16, fp8 = _gate_kernel_modules()
+    f16, fp8, mxfp8 = _all_gate_kernel_modules()
     f16_c = list(inspect.signature(f16.compile).parameters)
     fp8_c = list(inspect.signature(fp8.compile).parameters)
+    mx_c = list(inspect.signature(mxfp8.compile).parameters)
     assert f16_c[-1] == "gate_stride", f16_c[-3:]
     assert fp8_c[-2:] == ["gate_stride", "has_amax"], fp8_c[-3:]
-    for params in (f16_c, fp8_c):
+    assert mx_c[-2:] == ["gate_stride", "has_amax"], mx_c[-3:]
+    for params in (f16_c, fp8_c, mx_c):
         assert params.index("lse_stride") < params.index("gate_stride")
         assert params[: params.index("gate_stride")] == [p for p in params if p not in ("gate_stride", "has_amax")]
-    for mod in (f16, fp8):
+    for mod in (f16, fp8, mxfp8):
         sig = inspect.signature(mod.compile).parameters
         assert sig["gate_stride"].default is None
         host = list(inspect.signature(mod._host).parameters)
         assert host[-2:] == ["stream", "gate_tensor"], (mod.__name__, host[-3:])
         assert inspect.signature(mod._host).parameters["gate_tensor"].default is None
-    assert inspect.signature(fp8.compile).parameters["has_amax"].default is True
-    assert "gate_tensor" in inspect.signature(fp8._kernel).parameters and "tma_gate_desc" in inspect.signature(fp8._kernel).parameters
-    assert "gate_tensor" in inspect.signature(f16._kernel).parameters and "tma_gate_desc" in inspect.signature(f16._kernel).parameters
+        assert "gate_tensor" in inspect.signature(mod._kernel).parameters and "tma_gate_desc" in inspect.signature(mod._kernel).parameters
+    for mod in (fp8, mxfp8):
+        assert inspect.signature(mod.compile).parameters["has_amax"].default is True
+    # The MXFP8 kernel's SF totals stay keyword-only-in-effect AFTER seq_q_lens_addr and BEFORE stream (PR-B keeps the
+    # adapter's positional call byte-identical); gate_tensor is the one parameter after stream.
+    mx_host = list(inspect.signature(mxfp8._host).parameters)
+    assert mx_host.index("seq_q_lens_addr") < mx_host.index("total_q_sf_tiles") < mx_host.index("total_kv_sf_tiles") < mx_host.index("stream"), mx_host
 
     # Ungated modules refuse a gate stride before any trace.
-    for kw in ({}, _FP8_LOAD_KW):
+    for kw in ({}, *_QUANT_LOAD_KWS):
         off = _load(_D256, rubin=True, **kw)
         with pytest.raises(ValueError, match="epilogue_gate"):
             off.compile(b=1, qh=1, kh=1, sq=256, skv=256, gate_stride=(256 * 256, 256, 256, 1))
 
 
 def test_sm107_gate_seams_are_named_once():
-    """Every splice in both kernels is marked ``# == EPILOGUE_FUSION_SEAM(<name>) ==``
+    """Every splice in all three kernels is marked ``# == EPILOGUE_FUSION_SEAM(<name>) ==``
     -- the 16 names exactly once each, so a reviewer can walk the fusion in
     pipeline order with one grep and a dropped / duplicated seam is visible.
     And none of the fork's module knobs survived the port (contract rule 5)."""
     import re
 
-    f16, fp8 = _gate_kernel_modules()
-    for mod in (f16, fp8):
+    for mod in _all_gate_kernel_modules():
         with open(mod.__file__, encoding="utf-8") as fh:
             src = fh.read()
         seams = re.findall(r"# == EPILOGUE_FUSION_SEAM\((\w+)\) ==", src)
@@ -1505,9 +1562,11 @@ def _gate_api(
     gate_shape=None,
     gate_stride=None,
     with_gate=True,
+    dtype_o=None,
     **kw,
 ):
-    """A d256-shaped SdpaFwdDslSm100 built from descriptors only."""
+    """A d256-shaped SdpaFwdDslSm100 built from descriptors only.  ``dtype_o``
+    overrides the quantized paths' default bf16 O (e.g. an e4m3 O)."""
     import torch
 
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
@@ -1516,7 +1575,7 @@ def _gate_api(
     d_v = d if d_v is None else d_v
     dtype = dtype or torch.float16
     qkv_dtype = torch.float8_e4m3fn if fp8 else dtype
-    o_dtype = torch.bfloat16 if fp8 else dtype
+    o_dtype = (dtype_o or torch.bfloat16) if fp8 else dtype
     gate_dtype = gate_dtype or (torch.bfloat16 if fp8 else dtype)
     q = _desc((b, h, s, d), qkv_dtype, "q")
     k = _desc((b, h_kv, s, d), qkv_dtype, "k")
@@ -1552,6 +1611,20 @@ def test_gate_check_support_declines_typed(monkeypatch):
     assert _gate_api(with_gate=False).template_params().epilogue_gate is False
     assert _gate_api(fp8=True).check_support(), "bf16 G on the per-tensor FP8 path"
     assert _gate_api(fp8=True, has_amax_o=False).check_support(), "the Amax_O fold-out is a quantized-path option"
+    # MXFP8 (PR-B; INVERTED from PR-A's "not wired" decline): admitted on the SAME terms as FP8 -- Rubin, exactly
+    # (256, 256), a bf16 G -- with a bf16 or an (unscaled) e4m3 O, and the Amax_O fold-out.
+    import torch as _torch
+
+    for dto in (_torch.bfloat16, _torch.float8_e4m3fn):
+        mx = _gate_api(fp8=True, pertensor=False, dtype_o=dto)
+        assert mx.check_support(), dto
+        assert mx.template_params().epilogue_gate is True and mx.template_params().dtype_o == (2 if dto is _torch.bfloat16 else 0)
+    assert _gate_api(fp8=True, pertensor=False, has_amax_o=False).check_support()
+    with pytest.raises(ValueError, match="GATE"):
+        _gate_api(fp8=True, pertensor=False, gate_dtype=torch.float16).check_support()
+    for d, d_v in ((128, 128), (192, 128), (512, 512)):
+        with pytest.raises(NotImplementedError, match="256"):
+            _gate_api(fp8=True, pertensor=False, d=d, d_v=d_v).check_support()
 
     # Malformed requests -> ValueError.
     with pytest.raises(ValueError, match="GATE"):
@@ -1580,8 +1653,6 @@ def test_gate_check_support_declines_typed(monkeypatch):
         _gate_api(split_kv=2).check_support()
     with pytest.raises(NotImplementedError, match="PackGQA"):
         _gate_api(h_kv=2, pack_gqa=True).check_support()
-    with pytest.raises(NotImplementedError, match="MXFP8"):
-        _gate_api(fp8=True, pertensor=False).check_support()
     # Paged KV: K/V are page pools; the d256 f16 flavor serves paged, the gate does not ride it.
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
@@ -1645,6 +1716,9 @@ def test_gate_check_support_declines_other_arch_lines(monkeypatch):
 
 _GATE_O_TOL = dict(atol=5e-2, rtol=3e-2)
 _GATE_LSE_TOL = dict(atol=2e-2, rtol=2e-2)
+# Amax_O is an in-kernel atomicMax over the fp32 pre-cast values: the MXFP8 suite's
+# bound (test_sdpa_fwd_mxfp8_sm100 asserts |amax - ref| <= 0.03 on every flavor).
+_MX_AMAX_ATOL = 0.03
 
 
 def _rubin_only():
@@ -1668,7 +1742,8 @@ def _gate_problem(b, h, h_kv, s, d, dtype, *, seed=0):
 
 
 def _gate_reference(q, k, v, gate, *, causal, scale, seq_kv_lens=None):
-    """fp32 softmax(QK^T) V * sigmoid(G) and the fp64 natural-log LSE (-inf on an empty row)."""
+    """fp32 softmax(QK^T) V * sigmoid(G) (``gate=None``: the UNGATED O, the Amax_O reference)
+    and the fp64 natural-log LSE (-inf on an empty row)."""
     import torch
 
     rep = q.shape[1] // k.shape[1]
@@ -1684,7 +1759,8 @@ def _gate_reference(q, k, v, gate, *, causal, scale, seq_kv_lens=None):
         logits = logits.masked_fill(cols >= seq_kv_lens.view(-1, 1, 1, 1), float("-inf"))
     lse = torch.logsumexp(logits.double(), dim=-1).float()
     p = torch.softmax(logits, dim=-1).nan_to_num(0.0)  # an empty row is all -inf: O = 0
-    return (p @ vf) * torch.sigmoid(gate.float()), lse
+    o = p @ vf
+    return (o * torch.sigmoid(gate.float()) if gate is not None else o), lse
 
 
 def _run_gated(q, k, v, gate, *, causal, cga=None, sched_policy=None, seq_kv_lens=None, with_lse=True, gate_on=True):
@@ -1866,3 +1942,541 @@ def test_sm107_gate_lpt_is_bitwise_natural():
     assert torch.equal(lse_lpt, lse_nat)
     ref_o, _ = _gate_reference(q, k, v, gate, causal=True, scale=d**-0.5)
     torch.testing.assert_close(out_nat.float(), ref_o, **_GATE_O_TOL)
+
+
+# ============================================================================
+# Fused epilogue gate on the MXFP8 d256 kernel (PR-B slice S7, 2026-09-15)
+#
+# The block-scale ``sm107/prefill_d256_mxfp8.py`` carries the SAME shared hook
+# and the same 16 seams as its f16 / per-tensor FP8 siblings (the tests above
+# now iterate all three modules).  What is specific to this body, and what the
+# tests below pin:
+#   * the gate ``SmemTile`` is declared AFTER the four scale-factor slabs -- the
+#     module pins DESC_VERSION=0, so every UTCCP-fed SF slab must START under the
+#     256 KiB version-0 window, and a gate declared before them with a bf16 O at
+#     STAGES_KV=2 would put sQ_SF at exactly 262144 (PR-B D7);
+#   * the SF-root guard: ``config_sm107.d256_mxfp8_last_sf_tile_start`` (raises at
+#     make_cfg) and the kernel's own ``_last_sf_tile_start`` backstop agree, and
+#     a synthetic STAGES_KV=3 + bf16-O config is refused with the window's name;
+#   * ``compile(has_amax=False)`` folds the amax out exactly as on the FP8 body;
+#   * an e4m3 O is UNSCALED (the kernel has no per-tensor scale_o; PR-B D8).
+# The Rubin e2e at the end is the evidence behind the row's claim.
+# ============================================================================
+
+
+def test_sm107_mxfp8_gate_row_reaches_the_lowering_with_the_ctor_kwargs():
+    """The MXFP8 row's claim is not decorative: the same ``_epilogue_gate_ctor_kwargs``
+    that hands the FP8 row its ``sample_gate`` / ``has_amax_o`` does so for MXFP8
+    facts, and the row-level knob interactions decline typed.  The d256 MXFP8
+    flavor stays NATURAL-only under the gate (no LPT claim rides in on PR-B)."""
+    import inspect
+
+    import cudnn
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+    from cudnn.sdpa.fwd import api_dsl, engines, heuristics
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    caps = _caps(_GATE_ROWS[2])
+    assert caps.is_mxfp8 and caps.epilogue_gate is True
+    assert caps.epilogue_gate_d_shapes <= caps.d_shapes
+    ctor = frozenset(inspect.signature(api_dsl.SdpaFwdDsl.__init__).parameters)
+    exe = frozenset(inspect.signature(api_dsl.SdpaFwdDslSm100.execute).parameters)
+    assert "sample_gate" in ctor and "has_amax_o" in ctor and "gate" in exe, "the adapter carries the PR-A constructor / execute surface"
+    facts = _mxfp8_gate_facts()
+    # The Amax_O fold-out rides the same helper for MXFP8 facts (the gate half needs a real IR tensor, so it is
+    # exercised by the graph-path e2e, test_mxfp8_gate_tail_graph_api).
+    assert engines._epilogue_gate_ctor_kwargs(_mxfp8_facts(d_qk=256, d_v=256), ctor, exe, "x") == {"has_amax_o": False}
+    assert engines._epilogue_gate_ctor_kwargs(_mxfp8_facts(d_qk=256, d_v=256, amax_o_t=object()), ctor, exe, "x") == {"has_amax_o": True}
+    assert heuristics._sched_points(caps, _mxfp8_gate_facts(causal=True)) == [SCHED_NATURAL]
+    assert engines.effective_sched_policies(caps, facts) == frozenset({SCHED_NATURAL})
+    why = engines.mismatch(caps, facts, SdpaFwdKnobs(split_kv=2))
+    assert why is not None and "split_kv" in why, why
+    why = engines.mismatch(caps, _mxfp8_gate_facts(h_kv=2), SdpaFwdKnobs(pack_gqa=True))
+    assert why is not None, why
+    why = engines.mismatch(caps, _mxfp8_gate_facts(epilogue_gate_shape_ok=False))
+    assert why is not None and "shape" in why, why
+    why = engines.mismatch(caps, _mxfp8_gate_facts(epilogue_gate_layout_ok=False))
+    assert why is not None and "zero-copy" in why, why
+    # No row outside the three d256 ones claims MXFP8 + gate.
+    for spec in engines.ENGINE_SPECS:
+        if spec.capabilities.is_mxfp8 and spec.name != _GATE_ROWS[2]:
+            assert spec.capabilities.epilogue_gate is False, spec.name
+    _ = cudnn  # imported for symmetry with the sibling tests
+
+
+def test_sm107_mxfp8_gate_template_geometry_and_desc_version():
+    """The gated MXFP8 module: gate ON is a separate specialization of the same
+    file, GATE geometry derives from GATE_BPE (4 bf16 subtiles of 64, 64 KiB per
+    tile, NO CTA_MMA factor), and -- unlike its siblings -- DESC_VERSION stays the
+    PINNED 0 with and without the gate (version 1 is not a transparent widening
+    on the MXFP8 tiles; the gate tile is never a descriptor-fed operand)."""
+    import cutlass
+
+    for dto in (_E4M3, _BF16_OUT):
+        off = _load(_D256, rubin=True, **{**_MXFP8_LOAD_KW, "dtype_o": dto})
+        on = _mxfp8_gate_kernel_module(dtype_o=dto)
+        assert on is not off and on.__file__ == off.__file__
+        assert off.CFG.EPILOGUE_GATE == 0 and on.CFG.EPILOGUE_GATE == 1
+        assert on.DESC_VERSION == off.DESC_VERSION == 0, "the MXFP8 body pins version 0 (mma-tma-matrix.md S6)"
+        assert not hasattr(on, "_needs_desc_v1"), "no derived version bit on this body -- the SF-root guard is the tripwire instead"
+        assert on.GATE_STORAGE_DTYPE is cutlass.BFloat16 and on.CFG.GATE_BPE == 2
+        assert on._GG.tma_iters == 4 and on._GG.tma_granu_elems == 64 and on._GG.d_block == 64 and on._GG.granu_local == 128 * 64
+        assert on.gateBufferElems == 128 * 256 and on.gateTmaTransactionBytes == 64 * 1024, "one Q tile, bf16, no CTA_MMA factor"
+        assert on.SMEM_LAYOUT_GATE == 2 and on._GATE_SMEM_SWIZZLE == cutlass.Swizzle(3, 4, 3)
+        # The gate's walk is NOT O's: with an e4m3 O the O subtile is 128 wide.
+        o_d_block = on.CFG.TILE_O // ((on.CFG.TILE_O * on.CFG.BPE_O) // on.CFG.O_SWZ_BYTES)
+        assert (o_d_block == 128) == (dto == _E4M3) and on._GG.d_block == 64
+        assert on.FROST_SOURCE_DIGEST != off.FROST_SOURCE_DIGEST
+
+
+def test_sm107_mxfp8_gate_smem_tally_and_sf_root_guard():
+    """PR-B D7 in numbers.  The tally gains the four SF slabs (6 KiB at depth 2,
+    named in the validator's message) on top of the gate's 64 KiB; the two
+    layouts the block runs fit (e4m3-O 232 KiB, bf16-O 264 KiB).  The SF-ROOT
+    guard: a bf16 O at STAGES_KV=3 (or an e4m3 O at 4) puts the scale factors at
+    or past 262144 -- refused at make_cfg with the window's name, BEFORE the
+    SMEM check speaks -- and the kernel's own ``_last_sf_tile_start`` backstop
+    agrees with the config twin at every depth / O width.  The gate does not
+    move the SF slabs (declared after them)."""
+    from dataclasses import dataclass, replace
+
+    from cudnn.sdpa.fwd.config_sm107 import (
+        SMEM_USABLE_BYTES,
+        TCGEN05_V0_ADDR_LIMIT,
+        d256_mxfp8_last_sf_tile_start,
+        d256_mxfp8_sf_smem_bytes,
+        make_cfg_d256_mxfp8,
+        sdpa_smem_bytes,
+    )
+
+    KIB = 1024
+    fixed = 2 * KIB
+    assert TCGEN05_V0_ADDR_LIMIT == 262144
+    assert d256_mxfp8_sf_smem_bytes(128, 128, 256, 256, 2) == 6 * KIB  # Q 1 | K 2x1 | P 1 (512 B padded) | V 2x1
+    assert d256_mxfp8_sf_smem_bytes(128, 128, 256, 256, 3) == 8 * KIB
+
+    def tally(*, stages_kv, bpe_o, gate_bpe):
+        sf = d256_mxfp8_sf_smem_bytes(128, 128, 256, 256, stages_kv)
+        return sdpa_smem_bytes(128, 128, 256, 256, 1, stages_kv, 1, 1, bpe_o, qo_alias=True, gate_bpe=gate_bpe, sf_bytes=sf) + fixed
+
+    assert tally(stages_kv=2, bpe_o=1, gate_bpe=0) == 168 * KIB  # today's e4m3-O
+    assert tally(stages_kv=2, bpe_o=2, gate_bpe=0) == 200 * KIB  # today's bf16-O
+    assert tally(stages_kv=2, bpe_o=1, gate_bpe=2) == 232 * KIB  # fully fused block (e4m3 O)
+    assert tally(stages_kv=2, bpe_o=2, gate_bpe=2) == 264 * KIB  # bf16 O + gate
+    assert tally(stages_kv=3, bpe_o=2, gate_bpe=2) == 330 * KIB > SMEM_USABLE_BYTES
+
+    @dataclass(frozen=True)
+    class _ParamsWithStagesKv(TemplateParams):
+        stages_kv: int = None
+
+    def cfg_of(depth, dto, gate=True):
+        return make_cfg_d256_mxfp8(_ParamsWithStagesKv(stages_kv=depth, epilogue_gate=gate, dtype_qkv=_E4M3, dtype_o=dto, cta_mma=1))[0]
+
+    # Accepted: the block's two modes at depth 2; e4m3-O at depth 3 (SF root 231 KiB, 298 KiB total).
+    for depth, dto in ((2, _E4M3), (2, _BF16_OUT), (3, _E4M3)):
+        cfg = cfg_of(depth, dto)
+        assert cfg.EPILOGUE_GATE == 1 and cfg.STAGES_KV == depth
+        assert d256_mxfp8_last_sf_tile_start(cfg) < TCGEN05_V0_ADDR_LIMIT, (depth, dto)
+    assert d256_mxfp8_last_sf_tile_start(cfg_of(2, _E4M3)) == 165 * KIB and d256_mxfp8_last_sf_tile_start(cfg_of(2, _BF16_OUT)) == 197 * KIB
+    # Refused BY THE WINDOW GUARD (its diagnostic, not the SMEM one): bf16 O at depth 3 (sQ_SF at exactly 256 KiB),
+    # e4m3 O at depth 4 -- both latent until PR-B (depth 3 bf16-O fit the SMEM check at 266 KiB ungated).
+    for depth, dto, gate in ((3, _BF16_OUT, True), (3, _BF16_OUT, False), (4, _E4M3, True), (4, _E4M3, False)):
+        with pytest.raises(ValueError, match="version-0 tcgen05 descriptor window") as ei:
+            cfg_of(depth, dto, gate)
+        assert "262144" in str(ei.value) and f"STAGES_KV={depth}" in str(ei.value), str(ei.value)
+    # The out-of-domain depth message names BOTH bounds for this family.
+    with pytest.raises(ValueError, match="2..4") as ei:
+        cfg_of(5, _E4M3)
+    assert "version-0 tcgen05 descriptor window" in str(ei.value) and "DESC_VERSION=0" in str(ei.value), str(ei.value)
+
+    # Kernel-side backstop == config twin, on the loaded modules, at every depth / O width, gate on and off.
+    for dto in (_E4M3, _BF16_OUT):
+        off = _load(_D256, rubin=True, **{**_MXFP8_LOAD_KW, "dtype_o": dto})
+        on = _mxfp8_gate_kernel_module(dtype_o=dto)
+        assert on._LAST_SF_TILE_START == off._LAST_SF_TILE_START == d256_mxfp8_last_sf_tile_start(on.CFG) < 262144, dto
+        for depth in (2, 3, 4):
+            for bpe_o in (1, 2):
+                c = replace(on.CFG, STAGES_KV=depth, BPE_O=bpe_o)
+                assert on._last_sf_tile_start(c) == d256_mxfp8_last_sf_tile_start(c), (dto, depth, bpe_o)
+        assert on._last_sf_tile_start(replace(on.CFG, STAGES_KV=3, BPE_O=2)) >= 262144, "the kernel backstop must fire where the config does"
+        assert on._last_sf_tile_start(replace(on.CFG, STAGES_KV=4, BPE_O=1)) >= 262144
+        # D7 in the SOURCE: the gate slab is declared after the last SF slab AND after the last SF SmemTile.
+        with open(on.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        assert src.index("sV_SF_raw = cutlass.Array(") < src.index("sV_SF = SmemTile(") < src.index("sGate_raw = (") < src.index("bars = make_d256_bars(")
+
+
+# --- Rubin e2e, MXFP8 standalone adapter -------------------------------------
+#
+# Inputs from the shared torch MXFP8 quantizer (rowwise Q/K, columnwise V, the
+# F8_128x4 SF the kernel consumes); the oracle runs on the DEQUANTIZED operands.
+# O tolerance = the MXFP8 suite's (5e-2 abs for a half O; for an e4m3 O
+# max(5e-2, 3 x the e4m3 rounding floor of the reference)); LSE = the gate
+# suite's; bitwise claims are ``torch.equal``.  Sentinel-filled O (bf16 1.5e30;
+# e4m3 byte 0x7F = NaN, which a satfinite cast never produces), NaN-filled LSE
+# and the two-launch trick on every run.  sched_policy is passed EXPLICITLY
+# (NATURAL, the only policy the row claims at d256) and cga is left to the
+# adapter (it pins cta_mma=1 for the quantized d256 flavors).
+
+
+def _mx_bshd(x_bhsd_f32, b, h, s, d, *, columnwise, fp8_dtype=None):
+    """quantize_to_mxfp8 -> (fp8 data as a BHSD view over BSHD storage, fp32 dequantized [b,h,s,d], F8_128x4 SF).
+    ``fp8_dtype``: e4m3 (default) or e5m2 -- the row claims BOTH input members."""
+    import torch
+    from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+    fp8_dtype = fp8_dtype or torch.float8_e4m3fn
+    data_d, sf_d, swz_d, data_s, sf_s, swz_s = quantize_to_mxfp8(x_bhsd_f32.contiguous(), b, h, s, d, 32, fp8_dtype, with_ref=True)
+    data, sf, swz = (data_s, sf_s, swz_s) if columnwise else (data_d, sf_d, swz_d)
+    deq = data.float().reshape(b, h, s, d) * sf.float().reshape(b, h, s, d)
+    return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), deq, swz.contiguous()
+
+
+def _mxfp8_gate_problem(b, h, h_kv, s, d, *, seed=0, in_dtype=None):
+    """((q8, k8, v8, sf_q, sf_k, sf_v), (q_deq, k_deq, v_deq), gate) -- gate bf16 of O's shape, +-2 sigma.
+    ``in_dtype``: the fp8 input member (e4m3 default / e5m2); the oracle sees the DEQUANTIZED operands either way."""
+    import torch
+
+    torch.manual_seed(seed)
+    dev = "cuda"
+    qf = torch.randn(b, h, s, d, device=dev) * 0.5
+    kf = torch.randn(b, h_kv, s, d, device=dev) * 0.5
+    vf = torch.randn(b, h_kv, s, d, device=dev) * 0.5
+    q8, q_deq, sfq = _mx_bshd(qf, b, h, s, d, columnwise=False, fp8_dtype=in_dtype)
+    k8, k_deq, sfk = _mx_bshd(kf, b, h_kv, s, d, columnwise=False, fp8_dtype=in_dtype)
+    v8, v_deq, sfv = _mx_bshd(vf, b, h_kv, s, d, columnwise=True, fp8_dtype=in_dtype)
+    gate = (torch.randn(b, s, h, d, device=dev) * 2.0).to(torch.bfloat16).transpose(1, 2)
+    return (q8, k8, v8, sfq, sfk, sfv), (q_deq, k_deq, v_deq), gate
+
+
+# Sentinels per O dtype: fp8 byte 0x7F is NaN in BOTH e4m3 and e5m2 and a
+# satfinite cast never produces it; fp16 cannot hold 1.5e30 (overflows to inf,
+# which the finiteness check would then blame on the kernel), so it takes 6.0e4
+# (exactly representable, far above any |O| these inputs reach); bf16 keeps 1.5e30.
+_MX_FP8_DTYPES = ("float8_e4m3fn", "float8_e5m2")
+
+
+def _mx_sentinel_value(dtype):
+    import torch
+
+    return 6.0e4 if dtype == torch.float16 else 1.5e30
+
+
+def _mx_sentinel_fill(o):
+    import torch
+
+    if o.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        o.view(torch.uint8).fill_(0x7F)
+    else:
+        o.fill_(_mx_sentinel_value(o.dtype))
+
+
+def _mx_sentinel_survivors(o):
+    import torch
+
+    if o.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return int((o.view(torch.uint8) == 0x7F).sum().item())
+    return int((o.float() == _mx_sentinel_value(o.dtype)).sum().item())
+
+
+def _mx_check_o(out, ref, *, in_key="e4m3"):
+    """The MXFP8 suite's bound (``test_sdpa_fwd_mxfp8_sm100._check`` at d_qk=256): a half
+    O within 5e-2 abs for e4m3 inputs / 8e-2 for the noisier e5m2 inputs (2-bit
+    mantissa, d_qk > 128); an fp8 O within max(that, 3 x the reference's own
+    rounding floor in the OUTPUT fp8 dtype)."""
+    import torch
+
+    diff = (out.float() - ref).abs().max().item()
+    tol = 8e-2 if in_key == "e5m2" else 5e-2
+    if out.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        tol = max(tol, 3.0 * (ref - ref.to(out.dtype).float()).abs().max().item())
+    assert diff <= tol, f"max|O-ref| = {diff:.4f} exceeds {tol:.4f}"
+
+
+def _run_gated_mxfp8(ops, gate, *, causal, out_dtype, seq_kv_lens=None, with_lse=True, gate_on=True, has_amax_o=True, amax=None):
+    """Build, compile and launch TWICE through the standalone adapter; return (api, O, LSE)."""
+    import torch
+
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    q8, k8, v8, sfq, sfk, sfv = ops
+    b, h, s, d = q8.shape
+    d_v = v8.shape[3]
+    out = torch.empty(b, s, h, d_v, device=q8.device, dtype=out_dtype).transpose(1, 2)
+    _mx_sentinel_fill(out)
+    lse = torch.full((b, h, s), float("nan"), device=q8.device, dtype=torch.float32) if with_lse else None
+    api = SdpaFwdDslSm100(
+        q8,
+        k8,
+        v8,
+        out,
+        lse,
+        is_causal=causal,
+        scale_softmax=d**-0.5,
+        seq_kv_lens_present=seq_kv_lens is not None,
+        pertensor_fp8=False,
+        dtype_o=out_dtype,
+        sched_policy=SCHED_NATURAL,
+        has_amax_o=has_amax_o,
+        **({"sample_gate": gate} if gate_on else {}),
+    )
+    assert api.check_support()
+    assert api.template_params().epilogue_gate is gate_on
+    api.compile()
+    kw = dict(lse_tensor=lse, seq_kv_lens=seq_kv_lens, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+    if gate_on:
+        kw["gate"] = gate
+    if amax is not None:
+        kw["amax_o"] = amax
+    api.execute(q8, k8, v8, out, **kw)
+    torch.cuda.synchronize()
+    first_o, first_lse = out.clone(), (lse.clone() if lse is not None else None)
+    api.execute(q8, k8, v8, out, **kw)
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.uint8), first_o.view(torch.uint8)), "two-launch delta on O: a first-launch race (missing fence_proxy?)"
+    assert lse is None or torch.equal(lse, first_lse), "two-launch delta on LSE"
+    assert _mx_sentinel_survivors(out) == 0, "unwritten (sentinel) O cells"
+    assert torch.isfinite(out.float()).all(), "non-finite O cells"
+    return api, out, lse
+
+
+# Every frozenset member the MXFP8 row claims WITH the gate gets one launch
+# (engine-contract rule 9: a frozenset field is that many separate claims):
+# inputs {e4m3, e5m2} x outputs {fp16, bf16, e4m3, e5m2}.  e4m3-in carries the
+# shape/mask coverage (dense 512 + causal 1000 at bf16 and e4m3 O); the other
+# members get one shape each -- the gate path is dtype-orthogonal (it multiplies
+# the fp32 accumulator before the single output cast), so one launch per member
+# is what turns the claim into evidence, not a sweep.
+_MX_IN = {"e4m3": "float8_e4m3fn", "e5m2": "float8_e5m2"}
+_MX_OUT = {"fp16": "float16", "bf16": "bfloat16", "e4m3": "float8_e4m3fn", "e5m2": "float8_e5m2"}
+
+
+@pytest.mark.parametrize(
+    "in_key, out_key, causal, s",
+    [
+        ("e4m3", "bf16", False, 512),
+        ("e4m3", "bf16", True, 1000),
+        ("e4m3", "e4m3", False, 512),
+        ("e4m3", "e4m3", True, 1000),
+        ("e4m3", "fp16", False, 512),
+        ("e4m3", "e5m2", False, 512),
+        ("e5m2", "bf16", True, 1000),
+        ("e5m2", "fp16", False, 512),
+        ("e5m2", "e4m3", False, 512),
+        ("e5m2", "e5m2", True, 1000),
+    ],
+    ids=[
+        "e4m3-bf16-dense-512",
+        "e4m3-bf16-causal-1000",
+        "e4m3-e4m3-dense-512",
+        "e4m3-e4m3-causal-1000",
+        "e4m3-fp16-dense-512",
+        "e4m3-e5m2-dense-512",
+        "e5m2-bf16-causal-1000",
+        "e5m2-fp16-dense-512",
+        "e5m2-e4m3-dense-512",
+        "e5m2-e5m2-causal-1000",
+    ],
+)
+def test_sm107_mxfp8_gate_matches_the_dequant_oracle(in_key, out_key, causal, s):
+    """Rubin e2e for the MXFP8 row's gate claim, one launch per claimed dtype
+    member: O == softmax(QK^T)V * sigmoid(G) on the DEQUANTIZED operands within
+    the MXFP8 suite's bound (half O, or an UNSCALED fp8 O -- PR-B D8: the kernel
+    has no per-tensor scale_o); LSE is the plain (ungated) fp64 log-sum-exp.
+    S=1000 causal covers a KV tail."""
+    import torch
+
+    _rubin_only()
+    in_dt = getattr(torch, _MX_IN[in_key])
+    dt = getattr(torch, _MX_OUT[out_key])
+    b, h, h_kv, d = 2, 8, 2, 256
+    ops, (q_deq, k_deq, v_deq), gate = _mxfp8_gate_problem(b, h, h_kv, s, d, in_dtype=in_dt)
+    assert ops[0].dtype == in_dt
+    _, out, lse = _run_gated_mxfp8(ops, gate, causal=causal, out_dtype=dt)
+    assert out.dtype == dt
+    ref_o, ref_lse = _gate_reference(q_deq, k_deq, v_deq, gate, causal=causal, scale=d**-0.5)
+    _mx_check_o(out, ref_o, in_key=in_key)
+    torch.testing.assert_close(lse, ref_lse, **_GATE_LSE_TOL)
+
+
+def test_sm107_mxfp8_gate_off_is_bitwise_the_shipped_kernel(tmp_path):
+    """The one-time "gate-off == develop" proof for the MXFP8 body: the working-tree
+    kernel loaded with epilogue_gate=False and has_amax=True must be BITWISE the
+    kernel ``origin/develop`` ships (O, LSE and Amax_O) on the same block-scaled
+    problem.  The shipped file is extracted with ``git show`` and run through
+    the SAME adapter marshalling (its ``_k_mod`` / ``_compiled_kernel`` swapped in),
+    so the comparison is kernel-vs-kernel, not harness-vs-harness.  Live only
+    while develop is PRE-gate: once develop carries ``gate_stride`` the test
+    skips (the proof is recorded in the tracker), and an unreachable ref skips."""
+    import inspect
+    import pathlib
+    import subprocess
+
+    import torch
+
+    import cudnn
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    _rubin_only()
+    root = pathlib.Path(cudnn.__file__).resolve().parents[2]
+    rel = "python/cudnn/sdpa/fwd/kernels/sm107/prefill_d256_mxfp8.py"
+    try:
+        src = subprocess.run(["git", "-C", str(root), "show", f"origin/develop:{rel}"], check=True, capture_output=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:  # no checkout / no such ref here
+        pytest.skip(f"origin/develop:{rel} is not reachable from {root}: {exc}")
+    shipped_file = tmp_path / "shipped_prefill_d256_mxfp8.py"
+    shipped_file.write_bytes(src)
+
+    b, h, h_kv, s, d = 2, 8, 2, 1000, 256
+    ops, _, gate = _mxfp8_gate_problem(b, h, h_kv, s, d)
+    q8, k8, v8, sfq, sfk, sfv = ops
+    amax_p = torch.zeros(1, device="cuda", dtype=torch.float32)
+    api_p, out_p, lse_p = _run_gated_mxfp8(ops, gate, causal=True, out_dtype=torch.bfloat16, gate_on=False, amax=amax_p)
+    params = api_p.template_params()
+    assert params.epilogue_gate is False
+    assert getattr(api_p, "_amax_folded_out", None) is False
+
+    shipped = load_template(str(shipped_file), params, tag="shipped_sm107_mxfp8_d256")
+    if "gate_stride" in inspect.signature(shipped.compile).parameters:
+        # Post-merge: develop itself carries the gate, so there is no PRE-gate
+        # reference left to compare against.  A SKIP, not a failure -- a test
+        # must not depend on its own branch not having landed (it would turn the
+        # Rubin nightly red on the first run after the merge).  The one-time
+        # proof is on record: SUPPORT_MATRIX_TRACKER.md footnote viii, 2026-09-15
+        # (O / LSE / Amax_O bitwise vs develop `18091c19` at B=2 H=8 H_kv=2
+        # S=1000 causal, e4m3 in, bf16 O, has_amax=True).
+        pytest.skip("origin/develop already carries the epilogue gate; the one-time gate-off == shipped proof was recorded 2026-09-15 (tracker footnote viii)")
+    assert shipped.DESC_VERSION == api_p._k_mod.DESC_VERSION == 0
+    api_s = SdpaFwdDslSm100(
+        q8, k8, v8, out_p, lse_p, is_causal=True, scale_softmax=d**-0.5, pertensor_fp8=False, dtype_o=torch.bfloat16, sched_policy=SCHED_NATURAL
+    )
+    assert api_s.check_support() and api_s.template_params() == params
+    # Swap the SHIPPED module in under the same adapter (compile() would load the working-tree file).
+    api_s._k_mod = shipped
+    api_s._kernel_accepts = None
+    api_s._compiled_kernel = shipped.compile(b=b, qh=h, kh=h_kv, sq=s, skv=s, d_qk=d, d_v=d, has_lse=True)
+    api_s._combine_kernel = None
+    api_s._amax_folded_out = False
+    out_s = torch.empty_like(out_p)
+    _mx_sentinel_fill(out_s)
+    lse_s = torch.full_like(lse_p, float("nan"))
+    amax_s = torch.zeros(1, device="cuda", dtype=torch.float32)
+    api_s.execute(q8, k8, v8, out_s, lse_tensor=lse_s, sf_q=sfq, sf_k=sfk, sf_v=sfv, amax_o=amax_s)
+    torch.cuda.synchronize()
+    assert _mx_sentinel_survivors(out_s) == 0
+    assert torch.equal(out_s.view(torch.uint8), out_p.view(torch.uint8)), "gate-off production O must be BITWISE the shipped kernel's"
+    assert torch.equal(lse_s, lse_p), "gate-off production LSE must be BITWISE the shipped kernel's"
+    assert torch.equal(amax_s, amax_p) and amax_p.item() > 0.0, "gate-off production Amax_O must be BITWISE the shipped kernel's"
+
+
+def test_sm107_mxfp8_gate_lse_is_bitwise_independent_of_the_gate():
+    """The gate multiplies the fp32 pre-cast accumulator in the epilogue and
+    nothing upstream of it: the published LSE is BITWISE the ungated kernel's,
+    and O is the ungated O times sigmoid(G) to rounding."""
+    import torch
+
+    _rubin_only()
+    b, h, h_kv, s, d = 2, 8, 2, 1000, 256
+    ops, _, gate = _mxfp8_gate_problem(b, h, h_kv, s, d)
+    _, out_on, lse_on = _run_gated_mxfp8(ops, gate, causal=True, out_dtype=torch.bfloat16, gate_on=True)
+    _, out_off, lse_off = _run_gated_mxfp8(ops, gate, causal=True, out_dtype=torch.bfloat16, gate_on=False)
+    assert torch.equal(lse_on, lse_off), "LSE must not depend on the gate"
+    torch.testing.assert_close(out_on.float(), out_off.float() * torch.sigmoid(gate.float()), **_GATE_O_TOL)
+    assert not torch.equal(out_on, out_off), "the gate must actually apply (a +-2 sigma G is far from sigmoid == 1)"
+
+
+@pytest.mark.parametrize("out_key", ["bf16", "e4m3"])
+def test_sm107_mxfp8_gate_amax_is_a_compile_time_fact(out_key):
+    """``has_amax_o=False`` folds the Amax_O atomic out of the gated MXFP8 kernel
+    (the adapter records ``_amax_folded_out``, binds None in the slot and never
+    resets a buffer), O stays BITWISE identical, and an amax_o handed to that
+    specialization is a typed ValueError.  With the amax requested it is the
+    amax of the UNGATED, dead-row-selected fp32 pre-cast O -- the sdpa NODE's
+    output, which on the graph PRECEDES the sigmoid/mul tail -- in the O's own
+    units (no per-tensor scale_o on this path), while the quantized O itself
+    IS the gated value.  A random G cannot tell the two apart (the top |O|
+    cells carry sigmoid(G) ~ 1), so the discrimination is STRUCTURAL: G = -1e4
+    (sigmoid == 0) zeroes O yet must leave Amax_O at the un-gated value (a
+    gated-value reduction reports exactly 0); G = +1e4 (sigmoid == 1)
+    reproduces it; and all three gated runs equal the UNGATED specialization's
+    Amax_O bit-for-bit (the kernel folds |h| = |u/2| and doubles once per tile,
+    exact in fp32) -- the per-tensor FP8 sibling's contract
+    (test_sdpa_fp8_sm107::test_fp8_d256_amax_is_the_pre_gate_value)."""
+    import torch
+
+    _rubin_only()
+    dt = {"bf16": torch.bfloat16, "e4m3": torch.float8_e4m3fn}[out_key]
+    b, h, h_kv, s, d = 2, 8, 2, 512, 256
+    ops, (q_deq, k_deq, v_deq), gate = _mxfp8_gate_problem(b, h, h_kv, s, d)
+    ungated_ref, _ = _gate_reference(q_deq, k_deq, v_deq, None, causal=False, scale=d**-0.5)
+    ungated_amax = ungated_ref.abs().max().item()
+    assert ungated_amax > 2 * _MX_AMAX_ATOL, f"un-gated amax {ungated_amax:.4f} too small to be told from zero -- reshape the probe"
+    amax = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
+    api_a, out_a, lse_a = _run_gated_mxfp8(ops, gate, causal=False, out_dtype=dt, has_amax_o=True, amax=amax)
+    assert getattr(api_a, "_amax_folded_out", None) is False and amax.item() > 0.0
+    assert abs(amax.item() - ungated_amax) <= _MX_AMAX_ATOL, f"Amax_O {amax.item():.4f} vs the UN-gated reference {ungated_amax:.4f}"
+    api_n, out_n, lse_n = _run_gated_mxfp8(ops, gate, causal=False, out_dtype=dt, has_amax_o=False)
+    assert api_n._amax_folded_out is True, "the MXFP8 d256 kernel carries has_amax, so the fold-out must be live"
+    assert torch.equal(out_n.view(torch.uint8), out_a.view(torch.uint8)), "has_amax_o=False must fold only the Amax_O write out"
+    assert torch.equal(lse_n, lse_a)
+    with pytest.raises(ValueError, match="has_amax_o"):
+        api_n.execute(*ops[:3], out_n, lse_tensor=lse_n, sf_q=ops[3], sf_k=ops[4], sf_v=ops[5], gate=gate, amax_o=amax)
+    # Structural amax discrimination.  sigmoid(G) == 0: every gated O cell is 0, yet Amax_O is the
+    # UN-gated amax (a gated-value reduction would report exactly 0).
+    amax_neg = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
+    _, out_neg, _ = _run_gated_mxfp8(ops, torch.full_like(gate, -1e4), causal=False, out_dtype=dt, has_amax_o=True, amax=amax_neg)
+    assert (out_neg.float() == 0).all(), "O itself must be the gated (zero) value"
+    assert (
+        abs(amax_neg.item() - ungated_amax) <= _MX_AMAX_ATOL
+    ), f"Amax_O {amax_neg.item():.4f} with sigmoid(G) == 0 vs un-gated ref {ungated_amax:.4f}: the kernel reduced the GATED O"
+    # sigmoid(G) == 1: the gated value IS the un-gated one, and so is Amax_O.
+    amax_pos = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
+    _, out_pos, _ = _run_gated_mxfp8(ops, torch.full_like(gate, 1e4), causal=False, out_dtype=dt, has_amax_o=True, amax=amax_pos)
+    assert abs(amax_pos.item() - ungated_amax) <= _MX_AMAX_ATOL, f"Amax_O {amax_pos.item():.4f} with sigmoid(G) == 1 vs un-gated ref {ungated_amax:.4f}"
+    _mx_check_o(out_pos, ungated_ref)
+    # G-independence and agreement with the UNGATED specialization are bit-exact, not tolerance-bound.
+    amax_off = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
+    _, out_off, _ = _run_gated_mxfp8(ops, gate, causal=False, out_dtype=dt, gate_on=False, has_amax_o=True, amax=amax_off)
+    _mx_check_o(out_off, ungated_ref)
+    assert amax_neg.item() == amax_pos.item() == amax.item() == amax_off.item(), (
+        f"Amax_O must be G-independent and equal the ungated kernel's: -1e4 {amax_neg.item():.6f}, +1e4 {amax_pos.item():.6f}, "
+        f"random {amax.item():.6f}, ungated {amax_off.item():.6f}"
+    )
+
+
+@pytest.mark.parametrize("out_key", ["bf16", "e4m3"])
+def test_sm107_mxfp8_gate_dead_padded_entry_is_exactly_zero(out_key):
+    """sdpa-invariants S1/S2 on the MXFP8 body: a batch entry with seq_kv_len ==
+    0 runs ZERO KV iterations, so its epilogue must SELECT zero, never multiply
+    the (possibly NaN) accumulator residue -- and the gate fma sits BEFORE that
+    select, so a +-1e4 gate on the dead entry cannot leak through: O exactly 0,
+    LSE exactly -inf, Amax_O untouched by the dead rows (the gated arm's |h|
+    fold sees the dead rows' NaN-able residue, and its once-per-tile select at
+    corr_release must zero it before the atomicMax).  The live entry stays on
+    the oracle, and Amax_O is the live entry's UNGATED amax (the sdpa node's
+    output, independent of G).  (The empty-mainloop arm also issues the gate
+    load -- P14 -- which is what this shape exercises.)"""
+    import torch
+
+    _rubin_only()
+    dt = {"bf16": torch.bfloat16, "e4m3": torch.float8_e4m3fn}[out_key]
+    b, h, h_kv, s, d = 2, 8, 2, 512, 256
+    ops, (q_deq, k_deq, v_deq), gate = _mxfp8_gate_problem(b, h, h_kv, s, d)
+    sign = torch.where(torch.arange(s * h * d, device="cuda") % 2 == 0, 1.0, -1.0).view(s, h, d)
+    gate.transpose(1, 2)[1] = (sign * 1e4).to(torch.bfloat16)
+    lens = torch.tensor([s, 0], dtype=torch.int32, device="cuda")
+    amax = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
+    _, out, lse = _run_gated_mxfp8(ops, gate, causal=False, out_dtype=dt, seq_kv_lens=lens, amax=amax)
+    assert (out[1].float() == 0).all(), "the dead entry must be EXACTLY zero (select, not residue * 0)"
+    assert torch.isneginf(lse[1]).all(), "an empty row's LSE is -inf (no floor may leak: -69.08 = log 1e-30)"
+    ref_o, ref_lse = _gate_reference(q_deq, k_deq, v_deq, gate, causal=False, scale=d**-0.5, seq_kv_lens=lens)
+    _mx_check_o(out[0], ref_o[0])
+    torch.testing.assert_close(lse[0], ref_lse[0], **_GATE_LSE_TOL)
+    ungated_ref, _ = _gate_reference(q_deq, k_deq, v_deq, None, causal=False, scale=d**-0.5, seq_kv_lens=lens)
+    assert amax.item() > 0.0 and torch.isfinite(amax).all(), "Amax_O must be written, and finite (the dead rows' NaN residue must be selected out)"
+    assert (
+        abs(amax.item() - ungated_ref[0].abs().max().item()) <= _MX_AMAX_ATOL
+    ), f"Amax_O {amax.item():.4f} is the live entry's UNGATED amax {ungated_ref[0].abs().max().item():.4f}; the dead entry contributes nothing"

@@ -33,6 +33,7 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 - [FROST SDPA support-matrix tracker — what the FROST SDPA engines serve, per architecture](https://github.com/NVIDIA/cudnn-frontend/blob/main/python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md)
 - [Block-sparse attention (BSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/bsa.md), [DeepSeek sparse attention (DSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/dsa.md), [Native sparse attention (NSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/nsa.md)
 - [GEMM fusions (amax, SwiGLU, sReLU, grouped/discrete MoE variants)](https://github.com/NVIDIA/cudnn-frontend/tree/main/docs/fe-oss-apis/gemm_fusions)
+- [Gated attention block (SM107): projection + QK-norm/RoPE + SDPA + sigmoid gate + out projection as one FROST block, bf16 / FP8 / MXFP8](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/gated_attention_block.md)
 - [RMSNorm + RHT + Amax](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/rmsnorm_rht_amax.md), [RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/rmsnorm_silu.md)
 
 ## How-to guides
@@ -44,6 +45,7 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 - [Compile-time constants](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/CompileTimeConstants.md)
 - [Adding PyTorch custom ops](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/adding_torch_custom_ops.md)
 - [Python graph and execution backends](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/python_graph_and_execution_backends.md)
+- [Composing multi-kernel blocks in Python (workspace, streams, fusion knobs, typed declines)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/composing_kernel_blocks.md)
 
 ## Examples
 

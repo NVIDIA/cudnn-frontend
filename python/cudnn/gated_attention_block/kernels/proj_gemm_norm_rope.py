@@ -204,6 +204,10 @@ _OFF_Q, _OFF_GATE, _OFF_K, _OFF_V = PARAMS.offsets
 _N_QKVG: int = PARAMS.n_qkvg
 _EPS: float = PARAMS.eps
 WANT_RSTD: bool = PARAMS.want_rstd
+# False: the RoPE-ONLY epilogue -- no pass A (sum of squares), no rsqrt, no norm-weight
+# loads, no rstd; the Q/K tiles are rotated on the fp32 accumulator and stored.  Every
+# norm-only block below sits under const_expr(_QK_NORM); the weights are None at the ABI.
+_QK_NORM: bool = PARAMS.qk_norm
 NORM_SOURCE: str = PARAMS.norm_source  # "ldg" | "ldg_early" | "const" | "off"
 _LDG: bool = NORM_SOURCE in ("ldg", "ldg_early")  # real loads (vs the const diagnostic)
 _ROPE_SUBTILES: int = _ROPE_DIM // epi_n
@@ -309,8 +313,8 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
     out_stride_l_0: cutlass.Int64,
     tma_c_desc_0: cutlass.GridConstant[_tma.TensorMap],
     # ---- NORM+ROPE FUSION: appended, so the rendered prefix stays diffable ----
-    w_q_norm: cute.Tensor,  # [D]      io dtype
-    w_k_norm: cute.Tensor,  # [D]      io dtype
+    w_q_norm: Optional[cute.Tensor],  # [D]      io dtype, or None (qk_norm=False: folds out)
+    w_k_norm: Optional[cute.Tensor],  # [D]      io dtype, or None
     cos_tab: cute.Tensor,  # [T, ROPE_DIM] io dtype, per-token, halves duplicated
     sin_tab: cute.Tensor,  # [T, ROPE_DIM]
     rstd_q: Optional[cute.Tensor],  # [T, H_q]  fp32, or None (folds out)
@@ -1251,7 +1255,8 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
                         ((_n0 - cutlass.Int32(_OFF_K)) >> _LOG2_D).ir_value(),
                     )
                 )
-                _w_base = cutlass.Int64(arith.select(_is_q.ir_value(), w_q_norm.iterator.toint().ir_value(), w_k_norm.iterator.toint().ir_value()))
+                if cutlass.const_expr(_QK_NORM):
+                    _w_base = cutlass.Int64(arith.select(_is_q.ir_value(), w_q_norm.iterator.toint().ir_value(), w_k_norm.iterator.toint().ir_value()))
                 # Tail rows (row >= m) exist in TMEM and are clipped by the TMA
                 # store; their cos/sin READS must still be in bounds -> clamp.
                 _row64 = (coord_m_tile + tidx).to(cutlass.Int64)
@@ -1366,29 +1371,31 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
                                     _sn_words.append(_w)
 
                         # -- pass A: sum of squares over the whole row (8 subtiles), pairs of loads per wait --
-                        _sq_parts = []
-                        for _s0 in cutlass.range_constexpr(0, subtile_cnt, 2):
-                            _vs = []
-                            for _s in cutlass.range_constexpr(_s0, min(_s0 + 2, subtile_cnt)):
-                                _soff, _sw = epi_spans[_s]
-                                _tm = cutlass.inttoptr(tmem_col_addr_gemms[0] + _soff, 6, mma_c_dtype)
-                                _vs.append(nvvm.tcgen05_ld(shape, _tm, num=_sw, offset=ld_half_off))
-                            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                            for _v in _vs:
-                                _acc = _v[0] * _v[0]
-                                for _i in cutlass.range_constexpr(1, epi_n):
-                                    _acc = _acc + _v[_i] * _v[_i]
-                                _sq_parts.append(_acc)
-                        _sq = _sq_parts[0]
-                        for _p in cutlass.range_constexpr(1, len(_sq_parts)):
-                            _sq = _sq + _sq_parts[_p]
-                        _rstd = cute.math.rsqrt(_sq * cutlass.Float32(1.0 / _D) + cutlass.Float32(_EPS), fastmath=True)
-                        if cutlass.const_expr(WANT_RSTD):
-                            _rs_h = cutlass.Int32(arith.select(_is_q.ir_value(), cutlass.Int32(_H_Q).ir_value(), cutlass.Int32(_H_KV).ir_value()))
-                            _rs_base = cutlass.Int64(arith.select(_is_q.ir_value(), rstd_q.iterator.toint().ir_value(), rstd_k.iterator.toint().ir_value()))
-                            _rs_addr = _rs_base + (_row64 * _rs_h.to(cutlass.Int64) + _head.to(cutlass.Int64)) * cutlass.Int64(4)
-                            if _rstd_row_valid:
-                                st_global(_rs_addr, _rstd, cutlass.Float32)
+                        # (qk_norm=False: no pass A, no rsqrt, no rstd -- the arm is RoPE only)
+                        if cutlass.const_expr(_QK_NORM):
+                            _sq_parts = []
+                            for _s0 in cutlass.range_constexpr(0, subtile_cnt, 2):
+                                _vs = []
+                                for _s in cutlass.range_constexpr(_s0, min(_s0 + 2, subtile_cnt)):
+                                    _soff, _sw = epi_spans[_s]
+                                    _tm = cutlass.inttoptr(tmem_col_addr_gemms[0] + _soff, 6, mma_c_dtype)
+                                    _vs.append(nvvm.tcgen05_ld(shape, _tm, num=_sw, offset=ld_half_off))
+                                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                                for _v in _vs:
+                                    _acc = _v[0] * _v[0]
+                                    for _i in cutlass.range_constexpr(1, epi_n):
+                                        _acc = _acc + _v[_i] * _v[_i]
+                                    _sq_parts.append(_acc)
+                            _sq = _sq_parts[0]
+                            for _p in cutlass.range_constexpr(1, len(_sq_parts)):
+                                _sq = _sq + _sq_parts[_p]
+                            _rstd = cute.math.rsqrt(_sq * cutlass.Float32(1.0 / _D) + cutlass.Float32(_EPS), fastmath=True)
+                            if cutlass.const_expr(WANT_RSTD):
+                                _rs_h = cutlass.Int32(arith.select(_is_q.ir_value(), cutlass.Int32(_H_Q).ir_value(), cutlass.Int32(_H_KV).ir_value()))
+                                _rs_base = cutlass.Int64(arith.select(_is_q.ir_value(), rstd_q.iterator.toint().ir_value(), rstd_k.iterator.toint().ir_value()))
+                                _rs_addr = _rs_base + (_row64 * _rs_h.to(cutlass.Int64) + _head.to(cutlass.Int64)) * cutlass.Int64(4)
+                                if _rstd_row_valid:
+                                    st_global(_rs_addr, _rstd, cutlass.Float32)
 
                         # -- pass B: scale, rotate, and store subtile by subtile --
                         _rot_elems = []  # per rope subtile: list of epi_n fp32
@@ -1402,21 +1409,28 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
                                     _tm = cutlass.inttoptr(tmem_col_addr_gemms[0] + _soff, 6, mma_c_dtype)
                                     _rv.append(nvvm.tcgen05_ld(shape, _tm, num=_sw, offset=ld_half_off))
                                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                                _y = []  # ROPE_DIM normed fp32, flat
+                                # The `const` diagnostic substitutes a LIVE register for every deleted load:
+                                # rstd under the norm, the first accumulator element under RoPE-only.
+                                _diag = _rstd if cutlass.const_expr(_QK_NORM) else _rv[0][0]
+                                _y = []  # ROPE_DIM normed (or raw, qk_norm=False) fp32, flat
                                 for _s in cutlass.range_constexpr(_ROPE_SUBTILES):
-                                    _we = []
-                                    if cutlass.const_expr(_LDG):
-                                        _wa = _w_base + cutlass.Int64(epi_spans[_s][0] * _IO_BPE)
-                                        for _h in cutlass.range_constexpr(epi_n * _IO_BPE // 16):
-                                            for _w in ld_global_v4(_wa + cutlass.Int64(_h * 16), cutlass.Int32):
-                                                _lo, _hi = f16x2_to_f32(_w, dtype=cd_dtype)
-                                                _we.append(_lo)
-                                                _we.append(_hi)
+                                    if cutlass.const_expr(_QK_NORM):
+                                        _we = []
+                                        if cutlass.const_expr(_LDG):
+                                            _wa = _w_base + cutlass.Int64(epi_spans[_s][0] * _IO_BPE)
+                                            for _h in cutlass.range_constexpr(epi_n * _IO_BPE // 16):
+                                                for _w in ld_global_v4(_wa + cutlass.Int64(_h * 16), cutlass.Int32):
+                                                    _lo, _hi = f16x2_to_f32(_w, dtype=cd_dtype)
+                                                    _we.append(_lo)
+                                                    _we.append(_hi)
+                                        else:
+                                            for _i in cutlass.range_constexpr(epi_n):
+                                                _we.append(_rstd)  # DIAGNOSTIC: same ALU, no load
+                                        for _i in cutlass.range_constexpr(epi_n):
+                                            _y.append((_rv[_s][_i] * _rstd) * _we[_i])
                                     else:
                                         for _i in cutlass.range_constexpr(epi_n):
-                                            _we.append(_rstd)  # DIAGNOSTIC: same ALU, no load
-                                    for _i in cutlass.range_constexpr(epi_n):
-                                        _y.append((_rv[_s][_i] * _rstd) * _we[_i])
+                                            _y.append(_rv[_s][_i])
                                 _c = []
                                 _sn = []
                                 if cutlass.const_expr(_LDG):
@@ -1429,8 +1443,8 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
                                         _sn.append(_hi)
                                 else:
                                     for _i in cutlass.range_constexpr(_ROPE_DIM):
-                                        _c.append(_rstd + cutlass.Float32(1.0))  # DIAGNOSTIC: no load
-                                        _sn.append(_rstd)
+                                        _c.append(_diag + cutlass.Float32(1.0))  # DIAGNOSTIC: no load
+                                        _sn.append(_diag)
                                 _flat = []
                                 for _i in cutlass.range_constexpr(_ROPE_HALF):
                                     _flat.append(_y[_i] * _c[_i] - _y[_i + _ROPE_HALF] * _sn[_i])
@@ -1444,20 +1458,24 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
                                 _tm = cutlass.inttoptr(tmem_col_addr_gemms[0] + subtile_col_offset, 6, mma_c_dtype)
                                 _v = nvvm.tcgen05_ld(shape, _tm, num=subtile_w, offset=ld_half_off)
                                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                                _we = []
-                                if cutlass.const_expr(_LDG):
-                                    _wa = _w_base + cutlass.Int64(subtile_col_offset * _IO_BPE)
-                                    for _h in cutlass.range_constexpr(epi_n * _IO_BPE // 16):
-                                        for _w in ld_global_v4(_wa + cutlass.Int64(_h * 16), cutlass.Int32):
-                                            _lo, _hi = f16x2_to_f32(_w, dtype=cd_dtype)
-                                            _we.append(_lo)
-                                            _we.append(_hi)
+                                _elems = []
+                                if cutlass.const_expr(_QK_NORM):
+                                    _we = []
+                                    if cutlass.const_expr(_LDG):
+                                        _wa = _w_base + cutlass.Int64(subtile_col_offset * _IO_BPE)
+                                        for _h in cutlass.range_constexpr(epi_n * _IO_BPE // 16):
+                                            for _w in ld_global_v4(_wa + cutlass.Int64(_h * 16), cutlass.Int32):
+                                                _lo, _hi = f16x2_to_f32(_w, dtype=cd_dtype)
+                                                _we.append(_lo)
+                                                _we.append(_hi)
+                                    else:
+                                        for _i in cutlass.range_constexpr(epi_n):
+                                            _we.append(_rstd)  # DIAGNOSTIC: same ALU, no load
+                                    for _i in cutlass.range_constexpr(epi_n):
+                                        _elems.append((_v[_i] * _rstd) * _we[_i])
                                 else:
                                     for _i in cutlass.range_constexpr(epi_n):
-                                        _we.append(_rstd)  # DIAGNOSTIC: same ALU, no load
-                                _elems = []
-                                for _i in cutlass.range_constexpr(epi_n):
-                                    _elems.append((_v[_i] * _rstd) * _we[_i])
+                                        _elems.append(_v[_i])  # RoPE-only: the passthrough dims are the raw accumulator
 
                             if mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1:
                                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
@@ -1604,8 +1622,8 @@ def _host(
     b_0: cute.Tensor,
     c_0: cute.Tensor,
     # ---- NORM+ROPE FUSION: appended ----
-    w_q_norm: cute.Tensor,
-    w_k_norm: cute.Tensor,
+    w_q_norm: Optional[cute.Tensor],  # None iff PARAMS.qk_norm is False
+    w_k_norm: Optional[cute.Tensor],
     cos_tab: cute.Tensor,
     sin_tab: cute.Tensor,
     rstd_q: Optional[cute.Tensor],
@@ -1828,8 +1846,9 @@ def compile() -> Callable:
     # ---- NORM+ROPE FUSION: the six appended operands ----
     # Static [D] weights (the artifact then refuses a wrong-length weight at the
     # call boundary); cos/sin/rstd are [T, x] row-major over the symbolic M.
-    fake_w_q = make_fake_compact_tensor(cd_dtype, (_D,), stride_order=(0,), assumed_align=16)
-    fake_w_k = make_fake_compact_tensor(cd_dtype, (_D,), stride_order=(0,), assumed_align=16)
+    # qk_norm=False: the weights are None at the ABI (and the artifact then refuses a tensor there).
+    fake_w_q = make_fake_compact_tensor(cd_dtype, (_D,), stride_order=(0,), assumed_align=16) if _QK_NORM else None
+    fake_w_k = make_fake_compact_tensor(cd_dtype, (_D,), stride_order=(0,), assumed_align=16) if _QK_NORM else None
     fake_cos = make_fake_compact_tensor(cd_dtype, (sym_m, _ROPE_DIM), stride_order=(1, 0), assumed_align=16)
     fake_sin = make_fake_compact_tensor(cd_dtype, (sym_m, _ROPE_DIM), stride_order=(1, 0), assumed_align=16)
     fake_rstd_q = make_fake_compact_tensor(cutlass.Float32, (sym_m, _H_Q), stride_order=(1, 0), assumed_align=4) if WANT_RSTD else None

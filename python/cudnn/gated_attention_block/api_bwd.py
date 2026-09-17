@@ -31,6 +31,8 @@ The op graph, in pipeline order::
               |  (B5) RoPE^T   inverse rotation on the first ROPE_DIM of dQ, dK
               |  (B6) RMSNorm backward, per head over D
               |         -> dQ_pre, dK_pre, dW_q_norm, dW_k_norm
+              |         (does not exist under geometry.qk_norm=False: dQ_pre = RoPE^T(dQ),
+              |          no norm weights, no dW_*_norm, saved.rstd_* are None)
               |
               |  concat(dQ_pre | dG | dK_pre | dV) = dQKVG   (qkvg_offsets order)
               |
@@ -99,7 +101,7 @@ from cuda.bindings import driver as cuda
 from cudnn.api_base import APIBase, TupleDict
 from cudnn.frost.workspace import WorkspaceLayout
 
-from .api import GatedAttentionBlockGeometry, SavedForBackward, _Stage
+from .api import GatedAttentionBlockGeometry, SavedForBackward, _check_norm_weights_agree, _Stage
 
 _logger = logging.getLogger(__name__)
 
@@ -162,6 +164,10 @@ class RecomputePolicy(Enum):
     Whatever is recomputed must be recomputed BIT-IDENTICALLY to the forward, or
     gradients acquire a noise floor that looks like a kernel bug. Same tile
     config, same accumulation order, same epilogue rounding.
+
+    Under ``geometry.qk_norm=False`` the policy still decides ``q_pre`` /
+    ``k_pre`` (the RoPE-only backward reads them through the same slots), but
+    there is no ``rstd`` to save or rebuild -- stage (B6) does not exist.
     """
 
     SAVE_ALL = 0
@@ -393,6 +399,11 @@ class _QkRmsNormBwd(_Stage):
 
     Writes dQ_pre / dK_pre in place over the Q and K slices of ``dqkvg``.
 
+    **Not built when ``geometry.qk_norm`` is False**: a RoPE-only forward has no
+    norm, no norm weights, no ``rstd`` (``SavedForBackward.rstd_q/rstd_k`` are
+    ``None``) and nothing for ``need_dw_norms`` to produce -- (B5) alone yields
+    ``dQ_pre`` / ``dK_pre``.
+
     Kernel: ``kernels/<arch>/qk_norm_rope_bwd_*.py`` (shared with B5).
     """
 
@@ -474,8 +485,8 @@ class GatedAttentionBlockBwd(APIBase):
         sample_dy: torch.Tensor,  # [B, S, d_model]
         sample_saved: SavedForBackward,
         sample_w_qkvg: torch.Tensor,  # [N, d_model]
-        sample_w_q_norm: torch.Tensor,  # [D]
-        sample_w_k_norm: torch.Tensor,  # [D]
+        sample_w_q_norm: Optional[torch.Tensor],  # [D]; None (both) iff geometry.qk_norm is False -- same positions
+        sample_w_k_norm: Optional[torch.Tensor],  # [D]
         sample_cos: torch.Tensor,  # [B, S, ROPE_DIM]
         sample_sin: torch.Tensor,  # [B, S, ROPE_DIM]
         sample_w_o: torch.Tensor,  # [d_model, H_q * D]
@@ -489,10 +500,25 @@ class GatedAttentionBlockBwd(APIBase):
         need_dh: bool = True,
         need_dw_qkvg: bool = True,
         need_dw_o: bool = True,
-        need_dw_norms: bool = True,
+        # None -> geometry.qk_norm: the norm-weight gradients exist exactly when
+        # the norm does. An explicit True under qk_norm=False is a typed
+        # decline (there is no dW_*_norm to compute), never a silent False.
+        need_dw_norms: Optional[bool] = None,
     ):
         super().__init__()
         self._warn_experimental_api()
+        # The two declaration-time contracts that exist today (both typed,
+        # both checked BEFORE the stub decline so they are testable):
+        _check_norm_weights_agree(geometry.qk_norm, sample_w_q_norm, sample_w_k_norm, prefix="sample_")
+        if need_dw_norms is None:
+            need_dw_norms = bool(geometry.qk_norm)
+        elif need_dw_norms and not geometry.qk_norm:
+            raise ValueError(
+                "need_dw_norms=True with geometry.qk_norm=False: a RoPE-only block has no norm weights, so there is no dW_q_norm / dW_k_norm to compute"
+            )
+        if not geometry.qk_norm and (sample_saved.rstd_q is not None or sample_saved.rstd_k is not None):
+            raise ValueError("geometry.qk_norm=False: SavedForBackward.rstd_q / rstd_k must be None (the forward wrote none; stage B6 does not exist)")
+        self.need_dw_norms = bool(need_dw_norms)
         raise NotImplementedError("GatedAttentionBlockBwd.__init__")
 
     # -- support ------------------------------------------------------------
@@ -532,15 +558,15 @@ class GatedAttentionBlockBwd(APIBase):
         dy: torch.Tensor,
         saved: SavedForBackward,
         w_qkvg: torch.Tensor,
-        w_q_norm: torch.Tensor,
-        w_k_norm: torch.Tensor,
+        w_q_norm: Optional[torch.Tensor],  # None (both) iff geometry.qk_norm is False
+        w_k_norm: Optional[torch.Tensor],
         cos: torch.Tensor,
         sin: torch.Tensor,
         w_o: torch.Tensor,
         dh: Optional[torch.Tensor] = None,
         dw_qkvg: Optional[torch.Tensor] = None,
         dw_o: Optional[torch.Tensor] = None,
-        dw_q_norm: Optional[torch.Tensor] = None,
+        dw_q_norm: Optional[torch.Tensor] = None,  # must be None under qk_norm=False (need_dw_norms resolves False)
         dw_k_norm: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
@@ -563,12 +589,14 @@ class GatedAttentionBlockBwd(APIBase):
             (B5) rope_bwd          ws.dqkvg[Q,K]             -> in place
             (B6) qk_norm_bwd       ws.dqkvg[Q,K], rstd,
                                    q_pre, k_pre              -> in place, + dw_*_norm
+                                   SKIPPED under geometry.qk_norm=False (B5's output IS dQ_pre/dK_pre)
             (B7) qkv_gate_wgrad    saved.h, ws.dqkvg         -> dw_qkvg
             (B8) qkv_gate_dgrad    ws.dqkvg, w_qkvg          -> dh
 
         A ``need_*`` that was False at build time means the corresponding output
         argument must be ``None`` here — a provided-but-uncompiled tensor raises
-        rather than being silently ignored (Rule 1, both directions).
+        rather than being silently ignored (Rule 1, both directions). The norm
+        weights follow ``geometry.qk_norm`` the same way (both ``None`` iff False).
 
         No allocation, no D2H read, no implicit conversion.
         """
@@ -584,8 +612,8 @@ def gated_attention_block_backward(
     dy: torch.Tensor,
     saved: SavedForBackward,
     w_qkvg: torch.Tensor,
-    w_q_norm: torch.Tensor,
-    w_k_norm: torch.Tensor,
+    w_q_norm: Optional[torch.Tensor],  # None (both) iff geometry.qk_norm is False
+    w_k_norm: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
     w_o: torch.Tensor,
@@ -601,5 +629,6 @@ def gated_attention_block_backward(
     entries are non-``None`` follows ``requires_grad`` on the corresponding
     forward inputs, snapshotted here — the same policy a torch autograd
     ``Function`` would apply, and the natural place to wire one later.
+    ``dw_q_norm`` / ``dw_k_norm`` are ``None`` under ``geometry.qk_norm=False``.
     """
     raise NotImplementedError("gated_attention_block_backward")

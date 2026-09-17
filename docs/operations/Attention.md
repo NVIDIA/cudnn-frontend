@@ -387,6 +387,7 @@ graph.sdpa(
     - Pass `page_table_v` tensor with block offsets into the V container (optional if V is not paged)
     - Pass sequence length tensors (`seq_len_q`, `seq_len_kv`) for padding mask
     - Optionally pass `paged_attention_max_seq_len_kv` for the maximum KV sequence length (recommended)
+  - **FROST engines** (opt-in, SM100 line, f16/bf16): paged decode and MTP graphs (`S_q * pack_g <= 128` on the d128 flavor, `pack_g` = the packed head group for a PackGQA plan — `H_q/H_kv`, or its largest divisor of 128 — and 1 otherwise) run a dedicated decode tile (`TILE_CGA_M=1`); other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
   - **Offset calculation**:
     - $K_{cache}[b,h,s,d] = K_{container}[page\_table\_k[b,1,s / bs_k, 1], h, s \mod bs_k, d]$
     - $V_{cache}[b,h,s,d] = V_{container}[page\_table\_v[b,1,s / bs_v, 1], h, s \mod bs_v, d]$
@@ -409,6 +410,32 @@ graph.sdpa(
 - ALiBi requires causal masking (`diagonal_band_right_bound=0`).
 - Block masking is only supported with the UNIFIED implementation.
 - Ampere/Ada architectures are limited to head dimensions up to 256 for prefill, 128 for decode and backward.
+
+#### Fused epilogue gate (FROST, SM107)
+
+A gated attention tail -- the SDPA output multiplied by the sigmoid of a per-element gate tensor `G` of O's shape,
+`O_gated = O * sigmoid(G)` -- is built as three graph nodes, an `sdpa` (or `sdpa_fp8` / `sdpa_mxfp8`) node followed by
+`sigmoid` and `mul` pointwise nodes on `O`. Under `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` the Rubin d256 FROST
+forward engines (`sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm107_fp8`, `sdpa_fwd_prefill_sm107_mxfp8`) serve the
+whole tail fused: the gate tile is TMA-staged by the kernel's load warp and applied in the epilogue after the
+dead-row select, so the gated `O` (and the quantized `O` on the FP8 / MXFP8 rows) is written once. Served today at
+`d_qk = d_v = 256` with a bf16 `G`, dense / unsplit / non-PackGQA / non-paged layouts; any other combination
+falls back to the unfused three-node execution. Two contracts hold on the fused path: `Stats` (LSE) is
+independent of `G`, and `Amax_O` -- an output of the `sdpa` node, which precedes the gate on the graph -- is the
+amax of the **un-gated** normalised `O` (in `scale_o` units on FP8, unscaled on MXFP8), while the stored `O` is
+the gated value. The per-engine claims are tracked in
+[`python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`](../../python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md).
+
+```python
+o, stats = graph.sdpa(name="sdpa", q=q, k=k, v=v, is_inference=False, attn_scale=scale, use_causal_mask=True)
+o.set_dim(o_dims).set_stride(o_strides)          # the sdpa output stays VIRTUAL but declared; the mul output is the real O
+gate = graph.tensor(name="gate", dim=o_dims, stride=o_strides, data_type=cudnn.data_type.BFLOAT16)
+o_gated = graph.mul(a=o, b=graph.sigmoid(input=gate, name="sig"), name="gated")   # the tail the engine fuses
+o_gated.set_output(True).set_dim(o_dims).set_stride(o_strides).set_data_type(cudnn.data_type.BFLOAT16)
+```
+
+The same fusion is reachable without the graph API through the
+[gated attention block](../fe-oss-apis/gated_attention_block.md) (`fuse_gate=True`).
 
 #### Tensors
 ##### Input Tensors
@@ -726,6 +753,16 @@ normalization factor separately as `scaling_seqlen`. FP16 and BF16 arbitrary-mas
 forward and backward automatically build private block metadata on the active
 CUDA stream without adding public API parameters; D256 backward builds both
 Q-to-K and K-to-Q views from one coarse classification.
+
+### Gated Attention Block FE OSS API (SM107)
+
+The experimental [Gated Attention Block API](../fe-oss-apis/gated_attention_block.md) is a model-level FE OSS
+API for NVIDIA Rubin (SM107): the QKV+gate projection, QK-RMSNorm (optional) with partial RoPE, GQA SDPA,
+sigmoid gate and out projection of a Qwen3.5-style gated attention sub-layer behind one class, one workspace
+and one `execute()`, every stage a FROST kernel. It runs bf16 / fp16, per-tensor FP8 and MXFP8, with two
+fusion knobs (`fuse_norm_rope`, `fuse_gate`) that take the block to three launches, plus a bf16 backward with a
+recompute policy. It is separate from the cuDNN Graph API above; the fused epilogue gate it uses is also
+available as the graph pattern described under "Fused epilogue gate".
 
 ### SDPA PyTorch Custom Ops (`cudnn::sdpa_fwd` / `cudnn::sdpa_bwd`)
 

@@ -119,7 +119,7 @@ standalone.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Callable
+from typing import Callable, Optional
 
 from cutlass._mlir.dialects import arith
 
@@ -237,6 +237,11 @@ _N_Q: int = _H_Q * _D  # e4m3 q8 width (== _N_GATE; kept apart so each descripto
 _N_KV: int = _H_KV * _D  # e4m3 k8 / v8 width
 _EPS: float = PARAMS.eps
 NORM_SOURCE: str = PARAMS.norm_source  # "ldg" | "ldg_early" | "const" | "const_w" | "const_cs"  (no "off" on the FP8 fork)
+# False: the RoPE-ONLY Q/K arm -- no pass A (sum of squares), no rsqrt, no norm-weight loads;
+# the per-row multiplier collapses to alpha * scale_q|k (== the V arm's `_s_v` form) and the
+# Q/K tiles are descaled, rotated on the fp32 accumulator and quantized.  Every norm-only
+# block below sits under const_expr(_QK_NORM); the weights are None at the ABI.
+_QK_NORM: bool = PARAMS.qk_norm
 # The two epilogue load classes are gated SEPARATELY so a diagnostic arm can delete one at a time:
 #   _LDG_W    real per-subtile norm-weight loads  (w[col]: 64 B, same address for all lanes, after the wait)
 #   _LDG_CS   real per-row cos/sin gather          (ld_global_v4 of the bf16 tables, 32 KiB per tile)
@@ -382,8 +387,8 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
     tma_c_desc_1: cutlass.GridConstant[_tma.TensorMap],  # e4m3 k8 [N_KV, M]
     tma_c_desc_2: cutlass.GridConstant[_tma.TensorMap],  # e4m3 v8 [N_KV, M]
     tma_c_desc_3: cutlass.GridConstant[_tma.TensorMap],  # bf16 gate16 [N_GATE, M] (the rendering's own C descriptor form)
-    w_q_norm: cute.Tensor,  # [D]      bf16
-    w_k_norm: cute.Tensor,  # [D]      bf16
+    w_q_norm: Optional[cute.Tensor],  # [D]      bf16, or None (qk_norm=False: folds out)
+    w_k_norm: Optional[cute.Tensor],  # [D]      bf16, or None
     cos_tab: cute.Tensor,  # [T, ROPE_DIM] bf16, per-token, halves duplicated
     sin_tab: cute.Tensor,  # [T, ROPE_DIM]
     qscal: cute.Tensor,  # [4] fp32: alpha (= descale_h * descale_w), scale_q, scale_k, scale_v
@@ -1322,7 +1327,8 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
             _is_k = (_n0 >= cutlass.Int32(_OFF_K)) & (_n0 < cutlass.Int32(_OFF_V))
             _is_v = _n0 >= cutlass.Int32(_OFF_V)
             _is_norm = _is_q | _is_k
-            _w_base = cutlass.Int64(arith.select(_is_q.ir_value(), w_q_norm.iterator.toint().ir_value(), w_k_norm.iterator.toint().ir_value()))
+            if cutlass.const_expr(_QK_NORM):
+                _w_base = cutlass.Int64(arith.select(_is_q.ir_value(), w_q_norm.iterator.toint().ir_value(), w_k_norm.iterator.toint().ir_value()))
             # The [4] scales, read HERE -- before the wait, ahead of the cos/sin loads -- as
             # exactly TWO per-tile registers (a tile is one class), so nothing below the
             # wait waits on global memory:
@@ -1421,30 +1427,36 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
                     # .maxnreg, so ptxas drops every setmaxnreg (no SETMAXREG in SASS, the epilogue
                     # uses R252).  Verified on the sm_107a cubin (nvdisasm), not assumed.  Same
                     # values, same reduction, different chunking.
-                    _sq_parts = []
-                    for _s0 in cutlass.range_constexpr(0, subtile_cnt, 2):
-                        _vs = []
-                        for _s in cutlass.range_constexpr(_s0, min(_s0 + 2, subtile_cnt)):
-                            _soff, _sw = epi_spans[_s]
-                            for _hh in cutlass.range_constexpr(_PASS_A_SPLIT):
-                                _tm = cutlass.inttoptr(tmem_col_addr_gemms[0] + _soff + _hh * (_sw // _PASS_A_SPLIT), 6, mma_c_dtype)
-                                _vs.append(nvvm.tcgen05_ld(shape, _tm, num=_sw // _PASS_A_SPLIT, offset=ld_half_off))
-                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                        for _v in _vs:
-                            _acc = _v[0] * _v[0]
-                            for _i in cutlass.range_constexpr(1, epi_n // _PASS_A_SPLIT):
-                                _acc = _acc + _v[_i] * _v[_i]
-                            _sq_parts.append(_acc)
-                    # No global load here: the scales were read above the wait.
-                    _sq = _sq_parts[0]
-                    for _p in cutlass.range_constexpr(1, len(_sq_parts)):
-                        _sq = _sq + _sq_parts[_p]
-                    # rstd of the DEQUANTIZED row: alpha enters through the eps term,
-                    # rstd(alpha*x) = rsqrt(alpha^2 * mean(x^2) + eps).  alpha^2 / D is recomputed
-                    # from the pre-wait _qs_a here (registers only) rather than held across the wait.
-                    _rstd = cute.math.rsqrt(_sq * ((_qs_a * _qs_a) * cutlass.Float32(1.0 / _D)) + cutlass.Float32(_EPS), fastmath=True)
+                    # (qk_norm=False: no pass A, no rsqrt -- the arm is descale + RoPE + quantize)
+                    if cutlass.const_expr(_QK_NORM):
+                        _sq_parts = []
+                        for _s0 in cutlass.range_constexpr(0, subtile_cnt, 2):
+                            _vs = []
+                            for _s in cutlass.range_constexpr(_s0, min(_s0 + 2, subtile_cnt)):
+                                _soff, _sw = epi_spans[_s]
+                                for _hh in cutlass.range_constexpr(_PASS_A_SPLIT):
+                                    _tm = cutlass.inttoptr(tmem_col_addr_gemms[0] + _soff + _hh * (_sw // _PASS_A_SPLIT), 6, mma_c_dtype)
+                                    _vs.append(nvvm.tcgen05_ld(shape, _tm, num=_sw // _PASS_A_SPLIT, offset=ld_half_off))
+                            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                            for _v in _vs:
+                                _acc = _v[0] * _v[0]
+                                for _i in cutlass.range_constexpr(1, epi_n // _PASS_A_SPLIT):
+                                    _acc = _acc + _v[_i] * _v[_i]
+                                _sq_parts.append(_acc)
+                        # No global load here: the scales were read above the wait.
+                        _sq = _sq_parts[0]
+                        for _p in cutlass.range_constexpr(1, len(_sq_parts)):
+                            _sq = _sq + _sq_parts[_p]
+                        # rstd of the DEQUANTIZED row: alpha enters through the eps term,
+                        # rstd(alpha*x) = rsqrt(alpha^2 * mean(x^2) + eps).  alpha^2 / D is recomputed
+                        # from the pre-wait _qs_a here (registers only) rather than held across the wait.
+                        _rstd = cute.math.rsqrt(_sq * ((_qs_a * _qs_a) * cutlass.Float32(1.0 / _D)) + cutlass.Float32(_EPS), fastmath=True)
                     # ONE per-row multiplier: alpha (descale) * rstd * scale_q|k -- pass B costs what the bf16 fork's acc*rstd*w does.
-                    _srow = (_qs_a * _rstd) * _scale_cls
+                    # RoPE-only: alpha * scale_q|k, the V arm's `_s_v` form (two pre-wait registers, one FMUL).
+                    _srow = (_qs_a * _rstd) * _scale_cls if cutlass.const_expr(_QK_NORM) else _qs_a * _scale_cls
+                    # The `const*` diagnostics substitute a LIVE register for every deleted load: rstd under
+                    # the norm, the per-row multiplier under RoPE-only.
+                    _diag = _rstd if cutlass.const_expr(_QK_NORM) else _srow
                     # Column remap: q8 col = c for a Q tile, k8 col = c - OFF_K for a K tile.
                     _col_shift = cutlass.Int32(arith.select(_is_q.ir_value(), cutlass.Int32(0).ir_value(), cutlass.Int32(_OFF_K).ir_value()))
 
@@ -1460,21 +1472,25 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
                                 _tm = cutlass.inttoptr(tmem_col_addr_gemms[0] + _soff, 6, mma_c_dtype)
                                 _rv.append(nvvm.tcgen05_ld(shape, _tm, num=_sw, offset=ld_half_off))
                             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                            _y = []  # ROPE_DIM normed + scaled fp32, flat
+                            _y = []  # ROPE_DIM normed (or descaled, qk_norm=False) + scaled fp32, flat
                             for _s in cutlass.range_constexpr(_ROPE_SUBTILES):
-                                _we = []
-                                if cutlass.const_expr(_LDG_W):
-                                    _wa = _w_base + cutlass.Int64(epi_spans[_s][0] * _ACT_BPE)
-                                    for _h in cutlass.range_constexpr(epi_n * _ACT_BPE // 16):
-                                        for _w in ld_global_v4(_wa + cutlass.Int64(_h * 16), cutlass.Int32):
-                                            _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
-                                            _we.append(_lo)
-                                            _we.append(_hi)
+                                if cutlass.const_expr(_QK_NORM):
+                                    _we = []
+                                    if cutlass.const_expr(_LDG_W):
+                                        _wa = _w_base + cutlass.Int64(epi_spans[_s][0] * _ACT_BPE)
+                                        for _h in cutlass.range_constexpr(epi_n * _ACT_BPE // 16):
+                                            for _w in ld_global_v4(_wa + cutlass.Int64(_h * 16), cutlass.Int32):
+                                                _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
+                                                _we.append(_lo)
+                                                _we.append(_hi)
+                                    else:
+                                        for _i in cutlass.range_constexpr(epi_n):
+                                            _we.append(_rstd)  # DIAGNOSTIC: same ALU, no load
+                                    for _i in cutlass.range_constexpr(epi_n):
+                                        _y.append((_rv[_s][_i] * _srow) * _we[_i])
                                 else:
                                     for _i in cutlass.range_constexpr(epi_n):
-                                        _we.append(_rstd)  # DIAGNOSTIC: same ALU, no load
-                                for _i in cutlass.range_constexpr(epi_n):
-                                    _y.append((_rv[_s][_i] * _srow) * _we[_i])
+                                        _y.append(_rv[_s][_i] * _srow)
                             _c = []
                             _sn = []
                             if cutlass.const_expr(_LDG_CS):
@@ -1487,8 +1503,8 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
                                     _sn.append(_hi)
                             else:
                                 for _i in cutlass.range_constexpr(_ROPE_DIM):
-                                    _c.append(_rstd + cutlass.Float32(1.0))  # DIAGNOSTIC: no load
-                                    _sn.append(_rstd)
+                                    _c.append(_diag + cutlass.Float32(1.0))  # DIAGNOSTIC: no load
+                                    _sn.append(_diag)
                             _flat = []
                             for _i in cutlass.range_constexpr(_ROPE_HALF):
                                 _flat.append(_y[_i] * _c[_i] - _y[_i + _ROPE_HALF] * _sn[_i])
@@ -1502,20 +1518,24 @@ def frost_sm100_matmul_128x256x128_128x256x32_cluster2x1_2ctamma(
                             _tm = cutlass.inttoptr(tmem_col_addr_gemms[0] + subtile_col_offset, 6, mma_c_dtype)
                             _v = nvvm.tcgen05_ld(shape, _tm, num=subtile_w, offset=ld_half_off)
                             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                            _we = []
-                            if cutlass.const_expr(_LDG_W):
-                                _wa = _w_base + cutlass.Int64(subtile_col_offset * _ACT_BPE)
-                                for _h in cutlass.range_constexpr(epi_n * _ACT_BPE // 16):
-                                    for _w in ld_global_v4(_wa + cutlass.Int64(_h * 16), cutlass.Int32):
-                                        _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
-                                        _we.append(_lo)
-                                        _we.append(_hi)
+                            _elems = []
+                            if cutlass.const_expr(_QK_NORM):
+                                _we = []
+                                if cutlass.const_expr(_LDG_W):
+                                    _wa = _w_base + cutlass.Int64(subtile_col_offset * _ACT_BPE)
+                                    for _h in cutlass.range_constexpr(epi_n * _ACT_BPE // 16):
+                                        for _w in ld_global_v4(_wa + cutlass.Int64(_h * 16), cutlass.Int32):
+                                            _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
+                                            _we.append(_lo)
+                                            _we.append(_hi)
+                                else:
+                                    for _i in cutlass.range_constexpr(epi_n):
+                                        _we.append(_rstd)  # DIAGNOSTIC: same ALU, no load
+                                for _i in cutlass.range_constexpr(epi_n):
+                                    _elems.append((_v[_i] * _srow) * _we[_i])
                             else:
                                 for _i in cutlass.range_constexpr(epi_n):
-                                    _we.append(_rstd)  # DIAGNOSTIC: same ALU, no load
-                            _elems = []
-                            for _i in cutlass.range_constexpr(epi_n):
-                                _elems.append((_v[_i] * _srow) * _we[_i])
+                                    _elems.append(_v[_i] * _srow)  # RoPE-only passthrough dims: alpha * scale * acc
 
                         if mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1:
                             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
@@ -1725,8 +1745,8 @@ def _host(
     c_k8: cute.Tensor,  # e4m3 [M, N_KV]
     c_v8: cute.Tensor,  # e4m3 [M, N_KV]
     c_gate: cute.Tensor,  # bf16 [M, N_GATE]
-    w_q_norm: cute.Tensor,
-    w_k_norm: cute.Tensor,
+    w_q_norm: Optional[cute.Tensor],  # None iff PARAMS.qk_norm is False
+    w_k_norm: Optional[cute.Tensor],
     cos_tab: cute.Tensor,
     sin_tab: cute.Tensor,
     qscal: cute.Tensor,
@@ -1988,8 +2008,9 @@ def compile() -> Callable:
     fake_c_k8 = make_fake_compact_tensor(cutlass.Float8E4M3FN, (sym_m, sym_n_k8, sym_l), stride_order=(1, 0, 2), assumed_align=16)
     fake_c_v8 = make_fake_compact_tensor(cutlass.Float8E4M3FN, (sym_m, sym_n_v8, sym_l), stride_order=(1, 0, 2), assumed_align=16)
     fake_c_gate = make_fake_compact_tensor(cutlass.BFloat16, (sym_m, sym_n_gate, sym_l), stride_order=(1, 0, 2), assumed_align=16)
-    fake_w_q = make_fake_compact_tensor(cutlass.BFloat16, (_D,), stride_order=(0,), assumed_align=16)
-    fake_w_k = make_fake_compact_tensor(cutlass.BFloat16, (_D,), stride_order=(0,), assumed_align=16)
+    # qk_norm=False: the weights are None at the ABI (and the artifact then refuses a tensor there).
+    fake_w_q = make_fake_compact_tensor(cutlass.BFloat16, (_D,), stride_order=(0,), assumed_align=16) if _QK_NORM else None
+    fake_w_k = make_fake_compact_tensor(cutlass.BFloat16, (_D,), stride_order=(0,), assumed_align=16) if _QK_NORM else None
     fake_cos = make_fake_compact_tensor(cutlass.BFloat16, (sym_m, _ROPE_DIM), stride_order=(1, 0), assumed_align=16)
     fake_sin = make_fake_compact_tensor(cutlass.BFloat16, (sym_m, _ROPE_DIM), stride_order=(1, 0), assumed_align=16)
     fake_qscal = make_fake_compact_tensor(cutlass.Float32, (4,), stride_order=(0,), assumed_align=16)

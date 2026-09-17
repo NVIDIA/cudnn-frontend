@@ -1,14 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-JAX coverage for the SM100 grouped GEMM dSwiGLU backward wrapper.
-
-JAX contract: this backward API only supports dense weight mode, whose
-expert-outermost strided B layout (n, k, l) has no row-major JAX equivalent,
-so JAX inputs are rejected with a clear error (and unknown frameworks with
-an "Unsupported tensor framework" error).
-"""
+"""Legacy JAX layouts and direct API-class samples remain unsupported; canonical MXFP8 wrapper coverage lives in test_grouped_gemm_canonical_jax.py."""
 
 import numpy as np
 import pytest
@@ -37,12 +30,17 @@ def _make_jax_inputs(m=256, n=128, k=128, l=2):
 
 @pytest.mark.L0
 def test_grouped_gemm_dswiglu_jax_rejected():
-    """JAX inputs are rejected: the dense-only B layout is not expressible as JAX arrays."""
+    """Legacy rank-3 A inputs are rejected by the canonical JAX path."""
     skip_unless_sm100()
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    requirement = cutedsl_requirement_error("JAX grouped GEMM tests")
+    if requirement:
+        pytest.skip(requirement)
     from cudnn import grouped_gemm_dswiglu_wrapper_sm100
 
     a_j, b_j, c_j, sfa_j, sfb_j, offsets_j, alpha_j, beta_j, prob_j = _make_jax_inputs()
-    with pytest.raises(ValueError, match="not expressible as JAX arrays"):
+    with pytest.raises(ValueError, match="JAX requires canonical A"):
         grouped_gemm_dswiglu_wrapper_sm100(
             a_tensor=a_j,
             b_tensor=b_j,
@@ -51,6 +49,8 @@ def test_grouped_gemm_dswiglu_jax_rejected():
             sfb_tensor=sfb_j,
             padded_offsets=offsets_j,
             alpha_tensor=alpha_j,
+            norm_const_tensor=jnp.ones((1,), jnp.float32),
+            d_dtype=ml_dtypes.float8_e4m3fn,
             beta_tensor=beta_j,
             prob_tensor=prob_j,
             sf_vec_size=32,

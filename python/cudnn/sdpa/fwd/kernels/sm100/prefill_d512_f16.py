@@ -1163,10 +1163,19 @@ def _compute_warp_group(
             LN2 = cutlass.Float32(0.6931471805599453)
             if cutlass.const_expr(CFG.HAS_SINK):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
-                sink_logit = sinks_arr[row_head_idx]
+                sink_logit = cutlass.Float32(sinks_arr[row_head_idx])
                 final_max_nat = final_max * LN2
-                new_max_nat = cute.math.max(final_max_nat, sink_logit)
-                scale_sink = cute.math.exp(final_max_nat - new_max_nat, fastmath=True)
+                # Keyless row (final_ell == 0; an alive row has final_ell >= 1): the sink is
+                # the row's whole mass, O := 0 / LSE := sink.  Select new_max_nat := sink and
+                # scale_sink := 0 for it instead of computing the fold (exp(sink - max)
+                # underflows to a zero denominator for a very negative sink -> O = NaN,
+                # LSE = -inf; exp(max - sink) can overflow, 0 * inf is NaN) -- the arithmetic
+                # is spelled out at the d128 kernel's sink fold.  Rows with keys are unchanged.
+                kv_empty = final_ell <= cutlass.Float32(0.0)
+                new_max_nat = cutlass.Float32(arith.select(kv_empty.ir_value(), sink_logit.ir_value(), cute.math.max(final_max_nat, sink_logit).ir_value()))
+                scale_sink = cutlass.Float32(
+                    arith.select(kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), cute.math.exp(final_max_nat - new_max_nat, fastmath=True).ir_value())
+                )
                 new_sum = final_ell * scale_sink + cute.math.exp(sink_logit - new_max_nat, fastmath=True)
                 beta = scale_sink / new_sum
                 lse = new_max_nat + cute.math.log(new_sum, fastmath=True)

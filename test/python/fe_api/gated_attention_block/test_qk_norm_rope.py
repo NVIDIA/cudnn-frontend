@@ -7,6 +7,12 @@ The kernel is plain vectorized LDG/STG plus one butterfly shuffle: no tcgen05,
 no TMA, no arch-specific path. So unlike stage (4) it runs anywhere CuTe DSL
 does, and these tests deliberately do NOT gate on Rubin — catching a lane-group
 or tail bug on whatever device is at hand is worth more than arch purity.
+
+Every numerics test runs in two arms, ``norm`` and ``rope_only``
+(``GatedAttentionBlockGeometry.qk_norm`` / ``compile_qk_norm_rope(apply_norm=)``):
+the RoPE-only artifact traces no RMSNorm at all, takes ``None`` for both norm
+weights, emits no rstd, and must copy the passthrough dims ``[rope_dim, D)``
+BIT-EXACTLY (there is no fp32 op between load and store on them).
 """
 
 import os
@@ -15,23 +21,38 @@ import sys
 import pytest
 import torch
 
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("Gated attention block tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
 from cudnn.gated_attention_block.kernels.qk_norm_rope import (
+    QkNormRopeRecipe,
     build_qk_norm_rope,
+    compile_qk_norm_rope,
     lanes_per_row,
     moved_bytes,
+    run_qk_norm_rope,
     validate_shape,
     vec_chunks,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from reference import qk_norm_rope_reference  # noqa: E402
+from gated_block_reference import qk_norm_rope_reference  # noqa: E402
 
 pytestmark = pytest.mark.L0
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
 _EPS = 1e-6
+_QK_NORM = pytest.mark.parametrize("qk_norm", [True, False], ids=["norm", "rope_only"])
+
+
+def _weights(w_q, w_k, qk_norm):
+    """The two norm-weight slots as the kernel takes them: tensors, or ``None`` for RoPE-only."""
+    return (w_q, w_k) if qk_norm else (None, None)
 
 
 def _make(t, h_q, h_kv, d, rope_dim, dtype, seed=0):
@@ -54,10 +75,11 @@ def _make(t, h_q, h_kv, d, rope_dim, dtype, seed=0):
     return q, k, w_q, w_k, cos, sin
 
 
-def _ref(x, w, cos, sin, rope_dim):
-    """The [T, H, D] oracle: the reference takes [B, S, H, D], so borrow B=1."""
-    y, rstd = qk_norm_rope_reference(x[None], w, cos[None], sin[None], rope_dim, _EPS)
-    return y[0], rstd[0]
+def _ref(x, w, cos, sin, rope_dim, qk_norm=True):
+    """The [T, H, D] oracle: the reference takes [B, S, H, D], so borrow B=1.
+    ``qk_norm=False`` returns ``(rope_only_y, None)``."""
+    y, rstd = qk_norm_rope_reference(x[None], w, cos[None], sin[None], rope_dim, _EPS, qk_norm=qk_norm)
+    return y[0], (None if rstd is None else rstd[0])
 
 
 def _check(got, want, dtype):
@@ -108,23 +130,32 @@ def test_moved_bytes_counts_a_read_and_a_write_of_q_and_k():
 
 
 @requires_cuda
+@_QK_NORM
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("t, h_q, h_kv, d, rope_dim", [(64, 8, 2, 256, 64), (64, 4, 1, 128, 32), (64, 2, 2, 64, 16)])
-def test_matches_the_fused_oracle(dtype, t, h_q, h_kv, d, rope_dim):
+def test_matches_the_fused_oracle(dtype, t, h_q, h_kv, d, rope_dim, qk_norm):
     q, k, w_q, w_k, cos, sin = _make(t, h_q, h_kv, d, rope_dim, dtype)
     q_out, k_out = torch.empty_like(q), torch.empty_like(k)
-    rstd_q = torch.empty(t, h_q, device="cuda", dtype=torch.float32)
-    rstd_k = torch.empty(t, h_kv, device="cuda", dtype=torch.float32)
+    # rstd exists only where a norm exists: the RoPE-only artifact takes None.
+    rstd_q = torch.empty(t, h_q, device="cuda", dtype=torch.float32) if qk_norm else None
+    rstd_k = torch.empty(t, h_kv, device="cuda", dtype=torch.float32) if qk_norm else None
+    wq, wk = _weights(w_q, w_k, qk_norm)
 
-    build_qk_norm_rope(q, k, q_out, k_out, w_q, w_k, cos, sin, rstd_q, rstd_k, rope_dim=rope_dim, eps=_EPS, stream=torch.cuda.current_stream().cuda_stream)
+    r = build_qk_norm_rope(q, k, q_out, k_out, wq, wk, cos, sin, rstd_q, rstd_k, rope_dim=rope_dim, eps=_EPS, stream=torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
+    assert r.apply_norm is qk_norm and r.want_rstd is qk_norm
 
-    want_q, want_rstd_q = _ref(q, w_q, cos, sin, rope_dim)
-    want_k, want_rstd_k = _ref(k, w_k, cos, sin, rope_dim)
+    want_q, want_rstd_q = _ref(q, wq, cos, sin, rope_dim, qk_norm)
+    want_k, want_rstd_k = _ref(k, wk, cos, sin, rope_dim, qk_norm)
     _check(q_out, want_q, dtype)
     _check(k_out, want_k, dtype)
-    torch.testing.assert_close(rstd_q, want_rstd_q, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(rstd_k, want_rstd_k, rtol=1e-5, atol=1e-6)
+    if qk_norm:
+        torch.testing.assert_close(rstd_q, want_rstd_q, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(rstd_k, want_rstd_k, rtol=1e-5, atol=1e-6)
+    else:
+        assert want_rstd_q is None and want_rstd_k is None
+        # No fp32 op touches the passthrough dims on the RoPE-only path.
+        assert torch.equal(q_out[..., rope_dim:], q[..., rope_dim:]) and torch.equal(k_out[..., rope_dim:], k[..., rope_dim:])
 
 
 @requires_cuda
@@ -146,16 +177,18 @@ def test_rope_actually_rotates():
 
 
 @requires_cuda
-def test_in_place_matches_out_of_place():
+@_QK_NORM
+def test_in_place_matches_out_of_place(qk_norm):
     """``q_out is q`` is the block's default: every lane reads its whole row
     before any lane stores, and the RoPE shuffle stays inside the row."""
     t, h_q, h_kv, d, rope_dim = 96, 8, 2, 256, 64
     dtype = torch.bfloat16
     q, k, w_q, w_k, cos, sin = _make(t, h_q, h_kv, d, rope_dim, dtype, seed=3)
+    wq, wk = _weights(w_q, w_k, qk_norm)
     q_ref, k_ref = torch.empty_like(q), torch.empty_like(k)
-    build_qk_norm_rope(q, k, q_ref, k_ref, w_q, w_k, cos, sin, rope_dim=rope_dim, eps=_EPS, stream=torch.cuda.current_stream().cuda_stream)
+    build_qk_norm_rope(q, k, q_ref, k_ref, wq, wk, cos, sin, rope_dim=rope_dim, eps=_EPS, stream=torch.cuda.current_stream().cuda_stream)
     q_ip, k_ip = q.clone(), k.clone()
-    build_qk_norm_rope(q_ip, k_ip, q_ip, k_ip, w_q, w_k, cos, sin, rope_dim=rope_dim, eps=_EPS, stream=torch.cuda.current_stream().cuda_stream)
+    build_qk_norm_rope(q_ip, k_ip, q_ip, k_ip, wq, wk, cos, sin, rope_dim=rope_dim, eps=_EPS, stream=torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
     torch.testing.assert_close(q_ip, q_ref)
     torch.testing.assert_close(k_ip, k_ref)
@@ -197,6 +230,111 @@ def test_rstd_is_optional():
     _check(q_out, want_q, dtype)
 
 
+# ---------------------------------------------------------------------------
+# RoPE-only (qk_norm=False): the norm folded out at trace time
+# ---------------------------------------------------------------------------
+
+
+@requires_cuda
+@pytest.mark.parametrize("t", [64, 257])  # 257: a ragged last CTA on the RoPE-only path too
+def test_rope_only_passthrough_dims_are_bit_exact(t):
+    """With no RMSNorm there is no fp32 op between the load and the store of the
+    dims ``[rope_dim, D)``: widen, narrow, same value -- so ``torch.equal``, not a
+    tolerance. The rope band must still rotate (differ from the input, match the
+    RoPE-only oracle), and a second launch is bit-identical to the first."""
+    h_q, h_kv, d, rope_dim, dtype = 8, 2, 256, 64, torch.bfloat16
+    q, k, _, _, cos, sin = _make(t, h_q, h_kv, d, rope_dim, dtype, seed=11)
+    q_out, k_out = torch.full_like(q, 1.5e3), torch.full_like(k, 1.5e3)
+    stream = torch.cuda.current_stream().cuda_stream
+    r = build_qk_norm_rope(q, k, q_out, k_out, None, None, cos, sin, rope_dim=rope_dim, eps=_EPS, stream=stream)
+    torch.cuda.synchronize()
+    assert r.apply_norm is False and r.want_rstd is False
+    assert torch.equal(q_out[..., rope_dim:], q[..., rope_dim:]), "RoPE-only Q passthrough dims are not a bit-exact copy"
+    assert torch.equal(k_out[..., rope_dim:], k[..., rope_dim:]), "RoPE-only K passthrough dims are not a bit-exact copy"
+    want_q, none_q = _ref(q, None, cos, sin, rope_dim, qk_norm=False)
+    want_k, _ = _ref(k, None, cos, sin, rope_dim, qk_norm=False)
+    assert none_q is None
+    _check(q_out, want_q, dtype)
+    _check(k_out, want_k, dtype)
+    assert not torch.allclose(q_out[..., :rope_dim].float(), q[..., :rope_dim].float(), atol=1e-2), "the rope band did not rotate"
+    # Two launches, same plan: bit-identical (also a cheap cold-cache race probe).
+    q2, k2 = torch.empty_like(q), torch.empty_like(k)
+    run_qk_norm_rope(r, q, k, q2, k2, None, None, cos, sin, stream=stream)
+    torch.cuda.synchronize()
+    assert torch.equal(q2, q_out) and torch.equal(k2, k_out)
+
+
+@requires_cuda
+def test_rope_only_and_norm_are_distinct_cache_entries():
+    """``apply_norm`` is IN the compile key: a cached norm-on artifact bound to
+    None weights would dereference a null pointer, so the two must never alias."""
+    kw = dict(dtype=torch.bfloat16, h_q=8, h_kv=2, d=256, rope_dim=64, eps=_EPS, want_rstd=False)
+    on, off = compile_qk_norm_rope(**kw), compile_qk_norm_rope(**kw, apply_norm=False)
+    assert on.apply_norm is True and off.apply_norm is False
+    assert on.compiled is not off.compiled
+    assert compile_qk_norm_rope(**kw, apply_norm=False).compiled is off.compiled, "the RoPE-only recipe must itself be a cache hit"
+
+
+def test_rope_only_rejects_weights_and_rstd():
+    """Both directions, typed, and BEFORE any compile (so this runs on every box):
+
+    * a RoPE-only artifact cannot emit rstd (compile-time ``ValueError``);
+    * RoPE-only with ``rope_dim=0`` is an identity copy -- refused, not launched;
+    * at execute the weights must agree with the recipe: None on a norm-on
+      recipe, tensors on a RoPE-only one, or one of the two missing, all raise;
+    * rstd handed to a recipe compiled without it raises (it would be ignored).
+    """
+    base = dict(dtype=torch.bfloat16, h_q=8, h_kv=2, d=256, rope_dim=64, eps=_EPS)
+    with pytest.raises(ValueError, match="emits no rstd"):
+        compile_qk_norm_rope(**base, want_rstd=True, apply_norm=False)
+    with pytest.raises(ValueError, match="identity copy"):
+        compile_qk_norm_rope(**{**base, "rope_dim": 0}, want_rstd=False, apply_norm=False)
+
+    # Hand-built recipes: the checks run before `compiled` is ever touched.
+    rope_only = QkNormRopeRecipe(compiled=None, h_q=8, h_kv=2, d=256, eps=_EPS, rows_per_cta=8, want_rstd=False, apply_norm=False)
+    normed = QkNormRopeRecipe(compiled=None, h_q=8, h_kv=2, d=256, eps=_EPS, rows_per_cta=8, want_rstd=False)  # apply_norm defaults True
+    assert normed.apply_norm is True
+    x = torch.empty(4, 8, 256, dtype=torch.bfloat16)
+    kx = torch.empty(4, 2, 256, dtype=torch.bfloat16)
+    tab = torch.empty(4, 64, dtype=torch.bfloat16)
+    w = torch.ones(256, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="WITHOUT the RMSNorm"):
+        run_qk_norm_rope(rope_only, x, kx, x, kx, w, w, tab, tab, stream=0)
+    with pytest.raises(ValueError, match="WITH the RMSNorm"):
+        run_qk_norm_rope(normed, x, kx, x, kx, None, None, tab, tab, stream=0)
+    with pytest.raises(ValueError, match="together"):
+        run_qk_norm_rope(normed, x, kx, x, kx, w, None, tab, tab, stream=0)
+    with pytest.raises(ValueError, match="together"):
+        run_qk_norm_rope(rope_only, x, kx, x, kx, None, w, tab, tab, stream=0)
+    with pytest.raises(ValueError, match="WITHOUT rstd"):
+        run_qk_norm_rope(rope_only, x, kx, x, kx, None, None, tab, tab, torch.empty(4, 8), torch.empty(4, 2), stream=0)
+    # The convenience builder refuses a half-given pair before compiling anything.
+    with pytest.raises(ValueError, match="together"):
+        build_qk_norm_rope(x, kx, x, kx, w, None, tab, tab, rope_dim=64, eps=_EPS, stream=0)
+
+    # The TMA twin enforces the same contract at compile time.
+    from cudnn.gated_attention_block.kernels.qk_norm_rope_tma import QkNormRopeTmaRecipe, compile_qk_norm_rope_tma, run_qk_norm_rope_tma
+
+    with pytest.raises(ValueError, match="emits no rstd"):
+        compile_qk_norm_rope_tma(**base, want_rstd=True, apply_norm=False, tile_rows=8)  # 8: the fitted tile for h_q=8
+    tma_rope_only = QkNormRopeTmaRecipe(
+        compiled=None, h_q=8, h_kv=2, d=256, eps=_EPS, tile_rows=8, stages=2, stages_o=1, threads=128, want_rstd=False, ctas_per_sm=8, apply_norm=False
+    )
+    with pytest.raises(ValueError, match="WITHOUT the RMSNorm"):
+        run_qk_norm_rope_tma(tma_rope_only, x, kx, x, kx, w, w, tab, tab, stream=0)
+
+    # And the block-level knob: RoPE-only with no RoPE is refused at the geometry.
+    from cudnn.gated_attention_block import GatedAttentionBlockGeometry
+    from cudnn.gated_attention_block.api import _QkNormRope
+
+    with pytest.raises(ValueError, match="identity copy"):
+        GatedAttentionBlockGeometry(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=0, qk_norm=False).validate()
+    g0 = GatedAttentionBlockGeometry(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64, qk_norm=False)
+    with pytest.raises(ValueError, match="emits no rstd"):
+        _QkNormRope(g0, batch=1, seq_len=64, dtype=torch.bfloat16, want_rstd=True, impl="ldg").check_support()
+    _QkNormRope(g0, batch=1, seq_len=64, dtype=torch.bfloat16, want_rstd=False, impl="ldg").check_support()
+
+
 @pytest.mark.L0
 def test_block_default_tracks_the_kernel_default():
     """``api.py`` re-declares the deferred-load default so ``import cudnn`` stays
@@ -223,13 +361,15 @@ def test_block_default_tracks_the_kernel_default():
 # safe is that they compute the SAME function -- so it is asserted, not assumed.
 
 
-def _stage(impl, *, h_q=8, h_kv=2, d=256, rope=64, s=512):
+def _stage(impl, *, h_q=8, h_kv=2, d=256, rope=64, s=512, qk_norm=True, want_rstd=None):
+    """``want_rstd=None`` follows ``qk_norm`` (rstd exists only where a norm exists)."""
     from cudnn.gated_attention_block import GatedAttentionBlockGeometry
     from cudnn.gated_attention_block.api import _QkNormRope
 
-    g = GatedAttentionBlockGeometry(d_model=512, h_q=h_q, h_kv=h_kv, d_head=d, rope_dim=rope)
+    g = GatedAttentionBlockGeometry(d_model=512, h_q=h_q, h_kv=h_kv, d_head=d, rope_dim=rope, qk_norm=qk_norm)
     g.validate()
-    return _QkNormRope(g, batch=1, seq_len=s, dtype=torch.bfloat16, want_rstd=True, impl=impl), g
+    want_rstd = qk_norm if want_rstd is None else want_rstd
+    return _QkNormRope(g, batch=1, seq_len=s, dtype=torch.bfloat16, want_rstd=want_rstd, impl=impl), g
 
 
 @pytest.mark.L0
@@ -264,32 +404,40 @@ def test_tile_rows_is_fitted_when_left_default_and_honored_when_given():
 
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_ldg_and_tma_are_bit_identical():
+@_QK_NORM
+def test_ldg_and_tma_are_bit_identical(qk_norm):
     """The two kernels must agree EXACTLY -- not within a tolerance. They run the
-    same fp32 math and round once, so any difference is a bug in one of them."""
-    tma_stage, g = _stage("auto")
+    same fp32 math and round once, so any difference is a bug in one of them.
+    Under ``rope_only`` both take None weights, emit no rstd, and must ALSO copy
+    the passthrough dims bit-exactly."""
+    tma_stage, g = _stage("auto", qk_norm=qk_norm)
     if tma_stage.resolve_impl() != "tma":
         pytest.skip("this device has no TMA path; nothing to cross-check")
     t = tma_stage.seq_len
     dev = torch.device("cuda")
     q = torch.randn(1, t, g.h_q, g.d_head, dtype=torch.bfloat16, device=dev)
     k = torch.randn(1, t, g.h_kv, g.d_head, dtype=torch.bfloat16, device=dev)
-    wq = torch.randn(g.d_head, dtype=torch.bfloat16, device=dev)
-    wk = torch.randn(g.d_head, dtype=torch.bfloat16, device=dev)
+    wq = torch.randn(g.d_head, dtype=torch.bfloat16, device=dev) if qk_norm else None
+    wk = torch.randn(g.d_head, dtype=torch.bfloat16, device=dev) if qk_norm else None
     cos = torch.randn(1, t, g.rope_dim, dtype=torch.bfloat16, device=dev)
     sin = torch.randn(1, t, g.rope_dim, dtype=torch.bfloat16, device=dev)
     outs = {}
     for impl in ("ldg", "tma"):
-        st, _ = _stage(impl)
+        st, _ = _stage(impl, qk_norm=qk_norm)
         st.check_support()
         st.compile()
+        assert st._recipe.apply_norm is qk_norm
         qo, ko = torch.zeros_like(q), torch.zeros_like(k)
-        rq = torch.zeros(1, t, g.h_q, dtype=torch.float32, device=dev)
-        rk = torch.zeros(1, t, g.h_kv, dtype=torch.float32, device=dev)
+        rq = torch.zeros(1, t, g.h_q, dtype=torch.float32, device=dev) if qk_norm else None
+        rk = torch.zeros(1, t, g.h_kv, dtype=torch.float32, device=dev) if qk_norm else None
         st.execute(q, k, wq, wk, cos, sin, q_out=qo, k_out=ko, rstd_q=rq, rstd_k=rk)
         torch.cuda.synchronize()
-        outs[impl] = (qo, ko, rq, rk)
-    for name, a, b in zip(("q", "k", "rstd_q", "rstd_k"), outs["ldg"], outs["tma"]):
+        outs[impl] = (qo, ko, rq, rk) if qk_norm else (qo, ko)
+        if not qk_norm:
+            assert torch.equal(qo[..., g.rope_dim :], q[..., g.rope_dim :]), f"{impl}: RoPE-only passthrough dims are not bit-exact"
+            assert torch.equal(ko[..., g.rope_dim :], k[..., g.rope_dim :]), f"{impl}: RoPE-only passthrough dims are not bit-exact"
+    names = ("q", "k", "rstd_q", "rstd_k") if qk_norm else ("q", "k")
+    for name, a, b in zip(names, outs["ldg"], outs["tma"]):
         assert torch.equal(a, b), f"{name}: ldg and tma disagree, max|diff| = {(a.float() - b.float()).abs().max().item():g}"
 
 
@@ -474,3 +622,22 @@ def test_tma_compile_cache_keys_on_the_output_ring_depth(monkeypatch):
     assert compiled_stages_o == [1, 2], "the recipe must report the depth that was COMPILED"
     r1_again = kern_tma.compile_qk_norm_rope_tma(stages_o=1, **common)
     assert r1_again.compiled is r1.compiled and len(compiled_stages_o) == 2, "a repeat request is a cache hit, not a recompile"
+
+
+@pytest.mark.L0
+def test_stage_execute_checks_weights_against_the_geometry_both_ways():
+    """``_QkNormRope.execute`` names ``geometry.qk_norm`` in a typed ValueError
+    before it touches the recipe -- on any device, pre-compile."""
+    on, g = _stage("ldg")
+    off, _ = _stage("ldg", qk_norm=False)
+    on._recipe = off._recipe = object()  # never dereferenced: the check comes first
+    t = torch.empty(1, 4, g.h_q, g.d_head, dtype=torch.bfloat16)
+    kv = torch.empty(1, 4, g.h_kv, g.d_head, dtype=torch.bfloat16)
+    tab = torch.empty(1, 4, g.rope_dim, dtype=torch.bfloat16)
+    w = torch.ones(g.d_head, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="qk_norm=True"):
+        on.execute(t, kv, None, None, tab, tab)
+    with pytest.raises(ValueError, match="qk_norm=False"):
+        off.execute(t, kv, w, w, tab, tab)
+    with pytest.raises(ValueError, match="together"):
+        on.execute(t, kv, w, None, tab, tab)

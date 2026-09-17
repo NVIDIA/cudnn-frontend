@@ -543,3 +543,111 @@ def f16x2x2_to_fp8_word(lo_pair: cutlass.Int32, hi_pair: cutlass.Int32, dtype_ta
         write_only_types=[cutlass.Int32],
         read_only_args=[lo_pair, hi_pair],
     )
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 E8M0 block scales (TransformerEngine semantics; the torch oracle is
+# test/python/sdpa/mxfp8_quant.py::quantize_blocks).  Ported from the DSv3
+# projection kernel's hand-rolled copy (gemm/cutedsl/dense/proj_rope_mxfp8/
+# gemm_proj_rope_mxfp8.py:70-107) the moment a second kernel -- the gated
+# attention block's MXFP8 quantizer -- needed the same four lines.
+# ---------------------------------------------------------------------------
+
+# The fp32 rounding of 1/448 (TE ``Quantized_Limits<E4M3>::max_norm_rcp``).  The
+# scale is ``cvt.rp(amax * THIS)`` -- ONE fp32 multiply by exactly these bits, so
+# the kernel and the oracle agree on every rounding corner (448 -> 0x7F, 449 -> 0x80).
+E8M0_RCP_E4M3_MAX_BITS = 0x3B124925
+
+
+@cute.jit
+def opaque_e4m3_max_rcp() -> cutlass.Float32:
+    """``fp32(1/448)`` as a REGISTER operand the optimizer cannot fold.
+
+    It multiplies the block amax right before an ``inline_ptx`` ``cvt``; a folded
+    float immediate reaching an asm operand gets the ``n`` constraint and ICEs
+    libNVVM (:func:`opaque_f32_zero`).  ptxas re-folds the MOV into the FMUL."""
+    return inline_ptx(f"mov.b32 {{$w0}}, 0x{E8M0_RCP_E4M3_MAX_BITS:08X};", write_only_types=[cutlass.Float32])
+
+
+@cute.jit
+def e8m0_rcp(byte: cutlass.Int32) -> cutlass.Float32:
+    """Biased E8M0 byte -> the EXACT fp32 dequant reciprocal ``2^(127 - e)`` = ``bits((254 - e) << 23)``.
+
+    Valid for ``e <= 253`` (TE ``exp2f_rcp`` special-cases ``e == 254`` to the fp32
+    subnormal 2^-127; an inf/NaN amax is out of contract for the callers here)."""
+    return ((cutlass.Int32(254) - byte) << 23).bitcast(cutlass.Float32)
+
+
+@cute.jit
+def e8m0_from_amax(amax: cutlass.Float32):
+    """``(rcp, byte)`` for one 32-element block: ``byte = cvt.rp.satfinite.ue8m0x2.f32(amax * fp32(1/448))``,
+    ``rcp = bits((254 - byte) << 23)`` -- the exact power-of-two the data is multiplied by before the e4m3 cast.
+
+    Bit-exact with ``mxfp8_quant.quantize_blocks`` for FINITE inputs (max bf16 amax * 1/448 -> ``e <= 247``;
+    ``amax == 0 -> 0x00``).  ``e in {254, 255}`` (inf / NaN amax) is OUT OF CONTRACT: the oracle's
+    ``exp2_rcp`` special-cases ``e == 254`` and this does not.  ``byte`` is an ``Int32`` in ``[0, 255]``.
+    """
+    scaled = amax * opaque_e4m3_max_rcp()
+    # ue8m0x2 packs TWO scales (operand a -> upper byte, b -> lower); feeding the
+    # same value twice keeps the asm immediate-free, the mask keeps the low one.
+    packed = inline_ptx("cvt.rp.satfinite.ue8m0x2.f32 {$w0}, {$r0}, {$r0};", write_only_types=[cutlass.Uint16], read_only_args=[scaled])
+    byte = cutlass.Int32(packed) & cutlass.Int32(0xFF)
+    return e8m0_rcp(byte), byte
+
+
+@cute.jit
+def e8m0_pair(amax0: cutlass.Float32, amax1: cutlass.Float32):
+    """``(rcp0, rcp1, packed)`` for two blocks with ONE ``cvt``: ``byte0 = packed & 0xFF`` (amax0),
+    ``byte1 = (packed >> 8) & 0xFF`` (amax1) -- little-endian, so a ``st.b16`` of ``packed`` lays byte0 first.
+    Same contract as :func:`e8m0_from_amax`."""
+    scaled0 = amax0 * opaque_e4m3_max_rcp()
+    scaled1 = amax1 * opaque_e4m3_max_rcp()
+    # operand a lands in the UPPER byte: pass amax1's scale first so amax0's byte is the low one.
+    packed16 = inline_ptx("cvt.rp.satfinite.ue8m0x2.f32 {$w0}, {$r1}, {$r0};", write_only_types=[cutlass.Uint16], read_only_args=[scaled0, scaled1])
+    packed = cutlass.Int32(packed16) & cutlass.Int32(0xFFFF)
+    return e8m0_rcp(packed & cutlass.Int32(0xFF)), e8m0_rcp((packed >> 8) & cutlass.Int32(0xFF)), packed
+
+
+# ---------------------------------------------------------------------------
+# max.f32 that FUSES.  ``row_max_reduction`` above keeps ``cute.math.max`` (the
+# production SDPA softmax; switching it is a measured A/B on those kernels, not a
+# drive-by).  New reductions reach for these two.
+# ---------------------------------------------------------------------------
+
+
+@cutlass.cute.jit
+def fmax_f32(a: cutlass.Float32, b: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``max.f32`` -- the max ptxas fuses into ``FMNMX`` / ``FMNMX3``.
+
+    ``cute.math.max`` lowers to ``arith.maxnumf``, which the CuTe-DSL -> NVVM path
+    emits as compare + select.  Measured on cutlass-dsl 4.8.0.dev0 / sm_107a in the
+    gated attention block's MXFP8 quantizer (two ternary abs-max trees per lane):
+    ``cute.math.max`` -> 256 FSETP + 224 FSEL and ZERO FMNMX in the whole kernel;
+    this ``max.f32`` -> 56 (rowwise) / 60 (columnwise) FMNMX3, and the kernel shrank
+    from 1162 -> 762 and 2778 -> 1163 SASS lines.  NaN semantics are the SAME as
+    ``maxnumf`` (one NaN operand -> the other operand is returned; PTX ``max.f32``
+    without ``.NaN``), so this is purely a lowering choice.  ``|x|`` folds into the
+    operand modifier: ``fmax_f32(abs(a), abs(b))`` is one instruction."""
+    return inline_ptx("max.f32 $0, $1, $2;", write_only_types=[cutlass.Float32], read_only_args=[a, b])
+
+
+def abs_max_tree(vals):
+    """``max |v|`` over a Python list of ``Float32`` as a TERNARY tree on :func:`fmax_f32`.
+
+    The :func:`row_max_reduction` shape -- each node is ``max(max(a, b), c)``, the
+    DEPENDENT pair FMNMX3 fuses, ~log3(N) deep -- with the abs folded into the
+    operands.  Trace-time helper (plain Python over traced values), like
+    :func:`row_max_reduction`.  Finite inputs; ``len(vals) >= 1``."""
+    if len(vals) == 0:
+        raise ValueError("abs_max_tree: need at least one value")
+    elems = [cute.math.abs(v) for v in vals]
+    while len(elems) > 1:
+        nxt = []
+        for i in range(0, len(elems), 3):
+            grp = elems[i : i + 3]
+            acc = grp[0]
+            for g in grp[1:]:
+                acc = fmax_f32(acc, g)
+            nxt.append(acc)
+        elems = nxt
+    return elems[0]
