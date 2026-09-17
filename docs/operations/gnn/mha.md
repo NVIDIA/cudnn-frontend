@@ -40,10 +40,30 @@ mha_gat(
     activation_alpha=0.2,
     return_attention_weights=False,
     deterministic=False,
+    feature_grad_dtype=None,
+    weight_grad_dtype=None,
 )
 ```
 
-`mha_gat_v2` has the same signature.
+`mha_gat_v2` has the same graph-attention options and replaces the two GAT gradient dtype options with one:
+
+```python
+mha_gat_v2(
+    graph,
+    features,
+    attn_weights,
+    *,
+    edge_features=None,
+    dropout_mask=None,
+    num_heads=1,
+    concat_heads=True,
+    activation="leaky_relu",
+    activation_alpha=0.2,
+    return_attention_weights=False,
+    deterministic=False,
+    grad_dtype=None,
+)
+```
 
 Both operations require:
 
@@ -65,6 +85,30 @@ When `concat_heads=True`, the output has shape `(num_dst_nodes, dim_node)`. Othe
 With `return_attention_weights=True`, the result is `(output, attention)`. `attention` has shape `(num_heads, num_edges)`, uses FP32, and contains post-softmax, post-dropout coefficients. If `map_csc_to_coo` is set on the graph, attention and dropout entries use mapped edge-feature order.
 
 Gradients from both `output` and returned `attention` are included in backward. `dropout_mask` is not differentiable.
+
+## Gradient precision
+
+By default, gradient tensors use the input feature dtype. For FP16 or BF16 GAT inputs, `feature_grad_dtype` controls the source, destination, and edge feature gradients, while `weight_grad_dtype` controls the attention-weight gradient. The supported combinations are:
+
+- input dtype for both gradient groups;
+- input dtype for feature gradients and FP32 for the weight gradient;
+- FP32 for both gradient groups.
+
+GAT does not support FP32 feature gradients with a low-precision weight gradient. For GATv2, `grad_dtype` selects one shared dtype for all feature and weight gradients. Each option accepts the input dtype or `torch.float32`; FP32 inputs support only FP32 gradients.
+
+PyTorch separately controls the dtype in which a leaf tensor accumulates its gradient. To retain an FP32 gradient on an FP16 or BF16 leaf, set the leaf's `grad_dtype` to FP32 as well:
+
+```python
+src_features.grad_dtype = torch.float32
+attn_weights.grad_dtype = torch.float32
+output = mha_gat(
+    graph,
+    src_features,
+    attn_weights,
+    feature_grad_dtype=torch.float32,
+    weight_grad_dtype=torch.float32,
+)
+```
 
 ## Support and determinism
 
