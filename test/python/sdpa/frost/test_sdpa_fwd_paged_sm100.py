@@ -1771,3 +1771,65 @@ def test_paged_adapter_fp8_rejects_unequal_table_extents():
     live = seq_lens > 0
     _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
     torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
+
+
+@pytest.mark.L0
+def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
+    """Rule 4 across PLANS: the paged kernel ignores compile-time skv (its KV maximum is
+    the block table's dynamic page axis), so separately constructed paged fp8 plans that
+    differ only in paged_attention_max_seq_len_kv -- 96, then 128, then 96 again (page 32:
+    3 / 4 / 3 pages) -- share ONE compiled artifact: the second and third compile() add no
+    miss to the template's compile cache and return the same callable.  The dense fp8 plan
+    keeps its S_kv specialization (its K/V TMA extents are compiled from skv): 96 then 128
+    compile twice."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, H, KH, P = 3, 8, 2, 32
+    dev, in_key = "cuda", "e4m3"
+    q_gpu = _fp8_quant(torch.randn(B, 1, H, D, device=dev) * 0.5, in_key)[0].transpose(1, 2)
+    o_gpu = torch.empty(B, 1, H, D, device=dev, dtype=torch.float16).transpose(1, 2)
+    lse = torch.empty(B, H, 1, device=dev, dtype=torch.float32)
+    _, _, k_c, v_c, _, _, _ = _pools_fp8(B, KH, D, P, 4, False, in_key, [4 * P] * B, seed=2)
+
+    def paged_plan(max_kv):
+        api = SdpaFwdDslSm100(
+            sample_q=q_gpu,
+            sample_k=k_c,
+            sample_v=v_c,
+            sample_o=o_gpu,
+            sample_lse=lse,
+            seq_kv_lens_present=True,
+            seq_q_lens_present=True,
+            paged_page_size=P,
+            paged_max_seq_len_kv=max_kv,
+            pertensor_fp8=True,
+            dtype_o=torch.float16,
+        )
+        api.check_support()
+        api.compile()
+        return api
+
+    first = paged_plan(96)
+    misses = first._k_mod.compile.cache_info().misses
+    for max_kv in (128, 96):
+        api = paged_plan(max_kv)
+        assert api._k_mod is first._k_mod, "the same template module serves every paged fp8 d128 plan of this shape"
+        assert (
+            api._k_mod.compile.cache_info().misses == misses
+        ), f"paged_attention_max_seq_len_kv={max_kv} minted a new compile: the logical KV maximum leaked into the paged compile key"
+        assert api._compiled_kernel is first._compiled_kernel, max_kv
+
+    def dense_plan(s_kv):
+        kv = torch.zeros(B, s_kv, KH, D, device=dev, dtype=torch.float8_e4m3fn).transpose(1, 2)
+        api = SdpaFwdDslSm100(
+            sample_q=q_gpu, sample_k=kv, sample_v=kv, sample_o=o_gpu, sample_lse=lse, seq_kv_lens_present=True, pertensor_fp8=True, dtype_o=torch.float16
+        )
+        api.check_support()
+        api.compile()
+        return api
+
+    dense_96 = dense_plan(96)
+    misses = dense_96._k_mod.compile.cache_info().misses
+    dense_128 = dense_plan(128)
+    assert dense_128._k_mod.compile.cache_info().misses == misses + 1, "a dense plan's S_kv still specializes the artifact"
+    assert dense_128._compiled_kernel is not dense_96._compiled_kernel
