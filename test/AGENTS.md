@@ -55,6 +55,15 @@ pytest fe_api/gemm/          # OSS kernel tests
 
 ### Confirm you are testing the code you edited
 
+Construct allocation/JIT mock guards **before entering CUDA Graph capture**.
+Creating `MagicMock` objects inside capture can trigger cyclic garbage collection;
+the paired-MoE regression reproduced capture error 901 with GC starting inside
+`unittest.mock.__enter__`. Prefer `patch.object(..., new=raising_callback)` and
+enter that patch context before `torch.cuda.graph`. Keep the synchronization-debug
+guard around the execute call itself: graph entry legitimately synchronizes.
+Use `gc.callbacks` plus `torch.cuda.is_current_stream_capturing()` to diagnose
+this failure, and explicitly reset retained test graphs after their last replay.
+
 `pip install -e .` does **not** put the package on `sys.path`. It installs a
 `sys.meta_path` finder (`__editable___nvidia_cudnn_frontend_*_finder.py`) whose
 `MAPPING` hard-codes an absolute path to the checkout it was installed from.

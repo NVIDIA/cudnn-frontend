@@ -48,16 +48,25 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
     bf16, fp32 = cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT
     knobs = pair_knobs()
 
+    def forbidden_empty(*args, **kwargs):
+        raise AssertionError("execute allocated torch.empty")
+
+    def forbidden_compile(*args, **kwargs):
+        raise AssertionError("execute compiled a kernel")
+
+    @contextmanager
+    def allocation_and_compile_guards():
+        # Build the guards before capture. MagicMock construction inside
+        # capture triggered cyclic GC and invalidated a retained graph test.
+        with patch.object(torch, "empty", new=forbidden_empty), patch.object(cute, "compile", new=forbidden_compile):
+            yield
+
     @contextmanager
     def execute_contract():
         old = torch.cuda.get_sync_debug_mode()
         torch.cuda.set_sync_debug_mode("error")
         try:
-            with (
-                patch.object(torch, "empty", side_effect=AssertionError("execute allocated torch.empty")),
-                patch.object(cute, "compile", side_effect=AssertionError("execute compiled a kernel")),
-            ):
-                yield
+            yield
         finally:
             torch.cuda.set_sync_debug_mode(old)
 
@@ -199,13 +208,13 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
 
     expected_initial = []
     for index in range(2):
-        with torch.cuda.stream(stream):
+        with allocation_and_compile_guards(), torch.cuda.stream(stream):
             outputs[index].fill_(float("nan"))
             workspace.fill_(0xA5)
             launch(index)
         expected_initial.append(observe(index, "eager"))
         captured = torch.cuda.CUDAGraph(keep_graph=True)
-        with torch.cuda.graph(captured, stream=stream):
+        with allocation_and_compile_guards(), torch.cuda.graph(captured, stream=stream):
             launch(index)
         graphs.append(captured)
         case["kernels"].append(kernel_names(captured))
@@ -244,6 +253,8 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
     replay(1, "other_pack_unchanged")
     assert len(case["checks"]) == 10 and len(case["negative_controls"]) == 3
     stream.synchronize()
+    for captured in graphs:
+        captured.reset()
     cudnn.destroy_handle(handle)
 
     assert result["checks"] == 10 and result["negatives"] == 3
