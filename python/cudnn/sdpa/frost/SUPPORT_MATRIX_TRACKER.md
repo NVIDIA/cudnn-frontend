@@ -159,7 +159,7 @@ lengths bound the walk on device and the split composes with them; it pays when
 multiple of the 128-row KV tile (FlashInfer passes its true max verbatim, e.g. 4000)
 does not withhold the split, unlike a mask-free dense `S_kv`, which rides synthesized
 KV-tail padding the split cannot. Decode-shaped d128 units
-(`S_q * G <= 256`, one CTA's Q rows) launch at cga1 — one CTA per `(batch, packed head)`
+(`S_q * PACK_G <= 256`, one CTA's Q rows) launch at cga1 — one CTA per `(batch, packed head)`
 unit on the plain scheduler; the packed head holds `PACK_G` Q heads — the KV head's
 whole group when it divides the tile, its largest divisor that doesᵐ, a single Q head
 when nothing packs — so a serving batch such as `B=32, H_kv=4` fills one wave and runs
