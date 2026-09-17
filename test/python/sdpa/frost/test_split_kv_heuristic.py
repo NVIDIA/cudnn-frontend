@@ -13,7 +13,7 @@ d128 geometry: a cga2 cluster covers TILES_Q * TILE_M * CTA_MMA = 512 Q rows on
 import pytest
 
 from cudnn.sdpa.fwd.engines import Capabilities, SdpaFwdKnobs, mismatch
-from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_MIN_TILES, choose_split_kv, split_kv_candidates
+from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_MIN_TILES, choose_decode_tile_split_kv, choose_split_kv, split_kv_candidates
 
 # Pure arithmetic — no device, no kernel build — so every case is L0.
 pytestmark = pytest.mark.L0
@@ -416,6 +416,94 @@ def test_decode_rows_barely_pay_for_the_combine():
     prefill = choose_split_kv(q_tiles=1, heads_q=8, batch=1, kv_tiles=512, sm_count=B200_SMS, ctas_per_tile=2, combine_rows=8 * 4096)
     assert decode > 1
     assert decode >= prefill
+
+
+# --- the d256 decode tile's own model ----------------------------------------
+#
+# sm100/decode_d256_f16.py runs one cta_group::1 CTA per (KV-head group, batch,
+# split) unit and is HBM-bound, so its split trades the device's idle SMs
+# against the split path's second launch. Pinned at the B200 fit (148 SMs,
+# 128-key tiles); the shapes are Qwen3.5 32/2 (2 KV heads, packed 16:1).
+
+
+def _decode_tile(units, s_kv, sm_count=B200_SMS, **kw):
+    return choose_decode_tile_split_kv(units=units, kv_tiles=-(-s_kv // 128), sm_count=sm_count, **kw)
+
+
+def test_decode_tile_serving_shape_stays_unsplit_for_eager_callers():
+    """b=32 x 2 KV heads (64 units) over 4096 keys: split 2 saves ~6 us of GPU
+    time (56.9 -> 51.0 us CUDA-graph replay) and costs an eager caller ~30 us
+    of host time per execute (62 -> 92 us), so the default does not split. A
+    captured caller's optimum -- the launch term at 0 -- is the split."""
+    assert _decode_tile(64, 4096) == 1
+    assert _decode_tile(64, 4096, launch_cost=0.0) == 2
+
+
+def test_decode_tile_small_batch_splits_to_fill_the_machine():
+    """16 units (b=8) over 4096 keys: unsplit, 16 of 148 SMs stream 32 tiles
+    each; split 8 puts 128 streams on the device and the GPU saving (~56 ->
+    ~20 us) pays for the launch. Fewer units split at least as much."""
+    assert _decode_tile(16, 4096) == 8
+    assert _decode_tile(8, 4096) >= 8
+    assert _decode_tile(2, 4096) == 16  # 32 tiles: the thinnest split keeps two
+
+
+def test_decode_tile_wide_q_tile_splits_the_serving_shape():
+    """The same 64 units on the 32-column tile (S_q=2 x 16:1, the MTP step):
+    a lone CTA there streams a tile 1.6x slower (90.2 vs 57.1 us unsplit), so
+    split 2 saves ~32 us of GPU time -- enough to pay for the launch -- and
+    leads in both regimes; a saturated launch still does not split.  The
+    adapter does not route that tile today (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS
+    keeps (16, 32] rows on the prefill tile: even split, 96-103 us eager against
+    the prefill tile's 66 us); its fit stays pinned for when it is routed."""
+    assert _decode_tile(64, 4096, q_tile=32) == 2
+    assert _decode_tile(64, 4096, q_tile=32, launch_cost=0.0) == 2
+    assert _decode_tile(16, 4096, q_tile=32) == 8
+    assert _decode_tile(256, 4096, q_tile=32) == 1
+
+
+def test_decode_tile_saturated_launch_never_splits():
+    """256 units (b=128) already saturate HBM twice over, 128 once: the bytes
+    do not change with the split, only the fixed costs, so neither regime
+    splits."""
+    for units in (128, 256):
+        assert _decode_tile(units, 4096) == 1
+        assert _decode_tile(units, 4096, launch_cost=0.0) == 1
+
+
+def test_decode_tile_long_kv_pays_for_the_launch():
+    """At 64 units the GPU saving of a split grows with the KV length: 8192
+    keys (~22 us) does not cover the eager launch, 16384 (~45 us) does; past
+    saturation a finer split only adds fixed cost."""
+    assert _decode_tile(64, 8192) == 1
+    assert _decode_tile(64, 8192, launch_cost=0.0) == 2
+    assert _decode_tile(64, 16384) == 2
+    assert _decode_tile(64, 65536) == 2
+
+
+def test_decode_tile_short_kv_does_not_split():
+    """Two or three tiles cannot be cut (the thinnest split keeps two); a
+    handful can be, but saves too little GPU time to pay for a launch."""
+    assert _decode_tile(2, 256) == 1
+    assert _decode_tile(2, 384) == 1
+    assert _decode_tile(2, 1024) == 1
+    assert _decode_tile(2, 1024, launch_cost=0.0) > 1
+
+
+@pytest.mark.parametrize("q_tile", [16, 32])
+@pytest.mark.parametrize("units", [2, 16, 64, 128])
+def test_decode_tile_longer_kv_never_splits_less(units, q_tile):
+    """On tile-aligned KV lengths the choice is monotone in the length and a
+    power of two (split_kv is a kernel-module cache key)."""
+    got = [_decode_tile(units, 128 << i, q_tile=q_tile) for i in range(12)]
+    assert all(a <= b for a, b in zip(got, got[1:])), got
+    assert all(s & (s - 1) == 0 for s in got), got
+
+
+def test_decode_tile_degenerate_inputs_do_not_split():
+    assert choose_decode_tile_split_kv(units=0, kv_tiles=32, sm_count=B200_SMS) == 1
+    assert choose_decode_tile_split_kv(units=64, kv_tiles=0, sm_count=B200_SMS) == 1
+    assert choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=0) == 1
 
 
 # --- a quantized O is a legal split target ---------------------------------

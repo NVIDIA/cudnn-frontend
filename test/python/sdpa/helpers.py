@@ -30,9 +30,23 @@ def note_frost_routing(graph, label="graph"):
         print(f"@@@@ {label} graph: python engine '{engine.name}' serves this graph" + (f" with knobs {knobs}" if knobs is not None else ""))
         frost_routing.note(f"frost:{engine.name}")
         frost_routing.LAST_PLAN = (engine.name, knobs)
+        # One engine row can lower onto several kernel templates (the SM100
+        # d256 flavor: decode_d256_f16 for decode-shaped graphs, the prefill
+        # tile otherwise); the executor names the one that serves this plan.
+        template = _kernel_template_of(graph)
+        if template:
+            frost_routing.note(f"frost:{engine.name}:{template}")
     else:
         frost_routing.note(f"native:{label}")
         frost_routing.LAST_PLAN = (None, None)
+
+
+def _kernel_template_of(graph):
+    """The template file stem serving the selected FROST plan (``kernel_template``
+    on the compiled executor, set by engines.lower_dsl_prefill), or None."""
+    plans = getattr(graph, "_compiled_plans", None) or {}
+    plan = plans.get(getattr(graph, "_plan_index", None))
+    return getattr(getattr(plan, "_compiled", None), "kernel_template", None)
 
 def fill_sparse_small_int(tensor, rng, sparsity=0.8, abs_max=2):
     """

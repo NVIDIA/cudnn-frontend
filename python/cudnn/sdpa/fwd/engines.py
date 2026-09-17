@@ -1695,6 +1695,9 @@ def lower_dsl_prefill(
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
+    # The template file that serves this plan (e.g. "prefill_d256_f16" vs the
+    # decode-shaped "decode_d256_f16"), when the adapter records one.
+    kernel_template = getattr(api, "kernel_template", None)
 
     # Workspace requirement for the compiled geometry: every per-execute scratch
     # buffer is carved from the CALLER's workspace, so its size is fixed here at
@@ -1869,6 +1872,7 @@ def lower_dsl_prefill(
     # variant pack (the pack covers every IO tensor of the graph).
     _execute.workspace_bytes = total_workspace_bytes
     _execute.binding = binding
+    _execute.kernel_template = kernel_template
     return _execute
 
 

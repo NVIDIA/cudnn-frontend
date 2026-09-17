@@ -638,3 +638,84 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph():
     assert all((p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
     # ...and a gated graph on a flavor that does not carry the gate proposes nothing at all.
     assert not recommend("A", _facts(**dict(gated, d_qk=128, d_v=128)), _RUBIN_OFFERED)
+
+
+def _decode_d256_facts(**over):
+    """Qwen3.5 decode as served: 32/2 heads (packed 16:1), d=256, S_q=1, paged
+    (page 16) over a 4096-key table, on a 148-SM SM100 part."""
+    base = dict(
+        b=32,
+        h_q=32,
+        h_kv=2,
+        s_q=1,
+        s_kv=4096,
+        d_qk=256,
+        d_v=256,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=False,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        device_cc=(10, 0),
+        device_sm_count=148,
+    )
+    base.update(over)
+    return SdpaGraphFacts(**base)
+
+
+@pytest.mark.L0
+def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
+    """A d256 graph the decode tile serves gets the decode split model
+    (choose_decode_tile_split_kv), not the prefill fit: the LEADING set is the
+    choice that also pays for the split path's second host launch, the captured
+    caller's optimum follows as a runner-up (select_plan / autotune reach it),
+    and no-split closes the list. The same graph one token wider (S_q=2: 32
+    packed rows, the compiled-but-unrouted 32-column tile) or longer (S_q=3: 48
+    rows) is the prefill tile's launch and keeps the prefill model, which does
+    not split either shape at b=32."""
+
+    def sets(**over):
+        return [p.knobs for p in recommend("A", _decode_d256_facts(**over), _OFFERED) if p.engine_id == 20500]
+
+    serving = sets()
+    assert serving[0].split_kv == 1 and serving[0].pack_gqa is True, serving[0]
+    assert [k.split_kv for k in serving if k.split_kv > 1] == [2], serving
+    small = sets(b=8)
+    assert small[0].split_kv == 8, small[0]
+    assert any(k.split_kv == 1 for k in small[1:]), small
+    saturated = sets(b=128)
+    assert all(k.split_kv == 1 for k in saturated), saturated
+    long_kv = sets(s_kv=16384)
+    assert long_kv[0].split_kv == 2, long_kv[0]
+    # The 16-row MTP step (Qwen3-Next 16/2 at S_q=2 bottom-right: 8:1 packing)
+    # is decode-shaped and follows the serving shape's policy.
+    mtp16 = sets(h_q=16, s_q=2, causal=True, bottom_right=True)
+    assert mtp16[0].split_kv == 1 and mtp16[0].pack_gqa is True, mtp16[0]
+    assert [k.split_kv for k in mtp16 if k.split_kv > 1] == [2], mtp16
+    # The 32-row MTP step (32/2 at S_q=2) is NOT routed onto the decode tile
+    # (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS): the prefill model, unsplit.
+    mtp32 = sets(s_q=2, causal=True, bottom_right=True)
+    assert mtp32[0].split_kv == 1 and mtp32[0].pack_gqa is True and all(k.split_kv == 1 for k in mtp32), mtp32
+    prefill = sets(s_q=3)
+    assert prefill[0].split_kv == 1 and all(k.split_kv == 1 for k in prefill), prefill
+
+
+@pytest.mark.L0
+def test_decode_tile_model_counts_the_whole_packed_group():
+    """96/8 (G = 12) at d256: the prefill tile packs gcd(12, 128) = 4 heads per
+    row-group (partial PackGQA), the decode tile packs all 12 (HEADS_PER_TILE =
+    QH_PER_KH, no partial form), so its routing test and its split model count
+    S_q x 12 like the adapter does: S_q = 1 is a 12-row decode launch of b x 8
+    units, S_q = 2 (24 rows) is the prefill tile's graph.  Fed the partial group
+    the model would call S_q = 2 an 8-row decode launch and cost it with the
+    decode model while the adapter lowers it onto the prefill tile."""
+    from cudnn.sdpa.fwd.heuristics import _d256_decode_tile_selected, _decode_tile_pack_g, _pack_gqa_group
+
+    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
+    one, two = _decode_d256_facts(h_q=96, h_kv=8, s_q=1), _decode_d256_facts(h_q=96, h_kv=8, s_q=2)
+    partial = _pack_gqa_group(row, one, 128, True)
+    assert partial == 4, partial
+    assert _decode_tile_pack_g(one, partial) == 12 and _decode_tile_pack_g(one, 1) == 1
+    assert _d256_decode_tile_selected(row, one, _decode_tile_pack_g(one, partial))
+    assert _d256_decode_tile_selected(row, two, partial), "the control: the partial group would admit the 24-row graph"
+    assert not _d256_decode_tile_selected(row, two, _decode_tile_pack_g(two, partial))

@@ -39,6 +39,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     canonicalize_d192_lowering,
     canonicalize_d256_lowering,
     canonicalize_d512_mxfp8_lowering,
+    decode_d256_q_tile,
     derive_d192_internal_params,
     derive_d256_internal_params,
     pack_gqa_supported,
@@ -104,6 +105,14 @@ _SM100_KERNEL_FILES = {
 # template directly (its cga1 arm is kept for that).
 _SM100_DECODE_KERNEL_FILE = "sm100/decode_d128_f16.py"
 _SM100_DECODE_FLAVOR = (128, 128)
+# Decode-shaped alternates selected by a TemplateParams field instead of a knob
+# (TemplateParams.decode_q_tile != 0, set by SdpaFwdDslSm100._decode_q_tile when
+# S_q * pack_g rows fit the tile's N extent): the d256 flavor's swap-AB tile.
+# The two decode tiles are disjoint by flavor -- (128, 128) rides the cga1 knob
+# above, (256, 256) this record -- so _load_sm100_kernel_module tests both.
+_SM100_DECODE_KERNEL_FILES = {
+    (256, 256): "sm100/decode_d256_f16.py",
+}
 # DTYPE_* codes: E4M3=0, E5M2=1, BF16=2, FP16=3. FP8 inputs (0/1) route to the
 # FP8 kernel families; the output dtype is encoded the same way.
 _SM100_DTYPE_QKV_CODE = {
@@ -447,6 +456,11 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         # upstream (engines.mismatch / check_support), never routed here.
         filename = _SM100_DECODE_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_decode"
+    elif getattr(params, "decode_q_tile", 0):
+        # Decode-shaped d256 f16/bf16 graphs: the swap-AB tile (keys on the MMA M
+        # axis, the packed Q rows on N) instead of the 256-row prefill tile.
+        filename = _SM100_DECODE_KERNEL_FILES[flavor]
+        tag = f"sdpa_fwd_sm100_decode_{tag}"
     else:
         filename = _SM100_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{tag}"
@@ -1900,6 +1914,26 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._logger.debug("check_support completed successfully")
         return True
 
+    def _decode_q_tile(self) -> int:
+        """N extent of the decode tile (config_sm100.decode_d256_q_tile) when this
+        plan lowers onto sm100/decode_d256_f16.py, else 0 (the prefill tile).
+
+        A LOWERING choice, like the flavor pick: the decode tile serves the same
+        graph contract as prefill_d256_f16 (paged / dense, padding, causal
+        bottom-right, SWA, right band, sink, Stats natural or base-2, dense
+        padded-Q trim, split-KV partials) for f16/bf16 d256-flavor graphs whose
+        S_q x packed-heads rows fit the routed 16-wide N tile
+        (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS: the 32-wide tile compiles
+        but is issue-bound per CTA and stays unrouted); everything else (THD,
+        quantized, Rubin, larger S_q) stays on the prefill tile.  The
+        TILE_CGA_M / SCHED_POLICY knobs describe the prefill pipeline and are
+        no-ops here (one cta_group::1 CTA per unit, nothing to schedule).
+        """
+        if self._fp8 or self.thd or self.flavor != (256, 256) or self._device_cc == (10, 7):
+            return 0
+        pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
+        return decode_d256_q_tile(self.s_q_max, pack_g)
+
     def template_params(self) -> Sm100TemplateParams:
         """The compile-time record ``compile()`` loads the kernel module with.
 
@@ -2040,6 +2074,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 h_q=self.h_q,
                 s_q=self.s_q_max,
             )
+            decode_q_tile = self._decode_q_tile()
+            if decode_q_tile:
+                params = replace(params, decode_q_tile=decode_q_tile)
         elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
             from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
 
@@ -2057,6 +2094,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._ensure_support_checked()
         params = self.template_params()
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
+        # Which template serves this plan (its file stem, e.g. "prefill_d256_f16" /
+        # "decode_d256_f16"): a lowering choice the engine's executor exposes so
+        # a test can assert the route without inferring it from the source.
+        self.kernel_template = os.path.splitext(os.path.basename(self._k_mod.__file__))[0]
         # The kernel compile() keyword surface, read ONCE per plan (like
         # _thd_dynamic_bhk): the optional knobs below are passed only to a
         # kernel that carries them, so a kernel without the knob keeps its
