@@ -36,6 +36,7 @@ class GemmFacts:
     chain: Any  # fusion_ir.FusionChain
     dynamic_shapes: bool  # the graph declared dynamic shapes (split-K is skipped)
     pair: Any = None  # explicit common-parent SwiGLU facts, when supported
+    fc2: Any = None  # direct small-row BF16 projection, when supported
 
 
 def analyze_facts(graph) -> Optional[GemmFacts]:
@@ -58,7 +59,13 @@ def analyze_facts(graph) -> Optional[GemmFacts]:
         pair = analyze_pair(graph, dynamic_shapes=dynamic)
     except (NotImplementedError, ValueError, KeyError):
         pair = None
-    return GemmFacts(chain=chain, dynamic_shapes=dynamic, pair=pair)
+    from .moe_fc2_pair import analyze_fc2
+
+    try:
+        fc2 = analyze_fc2(graph, dynamic_shapes=dynamic)
+    except (NotImplementedError, ValueError, KeyError):
+        fc2 = None
+    return GemmFacts(chain=chain, dynamic_shapes=dynamic, pair=pair, fc2=fc2)
 
 
 def recommend(kind: str, facts: GemmFacts, offered: Dict[str, int]) -> List[PlanConfig]:
@@ -89,4 +96,13 @@ def recommend(kind: str, facts: GemmFacts, offered: Dict[str, int]) -> List[Plan
             proposals.append(PlanConfig(paired_id, pair_knobs()))
         except (NotImplementedError, ValueError, KeyError) as exc:
             _LOG.debug("paired MoE proposes nothing (%s): %s", kind, exc)
+    fc2_id = offered.get("frost_moe_fc2_pair")
+    if fc2_id is not None and facts.fc2 is not None:
+        from .moe_pair import device_params, pair_knobs
+
+        try:
+            device_params()
+            proposals.append(PlanConfig(fc2_id, pair_knobs()))
+        except (NotImplementedError, ValueError, KeyError) as exc:
+            _LOG.debug("paired FC2 proposes nothing (%s): %s", kind, exc)
     return proposals

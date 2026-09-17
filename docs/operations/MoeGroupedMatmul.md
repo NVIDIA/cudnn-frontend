@@ -281,6 +281,24 @@ more GEMMs, separate token operands, block scales or cross-row reductions and
 quantization are declined by this fusion path. Supported single-GEMM paths
 retain their existing contracts.
 
+### Small-row BF16 output projection on SM100
+
+The opt-in `frost_moe_fc2_pair` engine (`20402`) serves a single unfused
+`moe_grouped_matmul` with BF16 inputs/output and FP32 accumulation. It accepts
+1–8 routed rows, output widths divisible by 128, and reduction dimensions
+divisible by 64. Expert weights use the ordinary `(E,K,N)` graph declaration,
+with contiguous K and nonoverlapping row/expert strides aligned to 16 bytes;
+no pre-shuffle or weight repacking is required. Tokens/output must be compact,
+and device-resident int32 offsets describe one group per expert. Dynamic graph
+dimensions, operand transforms, and epilogues are declined.
+
+Use the same public M128/N8/K32-byte, single-CTA, swap-AB, static-scheduler knobs
+as engine `20401`. Engine `20402` writes both channel halves directly, without
+SwiGLU; the existing engine `20401` retains its SwiGLU contract. These plans
+are tuning candidates, not a performance ranking. Compilation occurs during
+plan build; execution consumes caller-owned workspace and the supplied stream,
+without allocation, conversion, or synchronization.
+
 ## MoE Grouped Matmul Backward
 
 The backward operation computes the weight gradient $d\text{Weight}$ given the upstream gradient $d\text{Output}$ and the forward token activations:

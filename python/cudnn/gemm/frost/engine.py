@@ -180,6 +180,37 @@ class FrostMoePairEngine(FrostGemmEngine):
             raise NotImplementedError(f"frost_moe_swiglu_pair: {exc}") from exc
 
 
+class FrostMoeFc2PairEngine(FrostGemmEngine):
+    """Direct BF16 grouped projection through one paired MMA on SM100."""
+
+    name = "frost_moe_fc2_pair"
+
+    def check_support(self, graph):
+        from .compiler import _graph_dynamic_shapes
+        from .moe_fc2_pair import analyze_fc2, device_params
+
+        try:
+            analyze_fc2(graph, dynamic_shapes=_graph_dynamic_shapes(graph))
+            device_params()
+        except (NotImplementedError, ValueError) as exc:
+            raise NotImplementedError(f"frost_moe_fc2_pair: {exc}") from exc
+
+    def build_plan(self, graph, plan, ctx=None):
+        from cudnn.frost.device import build_device
+        from .moe_fc2_pair import build_fc2
+
+        knobs = plan.knobs if plan is not None else None
+        handle = ctx.handle if ctx is not None else None
+        device = handle.device.ordinal if hasattr(handle, "device") else None
+        try:
+            if isinstance(knobs, dict):
+                knobs = self.knobs_from_public(knobs)
+            with build_device(device):
+                return _FrostGemmPlan(build_fc2(graph, knobs))
+        except (NotImplementedError, ValueError) as exc:
+            raise NotImplementedError(f"frost_moe_fc2_pair: {exc}") from exc
+
+
 def FrostGemmEngines(ids):
     """The gemm engines the manifest asked for, with the ids it assigned.
 
@@ -187,7 +218,7 @@ def FrostGemmEngines(ids):
     of engine ids -- an engine does not carry one of its own.
     """
     out = []
-    for cls in (FrostGemmEngine, FrostMoePairEngine):
+    for cls in (FrostGemmEngine, FrostMoePairEngine, FrostMoeFc2PairEngine):
         if cls.name in ids:
             engine = cls()
             engine.engine_id = ids[cls.name]
