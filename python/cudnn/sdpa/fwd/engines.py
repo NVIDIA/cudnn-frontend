@@ -693,8 +693,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
-        # Served by the d128 f16/bf16 kernel's PAGED_KV specialization
-        # (config_sm100._validate_params mirrors these as its backstop).
+        # Served by the d128 / d256 f16/bf16 kernels' PAGED_KV specialization
+        # (config_sm100._validate_params mirrors these as its backstop). The
+        # attention sink composes with it: the sink is a per-row epilogue fold
+        # and PAGED_KV only changes the K/V TMA-LDG warp (validated together in
+        # test_sdpa_fwd_paged_sm100, S_q 1..4, PackGQA on/off, HND/NHD, with a
+        # left window). Sink + split-KV stays declined above (the combine is
+        # not sink-aware), so sink decode runs unsplit.
         if facts.is_fp8 or facts.is_mxfp8:
             return "paged KV is served by the f16/bf16 kernel only"
         if not facts.padded:
@@ -703,8 +708,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return f"paged KV is wired on the d128 / d256 flavors only (d_qk, d_v <= 256); got ({facts.d_qk}, {facts.d_v})"
         if (facts.d_qk > 128 or facts.d_v > 128) and not (facts.d_qk > 128 and facts.d_v > 128):
             return f"paged KV with mixed head dims ({facts.d_qk}, {facts.d_v}) would select the d192x128 flavor, which is not wired"
-        if facts.has_sink:
-            return "paged KV with an attention sink is not validated"
         p = facts.page_size
         if p % 8 != 0 or (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
             return f"page_size {p} must be a multiple of 8 that divides the 128-row KV tile or is a multiple of it"

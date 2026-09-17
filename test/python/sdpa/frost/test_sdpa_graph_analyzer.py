@@ -1541,10 +1541,11 @@ def test_bwd_dsink_fact():
 # --- paged KV caches (issue #920) -------------------------------------------
 
 
-def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False):
+def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False, sink=False):
     """cuDNN's paged-cache contract: K/V page pools [num_pages, H_kv, page_size, D]
     (HND compact, or NHD storage declared via strides) + (B, 1, max_pages, 1)
-    int32 block tables + per-batch lengths."""
+    int32 block tables + per-batch lengths. ``sink`` adds the (1, H, 1, 1) fp32
+    sink_token (a decode graph: s_q = 1)."""
     g = _mk_graph()
     b, h, kh = B, H, 2
     q = g.tensor(dim=(b, h, 1, d), stride=(h * d, d, d, 1), data_type=DTYPE, name="q")
@@ -1562,6 +1563,8 @@ def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True,
     kw = dict(paged_attention_k_table=tk, paged_attention_v_table=tv)
     if max_seq_len is not None:
         kw["paged_attention_max_seq_len_kv"] = max_seq_len
+    if sink:
+        kw["sink_token"] = g.tensor(dim=(1, h, 1, 1), stride=(h, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="sink")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_padding_mask=padding, seq_len_q=slq, seq_len_kv=slk, **kw)
     _finish_output(o, (b, h, 1, d), (h * d, d, d, 1))
     return g
@@ -1589,6 +1592,10 @@ def test_paged_probe_declines():
     assert engines.engine_name() in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
     assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d256 flavors only"
     assert not _eligible(_mk_paged_graph(padding=False)), "paged KV needs the padding mask (per-batch KV lengths)"
+    # Lifted decline: the sink is an epilogue fold, orthogonal to the paged loader.
+    facts = _facts(_mk_paged_graph(sink=True))
+    assert facts.has_paged_kv and facts.has_sink and facts.s_q == 1
+    assert engines.engine_name() in _eligible(_mk_paged_graph(sink=True)), "paged KV with an attention sink at decode is served"
     facts = ga.analyze(_mk_paged_graph(max_seq_len=8 * 16 + 1))
     assert facts.invalid is not None, "a declared max S_kv beyond the block table's reach is invalid"
 

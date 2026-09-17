@@ -10,7 +10,10 @@ paged_attention_max_seq_len_kv=)`` — served by ``sdpa_fwd_prefill_sm100``
 through the d128 kernel's ``PAGED_KV`` specialization: block-table indirection on
 the K/V TMA loads, HND and NHD page layouts, per-batch lengths read on device,
 KV split + combine.  The reference gathers each sequence's pages in torch and
-runs fp32 attention over the live tokens.
+runs fp32 attention over the live tokens.  Attention sinks and left sliding
+windows (bottom-right causal, the decode spelling) ride the same graph: the sink
+is an epilogue fold and the window only moves the first KV tile, so neither
+touches the paged loader -- but the pair had never been compiled together.
 
 The second half drives the kernel template directly (like the split-KV suite)
 for the geometry the heuristic would not pick on its own: forced splits with
@@ -30,18 +33,21 @@ pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 D = 128
 
 
-def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, causal_br=False):
-    """q [B, H, S_q, D] (every query row); pools in their storage layout; returns
-    (O [B, H, S_q, D_v], LSE [B, H, S_q]) fp32.  ``causal_br``: bottom-right
-    causal anchored at the per-batch KV length -- row r of a batch with L live
-    keys sees keys <= L - S_q + r.  A row with no visible key (L == 0, or
-    L < S_q - r under the mask) is dead: O := 0, LSE := -inf."""
+def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, *, sink=None, window_left=None, causal_br=False):
+    """q [B, H, S_q, D]; pools in their storage layout; returns (O [B, H, S_q, D_v],
+    LSE [B, H, S_q]) fp32 with the kernel's semantics. ``causal_br``: bottom-right
+    causal -- row r of batch b has its diagonal at key ``seq_lens[b] - S_q + r``.
+    ``window_left``: cuDNN ``diagonal_band_left_bound`` -- visible keys INCLUDING the
+    diagonal (FA-style w maps to w + 1). ``sink`` [H] fp32: one extra softmax column
+    with V = 0, so a keyless row is O = 0 / LSE = sink (O = 0 / LSE = -inf without one)."""
     B, H, S_q, d = q.shape
     KH = k_pool.shape[1] if hnd else k_pool.shape[2]
     P = k_pool.shape[2] if hnd else k_pool.shape[1]
     Dv = v_pool.shape[-1]
     out = torch.zeros(B, H, S_q, Dv, device=q.device, dtype=torch.float32)
     lse = torch.full((B, H, S_q), float("-inf"), device=q.device, dtype=torch.float32)
+    if sink is not None:
+        lse[:] = sink.float().view(1, H, 1)
     for b, L in enumerate(seq_lens.tolist()):
         if L == 0:
             continue
@@ -52,18 +58,28 @@ def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, causal_br=Fa
         k = k.reshape(-1, KH, d)[:L].repeat_interleave(H // KH, dim=1).float()
         v = v.reshape(-1, KH, Dv)[:L].repeat_interleave(H // KH, dim=1).float()
         s = torch.einsum("hrd,lhd->hrl", q[b].float(), k) * scale
-        if causal_br:
-            r = torch.arange(S_q, device=q.device).view(1, S_q, 1)
-            j = torch.arange(L, device=q.device).view(1, 1, L)
-            s = s.masked_fill(j > L - S_q + r, float("-inf"))
-        # A fully-masked row softmaxes to NaN: it is dead, O := 0 (LSE is -inf already).
-        out[b] = torch.einsum("hrl,lhd->hrd", torch.softmax(s, -1).nan_to_num(0.0), v)
+        if causal_br or window_left is not None:
+            r = torch.arange(S_q, device=q.device).view(S_q, 1)
+            c = torch.arange(L, device=q.device).view(1, L)
+            diag = L - S_q + r
+            masked = torch.zeros(S_q, L, dtype=torch.bool, device=q.device)
+            if causal_br:
+                masked |= c > diag
+            if window_left is not None:
+                masked |= c <= diag - window_left
+            s = s.masked_fill(masked.unsqueeze(0), float("-inf"))
+        if sink is not None:
+            s = torch.cat([s, sink.float().view(H, 1, 1).expand(H, S_q, 1)], dim=-1)
+            probs = torch.softmax(s, -1)[..., :L]
+        else:
+            probs = torch.softmax(s, -1).nan_to_num(0.0)
+        out[b] = torch.einsum("hrl,lhd->hrd", probs, v)
         lse[b] = torch.logsumexp(s, -1)
     return out, lse
 
 
 def _ref(q, k_pool, v_pool, block_table, seq_lens, hnd, scale):
-    """q [B, H, D] (one query row); returns (O [B, H, D_v], LSE [B, H]) fp32."""
+    """Decode form of ``_ref_rows``: q [B, H, D] -> (O [B, H, D_v], LSE [B, H]) fp32."""
     out, lse = _ref_rows(q.unsqueeze(2), k_pool, v_pool, block_table, seq_lens, hnd, scale)
     return out[:, :, 0], lse[:, :, 0]
 
@@ -87,10 +103,35 @@ def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0):
     return k_pool, v_pool, k_c, v_c, bt
 
 
-def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, stats=False, s_q=1, max_seq_len=None, want_split=None, causal_br=False):
-    """Build + run the paged graph on the FROST engine's own best plan (or the
-    ``want_split`` leg), check O (+ Stats) against ``_ref_rows`` and return the
-    plan.  ``causal_br`` adds the bottom-right causal mask (MTP at S_q > 1)."""
+def _run_graph(
+    B,
+    H,
+    KH,
+    d,
+    P,
+    max_pages,
+    lens,
+    hnd,
+    *,
+    dtype=torch.float16,
+    stats=False,
+    s_q=1,
+    max_seq_len=None,
+    want_split=None,
+    sink=False,
+    window_left=None,
+    causal_br=False,
+    pack_gqa=None,
+):
+    """Build, pin the FROST engine, execute, compare every Q row against ``_ref_rows``.
+
+    ``sink`` binds a (1, H, 1, 1) fp32 ``sink_token``: ``True`` draws one logit per head
+    from randn, a number pins every head to that logit (the underflow regression needs
+    -120, far below anything randn draws). ``causal_br`` spells the bottom-right causal
+    diagonal (``diagonal_band_right_bound=0``, BOTTOM_RIGHT) and ``window_left`` adds
+    ``diagonal_band_left_bound`` to it -- the decode spelling FlashInfer uses (a left
+    window alone with BOTTOM_RIGHT has no right bound and the row declines it).
+    ``pack_gqa`` pins the packed / unpacked plan."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
@@ -103,6 +144,12 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     slk = seq_lens.view(B, 1, 1, 1)
     slq = torch.full((B, 1, 1, 1), s_q, dtype=torch.int32, device=dev)
+    if sink is True:
+        sink_gpu = torch.randn(1, H, 1, 1, device=dev, dtype=torch.float32)
+    elif sink is False or sink is None:
+        sink_gpu = None
+    else:
+        sink_gpu = torch.full((1, H, 1, 1), float(sink), device=dev, dtype=torch.float32)
 
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -123,8 +170,16 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
         paged_attention_v_table=tv,
         paged_attention_max_seq_len_kv=max_seq_len if max_seq_len is not None else max_pages * P,
     )
+    vp = {q: q_gpu, k: k_c, v: v_c, tk: bt, tv: bt, sq_t: slq, sk_t: slk}
     if causal_br:
-        kw["use_causal_mask_bottom_right"] = True
+        kw.update(diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT, diagonal_band_right_bound=0)
+    if window_left is not None:
+        assert causal_br, "a left window at decode rides the bottom-right causal diagonal (right bound 0)"
+        kw["diagonal_band_left_bound"] = window_left
+    if sink_gpu is not None:
+        snk = g.tensor_like(sink_gpu)
+        kw["sink_token"] = snk
+        vp[snk] = sink_gpu
     o, st = g.sdpa(**kw)
     o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
     stats_gpu = None
@@ -134,7 +189,7 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name())
+    plan = select_engine(g, engine_name(), pack_gqa=pack_gqa)
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
         idx = next((i for i, n in enumerate(names) if n.startswith(engine_name()) and g.plans[i].knobs.split_kv == want_split), None)
@@ -144,7 +199,7 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
-    vp = {q: q_gpu, k: k_c, v: v_c, tk: bt, tv: bt, sq_t: slq, sk_t: slk, o: o_gpu}
+    vp[o] = o_gpu
     if stats:
         vp[st] = stats_gpu
     # Rule 3: the FROST execute path reads the per-batch lengths on device;
@@ -156,20 +211,31 @@ def _run_graph(B, H, KH, d, P, max_pages, lens, hnd, *, dtype=torch.float16, sta
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
 
-    ref_o, ref_lse = _ref_rows(q_gpu, k_pool, v_pool, bt.view(B, max_pages), seq_lens, hnd, scale, causal_br)
+    sink_ref = sink_gpu.flatten() if sink_gpu is not None else None
+    ref_o, ref_lse = _ref_rows(q_gpu, k_pool, v_pool, bt.view(B, max_pages), seq_lens, hnd, scale, sink=sink_ref, window_left=window_left, causal_br=causal_br)
     out = o_gpu.float()
     assert not torch.isnan(out).any(), "NaN in O"
     torch.testing.assert_close(out, ref_o, atol=2e-2 if dtype == torch.float16 else 1e-1, rtol=0)
-    # Dead rows: an empty sequence, or (bottom-right causal) a row that sits
-    # before the batch's first visible key.
-    dead = ~torch.isfinite(ref_lse)
-    if dead.any():
-        assert out[dead].abs().max().item() == 0.0, "a row with no visible key must write O := 0"
+    # A keyless row -- every row of an empty sequence, or a row above the bottom-right
+    # diagonal (its diagonal key ``L - S_q + r`` is negative; a left window never empties
+    # a row whose diagonal key exists) -- has no KV mass: O := 0 exactly, and LSE := -inf
+    # without a sink, := sink with one (the sink is then the row's whole mass, whatever
+    # its magnitude -- exp(sink - max) underflowing in fp32 must not turn the row into
+    # O = NaN / LSE = -inf).
+    rows = torch.arange(s_q, device=dev).view(1, s_q)
+    keyless = (seq_lens.view(B, 1) - s_q + rows < 0) if causal_br else (seq_lens.view(B, 1) == 0).expand(B, s_q)
+    keyless = keyless.view(B, 1, s_q).expand(B, H, s_q)
+    if keyless.any():
+        assert out[keyless].abs().max().item() == 0.0, "a keyless row must write O := 0"
     if stats:
         got_lse = stats_gpu.view(B, H, s_q)
-        torch.testing.assert_close(got_lse[~dead], ref_lse[~dead], atol=5e-3, rtol=0)
-        if dead.any():
-            assert torch.isinf(got_lse[dead]).all() and (got_lse[dead] < 0).all(), "a row with no visible key must write LSE := -inf"
+        torch.testing.assert_close(got_lse[~keyless], ref_lse[~keyless], atol=5e-3, rtol=0)
+        if keyless.any():
+            if sink_gpu is not None:
+                want = sink_gpu.view(1, H, 1).expand(B, H, s_q)
+                torch.testing.assert_close(got_lse[keyless], want[keyless], atol=1e-4, rtol=0)
+            else:
+                assert torch.isneginf(got_lse[keyless]).all(), "a keyless row must write LSE := -inf"
     return plan
 
 
@@ -301,6 +367,118 @@ def test_paged_graph_prefill_shaped_s_q():
         torch.testing.assert_close(o_gpu[:, :, r, :].float(), ref_o, atol=2e-2, rtol=0)
 
 
+# --- attention sink and sliding window at decode ----------------------------
+#
+# The sink is a per-Q-row epilogue fold (max lifted to max(m, sink), exp(sink -
+# max) added to the denominator) and a left window only moves the first KV tile
+# the loop visits; neither touches the block-table loader.  PAGED_KV + HAS_SINK
+# had never been compiled together before these tests, and the python validator
+# used to reject sink_token at s_q == 1 outright (the backend engines' rule).
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("page_size", [16, 128])
+def test_paged_graph_sink(hnd, page_size):
+    """Decode with an attention sink over a paged cache: GQA 8:2 (PackGQA), mixed
+    lengths incl. 0 and 1 -- a keyless row is O = 0 / LSE = sink -- Stats out."""
+    _run_graph(5, 8, 2, D, page_size, -(-1100 // page_size), [300, 77, 0, 1, 1024], hnd, sink=True, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("pack_gqa", [False, True], ids=["unpacked", "packed"])
+def test_paged_graph_sink_pack_gqa(pack_gqa):
+    """Both GQA row mappings read the per-row sink logit (row_head_idx): pinned
+    explicitly rather than left to whichever plan the heuristic ranks first."""
+    _run_graph(3, 8, 2, D, 32, 40, [1000, 1279, 33], hnd=True, dtype=torch.bfloat16, sink=True, stats=True, pack_gqa=pack_gqa)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h,kh", [(96, 8), (48, 8)], ids=["g12_packs4", "g6_packs2"])
+@pytest.mark.parametrize("s_q", [1, 4])
+def test_paged_graph_sink_partial_pack_gqa(h, kh, s_q):
+    """Sink + partial PackGQA (#1104): a GQA group that does not divide the 128-row
+    tile packs its largest divisor that does (96/8: 4 of the 12 heads per token
+    row-group, three packed heads per KV head; 48/8: 2 of 6).  The sink fold reads
+    ``sinks[row_head_idx]`` with ``row_head_idx = packed_head * PACK_G + row % PACK_G``
+    -- the Q head, not the KV head or the packed head -- and every head draws its own
+    logit from randn, so a slip in that mapping moves the live rows' LSE and the
+    keyless rows' LSE (= sink) alike.  bf16, page 16, left window 128 under the
+    bottom-right diagonal at S_q = 4 (the 1-token sequence leaves three keyless
+    rows), the packed plan pinned."""
+    plan = _run_graph(
+        4,
+        h,
+        kh,
+        D,
+        16,
+        -(-1100 // 16),
+        [300, 77, 1, 1100],
+        hnd=True,
+        dtype=torch.bfloat16,
+        s_q=s_q,
+        sink=True,
+        window_left=128 if s_q > 1 else None,
+        causal_br=s_q > 1,
+        stats=True,
+        pack_gqa=True,
+    )
+    assert plan.knobs.pack_gqa is True, plan.knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("s_q", [1, 2])
+def test_paged_graph_d256_sink(hnd, s_q):
+    """The d256 flavor's PAGED_KV specialization with the sink fold, at S_q = 1 and
+    as two-token decode under the bottom-right causal diagonal (a batch with one
+    key leaves its first row keyless: LSE = sink)."""
+    _run_graph(3, 8, 2, 256, 32, 40, [1000, 1, 1279], hnd, s_q=s_q, sink=True, causal_br=s_q > 1, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [2, 4])
+def test_paged_graph_sink_multi_token_causal_br(s_q):
+    """S_q in {2, 4} (speculative / multi-token decode) with the bottom-right causal
+    diagonal and a sink; a batch shorter than S_q leaves keyless rows (LSE = sink)."""
+    _run_graph(4, 8, 2, D, 16, 70, [1000, 1, 129, 0], hnd=False, s_q=s_q, sink=True, causal_br=True, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("window_left", [128, 33], ids=["w128", "w33"])
+def test_paged_graph_sliding_window_causal_br(window_left):
+    """Left window at decode over a paged cache: the window start lands mid-cache on
+    page- and tile-unaligned keys, so the first KV tile the loop visits is read
+    through the block table, not from page 0."""
+    _run_graph(4, 8, 2, D, 16, 70, [1000, 129, 17, 1100], hnd=True, window_left=window_left, causal_br=True, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [1, 4])
+def test_paged_graph_d64_gqa8_sink_sliding_window(s_q):
+    """d=64 on the d128 envelope, 64/8 heads (PackGQA, group 8), bf16, page 16,
+    sink + left window 128 + bottom-right causal: the decode graph FlashInfer
+    builds for a GPT-OSS-class model, at S_q = 1 and as multi-token decode."""
+    _run_graph(4, 64, 8, 64, 16, 128, [2048, 1337, 129, 16], hnd=True, s_q=s_q, dtype=torch.bfloat16, sink=True, window_left=128, causal_br=True, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sink", [-120.0, -5.0, 3.0], ids=["sink_m120", "sink_m5", "sink_p3"])
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+def test_paged_graph_keyless_rows_sink_magnitude(d, sink):
+    """Review regression (PR #1095): bf16, B = 1, 4/1 heads, paged page 16 HND, a
+    128-key cache with ONE live key, S_q = 4 under the bottom-right causal diagonal,
+    Stats on, the sink pinned per head.  Three of the four rows have no key, so the
+    sink is their whole mass: O := 0, LSE := sink.  The softmax publishes a
+    0-substituted row max with total_sum = 0 for such a row; a sink fold that
+    COMPUTES the denominator from it gets exp(-120 - 0) = 0 in fp32, i.e. a zero
+    denominator -> O = 0 * inf = NaN and LSE = 0 + log(0) = -inf.  -5 does not
+    underflow (the fold happens to be right), +3 sits above the substituted max
+    (the sink dominates; also right) -- the three pin the row's contract, not one
+    arithmetic accident."""
+    _run_graph(1, 4, 1, d, 16, 8, [1], hnd=True, dtype=torch.bfloat16, s_q=4, sink=sink, causal_br=True, stats=True)
+
+
 @pytest.mark.L0
 def test_paged_graph_declines_off_contract():
     """Plan-time declines stay plan-time: no engine plan is offered, nothing compiles."""
@@ -309,7 +487,7 @@ def test_paged_graph_declines_off_contract():
     from cudnn.sdpa.fwd.engines import engine_name
     from frost_test_utils import offers_engine
 
-    def _build(P, d=D, H=8, KH=2, hnd=False, padding=True):
+    def _build(P, d=D, H=8, KH=2, hnd=False, padding=True, sink=False):
         B, max_pages = 2, 8
         dev = "cuda"
         _, _, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, torch.float16)
@@ -318,6 +496,9 @@ def test_paged_graph_declines_off_contract():
         q, k, v, tk, tv = g.tensor_like(q_gpu), g.tensor_like(k_c), g.tensor_like(v_c), g.tensor_like(bt), g.tensor_like(bt)
         lens = torch.full((B, 1, 1, 1), 10, dtype=torch.int32, device=dev)
         sq_t, sk_t = g.tensor_like(lens), g.tensor_like(lens)
+        kw = {}
+        if sink:
+            kw["sink_token"] = g.tensor(name="sink", dim=(1, H, 1, 1), stride=(H, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
         o, _ = g.sdpa(
             name="sdpa",
             q=q,
@@ -331,6 +512,7 @@ def test_paged_graph_declines_off_contract():
             paged_attention_k_table=tk,
             paged_attention_v_table=tv,
             paged_attention_max_seq_len_kv=max_pages * P,
+            **kw,
         )
         o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
         try:
@@ -348,6 +530,10 @@ def test_paged_graph_declines_off_contract():
         return g is not None and offers_engine(g, engine_name())
 
     assert _offers(_build(16))
+    # Lifted: paged KV + attention sink at s_q == 1 is offered (the decline
+    # "paged KV with an attention sink is not validated" is gone, and the python
+    # validator no longer rejects sink_token at s_q == 1).
+    assert _offers(_build(16, sink=True)), "paged KV with an attention sink at decode must be offered"
     assert not _offers(_build(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
     assert not _offers(_build(16, d=512)), "paged KV is wired on the d128 / d256 flavors only"
     assert not _offers(_build(16, padding=False)), "paged KV requires the padding mask"
