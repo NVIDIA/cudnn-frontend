@@ -7,6 +7,7 @@ from __future__ import annotations
 
 # Common
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -51,9 +52,12 @@ __all__ = [
     "_stress_backend_reuse",
     "_training_abi_prepared",
     "_training_config",
+    "_training_graph_pattern",
     "_training_prepared_pair",
     "make_distributed_forward_inputs",
     "make_forward_inputs",
+    "make_training_graph_pattern_inputs",
+    "make_training_graph_pattern_weights",
     "quantize_mxfp8",
 ]
 
@@ -175,6 +179,218 @@ def make_distributed_forward_inputs(
         .contiguous()
     )
     return activation, fc1_weight, fc2_weight, topk_idx, topk_weights
+
+
+@dataclass(frozen=True)
+class _TrainingGraphPattern:
+    name: str
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+    top_k: int
+    max_tokens_per_rank: int
+    physical_recv_pool_size: int
+    combine_format: str
+
+
+def _training_graph_pattern(
+    name: str,
+    world_size: int,
+) -> _TrainingGraphPattern:
+    """Resolve one reusable public-MoeEP graph workload pattern."""
+
+    if name == "smoke":
+        return _TrainingGraphPattern(
+            name=name,
+            num_experts=2 * world_size,
+            hidden_size=128,
+            intermediate_size=256,
+            top_k=2,
+            max_tokens_per_rank=8,
+            physical_recv_pool_size=128,
+            combine_format="bf16",
+        )
+    if name == "ds3_ep4_v1":
+        if world_size != 4:
+            raise ValueError(
+                "ds3_ep4_v1 training graph pattern requires world_size=4, "
+                f"got {world_size}"
+            )
+        return _TrainingGraphPattern(
+            name=name,
+            num_experts=32,
+            hidden_size=7168,
+            intermediate_size=2048,
+            top_k=8,
+            max_tokens_per_rank=4096,
+            physical_recv_pool_size=131968,
+            combine_format="mxfp8",
+        )
+    raise ValueError(
+        "training graph pattern must be 'smoke' or 'ds3_ep4_v1', "
+        f"got {name!r}"
+    )
+
+
+def _constant_mxfp8(
+    shape: tuple[int, ...],
+    *,
+    axis: int,
+    value: float,
+    device: torch.device,
+):
+    """Allocate deterministic MXFP8 data without a temporary FP32 tensor."""
+
+    from cudnn import BlockScaledTensor
+
+    canonical_axis = axis % len(shape)
+    scale_shape = list(shape)
+    scale_shape[canonical_axis] = (
+        scale_shape[canonical_axis] + 31
+    ) // 32
+    return BlockScaledTensor(
+        data=torch.full(
+            shape,
+            value,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+        scale=torch.full(
+            tuple(scale_shape),
+            1.0,
+            dtype=torch.float8_e8m0fnu,
+            device=device,
+        ),
+        format="mxfp8",
+        logical_shape=shape,
+        axis=canonical_axis,
+    )
+
+
+def make_training_graph_pattern_inputs(
+    pattern: _TrainingGraphPattern,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+):
+    """Build rank-local inputs for a reusable training Graph pattern."""
+
+    if pattern.name == "smoke":
+        args = make_distributed_forward_inputs(
+            rank,
+            world_size,
+            device,
+        )
+        return (*args[:4], args[4].float().contiguous())
+
+    experts_per_rank = pattern.num_experts // world_size
+    # Keep the optimized preset on its only qualified runtime workload.
+    # max_tokens_per_rank is not merely spare capacity for ds3_ep4_v1:
+    # upstream qualified every rank with exactly T4096 inputs.
+    token_count = pattern.max_tokens_per_rank
+    activation = _constant_mxfp8(
+        (token_count, pattern.hidden_size),
+        axis=1,
+        value=0.125,
+        device=device,
+    )
+    fc1_weight = _constant_mxfp8(
+        (
+            experts_per_rank,
+            pattern.hidden_size,
+            2 * pattern.intermediate_size,
+        ),
+        axis=1,
+        value=0.03125,
+        device=device,
+    )
+    fc2_weight = _constant_mxfp8(
+        (
+            experts_per_rank,
+            pattern.intermediate_size,
+            pattern.hidden_size,
+        ),
+        axis=1,
+        value=0.03125,
+        device=device,
+    )
+    tokens = torch.arange(
+        token_count,
+        dtype=torch.int64,
+        device=device,
+    ).unsqueeze(1)
+    slots = torch.arange(
+        pattern.top_k,
+        dtype=torch.int64,
+        device=device,
+    ).unsqueeze(0)
+    destination_rank = (rank + slots) % world_size
+    local_expert = (
+        tokens + torch.div(slots, world_size, rounding_mode="floor")
+    ) % experts_per_rank
+    topk_idx = (
+        destination_rank * experts_per_rank + local_expert
+    ).to(torch.int32)
+    topk_weights = torch.arange(
+        1,
+        pattern.top_k + 1,
+        dtype=torch.float32,
+        device=device,
+    ).expand(token_count, -1)
+    topk_weights = (
+        topk_weights / topk_weights.sum(dim=1, keepdim=True)
+    ).contiguous()
+    return (
+        activation,
+        fc1_weight,
+        fc2_weight,
+        topk_idx,
+        topk_weights,
+    )
+
+
+def make_training_graph_pattern_weights(
+    pattern: _TrainingGraphPattern,
+    inputs,
+):
+    """Build matching forward/backward source weights for one pattern."""
+
+    if pattern.name == "smoke":
+        return _fixed_training_weights(inputs)
+
+    from cudnn import MoeEpBackwardWeights, MoeEpForwardWeights
+
+    fc1_weight = inputs[1]
+    fc2_weight = inputs[2]
+    device = fc1_weight.device
+    experts_per_rank = int(fc1_weight.logical_shape[0])
+    forward = MoeEpForwardWeights(
+        fc1=fc1_weight,
+        fc2=fc2_weight,
+    )
+    backward = MoeEpBackwardWeights(
+        w2_transpose=_constant_mxfp8(
+            (
+                experts_per_rank,
+                pattern.hidden_size,
+                pattern.intermediate_size,
+            ),
+            axis=1,
+            value=0.03125,
+            device=device,
+        ),
+        w1_transpose=_constant_mxfp8(
+            (
+                experts_per_rank,
+                2 * pattern.intermediate_size,
+                pattern.hidden_size,
+            ),
+            axis=1,
+            value=0.03125,
+            device=device,
+        ),
+    )
+    return forward, backward
 
 
 def quantize_mxfp8(tensor: torch.Tensor, *, axis: int = -1):
@@ -1349,12 +1565,13 @@ def _grad_output(
     token_count: int,
     *,
     seed: int,
+    hidden_size: int = 128,
 ) -> torch.Tensor:
     generator = torch.Generator(device=device).manual_seed(seed)
     return (
         torch.randn(
             token_count,
-            128,
+            hidden_size,
             generator=generator,
             dtype=torch.float32,
             device=device,

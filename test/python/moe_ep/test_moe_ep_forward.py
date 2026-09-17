@@ -139,6 +139,26 @@ def test_upstream_receive_capacity_applies_per_expert_padding():
 
 
 @pytest.mark.L0
+def test_upstream_receive_capacity_preserves_overprovisioned_pool():
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.nvlink_domain.token_comm_deterministic import (
+        _compute_receive_capacity,
+    )
+
+    capacity = _compute_receive_capacity(
+        world_size=1,
+        max_tokens_per_rank=4,
+        topk=2,
+        experts_per_rank=2,
+        max_recv_size_per_rank=257,
+        padding_block=128,
+    )
+
+    assert capacity.raw_route_count == 8
+    assert capacity.logical_route_count == 257
+    assert capacity.padded_route_count == 384
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("validation_mode", ["strict", "trusted"])
 def test_moe_ep_accepts_validation_modes(validation_mode):
     from cudnn import MoeEp
@@ -264,6 +284,67 @@ def test_moe_ep_config_defaults_are_frozen_and_phase_independent():
             "backward_tuning",
         ):
             assert not hasattr(op, legacy_name)
+
+
+@pytest.mark.L0
+def test_dgrad_optimization_public_contract_and_phase_scope():
+    from cudnn import MoeEpTuningConfig
+
+    baseline = MoeEpTuningConfig()
+    assert baseline.dgrad_optimization == "baseline"
+
+    ds3_default = MoeEpTuningConfig(
+        dgrad_optimization="ds3_ep4_v1",
+    )
+    ds3_explicit = MoeEpTuningConfig(
+        epi_flag_batch=(4, 2),
+        dgrad_optimization="ds3_ep4_v1",
+    )
+    assert ds3_default == ds3_explicit
+    assert ds3_default.epi_flag_batch == (4, 2)
+
+    with pytest.raises(ValueError, match="dgrad_optimization must be one of"):
+        MoeEpTuningConfig(dgrad_optimization="unknown")
+
+    invalid_ds3 = (
+        {"token_back_mode": "standalone_warps"},
+        {"epi_flag_batch": (2, 2)},
+        {"token_in_flag_batch": 2},
+        {"group_hint": 64},
+        {"reduce_topk_in_kernel": True},
+    )
+    for overrides in invalid_ds3:
+        with pytest.raises(ValueError, match="ds3_ep4_v1"):
+            MoeEpTuningConfig(
+                dgrad_optimization="ds3_ep4_v1",
+                **overrides,
+            )
+
+    rolling = MoeEpTuningConfig(dgrad_optimization="rolling")
+    with pytest.raises(ValueError, match="supported only by training_backward"):
+        _moe_ep_config(
+            **_forward_config(),
+            inference_tuning=rolling,
+        )
+    with pytest.raises(ValueError, match="supported only by training_backward"):
+        _moe_ep_config(
+            **_forward_config(),
+            training_forward_tuning=rolling,
+        )
+    config = _moe_ep_config(
+        **_forward_config(),
+        training_backward_tuning=rolling,
+    )
+    assert config.training_backward_tuning is rolling
+
+
+@pytest.mark.L0
+def test_dgrad_profile_versions_kernel_fingerprint_metadata():
+    from cudnn.moe_ep._megamoe_backend.mxfp8._fingerprint import (
+        FINGERPRINT_SCHEMA_VERSION,
+    )
+
+    assert FINGERPRINT_SCHEMA_VERSION == 3
 
 
 @pytest.mark.L0

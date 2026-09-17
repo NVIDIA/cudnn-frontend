@@ -73,6 +73,20 @@ def test_autotune_core_contracts(monkeypatch):
         timed_iters=1,
         max_candidates=2,
     ) == (baseline, candidate)
+    ds3_default = MoeEpTuningConfig(
+        dgrad_optimization="ds3_ep4_v1",
+    )
+    ds3_explicit = MoeEpTuningConfig(
+        epi_flag_batch=(4, 2),
+        dgrad_optimization="ds3_ep4_v1",
+    )
+    assert normalize(
+        baseline,
+        [ds3_default, ds3_explicit],
+        warmup_iters=0,
+        timed_iters=1,
+        max_candidates=2,
+    ) == (baseline, ds3_default)
 
     invalid_limits = (
         ({"warmup_iters": -1}, "warmup_iters"),

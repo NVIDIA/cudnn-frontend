@@ -15,23 +15,39 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-from cudnn import BlockScaledTensor, MoeEp, MoeEpFc1WeightLayout
+from cudnn import (
+    BlockScaledTensor,
+    MoeEp,
+    MoeEpFc1WeightLayout,
+    MoeEpTuningConfig,
+)
 from cudnn.moe_ep._megamoe_backend._runtime import _runtime_debug
 from moe_ep.moe_ep_test_support import (
     _allocate_stateless_training_outputs,
     _allocate_training_weight_staging,
-    _fixed_training_weights,
     _grad_output,
     _moe_ep_config,
-    make_distributed_forward_inputs,
+    _training_graph_pattern,
+    make_training_graph_pattern_inputs,
+    make_training_graph_pattern_weights,
 )
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--pattern",
+        choices=("smoke", "ds3_ep4_v1"),
+        default="smoke",
+    )
+    parser.add_argument(
+        "--dgrad-optimization",
+        choices=("baseline", "rolling", "ds3_ep4_v1"),
+        default="baseline",
+    )
     parser.add_argument("--diagnostic-replays", type=int, default=2)
     parser.add_argument("--burst-replays", type=int, default=100)
-    parser.add_argument("--max-recv-size-per-rank", type=int, default=128)
+    parser.add_argument("--max-recv-size-per-rank", type=int)
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--timeout-seconds", type=int, default=600)
     parser.add_argument("--expect-overflow-assert", action="store_true")
@@ -41,6 +57,41 @@ def _parse_args() -> argparse.Namespace:
 def _positive(name: str, value: int) -> None:
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
+
+
+def _resolve_pattern_and_capacity(
+    args: argparse.Namespace,
+    world_size: int,
+):
+    pattern = _training_graph_pattern(args.pattern, world_size)
+    if (
+        args.dgrad_optimization == "ds3_ep4_v1"
+        and pattern.name != "ds3_ep4_v1"
+    ):
+        raise ValueError(
+            "dgrad_optimization='ds3_ep4_v1' requires "
+            "--pattern ds3_ep4_v1"
+        )
+    if pattern.name == "ds3_ep4_v1" and args.expect_overflow_assert:
+        raise ValueError(
+            "ds3_ep4_v1 uses the exact full route capacity and does not "
+            "support the overflow-assert probe"
+        )
+    physical_capacity = (
+        pattern.physical_recv_pool_size
+        if args.max_recv_size_per_rank is None
+        else args.max_recv_size_per_rank
+    )
+    _positive("max_recv_size_per_rank", physical_capacity)
+    if (
+        pattern.name == "ds3_ep4_v1"
+        and physical_capacity != pattern.physical_recv_pool_size
+    ):
+        raise ValueError(
+            "ds3_ep4_v1 requires physical max_recv_size_per_rank="
+            f"{pattern.physical_recv_pool_size}, got {physical_capacity}"
+        )
+    return pattern, physical_capacity
 
 
 def _token_prefix(value, token_count: int):
@@ -118,6 +169,8 @@ def _prepare_case(
     device: torch.device,
     rank: int,
     world_size: int,
+    pattern,
+    dgrad_optimization: str,
     max_recv_size_per_rank: int,
     drop_on_overflow: bool,
 ):
@@ -125,11 +178,22 @@ def _prepare_case(
         "probe.prepare.inputs.begin",
         physical_capacity=max_recv_size_per_rank,
         drop_on_overflow=drop_on_overflow,
+        pattern=pattern.name,
+        dgrad_optimization=dgrad_optimization,
     )
-    args = make_distributed_forward_inputs(rank, world_size, device)
-    args = (*args[:4], args[4].float().contiguous())
-    grad_output = _grad_output(device, args[0].shape[0], seed=7000 + rank)
-    source_weights = _fixed_training_weights(args)
+    args = make_training_graph_pattern_inputs(
+        pattern,
+        rank,
+        world_size,
+        device,
+    )
+    grad_output = _grad_output(
+        device,
+        args[0].shape[0],
+        seed=7000 + rank,
+        hidden_size=pattern.hidden_size,
+    )
+    source_weights = make_training_graph_pattern_weights(pattern, args)
     _runtime_debug(
         "probe.prepare.inputs.end",
         token_count=args[0].shape[0],
@@ -138,25 +202,57 @@ def _prepare_case(
     _runtime_debug("probe.operator.construct.begin")
     op = MoeEp(
         _moe_ep_config(
-            num_experts=2 * world_size,
-            hidden_size=128,
-            intermediate_size=256,
-            top_k=2,
+            num_experts=pattern.num_experts,
+            hidden_size=pattern.hidden_size,
+            intermediate_size=pattern.intermediate_size,
+            top_k=pattern.top_k,
             ep_group=dist.group.WORLD,
             # This is a collective ABI capacity, not the rank-local token count.
-            # make_distributed_forward_inputs intentionally varies local shapes.
-            max_tokens_per_rank=8,
+            # Pattern input factories may intentionally vary local shapes.
+            max_tokens_per_rank=pattern.max_tokens_per_rank,
             max_recv_size_per_rank=max_recv_size_per_rank,
             drop_on_overflow=drop_on_overflow,
-            combine_format="bf16",
+            combine_format=pattern.combine_format,
             fc1_weight_layout=(
                 MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
+            ),
+            training_backward_tuning=MoeEpTuningConfig(
+                dgrad_optimization=dgrad_optimization,
             ),
         )
     )
     _runtime_debug("probe.operator.construct.end")
     _runtime_debug("probe.prepare_training.begin")
     requirements = op.prepare_training(device=device)
+    state = op._training_state
+    if state is None:
+        raise RuntimeError("training graph probe did not prepare training state")
+    backward = state.backward_prepared
+    if backward.config.dgrad_optimization != dgrad_optimization:
+        raise RuntimeError(
+            "training graph probe prepared the wrong dgrad profile: "
+            f"{backward.config.dgrad_optimization!r} != "
+            f"{dgrad_optimization!r}"
+        )
+    if backward.pool_token_capacity != max_recv_size_per_rank:
+        raise RuntimeError(
+            "training graph probe prepared the wrong physical receive pool: "
+            f"{backward.pool_token_capacity} != {max_recv_size_per_rank}"
+        )
+    upstream_profile = backward.kernel.resolved_dgrad_config[
+        "dgrad_optimization_profile"
+    ]
+    expected_upstream_profile = {
+        "baseline": "explicit",
+        "rolling": "optimized",
+        "ds3_ep4_v1": "ds3_ep4_v1",
+    }[dgrad_optimization]
+    if upstream_profile != expected_upstream_profile:
+        raise RuntimeError(
+            "training graph probe did not select the requested upstream "
+            f"profile: {upstream_profile!r} != "
+            f"{expected_upstream_profile!r}"
+        )
     _runtime_debug("probe.prepare_training.end")
     _runtime_debug("probe.pack_weights.begin")
     forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
@@ -223,12 +319,16 @@ def _run_error_mode_assert_probe(
     device: torch.device,
     rank: int,
     world_size: int,
+    pattern,
+    physical_capacity: int,
 ) -> None:
     case = _prepare_case(
         device=device,
         rank=rank,
         world_size=world_size,
-        max_recv_size_per_rank=args.max_recv_size_per_rank,
+        pattern=pattern,
+        dgrad_optimization=args.dgrad_optimization,
+        max_recv_size_per_rank=physical_capacity,
         drop_on_overflow=False,
     )
     op, inputs, _, native_forward, _, output_pair = case
@@ -299,13 +399,24 @@ def _run_error_mode_assert_probe(
     os._exit(1)
 
 
-def _run_cycle(args: argparse.Namespace, *, device: torch.device, rank: int, world_size: int, cycle: int) -> None:
+def _run_cycle(
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    pattern,
+    physical_capacity: int,
+    cycle: int,
+) -> None:
     _runtime_debug("probe.cycle.begin", cycle=cycle)
     case = _prepare_case(
         device=device,
         rank=rank,
         world_size=world_size,
-        max_recv_size_per_rank=args.max_recv_size_per_rank,
+        pattern=pattern,
+        dgrad_optimization=args.dgrad_optimization,
+        max_recv_size_per_rank=physical_capacity,
         drop_on_overflow=True,
     )
     op, inputs, grad_output, native_forward, native_backward, output_pair = case
@@ -391,7 +502,6 @@ def main() -> None:
     for name in (
         "diagnostic_replays",
         "burst_replays",
-        "max_recv_size_per_rank",
         "cycles",
         "timeout_seconds",
     ):
@@ -400,6 +510,10 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
+    pattern, physical_capacity = _resolve_pattern_and_capacity(
+        args,
+        world_size,
+    )
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     dist.init_process_group(
@@ -414,7 +528,9 @@ def main() -> None:
         _runtime_debug(
             "probe.main.ready",
             world_size=world_size,
-            physical_capacity=args.max_recv_size_per_rank,
+            pattern=pattern.name,
+            dgrad_optimization=args.dgrad_optimization,
+            physical_capacity=physical_capacity,
             cycles=args.cycles,
         )
         if args.expect_overflow_assert:
@@ -423,6 +539,8 @@ def main() -> None:
                 device=device,
                 rank=rank,
                 world_size=world_size,
+                pattern=pattern,
+                physical_capacity=physical_capacity,
             )
             raise AssertionError("fatal overflow probe returned")
         for cycle in range(args.cycles):
@@ -431,11 +549,16 @@ def main() -> None:
                 device=device,
                 rank=rank,
                 world_size=world_size,
+                pattern=pattern,
+                physical_capacity=physical_capacity,
                 cycle=cycle,
             )
         if rank == 0:
             print(
-                "stateless MoeEP training graph probe passed: " f"world_size={world_size}, cycles={args.cycles}",
+                "stateless MoeEP training graph probe passed: "
+                f"world_size={world_size}, pattern={pattern.name}, "
+                f"dgrad_optimization={args.dgrad_optimization}, "
+                f"cycles={args.cycles}",
                 flush=True,
             )
     finally:

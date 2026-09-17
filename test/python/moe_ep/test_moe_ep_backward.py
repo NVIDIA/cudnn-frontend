@@ -790,6 +790,417 @@ def test_phase_kernel_config_factories_bind_launch_count_and_phase(
 
 
 @pytest.mark.L0
+def test_vendored_dgrad_config_preserves_moe_ep_legacy_defaults():
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.dgrad_config import (
+        resolve_dgrad_config,
+    )
+
+    resolved = resolve_dgrad_config(
+        {},
+        {
+            "load_balance_mode": "static",
+            "force_static_sched": True,
+            "num_sched_stages": None,
+            "token_back_mode": "epi_warps",
+            "epi_flag_batch": (1, 1),
+            "flag_batch": 1,
+            "enable_grad_y2_col_quant": True,
+            "num_ctas_grad_y2_col_quant": 2368,
+        },
+    )
+
+    assert resolved["enable_dgrad_optimizations"] is False
+    assert resolved["dgrad_optimization_profile"] == "explicit"
+    assert resolved["schedule_mode"] == "grouped"
+    assert resolved["input_dedup_mode"] == "off"
+    assert resolved["dfc1_m_group"] == 1
+    assert resolved["use_scaled_cvt"] is False
+
+
+@pytest.mark.L0
+def test_vendored_dgrad_config_preserves_ds3_preset_and_overrides():
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.dgrad_config import (
+        resolve_dgrad_config,
+    )
+
+    problem = {
+        "world_size": 4,
+        "expert_count": 32,
+        "topk": 8,
+        "max_tokens_per_rank": 4096,
+        "max_recv_size_per_rank": 131072,
+        "hidden_size": 7168,
+        "intermediate_gateup_size": 2048,
+        "quant_kind": "mxfp8_e4m3",
+        "combine_format": "32e4m3xe8m0",
+        "gate_up_clamp": None,
+    }
+    implementation = {
+        "mma_tiler_mnk": (256, 256, 128),
+        "cluster_shape_mnk": (2, 1, 1),
+        "use_2cta_instrs": True,
+        "token_padding_block": 128,
+        "sf_padding_block": 128,
+        "sf_vec_size": 32,
+        "launch_cluster_count": 106,
+        "group_hint": None,
+        "drop_on_overflow": True,
+        "act_func": "swiglu",
+        "fc2_in_kernel_topk_reduce": False,
+        "dfc2_recompute": True,
+        "dfc2_col_output": True,
+        "enable_grad_y2_col_quant": True,
+        "weight_storage_mode": "contiguous",
+        "enable_dgrad_optimizations": True,
+    }
+
+    resolved = resolve_dgrad_config(problem, implementation)
+    assert resolved["dgrad_optimization_profile"] == "ds3_ep4_v1"
+    assert resolved["dgrad_optimization_overrides"] == {}
+    assert (
+        resolved["load_balance_mode"],
+        resolved["schedule_mode"],
+        resolved["num_sched_stages"],
+        resolved["epi_flag_batch"],
+        resolved["num_ctas_grad_y2_col_quant"],
+        resolved["input_dedup_mode"],
+    ) == (
+        "atomic_counter",
+        "phase_interleave",
+        2,
+        (4, 2),
+        -1,
+        "rank",
+    )
+
+    custom = resolve_dgrad_config(
+        problem,
+        {**implementation, "use_scaled_cvt": False},
+    )
+    assert custom["dgrad_optimization_profile"] == "ds3_ep4_v1_custom"
+    assert custom["dgrad_optimization_overrides"] == {
+        "use_scaled_cvt": False
+    }
+
+
+def _qualified_ds3_training_config(
+    profile,
+    *,
+    max_recv_size_per_rank=None,
+    training_weight_storage_mode=(
+        MoeEpNativeWeightStorageMode.CONTIGUOUS
+    ),
+):
+    return _training_config(
+        num_experts=32,
+        hidden_size=7168,
+        intermediate_size=2048,
+        top_k=8,
+        max_tokens_per_rank=4096,
+        max_recv_size_per_rank=max_recv_size_per_rank,
+        combine_format="mxfp8",
+        ep_size=4,
+        ep_global_ranks=(0, 1, 2, 3),
+        experts_per_rank=8,
+        training_backward_tuning=profile,
+        training_weight_storage_mode=training_weight_storage_mode,
+    )
+
+
+@pytest.mark.L0
+def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._backward_compile import (
+        _dgrad_selector_kwargs,
+    )
+
+    tunings = {
+        name: MoeEpTuningConfig(dgrad_optimization=name)
+        for name in ("baseline", "rolling", "ds3_ep4_v1")
+    }
+    configs = {
+        name: Mxfp8KernelConfig.for_training_backward(
+            _qualified_ds3_training_config(tuning),
+            launch_cluster_count=106,
+        )
+        for name, tuning in tunings.items()
+    }
+
+    baseline = configs["baseline"]
+    rolling = configs["rolling"]
+    ds3 = configs["ds3_ep4_v1"]
+    assert (
+        baseline.load_balance_mode,
+        baseline.num_sched_stages,
+        baseline.epi_flag_batch,
+        baseline.col_quant_num_ctas,
+    ) == ("static", None, (1, 1), 2368)
+    assert (
+        rolling.load_balance_mode,
+        rolling.num_sched_stages,
+        rolling.epi_flag_batch,
+        rolling.col_quant_num_ctas,
+    ) == ("atomic_counter", None, (1, 1), 2368)
+    assert (
+        ds3.load_balance_mode,
+        ds3.num_sched_stages,
+        ds3.epi_flag_batch,
+        ds3.col_quant_num_ctas,
+        ds3.group_hint,
+    ) == ("atomic_counter", 2, (4, 2), -1, 106)
+
+    assert {
+        name: config.effective_config()["dgrad_optimization"]
+        for name, config in configs.items()
+    } == {
+        "baseline": "baseline",
+        "rolling": "rolling",
+        "ds3_ep4_v1": "ds3_ep4_v1",
+    }
+    assert {
+        name: _dgrad_selector_kwargs(config)
+        for name, config in configs.items()
+    } == {
+        "baseline": {
+            "enable_dgrad_optimizations": False,
+            "dgrad_schedule": None,
+        },
+        "rolling": {
+            "enable_dgrad_optimizations": False,
+            "dgrad_schedule": "optimized",
+        },
+        "ds3_ep4_v1": {
+            "enable_dgrad_optimizations": True,
+            "dgrad_schedule": None,
+        },
+    }
+    compile_keys = {
+        config.compile_key(torch.device("cuda", 0), (10, 7), ())
+        for config in configs.values()
+    }
+    assert len(compile_keys) == 3
+
+    ds3_resolved = _qualified_ds3_training_config(
+        tunings["ds3_ep4_v1"],
+    )
+    forward = Mxfp8KernelConfig.for_training_forward(
+        ds3_resolved,
+        launch_cluster_count=106,
+    )
+    assert forward.dgrad_optimization == "baseline"
+    assert forward.max_recv_size_per_rank == 131079
+    assert ds3.max_recv_size_per_rank == 131072
+    assert (
+        forward.physical_recv_pool_size,
+        ds3.physical_recv_pool_size,
+    ) == (131968, 131968)
+    assert 4 * 4096 * 8 <= min(
+        forward.max_recv_size_per_rank,
+        ds3.max_recv_size_per_rank,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("physical_pool", (131072, 131840, 132096))
+def test_ds3_rejects_inexact_public_physical_pool(physical_pool):
+    from cudnn import MoeEpTuningConfig
+
+    config = _qualified_ds3_training_config(
+        MoeEpTuningConfig(dgrad_optimization="ds3_ep4_v1"),
+        max_recv_size_per_rank=physical_pool,
+    )
+    with pytest.raises(ValueError, match="exact physical padded receive pool"):
+        Mxfp8KernelConfig.for_training_backward(
+            config,
+            launch_cluster_count=106,
+        )
+
+
+@pytest.mark.L0
+def test_automatic_col_quant_grid_is_scoped_to_ds3():
+    from cudnn import MoeEpTuningConfig
+
+    baseline = Mxfp8KernelConfig.for_training_backward(
+        _training_config(),
+        launch_cluster_count=16,
+    )
+    with pytest.raises(ValueError, match="requires ds3_ep4_v1"):
+        replace(baseline, col_quant_num_ctas=-1)
+
+    ds3 = Mxfp8KernelConfig.for_training_backward(
+        _qualified_ds3_training_config(
+            MoeEpTuningConfig(dgrad_optimization="ds3_ep4_v1"),
+        ),
+        launch_cluster_count=106,
+    )
+    with pytest.raises(ValueError, match="requires ds3_ep4_v1"):
+        replace(ds3, dgrad_optimization="rolling")
+
+
+@pytest.mark.L0
+def test_resolved_dgrad_profile_guard_rejects_upstream_drift():
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._backward_compile import (
+        _validate_resolved_dgrad_profile,
+    )
+
+    baseline = Mxfp8KernelConfig.for_training_backward(
+        _training_config(),
+        launch_cluster_count=16,
+    )
+    _validate_resolved_dgrad_profile(
+        baseline,
+        SimpleNamespace(
+            resolved_dgrad_config={
+                "dgrad_optimization_profile": "explicit",
+                "dgrad_optimization_overrides": {},
+            }
+        ),
+    )
+    with pytest.raises(RuntimeError, match="resolution drifted"):
+        _validate_resolved_dgrad_profile(
+            baseline,
+            SimpleNamespace(
+                resolved_dgrad_config={
+                    "dgrad_optimization_profile": "optimized",
+                    "dgrad_optimization_overrides": {},
+                }
+            ),
+        )
+
+    ds3 = Mxfp8KernelConfig.for_training_backward(
+        _qualified_ds3_training_config(
+            MoeEpTuningConfig(dgrad_optimization="ds3_ep4_v1"),
+        ),
+        launch_cluster_count=106,
+    )
+    with pytest.raises(RuntimeError, match="unexpected downstream overrides"):
+        _validate_resolved_dgrad_profile(
+            ds3,
+            SimpleNamespace(
+                resolved_dgrad_config={
+                    "dgrad_optimization_profile": "ds3_ep4_v1",
+                    "dgrad_optimization_overrides": {
+                        "num_sched_stages": None,
+                    },
+                }
+            ),
+        )
+
+
+@pytest.mark.L0
+def test_training_graph_patterns_preserve_smoke_and_qualify_ds3():
+    from argparse import Namespace
+
+    from moe_ep.moe_ep_test_support import (
+        _training_graph_pattern,
+        make_training_graph_pattern_inputs,
+        make_training_graph_pattern_weights,
+    )
+    from moe_ep.probe_moe_ep_training_graph import (
+        _resolve_pattern_and_capacity,
+    )
+
+    smoke = _training_graph_pattern("smoke", 4)
+    assert (
+        smoke.num_experts,
+        smoke.hidden_size,
+        smoke.intermediate_size,
+        smoke.top_k,
+        smoke.max_tokens_per_rank,
+        smoke.physical_recv_pool_size,
+        smoke.combine_format,
+    ) == (8, 128, 256, 2, 8, 128, "bf16")
+
+    ds3 = _training_graph_pattern("ds3_ep4_v1", 4)
+    assert (
+        ds3.num_experts,
+        ds3.hidden_size,
+        ds3.intermediate_size,
+        ds3.top_k,
+        ds3.max_tokens_per_rank,
+        ds3.physical_recv_pool_size,
+        ds3.combine_format,
+    ) == (32, 7168, 2048, 8, 4096, 131968, "mxfp8")
+    ds3_inputs = make_training_graph_pattern_inputs(
+        ds3,
+        rank=3,
+        world_size=4,
+        device=torch.device("meta"),
+    )
+    assert ds3_inputs[0].logical_shape == (4096, 7168)
+    assert ds3_inputs[1].logical_shape == (8, 7168, 4096)
+    assert tuple(ds3_inputs[1].scale.shape) == (8, 224, 4096)
+    assert ds3_inputs[2].logical_shape == (8, 2048, 7168)
+    assert tuple(ds3_inputs[3].shape) == (4096, 8)
+    ds3_weights = make_training_graph_pattern_weights(ds3, ds3_inputs)
+    assert ds3_weights[1].w2_transpose.logical_shape == (
+        8,
+        7168,
+        2048,
+    )
+    assert tuple(ds3_weights[1].w2_transpose.scale.shape) == (
+        8,
+        224,
+        2048,
+    )
+    assert ds3_weights[1].w1_transpose.logical_shape == (
+        8,
+        4096,
+        7168,
+    )
+    assert tuple(ds3_weights[1].w1_transpose.scale.shape) == (
+        8,
+        128,
+        7168,
+    )
+
+    args = Namespace(
+        pattern="ds3_ep4_v1",
+        dgrad_optimization="ds3_ep4_v1",
+        max_recv_size_per_rank=None,
+        expect_overflow_assert=False,
+    )
+    resolved_pattern, physical_capacity = _resolve_pattern_and_capacity(
+        args,
+        4,
+    )
+    assert resolved_pattern == ds3
+    assert physical_capacity == 131968
+
+    def probe_args(**overrides):
+        return Namespace(**{**vars(args), **overrides})
+
+    rolling_pattern, rolling_capacity = _resolve_pattern_and_capacity(
+        probe_args(
+            pattern="smoke",
+            dgrad_optimization="rolling",
+        ),
+        4,
+    )
+    assert rolling_pattern == smoke
+    assert rolling_capacity == 128
+
+    with pytest.raises(ValueError, match="world_size=4"):
+        _training_graph_pattern("ds3_ep4_v1", 2)
+    with pytest.raises(ValueError, match="requires --pattern ds3_ep4_v1"):
+        _resolve_pattern_and_capacity(
+            probe_args(pattern="smoke"),
+            4,
+        )
+    with pytest.raises(ValueError, match="does not support.*overflow"):
+        _resolve_pattern_and_capacity(
+            probe_args(expect_overflow_assert=True),
+            4,
+        )
+    with pytest.raises(ValueError, match="requires physical"):
+        _resolve_pattern_and_capacity(
+            probe_args(max_recv_size_per_rank=131840),
+            4,
+        )
+
+
+@pytest.mark.L0
 def test_standalone_weight_packers_write_only_caller_staging():
     config = _training_config()
     source = _source_weights(config)
@@ -1277,7 +1688,7 @@ def test_training_abi_fingerprint_covers_workspace_and_native_layouts():
         source_tree_digest="source",
     )
 
-    assert first["schema_version"] == 3
+    assert first["schema_version"] == 4
     assert "lane_count" not in first["resources"]
     assert first["native_weight_layouts"] == [layout.value for layout in MoeEpNativeWeightLayout]
     assert canonical_json_sha256(first) == canonical_json_sha256(repeated)
@@ -1370,7 +1781,69 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-def test_discrete_training_forward_backward_and_graph_match_reference():
+@pytest.mark.parametrize(
+    "weight_storage_mode",
+    (
+        MoeEpNativeWeightStorageMode.CONTIGUOUS,
+        MoeEpNativeWeightStorageMode.DISCRETE,
+    ),
+)
+def test_ds3_prepares_qualified_upstream_kernel(weight_storage_mode):
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._backward_compile import (
+        prepare_backward_kernel,
+    )
+    from cudnn.moe_ep._megamoe_backend.mxfp8._compile_common import (
+        _prepare_rubin_environment,
+    )
+
+    device = _sm107_device()
+    architecture, launch_cluster_count = _prepare_rubin_environment(
+        device,
+        cluster_size=2,
+        context="backward test",
+    )
+    resolved = _qualified_ds3_training_config(
+        MoeEpTuningConfig(dgrad_optimization="ds3_ep4_v1"),
+        training_weight_storage_mode=weight_storage_mode,
+    )
+    config = Mxfp8KernelConfig.for_training_backward(
+        resolved,
+        launch_cluster_count=launch_cluster_count,
+    )
+    prepared = prepare_backward_kernel(
+        resolved,
+        config,
+        device,
+        architecture=architecture,
+    )
+
+    assert prepared.pool_token_capacity == 131968
+    assert (
+        prepared.kernel.resolved_dgrad_config[
+            "dgrad_optimization_profile"
+        ]
+        == "ds3_ep4_v1"
+    )
+    assert (
+        prepared.kernel.resolved_dgrad_config[
+            "dgrad_optimization_overrides"
+        ]
+        == {}
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize(
+    "dgrad_optimization",
+    ("baseline", "rolling"),
+)
+def test_discrete_training_forward_backward_and_graph_match_reference(
+    dgrad_optimization,
+):
+    from cudnn import MoeEpTuningConfig
+
     device = _sm107_device()
     args = make_forward_inputs(device)
     args = (*args[:4], args[4].float().contiguous())
@@ -1394,6 +1867,9 @@ def test_discrete_training_forward_backward_and_graph_match_reference():
             combine_format="bf16",
             training_weight_storage_mode=(
                 MoeEpNativeWeightStorageMode.DISCRETE
+            ),
+            training_backward_tuning=MoeEpTuningConfig(
+                dgrad_optimization=dgrad_optimization,
             ),
         )
     ) as op:
