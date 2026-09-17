@@ -21,6 +21,12 @@ import sys
 import pytest
 import torch
 
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("Gated attention block tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
 from cudnn.gated_attention_block.kernels.qk_norm_rope import (
     QkNormRopeRecipe,
     build_qk_norm_rope,
