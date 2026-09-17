@@ -24,12 +24,11 @@ Scale-factor layout: the kernels read scale factors through TMA in a 2-CTA
 slot layout the upstream quantizer emits, not cuDNN's canonical F8_128x4 --
 see ``kernels/bprop_sf_repack_mxfp8_sm100.py`` for the layouts and why a TMA
 descriptor cannot address the shifted copy. The seven graph SF tensors are
-therefore repacked (eight small launches, one per kernel operand form) into
-workspace ahead of the two kernels. This is a documented, deliberate exception
-to Hard Rule 2 (python/cudnn/AGENTS.md) taken to ship the kernels as validated
-upstream; it costs ~1-2% of the backward (SF bytes are 1/32 of the payload)
-and is the first thing to remove once the kernels' SF path reads canonical
-atoms.
+therefore repacked (four launches, each producing the two operand forms needed
+by the kernels) into workspace ahead of the two kernels. This is a documented,
+deliberate exception to Hard Rule 2 (python/cudnn/AGENTS.md) taken to ship the
+kernels as validated upstream and is the first thing to remove once the
+kernels' SF path reads canonical atoms.
 
 Lives in its own module (not ``api_dsl.py``) so the MXFP8 lowering's imports
 stay out of the half-precision adapters' way; ``engines._adapter`` resolves it
@@ -143,6 +142,15 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             ("dkdv_sf_v", "sf_v", sk, dg, lk, SF_LAYOUT_SFA, True),
             ("dkdv_sf_do", "sf_do", sq, dg, lq, SF_LAYOUT_SFB, True),
         )
+
+    def _sf_pair_plan(self):
+        """One canonical source and its SFA/SFB kernel views per launch."""
+        entries = self._sf_plan()
+        by_src = {}
+        for name, src, rows, kg, l, layout, pm in entries:
+            pair = by_src.setdefault(src, {"geometry": (rows, kg, l, pm)})
+            pair[layout] = name
+        return tuple((src, *entry["geometry"], entry["sfa"], entry["sfb"]) for src, entry in by_src.items())
 
     def _sf_expected_bytes(self, graph_sf: str) -> int:
         """Byte count of a graph SF tensor under cuDNN's F8_128x4 padding rules
@@ -297,7 +305,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return masks.MaskEnum.RESIDUAL_MASK, masks.MaskEnum.RESIDUAL_MASK_BWD
 
     def compile(self) -> None:
-        """Plan-time JIT: the eight SF repacks, the dQ kernel and the fused dK/dV
+        """Plan-time JIT: four paired SF repacks, the dQ kernel and the fused dK/dV
         kernel, all against fake operands of the plan's exact geometry."""
         self._ensure_support_checked()
         if self._compiled is not None:
@@ -309,7 +317,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
 
         from cudnn.sdpa.bwd.kernels.bprop_dkdv_d256_mxfp8_sm100 import BlackwellFmhaBackwardDKDV256
         from cudnn.sdpa.bwd.kernels.bprop_dq_d256_mxfp8_sm100 import BlackwellFmhaBackwardDQ256
-        from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import Mxfp8SfRepackSm100
+        from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import Mxfp8SfRepackPairSm100, repack_geometry
 
         E4M3, E8M0 = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
         out_dt = cutlass.BFloat16 if self.out_dtype == torch.bfloat16 else cutlass.Float16
@@ -324,12 +332,18 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         def fake_flat(dt, n):
             return make_fake_tensor(dt, (n,), (1,), assumed_align=16)
 
-        # SF repacks: one specialization per (rows, groups, planes, layout, source order).
+        # Each source produces both operand layouts in one traversal/launch.
         repacks = {}
-        for name, _src, rows, kg, l, layout, pm in self._sf_plan():
-            rk = Mxfp8SfRepackSm100(rows, kg, l, layout, src_plane_major=pm)
-            fn = cute.compile(rk, fake_flat(cutlass.Int8, rk.src_bytes), fake_flat(cutlass.Int8, rk.dst_bytes), stream)
-            repacks[name] = (rk, fn)
+        for src, rows, kg, l, pm, _sfa_name, _sfb_name in self._sf_pair_plan():
+            rk = Mxfp8SfRepackPairSm100(rows, kg, l, src_plane_major=pm)
+            fn = cute.compile(
+                rk,
+                fake_flat(cutlass.Int8, rk.src_bytes),
+                fake_flat(cutlass.Int8, rk.sfa_bytes),
+                fake_flat(cutlass.Int8, rk.sfb_bytes),
+                stream,
+            )
+            repacks[src] = (rk, fn)
 
         # dS always gets the in-kernel per-block scale; the kernels' fixed-scale
         # specialization exists upstream but is not a mode this engine offers.
@@ -347,7 +361,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         fdkv = fake(out_dt, kv_geom)
 
         def fsf(name):
-            return fake_flat(E8M0, repacks[name][0].dst_bytes)
+            for plan_name, _src, rows, kg, l, layout, _pm in self._sf_plan():
+                if plan_name == name:
+                    return fake_flat(E8M0, repack_geometry(rows, kg, l, layout)[3])
+            raise KeyError(name)
 
         dq_kernel = BlackwellFmhaBackwardDQ256(
             out_dt,
@@ -521,13 +538,25 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             return _sf_storage_order_bytes(t, name)
 
         with _torch_stream_context(current_stream, q_tensor.device):
+            from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import repack_geometry
+
             carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm100_mxfp8")
             ws_kernel = carver.take(self._kernel_workspace_bytes(), torch.uint8)
-            sf_bufs = {}
+            sf_storage = {}
             for name, src, _rows, _kg, _l, _layout, _pm in self._sf_plan():
-                rk, fn = repacks[name]
-                dst = carver.take(rk.dst_bytes, torch.int8)
-                fn(from_dlpack(sf_bytes(extras[src], src), assumed_align=16), from_dlpack(dst, assumed_align=16), stream)
+                dst_bytes = repack_geometry(_rows, _kg, _l, _layout)[3]
+                dst = carver.take(dst_bytes, torch.int8)
+                sf_storage[name] = dst
+            for src, _rows, _kg, _l, _pm, sfa_name, sfb_name in self._sf_pair_plan():
+                _rk, fn = repacks[src]
+                fn(
+                    from_dlpack(sf_bytes(extras[src], src), assumed_align=16),
+                    from_dlpack(sf_storage[sfa_name], assumed_align=16),
+                    from_dlpack(sf_storage[sfb_name], assumed_align=16),
+                    stream,
+                )
+            sf_bufs = {}
+            for name, dst in sf_storage.items():
                 ct = from_dlpack(dst, assumed_align=16)
                 ct.element_type = E8M0
                 sf_bufs[name] = ct
