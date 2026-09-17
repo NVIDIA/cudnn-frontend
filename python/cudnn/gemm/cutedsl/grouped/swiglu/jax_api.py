@@ -7,8 +7,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cudnn.api_base import TupleDict
-from cudnn.jax import call, zeros_init
-from ..canonical_jax import grouped_plan, output_type, row_spec, sf_array, sf_shape, sf_zeros
+from ..canonical_jax import check_jax_inputs, grouped_call, grouped_plan, output_type, sf_array, sf_shape
 from .api import GroupedGemmSwigluSm100
 
 
@@ -34,7 +33,7 @@ def grouped_swiglu_adapter(stream, a, b, sfa, sfb, padded_offsets, alpha, prob, 
     )
 
 
-def swiglu_jax(
+def grouped_gemm_swiglu(
     a_tensor,
     b_tensor,
     sfa_tensor,
@@ -57,22 +56,23 @@ def swiglu_jax(
     bit patterns also accepted). Outputs use natural 2-D shapes and physical
     6-D SF buffers. Output storage is zero-initialized for untouched padding.
     Only FP8 A/B and FP8 D are supported. No automatic differentiation rule;
-    use grouped_gemm_dswiglu_wrapper_sm100 for the fused backward operation.
+    use cudnn.jax.grouped_gemm_dswiglu for the fused backward operation.
     """
-    m = a_tensor.shape[0]
-    if b_tensor.ndim != 3:
-        raise ValueError("B must have shape (experts, n, k)")
-    n = b_tensor.shape[1]
     inputs = dict(
         a=a_tensor,
         b=b_tensor,
-        sfa=sf_array(sfa_tensor),
-        sfb=sf_array(sfb_tensor),
+        sfa=sfa_tensor,
+        sfb=sfb_tensor,
         padded_offsets=padded_offsets,
         alpha=alpha_tensor,
         prob=prob_tensor,
         norm_const=norm_const_tensor,
     )
+    check_jax_inputs(inputs)
+    inputs["sfa"] = sf_array(sfa_tensor)
+    inputs["sfb"] = sf_array(sfb_tensor)
+    m = a_tensor.shape[0]
+    n = b_tensor.shape[1]
     outputs = dict(
         c=output_type((m, n), c_dtype),
         d=output_type((m, n // 2), d_dtype),
@@ -81,14 +81,12 @@ def swiglu_jax(
         sfd_col=output_type(sf_shape(n // 2, m), cutlass.Float8E8M0FNU),
     )
     kernel, mac = grouped_plan(GroupedGemmSwigluSm100, inputs, outputs, backward=False, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
-    result = call(
+    result = grouped_call(
         grouped_swiglu_adapter,
-        output_shape_dtype=tuple(outputs.values()),
-        input_spec=tuple(row_spec(t) for t in inputs.values()),
-        output_spec=tuple(row_spec(t) for t in outputs.values()),
-        initialized_outputs={0: zeros_init, 1: zeros_init, 2: zeros_init, 3: sf_zeros, 4: sf_zeros},
-        kernel=kernel,
-        mac=mac,
+        kernel,
+        mac,
+        tuple(output_type(t.shape, t.dtype) for t in inputs.values()),
+        tuple(outputs.values()),
     )(*inputs.values())
     return TupleDict(
         c_tensor=result[0],

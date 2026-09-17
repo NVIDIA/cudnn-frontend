@@ -7,8 +7,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cudnn.api_base import TupleDict
-from cudnn.jax import call, zeros_init
-from ..canonical_jax import grouped_plan, output_type, row_spec, sf_array, sf_shape, sf_zeros
+from ..canonical_jax import check_jax_inputs, grouped_call, grouped_plan, output_type, sf_array, sf_shape
 from .api import GroupedGemmDswigluSm100
 
 
@@ -36,7 +35,7 @@ def grouped_dswiglu_adapter(stream, a, b, c, sfa, sfb, padded_offsets, alpha, be
     )
 
 
-def dswiglu_jax(
+def grouped_gemm_dswiglu(
     a_tensor,
     b_tensor,
     c_tensor,
@@ -61,22 +60,23 @@ def dswiglu_jax(
     D_row/D_col (m,2n), dprob (m,), and physical 6-D SF buffers. Output storage
     is zero-initialized for padding and dprob accumulation. Only FP8 A/B/D.
     """
-    m = a_tensor.shape[0]
-    if b_tensor.ndim != 3:
-        raise ValueError("B must have shape (experts, n, k)")
-    n = b_tensor.shape[1]
     inputs = dict(
         a=a_tensor,
         b=b_tensor,
         c=c_tensor,
-        sfa=sf_array(sfa_tensor),
-        sfb=sf_array(sfb_tensor),
+        sfa=sfa_tensor,
+        sfb=sfb_tensor,
         padded_offsets=padded_offsets,
         alpha=alpha_tensor,
         beta=beta_tensor,
         prob=prob_tensor,
         norm_const=norm_const_tensor,
     )
+    check_jax_inputs(inputs)
+    inputs["sfa"] = sf_array(sfa_tensor)
+    inputs["sfb"] = sf_array(sfb_tensor)
+    m = a_tensor.shape[0]
+    n = b_tensor.shape[1]
     outputs = dict(
         d_row=output_type((m, 2 * n), d_dtype),
         d_col=output_type((m, 2 * n), d_dtype),
@@ -85,14 +85,12 @@ def dswiglu_jax(
         sfd_col=output_type(sf_shape(2 * n, m), cutlass.Float8E8M0FNU),
     )
     kernel, mac = grouped_plan(GroupedGemmDswigluSm100, inputs, outputs, backward=True, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
-    result = call(
+    result = grouped_call(
         grouped_dswiglu_adapter,
-        output_shape_dtype=tuple(outputs.values()),
-        input_spec=tuple(row_spec(t) for t in inputs.values()),
-        output_spec=tuple(row_spec(t) for t in outputs.values()),
-        initialized_outputs={0: zeros_init, 1: zeros_init, 2: zeros_init, 3: sf_zeros, 4: sf_zeros},
-        kernel=kernel,
-        mac=mac,
+        kernel,
+        mac,
+        tuple(output_type(t.shape, t.dtype) for t in inputs.values()),
+        tuple(outputs.values()),
     )(*inputs.values())
     return TupleDict(
         d_row_tensor=result[0],

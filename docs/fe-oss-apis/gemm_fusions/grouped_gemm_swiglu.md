@@ -6,7 +6,11 @@
 
 ## JAX support
 
-`grouped_gemm_swiglu_wrapper_sm100` accepts both Torch tensors and canonical MXFP8 JAX arrays or tracers. JAX calls use an XLA-managed custom call, including under `jax.jit`; there is no separate public JAX entry point. Direct API-class construction remains for Torch tensors or metadata descriptors. See the JAX execution contract below.
+`cudnn.jax.grouped_gemm_swiglu` accepts canonical MXFP8 JAX arrays or tracers,
+eagerly or under `jax.jit`. XLA owns its buffers and stream ordering. The existing
+`cudnn.grouped_gemm_swiglu_wrapper_sm100` remains Torch-only;
+`cudnn.torch.grouped_gemm_swiglu` is an alias to that same function, with
+identical arguments, defaults, and behavior. See the JAX execution contract below.
 
 ## Overview
 
@@ -358,8 +362,8 @@ kernel-facing forms above keep working unchanged:
 Flat SF buffers must already contain the packed MMA-tiled scale bytes in physical
 order. Ordinary row-major logical scales need packing before this API is called.
 
-These layouts are also used by the JAX execution path below. The same public
-wrapper dispatches by input framework. Unified GLU/dGLU APIs are separate.
+These layouts are also used by the JAX execution path below. Unified GLU/dGLU
+APIs are separate.
 
 When `A` is canonical (2-D), the wrapper returns natural-shaped outputs:
 `c (valid_m, N)`, `d`/`d_col (valid_m, N/2)` row-major, and `sfd_row`/`sfd_col` as
@@ -367,9 +371,10 @@ C-contiguous physical `(1, ceil(mn/128), rest, 32, 4, 4)` buffers.
 
 ### JAX execution
 
-`cudnn.grouped_gemm_swiglu_wrapper_sm100` runs the contiguous-weight MXFP8 fusion
+`cudnn.jax.grouped_gemm_swiglu` runs the contiguous-weight MXFP8 fusion
 through `cudnn.jax.call`, eagerly or under `jax.jit`. All operands are ordinary
-JAX arrays managed by XLA. Torch inputs use the existing eager implementation.
+JAX arrays managed by XLA. Torch callers use `cudnn.torch.grouped_gemm_swiglu`
+or the existing top-level wrapper name.
 Both paths return `TupleDict` with the same key order and tuple-unpacking behavior.
 The JAX path registers this output type as a JAX pytree.
 
@@ -383,27 +388,29 @@ multiple of 256. These device values are the caller's responsibility.
 Forward returns `c_tensor (m,n)`, `d_tensor`/`d_col_tensor (m,n/2)`, physical
 `sfd_row_tensor`/`sfd_col_tensor`, and `amax_tensor=None`.
 
-The shared signature and defaults are unchanged. Set `sf_vec_size=32` and an
-explicit FP8 `d_dtype` for JAX. JAX requires explicit probability and normalization
-arrays; mixed Torch/JAX operands are rejected. XLA manages streams and outputs,
-so `current_stream` is rejected. JAX also rejects `vector_f32=True`,
-`discrete_col_sfd=True`, non-default `m_aligned`, non-FP32 accumulation, and
-non-`n` output layout. Configuration arguments must be static under `jax.jit`,
-for example:
+The JAX API fixes scale-vector size to 32 and defaults `d_dtype` to FP8 e4m3.
+It requires explicit probability and normalization arrays. Mixed Torch/JAX
+operands are rejected. Torch-specific streams, output buffers,
+accumulation/layout options, and epilogues are not JAX parameters. The optional JAX
+configuration is `c_dtype`, `d_dtype`, `mma_tiler_mn`, and `cluster_shape_mn`.
+Configuration arguments must be static under `jax.jit`:
 
 ```python
-from functools import partial
 import jax
-import ml_dtypes
-import cudnn
+from cudnn.jax import grouped_gemm_swiglu
 
-operation = partial(
-    cudnn.grouped_gemm_swiglu_wrapper_sm100,
-    sf_vec_size=32,
-    d_dtype=ml_dtypes.float8_e4m3fn,
-)
-compiled = jax.jit(operation)
+compiled = jax.jit(grouped_gemm_swiglu)
 result = compiled(**jax_inputs)
+```
+
+The Torch alias preserves the existing wrapper signature, including its dtype and
+scale-vector defaults. For example, select MXFP8 explicitly:
+
+```python
+from cudnn.torch import grouped_gemm_swiglu
+import torch
+
+result = grouped_gemm_swiglu(**torch_inputs, d_dtype=torch.float8_e4m3fn, sf_vec_size=32)
 ```
 
 This initial bridge supports FP8 e4m3/e5m2 A/B and FP8 D, with E8M0 block

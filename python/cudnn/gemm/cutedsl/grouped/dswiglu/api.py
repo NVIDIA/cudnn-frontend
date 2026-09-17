@@ -126,7 +126,7 @@ class GroupedGemmDswigluSm100(APIBase):
                 raise ValueError(
                     "GroupedGemmDswigluSm100 only supports dense weight mode, whose expert-outermost strided "
                     "B layout (n, k, l) is not expressible as JAX arrays (row-major only); "
-                    "use torch tensors for this backward API, or grouped_gemm_dswiglu_wrapper_sm100 for canonical MXFP8 JAX arrays"
+                    "use torch tensors for this backward API, or cudnn.jax.grouped_gemm_dswiglu for canonical MXFP8 JAX arrays"
                 )
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmDswigluSm100; pass torch tensors")
         if acc_dtype is None:
@@ -769,11 +769,6 @@ def grouped_gemm_dswiglu_wrapper_sm100(
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM dSwiGLU backward operation.
 
-    Torch tensors use the eager implementation; canonical MXFP8 JAX arrays and
-    tracers use the XLA custom call, including under jax.jit. Both return TupleDict.
-    JAX requires explicit FP8 d_dtype and sf_vec_size=32; streams and output
-    buffers are XLA-managed. Other unsupported options raise ValueError.
-
     This function creates the API, compiles, and executes in one call.
     Compiled kernels are cached for reuse when called with the same configuration.
 
@@ -824,39 +819,10 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_dswiglu_wrapper_sm100; pass torch tensors or JAX arrays")
     if framework == "jax":
-        from ..canonical_jax import check_jax_call
-        from .jax_api import dswiglu_jax
-
-        tensors = dict(
-            a_tensor=a_tensor,
-            b_tensor=b_tensor,
-            c_tensor=c_tensor,
-            sfa_tensor=sfa_tensor,
-            sfb_tensor=sfb_tensor,
-            padded_offsets=padded_offsets,
-            alpha_tensor=alpha_tensor,
-            beta_tensor=beta_tensor,
-            prob_tensor=prob_tensor,
-            norm_const_tensor=norm_const_tensor,
-        )
-        check_jax_call(
-            tensors,
-            acc_dtype=acc_dtype,
-            cd_major=cd_major,
-            sf_vec_size=sf_vec_size,
-            vector_f32=vector_f32,
-            m_aligned=m_aligned,
-            discrete_col_sfd=discrete_col_sfd,
-            current_stream=current_stream,
-            epilogue_op=epilogue_op,
-            dprob_tensor_buf=dprob_tensor_buf,
-            amax_tensor_buf=amax_tensor_buf,
-        )
-        return dswiglu_jax(
-            **tensors,
-            d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
+        raise ValueError(
+            "grouped_gemm_dswiglu_wrapper_sm100 only supports dense weight mode, whose expert-outermost strided "
+            "B layout (n, k, l) is not expressible as JAX arrays (row-major only); "
+            "use torch tensors for this backward API, or cudnn.jax.grouped_gemm_dswiglu for canonical MXFP8 JAX arrays"
         )
     import torch
 

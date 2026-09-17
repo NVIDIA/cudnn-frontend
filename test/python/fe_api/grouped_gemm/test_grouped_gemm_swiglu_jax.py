@@ -1,9 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Noncanonical JAX inputs and direct swiglu API-class samples are rejected.
+"""
+JAX coverage for the SM100 grouped GEMM SwiGLU wrapper.
 
-Canonical MXFP8 shared-wrapper coverage is in test_grouped_gemm_canonical_jax.py.
+JAX contract: every configuration of this kernel is block-scaled and consumes the
+scale-factor tensors (sfa/sfb, and the sfd outputs for FP8 configs) as MMA-tiled
+(32, 4, m//128, 4, rest_k, l) strided views built via torch .permute(). Those layouts
+are not expressible as row-major JAX arrays, so JAX inputs are rejected with a clear
+ValueError at both the wrapper and the API class; torch behavior is unchanged.
 """
 
 import numpy as np
@@ -33,7 +38,7 @@ def test_grouped_gemm_swiglu_jax_rejected_with_clear_error():
     from cudnn import grouped_gemm_swiglu_wrapper_sm100
 
     a_j, b_j, sfa_j, sfb_j, offsets_j, alpha_j = make_jax_inputs()
-    with pytest.raises(ValueError, match="JAX requires canonical"):
+    with pytest.raises(ValueError, match="not expressible as JAX arrays"):
         grouped_gemm_swiglu_wrapper_sm100(
             a_tensor=a_j,
             b_tensor=b_j,

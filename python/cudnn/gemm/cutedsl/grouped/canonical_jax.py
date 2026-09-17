@@ -4,6 +4,7 @@
 """Shared metadata validation for canonical grouped MXFP8 JAX entry points."""
 
 import os
+from functools import lru_cache
 
 import cutlass
 import cutlass.utils
@@ -13,7 +14,7 @@ import ml_dtypes
 
 from cudnn.api_base import TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.jax import TensorSpec, row_major_desc
+from cudnn.jax import TensorSpec, call, row_major_desc, zeros_init
 from cudnn.tensor_adapter import detect_framework, framework_dtype
 
 jax.tree_util.register_pytree_node(
@@ -109,39 +110,25 @@ def grouped_plan(api_type, inputs, outputs, *, backward, mma_tiler_mn, cluster_s
     return kernel_cache[config]
 
 
-def check_jax_call(
-    tensors,
-    *,
-    acc_dtype,
-    cd_major,
-    sf_vec_size,
-    vector_f32,
-    m_aligned,
-    discrete_col_sfd,
-    current_stream,
-    epilogue_op=None,
-    dprob_tensor_buf=None,
-    amax_tensor_buf=None,
-):
-    if tensors["a_tensor"].ndim != 2 or (tensors["b_tensor"] is not None and tensors["b_tensor"].ndim != 3):
-        raise ValueError("JAX requires canonical A (m,k) and B (experts,n,k) layouts")
-    options = {
-        "acc_dtype": acc_dtype is None or _convert_to_cutlass_data_type(acc_dtype) is cutlass.Float32,
-        "cd_major": cd_major == "n",
-        "sf_vec_size": sf_vec_size == 32,
-        "vector_f32": not vector_f32,
-        "m_aligned": m_aligned == 256,
-        "discrete_col_sfd": not discrete_col_sfd,
-        "current_stream": current_stream is None,
-        "epilogue_op": epilogue_op in (None, "none", "identity"),
-        "dprob_tensor_buf": dprob_tensor_buf is None,
-        "amax_tensor_buf": amax_tensor_buf is None,
-    }
-    for name, supported in options.items():
-        if not supported:
-            raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
-    for name, tensor in tensors.items():
+def check_jax_inputs(inputs):
+    for name, tensor in inputs.items():
+        argument = name if name == "padded_offsets" else f"{name}_tensor"
         if tensor is None:
-            raise ValueError(f"{name} is required for the JAX MXFP8 path")
+            raise ValueError(f"{argument} is required for the JAX MXFP8 path")
         if detect_framework(tensor) != "jax":
-            raise ValueError(f"{name} must be a JAX array or tracer when a_tensor is JAX")
+            raise ValueError(f"{argument} must be a JAX array or tracer")
+    if inputs["a"].ndim != 2 or inputs["b"].ndim != 3:
+        raise ValueError("JAX requires canonical A (m,k) and B (experts,n,k) layouts")
+
+
+@lru_cache(maxsize=128)
+def grouped_call(adapter, kernel, mac, input_types, output_types):
+    return call(
+        adapter,
+        output_shape_dtype=output_types,
+        input_spec=tuple(row_spec(t) for t in input_types),
+        output_spec=tuple(row_spec(t) for t in output_types),
+        initialized_outputs={0: zeros_init, 1: zeros_init, 2: zeros_init, 3: sf_zeros, 4: sf_zeros},
+        kernel=kernel,
+        mac=mac,
+    )

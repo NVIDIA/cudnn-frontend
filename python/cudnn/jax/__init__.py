@@ -30,4 +30,22 @@ __all__ = [
     "sf_atom_spec",
     "zeros_init",
     "neg_inf_init",
+    "grouped_gemm_swiglu",
+    "grouped_gemm_dswiglu",
 ]
+
+
+def __getattr__(name):
+    if name in ("grouped_gemm_swiglu", "grouped_gemm_dswiglu"):
+        from importlib import import_module
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        requirement = cutedsl_requirement_error(name)
+        if requirement:
+            raise ImportError(requirement)
+        operation = name.removeprefix("grouped_gemm_")
+        module = import_module(f"cudnn.gemm.cutedsl.grouped.{operation}.jax_api")
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
