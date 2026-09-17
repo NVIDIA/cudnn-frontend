@@ -19,7 +19,7 @@ from typing import NamedTuple, Optional
 import pytest
 import torch
 
-from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
+from frost_test_utils import launch_f16, launch_combine, launch_quant, requires_pre_rubin_blackwell, requires_dsl
 
 # Pre-Rubin Blackwell only. Most of this module drives the SM100 kernel modules
 # directly (_kernel_module loads prefill_*_sm100.py), which cc10.7 never runs --
@@ -119,12 +119,13 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
     v = torch.randn(B, SKV, KH, D, device=dev, dtype=dtype)
 
     mod = _kernel_module(splits, 3 if dtype == torch.float16 else 2, causal, cta_mma=cta_mma, pack_gqa=pack_gqa, qh_per_kh=H // KH)
-    fn = mod.compile(b=B, qh=H, kh=KH, sq=SQ, skv=SKV, d_qk=D, d_v=D, has_lse=True)
+    fn = mod.compile(d_qk=D, d_v=D, has_lse=True, lse_kind="dense")
 
     o_p = torch.zeros(splits * B, SQ, H, D, device=dev, dtype=_partial_o_dtype(splits, dtype))
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k,
         v,
@@ -146,10 +147,8 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
 
     o_out = torch.zeros(B, SQ, H, D, device=dev, dtype=dtype)
     lse_out = torch.zeros(B, H, SQ, device=dev, dtype=torch.float32)
-    cfn = comb.compile(
-        b=B, h=H, sq=SQ, d_v=D, splits=splits, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)
-    )
-    cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, SQ, D), cutlass.Int32(splits), stream=stream)
+    cfn = comb.compile(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype))
+    launch_combine(cfn, o_p, lse_p, o_out, lse_out, None, None, (B, H, SQ, D), cutlass.Int32(splits), stream=stream)
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in combined O"
     return o_out.float(), (q, k, v, scale)
@@ -258,57 +257,7 @@ def test_split_kv_requires_lse():
     """has_lse=False + split is rejected: the per-split LSE IS the combine weight."""
     mod = _kernel_module(4, 3, causal=False)
     with pytest.raises(ValueError, match="has_lse"):
-        mod.compile(b=1, qh=4, kh=4, sq=128, skv=2048, d_qk=D, d_v=D, has_lse=False)
-
-
-@pytest.mark.L0
-def test_split_combine_compile_keeps_partial_lse_compact_and_strides_final_lse(monkeypatch):
-    """Only the caller-visible Stats output inherits its non-compact layout."""
-    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
-
-    def fake_compact_tensor(_dtype, shape, **kwargs):
-        return {"kind": "compact", "shape": tuple(shape), **kwargs}
-
-    def fake_tensor(_dtype, shape, stride, **kwargs):
-        return {"kind": "strided", "shape": tuple(shape), "stride": tuple(stride), **kwargs}
-
-    captured = {}
-    compiled = object()
-
-    def fake_compile(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return compiled
-
-    monkeypatch.setattr(comb.cute.runtime, "make_fake_compact_tensor", fake_compact_tensor)
-    monkeypatch.setattr(comb.cute.runtime, "make_fake_tensor", fake_tensor)
-    monkeypatch.setattr(comb.cute.runtime, "make_fake_stream", lambda **_kwargs: object())
-    monkeypatch.setattr(comb.cute, "compile", fake_compile)
-
-    comb.compile.cache_clear()
-    try:
-        result = comb.compile(
-            b=2,
-            h=4,
-            sq=5,
-            d_v=16,
-            splits=3,
-            has_lse=True,
-            lse_stride=(97, 19, 3),
-        )
-    finally:
-        comb.compile.cache_clear()
-
-    assert result is compiled
-    assert captured["args"][2]["kind"] == "compact"
-    assert captured["args"][2]["shape"] == (6, 4, 5)
-    assert captured["args"][2]["assumed_align"] == 16
-    assert captured["args"][4] == {
-        "kind": "strided",
-        "shape": (2, 4, 5),
-        "stride": (97, 19, 3),
-        "assumed_align": 4,
-    }
+        mod.compile(d_qk=D, d_v=D, has_lse=False, lse_kind="dense")
 
 
 # --- cga1 (CTA_MMA=1) ---------------------------------------------------
@@ -452,12 +401,13 @@ def test_empty_splits_every_flavor(flavor):
 
     path = _os.path.join(_os.path.dirname(_os.path.abspath(api_dsl.__file__)), "kernels", kmod)
     mod = load_template(path, TemplateParams(dtype_qkv=3, split_kv=S), tag=f"empty_{flavor}_{S}")
-    fn = mod.compile(b=B, qh=H, kh=H, sq=SQ, skv=SKV, d_qk=d_qk, d_v=d_v, has_lse=True)
+    fn = mod.compile(d_qk=d_qk, d_v=d_v, has_lse=True, lse_kind="dense")
 
     o_p = torch.zeros(S * B, SQ, H, d_v, device=dev, dtype=_partial_o_dtype(S, torch.float16))
     lse_p = torch.zeros(S * B, H, SQ, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k,
         v,
@@ -474,8 +424,8 @@ def test_empty_splits_every_flavor(flavor):
         stream=stream,
     )
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=torch.float16)
-    cfn = comb.compile(b=B, h=H, sq=SQ, d_v=d_v, splits=S, dtype_o="f16", has_lse=False, dtype_partial=_partial_tag(S, torch.float16))
-    cfn(o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(S), stream=stream)
+    cfn = comb.compile(dtype_o="f16", has_lse=False, dtype_partial=_partial_tag(S, torch.float16))
+    launch_combine(cfn, o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(S), stream=stream)
     torch.cuda.synchronize()
 
     assert not torch.isnan(o_out).any(), f"{flavor}: NaN from an empty split"
@@ -559,7 +509,7 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
         params,
         tag=f"t_{d_qk}_{d_v}_{dtype_qkv}_{splits}_{cta_mma}_{int(causal)}",
     )
-    compile_kwargs = dict(b=B, qh=H, kh=H, sq=SQ, skv=SKV, has_lse=True)
+    compile_kwargs = dict(has_lse=True, lse_kind="dense")
     if not mx:
         compile_kwargs.update(d_qk=d_qk, d_v=d_v)
     fn = mod.compile(**compile_kwargs)
@@ -587,25 +537,24 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
 
         # o_desc dummy + n_thd_units=0: THD-only ABI slots (dense fold), like the f16 call above.
         o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
-        fn(
-            q,
-            k,
-            v,
-            o_p,
-            lse_p,
-            zH,
-            zB,
-            o_desc,
-            ps,
-            log2e,
-            cutlass.Float32(1.0),
-            cutlass.Int32(0),
-            one(),
-            one(),
-            one(),
-            one(),
-            amax_o,
-            **_partial_kwargs(splits, o_p),
+        launch_quant(
+            fn,
+            host=mod._host,
+            q=q,
+            k=k,
+            v=v,
+            o=o_p,
+            lse=lse_p,
+            sinks=zH,
+            seq_kv=zB,
+            o_desc=o_desc,
+            problem_size=ps,
+            scale_log2=log2e,
+            units=cutlass.Int32(0),
+            descales=(one(), one(), one(), one()),
+            o_scale_fused=cutlass.Float32(1.0),
+            amax_o=amax_o,
+            o_partial_f32=o_p if splits > 1 else None,
             stream=stream,
         )
         qf, kf, vf = (t.float().permute(0, 2, 1, 3) for t in (q, k, v))
@@ -636,7 +585,25 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
         v8 = v8.reshape(B, H, SKV, d_v).permute(0, 2, 1, 3).contiguous()
         # o_desc dummy + n_thd_units=0: THD-only ABI slots (dense fold), like the f16 call above.
         o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
-        fn(q8, k8, v8, o_p, sfq, sfk, sfv, lse_p, amax_o, zH, zB, o_desc, ps, log2e, cutlass.Int32(0), **_partial_kwargs(splits, o_p), stream=stream)
+        launch_quant(
+            fn,
+            host=mod._host,
+            q=q8,
+            k=k8,
+            v=v8,
+            o=o_p,
+            lse=lse_p,
+            sinks=zH,
+            seq_kv=zB,
+            o_desc=o_desc,
+            problem_size=ps,
+            scale_log2=log2e,
+            units=cutlass.Int32(0),
+            sf=(sfq, sfk, sfv),
+            amax_o=amax_o,
+            o_partial_f32=o_p if splits > 1 else None,
+            stream=stream,
+        )
 
     scores = torch.matmul(qf, kf.transpose(-1, -2)) * scale
     if causal:
@@ -650,8 +617,8 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=torch.float16)
     # has_amax: at splits > 1 the per-split epilogues skip their amax write, so
     # the combine is what reports it -- over the RECOMBINED O.
-    cfn = comb.compile(b=B, h=H, sq=SQ, d_v=d_v, splits=splits, dtype_o="f16", has_lse=False, has_amax=True, dtype_partial=_partial_tag(splits, torch.float16))
-    cfn(o_p, lse_p, o_out, None, amax_o, None, (B, H, SQ, d_v), cutlass.Int32(splits), stream=stream)
+    cfn = comb.compile(dtype_o="f16", has_lse=False, has_amax=True, dtype_partial=_partial_tag(splits, torch.float16))
+    launch_combine(cfn, o_p, lse_p, o_out, None, amax_o, None, (B, H, SQ, d_v), cutlass.Int32(splits), stream=stream)
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in combined fp8-family O"
     return o_out.float(), ref, amax_o
@@ -732,20 +699,6 @@ def test_split_kv_mxfp8_d192(in_key, splits, causal):
 
 
 @pytest.mark.L0
-def test_split_kv_mxfp8_d192_rejects_dense_lse_stride():
-    from cudnn.frost.template_loader import load_template
-    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3, DTYPE_FP16
-    from cudnn.sdpa.fwd import api_dsl
-    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/prefill_d192_d128_mxfp8.py")
-    params = TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP16, split_kv=2, cta_mma=2)
-    mod = load_template(path, params, tag="d192_mxfp8_split_lse_stride_reject")
-    with pytest.raises(ValueError, match="dense LSE strides"):
-        mod.compile(b=1, qh=2, kh=2, sq=128, skv=256, has_lse=True, lse_stride=(256, 128, 1))
-
-
-@pytest.mark.L0
 @pytest.mark.parametrize("cta_mma", [2, 1], ids=["cga2", "cga1"])
 @pytest.mark.parametrize("splits", [1, 4], ids=lambda s: f"split{s}")
 def test_split_kv_mxfp8(splits, cta_mma):
@@ -784,11 +737,12 @@ def test_combine_lse_matches_reference(splits, stats_log2):
     v = torch.randn(B, SKV, H, D, device=dev, dtype=torch.float16)
 
     mod = _kernel_module(splits, 3, causal=False, stats_log2=stats_log2 and splits == 1)
-    fn = mod.compile(b=B, qh=H, kh=H, sq=SQ, skv=SKV, d_qk=D, d_v=D, has_lse=True)
+    fn = mod.compile(d_qk=D, d_v=D, has_lse=True, lse_kind="dense")
     o_p = torch.zeros(splits * B, SQ, H, D, device=dev, dtype=_partial_o_dtype(splits, torch.float16))
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k,
         v,
@@ -817,10 +771,8 @@ def test_combine_lse_matches_reference(splits, stats_log2):
     else:
         o_out = torch.zeros(B, SQ, H, D, device=dev, dtype=torch.float16)
         lse_out = torch.zeros(B, H, SQ, device=dev, dtype=torch.float32)
-        cfn = comb.compile(
-            b=B, h=H, sq=SQ, d_v=D, splits=splits, dtype_o="f16", has_lse=True, dtype_partial=_partial_tag(splits, torch.float16), stats_log2=stats_log2
-        )
-        cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, SQ, D), cutlass.Int32(splits), stream=stream)
+        cfn = comb.compile(dtype_o="f16", has_lse=True, dtype_partial=_partial_tag(splits, torch.float16), stats_log2=stats_log2)
+        launch_combine(cfn, o_p, lse_p, o_out, lse_out, None, None, (B, H, SQ, D), cutlass.Int32(splits), stream=stream)
         torch.cuda.synchronize()
         got_lse = lse_out
     assert not torch.isnan(got_lse).any(), "NaN in recombined LSE"
@@ -859,11 +811,12 @@ def test_even_splits_every_flavor_batched(flavor, dtype):
     path = _os.path.join(_os.path.dirname(_os.path.abspath(api_dsl.__file__)), "kernels", kmod)
     params = TemplateParams(dtype_qkv=3 if dtype == torch.float16 else 2, split_kv=S)
     mod = load_template(path, params, tag=f"even_{flavor}_{dtype}_{S}")
-    fn = mod.compile(b=B, qh=H, kh=H, sq=SQ, skv=SKV, d_qk=d_qk, d_v=d_v, has_lse=True)
+    fn = mod.compile(d_qk=d_qk, d_v=d_v, has_lse=True, lse_kind="dense")
     o_p = torch.zeros(S * B, SQ, H, d_v, device=dev, dtype=_partial_o_dtype(S, dtype))
     lse_p = torch.zeros(S * B, H, SQ, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k,
         v,
@@ -880,10 +833,8 @@ def test_even_splits_every_flavor_batched(flavor, dtype):
         stream=stream,
     )
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=dtype)
-    cfn = comb.compile(
-        b=B, h=H, sq=SQ, d_v=d_v, splits=S, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(S, dtype)
-    )
-    cfn(o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(S), stream=stream)
+    cfn = comb.compile(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(S, dtype))
+    launch_combine(cfn, o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(S), stream=stream)
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), f"{flavor}: NaN"
     ref = _ref_sdpa(q, k, v, scale, is_causal=False, kh=H)
@@ -921,13 +872,14 @@ def _run_masked(kfile, d_qk, d_v, splits, *, B, H, KH, SQ, SKV, tp_kwargs, seq_k
     path = _os.path.join(_os.path.dirname(_os.path.abspath(api_dsl.__file__)), "kernels", kfile)
     params = TemplateParams(dtype_qkv=3 if dtype == torch.float16 else 2, split_kv=splits, cta_mma=cta_mma, **tp_kwargs)
     mod = load_template(path, params, tag=f"mask_{kfile[:16]}_{splits}_{cta_mma}_{sorted(tp_kwargs.items())}")
-    fn = mod.compile(b=B, qh=H, kh=KH, sq=SQ, skv=SKV, d_qk=d_qk, d_v=d_v, has_lse=True)
+    fn = mod.compile(d_qk=d_qk, d_v=d_v, has_lse=True, lse_kind="dense")
 
     o_p = torch.zeros(splits * B, SQ, H, d_v, device=dev, dtype=_partial_o_dtype(splits, dtype))
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
     skv_t = seq_kv_lens if seq_kv_lens is not None else torch.zeros(B, dtype=torch.int32, device=dev)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k,
         v,
@@ -947,10 +899,8 @@ def _run_masked(kfile, d_qk, d_v, splits, *, B, H, KH, SQ, SKV, tp_kwargs, seq_k
         torch.cuda.synchronize()
         return o_p.float(), q, k, v, scale
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=dtype)
-    cfn = comb.compile(
-        b=B, h=H, sq=SQ, d_v=d_v, splits=splits, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(splits, dtype)
-    )
-    cfn(o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(splits), stream=stream)
+    cfn = comb.compile(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(splits, dtype))
+    launch_combine(cfn, o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(splits), stream=stream)
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN under mask+split"
     return o_out.float(), q, k, v, scale

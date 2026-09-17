@@ -548,11 +548,17 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
     assert kdir.is_dir(), f"kernel directory moved: {kdir}"
 
     offenders = []
+
+    def has_slot(src: str) -> bool:
+        # the host entry declares the fp32 partial pointer (the shared prologue names o_partial_f32 in every host)
+        sig = src[src.index("\ndef _host(") : src.index(") -> None:", src.index("\ndef _host("))]
+        return "o_partial_ptr" in sig
+
     for f in sorted(kdir.glob("prefill_*.py")):
         src = f.read_text()
         if "make_split_helpers" not in src:
             continue  # not split-capable, nothing to carry
-        if "o_partial_f32" in src:
+        if has_slot(src):
             continue  # wired
         if f.name in _SLOTLESS_FLAVORS:
             continue  # known, and excluded by _fp32_partial_split
@@ -568,4 +574,4 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
     for name in _SLOTLESS_FLAVORS:
         src = (kdir / name).read_text()
         assert "make_split_helpers" in src, f"{name}: no longer split-capable; drop it from _SLOTLESS_FLAVORS"
-        assert "o_partial_f32" not in src, f"{name}: now carries the slot; drop it from _SLOTLESS_FLAVORS and let the predicate return True"
+        assert not has_slot(src), f"{name}: now carries the slot; drop it from _SLOTLESS_FLAVORS and let the predicate return True"

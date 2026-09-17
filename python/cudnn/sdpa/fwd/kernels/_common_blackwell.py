@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -898,8 +898,7 @@ def make_sdpa_helpers(
     )
 
 
-# =============================================================================
-# Fused epilogue gate  --  O := O * sigmoid(G)   (Rubin d256 f16 / per-tensor FP8 / MXFP8)
+# ======================================================================# Fused epilogue gate  --  O := O * sigmoid(G)   (Rubin d256 f16 / per-tensor FP8 / MXFP8)
 # =============================================================================
 # Shared between the three SM107 d256 prefill kernels (``sm107/prefill_d256_f16.py``,
 # ``sm107/prefill_d256_fp8.py``, ``sm107/prefill_d256_mxfp8.py``); each kernel splices these under
@@ -1075,3 +1074,125 @@ def gate_half_opaque():
     gets the ``n`` immediate constraint and ICEs libNVVM (frost-tile-dsl S7).
     Hoist it once per tile, not per chunk."""
     return opaque_f32_zero() + cutlass.Float32(0.5)
+
+
+class SdpaOperandTensors(NamedTuple):
+    """The tensors a prefill host hands to the TMA encodes and the launch, built from pointers."""
+
+    q: cute.Tensor
+    k: cute.Tensor
+    v: cute.Tensor
+    o: cute.Tensor
+    lse: Optional[cute.Tensor]
+    sinks: cute.Tensor
+    meta: cute.Tensor
+    o_desc: cute.Tensor
+    thd_q_lens: Optional[cute.Tensor]
+    thd_kv_lens: Optional[cute.Tensor]
+    o_partial: Optional[cute.Tensor]
+    block_table: Optional[cute.Tensor]
+    block_table_v: Optional[cute.Tensor]
+
+
+def _vec(ptr, n):
+    return cute.make_tensor(ptr, cute.make_layout((n,), stride=(1,)))
+
+
+def _bshd(ptr, batch, seq, heads, d, strides, thd):
+    """(B, S, H, D) over the caller's (batch, seq, head) strides. A packed THD operand has
+    batch extent 1 and binds the seq stride there (never stepped, GitHub #980)."""
+    bs, ss, hs = strides
+    if thd:
+        return cute.make_tensor(ptr, cute.make_layout((1, seq, heads, d), stride=(ss, ss, hs, 1)))
+    return cute.make_tensor(ptr, cute.make_layout((batch, seq, heads, d), stride=(bs, ss, hs, 1)))
+
+
+def sdpa_operand_tensors(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    o_ptr,
+    lse_ptr,
+    sinks_ptr,
+    meta_ptr,
+    o_desc_ptr,
+    problem_size,
+    q_strides,
+    k_strides,
+    v_strides,
+    o_strides,
+    lse_strides,
+    lse_ext,
+    thd_q_lens_ptr,
+    thd_kv_lens_ptr,
+    thd_lens_form,
+    o_partial_ptr,
+    *,
+    d_qk,
+    d_v,
+    lse_kind,
+    thd,
+    split_kv,
+    tensor_map_qwords,
+    paged=False,
+    page_size=0,
+    block_table_ptr=None,
+    block_table_v_ptr=None,
+    table_strides=(0, 0),
+    n_pages=0,
+) -> SdpaOperandTensors:
+    """Pointer + stride prologue shared by every SM100 / SM107 prefill host (called while the
+    host traces, so the branches below are static).
+
+    ``problem_size`` is (B, QH, KH, SQ, SKV, 0); THD passes packed totals as SQ/SKV, paged K/V pass
+    max_pages*page_size. Strides are the caller's (batch, seq, head) element strides; paged K/V are
+    (n_pages, page_size, KH, D) pools with (page, row, head) strides. ``lse_kind``: "dense"
+    (B*split_kv, QH, SQ) in ``lse_strides``; "token" (SQ, QH) packed; "head" (1, QH, lse_ext);
+    "padded" (B, QH, lse_ext, 1) in ``lse_strides``. ``lse_ptr`` None compiles the store out."""
+    B, QH, KH, SQ, SKV, _ = problem_size
+    q = _bshd(q_ptr, B, SQ, QH, d_qk, q_strides, thd)
+    o = _bshd(o_ptr, B * split_kv, SQ, QH, d_v, o_strides, thd)
+    if paged:
+        k = _bshd(k_ptr, n_pages, page_size, KH, d_qk, k_strides, False)
+        v = _bshd(v_ptr, n_pages, page_size, KH, d_v, v_strides, False)
+    else:
+        k = _bshd(k_ptr, B, SKV, KH, d_qk, k_strides, thd)
+        v = _bshd(v_ptr, B, SKV, KH, d_v, v_strides, thd)
+    if lse_ptr is None:
+        lse = None
+    elif lse_kind == "token":
+        lse = cute.make_tensor(lse_ptr, cute.make_layout((SQ, QH), stride=(QH, 1)))
+    elif lse_kind == "head":
+        lse = cute.make_tensor(lse_ptr, cute.make_layout((1, QH, lse_ext), stride=(QH * lse_ext, lse_ext, 1)))
+    elif lse_kind == "padded":
+        l0, l1, l2 = lse_strides
+        lse = cute.make_tensor(lse_ptr, cute.make_layout((B, QH, lse_ext, 1), stride=(l0, l1, l2, 1)))
+    else:
+        l0, l1, l2 = lse_strides
+        lse = cute.make_tensor(lse_ptr, cute.make_layout((B * split_kv, QH, SQ), stride=(l0, l1, l2)))
+    sinks = _vec(sinks_ptr, QH)
+    if thd:
+        # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr] and (B + 3) O/K/V descriptor slots
+        meta = _vec(meta_ptr, 4 * B + 4)
+        o_desc = _vec(o_desc_ptr, (B + 3) * tensor_map_qwords)
+        q_lens = None if thd_q_lens_ptr is None else _vec(thd_q_lens_ptr, B + (thd_lens_form & 1))
+        kv_lens = None if thd_kv_lens_ptr is None else _vec(thd_kv_lens_ptr, B + ((thd_lens_form >> 1) & 1))
+    else:
+        meta, o_desc, q_lens, kv_lens = _vec(meta_ptr, B), _vec(o_desc_ptr, 1), None, None
+    o_partial = None if o_partial_ptr is None else o  # the split slab: same layout as O, written in fp32
+    table = table_v = None
+    if paged:
+        max_pages = SKV // cutlass.Int32(page_size)
+        t_bs, t_ps = table_strides
+        table = cute.make_tensor(block_table_ptr, cute.make_layout((B, max_pages), stride=(t_bs, t_ps)))
+        table_v = cute.make_tensor(block_table_v_ptr, cute.make_layout((B, max_pages), stride=(t_bs, t_ps)))
+    return SdpaOperandTensors(q, k, v, o, lse, sinks, meta, o_desc, q_lens, kv_lens, o_partial, table, table_v)
+
+
+def sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides):
+    """The fused epilogue gate G (O's (B, SQ, QH, d_v) shape) over the caller's (batch, seq, head)
+    strides; None folds the gate path out (the module's CFG.EPILOGUE_GATE must agree)."""
+    if gate_ptr is None:
+        return None
+    B, QH, _, SQ, _, _ = problem_size
+    return _bshd(gate_ptr, B, SQ, QH, d_v, gate_strides, False)

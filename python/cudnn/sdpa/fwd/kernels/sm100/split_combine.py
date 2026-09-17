@@ -162,18 +162,42 @@ _combine_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 @cute.jit
 def _host(
-    o_partial: cute.Tensor,
-    lse_partial: cute.Tensor,
-    o_out: cute.Tensor,
-    lse_out: Optional[cute.Tensor],
-    amax_o: Optional[cute.Tensor],
-    scale_o: Optional[cute.Tensor],
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    amax_o_ptr: Optional[cute.Pointer],
+    scale_o_ptr: Optional[cute.Pointer],
     problem_size: Tuple[int, int, int, int],
     n_splits: cutlass.Int32,
+    lse_out_strides: Tuple[int, int, int],
     stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    """Host entry: pointers and runtime extents in, one launch out.
+
+    ``problem_size`` = (B, H, S_q, d_v). The split-major partial slabs are compact
+    ``[n_splits*B, S_q, H, d_v]`` / ``[n_splits*B, H, S_q]``; O out is compact BSHD;
+    the recombined LSE goes to ``lse_out_strides`` (the caller-visible layout).
+    ``None`` pointers compile the LSE / amax / scale paths out."""
     B, H, SQ, D = problem_size
+    row = H * D
+    o_partial = cute.make_tensor(o_partial_ptr, cute.make_layout((n_splits * B, SQ, H, D), stride=(cutlass.Int64(SQ) * cutlass.Int64(row), row, D, 1)))
+    lse_partial = cute.make_tensor(lse_partial_ptr, cute.make_layout((n_splits * B, H, SQ), stride=(H * SQ, SQ, 1)))
+    o_out = cute.make_tensor(o_out_ptr, cute.make_layout((B, SQ, H, D), stride=(cutlass.Int64(SQ) * cutlass.Int64(row), row, D, 1)))
+    if cutlass.const_expr(lse_out_ptr is None):
+        lse_out = None
+    else:
+        l0, l1, l2 = lse_out_strides
+        lse_out = cute.make_tensor(lse_out_ptr, cute.make_layout((B, H, SQ), stride=(l0, l1, l2)))
+    if cutlass.const_expr(amax_o_ptr is None):
+        amax_o = None
+    else:
+        amax_o = cute.make_tensor(amax_o_ptr, cute.make_layout((1,), stride=(1,)))
+    if cutlass.const_expr(scale_o_ptr is None):
+        scale_o = None
+    else:
+        scale_o = cute.make_tensor(scale_o_ptr, cute.make_layout((1,), stride=(1,)))
     _combine_kernel(
         o_partial,
         lse_partial,
@@ -192,68 +216,48 @@ def _host(
     )
 
 
+EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument list itself
+
+
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001
-    b: int,
-    h: int,
-    sq: int,
-    d_v: int,
-    splits: int,
     dtype_o: str = "f16",
     has_lse: bool = False,
-    lse_stride: Optional[tuple[int, int, int]] = None,
     has_amax: bool = False,
     dtype_partial: Optional[str] = None,
     has_scale_o: bool = False,
     stats_log2: bool = False,
 ) -> Callable:
-    """Compile the combine pass for one concrete (B, H, S_q, d_v, splits) shape.
+    """Compile the combine pass for one dtype / output-set combination.
 
-    ``splits`` is baked into the workspace EXTENTS (batch dim ``splits*b``) but
-    passed to the kernel as a runtime count, so the split axis is a dynamic loop
-    — the pass is bandwidth-bound, so unrolling it buys nothing.  ``has_lse``
-    controls whether the recombined LSE is written at all; with ``False`` the
-    store is None-specialized out of the traced code.  ``has_amax`` does the
-    same for the FP8-family amax of the recombined O.  ``lse_stride`` describes
-    the caller-visible LSE output; the per-split LSE input workspace remains
-    compact regardless of that final layout. ``stats_log2`` writes the FINAL
-    LSE in base 2; the per-split partials stay natural.
-
-    ``dtype_partial`` names the workspace element type, which is never narrower
-    than ``dtype_o``: the split kernels write "f32" where they can store their
-    accumulator registers straight to global and half otherwise, and this pass
-    performs the only cast down to ``dtype_o``, applying ``scale_o``
-    (``has_scale_o``) at that single point.  It defaults to ``dtype_o``.
-    """
+    Shapes, the split count and the final LSE strides are runtime arguments of
+    the artifact (see ``_host``). ``has_lse`` controls whether the recombined LSE
+    is written at all; ``has_amax`` the FP8-family amax of the recombined O;
+    ``has_scale_o`` the single output scale applied at the cast; ``stats_log2``
+    writes the FINAL LSE in base 2 (the per-split partials stay natural).
+    ``dtype_partial`` names the workspace element type, never narrower than
+    ``dtype_o`` (the split kernels write "f32" where they can store their
+    accumulator registers straight to global and half otherwise); it defaults to
+    ``dtype_o``."""
     _cache_key = _template_key(globals(), locals(), "compile")
     elem = _ELEM[dtype_o]
     elem_partial = _ELEM[dtype_partial or dtype_o]
+    gmem = cute.AddressSpace.gmem
 
-    fake_o_partial = cute.runtime.make_fake_compact_tensor(elem_partial, (splits * b, sq, h, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fake_lse_partial = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (splits * b, h, sq), stride_order=(2, 1, 0), assumed_align=16)
-    fake_o_out = cute.runtime.make_fake_compact_tensor(elem, (b, sq, h, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fake_lse_out = (
-        (
-            cute.runtime.make_fake_tensor(cutlass.Float32, (b, h, sq), lse_stride, assumed_align=4)
-            if lse_stride is not None
-            else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, h, sq), stride_order=(2, 1, 0), assumed_align=16)
-        )
-        if has_lse
-        else None
-    )
-    fake_amax_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_amax else None
-    fake_scale_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_scale_o else None
+    def P(dtype, align=16):
+        return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=align)  # fake: type only
 
     return _compile_cached(
         _host,
-        fake_o_partial,
-        fake_lse_partial,
-        fake_o_out,
-        fake_lse_out,
-        fake_amax_o,
-        fake_scale_o,
-        (b, h, sq, d_v),
+        P(elem_partial),
+        P(cutlass.Float32),
+        P(elem),
+        P(cutlass.Float32, 4) if has_lse else None,
+        P(cutlass.Float32, 4) if has_amax else None,
+        P(cutlass.Float32, 4) if has_scale_o else None,
+        (0, 0, 0, 0),
         cutlass.Int32(0),
+        (0, 0, 0),
         bool(stats_log2),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",

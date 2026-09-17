@@ -379,6 +379,28 @@ def test_dsl_sm100_d192_d128(dtype, is_causal):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("singleton", ["q", "kv"])
+@pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
+@torch_fork_set_rng(seed=61)
+def test_dsl_sm100_singleton_seq_bhsd_storage(singleton, d):
+    """S=1 operands in BHSD-contiguous storage: the transposed view is contiguous
+    (torch wildcards size-1 dims) but its seq stride is D, not H*D, so the batch
+    stride must come from the caller, never from S * seq_stride (PR #1099 review)."""
+    _require_dsl()
+    b, h, hk, s = 3, 4, 2, 128
+    dtype = torch.bfloat16
+    scale = 1.0 / math.sqrt(d)
+    s_q, s_kv = (1, s) if singleton == "q" else (s, 1)
+    q = torch.randn(b, h, s_q, d, device="cuda", dtype=dtype)
+    k = torch.randn(b, hk, s_kv, d, device="cuda", dtype=dtype)
+    v = torch.randn(b, hk, s_kv, d, device="cuda", dtype=dtype)
+    o, stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=False), return_stats=True)
+    o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)
@@ -840,39 +862,6 @@ def test_dsl_sm100_q_trim_rejects_non_cuda_lengths(monkeypatch, length_device):
 
 
 @pytest.mark.L0
-def test_thd_padded_lse_order_is_cutes_stride_order_for_every_compact_layout():
-    """The dynamic THD plan hands the kernel a COMPACT LSE fake in the caller's
-    dim order instead of explicit strides. CuTe's ``stride_order`` is per axis
-    (the rank of its stride), the inverse of "axes sorted by stride"; the two
-    agree only on self-inverse orders such as FlashInfer's (b, s_max, h), so
-    every one of the six (b, h, s_max) storage orders is checked against the
-    strides CuTe derives. A gapped layout has no compact order."""
-    _require_dsl()
-    from itertools import permutations
-    from types import SimpleNamespace
-
-    import cutlass
-    import cutlass.cute as cute
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
-
-    b, h, s = 2, 3, 5
-    shape = (b, h, s, 1)
-    for storage_order in permutations(range(3)):  # slowest axis first
-        st, acc = [0, 0, 0], 1
-        for ax in reversed(storage_order):
-            st[ax] = acc
-            acc *= shape[ax]
-        api = SimpleNamespace(_lse_stride=tuple(st), batch_size=b, h_q=h, s_q_max=s)
-        order = SdpaFwdDslSm100._thd_padded_lse_order(api)
-        assert order is not None, (storage_order, st)
-        fake = cute.runtime.make_fake_compact_tensor(cutlass.Float32, shape, stride_order=order, assumed_align=4)
-        got = tuple(fake.stride)
-        assert all(shape[i] == 1 or got[i] == st[i] for i in range(4)), f"storage order {storage_order}: declared {st}, order {order}, CuTe derived {got}"
-    gapped = SimpleNamespace(_lse_stride=(h * s * 2, s * 2, 2), batch_size=b, h_q=h, s_q_max=s)
-    assert SdpaFwdDslSm100._thd_padded_lse_order(gapped) is None
-
-
-@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout():
     """A padded Stats whose (b, h, s_max) storage order is (h, s_max, b) --
@@ -901,7 +890,6 @@ def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout():
     hsb = torch.full((h, s, b), float("nan"), dtype=torch.float32, device="cuda").permute(2, 0, 1)  # (b, h, s) view, strides (1, s*b, b)
     api = run(hsb)
     assert tuple(hsb.stride()) == (1, s * b, b)
-    assert SdpaFwdDslSm100._thd_padded_lse_order(api) == (1, 3, 2, 0)  # the axis list sorted by stride would be (3, 0, 2, 1)
     for i, n in enumerate(lens.tolist()):
         torch.testing.assert_close(hsb[i, :, :n], ref[i, :, :n], atol=0, rtol=0)
         assert torch.isneginf(hsb[i, :, n:]).all(), f"batch {i}: rows past the length are not -inf"
@@ -2031,7 +2019,8 @@ def test_dsl_sm100_thd_compile_key_plan_time_only():
     _run_and_check([64, 33])
     info_exec = api._k_mod.compile.cache_info()
     assert info_exec.misses == info_plan.misses, "a THD execute minted a new kernel compile (runtime data leaked into the compile key)"
-    assert info_exec.hits >= info_plan.hits + 2
+    # The plan-time artifact is launched directly: execute does not even re-key the cache.
+    assert info_exec.hits == info_plan.hits, "a THD execute re-derived its compile key per call"
 
 
 @pytest.mark.L0

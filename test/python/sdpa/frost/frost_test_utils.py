@@ -137,3 +137,197 @@ def make_dense_stats(batch: int, heads: int, sequence: int, layout: str):
         assert not stats.is_contiguous()
         return stats
     raise ValueError(f"unknown dense Stats layout {layout!r}")
+
+
+_CUTE_DTYPE = {
+    "torch.float16": "Float16",
+    "torch.bfloat16": "BFloat16",
+    "torch.float32": "Float32",
+    "torch.int32": "Int32",
+    "torch.int64": "Int64",
+    "torch.int8": "Int8",
+    "torch.float8_e4m3fn": "Float8E4M3FN",
+    "torch.float8_e5m2": "Float8E5M2",
+}
+
+
+def launch_f16(
+    fn,
+    q,
+    k,
+    v,
+    o,
+    lse,
+    sinks,
+    seq_kv,
+    o_desc,
+    problem_size,
+    scale_log2,
+    units,
+    seq_q_lens_addr,
+    *,
+    o_partial_f32=None,
+    block_table_tensor=None,
+    block_table_v_tensor=None,
+    page_size=0,
+    stream=None,
+    host=None,
+):
+    """Drive an EXPLICIT_ABI f16 prefill host from BSHD torch tensors: the same operand
+    list the old tensor entry took, translated to pointers plus (batch, seq, head) strides.
+    Dense (padded) only — THD goes through the adapter."""
+    import inspect
+
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+
+    gmem = cute.AddressSpace.gmem
+
+    def P(t, align=16):
+        return None if t is None else make_ptr(getattr(cutlass, _CUTE_DTYPE[str(t.dtype)]), t.data_ptr(), gmem, assumed_align=align)
+
+    paged = block_table_tensor is not None
+    b, h, kh, sq, skv, _ = problem_size
+    if paged:
+        skv, n_pages = block_table_tensor.shape[1] * page_size, k.shape[0]
+        k_st, v_st = (k.stride(0), k.stride(1), k.stride(2)), (v.stride(0), v.stride(1), v.stride(2))
+        t_st = (block_table_tensor.stride(0), block_table_tensor.stride(1))
+    else:
+        n_pages = 0
+        k_st, v_st = (k.stride(0), k.stride(1), k.stride(2)), (v.stride(0), v.stride(1), v.stride(2))
+        t_st = (0, 0)
+    kw = dict(
+        q_ptr=P(q),
+        k_ptr=P(k),
+        v_ptr=P(v),
+        o_ptr=P(o),
+        lse_ptr=P(lse, 4),
+        sinks_ptr=P(sinks),
+        meta_ptr=P(seq_kv),
+        o_desc_ptr=P(o_desc),
+        problem_size=(b, h, kh, sq, skv, 0),
+        q_strides=(q.stride(0), q.stride(1), q.stride(2)),
+        k_strides=k_st,
+        v_strides=v_st,
+        o_strides=(o.stride(0), o.stride(1), o.stride(2)),
+        lse_strides=tuple(lse.stride()) if lse is not None else (0, 0, 0),
+        lse_ext=0,
+        scale_softmax_log2=scale_log2,
+        n_thd_units=units,
+        seq_q_lens_addr=seq_q_lens_addr,
+        thd_q_lens_ptr=None,
+        thd_kv_lens_ptr=None,
+        thd_lens_form=None,
+        o_partial_ptr=P(o_partial_f32),
+        block_table_ptr=P(block_table_tensor, 4),
+        block_table_v_ptr=P(block_table_v_tensor, 4),
+        table_strides=t_st,
+        n_pages=n_pages,
+    )
+    params = set(inspect.signature(host if host is not None else fn).parameters)
+    fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)
+
+
+def launch_combine(cfn, o_partial, lse_partial, o_out, lse_out, amax_o, scale_o, problem_size, n_splits, stream=None):
+    """Drive the explicit split-combine host from torch tensors (same operand list the tensor entry took)."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+
+    gmem = cute.AddressSpace.gmem
+
+    def P(t, align=16):
+        return None if t is None else make_ptr(getattr(cutlass, _CUTE_DTYPE[str(t.dtype)]), t.data_ptr(), gmem, assumed_align=align)
+
+    cfn(
+        P(o_partial),
+        P(lse_partial),
+        P(o_out),
+        P(lse_out, 4),
+        P(amax_o, 4),
+        P(scale_o, 4),
+        problem_size,
+        n_splits,
+        tuple(lse_out.stride()) if lse_out is not None else (0, 0, 0),
+        stream=stream,
+    )
+
+
+def launch_quant(
+    fn,
+    *,
+    host=None,
+    q,
+    k,
+    v,
+    o,
+    lse,
+    sinks,
+    seq_kv,
+    o_desc,
+    problem_size,
+    scale_log2,
+    units,
+    seq_q_lens_addr=0,
+    o_partial_f32=None,
+    descales=None,
+    o_scale_fused=None,
+    sf=None,
+    amax_o=None,
+    stream=None,
+):
+    """Drive an explicit-ABI FP8 / MXFP8 prefill host from dense BSHD torch tensors, by parameter name.
+    ``descales`` = (descale_q, descale_k, descale_v, scale_o) for the per-tensor FP8 templates; ``sf`` = (sf_q, sf_k, sf_v)
+    ``[B, H, tiles, SF_SMEM]`` int8 for MXFP8."""
+    import inspect
+
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+
+    gmem = cute.AddressSpace.gmem
+
+    def P(t, align=16):
+        return None if t is None else make_ptr(getattr(cutlass, _CUTE_DTYPE[str(t.dtype)]), t.data_ptr(), gmem, assumed_align=align)
+
+    # the reloaded artifact exposes the host's parameter names; the in-process (*args, **kwargs) wrapper does not
+    params = set(inspect.signature(host if host is not None else fn).parameters)
+    kw = dict(
+        q_ptr=P(q),
+        k_ptr=P(k),
+        v_ptr=P(v),
+        o_ptr=P(o),
+        lse_ptr=P(lse, 4),
+        sinks_ptr=P(sinks),
+        meta_ptr=P(seq_kv),
+        o_desc_ptr=P(o_desc),
+        problem_size=problem_size,
+        q_strides=tuple(q.stride()[:3]),
+        k_strides=tuple(k.stride()[:3]),
+        v_strides=tuple(v.stride()[:3]),
+        o_strides=tuple(o.stride()[:3]),
+        lse_strides=tuple(lse.stride()) if lse is not None else (0, 0, 0),
+        lse_ext=0,
+        scale_softmax_log2=scale_log2,
+        n_thd_units=units,
+        seq_q_lens_addr=seq_q_lens_addr,
+    )
+    if "thd_q_lens_ptr" in params:
+        kw.update(thd_q_lens_ptr=None, thd_kv_lens_ptr=None, thd_lens_form=None)
+    if "o_partial_ptr" in params:
+        kw["o_partial_ptr"] = P(o_partial_f32)
+    if descales is not None:
+        dq, dk, dv, so = descales
+        kw.update(descale_q_ptr=P(dq, 4), descale_k_ptr=P(dk, 4), descale_v_ptr=P(dv, 4), scale_o_ptr=P(so, 4), o_scale_fused=o_scale_fused)
+    if sf is not None:
+        sfq, sfk, sfv = sf
+        kw.update(sf_q_ptr=P(sfq), sf_k_ptr=P(sfk), sf_v_ptr=P(sfv))
+        kw.update(
+            dict(q_sf_tiles=sfq.shape[2], kv_sf_tiles=sfk.shape[2])
+            if "q_sf_tiles" in params
+            else dict(total_q_sf_tiles=sfq.shape[2], total_kv_sf_tiles=sfk.shape[2])
+        )
+    if amax_o is not None:
+        kw["amax_o_ptr"] = P(amax_o, 4)
+    fn(**kw, stream=stream)

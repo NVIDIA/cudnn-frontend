@@ -807,7 +807,7 @@ def test_fp8_d256_gate_module_is_a_separate_specialization():
     for mod in (off, on):
         params = inspect.signature(mod.compile).parameters
         assert "has_amax" in params and params["has_amax"].default is True
-        assert "gate_stride" in params and params["gate_stride"].default is None
+        assert "gate_stride" not in params, "the gate is a module specialization; its strides are runtime host arguments"
         assert not hasattr(mod, "AMAX_O"), "Amax_O is a compile-time fact (has_amax), not a module knob"
     # The e4m3-O geometry must NOT leak into the gate's: with a 1-byte O the two
     # TMA walks differ (O: 2 subtiles of 128; bf16 G: 4 of 64).

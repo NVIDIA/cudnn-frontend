@@ -330,6 +330,8 @@ BMM2_N_BLOCK_BYTE_STRIDE = CFG.TILE_N * CFG.V_SWZ_BYTES
 
 
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
+    sdpa_gate_tensor,
+    sdpa_operand_tensors,
     D256Bars as Bars,
     KvLoopBounds,
     make_d256_bars,
@@ -2329,8 +2331,7 @@ def _correction_warp_group(
             if cutlass.const_expr(lse_tensor is not None):
                 if q_row_global < q_row_limit:
                     lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[batch_idx, head_idx, :]
-                    lse_row[q_row_global] = lse_val
+                    lse_arr[batch_idx, head_idx, q_row_global] = lse_val
 
         parity_last_rt = cutlass.Int32(0)
         if bounds.right > bounds.left:
@@ -2535,62 +2536,124 @@ def _correction_warp_group(
 
 @cute.jit
 def _host(
-    q_tensor: cute.Tensor,
-    k_tensor: cute.Tensor,
-    v_tensor: cute.Tensor,
-    o_tensor: cute.Tensor,
-    sf_q_tensor: cute.Tensor,
-    sf_k_tensor: cute.Tensor,
-    sf_v_tensor: cute.Tensor,
-    lse_tensor: Optional[cute.Tensor],
-    # FROST's MXFP8 ABI puts amax_o RIGHT AFTER lse (position 9).  None-specialized
-    # when compile(has_amax=False): the |o| fold and the atomicMax fold out under
-    # const_expr(amax_o_tensor is not None), the way a None lse_tensor folds the
-    # Stats store out.
-    amax_o_tensor: Optional[cute.Tensor],
-    sinks_tensor: cute.Tensor,
-    seq_kv_lens_tensor: cute.Tensor,
-    o_desc_words: cute.Tensor,
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    sf_q_ptr: cute.Pointer,
+    sf_k_ptr: cute.Pointer,
+    sf_v_ptr: cute.Pointer,
+    lse_ptr: Optional[cute.Pointer],
+    amax_o_ptr: Optional[cute.Pointer],
+    sinks_ptr: cute.Pointer,
+    meta_ptr: cute.Pointer,
+    o_desc_ptr: cute.Pointer,
     problem_size: Tuple[int, int, int, int, int, int],
+    q_strides: Tuple[int, int, int],
+    k_strides: Tuple[int, int, int],
+    v_strides: Tuple[int, int, int],
+    o_strides: Tuple[int, int, int],
+    lse_strides: Tuple[int, int, int],
+    lse_ext: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
-    # Dense padded-Q trim: separate (B,)-int32 per-batch Q lengths, passed
-    # POSITIONALLY by the adapter right here; None folds the parameter and
-    # every consumer out when the specialization is off.
-    seq_q_lens_addr: cutlass.Int64 = 0,
-    # Keyword-only in effect: FROST never passes these positionally (its SF
-    # extents are compile-time), and they are read only on the THD path, which
-    # this kernel declines.  They MUST sit after seq_q_lens_addr: the adapter
-    # passes seq_q_lens positionally for the d256 quantized ABI, so an SF total
-    # in that slot would swallow it.
-    total_q_sf_tiles: cutlass.Int32 = 0,
-    total_kv_sf_tiles: cutlass.Int32 = 0,
-    # FROST plans must run on the caller's stream (engine contract; there is a
-    # dedicated stream-respect test).  Threaded exactly as the shipped
-    # sm107/prefill_d128_fp8.py sibling does.
+    seq_q_lens_addr: cutlass.Int64,
+    total_q_sf_tiles: cutlass.Int32,
+    total_kv_sf_tiles: cutlass.Int32,
+    gate_ptr: Optional[cute.Pointer],
+    gate_strides: Tuple[int, int, int],
+    d_qk: cutlass.Constexpr[int],
+    d_v: cutlass.Constexpr[int],
+    lse_kind: cutlass.Constexpr[str],
     stream: _cuda_driver.CUstream = None,
-    # == EPILOGUE_FUSION_SEAM(host_desc) ==
-    # Epilogue gate, APPENDED LAST so no existing positional moves (the adapter
-    # passes stream= by keyword and seq_q_lens_addr positionally, and the SF
-    # totals by keyword, so after `stream` + keyword-only is the one safe slot).
-    # bf16 [B, S, H_q, D_v] (compact or at the caller's DECLARED strides),
-    # TMA-staged once per tile.  Presence must match CFG.EPILOGUE_GATE (guarded
-    # below); None at gate-off.
-    gate_tensor: Optional[cute.Tensor] = None,
 ) -> None:
-    """MXFP8 host launcher — builds TMA descriptors for Q/K/V/O + SF tensors.
+    """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
 
-    THD/varlen: q/k/v/o/lse/SF are PACKED with batch dim 1; the SF descriptors use
-    B=1 + total_*_sf_tiles (per-sequence-TILE-padded SF layout); O uses a per-batch
-    descriptor array (build_thd_meta_o_descs_kernel)."""
+    Operands are ``[B, S, H, D]`` with the head dim innermost; ``*_strides`` carry the
+    (seq, head) element strides. ``problem_size`` = (B, QH, KH, SQ, SKV, 0); under THD
+    SQ/SKV are the packed token totals. Dense batch strides are ``S * seq_stride``
+    (Int64); a packed THD operand has batch extent 1 and binds the seq stride there.
+    ``lse_kind``: "dense" (B, QH, SQ) in ``lse_strides``; "token" (SQ, QH) packed;
+    "head" (1, QH, lse_ext); "padded" (B, QH, lse_ext, 1) in ``lse_strides``. None
+    pointers compile their paths out."""
     B, QH, KH, SQ, SKV, _ = problem_size
-
+    (
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        lse_tensor,
+        sinks_tensor,
+        seq_kv_lens_tensor,
+        o_desc_words,
+        thd_q_lens_tensor,
+        thd_kv_lens_tensor,
+        o_partial_f32,
+        block_table_tensor,
+        block_table_v_tensor,
+    ) = sdpa_operand_tensors(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        lse_ptr,
+        sinks_ptr,
+        meta_ptr,
+        o_desc_ptr,
+        problem_size,
+        q_strides,
+        k_strides,
+        v_strides,
+        o_strides,
+        lse_strides,
+        lse_ext,
+        None,
+        None,
+        None,
+        None,
+        d_qk=d_qk,
+        d_v=d_v,
+        lse_kind=lse_kind,
+        thd=CFG.THD_VARLEN,
+        split_kv=SPLIT_KV,
+        tensor_map_qwords=_TENSOR_MAP_QWORDS,
+    )
+    amax_o_tensor = None if cutlass.const_expr(amax_o_ptr is None) else cute.make_tensor(amax_o_ptr, cute.make_layout((1,), stride=(1,)))
+    # MXFP8 scale factors: [B_sf, H, tiles, SF_SMEM] int8, compact; THD packs B_sf = 1 with the
+    # per-sequence-TILE-padded tile totals, dense uses ceil(S / TILE) tiles per batch row.
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        B_SF = 1
+    else:
+        B_SF = B
+    sf_q_tensor = cute.make_tensor(
+        sf_q_ptr,
+        cute.make_layout(
+            (B_SF, QH, total_q_sf_tiles, SF_SMEM_SIZE_Q),
+            stride=(cutlass.Int64(QH) * cutlass.Int64(total_q_sf_tiles * SF_SMEM_SIZE_Q), total_q_sf_tiles * SF_SMEM_SIZE_Q, SF_SMEM_SIZE_Q, 1),
+        ),
+    )
+    sf_k_tensor = cute.make_tensor(
+        sf_k_ptr,
+        cute.make_layout(
+            (B_SF, KH, total_kv_sf_tiles, SF_SMEM_SIZE_K),
+            stride=(cutlass.Int64(KH) * cutlass.Int64(total_kv_sf_tiles * SF_SMEM_SIZE_K), total_kv_sf_tiles * SF_SMEM_SIZE_K, SF_SMEM_SIZE_K, 1),
+        ),
+    )
+    sf_v_tensor = cute.make_tensor(
+        sf_v_ptr,
+        cute.make_layout(
+            (B_SF, KH, total_kv_sf_tiles, SF_SMEM_SIZE_V),
+            stride=(cutlass.Int64(KH) * cutlass.Int64(total_kv_sf_tiles * SF_SMEM_SIZE_V), total_kv_sf_tiles * SF_SMEM_SIZE_V, SF_SMEM_SIZE_V, 1),
+        ),
+    )
+    gate_tensor = sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides)
+    _require_gate_presence_matches_cfg(gate_tensor)
+    stride_order = (3, 2, 1, 0)
     _O_GRANU_ELEMS = CFG.O_SWZ_BYTES // CFG.BPE_O
     qk_box_q = (1, CFG.TILE_M, 1, TMA_QK_GRANU_ELEMS)
     qk_box_k = (1, CFG.TILE_N // CFG.CTA_MMA, 1, TMA_QK_GRANU_ELEMS)
     vo_box_v = (1, CFG.TILE_N, 1, TMA_VO_GRANU_ELEMS)
     vo_box_o = (1, CFG.TILE_M, 1, _O_GRANU_ELEMS)
-    stride_order = (3, 2, 1, 0)
 
     SF_TMA_ROW_BYTES = 128
     SF_NUM_ROWS_Q = SF_SMEM_SIZE_Q // SF_TMA_ROW_BYTES
@@ -2786,220 +2849,70 @@ def _host(
     )
 
 
+EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument list itself
+LSE_KINDS = ("dense", "token", "head", "padded")
+
+
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001
-    b: int = 1,
-    qh: int = 1,
-    kh: int = 1,
-    sq: int = 256,
-    skv: int = 128,
-    total_q_sf_tiles: int = 0,
-    total_kv_sf_tiles: int = 0,
     d_qk: int = CFG.TILE_K,
     d_v: int = CFG.TILE_O,
     has_lse: bool = True,
-    lse_stride: Optional[tuple] = None,
-    # == EPILOGUE_FUSION_SEAM(compile) ==
-    # APPEND-ONLY.  gate_stride: the DECLARED BSHD stride of the bf16 gate
-    # tensor (D innermost-contiguous, seq/head strides 16-byte multiples); None
-    # = COMPACT bf16 [B, S, H_q, D_v] -- never "O's stride".  Only legal on an
-    # EPILOGUE_GATE module (the gate fake is built iff CFG.EPILOGUE_GATE; a
-    # stride on an ungated module raises).  has_amax: True = the legacy Amax_O
-    # output slot; False None-specializes amax_o_tensor and folds the fold +
-    # atomic out.  Both are part of the compile key (_template_key hashes locals()).
-    gate_stride: Optional[tuple] = None,
+    lse_kind: str = "dense",
     has_amax: bool = True,
 ) -> Callable:
-    """Compile a kernel with concrete dims.
-
-    THD/varlen: q/k/v/o/lse + SF tensors are PACKED with batch dim 1; ``b`` is the
-    LOGICAL batch (sequence count).  The SF tensors are per-sequence-TILE-padded so
-    their packed tile extent is ``total_q_sf_tiles`` / ``total_kv_sf_tiles`` (=
-    Σ_b ceil(S/TILE)); pass those (they vary with the cu_seqlens partition, hence
-    part of the lru_cache key).  Default 0 → fall back to the dense per-batch tile
-    counts so the dense path is unaffected."""
-    # THD/varlen is NOT ported for this kernel yet.  The setup-kernel call site
-    # below still speaks the pre-upstream 7-arg contract, while FROST's
-    # thd_helpers.build_thd_meta_o_descs_kernel takes 14 args and a different
-    # metadata layout (4B+4 with batch_remap + a claim counter, vs the 3B+2
-    # here), and the scheduler decode differs to match.  Raise here rather than
-    # let it fail as an arity error deep in the trace -- and so no engine row
-    # can advertise thd=True for this kernel and appear to work.  The dense
-    # path is unaffected: CFG.THD_VARLEN is 0 and every THD branch folds out.
+    """Compile the host entry for one layout kind: every extent and stride is a runtime
+    argument of the artifact (see ``_host``), so the key is only what specializes the
+    traced code — the head-dim envelope where the template has one, whether the LSE
+    store exists, the Stats layout kind, and the template's own constexpr flags."""
     _cache_key = _template_key(globals(), locals(), "compile")
-    if CFG.THD_VARLEN:
-        raise NotImplementedError(f"{__name__}: THD/varlen not ported to the FROST setup-kernel contract")
-    # ---- FROST adapter ABI ------------------------------------------------
-    # lower_dsl_prefill calls EVERY kernel with the full forward signature.
-    # This body carries only what the port brought over, so anything
-    # it cannot honor RAISES rather than being silently ignored: a raise here
-    # means the engine's Capabilities row is lying, which is the failure we
-    # want loud.  (Capabilities: lse_optional=False, no strided Stats.)
-    if lse_stride is not None:
-        raise NotImplementedError(f"{__name__}: strided Stats not ported (contiguous [B, H, S] only)")
-    if d_qk > CFG.TILE_K or d_v > CFG.TILE_O or d_qk <= 0 or d_v <= 0:
-        raise ValueError(f"{__name__}: envelope is 0 < d_qk <= {CFG.TILE_K}, 0 < d_v <= {CFG.TILE_O}; " f"got ({d_qk}, {d_v})")
-    _fake_batch = 1 if CFG.THD_VARLEN else b
+    if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
+        raise ValueError(f"envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
+    if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
+        raise ValueError(f"envelope: d_qk*BPE and d_v*BPE must be 16-byte multiples (TMA global-stride rule); got ({d_qk}, {d_v})")
+    if lse_kind not in LSE_KINDS:
+        raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
+    if has_lse and (lse_kind == "dense") == bool(CFG.THD_VARLEN):
+        raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
+    gmem = cute.AddressSpace.gmem
 
-    # Q SF tiles TILE_M-row wide → num_tiles = SQ/TILE_M; K/V SF TILE_N-row wide → num_tiles = SKV/TILE_N.
-    # THD: packed (batch dim 1) + per-sequence-TILE-padded → total_*_sf_tiles tiles.
-    sq_tiles = (sq + CFG.TILE_M - 1) // CFG.TILE_M
-    skv_tiles = (skv + CFG.TILE_N - 1) // CFG.TILE_N
-    if CFG.THD_VARLEN:
-        _q_sf_tiles = total_q_sf_tiles if total_q_sf_tiles > 0 else b * sq_tiles
-        _kv_sf_tiles = total_kv_sf_tiles if total_kv_sf_tiles > 0 else b * skv_tiles
-    else:
-        _q_sf_tiles = sq_tiles
-        _kv_sf_tiles = skv_tiles
+    def P(dtype, align=16):
+        return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=align)  # fake: type only
 
-    fake_q = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (_fake_batch, sq, qh, d_qk),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_k = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (_fake_batch, skv, kh, d_qk),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_v = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (_fake_batch, skv, kh, d_v),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_o = cute.runtime.make_fake_compact_tensor(
-        OUT_STORAGE_DTYPE,
-        (_fake_batch, sq, qh, d_v),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-
-    # Epilogue gate: the gate fake is ALWAYS bf16 at the gate's own BPE -- never
-    # O's dtype/strides -- and exists iff the module was loaded with
-    # TemplateParams.epilogue_gate (CFG.EPILOGUE_GATE).  None = compact; a
-    # declared stride obeys the TMA global-stride rules (the head dim
-    # innermost-contiguous, seq/head strides 16-byte multiples at GATE_BPE),
-    # exactly the _fake_bshd contract of the f16/fp8 siblings.  Q/K/V/O stay
-    # compact fakes on this kernel (no declared-stride path here).
-    if gate_stride is not None and not CFG.EPILOGUE_GATE:
-        raise ValueError(
-            f"{__name__}: gate_stride given but this module was loaded with epilogue_gate=False (CFG.EPILOGUE_GATE=0); load it with TemplateParams(epilogue_gate=True)"
-        )
-
-    def _fake_gate_bshd(shape, stride):
-        if stride is None:
-            return cute.runtime.make_fake_compact_tensor(GATE_STORAGE_DTYPE, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
-        if stride[3] != 1:
-            raise ValueError(f"declared gate stride {stride}: the head dim must be innermost-contiguous (stride[3] == 1)")
-        for axis in (1, 2):
-            if (stride[axis] * CFG.GATE_BPE) % 16 != 0:
-                raise ValueError(f"declared gate stride {stride} axis {axis} must be a 16-byte multiple at GATE_BPE={CFG.GATE_BPE} (TMA global-stride rule)")
-        return cute.runtime.make_fake_tensor(GATE_STORAGE_DTYPE, shape, tuple(stride), assumed_align=16)
-
-    fake_gate = _fake_gate_bshd((_fake_batch, sq, qh, d_v), gate_stride) if CFG.EPILOGUE_GATE else None
-
-    fake_sf_q = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8,
-        (_fake_batch, qh, _q_sf_tiles, SF_SMEM_SIZE_Q),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_sf_k = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8,
-        (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_K),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_sf_v = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8,
-        (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_V),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-
-    # has_lse=False (no Stats output): the LSE argument is None-specialized and
-    # the store is compiled out entirely -- no dummy buffer exists at any level,
-    # which is what lets the dense graph report get_workspace_size() == 0.
-    # Mirrors the shipped sm107/prefill_d128_fp8.py.
-    fake_lse = (
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (_fake_batch, qh, sq),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
-        if has_lse
-        else None
-    )
-    fake_sinks = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (qh,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
-    # has_amax=False (no Amax_O output): the amax argument is None-specialized
-    # and the |o| fold + atomicMax compile out -- no dummy buffer at any level,
-    # exactly the has_lse=False shape above.  None is legal in the positional
-    # slot (the lse_tensor precedent).
-    fake_amax_o = (
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (1,),
-            stride_order=(0,),
-            assumed_align=16,
-        )
-        if has_amax
-        else None
-    )
-    # seq_kv_lens always part of the ABI; THD overloads it as the
-    # [seq_kv_lens(B)|cu_q(B+1)|cu_k(B+1)] metadata buffer (length 3B+2).
-    _skv_len = (3 * b + 2) if CFG.THD_VARLEN else b
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (_skv_len,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
-    # Per-batch O TMA-descriptor array (TENSOR_MAP_QWORDS int64 = 128 B each) + 1
-    # pad slot; dummy 1-elem when THD off (kernel never reads it).
-    _odesc_len = (b * _TENSOR_MAP_QWORDS + _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1
-    fake_o_desc = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int64,
-        (_odesc_len,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
-    fake_seq_q_lens = cutlass.Int64(0)  # device address of the (B,) int32 Q lengths; 0 (unread) when the flag is off
-
+    i32 = cutlass.Int32(0)
+    thd = bool(CFG.THD_VARLEN)
     return _compile_cached(
         _host,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_sf_q,
-        fake_sf_k,
-        fake_sf_v,
-        fake_lse,
-        fake_amax_o,
-        fake_sinks,
-        fake_seq_kv_lens,
-        fake_o_desc,
-        (b, qh, kh, sq, skv, 0),
+        P(STORAGE_DTYPE),
+        P(STORAGE_DTYPE),
+        P(STORAGE_DTYPE),
+        P(OUT_STORAGE_DTYPE),
+        P(cutlass.Int8),
+        P(cutlass.Int8),
+        P(cutlass.Int8),
+        P(cutlass.Float32, 4) if has_lse else None,
+        P(cutlass.Float32, 4) if has_amax else None,
+        P(cutlass.Float32),
+        P(cutlass.Int32),
+        P(cutlass.Int64),
+        (0, 0, 0, 0, 0, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+        i32,
         cutlass.Float32(0.0),
-        cutlass.Int32(0),
-        fake_seq_q_lens,
-        # BY KEYWORD, not position: the SF totals sit AFTER seq_q_lens_addr in
-        # _host's signature (the adapter fills that slot positionally on the
-        # quantized ABI); passed positionally they would land in the Q-length slot.
-        total_q_sf_tiles=cutlass.Int32(_q_sf_tiles),
-        total_kv_sf_tiles=cutlass.Int32(_kv_sf_tiles),
+        i32,
+        cutlass.Int64(0),
+        i32,
+        i32,
+        P(GATE_STORAGE_DTYPE) if CFG.EPILOGUE_GATE else None,
+        (0, 0, 0),
+        d_qk,
+        d_v,
+        lse_kind,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        # KEYWORD: gate_tensor is the LAST _host parameter, after `stream`.
-        gate_tensor=fake_gate,
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd",
@@ -3011,17 +2924,13 @@ def _main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--b", type=int, default=1)
-    parser.add_argument("--hq", type=int, default=1)
-    parser.add_argument("--hk", type=int, default=1)
-    parser.add_argument("--sq", type=int, default=256)
-    parser.add_argument("--skv", type=int, default=128)
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--iters", type=int, default=0)
     args = parser.parse_args()
 
-    print(f"[d256_mxfp8] compile b={args.b} qh={args.hq} kh={args.hk} " f"sq={args.sq} skv={args.skv}", flush=True)
-    fn = compile(args.b, args.hq, args.hk, args.sq, args.skv)
+    lse_kind = "token" if CFG.THD_VARLEN else "dense"
+    print(f"[d256_mxfp8] compile lse_kind={lse_kind}", flush=True)
+    fn = compile(lse_kind=lse_kind)
     print(f"[d256_mxfp8] compile OK: {fn}", flush=True)
     if args.validate:
         print("[d256_mxfp8] --validate: see tests/run_python_sweep.py")
