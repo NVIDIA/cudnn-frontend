@@ -38,6 +38,7 @@ from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
+from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -534,16 +535,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # No gate on the O dtype: the partials are never narrower than it,
             # and the combine performs the only cast down to it.
             if capabilities.split_d_shapes is not None and not any(facts.d_qk <= sq and facts.d_v <= sv for sq, sv in capabilities.split_d_shapes):
-                return (
-                    f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel " f"flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
-                )
+                return f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:
             # _selected_d_shape, not the raw dims: the FP8 rows carry
             # d_pad_multiple=16, so an inexact graph (D=112) lowers onto the
             # smallest covering NATIVE flavor (d128) -- which is the kernel
             # whose PackGQA wiring the set is describing.
             if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
-                return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel " f"flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+                return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa:
             if facts.thd:
                 return "PackGQA is currently not supported for THD/ragged graphs"
@@ -583,16 +582,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         m = capabilities.d_pad_multiple
         if m > 1 and (facts.d_qk % m != 0 or facts.d_v % m != 0):
             return (
-                f"envelope zero-padding requires D_QK/D_V multiples of {m} (TMA 16-byte "
-                f"global-stride constraint); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+                f"envelope zero-padding requires D_QK/D_V multiples of {m} (TMA 16-byte global-stride constraint); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
             )
     elif not capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
         return f"serves exact native shapes {shapes} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
-        return (
-            f"THD (ragged) rides the packed native-tile leg on this engine "
-            f"(shapes {sorted(capabilities.thd_d_shapes)}); the head-dim envelope is dense-only"
-        )
+        return f"THD (ragged) rides the packed native-tile leg on this engine (shapes {sorted(capabilities.thd_d_shapes)}); the head-dim envelope is dense-only"
     if facts.s_q == 1 and not capabilities.decode:
         return "s_q == 1 (decode) is out of scope for the SM80 prefill kernels"
     if facts.dtype not in capabilities.dtypes:
@@ -775,8 +770,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return f"stats must be (B, H_q, S_q, 1) = {expected_dim}; got {stats_dim}"
         if not ga.dense_layout_ok(stats_dim, stats_stride):
             return (
-                "stats must use a dense-compatible B/H/S permutation or padded layout "
-                f"with non-broadcast, non-overlapping-by-span strides; got {stats_stride}"
+                f"stats must use a dense-compatible B/H/S permutation or padded layout with non-broadcast, non-overlapping-by-span strides; got {stats_stride}"
             )
 
     if capabilities.single_wave_only:
@@ -1874,14 +1868,10 @@ def engine_name(
 def _sm120_fp8_spec() -> EngineSpec:
     """SM120 per-tensor FP8 engine (E4M3/E5M2 in + scalar descales, FP16/BF16/FP8 out).
 
-    P quantization follows the backend's FORT ordering: the softmax denominator
-    reads the unscaled result, then Scale_S multiplies P, then the fp8 cast,
-    with Descale_S folded into o_scale_fused. (cuDNN's Scale_S/Descale_S scale
-    the softmax OUTPUT, not the scores.) The SM100 FP8 row deliberately does
-    NOT do this: its lazy-rescale skip leaves P bounded by 2^RESCALE_THRESHOLD
-    rather than 1, so e4m3's range above 1.0 is already spent and a caller
-    Scale_S would saturate it. It honours a reciprocal pair analytically
-    instead and declines anything else.
+    P quantization is stateless: a baked 2^4 cast bias preserves fp8 precision
+    and is canceled in the epilogue. Graph Scale_S/Descale_S operands are
+    accepted and ignored; they do not change the mathematical attention gain.
+    Q/K/V descales and Scale_O remain runtime device scalars.
 
     Same mma.sync architecture as the f16 SM120 cell with the MMA lowered to
     m16n8k32 e4m3; ``descale_q*descale_k`` folds into the softmax scale and
@@ -1890,14 +1880,19 @@ def _sm120_fp8_spec() -> EngineSpec:
     graphs that declare one). E4M3/E5M2 QKV supported; O may
     be FP16, BF16, or FP8 (either flavor — a direct quantizing store applies
     ``scale_o`` before the cast, and Amax_O stays the pre-cast fp32 amax).
-    Head TILES any multiple of 32 up to 256 with the QK^T and P@V sides
+    General head TILES are multiples of 32 up to 256 with the QK^T and P@V sides
     independent; actual head dims may be any multiple of 16 up to the tile
     (TMA 16-byte global-stride rule at 1 byte/elem) via TMA zero-padding.
+    The D512 flavor serves both head dimensions independently in (256, 512],
+    in multiples of 16, with a 64x64 CTA tile. Both templates address
+    declared BSHD strides natively (THD views of kv-interleaved records
+    included, like the f16 row); the dense path normalizes non-BSHD orders
+    to compact storage.
     Attention sinks fold into the softmax denominator: the sink is a virtual
     column with no V row — it rescales O and enters the LSE. THD (ragged) is
     served with token- or head-major Stats.
     """
-    from cudnn.sdpa.fwd.config_sm120 import SUPPORTED_HEAD_TILES_FP8
+    from cudnn.sdpa.fwd.config_sm120 import GENERAL_HEAD_TILE_MAX, FP8_GENERAL_HEAD_TILES
 
     return EngineSpec(
         name="sdpa_fwd_prefill_sm120_fp8",
@@ -1905,7 +1900,8 @@ def _sm120_fp8_spec() -> EngineSpec:
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
             phase="prefill",
-            d_shapes=frozenset((tq, tv) for tq in SUPPORTED_HEAD_TILES_FP8 for tv in SUPPORTED_HEAD_TILES_FP8),
+            d_shapes=frozenset((tq, tv) for tq in FP8_GENERAL_HEAD_TILES for tv in FP8_GENERAL_HEAD_TILES) | {D512_FLAVOR},
+            d_envelope_floors=((D512_FLAVOR, GENERAL_HEAD_TILE_MAX),),
             d_pad_multiple=16,  # TMA 16-byte global-stride rule at 1 byte/elem
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
@@ -1922,10 +1918,6 @@ def _sm120_fp8_spec() -> EngineSpec:
             thd=True,
             padded_stats=True,
             skv_tile=0,
-            # dense_flex: any dense layout with the head dim
-            # innermost-contiguous is normalized to the kernel's compact BSHD
-            # by the shared adapter (one gather copy in, one scatter copy
-            # back for O; zero-copy when already BSHD-physical).
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             # The kernel's inline chunking (same shape as the f16 sibling) + the

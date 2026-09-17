@@ -685,22 +685,18 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
 
 
 def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
-    """An f16 sliding-window graph on the SM120 d512 flavor.
+    """A sliding-window graph on the SM120 d512 flavor.
 
     Two rules key on it. Pack the GQA group into the Q tile: a packed unit holds
     ``tile_m / G`` tokens, so its key span is that many tokens plus the window
     instead of ``tile_m`` plus the window, fewer K/V tiles through the L2->SMEM
     path and less masked-out MMA at the same DRAM bytes. And walk the units with
     plain LPT (see :func:`_sched_points`). Without a window the decode rule
-    alone decides the packing.
+    alone decides the packing. The FP8 flavor takes only the LPT walk: its
+    64-key tile covers a 64-token unit's window in as many tiles as a packed
+    one-token unit, so packing saves no MMA there (measured 8-11% slower).
     """
-    return (
-        caps.sm_lo >= 120
-        and caps.sm_hi < 130
-        and not facts.is_fp8
-        and facts.window_left is not None
-        and pick_flavor(facts.d_qk, facts.d_v, fp8=False) == D512_FLAVOR
-    )
+    return caps.sm_lo >= 120 and caps.sm_hi < 130 and facts.window_left is not None and pick_flavor(facts.d_qk, facts.d_v, fp8=facts.is_fp8) == D512_FLAVOR
 
 
 def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
@@ -737,7 +733,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
     ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
     if not _pack_gqa_eligible(caps, facts, tile_m):
         return (False,)
-    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)) or _sm120_d512_windowed(caps, facts):
+    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)) or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8):
         return (True, False)
     return (False, True)
 
