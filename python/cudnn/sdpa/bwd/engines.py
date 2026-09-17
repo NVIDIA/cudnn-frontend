@@ -146,8 +146,9 @@ class Capabilities:
     # half ``sdpa_backward`` (both False), block-scale MXFP8
     # ``sdpa_mxfp8_backward`` (is_mxfp8), or per-tensor FP8
     # ``sdpa_fp8_backward`` (is_fp8; no row yet). ``out_dtypes`` is the domain
-    # of the half-precision side of a quantized graph (o_f16 / dO_f16 / dQ /
-    # dK / dV share it); empty on half rows, where the io dtype IS ``dtypes``.
+    # of the half-precision outputs of a quantized graph (o_f16 / dQ / dK / dV
+    # share it); empty on half rows, where the io dtype IS ``dtypes``.  The
+    # leakage-safe dO_f16 input is an independent BF16 sidecar.
     is_mxfp8: bool = False
     is_fp8: bool = False
     out_dtypes: frozenset = frozenset()
@@ -281,9 +282,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         if not facts.uniform_dtype:
             return "the FP8 payloads (K/V/dO and the transposed copies) must share Q's dtype"
         if facts.dtype_o not in capabilities.out_dtypes:
-            return f"half-precision O/dO_f16/dQ/dK/dV dtype {facts.dtype_o} not in {sorted(str(d) for d in capabilities.out_dtypes)}"
+            return f"half-precision O/dQ/dK/dV dtype {facts.dtype_o} not in {sorted(str(d) for d in capabilities.out_dtypes)}"
         if not facts.uniform_out_dtype:
-            return "o_f16/dO_f16/dQ/dK/dV dtypes must match"
+            return "o_f16/dQ/dK/dV dtypes must match"
         if facts.has_amax_dgrad and not capabilities.amax_dgrad:
             return "graph requests amax_dQ/dK/dV outputs, which this engine does not produce"
     elif not facts.uniform_dtype:
@@ -297,7 +298,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
                 "non-broadcast, non-overlapping strides (any B/H/S order, padded strides allowed)"
             )
     elif not facts.bshd_layout:
-        ports = "Q/K/V/O/dO/dQ/dK/dV" + ("/q_T/k_T/dO_T/dO_f16" if facts.is_mxfp8 else "")
+        ports = "Q/K/V/O/dO/dQ/dK/dV" + ("/q_T/k_T/q_f16/k_f16/dO_T/dO_f16" if facts.is_mxfp8 else "")
         return f"{ports} must be BSHD-physical (stride order 3,1,2,0)"
 
     for fact, cap, label in (
@@ -908,10 +909,10 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
     """Lower the SM100 MXFP8 backward engine through ``SdpaBwdDslSm100Mxfp8``.
 
     A sibling of :func:`lower_dsl_bwd` rather than a branch inside it: the
-    MXFP8 node binds eleven more operands (the transposed-quantization
-    payloads, the half-precision dO, seven block-scale tensors), and threading
-    those through the half-precision adapters' keyword filter would have every
-    one of them declare slots it never reads.
+    MXFP8 node binds transposed-quantization payloads, three leakage-safe BF16
+    sidecars, and seven block-scale tensors. Threading those through the
+    half-precision adapters' keyword filter would make every one of them
+    declare slots it never reads.
     """
     import torch
 
@@ -947,6 +948,8 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         )
 
     fp8, half = facts.dtype, facts.dtype_o
+    if facts.q_f16_t is None or facts.k_f16_t is None:
+        raise ValueError("sdpa_bwd_sm100_mxfp8 leakage-safe gradients require q_f16 and k_f16 graph inputs")
     api = _adapter(api_type)(
         sample_q=_port_desc("q", fp8, facts.q_t),
         sample_k=_port_desc("k", fp8, facts.k_t),
@@ -959,8 +962,10 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         sample_dv=_port_desc("dV", half, facts.dv_t),
         sample_q_T=_port_desc("q_T", fp8, facts.q_T_t),
         sample_k_T=_port_desc("k_T", fp8, facts.k_T_t),
+        sample_q_f16=_port_desc("q_f16", cudnn.data_type.BFLOAT16, facts.q_f16_t),
+        sample_k_f16=_port_desc("k_f16", cudnn.data_type.BFLOAT16, facts.k_f16_t),
         sample_do_T=_port_desc("dO_T", fp8, facts.dO_T_t),
-        sample_do_f16=_port_desc("dO_f16", half, facts.dO_f16_t),
+        sample_do_f16=_port_desc("dO_f16", cudnn.data_type.BFLOAT16, facts.dO_f16_t),
         # E8M0 has no torch dtype on the lowering boundary; the descs carry the
         # byte view the adapter consumes.
         sample_sf_q=_desc(facts.sf_q_t, torch.int8, "sf_q"),
@@ -997,6 +1002,8 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         dv=facts.dv_t,
         q_T=facts.q_T_t,
         k_T=facts.k_T_t,
+        q_f16=facts.q_f16_t,
+        k_f16=facts.k_f16_t,
         dO_T=facts.dO_T_t,
         dO_f16=facts.dO_f16_t,
         sf_q=facts.sf_q_t,
@@ -1036,6 +1043,8 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
             dv_tensor=_view(r[id(binding.dv)], "dV"),
             q_T_tensor=_view(r[id(binding.q_T)], "q_T"),
             k_T_tensor=_view(r[id(binding.k_T)], "k_T"),
+            q_f16_tensor=_view(r[id(binding.q_f16)], "q_f16"),
+            k_f16_tensor=_view(r[id(binding.k_f16)], "k_f16"),
             do_T_tensor=_view(r[id(binding.dO_T)], "dO_T"),
             do_f16_tensor=_view(r[id(binding.dO_f16)], "dO_f16"),
             sf_q=r[id(binding.sf_q)],
@@ -1065,12 +1074,13 @@ def _sm100_mxfp8_spec() -> EngineSpec:
     ``api_dsl_mxfp8_sm100`` for the Rule-2 exception this is). Exact d=256 only
     -- the SF plumbing has no envelope story, as on the forward MXFP8 row.
 
-    Served: E4M3 payloads with fp16/bf16 half side, BSHD-physical layout, MHA /
+    Served: E4M3 payloads with fp16/bf16 outputs plus explicit BF16 Q/K/dO
+    sidecars, BSHD-physical layout, MHA /
     GQA / MQA, any fixed S_q / S_kv (tails are masked), dense and top-left
     causal, and ``deterministic`` (both kernels own their output tiles; nothing
-    accumulates through atomics). dS is always quantized with an in-kernel
-    per-block (online) E8M0 scale -- the upstream "fixed scale 1" mode is not
-    exposed. Declined: E5M2, bottom-right / band-widened / sliding-window
+    accumulates through atomics). All sequence-reduction contractions use
+    ordinary BF16 MMA to prevent masked values from affecting shared scales.
+    Declined: E5M2, bottom-right / band-widened / sliding-window
     masks, padding, THD, bias / dBias, sink / dSink, amax_dQ/dK/dV outputs,
     non-BSHD strides (the kernels derive their head/batch strides; no staging
     copies).

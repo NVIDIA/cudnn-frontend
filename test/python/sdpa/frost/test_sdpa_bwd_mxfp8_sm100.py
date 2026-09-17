@@ -35,11 +35,12 @@ pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 _ENGINE = "sdpa_bwd_sm100_mxfp8"
 _D = 256
 _BLOCK = 32
-# dQ/dK carry the online-quantized dS (one E4M3 rounding the reference models
-# too); dV rides a fixed 2^-8 P scale that matches the reference bit-for-bit
-# in practice. The gate is on the whole tensor, so it is deliberately looser
-# than the half-precision d512 row's.
-_TOL_COS = 0.9995
+# Every leakage-safe sequence contraction differs intentionally from the
+# legacy block-scaled MXFP8 reference: dQ/dK consume BF16 dS, and dV consumes
+# BF16 P and dO.  The identity-scale test below is the direct oracle for those
+# contractions; this remains a high-similarity quality guard against the old
+# quantized reference.
+_TOL_COS = 0.999
 _OUT = {"bf16": torch.bfloat16, "fp16": torch.float16}
 _OUT_CUDNN = {torch.bfloat16: cudnn.data_type.BFLOAT16, torch.float16: cudnn.data_type.HALF}
 
@@ -96,6 +97,8 @@ def _build_graph(
     scale=None,
     fp8=cudnn.data_type.FP8_E4M3,
     grad_dt=None,
+    sidecar_dt=cudnn.data_type.BFLOAT16,
+    do_sidecar_dt=cudnn.data_type.BFLOAT16,
     stride_fn=_bshd_stride,
     declare_amax=False,
     with_sink=False,
@@ -111,8 +114,13 @@ def _build_graph(
     t = {}
     for name, sh in (("q", shq), ("q_T", shq), ("k", shk), ("k_T", shk), ("v", shk), ("dO", shq), ("dO_T", shq)):
         t[name] = g.tensor(name=name, dim=list(sh), stride=stride_fn(sh), data_type=fp8)
-    for name in ("o_f16", "dO_f16"):
-        t[name] = g.tensor(name=name, dim=list(shq), stride=stride_fn(shq), data_type=io_half)
+    t["o_f16"] = g.tensor(name="o_f16", dim=list(shq), stride=stride_fn(shq), data_type=io_half)
+    t["dO_f16"] = g.tensor(name="dO_f16", dim=list(shq), stride=stride_fn(shq), data_type=do_sidecar_dt)
+    # These are independent BF16 sidecars, not reinterpretations of the FP8
+    # payloads. They keep the causal sequence-reduction BMMs out of the
+    # block-scaled path while the head-dimension BMMs retain MXFP8 operands.
+    t["q_f16"] = g.tensor(name="q_f16", dim=list(shq), stride=stride_fn(shq), data_type=sidecar_dt)
+    t["k_f16"] = g.tensor(name="k_f16", dim=list(shk), stride=stride_fn(shk), data_type=sidecar_dt)
     t["stats"] = g.tensor(name="stats", dim=[b, hq, sq, 1], stride=[hq * sq, sq, 1, 1], data_type=cudnn.data_type.FLOAT)
     q_row, q_col = _sf_dims(b, hq, sq, d)
     k_row, k_col = _sf_dims(b, hkv, skv, d)
@@ -148,8 +156,10 @@ def _build_graph(
         name="bwd",
         q=t["q"],
         q_T=t["q_T"],
+        q_f16=t["q_f16"],
         k=t["k"],
         k_T=t["k_T"],
+        k_f16=t["k_f16"],
         v=t["v"],
         o_f16=t["o_f16"],
         dO_f16=t["dO_f16"],
@@ -190,7 +200,19 @@ def _plan_index(g, name=_ENGINE):
 
 
 def _run(
-    b=1, hq=2, hkv=None, sq=256, skv=256, out_dt=torch.bfloat16, causal=False, omit_scale=False, tol_cos=_TOL_COS, seed=0, repeat_outputs=0, **sdpa_kwargs
+    b=1,
+    hq=2,
+    hkv=None,
+    sq=256,
+    skv=256,
+    out_dt=torch.bfloat16,
+    causal=False,
+    omit_scale=False,
+    tol_cos=_TOL_COS,
+    seed=0,
+    repeat_outputs=0,
+    leakage_probes=(),
+    **sdpa_kwargs,
 ):
     """Quantize random operands, build the graph, pin the engine, execute, and
     compare dQ/dK/dV against the MXFP8 backward reference."""
@@ -210,7 +232,7 @@ def _run(
         Q["row"], K["row"], V["col"], Q["sf_row_ref"], K["sf_row_ref"], V["sf_col_ref"], scale, output_type=out_dt, right_bound=right, diag_align=align
     )
     o_f16 = _to_bshd(o_ref.to(out_dt))
-    dO_f16 = _to_bshd(dO.to(out_dt))
+    dO_f16 = _to_bshd(dO.to(torch.bfloat16))
     dq_r, dk_r, dv_r = compute_ref_backward(
         Q["row"],
         Q["col"],
@@ -251,8 +273,10 @@ def _run(
     pack = {
         t["q"]: Q["row"],
         t["q_T"]: Q["col"],
+        t["q_f16"]: _to_bshd(q.to(torch.bfloat16)),
         t["k"]: K["row"],
         t["k_T"]: K["col"],
+        t["k_f16"]: _to_bshd(k.to(torch.bfloat16)),
         t["v"]: V["row"],
         t["o_f16"]: o_f16,
         t["dO_f16"]: dO_f16,
@@ -275,7 +299,34 @@ def _run(
     for name, got, ref in (("dQ", dq, dq_r), ("dK", dk, dk_r), ("dV", dv, dv_r)):
         assert not torch.isnan(got).any(), f"{name} has NaN"
         cos = torch.nn.functional.cosine_similarity(got.float().flatten(), ref.flatten(), dim=0).item()
-        assert cos > tol_cos, f"{name}: cos={cos:.6f}"
+        assert cos > tol_cos, f"{name}: cos={cos:.6f}, threshold={tol_cos:.6f}"
+
+    if leakage_probes:
+        # Hold every FP8 payload, scale tensor, statistic and other BF16
+        # sidecar fixed.  Perturb only values that the causal mask excludes
+        # from the selected output region.  A block-scaled sequence-reduction
+        # BMM leaks through its shared E8M0 scale here; an ordinary BF16 BMM
+        # leaves the region bitwise unchanged.
+        cut = min(sq, skv) // 2
+        grads = {"dQ": dq, "dK": dk, "dV": dv}
+        baseline = {name: value.clone() for name, value in grads.items()}
+        for operand, grad_name in leakage_probes:
+            if operand == "k_f16":
+                target = pack[t[operand]][:, :, cut:, :]
+                region = (slice(None), slice(None), slice(None, cut), slice(None))
+            else:
+                target = pack[t[operand]][:, :, :cut, :]
+                region = (slice(None), slice(None), slice(cut, None), slice(None))
+            original = target.clone()
+            target.add_(torch.randn_like(target) * 1024)
+            for x in grads.values():
+                x.zero_()
+            g.execute(pack, ws)
+            torch.cuda.synchronize()
+            got = grads[grad_name][region]
+            expected = baseline[grad_name][region]
+            torch.testing.assert_close(got.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0)
+            target.copy_(original)
 
     if repeat_outputs:
         grads = (dq, dk, dv)
@@ -302,6 +353,195 @@ def _run(
                     torch.testing.assert_close(tail, torch.zeros_like(tail), rtol=0, atol=0)
 
 
+def _run_leakage_only(b=1, hq=8, hkv=1, sq=128, skv=128, seed=0):
+    """Exercise the Qwen-shaped causal sidecars without the test quantizer.
+
+    Identity E8M0 scales make their physical F8_128x4 ordering immaterial.
+    Zero Q/K scores and bounded V/dO payloads keep the backward finite and
+    nontrivial, while independent BF16 sidecars isolate the three sequence
+    reductions whose masked rows must not affect the selected gradients.
+    """
+    torch.manual_seed(seed)
+    d, dev, out_dt = _D, "cuda", torch.bfloat16
+    scale = 1.0 / math.sqrt(d)
+    shq, shk = (b, hq, sq, d), (b, hkv, skv, d)
+
+    def fp8_zeros(shape):
+        return _to_bshd(torch.zeros(shape, device=dev, dtype=torch.float8_e4m3fn))
+
+    def fp8_bounded(shape):
+        values = torch.randint(-2, 3, shape, device=dev, dtype=torch.int8)
+        return _to_bshd(values.to(torch.float8_e4m3fn))
+
+    def bf16_random(shape):
+        return _to_bshd(torch.randn(shape, device=dev, dtype=torch.bfloat16))
+
+    g, t, (dq_t, dk_t, dv_t, *_amax) = _build_graph(b, hq, hkv, sq, skv, d, out_dt=out_dt, scale=scale, use_causal_mask=True)
+    g.create_execution_plans([cudnn.heur_mode.A])
+    idx = _plan_index(g)
+    assert idx is not None, f"{_ENGINE} not offered; plans = {[g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]}"
+    g.select_plan(idx)
+    g.check_support()
+    g.build_plans()
+
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    dq = _to_bshd(torch.zeros(shq, device=dev, dtype=out_dt))
+    dk = _to_bshd(torch.zeros(shk, device=dev, dtype=out_dt))
+    dv = _to_bshd(torch.zeros(shk, device=dev, dtype=out_dt))
+    q_row, q_col = _sf_dims(b, hq, sq, d)
+    k_row, k_col = _sf_dims(b, hkv, skv, d)
+
+    # E8M0 1.0 is encoded as 0x7f. Uniform values are valid in every
+    # logical/reordered position, so these buffers need no quantizer or
+    # swizzle kernel.
+    def identity_sf(shape):
+        return torch.ones(shape, device=dev, dtype=torch.float8_e8m0fnu)
+
+    pack = {
+        t["q"]: fp8_zeros(shq),
+        t["q_T"]: fp8_zeros(shq),
+        t["q_f16"]: bf16_random(shq),
+        t["k"]: fp8_zeros(shk),
+        t["k_T"]: fp8_zeros(shk),
+        t["k_f16"]: bf16_random(shk),
+        t["v"]: fp8_bounded(shk),
+        t["o_f16"]: _to_bshd(torch.zeros(shq, device=dev, dtype=out_dt)),
+        t["dO_f16"]: bf16_random(shq),
+        t["dO"]: fp8_bounded(shq),
+        t["dO_T"]: fp8_bounded(shq),
+        t["stats"]: torch.zeros((b, hq, sq, 1), device=dev, dtype=torch.float32),
+        t["sf_q"]: identity_sf(q_row),
+        t["sf_q_T"]: identity_sf(q_col),
+        t["sf_k"]: identity_sf(k_row),
+        t["sf_k_T"]: identity_sf(k_col),
+        t["sf_v"]: identity_sf(k_row),
+        t["sf_dO"]: identity_sf(q_row),
+        t["sf_dO_T"]: identity_sf(q_col),
+        dq_t: dq,
+        dk_t: dk,
+        dv_t: dv,
+    }
+
+    g.execute(pack, ws)
+    torch.cuda.synchronize()
+    grads = {"dQ": dq, "dK": dk, "dV": dv}
+    for name, value in grads.items():
+        assert torch.isfinite(value).all(), f"{name} has non-finite values"
+        assert torch.count_nonzero(value), f"{name} is trivial"
+    baseline = {name: value.clone() for name, value in grads.items()}
+
+    cut = min(sq, skv) // 2
+    for operand, grad_name in (("k_f16", "dQ"), ("q_f16", "dK"), ("dO_f16", "dV")):
+        if operand == "k_f16":
+            target = pack[t[operand]][:, :, cut:, :]
+            region = (slice(None), slice(None), slice(None, cut), slice(None))
+        else:
+            target = pack[t[operand]][:, :, :cut, :]
+            region = (slice(None), slice(None), slice(cut, None), slice(None))
+        original = target.clone()
+        target.add_(torch.randn_like(target) * 1024)
+        for value in grads.values():
+            value.zero_()
+        g.execute(pack, ws)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(grads[grad_name][region].view(torch.int16), baseline[grad_name][region].view(torch.int16), rtol=0, atol=0)
+        target.copy_(original)
+
+
+def _run_identity_scale_reference(b=1, hq=8, hkv=1, sq=128, skv=128, seed=17):
+    """Compare the hybrid backward to a direct identity-scale causal oracle.
+
+    Integer-valued payloads are represented exactly by E4M3, and every E8M0
+    byte is 0x7f (scale 1). This exercises the real graph and Qwen GQA head
+    reduction without compiling the test-only MXFP8 quantizer.
+    """
+    torch.manual_seed(seed)
+    d, dev, out_dt = _D, "cuda", torch.bfloat16
+    scale = 1.0 / math.sqrt(d)
+    shq, shk = (b, hq, sq, d), (b, hkv, skv, d)
+
+    def exact_payload(shape):
+        values = torch.randint(-1, 2, shape, device=dev, dtype=torch.int8).float()
+        return values, _to_bshd(values.to(torch.float8_e4m3fn))
+
+    q, q8 = exact_payload(shq)
+    k, k8 = exact_payload(shk)
+    v, v8 = exact_payload(shk)
+    do, do8 = exact_payload(shq)
+    q16, k16, do16 = (_to_bshd(x.to(torch.bfloat16)) for x in (q, k, do))
+
+    scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+    causal_mask = torch.arange(skv, device=dev)[None, :] > torch.arange(sq, device=dev)[:, None]
+    scores = scores.masked_fill(causal_mask, -torch.inf)
+    stats = torch.logsumexp(scores, dim=-1, keepdim=True)
+    probabilities = torch.exp(scores - stats)
+    o = torch.matmul(probabilities, v).to(out_dt)
+
+    # Match the hybrid kernel's operand precision: score and dP GEMMs consume
+    # exact identity-scaled E4M3 values; sequence reductions consume BF16 P,
+    # dS, Q, K, and dO. sum(O*dO) uses the supplied BF16 forward output.
+    dp = torch.matmul(do, v.transpose(-1, -2))
+    sum_odo = (o.float() * do16.float()).sum(dim=-1, keepdim=True)
+    ds16 = (probabilities * (dp - sum_odo)).to(torch.bfloat16).float()
+    p16 = probabilities.to(torch.bfloat16).float()
+    dq_ref = (torch.matmul(ds16, k16.float()) * scale).to(out_dt)
+    dk_ref = (torch.matmul(ds16.transpose(-1, -2), q16.float()) * scale).sum(dim=1, keepdim=True).to(out_dt)
+    dv_ref = torch.matmul(p16.transpose(-1, -2), do16.float()).sum(dim=1, keepdim=True).to(out_dt)
+
+    g, t, (dq_t, dk_t, dv_t, *_amax) = _build_graph(b, hq, hkv, sq, skv, d, out_dt=out_dt, scale=scale, use_causal_mask=True)
+    g.create_execution_plans([cudnn.heur_mode.A])
+    idx = _plan_index(g)
+    assert idx is not None, f"{_ENGINE} not offered; plans = {[g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]}"
+    g.select_plan(idx)
+    g.check_support()
+    g.build_plans()
+
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    dq = _to_bshd(torch.zeros(shq, device=dev, dtype=out_dt))
+    dk = _to_bshd(torch.zeros(shk, device=dev, dtype=out_dt))
+    dv = _to_bshd(torch.zeros(shk, device=dev, dtype=out_dt))
+    q_row, q_col = _sf_dims(b, hq, sq, d)
+    k_row, k_col = _sf_dims(b, hkv, skv, d)
+
+    def identity_sf(shape):
+        return torch.full(shape, 0x7F, device=dev, dtype=torch.uint8)
+
+    pack = {
+        t["q"]: q8,
+        t["q_T"]: q8,
+        t["q_f16"]: q16,
+        t["k"]: k8,
+        t["k_T"]: k8,
+        t["k_f16"]: k16,
+        t["v"]: v8,
+        t["o_f16"]: _to_bshd(o),
+        t["dO_f16"]: do16,
+        t["dO"]: do8,
+        t["dO_T"]: do8,
+        t["stats"]: stats,
+        t["sf_q"]: identity_sf(q_row),
+        t["sf_q_T"]: identity_sf(q_col),
+        t["sf_k"]: identity_sf(k_row),
+        t["sf_k_T"]: identity_sf(k_col),
+        t["sf_v"]: identity_sf(k_row),
+        t["sf_dO"]: identity_sf(q_row),
+        t["sf_dO_T"]: identity_sf(q_col),
+        dq_t: dq,
+        dk_t: dk,
+        dv_t: dv,
+    }
+    g.execute(pack, ws)
+    torch.cuda.synchronize()
+
+    for name, got, ref in (("dQ", dq, dq_ref), ("dK", dk, dk_ref), ("dV", dv, dv_ref)):
+        assert torch.isfinite(got).all(), f"{name} has non-finite values"
+        got_f, ref_f = got.float(), ref.float()
+        cosine = torch.nn.functional.cosine_similarity(got_f.flatten(), ref_f.flatten(), dim=0).item()
+        relative_l2 = ((got_f - ref_f).norm() / ref_f.norm()).item()
+        assert cosine > 0.999, f"{name}: cosine={cosine:.6f}"
+        assert relative_l2 < 0.03, f"{name}: relative_l2={relative_l2:.6f}"
+
+
 # --------------------------------------------------------------------------- #
 # ACCEPT -- every capability the row claims                                    #
 # --------------------------------------------------------------------------- #
@@ -322,6 +562,26 @@ def test_default_attn_scale():
 @pytest.mark.L0
 def test_causal():
     _run(causal=True)
+
+
+@pytest.mark.L0
+def test_causal_sequence_reductions_do_not_leak_masked_rows():
+    """Each sequence-reduction BMM ignores BF16 rows excluded by causality.
+
+    dQ's prefix excludes future K rows.  dK/dV's suffix excludes earlier Q/dO
+    rows.  Keeping the score-side FP8 operands and stats fixed isolates the
+    three contraction operands rather than changing the attention problem.
+    """
+    # Qwen-class grouped-query geometry: the same compiled graph is reused by
+    # all three probes while each test mutates only one BF16 sidecar. This path
+    # deliberately skips the much slower CuTe test quantizer/reference setup.
+    _run_leakage_only(hq=8, hkv=1, sq=128, skv=128)
+
+
+@pytest.mark.L0
+def test_causal_identity_scale_matches_torch_qwen_gqa():
+    """The hybrid BF16 sequence reductions match a direct causal reference."""
+    _run_identity_scale_reference(hq=8, hkv=1, sq=128, skv=128)
 
 
 @pytest.mark.L0
@@ -430,11 +690,11 @@ def test_workspace_accounts_for_repack_buffers():
     from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import SF_LAYOUT_SFA, SF_LAYOUT_SFB, repack_geometry
 
     l = b * hq
-    # 4 rowwise-A + 5 rowwise/columnwise-B + 2 columnwise-B buffers (see _sf_plan)
+    # Four SFA and four SFB rowwise buffers (see _sf_plan).  The BF16 dS@Q
+    # and P@dO contractions no longer need transposed MXFP8 scale repacks.
     sfa = repack_geometry(sq, _D // 32, l, SF_LAYOUT_SFA)[3]
     sfb = repack_geometry(sq, _D // 32, l, SF_LAYOUT_SFB)[3]
-    sfb_t = repack_geometry(_D, sq // 32, l, SF_LAYOUT_SFB)[3]
-    assert g.get_workspace_size() >= 4 * sfa + 4 * sfb + 3 * sfb_t
+    assert g.get_workspace_size() >= 4 * sfa + 4 * sfb
 
 
 # --------------------------------------------------------------------------- #
@@ -470,6 +730,46 @@ def test_accepts_the_claimed_dense_graph():
 
 
 @pytest.mark.L0
+def test_analyzer_tracks_leakage_safe_bf16_sidecars():
+    """Both sidecars are first-class bound operands with Q/K geometry."""
+    from cudnn.sdpa import graph_analyzer as ga
+
+    g, t, _outs = _build_graph(1, 2, 1, 256, 128, scale=1.0 / math.sqrt(_D))
+    facts = ga.analyze(g)
+    assert facts is not None and facts.invalid is None
+    assert facts.q_f16_t is t["q_f16"] and facts.k_f16_t is t["k_f16"]
+    ports = {name: (dim, stride) for name, dim, stride in facts.port_layouts}
+    assert ports["q_f16"] == (tuple(t["q"].get_dim()), tuple(t["q"].get_stride()))
+    assert ports["k_f16"] == (tuple(t["k"].get_dim()), tuple(t["k"].get_stride()))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("sidecar_dt", "do_sidecar_dt"),
+    (
+        (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16),
+        (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF),
+    ),
+)
+def test_analyzer_rejects_non_bf16_sidecars(sidecar_dt, do_sidecar_dt):
+    from cudnn.sdpa import graph_analyzer as ga
+
+    g, _t, _outs = _build_graph(
+        1,
+        2,
+        2,
+        128,
+        128,
+        scale=1.0 / math.sqrt(_D),
+        sidecar_dt=sidecar_dt,
+        do_sidecar_dt=do_sidecar_dt,
+    )
+    facts = ga.analyze(g)
+    assert facts is not None and facts.invalid is not None
+    assert "q_f16 / k_f16 / dO_f16 must be BF16" in facts.invalid
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [128, 192, 512])
 def test_reject_other_head_dims(d):
     """Exact d=256 only: the SF plumbing has no envelope story."""
@@ -483,7 +783,7 @@ def test_reject_e5m2_payloads():
 
 @pytest.mark.L0
 def test_reject_gradient_dtype_mismatch():
-    """o_f16/dO_f16/dQ/dK/dV share one half dtype; the kernels have one element type."""
+    """o_f16/dQ/dK/dV share one output dtype; dO_f16 is always a BF16 sidecar."""
     assert _decline_reason(out_dt=torch.bfloat16, grad_dt=torch.float16) is not None
 
 

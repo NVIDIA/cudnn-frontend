@@ -4,27 +4,27 @@
 """SM100 (Blackwell) d=256 block-scale MXFP8 backward adapter: SF repack -> dQ -> fused dK/dV.
 
 Two CuTe DSL kernels ported from Xinbo Zhao's ``fmha_mxfp8_large_head_dim``
-each a 2-CTA warp-specialized
-MMA pipeline over E4M3 payloads with 1x32 E8M0 block scales: the dQ kernel
-(Q.K^T, dO.V^T, dS.K) and a fused dK/dV kernel (Q.K^T, dO.V^T, dS^T.Q, P^T.dO).
-dS is quantized in-kernel with an online per-block E8M0 scale (the upstream
-kernels' "fixed scale 1" mode is deliberately not exposed: its accuracy depends
-on the dS magnitude); P is quantized with a fixed 2^-8 descale, cuDNN's MXFP8
-convention.
+each a 2-CTA warp-specialized hybrid pipeline: the dQ kernel (Q.K^T, dO.V^T,
+dS.K) and a fused dK/dV kernel (Q.K^T, dO.V^T, dS^T.Q, P^T.dO). Q.K^T and
+dO.V^T retain E4M3 payloads with 1x32 E8M0 block scales. Every contraction
+whose reduction axis is sequence length uses ordinary BF16 MMA, keeping
+masked values out of any scale consumed by an unmasked output.
 
 Operand contract (all logical BHSD over BSHD-physical storage; exactly the
 ``sdpa_mxfp8_backward`` port set): FP8 ``q/k/v/dO`` plus the
 transposed-quantization payloads ``q_T/k_T/dO_T`` (each contraction axis needs
 its own 1x32 quantization -- a transposed payload is NOT the transpose of the
-payload), half-precision ``o_f16/dO_f16``, fp32 ``stats`` (natural-log LSE),
-and seven F8_128x4 scale tensors. The gradients ``dQ/dK/dV`` are half precision
-(the ``o_f16`` dtype); ``amax_*`` outputs are not produced.
+payload), explicit BF16 ``q_f16/k_f16/dO_f16`` sidecars for the leakage-safe
+sequence reductions, half-precision ``o_f16``, fp32 ``stats``
+(natural-log LSE), and seven F8_128x4 scale tensors. The gradients
+``dQ/dK/dV`` are half precision (the ``o_f16`` dtype); ``amax_*`` outputs are
+not produced.
 
 Scale-factor layout: the kernels read scale factors through TMA in a 2-CTA
 slot layout the upstream quantizer emits, not cuDNN's canonical F8_128x4 --
 see ``kernels/bprop_sf_repack_mxfp8_sm100.py`` for the layouts and why a TMA
 descriptor cannot address the shifted copy. The seven graph SF tensors are
-therefore repacked (eleven small launches, one per kernel operand form) into
+therefore repacked (eight small launches, one per kernel operand form) into
 workspace ahead of the two kernels. This is a documented, deliberate exception
 to Hard Rule 2 (python/cudnn/AGENTS.md) taken to ship the kernels as validated
 upstream; it costs ~1-2% of the backward (SF bytes are 1/32 of the payload)
@@ -78,8 +78,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         *,
         sample_q_T,
         sample_k_T,
+        sample_q_f16,
         sample_do_T,
         sample_do_f16,
+        sample_k_f16,
         sample_sf_q,
         sample_sf_q_T,
         sample_sf_k,
@@ -95,8 +97,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         self._mxfp8_samples = dict(
             q_T=sample_q_T,
             k_T=sample_k_T,
+            q_f16=sample_q_f16,
             dO_T=sample_do_T,
             dO_f16=sample_do_f16,
+            k_f16=sample_k_f16,
             sf_q=sample_sf_q,
             sf_q_T=sample_sf_q_T,
             sf_k=sample_sf_k,
@@ -115,7 +119,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return tuple(int(x) for x in desc.stride) == (s * h * d, d, h * d, 1)
 
     def _sf_plan(self):
-        """The eleven kernel-side SF buffers: (name, graph SF, rows, k_groups, planes, layout, plane_major).
+        """The eight kernel-side SF buffers: (name, graph SF, rows, k_groups, planes, layout, plane_major).
 
         Rowwise graph tensors (rows = S, blocks along D) are plane-major
         canonical; columnwise ones (rows = D, blocks along S) carry the
@@ -127,21 +131,17 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         b, hq, hk, sq, sk, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
         lq, lk = b * hq, b * hk
         dg = d // _SF_BLOCK
-        sqg, skg = _cdiv(sq, _SF_BLOCK), _cdiv(sk, _SF_BLOCK)
         return (
             # dQ kernel operands
             ("dq_sf_q", "sf_q", sq, dg, lq, SF_LAYOUT_SFA, True),
             ("dq_sf_k", "sf_k", sk, dg, lk, SF_LAYOUT_SFB, True),
-            ("dq_sf_kt", "sf_k_T", d, skg, lk, SF_LAYOUT_SFB, False),
             ("dq_sf_v", "sf_v", sk, dg, lk, SF_LAYOUT_SFB, True),
             ("dq_sf_do", "sf_do", sq, dg, lq, SF_LAYOUT_SFA, True),
             # fused dK/dV kernel operands
             ("dkdv_sf_q", "sf_q", sq, dg, lq, SF_LAYOUT_SFB, True),
-            ("dkdv_sf_qt", "sf_q_T", d, sqg, lq, SF_LAYOUT_SFB, False),
             ("dkdv_sf_k", "sf_k", sk, dg, lk, SF_LAYOUT_SFA, True),
             ("dkdv_sf_v", "sf_v", sk, dg, lk, SF_LAYOUT_SFA, True),
             ("dkdv_sf_do", "sf_do", sq, dg, lq, SF_LAYOUT_SFB, True),
-            ("dkdv_sf_dot", "sf_do_T", d, sqg, lq, SF_LAYOUT_SFB, False),
         )
 
     def _sf_expected_bytes(self, graph_sf: str) -> int:
@@ -164,8 +164,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         s = self._mxfp8_samples
         self.q_T_desc = self._make_tensor_desc(s["q_T"], name="q_T")
         self.k_T_desc = self._make_tensor_desc(s["k_T"], name="k_T")
+        self.q_f16_desc = self._make_tensor_desc(s["q_f16"], name="q_f16")
         self.do_T_desc = self._make_tensor_desc(s["dO_T"], name="dO_T")
         self.do_f16_desc = self._make_tensor_desc(s["dO_f16"], name="dO_f16")
+        self.k_f16_desc = self._make_tensor_desc(s["k_f16"], name="k_f16")
         self.sf_descs = {n: self._make_tensor_desc(s[n], name=n) for n in ("sf_q", "sf_q_T", "sf_k", "sf_k_T", "sf_v", "sf_do", "sf_do_T")}
 
         q_shape = tuple(int(x) for x in self.q_desc.shape)  # logical BHSD
@@ -174,7 +176,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         self.h_kv, self.s_k_max = int(k_shape[1]), int(k_shape[2])
         self.head_dim_v = int(tuple(self.v_desc.shape)[3])
         self.dtype = self.q_desc.dtype  # FP8 payload dtype
-        self.out_dtype = self.o_desc.dtype  # half-precision side (o_f16/dO_f16/dQ/dK/dV)
+        self.out_dtype = self.o_desc.dtype  # half-precision output side (o_f16/dQ/dK/dV)
         if self.scale_softmax is None or self.scale_softmax == 0.0:
             self.scale_softmax = 1.0 / math.sqrt(self.head_dim_qk)
         self._gqa_group = self.h_q // max(self.h_kv, 1)
@@ -194,8 +196,13 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         for desc in (self.k_desc, self.v_desc, self.do_desc, self.q_T_desc, self.k_T_desc, self.do_T_desc):
             self._value_error_if(desc.dtype != self.dtype, f"SM100 MXFP8 bwd: FP8 payload {desc.name} dtype {desc.dtype} != q {self.dtype}")
         self._value_error_if(self.out_dtype not in (torch.float16, torch.bfloat16), f"SM100 MXFP8 bwd: o_f16 must be fp16/bf16; got {self.out_dtype}")
-        for desc in (self.do_f16_desc, self.dq_desc, self.dk_desc, self.dv_desc):
+        for desc in (self.dq_desc, self.dk_desc, self.dv_desc):
             self._value_error_if(desc.dtype != self.out_dtype, f"SM100 MXFP8 bwd: {desc.name} dtype {desc.dtype} != o_f16 {self.out_dtype}")
+        self._value_error_if(self.do_f16_desc.dtype != torch.bfloat16, f"SM100 MXFP8 bwd: dO_f16 must be bfloat16; got {self.do_f16_desc.dtype}")
+        self._value_error_if(self.k_f16_desc.dtype != torch.bfloat16, f"SM100 MXFP8 bwd: k_f16 must be bfloat16; got {self.k_f16_desc.dtype}")
+        self._value_error_if(tuple(self.k_f16_desc.shape) != tuple(self.k_desc.shape), "SM100 MXFP8 bwd: k_f16 shape must match k")
+        self._value_error_if(self.q_f16_desc.dtype != torch.bfloat16, f"SM100 MXFP8 bwd: q_f16 must be bfloat16; got {self.q_f16_desc.dtype}")
+        self._value_error_if(tuple(self.q_f16_desc.shape) != tuple(self.q_desc.shape), "SM100 MXFP8 bwd: q_f16 shape must match q")
         # The kernels address BSHD-compact storage only (their head/batch
         # strides are derived, not read). No staging copies: decline.
         for desc in (
@@ -209,8 +216,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             self.dv_desc,
             self.q_T_desc,
             self.k_T_desc,
+            self.q_f16_desc,
             self.do_T_desc,
             self.do_f16_desc,
+            self.k_f16_desc,
         ):
             self._value_error_if(
                 not self._bshd_physical_ok(desc),
@@ -249,7 +258,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
 
     def scratch_workspace_bytes(self) -> int:
         """Kernel scratch (rowsum(O*dO) + scaled LSE + the dQ fp32 slot the
-        kernels size but do not use) plus the eleven repacked scale-factor
+        kernels size but do not use) plus the eight repacked scale-factor
         buffers. A pure function of the plan geometry; all of it is carved
         from the caller's buffer at execute."""
         from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import repack_geometry
@@ -288,7 +297,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return masks.MaskEnum.RESIDUAL_MASK, masks.MaskEnum.RESIDUAL_MASK_BWD
 
     def compile(self) -> None:
-        """Plan-time JIT: the eleven SF repacks, the dQ kernel and the fused dK/dV
+        """Plan-time JIT: the eight SF repacks, the dQ kernel and the fused dK/dV
         kernel, all against fake operands of the plan's exact geometry."""
         self._ensure_support_checked()
         if self._compiled is not None:
@@ -332,7 +341,9 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         ws_fake = fake_flat(cutlass.Uint8, self._kernel_workspace_bytes())
 
         fq, fkv, flse = fake(E4M3, q_geom), fake(E4M3, kv_geom), fake(Float32, lse_geom)
+        fq16, fk16 = fake(cutlass.BFloat16, q_geom), fake(cutlass.BFloat16, kv_geom)
         fo, fdq = fake(out_dt, q_geom), fake(out_dt, q_geom)
+        fdo16 = fake(cutlass.BFloat16, q_geom)
         fdkv = fake(out_dt, kv_geom)
 
         def fsf(name):
@@ -354,18 +365,18 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             fq,  # Q
             fkv,  # K
             fkv,  # K_MN
+            fk16,  # K_f16: leakage-safe dS@K operand
             fkv,  # V
             fo,  # O
             fsf("dq_sf_q"),
             fsf("dq_sf_k"),
-            fsf("dq_sf_kt"),
             fsf("dq_sf_v"),
             fsf("dq_sf_do"),
             fdq,  # dQ
             fdkv,  # dK (ABI slot; this kernel never writes it)
             fdkv,  # dV
             fq,  # dO (fp8)
-            fo,  # dO_16bits
+            fdo16,  # dO_16bits: explicit BF16 leakage-safe sidecar
             flse,
             None,
             None,
@@ -391,21 +402,18 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             dkdv_kernel,
             problem_shape,
             fq,  # Q
-            fq,  # Q_MN
+            fq16,  # Q_f16: leakage-safe dS @ Q
             fkv,  # K
             fkv,  # V
             fo,  # O
             fsf("dkdv_sf_q"),
-            fsf("dkdv_sf_qt"),
             fsf("dkdv_sf_k"),
             fsf("dkdv_sf_v"),
             fsf("dkdv_sf_do"),
-            fsf("dkdv_sf_dot"),
             fdkv,  # dK
             fdkv,  # dV
             fq,  # dO (fp8)
-            fq,  # dO_MN
-            fo,  # dO_16bits
+            fdo16,  # dO_16bits: explicit BF16 leakage-safe sidecar
             flse,
             None,
             None,
@@ -444,8 +452,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         *,
         q_T_tensor: Optional[torch.Tensor] = None,
         k_T_tensor: Optional[torch.Tensor] = None,
+        q_f16_tensor: Optional[torch.Tensor] = None,
         do_T_tensor: Optional[torch.Tensor] = None,
         do_f16_tensor: Optional[torch.Tensor] = None,
+        k_f16_tensor: Optional[torch.Tensor] = None,
         sf_q: Optional[torch.Tensor] = None,
         sf_q_T: Optional[torch.Tensor] = None,
         sf_k: Optional[torch.Tensor] = None,
@@ -464,8 +474,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         extras = dict(
             q_T=q_T_tensor,
             k_T=k_T_tensor,
+            q_f16=q_f16_tensor,
             dO_T=do_T_tensor,
             dO_f16=do_f16_tensor,
+            k_f16=k_f16_tensor,
             sf_q=sf_q,
             sf_q_T=sf_q_T,
             sf_k=sf_k,
@@ -498,7 +510,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             return ct
 
         def half_view(t, s, h_kv_, h_r_):
-            return from_dlpack(t.permute(0, 2, 1, 3).contiguous().view(b, s, h_kv_, h_r_, d).permute(1, 4, 3, 2, 0), assumed_align=16)
+            # The explicit BF16 sidecars are read-only kernel inputs.  They may
+            # originate from autograd-enabled benchmark/reference masters;
+            # DLPack rejects such tensors unless the view is detached first.
+            return from_dlpack(t.detach().permute(0, 2, 1, 3).contiguous().view(b, s, h_kv_, h_r_, d).permute(1, 4, 3, 2, 0), assumed_align=16)
 
         def sf_bytes(t, name="sf"):
             # Scale factors are an opaque F8_128x4 byte layout bound by STORAGE order (a permuted view
@@ -517,10 +532,12 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
                 ct.element_type = E8M0
                 sf_bufs[name] = ct
 
-            Q, Q_MN = fp8_view(q_tensor, sq, hk, hr), fp8_view(q_T_tensor, sq, hk, hr)
+            Q = fp8_view(q_tensor, sq, hk, hr)
+            Q16 = half_view(q_f16_tensor, sq, hk, hr)
             K, K_MN = fp8_view(k_tensor, sk, hk, 1), fp8_view(k_T_tensor, sk, hk, 1)
+            K16 = half_view(k_f16_tensor, sk, hk, 1)
             V = fp8_view(v_tensor, sk, hk, 1)
-            DO, DO_MN = fp8_view(do_tensor, sq, hk, hr), fp8_view(do_T_tensor, sq, hk, hr)
+            DO = fp8_view(do_tensor, sq, hk, hr)
             O, DO16 = half_view(o_tensor, sq, hk, hr), half_view(do_f16_tensor, sq, hk, hr)
             dQ = half_view(dq_tensor, sq, hk, hr)
             dK, dV = half_view(dk_tensor, sk, hk, 1), half_view(dv_tensor, sk, hk, 1)
@@ -533,11 +550,11 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
                 Q,
                 K,
                 K_MN,
+                K16,
                 V,
                 O,
                 sf_bufs["dq_sf_q"],
                 sf_bufs["dq_sf_k"],
-                sf_bufs["dq_sf_kt"],
                 sf_bufs["dq_sf_v"],
                 sf_bufs["dq_sf_do"],
                 dQ,
@@ -558,20 +575,17 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             dkdv_fn(
                 problem_shape,
                 Q,
-                Q_MN,
+                Q16,
                 K,
                 V,
                 O,
                 sf_bufs["dkdv_sf_q"],
-                sf_bufs["dkdv_sf_qt"],
                 sf_bufs["dkdv_sf_k"],
                 sf_bufs["dkdv_sf_v"],
                 sf_bufs["dkdv_sf_do"],
-                sf_bufs["dkdv_sf_dot"],
                 dK,
                 dV,
                 DO,
-                DO_MN,
                 DO16,
                 LSE,
                 None,

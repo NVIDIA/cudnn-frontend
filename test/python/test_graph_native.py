@@ -549,15 +549,36 @@ class TestReviewSemantics:
         assert A.get_name() == "A"
         A.set_name("A")  # a no-op rename stays legal, as a no-op re-uid does
 
+    @pytest.mark.L0
     def test_mxfp8_dsink_is_output(self):
         """Follow-up item 4: mxfp8_backward dSink_token is an output port."""
         g = pygraph()
         t = lambda n: g.tensor(dim=[2, 4, 8, 16], name=n)  # noqa: E731
-        kw = {p: t(p) for p in ("q", "q_T", "k", "k_T", "v", "o_f16", "dO_f16", "dO", "dO_T", "stats")}
+        kw = {p: t(p) for p in ("q", "q_T", "q_f16", "k", "k_T", "k_f16", "v", "o_f16", "dO_f16", "dO", "dO_T", "stats")}
         ds = g.tensor(dim=[1, 4, 1, 1], name="dsink_buf")
         g.sdpa_mxfp8_backward(dSink_token=ds, **kw)
         (node,) = g.nodes
         assert "dSink_token" in node.outputs and "dSink_token" not in node.inputs
+
+    @pytest.mark.L0
+    def test_mxfp8_bwd_bf16_sidecars_are_python_only_inputs(self):
+        """Leakage-safe copies bind to FROST without changing native ABI."""
+        from cudnn._pygraph import _CAPTURED_OPS
+
+        g = pygraph()
+        t = lambda n: g.tensor(dim=[1, 2, 8, 16], name=n)  # noqa: E731
+        kw = {p: t(p) for p in ("q", "q_T", "q_f16", "k", "k_T", "k_f16", "v", "o_f16", "dO_f16", "dO", "dO_T", "stats")}
+        g.sdpa_mxfp8_backward(**kw)
+        (node,) = g.nodes
+        assert node.inputs["q_f16"] is kw["q_f16"]
+        assert node.inputs["k_f16"] is kw["k_f16"]
+        assert set(_CAPTURED_OPS["sdpa_mxfp8_backward"]["python_only_inputs"]) == {"q_f16", "k_f16"}
+        assert not g._backend_lowerable()
+
+        native = pygraph()
+        nt = lambda n: native.tensor(dim=[1, 2, 8, 16], name=n)  # noqa: E731
+        native.sdpa_mxfp8_backward(**{p: nt(p) for p in ("q", "q_T", "k", "k_T", "v", "o_f16", "dO_f16", "dO", "dO_T", "stats")})
+        assert native._backend_lowerable()
 
     def test_semantic_setters_frozen_after_planning(self, monkeypatch):
         from cudnn.engines import BaseEngine
