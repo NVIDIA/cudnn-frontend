@@ -55,21 +55,21 @@ class _FrostSdpaFwdPlan(CompiledPlan):
         return self._workspace_bytes
 
     def execute(self, graph: "pygraph", uid_to_data, ctx: ExecutionContext) -> None:
-        # Keyed by IR tensor object: that is the binding's own identity, and the
-        # only key resolve_variant_pack() accepts for an auto-assigned uid.
-        pack = {}
+        # The executor's operands out of the graph-wide variant pack, keyed by
+        # IR tensor identity (the binding's own key).
+        resolved = {}
         for t, uid in zip(self._tensors, self._uids):
             buf = uid_to_data.get(uid)
             if buf is None:
                 missing = [t.get_name() or uid for t, uid in zip(self._tensors, self._uids) if uid_to_data.get(uid) is None]
                 raise ValueError(f"{self._name}: the variant pack is missing buffers for {missing}")
-            pack[t] = buf
+            resolved[id(t)] = buf
         required = self._workspace_bytes
         if required:
             _check_workspace(ctx.workspace, required, self._name)
-            self._compiled(pack, ctx.workspace, stream=ctx.stream)
+            self._compiled.execute_resolved(resolved, ctx.workspace, stream=ctx.stream)
         else:
-            self._compiled(pack, stream=ctx.stream)
+            self._compiled.execute_resolved(resolved, stream=ctx.stream)
 
 
 class FrostSdpaFwdEngine(BaseEngine):
