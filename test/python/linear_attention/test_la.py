@@ -396,7 +396,9 @@ def assert_rms_close(name, out, want, tol):
     assert r < tol, f"{name} rms ratio {r:.4g} >= {tol}"
 
 
-def assert_fwd_parity(backend, case, *, scale=None, use_initial_state=False, state_dtype=torch.float32, l2norm=False, beta_guard=False, seed=SEED + 1):
+def assert_fwd_parity(
+    backend, case, *, scale=None, use_initial_state=False, state_dtype=torch.float32, l2norm=False, beta_guard=False, seed=SEED + 1, tol_scale=1.0
+):
     set_seed(seed)
     state0 = None
     if use_initial_state:
@@ -408,9 +410,9 @@ def assert_fwd_parity(backend, case, *, scale=None, use_initial_state=False, sta
     o_ref, fs_ref = reference(case, scale=scale, initial_state=state0, l2norm=l2norm, beta_guard=beta_guard)
     if state0 is not None:
         assert fs.dtype == state_dtype, f"final_state is {fs.dtype}, initial_state is {state_dtype}"
-    assert_rms_close("o", o, o_ref, FWD_TOL[case.dtype])
+    assert_rms_close("o", o, o_ref, FWD_TOL[case.dtype] * tol_scale)
     if fs is not None and fs.numel():
-        assert_rms_close("final_state", fs, fs_ref, STATE_TOL[case.dtype])
+        assert_rms_close("final_state", fs, fs_ref, STATE_TOL[case.dtype] * tol_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +582,26 @@ def test_fwd_packed_matches_per_sequence(backend, variant):
         torch.testing.assert_close(fs[b], fs_b[0])
 
 
+def correlated_keys_case(variant, dtype, *, T, H, seed=SEED + 7):
+    """Keys of norm 0.9 sharing one direction per head, unit write strength, decay in [0.97, 1)."""
+    case = make_case(variant, dtype, T=T, H=H, beta=False, lo=0.97)
+    set_seed(seed)
+    direction = F.normalize(torch.randn(1, 1, case.H, case.K, device="cuda"), dim=-1)
+    k = 0.9 * F.normalize(direction + 0.002 * torch.randn_like(case.k, dtype=torch.float32), dim=-1)
+    return case.clone(k=k.to(dtype))
+
+
+@pytest.mark.parametrize("T", [256, 1024])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_fwd_bwd_correlated_keys(backend, variant, T):
+    """Near-parallel keys with beta 1 condition the chunk factor I + L at its worst; the scalar-gate families hold
+    twice the standard budget on this input (the saturated state leaves only small residuals to compare)."""
+    case = correlated_keys_case(variant, torch.bfloat16, T=T, H=2)
+    tol_scale = 2.0 if variant in SCALAR_GATE_VARIANTS else 1.0
+    assert_fwd_parity(backend, case, tol_scale=tol_scale)
+    assert_bwd_parity(backend, case, tol_scale=tol_scale)
+
+
 @pytest.mark.parametrize("K,V", HEAD_DIMS + WIDE_HEAD_DIMS)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_head_dims(backend, variant, K, V):
@@ -666,8 +688,9 @@ def assert_bwd_parity(
     beta_guard=False,
     gate_grad_tol=None,
     seed=SEED + 1,
+    tol_scale=1.0,
 ):
-    variant, tol = case.variant, BWD_TOL[case.dtype]
+    variant, tol = case.variant, BWD_TOL[case.dtype] * tol_scale
     tensors = case_tensors(case)
     op_leaves = {name: to_thd(t).detach().clone().requires_grad_(True) for name, t in tensors.items()}
     ref_leaves = {name: t.detach().double().requires_grad_(True) for name, t in tensors.items()}
@@ -703,9 +726,9 @@ def assert_bwd_parity(
     if case.varlen:
         ref_kwargs["cu_seqlens"] = case.cu
     o_ref, fs_ref = reference_call(variant, ref_tensors, case.n, **ref_kwargs)
-    assert_rms_close("o", o, o_ref, FWD_TOL[case.dtype])
+    assert_rms_close("o", o, o_ref, FWD_TOL[case.dtype] * tol_scale)
     if fs is not None and fs.numel():
-        assert_rms_close("final_state", fs, fs_ref, STATE_TOL[case.dtype])
+        assert_rms_close("final_state", fs, fs_ref, STATE_TOL[case.dtype] * tol_scale)
     ref_outputs, ref_gos = [o_ref], [dO.double().reshape(o_ref.shape)]
     if use_dfs:
         ref_outputs.append(fs_ref)
