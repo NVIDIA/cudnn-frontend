@@ -12,7 +12,7 @@ from typing import Any
 
 import cudnn
 
-from .fusion_ir import Dtype, FusionChain
+from .fusion_ir import Dtype, FusionChain, MoeSwapAbSpec
 
 # internal dtype -> cute-DSL / cutlass type name (same string serves both the
 # `.to(<type>)` DSL casts and the `cutlass.<Type>` enum args). FP4 is packed
@@ -178,17 +178,11 @@ def allowed_store_vsize(dim, stride, dtype: str) -> int:
     declared-layout alignment (``tensor_alignment`` over its ``dim`` + ``stride``)
     in elements. The store width is derived from the tensor, not fixed then
     rejected — it never exceeds what the buffer's row stride / contiguous extent
-    can address (the ptr layer is re-checked at run time). Raises below the
-    4-byte scalar-store floor."""
+    can address (the ptr layer is re-checked at run time). Byte and halfword
+    stores are legal too: the minimum access is one whole dtype element,
+    naturally aligned to its size, rather than a fixed 4-byte word."""
     elem_bytes = DTYPE_BYTES[dtype]
     align_bytes = tensor_alignment(dim, stride, elem_bytes)
-    if align_bytes < 4:
-        raise ValueError(
-            f"output row stride must be at least 4-byte aligned but got alignment "
-            f"{align_bytes} bytes for dim={dim}, stride={stride}, dtype={dtype!r}. "
-            f"PTX scalar store requires 4-byte natural alignment; sub-32-bit "
-            f"element stores are not supported by this kernel."
-        )
     return align_bytes // elem_bytes
 
 
@@ -212,7 +206,10 @@ def _allowed_vsize(chain: FusionChain, dtype: "str", dim=None, stride=None) -> i
     """This dense output's widest STG vector (elements) = its OWN declared-layout
     alignment."""
     dim, stride = dense_output_layout(chain, dtype, dim, stride)
-    return allowed_store_vsize(dim, stride, dtype)
+    vsize = allowed_store_vsize(dim, stride, dtype)
+    if isinstance(chain.moe, MoeSwapAbSpec):
+        vsize = min(vsize, _pow2_floor(chain.moe.offset_multiple), _pow2_floor(chain.matmul.N))
+    return vsize
 
 
 def _compute_output_vec_bytes(chain: FusionChain, tile_cols: "int | None" = None) -> int:
@@ -246,10 +243,12 @@ def _compute_output_vec_bytes(chain: FusionChain, tile_cols: "int | None" = None
     else:
         vsize = min(widths)
     vsize = min(vsize, MAX_EPI_CHUNK_ELEMS)
-    if chain.out_major == "m" or not widths:
+    if not chain.quants and (chain.out_major == "m" or not widths):
         vsize = min(vsize, _pow2_floor(chain.matmul.N, cap=MAX_EPI_CHUNK_ELEMS))
     if tile_cols is not None:
         vsize = min(vsize, _pow2_floor(tile_cols, cap=MAX_EPI_CHUNK_ELEMS))
+    if isinstance(chain.moe, MoeSwapAbSpec) and not chain.quants:
+        vsize = min(vsize, _pow2_floor(chain.moe.offset_multiple), _pow2_floor(chain.matmul.N))
     return vsize * elem_bytes
 
 
@@ -267,6 +266,8 @@ def _aux_align_reqs(chain: FusionChain, vec_bytes: "int | None" = None) -> dict:
         aeb = DTYPE_BYTES[aux.dtype]
         if aux.bcast_mode in ("per_col", "per_elem"):
             reqs[aux.name] = min(tensor_alignment(aux.dim, aux.stride, aeb), vsize * aeb)
+            if isinstance(chain.moe, MoeSwapAbSpec):
+                reqs[aux.name] = min(reqs[aux.name], _pow2_floor(chain.moe.offset_multiple) * aeb) if aux.stride[-1] == 1 else aeb
         else:
             reqs[aux.name] = aeb
     return reqs

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -92,7 +93,12 @@ def _validate_sparse_metadata(
 
 
 def _device_arch(tensor: torch.Tensor) -> int:
-    major, minor = torch.cuda.get_device_capability(tensor.device)
+    return _device_arch_for_index(tensor.device.index)
+
+
+@lru_cache(maxsize=None)
+def _device_arch_for_index(device_index: int) -> int:
+    major, minor = torch.cuda.get_device_capability(device_index)
     return major * 10 + minor
 
 
@@ -208,7 +214,7 @@ def block_sparse_attention_forward(
         if isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256:
             raise ValueError("SM90 kv_splits must be an integer in [1, 256]")
 
-    if arch_family in {9, 12} and sparse_block_size != 64:
+    if arch_family == 9 and sparse_block_size != 64:
         raise NotImplementedError(f"SM{arch} only provides a blk64 forward path")
     if arch_family == 9:
         if head_dim not in {64, 96, 128} or value_dim not in {64, 96, 128}:
@@ -294,6 +300,7 @@ def block_sparse_attention_forward(
                 block_sparse_num,
                 block_sizes,
                 q2k_block_nums=q2k_block_nums,
+                sparse_block_size=sparse_block_size,
                 allow_empty_block_nums=allow_empty_block_nums,
                 softmax_scale=softmax_scale,
                 pack_gqa=pack_gqa,
@@ -323,8 +330,6 @@ def block_sparse_attention_fp8_forward(
     if arch_family not in {10, 11, 12}:
         raise RuntimeError(f"Sage FP8 block sparse attention requires SM100-SM120, found SM{arch}")
     if arch_family in {10, 11}:
-        if batch != 1 or heads not in {4, 8}:
-            raise NotImplementedError("SM100/SM110 Sage FP8 requires B=1 and H in {4, 8}")
         if seqlen_q % 64 or seqlen_k % 64:
             raise NotImplementedError("SM100/SM110 Sage FP8 requires Sq and Sk to be multiples of 64")
         if q2k_block_nums is not None or block_sizes is not None:

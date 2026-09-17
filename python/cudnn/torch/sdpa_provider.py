@@ -158,15 +158,33 @@ def _fa_window_left_to_cudnn(w: int) -> int:
     return w + 1 if w >= 0 else -1
 
 
+def _fa_window_right_to_cudnn(is_causal: bool, w: int) -> tuple[bool, int]:
+    """FA2 window_size=(_, r) attends up to column i+r; cuDNN's
+    diagonal_band_right_bound=rb masks columns BEYOND i+rb, so rb = r with no
+    offset (unlike the left bound, which is exclusive and needs the +1).
+
+    r == 0 is exactly causal, and is folded into is_causal so the common case
+    keeps hitting the same graph-cache entry it always did. r > 0 admits future
+    columns, which contradicts is_causal -- the op rejects that pairing."""
+    if w == 0:
+        return True, -1
+    if w > 0:
+        return is_causal, w
+    return is_causal, -1
+
+
 def _varlen_supported(ws, seqused_k=None, block_table=None, num_splits=None) -> bool:
     """Configs the cudnn python varlen path serves today; everything else falls
     back to the flash kernels (exactly what the stock op body runs)."""
-    if seqused_k is not None or block_table is not None:  # paged KV not wired yet
+    if seqused_k is not None or block_table is not None:
+        # Paged KV stays on flash by design (Phase-1 scope decision): the op's
+        # stock body already serves it correctly.
         return False
     if num_splits is not None and num_splits != 1:
         return False
-    # left-window + causal only; asymmetric/right bounds pending window_right in sdpa_*_ex
-    return ws[1] in (-1, 0) and not (ws[0] >= 0 and ws[1] != 0)
+    # Both bounds are expressible now: window_left -> diagonal_band_left_bound,
+    # window_right -> diagonal_band_right_bound. Asymmetric bands included.
+    return True
 
 
 def _varlen_fwd_flash(query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, is_causal, scale, ws, seqused_k, block_table, num_splits):
@@ -185,13 +203,13 @@ def _varlen_fwd(query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, is_causal=F
     ws = _norm_window(window_size)
     if not _varlen_supported(ws, seqused_k, block_table, num_splits):
         return _varlen_fwd_flash(query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, is_causal, scale, ws, seqused_k, block_table, num_splits)
-    is_causal = is_causal or ws[1] == 0
+    is_causal, window_right = _fa_window_right_to_cudnn(is_causal, ws[1])
 
     calls["fwd"] += 1
     attn_scale = scale if scale is not None else query.shape[-1] ** -0.5
     o, stats = torch.ops.cudnn.sdpa_fwd(
         query, key, value, attn_scale,
-        is_causal=is_causal, window_left=_fa_window_left_to_cudnn(ws[0]),
+        is_causal=is_causal, window_left=_fa_window_left_to_cudnn(ws[0]), window_right=window_right,
         cu_seqlens_q=cu_seq_q, cu_seqlens_kv=cu_seq_k,
         max_seqlen_q=max_q, max_seqlen_kv=max_k, return_lse=True,
     )  # fmt: skip
@@ -230,7 +248,7 @@ def _varlen_bwd(grad_out, query, key, value, out, lse, cu_seq_q, cu_seq_k, max_q
             window_size_left=ws[0], window_size_right=ws[1],
         )  # fmt: skip
         return dq, dk, dv
-    is_causal = is_causal or ws[1] == 0
+    is_causal, window_right = _fa_window_right_to_cudnn(is_causal, ws[1])
 
     calls["bwd"] += 1
     attn_scale = scale if scale is not None else query.shape[-1] ** -0.5
@@ -244,7 +262,7 @@ def _varlen_bwd(grad_out, query, key, value, out, lse, cu_seq_q, cu_seq_k, max_q
     lse_padded = _cudnn_ops.thd_lse_to_padded(lse.transpose(0, 1), cu_seq_q, max_q)
     dq, dk, dv = torch.ops.cudnn.sdpa_bwd(
         grad_out, query, key, value, out, lse_padded, attn_scale,
-        is_causal=is_causal, window_left=_fa_window_left_to_cudnn(ws[0]),
+        is_causal=is_causal, window_left=_fa_window_left_to_cudnn(ws[0]), window_right=window_right,
         cu_seqlens_q=cu_seq_q, cu_seqlens_kv=cu_seq_k,
         max_seqlen_q=max_q, max_seqlen_kv=max_k,
         is_deterministic=torch.are_deterministic_algorithms_enabled(),

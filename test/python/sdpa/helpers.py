@@ -22,10 +22,17 @@ def note_frost_routing(graph, label="graph"):
 
     engine = getattr(graph, "selected_engine", None)
     if engine is not None:
-        print(f"@@@@ {label} graph: python engine '{engine.name}' serves this graph")
+        # The selected plan's knobs alongside the engine: a test that pins a
+        # kernel FLAVOR behind a knob (the d128 decode tile is TILE_CGA_M=1 on
+        # sdpa_fwd_prefill_sm100) reads frost_routing.LAST_PLAN after exec_sdpa.
+        cfg = getattr(graph, "_selected_plan_config", None)
+        knobs = getattr(cfg, "knobs", None)
+        print(f"@@@@ {label} graph: python engine '{engine.name}' serves this graph" + (f" with knobs {knobs}" if knobs is not None else ""))
         frost_routing.note(f"frost:{engine.name}")
+        frost_routing.LAST_PLAN = (engine.name, knobs)
     else:
         frost_routing.note(f"native:{label}")
+        frost_routing.LAST_PLAN = (None, None)
 
 def fill_sparse_small_int(tensor, rng, sparsity=0.8, abs_max=2):
     """
@@ -391,9 +398,13 @@ def create_container_and_page_table(tensor, block_size):
 
     reshaped = torch.cat((cat_tensor.clone()).chunk(blocks_per_batch, dim=2), dim=0)
 
+    # Page p of batch b lives at pool index p*B + b (the chunk/cat above). The
+    # table is stored ROW-MAJOR — each batch's page list contiguous, strides
+    # (table_size, table_size, 1, 1) on the (B, 1, table_size, 1) declaration —
+    # which is what every framework hands cuDNN (FlashInfer, vLLM, SGLang,
+    # Megatron/TE, PyTorch all keep [B, max_pages] int32 row-major).
     table_size = math.ceil(S/block_size)
-    page_table = torch.linspace(0, B*table_size-1, B*table_size, device='cuda', dtype=torch.int32).reshape(table_size,1,B,1)
-    page_table = torch.transpose(page_table,0,2)
+    page_table = torch.arange(B*table_size, device='cuda', dtype=torch.int32).reshape(table_size, B).t().contiguous().reshape(B, 1, table_size, 1)
 
     return(reshaped, page_table)
 

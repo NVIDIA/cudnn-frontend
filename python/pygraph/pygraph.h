@@ -464,7 +464,8 @@ class PyGraph {
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
          bool const unfuse_fma,
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
-         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv);
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
+         bool const stats_use_log2);
 
     // return [dQ, dK, dV]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
@@ -540,7 +541,8 @@ class PyGraph {
              bool const unfuse_fma,
              cudnn_frontend::AttentionImplementation_t const& implementation,
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
-             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv);
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
+             bool const stats_use_log2 = false);
 
     // MXFP8 SDPA forward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
     // return [o, stats, amax_o]
@@ -873,7 +875,8 @@ class PyGraph {
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> scale_s   = nullptr,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> scale_o   = nullptr,
                   cudnn_frontend::AttentionImplementation_t const& implementation     = AttentionImplementation_t::AUTO,
-                  bool const unfuse_fma                                               = false);
+                  bool const unfuse_fma                                               = false,
+                  bool const stats_use_log2                                           = false);
 };
 
 }  // namespace cudnn_frontend::python_bindings

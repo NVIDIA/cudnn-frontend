@@ -6,8 +6,6 @@ from functools import partial
 
 import cuda.bindings.driver as cuda
 
-import torch
-
 import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Float32, Int32, Int64, const_expr
@@ -22,18 +20,12 @@ from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import (
     assume_tensor_aligned,
     get_broadcast_dims,
     to_cute_tensor,
-    torch2cute_dtype_map,
 )
 from cudnn.block_sparse_attention.csrc.utils import copy_utils
 from cudnn.block_sparse_attention.csrc.utils import pipeline
 from cudnn.block_sparse_attention.csrc.utils.tcgen05_mma_helpers import gemm_w_idx, gemm_ptx_w_idx
 from cudnn.block_sparse_attention.csrc.utils.seqlen_info import SeqlenInfoQK
 from cudnn.block_sparse_attention.csrc.utils.block_info import BlockInfo
-from cudnn.block_sparse_attention.csrc.bwd.bsa_bwd_prepost import (
-    _bwd_postprocess_convert,
-    _bwd_preprocess,
-    _get_device_arch,
-)
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase, sub_packed_f32x2
 from cudnn.block_sparse_attention.csrc.utils.tile_scheduler import (
     TileSchedulerArguments,
@@ -2180,20 +2172,27 @@ def _ceil_div(a: int, b: int) -> int:
 
 
 def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
-    dout: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out: torch.Tensor,
-    lse: torch.Tensor,
-    bucketed_k2q_offsets: torch.Tensor,
-    bucketed_k2q_indices: torch.Tensor,
+    dout: "torch.Tensor",
+    q: "torch.Tensor",
+    k: "torch.Tensor",
+    v: "torch.Tensor",
+    out: "torch.Tensor",
+    lse: "torch.Tensor",
+    bucketed_k2q_offsets: "torch.Tensor",
+    bucketed_k2q_indices: "torch.Tensor",
     softmax_scale: Optional[float] = None,
-    dq: Optional[torch.Tensor] = None,
-    dk: Optional[torch.Tensor] = None,
-    dv: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dq: Optional["torch.Tensor"] = None,
+    dk: Optional["torch.Tensor"] = None,
+    dv: Optional["torch.Tensor"] = None,
+) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
     """SM100/SM110 blk128 bwd entry receiving BSA bucketed k2q CSR."""
+    import torch
+    from cudnn.block_sparse_attention.csrc.bwd.bsa_bwd_prepost import (
+        _bwd_postprocess_convert,
+        _bwd_preprocess,
+        _get_device_arch,
+    )
+
     assert q.dtype == torch.bfloat16, "SM100 blk128 bwd only supports bfloat16"
     assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype
     assert lse.dtype == torch.float32
@@ -2273,7 +2272,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
         dk_accum = None
         dv_accum = None
 
-    dtype = torch2cute_dtype_map[q.dtype]
+    dtype = cutlass.BFloat16
     _bwd_preprocess(
         out_bshd,
         dout_bshd,

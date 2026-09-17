@@ -27,23 +27,29 @@ BSA is implemented with Python CuTe DSL/JIT kernels.
 
 ## Installation
 
-Install the CuTe DSL optional dependencies:
+The CuTe DSL runtime is a required dependency, so the base install is enough:
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
-The package-wide `nvidia-cutlass-dsl[cu13]>=4.5.0` dependency floor applies to
-BSA. The FP16/BF16 APIs continue to work with supported CuTe DSL 4.5 releases.
-The Sage FP8 API below performs an additional runtime check and requires
-`nvidia-cutlass-dsl>=4.6.1`; this narrower requirement does not change the
-package dependency floor or make importing `cudnn` require CuTe DSL 4.6.1.
+The package-wide `nvidia-cutlass-dsl[cu13]>=4.6.2` dependency floor applies to
+BSA. Sage FP8 relies on functionality introduced in CuTe DSL 4.6.1, which the
+package floor already satisfies. A defensive runtime check remains for
+environments that force an older DSL.
 
 ## Forward
 
+The `cudnn.torch` BSA functions are lazy aliases of the existing `cudnn` and
+`cudnn.BSA` functions, with identical signatures, outputs, and supported configurations.
+
 ```python
 import torch
-from cudnn import BSA
+from cudnn.torch import (
+    block_sparse_attention_forward,
+    block_sparse_attention_backward,
+    block_sparse_attention_fp8_forward,
+)
 
 q = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(1, 8, 2048, 128, device="cuda", dtype=torch.bfloat16)
@@ -55,7 +61,7 @@ q2k_block_index = torch.arange(4, device="cuda", dtype=torch.int32)
 q2k_block_index = q2k_block_index.view(1, 1, 1, 4).expand(1, 8, 16, 4).contiguous()
 block_sizes = torch.full((32,), 64, device="cuda", dtype=torch.int32)
 
-result = BSA.block_sparse_attention_forward(
+result = block_sparse_attention_forward(
     q,
     k,
     v,
@@ -122,10 +128,25 @@ Provide `block_sizes` whenever a referenced final block is only partially
 valid.
 
 `sparse_block_size=None` chooses blk64 on SM90/SM120 and blk128 on
-SM100/SM103. Passing `sparse_block_size=64` explicitly selects the SM100/SM103
-blk64 CuTe DSL path, whose shape support is narrower. `kv_splits` is available
-on SM90 and the explicit Blackwell blk64 path; `use_clc` applies only to the
-explicit Blackwell blk64 path.
+SM100/SM103. On SM120, passing `sparse_block_size=128` selects a native
+KV128 kernel that consumes blk128 metadata directly; it does not
+expand the metadata or invoke the blk64 kernel. Passing `sparse_block_size=64`
+explicitly selects the SM100/SM103 blk64 CuTe DSL path, whose shape support is
+narrower. `kv_splits` is available on SM90 and the explicit Blackwell blk64
+path; `use_clc` applies only to the explicit Blackwell blk64 path.
+
+For SM120 blk128 with fixed `block_sparse_num`, full physical KV blocks
+(`block_sizes=None`), and a KV sequence length divisible by 128, the dispatcher
+uses an FA4-style native specialization with a dedicated K/V load warp,
+register-resident Q, and a four-fold-unrolled sparse loop. Most CTAs process
+128 Q rows; an underfilled final scheduling wave may use 64 Q rows per CTA
+while still loading full KV128 blocks and using the parent Q block's original
+metadata. This is Q-work scheduling, not KV128-to-KV64 lowering. Variable
+per-row block counts, explicit block sizes, and partial final KV blocks use
+the general native blk128 kernel. The FA4-style specialization requires
+`nvidia-cutlass-dsl >= 4.7.0`; an older public DSL version is rejected with
+a version-specific error before the specialized kernel is imported. The
+package-wide downstream dependency floor is unchanged.
 
 `kv_splits=2..256` computes FP32 partial outputs and combines them, with
 workspace growing linearly in the split count. SM90 accepts an explicit integer
@@ -146,7 +167,7 @@ BF16 Q, K, and V tensors in `BHSD` layout and performs FP8 quantization
 internally:
 
 ```python
-fp8_result = BSA.block_sparse_attention_fp8_forward(
+fp8_result = block_sparse_attention_fp8_forward(
     q,
     k,
     v,
@@ -168,19 +189,19 @@ backward implementation.
 
 The architecture-specific FP8 contracts are:
 
-- SM100/SM103 requires `B=1`, `H` equal to 4 or 8, and both sequence lengths
-  to be multiples of 64. It uses fixed `block_sparse_num` with full 64-token
-  KV blocks; `q2k_block_nums` and `block_sizes` are not supported. Split-KV is
-  selected internally, and the public FP8 API does not expose `kv_splits` or
-  `use_clc`.
+- SM100/SM103 accepts any positive batch and head counts and requires both
+  sequence lengths to be multiples of 64. It uses fixed `block_sparse_num`
+  with full 64-token KV blocks; `q2k_block_nums` and `block_sizes` are not
+  supported. Split-KV is selected internally, and the public FP8 API does not
+  expose `kv_splits` or `use_clc`.
 - SM120 accepts any positive batch and head counts, non-aligned Q/KV sequence
   tails, fixed or per-query-block counts, and `block_sizes` shaped `(N_kv,)`,
   `(B, N_kv)`, or `(B, H, N_kv)`. It does not use split-KV.
 
-`block_sparse_attention_fp8_forward` requires CuTe DSL 4.6.1 or newer at call
-time. Its internal Q/K/V quantizer is also implemented in CuTe DSL and is
-loaded lazily, so importing `cudnn` still works with the package-wide CuTe DSL
-4.5 dependency floor.
+`block_sparse_attention_fp8_forward` relies on functionality introduced in
+CuTe DSL 4.6.1; package-supported installations provide CuTe DSL 4.6.2 or
+newer. Its internal Q/K/V quantizer is also implemented in CuTe DSL and is
+loaded lazily, so importing `cudnn` does not eagerly import it.
 
 ## Backward
 
@@ -189,7 +210,7 @@ operation. It recomputes probabilities from the forward output and LSE:
 
 ```python
 dout = torch.randn_like(o)
-grads = BSA.block_sparse_attention_backward(
+grads = block_sparse_attention_backward(
     dout,
     q,
     k,
@@ -224,8 +245,9 @@ therefore requires full physical KV blocks and `block_sizes=None`.
 | SM90 | 64 | FP16, BF16 | each of 64, 96, 128 | MHA, GQA, MQA |
 | SM100/SM103 | 128 | FP16, BF16 | QK=V=64, 96, or 128 | MHA, GQA, MQA |
 | SM100/SM103 | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
-| SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA (B=1, H=4 or 8) |
+| SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
+| SM120 | 128 (explicit) | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 
 SM90 currently requires `S_q` to be a multiple of 64. Its fixed count may be
@@ -261,8 +283,8 @@ BSHD layout, including split-KV execution; FP8 output is contiguous BF16 BHSD.
 Compilation is lazy. The first call for a new static configuration JIT-compiles
 the relevant kernel; subsequent calls reuse an in-process cache.
 
-The current public surface consists of allocating function wrappers under
-`cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
+The Torch public surface consists of allocating function wrappers under
+`cudnn.torch`, also available under `cudnn` and `cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
 lifecycle for BSA.
 
 Correctness tests and FP32 references are under
@@ -270,7 +292,113 @@ Correctness tests and FP32 references are under
 
 ## Acknowledgements
 
-We would like to express our gratitude to <huangyitong.hyt@alibaba-inc.com> and
-<wenting.swt@alibaba-inc.com> for providing testing and optimization feedback
+We would like to express our gratitude to [huangyitong.hyt@alibaba-inc.com](mailto:huangyitong.hyt@alibaba-inc.com) and
+[wenting.swt@alibaba-inc.com](mailto:wenting.swt@alibaba-inc.com) for providing testing and optimization feedback
 throughout the deployment process, which has continuously advanced the BSA kernel
 toward Speed of Light.
+
+## Experimental JAX support
+
+`cudnn.jax.block_sparse_attention_forward` and
+`cudnn.jax.block_sparse_attention_backward` provide explicit forward/backward;
+`cudnn.jax.block_sparse_attention` adds first-order reverse-mode differentiation.
+All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
+The existing `cudnn` and `BSA` Torch APIs are unchanged. The former `_jax`
+exports have been removed without compatibility aliases.
+
+The JAX implementation reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
+backward, and gradient conversion kernels. Install `jax[cuda13]` alongside the
+frontend (CuTeDSL >=4.7, JAX >=0.9.1). The runtime imports no PyTorch; torch parity tests are separate.
+
+The JAX signatures omit Torch-specific launch options and caller-provided
+output buffers. XLA owns the outputs and workspaces.
+
+### Initial contract
+
+| Property | Supported |
+| --- | --- |
+| Device | One visible CUDA GPU, exactly compute capability 10.0 (SM100) |
+| Data | BF16 Q/K/V/O/dO/dQ/dK/dV; FP32 LSE and accumulation |
+| Dimensions | MHA with equal head counts, D=64 or 128; positive sequence lengths divisible by 128 |
+| Layout | Compact BHSD or BSHD, independently specialized |
+| Sparsity | 128-token blocks, int32 indices `[B,H,Sq/128,C]`, no `block_sizes` |
+| Counts | Fixed even `block_sparse_num` in `[2,C]`, or runtime int32 `q2k_block_nums[B,H,Sq/128]` |
+| Differentiation | First-order reverse-mode Q/K/V gradients through `block_sparse_attention` |
+
+Variable counts must be in `[1,C]`, or `[0,C]` with
+`allow_empty_block_nums=True`. Only each row's active prefix is read. Active
+indices must be unique and in `[0,Sk/128)`. An empty row returns zero output,
+negative-infinity LSE, and zero query gradient. Unselected K/V receive zero
+contributions. Metadata **values are the caller's responsibility**: the runtime
+validates shapes, dtypes, and static options, without copying metadata to the
+host or synchronizing to inspect it. Invalid values are outside the contract.
+
+SM103/SM110/SM120, blk64, FP16/FP8, GQA, different V dimensions, partial blocks,
+variable sequence lengths, causal masks, dropout, sharding, `vmap`, JVP, and
+higher derivatives are unsupported. KDA is outside this change. Static options
+(including scale and fixed count) specialize compilation; sparse arrays remain
+runtime operands. Do not mutate saved forward inputs or metadata before backward.
+
+### Usage
+
+```python
+import jax
+import jax.numpy as jnp
+from functools import partial
+from cudnn.jax import (
+    block_sparse_attention_forward as forward,
+    block_sparse_attention_backward as backward,
+    block_sparse_attention as attention,
+)
+
+q = jnp.ones((1, 2, 256, 64), dtype=jnp.bfloat16)
+k = jnp.ones((1, 2, 512, 64), dtype=jnp.bfloat16)
+v = jnp.ones_like(k)
+indices = jnp.broadcast_to(jnp.array([0, 2], jnp.int32), (1, 2, 2, 2))
+
+o, lse = forward(q, k, v, indices, 2)  # eager; asynchronous GPU execution
+run = jax.jit(partial(forward, block_sparse_num=2))
+result = run(q, k, v, indices)
+o, lse = result["o_tensor"], result["lse_tensor"]
+
+dq, dk, dv = backward(jnp.ones_like(o), q, k, v, o, lse, indices, 2)
+
+def loss(q, k, v, indices):
+    return attention(q, k, v, indices, 2).astype(jnp.float32).sum()
+
+grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+dq, dk, dv = grad(q, k, v, indices)
+dq.block_until_ready()  # needed for host timing, not between GPU operations
+```
+
+Explicit forward returns a JAX pytree with `o_tensor`, `lse_tensor`; backward returns `dq_tensor`,
+`dk_tensor`, `dv_tensor`. Both support tuple unpacking and dictionary access. Explicit helpers
+do not register autodiff rules; use `attention` for `jax.grad`. LSE and metadata
+are not differentiable public outputs. Backward must receive the exact matching
+forward Q/K/V/O/LSE, sparse pattern, scale, layout, and empty-row option.
+
+### Execution and ownership
+
+Every launch receives XLA's CUDA stream. Forward is one custom call; backward
+composes CSR construction, preprocessing, attention backward, and gradient
+conversion inside one custom call. XLA owns all outputs and workspaces. CSR
+counts and multi-bucket dK/dV accumulators are initialized for each invocation;
+preprocessing clears dQ accumulation. No mutable global scratch or public input
+buffer is donated. Atomic accumulation does not promise bitwise determinism.
+
+`TensorSpec.mode` presents compact BHSD/BSHD memory in the order expected by each
+kernel. It does not rewrite DLPack capsules or insert a Python transpose. XLA may
+still insert layout conversions when surrounding operations use incompatible
+physical layouts; this is not a universal zero-copy guarantee.
+
+Two cached call builders retain static configuration and kernel objects, never
+input arrays or pointers. XLA handles compilation and execution; there is no
+separate plan lifecycle. One `custom_vjp` registration connects forward and
+backward. `bucket_size_blocks` optionally controls backward query buckets;
+the default reuses the torch path's heuristic. Multi-device placement and cache
+portability across architectures require further qualification.
+
+The JAX tests live in `test/python/fe_api/jax` and are collected by the OSS
+suite. Torch-free import and gradient checks run in fresh subprocesses. To run
+the suite in a torch-free container, pass `--confcutdir=test/python/fe_api/jax`
+so pytest does not load the torch-based parent conftest.

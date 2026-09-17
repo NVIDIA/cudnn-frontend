@@ -24,7 +24,7 @@ Directory-specific guides: [include/cudnn_frontend/AGENTS.md](include/cudnn_fron
 - NVIDIA GPU required for essentially all tests and samples (SDPA/OSS kernels need Hopper SM90 or Blackwell SM100+).
 - CUDA toolkit (`nvcc`), cuDNN **9.x** backend (headers + libs), CMake ≥ 3.23, a C++17 compiler.
 - If cuDNN or CUDA are not in default system locations, set `CUDNN_PATH` and `CUDAToolkit_ROOT` (both honored by CMake and `setup.py`).
-- Python ≥ 3.9. `cudnn.backend_version()` gates many features at runtime (integer, e.g. 9.12.0 → `91200`); tests skip on older backends.
+- Python ≥ 3.10. `cudnn.backend_version()` gates many features at runtime (integer, e.g. 9.12.0 → `91200`); tests skip on older backends.
 
 ## Build
 
@@ -43,8 +43,8 @@ The C++ build uses `-Werror` (`/WX` on MSVC) with `-Wall -Wextra -Wpedantic` —
 Python (editable; compiles the pybind11 extension via CMake):
 
 ```bash
-pip install -e .              # core graph API only
-pip install -e ".[cutedsl]"   # + OSS CuTeDSL kernels (nvidia-cutlass-dsl, cuda-python, tvm-ffi; framework-neutral)
+pip install -e .              # graph API + the OSS CuTeDSL kernels (nvidia-cutlass-dsl, cuda-python, tvm-ffi; framework-neutral)
+                              # ".[cutedsl]" still resolves -- it now holds only cuda-python, which the DSL pulls in anyway
 pip install -e ".[cutile]"    # + the cuTile linear-attention engines (cuda-tile; needs a system tileiras)
 pip install --group torch      # + torch for the CuTeDSL APIs (torch, torch-c-dlpack-ext)
 pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.5; XLA entry points via cutlass.jax)
@@ -66,10 +66,12 @@ cd test/python
 pytest                        # default is -m L0 (smoke level) per pytest.ini
 pytest -m L1                  # deeper levels: L0..L4
 pytest test_conv_fprop.py     # one file (still filtered by -m L0 — pass -m "L0 or L1" to widen)
-pytest fe_api/                # OSS kernel tests; require ".[cutedsl]" + `--group torch` (and `--group jax` for the *_jax tests) + SM90/SM100 GPU
+pytest fe_api/                # OSS kernel tests; require `--group torch` (and `--group jax` for the *_jax tests) + SM90/SM100 GPU
 ```
 
 Read [test/AGENTS.md](test/AGENTS.md) before touching tests — `test/python/conftest.py` has import-order and env-var requirements that are easy to break.
+
+A numerics failure on ONE CI lane (e.g. sm103/GB300 red, sm100/B200 green, same cuDNN) is a different **dataset** before it is a different kernel: torch's CUDA Philox lays draws out by grid size, which follows the GPU's SM count, so one `manual_seed` yields different tensors on 148 vs 152 SMs. Detector (`--repro` dicts reproduce the *index*, not the data): dump the failing lane's inputs, then on the green lane monkeypatch the suite's generator to return them (`sdpa.fp8.create_sparse_int_tensor` / `torch.randn`) and rerun. Fails there too → data-dependent rounding (fp8 midpoint flips, see `assert_close_fp8_grad`), not hardware (#879, GB300 test69/test310). Before budgeting a new flip, A/B it against the previous kernel (`git show origin/develop:<kernel> > <kernel>`, rerun, restore): identical mismatch counts = pre-existing rounding; a real defect changes them and exceeds the budget's magnitude cap (GitHub #981 measured 0.42–2.0 vs flips ≤ 0.375).
 
 ## Format / lint
 
@@ -84,10 +86,13 @@ First invocation builds the hook environments and can take >5 minutes; later run
 
 - `include/` is header-only: no `.cpp` files, no new required dependencies. Vendored third-party code lives in `include/cudnn_frontend/thirdparty/`.
 - Every new frontend-only Python API needs: `APIBase` subclass + wrapper, lazy export in `python/cudnn/__init__.py`, docs under `docs/fe-oss-apis/`, and pytest coverage under `test/python/fe_api/`. Full recipe: [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) and the `cutedsl-kernel-integration` skill.
-- Frontend-only OSS APIs are experimental; keep the `[cutedsl]` optional-dependency boundary intact (no eager `torch`/`cutlass` imports at `cudnn` import time).
+- Frontend-only OSS APIs are experimental; keep the lazy-import boundary intact (no eager `torch`/`cutlass` imports at `cudnn` import time). CuTeDSL is a required dependency now, but a tensor framework is not, and `import cudnn` still has to stay cheap.
+- The `pyproject.toml` floor on `nvidia-cutlass-dsl` (`>=4.6.2`) is the **downstream** floor (vLLM/SGLang inherit quack-kernels' `==4.6.2`), and it is **below** what the FROST-derived kernels need (`CUTEDSL_MIN_VERSION`, 4.7.0). Every backend/kernel gates the DSL version at runtime and declines with an error that names the version — never assume the installed DSL satisfies your kernel. [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) **Rule 7** is canonical; cite it in review.
 - Version lives in three places that must stay in sync: `CMakeLists.txt` (`project(... VERSION ...)`), `include/cudnn_frontend_version.h`, `python/cudnn/__init__.py` (`__version__`).
 - Runtime debugging: set `CUDNN_FRONTEND_LOG_INFO=1` and `CUDNN_FRONTEND_LOG_FILE=stderr` for FE logs; backend logs via `CUDNN_LOGLEVEL_DBG=3 CUDNN_LOGDEST_DBG=stderr`.
 - Public-API signatures evolve **append-only**: new parameters go at the end (with defaults), never inserted mid-signature — positional callers across C++, pybind, and Python wrappers break silently otherwise (review on PR #266).
+- Knobs are ONE public vocabulary, `KnobType_t` in `include/cudnn_frontend/knobs.h`, for backend and python engines alike: an autotune record is `(engine_id, {cudnn.knob_type: int})` and downstream caches persist the integers. Reuse a backend-mirrored type when the meaning matches (`TILE_M`, `TILE_CGA_M`, ...); a tuning axis the backend has no word for goes in the frontend-only band (`>= FRONTEND_KNOB_TYPE_BASE`, never handed to the backend). Both bands are append-only — never insert, renumber, or reuse a value (the `static_assert`s in `knobs.h` are the tripwire). A python engine keeps whatever native knob object it likes inside `PlanConfig.knobs` and converts at the boundary via `BaseEngine.knobs_to_public` / `knobs_from_public`; no engine-private knob namespace reaches `get_engine_and_knobs_at_index` / `create_execution_plan`. Knobs are performance-only: a plan computes the same function under any knob value, so an autotuner may pick freely. Anything numerics-changing (e.g. `softmax_precision`) is an **op attribute** declared in the op's spec `python_only_attrs` (never forwarded to C++; a SET value makes the node backend-unlowerable) and surfaces as a graph fact the capability rows gate on.
+- The FROST GEMM engine's arch-specific half exists once per arch family: `python/cudnn/gemm/frost/sm100/` and `sm120/` each own a `compiler.py`, `epilogue_codegen.py` and `kernel_templates/`. `cudnn.gemm.frost.compiler` / `.epilogue_codegen` are facades that *become* the active family's module on first import (`arch_family.active_family()`: decided once per process from the current GPU, pinned by `CUDNN_FRONTEND_GEMM_ARCH_FAMILY=sm100|sm120`), so callers keep importing the facade path and `monkeypatch.setattr(compiler, ...)` still reaches the real module. Each tree renders only its own pipelines: `_FAMILY` / `_check_own_family` in each compiler decline the other family's template *after* the semantic gates (message `is served by the sm<N> arch tree, but this process runs the sm<M> tree`, which the frost test conftest reports as a skip), and `kernel_registry.preferred_pipeline` never targets a family the process cannot render — so the sm120 pipeline on an SM 10.x GPU needs `CUDNN_FRONTEND_GEMM_ARCH_FAMILY=sm120`. A fix that applies to both trees lands in both copies; a test of one tree's renderer imports that tree by name (`cudnn.gemm.frost.sm120.compiler`). Locate a template through `kernel_registry.template_path(file)` / `KernelTemplate.path` (by its `sm<NNN>_` prefix), never via `Path(compiler.__file__)` — a family may render the other's template where both run. Code both trees' templates import stays above them (`gemm/frost/kernel_templates/`), per the owner-names-the-directory rule in [python/cudnn/frost/README.md](python/cudnn/frost/README.md).
 - Never delete an existing log or diagnostic statement in a cleanup/refactor — several were added after repeated hard-to-repro failures and are the only tripwire for a recurrence (review on PR #280). If one looks redundant, ask before removing.
 - Every new source file needs the repo's SPDX/license header (flagged in review on PR #747) — enforced by the `spdx-license-header` pre-commit hook.
 - Changing any FROST SDPA `Capabilities` field that affects graph eligibility, or adding/retiring an `EngineSpec`, updates [python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md](python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md) in the same commit — it is maintained by hand and has no other tripwire. A change confined to knob domains (`tile_ms`, `sched_policies`, ...) is exempt. [python/cudnn/sdpa/AGENTS.md](python/cudnn/sdpa/AGENTS.md) **Rule S2** is canonical for the exact scope; cite it in review.

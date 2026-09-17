@@ -116,8 +116,8 @@ def generate_norm_charts(
             ax.legend(title="Backend", fontsize=LEGEND_FONT_SIZE)
 
         plt.tight_layout()
-        time_path = output_dir / f"{config.name}_time.png"
-        plt.savefig(time_path, dpi=150, bbox_inches="tight")
+        time_path = output_dir / f"{config.name}_time.webp"
+        plt.savefig(time_path, dpi=150, bbox_inches="tight", pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
         plt.close()
         saved_paths.append(time_path)
         logger.info(f"Chart saved to {time_path}")
@@ -150,8 +150,8 @@ def generate_norm_charts(
             ax.legend(title="Backend", fontsize=LEGEND_FONT_SIZE)
 
         plt.tight_layout()
-        bw_path = output_dir / f"{config.name}_bandwidth.png"
-        plt.savefig(bw_path, dpi=150, bbox_inches="tight")
+        bw_path = output_dir / f"{config.name}_bandwidth.webp"
+        plt.savefig(bw_path, dpi=150, bbox_inches="tight", pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
         plt.close()
         saved_paths.append(bw_path)
         logger.info(f"Chart saved to {bw_path}")

@@ -235,6 +235,8 @@ class KdaCuTileEngine(BaseEngine):
 
         facts = graph._facts_for(analyze)
         cutile_la_gate("KdaCuTileEngine", facts, "KDA", facts.g_dtype if facts is not None else None)
+        if facts.gate_domain != "log":
+            raise NotImplementedError("KdaCuTileEngine: gate_domain='linear' has no cuTile path (the FROST KDA engine serves it)")
         if facts.is_bwd and (facts.safe_gate or facts.use_beta_sigmoid):
             raise NotImplementedError("KdaCuTileEngine: raw-logit gate modes (safe_gate / use_beta_sigmoid) are forward-only")
         if facts.is_bwd and facts.d_v != 128:

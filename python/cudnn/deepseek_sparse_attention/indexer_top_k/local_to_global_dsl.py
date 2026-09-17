@@ -23,13 +23,15 @@ from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major as _get_device_capability,
     resolve_stream,
+    torch_stream_context,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor as _to_cute_tensor
 
 
 class LocalToGlobalTopK:
-    def __init__(self, is_varlen: bool, threads_per_cta: int = 256):
+    def __init__(self, is_varlen: bool, threads_per_cta: int = 256, preserve_negative: bool = False):
         self.is_varlen = is_varlen
+        self.preserve_negative = preserve_negative
         self.threads_per_cta = threads_per_cta
 
     @cute.jit
@@ -113,7 +115,7 @@ class LocalToGlobalTopK:
             # ~ B * max_seqlen_kv ≈ 10^7 ≪ 2^31), and every downstream
             # consumer (dsa-next sparse attn, indexer bwd) requires int32,
             # so we cast on store.
-            global_idx = Int64(-1)
+            global_idx = local if const_expr(self.preserve_negative) else Int64(-1)
             if local >= Int64(0):
                 global_idx = offset + local
             mGlobal[out_coord] = Int32(global_idx)
@@ -159,14 +161,40 @@ def local_to_global(
     elif local_indices.ndim != 3:
         raise ValueError("BSHD local_indices must be 3D")
 
-    global_indices = torch.empty_like(local_indices, dtype=torch.int32)
-    stream = resolve_stream(stream)
+    launch_stream = resolve_stream(stream)
+    if stream is None:
+        global_indices = torch.empty_like(local_indices, dtype=torch.int32)
+    else:
+        with torch_stream_context(stream):
+            global_indices = torch.empty_like(local_indices, dtype=torch.int32)
+    return _launch_local_to_global(local_indices, global_indices, seqlen_k, cu_seqlens_q, cu_seqlens_k, launch_stream)
+
+
+def _local_to_global_inplace(
+    indices: torch.Tensor,
+    seqlen_k: int,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    stream: cuda.CUstream | None = None,
+) -> torch.Tensor:
+    """Internal conversion of validated compressed top-k outputs.
+
+    Dynamic layouts allow caller-owned strided buffers. Each thread updates
+    its own slot, so aliasing the input and output is safe. Preserve every
+    negative sentinel, matching the compressed wrapper's in-place contract.
+    """
+    return _launch_local_to_global(indices, indices, seqlen_k, cu_seqlens_q, cu_seqlens_k, resolve_stream(stream), preserve_negative=True)
+
+
+def _launch_local_to_global(local_indices, global_indices, seqlen_k, cu_seqlens_q, cu_seqlens_k, stream, preserve_negative=False):
+    is_varlen = cu_seqlens_q is not None
     compile_key = (
         local_indices.dtype,
         is_varlen,
+        preserve_negative,
     )
     if compile_key not in _compile_cache:
-        kernel_obj = LocalToGlobalTopK(is_varlen=is_varlen)
+        kernel_obj = LocalToGlobalTopK(is_varlen=is_varlen, preserve_negative=preserve_negative)
         _compile_cache[compile_key] = cute.compile(
             kernel_obj,
             _to_cute_tensor(local_indices),

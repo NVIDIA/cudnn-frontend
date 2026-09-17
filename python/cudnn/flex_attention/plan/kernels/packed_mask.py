@@ -271,6 +271,31 @@ def load_mask_payload_to_smem(
 
 
 @cute.jit
+def create_mask_payload_pipeline(
+    barrier_storage: cute.Pointer,
+    consumer_threads: cutlass.Constexpr[int],
+    tx_count: cutlass.Constexpr[int],
+    defer_sync: cutlass.Constexpr[bool] = True,
+):
+    """Create a CTA-local mask slot whose reuse waits for every reader.
+
+    PipelineTmaAsync normally elects one empty-barrier signaller per warp.
+    Mask words are read independently by each lane; count each reader and
+    make every lane signal instead. This also avoids depending on warp-local
+    reconvergence to order the next bulk copy after all shared loads.
+    """
+    return cutlass.pipeline.PipelineTmaAsync.create(
+        barrier_storage=barrier_storage,
+        num_stages=1,
+        producer_group=cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 1),
+        consumer_group=cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, consumer_threads),
+        tidx=Int32(0),  # A local pipeline signals whenever tidx % 32 == 0.
+        tx_count=tx_count,
+        defer_sync=defer_sync,
+    )
+
+
+@cute.jit
 def consume_mask_payload_from_smem(
     s_mask: cute.Tensor,
     payload_group_idx: Int32,
@@ -283,6 +308,9 @@ def consume_mask_payload_from_smem(
     s_mask_thread = s_mask[payload_group_idx, None]
     r_mask = cute.make_rmem_tensor_like(s_mask_thread, Uint32)
     cute.autovec_copy(s_mask_thread, r_mask)
+    # Finish generic-proxy shared reads before allowing the producer to
+    # overwrite this slot through cp.async.bulk (the async proxy).
+    cute.arch.fence_proxy("async.shared", space="cta")
     mask_pipeline.consumer_release(consumer_state)
     consumer_state.advance()
     return r_mask, consumer_state

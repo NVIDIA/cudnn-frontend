@@ -91,10 +91,16 @@ def _plan_names(g):
     return [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
 
 
+def _is_plan_for(plan_name, engine):
+    """A python plan is named ``engine`` or ``engine[<public knobs>]``."""
+    return plan_name == engine or plan_name.startswith(engine + "[")
+
+
 def _index_of(g, name):
     names = _plan_names(g)
-    assert name in names, f"no plan named {name!r} in {names}"
-    return names.index(name)
+    hits = [i for i, n in enumerate(names) if _is_plan_for(n, name)]
+    assert hits, f"no plan for engine {name!r} in {names}"
+    return hits[0]
 
 
 def _pin_frost(g):
@@ -135,7 +141,10 @@ def test_select_frost_engine_runs_frost():
     torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
 
 
-_OVERRIDE_SHAPES = [(256, 256, 128), (1024, 512, 512), (200, 768, 256), (333, 512, 264)]
+_OVERRIDE_CASES = {
+    "dense": ((256, 256, 128), ((1024, 512, 512), (200, 768, 256), (333, 512, 264))),
+    "splitk": ((128, 128, 16384), ((256, 256, 16384), (128, 256, 16384), (64, 128, 16384))),
+}
 
 
 def _build_matmul_uids(m, n, k):
@@ -160,30 +169,36 @@ def _mm_operands(m, n, k):
 
 
 @_GPU
-def test_override_shape_frost():
+@pytest.mark.parametrize("case", _OVERRIDE_CASES, ids=tuple(_OVERRIDE_CASES))
+def test_override_shape_frost(case):
     """A FROST plan built for one problem size runs OTHER sizes through the native
     override-shape API — ``get_workspace_size_plan_at_index`` /
     ``execute_plan_at_index`` with ``override_uids/shapes/strides`` — and through
     plain ``execute`` with new-shape buffers. The compiled kernel is shape-agnostic
     (M/N/K symbolic), so no rebuild; results are bit-exact (small-int inputs)."""
     h = cudnn.create_handle()
-    m0, n0, k0 = 256, 256, 128
+    (m0, n0, k0), override_shapes = _OVERRIDE_CASES[case]
     g, _A, _B, _C = _build_matmul_uids(m0, n0, k0)
     _plan(g)
     frost = _index_of(g, _FROST)
     g.select_plan(frost)
     g.check_support()
     _build_plans_or_skip(g)  # one JIT compile, at the anchor shape
+    ws0 = g.get_workspace_size()
+    if case == "splitk" and ws0 == 0:
+        pytest.skip("auto selector did not split at this anchor")
 
-    for m, n, k in _OVERRIDE_SHAPES:
+    ou = [1, 2, 3]
+    for m, n, k in override_shapes:
         a, b, ref = _mm_operands(m, n, k)
-        ou = [1, 2, 3]
         osh = [[1, m, k], [1, k, n], [1, m, n]]
         ost = [[m * k, k, 1], [k * n, 1, k], [m * n, n, 1]]
 
         # (a) native override-shape API: workspace query + indexed execute.
         wsz = g.get_workspace_size_plan_at_index(frost, h, ou, osh, ost)
-        assert wsz == 0  # FROST owns its workspace at any shape
+        # dense gemm is 0
+        # splitK: ws0 = S * B * m0 * n0 * 4, wsz = S * B * m * n * 4
+        assert wsz == ws0 * (m * n) // (m0 * n0)
         ws = torch.empty(max(wsz, 1), device="cuda", dtype=torch.uint8)
         c = torch.empty(1, m, n, dtype=torch.bfloat16, device="cuda")
         g.execute_plan_at_index(
@@ -283,7 +298,7 @@ def test_frost_is_one_entry_of_the_ranked_list():
     g, _A, _B, _bias, _Y = _build_matmul_bias_relu()
     _plan(g)
     names = _plan_names(g)
-    assert names.count(_FROST) == 1
+    assert sum(1 for n in names if _is_plan_for(n, _FROST)) == 1
     assert g.get_execution_plan_count() == len(names)
     assert sum(1 for p in g.plans if is_python_engine(p.engine_id)) == 1
 
@@ -544,3 +559,21 @@ def test_override_shape_inside_a_max_allocation_matches_the_backend():
 
     for name, got in results.items():
         torch.testing.assert_close(got, ref, atol=0, rtol=0, msg=lambda s, name=name: f"{name} ran the wrong shape\n{s}")
+
+
+def test_moe_kernel_order_compares_the_declaration_in_storage_slots():
+    """A graph-described B operand arrives in the graph's [b, k, n] order and is
+    permuted to the kernel's (b, n, k); an fp4 declaration spells elements while
+    the slot spells x2 pairs, so the comparison must convert first."""
+    from cudnn.gemm.frost.compiler import _kernel_order
+
+    E, K, N = 4, 256, 512
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, compute_data_type=cudnn.data_type.FLOAT)
+    w_bf16 = g.tensor(name="w", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    w_fp4 = g.tensor(name="w4", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.FP4_E2M1)
+    graph_order = torch.empty(E, N, K, dtype=torch.bfloat16).permute(0, 2, 1)  # (E, K, N) strides (K*N, 1, K)
+    assert tuple(_kernel_order(graph_order, w_bf16).shape) == (E, N, K)
+    kernel_order = torch.empty(E, N, K, dtype=torch.bfloat16)  # the caller's own (b, n, k): left alone
+    assert _kernel_order(kernel_order, w_bf16) is kernel_order
+    fp4_slots = torch.empty(E, N, K // 2, dtype=torch.uint8).permute(0, 2, 1)  # (E, K/2, N) strides (K*N/2, 1, K/2)
+    assert tuple(_kernel_order(fp4_slots, w_fp4).shape) == (E, N, K // 2)

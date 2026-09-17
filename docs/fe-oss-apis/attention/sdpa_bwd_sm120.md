@@ -27,8 +27,8 @@ dBias convert kernels, the GQA `reduce`, `dsink`) in
 
 ## Requirements
 
-The `cutedsl` optional dependency (`nvidia-cutlass-dsl` + `apache-tvm-ffi`)
-and an SM120 or SM121 device.
+The CuTeDSL runtime (`nvidia-cutlass-dsl` + `apache-tvm-ffi`), which ships as a
+required dependency of the package, and an SM120 or SM121 device.
 
 ## API Usage
 

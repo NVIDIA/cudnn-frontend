@@ -22,7 +22,7 @@ The cuDNN graph API detects this pattern automatically when an `rmsnorm` node (i
 
 | GPU Architecture | SM | bf16 Output | FP8 E4M3 Output | NVFP4 E2M1 Output |
 |------------------|-----|-------------|------------------|--------------------|
-| < SM80           | — | ❌ (not supported) | ❌ | ❌ |
+| &lt; SM80           | — | ❌ (not supported) | ❌ | ❌ |
 | Ampere (A100)    | SM80 | ✅           | ❌                | ❌                  |
 | Ada (L40S, 4090) | SM89 | ✅           | ✅                | ❌                  |
 | Hopper (H100)    | SM90 | ✅           | ✅                | ❌                  |

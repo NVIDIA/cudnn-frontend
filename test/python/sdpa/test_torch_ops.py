@@ -37,9 +37,11 @@ _SINKS_UNSUPPORTED = pytest.mark.skipif(cudnn.backend_version() < 91300, reason=
 TOL = 2.5e-2  # bf16 rounding at these magnitudes
 
 
-def ref_attention(q, k, v, scale, is_causal=False, bottom_right=False, window_left=-1, sinks=None, return_lse=False):
+def ref_attention(q, k, v, scale, is_causal=False, bottom_right=False, window_left=-1, window_right=-1, sinks=None, return_lse=False):
     """fp32 reference in BHSD. window_left counts VISIBLE tokens including self
-    (the cuDNN diagonal_band_left_bound convention). sinks: (H,) extra softmax
+    (the cuDNN diagonal_band_left_bound convention); window_right is the last
+    VISIBLE column past the diagonal (diagonal_band_right_bound, so 0 == causal
+    and, unlike the left bound, no off-by-one). sinks: (H,) extra softmax
     logit per query head, contributing no value (but part of the softmax
     denominator, so part of the LSE too)."""
     q, k, v = q.float(), k.float(), v.float()
@@ -58,6 +60,8 @@ def ref_attention(q, k, v, scale, is_causal=False, bottom_right=False, window_le
         mask |= j > (i + off)
     if window_left >= 0:
         mask |= j <= (i + off - window_left)
+    if window_right >= 0:
+        mask |= j > (i + off + window_right)
     s = s.masked_fill(mask, float("-inf"))
 
     if sinks is not None:
@@ -123,6 +127,38 @@ class TestSdpaFwdDense:
         assert (o.float() - ref).abs().max().item() < TOL
 
     @pytest.mark.L0
+    @pytest.mark.parametrize(
+        "window_left,window_right",
+        [(-1, 0), (-1, 64), (128, 32), (32, 128), (64, 64)],
+        ids=["right0_causal", "right_only", "wide_left", "wide_right", "symmetric"],
+    )
+    def test_asymmetric_window(self, window_left, window_right):
+        """window_right admits columns AFTER the diagonal, which no causal or
+        left-only configuration can express. The reference applies the two
+        bounds independently, so an off-by-one on either edge shows up as a
+        mismatched column rather than a uniformly wrong tensor."""
+        torch.manual_seed(0)
+        B, H, S, D = 2, 8, 512, 128
+        q, k, v = bshd(B, H, S, D), bshd(B, H, S, D), bshd(B, H, S, D)
+        scale = D**-0.5
+        o, _ = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, window_left=window_left, window_right=window_right, return_lse=False)
+        ref = ref_attention(q, k, v, scale, window_left=window_left, window_right=window_right)
+        assert (o.float() - ref).abs().max().item() < TOL
+
+    @pytest.mark.L0
+    def test_window_right_zero_matches_causal(self):
+        """window_right=0 masks every column past the diagonal, i.e. exactly
+        is_causal — the two spellings must produce identical bytes so the
+        provider can fold FA's window_size=(_, 0) into is_causal."""
+        torch.manual_seed(0)
+        B, H, S, D = 2, 4, 256, 128
+        q, k, v = bshd(B, H, S, D), bshd(B, H, S, D), bshd(B, H, S, D)
+        scale = D**-0.5
+        o_win, _ = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, window_right=0, return_lse=False)
+        o_causal, _ = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, is_causal=True, return_lse=False)
+        assert torch.equal(o_win, o_causal)
+
+    @pytest.mark.L0
     def test_bottom_right_causal_cross_seqlen(self):
         torch.manual_seed(0)
         B, H, Sq, Skv, D = 2, 8, 128, 512, 128
@@ -180,6 +216,25 @@ class TestSdpaFwdDense:
 
 class TestOpContract:
     @pytest.mark.L0
+    def test_causal_with_future_window_right_rejected(self):
+        """is_causal masks every future column; window_right > 0 admits some.
+        Silently letting one win would give a mask the caller did not ask for,
+        so the pairing is rejected instead."""
+        q = bshd(1, 2, 128, 64)
+        with pytest.raises(Exception, match="window_right"):
+            torch.ops.cudnn.sdpa_fwd(q, q.clone(), q.clone(), 0.125, is_causal=True, window_right=8)
+
+    @pytest.mark.L0
+    def test_causal_with_future_window_right_rejected_bwd(self):
+        """The backward must reject the pairing the forward rejects, or a
+        direct sdpa_bwd call would compute gradients for a band the forward
+        never applied."""
+        q = bshd(1, 2, 128, 64)
+        o, lse = torch.ops.cudnn.sdpa_fwd(q, q.clone(), q.clone(), 0.125, is_causal=True, return_lse=True)
+        with pytest.raises(Exception, match="window_right"):
+            torch.ops.cudnn.sdpa_bwd(torch.randn_like(o), q, q.clone(), q.clone(), o, lse, 0.125, is_causal=True, window_right=8)
+
+    @pytest.mark.L0
     def test_opcheck(self):
         """torch.library.opcheck: fake-vs-real metadata agreement, schema
         round-trip, and autograd registration — including dynamic-shape AOT
@@ -221,6 +276,25 @@ class TestSdpaBwdDense:
         ref = torch.nn.functional.scaled_dot_product_attention(qr, kr, vr, is_causal=is_causal, scale=scale)
         ref.backward(grad.float())
         return ref, qr.grad, kr.grad, vr.grad
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("window_left,window_right", [(-1, 64), (128, 32)], ids=["right_only", "asymmetric"])
+    def test_dense_backward_asymmetric_window(self, window_left, window_right):
+        """Gradients under a band that admits future columns. F.sdpa cannot
+        express this, so the reference builds the mask explicitly."""
+        torch.manual_seed(0)
+        B, H, S, D = 2, 4, 256, 128
+        q, k, v = bshd(B, H, S, D), bshd(B, H, S, D), bshd(B, H, S, D)
+        scale = D**-0.5
+        o, lse = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, window_left=window_left, window_right=window_right, return_lse=True)
+        grad = torch.randn_like(o)
+        dq, dk, dv = torch.ops.cudnn.sdpa_bwd(grad, q, k, v, o, lse, scale, window_left=window_left, window_right=window_right)
+
+        qr, kr, vr = (t.detach().clone().float().requires_grad_(True) for t in (q, k, v))
+        ref = ref_attention(qr, kr, vr, scale, window_left=window_left, window_right=window_right)
+        ref.backward(grad.float())
+        for name, got, rg in (("dq", dq, qr.grad), ("dk", dk, kr.grad), ("dv", dv, vr.grad)):
+            self._assert_close(name, got, rg)
 
     @pytest.mark.L0
     @pytest.mark.parametrize("is_causal", [False, True])

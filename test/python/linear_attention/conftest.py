@@ -23,8 +23,11 @@ try:
     import cudnn
 
     _SRC_CUDNN = Path(__file__).resolve().parents[3] / "python" / "cudnn"
-    if _SRC_CUDNN.is_dir() and str(_SRC_CUDNN) not in cudnn.__path__:
-        cudnn.__path__.append(str(_SRC_CUDNN))
+    if _SRC_CUDNN.is_dir():
+        source_path = str(_SRC_CUDNN)
+        if source_path in cudnn.__path__:
+            cudnn.__path__.remove(source_path)
+        cudnn.__path__.insert(0, source_path)
 except ImportError:
     pass  # test_la.py skips via importorskip
 

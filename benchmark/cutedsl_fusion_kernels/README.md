@@ -45,7 +45,7 @@ docker run -it --gpus=all --workdir /workspace \
 Then, inside the container:
 
 ```bash
-PIP_CONSTRAINT="" pip install nvidia-cudnn-frontend[cutedsl] transformer-engine
+PIP_CONSTRAINT="" pip install nvidia-cudnn-frontend transformer-engine
 
 python cutedsl_fusion_benchmarks.py
 ```
@@ -74,7 +74,7 @@ nsys profile --force-overwrite=true --trace=cuda,nvtx,osrt --cuda-graph-trace=no
 ## Results
 
 Pass `--output-dir` to write `output.txt` (device/versions/summary),
-`output_verbose.txt` (per-activation detail), and `results.png` (speedup plot):
+`output_verbose.txt` (per-activation detail), and `results.webp` (speedup plot):
 
 ```bash
 python cutedsl_fusion_benchmarks.py --output-dir results
@@ -87,8 +87,8 @@ The results below were generated with the default shape
 
 ### B200
 
-![cuDNN fused-epilogue speedups vs Transformer Engine on NVIDIA GB200](results/B200/results.png)
+![cuDNN fused-epilogue speedups vs Transformer Engine on NVIDIA GB200](results/GB200/results.webp)
 
 ### B300
 
-![cuDNN fused-epilogue speedups vs Transformer Engine on NVIDIA GB300](results/B300/results.png)
+![cuDNN fused-epilogue speedups vs Transformer Engine on NVIDIA GB300](results/GB300/results.webp)

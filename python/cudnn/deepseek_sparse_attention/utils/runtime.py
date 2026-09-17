@@ -12,8 +12,24 @@ import cuda.bindings.driver as cuda
 
 
 @lru_cache(maxsize=None)
+def _device_capability(device_index: int) -> tuple[int, int]:
+    return torch.cuda.get_device_capability(device_index)
+
+
+def device_capability(device=None) -> tuple[int, int]:
+    if device is None:
+        index = torch.cuda.current_device()
+    elif isinstance(device, int):
+        index = device
+    else:
+        index = torch.device(device).index
+        if index is None:
+            index = torch.cuda.current_device()
+    return _device_capability(index)
+
+
 def device_major() -> int:
-    return torch.cuda.get_device_capability()[0]
+    return device_capability()[0]
 
 
 def maybe_contiguous(
@@ -55,12 +71,18 @@ def validate_q_causal_offsets(
 def resolve_stream(current_stream: Optional[cuda.CUstream] = None) -> cuda.CUstream:
     if current_stream is not None:
         return current_stream
-    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
 
 
 @contextmanager
 def torch_stream_context(current_stream: Optional[cuda.CUstream] = None) -> Iterator[None]:
     if current_stream is None:
+        yield
+        return
+    # A resolved handle usually names the already-current stream. Avoid
+    # constructing ExternalStream and entering another CUDA stream context.
+    active = torch.cuda.current_stream(torch.cuda.current_device())
+    if int(current_stream) == active.cuda_stream:
         yield
         return
     with torch.cuda.stream(torch.cuda.get_stream_from_external(int(current_stream))):

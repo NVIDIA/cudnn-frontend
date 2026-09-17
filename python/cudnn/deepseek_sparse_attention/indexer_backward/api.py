@@ -22,6 +22,8 @@ from typing import Optional
 import torch
 import cuda.bindings.driver as cuda
 
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
+
 from cudnn.api_base import APIBase, TupleDict
 from cudnn.tensor_adapter import canonicalize_unit_dim_strides
 from cudnn.deepseek_sparse_attention.utils.runtime import (
@@ -267,6 +269,7 @@ class IndexerBackward(APIBase):
         # Derived gate kept so the internal dispatch/validation sites read a
         # single boolean; ``backend`` remains the public, cache-keyed selector.
         self.use_v2 = backend == "sm100_v2"
+        self._plan_layout_validated = False
 
     def _validate_plan_shapes_and_layout(self) -> None:
         """Semantic shape + layout validation of the plan's tensor descriptors.
@@ -325,6 +328,8 @@ class IndexerBackward(APIBase):
                     f"{tuple(desc.shape)} with non-compact stride {tuple(desc.stride)}. The kernel addresses "
                     "index_k/d_index_k with a hard-coded compact (D, 1) stride and the backend caches do not key the layout."
                 )
+
+        self._plan_layout_validated = True
 
     def check_support(self) -> bool:
         # The generic gate reads the plan's own device for backend="sm100_v2"
@@ -507,7 +512,7 @@ class IndexerBackward(APIBase):
                 raise ValueError(
                     f"{name} dtype mismatch: this plan was compiled for {desc.dtype}, got {tensor.dtype}. Build a new plan (or use indexer_backward_wrapper) for a different signature."
                 )
-            tensor_shape = tuple(self._tensor_shape(tensor, name=name))
+            tensor_shape = tuple(tensor.shape)
             desc_shape = tuple(desc.shape)
             if tensor_shape != desc_shape:
                 raise ValueError(f"{name} shape mismatch: this plan was compiled for {desc_shape}, got {tensor_shape}.")
@@ -516,8 +521,10 @@ class IndexerBackward(APIBase):
             # unobservable stride): the compiled kernel bakes in the sample
             # stride/layout, so a different stride would run the kernel against
             # a layout it was not compiled for.
-            tensor_stride = tuple(self._tensor_stride(tensor, name=name))
-            if canonicalize_unit_dim_strides(tensor_shape, tensor_stride) != canonicalize_unit_dim_strides(desc_shape, tuple(desc.stride)):
+            tensor_stride = tuple(tensor.stride())
+            if tensor_stride != tuple(desc.stride) and canonicalize_unit_dim_strides(tensor_shape, tensor_stride) != canonicalize_unit_dim_strides(
+                desc_shape, tuple(desc.stride)
+            ):
                 raise ValueError(f"{name} stride/layout mismatch: this plan was compiled for stride {tuple(desc.stride)}, got {tensor_stride}.")
 
     def execute(
@@ -546,11 +553,11 @@ class IndexerBackward(APIBase):
         # signature-keyed wrapper cache never hits this, but a directly-
         # built/exported plan can.
         #
-        # First re-assert the plan's own descriptors are semantically
-        # consistent + compact (idempotent with check_support; also covers a
-        # directly-built plan whose owner skipped check_support), then verify
+        # Validate immutable plan descriptors once (also covers a directly-
+        # built plan whose owner skipped check_support), then verify
         # each runtime tensor matches the descriptor it was compiled for.
-        self._validate_plan_shapes_and_layout()
+        if not self._plan_layout_validated:
+            self._validate_plan_shapes_and_layout()
         self._check_execute_signature(
             (index_q, self.iq_desc, "index_q"),
             (weights, self.w_desc, "weights"),
@@ -794,7 +801,10 @@ def indexer_backward_wrapper(
         topk_indices_global: whether ``topk_indices`` already contains global
             flat KV ids. The cudnn top-k wrapper returns local per-batch ids by
             default, so this wrapper defaults to ``False`` and lets the kernel
-            add the batch offset internally.
+            validate each local id and add the batch offset internally. On
+            SM100, both conventions use the same optimized Gather4 path when
+            the installed CuTe DSL exposes it; converting local ids in a
+            separate launch is unnecessary for this backward kernel.
         sm_scale: indexer softmax scale baked into the forward via the
             weights-scaling trick.
         loss_coeff: coefficient scaling the KL-divergence loss in the
@@ -1005,7 +1015,7 @@ def dense_indexer_backward_wrapper(
     device as ``index_q``. The kernel reads its value at runtime, including on
     CUDA Graph replay.
     """
-    major, _ = torch.cuda.get_device_capability()
+    major, _ = device_capability()
     backend_stream = None if major == 9 else stream
 
     with _torch_stream_context(backend_stream):

@@ -2267,6 +2267,33 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_dispatch_threshold():
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+def test_DSA_indexer_backward_sm100_local_ids_use_tma_gather(topk):
+    """Normalize local ids in-kernel without giving up the Gather4 path."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ required")
+
+    try:
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import IndexerBackwardSm100, _HAS_TMA_GATHER4
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    kernel = IndexerBackwardSm100(
+        128,
+        heads=64,
+        block_I=128,
+        topk=topk,
+        total_seqlen_k=8192,
+        total_rows=sm_count + 1,
+        persistent_grid_size=sm_count,
+        topk_indices_global=False,
+    )
+    assert kernel.use_tma_gather is _HAS_TMA_GATHER4
+    assert kernel.use_cross_row_persistent is (_HAS_TMA_GATHER4 and topk == 512)
+
+
+@pytest.mark.L1
 @pytest.mark.parametrize("topk", [128, 256, 384, 512])
 def test_DSA_indexer_backward_sm100_score_grad_packed_rows_and_fused_dk_zero(topk):
     """Packed tail rows preserve score math and clear the FP32 dK scratch."""
@@ -2417,7 +2444,10 @@ def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(
         for topk_indices_global in (True, False)
         for topk in (128, 256, 384)
     ]
-    + [pytest.param(512, True, True, id="global-512-manual-k-load")],
+    + [
+        pytest.param(512, False, False, id="local-512"),
+        pytest.param(512, True, True, id="global-512-manual-k-load"),
+    ],
 )
 def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
     topk,

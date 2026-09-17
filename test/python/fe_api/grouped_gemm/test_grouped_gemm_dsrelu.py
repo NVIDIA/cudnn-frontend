@@ -961,7 +961,7 @@ def test_grouped_gemm_dsrelu_deterministic_at_scale(request):
 
     Measured (job 466159, 16 launches per config): at l=4 / [256] * 4 / n=512 -- what every other
     determinism test here uses -- the non-deterministic dprob AND dbias are both already bit-stable,
-    so those tests cannot distinguish a working fix from a broken one. At l=8 / [1024] * 8 / n=2048
+    so those tests cannot distinguish a working fix from an invalid one. At l=8 / [1024] * 8 / n=2048
     both vary 15/15. This is the case that actually demonstrates the flag does something.
 
     L1 rather than L0: it is roughly 16x the work of the smoke configs.
@@ -1176,12 +1176,19 @@ def test_grouped_gemm_dsrelu_deterministic_dprob_discrete(request, ab_dtype, c_d
 
     baseline = run(deterministic=False)
     deterministic = run(deterministic=True)
+    # The FP8 kernels may reassociate the same fp32 dprob sum differently on
+    # Rubin (the observed delta is below 5e-4).  This remains far below the
+    # tens-of-percent signal from a dropped or duplicated partial.  Keep the
+    # tighter default for the FP4 kernel, which does not show that drift.
+    dprob_tol = 1e-3 if ab_dtype == torch.float8_e4m3fn else 1e-4
     _assert_dprob_deterministic(
         (inputs, cfg),
         baseline,
         deterministic,
         lambda: run(deterministic=True),
         ref_inputs=_dense_ref_inputs_from_discrete(inputs),
+        dprob_rtol=dprob_tol,
+        dprob_atol=dprob_tol,
     )
 
 

@@ -159,10 +159,6 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
                                    error_code_t::ATTRIBUTE_NOT_SET,
                                    "Intermediate tensor data type needs to be set as internal tensors require it.");
 
-    // The Stats layout check (packed BHSD required prior to 9.26.0) lives in
-    // SDPANode::post_validate_node(), as it must run after shape inference has
-    // filled in the dim/stride of an unset Stats output.
-
     if (mma_core_mode == DataType_t::FP8_E4M3 || mma_core_mode == DataType_t::FP8_E5M2) {
         // FP8 specific validation
 
@@ -466,6 +462,13 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 has_input(input_names::CU_SEQ_LEN_Q) || has_input(input_names::CU_SEQ_LEN_KV),
                 error_code_t::GRAPH_NOT_SUPPORTED,
                 "Composite SDPA node doesn't support CU_SEQ_LEN_Q / CU_SEQ_LEN_KV inputs");
+            // Base-2 stats are an attribute of the fused SDPA_FWD op; the composite softmax has none, and
+            // an appended pointwise on Stats has no servable engine. Reject here so auto-select routes
+            // such graphs to the unified implementation (or a FROST engine) instead.
+            RETURN_CUDNN_FRONTEND_ERROR_IF(stats_use_log2 && generate_stats.value_or(false),
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Composite SDPA node doesn't support stats_use_log2 (requires the UNIFIED "
+                                           "implementation on cuDNN 9.28.0+ or a FROST engine)");
             // The ragged offset multiplier is only supported by the unified forward engine.
             // Reject it here so auto-select routes such graphs to the unified implementation.
             for (const auto& [key, value] : inputs) {

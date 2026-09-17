@@ -8,6 +8,7 @@ The header-only C++ library (CMake INTERFACE target `cudnn_frontend`, C++17). Um
 - Builds with `-Wall -Wextra -Wpedantic -Werror` (GCC/Clang) and `/W4 /WX` (MSVC) — code must be warning-clean on both.
 - C++17 only in `include/` (the pybind11 layer under `python/` is C++20).
 - Guard anything needing a newer cuDNN with runtime `detail::get_backend_version()` checks (compare against `CUDNN_FRONTEND_VERSION`-style integers, e.g. 9.12.0 → 91200); the same headers must compile against older cuDNN 9.x. **Declare unconditionally, gate in the body**: an `#if`-conditional declaration bakes the build-time cuDNN version into the artifact, so a wheel built against 9.23 silently loses the symbol on a 9.24 system — declare the API always and return not-supported at runtime instead (review on PR #246).
+- **A development version number does not prove an enum attribute exists.** Companion backend changes can lag newer headers. For an unreleased enum attribute, detect the enumerator through a dependent enum-type lookup (see `detail::get_sdpa_stats_log2_attribute`) and return not-supported if absent; keep the runtime version check too. Compile against both headers without the attribute and the companion headers that define it. `#ifdef` cannot detect an enum constant, and guessing its integer value risks an ABI collision.
 - clang-format (Google-based, indent 4, 120 cols, `SortIncludes: false`) via `pre-commit run`.
 
 ## Layering
@@ -33,8 +34,8 @@ Legacy flat API (`include/cudnn_frontend_*.h`: Tensor, Operation, ExecutionPlan,
 
 ## experimental/ and generated/
 
-- `generated/` holds **open-sourced kernel source embedded as raw C++ string literals** (`inline constexpr const char <name>_source[]`, namespace `cudnn_frontend::experimental::generated`) — SDPA prefill (sm90/sm100) and RMSNorm+SiLU. These files are large and machine-produced; don't hand-edit kernel bodies casually, and don't "clean them up".
-- `experimental/` is the NVRTC glue that compiles those strings at runtime (`IOssSdpaEngine`: `check_support`/`build`/`execute`, per-arch engines, `nvrtc_shim.h`).
+- `generated/` holds **open-sourced kernel source embedded as raw C++ string literals** (`inline constexpr const char <name>_source[]`, namespace `cudnn_frontend::experimental::generated`) — RMSNorm+SiLU. These files are large and machine-produced; don't hand-edit kernel bodies casually, and don't "clean them up".
+- `experimental/` is the NVRTC glue that compiles those strings at runtime (`IOssNormEngine`: `check_support`/`build`/`execute`, per-arch engines, `nvrtc_shim.h`).
 
 ## Versioning
 

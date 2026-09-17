@@ -1,7 +1,6 @@
 
 # Block Scaling
 
-(block-scale-quantize)=
 ## Block Scale Quantize
 
 The block scale quantize operation computes the quantized output
@@ -42,7 +41,6 @@ Block_scale_quantize_attributes&
 set_transpose(bool const value)
 ```
 
-(block-scale-dequantize)=
 ## Block Scale Dequantize
 
 The block scale dequantize operation computes the dequantized output

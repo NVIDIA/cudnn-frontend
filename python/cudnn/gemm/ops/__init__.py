@@ -13,6 +13,7 @@ _LAZY_EXPORTS = {
     # Both semantic entry points share the existing implementation module.
     "situ_mlp": ("cudnn.gemm.ops.swiglu_mlp", "situ_mlp"),
     "swiglu_mlp": ("cudnn.gemm.ops.swiglu_mlp", "swiglu_mlp"),
+    "swiglu_moe": ("cudnn.gemm.ops.swiglu_moe", "swiglu_moe"),
 }
 
 

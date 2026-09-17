@@ -30,7 +30,6 @@ add_executable(
     sdpa/fp16_bwd_with_sink_token.cpp
     sdpa/fp16_fwd_with_max_and_sum_exp.cpp
     sdpa/fp16_fwd_with_block_mask.cpp
-    sdpa/prefill_oss_engine.cpp
 
     convolution/fprop.cpp
     convolution/fp8_fprop.cpp

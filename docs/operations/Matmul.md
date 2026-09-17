@@ -4,7 +4,7 @@ The Matmul operation computes:
 
 $$ C[M, N] = A[M, K] * B[K, N] $$
 
-Last two dimensions of input dimensions are interpreted as M, N, K. All other preceding dimensions are interpreted as batch dimensions. The operation also has broadcasting capabilities which are described in {ref}`cudnn backend's matmul operation <CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR>`.
+Last two dimensions of input dimensions are interpreted as M, N, K. All other preceding dimensions are interpreted as batch dimensions. The operation also has broadcasting capabilities which are described in [cudnn backend's matmul operation](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/cudnn-graph-library.html#cudnn-backend-operation-matmul-descriptor).
 
 ## C++ API
 

@@ -15,7 +15,7 @@ are None and not produced, while the in-place dGate rewrite always runs.
 
 The parameter gradients are cross-token sums, done deterministically: every
 fp32 accumulator owns a statically assigned (head[, channel], token-slice)
-and partials are combined through fixed-shape trees only — the bracketing is
+and partials are combined through fixed-shape trees only, the bracketing is
 a pure function of the shapes, never of scheduling, so results are bitwise
 stable run to run.  Two stages with a launch boundary as the grid barrier:
 a partial pass over token stripes (the same pass rewrites dGate -> dg_raw),
@@ -118,7 +118,7 @@ def frost_scalar_gate_bwd_finish(
 ) -> None:
     """Grid (HO,), block (32,): head h's stripe partials fold as 8 fixed
     interleaved chains per lane (independent accumulators), then the 8 chains
-    pairwise and one butterfly tree across the 32 lanes — a fixed-shape
+    pairwise and one butterfly tree across the 32 lanes, a fixed-shape
     bracketing regardless of the stripe count.  mDA is None iff mPartA is,
     mDDt iff mPartDt is; at least one pair is present."""
     if cutlass.const_expr(USE_PDL):
@@ -504,7 +504,7 @@ def channel_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, 
     cache["compiled"](*tensors, *args, float(gate_lower_bound), cu_stream)
 
 
-frost_scalar_gate_bwd_partial.set_name_prefix("cudnn", remove_cutlass_symbol=True)
-frost_scalar_gate_bwd_finish.set_name_prefix("cudnn", remove_cutlass_symbol=True)
-frost_channel_gate_bwd_partial.set_name_prefix("cudnn", remove_cutlass_symbol=True)
-frost_channel_gate_bwd_finish.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_scalar_gate_bwd_partial.set_name_prefix("cudnn", remove_cutlass_symbol=False)
+frost_scalar_gate_bwd_finish.set_name_prefix("cudnn", remove_cutlass_symbol=False)
+frost_channel_gate_bwd_partial.set_name_prefix("cudnn", remove_cutlass_symbol=False)
+frost_channel_gate_bwd_finish.set_name_prefix("cudnn", remove_cutlass_symbol=False)

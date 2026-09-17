@@ -26,17 +26,19 @@ def _is_sm80() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability(torch.cuda.current_device()) == (8, 0)
 
 
-def _dsl_available() -> bool:
-    try:
-        import cutlass  # noqa: F401
-    except ImportError:
-        return False
-    return True
+def _has_supported_cutedsl() -> bool:
+    """Rule 7 (python/cudnn/AGENTS.md): skip below CUTEDSL_MIN_VERSION instead of
+    failing inside the DSL when the kernel module loads."""
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    return bool(installed) and not cutedsl_too_old(version)
 
 
 pytestmark = [
     pytest.mark.L0,
-    pytest.mark.skipif(not (_is_sm80() and _dsl_available()), reason="needs an SM80 (A100) GPU with cutlass"),
+    pytest.mark.skipif(not _is_sm80(), reason="needs an SM80 (A100) GPU"),
+    pytest.mark.skipif(not _has_supported_cutedsl(), reason="requires nvidia-cutlass-dsl at or above cudnn.frost.buffers.CUTEDSL_MIN_VERSION"),
 ]
 
 _B, _H, _S, _D = 2, 8, 256, 128

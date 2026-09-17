@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <optional>
 #include <unordered_set>
 
 #include "../../cudnn_frontend_Heuristics.h"
@@ -23,6 +24,25 @@
 #include "paged_cache_load.h"
 #include "block_scale_dequantize.h"
 #include "sdpa_support_surface.h"
+
+namespace cudnn_frontend::detail {
+
+// Development headers may advertise a newer version before this attribute lands.
+// Make the enum lookup dependent so those headers still compile without guessing its ABI value.
+template <typename AttributeName>
+constexpr auto
+get_sdpa_stats_log2_attribute(int)
+    -> decltype(std::optional<AttributeName>{AttributeName::CUDNN_ATTR_OPERATION_SDPA_FWD_STATS_LOG2}) {
+    return AttributeName::CUDNN_ATTR_OPERATION_SDPA_FWD_STATS_LOG2;
+}
+
+template <typename AttributeName>
+constexpr std::optional<AttributeName>
+get_sdpa_stats_log2_attribute(long) {
+    return std::nullopt;
+}
+
+}  // namespace cudnn_frontend::detail
 
 namespace cudnn_frontend::graph {
 
@@ -140,11 +160,6 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
     SDPANodeBase(SDPA_attributes&& attributes_, detail::Context const& context)
         : NodeCRTP<DerivedT>(context), attributes(std::move(attributes_)) {}
-
-    SDPA_attributes const*
-    get_sdpa_attributes() const override {
-        return &attributes;
-    }
 
     bool
     is_paged_v() const {
@@ -522,10 +537,13 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "The Stats output of sdpa must be an FP32 tensor.");
 
-        // Non-ragged Stats layouts other than packed BHSD are not correctly supported prior to 9.26.0.
+        // The forward Stats store honours the declared B/H/S strides since cuDNN 9.12 (backend
+        // commit 543ae842a7); before that a non-ragged Stats output was written at packed-BHSD
+        // offsets whatever its declared layout. The backward *read* of a non-ragged Stats input has
+        // the same limitation until 9.26 -- that guard lives in CompositeSDPABackwardNode.
         // Runs post shape inference so that an unset Stats layout (always inferred as packed BHSD)
         // is not rejected.
-        if (has_stats && !stats_out->second->get_ragged_offset() && detail::get_backend_version() < 92600) {
+        if (has_stats && !stats_out->second->get_ragged_offset() && detail::get_backend_version() < 91200) {
             auto const& stats_dim           = stats_out->second->get_dim();
             auto const& stats_stride        = stats_out->second->get_stride();
             bool const stats_is_packed_bhsd = stats_dim.size() == 4 && stats_stride.size() == 4 &&
@@ -535,7 +553,7 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 !stats_is_packed_bhsd,
                 error_code_t::GRAPH_NOT_SUPPORTED,
-                "For cuDNN version below 9.26.0, a non-ragged Stats output must be a packed BHSD "
+                "For cuDNN version below 9.12.0, a non-ragged Stats output must be a packed BHSD "
                 "tensor.");
         }
 
@@ -1505,10 +1523,11 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                         "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
         }
 
-        // Non-ragged layouts other than BHSD are not correctly supported prior to 9.26.0.
-        // TODO: move to sdpa_support_surface.h (where the forward twin of this check lives)
-        // once the backward path grows a SDPA_backward_attributes support surface there —
-        // today that file serves only the forward attributes.
+        // Non-ragged Stats INPUT layouts other than packed BHSD are not correctly read prior to 9.26.0
+        // (the forward store honours the declared layout since 9.12; see SDPANodeBase).
+        // TODO: move to sdpa_support_surface.h once the backward path grows a
+        // SDPA_backward_attributes support surface there — today that file serves only the
+        // forward attributes.
         if (detail::get_backend_version() < 92600 && !attributes.inputs.at(input_names::Stats)->get_ragged_offset()) {
             auto const& stats_dim    = attributes.inputs.at(input_names::Stats)->get_dim();
             auto const& stats_stride = attributes.inputs.at(input_names::Stats)->get_stride();
@@ -2822,6 +2841,25 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
 #else
             return unfuse_fma_cudnn_ver_error;
 #endif
+        }
+
+        // Base-2 Stats scales the entire natural-log LSE by log2(e).
+        auto stats_log2_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
+        if (attributes.stats_use_log2 && stats_log2_it != attributes.outputs.end() && stats_log2_it->second) {
+            constexpr auto stats_log2_attr = detail::get_sdpa_stats_log2_attribute<cudnnBackendAttributeName_t>(0);
+            if (!stats_log2_attr.has_value()) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "stats_use_log2 requires cuDNN headers with the SDPA Stats log-base attribute"};
+            }
+            auto stats_log2_cudnn_ver_error =
+                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "stats_use_log2 in unified SDPA node requires cuDNN 9.28.0"};
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92800, stats_log2_cudnn_ver_error);
+            bool stats_log2_value = true;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           *stats_log2_attr,
+                                                           CUDNN_TYPE_BOOLEAN,
+                                                           1,
+                                                           &stats_log2_value));
         }
 
         // Dropout attributes

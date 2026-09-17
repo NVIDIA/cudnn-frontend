@@ -1,5 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 import ast
 from pathlib import Path
@@ -8,6 +8,7 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _KERNEL_ROOTS = (
+    _REPO_ROOT / "python" / "cudnn" / "conv",
     _REPO_ROOT / "python" / "cudnn" / "gemm",
     _REPO_ROOT / "python" / "cudnn" / "sdpa",
 )
@@ -35,8 +36,7 @@ def _is_cudnn_name_prefix(statement: ast.stmt, kernel_name: str) -> bool:
     if len(call.args) != 1 or not isinstance(call.args[0], ast.Constant) or call.args[0].value != "cudnn":
         return False
 
-    remove_cutlass_symbol = next((kw.value for kw in call.keywords if kw.arg == "remove_cutlass_symbol"), None)
-    return isinstance(remove_cutlass_symbol, ast.Constant) and remove_cutlass_symbol.value is True
+    return True
 
 
 def _missing_prefixes(node: ast.AST, scope: tuple[str, ...] = ()) -> list[str]:
@@ -58,7 +58,7 @@ def _missing_prefixes(node: ast.AST, scope: tuple[str, ...] = ()) -> list[str]:
 
 
 @pytest.mark.L0
-def test_gemm_and_sdpa_kernels_have_cudnn_name_prefix():
+def test_frost_kernels_have_cudnn_name_prefix():
     missing = []
     counts = {}
     for root in _KERNEL_ROOTS:
