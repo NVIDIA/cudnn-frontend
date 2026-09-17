@@ -238,7 +238,7 @@ half first and the up half second. The parent is the external variant-pack
 input; the slices are virtual graph values. No weight repack is performed
 by plan execution.
 
-This specialization supports SM100, 1 through 8 total routed rows, and
+This specialization supports SM100, 1 through 513 total routed rows, and
 positive `N` and `K` divisible by 64. Tokens and output must be compact;
 weight row/expert strides must be positive and 16-byte aligned. Expert starts
 are contiguous INT32 metadata with the existing monotone in-range MoE contract.
@@ -263,7 +263,8 @@ an independently validated early-PDL change. It builds on Yanqin Zhai's
 [SM100 swap-AB implementation](https://github.com/NVIDIA/cudnn-frontend/pull/1090),
 NVIDIA CUTLASS example 113 layout concepts, and canonical rank-5 weight pairing.
 TRT-LLM gated-row interleaving informed the exploration; no TRT-LLM kernel body
-is copied. The larger-token KF candidate is not included.
+is copied. The row-range extension reuses the generic persistent kernel. The newer
+R<=8 scheduler specialization is still experimental and is not included.
 
 ### Frost SM120 shared-input fusion
 

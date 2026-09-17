@@ -114,12 +114,21 @@ def test_paired_graph_eligibility_and_native_metadata():
             mg.set_output(True)
         return g
 
-    for options in ({}, {"reverse_nodes": True}, {"padded": True}, {"r": 1}, {"n": 768, "k": 2048}):
+    for options in ({}, {"reverse_nodes": True}, {"padded": True}, {"r": 1}, {"r": 9}, {"r": 17}, {"r": 64}, {"r": 512}, {"r": 513}, {"n": 768, "k": 2048}):
         spec = analyze_pair(make(**options))
         assert len(spec.binding.operand_slices) == 2
         assert spec.binding.bound_tensors() == [spec.tokens, spec.weight, spec.output, spec.offsets]
         checks.append(dict(accepted=options, rows=spec.rows, features=spec.features))
-    for options in ({"r": 9}, {"n": 32}, {"k": 32}, {"reverse_halves": True}, {"narrow_activation": True}, {"wrong_mul": True}, {"extra_output": True}):
+    for options in (
+        {"r": 0},
+        {"r": 514},
+        {"n": 32},
+        {"k": 32},
+        {"reverse_halves": True},
+        {"narrow_activation": True},
+        {"wrong_mul": True},
+        {"extra_output": True},
+    ):
         try:
             analyze_pair(make(**options))
         except (NotImplementedError, ValueError) as exc:

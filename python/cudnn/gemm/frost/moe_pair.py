@@ -56,8 +56,8 @@ def analyze_pair(graph, *, dynamic_shapes=False):
         raise NotImplementedError("paired MoE requires BF16 operands and FP32 projections")
     if moe.offset_dtype != "int32" or moe.weight_layout is not None or moe.num_groups != moe.num_experts:
         raise NotImplementedError("paired MoE requires one int32 offset group per canonical expert")
-    if not 1 <= mm.M <= 8 or mm.N <= 0 or mm.K <= 0 or moe.num_experts <= 0 or mm.N % 64 or mm.K % 64:
-        raise NotImplementedError("paired MoE requires 1<=R<=8 and N,K divisible by64")
+    if not 1 <= mm.M <= 513 or mm.N <= 0 or mm.K <= 0 or moe.num_experts <= 0 or mm.N % 64 or mm.K % 64:
+        raise NotImplementedError("paired MoE requires 1<=R<=513 and N,K divisible by64")
     if len(chain.ops) != 2 or len(chain.output_specs) != 1 or len(binding.outputs) != 1:
         raise NotImplementedError("paired MoE requires exactly swish then multiply and one output")
     swish, mul = chain.ops

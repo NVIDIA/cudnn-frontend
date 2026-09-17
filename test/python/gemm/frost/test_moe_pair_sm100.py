@@ -17,6 +17,12 @@ pytestmark = [
 ]
 
 cases = [
+    # Exercise token-tile boundaries and multiple token tiles per expert.
+    dict(name="nine_rows", experts=4, rows=9, k=128, n=64, sizes=[4, 0, 5, 0], pitched=False),
+    dict(name="seventeen_rows", experts=4, rows=17, k=128, n=128, sizes=[0, 17, 0, 0], pitched=True),
+    dict(name="target_r64", experts=128, rows=64, k=2048, n=768, sizes=[1] * 64 + [0] * 64, pitched=False),
+    dict(name="target_r512", experts=128, rows=512, k=2048, n=768, sizes=[4] * 128, pitched=False),
+    dict(name="skew_r513", experts=128, rows=513, k=128, n=64, sizes=[8, 9, 17, 64, 415] + [0] * 123, pitched=True),
     dict(name="compact", experts=4, rows=8, k=128, n=64, sizes=[2, 0, 3, 3], pitched=False),
     dict(name="pitched_square", experts=5, rows=7, k=128, n=128, sizes=[0, 1, 0, 3, 3], pitched=True),
     dict(name="target_sparse", experts=128, rows=8, k=2048, n=768, sizes=[1] * 7 + [0] * 120 + [1], pitched=False),
