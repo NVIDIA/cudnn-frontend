@@ -68,7 +68,7 @@ def execute(plan, values, outputs, workspace):
 
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
 @pytest.mark.parametrize("schedule", ["uncut", "warmup", "chain"])
-def test_native_cache_reuses_kda_across_shapes(monkeypatch, backward, schedule):
+def test_frost_native_cache_reuses_kda_across_shapes(monkeypatch, backward, schedule):
     family = "chain" if schedule == "chain" else "warmup"
     direction = "backward" if backward else "forward"
     module = importlib.import_module(f"cudnn.linear_attention.frost.kernel.kda_{family}_{direction}_f16")
@@ -96,7 +96,7 @@ def test_native_cache_reuses_kda_across_shapes(monkeypatch, backward, schedule):
 
 @pytest.mark.parametrize("heads", [(1, 1, 2), (2, 2, 1)], ids=["fold_qk", "fold_v"])
 @pytest.mark.parametrize("total", [64, 512], ids=["uncut", "chain"])
-def test_native_kda_backward_respects_output_strides(total, heads):
+def test_frost_native_kda_backward_respects_output_strides(total, heads):
     plan, values, outputs, scratch, workspace = make_plan(total, heads, backward=True, invariant=total == 64)
     execute(plan, values, outputs, workspace)
     padded, strided = {}, {}
