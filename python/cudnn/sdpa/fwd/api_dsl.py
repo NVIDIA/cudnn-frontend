@@ -2632,6 +2632,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 got = tuple(bt.stride())
                 if any(g != w for g, w, n in zip(got, want, bt.shape) if n != 1):
                     raise ValueError(f"paged KV: {name} strides {got} do not match the declared table strides {want}")
+            # The kernel compiles both tables on ONE dynamic page-axis extent and
+            # reads its KV maximum from block_table: decline a mismatch here, by
+            # name, rather than let the compiled callable's argument check raise
+            # (the graph path declines it in graph_analyzer).
+            if block_table_v.shape[1] != block_table.shape[1]:
+                raise ValueError(
+                    f"paged KV: block_table and block_table_v must have the same page-axis extent; got {block_table.shape[1]} vs {block_table_v.shape[1]}"
+                )
             for name, t, d in (("k_tensor", k_tensor, self.k_desc), ("v_tensor", v_tensor, self.v_desc)):
                 if tuple(t.shape) != tuple(d.shape) or tuple(t.stride()) != tuple(d.stride):
                     raise ValueError(

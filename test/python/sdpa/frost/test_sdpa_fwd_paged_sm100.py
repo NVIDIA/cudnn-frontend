@@ -1713,3 +1713,61 @@ def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
     live = lens2 > 0
     _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
     torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
+
+
+@pytest.mark.L0
+def test_paged_adapter_fp8_rejects_unequal_table_extents():
+    """Direct API: K and V block tables of different page-axis extents are declined
+    by name in execute() before any launch (the kernel compiles both tables on one
+    dynamic extent and reads its KV maximum from the K table); equal extents --
+    a separate V table of the same width -- execute and match the reference.
+    The graph path declines the same mismatch in graph_analyzer."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, H, KH, P, max_pages = 8, 16, 4, 16, 64
+    dev, in_key = "cuda", "e4m3"
+    lens = [1000, 1024, 77, 0, 1, 640, 999, 300]
+    k_pool, v_pool, k_c, v_c, bt4, dk, dv = _pools_fp8(B, KH, D, P, max_pages, False, in_key, [max_pages * P] * B, seed=1)
+    bt = bt4.view(B, max_pages)
+    q8, dq = _fp8_quant(torch.randn(B, 1, H, D, device=dev) * 0.5, in_key)
+    q_gpu = q8.transpose(1, 2)
+    o_gpu = torch.empty(B, 1, H, D, device=dev, dtype=torch.float16).transpose(1, 2)
+    lse = torch.empty(B, H, 1, device=dev, dtype=torch.float32)
+    amax = torch.zeros(1, device=dev, dtype=torch.float32)
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
+    seq_q = torch.ones(B, dtype=torch.int32, device=dev)
+    dqt, dkt, dvt, sot = (torch.tensor([x], dtype=torch.float32, device=dev) for x in (dq, dk, dv, 1.0))
+    api = SdpaFwdDslSm100(
+        sample_q=q_gpu,
+        sample_k=k_c,
+        sample_v=v_c,
+        sample_o=o_gpu,
+        sample_lse=lse,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+        paged_page_size=P,
+        paged_max_seq_len_kv=max_pages * P,
+        split_kv=4,
+        pack_gqa=True,
+        pertensor_fp8=True,
+        dtype_o=torch.float16,
+    )
+    api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+    ex = dict(lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, workspace=ws, descale_q=dqt, descale_k=dkt, descale_v=dvt, scale_o=sot, amax_o=amax)
+    # Reject: a V table 24 pages wider than the K table (both otherwise valid).
+    bt_wide = torch.zeros(B, max_pages + 24, dtype=torch.int32, device=dev)
+    bt_wide[:, :max_pages] = bt
+    with pytest.raises(ValueError, match="same page-axis extent"):
+        api.execute(q_gpu, k_c, v_c, o_gpu, block_table=bt, block_table_v=bt_wide, **ex)
+    with pytest.raises(ValueError, match="same page-axis extent"):
+        api.execute(q_gpu, k_c, v_c, o_gpu, block_table=bt_wide, block_table_v=bt, **ex)
+    # Accept: a distinct V table of the SAME extent (a copy) binds and computes.
+    api.execute(q_gpu, k_c, v_c, o_gpu, block_table=bt, block_table_v=bt.clone(), **ex)
+    torch.cuda.synchronize()
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt, seq_lens, False, scale, dq, dk, dv, in_key, 1, max_pages * P)
+    live = seq_lens > 0
+    _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
+    torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
