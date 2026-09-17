@@ -886,6 +886,43 @@ def _exec_sdpa_served_by_frost_sm100(cfg, request, cudnn_handle):
     after = frost_routing.snapshot().get(FROST_SM100_ROUTING_KEY, 0)
     assert after == before + 1, f"expected {FROST_SM100_ROUTING_KEY} to serve this graph; routing tally = {frost_routing.snapshot()}"
 
+def _exec_sdpa_paged_decode_on_frost_sm100(cfg, request, cudnn_handle):
+    """exec_sdpa on a paged, decode-shaped graph and assert the FROST SM100 row
+    served it -- through the placement the heuristics rank by (#1107): a paged
+    decode proposal (s_q <= DECODE_MAX_S_Q) leads the backend's plan only on an
+    exact (d_qk, d_v) pair in the row's paged_decode_lead_d_shapes; any other
+    pair ranks it behind the backend's entries (fwd/heuristics._yields_to_backend).
+    So on a claimed pair the FROST plan must rank first and the unpinned walk must
+    land on it; on an unclaimed pair the backend must rank first and the FROST
+    plan, still offered, is pinned (select_plan through the select_engine helper)
+    so the split + combine path runs on every draw. Either way a FROST decline
+    cannot pass on the native backend: offers_engine fails it before the walk,
+    and a pin is strict (a pinned plan that fails to build raises inside
+    exec_sdpa instead of falling through)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, engine_name
+    from cudnn.sdpa.fwd.heuristics import decode_shaped
+    from sdpa.frost.frost_test_utils import _is_plan_for, offers_engine, select_engine
+
+    engine = engine_name()
+    assert f"frost:{engine}" == FROST_SM100_ROUTING_KEY
+    spec = next(s for s in ENGINE_SPECS if s.name == engine)
+    assert cfg.is_paged and decode_shaped(cfg), "placement rule under test is the paged decode one"
+    claimed = (cfg.d_qk, cfg.d_v) in spec.paged_decode_lead_d_shapes
+
+    def place(graph):
+        names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+        assert offers_engine(graph, engine), f"{engine} declined this paged decode graph; plans = {names}"
+        if claimed:
+            assert _is_plan_for(names[0], engine), f"({cfg.d_qk}, {cfg.d_v}) claims the paged-decode lead: the FROST plan ranks first; plans = {names}"
+        else:
+            assert not _is_plan_for(names[0], engine), f"({cfg.d_qk}, {cfg.d_v}) carries no lead claim: the backend ranks first at decode; plans = {names}"
+            select_engine(graph, engine)
+
+    before = frost_routing.snapshot().get(FROST_SM100_ROUTING_KEY, 0)
+    exec_sdpa(cfg, request, cudnn_handle, plan_select=place)
+    after = frost_routing.snapshot().get(FROST_SM100_ROUTING_KEY, 0)
+    assert after == before + 1, f"expected {FROST_SM100_ROUTING_KEY} to serve this graph ({'claimed pair, unpinned' if claimed else 'pinned'}); routing tally = {frost_routing.snapshot()}"
+
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=2001), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
@@ -894,8 +931,11 @@ def test_sdpa_fwd_paged_decode_split_frost_L0(env_info, test_no, request, cudnn_
     never a multiple of the 128-row KV tile, the FlashInfer spelling -- at a
     small batch, where the heuristic proposes a KV split. Every draw stays
     inside the SM100 row's paged contract (d_qk == d_v <= 256, page size a
-    multiple of 8 dividing 128 or a multiple of it, padded, no sink) and must
-    be served by FROST; the reference check covers the split + combine path.
+    multiple of 8 dividing 128 or a multiple of it, padded, no sink) and is
+    served by FROST -- by the unpinned walk on a pair that claims the
+    paged-decode lead, pinned behind the backend-first default on any other
+    (_exec_sdpa_paged_decode_on_frost_sm100, which asserts the placement
+    either way); the reference check covers the split + combine path.
     Own seed and function: widening test_sdpa_fwd_paged_L0 would reshuffle
     every downstream draw of that sweep."""
     _skip_unless_frost_sm100_serves()
@@ -924,7 +964,7 @@ def test_sdpa_fwd_paged_decode_split_frost_L0(env_info, test_no, request, cudnn_
     test.cfg.is_paged = True
     test.showConfig(test_no, request)
 
-    _exec_sdpa_served_by_frost_sm100(test.cfg, request, cudnn_handle)
+    _exec_sdpa_paged_decode_on_frost_sm100(test.cfg, request, cudnn_handle)
 
 
 PAGED_DECODE_SPLIT_FROST_CASES = [
