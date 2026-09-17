@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 import hashlib
+import json
 
 import pytest
 import torch
@@ -22,6 +23,9 @@ cases = [
     dict(name="one_token", experts=3, rows=1, k=64, n=64, sizes=[0, 1, 0], pitched=False),
     dict(name="one_active_expert", experts=2, rows=8, k=2048, n=768, sizes=[8, 0], pitched=False),
     dict(name="five_tokens", experts=7, rows=5, k=256, n=192, sizes=[0, 0, 2, 0, 0, 3, 0], pitched=False),
+    # Reuse accumulator and scheduler slots across multiple persistent waves.
+    dict(name="multi_wave", experts=128, rows=8, k=768, n=2048, sizes=[1] * 7 + [0] * 120 + [1], pitched=False),
+    dict(name="many_waves", experts=128, rows=8, k=128, n=8192, sizes=[1] * 7 + [0] * 120 + [1], pitched=False),
 ]
 
 
@@ -258,3 +262,5 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
     cudnn.destroy_handle(handle)
 
     assert result["checks"] == 10 and result["negatives"] == 3
+
+    (raw / "fc1_result.json").write_text(json.dumps(result, indent=2) + "\n")

@@ -119,9 +119,10 @@ num_a_operands = 1
 num_b_operands = 1
 gemm_a_idx = (0,)
 gemm_b_idx = (0,)
-num_tmem_alloc_cols = 512
+# KF candidate2f5c: compact resources; persistent multi-wave scheduling is retained.
+num_tmem_alloc_cols = 32
 tmem_alloc_exclusive = False
-acc_stages = 2  # two independent M128xN8 accumulator tiles
+acc_stages = 1
 grid_num_clusters = FROST_TEMPLATE_PARAMS.grid_ctas
 offset_cutlass_dtype = cutlass.Int32
 vec_bytes_epi = 32
@@ -217,7 +218,7 @@ def _b_collector_op(mi):
 
 
 @cute.kernel
-def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl(
+def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl_compact_resources(
     m: cutlass.Int64,
     n: cutlass.Int64,
     k: cutlass.Int64,
@@ -246,10 +247,7 @@ def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl(
     mma_warp_id = 4
     tma_warp_id = 5
     scheduler_warp_id = 6
-    unused_warp_id = 7
     num_epilogue_warps = 4
-    epi_reg_count = 232
-    prod_reg_count = 24
 
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -503,7 +501,6 @@ def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl(
     first_token_arr = cutlass.make_array_view(first_token_offset)
 
     if warp_idx == scheduler_warp_id:
-        nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         # PDL launch completion alone does not make predecessor writes visible.
         # The scheduler consumes the reset counter and live offsets itself.
         if cutlass.const_expr(USE_PDL):
@@ -687,7 +684,6 @@ def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl(
                     pass
 
     if warp_idx == tma_warp_id:
-        nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
         ab_empty_phase_bit = cutlass.Int32(1)
@@ -886,7 +882,6 @@ def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl(
         else:
             ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
     if warp_idx == mma_warp_id:
-        nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         _tcgen05_alloc(
             tmem_ptr_i32,
             cutlass.Int32(num_tmem_alloc_cols),
@@ -1248,7 +1243,6 @@ def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl(
                 )
 
     if warp_idx < num_epilogue_warps:
-        nvvm.setmaxregister(epi_reg_count, nvvm.SetMaxRegisterAction.INCREASE)
         nvvm.barrier_cta_sync(barrier_id=TMEM_ALLOC_BARRIER_ID, thread_count=tmem_alloc_bar_count)
         tmem_raw_addr = tmem_ptr_i32.load()
         base_col_id_root = tmem_raw_addr & 0xFFFF
@@ -1345,9 +1339,6 @@ def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl(
                 sched_stage = cutlass.Int32(0)
                 sched_full_phase = sched_full_phase ^ 1
 
-    if warp_idx == unused_warp_id:
-        nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
-
     # DSM broadcasts can outlive one CTA's final tile. Keep every peer's
     # shared storage alive until the whole cluster has finished its accesses.
     if cutlass.const_expr(cluster_size > 1):
@@ -1355,7 +1346,7 @@ def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl(
         nvvm.barrier_cluster_wait()
 
 
-frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl_compact_resources.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
@@ -1477,7 +1468,7 @@ def _host(
     if cutlass.const_expr(not moe_static_sched):
         counter_qword = grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS
         _reset_moe_sched_counter(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
-    frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl(
+    frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl_compact_resources(
         problem_size[0],
         problem_size[1],
         problem_size[2],
