@@ -2642,7 +2642,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
                 // Base-2 Stats is an attribute of the softmax descriptor, which this pre-9.21 path cannot express.
                 RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.stats_use_log2,
                                                error_code_t::GRAPH_NOT_SUPPORTED,
-                                               "stats_use_log2 in unified SDPA node requires cuDNN 9.28.0");
+                                               "stats_use_log2 in unified SDPA node requires cuDNN 9.27.0");
                 auto backend_stats = tensors[stats_it->second->get_uid()]->get_desc()->get_backend_descriptor();
                 _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
                                                                CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC,

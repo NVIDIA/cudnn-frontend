@@ -468,7 +468,7 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
             RETURN_CUDNN_FRONTEND_ERROR_IF(stats_use_log2 && generate_stats.value_or(false),
                                            error_code_t::GRAPH_NOT_SUPPORTED,
                                            "Composite SDPA node doesn't support stats_use_log2 (requires the UNIFIED "
-                                           "implementation on cuDNN 9.28.0+ or a FROST engine)");
+                                           "implementation on cuDNN 9.27.0+ or a FROST engine)");
             // The ragged offset multiplier is only supported by the unified forward engine.
             // Reject it here so auto-select routes such graphs to the unified implementation.
             for (const auto& [key, value] : inputs) {
