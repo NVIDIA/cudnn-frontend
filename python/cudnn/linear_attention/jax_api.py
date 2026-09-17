@@ -116,6 +116,7 @@ def target_device():
 def build_call(metadata, config, device):
     from cudnn.frost.device import build_device
     from .frost.kda_engine import KdaFrostEngine, build_kda
+    from .frost.kda_jax import make_launcher
     from cutlass.jax import TensorSpec
 
     data_types = dict(float16=cudnn.data_type.HALF, bfloat16=cudnn.data_type.BFLOAT16, float32=cudnn.data_type.FLOAT, int32=cudnn.data_type.INT32)
@@ -156,7 +157,7 @@ def build_call(metadata, config, device):
         return tuple(TensorSpec(layout=tuple(reversed(range(len(s))))) for s in shapes)
 
     invoke = call(
-        plan.make_launcher(input_names + output_names),
+        make_launcher(plan, input_names + output_names),
         output_shape_dtype=shapes + (workspace,),
         input_spec=specs([t.dim for t in node.inputs.values()]),
         output_spec=specs([s.shape for s in shapes + (workspace,)]),
