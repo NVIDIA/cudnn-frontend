@@ -1678,6 +1678,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # specialization (config_sm100._validate_params is the backstop
             # for the same set).
             self._not_implemented_error_if(self._fp8, "paged KV is served by the f16/bf16 kernel only")
+            # cc10.7 routes every flavor to its sibling kernel line, and no
+            # sibling carries the PAGED_KV loader (their compile() takes no
+            # block-table strides): decline here, where the engine row also
+            # declines (the cc10.7 f16 row has no paged_kv capability), instead
+            # of failing on the compile keywords inside template loading.
+            self._not_implemented_error_if(
+                self._device_cc == (10, 7),
+                "paged KV is wired in the SM100 f16/bf16 kernels only (cc 10.0 / 10.3); the cc10.7 sibling kernels carry no PAGED_KV loader",
+            )
             self._not_implemented_error_if(
                 self.flavor not in ((128, 128), (256, 256), (512, 512)),
                 f"paged KV is wired on the d128, d256 and d512 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",

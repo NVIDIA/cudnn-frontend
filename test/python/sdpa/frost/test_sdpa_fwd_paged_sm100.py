@@ -385,6 +385,47 @@ def test_paged_graph_declines_off_contract():
     assert not _offers(_build(16, padding=False)), "paged KV requires the padding mask"
 
 
+@pytest.mark.L0
+def test_paged_api_declines_on_cc107(monkeypatch):
+    """The standalone adapter's twin of the engine rows' cc10.7 gap: that line
+    routes every flavor to its sibling kernel and none carries the PAGED_KV
+    loader (their compile() takes no block-table strides), so paged KV declines
+    typed there -- d512 and the long-wired d128 alike -- before template loading,
+    while the same request is admitted on cc10.0 / cc10.3.  CPU only: the device
+    capability is monkeypatched, descriptors carry no storage."""
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def desc(shape, name):
+        b, h, s, d = shape
+        stride = (s * h * d, d, h * d, 1)
+        return TensorDesc(
+            dtype=torch.float16, shape=shape, stride=stride, stride_order=TensorDesc._compute_stride_order(shape, stride), device="cuda", name=name
+        )
+
+    def api(d):
+        return SdpaFwdDslSm100(
+            desc((2, 8, 1, d), "q"),
+            desc((16, 2, 16, d), "k"),
+            desc((16, 2, 16, d), "v"),
+            desc((2, 8, 1, d), "o"),
+            None,
+            seq_kv_lens_present=True,
+            paged_page_size=16,
+            paged_max_seq_len_kv=128,
+        )
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    for cc in ((10, 0), (10, 3)):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, cc=cc, **k: cc)
+        for d in (128, 512):
+            assert api(d).check_support(), (cc, d)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    for d in (128, 512):
+        with pytest.raises(NotImplementedError, match="cc10.7 sibling kernels carry no PAGED_KV"):
+            api(d).check_support()
+
+
 # --- kernel template, direct -----------------------------------------------
 #
 # What the graph path's heuristic would not choose on its own: forced split
