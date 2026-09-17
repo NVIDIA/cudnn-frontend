@@ -847,8 +847,9 @@ def _fp8_gate_api(*, dtype_o, gate_dtype, pertensor=True, **kw):
 
 def test_fp8_gate_check_support_declines_typed(monkeypatch):
     """Standalone twin of the FP8 row's gate claims (rule 8b'): a bf16 G is
-    accepted with every O dtype the row lists; a half-precision G, the MXFP8
-    path and the Amax_O fold-out on the wrong path are typed declines."""
+    accepted with every O dtype the row lists; a half-precision G and the Amax_O
+    fold-out on the wrong path are typed declines; the MXFP8 path is admitted at
+    d256 with a bf16 G (PR-B) and declines a half G like the per-tensor path."""
     import torch
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -863,8 +864,14 @@ def test_fp8_gate_check_support_declines_typed(monkeypatch):
     assert _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=None, has_amax_o=False).check_support(), "has_amax_o=False needs no gate"
     with pytest.raises(ValueError, match="GATE"):
         _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.float16).check_support()
-    with pytest.raises(NotImplementedError, match="MXFP8"):
-        _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.bfloat16, pertensor=False).check_support()
+    # MXFP8 (PR-B): the Rubin d256 block-scale kernel carries the same gate seams, so the
+    # block-scale path is ADMITTED on the FP8 row's terms (cc 10.7, exactly (256, 256), bf16 G)
+    # -- the mxfp8 row claims it (engines._sm107_mxfp8_spec epilogue_gate=True); a half G is
+    # still the typed dtype decline, gate or no gate.
+    api = _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.bfloat16, pertensor=False)
+    assert api.check_support() and api.template_params().epilogue_gate is True
+    with pytest.raises(ValueError, match="GATE"):
+        _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.float16, pertensor=False).check_support()
     # The cga knob domain at (256, 256) FP8 is {1} and the gate does not widen it.
     with pytest.raises(ValueError, match="cga"):
         _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.bfloat16, cga=2).check_support()

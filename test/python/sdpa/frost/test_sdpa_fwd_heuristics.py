@@ -99,7 +99,11 @@ def test_split_model_sees_the_partial_pack_group_not_the_gqa_ratio(monkeypatch):
     smaller grid and over-proposed the split on the GLM decode shape (b=1:
     split 8 instead of 2; b=2..4: a split where the packed grid already fills
     the machine).  Both launches the model compares -- the split leg and the
-    unsplit runner-up -- must carry p."""
+    unsplit runner-up -- must carry p.  The packed leg rides the d128 DECODE
+    tile (S_q * p = 4 <= 128 rows: TILE_CGA_M=1, one CTA per tile), so the
+    model is fed ctas_per_tile=1 and levels the 24 x b grid over 148 SMs with
+    split 4 / 2 / 1 at b = 1 / 2 / 4 (2 / 1 / 1 while the leg rode the cga2
+    prefill tile)."""
     import cudnn.sdpa.fwd.heuristics as heur
 
     seen = []
@@ -110,7 +114,7 @@ def test_split_model_sees_the_partial_pack_group_not_the_gqa_ratio(monkeypatch):
         return real(**kw)
 
     monkeypatch.setattr(heur, "choose_split_kv", recording)
-    for b, want in ((1, 2), (2, 1), (4, 1)):
+    for b, want in ((1, 4), (2, 2), (4, 1)):
         seen.clear()
         facts = _facts(b=b, h_q=96, h_kv=8, s_q=1, s_kv=4096, causal=False, dtype=cudnn.data_type.BFLOAT16)
         f16 = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
@@ -120,9 +124,9 @@ def test_split_model_sees_the_partial_pack_group_not_the_gqa_ratio(monkeypatch):
             assert kw["unsplit_launch"] is not None and kw["unsplit_launch"].heads_q == 24, kw["unsplit_launch"]
             # The combine still reduces the graph's own (S_q, H, B) rows.
             assert kw["combine_rows"] == 1 * 96 * b
-        assert f16[0].knobs.pack_gqa is True and f16[0].knobs.split_kv == want, (b, f16[0].knobs)
-        # Exactly the split the model gives the 24-packed-head geometry.
-        assert f16[0].knobs.split_kv == real(q_tiles=1, heads_q=24, batch=b, kv_tiles=32, sm_count=148, combine_rows=96 * b, ctas_per_tile=2)
+        assert f16[0].knobs.pack_gqa is True and f16[0].knobs.cga == 1 and f16[0].knobs.split_kv == want, (b, f16[0].knobs)
+        # Exactly the split the model gives the 24-packed-head geometry on the decode tile.
+        assert f16[0].knobs.split_kv == real(q_tiles=1, heads_q=24, batch=b, kv_tiles=32, sm_count=148, combine_rows=96 * b, ctas_per_tile=1)
 
 
 @pytest.mark.L0
@@ -239,6 +243,69 @@ def test_sm120_d512_sliding_window_packs_gqa():
     full_causal = primary()  # full causal prefill: decode rule only, L2 rule for the scheduler
     assert (full_causal.pack_gqa, full_causal.sched_policy) == (False, SCHED_LPT_L2)
     assert primary(window_left=128, d_qk=128, d_v=128).pack_gqa is False  # the rule is the d512 flavor's
+
+
+@pytest.mark.L0
+def test_sm120_fp8_d512_flavor_and_tile_contract():
+    """FP8 D512 has a dedicated 64x64 tile and a full-width shared-memory budget."""
+    from cudnn.sdpa.fwd.config_sm120 import pick_flavor, smem_bytes, tile_domain
+
+    assert pick_flavor(512, 512, fp8=True) == (512, 512)
+    assert tile_domain(512, 512, fp8=True) == frozenset({(64, 64)})
+    assert smem_bytes(512, 512, 64, 64, itemsize=1, out_itemsize=2) == 98328
+    assert smem_bytes(272, 496, 64, 64, itemsize=1, out_itemsize=1) == 98328
+    name = "sdpa_fwd_prefill_sm120_fp8"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+    for d_qk, d_v in ((272, 272), (496, 512), (512, 496), (512, 512)):
+        facts = _facts(
+            d_qk=d_qk, d_v=d_v, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3, is_fp8=True, device_cc=(12, 0), device_sm_count=188
+        )
+        plans = recommend("A", facts, {name: 20504})
+        assert plans, (d_qk, d_v)
+        assert {(plan.knobs.tile_m, plan.knobs.tile_n) for plan in plans} == {(64, 64)}
+        assert all(engines.mismatch(spec.capabilities, facts, plan.knobs) is None for plan in plans)
+    for d_qk, d_v in ((256, 512), (512, 256), (264, 512), (512, 528)):
+        facts = _facts(
+            d_qk=d_qk, d_v=d_v, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3, is_fp8=True, device_cc=(12, 0), device_sm_count=188
+        )
+        assert engines.mismatch(spec.capabilities, facts) is not None, (d_qk, d_v)
+    for dim in (128, 256):
+        assert pick_flavor(dim, dim, fp8=True) is None
+        assert (128, 128) in tile_domain(dim, dim, fp8=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dim", [256, 512])
+def test_sm120_fp8_dense_layouts_and_split_output(dim):
+    """FP8 layouts normalize to compact storage before main and split-combine kernels."""
+    from types import SimpleNamespace
+
+    shape = (1, 4, 16, dim)
+    head_major = (64 * dim, 16 * dim, dim, 1)
+    padded = (64 * (dim + 1), 16 * (dim + 1), dim + 1, 1)
+    query = SimpleNamespace(get_dim=lambda: shape, get_stride=lambda: padded)
+    output = SimpleNamespace(get_dim=lambda: shape, get_stride=lambda: head_major)
+    facts = _facts(
+        s_q=16,
+        s_kv=32768,
+        h_q=4,
+        h_kv=1,
+        d_qk=dim,
+        d_v=dim,
+        q_t=query,
+        o_t=output,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_fp8=True,
+        device_cc=(12, 0),
+        device_sm_count=188,
+    )
+    name = "sdpa_fwd_prefill_sm120_fp8"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+    knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=64, tile_n=64, cga=1, pack_gqa=False, split_kv=2)
+    assert engines.mismatch(spec.capabilities, facts, knobs) is None
+    plans = recommend("A", facts, {name: 20504})
+    assert plans and any((plan.knobs.split_kv or 1) > 1 for plan in plans)
 
 
 @pytest.mark.L0

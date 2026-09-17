@@ -34,7 +34,13 @@ def __getattr__(name):
         value = getattr(import_module("cudnn.block_sparse_attention"), name)
         globals()[name] = value
         return value
+    if name in ("grouped_gemm_swiglu", "grouped_gemm_dswiglu"):
+        import cudnn
+
+        value = getattr(cudnn, f"{name}_wrapper_sm100")
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = [*_BSA_EXPORTS, "calls", "install", "served_plan_names"]
+__all__ = [*_BSA_EXPORTS, "calls", "install", "served_plan_names", "grouped_gemm_swiglu", "grouped_gemm_dswiglu"]

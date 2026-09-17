@@ -906,10 +906,11 @@ class Gdn2SummaryFrostEngine(BaseEngine):
 
 
 class CompiledGdn2Summary:
-    """Compiled summary plan over the state-only recompute kernel: the final-state call (initial_state honored) and, when
-    ``transition`` is bound, the identity-seeded zero-value call whose buffer holds ``M_buf = M^T`` (``X_final = X_init @
-    M_buf + X_H``).  ``chain`` summarizes every filled piece (H, M) and composes them with one fp32 state chain whose tail
-    is ``final_state`` and whose running product is ``transition``."""
+    """Compiled summary plan.  With ``transition`` bound the fused H + M summary kernel writes ``final_state`` (initial_state
+    honored) and ``M_buf = M^T`` (``X_final = X_init @ M_buf + X_H``), each in its own dtype, in one pass over K: on the uncut or
+    split table, or in ``chain`` plans per filled piece, composed by one fp32 state chain whose tail is ``final_state`` and
+    whose running product is ``transition``.  Without ``transition`` the state-only recompute kernel writes ``final_state``
+    alone."""
 
     def __init__(self, node, recompute_module):
         from .common.host import tensormap_workspace_bytes
@@ -926,7 +927,6 @@ class CompiledGdn2Summary:
         self.run_state_chain = run_state_chain
         self.table = None
         self.final_cache = None
-        self.transition_cache = None
         self.run_chain_prologue = run_chain_prologue
         self.chain_prologue = {}
         self.fused_cache = None
@@ -974,6 +974,10 @@ class CompiledGdn2Summary:
         self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
+        from .kernel import gdn2_summary_f16 as summary_module
+
+        self.fused_summary = summary_module
+        self.fused_direct = self.has_transition and not self.chain
 
         layout = WorkspaceLayout()
         regions = []
@@ -997,17 +1001,13 @@ class CompiledGdn2Summary:
                 ("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)),
                 ("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
             ]
-            from .kernel import gdn2_summary_f16 as summary_module
-
-            self.fused_summary = summary_module
             fused_bytes = tensormap_workspace_bytes(summary_module, self.num_pieces)
             regions.append(("fused_tensormaps", layout.add(fused_bytes, align=128), "int64", (fused_bytes // 8,)))
         else:
-            off_scheduler = layout.add(16)
+            off_scheduler = layout.add(8)
             regions += [
                 ("scheduler_final", off_scheduler, "int32", (2,)),
-                ("scheduler_transition", off_scheduler + 8, "int32", (2,)),
-                ("scheduler_all", off_scheduler, "int32", (4,)),
+                ("scheduler_all", off_scheduler, "int32", (2,)),
             ]
             if self.split:
                 self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
@@ -1021,7 +1021,7 @@ class CompiledGdn2Summary:
                 self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
-            tensormap_bytes = tensormap_workspace_bytes(recompute_module, B)
+            tensormap_bytes = max(tensormap_workspace_bytes(recompute_module, B), tensormap_workspace_bytes(summary_module, B))
             regions.append(("tensormaps", layout.add(tensormap_bytes, align=128), "int64", (tensormap_bytes // 8,)))
         self.needs_table = self.split
         self.workspace_size = layout.size
@@ -1067,7 +1067,8 @@ class CompiledGdn2Summary:
         work_count = region["work_count"]
         item_scratch = region.get("item_scratch")
 
-        if self.final_cache is not None and (self.table is not None or not self.needs_table):
+        state_cache = self.fused_cache if self.fused_direct else self.final_cache
+        if state_cache is not None and (self.table is not None or not self.needs_table):
             if self.needs_table:
                 self.run_table(
                     self.table,
@@ -1082,6 +1083,29 @@ class CompiledGdn2Summary:
                     region["scheduler_all"],
                     stream,
                 )
+            if self.fused_direct:
+                self.fused_summary.run_summary(
+                    self.fused_cache,
+                    k,
+                    v,
+                    g,
+                    a_log if self.safe_gate else None,
+                    dt_bias if self.safe_gate else None,
+                    beta,
+                    w,
+                    cu,
+                    state0,
+                    final_state,
+                    transition,
+                    work_items,
+                    work_count,
+                    region["scheduler_final"],
+                    region["scheduler_all"],
+                    item_scratch,
+                    region["tensormaps"],
+                    stream,
+                )
+                return
             self.recompute.run_recompute(
                 self.final_cache,
                 k,
@@ -1104,29 +1128,6 @@ class CompiledGdn2Summary:
                 0,
                 stream,
             )
-            if self.has_transition:
-                self.recompute.run_recompute(
-                    self.transition_cache,
-                    k,
-                    k,
-                    g,
-                    a_log if self.safe_gate else None,
-                    dt_bias if self.safe_gate else None,
-                    beta,
-                    k,
-                    cu,
-                    None,
-                    transition,
-                    None,
-                    work_items,
-                    work_count,
-                    region["scheduler_transition"],
-                    region["scheduler_all"],
-                    item_scratch,
-                    region["tensormaps"],
-                    0,
-                    stream,
-                )
             return
 
         if not self.needs_table:
@@ -1154,6 +1155,38 @@ class CompiledGdn2Summary:
                 stream=stream,
             )
 
+        if self.fused_direct:
+            self.fused_cache = self.fused_summary.chunk_gdn2_summary_sm100(
+                k,
+                v,
+                g,
+                beta,
+                w,
+                cu,
+                state0,
+                final_state,
+                transition,
+                use_qk_l2norm_in_kernel=self.use_qk_l2norm,
+                safe_gate=self.safe_gate,
+                log_gate=self.log_gate,
+                gate_lower_bound=self.gate_lower_bound,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                use_beta_sigmoid=self.use_beta_sigmoid,
+                allow_neg_eigval=self.allow_neg_eigval,
+                beta_guard=self.beta_guard,
+                work_items=work_items,
+                work_count=work_count,
+                scheduler_counter=region["scheduler_final"],
+                scheduler_all=region["scheduler_all"],
+                work_item_scratch=item_scratch,
+                order_in_prologue=True,
+                tensormap_workspace=region["tensormaps"],
+                device=self.device,
+                num_sm=self.num_sm,
+                stream=stream,
+            )
+            return
         self.final_cache = self.recompute.chunk_gdn2_recompute_sm100(
             k,
             v,
@@ -1183,38 +1216,6 @@ class CompiledGdn2Summary:
             num_sm=self.num_sm,
             stream=stream,
         )
-        if self.has_transition:
-            self.transition_cache = self.recompute.chunk_gdn2_recompute_sm100(
-                k,
-                k,
-                g,
-                beta,
-                k,
-                cu,
-                None,
-                transition,
-                use_qk_l2norm_in_kernel=self.use_qk_l2norm,
-                safe_gate=self.safe_gate,
-                log_gate=self.log_gate,
-                gate_lower_bound=self.gate_lower_bound,
-                a_log=a_log,
-                dt_bias=dt_bias,
-                use_beta_sigmoid=self.use_beta_sigmoid,
-                allow_neg_eigval=self.allow_neg_eigval,
-                beta_guard=self.beta_guard,
-                seed_identity=True,
-                v_is_zero=True,
-                work_items=work_items,
-                work_count=work_count,
-                scheduler_counter=region["scheduler_transition"],
-                scheduler_all=region["scheduler_all"],
-                work_item_scratch=item_scratch,
-                order_in_prologue=True,
-                tensormap_workspace=region["tensormaps"],
-                device=self.device,
-                num_sm=self.num_sm,
-                stream=stream,
-            )
         return None
 
     def run_chain(self, k, v, g, beta, w, cu, state0, final_state, transition, a_log, dt_bias, region, stream) -> None:

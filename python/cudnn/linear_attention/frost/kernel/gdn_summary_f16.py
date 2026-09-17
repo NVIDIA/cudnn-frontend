@@ -956,10 +956,10 @@ def chain_warp_group(
                     for i in cutlass.range_constexpr(num_ldtms):
                         for k in cutlass.range_constexpr(32):
                             if state_row_valid:
-                                gState_out[state_gmem_row, i * ldtm_width + k] = cutlass.Float32(0.0).to(cfg.state_dtype)
+                                gState_out[state_gmem_row, i * ldtm_width + k] = cutlass.Float32(0.0).to(mState_out.element_type)
                     if cutlass.const_expr(not is_h):
                         if state_row_valid:
-                            gState_out[state_gmem_row, state_gmem_row] = cutlass.Float32(1.0).to(cfg.state_dtype)
+                            gState_out[state_gmem_row, state_gmem_row] = cutlass.Float32(1.0).to(mState_out.element_type)
 
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
@@ -1584,6 +1584,7 @@ TENSORMAP_DESC_ARRAYS = 3  # per-batch runtime TMA descriptors: K, V, tinv
 def get_compiled_cache(
     io_dtype_str: str,
     state_dtype_str: str,
+    transition_dtype_str: str,
     cu_dtype_str: str,
     gate_dtype_str: str,
     a_log_dtype_str: str,
@@ -1696,7 +1697,8 @@ def chunk_gdn_summary_sm100(
     config and replayed; tensors are DLPack CUDA tensors with a stride-1 innermost dim.  ``initial_state`` None = zero seed.
     gate: raw linear alpha, natural-log decay under ``log_gate``, or raw logits under ``safe_gate`` (``-exp(a_log) * softplus(gate + dt_bias)``)
     tinv: the beta-folded chunk-factor tiles of ``gdn_tinv_f16.chunk_gdn_tinv_sm100`` over the same inputs (the kernel takes no beta)
-    output_transition: ``(num_seqs, HO, DK, DK)`` in stored domain ``M_buf = M^T``; empty items receive the identity
+    output_transition: ``(num_seqs, HO, DK, DK)`` in stored domain ``M_buf = M^T``, in its own fp32 / bf16 dtype (every
+        store converts from the fp32 state to the output tensor's element type); empty items receive the identity
     work_items / work_count: the recompute's ``(max_items, 8)`` int32 table and ``(1,)`` int32 count (REQUIRED)
     expand_num: GDP's ``num_householder`` timeline factor (1 = off)
     own_prologue: False skips the prologue launch when the chain prologue already ordered the table and built the descriptors
@@ -1715,8 +1717,6 @@ def chunk_gdn_summary_sm100(
         raise ValueError(f"tinv dtype {tinv.dtype} must match k dtype {k.dtype}")
     if output_state is None or output_transition is None:
         raise ValueError("fused GDN summary writes both output_state and output_transition")
-    if output_state.dtype != output_transition.dtype:
-        raise ValueError("output_state and output_transition must share a dtype")
     if initial_state is not None and initial_state.dtype != output_state.dtype:
         raise ValueError("initial_state and output_state must share a dtype")
     if work_items is None or work_count is None or scheduler_counter is None:
@@ -1736,6 +1736,7 @@ def chunk_gdn_summary_sm100(
     cache = get_compiled_cache(
         str(k.dtype),
         str(output_state.dtype),
+        str(output_transition.dtype),
         str(cu_seqlens.dtype),
         str(gate.dtype),
         str(a_log.dtype) if a_log is not None else "none",

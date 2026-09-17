@@ -355,3 +355,64 @@ def test_a_bare_address_for_an_fp4_tensor_is_lent_the_storage_geometry():
     _, tb = g._describe(0x2000, b.get_uid())
     assert (tuple(ta.dim), tuple(ta.stride)) == ((1, 256, 128), (32768, 128, 1))
     assert (tuple(tb.dim), tuple(tb.stride)) == ((1, 128, 512), (65536, 1, 128))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capacity", [512, 2560])
+@pytest.mark.parametrize("rank", [1, 3])
+def test_reordered_scale_blob_keeps_physical_capacity(capacity, rank):
+    from cudnn.datatypes import _dlpack_code_bits
+
+    g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    token = g.tensor(name="token", dim=[1, 137, 128], stride=[137 * 128, 128, 1], data_type=cudnn.data_type.FP8_E4M3)
+    scale = g.tensor(
+        name="scale",
+        dim=[1, 256, 4],
+        stride=[1024, 4, 1],
+        data_type=cudnn.data_type.FP8_E8M0,
+        reordering_type=cudnn.tensor_reordering.F8_128x4,
+    )
+    g.block_scale_dequantize(token, scale, block_size=[1, 32]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    shape = (capacity,) if rank == 1 else (1, capacity // 4, 4)
+    blob = torch.empty(shape, dtype=torch.uint8, device="cuda")
+    pack = g._normalize({scale.get_uid(): blob}, None)
+    slot = pack.index_of(scale)
+    operand = pack.operand(slot)
+    assert operand.numel() * operand.element_size() == capacity
+    assert tuple(operand.shape) == ((1, capacity, 1) if rank == 1 else shape)
+    assert slot not in pack.graph_described
+    assert operand.data_ptr() == blob.data_ptr()
+    assert pack.native.dtype(slot) == _dlpack_code_bits(cudnn.data_type.FP8_E8M0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capacity", [4096, 4097])
+def test_reordered_batched_flat_scale_blob_preserves_batch_count(capacity):
+    g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    scale = g.tensor(name="scale", dim=[4, 128, 4], stride=[512, 4, 1], data_type=cudnn.data_type.FP8_E8M0, reordering_type=cudnn.tensor_reordering.F8_128x4)
+    token = g.tensor(name="token", dim=[4, 128, 128], stride=[16384, 128, 1], data_type=cudnn.data_type.FP8_E4M3)
+    g.block_scale_dequantize(token, scale, block_size=[1, 32]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    blob = torch.empty(capacity, dtype=torch.uint8, device="cuda")
+    pack = g._normalize({scale.get_uid(): blob}, None)
+    operand = pack.operand(pack.index_of(scale))
+    assert list(operand.shape) == ([4, capacity // 4, 1] if capacity % 4 == 0 else [capacity])
+    assert list(operand.stride()) == ([capacity // 4, 1, 1] if capacity % 4 == 0 else [1])
+    assert operand.numel() == capacity
+    assert operand.data_ptr() == blob.data_ptr()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stride", [(1023, 0), (1024, 1), (1, 2)])
+def test_reordered_scale_blob_keeps_noncontiguous_view(stride):
+    g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    scale = g.tensor(name="scale", dim=[1, 128, 4], stride=[512, 4, 1], data_type=cudnn.data_type.FP8_E8M0, reordering_type=cudnn.tensor_reordering.F8_128x4)
+    token = g.tensor(name="token", dim=[1, 128, 128], stride=[16384, 128, 1], data_type=cudnn.data_type.FP8_E4M3)
+    g.block_scale_dequantize(token, scale, block_size=[1, 32]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    blob = torch.empty(2048, dtype=torch.uint8, device="cuda").as_strided((2, 512), stride)
+    pack = g._normalize({scale.get_uid(): blob}, None)
+    slot = pack.index_of(scale)
+    operand = pack.operand(slot)
+    assert tuple(operand.shape) == tuple(blob.shape)
+    assert tuple(operand.stride()) == stride
+    assert slot not in pack.graph_described
+    assert operand.data_ptr() == blob.data_ptr()

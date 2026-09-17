@@ -7,7 +7,7 @@ This is an ATTRIBUTION harness, not an A/B: it answers "where does the time go
 and how does that shift with S", which is what decides the block's partitioning.
 It deliberately does not compare two implementations, so it needs no control
 pair -- when that day comes, use the protocol in the module docstring of
-``reference.py`` instead of extending this.
+``gated_block_reference.py`` instead of extending this.
 
 The number it exists to produce: the S at which the attention overtakes the two
 projections. Below it the gate GEMM is the dominant term and has a softmax
@@ -38,7 +38,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from reference import (  # noqa: E402
+from gated_block_reference import (  # noqa: E402
     GEOMETRY_D4096_H32_KV2_D256,
     RefGeometry,
     apply_partial_rope,

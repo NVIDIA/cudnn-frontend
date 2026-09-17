@@ -375,6 +375,8 @@ cudnn.jax.block_sparse_attention_backward
 cudnn.jax.block_sparse_attention_forward
 cudnn.jax.call
 cudnn.jax.gemm_operand_spec
+cudnn.jax.grouped_gemm_dswiglu
+cudnn.jax.grouped_gemm_swiglu
 cudnn.jax.neg_inf_init
 cudnn.jax.row_major_desc
 cudnn.jax.sf_atom_spec
@@ -763,6 +765,8 @@ cudnn.torch.block_sparse_attention_backward
 cudnn.torch.block_sparse_attention_forward
 cudnn.torch.block_sparse_attention_fp8_forward
 cudnn.torch.calls
+cudnn.torch.grouped_gemm_dswiglu
+cudnn.torch.grouped_gemm_swiglu
 cudnn.torch.install
 cudnn.torch.served_plan_names
 cudnn.wrapper

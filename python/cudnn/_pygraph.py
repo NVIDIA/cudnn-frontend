@@ -2027,7 +2027,8 @@ class pygraph:
         # what a bare address gets -- so an engine reading the pack answers the
         # way the backend does. A buffer with the declared extents but its own
         # strides, a strided view, or one too small for the declaration keeps
-        # its own description; the engine decides. The rule runs natively, one
+        # its own description; the engine decides. Reordered scale blobs retain
+        # their physical extents for capacity checks. The rule runs natively, one
         # crossing per pack: this is on every execute's critical path.
         from_graph.extend(native.describe_from(self._declared_layout(order), from_graph))
         if override_uids:
@@ -2092,6 +2093,7 @@ class pygraph:
                     storage_slot_bytes(declared.data_type) or 0,
                     *_dlpack_code_bits(declared.data_type),
                     _dlpack_lanes(declared.data_type),
+                    declared.get_reordering_type() == _pybind_module.tensor_reordering.F8_128x4,
                 )
             self._declared_layout_native = layout
         return layout
@@ -3484,13 +3486,33 @@ _CAPTURED_OPS = {
         out_kwargs=("dSink_token",),
         infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "amax_dQ": _AMAX, "amax_dK": _AMAX, "amax_dV": _AMAX, "amax_dP": _AMAX},
     ),
-    # mxfp8 variants (schemas match the bindings exactly; output dims via
-    # out_dims / set_dim where cuDNN needs them)
+    # mxfp8 variants (schemas match the bindings exactly).  The forward infers
+    # its output dims the way sdpa / sdpa_fp8 do -- O / Stats from q and v,
+    # Amax_O the [1, 1, 1, 1] scalar -- so an UNREQUESTED Amax_O (virtual, never
+    # set_dim'd) passes the IR-level Tensor.validate() and stays a port the
+    # python engines fold out (has_amax_o=False) instead of failing validate()
+    # with "dims not set".  The mechanism, exactly: builder-time / validate-time
+    # inference fills dim + a row-major stride on every output the caller has
+    # NOT dimensioned; a caller's set_dim / set_stride overwrites that IR value
+    # (it runs after the builder); and the sdpa-family arm of _lower_to_cpp
+    # pushes WHATEVER the IR carries -- inferred or user-set -- so C++ receives
+    # a virtual [1, 1, 1, 1] Amax_O for the formerly-failing undeclared case
+    # (the state sdpa_fp8 has always produced) and a fully declared graph lowers
+    # exactly as before.  Only push_output_attrs is user-assigned-only; it is not
+    # what dimensions an sdpa-family output.  Shared hazard, inherited from sdpa
+    # / sdpa_fp8 rather than new here: set_dim WITHOUT set_stride keeps the
+    # provisional row-major stride of the INFERRED dims (Tensor.set_dim does not
+    # drop a non-user-assigned stride, and validate()'s "stride optional" fill
+    # fires only on an EMPTY stride), so dims that disagree with q[:-1]+[v[-1]]
+    # / q[:-1]+[1] -- an inconsistent graph -- carry a stale stride.  Declare
+    # dim AND stride, as every in-tree caller does.  The backward carries no
+    # infer=; its output dims come from set_dim, as before.
     "sdpa_mxfp8": dict(
         node_type=NodeType.SDPA_MXFP8,
         pos=("q", "k", "v", "descale_q", "descale_k", "descale_v"),
         outputs=("O", "Stats", "Amax_O"),
         maybe={"Stats": _stats_expected},
+        infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_O": _AMAX},
     ),
     "sdpa_mxfp8_backward": dict(
         node_type=NodeType.SDPA_MXFP8_BWD,

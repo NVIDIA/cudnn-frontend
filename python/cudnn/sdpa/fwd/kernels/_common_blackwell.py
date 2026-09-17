@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -201,7 +201,16 @@ def make_d256_bars(CFG, *, N_O_CHUNKS: int, epilogue_gate: bool = False) -> D256
     )
 
 
-def make_classic_bars(CFG, *, epilogue_gate: bool = False) -> Bars:
+def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False) -> Bars:
+    """The classic pipeline's barrier set.
+
+    ``s_stages`` is the S/P TMEM slot ring depth the BMM1-done / BMM2-ready
+    handshakes run over: one stage per Q sub-tile on the classic pipeline
+    (``CFG.TILES_Q``, the default), or the number of slots a single-sub-tile
+    kernel alternates its S between so BMM1(i+1) can overlap softmax(i)
+    (``sm100/decode_d128_f16.py`` passes 2).  Every other barrier keeps its
+    per-sub-tile count.
+    """
     # ``epilogue_gate``: same two LOCAL gate barriers as make_d256_bars (table
     # there); no classic (d128/d192) kernel passes True yet, so today every
     # caller gets None and traces unchanged.  The init counts (ONE_LANE /
@@ -214,6 +223,7 @@ def make_classic_bars(CFG, *, epilogue_gate: bool = False) -> Bars:
     CORR_LANES_TOTAL = CFG.CORR_LANES * CFG.CTA_MMA
     KV_EMPTY_ARRIVERS = (CFG.CGA_M // CFG.CTA_MMA) + CFG.CGA_N - 1
     N_BMM2_CHUNKS = CFG.N_BMM2_CHUNKS
+    N_S = CFG.TILES_Q if s_stages is None else int(s_stages)
 
     def _alloc(n):
         return cutlass.Array(cutlass.Int64, n, alignment=16, space=cutlass.AddressSpace.smem)
@@ -225,12 +235,12 @@ def make_classic_bars(CFG, *, epilogue_gate: bool = False) -> Bars:
         mb_q_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_k_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
         mb_v_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
-        mb_bmm1_done=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
+        mb_bmm1_done=MBarrier(_alloc(N_S), stages=N_S, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_bmm2_done=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_bmm2_ready=MBarrier(
-            _alloc(CFG.TILES_Q * N_BMM2_CHUNKS),
-            stages=CFG.TILES_Q * N_BMM2_CHUNKS,
-            init_count=tuple(SOFTMAX_PLUS_CORR_TOTAL if (s % N_BMM2_CHUNKS) == 0 else SOFTMAX_LANES_TOTAL for s in range(CFG.TILES_Q * N_BMM2_CHUNKS)),
+            _alloc(N_S * N_BMM2_CHUNKS),
+            stages=N_S * N_BMM2_CHUNKS,
+            init_count=tuple(SOFTMAX_PLUS_CORR_TOTAL if (s % N_BMM2_CHUNKS) == 0 else SOFTMAX_LANES_TOTAL for s in range(N_S * N_BMM2_CHUNKS)),
             producer=Producer.LEADER,
             scope=Scope.LEADER,
         ),
@@ -899,11 +909,11 @@ def make_sdpa_helpers(
 
 
 # =============================================================================
-# Fused epilogue gate  --  O := O * sigmoid(G)   (Rubin d256 f16 / per-tensor FP8)
+# Fused epilogue gate  --  O := O * sigmoid(G)   (Rubin d256 f16 / per-tensor FP8 / MXFP8)
 # =============================================================================
-# Shared between the two SM107 d256 prefill kernels (``sm107/prefill_d256_f16.py``,
-# ``sm107/prefill_d256_fp8.py``); each kernel splices these under
-# ``cutlass.const_expr(CFG.EPILOGUE_GATE)`` at its sixteen ``EPILOGUE_FUSION_SEAM``
+# Shared between the three SM107 d256 prefill kernels (``sm107/prefill_d256_f16.py``,
+# ``sm107/prefill_d256_fp8.py``, ``sm107/prefill_d256_mxfp8.py``); each kernel splices these under
+# ``cutlass.const_expr(CFG.EPILOGUE_GATE)`` at its ``EPILOGUE_FUSION_SEAM``
 # tokens (one per splice; a source test counts them per kernel).  The gate ``SmemTile(`` itself is constructed INLINE in each kernel
 # (multi-line, ``desc_version=DESC_VERSION``) so the per-kernel "every SmemTile
 # takes the module DESC_VERSION" source test keeps counting truthfully; this
@@ -1042,7 +1052,8 @@ def gate_epilogue_pairs(o_scaled, g_vals: list, half_opaque, o_chunk: int) -> li
     UNGATED value halved -- exactly, see ``gate_inv_sum``) and doubles the
     running max once per tile: Amax_O is a statistic of the sdpa node, which
     precedes the gate, so it must not depend on G
-    (``sm107/prefill_d256_fp8.py`` corr_chunk / corr_release)."""
+    (``sm107/prefill_d256_fp8.py`` and ``sm107/prefill_d256_mxfp8.py``,
+    corr_chunk / corr_release)."""
     out = []
     for p in range(o_chunk // 2):
         a, b = g_vals[2 * p], g_vals[2 * p + 1]
@@ -1061,10 +1072,11 @@ def gate_inv_sum(inv_sum):
 
     Exact for the amax fold: ``o * (inv_sum * 0.5)`` is ``0.5 * RN(o * inv_sum)``
     bit-for-bit whenever the product is a normal fp32 (a power-of-two scale
-    commutes with RN), and ``scale_o * descale_v / S_kv <= inv_sum <= scale_o *
-    descale_v`` (``1 <= sum <= S_kv``) keeps the tile's max element far from the
-    subnormal range -- which is what lets the FP8 kernel's Amax_O fold consume
-    ``h`` and double once per tile."""
+    commutes with RN), and ``inv_sum <= scale_o * descale_v`` (``sum >= 1``; on
+    MXFP8, which has no per-tensor scale, ``inv_sum <= 1``) -- an upper bound
+    only, since a sink can shrink ``inv_sum`` without limit -- keeps the tile's
+    max element a normal fp32, which is what lets the FP8 / MXFP8 kernels'
+    Amax_O fold consume ``h`` and double once per tile."""
     return inv_sum * cutlass.Float32(0.5)
 
 
