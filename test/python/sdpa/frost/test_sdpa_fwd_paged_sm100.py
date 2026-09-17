@@ -29,7 +29,7 @@ import os
 import pytest
 import torch
 
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
+from frost_test_utils import launch_f16, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
 pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
@@ -634,14 +634,15 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
         assert cfg.PACK_G == expect_pack_g, f"PACK_G={cfg.PACK_G} for G={G}, expected {expect_pack_g}"
     mod = load_template(path, params, tag=f"paged_p{P}_s{splits}_c{cta_mma}_g{G if pack else 1}_{dtype}")
     # The pools' strides in the kernel's [num_pages, page_size, H_kv, d] order carry the layout (HND vs NHD).
-    fn = mod.compile(b=B, qh=H, kh=KH, sq=1, skv=0, d_qk=d, d_v=d_v, has_lse=True, k_stride=tuple(k_view.stride()), v_stride=tuple(v_view.stride()))
+    fn = mod.compile(d_qk=d, d_v=d_v, has_lse=True, lse_kind="dense", paged_hnd=k_view.stride(1) < k_view.stride(2))
     # Split partials are fp32 on SM100 (#891); the combine must be compiled for that width.
     from test_sdpa_fwd_split_kv_sm100 import _partial_kwargs, _partial_o_dtype, _partial_tag
 
     o_p = torch.zeros(splits * B, 1, H, d_v, device=dev, dtype=_partial_o_dtype(splits, dtype))
     lse_p = torch.zeros(splits * B, H, 1, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k_view,
         v_view,
@@ -657,6 +658,7 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
         **_partial_kwargs(splits, o_p),
         block_table_tensor=bt,
         block_table_v_tensor=bt,
+        page_size=P,
         stream=stream,
     )
     if splits == 1:

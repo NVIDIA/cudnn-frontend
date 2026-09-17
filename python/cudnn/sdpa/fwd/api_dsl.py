@@ -299,6 +299,20 @@ def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int
     return SCHED_LPT_L2 if _SCHED_L2_BUDGET_BYTES >= one_head_bytes else SCHED_LPT
 
 
+_CUTE_PTR_CTOR = None
+
+
+def _cute_ptr_ctor():
+    """``(make_ptr, gmem)`` resolved once: the DSL import is not paid on the execute path."""
+    global _CUTE_PTR_CTOR
+    if _CUTE_PTR_CTOR is None:
+        import cutlass.cute as cute
+        from cutlass.cute.runtime import make_ptr
+
+        _CUTE_PTR_CTOR = (make_ptr, cute.AddressSpace.gmem)
+    return _CUTE_PTR_CTOR
+
+
 def ws_align(nbytes: int) -> int:
     """Round a scratch-chunk size up to the carve alignment (128 B)."""
     return -(-int(nbytes) // _WS_ALIGN) * _WS_ALIGN
@@ -975,6 +989,50 @@ class SdpaFwdDsl(APIBase):
         # extent 1, this one is always in range, and the compile key already
         # zeroes it (``_thd_compile_kwargs``).
         return buf.as_strided((1, tokens, h, d), (ts, ts, hs, es), buf.storage_offset())
+
+    def _scratch_base(self, workspace, label: str, required: Optional[int] = None) -> int:
+        """The device address of the caller's per-execute scratch, validated
+        against ``scratch_workspace_bytes()`` (size and 16-byte alignment).
+        FROST executor contract (``engine._FrostSdpaFwdPlan``): scratch is fixed
+        offsets into the caller's buffer, never a per-execute allocation."""
+        nbytes = workspace.numel() * workspace.element_size()
+        if required is None:
+            required = self.scratch_workspace_bytes()
+        if nbytes < required:
+            raise ValueError(
+                f"cudnn.sdpa: {label} requires a {required}-byte workspace; the provided buffer has {nbytes} bytes (size it with graph.get_workspace_size())"
+            )
+        base = workspace.data_ptr()
+        if base % 16 != 0:
+            raise ValueError(f"cudnn.sdpa: {label} workspace must be at least 16-byte aligned; got data_ptr=0x{base:x}")
+        return base
+
+    def _check_dense_buffers(self, q, k, v, o) -> None:
+        """Dense explicit launches bind ``data_ptr()`` with the declared element type,
+        so the runtime dtype/device must match the declaration (the DLPack boundary
+        used to check this). Paged K/V pools are validated by the paged pack."""
+        pairs = [(q, self.q_desc), (o, self.o_desc)] + ([] if self.paged else [(k, self.k_desc), (v, self.v_desc)])
+        for buf, desc in pairs:
+            if buf.dtype != desc.dtype or buf.device != desc.device:
+                raise ValueError(f"{desc.name}: runtime buffer ({buf.dtype}, {buf.device}) does not match its declaration ({desc.dtype}, {desc.device})")
+
+    _PTR_CACHE_MAX = 4096
+
+    def _ptr(self, dtype, buf, align: int = 16):
+        """A ``cute.Pointer`` for a torch buffer; None stays None. A pointer object is a
+        pure function of (address, dtype, align), so repeated addresses (static serving
+        buffers, graph replay) reuse it; ~0.6 us each."""
+        if buf is None:
+            return None
+        key = (buf.data_ptr(), dtype, align)
+        cache = self.__dict__.setdefault("_ptr_cache", {})
+        ptr = cache.get(key)
+        if ptr is None:
+            if len(cache) >= self._PTR_CACHE_MAX:
+                cache.clear()
+            make_ptr, gmem = _cute_ptr_ctor()
+            ptr = cache[key] = make_ptr(dtype, key[0], gmem, assumed_align=align)
+        return ptr
 
     def _amax_slot(self, tensor, name: str, device: torch.device) -> torch.Tensor:
         """The caller's 1-element amax storage, or a cached dummy.
@@ -2106,10 +2164,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # plan agrees on `has_amax`.
         self._kernel_accepts = None  # a (re)loaded module: re-read its signature
         _kc = self._kernel_compile_accepts()
+        # Explicit pointer/int host entry (the f16/bf16 SM100 / SM107 prefill templates): every
+        # extent and stride is a runtime argument, so the compile key is layout-only and the
+        # dense / THD launches bind pointers (_execute_dense_explicit, cudnn.sdpa.fwd.prepared).
+        _explicit = bool(getattr(self._k_mod, "EXPLICIT_ABI", False))
+        self._thd_spec = None
         # Backstop only: check_support already declined every flavor whose
         # kernel lacks the gate (rule 8b twin); reaching this means the twin and
         # the kernel disagree.
-        if self.gate_desc is not None and "gate_stride" not in _kc:
+        if self.gate_desc is not None and not _explicit and "gate_stride" not in _kc:
             raise NotImplementedError(f"{self.flavor} kernel does not carry the epilogue gate")
         _gate_kw = {"gate_stride": self._gate_declared} if self.gate_desc is not None else {}
         _amax_kw = {"has_amax": self.has_amax_o} if "has_amax" in _kc else {}
@@ -2136,7 +2199,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         _bpe_o = self._o_dtype().itemsize
         self._bshd_declared = (
             (None, None, None, None)
-            if (self.thd or "q_stride" not in _kc or (self._fp8 and (self._device_cc != (10, 7) or self.flavor != (256, 256))))
+            if (self.thd or (not _explicit and "q_stride" not in _kc) or (self._fp8 and (self._device_cc != (10, 7) or self.flavor != (256, 256))))
             else (
                 self._bshd_zero_copy_stride(self.q_desc, _bpe_qkv),
                 None if self.paged else self._bshd_zero_copy_stride(self.k_desc, _bpe_qkv),
@@ -2149,7 +2212,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             if "q_stride" in _kc
             else {}
         )
-        if self.thd:
+        if _explicit:
+            # One artifact per layout kind: THD, dense and paged all compile HERE, at plan
+            # time, and execute() only binds pointers. has_lse=False compiles the LSE store
+            # out; a split requires the in-kernel LSE (the per-split LSE is the combine weight).
+            self._compiled_kernel = self._k_mod.compile(**self._explicit_compile_kwargs())
+            self._build_thd_spec()
+        elif self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
             # compile as dynamic extents — issue #552), so compile HERE like
             # every dense specialization; execute()'s lru-cached call re-binds
@@ -2254,6 +2323,162 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 stats_log2=self.stats_log2,
             )
         self._logger.debug("compile completed")
+
+    # Every host slot the dense explicit launch binds (a gate-less call binds the gate slots as absent);
+    # a template declaring a slot outside this vocabulary is declined at plan time, not at first launch.
+    _DENSE_EXPLICIT_SLOTS = frozenset(
+        "q_ptr k_ptr v_ptr o_ptr lse_ptr sinks_ptr meta_ptr o_desc_ptr problem_size q_strides k_strides v_strides o_strides lse_strides lse_ext "
+        "scale_softmax_log2 n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form o_partial_ptr block_table_ptr block_table_v_ptr "
+        "table_strides n_pages gate_ptr gate_strides stream".split()
+    )
+
+    def _explicit_compile_kwargs(self) -> dict:
+        """The compile key of an explicit-ABI template: only what specializes the
+        traced code (every extent and stride is a runtime argument)."""
+        if not self.thd:
+            kind = "dense"
+        elif self.thd_stats_padded:
+            kind = "padded"
+        elif self.thd_stats_head_major:
+            kind = "head"
+        else:
+            kind = "token"
+        import inspect
+
+        km = self._k_mod
+        accepted = inspect.signature(km.compile).parameters
+        kw = dict(has_lse=(self.lse_desc is not None) or self.split_kv > 1, lse_kind=kind)
+        if "d_qk" in accepted:  # head-dim envelope
+            kw.update(d_qk=self.head_dim_qk, d_v=self.head_dim_v)
+        if "paged_hnd" in accepted and self.paged:
+            ps = self._paged_pool_stride(self.k_desc)  # kernel order: page, row, head, d
+            kw["paged_hnd"] = ps[1] < ps[2]
+        self._host_params = frozenset(inspect.signature(km._host).parameters)
+        unknown = sorted(
+            n for n, p in inspect.signature(km._host).parameters.items() if "Constexpr" not in str(p.annotation) and n not in self._DENSE_EXPLICIT_SLOTS
+        )
+        if unknown:
+            raise NotImplementedError(f"{km.__name__}: host slots {unknown} are not bound by the SM100 adapter")
+        return kw
+
+    def _build_thd_spec(self) -> None:
+        """The THD f16 / bf16 launch, prepared once (``cudnn.sdpa.fwd.prepared``): the graph plan and
+        ``execute()`` both bind through it. None outside its domain (a split)."""
+        self._thd_spec = None
+        if not (self.thd and self.split_kv == 1):
+            return
+        from cudnn.sdpa.fwd.prepared import build_thd_spec
+
+        self._thd_spec = build_thd_spec(self, scale_softmax=None)  # the f16 THD path has no other launch: a NotImplementedError declines the plan here
+
+    def _execute_dense_explicit(
+        self,
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        lse_tensor,
+        sinks,
+        seq_kv_lens,
+        seq_q_lens,
+        scale_softmax_log2,
+        workspace,
+        current_stream,
+        block_table,
+        block_table_v,
+        gate=None,
+    ) -> None:
+        """Dense (padded) launch of an explicit-ABI template: compact BSHD operands
+        as pointers plus their (batch, seq, head) strides; a split writes the partial slabs
+        and recombines through the plan-time-compiled combine pass."""
+        import cutlass
+
+        st = self._k_mod.STORAGE_DTYPE
+        f32, i32, i64 = cutlass.Float32, cutlass.Int32, cutlass.Int64
+        P = self._ptr
+        device = q_tensor.device
+        b, h, kh, sq, skv, d_qk, d_v = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk, self.head_dim_v
+        self._check_dense_buffers(q_tensor, k_tensor, v_tensor, o_tensor)
+        _decl = getattr(self, "_bshd_declared", (None, None, None, None))  # zero-copy strided operands: view, never copy
+        Q = self._to_bshd(q_tensor, _decl[0])
+        G = self._checked_gate_view(gate, o_tensor) if gate is not None else None
+        if self.paged:
+            # Page pools [num_pages, H_kv, page_size, D] -> the kernel's [num_pages, page_size, H_kv, D] order (a view)
+            K, V = k_tensor.permute(0, 2, 1, 3), v_tensor.permute(0, 2, 1, 3)
+            skv, n_pages = block_table.shape[1] * self.paged_page_size, K.shape[0]
+            k_st, v_st = (K.stride(0), K.stride(1), K.stride(2)), (V.stride(0), V.stride(1), V.stride(2))
+            bt, btv, t_st = P(i32, block_table, 4), P(i32, block_table_v, 4), (block_table.stride(0), block_table.stride(1))
+        else:
+            K, V = self._to_bshd(k_tensor, _decl[1]), self._to_bshd(v_tensor, _decl[2])
+            n_pages = 0
+            k_st, v_st = (K.stride(0), K.stride(1), K.stride(2)), (V.stride(0), V.stride(1), V.stride(2))
+            bt, btv, t_st = None, None, (0, 0)
+        O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor, _decl[3])
+        o_arg = O_scratch if o_needs_copy_back else O_view
+        sinks_t = (
+            self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h, dtype=torch.float32, device=device))
+        )
+        seq_kv_t = (
+            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+            if seq_kv_lens is not None
+            else self._dummy("seq_kv", device, lambda: torch.zeros(b, dtype=torch.int32, device=device))
+        )
+        seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
+        o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
+        o_dst, lse_dst = o_arg, lse_tensor
+        if self.split_kv > 1:
+            o_dst, lse_dst = self._split_partials(workspace, device, current_stream)
+        fp32_partial = self._fp32_partial_split()
+        lse_st = tuple(lse_dst.stride()) if lse_dst is not None else (0, 0, 0)
+        kw = dict(
+            q_ptr=P(st, Q),
+            k_ptr=P(st, K),
+            v_ptr=P(st, V),
+            o_ptr=P(f32 if fp32_partial else st, o_dst),
+            lse_ptr=P(f32, lse_dst, 4),
+            sinks_ptr=P(f32, sinks_t),
+            meta_ptr=P(i32, seq_kv_t),
+            o_desc_ptr=P(i64, o_desc_dummy),
+            problem_size=(b, h, kh, sq, skv, 0),
+            q_strides=(Q.stride(0), Q.stride(1), Q.stride(2)),
+            k_strides=k_st,
+            v_strides=v_st,
+            o_strides=(o_dst.stride(0), o_dst.stride(1), o_dst.stride(2)),
+            lse_strides=lse_st,
+            lse_ext=0,  # THD-only
+            scale_softmax_log2=scale_softmax_log2,
+            n_thd_units=0,
+            seq_q_lens_addr=_q_lens_addr(seq_q_t),
+            thd_q_lens_ptr=None,
+            thd_kv_lens_ptr=None,
+            thd_lens_form=None,
+            o_partial_ptr=P(f32, o_dst) if fp32_partial else None,
+            block_table_ptr=bt,
+            block_table_v_ptr=btv,
+            table_strides=t_st,
+            n_pages=n_pages,
+            gate_ptr=None,  # the gate slots are declared by every gate-capable host; absent gate = None + zero strides
+            gate_strides=(0, 0, 0),
+        )
+        if G is not None:
+            kw.update(gate_ptr=P(getattr(self._k_mod, "GATE_STORAGE_DTYPE", st), G), gate_strides=(G.stride(0), G.stride(1), G.stride(2)))
+        params = self._host_params
+        self._compiled_kernel(**{name: value for name, value in kw.items() if name in params}, stream=current_stream)
+        if self.split_kv > 1:
+            self._combine_kernel(
+                o_dst,
+                lse_dst,
+                o_arg,
+                lse_tensor,
+                None,
+                None,  # dense half O: no amax, and never a quantized cast
+                (b, h, sq, d_v),
+                cutlass.Int32(self.split_kv),
+                stream=current_stream,
+            )
+        if o_needs_copy_back:
+            O_view.copy_(O_scratch)
+        self._logger.debug("execute completed")
 
     @staticmethod
     def _paged_pool_stride(desc) -> tuple:
@@ -2525,6 +2750,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             return
 
+        if getattr(self._k_mod, "EXPLICIT_ABI", False):
+            self._execute_dense_explicit(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                sinks,
+                seq_kv_lens,
+                seq_q_lens,
+                scale_softmax_log2,
+                workspace,
+                current_stream,
+                block_table,
+                block_table_v,
+                gate,
+            )
+            return
+
         # `_bshd_declared` is set by EVERY dense compile() (the quantized
         # branch reads it in _execute_fp8); THD leaves it (None,)*4, and a None
         # entry makes the call behave exactly as it always did (compact ->
@@ -2787,6 +3031,51 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         s_q_decl = int(self.q_desc.shape[2])
         return self.batch_size * ((s_q_decl + cga_tile_m - 1) // cga_tile_m) * self.h_q
 
+    def _thd_decl(self, desc: TensorDesc) -> tuple:
+        """``(h, d, token_stride, head_stride, elem_stride, row_span)`` of a THD declaration."""
+        h, d = desc.shape[1], desc.shape[3]
+        (ts, hs, es), _ = self._thd_declared(desc)
+        return (h, d, ts, hs, es, (h - 1) * hs + (d - 1) * es + 1)
+
+    def _thd_plan(self):
+        """The THD launch's per-plan constants — the operands' declared strides
+        and row spans, the scratch layout, the unit count, the length form —
+        resolved once (``prepared.build_thd_spec`` reads them)."""
+        plan = getattr(self, "_thd_plan_cached", None)
+        if plan is not None:
+            return plan
+        b = self.batch_size
+        # Persistent THD kernels cap the launch at what the device can hold resident (one
+        # cluster per CGA_SIZE SMs) instead of the plan-time envelope: the kernel pulls units
+        # from a device-bounded counter.
+        env = units = self._thd_unit_envelope()
+        if getattr(self._k_mod, "THD_PERSISTENT", False):
+            cluster_ctas = int(getattr(self._k_mod, "CGA_SIZE", 0) or getattr(self._k_mod, "CTA_MMA", 1))
+            units = min(env, max(1, _device_sm_count(self.q_desc.device) // max(1, cluster_ctas)))
+            dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
+            if dbg > 0:
+                units = min(env, dbg)
+        n_meta = 4 * b + 4
+        plan = SimpleNamespace(
+            q=self._thd_decl(self.q_desc),
+            k=self._thd_decl(self.k_desc),
+            v=self._thd_decl(self.v_desc),
+            o=self._thd_decl(self.o_desc),
+            units=units,
+            n_q_lens=b + 1 if self.cu_seq_q_lens else b,
+            n_kv_lens=b + 1 if self.cu_seq_kv_lens else b,
+            lens_form=(1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0),
+            # scratch layout: [meta(seq_kv, cu_q, cu_k) | o_desc | ...] (see scratch_workspace_bytes)
+            n_meta=n_meta,
+            n_o_desc=(b + 3) * 16,
+            off_o_desc=ws_align(n_meta * 4),
+            scratch_bytes=self.scratch_workspace_bytes(),
+            total_q=None if self.max_total_seq_len_q is None else max(int(self.max_total_seq_len_q), 0),
+            total_kv=None if self.max_total_seq_len_kv is None else max(int(self.max_total_seq_len_kv), 0),
+        )
+        self._thd_plan_cached = plan
+        return plan
+
     def _thd_pack(self, q_buf, k_buf, v_buf, o_buf, sinks, seq_kv_lens, seq_q_lens, workspace, label, current_stream=None, lse_tokens_cap=None):
         """Shared SM100 THD (ragged) packing — issue #552, zero host reads.
 
@@ -2986,62 +3275,39 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         execute is fully async and CUDA-graph capturable. No compile is keyed
         on runtime data: the kernels compile with DYNAMIC token extents, so a
         new packed total re-binds the same artifact."""
-        import cutlass
+        from cudnn.sdpa.fwd.prepared import bind_thd, facts_of_tensor
 
-        lse_cap = self._thd_lse_tokens_cap(lse_tensor)
-        pack = self._thd_pack(
-            q_buf, k_buf, v_buf, o_buf, sinks, seq_len_kv, seq_q_lens, workspace, "SdpaFwdDslSm100 (THD)", current_stream=current_stream, lse_tokens_cap=lse_cap
+        spec = self._thd_spec
+        if spec is None:
+            raise NotImplementedError("SdpaFwdDslSm100 (THD): this plan has no prepared launch (see _build_thd_spec)")
+        facts = dict(
+            q=facts_of_tensor(q_buf),
+            k=facts_of_tensor(k_buf),
+            v=facts_of_tensor(v_buf),
+            o=facts_of_tensor(o_buf),
+            lse=facts_of_tensor(lse_tensor),
+            sinks=facts_of_tensor(sinks),
+            q_lens=facts_of_tensor(seq_q_lens),
+            kv_lens=facts_of_tensor(seq_len_kv),
+            block_table=facts_of_tensor(block_table),
+            block_table_v=facts_of_tensor(block_table_v),
         )
-        if pack is None:
+        stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
+        if workspace is not None:
+            ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes)
+        else:
+            # standalone use without a workspace: GPU-written scratch is per INVOCATION (never shared
+            # through the spec), allocated on the launch stream
+            with _torch_stream_context(current_stream, q_buf.device):
+                scratch = torch.empty(spec.scratch_bytes, dtype=torch.uint8, device=q_buf.device)
+            ws_ptr = scratch.data_ptr()
+        frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
+        if frame is None:
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")
-            # no addressable Q token: every padded Stats row is unwritten, and the contract is -inf on all of them
-            self._seed_padded_lse(self._thd_padded_lse_view(lse_tensor), current_stream)
             return
-        LSE = self._thd_lse_view(lse_tensor, pack.t_q)
-
-        # PLAN-TIME-ONLY compile key (issue #552: keying on the packed totals
-        # degenerated into a per-step recompile under continuous batching):
-        # this lru-cached call re-binds the artifact compile() already built.
-        # The K/V strides are taken from the BOUND views because the
-        # all-KV-zero clamp swaps in packed batch-1 views (that rare shape
-        # mints its own cache entry); the batch stride is zeroed out of the
-        # key (a runtime value the kernel rebuilds symbolically).
-        kwargs = self._thd_compile_kwargs()
-        if not self.paged:
-            # the bound views' strides; packed ones derive from the dynamic extents
-            # under dynamic_bhk and stay out of the key
-            def _view_key(t, h):
-                st = tuple(int(x) for x in t.stride()[1:])
-                return None if (kwargs.get("dynamic_bhk") and st == (h * t.shape[-1], t.shape[-1], 1)) else (0, *st)
-
-            kwargs.update(k_stride=_view_key(pack.K, self.h_kv), v_stride=_view_key(pack.V, self.h_kv))
-        fn = self._k_mod.compile(**kwargs)
-        self._seed_padded_lse(LSE, current_stream)
-        # Paged pools: the block tables follow the THD length slots in the ABI.
-        paged_kwargs = {"block_table_tensor": block_table, "block_table_v_tensor": block_table_v} if self.paged else {}
-        # The caller's length tensors ride to the setup kernel, which builds
-        # the metadata buffer device-side; the form bitmask is a runtime
-        # value (no compile key grows). problem_size sq/skv slots are 0 by
-        # the THD contract (_host reads the dynamic extents).
-        fn(
-            pack.Q,
-            pack.K,
-            pack.V,
-            pack.O,
-            LSE,
-            pack.sinks_t,
-            pack.meta,
-            pack.o_desc,
-            (self.batch_size, self.h_q, self.h_kv, 0, 0, 0),
-            cutlass.Float32(scale_softmax_log2),
-            cutlass.Int32(pack.units),
-            0,  # seq_q_lens_addr: dense-only, unread on the paged path
-            pack.q_lens_dev,
-            pack.kv_lens_dev,
-            cutlass.Int32(pack.lens_form),
-            **paged_kwargs,
-            stream=current_stream,
-        )
+        if scale_softmax_log2 != spec.template[spec.index["scale_softmax_log2"]]:
+            frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
+        spec.fn(*frame)
         self._logger.debug("execute (THD) completed")
 
     @staticmethod
