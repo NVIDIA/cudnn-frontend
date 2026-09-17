@@ -314,6 +314,8 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
 }
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "MhcProjectionBackward": (".gemm.mhc_projection_bwd", "MhcProjectionBackward"),
+    "mhc_projection_backward": (".gemm.mhc_projection_bwd", "mhc_projection_backward"),
     "gnn": (".gnn", None),
     "FlexAttentionBwd": (".flex_attention", "FlexAttentionBwd"),
     "FlexAttentionFwd": (".flex_attention", "FlexAttentionFwd"),
