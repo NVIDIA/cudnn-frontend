@@ -32,7 +32,10 @@ class <Block>Fwd(APIBase)
   exact byte count. Nothing is read back to the host and nothing is converted, which is what makes a block
   CUDA-graph friendly with stable pointers.
 - **Append-only signatures.** New parameters go at the end with defaults (the gated block appended `quant=`,
-  then the MXFP8 scale-factor blobs, then `qk_norm` on the geometry); positional callers never break.
+  then the MXFP8 scale-factor blobs, then `qk_norm` on the geometry, then the fp4 `W_o` scale blob
+  `sample_w_o_sf` / `w_o_sf`); positional callers never break. The same rule applies to the spec dataclasses: a new
+  mode is a new field with a default (`MxQuantSpec.w_qkvg_dtype`, `MxQuantSpec.o_fp4`), never a new positional
+  argument or a second class.
 
 ## Mixing graph-API engines and DSL kernels
 
@@ -76,6 +79,24 @@ bf16 / fp16, per-tensor FP8 (a `QuantSpec` of static scales) and MXFP8 (an `MxQu
 select different stage sets — the quantized pipelines add quantize passes in the unfused form and fold them into
 the projection epilogue in the fused form — but the caller sees one class and one `execute()`. The workspace
 layout appends regions for new modes; existing offsets stay byte-identical.
+
+Two further modes ride the same signature and show the pattern at its smallest:
+
+- **fp4 weights.** `MxQuantSpec(w_qkvg_dtype=torch.float4_e2m1fn_x2)` swaps stage (1) onto the FROST GEMM's mixed
+  MXFP8 x MXFP4 block-scale row. Nothing else moves: the weight arrives packed (`[N, K // 2]`, two e2m1 codes per
+  byte) with its existing E8M0 scale blob, the stage list and the workspace are identical to MXFP8, and the one
+  fusion the mode cannot serve (the fused projection fork is rendered for an e4m3 B) is a feature-detected typed
+  `NotImplementedError`, so the test inverts the day the fork arm lands.
+- **fp4 output.** `MxQuantSpec(o_fp4=Fp4Format.NVFP4 | MXFP4)` replaces the per-tensor tail (quantize `O`, FP8 out
+  projection) with a block quantize of the gated `O` and the fp4 x fp4 block-scale out projection against an e2m1
+  `W_o` whose scale blob is one appended argument (`sample_w_o_sf` / `w_o_sf`, required iff the mode is on). The
+  format is an enum whose member IS the (codes, scale dtype, block) triple, so an illegal pairing cannot be spelled,
+  and the two per-tensor scales that no longer have a consumer are pinned to `1.0` by a typed `ValueError` rather
+  than silently dropped. The workspace appends the two new slots (`o4`, `sf_o`) at the end of the arm and drops the
+  e4m3 `o8` it no longer writes; a frozen offset snapshot pins every other layout byte-identical.
+
+Both are fields on `MxQuantSpec`, not constructor flags: a mode that only makes sense inside one precision pipeline
+lives on that pipeline's spec, so it is unrepresentable on the others instead of being one more decline to test.
 
 ## Measuring a block honestly
 
