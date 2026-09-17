@@ -8,9 +8,17 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Optional
 
-import torch
-
 from cudnn.api_base import TupleDict
+from cudnn.tensor_adapter import detect_framework
+
+
+def tensor_framework(q_tensor, *tensors):
+    framework = detect_framework(q_tensor)
+    if framework not in ("torch", "jax"):
+        raise TypeError("BSA requires PyTorch tensors or JAX arrays")
+    if any(tensor is not None and detect_framework(tensor) != framework for tensor in tensors):
+        raise TypeError("All BSA tensors must use the same framework")
+    return framework
 
 
 def _validate_layout(layout: str) -> None:
@@ -19,6 +27,8 @@ def _validate_layout(layout: str) -> None:
 
 
 def _canonical_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layout: str):
+    import torch
+
     _validate_layout(layout)
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("q, k, and v must all be rank-4 tensors")
@@ -61,6 +71,8 @@ def _validate_sparse_metadata(
     device: torch.device,
     allowed_block_size_ranks: tuple[int, ...],
 ) -> None:
+    import torch
+
     if q2k_block_index.ndim != 4 or q2k_block_index.dtype != torch.int32:
         raise ValueError("q2k_block_index must be a rank-4 int32 tensor")
     if tuple(q2k_block_index.shape[:3]) != expected_prefix:
@@ -98,6 +110,8 @@ def _device_arch(tensor: torch.Tensor) -> int:
 
 @lru_cache(maxsize=None)
 def _device_arch_for_index(device_index: int) -> int:
+    import torch
+
     major, minor = torch.cuda.get_device_capability(device_index)
     return major * 10 + minor
 
@@ -126,6 +140,8 @@ def _validate_backward_tensors(
     k_tensor: torch.Tensor,
     v_tensor: torch.Tensor,
 ) -> None:
+    import torch
+
     if do_tensor.shape != o_tensor.shape or o_tensor.shape != q_tensor.shape:
         raise ValueError("do_tensor, o_tensor, and q_tensor must have identical shapes")
     if do_tensor.dtype != q_tensor.dtype or o_tensor.dtype != q_tensor.dtype:
@@ -156,6 +172,8 @@ def _validate_sage_inputs(
     k_tensor: torch.Tensor,
     v_tensor: torch.Tensor,
 ) -> tuple[int, int, int, int]:
+    import torch
+
     if any(tensor.ndim != 4 for tensor in (q_tensor, k_tensor, v_tensor)):
         raise ValueError("Sage q, k, and v must be rank-4 BHSD tensors")
     batch, heads, seqlen_q, head_dim = q_tensor.shape
@@ -199,6 +217,30 @@ def block_sparse_attention_forward(
     Sparse metadata values are a caller contract; see the "Sparse metadata"
     section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
     """
+
+    framework = tensor_framework(q_tensor, k_tensor, v_tensor, q2k_block_index, block_sizes, q2k_block_nums)
+    if framework == "jax":
+        from . import jax_api
+
+        if pack_gqa not in (None, False) or kv_splits != 1 or use_clc is not None:
+            raise NotImplementedError("JAX BSA requires pack_gqa=None or False, kv_splits=1, and use_clc=None")
+        c = jax_api.configuration(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            q2k_block_index,
+            q2k_block_nums,
+            block_sparse_num,
+            block_sizes,
+            sparse_block_size,
+            layout,
+            softmax_scale,
+            allow_empty_block_nums,
+            None,
+        )
+        return jax_api.forward(c, q_tensor, k_tensor, v_tensor, q2k_block_index, q2k_block_nums)
+
+    import torch
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
     arch = _device_arch(q_tensor)
@@ -324,6 +366,8 @@ def block_sparse_attention_fp8_forward(
     softmax_scale: Optional[float] = None,
 ) -> TupleDict:
     """Quantize BF16 inputs internally and run forward-only Sage FP8 blk64 BSA."""
+    import torch
+
     batch, heads, seqlen_q, seqlen_k = _validate_sage_inputs(q_tensor, k_tensor, v_tensor)
     arch = _device_arch(q_tensor)
     arch_family = arch // 10
@@ -389,12 +433,41 @@ def block_sparse_attention_backward(
     bucket_size_blocks: Optional[int] = None,
     sparse_block_size: Optional[int] = None,
     layout: str = "bhsd",
+    allow_empty_block_nums: bool = False,
 ) -> TupleDict:
     """Compute explicit dQ, dK, and dV for block-sparse attention.
 
     Sparse metadata values are a caller contract; see the "Sparse metadata"
     section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
     """
+
+    framework = tensor_framework(
+        q_tensor, do_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, q2k_block_index, block_sizes, q2k_block_nums, dq_tensor, dk_tensor, dv_tensor
+    )
+    if framework == "jax":
+        from . import jax_api
+
+        if any(output is not None for output in (dq_tensor, dk_tensor, dv_tensor)):
+            raise NotImplementedError("JAX BSA does not accept caller-provided gradient outputs")
+        c = jax_api.configuration(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            q2k_block_index,
+            q2k_block_nums,
+            block_sparse_num,
+            block_sizes,
+            sparse_block_size,
+            layout,
+            softmax_scale,
+            allow_empty_block_nums,
+            bucket_size_blocks,
+        )
+        return jax_api.backward(c, do_tensor, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, q2k_block_index, q2k_block_nums)
+    if allow_empty_block_nums:
+        raise NotImplementedError("allow_empty_block_nums is only exposed by the JAX backward API")
+
+    import torch
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
     arch = _device_arch(q_tensor)

@@ -65,7 +65,7 @@ def require_array(x, name, shape=None, dtype=None):
 def configuration(q_tensor, k_tensor, v_tensor, indices, nums, count, block_sizes, block_size, layout, scale, allow_empty, bucket_size):
     if layout not in ("bhsd", "bshd"):
         raise ValueError("layout must be 'bhsd' or 'bshd'")
-    if block_sizes is not None or block_size != 128:
+    if block_sizes is not None or block_size not in (None, 128):
         raise ValueError("JAX BSA supports only sparse_block_size=128 and block_sizes=None")
     for name, x in (("q_tensor", q_tensor), ("k_tensor", k_tensor), ("v_tensor", v_tensor)):
         require_array(x, name, dtype=jnp.bfloat16)
@@ -168,79 +168,17 @@ def backward_call(c):
     )
 
 
-def block_sparse_attention_forward(
-    q_tensor,
-    k_tensor,
-    v_tensor,
-    q2k_block_index,
-    block_sparse_num=None,
-    block_sizes=None,
-    q2k_block_nums=None,
-    *,
-    sparse_block_size=128,
-    layout="bhsd",
-    softmax_scale=None,
-    allow_empty_block_nums=False,
-):
-    """Return ``(o_tensor, lse_tensor)``. Sparse metadata values are a caller-validated contract; see the JAX BSA documentation."""
-    c = configuration(
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        q2k_block_index,
-        q2k_block_nums,
-        block_sparse_num,
-        block_sizes,
-        sparse_block_size,
-        layout,
-        softmax_scale,
-        allow_empty_block_nums,
-        None,
-    )
-    o_tensor, lse_tensor = forward_call(c)(q_tensor, k_tensor, v_tensor, q2k_block_index, q2k_block_index if q2k_block_nums is None else q2k_block_nums)
-    return BSAResult(o_tensor=o_tensor, lse_tensor=lse_tensor)
+def forward(c, q, k, v, indices, nums):
+    o, lse = forward_call(c)(q, k, v, indices, indices if nums is None else nums)
+    return BSAResult(o_tensor=o, lse_tensor=lse)
 
 
-def block_sparse_attention_backward(
-    do_tensor,
-    q_tensor,
-    k_tensor,
-    v_tensor,
-    o_tensor,
-    lse_tensor,
-    q2k_block_index,
-    block_sparse_num=None,
-    block_sizes=None,
-    q2k_block_nums=None,
-    *,
-    sparse_block_size=128,
-    layout="bhsd",
-    softmax_scale=None,
-    allow_empty_block_nums=False,
-    bucket_size_blocks=None,
-):
-    """Explicit first-order backward. Reuse the exact forward inputs, output, LSE, and options."""
-    c = configuration(
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        q2k_block_index,
-        q2k_block_nums,
-        block_sparse_num,
-        block_sizes,
-        sparse_block_size,
-        layout,
-        softmax_scale,
-        allow_empty_block_nums,
-        bucket_size_blocks,
-    )
-    require_array(do_tensor, "do_tensor", q_tensor.shape, jnp.bfloat16)
-    require_array(o_tensor, "o_tensor", q_tensor.shape, jnp.bfloat16)
-    require_array(lse_tensor, "lse_tensor", c.bhsd[:3], jnp.float32)
-    dq_tensor, dk_tensor, dv_tensor, *workspace = backward_call(c)(
-        q_tensor, k_tensor, v_tensor, do_tensor, o_tensor, lse_tensor, q2k_block_index, q2k_block_index if q2k_block_nums is None else q2k_block_nums
-    )
-    return BSAResult(dq_tensor=dq_tensor, dk_tensor=dk_tensor, dv_tensor=dv_tensor)
+def backward(c, do, q, k, v, o, lse, indices, nums):
+    require_array(do, "do_tensor", q.shape, jnp.bfloat16)
+    require_array(o, "o_tensor", q.shape, jnp.bfloat16)
+    require_array(lse, "lse_tensor", c.bhsd[:3], jnp.float32)
+    dq, dk, dv, *workspace = backward_call(c)(q, k, v, do, o, lse, indices, indices if nums is None else nums)
+    return BSAResult(dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0,))
