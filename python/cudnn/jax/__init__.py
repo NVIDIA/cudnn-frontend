@@ -12,6 +12,8 @@ and TensorSpec presets for the layouts the GEMM fusions use.
 Requires jax >= 0.5 and the CuTeDSL JAX extensions (shipped with nvidia-cutlass-dsl).
 """
 
+from importlib import import_module
+
 from .call import (
     call,
     gemm_operand_spec,
@@ -22,7 +24,11 @@ from .call import (
 )
 from cutlass.jax import TensorSpec
 
+_BSA_EXPORTS = ("block_sparse_attention", "block_sparse_attention_forward", "block_sparse_attention_backward")
+
+
 __all__ = [
+    *_BSA_EXPORTS,
     "call",
     "row_major_desc",
     "TensorSpec",
@@ -36,8 +42,11 @@ __all__ = [
 
 
 def __getattr__(name):
+    if name in _BSA_EXPORTS:
+        value = getattr(import_module("cudnn.block_sparse_attention.jax_api"), name)
+        globals()[name] = value
+        return value
     if name in ("grouped_gemm_swiglu", "grouped_gemm_dswiglu"):
-        from importlib import import_module
         from cudnn.frost.buffers import cutedsl_requirement_error
 
         requirement = cutedsl_requirement_error(name)

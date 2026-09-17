@@ -131,11 +131,8 @@ cudnn.behavior_note.value
 cudnn.block_sparse_attention
 cudnn.block_sparse_attention.BSA
 cudnn.block_sparse_attention.block_sparse_attention_backward
-cudnn.block_sparse_attention.block_sparse_attention_backward_jax
 cudnn.block_sparse_attention.block_sparse_attention_forward
-cudnn.block_sparse_attention.block_sparse_attention_forward_jax
 cudnn.block_sparse_attention.block_sparse_attention_fp8_forward
-cudnn.block_sparse_attention.block_sparse_attention_jax
 cudnn.build_plan_policy
 cudnn.build_plan_policy.ALL
 cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -373,6 +370,9 @@ cudnn.hstu.hstu_lmsd.hstu_lmsd_forward
 cudnn.is_frontend_knob_type
 cudnn.jax
 cudnn.jax.TensorSpec
+cudnn.jax.block_sparse_attention
+cudnn.jax.block_sparse_attention_backward
+cudnn.jax.block_sparse_attention_forward
 cudnn.jax.call
 cudnn.jax.gemm_operand_spec
 cudnn.jax.grouped_gemm_dswiglu
@@ -761,6 +761,9 @@ cudnn.tensor_reordering.NONE
 cudnn.tensor_reordering.name
 cudnn.tensor_reordering.value
 cudnn.torch
+cudnn.torch.block_sparse_attention_backward
+cudnn.torch.block_sparse_attention_forward
+cudnn.torch.block_sparse_attention_fp8_forward
 cudnn.torch.calls
 cudnn.torch.grouped_gemm_dswiglu
 cudnn.torch.grouped_gemm_swiglu

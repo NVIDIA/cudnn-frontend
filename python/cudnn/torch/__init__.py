@@ -22,12 +22,18 @@ On torch < 2.13 (no registry), ``cudnn.torch.install()`` applies the
 ``F.scaled_dot_product_attention`` overrides directly.
 """
 
+from importlib import import_module
+
 from cudnn.torch.sdpa_provider import calls, install, served_plan_names  # noqa: F401
 
-__all__ = ["calls", "install", "served_plan_names", "grouped_gemm_swiglu", "grouped_gemm_dswiglu"]
+_BSA_EXPORTS = ("block_sparse_attention_forward", "block_sparse_attention_backward", "block_sparse_attention_fp8_forward")
 
 
 def __getattr__(name):
+    if name in _BSA_EXPORTS:
+        value = getattr(import_module("cudnn.block_sparse_attention"), name)
+        globals()[name] = value
+        return value
     if name in ("grouped_gemm_swiglu", "grouped_gemm_dswiglu"):
         import cudnn
 
@@ -35,3 +41,6 @@ def __getattr__(name):
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [*_BSA_EXPORTS, "calls", "install", "served_plan_names", "grouped_gemm_swiglu", "grouped_gemm_dswiglu"]
