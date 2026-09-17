@@ -759,10 +759,12 @@ Q-to-K and K-to-Q views from one coarse classification.
 The experimental [Gated Attention Block API](../fe-oss-apis/gated_attention_block.md) is a model-level FE OSS
 API for NVIDIA Rubin (SM107): the QKV+gate projection, QK-RMSNorm (optional) with partial RoPE, GQA SDPA,
 sigmoid gate and out projection of a Qwen3.5-style gated attention sub-layer behind one class, one workspace
-and one `execute()`, every stage a FROST kernel. It runs bf16 / fp16, per-tensor FP8 and MXFP8, with two
-fusion knobs (`fuse_norm_rope`, `fuse_gate`) that take the block to three launches, plus a bf16 backward with a
-recompute policy. It is separate from the cuDNN Graph API above; the fused epilogue gate it uses is also
-available as the graph pattern described under "Fused epilogue gate".
+and one `execute()`, every stage a FROST kernel. It runs bf16 / fp16, per-tensor FP8 and MXFP8 -- the MXFP8
+pipeline optionally with MXFP4 (e2m1 x E8M0) projection weights and with an NVFP4 or MXFP4 block-quantized output
+feeding an fp4 x fp4 out projection -- with two fusion knobs (`fuse_norm_rope`, `fuse_gate`) that take the block to
+three launches (four with the fp4 output), plus a bf16 backward with a recompute policy. It is separate from the
+cuDNN Graph API above; the fused epilogue gate it uses is also available as the graph pattern described under
+"Fused epilogue gate".
 
 ### SDPA PyTorch Custom Ops (`cudnn::sdpa_fwd` / `cudnn::sdpa_bwd`)
 
