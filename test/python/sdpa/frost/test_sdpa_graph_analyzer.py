@@ -737,17 +737,19 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    legacy_order = [n for n in names if n != "pack_gqa_partial_d_shapes"]
+    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes")]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
+    assert caps.paged_d_shapes is None
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
     legacy_tail = ["pack_gqa_d_shapes", "thd_padded_stats", "epilogue_gate", "epilogue_gate_d_shapes", "epilogue_gate_dtypes"]
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
-    assert names[-1] == "pack_gqa_partial_d_shapes", names[-3:]
+    # ... and every later field is appended after it, in the order it landed.
+    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes"], names[start:]
 
 
 def test_knob_request_pack_gqa_false_always_eligible():
@@ -1541,21 +1543,23 @@ def test_bwd_dsink_fact():
 # --- paged KV caches (issue #920) -------------------------------------------
 
 
-def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False, sink=False):
+def _mk_paged_graph(*, d=128, d_v=None, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False, sink=False):
     """cuDNN's paged-cache contract: K/V page pools [num_pages, H_kv, page_size, D]
     (HND compact, or NHD storage declared via strides) + (B, 1, max_pages, 1)
-    int32 block tables + per-batch lengths. ``sink`` adds the (1, H, 1, 1) fp32
-    sink_token (a decode graph: s_q = 1)."""
+    int32 block tables + per-batch lengths. ``d_v`` (default ``d``) is the V
+    pool's row width: the two pools may differ (MLA-style d_qk != d_v). ``sink``
+    adds the (1, H, 1, 1) fp32 sink_token (a decode graph: s_q = 1)."""
     g = _mk_graph()
     b, h, kh = B, H, 2
+    d_v = d if d_v is None else d_v
     q = g.tensor(dim=(b, h, 1, d), stride=(h * d, d, d, 1), data_type=DTYPE, name="q")
     num_pages = b * max_pages
-    if hnd:
-        strides = (kh * page_size * d, page_size * d, d, 1)
-    else:
-        strides = (page_size * kh * d, d, kh * d, 1)
-    k = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=DTYPE, name="k")
-    v = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=DTYPE, name="v")
+
+    def _pool_strides(dd):
+        return (kh * page_size * dd, page_size * dd, dd, 1) if hnd else (page_size * kh * dd, dd, kh * dd, 1)
+
+    k = g.tensor(dim=(num_pages, kh, page_size, d), stride=_pool_strides(d), data_type=DTYPE, name="k")
+    v = g.tensor(dim=(num_pages, kh, page_size, d_v), stride=_pool_strides(d_v), data_type=DTYPE, name="v")
     tk = g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tk")
     tv = tk if one_table else g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tv")
     slq = g.tensor(dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="slq")
@@ -1566,7 +1570,7 @@ def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True,
     if sink:
         kw["sink_token"] = g.tensor(dim=(1, h, 1, 1), stride=(h, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="sink")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_padding_mask=padding, seq_len_q=slq, seq_len_kv=slk, **kw)
-    _finish_output(o, (b, h, 1, d), (h * d, d, d, 1))
+    _finish_output(o, (b, h, 1, d_v), (h * d_v, d_v, d_v, 1))
     return g
 
 
@@ -1590,7 +1594,8 @@ def test_paged_facts_declared_max_seq_len_and_single_table():
 def test_paged_probe_declines():
     assert not _eligible(_mk_paged_graph(page_size=48)), "page_size must divide 128 or be a multiple of it"
     assert engines.engine_name() in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
-    assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d256 flavors only"
+    assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d192x128 / d256 flavors only"
+    assert not _eligible(_mk_paged_graph(d=512, d_v=128)), "(512, 128) selects the d512 flavor, which carries no PAGED_KV specialization"
     assert not _eligible(_mk_paged_graph(padding=False)), "paged KV needs the padding mask (per-batch KV lengths)"
     # Lifted decline: the sink is an epilogue fold, orthogonal to the paged loader.
     facts = _facts(_mk_paged_graph(sink=True))
@@ -1598,6 +1603,16 @@ def test_paged_probe_declines():
     assert engines.engine_name() in _eligible(_mk_paged_graph(sink=True)), "paged KV with an attention sink at decode is served"
     facts = ga.analyze(_mk_paged_graph(max_seq_len=8 * 16 + 1))
     assert facts.invalid is not None, "a declared max S_kv beyond the block table's reach is invalid"
+
+
+def test_paged_mixed_head_dims_are_served():
+    """The head-dim gate tests the flavor the lowering SELECTS
+    (``Capabilities.paged_d_shapes``), not the raw dims: (192, 128) is the
+    native d192x128 flavor, (256, 128) / (64, 192) / (136, 72) ride the d256 and
+    d192x128 envelopes. The previous "exactly one dim > 128" approximation
+    declined all of them (INVERTED from a decline)."""
+    for d_qk, d_v in ((192, 128), (256, 128), (64, 192), (136, 72)):
+        assert engines.engine_name() in _eligible(_mk_paged_graph(d=d_qk, d_v=d_v)), f"paged ({d_qk}, {d_v}) must be served"
 
 
 def test_paged_split_kv_is_proposed_on_a_decode_launch(monkeypatch):

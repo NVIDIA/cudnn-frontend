@@ -33,6 +33,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_S
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPILOGUE_GATE_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
+    _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
     bshd_zero_copy_stride as _bshd_zero_copy_stride_rule,
     canonicalize_d192_lowering,
@@ -1674,12 +1675,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "softmax_precision=HALF is served for per-tensor FP8 d128 on cc10.7 only (FLOAT is the default everywhere)",
         )
         if self.paged:
-            # Paged KV rides the d128 f16/bf16 kernel's PAGED_KV specialization
-            # (config_sm100._validate_params is the backstop for the same set).
+            # Paged KV rides the f16/bf16 kernels' PAGED_KV specialization on
+            # the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
+            # its _validate_params backstops, and engines' paged_d_shapes).
             self._not_implemented_error_if(self._fp8, "paged KV is served by the f16/bf16 kernel only")
             self._not_implemented_error_if(
-                self.flavor not in ((128, 128), (256, 256)),
-                f"paged KV is wired on the d128 and d256 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+                f"d{self.flavor[0]}" not in _SM100_PAGED_KV_FLAVORS,  # config_sm100 tags flavors by d_qk (d192 = the d192x128 kernel)
+                f"paged KV is wired on the {sorted(_SM100_PAGED_KV_FLAVORS)} flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._value_error_if(not self.seq_kv_lens_present, "paged KV requires per-batch KV lengths (seq_kv_lens_present)")
             # has_sink composes with paged KV (epilogue fold vs. loader); the
