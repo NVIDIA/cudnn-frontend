@@ -309,11 +309,15 @@ __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "RopeQDQInplace": "Install with 'pip install nvidia-cudnn-frontend[triton]' and install a CUDA-enabled torch build",
+    "rope_qdq_inplace": "Install with 'pip install nvidia-cudnn-frontend[triton]' and install a CUDA-enabled torch build",
     "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
 }
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "RopeQDQInplace": (".rope", "RopeQDQInplace"),
+    "rope_qdq_inplace": (".rope", "rope_qdq_inplace"),
     "gnn": (".gnn", None),
     "FlexAttentionBwd": (".flex_attention", "FlexAttentionBwd"),
     "FlexAttentionFwd": (".flex_attention", "FlexAttentionFwd"),
