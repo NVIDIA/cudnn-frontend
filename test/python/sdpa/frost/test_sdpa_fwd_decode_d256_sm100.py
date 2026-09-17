@@ -417,14 +417,17 @@ def test_decode_routing_boundary():
     """S_q x G past the routed tile stays on the prefill d256 tile -- including
     the (16, 32] rows the compiled 32-column tile could take (an eager
     regression: 90 us unsplit / 96-103 us split against the prefill tile's 66 us
-    at the b=32 serving shape on B200) -- and d128 stays on its own (THD
-    queries: test_decode_routing_boundary_thd_queries)."""
+    at the b=32 serving shape on B200) -- and d128 stays on its own flavor's
+    templates (its decode tile since PR #1094; THD queries:
+    test_decode_routing_boundary_thd_queries)."""
     _run_graph(B=2, H=32, KH=2, s_q=2, lens=[700, 130], page=16, causal_br=True, expect=PREFILL)  # 32 packed rows: the S_q=2 MTP step at 16:1
     _run_graph(B=2, H=32, KH=1, s_q=1, lens=[700, 130], page=16, expect=PREFILL)  # 32 packed rows at S_q=1
     _run_graph(B=2, H=16, KH=2, s_q=4, lens=[700, 130], page=16, causal_br=True, expect=PREFILL)  # 32 packed rows at 8:1
     _run_graph(B=2, H=4, KH=4, s_q=17, lens=[700, 130], page=16, expect=PREFILL)  # 17 MHA rows
     _run_graph(B=2, H=32, KH=2, s_q=3, lens=[700, 130], page=16, expect=PREFILL)  # 48 packed rows
-    _run_graph(B=2, H=8, KH=2, s_q=1, lens=[700, 130], d=128, page=16, expect="prefill_d128_f16")
+    # d128 is another flavor: its decode-shaped graphs ride the d128 flavor's own
+    # decode tile (sm100/decode_d128_f16.py, TILE_CGA_M=1, PR #1094), never this one.
+    _run_graph(B=2, H=8, KH=2, s_q=1, lens=[700, 130], d=128, page=16, expect="decode_d128_f16")
     _run_graph(B=2, H=64, KH=1, s_q=1, lens=[300, 130], page=16, expect=PREFILL)  # 64 packed rows
 
 
