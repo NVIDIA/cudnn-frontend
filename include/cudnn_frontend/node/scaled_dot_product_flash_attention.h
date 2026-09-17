@@ -952,6 +952,9 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
         if (attributes.inputs.find(input_names::SINK_TOKEN) != attributes.inputs.end()) {
             softmax_attributes.set_sink(attributes.inputs[input_names::SINK_TOKEN]);
         }
+        // Base-2 Stats: on cuDNN 9.21+ this softmax lowers to the unified softmax operation, whose
+        // descriptor carries the log-base attribute (cuDNN 9.27+); the composite engine honors it.
+        softmax_attributes.set_stats_use_log2(attributes.stats_use_log2);
         // Special non-functional-style call. Needed because output already created and provided to user.
         softmax(last_output,
                 softmax_attributes,
@@ -2639,10 +2642,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         } else {
             auto stats_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
             if (stats_it != attributes.outputs.end() && stats_it->second) {
-                // Base-2 Stats is an attribute of the softmax descriptor, which this pre-9.21 path cannot express.
-                RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.stats_use_log2,
-                                               error_code_t::GRAPH_NOT_SUPPORTED,
-                                               "stats_use_log2 in unified SDPA node requires cuDNN 9.27.0");
+                // stats_use_log2 cannot reach this pre-9.21 path: the support surface rejects it below 9.27.
                 auto backend_stats = tensors[stats_it->second->get_uid()]->get_desc()->get_backend_descriptor();
                 _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
                                                                CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC,

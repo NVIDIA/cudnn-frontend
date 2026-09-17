@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdlib>
 #include <unordered_set>
 
@@ -440,6 +441,18 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
         return true;
     };
 
+    // Base-2 Stats live on the unified softmax operation descriptor (cuDNN 9.27.0+), which both the
+    // UNIFIED and the COMPOSITE node spell their softmax with (cuDNN 9.21+), so both backend
+    // implementations honor the flag from 9.27.0 on. The attribute must also exist in the compiled
+    // headers. Below that there is no servable backend path (an appended pointwise on Stats has no
+    // engine): reject for both so auto-select routes such graphs to a FROST engine.
+    RETURN_CUDNN_FRONTEND_ERROR_IF(
+        stats_use_log2 && generate_stats.value_or(false) &&
+            std::min(detail::get_compiled_version(), detail::get_backend_version()) < 92700,
+        error_code_t::GRAPH_NOT_SUPPORTED,
+        "stats_use_log2 requires cuDNN 9.27.0+ (headers and library) for the UNIFIED and COMPOSITE "
+        "implementations, or a FROST engine");
+
     switch (impl) {
         case AttentionImplementation_t::AUTO:
             // This function should not be called with AUTO.
@@ -462,13 +475,6 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 has_input(input_names::CU_SEQ_LEN_Q) || has_input(input_names::CU_SEQ_LEN_KV),
                 error_code_t::GRAPH_NOT_SUPPORTED,
                 "Composite SDPA node doesn't support CU_SEQ_LEN_Q / CU_SEQ_LEN_KV inputs");
-            // Base-2 stats are an attribute of the unified softmax operation descriptor; the composite
-            // softmax has none, and an appended pointwise on Stats has no servable engine. Reject here so
-            // auto-select routes such graphs to the unified implementation (or a FROST engine) instead.
-            RETURN_CUDNN_FRONTEND_ERROR_IF(stats_use_log2 && generate_stats.value_or(false),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Composite SDPA node doesn't support stats_use_log2 (requires the UNIFIED "
-                                           "implementation on cuDNN 9.27.0+ or a FROST engine)");
             // The ragged offset multiplier is only supported by the unified forward engine.
             // Reject it here so auto-select routes such graphs to the unified implementation.
             for (const auto& [key, value] : inputs) {
