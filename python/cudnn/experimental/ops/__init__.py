@@ -13,6 +13,8 @@ from typing import Any
 _LAZY_ALIASES = {
     "moe_grouped_matmul": "cudnn.gemm.ops.moe_grouped_matmul",
     "swiglu_mlp": "cudnn.gemm.ops.swiglu_mlp",
+    "rms_norm": "cudnn.experimental.ops.rmsnorm",
+    "layer_norm": "cudnn.experimental.ops.layernorm",
 }
 
 
