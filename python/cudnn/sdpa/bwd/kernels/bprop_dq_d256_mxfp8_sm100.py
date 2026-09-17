@@ -102,6 +102,7 @@ def _make_load_pipeline_state(user_type: pipeline.PipelineUserType, stages: int)
         return _LoadPipelineState(stages, Int32(0))
     raise ValueError("load pipeline state must be producer or consumer")
 
+
 """
 SM100 D256 MXFP8 SDPA backward: the dQ kernel (2-CTA, online or fixed dS scale).
 
@@ -2512,7 +2513,6 @@ class BlackwellFmhaBackwardDQ256:
                 mcast_mask=self.sfb_full_mcast_mask,
             )
 
-
         # Load sfV (SFB) - slot 0 + slot 1 from merged tensor
         for sfv_k_half in cutlass.range_constexpr(self.k_halves):
             sfv_stage = load_stage * self.k_halves + sfv_k_half
@@ -2679,7 +2679,6 @@ class BlackwellFmhaBackwardDQ256:
                     tma_bar_ptr=tma_barrier_K_inner,
                     mcast_mask=self.sfb_full_mcast_mask,
                 )
-
 
             # Load sfV (SFB) - slot 0 + slot 1 from merged tensor
             for sfv_k_half in cutlass.range_constexpr(self.k_halves):

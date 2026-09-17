@@ -1599,12 +1599,8 @@ else:
     for i in range(total_iters):
         # FP8/MXFP8 needs randn in bfloat16 then convert (randn doesn't support fp8 well)
         randn_dtype = torch.bfloat16 if args.data_type in ("fp8", "mxfp8") else target_dtype
-        query_master = torch.randn(
-            batch_size, q_seqlen, num_q_heads, head_dim_qk, dtype=randn_dtype, device=device, requires_grad=True
-        ).transpose(1, 2)
-        key_master = torch.randn(
-            batch_size, kv_seqlen, num_kv_heads, head_dim_qk, dtype=randn_dtype, device=device, requires_grad=True
-        ).transpose(1, 2)
+        query_master = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_qk, dtype=randn_dtype, device=device, requires_grad=True).transpose(1, 2)
+        key_master = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_qk, dtype=randn_dtype, device=device, requires_grad=True).transpose(1, 2)
         query = query_master.to(target_dtype)
         key = key_master.to(target_dtype)
         value = (
@@ -1633,9 +1629,7 @@ else:
             amax_dP_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
 
         query, key, value = preprocess_qkv(query, key, value, args.sdpa_backend)
-        dOutput_master = torch.randn(
-            batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device
-        ).transpose(1, 2)
+        dOutput_master = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).transpose(1, 2)
         dOutput = dOutput_master.to(target_dtype)
 
         if is_cudnn_fe:

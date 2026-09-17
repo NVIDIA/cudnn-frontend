@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 pytestmark = pytest.mark.L0
 
 
@@ -51,7 +50,7 @@ def test_d256_dq_does_not_repack_or_load_columnwise_k_scale():
         assert obsolete not in source
 
     assert '("dq_sf_kt", "sf_k_T"' not in api
-    assert "sf_bufs[\"dq_sf_kt\"]" not in api
+    assert 'sf_bufs["dq_sf_kt"]' not in api
 
     # The row-wise K scales still feed the Q @ K block-scaled MMA.
     for required in ("sSFK_smem_layout_staged", "tma_atom_sfK", "tma_copy_sfK_bytes", "tSTtSFK"):
@@ -93,7 +92,11 @@ def test_d256_dkdv_sequence_reductions_are_bf16():
 
 def test_qwen_leakage_probe_does_not_compile_the_test_quantizer():
     source = _BWD_TEST.read_text()
-    helper = source[source.index("def _run_leakage_only(") : source.index("# --------------------------------------------------------------------------- #", source.index("def _run_leakage_only("))]
+    helper = source[
+        source.index("def _run_leakage_only(") : source.index(
+            "# --------------------------------------------------------------------------- #", source.index("def _run_leakage_only(")
+        )
+    ]
     test = source[source.index("def test_causal_sequence_reductions_do_not_leak_masked_rows") : source.index("def test_gqa")]
 
     assert "_quantize(" not in helper
