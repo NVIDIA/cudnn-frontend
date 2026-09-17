@@ -6,6 +6,9 @@ from importlib import import_module
 _SYMBOLS = {
     "sparse_attention": (".training", "sparse_attention"),
     "sparse_attention_score_recompute": (".training", "sparse_attention_score_recompute"),
+    "indexer_forward_jax_sm100": (".jax_api", "indexer_forward_jax_sm100"),
+    "sparse_attention_forward_jax_sm100": (".jax_api", "sparse_attention_forward_jax_sm100"),
+    "sparse_attention_backward_jax_sm100": (".jax_api", "sparse_attention_backward_jax_sm100"),
     "SparseAttentionForward": (".sparse_attention_forward", "SparseAttentionForward"),
     "sparse_attention_forward_wrapper": (".sparse_attention_forward", "sparse_attention_forward_wrapper"),
     "AlignedHCABackward": (".aligned_hca_backward", "AlignedHCABackward"),

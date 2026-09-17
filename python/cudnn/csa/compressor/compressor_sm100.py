@@ -79,7 +79,10 @@ import ctypes
 import os
 import threading
 
-import torch
+try:  # Torch is needed only by the eager wrapper; JAX imports the pure DSL kernels.
+    import torch
+except ImportError:  # pragma: no cover - exercised by JAX-only installs
+    torch = None
 import cuda.bindings.driver as cuda_driver
 
 import cutlass
@@ -112,11 +115,13 @@ MINIMUM_COMPUTE_CAPABILITY_MAJOR = 10
 # torch's raw current-stream query (~0.5 us) vs `torch.cuda.current_stream` object
 # construction (~2-3 us). Same handle the slow path ends up passing. Private API: guard
 # the bind so module import survives torch builds that do not expose it.
-_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None) if torch is not None else None
 if _raw_stream is None:  # pragma: no cover - older/stripped torch builds
 
     def _raw_stream(device_index=None):
         """Fallback raw-stream query via the public torch API."""
+        if torch is None:
+            raise ImportError("The eager CSA compressor launcher requires torch")
         return torch.cuda.current_stream(device_index).cuda_stream
 
 

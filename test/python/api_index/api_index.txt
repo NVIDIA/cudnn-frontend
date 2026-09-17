@@ -190,8 +190,12 @@ cudnn.csa.CSACompressorForward
 cudnn.csa.CSACompressorForward.check_support
 cudnn.csa.CSACompressorForward.compile
 cudnn.csa.CSACompressorForward.execute
+cudnn.csa.csa_compressor_backward_jax_sm100
 cudnn.csa.csa_compressor_backward_wrapper
+cudnn.csa.csa_compressor_forward_jax_sm100
 cudnn.csa.csa_compressor_forward_wrapper
+cudnn.csa_compressor_backward_jax_sm100
+cudnn.csa_compressor_forward_jax_sm100
 cudnn.cudnnGraphNotSupportedError
 cudnn.cudnnGraphNotSupportedError.add_note
 cudnn.cudnnGraphNotSupportedError.args
@@ -279,12 +283,15 @@ cudnn.deepseek_sparse_attention.dense_attn_score_recompute_wrapper
 cudnn.deepseek_sparse_attention.dense_indexer_backward_wrapper
 cudnn.deepseek_sparse_attention.dense_indexer_score_recompute_wrapper
 cudnn.deepseek_sparse_attention.indexer_backward_wrapper
+cudnn.deepseek_sparse_attention.indexer_forward_jax_sm100
 cudnn.deepseek_sparse_attention.indexer_forward_top_k_wrapper
 cudnn.deepseek_sparse_attention.indexer_forward_wrapper
 cudnn.deepseek_sparse_attention.indexer_top_k_wrapper
 cudnn.deepseek_sparse_attention.local_to_global_wrapper
 cudnn.deepseek_sparse_attention.sparse_attention
+cudnn.deepseek_sparse_attention.sparse_attention_backward_jax_sm100
 cudnn.deepseek_sparse_attention.sparse_attention_backward_wrapper
+cudnn.deepseek_sparse_attention.sparse_attention_forward_jax_sm100
 cudnn.deepseek_sparse_attention.sparse_attention_forward_wrapper
 cudnn.deepseek_sparse_attention.sparse_attention_score_recompute
 cudnn.deepseek_sparse_attention.sparse_attn_score_recompute_wrapper
@@ -693,6 +700,7 @@ cudnn.hstu.hstu_attention.hstu_attention_forward
 cudnn.hstu.hstu_lmsd
 cudnn.hstu.hstu_lmsd.hstu_lmsd_backward
 cudnn.hstu.hstu_lmsd.hstu_lmsd_forward
+cudnn.indexer_forward_jax_sm100
 cudnn.is_frontend_knob_type
 cudnn.jax
 cudnn.jax.TensorSpec
@@ -1431,6 +1439,8 @@ cudnn.sdpa.fwd.sdpa_fwd_wrapper_sm80
 cudnn.sdpa.fwd.torch_op
 cudnn.sdpa.fwd.torch_op.sdpa
 cudnn.set_stream
+cudnn.sparse_attention_backward_jax_sm100
+cudnn.sparse_attention_forward_jax_sm100
 cudnn.tensor
 cudnn.tensor.get_alignment
 cudnn.tensor.get_data_type

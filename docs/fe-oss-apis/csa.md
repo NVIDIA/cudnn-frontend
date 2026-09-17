@@ -160,6 +160,22 @@ pip install nvidia-cudnn-frontend
 
 ## API Usage
 
+### JAX custom call (SM100 ratio-4)
+
+```python
+from cudnn import csa_compressor_forward_jax_sm100
+
+out = csa_compressor_forward_jax_sm100(
+    kv, score, ape, cu_seqlens, cu_seqlens_comp, total_comp=static_output_rows
+)
+```
+
+This raw JAX kernel binding uses the active XLA CUDA stream. It currently accepts
+the DSv4 training specialization `ratio=4`, `coff=2`, BF16 KV/scores, FP32 APE,
+and int32 packed-sequence metadata. Use Transformer Engine's
+`transformer_engine.jax.csa_compressor` for the differentiable JAX API; it owns
+the VJP and invokes these forward/backward bindings.
+
 ### High-level wrappers
 
 ```python
