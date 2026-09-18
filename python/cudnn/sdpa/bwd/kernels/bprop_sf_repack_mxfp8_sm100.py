@@ -76,19 +76,20 @@ def repack_geometry(rows: int, k_groups: int, l: int, sf_layout: str) -> tuple:
 
 
 class Mxfp8SfRepackPairSm100:
-    """Build the SFA and SFB forms of one canonical tensor in one launch.
+    """Build the required SFA/SFB forms of one canonical tensor in one launch.
 
     One thread owns a contiguous 16-byte ``m0`` row of an F8_128x4 atom.
-    Besides halving the launch count, this decodes the atom coordinates once
-    and reuses each source byte for both consumers instead of independently
-    traversing the two expanded destinations byte by byte.
+    Besides halving the launch count when both forms are needed, this decodes
+    the atom coordinates once and reuses each source byte for both consumers.
+    ``write_sfb=False`` suppresses a dead SFB output for direct-canonical users.
     """
 
-    def __init__(self, rows: int, k_groups: int, l: int, src_plane_major: bool = True):
+    def __init__(self, rows: int, k_groups: int, l: int, src_plane_major: bool = True, write_sfb: bool = True):
         self.rows = int(rows)
         self.k_groups = int(k_groups)
         self.l = int(l)
         self.src_plane_major = bool(src_plane_major)
+        self.write_sfb = bool(write_sfb)
         self.rest_m, self.rest_k, self.sfa_rest_m, self.sfa_bytes = repack_geometry(rows, k_groups, l, SF_LAYOUT_SFA)
         _, _, self.sfb_rest_m, self.sfb_bytes = repack_geometry(rows, k_groups, l, SF_LAYOUT_SFB)
         self.src_bytes = self.l * self.rest_m * self.rest_k * 512
@@ -136,7 +137,8 @@ class Mxfp8SfRepackPairSm100:
                 if src_m < self.rows and group < self.k_groups:
                     value = src[src_base + j]
 
-                dst_sfb[sfb0 + j] = value
+                if cutlass.const_expr(self.write_sfb):
+                    dst_sfb[sfb0 + j] = value
                 dst_sfa[sfa0_even + j] = value
 
                 shifted_j = j + 8 if j < 8 else j
@@ -147,7 +149,8 @@ class Mxfp8SfRepackPairSm100:
                     shifted_value = src[src_base + shifted_j]
                 dst_sfa[sfa0_odd + j] = shifted_value
 
-                dst_sfb[sfb1 + j] = shifted_value if j < 8 else Int8(_E8M0_ONE)
+                if cutlass.const_expr(self.write_sfb):
+                    dst_sfb[sfb1 + j] = shifted_value if j < 8 else Int8(_E8M0_ONE)
                 dst_sfa[sfa1_even + j] = value if 4 <= j and j < 8 else Int8(_E8M0_ONE)
                 dst_sfa[sfa1_odd + j] = shifted_value if 4 <= j and j < 8 else Int8(_E8M0_ONE)
 
