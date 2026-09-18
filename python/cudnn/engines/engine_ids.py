@@ -41,6 +41,7 @@ FROST_SDPA_FWD_ID_BASE = PYTHON_ENGINE_ID_BASE + 500  # 20_500..20_599
 FROST_SDPA_BWD_ID_BASE = PYTHON_ENGINE_ID_BASE + 600  # 20_600..20_699
 GDP_ID_BASE = PYTHON_ENGINE_ID_BASE + 700  # 20_700..20_799
 FROST_CONV_ID_BASE = PYTHON_ENGINE_ID_BASE + 800  # 20_800..20_899
+MAMBA2_ID_BASE = PYTHON_ENGINE_ID_BASE + 900  # 20_900..20_999
 
 # The delegating entry: the backend picks among candidates it holds but does not
 # expose as plans (heur_mode.OPENSOURCE). It has no C++ plan index and no

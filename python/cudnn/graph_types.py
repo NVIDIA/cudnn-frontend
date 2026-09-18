@@ -70,6 +70,8 @@ class NodeType(Enum):
     KDA_SUMMARY_BWD = auto()
     GDN2_SUMMARY_BWD = auto()
     GDP_SUMMARY_BWD = auto()
+    MAMBA2 = auto()
+    MAMBA2_BWD = auto()
 
 
 @dataclass(eq=False)  # identity-based hash/eq: uid/name are mutable

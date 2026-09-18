@@ -211,7 +211,7 @@ def test_classification_and_facts_pull_no_framework():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("module", ["cudnn.sdpa.fwd.engines", "cudnn.sdpa.bwd.engines"])
+@pytest.mark.parametrize("module", ["cudnn.sdpa.fwd.engines", "cudnn.sdpa.bwd.engines", "cudnn.linear_attention.frost.mamba2_engine"])
 def test_support_check_pulls_no_framework(module):
     """Capabilities and mismatch() are pure data and comparisons.
 
