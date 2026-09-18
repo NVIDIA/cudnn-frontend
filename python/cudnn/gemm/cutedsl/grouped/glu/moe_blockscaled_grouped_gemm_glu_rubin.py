@@ -36,6 +36,7 @@ from ..moe_persistent_scheduler import (
     MoESchedulerParams,
     MoEWorkTileInfo,
 )
+from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
 from ..moe_utils import (
     compute_expert_token_range,
     MoEWeightMode,
@@ -748,6 +749,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         geglu_alpha: cutlass.Float32 = 1.702,
         glu_clamp_max: cutlass.Float32 = 7.0,
         glu_clamp_min: cutlass.Float32 = -7.0,
+        scheduler_counter: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM.
 
@@ -767,6 +769,15 @@ class BlockScaledMoEGroupedGemmGluKernel:
         The optional routing probability multiplies this result. Stored C
         retains the GEMM-plus-bias values before activation clamping.
         """
+        if cutlass.const_expr(scheduler_counter is not None):
+            workspace_ptr = scheduler_counter.iterator
+        a = kernel_facing_mx(a)
+        c = kernel_facing_mx(c)
+        d = kernel_facing_mx(d)
+        d_col = kernel_facing_mx(d_col)
+        prob = kernel_facing_prob(prob)
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
+            b = kernel_facing_b(b)
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
@@ -989,7 +1000,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         )
 
         # ---- Helper kernel: TMA desc init (discrete) + sched counter reset (dynamic) ----
-        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or self.use_dynamic_sched)
+        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and scheduler_counter is None))
         if cutlass.const_expr(_need_helper):
             _helper_grid_x = self.expert_cnt if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else 1
             _helper_args = (

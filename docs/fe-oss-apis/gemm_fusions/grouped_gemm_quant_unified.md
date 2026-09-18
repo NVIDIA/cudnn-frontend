@@ -30,7 +30,7 @@ This kernel performs:
   - `SFB` (discrete): per-expert scale factor tensors, passed via `sfb_ptrs`
   - `padded_offsets`: cumulative sum of aligned group M sizes, shape `(L,)`. `valid_m = padded_offsets[-1]`
   - `alpha`: per-group scaling factors, shape `(L,)`
-  - `prob`: per-row gating probabilities, shape `(valid_m, 1, 1)`. **Required.**
+  - `prob`: per-row gating probabilities, shape `(valid_m, 1, 1)`. Optional; omission disables gating.
   - `norm_const`: normalization constant for FP8 quantization, shape `(1,)`
 - **Outputs**
   - `D`: row-quantized output, shape `(valid_m, N, 1)`
@@ -38,6 +38,29 @@ This kernel performs:
   - `SFD_row`: row scale factors (when SFD outputs are enabled), shape `(32, 4, ceil(valid_m/128), 4, ceil(ceil(N/sf_vec_size)/4), 1)`
   - `SFD_col`: column scale factors (when SFD outputs are enabled), shape `(32, 4, ceil(N/128), 4, ceil(ceil(valid_m/sf_vec_size)/4), 1)`
   - `amax`: per-group amax (when `d_dtype` is bf16/float16), shape `(L, 1)`
+
+### Canonical layouts and optional amax
+
+The unified wrapper and API class also accept contiguous A `(M, K)`, dense B
+`(L, N, K)`, and probability `(M,)`. Operands may independently use canonical or
+legacy layouts. Scale buffers may be contiguous tensors of any rank, provided
+their bytes are already packed in the required MMA-tiled physical order; reshaping
+ordinary logical scales does not perform this packing.
+
+With 2-D A, the wrapper returns D/D_col `(M, N)` and contiguous SFD buffers with
+physical shape `(1, ceil(rows/128), ceil(ceil(cols/sf_vec_size)/4), 32, 4, 4)`.
+Preallocated D must follow the layout selected by A. Legacy 3-D A retains the
+existing output layouts. Canonical normalization happens during compilation.
+
+`generate_amax=False` disables the BF16/FP16 amax output, including its allocation,
+initialization, reduction, and atomic updates. The default is `True` for compatibility;
+when disabled, `amax_tensor` is `None`. D values are unchanged. Probability is
+optional: `prob_tensor=None` removes the probability load and multiply.
+
+The wrapper advertises `supports_canonical_layouts` and `supports_optional_amax`.
+Its metadata memo retains compiled APIs and output allocation parameters, never
+input tensors or their data pointers. Runtime data, routing, and streams remain
+per-call arguments.
 
 ### Equations
 
@@ -201,7 +224,7 @@ api.execute(
 
 - **Input tensor prob**: `prob_tensor` / `sample_prob`
   - Shape: `(valid_m, 1, 1)`, dtype: `float32`
-  - **Required**: pass ones tensor if no gating needed
+  - Optional: pass `None` when no gating is needed
 
 - **Scale factor tensors**: SFA, SFB, SFD_row, SFD_col -- block-scaled 6-D layout
 - **Group offsets**: `padded_offsets` shape `(L,)`, dtype `int32`
@@ -238,7 +261,7 @@ Returns `TupleDict`: `d_tensor`, `d_col_tensor` (optional; `None` for `bfloat16`
 - All scale factor tensors must have same dtype
 - Expert count `<= 1024`; M aligned to 256
 - SM100+ compute capability required
-- `prob_tensor` is unconditionally required
+- `prob_tensor=None` omits per-row gating
 - `use_single_group_runtime_offsets=True` requires exactly one expert. The
   kernel derives `padded_offsets[0]` from runtime `A.shape[0]` and does not load
   its value from device memory; the argument must still be an int32 tensor with
@@ -249,3 +272,49 @@ Returns `TupleDict`: `d_tensor`, `d_col_tensor` (optional; `None` for `bfloat16`
 ## Usage Examples
 
 For usage examples, see `test/python/gemm/cutedsl/test_grouped_gemm_quant.py` + `test/python/gemm/cutedsl/test_grouped_gemm_quant_utils.py` (dense and discrete unified API coverage)
+
+### Prepared execution
+
+Dense canonical MXFP8 E4M3 inputs with E8M0 packed scales support a prepared
+BF16/FP16 output call with `generate_amax=False`:
+
+```python
+from cudnn.gemm.cutedsl.grouped.prepared import prepare_grouped_gemm
+
+kwargs = dict(
+    a_tensor=a, b_tensor=b, sfa_tensor=sfa, sfb_tensor=sfb,
+    padded_offsets=padded_offsets, alpha_tensor=alpha,
+    prob_tensor=prob, d_dtype=torch.bfloat16, sf_vec_size=32,
+    generate_amax=False, use_dynamic_sched=True,
+)
+plan = prepare_grouped_gemm("quant", **kwargs)
+outputs = plan.run(d_tensor=output_buffer, **kwargs)
+assert outputs["d_tensor"] is output_buffer
+```
+
+Preparation does not execute the GEMM or retain sample inputs. Pass current
+operands on each call. D is fresh unless supplied through `d_tensor` or
+`outputs={"d_tensor": output_buffer}`; other quant outputs are `None` in this
+prepared configuration. A D supplied during preparation must be passed again
+at execution. `reuse_row_outputs` applies only to GLU.
+
+The shared [prepared execution contract](grouped_gemm_glu.md#prepared-execution)
+requires fixed metadata/configuration, a separate plan per stream, and the
+preparation stream current during every call. `check=False` is only for callers
+that enforce those invariants themselves.
+
+### Caller-owned scheduler counter
+
+Dense block-scaled dynamic scheduling accepts `scheduler_counter_tensor`, a
+nonempty contiguous one-dimensional CUDA int32 tensor on A's device. Zero its
+first element on the execution stream before **every** launch; keep it alive
+until execution completes. Use distinct counters for overlapping invocations
+and GEMMs. The class constructor uses `sample_scheduler_counter` and execution
+must preserve its optional presence.
+
+Omitting the counter retains internal initialization. Supplying it bypasses
+the counter-initialization launch, so callers may combine the reset with
+existing preparation work. The same contract applies to prepared calls;
+see [counter ownership](grouped_gemm_glu.md#caller-owned-scheduler-counter).
+Detect support with
+`grouped_gemm_quant_wrapper_sm100.supports_external_scheduler_counter`.
