@@ -1,0 +1,253 @@
+{
+  "accumulator_dtype": "float32",
+  "batch": 1,
+  "causal": true,
+  "chunk_len": 32,
+  "cp_size": 2,
+  "empty_chunks": [],
+  "fixture_sha256": "a1362e8251437efff161de9f299f0e2b1bc16b9934454c44315e295309f971af",
+  "fuser_mode": "torch.compile via transformer_engine.pytorch.jit.lazy_compile (NVTE_TORCH_COMPILE default 1)",
+  "generated_utc": "2026-09-18T14:25:58Z",
+  "generator": "test/python/sdpa/cp_numerics/make_fixtures.py",
+  "head_dim": 64,
+  "head_mapping": "full: every rank holds all H heads (no head split; cp_size_a2a == 1)",
+  "lane": "te_fidelity",
+  "layout": "bshd",
+  "lse_base": "e",
+  "lse_dtype": "float32",
+  "mask": "causal-top-left",
+  "name": "cp_p2_bf16_s128_causal",
+  "note": "BF16 storage for partials AND accumulator; the FP64 expected value is unaffected by this cast",
+  "num_heads": 4,
+  "o_dtype": "bfloat16",
+  "o_i_normalized": true,
+  "p_schedule_map": [
+    {
+      "causal_mode": "causal",
+      "kv_chunks": [
+        0,
+        3
+      ],
+      "q_chunks": [
+        0,
+        3
+      ],
+      "query_half": "both",
+      "rank": 0,
+      "ring_step": 0,
+      "section": "diagonal",
+      "source_rank": 0
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        1,
+        2
+      ],
+      "q_chunks": [
+        3
+      ],
+      "query_half": "second",
+      "rank": 0,
+      "ring_step": 1,
+      "section": "upper-triangle",
+      "source_rank": 1
+    },
+    {
+      "causal_mode": "causal",
+      "kv_chunks": [
+        1,
+        2
+      ],
+      "q_chunks": [
+        1,
+        2
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 0,
+      "section": "diagonal",
+      "source_rank": 1
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        0
+      ],
+      "q_chunks": [
+        1,
+        2
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 1,
+      "section": "lower-triangle",
+      "source_rank": 0
+    }
+  ],
+  "partial_storage_dtype": "bfloat16",
+  "qkv_dtype": "bfloat16",
+  "scale": 0.125,
+  "schema_version": 1,
+  "seq_len": 128,
+  "te_divisible": true,
+  "te_revision": "ae34b34f18d85cc62d90ca35cf6efe84c5a45a7e",
+  "te_source_relpath": "transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py",
+  "te_source_sha256": null,
+  "te_tag": "v0.1-2155-gae34b34f",
+  "trace": [
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "causal",
+      "kv_global_begin": 0,
+      "kv_global_end": 128,
+      "kv_global_ranges": [
+        [
+          0,
+          32
+        ],
+        [
+          96,
+          128
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 0,
+      "out_update_index": 0,
+      "partial_dtype": "bfloat16",
+      "partial_slot_id": "r0s0",
+      "q_global_begin": 0,
+      "q_global_end": 128,
+      "q_global_ranges": [
+        [
+          0,
+          32
+        ],
+        [
+          96,
+          128
+        ]
+      ],
+      "query_half": "both",
+      "rank": 0,
+      "ring_step": 0,
+      "section": "diagonal",
+      "source_rank": 0
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 32,
+      "kv_global_end": 96,
+      "kv_global_ranges": [
+        [
+          32,
+          64
+        ],
+        [
+          64,
+          96
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 1,
+      "out_update_index": 1,
+      "partial_dtype": "bfloat16",
+      "partial_slot_id": "r0s1",
+      "q_global_begin": 96,
+      "q_global_end": 128,
+      "q_global_ranges": [
+        [
+          96,
+          128
+        ]
+      ],
+      "query_half": "second",
+      "rank": 0,
+      "ring_step": 1,
+      "section": "upper-triangle",
+      "source_rank": 1
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "causal",
+      "kv_global_begin": 32,
+      "kv_global_end": 96,
+      "kv_global_ranges": [
+        [
+          32,
+          64
+        ],
+        [
+          64,
+          96
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 0,
+      "out_update_index": 0,
+      "partial_dtype": "bfloat16",
+      "partial_slot_id": "r1s0",
+      "q_global_begin": 32,
+      "q_global_end": 96,
+      "q_global_ranges": [
+        [
+          32,
+          64
+        ],
+        [
+          64,
+          96
+        ]
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 0,
+      "section": "diagonal",
+      "source_rank": 1
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 0,
+      "kv_global_end": 32,
+      "kv_global_ranges": [
+        [
+          0,
+          32
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 1,
+      "out_update_index": 1,
+      "partial_dtype": "bfloat16",
+      "partial_slot_id": "r1s1",
+      "q_global_begin": 32,
+      "q_global_end": 96,
+      "q_global_ranges": [
+        [
+          32,
+          64
+        ],
+        [
+          64,
+          96
+        ]
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 1,
+      "section": "lower-triangle",
+      "source_rank": 0
+    }
+  ],
+  "valid_len": 128
+}

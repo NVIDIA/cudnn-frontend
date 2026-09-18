@@ -1,0 +1,935 @@
+{
+  "accumulator_dtype": "float32",
+  "batch": 1,
+  "causal": false,
+  "chunk_len": 16,
+  "cp_size": 4,
+  "empty_chunks": [],
+  "fixture_sha256": "bbbce29e9f9809f29de904a71f229e7976439c0583c1a3ec2bc8ee7d879b7bec",
+  "fuser_mode": "torch.compile via transformer_engine.pytorch.jit.lazy_compile (NVTE_TORCH_COMPILE default 1)",
+  "generated_utc": "2026-09-18T14:25:58Z",
+  "generator": "test/python/sdpa/cp_numerics/make_fixtures.py",
+  "head_dim": 64,
+  "head_mapping": "full: every rank holds all H heads (no head split; cp_size_a2a == 1)",
+  "lane": "te_fidelity",
+  "layout": "bshd",
+  "lse_base": "e",
+  "lse_dtype": "float32",
+  "mask": "no_mask",
+  "name": "cp_p4_f32_s128_noncausal",
+  "note": "",
+  "num_heads": 4,
+  "o_dtype": "float32",
+  "o_i_normalized": true,
+  "p_schedule_map": [
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        0,
+        7
+      ],
+      "q_chunks": [
+        0,
+        7
+      ],
+      "query_half": "both",
+      "rank": 0,
+      "ring_step": 0,
+      "section": "all",
+      "source_rank": 0
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        3,
+        4
+      ],
+      "q_chunks": [
+        0,
+        7
+      ],
+      "query_half": "both",
+      "rank": 0,
+      "ring_step": 1,
+      "section": "all",
+      "source_rank": 3
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        2,
+        5
+      ],
+      "q_chunks": [
+        0,
+        7
+      ],
+      "query_half": "both",
+      "rank": 0,
+      "ring_step": 2,
+      "section": "all",
+      "source_rank": 2
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        1,
+        6
+      ],
+      "q_chunks": [
+        0,
+        7
+      ],
+      "query_half": "both",
+      "rank": 0,
+      "ring_step": 3,
+      "section": "all",
+      "source_rank": 1
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        1,
+        6
+      ],
+      "q_chunks": [
+        1,
+        6
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 0,
+      "section": "all",
+      "source_rank": 1
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        0,
+        7
+      ],
+      "q_chunks": [
+        1,
+        6
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 1,
+      "section": "all",
+      "source_rank": 0
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        3,
+        4
+      ],
+      "q_chunks": [
+        1,
+        6
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 2,
+      "section": "all",
+      "source_rank": 3
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        2,
+        5
+      ],
+      "q_chunks": [
+        1,
+        6
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 3,
+      "section": "all",
+      "source_rank": 2
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        2,
+        5
+      ],
+      "q_chunks": [
+        2,
+        5
+      ],
+      "query_half": "both",
+      "rank": 2,
+      "ring_step": 0,
+      "section": "all",
+      "source_rank": 2
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        1,
+        6
+      ],
+      "q_chunks": [
+        2,
+        5
+      ],
+      "query_half": "both",
+      "rank": 2,
+      "ring_step": 1,
+      "section": "all",
+      "source_rank": 1
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        0,
+        7
+      ],
+      "q_chunks": [
+        2,
+        5
+      ],
+      "query_half": "both",
+      "rank": 2,
+      "ring_step": 2,
+      "section": "all",
+      "source_rank": 0
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        3,
+        4
+      ],
+      "q_chunks": [
+        2,
+        5
+      ],
+      "query_half": "both",
+      "rank": 2,
+      "ring_step": 3,
+      "section": "all",
+      "source_rank": 3
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        3,
+        4
+      ],
+      "q_chunks": [
+        3,
+        4
+      ],
+      "query_half": "both",
+      "rank": 3,
+      "ring_step": 0,
+      "section": "all",
+      "source_rank": 3
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        2,
+        5
+      ],
+      "q_chunks": [
+        3,
+        4
+      ],
+      "query_half": "both",
+      "rank": 3,
+      "ring_step": 1,
+      "section": "all",
+      "source_rank": 2
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        1,
+        6
+      ],
+      "q_chunks": [
+        3,
+        4
+      ],
+      "query_half": "both",
+      "rank": 3,
+      "ring_step": 2,
+      "section": "all",
+      "source_rank": 1
+    },
+    {
+      "causal_mode": "no_mask",
+      "kv_chunks": [
+        0,
+        7
+      ],
+      "q_chunks": [
+        3,
+        4
+      ],
+      "query_half": "both",
+      "rank": 3,
+      "ring_step": 3,
+      "section": "all",
+      "source_rank": 0
+    }
+  ],
+  "partial_storage_dtype": "float32",
+  "qkv_dtype": "float32",
+  "scale": 0.125,
+  "schema_version": 1,
+  "seq_len": 128,
+  "te_divisible": true,
+  "te_revision": "ae34b34f18d85cc62d90ca35cf6efe84c5a45a7e",
+  "te_source_relpath": "transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py",
+  "te_source_sha256": null,
+  "te_tag": "v0.1-2155-gae34b34f",
+  "trace": [
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 0,
+      "kv_global_end": 128,
+      "kv_global_ranges": [
+        [
+          0,
+          16
+        ],
+        [
+          112,
+          128
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 0,
+      "out_update_index": 0,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r0s0",
+      "q_global_begin": 0,
+      "q_global_end": 128,
+      "q_global_ranges": [
+        [
+          0,
+          16
+        ],
+        [
+          112,
+          128
+        ]
+      ],
+      "query_half": "both",
+      "rank": 0,
+      "ring_step": 0,
+      "section": "all",
+      "source_rank": 0
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 48,
+      "kv_global_end": 80,
+      "kv_global_ranges": [
+        [
+          48,
+          64
+        ],
+        [
+          64,
+          80
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 1,
+      "out_update_index": 1,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r0s1",
+      "q_global_begin": 0,
+      "q_global_end": 128,
+      "q_global_ranges": [
+        [
+          0,
+          16
+        ],
+        [
+          112,
+          128
+        ]
+      ],
+      "query_half": "both",
+      "rank": 0,
+      "ring_step": 1,
+      "section": "all",
+      "source_rank": 3
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 32,
+      "kv_global_end": 96,
+      "kv_global_ranges": [
+        [
+          32,
+          48
+        ],
+        [
+          80,
+          96
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 2,
+      "out_update_index": 2,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r0s2",
+      "q_global_begin": 0,
+      "q_global_end": 128,
+      "q_global_ranges": [
+        [
+          0,
+          16
+        ],
+        [
+          112,
+          128
+        ]
+      ],
+      "query_half": "both",
+      "rank": 0,
+      "ring_step": 2,
+      "section": "all",
+      "source_rank": 2
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 16,
+      "kv_global_end": 112,
+      "kv_global_ranges": [
+        [
+          16,
+          32
+        ],
+        [
+          96,
+          112
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 3,
+      "out_update_index": 3,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r0s3",
+      "q_global_begin": 0,
+      "q_global_end": 128,
+      "q_global_ranges": [
+        [
+          0,
+          16
+        ],
+        [
+          112,
+          128
+        ]
+      ],
+      "query_half": "both",
+      "rank": 0,
+      "ring_step": 3,
+      "section": "all",
+      "source_rank": 1
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 16,
+      "kv_global_end": 112,
+      "kv_global_ranges": [
+        [
+          16,
+          32
+        ],
+        [
+          96,
+          112
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 0,
+      "out_update_index": 0,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r1s0",
+      "q_global_begin": 16,
+      "q_global_end": 112,
+      "q_global_ranges": [
+        [
+          16,
+          32
+        ],
+        [
+          96,
+          112
+        ]
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 0,
+      "section": "all",
+      "source_rank": 1
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 0,
+      "kv_global_end": 128,
+      "kv_global_ranges": [
+        [
+          0,
+          16
+        ],
+        [
+          112,
+          128
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 1,
+      "out_update_index": 1,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r1s1",
+      "q_global_begin": 16,
+      "q_global_end": 112,
+      "q_global_ranges": [
+        [
+          16,
+          32
+        ],
+        [
+          96,
+          112
+        ]
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 1,
+      "section": "all",
+      "source_rank": 0
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 48,
+      "kv_global_end": 80,
+      "kv_global_ranges": [
+        [
+          48,
+          64
+        ],
+        [
+          64,
+          80
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 2,
+      "out_update_index": 2,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r1s2",
+      "q_global_begin": 16,
+      "q_global_end": 112,
+      "q_global_ranges": [
+        [
+          16,
+          32
+        ],
+        [
+          96,
+          112
+        ]
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 2,
+      "section": "all",
+      "source_rank": 3
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 32,
+      "kv_global_end": 96,
+      "kv_global_ranges": [
+        [
+          32,
+          48
+        ],
+        [
+          80,
+          96
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 3,
+      "out_update_index": 3,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r1s3",
+      "q_global_begin": 16,
+      "q_global_end": 112,
+      "q_global_ranges": [
+        [
+          16,
+          32
+        ],
+        [
+          96,
+          112
+        ]
+      ],
+      "query_half": "both",
+      "rank": 1,
+      "ring_step": 3,
+      "section": "all",
+      "source_rank": 2
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 32,
+      "kv_global_end": 96,
+      "kv_global_ranges": [
+        [
+          32,
+          48
+        ],
+        [
+          80,
+          96
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 0,
+      "out_update_index": 0,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r2s0",
+      "q_global_begin": 32,
+      "q_global_end": 96,
+      "q_global_ranges": [
+        [
+          32,
+          48
+        ],
+        [
+          80,
+          96
+        ]
+      ],
+      "query_half": "both",
+      "rank": 2,
+      "ring_step": 0,
+      "section": "all",
+      "source_rank": 2
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 16,
+      "kv_global_end": 112,
+      "kv_global_ranges": [
+        [
+          16,
+          32
+        ],
+        [
+          96,
+          112
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 1,
+      "out_update_index": 1,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r2s1",
+      "q_global_begin": 32,
+      "q_global_end": 96,
+      "q_global_ranges": [
+        [
+          32,
+          48
+        ],
+        [
+          80,
+          96
+        ]
+      ],
+      "query_half": "both",
+      "rank": 2,
+      "ring_step": 1,
+      "section": "all",
+      "source_rank": 1
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 0,
+      "kv_global_end": 128,
+      "kv_global_ranges": [
+        [
+          0,
+          16
+        ],
+        [
+          112,
+          128
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 2,
+      "out_update_index": 2,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r2s2",
+      "q_global_begin": 32,
+      "q_global_end": 96,
+      "q_global_ranges": [
+        [
+          32,
+          48
+        ],
+        [
+          80,
+          96
+        ]
+      ],
+      "query_half": "both",
+      "rank": 2,
+      "ring_step": 2,
+      "section": "all",
+      "source_rank": 0
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 48,
+      "kv_global_end": 80,
+      "kv_global_ranges": [
+        [
+          48,
+          64
+        ],
+        [
+          64,
+          80
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 3,
+      "out_update_index": 3,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r2s3",
+      "q_global_begin": 32,
+      "q_global_end": 96,
+      "q_global_ranges": [
+        [
+          32,
+          48
+        ],
+        [
+          80,
+          96
+        ]
+      ],
+      "query_half": "both",
+      "rank": 2,
+      "ring_step": 3,
+      "section": "all",
+      "source_rank": 3
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 48,
+      "kv_global_end": 80,
+      "kv_global_ranges": [
+        [
+          48,
+          64
+        ],
+        [
+          64,
+          80
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 0,
+      "out_update_index": 0,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r3s0",
+      "q_global_begin": 48,
+      "q_global_end": 80,
+      "q_global_ranges": [
+        [
+          48,
+          64
+        ],
+        [
+          64,
+          80
+        ]
+      ],
+      "query_half": "both",
+      "rank": 3,
+      "ring_step": 0,
+      "section": "all",
+      "source_rank": 3
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 32,
+      "kv_global_end": 96,
+      "kv_global_ranges": [
+        [
+          32,
+          48
+        ],
+        [
+          80,
+          96
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 1,
+      "out_update_index": 1,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r3s1",
+      "q_global_begin": 48,
+      "q_global_end": 80,
+      "q_global_ranges": [
+        [
+          48,
+          64
+        ],
+        [
+          64,
+          80
+        ]
+      ],
+      "query_half": "both",
+      "rank": 3,
+      "ring_step": 1,
+      "section": "all",
+      "source_rank": 2
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 16,
+      "kv_global_end": 112,
+      "kv_global_ranges": [
+        [
+          16,
+          32
+        ],
+        [
+          96,
+          112
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 2,
+      "out_update_index": 2,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r3s2",
+      "q_global_begin": 48,
+      "q_global_end": 80,
+      "q_global_ranges": [
+        [
+          48,
+          64
+        ],
+        [
+          64,
+          80
+        ]
+      ],
+      "query_half": "both",
+      "rank": 3,
+      "ring_step": 2,
+      "section": "all",
+      "source_rank": 1
+    },
+    {
+      "accumulator_dtype": "float32",
+      "causal_alignment": "top-left",
+      "causal_mode": "no_mask",
+      "kv_global_begin": 0,
+      "kv_global_end": 128,
+      "kv_global_ranges": [
+        [
+          0,
+          16
+        ],
+        [
+          112,
+          128
+        ]
+      ],
+      "lse_base": "e",
+      "lse_dtype": "float32",
+      "lse_update_index": 3,
+      "out_update_index": 3,
+      "partial_dtype": "float32",
+      "partial_slot_id": "r3s3",
+      "q_global_begin": 48,
+      "q_global_end": 80,
+      "q_global_ranges": [
+        [
+          48,
+          64
+        ],
+        [
+          64,
+          80
+        ]
+      ],
+      "query_half": "both",
+      "rank": 3,
+      "ring_step": 3,
+      "section": "all",
+      "source_rank": 0
+    }
+  ],
+  "valid_len": 128
+}
