@@ -571,7 +571,11 @@ def _scheduler_warp_loop_predecode(
                         arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
                     else:
                         peer_mb = nvvm.mapa(sched.mb_scheduler.subview(state.idx), cutlass.Int32(cta_rank))
-                        nvvm.mbarrier_arrive_expect_tx(peer_mb, 16, scope=nvvm.MemScope.CLUSTER)
+                        # Local copy of tile_dsl/scheduler.py's leader arm: it only has to be program-ordered before the
+                        # multicast try_cancel issued below by the SAME thread, and a complete-tx that lands before the
+                        # arm leaves the tx-count transiently negative, which the mbarrier permits.  A cluster-scope
+                        # release here is a GPU-scope drain (MEMBAR.ALL.GPU + ERRBAR + CGAERRBAR) per tile; CTA scope is not.
+                        nvvm.mbarrier_arrive_expect_tx(peer_mb, 16, scope=nvvm.MemScope.CTA)
                 nvvm.clusterlaunchcontrol_try_cancel(
                     sched.tile_id_smem.subview(state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)),
                     sched.mb_scheduler.subview(state.idx),

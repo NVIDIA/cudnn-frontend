@@ -2491,20 +2491,23 @@ def test_sm107_mxfp8_gate_dead_padded_entry_is_exactly_zero(out_key):
 # The two perf regressions PR #1129 closed were invisible to every numerics test (O / LSE / Amax_O bit-identical before and after):
 # an Amax_O fold that lowered to thousands of FSETP + FSEL instead of FMNMX3, and a cluster-scope release arrive in the shared CLC
 # scheduler that put a GPU-scope drain (MEMBAR.ALL.GPU + CGAERRBAR) before every credit.  The only tripwire for either is the SASS,
-# so this pin compiles the kernel for Rubin here (`CUTE_DSL_ARCH=sm_107a` needs no matching device) and counts the instructions.
+# so this pin compiles each kernel for Rubin here (`CUTE_DSL_ARCH=sm_107a` needs no matching device) and counts the instructions.
 # SKIPS when the DSL predates sm_107a or no nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin (the DSL's own wheel nvdisasm
 # may not); a compile failure is a FAIL.
 _SM107_SASS_PROBE = textwrap.dedent("""
     import glob, os, subprocess, sys
-    dump, d, cands = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+    dump, quant, d, dtype_o, cands = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5:]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
     os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
     os.environ.setdefault("CUTE_DSL_ARCH", "sm_107a")
     os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps no cubin
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-    mod = _load_sm100_kernel_module((d, d), TemplateParams(dtype_qkv=0, dtype_o=0, cta_mma=2), fp8=True, pertensor=True, rubin=True)
-    mod.compile(1, 128, 128, 8192, 8192, d, d, True)  # (b, qh, kh, sq, skv, d_qk, d_v, has_lse): E4M3 in / E4M3 O, dense, Stats + Amax_O
+    params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=2)  # E4M3 in; the row picks the O dtype
+    mod = _load_sm100_kernel_module((d, d), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
+    # By keyword: the MXFP8 kernels' compile() carries total_{q,kv}_sf_tiles between skv and d_qk.  Dense, B=1 H=128 S=8192,
+    # Stats + Amax_O (emit_amax_o defaults True) -- the sweep's shape, and the arm that carries the fold.
+    mod.compile(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d, d_v=d, has_lse=True)
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
         print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
@@ -2531,6 +2534,19 @@ _SM107_SASS_PROBE = textwrap.dedent("""
     print("SASS LINES", len(sass))
     """)
 
+# One row per pinned kernel: (quantization path, d, TemplateParams.dtype_o).  The fold commit touched all eight sm107 fp8 / mxfp8
+# kernels; these four are the two the regression was found on, the d128 fp8 kernel (FSETP 790 -> 26 on the fold) and the mxfp8
+# d512 kernel (the largest measured win, +17.5 % dense / +29 % causal at S=8K).  The fp8 rows write E4M3 O; the mxfp8 row writes
+# BF16 O, the dtype MXFP8 graphs produce -- the fold sits on the fp32 accumulator before the cast, and the sm_107a counts are the
+# same with E4M3 O (2026-09-18: FSETP 9 / FMNMX3 256 / no drain / no spill either way).  Four rows, one sm_107a trace-compile
+# each (~20-60 s); the other four kernels share the fold's spelling and the scheduler, and add no new class of failure.
+_SM107_SASS_PIN_ROWS = [
+    pytest.param("fp8", 512, _E4M3, id="fp8-d512"),
+    pytest.param("fp8", 256, _E4M3, id="fp8-d256"),
+    pytest.param("fp8", 128, _E4M3, id="fp8-d128"),
+    pytest.param("mxfp8", 512, _BF16_OUT, id="mxfp8-d512"),
+]
+
 
 def _nvdisasm_candidates():
     cands = []
@@ -2552,27 +2568,29 @@ def _sm107a_known_to_the_dsl() -> bool:
         return False
 
 
-@pytest.mark.parametrize("d", [512, 256])
-def test_sm107_fp8_epilogue_and_scheduler_sass_pins(tmp_path, d):
+@pytest.mark.parametrize("quant, d, dtype_o", _SM107_SASS_PIN_ROWS)
+def test_sm107_fp8_epilogue_and_scheduler_sass_pins(tmp_path, quant, d, dtype_o):
     """The Amax_O fold is FMNMX3 (not a compare+select chain) and the CLC scheduler's credit arrives carry no GPU-scope
-    drain -- the two silent perf regressions of PR #1129, pinned on the fp8 d=512 and d=256 kernels' sm_107a SASS.
-    Bounds are loose on purpose (FSETP < 100 where the regression read 1548 / 779; FMNMX3 > 0 where it read 0;
-    MEMBAR.ALL.GPU == CGAERRBAR == 0 where the regression read 23) so they survive unrelated codegen drift."""
+    drain -- the two silent perf regressions of PR #1129, pinned on the sm_107a SASS of the fp8 d=512 / d=256 / d=128
+    and the mxfp8 d=512 kernels.  Bounds are loose on purpose (FSETP < 100 where the regression read 1548 / 779 / 790 and
+    the fixed kernels read 9-26; FMNMX3 > 0 where it read 0 and the fixed kernels read 128-256; MEMBAR.ALL.GPU ==
+    CGAERRBAR == 0 where the regression read 13-23) so they survive unrelated codegen drift."""
     if not _sm107a_known_to_the_dsl():
         pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
     cands = _nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
-    dump = tmp_path / f"sm107a_d{d}"
+    dump = tmp_path / f"sm107a_{quant}_d{d}"
     dump.mkdir()
-    proc = subprocess.run([sys.executable, "-c", _SM107_SASS_PROBE, str(dump), str(d), *cands], capture_output=True, text=True, timeout=1500)
-    assert proc.returncode == 0, f"sm_107a trace-compile of the fp8 d={d} kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    argv = [sys.executable, "-c", _SM107_SASS_PROBE, str(dump), quant, str(d), str(dtype_o), *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_107a trace-compile of the {quant} d={d} kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
     out = proc.stdout.splitlines()
     if any(ln.startswith("SKIP") for ln in out):
         pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
     stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
-    print(f"\nsm107 fp8 d={d} sm_107a SASS: {stats}")
+    print(f"\nsm107 {quant} d={d} dtype_o={dtype_o} sm_107a SASS: {stats}")
     assert stats["FMNMX3"] > 0, "the Amax_O fold must reach FMNMX3 (fmax_f32), not a compare+select chain"
     assert stats["FSETP"] < 100, f"{stats['FSETP']} FSETP: the Amax_O fold is lowering to compare+select again"
     assert stats["MEMBAR_GPU"] == 0 and stats["CGAERRBAR"] == 0, "a cluster-scope RELEASE arrive is back on a per-tile path (GPU-scope drain)"
-    assert stats["STL"] == 0 and stats["LDL"] == 0, "the fp8 kernel spills"
+    assert stats["STL"] == 0 and stats["LDL"] == 0, f"the {quant} d={d} kernel spills"
