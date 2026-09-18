@@ -1466,39 +1466,49 @@ def test_sm107_gate_desc_version_unchanged():
 
 
 def test_sm107_gate_kernel_signatures_are_append_only():
-    """Public-API signatures evolve append-only (AGENTS.md): all three kernels'
-    ``compile`` gain their gate parameters at the END (the quantized ones also
-    ``has_amax``), all three ``_host`` gain ``gate_tensor`` LAST -- after
-    ``stream``, which every caller passes by keyword.  A ``gate_stride`` handed to an UNGATED module is
-    a ValueError, not a silently ignored kwarg."""
+    """The f16 kernel is an explicit pointer/int host: the gate is a MODULE specialization
+    (TemplateParams.epilogue_gate -> CFG.EPILOGUE_GATE), its slot (``gate_ptr`` + runtime
+    ``gate_strides``) is always declared and compile() keys only what specializes the trace.
+    The quantized kernels keep the tensor entry, where signatures evolve append-only
+    (AGENTS.md): ``compile`` gains ``gate_stride`` / ``has_amax`` at the END, ``_host`` gains
+    ``gate_tensor`` LAST -- after ``stream``.  A ``gate_stride`` handed to an UNGATED tensor-entry
+    module is a ValueError, not a silently ignored kwarg."""
     import inspect
 
     f16, fp8, mxfp8 = _all_gate_kernel_modules()
-    f16_c = list(inspect.signature(f16.compile).parameters)
+    assert f16.EXPLICIT_ABI is True
+    f16_c = inspect.signature(f16.compile).parameters
+    assert "gate_stride" not in f16_c and "lse_stride" not in f16_c and "b" not in f16_c, list(f16_c)
+    f16_host = inspect.signature(f16._host).parameters
+    assert "gate_ptr" in f16_host and "gate_strides" in f16_host, list(f16_host)[-6:]
+    assert list(f16_host)[-1] == "stream"
+
     fp8_c = list(inspect.signature(fp8.compile).parameters)
     mx_c = list(inspect.signature(mxfp8.compile).parameters)
-    assert f16_c[-1] == "gate_stride", f16_c[-3:]
     assert fp8_c[-2:] == ["gate_stride", "has_amax"], fp8_c[-3:]
     assert mx_c[-2:] == ["gate_stride", "has_amax"], mx_c[-3:]
-    for params in (f16_c, fp8_c, mx_c):
+    for params in (fp8_c, mx_c):
         assert params.index("lse_stride") < params.index("gate_stride")
         assert params[: params.index("gate_stride")] == [p for p in params if p not in ("gate_stride", "has_amax")]
-    for mod in (f16, fp8, mxfp8):
+    for mod in (fp8, mxfp8):
         sig = inspect.signature(mod.compile).parameters
         assert sig["gate_stride"].default is None
+        assert sig["has_amax"].default is True
         host = list(inspect.signature(mod._host).parameters)
         assert host[-2:] == ["stream", "gate_tensor"], (mod.__name__, host[-3:])
         assert inspect.signature(mod._host).parameters["gate_tensor"].default is None
+    for mod in (f16, fp8, mxfp8):
         assert "gate_tensor" in inspect.signature(mod._kernel).parameters and "tma_gate_desc" in inspect.signature(mod._kernel).parameters
-    for mod in (fp8, mxfp8):
-        assert inspect.signature(mod.compile).parameters["has_amax"].default is True
-    # The MXFP8 kernel's SF totals stay keyword-only-in-effect AFTER seq_q_lens_addr and BEFORE stream (PR-B keeps the
-    # adapter's positional call byte-identical); gate_tensor is the one parameter after stream.
+    # The MXFP8 kernel's SF totals stay keyword-only-in-effect AFTER seq_q_lens_addr and BEFORE stream;
+    # gate_tensor is the one parameter after stream.
     mx_host = list(inspect.signature(mxfp8._host).parameters)
     assert mx_host.index("seq_q_lens_addr") < mx_host.index("total_q_sf_tiles") < mx_host.index("total_kv_sf_tiles") < mx_host.index("stream"), mx_host
 
-    # Ungated modules refuse a gate stride before any trace.
-    for kw in ({}, *_QUANT_LOAD_KWS):
+    # Ungated f16: the gate slot is folded out (the fake is None iff CFG.EPILOGUE_GATE == 0).
+    off = _load(_D256, rubin=True)
+    assert off.CFG.EPILOGUE_GATE == 0 and "gate_ptr" in inspect.signature(off._host).parameters
+    # Ungated quantized modules refuse a gate stride before any trace.
+    for kw in _QUANT_LOAD_KWS:
         off = _load(_D256, rubin=True, **kw)
         with pytest.raises(ValueError, match="epilogue_gate"):
             off.compile(b=1, qh=1, kh=1, sq=256, skv=256, gate_stride=(256 * 256, 256, 256, 1))

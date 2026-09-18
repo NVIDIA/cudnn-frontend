@@ -1749,80 +1749,120 @@ def lower_dsl_prefill(
         gate=facts.epilogue_gate_t,
     )
 
-    def _ir_view(buf, ir_t):
+    def _ir_view(buf, dim, stride):
         """Reinterpret a variant-pack buffer through the IR tensor's dim/stride.
 
         cuDNN's execute contract treats variant-pack entries as raw storage laid
         out per the IR tensor descriptor — callers may hand in a torch tensor
         whose *logical* shape is anything with the right bytes (e.g. a
         (B,S,H,D)-contiguous allocation for a (B,H,S,D) BSHD-strided IR tensor,
-        as test_mhas_v2's fp8 harness does). The DSL executor consumes torch
-        views, so rebuild the IR-shaped view here instead of trusting the
-        caller's metadata. No-op when the caller already passed an IR-shaped
-        view. THD buffers are packed (fewer elements than dim x stride
-        implies), so the caller's view is kept as-is there.
+        as test_mhas_v2's fp8 harness does), so rebuild the IR-shaped view here
+        instead of trusting the caller's metadata. No-op when the caller already
+        passed an IR-shaped view. THD buffers are packed (fewer elements than
+        dim x stride implies), so the caller's view is kept as-is there.
         """
-        dim, stride = tuple(ir_t.get_dim()), tuple(ir_t.get_stride())
         if tuple(buf.shape) == dim and tuple(buf.stride()) == stride:
             return buf
         return buf.as_strided(dim, stride)
 
-    def _execute_on_stream(variant_pack, workspace=None, stream=None):
-        resolved = ga.resolve_variant_pack(variant_pack, binding)
-        q_buf = resolved[id(binding.q)]
-        k_buf = resolved[id(binding.k)]
-        v_buf = resolved[id(binding.v)]
-        o_buf = resolved[id(binding.o)]
+    # What every execute needs that the graph fixed — operand ids, IR layouts,
+    # which feature operands the facts demand, the static keywords — resolved
+    # once here; an execute is then dict lookups and one adapter call.
+    def _layout(t):
+        return (tuple(t.get_dim()), tuple(t.get_stride()))
+
+    id_q, id_k, id_v, id_o = id(binding.q), id(binding.k), id(binding.v), id(binding.o)
+    lay_q, lay_k, lay_v, lay_o = _layout(binding.q), _layout(binding.k), _layout(binding.v), _layout(binding.o)
+    id_stats = id(binding.stats) if binding.stats is not None else None
+    sink_src = facts.sink_t if facts.has_sink else None
+    # Either length form satisfies a side: per-batch seq_len_* or the (B+1,)
+    # cu_seq_len_* prefix sums — the cu buffer travels through the same operand
+    # slot (the adapter was constructed knowing the form).
+    seq_kv_src = (facts.cu_seq_kv_t if facts.cu_seq_kv_t is not None else facts.seq_kv_t) if facts.padded else None
+    seq_q_src = (facts.cu_seq_q_t if facts.cu_seq_q_t is not None else facts.seq_q_t) if facts.padded else None
+    forward_seq_q = seq_q_lens_present or facts.thd
+    bias_src = facts.bias_t if facts.has_bias else None
+    forward_bias = bias_src is not None and "bias_tensor" in _extra_exec_keys
+    gate_src = facts.epilogue_gate_t if (getattr(facts, "has_epilogue_gate", False) and "gate" in _extra_exec_keys) else None
+    lay_gate = _layout(binding.gate) if gate_src is not None else None
+    quant_ids = (
+        {
+            name: id(t)
+            for name, t in (
+                ("sf_q", binding.sf_q),
+                ("sf_k", binding.sf_k),
+                ("sf_v", binding.sf_v),
+                ("amax_o", binding.amax_o),
+                ("descale_q", binding.descale_q),
+                ("descale_k", binding.descale_k),
+                ("descale_v", binding.descale_v),
+                ("scale_o", binding.scale_o),
+            )
+            if t is not None
+        }
+        if (facts.is_mxfp8 or facts.is_fp8)
+        else {}
+    )
+    stream_handles: dict = {}  # raw CUstream int -> driver.CUstream, per stream this plan has seen
+
+    def _need(resolved, t, label):
+        # A feature the graph requests whose buffer is absent from the variant
+        # pack is an error here — the lowering would otherwise fail later and
+        # worse (a silently-dense mask, a null-deref in the kernel host code).
+        buf = resolved.get(id(t))
+        if buf is None:
+            raise ValueError(f"cudnn.sdpa: {label} requested but no buffer was provided")
+        return buf
+
+    def _execute_resolved(resolved, workspace=None, stream=None):
+        q_buf, k_buf, v_buf, o_buf = resolved[id_q], resolved[id_k], resolved[id_v], resolved[id_o]
         if not facts.thd:
-            q_buf = _ir_view(q_buf, binding.q)
-            k_buf = _ir_view(k_buf, binding.k)
-            v_buf = _ir_view(v_buf, binding.v)
-            o_buf = _ir_view(o_buf, binding.o)
+            q_buf, k_buf, v_buf, o_buf = _ir_view(q_buf, *lay_q), _ir_view(k_buf, *lay_k), _ir_view(v_buf, *lay_v), _ir_view(o_buf, *lay_o)
         elif facts.has_paged_kv:
             # THD Q/O stay packed; the pools are ordinary dense tensors.
-            k_buf = _ir_view(k_buf, binding.k)
-            v_buf = _ir_view(v_buf, binding.v)
+            k_buf, v_buf = _ir_view(k_buf, *lay_k), _ir_view(v_buf, *lay_v)
         # Scratch comes from the CALLER's workspace (never allocated here): the
-        # CompiledPlan sized/validated it against workspace_bytes; the carver
-        # re-validates so a direct call cannot silently corrupt memory.
-        import torch  # execute path: a real tensor is about to be carved
-
-        carver = WorkspaceCarver(workspace, total_workspace_bytes, spec.name) if total_workspace_bytes else None
-        # Stats-less graphs bind lse_buf=None: every adapter here is
-        # lse_optional (the kernel compiles the LSE store out) — no dummy.
-        lse_buf = resolved.get(id(binding.stats)) if binding.stats is not None else None
-        # Shared presence-checked resolution (graph_analyzer.resolve_feature_operands);
-        # bias flows only to adapters declaring the keyword (the SM80 row);
-        # every other feature operand is gated off by mismatch for all rows.
-        feature_ops = ga.resolve_feature_operands(facts, resolved)
-        sinks_buf = feature_ops.sinks
-        seq_kv_buf = feature_ops.seq_kv_lens
+        # adapter validates it against its scratch_workspace_bytes() and takes
+        # fixed offsets into it; only the synthesized seq_len_kv chunk (below,
+        # rare) is carved here, ahead of the adapter's share.
+        if total_workspace_bytes and workspace is None:
+            raise ValueError(
+                f"cudnn.sdpa: {spec.name} requires a {total_workspace_bytes}-byte workspace but execute() received none; "
+                "allocate graph.get_workspace_size() bytes (uint8, on the graph's device) and pass the buffer to execute()"
+            )
+        api_workspace = workspace
+        seq_kv_buf = _need(resolved, seq_kv_src, "padding mask (seq_len_kv / cu_seq_len_kv)") if seq_kv_src is not None else None
         if synth_kv_padding and seq_kv_buf is None:
             # Full-length per-batch KV lengths: mathematically a no-op mask that
             # makes the kernel's padded path cover the ragged KV tail.
+            import torch
+
+            carver = WorkspaceCarver(workspace, total_workspace_bytes, spec.name)
             seq_kv_buf = carver.take(facts.b, torch.int32).fill_(facts.s_kv)
-        seq_q_buf = feature_ops.seq_len_q
-        sf_q_buf = resolved.get(id(binding.sf_q)) if binding.sf_q is not None else None
-        sf_k_buf = resolved.get(id(binding.sf_k)) if binding.sf_k is not None else None
-        sf_v_buf = resolved.get(id(binding.sf_v)) if binding.sf_v is not None else None
-        amax_o_buf = resolved.get(id(binding.amax_o)) if binding.amax_o is not None else None
-        dq_buf = resolved.get(id(binding.descale_q)) if binding.descale_q is not None else None
-        dk_buf = resolved.get(id(binding.descale_k)) if binding.descale_k is not None else None
-        dv_buf = resolved.get(id(binding.descale_v)) if binding.descale_v is not None else None
-        so_buf = resolved.get(id(binding.scale_o)) if binding.scale_o is not None else None
+            api_workspace = carver.remaining()
+        seq_q_buf = _need(resolved, seq_q_src, "per-batch query lengths (seq_len_q / cu_seq_len_q)") if seq_q_src is not None else None
+        bias_buf = _need(resolved, bias_src, "bias") if bias_src is not None else None
+        if stream is None:
+            cu_stream = None
+        else:
+            # Stream from the execute-time handle (raw CUstream int, the
+            # ExecutionContext's stream); None keeps the default stream.
+            cu_stream = stream_handles.get(stream)
+            if cu_stream is None:
+                cu_stream = stream_handles[stream] = _cuda_driver().CUstream(stream)
         execute_kwargs = dict(
             q_tensor=q_buf,
             k_tensor=k_buf,
             v_tensor=v_buf,
             o_tensor=o_buf,
-            lse_tensor=lse_buf,
+            # Stats-less graphs bind lse_tensor=None: every adapter here is
+            # lse_optional (the kernel compiles the LSE store out) — no dummy.
+            lse_tensor=resolved.get(id_stats) if id_stats is not None else None,
             scale_softmax=facts.scale,
-            sinks=sinks_buf,
+            sinks=_need(resolved, sink_src, "sink_token") if sink_src is not None else None,
             seq_kv_lens=seq_kv_buf,
-            seq_q_lens=seq_q_buf if (seq_q_lens_present or facts.thd) else None,
-            # Stream from the execute-time handle (raw CUstream int, the
-            # ExecutionContext's stream); None keeps the default stream.
-            current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
+            seq_q_lens=seq_q_buf if forward_seq_q else None,
+            current_stream=cu_stream,
         )
         if facts.has_paged_kv:
             # (B, 1, max_pages, 1) int32 tables bound as the kernel's flat
@@ -1836,26 +1876,15 @@ def lower_dsl_prefill(
                 block_table=_table_view(bt_k, binding.paged_k_table, facts.b),
                 block_table_v=_table_view(bt_v, binding.paged_v_table, facts.b),
             )
-        if facts.is_mxfp8 or facts.is_fp8:
-            execute_kwargs.update(
-                sf_q=sf_q_buf,
-                sf_k=sf_k_buf,
-                sf_v=sf_v_buf,
-                amax_o=amax_o_buf,
-                descale_q=dq_buf,
-                descale_k=dk_buf,
-                descale_v=dv_buf,
-                scale_o=so_buf,
-            )
-        if _extra_exec_keys:
-            # SM80 feature operand (mismatch admitted it for this row).
-            if feature_ops.bias is not None and "bias_tensor" in _extra_exec_keys:
-                execute_kwargs["bias_tensor"] = feature_ops.bias
+        for name, tid in quant_ids.items():
+            execute_kwargs[name] = resolved.get(tid)
+        if forward_bias:
+            execute_kwargs["bias_tensor"] = bias_buf  # SM80 feature operand (mismatch admitted it for this row)
+        if gate_src is not None:
             # Epilogue gate G, reinterpreted through its IR dim/stride like Q/K/V/O.
-            if feature_ops.gate is not None and "gate" in _extra_exec_keys:
-                execute_kwargs["gate"] = _ir_view(feature_ops.gate, binding.gate)
+            execute_kwargs["gate"] = _ir_view(_need(resolved, gate_src, "epilogue gate"), *lay_gate)
         if api_scratch_bytes:
-            execute_kwargs["workspace"] = carver.remaining()
+            execute_kwargs["workspace"] = api_workspace
         api.execute(**execute_kwargs)
         return None
 
@@ -1863,7 +1892,12 @@ def lower_dsl_prefill(
         # Adapter copies, scratch initialization and allocator lifetime must
         # follow the same stream as the kernels launched through the handle.
         with _torch_stream_context(stream, api.q_desc.device):
-            return _execute_on_stream(variant_pack, workspace, stream)
+            return _execute_resolved(ga.resolve_variant_pack(variant_pack, binding), workspace, stream)
+
+    def _execute_by_tensor(resolved, workspace=None, stream=None):
+        """The plan's lane: ``{id(ir_tensor): buffer}``, resolved by the plan from its uid table."""
+        with _torch_stream_context(stream, api.q_desc.device):
+            return _execute_resolved(resolved, workspace, stream)
 
     # Executor contract (engine._FrostSdpaFwdPlan): a non-zero workspace_bytes
     # means the plan calls _execute(variant_pack, workspace) with the caller's
@@ -1873,6 +1907,20 @@ def lower_dsl_prefill(
     _execute.workspace_bytes = total_workspace_bytes
     _execute.binding = binding
     _execute.kernel_template = kernel_template
+    _execute.execute_resolved = _execute_by_tensor
+    _execute.prepared = None
+    if (
+        facts.thd
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and not synth_kv_padding
+        and bias_src is None
+        and gate_src is None
+        and getattr(api, "_thd_spec", None) is not None
+    ):
+        from cudnn.sdpa.fwd.prepared import PreparedThdLaunch
+
+        _execute.prepared = PreparedThdLaunch(api._thd_spec, binding)
+        _execute.default_stream = lambda: api._get_default_stream(None)
     return _execute
 
 

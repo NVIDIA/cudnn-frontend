@@ -379,6 +379,28 @@ def test_dsl_sm100_d192_d128(dtype, is_causal):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("singleton", ["q", "kv"])
+@pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
+@torch_fork_set_rng(seed=61)
+def test_dsl_sm100_singleton_seq_bhsd_storage(singleton, d):
+    """S=1 operands in BHSD-contiguous storage: the transposed view is contiguous
+    (torch wildcards size-1 dims) but its seq stride is D, not H*D, so the batch
+    stride must come from the caller, never from S * seq_stride (PR #1099 review)."""
+    _require_dsl()
+    b, h, hk, s = 3, 4, 2, 128
+    dtype = torch.bfloat16
+    scale = 1.0 / math.sqrt(d)
+    s_q, s_kv = (1, s) if singleton == "q" else (s, 1)
+    q = torch.randn(b, h, s_q, d, device="cuda", dtype=dtype)
+    k = torch.randn(b, hk, s_kv, d, device="cuda", dtype=dtype)
+    v = torch.randn(b, hk, s_kv, d, device="cuda", dtype=dtype)
+    o, stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=False), return_stats=True)
+    o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)
@@ -2177,7 +2199,8 @@ def test_dsl_sm100_thd_compile_key_plan_time_only():
     _run_and_check([64, 33])
     info_exec = api._k_mod.compile.cache_info()
     assert info_exec.misses == info_plan.misses, "a THD execute minted a new kernel compile (runtime data leaked into the compile key)"
-    assert info_exec.hits >= info_plan.hits + 2
+    # The plan-time artifact is launched directly: execute does not even re-key the cache.
+    assert info_exec.hits == info_plan.hits, "a THD execute re-derived its compile key per call"
 
 
 @pytest.mark.L0

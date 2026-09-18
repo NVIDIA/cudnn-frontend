@@ -19,7 +19,7 @@ from typing import NamedTuple, Optional
 import pytest
 import torch
 
-from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
+from frost_test_utils import launch_f16, requires_pre_rubin_blackwell, requires_dsl
 
 # Pre-Rubin Blackwell only. Most of this module drives the SM100 kernel modules
 # directly (_kernel_module loads prefill_*_sm100.py), which cc10.7 never runs --
@@ -119,12 +119,13 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
     v = torch.randn(B, SKV, KH, D, device=dev, dtype=dtype)
 
     mod = _kernel_module(splits, 3 if dtype == torch.float16 else 2, causal, cta_mma=cta_mma, pack_gqa=pack_gqa, qh_per_kh=H // KH)
-    fn = mod.compile(b=B, qh=H, kh=KH, sq=SQ, skv=SKV, d_qk=D, d_v=D, has_lse=True)
+    fn = mod.compile(d_qk=D, d_v=D, has_lse=True, lse_kind="dense")
 
     o_p = torch.zeros(splits * B, SQ, H, D, device=dev, dtype=_partial_o_dtype(splits, dtype))
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k,
         v,
@@ -258,7 +259,7 @@ def test_split_kv_requires_lse():
     """has_lse=False + split is rejected: the per-split LSE IS the combine weight."""
     mod = _kernel_module(4, 3, causal=False)
     with pytest.raises(ValueError, match="has_lse"):
-        mod.compile(b=1, qh=4, kh=4, sq=128, skv=2048, d_qk=D, d_v=D, has_lse=False)
+        mod.compile(d_qk=D, d_v=D, has_lse=False, lse_kind="dense")
 
 
 @pytest.mark.L0
@@ -452,12 +453,13 @@ def test_empty_splits_every_flavor(flavor):
 
     path = _os.path.join(_os.path.dirname(_os.path.abspath(api_dsl.__file__)), "kernels", kmod)
     mod = load_template(path, TemplateParams(dtype_qkv=3, split_kv=S), tag=f"empty_{flavor}_{S}")
-    fn = mod.compile(b=B, qh=H, kh=H, sq=SQ, skv=SKV, d_qk=d_qk, d_v=d_v, has_lse=True)
+    fn = mod.compile(d_qk=d_qk, d_v=d_v, has_lse=True, lse_kind="dense")
 
     o_p = torch.zeros(S * B, SQ, H, d_v, device=dev, dtype=_partial_o_dtype(S, torch.float16))
     lse_p = torch.zeros(S * B, H, SQ, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k,
         v,
@@ -784,11 +786,12 @@ def test_combine_lse_matches_reference(splits, stats_log2):
     v = torch.randn(B, SKV, H, D, device=dev, dtype=torch.float16)
 
     mod = _kernel_module(splits, 3, causal=False, stats_log2=stats_log2 and splits == 1)
-    fn = mod.compile(b=B, qh=H, kh=H, sq=SQ, skv=SKV, d_qk=D, d_v=D, has_lse=True)
+    fn = mod.compile(d_qk=D, d_v=D, has_lse=True, lse_kind="dense")
     o_p = torch.zeros(splits * B, SQ, H, D, device=dev, dtype=_partial_o_dtype(splits, torch.float16))
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k,
         v,
@@ -859,11 +862,12 @@ def test_even_splits_every_flavor_batched(flavor, dtype):
     path = _os.path.join(_os.path.dirname(_os.path.abspath(api_dsl.__file__)), "kernels", kmod)
     params = TemplateParams(dtype_qkv=3 if dtype == torch.float16 else 2, split_kv=S)
     mod = load_template(path, params, tag=f"even_{flavor}_{dtype}_{S}")
-    fn = mod.compile(b=B, qh=H, kh=H, sq=SQ, skv=SKV, d_qk=d_qk, d_v=d_v, has_lse=True)
+    fn = mod.compile(d_qk=d_qk, d_v=d_v, has_lse=True, lse_kind="dense")
     o_p = torch.zeros(S * B, SQ, H, d_v, device=dev, dtype=_partial_o_dtype(S, dtype))
     lse_p = torch.zeros(S * B, H, SQ, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k,
         v,
@@ -921,13 +925,14 @@ def _run_masked(kfile, d_qk, d_v, splits, *, B, H, KH, SQ, SKV, tp_kwargs, seq_k
     path = _os.path.join(_os.path.dirname(_os.path.abspath(api_dsl.__file__)), "kernels", kfile)
     params = TemplateParams(dtype_qkv=3 if dtype == torch.float16 else 2, split_kv=splits, cta_mma=cta_mma, **tp_kwargs)
     mod = load_template(path, params, tag=f"mask_{kfile[:16]}_{splits}_{cta_mma}_{sorted(tp_kwargs.items())}")
-    fn = mod.compile(b=B, qh=H, kh=KH, sq=SQ, skv=SKV, d_qk=d_qk, d_v=d_v, has_lse=True)
+    fn = mod.compile(d_qk=d_qk, d_v=d_v, has_lse=True, lse_kind="dense")
 
     o_p = torch.zeros(splits * B, SQ, H, d_v, device=dev, dtype=_partial_o_dtype(splits, dtype))
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
     skv_t = seq_kv_lens if seq_kv_lens is not None else torch.zeros(B, dtype=torch.int32, device=dev)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k,
         v,
