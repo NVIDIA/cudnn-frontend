@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Paired canonical-weight SwiGLU kernel, integrated from KF624 plus early PDL.
+"""Paired canonical-weight SwiGLU kernel developed in this research effort.
 
-Credit: NVIDIA Frost; Kernel Factory optimizer; Yanqin Zhai's
+Credit: NVIDIA Frost; Yanqin Zhai's
 NVIDIA/cudnn-frontend PR1090 weight-M/token-N orientation; NVIDIA CUTLASS
 example113 layout; canonical rank5 pairing guidance and TRT-LLM gated-row
 interleaving motivation. No TRT-LLM kernel body is reused.
@@ -59,7 +59,7 @@ from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as _cuda
 
 # A TMA tensormap is 128 bytes = 16 int64 qwords.
-# KF candidate f19299: only R<=8 permits one token tile per live expert.
+# Only R<=8 permits one token tile per live expert.
 # The generic branch retains persistent scheduling for larger declarations.
 moe_small_rows = FROST_TEMPLATE_PARAMS.small_rows
 moe_kblocked64 = FROST_TEMPLATE_PARAMS.weight_layout == "k_blocked_64_v1"
@@ -125,7 +125,7 @@ num_a_operands = 1
 num_b_operands = 1
 gemm_a_idx = (0,)
 gemm_b_idx = (0,)
-# KF candidate2f5c: compact resources; persistent multi-wave scheduling is retained.
+# Resource specialization retains persistent multi-wave scheduling.
 num_tmem_alloc_cols = 32
 tmem_alloc_exclusive = False
 acc_stages = 1

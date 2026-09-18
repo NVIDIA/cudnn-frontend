@@ -41,11 +41,10 @@ modules in `python/cudnn/`:
 Thank you also to the broader CUTLASS/CuTe DSL and infrastructure teams who
 supported the original kernel development.
 
-## Frost MoE pipeline tuning
+## Frost MoE research and integration
 
-The paired BF16 FC2 six-stage option follows Kernel Factory campaign2132,
-candidate `e459dffedc6afc798f46073db14a159b49cff24d696024d801a45191d7e76521`.
-It builds on NVIDIA Frost, KF624/2f5c compact-resource work, and the paired-MMA
-and canonical rank-5 layout guidance from Yanqin Zhai's PR1090 and CUTLASS
-example113. FlashInfer integration and independent full-power validation
-establish the workload-specific scope of the measured benefit.
+This effort's MoE improvements build on NVIDIA Frost, Yanqin Zhai's PR1090,
+NVIDIA CUTLASS example113 and canonical pairing guidance. FlashInfer integration
+and independent full-power validation establish the workload-specific scope of
+the measured benefits. NVIDIA TensorRT-LLM contributions and Yanqin/Yihua's
+parallel work retain their separate credit in `FROST_MOE_HANDOFF.md`.

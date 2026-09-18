@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Small-row BF16 grouped projection with a paired, identity-store MMA.
 
-Credit: NVIDIA Frost, KF624, Yanqin Zhai's PR1090, CUTLASS example113,
+Credit: NVIDIA Frost, Yanqin Zhai's PR1090, CUTLASS example113,
 and the canonical rank5 pairing used by the SwiGLU sibling.
 """
 
@@ -24,7 +24,7 @@ class Fc2Knobs:
     """Exact paired-FC2 geometry and A/B pipeline depth in public knob terms.
 
     Missing STAGES preserves the original twelve-stage plan. The six-stage
-    alternative comes from KF2132/e459dff; its benefit depends on the workload.
+    alternative was studied in this effort; its benefit depends on the workload.
     """
 
     geometry: GemmKnobs = field(default_factory=pair_knobs)

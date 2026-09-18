@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Explicit canonical-parent SwiGLU specialization, sharing public GEMM knobs.
 
-Credit: NVIDIA Frost, KF624, Yanqin Zhai's NVIDIA/cudnn-frontend PR1090,
+Credit: NVIDIA Frost, Yanqin Zhai's NVIDIA/cudnn-frontend PR1090,
 CUTLASS example113, canonical rank5 pairing and TRT gated-row motivation.
 """
 

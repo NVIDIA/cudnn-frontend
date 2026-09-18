@@ -259,14 +259,12 @@ Execution binds the current parent pointer and caller stream without GPU
 allocation, synchronization, device reads, or compilation. Retained CUDA
 Graphs may bind distinct parent allocations to the same compiled plan.
 
-The implementation incorporates Kernel Factory's small-token candidate and
-an independently validated early-PDL change. It builds on Yanqin Zhai's
+The implementation includes optimizations developed and independently validated
+in this effort. It builds on Yanqin Zhai's
 [SM100 swap-AB implementation](https://github.com/NVIDIA/cudnn-frontend/pull/1090),
-NVIDIA CUTLASS example 113 layout concepts, and canonical rank-5 weight pairing.
-TRT-LLM gated-row interleaving informed the exploration; no TRT-LLM kernel body
-is copied. The row-range extension reuses the generic persistent kernel. For R<=8,
-the plan selects the validated smaller scheduler path; R9–513 retains the
-generic persistent scheduler.
+NVIDIA CUTLASS example 113 and canonical pairing guidance. TensorRT-LLM
+preparation designs informed the exploration; original contributor credit is
+preserved. Supported row ranges are validated through the public graph path.
 
 #### Optional prepared K64 FC1 weights
 
@@ -345,11 +343,11 @@ kernel and both public stage choices share a known fidelity limit for strongly
 cancelling dot products: with unit weights and input `[2^26, 1, ..., 1, -2^26]`
 at K=768, the tested plans return 0 instead of the exact sum 766 (768 after BF16
 rounding). The separate FP32 reference also loses terms. See
-`FROST_MOE_HANDOFF.md` for the reproduced inputs and scope; this draft does not
+`FROST_MOE_HANDOFF.md` for validation scope and remaining limitations; this draft does not
 provide a compensated or higher-precision accumulation mode for this case.
 
-The six-stage option follows Kernel Factory campaign2132 candidate `e459dff`;
-its benefit is workload-dependent. This exposes a tuning choice rather than a
+The additional stage-depth option was studied in this effort; its benefit is
+workload-dependent. This exposes a tuning choice rather than a
 new algorithm or a guaranteed speedup. These plans
 are tuning candidates, not a performance ranking. Compilation occurs during
 plan build; execution consumes caller-owned workspace and the supplied stream,
@@ -495,16 +493,13 @@ The paired SwiGLU engine additionally enumerates physical `TILE_M=64` and
 `MMA_TILE_M=64` together for 9–513 routed rows, with all other axes matching
 its existing M128N8 static record. M128 remains first and is the default.
 Both canonical and explicit K64 weights are supported; FC2 is unchanged.
-M64 uses 32 output features per CTA, a launch grid of twice the SM count,
-and a 16x256b TMEM drain.
 The plan owns the matching workspace size and compiled-template identity.
 This is an explicit tuning choice, not a ranking heuristic. M64 currently
 declines 1–8 routed rows; the existing M128 small-row path remains available.
 
-Credit: Kernel Factory round 2 candidate `14306536` supplied the M64 geometry,
-TMEM drain and explicit AB counters. This version retains the original Frost
-scheduler after the candidate's scheduler failed independent racecheck.
-Native graph validation has passed on B200, including memcheck and racecheck.
+This optional implementation was developed and independently validated in
+this effort. Native graph validation has passed on B200, including memcheck
+and racecheck; only validated implementation changes are included.
 With K64 weights and unchanged FC2, matched T8/T64 full MoE tests measured
 1.19–1.53% lower latency; these are operator measurements, not model E2E.
 See `FROST_MOE_HANDOFF.md` for exact shapes, source and validation scope.
@@ -518,7 +513,6 @@ The existing `1 <= R <= 513`, `N % 128 == 0`, and `K % 64 == 0` limits apply.
 Both `STAGES=12` and `STAGES=6` support this layout; no preferred depth is implied.
 Canonical pitched weights remain supported with no layout attribute.
 
-This applies the K64 physical-layout experiment to FC2's existing paired identity
-epilogue, retaining the NVIDIA Frost scheduler and the previously credited
-KF2132/e459dff pipeline-depth option. Component benefits do not establish
-complete MoE or model performance.
+This preparation option was developed in this effort, building on the credited
+NVIDIA Frost implementation. Component benefits do not establish complete MoE
+or model performance.

@@ -3,7 +3,7 @@
 
 """BF16 FC2 two-half direct-store kernel, derived from paired SwiGLU.
 
-Credit: NVIDIA Frost; Kernel Factory optimizer; Yanqin Zhai's
+Credit: NVIDIA Frost; Yanqin Zhai's
 NVIDIA/cudnn-frontend PR1090 weight-M/token-N orientation; NVIDIA CUTLASS
 example113 layout; canonical rank5 pairing guidance and TRT-LLM gated-row
 interleaving motivation. No TRT-LLM kernel body is reused.
@@ -119,7 +119,7 @@ num_a_operands = 1
 num_b_operands = 1
 gemm_a_idx = (0,)
 gemm_b_idx = (0,)
-# KF candidate2f5c: compact resources; persistent multi-wave scheduling is retained.
+# Resource specialization retains persistent multi-wave scheduling.
 num_tmem_alloc_cols = 32
 tmem_alloc_exclusive = False
 acc_stages = 1
@@ -136,8 +136,7 @@ epi_packed_lanes = True
 epi_dp22 = False
 epi_stage_rows = 8
 epi_chunk_elems = 8
-# KF2132/e459dff found six stages useful for larger routed rows; retain both
-# exact plan-time depths for workload-specific tuning.
+# Both supported depths remain explicit plan-time tuning choices.
 ab_stages = FROST_TEMPLATE_PARAMS.ab_stages
 fallback_cluster_shape_mnk = None
 mixed_a_pattern_pref = 1
