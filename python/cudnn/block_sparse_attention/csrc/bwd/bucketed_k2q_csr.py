@@ -9,6 +9,7 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
+import torch
 
 from cudnn.tensor_adapter import get_compute_capability
 

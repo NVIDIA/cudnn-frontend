@@ -589,11 +589,14 @@ def _empty_bwd_workspace_with_zeroed_accum(
     round_d_to: int,
     zero_dq_accum: bool,
     device: torch.device,
+    include_dkv_accum: bool = True,
 ) -> torch.Tensor:
     q_rounded = ((seqlen_q + round_q_to - 1) // round_q_to) * round_q_to
     k_rounded = ((seqlen_k + round_k_to - 1) // round_k_to) * round_k_to
     d_rounded = ((head_dim + round_d_to - 1) // round_d_to) * round_d_to
-    elems_per_bh = 2 * q_rounded + q_rounded * d_rounded + 2 * k_rounded * d_rounded
+    elems_per_bh = 2 * q_rounded + q_rounded * d_rounded
+    if include_dkv_accum:
+        elems_per_bh += 2 * k_rounded * d_rounded
     workspace = torch.empty(
         (
             batch_size,
@@ -605,7 +608,8 @@ def _empty_bwd_workspace_with_zeroed_accum(
     )
     # The (B, H, elems_per_bh) allocation shape is NOT how the kernels read this
     # buffer. They split the raw pointer field-major across all N = B * H entries:
-    #   [all N dPsum][all N LSE][all N dQ accum][all N dK accum][all N dV accum]
+    #   [all N dPsum][all N LSE][all N dQ accum]
+    # followed by dK/dV accumulators when include_dkv_accum is true.
     # so the flat start of each field is N * (per-BH elements of the preceding
     # fields), and the accumulator tail must be zeroed on the flattened view.
     # Rewriting this as workspace[..., accum_offset:].zero_() (per-(B,H) rows)
@@ -2456,7 +2460,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         assert q2k_block_nums.dtype == torch.int32
         assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
 
-    bucketed_k2q_offsets, bucketed_k2q_indices, _num_q_groups, _max_k2q_rows_per_group = _build_bucketed_k2q_csr(
+    bucketed_k2q_offsets, bucketed_k2q_indices, num_q_groups, _max_k2q_rows_per_group = _build_bucketed_k2q_csr(
         q2k_block_index,
         block_sparse_num,
         num_kv_blocks,
@@ -2570,6 +2574,10 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     if dv is None:
         dv = torch.empty_like(v)
 
+    # One Q group gives every KV block one unique CTA owner. For aligned
+    # physical KV64 tiles, that owner can scale/convert dK and dV directly
+    # instead of using FP32 atomic workspaces and postprocessing.
+    use_dkv_postprocess = num_q_groups > 1 or seqlen_k % sparse_block_size != 0
     workspace = _empty_bwd_workspace_with_zeroed_accum(
         batch_size=batch_size,
         num_heads=num_heads,
@@ -2581,6 +2589,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         round_d_to=8,
         zero_dq_accum=True,
         device=q.device,
+        include_dkv_accum=use_dkv_postprocess,
     )
 
     problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
@@ -2593,6 +2602,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         sparse_block_size,
         arch,
         has_block_sizes,
+        use_dkv_postprocess,
         _tensor_layout_compile_key(dout),
         _tensor_layout_compile_key(out),
         _tensor_layout_compile_key(q),
@@ -2629,6 +2639,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
             sparse_block_size=sparse_block_size,
             has_block_sizes=has_block_sizes,
+            force_dkv_postprocess=use_dkv_postprocess,
         )
 
         _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(
