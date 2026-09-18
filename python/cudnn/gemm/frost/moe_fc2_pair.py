@@ -8,7 +8,7 @@ and the canonical rank5 pairing used by the SwiGLU sibling.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from cudnn.frost import buffers
@@ -91,6 +91,7 @@ class Fc2Spec:
     features: int
     reduction: int
     experts: int
+    weight_layout: str | None = None
 
 
 def analyze_fc2(graph, *, dynamic_shapes=False):
@@ -116,8 +117,8 @@ def analyze_fc2(graph, *, dynamic_shapes=False):
     mm, moe = chain.matmul, chain.moe
     if (mm.a_dtype, mm.b_dtype, mm.accum_dtype, mm.out_dtype, mm.a_major, mm.b_major) != ("bf16", "bf16", "fp32", "bf16", "k", "k"):
         raise NotImplementedError("paired FC2 requires BF16 operands/output and FP32 accumulation")
-    if moe.mode != "none" or moe.offset_dtype != "int32" or moe.weight_layout is not None or moe.num_groups != moe.num_experts:
-        raise NotImplementedError("paired FC2 requires one int32 offset group per canonical expert")
+    if moe.mode != "none" or moe.offset_dtype != "int32" or moe.weight_layout not in (None, "k_blocked_64_v1") or moe.num_groups != moe.num_experts:
+        raise NotImplementedError("paired FC2 requires one int32 offset group per expert with canonical or K64 weights")
     if not 1 <= mm.M <= 513 or mm.N <= 0 or mm.N % 128 or mm.K <= 0 or mm.K % 64 or moe.num_experts <= 0:
         raise NotImplementedError("paired FC2 requires 1<=R<=513, output width divisible by128 and K divisible by64")
     if len(chain.output_specs) != 1 or len(binding.outputs) != 1:
@@ -127,11 +128,15 @@ def analyze_fc2(graph, *, dynamic_shapes=False):
         raise NotImplementedError("paired FC2 requires the direct BF16 projection output")
     tx, tw, ty, offsets = binding.a_operands[0], binding.b_operands[0], binding.outputs[0], binding.first_token_offset
     e, n, k, rows = moe.num_experts, mm.N, mm.K, mm.M
-    if tuple(tw.get_dim()) != (e, k, n):
-        raise NotImplementedError("paired FC2 requires canonical expert weight dimensions")
-    se, sk, sn = tw.get_stride()
-    if sk != 1 or sn < k or se < (n - 1) * sn + k or se % 8 or sn % 8:
-        raise NotImplementedError("paired FC2 requires nonoverlapping weight rows/experts with16-byte TMA strides")
+    if moe.weight_layout == "k_blocked_64_v1":
+        if tuple(tw.get_dim()) != (e, k // 64, n, 64) or tuple(tw.get_stride()) != (n * k, n * 64, 64, 1):
+            raise NotImplementedError("paired FC2 k_blocked_64_v1 requires contiguous [E,K/64,N,64] weights")
+    else:
+        if tuple(tw.get_dim()) != (e, k, n):
+            raise NotImplementedError("paired FC2 requires canonical expert weight dimensions")
+        se, sk, sn = tw.get_stride()
+        if sk != 1 or sn < k or se < (n - 1) * sn + k or se % 8 or sn % 8:
+            raise NotImplementedError("paired FC2 requires nonoverlapping weight rows/experts with16-byte TMA strides")
     for tensor, dim, stride in (
         (tx, (1, rows, k), (rows * k, k, 1)),
         (ty, (1, rows, n), (rows * n, n, 1)),
@@ -139,7 +144,7 @@ def analyze_fc2(graph, *, dynamic_shapes=False):
     ):
         if tuple(tensor.get_dim()) != dim or tuple(tensor.get_stride()) != stride:
             raise NotImplementedError("paired FC2 requires compact tokens/output and contiguous expert offsets")
-    return Fc2Spec(binding, tx, tw, ty, offsets, rows, n, k, e)
+    return Fc2Spec(binding, tx, tw, ty, offsets, rows, n, k, e, moe.weight_layout)
 
 
 class Fc2Compiled:
@@ -148,6 +153,7 @@ class Fc2Compiled:
     def __init__(self, spec, params):
         from cudnn.frost.template_loader import load_template
 
+        params = replace(params, weight_layout=spec.weight_layout)
         self.spec, self.binding = spec, spec.binding
         self.workspace_bytes = (params.grid_ctas * 2 + 1) * 128
         path = Path(__file__).resolve().parent / "sm100/kernel_templates/sm100_moe_fc2_pair.py"
@@ -166,7 +172,13 @@ class Fc2Compiled:
             if int(buf.__dlpack_device__()[0]) != 2 or int(buf.data_ptr()) % (4 if dtype == "int32" else 16):
                 raise ValueError("paired FC2 requires aligned CUDA operands")
         x, weight, out, offsets = operands
-        a, b, c = x.permute(1, 2, 0), weight.permute(2, 1, 0), out.permute(1, 2, 0)
+        if spec.weight_layout == "k_blocked_64_v1":
+            # Eligibility proves globally dense storage. This native reshape
+            # retains the pointer; the TMA descriptor addresses the K64 layout.
+            b = weight.reshape((spec.experts, spec.features, spec.reduction)).permute(1, 2, 0)
+        else:
+            b = weight.permute(2, 1, 0)
+        a, c = x.permute(1, 2, 0), out.permute(1, 2, 0)
         scratch = workspace.view(0, "int64", (self.workspace_bytes // 8,))
         # The paired ABI counts channels per half; identity stores write both halves.
         problem = (spec.rows, spec.features // 2, spec.reduction, spec.experts, spec.experts, *a.stride(), *b.stride(), *c.stride())

@@ -31,12 +31,19 @@ cases = [
     dict(name="r64_sparse", experts=128, rows=64, k=768, n=1024, sizes=[1] * 63 + [0] * 64 + [1], pitched=False),
     dict(name="r512_skew", experts=128, rows=512, k=128, n=1024, sizes=[257] + [0] * 126 + [255], pitched=False),
     dict(name="r513_many_waves", experts=257, rows=513, k=128, n=1024, sizes=[0] * 32 + [9] + [0] * 223 + [504], pitched=True),
+    dict(name="r513_compact_many_waves", experts=257, rows=513, k=128, n=1024, sizes=[0] * 32 + [9] + [0] * 223 + [504], pitched=False),
 ]
 
 
 @pytest.mark.parametrize("stages", [12, 6], ids=["stages12", "stages6"])
-@pytest.mark.parametrize("spec", cases, ids=[case["name"] for case in cases])
-def test_fc2_native_graph_and_live_captures(spec, stages, tmp_path):
+@pytest.mark.parametrize(
+    "spec,layout",
+    [(case, layout) for case in cases for layout in (None, "k_blocked_64_v1") if layout is None or not case["pitched"]],
+    ids=[
+        case["name"] + ("_k64" if layout else "_canonical") for case in cases for layout in (None, "k_blocked_64_v1") if layout is None or not case["pitched"]
+    ],
+)
+def test_fc2_native_graph_and_live_captures(spec, layout, stages, tmp_path):
     import cudnn
     from cudnn.frost import buffers
 
@@ -98,6 +105,16 @@ def test_fc2_native_graph_and_live_captures(spec, stages, tmp_path):
             (params,) = checked(drv.cuGraphKernelNodeGetParams(node))
             (name,) = checked(drv.cuFuncGetName(params.func))
             names.append(name.decode())
+            result.setdefault("launches", []).append(
+                dict(
+                    name=name.decode(),
+                    grid=[int(params.gridDimX), int(params.gridDimY), int(params.gridDimZ)],
+                    block=[int(params.blockDimX), int(params.blockDimY), int(params.blockDimZ)],
+                )
+            )
+            assert ("kblock64" in name.decode()) == (layout is not None)
+            assert [int(params.gridDimX), int(params.gridDimY), int(params.gridDimZ)] == [torch.cuda.get_device_properties(0).multi_processor_count, 1, 1]
+            assert [int(params.blockDimX), int(params.blockDimY), int(params.blockDimZ)] == [256, 1, 1]
         assert all("cudnn" in name and "frost_sm100_moe_fc2_pair" in name and "sched_static" in name for name in names)
         return names
 
@@ -144,18 +161,24 @@ def test_fc2_native_graph_and_live_captures(spec, stages, tmp_path):
         offsets = torch.tensor(starts[:-1], dtype=torch.int32, device="cuda").view(e, 1, 1)
         weights = []
         for hw in host_w:
-            storage = torch.empty(e * expert_pitch, dtype=torch.bfloat16, device="cuda")
-            storage.fill_(float("nan"))
-            weight = storage.as_strided((e, 2 * n, k), (expert_pitch, pitch, 1))
-            weight.copy_(hw)
+            if layout is not None:
+                # Restore exact singleton K-block strides after contiguous().
+                weight = hw.unflatten(-1, (k // 64, 64)).transpose(1, 2).contiguous().view(-1).view(e, k // 64, 2 * n, 64).cuda()
+            else:
+                storage = torch.empty(e * expert_pitch, dtype=torch.bfloat16, device="cuda")
+                storage.fill_(float("nan"))
+                weight = storage.as_strided((e, 2 * n, k), (expert_pitch, pitch, 1))
+                weight.copy_(hw)
             weights.append(weight)
         outputs = [torch.empty((r, 2 * n), dtype=torch.bfloat16, device="cuda") for _ in range(2)]
     stream.synchronize()
     g = cudnn.pygraph(io_data_type=bf16, intermediate_data_type=fp32, compute_data_type=fp32, handle=handle)
     tx = g.tensor(name="tokens", dim=[1, r, k], stride=[r * k, k, 1], data_type=bf16)
-    tw = g.tensor(name="parent_weight", dim=[e, k, 2 * n], stride=stride, data_type=bf16)
+    dim = [e, k // 64, 2 * n, 64] if layout is not None else [e, k, 2 * n]
+    stride = [2 * n * k, 2 * n * 64, 64, 1] if layout is not None else stride
+    tw = g.tensor(name="parent_weight", dim=dim, stride=stride, data_type=bf16)
     to = g.tensor(name="offsets", dim=[e, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
-    ty = g.moe_grouped_matmul(tx, tw, to, mode=cudnn.moe_grouped_matmul_mode.NONE, name="fc2")
+    ty = g.moe_grouped_matmul(tx, tw, to, mode=cudnn.moe_grouped_matmul_mode.NONE, name="fc2", weight_layout=layout)
     ty.set_dim([1, r, 2 * n]).set_stride([r * 2 * n, 2 * n, 1]).set_output(True).set_data_type(bf16)
     chain, binding = analyze_with_binding(g)
     assert binding.bound_tensors() == [tx, tw, ty, to] and len(binding.operand_slices) == 0
@@ -169,20 +192,21 @@ def test_fc2_native_graph_and_live_captures(spec, stages, tmp_path):
     template_path, template_params = loads.call_args.args[:2]
     assert Path(template_path).resolve() == root / "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_fc2_pair.py"
     assert template_params.grid_ctas == torch.cuda.get_device_properties(0).multi_processor_count
-    assert template_params.ab_stages == stages
+    assert template_params.ab_stages == stages and template_params.weight_layout == layout
     compiled = next(iter(g._compiled_plans.values()))._compiled
-    assert compiled.module.ab_stages == stages
+    assert compiled.module.ab_stages == stages and compiled.module.moe_kblocked64 == (layout is not None)
     result["ab_stages"] = stages
     result.setdefault("templates", []).append(dict(path=template_path, sha256=sha(template_path), params=repr(template_params)))
     engine, actual_knobs = g.get_engine_and_knobs_at_index(0)
     assert int(engine) == 20402 and actual_knobs == knobs.to_public()
     workspace_bytes = g.get_workspace_size_plan_at_index(0)
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
-    packs = [{tx: x.unsqueeze(0), tw: w.transpose(1, 2), to: offsets, ty: y.unsqueeze(0)} for w, y in zip(weights, outputs)]
+    packs = [{tx: x.unsqueeze(0), tw: w if layout is not None else w.transpose(1, 2), to: offsets, ty: y.unsqueeze(0)} for w, y in zip(weights, outputs)]
     graphs = []
     case = dict(
         **spec,
         ab_stages=stages,
+        weight_layout=layout,
         parent_stride=stride,
         engine=int(engine),
         workspace_bytes=workspace_bytes,
@@ -239,7 +263,9 @@ def test_fc2_native_graph_and_live_captures(spec, stages, tmp_path):
                 x.copy_(host_x)
             elif label == "weights":
                 host_w[0][first_expert].neg_()
-                weights[0][first_expert].copy_(host_w[0][first_expert])
+                weights[0][first_expert].copy_(
+                    host_w[0][first_expert].unflatten(-1, (k // 64, 64)).transpose(0, 1) if layout is not None else host_w[0][first_expert]
+                )
             else:
                 bounds = [0] * e + [r]
                 offsets.copy_(torch.tensor(bounds[:-1], dtype=torch.int32).view(e, 1, 1))
@@ -257,7 +283,7 @@ def test_fc2_native_graph_and_live_captures(spec, stages, tmp_path):
                 x.copy_(host_x)
             elif label == "weights":
                 host_w[0][first_expert].copy_(original_weight)
-                weights[0][first_expert].copy_(original_weight)
+                weights[0][first_expert].copy_(original_weight.unflatten(-1, (k // 64, 64)).transpose(0, 1) if layout is not None else original_weight)
             else:
                 offsets.copy_(torch.tensor(starts[:-1], dtype=torch.int32).view(e, 1, 1))
     replay(0, "restored")

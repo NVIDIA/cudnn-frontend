@@ -508,3 +508,17 @@ Native graph validation has passed on B200, including memcheck and racecheck.
 With K64 weights and unchanged FC2, matched T8/T64 full MoE tests measured
 1.19–1.53% lower latency; these are operator measurements, not model E2E.
 See `FROST_MOE_HANDOFF.md` for exact shapes, source and validation scope.
+
+### Prepared K64 paired FC2 weights
+
+On SM100, paired FC2 engine 20402 also accepts BF16 `weight_layout="k_blocked_64_v1"`
+with contiguous `[E,K/64,N,64]` storage. Prepare this storage before building or
+capturing the execution plan; execution binds the original pointer without a copy.
+The existing `1 <= R <= 513`, `N % 128 == 0`, and `K % 64 == 0` limits apply.
+Both `STAGES=12` and `STAGES=6` support this layout; no preferred depth is implied.
+Canonical pitched weights remain supported with no layout attribute.
+
+This applies the K64 physical-layout experiment to FC2's existing paired identity
+epilogue, retaining the NVIDIA Frost scheduler and the previously credited
+KF2132/e459dff pipeline-depth option. Component benefits do not establish
+complete MoE or model performance.
