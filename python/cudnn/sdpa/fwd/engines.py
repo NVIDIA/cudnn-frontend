@@ -545,7 +545,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return "split_kv > 1 cannot ride the synthesized KV-tail padding this S_kv needs"
             # No gate on the O dtype: the partials are never narrower than it,
             # and the combine performs the only cast down to it.
-            if capabilities.split_d_shapes is not None and not any(facts.d_qk <= sq and facts.d_v <= sv for sq, sv in capabilities.split_d_shapes):
+            # _selected_d_shape, not an envelope walk over the raw dims: the
+            # set names the flavors whose KERNELS wire SplitHelpers, and the
+            # lowering picks the smallest covering one. An envelope test says
+            # (64, 64) "fits" (128, 128) and admits a split the d64 kernel
+            # cannot serve, so the plan would clear eligibility and then die in
+            # the lowering (contract rule 8b'). Mirrors the pack_gqa gate below.
+            if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts) not in capabilities.split_d_shapes:
                 return f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:
             # _selected_d_shape, not the raw dims: the FP8 rows carry

@@ -1711,6 +1711,10 @@ def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
+        # f16/bf16 only here, so V matches Q/K: d128's `2 if pv_bf16 else b`
+        # collapses to b, _validate_params already declining pv_bf16 at d64.
+        BPE_V=b,
+        EMIT_AMAX_O=int(params.emit_amax_o),
         BPE_O=b_o,
         CGA_M=params.cta_mma,
         CTA_MMA=params.cta_mma,
@@ -1736,6 +1740,7 @@ def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
         BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
@@ -1744,12 +1749,15 @@ def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        # partial=False: the capability row leaves (64, 64) out of
+        # pack_gqa_partial_d_shapes, so only a group that FULLY divides TILE_M
+        # is admitted here. _pack_g raises on a group the gate would not pass,
+        # which is the check this used to open-code after _validate_cfg_d64.
+        PACK_G=_pack_g(params, CfgD64.TILE_M, partial=False),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d64(cfg)
-    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
-        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 
