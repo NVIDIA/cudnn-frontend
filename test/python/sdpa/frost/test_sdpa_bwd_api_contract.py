@@ -57,6 +57,49 @@ def test_d256_dq_does_not_repack_or_load_columnwise_k_scale():
         assert required in source
 
 
+def test_d256_dq_uses_independent_two_stage_k_and_one_stage_aux_pipelines():
+    source = _DQ.read_text()
+    setup_begin = source.index("def _setup_pipeline_stages_and_sf_tilers")
+    setup = source[setup_begin : source.index("@cute.jit", setup_begin)]
+    load = source[source.index("    def load(") : source.index("    def sfv_s2t_helper(")]
+    mma_begin = source.index("    def mma_interleaved(")
+    mma = source[mma_begin : source.index("    def mma(", mma_begin)]
+    helper = source[source.index("    def sfv_s2t_helper(") : source.index("    def mma_interleaved(")]
+    pipeline_helpers = source[source.index("    def make_and_init_load_mma_K_pipeline") :]
+
+    assert "self.load_mma_K_stage = 2" in setup
+    assert "self.load_mma_aux_stage = 1" in setup
+    assert "self.KT_load_mma_K_stage = self.load_mma_aux_stage" in setup
+    assert "self.SFV_load_mma_K_stage = self.load_mma_aux_stage * self.k_halves" in setup
+    assert "load_mma_aux_mbar_ptr" in source
+    assert "make_and_init_load_mma_aux_pipeline" in source
+    assert "2 * self.tma_copy_K_bytes + sfk_tx_multiplier * self.tma_copy_sfK_bytes" in pipeline_helpers
+    assert "kt_tx_multiplier * self.tma_copy_KT_bytes" in pipeline_helpers
+    assert "+ 2 * self.tma_copy_V_bytes" in pipeline_helpers
+    assert "+ sfv_tx_multiplier * self.tma_copy_sfV_bytes" in pipeline_helpers
+
+    for ring in ("K", "aux"):
+        assert f"load_mma_{ring}_producer_state" in load
+        assert f"cumulative_trip_count % Int32(2 * self.load_mma_{ring}_stage)" in load
+        assert f"load_mma_{ring}_pipeline.sync_object_full.get_barrier" in load
+        assert f"load_mma_{ring}_consumer_state" in mma
+        assert f"load_mma_{ring}_pipeline.consumer_wait" in mma
+        assert f"load_mma_{ring}_pipeline.consumer_release" in mma
+        assert f"load_mma_{ring}_consumer_state.advance()" in mma
+
+    assert "tma_barrier_K_inner" in load
+    assert "tma_barrier_aux_inner" in load
+    assert "tKsK[None, k_stage]" in load
+    assert "tKTsKT[None, aux_stage]" in load
+    assert "tVsV[None, aux_stage]" in load
+    refill = load[load.index("        while iter_count > 0:") :]
+    assert refill.index("tKsK[None, k_stage]") < refill.index("for sfk_k_half")
+    assert refill.index("for sfk_k_half") < refill.index("load_mma_K_producer_state.advance()")
+    assert refill.index("load_mma_K_producer_state.advance()") < refill.index("load_mma_aux_pipeline.producer_acquire")
+    assert refill.index("load_mma_aux_pipeline.producer_acquire") < refill.index("tKTsKT[None, aux_stage]")
+    assert "load_mma_aux_pipeline.consumer_wait" in helper
+
+
 def test_d256_dkdv_sequence_reductions_are_bf16():
     source = _DKDV.read_text()
     mma_begin = source.index("# dK = dS @ Q")

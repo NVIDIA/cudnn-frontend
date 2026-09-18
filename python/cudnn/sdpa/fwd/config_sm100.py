@@ -588,7 +588,8 @@ def _d256_smem_bytes(cfg: CfgD256) -> int:
     """Q/O alias plus the staged K/V data buffers for D256."""
     q = cfg.TILE_M * cfg.TILE_K * cfg.BPE
     o = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
-    k = cfg.STAGES_KV * cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA
+    stages_k = 2 if cfg.PV_BF16 else cfg.STAGES_KV
+    k = stages_k * cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA
     v = cfg.STAGES_KV * cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA
     return max(q, o) + k + v
 
