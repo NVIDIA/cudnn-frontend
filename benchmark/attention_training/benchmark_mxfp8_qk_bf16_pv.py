@@ -6,14 +6,14 @@
 This does not alter graph routing. It compares the direct-only hybrid kernel
 with ordinary MXFP8 QKV and native BF16 using identical logical shapes. The
 hybrid and ordinary MXFP8 paths share Q/K quantization; their V inputs differ
-by design (BF16 versus columnwise-MXFP8). Both D128/D128 and the native MLA
-D192/D128 flavor can be selected in one sweep.
+by design (BF16 versus columnwise-MXFP8). D128/D128, native MLA D192/D128,
+and Qwen-class D256/D256 can be selected in one sweep.
 
 Examples (GB200):
     python benchmark/attention_training/benchmark_mxfp8_qk_bf16_pv.py
     python benchmark/attention_training/benchmark_mxfp8_qk_bf16_pv.py --sweep
     python benchmark/attention_training/benchmark_mxfp8_qk_bf16_pv.py \
-        --sweep --d-shapes d128,d192_d128 --amax-o
+        --sweep --d-shapes d128,d192_d128,d256 --amax-o
 
 The full sweep is the Cartesian product B={1,2,4,8,16,32,64,128} and
 Sq=Sk={1024,2048,4096,8192,16384}. It intentionally takes a long time:
@@ -43,6 +43,7 @@ BF16_NAME = "QKV BF16"
 D_SHAPES = {
     "d128": (128, 128),
     "d192_d128": (192, 128),
+    "d256": (256, 256),
 }
 DEFAULT_D_SHAPES = (("d128", 128, 128),)
 
@@ -408,7 +409,7 @@ def main() -> None:
         "--d-shapes",
         type=_parse_d_shapes,
         default=DEFAULT_D_SHAPES,
-        help="comma-separated Q/K--V flavors: d128,d192_d128 (default: d128)",
+        help="comma-separated Q/K--V flavors: d128,d192_d128,d256 (default: d128)",
     )
     parser.add_argument(
         "--amax-o",

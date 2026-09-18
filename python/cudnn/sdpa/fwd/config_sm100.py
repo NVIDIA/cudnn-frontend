@@ -147,7 +147,7 @@ class TemplateParams:
     # pool's strides, which the per-shape compile() already pins. Dense-only.
     paged_kv: bool = False
     page_size: int = 0
-    # Experimental D128 MXFP8 specialization: Q/K remain block-scaled FP8,
+    # Experimental MXFP8 specialization: Q/K remain block-scaled FP8,
     # while the complete softmax(P) @ V leg uses BF16 operands. This is a
     # template axis because it changes the TMA maps, shared-memory layout and
     # BMM2 instruction kind. It is intentionally not wired into graph routing.
@@ -206,8 +206,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
         raise ValueError(f"{flavor}: softmax_f16 is per-tensor-FP8-only (f16/bf16 softmax already runs the f32 pipeline)")
-    if k.pv_bf16 and (not fp8 or flavor not in ("d128", "d192")):
-        raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128/D192 specialization")
+    if k.pv_bf16 and (not fp8 or flavor not in ("d128", "d192", "d256")):
+        raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128/D192/D256 specialization")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
     if dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_O must be 0..3; got {dtype_o}")
@@ -499,6 +499,9 @@ class CfgD256:
     DTYPE_QKV: int = DTYPE_FP16
     DTYPE_O: int = DTYPE_FP16
     BPE: int = 2
+    BPE_V: int = 2
+    PV_BF16: int = 0
+    EMIT_AMAX_O: int = 1
     BPE_O: int = 2
 
     CGA_M: int = 2
@@ -596,6 +599,16 @@ class CfgD256:
     PAGE_SIZE: int = 0
 
 
+def _d256_smem_bytes(cfg: CfgD256) -> int:
+    """Q/O alias plus the staged K/V data buffers for D256."""
+    q = cfg.TILE_M * cfg.TILE_K * cfg.BPE
+    o = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
+    stages_k = 2 if cfg.PV_BF16 else cfg.STAGES_KV
+    k = stages_k * cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA
+    v = cfg.STAGES_KV * cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA
+    return max(q, o) + k + v
+
+
 def _validate_cfg_d256(cfg: CfgD256) -> None:
     """Consistency checks on the (mostly hardcoded) d256 geometry."""
     fp8 = cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2)
@@ -614,18 +627,22 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
         ),
         (cfg.CGA_M == cfg.CTA_MMA, "d256 flavor pairs CGA_M with CTA_MMA"),
         (cfg.CTA_MMA == (1 if fp8 else 2), "d256 SM100: FP8 requires CTA1; BF16/FP16 requires CTA2"),
-        (cfg.STAGES_KV == 2, "d256 SM100 uses two full/half-width KV stages"),
+        (cfg.STAGES_KV == (1 if cfg.PV_BF16 else 2), "d256 SM100 uses one BF16-PV or two FP8 KV stages"),
         (cfg.Q_SWZ_BYTES in (64, 128) and cfg.K_SWZ_BYTES in (64, 128), "d256: Q/K swizzle must be 64/128B"),
         (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d256: V/O swizzle out of range"),
+        (cfg.V_SWZ_BYTES == v_swz_bytes(256, cfg.CTA_MMA, cfg.BPE_V), "d256: V swizzle must match V element width and CTA topology"),
         (cfg.TILES_Q == 1, "d256 pipeline mandates TILES_Q == 1"),
         (not split_p or split_p_supported, "d256: unsupported split-P specialization"),
         (cfg.SOFTMAX_WARPGROUPS == 2 if cfg.MASK_FLAGS == MASK_NONE and fp8 else True, "d256: dense FP8 must split P generation"),
         (cfg.TOTAL_WARPS == (12 if fused_corr_split_p else 16 if split_p else 12), "d256: role layout and warp count disagree"),
         (not fused_corr_split_p or (split_p and cfg.CORRECTION_WARPS == 0), "d256: fused split-P must replace the correction warp group"),
         (
-            cfg.TILE_K_HW_BMM1 == (32 if fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if fp8 else 16),
-            "d256: TILE_K_HW must be 32 for FP8 and 16 for BF16/FP16",
+            cfg.TILE_K_HW_BMM1 == (32 if fp8 else 16) and cfg.TILE_K_HW_BMM2 == (16 if cfg.PV_BF16 else (32 if fp8 else 16)),
+            "d256: BMM1 TILE_K_HW must match Q/K and BMM2 must match the P/V specialization",
         ),
+        (cfg.PV_BF16 in (0, 1) and (not cfg.PV_BF16 or fp8), "d256: pv_bf16 requires MXFP8 Q/K"),
+        (cfg.BPE_V == (2 if cfg.PV_BF16 else cfg.BPE), "d256: V bytes/element must match the PV specialization"),
+        (_d256_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM, f"d256: data-buffer SMEM {_d256_smem_bytes(cfg)} exceeds SM100 usable limit"),
         (fp8 or cfg.DTYPE_O == cfg.DTYPE_QKV, "d256: half input requires DTYPE_O == DTYPE_QKV"),
     )
     for ok, msg in checks:
@@ -717,6 +734,7 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     fused_corr_split_p = mxfp8 and strict_top_left_causal
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
+    b_v = 2 if params.pv_bf16 else b
 
     # These register profiles are coupled to the kernel's role topologies;
     # they are not independent public knobs.
@@ -757,6 +775,9 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
+        BPE_V=b_v,
+        PV_BF16=int(params.pv_bf16),
+        EMIT_AMAX_O=int(params.emit_amax_o),
         BPE_O=b_o,
         # FP8 uses one M128 CTA per work unit. With a full K/V slice per CTA,
         # two KV stages consume the same SMEM payload as CTA2's four half-slices.
@@ -764,12 +785,12 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         CTA_MMA=params.cta_mma,
         Q_SWZ_BYTES=q_swz_bytes(256, b),
         K_SWZ_BYTES=q_swz_bytes(256, b),
-        V_SWZ_BYTES=v_swz_bytes(256, 1 if fp8 else 2, b),
+        V_SWZ_BYTES=v_swz_bytes(256, 1 if fp8 else 2, b_v),
         O_SWZ_BYTES=o_swz_bytes(256, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
-        TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
-        STAGES_KV=2,
+        TILE_K_HW_BMM2=16 if params.pv_bf16 else (32 if fp8 else tile_k_hw(params.dtype_qkv)),
+        STAGES_KV=1 if params.pv_bf16 else 2,
         SOFTMAX_WARPGROUPS=2 if split_p or fused_corr_split_p else 1,
         CORRECTION_WARPS=0 if fused_corr_split_p else 4,
         FUSED_CORR_SPLIT_P=1 if fused_corr_split_p else 0,

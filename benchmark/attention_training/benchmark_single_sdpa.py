@@ -670,8 +670,10 @@ else:
         ## Will define tensors to set up cuDNN graph once.
         # FP8/MXFP8 needs randn in bfloat16 then convert (randn doesn't support fp8 well)
         randn_dtype = torch.bfloat16 if args.data_type in ("fp8", "mxfp8") else target_dtype
-        query = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_qk, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
-        key = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_qk, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
+        query_master = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_qk, dtype=randn_dtype, device=device).transpose(1, 2)
+        key_master = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_qk, dtype=randn_dtype, device=device).transpose(1, 2)
+        query = query_master.to(target_dtype)
+        key = key_master.to(target_dtype)
         value = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
         if args.data_type == "mxfp8":
             output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
@@ -714,6 +716,11 @@ else:
             sf_q_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_q_heads, s_q_padded, head_dim_qk, block_size)
             sf_k_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_kv_heads, s_kv_padded, head_dim_qk, block_size)
             sf_v_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_kv_heads, d_vo_padded, kv_seqlen, block_size)
+            # Forward consumes V columnwise (the contraction dimension is S),
+            # while backward dO @ V^T consumes V rowwise (the contraction
+            # dimension is D). Their F8_128x4 tensors have different atom
+            # order and cannot be aliased.
+            sf_v_bwd_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_kv_heads, s_kv_padded, head_dim_vo, block_size)
             # Backward-specific scale factors: transposed views for Q, K, dO
             # SF_Q_T, SF_K_T: scale along sequence dimension [b, h, s_scale_padded, d_padded]
             sf_q_t_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_q_heads, d_qk_padded, q_seqlen, block_size)
@@ -742,7 +749,8 @@ else:
         # dO in O's memory format (BSHD-physical): torch.randn(output.shape) would
         # allocate BHSD-contiguous and hand every backward a gradient laid out
         # differently from the activations.
-        dOutput = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
+        dOutput_master = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).transpose(1, 2)
+        dOutput = dOutput_master.to(target_dtype)
         stats = torch.empty(batch_size, num_q_heads, q_seqlen, 1, dtype=torch.float32, device=device)
         if is_dropout:
             dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
@@ -1011,6 +1019,21 @@ else:
                 # Create transposed tensor views (separate storage with transposed strides)
                 q_t_bwd = graph_bwd.tensor_like(query)
                 k_t_bwd = graph_bwd.tensor_like(key)
+                # FROST's leakage-safe sequence contractions consume explicit
+                # BF16 sidecars.  Keep them off native cuDNN graphs because
+                # they are intentionally Python-only ports.
+                q_f16_bwd = k_f16_bwd = None
+                if args.sdpa_backend == "cudnn_oss":
+                    q_f16_bwd = graph_bwd.tensor(
+                        dim=query.size(),
+                        stride=query.stride(),
+                        data_type=cudnn.data_type.BFLOAT16,
+                    )
+                    k_f16_bwd = graph_bwd.tensor(
+                        dim=key.size(),
+                        stride=key.stride(),
+                        data_type=cudnn.data_type.BFLOAT16,
+                    )
 
                 # O in BFLOAT16 (forward output)
                 o_bwd = graph_bwd.tensor(
@@ -1088,8 +1111,10 @@ else:
                 ) = graph_bwd.sdpa_mxfp8_backward(
                     q=q_bwd,
                     q_T=q_t_bwd,
+                    q_f16=q_f16_bwd,
                     k=k_bwd,
                     k_T=k_t_bwd,
+                    k_f16=k_f16_bwd,
                     v=v_bwd,
                     o_f16=o_bwd,
                     dO_f16=dO_f16_bwd,
@@ -1230,10 +1255,12 @@ else:
                 # Create additional tensors needed for MXFP8 backward
                 # Output and dOutput in output_dtype format for backward
                 output_f16 = output.to(output_dtype)
-                dOutput_f16 = dOutput.float().to(output_dtype)
+                dOutput_f16 = dOutput_master.to(torch.bfloat16)
                 # Transposed tensors (use same data, just for passing to graph)
                 query_t = query.clone()
                 key_t = key.clone()
+                query_f16 = query_master.to(torch.bfloat16)
+                key_f16 = key_master.to(torch.bfloat16)
                 dOutput_t = dOutput.clone()
 
                 variant_pack_fwd = {
@@ -1262,13 +1289,16 @@ else:
                     sf_q_t_bwd: sf_q_t_gpu,
                     sf_k_bwd: sf_k_gpu,
                     sf_k_t_bwd: sf_k_t_gpu,
-                    sf_v_bwd: sf_v_gpu,
+                    sf_v_bwd: sf_v_bwd_gpu,
                     sf_dO_bwd: sf_dO_gpu,
                     sf_dO_t_bwd: sf_dO_t_gpu,
                     dQ_bwd: dQuery,
                     dK_bwd: dKey,
                     dV_bwd: dValue,
                 }
+                if q_f16_bwd is not None:
+                    variant_pack_bwd[q_f16_bwd] = query_f16
+                    variant_pack_bwd[k_f16_bwd] = key_f16
                 if mxfp8_amax_requested:
                     variant_pack_bwd[amax_dQ_bwd] = amax_dQ_gpu
                     variant_pack_bwd[amax_dK_bwd] = amax_dK_gpu
@@ -1574,12 +1604,10 @@ else:
     for i in range(total_iters):
         # FP8/MXFP8 needs randn in bfloat16 then convert (randn doesn't support fp8 well)
         randn_dtype = torch.bfloat16 if args.data_type in ("fp8", "mxfp8") else target_dtype
-        query = (
-            torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_qk, dtype=randn_dtype, device=device, requires_grad=True).to(target_dtype).transpose(1, 2)
-        )
-        key = (
-            torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_qk, dtype=randn_dtype, device=device, requires_grad=True).to(target_dtype).transpose(1, 2)
-        )
+        query_master = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_qk, dtype=randn_dtype, device=device, requires_grad=True).transpose(1, 2)
+        key_master = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_qk, dtype=randn_dtype, device=device, requires_grad=True).transpose(1, 2)
+        query = query_master.to(target_dtype)
+        key = key_master.to(target_dtype)
         value = (
             torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_vo, dtype=randn_dtype, device=device, requires_grad=True).to(target_dtype).transpose(1, 2)
         )
@@ -1606,7 +1634,8 @@ else:
             amax_dP_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
 
         query, key, value = preprocess_qkv(query, key, value, args.sdpa_backend)
-        dOutput = torch.randn(*query.shape[:-1], head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype)
+        dOutput_master = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).transpose(1, 2)
+        dOutput = dOutput_master.to(target_dtype)
 
         if is_cudnn_fe:
             if args.data_type == "mxfp8":
@@ -1672,9 +1701,11 @@ else:
                 elif args.data_type == "mxfp8":
                     # MXFP8 backward needs additional tensors
                     output_f16 = output.to(output_dtype)
-                    dOutput_f16 = dOutput.float().to(output_dtype)
+                    dOutput_f16 = dOutput_master.to(torch.bfloat16)
                     query_t = query.clone()
                     key_t = key.clone()
+                    query_f16 = query_master.to(torch.bfloat16)
+                    key_f16 = key_master.to(torch.bfloat16)
                     dOutput_t = dOutput.clone()
 
                     variant_pack_fwd = {
@@ -1703,16 +1734,20 @@ else:
                         sf_q_t_bwd: sf_q_t_gpu,
                         sf_k_bwd: sf_k_gpu,
                         sf_k_t_bwd: sf_k_t_gpu,
-                        sf_v_bwd: sf_v_gpu,
+                        sf_v_bwd: sf_v_bwd_gpu,
                         sf_dO_bwd: sf_dO_gpu,
                         sf_dO_t_bwd: sf_dO_t_gpu,
                         dQ_bwd: dQuery,
                         dK_bwd: dKey,
                         dV_bwd: dValue,
-                        amax_dQ_bwd: amax_dQ_gpu,
-                        amax_dK_bwd: amax_dK_gpu,
-                        amax_dV_bwd: amax_dV_gpu,
                     }
+                    if q_f16_bwd is not None:
+                        variant_pack_bwd[q_f16_bwd] = query_f16
+                        variant_pack_bwd[k_f16_bwd] = key_f16
+                    if mxfp8_amax_requested:
+                        variant_pack_bwd[amax_dQ_bwd] = amax_dQ_gpu
+                        variant_pack_bwd[amax_dK_bwd] = amax_dK_gpu
+                        variant_pack_bwd[amax_dV_bwd] = amax_dV_gpu
                 else:
                     variant_pack_fwd = {
                         q_fwd: query,

@@ -62,6 +62,33 @@ def test_d192_hybrid_elides_pv_scale_factor_storage_and_transactions():
 
 
 @pytest.mark.L0
+def test_d256_hybrid_uses_bf16_pv_and_elides_scale_factor_traffic():
+    """D256 must keep the non-causal block-scaled operator out of BMM2."""
+    kernel = Path(__file__).parents[4] / "python/cudnn/sdpa/fwd/kernels/sm100/prefill_d256_mxfp8.py"
+    source = kernel.read_text()
+
+    assert "V_STORAGE_DTYPE = cutlass.BFloat16 if CFG.PV_BF16 else STORAGE_DTYPE" in source
+    assert "P_STORAGE_DTYPE = cutlass.BFloat16 if CFG.PV_BF16 else STORAGE_DTYPE" in source
+    assert "if cutlass.const_expr(CFG.PV_BF16):" in source
+    assert "kind=nvvm.Tcgen05MMAKind.F16" in source
+    assert "sP_SF = sQ_SF" in source
+    assert "sV_SF = sK_SF" in source
+    assert "V_SF_EXPECT_BYTES = 0 if CFG.PV_BF16 else" in source
+
+
+@pytest.mark.L0
+def test_d256_hybrid_pipelines_fp8_k_deeper_than_bf16_v():
+    """The hybrid D256 path should overlap the next FP8 K with the current BF16 PV."""
+    kernel = Path(__file__).parents[4] / "python/cudnn/sdpa/fwd/kernels/sm100/prefill_d256_mxfp8.py"
+    source = kernel.read_text()
+
+    assert "STAGES_K = 2 if CFG.PV_BF16 else CFG.STAGES_KV" in source
+    assert "STAGES_V = CFG.STAGES_KV" in source
+    assert "stages=STAGES_K" in source
+    assert "stages=STAGES_V" in source
+
+
+@pytest.mark.L0
 def test_hybrid_execute_uses_cached_v_scale_factor_dummy():
     """Hybrid execution must not materialize a sliced SF tensor per launch."""
     source = inspect.getsource(SdpaFwdDslSm100._execute_mxfp8)

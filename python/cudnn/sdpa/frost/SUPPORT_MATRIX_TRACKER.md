@@ -52,12 +52,13 @@ half-precision row and ᵍ for the MXFP8 row.
 
 The MXFP8 backward is a **two-kernel chain with a scale-factor repack in
 front**: the seven F8_128x4 scale tensors are repacked into the kernels'
-2-CTA slot layout (eleven small launches into workspace), then a dQ kernel
+2-CTA slot layout (eight small launches into workspace), then a dQ kernel
 (Q·Kᵀ, dO·Vᵀ, dS·K) and a fused dK/dV kernel (Q·Kᵀ, dO·Vᵀ, dSᵀ·Q, Pᵀ·dO) run,
-both 2-CTA block-scaled MMA pipelines ported from Xinbo Zhao's
-`fmha_mxfp8_large_head_dim`. dS is quantized in-kernel with an
-online per-32-block E8M0 scale; P with a fixed 2⁻⁸ descale. The repack is a
-documented exception to Hard Rule 2 (see `bwd/api_dsl_mxfp8_sm100.py`).
+both 2-CTA pipelines ported from Xinbo Zhao's
+`fmha_mxfp8_large_head_dim`. Q·Kᵀ and dO·Vᵀ remain block-scaled MXFP8;
+dS·K, dSᵀ·Q, and Pᵀ·dO use ordinary BF16 MMA to prevent causal leakage. The
+repack is a documented exception to Hard Rule 2 (see
+`bwd/api_dsl_mxfp8_sm100.py`).
 
 The backward is a **three-stage chain**, not one fused kernel: a fused d=512
 backward needs 512 TMEM columns for dV and 512 more for dK against 512 per CTA,
@@ -435,7 +436,8 @@ backend verdict — the same envelope the C++ `validate()` always enforced. The
 d128 flavor's ×16 envelope and the d512 band² are unaffected. Lift the floors
 once the kernels' padded paths pass the battery.
 ᵍ **`sdpa_bwd_sm100_mxfp8` only — `sdpa_mxfp8_backward()` with E4M3 payloads,
-d_qk = d_v = 256 exactly, fp16/bf16 `o_f16`/`dO_f16`/dQ/dK/dV.** Serves MHA /
+d_qk = d_v = 256 exactly, fp16/bf16 `o_f16`/dQ/dK/dV, and explicit BF16
+`q_f16`/`k_f16`/`dO_f16` sidecars.** Serves MHA /
 GQA / MQA, any fixed S_q / S_kv (the kernels mask tile tails; S_q = 1 works),
 dense and top-left causal, and honors `use_deterministic_algorithm` (both
 kernels own their output tiles — nothing accumulates through atomics).
@@ -444,10 +446,12 @@ than reading them, so a BHSD-contiguous graph is declined, not staged. Declined
 outright: E5M2, bottom-right / right-widened / sliding-window masks, padding,
 THD, bias / dBias, sink / dSink, and any of `amax_dQ/dK/dV` requested as a real
 output (the kernels write half-precision gradients and produce no amax).
-Numerics: dS is quantized in-kernel with an online per-32-block E8M0 scale;
-P with a fixed 2⁻⁸ descale (cuDNN's MXFP8 convention). Cost to know about: the
-scale-factor repack in front of the kernels (eleven launches, ~1–2 % of the
-backward) and its workspace (about one payload-equivalent of bytes).
+Numerics: Q@K and dO@V retain MXFP8 acceleration, while every contraction with
+a sequence reduction (`dS@K`, `dS@Q`, and `P@dO`) uses ordinary BF16 MMA so a
+masked value cannot affect an E8M0 scale observed by an unmasked output. This
+intentional forward/backward quantization mismatch has a small quality cost.
+Cost to know about: the scale-factor repack in front of the kernels (eight
+launches, ~1–2 % of the backward) and its workspace.
 
 ---
 
