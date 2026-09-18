@@ -67,6 +67,13 @@ class EngineSlot:
     so one implementation can graduate while a sibling matures; it lives here
     rather than on the engine class because the gate must answer without
     importing the engine.
+
+    The gate withholds an optimization, never an operation: an opt-in engine is
+    still offered, without the flag, for a graph the cuDNN backend validates but
+    proposes no plan for or declines at check_support / build time
+    (``pygraph._admit_opt_in_engines``), and an explicit replay of such a plan
+    resolves it (``engine_for_id(include_opt_in=True)``) -- the per-graph form
+    of the rule that a sole-implementation family is never gated.
     """
 
     slot: int
@@ -116,13 +123,15 @@ class EngineFamily:
     def owns(self, engine_id: int) -> bool:
         return self.engine_id <= engine_id < self.id_end
 
-    def offered_ids(self) -> Dict[str, int]:
+    def offered_ids(self, *, include_opt_in: bool = False) -> Dict[str, int]:
         """``{engine name: engine id}`` for the engines on offer.
 
         Maturity only -- no arch range. Whether an engine suits a device is the
-        engine's own check_support().
+        engine's own check_support(). ``include_opt_in`` lists the opt-in slots
+        regardless of the flag: the caller has established that nothing else
+        serves the graph.
         """
-        enabled = opt_in_engines_enabled()
+        enabled = include_opt_in or opt_in_engines_enabled()
         return {name: self.engine_id + s.slot for name, s in self.slots.items() if enabled or not s.opt_in}
 
 
@@ -386,29 +395,34 @@ def instantiate(family: EngineFamily, ids: Dict[str, int]):
     return engines
 
 
-def engines_for(graph):
-    """Every in-tree engine of the graph's family, in candidate order."""
+def engines_for(graph, *, include_opt_in: bool = False):
+    """Every in-tree engine of the graph's family, in candidate order.
+
+    ``include_opt_in`` admits the family's opt-in engines without the flag --
+    the planning layer's call once the backend has proposed nothing."""
     family = family_for(graph)
     if family is None:
         return []
-    ids = family.offered_ids()  # availability is a separate question from kind
+    ids = family.offered_ids(include_opt_in=include_opt_in)  # availability is a separate question from kind
     return list(instantiate(family, ids)) if ids else []
 
 
-def engine_for_id(engine_id: int):
+def engine_for_id(engine_id: int, *, include_opt_in: bool = False):
     """The engine that owns ``engine_id``, or None.
 
     An engine id is fully decodable from this table: the family owning the id
     block, then the slot within it. Nothing has to be registered first, which is
     what lets create_execution_plan() replay an autotune result on a fresh graph
     -- including an engine that is not a candidate for THAT graph, where the
-    replay is a deliberate pin rather than a routing decision.
+    replay is a deliberate pin rather than a routing decision. ``include_opt_in``
+    decodes a gated slot too (the replay of a plan that was offered without the
+    flag because the backend had nothing for the graph).
     """
     for family in MANIFEST:
         if not family.owns(engine_id):
             continue
-        ids = family.offered_ids()
+        ids = family.offered_ids(include_opt_in=include_opt_in)
         if engine_id not in ids.values():
-            return None  # a real slot, but gated off in this process
+            return None  # a real slot, but gated off in this process (or not a slot at all)
         return next((e for e in instantiate(family, ids) if e.engine_id == engine_id), None)
     return None

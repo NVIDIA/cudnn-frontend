@@ -514,7 +514,15 @@ without being imported. Everything else is the engine's own `check_support()`.
 - **Maturity is per engine** (`EngineSlot.opt_in`, gated by
   `CUDNN_FRONTEND_ENABLE_FROST_ENGINES`), so one implementation can graduate
   while a sibling matures. It lives in the manifest rather than on the engine
-  class because the gate must answer without importing the engine.
+  class because the gate must answer without importing the engine. The gate
+  withholds an optimization, never an operation: when the backend validates a
+  graph but proposes no plan for it, or every plan it proposed declines at
+  `check_support()` / build time, the family's opt-in engines are admitted as
+  candidates without the flag (`pygraph._admit_opt_in_engines`; an explicit
+  `create_execution_plan(engine_id, knobs)` replay of such a plan resolves the
+  engine the same way) — the per-graph form of never gating a
+  sole-implementation family. A graph the installed backend rejects at
+  `validate()` still raises there.
 - **A family may name a `heuristics` hook** — like `analyzer`, a
   `("module", "callable")` pair kept as strings so the coarse key stays
   import-free. It is handed the facts, the family's offered ids and the

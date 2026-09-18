@@ -1012,7 +1012,15 @@ class pygraph:
         self._freeze()
         self._attach_facts()
 
-        plans = list(rank(self, self._candidate_engines(), self.backend_plan_entries(), self._backend_heuristics))
+        backend_plans = self.backend_plan_entries()
+        if not backend_plans:
+            # The backend proposed nothing for this graph. Every in-tree engine
+            # that can serve it is then a candidate, opt-in or not: withholding
+            # one here would delete the operation rather than defer an
+            # optimization -- the per-graph form of never gating a
+            # sole-implementation family.
+            self._admit_opt_in_engines("the backend proposed no plan for this graph")
+        plans = list(rank(self, self._candidate_engines(), backend_plans, self._backend_heuristics))
         # Validate the FINAL router output: every entry must name an engine this
         # graph can actually dispatch to.
         from .engines.engine_ids import is_python_engine
@@ -1041,6 +1049,30 @@ class pygraph:
 
             self._candidates = list(manifest.engines_for(self))
         return self._candidates
+
+    def _admittable_opt_in_engines(self) -> List["BaseEngine"]:
+        """The family's opt-in engines that are not yet candidates of this graph
+        and that the flag does not already offer — what ``_admit_opt_in_engines``
+        would add. [] when the flag is set (everything is offered already)."""
+        from .engines import manifest
+
+        if manifest.opt_in_engines_enabled():
+            return []
+        have = {e.engine_id for e in self._candidate_engines()}
+        return [e for e in manifest.engines_for(self, include_opt_in=True) if e.engine_id not in have]
+
+    def _admit_opt_in_engines(self, reason: str) -> List["BaseEngine"]:
+        """Add the family's opt-in engines to this graph's candidates without the
+        flag, because nothing else serves it (``reason`` says what was
+        established). Returns the engines newly admitted, [] when there are none
+        or the flag already offers everything."""
+        from .engines import manifest
+
+        admitted = self._admittable_opt_in_engines()
+        if admitted:
+            _LOG.info("%s; offering the opt-in engine(s) %s without %s", reason, [e.name for e in admitted], manifest._ENABLE_ENV)
+            self._candidates = self._candidate_engines() + admitted
+        return admitted
 
     def _finalize_backend_layout(self) -> None:
         """Let the backend's layout inference land before the graph is frozen.
@@ -1547,10 +1579,19 @@ class pygraph:
             self._lowered_graph.check_support()
         except decline_types() as exc:
             others = [i for i, cfg in enumerate(self._plans) if i != self._plan_index and self._engine_for(cfg) is not None]
-            if self._plan_pinned or not others:
+            # An opt-in engine the flag withholds is still an entry that could
+            # serve the graph: build_plans() admits it once every backend plan
+            # has declined, so the aggregate decline must not abort build() here.
+            admissible = [] if (others or self._plan_pinned) else self._admittable_opt_in_engines()
+            if self._plan_pinned or not (others or admissible):
                 raise
             self._backend_declined = exc
-            _LOG.info("backend check_support declined the graph (%s); the plan walk still has %d python entr(y|ies)", exc, len(others))
+            _LOG.info(
+                "backend check_support declined the graph (%s); the plan walk still has %d python entr(y|ies) and %d admissible opt-in engine(s)",
+                exc,
+                len(others),
+                len(admissible),
+            )
 
     def build_plans(self, *args, ctx: Any = None, **kwargs) -> None:
         """Walk the ranked plan list from the selected index and finalize the
@@ -1579,37 +1620,61 @@ class pygraph:
         strict = self._plan_pinned
         barred = self._barred_indices()  # once: resolving names can lower the backend
         failures = []
-        for index in range(self._plan_index, len(self._plans)):
-            if index in barred:
-                if strict:  # select_plan and deselect_engines contradict each other
-                    raise ValueError(
-                        f"plan {index} ({self.get_plan_name_at_index(index)!r}) is pinned by select_plan() but "
-                        f"excluded by deselect_engines(); drop one of the two instructions"
-                    )
-                continue
-            try:
-                self._build_plan_at(index, *args, ctx=ctx, **kwargs)
-                if self._workspace_limit is not None and self._engine_for(self._plans[index]) is not None:
-                    need = self._compiled_plans[index].get_workspace_size()
-                    if need > self._workspace_limit:
-                        raise cudnn_graph_not_supported(f"needs {need} workspace bytes, over the {self._workspace_limit} limit")
-            except decline_types() as exc:
-                if strict:
-                    raise
-                failures.append(f"[{index}] {self.get_plan_name_at_index(index)}: {exc}")
-                _LOG.info("plan %d declined at build time (%s); trying the next entry", index, exc)
-                continue
-            if not build_all:
-                self._plan_index = index
-                self._is_built = True
-                return
-            if not self._is_built:  # ALL: the first success is still the selection
-                self._plan_index, self._is_built = index, True
-        if self._is_built:
+
+        def walk(start: int) -> bool:
+            """Build entries from ``start``; True when the walk may stop (a plan built and not ALL)."""
+            for index in range(start, len(self._plans)):
+                if index in barred:
+                    if strict:  # select_plan and deselect_engines contradict each other
+                        raise ValueError(
+                            f"plan {index} ({self.get_plan_name_at_index(index)!r}) is pinned by select_plan() but "
+                            f"excluded by deselect_engines(); drop one of the two instructions"
+                        )
+                    continue
+                try:
+                    self._build_plan_at(index, *args, ctx=ctx, **kwargs)
+                    if self._workspace_limit is not None and self._engine_for(self._plans[index]) is not None:
+                        need = self._compiled_plans[index].get_workspace_size()
+                        if need > self._workspace_limit:
+                            raise cudnn_graph_not_supported(f"needs {need} workspace bytes, over the {self._workspace_limit} limit")
+                except decline_types() as exc:
+                    if strict:
+                        raise
+                    failures.append(f"[{index}] {self.get_plan_name_at_index(index)}: {exc}")
+                    _LOG.info("plan %d declined at build time (%s); trying the next entry", index, exc)
+                    continue
+                if not build_all:
+                    self._plan_index = index
+                    self._is_built = True
+                    return True
+                if not self._is_built:  # ALL: the first success is still the selection
+                    self._plan_index, self._is_built = index, True
+            return False
+
+        if walk(self._plan_index) or self._is_built:
             return
+        if not strict:
+            # Every entry the backend proposed declined at build time. The
+            # family's opt-in engines are the remaining candidates: rank them
+            # (no backend entries left to place against) and walk the new tail.
+            admitted = self._admit_opt_in_engines("every plan the backend proposed declined at build time")
+            if admitted:
+                from .engines.heuristics import rank
+
+                seen = {(c.engine_id, repr(c.knobs)) for c in self._plans}
+                extra = [c for c in rank(self, admitted, [], self._backend_heuristics) if (c.engine_id, repr(c.knobs)) not in seen]
+                if extra:
+                    start = len(self._plans)
+                    self._plans = list(self._plans) + extra
+                    barred = self._barred_indices()
+                    if walk(start) or self._is_built:
+                        return
         if self._backend_declined is not None and not failures:
             raise self._backend_declined  # nothing else ran: the backend's failure IS the answer
-        raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(failures or ["the plan list is empty"]))
+        detail = list(failures or ["the plan list is empty"])
+        if self._backend_declined is not None:
+            detail.append(f"(the backend declined the graph: {self._backend_declined})")
+        raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(detail))
 
     def _build_plan_at(self, index: int, *args, ctx: Any = None, **kwargs) -> None:
         """Build one entry — the single place the two sides diverge.
@@ -1823,6 +1888,17 @@ class pygraph:
             self.validate()
         if is_python_engine(engine_id):
             owners = self._owners_for_id(engine_id)
+            if not owners:
+                # A recorded (engine_id, knobs) is a deliberate pin, not a routing
+                # decision: a plan this library offered without the flag (the
+                # backend had nothing for the graph) must replay without it too.
+                from .engines import manifest
+
+                engine = manifest.engine_for_id(engine_id, include_opt_in=True)
+                if engine is not None:
+                    _LOG.info("replaying the opt-in engine %s without %s", engine.name, manifest._ENABLE_ENV)
+                    self._candidates = self._candidate_engines() + [engine]
+                    owners = [engine]
             if not owners:
                 raise ValueError(f"no python engine on this graph owns engine_id {engine_id}")
             if len(owners) > 1:
