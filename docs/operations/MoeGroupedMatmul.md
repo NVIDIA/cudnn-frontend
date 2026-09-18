@@ -245,11 +245,12 @@ are contiguous INT32 metadata with the existing monotone in-range MoE contract.
 Only standard unit-beta SwiGLU is supported: no auxiliary outputs, reductions,
 quantization, dynamic shapes, or additional pointwise operations.
 
-The engine exposes the existing public GEMM knob vocabulary. Its implemented
+The engine exposes the existing public GEMM knob vocabulary. Its default
 record has `TILE_M=128`, `TILE_N=8`, `TILEK=128` bytes,
 `MMA_TILE_M=128`, `MMA_TILE_N=8`, `MMA_TILE_K=32` bytes,
 one CTA, `SWAP_AB=1` and `SCHED_POLICY=1`. The physical M tile includes both
-projections and produces 64 output features. Other knob combinations decline.
+projections and produces 64 output features. The optional M64 variant described
+below changes both physical M axes together; other combinations decline.
 The ordinary Frost engine (20400) remains available. Heuristic enumeration
 is not a performance ranking; tune the eligible complete MoE configurations.
 
@@ -486,3 +487,24 @@ knob. Replaying `(engine, knobs)` requires reconstructing the same graph layout.
 Classic backend graph key/serialization rejects this Python-only declaration.
 See [the integration handoff](../../FROST_MOE_HANDOFF.md) for validation boundaries
 and the matching FlashInfer draft.
+
+
+### Optional paired FC1 M64 tile (SM100 draft)
+
+The paired SwiGLU engine additionally enumerates physical `TILE_M=64` and
+`MMA_TILE_M=64` together for 9–513 routed rows, with all other axes matching
+its existing M128N8 static record. M128 remains first and is the default.
+Both canonical and explicit K64 weights are supported; FC2 is unchanged.
+M64 uses 32 output features per CTA, a launch grid of twice the SM count,
+and a 16x256b TMEM drain.
+The plan owns the matching workspace size and compiled-template identity.
+This is an explicit tuning choice, not a ranking heuristic. M64 currently
+declines 1–8 routed rows; the existing M128 small-row path remains available.
+
+Credit: Kernel Factory round 2 candidate `14306536` supplied the M64 geometry,
+TMEM drain and explicit AB counters. This version retains the original Frost
+scheduler after the candidate's scheduler failed independent racecheck.
+Native graph validation has passed on B200, including memcheck and racecheck.
+With K64 weights and unchanged FC2, matched T8/T64 full MoE tests measured
+1.19–1.53% lower latency; these are operator measurements, not model E2E.
+See `FROST_MOE_HANDOFF.md` for exact shapes, source and validation scope.

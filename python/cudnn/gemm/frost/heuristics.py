@@ -94,6 +94,10 @@ def recommend(kind: str, facts: GemmFacts, offered: Dict[str, int]) -> List[Plan
         try:
             device_params()
             proposals.append(PlanConfig(paired_id, pair_knobs()))
+            # Preserve the historical M128 default; enumerate the independently
+            # validated M64 choice only over its declared row envelope.
+            if facts.pair.rows > 8:
+                proposals.append(PlanConfig(paired_id, pair_knobs(64)))
         except (NotImplementedError, ValueError, KeyError) as exc:
             _LOG.debug("paired MoE proposes nothing (%s): %s", kind, exc)
     fc2_id = offered.get("frost_moe_fc2_pair")

@@ -21,10 +21,12 @@ ENGINE = "frost_moe_swiglu_pair"
 CONFIG = "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"
 
 
-def pair_knobs():
+def pair_knobs(tile_m=128):
     # M counts the physical gate+up projection rows before SwiGLU; one CTA
-    # produces 64 output features for up to eight routed tokens.
-    return replace(GemmKnobs.from_config(by_name(CONFIG)), moe_sched_policy=1)
+    # produces tile_m // 2 output features for up to eight routed tokens.
+    if type(tile_m) is not int or tile_m not in (64, 128):
+        raise ValueError("paired FC1 physical MMA-M must be64 or128")
+    return replace(GemmKnobs.from_config(by_name(CONFIG)), cta_tile_m=tile_m, mma_tile_m=tile_m, moe_sched_policy=1)
 
 
 @dataclass(frozen=True)
@@ -139,7 +141,7 @@ def device_params():
 class PairedCompiled:
     """Framework-neutral callable consumed by the existing Frost graph plan."""
 
-    def __init__(self, spec, params):
+    def __init__(self, spec, params, *, tile_m=128):
         from cudnn.frost.template_loader import load_template
 
         # A declaration with at most eight routed rows has one token tile per
@@ -148,9 +150,11 @@ class PairedCompiled:
         params = replace(params, small_rows=spec.rows <= 8, weight_layout=getattr(spec, "weight_layout", None))
         self.spec = spec
         self.binding = spec.binding
+        self.tile_m = tile_m
         self.workspace_bytes = (params.grid_ctas * 2 + 1) * 128
-        path = Path(__file__).resolve().parent / "sm100/kernel_templates/sm100_moe_swiglu_pair.py"
-        self.module = load_template(str(path), params, tag="moe_swiglu_pair")
+        template = "sm100_moe_swiglu_pair_m64.py" if tile_m == 64 else "sm100_moe_swiglu_pair.py"
+        path = Path(__file__).resolve().parent / "sm100/kernel_templates" / template
+        self.module = load_template(str(path), params, tag="moe_swiglu_pair_m64" if tile_m == 64 else "moe_swiglu_pair")
         self.kernel = self.module.compile()  # all compilation belongs to build
 
     def __call__(self, pack, workspace, *, stream):
@@ -181,8 +185,15 @@ def build_pair(graph, knobs):
     from .compiler import _graph_dynamic_shapes
 
     spec = analyze_pair(graph, dynamic_shapes=_graph_dynamic_shapes(graph))
-    expected = pair_knobs()
-    if knobs is not None and knobs != expected:
-        raise NotImplementedError("paired MoE currently supports only its exact M128N8 static configuration")
+    knobs = pair_knobs() if knobs is None else knobs
+    if knobs not in (pair_knobs(), pair_knobs(64)):
+        raise NotImplementedError("paired MoE requires its exact M128N8 or M64N8 static configuration")
+    tile_m = knobs.cta_tile_m
+    if tile_m == 64 and spec.rows <= 8:
+        raise NotImplementedError("paired M64 currently requires9..513 routed rows")
     params = device_params()
-    return PairedCompiled(spec, params)
+    # The validated M64 plan uses two resident CTAs per SM. The native
+    # workspace contract follows this grid; never retain an M128-size buffer.
+    if tile_m == 64:
+        params = replace(params, grid_ctas=params.grid_ctas * 2)
+    return PairedCompiled(spec, params, tile_m=tile_m)

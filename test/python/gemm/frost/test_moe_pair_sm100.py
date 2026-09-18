@@ -18,6 +18,7 @@ pytestmark = [
 
 cases = [
     dict(name="expert257", experts=257, rows=8, k=64, n=64, sizes=[1] * 7 + [0] * 249 + [1], pitched=True),
+    dict(name="expert257_r9", experts=257, rows=9, k=64, n=64, sizes=[1] * 8 + [0] * 248 + [1], pitched=True),
     # Exercise token-tile boundaries and multiple token tiles per expert.
     dict(name="nine_rows", experts=4, rows=9, k=128, n=64, sizes=[4, 0, 5, 0], pitched=False),
     dict(name="seventeen_rows", experts=4, rows=17, k=128, n=128, sizes=[0, 17, 0, 0], pitched=True),
@@ -36,9 +37,17 @@ cases = [
 ]
 
 
-@pytest.mark.parametrize("spec", cases, ids=[case["name"] for case in cases])
-@pytest.mark.parametrize("weight_layout", [None, "k_blocked_64_v1"], ids=["canonical", "k64"])
-def test_paired_moe_native_graph_and_live_captures(spec, tmp_path, weight_layout):
+@pytest.mark.parametrize(
+    "spec,weight_layout,tile_m",
+    [
+        pytest.param(spec, layout, tile, id=f"{spec['name']}_{layout or 'canonical'}_m{tile}")
+        for spec in cases
+        for layout in (None, "k_blocked_64_v1")
+        for tile in (128, 64)
+        if tile == 128 or spec["rows"] > 8
+    ],
+)
+def test_paired_moe_native_graph_and_live_captures(spec, tmp_path, weight_layout, tile_m):
     import cudnn
     from cudnn.frost import buffers
 
@@ -58,7 +67,7 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path, weight_layout
     assert torch.cuda.get_device_capability() == (10, 0)
     generator = torch.Generator().manual_seed(1810)
     bf16, fp32 = cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT
-    knobs = pair_knobs()
+    knobs = pair_knobs(tile_m)
 
     def forbidden_empty(*args, **kwargs):
         raise AssertionError("execute allocated torch.empty")
@@ -100,9 +109,15 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path, weight_layout
             (params,) = checked(drv.cuGraphKernelNodeGetParams(node))
             (name,) = checked(drv.cuFuncGetName(params.func))
             names.append(name.decode())
+            grid = [int(params.gridDimX), int(params.gridDimY), int(params.gridDimZ)]
+            block = [int(params.blockDimX), int(params.blockDimY), int(params.blockDimZ)]
+            assert grid == [torch.cuda.get_device_properties(0).multi_processor_count * (2 if tile_m == 64 else 1), 1, 1]
+            assert block == [256, 1, 1]
+            result.setdefault("launches", []).append(dict(name=name.decode(), grid=grid, block=block))
         assert all("cudnn" in name and "frost_sm100_moe_swiglu_pair" in name and "sched_static" in name for name in names)
         assert all(("small_row_sched" in name) == (spec["rows"] <= 8) for name in names)
         assert all(("kblock64" in name) == (weight_layout is not None) for name in names)
+        assert all(("_m64n8k16_" in name) == (tile_m == 64) for name in names)
         return names
 
     def reference(x, w, offsets):
@@ -186,10 +201,11 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path, weight_layout
         g.build_plan_at_index(0)
     assert loads.call_count == 1
     template_path, template_params = loads.call_args.args[:2]
-    assert Path(template_path).resolve() == root / "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_swiglu_pair.py"
+    template = "sm100_moe_swiglu_pair_m64.py" if tile_m == 64 else "sm100_moe_swiglu_pair.py"
+    assert Path(template_path).resolve() == root / "python/cudnn/gemm/frost/sm100/kernel_templates" / template
     assert template_params.small_rows == (r <= 8)
     assert template_params.weight_layout == weight_layout
-    assert template_params.grid_ctas == torch.cuda.get_device_properties(0).multi_processor_count
+    assert template_params.grid_ctas == torch.cuda.get_device_properties(0).multi_processor_count * (2 if tile_m == 64 else 1)
     result.setdefault("templates", []).append(dict(path=template_path, sha256=sha(template_path), params=repr(template_params)))
     engine, actual_knobs = g.get_engine_and_knobs_at_index(0)
     assert int(engine) == 20401 and actual_knobs == knobs.to_public()
@@ -203,6 +219,7 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path, weight_layout
         engine=int(engine),
         small_rows=template_params.small_rows,
         weight_layout=weight_layout,
+        tile_m=tile_m,
         workspace_bytes=workspace_bytes,
         parent_ptrs=[w.data_ptr() for w in weights],
         checks=[],

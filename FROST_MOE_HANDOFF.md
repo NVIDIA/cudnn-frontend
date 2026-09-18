@@ -1,3 +1,65 @@
+## Optional M64 paired FC1: native integration and full FI benefit
+
+The SM100 paired SwiGLU engine now exposes physical `TILE_M=64` and
+`MMA_TILE_M=64` together through the existing public knob vocabulary.
+M128 remains the default and first enumerated choice. M64 supports9–513
+routed rows with canonical or explicit K64 weights, uses32 output features
+per CTA, a grid of2*SM-count and a16x256b TMEM drain. Its queried workspace
+and compiled-template identity match that grid. The separate M64 template
+preserves the original M128 template unchanged. The generic M64 small-row
+path regressed in the component test and remains excluded for1–8 rows.
+
+Matched full FlashInfer MoE,148-SM B2001000W, BF16 E128/top8/H2048/I768,
+K64 FC1 weights and paired12-stage FC2 held fixed; only the FC1 tile changes:
+
+| Tokens | Routing | M128 + K64 | M64 + K64 | Latency reduction |
+|---:|---|---:|---:|---:|
+| 8 | unpacked | 101.252375 us | 99.920375 us | 1.316% |
+| 8 | packed | 101.361625 us | 99.809250 us | 1.532% |
+| 64 | unpacked | 204.067000 us | 201.486750 us | 1.264% |
+| 64 | packed | 203.940000 us | 201.504000 us | 1.194% |
+
+Job4387532: normal/memcheck/racecheck, live X/IDs/scales/FC1/FC2 weights,
+retained/legacy CUDA Graphs, exact CPU/GPU preparation bytes and cross-arm
+output bytes, actual grid/block/workspace, and fresh ABBA processes pass.
+Independent audit2326 reconstructs592 raw checks,240 changed-reference
+controls and1536 timing spans. The original CPU auditor confused TILEK6
+with MMA_TILE_M1004; audit repair2325 changes only the expected public axes
+to TILE_M26/MMA_TILE_M1004. The original failure and all raw GPU data remain
+preserved; no numerical or sanitizer requirement changed and no GPU rerun
+was used to replace an unfavorable result.
+
+Native graph job4387183/audit2302 passes345 zero-skip executions
+(42graph+73CPU tests in each normal/mem/race mode),1260 raw checks,
+378 changed-reference controls and252 captured routes. Canonical/K64,
+E257, R9..513 boundaries, pitched weights, live bindings and retained
+captures are covered. Execution remains allocation/JIT/synchronization-free.
+Eight new M64 declarations are rejected by the old source before device
+probing. Changed-file hooks pass; full repository CI remains unclaimed.
+
+Credit: Kernel Factory round2 candidate14306536 supplied the adopted M64
+geometry, TMEM drain and explicit AB counters. The original Frost scheduler
+is retained because the KF scheduler variant failed independent racecheck
+with126errors. No rejected scheduler code is adopted. Existing NVIDIA Frost,
+KF624/2f5c/f19299, Yanqin Zhai PR1090, Yanqin/Yihua and CUTLASS113 credits remain.
+
+All timings are synthetic complete-operator measurements, not model E2E.
+PDL overlaps stages: the changed FC2 duration reflects changed scheduling
+overlap and is not a separate FC2 kernel optimization. Gains across different
+snapshots must not be compounded. No fresh M64-versus-TRT result exists yet.
+The known paired-FC2 cancellation limitation remains unresolved.
+
+Fresh published M128+K64 versus strongest TRT, separately matched atT8
+unpacked on B2001000W (job4387103/audit2297):101.1090625us versus96.45725us,
+Frost4.8227% slower after all704 native FC1/FC2/PDL choices; winnerPDLon8/89.
+All winner sanitizer and four freshABBA checks pass. Both preparations are
+excluded; TRT uses interleave/row-shuffle/BlockMajorK128B preparation.
+Same-run CUPTI timeline2310 finds FC1 approximately equal (~66.6us); most
+remaining delay is after FC1 until FC2 finishes, with a smaller finalizer tail.
+This is a timeline observation including PDL waits, not isolated compute cost.
+Future work targets FC2; the new K64 FC2 result is still component-only and
+is not included in this public M64 integration.
+
 ## Explicit K64 FC1 layout through FE and FlashInfer — 2026-09-18
 
 Paired SM100 SwiGLU FC1 now accepts `weight_layout="k_blocked_64_v1"`.
