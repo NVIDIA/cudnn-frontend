@@ -200,6 +200,18 @@ def test_dense(dt):
     _run(dt=dt)
 
 
+def test_d512_backward_runs_on_frost_without_the_opt_in_flag(monkeypatch):
+    """d = 512 backward is a graph the cuDNN backend proposes no plan for. The
+    opt-in gate withholds an optimization, never an operation: with the flag
+    unset this engine is admitted at planning time, is the whole plan list, and
+    the graph runs on it (numerics checked by _run)."""
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    g, _, _ = _build_graph(2, 2, 2, 512, 512, _D, 1.0 / math.sqrt(_D))
+    names = [g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]
+    assert names and all(n.startswith(_ENGINE) for n in names), names
+    _run()
+
+
 @pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
 def test_causal_dtypes(dt):
     """Both dtypes through the masked path too: the causal chain reads the

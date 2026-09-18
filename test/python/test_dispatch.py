@@ -349,13 +349,14 @@ def _ranking(monkeypatch, fn):
     monkeypatch.setattr(heuristics, "rank", fn)
 
 
-def _offer(monkeypatch, *engines, node_type="MATMUL", analyzer=None, heuristics=None, name="fake_family"):
+def _offer(monkeypatch, *engines, node_type="MATMUL", analyzer=None, heuristics=None, name="fake_family", opt_in=False):
     """Make ``engines`` the manifest's answer for graphs anchored at ``node_type``.
 
     What register_backend() used to do, through the path production uses: the
     manifest is the only way a python engine exists, so a test engine is offered
     by putting it in one. The fakes share a block at _FAKE so their ids stay out
-    of every shipped family's.
+    of every shipped family's. ``opt_in`` marks every slot as maturing (offered
+    only with the flag, or once the backend has nothing for the graph).
     """
     from cudnn.engines import manifest
 
@@ -364,7 +365,7 @@ def _offer(monkeypatch, *engines, node_type="MATMUL", analyzer=None, heuristics=
         name,
         __name__,
         "unused_factory",
-        slots={e.name: manifest.EngineSlot(e.engine_id - _FAKE) for e in engines},
+        slots={e.name: manifest.EngineSlot(e.engine_id - _FAKE, opt_in=opt_in) for e in engines},
         analyzer=analyzer,
         heuristics=heuristics,
     )
@@ -1460,6 +1461,78 @@ def test_frost_opt_in_does_not_leak_out_of_the_frost_suites():
     from cudnn.engines import manifest
 
     assert not manifest.opt_in_engines_enabled(), "CUDNN_FRONTEND_ENABLE_FROST_ENGINES leaked into the default-path tests"
+
+
+def test_opt_in_engine_is_admitted_when_the_backend_proposes_no_plan(monkeypatch):
+    """The gate withholds an optimization, never an operation: with the flag
+    unset, a graph the backend proposes NO plan for is still served by the
+    family's opt-in engine, which is admitted at planning time."""
+    from cudnn.engines import manifest
+
+    monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
+    stub = _offer(monkeypatch, StubEngine(), opt_in=True)
+    monkeypatch.setattr(pygraph, "backend_plan_entries", lambda self: [])
+    g = pygraph()
+    C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g.create_execution_plans()
+    assert _plan_names(g) == ["stub"], _plan_names(g)
+    g.build_plans()
+    assert g.selected_engine is stub
+    out = torch.empty(2, 2)
+    g.execute({C: out})
+    assert _marked(out)
+
+
+def test_opt_in_engine_stays_withheld_when_the_backend_serves_the_graph(monkeypatch):
+    """Unchanged default: when the backend proposes a plan, the opt-in engine is
+    not a candidate without the flag -- it is absent from the list, not ranked
+    behind the backend."""
+    from cudnn.engines import PlanConfig, manifest
+
+    monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
+    _offer(monkeypatch, StubEngine(), opt_in=True)
+    monkeypatch.setattr(pygraph, "backend_plan_entries", lambda self: [PlanConfig(0, {}, cpp_index=0)])
+    g = pygraph()
+    g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g._lowered_graph = _FakeBackend()
+    g._cpp_plans_created = g._cpp_bog_done = True
+    g.create_execution_plans()
+    assert "stub" not in _plan_names(g), _plan_names(g)
+    g.build_plans()
+    assert g.selected_engine is None  # the backend path
+
+
+def test_opt_in_engine_is_admitted_when_every_backend_plan_declines_at_build(monkeypatch):
+    """The backend proposed a plan but finalizing it declines: the walk appends
+    the opt-in engine's proposals to the list and builds them, instead of
+    reporting that no plan could be built."""
+    import cudnn
+    from cudnn.engines import PlanConfig, manifest
+
+    monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
+    stub = _offer(monkeypatch, StubEngine(), opt_in=True)
+    monkeypatch.setattr(pygraph, "backend_plan_entries", lambda self: [PlanConfig(0, {}, cpp_index=0)])
+    g = pygraph()
+    C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g._lowered_graph = _FakeBackend(build=cudnn.cudnnGraphNotSupportedError("backend build declined"))
+    g._cpp_plans_created = g._cpp_bog_done = True
+    g.create_execution_plans()
+    assert "stub" not in _plan_names(g)
+    g.build_plans()
+    assert g.selected_engine is stub
+    assert _plan_names(g)[-1] == "stub", _plan_names(g)  # appended after the backend's entries
+    out = torch.empty(2, 2)
+    g.execute({C: out})
+    assert _marked(out)
+    # an explicit pin on the declining backend entry stays strict: no silent fallback
+    g2 = pygraph()
+    g2.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g2._lowered_graph = _FakeBackend(build=cudnn.cudnnGraphNotSupportedError("backend build declined"))
+    g2._cpp_plans_created = g2._cpp_bog_done = True
+    g2.create_execution_plans()
+    g2.select_plan(0)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+        g2.build_plans()
 
 
 def test_at_index_queries_answer_from_the_unified_list(monkeypatch):

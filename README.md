@@ -186,7 +186,9 @@ Alternatively, you can control logging programmatically via `cudnn_frontend::isL
 
 The open-source engines are opt-in while they mature: set the flag below and they become candidates
 for every graph they can serve, ranked against the cuDNN backend's own engines in one list. Engines
-that are the only implementation of their operation (GDN/KDA) need no flag.
+that are the only implementation of their operation (GDN/KDA) need no flag, and neither does a graph
+the cuDNN backend proposes no plan for or declines at build time: the flag withholds an optimization,
+never an operation, so such a graph runs on the open-source engine that serves it.
 
 ```bash
 # Offer the maturing open-source engines (FROST GEMM / SDPA) as plan candidates.
