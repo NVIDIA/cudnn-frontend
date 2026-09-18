@@ -186,3 +186,36 @@ def test_paired_graph_eligibility_and_native_metadata():
     assert tuple(args_[4].shape) == (128, 128, 4)
     assert tuple(args_[1].shape) == (4,) and int(kwargs["stream"]) == 17
     checks.append(dict(name="native_execute_metadata_uses_live_parent_and_caller_workspace"))
+
+
+def test_small_row_plan_selection_and_template_cache(monkeypatch, tmp_path):
+    """The R8/R9 boundary selects distinct artifacts without querying live data."""
+    from types import SimpleNamespace
+    from pathlib import Path
+    from cudnn.frost import template_loader
+    from cudnn.gemm.frost.moe_pair import KernelParams, PairedCompiled
+
+    # Use the real module/cache loader with a CPU-only stand-in for compilation.
+    template = tmp_path / "plan_cache_probe.py"
+    template.write_text("small_rows = FROST_TEMPLATE_PARAMS.small_rows\ndef compile(): return object()\n")
+    original_loader = template_loader.load_template
+    selected = []
+
+    def load(path, params, *, tag):
+        assert Path(path).name == "sm100_moe_swiglu_pair.py"
+        selected.append(params)
+        return original_loader(str(template), params, tag=tag)
+
+    monkeypatch.setattr(template_loader, "load_template", load)
+    base = KernelParams(148, 44214954, "helpers")
+    plans = [PairedCompiled(SimpleNamespace(rows=r, binding=object()), base) for r in (8, 9, 1, 513, 8)]
+    assert [p.small_rows for p in selected] == [True, False, True, False, True]
+    assert base.small_rows is False  # The shared FC2 device params remain generic.
+    assert plans[0].module is plans[2].module is plans[4].module
+    assert plans[1].module is plans[3].module
+    assert plans[0].module is not plans[1].module
+    assert plans[0].module.FROST_SOURCE_DIGEST != plans[1].module.FROST_SOURCE_DIGEST
+    assert all(p.workspace_bytes == 38016 for p in plans)
+    # A reused incoming parameter object cannot impose an invalid specialization.
+    plan = PairedCompiled(SimpleNamespace(rows=9, binding=object()), replace(base, small_rows=True))
+    assert selected[-1].small_rows is False and plan.module is plans[1].module

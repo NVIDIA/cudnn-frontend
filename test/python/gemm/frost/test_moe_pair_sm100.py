@@ -17,6 +17,7 @@ pytestmark = [
 ]
 
 cases = [
+    dict(name="expert257", experts=257, rows=8, k=64, n=64, sizes=[1] * 7 + [0] * 249 + [1], pitched=True),
     # Exercise token-tile boundaries and multiple token tiles per expert.
     dict(name="nine_rows", experts=4, rows=9, k=128, n=64, sizes=[4, 0, 5, 0], pitched=False),
     dict(name="seventeen_rows", experts=4, rows=17, k=128, n=128, sizes=[0, 17, 0, 0], pitched=True),
@@ -99,6 +100,7 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
             (name,) = checked(drv.cuFuncGetName(params.func))
             names.append(name.decode())
         assert all("cudnn" in name and "frost_sm100_moe_swiglu_pair" in name and "sched_static" in name for name in names)
+        assert all(("small_row_sched" in name) == (spec["rows"] <= 8) for name in names)
         return names
 
     def reference(x, w, offsets):
@@ -172,6 +174,7 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
     assert loads.call_count == 1
     template_path, template_params = loads.call_args.args[:2]
     assert Path(template_path).resolve() == root / "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_swiglu_pair.py"
+    assert template_params.small_rows == (r <= 8)
     assert template_params.grid_ctas == torch.cuda.get_device_properties(0).multi_processor_count
     result.setdefault("templates", []).append(dict(path=template_path, sha256=sha(template_path), params=repr(template_params)))
     engine, actual_knobs = g.get_engine_and_knobs_at_index(0)
@@ -184,6 +187,7 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
         **spec,
         parent_stride=stride,
         engine=int(engine),
+        small_rows=template_params.small_rows,
         workspace_bytes=workspace_bytes,
         parent_ptrs=[w.data_ptr() for w in weights],
         checks=[],

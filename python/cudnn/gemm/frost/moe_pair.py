@@ -104,6 +104,7 @@ class KernelParams:
     grid_ctas: int
     l2_budget_bytes: int
     helper_digest: str
+    small_rows: bool = False
 
 
 def device_params():
@@ -130,6 +131,10 @@ class PairedCompiled:
     def __init__(self, spec, params):
         from cudnn.frost.template_loader import load_template
 
+        # A declaration with at most eight routed rows has one token tile per
+        # nonempty expert. Select at plan time, never from live device offsets.
+        # Frozen params distinguish both template and persistent compile caches.
+        params = replace(params, small_rows=spec.rows <= 8)
         self.spec = spec
         self.binding = spec.binding
         self.workspace_bytes = (params.grid_ctas * 2 + 1) * 128

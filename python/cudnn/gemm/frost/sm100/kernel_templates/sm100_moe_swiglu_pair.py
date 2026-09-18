@@ -8,7 +8,7 @@ NVIDIA/cudnn-frontend PR1090 weight-M/token-N orientation; NVIDIA CUTLASS
 example113 layout; canonical rank5 pairing guidance and TRT-LLM gated-row
 interleaving motivation. No TRT-LLM kernel body is reused.
 
-The gate enforces R<=8, N divisible by64 and canonical [gate,up] parent
+The gate enforces R<=513, N divisible by64 and canonical [gate,up] parent
 storage. The retained generated scaffold is intentionally not refactored while
 establishing graph/API parity with the independently audited kernel.
 
@@ -59,6 +59,10 @@ from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as _cuda
 
 # A TMA tensormap is 128 bytes = 16 int64 qwords.
+# KF candidate f19299: only R<=8 permits one token tile per live expert.
+# The generic branch retains persistent scheduling for larger declarations.
+moe_small_rows = FROST_TEMPLATE_PARAMS.small_rows
+
 moe_static_sched = False  # Public SCHED_POLICY: 0 dynamic (default), 1 static.
 moe_absolute_a = False  # Set before injection so the rendered eligibility gate wins.
 moe_wide_mma = False  # Shared-A pair packed into one doubled-N instruction.
@@ -591,7 +595,11 @@ def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_res
                             my_end = cutlass.Int32(first_token_arr[my_group + 1])
                         else:
                             my_end = gemm_s
-                        my_tiles = cute.ceil_div(my_end - my_begin, cgrp_tile_mnk[0]) * clusters_along_n
+                        if cutlass.const_expr(moe_small_rows):
+                            if my_end != my_begin:
+                                my_tiles = clusters_along_n
+                        else:
+                            my_tiles = cute.ceil_div(my_end - my_begin, cgrp_tile_mnk[0]) * clusters_along_n
                     prefix_tiles = my_tiles
                     for delta in (1, 2, 4, 8, 16):
                         prefix_delta = nvvm.shfl_sync(
@@ -632,17 +640,21 @@ def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_res
                             is_search_live = cutlass.Int32(0)
 
             coord_expert = cutlass.Int32(0)
-            cluster_tile_m = cutlass.Int32(0)
+            if cutlass.const_expr(not moe_small_rows):
+                cluster_tile_m = cutlass.Int32(0)
             coord_n = cutlass.Int32(0)
             if is_tile_valid != 0:
                 local_linear_idx = linear_idx - start_linear_idx
-                group_nt_m = total_tiles // clusters_along_n
-                cluster_tile_m, coord_n = _moe_swizzle_tile(
-                    local_linear_idx,
-                    group_nt_m,
-                    clusters_along_n,
-                    _moe_auto_swizzle_w(group_nt_m * cgrp_tile_mnk[0], N, k, clusters_along_n),
-                )
+                if cutlass.const_expr(moe_small_rows):
+                    coord_n = local_linear_idx
+                else:
+                    group_nt_m = total_tiles // clusters_along_n
+                    cluster_tile_m, coord_n = _moe_swizzle_tile(
+                        local_linear_idx,
+                        group_nt_m,
+                        clusters_along_n,
+                        _moe_auto_swizzle_w(group_nt_m * cgrp_tile_mnk[0], N, k, clusters_along_n),
+                    )
                 coord_expert = group_idx % num_experts
 
             while not nvvm.mbarrier_try_wait_parity(
@@ -654,12 +666,14 @@ def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_res
             if lane == 0:
                 slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
                 (slot.subview(0)).store(coord_expert)
-                (slot.subview(1)).store(cluster_tile_m)
+                if cutlass.const_expr(not moe_small_rows):
+                    (slot.subview(1)).store(cluster_tile_m)
                 (slot.subview(2)).store(coord_n)
                 (slot.subview(3)).store(is_tile_valid)
                 (slot.subview(4)).store(group_begin)
                 (slot.subview(5)).store(group_end)
-                (slot.subview(7)).store(group_idx)
+                if cutlass.const_expr(not moe_small_rows):
+                    (slot.subview(7)).store(group_idx)
                 nvvm.mbarrier_arrive(sched_full_mbar_ptr.subview(sched_stage))
 
             if cutlass.const_expr(moe_static_sched):
@@ -726,7 +740,8 @@ def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_res
                 pass
             slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
             coord_expert = _moe_load_sched_word((slot.subview(0)))
-            tile_m = _moe_load_sched_word((slot.subview(1)))
+            if cutlass.const_expr(not moe_small_rows):
+                tile_m = _moe_load_sched_word((slot.subview(1)))
             tile_n = _moe_load_sched_word((slot.subview(2)))
             is_valid = _moe_load_sched_word((slot.subview(3)))
             group_begin = _moe_load_sched_word((slot.subview(4)))
@@ -741,7 +756,10 @@ def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_res
                 sched_full_phase = sched_full_phase ^ 1
 
             if is_valid != 0:
-                coord_m_group = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
+                if cutlass.const_expr(moe_small_rows):
+                    coord_m_group = m_rank * cta_tile_mnk[0]
+                else:
+                    coord_m_group = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
                 if cutlass.const_expr(moe_aligned_offsets or moe_absolute_a):
                     coord_m_desc = group_begin + coord_m_group
                 else:
@@ -1269,12 +1287,14 @@ def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_res
         while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
             pass
         _slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-        tile_m = _moe_load_sched_word((_slot.subview(1)))
+        if cutlass.const_expr(not moe_small_rows):
+            tile_m = _moe_load_sched_word((_slot.subview(1)))
         tile_n = _moe_load_sched_word((_slot.subview(2)))
         is_valid = _moe_load_sched_word((_slot.subview(3)))
         group_begin = _moe_load_sched_word((_slot.subview(4)))
         group_end = _moe_load_sched_word((_slot.subview(5)))
-        group_idx = _moe_load_sched_word((_slot.subview(7)))
+        if cutlass.const_expr(not moe_small_rows):
+            group_idx = _moe_load_sched_word((_slot.subview(7)))
         # Converge consumers before releasing their scheduler slot.
         nvvm.bar_warp_sync(0xFFFFFFFF)
         sched_stage = cute.arch.make_warp_uniform(sched_stage)
@@ -1286,7 +1306,10 @@ def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_res
             sched_full_phase = sched_full_phase ^ 1
 
         while is_valid != 0:
-            coord_m_tile = group_begin + tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
+            if cutlass.const_expr(moe_small_rows):
+                coord_m_tile = group_begin + m_rank * cta_tile_mnk[0]
+            else:
+                coord_m_tile = group_begin + tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
             # @@EPILOGUE_DRAIN:BEGIN@@
             coord_n_c = tile_n * cgrp_tile_mnk[1] + n_rank * (cta_tile_mnk[1] * cta_group)
             acc_stage = tile_iter % acc_stages
@@ -1334,12 +1357,14 @@ def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_res
             ):
                 pass
             _slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
-            tile_m = _moe_load_sched_word((_slot.subview(1)))
+            if cutlass.const_expr(not moe_small_rows):
+                tile_m = _moe_load_sched_word((_slot.subview(1)))
             tile_n = _moe_load_sched_word((_slot.subview(2)))
             is_valid = _moe_load_sched_word((_slot.subview(3)))
             group_begin = _moe_load_sched_word((_slot.subview(4)))
             group_end = _moe_load_sched_word((_slot.subview(5)))
-            group_idx = _moe_load_sched_word((_slot.subview(7)))
+            if cutlass.const_expr(not moe_small_rows):
+                group_idx = _moe_load_sched_word((_slot.subview(7)))
             # Converge consumers before releasing their scheduler slot.
             nvvm.bar_warp_sync(0xFFFFFFFF)
             sched_stage = cute.arch.make_warp_uniform(sched_stage)
@@ -1357,7 +1382,9 @@ def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_res
         nvvm.barrier_cluster_wait()
 
 
-frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_resources.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_resources.set_name_prefix(
+    "cudnn_small_row_sched" if moe_small_rows else "cudnn", remove_cutlass_symbol=True
+)
 
 
 @cute.jit
