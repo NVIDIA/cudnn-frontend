@@ -274,8 +274,12 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: paged_kv is not implemented on this flavor; supported: {sorted(_PAGED_KV_FLAVORS)}")
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
-        if fp8:
-            raise ValueError(f"{flavor}: paged_kv is wired for the f16/bf16 kernel only")
+        # dtype_qkv alone cannot tell per-tensor FP8 (d128 wired) from MXFP8
+        # (block-scale SF atoms bundle 128 rows of one head; not pageable), so
+        # the dtype family is NOT gated here: every kernel file WITHOUT the
+        # PAGED_KV specialization raises at module scope on paged_kv=True
+        # (next to its softmax_f16 guard), which is the backstop that cannot
+        # silently read a page pool as dense K/V.
         # A K/V tile is loaded as a stack of page-sized row boxes (or one box
         # inside a page when the page is taller than the tile). Either way a
         # box must never straddle a page, and the 128 B swizzle atom is 8 rows.

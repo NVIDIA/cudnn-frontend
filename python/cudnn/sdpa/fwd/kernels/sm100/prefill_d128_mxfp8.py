@@ -47,6 +47,10 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d128(PARAMS)
+if PARAMS.paged_kv:
+    raise ValueError(
+        "prefill_d128_mxfp8_sm100: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"
+    )
 if PARAMS.softmax_f16:
     raise ValueError("prefill_d128_mxfp8_sm100: softmax_f16 is per-tensor-FP8-on-SM107 only (softmax_precision knob domain)")
 Cfg = type(CFG)

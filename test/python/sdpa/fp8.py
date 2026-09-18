@@ -658,7 +658,20 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=N
     return fits
 
 
-def create_paged_container_and_block_table(tensor, block_size):
+def create_paged_container_and_block_table(tensor, block_size, seq_lens=None):
+    """Page a dense [B, H, S, D] tensor: container [B*blocks, H, block_size, D] (page p of
+    batch b at pool index p*B + b) + a row-major (B, 1, blocks, 1) int32 table.
+
+    ``seq_lens`` (per-batch lengths, the padding-mask values bound alongside) is OPT-IN
+    poison: when given, every page at or past ``ceil(seq_lens[b] / block_size)`` -- a page
+    no length reaches -- is NaN-filled, so an engine that dereferences a dead table slot
+    poisons its O through 0 * NaN and fails the compare. Only engines that promise to
+    skip dead slots may be tested this way: the FROST paged kernels issue a TMA-OOB page
+    -1 there, while the backend engine loads whole tile-rounded page ranges through the
+    table and masks the scores, so it needs finite data in every table slot (its default
+    ``exec_sdpa_fp8`` path passes ``seq_lens=None``; see ``ExecConfig.paged_nan_dead_pages``).
+    Rows INSIDE the last live page but past the length keep their finite data either way:
+    the paged-attention contract lets a kernel load and mask them."""
     B, H, S, D = tensor.shape
     blocks_per_batch = math.ceil(S / block_size)
 
@@ -670,6 +683,11 @@ def create_paged_container_and_block_table(tensor, block_size):
         cat_tensor = tensor
 
     container = torch.cat(cat_tensor.chunk(blocks_per_batch, dim=2), dim=0)
+    if seq_lens is not None:
+        for b, length in enumerate(seq_lens):
+            live_pages = math.ceil(int(length) / block_size)
+            for p in range(live_pages, blocks_per_batch):
+                container[p * B + b] = float("nan")
 
     table_size = math.ceil(S / block_size)
     block_table_temp = torch.linspace(0, B * table_size - 1, B * table_size, device="cuda", dtype=torch.int32).reshape(table_size, 1, B, 1)
@@ -806,10 +824,20 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if with_sink_token:
         sink_token_gpu = torch.randn((1, h_q, 1, 1), dtype=torch.float, device="cuda", generator=rng_data) * 0.5
 
+    # Paged: the per-batch lengths the padding mask binds. A "padded" config draws them
+    # (partial last pages, zero-length sequences, dead pages past each length); a full
+    # config binds every batch at its maximum, as before.
+    paged_seq_len_q = list(seq_len_q_list) if (is_paged and seq_len_q_list) else [s_qo] * b
+    paged_seq_len_kv = list(seq_len_kv_list) if (is_paged and seq_len_kv_list) else [s_kv] * b
+
     # Compute forward reference (also computes o_amax internally)
     if is_ragged:
         seq_len_q_ref = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda")
         seq_len_kv_ref = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda")
+        padding = (seq_len_q_ref, seq_len_kv_ref)
+    elif is_paged:
+        seq_len_q_ref = torch.tensor(paged_seq_len_q, dtype=torch.int32, device="cuda")
+        seq_len_kv_ref = torch.tensor(paged_seq_len_kv, dtype=torch.int32, device="cuda")
         padding = (seq_len_q_ref, seq_len_kv_ref)
     else:
         padding = None
@@ -843,8 +871,12 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_paged:
         k_gpu_bhsd = torch.einsum('bshd->bhsd', k_fp8).contiguous()
         v_gpu_bhsd = torch.einsum('bshd->bhsd', v_fp8).contiguous()
-        container_k_gpu, k_block_table_gpu = create_paged_container_and_block_table(k_gpu_bhsd, block_size)
-        container_v_gpu, v_block_table_gpu = create_paged_container_and_block_table(v_gpu_bhsd, block_size)
+        # Dead-page NaN poison is opt-in (cfg.paged_nan_dead_pages): the FROST-pinned
+        # paged tests set it; the default path serves the backend engine, whose
+        # contract lets it read (and mask) every page the table names.
+        poison_lens = paged_seq_len_kv if getattr(cfg, "paged_nan_dead_pages", False) else None
+        container_k_gpu, k_block_table_gpu = create_paged_container_and_block_table(k_gpu_bhsd, block_size, seq_lens=poison_lens)
+        container_v_gpu, v_block_table_gpu = create_paged_container_and_block_table(v_gpu_bhsd, block_size, seq_lens=poison_lens)
 
     # Allocate forward output tensors
     if is_ragged:
@@ -874,8 +906,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_paged:
         variant_pack[int(GraphFwdUid.k)] = container_k_gpu
         variant_pack[int(GraphFwdUid.v)] = container_v_gpu
-        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.full((b,), s_kv, device="cuda", dtype=torch.int32)
-        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.full((b,), s_qo, device="cuda", dtype=torch.int32)
+        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(paged_seq_len_kv, device="cuda", dtype=torch.int32)
+        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(paged_seq_len_q, device="cuda", dtype=torch.int32)
         variant_pack[int(GraphFwdUid.k_block_table)] = k_block_table_gpu
         variant_pack[int(GraphFwdUid.v_block_table)] = v_block_table_gpu
 
@@ -917,6 +949,13 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
             t_idx = sum(seq_len_q_list)
             o_gpu_float[t_idx:] = 0
             o_ref_float[t_idx:] = 0
+        elif is_paged:
+            # Padded (dead) query rows: the reference holds 0 there and the engines
+            # write O := 0 (the FROST dense padded-Q trim) or leave the buffer; compare
+            # the live rows only.  O is [b, s_qo, h_q, d_vo].
+            dead_q = torch.arange(s_qo, device="cuda")[None, :] >= seq_len_q_ref[:, None]
+            o_gpu_float[dead_q] = 0
+            o_ref_float[dead_q] = 0
 
         # E5M2 is less precise than E4M3, so its P quantization needs one wider step.
         atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2
