@@ -219,6 +219,7 @@ class pygraph:
         # Both are properties of the frozen graph, so they outlive any one call.
         self._sorted_uids: Optional[List[int]] = None
         self._declared_layout_native = None  # DeclaredLayout for _sorted_uids; see _declared_layout
+        self._slot_of_uid = None  # uid -> slot of that order, built with the layout
         self._selected_engine_cache = None  # (plan config, engine); see selected_engine
 
     # =========================================================================
@@ -2088,21 +2089,16 @@ class pygraph:
                     f"override_uids, override_shapes and override_strides must name the same tensors: got "
                     f"{len(override_uids)}, {len(override_shapes or ())} and {len(override_strides or ())} entries"
                 )
-            slot_of = {uid: i for i, uid in enumerate(order)}
-            for j, uid in enumerate(override_uids):
-                i = slot_of.get(uid)
-                if i is None:
-                    raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
-                # Overrides speak cuDNN element units; the slot speaks storage slots.
-                declared = self._tensor_by_uid.get(uid)
-                storage = storage_geometry(override_shapes[j], override_strides[j], declared.data_type if declared is not None else None)
-                if storage is None:
-                    raise ValueError(
-                        f"override_shapes for tensor uid {uid}: an fp4 tensor packs two elements per storage slot, so its "
-                        f"unit-stride extent must be even; got {tuple(override_shapes[j])} / {tuple(override_strides[j])}"
-                    )
-                dtype = (*_dlpack_code_bits(declared.data_type), _dlpack_lanes(declared.data_type)) if declared is not None else (0, 0, 1)
-                native.override_operand(i, *_in_axis_order_of(storage[0], storage[1], native.stride(i)), *dtype)
+            # One crossing for every override: the native side turns each element geometry into
+            # storage-slot geometry (fp4 packing), re-expresses it in the buffer's own axis order and
+            # applies it with the declared dtype (see VariantPackNative::override_many).
+            layout = self._declared_layout(order)
+            slot_of = self._slot_of_uid
+            try:
+                indices = [slot_of[uid] for uid in override_uids]
+            except KeyError as exc:
+                raise ValueError(f"override_uids names tensor uid {exc.args[0]}, which is not an operand of this graph") from None
+            native.override_many(layout, indices, [list(s) for s in override_shapes], [list(s) if s else [] for s in override_strides])
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
@@ -2128,12 +2124,14 @@ class pygraph:
         layout = self._declared_layout_native
         if layout is None:
             layout = _pybind_module.DeclaredLayout(len(order))
+            self._slot_of_uid = {uid: i for i, uid in enumerate(order)}
             for i, uid in enumerate(order):
                 declared = self._tensor_by_uid.get(uid)
-                if declared is None or not declared.dim:
+                if declared is None:
                     continue
-                storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
+                storage = storage_geometry(declared.dim, declared.stride, declared.data_type) if declared.dim else None
                 if storage is None:
+                    layout.set_dtype(i, *_dlpack_code_bits(declared.data_type), _dlpack_lanes(declared.data_type))  # overrides still speak its dtype
                     continue
                 layout.set(
                     i,
@@ -2334,6 +2332,7 @@ class pygraph:
         # this container held a different graph no longer describes it.
         self._sorted_uids = None
         self._declared_layout_native = None
+        self._slot_of_uid = None
 
     def _lower_to_cpp(self) -> Any:
         """Lower Python graph to C++ (the internal ``_pybind_module.backend_graph``)."""
