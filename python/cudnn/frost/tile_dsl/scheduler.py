@@ -102,8 +102,13 @@ def read_tile_id_arrive(mb, cga_size: int):
                 # lets the scheduler refill the very slot this warp decodes, so
                 # the payload loads must be ordered-before the arrive becomes
                 # visible.  A relaxed arrive imposes no such order and lets the
-                # refill race a still-in-flight decode.
-                nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CLUSTER)
+                # refill race a still-in-flight decode.  CTA scope is enough for
+                # that order (the loads are THIS thread's, the refill lands in
+                # THIS CTA's slot): `.release.cluster` made ptxas drain
+                # MEMBAR.ALL.GPU + ERRBAR + CGAERRBAR before every one of these
+                # arrives (23 per tile on the d512 kernel, -4.2 % measured on
+                # fractal 2026-09-18), `.release.cta` is a MEMBAR.ALL.CTA.
+                nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CTA)
 
 
 class Sched(NamedTuple):
@@ -257,7 +262,10 @@ def scheduler_warp_loop(sched, sched_stages: int, is_cga_first_cta, cga_size: in
                     arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
                 else:
                     peer_mb = nvvm.mapa(sched.mb_scheduler.subview(state.idx), cutlass.Int32(i))
-                    nvvm.mbarrier_arrive_expect_tx(peer_mb, 16, scope=nvvm.MemScope.CLUSTER)
+                    # The arm only has to be program-ordered before the multicast try_cancel issued below by the SAME
+                    # thread; a complete-tx that lands before the arm leaves the tx-count transiently negative, which
+                    # the mbarrier permits, so no cluster-scope release (= a GPU-scope drain) is needed here either.
+                    nvvm.mbarrier_arrive_expect_tx(peer_mb, 16, scope=nvvm.MemScope.CTA)
             nvvm.clusterlaunchcontrol_try_cancel(
                 sched.tile_id_smem.subview(state.idx * cutlass.Int32(8)),
                 sched.mb_scheduler.subview(state.idx),
