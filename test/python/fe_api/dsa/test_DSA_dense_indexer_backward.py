@@ -4,6 +4,9 @@
 import pytest
 import torch
 
+from cudnn.deepseek_sparse_attention.indexer_backward.dense_indexer_backward_sm100 import (
+    dense_indexer_backward_sm100,
+)
 from test_utils import torch_fork_set_rng
 
 from fe_api.dsa.dsa_utils import dsa_init, with_dsa_dense_indexer_backward_params
@@ -237,3 +240,56 @@ def test_DSA_dense_indexer_backward_cuda_graph():
             d_index_k,
             grad_scale=scale,
         )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(("queries", "keys"), [(1, 1), (17, 31), (32, 128), (33, 129), (32, 513)])
+def test_DSA_dense_indexer_backward_staging_sync(queries: int, keys: int, head_dim: int) -> None:
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Dense indexer SM100 staging test requires Blackwell+")
+
+    query = torch.ones(queries, 64, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.ones(keys, head_dim, device="cuda", dtype=query.dtype)
+    weights = torch.full(query.shape[:2], 0.01, device="cuda", dtype=query.dtype)
+    grad_signal = torch.full((queries, keys), 0.0001, device="cuda", dtype=torch.float32)
+    grad_signal.masked_fill_(
+        torch.arange(keys, device="cuda")[None, :] > torch.arange(queries, device="cuda")[:, None] + keys - queries,
+        0,
+    )
+    cu_query = torch.tensor([0, queries], device="cuda", dtype=torch.int32)
+    cu_key = torch.tensor([0, keys], device="cuda", dtype=torch.int32)
+    offsets = torch.tensor([keys - queries], device="cuda", dtype=torch.int32)
+    query_grad = torch.empty_like(query)
+    weights_grad = torch.empty_like(weights)
+    key_grad = torch.zeros_like(key, dtype=torch.float32)
+    kernel = dense_indexer_backward_sm100(
+        1,
+        queries,
+        keys,
+        64,
+        head_dim,
+        sm_scale=1.0,
+        ratio=1,
+        is_varlen=True,
+        has_q_causal_offsets=True,
+    )
+    for sign in (1.0, -1.0, 1.0, -1.0):
+        query.fill_(sign)
+        key_grad.zero_()
+        kernel.gemm_only(
+            query,
+            weights,
+            key,
+            query_grad,
+            weights_grad,
+            key_grad,
+            grad_signal,
+            cu_query,
+            cu_key,
+            offsets,
+        )
+        for name, gradient in (("dQ", query_grad), ("dK", key_grad), ("dW", weights_grad)):
+            assert torch.isfinite(gradient).all(), f"Nonfinite {name}: {queries=}, {keys=}, {head_dim=}, {sign=}"
+            if sign < 0:
+                assert torch.count_nonzero(gradient).item() == 0, f"Negative QK requires zero {name}: {queries=}, {keys=}, {head_dim=}"
