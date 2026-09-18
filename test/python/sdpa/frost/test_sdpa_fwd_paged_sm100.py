@@ -1530,12 +1530,16 @@ def test_paged_graph_fp8_declines_off_contract():
     assert not offers_engine(_build_fp8_paged_graph(16), engine_name())
 
 
-# Every d128 / d256 kernel file WITHOUT the PAGED_KV specialization, with the dtype code
-# its family takes (0 = E4M3 for the quantized files, 2 = BF16 for f16/bf16) and the
-# CTA-MMA topology its config accepts before the module body runs (the quantized d256
-# kernels are cga1-only); the guard under test is the module's own.
+# Every d128 / d192x128 / d256 kernel file WITHOUT the PAGED_KV specialization, with the
+# dtype code its family takes (0 = E4M3 for the quantized files, 2 = BF16 for f16/bf16)
+# and the CTA-MMA topology its config accepts before the module body runs (the quantized
+# d192x128 / d256 kernels are probed at cga1); the guard under test is the module's own.
+# The SM100 d192x128 quantized files are listed because config_sm100._PAGED_KV_FLAVORS
+# names "d192" for the f16/bf16 kernel, so their config no longer refuses paged_kv.
 _PAGED_UNWIRED_KERNELS = [
     ("sm100/prefill_d128_mxfp8.py", 0, 2),
+    ("sm100/prefill_d192_d128_fp8.py", 0, 1),
+    ("sm100/prefill_d192_d128_mxfp8.py", 0, 1),
     ("sm100/prefill_d256_fp8.py", 0, 1),
     ("sm100/prefill_d256_mxfp8.py", 0, 1),
     ("sm107/prefill_d128_f16.py", 2, 2),
@@ -1551,10 +1555,12 @@ _PAGED_UNWIRED_KERNELS = [
 @pytest.mark.parametrize("rel, dtype_qkv, cta_mma", _PAGED_UNWIRED_KERNELS, ids=[k[0].replace("/", "_") for k in _PAGED_UNWIRED_KERNELS])
 def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
     """config_sm100._validate_params no longer keys the paged backstop off the dtype
-    family (per-tensor FP8 d128 is wired now, MXFP8 shares its dtype codes), so each
-    d128/d256 kernel file WITHOUT the PAGED_KV specialization -- the SM100 MXFP8 and
-    d256 FP8 flavors and all six SM107 siblings -- must refuse a paged TemplateParams
-    itself, at module scope -- never load its dense K/V descriptors over a page pool."""
+    family (per-tensor FP8 d128 is wired now, MXFP8 shares its dtype codes) and names
+    the d192 flavor for the f16/bf16 kernel, so each d128 / d192x128 / d256 kernel file
+    WITHOUT the PAGED_KV specialization -- the SM100 MXFP8 flavors, the d192x128 and
+    d256 FP8 flavors and all six SM107 d128 / d256 siblings -- must refuse a paged
+    TemplateParams itself, at module scope -- never load its dense K/V descriptors over
+    a page pool."""
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
