@@ -216,8 +216,9 @@ def indexer_forward_wrapper(
 
     Returns ``{'scores': (B, S_q, S_k) FP32}``. The ratio causal mask marks
     positions outside the valid KV range with -inf. ``q_causal_offsets`` may
-    specify the global uncompressed token index for each batch/THD segment's
-    local q[0].
+    contain one position delta per batch/THD segment, or one delta per packed
+    Q token for THD input. Offset values are read at execution time, so a
+    captured CUDA Graph can replay after the tensor is updated in place.
     """
     if device_major() == 9:
         if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:

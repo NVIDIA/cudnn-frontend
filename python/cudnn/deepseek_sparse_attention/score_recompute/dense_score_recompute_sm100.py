@@ -109,9 +109,12 @@ class DenseScoreRecomputeSm100:
         k_block_size: int | None = None,
         ratio: int = 1,
         is_varlen: bool = False,
+        q_causal_offset_mode: str = "sequence",
     ):
         assert score_type in ("indexer", "attention")
         assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
+        assert q_causal_offset_mode in ("none", "sequence", "token")
+        assert q_causal_offset_mode != "token" or is_varlen
         self.score_type = score_type
         self.head_dim = head_dim
         self.qhead_per_kvhead = qhead_per_kvhead
@@ -120,6 +123,7 @@ class DenseScoreRecomputeSm100:
         self.kv_stage = kv_stage
         self.ratio = ratio
         self.is_varlen = is_varlen
+        self.q_causal_offset_mode = q_causal_offset_mode
         # Unified forward specializations opt in to compact output. The base
         # dense score kernel always retains its dense output contract.
         self.is_compressed_logits = False
@@ -556,7 +560,7 @@ class DenseScoreRecomputeSm100:
                     m_block_sched = work_tile.tile_idx[0]
                     batch_idx = work_tile.tile_idx[2]
                     seqlen = SeqlenInfoCls(batch_idx)
-                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
+                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None or self.q_causal_offset_mode == "token") else mQCausalOffsets[batch_idx]
                     num_m_blocks_cur = cute.ceil_div(
                         seqlen.seqlen_q * self.qhead_per_kvhead,
                         self.m_block_size,
@@ -570,6 +574,8 @@ class DenseScoreRecomputeSm100:
                             seqlen.seqlen_q,
                             seqlen.seqlen_k,
                             q_causal_offset,
+                            seqlen.offset_q,
+                            mQCausalOffsets,
                         )
                         # PerHead data load (double-buffered)
                         per_head_buf_off = (tile_count % 2) * self.m_block_size
@@ -658,7 +664,7 @@ class DenseScoreRecomputeSm100:
                     m_block_sched = work_tile.tile_idx[0]
                     batch_idx = work_tile.tile_idx[2]
                     seqlen = SeqlenInfoCls(batch_idx)
-                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
+                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None or self.q_causal_offset_mode == "token") else mQCausalOffsets[batch_idx]
                     num_m_blocks_cur = cute.ceil_div(
                         seqlen.seqlen_q * self.qhead_per_kvhead,
                         self.m_block_size,
@@ -672,6 +678,8 @@ class DenseScoreRecomputeSm100:
                             seqlen.seqlen_q,
                             seqlen.seqlen_k,
                             q_causal_offset,
+                            seqlen.offset_q,
+                            mQCausalOffsets,
                         )
                         Q_consumer.reset()
                         handle_Q = Q_consumer.wait_and_advance()
@@ -761,7 +769,7 @@ class DenseScoreRecomputeSm100:
                 m_block_sched = work_tile.tile_idx[0]
                 batch_idx = work_tile.tile_idx[2]
                 seqlen = SeqlenInfoCls(batch_idx)
-                q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
+                q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None or self.q_causal_offset_mode == "token") else mQCausalOffsets[batch_idx]
                 num_m_blocks_cur = cute.ceil_div(
                     seqlen.seqlen_q * self.qhead_per_kvhead,
                     self.m_block_size,
@@ -775,6 +783,8 @@ class DenseScoreRecomputeSm100:
                         seqlen.seqlen_q,
                         seqlen.seqlen_k,
                         q_causal_offset,
+                        seqlen.offset_q,
+                        mQCausalOffsets,
                     )
                     per_head_offset = (tile_count % 2) * self.m_block_size
                     mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1)
@@ -825,6 +835,8 @@ class DenseScoreRecomputeSm100:
                             reduce_phase,
                             softmax_scale,
                             per_head_offset=per_head_offset,
+                            q_batch_offset=seqlen.offset_q,
+                            q_causal_offsets=mQCausalOffsets,
                             batch_idx=batch_idx,
                             cand_batch_offsets=mCandBatchOffsets,
                         )
@@ -850,6 +862,8 @@ class DenseScoreRecomputeSm100:
                             reduce_phase,
                             softmax_scale,
                             per_head_offset=per_head_offset,
+                            q_batch_offset=seqlen.offset_q,
+                            q_causal_offsets=mQCausalOffsets,
                         )
                     tile_count = tile_count + 1
                 clc_pipeline.consumer_wait(clc_consumer_state)
@@ -861,14 +875,31 @@ class DenseScoreRecomputeSm100:
                     cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
     @cute.jit
-    def _dense_compute_n_blocks(self, m_block, seqlen_q, seqlen_k, q_causal_offset):
+    def _dense_compute_n_blocks(
+        self,
+        m_block,
+        seqlen_q,
+        seqlen_k,
+        q_causal_offset,
+        q_batch_offset=None,
+        mQCausalOffsets=None,
+    ):
         """Return dense K blocks that can contain at least one valid KV column."""
         ratio = Int32(self.ratio)
         q_token_base = m_block * self.q_tokens_per_tile
-        q_token_last = q_token_base + Int32(self.q_tokens_per_tile - 1)
-        q_token_last = q_token_last if q_token_last < seqlen_q else seqlen_q - Int32(1)
-
-        max_kv_needed = (q_causal_offset + q_token_last + Int32(1)) // ratio
+        if const_expr(self.q_causal_offset_mode == "token"):
+            max_kv_needed = Int32(0)
+            for qi in cutlass.range_constexpr(self.q_tokens_per_tile):
+                q_token = q_token_base + Int32(qi)
+                if q_token < seqlen_q:
+                    kv_needed = (mQCausalOffsets[q_batch_offset + q_token] + q_token + Int32(1)) // ratio
+                    kv_needed = kv_needed if kv_needed > Int32(0) else Int32(0)
+                    kv_needed = kv_needed if kv_needed < seqlen_k else seqlen_k
+                    max_kv_needed = kv_needed if kv_needed > max_kv_needed else max_kv_needed
+        else:
+            q_token_last = q_token_base + Int32(self.q_tokens_per_tile - 1)
+            q_token_last = q_token_last if q_token_last < seqlen_q else seqlen_q - Int32(1)
+            max_kv_needed = (q_causal_offset + q_token_last + Int32(1)) // ratio
         max_kv_needed = max_kv_needed if max_kv_needed > Int32(0) else Int32(0)
         max_kv_needed = max_kv_needed if max_kv_needed < seqlen_k else seqlen_k
         return cute.ceil_div(max_kv_needed, self.n_block_size)
@@ -981,6 +1012,8 @@ class DenseScoreRecomputeSm100:
         reduce_phase,
         softmax_scale,
         per_head_offset=None,
+        q_batch_offset=None,
+        q_causal_offsets=None,
     ):
         """Dense indexer epilogue: TMEM->RF, ReLU, *W, head reduce.
 
