@@ -1909,19 +1909,44 @@ def lower_dsl_prefill(
     _execute.kernel_template = kernel_template
     _execute.execute_resolved = _execute_by_tensor
     _execute.prepared = None
-    if (
-        facts.thd
-        and not (facts.is_fp8 or facts.is_mxfp8)
-        and not synth_kv_padding
-        and bias_src is None
-        and gate_src is None
-        and getattr(api, "_thd_spec", None) is not None
-    ):
-        from cudnn.sdpa.fwd.prepared import PreparedThdLaunch
+    if not (facts.is_fp8 or facts.is_mxfp8) and not synth_kv_padding and bias_src is None:
+        # The prepared launch (cudnn.sdpa.fwd.prepared): the plan binds the normalized VariantPack itself.
+        # THD: the f16 ragged plan without a gate. Dense: the f16 plan whose declared Q/K/V/O layouts TMA
+        # binds zero-copy and that runs unsplit (the split's combine pass is still a tensor call).
+        from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch, PreparedThdLaunch
 
-        _execute.prepared = PreparedThdLaunch(api._thd_spec, binding)
-        _execute.default_stream = lambda: api._get_default_stream(None)
+        if facts.thd and gate_src is None and getattr(api, "_thd_spec", None) is not None:
+            _execute.prepared = PreparedThdLaunch(api._thd_spec, binding)
+        elif (
+            not facts.thd
+            and api.split_kv == 1
+            and facts.cu_seq_q_t is None
+            and facts.cu_seq_kv_t is None  # the dense host reads per-batch lengths; a prefix-sum form stays on the tensor arm
+            and getattr(api, "_dense_spec", None) is not None
+            and _dense_layouts_bind_zero_copy(api, facts, gate_src)
+        ):
+            _execute.prepared = PreparedDenseLaunch(
+                api._dense_spec, binding, seq_kv_src=seq_kv_src, seq_q_src=seq_q_src if seq_q_lens_present else None, gate_src=gate_src
+            )
+        if _execute.prepared is not None:
+            _execute.default_stream = lambda: api._get_default_stream(None)
     return _execute
+
+
+def _dense_layouts_bind_zero_copy(api, facts, gate_src) -> bool:
+    """Whether every dense operand's DECLARED layout is one the kernel binds without a repack
+    (`config_sm100.dense_bind_strides`, the binder's own predicate): the prepared launch never copies, so a
+    graph declared in a layout the tensor path normalizes by copying keeps the tensor path."""
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+    def ok(desc, elem_bytes):
+        return dense_bind_strides(tuple(int(x) for x in desc.shape), tuple(int(x) for x in desc.stride), elem_bytes) is not None
+
+    bpe = api._o_dtype().itemsize
+    descs = [(api.q_desc, 2), (api.o_desc, bpe)] + ([] if api.paged else [(api.k_desc, 2), (api.v_desc, 2)])
+    if gate_src is not None and getattr(api, "gate_desc", None) is not None:
+        descs.append((api.gate_desc, api.gate_desc.dtype.itemsize))
+    return all(ok(d, b) for d, b in descs)
 
 
 def engine_name(

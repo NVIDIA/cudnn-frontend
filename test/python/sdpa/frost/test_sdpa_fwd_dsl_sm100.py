@@ -1077,6 +1077,65 @@ def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_padded_stats_from_a_fresh_thread_with_a_workspace():
+    """execute() on a thread that never touched CUDA, with the caller's workspace: the padded-Stats
+    seed (a driver memset) and the launch both need the calling thread's context bound FIRST -- for a
+    live batch, for all-zero lengths over addressable buffers (the binder sizes the launch from the
+    buffers, so this still launches), and for a zero-CAPACITY packed Q / O, which seeds -inf and
+    returns without launching."""
+    _require_dsl()
+    import threading
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 256, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    lse = torch.full((b, h, s), float("nan"), dtype=torch.float32, device="cuda")
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True, thd_stats_padded=True)
+    assert api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
+    outcome = {}
+    launches = []
+    spec = api._thd_spec
+    fn = spec.fn
+    spec.fn = lambda *args: launches.append(1) or fn(*args)  # counts the positional-entry launches
+
+    def run(lens, q_buf=q, o_buf=o):
+        try:
+            api.execute(q_tensor=q_buf, k_tensor=k, v_tensor=v, o_tensor=o_buf, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse, workspace=ws)
+            torch.cuda.synchronize()
+            outcome["ok"] = True
+        except BaseException as exc:  # pragma: no cover - reported below
+            outcome["err"] = exc
+
+    def on_fresh_thread(*args):
+        outcome.clear()
+        launches.clear()
+        lse.fill_(float("nan"))
+        t = threading.Thread(target=run, args=args, daemon=True)
+        t.start()
+        t.join(timeout=120)
+        assert not t.is_alive() and outcome.get("ok"), outcome.get("err")
+
+    try:
+        for lens in (torch.tensor([200, 150], dtype=torch.int32, device="cuda"), torch.zeros(b, dtype=torch.int32, device="cuda")):
+            on_fresh_thread(lens)
+            assert launches == [1], "addressable buffers launch once, whatever the lengths"
+            for i, n in enumerate(lens.tolist()):
+                assert torch.isneginf(lse[i, :, n:]).all(), f"batch {i}: rows past the length are not -inf"
+                assert not torch.isnan(lse[i, :, :n]).any(), f"batch {i}: live rows unwritten"
+        # zero capacity: no addressable Q / O row, so the declared seed runs and the kernel is never launched
+        on_fresh_thread(torch.zeros(b, dtype=torch.int32, device="cuda"), q[:, :, :0, :], o[:, :, :0, :])
+        assert launches == [], "a zero-capacity call must not launch"
+        assert torch.isneginf(lse).all(), "every declared Stats row reads -inf after the seed"
+    finally:
+        spec.fn = fn
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
 def test_dsl_sm100_thd_padded_stats_execute_checks_the_buffer():
     """A per-batch padded Stats buffer is bound through the DECLARED (b, h, s_max)
     strides, so execute() first checks that the runtime buffer is exactly

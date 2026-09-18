@@ -364,7 +364,8 @@ def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int
     judge a layout with ONE function (rule 8b lockstep):
 
       * the head dim is innermost-contiguous (stride 1);
-      * the seq and head strides are 16-byte multiples (TMA global-stride rule);
+      * the batch, seq and head strides are 16-byte multiples (TMA global-stride rule;
+        the DSL floors a misaligned stride to TMA units, so a violation would mis-address);
       * the declaration is TOKEN-MAJOR and COVERING: head >= d, seq >= h*head,
         batch >= s*seq.  A head-major nest (a torch-contiguous ``[B, H, S, D]``:
         seq stride d < h*head) returns None because the kernels' TMA
@@ -383,11 +384,42 @@ def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int
     if es != 1:
         return None
     per16 = 16 // elem_bytes
-    if ss % per16 or hs % per16:
+    if ss % per16 or hs % per16 or (b > 1 and bs % per16):  # every non-innermost TMA global stride, the batch one included
         return None
     if hs < d or ss < h * hs or bs < s * ss:
         return None
     return (bs, ss, hs, es)
+
+
+def canonical_bhsd_strides(shape_bhsd: tuple, stride_bhsd: tuple) -> tuple:
+    """``stride_bhsd`` with every extent-1 axis given the covering canonical stride.
+
+    A stride on an axis of extent 1 is never stepped, so a buffer's own value there is
+    unobservable (torch's ``is_contiguous`` wildcards such axes and a one-KV-head K keeps
+    whatever stride its allocation had); the kernels' layout rules below are stated for
+    stepped axes, so the singleton ones are spelled the way a compact BSHD buffer would
+    spell them before the rules are applied."""
+    b, h, s, d = (int(x) for x in shape_bhsd)
+    bs, hs, ss, es = (int(x) for x in stride_bhsd)
+    if h == 1:
+        hs = d
+    if s == 1:
+        ss = h * hs
+    if b == 1:
+        bs = s * ss
+    return (bs, hs, ss, es)
+
+
+def dense_bind_strides(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -> Optional[tuple]:
+    """The ``(batch, seq, head)`` element strides a dense prefill kernel binds a logical BHSD
+    operand at zero-copy, or None when the layout needs a repack: singleton axes canonicalized,
+    then BSHD-compact or ``bshd_zero_copy_stride``. ONE predicate for the lowering's decision to
+    attach the prepared launch and for the binder's per-call admission (rule 8b lockstep)."""
+    st = canonical_bhsd_strides(shape_bhsd, stride_bhsd)
+    if not (bshd_compact(shape_bhsd, st) or bshd_zero_copy_stride(shape_bhsd, st, elem_bytes) is not None):
+        return None
+    bs, hs, ss, _es = st
+    return (bs, ss, hs)
 
 
 def rescale_threshold(dtype_qkv: int) -> float:
