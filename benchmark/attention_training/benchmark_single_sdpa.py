@@ -716,12 +716,6 @@ else:
             sf_q_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_q_heads, s_q_padded, head_dim_qk, block_size)
             sf_k_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_kv_heads, s_kv_padded, head_dim_qk, block_size)
             sf_v_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_kv_heads, d_vo_padded, kv_seqlen, block_size)
-            # Forward consumes V columnwise (the contraction dimension is S),
-            # while backward dO @ V^T consumes V rowwise (the contraction
-            # dimension is D).  Their opaque F8_128x4 buffers have the same
-            # byte count at D=256 but different atom order, so they cannot be
-            # aliased.
-            sf_v_bwd_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_kv_heads, s_kv_padded, head_dim_vo, block_size)
             # Backward-specific scale factors: transposed views for Q, K, dO
             # SF_Q_T, SF_K_T: scale along sequence dimension [b, h, s_scale_padded, d_padded]
             sf_q_t_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_q_heads, d_qk_padded, q_seqlen, block_size)
@@ -1290,7 +1284,7 @@ else:
                     sf_q_t_bwd: sf_q_t_gpu,
                     sf_k_bwd: sf_k_gpu,
                     sf_k_t_bwd: sf_k_t_gpu,
-                    sf_v_bwd: sf_v_bwd_gpu,
+                    sf_v_bwd: sf_v_gpu,
                     sf_dO_bwd: sf_dO_gpu,
                     sf_dO_t_bwd: sf_dO_t_gpu,
                     dQ_bwd: dQuery,
@@ -1735,7 +1729,7 @@ else:
                         sf_q_t_bwd: sf_q_t_gpu,
                         sf_k_bwd: sf_k_gpu,
                         sf_k_t_bwd: sf_k_t_gpu,
-                        sf_v_bwd: sf_v_bwd_gpu,
+                        sf_v_bwd: sf_v_gpu,
                         sf_dO_bwd: sf_dO_gpu,
                         sf_dO_t_bwd: sf_dO_t_gpu,
                         dQ_bwd: dQuery,

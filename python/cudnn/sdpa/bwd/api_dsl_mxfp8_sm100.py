@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""SM100 (Blackwell) d=256 block-scale MXFP8 backward adapter: dQ -> fused dK/dV.
+"""SM100 (Blackwell) d=256 block-scale MXFP8 backward adapter: SF repack -> dQ -> fused dK/dV.
 
 Two CuTe DSL kernels ported from Xinbo Zhao's ``fmha_mxfp8_large_head_dim``
 each a 2-CTA warp-specialized hybrid pipeline: the dQ kernel (Q.K^T, dO.V^T,
@@ -20,12 +20,15 @@ sequence reductions, half-precision ``o_f16``, fp32 ``stats``
 ``dQ/dK/dV`` are half precision (the ``o_f16`` dtype); ``amax_*`` outputs are
 not produced.
 
-Scale-factor layout: the dQ kernel reads V scales directly from cuDNN's
-canonical F8_128x4 tensor.  One aligned atom is loaded per D half; a helper
-warp builds the shifted SFB slot in shared memory and sends it to the peer CTA
-before the paired-CTA S2T copy.  The other scale operands still use the 2-CTA
-slot layouts documented in ``kernels/bprop_sf_repack_mxfp8_sm100.py`` and are
-materialized in workspace ahead of the two attention kernels.
+Scale-factor layout: the kernels read scale factors through TMA in a 2-CTA
+slot layout the upstream quantizer emits, not cuDNN's canonical F8_128x4 --
+see ``kernels/bprop_sf_repack_mxfp8_sm100.py`` for the layouts and why a TMA
+descriptor cannot address the shifted copy. The seven graph SF tensors are
+therefore repacked (four launches, each producing the two operand forms needed
+by the kernels) into workspace ahead of the two kernels. This is a documented,
+deliberate exception to Hard Rule 2 (python/cudnn/AGENTS.md) taken to ship the
+kernels as validated upstream and is the first thing to remove once the
+kernels' SF path reads canonical atoms.
 
 Lives in its own module (not ``api_dsl.py``) so the MXFP8 lowering's imports
 stay out of the half-precision adapters' way; ``engines._adapter`` resolves it
@@ -263,15 +266,13 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
 
     def scratch_workspace_bytes(self) -> int:
         """Kernel scratch (rowsum(O*dO) + scaled LSE + the dQ fp32 slot the
-        kernels size but do not use) plus the still-consumed repacked scale-factor
+        kernels size but do not use) plus the eight repacked scale-factor
         buffers. A pure function of the plan geometry; all of it is carved
         from the caller's buffer at execute."""
         from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import repack_geometry
 
         total = ws_align(self._kernel_workspace_bytes())
         for _name, _src, rows, kg, l, layout, _pm in self._sf_plan():
-            if _name == "dq_sf_v":
-                continue
             total += ws_align(repack_geometry(rows, kg, l, layout)[3])
         return total
 
@@ -304,7 +305,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return masks.MaskEnum.RESIDUAL_MASK, masks.MaskEnum.RESIDUAL_MASK_BWD
 
     def compile(self) -> None:
-        """Plan-time JIT: four fused SF repacks, the dQ kernel and the fused dK/dV
+        """Plan-time JIT: four paired SF repacks, the dQ kernel and the fused dK/dV
         kernel, all against fake operands of the plan's exact geometry."""
         self._ensure_support_checked()
         if self._compiled is not None:
@@ -331,15 +332,15 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         def fake_flat(dt, n):
             return make_fake_tensor(dt, (n,), (1,), assumed_align=16)
 
-        # Each source produces its still-consumed operand layouts in one launch.
+        # Each source produces both operand layouts in one traversal/launch.
         repacks = {}
         for src, rows, kg, l, pm, _sfa_name, _sfb_name in self._sf_pair_plan():
-            rk = Mxfp8SfRepackPairSm100(rows, kg, l, src_plane_major=pm, write_sfb=src != "sf_v")
+            rk = Mxfp8SfRepackPairSm100(rows, kg, l, src_plane_major=pm)
             fn = cute.compile(
                 rk,
                 fake_flat(cutlass.Int8, rk.src_bytes),
                 fake_flat(cutlass.Int8, rk.sfa_bytes),
-                fake_flat(cutlass.Int8, rk.sfb_bytes if rk.write_sfb else rk.sfa_bytes),
+                fake_flat(cutlass.Int8, rk.sfb_bytes),
                 stream,
             )
             repacks[src] = (rk, fn)
@@ -374,7 +375,6 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             is_persistent=False,
             online_ds_scale=online,
             store_num_bits_per_copy=(out_dt.width if sq == 1 else None),
-            direct_canonical_sfv=True,
         )
         dq_fn = cute.compile(
             dq_kernel,
@@ -387,9 +387,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             fo,  # O
             fsf("dq_sf_q"),
             fsf("dq_sf_k"),
-            # dQ consumes V's compact canonical F8_128x4 scale tensor directly;
-            # unlike the other operands this is not an expanded SFB repack.
-            fake_flat(E8M0, self._sf_expected_bytes("sf_v")),
+            fsf("dq_sf_v"),
             fsf("dq_sf_do"),
             fdq,  # dQ
             fdkv,  # dK (ABI slot; this kernel never writes it)
@@ -546,8 +544,6 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             ws_kernel = carver.take(self._kernel_workspace_bytes(), torch.uint8)
             sf_storage = {}
             for name, src, _rows, _kg, _l, _layout, _pm in self._sf_plan():
-                if name == "dq_sf_v":
-                    continue
                 dst_bytes = repack_geometry(_rows, _kg, _l, _layout)[3]
                 dst = carver.take(dst_bytes, torch.int8)
                 sf_storage[name] = dst
@@ -556,7 +552,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
                 fn(
                     from_dlpack(sf_bytes(extras[src], src), assumed_align=16),
                     from_dlpack(sf_storage[sfa_name], assumed_align=16),
-                    from_dlpack(sf_storage[sfb_name] if _rk.write_sfb else sf_storage[sfa_name], assumed_align=16),
+                    from_dlpack(sf_storage[sfb_name], assumed_align=16),
                     stream,
                 )
             sf_bufs = {}
@@ -564,9 +560,6 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
                 ct = from_dlpack(dst, assumed_align=16)
                 ct.element_type = E8M0
                 sf_bufs[name] = ct
-
-            canonical_sfv = from_dlpack(sf_bytes(extras["sf_v"], "sf_v"), assumed_align=16)
-            canonical_sfv.element_type = E8M0
 
             Q = fp8_view(q_tensor, sq, hk, hr)
             Q16 = half_view(q_f16_tensor, sq, hk, hr)
@@ -591,7 +584,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
                 O,
                 sf_bufs["dq_sf_q"],
                 sf_bufs["dq_sf_k"],
-                canonical_sfv,
+                sf_bufs["dq_sf_v"],
                 sf_bufs["dq_sf_do"],
                 dQ,
                 dK,

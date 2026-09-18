@@ -278,7 +278,7 @@ class BlackwellFmhaBackwardDKDV256:
         self.mma_compute_KQ_stage = 1
         self.mma_compute_VDO_stage = 1
         self.compute_mma_P_stage = 1
-        self.compute_mma_dS_stage = 2
+        self.compute_mma_dS_stage = 1
         self.mma_compute_dKdV_stage = 1
         self.num_prologue_iters = self.mma_compute_KQ_stage
         self.k_halves = 2
