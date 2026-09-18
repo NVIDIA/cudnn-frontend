@@ -58,7 +58,12 @@ _PART_WHOLE = tea.PART_WHOLE
 
 
 def _tensor_digest(tensor: torch.Tensor) -> str:
-    payload = tensor.detach().to("cpu").contiguous()
+    """A short identity tag for a tensor.
+
+    Widened to float32 before hashing because numpy has no bfloat16; the tag
+    identifies a tensor across runs and is not a numerical result.
+    """
+    payload = tensor.detach().to("cpu").to(torch.float32).contiguous()
     return hashlib.sha256(payload.numpy().tobytes()).hexdigest()[:32]
 
 
