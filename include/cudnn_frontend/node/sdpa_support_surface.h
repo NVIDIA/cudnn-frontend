@@ -823,6 +823,12 @@ SDPA_backward_attributes::validate_sdpa_backward_support_surface(const detail::C
         "seq_len_q/seq_len_kv (or cu_seq_len_q/cu_seq_len_kv) needs to be set only if padding mask is enabled.");
 
     // validate options for max_total_seq_len
+    // Ragged (THD) layouts need the per-sequence lengths to bound the packed rows: the backward engines' dQ downcast
+    // and full-head reductions take their ragged paths only when the lengths are present (same rule as the forward).
+    RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (padding_mask == false) && (attention_score_modifier == nullptr),
+                                   error_code_t::GRAPH_NOT_SUPPORTED,
+                                   "Ragged offsets are only supported with padding mask.");
+
     RETURN_CUDNN_FRONTEND_ERROR_IF((max_total_seq_len_q.has_value() || max_total_seq_len_kv.has_value()) && !is_ragged,
                                    error_code_t::GRAPH_NOT_SUPPORTED,
                                    "max_total_seq_len_q is only supported with packed layout");
