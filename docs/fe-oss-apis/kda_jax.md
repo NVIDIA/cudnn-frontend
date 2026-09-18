@@ -20,7 +20,7 @@ this bridge. The existing torch API retains its engine routing.
 | `v` | `[T, HV, V]` | Same as q |
 | `g` | `[T, HO, K]` | FP32, BF16, or FP16 |
 | `beta` | `[T, HO]` | FP32 or q dtype |
-| `cu_seqlens` | `[N+1]` | INT32 |
+| `cu_seqlens` | `[N+1]` | INT32 or INT64 |
 | `initial_state` (optional) | `[N, HO, V, K]` | FP32 or BF16 |
 | `a_log` (optional) | `[HO]` | FP32, BF16, or FP16 |
 | `dt_bias` (optional) | `[HO, K]` | FP32, BF16, or FP16 |
@@ -32,6 +32,9 @@ runtime device data: changing sequence lengths without changing tensor shapes
 does not require recompilation. The wrapper validates metadata, not boundary
 values; it never copies boundaries to the host. Callers must supply valid
 boundaries. Empty individual sequences preserve their initial state (or zero).
+Enable `jax_enable_x64` before constructing INT64 offsets; otherwise JAX may
+downcast them to INT32. INT64 storage does not remove the signed-INT32 limits
+on total tokens and scheduler counts.
 
 The state is V-major. It is a differentiable array, not a mutable cache. Pass the
 returned state explicitly to the next call, including inside `jax.lax.scan`.
@@ -116,6 +119,17 @@ The explicit APIs do not themselves provide autodiff rules; the high-level API
 installs `custom_vjp` using the existing backward kernels. Higher derivatives and
 forward-mode differentiation are unsupported.
 
+Pass `gate_domain="linear"` to either forward API when `g` contains decay
+factors such as `0.9`, rather than their natural logarithms. Backward and
+`jax.grad` then return gradients with respect to those factors. Linear gates
+cannot be combined with `safe_gate=True`.
+
+`checkpoint_every_n_tokens=64`, for example, saves fewer recurrent states than
+cadence 16. Backward uses Frost's existing seeded recomputation to reconstruct
+the intermediate states. This reduces saved residual storage, but backward
+still needs workspace for the reconstructed states. Cadence 0 saves no
+checkpoints; any positive multiple of 16 fitting signed INT32 is supported.
+
 ## Bounded support
 
 | Feature | Draft contract |
@@ -125,21 +139,22 @@ forward-mode differentiation are unsupported.
 | Heads | HQ:HV ratios 1, 2, 4, or 8 in either direction; HK equals HQ or HV |
 | Sequences | Positive static T/N; packed THD; empty individual sequences allowed |
 | State | Optional initial/final state; gradients through both; recurrent scan |
-| Gates | Natural-log decay by default; safe gate; optional a_log/dt_bias |
+| Gates | Natural-log decay by default; direct decay with `gate_domain="linear"`; safe gate with optional a_log/dt_bias |
 | Safe gate | `lower_bound * sigmoid(exp(a_log) * (g + dt_bias))`; default bound -5, allowed [-5, 0); omitted parameters mean 0 |
 | Beta | Direct write strength, or sigmoid of logits; `allow_neg_eigval=True` multiplies sigmoid by 2 and requires sigmoid enabled |
 | Q/K normalization | Optional in-kernel L2 normalization |
 | Scheduling | Frost automatic piece-chain / decay-warmup / uncut selection, shared with torch; `batch_invariant=True` uses Frost's batch-independent length rule |
-| Checkpoints | Cadence 0 (backward recomputes) or 16 (saved for backward) |
+| Checkpoints | Cadence 0 (backward recomputes), 16, or coarser positive multiples of 16 (seeded recomputation) |
 | Transformations | Eager, jit, first-order grad/vjp, recurrent scan |
 
-Checkpoint capacity is `[max(T // 16 + N, 1), HO, V, K]` in q dtype. The valid
-prefix contains `sum(ceil(sequence_length / 16))` rows; padding is initialized to
+For a positive cadence `C`, checkpoint capacity is
+`[max(T // C + N, 1), HO, V, K]` in q dtype. The valid
+prefix contains `sum(ceil(sequence_length / C))` rows; padding is initialized to
 zero. The residual holds primals, static configuration and optional checkpoints.
 It owns no graph handle, workspace or executable. Do not fabricate or edit
 residuals: checkpoints must correspond to their saved primals and configuration.
 
-Deferred: cuTile/other engine routing, SM90/SM120/SM107, coarse checkpoints,
+Deferred: cuTile/other engine routing, SM90/SM120/SM107, indexed state pools,
 zero total tokens, arbitrary physical strides, `vmap`, JVP, higher derivatives,
 sharding/multiple GPUs, portable executable export, and full FLA compatibility.
 JAX supplies compact row-major operands to the custom call; upstream transposes
@@ -158,9 +173,10 @@ backward; it does not implement KDA kernels or choose a different schedule.
 The native executor retains its compiled-artifact caches, dynamic tensor
 annotations, output strides and execution path. JAX tracing specializes buffer
 bindings to static shapes; it does not replace or populate the native caches.
-Frost's automatic piece-chain selection applies to both paths. Coarse
-checkpoints, linear gate inputs and state-pool indexing remain outside the
-bounded JAX API; their native support is unchanged.
+Frost's automatic piece-chain selection applies to both paths, including
+checkpoint-aligned piece boundaries. Coarse checkpoints, linear gate inputs
+and INT64 sequence offsets use the native forward/backward hosts. State-pool
+indexing remains outside the JAX API; native support is unchanged.
 
 Graph tensors come directly from JAX shape/dtype metadata; the existing
 `graph.kda` / `graph.kda_bwd` methods infer output shapes and validate the graph.

@@ -62,6 +62,7 @@ def reference(
     allow_neg_eigval=False,
     use_qk_l2norm_in_kernel=False,
     gate_lower_bound=None,
+    gate_domain="log",
     scale=None,
     **unused,
 ):
@@ -81,7 +82,7 @@ def reference(
 
     def step(s, xs):
         qt, kt, vt, gt, bt = xs
-        s = s * jnp.exp(gt)[:, None, :]
+        s = s * (gt if gate_domain == "linear" else jnp.exp(gt))[:, None, :]
         delta = vt - jnp.einsum("hvk,hk->hv", s, kt)
         s = s + bt[:, None, None] * delta[:, :, None] * kt[:, None, :]
         return s, jnp.einsum("hvk,hk->hv", s, qt)
@@ -270,12 +271,16 @@ sys.meta_path.insert(0, RejectTorch())
 import jax
 import jax.numpy as jnp
 from cudnn.jax import kimi_delta_attention as kda
-q = jnp.ones((16, 1, 64), jnp.bfloat16) * 0.05
-g = jnp.full(q.shape, -0.1, jnp.float32)
-b = jnp.ones((16, 1), jnp.float32) * 0.5
-cu = jnp.array([0, 16], jnp.int32)
-f = jax.jit(jax.value_and_grad(lambda q: kda(q, q, q, g, b, cu)[0].astype(jnp.float32).sum()))
-jax.block_until_ready(f(q))
+jax.config.update("jax_enable_x64", True)
+q = jnp.ones((80, 1, 64), jnp.bfloat16) * 0.05
+b = jnp.ones((80, 1), jnp.float32) * 0.5
+for domain, dtype, cadence in (("log", jnp.int32, 0), ("linear", jnp.int64, 64)):
+    g = jnp.full(q.shape, -0.1 if domain == "log" else 0.9, jnp.float32)
+    cu = jnp.array([0, 80], dtype)
+    f = jax.jit(jax.value_and_grad(lambda q: kda(
+        q, q, q, g, b, cu, gate_domain=domain, checkpoint_every_n_tokens=cadence
+    )[0].astype(jnp.float32).sum()))
+    jax.block_until_ready(f(q))
 assert "torch" not in sys.modules
 """
     subprocess.run(
@@ -288,7 +293,12 @@ assert "torch" not in sys.modules
 @pytest.mark.parametrize(
     "options",
     [
-        dict(checkpoint_every_n_tokens=32),
+        dict(checkpoint_every_n_tokens=17),
+        dict(checkpoint_every_n_tokens=-16),
+        dict(checkpoint_every_n_tokens=2**31),
+        dict(checkpoint_every_n_tokens=16.5),
+        dict(gate_domain="invalid"),
+        dict(gate_domain="linear", safe_gate=True),
         dict(allow_neg_eigval=True),
         dict(gate_lower_bound=-6),
     ],
@@ -407,3 +417,84 @@ def test_bad_metadata():
         bwd(residual, jnp.ones((35, 1, 64), jnp.float32))
     with pytest.raises(ValueError, match="output_final_state"):
         bwd(residual, jnp.ones((35, 1, 64), jnp.bfloat16), d_final_state=jnp.ones((3, 1, 64, 64), jnp.float32))
+
+
+@pytest.mark.parametrize("schedule", ["uncut", "warmup", "chain"])
+@pytest.mark.parametrize(
+    "domain,offset_dtype,checkpoint,safe_gate,gate_dtype",
+    [
+        ("log", jnp.int64, 0, False, jnp.float32),
+        ("linear", jnp.int32, 16, False, jnp.bfloat16),
+        ("log", jnp.int32, 48, True, jnp.float32),
+        ("linear", jnp.int64, 64, False, jnp.float16),
+        ("linear", jnp.int32, 32, False, jnp.float32),
+    ],
+    ids=["int64", "linear", "coarse_safe", "combined", "linear_fp32"],
+)
+def test_extended_options_forward_backward(schedule, domain, offset_dtype, checkpoint, safe_gate, gate_dtype, monkeypatch):
+    from cudnn.linear_attention import jax_api
+    from cudnn.linear_attention.frost import kda_engine
+
+    build = kda_engine.build_kda
+    plans = []
+
+    def checked_build(graph):
+        plan = build(graph)
+        assert plan.chain == (schedule == "chain")
+        assert plan.split == (schedule == "warmup")
+        plans.append(plan.node.node_type.name)
+        return plan
+
+    jax_api.build_call.cache_clear()
+    monkeypatch.setattr(kda_engine, "build_kda", checked_build)
+    bounds = dict(uncut=(0, 81, 81, 177), warmup=(0, 49, 49, 97), chain=(0, 129, 129, 3073))[schedule]
+    dtype = jnp.float16 if domain == "linear" and offset_dtype == jnp.int64 else jnp.bfloat16
+    args, _ = inputs(dv=128 if schedule == "chain" else 64, dtype=dtype, bounds=bounds, gates=safe_gate)
+    if domain == "linear":
+        args = (*args[:3], jnp.exp(8 * args[3]).astype(gate_dtype), *args[4:])
+    if safe_gate and schedule == "warmup":
+        args = (*args[:5], None, *args[6:])
+    options = dict(checkpoint_every_n_tokens=checkpoint, batch_invariant=schedule == "uncut", safe_gate=safe_gate)
+    if domain == "linear":
+        options["gate_domain"] = domain
+
+    with jax.enable_x64():
+        cu = jnp.asarray(bounds, offset_dtype)
+        assert cu.dtype == offset_dtype
+        actual = run(args, cu, **options)
+        expected = reference(args, bounds, **options)
+        for got, want in zip(actual, expected):
+            assert_close(got, want, 0.02)
+        rng = np.random.default_rng(19)
+        do = jnp.asarray(rng.normal(size=actual[0].shape), dtype)
+        ds = jnp.asarray(rng.normal(size=actual[1].shape), jnp.float32)
+
+        def loss(args, cu, ref=False):
+            o, state = reference(args, bounds, **options) if ref else run(args, cu, **options)
+            return jnp.sum(o.astype(jnp.float32) * do) + jnp.sum(state.astype(jnp.float32) * ds)
+
+        differentiated = jax.jit(jax.grad(loss))
+        actual_grads = differentiated(args, cu)
+        expected_grads = jax.jit(jax.grad(partial(loss, ref=True)))(args, cu)
+        for got, want in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
+            assert_close(got, want, 0.06)
+        out, state, residual = jax.jit(
+            lambda args, cu: fwd(*args[:5], cu, initial_state=args[5], a_log=args[6], dt_bias=args[7], output_final_state=True, **options)
+        )(args, cu)
+        assert residual.primals[5].dtype == offset_dtype
+        explicit = jax.jit(lambda r: bwd(r, do, d_final_state=ds))(residual)
+        for got, want in zip(jax.tree.leaves(explicit), jax.tree.leaves(actual_grads)):
+            np.testing.assert_array_equal(got, want)
+        for got, want in zip((out, state), actual):
+            np.testing.assert_array_equal(got, want)
+        if checkpoint:
+            assert residual.checkpoints.shape == (bounds[-1] // checkpoint + len(bounds) - 1, 1, args[2].shape[-1], 64)
+            valid = sum((end - start + checkpoint - 1) // checkpoint for start, end in zip(bounds, bounds[1:]))
+            np.testing.assert_array_equal(residual.checkpoints[valid:], 0)
+        changed = tuple(x * 0.9 if x is not None else None for x in args)
+        repeated = differentiated(changed, cu)
+        expected_repeated = jax.jit(jax.grad(partial(loss, ref=True)))(changed, cu)
+        for got, want in zip(jax.tree.leaves(repeated), jax.tree.leaves(expected_repeated)):
+            assert_close(got, want, 0.06)
+        assert differentiated._cache_size() == 1
+    assert "KDA" in plans and "KDA_BWD" in plans

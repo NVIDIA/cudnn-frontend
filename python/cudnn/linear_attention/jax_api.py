@@ -30,6 +30,7 @@ class KdaConfig:
     gate_lower_bound: float | None = None
     batch_invariant: bool = False
     checkpoint_every_n_tokens: int = 0
+    gate_domain: str = "log"
 
 
 @partial(
@@ -84,10 +85,15 @@ def validate_inputs(primals, config):
             raise ValueError(f"{name} must have shape {shape}; got {value.shape}")
     if q.dtype not in (jnp.float16, jnp.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
         raise ValueError("q/k/v must have matching float16 or bfloat16 dtype")
-    if cu.dtype != jnp.int32:
-        raise ValueError("cu_seqlens must be int32")
-    if config.checkpoint_every_n_tokens not in (0, 16):
-        raise NotImplementedError("JAX KDA supports checkpoint cadence 0 or 16")
+    if cu.dtype not in (jnp.int32, jnp.int64):
+        raise ValueError("cu_seqlens must be int32 or int64")
+    cadence = config.checkpoint_every_n_tokens
+    if not isinstance(cadence, (int, np.integer)) or cadence < 0 or cadence >= 2**31 or cadence % 16:
+        raise ValueError("checkpoint_every_n_tokens must be 0 or a positive multiple of 16 fitting signed int32")
+    if config.gate_domain not in ("log", "linear"):
+        raise ValueError("gate_domain must be 'log' or 'linear'")
+    if config.gate_domain == "linear" and config.safe_gate:
+        raise ValueError("gate_domain='linear' cannot combine with safe_gate=True")
     if config.allow_neg_eigval and not config.use_beta_sigmoid_in_kernel:
         raise ValueError("allow_neg_eigval requires use_beta_sigmoid_in_kernel")
     if not config.safe_gate and (a is not None or dt is not None or config.gate_lower_bound is not None):
@@ -119,7 +125,13 @@ def build_call(metadata, config, device):
     from .frost.kda_jax import make_launcher
     from cutlass.jax import TensorSpec
 
-    data_types = dict(float16=cudnn.data_type.HALF, bfloat16=cudnn.data_type.BFLOAT16, float32=cudnn.data_type.FLOAT, int32=cudnn.data_type.INT32)
+    data_types = dict(
+        float16=cudnn.data_type.HALF,
+        bfloat16=cudnn.data_type.BFLOAT16,
+        float32=cudnn.data_type.FLOAT,
+        int32=cudnn.data_type.INT32,
+        int64=cudnn.data_type.INT64,
+    )
     graph = cudnn.pygraph()
     tensors = {}
     for name, shape, dtype in metadata:
@@ -201,6 +213,7 @@ def kimi_delta_attention_fwd(
     gate_lower_bound=None,
     batch_invariant=False,
     checkpoint_every_n_tokens=0,
+    gate_domain="log",
 ):
     """Return ``(output, final_state_or_None, residual)``; see the JAX KDA guide."""
     config = KdaConfig(
@@ -213,6 +226,7 @@ def kimi_delta_attention_fwd(
         gate_lower_bound,
         batch_invariant,
         checkpoint_every_n_tokens,
+        gate_domain,
     )
     return forward((q, k, v, g, beta, cu_seqlens, initial_state, a_log, dt_bias), config)
 
@@ -272,6 +286,7 @@ def kimi_delta_attention(
     gate_lower_bound=None,
     batch_invariant=False,
     checkpoint_every_n_tokens=0,
+    gate_domain="log",
 ):
     """KDA on packed THD arrays; return ``(output, final_state_or_None)``.
 
@@ -290,5 +305,6 @@ def kimi_delta_attention(
         gate_lower_bound,
         batch_invariant,
         checkpoint_every_n_tokens,
+        gate_domain,
     )
     return differentiable((q, k, v, g, beta, cu_seqlens, initial_state, a_log, dt_bias), config)
