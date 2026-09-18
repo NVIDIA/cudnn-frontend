@@ -308,6 +308,14 @@ rejected before compilation. The depth is part of the template and persistent
 compile-cache identity, so both plans may remain live simultaneously. This
 axis applies to `20402`; engines `20400` and `20401` reject it.
 
+These BF16 paired projection plans accumulate in FP32. The original 12-stage
+kernel and both public stage choices share a known fidelity limit for strongly
+cancelling dot products: with unit weights and input `[2^26, 1, ..., 1, -2^26]`
+at K=768, the tested plans return 0 instead of the exact sum 766 (768 after BF16
+rounding). The separate FP32 reference also loses terms. See
+`FROST_MOE_HANDOFF.md` for the reproduced inputs and scope; this draft does not
+provide a compensated or higher-precision accumulation mode for this case.
+
 The six-stage option follows Kernel Factory campaign2132 candidate `e459dff`;
 its benefit is workload-dependent. This exposes a tuning choice rather than a
 new algorithm or a guaranteed speedup. These plans

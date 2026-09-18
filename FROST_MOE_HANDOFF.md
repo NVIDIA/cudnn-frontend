@@ -1,3 +1,47 @@
+## Cancellation-fidelity limitation, independently reproduced — 2026-09-18
+
+The final review of KF campaign2132 reported a numerical issue in cancelling
+dot products. Independent full-power B200 diagnostic4383198 / audit2214 compares
+the original fixed 12-stage FC2 kernel with the public 12- and 6-stage plans.
+All six tested input patterns produce bitwise-identical outputs in all three
+versions, both eager and through a retained graph. No stage-depth regression
+was observed. The existing accumulation-fidelity limitation remains unresolved.
+
+For E128/R8/K768/N2048, unit weights and one active expert, each input row has
+unit entries except the specified cancelling pair. Exact sums are computed in
+FP64, then rounded to BF16; a separate FP32 cuBLAS reference has TF32 disabled.
+
+| Input pattern | Exact sum rounded to BF16 | All three Frost versions | FP32 cuBLAS reference |
+|---|---:|---:|---:|
+| All ones | 768 | 768 | 768 |
+| First/last entries +2^24/-2^24 | 768 | 764 | 752 |
+| First/last entries +2^25/-2^25 | 768 | 764 | 752 |
+| First/last entries +2^26/-2^26 | 768 | 0 | 752 |
+| Same 2^26 pattern scaled by 2^-26 | 1.14440918e-5 | 0 | 1.12056732e-5 |
+| Adjacent first entries +2^26/-2^26 | 768 | 752 | 736 |
+
+The unrounded exact cancelling sum is 766. The scaled case has maximum input
+magnitude 1, so an absolute-magnitude bound alone would not exclude this failure.
+The FP32 reference also loses terms; agreement with it is not a universal
+accuracy guarantee. Against exact sums, the last three patterns fail the
+existing combined 2% elementwise / 1% relative-L2 diagnostic criteria. All
+failures and raw tensors are retained; no tolerance was relaxed or kernel changed.
+This does not invalidate the matched measured fixtures, but those fixtures do
+not establish accuracy for arbitrary ill-conditioned BF16 inputs.
+
+The diagnostic report's top-level PASS means source/route/raw-output integrity
+checks completed. Individual numerical failures remain explicit. It must not be
+reported as an all-input numerical pass. KF's final advisory review remains
+`passed=false`; its separate R0 empty-graph finding concerns the KF packet's
+declared R0..513 scope, while the published paired graph API declines R0.
+The unused TMA-C descriptor observation remains an unreachable-path question,
+not proof of an error in the tested direct-store path.
+
+Credit: KF campaign2132's final Karma review (`karma-F1`) identified the
+cancellation case; the original/public-stage and scaled-input comparisons are
+the independent FlashInfer/Frost integration followup. A numerical repair or
+stronger accumulation mode is not claimed by this draft.
+
 ## Public FC2 pipeline depth and refreshed comparison — 2026-09-18
 
 Paired BF16 FC2 engine 20402 now exposes the shared public `STAGES` knob
