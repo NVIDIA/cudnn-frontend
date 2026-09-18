@@ -156,6 +156,8 @@ from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
 )
 from cudnn.frost.tile_dsl.pointwise import (
+    opaque_f32_zero,
+    fmax_f32,
     tmem_load_max_reduction_tile,
     row_reduction_pair,
     row_max_reduction,
@@ -1995,7 +1997,7 @@ def _correction_warp_group(
         # tensor and folds the pointer, the fold and the atomic out; the local
         # stays unconditional (cheap, keeps the fold's code shape).
         _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32) if cutlass.const_expr(amax_o_tensor is not None) else None
-        _amax_o_local = cutlass.Float32(0.0)
+        _amax_o_local = opaque_f32_zero()  # not a constant: it feeds fmax_f32's inline_ptx
         # Row validity gates BOTH the Stats write and the amax atomic.  Under THD
         # `seqlen_q` is the PACKED TOTAL, so comparing against it lets rows that
         # belong to a LATER sequence -- and every row of a dead unit from the
@@ -2076,7 +2078,7 @@ def _correction_warp_group(
                     _e = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), _vals[_i].ir_value()))
                     if cutlass.const_expr(amax_o_tensor is not None):
                         _a = o_scaled[_i] if cutlass.const_expr(CFG.EPILOGUE_GATE) else _e
-                        _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_a, -_a))
+                        _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_a))
                     _o_elems.append(_e)
                 o_out = cutlass.Vector.from_elements(tuple(_o_elems), cutlass.Float32).to(OUT_STORAGE_DTYPE)
 

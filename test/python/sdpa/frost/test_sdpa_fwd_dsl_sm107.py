@@ -16,6 +16,11 @@ which exercise whichever part is present.
 """
 
 import dataclasses
+import subprocess
+import textwrap
+import sys
+import shutil
+import os
 
 import pytest
 
@@ -2490,3 +2495,125 @@ def test_sm107_mxfp8_gate_dead_padded_entry_is_exactly_zero(out_key):
     assert (
         abs(amax.item() - ungated_ref[0].abs().max().item()) <= _MX_AMAX_ATOL
     ), f"Amax_O {amax.item():.4f} is the live entry's UNGATED amax {ungated_ref[0].abs().max().item():.4f}; the dead entry contributes nothing"
+
+
+# ============================================================================ Rubin SASS pins: trace-compile for sm_107a on ANY box
+# The two perf regressions PR #1129 closed were invisible to every numerics test (O / LSE / Amax_O bit-identical before and after):
+# an Amax_O fold that lowered to thousands of FSETP + FSEL instead of FMNMX3, and a cluster-scope release arrive in the shared CLC
+# scheduler that put a GPU-scope drain (MEMBAR.ALL.GPU + CGAERRBAR) before every credit.  The only tripwire for either is the SASS,
+# so this pin compiles each kernel for Rubin here (`CUTE_DSL_ARCH=sm_107a` needs no matching device) and counts the instructions.
+# SKIPS when the DSL predates sm_107a or no nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin (the DSL's own wheel nvdisasm
+# may not); a compile failure is a FAIL.
+_SM107_SASS_PROBE = textwrap.dedent("""
+    import glob, os, subprocess, sys
+    dump, quant, d, dtype_o, cands = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
+    os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"       # unconditional: an inherited value would pin the wrong target's SASS
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps no cubin
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    # The PRODUCTION CTA geometry, from the adapter itself: cga2 for d128 / d512, cga1 for d256 (review on #1129: a d256 fp8 row
+    # compiled at cga2 was a configuration the adapter never builds).  One width per Rubin quantized flavor today; if that ever
+    # widens, the unpack fails here and the row has to say which geometry it pins.
+    (cta_mma,) = supported_cgas_for((d, d), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma)  # E4M3 in; the row picks the O dtype
+    mod = _load_sm100_kernel_module((d, d), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
+    # By keyword: the MXFP8 kernels' compile() carries total_{q,kv}_sf_tiles between skv and d_qk.  Dense, B=1 H=128 S=8192,
+    # Stats + Amax_O (emit_amax_o defaults True) -- the sweep's shape, and the arm that carries the fold.
+    mod.compile(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d, d_v=d, has_lse=True)
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    nvd = None
+    for c in cands:
+        try:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", c, "->", repr(exc)); continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            nvd = c; print("NVDISASM", c); break
+        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if nvd is None:
+        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    def cnt(*subs):
+        return sum(1 for ln in sass if all(sb in ln for sb in subs))
+    print("SASS FSETP", cnt("FSETP"))
+    print("SASS FMNMX3", cnt("FMNMX3"))
+    print("SASS MEMBAR_GPU", cnt("MEMBAR.ALL.GPU"))
+    print("SASS CGAERRBAR", cnt("CGAERRBAR"))
+    print("SASS STL", cnt("STL"))
+    print("SASS LDL", cnt("LDL"))
+    print("SASS LINES", len(sass))
+    """)
+
+# One row per pinned kernel: (quantization path, d, TemplateParams.dtype_o).  The fold commit touched all eight sm107 fp8 / mxfp8
+# kernels; these four are the two the regression was found on, the d128 fp8 kernel (FSETP 790 -> 26 on the fold) and the mxfp8
+# d512 kernel (the largest measured win, +17.5 % dense / +29 % causal at S=8K).  The fp8 rows write E4M3 O; the mxfp8 row writes
+# BF16 O, the dtype MXFP8 graphs produce -- the fold sits on the fp32 accumulator before the cast, and the sm_107a counts are the
+# same with E4M3 O (2026-09-18: FSETP 9 / FMNMX3 256 / no drain / no spill either way).  Four rows, one sm_107a trace-compile
+# each (~20-60 s); the other four kernels share the fold's spelling and the scheduler, and add no new class of failure.
+# 4th field: the row's FSETP ceiling = the count measured on the fixed kernel (2026-09-18, sm_107a, PRODUCTION geometry) plus
+# _FSETP_SLACK.  One fold site regressing to compare+select adds at least 3 FSETP per O element per lane (384 on a 128-element
+# chunk), so a slack of 16 still catches a single site while tolerating unrelated drift; the aggregate `< 100` alone would not
+# (review on #1129).  5th field: the row's spill ceiling.  d256 fp8 at its production cga1 carries 3 STL / 3 LDL on the PR BASE
+# d34a6909 already (the cga2 build this row compiled before had none), so 3 is the pre-existing count, not a budget for new spills.
+_FSETP_SLACK = 16
+_SM107_SASS_PIN_ROWS = [
+    pytest.param("fp8", 512, _E4M3, 14 + _FSETP_SLACK, 0, id="fp8-d512"),
+    pytest.param("fp8", 256, _E4M3, 13 + _FSETP_SLACK, 3, id="fp8-d256"),
+    pytest.param("fp8", 128, _E4M3, 26 + _FSETP_SLACK, 0, id="fp8-d128"),
+    pytest.param("mxfp8", 512, _BF16_OUT, 9 + _FSETP_SLACK, 0, id="mxfp8-d512"),
+]
+
+
+def _nvdisasm_candidates():
+    cands = []
+    if os.environ.get("CUDA_PATH"):
+        cands.append(os.path.join(os.environ["CUDA_PATH"], "bin", "nvdisasm"))
+    on_path = shutil.which("nvdisasm")
+    if on_path:
+        cands.append(on_path)
+    return [c for c in dict.fromkeys(cands) if os.path.isfile(c) and os.access(c, os.X_OK)]
+
+
+def _sm107a_known_to_the_dsl() -> bool:
+    try:
+        from cutlass.base_dsl.enums import Arch
+
+        Arch.from_string("sm_107a")
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.parametrize("quant, d, dtype_o, fsetp_max, spill_max", _SM107_SASS_PIN_ROWS)
+def test_sm107_fp8_epilogue_and_scheduler_sass_pins(tmp_path, quant, d, dtype_o, fsetp_max, spill_max):
+    """The Amax_O fold is FMNMX3 (not a compare+select chain) and the CLC scheduler's credit arrives carry no GPU-scope
+    drain -- the two silent perf regressions of PR #1129, pinned on the sm_107a SASS of the fp8 d=512 / d=256 / d=128
+    and the mxfp8 d=512 kernels, each compiled at the CTA geometry the adapter serves (cga2 for d128 / d512, cga1 for
+    d256).  Bounds: FSETP <= measured + 16 per row (the regression read 1548 / 779 / 790, the fixed kernels 9-26; one
+    regressed fold site adds >= 384); FMNMX3 > 0 (it read 0 before); MEMBAR.ALL.GPU == CGAERRBAR == 0 (13-23 before);
+    spills <= the row's pre-existing count (0 everywhere but d256 fp8 at cga1, which carries 3 on the PR base)."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    cands = _nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    dump = tmp_path / f"sm107a_{quant}_d{d}"
+    dump.mkdir()
+    argv = [sys.executable, "-c", _SM107_SASS_PROBE, str(dump), quant, str(d), str(dtype_o), *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_107a trace-compile of the {quant} d={d} kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    print(f"\nsm107 {quant} d={d} dtype_o={dtype_o} sm_107a SASS: {stats}")
+    assert stats["FMNMX3"] > 0, "the Amax_O fold must reach FMNMX3 (fmax_f32), not a compare+select chain"
+    assert stats["FSETP"] <= fsetp_max, f"{stats['FSETP']} FSETP > {fsetp_max}: an Amax_O fold site is lowering to compare+select again"
+    assert stats["MEMBAR_GPU"] == 0 and stats["CGAERRBAR"] == 0, "a cluster-scope RELEASE arrive is back on a per-tile path (GPU-scope drain)"
+    assert (
+        stats["STL"] <= spill_max and stats["LDL"] <= spill_max
+    ), f"the {quant} d={d} kernel spills ({stats['STL']} STL / {stats['LDL']} LDL, ceiling {spill_max})"

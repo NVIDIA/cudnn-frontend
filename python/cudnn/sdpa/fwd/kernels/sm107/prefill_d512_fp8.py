@@ -154,6 +154,8 @@ from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
 )
 from cudnn.frost.tile_dsl.pointwise import (
+    opaque_f32_zero,
+    fmax_f32,
     tmem_load_max_reduction_tile,
     row_reduction_pair,
     row_max_reduction,
@@ -1636,7 +1638,7 @@ def _compute_warp_group(
             # exists -- atomicMax only grows, so a padded row would permanently
             # inflate the graph's Amax_O with no error anywhere.
             _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
-            _amax_o_local = cutlass.Float32(0.0)
+            _amax_o_local = opaque_f32_zero()  # not a constant: it feeds fmax_f32's inline_ptx
 
             for b in cutlass.range_constexpr(CFG.TILE_O // O_EPI_BLOCK_SIZE):
                 b_intra = b & (O_BLOCKS_PER_SUB - 1)
@@ -1657,7 +1659,7 @@ def _compute_warp_group(
                 _o_elems = []
                 for _i in cutlass.range_constexpr(O_EPI_BLOCK_SIZE):
                     _e = cutlass.Float32(arith.select(_row_empty.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_i].ir_value()))
-                    _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                    _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
                     _o_elems.append(_e)
                 o_half = cutlass.Vector.from_elements(tuple(_o_elems), cutlass.Float32).to(OUT_STORAGE_DTYPE)
 

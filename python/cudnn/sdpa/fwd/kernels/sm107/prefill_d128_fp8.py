@@ -147,6 +147,8 @@ from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
 )
 from cudnn.frost.tile_dsl.pointwise import (
+    opaque_f32_zero,
+    fmax_f32,
     # SM107 fuses the MASK_NONE S load + row-max into one LDTM.STAT
     # (tmem_load_max_reduction_x64); masked iters keep the software reduction.
     row_max_reduction,
@@ -2346,7 +2348,7 @@ def _correction_warp_group(
             # amax_o = max over valid rows of |o_scaled| (the fp32 pre-cast output). Divided
             # by scale_o in api to give the pre-quant output amax (cuDNN FP8 ref, in-kernel).
             _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
-            _amax_o_local = cutlass.Float32(0.0)
+            _amax_o_local = opaque_f32_zero()  # not a constant: it feeds fmax_f32's inline_ptx
 
             sO_sub_base = sO[qs].base
 
@@ -2399,7 +2401,7 @@ def _correction_warp_group(
 
                         for _i in cutlass.range_constexpr(O_CHUNK):
                             _e = o_elems[_i]
-                            _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                            _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
 
                         # Plain range (not range_constexpr) — extraction at Python trace time.
                         o_packed_v = fp32_to_fp8_pack(
@@ -2449,7 +2451,7 @@ def _correction_warp_group(
                         )
                         for _i in cutlass.range_constexpr(O_EPI_BLOCK_SIZE):
                             _e = o_scaled_h[_i]
-                            _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                            _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
                         o_half = o_scaled_h.to(OUT_STORAGE_DTYPE)
 
                         col_offset_const = (b * O_EPI_BLOCK_SIZE) % O_D_BLOCK
