@@ -155,6 +155,8 @@ from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
 )
 from cudnn.frost.tile_dsl.pointwise import (
+    opaque_f32_zero,
+    fmax_f32,
     tmem_load_max_reduction_x64,
     row_max_reduction_64,
     row_reduction_pair_64,
@@ -2543,7 +2545,7 @@ def _correction_warp_group(
             # grows, so a padded row would permanently inflate the graph's
             # Amax_O -- gate it exactly like the LSE write above.
             _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
-            _amax_o_local = cutlass.Float32(0.0)
+            _amax_o_local = opaque_f32_zero()  # not a constant: it feeds fmax_f32's inline_ptx
 
             for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                 o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
@@ -2564,7 +2566,7 @@ def _correction_warp_group(
                 o_scaled = cutlass.Vector.from_elements(tuple(_o_elems), cutlass.Float32)
                 for _i in cutlass.range_constexpr(O_CHUNK):
                     _e = o_scaled[_i]
-                    _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                    _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
                 o_out = o_scaled.to(OUT_STORAGE_DTYPE)
 
                 col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
