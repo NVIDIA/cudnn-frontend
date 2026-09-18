@@ -314,6 +314,8 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
 }
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "VisionRoPEBackward": (".rope", "VisionRoPEBackward"),
+    "vision_rope_backward_wrapper": (".rope", "vision_rope_backward_wrapper"),
     "gnn": (".gnn", None),
     "FlexAttentionBwd": (".flex_attention", "FlexAttentionBwd"),
     "FlexAttentionFwd": (".flex_attention", "FlexAttentionFwd"),
