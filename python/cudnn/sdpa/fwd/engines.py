@@ -869,7 +869,7 @@ def _sm100_spec() -> EngineSpec:
             # table). A d192x128 decode tile is the follow-up, as the d128
             # tile was: parity is a kernel's job, not an ordering rule's.
             paged_kv=True,
-            paged_d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
+            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
             sink=True,
             stats=True,
             stats_log2=True,
@@ -906,13 +906,12 @@ def _sm100_spec() -> EngineSpec:
             # (64, 64): the native d64 prefill flavor builds at both widths.
             cgas_by_d_shape=(((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2})), ((64, 64), frozenset({1, 2}))),
             split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
-            # The d128/d192/d256/d512 flavor kernels wire SplitHelpers, and the
-            # adapter carves the partial slabs + launches sm100/split_combine
-            # when split_kv > 1 (dense f16 only; see mismatch's facts x knobs
-            # gate). d64 does NOT yet thread them (config_sm100._SPLIT_KV_FLAVORS),
-            # so it is excluded here rather than left to fail in the lowering.
+            # Every f16 flavor kernel wires SplitHelpers, and the adapter carves
+            # the partial slabs + launches sm100/split_combine when split_kv > 1
+            # (dense f16 only; see mismatch's facts x knobs gate). d64 included:
+            # it compiles the same kernel body, and at a NATIVE d_v = TILE_O the
+            # fp32 partial store has no surplus columns to clip.
             split_kv_supported=True,
-            split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             pack_gqas=frozenset({False, True}),
             # The d128 / d256 f16 kernels pack a GQA group that does not divide
             # the 128-row tile by its largest divisor that does (Cfg.PACK_G:

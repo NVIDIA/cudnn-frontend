@@ -110,6 +110,8 @@ _SM100_KERNEL_FILES = {
 # template directly (its cga1 arm is kept for that).
 _SM100_DECODE_KERNEL_FILE = "sm100/decode_d128_f16.py"
 _SM100_DECODE_FLAVOR = (128, 128)
+# Q rows one d64 decode tile covers (CfgD64Decode: TILES_Q=1 x TILE_M=128).
+_D64_DECODE_TILE_ROWS = 128
 # Decode-shaped alternates selected by a TemplateParams field instead of a knob
 # (TemplateParams.decode_q_tile != 0, set by SdpaFwdDslSm100._decode_q_tile when
 # S_q * pack_g rows fit the tile's N extent): the d256 flavor's swap-AB tile.
@@ -474,7 +476,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     elif fp8:
         filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
-    elif flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and not params.thd_varlen:
+    elif getattr(params, "decode_tile", False) or (flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and not params.thd_varlen):
         # TILE_CGA_M=1 on the d128 f16/bf16 flavor IS the decode tile (see
         # config_sm100.CfgD128Decode).  Dense only: THD at cga1 is declined
         # upstream (engines.mismatch / check_support), never routed here.
@@ -2002,6 +2004,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
         return decode_d256_q_tile(self.s_q_max, pack_g)
 
+    def _d64_decode_tile(self) -> bool:
+        """Whether this d64 plan lowers onto the 128-row decode tile.
+
+        The twin of :meth:`_decode_q_tile`, and the same LOWERING choice: the
+        decode tile serves the d64 flavor's whole graph contract (paged / dense,
+        padding, causal bottom-right, SWA, right band, sink, Stats natural or
+        base-2, split-KV partials) for graphs whose S_q x packed heads fit one
+        128-row tile -- S_q = 1 decode and MTP.  Everything else (THD, larger
+        S_q) stays on the prefill tile.  d128 keys the same tile off cga1; d64
+        cannot, because cga1 IS its prefill width.
+        """
+        if self._fp8 or self.thd or self.flavor != (64, 64) or self._device_cc == (10, 7):
+            return False
+        pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
+        return int(self.s_q_max) * pack_g <= _D64_DECODE_TILE_ROWS
+
     def template_params(self) -> Sm100TemplateParams:
         """The compile-time record ``compile()`` loads the kernel module with.
 
@@ -2084,6 +2102,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # per-CTA K/V, which the halved d64 slabs no longer need, and a
             # 2-CTA cluster doubles the Q rows a cluster must cover -- wasted
             # work under a narrow diagonal band.
+            # d64 prefill runs cga1: the narrow slabs need no collective MMA to
+            # halve K/V, and a 512-row cga2 cluster wastes most of a narrow
+            # diagonal band. Its decode leg is picked by decode_tile, not cga.
             cta_mma=(1 if (self._fp8 and self.flavor == (256, 256)) or self.flavor == (64, 64) else 2) if self.cga is None else self.cga,
             d_flavor=64 if self.flavor == (64, 64) else 128,
             fused_ldtm_stat=fused_ldtm_stat,
@@ -2151,6 +2172,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             decode_q_tile = self._decode_q_tile()
             if decode_q_tile:
                 params = replace(params, decode_q_tile=decode_q_tile)
+        if self._d64_decode_tile():
+            params = replace(params, decode_tile=True)
         elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
             from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
 
