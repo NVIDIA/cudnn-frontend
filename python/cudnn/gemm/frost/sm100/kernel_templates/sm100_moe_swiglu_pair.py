@@ -62,6 +62,7 @@ from cuda.bindings import driver as _cuda
 # KF candidate f19299: only R<=8 permits one token tile per live expert.
 # The generic branch retains persistent scheduling for larger declarations.
 moe_small_rows = FROST_TEMPLATE_PARAMS.small_rows
+moe_kblocked64 = FROST_TEMPLATE_PARAMS.weight_layout == "k_blocked_64_v1"
 
 moe_static_sched = False  # Public SCHED_POLICY: 0 dynamic (default), 1 static.
 moe_absolute_a = False  # Set before injection so the rendered eligibility gate wins.
@@ -859,11 +860,11 @@ def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_res
                                         sB_stage.subview(_b_off * cta_tile_mnk[2]),
                                         tma_b_descs[_bj].get_ptr(),
                                         (
-                                            coord_k,
+                                            cutlass.Int32(0) if cutlass.const_expr(moe_kblocked64) else coord_k,
                                             cutlass.Int32(0),
                                             cutlass.Int32(0),
                                             (coord_n_per_cta + _b_off) // 8,
-                                            coord_expert,
+                                            cutlass.Int32(coord_expert * num_k_tiles + k_tile_idx) if cutlass.const_expr(moe_kblocked64) else coord_expert,
                                         ),
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
@@ -1383,7 +1384,8 @@ def frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_res
 
 
 frost_sm100_moe_swiglu_pair_m128n8k16_sched_static_s12_early_pdl_compact_resources.set_name_prefix(
-    "cudnn_small_row_sched" if moe_small_rows else "cudnn", remove_cutlass_symbol=True
+    ("cudnn_kblock64_small_row_sched" if moe_small_rows else "cudnn_kblock64") if moe_kblocked64 else ("cudnn_small_row_sched" if moe_small_rows else "cudnn"),
+    remove_cutlass_symbol=True,
 )
 
 
@@ -1488,13 +1490,17 @@ def _host(
                     # Canonical [gate,up] rows are exposed as
                     # (K, i8, projection, q=N/8, expert).  One box gathers
                     # 64 output channels from both projections into M=128.
-                    global_dims=[k_sym, 8, 2, n // 8, num_experts],
-                    global_strides=[
-                        b_stride_n * ab_dtype.width // 128,
-                        n * b_stride_n * ab_dtype.width // 128,
-                        8 * b_stride_n * ab_dtype.width // 128,
-                        b_stride_l * ab_dtype.width // 128,
-                    ],
+                    global_dims=[64, 8, 2, n // 8, num_experts * (k_sym // 64)] if moe_kblocked64 else [k_sym, 8, 2, n // 8, num_experts],
+                    global_strides=(
+                        [64 * ab_dtype.width // 128, n * 64 * ab_dtype.width // 128, 8 * 64 * ab_dtype.width // 128, 2 * n * 64 * ab_dtype.width // 128]
+                        if moe_kblocked64
+                        else [
+                            b_stride_n * ab_dtype.width // 128,
+                            n * b_stride_n * ab_dtype.width // 128,
+                            8 * b_stride_n * ab_dtype.width // 128,
+                            b_stride_l * ab_dtype.width // 128,
+                        ]
+                    ),
                     box_dims=[cta_tile_mnk[2], 8, 2, cta_tile_mnk[1] // 8, 1],
                     swizzle=ab_tma_swizzle,
                 )

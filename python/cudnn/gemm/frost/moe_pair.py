@@ -38,6 +38,7 @@ class PairSpec:
     features: int
     reduction: int
     experts: int
+    weight_layout: str | None = None
 
 
 def analyze_pair(graph, *, dynamic_shapes=False):
@@ -54,7 +55,7 @@ def analyze_pair(graph, *, dynamic_shapes=False):
     mm, moe = chain.matmul, chain.moe
     if (mm.a_dtype, mm.b_dtype, mm.accum_dtype, mm.out_dtype, mm.a_major, mm.b_major) != ("bf16", "bf16", "fp32", "fp32", "k", "k"):
         raise NotImplementedError("paired MoE requires BF16 operands and FP32 projections")
-    if moe.offset_dtype != "int32" or moe.weight_layout is not None or moe.num_groups != moe.num_experts:
+    if moe.offset_dtype != "int32" or moe.weight_layout not in (None, "k_blocked_64_v1") or moe.num_groups != moe.num_experts:
         raise NotImplementedError("paired MoE requires one int32 offset group per canonical expert")
     if not 1 <= mm.M <= 513 or mm.N <= 0 or mm.K <= 0 or moe.num_experts <= 0 or mm.N % 64 or mm.K % 64:
         raise NotImplementedError("paired MoE requires 1<=R<=513 and N,K divisible by64")
@@ -82,11 +83,20 @@ def analyze_pair(graph, *, dynamic_shapes=False):
     if gate is None or up is None or gate.parent is not up.parent:
         raise NotImplementedError("paired MoE weights must declare the same parent")
     e, n, k, r = moe.num_experts, mm.N, mm.K, mm.M
-    if gate.parent_dim != (e, k, 2 * n) or gate.byte_offset != 0 or up.byte_offset != n * gate.parent_stride[2] * 2:
-        raise NotImplementedError("paired MoE requires complete [gate,up] halves of its parent")
-    se, sk, sn = gate.parent_stride
-    if sk != 1 or se % 8 or sn % 8:
-        raise NotImplementedError("paired MoE weight TMA strides must be16-byte aligned")
+    if moe.weight_layout == "k_blocked_64_v1":
+        if (
+            gate.parent_dim != (e, k // 64, 2 * n, 64)
+            or gate.parent_stride != (2 * n * k, 2 * n * 64, 64, 1)
+            or gate.byte_offset != 0
+            or up.byte_offset != n * 64 * 2
+        ):
+            raise NotImplementedError("paired k_blocked_64_v1 requires complete [gate,up] halves of a contiguous [E,K/64,2N,64] parent")
+    else:
+        if gate.parent_dim != (e, k, 2 * n) or gate.byte_offset != 0 or up.byte_offset != n * gate.parent_stride[2] * 2:
+            raise NotImplementedError("paired MoE requires complete [gate,up] halves of its parent")
+        se, sk, sn = gate.parent_stride
+        if sk != 1 or se % 8 or sn % 8:
+            raise NotImplementedError("paired MoE weight TMA strides must be16-byte aligned")
     tx, ty, offsets = binding.a_operands[0], binding.outputs[0], binding.first_token_offset
     geometry = (
         (tx, (1, r, k), (r * k, k, 1)),
@@ -96,7 +106,7 @@ def analyze_pair(graph, *, dynamic_shapes=False):
     for tensor, dim, stride in geometry:
         if tuple(tensor.get_dim()) != dim or tuple(tensor.get_stride()) != stride:
             raise NotImplementedError("paired MoE requires compact tokens/output and a contiguous offset vector")
-    return PairSpec(binding, tx, gate.parent, ty, offsets, r, n, k, e)
+    return PairSpec(binding, tx, gate.parent, ty, offsets, r, n, k, e, moe.weight_layout)
 
 
 @dataclass(frozen=True)
@@ -105,6 +115,7 @@ class KernelParams:
     l2_budget_bytes: int
     helper_digest: str
     small_rows: bool = False
+    weight_layout: str | None = None
 
 
 def device_params():
@@ -134,7 +145,7 @@ class PairedCompiled:
         # A declaration with at most eight routed rows has one token tile per
         # nonempty expert. Select at plan time, never from live device offsets.
         # Frozen params distinguish both template and persistent compile caches.
-        params = replace(params, small_rows=spec.rows <= 8)
+        params = replace(params, small_rows=spec.rows <= 8, weight_layout=getattr(spec, "weight_layout", None))
         self.spec = spec
         self.binding = spec.binding
         self.workspace_bytes = (params.grid_ctas * 2 + 1) * 128
@@ -154,7 +165,13 @@ class PairedCompiled:
             if int(buf.__dlpack_device__()[0]) != 2 or int(buf.data_ptr()) % (4 if dtype == "int32" else 16):
                 raise ValueError("paired MoE requires aligned CUDA operands")
         x, parent, out, offsets = operands
-        a, b, c = x.permute(1, 2, 0), parent.permute(2, 1, 0), out.permute(1, 2, 0)
+        if spec.weight_layout == "k_blocked_64_v1":
+            # The checked rank-4 parent is globally dense. This native reshape
+            # changes only metadata; the kernel's TMA descriptor defines its layout.
+            b = parent.reshape((spec.experts, 2 * spec.features, spec.reduction)).permute(1, 2, 0)
+        else:
+            b = parent.permute(2, 1, 0)
+        a, c = x.permute(1, 2, 0), out.permute(1, 2, 0)
         scratch = workspace.view(0, "int64", (self.workspace_bytes // 8,))
         problem = (spec.rows, spec.features, spec.reduction, spec.experts, spec.experts, *a.stride(), *b.stride(), *c.stride())
         self.kernel(problem, offsets.view(-1), scratch, a, b, b, c, stream=cuda.CUstream(stream))

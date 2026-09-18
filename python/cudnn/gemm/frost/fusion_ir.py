@@ -637,7 +637,7 @@ class MoeSpec:
     weight_layout: str | None = None
 
     def __post_init__(self) -> None:
-        if self.weight_layout not in (None, "blocked_128x128_v1"):
+        if self.weight_layout not in (None, "blocked_128x128_v1", "k_blocked_64_v1"):
             raise ValueError(f"unsupported MoE weight_layout {self.weight_layout!r}")
         if self.num_experts < 1:
             raise ValueError(f"num_experts must be positive; got {self.num_experts}")

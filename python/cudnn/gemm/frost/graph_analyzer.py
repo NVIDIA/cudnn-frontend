@@ -947,7 +947,7 @@ def _build_multi_moe_chain(
             )
 
     weight_layout = moe_ops[0].moe_weight_layout
-    if weight_layout not in (None, "blocked_128x128_v1"):
+    if weight_layout not in (None, "blocked_128x128_v1", "k_blocked_64_v1"):
         raise NotImplementedError(f"unsupported MoE weight_layout {weight_layout!r}")
     if any(op.moe_weight_layout != weight_layout for op in moe_ops):
         raise NotImplementedError("parallel MoE matmuls must share the same weight_layout")
@@ -1025,6 +1025,24 @@ def _build_multi_moe_chain(
                 raise ValueError(f"ordinary MoE weight must be rank-3; got {weight_meta.dim}")
             E, Kb, N = weight_meta.dim
             b_major = _infer_b_major(weight_meta.dim, weight_meta.stride)
+        elif weight_layout == "k_blocked_64_v1":
+            if is_block_scale or token_meta.dtype != "bf16" or weight_meta.dtype != "bf16":
+                raise NotImplementedError("k_blocked_64_v1 requires unscaled BF16 tokens and weights")
+            if len(weight_meta.dim) != 4 or weight_meta.dim[-1] != 64 or min(weight_meta.dim) <= 0:
+                raise ValueError("k_blocked_64_v1 weight must be [E,K/64,N,64] with positive dimensions")
+            E, kb, N, _ = weight_meta.dim
+            Kb = int(kb) * 64
+            strides = tuple(weight_meta.stride)
+            if (
+                len(strides) != 4
+                or strides[2:] != (64, 1)
+                or strides[1] < N * 64
+                or strides[0] < (kb - 1) * strides[1] + N * 64
+                or strides[0] % 8
+                or strides[1] % 8
+            ):
+                raise NotImplementedError("k_blocked_64_v1 requires nonoverlapping K blocks and 16-byte aligned expert/K-block strides")
+            b_major = "k"
         else:
             if is_block_scale or token_meta.dtype != "fp8_e4m3" or weight_meta.dtype != "fp8_e4m3":
                 raise NotImplementedError("blocked_128x128_v1 requires unscaled E4M3 token and weight operands")
@@ -2153,6 +2171,26 @@ def _lower_moe_weight_slices(ops, meta):
         if _TENSOR_OUTPUT_FLAG.get(op.output, False):
             raise NotImplementedError("Frost cannot materialize a MoE weight slice")
         slices = dict(op.op_attrs)["slices"]
+        if len(parent.dim) == 4:
+            if any(other.moe_weight_layout != "k_blocked_64_v1" for other in consumers):
+                raise NotImplementedError("rank-4 MoE slices require explicit k_blocked_64_v1 consumers")
+            if len(slices) != 4 or parent.dtype != "bf16" or output.dtype != "bf16" or min(parent.dim) <= 0 or parent.dim[-1] != 64:
+                raise NotImplementedError("k_blocked_64_v1 slices require BF16 [E,K/64,N,64] parents")
+            if any(not isinstance(s, slice) or s.step not in (None, 1) for s in slices):
+                raise NotImplementedError("k_blocked_64_v1 slices require unit positive steps")
+            bounds = [s.indices(int(size)) for s, size in zip(slices, parent.dim)]
+            if any(bounds[i][:2] != (0, parent.dim[i]) for i in (0, 1, 3)):
+                raise NotImplementedError("k_blocked_64_v1 slices may select only the output-feature axis")
+            e, kb, n, inner = parent.dim
+            if parent.stride != (kb * n * 64, n * 64, 64, 1):
+                raise NotImplementedError("k_blocked_64_v1 slice parent must be contiguous")
+            dims = tuple(end - begin for begin, end, _ in bounds)
+            if min(dims) <= 0 or output.dim != dims or output.stride != parent.stride:
+                raise NotImplementedError("k_blocked_64_v1 slices must retain parent strides and inferred dimensions")
+            if parent.reordering is not None or output.reordering is not None:
+                raise NotImplementedError("k_blocked_64_v1 slices do not support reordered storage")
+            views.append(_OperandSlice(output.tensor, parent.tensor, parent.dim, parent.stride, dims, parent.stride, bounds[2][0] * 64 * 2))
+            continue
         if len(parent.dim) != 3 or len(slices) != 3 or parent.dtype != "bf16" or output.dtype != "bf16":
             raise NotImplementedError("Frost MoE weight slices require rank-3 BF16 weights")
         if any(not isinstance(s, slice) or s.step not in (None, 1) for s in slices):

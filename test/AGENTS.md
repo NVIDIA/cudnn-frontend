@@ -103,6 +103,15 @@ template a test actually compiles, log `path` at the top of `load_template` —
 do not infer it from `_pick_flavor` by reading the source.
 
 
+A prepared layout with an exact stride contract needs singleton-axis coverage.
+PyTorch may regard a permuted tensor as contiguous when an axis has size one;
+`contiguous()` can then preserve a noncanonical stride on that axis. During
+preparation, flatten and restore the declared shape with metadata-only `view`
+operations after making storage contiguous. Assert exact strides and parent
+aliases, then execute the graph for both singleton and multiple-block cases.
+The paired K64 MoE tests exercise K=64 and K>64; numerical equality of a
+standalone framework reshape does not establish the native binding contract.
+
 ### Persistent MoE scheduler validation
 
 When changing the scheduler ring or cluster broadcasts, use a workload that

@@ -37,7 +37,8 @@ cases = [
 
 
 @pytest.mark.parametrize("spec", cases, ids=[case["name"] for case in cases])
-def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
+@pytest.mark.parametrize("weight_layout", [None, "k_blocked_64_v1"], ids=["canonical", "k64"])
+def test_paired_moe_native_graph_and_live_captures(spec, tmp_path, weight_layout):
     import cudnn
     from cudnn.frost import buffers
 
@@ -101,6 +102,7 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
             names.append(name.decode())
         assert all("cudnn" in name and "frost_sm100_moe_swiglu_pair" in name and "sched_static" in name for name in names)
         assert all(("small_row_sched" in name) == (spec["rows"] <= 8) for name in names)
+        assert all(("kblock64" in name) == (weight_layout is not None) for name in names)
         return names
 
     def reference(x, w, offsets):
@@ -134,6 +136,14 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
     stride = [expert_pitch, 1, pitch]
     # Pitched case deliberately has 16B but not 32B expert alignment.
     assert not spec["pitched"] or expert_pitch * 2 % 32 == 16
+    if weight_layout is not None:
+        stride = [2 * n * k, 2 * n * 64, 64, 1]
+
+    def prepared(host):
+        # Flatten the contiguous view before restoring rank four so singleton
+        # K-block axes also receive the declared canonical strides.
+        return host.reshape(-1, 2 * n, k // 64, 64).permute(0, 2, 1, 3).contiguous().view(-1).view(-1, k // 64, 2 * n, 64)
+
     host_x = torch.randn((r, k), dtype=torch.bfloat16, generator=generator)
     host_w = [(torch.randn((e, 2 * n, k), dtype=torch.float32, generator=generator) / k**0.5).to(torch.bfloat16) for _ in range(2)]
     original_x = host_x.clone()
@@ -147,21 +157,24 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
         offsets = torch.tensor(starts[:-1], dtype=torch.int32, device="cuda").view(e, 1, 1)
         weights = []
         for hw in host_w:
-            storage = torch.empty(e * expert_pitch, dtype=torch.bfloat16, device="cuda")
-            storage.fill_(float("nan"))
-            weight = storage.as_strided((e, 2 * n, k), (expert_pitch, pitch, 1))
-            weight.copy_(hw)
+            if weight_layout is not None:
+                weight = prepared(hw).cuda()
+            else:
+                storage = torch.empty(e * expert_pitch, dtype=torch.bfloat16, device="cuda")
+                storage.fill_(float("nan"))
+                weight = storage.as_strided((e, 2 * n, k), (expert_pitch, pitch, 1))
+                weight.copy_(hw)
             weights.append(weight)
         outputs = [torch.empty((r, n), dtype=torch.bfloat16, device="cuda") for _ in range(2)]
     stream.synchronize()
     g = cudnn.pygraph(io_data_type=bf16, intermediate_data_type=fp32, compute_data_type=fp32, handle=handle)
     tx = g.tensor(name="tokens", dim=[1, r, k], stride=[r * k, k, 1], data_type=bf16)
-    tw = g.tensor(name="parent_weight", dim=[e, k, 2 * n], stride=stride, data_type=bf16)
+    tw = g.tensor(name="parent_weight", dim=[e, k, 2 * n] if weight_layout is None else [e, k // 64, 2 * n, 64], stride=stride, data_type=bf16)
     to = g.tensor(name="offsets", dim=[e, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
-    gate = g.slice(tw, [slice(None), slice(None), slice(0, n)], name="gate_weight").set_stride(stride)
-    up = g.slice(tw, [slice(None), slice(None), slice(n, 2 * n)], name="up_weight").set_stride(stride)
-    mg = g.moe_grouped_matmul(tx, gate, to, mode=cudnn.moe_grouped_matmul_mode.NONE, name="gate")
-    mu = g.moe_grouped_matmul(tx, up, to, mode=cudnn.moe_grouped_matmul_mode.NONE, name="up")
+    gate = g.slice(tw, [slice(None), slice(None), slice(0, n)] + ([] if weight_layout is None else [slice(None)]), name="gate_weight").set_stride(stride)
+    up = g.slice(tw, [slice(None), slice(None), slice(n, 2 * n)] + ([] if weight_layout is None else [slice(None)]), name="up_weight").set_stride(stride)
+    mg = g.moe_grouped_matmul(tx, gate, to, mode=cudnn.moe_grouped_matmul_mode.NONE, name="gate", weight_layout=weight_layout)
+    mu = g.moe_grouped_matmul(tx, up, to, mode=cudnn.moe_grouped_matmul_mode.NONE, name="up", weight_layout=weight_layout)
     ty = g.mul(g.swish(mg, name="silu"), mu, name="out").set_dim([1, r, n]).set_stride([r * n, n, 1]).set_output(True).set_data_type(bf16)
     chain, binding = analyze_with_binding(g)
     assert binding.bound_tensors() == [tx, tw, ty, to] and len(binding.operand_slices) == 2
@@ -175,19 +188,21 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
     template_path, template_params = loads.call_args.args[:2]
     assert Path(template_path).resolve() == root / "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_swiglu_pair.py"
     assert template_params.small_rows == (r <= 8)
+    assert template_params.weight_layout == weight_layout
     assert template_params.grid_ctas == torch.cuda.get_device_properties(0).multi_processor_count
     result.setdefault("templates", []).append(dict(path=template_path, sha256=sha(template_path), params=repr(template_params)))
     engine, actual_knobs = g.get_engine_and_knobs_at_index(0)
     assert int(engine) == 20401 and actual_knobs == knobs.to_public()
     workspace_bytes = g.get_workspace_size_plan_at_index(0)
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
-    packs = [{tx: x.unsqueeze(0), tw: w.transpose(1, 2), to: offsets, ty: y.unsqueeze(0)} for w, y in zip(weights, outputs)]
+    packs = [{tx: x.unsqueeze(0), tw: w.transpose(1, 2) if weight_layout is None else w, to: offsets, ty: y.unsqueeze(0)} for w, y in zip(weights, outputs)]
     graphs = []
     case = dict(
         **spec,
         parent_stride=stride,
         engine=int(engine),
         small_rows=template_params.small_rows,
+        weight_layout=weight_layout,
         workspace_bytes=workspace_bytes,
         parent_ptrs=[w.data_ptr() for w in weights],
         checks=[],
@@ -242,7 +257,7 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
                 x.copy_(host_x)
             elif label == "weights":
                 host_w[0][first_expert].neg_()
-                weights[0][first_expert].copy_(host_w[0][first_expert])
+                weights[0][first_expert].copy_(host_w[0][first_expert] if weight_layout is None else prepared(host_w[0][first_expert])[0])
             else:
                 bounds = [0] * e + [r]
                 offsets.copy_(torch.tensor(bounds[:-1], dtype=torch.int32).view(e, 1, 1))
@@ -260,7 +275,7 @@ def test_paired_moe_native_graph_and_live_captures(spec, tmp_path):
                 x.copy_(host_x)
             elif label == "weights":
                 host_w[0][first_expert].copy_(original_weight)
-                weights[0][first_expert].copy_(original_weight)
+                weights[0][first_expert].copy_(original_weight if weight_layout is None else prepared(original_weight)[0])
             else:
                 offsets.copy_(torch.tensor(starts[:-1], dtype=torch.int32).view(e, 1, 1))
     replay(0, "restored")

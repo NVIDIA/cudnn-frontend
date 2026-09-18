@@ -3879,6 +3879,8 @@ def _check_executable(chain: FusionChain) -> None:
     MoE is the exception and stays on its own launchers: it is >= 2 launches
     with a workspace, and has no recipe to lower from.
     """
+    if chain.has_moe and chain.moe.weight_layout == "k_blocked_64_v1":
+        raise NotImplementedError("k_blocked_64_v1 requires the SM100 paired SwiGLU engine")
     if any(red.mode == "norm2" for red in chain.reductions):
         raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
     if chain.has_moe:

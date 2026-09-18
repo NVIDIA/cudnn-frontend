@@ -2828,7 +2828,11 @@ _STRUCTURED_OPS = {
             "OUT_0": lambda n: [
                 1,
                 n.inputs["token"].dim[-2],
-                n.inputs["weight"].dim[1] * 128 if n.params.get("weight_layout") == "blocked_128x128_v1" else n.inputs["weight"].dim[-1],
+                (
+                    n.inputs["weight"].dim[1] * 128
+                    if n.params.get("weight_layout") == "blocked_128x128_v1"
+                    else n.inputs["weight"].dim[2] if n.params.get("weight_layout") == "k_blocked_64_v1" else n.inputs["weight"].dim[-1]
+                ),
             ]
         },
     ),

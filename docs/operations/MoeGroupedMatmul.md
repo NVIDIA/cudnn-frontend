@@ -267,6 +267,37 @@ is copied. The row-range extension reuses the generic persistent kernel. For R<=
 the plan selects the validated smaller scheduler path; R9–513 retains the
 generic persistent scheduler.
 
+#### Optional prepared K64 FC1 weights
+
+Engine `20401` also accepts `weight_layout="k_blocked_64_v1"` on both
+grouped matmul nodes. This is an explicit tensor layout attribute, not a
+tuning knob. Prepare a contiguous BF16 parent `[E, K/64, 2*N, 64]` before
+plan execution; its strides are `[2*N*K, 2*N*64, 64, 1]`. Slice the feature
+axis (axis 2) into gate `[0:N]` and up `[N:2*N]`, preserving the parent
+strides. Starting from canonical gate-then-up weights `[E, 2*N, K]`, the
+preparation is:
+
+```python
+parent = weights.reshape(E, 2*N, K//64, 64).permute(0, 2, 1, 3).contiguous()
+parent = parent.view(-1).view(E, K//64, 2*N, 64)
+```
+
+The final metadata-only views canonicalize strides even when `K/64 == 1`.
+
+The execution plan binds this prepared parent directly. It neither caches
+weight contents nor allocates or repacks weights during execution. Callers
+that change weights must update the prepared storage or provide another
+prepared allocation. The layout participates in plan/template identity;
+rank, strides, gate/up offsets and dtype are validated. Materialized graph
+slices, arbitrary parent pitches, mixed layouts and canonical buffers bound
+to a K64 plan are rejected. Ordinary SM100/SM120 engines decline this layout;
+the paired SM100 SwiGLU shape and numerical contracts above still apply.
+
+Preparation time and temporary storage belong to model loading or an explicit
+weight update. They must be included when comparing workloads that update
+weights frequently. This opt-in interface does not imply a performance ranking;
+measure the complete MoE with preparation costs reported separately.
+
 ### Frost SM120 shared-input fusion
 
 For ordinary forward grouped matmul, the experimental Frost SM120 engine can
