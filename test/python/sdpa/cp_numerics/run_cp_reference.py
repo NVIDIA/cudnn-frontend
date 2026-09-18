@@ -59,6 +59,7 @@ _PARENT = os.path.dirname(_HERE)
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
+from cp_numerics import actual_attention as act  # noqa: E402
 from cp_numerics import te_adapter as tea  # noqa: E402
 from cp_numerics import trace_schema as ts  # noqa: E402
 
@@ -246,9 +247,9 @@ def local_preflight(args: argparse.Namespace, rank: int, local_rank: int, world_
         "uuid": str(getattr(props, "uuid", "")),
     }
 
-    if args.mode == "frozen-partials":
+    if args.mode in ("frozen-partials", "actual-attention"):
         if not args.fixture:
-            raise RuntimeError("--mode frozen-partials requires --fixture")
+            raise RuntimeError(f"--mode {args.mode} requires --fixture")
         if not os.path.exists(args.fixture):
             raise RuntimeError(f"fixture not found: {args.fixture}")
         fixture = tea.load_fixture(args.fixture)
@@ -498,28 +499,79 @@ def _te_installed_matches_pin(te_repo: Optional[str]) -> Tuple[bool, str]:
 
 
 def run_actual_attention(args: argparse.Namespace, rank: int, local_rank: int, world_size: int, output_dir: str) -> int:
-    """R2 lane. Refuses cleanly when the pinned TE is not available."""
+    """R2 lane: per-step partials from the pinned TE fused attention, then TE's merge.
+
+    Refuses unless ``--te-repo`` hashes to the pinned ``context_parallel.py``: a
+    look-alike TransformerEngine would produce numbers that look like TE
+    fidelity and are not.
+    """
     ok, why = _te_installed_matches_pin(args.te_repo)
-    report = {
+    base: Dict[str, Any] = {
         "schema": "cp_numerics_run/1",
         "mode": "actual-attention",
-        "status": "R2_READY" if ok else "R2_UNVERIFIED",
         "rank": rank,
         "local_rank": local_rank,
         "world_size": world_size,
-        "reason": why,
         "utc": _utc_now(),
         "te_binding": tea.describe_te_binding(),
-        "note": (
-            "This lane is meant to compute per-step partials with the pinned TransformerEngine fused attention "
-            "and merge them with te_adapter.merge_te_fidelity. It refuses outright when the pinned revision is "
-            "not importable rather than substituting a look-alike implementation."
-        ),
+        "te_repo": os.path.abspath(args.te_repo) if args.te_repo else None,
+        "te_repo_sha256": tea.helper_source_sha256(args.te_repo) if args.te_repo else None,
     }
+    if not ok:
+        base["status"] = "R2_UNVERIFIED"
+        base["reason"] = why
+        base["note"] = (
+            "This lane computes per-step partials with the pinned TransformerEngine fused attention and merges "
+            "them with te_adapter.merge_te_fidelity. It refuses outright when the pinned revision is not "
+            "importable rather than substituting a look-alike implementation."
+        )
+        _write_json(os.path.join(output_dir, f"rank_{rank}_actual_attention.json"), base)
+        if rank == 0:
+            print(json.dumps(base, indent=2))
+        return EXIT_R2_UNVERIFIED
+
+    if not args.fixture:
+        raise RuntimeError("--mode actual-attention requires --fixture (it supplies the Q/K/V the attention runs on)")
+    if not os.path.exists(args.fixture):
+        raise RuntimeError(f"fixture not found: {args.fixture}")
+    fixture = tea.load_fixture(args.fixture)
+    header = fixture.header
+    if header.cp_size != world_size:
+        raise RuntimeError(f"fixture {header.name!r} carries cp_size={header.cp_size} but world_size={world_size}")
+
+    device = torch.device(f"cuda:{local_rank}")
+    result = act.run_actual_attention_on_fixture(
+        fixture=fixture,
+        rank=rank,
+        world_size=world_size,
+        compiled=bool(args.compiled_helpers),
+        device=device,
+    )
+    report = dict(base)
+    report["status"] = result.status
+    report["reason"] = ""
+    report.update(
+        {
+            "per_step": result.per_step,
+            "merged": result.merged,
+            "fixture": result.fixture,
+            "notes": result.notes,
+        }
+    )
     _write_json(os.path.join(output_dir, f"rank_{rank}_actual_attention.json"), report)
     if rank == 0:
-        print(json.dumps(report, indent=2))
-    return EXIT_OK if ok else EXIT_R2_UNVERIFIED
+        summary = {
+            "status": report["status"],
+            "fixture": result.fixture["name"],
+            "ranks": world_size,
+            "steps_this_rank": len(result.per_step),
+            "merged_o": result.merged["o"],
+            "merged_lse": result.merged["lse"],
+            "merge_label": result.merged["merge_label"],
+            "partial_lse_source": result.merged["partial_lse_source"],
+        }
+        print(json.dumps(summary, indent=2))
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------------------
