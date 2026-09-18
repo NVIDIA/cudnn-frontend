@@ -249,9 +249,24 @@ def test_norm_custom_ops_create_handles_on_input_device(op_name):
     outputs = []
     for device_index in (0, 1):
         device = torch.device("cuda", device_index)
-        input = torch.randn(4, 64, device=device, dtype=torch.float16)
-        weight = torch.randn(64, device=device, dtype=torch.float16)
-        with torch.cuda.device(1 - device_index):
-            output = layer_norm(input, (64,), weight) if op_name == "layer_norm" else rms_norm(input, weight)
+        for _ in range(2):  # Exercise both graph-cache construction and a cache hit.
+            input = torch.randn(4, 64, device=device, dtype=torch.float16, requires_grad=True)
+            weight = torch.randn(64, device=device, dtype=torch.float16, requires_grad=True)
+            reference_input = input.detach().clone().requires_grad_(True)
+            reference_weight = weight.detach().clone().requires_grad_(True)
+            with torch.cuda.device(1 - device_index):
+                if op_name == "layer_norm":
+                    output = layer_norm(input, (64,), weight)
+                    expected = torch.nn.functional.layer_norm(reference_input, (64,), reference_weight)
+                else:
+                    output = rms_norm(input, weight)
+                    expected = _rms_norm_reference(reference_input, reference_weight)
+                grad = torch.randn_like(output)
+                output.backward(grad)
+                expected.backward(grad)
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(output, expected, atol=0.015625, rtol=0.015625)
+            torch.testing.assert_close(input.grad, reference_input.grad, atol=0.015625, rtol=0.015625)
+            torch.testing.assert_close(weight.grad, reference_weight.grad, atol=0.015625, rtol=0.015625)
         outputs.append(output)
     assert [output.device.index for output in outputs] == [0, 1]

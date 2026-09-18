@@ -20,6 +20,7 @@ TOKEN_COUNTS = {
     "decode": [32, 64, 128, 256],
     "train": [4096, 8192, 16384],
 }
+EPSILON = 1e-5
 
 
 def _benchmark(function, warmup, repeat):
@@ -42,13 +43,14 @@ def _run_case(op_name, tokens, hidden_size, warmup, repeat):
     input = torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(hidden_size, dtype=torch.bfloat16, device="cuda")
     if op_name == "rmsnorm":
-        cudnn_fn = lambda: rms_norm(input, weight)
-        torch_fn = lambda: torch.nn.functional.rms_norm(input, (hidden_size,), weight)
+        cudnn_fn = lambda: rms_norm(input, weight, eps=EPSILON)
+        torch_fn = lambda: torch.nn.functional.rms_norm(input, (hidden_size,), weight, eps=EPSILON)
     else:
         bias = torch.randn(hidden_size, dtype=torch.bfloat16, device="cuda")
-        cudnn_fn = lambda: layer_norm(input, (hidden_size,), weight, bias)
-        torch_fn = lambda: torch.nn.functional.layer_norm(input, (hidden_size,), weight, bias)
+        cudnn_fn = lambda: layer_norm(input, (hidden_size,), weight, bias, eps=EPSILON)
+        torch_fn = lambda: torch.nn.functional.layer_norm(input, (hidden_size,), weight, bias, eps=EPSILON)
 
+    torch.testing.assert_close(cudnn_fn(), torch_fn(), atol=0.03125, rtol=0.03125)
     cudnn_us = _benchmark(cudnn_fn, warmup, repeat)
     torch_us = _benchmark(torch_fn, warmup, repeat)
     return cudnn_us, torch_us

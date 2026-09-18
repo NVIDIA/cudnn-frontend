@@ -189,7 +189,7 @@ _lib.define("layernorm(Tensor x, Tensor scale, Tensor bias, float eps) -> (Tenso
 _lib.define("layernorm_bwd(Tensor dy, Tensor x, Tensor scale, Tensor mean, Tensor inv_var) -> (Tensor, Tensor, Tensor)")
 
 
-def _layernorm_impl(
+def _layernorm_impl_on_device(
     x: torch.Tensor,
     scale: torch.Tensor,
     bias: torch.Tensor,
@@ -220,6 +220,16 @@ def _layernorm_impl(
     return y, mean, inv_var
 
 
+def _layernorm_impl(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    with torch.cuda.device(x.device):
+        return _layernorm_impl_on_device(x, scale, bias, eps)
+
+
 _lib.impl("layernorm", _layernorm_impl, "CUDA")
 
 
@@ -238,7 +248,7 @@ def _layernorm_fake(
     )
 
 
-def _layernorm_bwd_impl(
+def _layernorm_bwd_impl_on_device(
     dy: torch.Tensor,
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -280,6 +290,17 @@ def _layernorm_bwd_impl(
         handle=handle,
     )
     return dx, dscale, dbias
+
+
+def _layernorm_bwd_impl(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    mean: torch.Tensor,
+    inv_var: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    with torch.cuda.device(x.device):
+        return _layernorm_bwd_impl_on_device(dy, x, scale, mean, inv_var)
 
 
 _lib.impl("layernorm_bwd", _layernorm_bwd_impl, "CUDA")

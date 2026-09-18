@@ -172,7 +172,7 @@ _lib.define("rmsnorm(Tensor x, Tensor scale, float eps, Tensor? bias=None) -> (T
 _lib.define("rmsnorm_bwd(Tensor dy, Tensor x, Tensor scale, Tensor inv_var, bool has_dbias=False) -> (Tensor, Tensor, Tensor)")
 
 
-def _rmsnorm_impl(
+def _rmsnorm_impl_on_device(
     x: torch.Tensor,
     scale: torch.Tensor,
     eps: float,
@@ -205,6 +205,16 @@ def _rmsnorm_impl(
     return y, inv_var
 
 
+def _rmsnorm_impl(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    bias: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    with torch.cuda.device(x.device):
+        return _rmsnorm_impl_on_device(x, scale, eps, bias)
+
+
 _lib.impl("rmsnorm", _rmsnorm_impl, "CUDA")
 
 
@@ -218,7 +228,7 @@ def _rmsnorm_fake(
     return torch.empty_like(x), torch.empty(x.shape[0], 1, 1, 1, dtype=torch.float32, device=x.device)
 
 
-def _rmsnorm_bwd_impl(
+def _rmsnorm_bwd_impl_on_device(
     dy: torch.Tensor,
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -257,6 +267,17 @@ def _rmsnorm_bwd_impl(
         variant[int(_UIDs.DBIAS)] = dbias
     graph.execute(variant, workspace, handle=handle)
     return dx, dscale, dbias
+
+
+def _rmsnorm_bwd_impl(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    inv_var: torch.Tensor,
+    has_dbias: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    with torch.cuda.device(x.device):
+        return _rmsnorm_bwd_impl_on_device(dy, x, scale, inv_var, has_dbias)
 
 
 _lib.impl("rmsnorm_bwd", _rmsnorm_bwd_impl, "CUDA")
