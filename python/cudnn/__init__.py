@@ -309,11 +309,19 @@ __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "EngramGateSavedForward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
+    "EngramGateSavedBackward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
+    "engram_gate_saved_forward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
+    "engram_gate_saved_backward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
     "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
 }
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "EngramGateSavedForward": (".engram", "EngramGateSavedForward"),
+    "EngramGateSavedBackward": (".engram", "EngramGateSavedBackward"),
+    "engram_gate_saved_forward": (".engram", "engram_gate_saved_forward"),
+    "engram_gate_saved_backward": (".engram", "engram_gate_saved_backward"),
     "gnn": (".gnn", None),
     "FlexAttentionBwd": (".flex_attention", "FlexAttentionBwd"),
     "FlexAttentionFwd": (".flex_attention", "FlexAttentionFwd"),
