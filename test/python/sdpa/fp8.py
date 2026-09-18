@@ -731,6 +731,17 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     seq_len_q_list = cfg.seq_len_q if hasattr(cfg, 'seq_len_q') and cfg.seq_len_q else []
     seq_len_kv_list = cfg.seq_len_kv if hasattr(cfg, 'seq_len_kv') and cfg.seq_len_kv else []
 
+    if is_ragged and torch.cuda.get_device_capability()[0] == 9:
+        # GitHub #1009: the SM90 FP8 forward kernel hangs on query tiles with no valid
+        # keys -- a batch with seq_len_kv == 0, or a TOP_LEFT left window bound that
+        # ends past the batch's keys. Per-batch lengths are runtime data, so the
+        # frontend cannot decline this at build time; skip instead of hanging CI.
+        top_left = diag_align is None or diag_align == cudnn.diagonal_alignment.TOP_LEFT
+        for q_len, kv_len in zip(seq_len_q_list, seq_len_kv_list):
+            past_keys = top_left and left_bound is not None and q_len > kv_len + left_bound
+            if q_len > 0 and (kv_len == 0 or past_keys):
+                pytest.skip(f"SM90 FP8 forward hangs on query rows with no valid keys (seq_len_q={q_len}, seq_len_kv={kv_len}, left_bound={left_bound}; GitHub #1009)")
+
     if is_ragged:
         seq_len_q_gpu = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
         seq_len_kv_gpu = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
