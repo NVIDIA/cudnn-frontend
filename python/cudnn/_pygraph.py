@@ -1050,6 +1050,17 @@ class pygraph:
             self._candidates = list(manifest.engines_for(self))
         return self._candidates
 
+    def _admittable_opt_in_engines(self) -> List["BaseEngine"]:
+        """The family's opt-in engines that are not yet candidates of this graph
+        and that the flag does not already offer — what ``_admit_opt_in_engines``
+        would add. [] when the flag is set (everything is offered already)."""
+        from .engines import manifest
+
+        if manifest.opt_in_engines_enabled():
+            return []
+        have = {e.engine_id for e in self._candidate_engines()}
+        return [e for e in manifest.engines_for(self, include_opt_in=True) if e.engine_id not in have]
+
     def _admit_opt_in_engines(self, reason: str) -> List["BaseEngine"]:
         """Add the family's opt-in engines to this graph's candidates without the
         flag, because nothing else serves it (``reason`` says what was
@@ -1057,10 +1068,7 @@ class pygraph:
         or the flag already offers everything."""
         from .engines import manifest
 
-        if manifest.opt_in_engines_enabled():
-            return []
-        have = {e.engine_id for e in self._candidate_engines()}
-        admitted = [e for e in manifest.engines_for(self, include_opt_in=True) if e.engine_id not in have]
+        admitted = self._admittable_opt_in_engines()
         if admitted:
             _LOG.info("%s; offering the opt-in engine(s) %s without %s", reason, [e.name for e in admitted], manifest._ENABLE_ENV)
             self._candidates = self._candidate_engines() + admitted
@@ -1571,10 +1579,19 @@ class pygraph:
             self._lowered_graph.check_support()
         except decline_types() as exc:
             others = [i for i, cfg in enumerate(self._plans) if i != self._plan_index and self._engine_for(cfg) is not None]
-            if self._plan_pinned or not others:
+            # An opt-in engine the flag withholds is still an entry that could
+            # serve the graph: build_plans() admits it once every backend plan
+            # has declined, so the aggregate decline must not abort build() here.
+            admissible = [] if (others or self._plan_pinned) else self._admittable_opt_in_engines()
+            if self._plan_pinned or not (others or admissible):
                 raise
             self._backend_declined = exc
-            _LOG.info("backend check_support declined the graph (%s); the plan walk still has %d python entr(y|ies)", exc, len(others))
+            _LOG.info(
+                "backend check_support declined the graph (%s); the plan walk still has %d python entr(y|ies) and %d admissible opt-in engine(s)",
+                exc,
+                len(others),
+                len(admissible),
+            )
 
     def build_plans(self, *args, ctx: Any = None, **kwargs) -> None:
         """Walk the ranked plan list from the selected index and finalize the
@@ -1654,7 +1671,10 @@ class pygraph:
                         return
         if self._backend_declined is not None and not failures:
             raise self._backend_declined  # nothing else ran: the backend's failure IS the answer
-        raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(failures or ["the plan list is empty"]))
+        detail = list(failures or ["the plan list is empty"])
+        if self._backend_declined is not None:
+            detail.append(f"(the backend declined the graph: {self._backend_declined})")
+        raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(detail))
 
     def _build_plan_at(self, index: int, *args, ctx: Any = None, **kwargs) -> None:
         """Build one entry — the single place the two sides diverge.
@@ -1868,6 +1888,17 @@ class pygraph:
             self.validate()
         if is_python_engine(engine_id):
             owners = self._owners_for_id(engine_id)
+            if not owners:
+                # A recorded (engine_id, knobs) is a deliberate pin, not a routing
+                # decision: a plan this library offered without the flag (the
+                # backend had nothing for the graph) must replay without it too.
+                from .engines import manifest
+
+                engine = manifest.engine_for_id(engine_id, include_opt_in=True)
+                if engine is not None:
+                    _LOG.info("replaying the opt-in engine %s without %s", engine.name, manifest._ENABLE_ENV)
+                    self._candidates = self._candidate_engines() + [engine]
+                    owners = [engine]
             if not owners:
                 raise ValueError(f"no python engine on this graph owns engine_id {engine_id}")
             if len(owners) > 1:

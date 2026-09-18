@@ -69,10 +69,11 @@ class EngineSlot:
     importing the engine.
 
     The gate withholds an optimization, never an operation: an opt-in engine is
-    still offered, without the flag, for a graph the cuDNN backend proposes no
-    plan for or declines at build time (``pygraph._admit_opt_in_engines``) --
-    the per-graph form of the rule that a sole-implementation family is never
-    gated.
+    still offered, without the flag, for a graph the cuDNN backend validates but
+    proposes no plan for or declines at check_support / build time
+    (``pygraph._admit_opt_in_engines``), and an explicit replay of such a plan
+    resolves it (``engine_for_id(include_opt_in=True)``) -- the per-graph form
+    of the rule that a sole-implementation family is never gated.
     """
 
     slot: int
@@ -406,20 +407,22 @@ def engines_for(graph, *, include_opt_in: bool = False):
     return list(instantiate(family, ids)) if ids else []
 
 
-def engine_for_id(engine_id: int):
+def engine_for_id(engine_id: int, *, include_opt_in: bool = False):
     """The engine that owns ``engine_id``, or None.
 
     An engine id is fully decodable from this table: the family owning the id
     block, then the slot within it. Nothing has to be registered first, which is
     what lets create_execution_plan() replay an autotune result on a fresh graph
     -- including an engine that is not a candidate for THAT graph, where the
-    replay is a deliberate pin rather than a routing decision.
+    replay is a deliberate pin rather than a routing decision. ``include_opt_in``
+    decodes a gated slot too (the replay of a plan that was offered without the
+    flag because the backend had nothing for the graph).
     """
     for family in MANIFEST:
         if not family.owns(engine_id):
             continue
-        ids = family.offered_ids()
+        ids = family.offered_ids(include_opt_in=include_opt_in)
         if engine_id not in ids.values():
-            return None  # a real slot, but gated off in this process
+            return None  # a real slot, but gated off in this process (or not a slot at all)
         return next((e for e in instantiate(family, ids) if e.engine_id == engine_id), None)
     return None

@@ -210,6 +210,25 @@ def test_d512_backward_runs_on_frost_without_the_opt_in_flag(monkeypatch):
     names = [g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]
     assert names and all(n.startswith(_ENGINE) for n in names), names
     _run()
+    # The recorded (engine_id, knobs) of such a plan replays on a fresh graph, still without the flag.
+    record = g.get_engine_and_knobs_at_index(0)
+    io = _io_dtype(torch.bfloat16)
+    g2 = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    sh = [2, 2, 512, _D]
+    t = {n: g2.tensor(name=n, dim=sh, stride=_bshd_stride(sh)) for n in ("q", "k", "v", "o", "do")}
+    t["stats"] = g2.tensor(name="stats", dim=[2, 2, 512, 1], stride=[2 * 512, 512, 1, 1], data_type=cudnn.data_type.FLOAT)
+    outs = g2.sdpa_backward(name="bwd", q=t["q"], k=t["k"], v=t["v"], o=t["o"], dO=t["do"], stats=t["stats"], attn_scale=1.0 / math.sqrt(_D))
+    for out in outs:
+        out.set_output(True).set_data_type(io).set_stride(_bshd_stride(sh))
+    g2.validate()
+    g2.build_operation_graph()
+    g2.create_execution_plan(*record)  # no create_execution_plans(): the pin is what admits the engine
+    last = g2.get_execution_plan_count() - 1
+    assert g2.get_plan_name_at_index(last).startswith(_ENGINE)
+    assert g2.get_engine_and_knobs_at_index(last) == record
+    g2.select_plan(last)
+    g2.check_support()
+    g2.build_plans()
 
 
 @pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)

@@ -1124,17 +1124,43 @@ def test_backend_check_support_decline_does_not_abort_the_walk(monkeypatch):
     g.execute({C: torch.empty(2, 2)})
 
 
-def test_backend_check_support_decline_still_raises_when_it_is_the_only_plan():
-    """...but with nothing else in the list, the decline is the answer."""
-    import cudnn
+def test_backend_check_support_decline_still_raises_when_it_is_the_only_plan(monkeypatch):
+    """...but with nothing else in the list, the decline is the answer.
 
-    g = pygraph()
-    g.matmul(torch.randn(2, 3), torch.randn(3, 2))
-    g._lowered_graph = _FakeBackend(check=cudnn.cudnnGraphNotSupportedError("nope"))
-    g._cpp_plans_created = g._cpp_bog_done = True
-    g.create_execution_plans()
+    "Nothing else" includes the family's opt-in engines: with none to admit,
+    check_support() raises at once; with an opt-in engine that then declines
+    the graph itself, the decline is recorded and build_plans() raises it."""
+    import cudnn
+    from cudnn.engines import PlanConfig, manifest
+
+    monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
+
+    class Declining(StubEngine):
+        name = "declining"
+        engine_id = _FAKE + 3
+
+        def check_support(self, graph):
+            raise NotImplementedError("declining stub")
+
+    def graph():
+        g = pygraph()
+        g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+        g._lowered_graph = _FakeBackend(check=cudnn.cudnnGraphNotSupportedError("nope"), build=cudnn.cudnnGraphNotSupportedError("nope"))
+        g._cpp_plans_created = g._cpp_bog_done = True
+        g.create_execution_plans()
+        return g
+
+    _offer(monkeypatch, Declining())  # offered but declining, no opt-in slot: nothing else can serve the graph
+    monkeypatch.setattr(pygraph, "backend_plan_entries", lambda self: [PlanConfig(0, {}, cpp_index=0)])
+    g = graph()
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="nope"):
         g.check_support()
+    _offer(monkeypatch, Declining(), opt_in=True)  # admissible, but declines the graph itself
+    g = graph()
+    g.check_support()  # tolerated: the walk may still admit the opt-in engine
+    assert "nope" in str(g._backend_declined)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="nope"):
+        g.build_plans()  # the admitted engine declines too, so the backend's decline is still the answer
 
 
 def test_execute_time_handle_reaches_a_lazily_built_python_plan(monkeypatch):
@@ -1533,6 +1559,69 @@ def test_opt_in_engine_is_admitted_when_every_backend_plan_declines_at_build(mon
     g2.select_plan(0)
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):
         g2.build_plans()
+
+
+def test_backend_aggregate_check_support_decline_reaches_the_opt_in_admission(monkeypatch):
+    """build() runs check_support() before build_plans(). The backend's aggregate
+    check_support() declining the whole graph must not abort there when an
+    opt-in engine could still be admitted by the walk -- otherwise the documented
+    "declines at build time -> runs on the open-source engine" rule is
+    unreachable from build() / execute(). A select_plan() pin stays strict."""
+    import cudnn
+    from cudnn.engines import PlanConfig, manifest
+
+    monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
+    stub = _offer(monkeypatch, StubEngine(), opt_in=True)
+    monkeypatch.setattr(pygraph, "backend_plan_entries", lambda self: [PlanConfig(0, {}, cpp_index=0)])
+
+    def graph():
+        g = pygraph()
+        C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+        g._lowered_graph = _FakeBackend(
+            check=cudnn.cudnnGraphNotSupportedError("every backend config is barred"), build=cudnn.cudnnGraphNotSupportedError("barred")
+        )
+        g._cpp_plans_created = g._cpp_bog_done = True
+        return g, C
+
+    g, C = graph()
+    g.create_execution_plans()
+    g.check_support()  # tolerated: an opt-in engine is admissible
+    g.build_plans()
+    assert g.selected_engine is stub
+    out = torch.empty(2, 2)
+    g.execute({C: out})
+    assert _marked(out)
+    g, C = graph()  # the auto-build path (execute -> build -> check_support -> build_plans)
+    out = torch.empty(2, 2)
+    g.execute({C: out})
+    assert g.selected_engine is stub and _marked(out)
+    g, C = graph()
+    g.create_execution_plans()
+    g.select_plan(0)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+        g.check_support()
+
+
+def test_replay_of_a_flag_less_admitted_plan_resolves_the_opt_in_engine(monkeypatch):
+    """A plan the library offered without the flag (the backend had nothing for
+    the graph) must replay without it: create_execution_plan(engine_id, knobs)
+    on a fresh graph resolves the gated engine as a deliberate pin."""
+    from cudnn.engines import manifest
+
+    monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
+    stub = _offer(monkeypatch, StubEngine(), opt_in=True)
+    g = pygraph()
+    C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g.create_execution_plan(stub.engine_id, None)  # no create_execution_plans(): nothing admitted the engine before
+    assert _plan_names(g) == ["stub"]
+    assert g._engine_for(g.plans[-1]) is stub
+    g.build_plans()
+    assert g.selected_engine is stub
+    out = torch.empty(2, 2)
+    g.execute({C: out})
+    assert _marked(out)
+    assert manifest.engine_for_id(stub.engine_id) is None  # the plain lookup stays gated
+    assert manifest.engine_for_id(stub.engine_id, include_opt_in=True) is stub
 
 
 def test_at_index_queries_answer_from_the_unified_list(monkeypatch):
