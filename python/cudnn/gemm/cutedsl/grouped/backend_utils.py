@@ -191,15 +191,18 @@ def wrapper_operand_meta(tensor):
     return (get_shape(tensor), get_strides(tensor), tensor.dtype, device.type, device.index)
 
 
-def block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device):
+def block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device, canonical=False):
     """MMA-interleaved (sfd_row, sfd_col) output scale-factor buffers for a (valid_m, n_out) result."""
     import torch
 
     mma_permute_order = (3, 4, 1, 5, 2, 0)
     mma_shape_row = (1, ceil_div(valid_m, 128), ceil_div(ceil_div(n_out, sf_vec_size), 4), 32, 4, 4)
     mma_shape_col = (1, ceil_div(n_out, 128), ceil_div(ceil_div(valid_m, sf_vec_size), 4), 32, 4, 4)
-    sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=device).permute(mma_permute_order)
-    sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=device).permute(mma_permute_order)
+    sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=device)
+    sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=device)
+    if not canonical:
+        sfd_row_tensor = sfd_row_tensor.permute(mma_permute_order)
+        sfd_col_tensor = sfd_col_tensor.permute(mma_permute_order)
     return sfd_row_tensor, sfd_col_tensor
 
 
