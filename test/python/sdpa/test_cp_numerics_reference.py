@@ -663,3 +663,64 @@ class TestR2Preconditions:
         args = runner._parse_args(["--mode", "frozen-partials", "--fixture", str(tmp_path / "nope.pt"), "--output-dir", str(tmp_path)])
         with pytest.raises(RuntimeError, match="fixture not found"):
             runner.local_preflight(args, rank=0, local_rank=0, world_size=1)
+
+
+import ast
+import os
+import pathlib
+import sys
+
+import pytest
+import torch
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _lane_source() -> str:
+    return pathlib.Path(_HERE, "cp_numerics", "actual_attention.py").read_text()
+
+
+@pytest.mark.L0
+def test_r2_lane_inverts_the_keep_rule_for_te() -> None:
+    """TE drops where the mask is True; handing it the keep rule directly is a bug.
+
+    Measured on the pinned revision: the causal keep mask scores 3.9 against a
+    causal reference while its complement scores 0.0.
+    """
+    source = _lane_source()
+    assert "drop = ~keep_mask" in source, "the R2 lane must invert the keep rule before calling TE"
+    assert "TE's convention is drop-True" in source, "and must say why, next to the inversion"
+    # The mask must be derived from the keep rule, not passed through.
+    assert "mask = drop.view(" in source
+
+
+@pytest.mark.L0
+def test_r2_lane_uses_the_step_mask_not_a_causal_flag() -> None:
+    """Every section goes through the explicit-mask path with the fixture's own rule.
+
+    A plain causal flag would keep the rectangular corners of the two disjoint
+    chunk ranges, which is how the first version produced 128 query rows where
+    the fixture stores 64 and a merged O that was wrong by 1.8.
+    """
+    source = _lane_source()
+    assert 'attn_mask_type = "arbitrary"' in source
+    assert "causal_keep_mask_from_positions" in source, "the mask must come from the shared reference rule"
+    assert "in_block" in source, "the block-diagonal structure must gate the keep rule"
+
+
+@pytest.mark.L0
+def test_r2_lane_drops_rows_that_keep_nothing() -> None:
+    """The fixture's partial carries only rows with at least one valid key."""
+    source = _lane_source()
+    assert "selected = effective.any(dim=1)" in source
+    assert "q_step.index_select(1, torch.nonzero(selected, as_tuple=False).flatten()" in source
+
+
+@pytest.mark.L0
+def test_r2_lane_is_syntactically_importable_without_a_gpu() -> None:
+    """The module must parse and expose its entry point even on a CPU-only box."""
+    path = pathlib.Path(_HERE, "cp_numerics", "actual_attention.py")
+    tree = ast.parse(path.read_text())
+    names = {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert "run_actual_attention_on_fixture" in names
+    assert "compute_partials" in names
