@@ -356,7 +356,38 @@ def agg_simple(
     concat_features: Optional[Tensor] = None,
     aggr: str = "sum",
 ) -> Tensor:
-    """Aggregate CSC-neighbor node/edge features and optionally append destination features."""
+    """Aggregate incoming node and edge features over a CSC graph.
+
+    For each destination node, this operation reduces the features of its
+    incoming source nodes and edges, then appends the corresponding
+    destination features. Omitted feature groups are omitted from the output.
+    At least one of ``node_features`` and ``edge_features`` must be provided.
+
+    Args:
+        graph (CscGraph): Input graph in compressed sparse column format.
+        node_features (torch.Tensor, optional): Source-node features shaped
+            ``(num_src_nodes, node_feat_dim)``.
+        edge_features (torch.Tensor, optional): Edge features shaped
+            ``(num_edges, edge_feat_dim)``. Rows use mapped edge order when
+            ``graph.map_csc_to_coo`` is present.
+        concat_features (torch.Tensor, optional): Destination features shaped
+            ``(num_dst_nodes, concat_feat_dim)``. These features are appended
+            without aggregation.
+        aggr (str): Reduction applied independently to incoming node and edge
+            features. Supported values are ``"sum"``, ``"mean"``, ``"max"``,
+            and ``"min"``. Default: ``"sum"``.
+
+    Returns:
+        torch.Tensor: Aggregated features shaped ``(num_dst_nodes,
+            node_feat_dim + edge_feat_dim + concat_feat_dim)``. Present groups
+            are ordered as node features, edge features, then destination
+            features.
+
+    Note:
+        All feature tensors must be CUDA tensors on the graph device and have
+        the same FP32, FP16, or BF16 dtype. Backward atomic accumulation may
+        be nondeterministic.
+    """
 
     output, _ = torch.ops.cudnn.gnn_agg_simple_fwd(
         graph.offsets,

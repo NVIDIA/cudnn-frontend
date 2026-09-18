@@ -710,7 +710,54 @@ def mha_gat(
     high_precision_dgrad: bool = False,
     high_precision_wgrad: bool = False,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-    """Apply GAT multi-head attention to a homogeneous or bipartite CSC graph."""
+    """Apply GAT multi-head attention to a homogeneous or bipartite CSC graph.
+
+    Pass one feature tensor for a homogeneous graph or separate source and
+    destination tensors for a bipartite graph. Deterministic backward requires
+    reverse-CSC metadata created by :meth:`CscGraph.with_reverse_csc`.
+
+    Args:
+        graph (CscGraph): Input graph in compressed sparse column format.
+        features (torch.Tensor or tuple[torch.Tensor, torch.Tensor]): Source
+            features shaped (num_src_nodes, dim_node), or a
+            (src_features, dst_features) pair with destination features shaped
+            (num_dst_nodes, dim_node).
+        attn_weights (torch.Tensor): Flat source, destination, and optional
+            edge weights with length 2 * dim_node + dim_edge.
+        edge_features (torch.Tensor, optional): Edge features shaped
+            (num_edges, dim_edge).
+        dropout_mask (torch.Tensor, optional): FP32 inverted-dropout factors
+            shaped (num_heads, num_edges). Entries use mapped edge order when
+            graph.map_csc_to_coo is present.
+        num_heads (int): Number of attention heads. Feature dimensions must be
+            divisible by this value. Default: 1.
+        concat_heads (bool): Concatenate head outputs when True; otherwise
+            average them. Default: True.
+        activation (str): Logit activation. Supported values are "linear",
+            "relu", "sigmoid", "tanh", "elu", "scalar", and "leaky_relu".
+            Default: "leaky_relu".
+        activation_alpha (float): Negative slope for "leaky_relu" or scale for
+            "scalar". Default: 0.2.
+        return_attention_weights (bool): Return post-softmax, post-dropout
+            attention coefficients with the output. Default: False.
+        deterministic (bool): Use deterministic backward reductions. The graph
+            must contain reverse-CSC metadata. Default: False.
+        high_precision_dgrad (bool): Compute source, destination, and edge
+            feature gradients in FP32 for FP16 or BF16 inputs. Requires
+            high_precision_wgrad=True. Default: False.
+        high_precision_wgrad (bool): Compute attention-weight gradients in FP32
+            for FP16 or BF16 inputs. Default: False.
+
+    Returns:
+        torch.Tensor or tuple[torch.Tensor, torch.Tensor]: The output tensor,
+        or (output, attention_weights) when return_attention_weights=True.
+        Attention weights have shape (num_heads, num_edges) and FP32 dtype.
+
+    Note:
+        PyTorch separately controls leaf-gradient accumulation. Set each
+        applicable input tensor's grad_dtype to torch.float32 to retain a
+        high-precision gradient.
+    """
     src_features, dst_features = _normalize_features(graph, features)
     feature_grad_dtype, weight_grad_dtype = _resolve_gradient_dtypes(src_features.dtype, high_precision_dgrad, high_precision_wgrad)
     output, attention, _ = torch.ops.cudnn.gnn_mha_gat_fwd(
