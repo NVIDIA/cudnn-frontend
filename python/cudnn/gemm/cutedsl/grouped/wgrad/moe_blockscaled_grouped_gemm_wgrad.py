@@ -50,6 +50,7 @@ from ..moe_utils import (
     MoEWeightMode,
     WGradInputOrder,
     WgradSfTensormapConstructor,
+    gmem_ptr_to_generic,
 )
 from ..moe_sched_extension import (
     WgradScaledGemmSchedExtension,
@@ -1023,9 +1024,22 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             sched_pipeline.consumer_release(sched_consumer_state)
             sched_consumer_state.advance()
 
+            last_acquired_expert = cutlass.Int32(-1)
             while work_tile_info.is_valid_tile:
                 k_tile_cnt = work_tile_info.k_tile_cnt
                 ext.update_expert_info(offs, work_tile_info.expert_idx)
+
+                # The preceding device kernel writes descriptors through the generic
+                # proxy. Acquire them before TMA reads, including on graph replay.
+                # Descriptors remain immutable within this kernel, so consecutive
+                # tiles of the same expert can reuse the acquire.
+                if work_tile_info.expert_idx != last_acquired_expert:
+                    if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged):
+                        cpasync.fence_tma_desc_acquire(gmem_ptr_to_generic(desc_workspace.get_desc_ptr("a", work_tile_info.expert_idx)))
+                        cpasync.fence_tma_desc_acquire(gmem_ptr_to_generic(desc_workspace.get_desc_ptr("b", work_tile_info.expert_idx)))
+                    cpasync.fence_tma_desc_acquire(gmem_ptr_to_generic(desc_workspace.get_desc_ptr("sfa", work_tile_info.expert_idx)))
+                    cpasync.fence_tma_desc_acquire(gmem_ptr_to_generic(desc_workspace.get_desc_ptr("sfb", work_tile_info.expert_idx)))
+                    last_acquired_expert = work_tile_info.expert_idx
 
                 real_a, desc_ptr_a = ext.get_gmem_tensor(
                     "a",
@@ -1458,9 +1472,18 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             sched_pipeline.consumer_release(sched_consumer_state)
             sched_consumer_state.advance()
 
+            last_acquired_expert = cutlass.Int32(-1)
             while work_tile_info.is_valid_tile:
                 k_tile_cnt = work_tile_info.k_tile_cnt
                 ext.update_expert_info(offs, work_tile_info.expert_idx)
+
+                # Only the warp issuing TMA stores needs the output descriptor.
+                # Empty experts still store zeros and must acquire it as well.
+                if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE):
+                    if warp_idx == self.epilogue_warp_id[0]:
+                        if work_tile_info.expert_idx != last_acquired_expert:
+                            cpasync.fence_tma_desc_acquire(gmem_ptr_to_generic(desc_workspace.get_desc_ptr("c", work_tile_info.expert_idx)))
+                            last_acquired_expert = work_tile_info.expert_idx
 
                 real_c, desc_ptr_c = ext.get_gmem_tensor(
                     "c",
