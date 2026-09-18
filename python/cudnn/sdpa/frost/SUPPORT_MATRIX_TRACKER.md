@@ -308,8 +308,8 @@ MHA 8/8 b=8 S_q=16 s_kv=2048 32.9 -> 29.6; MHA 32/32 b=1 S_q=16 s_kv=32768 243.5
 GQA 32/2 b=32 S_q=1 s_kv=4096 61.8 -> 51.2; padded GQA 16/2 b=32 S_q=2 bottom-right
 52.8 -> 51.2 and 32/4 b=16 52.8 -> 49.2; MHA 64/64 b=1 S_q=16 s_kv=4096 62.4 ->
 51.4; synthesized KV tail S=300 14.4 -> 12.3, S=1000 20.5 -> 20.5. The main kernel
-alone reaches trtllm-gen's 46 us at split 2; the shared combine pass (~6 us) is the
-remaining captured-path gap. Not a Capabilities change (the row's claims are
+alone reaches the 46 us of the TensorRT-LLM decode kernel (via FlashInfer) at split 2;
+the shared combine pass (~6 us) is the remaining captured-path gap. Not a Capabilities change (the row's claims are
 unchanged; this documents the lowering), Rule S2.
 
 ᵐ **PackGQA — partial packing on the d128 and d256 f16/bf16 kernels**
