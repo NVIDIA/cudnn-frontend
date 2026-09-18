@@ -650,4 +650,5 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 
 For usage examples, see test cases in `test/python/fe_api/grouped_gemm/test_grouped_gemm_dglu.py` (dense mode, unified API) and `test/python/fe_api/grouped_gemm/test_discrete_grouped_gemm_dswiglu.py` (discrete mode).
 Rubin MXFP8 activation-parameter coverage is in
-`test/python/fe_api/grouped_gemm/test_grouped_gemm_dglu_rubin_mxfp8.py`.
+`test/python/fe_api/grouped_gemm/test_grouped_gemm_dglu.py`
+(`test_rubin_mxfp8_clamped_dgeglu_*`).
