@@ -26,6 +26,11 @@ cases = [
     # Reuse accumulator and scheduler slots across multiple persistent waves.
     dict(name="multi_wave", experts=128, rows=8, k=768, n=2048, sizes=[1] * 7 + [0] * 120 + [1], pitched=False),
     dict(name="many_waves", experts=128, rows=8, k=128, n=8192, sizes=[1] * 7 + [0] * 120 + [1], pitched=False),
+    dict(name="r9_one_expert", experts=3, rows=9, k=128, n=128, sizes=[0, 9, 0], pitched=False),
+    dict(name="r17_pitched_scan", experts=35, rows=17, k=128, n=192, sizes=[0] * 32 + [1, 16, 0], pitched=True),
+    dict(name="r64_sparse", experts=128, rows=64, k=768, n=1024, sizes=[1] * 63 + [0] * 64 + [1], pitched=False),
+    dict(name="r512_skew", experts=128, rows=512, k=128, n=1024, sizes=[257] + [0] * 126 + [255], pitched=False),
+    dict(name="r513_many_waves", experts=257, rows=513, k=128, n=1024, sizes=[0] * 32 + [9] + [0] * 223 + [504], pitched=True),
 ]
 
 

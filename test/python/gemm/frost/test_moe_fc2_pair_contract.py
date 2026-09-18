@@ -31,7 +31,7 @@ def make_graph(*, r=8, n=256, k=128, pitched=False, weight_stride=None, output_s
     return g
 
 
-@pytest.mark.parametrize("options", [{}, {"r": 1}, {"pitched": True}, {"n": 2048, "k": 768}])
+@pytest.mark.parametrize("options", [{}, {"r": 1}, {"pitched": True}, {"n": 2048, "k": 768}, {"r": 9}, {"r": 17}, {"r": 64}, {"r": 512}, {"r": 513}])
 def test_fc2_supported_graphs(options):
     g = make_graph(**options)
     spec = analyze_fc2(g)
@@ -51,7 +51,8 @@ def test_fc2_supported_graphs(options):
 @pytest.mark.parametrize(
     "options",
     [
-        {"r": 9},
+        {"r": 514},
+        {"r": 0},
         {"n": 64},
         {"k": 32},
         {"epilogue": True},

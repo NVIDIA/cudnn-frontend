@@ -8,7 +8,7 @@ NVIDIA/cudnn-frontend PR1090 weight-M/token-N orientation; NVIDIA CUTLASS
 example113 layout; canonical rank5 pairing guidance and TRT-LLM gated-row
 interleaving motivation. No TRT-LLM kernel body is reused.
 
-The graph engine enforces R<=8, full output channels divisible by128,
+The graph engine enforces 1<=R<=513, full output channels divisible by128,
 K divisible by64, and positive 16-byte-aligned weight strides. The retained generated scaffold is intentionally not refactored to retain parity with the independently audited kernel.
 
 Original template: sm100 MoE grouped matmul fwd: grouped persistent scheduler + per-group A TMA

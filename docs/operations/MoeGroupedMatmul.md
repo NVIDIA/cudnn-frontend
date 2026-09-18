@@ -263,8 +263,9 @@ an independently validated early-PDL change. It builds on Yanqin Zhai's
 [SM100 swap-AB implementation](https://github.com/NVIDIA/cudnn-frontend/pull/1090),
 NVIDIA CUTLASS example 113 layout concepts, and canonical rank-5 weight pairing.
 TRT-LLM gated-row interleaving informed the exploration; no TRT-LLM kernel body
-is copied. The row-range extension reuses the generic persistent kernel. The newer
-R<=8 scheduler specialization is still experimental and is not included.
+is copied. The row-range extension reuses the generic persistent kernel. For R<=8,
+the plan selects the validated smaller scheduler path; R9–513 retains the
+generic persistent scheduler.
 
 ### Frost SM120 shared-input fusion
 
@@ -282,11 +283,11 @@ more GEMMs, separate token operands, block scales or cross-row reductions and
 quantization are declined by this fusion path. Supported single-GEMM paths
 retain their existing contracts.
 
-### Small-row BF16 output projection on SM100
+### Paired BF16 output projection on SM100
 
 The opt-in `frost_moe_fc2_pair` engine (`20402`) serves a single unfused
 `moe_grouped_matmul` with BF16 inputs/output and FP32 accumulation. It accepts
-1–8 routed rows, output widths divisible by 128, and reduction dimensions
+1–513 routed rows, output widths divisible by 128, and reduction dimensions
 divisible by 64. Expert weights use the ordinary `(E,K,N)` graph declaration,
 with contiguous K and nonoverlapping row/expert strides aligned to 16 bytes;
 no pre-shuffle or weight repacking is required. Tokens/output must be compact,
@@ -299,6 +300,16 @@ SwiGLU; the existing engine `20401` retains its SwiGLU contract. These plans
 are tuning candidates, not a performance ranking. Compilation occurs during
 plan build; execution consumes caller-owned workspace and the supplied stream,
 without allocation, conversion, or synchronization.
+
+The row-range extension reuses the existing persistent kernel, including
+multiple token tiles per expert and multiple waves of work. Coverage includes
+empty and skewed groups, expert indices beyond the first warp, pitched weights,
+retained graph captures, and changing inputs/weights/offsets. It changes engine
+eligibility, not the kernel mathematics or the meaning of the public knobs.
+At BF16 E128/top8/H2048/I768 on a 1000W B200, the measured complete FlashInfer
+MoE benefit is about11% at T8 and under0.5% at T64; tune the complete eligible
+engine combinations for the intended workload. See `FROST_MOE_HANDOFF.md` for
+exact measurements and validation boundaries.
 
 ## MoE Grouped Matmul Backward
 

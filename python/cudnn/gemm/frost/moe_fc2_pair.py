@@ -56,8 +56,8 @@ def analyze_fc2(graph, *, dynamic_shapes=False):
         raise NotImplementedError("paired FC2 requires BF16 operands/output and FP32 accumulation")
     if moe.mode != "none" or moe.offset_dtype != "int32" or moe.weight_layout is not None or moe.num_groups != moe.num_experts:
         raise NotImplementedError("paired FC2 requires one int32 offset group per canonical expert")
-    if not 1 <= mm.M <= 8 or mm.N <= 0 or mm.N % 128 or mm.K <= 0 or mm.K % 64 or moe.num_experts <= 0:
-        raise NotImplementedError("paired FC2 requires 1<=R<=8, output width divisible by128 and K divisible by64")
+    if not 1 <= mm.M <= 513 or mm.N <= 0 or mm.N % 128 or mm.K <= 0 or mm.K % 64 or moe.num_experts <= 0:
+        raise NotImplementedError("paired FC2 requires 1<=R<=513, output width divisible by128 and K divisible by64")
     if len(chain.output_specs) != 1 or len(binding.outputs) != 1:
         raise NotImplementedError("paired FC2 requires exactly one BF16 output")
     output = chain.output_specs[0]
