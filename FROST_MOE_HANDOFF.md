@@ -1,3 +1,61 @@
+## Public FC2 pipeline depth and refreshed comparison — 2026-09-18
+
+Paired BF16 FC2 engine 20402 now exposes the shared public `STAGES` knob
+(integer ID 7) with values 6 and 12. Omitting it preserves the original
+12-stage serialized record and default. Both choices are enumerated, with 12
+first; tuning selects explicitly. Depth participates in template/cache identity.
+Ordinary GEMM and paired FC1 reject this unsupported axis. Both paired engines
+accept 1–513 routed rows under their existing layout and dtype contracts.
+
+Full FlashInfer MoE on a 148-SM, 1000W B200, BF16 E128/top8/H2048/I768:
+
+| Tokens | Routing | 12 stages | 6 stages | Latency reduction |
+|---|---|---:|---:|---:|
+| 8 | Unpacked | 101.902625 us | 101.419000 us | +0.475% |
+| 8 | Packed | 101.894750 us | 101.426625 us | +0.459% |
+| 1 | Unpacked | 29.179500 us | 29.559750 us | -1.303% |
+| 1 | Packed | 28.599625 us | 28.999250 us | -1.397% |
+| 64 | Unpacked | 205.961250 us | 205.365000 us | +0.289% |
+| 64 | Packed | 205.973375 us | 205.329250 us | +0.313% |
+
+T8 is the exact public-knob implementation (audit2199, job4382694), with the
+same FE and FI source in both arms. T1/T64 are fixed-depth implementation
+ablations (audit2177, job4381966). Source analysis2196 confirms each public
+depth's template AST matches its fixed-depth counterpart after substituting
+the parameter and normalizing symbols. Results are separate matched runs;
+do not combine their percentages. This is a tuning axis, not a new algorithm,
+and the T1 regression is why 12 remains the default.
+
+Public graph audit2193 passes 177 zero-skip test executions: 33 CPU contracts
+and 26 GPU cases in each normal/memcheck/racecheck mode, 780 raw output checks,
+234 changed-reference controls and 156 captured routes. Both depths produce
+bitwise-identical outputs across matching cases. Tests cover R9/17/64/512/513,
+skew/pitches, simultaneous depth-specific plans, live inputs/weights/offsets,
+retained captures, streams, and no execute-time allocation/compilation/sync.
+Full-FI audit2199 adds 296 raw checks, 120 negative controls and 768 timing
+spans across both routes, sanitizers, live/retained/legacy captures and four
+fresh ABBA processes. CPU contracts and changed-file pre-commit hooks pass.
+Full repository CI and model E2E are not claimed.
+
+The previously pending strongest-native T8 comparison is complete (audit2167,
+job4381553): the earlier public 12-stage Frost snapshot is 102.232750 us versus
+TRT-LLM 96.686313 us, or 5.737% slower, after searching all 704 exported joint
+FC1/FC2/PDL-off/on configurations. The selected (8,41)/PDL-on native path passes
+the same live/capture/sanitizer gates before fresh ABBA timing. Both weight
+preparations are outside timing; TRT preparation includes gate/up interleave,
+row shuffles and BlockMajorK128B copies. This is not a new 6-stage-versus-TRT
+measurement. Do not subtract gains from separate experiments. The original
+job4380036 sanitizer API-warning failure remains recorded; the exact-source
+bounded retry passed. No performance roof is established.
+
+Credit: NVIDIA Frost; Kernel Factory campaign2132 candidate e459dff for the
+six-stage option; KF624/2f5c compact-resource work; Yanqin Zhai PR1090 and
+CUTLASS example113 canonical pairing; Yanqin/Yihua; FlashInfer and NVIDIA's
+TRT native finalizer. Non-winning later KF candidates are not incorporated.
+
+This section supersedes older pending-comparison and FC2 row-limit statements
+below. Earlier frozen measurements retain their original scope.
+
 ## Paired FC2 admission extended to 513 routed rows — 2026-09-17
 
 The SM100 paired BF16 projection engine20402 now accepts1–513 total routed

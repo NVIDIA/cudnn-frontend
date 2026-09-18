@@ -296,7 +296,21 @@ dimensions, operand transforms, and epilogues are declined.
 
 Use the same public M128/N8/K32-byte, single-CTA, swap-AB, static-scheduler knobs
 as engine `20401`. Engine `20402` writes both channel halves directly, without
-SwiGLU; the existing engine `20401` retains its SwiGLU contract. These plans
+SwiGLU; the existing engine `20401` retains its SwiGLU contract.
+
+Engine `20402` additionally accepts the public `cudnn.knob_type.STAGES` knob
+with values `6` or `12` for its A/B load pipeline. Omission retains the original
+12-stage plan and its serialized record. Both depths are offered for tuning,
+with 12 first; there is no shape-based performance ranking. For example, add
+`{cudnn.knob_type.STAGES: 6}` to the recorded paired-FC2 geometry before calling
+`create_execution_plan(20402, knobs)`. Unsupported depths or geometry are
+rejected before compilation. The depth is part of the template and persistent
+compile-cache identity, so both plans may remain live simultaneously. This
+axis applies to `20402`; engines `20400` and `20401` reject it.
+
+The six-stage option follows Kernel Factory campaign2132 candidate `e459dff`;
+its benefit is workload-dependent. This exposes a tuning choice rather than a
+new algorithm or a guaranteed speedup. These plans
 are tuning candidates, not a performance ranking. Compilation occurs during
 plan build; execution consumes caller-owned workspace and the supplied stream,
 without allocation, conversion, or synchronization.

@@ -185,6 +185,16 @@ class FrostMoeFc2PairEngine(FrostGemmEngine):
 
     name = "frost_moe_fc2_pair"
 
+    def knobs_to_public(self, knobs):
+        from .moe_fc2_pair import _fc2_knobs
+
+        return _fc2_knobs(knobs).to_public() if knobs is not None else {}
+
+    def knobs_from_public(self, public):
+        from .moe_fc2_pair import Fc2Knobs
+
+        return Fc2Knobs.from_public(public) if public else None
+
     def check_support(self, graph):
         from .compiler import _graph_dynamic_shapes
         from .moe_fc2_pair import analyze_fc2, device_params

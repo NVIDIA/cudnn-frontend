@@ -8,14 +8,76 @@ and the canonical rank5 pairing used by the SwiGLU sibling.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from cudnn.frost import buffers
 from .graph_analyzer import analyze_with_binding
-from .moe_pair import device_params, pair_knobs
+from .knobs import GemmKnobs
+from .moe_pair import KernelParams, device_params, pair_knobs
 
 ENGINE = "frost_moe_fc2_pair"
+
+
+@dataclass(frozen=True)
+class Fc2Knobs:
+    """Exact paired-FC2 geometry and A/B pipeline depth in public knob terms.
+
+    Missing STAGES preserves the original twelve-stage plan. The six-stage
+    alternative comes from KF2132/e459dff; its benefit depends on the workload.
+    """
+
+    geometry: GemmKnobs = field(default_factory=pair_knobs)
+    ab_stages: int = 12
+
+    def __post_init__(self):
+        if self.geometry != pair_knobs():
+            raise ValueError("paired FC2 supports only its exact M128N8 static configuration")
+        if isinstance(self.ab_stages, bool) or not isinstance(self.ab_stages, int) or self.ab_stages not in (6, 12):
+            raise ValueError("paired FC2 STAGES must be 6 or 12")
+
+    def to_public(self):
+        import cudnn
+
+        public = self.geometry.to_public()
+        if self.ab_stages != 12:
+            public[cudnn.knob_type.STAGES] = self.ab_stages
+        return public
+
+    @classmethod
+    def from_public(cls, public):
+        import cudnn
+
+        geometry = {}
+        stages = 12
+        seen_stages = False
+        for knob, value in public.items():
+            knob = cudnn.knob_type(int(knob))
+            if knob == cudnn.knob_type.STAGES:
+                if seen_stages:
+                    raise ValueError("paired FC2 STAGES must be specified once")
+                stages, seen_stages = value, True
+            else:
+                geometry[knob] = value
+        return cls(GemmKnobs.from_public(geometry), stages)
+
+
+def _fc2_knobs(knobs):
+    if knobs is None:
+        return Fc2Knobs()
+    if isinstance(knobs, Fc2Knobs):
+        return knobs
+    if isinstance(knobs, GemmKnobs):
+        return Fc2Knobs(geometry=knobs)
+    if isinstance(knobs, dict):
+        return Fc2Knobs.from_public(knobs)
+    raise ValueError("paired FC2 requires its exact public knob record")
+
+
+@dataclass(frozen=True)
+class Fc2KernelParams(KernelParams):
+    # Frozen template parameters also distinguish the persistent compile key.
+    ab_stages: int = 12
 
 
 @dataclass(frozen=True)
@@ -115,6 +177,9 @@ def build_fc2(graph, knobs):
     from .compiler import _graph_dynamic_shapes
 
     spec = analyze_fc2(graph, dynamic_shapes=_graph_dynamic_shapes(graph))
-    if knobs is not None and knobs != pair_knobs():
-        raise NotImplementedError("paired FC2 supports only its exact M128N8 static configuration")
-    return Fc2Compiled(spec, device_params())
+    try:
+        knobs = _fc2_knobs(knobs)
+    except ValueError as exc:
+        raise NotImplementedError(str(exc)) from exc
+    params = Fc2KernelParams(**asdict(device_params()), ab_stages=knobs.ab_stages)
+    return Fc2Compiled(spec, params)

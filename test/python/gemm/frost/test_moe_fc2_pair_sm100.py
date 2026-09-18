@@ -34,8 +34,9 @@ cases = [
 ]
 
 
+@pytest.mark.parametrize("stages", [12, 6], ids=["stages12", "stages6"])
 @pytest.mark.parametrize("spec", cases, ids=[case["name"] for case in cases])
-def test_fc2_native_graph_and_live_captures(spec, tmp_path):
+def test_fc2_native_graph_and_live_captures(spec, stages, tmp_path):
     import cudnn
     from cudnn.frost import buffers
 
@@ -47,7 +48,7 @@ def test_fc2_native_graph_and_live_captures(spec, tmp_path):
     sha = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
     result = dict(cases=[], checks=0, negatives=0)
     from cutlass import cute
-    from cudnn.gemm.frost.moe_pair import pair_knobs
+    from cudnn.gemm.frost.moe_fc2_pair import Fc2Knobs
     from cudnn.frost import template_loader
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
     from cuda.bindings import driver as drv
@@ -55,7 +56,7 @@ def test_fc2_native_graph_and_live_captures(spec, tmp_path):
     assert torch.cuda.get_device_capability() == (10, 0)
     generator = torch.Generator().manual_seed(1810)
     bf16, fp32 = cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT
-    knobs = pair_knobs()
+    knobs = Fc2Knobs(ab_stages=stages)
 
     def forbidden_empty(*args, **kwargs):
         raise AssertionError("execute allocated torch.empty")
@@ -168,6 +169,10 @@ def test_fc2_native_graph_and_live_captures(spec, tmp_path):
     template_path, template_params = loads.call_args.args[:2]
     assert Path(template_path).resolve() == root / "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_fc2_pair.py"
     assert template_params.grid_ctas == torch.cuda.get_device_properties(0).multi_processor_count
+    assert template_params.ab_stages == stages
+    compiled = next(iter(g._compiled_plans.values()))._compiled
+    assert compiled.module.ab_stages == stages
+    result["ab_stages"] = stages
     result.setdefault("templates", []).append(dict(path=template_path, sha256=sha(template_path), params=repr(template_params)))
     engine, actual_knobs = g.get_engine_and_knobs_at_index(0)
     assert int(engine) == 20402 and actual_knobs == knobs.to_public()
@@ -177,6 +182,7 @@ def test_fc2_native_graph_and_live_captures(spec, tmp_path):
     graphs = []
     case = dict(
         **spec,
+        ab_stages=stages,
         parent_stride=stride,
         engine=int(engine),
         workspace_bytes=workspace_bytes,

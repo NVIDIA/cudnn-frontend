@@ -136,7 +136,9 @@ epi_packed_lanes = True
 epi_dp22 = False
 epi_stage_rows = 8
 epi_chunk_elems = 8
-ab_stages = 12  # 12 * (M128xK64 weights + N8xK64 tokens) = 208,896B
+# KF2132/e459dff found six stages useful for larger routed rows; retain both
+# exact plan-time depths for workload-specific tuning.
+ab_stages = FROST_TEMPLATE_PARAMS.ab_stages
 fallback_cluster_shape_mnk = None
 mixed_a_pattern_pref = 1
 mixed_b_pattern_pref = 1
@@ -218,7 +220,7 @@ def _b_collector_op(mi):
 
 
 @cute.kernel
-def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl_compact_resources(
+def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_stages_early_pdl_compact_resources(
     m: cutlass.Int64,
     n: cutlass.Int64,
     k: cutlass.Int64,
@@ -1346,7 +1348,7 @@ def frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl_compact_resour
         nvvm.barrier_cluster_wait()
 
 
-frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl_compact_resources.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_sm100_moe_fc2_pair_m128n8k16_sched_static_stages_early_pdl_compact_resources.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
@@ -1468,7 +1470,7 @@ def _host(
     if cutlass.const_expr(not moe_static_sched):
         counter_qword = grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS
         _reset_moe_sched_counter(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
-    frost_sm100_moe_fc2_pair_m128n8k16_sched_static_s12_early_pdl_compact_resources(
+    frost_sm100_moe_fc2_pair_m128n8k16_sched_static_stages_early_pdl_compact_resources(
         problem_size[0],
         problem_size[1],
         problem_size[2],
