@@ -98,6 +98,44 @@ target_include_directories(
 
 target_compile_definitions(_compiled_module PRIVATE NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
 
+# ---------------------------------------------------------------------------
+# AOT kernel export/import (cudnn.export_to_disk / import_from_disk / ...).
+#
+# Needs the tvm-ffi headers and libtvm_ffi, which arrive with the optional
+# `cutedsl` extra (apache-tvm-ffi). When the extra is absent the bindings build
+# exactly as before and the AOT entry points raise a clear "not available in
+# this build" error.
+# ---------------------------------------------------------------------------
+option(CUDNN_FRONTEND_ENABLE_AOT "Build the AOT kernel export/import entry points." ON)
+
+if(CUDNN_FRONTEND_ENABLE_AOT)
+    execute_process(
+        COMMAND ${Python_EXECUTABLE} -c
+            "import os,tvm_ffi,tvm_ffi.libinfo as l;d=os.path.dirname(tvm_ffi.__file__);print(os.path.join(d,'include'));print(os.path.join(d,'3rdparty','dlpack','include'));print(l.find_libtvm_ffi())"
+        OUTPUT_VARIABLE TVM_FFI_PATHS
+        RESULT_VARIABLE TVM_FFI_PROBE_RESULT
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(TVM_FFI_PROBE_RESULT EQUAL 0)
+        string(REPLACE "\n" ";" TVM_FFI_PATHS "${TVM_FFI_PATHS}")
+        list(GET TVM_FFI_PATHS 0 TVM_FFI_INCLUDE_DIR)
+        list(GET TVM_FFI_PATHS 1 TVM_FFI_DLPACK_INCLUDE_DIR)
+        list(GET TVM_FFI_PATHS 2 TVM_FFI_LIBRARY)
+        message(STATUS "AOT export enabled: tvm-ffi at ${TVM_FFI_LIBRARY}")
+        # SYSTEM: the tvm-ffi headers do not survive FE's -Wall -Wextra -Werror.
+        target_include_directories(
+            _compiled_module SYSTEM
+            PRIVATE ${TVM_FFI_INCLUDE_DIR}
+            PRIVATE ${TVM_FFI_DLPACK_INCLUDE_DIR}
+        )
+        target_link_libraries(_compiled_module PRIVATE ${TVM_FFI_LIBRARY})
+        target_compile_definitions(_compiled_module PRIVATE CUDNN_FRONTEND_ENABLE_AOT)
+    else()
+        message(STATUS "AOT export disabled: apache-tvm-ffi not importable (install the 'cutedsl' extra)")
+    endif()
+endif()
+
 if(CUDNN_FRONTEND_USE_SYSTEM_DLPACK)
     target_link_libraries(
         _compiled_module
