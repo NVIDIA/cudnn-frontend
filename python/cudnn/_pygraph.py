@@ -2667,6 +2667,20 @@ def _moe_bwd_dweight_dims(node):
     return [fto[0], tok[-1], do[-1]]  # [E, H, N]
 
 
+def _mamba2_state_dims(node):
+    x = node.inputs["x"].dim
+    b = node.inputs["B"].dim
+    return [x[0], x[2], x[3], b[3]] if len(x) == len(b) == 4 else None
+
+
+def _mamba2_checkpoint_dims(node):
+    state = _mamba2_state_dims(node)
+    chunk = int(node.params.get("chunk_size", 32))
+    if state is None or chunk <= 0:
+        return None
+    return state[:2] + [(node.inputs["x"].dim[1] + chunk - 1) // chunk] + state[2:]
+
+
 def _linear_attention_final_state_dims(node):
     # [N, HO, V, K], one row per sequence -- or, when the state is addressed
     # through a ``state_indices`` pool-slot table, the caller's pool
@@ -2886,6 +2900,45 @@ _STRUCTURED_OPS = {
         push_output_dims=True,
     ),
     # ---- linear attention ----------------------------------------------------
+    "mamba2": dict(
+        node_type=NodeType.MAMBA2,
+        inputs=("x", "dt", "A", "B", "C", "D", "dt_bias", "z", "initial_state"),
+        attrs=("chunk_size", "dt_softplus", "output_final_state", "save_state_checkpoints", "intermediate_dtype"),
+        outputs=("O", "final_state", "ungated_out", "state_checkpoints"),
+        maybe={
+            "final_state": lambda n: bool(n.params.get("output_final_state", False)),
+            "ungated_out": lambda n: "z" in n.inputs,
+            "state_checkpoints": lambda n: bool(n.params.get("save_state_checkpoints", False)),
+        },
+        infer={"O": _like("x"), "final_state": _mamba2_state_dims, "ungated_out": _like("x"), "state_checkpoints": _mamba2_checkpoint_dims},
+        dtype_like={"O": "x", "final_state": "A", "ungated_out": "x", "state_checkpoints": "A"},
+        python_only=True,
+    ),
+    "mamba2_bwd": dict(
+        node_type=NodeType.MAMBA2_BWD,
+        inputs=("x", "dt", "A", "B", "C", "dO", "D", "dt_bias", "z", "initial_state", "d_final_state", "ungated_out", "state_checkpoints"),
+        attrs=("chunk_size", "dt_softplus", "intermediate_dtype"),
+        outputs=("dX", "dDt", "dA", "dB", "dC", "dD", "d_dt_bias", "dZ", "d_initial_state"),
+        maybe={
+            "dD": lambda n: "D" in n.inputs,
+            "d_dt_bias": lambda n: "dt_bias" in n.inputs,
+            "dZ": lambda n: "z" in n.inputs,
+            "d_initial_state": lambda n: "initial_state" in n.inputs,
+        },
+        infer={
+            "dX": _like("x"),
+            "dDt": _like("dt"),
+            "dA": _like("A"),
+            "dB": _like("B"),
+            "dC": _like("C"),
+            "dD": _like("D"),
+            "d_dt_bias": _like("dt_bias"),
+            "dZ": _like("z"),
+            "d_initial_state": _like("initial_state"),
+        },
+        dtype_like={"dX": "x", "dDt": "dt", "dA": "A", "dB": "B", "dC": "C", "dD": "D", "d_dt_bias": "dt_bias", "dZ": "z", "d_initial_state": "initial_state"},
+        python_only=True,
+    ),
     "gdn": dict(
         node_type=NodeType.GDN,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),

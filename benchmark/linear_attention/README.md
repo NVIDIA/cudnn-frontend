@@ -134,3 +134,20 @@ pass. Runs were captured on GB200 and GB300 (GB300 results shown below).
 ### GB300 - GDP
 ![GDP on GB300](results/gdp/gb300/gdp_fixed_batch_flops.webp)
 ![GDP on GB300, batch 1](results/gdp/gb300/gdp_low_bh_flops.webp)
+
+## Mamba-2 SSD
+
+`benchmark_mamba2.py` compares complete Mamba-2 SSD forward/backward graph
+executions with the unmodified `mamba_ssm` Triton implementation. The default
+shape is B=2, L=2048, H=64, P=N=64, G=1, chunk=32, BF16 I/O on SM100.
+
+```bash
+python benchmark_mamba2.py --mamba-repo /path/to/mamba \
+  --intermediate-dtype bfloat16 --output mamba2_b200.json
+```
+
+Use `--intermediate-dtype float32` for the default precision. The report includes
+correctness errors, source hashes, baseline commit/status, workspace sizes and
+CUDA Graph device timings. It includes timestep preprocessing, optional SiLU,
+all backward recomputation and reductions; it excludes GatedRMSNorm, causal
+convolution, projections and model execution.

@@ -8,7 +8,10 @@ from .gdn2 import gated_delta_net_v2, gated_delta_net_v2_summary_bwd, gated_delt
 from .gdp import gated_delta_product, gated_delta_product_summary_bwd, gated_delta_product_summary
 from .kda import kimi_delta_attention, kimi_delta_attention_summary_bwd, kimi_delta_attention_summary
 
+from .mamba2 import mamba2
+
 __all__ = [
+    "mamba2",
     "gated_delta_net",
     "kimi_delta_attention",
     "gated_delta_net_v2",
