@@ -3317,14 +3317,7 @@ def _graph_dynamic_shapes(graph) -> bool:
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
-def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
-    """Choose the tile strategy for one analyzed fusion chain.
-
-    ``knobs`` (a :class:`~cudnn.gemm.frost.knobs.GemmKnobs`, the replay of a
-    recorded ``(engine_id, knobs)`` plan) names one TileConfig exactly and
-    bypasses the automatic pick; a request that does not spell a canonical
-    config is a decline (NotImplementedError), never a silent snap to a
-    neighbour. Without knobs this is the automatic strategy."""
+def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
     if knobs is not None:
         try:
             config = knobs.to_config()
@@ -3369,10 +3362,30 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None)
     # the geometry and only moves when the family cannot serve it (sm120 is
     # warp-scoped MMA, 1-CTA only).
     config = preferred_strategy(chain, config)
-    # skip splitK when dynamic_shape is enabled
-    if dynamic_shapes:
+    # skip splitK for MoE and dynamic shapes
+    if chain.has_moe or dynamic_shapes:
         return config
     return _auto_split_k(chain, config)
+
+
+def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+    """Choose one strategy, or replay the exact supplied knobs."""
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, knobs=knobs)
+    if knobs is not None or dynamic_shapes:
+        return config
+    from ..planning import select_strategy
+
+    return select_strategy(chain, config, probe=probe_chain)
+
+
+def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False) -> list[TileConfig]:
+    """Choose a bounded list with the single-plan recommendation first."""
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes)
+    if dynamic_shapes:
+        return [config]
+    from ..planning import select_strategies
+
+    return select_strategies(chain, config, probe=probe_chain)
 
 
 def _precheck_plain(
