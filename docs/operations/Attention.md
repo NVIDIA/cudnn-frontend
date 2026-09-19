@@ -1176,6 +1176,106 @@ Where:
 - $D_{v}$ is the embedding dimension per head of value
 
 
+## Execute-Time Shape Overrides
+
+Unified SDPA forward distinguishes the shape a graph **declares** from the shape a
+run **uses**:
+
+| stage | what it says | who sees it |
+|---|---|---|
+| build, `pygraph(is_override_shape_enabled=True)` | the largest extent this graph will ever be asked for | the heuristic, i.e. the plan choice |
+| execute, `override_uids` / `override_shapes` / `override_strides` | the extent **this** run actually uses | the backend, at launch |
+
+The declaration is the envelope the plan is built for, not a promise about any
+one run. One plan can then serve many extents without being rebuilt, which is
+what a serving stack wants when it groups requests into length buckets.
+
+```python
+g = cudnn.pygraph(
+    io_data_type=cudnn.data_type.HALF,
+    intermediate_data_type=cudnn.data_type.FLOAT,
+    compute_data_type=cudnn.data_type.FLOAT,
+    is_override_shape_enabled=True,
+)
+Q = g.tensor(name="q", dim=[B, H, 256, D], stride=[H * 256 * D, 256 * D, D, 1], data_type=cudnn.data_type.HALF)
+K = g.tensor(name="k", dim=[B, H, 256, D], stride=[H * 256 * D, 256 * D, D, 1], data_type=cudnn.data_type.HALF)
+V = g.tensor(name="v", dim=[B, H, 256, D], stride=[H * 256 * D, 256 * D, D, 1], data_type=cudnn.data_type.HALF)
+O, _ = g.sdpa(Q, K, V, is_inference=True, attn_scale=1.0 / (D ** 0.5))
+O.set_output(True).set_data_type(cudnn.data_type.HALF)
+g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+
+# This run uses 64 of the declared 256 rows. Buffers keep the declared extent.
+q, k, v = (torch.randn(B, H, 256, D, dtype=torch.float16, device="cuda") for _ in range(3))
+o = torch.empty(B, H, 256, D, dtype=torch.float16, device="cuda")
+geometry = [B, H, 64, D]
+strides = [H * 256 * D, 256 * D, D, 1]
+g.execute(
+    {Q: q, K: k, V: v, O: o},
+    workspace,
+    override_uids=[Q.get_uid(), K.get_uid(), V.get_uid(), O.get_uid()],
+    override_shapes=[geometry, geometry, geometry, geometry],
+    override_strides=[strides, strides, strides, strides],
+)
+```
+
+### What an override does and does not do
+
+- **Buffers are sized for the declaration.** An override says how much of a
+  declared buffer this run uses; it neither shrinks the allocation nor re-packs
+  the layout, and the strides describe the declared storage. Allocating only the
+  run's extent leaves the kernel addressing past the buffer.
+- **The plan is chosen at build time.** `override_*` does not re-run the
+  heuristic and does not reselect an engine, so grouping lengths into buckets is
+  the caller's policy rather than something this feature does. Two graphs
+  declared at different extents are two different plans.
+- **It is not `set_dynamic_shape_enabled` / the kernel cache.** That feature
+  reuses compiled kernels across dynamic-shape graphs (see
+  [Dynamic Shapes and Kernel Cache](../utilities/dynamic-kernel-cache.md)); this
+  one keeps a single plan and re-describes its operands per run.
+- **It is not CUDA graph capture/replay.** Overrides are an execute-path
+  argument; capturing a graph populated with a fixed variant pack is a separate
+  contract.
+
+### Boundaries
+
+Measured on an L20 (SM89), cuDNN 9.26, FP16, `B=1 H=4 D=64`, plan
+`eng8_k24=1_k27=0_k38=0_k40=3_k41=1`, buffers allocated at the declared extent:
+
+| declared | run | result |
+|---|---|---|
+| 256, non-causal | 64 / 128 / 192 / 256 | served, max abs error ~3e-4 (FP16 storage) |
+| 256, causal | 2 ... 256 | served, same error |
+| 256, `generate_stats=True` | 64 | served, O and Stats both follow the override |
+| 1 (decode), KV declared 256 | `s_q=1`, `s_kv=64` | served |
+| 256 | `s_q = 1` | **rejected**: `CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE` |
+| 256 | 96 / 160 (non-causal, off the 64-row tile grid) | **not rejected, wrong output** |
+| 256 | 320 / 512 (beyond the declaration) | **not rejected**: wrong output / NaN |
+| any | `override_uids` and `override_shapes` of different length | rejected at variant-pack finalize (`CUDNN_STATUS_BAD_PARAM`) |
+
+Two consequences are worth stating plainly, because neither is an error a caller
+can catch:
+
+1. **Decode and prefill are different engine classes.** A declared prefill graph
+   cannot be overridden to `s_q == 1`, and a graph declared at `s_q == 1` should
+   not be expected to serve prefill lengths. Keep one graph per class.
+2. **The legal window is narrower than "anything up to the declaration".** In the
+   non-causal class only multiples of the plan's Q tile were served on the
+   measured configuration; the other lengths produced wrong output without an
+   error. Validate the window you intend to use against your own plan and shapes
+   before relying on it, and prefer run extents that match the declaration's
+   tiling.
+
+The `s_q == 1` boundary and the declared-max-length sensitivity of the heuristic
+(an `eng8` -> `eng10` flip between a declared 128 and 256, and 2.0-2.3x cost on
+4-token rows on B200) were reported in
+[#1087](https://github.com/NVIDIA/cudnn-frontend/issues/1087) for SM100/SM107.
+Those numbers belong to the reporter's platform; the table above is this
+repository's L20 measurement, and on that configuration the plan list did not
+change between a declared 64 and a declared 256. The split-KV note in the same
+report (an override forces the split-KV factor to 1; 1.2-1.6x on low-occupancy
+shapes for the per-batch `seq_len` form) is likewise the reporter's measurement
+and has not been repeated here.
+
 ## FAQs
 
 ### Logical vs Physical Layout
