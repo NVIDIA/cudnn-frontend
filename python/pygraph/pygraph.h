@@ -482,6 +482,8 @@ class PyGraph {
                   bool const use_padding_mask,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
                   py::object const& max_total_seq_len_q,
                   py::object const& max_total_seq_len_kv,
                   bool const use_causal_mask,
@@ -498,7 +500,8 @@ class PyGraph {
                   std::optional<PyCallback> fn,
                   std::optional<PyCallback> fn_bprop,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
+                  cudnn_frontend::AttentionImplementation_t const& implementation);
 
     // return [o, stats, amax_s, amax_o]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 4>

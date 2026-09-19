@@ -87,7 +87,8 @@ def validate_config(cfg):
 
     if cfg.is_cu_seq_len:
         assert cfg.is_padding == True, "is_cu_seq_len=True requires is_padding=True"
-        assert cfg.is_train == False, "is_cu_seq_len=True is forward-only (cu_seq_len is not plumbed for backward)"
+        # cu_seq_len_q / cu_seq_len_kv reach the backward graph too (unified backward, cuDNN 9.28+); the composite
+        # backward waives them through the support surface.
         assert cfg.cu_seq_len_sides in ("both", "q", "kv"), f"invalid cu_seq_len_sides={cfg.cu_seq_len_sides}"
 
     assert isinstance(cfg.seq_len_q, (list, tuple)), "input 'seq_len_q' must be list or tuple"
@@ -113,6 +114,10 @@ def validate_config(cfg):
     if cudnn_version < "9.13.1" and cfg.implementation == cudnn.attention_implementation.UNIFIED:
         print("@@@@ Overall result: WAIVED, unified SDPA implementation requires cudnn 9.13.1 or higher.")
         pytest.skip("unified SDPA implementation requires cudnn 9.13.1 or higher")
+
+    if cudnn_version < "9.27.0" and cfg.is_train and cfg.implementation == cudnn.attention_implementation.UNIFIED:
+        print("@@@@ Overall result: WAIVED, unified SDPA backward implementation requires cudnn 9.27.0 or higher.")
+        pytest.skip("unified SDPA backward implementation requires cudnn 9.27.0 or higher")
 
     if cfg.s_q == cfg.s_kv == 1:
         print("@@@@ Overall result: WAIVED, skipping known issue of s_q == s_kv == 1.")
@@ -440,6 +445,14 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
     except cudnn.cudnnGraphNotSupportedError as e:
         print(f"@@@@ Overall result: WAIVED, not supported forward graph. {e}")
         pytest.skip("not supported forward graph")
+    except RuntimeError as e:
+        # AUTO found no forward implementation for this attribute set on this device (e.g. dropout with the
+        # packed layouts only the unified backward serves): nothing to test here.
+        if "No suitable implementation" not in str(e):
+            print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during forward graph build. {e}")
+            pytest.fail("unexpected exception during forward graph build", pytrace=False)
+        print(f"@@@@ Overall result: WAIVED, no SDPA forward implementation supports this graph. {e}")
+        pytest.skip("no SDPA forward implementation supports this graph")
     except Exception as e:
         print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during forward graph build. {e}")
         pytest.fail("unexpected exception during forward graph build", pytrace=False)
@@ -511,10 +524,15 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
     bias_dim = (1, cfg.h_q, cfg.s_q, cfg.s_kv)
     bias_stride = (cfg.h_q * cfg.s_q * cfg.s_kv, cfg.s_q * cfg.s_kv, cfg.s_kv, 1)
     bias = graph.tensor(uid=int(TensorUid.bias), dim=bias_dim, stride=bias_stride, data_type=cudnn_dtype) if cfg.is_bias else None
-    dBias = graph.tensor(uid=int(TensorUid.dBias), dim=bias_dim, stride=bias_stride, data_type=cudnn_dtype) if cfg.is_bias and not(cfg.d_qk == 256 and cfg.d_v == 256) else None
+    # with_dbias=False requests the bias input without its gradient (the unified backward applies the bias but has no
+    # dBias output yet); the dBias comparison below is skipped when the tensor is absent.
+    dBias = graph.tensor(uid=int(TensorUid.dBias), dim=bias_dim, stride=bias_stride, data_type=cudnn_dtype) if cfg.is_bias and getattr(cfg, "with_dbias", True) and not(cfg.d_qk == 256 and cfg.d_v == 256) else None
+    cfg.has_dbias = dBias is not None  # the allocation table always holds a dBias buffer; key the checks on the graph tensor
 
-    seq_len_q = graph.tensor(uid=int(TensorUid.seq_len_q), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_padding else None
-    seq_len_kv = graph.tensor(uid=int(TensorUid.seq_len_kv), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_padding else None
+    seq_len_q = graph.tensor(uid=int(TensorUid.seq_len_q), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if (cfg.is_padding and not cfg.is_cu_seq_len_q()) else None
+    seq_len_kv = graph.tensor(uid=int(TensorUid.seq_len_kv), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if (cfg.is_padding and not cfg.is_cu_seq_len_kv()) else None
+    cu_seq_len_q = graph.tensor(uid=int(TensorUid.cu_seq_len_q), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_cu_seq_len_q() else None
+    cu_seq_len_kv = graph.tensor(uid=int(TensorUid.cu_seq_len_kv), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_cu_seq_len_kv() else None
 
     seed = offset = dropout_tuple = None
     if cfg.is_dropout:
@@ -539,6 +557,8 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         use_padding_mask=cfg.is_padding,
         seq_len_q=seq_len_q,
         seq_len_kv=seq_len_kv,
+        cu_seq_len_q=cu_seq_len_q,
+        cu_seq_len_kv=cu_seq_len_kv,
         max_total_seq_len_q=max_t_q,
         max_total_seq_len_kv=max_t_kv,
         diagonal_band_left_bound=cfg.left_bound,
@@ -548,6 +568,7 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         use_deterministic_algorithm=cfg.is_determin,
         sink_token=sink_token,
         dSink_token=dSink_token,
+        implementation=getattr(cfg, "bwd_implementation", None) or cfg.implementation,
     )
 
     dQ.set_uid(int(dq_uid_out)).set_output(True).set_dim(cfg.shape_q).set_stride(cfg.stride_q)
@@ -578,6 +599,16 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         dK.set_ragged_offset(k_ragged_offset)
         dV.set_ragged_offset(v_ragged_offset)
         dO.set_ragged_offset(o_ragged_offset)
+        if cfg.with_ragged_offset_multiplier:
+            # the offset tables are in multiplier units; the gradients share Q/K/V/O's tables
+            q.set_ragged_offset_multiplier(cfg.d_qk)
+            k.set_ragged_offset_multiplier(cfg.d_qk)
+            v.set_ragged_offset_multiplier(cfg.d_v)
+            o.set_ragged_offset_multiplier(cfg.d_v)
+            dQ.set_ragged_offset_multiplier(cfg.d_qk)
+            dK.set_ragged_offset_multiplier(cfg.d_qk)
+            dV.set_ragged_offset_multiplier(cfg.d_v)
+            dO.set_ragged_offset_multiplier(cfg.d_v)
 
     try:
         graph.validate()
@@ -589,6 +620,14 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
     except cudnn.cudnnGraphNotSupportedError as e:
         print(f"@@@@ Overall result: WAIVED, not supported backward graph. {e}")
         pytest.skip("not supported backward graph")
+    except RuntimeError as e:
+        # AUTO found no implementation for this attribute set on this device (e.g. cumulative sequence
+        # lengths off SM10x): nothing to test, the per-implementation surfaces are exercised elsewhere.
+        if "No suitable implementation" not in str(e):
+            print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during backward graph build. {e}")
+            pytest.fail("unexpected exception during backward graph build", pytrace=False)
+        print(f"@@@@ Overall result: WAIVED, no SDPA backward implementation supports this graph. {e}")
+        pytest.skip("no SDPA backward implementation supports this graph")
     except Exception as e:
         print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during backward graph build. {e}")
         pytest.fail("unexpected exception during backward graph build", pytrace=False)
@@ -606,9 +645,11 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         int(TensorUid.dV): tensors.get(TensorUid.dV),
         int(TensorUid.dO): tensors.get(TensorUid.dO),
         int(TensorUid.bias): tensors.get(TensorUid.bias),
-        int(TensorUid.dBias): tensors.get(TensorUid.dBias),
+        int(TensorUid.dBias): tensors.get(TensorUid.dBias) if getattr(cfg, "has_dbias", True) else None,
         int(TensorUid.seq_len_q): tensors.get(TensorUid.seq_len_q),
         int(TensorUid.seq_len_kv): tensors.get(TensorUid.seq_len_kv),
+        int(TensorUid.cu_seq_len_q): tensors.get(TensorUid.cu_seq_len_q),
+        int(TensorUid.cu_seq_len_kv): tensors.get(TensorUid.cu_seq_len_kv),
         int(TensorUid.q_ragged_offset): tensors.get(TensorUid.q_ragged_offset),
         int(TensorUid.k_ragged_offset): tensors.get(TensorUid.k_ragged_offset),
         int(TensorUid.v_ragged_offset): tensors.get(TensorUid.v_ragged_offset),
@@ -641,13 +682,13 @@ def check_deterministic(cfg, tensors, allocs, bwd_graph, bwd_pack, cudnn_handle,
     dQ_gpu_rerun = dQ_gpu.clone().detach()
     dK_gpu_rerun = dK_gpu.clone().detach()
     dV_gpu_rerun = dV_gpu.clone().detach()
-    if cfg.is_bias:
+    if cfg.is_bias and getattr(cfg, "has_dbias", True):
         dBias_gpu_rerun = dBias_gpu.clone().detach()
     
     torch.fill_(dQ_gpu, float("nan"))
     torch.fill_(dK_gpu, float("nan"))
     torch.fill_(dV_gpu, float("nan"))
-    if cfg.is_bias:
+    if cfg.is_bias and getattr(cfg, "has_dbias", True):
         torch.fill_(dBias_gpu, float("nan"))
     bwd_graph.execute(bwd_pack, workspace[0], cudnn_handle)
     torch.cuda.synchronize()
@@ -656,7 +697,7 @@ def check_deterministic(cfg, tensors, allocs, bwd_graph, bwd_pack, cudnn_handle,
     determin_err_count += exact_equal(dQ_gpu, dQ_gpu_rerun, tag="dQ_determin", disp_elems=request.config.getoption("--diffs"))
     determin_err_count += exact_equal(dK_gpu, dK_gpu_rerun, tag="dK_determin", disp_elems=request.config.getoption("--diffs"))
     determin_err_count += exact_equal(dV_gpu, dV_gpu_rerun, tag="dV_determin", disp_elems=request.config.getoption("--diffs"))
-    if cfg.is_bias and not(cfg.d_qk == 256 and cfg.d_v == 256):
+    if cfg.is_bias and getattr(cfg, "has_dbias", True) and not(cfg.d_qk == 256 and cfg.d_v == 256):
         determin_err_count += exact_equal(dBias_gpu, dBias_gpu_rerun, tag="dBias_determin", disp_elems=request.config.getoption("--diffs"))
     # NOTE: dSink_token is implemented non-deterministically (even if determinism enabled),
     # therefore not included in this check.
@@ -665,7 +706,7 @@ def check_deterministic(cfg, tensors, allocs, bwd_graph, bwd_pack, cudnn_handle,
         print("@@@@ Overall result: FAILED, determinism check failed - outputs differ between runs.")
         pytest.fail("determinism check failed", pytrace=False)
     print("@@@@ Determinism check: PASSED, dQ, dK, dV" + 
-          (", dBias" if cfg.is_bias else "") + " bitwise match between runs.")
+          (", dBias" if cfg.is_bias and getattr(cfg, "has_dbias", True) else "") + " bitwise match between runs.")
 
 
 def execute_graph(graph, variant_pack, allocs, tensors, cudnn_handle, request, label="Graph"):
@@ -876,7 +917,7 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
         print_tensor_stats(allocs[TensorUid.dQ][0], tag="dQ_gpu")
         print_tensor_stats(allocs[TensorUid.dK][0], tag="dK_gpu")
         print_tensor_stats(allocs[TensorUid.dV][0], tag="dV_gpu")
-        if cfg.is_bias:
+        if cfg.is_bias and getattr(cfg, "has_dbias", True):
             print_tensor_stats(allocs[TensorUid.dBias][0], tag="dBias_gpu")
         if cfg.with_sink_token:
             print_tensor_stats(allocs[TensorUid.dSink_token][0], tag="dSink_token_gpu")
@@ -909,7 +950,7 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
         err_count += approx_equal(allocs[TensorUid.dQ], dQ_ref, atol=2e-2, rtol=2e-2, tag="dQ", disp_elems=diffs)
         err_count += approx_equal(allocs[TensorUid.dK], dK_ref, atol=dkv_atol, rtol=2e-2, tag="dK", disp_elems=diffs)
         err_count += approx_equal(allocs[TensorUid.dV], dV_ref, atol=dkv_atol, rtol=2e-2, tag="dV", disp_elems=diffs)
-    if cfg.is_train and cfg.is_bias and not(cfg.d_qk == 256 and cfg.d_v == 256):
+    if cfg.is_train and cfg.is_bias and getattr(cfg, "has_dbias", True) and not(cfg.d_qk == 256 and cfg.d_v == 256):
         err_count += approx_equal(allocs[TensorUid.dBias], dBias_ref, atol=2e-2, rtol=2e-2, tag="dBias", disp_elems=diffs)
     if cfg.is_train and cfg.with_sink_token:
         err_count += approx_equal(allocs[TensorUid.dSink_token], dSink_token_ref, atol=4e-2, rtol=2e-2, tag="dSink_token", disp_elems=diffs)
