@@ -11,6 +11,7 @@ import cudnn
 import pytest
 import torch
 
+from cudnn.sdpa import band
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.bwd import engines as bwd_engines
 from cudnn.sdpa.fwd import engines
@@ -748,8 +749,29 @@ def test_capabilities_positional_prefix_is_append_only():
     legacy_tail = ["pack_gqa_d_shapes", "thd_padded_stats", "epilogue_gate", "epilogue_gate_d_shapes", "epilogue_gate_dtypes"]
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
-    # ... and every later field is appended after it, in the order it landed.
-    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes"], names[start:]
+    # ... and every later field is appended after it, in the order it landed:
+    # the canonical band set (#601) is the newest one and sits at the very end,
+    # so a positional construction written before it keeps binding.
+    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes", "band"], names[start:]
+
+    # Positional construction in the PRE-BAND order (every row's spelling before
+    # the canonical model landed) still binds every field, and the appended band
+    # set is DERIVED from those flags rather than shadowing them.  The row built
+    # here carries the pre-band defaults, so its claim is unmasked-only.
+    pre_band_order = [n for n in names if n != "band"]
+    pre_band = engines.Capabilities(*[legacy_value(n) for n in pre_band_order])
+    assert pre_band.sm_lo == 100 and pre_band.d_shapes == frozenset({(128, 128)})
+    assert pre_band.causal is False and pre_band.swa is False
+    assert pre_band.band == band.BandSupport.unmasked_only()
+
+    # ... and the row's claim is exactly the legacy flags' mapping (the
+    # normalization layer is one-directional: flags in, canonical set out).
+    assert pre_band.band == band.BandSupport.from_legacy_flags(
+        causal=pre_band.causal,
+        bottom_right=pre_band.bottom_right,
+        swa=pre_band.swa,
+        right_band_widening=pre_band.right_band_widening,
+    )
 
 
 def test_knob_request_pack_gqa_false_always_eligible():
