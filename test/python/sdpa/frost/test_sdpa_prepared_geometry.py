@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Host-only contracts for reuse of a prepared THD plan's pure geometry calculation."""
+"""Host-only contracts for reuse of prepared plans' pure geometry calculations."""
 
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -114,3 +114,61 @@ def test_thd_geometry_reuse_keeps_padded_stats_seed_per_call(monkeypatch):
     _bind(spec, replacement, stream=23)
     assert spec._geometry_cache[1] is geometry
     assert [(ptr, stream) for ptr, _, _, stream in seeds] == [(0x20000, 17), (0x50000, 23)]
+
+
+def test_dense_geometry_cache_keys_shape_strides_and_element_width():
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+    dense_bind_strides.cache_clear()
+    shape, strides = (2, 2, 2, 8), (40, 8, 16, 1)
+    assert dense_bind_strides(shape, strides, 2) == (40, 16, 8)
+    assert dense_bind_strides(shape, strides, 2) == (40, 16, 8)
+    assert dense_bind_strides.cache_info().hits == 1
+    assert dense_bind_strides(shape, strides, 1) is None, "alignment depends on element width"
+    assert dense_bind_strides(shape, (32, 8, 16, 2), 2) is None, "the stepped inner stride must remain one"
+    assert dense_bind_strides((1, 2, 2, 8), (999, 8, 16, 1), 2) == (32, 16, 8)
+    assert dense_bind_strides(shape, (999, 8, 16, 1), 2) is None, "a formerly singleton axis becomes addressable"
+
+
+def test_dense_geometry_cache_is_bounded_and_safe_across_layouts():
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+    dense_bind_strides.cache_clear()
+    cases = [((2, 8, seq, 128), (seq * 1024, 128, 1024, 1), 2) for seq in range(1, 321)]
+    expected = [dense_bind_strides.__wrapped__(*args) for args in cases]
+    with ThreadPoolExecutor(2) as pool:
+        assert list(pool.map(lambda args: dense_bind_strides(*args), cases)) == expected
+        assert list(pool.map(lambda args: dense_bind_strides(*args), reversed(cases))) == list(reversed(expected))
+    assert dense_bind_strides.cache_info().currsize == 256
+    assert dense_bind_strides(*cases[0]) == expected[0], "an evicted layout must still use the same predicate"
+
+
+@pytest.mark.parametrize(
+    "updates,match",
+    [
+        ({"device": (1, 0)}, "CUDA device"),
+        ({"device": (2, 1)}, "CUDA device"),
+        ({"dtype": "float32"}, "dtype"),
+        ({"ptr": 4097}, "16-byte aligned"),
+        ({"span": 2047}, "spans"),
+        ({"shape": (3, 8, 1, 128)}, "batch 3"),
+        ({"shape": (2, 8, 2, 128)}, "sequence length 2"),
+        ({"shape": (2, 7, 1, 128)}, "8 heads"),
+    ],
+)
+def test_dense_geometry_warm_cache_preserves_per_call_binding_checks(updates, match):
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+    spec = SimpleNamespace(b=2, device_index=0)
+    original = prep.BufferFacts(4096, "bfloat16", (2, 0), 2048, (2, 8, 1, 128), (1024, 128, 1024, 1))
+
+    def bind(fact):
+        return prep._dense_role(spec, {"q": fact}, "q", 8, 128, 1, "bfloat16")
+
+    before = bind(original)
+    hits = dense_bind_strides.cache_info().hits
+    assert bind(original._replace(ptr=8192)).ptr == 8192
+    assert before.ptr == 4096
+    assert dense_bind_strides.cache_info().hits == hits + 1
+    with pytest.raises(ValueError, match=match):
+        bind(original._replace(**updates))
