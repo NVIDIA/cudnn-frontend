@@ -164,7 +164,13 @@ def check_invariants(
 
     by_rank: Dict[int, List[TraceRecord]] = {r: [] for r in range(cp_size)}
     for rec in records:
-        by_rank.setdefault(rec.rank, []).append(rec)
+        # Fail closed on a stray rank.  Every check below iterates range(cp_size),
+        # so a record outside it would be skipped by all of them while the slot
+        # count still added up -- a trace with an out-of-domain record would pass
+        # with every invariant green.
+        if not 0 <= rec.rank < cp_size:
+            raise ValueError(f"trace record carries rank {rec.rank}, outside 0..{cp_size - 1}")
+        by_rank[rec.rank].append(rec)
 
     # --- coverage without duplication ---------------------------------
     problems: List[str] = []

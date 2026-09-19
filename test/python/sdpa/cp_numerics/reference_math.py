@@ -12,8 +12,12 @@ separate implementations that are used for three different purposes:
 ``chunk_partials_fp64`` / ``chunk_partial_with_mask_fp64``
     normalise one key/value chunk on its own, producing ``(O_i, L_i)`` pairs.
     These are the **inputs** handed to the merge under test. The chunked path
-    shares no code with ``full_attention_fp64`` beyond the mask predicate, so a
-    bug in the monolithic path cannot silently cancel a bug in the chunked path.
+    differs from ``full_attention_fp64`` only in the key set it sees: both call
+    ``_normalise`` (the softmax normalisation, the empty-row policy and the LSE
+    formula), so a bug in that shared surface would cancel in a
+    monolithic-versus-chunked agreement. That is why the merge ORDER under test
+    is graded against the frozen partials and the closed form below, not against
+    the shared normalisation.
 ``analytic_merge_fp64``
     the closed-form merge from the execution plan::
 
