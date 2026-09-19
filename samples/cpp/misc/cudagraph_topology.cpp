@@ -285,10 +285,10 @@ walk_graph(cudaGraph_t graph, std::string const &path, int depth, TopoSummary &s
 
         std::string dependents = "[";
         size_t dependent_count = 0;
-        if (cudaGraphNodeGetDependentNodes(nodes[i], nullptr, &dependent_count) == cudaSuccess) {
+        if (cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(nodes[i], nullptr, &dependent_count) == cudaSuccess) {
             std::vector<cudaGraphNode_t> dependent_nodes(dependent_count);
             if (dependent_count > 0 &&
-                cudaGraphNodeGetDependentNodes(nodes[i], dependent_nodes.data(), &dependent_count) == cudaSuccess) {
+                cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(nodes[i], dependent_nodes.data(), &dependent_count) == cudaSuccess) {
                 for (size_t d = 0; d < dependent_count; ++d) {
                     auto it = index_of.find(dependent_nodes[d]);
                     dependents +=
@@ -301,10 +301,10 @@ walk_graph(cudaGraph_t graph, std::string const &path, int depth, TopoSummary &s
 
         std::string dependencies = "[";
         size_t dependency_count  = 0;
-        if (cudaGraphNodeGetDependencies(nodes[i], nullptr, &dependency_count) == cudaSuccess) {
+        if (cudnn_frontend::detail::cuda_graph_node_get_dependencies(nodes[i], nullptr, &dependency_count) == cudaSuccess) {
             std::vector<cudaGraphNode_t> dependency_nodes(dependency_count);
             if (dependency_count > 0 &&
-                cudaGraphNodeGetDependencies(nodes[i], dependency_nodes.data(), &dependency_count) == cudaSuccess) {
+                cudnn_frontend::detail::cuda_graph_node_get_dependencies(nodes[i], dependency_nodes.data(), &dependency_count) == cudaSuccess) {
                 for (size_t d = 0; d < dependency_count; ++d) {
                     auto it = index_of.find(dependency_nodes[d]);
                     dependencies +=
@@ -1714,10 +1714,10 @@ TEST_CASE("186 P4 G06: frontend auxiliary memcpy node ordering and behaviour", "
     bool ordering_ok = false;
     for (auto memcpy_node : memcpy_nodes) {
         size_t dependent_count = 0;
-        REQUIRE(cudaGraphNodeGetDependentNodes(memcpy_node, nullptr, &dependent_count) == cudaSuccess);
+        REQUIRE(cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(memcpy_node, nullptr, &dependent_count) == cudaSuccess);
         std::vector<cudaGraphNode_t> dependent_nodes(dependent_count);
         if (dependent_count > 0) {
-            REQUIRE(cudaGraphNodeGetDependentNodes(memcpy_node, dependent_nodes.data(), &dependent_count) ==
+            REQUIRE(cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(memcpy_node, dependent_nodes.data(), &dependent_count) ==
                     cudaSuccess);
             for (auto candidate : dependent_nodes) {
                 for (auto graph_node : graph_nodes) {

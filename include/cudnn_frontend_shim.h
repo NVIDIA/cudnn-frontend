@@ -327,6 +327,33 @@ cuda_graph_node_get_dependent_nodes(cudaGraphNode_t node,
 #endif
 }
 
+// 4-parameter shim for cudaGraphNodeGetDependencies.
+// Same story as the DependentNodes shim above: the edge-data form exists from
+// CUDA 12.3, and the 3-parameter form is gone in CUDA 13.0.
+#if (CUDART_VERSION >= 13000)
+inline cudaError_t
+cuda_graph_node_get_dependencies_v2(cudaGraphNode_t node,
+                                    cudaGraphNode_t *pDependencies,
+                                    cudaGraphEdgeData *edgeData,
+                                    size_t *pNumDependencies) {
+    NV_FE_CALL_TO_CUDA(
+        cuda_graph_node_get_dependencies_v2, cudaGraphNodeGetDependencies, node, pDependencies, edgeData, pNumDependencies);
+}
+#endif
+
+// 3-parameter shim for cudaGraphNodeGetDependencies.
+inline cudaError_t
+cuda_graph_node_get_dependencies(cudaGraphNode_t node, cudaGraphNode_t *pDependencies, size_t *pNumDependencies) {
+#if (CUDART_VERSION >= 13000)
+    // The 3-parameter version of cudaGraphNodeGetDependencies was removed in CUDA 13.0,
+    // so call the other shim.
+    return cuda_graph_node_get_dependencies_v2(node, pDependencies, /*edgeData=*/nullptr, pNumDependencies);
+#else
+    NV_FE_CALL_TO_CUDA(
+        cuda_graph_node_get_dependencies, cudaGraphNodeGetDependencies, node, pDependencies, pNumDependencies);
+#endif
+}
+
 inline cudaError_t
 cuda_graph_add_memcpy_node_set_params_1D(cudaGraphNode_t node,
                                          void *dst,
