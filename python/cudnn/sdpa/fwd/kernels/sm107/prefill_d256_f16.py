@@ -2060,11 +2060,11 @@ def _host(
     meta_ptr: cute.Pointer,
     o_desc_ptr: cute.Pointer,
     problem_size: Tuple[int, int, int, int, int, int],
-    q_strides: Tuple[int, int, int],
-    k_strides: Tuple[int, int, int],
-    v_strides: Tuple[int, int, int],
-    o_strides: Tuple[int, int, int],
-    lse_strides: Tuple[int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_ext: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
@@ -2076,7 +2076,7 @@ def _host(
     # Fused epilogue gate, [B, S, H_q, D_v] like O: a pointer + runtime (batch, seq, head) strides;
     # None iff CFG.EPILOGUE_GATE == 0 (sdpa_gate_tensor folds the slot out).
     gate_ptr: Optional[cute.Pointer],
-    gate_strides: Tuple[int, int, int],
+    gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
@@ -2086,8 +2086,10 @@ def _host(
 
     Operands are ``[B, S, H, D]`` with the head dim innermost; ``*_strides`` carry the
     (seq, head) element strides. ``problem_size`` = (B, QH, KH, SQ, SKV, 0); under THD
-    SQ/SKV are the packed token totals. Dense batch strides are ``S * seq_stride``
-    (Int64); a packed THD operand has batch extent 1 and binds the seq stride there.
+    SQ/SKV are the packed token totals. Dense batch strides are ``S * seq_stride``; a
+    packed THD operand has batch extent 1 and binds the seq stride there. Every stride
+    leaf is Int64 (the ``compile()`` fakes fix the width): a 16-bit operand with
+    S * H * D >= 2^27 elements would wrap the Int32 TMA-unit scaling.
     ``lse_kind``: "dense" (B, QH, SQ) in ``lse_strides``; "token" (SQ, QH) packed;
     "head" (1, QH, lse_ext); "padded" (B, QH, lse_ext, 1) in ``lse_strides``. None
     pointers compile their paths out."""
@@ -2279,6 +2281,7 @@ def compile(  # noqa: A001
         return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=align)  # fake: type only
 
     i32 = cutlass.Int32(0)
+    i64_3 = (cutlass.Int64(0),) * 3  # stride slots: Int64 leaves, see _host
     thd = bool(CFG.THD_VARLEN)
     return _compile_cached(
         _host,
@@ -2291,11 +2294,11 @@ def compile(  # noqa: A001
         P(cutlass.Int32),
         P(cutlass.Int64),
         (0, 0, 0, 0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
         i32,
         cutlass.Float32(0.0),
         i32,
@@ -2304,7 +2307,7 @@ def compile(  # noqa: A001
         P(cutlass.Int32, 4) if thd else None,
         i32 if thd else None,
         P(GATE_STORAGE_DTYPE) if CFG.EPILOGUE_GATE else None,
-        (0, 0, 0),
+        i64_3,
         d_qk,
         d_v,
         lse_kind,
