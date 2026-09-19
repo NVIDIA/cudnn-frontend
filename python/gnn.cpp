@@ -26,15 +26,24 @@ make_csc_graph(std::intptr_t csc_offsets,
                std::int64_t n_src_nodes,
                std::int64_t n_dst_nodes,
                std::int64_t n_indices,
-               int idx_type) {
+               int idx_type,
+               std::intptr_t csc_rev_offsets = 0,
+               std::intptr_t map_rev_to_coo  = 0) {
     cudnnGnnCscGraph_t graph{};
     graph.cscOffsets  = reinterpret_cast<const void *>(csc_offsets);
     graph.cscIndices  = reinterpret_cast<const void *>(csc_indices);
     graph.mapCscToCoo = reinterpret_cast<const void *>(map_csc_to_coo);
-    graph.nSrcNodes   = n_src_nodes;
-    graph.nDstNodes   = n_dst_nodes;
-    graph.nIndices    = n_indices;
-    graph.idxType     = static_cast<cudnnDataType_t>(idx_type);
+#if CUDNN_VERSION >= 92700
+    graph.cscRevOffsets = reinterpret_cast<const void *>(csc_rev_offsets);
+    graph.mapRevToCoo   = reinterpret_cast<const void *>(map_rev_to_coo);
+#else
+    (void)csc_rev_offsets;
+    (void)map_rev_to_coo;
+#endif
+    graph.nSrcNodes = n_src_nodes;
+    graph.nDstNodes = n_dst_nodes;
+    graph.nIndices  = n_indices;
+    graph.idxType   = static_cast<cudnnDataType_t>(idx_type);
     return graph;
 }
 
@@ -191,6 +200,366 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
         py::arg("concat_feat_dim"),
         py::arg("data_type"),
         py::arg("agg_op"));
+
+#if CUDNN_VERSION >= 92800
+    py::enum_<cudnnGnnActivationOp_t>(m, "gnn_activation_op")
+        .value("LINEAR", CUDNN_GNN_ACT_LINEAR)
+        .value("RELU", CUDNN_GNN_ACT_RELU)
+        .value("SIGMOID", CUDNN_GNN_ACT_SIGMOID)
+        .value("TANH", CUDNN_GNN_ACT_TANH)
+        .value("ELU", CUDNN_GNN_ACT_ELU)
+        .value("SCALAR", CUDNN_GNN_ACT_SCALAR)
+        .value("LEAKY_RELU", CUDNN_GNN_ACT_LEAKY_RELU);
+
+    m.def(
+        "gnn_mha_gat_forward",
+        [](std::intptr_t stream,
+           std::intptr_t csc_offsets,
+           std::intptr_t csc_indices,
+           std::intptr_t map_csc_to_coo,
+           std::int64_t n_src_nodes,
+           std::int64_t n_dst_nodes,
+           std::int64_t n_indices,
+           int idx_type,
+           std::intptr_t src_features,
+           std::intptr_t dst_features,
+           std::intptr_t edge_features,
+           std::intptr_t attn_weights,
+           std::intptr_t dropout_mask,
+           std::intptr_t output,
+           std::intptr_t sm_scores,
+           int node_feat_dim,
+           int edge_feat_dim,
+           int activation,
+           float activation_alpha,
+           int num_heads,
+           bool concat_heads,
+           int data_type) {
+            ensure_cuda_runtime_context();
+            auto graph =
+                make_csc_graph(csc_offsets, csc_indices, map_csc_to_coo, n_src_nodes, n_dst_nodes, n_indices, idx_type);
+            cudnnGnnMhaParams_t params{
+                static_cast<cudnnGnnActivationOp_t>(activation), activation_alpha, num_heads, concat_heads ? 1 : 0};
+            auto status = detail::gnn_mha_gat_forward(reinterpret_cast<cudaStream_t>(stream),
+                                                      &graph,
+                                                      reinterpret_cast<const void *>(src_features),
+                                                      reinterpret_cast<const void *>(dst_features),
+                                                      reinterpret_cast<const void *>(edge_features),
+                                                      reinterpret_cast<const void *>(attn_weights),
+                                                      reinterpret_cast<const float *>(dropout_mask),
+                                                      reinterpret_cast<void *>(output),
+                                                      reinterpret_cast<void *>(sm_scores),
+                                                      node_feat_dim,
+                                                      edge_feat_dim,
+                                                      &params,
+                                                      static_cast<cudnnDataType_t>(data_type));
+            throw_if_gnn_failed(status, "cudnnGnnMhaGatForward");
+        },
+        py::arg("stream"),
+        py::arg("csc_offsets"),
+        py::arg("csc_indices"),
+        py::arg("map_csc_to_coo"),
+        py::arg("n_src_nodes"),
+        py::arg("n_dst_nodes"),
+        py::arg("n_indices"),
+        py::arg("idx_type"),
+        py::arg("src_features"),
+        py::arg("dst_features"),
+        py::arg("edge_features"),
+        py::arg("attn_weights"),
+        py::arg("dropout_mask"),
+        py::arg("output"),
+        py::arg("sm_scores"),
+        py::arg("node_feat_dim"),
+        py::arg("edge_feat_dim"),
+        py::arg("activation"),
+        py::arg("activation_alpha"),
+        py::arg("num_heads"),
+        py::arg("concat_heads"),
+        py::arg("data_type"));
+
+    m.def(
+        "gnn_mha_gat_backward",
+        [](std::intptr_t stream,
+           std::intptr_t csc_offsets,
+           std::intptr_t csc_indices,
+           std::intptr_t map_csc_to_coo,
+           std::int64_t n_src_nodes,
+           std::int64_t n_dst_nodes,
+           std::int64_t n_indices,
+           int idx_type,
+           std::intptr_t grad_output,
+           std::intptr_t src_features,
+           std::intptr_t dst_features,
+           std::intptr_t edge_features,
+           std::intptr_t attn_weights,
+           std::intptr_t sm_scores,
+           std::intptr_t dropout_mask,
+           std::intptr_t grad_attention,
+           std::intptr_t grad_src_features,
+           std::intptr_t grad_dst_features,
+           std::intptr_t grad_edge_features,
+           std::intptr_t grad_weights,
+           std::intptr_t grad_sm_scores,
+           int node_feat_dim,
+           int edge_feat_dim,
+           int activation,
+           float activation_alpha,
+           int num_heads,
+           bool concat_heads,
+           int data_type,
+           std::intptr_t csc_rev_offsets,
+           std::intptr_t map_rev_to_coo,
+           std::intptr_t grad_workspace_features,
+           std::intptr_t grad_workspace_weights,
+           int grad_data_type,
+           int grad_weight_type) {
+            ensure_cuda_runtime_context();
+            auto graph = make_csc_graph(csc_offsets,
+                                        csc_indices,
+                                        map_csc_to_coo,
+                                        n_src_nodes,
+                                        n_dst_nodes,
+                                        n_indices,
+                                        idx_type,
+                                        csc_rev_offsets,
+                                        map_rev_to_coo);
+            cudnnGnnMhaParams_t params{
+                static_cast<cudnnGnnActivationOp_t>(activation), activation_alpha, num_heads, concat_heads ? 1 : 0};
+            auto status = detail::gnn_mha_gat_backward(
+                reinterpret_cast<cudaStream_t>(stream),
+                &graph,
+                reinterpret_cast<const void *>(grad_output),
+                reinterpret_cast<const void *>(src_features),
+                reinterpret_cast<const void *>(dst_features),
+                reinterpret_cast<const void *>(edge_features),
+                reinterpret_cast<const void *>(attn_weights),
+                reinterpret_cast<const void *>(sm_scores),
+                reinterpret_cast<const float *>(dropout_mask),
+                reinterpret_cast<const float *>(grad_attention),
+                reinterpret_cast<void *>(grad_src_features),
+                reinterpret_cast<void *>(grad_dst_features),
+                reinterpret_cast<void *>(grad_edge_features),
+                reinterpret_cast<void *>(grad_weights),
+                reinterpret_cast<void *>(grad_sm_scores),
+                reinterpret_cast<void *>(grad_workspace_features),
+                reinterpret_cast<void *>(grad_workspace_weights),
+                node_feat_dim,
+                edge_feat_dim,
+                &params,
+                static_cast<cudnnDataType_t>(data_type),
+                static_cast<cudnnDataType_t>(grad_data_type < 0 ? data_type : grad_data_type),
+                static_cast<cudnnDataType_t>(grad_weight_type < 0 ? data_type : grad_weight_type));
+            throw_if_gnn_failed(status, "cudnnGnnMhaGatBackward");
+        },
+        py::arg("stream"),
+        py::arg("csc_offsets"),
+        py::arg("csc_indices"),
+        py::arg("map_csc_to_coo"),
+        py::arg("n_src_nodes"),
+        py::arg("n_dst_nodes"),
+        py::arg("n_indices"),
+        py::arg("idx_type"),
+        py::arg("grad_output"),
+        py::arg("src_features"),
+        py::arg("dst_features"),
+        py::arg("edge_features"),
+        py::arg("attn_weights"),
+        py::arg("sm_scores"),
+        py::arg("dropout_mask"),
+        py::arg("grad_attention"),
+        py::arg("grad_src_features"),
+        py::arg("grad_dst_features"),
+        py::arg("grad_edge_features"),
+        py::arg("grad_weights"),
+        py::arg("grad_sm_scores"),
+        py::arg("node_feat_dim"),
+        py::arg("edge_feat_dim"),
+        py::arg("activation"),
+        py::arg("activation_alpha"),
+        py::arg("num_heads"),
+        py::arg("concat_heads"),
+        py::arg("data_type"),
+        py::arg("csc_rev_offsets"),
+        py::arg("map_rev_to_coo"),
+        py::arg("grad_workspace_features"),
+        py::arg("grad_workspace_weights"),
+        py::arg("grad_data_type")   = -1,
+        py::arg("grad_weight_type") = -1);
+
+    m.def(
+        "gnn_mha_gat_v2_forward",
+        [](std::intptr_t stream,
+           std::intptr_t csc_offsets,
+           std::intptr_t csc_indices,
+           std::intptr_t map_csc_to_coo,
+           std::int64_t n_src_nodes,
+           std::int64_t n_dst_nodes,
+           std::int64_t n_indices,
+           int idx_type,
+           std::intptr_t src_features,
+           std::intptr_t dst_features,
+           std::intptr_t edge_features,
+           std::intptr_t attn_weights,
+           std::intptr_t dropout_mask,
+           std::intptr_t output,
+           std::intptr_t sm_scores,
+           std::intptr_t act_scores,
+           int node_feat_dim,
+           int activation,
+           float activation_alpha,
+           int num_heads,
+           bool concat_heads,
+           int data_type) {
+            ensure_cuda_runtime_context();
+            auto graph =
+                make_csc_graph(csc_offsets, csc_indices, map_csc_to_coo, n_src_nodes, n_dst_nodes, n_indices, idx_type);
+            cudnnGnnMhaParams_t params{
+                static_cast<cudnnGnnActivationOp_t>(activation), activation_alpha, num_heads, concat_heads ? 1 : 0};
+            auto status = detail::gnn_mha_gat_v2_forward(reinterpret_cast<cudaStream_t>(stream),
+                                                         &graph,
+                                                         reinterpret_cast<const void *>(src_features),
+                                                         reinterpret_cast<const void *>(dst_features),
+                                                         reinterpret_cast<const void *>(edge_features),
+                                                         reinterpret_cast<const void *>(attn_weights),
+                                                         reinterpret_cast<const float *>(dropout_mask),
+                                                         reinterpret_cast<void *>(output),
+                                                         reinterpret_cast<void *>(sm_scores),
+                                                         reinterpret_cast<void *>(act_scores),
+                                                         node_feat_dim,
+                                                         &params,
+                                                         static_cast<cudnnDataType_t>(data_type));
+            throw_if_gnn_failed(status, "cudnnGnnMhaGatV2Forward");
+        },
+        py::arg("stream"),
+        py::arg("csc_offsets"),
+        py::arg("csc_indices"),
+        py::arg("map_csc_to_coo"),
+        py::arg("n_src_nodes"),
+        py::arg("n_dst_nodes"),
+        py::arg("n_indices"),
+        py::arg("idx_type"),
+        py::arg("src_features"),
+        py::arg("dst_features"),
+        py::arg("edge_features"),
+        py::arg("attn_weights"),
+        py::arg("dropout_mask"),
+        py::arg("output"),
+        py::arg("sm_scores"),
+        py::arg("act_scores"),
+        py::arg("node_feat_dim"),
+        py::arg("activation"),
+        py::arg("activation_alpha"),
+        py::arg("num_heads"),
+        py::arg("concat_heads"),
+        py::arg("data_type"));
+
+    m.def(
+        "gnn_mha_gat_v2_backward",
+        [](std::intptr_t stream,
+           std::intptr_t csc_offsets,
+           std::intptr_t csc_indices,
+           std::intptr_t map_csc_to_coo,
+           std::int64_t n_src_nodes,
+           std::int64_t n_dst_nodes,
+           std::int64_t n_indices,
+           int idx_type,
+           std::intptr_t grad_output,
+           std::intptr_t src_features,
+           std::intptr_t dst_features,
+           std::intptr_t edge_features,
+           std::intptr_t attn_weights,
+           std::intptr_t sm_scores,
+           std::intptr_t act_scores,
+           std::intptr_t dropout_mask,
+           std::intptr_t grad_attention,
+           std::intptr_t grad_src_features,
+           std::intptr_t grad_dst_features,
+           std::intptr_t grad_edge_features,
+           std::intptr_t grad_weights,
+           std::intptr_t grad_sm_scores,
+           int node_feat_dim,
+           int activation,
+           float activation_alpha,
+           int num_heads,
+           bool concat_heads,
+           int data_type,
+           std::intptr_t csc_rev_offsets,
+           std::intptr_t map_rev_to_coo,
+           std::intptr_t grad_workspace_features,
+           std::intptr_t grad_workspace_weights,
+           int grad_type) {
+            ensure_cuda_runtime_context();
+            auto graph = make_csc_graph(csc_offsets,
+                                        csc_indices,
+                                        map_csc_to_coo,
+                                        n_src_nodes,
+                                        n_dst_nodes,
+                                        n_indices,
+                                        idx_type,
+                                        csc_rev_offsets,
+                                        map_rev_to_coo);
+            cudnnGnnMhaParams_t params{
+                static_cast<cudnnGnnActivationOp_t>(activation), activation_alpha, num_heads, concat_heads ? 1 : 0};
+            auto status =
+                detail::gnn_mha_gat_v2_backward(reinterpret_cast<cudaStream_t>(stream),
+                                                &graph,
+                                                reinterpret_cast<const void *>(grad_output),
+                                                reinterpret_cast<const void *>(src_features),
+                                                reinterpret_cast<const void *>(dst_features),
+                                                reinterpret_cast<const void *>(edge_features),
+                                                reinterpret_cast<const void *>(attn_weights),
+                                                reinterpret_cast<const void *>(sm_scores),
+                                                reinterpret_cast<const void *>(act_scores),
+                                                reinterpret_cast<const float *>(dropout_mask),
+                                                reinterpret_cast<const float *>(grad_attention),
+                                                reinterpret_cast<void *>(grad_src_features),
+                                                reinterpret_cast<void *>(grad_dst_features),
+                                                reinterpret_cast<void *>(grad_edge_features),
+                                                reinterpret_cast<void *>(grad_weights),
+                                                reinterpret_cast<void *>(grad_sm_scores),
+                                                reinterpret_cast<void *>(grad_workspace_features),
+                                                reinterpret_cast<void *>(grad_workspace_weights),
+                                                node_feat_dim,
+                                                &params,
+                                                static_cast<cudnnDataType_t>(data_type),
+                                                static_cast<cudnnDataType_t>(grad_type < 0 ? data_type : grad_type));
+            throw_if_gnn_failed(status, "cudnnGnnMhaGatV2Backward");
+        },
+        py::arg("stream"),
+        py::arg("csc_offsets"),
+        py::arg("csc_indices"),
+        py::arg("map_csc_to_coo"),
+        py::arg("n_src_nodes"),
+        py::arg("n_dst_nodes"),
+        py::arg("n_indices"),
+        py::arg("idx_type"),
+        py::arg("grad_output"),
+        py::arg("src_features"),
+        py::arg("dst_features"),
+        py::arg("edge_features"),
+        py::arg("attn_weights"),
+        py::arg("sm_scores"),
+        py::arg("act_scores"),
+        py::arg("dropout_mask"),
+        py::arg("grad_attention"),
+        py::arg("grad_src_features"),
+        py::arg("grad_dst_features"),
+        py::arg("grad_edge_features"),
+        py::arg("grad_weights"),
+        py::arg("grad_sm_scores"),
+        py::arg("node_feat_dim"),
+        py::arg("activation"),
+        py::arg("activation_alpha"),
+        py::arg("num_heads"),
+        py::arg("concat_heads"),
+        py::arg("data_type"),
+        py::arg("csc_rev_offsets"),
+        py::arg("map_rev_to_coo"),
+        py::arg("grad_workspace_features"),
+        py::arg("grad_workspace_weights"),
+        py::arg("grad_type") = -1);
+#endif
 #endif
 }
 
