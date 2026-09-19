@@ -1,0 +1,588 @@
+config_name,model_name,phase,backend,data_type,kv_cache_dtype,batch_size,q_tokens,kv_len,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,kind,sliding_window_size,page_size,time_ms,tflops,gbps,sol_pct,num_iterations,success,error_message,gpu_name,backend_detail,cudnn_backend_version
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,2048,2048,64,8,128,128,gqa,,16,0.06736,1020.182,1120.806,14.0101,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,8192,8192,64,8,128,128,gqa,,16,0.794263,1384.317,380.214,4.7527,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,32768,32768,64,8,128,128,gqa,,16,12.788422,1375.634,94.457,1.1807,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,512,65536,64,8,128,128,gqa,,16,0.784987,1400.675,363.334,4.5417,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,512,131072,64,8,128,128,gqa,,16,1.576473,1394.901,351.194,4.3899,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,1024,65536,64,8,128,128,gqa,,16,1.563259,1406.692,193.18,2.4147,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,1024,131072,64,8,128,128,gqa,,16,3.114348,1412.189,183.16,2.2895,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,1,1,131072,64,8,128,128,gqa,,16,0.094688,45.359,5670.24,70.878,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,64,8,128,128,gqa,,16,0.059168,72.589,4537.112,56.7139,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,128,1,131072,64,8,128,128,gqa,,16,9.431964,58.286,7286.252,91.0782,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"ttention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 49.62 GiB is free. Including non-PyTorch memory, this process has 128.70 GiB memory in use. Of the allocated memory 80.00 GiB is allocated by PyTorch, and 48.00 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,1,2,131072,64,8,128,128,gqa,,16,2.320333,3.702,231.405,2.8926,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,64,8,128,128,gqa,,16,1.289115,6.663,208.258,2.6032,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,128,2,131072,64,8,128,128,gqa,,16,91.811967,11.976,748.572,9.3571,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"ttention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 49.61 GiB is free. Including non-PyTorch memory, this process has 128.72 GiB memory in use. Of the allocated memory 80.00 GiB is allocated by PyTorch, and 48.02 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,1,3,131072,64,8,128,128,gqa,,16,2.318902,5.556,231.562,2.8945,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,64,8,128,128,gqa,,16,1.288935,9.997,208.3,2.6037,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,128,3,131072,64,8,128,128,gqa,,16,91.813212,17.963,748.608,9.3576,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"ttention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 49.62 GiB is free. Including non-PyTorch memory, this process has 128.71 GiB memory in use. Of the allocated memory 80.00 GiB is allocated by PyTorch, and 48.01 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,1,4,131072,64,8,128,128,gqa,,16,2.31999,7.405,231.467,2.8933,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,64,8,128,128,gqa,,16,1.28786,13.34,208.486,2.6061,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,128,4,131072,64,8,128,128,gqa,,16,91.797769,23.955,748.779,9.3597,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"ttention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 49.61 GiB is free. Including non-PyTorch memory, this process has 128.71 GiB memory in use. Of the allocated memory 80.00 GiB is allocated by PyTorch, and 48.01 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,64,8,128,128,gqa,,16,0.089151,770.821,846.849,10.5856,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,64,8,128,128,gqa,,16,0.862014,1275.515,350.331,4.3791,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,64,8,128,128,gqa,,16,13.118942,1340.976,92.078,1.151,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,64,8,128,128,gqa,,16,0.837402,1313.003,340.592,4.2574,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,64,8,128,128,gqa,,16,1.66853,1317.94,331.818,4.1477,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=1; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,64,8,128,128,gqa,,16,1.699553,1293.883,177.688,2.2211,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,64,8,128,128,gqa,,16,3.346529,1314.211,170.453,2.1307,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,64,8,128,128,gqa,,16,0.110975,38.702,4838.06,60.4757,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=16; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,64,8,128,128,gqa,,16,9.767954,56.282,7035.626,87.9453,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 49.62 GiB is free. Including non-PyTorch memory, this process has 128.70 GiB memory in use. Of the allocated memory 80.00 GiB is allocated by PyTorch, and 48.00 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,64,8,128,128,gqa,,16,0.110847,77.494,4843.942,60.5493,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=16; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,64,8,128,128,gqa,,16,9.675176,113.643,7103.526,88.7941,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 49.61 GiB is free. Including non-PyTorch memory, this process has 128.72 GiB memory in use. Of the allocated memory 80.00 GiB is allocated by PyTorch, and 48.02 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,64,8,128,128,gqa,,16,0.11155,115.508,4813.709,60.1714,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=16; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,64,8,128,128,gqa,,16,9.986643,165.147,6882.399,86.03,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 49.62 GiB is free. Including non-PyTorch memory, this process has 128.71 GiB memory in use. Of the allocated memory 80.00 GiB is allocated by PyTorch, and 48.01 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,64,8,128,128,gqa,,16,0.111744,153.743,4805.645,60.0706,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=16; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,64,8,128,128,gqa,,16,10.072505,218.319,6824.147,85.3018,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 178.34 GiB of which 49.61 GiB is free. Including non-PyTorch memory, this process has 128.71 GiB memory in use. Of the allocated memory 80.00 GiB is allocated by PyTorch, and 48.01 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,2048,2048,32,4,128,128,gqa,,16,0.044128,778.638,855.437,10.693,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,8192,8192,32,4,128,128,gqa,,16,0.405055,1357.237,372.776,4.6597,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,32768,32768,32,4,128,128,gqa,,16,6.097562,1442.559,99.053,1.2382,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,512,65536,32,4,128,128,gqa,,16,0.716318,767.475,199.082,2.4885,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,512,131072,32,4,128,128,gqa,,16,1.419676,774.481,194.991,2.4374,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,1024,65536,32,4,128,128,gqa,,16,0.774682,1419.307,194.912,2.4364,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,1024,131072,32,4,128,128,gqa,,16,1.551983,1416.912,183.773,2.2972,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,1,1,131072,32,4,128,128,gqa,,16,0.054336,39.522,4940.589,61.7574,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,32,4,128,128,gqa,,16,0.032608,65.858,4116.349,51.4544,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,128,1,131072,32,4,128,128,gqa,,16,4.712211,58.333,7292.083,91.151,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,32,4,128,128,gqa,,16,2.387385,115.138,7196.543,89.9568,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,1,2,131072,32,4,128,128,gqa,,16,2.27774,1.886,117.866,1.4733,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,32,4,128,128,gqa,,16,1.285971,3.34,104.383,1.3048,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,128,2,131072,32,4,128,128,gqa,,16,45.988416,11.954,747.23,9.3404,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,32,4,128,128,gqa,,16,38.24681,14.374,449.239,5.6155,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,1,3,131072,32,4,128,128,gqa,,16,2.279539,2.826,117.78,1.4723,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,32,4,128,128,gqa,,16,1.286106,5.009,104.379,1.3047,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,128,3,131072,32,4,128,128,gqa,,16,45.947331,17.947,747.944,9.3493,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,32,4,128,128,gqa,,16,37.786469,21.824,454.74,5.6842,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,1,4,131072,32,4,128,128,gqa,,16,2.279162,3.769,117.807,1.4726,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,32,4,128,128,gqa,,16,1.285851,6.68,104.406,1.3051,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,128,4,131072,32,4,128,128,gqa,,16,45.93731,23.935,748.153,9.3519,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,32,4,128,128,gqa,,16,36.964657,29.745,464.878,5.811,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,32,4,128,128,gqa,,16,0.056608,606.977,666.845,8.3356,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,32,4,128,128,gqa,,16,0.436924,1258.241,345.586,4.3198,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,32,4,128,128,gqa,,16,6.277283,1401.258,96.217,1.2027,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,32,4,128,128,gqa,,16,0.458624,1198.707,310.944,3.8868,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,32,4,128,128,gqa,,16,0.87318,1259.204,317.03,3.9629,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,32,4,128,128,gqa,,16,0.828192,1327.605,182.319,2.279,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,32,4,128,128,gqa,,16,1.658367,1326.017,171.984,2.1498,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=1; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,32,4,128,128,gqa,,16,0.079199,27.115,3389.586,42.3698,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=32; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,32,4,128,128,gqa,,16,4.946777,55.567,6946.308,86.8288,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,32,4,128,128,gqa,,16,0.078015,55.053,3441.239,43.0155,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=32; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,32,4,128,128,gqa,,16,5.016257,109.595,6850.513,85.6314,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,32,4,128,128,gqa,,16,0.079677,80.857,3369.663,42.1208,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=32; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,32,4,128,128,gqa,,16,4.96598,166.057,6920.292,86.5036,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,32,4,128,128,gqa,,16,0.080063,107.29,3353.621,41.9203,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=32; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,32,4,128,128,gqa,,16,4.993441,220.191,6882.654,86.0332,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,2048,2048,16,2,128,128,gqa,,16,0.030751,558.677,613.781,7.6723,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,8192,8192,16,2,128,128,gqa,,16,0.22099,1243.848,341.633,4.2704,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,32768,32768,16,2,128,128,gqa,,16,3.101666,1417.963,97.364,1.217,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,512,65536,16,2,128,128,gqa,,16,0.71302,385.512,100.002,1.25,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,512,131072,16,2,128,128,gqa,,16,1.416248,388.178,97.731,1.2216,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,1024,65536,16,2,128,128,gqa,,16,0.714527,769.398,105.661,1.3208,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,1024,131072,16,2,128,128,gqa,,16,1.418104,775.339,100.561,1.257,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,1,1,131072,16,2,128,128,gqa,,16,0.030048,35.734,4467.05,55.8381,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,16,2,128,128,gqa,,16,0.020543,52.268,3266.95,40.8369,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,128,1,131072,16,2,128,128,gqa,,16,2.352248,58.429,7304.042,91.3005,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,16,2,128,128,gqa,,16,1.255512,109.468,6842.196,85.5274,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,1,2,131072,16,2,128,128,gqa,,16,2.284942,0.94,58.747,0.7343,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,16,2,128,128,gqa,,16,1.275156,1.684,52.634,0.6579,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,128,2,131072,16,2,128,128,gqa,,16,23.002936,11.95,746.947,9.3368,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,16,2,128,128,gqa,,16,18.328598,14.997,468.72,5.859,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,1,3,131072,16,2,128,128,gqa,,16,2.286189,1.409,58.719,0.734,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,16,2,128,128,gqa,,16,1.274917,2.527,52.647,0.6581,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,128,3,131072,16,2,128,128,gqa,,16,23.004536,17.923,746.94,9.3368,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,16,2,128,128,gqa,,16,17.861486,23.084,481.007,6.0126,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,1,4,131072,16,2,128,128,gqa,,16,2.283901,1.881,58.781,0.7348,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,16,2,128,128,gqa,,16,1.274875,3.369,52.652,0.6582,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,128,4,131072,16,2,128,128,gqa,,16,23.005999,23.896,746.938,9.3367,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,16,2,128,128,gqa,,16,17.862708,30.777,481.004,6.0125,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,16,2,128,128,gqa,,16,0.037727,455.373,500.288,6.2536,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,16,2,128,128,gqa,,16,0.226079,1215.849,333.943,4.1743,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,16,2,128,128,gqa,,16,3.125326,1407.228,96.627,1.2078,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,16,2,128,128,gqa,,16,0.25011,1099.028,285.087,3.5636,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,16,2,128,128,gqa,,16,0.456252,1204.939,303.368,3.7921,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,16,2,128,128,gqa,,16,0.456318,1204.765,165.449,2.0681,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,16,2,128,128,gqa,,16,0.866974,1268.218,164.487,2.0561,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,16,2,128,128,gqa,,16,0.070079,15.322,1915.352,23.9419,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,16,2,128,128,gqa,,16,2.483776,55.335,6917.257,86.4657,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,16,2,128,128,gqa,,16,0.069183,31.041,1940.276,24.2534,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,16,2,128,128,gqa,,16,2.495701,110.141,6884.625,86.0578,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,16,2,128,128,gqa,,16,0.069888,46.091,1920.821,24.0103,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,16,2,128,128,gqa,,16,2.500955,164.864,6870.581,85.8823,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,16,2,128,128,gqa,,16,0.071486,60.081,1877.997,23.475,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,16,2,128,128,gqa,,16,2.511167,218.924,6843.059,85.5382,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,2048,2048,8,1,128,128,gqa,,16,0.029024,295.96,325.151,4.0644,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,8192,8192,8,1,128,128,gqa,,16,0.135263,1016.087,279.077,3.4885,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,32768,32768,8,1,128,128,gqa,,16,1.623323,1354.643,93.016,1.1627,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,512,65536,8,1,128,128,gqa,,16,0.707419,194.282,50.397,0.63,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,512,131072,8,1,128,128,gqa,,16,1.405522,195.57,49.239,0.6155,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,1024,65536,8,1,128,128,gqa,,16,0.712927,385.562,52.949,0.6619,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,1024,131072,8,1,128,128,gqa,,16,1.41513,388.484,50.386,0.6298,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,1,1,131072,8,1,128,128,gqa,,16,0.022432,23.933,2991.84,37.398,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,8,1,128,128,gqa,,16,0.019456,27.594,1724.737,21.5592,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,128,1,131072,8,1,128,128,gqa,,16,1.168408,58.815,7352.277,91.9035,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 337, in setup_cudnn_fp8
+    graph.build_plans()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1612, in build_plans
+    raise cudnn_graph_not_supported(""no plan in the list could be built:\n  "" + ""\n  "".join(failures or [""the plan list is empty""]))
+cudnn._compiled_module.cudnnGraphNotSupportedError: no plan in the list could be built:
+  [0] eng10_k24=1_k27=0_k38=0_k40=3_k41=2: CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnFinalize Descriptor FailedEncountered runtime kernel compilation failure at: compilationResult != NVRTC_SUCCESS cudnn_status: CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED",,,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,1,2,131072,8,1,128,128,gqa,,16,2.22776,0.482,30.128,0.3766,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,8,1,128,128,gqa,,16,1.273391,0.843,26.354,0.3294,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,128,2,131072,8,1,128,128,gqa,,16,11.970374,11.482,717.687,8.9711,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,8,1,128,128,gqa,,16,8.972088,15.319,478.762,5.9845,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,1,3,131072,8,1,128,128,gqa,,16,2.22812,0.723,30.125,0.3766,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,8,1,128,128,gqa,,16,1.273372,1.265,26.356,0.3294,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,128,3,131072,8,1,128,128,gqa,,16,11.978132,17.211,717.266,8.9658,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,8,1,128,128,gqa,,16,8.974663,22.971,478.653,5.9832,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,1,4,131072,8,1,128,128,gqa,,16,2.227733,0.964,30.132,0.3766,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,8,1,128,128,gqa,,16,1.273352,1.686,26.358,0.3295,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,128,4,131072,8,1,128,128,gqa,,16,11.972005,22.96,717.677,8.971,20,True,,NVIDIA B200,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,8,1,128,128,gqa,,16,8.972066,30.637,478.821,5.9853,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,8,1,128,128,gqa,,16,0.03536,242.928,266.889,3.3361,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,8,1,128,128,gqa,,16,0.163201,842.145,231.302,2.8913,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,8,1,128,128,gqa,,16,1.577857,1393.677,95.696,1.1962,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,8,1,128,128,gqa,,16,0.147452,932.093,241.784,3.0223,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=8; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,8,1,128,128,gqa,,16,0.250816,1095.934,275.923,3.449,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=8; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,8,1,128,128,gqa,,16,0.250175,1098.743,150.889,1.8861,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,8,1,128,128,gqa,,16,0.457316,1202.136,155.917,1.949,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,8,1,128,128,gqa,,16,0.081343,6.6,825.061,10.3133,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,8,1,128,128,gqa,,16,1.22082,56.29,7036.63,87.9579,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,8,1,128,128,gqa,,16,0.087073,12.332,770.814,9.6352,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,8,1,128,128,gqa,,16,1.224555,112.236,7015.596,87.695,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,8,1,128,128,gqa,,16,0.088767,18.144,756.15,9.4519,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,8,1,128,128,gqa,,16,1.222655,168.615,7026.927,87.8366,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,8,1,128,128,gqa,,16,0.09488,22.634,707.475,8.8434,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,8,1,128,128,gqa,,16,1.226713,224.077,7004.109,87.5514,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,

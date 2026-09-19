@@ -1,0 +1,625 @@
+config_name,model_name,phase,backend,data_type,kv_cache_dtype,batch_size,q_tokens,kv_len,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,kind,sliding_window_size,page_size,time_ms,tflops,gbps,sol_pct,num_iterations,success,error_message,gpu_name,backend_detail,cudnn_backend_version
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,2048,2048,32,2,256,256,gqa,,16,0.05616,1223.637,1269.643,15.8705,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,8192,8192,32,2,256,256,gqa,,16,0.664633,1654.314,429.128,5.3641,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,32768,32768,32,2,256,256,gqa,,16,10.367662,1696.833,110.039,1.3755,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,512,65536,32,2,256,256,gqa,,16,0.66073,1664.086,228.527,2.8566,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,512,131072,32,2,256,256,gqa,,16,1.33228,1650.571,214.079,2.676,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,1024,65536,32,2,256,256,gqa,,16,1.34755,1631.868,124.502,1.5563,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,1024,131072,32,2,256,256,gqa,,16,2.694231,1632.394,112.088,1.4011,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,1,1,131072,32,2,256,256,gqa,,16,0.081631,52.614,3288.802,41.11,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1000,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,128,1,131072,32,2,256,256,gqa,,16,8.906546,61.725,3858.278,48.2285,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1000,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,1,2,131072,32,2,256,256,gqa,,16,6.811824,1.261,39.417,0.4927,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,32,2,256,256,gqa,,16,1.915486,4.484,70.087,0.8761,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,128,2,131072,32,2,256,256,gqa,,16,202.889241,5.419,169.394,2.1174,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,32,2,256,256,gqa,,16,128.372397,8.565,133.861,1.6733,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,1,3,131072,32,2,256,256,gqa,,16,6.808856,1.892,39.439,0.493,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,32,2,256,256,gqa,,16,1.914354,6.731,70.137,0.8767,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,128,3,131072,32,2,256,256,gqa,,16,202.618495,8.14,169.641,2.1205,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,32,2,256,256,gqa,,16,128.740968,12.811,133.494,1.6687,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,1,4,131072,32,2,256,256,gqa,,16,6.804887,2.525,39.467,0.4933,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,32,2,256,256,gqa,,16,1.913772,8.977,70.167,0.8771,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,128,4,131072,32,2,256,256,gqa,,16,202.200735,10.875,170.012,2.1251,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,32,2,256,256,gqa,,16,127.912126,17.192,134.376,1.6797,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,32,2,256,256,gqa,,16,0.070176,979.245,1016.062,12.7008,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,32,2,256,256,gqa,,16,0.697024,1577.437,409.186,5.1148,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,32,2,256,256,gqa,,16,10.296361,1708.583,110.801,1.385,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,32,2,256,256,gqa,,16,0.652704,1684.549,231.338,2.8917,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=1; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,32,2,256,256,gqa,,16,1.318887,1667.333,216.253,2.7032,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=1; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,32,2,256,256,gqa,,16,1.335263,1646.884,125.647,1.5706,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=1; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,32,2,256,256,gqa,,16,2.769491,1588.034,109.042,1.363,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,32,2,256,256,gqa,,16,0.106686,40.258,2516.433,31.4554,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,32,2,256,256,gqa,,16,4.722108,116.422,7277.244,90.9656,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,32,2,256,256,gqa,,16,0.094847,90.566,2830.885,35.3861,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=32; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,32,2,256,256,gqa,,16,6.120281,179.651,5615.449,70.1931,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,32,2,256,256,gqa,,16,0.099968,128.89,2686.197,33.5775,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=32; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,32,2,256,256,gqa,,16,6.02672,273.659,5703.321,71.2915,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,32,2,256,256,gqa,,16,0.09968,172.35,2694.287,33.6786,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=32; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,32,2,256,256,gqa,,16,6.100242,360.481,5635.271,70.4409,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,2048,2048,16,1,256,256,gqa,,16,0.032192,1067.338,1107.467,13.8433,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,8192,8192,16,1,256,256,gqa,,16,0.321243,1711.339,443.92,5.549,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,32768,32768,16,1,256,256,gqa,,16,5.099996,1724.725,111.848,1.3981,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,512,65536,16,1,256,256,gqa,,16,0.583965,941.419,129.284,1.6161,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,512,131072,16,1,256,256,gqa,,16,1.1571,950.23,123.245,1.5406,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,1024,65536,16,1,256,256,gqa,,16,0.653026,1683.718,128.457,1.6057,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,1024,131072,16,1,256,256,gqa,,16,1.319669,1666.345,114.419,1.4302,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,1,1,131072,16,1,256,256,gqa,,16,0.071328,30.107,1881.927,23.5241,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1000,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,128,1,131072,16,1,256,256,gqa,,16,4.316651,63.679,3980.393,49.7549,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1000,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,1,2,131072,16,1,256,256,gqa,,16,6.721955,0.639,19.972,0.2496,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,16,1,256,256,gqa,,16,1.908755,2.25,35.167,0.4396,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,128,2,131072,16,1,256,256,gqa,,16,100.531618,5.468,170.932,2.1366,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,16,1,256,256,gqa,,16,63.640907,8.638,135.008,1.6876,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,1,3,131072,16,1,256,256,gqa,,16,6.72036,0.959,19.979,0.2497,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,16,1,256,256,gqa,,16,1.90902,3.375,35.166,0.4396,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,128,3,131072,16,1,256,256,gqa,,16,101.168951,8.151,169.876,2.1234,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,16,1,256,256,gqa,,16,63.218544,13.044,135.927,1.6991,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,1,4,131072,16,1,256,256,gqa,,16,6.717332,1.279,19.991,0.2499,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,16,1,256,256,gqa,,16,1.908663,4.5,35.177,0.4397,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,128,4,131072,16,1,256,256,gqa,,16,100.450621,10.946,171.112,2.1389,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,16,1,256,256,gqa,,16,63.626338,17.281,135.072,1.6884,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,16,1,256,256,gqa,,16,0.045024,763.143,791.835,9.8979,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,16,1,256,256,gqa,,16,0.342302,1606.055,416.61,5.2076,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,16,1,256,256,gqa,,16,5.106611,1722.491,111.703,1.3963,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,16,1,256,256,gqa,,16,0.354112,1552.491,213.202,2.665,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,16,1,256,256,gqa,,16,0.68579,1603.277,207.945,2.5993,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,16,1,256,256,gqa,,16,0.648665,1695.038,129.321,1.6165,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=1; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,16,1,256,256,gqa,,16,1.303752,1686.688,115.816,1.4477,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=1; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,16,1,256,256,gqa,,16,0.128349,16.732,1045.852,13.0732,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,16,1,256,256,gqa,,16,2.319772,118.494,7406.748,92.5843,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,16,1,256,256,gqa,,16,0.096703,44.414,1388.276,17.3535,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,16,1,256,256,gqa,,16,3.052887,180.077,5628.791,70.3599,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,16,1,256,256,gqa,,16,0.103136,62.466,1301.843,16.273,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,16,1,256,256,gqa,,16,3.089229,266.938,5563.252,69.5407,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,16,1,256,256,gqa,,16,0.102014,84.203,1316.322,16.454,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,16,1,256,256,gqa,,16,3.121685,352.217,5506.083,68.826,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,2048,2048,8,1,256,256,gqa,,16,0.027936,614.972,675.629,8.4454,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,8192,8192,8,1,256,256,gqa,,16,0.158973,1729.085,474.908,5.9363,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,32768,32768,8,1,256,256,gqa,,16,2.560864,1717.407,117.925,1.4741,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,512,65536,8,1,256,256,gqa,,16,0.582556,471.848,122.397,1.53,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,512,131072,8,1,256,256,gqa,,16,1.154427,476.215,119.897,1.4987,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,1024,65536,8,1,256,256,gqa,,16,0.583826,941.643,129.315,1.6164,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,1024,131072,8,1,256,256,gqa,,16,1.157304,950.063,123.223,1.5403,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,1,1,131072,8,1,256,256,gqa,,16,0.071202,15.08,1885.143,23.5643,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1000,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,128,1,131072,8,1,256,256,gqa,,16,4.314052,31.858,3982.548,49.7818,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1000,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,1,2,131072,8,1,256,256,gqa,,16,6.723904,0.319,19.964,0.2495,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,8,1,256,256,gqa,,16,1.895099,1.133,35.416,0.4427,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,128,2,131072,8,1,256,256,gqa,,16,52.641664,5.222,326.395,4.0799,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,8,1,256,256,gqa,,16,31.263436,8.792,274.793,3.4349,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,1,3,131072,8,1,256,256,gqa,,16,6.720525,0.479,19.975,0.2497,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,8,1,256,256,gqa,,16,1.895493,1.699,35.411,0.4426,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,128,3,131072,8,1,256,256,gqa,,16,52.4846,7.856,327.392,4.0924,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,8,1,256,256,gqa,,16,31.444105,13.113,273.231,3.4154,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,1,4,131072,8,1,256,256,gqa,,16,6.720284,0.639,19.977,0.2497,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,8,1,256,256,gqa,,16,1.894339,2.267,35.435,0.4429,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,128,4,131072,8,1,256,256,gqa,,16,52.422963,10.487,327.796,4.0975,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,8,1,256,256,gqa,,16,31.227793,17.605,275.141,3.4393,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,8,1,256,256,gqa,,16,0.030176,569.322,625.476,7.8185,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,8,1,256,256,gqa,,16,0.172031,1597.839,438.86,5.4857,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,8,1,256,256,gqa,,16,2.553562,1722.318,118.262,1.4783,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,8,1,256,256,gqa,,16,0.194848,1410.73,365.943,4.5743,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,8,1,256,256,gqa,,16,0.357118,1539.423,387.581,4.8448,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,8,1,256,256,gqa,,16,0.354555,1550.552,212.936,2.6617,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,8,1,256,256,gqa,,16,0.688412,1597.171,207.153,2.5894,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,8,1,256,256,gqa,,16,0.128862,8.332,1041.625,13.0203,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,8,1,256,256,gqa,,16,2.316552,59.329,7416.591,92.7074,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,8,1,256,256,gqa,,16,0.129182,16.624,1039.108,12.9889,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,8,1,256,256,gqa,,16,2.318859,118.54,7409.664,92.6208,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=1; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,8,1,256,256,gqa,,16,0.093855,34.321,1430.316,17.8789,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,8,1,256,256,gqa,,16,3.03497,135.855,5661.675,70.7709,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,8,1,256,256,gqa,,16,0.096544,44.487,1390.563,17.382,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,8,1,256,256,gqa,,16,3.043071,180.658,5646.948,70.5868,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,2048,2048,4,1,256,256,gqa,,16,0.026208,327.76,400.098,5.0012,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,8192,8192,4,1,256,256,gqa,,16,0.085024,1616.472,493.308,6.1664,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,32768,32768,4,1,256,256,gqa,,16,1.272762,1727.757,131.817,1.6477,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,512,65536,4,1,256,256,gqa,,16,0.581602,236.311,118.992,1.4874,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,512,131072,4,1,256,256,gqa,,16,1.154427,238.108,118.08,1.476,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,1024,65536,4,1,256,256,gqa,,16,0.582175,472.157,122.477,1.531,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,1024,131072,4,1,256,256,gqa,,16,1.15442,476.218,119.897,1.4987,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,1,1,131072,4,1,256,256,gqa,,16,0.071104,7.551,1887.683,23.596,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1000,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,128,1,131072,4,1,256,256,gqa,,16,4.314181,15.929,3982.307,49.7788,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1000,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,1,2,131072,4,1,256,256,gqa,,16,7.383742,0.145,18.179,0.2272,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,4,1,256,256,gqa,,16,1.894489,0.567,35.425,0.4428,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,128,2,131072,4,1,256,256,gqa,,16,31.018474,4.431,553.893,6.9237,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,4,1,256,256,gqa,,16,15.453943,8.893,555.875,6.9484,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,1,3,131072,4,1,256,256,gqa,,16,7.385286,0.218,18.175,0.2272,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,4,1,256,256,gqa,,16,1.89339,0.851,35.447,0.4431,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,128,3,131072,4,1,256,256,gqa,,16,30.958913,6.659,554.976,6.9372,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,4,1,256,256,gqa,,16,14.989461,13.754,573.117,7.164,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,1,4,131072,4,1,256,256,gqa,,16,7.378074,0.291,18.194,0.2274,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,4,1,256,256,gqa,,16,1.89328,1.134,35.45,0.4431,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,128,4,131072,4,1,256,256,gqa,,16,30.957842,8.879,555.012,6.9376,20,True,,NVIDIA B200,cudnn 9.27.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,4,1,256,256,gqa,,16,15.105854,18.197,568.719,7.109,20,True,,NVIDIA B200,cudnn fp8 9.27.0,
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,4,1,256,256,gqa,,16,0.048546,176.944,215.996,2.7,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,4,1,256,256,gqa,,16,0.120613,1139.504,347.749,4.3469,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,4,1,256,256,gqa,,16,1.279583,1718.547,131.115,1.6389,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,4,1,256,256,gqa,,16,0.115903,1185.81,597.103,7.4638,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=8; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,4,1,256,256,gqa,,16,0.194789,1411.157,699.808,8.7476,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=8; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,4,1,256,256,gqa,,16,0.192994,1424.282,369.458,4.6182,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,4,1,256,256,gqa,,16,0.356667,1541.37,388.071,4.8509,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,4,1,256,256,gqa,,16,0.116703,4.6,1150.115,14.3764,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,4,1,256,256,gqa,,16,2.319729,29.624,7406.207,92.5776,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,4,1,256,256,gqa,,16,0.127679,8.41,1051.276,13.141,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,4,1,256,256,gqa,,16,2.315642,59.352,7419.505,92.7438,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=1; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,4,1,256,256,gqa,,16,0.133632,12.053,1004.475,12.5559,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,4,1,256,256,gqa,,16,2.322424,88.769,7398.064,92.4758,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=1; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,4,1,256,256,gqa,,16,0.130466,16.46,1028.882,12.861,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,4,1,256,256,gqa,,16,2.320523,118.455,7404.351,92.5544,20,True,,NVIDIA B200,cudnn_oss plan=sdpa_fwd_prefill_sm100[PACK_GQA=1; SCHED_POLICY=1; SPLIT_KV=1; TILE_CGA_M=2; TILE_M=128; TILE_N=128],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,

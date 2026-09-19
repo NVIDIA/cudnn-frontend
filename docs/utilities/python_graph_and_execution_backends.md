@@ -50,11 +50,12 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
    ├─ family_for(graph) → resolve_heuristics(family)
    │     declares none → _unranked: accepting engines, then the backend
    │
-   └─ <family>.recommend(modes, facts, offered, backend_plans)
-      │                                    e.g. sdpa/fwd/heuristics.py
+   └─ _assemble(modes, <family>.recommend(kind, facts, offered), backend_plans)
+      │                                    e.g. sdpa/fwd/heuristics.py (propose)
       ├─ A  → per eligible cell: a measured rule (_sm120_tiles) names the config,
       │       runners-up behind it; a cell with one point per axis contributes one
-      │       entry. Placed against the backend's A block by _MEASURED_BEHIND.
+      │       entry. The backend's A block goes where the family's BACKEND marker
+      │       sits (sdpa/fwd/placement.py per shard; ours first without a marker).
       ├─ FALLBACK → the config expected to build, + the backend's FALLBACK block
       ├─ OPENSOURCE → our candidates, then the delegating entry (see below)
       └─ dedup by (engine_id, knobs), first position wins
@@ -517,8 +518,10 @@ without being imported. Everything else is the engine's own `check_support()`.
   class because the gate must answer without importing the engine.
 - **A family may name a `heuristics` hook** — like `analyzer`, a
   `("module", "callable")` pair kept as strings so the coarse key stays
-  import-free. It is handed the facts, the family's offered ids and the
-  backend's entries, and what it returns IS the plan list.
+  import-free. It is handed the facts and the family's offered ids and returns
+  its proposals; a `BACKEND` marker in that list says where the backend's own
+  block goes inside each mode block (ours first when absent). The SDPA-forward
+  family decides that per measured shard (`sdpa/fwd/placement.py`).
 - **A family may name a `validator` hook** — the same import-free pair,
   `validate_graph(graph) -> bool`. When the manifest offers a python engine for
   the graph, `validate()` runs it instead of the eager C++ lowering: it applies
@@ -901,10 +904,12 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
 - FALLBACK is one config per cell today — the smallest tile the row admits, the
   config that asks least of the device. Picking the handful that between them
   cover the plane needs measurements; the TODO is in `_mode_fallback`.
-- `_MEASURED_BEHIND` is an empty set: which side leads is meant to be a
-  measurement, and an untimed cell keeps the order this dispatch has always
-  had. A cost model that can compare a python config against a cuDNN engine on
-  a common currency (predicted time) turns that set into a number.
+- Which side leads is a measurement: `sdpa/fwd/placement.py` places the
+  SDPA-forward family per timed shard (B200 / RTX PRO 6000 CSVs under
+  `benchmark/attention_inference/results`, bound by `test_sdpa_fwd_placement.py`);
+  an untimed row keeps the order this dispatch has always had. A cost model
+  that can compare a python config against a cuDNN engine on a common currency
+  (predicted time) would replace the table with a number.
 - DSL engine integration (the cuTile matmul engine lives in this track).
 - Structural cleanup: lifecycle state objects, a `CudnnBackendAdapter` to
   remove `selected_engine is None` branching, lowering extracted to its own

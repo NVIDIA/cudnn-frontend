@@ -566,6 +566,15 @@ else:
     elif is_cudnn_fe:
         os.environ["CUDNN_FRONTEND_ENABLE_FROST_ENGINES"] = "0"
 
+    def _deselect_frost_sdpa(graph):
+        # `cudnn` = the native backend. The SM100/SM120 f16 FROST rows are default
+        # candidates now (ranked per measured shard), so the env flag alone no
+        # longer withholds them: bar every FROST SDPA engine by name.
+        if args.sdpa_backend == "cudnn":
+            from cudnn.engines.manifest import MANIFEST
+
+            graph.deselect_engines([name for fam in MANIFEST if fam.name in ("frost_sdpa_fwd", "frost_sdpa_bwd") for name in fam.slots])
+
     def exit_unsupported(reason):
         """Signal the parent runner that this config is unsupported (not failed)."""
         import sys
@@ -914,6 +923,7 @@ else:
 
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
+        _deselect_frost_sdpa(graph_fwd)
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         if args.sdpa_backend == "cudnn_oss" and run_fwd:
             # Only the measured pass must run on an OSS kernel. For bwd-only
@@ -1161,6 +1171,7 @@ else:
 
             graph_bwd.validate()
             graph_bwd.build_operation_graph()
+            _deselect_frost_sdpa(graph_bwd)
             graph_bwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
             if args.sdpa_backend == "cudnn_oss":
                 # FROST bwd currently ships only sdpa_bwd_sm120, so on other

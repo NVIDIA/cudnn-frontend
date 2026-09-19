@@ -21,8 +21,10 @@ partial LSEs stay natural (the combine merges them in that base) and only the
 combine kernel's final LSE converts. Backward engines consume natural-log Stats
 only (the graph attribute is forward-only).
 
-All FROST engines are `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`
-before `import cudnn` or the graph silently runs a cuDNN backend plan.
+`sdpa_fwd_prefill_sm100` and `sdpa_fwd_prefill_sm120` (f16/bf16) are default candidates,
+ranked against the backend per measured shard (`sdpa/fwd/placement.py`); every other FROST
+SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
+`import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
 
 > **Keeping this current is a hard rule.** A change to any FROST SDPA
 > `Capabilities` row, or adding/retiring an `EngineSpec`, updates this file in

@@ -1,0 +1,767 @@
+config_name,model_name,phase,backend,data_type,kv_cache_dtype,batch_size,q_tokens,kv_len,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,kind,sliding_window_size,page_size,time_ms,tflops,gbps,sol_pct,num_iterations,success,error_message,gpu_name,backend_detail,cudnn_backend_version
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,2048,2048,64,8,128,128,gqa,,16,0.283427,242.459,266.374,14.8646,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,8192,8192,64,8,128,128,gqa,,16,3.111658,353.352,97.051,5.4158,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,32768,32768,64,8,128,128,gqa,,16,46.816481,375.769,25.802,1.4398,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,512,65536,64,8,128,128,gqa,,16,4.286978,256.477,66.53,3.7126,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,512,131072,64,8,128,128,gqa,,16,8.554094,257.073,64.723,3.6118,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,1024,65536,64,8,128,128,gqa,,16,6.407355,343.203,47.132,2.6301,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1,context,cudnn,bfloat16,bfloat16,1,1024,131072,64,8,128,128,gqa,,16,12.802671,343.526,44.555,2.4863,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,1,1,131072,64,8,128,128,gqa,,16,0.409823,10.48,1310.087,73.1075,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1200,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,128,1,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"e 0 while trying to allocate 34359738368 bytes (free: 32520077312, total: 101975851008).
+Traceback (most recent call last):
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 185, in setup_cudnn
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"", dtype=dtype) * 0.1).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 18.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"ttention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 289, in setup_cudnn_fp8
+    k_gpu = (torch.randn(b, skv, hkv, dqk, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.30 GiB is free. Including non-PyTorch memory, this process has 64.66 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 1024.00 KiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,1,2,131072,64,8,128,128,gqa,,16,2.448847,3.508,219.261,12.2355,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,64,8,128,128,gqa,,16,2.770764,3.1,96.893,5.407,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,128,2,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"e 0 while trying to allocate 34359738368 bytes (free: 32520077312, total: 101975851008).
+Traceback (most recent call last):
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 185, in setup_cudnn
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"", dtype=dtype) * 0.1).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 16.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"_attention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 289, in setup_cudnn_fp8
+    k_gpu = (torch.randn(b, skv, hkv, dqk, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 18.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,1,3,131072,64,8,128,128,gqa,,16,2.449321,5.261,219.232,12.2339,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,64,8,128,128,gqa,,16,2.770778,4.65,96.899,5.4073,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,128,3,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"e 0 while trying to allocate 34359738368 bytes (free: 32520077312, total: 101975851008).
+Traceback (most recent call last):
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 185, in setup_cudnn
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"", dtype=dtype) * 0.1).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 64.01 GiB is allocated by PyTorch, and 14.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"e_attention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 289, in setup_cudnn_fp8
+    k_gpu = (torch.randn(b, skv, hkv, dqk, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.67 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 9.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,1,4,131072,64,8,128,128,gqa,,16,2.448406,7.017,219.327,12.2392,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,64,8,128,128,gqa,,16,2.773667,6.194,96.804,5.402,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1,generation,cudnn,bfloat16,bfloat16,128,4,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"e 0 while trying to allocate 34359738368 bytes (free: 32520077312, total: 101975851008).
+Traceback (most recent call last):
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 185, in setup_cudnn
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"", dtype=dtype) * 0.1).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 64.01 GiB is allocated by PyTorch, and 12.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"_attention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 289, in setup_cudnn_fp8
+    k_gpu = (torch.randn(b, skv, hkv, dqk, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.67 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 12.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,64,8,128,128,gqa,,16,0.23386,293.849,322.832,18.0152,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,64,8,128,128,gqa,,16,2.704011,406.622,111.682,6.2323,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,64,8,128,128,gqa,,16,42.273368,416.153,28.575,1.5946,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,64,8,128,128,gqa,,16,3.078073,357.208,92.659,5.1707,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,64,8,128,128,gqa,,16,5.777522,380.617,95.828,5.3475,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,64,8,128,128,gqa,,16,5.725945,384.045,52.741,2.9431,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,64,8,128,128,gqa,,16,11.39682,385.901,50.051,2.793,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,64,8,128,128,gqa,,16,0.426175,10.078,1259.82,70.3024,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=16; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,""", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 185, in setup_cudnn
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"", dtype=dtype) * 0.1).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 18.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 289, in setup_cudnn_fp8
+    k_gpu = (torch.randn(b, skv, hkv, dqk, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.30 GiB is free. Including non-PyTorch memory, this process has 64.66 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 1024.00 KiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,64,8,128,128,gqa,,16,0.422429,20.335,1271.069,70.9302,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=16; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,""", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 185, in setup_cudnn
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"", dtype=dtype) * 0.1).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 16.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 289, in setup_cudnn_fp8
+    k_gpu = (torch.randn(b, skv, hkv, dqk, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 18.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,64,8,128,128,gqa,,16,0.423108,30.453,1269.107,70.8207,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=16; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,""", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 185, in setup_cudnn
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"", dtype=dtype) * 0.1).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 64.01 GiB is allocated by PyTorch, and 14.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 289, in setup_cudnn_fp8
+    k_gpu = (torch.randn(b, skv, hkv, dqk, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.67 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 9.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,64,8,128,128,gqa,,16,0.423168,40.598,1269.004,70.815,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=16; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,""", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 185, in setup_cudnn
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"", dtype=dtype) * 0.1).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 64.01 GiB is allocated by PyTorch, and 12.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,64,8,128,128,gqa,,16,inf,0.0,0.0,,20,False,"              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 289, in setup_cudnn_fp8
+    k_gpu = (torch.randn(b, skv, hkv, dqk, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.67 GiB memory in use. Of the allocated memory 64.00 GiB is allocated by PyTorch, and 12.00 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,2048,2048,32,4,128,128,gqa,,16,0.17037,201.677,221.569,12.3643,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,8192,8192,32,4,128,128,gqa,,16,1.658637,331.45,91.036,5.0801,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,32768,32768,32,4,128,128,gqa,,16,23.264441,378.092,25.961,1.4487,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,512,65536,32,4,128,128,gqa,,16,2.151616,255.508,66.279,3.6986,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,512,131072,32,4,128,128,gqa,,16,4.283334,256.695,64.628,3.6065,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,1024,65536,32,4,128,128,gqa,,16,4.275253,257.18,35.318,1.9709,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,context,cudnn,bfloat16,bfloat16,1,1024,131072,32,4,128,128,gqa,,16,8.543553,257.39,33.383,1.8629,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,1,1,131072,32,4,128,128,gqa,,16,0.23501,9.138,1142.3,63.7444,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1200,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,128,1,131072,32,4,128,128,gqa,,16,22.380326,12.282,1535.359,85.6785,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"_attention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.30 GiB is free. Including non-PyTorch memory, this process has 64.66 GiB memory in use. Of the allocated memory 40.00 GiB is allocated by PyTorch, and 24.00 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,1,2,131072,32,4,128,128,gqa,,16,2.43914,1.761,110.067,6.1421,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,32,4,128,128,gqa,,16,2.76772,1.552,48.5,2.7065,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,128,2,131072,32,4,128,128,gqa,,16,48.475689,11.341,708.89,39.5586,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"_attention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.30 GiB is free. Including non-PyTorch memory, this process has 64.66 GiB memory in use. Of the allocated memory 40.00 GiB is allocated by PyTorch, and 24.00 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,1,3,131072,32,4,128,128,gqa,,16,2.436875,2.644,110.176,6.1482,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,32,4,128,128,gqa,,16,2.765701,2.329,48.538,2.7086,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,128,3,131072,32,4,128,128,gqa,,16,48.556294,16.983,707.756,39.4953,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"_attention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 40.00 GiB is allocated by PyTorch, and 24.02 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,1,4,131072,32,4,128,128,gqa,,16,2.440117,3.52,110.036,6.1404,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,32,4,128,128,gqa,,16,2.766275,3.105,48.531,2.7082,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,bfloat16,128,4,131072,32,4,128,128,gqa,,16,48.735969,22.561,705.19,39.3521,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"_attention.py"", line 824, in <module>
+    main()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 789, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 40.00 GiB is allocated by PyTorch, and 24.02 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,32,4,128,128,gqa,,16,0.137857,249.242,273.825,15.2804,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,32,4,128,128,gqa,,16,1.360747,404.01,110.965,6.1922,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,32,4,128,128,gqa,,16,20.736841,424.177,29.126,1.6253,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,32,4,128,128,gqa,,16,1.591058,345.528,89.63,5.0017,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,32,4,128,128,gqa,,16,3.135624,350.652,88.284,4.9265,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,32,4,128,128,gqa,,16,3.065057,358.725,49.263,2.7491,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,32,4,128,128,gqa,,16,5.751344,382.349,49.591,2.7673,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,32,4,128,128,gqa,,16,0.25722,8.349,1043.666,58.2403,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=32; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,32,4,128,128,gqa,,16,22.394355,12.274,1534.397,85.6248,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.30 GiB is free. Including non-PyTorch memory, this process has 64.66 GiB memory in use. Of the allocated memory 40.00 GiB is allocated by PyTorch, and 24.00 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,32,4,128,128,gqa,,16,0.25517,16.832,1052.115,58.7118,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=32; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,32,4,128,128,gqa,,16,22.408469,24.533,1533.524,85.5761,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.30 GiB is free. Including non-PyTorch memory, this process has 64.66 GiB memory in use. Of the allocated memory 40.00 GiB is allocated by PyTorch, and 24.00 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,32,4,128,128,gqa,,16,0.25517,25.248,1052.179,58.7154,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=32; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,32,4,128,128,gqa,,16,22.419967,36.781,1532.831,85.5375,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 40.00 GiB is allocated by PyTorch, and 24.02 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,32,4,128,128,gqa,,16,0.255297,33.647,1051.72,58.6897,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=32; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,32,4,128,128,gqa,,16,22.456772,48.961,1530.413,85.4025,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,32,4,128,128,gqa,,16,inf,0.0,0.0,,20,False,"              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 290, in setup_cudnn_fp8
+    v_gpu = (torch.randn(b, skv, hkv, dvo, device=""cuda"") * 0.1).to(f8).transpose(1, 2)
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 94.97 GiB of which 30.29 GiB is free. Including non-PyTorch memory, this process has 64.68 GiB memory in use. Of the allocated memory 40.00 GiB is allocated by PyTorch, and 24.02 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",,,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,2048,2048,16,2,128,128,gqa,,16,0.112706,152.431,167.466,9.3452,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,8192,8192,16,2,128,128,gqa,,16,0.924677,297.269,81.647,4.5562,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,32768,32768,16,2,128,128,gqa,,16,11.937113,368.435,25.298,1.4117,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,512,65536,16,2,128,128,gqa,,16,2.215892,124.048,32.178,1.7957,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,512,131072,16,2,128,128,gqa,,16,4.2769,128.541,32.363,1.806,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,1024,65536,16,2,128,128,gqa,,16,2.211508,248.589,34.138,1.905,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn,bfloat16,bfloat16,1,1024,131072,16,2,128,128,gqa,,16,4.281802,256.787,33.305,1.8585,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,1,1,131072,16,2,128,128,gqa,,16,0.130048,8.257,1032.126,57.5963,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1200,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,128,1,131072,16,2,128,128,gqa,,16,11.2108,12.26,1532.533,85.5208,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1200,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,1,2,131072,16,2,128,128,gqa,,16,2.436398,0.881,55.095,3.0745,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,16,2,128,128,gqa,,16,2.762732,0.777,24.294,1.3557,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,128,2,131072,16,2,128,128,gqa,,16,23.458401,11.718,732.444,40.873,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,16,2,128,128,gqa,,16,29.18631,9.418,294.35,16.4258,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,1,3,131072,16,2,128,128,gqa,,16,2.435204,1.323,55.126,3.0762,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,16,2,128,128,gqa,,16,2.762808,1.166,24.295,1.3557,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,128,3,131072,16,2,128,128,gqa,,16,23.848474,17.289,720.508,40.2069,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,16,2,128,128,gqa,,16,29.160262,14.14,294.631,16.4414,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,1,4,131072,16,2,128,128,gqa,,16,2.368733,1.813,56.676,3.1627,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,16,2,128,128,gqa,,16,2.68484,1.6,25.002,1.3952,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,bfloat16,128,4,131072,16,2,128,128,gqa,,16,23.752912,23.145,723.451,40.3711,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,16,2,128,128,gqa,,16,29.143156,18.864,294.822,16.4521,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,16,2,128,128,gqa,,16,0.075616,227.199,249.608,13.929,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,16,2,128,128,gqa,,16,0.698854,393.327,108.03,6.0285,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,16,2,128,128,gqa,,16,10.222777,430.22,29.541,1.6485,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,16,2,128,128,gqa,,16,0.864067,318.121,82.52,4.6049,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,16,2,128,128,gqa,,16,1.598474,343.925,86.59,4.832,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,16,2,128,128,gqa,,16,1.673966,328.415,45.101,2.5168,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,16,2,128,128,gqa,,16,3.122844,352.087,45.666,2.5483,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,16,2,128,128,gqa,,16,0.161728,6.639,829.949,46.3141,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,16,2,128,128,gqa,,16,11.21437,12.256,1532.045,85.4936,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,16,2,128,128,gqa,,16,0.160287,13.398,837.461,46.7333,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,16,2,128,128,gqa,,16,11.220941,24.497,1531.241,85.4487,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,16,2,128,128,gqa,,16,0.16083,20.029,834.684,46.5784,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,16,2,128,128,gqa,,16,11.225947,36.729,1530.652,85.4158,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,16,2,128,128,gqa,,16,0.160192,26.811,838.06,46.7667,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=64; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,16,2,128,128,gqa,,16,11.230079,48.954,1530.182,85.3896,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=2; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,16,2,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,2048,2048,8,1,128,128,gqa,,16,0.080064,107.288,117.871,6.5776,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,8192,8192,8,1,128,128,gqa,,16,0.576163,238.542,65.517,3.6561,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,32768,32768,8,1,128,128,gqa,,16,6.291501,349.523,24.0,1.3393,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,512,65536,8,1,128,128,gqa,,16,2.207394,62.263,16.151,0.9013,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,512,131072,8,1,128,128,gqa,,16,4.407054,62.372,15.703,0.8763,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,1024,65536,8,1,128,128,gqa,,16,2.214438,124.13,17.047,0.9513,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn,bfloat16,bfloat16,1,1024,131072,8,1,128,128,gqa,,16,4.273397,128.646,16.685,0.9311,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,1,1,131072,8,1,128,128,gqa,,16,0.06845,7.843,980.467,54.7136,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1200,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,128,1,131072,8,1,128,128,gqa,,16,5.64335,12.177,1522.227,84.9457,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"Warning: CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN; Reason: process_knob_choices()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+{""engineId"":18,""smVersion"":1200,""knobChoices"":{""CUDNN_KNOB_TYPE_KERNEL_CFG"":-1,""CUDNN_KNOB_TYPE_TILE_CGA_M"":-1,""CUDNN_KNOB_TYPE_STREAM_K"":-1,""CUDNN_KNOB_TYPE_TILE_M"":-1,""CUDNN_KNOB_TYPE_TILE_N"":-1}}
+Warning: CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: only Rubin is supported for this engine at: !(1070 <= deviceVer && deviceVer < 1100)
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: (CUDNN_STATUS_NOT_INITIALIZED == status) || (CUDNN_STATUS_NOT_SUPPORTED == ((status) / 1000 * 1000))
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: ptr->isSupported()
+Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
+
+)",,,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,1,2,131072,8,1,128,128,gqa,,16,2.437584,0.44,27.534,1.5365,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,8,1,128,128,gqa,,16,2.759597,0.389,12.161,0.6786,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,128,2,131072,8,1,128,128,gqa,,16,12.415064,11.07,691.981,38.615,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,8,1,128,128,gqa,,16,15.886668,8.651,270.383,15.0884,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,1,3,131072,8,1,128,128,gqa,,16,2.437578,0.661,27.536,1.5366,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,8,1,128,128,gqa,,16,2.760475,0.583,12.158,0.6784,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,128,3,131072,8,1,128,128,gqa,,16,12.43326,16.581,691.01,38.5608,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,8,1,128,128,gqa,,16,15.883949,12.979,270.446,15.0919,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,1,4,131072,8,1,128,128,gqa,,16,2.437547,0.881,27.538,1.5367,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,8,1,128,128,gqa,,16,2.758782,0.778,12.166,0.6789,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,bfloat16,128,4,131072,8,1,128,128,gqa,,16,12.441854,22.093,690.575,38.5365,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn 9.27.0,
+llama3.1,llama3.1-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,8,1,128,128,gqa,,16,15.879881,17.31,270.532,15.0967,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn fp8 9.27.0,
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,8,1,128,128,gqa,,16,0.047968,179.076,196.739,10.9787,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,8,1,128,128,gqa,,16,0.421185,326.315,89.625,5.0014,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,8,1,128,128,gqa,,16,5.149571,427.03,29.322,1.6363,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=2; SPLIT_KV=1; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,8,1,128,128,gqa,,16,0.451517,304.394,78.96,4.4062,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=8; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,8,1,128,128,gqa,,16,0.833451,329.807,83.035,4.6337,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=8; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,8,1,128,128,gqa,,16,0.815139,337.216,46.31,2.5842,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,8,1,128,128,gqa,,16,1.592868,345.136,44.764,2.498,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=64; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,8,1,128,128,gqa,,16,0.126465,4.245,530.684,29.6141,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,8,1,128,128,gqa,,16,5.654236,12.154,1519.296,84.7822,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,8,1,128,128,gqa,,16,0.126691,8.475,529.77,29.563,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,8,1,128,128,gqa,,16,5.658274,24.29,1518.305,84.7268,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,8,1,128,128,gqa,,16,0.126816,12.7,529.28,29.5357,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,8,1,128,128,gqa,,16,5.660606,36.42,1517.772,84.6971,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,8,1,128,128,gqa,,16,0.127104,16.895,528.113,29.4706,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=128; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,8,1,128,128,gqa,,16,5.663561,48.534,1517.072,84.6581,20,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,cudnn_oss plan=sdpa_fwd_prefill_sm120[PACK_GQA=1; SCHED_POLICY=0; SPLIT_KV=4; TILE_CGA_M=1; TILE_M=128; TILE_N=128],
+llama3.1,llama3.1-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,8,1,128,128,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 270, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 167, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/benchmark/attention_inference/benchmark_single_attention.py"", line 336, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/scratch.yanxu_gpu/fe-sites/computelab_trees/fe_develop_5567e2733/python/cudnn/_pygraph.py"", line 1547, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,

@@ -19,11 +19,13 @@ behind for a caller that autotunes) or ``"FALLBACK"`` (the config expected to
 build where A's choice may not — nothing chosen for speed).
 
 Everything else about the final list — mode blocks, the backend's entries,
-the delegating entry, dedup, the mode strip — is PLACEMENT, and placement is
-not a family opinion: it lives once in ``engines/heuristics._assemble``,
-under the standing assumption that these proposals lead the backend's entries
-(an OSS engine measured behind the backend gets fixed or pulled, not
-demoted).
+the delegating entry, dedup, the mode strip — is PLACEMENT and lives once in
+``engines/heuristics._assemble``. The one placement opinion this family holds
+is WHERE the backend's block goes, and :func:`propose` (the manifest hook)
+states it per measured shard through ``placement.place``: ours first where
+FROST is timed ahead of the backend, the backend's block first where it is
+not. With ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` set the caller asked for
+FROST and ours lead everywhere.
 
 Cross-ENGINE order within a proposal batch is ``ENGINE_SPECS`` declaration
 order. Today that is unambiguous in practice — co-eligible cells are the
@@ -1167,7 +1169,26 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     return out
 
 
-# Placement — mode blocks, the backend's entries, the delegating entry, dedup,
-# the mode strip — is NOT this family's business: it happens once for every
-# family in ``engines/heuristics._assemble``, with these proposals leading the
-# backend's entries inside each block by standing assumption.
+def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
+    """The manifest hook: :func:`recommend`'s proposals with the backend's block
+    placed per the measured shard (:func:`placement.place`) — ours first where
+    FROST is timed ahead of the backend, the backend's block first where it is
+    not. ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` set means the caller asked for
+    FROST (the ``cudnn_oss`` benchmark lane, the FROST suites): ours lead
+    everywhere. An empty proposal list stays empty — nothing to place."""
+    ours = recommend(kind, facts, offered)
+    if not ours:
+        return ours
+    from cudnn.engines.heuristics import BACKEND
+    from cudnn.engines.manifest import opt_in_engines_enabled
+
+    from .placement import LEAD, place
+
+    if opt_in_engines_enabled():
+        return ours + [BACKEND]
+    spec = next(s for s in ENGINE_SPECS if offered.get(s.name) == ours[0].engine_id)
+    return ours + [BACKEND] if place(spec, facts) == LEAD else [BACKEND] + ours
+
+
+# Mode blocks, the delegating entry, dedup, the mode strip: placement bookkeeping
+# that happens once for every family in ``engines/heuristics._assemble``.
