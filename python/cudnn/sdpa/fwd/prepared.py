@@ -76,13 +76,7 @@ def facts_of_tensor(t) -> Optional[BufferFacts]:
 
 def facts_of_roles(pack, indices: List[int]) -> List[BufferFacts]:
     """Facts of several variant-pack operands in one native crossing (see :func:`facts_of_pack`)."""
-    out = []
-    for ptr, code, bits, dev_type, dev_id, nbytes, shape, stride in pack.native.facts(list(indices)):
-        width = max(1, (int(bits) + 7) // 8)
-        out.append(
-            BufferFacts(int(ptr), _DTYPE_BY_CODE.get((code, bits), ""), (dev_type, dev_id), -1 if nbytes < 0 else nbytes // width, tuple(shape), tuple(stride))
-        )
-    return out
+    return pack.native._facts_as(indices, BufferFacts, _DTYPE_BY_CODE)
 
 
 def facts_of_pack(pack, index: int) -> BufferFacts:

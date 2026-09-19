@@ -901,6 +901,47 @@ class VariantPackNative {
         return out;
     }
 
+    // Private typed projection of facts(), not another observation or validation path.
+    // Build the consumer's immutable records directly: facts()'s shape/stride lists
+    // and Python's second conversion loop otherwise allocate the same metadata twice.
+    // Effective dtype/geometry and observed producer span/device remain separate.
+    py::list
+    facts_as(const std::vector<size_t> &indices, const py::object &constructor, const py::dict &dtype_names) const {
+        py::list out(indices.size());
+        const py::str unknown_dtype("");
+        for (size_t i = 0; i < indices.size(); ++i) {
+            const size_t index     = indices[i];
+            const Operand &operand = operands_.at(index);
+            py::tuple shape(operand.shape.size());
+            for (size_t d = 0; d < operand.shape.size(); ++d) shape[d] = py::int_(operand.shape[d]);
+
+            py::tuple strides(operand.stride.empty() ? operand.shape.size() : operand.stride.size());
+            if (operand.stride.empty()) {
+                int64_t running = 1;
+                for (int d = operand.ndim - 1; d >= 0; --d) {
+                    strides[d] = py::int_(running);
+                    if (d > 0) running *= operand.shape[d];
+                }
+            } else {
+                for (size_t d = 0; d < operand.stride.size(); ++d) strides[d] = py::int_(operand.stride[d]);
+            }
+            const auto dtype_key =
+                py::make_tuple(static_cast<int>(operand.dtype.code), static_cast<int>(operand.dtype.bits));
+            PyObject *dtype = PyDict_GetItem(dtype_names.ptr(), dtype_key.ptr());
+            // Match the facts consumer: producer bytes in the EFFECTIVE element width.
+            const int64_t width = std::max<int64_t>(1, (static_cast<int64_t>(operand.dtype.bits) + 7) / 8);
+            const int64_t span  = operand.observed_bytes < 0 ? -1 : operand.observed_bytes / width;
+            out[i] =
+                constructor(reinterpret_cast<int64_t>(pointers_.at(index)),
+                            dtype == nullptr ? py::object(unknown_dtype) : py::reinterpret_borrow<py::object>(dtype),
+                            py::make_tuple(operand.observed_device_type, operand.observed_device_id),
+                            span,
+                            shape,
+                            strides);
+        }
+        return out;
+    }
+
     std::pair<int32_t, int32_t>
     observed_device(size_t index) const {
         const Operand &operand = operands_.at(index);
@@ -1212,6 +1253,7 @@ its parts.
         .def("pointer", &VariantPackNative::pointer)
         .def("observed_bytes", &VariantPackNative::observed_bytes)
         .def("facts", &VariantPackNative::facts)
+        .def("_facts_as", &VariantPackNative::facts_as)
         .def("observed_device", &VariantPackNative::observed_device)
         .def("shape", &VariantPackNative::shape)
         .def("stride", &VariantPackNative::stride)
