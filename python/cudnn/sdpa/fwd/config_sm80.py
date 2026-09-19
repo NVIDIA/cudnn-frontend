@@ -140,3 +140,58 @@ def params_for_flavor(flavor: str, **overrides) -> TemplateParams:
     p = TemplateParams(**base)
     validate_params(p)
     return p
+
+
+# ---------------------------------------------------------------------------
+# SM89 (Ada / L20) — the same kernel skeleton on a 99 KiB-SMEM part.
+#
+# The SM80 row is pinned to cc 8.0 exactly because the *shared* skeleton has to
+# cover the d=256 flavor, whose pinned point needs sQ_buf (64 KiB) + sK_buf
+# (64 KiB) = 128 KiB, inside A100s 164 KiB opt-in SMEM limit. An Ada part
+# ---------------------------------------------------------------------------
+# SM89 (Ada / L20) — the same kernel skeleton on a 99 KiB-SMEM part.
+#
+# The SM80 row is pinned to cc 8.0 exactly because the shared skeleton has to
+# cover the d=256 flavor, whose pinned point needs sQ_buf (64 KiB) + sK_buf
+# (64 KiB) = 128 KiB, inside A100's 164 KiB opt-in SMEM limit.  An Ada part
+# exposes 99 KiB per block (101376 B on the L20, queried), so only flavors whose
+# allocation fits can be served there.  d=64 routes to ``prefill_f16`` (the
+# shared skeleton, NOT ``prefill_d256_f16``); its pinned gptoss point
+# (tile_m=128, tile_n=64, num_warps=4) allocates
+#
+#     sQ_buf = max(tile_m*d_qk, 2*tile_n*d_v, tile_m*d_v) = 8192 elems = 16 KiB
+#     sK_buf = 2*tile_n*d_qk                                = 8192 elems = 16 KiB
+#                                                        total = 32 KiB
+#
+# which is not the binding constraint on Ada at all.  The flavor geometry is
+# therefore identical to the SM80 gptoss point; only the device gate and the
+# advertised capability box differ.  Nothing here widens the SM80 gate: the
+# SM80 row stays cc 8.0 exactly and keeps serving A100.
+# ---------------------------------------------------------------------------
+
+SM89_SUPPORTED_FLAVORS = ("gptoss",)
+
+# The template box the SM89 row lowers onto: d64 gptoss, same as A100's pinned
+# point.  Kept as a name here so a later Ada sweep can move it in one place.
+SM89_FLAVOR = "gptoss"
+
+
+def smem_bytes(d_qk: int, d_v: int, tile_m: int, tile_n: int, elem_bytes: int = 2) -> int:
+    """Static SMEM a specialization of ``prefill_f16`` allocates.
+
+    Mirrors the allocation site verbatim (``SQ_BUF_ELEMS`` / ``SK_BUF_ELEMS``)
+    so the plan-time resource gate and the kernel cannot drift:
+    ``(max(tile_m*d_qk, 2*tile_n*d_v, tile_m*d_v) + 2*tile_n*d_qk) * elem_bytes``.
+    A lower bound on the real footprint (alignment padding excluded).
+    """
+    elems_q = tile_m * d_qk
+    elems_kv_v = tile_n * d_v
+    elems_kv_k = tile_n * d_qk
+    return (max(elems_q, 2 * elems_kv_v, tile_m * d_v) + 2 * elems_kv_k) * elem_bytes
+
+
+def sm89_smem_bytes(params: "TemplateParams") -> int:
+    """SMEM for one SM89 TemplateParams.  Reads the FLAVOR head dims (the compile
+    box), not the graph's actual head dim: the allocation is a compile-time
+    constant and does not shrink for a head dim below the box."""
+    return smem_bytes(params.d_qk, params.d_v, params.tile_m, params.tile_n)
