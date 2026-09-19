@@ -339,8 +339,9 @@ MATRIX = (
         causal=True,
         qkv_dtype=torch.float16,
         partial_storage_dtype=torch.float16,
+        accumulator_dtype=torch.float16,
         o_dtype=torch.float16,
-        note="FP16 STORAGE for the partials (the reduced-precision contract); the accumulation they were produced by stays fp32, so this is not a native FP16-accumulated partial",
+        note="FP16 storage AND FP16 accumulation, matching TE's accumulator dtype on the non-FP8 path; not a native FP32 partial",
     ),
     dict(
         name="cp_p2_bf16_s128_causal",
@@ -349,8 +350,9 @@ MATRIX = (
         causal=True,
         qkv_dtype=torch.bfloat16,
         partial_storage_dtype=torch.bfloat16,
+        accumulator_dtype=torch.bfloat16,
         o_dtype=torch.bfloat16,
-        note="BF16 STORAGE for the partials (the reduced-precision contract); the accumulation stays fp32 and the FP64 expected value is unaffected by the storage cast",
+        note="BF16 storage AND BF16 accumulation; the FP64 expected value is unaffected by this cast",
     ),
 )
 

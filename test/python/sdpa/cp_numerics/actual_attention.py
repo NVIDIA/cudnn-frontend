@@ -111,17 +111,30 @@ class _record_backend_selection:
     read off ``utils.get_attention_backend``'s own return statement, not
     assumed; the first attempt guessed a different order and recorded every flag
     as False.  ``fused_attention_backend`` is an int when the fused backend was
-    chosen and ``None`` otherwise.
+    chosen and ``None`` otherwise, while ``flash_attention_backend`` is NOT an
+    int: the pinned selector reports the AVAILABLE FlashAttention version there
+    (a ``packaging.version.Version``) even when ``use_flash_attention`` is False
+    and the fused backend was selected, so it is recorded as text.
+
+    ``DotProductAttention.forward`` only calls the selector when its module-level
+    cache says the parameters changed, so the cache flag is forced for the
+    duration of the recording (and restored afterwards): a repeated non-causal
+    step would otherwise leave the sink EMPTY, which the report treats as an
+    unrecorded step rather than as evidence.
     """
 
     def __init__(self, sink: Dict[str, Any]) -> None:
         self._sink = sink
 
     def __enter__(self) -> "_record_backend_selection":
+        from transformer_engine.pytorch.attention.dot_product_attention import _attention_backends
         from transformer_engine.pytorch.attention.dot_product_attention import utils as dpa_utils
 
         self._module = dpa_utils
         self._original = dpa_utils.get_attention_backend
+        self._cache = _attention_backends
+        self._cache_previous = _attention_backends["backend_selection_requires_update"]
+        _attention_backends["backend_selection_requires_update"] = True
 
         def recording(attention_params: Any):
             selected = self._original(attention_params)
@@ -130,7 +143,7 @@ class _record_backend_selection:
             self._sink.update(
                 {
                     "use_flash_attention": bool(use_flash),
-                    "flash_attention_backend": None if flash_backend is None else int(flash_backend),
+                    "flash_attention_backend": None if flash_backend is None else str(flash_backend),
                     "use_fused_attention": bool(use_fused),
                     "fused_attention_backend": None if fused_backend is None else int(fused_backend),
                     "use_unfused_attention": bool(use_unfused),
@@ -144,6 +157,7 @@ class _record_backend_selection:
 
     def __exit__(self, *_exc: object) -> bool:
         self._module.get_attention_backend = self._original
+        self._cache["backend_selection_requires_update"] = self._cache_previous
         return False
 
 
@@ -431,16 +445,26 @@ def run_actual_attention_on_fixture(
     got_lse = merged_lse
 
     backends = [entry["backend"] for entry in per_step]
-    fused_steps = sum(1 for entry in backends if entry["use_fused_attention"])
-    unfused_steps = sum(1 for entry in backends if entry["use_unfused_attention"])
-    fused_backend_ids = sorted({entry["fused_attention_backend"] for entry in backends if entry["fused_attention_backend"] is not None})
-    executed = fused_steps == len(backends) and unfused_steps == 0
+    # A step whose selection was never observed is NOT evidence of a fused run,
+    # so it is counted separately and blocks R2_EXECUTED; the access is tolerant
+    # because an empty record is a legitimate outcome (the dispatcher caches),
+    # not an exception.
+    steps = len(backends)
+    unrecorded_steps = sum(1 for entry in backends if not entry)
+    fused_steps = sum(1 for entry in backends if entry.get("use_fused_attention"))
+    unfused_steps = sum(1 for entry in backends if entry.get("use_unfused_attention"))
+    fused_backend_ids = sorted({entry["fused_attention_backend"] for entry in backends if entry.get("fused_attention_backend") is not None})
+    executed = steps > 0 and fused_steps == steps and unfused_steps == 0 and unrecorded_steps == 0
     status = "R2_EXECUTED" if executed else "R2_UNVERIFIED"
-    backend_note = (
-        f"every step ran TE's fused attention (sub-backend ids {fused_backend_ids})"
-        if executed
-        else f"the fused kernel did NOT run: {fused_steps}/{len(backends)} steps fused, {unfused_steps} unfused"
-    )
+    if executed:
+        backend_note = f"every step ran TE's fused attention (sub-backend ids {fused_backend_ids})"
+    elif unrecorded_steps:
+        backend_note = (
+            f"the fused kernel was NOT observed: {unrecorded_steps}/{steps} steps recorded no backend selection, "
+            f"{fused_steps} fused, {unfused_steps} unfused"
+        )
+    else:
+        backend_note = f"the fused kernel did NOT run: {fused_steps}/{steps} steps fused, {unfused_steps} unfused"
 
     return ActualAttentionResult(
         status=status,
@@ -455,7 +479,8 @@ def run_actual_attention_on_fixture(
             "partial_lse_source": "fixture",
             "merge_label": "te_o_with_fixture_lse",
             "backend": {
-                "steps": len(backends),
+                "steps": steps,
+                "unrecorded_steps": unrecorded_steps,
                 "fused_steps": fused_steps,
                 "unfused_steps": unfused_steps,
                 "fused_attention_backend_ids": fused_backend_ids,

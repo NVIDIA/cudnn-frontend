@@ -1,5 +1,5 @@
 {
-  "accumulator_dtype": "float32",
+  "accumulator_dtype": "float16",
   "batch": 1,
   "causal": true,
   "chunk_len": 32,
@@ -7,7 +7,7 @@
   "empty_chunks": [],
   "fixture_sha256": "9c9aceb0d95ad2ec2b526a30e156768fda49d3fe67e5930a7a19456d8e186e9c",
   "fuser_mode": "torch.compile via transformer_engine.pytorch.jit.lazy_compile (NVTE_TORCH_COMPILE default 1)",
-  "generated_utc": "2026-09-19T02:50:26Z",
+  "generated_utc": "2026-09-19T04:32:37Z",
   "generator": "test/python/sdpa/cp_numerics/make_fixtures.py",
   "head_dim": 64,
   "head_mapping": "full: every rank holds all H heads (no head split; cp_size_a2a == 1)",
@@ -17,7 +17,7 @@
   "lse_dtype": "float32",
   "mask": "causal-top-left",
   "name": "cp_p2_f16_s128_causal",
-  "note": "FP16 STORAGE for the partials (the reduced-precision contract); the accumulation they were produced by stays fp32, so this is not a native FP16-accumulated partial",
+  "note": "FP16 storage AND FP16 accumulation, matching TE's accumulator dtype on the non-FP8 path; not a native FP32 partial",
   "num_heads": 4,
   "o_dtype": "float16",
   "o_i_normalized": true,
@@ -97,7 +97,7 @@
   "te_tag": "v0.1-2155-gae34b34f",
   "trace": [
     {
-      "accumulator_dtype": "float32",
+      "accumulator_dtype": "float16",
       "causal_alignment": "top-left",
       "causal_mode": "causal",
       "kv_global_begin": 0,
@@ -137,7 +137,7 @@
       "source_rank": 0
     },
     {
-      "accumulator_dtype": "float32",
+      "accumulator_dtype": "float16",
       "causal_alignment": "top-left",
       "causal_mode": "no_mask",
       "kv_global_begin": 32,
@@ -173,7 +173,7 @@
       "source_rank": 1
     },
     {
-      "accumulator_dtype": "float32",
+      "accumulator_dtype": "float16",
       "causal_alignment": "top-left",
       "causal_mode": "causal",
       "kv_global_begin": 32,
@@ -213,7 +213,7 @@
       "source_rank": 1
     },
     {
-      "accumulator_dtype": "float32",
+      "accumulator_dtype": "float16",
       "causal_alignment": "top-left",
       "causal_mode": "no_mask",
       "kv_global_begin": 0,
