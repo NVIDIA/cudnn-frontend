@@ -57,6 +57,15 @@ pytest fe_api/gemm/          # OSS kernel tests
 - **Compiled DSL call arity excludes compile-time parameters.** A `cutlass.Constexpr` argument belongs to the compilation signature and disappears from the compiled runtime call. When checking positional launch sites against `_host`, exclude these annotations as well as the stream keyword; do not add a runtime argument to satisfy an unfiltered Python signature count. `test_every_combine_call_site_matches_the_compiled_arity` is the detector.
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
 
+### Gate correctness on capability, not benchmark policy
+
+GPU correctness tests must check the kernel's actual architecture, resource,
+and provider requirements, not a product-name string or a preferred benchmark
+SM count. A requirement to collect performance numbers on a particular GPU is
+an agent/reporting instruction, not a test skip condition. When changing a gate,
+cover both a supported architecture with a different product name and genuinely
+unsupported architectures.
+
 ### Confirm you are testing the code you edited
 
 `pip install -e .` does **not** put the package on `sys.path`. It installs a
