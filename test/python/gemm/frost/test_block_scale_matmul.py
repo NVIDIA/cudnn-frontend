@@ -567,6 +567,78 @@ def _make_block_scale_inputs(combo, M, N, K, dev="cuda"):
     return a_rt, b_rt, sfa_log, sfb_log, ref, bs, sf_dt, a_dt
 
 
+@requires_sm100
+@pytest.mark.parametrize(
+    "combo,a_dtype,b_dtype,out_dtype",
+    [
+        ("nvfp4", "fp4_e2m1", "fp4_e2m1", "bf16"),
+        ("mxfp4", "fp4_e2m1", "fp4_e2m1", "fp16"),
+        ("mxfp8", "fp8_e4m3", "fp8_e4m3", "bf16"),
+        ("mxfp8", "fp8_e5m2", "fp8_e5m2", "fp16"),
+        ("mxfp8", "fp8_e4m3", "fp8_e5m2", "fp16"),
+        ("mxfp8", "fp8_e5m2", "fp8_e4m3", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("profile_device", ["b200", "rubin"])
+def test_block_scale_eight_public_plans_replay(monkeypatch, profile_device, combo, a_dtype, b_dtype, out_dtype):
+    from gemm_test_utils import skip_unless_pipeline_active
+    from cudnn.engines import is_python_engine
+    from cudnn.gemm.frost import planning, tile_config
+    from cudnn.gemm.frost.dtypes import CUDNN_FROM_DTYPE
+    from cudnn.gemm.frost.knobs import GemmKnobs
+
+    skip_unless_pipeline_active(by_name(_SPLITK_BS_CFG))
+    if profile_device == "b200":
+        monkeypatch.setattr(planning, "current_device_properties", lambda: planning.DeviceProperties(100, "NVIDIA B200", 148, 132644864))
+        monkeypatch.setattr(tile_config, "_sm_count", lambda: 148)
+        monkeypatch.setattr(C, "_sm_count", lambda: 148)
+    elif torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Rubin profile requires an SM107 GPU")
+    m, n, k = 192, 160, 4160
+    torch.manual_seed(919)
+    a, b, sfa, sfb, reference, bs, sf_dt, _ = _make_block_scale_inputs(combo, m, n, k)
+    if combo == "mxfp8":
+        torch_dtypes = {"fp8_e4m3": torch.float8_e4m3fn, "fp8_e5m2": torch.float8_e5m2}
+        a = torch.randint(-2, 3, (1, m, k), device="cuda").to(torch_dtypes[a_dtype])
+        b = torch.randint(-2, 3, (1, n, k), device="cuda").to(torch_dtypes[b_dtype])
+        reference = (a[0].double() * sfa.double().repeat_interleave(bs, -1)) @ (b[0].double() * sfb.double().repeat_interleave(bs, -1)).t()
+    output_torch = torch.bfloat16 if out_dtype == "bf16" else torch.float16
+    reference = reference.to(output_torch)
+    sfa = _to_blocked(sfa).view(1, _ceil_div(m, 128) * 128, -1)
+    sfb = _to_blocked(sfb).view(1, _ceil_div(n, 128) * 128, -1)
+
+    def graph():
+        g = _build_nvfp4_graph(m, n, k, block_size=bs, sf_dt=sf_dt, a_dt=CUDNN_FROM_DTYPE[a_dtype], b_dt=CUDNN_FROM_DTYPE[b_dtype])
+        _, binding = analyze_with_binding(g)
+        binding.outputs[0].set_data_type(CUDNN_FROM_DTYPE[out_dtype])
+        g.validate()
+        g.build_operation_graph()
+        return g, binding
+
+    g, _ = graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    records = [g.get_engine_and_knobs_at_index(i) for i in range(g.get_execution_plan_count())]
+    records = [(engine, knobs) for engine, knobs in records if is_python_engine(engine)]
+    assert len(records) == 8
+    assert len({GemmKnobs.from_public(knobs).to_config() for _, knobs in records}) == 8
+    if profile_device == "rubin":
+        assert all(GemmKnobs.from_public(knobs).to_config().mma_tile_k_bytes == 64 for _, knobs in records)
+    for engine, knobs in records:
+        replay, binding = graph()
+        replay.create_execution_plan(engine, knobs)
+        index = replay.get_execution_plan_count() - 1
+        replay.select_plan(index)
+        replay.check_support()
+        replay.build_plans()
+        assert replay.get_engine_and_knobs_at_index(index) == (engine, knobs)
+        y = torch.full((1, m, n), float("nan"), device="cuda", dtype=output_torch)
+        workspace = torch.empty(max(1, replay.get_workspace_size()), device="cuda", dtype=torch.uint8)
+        pack = {binding.a_operands[0]: a, binding.b_operands[0]: b, binding.sfa_operands[0]: sfa, binding.sfb_operands[0]: sfb, binding.outputs[0]: y}
+        replay.execute_plan_at_index(pack, workspace, index=index)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y[0], reference, rtol=0, atol=0)
+
+
 def _splitk_workspace(compiled):
     """(Workspace, buffer); the caller keeps both alive across the launch."""
     from cudnn.frost.workspace import Workspace
