@@ -14,15 +14,6 @@ def _require_gnn_mha(variant: str) -> None:
         pytest.skip(f"cudnn-frontend was built without cudnnGnnMha{variant.title().replace('_', '')} support")
 
 
-@pytest.fixture
-def graph_data(request):
-    index_dtype = request.param
-    offsets = torch.tensor([0, 2, 5], device="cuda", dtype=index_dtype)
-    indices = torch.tensor([0, 2, 1, 2, 3], device="cuda", dtype=index_dtype)
-    edge_map = torch.tensor([3, 0, 4, 1, 2], device="cuda", dtype=index_dtype)
-    return CscGraph(offsets, indices, num_src_nodes=4, map_csc_to_coo=edge_map)
-
-
 def _tolerances(dtype: torch.dtype) -> tuple[float, float]:
     if dtype == torch.float32:
         return (0.0005, 0.006)

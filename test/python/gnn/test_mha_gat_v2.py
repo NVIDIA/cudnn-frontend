@@ -6,12 +6,9 @@ import pytest
 import cudnn
 import torch
 from cudnn.gnn import CscGraph, mha_gat_v2
-from gnn._mha_test_utils import _require_gnn_mha, _reference_gat_v2, _tolerances, graph_data
-
-__all__ = ["graph_data"]
+from gnn._mha_test_utils import _require_gnn_mha, _reference_gat_v2, _tolerances
 
 
-@pytest.mark.parametrize("graph_data", [torch.int32, torch.int64], indirect=True)
 @pytest.mark.parametrize(
     "dtype",
     [pytest.param(torch.float32, marks=pytest.mark.L0), pytest.param(torch.float16, marks=pytest.mark.L1), pytest.param(torch.bfloat16, marks=pytest.mark.L1)],
@@ -19,10 +16,10 @@ __all__ = ["graph_data"]
 @pytest.mark.parametrize("concat_heads", [False, True])
 @pytest.mark.parametrize("with_edge", [False, True])
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_gnn_mha_gat_v2_forward_backward(graph_data, dtype, concat_heads, with_edge, deterministic):
+def test_gnn_mha_gat_v2_forward_backward(small_reverse_csc_graph, dtype, concat_heads, with_edge, deterministic):
     _require_gnn_mha("gat_v2")
     torch.manual_seed(1234)
-    graph = graph_data.with_reverse_csc()
+    graph = small_reverse_csc_graph
     assert graph.has_reverse_csc
     torch.testing.assert_close(graph.csc_rev_offsets, torch.tensor([0, 1, 2, 4, 5], device="cuda", dtype=graph.offsets.dtype))
     torch.testing.assert_close(graph.map_rev_to_coo, torch.tensor([3, 4, 0, 1, 2], device="cuda", dtype=graph.offsets.dtype))
@@ -64,6 +61,53 @@ def test_gnn_mha_gat_v2_forward_backward(graph_data, dtype, concat_heads, with_e
     torch.testing.assert_close(weights.grad, reference_weights.grad, atol=gradient_tolerance, rtol=gradient_tolerance)
     if edge is not None:
         torch.testing.assert_close(edge.grad, reference_edge.grad, atol=gradient_tolerance, rtol=gradient_tolerance)
+
+
+@pytest.mark.L2
+def test_gnn_mha_gat_v2_medium_graph(medium_reverse_csc_graph):
+    _require_gnn_mha("gat_v2")
+    torch.manual_seed(2345)
+    graph = medium_reverse_csc_graph
+    num_heads = 4
+    dim_node = 32
+    node = torch.randn((graph.num_src_nodes, dim_node), device="cuda", requires_grad=True)
+    edge = torch.randn((graph.num_edges, dim_node), device="cuda", requires_grad=True)
+    weights = torch.randn((dim_node,), device="cuda", requires_grad=True)
+
+    actual_output, actual_attention = mha_gat_v2(
+        graph,
+        node,
+        weights,
+        edge_features=edge,
+        num_heads=num_heads,
+        return_attention_weights=True,
+        deterministic=True,
+    )
+    reference_node = node.detach().clone().requires_grad_()
+    reference_edge = edge.detach().clone().requires_grad_()
+    reference_weights = weights.detach().clone().requires_grad_()
+    expected_output, expected_attention = _reference_gat_v2(
+        graph,
+        reference_node,
+        reference_node,
+        reference_edge,
+        reference_weights,
+        None,
+        num_heads,
+        True,
+        "leaky_relu",
+        0.2,
+    )
+    torch.testing.assert_close(actual_output, expected_output, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(actual_attention, expected_attention, atol=5e-4, rtol=5e-4)
+
+    grad_output = torch.randn_like(actual_output)
+    grad_attention = torch.randn_like(actual_attention)
+    torch.autograd.backward((actual_output, actual_attention), (grad_output, grad_attention))
+    torch.autograd.backward((expected_output, expected_attention), (grad_output, grad_attention))
+    torch.testing.assert_close(node.grad, reference_node.grad, atol=6e-3, rtol=6e-3)
+    torch.testing.assert_close(edge.grad, reference_edge.grad, atol=6e-3, rtol=6e-3)
+    torch.testing.assert_close(weights.grad, reference_weights.grad, atol=6e-3, rtol=6e-3)
 
 
 @pytest.mark.L0
