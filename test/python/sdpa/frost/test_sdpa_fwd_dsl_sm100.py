@@ -400,6 +400,47 @@ def test_dsl_sm100_singleton_seq_bhsd_storage(singleton, d):
     torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
 
 
+def _require_free_gib(gib):
+    free, _ = torch.cuda.mem_get_info()
+    if free < gib * 2**30:
+        pytest.skip(f"needs ~{gib} GiB free device memory, have {free / 2**30:.1f} GiB")
+
+
+def _ref_rows(q, k, v, rows, scale):
+    """fp32 reference for query rows [0, rows) of one batch; a wrapped stride aliases whole operands, so a slice proves the batch."""
+    scores = torch.matmul(q[:, :rows].float(), k.float().transpose(-1, -2)) * scale
+    return torch.matmul(torch.softmax(scores, dim=-1), v.float())
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d,b,s_q,s_kv,dtype",
+    [
+        (128, 1, 8192, 128, torch.float16),  # Q / O batch extent 2^27 = 8192 * 128 * 128
+        (512, 1, 16, 2048, torch.bfloat16),  # K / V batch extent 2^27 = 2048 * 128 * 512 (the benchmark repro's K/V)
+        (128, 2, 16384, 128, torch.float16),  # Q / O batch stride 2^28 at B = 2
+        (256, 2, 16, 8192, torch.float16),  # K / V batch stride 2^28 at B = 2 (the reported silent case, decode-shaped)
+    ],
+    ids=["q_2p27_d128", "kv_2p27_d512", "q_2p28_b2_d128", "kv_2p28_b2_d256"],
+)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_stride_leaves_are_int64(d, b, s_q, s_kv, dtype):
+    """Per-batch extents of 2^27 / 2^28 16-bit elements, H = 128. The host binds the (batch, seq,
+    head) strides as Int64 leaves; an Int32 leaf wraps in the TMA-unit scaling (stride * 16 // 128):
+    2^27 encodes negative (cuTensorMapEncodeTiled rejects, the launch aborts with
+    cudaErrorInvalidValue), 2^28 encodes 0 (every batch aliases batch 0, silently)."""
+    _require_dsl()
+    _require_free_gib(6)
+    h = 128
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _bhsd(b, h, s_q, d, dtype), _bhsd(b, h, s_kv, d, dtype), _bhsd(b, h, s_kv, d, dtype)
+    assert max(q.stride(0), k.stride(0)) in (2**27, 2**28), "the geometry under test drifted"
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=False))
+    rows = min(s_q, 256)
+    for i in range(b):
+        torch.testing.assert_close(o[i, :, :rows].float(), _ref_rows(q[i], k[i], v[i], rows, scale), atol=5e-2, rtol=3e-2)
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)

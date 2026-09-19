@@ -1111,7 +1111,7 @@ def _vec(ptr, n):
 def _bshd(ptr, batch, seq, heads, d, strides, thd):
     """(B, S, H, D) over the caller's (batch, seq, head) strides. A packed THD operand has
     batch extent 1 and binds the seq stride there (never stepped, GitHub #980)."""
-    bs, ss, hs = strides
+    bs, ss, hs = (cutlass.Int64(s) for s in strides)  # Int64 leaves: TMA-unit scaling happens in the leaf's width
     if thd:
         return cute.make_tensor(ptr, cute.make_layout((1, seq, heads, d), stride=(ss, ss, hs, 1)))
     return cute.make_tensor(ptr, cute.make_layout((batch, seq, heads, d), stride=(bs, ss, hs, 1)))
