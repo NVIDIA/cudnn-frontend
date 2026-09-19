@@ -673,6 +673,10 @@ class Graph : public ICudnn, public INode {
         }
 
         // Make sure device pointer is provided for all uids expected for this plan
+        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
+        // pointer plus a byte offset, so materialise those entries before looking them up.
+        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
+
         std::vector<void *> device_ptrs;
         std::vector<uid_t> uids;
 
@@ -819,6 +823,10 @@ class Graph : public ICudnn, public INode {
         // Get the BE's cuda graph
 
         // Make sure device pointer is provided for all uids expected for this plan
+        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
+        // pointer plus a byte offset, so materialise those entries before looking them up.
+        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
+
         std::vector<void *> device_ptrs;
         device_ptrs.reserve(variant_pack_uids.size());
         std::vector<uid_t> uids;
@@ -974,6 +982,10 @@ class Graph : public ICudnn, public INode {
         }
 
         // Make sure device pointer is provided for all uids expected for this plan
+        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
+        // pointer plus a byte offset, so materialise those entries before looking them up.
+        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
+
         std::vector<void *> device_ptrs;
         std::vector<uid_t> uids;
         device_ptrs.reserve(variant_pack_uids.size());
@@ -1042,6 +1054,10 @@ class Graph : public ICudnn, public INode {
         for (auto const &entry : cached_workspace_modifications) {
             uid_to_device_ptrs[entry.first] = static_cast<char *>(workspace) + std::get<1>(entry.second);
         }
+
+        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
+        // pointer plus a byte offset, so materialise those entries before looking them up.
+        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
 
         std::vector<void *> device_ptrs;
         std::vector<uid_t> uids;
