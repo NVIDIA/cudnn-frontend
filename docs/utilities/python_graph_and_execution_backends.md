@@ -1,5 +1,7 @@
 # Python-native `cudnn.pygraph` and pluggable execution backends
 
+> Execute-time shape overrides (`override_uids` / `override_shapes` / `override_strides`) are a **backend-plan** feature: they are passed through to the cuDNN variant pack and the Python engines ignore them. See [Execute-Time Shape Overrides](../operations/Attention.md#execute-time-shape-overrides).
+
 ## What this is
 
 `cudnn.pygraph` is a Python-native graph class: graph structure (nodes,
