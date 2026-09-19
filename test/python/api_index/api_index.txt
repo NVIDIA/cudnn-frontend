@@ -331,9 +331,9 @@ cudnn.gnn.CscGraph.has_reverse_csc
 cudnn.gnn.CscGraph.map_csc_to_coo
 cudnn.gnn.CscGraph.map_rev_to_coo
 cudnn.gnn.CscGraph.num_dst_nodes
-cudnn.gnn.CscGraph.with_reverse_csc
 cudnn.gnn.CscGraph.num_edges
 cudnn.gnn.CscGraph.num_indices
+cudnn.gnn.CscGraph.with_reverse_csc
 cudnn.gnn.agg_simple
 cudnn.gnn.gat
 cudnn.gnn.gat_v2
