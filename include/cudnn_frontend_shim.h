@@ -336,8 +336,12 @@ cuda_graph_node_get_dependencies_v2(cudaGraphNode_t node,
                                     cudaGraphNode_t *pDependencies,
                                     cudaGraphEdgeData *edgeData,
                                     size_t *pNumDependencies) {
-    NV_FE_CALL_TO_CUDA(
-        cuda_graph_node_get_dependencies_v2, cudaGraphNodeGetDependencies, node, pDependencies, edgeData, pNumDependencies);
+    NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependencies_v2,
+                       cudaGraphNodeGetDependencies,
+                       node,
+                       pDependencies,
+                       edgeData,
+                       pNumDependencies);
 }
 #endif
 

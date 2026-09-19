@@ -285,10 +285,11 @@ walk_graph(cudaGraph_t graph, std::string const &path, int depth, TopoSummary &s
 
         std::string dependents = "[";
         size_t dependent_count = 0;
-        if (cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(nodes[i], nullptr, &dependent_count) == cudaSuccess) {
+        if (cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(nodes[i], nullptr, &dependent_count) ==
+            cudaSuccess) {
             std::vector<cudaGraphNode_t> dependent_nodes(dependent_count);
-            if (dependent_count > 0 &&
-                cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(nodes[i], dependent_nodes.data(), &dependent_count) == cudaSuccess) {
+            if (dependent_count > 0 && cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(
+                                           nodes[i], dependent_nodes.data(), &dependent_count) == cudaSuccess) {
                 for (size_t d = 0; d < dependent_count; ++d) {
                     auto it = index_of.find(dependent_nodes[d]);
                     dependents +=
@@ -301,10 +302,11 @@ walk_graph(cudaGraph_t graph, std::string const &path, int depth, TopoSummary &s
 
         std::string dependencies = "[";
         size_t dependency_count  = 0;
-        if (cudnn_frontend::detail::cuda_graph_node_get_dependencies(nodes[i], nullptr, &dependency_count) == cudaSuccess) {
+        if (cudnn_frontend::detail::cuda_graph_node_get_dependencies(nodes[i], nullptr, &dependency_count) ==
+            cudaSuccess) {
             std::vector<cudaGraphNode_t> dependency_nodes(dependency_count);
-            if (dependency_count > 0 &&
-                cudnn_frontend::detail::cuda_graph_node_get_dependencies(nodes[i], dependency_nodes.data(), &dependency_count) == cudaSuccess) {
+            if (dependency_count > 0 && cudnn_frontend::detail::cuda_graph_node_get_dependencies(
+                                            nodes[i], dependency_nodes.data(), &dependency_count) == cudaSuccess) {
                 for (size_t d = 0; d < dependency_count; ++d) {
                     auto it = index_of.find(dependency_nodes[d]);
                     dependencies +=
@@ -642,28 +644,30 @@ make_matmul_add_graph(int64_t b, int64_t m, int64_t n, int64_t k, float scale_va
 constexpr int64_t kUidSliceX = 21;
 constexpr int64_t kUidSliceY = 22;
 constexpr int64_t kUidSliceZ = 23;
+constexpr int64_t kUidSliceW = 24;
 
-// Y = Slice(X)[1:2, :], Z = 2 * Y. When Slice cannot be expressed as a backend
-// operation the frontend records a variant-pack replacement instead: Y has to be
-// bound to X plus a byte offset. The caller therefore supplies the source
-// pointer and the destination pointer is derived from it.
+// Y = Slice(X)[:, 1:2, :], Z = Y @ W, all rank-3.  When Slice cannot be
+// expressed as a backend operation the frontend records a variant-pack
+// replacement instead: Y has to be bound to X plus a byte offset, and the
+// caller supplies the source pointer.  Rank-3 on purpose: this is the shape the
+// legacy lane builds on machines where a rank-2 slice feeding a pointwise has
+// no engine at all (measured on cuDNN 9.21.1 / SM100), so the replacement is
+// exercised rather than skipped.
 std::shared_ptr<fe::graph::Graph>
-make_slice_scale_graph(int64_t rows, int64_t cols) {
+make_slice_matmul_graph(int64_t b, int64_t s, int64_t d, int64_t n) {
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::HALF)
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
 
-    auto X = graph->tensor(fe::graph::Tensor_attributes()
-                               .set_name("X")
-                               .set_dim({rows, cols})
-                               .set_stride({cols, 1})
-                               .set_uid(kUidSliceX));
-    auto Y = graph->slice(X, fe::graph::Slice_attributes().set_slices({{1, 2}, {0, cols}}));
+    auto X = graph->tensor(
+        fe::graph::Tensor_attributes().set_name("X").set_dim({b, s, d}).set_stride({s * d, d, 1}).set_uid(kUidSliceX));
+    auto Y = graph->slice(X, fe::graph::Slice_attributes().set_slices({{0, b}, {1, 2}, {0, d}}));
     Y->set_data_type(fe::DataType_t::HALF).set_uid(kUidSliceY);
 
-    auto scale_options = fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::MUL);
-    auto Z             = graph->pointwise(Y, graph->tensor(2.0f), scale_options);
+    auto W = graph->tensor(
+        fe::graph::Tensor_attributes().set_name("W").set_dim({b, d, n}).set_stride({d * n, n, 1}).set_uid(kUidSliceW));
+    auto Z = graph->matmul(Y, W, fe::graph::Matmul_attributes());
     Z->set_data_type(fe::DataType_t::HALF).set_output(true).set_uid(kUidSliceZ);
     return graph;
 }
@@ -1747,11 +1751,12 @@ TEST_CASE("186 P4 G06: frontend auxiliary memcpy node ordering and behaviour", "
     bool ordering_ok = false;
     for (auto memcpy_node : memcpy_nodes) {
         size_t dependent_count = 0;
-        REQUIRE(cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(memcpy_node, nullptr, &dependent_count) == cudaSuccess);
+        REQUIRE(cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(memcpy_node, nullptr, &dependent_count) ==
+                cudaSuccess);
         std::vector<cudaGraphNode_t> dependent_nodes(dependent_count);
         if (dependent_count > 0) {
-            REQUIRE(cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(memcpy_node, dependent_nodes.data(), &dependent_count) ==
-                    cudaSuccess);
+            REQUIRE(cudnn_frontend::detail::cuda_graph_node_get_dependent_nodes(
+                        memcpy_node, dependent_nodes.data(), &dependent_count) == cudaSuccess);
             for (auto candidate : dependent_nodes) {
                 for (auto graph_node : graph_nodes) {
                     if (candidate == graph_node) {
@@ -2707,73 +2712,88 @@ TEST_CASE("186 G11: legacy Slice aliasing is materialised for every CUDA graph p
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;
 
-    int64_t const rows = 2, cols = 64;
-    auto graph         = make_slice_scale_graph(rows, cols);
-    auto status        = prepare_native_plan(graph, handle);
+    int64_t const b = 2, s = 64, d = 64, n = 8;
+    auto graph  = make_slice_matmul_graph(b, s, d, n);
+    auto status = prepare_native_plan(graph, handle);
     if (!status.built) {
         SKIP("slice plan could not be built: " + status.reason);
         return;
     }
 
     ev_header("G11 legacy Slice aliasing: the destination pointer is derived from the source");
-    print_plan_identity(graph, "G11 slice+scale");
+    print_plan_identity(graph, "G11 slice+matmul");
 
     int64_t const workspace_bytes = workspace_size_of(graph);
-    Surface<half> x(static_cast<size_t>(rows * cols), __float2half(0.f));
-    Surface<half> z(static_cast<size_t>(cols), __float2half(-1234.f));
+    int64_t const z_elements      = b * n;
+    half const sentinel           = __float2half(-1234.0f);
+    // Filled with exact halves (all-ones / all-twos against an all-ones W), so
+    // the expected output is the row sum itself and needs no tolerance.
+    Surface<half> x(static_cast<size_t>(b * s * d), __float2half(1.f));
+    Surface<half> x2(static_cast<size_t>(b * s * d), __float2half(2.f));
+    Surface<half> w(static_cast<size_t>(b * d * n), __float2half(1.f));
+    Surface<half> z(static_cast<size_t>(z_elements), sentinel);
+    Surface<half> z2(static_cast<size_t>(z_elements), sentinel);
     Surface<int8_t> workspace(static_cast<size_t>(std::max<int64_t>(workspace_bytes, 1)));
 
-    fill_deterministic_half(x.devPtr, x.size, 0x1860u);
-    std::vector<half> host_x(x.size);
-    CUDA_CHECK(cudaMemcpy(host_x.data(), x.devPtr, sizeof(half) * x.size, cudaMemcpyDeviceToHost));
+    // slices = {{0, b}, {1, 2}, {0, d}} on strides {s*d, d, 1}: the source pointer
+    // moves by exactly one d-row.
+    int64_t const offset_bytes = d * static_cast<int64_t>(sizeof(half));
 
-    int64_t const offset_bytes = cols * static_cast<int64_t>(sizeof(half));
-
-    // What the caller is expected to bind: the slice source and the graph
-    // output. The slice destination is derived by the frontend.
-    std::unordered_map<int64_t, void *> source_and_output = {{kUidSliceX, x.devPtr}, {kUidSliceZ, z.devPtr}};
-    // The same call with the derived pointer spelled out by hand.
-    std::unordered_map<int64_t, void *> explicit_alias = {{kUidSliceX, x.devPtr},
-                                                          {kUidSliceY, reinterpret_cast<char *>(x.devPtr) + offset_bytes},
-                                                          {kUidSliceZ, z.devPtr}};
-
-    auto z_is_scaled_slice = [&]() {
-        std::vector<half> host_z(z.size);
-        CUDA_CHECK(cudaMemcpy(host_z.data(), z.devPtr, sizeof(half) * z.size, cudaMemcpyDeviceToHost));
-        for (int64_t i = 0; i < cols; ++i) {
-            half const expected = __float2half(2.0f * __half2float(host_x[static_cast<size_t>(cols + i)]));
-            if (host_z[static_cast<size_t>(i)] != expected) {
+    auto buffer_all_equal = [&](Surface<half> const &buffer, half expected) {
+        std::vector<half> host(buffer.size);
+        CUDA_CHECK(cudaMemcpy(host.data(), buffer.devPtr, sizeof(half) * buffer.size, cudaMemcpyDeviceToHost));
+        for (auto element : host) {
+            if (element != expected) {
                 return false;
             }
         }
         return true;
     };
 
-    auto replay_and_check = [&](cudaGraph_t target, std::string const &label) {
+    // What the caller is expected to bind: the slice source, the matmul weight
+    // and the graph output.  The slice destination is derived by the frontend.
+    std::unordered_map<int64_t, void *> first_bind = {
+        {kUidSliceX, x.devPtr}, {kUidSliceW, w.devPtr}, {kUidSliceZ, z.devPtr}};
+    // The SAME graph re-bound to FRESH source and output buffers: the alias has
+    // to be re-derived from the new source pointer, not remembered from the
+    // populate that created it.
+    std::unordered_map<int64_t, void *> second_bind = {
+        {kUidSliceX, x2.devPtr}, {kUidSliceW, w.devPtr}, {kUidSliceZ, z2.devPtr}};
+    // The same call with the derived pointer spelled out by hand.
+    std::unordered_map<int64_t, void *> explicit_alias = {
+        {kUidSliceX, x.devPtr},
+        {kUidSliceW, w.devPtr},
+        {kUidSliceY, reinterpret_cast<char *>(x.devPtr) + offset_bytes},
+        {kUidSliceZ, z.devPtr}};
+
+    auto replay_and_check = [&](cudaGraph_t target, std::string const &label, Surface<half> &buffer, float expected) {
         cudaGraphExec_t exec = nullptr;
         CUDA_CHECK(cudaGraphInstantiate(&exec, target, nullptr, nullptr, 0));
-        fillImage(z.devPtr, z.size, __float2half(-1234.f));
+        fillImage(buffer.devPtr, buffer.size, sentinel);
         CUDA_CHECK(cudaGraphLaunch(exec, 0));
         CUDA_CHECK(cudaDeviceSynchronize());
-        REQUIRE(z_is_scaled_slice());
-        ev("[186][G11] PASS " + label + " replayed the alias and produced 2 * X[1, :]");
+        REQUIRE(buffer_all_equal(buffer, __float2half(expected)));
+        ev("[186][G11] PASS " + label + " replayed the alias and produced " + fmt(expected, 1));
         CUDA_CHECK(cudaGraphExecDestroy(exec));
     };
 
-    // 1. Wrapped populate and update bind the replacement from the source.
+    // 1. Wrapped populate, then update to FRESH buffers: both bind the
+    //    replacement from the source they were given.
     cudaGraph_t wrapped = nullptr;
     CUDA_CHECK(cudaGraphCreate(&wrapped, 0));
-    auto wrapped_populate = graph->populate_cuda_graph(handle, source_and_output, workspace.devPtr, wrapped);
+    auto wrapped_populate = graph->populate_cuda_graph(handle, first_bind, workspace.devPtr, wrapped);
     ev("[186][G11] wrapped populate with a source-only slice binding: " +
        (wrapped_populate.is_good() ? std::string("OK") : wrapped_populate.get_message()));
     REQUIRE(wrapped_populate.is_good());
-    replay_and_check(wrapped, "wrapped populate");
+    replay_and_check(wrapped, "wrapped populate", z, 64.0f);
 
-    auto wrapped_update = graph->update_cuda_graph(handle, source_and_output, workspace.devPtr, wrapped);
-    ev("[186][G11] wrapped update with a source-only slice binding: " +
+    auto wrapped_update = graph->update_cuda_graph(handle, second_bind, workspace.devPtr, wrapped);
+    ev("[186][G11] wrapped update onto fresh source/output buffers: " +
        (wrapped_update.is_good() ? std::string("OK") : wrapped_update.get_message()));
     REQUIRE(wrapped_update.is_good());
-    replay_and_check(wrapped, "wrapped update");
+    replay_and_check(wrapped, "wrapped update (fresh buffers)", z2, 128.0f);
+    REQUIRE(buffer_all_equal(z, __float2half(64.0f)));
+    ev("[186][G11] the first output buffer still holds its own result -> the alias was not carried over");
 
     // 2. Spelling the derived pointer out by hand stays accepted.
     cudaGraph_t explicit_graph = nullptr;
@@ -2782,23 +2802,24 @@ TEST_CASE("186 G11: legacy Slice aliasing is materialised for every CUDA graph p
     ev("[186][G11] wrapped populate with the alias spelled out: " +
        (explicit_populate.is_good() ? std::string("OK") : explicit_populate.get_message()));
     REQUIRE(explicit_populate.is_good());
-    replay_and_check(explicit_graph, "explicit alias populate");
+    replay_and_check(explicit_graph, "explicit alias populate", z, 64.0f);
 
-    // 3. The direct entry points take the same binding.
+    // 3. The direct entry points take the same binding, including the rebind.
     if (direct_population_eligible(graph)) {
         cudaGraph_t direct = nullptr;
         CUDA_CHECK(cudaGraphCreate(&direct, 0));
-        auto direct_populate = populate_graph(graph, handle, source_and_output, workspace.devPtr, direct);
+        auto direct_populate = populate_graph(graph, handle, first_bind, workspace.devPtr, direct);
         ev("[186][G11] " + direct_path_label() + " populate with a source-only slice binding: " +
            (direct_populate.is_good() ? std::string("OK") : direct_populate.get_message()));
         REQUIRE(direct_populate.is_good());
-        replay_and_check(direct, direct_path_label() + " populate");
+        replay_and_check(direct, direct_path_label() + " populate", z, 64.0f);
 
-        auto direct_update = update_graph(graph, handle, explicit_alias, workspace.devPtr, direct);
-        ev("[186][G11] " + direct_path_label() + " update with the alias spelled out: " +
+        auto direct_update = update_graph(graph, handle, second_bind, workspace.devPtr, direct);
+        ev("[186][G11] " + direct_path_label() + " update onto fresh source/output buffers: " +
            (direct_update.is_good() ? std::string("OK") : direct_update.get_message()));
         REQUIRE(direct_update.is_good());
-        replay_and_check(direct, direct_path_label() + " update");
+        replay_and_check(direct, direct_path_label() + " update (fresh buffers)", z2, 128.0f);
+        REQUIRE(buffer_all_equal(z, __float2half(64.0f)));
         CUDA_CHECK(cudaGraphDestroy(direct));
     } else {
         ev("[186][G11] direct population is not eligible for this graph: " + status.reason);
@@ -2808,7 +2829,7 @@ TEST_CASE("186 G11: legacy Slice aliasing is materialised for every CUDA graph p
     //    instead of binding a pointer that was never supplied.
     cudaGraph_t output_only_graph = nullptr;
     CUDA_CHECK(cudaGraphCreate(&output_only_graph, 0));
-    std::unordered_map<int64_t, void *> output_only = {{kUidSliceZ, z.devPtr}};
+    std::unordered_map<int64_t, void *> output_only = {{kUidSliceW, w.devPtr}, {kUidSliceZ, z.devPtr}};
     auto unbound = graph->populate_cuda_graph(handle, output_only, workspace.devPtr, output_only_graph);
     ev("[186][G11] populate without the slice source: " +
        (unbound.is_good() ? std::string("OK") : unbound.get_message()));
