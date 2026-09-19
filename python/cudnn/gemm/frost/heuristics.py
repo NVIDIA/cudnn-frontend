@@ -17,7 +17,7 @@ candidates for measurement; their order does not claim a universal ranking.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional
 
 from cudnn.engines.base import PlanConfig
@@ -102,13 +102,18 @@ def recommend(kind: str, facts: GemmFacts, offered: Dict[str, int]) -> List[Plan
             _LOG.debug("paired MoE proposes nothing (%s): %s", kind, exc)
     fc2_id = offered.get("frost_moe_fc2_pair")
     if fc2_id is not None and facts.fc2 is not None:
-        from .moe_pair import device_params
+        from .moe_pair import device_params, pair_knobs
         from .moe_fc2_pair import Fc2Knobs
 
         try:
             device_params()
-            # Keep the historical default first; tuning may select either depth.
-            proposals.extend(PlanConfig(fc2_id, Fc2Knobs(ab_stages=stages)) for stages in (12, 6))
+            # Preserve existing candidates first; each additional record is
+            # independently selectable through the shared public vocabulary.
+            proposals.extend(
+                PlanConfig(fc2_id, Fc2Knobs(geometry=replace(pair_knobs(), cta_tile_n=token_n, mma_tile_n=token_n), ab_stages=stages))
+                for token_n in (8, 16)
+                for stages in (12, 6)
+            )
         except (NotImplementedError, ValueError, KeyError) as exc:
             _LOG.debug("paired FC2 proposes nothing (%s): %s", kind, exc)
     return proposals

@@ -31,8 +31,9 @@ class Fc2Knobs:
     ab_stages: int = 12
 
     def __post_init__(self):
-        if self.geometry != pair_knobs():
-            raise ValueError("paired FC2 supports only its exact M128N8 static configuration")
+        supported = (pair_knobs(), replace(pair_knobs(), cta_tile_n=16, mma_tile_n=16))
+        if self.geometry not in supported:
+            raise ValueError("paired FC2 supports only its exact M128N8 or M128N16 static configuration")
         if isinstance(self.ab_stages, bool) or not isinstance(self.ab_stages, int) or self.ab_stages not in (6, 12):
             raise ValueError("paired FC2 STAGES must be 6 or 12")
 
@@ -76,8 +77,9 @@ def _fc2_knobs(knobs):
 
 @dataclass(frozen=True)
 class Fc2KernelParams(KernelParams):
-    # Frozen template parameters also distinguish the persistent compile key.
+    # Frozen parameters distinguish tile geometry as well as pipeline depth.
     ab_stages: int = 12
+    token_n: int = 8
 
 
 @dataclass(frozen=True)
@@ -156,7 +158,8 @@ class Fc2Compiled:
         params = replace(params, weight_layout=spec.weight_layout)
         self.spec, self.binding = spec, spec.binding
         self.workspace_bytes = (params.grid_ctas * 2 + 1) * 128
-        path = Path(__file__).resolve().parent / "sm100/kernel_templates/sm100_moe_fc2_pair.py"
+        template = "sm100_moe_fc2_pair_n16.py" if params.token_n == 16 else "sm100_moe_fc2_pair.py"
+        path = Path(__file__).resolve().parent / "sm100/kernel_templates" / template
         self.module = load_template(str(path), params, tag="moe_fc2_pair")
         self.kernel = self.module.compile()
 
@@ -193,5 +196,5 @@ def build_fc2(graph, knobs):
         knobs = _fc2_knobs(knobs)
     except ValueError as exc:
         raise NotImplementedError(str(exc)) from exc
-    params = Fc2KernelParams(**asdict(device_params()), ab_stages=knobs.ab_stages)
+    params = Fc2KernelParams(**asdict(device_params()), ab_stages=knobs.ab_stages, token_n=knobs.geometry.cta_tile_n)
     return Fc2Compiled(spec, params)

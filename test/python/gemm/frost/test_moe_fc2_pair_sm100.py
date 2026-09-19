@@ -3,6 +3,7 @@
 """Direct FC2 graph plans: two retained weights and live captured inputs."""
 
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 import hashlib
@@ -26,6 +27,7 @@ cases = [
     # Reuse accumulator and scheduler slots across multiple persistent waves.
     dict(name="multi_wave", experts=128, rows=8, k=768, n=2048, sizes=[1] * 7 + [0] * 120 + [1], pitched=False),
     dict(name="many_waves", experts=128, rows=8, k=128, n=8192, sizes=[1] * 7 + [0] * 120 + [1], pitched=False),
+    dict(name="r16_boundary", experts=4, rows=16, k=64, n=128, sizes=[0, 16, 0, 0], pitched=False),
     dict(name="r9_one_expert", experts=3, rows=9, k=128, n=128, sizes=[0, 9, 0], pitched=False),
     dict(name="r17_pitched_scan", experts=35, rows=17, k=128, n=192, sizes=[0] * 32 + [1, 16, 0], pitched=True),
     dict(name="r64_sparse", experts=128, rows=64, k=768, n=1024, sizes=[1] * 63 + [0] * 64 + [1], pitched=False),
@@ -35,6 +37,7 @@ cases = [
 ]
 
 
+@pytest.mark.parametrize("token_n", [8, 16], ids=["n8", "n16"])
 @pytest.mark.parametrize("stages", [12, 6], ids=["stages12", "stages6"])
 @pytest.mark.parametrize(
     "spec,layout",
@@ -43,7 +46,7 @@ cases = [
         case["name"] + ("_k64" if layout else "_canonical") for case in cases for layout in (None, "k_blocked_64_v1") if layout is None or not case["pitched"]
     ],
 )
-def test_fc2_native_graph_and_live_captures(spec, layout, stages, tmp_path):
+def test_fc2_native_graph_and_live_captures(spec, layout, stages, token_n, tmp_path):
     import cudnn
     from cudnn.frost import buffers
 
@@ -63,7 +66,9 @@ def test_fc2_native_graph_and_live_captures(spec, layout, stages, tmp_path):
     assert torch.cuda.get_device_capability() == (10, 0)
     generator = torch.Generator().manual_seed(1810)
     bf16, fp32 = cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT
-    knobs = Fc2Knobs(ab_stages=stages)
+    from cudnn.gemm.frost.moe_pair import pair_knobs
+
+    knobs = Fc2Knobs(geometry=replace(pair_knobs(), cta_tile_n=token_n, mma_tile_n=token_n), ab_stages=stages)
 
     def forbidden_empty(*args, **kwargs):
         raise AssertionError("execute allocated torch.empty")
@@ -112,6 +117,7 @@ def test_fc2_native_graph_and_live_captures(spec, layout, stages, tmp_path):
                     block=[int(params.blockDimX), int(params.blockDimY), int(params.blockDimZ)],
                 )
             )
+            assert f"_m128n{token_n}k16_" in name.decode()
             assert ("kblock64" in name.decode()) == (layout is not None)
             assert [int(params.gridDimX), int(params.gridDimY), int(params.gridDimZ)] == [torch.cuda.get_device_properties(0).multi_processor_count, 1, 1]
             assert [int(params.blockDimX), int(params.blockDimY), int(params.blockDimZ)] == [256, 1, 1]
@@ -190,11 +196,16 @@ def test_fc2_native_graph_and_live_captures(spec, layout, stages, tmp_path):
         g.build_plan_at_index(0)
     assert loads.call_count == 1
     template_path, template_params = loads.call_args.args[:2]
-    assert Path(template_path).resolve() == root / "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_fc2_pair.py"
+    template_name = "sm100_moe_fc2_pair_n16.py" if token_n == 16 else "sm100_moe_fc2_pair.py"
+    assert Path(template_path).resolve() == root / "python/cudnn/gemm/frost/sm100/kernel_templates" / template_name
+    assert template_params.token_n == token_n
     assert template_params.grid_ctas == torch.cuda.get_device_properties(0).multi_processor_count
     assert template_params.ab_stages == stages and template_params.weight_layout == layout
     compiled = next(iter(g._compiled_plans.values()))._compiled
     assert compiled.module.ab_stages == stages and compiled.module.moe_kblocked64 == (layout is not None)
+    assert compiled.module.mma_inst_shape_mnk == (128, token_n, 16)
+    assert compiled.module.cta_tile_mnk == (token_n, 64, 64)
+    result["token_n"] = token_n
     result["ab_stages"] = stages
     result.setdefault("templates", []).append(dict(path=template_path, sha256=sha(template_path), params=repr(template_params)))
     engine, actual_knobs = g.get_engine_and_knobs_at_index(0)
@@ -206,6 +217,7 @@ def test_fc2_native_graph_and_live_captures(spec, layout, stages, tmp_path):
     case = dict(
         **spec,
         ab_stages=stages,
+        token_n=token_n,
         weight_layout=layout,
         parent_stride=stride,
         engine=int(engine),

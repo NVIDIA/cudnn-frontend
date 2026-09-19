@@ -338,6 +338,12 @@ rejected before compilation. The depth is part of the template and persistent
 compile-cache identity, so both plans may remain live simultaneously. This
 axis applies to `20402`; engines `20400` and `20401` reject it.
 
+Engine `20402` also accepts matching `TILE_N` and `MMA_TILE_N` values of `16`.
+Both fields must agree; the existing value `8` remains the default. Each supported
+geometry can use either stage-depth option. Candidate enumeration preserves the
+existing records first and appends the additional choices without a performance
+ranking. Recorded choices replay through the same engine and public knob API.
+
 These BF16 paired projection plans accumulate in FP32. The original 12-stage
 kernel and both public stage choices share a known fidelity limit for strongly
 cancelling dot products: with unit weights and input `[2^26, 1, ..., 1, -2^26]`

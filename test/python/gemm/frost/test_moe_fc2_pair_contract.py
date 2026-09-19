@@ -42,8 +42,14 @@ def test_fc2_supported_graphs(options):
     # Device eligibility is independently enforced, without importing the template.
     with patch("cudnn.gemm.frost.moe_pair.device_params", return_value=None):
         proposals = recommend("A", facts, {"frost_moe_fc2_pair": 20402})
-    assert [p.engine_id for p in proposals] == [20402, 20402]
-    assert [p.knobs.ab_stages for p in proposals] == [12, 6]
+    assert [p.engine_id for p in proposals] == [20402] * 4
+    assert [(p.knobs.geometry.cta_tile_n, p.knobs.geometry.mma_tile_n, p.knobs.ab_stages) for p in proposals] == [
+        (8, 8, 12),
+        (8, 8, 6),
+        (16, 16, 12),
+        (16, 16, 6),
+    ]
+    assert len({tuple(sorted((int(k), int(v)) for k, v in p.knobs.to_public().items())) for p in proposals}) == 4
     engines = FrostGemmEngines({"frost_gemm": 20400, "frost_moe_swiglu_pair": 20401, "frost_moe_fc2_pair": 20402})
     assert [engine.engine_id for engine in engines] == [20400, 20401, 20402]
     knobs = pair_knobs()
