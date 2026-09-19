@@ -541,6 +541,26 @@ class TestR1TeFidelity:
         assert "select(seq_dim, 1)" in second and "view(*softmax_lse.shape[:-1], 2, -1)" in second
 
     @pytest.mark.L0
+    def test_reduced_precision_fixtures_record_the_accumulator_they_ran(self) -> None:
+        """`accumulator_dtype` is part of the contract, so it may not drift.
+
+        The FP16/BF16 fixtures exist to pin the reduced-precision path, and the
+        accumulation there is the storage dtype (TE's accumulator on the
+        non-FP8 path): recording float32 while the replay accumulates in half
+        would describe a different run than the one the fixture carries.
+        """
+        fixtures = pathlib.Path(_HERE, "cp_numerics", "fixtures")
+        seen = set()
+        for header_path in sorted(fixtures.glob("*.header.json")):
+            header = json.loads(header_path.read_text())
+            seen.add(header["partial_storage_dtype"])
+            if header["partial_storage_dtype"] in ("float16", "bfloat16"):
+                assert header["accumulator_dtype"] == header["partial_storage_dtype"], header_path.name
+            else:
+                assert header["accumulator_dtype"] == "float32", header_path.name
+        assert {"float16", "bfloat16", "float32"} <= seen, seen
+
+    @pytest.mark.L0
     def test_te_source_anchors_still_present(self) -> None:
         """Bind the transcription to the pinned checkout when one is available."""
         repo = os.environ.get("TE_CP_REF_REPO")
@@ -659,6 +679,45 @@ class TestR2Preconditions:
         assert "transformer_engine" in why or "--te-repo" in why
 
     @pytest.mark.L0
+    def test_runner_returns_unverified_exit_for_an_unverified_backend(self, tmp_path, monkeypatch) -> None:
+        """A downgraded backend must reach the shell, not only the JSON.
+
+        The backend guard turns a run whose fused kernel was not observed into
+        ``R2_UNVERIFIED``; that path used to return ``EXIT_OK``, so automation
+        saw success while the report said unverified.
+        """
+        import json
+
+        sys.path.insert(0, os.path.join(_HERE, "cp_numerics"))
+        from cp_numerics import actual_attention as act
+        from cp_numerics import run_cp_reference as runner
+
+        fixture = pathlib.Path(_HERE, "cp_numerics", "fixtures", "cp_p1_f32_s128_causal.pt")
+        args = runner._parse_args(["--mode", "actual-attention", "--fixture", str(fixture), "--output-dir", str(tmp_path), "--te-compute-dtype", "float16"])
+        monkeypatch.setattr(runner, "_te_installed_matches_pin", lambda repo: (True, "mocked pin"))
+        monkeypatch.setattr(
+            act,
+            "run_actual_attention_on_fixture",
+            lambda **kwargs: act.ActualAttentionResult(
+                status="R2_UNVERIFIED",
+                per_step=[{"backend": {}}],
+                merged={
+                    "o": {"elements": 0},
+                    "lse": {"elements": 0},
+                    "merge_label": "te_o_with_fixture_lse",
+                    "partial_lse_source": "fixture",
+                    "backend": {"steps": 1, "unrecorded_steps": 1, "fused_steps": 0, "unfused_steps": 0},
+                },
+                fixture={"name": "cp_p1_f32_s128_causal"},
+            ),
+        )
+        code = runner.run_actual_attention(args, rank=0, local_rank=0, world_size=1, output_dir=str(tmp_path))
+        assert code == runner.EXIT_R2_UNVERIFIED, f"unverified backend exited {code}"
+        report = json.loads((tmp_path / "rank_0_actual_attention.json").read_text())
+        assert report["status"] == "R2_UNVERIFIED"
+        assert report["merged"]["backend"]["unrecorded_steps"] == 1
+
+    @pytest.mark.L0
     def test_runner_rejects_a_missing_fixture(self, tmp_path) -> None:
         sys.path.insert(0, os.path.join(_HERE, "cp_numerics"))
         from cp_numerics import run_cp_reference as runner  # noqa: PLC0415
@@ -669,6 +728,7 @@ class TestR2Preconditions:
 
 
 import ast
+import json
 import os
 import pathlib
 import sys
@@ -713,8 +773,16 @@ def test_r2_lane_records_and_requires_the_fused_backend() -> None:
     source = _lane_source()
     assert "dpa_utils.get_attention_backend" in source, "the REAL dispatcher decision is recorded, not re-derived"
     assert "fused_steps = sum(" in source and "unfused_steps = sum(" in source
-    assert "executed = fused_steps == len(backends) and unfused_steps == 0" in source
+    # A step whose selection was never observed is not evidence: the dispatcher
+    # caches its decision, so the recache has to be forced and an empty record
+    # counted as unrecorded rather than assumed fused.
+    assert '_attention_backends["backend_selection_requires_update"] = True' in source
+    assert "unrecorded_steps = sum(" in source
+    assert "fused_steps == steps and unfused_steps == 0 and unrecorded_steps == 0" in source
     assert 'status = "R2_EXECUTED" if executed else "R2_UNVERIFIED"' in source
+    # The FlashAttention field is a VERSION, not a backend id: the pinned
+    # selector reports it even when the fused backend was selected.
+    assert "str(flash_backend)" in source and "int(flash_backend)" not in source
 
 
 @pytest.mark.L0

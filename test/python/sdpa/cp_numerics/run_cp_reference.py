@@ -624,6 +624,11 @@ def run_actual_attention(args: argparse.Namespace, rank: int, local_rank: int, w
             "partial_lse_source": result.merged["partial_lse_source"],
         }
         print(json.dumps(summary, indent=2))
+    if report["status"] != "R2_EXECUTED":
+        # The backend guard downgrades a run whose fused kernel was not observed
+        # (or was not used) to R2_UNVERIFIED: the report already says so, and the
+        # exit code has to agree with it instead of handing CI a success.
+        return EXIT_R2_UNVERIFIED
     return EXIT_OK
 
 

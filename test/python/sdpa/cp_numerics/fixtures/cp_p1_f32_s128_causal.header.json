@@ -7,7 +7,7 @@
   "empty_chunks": [],
   "fixture_sha256": "dc2111226320f37b9d3b9b7525fafb98e0f4a59c36b540e94de4b9fb96868d39",
   "fuser_mode": "torch.compile via transformer_engine.pytorch.jit.lazy_compile (NVTE_TORCH_COMPILE default 1)",
-  "generated_utc": "2026-09-19T02:50:26Z",
+  "generated_utc": "2026-09-19T04:32:37Z",
   "generator": "test/python/sdpa/cp_numerics/make_fixtures.py",
   "head_dim": 64,
   "head_mapping": "full: every rank holds all H heads (no head split; cp_size_a2a == 1)",

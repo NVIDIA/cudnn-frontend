@@ -12,7 +12,7 @@
   ],
   "fixture_sha256": "0c494b54072b74100de7c5aedb201ab21814a69fb457a024aa8f3d157f800c15",
   "fuser_mode": "torch.compile via transformer_engine.pytorch.jit.lazy_compile (NVTE_TORCH_COMPILE default 1)",
-  "generated_utc": "2026-09-19T02:50:26Z",
+  "generated_utc": "2026-09-19T04:32:37Z",
   "generator": "test/python/sdpa/cp_numerics/make_fixtures.py",
   "head_dim": 64,
   "head_mapping": "full: every rank holds all H heads (no head split; cp_size_a2a == 1)",
