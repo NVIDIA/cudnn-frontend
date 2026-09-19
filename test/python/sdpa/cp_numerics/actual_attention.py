@@ -27,6 +27,14 @@ Those partials then go through ``te_adapter.merge_te_fidelity``, and the merged
 O is compared against the fixture's FP64 expectation (``expected_out_fp64``),
 which was produced by the independent oracle, not by TE.
 
+Backend verification
+--------------------
+A passing numerical comparison is not evidence of WHICH kernel ran, so every
+step records the dispatcher selection of TE while it executes, and the lane
+reports ``R2_EXECUTED`` only when every step took the FUSED path with no unfused
+step.  Otherwise the status is downgraded to ``R2_UNVERIFIED`` and the per-step
+counts say why: a green merge from the unfused fallback is not fused evidence.
+
 One honesty boundary, stated rather than papered over
 -----------------------------------------------------
 The public ``DotProductAttention`` returns **only** O.  TE's softmax LSE lives
@@ -88,6 +96,57 @@ class ActualAttentionResult:
     notes: List[str] = field(default_factory=list)
 
 
+class _record_backend_selection:
+    """Record which attention backend TE's own dispatcher selects.
+
+    ``DotProductAttention.forward`` calls
+    ``dpa_utils.get_attention_backend(attention_params)`` and branches on its
+    return value.  Wrapping that one function observes the REAL decision without
+    reaching into private state, and the wrapper only forwards and records --
+    it never changes the answer.
+
+    The pinned revision returns
+    ``(use_flash_attention, flash_attention_backend, use_fused_attention,
+    fused_attention_backend, use_unfused_attention, available_backends)`` --
+    read off ``utils.get_attention_backend``'s own return statement, not
+    assumed; the first attempt guessed a different order and recorded every flag
+    as False.  ``fused_attention_backend`` is an int when the fused backend was
+    chosen and ``None`` otherwise.
+    """
+
+    def __init__(self, sink: Dict[str, Any]) -> None:
+        self._sink = sink
+
+    def __enter__(self) -> "_record_backend_selection":
+        from transformer_engine.pytorch.attention.dot_product_attention import utils as dpa_utils
+
+        self._module = dpa_utils
+        self._original = dpa_utils.get_attention_backend
+
+        def recording(attention_params: Any):
+            selected = self._original(attention_params)
+            use_flash, flash_backend, use_fused, fused_backend, use_unfused = selected[0], selected[1], selected[2], selected[3], selected[4]
+            self._sink.clear()
+            self._sink.update(
+                {
+                    "use_flash_attention": bool(use_flash),
+                    "flash_attention_backend": None if flash_backend is None else int(flash_backend),
+                    "use_fused_attention": bool(use_fused),
+                    "fused_attention_backend": None if fused_backend is None else int(fused_backend),
+                    "use_unfused_attention": bool(use_unfused),
+                    "selector_arity": len(selected),
+                }
+            )
+            return selected
+
+        self._module.get_attention_backend = recording
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        self._module.get_attention_backend = self._original
+        return False
+
+
 class _PinnedAttention:
     """One ``DotProductAttention`` per mask type, reused across every step.
 
@@ -123,26 +182,25 @@ class _PinnedAttention:
             self._modules[attn_mask_type] = module
         return module
 
-    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, keep_mask: torch.Tensor, attn_mask_type: str) -> torch.Tensor:
-        """``[B, Sq, H, D]`` in, ``[B, Sq, H, D]`` out, in the input dtype.
+    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask_type: str) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """``[B, Sq, H, D]`` in, ``([B, Sq, H, D], backend)`` out.
 
-        ``keep_mask`` is the step's own ``[Sq, Skv]`` boolean keep rule.  A step
-        whose axes each concatenate two DISJOINT chunks cannot be described by
-        TE's causal flag -- that flag would keep the rectangular
-        first-chunk-Q x second-chunk-KV corners as well -- so every section goes
-        through the explicit ``arbitrary`` path with the same mask the fixture
-        used.
+        ``attn_mask_type`` is ``causal`` for the diagonal section and ``no_mask``
+        for the two triangle sections.  Both are mask types the fused backend
+        supports; the explicit ``arbitrary`` path is deliberately NOT used,
+        because at the pinned revision it disables FusedAttention and
+        FlashAttention alike (reviewer finding on PR #1142).
+
+        The atomic backend selection is recorded while the module runs, so the
+        report can say which kernel produced the partials instead of assuming.
         """
         module = self._module(attn_mask_type)
-        batch = q.shape[0]
-        # TE's convention is drop-True, the OPPOSITE of the keep rule the fixtures
-        # are built from: measured, the complement reproduces a causal reference
-        # exactly while the keep mask itself is off by 3.9.
-        drop = ~keep_mask
-        mask = drop.view(1, 1, drop.shape[0], drop.shape[1]).expand(batch, 1, drop.shape[0], drop.shape[1]).contiguous()
         with torch.cuda.device(self._device):
-            flat = module(q, k, v, attention_mask=mask, qkv_format="bshd", attn_mask_type=attn_mask_type)
-            return flat.reshape(self._batch, q.shape[1], self._num_heads, self._head_dim)
+            recorded: Dict[str, Any] = {}
+            with _record_backend_selection(recorded):
+                flat = module(q, k, v, qkv_format="bshd", attn_mask_type=attn_mask_type)
+            out = flat.reshape(self._batch, q.shape[1], self._num_heads, self._head_dim)
+        return out, recorded
 
 
 def compute_partials(
@@ -188,45 +246,18 @@ def compute_partials(
         k_step = k_global.index_select(1, kv_positions.to(k_global.device))
         v_step = v_global.index_select(1, kv_positions.to(v_global.device))
 
-        # The step's keep rule, from global positions -- the SAME function the
-        # fixtures were built with, so both sides are defined identically.
-        q_cpu = torch.cat([torch.arange(begin, end) for begin, end in record.q_global_ranges])
-        kv_cpu = torch.cat([torch.arange(begin, end) for begin, end in record.kv_global_ranges])
-        # The keep rule is built on the host (it is integer bookkeeping) and moved
-        # once, so every later comparison in the block-diagonal pass stays on one
-        # device.
-        q_positions_host = q_cpu.to(device)
-        kv_positions_host = kv_cpu.to(device)
-        keep = rm.causal_keep_mask_from_positions(
-            q_cpu,
-            kv_cpu,
-            causal=(record.causal_mode == "causal"),
-            valid_kv_len=valid_len,
-        ).to(device)
-
-        # Block-diagonal structure: a row survives only if a kept column lies in
-        # the same (q_range, kv_range) block pair as the row itself.  That is what
-        # removes the rectangular corners a plain causal flag would keep, and it
-        # leaves the second half's cross-chunk rows empty, which is exactly the
-        # row set the fixture's partial carries.
-        in_block = torch.zeros_like(keep)
-        for q_begin, q_end in record.q_global_ranges:
-            for kv_begin, kv_end in record.kv_global_ranges:
-                row_hit = (q_positions_host >= q_begin) & (q_positions_host < q_end)
-                col_hit = (kv_positions_host >= kv_begin) & (kv_positions_host < kv_end)
-                in_block |= row_hit.unsqueeze(1) & col_hit.unsqueeze(0)
-        effective = keep & in_block
-        selected = effective.any(dim=1)
-
-        # Trim the local Q axis to the surviving rows, and trim the mask's query
-        # axis with the same selection so TE and the fixture see one mask.
-        q_step = q_step.index_select(1, torch.nonzero(selected, as_tuple=False).flatten().to(q_step.device))
-        effective = effective[selected]
-
-        # TE sees an explicit mask, so the type is 'arbitrary' for every section.
-        assert effective.device == q_step.device, (effective.device, q_step.device)
-        attn_mask_type = "arbitrary"
-        out_step = attention.run(q_step, k_step, v_step, effective, attn_mask_type).to(o_dtype)
+        # The mask type the schedule implies, NOT a hand-built mask:
+        #   diagonal  the local axes are causal WITHIN each block-diagonal block
+        #             (the concatenated range makes i-j ordering differ from the
+        #             global one), so TE's own causal flag is exactly the
+        #             fixture's per-block keep rule;
+        #   triangles their keep rule is total on the axes the step carries.
+        # Measured against the fixtures: 1.19e-07 (P1) and 8.94e-08 (P2 worst
+        # step), identical to the explicit-mask path, so the supported types cost
+        # nothing in fidelity and let the fused backend run.
+        attn_mask_type = "causal" if record.causal_mode == "causal" else "no_mask"
+        out_step, backend = attention.run(q_step, k_step, v_step, attn_mask_type)
+        out_step = out_step.to(o_dtype)
         partial_out.append(out_step)
         per_step.append(
             {
@@ -237,9 +268,8 @@ def compute_partials(
                 "query_half": record.query_half,
                 "causal_mode": record.causal_mode,
                 "attn_mask_type": attn_mask_type,
+                "backend": backend,
                 "q_tokens": int(q_step.shape[1]),
-                "q_rows_kept": int(selected.sum().item()),
-                "q_rows_kept": int(selected.sum().item()),
                 "kv_tokens": int(k_step.shape[1]),
                 "out_shape": list(out_step.shape),
                 "out_dtype": str(out_step.dtype).replace("torch.", ""),
@@ -321,8 +351,16 @@ def run_actual_attention_on_fixture(
     world_size: int,
     compiled: bool,
     device: torch.device,
+    compute_dtype: torch.dtype = torch.bfloat16,
 ) -> ActualAttentionResult:
-    """The R2 computation, on one rank, against one fixture's own Q/K/V."""
+    """The R2 computation, on one rank, against one fixture's own Q/K/V.
+
+    ``compute_dtype`` is the dtype the fused kernel runs in.  It is a parameter
+    rather than the fixture's storage dtype because TE's fused backend does not
+    accept fp32 (measured: fp32 selects the UNFUSED backend, fp16/bf16 select
+    the fused one), while the fixtures deliberately store fp32 for the R0/R1
+    contract.
+    """
     header = fixture.header
     if header.cp_size != world_size:
         raise ValueError(f"fixture {header.name!r} carries cp_size={header.cp_size} but world_size={world_size}")
@@ -331,9 +369,14 @@ def run_actual_attention_on_fixture(
     qkv_dtype = tea.dtype_from_name(header.qkv_dtype)
     o_dtype = tea.dtype_from_name(header.o_dtype)
 
-    q_global = fixture.tensors["q_global"].to(device).to(qkv_dtype)
-    k_global = fixture.tensors["k_global"].to(device).to(qkv_dtype)
-    v_global = fixture.tensors["v_global"].to(device).to(qkv_dtype)
+    # The fixture's own tensors stay in their stored dtype for the comparison;
+    # the kernel input is cast, and the cast is recorded, not hidden.
+    q_stored = fixture.tensors["q_global"].to(device)
+    k_stored = fixture.tensors["k_global"].to(device)
+    v_stored = fixture.tensors["v_global"].to(device)
+    q_global = q_stored.to(compute_dtype)
+    k_global = k_stored.to(compute_dtype)
+    v_global = v_stored.to(compute_dtype)
 
     partial_out, per_step = compute_partials(
         q_global=q_global,
@@ -344,8 +387,8 @@ def run_actual_attention_on_fixture(
         chunk_len=header.chunk_len,
         num_heads=header.num_heads,
         head_dim=header.head_dim,
-        qkv_dtype=qkv_dtype,
-        o_dtype=o_dtype,
+        qkv_dtype=compute_dtype,
+        o_dtype=compute_dtype,
         device=device,
         valid_len=header.valid_len,
     )
@@ -387,8 +430,20 @@ def run_actual_attention_on_fixture(
     expected_lse_local = _local_expected_lse(expected_lse, rank, header.cp_size, header.chunk_len)
     got_lse = merged_lse
 
+    backends = [entry["backend"] for entry in per_step]
+    fused_steps = sum(1 for entry in backends if entry["use_fused_attention"])
+    unfused_steps = sum(1 for entry in backends if entry["use_unfused_attention"])
+    fused_backend_ids = sorted({entry["fused_attention_backend"] for entry in backends if entry["fused_attention_backend"] is not None})
+    executed = fused_steps == len(backends) and unfused_steps == 0
+    status = "R2_EXECUTED" if executed else "R2_UNVERIFIED"
+    backend_note = (
+        f"every step ran TE's fused attention (sub-backend ids {fused_backend_ids})"
+        if executed
+        else f"the fused kernel did NOT run: {fused_steps}/{len(backends)} steps fused, {unfused_steps} unfused"
+    )
+
     return ActualAttentionResult(
-        status="R2_EXECUTED",
+        status=status,
         per_step=per_step,
         merged={
             "o": _ulp_stats(got_out, expected_local),
@@ -399,6 +454,15 @@ def run_actual_attention_on_fixture(
             "o_sha256_32": _tensor_digest(got_out),
             "partial_lse_source": "fixture",
             "merge_label": "te_o_with_fixture_lse",
+            "backend": {
+                "steps": len(backends),
+                "fused_steps": fused_steps,
+                "unfused_steps": unfused_steps,
+                "fused_attention_backend_ids": fused_backend_ids,
+                "compute_dtype": str(compute_dtype).replace("torch.", ""),
+                "fixture_qkv_dtype": header.qkv_dtype,
+                "verdict": backend_note,
+            },
         },
         fixture={
             "name": header.name,
@@ -418,7 +482,9 @@ def run_actual_attention_on_fixture(
         },
         te_binding=tea.describe_te_binding(),
         notes=[
-            "O partials are computed by the pinned TransformerEngine fused attention; the merge is te_adapter.merge_te_fidelity.",
+            "O partials come from TE's own attention module; the merge is te_adapter.merge_te_fidelity.",
+            backend_note,
+            "The mask type is the section's own (causal for the diagonal, no_mask for the triangles); the explicit arbitrary-mask path is not used because it disables the fused backend.",
             "Per-step LSE is taken from the fixture because the public TE forward returns only O at this revision.",
             "Comparison target is the fixture's FP64 expectation, produced by the independent oracle.",
         ],

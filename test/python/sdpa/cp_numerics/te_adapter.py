@@ -200,10 +200,14 @@ def verify_helper_source(te_repo: str) -> Dict[str, Any]:
     for verification never gets a silent pass.
     """
     path = os.path.join(te_repo, TE_SOURCE_RELPATH)
-    with open(path, "r", encoding="utf-8") as handle:
-        text = handle.read()
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    # Anchors are searched in TEXT, but the digest is taken over the raw BYTES:
+    # text mode normalizes CRLF to LF, so a checkout whose bytes differ from the
+    # recorded pin could still report source_sha256_matches_recorded=True.
+    text = raw.decode("utf-8")
     out: Dict[str, Any] = {name: (anchor in text) for name, anchor in _HELPER_ANCHORS.items()}
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(raw).hexdigest()
     out["source_sha256"] = digest
     out["source_sha256_matches_recorded"] = (digest == TE_SOURCE_SHA256) if TE_SOURCE_SHA256 else None
     return out
@@ -568,6 +572,14 @@ class FixtureHeader:
     @staticmethod
     def from_json(text: str) -> "FixtureHeader":
         payload = json.loads(text)
+        # The schema version is checked FIRST and is never a compatibility hint:
+        # a header written by another version can carry the same field names with
+        # different semantics, and replaying it as the current schema would
+        # interpret it silently wrong.  A NEWER header is refused here as well --
+        # its extra fields stay a schema error, not a soft "version" warning.
+        version = payload.get("schema_version")
+        if version != _SCHEMA_VERSION:
+            raise ValueError(f"fixture header schema_version {version!r} is not the supported {_SCHEMA_VERSION}")
         known = set(FixtureHeader.__dataclass_fields__)  # type: ignore[attr-defined]
         unknown = set(payload) - known
         if unknown:

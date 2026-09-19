@@ -546,12 +546,15 @@ class TestR1TeFidelity:
         repo = os.environ.get("TE_CP_REF_REPO")
         if not repo or not os.path.isdir(repo):
             pytest.skip("TE_CP_REF_REPO is not set to a TransformerEngine checkout; " "the transcription cannot be re-verified against source in this run")
-        result = tea.verify_helper_source(repo)
-        missing = [k for k, v in result.items() if v is False]
-        assert not missing, f"pinned TE source no longer contains: {missing}"
+        # The revision is checked BEFORE the anchors: on an unpinned tree the
+        # anchors (and the recorded digest) may legitimately be absent, and the
+        # intended outcome there is a SKIP, not an assertion failure.
         head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
         if head.stdout.strip() != tea.TE_PINNED_SHA:
             pytest.skip(f"checkout HEAD {head.stdout.strip()} != pinned {tea.TE_PINNED_SHA}; anchors verified on that tree only")
+        result = tea.verify_helper_source(repo)
+        missing = [k for k, v in result.items() if v is False]
+        assert not missing, f"pinned TE source no longer contains: {missing}"
 
     @pytest.mark.L0
     def test_compiled_lane_is_close_to_eager_but_not_bitwise_identical(self) -> None:
@@ -681,39 +684,51 @@ def _lane_source() -> str:
 
 
 @pytest.mark.L0
-def test_r2_lane_inverts_the_keep_rule_for_te() -> None:
-    """TE drops where the mask is True; handing it the keep rule directly is a bug.
+def test_r2_lane_uses_te_supported_mask_types() -> None:
+    """The lane must not ask TE for the ``arbitrary`` mask type.
 
-    Measured on the pinned revision: the causal keep mask scores 3.9 against a
-    causal reference while its complement scores 0.0.
+    At the pinned revision the dispatcher turns an arbitrary mask into
+    UnfusedDotProductAttention -- FusedAttention and FlashAttention are both
+    disabled for it -- so that spelling could never evidence a fused run.  The
+    mask of the section is expressed through the types the fused backend
+    supports: ``causal`` for the diagonal section, whose block-diagonal ranges
+    are causal within each block, and ``no_mask`` for the two triangles, whose
+    keep rule is total on the axes the step carries.
     """
     source = _lane_source()
-    assert "drop = ~keep_mask" in source, "the R2 lane must invert the keep rule before calling TE"
-    assert "TE's convention is drop-True" in source, "and must say why, next to the inversion"
-    # The mask must be derived from the keep rule, not passed through.
-    assert "mask = drop.view(" in source
+    assert 'attn_mask_type = "causal" if record.causal_mode == "causal" else "no_mask"' in source
+    assert '"arbitrary"' not in source, "an arbitrary mask disables the fused backend at the pinned revision"
+    assert "mask = drop.view(" not in source, "the lane expresses the mask through the mask type, not a built mask"
 
 
 @pytest.mark.L0
-def test_r2_lane_uses_the_step_mask_not_a_causal_flag() -> None:
-    """Every section goes through the explicit-mask path with the fixture's own rule.
+def test_r2_lane_records_and_requires_the_fused_backend() -> None:
+    """A passing number is not evidence of WHICH kernel produced it.
 
-    A plain causal flag would keep the rectangular corners of the two disjoint
-    chunk ranges, which is how the first version produced 128 query rows where
-    the fixture stores 64 and a merged O that was wrong by 1.8.
+    The lane wraps the TE dispatcher, records the selection atomically with the
+    call, and downgrades the result unless EVERY step ran fused with no unfused
+    step -- so an unfused fallback reports R2_UNVERIFIED instead of a green
+    merged O.
     """
     source = _lane_source()
-    assert 'attn_mask_type = "arbitrary"' in source
-    assert "causal_keep_mask_from_positions" in source, "the mask must come from the shared reference rule"
-    assert "in_block" in source, "the block-diagonal structure must gate the keep rule"
+    assert "dpa_utils.get_attention_backend" in source, "the REAL dispatcher decision is recorded, not re-derived"
+    assert "fused_steps = sum(" in source and "unfused_steps = sum(" in source
+    assert "executed = fused_steps == len(backends) and unfused_steps == 0" in source
+    assert 'status = "R2_EXECUTED" if executed else "R2_UNVERIFIED"' in source
 
 
 @pytest.mark.L0
-def test_r2_lane_drops_rows_that_keep_nothing() -> None:
-    """The fixture's partial carries only rows with at least one valid key."""
+def test_r2_lane_keeps_the_fixture_row_axis() -> None:
+    """Each partial covers the FULL local query axis of its step.
+
+    Trimming the rows that keep nothing made an all-masked step hand the merge a
+    zero-row partial, which cannot be reshaped back to the section it belongs to.
+    Fully masked rows stay in the partial as zeros, in their original order.
+    """
     source = _lane_source()
-    assert "selected = effective.any(dim=1)" in source
-    assert "q_step.index_select(1, torch.nonzero(selected, as_tuple=False).flatten()" in source
+    assert "q_step.index_select(1, torch.nonzero" not in source, "the row axis is the fixture's, not a subset"
+    assert '"q_tokens": int(q_step.shape[1])' in source, "the partial reports the step width, not a kept-row count"
+    assert "q_rows_kept" not in source
 
 
 @pytest.mark.L0

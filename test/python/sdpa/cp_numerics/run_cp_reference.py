@@ -59,7 +59,6 @@ _PARENT = os.path.dirname(_HERE)
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
-from cp_numerics import actual_attention as act  # noqa: E402
 from cp_numerics import te_adapter as tea  # noqa: E402
 from cp_numerics import trace_schema as ts  # noqa: E402
 
@@ -482,20 +481,64 @@ def run_merge_lanes(
 # ---------------------------------------------------------------------------
 
 
-def _te_installed_matches_pin(te_repo: Optional[str]) -> Tuple[bool, str]:
+def _te_imported_module() -> Tuple[Optional[str], str]:
+    """``(source path of the TE the interpreter would run, refusal reason)``.
+
+    Binds the pin to the INSTALLED TransformerEngine rather than to a checkout
+    passed on the command line: the kernels that produce R2's numbers come from
+    the imported package, so hashing a ``--te-repo`` copy proves nothing about
+    them, and a developer pointing ``--te-repo`` at the pin while running a
+    different install would get a green report for a kernel it did not use
+    (reviewer finding on PR #1142).
+    """
     try:
-        import transformer_engine  # noqa: F401
-    except Exception as exc:  # ImportError, or OSError from missing CUDA libs
-        return False, f"transformer_engine is not importable in this interpreter: {exc!r}"
+        from transformer_engine.pytorch.attention.dot_product_attention import context_parallel as te_cp
+    except (ImportError, OSError) as exc:
+        # ImportError when TE is absent; OSError when its CUDA libraries cannot
+        # be dlopen'd in this interpreter. Both mean "cannot verify".
+        return None, f"transformer_engine is not importable in this interpreter: {exc!r}"
+
+    installed = os.path.abspath(te_cp.__file__ or "")
+    if not installed.endswith(tea.TE_SOURCE_RELPATH.replace("/", os.sep)):
+        return None, f"imported CP module {installed} does not match the pinned relpath {tea.TE_SOURCE_RELPATH}"
+
+    with open(installed, "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    if not tea.TE_SOURCE_SHA256:
+        return None, "no TE source sha256 is recorded; the pin cannot be verified"
+    if digest != tea.TE_SOURCE_SHA256:
+        return None, f"imported TE source sha256 {digest} != recorded pin {tea.TE_SOURCE_SHA256} ({installed})"
+    return installed, ""
+
+
+def _te_repo_cross_check(te_repo: Optional[str]) -> str:
+    """Optional extra check: the checkout named on the command line, if given.
+
+    Returns a refusal reason, or an empty string when it agrees (or was not
+    given). Never raises for a missing path -- a fail-closed report must still
+    be written.
+    """
     if not te_repo:
-        return False, "--te-repo is required so the installed TE source can be hash-compared to the pinned revision"
+        return ""
     candidate = os.path.join(te_repo, tea.TE_SOURCE_RELPATH)
     if not os.path.exists(candidate):
-        return False, f"pinned source not found at {candidate}"
-    digest = tea.helper_source_sha256(te_repo)
-    if tea.TE_SOURCE_SHA256 and digest != tea.TE_SOURCE_SHA256:
-        return False, f"TE source sha256 {digest} != recorded pin {tea.TE_SOURCE_SHA256}"
-    return True, ""
+        return f"--te-repo names no pinned source at {candidate}"
+    if tea.TE_SOURCE_SHA256:
+        digest = tea.helper_source_sha256(te_repo)
+        if digest != tea.TE_SOURCE_SHA256:
+            return f"--te-repo source sha256 {digest} != recorded pin {tea.TE_SOURCE_SHA256}"
+    return ""
+
+
+def _te_installed_matches_pin(te_repo: Optional[str]) -> Tuple[bool, str]:
+    """Does the TE this interpreter imports match the pin? (Cross-checks --te-repo.)"""
+    installed, why = _te_imported_module()
+    if why:
+        return False, why
+    repo_why = _te_repo_cross_check(te_repo)
+    if repo_why:
+        return False, repo_why
+    return True, f"imported TE source verified: {installed}"
 
 
 def run_actual_attention(args: argparse.Namespace, rank: int, local_rank: int, world_size: int, output_dir: str) -> int:
@@ -506,6 +549,7 @@ def run_actual_attention(args: argparse.Namespace, rank: int, local_rank: int, w
     fidelity and are not.
     """
     ok, why = _te_installed_matches_pin(args.te_repo)
+    installed_path, _installed_why = _te_imported_module()
     base: Dict[str, Any] = {
         "schema": "cp_numerics_run/1",
         "mode": "actual-attention",
@@ -514,8 +558,12 @@ def run_actual_attention(args: argparse.Namespace, rank: int, local_rank: int, w
         "world_size": world_size,
         "utc": _utc_now(),
         "te_binding": tea.describe_te_binding(),
+        "te_imported_module": installed_path,
         "te_repo": os.path.abspath(args.te_repo) if args.te_repo else None,
-        "te_repo_sha256": tea.helper_source_sha256(args.te_repo) if args.te_repo else None,
+        # Only hashed once the check has passed: hashing it earlier turned a
+        # missing path into a traceback instead of the fail-closed report.
+        "te_repo_sha256": tea.helper_source_sha256(args.te_repo) if (ok and args.te_repo) else None,
+        "te_compute_dtype": args.te_compute_dtype,
     }
     if not ok:
         base["status"] = "R2_UNVERIFIED"
@@ -539,6 +587,10 @@ def run_actual_attention(args: argparse.Namespace, rank: int, local_rank: int, w
     if header.cp_size != world_size:
         raise RuntimeError(f"fixture {header.name!r} carries cp_size={header.cp_size} but world_size={world_size}")
 
+    # Imported here, after the pin check, so the frozen-partial mode and the
+    # fail-closed report never need TransformerEngine on the import path.
+    from cp_numerics import actual_attention as act  # noqa: PLC0415
+
     device = torch.device(f"cuda:{local_rank}")
     result = act.run_actual_attention_on_fixture(
         fixture=fixture,
@@ -546,6 +598,7 @@ def run_actual_attention(args: argparse.Namespace, rank: int, local_rank: int, w
         world_size=world_size,
         compiled=bool(args.compiled_helpers),
         device=device,
+        compute_dtype=torch.float16 if args.te_compute_dtype == "float16" else torch.bfloat16,
     )
     report = dict(base)
     report["status"] = result.status
@@ -659,7 +712,13 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument("--mode", required=True, choices=["frozen-partials", "actual-attention"])
     parser.add_argument("--fixture", default=None, help="frozen-partial fixture; required for --mode frozen-partials")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--te-repo", default=None, help="TE checkout, for --mode actual-attention")
+    parser.add_argument("--te-repo", default=None, help="optional TE checkout cross-check for --mode actual-attention")
+    parser.add_argument(
+        "--te-compute-dtype",
+        default="float16",
+        choices=("float16", "bfloat16"),
+        help="dtype the fused kernel runs in; fp32 is not fused-capable at the pinned revision",
+    )
     parser.add_argument("--timing-repeats", type=int, default=20)
     parser.add_argument("--timing-warmup", type=int, default=3)
     parser.add_argument(
