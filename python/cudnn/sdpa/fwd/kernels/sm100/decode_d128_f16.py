@@ -92,13 +92,18 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 
 from dataclasses import dataclass
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128_decode
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128_decode, make_cfg_d64_decode
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body executes; a plain import falls back to
 # the decode tile's minimal legal params so the file stays importable on its own.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(cta_mma=1))
-CFG, _TMA = make_cfg_d128_decode(PARAMS)
+# One decode tile, two head-dim geometries: d128 and d64 (gpt-oss class). The
+# reshape is head-dim independent, so the flavor only picks the Cfg.
+_MAKE_CFG = {64: make_cfg_d64_decode, 128: make_cfg_d128_decode}
+if PARAMS.d_flavor not in _MAKE_CFG:
+    raise ValueError(f"decode_d128_f16: d_flavor must be 64 or 128; got {PARAMS.d_flavor}")
+CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS

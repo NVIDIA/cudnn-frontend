@@ -545,7 +545,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return "split_kv > 1 cannot ride the synthesized KV-tail padding this S_kv needs"
             # No gate on the O dtype: the partials are never narrower than it,
             # and the combine performs the only cast down to it.
-            if capabilities.split_d_shapes is not None and not any(facts.d_qk <= sq and facts.d_v <= sv for sq, sv in capabilities.split_d_shapes):
+            # _selected_d_shape, not an envelope walk over the raw dims: the
+            # set names the flavors whose KERNELS wire SplitHelpers, and the
+            # lowering picks the smallest covering one. An envelope test says
+            # (64, 64) "fits" (128, 128) and admits a split the d64 kernel
+            # cannot serve, so the plan would clear eligibility and then die in
+            # the lowering (contract rule 8b'). Mirrors the pack_gqa gate below.
+            if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts) not in capabilities.split_d_shapes:
                 return f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:
             # _selected_d_shape, not the raw dims: the FP8 rows carry
@@ -721,6 +727,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # the raw dims: (256, 128) and (64, 192) ride the wired d256
             # envelope, (192, 128) is the native d192x128 flavor, and a
             # d512-envelope selection is declined until that kernel wires it.
+            # d64 is likewise excluded simply by not appearing in the set.
             selected = _selected_d_shape(capabilities, facts)
             if selected not in capabilities.paged_d_shapes:
                 wired = ", ".join(f"d{sq}" if sq == sv else f"d{sq}x{sv}" for sq, sv in sorted(capabilities.paged_d_shapes))
@@ -837,7 +844,10 @@ def _sm100_spec() -> EngineSpec:
             sm_lo=_BLACKWELL[0],
             sm_hi=106,
             phase="prefill",
-            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            # (64, 64) is a NATIVE flavor, not an envelope: it compiles the d128
+            # file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor) instead of
+            # zero-filling a 128-wide tile for gpt-oss-class head dims.
+            d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
@@ -859,7 +869,7 @@ def _sm100_spec() -> EngineSpec:
             # table). A d192x128 decode tile is the follow-up, as the d128
             # tile was: parity is a kernel's job, not an ordering rule's.
             paged_kv=True,
-            paged_d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
+            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
             sink=True,
             stats=True,
             stats_log2=True,
@@ -893,11 +903,14 @@ def _sm100_spec() -> EngineSpec:
             # largest divisor of 128 under partial PackGQA -- 1 unpacked):
             # decode and MTP.
             # A split rides either width (no split_cgas entry).
-            cgas_by_d_shape=(((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2}))),
+            # (64, 64): the native d64 prefill flavor builds at both widths.
+            cgas_by_d_shape=(((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2})), ((64, 64), frozenset({1, 2}))),
             split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
-            # All four f16 flavor kernels wire SplitHelpers, and the adapter
-            # carves the partial slabs + launches sm100/split_combine when
-            # split_kv > 1 (dense f16 only; see mismatch's facts x knobs gate).
+            # Every f16 flavor kernel wires SplitHelpers, and the adapter carves
+            # the partial slabs + launches sm100/split_combine when split_kv > 1
+            # (dense f16 only; see mismatch's facts x knobs gate). d64 included:
+            # it compiles the same kernel body, and at a NATIVE d_v = TILE_O the
+            # fp32 partial store has no surplus columns to clip.
             split_kv_supported=True,
             pack_gqas=frozenset({False, True}),
             # The d128 / d256 f16 kernels pack a GQA group that does not divide

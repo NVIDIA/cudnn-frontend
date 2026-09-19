@@ -522,7 +522,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         causal_ish
         and caps.sm_lo == 100
         and not (facts.is_fp8 or facts.is_mxfp8)
-        and _selected_d_shape(caps, facts) == (128, 128)
+        and _selected_d_shape(caps, facts) in ((128, 128), (64, 64))
         and 1 in effective_cgas(caps, facts)
         and _d128_decode_tile_fits(caps, facts)
     ):
@@ -729,6 +729,12 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
     selected_shape = _selected_d_shape(caps, facts)
+    if selected_shape == (64, 64) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
+        # d64 runs cga1 on BOTH legs -- it is the prefill width (the narrow
+        # slabs need no collective MMA, and a 512-row cga2 cluster wastes most
+        # of a narrow diagonal band) and the decode tile's width. The two are
+        # told apart by TemplateParams.decode_tile, not by this knob.
+        return sched_policy, 1
     if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # The f16 SM100 row: cga1 = the decode tile when one of its 128-row
         # tiles covers the head's Q rows, else the cga2 prefill pipeline.
@@ -904,6 +910,13 @@ def _split_points(
     """
     no_split = 1
     if not caps.split_kv_supported:
+        return [no_split]
+    # split_kv_supported is a ROW-wide flag; split_d_shapes narrows it to the
+    # flavors that actually wire SplitHelpers. mismatch() already honours that
+    # for an explicitly REQUESTED split, but this function proposes one on its
+    # own, so it has to consult the same set or it hands back a knob the
+    # lowering will reject (d64 wires no split; see config_sm100.CfgD64).
+    if caps.split_d_shapes is not None and _selected_d_shape(caps, facts) not in caps.split_d_shapes:
         return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
