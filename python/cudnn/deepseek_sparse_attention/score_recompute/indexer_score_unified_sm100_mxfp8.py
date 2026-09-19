@@ -10,7 +10,7 @@ High-level flow:
   1. reinterpret FP8 Q/K and packed E8M0 scales into CuTe/TMA layouts,
   2. load Q/K and SFB/SFA scales into SMEM,
   3. copy scales into TMEM SFB/SFA fields and issue blockscaled QK UMMA,
-  4. run the inherited unified indexer epilogue to write score and optional LSE.
+  4. reduce heads in FP32 to write scores and optional LSE.
 """
 
 from __future__ import annotations
@@ -18,8 +18,6 @@ from __future__ import annotations
 import math
 from functools import partial
 from typing import Tuple
-
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
@@ -46,6 +44,8 @@ from cutlass.utils.blackwell_helpers import (
     cluster_shape_to_tma_atom_SFB as _cluster_shape_to_tma_atom_SFB,
 )
 from cutlass.utils import blockscaled_layout as _blockscaled_layout
+
+import cuda.bindings.driver as cuda
 
 from cudnn.deepseek_sparse_attention.utils import copy as copy_utils
 from cudnn.deepseek_sparse_attention.utils.sm100.gemm import (
@@ -103,6 +103,14 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                 f"head_dim_padded ({_hd_padded}); got {k_block_size}"
             )
 
+        # Reduce prefetch depth only for the dense H64 ratio-four LSE schedule.
+        # Only override the interface's 24-stage configuration; compressed-logit
+        # paths and other stage counts retain their existing configuration.
+        interface_kv_stages = 24
+        dense_lse_kv_stages = 8
+        if kv_stage == interface_kv_stages and qhead_per_kvhead == 64 and ratio == 4 and compute_lse and not is_compressed_logits:
+            kv_stage = dense_lse_kv_stages
+
         super().__init__(
             head_dim=head_dim,
             qhead_per_kvhead=qhead_per_kvhead,
@@ -154,9 +162,9 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         self.reduce_sync_mbar_size = 4
         self.sScoreAll_size = self.sScoreAll_single_size * 2
 
-        # m=n=128 MXFP8 TMEM plan. ratio==1 uses two accumulator slots; ratio>1
-        # keeps three slots to cover the direct GEMM path without extra waits.
-        self.num_tmem_slots = 2 if ratio == 1 else 3
+        # Three slots let ratio-one H64 forward overlap MMA with head reduction.
+        # Other ratio-one paths retain two; ratio>1 keeps three for direct GEMM.
+        self.num_tmem_slots = 2 if ratio == 1 and (qhead_per_kvhead == 32 or compute_lse) else 3
         self.tmem_s_stride = self.m_block_size
         self.tmem_sfa_cols = (self.n_block_size // 32) * 4
         self.tmem_sfb_cols = (self.m_block_size // 32) * 4
@@ -613,11 +621,10 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             pos = kv_offset + n_blk * self.n_block_size
 
             if q_token_idx < seqlen_q and pos < col_limit and pos < seqlen_k:
-                local_sum_0 = (Float32(0.0), Float32(0.0))
-                local_sum_1 = (Float32(0.0), Float32(0.0))
-                local_sum_2 = (Float32(0.0), Float32(0.0))
-                local_sum_3 = (Float32(0.0), Float32(0.0))
-                # Four independent accumulators reduce dependency depth in the
+                acc_score_0 = (Float32(0.0), Float32(0.0))
+                acc_score_1 = (Float32(0.0), Float32(0.0))
+
+                # Two independent accumulators reduce dependency depth in the
                 # hot ReLU(QK)*W loop.
                 for ho in cutlass.range_constexpr(qhpkv // 2 // W_ILP):
                     for ci in cutlass.range_constexpr(W_ILP):
@@ -630,35 +637,21 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                         val1 = tSrS[idx1]
                         val1 = val1 if val1 > Float32(0.0) else Float32(0.0)
 
-                        if cutlass.const_expr(ci < W_ILP // 4):
-                            local_sum_0 = fma_packed_f32x2(
+                        if cutlass.const_expr(ci % 2 == 0):
+                            acc_score_0 = fma_packed_f32x2(
                                 (val0, val1),
                                 w_pair,
-                                local_sum_0,
-                            )
-                        elif cutlass.const_expr(ci < W_ILP // 2):
-                            local_sum_1 = fma_packed_f32x2(
-                                (val0, val1),
-                                w_pair,
-                                local_sum_1,
-                            )
-                        elif cutlass.const_expr(ci < (W_ILP * 3) // 4):
-                            local_sum_2 = fma_packed_f32x2(
-                                (val0, val1),
-                                w_pair,
-                                local_sum_2,
+                                acc_score_0,
                             )
                         else:
-                            local_sum_3 = fma_packed_f32x2(
+                            acc_score_1 = fma_packed_f32x2(
                                 (val0, val1),
                                 w_pair,
-                                local_sum_3,
+                                acc_score_1,
                             )
 
-                local_sum_lo = add_packed_f32x2(local_sum_0, local_sum_1)
-                local_sum_hi = add_packed_f32x2(local_sum_2, local_sum_3)
-                local_sum = add_packed_f32x2(local_sum_lo, local_sum_hi)
-                score = (local_sum[0] + local_sum[1]) * Float32(softmax_scale)
+                acc_score = add_packed_f32x2(acc_score_0, acc_score_1)
+                score = (acc_score[0] + acc_score[1]) * Float32(softmax_scale)
                 if cutlass.const_expr(self.is_compressed_logits):
                     mOut[cand_batch_base + cand_row_offset + Int64(pos)] = score
                 else:
@@ -791,9 +784,19 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         first_block = Int32(1)
 
         n_blk = num_n_blocks_compute - Int32(1)
+        use_half_tmem = self.compute_lse and self.ratio == 4
+        use_two_sums = not (self.compute_lse and self.ratio == 1)
+        tmem_head_offset = q_token_stage_base * qhpkv if cutlass.const_expr(use_half_tmem) else 0
+        half_tmem_rows = 128
+        half_tmem_cols = 64
+        half_tmem_repetition = 16
+        if cutlass.const_expr(use_half_tmem):
+            # Each epilogue warpgroup consumes two of the four H32 query rows:
+            # 128 KV rows x 64 head columns, using half the full-tile load width.
+            tStS_ref = cute.make_tensor(tStS_ref.iterator, cute.make_layout(((half_tmem_rows, half_tmem_cols), 1, 1), stride=tStS_ref.layout.stride))
         while n_blk >= Int32(0):
             tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.tmem_repetition)),
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(half_tmem_repetition if use_half_tmem else self.tmem_repetition)),
                 Float32,
             )
             thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStS_ref).get_slice(tidx_wg)
@@ -813,7 +816,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
 
             tmem_ptr_cur = cute.make_ptr(
                 Float32,
-                slot * self.tmem_s_stride,
+                slot * self.tmem_s_stride + tmem_head_offset,
                 mem_space=cute.AddressSpace.tmem,
                 assumed_align=16,
             )
@@ -836,50 +839,43 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                 q_token_idx = q_token_idxs[qi]
                 col_limit = col_limits[qi]
                 if q_token_idx < seqlen_q and pos < col_limit and pos < seqlen_k:
-                    local_sum_0 = (Float32(0.0), Float32(0.0))
-                    local_sum_1 = (Float32(0.0), Float32(0.0))
-                    local_sum_2 = (Float32(0.0), Float32(0.0))
-                    local_sum_3 = (Float32(0.0), Float32(0.0))
+                    acc_score_0 = (Float32(0.0), Float32(0.0))
+                    acc_score_1 = (Float32(0.0), Float32(0.0))
+                    acc_score_2 = (Float32(0.0), Float32(0.0))
+                    acc_score_3 = (Float32(0.0), Float32(0.0))
+
                     for ho in cutlass.range_constexpr(qhpkv // 2 // W_ILP):
                         for ci in cutlass.range_constexpr(W_ILP):
                             idx0 = (q_token_stage_base + qi) * qhpkv + (ho * W_ILP + ci) * 2
                             idx1 = idx0 + 1
                             w_pair = (rW_all[idx0], rW_all[idx1])
 
-                            val0 = tSrS[idx0]
+                            val0 = tSrS[idx0 - tmem_head_offset]
                             val0 = val0 if val0 > Float32(0.0) else Float32(0.0)
-                            val1 = tSrS[idx1]
+                            val1 = tSrS[idx1 - tmem_head_offset]
                             val1 = val1 if val1 > Float32(0.0) else Float32(0.0)
 
-                            if cutlass.const_expr(ci < W_ILP // 4):
-                                local_sum_0 = fma_packed_f32x2(
+                            if cutlass.const_expr((ci % 2 == 0) if use_two_sums else (ci < W_ILP // 4)):
+                                acc_score_0 = fma_packed_f32x2(
                                     (val0, val1),
                                     w_pair,
-                                    local_sum_0,
+                                    acc_score_0,
                                 )
-                            elif cutlass.const_expr(ci < W_ILP // 2):
-                                local_sum_1 = fma_packed_f32x2(
+                            elif cutlass.const_expr(use_two_sums or ci < W_ILP // 2):
+                                acc_score_1 = fma_packed_f32x2(
                                     (val0, val1),
                                     w_pair,
-                                    local_sum_1,
+                                    acc_score_1,
                                 )
                             elif cutlass.const_expr(ci < (W_ILP * 3) // 4):
-                                local_sum_2 = fma_packed_f32x2(
-                                    (val0, val1),
-                                    w_pair,
-                                    local_sum_2,
-                                )
+                                acc_score_2 = fma_packed_f32x2((val0, val1), w_pair, acc_score_2)
                             else:
-                                local_sum_3 = fma_packed_f32x2(
-                                    (val0, val1),
-                                    w_pair,
-                                    local_sum_3,
-                                )
+                                acc_score_3 = fma_packed_f32x2((val0, val1), w_pair, acc_score_3)
 
-                    local_sum_lo = add_packed_f32x2(local_sum_0, local_sum_1)
-                    local_sum_hi = add_packed_f32x2(local_sum_2, local_sum_3)
-                    local_sum = add_packed_f32x2(local_sum_lo, local_sum_hi)
-                    score = (local_sum[0] + local_sum[1]) * Float32(softmax_scale)
+                    acc_score = add_packed_f32x2(acc_score_0, acc_score_1)
+                    if cutlass.const_expr(not use_two_sums):
+                        acc_score = add_packed_f32x2(acc_score, add_packed_f32x2(acc_score_2, acc_score_3))
+                    score = (acc_score[0] + acc_score[1]) * Float32(softmax_scale)
                     if cutlass.const_expr(self.is_compressed_logits):
                         mOut[cand_batch_base + cand_row_offsets[qi] + Int64(pos)] = score
                     else:
