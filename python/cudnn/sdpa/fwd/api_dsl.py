@@ -2300,6 +2300,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         km = self._k_mod
         accepted = inspect.signature(km.compile).parameters
         kw = dict(has_lse=(self.lse_desc is not None) or self.split_kv > 1, lse_kind=kind)
+        if "prepared" in accepted:  # decode keeps its existing tensor compile entry for direct callers
+            kw["prepared"] = True
         if "d_qk" in accepted:  # head-dim envelope
             kw.update(d_qk=self.head_dim_qk, d_v=self.head_dim_v)
         if "paged_hnd" in accepted and self.paged:

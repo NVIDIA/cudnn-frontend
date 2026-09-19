@@ -670,7 +670,25 @@ def test_decode_kernel_template_rejects_off_contract_params():
 # --- graph API ----------------------------------------------------------------------
 
 
-def _paged_graph(B, H, KH, d, P, max_pages, lens, hnd, *, s_q=1, causal_br=False, stats=False, dtype=torch.float16, pin_cga=None, seed=0):
+def _paged_graph(
+    B,
+    H,
+    KH,
+    d,
+    P,
+    max_pages,
+    lens,
+    hnd,
+    *,
+    s_q=1,
+    causal_br=False,
+    stats=False,
+    dtype=torch.float16,
+    pin_cga=None,
+    seed=0,
+    table_batch_stride=None,
+    require_prepared=False,
+):
     """Build + run cuDNN's paged-cache graph; return (plan, o [B,H,s_q,d], stats or None, inputs)."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
@@ -680,6 +698,9 @@ def _paged_graph(B, H, KH, d, P, max_pages, lens, hnd, *, s_q=1, causal_br=False
     k_pool, v_pool, bt = _pools(B, KH, d, P, max_pages, hnd, dtype, seed)
     k_c, v_c = (k_pool, v_pool) if hnd else (k_pool.permute(0, 2, 1, 3), v_pool.permute(0, 2, 1, 3))
     bt4 = bt.view(B, 1, max_pages, 1)
+    if table_batch_stride is not None:
+        assert B == 1, "the large-stride probe traverses no batch stride and needs only one row of storage"
+        bt4 = torch.as_strided(bt4, bt4.shape, (table_batch_stride, max_pages, 1, 1))
     gen = torch.Generator(device=dev).manual_seed(seed + 7)
     q_gpu = torch.randn(B, s_q, H, d, device=dev, dtype=torch.float32, generator=gen).to(dtype).transpose(1, 2)
     o_gpu = torch.empty(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)
@@ -731,6 +752,12 @@ def _paged_graph(B, H, KH, d, P, max_pages, lens, hnd, *, s_q=1, causal_br=False
         plan = g.plans[len(g.plans) - 1]
     g.check_support()
     g.build_plans()
+    if require_prepared:
+        from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch
+
+        compiled = g._compiled_plans[g._plan_index]
+        assert compiled._compiled.kernel_template == "decode_d128_f16"
+        assert isinstance(compiled._prepared, PreparedDenseLaunch)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     vp = {q: q_gpu, k: k_c, v: v_c, tk: bt4, tv: bt4, sq_t: slq, sk_t: slk, o: o_gpu}
     if stats:
@@ -755,6 +782,13 @@ def _paged_graph(B, H, KH, d, P, max_pages, lens, hnd, *, s_q=1, causal_br=False
             torch.testing.assert_close(got_lse[live], ref_lse[live], atol=5e-3, rtol=0)
             assert torch.isinf(got_lse[~live]).all()
     return plan
+
+
+@pytest.mark.L0
+def test_graph_decode_prepared_keeps_int64_page_table_batch_stride():
+    """A singleton table's unused batch stride must not narrow at the pointer ABI.
+    B=1 keeps the valid allocation small while a stride over 2**31 catches int32 fakes."""
+    _paged_graph(1, 8, 2, D, 16, 8, [128], False, stats=True, table_batch_stride=2**31 + 32, require_prepared=True)
 
 
 @pytest.mark.L0

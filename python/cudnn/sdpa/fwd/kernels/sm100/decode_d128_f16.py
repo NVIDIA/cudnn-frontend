@@ -72,8 +72,9 @@ unpacked one), i.e. when one 128-row tile covers a packed head's live Q rows.
 The kernel is correct for any S_q -- larger S_q simply launches
 ``ceil(S_q * PACK_G / 128)`` independent CTAs per packed head, each walking the
 KV range.
-The per-shape ``compile()`` ABI is the prefill kernel's (minus the THD-only
-arguments), so the adapter's dense execute path binds both templates alike.
+The graph adapter uses the shared prepared pointer ABI (``compile(prepared=True)``).
+The default tensor ``compile()`` entry remains available for direct callers; both
+entries share the same TMA construction and device-kernel launch.
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -149,6 +150,7 @@ else:
 
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
+    sdpa_operand_tensors,
     store_fp32_partial_tile as _store_fp32_partial_tile,
     make_classic_bars,
     row_max_for_exp2,
@@ -1772,7 +1774,7 @@ def _correction_warp_group(
 
 
 @cute.jit
-def _host(
+def _launch(
     q_tensor: cute.Tensor,
     k_tensor: cute.Tensor,
     v_tensor: cute.Tensor,
@@ -1783,31 +1785,19 @@ def _host(
     o_desc_words: cute.Tensor,
     problem_size: Tuple[int, int, int, int, int, int],
     scale_softmax_log2: cutlass.Float32,
-    n_thd_units: cutlass.Int32,
-    # Dense padded-Q trim: separate (B,)-int32 per-batch Q lengths; None
-    # (and absent from the compiled ABI) unless CFG.SEQ_Q_LENS_PRESENT.
-    seq_q_lens_addr: cutlass.Int64 = 0,
-    # THD-only slots of the shared dense ABI (the adapter passes them
-    # positionally as None on every dense build); this tile never reads them.
-    thd_q_lens_tensor: Optional[cute.Tensor] = None,
-    thd_kv_lens_tensor: Optional[cute.Tensor] = None,
-    thd_lens_form: Optional[cutlass.Int32] = None,
-    o_partial_f32: Optional[cute.Tensor] = None,
-    # Paged KV: [B, max_pages] int32 block tables; None (folded out) unless
-    # CFG.PAGED_KV.  The page axis is a DYNAMIC extent and defines the static
-    # KV maximum the masks clamp against: seqlen_kv = max_pages * PAGE_SIZE.
-    block_table_tensor: Optional[cute.Tensor] = None,
-    block_table_v_tensor: Optional[cute.Tensor] = None,
+    seq_q_lens_addr: cutlass.Int64,
+    o_partial_f32: Optional[cute.Tensor],
+    block_table_tensor: Optional[cute.Tensor],
+    block_table_v_tensor: Optional[cute.Tensor],
+    paged_hnd: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    """Shared TMA construction and launch for tensor and prepared callers."""
     B, QH, KH, SQ, SKV, _ = problem_size
     if cutlass.const_expr(PAGED_KV):
         SKV = block_table_tensor.shape[1] * cutlass.Int32(PAGE_SIZE)
 
     _O_GRANU_ELEMS = CFG.O_SWZ_BYTES // CFG.BPE
-    if cutlass.const_expr(CFG.PACK_GQA):
-        if cutlass.const_expr(q_tensor.shape[2] != k_tensor.shape[2] * CFG.QH_PER_KH):
-            raise ValueError(f"CFG.QH_PER_KH ({CFG.QH_PER_KH}) does not match tensor head extents H_q={q_tensor.shape[2]}, H_kv={k_tensor.shape[2]}")
     # Tensors are [B, S, H, D] with stride_order=(3, 2, 1, 0); D is fastest.
     # PackGQA: the Q box is TILE_M/G tokens x G heads (token-major rows).
     qk_box_q = (1, CFG.TILE_M // HEADS_PER_TILE, HEADS_PER_TILE, TMA_QK_GRANU_ELEMS)
@@ -1823,9 +1813,6 @@ def _host(
     # descriptor lists dims innermost-first as (D, row, H_kv, page) and the
     # TMA-LDG warp swaps its (head, row) coords to match; NHD is the dense BSHD
     # order with batch -> page.
-    paged_hnd = bool(PAGED_KV) and k_tensor.stride[1] < k_tensor.stride[2]
-    if cutlass.const_expr(PAGED_KV and (v_tensor.stride[1] < v_tensor.stride[2]) != paged_hnd):
-        raise ValueError("paged K and V pools must share an in-page layout (both HND or both NHD)")
     kv_stride_order = (3, 1, 2, 0) if paged_hnd else stride_order
 
     def _tma_swz(byte_w: int):
@@ -1903,6 +1890,238 @@ def _host(
     )
 
 
+@cute.jit
+def _tensor_host(
+    q_tensor: cute.Tensor,
+    k_tensor: cute.Tensor,
+    v_tensor: cute.Tensor,
+    o_tensor: cute.Tensor,
+    lse_tensor: Optional[cute.Tensor],
+    sinks_tensor: cute.Tensor,
+    seq_kv_lens_tensor: cute.Tensor,
+    o_desc_words: cute.Tensor,
+    problem_size: Tuple[int, int, int, int, int, int],
+    scale_softmax_log2: cutlass.Float32,
+    n_thd_units: cutlass.Int32,
+    # Dense padded-Q trim: separate (B,)-int32 per-batch Q lengths; None
+    # (and absent from the compiled ABI) unless CFG.SEQ_Q_LENS_PRESENT.
+    seq_q_lens_addr: cutlass.Int64 = 0,
+    # THD-only slots of the shared dense ABI (the adapter passes them
+    # positionally as None on every dense build); this tile never reads them.
+    thd_q_lens_tensor: Optional[cute.Tensor] = None,
+    thd_kv_lens_tensor: Optional[cute.Tensor] = None,
+    thd_lens_form: Optional[cutlass.Int32] = None,
+    o_partial_f32: Optional[cute.Tensor] = None,
+    # Paged KV: [B, max_pages] int32 block tables; None (folded out) unless
+    # CFG.PAGED_KV.  The page axis is a DYNAMIC extent and defines the static
+    # KV maximum the masks clamp against: seqlen_kv = max_pages * PAGE_SIZE.
+    block_table_tensor: Optional[cute.Tensor] = None,
+    block_table_v_tensor: Optional[cute.Tensor] = None,
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    if cutlass.const_expr(CFG.PACK_GQA):
+        if cutlass.const_expr(q_tensor.shape[2] != k_tensor.shape[2] * CFG.QH_PER_KH):
+            raise ValueError(f"CFG.QH_PER_KH ({CFG.QH_PER_KH}) does not match tensor head extents H_q={q_tensor.shape[2]}, H_kv={k_tensor.shape[2]}")
+    paged_hnd = bool(PAGED_KV) and k_tensor.stride[1] < k_tensor.stride[2]
+    if cutlass.const_expr(PAGED_KV and (v_tensor.stride[1] < v_tensor.stride[2]) != paged_hnd):
+        raise ValueError("paged K and V pools must share an in-page layout (both HND or both NHD)")
+    _launch(
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        lse_tensor,
+        sinks_tensor,
+        seq_kv_lens_tensor,
+        o_desc_words,
+        problem_size,
+        scale_softmax_log2,
+        seq_q_lens_addr,
+        o_partial_f32,
+        block_table_tensor,
+        block_table_v_tensor,
+        paged_hnd,
+        stream,
+    )
+
+
+@cute.jit
+def _host(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    lse_ptr: Optional[cute.Pointer],
+    sinks_ptr: cute.Pointer,
+    meta_ptr: cute.Pointer,
+    o_desc_ptr: cute.Pointer,
+    problem_size: Tuple[int, int, int, int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_ext: cutlass.Int32,
+    scale_softmax_log2: cutlass.Float32,
+    n_thd_units: cutlass.Int32,
+    seq_q_lens_addr: cutlass.Int64,
+    thd_q_lens_ptr: Optional[cute.Pointer],
+    thd_kv_lens_ptr: Optional[cute.Pointer],
+    thd_lens_form: Optional[cutlass.Int32],
+    o_partial_ptr: Optional[cute.Pointer],
+    block_table_ptr: Optional[cute.Pointer],
+    block_table_v_ptr: Optional[cute.Pointer],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    n_pages: cutlass.Int32,
+    d_qk: cutlass.Constexpr[int],
+    d_v: cutlass.Constexpr[int],
+    lse_kind: cutlass.Constexpr[str],
+    paged_hnd: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """Bind the shared explicit SDPA ABI and launch the existing decode kernel."""
+    B, QH, KH, SQ, SKV, _ = problem_size
+    (
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        lse_tensor,
+        sinks_tensor,
+        seq_kv_lens_tensor,
+        o_desc_words,
+        thd_q_lens_tensor,
+        thd_kv_lens_tensor,
+        o_partial_f32,
+        block_table_tensor,
+        block_table_v_tensor,
+    ) = sdpa_operand_tensors(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        lse_ptr,
+        sinks_ptr,
+        meta_ptr,
+        o_desc_ptr,
+        problem_size,
+        q_strides,
+        k_strides,
+        v_strides,
+        o_strides,
+        lse_strides,
+        lse_ext,
+        thd_q_lens_ptr,
+        thd_kv_lens_ptr,
+        thd_lens_form,
+        o_partial_ptr,
+        d_qk=d_qk,
+        d_v=d_v,
+        lse_kind=lse_kind,
+        thd=CFG.THD_VARLEN,
+        split_kv=SPLIT_KV,
+        tensor_map_qwords=16,
+        paged=PAGED_KV,
+        page_size=PAGE_SIZE,
+        block_table_ptr=block_table_ptr,
+        block_table_v_ptr=block_table_v_ptr,
+        table_strides=table_strides,
+        n_pages=n_pages,
+    )
+
+    _launch(
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        lse_tensor,
+        sinks_tensor,
+        seq_kv_lens_tensor,
+        o_desc_words,
+        problem_size,
+        scale_softmax_log2,
+        seq_q_lens_addr,
+        o_partial_f32,
+        block_table_tensor,
+        block_table_v_tensor,
+        paged_hnd,
+        stream,
+    )
+
+
+EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument list itself
+LSE_KINDS = ("dense",)  # the decode tile never serves THD
+
+
+@lru_cache(maxsize=None)
+def _compile_prepared(  # noqa: A001
+    d_qk: int = CFG.TILE_K,
+    d_v: int = CFG.TILE_O,
+    has_lse: bool = True,
+    lse_kind: str = "dense",
+    paged_hnd: bool = False,
+) -> Callable:
+    """Compile the shared pointer ABI for dense or paged decode. Shapes and strides
+    are runtime arguments; head-dim envelopes, Stats presence and pool layout
+    are specializations. All stride fakes, including page tables, are Int64."""
+    _cache_key = _template_key(globals(), locals(), "compile_prepared")
+    if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
+        raise ValueError(f"d128 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
+    if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
+        raise ValueError(f"d128 envelope: d_qk*BPE and d_v*BPE must be 16-byte multiples (TMA global-stride rule); got ({d_qk}, {d_v}) at BPE={CFG.BPE}")
+    if SPLIT_KV > 1 and not has_lse:
+        raise ValueError("d128: split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
+    if lse_kind not in LSE_KINDS:
+        raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
+    if paged_hnd and not PAGED_KV:
+        raise ValueError("paged_hnd is a paged-KV specialization")
+    gmem = cute.AddressSpace.gmem
+
+    def P(dtype, align=16):
+        return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=align)  # fake: type only
+
+    i32 = cutlass.Int32(0)
+    i64_3 = (cutlass.Int64(0),) * 3  # stride slots: Int64 leaves, see _host
+    thd = bool(CFG.THD_VARLEN)
+    return _compile_cached(
+        _host,
+        P(STORAGE_DTYPE),
+        P(STORAGE_DTYPE),
+        P(STORAGE_DTYPE),
+        P(cutlass.Float32 if _FP32_PARTIALS else STORAGE_DTYPE),
+        P(cutlass.Float32, 4) if has_lse else None,
+        P(cutlass.Float32),
+        P(cutlass.Int32),
+        P(cutlass.Int64),
+        (0, 0, 0, 0, 0, 0),
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
+        i32,
+        cutlass.Float32(0.0),
+        i32,
+        cutlass.Int64(0),
+        P(cutlass.Int32, 4) if thd else None,
+        P(cutlass.Int32, 4) if thd else None,
+        i32 if thd else None,
+        P(cutlass.Float32) if _FP32_PARTIALS else None,
+        P(cutlass.Int32, 4) if PAGED_KV else None,
+        P(cutlass.Int32, 4) if PAGED_KV else None,
+        (cutlass.Int64(0), cutlass.Int64(0)),
+        i32,
+        d_qk,
+        d_v,
+        lse_kind,
+        paged_hnd,
+        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd_decode_prepared",
+    )
+
+
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001
     b: int = 1,
@@ -1920,6 +2139,9 @@ def compile(  # noqa: A001
     lse_stride: Optional[tuple[int, int, int]] = None,
     block_table_stride: Optional[tuple[int, int]] = None,
     block_table_v_stride: Optional[tuple[int, int]] = None,
+    lse_kind: str = "dense",
+    paged_hnd: bool = False,
+    prepared: bool = False,
 ) -> Callable:
     """Compile the decode tile with ALL dims concrete to pin TMA descriptor strides.
 
@@ -1932,7 +2154,13 @@ def compile(  # noqa: A001
     the ACTUAL head dims (multiples of 8) and the descriptors carry them while
     the tile box stays 128; a split (``CFG.SPLIT_KV > 1``) writes fp32 partials
     into ``(B*SPLIT_KV)``-batch slabs and REQUIRES ``has_lse``.
+
+    ``prepared=True`` selects the shape-generic pointer ABI used by the graph
+    adapter. Only the head dimensions, Stats presence/layout and ``paged_hnd``
+    specialize that entry; its binder supplies shapes and strides at execute.
     """
+    if prepared:
+        return _compile_prepared(d_qk=d_qk, d_v=d_v, has_lse=has_lse, lse_kind=lse_kind, paged_hnd=paged_hnd)
     _cache_key = _template_key(globals(), locals(), "compile")
     _b0, _qh0, _kh0 = b, qh, kh  # the problem_size fake: runtime scalars, values immaterial
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
@@ -2017,7 +2245,7 @@ def compile(  # noqa: A001
         assumed_align=16,
     )
     return _compile_cached(
-        _host,
+        _tensor_host,
         fake_q,
         fake_k,
         fake_v,

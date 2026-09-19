@@ -655,6 +655,52 @@ def _dense_pack(t, bufs):
 
 @requires_pre_rubin_blackwell
 @requires_dsl
+@pytest.mark.parametrize("s_q", [1, 4])
+def test_decode_d128_prepared_rebind_and_capture(s_q):
+    """The small-Q decode tile uses the prepared binder and remains correct with new
+    buffers, an explicit non-current stream and changed-input CUDA-graph replay."""
+    b, h, hk, sk, d = 4, 8, 2, 128, 128
+    g, t = _dense_graph(b, h, hk, s_q, sk, d, causal=False)
+    plan = _plan(g)
+    assert plan._compiled.kernel_template == "decode_d128_f16"
+    assert isinstance(plan._prepared, prep_mod.PreparedDenseLaunch)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    stream = torch.cuda.Stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle, stream.cuda_stream)
+
+    def check(bufs):
+        o_ref, lse_ref = _dense_reference(bufs, causal=False)
+        torch.testing.assert_close(bufs["o"].float(), o_ref, atol=5e-2, rtol=3e-2)
+        torch.testing.assert_close(bufs["lse"].squeeze(-1), lse_ref, atol=5e-3, rtol=1e-3)
+
+    for seed in (11, 12):
+        bufs = _dense_buffers(b, h, hk, s_q, sk, d, seed=seed)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        stream.wait_stream(torch.cuda.current_stream())
+        mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            g.execute(_dense_pack(t, bufs), ws, handle=handle)
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+        stream.synchronize()
+        check(bufs)
+
+    capture = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(capture, stream=stream):
+        g.execute(_dense_pack(t, bufs), ws, handle=handle)
+    bufs["q"].mul_(0.75)
+    bufs["o"].fill_(float("nan"))
+    bufs["lse"].fill_(float("nan"))
+    capture.replay()
+    torch.cuda.synchronize()
+    check(bufs)
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
 def test_dense_f16_plan_is_prepared_and_matches_reference():
     """A dense bf16 graph declared in BSHD storage executes through the prepared dense launch (no
     tensor arm, no copies) and reproduces the reference O / LSE; a BHSD-declared graph (a layout the
