@@ -635,6 +635,39 @@ make_matmul_add_graph(int64_t b, int64_t m, int64_t n, int64_t k, float scale_va
     return graph;
 }
 
+// ===========================================================================
+// Legacy Slice aliasing (a frontend/backend pair below cuDNN 9.22)
+// ===========================================================================
+
+constexpr int64_t kUidSliceX = 21;
+constexpr int64_t kUidSliceY = 22;
+constexpr int64_t kUidSliceZ = 23;
+
+// Y = Slice(X)[1:2, :], Z = 2 * Y. When Slice cannot be expressed as a backend
+// operation the frontend records a variant-pack replacement instead: Y has to be
+// bound to X plus a byte offset. The caller therefore supplies the source
+// pointer and the destination pointer is derived from it.
+std::shared_ptr<fe::graph::Graph>
+make_slice_scale_graph(int64_t rows, int64_t cols) {
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto X = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("X")
+                               .set_dim({rows, cols})
+                               .set_stride({cols, 1})
+                               .set_uid(kUidSliceX));
+    auto Y = graph->slice(X, fe::graph::Slice_attributes().set_slices({{1, 2}, {0, cols}}));
+    Y->set_data_type(fe::DataType_t::HALF).set_uid(kUidSliceY);
+
+    auto scale_options = fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::MUL);
+    auto Z             = graph->pointwise(Y, graph->tensor(2.0f), scale_options);
+    Z->set_data_type(fe::DataType_t::HALF).set_output(true).set_uid(kUidSliceZ);
+    return graph;
+}
+
 // Fill values are powers of two / small integers so that the expected result is
 // exactly representable and can be compared without a tolerance.
 class MatmulAddFixture {
@@ -2655,5 +2688,134 @@ TEST_CASE("186 eligibility comes from node-producing frontend workspace operatio
             CUDA_CHECK(cudaGraphDestroy(populated));
         }
     }
+#endif
+}
+
+// ===========================================================================
+// G11: the legacy Slice alias reaches every CUDA graph entry point
+// ===========================================================================
+
+TEST_CASE("186 G11: legacy Slice aliasing is materialised for every CUDA graph path", "[cudagraph_186]") {
+#if (CUDART_VERSION < 12000)
+    SKIP("Test requires cuda toolkit 12.0 or above");
+#else
+    if (fe::detail::get_backend_version() >= 92200 && fe::detail::get_compiled_version() >= 92200) {
+        SKIP("this frontend/backend pair handles Slice natively, so there is no replacement to materialise");
+        return;
+    }
+
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
+    int64_t const rows = 2, cols = 64;
+    auto graph         = make_slice_scale_graph(rows, cols);
+    auto status        = prepare_native_plan(graph, handle);
+    if (!status.built) {
+        SKIP("slice plan could not be built: " + status.reason);
+        return;
+    }
+
+    ev_header("G11 legacy Slice aliasing: the destination pointer is derived from the source");
+    print_plan_identity(graph, "G11 slice+scale");
+
+    int64_t const workspace_bytes = workspace_size_of(graph);
+    Surface<half> x(static_cast<size_t>(rows * cols), __float2half(0.f));
+    Surface<half> z(static_cast<size_t>(cols), __float2half(-1234.f));
+    Surface<int8_t> workspace(static_cast<size_t>(std::max<int64_t>(workspace_bytes, 1)));
+
+    fill_deterministic_half(x.devPtr, x.size, 0x1860u);
+    std::vector<half> host_x(x.size);
+    CUDA_CHECK(cudaMemcpy(host_x.data(), x.devPtr, sizeof(half) * x.size, cudaMemcpyDeviceToHost));
+
+    int64_t const offset_bytes = cols * static_cast<int64_t>(sizeof(half));
+
+    // What the caller is expected to bind: the slice source and the graph
+    // output. The slice destination is derived by the frontend.
+    std::unordered_map<int64_t, void *> source_and_output = {{kUidSliceX, x.devPtr}, {kUidSliceZ, z.devPtr}};
+    // The same call with the derived pointer spelled out by hand.
+    std::unordered_map<int64_t, void *> explicit_alias = {{kUidSliceX, x.devPtr},
+                                                          {kUidSliceY, reinterpret_cast<char *>(x.devPtr) + offset_bytes},
+                                                          {kUidSliceZ, z.devPtr}};
+
+    auto z_is_scaled_slice = [&]() {
+        std::vector<half> host_z(z.size);
+        CUDA_CHECK(cudaMemcpy(host_z.data(), z.devPtr, sizeof(half) * z.size, cudaMemcpyDeviceToHost));
+        for (int64_t i = 0; i < cols; ++i) {
+            half const expected = __float2half(2.0f * __half2float(host_x[static_cast<size_t>(cols + i)]));
+            if (host_z[static_cast<size_t>(i)] != expected) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto replay_and_check = [&](cudaGraph_t target, std::string const &label) {
+        cudaGraphExec_t exec = nullptr;
+        CUDA_CHECK(cudaGraphInstantiate(&exec, target, nullptr, nullptr, 0));
+        fillImage(z.devPtr, z.size, __float2half(-1234.f));
+        CUDA_CHECK(cudaGraphLaunch(exec, 0));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        REQUIRE(z_is_scaled_slice());
+        ev("[186][G11] PASS " + label + " replayed the alias and produced 2 * X[1, :]");
+        CUDA_CHECK(cudaGraphExecDestroy(exec));
+    };
+
+    // 1. Wrapped populate and update bind the replacement from the source.
+    cudaGraph_t wrapped = nullptr;
+    CUDA_CHECK(cudaGraphCreate(&wrapped, 0));
+    auto wrapped_populate = graph->populate_cuda_graph(handle, source_and_output, workspace.devPtr, wrapped);
+    ev("[186][G11] wrapped populate with a source-only slice binding: " +
+       (wrapped_populate.is_good() ? std::string("OK") : wrapped_populate.get_message()));
+    REQUIRE(wrapped_populate.is_good());
+    replay_and_check(wrapped, "wrapped populate");
+
+    auto wrapped_update = graph->update_cuda_graph(handle, source_and_output, workspace.devPtr, wrapped);
+    ev("[186][G11] wrapped update with a source-only slice binding: " +
+       (wrapped_update.is_good() ? std::string("OK") : wrapped_update.get_message()));
+    REQUIRE(wrapped_update.is_good());
+    replay_and_check(wrapped, "wrapped update");
+
+    // 2. Spelling the derived pointer out by hand stays accepted.
+    cudaGraph_t explicit_graph = nullptr;
+    CUDA_CHECK(cudaGraphCreate(&explicit_graph, 0));
+    auto explicit_populate = graph->populate_cuda_graph(handle, explicit_alias, workspace.devPtr, explicit_graph);
+    ev("[186][G11] wrapped populate with the alias spelled out: " +
+       (explicit_populate.is_good() ? std::string("OK") : explicit_populate.get_message()));
+    REQUIRE(explicit_populate.is_good());
+    replay_and_check(explicit_graph, "explicit alias populate");
+
+    // 3. The direct entry points take the same binding.
+    if (direct_population_eligible(graph)) {
+        cudaGraph_t direct = nullptr;
+        CUDA_CHECK(cudaGraphCreate(&direct, 0));
+        auto direct_populate = populate_graph(graph, handle, source_and_output, workspace.devPtr, direct);
+        ev("[186][G11] " + direct_path_label() + " populate with a source-only slice binding: " +
+           (direct_populate.is_good() ? std::string("OK") : direct_populate.get_message()));
+        REQUIRE(direct_populate.is_good());
+        replay_and_check(direct, direct_path_label() + " populate");
+
+        auto direct_update = update_graph(graph, handle, explicit_alias, workspace.devPtr, direct);
+        ev("[186][G11] " + direct_path_label() + " update with the alias spelled out: " +
+           (direct_update.is_good() ? std::string("OK") : direct_update.get_message()));
+        REQUIRE(direct_update.is_good());
+        replay_and_check(direct, direct_path_label() + " update");
+        CUDA_CHECK(cudaGraphDestroy(direct));
+    } else {
+        ev("[186][G11] direct population is not eligible for this graph: " + status.reason);
+    }
+
+    // 4. A variant pack that names neither end of the alias fails closed
+    //    instead of binding a pointer that was never supplied.
+    cudaGraph_t output_only_graph = nullptr;
+    CUDA_CHECK(cudaGraphCreate(&output_only_graph, 0));
+    std::unordered_map<int64_t, void *> output_only = {{kUidSliceZ, z.devPtr}};
+    auto unbound = graph->populate_cuda_graph(handle, output_only, workspace.devPtr, output_only_graph);
+    ev("[186][G11] populate without the slice source: " +
+       (unbound.is_good() ? std::string("OK") : unbound.get_message()));
+    REQUIRE(unbound.is_bad());
+    CUDA_CHECK(cudaGraphDestroy(output_only_graph));
+
+    CUDA_CHECK(cudaGraphDestroy(wrapped));
+    CUDA_CHECK(cudaGraphDestroy(explicit_graph));
 #endif
 }
