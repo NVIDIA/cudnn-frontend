@@ -792,11 +792,14 @@ def rubin_mxfp8_dglu_reference(p, parameters):
         c = p["c"].squeeze(-1).float().detach().requires_grad_()
         probability = p["prob"].squeeze(-1).float().detach().requires_grad_()
         pairs = c.reshape(m, p["n"] // 32, 2, 32)
-        gate = pairs[:, :, 0, :].reshape(m, p["n"]).clamp(max=params["glu_clamp_max"])
-        up = pairs[:, :, 1, :].reshape(m, p["n"]).clamp(min=params["glu_clamp_min"], max=params["glu_clamp_max"])
+        gate = pairs[:, :, 0, :].reshape(m, p["n"])
+        up = pairs[:, :, 1, :].reshape(m, p["n"])
+        # FE retains derivative 1 at the clamp boundaries. Select the original
+        # input at equality explicitly: torch.clamp uses derivative 0 in PyTorch 2.14+.
+        gate = torch.where(gate > params["glu_clamp_max"], params["glu_clamp_max"], gate)
+        up = torch.where(up < params["glu_clamp_min"], params["glu_clamp_min"], up)
+        up = torch.where(up > params["glu_clamp_max"], params["glu_clamp_max"], up)
         unweighted = gate * torch.sigmoid(params["geglu_alpha"] * gate) * (up + params["linear_offset"])
-        # torch.clamp retains derivative 1 at equality, matching FE's existing
-        # Blackwell contract: gate <= max and min <= up <= max.
         output = unweighted * probability
         dc, dprob = torch.autograd.grad(output, (c, probability), grad_outputs=upstream)
         dprob_scale = (unweighted.detach() * upstream).abs().sum(dim=1, keepdim=True)
